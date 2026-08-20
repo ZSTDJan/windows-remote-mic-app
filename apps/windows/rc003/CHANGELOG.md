@@ -9,8 +9,9 @@
 ## [Unreleased] — 2026-08-20
 
 状态：自动检查通过；`fix6` 已在异机通过多候选连接，按住说话产生非零
-PCM 和可见识别文字，所有按键也能在映射页识别。切换模式的多来源重复
-触发已在 `fix7` 修复，仍待异机复测。本节不得扩大为完整真机通过声明。
+PCM 和可见识别文字，所有按键也能在映射页识别。`fix7` 已合并首轮多来源
+事件，但真机又暴露音频停止早于物理释放、低层 F5 回调阻塞和重复音频通知
+问题；`fix8` 已修复并待异机复测。本节不得扩大为完整真机通过声明。
 维护证据与验收入口见
 `MAINTENANCE.md`、
 `bugs/BUG-001-audio-endpoint.md`、`bugs/BUG-002-hid-tap-readiness.md`
@@ -19,7 +20,8 @@ PCM 和可见识别文字，所有按键也能在映射页识别。切换模式�
 `bugs/BUG-005-toggle-continuous-voice.md`、
 `bugs/BUG-006-live-bridge-key-detection.md`、
 `bugs/BUG-007-duplicate-winrt-ble-candidates.md`、
-`bugs/BUG-008-toggle-multi-source-gesture.md` 和 `TESTING.md`。
+`bugs/BUG-008-toggle-multi-source-gesture.md`、
+`bugs/BUG-009-f5-hook-release-race.md` 和 `TESTING.md`。
 
 ### 修复
 
@@ -61,6 +63,11 @@ PCM 和可见识别文字，所有按键也能在映射页识别。切换模式�
   来源当成第二次点击并立即 `MIC_CLOSE`。现在首个来源认领整轮手势，其他
   来源只合并不再切换；物理/音频释放后下一次按下才执行关闭。HOLD 模式的
   一次 key-down/key-up 行为保持不变。
+- **切换模式时灵时不灵且偶发输入日期时间**：`AudioStopped` 会早于排队中
+  的 F5/HID 物理释放，门闩不能只靠音频停止释放；低层 F5 钩子也不能同步
+  等待 PortAudio 初始化。现在手势需同时越过音频停止和全部物理 up，F5
+  应用处理投递到事件循环，重复音频 start/stop 只处理一次；关闭切换时不再
+  重开播放端点。
 
 ### 变更
 
