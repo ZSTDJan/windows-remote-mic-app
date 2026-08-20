@@ -92,7 +92,7 @@ import queue
 import threading
 import uuid
 from dataclasses import dataclass
-from typing import Any, Callable, List, Optional
+from typing import Any, Awaitable, Callable, List, Optional, Sequence
 
 from . import atvv_protocol as proto
 from . import atvv_session
@@ -105,11 +105,23 @@ DisconnectedCallback = Callable[[], None]
 
 _QUEUE_MAXSIZE = 64
 _WORKER_POLL_SECONDS = 0.2
+_CANDIDATE_PROBE_TIMEOUT_SECONDS = 8.0
 _logger = logging.getLogger(__name__)
 
 
 class WinRTUnavailableError(Exception):
     """Raised when the optional winrt Bluetooth packages are not installed."""
+
+
+class NoReachableCandidateError(identity.RC003IdentityError):
+    """No name-matched candidate exposed a reachable ATVV voice service."""
+
+    def __init__(self, count: int):
+        super().__init__(
+            f"{count} RC003 candidates matched, but none exposed a reachable "
+            "ATVV voice service"
+        )
+        self.count = count
 
 
 @dataclass(frozen=True)
@@ -225,6 +237,134 @@ async def discover_candidates(
         missing_device_ids,
     )
     return candidates
+
+
+async def _candidate_has_voice_service(
+    candidate: identity.RC003Candidate,
+    winrt: Optional[WinRTModules] = None,
+) -> bool:
+    """Probe one paired candidate without retaining its device or service.
+
+    This is used only to disambiguate multiple exact RC003 name matches.
+    The UNCACHED query verifies that the physical device is reachable and
+    currently exposes the ATVV voice service instead of trusting a stale
+    Windows GATT cache.
+    """
+
+    winrt = winrt or _import_winrt()
+    device = None
+    services = []
+    reachable = False
+    cleanup_ok = True
+    try:
+        device = await winrt.bluetooth_le_device.from_id_async(candidate.handle.id)
+        if device is None:
+            return False
+
+        result = await device.get_gatt_services_for_uuid_with_cache_mode_async(
+            uuid.UUID(proto.VOICE_SERVICE_UUID),
+            winrt.bluetooth_cache_mode.UNCACHED,
+        )
+        services = list(result.services or [])
+        reachable = (
+            result.status == winrt.gatt_communication_status.SUCCESS
+            and bool(services)
+        )
+    except Exception as exc:  # noqa: BLE001 - one stale paired record must
+        # not prevent another candidate from being checked. Log only the
+        # exception type so a device ID embedded in a platform message never
+        # reaches the persistent log.
+        _logger.info(
+            "ATVV candidate probe unavailable: error_type=%s",
+            type(exc).__name__,
+        )
+    finally:
+        for service in services:
+            try:
+                service.close()
+            except Exception as exc:  # noqa: BLE001 - cleanup is best effort
+                cleanup_ok = False
+                _logger.info(
+                    "ATVV candidate probe service cleanup failed: error_type=%s",
+                    type(exc).__name__,
+                )
+        if device is not None:
+            try:
+                device.close()
+            except Exception as exc:  # noqa: BLE001 - cleanup is best effort
+                cleanup_ok = False
+                _logger.info(
+                    "ATVV candidate probe device cleanup failed: error_type=%s",
+                    type(exc).__name__,
+                )
+    return reachable and cleanup_ok
+
+
+async def select_connectable_candidate(
+    candidates: Sequence[identity.RC003Candidate],
+    *,
+    winrt: Optional[WinRTModules] = None,
+    probe: Optional[
+        Callable[[identity.RC003Candidate], Awaitable[bool]]
+    ] = None,
+    probe_timeout: float = _CANDIDATE_PROBE_TIMEOUT_SECONDS,
+) -> identity.RC003Candidate:
+    """Resolve one RC003, probing ATVV only when names are ambiguous.
+
+    A sole exact identity match follows the existing fast path. With two or
+    more matches, every candidate is checked sequentially and only a single
+    reachable ATVV device is accepted. Zero reachable candidates fail; two
+    reachable candidates remain ambiguous. The resolver never guesses by
+    enumeration order, localized name, or a persisted device identifier.
+    """
+
+    qualifying = identity.qualifying_candidates(candidates)
+    if len(qualifying) <= 1:
+        return identity.select_single_candidate(qualifying)
+
+    _logger.info(
+        "multiple RC003 candidates: probing ATVV voice service count=%d",
+        len(qualifying),
+    )
+    if probe is None:
+        modules = winrt or _import_winrt()
+
+        async def probe(candidate: identity.RC003Candidate) -> bool:
+            return await _candidate_has_voice_service(candidate, modules)
+
+    reachable = []
+    for ordinal, candidate in enumerate(qualifying, start=1):
+        try:
+            available = await asyncio.wait_for(
+                probe(candidate),
+                timeout=max(0.001, float(probe_timeout)),
+            )
+        except TimeoutError:
+            available = False
+            _logger.info(
+                "ATVV candidate probe timed out: candidate=%d of %d",
+                ordinal,
+                len(qualifying),
+            )
+        _logger.info(
+            "ATVV candidate probe result: candidate=%d of %d reachable=%s",
+            ordinal,
+            len(qualifying),
+            available,
+        )
+        if available:
+            reachable.append(candidate)
+
+    if not reachable:
+        raise NoReachableCandidateError(len(qualifying))
+    if len(reachable) > 1:
+        raise identity.AmbiguousCandidateError(len(reachable))
+
+    _logger.info(
+        "multiple RC003 candidates resolved by ATVV service: matched=%d reachable=1",
+        len(qualifying),
+    )
+    return reachable[0]
 
 
 class RC003BleSession:

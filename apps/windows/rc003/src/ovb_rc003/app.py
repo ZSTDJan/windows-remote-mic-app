@@ -73,7 +73,6 @@ from . import (
     frida_compat,
     hid_identity,
     hotkey,
-    identity,
     key_detection_bridge,
     key_mapping,
     legacy_key_suppressor_windows,
@@ -171,9 +170,11 @@ class RC003App:
     async def _connect_once(self) -> None:
         self._logger.info("startup: resolving RC003 identity")
         candidates = await ble_transport_winrt.discover_candidates()
-        # Fail-closed by construction: raises NoCandidateFoundError or
-        # AmbiguousCandidateError instead of guessing.
-        candidate = identity.select_single_candidate(candidates)
+        # A sole exact identity match remains the fast path. If Windows keeps
+        # multiple paired records, accept only the unique candidate that is
+        # currently reachable and exposes the ATVV voice service; zero or
+        # multiple reachable devices still fail closed instead of guessing.
+        candidate = await ble_transport_winrt.select_connectable_candidate(candidates)
         self._logger.info("startup: exactly one RC003 candidate resolved")
 
         self._ble_session = ble_transport_winrt.RC003BleSession(

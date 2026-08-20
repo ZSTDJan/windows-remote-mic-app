@@ -35,7 +35,13 @@ import uuid
 from ovb_rc003 import atvv_protocol as proto
 from ovb_rc003 import atvv_session
 from ovb_rc003 import identity
-from ovb_rc003.ble_transport_winrt import RC003BleSession, discover_candidates
+from ovb_rc003.ble_transport_winrt import (
+    NoReachableCandidateError,
+    RC003BleSession,
+    _candidate_has_voice_service,
+    discover_candidates,
+    select_connectable_candidate,
+)
 
 from .fakes.fake_winrt import (
     FakeDeviceInformation,
@@ -141,6 +147,103 @@ class DiscoverCandidatesTests(unittest.TestCase):
         self.assertIn("duplicate_device_id_entries=0", combined)
         self.assertNotIn("private-device-id-a", combined)
         self.assertNotIn("private-device-id-b", combined)
+
+
+class SelectConnectableCandidateTests(unittest.TestCase):
+    @staticmethod
+    def _candidates():
+        return [
+            identity.RC003Candidate(name="MI RC", hardware_match=False, handle=object()),
+            identity.RC003Candidate(
+                name="小米蓝牙语音遥控器", hardware_match=False, handle=object()
+            ),
+        ]
+
+    def test_single_match_uses_fast_path_without_probing(self):
+        candidate = identity.RC003Candidate(
+            name="MI RC", hardware_match=False, handle=object()
+        )
+
+        async def probe(_candidate):
+            raise AssertionError("single-candidate fast path must not probe")
+
+        chosen = _run(select_connectable_candidate([candidate], probe=probe))
+
+        self.assertIs(chosen, candidate)
+
+    def test_multiple_matches_select_the_only_reachable_voice_device(self):
+        candidates = self._candidates()
+
+        async def probe(candidate):
+            return candidate is candidates[0]
+
+        chosen = _run(select_connectable_candidate(candidates, probe=probe))
+
+        self.assertIs(chosen, candidates[0])
+
+    def test_multiple_reachable_voice_devices_remain_ambiguous(self):
+        candidates = self._candidates()
+
+        async def probe(_candidate):
+            return True
+
+        with self.assertRaises(identity.AmbiguousCandidateError) as ctx:
+            _run(select_connectable_candidate(candidates, probe=probe))
+
+        self.assertEqual(ctx.exception.count, 2)
+
+    def test_no_reachable_voice_device_fails_without_guessing(self):
+        candidates = self._candidates()
+
+        async def probe(_candidate):
+            return False
+
+        with self.assertRaises(NoReachableCandidateError) as ctx:
+            _run(select_connectable_candidate(candidates, probe=probe))
+
+        self.assertEqual(ctx.exception.count, 2)
+
+    def test_real_probe_uses_uncached_service_query_and_closes_resources(self):
+        env = FakeWinRTEnvironment()
+        candidate = identity.RC003Candidate(
+            name=env.name, hardware_match=False, handle=env.discovered_info
+        )
+
+        reachable = _run(
+            _candidate_has_voice_service(candidate, env.build_winrt_modules())
+        )
+
+        self.assertTrue(reachable)
+        self.assertEqual(
+            env.device.service_query_cache_modes,
+            [env.build_winrt_modules().bluetooth_cache_mode.UNCACHED],
+        )
+        self.assertTrue(env.service.closed)
+        self.assertTrue(env.device.closed)
+
+    def test_real_probe_treats_unreachable_service_as_unavailable_and_closes(self):
+        env = FakeWinRTEnvironment()
+
+        async def unreachable(_service_uuid, cache_mode):
+            env.device.service_query_cache_modes.append(cache_mode)
+            from .fakes.fake_winrt import (
+                FakeGattCommunicationStatus,
+                FakeGattServicesResult,
+            )
+
+            return FakeGattServicesResult(FakeGattCommunicationStatus.UNREACHABLE, [])
+
+        env.device.get_gatt_services_for_uuid_with_cache_mode_async = unreachable
+        candidate = identity.RC003Candidate(
+            name=env.name, hardware_match=False, handle=env.discovered_info
+        )
+
+        reachable = _run(
+            _candidate_has_voice_service(candidate, env.build_winrt_modules())
+        )
+
+        self.assertFalse(reachable)
+        self.assertTrue(env.device.closed)
 
 
 class RejectsWrongIdDomainTests(unittest.TestCase):

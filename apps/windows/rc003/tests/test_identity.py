@@ -4,6 +4,17 @@ from ovb_rc003 import identity
 
 
 class SelectSingleCandidateTests(unittest.TestCase):
+    def test_qualifying_candidates_uses_the_same_identity_rules(self):
+        candidates = [
+            identity.RC003Candidate(name="MI RC", hardware_match=False),
+            identity.RC003Candidate(name="unrelated", hardware_match=True),
+            identity.RC003Candidate(name="unrelated", hardware_match=False),
+        ]
+
+        qualifying = identity.qualifying_candidates(candidates)
+
+        self.assertEqual(qualifying, candidates[:2])
+
     def test_selects_sole_matching_candidate_by_name(self):
         candidates = [identity.RC003Candidate(name="MI RC", hardware_match=False)]
         chosen = identity.select_single_candidate(candidates)

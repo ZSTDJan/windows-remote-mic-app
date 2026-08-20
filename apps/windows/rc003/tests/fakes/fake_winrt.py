@@ -213,6 +213,7 @@ class FakeBluetoothLEDevice:
         self._connection_status_handlers: Dict[int, Any] = {}
         self._next_token = 1
         self.connection_status = FakeBluetoothConnectionStatus.CONNECTED
+        self.service_query_cache_modes: List[int] = []
 
     def add_connection_status_changed(self, handler) -> int:
         token = self._next_token
@@ -235,6 +236,7 @@ class FakeBluetoothLEDevice:
     async def get_gatt_services_for_uuid_with_cache_mode_async(
         self, service_uuid: uuid.UUID, cache_mode
     ) -> FakeGattServicesResult:
+        self.service_query_cache_modes.append(cache_mode)
         return await self.get_gatt_services_for_uuid_async(service_uuid)
 
     def close(self) -> None:

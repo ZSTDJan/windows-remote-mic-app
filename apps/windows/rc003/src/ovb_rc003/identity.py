@@ -61,6 +61,18 @@ def matches_rc003_name(name: str) -> bool:
     return normalize_name(name) in device_profile.BLUETOOTH_NAMES
 
 
+def qualifying_candidates(
+    candidates: Sequence[RC003Candidate],
+) -> list[RC003Candidate]:
+    """Return candidates that satisfy the public RC003 identity contract."""
+
+    return [
+        candidate
+        for candidate in candidates
+        if candidate.hardware_match or matches_rc003_name(candidate.name)
+    ]
+
+
 def select_single_candidate(candidates: Sequence[RC003Candidate]) -> RC003Candidate:
     """Return the sole qualifying candidate, or fail closed.
 
@@ -71,11 +83,7 @@ def select_single_candidate(candidates: Sequence[RC003Candidate]) -> RC003Candid
     pick a "most likely" one.
     """
 
-    qualifying = [
-        candidate
-        for candidate in candidates
-        if candidate.hardware_match or matches_rc003_name(candidate.name)
-    ]
+    qualifying = qualifying_candidates(candidates)
 
     if not qualifying:
         raise NoCandidateFoundError("no paired RC003 candidate was discovered")

@@ -205,6 +205,51 @@ class _AppWiringTestCase(unittest.TestCase):
         self._loop.close()
 
 
+class CandidateResolutionWiringTests(_AppWiringTestCase):
+    def test_connect_once_uses_connectable_candidate_resolver(self):
+        candidates = [object(), object()]
+        chosen = object()
+        resolver_calls = []
+        connected = []
+
+        async def discover():
+            return candidates
+
+        async def resolve(received):
+            resolver_calls.append(received)
+            return chosen
+
+        class Session:
+            def __init__(self, **_kwargs):
+                pass
+
+            async def connect(self, candidate):
+                connected.append(candidate)
+
+            async def close(self):
+                pass
+
+        with mock.patch.object(
+            app_module.ble_transport_winrt, "discover_candidates", discover
+        ), mock.patch.object(
+            app_module.ble_transport_winrt,
+            "select_connectable_candidate",
+            resolve,
+        ), mock.patch.object(
+            app_module.ble_transport_winrt, "RC003BleSession", Session
+        ), mock.patch.object(
+            self.app, "_start_hid_listener"
+        ) as start_hid, mock.patch.object(
+            self.app, "_start_hid_report_tap"
+        ) as start_tap:
+            self._loop.run_until_complete(self.app._connect_once())
+
+        self.assertEqual(resolver_calls, [candidates])
+        self.assertEqual(connected, [chosen])
+        start_hid.assert_called_once_with()
+        start_tap.assert_called_once_with()
+
+
 class HostHotkeyFailureSuppressesMicOpenTests(_AppWiringTestCase):
     """XRBM-014 review round 2 P1 #6: MIC_OPEN must never be sent unless the
     host hotkey actually, fully delivered.
