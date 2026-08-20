@@ -165,6 +165,25 @@ class BridgeModeRoutingTests(_ArgvRestoringTestCase):
         self.assertEqual(len(notice_calls), 1)
         self.assertIn("already running", notice_calls[0])
 
+    def test_settings_duplicate_returns_immediately_without_modal_notice(self):
+        app.main = lambda: self.fail("app.main() must never run on a duplicate launch")
+        single_instance.BridgeInstanceGuard = _make_guard_class(
+            raise_on_enter=single_instance.DuplicateInstanceError("already running")
+        )
+        notice_calls = []
+        single_instance.show_bridge_startup_blocked_notice = lambda msg: notice_calls.append(msg)
+        sys.argv = [
+            "ovb_rc003",
+            "--bridge",
+            "--bridge-from-settings",
+        ]
+
+        with self.assertRaises(SystemExit) as ctx:
+            main_module.main()
+
+        self.assertEqual(ctx.exception.code, single_instance.DUPLICATE_INSTANCE_EXIT_CODE)
+        self.assertEqual(notice_calls, [])
+
     def test_guard_unavailable_fails_closed_and_never_calls_app_main(self):
         # XRBM-021 review round 1 P1 #1: the guard FAILS CLOSED - an
         # acquisition failure it cannot resolve is treated the same as a

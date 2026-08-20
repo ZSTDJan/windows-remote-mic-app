@@ -732,6 +732,7 @@ def _load_qt_classes() -> dict:
             saved_name = self._config.get("output_endpoint_name", "")
             saved_host_api = self._config.get("output_endpoint_host_api", "")
             saved_display = ""
+            migrated_display = ""
             if saved_name:
                 saved_display = settings_ui._endpoint_display(
                     audio_output.AudioEndpoint(
@@ -751,9 +752,33 @@ def _load_qt_classes() -> dict:
                 # round-tripping whatever text is present at save time.
                 options = [saved_display] + options
 
+            if saved_name and not audio_output.is_supported_output_host_api(
+                saved_host_api
+            ):
+                cable_matches = [
+                    endpoint
+                    for endpoint in endpoints
+                    if audio_output.is_cable_input_endpoint(endpoint.name)
+                ]
+                try:
+                    migrated_endpoint = audio_output.select_preferred_output_endpoint(
+                        cable_matches
+                    )
+                except audio_output.AudioOutputUnavailableError:
+                    pass
+                else:
+                    migrated_display = settings_ui._endpoint_display(
+                        migrated_endpoint
+                    )
+                    self._status_message = (
+                        "旧的 Windows WDM-KS 语音端点不可用于当前播放方式；"
+                        f"已为本次设置预选 {migrated_display}。点击保存后才会写入。"
+                    )
+
             self._endpoint_options = options
+            selected_display = migrated_display or saved_display
             self._selected_endpoint_index = (
-                options.index(saved_display) if saved_display in options else -1
+                options.index(selected_display) if selected_display in options else -1
             )
 
         def _load_bindings_into_model(self) -> None:

@@ -15,7 +15,14 @@ class BuildLaunchCommandTests(unittest.TestCase):
         command = bridge_launcher.build_launch_command(
             frozen=True, executable=r"C:\Apps\RemoteMicRC003.exe"
         )
-        self.assertEqual(command, [r"C:\Apps\RemoteMicRC003.exe", "--bridge"])
+        self.assertEqual(
+            command,
+            [
+                r"C:\Apps\RemoteMicRC003.exe",
+                "--bridge",
+                bridge_launcher.SETTINGS_LAUNCH_FLAG,
+            ],
+        )
 
     def test_frozen_command_never_recurses_into_settings(self):
         command = bridge_launcher.build_launch_command(
@@ -30,15 +37,35 @@ class BuildLaunchCommandTests(unittest.TestCase):
         command = bridge_launcher.build_launch_command(
             frozen=True, executable=r"C:\Apps\RemoteMicRC003.exe"
         )
-        self.assertEqual(command, [r"C:\Apps\RemoteMicRC003.exe", "--bridge"])
+        self.assertEqual(
+            command,
+            [
+                r"C:\Apps\RemoteMicRC003.exe",
+                "--bridge",
+                bridge_launcher.SETTINGS_LAUNCH_FLAG,
+            ],
+        )
 
     def test_source_uses_the_current_interpreter_with_module_flag_and_bridge(self):
         command = bridge_launcher.build_launch_command(
             frozen=False, executable=r"C:\Python312\python.exe"
         )
         self.assertEqual(
-            command, [r"C:\Python312\python.exe", "-m", "ovb_rc003", "--bridge"]
+            command,
+            [
+                r"C:\Python312\python.exe",
+                "-m",
+                "ovb_rc003",
+                "--bridge",
+                bridge_launcher.SETTINGS_LAUNCH_FLAG,
+            ],
         )
+
+    def test_settings_launch_marker_is_always_after_the_bridge_flag(self):
+        command = bridge_launcher.build_launch_command(
+            frozen=True, executable=r"C:\Apps\RemoteMicRC003.exe"
+        )
+        self.assertEqual(command[-2:], ["--bridge", bridge_launcher.SETTINGS_LAUNCH_FLAG])
 
     def test_source_command_never_recurses_into_settings(self):
         command = bridge_launcher.build_launch_command(

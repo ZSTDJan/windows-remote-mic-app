@@ -11,10 +11,12 @@ future third mode cannot silently fall through unnoticed:
 - **Frozen** (the packaged ``RemoteMicRC003.exe``, built from
   ``src/launcher.py`` - see that module's docstring): ``sys.executable`` IS
   that same exe, and running it again with ``--bridge`` enters
-  ``__main__.main()``'s ``_run_bridge()`` branch. The no-argument form now
-  opens the settings window, so the bridge is always launched EXPLICITLY -
-  never ``--settings``, which would just open a second settings window
-  instead of starting the bridge.
+  ``__main__.main()``'s ``_run_bridge()`` branch. The settings-only hidden
+  flag also tells a duplicate child to return its stable exit code without
+  opening a modal notice that would block launch-outcome polling. The
+  no-argument form opens settings, so the bridge is always launched
+  EXPLICITLY - never ``--settings``, which would just open a second settings
+  window instead of starting the bridge.
 - **Source** (``python -m ovb_rc003``): ``sys.executable`` is the
   interpreter itself; ``[sys.executable, "-m", "ovb_rc003", "--bridge"]``
   enters the same bridge branch. This relies on the child inheriting the
@@ -23,7 +25,8 @@ future third mode cannot silently fall through unnoticed:
   needed to have been started with in order to import ``ovb_rc003`` at all
   (see the root README's "Running from source" section).
 
-Both branches deliberately append ``--bridge`` and never ``--settings``:
+Both branches deliberately append ``--bridge`` plus the hidden settings-
+launch marker, and never ``--settings``:
 that argument would recursively open another settings window instead of
 starting the bridge (In-scope item 2's "不得递归打开 --settings").
 
@@ -71,6 +74,7 @@ from . import single_instance
 
 # Reused, not redefined - see module docstring's ALREADY_RUNNING note.
 ALREADY_RUNNING_EXIT_CODE = single_instance.DUPLICATE_INSTANCE_EXIT_CODE
+SETTINGS_LAUNCH_FLAG = "--bridge-from-settings"
 
 DEFAULT_GRACE_CHECKS = 10
 DEFAULT_POLL_INTERVAL_SECONDS = 0.15
@@ -111,9 +115,15 @@ def build_launch_command(
         # The same frozen exe handles both modes: with no arguments (or
         # --settings) it opens the settings window, and with --bridge (as
         # launched here) it starts the bridge - see __main__.py's dispatch.
-        return [executable, "--bridge"]
+        return [executable, "--bridge", SETTINGS_LAUNCH_FLAG]
     # The current interpreter, `-m ovb_rc003 --bridge`.
-    return [executable, "-m", "ovb_rc003", "--bridge"]
+    return [
+        executable,
+        "-m",
+        "ovb_rc003",
+        "--bridge",
+        SETTINGS_LAUNCH_FLAG,
+    ]
 
 
 class LaunchOutcome(Enum):

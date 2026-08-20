@@ -15,6 +15,10 @@ built from the standalone ``src/launcher.py`` entry point - see XRBM-021):
                 duplicate - the bridge does not start either. A caller
                 that cannot prove it is the only owner of BLE/HID/audio
                 resources must never gamble on being one anyway.
+- ``--bridge-from-settings``  HIDDEN marker used only together with
+                ``--bridge`` by the settings window. A confirmed duplicate
+                still exits with the same nonzero code, but skips the modal
+                notice so the parent can classify the result immediately.
 - ``--dry-run``   import every first-party module and exit 0, touching no
                   GUI, BLE, Raw Input, or audio device - the safe smoke
                   check build-candidate.ps1 and
@@ -122,7 +126,7 @@ def _dry_run() -> int:
     return 0
 
 
-def _run_bridge() -> None:
+def _run_bridge(*, quiet_duplicate: bool = False) -> None:
     """No-argument bridge mode: guarded by the per-session single-instance
     mutex (XRBM-021 In-scope items 2-3). ``app.main()`` is only ever called
     from INSIDE the guard's ``with`` block (first owner) - NEVER from any
@@ -158,7 +162,8 @@ def _run_bridge() -> None:
         with single_instance.BridgeInstanceGuard():
             app.main()
     except single_instance.DuplicateInstanceError as exc:
-        single_instance.show_bridge_startup_blocked_notice(str(exc))
+        if not quiet_duplicate:
+            single_instance.show_bridge_startup_blocked_notice(str(exc))
         raise SystemExit(single_instance.DUPLICATE_INSTANCE_EXIT_CODE)
     except single_instance.SingleInstanceUnavailableError as exc:
         single_instance.show_bridge_startup_blocked_notice(
@@ -213,7 +218,11 @@ def main() -> None:
         flag_index = args.index("--rc003-hid-injector")
         raise SystemExit(frida_compat.injector_main(args[flag_index + 1 :]))
     if "--bridge" in args:
-        _run_bridge()
+        from . import bridge_launcher
+
+        _run_bridge(
+            quiet_duplicate=bridge_launcher.SETTINGS_LAUNCH_FLAG in args
+        )
         return
 
     # Default (no arguments) and explicit --settings both open the settings

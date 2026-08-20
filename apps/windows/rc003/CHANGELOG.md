@@ -8,17 +8,19 @@
 
 ## [Unreleased] — 2026-08-20
 
-状态：自动检查进行中，当前机器的 RC003 逐键与语音复测尚未完成；本节
+状态：自动检查通过，当前机器的 RC003 逐键与语音复测尚未完成；本节
 不得作为真机通过声明。维护证据与验收入口见 `MAINTENANCE.md`、
 `bugs/BUG-001-audio-endpoint.md`、`bugs/BUG-002-hid-tap-readiness.md`
-和 `TESTING.md`。
+、`bugs/BUG-003-duplicate-bridge-dialog.md` 和 `TESTING.md`。
 
 ### 修复
 
 - **语音触发但无声**：过滤当前 PortAudio 阻塞播放不支持的
   `Windows WDM-KS` 端点；同名视图优先 `Windows WASAPI`，缺失时使用
   `Windows DirectSound`；设置保存和诊断页自动选择都会先真实打开、启动
-  并关闭输出流，不能再把只能枚举、无法播放的端点写入配置。
+  并关闭输出流，不能再把只能枚举、无法播放的端点写入配置。已有 WDM-KS
+  配置且检测到标准 CABLE Input 时，设置页预选其 WASAPI 视图，等待用户
+  保存后再持久化。
 - **部分按键在设置页无法识别**：设置页的真实按键检测同时接收 Raw Input
   与 Frida HID tap，tap 只补齐 Windows 普通键盘链路丢失的返回和音量
   usages，任一来源捕获到首个按下事件后统一停止且不执行映射动作。
@@ -26,6 +28,10 @@
   WUDFHost 和 Gadget 哈希校验；新增等待宿主、注入、等待连接、等待 IO、
   ready、不健康和失败状态。后台线程创建只记录 starting，收到有效 HID IO
   后才记录 ready，状态进入 `app.log` 而不是窗口 EXE 不可见的 stdout。
+- **重复启动提示与状态矛盾**：设置页启动桥接时附加隐藏来源标记；已有
+  桥接实例时，子进程不再弹出阻塞轮询的系统模态框，而是立即返回既有的
+  确定退出码，设置页可准确显示“已经在运行”。手工 `--bridge` 启动仍保留
+  可见的单实例保护提示。
 
 ### 变更
 

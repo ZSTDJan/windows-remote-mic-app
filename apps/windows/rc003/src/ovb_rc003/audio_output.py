@@ -214,9 +214,10 @@ def _enumerate_endpoints(channel_count_key: str) -> List[AudioEndpoint]:
 # Canonical VB-CABLE (Basic/Donationware) endpoint display names, as VB-Audio's
 # own driver names them: the playback ("speaker") side the app writes decoded
 # voice PCM to, and the recording ("microphone") side a recognizer reads from.
-# Never used to auto-select anything - only to let the diagnostics page (XRBM-
-# 031) report whether the optional driver is installed, and to recognize the
-# one endpoint the "select detected CABLE Input" action is allowed to persist.
+# Selection remains narrowly scoped: diagnostics may offer the detected Basic
+# CABLE Input explicitly, and settings may preselect its preferred usable view
+# when migrating an already-saved, unsupported WDM-KS endpoint. Nothing is
+# persisted until the user saves and the real stream preflight succeeds.
 CABLE_INPUT_NAME = "CABLE Input"
 CABLE_OUTPUT_NAME = "CABLE Output"
 DJI_MIC_2_NAME_PREFIXES = ("DJI-MIC2", "DJI Mic 2", "DJI Mic2")

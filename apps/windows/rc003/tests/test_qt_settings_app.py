@@ -387,6 +387,33 @@ class SettingsControllerTests(unittest.TestCase):
         controller, _ = self._make_controller()
         self.assertEqual(controller.launchStatusText, settings_ui.LAUNCH_NOT_STARTED_TEXT)
 
+    def test_unsupported_saved_wdmks_endpoint_preselects_preferred_cable_input(self):
+        saved = config.default_config()
+        saved["output_endpoint_name"] = "Output (VB-Audio Point)"
+        saved["output_endpoint_host_api"] = "Windows WDM-KS"
+        config.save_config(config.config_path(config.config_root()), saved)
+        endpoints = [
+            audio_output.AudioEndpoint(
+                name="CABLE Input (VB-Audio Virtual Cable)",
+                host_api="Windows DirectSound",
+            ),
+            audio_output.AudioEndpoint(
+                name="CABLE Input (VB-Audio Virtual Cable)",
+                host_api="Windows WASAPI",
+            ),
+        ]
+
+        with mock.patch.object(
+            audio_output, "enumerate_output_endpoints", return_value=endpoints
+        ):
+            controller, _ = self._make_controller()
+
+        selected = controller.endpointOptions[controller.selectedEndpointIndex]
+        self.assertIn("CABLE Input", selected)
+        self.assertIn("Windows WASAPI", selected)
+        self.assertIn("WDM-KS", controller.statusMessage)
+        self.assertIn("点击保存后才会写入", controller.statusMessage)
+
     def test_mic_row_text_matches_settings_ui_constant(self):
         controller, _ = self._make_controller()
         self.assertEqual(controller.micRowText, settings_ui._MIC_ROW_DISPLAY)
