@@ -1,8 +1,8 @@
 """Remote Mic - RC003 Windows client (source/build candidate).
 
-Not yet real-device verified on Windows. See this package's top-level
-README.md "Known gaps" section for the full list of what remains
-unverified on real hardware.
+Partially verified with a real RC003 on Windows. See this package's
+README.md and TESTING.md for the exact verified paths and remaining
+real-device checks.
 """
 
 __all__ = ["__version__"]

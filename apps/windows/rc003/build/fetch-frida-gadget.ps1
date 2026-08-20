@@ -2,15 +2,15 @@
 <#
 .SYNOPSIS
     Optionally fetches the official Frida Gadget release asset and verifies
-    its SHA-256 before use. This is the ONLY place this project ever
-    downloads a third-party binary, and it never runs automatically as part
+    its SHA-256 before use. This is the only fetch path for Frida Gadget,
+    and it never runs automatically as part
     of a normal build - the build (see build-candidate.ps1) proceeds without
     it and the optional RC003 HID report tap stays disabled (see
     ovb_rc003.frida_compat.RC003HidReportTap).
 
-    No binary is bundled in source control. VB-CABLE is intentionally not
-    fetched by this project at all (see XRBM-014's hard
-    boundary against auto-installing/downloading it).
+    No Frida binary is bundled in source control. VB-CABLE has a separate,
+    hash-pinned required candidate-build fetch step; neither fetch script
+    installs a driver or runs automatically when the application starts.
 
 .PARAMETER Destination
     Where to place the verified asset. Defaults to the optional runtime asset
@@ -91,6 +91,7 @@ Get-VerifiedAsset -Name $AssetName -Url $AssetUrl -Destination $Destination -Exp
 
 Write-Host ""
 Write-Host "Frida Gadget license: see https://raw.githubusercontent.com/frida/frida-core/main/COPYING"
-Write-Host "This asset is optional. When present, RC003HidReportTap can request one"
-Write-Host "UAC-elevated injection into the paired RC003 WUDF host to recover the"
+Write-Host "This asset is optional. When present, RC003HidReportTap can inject into"
+Write-Host "the paired RC003 WUDF host only when the bridge already has administrator"
+Write-Host "rights; the application does not request UAC elevation for the tap. It recovers"
 Write-Host "back and volume HID usages that Windows Raw Input drops."

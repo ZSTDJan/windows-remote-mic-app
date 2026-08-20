@@ -1,7 +1,7 @@
 ; Inno Setup source for Remote Mic · RC003 (Windows source/build
-; candidate). Unsigned. Not yet real-device verified - see this
-; subtree's top-level README.md "Known gaps" section before treating
-; this as a supported release artifact.
+; candidate). Unsigned and partially real-device verified - see this
+; subtree's README.md and TESTING.md for the exact verified paths and
+; remaining checks before treating this as a supported release artifact.
 ;
 ; Hard boundaries enforced by this script:
 ;   - PrivilegesRequired=lowest (no admin elevation requested, ever).
@@ -19,8 +19,10 @@
 ;     never this installer, never silently, and only after the app is
 ;     already running and the user has explicitly clicked to do so. Voice
 ;     output itself is still chosen by the user inside the app.
-;   - No Frida binary is included (none is ever bundled - see
-;     ovb_rc003/frida_compat.py).
+;   - Frida Gadget is never downloaded by this installer or by the normal
+;     candidate build. If a maintainer explicitly fetched the pinned asset
+;     before PyInstaller ran, the frozen DistDir may contain it as optional
+;     application data; runtime verifies it again before use.
 
 #define AppName "Remote Mic · RC003"
 #define AppPublisher "Remote Mic contributors"

@@ -73,7 +73,7 @@ from . import __version__
 
 def _print_help() -> None:
     print(f"Remote Mic - RC003 Windows client (source/build candidate) {__version__}")
-    print("Not yet real-device verified - see this package's README.md 'Known gaps' section.")
+    print("Partially real-device verified - see this package's README.md and TESTING.md.")
     print()
     print("Usage:")
     print("  python -m ovb_rc003               open the settings window (default)")
