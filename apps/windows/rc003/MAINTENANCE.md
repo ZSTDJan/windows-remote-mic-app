@@ -64,6 +64,9 @@
   用户录制的快捷键。
 - HID tap 改为隐藏独立子进程，保留目标 PID、WUDFHost 名称和固定 Gadget
   哈希校验，并把启动到有效 HID IO 的状态写入 `app.log`。
+- 管理员现场诊断确认 WUDFHost 进程名查询必须发生在
+  `SeDebugPrivilege` 启用之后；注入器现已按此顺序执行。同一宿主 PID
+  注入失败后保持稳定失败状态，只在 PID 改变后重试。
 - 设置页的按键检测同时监听 Raw Input 与 HID tap；任一路径捕获后都会统一
   停止监听，检测期间不会执行已配置动作。
 - 设置页发起的桥接子进程使用隐藏来源标记；重复实例立即以退出码 3 返回，
@@ -80,20 +83,24 @@
 - HID、入口、Qt 与应用定向测试：164 项通过，1 项平台相关跳过。
 - 托盘、启动器、应用与入口定向测试：90 项通过，1 项平台相关跳过；原生
   托盘线程 start/stop smoke test 通过且无 `ResourceWarning`。
-- 最终完整测试：958 项通过，7 项安全或平台相关跳过，退出码 0。
+- 最终完整测试：962 项通过，7 项安全或平台相关跳过，退出码 0。
 - 公开边界扫描：通过，扫描 215 个文件。
 - PyInstaller 候选构建：成功；冻结程序 `--dry-run` 和 `--help` 退出码均为
   0，隐藏注入器对无效 PID 稳定返回退出码 4。
 - 冻结重复启动实测：已有桥接运行时，设置来源子进程在 256 ms 内返回
   退出码 3，没有显示阻塞设置页轮询的模态提示框。
 - 最新候选目录：源码仓库同级的
-  `RemoteMicRC003-0.1.0-candidate-20260820-fix3/`。
+  `RemoteMicRC003-0.1.0-candidate-20260820-fix4/`。
 - 候选 EXE SHA-256：
-  `E11CFC991DDC24524790ADA48AE7C17CCE2E6C68252E9A798B85F62A21329645`。
+  `14EB1394D4E91DCB63A80CF71EE20F788E14258E5F797AE1F7FBCE2AF9027A4F`。
 - 冻结桥接实测：进程日志记录通知区域图标 ready 和 started，随后完成
   RC003 BLE/ATVV 能力连接。用户从托盘打开设置后再选择“退出桥接”，桥接
   进程消失而设置窗口继续保留；日志记录 HID tap stopped、BLE/HID/音频
   清理和 graceful bridge exit，通知区域生命周期验收通过。
+- `fix4` 管理员冻结桥接实测：HID tap 从 `injecting` 进入
+  `waiting_for_gadget_connection` 和 `attached_waiting_for_hid_io`，确认已
+  越过此前的权限失败；当前 CABLE Input / Windows WASAPI 配置再次通过
+  真实音频端点预检。两项结果仍不能替代实体逐键和非零 PCM 语音验收。
 
 基础功能实现提交：`88ea7a90144ff078b7abc62de9dedc4290043fe2`。
 
@@ -102,6 +109,9 @@
 
 后台桥接通知区域控制提交：
 `dad113ce992ea34af7dc3f74ba797543c8adc77c`。
+
+HID 注入权限顺序与稳定失败提交：
+`9daf49fc8fae1ecc5824fca4360ca0a6f968c55b`。
 
 仍未完成：真实 RC003 逐键、语音识别、断连重连、休眠恢复、长期运行与
 杀软兼容验收。

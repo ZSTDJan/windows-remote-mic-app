@@ -12,6 +12,9 @@
 后台桥接通知区域控制提交：
 `dad113ce992ea34af7dc3f74ba797543c8adc77c`
 
+HID 注入权限顺序与稳定失败提交：
+`9daf49fc8fae1ecc5824fca4360ca0a6f968c55b`
+
 本文集中维护当前 RC003 修复的自动检查与真机验收。历史发布说明不能
 替代本机当前构建的复测结果。
 
@@ -33,6 +36,11 @@
 - 结果：HID、入口、Qt 与应用定向测试 164 项通过，1 项平台相关跳过。
 - 冻结入口补充：`--rc003-hid-injector --pid 0` 稳定返回退出码 4，证明
   隐藏入口已打包且对无效目标失败关闭；这不等同于真机注入成功。
+- 管理员诊断：启用 `SeDebugPrivilege` 前查询目标 WUDFHost 返回
+  `WinError 5`，启用后对同一 PID 查询成功。`fix4` 已按正确顺序执行。
+- 冻结真机启动：状态依次进入 `injecting`、
+  `waiting_for_gadget_connection`、`attached_waiting_for_hid_io`，没有再次
+  出现权限退出码 3；尚未按实体键，所以没有把状态记为 `ready`。
 - 状态：通过。
 
 ### CHECK-FULL-001 完整自动测试与公开边界
@@ -40,7 +48,7 @@
 - 范围：RC003 全部 unittest、`build/check-public-boundary.ps1`。
 - 命令：
   `python -W error::ResourceWarning -m unittest discover -s tests -t . -p test_*.py`
-- 结果：958 项通过，7 项安全或平台相关跳过，退出码 0。
+- 结果：962 项通过，7 项安全或平台相关跳过，退出码 0。
 - 公开边界：通过，扫描 215 个文件。
 - `compileall` 与 `git diff --check`：通过。
 - 状态：通过。
@@ -51,12 +59,20 @@
 - 结果：依赖锁定、VB-CABLE 固定包校验、公开边界、完整测试、PyInstaller
   冻结与构建后 smoke check 全部通过。
 - 候选：源码仓库同级
-  `RemoteMicRC003-0.1.0-candidate-20260820-fix3/RemoteMicRC003.exe`，大小
-  4,955,866 字节。
+  `RemoteMicRC003-0.1.0-candidate-20260820-fix4/RemoteMicRC003.exe`，大小
+  4,956,113 字节。
 - SHA-256：
-  `E11CFC991DDC24524790ADA48AE7C17CCE2E6C68252E9A798B85F62A21329645`。
+  `14EB1394D4E91DCB63A80CF71EE20F788E14258E5F797AE1F7FBCE2AF9027A4F`。
 - 冻结入口：`--dry-run=0`、`--help=0`、无效 PID 注入器入口 `=4`。
 - 状态：通过，未签名且待真机验收。
+
+### CHECK-AUDIO-002 当前配置复核
+
+- 当前保存端点：`CABLE Input (VB-Audio Virtual Cable)` / `Windows WASAPI`。
+- 结果：真实 `open/start/stop/close` 预检通过。
+- 边界：本项只证明端点可打开；没有遥控器麦克风输入时，不能证明 ATVV
+  帧数、PCM 样本数或宿主语音识别已经恢复。
+- 状态：通过。
 
 ### CHECK-LAUNCH-001 重复桥接启动
 

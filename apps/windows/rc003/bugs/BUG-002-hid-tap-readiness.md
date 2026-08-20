@@ -19,6 +19,14 @@
   或收到真实 HID IO。
 - tap 的关键状态与异常使用 `print`；窗口子系统 EXE 没有可靠可见的
   stdout，因此现场日志无法解释失败发生在哪一步。
+- 2026-08-20 的 `fix3` 管理员真机启动显示隐藏注入器持续返回退出码 3。
+  外置管理员诊断进一步确认：在启用 `SeDebugPrivilege` 前，使用
+  `PROCESS_QUERY_LIMITED_INFORMATION` 查询已锁定的 WUDFHost 会返回
+  `WinError 5`；启用该权限后，对同一 PID 的进程名查询立即成功。
+- `inject_current_process()` 当时先调用 `_target_process_name()`，最后才调用
+  `enable_debug_privilege()`，所以注入尚未开始就被错误的权限顺序挡住。
+- 注入失败没有记住对应宿主 PID，状态会每两秒在 `injecting` 与 `failed`
+  之间切换，对同一系统进程反复尝试并持续刷日志。
 
 结论：一部分是设置页功能覆盖不完整，另一部分是运行状态被过早宣布且
 诊断信息写入了错误的输出通道。
@@ -33,6 +41,10 @@
   保留 PID 重查、WUDFHost 进程名、固定 Gadget 哈希、超时和退出码检查。
 - 设置页同时启动 Raw Input 与 HID tap；tap 只补齐普通输入链路缺失的
   usage，任一来源捕获到首个按下事件后统一停止，不执行已配置动作。
+- 注入器先启用 `SeDebugPrivilege`，再校验 WUDFHost 进程名、Gadget 哈希并
+  执行注入；权限、校验和未知失败使用稳定且可操作的脱敏状态名。
+- 同一 WUDFHost PID 注入失败后保持稳定 `failed`，只在宿主 PID 改变后
+  重新尝试，避免重复注入和状态刷屏。
 
 ## 验证门槛
 
@@ -54,6 +66,12 @@
   `src/ovb_rc003/qml/ButtonsPage.qml`。
 - 回归测试：`tests/test_app_wiring.py`、`tests/test_frida_compat.py`、
   `tests/test_main_entrypoint.py`、`tests/test_qt_settings_app.py`。
-- 自动验证：HID、入口、Qt 与应用定向测试 164 项通过、1 项跳过；完整
-  测试 947 项通过、7 项跳过；冻结隐藏入口无效 PID 检查返回退出码 4。
-- 对应提交：`88ea7a90144ff078b7abc62de9dedc4290043fe2`。
+- 自动验证：HID、入口、Qt 与应用定向测试 170 项通过、1 项跳过；最终
+  完整测试 962 项通过、7 项跳过；公开边界扫描 215 文件通过；冻结隐藏
+  入口无效 PID 检查返回退出码 4。
+- `fix4` 管理员冻结桥接已从 `injecting` 进入
+  `waiting_for_gadget_connection` 和 `attached_waiting_for_hid_io`，不再出现
+  退出码 3；尚未收到实体键输入，因此不能把该检查写成 `ready` 或逐键通过。
+- 初始实现提交：`88ea7a90144ff078b7abc62de9dedc4290043fe2`。
+- 权限顺序与稳定失败修复提交：
+  `9daf49fc8fae1ecc5824fca4360ca0a6f968c55b`。
