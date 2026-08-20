@@ -37,7 +37,11 @@ from ovb_rc003 import atvv_session
 from ovb_rc003 import identity
 from ovb_rc003.ble_transport_winrt import RC003BleSession, discover_candidates
 
-from .fakes.fake_winrt import FakeWinRTEnvironment, gatt_service_instance_id
+from .fakes.fake_winrt import (
+    FakeDeviceInformation,
+    FakeWinRTEnvironment,
+    gatt_service_instance_id,
+)
 
 
 def _run(coro):
@@ -103,6 +107,40 @@ class DiscoverCandidatesTests(unittest.TestCase):
         candidates = _run(discover_candidates(winrt=winrt))
         chosen = identity.select_single_candidate(candidates)
         self.assertEqual(chosen.name, "Xiaomi Bluetooth Remote 2 Pro")
+
+    def test_logs_duplicate_device_ids_without_logging_the_id(self):
+        env = FakeWinRTEnvironment(device_id="private-device-id", name="MI RC")
+        env.discovered_infos.append(
+            FakeDeviceInformation("PRIVATE-DEVICE-ID", "MI RC")
+        )
+
+        with self.assertLogs("ovb_rc003.ble_transport_winrt", level="INFO") as logs:
+            candidates = _run(discover_candidates(winrt=env.build_winrt_modules()))
+
+        self.assertEqual(len(candidates), 2)
+        combined = "\n".join(logs.output)
+        self.assertIn("total=2", combined)
+        self.assertIn("rc003_name_matches=2", combined)
+        self.assertIn("unique_device_ids=1", combined)
+        self.assertIn("duplicate_device_id_entries=1", combined)
+        self.assertNotIn("private-device-id", combined.lower())
+
+    def test_logs_distinct_device_ids_without_logging_either_id(self):
+        env = FakeWinRTEnvironment(device_id="private-device-id-a", name="MI RC")
+        env.discovered_infos.append(
+            FakeDeviceInformation("private-device-id-b", "MI RC")
+        )
+
+        with self.assertLogs("ovb_rc003.ble_transport_winrt", level="INFO") as logs:
+            candidates = _run(discover_candidates(winrt=env.build_winrt_modules()))
+
+        self.assertEqual(len(candidates), 2)
+        combined = "\n".join(logs.output)
+        self.assertIn("total=2", combined)
+        self.assertIn("unique_device_ids=2", combined)
+        self.assertIn("duplicate_device_id_entries=0", combined)
+        self.assertNotIn("private-device-id-a", combined)
+        self.assertNotIn("private-device-id-b", combined)
 
 
 class RejectsWrongIdDomainTests(unittest.TestCase):

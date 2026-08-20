@@ -279,11 +279,12 @@ class FakeWinRTEnvironment:
 
         self.device = FakeBluetoothLEDevice(device_id, self.service)
         self.discovered_info = FakeDeviceInformation(device_id, name)
+        self.discovered_infos = [self.discovered_info]
 
         self._device_information_cls = self._build_device_information_cls()
 
     def _build_device_information_cls(self):
-        discovered_info = self.discovered_info
+        discovered_infos = self.discovered_infos
 
         class _FakeDeviceInformation:
             @staticmethod
@@ -295,7 +296,7 @@ class FakeWinRTEnvironment:
                 assert selector == PAIRED_DEVICE_SELECTOR, (
                     f"find_all_async_aqs_filter received an unexpected selector: {selector!r}"
                 )
-                return [discovered_info]
+                return list(discovered_infos)
 
         return _FakeDeviceInformation
 

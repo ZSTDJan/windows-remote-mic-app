@@ -87,6 +87,7 @@ already-torn-down session can never be processed after a reconnect.
 from __future__ import annotations
 
 import asyncio
+import logging
 import queue
 import threading
 import uuid
@@ -104,6 +105,7 @@ DisconnectedCallback = Callable[[], None]
 
 _QUEUE_MAXSIZE = 64
 _WORKER_POLL_SECONDS = 0.2
+_logger = logging.getLogger(__name__)
 
 
 class WinRTUnavailableError(Exception):
@@ -191,11 +193,37 @@ async def discover_candidates(
     devices = await winrt.device_information.find_all_async_aqs_filter(selector)
 
     candidates: List[identity.RC003Candidate] = []
+    unique_device_ids = set()
+    duplicate_device_id_entries = 0
+    missing_device_ids = 0
+    rc003_name_matches = 0
     for info in devices:
         name = getattr(info, "name", "") or ""
+        device_id = getattr(info, "id", "") or ""
+        if device_id:
+            normalized_device_id = str(device_id).casefold()
+            if normalized_device_id in unique_device_ids:
+                duplicate_device_id_entries += 1
+            else:
+                unique_device_ids.add(normalized_device_id)
+        else:
+            missing_device_ids += 1
+        if identity.matches_rc003_name(name):
+            rc003_name_matches += 1
         candidates.append(
             identity.RC003Candidate(name=name, hardware_match=False, handle=info)
         )
+
+    _logger.info(
+        "paired BLE discovery: total=%d rc003_name_matches=%d "
+        "unique_device_ids=%d duplicate_device_id_entries=%d "
+        "missing_device_ids=%d",
+        len(candidates),
+        rc003_name_matches,
+        len(unique_device_ids),
+        duplicate_device_id_entries,
+        missing_device_ids,
+    )
     return candidates
 
 
