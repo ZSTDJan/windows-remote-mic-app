@@ -32,6 +32,30 @@ class SemanticApplicationActionTests(unittest.TestCase):
 
         self.assertEqual(shortcuts, [])
 
+    def test_missing_start_menu_environment_never_searches_the_working_directory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            working_directory = Path(tmp)
+            fake_start_menu = (
+                working_directory
+                / "Microsoft"
+                / "Windows"
+                / "Start Menu"
+                / "Programs"
+            )
+            fake_start_menu.mkdir(parents=True)
+            (fake_start_menu / "Codex.lnk").write_bytes(b"shortcut")
+            original_cwd = Path.cwd()
+            try:
+                os.chdir(working_directory)
+                with mock.patch.dict(os.environ, {}, clear=True):
+                    shortcuts = list(
+                        action_executor._start_menu_shortcuts(("Codex",))
+                    )
+            finally:
+                os.chdir(original_cwd)
+
+        self.assertEqual(shortcuts, [])
+
     def test_resolves_a_reference_application_action_to_a_real_executable(self):
         with tempfile.TemporaryDirectory() as tmp:
             executable = Path(tmp) / "Codex.exe"

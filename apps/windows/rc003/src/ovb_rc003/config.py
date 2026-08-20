@@ -107,7 +107,7 @@ def _find_forbidden_key_paths(
     if isinstance(node, dict):
         for key, value in node.items():
             child_path = f"{path}.{key}" if path else str(key)
-            if key in FORBIDDEN_KEYS:
+            if isinstance(key, str) and key.casefold() in FORBIDDEN_KEYS:
                 found.append(child_path)
             found.extend(_find_forbidden_key_paths(value, child_path))
     elif isinstance(node, list):

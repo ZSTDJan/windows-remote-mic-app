@@ -104,18 +104,14 @@ def _candidate_paths(executable_names: Sequence[str]) -> Iterable[Path]:
 def _start_menu_shortcuts(
     names: Sequence[str], *, exact_only: bool = False
 ) -> Iterable[Path]:
-    roots = [
-        Path(os.environ.get("APPDATA", ""))
-        / "Microsoft"
-        / "Windows"
-        / "Start Menu"
-        / "Programs",
-        Path(os.environ.get("PROGRAMDATA", ""))
-        / "Microsoft"
-        / "Windows"
-        / "Start Menu"
-        / "Programs",
-    ]
+    roots = []
+    for variable in ("APPDATA", "PROGRAMDATA"):
+        raw = os.environ.get(variable, "").strip()
+        if not raw:
+            continue
+        roots.append(
+            Path(raw) / "Microsoft" / "Windows" / "Start Menu" / "Programs"
+        )
     wanted = tuple(name.casefold() for name in names)
     for root in roots:
         if not root.is_dir():

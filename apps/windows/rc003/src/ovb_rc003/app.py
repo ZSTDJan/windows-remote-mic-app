@@ -102,12 +102,14 @@ def open_configured_application(action: key_mapping.ButtonAction) -> bool:
 class RC003App:
     def __init__(self) -> None:
         self._config_root = config.config_root()
-        self._config = config.load_config(config.config_path(self._config_root))
+        self._config_path = config.config_path(self._config_root)
+        self._config = config.load_config(self._config_path)
+        self._config_mtime_ns = self._settings_file_mtime_ns(self._config_path)
         self._bindings_path = config.key_bindings_path(self._config_root)
         self._bindings = config.load_key_bindings(
             self._bindings_path
         )
-        self._bindings_mtime_ns = self._bindings_file_mtime_ns()
+        self._bindings_mtime_ns = self._settings_file_mtime_ns(self._bindings_path)
         self._button_gestures = button_gesture.ButtonGestureDispatcher(
             is_action_configured=self._is_button_action_configured,
             is_repeatable=self._is_button_repeatable,
@@ -118,6 +120,7 @@ class RC003App:
             key_mapping.VoiceTriggerMode(self._config["voice_trigger_mode"])
         )
         self._voice_hotkey = hotkey.HotkeySpec.parse(self._config["voice_hotkey"])
+        self._pending_voice_settings = None
         self._voice_audio_start_fallback_pending = False
         self._voice_audio_started_waiting_for_legacy_f5 = False
         self._voice_toggle_close_pending = False
@@ -125,6 +128,11 @@ class RC003App:
         # threads. Serialize the voice state machine so one physical press
         # cannot race into two host shortcut deliveries.
         self._voice_trigger_lock = threading.Lock()
+        self._logger.info(
+            "startup: voice settings active: trigger_mode=%s hotkey=%s",
+            self._voice.trigger_mode.value,
+            self._voice_hotkey.serialize(),
+        )
         # One RC003 microphone press is reported independently by the legacy
         # F5 hook, HID/Raw Input, the ATVV mic opcode, and sometimes
         # AUDIO_STARTED first. Keep all of those reports in one gesture until
@@ -763,16 +771,85 @@ class RC003App:
 
     # -- HID button events --------------------------------------------------
 
-    def _bindings_file_mtime_ns(self) -> int:
+    @staticmethod
+    def _settings_file_mtime_ns(path: Path) -> int:
         try:
-            return self._bindings_path.stat().st_mtime_ns
+            return path.stat().st_mtime_ns
         except OSError:
             return -1
 
-    def _reload_bindings_if_changed(self) -> None:
-        """Apply settings edits without requiring a bridge restart."""
+    def _voice_settings_idle_locked(self) -> bool:
+        return not (
+            self._voice.active
+            or self._voice_toggle_close_pending
+            or self._voice_mic_gesture_active
+            or self._voice_audio_stream_active
+            or self._voice_legacy_transform_key_down
+            or self._voice_legacy_transform_session
+        )
 
-        current_mtime_ns = self._bindings_file_mtime_ns()
+    def _apply_voice_settings_locked(
+        self,
+        trigger_mode: key_mapping.VoiceTriggerMode,
+        voice_hotkey: hotkey.HotkeySpec,
+    ) -> None:
+        self._voice = voice_controller.VoiceController(trigger_mode)
+        self._voice_hotkey = voice_hotkey
+        self._config["voice_trigger_mode"] = trigger_mode.value
+        self._config["voice_hotkey"] = voice_hotkey.serialize()
+        self._logger.info(
+            "settings voice configuration applied: trigger_mode=%s hotkey=%s",
+            trigger_mode.value,
+            voice_hotkey.serialize(),
+        )
+
+    def _apply_pending_voice_settings_if_idle_locked(self) -> None:
+        if self._pending_voice_settings is None or not self._voice_settings_idle_locked():
+            return
+        trigger_mode, voice_hotkey = self._pending_voice_settings
+        self._pending_voice_settings = None
+        self._apply_voice_settings_locked(trigger_mode, voice_hotkey)
+
+    def _reload_settings_if_changed(self) -> None:
+        """Apply mapping and voice-setting edits without a bridge restart."""
+
+        current_config_mtime_ns = self._settings_file_mtime_ns(self._config_path)
+        if current_config_mtime_ns != self._config_mtime_ns:
+            try:
+                refreshed_config = config.load_config(self._config_path)
+                trigger_mode = key_mapping.VoiceTriggerMode(
+                    refreshed_config["voice_trigger_mode"]
+                )
+                voice_hotkey = hotkey.HotkeySpec.parse(
+                    refreshed_config["voice_hotkey"]
+                )
+            except Exception as exc:  # noqa: BLE001 - keep the last valid settings
+                self._logger.warning("voice settings reload skipped: %s", exc)
+                self._config_mtime_ns = current_config_mtime_ns
+            else:
+                self._config_mtime_ns = current_config_mtime_ns
+                with self._voice_trigger_lock:
+                    current_settings = (
+                        self._voice.trigger_mode,
+                        self._voice_hotkey.serialize(),
+                    )
+                    refreshed_settings = (trigger_mode, voice_hotkey.serialize())
+                    if refreshed_settings != current_settings:
+                        if self._voice_settings_idle_locked():
+                            self._pending_voice_settings = None
+                            self._apply_voice_settings_locked(trigger_mode, voice_hotkey)
+                        else:
+                            self._pending_voice_settings = (trigger_mode, voice_hotkey)
+                            self._logger.info(
+                                "settings voice configuration deferred until idle: "
+                                "trigger_mode=%s hotkey=%s",
+                                trigger_mode.value,
+                                voice_hotkey.serialize(),
+                            )
+                    else:
+                        self._pending_voice_settings = None
+
+        current_mtime_ns = self._settings_file_mtime_ns(self._bindings_path)
         if current_mtime_ns == self._bindings_mtime_ns:
             return
         try:
@@ -813,7 +890,7 @@ class RC003App:
                 button_id,
             )
             return
-        self._reload_bindings_if_changed()
+        self._reload_settings_if_changed()
         if button_id == "mic":
             if not is_pressed:
                 with self._voice_trigger_lock:
@@ -830,6 +907,7 @@ class RC003App:
                         )
                     ):
                         self._finish_voice_mic_gesture()
+                    self._apply_pending_voice_settings_if_idle_locked()
                 return
             with self._voice_trigger_lock:
                 if self._voice_toggle_close_pending:
@@ -916,7 +994,7 @@ class RC003App:
     def _on_button_trigger(
         self, button_id: str, trigger: button_gesture.ButtonTrigger
     ) -> None:
-        self._reload_bindings_if_changed()
+        self._reload_settings_if_changed()
         action = key_mapping.button_action_for(
             self._bindings,
             button_id,
@@ -986,6 +1064,11 @@ class RC003App:
     # -- ATVV control-channel events (mic button + audio start/stop) ------
 
     def _on_control_event(self, event: object) -> None:
+        # Some machines expose no usable Raw Input/F5 edge for the mic key,
+        # leaving AudioStarted as the first event of the next physical press.
+        # Refresh here as well so saved voice mode/hotkey edits do not depend
+        # on an ordinary HID event arriving first.
+        self._reload_settings_if_changed()
         if isinstance(event, CapsReceived):
             self._logger.info(
                 "voice capabilities received: version=0x%04x sample_rate=%s frame_size=%s",
@@ -1135,6 +1218,7 @@ class RC003App:
                         "voice toggle remains active after physical release; reopening device mic"
                     )
                     self._ble_session.send_mic_open_threadsafe()
+                self._apply_pending_voice_settings_if_idle_locked()
 
     def _handle_mic_button_pressed(
         self,

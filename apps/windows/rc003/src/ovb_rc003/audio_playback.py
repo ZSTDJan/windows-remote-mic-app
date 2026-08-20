@@ -191,11 +191,20 @@ class EndpointPlaybackSink:
     def close(self) -> None:
         if self._stream is not None:
             stream = self._stream
-            self._stream = None
             try:
                 stream.stop()
-            finally:
+            except Exception:
+                # A successful close is sufficient proof that PortAudio no
+                # longer owns the endpoint even if stop() itself reported an
+                # error. Only a close failure requires retaining the stream
+                # handle so cleanup can retry it.
+                pass
+            try:
                 stream.close()
+            except Exception:
+                self._stream = stream
+                raise
+            self._stream = None
 
 
 def preflight_output_endpoint(endpoint_name: str, host_api: str = "") -> None:

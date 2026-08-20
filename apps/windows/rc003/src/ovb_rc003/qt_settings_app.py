@@ -1023,7 +1023,10 @@ def _load_qt_classes() -> dict:
                     "已保存 DJI Mic 2 设备选择。它使用 Windows 系统录音输入，不需要启动 RC003 桥。"
                 )
             else:
-                self._set_status_message("已保存。重启桥接以应用新的连接/输出设置。")
+                self._set_status_message(
+                    "已保存。按键映射和语音触发将在下一次按键时应用；"
+                    "连接/输出设置需重启桥接。"
+                )
             return True
 
         # -- properties ---------------------------------------------------

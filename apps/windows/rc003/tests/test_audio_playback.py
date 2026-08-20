@@ -253,5 +253,55 @@ class PlaybackPreflightTests(unittest.TestCase):
         self.assertNotIn("private endpoint detail", str(ctx.exception))
 
 
+class PlaybackCloseOwnershipTests(unittest.TestCase):
+    def test_stop_failure_does_not_hide_a_successful_close(self):
+        class Stream:
+            def __init__(self):
+                self.close_calls = 0
+
+            def stop(self):
+                raise RuntimeError("stop failed")
+
+            def close(self):
+                self.close_calls += 1
+
+        stream = Stream()
+        sink = EndpointPlaybackSink("CABLE Input")
+        sink._stream = stream
+
+        sink.close()
+
+        self.assertEqual(stream.close_calls, 1)
+        self.assertIsNone(sink._stream)
+
+    def test_close_failure_retains_stream_for_a_later_retry(self):
+        class Stream:
+            def __init__(self):
+                self.close_calls = 0
+                self.fail_close = True
+
+            def stop(self):
+                pass
+
+            def close(self):
+                self.close_calls += 1
+                if self.fail_close:
+                    raise RuntimeError("close failed")
+
+        stream = Stream()
+        sink = EndpointPlaybackSink("CABLE Input")
+        sink._stream = stream
+
+        with self.assertRaises(RuntimeError):
+            sink.close()
+        self.assertIs(sink._stream, stream)
+
+        stream.fail_close = False
+        sink.close()
+
+        self.assertEqual(stream.close_calls, 2)
+        self.assertIsNone(sink._stream)
+
+
 if __name__ == "__main__":
     unittest.main()

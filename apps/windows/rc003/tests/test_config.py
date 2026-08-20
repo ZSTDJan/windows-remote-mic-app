@@ -138,6 +138,18 @@ class SaveConfigPrivacyGuardTests(unittest.TestCase):
             self.assertIn("bindings.menu.metadata.address", str(ctx.exception))
             self.assertFalse(path.exists())
 
+    def test_rejects_forbidden_key_regardless_of_letter_case(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.json"
+            bad_config = config.default_config()
+            bad_config["metadata"] = {"Bluetooth_Address": "private"}
+
+            with self.assertRaises(config.ConfigPrivacyError) as ctx:
+                config.save_config(path, bad_config)
+
+            self.assertIn("metadata.Bluetooth_Address", str(ctx.exception))
+            self.assertFalse(path.exists())
+
     def test_rejects_forbidden_key_nested_inside_a_list_of_dicts(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "config.json"

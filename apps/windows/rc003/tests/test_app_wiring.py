@@ -207,6 +207,67 @@ class _AppWiringTestCase(unittest.TestCase):
     def _drain_event_loop(self):
         self._loop.run_until_complete(asyncio.sleep(0))
 
+    def _save_voice_settings(self, *, mode: str, hotkey_text: str) -> None:
+        refreshed = config.load_config(self.app._config_path)
+        refreshed["voice_trigger_mode"] = mode
+        refreshed["voice_hotkey"] = hotkey_text
+        config.save_config(self.app._config_path, refreshed)
+
+
+class LiveSettingsReloadTests(_AppWiringTestCase):
+    def test_voice_mode_and_hotkey_reload_while_idle(self):
+        self._save_voice_settings(mode="hold", hotkey_text="ctrl+l")
+
+        self.app._reload_settings_if_changed()
+
+        self.assertEqual(self.app._voice.trigger_mode, key_mapping.VoiceTriggerMode.HOLD)
+        self.assertEqual(self.app._voice_hotkey.serialize(), "ctrl+l")
+        self.assertIsNone(self.app._pending_voice_settings)
+
+    def test_audio_only_trigger_reloads_voice_settings_before_dispatch(self):
+        self._save_voice_settings(mode="hold", hotkey_text="ctrl+l")
+        delivered = []
+
+        with mock.patch.object(
+            win32_input,
+            "send_voice_key_combo_down",
+            side_effect=lambda tokens: delivered.append(tokens),
+        ):
+            self.app._on_control_event(AudioStarted(session_id=1))
+
+        self.assertEqual(self.app._voice.trigger_mode, key_mapping.VoiceTriggerMode.HOLD)
+        self.assertEqual(self.app._voice_hotkey.serialize(), "ctrl+l")
+        self.assertEqual(delivered, [("ctrl", "l")])
+
+    def test_voice_settings_reload_is_deferred_until_active_toggle_closes(self):
+        self.app._voice.on_mic_button_pressed()
+        self._save_voice_settings(mode="hold", hotkey_text="ctrl+l")
+
+        self.app._reload_settings_if_changed()
+
+        self.assertEqual(self.app._voice.trigger_mode, key_mapping.VoiceTriggerMode.TOGGLE)
+        self.assertEqual(self.app._voice_hotkey.serialize(), "ralt+space")
+        self.assertIsNotNone(self.app._pending_voice_settings)
+
+        self.app._voice.on_mic_button_pressed()
+        with self.app._voice_trigger_lock:
+            self.app._apply_pending_voice_settings_if_idle_locked()
+
+        self.assertEqual(self.app._voice.trigger_mode, key_mapping.VoiceTriggerMode.HOLD)
+        self.assertEqual(self.app._voice_hotkey.serialize(), "ctrl+l")
+        self.assertIsNone(self.app._pending_voice_settings)
+
+    def test_invalid_voice_settings_keep_the_last_valid_runtime_values(self):
+        refreshed = config.load_config(self.app._config_path)
+        refreshed["voice_hotkey"] = "ctrl"
+        config.save_config(self.app._config_path, refreshed)
+
+        self.app._reload_settings_if_changed()
+
+        self.assertEqual(self.app._voice.trigger_mode, key_mapping.VoiceTriggerMode.TOGGLE)
+        self.assertEqual(self.app._voice_hotkey.serialize(), "ralt+space")
+        self.assertIsNone(self.app._pending_voice_settings)
+
 
 class CandidateResolutionWiringTests(_AppWiringTestCase):
     def test_connect_once_uses_connectable_candidate_resolver(self):
