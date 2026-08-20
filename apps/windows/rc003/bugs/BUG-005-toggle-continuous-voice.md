@@ -1,6 +1,7 @@
 # BUG-005 切换模式没有持续语音
 
-状态：自动验证通过，`fix5` 待本机真机验收
+状态：`fix5` 完成持续传音设计，但异机复测发现多来源重复触发；后续见
+`BUG-008-toggle-multi-source-gesture.md`
 
 记录日期：2026-08-20
 
@@ -50,3 +51,10 @@
   `tests/test_app_wiring.py`、`tests/test_ble_transport_contract.py`。
 - 完整自动验证：980 项通过、7 项跳过；公开边界扫描 223 个文件通过。
 - 对应提交：`ca5b69885a3796901dc36f1578cb7a754d73f140`。
+
+## 后续复测
+
+`fix6` 已证明第一次释放后能够获得约 3.6 秒 `result=signal` 的音频，但同一
+实体按下的 `AudioStarted`、legacy F5、HID 和 ATVV mic 事件仍会被重复计数，
+导致部分短按会话立即发送 `MIC_CLOSE`。该独立接线缺陷记录为 `BUG-008`，
+不改写本记录对持续传音生命周期的历史结论。

@@ -1,6 +1,6 @@
 # BUG-007 配对列表仅一个设备但 WinRT 返回两个候选
 
-状态：定向自动验证通过，`fix6` 待异机真机验收
+状态：`fix6` 异机真机连接验收通过
 
 记录日期：2026-08-20
 
@@ -91,6 +91,11 @@ BLE/ATVV 连接；随后出现的日期时间输入是未被桥接截获的遥�
 `fix6` 自动验证：身份、BLE 合同与应用接线定向测试 40 项通过；完整测试
 990 项通过、7 项跳过；公开边界扫描 224 个文件、`compileall` 与
 `git diff --check` 通过。
+
+异机真机结果：两个名称匹配候选分别得到一个 `reachable=True` 和一个
+`reachable=False`，随后日志记录 `exactly one RC003 candidate resolved`、
+`voice capabilities received`，HID tap 进入 `ready/hid_io_verified`。因此
+多候选身份解析已通过；后续切换语音问题属于独立的 `BUG-008`。
 
 `fix6` 便携 ZIP：
 `RemoteMicRC003-0.1.0-candidate-20260820-fix6-portable.zip`，SHA-256
