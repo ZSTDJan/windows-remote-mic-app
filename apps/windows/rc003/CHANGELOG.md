@@ -8,11 +8,14 @@
 
 ## [Unreleased] — 2026-08-20
 
-状态：自动检查通过，当前机器的 RC003 逐键与语音复测尚未完成；本节
-不得作为真机通过声明。维护证据与验收入口见 `MAINTENANCE.md`、
+状态：自动检查通过；按住说话已在当前机器产生非零 PCM 和可见识别文字，
+但 `fix5` 的切换语音与桥接运行时按键检测仍待复测。本节不得扩大为完整
+真机通过声明。维护证据与验收入口见 `MAINTENANCE.md`、
 `bugs/BUG-001-audio-endpoint.md`、`bugs/BUG-002-hid-tap-readiness.md`
 、`bugs/BUG-003-duplicate-bridge-dialog.md`、
-`bugs/BUG-004-background-bridge-tray.md` 和 `TESTING.md`。
+`bugs/BUG-004-background-bridge-tray.md`、
+`bugs/BUG-005-toggle-continuous-voice.md`、
+`bugs/BUG-006-live-bridge-key-detection.md` 和 `TESTING.md`。
 
 ### 修复
 
@@ -37,6 +40,14 @@
   打开设置，右键可选择“打开设置”或“退出桥接”。托盘退出会投递到 asyncio
   主线程并执行既有 BLE、HID、语音热键、音频与互斥锁清理，不依赖任务
   管理器强杀。关闭设置窗口仍只关闭设置，不会意外中断桥接。
+- **切换模式短按后没有持续语音**：切换状态现在只由两次独立按下改变；
+  第一次松开产生的 `AudioStopped` 不再关闭宿主，而会续发 `MIC_OPEN`；
+  第二次按下发送宿主关闭快捷键和线程安全 `MIC_CLOSE`，竞态音频事件不会
+  重新开麦。按住说话模式保持原行为。
+- **从托盘打开设置后真实按键检测失效**：设置页检测到后台桥接已持有 HID
+  资源时，通过一次性本地文件 IPC 请求后台捕获下一键；后台回传逻辑按键并
+  吞掉该次 down/up，不执行映射。后台未运行时仍使用本地 Raw Input 与
+  HID tap。
 
 ### 变更
 

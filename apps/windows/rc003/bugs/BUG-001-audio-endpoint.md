@@ -1,6 +1,6 @@
 # BUG-001 语音已触发但无音频
 
-状态：检查点待实测
+状态：按住说话真机通过；切换模式见 BUG-005 待实测
 
 记录日期：2026-08-20
 
@@ -18,6 +18,8 @@ RC003 麦克风键能够唤起和结束宿主语音输入，但说话没有识�
   `CABLE Input / Windows DirectSound` 打开输出流成功。
 - 本机合成回环检查已从 CABLE Input 写入并由 CABLE Output 捕获到非零
   音频，证明 VB-CABLE 驱动链路本身可工作。
+- `fix4` 真机复测已记录约 2.4 秒非零 PCM，汇总结果为 `signal`，宿主产生
+  可见识别文字，证明端点、ATVV、播放和按住说话链路已经贯通。
 
 结论：问题位于应用的端点枚举、选择和保存校验，不是 RC003 BLE/ATVV
 传输失败，也不是 VB-CABLE 安装失败。
@@ -42,8 +44,10 @@ RC003 麦克风键能够唤起和结束宿主语音输入，但说话没有识�
 - 多个 CABLE Input 视图优先选 WASAPI，缺失时选 DirectSound。
 - 端点预检真实 open/start/close 失败时不保存。
 
-人工检查：见 `../TESTING.md` 的 `TEST-VOICE-001` 至
-`TEST-VOICE-003`。在这些检查完成前不得写“真机语音已通过”。
+人工检查：按住说话见 `../TESTING.md` 的 `TEST-VOICE-001`、
+`TEST-VOICE-002`，已经通过；切换持续语音由
+`BUG-005-toggle-continuous-voice.md` 与 `TEST-VOICE-004` 单独收口。断连、
+休眠等恢复能力仍见 `TEST-VOICE-003`，不得扩大为全部语音场景已通过。
 
 ## 实施与提交
 
