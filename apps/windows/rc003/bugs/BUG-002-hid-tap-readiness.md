@@ -56,4 +56,4 @@
   `tests/test_main_entrypoint.py`、`tests/test_qt_settings_app.py`。
 - 自动验证：HID、入口、Qt 与应用定向测试 164 项通过、1 项跳过；完整
   测试 947 项通过、7 项跳过；冻结隐藏入口无效 PID 检查返回退出码 4。
-- 对应提交：待提交后回写。
+- 对应提交：`88ea7a90144ff078b7abc62de9dedc4290043fe2`。
