@@ -84,7 +84,31 @@ HID 注入权限顺序与稳定失败提交：
   配对。回传 `app.log` 中以 `paired BLE discovery` 开头的行。
 - 判定：`unique_device_ids=1` 进入同 ID 去重修复；`=2` 进入隐藏记录或显式
   候选选择调查。本检查点不修改原有失败关闭规则。
-- 状态：自动验证通过，待异机日志。
+- 状态：异机取证完成；两个不同设备 ID、不同容器，隐藏节点删除后被配对
+  数据库重建。
+
+### CHECK-BLE-003 多候选 ATVV 可用性解析
+
+- 前置：Windows WinRT 返回两个不同 RC003 配对记录，其中普通蓝牙界面只
+  显示当前使用的一个；删除隐藏 PnP 节点后扫描会自动重建。
+- 单候选：不得执行预探测，直接沿用原有连接路径。
+- 多候选：每个候选使用 UNCACHED 查询 ATVV 语音服务，探测完成必须关闭
+  临时 service/device；只有一个可用时选择它。
+- 失败关闭：零个可用报告无可达候选，两个可用仍报告歧义；不得按候选
+  顺序、名称语言或持久化 ID 选择。
+- 隐私：持久日志只允许候选序号、总数、可达布尔值和异常类型。
+- 自动结果：身份、BLE 合同与应用接线定向测试 40 项通过；完整测试 990 项
+  通过、7 项跳过；公开边界扫描 224 个文件通过；`compileall` 与
+  `git diff --check` 通过。
+- 真机步骤：不再修改异机配对状态；运行 `fix6`，回传包含
+  `ATVV candidate probe result`、`exactly one RC003 candidate resolved`、
+  `voice capabilities received` 的日志，再测试两种语音生命周期。
+- 候选：`RemoteMicRC003-0.1.0-candidate-20260820-fix6-portable.zip`，
+  SHA-256
+  `60DE6082BEE84824073713B4235FB8B71A3356B0B5A955368D735AFCBF1820C3`；
+  ZIP 内 EXE SHA-256
+  `A168A28514D635725D2B08BA051986FDED4F52E725BFAD23AB77477B725C27DA`。
+- 状态：自动验证与构建通过，待异机验收。
 
 ### CHECK-AUDIO-002 当前配置复核
 
