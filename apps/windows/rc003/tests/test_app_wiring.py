@@ -454,13 +454,14 @@ class HostHotkeyFailureSuppressesMicOpenTests(_AppWiringTestCase):
         self.assertTrue(self.app._voice.active)
         self.assertEqual(self.app._ble_session.mic_open_calls, 0)
 
-    def test_next_mic_button_after_the_late_duplicate_closes_toggle_voice(self):
+    def test_next_mic_button_after_release_closes_toggle_voice(self):
         hotkey_calls = []
         original = win32_input.send_voice_key_combo_tap
         win32_input.send_voice_key_combo_tap = lambda tokens: hotkey_calls.append(tokens)
         try:
             self.app._on_control_event(AudioStarted(session_id=1))
             self.app._on_control_event(MicButtonPressed())
+            self.app._on_control_event(AudioStopped())
             self.app._on_control_event(MicButtonPressed())
         finally:
             win32_input.send_voice_key_combo_tap = original
@@ -469,6 +470,79 @@ class HostHotkeyFailureSuppressesMicOpenTests(_AppWiringTestCase):
         self.assertFalse(self.app._voice.active)
         self.assertTrue(self.app._voice_toggle_close_pending)
         self.assertEqual(self.app._ble_session.mic_close_calls, 1)
+
+    def test_toggle_audio_started_f5_hid_and_atvv_are_one_physical_press(self):
+        hotkey_calls = []
+        original = win32_input.send_voice_key_combo_tap
+        win32_input.send_voice_key_combo_tap = lambda tokens: hotkey_calls.append(tokens)
+        try:
+            self.app._on_control_event(AudioStarted(session_id=1))
+            self.app._on_legacy_key_event(0x74, True)
+            self.app._on_button_event("mic", True, event_source="hid")
+            self.app._on_control_event(MicButtonPressed())
+
+            self.assertEqual(hotkey_calls, [("ralt", "space")])
+            self.assertTrue(self.app._voice.active)
+            self.assertFalse(self.app._voice_toggle_close_pending)
+
+            self.app._on_legacy_key_event(0x74, False)
+            self.app._on_button_event("mic", False, event_source="hid")
+            self.app._on_control_event(AudioStopped())
+            self.app._on_button_event("mic", True, event_source="hid")
+        finally:
+            win32_input.send_voice_key_combo_tap = original
+
+        self.assertEqual(
+            hotkey_calls,
+            [("ralt", "space"), ("ralt", "space")],
+        )
+        self.assertFalse(self.app._voice.active)
+        self.assertTrue(self.app._voice_toggle_close_pending)
+        self.assertEqual(self.app._ble_session.mic_close_calls, 1)
+
+    def test_toggle_hid_atvv_audio_and_late_f5_are_one_physical_press(self):
+        hotkey_calls = []
+        original = win32_input.send_voice_key_combo_tap
+        win32_input.send_voice_key_combo_tap = lambda tokens: hotkey_calls.append(tokens)
+        try:
+            self.app._on_button_event("mic", True, event_source="hid")
+            self.app._on_control_event(MicButtonPressed())
+            self.app._on_control_event(AudioStarted(session_id=1))
+            self.app._on_legacy_key_event(0x74, True)
+        finally:
+            win32_input.send_voice_key_combo_tap = original
+
+        self.assertEqual(hotkey_calls, [("ralt", "space")])
+        self.assertTrue(self.app._voice.active)
+        self.assertFalse(self.app._voice_toggle_close_pending)
+
+    def test_hold_mode_multi_source_press_still_sends_one_down_and_one_up(self):
+        self.app._voice.trigger_mode = key_mapping.VoiceTriggerMode.HOLD
+        calls = []
+        original_down = win32_input.send_voice_key_combo_down
+        original_up = win32_input.send_voice_key_combo_up
+        win32_input.send_voice_key_combo_down = lambda tokens: calls.append(("down", tokens))
+        win32_input.send_voice_key_combo_up = lambda tokens: calls.append(("up", tokens))
+        try:
+            self.app._on_button_event("mic", True, event_source="hid")
+            self.app._on_control_event(MicButtonPressed())
+            self.app._on_control_event(AudioStarted(session_id=1))
+            self.app._on_legacy_key_event(0x74, True)
+            self.app._on_legacy_key_event(0x74, False)
+            self.app._on_button_event("mic", False, event_source="hid")
+            self.app._on_control_event(AudioStopped())
+        finally:
+            win32_input.send_voice_key_combo_down = original_down
+            win32_input.send_voice_key_combo_up = original_up
+
+        self.assertEqual(
+            calls,
+            [
+                ("down", ("ralt", "space")),
+                ("up", ("ralt", "space")),
+            ],
+        )
+        self.assertFalse(self.app._voice.active)
 
     def test_toggle_audio_stop_reopens_device_mic_after_first_short_press(self):
         hotkey_calls = []

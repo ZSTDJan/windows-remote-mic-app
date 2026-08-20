@@ -125,6 +125,14 @@ class RC003App:
         # threads. Serialize the voice state machine so one physical press
         # cannot race into two host shortcut deliveries.
         self._voice_trigger_lock = threading.Lock()
+        # One RC003 microphone press is reported independently by the legacy
+        # F5 hook, HID/Raw Input, the ATVV mic opcode, and sometimes
+        # AUDIO_STARTED first. Keep all of those reports in one gesture until
+        # the physical/audio release boundary so toggle mode changes state
+        # exactly once per real press regardless of arrival order.
+        self._voice_mic_gesture_active = False
+        self._voice_mic_gesture_audio_started = False
+        self._voice_mic_gesture_sources_down: set[str] = set()
         self._voice_raw_input_trigger_pending = False
         # When the built-in HOLD shortcut is selected, the low-level F5 hook
         # can deliver one right-Alt edge through the physicalized low-level
@@ -432,6 +440,7 @@ class RC003App:
                 self._voice_audio_started_waiting_for_legacy_f5 = False
                 self._voice_toggle_close_pending = False
                 self._voice_raw_input_trigger_pending = False
+                self._finish_voice_mic_gesture()
                 reset_action = self._voice.reset()
                 if reset_action is not None and not self._apply_voice_action(reset_action):
                     # _apply_voice_action() already logged the specific failure.
@@ -518,6 +527,31 @@ class RC003App:
         return self._voice.trigger_mode == key_mapping.VoiceTriggerMode.HOLD and (
             self._voice_hotkey.serialize() in {"ralt", "lctrl+win", "lctrl+lwin"}
         )
+
+    def _begin_voice_mic_gesture(
+        self, source: str, *, physical_down: bool = False
+    ) -> bool:
+        """Claim one physical mic press for its first arriving event source.
+
+        The caller holds ``_voice_trigger_lock``. Later sources are recorded
+        for release tracking but must not toggle the host voice state again.
+        """
+
+        if self._voice_mic_gesture_active:
+            if physical_down:
+                self._voice_mic_gesture_sources_down.add(source)
+            return False
+        self._voice_mic_gesture_active = True
+        self._voice_mic_gesture_audio_started = source == "audio_started"
+        self._voice_mic_gesture_sources_down = {source} if physical_down else set()
+        return True
+
+    def _finish_voice_mic_gesture(self) -> None:
+        """Release the current cross-source mic gesture latch."""
+
+        self._voice_mic_gesture_active = False
+        self._voice_mic_gesture_audio_started = False
+        self._voice_mic_gesture_sources_down.clear()
 
     def _emit_legacy_voice_key(
         self,
@@ -641,6 +675,7 @@ class RC003App:
                 "mic",
                 is_pressed,
                 host_action_handled=host_action_handled,
+                event_source="legacy_f5",
             )
             self._voice_legacy_transform_emitted = False
 
@@ -713,7 +748,12 @@ class RC003App:
         self._logger.info("settings mappings reloaded from disk")
 
     def _on_button_event(
-        self, button_id: str, is_pressed: bool, *, host_action_handled: bool = False
+        self,
+        button_id: str,
+        is_pressed: bool,
+        *,
+        host_action_handled: bool = False,
+        event_source: str = "hid",
     ) -> None:
         if button_id in self._key_detection_suppressed_buttons:
             if not is_pressed:
@@ -738,16 +778,31 @@ class RC003App:
         self._reload_bindings_if_changed()
         if button_id == "mic":
             if not is_pressed:
+                with self._voice_trigger_lock:
+                    self._voice_mic_gesture_sources_down.discard(event_source)
+                    if (
+                        self._voice_mic_gesture_active
+                        and not self._voice_mic_gesture_sources_down
+                        and not self._voice_mic_gesture_audio_started
+                        and not self._voice_toggle_close_pending
+                    ):
+                        self._finish_voice_mic_gesture()
                 return
             with self._voice_trigger_lock:
                 if self._voice_toggle_close_pending:
+                    if self._voice_mic_gesture_active:
+                        self._voice_mic_gesture_sources_down.add(event_source)
                     self._logger.info(
                         "voice physical trigger ignored: toggle close still pending"
                     )
                     return
-                if self._voice_raw_input_trigger_pending:
+                if not self._begin_voice_mic_gesture(
+                    event_source,
+                    physical_down=True,
+                ):
                     self._logger.info(
-                        "voice physical trigger ignored: duplicate edge already in progress"
+                        "voice physical trigger ignored: same mic gesture source=%s",
+                        event_source,
                     )
                     return
                 if (
@@ -902,22 +957,19 @@ class RC003App:
                     self._logger.info(
                         "voice mic trigger ignored: toggle close still pending"
                     )
-                elif self._voice_raw_input_trigger_pending:
+                elif self._voice_mic_gesture_active:
                     self._voice_raw_input_trigger_pending = False
-                    self._logger.info(
-                        "voice mic trigger ignored: matched prior Raw Input trigger"
-                    )
-                elif self._voice_audio_start_fallback_pending:
                     self._voice_audio_start_fallback_pending = False
                     self._logger.info(
-                        "voice mic trigger ignored: matched prior AUDIO_STARTED fallback"
+                        "voice mic trigger ignored: matched current multi-source gesture"
                     )
                 elif self._voice_audio_started_waiting_for_legacy_f5:
                     self._voice_audio_started_waiting_for_legacy_f5 = False
                     self._logger.info(
                         "voice mic trigger received without F5; using host fallback"
                     )
-                    self._handle_mic_button_pressed(send_device_open=False)
+                    if self._begin_voice_mic_gesture("atvv"):
+                        self._handle_mic_button_pressed(send_device_open=False)
                 else:
                     if self._legacy_voice_transform_enabled():
                         self._logger.info(
@@ -927,7 +979,8 @@ class RC003App:
                         self._open_playback_for_new_session()
                     else:
                         self._logger.info("voice mic trigger received from ATVV control channel")
-                        self._handle_mic_button_pressed()
+                        if self._begin_voice_mic_gesture("atvv"):
+                            self._handle_mic_button_pressed()
         elif isinstance(event, AudioStarted):
             with self._voice_trigger_lock:
                 self._logger.info("voice audio started")
@@ -936,6 +989,11 @@ class RC003App:
                 if self._voice_toggle_close_pending:
                     self._logger.info(
                         "voice audio start ignored: toggle close still pending"
+                    )
+                elif self._voice_mic_gesture_active:
+                    self._voice_mic_gesture_audio_started = True
+                    self._logger.info(
+                        "voice audio start matched current multi-source gesture"
                     )
                 elif not self._voice.active:
                     if self._legacy_voice_transform_enabled():
@@ -946,8 +1004,9 @@ class RC003App:
                         self._open_playback_for_new_session()
                     else:
                         self._logger.info("voice audio start used as microphone trigger")
-                        self._handle_mic_button_pressed(send_device_open=False)
-                        self._voice_audio_start_fallback_pending = self._voice.active
+                        if self._begin_voice_mic_gesture("audio_started"):
+                            self._handle_mic_button_pressed(send_device_open=False)
+                            self._voice_audio_start_fallback_pending = self._voice.active
         elif isinstance(event, AudioStopped):
             with self._voice_trigger_lock:
                 self._logger.info("voice audio stopped")
@@ -971,6 +1030,7 @@ class RC003App:
                 self._voice_audio_start_fallback_pending = False
                 self._voice_audio_started_waiting_for_legacy_f5 = False
                 self._voice_raw_input_trigger_pending = False
+                self._finish_voice_mic_gesture()
                 toggle_close_completed = self._voice_toggle_close_pending
                 self._voice_toggle_close_pending = False
                 action = self._voice.on_audio_stopped()
