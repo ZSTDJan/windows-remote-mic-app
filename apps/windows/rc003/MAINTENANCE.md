@@ -91,8 +91,9 @@
 - 候选 EXE SHA-256：
   `E11CFC991DDC24524790ADA48AE7C17CCE2E6C68252E9A798B85F62A21329645`。
 - 冻结桥接实测：进程日志记录通知区域图标 ready 和 started，随后完成
-  RC003 BLE/ATVV 能力连接；桌面自动化未能可靠操作系统托盘，因此菜单
-  点击退出与对应清理日志仍保留为人工验收，未冒充通过。
+  RC003 BLE/ATVV 能力连接。用户从托盘打开设置后再选择“退出桥接”，桥接
+  进程消失而设置窗口继续保留；日志记录 HID tap stopped、BLE/HID/音频
+  清理和 graceful bridge exit，通知区域生命周期验收通过。
 
 基础功能实现提交：`88ea7a90144ff078b7abc62de9dedc4290043fe2`。
 
