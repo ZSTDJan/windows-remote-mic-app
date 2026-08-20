@@ -27,6 +27,13 @@ Item {
         shortcutRecorder.open()
     }
 
+    Timer {
+        interval: 100
+        repeat: true
+        running: SettingsController.keyDetectionActive
+        onTriggered: SettingsController.pollKeyDetectionBridge()
+    }
+
     Dialog {
         id: shortcutRecorder
         objectName: "shortcutRecorderDialog"

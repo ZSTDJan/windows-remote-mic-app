@@ -36,6 +36,7 @@ from ovb_rc003 import (
     device_catalog,
     frida_compat,
     hotkey,
+    key_detection_bridge,
     key_mapping,
     qt_settings_app,
     remote_layout,
@@ -350,8 +351,15 @@ class SettingsControllerTests(unittest.TestCase):
         self._tmpdir = tempfile.TemporaryDirectory()
         self._env_patch = mock.patch.dict(os.environ, {"LOCALAPPDATA": self._tmpdir.name})
         self._env_patch.start()
+        self._bridge_status_patch = mock.patch.object(
+            qt_settings_app.single_instance,
+            "bridge_instance_running",
+            return_value=False,
+        )
+        self._bridge_status_patch.start()
 
     def tearDown(self):
+        self._bridge_status_patch.stop()
         self._env_patch.stop()
         self._tmpdir.cleanup()
 
@@ -650,6 +658,64 @@ class SettingsControllerTests(unittest.TestCase):
         self.assertIn("0x00F1", controller.keyDetectionText)
         self.assertEqual(raw_instances[0].stop_calls, 1)
         self.assertEqual(tap_instances[0].stop_calls, 1)
+
+    def test_running_bridge_detection_returns_button_without_starting_local_hid(self):
+        controller, model = self._make_controller()
+        self._bridge_status_patch.stop()
+        self._bridge_status_patch = mock.patch.object(
+            qt_settings_app.single_instance,
+            "bridge_instance_running",
+            return_value=True,
+        )
+        self._bridge_status_patch.start()
+
+        with mock.patch.object(
+            qt_settings_app.raw_input_windows,
+            "RawInputButtonListener",
+        ) as raw_listener, mock.patch.object(
+            qt_settings_app.frida_compat,
+            "RC003HidReportTap",
+        ) as tap:
+            controller.startKeyDetection()
+
+        self.assertTrue(controller.keyDetectionActive)
+        self.assertIsNotNone(controller._key_detection_bridge_request)
+        raw_listener.assert_not_called()
+        tap.assert_not_called()
+
+        self.assertTrue(
+            key_detection_bridge.publish_next_button(
+                controller._config_root,
+                "volume_down",
+            )
+        )
+        controller.pollKeyDetectionBridge()
+
+        self.assertFalse(controller.keyDetectionActive)
+        self.assertEqual(controller.selectedButtonId, "volume_down")
+        self.assertEqual(model.selected_button_id(), "volume_down")
+        self.assertIn("后台桥接", controller.keyDetectionText)
+
+    def test_running_bridge_detection_times_out_cleanly(self):
+        controller, _ = self._make_controller()
+        self._bridge_status_patch.stop()
+        self._bridge_status_patch = mock.patch.object(
+            qt_settings_app.single_instance,
+            "bridge_instance_running",
+            return_value=True,
+        )
+        self._bridge_status_patch.start()
+        controller.startKeyDetection()
+        request = controller._key_detection_bridge_request
+        controller._key_detection_started_at -= (
+            controller._KEY_DETECTION_TIMEOUT_SECONDS + 1.0
+        )
+
+        controller.pollKeyDetectionBridge()
+
+        self.assertFalse(controller.keyDetectionActive)
+        self.assertFalse(request.request_path.exists())
+        self.assertIn("超时", controller.keyDetectionText)
 
     def test_open_log_location_reports_honestly_when_never_run(self):
         controller, _ = self._make_controller()

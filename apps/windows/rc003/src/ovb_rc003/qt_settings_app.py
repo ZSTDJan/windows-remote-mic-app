@@ -98,6 +98,7 @@ import atexit
 import gc
 import sys
 import threading
+import time
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -110,6 +111,7 @@ from . import (
     frida_compat,
     hotkey,
     hotkey_capture_windows,
+    key_detection_bridge,
     key_mapping,
     logging_setup,
     remote_layout,
@@ -117,6 +119,7 @@ from . import (
     resources,
     settings_ui,
     shell_targets,
+    single_instance,
     vb_cable_bundle,
     windows_diagnostics,
 )
@@ -662,6 +665,7 @@ def _load_qt_classes() -> dict:
 
         _TRIGGER_MODE_ORDER = tuple(key_mapping.VoiceTriggerMode)
         _DEVICE_ORDER = tuple(profile.device_id for profile in device_catalog.DEVICE_PROFILES)
+        _KEY_DETECTION_TIMEOUT_SECONDS = 15.0
 
         def __init__(self, model: "ButtonMappingModel", parent=None) -> None:
             super().__init__(parent)
@@ -696,6 +700,8 @@ def _load_qt_classes() -> dict:
             self._dji_mic_status_text = ""
             self._key_detection_listener = None
             self._key_detection_tap = None
+            self._key_detection_bridge_request = None
+            self._key_detection_started_at = 0.0
             self._key_detection_tap_usages = set()
             self._key_detection_active = False
             self._key_detection_text = (
@@ -1231,6 +1237,23 @@ def _load_qt_classes() -> dict:
             if self._selected_device_id() != device_catalog.RC003_ID:
                 self._set_key_detection_text("当前设备不是 RC003，无法检测遥控器按键。")
                 return
+            if single_instance.bridge_instance_running():
+                try:
+                    request = key_detection_bridge.request_detection(self._config_root)
+                except OSError as exc:
+                    self._set_key_detection_text(
+                        f"无法向后台桥接启动真实按键检测：{exc}"
+                    )
+                    return
+                self._key_detection_bridge_request = request
+                self._key_detection_started_at = time.monotonic()
+                self._key_detection_active = True
+                self.keyDetectionActiveChanged.emit()
+                self._set_key_detection_text(
+                    "后台桥接正在等待下一次 RC003 按键。请现在按一次遥控器按键；"
+                    "该次按键不会执行映射动作。"
+                )
+                return
             listener = None
             tap = None
             failures = []
@@ -1300,6 +1323,24 @@ def _load_qt_classes() -> dict:
             )
 
         @Slot()
+        def pollKeyDetectionBridge(self) -> None:
+            request = self._key_detection_bridge_request
+            if request is None or not self._key_detection_active:
+                return
+            if (
+                time.monotonic() - self._key_detection_started_at
+                >= self._KEY_DETECTION_TIMEOUT_SECONDS
+            ):
+                self.stopKeyDetection()
+                self._set_key_detection_text(
+                    "等待后台桥接按键超时。请确认遥控器已连接后重新检测。"
+                )
+                return
+            button_id = key_detection_bridge.poll_detection(request)
+            if button_id is not None:
+                self._on_raw_key_detected(button_id, " 来源=后台桥接。")
+
+        @Slot()
         def startHotkeyCapture(self) -> None:
             """Start the EXE-owned physical keyboard shortcut recorder."""
 
@@ -1331,6 +1372,9 @@ def _load_qt_classes() -> dict:
 
         @Slot()
         def stopKeyDetection(self) -> None:
+            bridge_request = self._key_detection_bridge_request
+            self._key_detection_bridge_request = None
+            self._key_detection_started_at = 0.0
             listener = self._key_detection_listener
             self._key_detection_listener = None
             tap = self._key_detection_tap
@@ -1340,6 +1384,8 @@ def _load_qt_classes() -> dict:
             self._key_detection_tap_usages.clear()
             if was_active:
                 self.keyDetectionActiveChanged.emit()
+            if bridge_request is not None:
+                key_detection_bridge.cancel_detection(bridge_request)
             if listener is not None:
                 try:
                     listener.stop()

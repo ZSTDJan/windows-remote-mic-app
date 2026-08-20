@@ -379,6 +379,80 @@ class SendMicOpenThreadsafeTests(unittest.TestCase):
         _run(scenario())
 
 
+class SendMicCloseThreadsafeTests(unittest.TestCase):
+    def _connected_session(self, env, **kwargs):
+        winrt = env.build_winrt_modules()
+        session = RC003BleSession(winrt=winrt, loop=asyncio.get_event_loop(), **kwargs)
+        candidate = identity.RC003Candidate(
+            name=env.name, hardware_match=False, handle=env.discovered_info
+        )
+        return session, candidate
+
+    def test_a_normal_scheduled_close_write_lands(self):
+        env = FakeWinRTEnvironment()
+
+        async def scenario():
+            session, candidate = self._connected_session(
+                env, on_pcm_frame=lambda samples: None
+            )
+            await session.connect(candidate)
+            writes_before = len(env.tx_characteristic.write_history)
+
+            session.send_mic_close_threadsafe()
+            self.assertTrue(
+                await _async_wait_until(
+                    lambda: len(env.tx_characteristic.write_history) > writes_before
+                )
+            )
+            self.assertEqual(
+                env.tx_characteristic.write_history[-1],
+                session.session.mic_close_command(),
+            )
+            await session.close()
+
+        _run(scenario())
+
+    def test_a_failed_scheduled_close_write_is_reported(self):
+        env = FakeWinRTEnvironment()
+        errors = []
+        boom = ConnectionError("simulated MIC_CLOSE write failure")
+
+        async def scenario():
+            session, candidate = self._connected_session(
+                env, on_pcm_frame=lambda samples: None, on_error=errors.append
+            )
+            await session.connect(candidate)
+            env.tx_characteristic._on_write = lambda _payload: (_ for _ in ()).throw(boom)
+
+            session.send_mic_close_threadsafe()
+            self.assertTrue(await _async_wait_until(lambda: len(errors) > 0))
+            self.assertIs(errors[0], boom)
+
+            env.tx_characteristic._on_write = None
+            await session.close()
+
+        _run(scenario())
+
+    def test_generation_gate_drops_a_stale_close_write(self):
+        env = FakeWinRTEnvironment()
+
+        async def scenario():
+            session, candidate = self._connected_session(
+                env, on_pcm_frame=lambda samples: None
+            )
+            await session.connect(candidate)
+            writes_before = len(env.tx_characteristic.write_history)
+
+            session.send_mic_close_threadsafe()
+            session._generation += 1
+            await asyncio.sleep(0.05)
+
+            self.assertEqual(len(env.tx_characteristic.write_history), writes_before)
+            await session.close()
+
+        _run(scenario())
+
+
 class CloseCancelsInFlightMicOpenTests(unittest.TestCase):
     """XRBM-018 RETRY 1 P1 #3: close() must cancel/await an ALREADY IN-
     FLIGHT MIC_OPEN write, not merely refuse to schedule a new one. The

@@ -74,6 +74,7 @@ from . import (
     hid_identity,
     hotkey,
     identity,
+    key_detection_bridge,
     key_mapping,
     legacy_key_suppressor_windows,
     logging_setup,
@@ -120,6 +121,7 @@ class RC003App:
         self._voice_hotkey = hotkey.HotkeySpec.parse(self._config["voice_hotkey"])
         self._voice_audio_start_fallback_pending = False
         self._voice_audio_started_waiting_for_legacy_f5 = False
+        self._voice_toggle_close_pending = False
         # Raw Input and the ATVV control channel arrive on different worker
         # threads. Serialize the voice state machine so one physical press
         # cannot race into two host shortcut deliveries.
@@ -146,6 +148,7 @@ class RC003App:
         # While the tap side channel is live, the keyboard Raw Input path
         # stands down so the same physical edge is not armed/dispatched twice.
         self._direct_hid_tap_active = False
+        self._key_detection_suppressed_buttons: set[str] = set()
         self._playback: Optional[audio_playback.EndpointPlaybackSink] = None
         self._voice_pcm_stats = PcmStats()
 
@@ -415,6 +418,7 @@ class RC003App:
         with self._direct_hid_lock:
             self._direct_hid_usages.clear()
         self._direct_hid_tap_active = False
+        self._key_detection_suppressed_buttons.clear()
 
         # Cancel gesture timers before stopping Raw Input. The listener's
         # forced releases then clear the dispatcher state without a late
@@ -425,6 +429,7 @@ class RC003App:
             with self._voice_trigger_lock:
                 self._voice_audio_start_fallback_pending = False
                 self._voice_audio_started_waiting_for_legacy_f5 = False
+                self._voice_toggle_close_pending = False
                 self._voice_raw_input_trigger_pending = False
                 reset_action = self._voice.reset()
                 if reset_action is not None and not self._apply_voice_action(reset_action):
@@ -570,6 +575,16 @@ class RC003App:
         if vk_code != 0x74 or not self._legacy_voice_transform_enabled():
             return None
         if is_pressed:
+            try:
+                detection_pending = key_detection_bridge.has_pending_request(
+                    self._config_root
+                )
+            except OSError:
+                detection_pending = False
+            if detection_pending:
+                # The bridge will report and swallow this press in
+                # _on_button_event(); do not inject right-Alt first.
+                return None
             if (
                 self._voice.active
                 or self._voice_raw_input_trigger_pending
@@ -699,19 +714,47 @@ class RC003App:
     def _on_button_event(
         self, button_id: str, is_pressed: bool, *, host_action_handled: bool = False
     ) -> None:
+        if button_id in self._key_detection_suppressed_buttons:
+            if not is_pressed:
+                self._key_detection_suppressed_buttons.discard(button_id)
+            return
+        detection_captured = False
+        if is_pressed:
+            try:
+                detection_captured = key_detection_bridge.publish_next_button(
+                    self._config_root,
+                    button_id,
+                )
+            except OSError as exc:
+                self._logger.warning("key detection IPC unavailable: %s", exc)
+        if detection_captured:
+            self._key_detection_suppressed_buttons.add(button_id)
+            self._logger.info(
+                "key detection captured button=%s; mapped action suppressed",
+                button_id,
+            )
+            return
         self._reload_bindings_if_changed()
         if button_id == "mic":
             if not is_pressed:
                 return
             with self._voice_trigger_lock:
-                if self._voice.active:
+                if self._voice_toggle_close_pending:
                     self._logger.info(
-                        "voice physical trigger ignored: voice session already active"
+                        "voice physical trigger ignored: toggle close still pending"
                     )
                     return
                 if self._voice_raw_input_trigger_pending:
                     self._logger.info(
-                        "voice physical trigger ignored: trigger already in progress"
+                        "voice physical trigger ignored: duplicate edge already in progress"
+                    )
+                    return
+                if (
+                    self._voice.active
+                    and self._voice.trigger_mode != key_mapping.VoiceTriggerMode.TOGGLE
+                ):
+                    self._logger.info(
+                        "voice physical trigger ignored: hold session already active"
                     )
                     return
                 # The physical key is the earliest reliable signal. Send the
@@ -726,7 +769,7 @@ class RC003App:
                     send_device_open=False,
                     host_action_handled=host_action_handled,
                 )
-                if not self._voice.active:
+                if not self._voice.active and not self._voice_toggle_close_pending:
                     self._voice_raw_input_trigger_pending = False
             return
         if is_pressed:
@@ -853,7 +896,12 @@ class RC003App:
             )
         elif isinstance(event, MicButtonPressed):
             with self._voice_trigger_lock:
-                if self._voice_raw_input_trigger_pending:
+                if self._voice_toggle_close_pending:
+                    self._voice_raw_input_trigger_pending = False
+                    self._logger.info(
+                        "voice mic trigger ignored: toggle close still pending"
+                    )
+                elif self._voice_raw_input_trigger_pending:
                     self._voice_raw_input_trigger_pending = False
                     self._logger.info(
                         "voice mic trigger ignored: matched prior Raw Input trigger"
@@ -884,7 +932,11 @@ class RC003App:
                 self._logger.info("voice audio started")
                 self._voice_pcm_stats.reset()
                 self._voice_audio_start_fallback_pending = False
-                if not self._voice.active:
+                if self._voice_toggle_close_pending:
+                    self._logger.info(
+                        "voice audio start ignored: toggle close still pending"
+                    )
+                elif not self._voice.active:
                     if self._legacy_voice_transform_enabled():
                         self._logger.info(
                             "voice audio started before F5; waiting for physical mic edge"
@@ -918,6 +970,8 @@ class RC003App:
                 self._voice_audio_start_fallback_pending = False
                 self._voice_audio_started_waiting_for_legacy_f5 = False
                 self._voice_raw_input_trigger_pending = False
+                toggle_close_completed = self._voice_toggle_close_pending
+                self._voice_toggle_close_pending = False
                 action = self._voice.on_audio_stopped()
                 transformed_session = self._voice_legacy_transform_session
                 action_applied = (
@@ -942,6 +996,16 @@ class RC003App:
                         "requesting reconnect"
                     )
                     self._supervisor.request_reconnect()
+                elif (
+                    self._voice.trigger_mode == key_mapping.VoiceTriggerMode.TOGGLE
+                    and self._voice.active
+                    and not toggle_close_completed
+                    and self._ble_session is not None
+                ):
+                    self._logger.info(
+                        "voice toggle remains active after physical release; reopening device mic"
+                    )
+                    self._ble_session.send_mic_open_threadsafe()
 
     def _handle_mic_button_pressed(
         self,
@@ -972,7 +1036,13 @@ class RC003App:
             )
             return
 
+        was_active = self._voice.active
         action = self._voice.on_mic_button_pressed()
+        is_toggle_close = (
+            self._voice.trigger_mode == key_mapping.VoiceTriggerMode.TOGGLE
+            and was_active
+            and not self._voice.active
+        )
         action_delivered = (
             True
             if host_action_handled
@@ -983,17 +1053,25 @@ class RC003App:
                 "voice host shortcut already handled by physical F5-to-right-Alt transform"
             )
         if not action_delivered:
-            # Nothing physically landed (win32_input.py's own batching
-            # already rolled back any partial key-down) - clear the
-            # controller's logical state without emitting a second,
-            # likely-just-as-doomed compensating action.
-            self._voice.cancel_pending()
+            if is_toggle_close:
+                # The host is still in voice mode if its closing tap failed.
+                self._voice.restore_pending(action)
+            else:
+                # Nothing physically landed (win32_input.py's own batching
+                # already rolled back any partial key-down) - clear the
+                # controller's logical state without emitting a second,
+                # likely-just-as-doomed compensating action.
+                self._voice.cancel_pending()
             self._logger.info(
-                "voice failing closed: host hotkey delivery failed; MIC_OPEN suppressed"
+                "voice failing closed: host hotkey delivery failed; device command suppressed"
             )
             return
 
-        if send_device_open and self._ble_session is not None:
+        if is_toggle_close and self._ble_session is not None:
+            self._voice_toggle_close_pending = True
+            self._logger.info("voice toggle closing: sending MIC_CLOSE")
+            self._ble_session.send_mic_close_threadsafe()
+        elif send_device_open and self._ble_session is not None:
             self._ble_session.send_mic_open_threadsafe()
 
     def _apply_voice_action(self, action: voice_controller.VoiceHostAction) -> bool:

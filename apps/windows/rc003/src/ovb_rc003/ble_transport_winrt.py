@@ -228,7 +228,7 @@ class RC003BleSession:
         self._connection_status_token = None
         # WinRT notification callbacks are not guaranteed to run on the
         # asyncio thread that owns connect()/close(); this loop reference
-        # lets send_mic_open_threadsafe() hop back onto it safely.
+        # lets the thread-safe mic command helpers hop back onto it safely.
         self._loop = loop or asyncio.get_event_loop()
 
         self._generation = 0
@@ -236,14 +236,14 @@ class RC003BleSession:
         self._worker_thread: Optional[threading.Thread] = None
         self._worker_stop = threading.Event()
         self.dropped_event_count = 0
-        # Gates send_mic_open_threadsafe()'s scheduled write - see that
-        # method's docstring.
+        # Gates the thread-safe mic command writes while teardown is active.
         self._closing = False
-        # Every MIC_OPEN write task send_mic_open_threadsafe() schedules,
-        # tracked so close() can cancel/await any still in-flight one before
+        # Every thread-safe mic command task is tracked so close() can
+        # cancel/await any still in-flight one before
         # touching GATT resources (XRBM-018 RETRY 1 P1 #3) - see
-        # _cancel_pending_mic_open_writes().
+        # _cancel_pending_mic_command_writes().
         self._mic_open_tasks: "set[asyncio.Task]" = set()
+        self._mic_close_tasks: "set[asyncio.Task]" = set()
 
     @property
     def session(self) -> atvv_session.ATVVSession:
@@ -366,22 +366,53 @@ class RC003BleSession:
         it.
         """
 
+        self._schedule_mic_command_threadsafe(
+            self._session.mic_open_command,
+            self._mic_open_tasks,
+        )
+
+    def send_mic_close_threadsafe(self) -> None:
+        """Schedule MIC_CLOSE from the HID/ATVV worker thread safely."""
+
+        self._schedule_mic_command_threadsafe(
+            self._session.mic_close_command,
+            self._mic_close_tasks,
+        )
+
+    def _schedule_mic_command_threadsafe(
+        self,
+        command_factory: Callable[[], bytes],
+        tasks: "set[asyncio.Task]",
+    ) -> None:
         generation = self._generation
 
         def _schedule() -> None:
             if self._closing or generation != self._generation:
                 return
-            task = asyncio.ensure_future(self._write_tx(self._session.mic_open_command()))
-            self._mic_open_tasks.add(task)
-            task.add_done_callback(lambda t: self._on_mic_open_task_done(t, generation))
+            task = asyncio.ensure_future(self._write_tx(command_factory()))
+            tasks.add(task)
+            task.add_done_callback(
+                lambda completed: self._on_mic_command_task_done(
+                    completed,
+                    generation,
+                    tasks,
+                )
+            )
 
         self._loop.call_soon_threadsafe(_schedule)
 
-    def _on_mic_open_task_done(self, task: "asyncio.Task", generation: int) -> None:
-        self._mic_open_tasks.discard(task)
-        self._observe_mic_open_result(task, generation)
+    def _on_mic_command_task_done(
+        self,
+        task: "asyncio.Task",
+        generation: int,
+        tasks: "set[asyncio.Task]",
+    ) -> None:
+        tasks.discard(task)
+        self._observe_mic_command_result(task, generation)
 
-    def _observe_mic_open_result(self, future: "asyncio.Future", generation: int) -> None:
+    def _observe_mic_command_result(
+        self, future: "asyncio.Future", generation: int
+    ) -> None:
         if future.cancelled():
             return
         exc = future.exception()
@@ -392,9 +423,8 @@ class RC003BleSession:
         if self._on_error is not None:
             self._on_error(exc)
 
-    async def _cancel_pending_mic_open_writes(self) -> None:
-        """Cancels and awaits every MIC_OPEN write task
-        send_mic_open_threadsafe() scheduled that has not finished yet, so
+    async def _cancel_pending_mic_command_writes(self) -> None:
+        """Cancel and await every scheduled MIC_OPEN/MIC_CLOSE write, so
         an already-in-flight WinRT write can never complete concurrently
         with (or after) the GATT teardown close() performs next (XRBM-018
         RETRY 1 P1 #3).
@@ -409,7 +439,7 @@ class RC003BleSession:
         close() itself.
         """
 
-        tasks = list(self._mic_open_tasks)
+        tasks = list(self._mic_open_tasks | self._mic_close_tasks)
         for task in tasks:
             task.cancel()
         for task in tasks:
@@ -418,6 +448,7 @@ class RC003BleSession:
             except (asyncio.CancelledError, Exception):
                 pass
         self._mic_open_tasks.clear()
+        self._mic_close_tasks.clear()
 
     # -- notification callbacks: non-blocking enqueue only -----------------
 
@@ -516,10 +547,10 @@ class RC003BleSession:
         # already queued via call_soon_threadsafe sees it the moment it runs.
         self._closing = True
         # Then, before anything else touches GATT resources: cancel/await
-        # any MIC_OPEN write that is already in flight (XRBM-018 RETRY 1 P1
-        # #3) - closing the gate above only stops *new* writes from being
+        # any mic command write that is already in flight (XRBM-018 RETRY 1
+        # P1 #3) - closing the gate above only stops *new* writes from being
         # scheduled, it does nothing about one that had already started.
-        await self._cancel_pending_mic_open_writes()
+        await self._cancel_pending_mic_command_writes()
 
         worker_join_failed = False
         self._worker_stop.set()

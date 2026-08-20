@@ -70,6 +70,8 @@ _MUTEX_NAME = r"Local\RemoteMicRC003_BridgeInstance"
 
 # https://learn.microsoft.com/windows/win32/debug/system-error-codes--0-499-
 _ERROR_ALREADY_EXISTS = 183
+_ERROR_ACCESS_DENIED = 5
+_SYNCHRONIZE = 0x00100000
 
 # Deterministic, documented nonzero exit codes (DoD 2's "deterministic
 # nonzero exit"), distinct from Python's generic ``1`` (an unhandled
@@ -126,9 +128,15 @@ class MutexCreationResult(NamedTuple):
     last_error: int
 
 
+class MutexOpenResult(NamedTuple):
+    handle: int
+    last_error: int
+
+
 CreateMutexFn = Callable[[str], MutexCreationResult]
 ReleaseMutexFn = Callable[[int], bool]
 CloseHandleFn = Callable[[int], bool]
+OpenMutexFn = Callable[[str], MutexOpenResult]
 
 
 def _require_windows() -> None:
@@ -167,12 +175,55 @@ def _real_release_mutex(handle: int) -> bool:
     return bool(kernel32.ReleaseMutex(handle))
 
 
+def _real_open_mutex(name: str) -> MutexOpenResult:
+    """Open the bridge mutex without acquiring or changing its ownership."""
+
+    _require_windows()
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenMutexW.argtypes = (
+        wintypes.DWORD,
+        wintypes.BOOL,
+        wintypes.LPCWSTR,
+    )
+    kernel32.OpenMutexW.restype = wintypes.HANDLE
+    ctypes.set_last_error(0)
+    raw_handle = kernel32.OpenMutexW(_SYNCHRONIZE, False, name)
+    last_error = ctypes.get_last_error()
+    return MutexOpenResult(
+        handle=int(raw_handle) if raw_handle else 0,
+        last_error=last_error,
+    )
+
+
 def _real_close_handle(handle: int) -> bool:
     kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
     # BOOL CloseHandle(HANDLE hObject)
     kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
     kernel32.CloseHandle.restype = wintypes.BOOL
     return bool(kernel32.CloseHandle(handle))
+
+
+def bridge_instance_running(
+    *,
+    name: str = _MUTEX_NAME,
+    _open_mutex: OpenMutexFn = _real_open_mutex,
+    _close_handle: CloseHandleFn = _real_close_handle,
+) -> bool:
+    """Return whether bridge mode already owns the per-session mutex."""
+
+    try:
+        result = _open_mutex(name)
+    except Exception:  # noqa: BLE001 - settings can fall back to local detection
+        return False
+    if result.handle:
+        try:
+            _close_handle(result.handle)
+        except Exception:
+            pass
+        return True
+    # A protected object can deny SYNCHRONIZE access while still proving
+    # that the named mutex exists in this logon session.
+    return result.last_error == _ERROR_ACCESS_DENIED
 
 
 class BridgeInstanceGuard:

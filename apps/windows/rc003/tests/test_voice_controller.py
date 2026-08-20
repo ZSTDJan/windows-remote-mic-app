@@ -5,14 +5,7 @@ from ovb_rc003.voice_controller import VoiceController, VoiceHostAction
 
 
 class ToggleModeTests(unittest.TestCase):
-    """Frozen by XRBM-018 (superseding the XRBM-014 RETRY P1
-    #4 "tap only on press" fix - see the XRBM-014 round 2 replan-check
-    finding "Toggle release edge absent"): toggle mode taps on
-    mic-button-press to start Windows' own Win+H toggle, and taps AGAIN on
-    AUDIO_STOP to turn that same toggle back off - never holding Win/H down
-    across the (device-controlled) voice session, but also never leaving it
-    stuck on indefinitely.
-    """
+    """Toggle follows user presses, not the device's short-press release."""
 
     def test_press_issues_a_tap(self):
         controller = VoiceController(VoiceTriggerMode.TOGGLE)
@@ -28,27 +21,31 @@ class ToggleModeTests(unittest.TestCase):
         controller.on_mic_button_pressed()
         self.assertTrue(controller.active)
 
-    def test_repeated_presses_each_issue_their_own_tap(self):
+    def test_repeated_presses_alternate_active_state_and_each_issue_a_tap(self):
         controller = VoiceController(VoiceTriggerMode.TOGGLE)
         self.assertEqual(controller.on_mic_button_pressed(), VoiceHostAction.TAP)
+        self.assertTrue(controller.active)
         self.assertEqual(controller.on_mic_button_pressed(), VoiceHostAction.TAP)
+        self.assertFalse(controller.active)
         self.assertEqual(controller.on_mic_button_pressed(), VoiceHostAction.TAP)
+        self.assertTrue(controller.active)
 
-    def test_audio_stopped_after_a_press_issues_a_closing_tap(self):
+    def test_audio_stopped_after_a_press_keeps_toggle_active(self):
         controller = VoiceController(VoiceTriggerMode.TOGGLE)
         controller.on_mic_button_pressed()
-        self.assertEqual(controller.on_audio_stopped(), VoiceHostAction.TAP)
-        self.assertFalse(controller.active)
+        self.assertIsNone(controller.on_audio_stopped())
+        self.assertTrue(controller.active)
 
     def test_audio_stopped_without_a_prior_press_does_nothing(self):
         controller = VoiceController(VoiceTriggerMode.TOGGLE)
         self.assertIsNone(controller.on_audio_stopped())
 
-    def test_audio_stopped_only_closes_once(self):
+    def test_repeated_audio_stopped_events_do_not_change_toggle_state(self):
         controller = VoiceController(VoiceTriggerMode.TOGGLE)
         controller.on_mic_button_pressed()
-        controller.on_audio_stopped()
-        self.assertIsNone(controller.on_audio_stopped())  # already closed
+        self.assertIsNone(controller.on_audio_stopped())
+        self.assertIsNone(controller.on_audio_stopped())
+        self.assertTrue(controller.active)
 
     def test_reset_after_a_press_issues_the_closing_tap(self):
         controller = VoiceController(VoiceTriggerMode.TOGGLE)
@@ -56,11 +53,12 @@ class ToggleModeTests(unittest.TestCase):
         self.assertEqual(controller.reset(), VoiceHostAction.TAP)
         self.assertFalse(controller.active)
 
-    def test_reset_is_a_no_op_after_audio_stopped_already_closed_it(self):
+    def test_reset_after_audio_stopped_still_closes_the_active_toggle(self):
         controller = VoiceController(VoiceTriggerMode.TOGGLE)
         controller.on_mic_button_pressed()
         controller.on_audio_stopped()
-        self.assertIsNone(controller.reset())
+        self.assertEqual(controller.reset(), VoiceHostAction.TAP)
+        self.assertFalse(controller.active)
 
     def test_cancel_pending_clears_active_without_an_action(self):
         controller = VoiceController(VoiceTriggerMode.TOGGLE)
@@ -142,9 +140,9 @@ class RestorePendingTests(unittest.TestCase):
     def test_restores_toggle_active_after_a_failed_closing_tap(self):
         controller = VoiceController(VoiceTriggerMode.TOGGLE)
         controller.on_mic_button_pressed()
-        action = controller.on_audio_stopped()
+        action = controller.on_mic_button_pressed()
         self.assertEqual(action, VoiceHostAction.TAP)
-        self.assertFalse(controller.active)  # on_audio_stopped() cleared it
+        self.assertFalse(controller.active)  # second press eagerly closed it
 
         controller.restore_pending(action)
 
