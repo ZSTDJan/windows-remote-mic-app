@@ -7,6 +7,7 @@ this mirrors for the actual PortAudio device-index lookup used at
 """
 
 import unittest
+from unittest import mock
 
 from ovb_rc003 import audio_output
 from ovb_rc003.audio_playback import EndpointPlaybackSink
@@ -159,14 +160,13 @@ class SelectOutputSampleRateTests(unittest.TestCase):
         self.assertEqual(stream.writes[0], [0, 0, 0, 100, 200, 300])
         self.assertEqual(stream.writes[1], [400, 500, 600])
 
-    def test_ambiguous_name_without_host_api_fails_closed(self):
+    def test_name_without_host_api_prefers_wasapi(self):
         sd = FakeSoundDevice(
             devices=[_device("Speakers", 2, 0), _device("Speakers", 2, 1)],
             host_apis=self.host_apis,
         )
         sink = EndpointPlaybackSink("Speakers")
-        with self.assertRaises(audio_output.AudioOutputUnavailableError):
-            sink._resolve_device_index(sd)
+        self.assertEqual(sink._resolve_device_index(sd), 0)
 
     def test_ambiguous_name_with_host_api_resolves_the_right_index(self):
         sd = FakeSoundDevice(
@@ -181,6 +181,76 @@ class SelectOutputSampleRateTests(unittest.TestCase):
         sink = EndpointPlaybackSink("Speakers", host_api="MME")
         with self.assertRaises(audio_output.AudioOutputUnavailableError):
             sink._resolve_device_index(sd)
+
+    def test_explicit_wdm_ks_endpoint_fails_before_stream_open(self):
+        sd = FakeSoundDevice(
+            devices=[_device("Output (VB-Audio Point)", 2, 0)],
+            host_apis=[{"name": "Windows WDM-KS"}],
+        )
+        sink = EndpointPlaybackSink(
+            "Output (VB-Audio Point)", host_api="Windows WDM-KS"
+        )
+        with self.assertRaises(audio_output.AudioOutputUnavailableError):
+            sink._resolve_device_index(sd)
+
+
+class PlaybackPreflightTests(unittest.TestCase):
+    def _fake_module(self, stream_type):
+        import types
+
+        module = types.ModuleType("sounddevice")
+        module.query_hostapis = lambda: [{"name": "Windows WASAPI"}]
+        module.query_devices = lambda: [_device("CABLE Input", 2, 0, 48000.0)]
+        module.check_output_settings = lambda **_kwargs: None
+        module.OutputStream = stream_type
+        return module
+
+    def test_preflight_opens_starts_stops_and_closes(self):
+        import sys
+
+        events = []
+
+        class Stream:
+            def __init__(self, **_kwargs):
+                events.append("open")
+
+            def start(self):
+                events.append("start")
+
+            def stop(self):
+                events.append("stop")
+
+            def close(self):
+                events.append("close")
+
+        with mock.patch.dict(sys.modules, {"sounddevice": self._fake_module(Stream)}):
+            from ovb_rc003.audio_playback import preflight_output_endpoint
+
+            preflight_output_endpoint("CABLE Input", "Windows WASAPI")
+        self.assertEqual(events, ["open", "start", "stop", "close"])
+
+    def test_start_failure_is_sanitized_and_closes_stream(self):
+        import sys
+
+        events = []
+
+        class Stream:
+            def __init__(self, **_kwargs):
+                events.append("open")
+
+            def start(self):
+                raise RuntimeError("private endpoint detail")
+
+            def close(self):
+                events.append("close")
+
+        with mock.patch.dict(sys.modules, {"sounddevice": self._fake_module(Stream)}):
+            from ovb_rc003.audio_playback import preflight_output_endpoint
+
+            with self.assertRaises(audio_output.AudioOutputUnavailableError) as ctx:
+                preflight_output_endpoint("CABLE Input", "Windows WASAPI")
+        self.assertEqual(events, ["open", "close"])
+        self.assertNotIn("private endpoint detail", str(ctx.exception))
 
 
 if __name__ == "__main__":

@@ -16,7 +16,7 @@ SOURCE_SAMPLE_RATE_HZ = 16000
 DEFAULT_CHANNELS = 1
 
 
-class PlaybackUnavailableError(Exception):
+class PlaybackUnavailableError(audio_output.AudioOutputUnavailableError):
     pass
 
 
@@ -51,14 +51,26 @@ class EndpointPlaybackSink:
         self._output_channels = self._select_output_channels(sd, device_index)
         self._output_sample_rate_hz = self._select_output_sample_rate(sd, device_index)
 
-        self._stream = sd.OutputStream(
-            device=device_index,
-            channels=self._output_channels,
-            dtype="int16",
-            samplerate=self._output_sample_rate_hz,
-            latency="low",
-        )
-        self._stream.start()
+        stream = None
+        try:
+            stream = sd.OutputStream(
+                device=device_index,
+                channels=self._output_channels,
+                dtype="int16",
+                samplerate=self._output_sample_rate_hz,
+                latency="low",
+            )
+            stream.start()
+        except Exception as exc:  # noqa: BLE001 - normalize PortAudio backend failures
+            if stream is not None:
+                try:
+                    stream.close()
+                except Exception:
+                    pass
+            raise audio_output.AudioOutputUnavailableError(
+                "selected output endpoint could not be opened for blocking playback"
+            ) from exc
+        self._stream = stream
         self._previous_sample = 0
         self._have_previous_sample = False
 
@@ -122,22 +134,23 @@ class EndpointPlaybackSink:
                 f"selected output endpoint is not currently present: {self._endpoint_name!r}"
             )
 
-        if self._host_api:
-            for index, host_api_name in candidates:
-                if host_api_name == self._host_api:
-                    return index
+        resolved = audio_output.resolve_selected_endpoint(
+            [
+                audio_output.AudioEndpoint(name=self._endpoint_name, host_api=host_api_name)
+                for _index, host_api_name in candidates
+            ],
+            self._endpoint_name,
+            self._host_api,
+        )
+        matching_indices = [
+            index for index, host_api_name in candidates if host_api_name == resolved.host_api
+        ]
+        if len(matching_indices) != 1:
             raise audio_output.AudioOutputUnavailableError(
-                f"selected output endpoint {self._endpoint_name!r} is no longer present "
-                f"under host API {self._host_api!r}"
+                f"{len(matching_indices)} output endpoints share the resolved name and "
+                "host API; select a unique device explicitly"
             )
-
-        if len(candidates) > 1:
-            raise audio_output.AudioOutputUnavailableError(
-                f"{len(candidates)} output endpoints are named {self._endpoint_name!r} "
-                "across different host APIs; open settings and re-select one to disambiguate"
-            )
-
-        return candidates[0][0]
+        return matching_indices[0]
 
     def write(self, samples: List[int]) -> None:
         if self._stream is None:
@@ -177,6 +190,19 @@ class EndpointPlaybackSink:
 
     def close(self) -> None:
         if self._stream is not None:
-            self._stream.stop()
-            self._stream.close()
+            stream = self._stream
             self._stream = None
+            try:
+                stream.stop()
+            finally:
+                stream.close()
+
+
+def preflight_output_endpoint(endpoint_name: str, host_api: str = "") -> None:
+    """Prove the selected endpoint can open now without sending any PCM."""
+
+    sink = EndpointPlaybackSink(endpoint_name, host_api)
+    try:
+        sink.open()
+    finally:
+        sink.close()

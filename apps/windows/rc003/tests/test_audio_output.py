@@ -50,9 +50,9 @@ class HostApiDisambiguationTests(unittest.TestCase):
             audio_output.AudioEndpoint(name="Unique Device", host_api="Windows WASAPI"),
         ]
 
-    def test_ambiguous_name_without_host_api_fails_closed(self):
-        with self.assertRaises(audio_output.AudioOutputUnavailableError):
-            audio_output.resolve_selected_endpoint(self.endpoints, "Speakers")
+    def test_name_without_host_api_prefers_wasapi(self):
+        endpoint = audio_output.resolve_selected_endpoint(self.endpoints, "Speakers")
+        self.assertEqual(endpoint.host_api, "Windows WASAPI")
 
     def test_ambiguous_name_with_host_api_resolves_the_right_one(self):
         endpoint = audio_output.resolve_selected_endpoint(self.endpoints, "Speakers", "MME")
@@ -71,6 +71,36 @@ class HostApiDisambiguationTests(unittest.TestCase):
             self.endpoints, "Unique Device", "Windows WASAPI"
         )
         self.assertEqual(endpoint.host_api, "Windows WASAPI")
+
+    def test_directsound_is_used_when_wasapi_is_absent(self):
+        endpoints = [
+            audio_output.AudioEndpoint(name="CABLE Input", host_api="MME"),
+            audio_output.AudioEndpoint(
+                name="CABLE Input", host_api="Windows DirectSound"
+            ),
+        ]
+        endpoint = audio_output.resolve_selected_endpoint(endpoints, "CABLE Input")
+        self.assertEqual(endpoint.host_api, "Windows DirectSound")
+
+    def test_wdm_ks_is_rejected_even_when_explicitly_saved(self):
+        endpoints = [
+            audio_output.AudioEndpoint(
+                name="Output (VB-Audio Point)", host_api="Windows WDM-KS"
+            )
+        ]
+        with self.assertRaises(audio_output.AudioOutputUnavailableError) as ctx:
+            audio_output.resolve_selected_endpoint(
+                endpoints, "Output (VB-Audio Point)", "Windows WDM-KS"
+            )
+        self.assertIn("WDM-KS", str(ctx.exception))
+
+    def test_same_rank_duplicate_still_fails_closed(self):
+        endpoints = [
+            audio_output.AudioEndpoint(name="Speakers", host_api="Windows WASAPI"),
+            audio_output.AudioEndpoint(name="Speakers", host_api="Windows WASAPI"),
+        ]
+        with self.assertRaises(audio_output.AudioOutputUnavailableError):
+            audio_output.resolve_selected_endpoint(endpoints, "Speakers")
 
 
 class CableEndpointMatchingTests(unittest.TestCase):
@@ -227,6 +257,37 @@ class EnumerateInputEndpointsFilteringTests(unittest.TestCase):
             endpoints = audio_output.enumerate_output_endpoints()
         self.assertEqual(len(endpoints), 1)
         self.assertTrue(audio_output.is_cable_input_endpoint(endpoints[0].name))
+
+    def test_output_enumeration_excludes_wdm_ks_blocking_backend(self):
+        import sys
+        import types
+        import unittest.mock as mock
+
+        fake_sd = types.ModuleType("sounddevice")
+        fake_sd.query_hostapis = lambda: [
+            {"name": "Windows WDM-KS"},
+            {"name": "Windows WASAPI"},
+        ]
+        fake_sd.query_devices = lambda: [
+            {
+                "name": "Output (VB-Audio Point)",
+                "hostapi": 0,
+                "max_input_channels": 0,
+                "max_output_channels": 2,
+            },
+            {
+                "name": "CABLE Input",
+                "hostapi": 1,
+                "max_input_channels": 0,
+                "max_output_channels": 2,
+            },
+        ]
+        with mock.patch.dict(sys.modules, {"sounddevice": fake_sd}):
+            endpoints = audio_output.enumerate_output_endpoints()
+        self.assertEqual(
+            endpoints,
+            [audio_output.AudioEndpoint("CABLE Input", "Windows WASAPI")],
+        )
 
 
 class DjiMic2EndpointIdentityTests(unittest.TestCase):

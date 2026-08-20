@@ -93,8 +93,8 @@ _PRESET_KEY_COMBOS = (
 )
 
 _TRIGGER_MODE_LABELS = {
-    key_mapping.VoiceTriggerMode.TOGGLE: "免按住（右 Alt + 空格）",
-    key_mapping.VoiceTriggerMode.HOLD: "长按（右 Alt）",
+    key_mapping.VoiceTriggerMode.TOGGLE: "免按住（切换）",
+    key_mapping.VoiceTriggerMode.HOLD: "按住说话（按下 / 松开）",
 }
 
 def voice_hotkey_for_trigger_mode(trigger_mode: key_mapping.VoiceTriggerMode) -> str:
@@ -115,7 +115,7 @@ SECONDARY_UNCONFIGURED_DISPLAY = "未设置"
 # The microphone button remains a VOICE lifecycle action (it cannot be changed
 # into an unrelated normal-key mapping), but the host chord it emits is
 # editable through SettingsController.hotkeyText in the same row.
-_MIC_ROW_DISPLAY = "触发语音（免按住：右 Alt+空格；长按：右 Alt）"
+_MIC_ROW_DISPLAY = "触发语音（生命周期与宿主快捷键分别设置）"
 
 # device_profile.ALL_BUTTON_IDS also carries "volume_mute", a HID usage-table
 # entry kept for protocol compatibility (see key_mapping.py's module

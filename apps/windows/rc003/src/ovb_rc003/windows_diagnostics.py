@@ -45,6 +45,7 @@ from enum import Enum
 from typing import Callable, List, Optional, Sequence, Tuple
 
 from . import audio_output
+from . import audio_playback
 from . import ble_transport_winrt
 from . import identity
 from . import raw_input_windows
@@ -1010,7 +1011,11 @@ def check_vb_cable_endpoints(
             f"无法枚举音频端点：{exc}",
         )
 
-    has_input = any(audio_output.is_cable_input_endpoint(e.name) for e in playback)
+    has_input = any(
+        audio_output.is_cable_input_endpoint(e.name)
+        and audio_output.is_supported_output_host_api(e.host_api)
+        for e in playback
+    )
     has_output = any(audio_output.is_cable_output_endpoint(e.name) for e in recording)
 
     if has_input and has_output:
@@ -1088,6 +1093,7 @@ def check_output_endpoint_resolution(
     list_playback: Callable[
         [], Sequence[audio_output.AudioEndpoint]
     ] = audio_output.enumerate_output_endpoints,
+    preflight: Callable[[str, str], None] = audio_playback.preflight_output_endpoint,
 ) -> CheckResult:
     try:
         endpoints = list(list_playback())
@@ -1111,6 +1117,18 @@ def check_output_endpoint_resolution(
             CheckGroup.VOICE_BRIDGE,
             CheckStatus.FAIL,
             str(exc),
+        )
+
+    try:
+        preflight(endpoint.name, endpoint.host_api)
+    except Exception:  # noqa: BLE001 - never expose PortAudio/device details
+        return CheckResult(
+            "output_endpoint",
+            "语音输出端点",
+            CheckGroup.VOICE_BRIDGE,
+            CheckStatus.FAIL,
+            "所选端点存在，但当前无法实际打开阻塞播放流；请选择 Windows "
+            "WASAPI 或 Windows DirectSound 后重试。",
         )
 
     if audio_output.is_cable_input_endpoint(endpoint.name):

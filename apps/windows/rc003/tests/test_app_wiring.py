@@ -26,6 +26,7 @@ import tempfile
 import threading
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from ovb_rc003 import app as app_module
 from ovb_rc003 import config, key_mapping, logging_setup, raw_input_windows, win32_input
@@ -852,6 +853,34 @@ class StartHidListenerOwnershipTests(_AppWiringTestCase):
 
         self.assertIsNone(self.app._hid_listener)
         self.assertEqual(fake_listener.start_calls, 1)
+
+
+class HidTapStartupStateTests(_AppWiringTestCase):
+    def test_thread_start_is_logged_separately_from_verified_ready(self):
+        instances = []
+
+        class FakeTap:
+            def __init__(self, _report_handler, *, status_handler):
+                self.status_handler = status_handler
+                self.status = "starting"
+                instances.append(self)
+
+            def start(self):
+                return True
+
+            def stop(self):
+                pass
+
+        with mock.patch.object(
+            app_module.frida_compat, "RC003HidReportTap", FakeTap
+        ), self.assertLogs(self.app._logger, level="INFO") as captured:
+            self.app._start_hid_report_tap()
+            instances[0].status_handler("ready", "hid_io_verified")
+
+        text = "\n".join(captured.output)
+        self.assertIn("tap thread started; state=starting", text)
+        self.assertNotIn("tap enabled", text)
+        self.assertIn("tap state: ready detail=hid_io_verified", text)
 
 
 class VoiceCleanupFailurePreservesPendingStateTests(_AppWiringTestCase):

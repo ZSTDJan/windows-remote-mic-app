@@ -283,11 +283,17 @@ class RC003App:
         BLE voice from starting.
         """
 
-        tap = frida_compat.RC003HidReportTap(self._on_direct_hid_report)
+        tap = frida_compat.RC003HidReportTap(
+            self._on_direct_hid_report,
+            status_handler=self._on_hid_tap_status,
+        )
         try:
             if tap.start():
                 self._hid_report_tap = tap
-                self._logger.info("startup: RC003 HID report tap enabled")
+                self._logger.info(
+                    "startup: RC003 HID report tap thread started; state=%s",
+                    tap.status,
+                )
             else:
                 self._logger.info(
                     "startup: RC003 HID report tap unavailable: %s", tap.status
@@ -298,6 +304,20 @@ class RC003App:
                 tap.stop()
             except Exception:
                 self._logger.exception("startup: RC003 HID report tap cleanup failed")
+
+    def _on_hid_tap_status(self, status: str, detail: str) -> None:
+        message = "RC003 HID report tap state: %s"
+        args = [status]
+        if detail:
+            message += " detail=%s"
+            args.append(detail)
+        if status in {
+            frida_compat.HidTapState.FAILED.value,
+            frida_compat.HidTapState.UNHEALTHY.value,
+        }:
+            self._logger.warning(message, *args)
+        else:
+            self._logger.info(message, *args)
 
     def _on_direct_hid_report(self, report_id: int, payload: bytes) -> None:
         """Translate every RC003 keyboard HID usage into button edges.

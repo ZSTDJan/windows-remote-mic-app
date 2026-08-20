@@ -28,6 +28,77 @@ class AudioEndpoint:
     host_api: str = ""
 
 
+UNSUPPORTED_BLOCKING_OUTPUT_HOST_APIS = frozenset({"Windows WDM-KS"})
+PREFERRED_OUTPUT_HOST_APIS = (
+    "Windows WASAPI",
+    "Windows DirectSound",
+    "MME",
+)
+
+
+def is_supported_output_host_api(host_api: str) -> bool:
+    """Whether the current blocking ``sounddevice.OutputStream`` path can
+    use this PortAudio host API.
+
+    PortAudio exposes WDM-KS devices during enumeration, but its blocking
+    read/write API is not implemented for that backend. Showing or accepting
+    one therefore creates a selection that can never carry RC003 PCM.
+    """
+
+    return host_api not in UNSUPPORTED_BLOCKING_OUTPUT_HOST_APIS
+
+
+def ensure_supported_output_endpoint(endpoint: AudioEndpoint) -> AudioEndpoint:
+    if not is_supported_output_host_api(endpoint.host_api):
+        raise AudioOutputUnavailableError(
+            f"output host API {endpoint.host_api!r} is not supported by "
+            "the current blocking playback path; select Windows WASAPI or "
+            "Windows DirectSound"
+        )
+    return endpoint
+
+
+def output_host_api_rank(host_api: str) -> int:
+    try:
+        return PREFERRED_OUTPUT_HOST_APIS.index(host_api)
+    except ValueError:
+        return len(PREFERRED_OUTPUT_HOST_APIS)
+
+
+def select_preferred_output_endpoint(
+    endpoints: Sequence[AudioEndpoint],
+) -> AudioEndpoint:
+    """Choose one usable host-API view without guessing between devices.
+
+    Windows commonly exposes the same physical endpoint through several
+    PortAudio host APIs. Prefer WASAPI, then DirectSound. If the best rank is
+    still represented by more than one endpoint, identity remains ambiguous
+    and the caller must fail closed.
+    """
+
+    usable = [
+        endpoint
+        for endpoint in endpoints
+        if is_supported_output_host_api(endpoint.host_api)
+    ]
+    if not usable:
+        raise AudioOutputUnavailableError(
+            "no output endpoint uses a supported blocking playback host API"
+        )
+    best_rank = min(output_host_api_rank(endpoint.host_api) for endpoint in usable)
+    preferred = [
+        endpoint
+        for endpoint in usable
+        if output_host_api_rank(endpoint.host_api) == best_rank
+    ]
+    if len(preferred) != 1:
+        raise AudioOutputUnavailableError(
+            f"{len(preferred)} equally preferred output endpoints remain; "
+            "select a unique device explicitly"
+        )
+    return preferred[0]
+
+
 def resolve_selected_endpoint(
     endpoints: Sequence[AudioEndpoint],
     selected_name: Optional[str],
@@ -35,20 +106,21 @@ def resolve_selected_endpoint(
 ) -> AudioEndpoint:
     """Return the endpoint the user selected, or fail closed.
 
-    Never picks a default or "closest match" endpoint: an empty selection, a
-    selection that no longer exists, or an ambiguous selection (same display
-    name exposed under more than one host API, e.g. WASAPI and MME both
-    listing "Speakers") all raise, by design - name alone is not always a
-    unique identity, so a saved ``selected_host_api`` disambiguates when
-    present. If no host API was saved (older config, or a name that happens
-    to be unique) and the name alone resolves to exactly one endpoint, that
-    is accepted; if it resolves to more than one, this fails closed instead
-    of guessing which one the user meant.
+    Never falls back to the system default or a differently named endpoint.
+    A saved ``selected_host_api`` must still resolve exactly. Older configs
+    that saved only a name may match several host-API views of that same
+    endpoint; those are ranked WASAPI, DirectSound, then MME. More than one
+    candidate at the best rank still fails closed instead of guessing.
     """
 
     if not selected_name:
         raise AudioOutputUnavailableError(
             "no output endpoint has been selected; open settings and choose one"
+        )
+
+    if selected_host_api and not is_supported_output_host_api(selected_host_api):
+        ensure_supported_output_endpoint(
+            AudioEndpoint(name=selected_name, host_api=selected_host_api)
         )
 
     name_matches = [endpoint for endpoint in endpoints if endpoint.name == selected_name]
@@ -67,16 +139,14 @@ def resolve_selected_endpoint(
                 f"selected output endpoint {selected_name!r} is no longer present "
                 f"under host API {selected_host_api!r}"
             )
-        # A saved host API is assumed unique per (name, host_api) pair.
-        return host_api_matches[0]
+        if len(host_api_matches) > 1:
+            raise AudioOutputUnavailableError(
+                f"{len(host_api_matches)} output endpoints share the selected "
+                "name and host API; select a unique device explicitly"
+            )
+        return ensure_supported_output_endpoint(host_api_matches[0])
 
-    if len(name_matches) > 1:
-        raise AudioOutputUnavailableError(
-            f"{len(name_matches)} output endpoints are named {selected_name!r} across "
-            "different host APIs; open settings and re-select one to disambiguate"
-        )
-
-    return name_matches[0]
+    return select_preferred_output_endpoint(name_matches)
 
 
 def enumerate_output_endpoints() -> List[AudioEndpoint]:
@@ -87,7 +157,11 @@ def enumerate_output_endpoints() -> List[AudioEndpoint]:
     never fails on a machine without the optional dependency installed.
     """
 
-    return _enumerate_endpoints("max_output_channels")
+    return [
+        endpoint
+        for endpoint in _enumerate_endpoints("max_output_channels")
+        if is_supported_output_host_api(endpoint.host_api)
+    ]
 
 
 def enumerate_input_endpoints() -> List[AudioEndpoint]:
@@ -96,7 +170,7 @@ def enumerate_input_endpoints() -> List[AudioEndpoint]:
     confirm a VB-CABLE ``CABLE Output`` recording endpoint exists alongside
     the ``CABLE Input`` playback endpoint - this project's own voice path
     never reads from a recording endpoint itself (see
-    ``resolve_selected_endpoint``, which is playback-only and unchanged).
+    ``resolve_selected_endpoint``, which is playback-only).
     """
 
     return _enumerate_endpoints("max_input_channels")

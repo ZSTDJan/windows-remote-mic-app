@@ -144,11 +144,12 @@ def save_config(path: Path, config: Dict[str, Any]) -> None:
 
 
 def _normalize_voice_hotkey(config: Dict[str, Any]) -> None:
-    """Keep the two built-in voice modes paired with their real shortcuts.
+    """Repair only obsolete built-ins; keep trigger semantics independent.
 
-    Legacy built-in values are repaired, and a recorded built-in chord also
-    restores its required mode if the UI previously saved the two fields out
-    of sync. A user-supplied shortcut such as ``win+h`` remains untouched.
+    A host may define the same chord as either a toggle or a hold-to-talk
+    shortcut. Current settings therefore preserve ``voice_hotkey`` and
+    ``voice_trigger_mode`` independently instead of inferring or overwriting
+    one from the other.
     """
 
     current = str(config.get("voice_hotkey", "")).strip().lower()
@@ -167,7 +168,8 @@ def _normalize_voice_hotkey(config: Dict[str, Any]) -> None:
     try:
         mode = key_mapping.VoiceTriggerMode(config.get("voice_trigger_mode"))
     except ValueError:
-        mode = None
+        config["voice_trigger_mode"] = key_mapping.VoiceTriggerMode.TOGGLE.value
+        mode = key_mapping.VoiceTriggerMode.TOGGLE
 
     # ``lalt`` was an invalid recording of the RC003 F5 leak. Repair it only
     # for the built-in HOLD mode; arbitrary user shortcuts remain untouched.
@@ -175,15 +177,8 @@ def _normalize_voice_hotkey(config: Dict[str, Any]) -> None:
         config["voice_hotkey"] = key_mapping.voice_hotkey_for_trigger_mode(mode)
         return
 
-    if current not in key_mapping.LEGACY_VOICE_HOTKEYS:
-        inferred_mode = key_mapping.voice_trigger_mode_for_hotkey(current)
-        if inferred_mode is not None:
-            config["voice_trigger_mode"] = inferred_mode.value
-        return
-
-    if mode is None:
-        return
-    config["voice_hotkey"] = key_mapping.voice_hotkey_for_trigger_mode(mode)
+    # Current built-ins and custom chords are intentionally not coupled to
+    # ``mode``. In particular, ralt+space may legitimately be hold-to-talk.
 
 
 def default_key_bindings() -> Dict[str, Any]:

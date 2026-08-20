@@ -278,8 +278,15 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--pid", type=int, required=True)
     args = parser.parse_args(argv)
-    inject_current_process(args.pid)
-    return 0
+    try:
+        inject_current_process(args.pid)
+        return 0
+    except PermissionError:
+        return 3
+    except (OSError, RuntimeError, ValueError):
+        return 4
+    except Exception:  # noqa: BLE001 - hidden child reports only a stable exit code
+        return 5
 
 
 if __name__ == "__main__":

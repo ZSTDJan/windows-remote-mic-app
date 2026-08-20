@@ -189,7 +189,7 @@ Item {
                         rowSpacing: tokens.spacingSmall
 
                         Label {
-                            text: qsTr("语音键组合键（随触发方式同步）")
+                            text: qsTr("宿主语音快捷键")
                             color: tokens.textPrimary
                         }
                         TextField {
@@ -207,7 +207,7 @@ Item {
                             function onHotkeyTextChanged() {
                                 // TextField editing breaks a declarative
                                 // binding; restore the visible field when
-                                // the trigger-mode preset changes it.
+                                // the controller changes it programmatically.
                                 hotkeyField.text = SettingsController.hotkeyText
                             }
                         }
@@ -216,7 +216,7 @@ Item {
                             Layout.columnSpan: 2
                             Layout.fillWidth: true
                             wrapMode: Text.WordWrap
-                            text: qsTr("免按住自动使用右 Alt+空格；长按自动使用右 Alt。切换触发方式会同步更新快捷键。")
+                            text: qsTr("快捷键按宿主语音软件的设置填写；触发方式只决定按一下切换，还是按下到松开。")
                             color: tokens.textSecondary
                             font.pixelSize: tokens.fontSizeSmall
                         }

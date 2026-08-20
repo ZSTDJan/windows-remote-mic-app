@@ -39,7 +39,7 @@ class DefaultConfigPrivacyTests(unittest.TestCase):
     def test_output_endpoint_defaults_to_empty_so_voice_fails_closed(self):
         self.assertEqual(config.default_config()["output_endpoint_name"], "")
 
-    def test_load_repairs_a_stale_toggle_right_alt_pair(self):
+    def test_load_preserves_toggle_with_a_custom_right_alt_chord(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "config.json"
             path.write_text(
@@ -47,16 +47,18 @@ class DefaultConfigPrivacyTests(unittest.TestCase):
                 encoding="utf-8",
             )
             loaded = config.load_config(path)
-        self.assertEqual(loaded["voice_hotkey"], "ralt+space")
+        self.assertEqual(loaded["voice_hotkey"], "ralt")
+        self.assertEqual(loaded["voice_trigger_mode"], "toggle")
 
-    def test_save_repairs_a_stale_hold_right_alt_space_pair(self):
+    def test_save_preserves_hold_with_right_alt_space(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "config.json"
             data = config.default_config()
             data.update({"voice_trigger_mode": "hold", "voice_hotkey": "ralt+space"})
             config.save_config(path, data)
             loaded = config.load_config(path)
-        self.assertEqual(loaded["voice_hotkey"], "ralt")
+        self.assertEqual(loaded["voice_hotkey"], "ralt+space")
+        self.assertEqual(loaded["voice_trigger_mode"], "hold")
 
     def test_load_preserves_a_user_custom_voice_shortcut(self):
         with tempfile.TemporaryDirectory() as tmp:

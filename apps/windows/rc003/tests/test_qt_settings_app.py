@@ -34,6 +34,7 @@ from ovb_rc003 import (
     bridge_launcher,
     config,
     device_catalog,
+    frida_compat,
     hotkey,
     key_mapping,
     qt_settings_app,
@@ -367,17 +368,18 @@ class SettingsControllerTests(unittest.TestCase):
         controller, _ = self._make_controller()
         self.assertEqual(len(controller.triggerModeOptions), 2)
 
-    def test_trigger_mode_switch_also_switches_the_paired_voice_hotkey(self):
+    def test_trigger_mode_switch_preserves_the_recorded_voice_hotkey(self):
         controller, _ = self._make_controller()
+        controller.hotkeyText = "ralt+space"
         controller.triggerModeIndex = 1
-        self.assertEqual(controller.hotkeyText, "ralt")
+        self.assertEqual(controller.hotkeyText, "ralt+space")
         controller.triggerModeIndex = 0
         self.assertEqual(controller.hotkeyText, "ralt+space")
 
-    def test_recording_left_ctrl_win_switches_to_hold_without_replacing_capture(self):
+    def test_recording_a_hotkey_does_not_change_trigger_semantics(self):
         controller, _ = self._make_controller()
         controller._on_hotkey_capture_result("lctrl+lwin")
-        self.assertEqual(controller.triggerModeIndex, 1)
+        self.assertEqual(controller.triggerModeIndex, 0)
         controller.hotkeyText = "lctrl+lwin"
         self.assertEqual(controller.hotkeyText, "lctrl+lwin")
 
@@ -543,14 +545,84 @@ class SettingsControllerTests(unittest.TestCase):
 
     def test_real_key_detection_failure_is_reported_in_the_ui(self):
         controller, _ = self._make_controller()
+        class UnavailableTap:
+            status = frida_compat.HidTapState.UNAVAILABLE.value
+
+            def __init__(self, _report_handler, *, status_handler):
+                self.status_handler = status_handler
+
+            def start(self):
+                return False
+
         with mock.patch.object(
             qt_settings_app.raw_input_windows,
             "enumerate_matching_device_paths",
             side_effect=RuntimeError("Raw Input unavailable"),
+        ), mock.patch.object(
+            qt_settings_app.frida_compat,
+            "RC003HidReportTap",
+            UnavailableTap,
         ):
             controller.startKeyDetection()
         self.assertFalse(controller.keyDetectionActive)
         self.assertIn("Raw Input unavailable", controller.keyDetectionText)
+
+    def test_real_key_detection_accepts_missing_usage_from_hid_tap_and_stops_both(self):
+        controller, model = self._make_controller()
+        raw_instances = []
+        tap_instances = []
+
+        class FakeListener:
+            def __init__(self, _button_callback, _raw_callback):
+                self.stop_calls = 0
+                raw_instances.append(self)
+
+            def start(self, _device_path):
+                pass
+
+            def stop(self):
+                self.stop_calls += 1
+
+        class FakeTap:
+            def __init__(self, report_handler, *, status_handler):
+                self.report_handler = report_handler
+                self.status_handler = status_handler
+                self.status = frida_compat.HidTapState.STARTING.value
+                self.stop_calls = 0
+                tap_instances.append(self)
+
+            def start(self):
+                return True
+
+            def stop(self):
+                self.stop_calls += 1
+
+        with mock.patch.object(
+            qt_settings_app.raw_input_windows,
+            "enumerate_matching_device_paths",
+            return_value=["rc003-device-path"],
+        ), mock.patch.object(
+            qt_settings_app.raw_input_windows.hid_identity,
+            "select_single_device_path",
+            return_value="rc003-device-path",
+        ), mock.patch.object(
+            qt_settings_app.raw_input_windows,
+            "RawInputButtonListener",
+            FakeListener,
+        ), mock.patch.object(
+            qt_settings_app.frida_compat,
+            "RC003HidReportTap",
+            FakeTap,
+        ):
+            controller.startKeyDetection()
+            tap_instances[0].report_handler(1, bytes.fromhex("f10000000000"))
+
+        self.assertFalse(controller.keyDetectionActive)
+        self.assertEqual(controller.selectedButtonId, "back")
+        self.assertEqual(model.selected_button_id(), "back")
+        self.assertIn("0x00F1", controller.keyDetectionText)
+        self.assertEqual(raw_instances[0].stop_calls, 1)
+        self.assertEqual(tap_instances[0].stop_calls, 1)
 
     def test_open_log_location_reports_honestly_when_never_run(self):
         controller, _ = self._make_controller()
@@ -585,8 +657,14 @@ class SettingsControllerTests(unittest.TestCase):
 
     def test_select_and_persist_output_endpoint_succeeds_and_updates_options(self):
         controller, _ = self._make_controller()
-        result = controller.selectAndPersistOutputEndpoint("CABLE Input", "Windows WASAPI")
+        with mock.patch.object(
+            qt_settings_app.audio_playback, "preflight_output_endpoint"
+        ) as preflight:
+            result = controller.selectAndPersistOutputEndpoint(
+                "CABLE Input", "Windows WASAPI"
+            )
         self.assertTrue(result)
+        preflight.assert_called_once_with("CABLE Input", "Windows WASAPI")
         reloaded = config.load_config(config.config_path(controller._config_root))
         self.assertEqual(reloaded["output_endpoint_name"], "CABLE Input")
         self.assertEqual(reloaded["output_endpoint_host_api"], "Windows WASAPI")
@@ -597,7 +675,9 @@ class SettingsControllerTests(unittest.TestCase):
         # must never be reported as a successful save.
         controller, _ = self._make_controller()
         original_config = dict(controller._config)
-        with mock.patch.object(config, "save_config", side_effect=OSError("disk full")):
+        with mock.patch.object(
+            qt_settings_app.audio_playback, "preflight_output_endpoint"
+        ), mock.patch.object(config, "save_config", side_effect=OSError("disk full")):
             result = controller.selectAndPersistOutputEndpoint("CABLE Input", "Windows WASAPI")
         self.assertFalse(result)
         # The in-memory config must not look saved when it was not.
@@ -605,9 +685,26 @@ class SettingsControllerTests(unittest.TestCase):
 
     def test_select_and_persist_output_endpoint_never_raises_on_unexpected_error(self):
         controller, _ = self._make_controller()
-        with mock.patch.object(config, "save_config", side_effect=RuntimeError("boom")):
+        with mock.patch.object(
+            qt_settings_app.audio_playback, "preflight_output_endpoint"
+        ), mock.patch.object(config, "save_config", side_effect=RuntimeError("boom")):
             result = controller.selectAndPersistOutputEndpoint("CABLE Input", "")
         self.assertFalse(result)
+
+    def test_select_and_persist_output_endpoint_rejects_failed_preflight(self):
+        controller, _ = self._make_controller()
+        original_config = dict(controller._config)
+        with mock.patch.object(
+            qt_settings_app.audio_playback,
+            "preflight_output_endpoint",
+            side_effect=audio_output.AudioOutputUnavailableError("cannot open"),
+        ), mock.patch.object(config, "save_config") as save_config:
+            result = controller.selectAndPersistOutputEndpoint(
+                "CABLE Input", "Windows WASAPI"
+            )
+        self.assertFalse(result)
+        save_config.assert_not_called()
+        self.assertEqual(controller._config, original_config)
 
 
 @unittest.skipUnless(_HAS_PYSIDE6, _SKIP_REASON)
@@ -763,9 +860,17 @@ class DiagnosticsControllerTests(unittest.TestCase):
         # to, and starting a new thread this late only works against the
         # atexit hook's own bounded join.
         settings_controller = self._make_settings_controller()
-        diag = self.DiagnosticsController(settings_controller, self._config_root)
-        self._pump_until(lambda: not diag.isRefreshing)
-        self._pump_until(lambda: len(qt_settings_app._diagnostics_threads) == 0)
+        empty_report = windows_diagnostics.DiagnosticsReport(checks=())
+        with mock.patch.object(
+            windows_diagnostics, "run_diagnostics", return_value=empty_report
+        ):
+            diag = self.DiagnosticsController(settings_controller, self._config_root)
+            self.assertTrue(self._pump_until(lambda: not diag.isRefreshing))
+            self.assertTrue(
+                self._pump_until(
+                    lambda: len(qt_settings_app._diagnostics_threads) == 0
+                )
+            )
 
         qt_settings_app._diagnostics_shutdown_event.set()
         diag.refreshDiagnostics()
@@ -891,6 +996,8 @@ class DiagnosticsControllerTests(unittest.TestCase):
         endpoint = audio_output.AudioEndpoint(name="CABLE Input", host_api="Windows WASAPI")
         with mock.patch.object(
             audio_output, "enumerate_output_endpoints", return_value=[endpoint]
+        ), mock.patch.object(
+            qt_settings_app.audio_playback, "preflight_output_endpoint"
         ):
             result = diag.selectDetectedCableInputAsOutput()
 
@@ -971,6 +1078,28 @@ class DiagnosticsControllerTests(unittest.TestCase):
 
         self.assertFalse(result)
         self.assertIn("无法唯一确定", diag.driverErrorMessage)
+
+    def test_select_detected_cable_input_prefers_wasapi_over_directsound(self):
+        settings_controller = self._make_settings_controller()
+        diag = self.DiagnosticsController(settings_controller, self._config_root)
+        self._pump_until(lambda: not diag.isRefreshing)
+
+        endpoints = [
+            audio_output.AudioEndpoint(
+                name="CABLE Input", host_api="Windows DirectSound"
+            ),
+            audio_output.AudioEndpoint(name="CABLE Input", host_api="Windows WASAPI"),
+        ]
+        with mock.patch.object(
+            audio_output, "enumerate_output_endpoints", return_value=endpoints
+        ), mock.patch.object(
+            qt_settings_app.audio_playback, "preflight_output_endpoint"
+        ):
+            result = diag.selectDetectedCableInputAsOutput()
+
+        self.assertTrue(result)
+        reloaded = config.load_config(config.config_path(self._config_root))
+        self.assertEqual(reloaded["output_endpoint_host_api"], "Windows WASAPI")
 
     def test_launch_vb_cable_setup_reports_bundle_not_found_as_an_error(self):
         settings_controller = self._make_settings_controller()

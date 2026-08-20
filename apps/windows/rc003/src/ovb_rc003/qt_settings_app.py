@@ -102,10 +102,12 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 from . import (
+    audio_playback,
     audio_output,
     bridge_launcher,
     config,
     device_catalog,
+    frida_compat,
     hotkey,
     hotkey_capture_windows,
     key_mapping,
@@ -653,6 +655,7 @@ def _load_qt_classes() -> dict:
         keyDetectionActiveChanged = Signal()
         keyDetectionTextChanged = Signal()
         _rawKeyDetected = Signal(str, str)
+        _hidTapDetectionStatus = Signal(str, str)
         hotkeyCaptured = Signal(str)
         hotkeyCaptureError = Signal(str)
         _hotkeyCaptureResult = Signal(str)
@@ -692,11 +695,14 @@ def _load_qt_classes() -> dict:
             )
             self._dji_mic_status_text = ""
             self._key_detection_listener = None
+            self._key_detection_tap = None
+            self._key_detection_tap_usages = set()
             self._key_detection_active = False
             self._key_detection_text = (
                 "尚未检测真实按键。点击“检测真实按键”后，再按一次遥控器按键。"
             )
             self._rawKeyDetected.connect(self._on_raw_key_detected)
+            self._hidTapDetectionStatus.connect(self._on_hid_tap_detection_status)
             self._hotkey_capture = None
             self._hotkeyCaptureResult.connect(self._on_hotkey_capture_result)
 
@@ -712,20 +718,32 @@ def _load_qt_classes() -> dict:
         def _refresh_endpoint_options(self) -> None:
             try:
                 endpoints = audio_output.enumerate_output_endpoints()
+                endpoints = sorted(
+                    endpoints,
+                    key=lambda endpoint: (
+                        audio_output.output_host_api_rank(endpoint.host_api),
+                        endpoint.name.casefold(),
+                    ),
+                )
                 options = [settings_ui._endpoint_display(e) for e in endpoints]
             except audio_output.AudioOutputUnavailableError:
                 options = []
 
             saved_name = self._config.get("output_endpoint_name", "")
+            saved_host_api = self._config.get("output_endpoint_host_api", "")
             saved_display = ""
             if saved_name:
                 saved_display = settings_ui._endpoint_display(
                     audio_output.AudioEndpoint(
                         name=saved_name,
-                        host_api=self._config.get("output_endpoint_host_api", ""),
+                        host_api=saved_host_api,
                     )
                 )
-            if saved_display and saved_display not in options:
+            if (
+                saved_display
+                and audio_output.is_supported_output_host_api(saved_host_api)
+                and saved_display not in options
+            ):
                 # The previously-saved device is no longer enumerated (e.g.
                 # unplugged) - still show it as a selectable-but-absent
                 # option rather than silently discarding the user's saved
@@ -836,6 +854,8 @@ def _load_qt_classes() -> dict:
             choosing/saving the Windows mapping.
             """
 
+            if not self._key_detection_active:
+                return
             self.stopKeyDetection()
             if button_id:
                 self.selectButton(button_id)
@@ -851,12 +871,48 @@ def _load_qt_classes() -> dict:
                 f"{result}{details} 现在可设置该行的 Windows 映射并保存。"
             )
 
+        def _on_key_detection_hid_report(self, report_id: int, payload: bytes) -> None:
+            if report_id != 1 or len(payload) != 6 or not self._key_detection_active:
+                return
+            active = {
+                int.from_bytes(payload[index : index + 2], "little")
+                for index in range(0, len(payload), 2)
+            } & set(frida_compat.MISSING_USAGE_TO_BUTTON)
+            pressed = active - self._key_detection_tap_usages
+            self._key_detection_tap_usages = set(active)
+            if not pressed:
+                return
+            usage = sorted(pressed)[0]
+            button_id = frida_compat.MISSING_USAGE_TO_BUTTON[usage]
+            self._rawKeyDetected.emit(
+                button_id,
+                f"HID tap 报告：Usage=0x{usage:04X}",
+            )
+
+        def _on_key_detection_tap_status(self, status: str, detail: str) -> None:
+            self._hidTapDetectionStatus.emit(status, detail)
+
+        def _on_hid_tap_detection_status(self, status: str, detail: str) -> None:
+            if not self._key_detection_active:
+                return
+            if status == frida_compat.HidTapState.READY.value:
+                self._set_key_detection_text(
+                    "HID tap 已收到真实 RC003 报告。请按要检测的遥控器按键；"
+                    "不会执行映射动作。"
+                )
+            elif status in {
+                frida_compat.HidTapState.FAILED.value,
+                frida_compat.HidTapState.UNHEALTHY.value,
+            }:
+                suffix = f"（{detail}）" if detail else ""
+                self._set_key_detection_text(
+                    f"HID tap 当前不可用{suffix}；Raw Input 仍在监听 Windows "
+                    "能够暴露的按键。"
+                )
+
         def _on_hotkey_capture_result(self, chord: str) -> None:
             """Forward a hook-thread result to QML on the GUI thread."""
 
-            inferred_mode = key_mapping.voice_trigger_mode_for_hotkey(chord)
-            if inferred_mode is not None:
-                self._set_trigger_mode_preserving_hotkey(inferred_mode)
             self.hotkeyCaptured.emit(chord)
 
         def _set_trigger_mode_preserving_hotkey(
@@ -897,6 +953,20 @@ def _load_qt_classes() -> dict:
                 title = f"「{exc.button_id}」映射无效" if exc.button_id else "语音热键无效"
                 self._set_error_message(f"{title}：{exc.message}")
                 return False
+
+            endpoint_name = new_config.get("output_endpoint_name", "")
+            endpoint_host_api = new_config.get("output_endpoint_host_api", "")
+            if endpoint_name:
+                try:
+                    audio_playback.preflight_output_endpoint(
+                        endpoint_name, endpoint_host_api
+                    )
+                except audio_output.AudioOutputUnavailableError:
+                    self._set_error_message(
+                        "保存失败：所选语音输出设备无法实际打开。请选择 "
+                        "Windows WASAPI 或 Windows DirectSound 端点后重试。"
+                    )
+                    return False
 
             config_path = config.config_path(self._config_root)
             bindings_path = config.key_bindings_path(self._config_root)
@@ -948,8 +1018,6 @@ def _load_qt_classes() -> dict:
         def _set_trigger_mode_index(self, value: int) -> None:
             if value != self._trigger_mode_index and 0 <= value < len(self._TRIGGER_MODE_ORDER):
                 self._trigger_mode_index = value
-                trigger_mode = self._TRIGGER_MODE_ORDER[value]
-                self._set_hotkey_text(settings_ui.voice_hotkey_for_trigger_mode(trigger_mode))
                 self.triggerModeIndexChanged.emit()
 
         triggerModeIndex = Property(
@@ -1138,6 +1206,9 @@ def _load_qt_classes() -> dict:
             if self._selected_device_id() != device_catalog.RC003_ID:
                 self._set_key_detection_text("当前设备不是 RC003，无法检测遥控器按键。")
                 return
+            listener = None
+            tap = None
+            failures = []
             try:
                 paths = raw_input_windows.enumerate_matching_device_paths()
                 device_path = raw_input_windows.hid_identity.select_single_device_path(paths)
@@ -1152,17 +1223,55 @@ def _load_qt_classes() -> dict:
                     set_physical_bindings(self._bindings.get("physical_bindings", {}))
                 listener.start(device_path)
             except Exception as exc:  # noqa: BLE001 - surface failure in the UI
+                failures.append(f"Raw Input：{exc}")
+                if listener is not None:
+                    try:
+                        listener.stop()
+                    except Exception:
+                        pass
+                listener = None
+
+            tap = frida_compat.RC003HidReportTap(
+                self._on_key_detection_hid_report,
+                status_handler=self._on_key_detection_tap_status,
+            )
+            try:
+                if not tap.start():
+                    failures.append(f"HID tap：{tap.status}")
+                    tap = None
+            except Exception as exc:  # noqa: BLE001 - surface failure in the UI
+                failures.append(f"HID tap：{type(exc).__name__}")
+                try:
+                    tap.stop()
+                except Exception:
+                    pass
+                tap = None
+
+            if listener is None and tap is None:
                 self._key_detection_listener = None
+                self._key_detection_tap = None
                 self._key_detection_active = False
                 self.keyDetectionActiveChanged.emit()
-                self._set_key_detection_text(f"无法启动真实按键检测：{exc}")
+                self._set_key_detection_text(
+                    "无法启动真实按键检测：" + "；".join(failures)
+                )
                 return
 
             self._key_detection_listener = listener
+            self._key_detection_tap = tap
+            self._key_detection_tap_usages.clear()
             self._key_detection_active = True
             self.keyDetectionActiveChanged.emit()
+            if listener is not None and tap is not None:
+                source_text = "Raw Input 与 HID tap"
+            elif tap is not None:
+                source_text = "HID tap"
+            else:
+                source_text = "Raw Input"
+            failure_text = f" 受限来源：{'；'.join(failures)}。" if failures else ""
             self._set_key_detection_text(
-                "正在监听 RC003。请现在按一次遥控器按键；不会执行该键的映射动作。"
+                f"正在通过 {source_text} 监听 RC003。请现在按一次遥控器按键；"
+                f"不会执行该键的映射动作。{failure_text}"
             )
 
         @Slot()
@@ -1199,14 +1308,23 @@ def _load_qt_classes() -> dict:
         def stopKeyDetection(self) -> None:
             listener = self._key_detection_listener
             self._key_detection_listener = None
+            tap = self._key_detection_tap
+            self._key_detection_tap = None
+            was_active = self._key_detection_active
+            self._key_detection_active = False
+            self._key_detection_tap_usages.clear()
+            if was_active:
+                self.keyDetectionActiveChanged.emit()
             if listener is not None:
                 try:
                     listener.stop()
                 except Exception as exc:  # noqa: BLE001 - report, do not crash Qt
                     self._set_key_detection_text(f"停止真实按键检测时出错：{exc}")
-            if self._key_detection_active:
-                self._key_detection_active = False
-                self.keyDetectionActiveChanged.emit()
+            if tap is not None:
+                try:
+                    tap.stop()
+                except Exception as exc:  # noqa: BLE001 - report, do not crash Qt
+                    self._set_key_detection_text(f"停止 HID tap 检测时出错：{exc}")
 
         @Slot()
         def saveAndLaunch(self) -> None:
@@ -1340,8 +1458,9 @@ def _load_qt_classes() -> dict:
             new_config["output_endpoint_name"] = name
             new_config["output_endpoint_host_api"] = host_api
             try:
+                audio_playback.preflight_output_endpoint(name, host_api)
                 config.save_config(config.config_path(self._config_root), new_config)
-            except Exception:  # noqa: BLE001 - never let a persistence failure escape this Slot
+            except Exception:  # noqa: BLE001 - never let preflight/persistence escape this Slot
                 return False
 
             self._config = new_config
@@ -1620,14 +1739,14 @@ def _load_qt_classes() -> dict:
                     "未检测到 CABLE Input 端点；请先确认 VB-CABLE 已安装，安装后需要重启电脑。"
                 )
                 return False
-            if len(matches) > 1:
+            try:
+                endpoint = audio_output.select_preferred_output_endpoint(matches)
+            except audio_output.AudioOutputUnavailableError:
                 self._set_driver_error(
                     f"检测到 {len(matches)} 个 CABLE Input 端点，无法唯一确定，请手动在"
                     "「连接」页选择。"
                 )
                 return False
-
-            endpoint = matches[0]
             try:
                 persisted = self._settings_controller.selectAndPersistOutputEndpoint(
                     endpoint.name, endpoint.host_api

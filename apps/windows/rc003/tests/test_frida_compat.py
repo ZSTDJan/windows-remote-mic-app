@@ -1,9 +1,11 @@
 import hashlib
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
-from ovb_rc003 import frida_compat
+from ovb_rc003 import frida_compat, frida_hid_tap_injector
 
 
 class AssetDescriptorTests(unittest.TestCase):
@@ -124,7 +126,172 @@ class ReportTapTests(unittest.TestCase):
             )
             layer = frida_compat.BackKeyCompatLayer(gadget_path=path, asset=asset)
             self.assertTrue(layer.available)
-            self.assertEqual(layer.status, "ready_gadget_verified")
+            self.assertEqual(layer.status, "verified_not_started")
+
+
+class InjectorSubprocessTests(unittest.TestCase):
+    def test_source_command_is_an_argument_array_with_hidden_flag(self):
+        command = frida_compat.build_injector_command(
+            1234, frozen=False, executable="python.exe"
+        )
+        self.assertEqual(
+            command,
+            [
+                "python.exe",
+                "-m",
+                "ovb_rc003",
+                frida_compat.HID_TAP_INJECTOR_FLAG,
+                "--pid",
+                "1234",
+            ],
+        )
+
+    def test_frozen_command_reuses_the_packaged_executable(self):
+        command = frida_compat.build_injector_command(
+            4321, frozen=True, executable="RemoteMicRC003.exe"
+        )
+        self.assertEqual(
+            command,
+            [
+                "RemoteMicRC003.exe",
+                frida_compat.HID_TAP_INJECTOR_FLAG,
+                "--pid",
+                "4321",
+            ],
+        )
+
+    def test_nonzero_exit_is_captured_as_a_sanitized_failure(self):
+        def fake_run(command, **kwargs):
+            self.assertIsInstance(command, list)
+            self.assertFalse(kwargs["check"])
+            return subprocess.CompletedProcess(command, 4)
+
+        with self.assertRaises(frida_compat.HidTapInjectionError) as ctx:
+            frida_compat.run_injector_subprocess(1234, _run=fake_run)
+        self.assertEqual(str(ctx.exception), "injector_exit_code_4")
+
+    def test_timeout_is_captured_without_raw_child_output(self):
+        def fake_run(command, **kwargs):
+            raise subprocess.TimeoutExpired(command, kwargs["timeout"])
+
+        with self.assertRaises(frida_compat.HidTapInjectionError) as ctx:
+            frida_compat.run_injector_subprocess(1234, _run=fake_run)
+        self.assertEqual(str(ctx.exception), "injector_timeout")
+
+    def test_child_entrypoint_returns_stable_permission_failure_code(self):
+        with mock.patch.object(
+            frida_hid_tap_injector,
+            "inject_current_process",
+            side_effect=PermissionError("private detail"),
+        ):
+            self.assertEqual(frida_hid_tap_injector.main(["--pid", "1234"]), 3)
+
+    def test_child_entrypoint_returns_stable_validation_failure_code(self):
+        with mock.patch.object(
+            frida_hid_tap_injector,
+            "inject_current_process",
+            side_effect=RuntimeError("private detail"),
+        ):
+            self.assertEqual(frida_hid_tap_injector.main(["--pid", "1234"]), 4)
+
+
+class TapStateTests(unittest.TestCase):
+    def test_thread_start_is_starting_not_ready(self):
+        statuses = []
+        tap = frida_compat.RC003HidReportTap(
+            lambda _report_id, _payload: None,
+            enabled=False,
+            status_handler=lambda status, detail: statuses.append((status, detail)),
+        )
+        tap.enabled = True
+
+        class FakeThread:
+            def __init__(self, **kwargs):
+                self.target = kwargs["target"]
+                self.started = False
+
+            def start(self):
+                self.started = True
+
+            def is_alive(self):
+                return self.started
+
+        with mock.patch.object(
+            type(tap), "dependency_available", new_callable=mock.PropertyMock,
+            return_value=True,
+        ), mock.patch.object(frida_compat.threading, "Thread", FakeThread):
+            self.assertTrue(tap.start())
+
+        self.assertEqual(tap.status, frida_compat.HidTapState.STARTING.value)
+        self.assertNotEqual(tap.status, frida_compat.HidTapState.READY.value)
+        self.assertEqual(statuses[-1][0], frida_compat.HidTapState.STARTING.value)
+
+    def test_valid_hid_io_is_the_event_that_announces_ready(self):
+        reports = []
+        statuses = []
+        tap = frida_compat.RC003HidReportTap(
+            lambda report_id, payload: reports.append((report_id, payload)),
+            enabled=False,
+            injector=lambda _pid: None,
+            status_handler=lambda status, detail: statuses.append((status, detail)),
+        )
+
+        class FakeClient:
+            def __init__(self):
+                self.calls = 0
+
+            def settimeout(self, _timeout):
+                pass
+
+            def recv(self, _size):
+                self.calls += 1
+                if self.calls == 1:
+                    return (
+                        b'{"kind":"ready","hook_installed":true}\n'
+                        b'{"kind":"gatt_read","raw":"010000f10000000000"}\n'
+                    )
+                tap.stop_event.set()
+                return b""
+
+            def close(self):
+                pass
+
+        class FakeServer:
+            def setsockopt(self, *_args):
+                pass
+
+            def bind(self, _address):
+                pass
+
+            def listen(self, _backlog):
+                pass
+
+            def settimeout(self, _timeout):
+                pass
+
+            def accept(self):
+                return FakeClient(), ("127.0.0.1", 1)
+
+            def close(self):
+                pass
+
+        with mock.patch.object(
+            frida_compat.frida_hid_tap_runtime,
+            "find_rc003_hidogatt_host_pid",
+            return_value=2468,
+        ), mock.patch.object(frida_compat.socket, "socket", return_value=FakeServer()):
+            tap._run()
+
+        state_names = [status for status, _detail in statuses]
+        self.assertIn(frida_compat.HidTapState.ATTACHED_WAITING_IO.value, state_names)
+        self.assertIn(frida_compat.HidTapState.READY.value, state_names)
+        self.assertEqual(
+            reports,
+            [
+                (1, bytes.fromhex("f10000000000")),
+                (1, b"\x00" * 6),
+            ],
+        )
 
 
 if __name__ == "__main__":

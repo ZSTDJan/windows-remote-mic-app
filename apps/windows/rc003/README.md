@@ -132,13 +132,15 @@ Windows 默认输入/输出设备。如果要让语音识别/听写软件把 RC0
 [VB-CABLE](https://vb-audio.com/Cable/)，然后按下面的方向手动配置——
 方向不能弄反：
 
-- Remote Mic 的"语音输出设备"设置项 → 选择 `CABLE Input`
-  （VB-CABLE 虚拟"扬声器"一侧）；
+- Remote Mic 的"语音输出设备"设置项 → 优先选择
+  `CABLE Input — Windows WASAPI`，没有 WASAPI 时可选
+  `CABLE Input — Windows DirectSound`（VB-CABLE 虚拟"扬声器"一侧）；
 - 语音识别/听写软件的麦克风输入设置 → 选择 `CABLE Output`
   （VB-CABLE 虚拟"麦克风"一侧）。
 
-两边选成同一个名字，或方向选反，都会让语音功能静默失败，但普通按键映射
-仍然正常工作。
+不要选择 `Windows WDM-KS` 视图：PortAudio 能枚举它，但当前阻塞播放 API
+不能打开它。新版本会隐藏并拒绝该视图，保存前还会实际打开一次端点。两边
+选成同一个名字，或方向选反，都会让语音功能失败，但普通按键映射仍然正常。
 
 ### 独立测试 Windows 系统听写（Win+H）
 
@@ -160,7 +162,8 @@ VB-CABLE 虚拟音频驱动"卡片会显示 CABLE Input/CABLE Output 两个端�
 (UAC) 提示启动官方原始的 `VBCABLE_Setup_x64.exe`——本程序自身全程不以管理员
 身份运行，UAC 提示可以随时取消，取消不会安装任何内容。安装完成后需要重启
 电脑，重启后点击"重新检测"确认两个端点已出现，再点击同一页的"选择检测到
-的 CABLE Input 作为输出"即可把它设为语音输出端点（仍需要按方向手动把
+的 CABLE Input 作为输出"即可按 WASAPI、DirectSound 的顺序选择并预检
+语音输出端点（仍需要按方向手动把
 听写/识别软件的麦克风输入设为 `CABLE Output`）。这个入口只是把上面的手动
 下载步骤换成随包、离线、显式确认的流程，效果完全一致；仍然可以选择直接从
 <https://vb-audio.com/Cable/> 手动下载安装。
@@ -257,8 +260,8 @@ VB-CABLE 虚拟音频驱动"卡片会显示 CABLE Input/CABLE Output 两个端�
 
 RC003 共 **13 个物理按键**（12 个普通按键 + 1 个固定的麦克风按键）；遥控器
 **没有独立的物理静音键**（"系统静音"只是可选的手动绑定，不是任何按键的默认
-映射）；"返回"默认映射为退格动作；如果设备交付了未识别的 Raw Input 签名，需按
-下方的按键采集流程学习该物理签名。
+映射）；"返回"默认映射为退格动作。设置页的“检测真实按键”同时使用
+Raw Input 与可选 HID tap；后者补齐 Windows 普通输入链路丢失的返回和音量键。
 
 所有普通按键（方向、OK、Home、Menu、TV、Power、返回、音量±）的真实按下
 事件已通过 Frida HID tap 旁路在独立线程上报并由低层钩子吞掉原生键，只注入
@@ -267,10 +270,11 @@ RC003 共 **13 个物理按键**（12 个普通按键 + 1 个固定的麦克风�
 ### 隐私与来源、真机验证事项
 
 不持久化保存真实蓝牙地址、HID 路径或设备令牌；本候选源自同一 GPL-3.0
-参考项目的 Windows 实现，并在本仓库中完成了品牌、构建和说明适配。已在真实
-RC003 上完成配对、逐键（方向/OK/Home/Menu/TV/Power/返回/音量±单次触发）和
-语音链路（豆包输入法识别遥控器语音）验收；ATVV 语音延迟与音量、长期重连
-稳定性仍建议在更多真实场景中继续观察。只有用户明确确认后，程序才会通过
+参考项目的 Windows 实现，并在本仓库中完成了品牌、构建和说明适配。历史候选
+曾记录“已通过真实硬件验收”，包括配对、逐键和豆包语音；但 2026-08-20 在
+当前机器复核时重新发现 WDM-KS 无声与设置页漏键问题。本轮修复仍处于检查点
+待实测，历史记录不能替代当前构建的逐键和语音复测；详见 `MAINTENANCE.md`
+与 `TESTING.md`。只有用户明确确认后，程序才会通过
 Windows 的 `runas`/UAC 启动 VB-Audio 官方安装器；Remote Mic 自身不会提权。
 
 ## 功能实现
@@ -281,8 +285,8 @@ Windows 客户端围绕 RC003 使用场景实现，主要功能如下：
 - 使用 Windows **Raw Input** 接收遥控器普通按键，并校验选中的 HID 路径，避免误接收另一只相同型号设备的事件。
 - 对 Windows Raw Input 丢失的 HID usages，可选复用上游的 Frida Gadget WUDFHost tap。该 tap 上报遥控器的**全部键盘 usage**（返回 `0xF1`、音量 `0x80/0x81`、方向/OK/Home/Menu/TV/Power 等），作为所有普通按键的输入旁路：它在独立 socket 线程上 arm，低层键盘钩子零等待匹配并吞掉原生键，只注入一次映射动作，解决一次按键两次触发的问题。只有显式下载并校验 Gadget 后才会启用；Remote Mic 不会自动提权，需要 tap 时用户必须从已明确提升权限的终端启动桥接。
 - 连接 ATVV GATT 服务，协商能力，接收并解码 16 kHz IMA/DVI ADPCM 语音帧。
-- 使用 **PortAudio** 把解码后的语音写入用户明确选择的输出端点（按端点能力输出立体声并复制声道；16 kHz → 48 kHz 有状态连续插值；解码后经 20 Hz 高通 DC 阻挡和 +10 dB 增益）；不会自动使用 Windows 默认设备。
-- 语音快捷键使用带私有标记的虚拟键 `keybd_event`；`DoubaoPhysicalizer` 附加到豆包 `ImeService.exe` 的低层回调，只对该标记事件清除 `LLKHF_INJECTED` / lower-integrity 标志并清空 `dwExtraInfo`，再把右 Alt 事件转交给后续钩子，因此豆包看到的形状与实体右 Alt 一致。默认切换模式为 `ralt+space`，按住模式为 `ralt`；不把 Windows `Win+H` 当作豆包输入法的验收目标。
+- 使用 **PortAudio** 把解码后的语音写入用户明确选择的输出端点（WASAPI 优先、DirectSound 回退，拒绝阻塞 API 不支持的 WDM-KS；按端点能力输出立体声并复制声道；16 kHz → 48 kHz 有状态连续插值；解码后经 20 Hz 高通 DC 阻挡和 +10 dB 增益）；保存和诊断选择前会真实预检，不会自动使用 Windows 默认设备。
+- 语音快捷键使用带私有标记的虚拟键 `keybd_event`；`DoubaoPhysicalizer` 附加到豆包 `ImeService.exe` 的低层回调，只对该标记事件清除 `LLKHF_INJECTED` / lower-integrity 标志并清空 `dwExtraInfo`，再把右 Alt 事件转交给后续钩子，因此豆包看到的形状与实体右 Alt 一致。默认快捷键仍为 `ralt+space`，但宿主快捷键与“按一下切换 / 按住到松开”的生命周期分别设置，不再互相覆盖；不把 Windows `Win+H` 当作豆包输入法的验收目标。
 - 提供 RC003 的 13 键映射界面。麦克风键由 ATVV 协议固定处理；电源、返回、音量键在扫描码层直接映射为 Windows 动作。
 - 提供“连接”“按键”“权限”“检查与修复”四个设置页面；诊断页会区分“已检测到”和“需要手动验证”，不会把进程存活伪装成硬件验收通过。
 - 设置窗口使用 PySide6 Essentials + Qt Quick/QML；便携版和安装器都通过 PyInstaller 打包，不要求终端用户另装 Python 或 Qt。**单个 `RemoteMicRC003.exe`**：双击（无参数）或 `--settings` 打开设置窗口，`--bridge` 启动桥接。
@@ -297,7 +301,7 @@ Windows 客户端围绕 RC003 使用场景实现，主要功能如下：
 
 运行流程大致如下：
 
-1. 设置页保存设备、输出端点和按键映射；保存时会校验设备类型、组合键和音频端点，并以原子写 + 回读校验落盘。桥接进程在按键前按 mtime 热加载新映射。
+1. 设置页保存设备、输出端点和按键映射；保存时会校验设备类型与组合键，并对所选音频端点执行 open/start/stop/close 预检，再以原子写 + 回读校验落盘。桥接进程在按键前按 mtime 热加载新映射。
 2. 桥接进程启动单实例保护，并由连接监督器负责 BLE 会话、Raw Input 监听和重连。服务/特征读取使用 `BluetoothCacheMode.UNCACHED`，避免陈旧缓存。
 3. 可选的 RC003 HID tap 在配对的 WUDFHost 内读取全部键盘 usage，把方向/OK/Home/Menu/TV/Power/返回/音量边沿送入同一映射层，并在独立 socket 线程上 arm，低层钩子零等待吞掉原生键后只注入一次动作；普通动作仍通过 SendInput，语音快捷键通过物理化的右 Alt 事件，随后启动/停止 ATVV 音频流。
 4. BLE 断开、Raw Input 路径失效、热键发送失败或音频写入失败时，相关资源会先关闭，再按策略重连；不会继续向失效音频端点写入数据。
@@ -397,10 +401,10 @@ $env:PYTHONPATH = Join-Path (Get-Location) 'src'
   --output "$env:LOCALAPPDATA\RemoteMic\RC003\logs\broad-raw-probe.jsonl"
 ```
 
-看到 `kind=ready` 后，依次只按一个目标键并完整释放。若日志有 `raw_input`，先保留
+看到 `RC003 HID report tap state: ready` 后，依次只按一个目标键并完整释放。若日志有 `raw_input`，先保留
 其中的 `raw_type`、`body`、键盘字段和 `path` 交给解码适配；不要把 `path` 或蓝牙
-地址复制进 `key_bindings.json`。若连广域探针也没有 `raw_input`，但 tap 已显示 `READY`
-后仍没有 `RC003 HID TAP ...=down`，问题在配对设备的 HidOverGatt 注入/报告链路，
+地址复制进 `key_bindings.json`。若连广域探针也没有 `raw_input`，但 tap 已显示 ready
+后仍没有 `RC003 direct HID usage down`，问题在配对设备的 HidOverGatt 注入/报告链路，
 而不是按键动作映射。
 
 若回放通过但动作仍不对，问题在语义动作配置而不是物理识别；在设置页检查该逻辑键
@@ -426,7 +430,8 @@ Windows GitHub Actions 工作流位于 `.github/workflows/windows-rc003-ci.yml`�
   不会被猜测或伪造。执行脚本、从管理员终端启动后，还必须在日志中看到 tap ready 和
   真实按键边沿。
 - VB-CABLE 是可选的语音路由方案；未安装时语音默认没有虚拟麦克风路由，需要
-  用户自行配置输出端点。
+  用户自行配置输出端点。当前播放实现不支持 `Windows WDM-KS`，应使用
+  `Windows WASAPI`，必要时回退 `Windows DirectSound`。
 - 遥控器没有独立的物理静音键；语音键的 F5 兼容事件只用于识别，不再作为普通 F5 注入到主机。
 - Windows 权限页只能打开系统设置页面；Windows 没有一个可供本程序可靠读取的统一
   权限状态 API，因此不会显示虚假的“已授权”。

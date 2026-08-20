@@ -319,6 +319,7 @@ class OutputEndpointResolutionCheckTests(unittest.TestCase):
         result = diag.check_output_endpoint_resolution(
             "CABLE Input", "",
             list_playback=lambda: [audio_output.AudioEndpoint(name="CABLE Input")],
+            preflight=lambda _name, _host_api: None,
         )
         self.assertEqual(result.status, diag.CheckStatus.PASS)
         self.assertIn("CABLE Input", result.detail)
@@ -332,6 +333,7 @@ class OutputEndpointResolutionCheckTests(unittest.TestCase):
         result = diag.check_output_endpoint_resolution(
             "Speakers", "",
             list_playback=lambda: [audio_output.AudioEndpoint(name="Speakers")],
+            preflight=lambda _name, _host_api: None,
         )
         self.assertEqual(result.status, diag.CheckStatus.FAIL)
         self.assertIn("不是 CABLE Input", result.detail)
@@ -355,6 +357,21 @@ class OutputEndpointResolutionCheckTests(unittest.TestCase):
 
         result = diag.check_output_endpoint_resolution("x", "", list_playback=_raise)
         self.assertEqual(result.status, diag.CheckStatus.UNSUPPORTED)
+
+    def test_present_endpoint_that_cannot_open_fails(self):
+        result = diag.check_output_endpoint_resolution(
+            "CABLE Input",
+            "Windows WASAPI",
+            list_playback=lambda: [
+                audio_output.AudioEndpoint("CABLE Input", "Windows WASAPI")
+            ],
+            preflight=lambda _name, _host_api: (_ for _ in ()).throw(
+                RuntimeError("private endpoint detail")
+            ),
+        )
+        self.assertEqual(result.status, diag.CheckStatus.FAIL)
+        self.assertIn("无法实际打开", result.detail)
+        self.assertNotIn("private endpoint detail", result.detail)
 
 
 class DjiMic2InputCheckTests(unittest.TestCase):

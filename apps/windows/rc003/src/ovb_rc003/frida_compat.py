@@ -17,15 +17,17 @@ import hashlib
 import json
 import os
 from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 import socket
+import subprocess
+import sys
 import threading
 import time
 from typing import Callable
 
 from . import frida_hid_tap_runtime
 from .device_profile import BUTTON_USAGE_IDS
-from .frida_hid_tap_injector import inject_current_process
 
 
 @dataclass(frozen=True)
@@ -89,6 +91,77 @@ TAP_USAGE_TO_KEY = {
     0x00F1: (0xFF, 0x6A, True),  # back (untranslated VK)
 }
 
+HID_TAP_INJECTOR_FLAG = "--rc003-hid-injector"
+HID_TAP_INJECTOR_TIMEOUT_SECONDS = 30.0
+
+
+class HidTapInjectionError(RuntimeError):
+    pass
+
+
+class HidTapState(str, Enum):
+    DISABLED = "disabled_non_windows"
+    UNAVAILABLE = "unavailable_gadget_not_verified"
+    VERIFIED_NOT_STARTED = "verified_not_started"
+    STARTING = "starting"
+    WAITING_HOST = "waiting_for_rc003_host"
+    INJECTING = "injecting"
+    WAITING_CONNECTION = "waiting_for_gadget_connection"
+    ATTACHED_WAITING_IO = "attached_waiting_for_hid_io"
+    READY = "ready"
+    UNHEALTHY = "unhealthy"
+    FAILED = "failed"
+    STOPPED = "stopped"
+
+
+def build_injector_command(
+    pid: int,
+    *,
+    frozen: bool | None = None,
+    executable: str | None = None,
+) -> list[str]:
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        raise ValueError("injector PID must be a positive integer")
+    if frozen is None:
+        frozen = bool(getattr(sys, "frozen", False))
+    if executable is None:
+        executable = sys.executable
+    if not executable:
+        raise HidTapInjectionError("injector executable is unavailable")
+    suffix = [HID_TAP_INJECTOR_FLAG, "--pid", str(pid)]
+    if frozen:
+        return [executable, *suffix]
+    return [executable, "-m", "ovb_rc003", *suffix]
+
+
+def run_injector_subprocess(
+    pid: int,
+    *,
+    timeout: float = HID_TAP_INJECTOR_TIMEOUT_SECONDS,
+    _run: Callable[..., subprocess.CompletedProcess] = subprocess.run,
+) -> None:
+    """Run the narrow injector out of process and accept only exit code 0."""
+
+    kwargs: dict = {
+        "stdin": subprocess.DEVNULL,
+        "stdout": subprocess.DEVNULL,
+        "stderr": subprocess.DEVNULL,
+        "check": False,
+        "timeout": timeout,
+    }
+    if sys.platform == "win32":
+        kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    try:
+        completed = _run(build_injector_command(pid), **kwargs)
+    except subprocess.TimeoutExpired as exc:
+        raise HidTapInjectionError("injector_timeout") from exc
+    except OSError as exc:
+        raise HidTapInjectionError("injector_launch_failed") from exc
+    if completed.returncode != 0:
+        raise HidTapInjectionError(
+            f"injector_exit_code_{int(completed.returncode)}"
+        )
+
 
 def verify_asset(path: Path, asset: ThirdPartyAsset = FRIDA_GADGET) -> bool:
     """Return true only when ``path`` is the exact pinned archive."""
@@ -131,17 +204,40 @@ class RC003HidReportTap:
         enabled: bool = True,
         retry_delay: float = 2.0,
         heartbeat_timeout: float = 15.0,
+        status_handler: Callable[[str, str], None] | None = None,
+        injector: Callable[[int], None] = run_injector_subprocess,
     ) -> None:
         self.report_handler = report_handler
         self.archive_path = archive_path or gadget_archive_path()
         self.enabled = bool(enabled) and os.name == "nt"
         self.retry_delay = max(0.5, float(retry_delay))
         self.heartbeat_timeout = max(10.0, float(heartbeat_timeout))
+        self.status_handler = status_handler or (lambda _status, _detail: None)
+        self.injector = injector
         self.stop_event = threading.Event()
         self.thread: threading.Thread | None = None
         self.active_usages: set[int] = set()
         self._state_lock = threading.Lock()
-        self._last_wait_log = 0.0
+        self._status = self._initial_status()
+        self._status_detail = ""
+
+    def _initial_status(self) -> HidTapState:
+        if not self.enabled:
+            return HidTapState.DISABLED
+        if not self.dependency_available:
+            return HidTapState.UNAVAILABLE
+        return HidTapState.VERIFIED_NOT_STARTED
+
+    def _set_status(self, state: HidTapState, detail: str = "") -> None:
+        with self._state_lock:
+            if state == self._status and detail == self._status_detail:
+                return
+            self._status = state
+            self._status_detail = detail
+        try:
+            self.status_handler(state.value, detail)
+        except Exception:
+            pass
 
     @property
     def dependency_available(self) -> bool:
@@ -153,15 +249,13 @@ class RC003HidReportTap:
 
     @property
     def status(self) -> str:
-        if not self.enabled:
-            return "disabled_non_windows"
-        if not self.archive_path.is_file():
-            return "unavailable_gadget_not_downloaded"
-        if not self.dependency_available:
-            return "unavailable_gadget_hash_mismatch"
-        if self.thread is not None and self.thread.is_alive():
-            return "running_waiting_for_hidogatt_io"
-        return "ready_gadget_verified"
+        with self._state_lock:
+            return self._status.value
+
+    @property
+    def status_detail(self) -> str:
+        with self._state_lock:
+            return self._status_detail
 
     def _release_active(self) -> None:
         with self._state_lock:
@@ -179,33 +273,30 @@ class RC003HidReportTap:
             previous = self.active_usages
             if active == previous:
                 return
-            pressed = active - previous
-            released = previous - active
             self.active_usages = set(active)
         filtered = b"".join(
             value.to_bytes(2, "little") for value in sorted(active)
         )
         self.report_handler(1, (filtered + b"\x00" * 6)[:6])
-        changes = [
-            f"{TAP_USAGE_TO_BUTTON[value]}=down" for value in sorted(pressed)
-        ]
-        changes.extend(
-            f"{TAP_USAGE_TO_BUTTON[value]}=up" for value in sorted(released)
-        )
-        print(
-            f"RC003 HID TAP {' '.join(changes)} raw={data.hex()}",
-            flush=True,
-        )
+
+    def _run_guarded(self) -> None:
+        try:
+            self._run()
+        except Exception as exc:  # noqa: BLE001 - thread must report, never disappear
+            self._set_status(
+                HidTapState.FAILED,
+                f"tap_thread_exception_{type(exc).__name__}",
+            )
+        finally:
+            if self.stop_event.is_set():
+                self._set_status(HidTapState.STOPPED)
 
     def _run(self) -> None:
         injection_attempted_pid: int | None = None
         while not self.stop_event.is_set():
             pid = frida_hid_tap_runtime.find_rc003_hidogatt_host_pid()
             if pid is None:
-                now = time.monotonic()
-                if now - self._last_wait_log >= 30.0:
-                    self._last_wait_log = now
-                    print("RC003 HID TAP waiting_for_rc003_host", flush=True)
+                self._set_status(HidTapState.WAITING_HOST)
                 self.stop_event.wait(self.retry_delay)
                 continue
             if pid != injection_attempted_pid:
@@ -218,33 +309,33 @@ class RC003HidReportTap:
                 server.listen(1)
                 server.settimeout(1.0)
                 if injection_attempted_pid is None:
+                    self._set_status(HidTapState.INJECTING)
                     try:
-                        inject_current_process(pid)
+                        self.injector(pid)
                         injection_attempted_pid = pid
-                    except Exception as exc:
-                        print(
-                            f"RC003 HID TAP injection retry {type(exc).__name__}: {exc}",
-                            flush=True,
+                    except Exception as exc:  # noqa: BLE001 - retry with sanitized state
+                        self._set_status(
+                            HidTapState.FAILED,
+                            str(exc)
+                            if isinstance(exc, HidTapInjectionError)
+                            else f"injector_exception_{type(exc).__name__}",
                         )
                         self.stop_event.wait(self.retry_delay)
                         continue
+                self._set_status(HidTapState.WAITING_CONNECTION)
                 try:
                     client, _address = server.accept()
                 except socket.timeout:
                     continue
                 client.settimeout(1.0)
                 try:
-                    print(
-                        f"RC003 HID TAP ATTACHED pid={pid} awaiting_io=true",
-                        flush=True,
-                    )
+                    self._set_status(HidTapState.ATTACHED_WAITING_IO)
                     buffer = b""
                     last_heartbeat = time.monotonic()
                     io_verified = False
-                    announced_ready = False
                     while not self.stop_event.is_set():
                         if frida_hid_tap_runtime.find_rc003_hidogatt_host_pid() != pid:
-                            print(f"RC003 HID TAP HOST CHANGED old_pid={pid}", flush=True)
+                            self._set_status(HidTapState.WAITING_HOST, "host_changed")
                             injection_attempted_pid = None
                             break
                         try:
@@ -252,9 +343,15 @@ class RC003HidReportTap:
                         except socket.timeout:
                             chunk = None
                         if chunk == b"":
+                            if not self.stop_event.is_set():
+                                self._set_status(
+                                    HidTapState.UNHEALTHY,
+                                    "gadget_connection_closed",
+                                )
                             break
                         if chunk:
                             buffer += chunk
+                            fatal_message = False
                             while b"\n" in buffer:
                                 line, buffer = buffer.split(b"\n", 1)
                                 try:
@@ -262,7 +359,16 @@ class RC003HidReportTap:
                                 except (UnicodeDecodeError, json.JSONDecodeError):
                                     continue
                                 kind = message.get("kind")
-                                if kind in {"heartbeat", "ready"}:
+                                if kind == "ready":
+                                    last_heartbeat = time.monotonic()
+                                    if message.get("hook_installed") is not True:
+                                        self._set_status(
+                                            HidTapState.FAILED,
+                                            "gadget_hook_not_installed",
+                                        )
+                                        fatal_message = True
+                                        break
+                                elif kind == "heartbeat":
                                     last_heartbeat = time.monotonic()
                                 elif kind == "gatt_read":
                                     raw = message.get("raw", "")
@@ -270,28 +376,25 @@ class RC003HidReportTap:
                                         data = bytes.fromhex(raw)
                                     except (TypeError, ValueError):
                                         data = b""
-                                    if data:
+                                    if decode_rc003_ioctl_output(data) is not None:
                                         io_verified = True
+                                        self._set_status(HidTapState.READY, "hid_io_verified")
                                         self._handle_ioctl_output(data)
                                 elif kind == "error":
-                                    print(
-                                        f"RC003 HID TAP hook_error={message.get('message')}",
-                                        flush=True,
-                                    )
+                                    self._set_status(HidTapState.FAILED, "gadget_hook_error")
+                                    fatal_message = True
+                                    break
+                            if fatal_message:
+                                break
                         now = time.monotonic()
                         if now - last_heartbeat >= self.heartbeat_timeout:
-                            print(
-                                f"RC003 HID TAP UNHEALTHY pid={pid} "
-                                "reason=agent_heartbeat_stale",
-                                flush=True,
+                            self._set_status(
+                                HidTapState.UNHEALTHY,
+                                "gadget_heartbeat_stale",
                             )
                             break
-                        if io_verified and not announced_ready:
-                            announced_ready = True
-                            print(
-                                f"RC003 HID TAP READY pid={pid} io_verified=true",
-                                flush=True,
-                            )
+                        if io_verified:
+                            self._set_status(HidTapState.READY, "hid_io_verified")
                 finally:
                     try:
                         client.close()
@@ -305,16 +408,17 @@ class RC003HidReportTap:
 
     def start(self) -> bool:
         if not self.enabled:
-            print("RC003 HID TAP disabled", flush=True)
+            self._set_status(HidTapState.DISABLED)
             return False
         if not self.dependency_available:
-            print("RC003 HID TAP unavailable verified_gadget_not_installed", flush=True)
+            self._set_status(HidTapState.UNAVAILABLE)
             return False
         if self.thread is not None and self.thread.is_alive():
             return True
         self.stop_event.clear()
+        self._set_status(HidTapState.STARTING)
         self.thread = threading.Thread(
-            target=self._run,
+            target=self._run_guarded,
             name="rc003-hidogatt-report-tap",
             daemon=True,
         )
@@ -329,6 +433,7 @@ class RC003HidReportTap:
                 raise RuntimeError("RC003 HID report tap did not stop")
         self._release_active()
         self.thread = None
+        self._set_status(HidTapState.STOPPED)
 
 
 class BackKeyCompatLayer(RC003HidReportTap):

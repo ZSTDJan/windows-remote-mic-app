@@ -488,7 +488,7 @@ Item {
                             Layout.fillWidth: true
                             Layout.minimumWidth: 0
                             text: SettingsController.hotkeyText
-                            placeholderText: qsTr("免按住 ralt+space；长按 ralt")
+                            placeholderText: qsTr("例如 ralt+space")
                             selectByMouse: true
                             onEditingFinished: SettingsController.hotkeyText = text
                             Accessible.name: qsTr("语音键组合键")
@@ -516,7 +516,7 @@ Item {
                         anchors.rightMargin: tokens.spacingSmall
                         anchors.bottomMargin: tokens.spacingSmall
                         visible: mappingRow.isMic
-                        text: qsTr("豆包：免按住 ralt+space；长按 ralt")
+                        text: qsTr("组合键按宿主语音软件设置；触发方式在连接页选择")
                         color: tokens.textSecondary
                         font.pixelSize: tokens.fontSizeSmall
                         elide: Text.ElideRight

@@ -13,7 +13,14 @@ import sys
 import unittest
 
 from ovb_rc003 import __main__ as main_module
-from ovb_rc003 import app, config, device_catalog, single_instance, windows_diagnostics
+from ovb_rc003 import (
+    app,
+    config,
+    device_catalog,
+    frida_compat,
+    single_instance,
+    windows_diagnostics,
+)
 
 
 def _make_guard_class(*, raise_on_enter=None, enter_calls=None):
@@ -300,6 +307,29 @@ class ArgumentModeBypassTests(_ArgvRestoringTestCase):
         finally:
             windows_diagnostics.run_ble_diagnostics_subprocess_entrypoint = original_entrypoint
 
+        self.assertEqual(enter_calls, [])
+
+    def test_hid_injector_child_never_touches_the_guard(self):
+        enter_calls = []
+        received_args = []
+        single_instance.BridgeInstanceGuard = _make_guard_class(enter_calls=enter_calls)
+        app.main = lambda: self.fail("HID injector child must never call app.main()")
+        original_injector_main = frida_compat.injector_main
+        frida_compat.injector_main = lambda args: received_args.append(args) or 4
+        sys.argv = [
+            "ovb_rc003",
+            frida_compat.HID_TAP_INJECTOR_FLAG,
+            "--pid",
+            "1234",
+        ]
+        try:
+            with self.assertRaises(SystemExit) as ctx:
+                main_module.main()
+        finally:
+            frida_compat.injector_main = original_injector_main
+
+        self.assertEqual(ctx.exception.code, 4)
+        self.assertEqual(received_args, [["--pid", "1234"]])
         self.assertEqual(enter_calls, [])
 
 

@@ -45,8 +45,12 @@ built from the standalone ``src/launcher.py`` entry point - see XRBM-021):
                   path here fails this branch CLOSED (a nonzero exit,
                   before ever attempting discovery, never a fallback
                   location and never falling through to running the
-                  bridge). Never launched by a real end user directly; not
-                  part of this program's public CLI surface.
+                bridge). Never launched by a real end user directly; not
+                part of this program's public CLI surface.
+- ``--rc003-hid-injector --pid <pid>``  HIDDEN child-process entry point for
+                the verified HID tap injector. It validates the current
+                RC003 WUDFHost target and returns a stable exit code; it never
+                falls through to settings or bridge startup.
 - ``--help``/``-h``  print this usage and exit 0
 
 ``--settings``, ``--bridge``, ``--dry-run``,
