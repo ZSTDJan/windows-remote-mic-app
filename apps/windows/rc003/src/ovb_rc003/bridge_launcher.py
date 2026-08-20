@@ -88,6 +88,17 @@ class BridgeLaunchConfigurationError(Exception):
     """
 
 
+@dataclass(frozen=True)
+class SettingsLaunchResult:
+    command: Tuple[str, ...]
+    pid: Optional[int] = None
+    error: Optional[str] = None
+
+    @property
+    def started(self) -> bool:
+        return self.pid is not None and self.error is None
+
+
 def build_launch_command(
     *,
     frozen: Optional[bool] = None,
@@ -124,6 +135,52 @@ def build_launch_command(
         "--bridge",
         SETTINGS_LAUNCH_FLAG,
     ]
+
+
+def build_settings_command(
+    *,
+    frozen: Optional[bool] = None,
+    executable: Optional[str] = None,
+) -> List[str]:
+    """Build the explicit settings command used by the bridge tray."""
+
+    if frozen is None:
+        frozen = bool(getattr(sys, "frozen", False))
+    if executable is None:
+        executable = sys.executable
+    if not executable:
+        raise BridgeLaunchConfigurationError(
+            "sys.executable is empty; cannot construct a settings launch command"
+        )
+    if frozen:
+        return [executable, "--settings"]
+    return [executable, "-m", "ovb_rc003", "--settings"]
+
+
+def launch_settings(
+    command: Optional[Sequence[str]] = None,
+    *,
+    _popen: Callable[..., "subprocess.Popen"] = subprocess.Popen,
+    _popen_kwargs: Optional[Dict[str, object]] = None,
+) -> SettingsLaunchResult:
+    """Open a settings window from the bridge tray without using a shell."""
+
+    resolved_command = tuple(command) if command is not None else tuple(
+        build_settings_command()
+    )
+    popen_kwargs = dict(_popen_kwargs) if _popen_kwargs is not None else {}
+    if _popen is subprocess.Popen and sys.platform == "win32":
+        popen_kwargs.setdefault(
+            "creationflags", getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        )
+    try:
+        process = _popen(list(resolved_command), **popen_kwargs)
+    except OSError as exc:
+        return SettingsLaunchResult(command=resolved_command, error=str(exc))
+    return SettingsLaunchResult(
+        command=resolved_command,
+        pid=getattr(process, "pid", None),
+    )
 
 
 class LaunchOutcome(Enum):

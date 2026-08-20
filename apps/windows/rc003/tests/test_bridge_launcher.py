@@ -73,6 +73,24 @@ class BuildLaunchCommandTests(unittest.TestCase):
         )
         self.assertNotIn("--settings", command)
 
+    def test_frozen_settings_command_uses_the_same_executable(self):
+        command = bridge_launcher.build_settings_command(
+            frozen=True, executable=r"C:\Apps\RemoteMicRC003.exe"
+        )
+        self.assertEqual(
+            command,
+            [r"C:\Apps\RemoteMicRC003.exe", "--settings"],
+        )
+
+    def test_source_settings_command_uses_module_entrypoint(self):
+        command = bridge_launcher.build_settings_command(
+            frozen=False, executable=r"C:\Python312\python.exe"
+        )
+        self.assertEqual(
+            command,
+            [r"C:\Python312\python.exe", "-m", "ovb_rc003", "--settings"],
+        )
+
     def test_empty_executable_fails_closed(self):
         with self.assertRaises(bridge_launcher.BridgeLaunchConfigurationError):
             bridge_launcher.build_launch_command(frozen=False, executable="")
@@ -229,6 +247,33 @@ class LaunchBridgeTests(unittest.TestCase):
 
         self.assertEqual(len(popen_calls), 1)
         self.assertTrue(popen_calls[0])  # non-empty, host-dependent contents
+
+
+class LaunchSettingsTests(unittest.TestCase):
+    def test_success_reports_the_created_process_pid(self):
+        process = _FakeProcess([None], pid=6543)
+        popen_calls = []
+
+        result = bridge_launcher.launch_settings(
+            ["exe", "--settings"],
+            _popen=lambda command: popen_calls.append(command) or process,
+        )
+
+        self.assertTrue(result.started)
+        self.assertEqual(result.pid, 6543)
+        self.assertEqual(popen_calls, [["exe", "--settings"]])
+
+    def test_launch_error_is_returned_without_raising(self):
+        def fail(_command):
+            raise OSError("missing settings executable")
+
+        result = bridge_launcher.launch_settings(
+            ["missing.exe", "--settings"],
+            _popen=fail,
+        )
+
+        self.assertFalse(result.started)
+        self.assertIn("missing settings executable", result.error)
 
 
 if __name__ == "__main__":

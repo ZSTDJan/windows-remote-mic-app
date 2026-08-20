@@ -1233,12 +1233,13 @@ class RealWindowsCiEvidenceContractTests(unittest.TestCase):
 class PortableAndInstallerFlowContractTests(unittest.TestCase):
     """XRBM-027 RETRY 1 correction: the installer and the portable ZIP are
     materially different distributions - the portable ZIP has no Start
-    Menu entries, no stop script, and no uninstaller, so it must never be
-    told to a user via the installer's Start Menu instructions. Each flow
-    needs its own settings/start/stop/removal steps, and the portable
-    steps must name the real executable and real flags this candidate
-    actually ships (see __main__.py's ``--settings``/no-argument handling
-    and the .spec's ``AppExeName``/``RemoteMicRC003.exe``).
+    Menu entries, no stop script, and no uninstaller. The bridge now owns a
+    notification-area exit command, so the portable flow uses that graceful
+    path and keeps Task Manager only as a last-resort fallback. Each flow
+    still needs its own settings/start/stop/removal steps, and the portable
+    steps must name the real executable and real flags this candidate ships
+    (see __main__.py's ``--settings``/no-argument handling and the .spec's
+    ``AppExeName``/``RemoteMicRC003.exe``).
     """
 
     def setUp(self):
@@ -1258,10 +1259,12 @@ class PortableAndInstallerFlowContractTests(unittest.TestCase):
             r"`.\RemoteMicRC003.exe --bridge` 启动桥接", self.normalized
         )
 
-    def test_portable_stop_is_via_task_manager_not_a_stop_script(self):
+    def test_portable_stop_prefers_notification_area_with_task_manager_fallback(self):
+        self.assertIn("通知区域", self.text)
+        self.assertIn("退出桥接", self.text)
+        self.assertIn("正常清理 BLE、HID、语音热键与音频资源", self.normalized)
         self.assertIn("任务管理器", self.text)
-        self.assertIn("结束任务", self.text)
-        self.assertIn("Ctrl+Shift+Esc", self.text)
+        self.assertIn("只有托盘不可用且程序无法正常退出时", self.normalized)
         # Must explicitly say there is no packaged stop script/Start Menu
         # entry for the portable flow, so this isn't confused with the
         # installer's "停止" Start Menu shortcut.

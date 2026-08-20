@@ -100,6 +100,7 @@ def _dry_run() -> int:
         audio_playback,
         ble_transport_winrt,
         bridge_launcher,
+        bridge_tray_windows,
         config,
         connection_supervisor,
         device_catalog,

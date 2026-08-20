@@ -64,6 +64,8 @@ from . import (
     audio_playback,
     action_executor,
     ble_transport_winrt,
+    bridge_launcher,
+    bridge_tray_windows,
     button_gesture,
     config,
     connection_supervisor,
@@ -1114,11 +1116,63 @@ class RC003App:
             self._supervisor.request_reconnect()
 
 
-async def _run() -> None:
-    app = RC003App()
+async def _run(
+    *,
+    app_factory=None,
+    tray_factory=None,
+    settings_launcher=None,
+) -> None:
+    app_factory = app_factory or RC003App
+    tray_factory = tray_factory or bridge_tray_windows.BridgeTray
+    settings_launcher = settings_launcher or bridge_launcher.launch_settings
+    app = app_factory()
+    loop = asyncio.get_running_loop()
+    tray_exit_requested = threading.Event()
+    run_task = asyncio.create_task(app.run_forever())
+
+    def open_settings() -> None:
+        result = settings_launcher()
+        if result.started:
+            app._logger.info("notification area: settings opened; pid=%s", result.pid)
+        else:
+            app._logger.warning(
+                "notification area: settings launch failed: %s",
+                result.error or "unknown_error",
+            )
+
+    def request_exit() -> None:
+        tray_exit_requested.set()
+        loop.call_soon_threadsafe(run_task.cancel)
+
+    tray = None
     try:
-        await app.run_forever()
+        try:
+            tray = tray_factory(
+                on_open_settings=open_settings,
+                on_exit_requested=request_exit,
+                status_handler=lambda message: app._logger.info(
+                    "notification area: %s", message
+                ),
+            )
+            if tray.start():
+                app._logger.info("notification area: bridge control icon started")
+            else:
+                app._logger.warning(
+                    "notification area unavailable: %s",
+                    tray.startup_error or "unknown_error",
+                )
+        except Exception:
+            app._logger.exception("notification area failed to initialize")
+
+        try:
+            await run_task
+        except asyncio.CancelledError:
+            if not tray_exit_requested.is_set():
+                raise
+            app._logger.info("notification area: graceful bridge exit requested")
     finally:
+        if tray is not None and not tray.stop():
+            app._logger.warning("notification area thread did not stop cleanly")
         await app.stop()
 
 

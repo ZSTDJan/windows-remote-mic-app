@@ -11,7 +11,8 @@
 状态：自动检查通过，当前机器的 RC003 逐键与语音复测尚未完成；本节
 不得作为真机通过声明。维护证据与验收入口见 `MAINTENANCE.md`、
 `bugs/BUG-001-audio-endpoint.md`、`bugs/BUG-002-hid-tap-readiness.md`
-、`bugs/BUG-003-duplicate-bridge-dialog.md` 和 `TESTING.md`。
+、`bugs/BUG-003-duplicate-bridge-dialog.md`、
+`bugs/BUG-004-background-bridge-tray.md` 和 `TESTING.md`。
 
 ### 修复
 
@@ -32,6 +33,10 @@
   桥接实例时，子进程不再弹出阻塞轮询的系统模态框，而是立即返回既有的
   确定退出码，设置页可准确显示“已经在运行”。手工 `--bridge` 启动仍保留
   可见的单实例保护提示。
+- **后台桥接缺少退出入口**：桥接进程新增 Windows 通知区域图标；双击可
+  打开设置，右键可选择“打开设置”或“退出桥接”。托盘退出会投递到 asyncio
+  主线程并执行既有 BLE、HID、语音热键、音频与互斥锁清理，不依赖任务
+  管理器强杀。关闭设置窗口仍只关闭设置，不会意外中断桥接。
 
 ### 变更
 
