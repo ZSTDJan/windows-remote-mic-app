@@ -31,6 +31,8 @@
    立即结束 RC003 音频，无法在两次短按之间持续讲话。
 6. 后台桥接运行时，从通知区域打开的第二个设置进程无法使用“检测真实
    按键”；普通映射在记事本中仍能执行。
+7. 异机删除并重新配对后，Windows 设置只显示一个 RC003，但 WinRT 仍返回
+   两个名称匹配候选，桥接在连接前失败关闭。
 
 已确认原因：
 
@@ -46,6 +48,9 @@
   第二次切换，同时关闭逻辑会话；短按 PCM 只有 60 至 195 毫秒。
 - `BUG-006`：后台桥接已经独占 HID tap 端口并吞掉原始键，托盘打开的设置
   进程再次启动 Raw Input/HID tap，必然与资源所有者冲突或看不到事件。
+- `BUG-007`：已确认可见配对列表与 WinRT 枚举数量不一致；当前证据还不能
+  区分同一设备 ID 重复枚举与两个不同的隐藏/陈旧记录，先增加不记录原始
+  ID 的计数诊断，不改变失败关闭规则。
 
 本批次范围：
 
@@ -63,6 +68,7 @@
 - `bugs/BUG-004-background-bridge-tray.md`
 - `bugs/BUG-005-toggle-continuous-voice.md`
 - `bugs/BUG-006-live-bridge-key-detection.md`
+- `bugs/BUG-007-duplicate-winrt-ble-candidates.md`
 - `TESTING.md`
 
 实施结果：

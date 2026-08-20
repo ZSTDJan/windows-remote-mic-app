@@ -15,7 +15,8 @@
 、`bugs/BUG-003-duplicate-bridge-dialog.md`、
 `bugs/BUG-004-background-bridge-tray.md`、
 `bugs/BUG-005-toggle-continuous-voice.md`、
-`bugs/BUG-006-live-bridge-key-detection.md` 和 `TESTING.md`。
+`bugs/BUG-006-live-bridge-key-detection.md`、
+`bugs/BUG-007-duplicate-winrt-ble-candidates.md` 和 `TESTING.md`。
 
 ### 修复
 
@@ -48,6 +49,9 @@
   资源时，通过一次性本地文件 IPC 请求后台捕获下一键；后台回传逻辑按键并
   吞掉该次 down/up，不执行映射。后台未运行时仍使用本地 Raw Input 与
   HID tap。
+- **配对列表一个设备但桥接报告两个候选**：增加隐私安全的 WinRT 枚举
+  诊断，只记录候选总数、唯一设备 ID 数和重复条目数，不记录原始设备 ID、
+  蓝牙地址或设备路径。本诊断检查点尚未改变失败关闭的候选选择规则。
 
 ### 变更
 
