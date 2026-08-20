@@ -132,7 +132,10 @@ class RC003App:
         # exactly once per real press regardless of arrival order.
         self._voice_mic_gesture_active = False
         self._voice_mic_gesture_audio_started = False
+        self._voice_mic_gesture_audio_stopped = False
         self._voice_mic_gesture_sources_down: set[str] = set()
+        self._voice_audio_stream_active = False
+        self._voice_audio_stop_processed = False
         self._voice_raw_input_trigger_pending = False
         # When the built-in HOLD shortcut is selected, the low-level F5 hook
         # can deliver one right-Alt edge through the physicalized low-level
@@ -158,6 +161,8 @@ class RC003App:
         self._key_detection_suppressed_buttons: set[str] = set()
         self._playback: Optional[audio_playback.EndpointPlaybackSink] = None
         self._voice_pcm_stats = PcmStats()
+        self._event_loop = asyncio.get_event_loop()
+        self._legacy_voice_event_generation = 0
 
         self._supervisor = connection_supervisor.ConnectionSupervisor(
             connect=self._connect_once,
@@ -165,6 +170,7 @@ class RC003App:
             retry_delay=float(self._config.get("retry_delay", 2.0)),
             max_retry_delay=float(self._config.get("max_retry_delay", 60.0)),
             logger=self._logger,
+            loop=self._event_loop,
         )
 
     # -- lifecycle: driven by ConnectionSupervisor -------------------------
@@ -269,6 +275,7 @@ class RC003App:
             on_key_emit=self._emit_legacy_voice_key,
             rc003_vk_codes=frozenset(raw_input_windows.KEYBOARD_VK_TO_BUTTON),
         )
+        self._legacy_voice_event_generation += 1
         try:
             self._legacy_key_suppressor.start()
             self._logger.info("startup: RC003 voice legacy-key guard enabled")
@@ -416,6 +423,7 @@ class RC003App:
         """
 
         failures: List[str] = []
+        self._legacy_voice_event_generation += 1
 
         if self._hid_report_tap is not None:
             try:
@@ -440,6 +448,8 @@ class RC003App:
                 self._voice_audio_started_waiting_for_legacy_f5 = False
                 self._voice_toggle_close_pending = False
                 self._voice_raw_input_trigger_pending = False
+                self._voice_audio_stream_active = False
+                self._voice_audio_stop_processed = False
                 self._finish_voice_mic_gesture()
                 reset_action = self._voice.reset()
                 if reset_action is not None and not self._apply_voice_action(reset_action):
@@ -543,6 +553,7 @@ class RC003App:
             return False
         self._voice_mic_gesture_active = True
         self._voice_mic_gesture_audio_started = source == "audio_started"
+        self._voice_mic_gesture_audio_stopped = False
         self._voice_mic_gesture_sources_down = {source} if physical_down else set()
         return True
 
@@ -551,6 +562,7 @@ class RC003App:
 
         self._voice_mic_gesture_active = False
         self._voice_mic_gesture_audio_started = False
+        self._voice_mic_gesture_audio_stopped = False
         self._voice_mic_gesture_sources_down.clear()
 
     def _emit_legacy_voice_key(
@@ -640,14 +652,18 @@ class RC003App:
         )
 
     def _on_legacy_key_event(self, vk_code: int, is_pressed: bool) -> None:
-        """Use the already-suppressed physical F5 leak as a voice edge.
+        """Queue the already-suppressed physical F5 as a voice edge.
 
         Some RC003 firmware/Windows input-class combinations do not produce
         a device-scoped Raw Input keyboard record for the microphone button,
         even though the same physical press is visible to the low-level hook
         as F5. The hook is configured only for that legacy F5 and swallows it
-        before it reaches the foreground app; route the edge through the same
-        deduplicated voice path as Raw Input.
+        before it reaches the foreground app. This callback itself runs inside
+        WH_KEYBOARD_LL and therefore must return immediately: opening a
+        PortAudio endpoint can take longer than Windows' low-level-hook
+        timeout, after which Windows may silently remove the hook and let F5
+        reach the foreground app. Queue the application work onto the owning
+        event loop instead of waiting for the voice-state lock here.
         """
 
         if vk_code == 0x74:
@@ -658,9 +674,6 @@ class RC003App:
                 if self._legacy_f5_is_down:
                     return
                 self._legacy_f5_is_down = True
-                self._logger.info(
-                    "voice legacy F5 trigger received from low-level keyboard hook"
-                )
                 if (
                     self._voice_legacy_transform_emitted
                     or self._voice_legacy_transform_key_down
@@ -671,13 +684,38 @@ class RC003App:
             else:
                 self._legacy_f5_is_down = False
             host_action_handled = self._voice_legacy_transform_session
-            self._on_button_event(
-                "mic",
-                is_pressed,
-                host_action_handled=host_action_handled,
-                event_source="legacy_f5",
-            )
+            generation = self._legacy_voice_event_generation
+            try:
+                self._event_loop.call_soon_threadsafe(
+                    self._dispatch_legacy_key_event,
+                    generation,
+                    is_pressed,
+                    host_action_handled,
+                )
+            except RuntimeError:
+                # The owning loop is already closing. The original F5 remains
+                # swallowed by LegacyKeySuppressor; cleanup owns voice state.
+                pass
             self._voice_legacy_transform_emitted = False
+
+    def _dispatch_legacy_key_event(
+        self,
+        generation: int,
+        is_pressed: bool,
+        host_action_handled: bool,
+    ) -> None:
+        if generation != self._legacy_voice_event_generation:
+            return
+        if is_pressed:
+            self._logger.info(
+                "voice legacy F5 trigger received from low-level keyboard hook"
+            )
+        self._on_button_event(
+            "mic",
+            is_pressed,
+            host_action_handled=host_action_handled,
+            event_source="legacy_f5",
+        )
 
     def _on_raw_input_event(self, event: raw_input_windows.RawInputEvent) -> None:
         """Arm the exact original keyboard edge for duplicate suppression.
@@ -783,8 +821,13 @@ class RC003App:
                     if (
                         self._voice_mic_gesture_active
                         and not self._voice_mic_gesture_sources_down
-                        and not self._voice_mic_gesture_audio_started
-                        and not self._voice_toggle_close_pending
+                        and (
+                            self._voice_mic_gesture_audio_stopped
+                            or (
+                                not self._voice_mic_gesture_audio_started
+                                and not self._voice_toggle_close_pending
+                            )
+                        )
                     ):
                         self._finish_voice_mic_gesture()
                 return
@@ -984,6 +1027,14 @@ class RC003App:
         elif isinstance(event, AudioStarted):
             with self._voice_trigger_lock:
                 self._logger.info("voice audio started")
+                if self._voice_audio_stream_active:
+                    self._logger.info(
+                        "voice duplicate audio start ignored: session_id=%s",
+                        event.session_id,
+                    )
+                    return
+                self._voice_audio_stream_active = True
+                self._voice_audio_stop_processed = False
                 self._voice_pcm_stats.reset()
                 self._voice_audio_start_fallback_pending = False
                 if self._voice_toggle_close_pending:
@@ -991,10 +1042,15 @@ class RC003App:
                         "voice audio start ignored: toggle close still pending"
                     )
                 elif self._voice_mic_gesture_active:
-                    self._voice_mic_gesture_audio_started = True
-                    self._logger.info(
-                        "voice audio start matched current multi-source gesture"
-                    )
+                    if self._voice_mic_gesture_audio_stopped:
+                        self._logger.info(
+                            "voice continuation audio start ignored until physical release"
+                        )
+                    else:
+                        self._voice_mic_gesture_audio_started = True
+                        self._logger.info(
+                            "voice audio start matched current multi-source gesture"
+                        )
                 elif not self._voice.active:
                     if self._legacy_voice_transform_enabled():
                         self._logger.info(
@@ -1009,6 +1065,14 @@ class RC003App:
                             self._voice_audio_start_fallback_pending = self._voice.active
         elif isinstance(event, AudioStopped):
             with self._voice_trigger_lock:
+                if (
+                    not self._voice_audio_stream_active
+                    and self._voice_audio_stop_processed
+                ):
+                    self._logger.info("voice duplicate audio stop ignored")
+                    return
+                self._voice_audio_stream_active = False
+                self._voice_audio_stop_processed = True
                 self._logger.info("voice audio stopped")
                 stats = self._voice_pcm_stats.summary()
                 self._logger.info(
@@ -1030,7 +1094,11 @@ class RC003App:
                 self._voice_audio_start_fallback_pending = False
                 self._voice_audio_started_waiting_for_legacy_f5 = False
                 self._voice_raw_input_trigger_pending = False
-                self._finish_voice_mic_gesture()
+                if self._voice_mic_gesture_active:
+                    self._voice_mic_gesture_audio_started = False
+                    self._voice_mic_gesture_audio_stopped = True
+                    if not self._voice_mic_gesture_sources_down:
+                        self._finish_voice_mic_gesture()
                 toggle_close_completed = self._voice_toggle_close_pending
                 self._voice_toggle_close_pending = False
                 action = self._voice.on_audio_stopped()
@@ -1091,7 +1159,11 @@ class RC003App:
 
         self._voice_audio_started_waiting_for_legacy_f5 = False
 
-        if not self._open_playback_for_new_session():
+        is_toggle_close_request = (
+            self._voice.trigger_mode == key_mapping.VoiceTriggerMode.TOGGLE
+            and self._voice.active
+        )
+        if not is_toggle_close_request and not self._open_playback_for_new_session():
             self._logger.info(
                 "voice failing closed: no usable output endpoint; hotkey/MIC_OPEN suppressed"
             )

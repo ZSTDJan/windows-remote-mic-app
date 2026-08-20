@@ -204,6 +204,9 @@ class _AppWiringTestCase(unittest.TestCase):
         asyncio.set_event_loop(None)
         self._loop.close()
 
+    def _drain_event_loop(self):
+        self._loop.run_until_complete(asyncio.sleep(0))
+
 
 class CandidateResolutionWiringTests(_AppWiringTestCase):
     def test_connect_once_uses_connectable_candidate_resolver(self):
@@ -330,6 +333,7 @@ class HostHotkeyFailureSuppressesMicOpenTests(_AppWiringTestCase):
         try:
             self.app._on_legacy_key_event(0x74, True)
             self.app._on_legacy_key_event(0x74, False)
+            self._drain_event_loop()
         finally:
             win32_input.send_voice_key_combo_tap = original
 
@@ -345,6 +349,7 @@ class HostHotkeyFailureSuppressesMicOpenTests(_AppWiringTestCase):
         win32_input.send_voice_key_combo_down = lambda tokens: hotkey_calls.append(tokens)
         try:
             self.app._on_legacy_key_event(0x74, True)
+            self._drain_event_loop()
         finally:
             win32_input.send_voice_key_combo_down = original
 
@@ -478,6 +483,7 @@ class HostHotkeyFailureSuppressesMicOpenTests(_AppWiringTestCase):
         try:
             self.app._on_control_event(AudioStarted(session_id=1))
             self.app._on_legacy_key_event(0x74, True)
+            self._drain_event_loop()
             self.app._on_button_event("mic", True, event_source="hid")
             self.app._on_control_event(MicButtonPressed())
 
@@ -486,6 +492,7 @@ class HostHotkeyFailureSuppressesMicOpenTests(_AppWiringTestCase):
             self.assertFalse(self.app._voice_toggle_close_pending)
 
             self.app._on_legacy_key_event(0x74, False)
+            self._drain_event_loop()
             self.app._on_button_event("mic", False, event_source="hid")
             self.app._on_control_event(AudioStopped())
             self.app._on_button_event("mic", True, event_source="hid")
@@ -509,6 +516,7 @@ class HostHotkeyFailureSuppressesMicOpenTests(_AppWiringTestCase):
             self.app._on_control_event(MicButtonPressed())
             self.app._on_control_event(AudioStarted(session_id=1))
             self.app._on_legacy_key_event(0x74, True)
+            self._drain_event_loop()
         finally:
             win32_input.send_voice_key_combo_tap = original
 
@@ -529,6 +537,7 @@ class HostHotkeyFailureSuppressesMicOpenTests(_AppWiringTestCase):
             self.app._on_control_event(AudioStarted(session_id=1))
             self.app._on_legacy_key_event(0x74, True)
             self.app._on_legacy_key_event(0x74, False)
+            self._drain_event_loop()
             self.app._on_button_event("mic", False, event_source="hid")
             self.app._on_control_event(AudioStopped())
         finally:
@@ -561,6 +570,86 @@ class HostHotkeyFailureSuppressesMicOpenTests(_AppWiringTestCase):
         self.assertEqual(self.app._ble_session.mic_open_calls, 1)
         self.assertEqual(self.app._ble_session.mic_close_calls, 0)
 
+    def test_audio_stop_waits_for_all_physical_sources_before_releasing_gesture(self):
+        hotkey_calls = []
+        original = win32_input.send_voice_key_combo_tap
+        win32_input.send_voice_key_combo_tap = lambda tokens: hotkey_calls.append(tokens)
+        try:
+            self.app._on_control_event(AudioStarted(session_id=1))
+            self.app._on_legacy_key_event(0x74, True)
+            self._drain_event_loop()
+            self.app._on_button_event("mic", True, event_source="hid")
+
+            self.app._on_control_event(AudioStopped())
+            self.app._on_control_event(AudioStarted(session_id=2))
+            self.app._on_button_event("mic", True, event_source="hid")
+
+            self.assertEqual(hotkey_calls, [("ralt", "space")])
+            self.assertTrue(self.app._voice.active)
+            self.assertTrue(self.app._voice_mic_gesture_active)
+
+            self.app._on_legacy_key_event(0x74, False)
+            self._drain_event_loop()
+            self.app._on_button_event("mic", False, event_source="hid")
+            self.assertFalse(self.app._voice_mic_gesture_active)
+
+            self.app._on_button_event("mic", True, event_source="hid")
+        finally:
+            win32_input.send_voice_key_combo_tap = original
+
+        self.assertEqual(
+            hotkey_calls,
+            [("ralt", "space"), ("ralt", "space")],
+        )
+        self.assertFalse(self.app._voice.active)
+        self.assertEqual(self.app._ble_session.mic_close_calls, 1)
+
+    def test_duplicate_audio_stop_reopens_toggle_stream_only_once(self):
+        original = win32_input.send_voice_key_combo_tap
+        win32_input.send_voice_key_combo_tap = lambda tokens: None
+        try:
+            self.app._on_control_event(AudioStarted(session_id=1))
+            self.app._on_control_event(AudioStopped())
+            self.app._on_control_event(AudioStopped())
+        finally:
+            win32_input.send_voice_key_combo_tap = original
+
+        self.assertTrue(self.app._voice.active)
+        self.assertEqual(self.app._ble_session.mic_open_calls, 1)
+
+    def test_duplicate_audio_start_does_not_toggle_or_reset_the_gesture(self):
+        hotkey_calls = []
+        original = win32_input.send_voice_key_combo_tap
+        win32_input.send_voice_key_combo_tap = lambda tokens: hotkey_calls.append(tokens)
+        try:
+            self.app._on_control_event(AudioStarted(session_id=1))
+            self.app._on_control_event(AudioStarted(session_id=1))
+        finally:
+            win32_input.send_voice_key_combo_tap = original
+
+        self.assertEqual(hotkey_calls, [("ralt", "space")])
+        self.assertTrue(self.app._voice.active)
+        self.assertTrue(self.app._voice_mic_gesture_active)
+
+    def test_toggle_close_does_not_reopen_or_revalidate_playback(self):
+        self.app._voice.on_mic_button_pressed()
+        self.app._playback = None
+        hotkey_calls = []
+        original = win32_input.send_voice_key_combo_tap
+        win32_input.send_voice_key_combo_tap = lambda tokens: hotkey_calls.append(tokens)
+        try:
+            with mock.patch.object(
+                self.app, "_open_playback_for_new_session"
+            ) as open_playback:
+                self.app._handle_mic_button_pressed()
+        finally:
+            win32_input.send_voice_key_combo_tap = original
+
+        open_playback.assert_not_called()
+        self.assertEqual(hotkey_calls, [("ralt", "space")])
+        self.assertFalse(self.app._voice.active)
+        self.assertEqual(self.app._ble_session.mic_close_calls, 1)
+
     def test_toggle_second_press_closes_and_racing_audio_does_not_reopen(self):
         hotkey_calls = []
         original = win32_input.send_voice_key_combo_tap
@@ -570,6 +659,7 @@ class HostHotkeyFailureSuppressesMicOpenTests(_AppWiringTestCase):
             self.app._on_control_event(MicButtonPressed())
             self.app._on_control_event(AudioStarted(session_id=1))
             self.app._on_control_event(AudioStopped())
+            self.app._on_button_event("mic", False)
 
             self.app._on_button_event("mic", True)
             self.app._on_control_event(MicButtonPressed())
@@ -680,10 +770,32 @@ class OrdinaryButtonGestureWiringTests(_AppWiringTestCase):
             self.app._on_legacy_key_event(0x74, True)
             self.app._on_legacy_key_event(0x74, True)
             self.app._on_legacy_key_event(0x74, False)
+            self._drain_event_loop()
         finally:
             self.app._on_button_event = original
 
         self.assertEqual([entry[0][:2] for entry in calls], [("mic", True), ("mic", False)])
+
+    def test_legacy_f5_hook_callback_never_waits_for_the_voice_lock(self):
+        returned = []
+
+        def invoke():
+            self.app._on_legacy_key_event(0x74, True)
+            returned.append(True)
+
+        self.app._voice_trigger_lock.acquire()
+        worker = threading.Thread(target=invoke)
+        try:
+            worker.start()
+            worker.join(timeout=0.2)
+            returned_without_lock = not worker.is_alive()
+        finally:
+            self.app._voice_trigger_lock.release()
+        worker.join(timeout=1.0)
+        self._drain_event_loop()
+
+        self.assertTrue(returned_without_lock)
+        self.assertEqual(returned, [True])
 
     def test_semantic_arrow_action_uses_its_function_executor(self):
         calls = []
