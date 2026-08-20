@@ -168,7 +168,15 @@ class InjectorSubprocessTests(unittest.TestCase):
 
         with self.assertRaises(frida_compat.HidTapInjectionError) as ctx:
             frida_compat.run_injector_subprocess(1234, _run=fake_run)
-        self.assertEqual(str(ctx.exception), "injector_exit_code_4")
+        self.assertEqual(str(ctx.exception), "injector_validation_failed")
+
+    def test_permission_exit_has_actionable_sanitized_detail(self):
+        def fake_run(command, **_kwargs):
+            return subprocess.CompletedProcess(command, 3)
+
+        with self.assertRaises(frida_compat.HidTapInjectionError) as ctx:
+            frida_compat.run_injector_subprocess(1234, _run=fake_run)
+        self.assertEqual(str(ctx.exception), "injector_requires_administrator")
 
     def test_timeout_is_captured_without_raw_child_output(self):
         def fake_run(command, **kwargs):
@@ -292,6 +300,99 @@ class TapStateTests(unittest.TestCase):
                 (1, b"\x00" * 6),
             ],
         )
+
+    def test_injection_failure_waits_for_a_new_host_pid_before_retrying(self):
+        statuses = []
+        injector = mock.Mock(
+            side_effect=frida_compat.HidTapInjectionError(
+                "injector_requires_administrator"
+            )
+        )
+        tap = frida_compat.RC003HidReportTap(
+            lambda _report_id, _payload: None,
+            enabled=False,
+            injector=injector,
+            status_handler=lambda status, detail: statuses.append((status, detail)),
+        )
+        wait_count = 0
+
+        def bounded_wait(_delay):
+            nonlocal wait_count
+            wait_count += 1
+            if wait_count == 2:
+                tap.stop_event.set()
+
+        tap.stop_event.wait = mock.Mock(side_effect=bounded_wait)
+        server = mock.MagicMock()
+        with mock.patch.object(
+            frida_compat.frida_hid_tap_runtime,
+            "find_rc003_hidogatt_host_pid",
+            return_value=2468,
+        ), mock.patch.object(frida_compat.socket, "socket", return_value=server):
+            tap._run()
+
+        injector.assert_called_once_with(2468)
+        self.assertEqual(
+            statuses,
+            [
+                (frida_compat.HidTapState.INJECTING.value, ""),
+                (
+                    frida_compat.HidTapState.FAILED.value,
+                    "injector_requires_administrator",
+                ),
+            ],
+        )
+
+
+class InjectorOrderingTests(unittest.TestCase):
+    def test_debug_privilege_is_enabled_before_wudfhost_name_query(self):
+        calls = []
+
+        with mock.patch.object(frida_hid_tap_injector.os, "name", "nt"), mock.patch.object(
+            frida_hid_tap_injector,
+            "find_rc003_hidogatt_host_pid",
+            return_value=2468,
+        ), mock.patch.object(
+            frida_hid_tap_injector,
+            "enable_debug_privilege",
+            side_effect=lambda: calls.append("debug"),
+        ), mock.patch.object(
+            frida_hid_tap_injector,
+            "_target_process_name",
+            side_effect=lambda _pid: calls.append("target") or "wudfhost.exe",
+        ), mock.patch.object(
+            frida_hid_tap_injector,
+            "prepare_secure_runtime",
+            return_value=Path("verified.dll"),
+        ), mock.patch.object(
+            frida_hid_tap_injector,
+            "sha256_file",
+            return_value=frida_hid_tap_injector.GADGET_DLL_SHA256,
+        ), mock.patch.object(
+            frida_hid_tap_injector,
+            "inject_library",
+            side_effect=lambda _pid, _path: calls.append("inject"),
+        ):
+            frida_hid_tap_injector.inject_current_process(2468)
+
+        self.assertEqual(calls, ["debug", "target", "inject"])
+
+    def test_debug_privilege_failure_stops_before_target_query(self):
+        with mock.patch.object(frida_hid_tap_injector.os, "name", "nt"), mock.patch.object(
+            frida_hid_tap_injector,
+            "find_rc003_hidogatt_host_pid",
+            return_value=2468,
+        ), mock.patch.object(
+            frida_hid_tap_injector,
+            "enable_debug_privilege",
+            side_effect=PermissionError("not assigned"),
+        ), mock.patch.object(
+            frida_hid_tap_injector, "_target_process_name"
+        ) as target_name:
+            with self.assertRaises(PermissionError):
+                frida_hid_tap_injector.inject_current_process(2468)
+
+        target_name.assert_not_called()
 
 
 if __name__ == "__main__":

@@ -93,6 +93,11 @@ TAP_USAGE_TO_KEY = {
 
 HID_TAP_INJECTOR_FLAG = "--rc003-hid-injector"
 HID_TAP_INJECTOR_TIMEOUT_SECONDS = 30.0
+HID_TAP_INJECTOR_EXIT_DETAILS = {
+    3: "injector_requires_administrator",
+    4: "injector_validation_failed",
+    5: "injector_unexpected_failure",
+}
 
 
 class HidTapInjectionError(RuntimeError):
@@ -158,9 +163,11 @@ def run_injector_subprocess(
     except OSError as exc:
         raise HidTapInjectionError("injector_launch_failed") from exc
     if completed.returncode != 0:
-        raise HidTapInjectionError(
-            f"injector_exit_code_{int(completed.returncode)}"
+        return_code = int(completed.returncode)
+        detail = HID_TAP_INJECTOR_EXIT_DETAILS.get(
+            return_code, f"injector_exit_code_{return_code}"
         )
+        raise HidTapInjectionError(detail)
 
 
 def verify_asset(path: Path, asset: ThirdPartyAsset = FRIDA_GADGET) -> bool:
@@ -293,14 +300,24 @@ class RC003HidReportTap:
 
     def _run(self) -> None:
         injection_attempted_pid: int | None = None
+        injection_failed_pid: int | None = None
         while not self.stop_event.is_set():
             pid = frida_hid_tap_runtime.find_rc003_hidogatt_host_pid()
             if pid is None:
+                injection_attempted_pid = None
+                injection_failed_pid = None
                 self._set_status(HidTapState.WAITING_HOST)
                 self.stop_event.wait(self.retry_delay)
                 continue
-            if pid != injection_attempted_pid:
+            if pid != injection_attempted_pid and pid != injection_failed_pid:
                 injection_attempted_pid = None
+                injection_failed_pid = None
+            if pid == injection_failed_pid:
+                # Retrying an identical injection into the same system process
+                # adds risk and alternates FAILED/INJECTING in the log forever.
+                # A new WUDFHost PID is the safe retry boundary.
+                self.stop_event.wait(self.retry_delay)
+                continue
 
             server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -314,6 +331,7 @@ class RC003HidReportTap:
                         self.injector(pid)
                         injection_attempted_pid = pid
                     except Exception as exc:  # noqa: BLE001 - retry with sanitized state
+                        injection_failed_pid = pid
                         self._set_status(
                             HidTapState.FAILED,
                             str(exc)

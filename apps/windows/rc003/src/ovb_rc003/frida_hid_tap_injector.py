@@ -264,13 +264,15 @@ def inject_current_process(pid: int) -> None:
         raise RuntimeError(
             f"RC003 host changed before injection: expected={expected_pid} requested={pid}"
         )
+    # WUDFHost denies even limited process queries until the elevated injector
+    # enables SeDebugPrivilege.  Validate the target only after that succeeds.
+    enable_debug_privilege()
     if _target_process_name(pid) != "wudfhost.exe":
         raise RuntimeError("refusing non-WUDFHost target")
     dll_path = prepare_secure_runtime()
     dll_hash = sha256_file(dll_path)
     if dll_hash != GADGET_DLL_SHA256:
         raise RuntimeError(f"verified Gadget changed before injection: {dll_hash}")
-    enable_debug_privilege()
     inject_library(pid, dll_path)
 
 
