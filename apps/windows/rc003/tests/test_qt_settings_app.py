@@ -522,6 +522,83 @@ class SettingsControllerTests(unittest.TestCase):
         self.assertEqual(saved["voice_hotkey"], "ctrl+l")
         self.assertEqual(saved["voice_hotkeys"]["toggle"], "lalt+space")
         self.assertEqual(saved["voice_hotkeys"]["hold"], "ctrl+l")
+        saved_bindings = config.load_key_bindings(
+            config.key_bindings_path(config.config_root())
+        )
+        self.assertEqual(saved_bindings["bindings"]["mic"]["kind"], "escape")
+        self.assertEqual(saved_bindings["bindings"]["up"]["kind"], "voice_hold")
+
+    def test_legacy_generic_voice_mapping_saves_as_explicit_selected_mode(self):
+        saved_config = config.default_config()
+        saved_config["voice_trigger_mode"] = "hold"
+        saved_config["voice_hotkey"] = "ctrl+l"
+        saved_config["voice_hotkeys"]["hold"] = "ctrl+l"
+        config.save_config(config.config_path(config.config_root()), saved_config)
+        saved_bindings = config.default_key_bindings()
+        saved_bindings["bindings"]["mic"] = key_mapping.ButtonAction(
+            key_mapping.ActionKind.VOICE
+        ).to_dict()
+        config.save_key_bindings(
+            config.key_bindings_path(config.config_root()),
+            saved_bindings,
+        )
+
+        controller, model = self._make_controller()
+
+        mic_index = model.index(model.index_of("mic"), 0)
+        self.assertEqual(
+            model.data(mic_index, model.ActionTextRole),
+            settings_ui._VOICE_HOLD_DISPLAY,
+        )
+        self.assertTrue(controller.saveSettings())
+        reloaded = config.load_key_bindings(
+            config.key_bindings_path(config.config_root())
+        )
+        self.assertEqual(reloaded["bindings"]["mic"]["kind"], "voice_hold")
+
+    def test_mic_ordinary_primary_and_secondary_actions_persist_and_reload(self):
+        controller, model = self._make_controller()
+        mic_row = model.index_of("mic")
+        model.setActionTextAt(mic_row, "Escape")
+        model.setSecondaryActionTextAt(mic_row, "double_click", "f5")
+        model.setSecondaryActionTextAt(mic_row, "long_press", "系统音量 +")
+
+        self.assertTrue(controller.saveSettings())
+
+        reloaded_controller, reloaded_model = self._make_controller()
+        del reloaded_controller
+        mic_index = reloaded_model.index(reloaded_model.index_of("mic"), 0)
+        self.assertEqual(reloaded_model.data(mic_index, reloaded_model.ActionTextRole), "Escape")
+        self.assertEqual(reloaded_model.data(mic_index, reloaded_model.DoubleClickTextRole), "f5")
+        self.assertEqual(
+            reloaded_model.data(mic_index, reloaded_model.LongPressTextRole),
+            "系统音量 +",
+        )
+
+    def test_zero_voice_mapping_skips_audio_endpoint_preflight(self):
+        saved_config = config.default_config()
+        saved_config["output_endpoint_name"] = "Missing CABLE Input"
+        saved_config["output_endpoint_host_api"] = "Windows WASAPI"
+        config.save_config(config.config_path(config.config_root()), saved_config)
+
+        with mock.patch.object(
+            audio_output, "enumerate_output_endpoints", return_value=[]
+        ):
+            controller, model = self._make_controller()
+        model.setActionTextAt(model.index_of("mic"), "Escape")
+        controller.toggleVoiceHotkeyText = ""
+        controller.holdVoiceHotkeyText = ""
+
+        with mock.patch.object(
+            qt_settings_app.audio_playback,
+            "preflight_output_endpoint",
+            side_effect=AssertionError("preflight must be skipped without voice"),
+        ) as preflight:
+            self.assertTrue(controller.saveSettings())
+
+        preflight.assert_not_called()
+        saved = config.load_config(config.config_path(config.config_root()))
+        self.assertEqual(saved["voice_hotkeys"], {"toggle": "", "hold": ""})
 
     def test_save_settings_with_empty_hotkey_fails_and_reports_error(self):
         controller, _ = self._make_controller()
@@ -1802,7 +1879,7 @@ class QmlLoadProbeCallsProductionShutdownHelperTests(unittest.TestCase):
 
 # Real mouse clicks and real key events via QTest, delivered through the
 # ACTUAL QQmlApplicationEngine-loaded main.qml (not a Python-level call to
-# setActionTextAt()) - types a custom chord into the "power" row's visible
+# setActionTextAt()) - types a custom chord into the "mic" row's visible
 # ComboBox and clicks "保存映射" WITHOUT ever pressing Enter. Run in an
 # isolated subprocess (see OffscreenQmlLoadTests/RenderedContrastTests
 # above for the two separate same-process-multi-engine QQC2 limitations
@@ -1828,16 +1905,12 @@ def _find_child_by_object_name(root, name):
     return None
 
 
-def _find_mapping_row_combo(mapping_list, button_id, model):
+def _find_mapping_row_control(mapping_list, button_id, model, object_name):
     mapping_list.setProperty("currentIndex", model.index_of(button_id))
     current_item = mapping_list.property("currentItem")
     if current_item is None:
         return None
-    for child in current_item.children():
-        for grandchild in child.children():
-            if grandchild.objectName() == "actionCombo_" + button_id:
-                return grandchild
-    return None
+    return _find_child_by_object_name(current_item, object_name)
 
 
 classes = m._load_qt_classes()
@@ -1889,8 +1962,23 @@ for _ in range(10):
 
 mapping_list = _find_child_by_object_name(window, "mappingList")
 assert mapping_list is not None
-combo = _find_mapping_row_combo(mapping_list, "power", model)
-assert combo is not None, "power row's ComboBox not found - is it in view?"
+assert _find_child_by_object_name(window, "toggleVoiceModeButton") is None
+assert _find_child_by_object_name(window, "holdVoiceModeButton") is None
+for field_name in ("toggleVoiceHotkeyField", "holdVoiceHotkeyField"):
+    field = _find_child_by_object_name(window, field_name)
+    assert field is not None and field.property("visible"), field_name + " missing"
+
+combo = _find_mapping_row_control(mapping_list, "mic", model, "actionCombo_mic")
+double_combo = _find_mapping_row_control(
+    mapping_list, "mic", model, "doubleActionCombo_mic"
+)
+long_combo = _find_mapping_row_control(
+    mapping_list, "mic", model, "longActionCombo_mic"
+)
+assert combo is not None, "mic row's primary ComboBox not found - is it in view?"
+assert double_combo is not None and long_combo is not None
+assert combo.property("visible")
+assert not double_combo.property("visible") and not long_combo.property("visible")
 
 # Real mouse click into the ComboBox's editable text area -
 # forceActiveFocus() on the ComboBox item alone is NOT equivalent (proven
@@ -1920,7 +2008,12 @@ assert combo.property("editText") == typed
 # 1's fix) - checked BEFORE any save runs, so a regression that removes the
 # live-commit wiring but leaves onAccepted/onActivated intact cannot
 # silently pass this test by "saving" a value it only just picked up.
-assert model.to_display_map()["power"] == typed
+assert model.to_display_map()["mic"] == typed
+for _ in range(3):
+    window.grabWindow()
+    app.processEvents()
+assert double_combo.property("visible") and long_combo.property("visible")
+assert double_combo.property("enabled") and long_combo.property("enabled")
 
 # Real click on "保存映射" - deliberately never press Enter/Return anywhere
 # in this test.
@@ -1941,10 +2034,10 @@ print("OK")
 class ButtonsPageDirectSaveIntegrationTests(unittest.TestCase):
     """XRBM-030 RETRY 1 blocker 1: a REAL Qt/QML interaction test (see
     ``_DIRECT_SAVE_PROBE_SCRIPT`` above) proving a user can type a custom
-    chord into a specific visible mapping row's ComboBox and click "保存
-    映射" WITHOUT ever pressing Enter, and have that typed value actually
-    reach the persisted key_bindings.json - the exact gap the previous
-    onAccepted/onActivated-only wiring left open.
+    chord into the visible microphone row's ComboBox and click "保存映射"
+    WITHOUT ever pressing Enter. It also locks the fix15 UI contract: both
+    host-shortcut fields exist, the old global lifecycle buttons do not, and
+    the microphone row exposes primary/double/long controls.
     """
 
     def test_typed_chord_survives_a_direct_save_click_with_no_enter_pressed(self):
@@ -1974,7 +2067,7 @@ class ButtonsPageDirectSaveIntegrationTests(unittest.TestCase):
                 bindings = config.load_key_bindings(
                     config.key_bindings_path(config.config_root())
                 )
-            action = key_mapping.ButtonAction.from_dict(bindings["bindings"]["power"])
+            action = key_mapping.ButtonAction.from_dict(bindings["bindings"]["mic"])
             self.assertEqual(action.kind, key_mapping.ActionKind.KEY_COMBO)
             self.assertEqual(action.keys, ("ctrl", "shift", "p"))
 

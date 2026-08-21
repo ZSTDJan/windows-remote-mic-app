@@ -292,6 +292,24 @@ def build_save_model(
         secondary_bindings = (
             copy.deepcopy(raw_secondary) if isinstance(raw_secondary, dict) else {}
         )
+        for button_id, trigger_map in secondary_bindings.items():
+            if not isinstance(trigger_map, dict):
+                continue
+            for raw_action in trigger_map.values():
+                try:
+                    action = key_mapping.ButtonAction.from_dict(raw_action)
+                except (KeyError, TypeError, ValueError) as exc:
+                    raise SettingsValidationError(
+                        button_id,
+                        "双击或长按动作配置无效，请重新选择后保存。",
+                    ) from exc
+                if action.kind == key_mapping.ActionKind.DISABLED:
+                    continue
+                if key_mapping.is_voice_action(action):
+                    raise SettingsValidationError(
+                        button_id,
+                        "语音动作只能用于主映射，不能设置为双击或长按动作。",
+                    )
     else:
         secondary_bindings: Dict[str, Dict[str, dict]] = {}
         valid_triggers = {

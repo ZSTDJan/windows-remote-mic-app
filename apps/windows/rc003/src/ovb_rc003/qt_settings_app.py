@@ -980,7 +980,13 @@ def _load_qt_classes() -> dict:
 
             endpoint_name = new_config.get("output_endpoint_name", "")
             endpoint_host_api = new_config.get("output_endpoint_host_api", "")
-            if endpoint_name:
+            primary_bindings = new_bindings.get("bindings", {})
+            voice_mapping_enabled = any(
+                key_mapping.is_voice_action(key_mapping.ButtonAction.from_dict(raw_action))
+                for raw_action in primary_bindings.values()
+                if isinstance(raw_action, dict)
+            )
+            if endpoint_name and voice_mapping_enabled:
                 try:
                     audio_playback.preflight_output_endpoint(
                         endpoint_name, endpoint_host_api

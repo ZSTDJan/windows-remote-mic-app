@@ -357,6 +357,86 @@ class BuildSaveModelTests(unittest.TestCase):
         self.assertEqual(ctx.exception.button_id, "up")
         self.assertIn("只能用于主映射", ctx.exception.message)
 
+    def test_voice_primary_preserves_inactive_explicit_secondary_action(self):
+        _, new_bindings = build_save_model(
+            button_display_map={"up": _VOICE_TOGGLE_DISPLAY},
+            secondary_display_map={
+                "up": {"double_click": "Escape", "long_press": ""}
+            },
+            hotkey_text="ralt+space",
+            trigger_mode=key_mapping.VoiceTriggerMode.TOGGLE,
+            endpoint_display_text="",
+            base_config=self.base_config,
+            base_bindings=self.base_bindings,
+        )
+        self.assertEqual(
+            new_bindings["secondary_bindings"]["up"]["double_click"],
+            {"kind": "escape", "keys": []},
+        )
+
+    def test_voice_primary_preserves_inactive_raw_secondary_action(self):
+        base_bindings = {
+            "schema_version": 1,
+            "bindings": {},
+            "secondary_bindings": {
+                "up": {
+                    "long_press": {"kind": "escape", "keys": []},
+                }
+            },
+        }
+        _, new_bindings = build_save_model(
+            button_display_map={"up": _VOICE_HOLD_DISPLAY},
+            hotkey_text="ralt",
+            trigger_mode=key_mapping.VoiceTriggerMode.HOLD,
+            endpoint_display_text="",
+            base_config=self.base_config,
+            base_bindings=base_bindings,
+        )
+        self.assertEqual(
+            new_bindings["secondary_bindings"]["up"]["long_press"],
+            {"kind": "escape", "keys": []},
+        )
+
+    def test_voice_primary_can_preserve_a_disabled_raw_secondary_action(self):
+        base_bindings = {
+            "schema_version": 1,
+            "bindings": {},
+            "secondary_bindings": {
+                "up": {
+                    "long_press": {"kind": "disabled", "keys": []},
+                }
+            },
+        }
+        _, new_bindings = build_save_model(
+            button_display_map={"up": _VOICE_HOLD_DISPLAY},
+            hotkey_text="ralt",
+            trigger_mode=key_mapping.VoiceTriggerMode.HOLD,
+            endpoint_display_text="",
+            base_config=self.base_config,
+            base_bindings=base_bindings,
+        )
+        self.assertEqual(
+            new_bindings["secondary_bindings"]["up"]["long_press"],
+            {"kind": "disabled", "keys": []},
+        )
+
+    def test_ordinary_mic_primary_can_keep_ordinary_secondary_actions(self):
+        _, new_bindings = build_save_model(
+            button_display_map={"mic": "Escape"},
+            secondary_display_map={
+                "mic": {"double_click": "Return", "long_press": ""}
+            },
+            hotkey_text="ralt+space",
+            trigger_mode=key_mapping.VoiceTriggerMode.TOGGLE,
+            endpoint_display_text="",
+            base_config=self.base_config,
+            base_bindings=self.base_bindings,
+        )
+        self.assertEqual(
+            new_bindings["secondary_bindings"]["mic"]["double_click"],
+            {"kind": "return", "keys": []},
+        )
+
     def test_zero_voice_buttons_are_allowed(self):
         new_config, new_bindings = build_save_model(
             button_display_map={"mic": "Escape", "up": "方向上"},

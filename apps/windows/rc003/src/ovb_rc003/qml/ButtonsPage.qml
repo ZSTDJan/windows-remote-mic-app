@@ -23,7 +23,9 @@ Item {
         shortcutRecorder.rowIndex = rowIndex
         shortcutRecorder.trigger = trigger || "single_click"
         shortcutRecorder.voiceMode = voiceMode || ""
-        shortcutRecorder.previewText = qsTr("请按下要映射的真实按键")
+        shortcutRecorder.previewText = voiceMode
+            ? qsTr("请按下输入法中已设置的语音快捷键")
+            : qsTr("请按下希望遥控器发送的键盘快捷键")
         shortcutRecorder.open()
     }
 
@@ -99,7 +101,9 @@ Item {
                     Layout.fillWidth: true
                     wrapMode: Text.WordWrap
                     horizontalAlignment: Text.AlignHCenter
-                    text: qsTr("请直接按下要映射的真实按键；左右修饰键会分别记录。录制期间不会执行该快捷键。")
+                    text: shortcutRecorder.voiceMode
+                        ? qsTr("请在电脑键盘上按下输入法已配置的语音快捷键；本次只记录按键组合。")
+                        : qsTr("请在电脑键盘上按下希望遥控器发送的单键或组合键；左右修饰键会分别记录。")
                     color: tokens.textSecondary
                     font.pixelSize: tokens.fontSizeSmall
                 }
@@ -171,12 +175,18 @@ Item {
 
                         required property string buttonId
                         required property string displayName
+                        required property string actionText
                         required property real hotspotX
                         required property real hotspotY
                         required property real hotspotWidth
                         required property real hotspotHeight
                         required property bool isSelected
-                        required property bool isVoice
+
+                        readonly property string normalizedActionText: actionText.trim()
+                        readonly property bool primaryIsVoice:
+                            normalizedActionText === "开关型语音"
+                            || normalizedActionText === "按住型语音"
+                            || normalizedActionText === "语音（使用专用组合键）"
 
                         readonly property real paintedW: photoImage.paintedWidth
                         readonly property real paintedH: photoImage.paintedHeight
@@ -207,7 +217,8 @@ Item {
                                     ? Qt.rgba(tokens.accent.r, tokens.accent.g, tokens.accent.b, 0.14)
                                     : "transparent")
                             border.width: hotspot.isSelected ? 2 : (hotspot.activeFocus ? 1 : 0)
-                            border.color: hotspot.isVoice ? tokens.voiceAccent : tokens.accent
+                            border.color: hotspot.primaryIsVoice
+                                ? tokens.voiceAccent : tokens.accent
                         }
 
                         HoverHandler { id: hoverHandler }
@@ -223,7 +234,7 @@ Item {
                 Layout.alignment: Qt.AlignHCenter
                 wrapMode: Text.WordWrap
                 horizontalAlignment: Text.AlignHCenter
-                text: qsTr("点击实物按键定位映射；普通键可直接输入任意组合键，麦克风键的语音组合键也可编辑。遥控器没有独立静音键。")
+                text: qsTr("点击实物按键定位映射；任意实体按键都可设置为普通动作、开关型语音或按住型语音。遥控器没有独立静音键。")
                 color: tokens.textSecondary
                 font.pixelSize: tokens.fontSizeSmall
             }
@@ -446,6 +457,12 @@ Item {
                     required property bool isMic
                     required property bool isSelected
 
+                    readonly property string normalizedActionText: actionText.trim()
+                    readonly property bool primaryIsVoice:
+                        normalizedActionText === "开关型语音"
+                        || normalizedActionText === "按住型语音"
+                        || normalizedActionText === "语音（使用专用组合键）"
+
                     width: mappingList.cellWidth - tokens.spacingTiny
                     height: mappingList.cellHeight - tokens.spacingTiny
                     radius: tokens.cornerRadiusSmall
@@ -608,6 +625,17 @@ Item {
                         spacing: tokens.spacingTiny
 
                         Label {
+                            visible: mappingRow.primaryIsVoice
+                            Layout.fillWidth: true
+                            horizontalAlignment: Text.AlignHCenter
+                            text: qsTr("双击/长按暂停，原设置保留")
+                            color: tokens.textSecondary
+                            font.pixelSize: tokens.fontSizeSmall
+                            Accessible.name: text
+                        }
+
+                        Label {
+                            visible: !mappingRow.primaryIsVoice
                             text: qsTr("双")
                             color: tokens.textSecondary
                             font.pixelSize: tokens.fontSizeSmall
@@ -617,6 +645,8 @@ Item {
                             objectName: "doubleActionCombo_" + mappingRow.buttonId
                             Layout.fillWidth: true
                             Layout.minimumWidth: 0
+                            visible: !mappingRow.primaryIsVoice
+                            enabled: !mappingRow.primaryIsVoice
                             editable: true
                             model: SettingsController.secondaryActionOptions
                             ToolTip.visible: hovered
@@ -641,6 +671,8 @@ Item {
                         }
                         Button {
                             objectName: "recordDoubleShortcut_" + mappingRow.buttonId
+                            visible: !mappingRow.primaryIsVoice
+                            enabled: !mappingRow.primaryIsVoice
                             text: qsTr("录")
                             Layout.preferredWidth: 30
                             Layout.minimumWidth: 28
@@ -651,6 +683,7 @@ Item {
                             Accessible.name: qsTr("录制双击") + mappingRow.displayName
                         }
                         Label {
+                            visible: !mappingRow.primaryIsVoice
                             text: qsTr("长")
                             color: tokens.textSecondary
                             font.pixelSize: tokens.fontSizeSmall
@@ -660,6 +693,8 @@ Item {
                             objectName: "longActionCombo_" + mappingRow.buttonId
                             Layout.fillWidth: true
                             Layout.minimumWidth: 0
+                            visible: !mappingRow.primaryIsVoice
+                            enabled: !mappingRow.primaryIsVoice
                             editable: true
                             model: SettingsController.secondaryActionOptions
                             ToolTip.visible: hovered
@@ -684,6 +719,8 @@ Item {
                         }
                         Button {
                             objectName: "recordLongShortcut_" + mappingRow.buttonId
+                            visible: !mappingRow.primaryIsVoice
+                            enabled: !mappingRow.primaryIsVoice
                             text: qsTr("录")
                             Layout.preferredWidth: 30
                             Layout.minimumWidth: 28
