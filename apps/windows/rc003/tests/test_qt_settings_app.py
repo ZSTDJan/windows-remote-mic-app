@@ -960,6 +960,7 @@ class SettingsControllerTests(unittest.TestCase):
 
     def test_open_bluetooth_settings_reports_the_uri_it_opened(self):
         controller, _ = self._make_controller()
+        controller._set_error_message("stale error")
         fake_result = shell_targets.ExternalTargetResult(
             outcome=shell_targets.ExternalTargetOutcome.OPENED,
             target=shell_targets.BLUETOOTH_SETTINGS_URI,
@@ -970,6 +971,33 @@ class SettingsControllerTests(unittest.TestCase):
             controller.openBluetoothSettings()
         fake_open.assert_called_once_with(shell_targets.BLUETOOTH_SETTINGS_URI)
         self.assertIn(shell_targets.BLUETOOTH_SETTINGS_URI, controller.statusMessage)
+        self.assertEqual(controller.errorMessage, "")
+
+    def test_open_microphone_privacy_settings_uses_the_windows_privacy_uri(self):
+        controller, _ = self._make_controller()
+        fake_result = shell_targets.ExternalTargetResult(
+            outcome=shell_targets.ExternalTargetOutcome.OPENED,
+            target=shell_targets.MICROPHONE_PRIVACY_SETTINGS_URI,
+        )
+        with mock.patch.object(
+            shell_targets, "open_external_target", return_value=fake_result
+        ) as fake_open:
+            controller.openMicrophonePrivacySettings()
+        fake_open.assert_called_once_with(
+            shell_targets.MICROPHONE_PRIVACY_SETTINGS_URI
+        )
+
+    def test_open_sound_settings_uses_the_windows_sound_uri(self):
+        controller, _ = self._make_controller()
+        fake_result = shell_targets.ExternalTargetResult(
+            outcome=shell_targets.ExternalTargetOutcome.OPENED,
+            target=shell_targets.SOUND_SETTINGS_URI,
+        )
+        with mock.patch.object(
+            shell_targets, "open_external_target", return_value=fake_result
+        ) as fake_open:
+            controller.openSoundSettings()
+        fake_open.assert_called_once_with(shell_targets.SOUND_SETTINGS_URI)
 
     def test_open_speech_settings_reports_a_failure_honestly(self):
         controller, _ = self._make_controller()
@@ -982,7 +1010,8 @@ class SettingsControllerTests(unittest.TestCase):
             shell_targets, "open_external_target", return_value=fake_result
         ):
             controller.openSpeechSettings()
-        self.assertIn("no handler registered", controller.statusMessage)
+        self.assertEqual(controller.statusMessage, "")
+        self.assertIn("no handler registered", controller.errorMessage)
 
     def test_select_and_persist_output_endpoint_succeeds_and_updates_options(self):
         controller, _ = self._make_controller()
@@ -1768,9 +1797,377 @@ result = {
     "mapping_page_title": controller.mappingPageTitle,
     "control_names": [row["name"] for row in controller.djiControlRows],
 }
+tab_bar.setProperty("currentIndex", 2)
+for _ in range(10):
+    window.grabWindow()
+    app.processEvents()
+result.update(
+    {
+        "bluetooth_permission_visible": bool(
+            find_child(window, "bluetoothPermissionBlock").property("visible")
+        ),
+        "optional_enhancements_visible": bool(
+            find_child(window, "optionalEnhancementsSection").property("visible")
+        ),
+        "host_voice_setup_visible": bool(
+            find_child(window, "hostVoiceSetupBlock").property("visible")
+        ),
+        "microphone_permission_text": str(
+            find_child(window, "microphonePermissionDescription").property("text")
+        ),
+    }
+)
 m._shutdown_diagnostics_workers()
 print(json.dumps(result))
 """
+
+
+_SETTINGS_SHELL_LAYOUT_PROBE_SCRIPT = r"""
+import json
+import os
+
+from PySide6.QtCore import QPointF
+from ovb_rc003 import qt_settings_app as m
+
+
+def find_child(root, name):
+    for child in root.children():
+        if child.objectName() == name:
+            return child
+        found = find_child(child, name)
+        if found is not None:
+            return found
+    return None
+
+
+def render(window, app):
+    for _ in range(12):
+        window.grabWindow()
+        app.processEvents()
+
+
+def bounds(window, name):
+    item = find_child(window, name)
+    assert item is not None, name + " missing"
+    origin = item.mapToScene(QPointF(0, 0))
+    width = float(item.property("width"))
+    return {
+        "visible": bool(item.property("visible")),
+        "x": float(origin.x()),
+        "y": float(origin.y()),
+        "width": width,
+        "height": float(item.property("height")),
+        "right": float(origin.x()) + width,
+    }
+
+
+classes = m._load_qt_classes()
+QGuiApplication = classes["QGuiApplication"]
+QQmlApplicationEngine = classes["QQmlApplicationEngine"]
+QQuickStyle = classes["QQuickStyle"]
+QUrl = classes["QUrl"]
+qmlRegisterSingletonInstance = classes["qmlRegisterSingletonInstance"]
+ButtonMappingModel = classes["ButtonMappingModel"]
+SettingsController = classes["SettingsController"]
+DiagnosticsController = classes["DiagnosticsController"]
+
+QQuickStyle.setStyle("Basic")
+app = QGuiApplication.instance() or QGuiApplication([])
+model = ButtonMappingModel()
+controller = SettingsController(model)
+diagnostics_controller = DiagnosticsController(controller, m.config.config_root())
+qmlRegisterSingletonInstance(SettingsController, "OvbRc003Settings", 1, 0, "SettingsController", controller)
+qmlRegisterSingletonInstance(ButtonMappingModel, "OvbRc003Settings", 1, 0, "ButtonMappingModel", model)
+qmlRegisterSingletonInstance(DiagnosticsController, "OvbRc003Settings", 1, 0, "DiagnosticsController", diagnostics_controller)
+
+engine = QQmlApplicationEngine()
+qml_dir = m._qml_directory()
+engine.addImportPath(str(qml_dir))
+warnings = []
+engine.warnings.connect(lambda values: warnings.extend(values))
+engine.load(QUrl.fromLocalFile(str(qml_dir / "main.qml")))
+assert len(engine.rootObjects()) == 1, "main.qml failed to load"
+window = engine.rootObjects()[0]
+window.setWidth(int(os.environ["PROBE_WIDTH"]))
+window.setHeight(int(os.environ["PROBE_HEIGHT"]))
+window.show()
+render(window, app)
+
+tab_bar = find_child(window, "tabBar")
+assert tab_bar is not None
+status_bar = find_child(window, "globalStatusBar")
+status_text = find_child(window, "globalStatusText")
+assert status_bar is not None and status_text is not None
+
+result = {
+    "warnings": [],
+    "width": int(window.property("width")),
+    "height": int(window.property("height")),
+    "initial_status_visible": bool(status_bar.property("visible")),
+    "navigation": {
+        name: bounds(window, name)
+        for name in (
+            "navigationBar",
+            "connectionTabButton",
+            "mappingTabButton",
+            "permissionsTabButton",
+            "diagnosticsTabButton",
+        )
+    },
+}
+
+tab_bar.setProperty("currentIndex", 0)
+render(window, app)
+connection_names = (
+    "connectionPageContent",
+    "deviceSection",
+    "deviceCombo",
+    "rc003OutputSection",
+    "endpointCombo",
+    "bridgeSection",
+    "openLogButton",
+    "connectionActionRow",
+    "restoreDefaultsButton",
+    "deviceSaveButton",
+    "saveAndLaunchButton",
+)
+connection_scroll = find_child(window, "connectionScroll")
+result["connection"] = {
+    "items": {name: bounds(window, name) for name in connection_names},
+    "content_width": float(connection_scroll.property("contentWidth")),
+    "available_width": float(connection_scroll.property("availableWidth")),
+    "launch_status": str(find_child(window, "launchStatusText").property("text")),
+    "save_highlighted": bool(find_child(window, "deviceSaveButton").property("highlighted")),
+    "launch_highlighted": bool(find_child(window, "saveAndLaunchButton").property("highlighted")),
+}
+
+tab_bar.setProperty("currentIndex", 2)
+render(window, app)
+permissions_names = (
+    "permissionsPageContent",
+    "requiredPermissionsSection",
+    "openBluetoothSettingsButton",
+    "openMicrophonePrivacyButton",
+    "openSoundInputSettingsButton",
+    "optionalEnhancementsSection",
+    "openDiagnosticsButton",
+    "manualSetupSection",
+    "openMappingButton",
+    "openSpeechSettingsButton",
+    "permissionsTroubleshootingSection",
+    "permissionsOpenLogButton",
+)
+permissions_scroll = find_child(window, "permissionsScroll")
+result["permissions"] = {
+    "items": {name: bounds(window, name) for name in permissions_names},
+    "content_width": float(permissions_scroll.property("contentWidth")),
+    "available_width": float(permissions_scroll.property("availableWidth")),
+}
+
+controller._set_status_message("neutral status")
+render(window, app)
+result["neutral_status"] = {
+    "visible": bool(status_bar.property("visible")),
+    "text": str(status_text.property("text")),
+}
+controller._set_error_message("priority error")
+render(window, app)
+result["error_status"] = {
+    "visible": bool(status_bar.property("visible")),
+    "text": str(status_text.property("text")),
+}
+result["warnings"] = [warning.toString() for warning in warnings]
+
+m._shutdown_diagnostics_workers()
+print(json.dumps(result))
+"""
+
+
+_TAB_FOCUS_SCROLL_PROBE_SCRIPT = r"""
+import json
+
+from PySide6.QtCore import QPointF, Qt
+from PySide6.QtTest import QTest
+from ovb_rc003 import qt_settings_app as m
+
+
+def find_child(root, name):
+    for child in root.children():
+        if child.objectName() == name:
+            return child
+        found = find_child(child, name)
+        if found is not None:
+            return found
+    return None
+
+
+def render(window, app):
+    for _ in range(10):
+        window.grabWindow()
+        app.processEvents()
+
+
+def tab_to(window, app, target, count):
+    for _ in range(count):
+        QTest.keyClick(window, Qt.Key_Tab)
+        render(window, app)
+    return bool(target.property("activeFocus"))
+
+
+def navigation_has_focus(window):
+    return any(
+        bool(find_child(window, name).property("activeFocus"))
+        for name in (
+            "connectionTabButton",
+            "mappingTabButton",
+            "permissionsTabButton",
+            "diagnosticsTabButton",
+        )
+    )
+
+
+def visible_in_window(item, window):
+    origin = item.mapToScene(QPointF(0, 0))
+    return (
+        origin.y() >= 0
+        and origin.y() + float(item.property("height")) <= float(window.property("height"))
+    )
+
+
+classes = m._load_qt_classes()
+QGuiApplication = classes["QGuiApplication"]
+QQmlApplicationEngine = classes["QQmlApplicationEngine"]
+QQuickStyle = classes["QQuickStyle"]
+QUrl = classes["QUrl"]
+qmlRegisterSingletonInstance = classes["qmlRegisterSingletonInstance"]
+ButtonMappingModel = classes["ButtonMappingModel"]
+SettingsController = classes["SettingsController"]
+DiagnosticsController = classes["DiagnosticsController"]
+
+QQuickStyle.setStyle("Basic")
+app = QGuiApplication.instance() or QGuiApplication([])
+model = ButtonMappingModel()
+controller = SettingsController(model)
+diagnostics_controller = DiagnosticsController(controller, m.config.config_root())
+qmlRegisterSingletonInstance(SettingsController, "OvbRc003Settings", 1, 0, "SettingsController", controller)
+qmlRegisterSingletonInstance(ButtonMappingModel, "OvbRc003Settings", 1, 0, "ButtonMappingModel", model)
+qmlRegisterSingletonInstance(DiagnosticsController, "OvbRc003Settings", 1, 0, "DiagnosticsController", diagnostics_controller)
+
+engine = QQmlApplicationEngine()
+qml_dir = m._qml_directory()
+engine.addImportPath(str(qml_dir))
+warnings = []
+engine.warnings.connect(lambda values: warnings.extend(values))
+engine.load(QUrl.fromLocalFile(str(qml_dir / "main.qml")))
+assert len(engine.rootObjects()) == 1, "main.qml failed to load"
+window = engine.rootObjects()[0]
+window.setWidth(640)
+window.setHeight(480)
+window.show()
+render(window, app)
+
+tab_bar = find_child(window, "tabBar")
+tab_bar.setProperty("currentIndex", 0)
+render(window, app)
+connection_scroll = find_child(window, "connectionScroll")
+connection_flickable = connection_scroll.property("contentItem")
+connection_flickable.setProperty("contentY", 0)
+endpoint = find_child(window, "endpointCombo")
+launch = find_child(window, "saveAndLaunchButton")
+endpoint.forceActiveFocus(Qt.TabFocusReason)
+render(window, app)
+connection_reached = tab_to(window, app, launch, 4)
+QTest.keyClick(window, Qt.Key_Tab)
+render(window, app)
+connection_escaped = not bool(launch.property("activeFocus")) and navigation_has_focus(window)
+
+tab_bar.setProperty("currentIndex", 2)
+render(window, app)
+permissions_scroll = find_child(window, "permissionsScroll")
+permissions_flickable = permissions_scroll.property("contentItem")
+permissions_flickable.setProperty("contentY", 0)
+microphone = find_child(window, "openMicrophonePrivacyButton")
+log_button = find_child(window, "permissionsOpenLogButton")
+microphone.forceActiveFocus(Qt.TabFocusReason)
+render(window, app)
+permissions_reached = tab_to(window, app, log_button, 5)
+QTest.keyClick(window, Qt.Key_Tab)
+render(window, app)
+permissions_escaped = not bool(log_button.property("activeFocus")) and navigation_has_focus(window)
+
+result = {
+    "warnings": [warning.toString() for warning in warnings],
+    "connection": {
+        "reached": connection_reached,
+        "escaped": connection_escaped,
+        "content_y": float(connection_flickable.property("contentY")),
+        "target_visible": visible_in_window(launch, window),
+    },
+    "permissions": {
+        "reached": permissions_reached,
+        "escaped": permissions_escaped,
+        "content_y": float(permissions_flickable.property("contentY")),
+        "target_visible": visible_in_window(log_button, window),
+    },
+}
+m._shutdown_diagnostics_workers()
+print(json.dumps(result))
+"""
+
+
+class SettingsShellSourceContractTests(unittest.TestCase):
+    def setUp(self):
+        qml_dir = Path(qt_settings_app.__file__).resolve().parent / "qml"
+        self.main_qml = (qml_dir / "main.qml").read_text(encoding="utf-8")
+        self.connection_qml = (qml_dir / "ConnectionPage.qml").read_text(
+            encoding="utf-8"
+        )
+        self.permissions_qml = (qml_dir / "PermissionsPage.qml").read_text(
+            encoding="utf-8"
+        )
+        self.buttons_qml = (qml_dir / "ButtonsPage.qml").read_text(
+            encoding="utf-8"
+        )
+
+    def test_settings_feedback_has_one_global_owner(self):
+        self.assertIn('objectName: "globalStatusBar"', self.main_qml)
+        for page_text in (
+            self.connection_qml,
+            self.permissions_qml,
+            self.buttons_qml,
+        ):
+            self.assertNotIn("SettingsController.errorMessage", page_text)
+            self.assertNotIn("SettingsController.statusMessage", page_text)
+
+    def test_connection_keeps_save_and_launch_as_distinct_commands(self):
+        self.assertIn('qsTr("仅保存设置")', self.connection_qml)
+        self.assertIn('qsTr("保存并启动桥接")', self.connection_qml)
+        self.assertIn("SettingsController.saveSettings()", self.connection_qml)
+        self.assertIn("SettingsController.saveAndLaunch()", self.connection_qml)
+        self.assertIn("恢复按键与语音默认", self.connection_qml)
+        self.assertNotIn("恢复全部默认", self.connection_qml)
+        self.assertIn("已保存但当前缺失的端点", self.connection_qml)
+        self.assertIn("启用语音映射时", self.connection_qml)
+
+    def test_permissions_page_states_real_boundaries_without_fake_grants(self):
+        for heading in ("运行必需", "可选增强", "手动操作"):
+            self.assertIn(heading, self.permissions_qml)
+        for misleading_claim in (
+            "已授权",
+            "Remote Mic 需要管理员权限",
+            "VB-CABLE 安装成功",
+        ):
+            self.assertNotIn(misleading_claim, self.permissions_qml)
+        self.assertIn("仅 Win+H", self.permissions_qml)
+        self.assertIn("普通按键映射不依赖这些设置", self.permissions_qml)
+
+    def test_permissions_navigation_reuses_existing_pages(self):
+        self.assertIn("signal openMappingRequested()", self.permissions_qml)
+        self.assertIn("signal openDiagnosticsRequested()", self.permissions_qml)
+        self.assertIn("onOpenMappingRequested: tabBar.currentIndex = 1", self.main_qml)
+        self.assertIn(
+            "onOpenDiagnosticsRequested: tabBar.currentIndex = 3", self.main_qml
+        )
 
 
 @unittest.skipUnless(_HAS_PYSIDE6, _SKIP_REASON)
@@ -1832,6 +2229,128 @@ class OffscreenQmlLoadTests(unittest.TestCase):
         self.assertFalse(data["rc003_visible"])
         self.assertEqual(data["mapping_page_title"], "设备控制")
         self.assertEqual(data["control_names"], ["录音键", "连接键", "电源键"])
+        self.assertFalse(data["bluetooth_permission_visible"])
+        self.assertFalse(data["optional_enhancements_visible"])
+        self.assertFalse(data["host_voice_setup_visible"])
+        self.assertIn("DJI Mic 2", data["microphone_permission_text"])
+        self.assertNotIn("CABLE Output", data["microphone_permission_text"])
+
+    def test_settings_shell_fits_supported_logical_viewports_without_horizontal_overflow(self):
+        import json
+        import subprocess
+
+        # Logical sizes corresponding to the supported physical viewports:
+        # 1024x720@100%, 1366x768@125%, 1920x1080@150%, plus the stricter
+        # 1024x720@150% fallback used on small high-DPI laptops.
+        scenarios = ((1024, 720), (1093, 614), (1280, 720), (683, 480))
+
+        for width, height in scenarios:
+            with self.subTest(width=width, height=height), tempfile.TemporaryDirectory() as tmpdir:
+                env = dict(os.environ)
+                env.setdefault("QT_QPA_PLATFORM", "offscreen")
+                env["LOCALAPPDATA"] = tmpdir
+                env["PROBE_WIDTH"] = str(width)
+                env["PROBE_HEIGHT"] = str(height)
+                result = subprocess.run(
+                    [sys.executable, "-c", _SETTINGS_SHELL_LAYOUT_PROBE_SCRIPT],
+                    env=env,
+                    capture_output=True,
+                    text=True,
+                    timeout=60,
+                )
+                self.assertEqual(
+                    result.returncode,
+                    0,
+                    "settings layout probe failed at "
+                    f"{width}x{height}: {result.stdout}\n{result.stderr}",
+                )
+                data = json.loads(result.stdout.strip().splitlines()[-1])
+                self.assertEqual(data["warnings"], [])
+                self.assertEqual((data["width"], data["height"]), (width, height))
+                self.assertFalse(data["initial_status_visible"])
+
+                for group_name in ("navigation",):
+                    for item_name, item in data[group_name].items():
+                        self.assertGreater(item["width"], 0, item_name)
+                        self.assertGreaterEqual(item["x"], -1, item_name)
+                        self.assertLessEqual(item["right"], width + 1, item_name)
+
+                for page_name in ("connection", "permissions"):
+                    page = data[page_name]
+                    self.assertLessEqual(
+                        page["content_width"], page["available_width"] + 1
+                    )
+                    for item_name, item in page["items"].items():
+                        if not item["visible"]:
+                            continue
+                        self.assertGreater(item["width"], 0, item_name)
+                        self.assertGreaterEqual(item["x"], -1, item_name)
+                        self.assertLessEqual(item["right"], width + 1, item_name)
+
+                connection_items = data["connection"]["items"]
+                self.assertLess(
+                    connection_items["deviceSection"]["y"],
+                    connection_items["rc003OutputSection"]["y"],
+                )
+                self.assertLess(
+                    connection_items["rc003OutputSection"]["y"],
+                    connection_items["bridgeSection"]["y"],
+                )
+                self.assertLess(
+                    connection_items["bridgeSection"]["y"],
+                    connection_items["connectionActionRow"]["y"],
+                )
+                self.assertFalse(data["connection"]["save_highlighted"])
+                self.assertTrue(data["connection"]["launch_highlighted"])
+                self.assertNotIn("RC003 已连接", data["connection"]["launch_status"])
+
+                permission_items = data["permissions"]["items"]
+                self.assertLess(
+                    permission_items["requiredPermissionsSection"]["y"],
+                    permission_items["optionalEnhancementsSection"]["y"],
+                )
+                self.assertLess(
+                    permission_items["optionalEnhancementsSection"]["y"],
+                    permission_items["manualSetupSection"]["y"],
+                )
+                self.assertLess(
+                    permission_items["manualSetupSection"]["y"],
+                    permission_items["permissionsTroubleshootingSection"]["y"],
+                )
+
+                self.assertTrue(data["neutral_status"]["visible"])
+                self.assertEqual(data["neutral_status"]["text"], "neutral status")
+                self.assertTrue(data["error_status"]["visible"])
+                self.assertEqual(data["error_status"]["text"], "priority error")
+
+    def test_tab_focus_scrolls_connection_and_permissions_commands_into_view(self):
+        import json
+        import subprocess
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            env = dict(os.environ)
+            env.setdefault("QT_QPA_PLATFORM", "offscreen")
+            env["LOCALAPPDATA"] = tmpdir
+            result = subprocess.run(
+                [sys.executable, "-c", _TAB_FOCUS_SCROLL_PROBE_SCRIPT],
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+        self.assertEqual(
+            result.returncode,
+            0,
+            f"Tab focus probe failed: {result.stdout}\n{result.stderr}",
+        )
+        data = json.loads(result.stdout.strip().splitlines()[-1])
+        self.assertEqual(data["warnings"], [])
+        for page_name in ("connection", "permissions"):
+            page = data[page_name]
+            self.assertTrue(page["reached"], page_name)
+            self.assertTrue(page["escaped"], page_name)
+            self.assertGreater(page["content_y"], 0, page_name)
+            self.assertTrue(page["target_visible"], page_name)
 
 
 class QmlLoadProbeCallsProductionShutdownHelperTests(unittest.TestCase):

@@ -17,6 +17,7 @@ QtObject {
 
     property color background: palette.window
     property color surface: Qt.tint(palette.window, Qt.rgba(palette.windowText.r, palette.windowText.g, palette.windowText.b, 0.035))
+    property color surfaceMuted: Qt.tint(palette.window, Qt.rgba(palette.windowText.r, palette.windowText.g, palette.windowText.b, 0.018))
     property color textPrimary: palette.windowText
     property color textSecondary: Qt.rgba(palette.windowText.r, palette.windowText.g, palette.windowText.b, 0.62)
     property color disabledText: Qt.rgba(palette.windowText.r, palette.windowText.g, palette.windowText.b, 0.38)
@@ -35,9 +36,11 @@ QtObject {
     property color voiceAccent: "#F2914A"
     property color successColor: "#2E7D32"
     property color errorColor: "#C62828"
+    property color statusBackground: Qt.tint(palette.window, Qt.rgba(palette.highlight.r, palette.highlight.g, palette.highlight.b, 0.09))
+    property color errorBackground: Qt.tint(palette.window, Qt.rgba(0.78, 0.16, 0.16, 0.08))
 
     property int cornerRadiusSmall: 8
-    property int cornerRadiusLarge: 12
+    property int cornerRadiusLarge: 8
 
     property int spacingTiny: 4
     property int spacingSmall: 8
@@ -47,4 +50,10 @@ QtObject {
     property int fontSizeSmall: 11
     property int fontSizeBody: 13
     property int fontSizeTitle: 16
+
+    property int navigationHeight: 60
+    property int statusBarMinHeight: 42
+    property int pageMaxWidth: 920
+    property int pageHorizontalPadding: 24
+    property int sectionVerticalPadding: 18
 }

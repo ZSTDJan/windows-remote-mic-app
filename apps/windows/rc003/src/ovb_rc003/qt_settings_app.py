@@ -1536,7 +1536,7 @@ def _load_qt_classes() -> dict:
         @Slot()
         def saveAndLaunch(self) -> None:
             """Saves first (using the exact same validation as
-            "保存并应用"), and only launches the bridge if that save
+            "仅保存设置"), and only launches the bridge if that save
             actually succeeded - a rejected mapping/hotkey must never be
             silently followed by starting the bridge with stale config
             anyway (unchanged XRBM-029 contract, now driven from QML).
@@ -1582,7 +1582,7 @@ def _load_qt_classes() -> dict:
             self._set_trigger_mode_index(self._TRIGGER_MODE_ORDER.index(trigger_mode))
             self._set_error_message("")
             self._set_status_message(
-                "已恢复默认显示，尚未保存——点击「保存映射」或「保存并应用」才会写入设置。"
+                "已恢复默认显示，尚未保存——点击「保存映射」或「仅保存设置」才会写入设置。"
             )
 
         @Slot()
@@ -1600,9 +1600,11 @@ def _load_qt_classes() -> dict:
 
         def _report_external_target(self, result) -> None:
             if result.outcome is shell_targets.ExternalTargetOutcome.OPENED:
+                self._set_error_message("")
                 self._set_status_message(f"已打开：{result.target}")
             else:
-                self._set_status_message(f"无法打开 {result.target}（{result.error}）")
+                self._set_status_message("")
+                self._set_error_message(f"无法打开 {result.target}（{result.error}）")
 
         @Slot()
         def openBluetoothSettings(self) -> None:

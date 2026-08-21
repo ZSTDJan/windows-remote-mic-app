@@ -22,10 +22,10 @@ import OvbRc003Settings 1.0
 ApplicationWindow {
     id: window
     title: qsTr("Remote Mic 设置")
-    width: 900
-    height: 680
-    minimumWidth: 780
-    minimumHeight: 600
+    width: 1024
+    height: 720
+    minimumWidth: 640
+    minimumHeight: 480
     visible: true
 
     property Tokens tokens: Tokens {}
@@ -62,28 +62,80 @@ ApplicationWindow {
         anchors.fill: parent
         spacing: 0
 
-        TabBar {
-            id: tabBar
-            objectName: "tabBar"  // lets tooling (e.g. a screenshot script) drive tab switching via QObject.findChild
+        Rectangle {
+            id: navigationBar
+            objectName: "navigationBar"
             Layout.fillWidth: true
+            Layout.preferredHeight: tokens.navigationHeight
+            color: tokens.surface
 
-            TabButton {
-                objectName: "connectionTabButton"  // test hook: for the rendered contrast regression test
-                text: qsTr("连接")
-                Accessible.name: text
+            RowLayout {
+                anchors.fill: parent
+                anchors.leftMargin: tokens.pageHorizontalPadding
+                anchors.rightMargin: tokens.pageHorizontalPadding
+                spacing: tokens.spacingLarge
+
+                ColumnLayout {
+                    Layout.preferredWidth: 150
+                    Layout.maximumWidth: 170
+                    spacing: 0
+
+                    Label {
+                        text: qsTr("Remote Mic")
+                        color: tokens.textPrimary
+                        font.pixelSize: tokens.fontSizeTitle
+                        font.bold: true
+                    }
+                    Label {
+                        text: qsTr("Windows 设置")
+                        color: tokens.textSecondary
+                        font.pixelSize: tokens.fontSizeSmall
+                    }
+                }
+
+                TabBar {
+                    id: tabBar
+                    objectName: "tabBar"  // lets tooling (e.g. a screenshot script) drive tab switching via QObject.findChild
+                    Layout.fillWidth: true
+                    Layout.preferredWidth: 620
+                    Layout.maximumWidth: 620
+                    Layout.alignment: Qt.AlignRight
+                    implicitWidth: 620
+                    background: Item {}
+
+                    TabButton {
+                        width: tabBar.width / 4
+                        objectName: "connectionTabButton"  // test hook: for the rendered contrast regression test
+                        text: qsTr("连接")
+                        Accessible.name: text
+                    }
+                    TabButton {
+                        width: tabBar.width / 4
+                        objectName: "mappingTabButton"
+                        text: SettingsController.mappingPageTitle
+                        Accessible.name: text
+                    }
+                    TabButton {
+                        width: tabBar.width / 4
+                        objectName: "permissionsTabButton"
+                        text: qsTr("权限")
+                        Accessible.name: text
+                    }
+                    TabButton {
+                        width: tabBar.width / 4
+                        objectName: "diagnosticsTabButton"  // test hook: for driving this tab in the offscreen screenshot/interaction tests
+                        text: qsTr("检查与修复")
+                        Accessible.name: text
+                    }
+                }
             }
-            TabButton {
-                text: SettingsController.mappingPageTitle
-                Accessible.name: text
-            }
-            TabButton {
-                text: qsTr("权限")
-                Accessible.name: text
-            }
-            TabButton {
-                objectName: "diagnosticsTabButton"  // test hook: for driving this tab in the offscreen screenshot/interaction tests
-                text: qsTr("检查与修复")
-                Accessible.name: text
+
+            Rectangle {
+                anchors.left: parent.left
+                anchors.right: parent.right
+                anchors.bottom: parent.bottom
+                height: 1
+                color: tokens.border
             }
         }
 
@@ -95,8 +147,56 @@ ApplicationWindow {
 
             ConnectionPage { tokens: window.tokens }
             ButtonsPage { tokens: window.tokens }
-            PermissionsPage { tokens: window.tokens }
+            PermissionsPage {
+                tokens: window.tokens
+                onOpenMappingRequested: tabBar.currentIndex = 1
+                onOpenDiagnosticsRequested: tabBar.currentIndex = 3
+            }
             DiagnosticsPage { tokens: window.tokens }
+        }
+
+        Rectangle {
+            id: globalStatusBar
+            objectName: "globalStatusBar"
+            Layout.fillWidth: true
+            Layout.minimumHeight: visible ? tokens.statusBarMinHeight : 0
+            Layout.preferredHeight: visible
+                ? Math.max(tokens.statusBarMinHeight, globalStatusText.implicitHeight + tokens.spacingSmall * 2)
+                : 0
+            visible: SettingsController.errorMessage.length > 0
+                || SettingsController.statusMessage.length > 0
+            color: SettingsController.errorMessage.length > 0
+                ? tokens.errorBackground
+                : tokens.statusBackground
+
+            Rectangle {
+                anchors.left: parent.left
+                anchors.right: parent.right
+                anchors.top: parent.top
+                height: 1
+                color: SettingsController.errorMessage.length > 0
+                    ? tokens.errorColor
+                    : tokens.accent
+            }
+
+            Label {
+                id: globalStatusText
+                objectName: "globalStatusText"
+                anchors.left: parent.left
+                anchors.right: parent.right
+                anchors.verticalCenter: parent.verticalCenter
+                anchors.leftMargin: tokens.pageHorizontalPadding
+                anchors.rightMargin: tokens.pageHorizontalPadding
+                text: SettingsController.errorMessage.length > 0
+                    ? SettingsController.errorMessage
+                    : SettingsController.statusMessage
+                color: SettingsController.errorMessage.length > 0
+                    ? tokens.errorColor
+                    : tokens.textPrimary
+                font.pixelSize: tokens.fontSizeSmall
+                wrapMode: Text.WordWrap
+                Accessible.name: text
+            }
         }
     }
 }

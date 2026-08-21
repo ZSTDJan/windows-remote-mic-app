@@ -262,8 +262,8 @@ Item {
                 Button {
                     // XRBM-030 RETRY 1 blocker 4: without this button, a
                     // mapping edit made on this page could only actually be
-                    // persisted by switching to "连接" and clicking "保存并
-                    // 应用" - a user who edits a mapping and just closes the
+                    // persisted by switching to "连接" and clicking "仅保存
+                    // 设置" - a user who edits a mapping and just closes the
                     // window loses it. Calls the exact same
                     // SettingsController.saveSettings() slot the "连接" page
                     // uses (same validation, same config.save_*() calls) -
@@ -274,29 +274,6 @@ Item {
                     highlighted: true
                     onClicked: SettingsController.saveSettings()
                 }
-            }
-
-            // -- Status / error feedback (mirrors ConnectionPage.qml) --------
-            // "恢复默认" alone never persists anything - restoreDefaults()
-            // sets a status message saying so explicitly (see
-            // SettingsController.restoreDefaults()), so this page can never
-            // look "silently saved" when it is only showing an in-memory
-            // reset.
-            Label {
-                Layout.fillWidth: true
-                wrapMode: Text.WordWrap
-                visible: text.length > 0
-                text: SettingsController.errorMessage
-                color: tokens.errorColor
-                font.pixelSize: tokens.fontSizeSmall
-            }
-            Label {
-                Layout.fillWidth: true
-                wrapMode: Text.WordWrap
-                visible: text.length > 0 && SettingsController.errorMessage.length === 0
-                text: SettingsController.statusMessage
-                color: tokens.successColor
-                font.pixelSize: tokens.fontSizeSmall
             }
 
             Rectangle {
