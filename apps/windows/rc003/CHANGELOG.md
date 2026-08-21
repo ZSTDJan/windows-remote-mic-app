@@ -251,6 +251,19 @@ RC003 的可靠原生行为是 HOLD，主动 `MIC_OPEN` 可能只有开始控制
   `6A24FA1023F5E4C5AC4FFCE68C43B2334286851A69CB7C87E00F1C1E60EF7DF`；
   ZIP 内 EXE 已重新计算并与候选目录一致。统一映射与非麦克风键语音仍待
   真机复测。
+- `ui1` 全局框架、连接页和权限页代码提交：`addc2b0`。Qt 设置定向测试
+  101 项通过；从该提交的干净 detached worktree 执行完整测试 1151 项通过、
+  7 项安全或平台相关跳过；公开边界扫描 137 个文件通过；`compileall`、
+  `pip check` 和 `git diff --check` 通过。共享工作区开发期的 1154/7 和
+  267 文件结果包含同期 BLE 测试，不作为 UI 独立候选的权威计数。
+- `ui1` 候选目录为源码仓库同级
+  `RemoteMicRC003-0.1.0-candidate-20260821-ui1/`；EXE SHA-256 为
+  `8575F8B3FD273F5CC6915D2F8A9BEA037D0E66E27EF6929AAE15887E6ACB0988`。
+  便携 ZIP SHA-256 为
+  `9E3D8ECBFD95335720E80DE853E7BCBD97D4AC3D02FCC314FF456580E37EC718`；
+  ZIP 内 EXE 与目录 EXE 一致，六个冻结 QML 与 `addc2b0` 源码逐文件一致。
+  冻结入口 `--dry-run=0`、`--help=0`、无效 HID 注入 PID `=4`。该 UI-only
+  候选不包含随后提交 `a189a1c` 的 BLE/音频停止排序修复，人工界面复核待完成。
 
 ## [0.1.0-candidate] — 2026-07-31
 
