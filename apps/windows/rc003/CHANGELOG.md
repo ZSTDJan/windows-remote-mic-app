@@ -13,7 +13,8 @@
 同时暴露设置页保存语音模式/快捷键后，运行中桥仍沿用旧状态机。`fix9` 已增加
 语音设置热加载；`fix10` 在完整代码审查后加固资源清理、队列、配置保存、
 HID tap 身份校验、进程控制和日志隐私。自动检查与 `fix10` 候选构建已通过，
-正在本机真机复测。
+本机已确认 13 个按键全部可识别；同轮日志发现检测麦克风键会抢先进入语音
+状态，`fix11` 已隔离检测手势与正式语音路径，待本机复测。
 本节不得扩大为完整真机通过声明。
 维护证据与验收入口见
 `MAINTENANCE.md`、
@@ -25,7 +26,8 @@ HID tap 身份校验、进程控制和日志隐私。自动检查与 `fix10` 候
 `bugs/BUG-007-duplicate-winrt-ble-candidates.md`、
 `bugs/BUG-008-toggle-multi-source-gesture.md`、
 `bugs/BUG-009-f5-hook-release-race.md`、
-`bugs/BUG-010-live-voice-settings-reload.md` 和 `TESTING.md`。
+`bugs/BUG-010-live-voice-settings-reload.md`、
+`bugs/BUG-011-mic-key-detection-voice-race.md` 和 `TESTING.md`。
 
 ### 修复
 
@@ -77,6 +79,11 @@ HID tap 身份校验、进程控制和日志隐私。自动检查与 `fix10` 候
   选择 HOLD 后日志仍执行 TOGGLE。桥接现在同时监控两个设置文件；空闲时在
   下一次输入事件前立即应用语音模式和快捷键，活跃会话则在完整收尾后切换。
   启动和热应用日志会写明实际生效模式与快捷键。
+- **检测麦克风键后后台持续空开麦**：`AudioStarted` 或 ATVV mic 事件可能
+  比 F5/HID 的检测回调先到，旧逻辑会先改变语音状态，再把后到物理边沿作为
+  检测结果吞掉。现在一次检测手势由首个来源统一认领，音频、ATVV、F5 和
+  HID 后续事件全部只用于收尾，不发送宿主快捷键、播放端点或设备开关麦命令；
+  释放宽限和硬超时确保乱序事件被吸收且下一次正常按键仍可用。
 - **PortAudio 清理失败时丢失重试句柄**：播放流只有在 `close()` 确认成功后
   才清除内部引用；关闭失败会保留句柄供后续清理重试。
 - **隐私字段大小写绕过**：禁止持久化的设备标识字段改为大小写不敏感检查，
@@ -117,6 +124,9 @@ HID tap 身份校验、进程控制和日志隐私。自动检查与 `fix10` 候
 - `fix10` 便携 ZIP SHA-256：
   `69B3F76BB2590C736CFEE6359AADE5EB8848DB2937D7FDC8CDAF404F70708799`；
   ZIP 内 EXE 已重新计算并与候选目录一致。
+- `fix11` 麦克风检测隔离代码提交：`4d6a0fe`。
+- `fix11` 构建前完整测试：1093 项通过，7 项安全或平台相关跳过；公开边界
+  扫描 229 个文件通过；`compileall`、`pip check` 和 `git diff --check` 通过。
 
 ## [0.1.0-candidate] — 2026-07-31
 

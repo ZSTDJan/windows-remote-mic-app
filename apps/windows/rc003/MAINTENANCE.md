@@ -181,6 +181,12 @@
 - `fix10` 便携 ZIP SHA-256：
   `69B3F76BB2590C736CFEE6359AADE5EB8848DB2937D7FDC8CDAF404F70708799`；
   ZIP 内 EXE 已重新计算并与候选目录一致。
+- `fix10` 本机逐键检测确认 13 个按钮全部可识别；日志同时证明麦克风检测的
+  `AudioStarted` 会早于 F5/HID 回调并误开持续空语音会话。故障、证据和修复
+  边界见 `bugs/BUG-011-mic-key-detection-voice-race.md`。
+- `fix11` 麦克风检测隔离代码提交：`4d6a0fe`。应用接线测试 81 项通过、1 项
+  平台相关跳过；完整测试 1093 项通过、7 项跳过；公开边界扫描 229 个文件
+  通过；`compileall`、`pip check` 和 `git diff --check` 通过。
 - 冻结桥接实测：进程日志记录通知区域图标 ready 和 started，随后完成
   RC003 BLE/ATVV 能力连接。用户从托盘打开设置后再选择“退出桥接”，桥接
   进程消失而设置窗口继续保留；日志记录 HID tap stopped、BLE/HID/音频
