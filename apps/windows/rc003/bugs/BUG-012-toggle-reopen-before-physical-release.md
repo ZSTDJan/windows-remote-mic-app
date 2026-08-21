@@ -79,3 +79,17 @@ legacy F5 / HID 的最终松键边沿；此时设备仍在处理原始物理手�
 3. 再短按一次结束，宿主语音窗口与设备音频都应关闭，不得需要第三次按键。
 4. 连续完成至少 5 轮，记录失败轮次和主观启动延迟；自动测试不能替代此项
    RC003 真机结果。
+
+## `fix12` 候选
+
+- 构建时 Git HEAD：`62b10320971fe8fa9a99f61e51d18a08ded7f55f`。
+- 候选目录：
+  `RemoteMicRC003-0.1.0-candidate-20260821-fix12/`。
+- EXE SHA-256：
+  `7B99267D5E1385408CDBAAE36BA422FAACC43B50F16E47BF3E5EEC8176BB0926`。
+- 便携 ZIP：
+  `RemoteMicRC003-0.1.0-candidate-20260821-fix12-portable.zip`。
+- ZIP SHA-256：
+  `D6B9168B728E12FD0D892BD472547007F0A8B5E835F34D35230677E76BF5CBAA`。
+- ZIP 内 EXE 已重新计算并与候选目录一致；冻结入口
+  `--dry-run=0`、`--help=0`、无效 HID 注入 PID `=4`。
