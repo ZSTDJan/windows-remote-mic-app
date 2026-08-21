@@ -93,8 +93,8 @@ _PRESET_KEY_COMBOS = (
 )
 
 _TRIGGER_MODE_LABELS = {
-    key_mapping.VoiceTriggerMode.TOGGLE: "免按住（切换）",
-    key_mapping.VoiceTriggerMode.HOLD: "按住说话（按下 / 松开）",
+    key_mapping.VoiceTriggerMode.TOGGLE: "按一下切换",
+    key_mapping.VoiceTriggerMode.HOLD: "按住说话",
 }
 
 def voice_hotkey_for_trigger_mode(trigger_mode: key_mapping.VoiceTriggerMode) -> str:
@@ -210,6 +210,7 @@ def build_save_model(
     base_config: dict,
     base_bindings: dict,
     selected_device_profile: str = device_catalog.RC003_ID,
+    voice_hotkeys: Optional[Dict[str, str]] = None,
 ) -> Tuple[dict, dict]:
     """Pure validation+build step for "Save"/"Restore defaults", with no Tk
     dependency at all - directly unit tested without constructing any
@@ -217,13 +218,41 @@ def build_save_model(
     SettingsValidationError on invalid input; never raises a Tk exception.
     """
 
-    try:
-        parsed_hotkey = hotkey.HotkeySpec.parse(hotkey_text)
-        win32_keys.resolve_vk_codes(tuple(parsed_hotkey.modifiers) + (parsed_hotkey.key,))
-    except hotkey.HotkeyParseError as exc:
-        raise SettingsValidationError(None, str(exc)) from exc
-    except win32_keys.UnknownKeyTokenError as exc:
-        raise SettingsValidationError(None, str(exc)) from exc
+    mode_hotkeys = {
+        mode.value: key_mapping.voice_hotkey_for_trigger_mode(mode)
+        for mode in key_mapping.VoiceTriggerMode
+    }
+    if voice_hotkeys is None:
+        mode_hotkeys[trigger_mode.value] = hotkey_text.strip()
+    else:
+        mode_hotkeys.update(
+            {
+                mode.value: str(voice_hotkeys.get(mode.value, "")).strip()
+                for mode in key_mapping.VoiceTriggerMode
+            }
+        )
+
+    active_hotkey_text = mode_hotkeys[trigger_mode.value]
+    if not active_hotkey_text:
+        raise SettingsValidationError(None, "请先录入当前语音方式的宿主快捷键")
+
+    for mode in key_mapping.VoiceTriggerMode:
+        candidate = mode_hotkeys[mode.value]
+        if not candidate:
+            continue
+        try:
+            parsed_hotkey = hotkey.HotkeySpec.parse(candidate)
+            win32_keys.resolve_vk_codes(
+                tuple(parsed_hotkey.modifiers) + (parsed_hotkey.key,)
+            )
+        except hotkey.HotkeyParseError as exc:
+            raise SettingsValidationError(
+                None, f"{_TRIGGER_MODE_LABELS[mode]}快捷键：{exc}"
+            ) from exc
+        except win32_keys.UnknownKeyTokenError as exc:
+            raise SettingsValidationError(
+                None, f"{_TRIGGER_MODE_LABELS[mode]}快捷键：{exc}"
+            ) from exc
 
     bindings: Dict[str, dict] = {}
     for button_id, text in button_display_map.items():
@@ -288,7 +317,8 @@ def build_save_model(
     new_config["selected_device_profile"] = device_catalog.normalize_device_id(
         selected_device_profile
     )
-    new_config["voice_hotkey"] = hotkey_text.strip()
+    new_config["voice_hotkey"] = active_hotkey_text
+    new_config["voice_hotkeys"] = mode_hotkeys
     new_config["voice_trigger_mode"] = trigger_mode.value
     new_config["output_endpoint_name"] = endpoint_name
     new_config["output_endpoint_host_api"] = endpoint_host_api
@@ -309,6 +339,7 @@ class DefaultDisplayState:
     button_display_map: Dict[str, str]
     secondary_display_map: Dict[str, Dict[str, str]]
     hotkey_text: str
+    voice_hotkeys: Dict[str, str]
     trigger_mode_label: str
 
 
@@ -327,10 +358,15 @@ def default_display_state() -> DefaultDisplayState:
         for button_id in _USER_FACING_BUTTON_IDS
         if button_id != "mic"
     }
+    voice_hotkeys = {
+        mode.value: key_mapping.voice_hotkey_for_trigger_mode(mode)
+        for mode in key_mapping.VoiceTriggerMode
+    }
     return DefaultDisplayState(
         button_display_map=button_display_map,
         secondary_display_map=secondary_display_map,
         hotkey_text=hotkey.DEFAULT_VOICE_HOTKEY.serialize(),
+        voice_hotkeys=voice_hotkeys,
         trigger_mode_label=_TRIGGER_MODE_LABELS[key_mapping.VoiceTriggerMode.TOGGLE],
     )
 

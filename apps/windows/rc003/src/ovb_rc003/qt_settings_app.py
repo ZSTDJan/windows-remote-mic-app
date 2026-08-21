@@ -645,6 +645,8 @@ def _load_qt_classes() -> dict:
         """
 
         hotkeyTextChanged = Signal()
+        toggleVoiceHotkeyTextChanged = Signal()
+        holdVoiceHotkeyTextChanged = Signal()
         triggerModeIndexChanged = Signal()
         endpointOptionsChanged = Signal()
         selectedEndpointIndexChanged = Signal()
@@ -676,13 +678,20 @@ def _load_qt_classes() -> dict:
                 config.key_bindings_path(self._config_root)
             )
 
-            self._hotkey_text = self._config.get(
-                "voice_hotkey", hotkey.DEFAULT_VOICE_HOTKEY.serialize()
-            )
             saved_trigger_mode = key_mapping.VoiceTriggerMode(
                 self._config.get("voice_trigger_mode", "toggle")
             )
             self._trigger_mode_index = self._TRIGGER_MODE_ORDER.index(saved_trigger_mode)
+            saved_voice_hotkeys = self._config.get("voice_hotkeys", {})
+            self._voice_hotkeys = {
+                mode: str(
+                    saved_voice_hotkeys.get(
+                        mode.value,
+                        key_mapping.voice_hotkey_for_trigger_mode(mode),
+                    )
+                )
+                for mode in self._TRIGGER_MODE_ORDER
+            }
 
             self._launch_status_text = settings_ui.LAUNCH_NOT_STARTED_TEXT
             self._status_message = ""
@@ -946,16 +955,6 @@ def _load_qt_classes() -> dict:
 
             self.hotkeyCaptured.emit(chord)
 
-        def _set_trigger_mode_preserving_hotkey(
-            self, trigger_mode: key_mapping.VoiceTriggerMode
-        ) -> None:
-            """Change the mode preset without overwriting a just-recorded chord."""
-
-            index = self._TRIGGER_MODE_ORDER.index(trigger_mode)
-            if index != self._trigger_mode_index:
-                self._trigger_mode_index = index
-                self.triggerModeIndexChanged.emit()
-
         def _save(self) -> bool:
             """Same validation as before (settings_ui.build_save_model);
             returns True only on an actual successful save, so
@@ -973,12 +972,16 @@ def _load_qt_classes() -> dict:
                 new_config, new_bindings = settings_ui.build_save_model(
                     button_display_map=self._model.to_display_map(),
                     secondary_display_map=self._model.to_secondary_display_map(),
-                    hotkey_text=self._hotkey_text,
+                    hotkey_text=self._voice_hotkeys[trigger_mode],
                     trigger_mode=trigger_mode,
                     endpoint_display_text=endpoint_display,
                     base_config=self._config,
                     base_bindings=self._bindings,
                     selected_device_profile=self._selected_device_id(),
+                    voice_hotkeys={
+                        mode.value: self._voice_hotkeys[mode]
+                        for mode in self._TRIGGER_MODE_ORDER
+                    },
                 )
             except settings_ui.SettingsValidationError as exc:
                 title = f"「{exc.button_id}」映射无效" if exc.button_id else "语音热键无效"
@@ -1036,14 +1039,53 @@ def _load_qt_classes() -> dict:
         # -- properties ---------------------------------------------------
 
         def _get_hotkey_text(self) -> str:
-            return self._hotkey_text
+            mode = self._TRIGGER_MODE_ORDER[self._trigger_mode_index]
+            return self._voice_hotkeys[mode]
 
         def _set_hotkey_text(self, value: str) -> None:
-            if value != self._hotkey_text:
-                self._hotkey_text = value
-                self.hotkeyTextChanged.emit()
+            mode = self._TRIGGER_MODE_ORDER[self._trigger_mode_index]
+            self._set_voice_hotkey_text(mode, value)
 
         hotkeyText = Property(str, _get_hotkey_text, _set_hotkey_text, notify=hotkeyTextChanged)
+
+        def _set_voice_hotkey_text(
+            self, mode: key_mapping.VoiceTriggerMode, value: str
+        ) -> None:
+            if value == self._voice_hotkeys[mode]:
+                return
+            self._voice_hotkeys[mode] = value
+            if mode == key_mapping.VoiceTriggerMode.TOGGLE:
+                self.toggleVoiceHotkeyTextChanged.emit()
+            else:
+                self.holdVoiceHotkeyTextChanged.emit()
+            if mode == self._TRIGGER_MODE_ORDER[self._trigger_mode_index]:
+                self.hotkeyTextChanged.emit()
+
+        def _get_toggle_voice_hotkey_text(self) -> str:
+            return self._voice_hotkeys[key_mapping.VoiceTriggerMode.TOGGLE]
+
+        def _set_toggle_voice_hotkey_text(self, value: str) -> None:
+            self._set_voice_hotkey_text(key_mapping.VoiceTriggerMode.TOGGLE, value)
+
+        toggleVoiceHotkeyText = Property(
+            str,
+            _get_toggle_voice_hotkey_text,
+            _set_toggle_voice_hotkey_text,
+            notify=toggleVoiceHotkeyTextChanged,
+        )
+
+        def _get_hold_voice_hotkey_text(self) -> str:
+            return self._voice_hotkeys[key_mapping.VoiceTriggerMode.HOLD]
+
+        def _set_hold_voice_hotkey_text(self, value: str) -> None:
+            self._set_voice_hotkey_text(key_mapping.VoiceTriggerMode.HOLD, value)
+
+        holdVoiceHotkeyText = Property(
+            str,
+            _get_hold_voice_hotkey_text,
+            _set_hold_voice_hotkey_text,
+            notify=holdVoiceHotkeyTextChanged,
+        )
 
         def _get_trigger_mode_options(self) -> List[str]:
             return [settings_ui._TRIGGER_MODE_LABELS[mode] for mode in self._TRIGGER_MODE_ORDER]
@@ -1057,9 +1099,34 @@ def _load_qt_classes() -> dict:
             if value != self._trigger_mode_index and 0 <= value < len(self._TRIGGER_MODE_ORDER):
                 self._trigger_mode_index = value
                 self.triggerModeIndexChanged.emit()
+                self.hotkeyTextChanged.emit()
 
         triggerModeIndex = Property(
             int, _get_trigger_mode_index, _set_trigger_mode_index, notify=triggerModeIndexChanged
+        )
+
+        def _get_toggle_trigger_mode_index(self) -> int:
+            return self._TRIGGER_MODE_ORDER.index(key_mapping.VoiceTriggerMode.TOGGLE)
+
+        toggleTriggerModeIndex = Property(
+            int, _get_toggle_trigger_mode_index, constant=True
+        )
+
+        def _get_hold_trigger_mode_index(self) -> int:
+            return self._TRIGGER_MODE_ORDER.index(key_mapping.VoiceTriggerMode.HOLD)
+
+        holdTriggerModeIndex = Property(int, _get_hold_trigger_mode_index, constant=True)
+
+        def _get_active_voice_action_text(self) -> str:
+            mode = self._TRIGGER_MODE_ORDER[self._trigger_mode_index]
+            return (
+                "开关型语音"
+                if mode == key_mapping.VoiceTriggerMode.TOGGLE
+                else "按住型语音"
+            )
+
+        activeVoiceActionText = Property(
+            str, _get_active_voice_action_text, notify=triggerModeIndexChanged
         )
 
         def _get_endpoint_options(self) -> List[str]:
@@ -1483,7 +1550,12 @@ def _load_qt_classes() -> dict:
                 defaults.button_display_map,
                 defaults.secondary_display_map,
             )
-            self._set_hotkey_text(defaults.hotkey_text)
+            self._set_toggle_voice_hotkey_text(
+                defaults.voice_hotkeys[key_mapping.VoiceTriggerMode.TOGGLE.value]
+            )
+            self._set_hold_voice_hotkey_text(
+                defaults.voice_hotkeys[key_mapping.VoiceTriggerMode.HOLD.value]
+            )
             trigger_mode = next(
                 mode
                 for mode in self._TRIGGER_MODE_ORDER

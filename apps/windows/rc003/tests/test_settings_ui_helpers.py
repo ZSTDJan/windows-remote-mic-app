@@ -264,6 +264,45 @@ class BuildSaveModelTests(unittest.TestCase):
         self.assertEqual(new_config["output_endpoint_host_api"], "Windows WASAPI")
         self.assertEqual(new_config["voice_trigger_mode"], "hold")
 
+    def test_two_voice_shortcuts_are_saved_and_selected_by_trigger_mode(self):
+        new_config, _ = build_save_model(
+            button_display_map={},
+            hotkey_text="ignored-active-alias",
+            trigger_mode=key_mapping.VoiceTriggerMode.HOLD,
+            endpoint_display_text="",
+            base_config=self.base_config,
+            base_bindings=self.base_bindings,
+            voice_hotkeys={"toggle": "lalt+space", "hold": "ctrl+l"},
+        )
+        self.assertEqual(new_config["voice_hotkeys"]["toggle"], "lalt+space")
+        self.assertEqual(new_config["voice_hotkeys"]["hold"], "ctrl+l")
+        self.assertEqual(new_config["voice_hotkey"], "ctrl+l")
+
+    def test_blank_inactive_voice_shortcut_is_allowed(self):
+        new_config, _ = build_save_model(
+            button_display_map={},
+            hotkey_text="lalt+space",
+            trigger_mode=key_mapping.VoiceTriggerMode.TOGGLE,
+            endpoint_display_text="",
+            base_config=self.base_config,
+            base_bindings=self.base_bindings,
+            voice_hotkeys={"toggle": "lalt+space", "hold": ""},
+        )
+        self.assertEqual(new_config["voice_hotkeys"]["hold"], "")
+
+    def test_blank_active_voice_shortcut_is_rejected(self):
+        with self.assertRaises(SettingsValidationError) as ctx:
+            build_save_model(
+                button_display_map={},
+                hotkey_text="",
+                trigger_mode=key_mapping.VoiceTriggerMode.HOLD,
+                endpoint_display_text="",
+                base_config=self.base_config,
+                base_bindings=self.base_bindings,
+                voice_hotkeys={"toggle": "lalt+space", "hold": ""},
+            )
+        self.assertIn("当前语音方式", ctx.exception.message)
+
     def test_does_not_mutate_base_dicts(self):
         base_config_copy = dict(self.base_config)
         base_bindings_copy = {"schema_version": 1, "bindings": dict(self.base_bindings["bindings"])}
@@ -366,7 +405,12 @@ class DefaultDisplayStateTests(unittest.TestCase):
 
     def test_trigger_mode_defaults_to_toggle_label(self):
         state = default_display_state()
-        self.assertIn("免按住", state.trigger_mode_label)
+        self.assertEqual(state.trigger_mode_label, "按一下切换")
+
+    def test_defaults_keep_one_host_shortcut_per_voice_mode(self):
+        state = default_display_state()
+        self.assertEqual(state.voice_hotkeys["toggle"], "ralt+space")
+        self.assertEqual(state.voice_hotkeys["hold"], "ralt")
 
 
 class DescribeLaunchResultTests(unittest.TestCase):

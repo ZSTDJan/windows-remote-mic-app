@@ -24,9 +24,12 @@ class ConfigRootTests(unittest.TestCase):
 
 class DefaultConfigPrivacyTests(unittest.TestCase):
     def test_default_config_preserves_existing_users_on_rc003(self):
-        self.assertEqual(config.default_config()["selected_device_profile"], "xiaomi-rc003")
-        self.assertEqual(config.default_config()["voice_hotkey"], "ralt+space")
-        self.assertEqual(config.default_config()["gain_db"], 10.0)
+        defaults = config.default_config()
+        self.assertEqual(defaults["selected_device_profile"], "xiaomi-rc003")
+        self.assertEqual(defaults["voice_hotkey"], "ralt+space")
+        self.assertEqual(defaults["voice_hotkeys"]["toggle"], "ralt+space")
+        self.assertEqual(defaults["voice_hotkeys"]["hold"], "ralt")
+        self.assertEqual(defaults["gain_db"], 10.0)
 
     def test_default_config_contains_no_forbidden_identity_fields(self):
         defaults = config.default_config()
@@ -69,6 +72,28 @@ class DefaultConfigPrivacyTests(unittest.TestCase):
             )
             loaded = config.load_config(path)
         self.assertEqual(loaded["voice_hotkey"], "win+h")
+        self.assertEqual(loaded["voice_hotkeys"]["toggle"], "win+h")
+        self.assertEqual(loaded["voice_hotkeys"]["hold"], "ralt")
+
+    def test_load_preserves_inactive_mode_shortcut(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "voice_trigger_mode": "toggle",
+                        "voice_hotkey": "lalt+space",
+                        "voice_hotkeys": {
+                            "toggle": "lalt+space",
+                            "hold": "ctrl+l",
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            loaded = config.load_config(path)
+        self.assertEqual(loaded["voice_hotkeys"]["toggle"], "lalt+space")
+        self.assertEqual(loaded["voice_hotkeys"]["hold"], "ctrl+l")
 
     def test_load_repairs_recorded_left_ctrl_win_to_hold_mode(self):
         with tempfile.TemporaryDirectory() as tmp:

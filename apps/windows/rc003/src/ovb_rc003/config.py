@@ -99,6 +99,14 @@ def default_config() -> Dict[str, Any]:
             key_mapping.VoiceTriggerMode.TOGGLE
         ),
         "voice_trigger_mode": "toggle",
+        # Keep each host shortcut independently so switching the remote's
+        # voice lifecycle does not make the user record the other host
+        # shortcut again. ``voice_hotkey`` remains the active, runtime-facing
+        # value for backwards compatibility with the bridge.
+        "voice_hotkeys": {
+            mode.value: key_mapping.voice_hotkey_for_trigger_mode(mode)
+            for mode in key_mapping.VoiceTriggerMode
+        },
         # Empty until the user explicitly picks one in settings; voice fails
         # closed while this is empty (see audio_output.resolve_selected_endpoint).
         # Both fields together disambiguate endpoints that share a display
@@ -159,12 +167,13 @@ def save_config(path: Path, config: Dict[str, Any]) -> None:
 
 
 def _normalize_voice_hotkey(config: Dict[str, Any]) -> None:
-    """Repair only obsolete built-ins; keep trigger semantics independent.
+    """Repair obsolete built-ins and normalize per-mode host shortcuts.
 
     A host may define the same chord as either a toggle or a hold-to-talk
-    shortcut. Current settings therefore preserve ``voice_hotkey`` and
-    ``voice_trigger_mode`` independently instead of inferring or overwriting
-    one from the other.
+    shortcut. ``voice_hotkeys`` therefore stores one independent chord for
+    each lifecycle while ``voice_hotkey`` remains the selected, runtime-facing
+    chord. Legacy files containing only the latter migrate without changing
+    their current mode or current shortcut.
     """
 
     current = str(config.get("voice_hotkey", "")).strip().lower()
@@ -178,7 +187,6 @@ def _normalize_voice_hotkey(config: Dict[str, Any]) -> None:
         config["voice_hotkey"] = key_mapping.voice_hotkey_for_trigger_mode(
             key_mapping.VoiceTriggerMode.HOLD
         )
-        return
 
     try:
         mode = key_mapping.VoiceTriggerMode(config.get("voice_trigger_mode"))
@@ -190,9 +198,32 @@ def _normalize_voice_hotkey(config: Dict[str, Any]) -> None:
     # for the built-in HOLD mode; arbitrary user shortcuts remain untouched.
     if mode == key_mapping.VoiceTriggerMode.HOLD and current == "lalt":
         config["voice_hotkey"] = key_mapping.voice_hotkey_for_trigger_mode(mode)
-        return
 
-    # Current built-ins and custom chords are intentionally not coupled to
+    raw_mode_hotkeys = config.get("voice_hotkeys")
+    if not isinstance(raw_mode_hotkeys, dict):
+        raw_mode_hotkeys = {}
+    mode_hotkeys = {
+        candidate_mode.value: str(
+            raw_mode_hotkeys.get(
+                candidate_mode.value,
+                key_mapping.voice_hotkey_for_trigger_mode(candidate_mode),
+            )
+        ).strip()
+        for candidate_mode in key_mapping.VoiceTriggerMode
+    }
+
+    # The legacy/current active field remains authoritative during migration
+    # and for callers that still edit only ``voice_hotkey``. The inactive
+    # mode keeps its separately stored value (or its shipped default).
+    active_hotkey = str(config.get("voice_hotkey", "")).strip()
+    if active_hotkey:
+        mode_hotkeys[mode.value] = active_hotkey
+    else:
+        active_hotkey = mode_hotkeys[mode.value]
+        config["voice_hotkey"] = active_hotkey
+    config["voice_hotkeys"] = mode_hotkeys
+
+    # Current built-ins and custom chords are intentionally not inferred from
     # ``mode``. In particular, ralt+space may legitimately be hold-to-talk.
 
 

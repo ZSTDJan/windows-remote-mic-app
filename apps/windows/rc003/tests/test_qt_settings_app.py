@@ -377,13 +377,14 @@ class SettingsControllerTests(unittest.TestCase):
         controller, _ = self._make_controller()
         self.assertEqual(len(controller.triggerModeOptions), 2)
 
-    def test_trigger_mode_switch_preserves_the_recorded_voice_hotkey(self):
+    def test_trigger_mode_switch_selects_each_recorded_voice_hotkey(self):
         controller, _ = self._make_controller()
-        controller.hotkeyText = "ralt+space"
-        controller.triggerModeIndex = 1
-        self.assertEqual(controller.hotkeyText, "ralt+space")
-        controller.triggerModeIndex = 0
-        self.assertEqual(controller.hotkeyText, "ralt+space")
+        controller.toggleVoiceHotkeyText = "lalt+space"
+        controller.holdVoiceHotkeyText = "ctrl+l"
+        controller.triggerModeIndex = controller.holdTriggerModeIndex
+        self.assertEqual(controller.hotkeyText, "ctrl+l")
+        controller.triggerModeIndex = controller.toggleTriggerModeIndex
+        self.assertEqual(controller.hotkeyText, "lalt+space")
 
     def test_recording_a_hotkey_does_not_change_trigger_semantics(self):
         controller, _ = self._make_controller()
@@ -492,6 +493,20 @@ class SettingsControllerTests(unittest.TestCase):
         self.assertIn("保存失败", controller.errorMessage)
         self.assertIn("settings file is locked", controller.errorMessage)
 
+    def test_save_settings_persists_both_voice_shortcuts_and_the_selected_one(self):
+        controller, _ = self._make_controller()
+        controller.toggleVoiceHotkeyText = "lalt+space"
+        controller.holdVoiceHotkeyText = "ctrl+l"
+        controller.triggerModeIndex = controller.holdTriggerModeIndex
+
+        self.assertTrue(controller.saveSettings())
+
+        saved = config.load_config(config.config_path(config.config_root()))
+        self.assertEqual(saved["voice_trigger_mode"], "hold")
+        self.assertEqual(saved["voice_hotkey"], "ctrl+l")
+        self.assertEqual(saved["voice_hotkeys"]["toggle"], "lalt+space")
+        self.assertEqual(saved["voice_hotkeys"]["hold"], "ctrl+l")
+
     def test_save_settings_with_empty_hotkey_fails_and_reports_error(self):
         controller, _ = self._make_controller()
         controller.hotkeyText = ""
@@ -518,10 +533,13 @@ class SettingsControllerTests(unittest.TestCase):
 
     def test_restore_defaults_resets_hotkey_and_trigger_mode(self):
         controller, _ = self._make_controller()
-        controller.hotkeyText = "shift+z"
+        controller.toggleVoiceHotkeyText = "shift+z"
+        controller.holdVoiceHotkeyText = "ctrl+l"
         controller.triggerModeIndex = 1
         controller.restoreDefaults()
         self.assertEqual(controller.hotkeyText, hotkey.DEFAULT_VOICE_HOTKEY.serialize())
+        self.assertEqual(controller.toggleVoiceHotkeyText, "ralt+space")
+        self.assertEqual(controller.holdVoiceHotkeyText, "ralt")
         self.assertEqual(controller.triggerModeIndex, 0)
 
     def test_select_button_updates_both_the_controller_and_the_model(self):
@@ -2016,13 +2034,16 @@ if len(engine.rootObjects()) != 1:
 
 window = engine.rootObjects()[0]
 window.show()
-for _ in range(10):
-    window.grabWindow()
-    app.processEvents()
-image = window.grabWindow()
 
-results = {}
-for object_name in ("connectionTabButton", "openLogButton", "hotkeyField"):
+
+def render():
+    for _ in range(10):
+        window.grabWindow()
+        app.processEvents()
+    return window.grabWindow()
+
+
+def sample_control(results, image, object_name):
     item = _find(window, object_name)
     if item is None:
         print(json.dumps({"error": object_name + " not found"}))
@@ -2041,6 +2062,20 @@ for object_name in ("connectionTabButton", "openLogButton", "hotkeyField"):
             if luminance < darkest:
                 darkest = luminance
     results[object_name] = {"background": background_luminance, "darkest": darkest}
+
+
+results = {}
+image = render()
+for object_name in ("connectionTabButton", "openLogButton"):
+    sample_control(results, image, object_name)
+
+tab_bar = _find(window, "tabBar")
+if tab_bar is None:
+    print(json.dumps({"error": "tabBar not found"}))
+    sys.exit(1)
+tab_bar.setProperty("currentIndex", 1)
+image = render()
+sample_control(results, image, "toggleVoiceHotkeyField")
 
 print(json.dumps(results))
 """
@@ -2068,7 +2103,7 @@ class RenderedContrastTests(unittest.TestCase):
     _LABELS = {
         "connectionTabButton": "「连接」tab label",
         "openLogButton": "「打开日志目录」button",
-        "hotkeyField": "语音热键 TextField",
+        "toggleVoiceHotkeyField": "开关型宿主语音快捷键 TextField",
     }
 
     def test_tab_button_plain_button_and_text_field_are_all_readable(self):

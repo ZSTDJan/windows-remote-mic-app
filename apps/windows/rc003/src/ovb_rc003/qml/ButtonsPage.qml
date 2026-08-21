@@ -18,11 +18,11 @@ Item {
 
     readonly property real photoAspectRatio: 1030 / 508
 
-    function openShortcutRecorder(buttonId, rowIndex, isMic, trigger) {
+    function openShortcutRecorder(buttonId, rowIndex, trigger, voiceMode) {
         shortcutRecorder.buttonId = buttonId
         shortcutRecorder.rowIndex = rowIndex
-        shortcutRecorder.isMic = isMic
         shortcutRecorder.trigger = trigger || "single_click"
+        shortcutRecorder.voiceMode = voiceMode || ""
         shortcutRecorder.previewText = qsTr("请按下要映射的真实按键")
         shortcutRecorder.open()
     }
@@ -44,14 +44,16 @@ Item {
         standardButtons: Dialog.Cancel
         property string buttonId: ""
         property int rowIndex: -1
-        property bool isMic: false
         property string trigger: "single_click"
+        property string voiceMode: ""
         property string previewText: ""
 
         function commitShortcut(chord) {
             previewText = chord
-            if (isMic)
-                SettingsController.hotkeyText = chord
+            if (voiceMode === "toggle")
+                SettingsController.toggleVoiceHotkeyText = chord
+            else if (voiceMode === "hold")
+                SettingsController.holdVoiceHotkeyText = chord
             else if (trigger === "single_click")
                 ButtonMappingModel.setActionTextAt(rowIndex, chord)
             else
@@ -324,6 +326,125 @@ Item {
                 }
             }
 
+            Rectangle {
+                id: voiceSettingsPanel
+                objectName: "voiceSettingsPanel"
+                Layout.fillWidth: true
+                implicitHeight: voiceSettingsColumn.implicitHeight + tokens.spacingMedium * 2
+                radius: tokens.cornerRadiusSmall
+                color: tokens.surface
+                border.color: tokens.border
+                border.width: 1
+
+                ColumnLayout {
+                    id: voiceSettingsColumn
+                    anchors.fill: parent
+                    anchors.margins: tokens.spacingMedium
+                    spacing: tokens.spacingSmall
+
+                    RowLayout {
+                        Layout.fillWidth: true
+                        spacing: tokens.spacingSmall
+
+                        Label {
+                            text: qsTr("语音键")
+                            font.pixelSize: tokens.fontSizeTitle
+                            font.bold: true
+                            color: tokens.textPrimary
+                        }
+                        Item { Layout.fillWidth: true }
+                        Label {
+                            text: qsTr("遥控器触发方式")
+                            color: tokens.textSecondary
+                            font.pixelSize: tokens.fontSizeSmall
+                        }
+                        Button {
+                            id: toggleVoiceModeButton
+                            objectName: "toggleVoiceModeButton"
+                            text: qsTr("按一下切换")
+                            highlighted: SettingsController.triggerModeIndex
+                                === SettingsController.toggleTriggerModeIndex
+                            onClicked: SettingsController.triggerModeIndex
+                                = SettingsController.toggleTriggerModeIndex
+                            Accessible.name: qsTr("遥控器按一下切换语音")
+                        }
+                        Button {
+                            id: holdVoiceModeButton
+                            objectName: "holdVoiceModeButton"
+                            text: qsTr("按住说话")
+                            highlighted: SettingsController.triggerModeIndex
+                                === SettingsController.holdTriggerModeIndex
+                            onClicked: SettingsController.triggerModeIndex
+                                = SettingsController.holdTriggerModeIndex
+                            Accessible.name: qsTr("遥控器按住说话")
+                        }
+                    }
+
+                    GridLayout {
+                        Layout.fillWidth: true
+                        columns: 3
+                        columnSpacing: tokens.spacingSmall
+                        rowSpacing: tokens.spacingTiny
+
+                        Label {
+                            text: qsTr("开关型宿主快捷键")
+                            color: tokens.textPrimary
+                            font.pixelSize: tokens.fontSizeSmall
+                        }
+                        TextField {
+                            id: toggleVoiceHotkeyField
+                            objectName: "toggleVoiceHotkeyField"
+                            Layout.fillWidth: true
+                            text: SettingsController.toggleVoiceHotkeyText
+                            placeholderText: qsTr("例如 lalt+space")
+                            selectByMouse: true
+                            onEditingFinished: SettingsController.toggleVoiceHotkeyText = text
+                            Accessible.name: qsTr("开关型宿主语音快捷键")
+                        }
+                        Button {
+                            text: qsTr("录")
+                            Layout.preferredWidth: 34
+                            Layout.minimumWidth: 30
+                            onClicked: root.openShortcutRecorder("", -1, "", "toggle")
+                            Accessible.name: qsTr("录制开关型宿主语音快捷键")
+                        }
+
+                        Label {
+                            text: qsTr("按住型宿主快捷键")
+                            color: tokens.textPrimary
+                            font.pixelSize: tokens.fontSizeSmall
+                        }
+                        TextField {
+                            id: holdVoiceHotkeyField
+                            objectName: "holdVoiceHotkeyField"
+                            Layout.fillWidth: true
+                            text: SettingsController.holdVoiceHotkeyText
+                            placeholderText: qsTr("例如 ctrl+l")
+                            selectByMouse: true
+                            onEditingFinished: SettingsController.holdVoiceHotkeyText = text
+                            Accessible.name: qsTr("按住型宿主语音快捷键")
+                        }
+                        Button {
+                            text: qsTr("录")
+                            Layout.preferredWidth: 34
+                            Layout.minimumWidth: 30
+                            onClicked: root.openShortcutRecorder("", -1, "", "hold")
+                            Accessible.name: qsTr("录制按住型宿主语音快捷键")
+                        }
+                    }
+
+                    Connections {
+                        target: SettingsController
+                        function onToggleVoiceHotkeyTextChanged() {
+                            toggleVoiceHotkeyField.text = SettingsController.toggleVoiceHotkeyText
+                        }
+                        function onHoldVoiceHotkeyTextChanged() {
+                            holdVoiceHotkeyField.text = SettingsController.holdVoiceHotkeyText
+                        }
+                    }
+                }
+            }
+
             GridView {
                 id: mappingList
                 objectName: "mappingList"  // stable hook for positioning a mapping card
@@ -488,27 +609,29 @@ Item {
                             onActivated: ButtonMappingModel.setActionTextAt(mappingRow.index, currentText)
                         }
 
-                        TextField {
-                            id: voiceHotkeyField
-                            objectName: "voiceHotkeyField_" + mappingRow.buttonId
+                        Label {
+                            id: voiceActionLabel
+                            objectName: "voiceActionLabel_" + mappingRow.buttonId
                             visible: mappingRow.isMic
                             Layout.fillWidth: true
                             Layout.minimumWidth: 0
-                            text: SettingsController.hotkeyText
-                            placeholderText: qsTr("例如 ralt+space")
-                            selectByMouse: true
-                            onEditingFinished: SettingsController.hotkeyText = text
-                            Accessible.name: qsTr("语音键组合键")
+                            text: SettingsController.activeVoiceActionText
+                            color: tokens.voiceAccent
+                            font.pixelSize: tokens.fontSizeBody
+                            font.bold: true
+                            elide: Text.ElideRight
+                            Accessible.name: qsTr("当前麦克风动作")
                         }
 
                         Button {
                             objectName: "recordShortcut_" + mappingRow.buttonId
+                            visible: !mappingRow.isMic
                             text: qsTr("录")
                             Layout.preferredWidth: 34
                             Layout.minimumWidth: 30
                             onClicked: root.openShortcutRecorder(
                                 mappingRow.buttonId, mappingRow.index,
-                                mappingRow.isMic, "single_click"
+                                "single_click", ""
                             )
                             Accessible.name: qsTr("录制") + mappingRow.displayName + qsTr("快捷键")
                         }
@@ -523,7 +646,7 @@ Item {
                         anchors.rightMargin: tokens.spacingSmall
                         anchors.bottomMargin: tokens.spacingSmall
                         visible: mappingRow.isMic
-                        text: qsTr("组合键按宿主语音软件设置；触发方式在连接页选择")
+                        text: qsTr("宿主快捷键：") + SettingsController.hotkeyText
                         color: tokens.textSecondary
                         font.pixelSize: tokens.fontSizeSmall
                         elide: Text.ElideRight
@@ -580,7 +703,7 @@ Item {
                             Layout.minimumWidth: 28
                             onClicked: root.openShortcutRecorder(
                                 mappingRow.buttonId, mappingRow.index,
-                                mappingRow.isMic, "double_click"
+                                "double_click", ""
                             )
                             Accessible.name: qsTr("录制双击") + mappingRow.displayName
                         }
@@ -623,7 +746,7 @@ Item {
                             Layout.minimumWidth: 28
                             onClicked: root.openShortcutRecorder(
                                 mappingRow.buttonId, mappingRow.index,
-                                mappingRow.isMic, "long_press"
+                                "long_press", ""
                             )
                             Accessible.name: qsTr("录制长按") + mappingRow.displayName
                         }
