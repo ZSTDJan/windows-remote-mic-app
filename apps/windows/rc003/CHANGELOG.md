@@ -205,6 +205,19 @@ HID tap 身份校验、进程控制和日志隐私。自动检查与 `fix10` 候
 - `fix14` 便携 ZIP SHA-256：
   `59DA357C40BDA873AF7FF06F4CFFFC68D1E5EB56FEC4BE37B3CE3BAA453FCDB5`；
   ZIP 内 EXE 已重新计算并与候选目录一致。真机复测待完成。
+- `fix15` 检查点提交 `979ed49`，最终代码提交 `eaabde8`。应用接线测试 108 项
+  通过、1 项平台相关跳过；完整测试 1143 项通过、7 项跳过；1024x720 离屏
+  QML 加载 0 warning；公开边界扫描 266 个文件通过；`compileall`、`pip check`
+  和 `git diff --check` 通过。
+- `fix15` 构建时 Git HEAD：`8624ceb`；PyInstaller 与冻结入口检查通过，
+  `--dry-run=0`、`--help=0`、无效 HID 注入 PID `=4`。
+- `fix15` 候选目录：源码仓库同级
+  `RemoteMicRC003-0.1.0-candidate-20260821-fix15/`；EXE SHA-256 为
+  `FE9B15C484DCF5E7DCBC2472DA3181587344AB4ABA3F942FC2C972B20475D61D`。
+- `fix15` 便携 ZIP SHA-256：
+  `6A24FA1023F5E4C5AC4FFCE68C43B2334286851A69CB7C87E00F1C1E60EF7DF`；
+  ZIP 内 EXE 已重新计算并与候选目录一致。统一映射与非麦克风键语音仍待
+  真机复测。
 
 ## [0.1.0-candidate] — 2026-07-31
 

@@ -271,9 +271,26 @@ HID 注入权限顺序与稳定失败提交：
   动作。零语音映射是合法配置，不应因缺少语音快捷键或语音输出端点阻止保存。
 - 自动门槛：配置迁移、设置帮助器、Qt model/controller、QML 真实加载与保存、
   应用接线和完整测试全部通过；不能只依赖模型层单元测试证明界面已正确禁用。
+- 自动结果：应用接线 108 项通过、1 项平台相关跳过；设置帮助器与 Qt 设置
+  定向测试 149 项通过；完整测试 1143 项通过、7 项安全或平台相关跳过，退出码
+  0。1024x720 离屏加载 `main.qml` 无 QML warning，真实输入普通组合键并直接
+  保存的交互探针通过。公开边界扫描 266 个文件通过；`compileall`、`pip check`
+  和 `git diff --check` 通过。
+- 代码与构建：检查点 `979ed49`，最终代码提交 `eaabde8`；构建时 Git HEAD
+  `8624ceb`。PyInstaller 构建通过，复制后的候选入口为 `--dry-run=0`、
+  `--help=0`、无效 HID 注入 PID `=4`。
+- 候选目录：源码仓库同级
+  `RemoteMicRC003-0.1.0-candidate-20260821-fix15/`；EXE SHA-256
+  `FE9B15C484DCF5E7DCBC2472DA3181587344AB4ABA3F942FC2C972B20475D61D`。
+- 便携 ZIP：`RemoteMicRC003-0.1.0-candidate-20260821-fix15-portable.zip`，
+  SHA-256
+  `6A24FA1023F5E4C5AC4FFCE68C43B2334286851A69CB7C87E00F1C1E60EF7DF`；ZIP 只有
+  一个版本顶层目录，内部 EXE 哈希已与候选目录复核一致。同批次校验文件为
+  `RemoteMicRC003-0.1.0-candidate-20260821-fix15-SHA256SUMS.txt`。
 - 真机边界：自动检查不能证明非麦克风键能让 RC003 固件持续发送 ATVV PCM，
   该能力单独由 `TEST-VOICE-006` 验收。
-- 状态：待主任务完成自动检查、候选构建和真机复测。
+- 状态：自动与冻结验证通过；`TEST-UI-002`、`TEST-KEY-003`、
+  `TEST-VOICE-005` 和 `TEST-VOICE-006` 待真机复测。
 
 ### CHECK-UI-001 语音设置集中与双快捷键保存
 
