@@ -14,6 +14,11 @@
 （Android TV Voice-over-BLE）语音桥接。项目整体说明请阅读仓库根目录的
 `README.md`。
 
+维护者需要先阅读 `WINDOWS-ARCHITECTURE-LEDGER.md`。它集中说明项目背景、
+当前范围、Windows 版的进程、线程、BLE/ATVV、Raw Input、Frida、音频、配置、
+安装和验证边界；具体故障和批次证据再分别查阅 `bugs/`、`MAINTENANCE.md`
+与 `reviews/`。
+
 设置窗口提供明确的设备选择器。选择 **小米 RC003** 时使用桥接、虚拟输出和
 13 键映射界面；选择 **DJI Mic 2（Pocket 3 套装发射器）** 时切换到独立的
 Windows 系统录音输入页面，绝不会启动 RC003 BLE/HID/ATVV 桥接。DJI 发射器
