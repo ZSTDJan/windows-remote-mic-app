@@ -261,7 +261,8 @@ GATT 查询连接 ATVV voice service。若 Windows 返回多个同名候选，�
 
 - HOLD：按下发送 key-down，音频停止发送 key-up；
 - TOGGLE：第一次按下 TAP 开始，第二次按下 TAP 结束；第一次松开后仍保持
-  逻辑会话，并重新发送 `MIC_OPEN` 维持遥控器音频。
+  逻辑会话。`AudioStopped` 先进入待续开；观察到实体来源时必须等全部 up
+  才重新发送 `MIC_OPEN`，BLE-only 使用 200 毫秒有界宽限吸收迟到边沿。
 
 `app.py` 强制顺序为：
 
@@ -270,6 +271,9 @@ GATT 查询连接 ATVV voice service。若 Windows 返回多个同名候选，�
 3. 开始语音时先验证并打开播放端点；
 4. 先向宿主交付热键；
 5. 只有宿主热键成功后才向设备发送 `MIC_OPEN` 或 `MIC_CLOSE`。
+
+TOGGLE 待续开由连接 generation 约束；第二次点击、连接清理或重连会取消
+旧计时器，避免上一连接代的 `MIC_OPEN` 落到新会话。
 
 TOGGLE 关闭 TAP 一旦成功，就不会因为后续 BLE `MIC_CLOSE` 失败而再次 TAP。
 BLE 写失败只触发清理/重连；重发 TAP 可能把宿主语音重新打开，因此被明确

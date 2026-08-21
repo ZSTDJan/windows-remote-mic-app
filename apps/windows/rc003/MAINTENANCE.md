@@ -42,6 +42,8 @@
 10. `fix8` 已能稳定得到识别文字且未再泄漏日期时间，但用户在设置页切换
     HOLD/TOGGLE 和快捷键后，运行中桥的行为没有变化；日志仍显示旧 TOGGLE
     状态机。
+11. `fix11` 中切换模式第一次短按后仍无声，必须先长按才能得到识别；日志
+    显示续发 `MIC_OPEN` 时实体 F5 尚未 up。
 
 已确认原因：
 
@@ -69,6 +71,10 @@
   了开关竞态。
 - `BUG-010`：设置窗口正确写入 `config.json`，运行中桥却只按 mtime 热加载
   `key_bindings.json`；语音生命周期和快捷键只在进程启动时读取。
+- `BUG-011`：按键检测请求可能先被 `AudioStarted` 或 ATVV mic 抢跑，后到
+  F5/HID 虽能让界面显示 `mic`，正式语音状态却已经被改变。
+- `BUG-012`：TOGGLE 在 `AudioStopped` 时立即续开，但真机实体 F5 约 108
+  毫秒后才 up；设备回复续流开始却不发送 PCM。
 
 本批次范围：
 
@@ -90,6 +96,8 @@
 - `bugs/BUG-008-toggle-multi-source-gesture.md`
 - `bugs/BUG-009-f5-hook-release-race.md`
 - `bugs/BUG-010-live-voice-settings-reload.md`
+- `bugs/BUG-011-mic-key-detection-voice-race.md`
+- `bugs/BUG-012-toggle-reopen-before-physical-release.md`
 - `TESTING.md`
 
 实施结果：
@@ -131,6 +139,9 @@
 - 同轮完整代码审查修复了三个确定性问题：PortAudio `close()` 失败时保留
   资源句柄以便重试；隐私禁用字段按大小写不敏感校验；开始菜单环境变量缺失
   时不再误扫当前工作目录。
+- 麦克风按键检测改用独立跨来源门闩，检测期间不会改变正式语音状态。
+- TOGGLE 续开改为待全部实体来源 up 后执行；BLE-only 使用 200 毫秒有界
+  宽限，第二次关闭、清理和重连均取消待续开。
 
 自动验证证据：
 
@@ -196,6 +207,9 @@
 - `fix11` 便携 ZIP SHA-256：
   `DF9F50C4B9F11D703FA65BFE200A52FBD953B7591670FA3AEF89B6C96985127B`；
   ZIP 内 EXE 已重新计算并与候选目录一致。
+- `fix12` 代码修复提交：`f6ae3c3`；应用接线测试 83 项通过、1 项平台相关
+  跳过；完整测试 1095 项通过、7 项跳过；公开边界扫描 230 个文件通过。
+  候选构建和真机短按持续语音复测尚未完成。
 - 冻结桥接实测：进程日志记录通知区域图标 ready 和 started，随后完成
   RC003 BLE/ATVV 能力连接。用户从托盘打开设置后再选择“退出桥接”，桥接
   进程消失而设置窗口继续保留；日志记录 HID tap stopped、BLE/HID/音频
