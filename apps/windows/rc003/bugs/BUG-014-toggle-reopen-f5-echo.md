@@ -68,3 +68,16 @@ F5 down/up。旧状态机已经结束原手势，因此把这组紧邻续开的�
    不得立刻出现 `toggle closing` 和空会话。
 4. 讲话后再短按一次，必须正常结束。连续至少 5 轮并记录失败次数与启动延迟。
 
+## `fix14` 候选
+
+- 构建时 Git HEAD：`f5c86b9`。
+- 候选目录：
+  `RemoteMicRC003-0.1.0-candidate-20260821-fix14/`。
+- EXE SHA-256：
+  `E0E3A7A36D6F07A1E1893E6B2A2750240EE0C78056EE5DC6DCE331227C98D24D`。
+- 便携 ZIP：
+  `RemoteMicRC003-0.1.0-candidate-20260821-fix14-portable.zip`。
+- ZIP SHA-256：
+  `59DA357C40BDA873AF7FF06F4CFFFC68D1E5EB56FEC4BE37B3CE3BAA453FCDB5`。
+- ZIP 内 EXE 已重新计算并与候选目录一致；冻结入口
+  `--dry-run=0`、`--help=0`、无效 HID 注入 PID `=4`。

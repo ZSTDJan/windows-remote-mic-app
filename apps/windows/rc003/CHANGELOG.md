@@ -187,7 +187,15 @@ HID tap 身份校验、进程控制和日志隐私。自动检查与 `fix10` 候
   ZIP 内 EXE 已重新计算并与候选目录一致。人工界面与真机语音仍待复测。
 - `fix14` F5 续开回声代码提交：`bfd514d`。应用接线测试 84 项通过、1 项
   平台相关跳过；完整测试 1103 项通过、7 项跳过；公开边界扫描 231 个文件
-  通过；`compileall`、`pip check` 和 `git diff --check` 通过。候选待构建。
+  通过；`compileall`、`pip check` 和 `git diff --check` 通过。
+- `fix14` 构建时 Git HEAD：`f5c86b9`；构建门禁公开边界扫描 233 个文件，
+  PyInstaller 和冻结入口检查通过。
+- `fix14` 候选目录：源码仓库同级的
+  `RemoteMicRC003-0.1.0-candidate-20260821-fix14/`；EXE SHA-256 为
+  `E0E3A7A36D6F07A1E1893E6B2A2750240EE0C78056EE5DC6DCE331227C98D24D`。
+- `fix14` 便携 ZIP SHA-256：
+  `59DA357C40BDA873AF7FF06F4CFFFC68D1E5EB56FEC4BE37B3CE3BAA453FCDB5`；
+  ZIP 内 EXE 已重新计算并与候选目录一致。真机复测待完成。
 
 ## [0.1.0-candidate] — 2026-07-31
 

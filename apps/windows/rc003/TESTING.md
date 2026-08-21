@@ -252,7 +252,14 @@ HID 注入权限顺序与稳定失败提交：
 - 自动结果：应用接线测试 84 项通过、1 项平台相关跳过；完整测试 1103 项
   通过、7 项跳过；公开边界扫描 231 个文件通过；`compileall`、`pip check`
   和 `git diff --check` 通过。
-- 状态：自动验证通过，待 `fix14` 本机连续短按复测。
+- 候选：`RemoteMicRC003-0.1.0-candidate-20260821-fix14-portable.zip`，
+  SHA-256
+  `59DA357C40BDA873AF7FF06F4CFFFC68D1E5EB56FEC4BE37B3CE3BAA453FCDB5`；
+  ZIP 内 EXE SHA-256
+  `E0E3A7A36D6F07A1E1893E6B2A2750240EE0C78056EE5DC6DCE331227C98D24D`，
+  已与候选目录一致。冻结入口 `--dry-run=0`、`--help=0`、无效 HID 注入
+  PID `=4`。
+- 状态：自动与冻结验证通过，待 `fix14` 本机连续短按复测。
 
 ### CHECK-UI-001 语音设置集中与双快捷键保存
 
