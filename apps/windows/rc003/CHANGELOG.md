@@ -19,8 +19,11 @@ HID tap 身份校验、进程控制和日志隐私。自动检查与 `fix10` 候
 续开，待本机复测。随后单独完成语音设置界面整合：连接页不再重复展示语音
 配置，按键页集中管理两套语音快捷键；当前 `fix15` 源码进一步取消全局语音
 模式选择，把开关型/按住型语音改为任一实体键可选的主映射动作，并允许麦克风
-键改为普通动作。该界面与动作模型批次不改变 `fix12` / `fix14` 的语音时序
-实现；非麦克风键能否持续取得 ATVV 音频仍待新候选真机复测。
+键改为普通动作。后续 transport 复核确认短流还存在 `AUDIO_STOP` 越过已收到
+音频的独立缺陷，现已修复并通过自动回归；同时产品资料和同型号真机证据表明
+RC003 的可靠原生行为是 HOLD，主动 `MIC_OPEN` 可能只有开始控制、没有 PCM。
+因此 TOGGLE 已从“待复测修复”降为实验性，只剩规范
+`START_SEARCH -> MIC_OPEN` 路径待真机排除。
 本节不得扩大为完整真机通过声明。
 维护证据与验收入口见
 `MAINTENANCE.md`、
@@ -37,7 +40,9 @@ HID tap 身份校验、进程控制和日志隐私。自动检查与 `fix10` 候
 `bugs/BUG-012-toggle-reopen-before-physical-release.md`、
 `bugs/BUG-013-key-detection-claim-race.md`、
 `bugs/BUG-014-toggle-reopen-f5-echo.md`、
-`bugs/BUG-015-sogou-codex-text-commit.md` 和 `TESTING.md`。
+`bugs/BUG-015-sogou-codex-text-commit.md`、
+`bugs/BUG-016-audio-stop-overtakes-audio.md`、
+`bugs/BUG-017-toggle-firmware-audio-boundary.md` 和 `TESTING.md`。
 
 ### 界面
 
@@ -57,6 +62,12 @@ HID tap 身份校验、进程控制和日志隐私。自动检查与 `fix10` 候
   陷阱。现有按键矩阵、语音时序、BLE、音频和配置 schema 不在本批修改范围。
 
 ### 修复
+
+- **短语音停止越过已收到音频**：CONTROL/AUDIO 分队列原本让
+  `AUDIO_STOP` 优先关闭 decoder，排队中的短流尾包随后全部被判为晚到数据。
+  现在两个队列共享通知序号，序号分配与入队由 producer lock 原子保护；STOP
+  只排空同代且更早的音频，不吞下一会话首帧。确定性、跨会话和并发 producer
+  回归通过；真实 RC003 短流仍待候选复测。
 
 - **语音触发但无声**：过滤当前 PortAudio 阻塞播放不支持的
   `Windows WDM-KS` 端点；同名视图优先 `Windows WASAPI`，缺失时使用
@@ -83,6 +94,8 @@ HID tap 身份校验、进程控制和日志隐私。自动检查与 `fix10` 候
   第一次松开产生的 `AudioStopped` 不再关闭宿主，而会续发 `MIC_OPEN`；
   第二次按下发送宿主关闭快捷键和线程安全 `MIC_CLOSE`，竞态音频事件不会
   重新开麦。按住说话模式保持原行为。
+  后续产品复核撤回“持续语音已修复”的判断：上述只是 Windows 状态机行为，
+  RC003 主动续开会话仍可能零 PCM；TOGGLE 现为 `BUG-017` 的实验路径。
 - **从托盘打开设置后真实按键检测失效**：设置页检测到后台桥接已持有 HID
   资源时，通过一次性本地文件 IPC 请求后台捕获下一键；后台回传逻辑按键并
   吞掉该次 down/up，不执行映射。后台未运行时仍使用本地 Raw Input 与
@@ -132,6 +145,9 @@ HID tap 身份校验、进程控制和日志隐私。自动检查与 `fix10` 候
   不再把相对路径解析为当前工作目录，避免意外启动同名快捷方式。
 
 ### 变更
+
+- RC003 正式语音能力边界收敛为 HOLD；TOGGLE 暂保留配置和实现用于最后一条
+  On-request 真机探针，不再作为当前已支持能力或候选通过项。
 
 - 语音生命周期（按一下切换 / 按住到松开）与宿主语音快捷键解耦。切换
   生命周期或录制快捷键不再擅自改写另一个字段，支持宿主把

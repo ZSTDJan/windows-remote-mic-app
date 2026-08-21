@@ -407,6 +407,9 @@ class RC003BleSession:
         self._audio_event_queue: "queue.Queue[tuple]" = queue.Queue(
             maxsize=_QUEUE_MAXSIZE
         )
+        self._event_sequence_lock = threading.Lock()
+        self._next_event_sequence = 0
+        self._deferred_audio_event: Optional[tuple] = None
         self._event_queue_wakeup = threading.Event()
         self._worker_thread: Optional[threading.Thread] = None
         self._worker_stop = threading.Event()
@@ -661,30 +664,45 @@ class RC003BleSession:
                 )
 
     def _enqueue(self, kind: str, payload: bytes) -> None:
-        item = (self._generation, payload)
-        if kind == "control":
-            try:
-                self._control_event_queue.put_nowait(item)
-            except queue.Full:
-                self._worker_stop.set()
-                self._notify_error(RuntimeError("ATVV control event queue overflow"))
+        notify_error = None
+        wake_worker = False
+        with self._event_sequence_lock:
+            sequence = self._next_event_sequence
+            self._next_event_sequence += 1
+            item = (self._generation, sequence, payload)
+            # Keep sequence assignment and queue insertion under the same
+            # producer lock. WinRT may invoke the two characteristic
+            # callbacks on different threads; allowing a producer to pause
+            # between these operations could otherwise let a later
+            # AUDIO_STOP enter its queue before earlier audio is visible to
+            # the worker.
+            if kind == "control":
+                try:
+                    self._control_event_queue.put_nowait(item)
+                except queue.Full:
+                    self._worker_stop.set()
+                    notify_error = RuntimeError("ATVV control event queue overflow")
+                else:
+                    wake_worker = True
             else:
-                self._event_queue_wakeup.set()
-            return
-        try:
-            self._audio_event_queue.put_nowait(item)
+                try:
+                    self._audio_event_queue.put_nowait(item)
+                    wake_worker = True
+                except queue.Full:
+                    try:
+                        self._audio_event_queue.get_nowait()  # drop oldest audio only
+                    except queue.Empty:
+                        pass
+                    self.dropped_event_count += 1
+                    try:
+                        self._audio_event_queue.put_nowait(item)
+                        wake_worker = True
+                    except queue.Full:
+                        pass
+        if wake_worker:
             self._event_queue_wakeup.set()
-        except queue.Full:
-            try:
-                self._audio_event_queue.get_nowait()  # drop oldest audio only
-            except queue.Empty:
-                pass
-            self.dropped_event_count += 1
-            try:
-                self._audio_event_queue.put_nowait(item)
-                self._event_queue_wakeup.set()
-            except queue.Full:
-                pass
+        if notify_error is not None:
+            self._notify_error(notify_error)
 
     # -- dedicated worker thread: decode + dispatch, never on a WinRT thread
 
@@ -698,18 +716,30 @@ class RC003BleSession:
 
     def _worker_loop(self, generation: int) -> None:
         while not self._worker_stop.is_set():
-            if self._control_event_queue.empty() and self._audio_event_queue.empty():
+            if (
+                self._control_event_queue.empty()
+                and self._audio_event_queue.empty()
+                and self._deferred_audio_event is None
+            ):
                 self._event_queue_wakeup.wait(timeout=_WORKER_POLL_SECONDS)
                 self._event_queue_wakeup.clear()
                 if self._worker_stop.is_set():
                     break
             try:
-                item_generation, payload = self._control_event_queue.get_nowait()
+                item_generation, sequence, payload = (
+                    self._control_event_queue.get_nowait()
+                )
             except queue.Empty:
-                try:
-                    item_generation, payload = self._audio_event_queue.get_nowait()
-                except queue.Empty:
-                    continue
+                if self._deferred_audio_event is not None:
+                    item_generation, sequence, payload = self._deferred_audio_event
+                    self._deferred_audio_event = None
+                else:
+                    try:
+                        item_generation, sequence, payload = (
+                            self._audio_event_queue.get_nowait()
+                        )
+                    except queue.Empty:
+                        continue
                 kind = "audio"
             else:
                 kind = "control"
@@ -717,6 +747,8 @@ class RC003BleSession:
                 continue  # stale event from a previous/torn-down session
             try:
                 if kind == "control":
+                    if payload and payload[0] == proto.OPCODE_AUDIO_STOP:
+                        self._drain_audio_before_stop(generation, sequence)
                     self._process_control(payload)
                 elif kind == "audio":
                     self._process_audio(payload)
@@ -727,6 +759,42 @@ class RC003BleSession:
                 # and notify the supervisor so cleanup/reconnect owns recovery.
                 self._worker_stop.set()
                 self._notify_error(exc)
+
+    def _drain_audio_before_stop(self, generation: int, stop_sequence: int) -> None:
+        """Process audio callbacks that arrived before this AUDIO_STOP.
+
+        Control notifications normally retain priority so a large audio
+        backlog cannot hide a transport failure or capability response. An
+        AUDIO_STOP is different: overtaking already-received audio changes
+        protocol meaning because ATVVSession immediately closes its decoder
+        and rejects those bytes as late leftovers. Sequence tags let this one
+        control edge drain only its own earlier audio while leaving any later
+        session's first frame deferred until that session's AUDIO_START runs.
+        """
+
+        drained = 0
+        while True:
+            if self._deferred_audio_event is not None:
+                item = self._deferred_audio_event
+                self._deferred_audio_event = None
+            else:
+                try:
+                    item = self._audio_event_queue.get_nowait()
+                except queue.Empty:
+                    break
+            item_generation, sequence, payload = item
+            if item_generation != generation:
+                continue
+            if sequence >= stop_sequence:
+                self._deferred_audio_event = item
+                break
+            self._process_audio(payload)
+            drained += 1
+        if drained:
+            _logger.info(
+                "ATVV audio tail processed before stop: notification_count=%d",
+                drained,
+            )
 
     def _notify_error(self, exc: BaseException) -> None:
         if self._on_error is None:
@@ -798,6 +866,7 @@ class RC003BleSession:
                     event_queue.get_nowait()
                 except queue.Empty:
                     break
+        self._deferred_audio_event = None
 
         if self._session.mic_open:
             try:

@@ -44,6 +44,10 @@
     状态机。
 11. `fix11` 中切换模式第一次短按后仍无声，必须先长按才能得到识别；日志
     显示续发 `MIC_OPEN` 时实体 F5 尚未 up。
+12. 短语音会话存在开始/停止控制完整但 `frames=0 samples=0`；独立
+    VB-CABLE 合成信号验证不能解释所有空会话。
+13. 多轮 Windows TOGGLE 时序修复后，主动续开仍只有开始控制事件、没有持续
+    PCM；需要区分客户端缺陷与 RC003 固件不产音频。
 
 已确认原因：
 
@@ -77,6 +81,11 @@
   毫秒后才 up；设备回复续流开始却不发送 PCM。
 - `BUG-013`：一次性检测的并发来源先读取请求再争锁；Windows 共享冲突可让
   锁胜者和败者同时失败，设置页得不到结果。
+- `BUG-016`：CONTROL/AUDIO 分队列且控制优先，`AUDIO_STOP` 会越过已入队
+  音频并先关闭 decoder；并发 WinRT 回调还要求序号分配和入队原子化。
+- `BUG-017`：RC003 正式产品路径是 HOLD；主动 `MIC_OPEN` 可返回开始控制
+  但不发送音频。TOGGLE 只剩实体 `START_SEARCH -> MIC_OPEN` 的 On-request
+  窄路径尚未真机排除。
 
 本批次范围：
 
@@ -103,6 +112,8 @@
 - `bugs/BUG-013-key-detection-claim-race.md`
 - `bugs/BUG-014-toggle-reopen-f5-echo.md`
 - `bugs/BUG-015-sogou-codex-text-commit.md`
+- `bugs/BUG-016-audio-stop-overtakes-audio.md`
+- `bugs/BUG-017-toggle-firmware-audio-boundary.md`
 - `TESTING.md`
 
 实施结果：
@@ -418,6 +429,40 @@ HID 注入权限顺序与稳定失败提交：
 - 完整测试 1154 项通过、7 项安全或平台相关跳过，退出码 0；公开边界扫描
   267 个文件通过；`compileall`、`pip check` 和 `git diff --check` 通过。
 - 状态：源码与自动检查通过；新候选构建及 `TEST-UI-003` 人工界面复核待完成。
+
+### 2026-08-21 BLE 音频停止排序与 RC003 固件边界
+
+来源与边界：
+
+- 本批只修改 `ble_transport_winrt.py`、对应 transport 合同测试和技术记录，
+  不修改或混入同期 QML/Qt 设置界面工作。
+- 目标是解释短会话 `frames=0`，同时重新核对反复失败的 TOGGLE 是否属于
+  Windows 时序缺陷。Quicker 和宿主文字提交兼容不在本批。
+
+已确认修复：
+
+- 生产类确定性复现证明 CONTROL 优先会让 `AUDIO_STOP` 越过已经收到的 AUDIO，
+  decoder 先关闭后把尾包全部拒绝。
+- CONTROL/AUDIO 现在共享通知序号；producer lock 同时覆盖序号分配和入队；
+  worker 仅在 STOP 前排空更早的同代音频，下一会话首帧不会串入上一会话。
+- 定向 9 项通过；完整 unittest 1154 项通过、7 项按安全或平台条件跳过，
+  退出码 0。真机短流尾音仍需当前构建复测。
+
+产品复核：
+
+- 截至 2026-08-21，上游产品说明和同型号真机对照都把 RC003 的可靠行为定义
+  为按住传音、松开停止；Power 主动 `MIC_OPEN` 曾得到 stream 0 开始事件但
+  零音频，同连接普通语音键立即有连续 120-byte 音频。
+- 本地 On-request-only 直接开麦探针也为开始控制成功、四秒零 PCM，但缺少
+  规范要求的实体 `START_SEARCH` 前置，因此只保留这一条窄路径待真机验证。
+- 结论：`BUG-016` 是已修复的 Windows 真实缺陷；它不能证明 TOGGLE 可用。
+  TOGGLE 从“已修复”退回“实验性/待产品决策”，不在本批擅自删除界面和配置。
+
+详细证据：
+
+- `bugs/BUG-016-audio-stop-overtakes-audio.md`
+- `bugs/BUG-017-toggle-firmware-audio-boundary.md`
+- `TESTING.md` 的 `CHECK-VOICE-010` 与 `CHECK-VOICE-011`
 
 ## 维护纪律
 

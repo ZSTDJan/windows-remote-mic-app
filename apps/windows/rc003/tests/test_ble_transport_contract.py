@@ -28,6 +28,8 @@ without one.
 """
 
 import asyncio
+import queue
+import threading
 import time
 import unittest
 import uuid
@@ -359,6 +361,66 @@ class ConnectTests(unittest.TestCase):
 
 
 class NotificationProcessingTests(unittest.TestCase):
+    def test_concurrent_producers_insert_in_their_assigned_sequence_order(self):
+        class BlockingAudioQueue(queue.Queue):
+            def __init__(self):
+                super().__init__()
+                self.put_entered = threading.Event()
+                self.release_put = threading.Event()
+
+            def put_nowait(self, item):
+                self.put_entered.set()
+                if not self.release_put.wait(timeout=2.0):
+                    raise AssertionError("test did not release blocked audio enqueue")
+                return super().put_nowait(item)
+
+        loop = asyncio.new_event_loop()
+        session = RC003BleSession(
+            on_pcm_frame=lambda samples: None,
+            loop=loop,
+        )
+        audio_queue = BlockingAudioQueue()
+        session._audio_event_queue = audio_queue
+        control_inserted = threading.Event()
+        original_control_put = session._control_event_queue.put_nowait
+
+        def record_control_put(item):
+            original_control_put(item)
+            control_inserted.set()
+
+        session._control_event_queue.put_nowait = record_control_put
+        audio_thread = threading.Thread(
+            target=session._enqueue,
+            args=("audio", b"audio"),
+        )
+        stop_thread = threading.Thread(
+            target=session._enqueue,
+            args=("control", bytes((proto.OPCODE_AUDIO_STOP, 0x02))),
+        )
+        try:
+            audio_thread.start()
+            self.assertTrue(audio_queue.put_entered.wait(timeout=1.0))
+            stop_thread.start()
+
+            self.assertFalse(
+                control_inserted.wait(timeout=0.1),
+                "later control insertion overtook the in-progress audio insertion",
+            )
+
+            audio_queue.release_put.set()
+            audio_thread.join(timeout=1.0)
+            stop_thread.join(timeout=1.0)
+            self.assertFalse(audio_thread.is_alive())
+            self.assertFalse(stop_thread.is_alive())
+            self.assertTrue(control_inserted.is_set())
+            self.assertEqual(audio_queue.get_nowait()[1], 0)
+            self.assertEqual(session._control_event_queue.get_nowait()[1], 1)
+        finally:
+            audio_queue.release_put.set()
+            audio_thread.join(timeout=1.0)
+            stop_thread.join(timeout=1.0)
+            loop.close()
+
     def test_audio_backpressure_never_drops_or_delays_control_behind_audio(self):
         processed = []
         loop = asyncio.new_event_loop()
@@ -381,6 +443,88 @@ class NotificationProcessingTests(unittest.TestCase):
             self.assertGreater(session.dropped_event_count, 0)
         finally:
             session._worker_stop.set()
+            if session._worker_thread is not None:
+                session._worker_thread.join(timeout=2.0)
+            loop.close()
+
+    def test_audio_stop_processes_earlier_audio_before_closing_session(self):
+        pcm_batches = []
+        control_events = []
+        loop = asyncio.new_event_loop()
+        session = RC003BleSession(
+            on_pcm_frame=pcm_batches.append,
+            on_control_event=control_events.append,
+            loop=loop,
+        )
+        try:
+            session._session.handle_control(_caps_payload(frame_size=2))
+            session._enqueue(
+                "control",
+                bytes((proto.OPCODE_AUDIO_START, 0x03, 0x02, 0x01)),
+            )
+            for _ in range(10):
+                session._enqueue("audio", bytes((0x11, 0x11)))
+            session._enqueue("control", bytes((proto.OPCODE_AUDIO_STOP, 0x02)))
+
+            session._start_worker(session._generation)
+
+            self.assertTrue(
+                _wait_until(
+                    lambda: any(
+                        isinstance(event, atvv_session.AudioStopped)
+                        for event in control_events
+                    )
+                )
+            )
+            self.assertEqual(len(pcm_batches), 10)
+            self.assertIsInstance(control_events[0], atvv_session.AudioStarted)
+            self.assertIsInstance(control_events[-1], atvv_session.AudioStopped)
+        finally:
+            session._worker_stop.set()
+            session._event_queue_wakeup.set()
+            if session._worker_thread is not None:
+                session._worker_thread.join(timeout=2.0)
+            loop.close()
+
+    def test_audio_stop_does_not_drain_a_later_sessions_audio(self):
+        processed = []
+        loop = asyncio.new_event_loop()
+        session = RC003BleSession(
+            on_pcm_frame=lambda samples: None,
+            loop=loop,
+        )
+        session._process_control = lambda payload: processed.append(
+            ("control", payload)
+        )
+        session._process_audio = lambda payload: processed.append(("audio", payload))
+        first_start = bytes((proto.OPCODE_AUDIO_START, 0x03, 0x02, 0x01))
+        first_audio = b"first-audio"
+        first_stop = bytes((proto.OPCODE_AUDIO_STOP, 0x02))
+        second_start = bytes((proto.OPCODE_AUDIO_START, 0x03, 0x02, 0x02))
+        second_audio = b"second-audio"
+        try:
+            session._enqueue("control", first_start)
+            session._enqueue("audio", first_audio)
+            session._enqueue("control", first_stop)
+            session._enqueue("control", second_start)
+            session._enqueue("audio", second_audio)
+
+            session._start_worker(session._generation)
+
+            self.assertTrue(_wait_until(lambda: len(processed) == 5))
+            self.assertEqual(
+                processed,
+                [
+                    ("control", first_start),
+                    ("audio", first_audio),
+                    ("control", first_stop),
+                    ("control", second_start),
+                    ("audio", second_audio),
+                ],
+            )
+        finally:
+            session._worker_stop.set()
+            session._event_queue_wakeup.set()
             if session._worker_thread is not None:
                 session._worker_thread.join(timeout=2.0)
             loop.close()
