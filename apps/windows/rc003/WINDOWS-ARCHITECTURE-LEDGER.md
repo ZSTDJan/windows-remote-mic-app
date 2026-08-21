@@ -336,6 +336,10 @@ session detach 成功即证明其脚本不再被会话持有；单独 script unl
 本地文件请求，由桥接吞掉下一次按下/释放、返回逻辑 button id 且不执行映射。
 无法安全确认桥接 mutex 状态时，设置页停止检测，不猜测“没有运行”。
 
+多个输入来源可能同时尝试认领该请求。`key_detection_bridge.py` 必须先用
+`O_CREAT | O_EXCL` 独占 claim lock，再读取和移动 request JSON；结果写入失败
+时尽量恢复 request。先读文件再争锁会在 Windows 共享时序下产生双失败。
+
 ## 12. 线程、队列与资源所有权
 
 | 所有者 | 资源 | 停止/失败原则 |

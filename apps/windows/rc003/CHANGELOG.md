@@ -30,7 +30,8 @@ HID tap 身份校验、进程控制和日志隐私。自动检查与 `fix10` 候
 `bugs/BUG-009-f5-hook-release-race.md`、
 `bugs/BUG-010-live-voice-settings-reload.md`、
 `bugs/BUG-011-mic-key-detection-voice-race.md`、
-`bugs/BUG-012-toggle-reopen-before-physical-release.md` 和 `TESTING.md`。
+`bugs/BUG-012-toggle-reopen-before-physical-release.md`、
+`bugs/BUG-013-key-detection-claim-race.md` 和 `TESTING.md`。
 
 ### 修复
 
@@ -92,6 +93,10 @@ HID tap 身份校验、进程控制和日志隐私。自动检查与 `fix10` 候
   设备虽回复 `AudioStarted` 却不再发送 PCM。现在续开先等待全部实体来源
   up；BLE-only 路径使用 200 毫秒有界宽限吸收迟到边沿。第二次点击、清理和
   重连都会取消待续开，旧回调不能串入新连接。
+- **真实按键检测偶发没有结果**：多个 HID/F5/音频来源会同时读取一次性请求
+  后再竞争认领锁；Windows 文件共享时序可能让锁胜者移动失败、败者也返回
+  失败。现在先独占 claim lock 再读取和移动请求，结果写入失败会尽量恢复
+  请求供后续来源重试。
 - **PortAudio 清理失败时丢失重试句柄**：播放流只有在 `close()` 确认成功后
   才清除内部引用；关闭失败会保留句柄供后续清理重试。
 - **隐私字段大小写绕过**：禁止持久化的设备标识字段改为大小写不敏感检查，
@@ -144,9 +149,10 @@ HID tap 身份校验、进程控制和日志隐私。自动检查与 `fix10` 候
 - `fix11` 便携 ZIP SHA-256：
   `DF9F50C4B9F11D703FA65BFE200A52FBD953B7591670FA3AEF89B6C96985127B`；
   ZIP 内 EXE 已重新计算并与候选目录一致。
-- `fix12` 实体释放后续开代码提交：`f6ae3c3`。应用接线测试 83 项通过、
-  1 项平台相关跳过；完整测试 1095 项通过、7 项跳过；公开边界扫描 230 个
-  文件通过；候选尚待构建和真机复测。
+- `fix12` 实体释放后续开代码提交：`f6ae3c3`；并发检测认领提交：
+  `cfbca35`。应用接线测试 83 项通过、1 项平台相关跳过；检测与应用扩展
+  定向测试 90 项通过、1 项跳过；完整测试 1096 项通过、7 项跳过；公开边界
+  扫描 231 个文件通过；候选尚待构建和真机复测。
 
 ## [0.1.0-candidate] — 2026-07-31
 
