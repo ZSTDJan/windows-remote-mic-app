@@ -76,17 +76,19 @@ RC003 原本是面向电视/机顶盒的蓝牙语音遥控器。Windows 可以�
 
 ## 4. 来源、演进基线与许可
 
-- Remote Mic 主项目调研快照：`remote-mic-app` 的 `main` 在 2026-08-20 核验为
-  `4d526175817ad2c4c5fbe1650d528c946a3cdbf3`，主要维护 macOS，不是本 Windows
-  客户端的直接代码基线。
+- Remote Mic 主项目调研快照：`HD838A/remote-mic-app` 的 `main` 在
+  2026-08-20 核验为 `4d526175817ad2c4c5fbe1650d528c946a3cdbf3`，主要维护
+  macOS，不是本 Windows 客户端的直接代码基线。
 - Windows 派生仓库：`miaomiaozii/windows-remote-mic-app`。
 - Windows 派生起点：`271ed7947eec19c4c691ed3ba97f338461be8051`；内部实现
   基于 GPL-3.0-only 项目 `nijez/open-voice-bridge` 的 Windows RC003 客户端。
 - 最近完整源码检查点：`eafd203`；该提交证明代码修改与自动检查基线，不代表
   最新冻结包已经完成真机验收。
 - 当前维护主线：小米蓝牙遥控器 2 Pro / RC003 的 Windows 客户端。
-- 协议与 HID tap 参考：GPL-3.0-only 上游 `remote-bridge-hub` 的已记录提交；
-  具体归属见 `ATTRIBUTION.md`。
+- 协议与 HID tap 参考：GPL-3.0-only 项目
+  `xxb26553663-star/remote-bridge-hub` 的提交
+  `8a93f321ac71a602300c6cd77f7256fa4b63068e`；具体归属见
+  `THIRD_PARTY_NOTICES.md`。
 - 本仓库许可：GPL-3.0-only。PySide6、Frida、PortAudio、NumPy、WinRT 投影、
   VB-CABLE 等仍按各自许可和通知分开处理。
 - Quicker 不是核心运行依赖。未来只需要新增一个动作出口，不应反向侵入
@@ -103,7 +105,7 @@ RC003 原本是面向电视/机顶盒的蓝牙语音遥控器。Windows 可以�
 | HID/按键链 | 从 Windows HID、Raw Input 或 HID tap 到逻辑按钮和映射动作的链路 |
 | ATVV/语音链 | 从 BLE GATT 控制与音频特征到 PCM 输出端点的链路 |
 | 宿主 | 最终接收快捷键和虚拟麦克风输入的输入法或语音应用 |
-| HOLD | 按下开始，物理/音频结束后释放宿主快捷键 |
+| HOLD | 按下时发送宿主 key-down，设备 AUDIO_STOP 时发送 key-up |
 | TOGGLE | 第一次按下开始，第二次按下结束，中间无需持续按住 |
 | 候选构建 | 未签名、需要绑定源码提交和哈希、尚可能等待真机验收的包 |
 
@@ -115,10 +117,11 @@ RC003 原本是面向电视/机顶盒的蓝牙语音遥控器。Windows 可以�
 
 | 入口 | 角色 | 是否持有硬件资源 |
 | --- | --- | --- |
-| 无参数、`--settings` | Qt Quick 设置窗口 | 通常不持有；本地按键检测时短暂持有 |
+| 无参数、`--settings` | Qt Quick 设置窗口 | 不长期持有；本地按键检测和音频预检时短暂持有，BLE 诊断委托子进程 |
 | `--bridge` | 后台桥接进程 | 持有 BLE、Raw Input、HID tap、音频和托盘 |
 | `--dry-run` | 模块导入检查 | 否 |
 | `--help` | 帮助文本 | 否 |
+| `--diagnose-ble-candidates <result>` | 隐藏的有界 BLE 诊断子进程 | 短暂持有 WinRT BLE 枚举资源 |
 | `--rc003-hid-injector --pid ...` | 隐藏的受限注入子进程 | 短暂持有目标进程句柄 |
 
 源码运行使用 `python -m ovb_rc003`。PyInstaller 不直接分析包内
@@ -128,6 +131,11 @@ RC003 原本是面向电视/机顶盒的蓝牙语音遥控器。Windows 可以�
 后台桥接由 per-session Windows named mutex 保证单实例。设置窗口可以多次
 打开，但第二个桥接不能越过单实例保护。桥接存活时通知区域图标提供“打开
 设置”和“退出桥接”；关闭设置窗口本身不会结束后台桥接。
+
+`--bridge-from-settings` 只是设置窗口启动 `--bridge` 时附带的隐藏来源标记，
+用于让重复实例静默返回确定退出码，不是独立运行角色。BLE 诊断另起子进程，
+是为了在 WinRT 调用卡住时仍能由父进程确认终止，不把不可取消的原生调用留在
+设置进程中。
 
 ## 7. 运行拓扑
 
@@ -166,8 +174,8 @@ RC003 遥控器
 匹配 RC003 设备。Windows 键盘栈会丢掉返回、音量加、音量减等部分 usage，
 所以 `frida_compat.py` 提供可选 HID-over-GATT tap 补齐缺失报告。
 
-HID tap 只接收由目标 RC003 `WUDFHost.exe` 建立的 loopback TCP 连接。
-服务端通过 `GetExtendedTcpTable` 核对 TCP 客户端进程 PID；
+HID tap 的 loopback TCP 客户端是运行在已核验目标 `WUDFHost.exe` 内的
+Frida Gadget。服务端通过 `GetExtendedTcpTable` 核对 TCP 客户端进程 PID；
 无法确认或 PID 不等于刚核验过的 WUDFHost 时，连接会在读取任何消息前关闭。
 日志只写固定状态，不持久化端点、PID、设备路径或地址。
 
@@ -178,11 +186,17 @@ HID tap 只接收由目标 RC003 `WUDFHost.exe` 建立的 loopback TCP 连接。
 
 - `legacy_key_suppressor_windows.py` 安装低层键盘钩子；
 - HID tap 或 Raw Input 根据已知 usage 提前 arm 一个待吞掉边沿；
-- 钩子只吞与 arm 条目匹配的 RC003 原生边沿；
+- 低层钩子本身看不到设备身份，只在短时间窗内吞掉与 arm 条目键值、扫描码、
+  扩展位和按下/释放状态都匹配的非注入边沿；
 - 应用随后只执行一次映射动作。
 
-麦克风的原生 F5 是特殊路径：它会被替换成宿主需要的右 Alt 物理形状，不能
-泄漏给记事本或输入框，否则可能触发“插入日期时间”等原生 F5 行为。
+麦克风的原生 F5 是特殊路径：部分 RC003/Windows 组合只把麦克风键暴露成
+无法关联设备来源的 legacy F5。桥接运行时，专用钩子会吞掉非注入 F5，避免
+它泄漏给记事本或输入框并触发“插入日期时间”。在兼容的 HOLD 预设下，符合
+当前手势条件的 F5 按下/释放对会转换为带私有标记的右 Alt 边沿；其他模式或
+自定义快捷键由语音状态机交付当前配置。代价是桥接钩子启用期间，用户键盘上
+任何非注入的真实 F5 同样会被吞掉；这是当前已知架构边界，不能描述成钩子
+直接识别了 RC003 设备来源。
 
 ### 8.3 物理签名、手势与动作
 
@@ -326,7 +340,7 @@ session detach 成功即证明其脚本不再被会话持有；单独 script unl
 | BLE worker | CONTROL/AUDIO 队列和解码回调 | 异常通知 supervisor，不静默死亡 |
 | Raw Input 线程 | 隐藏窗口、设备通知、按键状态 | join 超时保留 listener 引用 |
 | 低层钩子线程 | F5/原生键抑制 | 消息队列 ready 后才报告启动成功 |
-| HID tap 线程 | loopback server、Gadget 消息 | 验证客户端 PID，心跳/大小有界 |
+| HID tap 线程/注入子进程 | loopback server、目标进程句柄、Gadget 消息 | 验证客户端 PID，心跳/大小有界 |
 | 托盘线程 | Win32 window、图标、菜单 | 退出回投 asyncio，不直接碰 BLE |
 | Qt 诊断线程 | 一次诊断任务 | 窗口退出发 stop 并有界等待 |
 | PortAudio sink | native output stream | close 未确认时保留 owner 重试 |
