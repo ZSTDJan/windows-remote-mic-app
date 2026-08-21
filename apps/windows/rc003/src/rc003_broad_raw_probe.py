@@ -1,10 +1,11 @@
 """Temporary broad Raw Input probe for the RC003 keyboard collection.
 
 The normal listener intentionally scopes and decodes only translated keyboard
-events.  This probe registers usage pages in page-only mode and records the
-complete WM_INPUT payload for the RC003 path, including any event that the
-normal decoder would classify as unknown.  It is passive and never injects or
-suppresses input.
+events. This probe registers usage pages in page-only mode and records the
+WM_INPUT payload plus a boolean RC003 match, including any event that the
+normal decoder would classify as unknown. Device interface paths are used
+only transiently for matching and are never written to the capture. It is
+passive and never injects or suppresses input.
 """
 
 from __future__ import annotations
@@ -88,7 +89,7 @@ def _device_name(user32, handle) -> str | None:
     return buffer.value
 
 
-def _enumerate_rc003_paths(user32) -> list[str]:
+def _count_rc003_paths(user32) -> int:
     count = wintypes.UINT(0)
     user32.GetRawInputDeviceList(
         None, ctypes.byref(count), ctypes.sizeof(RawInputDeviceList)
@@ -97,15 +98,15 @@ def _enumerate_rc003_paths(user32) -> list[str]:
     written = user32.GetRawInputDeviceList(
         items, ctypes.byref(count), ctypes.sizeof(RawInputDeviceList)
     )
-    paths: list[str] = []
+    count_matches = 0
     for index in range(int(written)):
         path = _device_name(user32, items[index].hDevice)
         if path and hid_identity.device_path_matches_rc003(path):
-            paths.append(path)
-    return paths
+            count_matches += 1
+    return count_matches
 
 
-def _read_raw_input(user32, lparam: int) -> tuple[int, str | None, bytes] | None:
+def _read_raw_input(user32, lparam: int) -> tuple[int, bool, bytes] | None:
     class Header(ctypes.Structure):
         _fields_ = [
             ("dwType", wintypes.DWORD),
@@ -129,7 +130,8 @@ def _read_raw_input(user32, lparam: int) -> tuple[int, str | None, bytes] | None
     header = Header.from_buffer_copy(buffer, 0)
     path = _device_name(user32, header.hDevice)
     body = bytes(buffer.raw[ctypes.sizeof(Header) :])
-    return int(header.dwType), path, body
+    is_rc003 = bool(path and hid_identity.device_path_matches_rc003(path))
+    return int(header.dwType), is_rc003, body
 
 
 def main() -> int:
@@ -272,11 +274,8 @@ def main() -> int:
             if message == WM_INPUT:
                 parsed = _read_raw_input(user32, lparam)
                 if parsed is not None:
-                    raw_type, path, body = parsed
+                    raw_type, is_rc003, body = parsed
                     counts["parsed"] += 1
-                    is_rc003 = bool(
-                        path and hid_identity.device_path_matches_rc003(path)
-                    )
                     if is_rc003:
                         counts["rc003"] += 1
                     include_event = is_rc003 or (
@@ -287,7 +286,6 @@ def main() -> int:
                         counts["written"] = counts.get("written", 0) + 1
                         fields: dict[str, object] = {
                             "raw_type": raw_type,
-                            "path": path or "<unresolved>",
                             "rc003": is_rc003,
                             "body": body.hex(" "),
                         }
@@ -368,10 +366,10 @@ def main() -> int:
         ):
             raise ctypes.WinError()
         registered = True
-        paths = _enumerate_rc003_paths(user32)
+        rc003_path_count = _count_rc003_paths(user32)
         writer.write(
             "ready",
-            rc003_paths=paths,
+            rc003_path_count=rc003_path_count,
             text=(
                 "请按一次返回、音量+、音量-和一个已知正常按键；"
                 "记录完整 WM_INPUT，不执行映射。"
@@ -395,7 +393,7 @@ def main() -> int:
     except KeyboardInterrupt:
         pass
     except BaseException as exc:  # noqa: BLE001 - diagnostic process
-        writer.write("error", error=f"{type(exc).__name__}: {exc}")
+        writer.write("error", error_type=type(exc).__name__)
         return 1
     finally:
         if registered:

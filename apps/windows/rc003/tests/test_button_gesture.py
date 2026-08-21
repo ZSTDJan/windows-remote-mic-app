@@ -149,6 +149,25 @@ class ButtonGestureDispatcherTests(unittest.TestCase):
         self.dispatcher.release("ok")
         self.assertEqual(self.triggers, [("ok", ButtonTrigger.LONG_PRESS)])
 
+    def test_cancelled_double_click_timer_cannot_fire_after_reset(self):
+        self.dispatcher.press("ok")
+        self.dispatcher.release("ok")
+        stale_callback = self.timers[0].callback
+
+        self.dispatcher.reset()
+        stale_callback()
+
+        self.assertEqual(self.triggers, [])
+
+    def test_cancelled_repeat_timer_cannot_fire_after_reset(self):
+        self.dispatcher.press("up")
+        stale_callback = self.timers[0].callback
+
+        self.dispatcher.reset()
+        stale_callback()
+
+        self.assertEqual(self.triggers, [("up", ButtonTrigger.SINGLE_CLICK)])
+
     def _new_timer(self, callback):
         timer = _FakeTimer(callback)
         self.timers.append(timer)

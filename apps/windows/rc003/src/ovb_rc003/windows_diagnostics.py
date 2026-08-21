@@ -779,8 +779,22 @@ def _run_ble_diagnostics_subprocess(
     proc = popen(list(command), **_popen_kwargs())
 
     deadline = time.monotonic() + timeout
+    returncode = None
     while True:
-        if proc.poll() is not None:
+        try:
+            returncode = proc.poll()
+        except OSError:
+            confirmed_dead = _terminate_and_confirm_exit(
+                proc, terminate_wait=terminate_wait, kill_wait=kill_wait
+            )
+            if not confirmed_dead:
+                raise BleDiscoverySubprocessShutdownUnconfirmedError(
+                    "BLE diagnostics subprocess status failed and exit could not be confirmed"
+                )
+            raise RuntimeError(
+                "BLE diagnostics subprocess status failed; child was terminated"
+            )
+        if returncode is not None:
             break
         if cancel_event.is_set():
             break
@@ -788,7 +802,7 @@ def _run_ble_diagnostics_subprocess(
             break
         time.sleep(poll_interval)
 
-    if proc.poll() is None:
+    if returncode is None:
         confirmed_dead = _terminate_and_confirm_exit(
             proc, terminate_wait=terminate_wait, kill_wait=kill_wait
         )
@@ -800,7 +814,7 @@ def _run_ble_diagnostics_subprocess(
 
     # The child has been CONFIRMED to have exited on its own - only now is
     # its result file ever read.
-    return _read_subprocess_verdict(result_path, proc.returncode)
+    return _read_subprocess_verdict(result_path, returncode)
 
 
 def _discover_ble_candidates_sync(

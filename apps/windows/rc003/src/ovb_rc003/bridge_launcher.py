@@ -30,7 +30,7 @@ launch marker, and never ``--settings``:
 that argument would recursively open another settings window instead of
 starting the bridge (In-scope item 2's "不得递归打开 --settings").
 
-Launch-outcome detection (``launch_bridge``) distinguishes four states by
+Launch-outcome detection (``launch_bridge``) distinguishes five states by
 polling the child for a short grace period rather than assuming
 "``Popen()`` did not raise" means "the bridge is running":
 
@@ -51,6 +51,9 @@ polling the child for a short grace period rather than assuming
 - ``LAUNCH_FAILED``: ``Popen()`` itself raised ``OSError`` (e.g. the target
   executable is missing or not executable) - no process was ever created at
   all.
+- ``STATUS_UNKNOWN``: a process was created, but querying its status raised
+  ``OSError``. The owner PID is retained and the UI must not tell the user to
+  retry, because the child may still be running.
 
 Testability: every OS-facing call (``_popen``, ``_sleep``) is injectable, so
 tests/test_bridge_launcher.py drives all four outcomes deterministically -
@@ -176,7 +179,10 @@ def launch_settings(
     try:
         process = _popen(list(resolved_command), **popen_kwargs)
     except OSError as exc:
-        return SettingsLaunchResult(command=resolved_command, error=str(exc))
+        return SettingsLaunchResult(
+            command=resolved_command,
+            error=type(exc).__name__,
+        )
     return SettingsLaunchResult(
         command=resolved_command,
         pid=getattr(process, "pid", None),
@@ -188,6 +194,7 @@ class LaunchOutcome(Enum):
     ALREADY_RUNNING = "already_running"
     QUICK_EXIT = "quick_exit"
     LAUNCH_FAILED = "launch_failed"
+    STATUS_UNKNOWN = "status_unknown"
 
 
 @dataclass(frozen=True)
@@ -236,15 +243,31 @@ def launch_bridge(
         return LaunchResult(
             outcome=LaunchOutcome.LAUNCH_FAILED,
             command=resolved_command,
-            error=str(exc),
+            error=type(exc).__name__,
         )
 
     pid = getattr(process, "pid", None)
-    exit_code = process.poll()
+    try:
+        exit_code = process.poll()
+    except OSError as exc:
+        return LaunchResult(
+            outcome=LaunchOutcome.STATUS_UNKNOWN,
+            command=resolved_command,
+            pid=pid,
+            error=type(exc).__name__,
+        )
     checks = 0
     while exit_code is None and checks < grace_checks:
         _sleep(poll_interval_seconds)
-        exit_code = process.poll()
+        try:
+            exit_code = process.poll()
+        except OSError as exc:
+            return LaunchResult(
+                outcome=LaunchOutcome.STATUS_UNKNOWN,
+                command=resolved_command,
+                pid=pid,
+                error=type(exc).__name__,
+            )
         checks += 1
 
     if exit_code is None:

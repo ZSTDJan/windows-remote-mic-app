@@ -127,3 +127,39 @@ class BridgeTrayLifecycleTests(unittest.TestCase):
             self.assertEqual(tray.stop_calls, 1)
 
         asyncio.run(scenario())
+
+    def test_tray_stop_exception_never_skips_bridge_cleanup(self):
+        async def scenario():
+            fake_app = _FakeBridgeApp()
+            holder = {}
+
+            class RaisingStopTray(_FakeTray):
+                def stop(self):
+                    self.stop_calls += 1
+                    raise RuntimeError("simulated tray stop failure")
+
+            def tray_factory(**callbacks):
+                tray = RaisingStopTray(**callbacks)
+                holder["tray"] = tray
+                return tray
+
+            task = asyncio.create_task(
+                app_module._run(
+                    app_factory=lambda: fake_app,
+                    tray_factory=tray_factory,
+                )
+            )
+            await asyncio.wait_for(fake_app.started.wait(), timeout=1.0)
+            holder["tray"].on_exit_requested()
+            await asyncio.wait_for(task, timeout=1.0)
+
+            self.assertEqual(fake_app.stop_calls, 1)
+            self.assertEqual(holder["tray"].stop_calls, 1)
+            self.assertTrue(
+                any(
+                    row[0] == "warning" and "stop failed" in row[1]
+                    for row in fake_app._logger.rows
+                )
+            )
+
+        asyncio.run(scenario())

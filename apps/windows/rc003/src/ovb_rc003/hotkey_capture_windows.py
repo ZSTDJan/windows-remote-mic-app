@@ -137,8 +137,13 @@ class HotkeyCapture:
     def is_running(self) -> bool:
         return self._thread is not None and self._thread.is_alive()
 
-    def start(self, *, start_timeout: float = 5.0) -> None:
-        if sys.platform != "win32":
+    def start(
+        self,
+        *,
+        start_timeout: float = 5.0,
+        _run_target: Optional[Callable[[], None]] = None,
+    ) -> None:
+        if _run_target is None and sys.platform != "win32":
             raise HotkeyCaptureUnavailableError(
                 "keyboard shortcut capture is only available on Windows"
             )
@@ -152,20 +157,32 @@ class HotkeyCapture:
         self._ready_event.clear()
         self._stop_event.clear()
         self._start_error = None
-        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread = threading.Thread(target=_run_target or self._run, daemon=True)
         self._thread.start()
         if not self._ready_event.wait(timeout=start_timeout):
-            self.stop()
+            self._stop_event.set()
+            self._post_quit()
+            self._join_thread_or_report_alive()
             raise HotkeyCaptureUnavailableError(
                 f"keyboard shortcut capture did not start within {start_timeout}s"
             )
         if self._start_error is not None:
             error = self._start_error
-            thread = self._thread
-            if thread is not None:
-                thread.join(timeout=_STOP_JOIN_TIMEOUT_SECONDS)
-            self._thread = None
+            self._stop_event.set()
+            self._post_quit()
+            self._join_thread_or_report_alive()
             raise HotkeyCaptureUnavailableError(str(error)) from error
+
+    def _join_thread_or_report_alive(self) -> bool:
+        thread = self._thread
+        if thread is None:
+            return True
+        thread.join(timeout=_STOP_JOIN_TIMEOUT_SECONDS)
+        if thread.is_alive():
+            return False
+        self._thread = None
+        self._thread_id = 0
+        return True
 
     def stop(self) -> None:
         thread = self._thread
@@ -173,13 +190,10 @@ class HotkeyCapture:
             return
         self._stop_event.set()
         self._post_quit()
-        thread.join(timeout=_STOP_JOIN_TIMEOUT_SECONDS)
-        if thread.is_alive():
+        if not self._join_thread_or_report_alive():
             raise HotkeyCaptureUnavailableError(
                 "keyboard shortcut capture did not stop within the bounded timeout"
             )
-        self._thread = None
-        self._thread_id = 0
 
     def _post_quit(self) -> None:
         if not self._thread_id:
@@ -243,6 +257,8 @@ class HotkeyCapture:
         try:
             user32 = ctypes.windll.user32  # type: ignore[attr-defined]
             kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+            kernel32.GetCurrentThreadId.argtypes = ()
+            kernel32.GetCurrentThreadId.restype = wintypes.DWORD
             self._thread_id = int(kernel32.GetCurrentThreadId())
             lresult = ctypes.c_ssize_t
             hookproc_type = ctypes.WINFUNCTYPE(

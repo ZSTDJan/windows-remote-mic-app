@@ -8,6 +8,7 @@ that as "voice fails closed, buttons keep working" (see audio_output.py).
 
 from __future__ import annotations
 
+import threading
 from typing import List, Optional
 
 from . import audio_output
@@ -18,6 +19,14 @@ DEFAULT_CHANNELS = 1
 
 class PlaybackUnavailableError(audio_output.AudioOutputUnavailableError):
     pass
+
+
+class PreflightCleanupIncompleteError(audio_output.AudioOutputUnavailableError):
+    """A settings/diagnostics preflight still owns a PortAudio stream."""
+
+
+_preflight_lock = threading.RLock()
+_retained_preflight_sink: Optional["EndpointPlaybackSink"] = None
 
 
 class EndpointPlaybackSink:
@@ -34,12 +43,17 @@ class EndpointPlaybackSink:
         self._endpoint_name = endpoint_name
         self._host_api = host_api
         self._stream = None
+        self._ready = False
         self._output_sample_rate_hz = SOURCE_SAMPLE_RATE_HZ
         self._output_channels = DEFAULT_CHANNELS
         self._previous_sample = 0
         self._have_previous_sample = False
 
     def open(self) -> None:
+        if self._stream is not None:
+            raise PlaybackUnavailableError(
+                "playback sink still owns a stream; close it before reopening"
+            )
         try:
             import sounddevice as sd  # type: ignore
         except ImportError as exc:  # pragma: no cover - exercised only on Windows
@@ -60,19 +74,30 @@ class EndpointPlaybackSink:
                 samplerate=self._output_sample_rate_hz,
                 latency="low",
             )
+            # Retain ownership before start(): PortAudio may allocate native
+            # resources during construction even when start() later fails.
+            self._stream = stream
             stream.start()
+            self._ready = True
         except Exception as exc:  # noqa: BLE001 - normalize PortAudio backend failures
-            if stream is not None:
+            if self._stream is not None:
                 try:
-                    stream.close()
+                    self.close()
                 except Exception:
                     pass
             raise audio_output.AudioOutputUnavailableError(
                 "selected output endpoint could not be opened for blocking playback"
             ) from exc
-        self._stream = stream
         self._previous_sample = 0
         self._have_previous_sample = False
+
+    @property
+    def owns_stream(self) -> bool:
+        return self._stream is not None
+
+    @property
+    def ready(self) -> bool:
+        return self._ready and self._stream is not None
 
     @property
     def output_sample_rate_hz(self) -> int:
@@ -191,6 +216,7 @@ class EndpointPlaybackSink:
     def close(self) -> None:
         if self._stream is not None:
             stream = self._stream
+            self._ready = False
             try:
                 stream.stop()
             except Exception:
@@ -210,8 +236,40 @@ class EndpointPlaybackSink:
 def preflight_output_endpoint(endpoint_name: str, host_api: str = "") -> None:
     """Prove the selected endpoint can open now without sending any PCM."""
 
-    sink = EndpointPlaybackSink(endpoint_name, host_api)
-    try:
-        sink.open()
-    finally:
+    global _retained_preflight_sink
+    with _preflight_lock:
+        cleanup_retained_preflight_sink()
+        sink = EndpointPlaybackSink(endpoint_name, host_api)
+        try:
+            sink.open()
+        except BaseException as open_exc:
+            try:
+                sink.close()
+            except Exception as close_exc:
+                if sink.owns_stream:
+                    _retained_preflight_sink = sink
+                raise PreflightCleanupIncompleteError(
+                    "output preflight failed and its PortAudio stream did not close"
+                ) from open_exc
+            raise
+        try:
+            sink.close()
+        except Exception as close_exc:
+            if sink.owns_stream:
+                _retained_preflight_sink = sink
+            raise PreflightCleanupIncompleteError(
+                "output preflight stream did not close"
+            ) from close_exc
+
+
+def cleanup_retained_preflight_sink() -> None:
+    """Retry cleanup of a preflight stream whose prior close failed."""
+
+    global _retained_preflight_sink
+    with _preflight_lock:
+        sink = _retained_preflight_sink
+        if sink is None:
+            return
         sink.close()
+        if not sink.owns_stream:
+            _retained_preflight_sink = None

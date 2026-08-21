@@ -2,11 +2,12 @@
 
 Callers must only ever log opaque markers (button names, session ids,
 sample/frame counts, boolean flags) - never a Bluetooth address, HID
-interface path, device token, or decoded voice content. This module doesn't
-attempt to scrub arbitrary strings after the fact (a redaction filter would
-give false confidence); the guarantee instead comes from code review plus
-tests/test_privacy_contract.py, which statically scans this package's source
-for the sensitive field names and MAC-address-shaped literals.
+interface path, device token, or decoded voice content. The primary guarantee
+comes from code review plus tests/test_privacy_contract.py, which statically
+scans this package's source for sensitive field names and MAC-address-shaped
+literals. As defense in depth, the persistent handler also removes traceback
+text and replaces exception arguments with their exception type; this is not
+a substitute for keeping sensitive values out of ordinary log messages.
 
 ``log_dir``/``log_file_path`` (XRBM-029) expose this module's canonical
 ``%LOCALAPPDATA%\\RemoteMic\\RC003\\logs\\app.log`` location WITHOUT the
@@ -25,6 +26,7 @@ actually invoking Windows Explorer.
 from __future__ import annotations
 
 import logging
+from logging.handlers import RotatingFileHandler
 import os
 from dataclasses import dataclass
 from enum import Enum
@@ -35,8 +37,38 @@ from . import config
 
 LOGGER_NAME = "ovb_rc003"
 LOG_FILENAME = "app.log"
+LOG_MAX_BYTES = 5 * 1024 * 1024
+LOG_BACKUP_COUNT = 3
 
 _configured = False
+
+
+class PrivacySafeExceptionFilter(logging.Filter):
+    """Keep native exception details out of the persistent log.
+
+    WinRT, Raw Input, PortAudio, Frida, and shell exceptions can embed a
+    device interface path or other machine-local identifier in ``str(exc)``
+    and in a formatted traceback. Preserve the exception type for diagnosis,
+    but never persist the raw exception text or traceback.
+    """
+
+    @staticmethod
+    def _safe_argument(value):
+        if isinstance(value, BaseException):
+            return type(value).__name__
+        return value
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if isinstance(record.args, tuple):
+            record.args = tuple(self._safe_argument(value) for value in record.args)
+        elif isinstance(record.args, dict):
+            record.args = {
+                key: self._safe_argument(value) for key, value in record.args.items()
+            }
+        if record.exc_info is not None:
+            record.exc_info = None
+            record.exc_text = None
+        return True
 
 
 def get_logger(root: Optional[Path] = None) -> logging.Logger:
@@ -49,7 +81,13 @@ def get_logger(root: Optional[Path] = None) -> logging.Logger:
     directory = log_dir(root)
     directory.mkdir(parents=True, exist_ok=True)
 
-    handler = logging.FileHandler(directory / LOG_FILENAME, encoding="utf-8")
+    handler = RotatingFileHandler(
+        directory / LOG_FILENAME,
+        maxBytes=LOG_MAX_BYTES,
+        backupCount=LOG_BACKUP_COUNT,
+        encoding="utf-8",
+    )
+    handler.addFilter(PrivacySafeExceptionFilter())
     handler.setFormatter(
         logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
     )

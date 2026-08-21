@@ -71,6 +71,7 @@ _MUTEX_NAME = r"Local\RemoteMicRC003_BridgeInstance"
 # https://learn.microsoft.com/windows/win32/debug/system-error-codes--0-499-
 _ERROR_ALREADY_EXISTS = 183
 _ERROR_ACCESS_DENIED = 5
+_ERROR_FILE_NOT_FOUND = 2
 _SYNCHRONIZE = 0x00100000
 
 # Deterministic, documented nonzero exit codes (DoD 2's "deterministic
@@ -213,17 +214,34 @@ def bridge_instance_running(
 
     try:
         result = _open_mutex(name)
-    except Exception:  # noqa: BLE001 - settings can fall back to local detection
-        return False
+    except Exception as exc:  # noqa: BLE001 - fail closed on an unknown owner state
+        raise SingleInstanceUnavailableError(
+            "OpenMutexW raised an exception while checking bridge status"
+        ) from exc
     if result.handle:
         try:
-            _close_handle(result.handle)
-        except Exception:
-            pass
+            closed = _close_handle(result.handle)
+        except Exception as exc:
+            raise MutexCleanupError(
+                "mutex status probe cleanup did not fully succeed: "
+                "CloseHandle raised an exception"
+            ) from exc
+        if not closed:
+            raise MutexCleanupError(
+                "mutex status probe cleanup did not fully succeed: "
+                "CloseHandle returned FALSE"
+            )
         return True
     # A protected object can deny SYNCHRONIZE access while still proving
     # that the named mutex exists in this logon session.
-    return result.last_error == _ERROR_ACCESS_DENIED
+    if result.last_error == _ERROR_ACCESS_DENIED:
+        return True
+    if result.last_error == _ERROR_FILE_NOT_FOUND:
+        return False
+    raise SingleInstanceUnavailableError(
+        f"OpenMutexW failed while checking bridge status "
+        f"(GetLastError={result.last_error})"
+    )
 
 
 class BridgeInstanceGuard:

@@ -42,6 +42,7 @@ from ovb_rc003 import (
     remote_layout,
     settings_ui,
     shell_targets,
+    single_instance,
     vb_cable_bundle,
     windows_diagnostics,
 )
@@ -485,7 +486,7 @@ class SettingsControllerTests(unittest.TestCase):
     def test_save_settings_reports_a_persistence_failure(self):
         controller, _ = self._make_controller()
         with mock.patch.object(
-            config, "save_key_bindings", side_effect=OSError("settings file is locked")
+            config, "save_settings_pair", side_effect=OSError("settings file is locked")
         ):
             self.assertFalse(controller.saveSettings())
         self.assertIn("保存失败", controller.errorMessage)
@@ -601,6 +602,127 @@ class SettingsControllerTests(unittest.TestCase):
             controller.startKeyDetection()
         self.assertFalse(controller.keyDetectionActive)
         self.assertIn("Raw Input unavailable", controller.keyDetectionText)
+
+    def test_real_key_detection_stops_when_bridge_status_is_unavailable(self):
+        controller, _ = self._make_controller()
+
+        with mock.patch.object(
+            qt_settings_app.single_instance,
+            "bridge_instance_running",
+            side_effect=single_instance.SingleInstanceUnavailableError(
+                "status unavailable"
+            ),
+        ), mock.patch.object(
+            qt_settings_app.raw_input_windows,
+            "enumerate_matching_device_paths",
+        ) as enumerate_paths, mock.patch.object(
+            qt_settings_app.frida_compat,
+            "RC003HidReportTap",
+        ) as tap:
+            controller.startKeyDetection()
+
+        self.assertFalse(controller.keyDetectionActive)
+        self.assertIn("无法安全确认后台桥接状态", controller.keyDetectionText)
+        enumerate_paths.assert_not_called()
+        tap.assert_not_called()
+
+    def test_real_key_detection_stops_when_bridge_status_cleanup_fails(self):
+        controller, _ = self._make_controller()
+
+        with mock.patch.object(
+            qt_settings_app.single_instance,
+            "bridge_instance_running",
+            side_effect=single_instance.MutexCleanupError("close failed"),
+        ), mock.patch.object(
+            qt_settings_app.raw_input_windows,
+            "enumerate_matching_device_paths",
+        ) as enumerate_paths, mock.patch.object(
+            qt_settings_app.frida_compat,
+            "RC003HidReportTap",
+        ) as tap:
+            controller.startKeyDetection()
+
+        self.assertFalse(controller.keyDetectionActive)
+        self.assertIn("无法安全确认后台桥接状态", controller.keyDetectionText)
+        enumerate_paths.assert_not_called()
+        tap.assert_not_called()
+
+    def test_failed_raw_listener_cleanup_retains_the_owner(self):
+        controller, _ = self._make_controller()
+        instances = []
+
+        class StuckListener:
+            def __init__(self, _button_callback, _raw_callback):
+                instances.append(self)
+
+            def start(self, _device_path):
+                raise RuntimeError("start failed")
+
+            def stop(self):
+                raise RuntimeError("stop failed")
+
+        with mock.patch.object(
+            qt_settings_app.raw_input_windows,
+            "enumerate_matching_device_paths",
+            return_value=["rc003-device-path"],
+        ), mock.patch.object(
+            qt_settings_app.raw_input_windows.hid_identity,
+            "select_single_device_path",
+            return_value="rc003-device-path",
+        ), mock.patch.object(
+            qt_settings_app.raw_input_windows,
+            "RawInputButtonListener",
+            StuckListener,
+        ), mock.patch.object(
+            qt_settings_app.frida_compat,
+            "RC003HidReportTap",
+        ) as tap:
+            controller.startKeyDetection()
+
+        self.assertIs(controller._key_detection_listener, instances[0])
+        self.assertFalse(controller.keyDetectionActive)
+        tap.assert_not_called()
+
+    def test_stop_key_detection_retains_each_owner_that_failed_to_stop(self):
+        controller, _ = self._make_controller()
+        listener = mock.Mock()
+        tap = mock.Mock()
+        listener.stop.side_effect = RuntimeError("listener stop failed")
+        tap.stop.side_effect = RuntimeError("tap stop failed")
+        controller._key_detection_listener = listener
+        controller._key_detection_tap = tap
+        controller._key_detection_active = True
+
+        controller.stopKeyDetection()
+
+        self.assertIs(controller._key_detection_listener, listener)
+        self.assertIs(controller._key_detection_tap, tap)
+        self.assertFalse(controller.keyDetectionActive)
+
+    def test_hotkey_start_failure_retains_a_still_running_capture(self):
+        controller, _ = self._make_controller()
+        capture = mock.Mock()
+        capture.is_running = True
+        capture.start.side_effect = RuntimeError("start failed")
+
+        with mock.patch.object(
+            qt_settings_app.hotkey_capture_windows,
+            "HotkeyCapture",
+            return_value=capture,
+        ):
+            controller.startHotkeyCapture()
+
+        self.assertIs(controller._hotkey_capture, capture)
+
+    def test_hotkey_stop_failure_retains_capture_for_retry(self):
+        controller, _ = self._make_controller()
+        capture = mock.Mock()
+        capture.stop.side_effect = RuntimeError("stop failed")
+        controller._hotkey_capture = capture
+
+        controller.stopHotkeyCapture()
+
+        self.assertIs(controller._hotkey_capture, capture)
 
     def test_real_key_detection_accepts_missing_usage_from_hid_tap_and_stops_both(self):
         controller, model = self._make_controller()
@@ -1358,6 +1480,33 @@ class RunSettingsWindowShutdownCoverageTests(unittest.TestCase):
                 exit_code = qt_settings_app.run_settings_window()
 
         self.assertEqual(exit_code, 0)
+        shutdown_spy.assert_called()
+        self.assertEqual(len(qt_settings_app._diagnostics_threads), 0)
+
+    def test_hotkey_cleanup_failure_cannot_skip_detection_or_worker_shutdown(self):
+        fake_classes = self._fake_classes(root_objects=[object()], exec_return=0)
+        controller_class = fake_classes["SettingsController"]
+        detection_calls = []
+        with mock.patch.object(
+            qt_settings_app, "_load_qt_classes", return_value=fake_classes
+        ), mock.patch.object(
+            controller_class,
+            "stopHotkeyCapture",
+            side_effect=RuntimeError("simulated capture cleanup failure"),
+        ), mock.patch.object(
+            controller_class,
+            "stopKeyDetection",
+            side_effect=lambda instance: detection_calls.append(instance),
+            autospec=True,
+        ), mock.patch.object(
+            qt_settings_app,
+            "_shutdown_diagnostics_workers",
+            wraps=qt_settings_app._shutdown_diagnostics_workers,
+        ) as shutdown_spy:
+            with self.assertRaises(RuntimeError):
+                qt_settings_app.run_settings_window()
+
+        self.assertEqual(len(detection_calls), 1)
         shutdown_spy.assert_called()
         self.assertEqual(len(qt_settings_app._diagnostics_threads), 0)
 

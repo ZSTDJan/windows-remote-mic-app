@@ -10,6 +10,7 @@ tests/test_bridge_launcher.py uses for subprocess.Popen.
 
 import tempfile
 import unittest
+import logging
 from pathlib import Path
 
 from ovb_rc003 import logging_setup
@@ -31,7 +32,37 @@ class LogPathHelpersTests(unittest.TestCase):
             root = Path(tmp) / "not-created-yet"
             logging_setup.log_dir(root)
             logging_setup.log_file_path(root)
-            self.assertFalse(root.exists())
+        self.assertFalse(root.exists())
+
+
+class PersistentLogPrivacyTests(unittest.TestCase):
+    def test_native_exception_text_and_traceback_are_removed(self):
+        record = logging.LogRecord(
+            name="ovb_rc003",
+            level=logging.ERROR,
+            pathname=__file__,
+            lineno=1,
+            msg="native operation failed: %s",
+            args=(RuntimeError("sensitive device interface detail"),),
+            exc_info=None,
+        )
+        try:
+            raise RuntimeError("sensitive traceback detail")
+        except RuntimeError:
+            import sys
+
+            record.exc_info = sys.exc_info()
+
+        self.assertTrue(logging_setup.PrivacySafeExceptionFilter().filter(record))
+        rendered = logging.Formatter("%(message)s").format(record)
+
+        self.assertEqual(rendered, "native operation failed: RuntimeError")
+        self.assertNotIn("sensitive", rendered)
+        self.assertIsNone(record.exc_info)
+
+    def test_logger_uses_bounded_rotation(self):
+        self.assertEqual(logging_setup.LOG_MAX_BYTES, 5 * 1024 * 1024)
+        self.assertEqual(logging_setup.LOG_BACKUP_COUNT, 3)
 
 
 class DescribeLogLocationTests(unittest.TestCase):

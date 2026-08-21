@@ -146,6 +146,16 @@ class Win32InputUnavailableError(Exception):
     """Raised when SendInput is invoked on a non-Windows platform."""
 
 
+class InputCleanupIncompleteError(OSError):
+    """Raised when delivery failed and a compensating key-up could not be
+    confirmed.
+
+    Callers must retain enough state to retry a release later. Treating this
+    as an ordinary delivery failure can strand Alt/Ctrl/Win logically down
+    while the application forgets that it still owes cleanup.
+    """
+
+
 def _require_windows() -> None:
     if sys.platform != "win32":
         raise Win32InputUnavailableError(
@@ -219,16 +229,28 @@ def _real_send_input_batch(events: Sequence[Tuple[int, bool]]) -> int:
     return int(sent)
 
 
-def _best_effort_release(vk_codes: Sequence[int], sender: RawSender) -> None:
-    """Releases exactly these VK codes, swallowing any failure - used only
-    for rollback/cleanup paths that must never raise past this point.
+def _best_effort_release(vk_codes: Sequence[int], sender: RawSender) -> bool:
+    """Attempt every requested key-up and report whether all were confirmed.
+
+    The caller still owns the observable delivery exception. This helper
+    deliberately continues after a failed release so one stuck modifier does
+    not prevent the remaining keys from being released too.
     """
 
+    complete = True
     for vk in vk_codes:
         try:
-            sender([(vk, True)])
+            sent = sender([(vk, True)])
         except Exception:
-            pass
+            complete = False
+        else:
+            if sent != 1:
+                complete = False
+    return complete
+
+
+def _delivery_error_type(cleanup_complete: bool):
+    return OSError if cleanup_complete else InputCleanupIncompleteError
 
 
 def send_key_combo_down(
@@ -259,12 +281,14 @@ def send_key_combo_down(
     except Win32InputUnavailableError:
         raise
     except Exception as exc:
-        _best_effort_release(list(reversed(vk_codes)), sender)
-        raise OSError(f"key-down delivery failed: {exc}") from exc
+        cleanup_complete = _best_effort_release(list(reversed(vk_codes)), sender)
+        error_type = _delivery_error_type(cleanup_complete)
+        raise error_type(f"key-down delivery failed: {exc}") from exc
     if sent < len(events):
         stuck_down = [vk for vk, _key_up in events[:sent]]
-        _best_effort_release(list(reversed(stuck_down)), sender)
-        raise OSError(
+        cleanup_complete = _best_effort_release(list(reversed(stuck_down)), sender)
+        error_type = _delivery_error_type(cleanup_complete)
+        raise error_type(
             f"SendInput delivered only {sent}/{len(events)} key-down events; rolled back"
         )
 
@@ -304,12 +328,14 @@ def send_key_combo_up(
     except Win32InputUnavailableError:
         raise
     except Exception as exc:
-        _best_effort_release(vk_codes, sender)
-        raise OSError(f"key-up delivery failed: {exc}") from exc
+        cleanup_complete = _best_effort_release(vk_codes, sender)
+        error_type = _delivery_error_type(cleanup_complete)
+        raise error_type(f"key-up delivery failed: {exc}") from exc
     if sent < len(events):
         remaining = [vk for vk, _key_up in events[sent:]]
-        _best_effort_release(remaining, sender)
-        raise OSError(
+        cleanup_complete = _best_effort_release(remaining, sender)
+        error_type = _delivery_error_type(cleanup_complete)
+        raise error_type(
             f"SendInput delivered only {sent}/{len(events)} key-up events; "
             "best-effort release attempted for the rest"
         )
@@ -345,19 +371,23 @@ def send_key_combo_tap(
     except Win32InputUnavailableError:
         raise
     except Exception as exc:
-        _best_effort_release(list(reversed(vk_codes)), sender)
-        raise OSError(f"key tap delivery failed: {exc}") from exc
+        cleanup_complete = _best_effort_release(list(reversed(vk_codes)), sender)
+        error_type = _delivery_error_type(cleanup_complete)
+        raise error_type(f"key tap delivery failed: {exc}") from exc
     if sent < len(events):
         if sent < len(down_events):
             # Not every key-down made it; release exactly the ones that did.
             stuck_down = [vk for vk, _key_up in down_events[:sent]]
-            _best_effort_release(list(reversed(stuck_down)), sender)
+            cleanup_complete = _best_effort_release(
+                list(reversed(stuck_down)), sender
+            )
         else:
             # All key-downs landed; finish releasing whatever key-ups didn't.
             remaining_index = sent - len(down_events)
             remaining_ups = [vk for vk, _key_up in up_events[remaining_index:]]
-            _best_effort_release(remaining_ups, sender)
-        raise OSError(
+            cleanup_complete = _best_effort_release(remaining_ups, sender)
+        error_type = _delivery_error_type(cleanup_complete)
+        raise error_type(
             f"SendInput delivered only {sent}/{len(events)} events for a key tap; rolled back"
         )
 
@@ -412,12 +442,14 @@ def _real_voice_event(vk: int, key_up: bool) -> None:
     _real_keybd_event(vk, key_up)
 
 
-def _best_effort_voice_up(vk_codes: Sequence[int], sender: VoiceSender) -> None:
+def _best_effort_voice_up(vk_codes: Sequence[int], sender: VoiceSender) -> bool:
+    complete = True
     for vk in reversed(vk_codes):
         try:
             sender(vk, True)
         except Exception:
-            pass
+            complete = False
+    return complete
 
 
 def send_voice_key_combo_down(
@@ -431,11 +463,19 @@ def send_voice_key_combo_down(
     for vk in vk_codes:
         try:
             sender(vk, False)
-        except Win32InputUnavailableError:
+        except Win32InputUnavailableError as exc:
+            if delivered and not _best_effort_voice_up(delivered, sender):
+                raise InputCleanupIncompleteError(
+                    "voice backend became unavailable and delivered keys could not be released"
+                ) from exc
             raise
         except Exception as exc:
-            _best_effort_voice_up(delivered, sender)
-            raise OSError(f"voice key-down delivery failed: {exc}") from exc
+            # A sender can raise after the native call returned control but
+            # before the wrapper could prove whether this current edge
+            # landed. Treat the current key as possibly down too.
+            cleanup_complete = _best_effort_voice_up([*delivered, vk], sender)
+            error_type = _delivery_error_type(cleanup_complete)
+            raise error_type(f"voice key-down delivery failed: {exc}") from exc
         delivered.append(vk)
 
 
@@ -445,15 +485,23 @@ def send_voice_key_combo_up(
     """Release a voice shortcut through the selected voice transport."""
 
     sender = _sender or _real_voice_event
-    vk_codes = list(reversed(win32_keys.resolve_vk_codes(tokens)))
+    resolved_vk_codes = win32_keys.resolve_vk_codes(tokens)
+    vk_codes = list(reversed(resolved_vk_codes))
     for vk in vk_codes:
         try:
             sender(vk, True)
-        except Win32InputUnavailableError:
+        except Win32InputUnavailableError as exc:
+            if not _best_effort_voice_up(resolved_vk_codes, sender):
+                raise InputCleanupIncompleteError(
+                    "voice backend became unavailable and key-up could not be confirmed"
+                ) from exc
             raise
         except Exception as exc:
-            _best_effort_voice_up([vk], sender)
-            raise OSError(f"voice key-up delivery failed: {exc}") from exc
+            # Releasing an already-up key is harmless. Retry every member so
+            # a failure on one edge cannot strand later modifiers down.
+            cleanup_complete = _best_effort_voice_up(resolved_vk_codes, sender)
+            error_type = _delivery_error_type(cleanup_complete)
+            raise error_type(f"voice key-up delivery failed: {exc}") from exc
 
 
 def send_voice_key_combo_tap(
@@ -464,11 +512,19 @@ def send_voice_key_combo_tap(
     sender = _sender or _real_voice_event
     vk_codes = win32_keys.resolve_vk_codes(tokens)
     send_voice_key_combo_down(tokens, _sender=sender)
-    time.sleep(0.07)
     try:
+        time.sleep(0.07)
         send_voice_key_combo_up(tokens, _sender=sender)
-    except Exception:
-        _best_effort_voice_up(vk_codes, sender)
+    except BaseException as exc:
+        cleanup_complete = _best_effort_voice_up(vk_codes, sender)
+        if not cleanup_complete:
+            raise InputCleanupIncompleteError(
+                "voice key tap failed and final key-up could not be confirmed"
+            ) from exc
+        if isinstance(exc, InputCleanupIncompleteError):
+            raise OSError(
+                "voice key tap failed but final safety key-up completed"
+            ) from exc
         raise
 
 

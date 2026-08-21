@@ -337,10 +337,8 @@ def default_display_state() -> DefaultDisplayState:
 
 # Bridge-control status text (XRBM-029). Kept as pure, Tk-free functions -
 # same testability contract as the save-model helpers above (see
-# tests/test_settings_ui_helpers.py) - so every one of the four required
-# stable states (not-started / running / already-running / abnormal-quick-
-# exit) is asserted on directly without constructing a window or a real
-# subprocess.
+# tests/test_settings_ui_helpers.py) - so every stable state is asserted on
+# directly without constructing a window or a real subprocess.
 #
 # Wording contract: a STARTED result is deliberately never described as
 # "RC003 已连接"/"RC003 connected" - only as the process itself still being
@@ -364,6 +362,13 @@ def describe_launch_result(result: bridge_launcher.LaunchResult) -> str:
             f"{result.exit_code}）。不需要再次启动；如需重启，请先从任务管理器结束 "
             "现有 RemoteMicRC003 进程，或使用 Start Menu 的“停止”条目/"
             "便携版的手动停止步骤。"
+        )
+    if result.outcome is bridge_launcher.LaunchOutcome.STATUS_UNKNOWN:
+        pid_text = f"（PID {result.pid}）" if result.pid is not None else ""
+        return (
+            f"桥接进程已经创建{pid_text}，但 Windows 未能确认它当前是否仍在运行"
+            f"（{result.error}）。请先不要重复启动；查看任务栏通知区域、任务管理器和 "
+            "app.log 确认状态。"
         )
     if result.outcome is bridge_launcher.LaunchOutcome.QUICK_EXIT:
         return (

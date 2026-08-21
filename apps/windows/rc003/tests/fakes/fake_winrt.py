@@ -90,6 +90,8 @@ class FakeEventArgs:
 class FakeDataWriter:
     def __init__(self) -> None:
         self._buffer = b""
+        self.close_calls = 0
+        self.close_error: Optional[BaseException] = None
 
     def write_bytes(self, value: bytes) -> None:
         assert isinstance(value, (bytes, bytearray)), (
@@ -99,6 +101,11 @@ class FakeDataWriter:
 
     def detach_buffer(self) -> bytes:
         return self._buffer
+
+    def close(self) -> None:
+        self.close_calls += 1
+        if self.close_error is not None:
+            raise self.close_error
 
 
 class FakeGattCharacteristic:
@@ -282,6 +289,8 @@ class FakeWinRTEnvironment:
         self.device = FakeBluetoothLEDevice(device_id, self.service)
         self.discovered_info = FakeDeviceInformation(device_id, name)
         self.discovered_infos = [self.discovered_info]
+        self.data_writers: List[FakeDataWriter] = []
+        self.data_writer_close_error: Optional[BaseException] = None
 
         self._device_information_cls = self._build_device_information_cls()
 
@@ -333,12 +342,18 @@ class FakeWinRTEnvironment:
     def build_winrt_modules(self):
         from ovb_rc003.ble_transport_winrt import WinRTModules
 
+        def data_writer_factory():
+            writer = FakeDataWriter()
+            writer.close_error = self.data_writer_close_error
+            self.data_writers.append(writer)
+            return writer
+
         return WinRTModules(
             bluetooth_le_device=self._build_bluetooth_le_device_cls(),
             bluetooth_connection_status=FakeBluetoothConnectionStatus,
             gatt_communication_status=FakeGattCommunicationStatus,
             cccd_value=FakeGattClientCharacteristicConfigurationDescriptorValue,
             device_information=self._device_information_cls,
-            data_writer_factory=FakeDataWriter,
+            data_writer_factory=data_writer_factory,
             bluetooth_cache_mode=FakeBluetoothCacheMode,
         )

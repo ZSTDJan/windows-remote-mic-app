@@ -33,6 +33,7 @@ LLKHF_INJECTED = 0x00000010
 LLKHF_LOWER_IL_INJECTED = 0x00000002
 LLKHF_EXTENDED = 0x00000001
 LLKHF_UP = 0x00000080
+PM_NOREMOVE = 0x0000
 
 # "RMICRC03" as a pointer-sized value. It is cleared before the event reaches
 # downstream hooks and is never used for ordinary input.
@@ -391,14 +392,25 @@ class LegacyKeySuppressor:
         self._thread.start()
         if not self._ready_event.wait(timeout=start_timeout):
             self._stop_event.set()
-            self._thread.join(timeout=2.0)
+            self._join_thread_or_report_alive()
             raise LegacyKeySuppressorUnavailableError(
                 f"legacy key suppressor did not become ready within {start_timeout}s"
             )
         if self._start_error is not None:
             error = self._start_error
-            self._thread = None
+            self._stop_event.set()
+            self._join_thread_or_report_alive()
             raise error
+
+    def _join_thread_or_report_alive(self) -> bool:
+        if self._thread is None:
+            return True
+        self._thread.join(timeout=2.0)
+        if self._thread.is_alive():
+            return False
+        self._thread = None
+        self._thread_id = wintypes.DWORD(0)
+        return True
 
     def stop(self) -> None:
         self._stop_event.set()
@@ -416,13 +428,10 @@ class LegacyKeySuppressor:
             )
             user32.PostThreadMessageW.restype = wintypes.BOOL
             user32.PostThreadMessageW(self._thread_id.value, 0x0012, 0, 0)  # WM_QUIT
-        self._thread.join(timeout=2.0)
-        if self._thread.is_alive():
+        if not self._join_thread_or_report_alive():
             raise LegacyKeySuppressorUnavailableError(
                 "legacy key suppressor thread did not stop within 2.0s"
             )
-        self._thread = None
-        self._thread_id = wintypes.DWORD(0)
 
     def _run(self) -> None:
         try:
@@ -454,12 +463,26 @@ class LegacyKeySuppressor:
             user32.UnhookWindowsHookEx.argtypes = (wintypes.HHOOK,)
             user32.UnhookWindowsHookEx.restype = wintypes.BOOL
 
+            user32.PeekMessageW.argtypes = (
+                ctypes.POINTER(wintypes.MSG),
+                wintypes.HWND,
+                wintypes.UINT,
+                wintypes.UINT,
+                wintypes.UINT,
+            )
+            user32.PeekMessageW.restype = wintypes.BOOL
+
             self._hook = user32.SetWindowsHookExW(
                 WH_KEYBOARD_LL, hookproc, kernel32.GetModuleHandleW(None), 0
             )
             if not self._hook:
                 raise LegacyKeySuppressorUnavailableError("SetWindowsHookExW failed")
 
+            # Force creation of this thread's message queue before start()
+            # reports readiness. Otherwise an immediate stop can race a
+            # PostThreadMessageW(WM_QUIT) against a queue that does not yet
+            # exist, leaving the hook thread alive until its join times out.
+            user32.PeekMessageW(None, None, 0, 0, PM_NOREMOVE)
             self._ready_event.set()
 
             msg = wintypes.MSG()

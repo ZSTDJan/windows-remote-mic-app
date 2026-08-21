@@ -35,7 +35,7 @@ HID_PRODUCT_ID = 0x32B8
 # reports it as Keyboard F5 (usage 0x003E), so it is included here as a
 # host-trigger fallback. One button ("back") sits
 # outside the standard translated usage range on Windows; see
-# ovb_rc003.frida_compat for the documented, currently-unwired compatibility
+# ovb_rc003.frida_compat for the documented optional compatibility
 # gap.
 HID_USAGE_PAGE = 0x07
 

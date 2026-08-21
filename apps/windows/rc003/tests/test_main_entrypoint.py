@@ -90,6 +90,19 @@ class BridgeModeRoutingTests(_ArgvRestoringTestCase):
         self.assertIn("DJI Mic 2", notice_calls[0][0])
         self.assertEqual(notice_calls[0][1]["title"], "Remote Mic")
 
+    def test_unexpected_bridge_runtime_failure_is_visible_and_sanitized(self):
+        notice_calls = []
+        single_instance.show_bridge_startup_blocked_notice = notice_calls.append
+        app.main = lambda: (_ for _ in ()).throw(RuntimeError("private detail"))
+        sys.argv = ["ovb_rc003", "--bridge"]
+
+        with self.assertRaises(SystemExit) as ctx:
+            main_module.main()
+
+        self.assertEqual(ctx.exception.code, main_module.BRIDGE_RUNTIME_FAILED_EXIT_CODE)
+        self.assertEqual(len(notice_calls), 1)
+        self.assertNotIn("private detail", notice_calls[0])
+
     def test_bridge_flag_calls_app_main_exactly_once_on_first_owner(self):
         app_main_calls = []
         app.main = lambda: app_main_calls.append(1)
@@ -311,6 +324,61 @@ class ArgumentModeBypassTests(_ArgvRestoringTestCase):
             settings_ui.main = original_settings_main
 
         self.assertEqual(enter_calls, [])
+
+    def test_explicit_settings_wins_when_bridge_flag_is_also_present(self):
+        from ovb_rc003 import settings_ui
+
+        enter_calls = []
+        settings_calls = []
+        single_instance.BridgeInstanceGuard = _make_guard_class(enter_calls=enter_calls)
+        app.main = lambda: self.fail("--settings must take precedence over --bridge")
+        original_settings_main = settings_ui.main
+        settings_ui.main = lambda: settings_calls.append(1)
+        sys.argv = ["ovb_rc003", "--bridge", "--settings"]
+
+        try:
+            main_module.main()
+        finally:
+            settings_ui.main = original_settings_main
+
+        self.assertEqual(settings_calls, [1])
+        self.assertEqual(enter_calls, [])
+
+    def test_settings_startup_failure_is_visible_and_has_a_stable_exit_code(self):
+        from ovb_rc003 import settings_ui
+
+        notice_calls = []
+        single_instance.show_bridge_startup_blocked_notice = notice_calls.append
+        original_settings_main = settings_ui.main
+        settings_ui.main = lambda: (_ for _ in ()).throw(ValueError("private detail"))
+        sys.argv = ["ovb_rc003", "--settings"]
+
+        try:
+            with self.assertRaises(SystemExit) as ctx:
+                main_module.main()
+        finally:
+            settings_ui.main = original_settings_main
+
+        self.assertEqual(ctx.exception.code, main_module.SETTINGS_STARTUP_FAILED_EXIT_CODE)
+        self.assertEqual(len(notice_calls), 1)
+        self.assertNotIn("private detail", notice_calls[0])
+
+    def test_bridge_config_failure_is_visible_and_never_touches_the_guard(self):
+        enter_calls = []
+        notice_calls = []
+        single_instance.BridgeInstanceGuard = _make_guard_class(enter_calls=enter_calls)
+        single_instance.show_bridge_startup_blocked_notice = notice_calls.append
+        config.load_config = lambda path: (_ for _ in ()).throw(ValueError("private detail"))
+        app.main = lambda: self.fail("invalid config must never start the bridge")
+        sys.argv = ["ovb_rc003", "--bridge"]
+
+        with self.assertRaises(SystemExit) as ctx:
+            main_module.main()
+
+        self.assertEqual(ctx.exception.code, main_module.BRIDGE_CONFIG_FAILED_EXIT_CODE)
+        self.assertEqual(enter_calls, [])
+        self.assertEqual(len(notice_calls), 1)
+        self.assertNotIn("private detail", notice_calls[0])
 
     def test_diagnose_ble_candidates_never_touches_the_guard(self):
         enter_calls = []

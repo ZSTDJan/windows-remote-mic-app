@@ -1,7 +1,10 @@
+import os
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from ovb_rc003 import key_detection_bridge
 
@@ -83,6 +86,30 @@ class KeyDetectionBridgeTests(unittest.TestCase):
         self.assertIn('"button_id": "ok"', result_text)
         self.assertNotIn("bluetooth", result_text.casefold())
         self.assertNotIn("device", result_text.casefold())
+
+    def test_publish_claims_the_oldest_request_not_uuid_name_order(self):
+        first = key_detection_bridge.request_detection(self.root)
+        second = key_detection_bridge.request_detection(self.root)
+        now_ns = time.time_ns()
+        os.utime(first.request_path, ns=(now_ns - 2_000_000_000,) * 2)
+        os.utime(second.request_path, ns=(now_ns - 1_000_000_000,) * 2)
+
+        self.assertTrue(key_detection_bridge.publish_next_button(self.root, "left"))
+
+        self.assertEqual(key_detection_bridge.poll_detection(first), "left")
+        self.assertIsNone(key_detection_bridge.poll_detection(second))
+
+    def test_atomic_write_failure_removes_the_temporary_file(self):
+        target = self.root / "result.json"
+
+        with mock.patch.object(
+            key_detection_bridge.os,
+            "replace",
+            side_effect=OSError("simulated replace failure"),
+        ), self.assertRaises(OSError):
+            key_detection_bridge._write_json_atomic(target, {"schema": 1})
+
+        self.assertEqual(list(self.root.glob(".*.tmp")), [])
 
 
 if __name__ == "__main__":

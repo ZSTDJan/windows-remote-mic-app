@@ -154,6 +154,116 @@ class DoubaoPhysicalizerTests(unittest.TestCase):
         self.assertEqual(physicalizer.status, "unavailable")
         self.assertIn("not running", physicalizer.error or "")
 
+    def test_native_failure_detail_is_reduced_to_exception_type(self):
+        physicalizer = doubao_rpc.DoubaoPhysicalizer()
+
+        physicalizer._set_failure(
+            "unavailable",
+            RuntimeError("sensitive native device detail"),
+        )
+
+        self.assertEqual(physicalizer.error, "RuntimeError")
+
+    def test_process_level_interrupt_is_cleaned_up_and_propagated(self):
+        script = mock.Mock()
+        script.load.side_effect = KeyboardInterrupt()
+        session = mock.Mock()
+        session.create_script.return_value = script
+        process = types.SimpleNamespace(pid=46500, name="ImeService.exe")
+        device = mock.Mock()
+        device.enumerate_processes.return_value = [process]
+        fake_frida = types.SimpleNamespace(
+            get_local_device=lambda: device,
+            attach=mock.Mock(return_value=session),
+        )
+        physicalizer = doubao_rpc.DoubaoPhysicalizer()
+
+        with mock.patch.object(doubao_rpc.sys, "platform", "win32"), mock.patch.dict(
+            sys.modules, {"frida": fake_frida}
+        ), mock.patch.object(
+            physicalizer,
+            "_probe_module",
+            return_value=r"C:\Program Files\DoubaoIME\ImeService.exe",
+        ), mock.patch.object(
+            physicalizer, "_verify_module", return_value=True
+        ), self.assertRaises(KeyboardInterrupt):
+            physicalizer.start()
+
+        script.unload.assert_called_once()
+        session.detach.assert_called_once()
+        self.assertIsNone(physicalizer._script)
+        self.assertIsNone(physicalizer._session)
+
+    def test_stop_failure_retains_resources_for_a_later_retry(self):
+        script = mock.Mock()
+        session = mock.Mock()
+        script.unload.side_effect = RuntimeError("unload failed")
+        session.detach.side_effect = RuntimeError("detach failed")
+        physicalizer = doubao_rpc.DoubaoPhysicalizer()
+        physicalizer._script = script
+        physicalizer._session = session
+        physicalizer._status = "active"
+
+        with self.assertRaises(RuntimeError):
+            physicalizer.stop()
+
+        self.assertIs(physicalizer._script, script)
+        self.assertIs(physicalizer._session, session)
+        self.assertEqual(physicalizer.status, "cleanup_required")
+
+        script.unload.side_effect = None
+        session.detach.side_effect = None
+        physicalizer.stop()
+        self.assertIsNone(physicalizer._script)
+        self.assertIsNone(physicalizer._session)
+
+    def test_successful_session_detach_clears_a_script_that_failed_to_unload(self):
+        script = mock.Mock()
+        session = mock.Mock()
+        script.unload.side_effect = RuntimeError("unload failed")
+        physicalizer = doubao_rpc.DoubaoPhysicalizer()
+        physicalizer._script = script
+        physicalizer._session = session
+        physicalizer._status = "active"
+
+        physicalizer.stop()
+
+        session.detach.assert_called_once()
+        self.assertIsNone(physicalizer._script)
+        self.assertIsNone(physicalizer._session)
+        self.assertEqual(physicalizer.status, "stopped")
+
+    def test_start_cleanup_accepts_detach_after_script_unload_failure(self):
+        script = mock.Mock()
+        script.load.side_effect = RuntimeError("load failed")
+        script.unload.side_effect = RuntimeError("unload failed")
+        session = mock.Mock()
+        session.create_script.return_value = script
+        process = types.SimpleNamespace(pid=46500, name="ImeService.exe")
+        device = mock.Mock()
+        device.enumerate_processes.return_value = [process]
+        fake_frida = types.SimpleNamespace(
+            get_local_device=lambda: device,
+            attach=mock.Mock(return_value=session),
+        )
+        physicalizer = doubao_rpc.DoubaoPhysicalizer()
+
+        with mock.patch.object(doubao_rpc.sys, "platform", "win32"), mock.patch.dict(
+            sys.modules, {"frida": fake_frida}
+        ), mock.patch.object(
+            physicalizer,
+            "_probe_module",
+            return_value=r"C:\Program Files\DoubaoIME\ImeService.exe",
+        ), mock.patch.object(
+            physicalizer, "_verify_module", return_value=True
+        ):
+            self.assertFalse(physicalizer.start())
+
+        session.detach.assert_called_once()
+        self.assertIsNone(physicalizer._script)
+        self.assertIsNone(physicalizer._session)
+        self.assertEqual(physicalizer.status, "unavailable")
+
 
 if __name__ == "__main__":
     unittest.main()

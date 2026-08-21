@@ -18,6 +18,7 @@ _CI_PATH = _REPO_ROOT / ".github" / "workflows" / "windows-rc003-ci.yml"
 _PACKAGE_MAIN_PATH = _RC003_ROOT / "src" / "ovb_rc003" / "__main__.py"
 _LAUNCHER_PATH = _RC003_ROOT / "src" / "launcher.py"
 _BUILD_CANDIDATE_PATH = _RC003_ROOT / "build" / "build-candidate.ps1"
+_PUBLIC_BOUNDARY_PATH = _RC003_ROOT / "build" / "check-public-boundary.ps1"
 _README_PATH = _RC003_ROOT / "README.md"
 _INSTALLED_README_PATH = _RC003_ROOT / "installer" / "readme-rc003.txt"
 _ROOT_README_PATH = _REPO_ROOT / "README.md"
@@ -342,13 +343,44 @@ class InnoSetupScriptTests(unittest.TestCase):
         self.assertNotIn("T1RemoteBridge", self.text)
         self.assertNotIn("V60PenBridge", self.text)
 
-    def test_uninstall_run_stops_the_app_first(self):
-        self.assertIn("stop-app.ps1", self.text)
+    def test_uninstall_initialization_stops_the_app_before_removing_files(self):
+        code_section = _iss_section(self.text, "Code")
+        self.assertIn("function InitializeUninstall(): Boolean", code_section)
+        self.assertIn("stop-app.ps1", code_section)
+        self.assertIn("Result := False", code_section)
+        self.assertNotIn("[UninstallRun]", self.text)
+
+    def test_upgrade_aborts_when_the_old_process_cannot_be_confirmed_stopped(self):
+        code_section = _iss_section(self.text, "Code")
+        self.assertIn("Started := Exec", code_section)
+        self.assertIn("if not Started then", code_section)
+        self.assertIn("if ResultCode <> 0 then", code_section)
+
+    def test_stop_script_uses_directory_boundary_and_bounded_exit_confirmation(self):
+        script = (_ISS_PATH.parent / "stop-app.ps1").read_text(
+            encoding="utf-8-sig"
+        )
+        self.assertIn("$rootPrefix", script)
+        self.assertIn("[System.IO.Path]::GetFullPath", script)
+        self.assertIn("AddSeconds(5)", script)
+        self.assertIn("CreationDate", script)
+        self.assertIn("Get-CurrentTargetProcess", script)
+        self.assertIn('$targetExecutableName = "RemoteMicRC003.exe"', script)
+        self.assertIn("GetFileName", script)
+        self.assertIn("exit 2", script)
+
+    def test_uninstall_aborts_when_the_installed_stop_script_is_missing(self):
+        code_section = _iss_section(self.text, "Code")
+        self.assertIn("if not FileExists(StopScript) then", code_section)
+        missing_branch = code_section.split(
+            "if not FileExists(StopScript) then", 1
+        )[1].split("Started := Exec", 1)[0]
+        self.assertIn("Result := False", missing_branch)
 
     def test_stop_app_script_is_both_temp_extractable_and_permanently_installed(self):
         # XRBM-022: the round-1 defect was that stop-app.ps1 only had a
         # "dontcopy" [Files] entry (extractable during PrepareToInstall) and
-        # was never actually installed to {app} - so [UninstallRun] and any
+        # was never actually installed to {app} - so uninstall startup and any
         # Stop shortcut referencing "{app}\stop-app.ps1" pointed at a file
         # that never existed on disk after install. Both entries must exist.
         files_section = _iss_section(self.text, "Files")
@@ -361,9 +393,9 @@ class InnoSetupScriptTests(unittest.TestCase):
             files_section,
         )
 
-    def test_uninstall_run_and_a_stop_shortcut_both_target_the_installed_copy(self):
+    def test_uninstall_and_a_stop_shortcut_both_target_the_installed_copy(self):
         # At least two independent references to the installed (not
-        # temp-extracted) copy: [UninstallRun] and an explicit Stop shortcut.
+        # temp-extracted) copy: InitializeUninstall and an explicit Stop shortcut.
         self.assertGreaterEqual(self.text.count(r"{app}\stop-app.ps1"), 2)
 
     def test_primary_start_menu_shortcut_opens_settings_not_bridge(self):
@@ -929,6 +961,17 @@ class BuildCandidateScriptTests(unittest.TestCase):
         self.assertLess(fetch_index, pyinstaller_index)
         assert_index = self.text.index('Assert-LastExitCode "fetch-vb-cable.ps1"')
         self.assertGreater(assert_index, fetch_index)
+
+
+class PublicBoundaryScriptTests(unittest.TestCase):
+    def setUp(self):
+        self.text = _PUBLIC_BOUNDARY_PATH.read_text(encoding="utf-8")
+
+    def test_timestamped_generated_directories_match_python_replay(self):
+        self.assertIn('$component -like "dist-*"', self.text)
+        self.assertIn('$component -like "build-*"', self.text)
+        self.assertIn('$component -like "pyinstaller-work-*"', self.text)
+        self.assertIn("$ExcludedDirNames -contains $component", self.text)
 
 
 class VbCablePinConsistencyTests(unittest.TestCase):

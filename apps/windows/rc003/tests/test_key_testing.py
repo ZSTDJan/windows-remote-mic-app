@@ -114,16 +114,20 @@ class CaptureReplayTests(unittest.TestCase):
         self.assertEqual(record["signature"], raw_input_windows.physical_signature(event))
         self.assertNotIn("device_path", record)
 
-    def test_recorder_can_include_device_path_only_for_live_diagnostics(self):
+    def test_recorder_never_persists_or_replays_a_device_path(self):
         event = raw_input_windows.RawInputEvent(
             source="keyboard",
             is_pressed=True,
             vkey=0x27,
             device_path="\\\\?\\HID#RC003",
         )
-        recorder = key_testing.KeyCaptureRecorder(include_device_path=True)
+        recorder = key_testing.KeyCaptureRecorder()
         recorder.append(event)
-        self.assertEqual(recorder.records[0]["device_path"], event.device_path)
+        self.assertNotIn("device_path", recorder.records[0])
+        replayed = key_testing.record_to_event(
+            {**recorder.records[0], "device_path": event.device_path}
+        )
+        self.assertIsNone(replayed.device_path)
 
     def test_capture_schema_version_is_checked(self):
         record = {

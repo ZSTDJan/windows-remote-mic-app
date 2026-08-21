@@ -83,7 +83,9 @@ def publish_next_button(
     if not root.is_dir():
         return False
     _cleanup_stale(root, now=now)
-    for request_path in sorted(root.glob("request-*.json")):
+    request_paths = list(root.glob("request-*.json"))
+    request_paths.sort(key=_request_age_key)
+    for request_path in request_paths:
         request = _read_request(request_path, now=now)
         if request is None:
             _unlink(request_path)
@@ -114,6 +116,14 @@ def publish_next_button(
             _unlink(request.claim_lock_path)
         return True
     return False
+
+
+def _request_age_key(path: Path) -> tuple[int, str]:
+    try:
+        modified_ns = path.stat().st_mtime_ns
+    except OSError:
+        modified_ns = 2**63 - 1
+    return modified_ns, path.name
 
 
 def poll_detection(request: DetectionRequest) -> Optional[str]:
@@ -182,11 +192,14 @@ def _read_json(path: Path):
 
 def _write_json_atomic(path: Path, payload: dict) -> None:
     temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
-    temporary.write_text(
-        json.dumps(payload, ensure_ascii=True, sort_keys=True),
-        encoding="utf-8",
-    )
-    os.replace(temporary, path)
+    try:
+        temporary.write_text(
+            json.dumps(payload, ensure_ascii=True, sort_keys=True),
+            encoding="utf-8",
+        )
+        os.replace(temporary, path)
+    finally:
+        _unlink(temporary)
 
 
 def _unlink(path: Path) -> None:

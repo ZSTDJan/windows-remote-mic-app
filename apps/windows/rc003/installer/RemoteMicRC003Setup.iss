@@ -65,8 +65,8 @@ Source: "..\..\..\..\COPYRIGHT.md"; DestDir: "{app}"; DestName: "COPYRIGHT.txt";
 ;     in PrepareToInstall, so an in-place upgrade can stop a running instance
 ;     BEFORE this run's [Files] have been (re)written to {app};
 ;   - this normally-installed entry puts a real, permanent copy at
-;     {app}\stop-app.ps1, which [UninstallRun] and the "Stop" shortcut below
-;     both depend on existing on disk AFTER install completes.
+;     {app}\stop-app.ps1, which InitializeUninstall() and the "Stop" shortcut
+;     below both depend on existing on disk AFTER install completes.
 Source: "stop-app.ps1"; DestDir: "{app}"; Flags: ignoreversion
 Source: "stop-app.ps1"; DestDir: "{tmp}"; Flags: dontcopy
 
@@ -93,17 +93,58 @@ Name: "{userdesktop}\{#AppName}"; Filename: "{app}\{#AppExeName}"; Parameters: "
 ; anything) - unchecked by default either way.
 Filename: "{app}\{#AppExeName}"; Parameters: "--settings"; Description: "打开 {#AppName} 设置"; Flags: postinstall nowait skipifsilent unchecked
 
-[UninstallRun]
-Filename: "powershell.exe"; Parameters: "-ExecutionPolicy Bypass -File ""{app}\stop-app.ps1"" -AppPath ""{app}"""; Flags: runhidden
-
 [Code]
 function PrepareToInstall(var NeedsRestart: Boolean): String;
 var
   ResultCode: Integer;
+  Started: Boolean;
 begin
   Result := '';
   ExtractTemporaryFile('stop-app.ps1');
-  Exec('powershell.exe',
+  Started := Exec('powershell.exe',
     '-ExecutionPolicy Bypass -File "' + ExpandConstant('{tmp}\stop-app.ps1') + '" -AppPath "' + ExpandConstant('{app}') + '"',
     '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  if not Started then
+  begin
+    Result := '无法运行旧进程清理程序；安装已停止，以免覆盖仍在使用的文件。';
+    exit;
+  end;
+  if ResultCode <> 0 then
+  begin
+    Result := 'Remote Mic 仍在运行或未能确认退出；请先退出程序后再重试安装。';
+    exit;
+  end;
+end;
+
+function InitializeUninstall(): Boolean;
+var
+  ResultCode: Integer;
+  Started: Boolean;
+  StopScript: String;
+begin
+  Result := True;
+  StopScript := ExpandConstant('{app}\stop-app.ps1');
+  if not FileExists(StopScript) then
+  begin
+    MsgBox(
+      '无法找到 Remote Mic 进程清理程序。卸载尚未开始，请修复或重新安装当前版本后重试。',
+      mbError,
+      MB_OK
+    );
+    Result := False;
+    exit;
+  end;
+
+  Started := Exec('powershell.exe',
+    '-ExecutionPolicy Bypass -File "' + StopScript + '" -AppPath "' + ExpandConstant('{app}') + '"',
+    '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  if (not Started) or (ResultCode <> 0) then
+  begin
+    MsgBox(
+      'Remote Mic 仍在运行或未能确认退出。卸载尚未开始，请先退出程序后重试。',
+      mbError,
+      MB_OK
+    );
+    Result := False;
+  end;
 end;

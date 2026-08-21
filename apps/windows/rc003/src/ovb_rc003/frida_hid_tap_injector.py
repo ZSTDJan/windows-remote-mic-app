@@ -31,6 +31,8 @@ MEM_RESERVE = 0x2000
 MEM_RELEASE = 0x8000
 PAGE_READWRITE = 0x04
 WAIT_OBJECT_0 = 0
+WAIT_TIMEOUT = 258
+WAIT_FAILED = 0xFFFFFFFF
 TOKEN_ADJUST_PRIVILEGES = 0x0020
 TOKEN_QUERY = 0x0008
 SE_PRIVILEGE_ENABLED = 0x00000002
@@ -175,6 +177,7 @@ def inject_library(pid: int, dll_path: Path) -> None:
         raise ctypes.WinError(ctypes.get_last_error())
     remote_path = None
     thread = None
+    remote_thread_completed = False
     try:
         encoded = (str(dll_path.resolve()) + "\0").encode("utf-16-le")
         remote_path = kernel32.VirtualAllocEx(
@@ -206,8 +209,14 @@ def inject_library(pid: int, dll_path: Path) -> None:
         )
         if not thread:
             raise ctypes.WinError(ctypes.get_last_error())
-        if kernel32.WaitForSingleObject(thread, 20_000) != WAIT_OBJECT_0:
+        wait_result = int(kernel32.WaitForSingleObject(thread, 20_000))
+        if wait_result == WAIT_TIMEOUT:
             raise TimeoutError("remote LoadLibraryW timed out")
+        if wait_result == WAIT_FAILED:
+            raise ctypes.WinError(ctypes.get_last_error())
+        if wait_result != WAIT_OBJECT_0:
+            raise RuntimeError("remote LoadLibraryW returned an unexpected wait result")
+        remote_thread_completed = True
         exit_code = wintypes.DWORD()
         if not kernel32.GetExitCodeThread(thread, ctypes.byref(exit_code)):
             raise ctypes.WinError(ctypes.get_last_error())
@@ -216,7 +225,10 @@ def inject_library(pid: int, dll_path: Path) -> None:
     finally:
         if thread:
             kernel32.CloseHandle(thread)
-        if remote_path:
+        # Never free the remote UTF-16 path while LoadLibraryW may still be
+        # reading it. A timeout/status failure leaves this small allocation
+        # behind in WUDFHost, which is safer than a remote use-after-free.
+        if remote_path and (thread is None or remote_thread_completed):
             kernel32.VirtualFreeEx(process, remote_path, 0, MEM_RELEASE)
         kernel32.CloseHandle(process)
 

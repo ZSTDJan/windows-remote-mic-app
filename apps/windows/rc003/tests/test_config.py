@@ -113,6 +113,24 @@ class SaveConfigPrivacyGuardTests(unittest.TestCase):
             with self.assertRaises(config.ConfigPrivacyError):
                 config.save_key_bindings(path, bad_bindings)
 
+    def test_save_rejects_device_paths_and_platform_device_ids(self):
+        for forbidden_key in (
+            "device_path",
+            "hid_device_path",
+            "raw_device_path",
+            "device_id",
+            "ble_device_id",
+        ):
+            with self.subTest(forbidden_key=forbidden_key), tempfile.TemporaryDirectory() as tmp:
+                path = Path(tmp) / "config.json"
+                bad_config = config.default_config()
+                bad_config["runtime"] = {forbidden_key: "private-machine-identity"}
+
+                with self.assertRaises(config.ConfigPrivacyError):
+                    config.save_config(path, bad_config)
+
+                self.assertFalse(path.exists())
+
     def test_load_config_rejects_a_forbidden_key_found_on_disk(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "config.json"
@@ -193,6 +211,22 @@ class SaveConfigPrivacyGuardTests(unittest.TestCase):
 
 
 class RoundTripTests(unittest.TestCase):
+    def test_load_config_rejects_a_non_object_root(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.json"
+            path.write_text("[]", encoding="utf-8")
+
+            with self.assertRaises(config.ConfigFormatError):
+                config.load_config(path)
+
+    def test_load_key_bindings_rejects_a_non_object_root(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "key_bindings.json"
+            path.write_text("[]", encoding="utf-8")
+
+            with self.assertRaises(config.ConfigFormatError):
+                config.load_key_bindings(path)
+
     def test_save_config_replaces_an_existing_file_atomically(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "config.json"
@@ -237,7 +271,96 @@ class RoundTripTests(unittest.TestCase):
             original = config.default_key_bindings()
             config.save_key_bindings(path, original)
             loaded = config.load_key_bindings(path)
-            self.assertEqual(loaded["bindings"], original["bindings"])
+        self.assertEqual(loaded["bindings"], original["bindings"])
+
+    def test_paired_save_rolls_back_config_when_bindings_save_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_path = root / "config.json"
+            bindings_path = root / "key_bindings.json"
+            config_path.write_bytes(b'{"old_config": true}\n')
+            bindings_path.write_bytes(b'{"old_bindings": true}\n')
+
+            with mock.patch.object(
+                config,
+                "save_key_bindings",
+                side_effect=OSError("bindings locked"),
+            ):
+                with self.assertRaisesRegex(OSError, "bindings locked"):
+                    config.save_settings_pair(
+                        config_path,
+                        config.default_config(),
+                        bindings_path,
+                        config.default_key_bindings(),
+                    )
+
+            self.assertEqual(config_path.read_bytes(), b'{"old_config": true}\n')
+            self.assertEqual(bindings_path.read_bytes(), b'{"old_bindings": true}\n')
+
+    def test_paired_save_removes_new_config_when_second_save_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_path = root / "config.json"
+            bindings_path = root / "key_bindings.json"
+
+            with mock.patch.object(
+                config,
+                "save_key_bindings",
+                side_effect=OSError("bindings locked"),
+            ):
+                with self.assertRaisesRegex(OSError, "bindings locked"):
+                    config.save_settings_pair(
+                        config_path,
+                        config.default_config(),
+                        bindings_path,
+                        config.default_key_bindings(),
+                    )
+
+            self.assertFalse(config_path.exists())
+            self.assertFalse(bindings_path.exists())
+
+    def test_paired_save_validates_both_documents_before_writing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_path = root / "config.json"
+            bindings_path = root / "key_bindings.json"
+            bad_bindings = config.default_key_bindings()
+            bad_bindings["device_path"] = "private"
+
+            with self.assertRaises(config.ConfigPrivacyError):
+                config.save_settings_pair(
+                    config_path,
+                    config.default_config(),
+                    bindings_path,
+                    bad_bindings,
+                )
+
+            self.assertFalse(config_path.exists())
+            self.assertFalse(bindings_path.exists())
+
+    def test_paired_save_reports_an_incomplete_rollback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_path = root / "config.json"
+            bindings_path = root / "key_bindings.json"
+            config_path.write_text('{"old": true}\n', encoding="utf-8")
+
+            with mock.patch.object(
+                config,
+                "save_key_bindings",
+                side_effect=OSError("bindings locked"),
+            ), mock.patch.object(
+                config,
+                "_restore_file_snapshot",
+                side_effect=OSError("rollback locked"),
+            ):
+                with self.assertRaises(config.ConfigTransactionError):
+                    config.save_settings_pair(
+                        config_path,
+                        config.default_config(),
+                        bindings_path,
+                        config.default_key_bindings(),
+                    )
 
     def test_legacy_reference_chords_are_migrated_to_semantic_actions(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -70,6 +70,10 @@ import sys
 
 from . import __version__
 
+SETTINGS_STARTUP_FAILED_EXIT_CODE = 15
+BRIDGE_CONFIG_FAILED_EXIT_CODE = 16
+BRIDGE_RUNTIME_FAILED_EXIT_CODE = 17
+
 
 def _print_help() -> None:
     print(f"Remote Mic - RC003 Windows client (source/build candidate) {__version__}")
@@ -148,9 +152,20 @@ def _run_bridge(*, quiet_duplicate: bool = False) -> None:
 
     from . import app, config, device_catalog, single_instance
 
-    selected_device_id = device_catalog.normalize_device_id(
-        config.load_config(config.config_path()).get("selected_device_profile")
-    )
+    try:
+        selected_device_id = device_catalog.normalize_device_id(
+            config.load_config(config.config_path()).get("selected_device_profile")
+        )
+    except Exception as exc:
+        print(
+            f"bridge configuration load failed: error_type={type(exc).__name__}",
+            file=sys.stderr,
+        )
+        single_instance.show_bridge_startup_blocked_notice(
+            "Remote Mic 无法读取现有配置，因此不会启动桥接，也不会覆盖原配置。"
+            "请先打开设置目录检查 config.json 和 key_bindings.json。"
+        )
+        raise SystemExit(BRIDGE_CONFIG_FAILED_EXIT_CODE)
     if selected_device_id == device_catalog.DJI_MIC_2_ID:
         single_instance.show_bridge_startup_blocked_notice(
             "当前设备是 DJI Mic 2。它由 Windows 作为系统录音输入使用，不需要也不会启动 "
@@ -185,6 +200,16 @@ def _run_bridge(*, quiet_duplicate: bool = False) -> None:
             "Task Manager for a lingering process before retrying."
         )
         raise SystemExit(single_instance.CLEANUP_FAILED_EXIT_CODE)
+    except Exception as exc:
+        print(
+            f"bridge runtime failed: error_type={type(exc).__name__}",
+            file=sys.stderr,
+        )
+        single_instance.show_bridge_startup_blocked_notice(
+            "Remote Mic 桥接启动或运行失败，已停止本次进程。"
+            "请打开日志目录查看固定诊断标记后重试。"
+        )
+        raise SystemExit(BRIDGE_RUNTIME_FAILED_EXIT_CODE)
 
 
 def main() -> None:
@@ -218,6 +243,9 @@ def main() -> None:
 
         flag_index = args.index("--rc003-hid-injector")
         raise SystemExit(frida_compat.injector_main(args[flag_index + 1 :]))
+    if "--settings" in args:
+        _run_settings()
+        return
     if "--bridge" in args:
         from . import bridge_launcher
 
@@ -229,9 +257,24 @@ def main() -> None:
     # Default (no arguments) and explicit --settings both open the settings
     # window. A user who double-clicks the packaged exe must see a window,
     # never a headless bridge process with no UI.
-    from . import settings_ui
+    _run_settings()
 
-    settings_ui.main()
+
+def _run_settings() -> None:
+    from . import settings_ui, single_instance
+
+    try:
+        settings_ui.main()
+    except Exception as exc:
+        print(
+            f"settings startup failed: error_type={type(exc).__name__}",
+            file=sys.stderr,
+        )
+        single_instance.show_bridge_startup_blocked_notice(
+            "Remote Mic 设置窗口无法启动。现有配置不会被自动覆盖；"
+            "请检查日志目录和配置文件后重试。"
+        )
+        raise SystemExit(SETTINGS_STARTUP_FAILED_EXIT_CODE)
 
 
 if __name__ == "__main__":

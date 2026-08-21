@@ -149,8 +149,13 @@ function Test-ExcludedGeneratedPath {
     param([string]$FullName, [string[]]$ExcludedDirNames)
 
     $components = $FullName -split '[\\/]'
-    foreach ($name in $ExcludedDirNames) {
-        if (($components -contains $name) -or ($name -eq "dist" -and ($components | Where-Object { $_ -like "dist-*" })) -or ($name -eq "pyinstaller-work" -and ($components | Where-Object { $_ -like "pyinstaller-work-*" })) -or ($name -eq "build" -and ($components | Where-Object { $_ -like "build-*" }))) {
+    foreach ($component in $components) {
+        if (
+            ($ExcludedDirNames -contains $component) -or
+            ($component -like "dist-*") -or
+            ($component -like "build-*") -or
+            ($component -like "pyinstaller-work-*")
+        ) {
             return $true
         }
     }

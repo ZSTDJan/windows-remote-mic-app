@@ -77,7 +77,15 @@ class ConnectionSupervisor:
         directly, which is only safe from the loop thread itself.
         """
 
-        self._loop.call_soon_threadsafe(self._disconnect_event.set)
+        if self._stopping or self._loop.is_closed():
+            return
+        try:
+            self._loop.call_soon_threadsafe(self._disconnect_event.set)
+        except RuntimeError:
+            # The event loop can close between is_closed() and the scheduling
+            # call during process teardown. There is no live attempt left to
+            # reconnect in that state, so this notification is safely stale.
+            return
 
     async def run_forever(self) -> None:
         while not self._stopping:
@@ -96,17 +104,21 @@ class ConnectionSupervisor:
                 # and a retry, never propagate out of the supervisor.
                 self.last_error = exc
                 if self._logger is not None:
-                    self._logger.info("connection attempt failed: %s", exc)
+                    self._logger.info(
+                        "connection attempt failed: error_type=%s",
+                        type(exc).__name__,
+                    )
             finally:
                 await self._cleanup()
                 self.cleanup_count += 1
 
             if self._stopping:
                 break
-            delay = self._next_retry_delay
             if connected:
+                delay = self._retry_delay
                 self._next_retry_delay = self._retry_delay
             else:
+                delay = self._next_retry_delay
                 self._next_retry_delay = min(
                     self._max_retry_delay,
                     max(self._retry_delay, self._next_retry_delay * 2),

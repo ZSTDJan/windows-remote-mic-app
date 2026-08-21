@@ -97,6 +97,62 @@ class Rc003KeyTestCliTests(unittest.TestCase):
         self.assertEqual(result, 1)
         save_binding.assert_not_called()
 
+    def test_complete_capture_with_listener_stop_failure_does_not_save_binding(self):
+        class StopFailingListener:
+            def __init__(self, _on_button_event, on_raw_event):
+                self._on_raw_event = on_raw_event
+
+            def start(self, _device_path):
+                for is_pressed, flags, message in (
+                    (True, 0x0002, 0x0100),
+                    (False, 0x0003, 0x0101),
+                ):
+                    self._on_raw_event(
+                        raw_input_windows.RawInputEvent(
+                            source="keyboard",
+                            is_pressed=is_pressed,
+                            vkey=0xFF,
+                            make_code=0x70,
+                            flags=flags,
+                            message=message,
+                        )
+                    )
+
+            def stop(self):
+                raise RuntimeError("synthetic stop failure")
+
+        with tempfile.TemporaryDirectory() as temp:
+            output = Path(temp) / "complete.jsonl"
+            with mock.patch.object(
+                rc003_key_test.raw_input_windows,
+                "RawInputButtonListener",
+                StopFailingListener,
+            ), mock.patch.object(
+                rc003_key_test.raw_input_windows,
+                "enumerate_matching_device_paths",
+                return_value=("rc003",),
+            ), mock.patch.object(
+                rc003_key_test.hid_identity,
+                "select_single_device_path",
+                return_value="rc003",
+            ), mock.patch.object(
+                rc003_key_test, "_save_physical_binding"
+            ) as save_binding:
+                result = rc003_key_test.main(
+                    [
+                        "capture",
+                        "--assign",
+                        "back",
+                        "--duration",
+                        "0",
+                        "--output",
+                        str(output),
+                    ]
+                )
+
+        self.assertEqual(result, 2)
+        save_binding.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

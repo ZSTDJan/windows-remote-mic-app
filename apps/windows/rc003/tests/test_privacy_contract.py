@@ -14,8 +14,13 @@ import unittest
 from pathlib import Path
 
 _PACKAGE_ROOT = Path(__file__).resolve().parents[1] / "src" / "ovb_rc003"
+_SOURCE_ROOT = _PACKAGE_ROOT.parent
 
 _PY_FILES = sorted(_PACKAGE_ROOT.glob("*.py"))
+_DIAGNOSTIC_SCRIPT_FILES = (
+    _SOURCE_ROOT / "rc003_broad_raw_probe.py",
+    _SOURCE_ROOT / "rc003_key_test.py",
+)
 
 # A real MAC address literal, e.g. AA:BB:CC:DD:EE:FF. This project must never
 # contain one anywhere (not even as a documented example), since a documented
@@ -216,10 +221,55 @@ class ConfigPrivacyKeysNotHardcodedElsewhereTests(unittest.TestCase):
             if path.name == "config.py":
                 continue
             text = path.read_text(encoding="utf-8")
-            for key in ("address", "device_match", "interface_id", "device_token"):
+            for key in (
+                "address",
+                "device_match",
+                "device_id",
+                "device_path",
+                "interface_id",
+                "device_token",
+            ):
                 if re.search(rf'["\']{key}["\']\s*:', text):
                     offenders.append((str(path), key))
         self.assertEqual(offenders, [], f"forbidden identity key literal found: {offenders}")
+
+    def test_diagnostic_writer_calls_never_persist_device_identity_fields(self):
+        forbidden_fields = {
+            "address",
+            "device_id",
+            "device_path",
+            "interface_id",
+            "path",
+        }
+        offenders = []
+        for path in _DIAGNOSTIC_SCRIPT_FILES:
+            tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Call):
+                    continue
+                if not (
+                    isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "write"
+                ):
+                    continue
+                for keyword in node.keywords:
+                    if keyword.arg in forbidden_fields:
+                        offenders.append((str(path), keyword.arg))
+                for argument in node.args:
+                    if not isinstance(argument, ast.Dict):
+                        continue
+                    for key in argument.keys:
+                        if (
+                            isinstance(key, ast.Constant)
+                            and isinstance(key.value, str)
+                            and key.value in forbidden_fields
+                        ):
+                            offenders.append((str(path), key.value))
+        self.assertEqual(
+            offenders,
+            [],
+            f"diagnostic writer persists a device identity field: {offenders}",
+        )
 
 
 class NoAutoStartOnLoginTests(unittest.TestCase):

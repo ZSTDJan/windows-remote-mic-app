@@ -370,7 +370,7 @@ class DefaultDisplayStateTests(unittest.TestCase):
 
 
 class DescribeLaunchResultTests(unittest.TestCase):
-    """XRBM-029: settings_ui's status text for each of the four required
+    """XRBM-029: settings_ui's status text for each required
     stable bridge-launch states, built directly on the same
     bridge_launcher.LaunchResult values tests/test_bridge_launcher.py
     proves get produced - no Tk, no subprocess.
@@ -416,6 +416,18 @@ class DescribeLaunchResultTests(unittest.TestCase):
         text = describe_launch_result(result)
         self.assertIn("9", text)
         self.assertIn("日志", text)
+
+    def test_status_unknown_warns_against_restarting_the_created_process(self):
+        result = bridge_launcher.LaunchResult(
+            outcome=bridge_launcher.LaunchOutcome.STATUS_UNKNOWN,
+            command=("exe",),
+            pid=456,
+            error="OSError",
+        )
+        text = describe_launch_result(result)
+        self.assertIn("456", text)
+        self.assertIn("不要重复启动", text)
+        self.assertIn("app.log", text)
 
     def test_launch_failed_surfaces_the_error_and_points_at_the_log(self):
         result = bridge_launcher.LaunchResult(

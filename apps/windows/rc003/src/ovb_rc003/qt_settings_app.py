@@ -1002,8 +1002,12 @@ def _load_qt_classes() -> dict:
             config_path = config.config_path(self._config_root)
             bindings_path = config.key_bindings_path(self._config_root)
             try:
-                config.save_config(config_path, new_config)
-                config.save_key_bindings(bindings_path, new_bindings)
+                config.save_settings_pair(
+                    config_path,
+                    new_config,
+                    bindings_path,
+                    new_bindings,
+                )
                 # Read the files back through the same normalizers the bridge
                 # uses. This prevents the UI from claiming success when the
                 # file was not actually writable or the persisted shape was
@@ -1237,10 +1241,33 @@ def _load_qt_classes() -> dict:
 
             if self._key_detection_active:
                 return
+            if (
+                self._key_detection_listener is not None
+                or self._key_detection_tap is not None
+            ):
+                self.stopKeyDetection()
+                if (
+                    self._key_detection_listener is not None
+                    or self._key_detection_tap is not None
+                ):
+                    self._set_key_detection_text(
+                        "上一次真实按键检测仍有资源未能停止，请关闭设置窗口后重试。"
+                    )
+                    return
             if self._selected_device_id() != device_catalog.RC003_ID:
                 self._set_key_detection_text("当前设备不是 RC003，无法检测遥控器按键。")
                 return
-            if single_instance.bridge_instance_running():
+            try:
+                bridge_running = single_instance.bridge_instance_running()
+            except (
+                single_instance.SingleInstanceUnavailableError,
+                single_instance.MutexCleanupError,
+            ):
+                self._set_key_detection_text(
+                    "无法安全确认后台桥接状态，请关闭设置窗口和桥接后重试。"
+                )
+                return
+            if bridge_running:
                 try:
                     request = key_detection_bridge.request_detection(self._config_root)
                 except OSError as exc:
@@ -1278,9 +1305,15 @@ def _load_qt_classes() -> dict:
                 if listener is not None:
                     try:
                         listener.stop()
-                    except Exception:
-                        pass
-                listener = None
+                    except Exception as cleanup_exc:
+                        self._key_detection_listener = listener
+                        self._set_key_detection_text(
+                            "Raw Input 启动失败，且监听资源未能停止："
+                            f"{cleanup_exc}"
+                        )
+                        return
+                    else:
+                        listener = None
 
             tap = frida_compat.RC003HidReportTap(
                 self._on_key_detection_hid_report,
@@ -1294,9 +1327,20 @@ def _load_qt_classes() -> dict:
                 failures.append(f"HID tap：{type(exc).__name__}")
                 try:
                     tap.stop()
-                except Exception:
-                    pass
-                tap = None
+                except Exception as cleanup_exc:
+                    if listener is not None:
+                        try:
+                            listener.stop()
+                        except Exception:
+                            self._key_detection_listener = listener
+                    self._key_detection_tap = tap
+                    self._set_key_detection_text(
+                        "HID tap 启动失败，且检测资源未能停止："
+                        f"{cleanup_exc}"
+                    )
+                    return
+                else:
+                    tap = None
 
             if listener is None and tap is None:
                 self._key_detection_listener = None
@@ -1356,7 +1400,8 @@ def _load_qt_classes() -> dict:
             try:
                 capture.start()
             except Exception as exc:  # noqa: BLE001 - surface in the dialog
-                self._hotkey_capture = None
+                if not capture.is_running:
+                    self._hotkey_capture = None
                 self.hotkeyCaptureError.emit(f"无法启动真实键盘录制：{exc}")
                 return
 
@@ -1365,13 +1410,14 @@ def _load_qt_classes() -> dict:
             """Stop the physical recorder, including Cancel/window close."""
 
             capture = self._hotkey_capture
-            self._hotkey_capture = None
             if capture is None:
                 return
             try:
                 capture.stop()
             except Exception as exc:  # noqa: BLE001 - never crash the settings UI
                 self.hotkeyCaptureError.emit(f"停止真实键盘录制时出错：{exc}")
+            else:
+                self._hotkey_capture = None
 
         @Slot()
         def stopKeyDetection(self) -> None:
@@ -1379,9 +1425,7 @@ def _load_qt_classes() -> dict:
             self._key_detection_bridge_request = None
             self._key_detection_started_at = 0.0
             listener = self._key_detection_listener
-            self._key_detection_listener = None
             tap = self._key_detection_tap
-            self._key_detection_tap = None
             was_active = self._key_detection_active
             self._key_detection_active = False
             self._key_detection_tap_usages.clear()
@@ -1394,11 +1438,15 @@ def _load_qt_classes() -> dict:
                     listener.stop()
                 except Exception as exc:  # noqa: BLE001 - report, do not crash Qt
                     self._set_key_detection_text(f"停止真实按键检测时出错：{exc}")
+                else:
+                    self._key_detection_listener = None
             if tap is not None:
                 try:
                     tap.stop()
                 except Exception as exc:  # noqa: BLE001 - report, do not crash Qt
                     self._set_key_detection_text(f"停止 HID tap 检测时出错：{exc}")
+                else:
+                    self._key_detection_tap = None
 
         @Slot()
         def saveAndLaunch(self) -> None:
@@ -1990,18 +2038,18 @@ def run_settings_window() -> int:
 
         return app.exec()
     finally:
-        controller.stopHotkeyCapture()
-        controller.stopKeyDetection()
-        # XRBM-035: called HERE, synchronously - whether app.exec()
-        # returned normally, engine.load() raised, rootObjects() was empty,
-        # or anything else in this block raised - and BEFORE this
-        # function's own local Qt/Python objects (engine,
-        # diagnostics_controller, controller, model) go out of scope - i.e.
-        # while they are all still fully alive, not during interpreter
-        # shutdown. Signals any in-flight diagnostics worker to stop and
-        # gives it a real, bounded chance to actually finish (see
-        # _shutdown_diagnostics_workers()'s own docstring for the full
-        # story/red evidence this fixes) instead of relying solely on this
-        # module's atexit hook, which fires arbitrarily later - possibly
-        # after native Qt/WinRT teardown has already begun.
-        _shutdown_diagnostics_workers()
+        try:
+            controller.stopHotkeyCapture()
+        finally:
+            try:
+                controller.stopKeyDetection()
+            finally:
+                try:
+                    # XRBM-035: called HERE, synchronously - whether app.exec()
+                    # returned normally, engine.load() raised, rootObjects()
+                    # was empty, either input cleanup raised, or anything else
+                    # in this block raised. Independent cleanup steps cannot
+                    # skip the diagnostics-worker shutdown contract.
+                    _shutdown_diagnostics_workers()
+                finally:
+                    audio_playback.cleanup_retained_preflight_sink()

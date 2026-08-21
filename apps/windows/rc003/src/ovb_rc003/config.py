@@ -42,6 +42,11 @@ FORBIDDEN_KEYS = frozenset(
         "bt_address",
         "mac_address",
         "device_match",
+        "device_id",
+        "ble_device_id",
+        "device_path",
+        "hid_device_path",
+        "raw_device_path",
         "device_token",
         "interface_id",
         "device_interface_id",
@@ -51,6 +56,14 @@ FORBIDDEN_KEYS = frozenset(
 
 class ConfigPrivacyError(Exception):
     """Raised when code attempts to persist a forbidden identity field."""
+
+
+class ConfigFormatError(ValueError):
+    """Raised when a persisted JSON document is not an object."""
+
+
+class ConfigTransactionError(RuntimeError):
+    """Raised when a paired settings save also fails to roll back."""
 
 
 def config_root() -> Path:
@@ -130,6 +143,8 @@ def load_config(path: Path) -> Dict[str, Any]:
     if path.is_file():
         with path.open("r", encoding="utf-8-sig") as handle:
             stored = json.load(handle)
+        if not isinstance(stored, dict):
+            raise ConfigFormatError("config.json root must be a JSON object")
         _assert_no_forbidden_keys(stored)
         config.update(stored)
     _normalize_voice_hotkey(config)
@@ -208,6 +223,8 @@ def load_key_bindings(path: Path) -> Dict[str, Any]:
     if path.is_file():
         with path.open("r", encoding="utf-8-sig") as handle:
             stored = json.load(handle)
+        if not isinstance(stored, dict):
+            raise ConfigFormatError("key_bindings.json root must be a JSON object")
         _assert_no_forbidden_keys(stored)
         for key, value in stored.items():
             if key in {"bindings", "secondary_bindings", "physical_bindings"}:
@@ -341,17 +358,60 @@ def save_key_bindings(path: Path, bindings: Dict[str, Any]) -> None:
     _save_json_atomic(path, bindings)
 
 
+def save_settings_pair(
+    config_file: Path,
+    config_data: Dict[str, Any],
+    bindings_file: Path,
+    bindings_data: Dict[str, Any],
+) -> None:
+    """Save the two user-facing settings documents as one recoverable action.
+
+    NTFS does not provide a multi-file atomic replace. Validate both
+    documents before touching disk, then restore the first file byte-for-byte
+    if the second atomic write fails. This prevents ordinary disk-lock,
+    permission, serialization, and replace failures from leaving a mixed
+    configuration behind.
+    """
+
+    if Path(config_file).absolute() == Path(bindings_file).absolute():
+        raise ValueError("paired settings paths must be distinct")
+    _assert_no_forbidden_keys(config_data)
+    _assert_no_forbidden_keys(bindings_data)
+
+    previous_config = (
+        config_file.read_bytes() if config_file.is_file() else None
+    )
+    config_saved = False
+    try:
+        save_config(config_file, config_data)
+        config_saved = True
+        save_key_bindings(bindings_file, bindings_data)
+    except BaseException as save_exc:
+        if config_saved:
+            try:
+                _restore_file_snapshot(config_file, previous_config)
+            except Exception as rollback_exc:
+                raise ConfigTransactionError(
+                    "paired settings save failed and config rollback was incomplete"
+                ) from save_exc
+        raise
+
+
 def _save_json_atomic(path: Path, data: Dict[str, Any]) -> None:
     """Write one settings file without exposing a half-written JSON file."""
 
+    content = (json.dumps(data, indent=2, sort_keys=True) + "\n").encode("utf-8")
+    _save_bytes_atomic(path, content)
+
+
+def _save_bytes_atomic(path: Path, content: bytes) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     file_descriptor, temporary_name = tempfile.mkstemp(
         prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent)
     )
     try:
-        with os.fdopen(file_descriptor, "w", encoding="utf-8", newline="\n") as handle:
-            json.dump(data, handle, indent=2, sort_keys=True)
-            handle.write("\n")
+        with os.fdopen(file_descriptor, "wb") as handle:
+            handle.write(content)
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary_name, path)
@@ -361,3 +421,10 @@ def _save_json_atomic(path: Path, data: Dict[str, Any]) -> None:
         except OSError:
             pass
         raise
+
+
+def _restore_file_snapshot(path: Path, content: bytes | None) -> None:
+    if content is None:
+        path.unlink(missing_ok=True)
+        return
+    _save_bytes_atomic(path, content)

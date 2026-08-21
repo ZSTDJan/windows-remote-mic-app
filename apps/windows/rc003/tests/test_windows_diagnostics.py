@@ -1013,6 +1013,41 @@ class RunBleDiagnosticsSubprocessTests(unittest.TestCase):
             )
         self.assertEqual(spawn_calls, [])
 
+    def test_poll_failure_terminates_and_confirms_the_child_before_raising(self):
+        proc = _FakeProc(poll_raises=OSError("status query failed"))
+
+        with self.assertRaisesRegex(RuntimeError, "child was terminated"):
+            diag._run_ble_diagnostics_subprocess(
+                ["irrelevant"],
+                result_path="/irrelevant",
+                cancel_event=threading.Event(),
+                timeout=5.0,
+                popen=lambda _cmd, **_kwargs: proc,
+            )
+
+        self.assertEqual(proc.terminate_calls, 1)
+        self.assertEqual(proc.wait_calls, 1)
+
+    def test_poll_failure_with_unconfirmed_shutdown_raises_the_owner_error(self):
+        proc = _FakeProc(
+            poll_raises=OSError("status query failed"),
+            wait_raises=subprocess.TimeoutExpired(cmd="x", timeout=0.1),
+        )
+
+        with self.assertRaises(diag.BleDiscoverySubprocessShutdownUnconfirmedError):
+            diag._run_ble_diagnostics_subprocess(
+                ["irrelevant"],
+                result_path="/irrelevant",
+                cancel_event=threading.Event(),
+                timeout=5.0,
+                terminate_wait=0.1,
+                kill_wait=0.1,
+                popen=lambda _cmd, **_kwargs: proc,
+            )
+
+        self.assertEqual(proc.terminate_calls, 1)
+        self.assertEqual(proc.kill_calls, 1)
+
     def test_a_hanging_child_is_terminated_and_confirmed_dead_within_bound(self):
         # A genuine child process that never exits on its own (no
         # cooperative-cancel handling of any kind - this is the exact

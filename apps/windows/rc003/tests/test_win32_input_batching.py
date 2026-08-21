@@ -120,6 +120,14 @@ class SendKeyComboDownTests(unittest.TestCase):
         # "win" one failing.
         self.assertEqual(len(calls), 3)
 
+    def test_zero_count_from_fallback_release_is_reported_as_incomplete_cleanup(self):
+        sender = RecordingSender(sent_counts=[1, 0])
+
+        with self.assertRaises(win32_input.InputCleanupIncompleteError):
+            win32_input.send_key_combo_down(("win", "d"), _sender=sender)
+
+        self.assertEqual(len(sender.calls), 2)
+
 
 class SendKeyComboUpTests(unittest.TestCase):
     def test_full_delivery_releases_in_reverse_order(self):
@@ -334,7 +342,7 @@ class VoiceKeyComboTests(unittest.TestCase):
         self.assertEqual(calls, [(vk, False), (vk, True)])
         sleep.assert_called_once_with(0.07)
 
-    def test_down_failure_releases_only_keys_already_pressed(self):
+    def test_down_failure_releases_every_key_that_may_have_landed(self):
         calls = []
 
         def sender(vk, key_up):
@@ -350,6 +358,92 @@ class VoiceKeyComboTests(unittest.TestCase):
             [
                 (win32_input.win32_keys.VK_CODES["ralt"], False),
                 (win32_input.win32_keys.VK_CODES["space"], False),
+                (win32_input.win32_keys.VK_CODES["space"], True),
+                (win32_input.win32_keys.VK_CODES["ralt"], True),
+            ],
+        )
+
+    def test_up_failure_retries_every_modifier_that_may_still_be_down(self):
+        calls = []
+
+        def sender(vk, key_up):
+            calls.append((vk, key_up))
+            if len(calls) == 1:
+                raise RuntimeError("simulated voice sender failure")
+
+        with self.assertRaises(OSError):
+            win32_input.send_voice_key_combo_up(("ralt", "space"), _sender=sender)
+
+        self.assertEqual(
+            calls,
+            [
+                (win32_input.win32_keys.VK_CODES["space"], True),
+                (win32_input.win32_keys.VK_CODES["space"], True),
+                (win32_input.win32_keys.VK_CODES["ralt"], True),
+            ],
+        )
+
+    def test_tap_releases_keys_when_the_hold_delay_is_interrupted(self):
+        calls = []
+
+        with mock.patch.object(
+            win32_input.time, "sleep", side_effect=KeyboardInterrupt
+        ), self.assertRaises(KeyboardInterrupt):
+            win32_input.send_voice_key_combo_tap(
+                ("ralt", "space"),
+                _sender=lambda vk, key_up: calls.append((vk, key_up)),
+            )
+
+        self.assertEqual(
+            calls[-2:],
+            [
+                (win32_input.win32_keys.VK_CODES["space"], True),
+                (win32_input.win32_keys.VK_CODES["ralt"], True),
+            ],
+        )
+
+    def test_tap_reports_when_final_safety_release_is_incomplete(self):
+        calls = []
+
+        def sender(vk, key_up):
+            calls.append((vk, key_up))
+            if key_up:
+                raise RuntimeError("simulated persistent key-up failure")
+
+        with mock.patch.object(
+            win32_input.time, "sleep", side_effect=KeyboardInterrupt
+        ), self.assertRaises(win32_input.InputCleanupIncompleteError):
+            win32_input.send_voice_key_combo_tap(
+                ("ralt", "space"),
+                _sender=sender,
+            )
+
+        self.assertGreaterEqual(len(calls), 4)
+
+    def test_tap_downgrades_prior_incomplete_error_after_final_release_succeeds(self):
+        calls = []
+        failed_once = {win32_input.win32_keys.VK_CODES["space"]: False}
+
+        def sender(vk, key_up):
+            calls.append((vk, key_up))
+            if key_up and vk in failed_once and not failed_once[vk]:
+                failed_once[vk] = True
+                raise RuntimeError("simulated transient key-up failure")
+
+        with self.assertRaises(OSError) as ctx:
+            win32_input.send_voice_key_combo_tap(
+                ("ralt", "space"),
+                _sender=sender,
+            )
+
+        self.assertNotIsInstance(
+            ctx.exception,
+            win32_input.InputCleanupIncompleteError,
+        )
+        self.assertEqual(
+            calls[-2:],
+            [
+                (win32_input.win32_keys.VK_CODES["space"], True),
                 (win32_input.win32_keys.VK_CODES["ralt"], True),
             ],
         )
@@ -360,6 +454,19 @@ class VoiceKeyComboTests(unittest.TestCase):
 
         with self.assertRaises(win32_input.Win32InputUnavailableError):
             win32_input.send_voice_key_combo_down(("ralt",), _sender=unavailable_sender)
+
+    def test_voice_down_reports_when_compensating_key_up_also_fails(self):
+        calls = []
+
+        def sender(vk, key_up):
+            calls.append((vk, key_up))
+            if len(calls) >= 2:
+                raise RuntimeError("simulated persistent voice sender failure")
+
+        with self.assertRaises(win32_input.InputCleanupIncompleteError):
+            win32_input.send_voice_key_combo_down(("ralt", "space"), _sender=sender)
+
+        self.assertGreaterEqual(len(calls), 4)
 
 
 class VolumeTests(unittest.TestCase):

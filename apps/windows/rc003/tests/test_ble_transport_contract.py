@@ -318,6 +318,29 @@ class ConnectTests(unittest.TestCase):
         finally:
             _run(session.close())
 
+        self.assertTrue(env.data_writers)
+        self.assertTrue(all(writer.close_calls == 1 for writer in env.data_writers))
+
+    def test_tx_writer_is_closed_even_when_writer_close_itself_fails(self):
+        env = FakeWinRTEnvironment()
+        close_error = RuntimeError("simulated writer close failure")
+        env.data_writer_close_error = close_error
+
+        async def scenario():
+            session = RC003BleSession(
+                on_pcm_frame=lambda samples: None,
+                winrt=env.build_winrt_modules(),
+                loop=asyncio.get_event_loop(),
+            )
+            session._tx_characteristic = env.tx_characteristic
+            with self.assertRaises(RuntimeError) as ctx:
+                await session._write_tx(b"test")
+            self.assertIs(ctx.exception, close_error)
+
+        _run(scenario())
+        self.assertEqual(env.tx_characteristic.write_history, [b"test"])
+        self.assertEqual(env.data_writers[0].close_calls, 1)
+
     def test_connect_subscribes_to_connection_status(self):
         env = FakeWinRTEnvironment()
 
@@ -336,6 +359,32 @@ class ConnectTests(unittest.TestCase):
 
 
 class NotificationProcessingTests(unittest.TestCase):
+    def test_audio_backpressure_never_drops_or_delays_control_behind_audio(self):
+        processed = []
+        loop = asyncio.new_event_loop()
+        session = RC003BleSession(
+            on_pcm_frame=lambda samples: None,
+            loop=loop,
+        )
+        session._process_audio = lambda _payload: processed.append("audio")
+        session._process_control = lambda _payload: processed.append("control")
+        try:
+            for _ in range(200):
+                session._enqueue("audio", b"audio")
+            session._enqueue("control", b"control")
+            for _ in range(200):
+                session._enqueue("audio", b"audio")
+
+            session._start_worker(session._generation)
+            self.assertTrue(_wait_until(lambda: processed))
+            self.assertEqual(processed[0], "control")
+            self.assertGreater(session.dropped_event_count, 0)
+        finally:
+            session._worker_stop.set()
+            if session._worker_thread is not None:
+                session._worker_thread.join(timeout=2.0)
+            loop.close()
+
     def test_caps_then_audio_start_then_audio_notification_yields_pcm(self):
         env = FakeWinRTEnvironment()
         pcm_batches = []
@@ -398,6 +447,59 @@ class NotificationProcessingTests(unittest.TestCase):
             self.assertIsInstance(errors[0], atvv_session.ATVVProtocolError)
         finally:
             _run(session.close())
+
+    def test_control_callback_failure_reports_error_and_stops_worker(self):
+        env = FakeWinRTEnvironment()
+        errors = []
+        boom = RuntimeError("simulated control callback failure")
+
+        async def scenario():
+            session = RC003BleSession(
+                on_pcm_frame=lambda samples: None,
+                on_control_event=lambda _event: (_ for _ in ()).throw(boom),
+                on_error=errors.append,
+                winrt=env.build_winrt_modules(),
+                loop=asyncio.get_event_loop(),
+            )
+            candidate = identity.RC003Candidate(
+                name=env.name, hardware_match=False, handle=env.discovered_info
+            )
+            await session.connect(candidate)
+            env.control_characteristic.fire(_caps_payload(frame_size=2))
+            self.assertTrue(_wait_until(lambda: errors))
+            self.assertIs(errors[0], boom)
+            self.assertTrue(session._worker_stop.is_set())
+            await session.close()
+
+        _run(scenario())
+
+    def test_pcm_callback_failure_reports_error_and_stops_worker(self):
+        env = FakeWinRTEnvironment()
+        errors = []
+        boom = RuntimeError("simulated PCM callback failure")
+
+        async def scenario():
+            session = RC003BleSession(
+                on_pcm_frame=lambda _samples: (_ for _ in ()).throw(boom),
+                on_error=errors.append,
+                winrt=env.build_winrt_modules(),
+                loop=asyncio.get_event_loop(),
+            )
+            candidate = identity.RC003Candidate(
+                name=env.name, hardware_match=False, handle=env.discovered_info
+            )
+            await session.connect(candidate)
+            env.control_characteristic.fire(_caps_payload(frame_size=2))
+            env.control_characteristic.fire(
+                bytes((proto.OPCODE_AUDIO_START, 0, 0, 1))
+            )
+            env.audio_characteristic.fire(bytes((0x00, 0x00)))
+            self.assertTrue(_wait_until(lambda: errors))
+            self.assertIs(errors[0], boom)
+            self.assertTrue(session._worker_stop.is_set())
+            await session.close()
+
+        _run(scenario())
 
     def test_disconnect_callback_fires_on_status_change(self):
         env = FakeWinRTEnvironment()
@@ -750,6 +852,61 @@ class CloseTests(unittest.TestCase):
         self.assertEqual(len(env.audio_characteristic._handlers), 0)
         self.assertEqual(len(env.control_characteristic._handlers), 0)
         self.assertEqual(len(env.device._connection_status_handlers), 0)
+
+    def test_service_close_failure_retains_owner_for_retry(self):
+        env = FakeWinRTEnvironment()
+
+        async def scenario():
+            session = RC003BleSession(
+                on_pcm_frame=lambda samples: None,
+                winrt=env.build_winrt_modules(),
+                loop=asyncio.get_event_loop(),
+            )
+            candidate = identity.RC003Candidate(
+                name=env.name, hardware_match=False, handle=env.discovered_info
+            )
+            await session.connect(candidate)
+            original_close = env.service.close
+            env.service.close = lambda: (_ for _ in ()).throw(
+                RuntimeError("simulated service close failure")
+            )
+            with self.assertRaises(RuntimeError):
+                await session.close()
+            self.assertIs(session._service, env.service)
+            self.assertIs(session._audio_characteristic, env.audio_characteristic)
+
+            env.service.close = original_close
+            await session.close()
+            self.assertIsNone(session._service)
+
+        _run(scenario())
+
+    def test_device_close_failure_retains_owner_for_retry(self):
+        env = FakeWinRTEnvironment()
+
+        async def scenario():
+            session = RC003BleSession(
+                on_pcm_frame=lambda samples: None,
+                winrt=env.build_winrt_modules(),
+                loop=asyncio.get_event_loop(),
+            )
+            candidate = identity.RC003Candidate(
+                name=env.name, hardware_match=False, handle=env.discovered_info
+            )
+            await session.connect(candidate)
+            original_close = env.device.close
+            env.device.close = lambda: (_ for _ in ()).throw(
+                RuntimeError("simulated device close failure")
+            )
+            with self.assertRaises(RuntimeError):
+                await session.close()
+            self.assertIs(session._device, env.device)
+
+            env.device.close = original_close
+            await session.close()
+            self.assertIsNone(session._device)
+
+        _run(scenario())
 
     def test_close_sends_mic_close_if_a_mic_session_was_open(self):
         env = FakeWinRTEnvironment()

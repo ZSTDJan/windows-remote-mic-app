@@ -348,6 +348,37 @@ class HostHotkeyFailureSuppressesMicOpenTests(_AppWiringTestCase):
         self.assertEqual(self.app._ble_session.mic_open_calls, 0)
         self.assertFalse(self.app._voice.active)
 
+    def test_incomplete_hotkey_rollback_is_retained_for_a_later_safety_release(self):
+        original = win32_input.send_voice_key_combo_tap
+        win32_input.send_voice_key_combo_tap = lambda tokens: (_ for _ in ()).throw(
+            win32_input.InputCleanupIncompleteError("simulated stuck modifier")
+        )
+        try:
+            self.app._handle_mic_button_pressed()
+        finally:
+            win32_input.send_voice_key_combo_tap = original
+
+        self.assertEqual(self.app._ble_session.mic_open_calls, 0)
+        self.assertFalse(self.app._voice.active)
+        self.assertEqual(
+            self.app._voice_hotkey_release_pending,
+            ("ralt", "space"),
+        )
+
+    def test_safety_release_uses_the_original_shortcut_after_settings_change(self):
+        self.app._voice_hotkey_release_pending = ("ralt", "space")
+        self.app._voice_hotkey = app_module.hotkey.HotkeySpec.parse("lctrl+l")
+        calls = []
+
+        original = win32_input.send_voice_key_combo_up
+        win32_input.send_voice_key_combo_up = lambda tokens: calls.append(tokens)
+        try:
+            self.assertTrue(self.app._release_pending_voice_hotkey())
+        finally:
+            win32_input.send_voice_key_combo_up = original
+
+        self.assertEqual(calls, [("ralt", "space")])
+
     def test_hotkey_success_sends_mic_open(self):
         original = win32_input.send_voice_key_combo_tap
         win32_input.send_voice_key_combo_tap = lambda tokens: None
@@ -449,6 +480,46 @@ class HostHotkeyFailureSuppressesMicOpenTests(_AppWiringTestCase):
 
         self.assertEqual(calls, [("down", ("ralt",)), ("up", ("ralt",))])
         self.assertTrue(self.app._voice_legacy_transform_emitted)
+
+    def test_transformed_f5_down_incomplete_cleanup_retains_safety_release(self):
+        self.app._voice.trigger_mode = key_mapping.VoiceTriggerMode.HOLD
+        self.app._voice_hotkey = app_module.hotkey.HotkeySpec.parse("ralt")
+        target = app_module.legacy_key_suppressor_windows.PhysicalKeyTarget(
+            0xA5, 0x38, True, True
+        )
+        original = win32_input.send_voice_key_combo_down
+        win32_input.send_voice_key_combo_down = lambda _tokens: (
+            (_ for _ in ()).throw(
+                win32_input.InputCleanupIncompleteError("simulated stuck right Alt")
+            )
+        )
+        try:
+            self.assertFalse(self.app._emit_legacy_voice_key(target, True))
+        finally:
+            win32_input.send_voice_key_combo_down = original
+
+        self.assertEqual(self.app._voice_hotkey_release_pending, ("ralt",))
+        self.assertFalse(self.app._voice_legacy_transform_emitted)
+
+    def test_transformed_f5_up_incomplete_cleanup_retains_safety_release(self):
+        self.app._voice.trigger_mode = key_mapping.VoiceTriggerMode.HOLD
+        self.app._voice_hotkey = app_module.hotkey.HotkeySpec.parse("ralt")
+        target = app_module.legacy_key_suppressor_windows.PhysicalKeyTarget(
+            0xA5, 0x38, True, True
+        )
+        original = win32_input.send_voice_key_combo_up
+        win32_input.send_voice_key_combo_up = lambda _tokens: (
+            (_ for _ in ()).throw(
+                win32_input.InputCleanupIncompleteError("simulated stuck right Alt")
+            )
+        )
+        try:
+            self.assertFalse(self.app._emit_legacy_voice_key(target, False))
+        finally:
+            win32_input.send_voice_key_combo_up = original
+
+        self.assertEqual(self.app._voice_hotkey_release_pending, ("ralt",))
+        self.assertFalse(self.app._voice_legacy_transform_emitted)
 
     def test_hold_audio_start_waits_for_f5_instead_of_injecting_ahead_of_it(self):
         self.app._voice.trigger_mode = key_mapping.VoiceTriggerMode.HOLD
@@ -711,6 +782,25 @@ class HostHotkeyFailureSuppressesMicOpenTests(_AppWiringTestCase):
         self.assertFalse(self.app._voice.active)
         self.assertEqual(self.app._ble_session.mic_close_calls, 1)
 
+    def test_toggle_close_transport_failure_reconnects_without_repeating_host_tap(self):
+        self.app._voice.on_mic_button_pressed()
+        hotkey_calls = []
+        reconnect_calls = []
+        self.app._supervisor.request_reconnect = lambda: reconnect_calls.append(1)
+        original = win32_input.send_voice_key_combo_tap
+        win32_input.send_voice_key_combo_tap = lambda tokens: hotkey_calls.append(tokens)
+        try:
+            self.app._handle_mic_button_pressed()
+            self.app._on_session_error(ConnectionError("MIC_CLOSE failed"))
+        finally:
+            win32_input.send_voice_key_combo_tap = original
+
+        self.assertEqual(hotkey_calls, [("ralt", "space")])
+        self.assertFalse(self.app._voice.active)
+        self.assertTrue(self.app._voice_toggle_close_pending)
+        self.assertEqual(self.app._ble_session.mic_close_calls, 1)
+        self.assertEqual(reconnect_calls, [1])
+
     def test_toggle_second_press_closes_and_racing_audio_does_not_reopen(self):
         hotkey_calls = []
         original = win32_input.send_voice_key_combo_tap
@@ -873,6 +963,55 @@ class OrdinaryButtonGestureWiringTests(_AppWiringTestCase):
                 win32_input.send_arrow_up = original
 
         self.assertEqual(calls, ["arrow_up"])
+
+    def test_incomplete_button_rollback_is_released_before_the_next_action(self):
+        original_up = win32_input.send_arrow_up
+        original_down = win32_input.send_arrow_down
+        original_release = win32_input.send_key_combo_up
+        releases = []
+        actions = []
+        win32_input.send_arrow_up = lambda: (_ for _ in ()).throw(
+            win32_input.InputCleanupIncompleteError("simulated stuck arrow key")
+        )
+        win32_input.send_arrow_down = lambda: actions.append("arrow_down")
+        win32_input.send_key_combo_up = lambda keys: releases.append(tuple(keys))
+        try:
+            self.app._apply_button_action(
+                key_mapping.ButtonAction(key_mapping.ActionKind.ARROW_UP)
+            )
+            self.assertEqual(self.app._button_key_release_pending, ("up",))
+
+            self.app._apply_button_action(
+                key_mapping.ButtonAction(key_mapping.ActionKind.ARROW_DOWN)
+            )
+        finally:
+            win32_input.send_arrow_up = original_up
+            win32_input.send_arrow_down = original_down
+            win32_input.send_key_combo_up = original_release
+
+        self.assertEqual(releases, [("up",)])
+        self.assertEqual(actions, ["arrow_down"])
+        self.assertIsNone(self.app._button_key_release_pending)
+
+    def test_pending_button_release_blocks_new_actions_when_retry_is_incomplete(self):
+        original_down = win32_input.send_arrow_down
+        original_release = win32_input.send_key_combo_up
+        actions = []
+        self.app._button_key_release_pending = ("ctrl", "l")
+        win32_input.send_arrow_down = lambda: actions.append("arrow_down")
+        win32_input.send_key_combo_up = lambda _keys: (_ for _ in ()).throw(
+            win32_input.InputCleanupIncompleteError("still stuck")
+        )
+        try:
+            self.app._apply_button_action(
+                key_mapping.ButtonAction(key_mapping.ActionKind.ARROW_DOWN)
+            )
+        finally:
+            win32_input.send_arrow_down = original_down
+            win32_input.send_key_combo_up = original_release
+
+        self.assertEqual(actions, [])
+        self.assertEqual(self.app._button_key_release_pending, ("ctrl", "l"))
 
     def test_open_app_action_uses_application_executor(self):
         calls = []
@@ -1068,6 +1207,34 @@ class CleanupOwnershipTests(_AppWiringTestCase):
         self.assertIsNone(self.app._ble_session)
         self.assertIsNone(self.app._playback)
 
+    def test_cleanup_releases_and_clears_pending_ordinary_button_keys(self):
+        original = win32_input.send_key_combo_up
+        released = []
+        self.app._button_key_release_pending = ("ctrl", "l")
+        win32_input.send_key_combo_up = lambda keys: released.append(tuple(keys))
+        try:
+            _run(self.app._cleanup_once())
+        finally:
+            win32_input.send_key_combo_up = original
+
+        self.assertEqual(released, [("ctrl", "l")])
+        self.assertIsNone(self.app._button_key_release_pending)
+
+    def test_cleanup_retains_incomplete_ordinary_button_release(self):
+        original = win32_input.send_key_combo_up
+        self.app._button_key_release_pending = ("ctrl", "l")
+        win32_input.send_key_combo_up = lambda _keys: (_ for _ in ()).throw(
+            win32_input.InputCleanupIncompleteError("still stuck")
+        )
+        try:
+            with self.assertRaises(app_module.CleanupIncompleteError) as ctx:
+                _run(self.app._cleanup_once())
+        finally:
+            win32_input.send_key_combo_up = original
+
+        self.assertIn("ordinary button key", str(ctx.exception))
+        self.assertEqual(self.app._button_key_release_pending, ("ctrl", "l"))
+
     def test_hid_stop_failure_retains_hid_owner_but_still_completes_ble_and_playback(self):
         hid = _FakeHidListener(stop_raises=True)
         ble = _FakeBleSession()
@@ -1236,6 +1403,60 @@ class StartHidListenerOwnershipTests(_AppWiringTestCase):
         self.assertIsNone(self.app._hid_listener)
         self.assertEqual(fake_listener.start_calls, 1)
 
+    def test_legacy_guard_failed_start_retains_live_owner_and_raises(self):
+        class StartedListener:
+            is_running = True
+
+            def set_physical_bindings(self, _bindings):
+                pass
+
+            def set_raw_event_callback(self, _callback):
+                pass
+
+            def start(self, _device_path):
+                pass
+
+            def stop(self):
+                pass
+
+        class StuckSuppressor:
+            is_running = True
+
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            def start(self):
+                raise app_module.legacy_key_suppressor_windows.LegacyKeySuppressorUnavailableError(
+                    "simulated failed start"
+                )
+
+            def stop(self):
+                pass
+
+        with mock.patch.object(
+            app_module.raw_input_windows,
+            "enumerate_matching_device_paths",
+            return_value=["fake-path"],
+        ), mock.patch.object(
+            app_module.hid_identity,
+            "select_single_device_path",
+            return_value="fake-path",
+        ), mock.patch.object(
+            app_module.raw_input_windows,
+            "RawInputButtonListener",
+            return_value=StartedListener(),
+        ), mock.patch.object(
+            app_module.legacy_key_suppressor_windows,
+            "LegacyKeySuppressor",
+            StuckSuppressor,
+        ):
+            with self.assertRaises(
+                app_module.legacy_key_suppressor_windows.LegacyKeySuppressorUnavailableError
+            ):
+                self.app._start_hid_listener()
+
+        self.assertIsInstance(self.app._legacy_key_suppressor, StuckSuppressor)
+
 
 class HidTapStartupStateTests(_AppWiringTestCase):
     def test_thread_start_is_logged_separately_from_verified_ready(self):
@@ -1263,6 +1484,29 @@ class HidTapStartupStateTests(_AppWiringTestCase):
         self.assertIn("tap thread started; state=starting", text)
         self.assertNotIn("tap enabled", text)
         self.assertIn("tap state: ready detail=hid_io_verified", text)
+
+    def test_failed_start_cleanup_retains_tap_owner_and_raises(self):
+        instances = []
+
+        class StuckTap:
+            status = "starting"
+
+            def __init__(self, _report_handler, *, status_handler):
+                instances.append(self)
+
+            def start(self):
+                raise RuntimeError("start failed")
+
+            def stop(self):
+                raise RuntimeError("stop failed")
+
+        with mock.patch.object(
+            app_module.frida_compat, "RC003HidReportTap", StuckTap
+        ):
+            with self.assertRaises(RuntimeError):
+                self.app._start_hid_report_tap()
+
+        self.assertIs(self.app._hid_report_tap, instances[0])
 
 
 class VoiceCleanupFailurePreservesPendingStateTests(_AppWiringTestCase):
@@ -1388,6 +1632,48 @@ class PlaybackCleanupOwnershipTests(_AppWiringTestCase):
         self.assertIs(self.app._playback, sink)
         self.assertEqual(sink.close_calls, 1)
         # Still fails closed via reconnect either way:
+        self.assertEqual(reconnect_calls, [1])
+
+    def test_open_failure_with_unclean_stream_retains_owner_and_reconnects(self):
+        instances = []
+
+        class FailedOpenSink:
+            owns_stream = True
+            ready = False
+
+            def __init__(self, _name, _host_api):
+                instances.append(self)
+
+            def open(self):
+                raise app_module.audio_output.AudioOutputUnavailableError(
+                    "simulated open failure"
+                )
+
+        self.app._playback = None
+        self.app._config["output_endpoint_name"] = "CABLE Input"
+        self.app._config["output_endpoint_host_api"] = "Windows WASAPI"
+        reconnect_calls = []
+        self.app._supervisor.request_reconnect = lambda: reconnect_calls.append(1)
+        endpoint = app_module.audio_output.AudioEndpoint(
+            name="CABLE Input", host_api="Windows WASAPI"
+        )
+
+        with mock.patch.object(
+            app_module.audio_output,
+            "enumerate_output_endpoints",
+            return_value=[endpoint],
+        ), mock.patch.object(
+            app_module.audio_output,
+            "resolve_selected_endpoint",
+            return_value=endpoint,
+        ), mock.patch.object(
+            app_module.audio_playback,
+            "EndpointPlaybackSink",
+            FailedOpenSink,
+        ):
+            self.assertFalse(self.app._open_playback_for_new_session())
+
+        self.assertIs(self.app._playback, instances[0])
         self.assertEqual(reconnect_calls, [1])
 
 

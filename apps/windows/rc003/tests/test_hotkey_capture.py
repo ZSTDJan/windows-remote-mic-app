@@ -1,3 +1,4 @@
+import threading
 import unittest
 
 from ovb_rc003 import hotkey_capture_windows, win32_keys
@@ -59,7 +60,12 @@ class HotkeyCaptureStateTests(unittest.TestCase):
         self.assertEqual(captured, [])
         recorder._handle_event(
             hotkey_capture_windows.WM_KEYUP,
-            self._event(0x5B, 0x5B, hotkey_capture_windows.LLKHF_EXTENDED | hotkey_capture_windows.LLKHF_UP),
+            self._event(
+                0x5B,
+                0x5B,
+                hotkey_capture_windows.LLKHF_EXTENDED
+                | hotkey_capture_windows.LLKHF_UP,
+            ),
         )
         self.assertEqual(captured, [])
         recorder._handle_event(
@@ -78,6 +84,44 @@ class HotkeyCaptureStateTests(unittest.TestCase):
             )
         )
         self.assertEqual(captured, [])
+
+
+class HotkeyCaptureLifecycleTests(unittest.TestCase):
+    def test_start_timeout_retains_a_thread_that_did_not_stop(self):
+        recorder = hotkey_capture_windows.HotkeyCapture(lambda _chord: None)
+        release = threading.Event()
+
+        def fake_run():
+            release.wait()
+
+        try:
+            with self.assertRaises(
+                hotkey_capture_windows.HotkeyCaptureUnavailableError
+            ):
+                recorder.start(start_timeout=0.01, _run_target=fake_run)
+            self.assertTrue(recorder.is_running)
+        finally:
+            release.set()
+            recorder.stop()
+
+    def test_start_error_retains_a_thread_until_it_really_exits(self):
+        recorder = hotkey_capture_windows.HotkeyCapture(lambda _chord: None)
+        release = threading.Event()
+
+        def fake_run():
+            recorder._start_error = RuntimeError("simulated startup error")
+            recorder._ready_event.set()
+            release.wait()
+
+        try:
+            with self.assertRaises(
+                hotkey_capture_windows.HotkeyCaptureUnavailableError
+            ):
+                recorder.start(_run_target=fake_run)
+            self.assertTrue(recorder.is_running)
+        finally:
+            release.set()
+            recorder.stop()
 
 
 if __name__ == "__main__":

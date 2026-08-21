@@ -9,7 +9,7 @@ this mirrors for the actual PortAudio device-index lookup used at
 import unittest
 from unittest import mock
 
-from ovb_rc003 import audio_output
+from ovb_rc003 import audio_output, audio_playback
 from ovb_rc003.audio_playback import EndpointPlaybackSink
 
 
@@ -195,6 +195,14 @@ class SelectOutputSampleRateTests(unittest.TestCase):
 
 
 class PlaybackPreflightTests(unittest.TestCase):
+    def tearDown(self):
+        retained = audio_playback._retained_preflight_sink
+        if retained is not None:
+            stream = retained._stream
+            if stream is not None and hasattr(stream, "fail_close"):
+                stream.fail_close = False
+            audio_playback.cleanup_retained_preflight_sink()
+
     def _fake_module(self, stream_type):
         import types
 
@@ -251,6 +259,66 @@ class PlaybackPreflightTests(unittest.TestCase):
                 preflight_output_endpoint("CABLE Input", "Windows WASAPI")
         self.assertEqual(events, ["open", "close"])
         self.assertNotIn("private endpoint detail", str(ctx.exception))
+
+    def test_start_and_close_failure_retains_stream_for_cleanup_retry(self):
+        import sys
+
+        class Stream:
+            def __init__(self, **_kwargs):
+                self.close_calls = 0
+
+            def start(self):
+                raise RuntimeError("start failed")
+
+            def stop(self):
+                pass
+
+            def close(self):
+                self.close_calls += 1
+                raise RuntimeError("close failed")
+
+        sink = EndpointPlaybackSink("CABLE Input", "Windows WASAPI")
+        with mock.patch.dict(sys.modules, {"sounddevice": self._fake_module(Stream)}):
+            with self.assertRaises(audio_output.AudioOutputUnavailableError):
+                sink.open()
+
+        self.assertTrue(sink.owns_stream)
+        self.assertFalse(sink.ready)
+        self.assertEqual(sink._stream.close_calls, 1)
+
+    def test_preflight_close_failure_retains_owner_until_a_retry_succeeds(self):
+        import sys
+
+        instances = []
+
+        class Stream:
+            def __init__(self, **_kwargs):
+                self.fail_close = True
+                self.close_calls = 0
+                instances.append(self)
+
+            def start(self):
+                pass
+
+            def stop(self):
+                pass
+
+            def close(self):
+                self.close_calls += 1
+                if self.fail_close:
+                    raise RuntimeError("close failed")
+
+        with mock.patch.dict(sys.modules, {"sounddevice": self._fake_module(Stream)}):
+            with self.assertRaises(audio_playback.PreflightCleanupIncompleteError):
+                audio_playback.preflight_output_endpoint(
+                    "CABLE Input", "Windows WASAPI"
+                )
+
+        self.assertIsNotNone(audio_playback._retained_preflight_sink)
+        self.assertTrue(audio_playback._retained_preflight_sink.owns_stream)
+        instances[0].fail_close = False
+        audio_playback.cleanup_retained_preflight_sink()
+        self.assertIsNone(audio_playback._retained_preflight_sink)
 
 
 class PlaybackCloseOwnershipTests(unittest.TestCase):

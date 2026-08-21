@@ -204,6 +204,7 @@ class ButtonGestureDispatcher:
         self._long_timers: Dict[str, object] = {}
         self._repeat_timers: Dict[str, object] = {}
         self._held_immediate_buttons: Set[str] = set()
+        self._generation = 0
 
     def press(self, button_id: str) -> None:
         callbacks: List[ButtonTrigger] = []
@@ -230,7 +231,7 @@ class ButtonGestureDispatcher:
                     recognizes_long_press=recognizes_long,
                 )
                 callbacks.extend(self._execute_commands_locked(commands))
-        self._emit(button_id, callbacks)
+            self._emit(button_id, callbacks)
 
     def release(self, button_id: str) -> None:
         with self._lock:
@@ -238,10 +239,11 @@ class ButtonGestureDispatcher:
             self._cancel_timer_locked(self._repeat_timers, button_id)
             commands = self._recognizer.release(button_id)
             callbacks = self._execute_commands_locked(commands)
-        self._emit_many(commands, callbacks)
+            self._emit_many(commands, callbacks)
 
     def reset(self) -> None:
         with self._lock:
+            self._generation += 1
             for timers in (
                 self._double_timers,
                 self._long_timers,
@@ -274,7 +276,9 @@ class ButtonGestureDispatcher:
         self._cancel_timer_locked(self._double_timers, button_id)
         timer = self._timer_factory(
             self.DOUBLE_CLICK_SECONDS,
-            lambda: self._double_click_timeout(button_id),
+            lambda generation=self._generation: self._double_click_timeout(
+                button_id, generation
+            ),
         )
         self._double_timers[button_id] = timer
         timer.start()
@@ -283,33 +287,46 @@ class ButtonGestureDispatcher:
         self._cancel_timer_locked(self._long_timers, button_id)
         timer = self._timer_factory(
             self.LONG_PRESS_SECONDS,
-            lambda: self._long_press_timeout(button_id),
+            lambda generation=self._generation: self._long_press_timeout(
+                button_id, generation
+            ),
         )
         self._long_timers[button_id] = timer
         timer.start()
 
     def _schedule_repeat_locked(self, button_id: str, delay: float) -> None:
         self._cancel_timer_locked(self._repeat_timers, button_id)
-        timer = self._timer_factory(delay, lambda: self._repeat_timeout(button_id))
+        timer = self._timer_factory(
+            delay,
+            lambda generation=self._generation: self._repeat_timeout(
+                button_id, generation
+            ),
+        )
         self._repeat_timers[button_id] = timer
         timer.start()
 
-    def _double_click_timeout(self, button_id: str) -> None:
+    def _double_click_timeout(self, button_id: str, generation: int) -> None:
         with self._lock:
+            if generation != self._generation:
+                return
             self._double_timers.pop(button_id, None)
             commands = self._recognizer.double_click_timed_out(button_id)
             callbacks = self._execute_commands_locked(commands)
-        self._emit_many(commands, callbacks)
+            self._emit_many(commands, callbacks)
 
-    def _long_press_timeout(self, button_id: str) -> None:
+    def _long_press_timeout(self, button_id: str, generation: int) -> None:
         with self._lock:
+            if generation != self._generation:
+                return
             self._long_timers.pop(button_id, None)
             commands = self._recognizer.long_press_timed_out(button_id)
             callbacks = self._execute_commands_locked(commands)
-        self._emit_many(commands, callbacks)
+            self._emit_many(commands, callbacks)
 
-    def _repeat_timeout(self, button_id: str) -> None:
+    def _repeat_timeout(self, button_id: str, generation: int) -> None:
         with self._lock:
+            if generation != self._generation:
+                return
             if button_id not in self._held_immediate_buttons:
                 self._repeat_timers.pop(button_id, None)
                 return
@@ -320,7 +337,10 @@ class ButtonGestureDispatcher:
                 else self.REPEAT_INTERVAL_SECONDS
             )
             self._schedule_repeat_locked(button_id, interval)
-        self._on_trigger(button_id, ButtonTrigger.SINGLE_CLICK)
+            # Keep reset() mutually exclusive with callback entry. Once reset
+            # returns, no callback from an older connection generation can
+            # begin and synthesize a late host action.
+            self._on_trigger(button_id, ButtonTrigger.SINGLE_CLICK)
 
     def _emit(self, button_id: str, callbacks: List[ButtonTrigger]) -> None:
         for trigger in callbacks:

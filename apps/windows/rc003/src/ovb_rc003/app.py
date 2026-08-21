@@ -57,7 +57,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import threading
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 from . import (
     audio_output,
@@ -93,6 +93,24 @@ class CleanupIncompleteError(RuntimeError):
     """
 
 
+_BUTTON_ACTION_KEY_TOKENS = {
+    key_mapping.ActionKind.ESCAPE: ("escape",),
+    key_mapping.ActionKind.RETURN: ("enter",),
+    key_mapping.ActionKind.ARROW_UP: ("up",),
+    key_mapping.ActionKind.ARROW_DOWN: ("down",),
+    key_mapping.ActionKind.ARROW_LEFT: ("left",),
+    key_mapping.ActionKind.ARROW_RIGHT: ("right",),
+    key_mapping.ActionKind.DELETE_BACKWARD: ("backspace",),
+    key_mapping.ActionKind.SHOW_DESKTOP: ("win", "d"),
+    key_mapping.ActionKind.CONTEXT_MENU: ("apps",),
+    key_mapping.ActionKind.APP_SWITCHER: ("alt", "tab"),
+    key_mapping.ActionKind.SYSTEM_VOLUME_UP: ("volume_up",),
+    key_mapping.ActionKind.SYSTEM_VOLUME_DOWN: ("volume_down",),
+    key_mapping.ActionKind.SYSTEM_VOLUME_MUTE: ("volume_mute",),
+    key_mapping.ActionKind.PLAY_PAUSE: ("media_play_pause",),
+}
+
+
 def open_configured_application(action: key_mapping.ButtonAction) -> bool:
     """Application-action seam kept at the app boundary for testability."""
 
@@ -124,6 +142,8 @@ class RC003App:
         self._voice_audio_start_fallback_pending = False
         self._voice_audio_started_waiting_for_legacy_f5 = False
         self._voice_toggle_close_pending = False
+        self._voice_hotkey_release_pending: Optional[Tuple[str, ...]] = None
+        self._button_key_release_pending: Optional[Tuple[str, ...]] = None
         # Raw Input and the ATVV control channel arrive on different worker
         # threads. Serialize the voice state machine so one physical press
         # cannot race into two host shortcut deliveries.
@@ -301,6 +321,12 @@ class RC003App:
                         doubao_rpc.physicalizer_error() or doubao_rpc.physicalizer_status(),
                     )
         except legacy_key_suppressor_windows.LegacyKeySuppressorUnavailableError as exc:
+            if self._legacy_key_suppressor.is_running:
+                self._logger.exception(
+                    "startup: RC003 voice legacy-key guard failed to start but is "
+                    "still running; owner retained for cleanup to retry"
+                )
+                raise
             self._logger.warning("startup: RC003 voice legacy-key guard unavailable: %s", exc)
             self._legacy_key_suppressor = None
 
@@ -333,6 +359,8 @@ class RC003App:
                 tap.stop()
             except Exception:
                 self._logger.exception("startup: RC003 HID report tap cleanup failed")
+                self._hid_report_tap = tap
+                raise
 
     def _on_hid_tap_status(self, status: str, detail: str) -> None:
         message = "RC003 HID report tap state: %s"
@@ -459,6 +487,13 @@ class RC003App:
                 self._voice_audio_stream_active = False
                 self._voice_audio_stop_processed = False
                 self._finish_voice_mic_gesture()
+                if self._voice_hotkey_release_pending is not None:
+                    if self._release_pending_voice_hotkey():
+                        self._voice_hotkey_release_pending = None
+                    else:
+                        failures.append(
+                            "voice hotkey safety release did not fully deliver; state retained"
+                        )
                 reset_action = self._voice.reset()
                 if reset_action is not None and not self._apply_voice_action(reset_action):
                     # _apply_voice_action() already logged the specific failure.
@@ -475,6 +510,16 @@ class RC003App:
                 self._legacy_f5_is_down = False
         except Exception:
             self._logger.exception("cleanup: releasing the voice hotkey failed")
+            failures.append("voice hotkey cleanup failed; state retained")
+
+        if self._button_key_release_pending is not None:
+            if self._release_pending_button_keys():
+                self._button_key_release_pending = None
+            else:
+                failures.append(
+                    "ordinary button key safety release did not fully deliver; "
+                    "state retained"
+                )
 
         if self._hid_listener is not None:
             try:
@@ -599,6 +644,7 @@ class RC003App:
                 win32_input.send_voice_key_combo_down(("ralt",))
             else:
                 win32_input.send_voice_key_combo_up(("ralt",))
+                self._voice_hotkey_release_pending = None
             self._voice_legacy_transform_emitted = True
             self._logger.info(
                 "voice physical F5 replaced with one right-Alt edge via %s: %s",
@@ -606,6 +652,14 @@ class RC003App:
                 "down" if is_pressed else "up",
             )
             return True
+        except win32_input.InputCleanupIncompleteError:
+            self._voice_hotkey_release_pending = ("ralt",)
+            self._voice_legacy_transform_emitted = False
+            self._logger.exception(
+                "voice physical right-Alt replacement failed and safety "
+                "release remains pending"
+            )
+            return False
         except (win32_input.Win32InputUnavailableError, OSError):
             self._voice_legacy_transform_emitted = False
             if is_pressed:
@@ -1016,6 +1070,14 @@ class RC003App:
         self._apply_button_action(action)
 
     def _apply_button_action(self, action: key_mapping.ButtonAction) -> None:
+        if self._button_key_release_pending is not None:
+            if not self._release_pending_button_keys():
+                self._logger.info(
+                    "button action suppressed: an earlier key release is still pending"
+                )
+                return
+            self._button_key_release_pending = None
+
         try:
             if action.kind == key_mapping.ActionKind.DISABLED:
                 return
@@ -1058,8 +1120,45 @@ class RC003App:
             # (_on_control_event), never dispatched from a HID button event.
         except win32_input.Win32InputUnavailableError:
             self._logger.info("button action skipped: SendInput unavailable here")
+        except win32_input.InputCleanupIncompleteError:
+            tokens = self._button_action_key_tokens(action)
+            if tokens is not None:
+                self._button_key_release_pending = tokens
+            self._logger.exception(
+                "button action failed and safety key-up remains pending"
+            )
         except OSError:
             self._logger.exception("button action failed to fully deliver")
+
+    @staticmethod
+    def _button_action_key_tokens(
+        action: key_mapping.ButtonAction,
+    ) -> Optional[Tuple[str, ...]]:
+        if action.kind == key_mapping.ActionKind.KEY_COMBO:
+            return tuple(action.keys)
+        return _BUTTON_ACTION_KEY_TOKENS.get(action.kind)
+
+    def _release_pending_button_keys(self) -> bool:
+        tokens = self._button_key_release_pending
+        if tokens is None:
+            return True
+        try:
+            win32_input.send_key_combo_up(tokens)
+        except win32_input.InputCleanupIncompleteError:
+            self._logger.exception("button key safety release remains incomplete")
+            return False
+        except win32_input.Win32InputUnavailableError:
+            self._logger.info("button key safety release unavailable")
+            return False
+        except OSError:
+            # send_key_combo_up raises ordinary OSError only after its own
+            # per-key fallback confirmed every requested key-up.
+            self._logger.exception(
+                "button key safety release needed fallback but completed"
+            )
+        else:
+            self._logger.info("button key safety release completed")
+        return True
 
     # -- ATVV control-channel events (mic button + audio start/stop) ------
 
@@ -1241,6 +1340,14 @@ class RC003App:
             self._logger.info("voice ignored: BLE voice session is not connected")
             return
 
+        if self._voice_hotkey_release_pending is not None:
+            if not self._release_pending_voice_hotkey():
+                self._logger.info(
+                    "voice failing closed: an earlier hotkey release is still pending"
+                )
+                return
+            self._voice_hotkey_release_pending = None
+
         self._voice_audio_started_waiting_for_legacy_f5 = False
 
         is_toggle_close_request = (
@@ -1285,6 +1392,11 @@ class RC003App:
             return
 
         if is_toggle_close and self._ble_session is not None:
+            # The host closing TAP has already landed. A later asynchronous
+            # MIC_CLOSE write failure is a transport failure only: the BLE
+            # error callback requests cleanup/reconnect, but must never
+            # restore this logical toggle state or emit a second TAP, which
+            # could reopen the host voice UI.
             self._voice_toggle_close_pending = True
             self._logger.info("voice toggle closing: sending MIC_CLOSE")
             self._ble_session.send_mic_close_threadsafe()
@@ -1303,16 +1415,20 @@ class RC003App:
                 # or early stream stop can never leave Alt logically held.
                 try:
                     win32_input.send_voice_key_combo_up(("ralt",))
+                    self._voice_hotkey_release_pending = None
                     self._voice_legacy_transform_key_down = False
                     self._voice_legacy_transform_session = False
                     self._logger.info(
                         "voice released right-Alt replacement before physical F5 key-up"
                     )
                     return True
-                except (
-                    win32_input.Win32InputUnavailableError,
-                    OSError,
-                ):
+                except win32_input.InputCleanupIncompleteError:
+                    self._voice_hotkey_release_pending = ("ralt",)
+                    self._logger.exception(
+                        "voice right-Alt replacement release remains pending"
+                    )
+                    return False
+                except (win32_input.Win32InputUnavailableError, OSError):
                     self._logger.exception(
                         "voice right-Alt replacement release failed"
                     )
@@ -1329,25 +1445,56 @@ class RC003App:
                 win32_input.send_voice_key_combo_down(tokens)
             else:
                 win32_input.send_voice_key_combo_up(tokens)
+            if action in {
+                voice_controller.VoiceHostAction.TAP,
+                voice_controller.VoiceHostAction.KEY_UP,
+            }:
+                self._voice_hotkey_release_pending = None
             return True
         except win32_input.Win32InputUnavailableError:
             self._logger.info("voice hotkey action skipped: no usable voice input backend")
+            return False
+        except win32_input.InputCleanupIncompleteError:
+            self._voice_hotkey_release_pending = tokens
+            self._logger.exception(
+                "voice hotkey action failed and safety key-up remains pending"
+            )
             return False
         except OSError:
             self._logger.exception("voice hotkey action failed to fully deliver")
             return False
 
+    def _release_pending_voice_hotkey(self) -> bool:
+        tokens = self._voice_hotkey_release_pending
+        if tokens is None:
+            return True
+        try:
+            win32_input.send_voice_key_combo_up(tokens)
+        except (win32_input.Win32InputUnavailableError, OSError):
+            self._logger.exception("voice hotkey safety release failed")
+            return False
+        self._logger.info("voice hotkey safety release completed")
+        return True
+
     def _open_playback_for_new_session(self) -> bool:
         if self._playback is not None:
-            return True
+            if getattr(self._playback, "ready", True):
+                return True
+            self._logger.warning(
+                "voice playback cannot reopen while a failed stream remains owned; "
+                "requesting cleanup"
+            )
+            self._supervisor.request_reconnect()
+            return False
         endpoint_name = self._config.get("output_endpoint_name") or ""
         endpoint_host_api = self._config.get("output_endpoint_host_api") or ""
+        sink = None
         try:
             endpoints = audio_output.enumerate_output_endpoints()
             audio_output.resolve_selected_endpoint(endpoints, endpoint_name, endpoint_host_api)
             sink = audio_playback.EndpointPlaybackSink(endpoint_name, endpoint_host_api)
-            sink.open()
             self._playback = sink
+            sink.open()
             self._logger.info(
                 "voice playback opened: host_api=%s sample_rate=%s channels=%s",
                 endpoint_host_api or "unspecified",
@@ -1357,11 +1504,23 @@ class RC003App:
             return True
         except audio_output.AudioOutputUnavailableError as exc:
             self._logger.info("voice audio unavailable, failing closed: %s", exc)
-            self._playback = None
+            if sink is None or not sink.owns_stream:
+                self._playback = None
+            else:
+                self._logger.warning(
+                    "voice audio open cleanup incomplete; playback owner retained"
+                )
+                self._supervisor.request_reconnect()
             return False
         except Exception:
             self._logger.exception("voice audio failed to open, failing closed")
-            self._playback = None
+            if sink is None or not sink.owns_stream:
+                self._playback = None
+            else:
+                self._logger.warning(
+                    "voice audio open cleanup incomplete; playback owner retained"
+                )
+                self._supervisor.request_reconnect()
             return False
 
     def _on_pcm_frame(self, samples) -> None:
@@ -1466,9 +1625,16 @@ async def _run(
                 raise
             app._logger.info("notification area: graceful bridge exit requested")
     finally:
-        if tray is not None and not tray.stop():
-            app._logger.warning("notification area thread did not stop cleanly")
-        await app.stop()
+        try:
+            if tray is not None and not tray.stop():
+                app._logger.warning("notification area thread did not stop cleanly")
+        except Exception as exc:
+            app._logger.warning(
+                "notification area stop failed: error_type=%s",
+                type(exc).__name__,
+            )
+        finally:
+            await app.stop()
 
 
 def main() -> None:

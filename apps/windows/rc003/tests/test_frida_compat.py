@@ -1,4 +1,5 @@
 import hashlib
+import inspect
 import subprocess
 import tempfile
 import unittest
@@ -129,6 +130,39 @@ class ReportTapTests(unittest.TestCase):
             self.assertEqual(layer.status, "verified_not_started")
 
 
+class TcpClientIdentityTests(unittest.TestCase):
+    def test_resolves_the_unique_peer_endpoint_owner(self):
+        client = mock.Mock()
+        client.getpeername.return_value = ("127.0.0.1", 41000)
+        client.getsockname.return_value = ("127.0.0.1", 30684)
+        rows = (
+            frida_compat._TcpOwnerRow(41000, 30684, 2468),
+            frida_compat._TcpOwnerRow(30684, 41000, 1357),
+        )
+
+        self.assertEqual(
+            frida_compat.tcp_client_process_id(client, _rows=lambda: rows),
+            2468,
+        )
+
+    def test_rejects_non_loopback_or_ambiguous_owner(self):
+        client = mock.Mock()
+        client.getpeername.return_value = ("127.0.0.1", 41000)
+        client.getsockname.return_value = ("127.0.0.1", 30684)
+        rows = (
+            frida_compat._TcpOwnerRow(41000, 30684, 2468),
+            frida_compat._TcpOwnerRow(41000, 30684, 9999),
+        )
+        self.assertIsNone(
+            frida_compat.tcp_client_process_id(client, _rows=lambda: rows)
+        )
+
+        client.getpeername.return_value = ("192.0.2.1", 41000)
+        self.assertIsNone(
+            frida_compat.tcp_client_process_id(client, _rows=lambda: rows)
+        )
+
+
 class InjectorSubprocessTests(unittest.TestCase):
     def test_source_command_is_an_argument_array_with_hidden_flag(self):
         command = frida_compat.build_injector_command(
@@ -241,6 +275,7 @@ class TapStateTests(unittest.TestCase):
             lambda report_id, payload: reports.append((report_id, payload)),
             enabled=False,
             injector=lambda _pid: None,
+            client_pid_resolver=lambda _client: 2468,
             status_handler=lambda status, detail: statuses.append((status, detail)),
         )
 
@@ -299,6 +334,112 @@ class TapStateTests(unittest.TestCase):
                 (1, bytes.fromhex("f10000000000")),
                 (1, b"\x00" * 6),
             ],
+        )
+
+    def test_non_object_json_message_is_ignored_without_killing_the_tap(self):
+        statuses = []
+        tap = frida_compat.RC003HidReportTap(
+            lambda _report_id, _payload: None,
+            enabled=False,
+            injector=lambda _pid: None,
+            client_pid_resolver=lambda _client: 2468,
+            status_handler=lambda status, detail: statuses.append((status, detail)),
+        )
+
+        class FakeClient:
+            def settimeout(self, _timeout):
+                pass
+
+            def recv(self, _size):
+                tap.stop_event.set()
+                return b"[]\n"
+
+            def close(self):
+                pass
+
+        server = mock.MagicMock()
+        server.accept.return_value = (FakeClient(), ("127.0.0.1", 1))
+        with mock.patch.object(
+            frida_compat.frida_hid_tap_runtime,
+            "find_rc003_hidogatt_host_pid",
+            return_value=2468,
+        ), mock.patch.object(frida_compat.socket, "socket", return_value=server):
+            tap._run()
+
+        self.assertNotIn(
+            frida_compat.HidTapState.FAILED.value,
+            [status for status, _detail in statuses],
+        )
+
+    def test_oversized_unterminated_message_is_rejected_with_a_bounded_buffer(self):
+        statuses = []
+
+        def record_status(status, detail):
+            statuses.append((status, detail))
+            if detail == "gadget_message_too_large":
+                tap.stop_event.set()
+
+        tap = frida_compat.RC003HidReportTap(
+            lambda _report_id, _payload: None,
+            enabled=False,
+            injector=lambda _pid: None,
+            client_pid_resolver=lambda _client: 2468,
+            status_handler=record_status,
+        )
+
+        client = mock.MagicMock()
+        client.recv.return_value = b"x" * (frida_compat.HID_TAP_MAX_BUFFER_BYTES + 1)
+        server = mock.MagicMock()
+        server.accept.return_value = (client, ("127.0.0.1", 1))
+        with mock.patch.object(
+            frida_compat.frida_hid_tap_runtime,
+            "find_rc003_hidogatt_host_pid",
+            return_value=2468,
+        ), mock.patch.object(frida_compat.socket, "socket", return_value=server):
+            tap._run()
+
+        self.assertIn(
+            (
+                frida_compat.HidTapState.UNHEALTHY.value,
+                "gadget_message_too_large",
+            ),
+            statuses,
+        )
+
+    def test_unexpected_local_client_is_closed_before_any_message_is_read(self):
+        statuses = []
+
+        def record_status(status, detail):
+            statuses.append((status, detail))
+            if detail == "gadget_client_identity_mismatch":
+                tap.stop_event.set()
+
+        tap = frida_compat.RC003HidReportTap(
+            lambda _report_id, _payload: None,
+            enabled=False,
+            injector=lambda _pid: None,
+            client_pid_resolver=lambda _client: 9999,
+            status_handler=record_status,
+        )
+        client = mock.MagicMock()
+        server = mock.MagicMock()
+        server.accept.return_value = (client, ("127.0.0.1", 1))
+
+        with mock.patch.object(
+            frida_compat.frida_hid_tap_runtime,
+            "find_rc003_hidogatt_host_pid",
+            return_value=2468,
+        ), mock.patch.object(frida_compat.socket, "socket", return_value=server):
+            tap._run()
+
+        client.recv.assert_not_called()
+        client.close.assert_called_once()
+        self.assertIn(
+            (
+                frida_compat.HidTapState.UNHEALTHY.value,
+                "gadget_client_identity_mismatch",
+            ),
+            statuses,
         )
 
     def test_injection_failure_waits_for_a_new_host_pid_before_retrying(self):
@@ -393,6 +534,24 @@ class InjectorOrderingTests(unittest.TestCase):
                 frida_hid_tap_injector.inject_current_process(2468)
 
         target_name.assert_not_called()
+
+
+class InjectorCleanupSafetyTests(unittest.TestCase):
+    def test_remote_buffer_is_only_freed_after_thread_completion(self):
+        source = inspect.getsource(frida_hid_tap_injector.inject_library)
+
+        self.assertIn("remote_thread_completed = False", source)
+        self.assertIn("remote_thread_completed = True", source)
+        self.assertIn(
+            "if remote_path and (thread is None or remote_thread_completed):",
+            source,
+        )
+
+    def test_wait_timeout_and_failure_are_distinguished(self):
+        source = inspect.getsource(frida_hid_tap_injector.inject_library)
+
+        self.assertIn("wait_result == WAIT_TIMEOUT", source)
+        self.assertIn("wait_result == WAIT_FAILED", source)
 
 
 if __name__ == "__main__":

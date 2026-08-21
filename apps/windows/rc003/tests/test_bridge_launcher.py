@@ -211,8 +211,50 @@ class LaunchBridgeTests(unittest.TestCase):
 
         self.assertEqual(result.outcome, bridge_launcher.LaunchOutcome.LAUNCH_FAILED)
         self.assertIsNone(result.exit_code)
-        self.assertIn("WinError 2", result.error)
+        self.assertEqual(result.error, "OSError")
         self.assertEqual(self._sleep_calls, [])
+
+    def test_initial_poll_oserror_retains_created_process_as_status_unknown(self):
+        class PollFailureProcess:
+            pid = 9876
+
+            def poll(self):
+                raise OSError("simulated process status failure")
+
+        result = bridge_launcher.launch_bridge(
+            ["exe"],
+            _popen=lambda _command: PollFailureProcess(),
+            _sleep=self._fake_sleep,
+        )
+
+        self.assertEqual(result.outcome, bridge_launcher.LaunchOutcome.STATUS_UNKNOWN)
+        self.assertEqual(result.pid, 9876)
+        self.assertEqual(result.error, "OSError")
+        self.assertEqual(self._sleep_calls, [])
+
+    def test_later_poll_oserror_retains_created_process_as_status_unknown(self):
+        class LaterPollFailureProcess:
+            pid = 9877
+
+            def __init__(self):
+                self.calls = 0
+
+            def poll(self):
+                self.calls += 1
+                if self.calls == 1:
+                    return None
+                raise OSError("simulated process status failure")
+
+        result = bridge_launcher.launch_bridge(
+            ["exe"],
+            _popen=lambda _command: LaterPollFailureProcess(),
+            _sleep=self._fake_sleep,
+        )
+
+        self.assertEqual(result.outcome, bridge_launcher.LaunchOutcome.STATUS_UNKNOWN)
+        self.assertEqual(result.pid, 9877)
+        self.assertEqual(result.error, "OSError")
+        self.assertEqual(len(self._sleep_calls), 1)
 
     def test_process_exits_partway_through_the_grace_period(self):
         # Alive for the first two checks, then exits - proves the polling
@@ -273,7 +315,7 @@ class LaunchSettingsTests(unittest.TestCase):
         )
 
         self.assertFalse(result.started)
-        self.assertIn("missing settings executable", result.error)
+        self.assertEqual(result.error, "OSError")
 
 
 if __name__ == "__main__":

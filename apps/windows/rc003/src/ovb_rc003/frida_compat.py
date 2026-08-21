@@ -13,6 +13,7 @@ these three missing usages remain unavailable instead of being guessed.
 
 from __future__ import annotations
 
+import ctypes
 import hashlib
 import json
 import os
@@ -24,7 +25,8 @@ import subprocess
 import sys
 import threading
 import time
-from typing import Callable
+from ctypes import wintypes
+from typing import Callable, Iterable
 
 from . import frida_hid_tap_runtime
 from .device_profile import BUTTON_USAGE_IDS
@@ -93,6 +95,9 @@ TAP_USAGE_TO_KEY = {
 
 HID_TAP_INJECTOR_FLAG = "--rc003-hid-injector"
 HID_TAP_INJECTOR_TIMEOUT_SECONDS = 30.0
+HID_TAP_MAX_BUFFER_BYTES = 64 * 1024
+_ERROR_INSUFFICIENT_BUFFER = 122
+_TCP_TABLE_OWNER_PID_ALL = 5
 HID_TAP_INJECTOR_EXIT_DETAILS = {
     3: "injector_requires_administrator",
     4: "injector_validation_failed",
@@ -117,6 +122,123 @@ class HidTapState(str, Enum):
     UNHEALTHY = "unhealthy"
     FAILED = "failed"
     STOPPED = "stopped"
+
+
+@dataclass(frozen=True)
+class _TcpOwnerRow:
+    local_port: int
+    remote_port: int
+    owning_pid: int
+
+
+class _MibTcpRowOwnerPid(ctypes.Structure):
+    _fields_ = (
+        ("state", wintypes.DWORD),
+        ("local_address", wintypes.DWORD),
+        ("local_port", wintypes.DWORD),
+        ("remote_address", wintypes.DWORD),
+        ("remote_port", wintypes.DWORD),
+        ("owning_pid", wintypes.DWORD),
+    )
+
+
+def _tcp_owner_rows() -> tuple[_TcpOwnerRow, ...]:
+    """Read IPv4 TCP endpoint ownership without exposing endpoint values."""
+
+    if os.name != "nt":
+        raise OSError("TCP owner lookup is only available on Windows")
+    iphlpapi = ctypes.WinDLL("iphlpapi", use_last_error=True)
+    iphlpapi.GetExtendedTcpTable.argtypes = (
+        wintypes.LPVOID,
+        ctypes.POINTER(wintypes.ULONG),
+        wintypes.BOOL,
+        wintypes.ULONG,
+        ctypes.c_int,
+        wintypes.ULONG,
+    )
+    iphlpapi.GetExtendedTcpTable.restype = wintypes.DWORD
+
+    size = wintypes.ULONG(0)
+    result = int(
+        iphlpapi.GetExtendedTcpTable(
+            None,
+            ctypes.byref(size),
+            False,
+            socket.AF_INET,
+            _TCP_TABLE_OWNER_PID_ALL,
+            0,
+        )
+    )
+    if result not in {0, _ERROR_INSUFFICIENT_BUFFER} or size.value < 4:
+        raise OSError("GetExtendedTcpTable size query failed")
+
+    buffer = ctypes.create_string_buffer(size.value)
+    result = int(
+        iphlpapi.GetExtendedTcpTable(
+            buffer,
+            ctypes.byref(size),
+            False,
+            socket.AF_INET,
+            _TCP_TABLE_OWNER_PID_ALL,
+            0,
+        )
+    )
+    if result != 0:
+        raise OSError("GetExtendedTcpTable failed")
+
+    count = int(ctypes.cast(buffer, ctypes.POINTER(wintypes.DWORD)).contents.value)
+    row_size = ctypes.sizeof(_MibTcpRowOwnerPid)
+    required_size = ctypes.sizeof(wintypes.DWORD) + count * row_size
+    if required_size > size.value:
+        raise OSError("GetExtendedTcpTable returned a truncated table")
+
+    rows = []
+    offset = ctypes.sizeof(wintypes.DWORD)
+    for index in range(count):
+        row = _MibTcpRowOwnerPid.from_buffer_copy(
+            buffer,
+            offset + index * row_size,
+        )
+        rows.append(
+            _TcpOwnerRow(
+                local_port=socket.ntohs(int(row.local_port) & 0xFFFF),
+                remote_port=socket.ntohs(int(row.remote_port) & 0xFFFF),
+                owning_pid=int(row.owning_pid),
+            )
+        )
+    return tuple(rows)
+
+
+def tcp_client_process_id(
+    client: socket.socket,
+    *,
+    _rows: Callable[[], Iterable[_TcpOwnerRow]] = _tcp_owner_rows,
+) -> int | None:
+    """Resolve the process owning the accepted side's peer TCP endpoint."""
+
+    peer = client.getpeername()
+    local = client.getsockname()
+    if (
+        not isinstance(peer, tuple)
+        or not isinstance(local, tuple)
+        or len(peer) < 2
+        or len(local) < 2
+        or peer[0] != "127.0.0.1"
+        or local[0] != "127.0.0.1"
+    ):
+        return None
+    peer_port = int(peer[1])
+    local_port = int(local[1])
+    owners = {
+        row.owning_pid
+        for row in _rows()
+        if row.local_port == peer_port
+        and row.remote_port == local_port
+        and row.owning_pid > 0
+    }
+    if len(owners) != 1:
+        return None
+    return owners.pop()
 
 
 def build_injector_command(
@@ -213,6 +335,7 @@ class RC003HidReportTap:
         heartbeat_timeout: float = 15.0,
         status_handler: Callable[[str, str], None] | None = None,
         injector: Callable[[int], None] = run_injector_subprocess,
+        client_pid_resolver: Callable[[socket.socket], int | None] = tcp_client_process_id,
     ) -> None:
         self.report_handler = report_handler
         self.archive_path = archive_path or gadget_archive_path()
@@ -221,6 +344,7 @@ class RC003HidReportTap:
         self.heartbeat_timeout = max(10.0, float(heartbeat_timeout))
         self.status_handler = status_handler or (lambda _status, _detail: None)
         self.injector = injector
+        self.client_pid_resolver = client_pid_resolver
         self.stop_event = threading.Event()
         self.thread: threading.Thread | None = None
         self.active_usages: set[int] = set()
@@ -345,6 +469,20 @@ class RC003HidReportTap:
                     client, _address = server.accept()
                 except socket.timeout:
                     continue
+                try:
+                    client_pid = self.client_pid_resolver(client)
+                except Exception:  # noqa: BLE001 - fail closed on identity lookup
+                    client_pid = None
+                    identity_detail = "gadget_client_identity_unavailable"
+                else:
+                    identity_detail = "gadget_client_identity_mismatch"
+                if client_pid != pid:
+                    self._set_status(HidTapState.UNHEALTHY, identity_detail)
+                    try:
+                        client.close()
+                    except OSError:
+                        pass
+                    continue
                 client.settimeout(1.0)
                 try:
                     self._set_status(HidTapState.ATTACHED_WAITING_IO)
@@ -368,6 +506,12 @@ class RC003HidReportTap:
                                 )
                             break
                         if chunk:
+                            if len(buffer) + len(chunk) > HID_TAP_MAX_BUFFER_BYTES:
+                                self._set_status(
+                                    HidTapState.UNHEALTHY,
+                                    "gadget_message_too_large",
+                                )
+                                break
                             buffer += chunk
                             fatal_message = False
                             while b"\n" in buffer:
@@ -375,6 +519,8 @@ class RC003HidReportTap:
                                 try:
                                     message = json.loads(line.decode("utf-8"))
                                 except (UnicodeDecodeError, json.JSONDecodeError):
+                                    continue
+                                if not isinstance(message, dict):
                                     continue
                                 kind = message.get("kind")
                                 if kind == "ready":

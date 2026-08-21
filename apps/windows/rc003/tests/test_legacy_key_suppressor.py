@@ -170,6 +170,17 @@ class LegacyKeySuppressorRaceTests(unittest.TestCase):
 
 
 class LegacyKeySuppressorLifecycleTests(unittest.TestCase):
+    def test_real_hook_creates_its_message_queue_before_reporting_ready(self):
+        import inspect
+
+        source = inspect.getsource(suppressor.LegacyKeySuppressor._run)
+        self.assertIn("PeekMessageW.argtypes", source)
+        self.assertIn("PeekMessageW.restype", source)
+        self.assertLess(
+            source.index("PeekMessageW(None"),
+            source.index("self._ready_event.set()"),
+        )
+
     def test_empty_suppressor_is_a_noop(self):
         gate = suppressor.LegacyKeySuppressor(set())
         gate.start(_run_target=lambda: None)
@@ -187,6 +198,42 @@ class LegacyKeySuppressorLifecycleTests(unittest.TestCase):
             gate.start(_run_target=fake_run)
             with self.assertRaises(suppressor.LegacyKeySuppressorUnavailableError):
                 gate.start(_run_target=fake_run)
+        finally:
+            release.set()
+            gate.stop()
+
+    def test_start_timeout_retains_a_thread_that_did_not_stop(self):
+        gate = suppressor.LegacyKeySuppressor({0x74})
+        release = threading.Event()
+
+        def fake_run():
+            release.wait()
+
+        try:
+            with self.assertRaises(suppressor.LegacyKeySuppressorUnavailableError):
+                gate.start(start_timeout=0.01, _run_target=fake_run)
+            self.assertTrue(gate.is_running)
+            with self.assertRaises(suppressor.LegacyKeySuppressorUnavailableError):
+                gate.start(start_timeout=0.01, _run_target=fake_run)
+        finally:
+            release.set()
+            gate.stop()
+
+    def test_start_error_retains_a_thread_until_it_really_exits(self):
+        gate = suppressor.LegacyKeySuppressor({0x74})
+        release = threading.Event()
+
+        def fake_run():
+            gate._start_error = suppressor.LegacyKeySuppressorUnavailableError(
+                "simulated startup error"
+            )
+            gate._ready_event.set()
+            release.wait()
+
+        try:
+            with self.assertRaises(suppressor.LegacyKeySuppressorUnavailableError):
+                gate.start(_run_target=fake_run)
+            self.assertTrue(gate.is_running)
         finally:
             release.set()
             gate.stop()

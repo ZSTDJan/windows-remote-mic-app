@@ -28,9 +28,12 @@ def event_to_record(
     sequence: int,
     *,
     timestamp_ns: Optional[int] = None,
-    include_device_path: bool = False,
 ) -> Dict[str, Any]:
-    """Convert one runtime event into a stable JSONL record."""
+    """Convert one runtime event into a privacy-safe JSONL record.
+
+    Device interface paths are deliberately never serializable here. They
+    are machine-local identifiers and are unnecessary for signature replay.
+    """
 
     record: Dict[str, Any] = {
         "schema_version": CAPTURE_SCHEMA_VERSION,
@@ -50,8 +53,6 @@ def event_to_record(
     }
     if event.decode_error:
         record["decode_error"] = event.decode_error
-    if include_device_path and event.device_path:
-        record["device_path"] = event.device_path
     return record
 
 
@@ -79,7 +80,7 @@ def record_to_event(record: Mapping[str, Any]) -> RawInputEvent:
             message=_optional_int(record.get("message")),
             report=report,
             usages=usages,
-            device_path=record.get("device_path"),
+            device_path=None,
             decode_error=record.get("decode_error"),
         )
     except (KeyError, TypeError, ValueError) as exc:
@@ -201,8 +202,7 @@ def evaluate_key_capture(
 class KeyCaptureRecorder:
     """Thread-safe raw-event recorder suitable for the settings UI/probe."""
 
-    def __init__(self, *, include_device_path: bool = False) -> None:
-        self._include_device_path = include_device_path
+    def __init__(self) -> None:
         self._lock = threading.Lock()
         self._records: List[Dict[str, Any]] = []
 
@@ -211,7 +211,6 @@ class KeyCaptureRecorder:
             record = event_to_record(
                 event,
                 len(self._records),
-                include_device_path=self._include_device_path,
             )
             self._records.append(record)
             return dict(record)

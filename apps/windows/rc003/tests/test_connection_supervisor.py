@@ -326,7 +326,18 @@ class RetryBackoffTests(unittest.TestCase):
                 await supervisor.run_forever()
 
         _run(scenario())
-        self.assertEqual(delays, [5.0, 10.0, 20.0, 5.0])
+        self.assertEqual(delays, [5.0, 10.0, 5.0, 5.0])
+
+    def test_reconnect_notification_after_loop_close_is_a_safe_noop(self):
+        loop = asyncio.new_event_loop()
+        supervisor = ConnectionSupervisor(
+            lambda: None,
+            lambda: None,
+            loop=loop,
+        )
+        loop.close()
+
+        supervisor.request_reconnect()
 
 
 if __name__ == "__main__":

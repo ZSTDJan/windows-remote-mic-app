@@ -104,6 +104,7 @@ ErrorCallback = Callable[[BaseException], None]
 DisconnectedCallback = Callable[[], None]
 
 _QUEUE_MAXSIZE = 64
+_CONTROL_QUEUE_MAXSIZE = 32
 _WORKER_POLL_SECONDS = 0.2
 _CANDIDATE_PROBE_TIMEOUT_SECONDS = 8.0
 _logger = logging.getLogger(__name__)
@@ -400,7 +401,13 @@ class RC003BleSession:
         self._loop = loop or asyncio.get_event_loop()
 
         self._generation = 0
-        self._event_queue: "queue.Queue[tuple]" = queue.Queue(maxsize=_QUEUE_MAXSIZE)
+        self._control_event_queue: "queue.Queue[tuple]" = queue.Queue(
+            maxsize=_CONTROL_QUEUE_MAXSIZE
+        )
+        self._audio_event_queue: "queue.Queue[tuple]" = queue.Queue(
+            maxsize=_QUEUE_MAXSIZE
+        )
+        self._event_queue_wakeup = threading.Event()
         self._worker_thread: Optional[threading.Thread] = None
         self._worker_stop = threading.Event()
         self.dropped_event_count = 0
@@ -497,10 +504,13 @@ class RC003BleSession:
     async def _write_tx(self, data: bytes) -> None:
         winrt = self._winrt or _import_winrt()
         writer = winrt.data_writer_factory()
-        writer.write_bytes(bytes(data))
-        result = await self._tx_characteristic.write_value_with_result_async(
-            writer.detach_buffer()
-        )
+        try:
+            writer.write_bytes(bytes(data))
+            result = await self._tx_characteristic.write_value_with_result_async(
+                writer.detach_buffer()
+            )
+        finally:
+            writer.close()
         if result.status != winrt.gatt_communication_status.SUCCESS:
             raise ConnectionError(
                 f"writing to ATVV TX characteristic failed: {result.status}"
@@ -557,7 +567,12 @@ class RC003BleSession:
         def _schedule() -> None:
             if self._closing or generation != self._generation:
                 return
-            task = asyncio.ensure_future(self._write_tx(command_factory()))
+            try:
+                command = command_factory()
+                task = asyncio.ensure_future(self._write_tx(command))
+            except Exception as exc:  # noqa: BLE001 - report scheduling failure
+                self._notify_error(exc)
+                return
             tasks.add(task)
             task.add_done_callback(
                 lambda completed: self._on_mic_command_task_done(
@@ -567,7 +582,10 @@ class RC003BleSession:
                 )
             )
 
-        self._loop.call_soon_threadsafe(_schedule)
+        try:
+            self._loop.call_soon_threadsafe(_schedule)
+        except RuntimeError as exc:
+            self._notify_error(exc)
 
     def _on_mic_command_task_done(
         self,
@@ -588,8 +606,7 @@ class RC003BleSession:
             return
         if self._closing or generation != self._generation:
             return  # a torn-down/superseded session's error is not actionable
-        if self._on_error is not None:
-            self._on_error(exc)
+        self._notify_error(exc)
 
     async def _cancel_pending_mic_command_writes(self) -> None:
         """Cancel and await every scheduled MIC_OPEN/MIC_CLOSE write, so
@@ -635,20 +652,37 @@ class RC003BleSession:
         except Exception:  # noqa: BLE001 - treat any read failure as "assume disconnected"
             disconnected = True
         if disconnected and self._on_disconnected is not None:
-            self._on_disconnected()
+            try:
+                self._on_disconnected()
+            except Exception as exc:  # noqa: BLE001 - never escape a WinRT callback
+                _logger.error(
+                    "BLE disconnect callback failed: error_type=%s",
+                    type(exc).__name__,
+                )
 
     def _enqueue(self, kind: str, payload: bytes) -> None:
-        item = (self._generation, kind, payload)
+        item = (self._generation, payload)
+        if kind == "control":
+            try:
+                self._control_event_queue.put_nowait(item)
+            except queue.Full:
+                self._worker_stop.set()
+                self._notify_error(RuntimeError("ATVV control event queue overflow"))
+            else:
+                self._event_queue_wakeup.set()
+            return
         try:
-            self._event_queue.put_nowait(item)
+            self._audio_event_queue.put_nowait(item)
+            self._event_queue_wakeup.set()
         except queue.Full:
             try:
-                self._event_queue.get_nowait()  # drop oldest
+                self._audio_event_queue.get_nowait()  # drop oldest audio only
             except queue.Empty:
                 pass
             self.dropped_event_count += 1
             try:
-                self._event_queue.put_nowait(item)
+                self._audio_event_queue.put_nowait(item)
+                self._event_queue_wakeup.set()
             except queue.Full:
                 pass
 
@@ -656,6 +690,7 @@ class RC003BleSession:
 
     def _start_worker(self, generation: int) -> None:
         self._worker_stop.clear()
+        self._event_queue_wakeup.clear()
         self._worker_thread = threading.Thread(
             target=self._worker_loop, args=(generation,), daemon=True
         )
@@ -663,25 +698,52 @@ class RC003BleSession:
 
     def _worker_loop(self, generation: int) -> None:
         while not self._worker_stop.is_set():
+            if self._control_event_queue.empty() and self._audio_event_queue.empty():
+                self._event_queue_wakeup.wait(timeout=_WORKER_POLL_SECONDS)
+                self._event_queue_wakeup.clear()
+                if self._worker_stop.is_set():
+                    break
             try:
-                item_generation, kind, payload = self._event_queue.get(
-                    timeout=_WORKER_POLL_SECONDS
-                )
+                item_generation, payload = self._control_event_queue.get_nowait()
             except queue.Empty:
-                continue
+                try:
+                    item_generation, payload = self._audio_event_queue.get_nowait()
+                except queue.Empty:
+                    continue
+                kind = "audio"
+            else:
+                kind = "control"
             if item_generation != generation:
                 continue  # stale event from a previous/torn-down session
-            if kind == "control":
-                self._process_control(payload)
-            elif kind == "audio":
-                self._process_audio(payload)
+            try:
+                if kind == "control":
+                    self._process_control(payload)
+                elif kind == "audio":
+                    self._process_audio(payload)
+            except Exception as exc:  # noqa: BLE001 - reconnect on any worker failure
+                # One unexpected decoder/application callback failure must
+                # not make the worker disappear while the BLE connection
+                # remains apparently healthy. Stop consuming this generation
+                # and notify the supervisor so cleanup/reconnect owns recovery.
+                self._worker_stop.set()
+                self._notify_error(exc)
+
+    def _notify_error(self, exc: BaseException) -> None:
+        if self._on_error is None:
+            return
+        try:
+            self._on_error(exc)
+        except Exception as callback_exc:  # noqa: BLE001 - never kill a native callback thread
+            _logger.error(
+                "BLE error callback failed: error_type=%s",
+                type(callback_exc).__name__,
+            )
 
     def _process_control(self, payload: bytes) -> None:
         try:
             event = self._session.handle_control(payload)
         except atvv_session.ATVVProtocolError as exc:
-            if self._on_error is not None:
-                self._on_error(exc)
+            self._notify_error(exc)
             return
         if self._on_control_event is not None:
             self._on_control_event(event)
@@ -694,14 +756,15 @@ class RC003BleSession:
     async def close(self) -> None:
         """Closes the BLE session, always attempting every independent
         cleanup step regardless of any single step's outcome, then raises
-        if the worker thread never actually stopped (XRBM-019 P1 #3 - see
+        if the worker thread, GATT service, or BLE device did not actually
+        stop/close (XRBM-019 P1 #3 - see
         XRBM-018's independent review round 2 finding #2, which
         found the prior "report a join timeout via on_error and keep
         going" behavior let ``app.py``'s cleanup silently drop the session
         owner over a still-live worker thread anyway).
 
-        A worker-thread join timeout is now a real ``close()`` failure: it
-        is tracked but does NOT short-circuit the method - every other
+        Each retained-owner failure is a real ``close()`` failure: it is
+        tracked but does NOT short-circuit the method - every other
         independent GATT cleanup step below (MIC_CLOSE write, CCCD
         removal, event-token cleanup, service/device close) still runs -
         and only once all of them have been attempted does this raise,
@@ -720,19 +783,21 @@ class RC003BleSession:
         # scheduled, it does nothing about one that had already started.
         await self._cancel_pending_mic_command_writes()
 
-        worker_join_failed = False
+        cleanup_failures = []
         self._worker_stop.set()
+        self._event_queue_wakeup.set()
         if self._worker_thread is not None:
             self._worker_thread.join(timeout=2.0)
             if self._worker_thread.is_alive():
-                worker_join_failed = True
+                cleanup_failures.append("worker thread did not stop")
             else:
                 self._worker_thread = None
-        while True:  # drain so a future restart never replays stale events
-            try:
-                self._event_queue.get_nowait()
-            except queue.Empty:
-                break
+        for event_queue in (self._control_event_queue, self._audio_event_queue):
+            while True:  # drain so a future restart never replays stale events
+                try:
+                    event_queue.get_nowait()
+                except queue.Empty:
+                    break
 
         if self._session.mic_open:
             try:
@@ -758,6 +823,7 @@ class RC003BleSession:
                 if self._audio_token is not None:
                     try:
                         self._audio_characteristic.remove_value_changed(self._audio_token)
+                        self._audio_token = None
                     except Exception:
                         pass
             if self._control_characteristic is not None:
@@ -770,6 +836,7 @@ class RC003BleSession:
                 if self._control_token is not None:
                     try:
                         self._control_characteristic.remove_value_changed(self._control_token)
+                        self._control_token = None
                     except Exception:
                         pass
             if self._device is not None and self._connection_status_token is not None:
@@ -777,6 +844,7 @@ class RC003BleSession:
                     self._device.remove_connection_status_changed(
                         self._connection_status_token
                     )
+                    self._connection_status_token = None
                 except Exception:
                     pass
 
@@ -784,28 +852,27 @@ class RC003BleSession:
             try:
                 self._service.close()
             except Exception:
-                pass
-            self._service = None
+                cleanup_failures.append("GATT service did not close")
+            else:
+                self._service = None
+                self._tx_characteristic = None
+                self._audio_characteristic = None
+                self._control_characteristic = None
+                self._audio_token = None
+                self._control_token = None
         if self._device is not None:
             try:
                 self._device.close()
             except Exception:
-                pass
-            self._device = None
+                cleanup_failures.append("BLE device did not close")
+            else:
+                self._device = None
+                self._connection_status_token = None
 
-        self._tx_characteristic = None
-        self._audio_characteristic = None
-        self._control_characteristic = None
-        self._audio_token = None
-        self._control_token = None
-        self._connection_status_token = None
-
-        if worker_join_failed:
-            # Raised only now, after every independent GATT cleanup step
-            # above has already been attempted - see the method docstring.
+        if cleanup_failures:
+            # Raised only now, after every independent GATT cleanup step has
+            # already been attempted. References for failed resources remain
+            # populated so app.py can retain this session and retry cleanup.
             raise RuntimeError(
-                "ATVV worker thread did not stop within close()'s join "
-                "timeout; the BLE session owner must be retained, not "
-                "dropped, and no reconnect may start a replacement "
-                "generation over it"
+                "ATVV session cleanup incomplete: " + "; ".join(cleanup_failures)
             )

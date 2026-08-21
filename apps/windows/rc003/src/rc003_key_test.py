@@ -73,6 +73,7 @@ def _capture(args: argparse.Namespace) -> int:
             finished.set()
 
     listener = raw_input_windows.RawInputButtonListener(lambda *_: None, on_raw_event)
+    stop_failed = False
     try:
         listener.start(device_path)
         print(
@@ -88,11 +89,15 @@ def _capture(args: argparse.Namespace) -> int:
             listener.stop()
         except Exception as exc:  # noqa: BLE001 - preserve the capture for diagnosis
             print(f"listener stop failed: {exc}")
+            stop_failed = True
 
     events = recorder.events()
     output = Path(args.output) if args.output else _default_capture_path()
     recorder.write_jsonl(output)
     print(f"capture written: {output}")
+    if stop_failed:
+        print("listener cleanup was incomplete; no mapping will be saved")
+        return 2
     if not events or not first_signature or not finished.is_set():
         print("no complete physical key press/release was captured")
         return 1
@@ -164,6 +169,7 @@ def _capture_guided_key(
             finished.set()
 
     listener = raw_input_windows.RawInputButtonListener(lambda *_: None, on_raw_event)
+    stop_failed = False
     try:
         listener.start(device_path)
         finished.wait(timeout=duration)
@@ -175,10 +181,15 @@ def _capture_guided_key(
             listener.stop()
         except Exception as exc:  # noqa: BLE001 - preserve the capture
             print(f"  停止监听失败: {exc}")
+            stop_failed = True
 
     events = recorder.events()
     output = _guided_capture_path(button)
     recorder.write_jsonl(output)
+    if stop_failed:
+        print(f"  {_GUIDED_LABELS[button]}监听清理失败，未修改映射")
+        print(f"  诊断记录: {output}")
+        return False
     if not first_signature or not finished.is_set():
         print(f"  {_GUIDED_LABELS[button]}未收到完整按下/释放，未修改映射")
         print(f"  诊断记录: {output}")

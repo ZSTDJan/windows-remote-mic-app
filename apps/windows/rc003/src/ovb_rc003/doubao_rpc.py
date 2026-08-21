@@ -83,7 +83,10 @@ class DoubaoPhysicalizer:
 
     def _set_failure(self, status: str, error: BaseException | str) -> bool:
         self._status = status
-        self._error = str(error)
+        # Frida/native exception messages may embed a process path, PID, or
+        # address. Persistent logs consume this field, so only fixed strings
+        # or an exception type may cross this boundary.
+        self._error = error if isinstance(error, str) else type(error).__name__
         return False
 
     @staticmethod
@@ -128,15 +131,21 @@ class DoubaoPhysicalizer:
             path = info.get("path")
             return str(path) if path else None
         finally:
-            try:
-                probe.unload()
-            except Exception:
-                pass
+            probe.unload()
 
     def start(self) -> bool:
         with self._lock:
-            if self._script is not None and self._session is not None:
+            if (
+                self._status == "active"
+                and self._script is not None
+                and self._session is not None
+            ):
                 return True
+            if self._script is not None or self._session is not None:
+                return self._set_failure(
+                    "cleanup_required",
+                    "retained Frida resources require stop() before restart",
+                )
             self._status = "starting"
             self._error = None
 
@@ -157,9 +166,10 @@ class DoubaoPhysicalizer:
                 ]
                 if not candidates:
                     return self._set_failure("unavailable", "ImeService.exe is not running")
-                last_error: Optional[BaseException] = None
+                last_error: Optional[Exception] = None
                 for process in candidates:
                     session = None
+                    script = None
                     try:
                         session = frida.attach(process.pid)
                         module_path = self._probe_module(session)
@@ -175,33 +185,72 @@ class DoubaoPhysicalizer:
                         self._status = "active"
                         return True
                     except BaseException as exc:  # noqa: BLE001 - optional integration
-                        last_error = exc
+                        script_unload_failed = False
+                        if script is not None:
+                            try:
+                                script.unload()
+                            except Exception:
+                                script_unload_failed = True
+                        session_detach_failed = False
                         if session is not None:
                             try:
                                 session.detach()
                             except Exception:
-                                pass
+                                self._session = session
+                                session_detach_failed = True
+                            else:
+                                # A detached Frida session no longer owns any
+                                # of its scripts, even if a prior explicit
+                                # script.unload() call reported an error.
+                                script_unload_failed = False
+                        if script_unload_failed:
+                            self._script = script
+                        cleanup_failed = script_unload_failed or session_detach_failed
+                        if cleanup_failed:
+                            self._frida = frida
+                            if not isinstance(exc, Exception):
+                                raise
+                            return self._set_failure(
+                                "cleanup_required",
+                                "failed Frida startup resources remain owned",
+                            )
+                        if not isinstance(exc, Exception):
+                            raise
+                        last_error = exc
                 return self._set_failure("unavailable", last_error or "could not attach to ImeService.exe")
-            except BaseException as exc:  # noqa: BLE001 - optional integration
+            except Exception as exc:  # noqa: BLE001 - optional integration
                 return self._set_failure("unavailable", exc)
 
     def stop(self) -> None:
         with self._lock:
             script, session = self._script, self._session
-            self._script = None
-            self._session = None
-            self._frida = None
-            self._status = "stopped"
+            failures = []
+            script_unload_failed = False
             if script is not None:
                 try:
                     script.unload()
                 except Exception:
-                    pass
+                    script_unload_failed = True
+                else:
+                    self._script = None
             if session is not None:
                 try:
                     session.detach()
                 except Exception:
-                    pass
+                    failures.append("session detach failed")
+                else:
+                    self._session = None
+                    self._script = None
+                    script_unload_failed = False
+            if script_unload_failed:
+                failures.append("script unload failed")
+            if failures:
+                self._status = "cleanup_required"
+                self._error = "; ".join(failures)
+                raise RuntimeError("Doubao physicalizer cleanup incomplete")
+            self._frida = None
+            self._status = "stopped"
+            self._error = None
 
 
 _physicalizer = DoubaoPhysicalizer()
