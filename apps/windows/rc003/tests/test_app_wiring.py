@@ -634,6 +634,9 @@ class HostHotkeyFailureSuppressesMicOpenTests(_AppWiringTestCase):
             self.app._on_button_event("mic", False, event_source="hid")
             self.app._on_control_event(AudioStopped())
             self._drain_event_loop()
+            # This is the user's later second press, not the immediate
+            # post-MIC_OPEN echo covered by the reopen guard.
+            self.app._voice_toggle_reopen_echo_guard_until = 0.0
             self.app._on_button_event("mic", True, event_source="hid")
         finally:
             win32_input.send_voice_key_combo_tap = original
@@ -742,6 +745,44 @@ class HostHotkeyFailureSuppressesMicOpenTests(_AppWiringTestCase):
         self.assertTrue(self.app._voice.active)
         self.assertEqual(self.app._ble_session.mic_open_calls, 1)
         self.assertEqual(self.app._ble_session.mic_close_calls, 0)
+
+    def test_toggle_reopen_ignores_immediate_legacy_f5_echo_only(self):
+        hotkey_calls = []
+        original = win32_input.send_voice_key_combo_tap
+        win32_input.send_voice_key_combo_tap = lambda tokens: hotkey_calls.append(tokens)
+        try:
+            self.app._on_control_event(AudioStarted(session_id=1))
+            self.app._on_legacy_key_event(0x74, True)
+            self._drain_event_loop()
+            self.app._on_control_event(AudioStopped())
+
+            with mock.patch.object(app_module.time, "monotonic", return_value=100.0):
+                self.app._on_legacy_key_event(0x74, False)
+                self._drain_event_loop()
+
+            self.app._on_control_event(AudioStarted(session_id=2))
+            with mock.patch.object(app_module.time, "monotonic", return_value=100.1):
+                self.app._on_legacy_key_event(0x74, True)
+                self.app._on_legacy_key_event(0x74, False)
+                self._drain_event_loop()
+
+            self.assertEqual(hotkey_calls, [("ralt", "space")])
+            self.assertTrue(self.app._voice.active)
+            self.assertEqual(self.app._ble_session.mic_open_calls, 1)
+            self.assertEqual(self.app._ble_session.mic_close_calls, 0)
+
+            with mock.patch.object(app_module.time, "monotonic", return_value=100.3):
+                self.app._on_legacy_key_event(0x74, True)
+                self._drain_event_loop()
+        finally:
+            win32_input.send_voice_key_combo_tap = original
+
+        self.assertEqual(
+            hotkey_calls,
+            [("ralt", "space"), ("ralt", "space")],
+        )
+        self.assertFalse(self.app._voice.active)
+        self.assertEqual(self.app._ble_session.mic_close_calls, 1)
 
     def test_duplicate_audio_stop_reopens_toggle_stream_only_once(self):
         original = win32_input.send_voice_key_combo_tap

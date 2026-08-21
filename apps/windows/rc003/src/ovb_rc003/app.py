@@ -114,6 +114,7 @@ _BUTTON_ACTION_KEY_TOKENS = {
 _KEY_DETECTION_MIC_RELEASE_GRACE_SECONDS = 1.0
 _KEY_DETECTION_MIC_MAX_SECONDS = 10.0
 _VOICE_TOGGLE_REOPEN_FALLBACK_SECONDS = 0.2
+_VOICE_TOGGLE_REOPEN_ECHO_GUARD_SECONDS = 0.25
 
 
 def open_configured_application(action: key_mapping.ButtonAction) -> bool:
@@ -151,6 +152,8 @@ class RC003App:
         self._voice_toggle_reopen_scheduled = False
         self._voice_toggle_reopen_generation = 0
         self._voice_toggle_reopen_handle: Optional[asyncio.TimerHandle] = None
+        self._voice_toggle_reopen_echo_guard_until = 0.0
+        self._voice_toggle_reopen_echo_sources_down: set[str] = set()
         self._voice_hotkey_release_pending: Optional[Tuple[str, ...]] = None
         self._button_key_release_pending: Optional[Tuple[str, ...]] = None
         # Raw Input and the ATVV control channel arrive on different worker
@@ -502,6 +505,8 @@ class RC003App:
                 self._voice_audio_started_waiting_for_legacy_f5 = False
                 self._voice_toggle_close_pending = False
                 self._cancel_voice_toggle_reopen_locked("connection cleanup")
+                self._voice_toggle_reopen_echo_guard_until = 0.0
+                self._voice_toggle_reopen_echo_sources_down.clear()
                 self._voice_raw_input_trigger_pending = False
                 self._voice_audio_stream_active = False
                 self._voice_audio_stop_processed = False
@@ -760,6 +765,16 @@ class RC003App:
                 "voice toggle reopening device mic after %s",
                 reason,
             )
+            # Real RC003 logs show a synthetic-looking F5 down/up about 60 ms
+            # after an application-issued MIC_OPEN. Without a narrow guard it
+            # is mistaken for the user's second toggle press and immediately
+            # closes the stream that was just reopened. Keep the guard short
+            # and source-paired: the whole echo press is ignored, while a real
+            # later press still closes toggle mode normally.
+            self._voice_toggle_reopen_echo_guard_until = (
+                time.monotonic() + _VOICE_TOGGLE_REOPEN_ECHO_GUARD_SECONDS
+            )
+            self._voice_toggle_reopen_echo_sources_down.clear()
             self._ble_session.send_mic_open_threadsafe()
 
     def _reset_key_detection_mic_gesture_locked(self) -> None:
@@ -1205,6 +1220,14 @@ class RC003App:
         if button_id == "mic":
             if not is_pressed:
                 with self._voice_trigger_lock:
+                    if event_source in self._voice_toggle_reopen_echo_sources_down:
+                        self._voice_toggle_reopen_echo_sources_down.discard(event_source)
+                        self._logger.info(
+                            "voice physical release ignored: toggle reopen echo "
+                            "source=%s",
+                            event_source,
+                        )
+                        return
                     self._voice_mic_gesture_sources_down.discard(event_source)
                     if (
                         self._voice_toggle_reopen_pending
@@ -1232,6 +1255,17 @@ class RC003App:
                     self._apply_pending_voice_settings_if_idle_locked()
                 return
             with self._voice_trigger_lock:
+                if (
+                    self._voice.trigger_mode == key_mapping.VoiceTriggerMode.TOGGLE
+                    and self._voice.active
+                    and time.monotonic() < self._voice_toggle_reopen_echo_guard_until
+                ):
+                    self._voice_toggle_reopen_echo_sources_down.add(event_source)
+                    self._logger.info(
+                        "voice physical trigger ignored: toggle reopen echo source=%s",
+                        event_source,
+                    )
+                    return
                 if self._voice_toggle_close_pending:
                     if self._voice_mic_gesture_active:
                         self._voice_mic_gesture_sources_down.add(event_source)
@@ -1693,6 +1727,8 @@ class RC003App:
             return
 
         if is_toggle_close and self._ble_session is not None:
+            self._voice_toggle_reopen_echo_guard_until = 0.0
+            self._voice_toggle_reopen_echo_sources_down.clear()
             # The host closing TAP has already landed. A later asynchronous
             # MIC_CLOSE write failure is a transport failure only: the BLE
             # error callback requests cleanup/reconnect, but must never
