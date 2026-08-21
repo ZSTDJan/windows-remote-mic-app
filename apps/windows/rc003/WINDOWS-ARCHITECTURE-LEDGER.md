@@ -1,6 +1,7 @@
 # RC003 Windows 项目认知与构成原理总台账
 
-当前认知基线：2026-08-21，源码检查点 `eafd203`。
+当前认知基线：2026-08-21，完整源码检查点 `eafd203`，设置界面检查点
+`459a0bd`。
 
 ## 文档定位
 
@@ -315,6 +316,12 @@ session detach 成功即证明其脚本不再被会话持有；单独 script unl
 机，新设置会等本次手势完整收尾后应用。设备 profile 与音频端点仍要求重启
 桥接。
 
+语音配置同时保留 `voice_hotkeys.toggle` 与 `voice_hotkeys.hold`，用于在界面
+中独立维护两套宿主快捷键；`voice_trigger_mode` 选择当前生命周期，
+`voice_hotkey` 则保存该模式当前交给桥接的运行时值。这个兼容字段使界面模型
+可以演进而不要求桥接状态机同步改接口。旧配置只有 `voice_hotkey` 时，加载器
+把它归入当时选中的模式，另一模式使用默认值补齐。
+
 配置隐私守卫递归拒绝地址、设备 ID、设备路径、接口 ID 和 token 等字段，
 且大小写不敏感。诊断捕获也不提供“包含设备路径”开关。
 
@@ -322,8 +329,9 @@ session detach 成功即证明其脚本不再被会话持有；单独 script unl
 
 `qt_settings_app.py` 把 Python model/controller 暴露给 QML。主要页面：
 
-- `ConnectionPage.qml`：设备、桥接、输出端点；
-- `ButtonsPage.qml`：13 键布局、主/次动作、真实按键检测；
+- `ConnectionPage.qml`：设备、桥接、输出端点，不重复承载语音动作设置；
+- `ButtonsPage.qml`：13 键布局、主/次动作、真实按键检测，以及两种语音方式
+  各自的宿主快捷键；
 - `PermissionsPage.qml`：权限和系统入口；
 - `DiagnosticsPage.qml`：BLE、音频、驱动和日志诊断；
 - `main.qml` / `Tokens.qml`：窗口、导航和设计 token。
@@ -335,6 +343,10 @@ session detach 成功即证明其脚本不再被会话持有；单独 script unl
 后台桥接存在时，“检测真实按键”不再争抢 Raw Input/HID tap，而是写入一次性
 本地文件请求，由桥接吞掉下一次按下/释放、返回逻辑 button id 且不执行映射。
 无法安全确认桥接 mutex 状态时，设置页停止检测，不猜测“没有运行”。
+
+麦克风键不是普通可编辑映射。按键页顶部的语音面板负责选择 HOLD/TOGGLE 并
+维护两套宿主快捷键；下方麦克风映射卡只显示当前语音动作与已选快捷键。这种
+单一编辑入口避免连接页、语音面板和映射卡同时写同一配置。
 
 多个输入来源可能同时尝试认领该请求。`key_detection_bridge.py` 必须先用
 `O_CREAT | O_EXCL` 独占 claim lock，再读取和移动 request JSON；结果写入失败
