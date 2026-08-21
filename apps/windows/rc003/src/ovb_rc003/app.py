@@ -57,6 +57,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import threading
+import time
 from typing import List, Optional, Tuple
 
 from . import (
@@ -109,6 +110,9 @@ _BUTTON_ACTION_KEY_TOKENS = {
     key_mapping.ActionKind.SYSTEM_VOLUME_MUTE: ("volume_mute",),
     key_mapping.ActionKind.PLAY_PAUSE: ("media_play_pause",),
 }
+
+_KEY_DETECTION_MIC_RELEASE_GRACE_SECONDS = 1.0
+_KEY_DETECTION_MIC_MAX_SECONDS = 10.0
 
 
 def open_configured_application(action: key_mapping.ButtonAction) -> bool:
@@ -187,6 +191,12 @@ class RC003App:
         # stands down so the same physical edge is not armed/dispatched twice.
         self._direct_hid_tap_active = False
         self._key_detection_suppressed_buttons: set[str] = set()
+        self._key_detection_mic_lock = threading.Lock()
+        self._key_detection_mic_gesture_active = False
+        self._key_detection_mic_gesture_started_at = 0.0
+        self._key_detection_mic_release_deadline: Optional[float] = None
+        self._key_detection_mic_audio_started = False
+        self._key_detection_mic_sources_down: set[str] = set()
         self._playback: Optional[audio_playback.EndpointPlaybackSink] = None
         self._voice_pcm_stats = PcmStats()
         self._event_loop = asyncio.get_event_loop()
@@ -472,6 +482,8 @@ class RC003App:
             self._direct_hid_usages.clear()
         self._direct_hid_tap_active = False
         self._key_detection_suppressed_buttons.clear()
+        with self._key_detection_mic_lock:
+            self._reset_key_detection_mic_gesture_locked()
 
         # Cancel gesture timers before stopping Raw Input. The listener's
         # forced releases then clear the dispatcher state without a late
@@ -618,6 +630,109 @@ class RC003App:
         self._voice_mic_gesture_audio_stopped = False
         self._voice_mic_gesture_sources_down.clear()
 
+    def _reset_key_detection_mic_gesture_locked(self) -> None:
+        self._key_detection_mic_gesture_active = False
+        self._key_detection_mic_gesture_started_at = 0.0
+        self._key_detection_mic_release_deadline = None
+        self._key_detection_mic_audio_started = False
+        self._key_detection_mic_sources_down.clear()
+
+    def _expire_key_detection_mic_gesture_locked(self, now: float) -> None:
+        if not self._key_detection_mic_gesture_active:
+            return
+        release_deadline = self._key_detection_mic_release_deadline
+        hard_deadline = (
+            self._key_detection_mic_gesture_started_at
+            + _KEY_DETECTION_MIC_MAX_SECONDS
+        )
+        if (release_deadline is not None and now >= release_deadline) or (
+            now >= hard_deadline
+        ):
+            self._reset_key_detection_mic_gesture_locked()
+
+    def _handle_key_detection_mic_event(
+        self,
+        event_kind: str,
+        source: str,
+    ) -> Tuple[bool, bool]:
+        """Capture or suppress one source from a detected physical mic press.
+
+        A single RC003 mic gesture is reported by multiple independent paths.
+        The key-detection request disappears as soon as the first path claims
+        it, so a short in-process latch must keep later paths from entering the
+        normal voice state machine. Returns ``(handled, newly_captured)``.
+        """
+
+        now = time.monotonic()
+        starts_gesture = event_kind in {
+            "physical_down",
+            "atvv_press",
+            "audio_started",
+        }
+        with self._key_detection_mic_lock:
+            self._expire_key_detection_mic_gesture_locked(now)
+            newly_captured = False
+            if not self._key_detection_mic_gesture_active:
+                if not starts_gesture:
+                    return False, False
+                try:
+                    newly_captured = key_detection_bridge.publish_next_button(
+                        self._config_root,
+                        "mic",
+                    )
+                except OSError as exc:
+                    self._logger.warning("key detection IPC unavailable: %s", exc)
+                    return False, False
+                if not newly_captured:
+                    return False, False
+                self._key_detection_mic_gesture_active = True
+                self._key_detection_mic_gesture_started_at = now
+
+            if event_kind == "physical_down":
+                self._key_detection_mic_sources_down.add(source)
+                self._key_detection_mic_release_deadline = None
+            elif event_kind == "physical_up":
+                self._key_detection_mic_sources_down.discard(source)
+                if (
+                    not self._key_detection_mic_sources_down
+                    and not self._key_detection_mic_audio_started
+                ):
+                    self._key_detection_mic_release_deadline = (
+                        now + _KEY_DETECTION_MIC_RELEASE_GRACE_SECONDS
+                    )
+            elif event_kind == "audio_started":
+                self._key_detection_mic_audio_started = True
+                self._key_detection_mic_release_deadline = None
+            elif event_kind == "audio_stopped":
+                self._key_detection_mic_audio_started = False
+                if not self._key_detection_mic_sources_down:
+                    self._key_detection_mic_release_deadline = (
+                        now + _KEY_DETECTION_MIC_RELEASE_GRACE_SECONDS
+                    )
+            elif not self._key_detection_mic_sources_down:
+                # MicButtonPressed has no matching release opcode. Give the
+                # physical/audio paths time to join, then let a future press
+                # through even if neither companion event ever arrives.
+                self._key_detection_mic_release_deadline = (
+                    now + _KEY_DETECTION_MIC_RELEASE_GRACE_SECONDS
+                )
+            return True, newly_captured
+
+    def _key_detection_blocks_legacy_mic_transform(self) -> bool:
+        now = time.monotonic()
+        with self._key_detection_mic_lock:
+            self._expire_key_detection_mic_gesture_locked(now)
+            if self._key_detection_mic_gesture_active:
+                return True
+            # Keep the pending-file check serialized with the first source's
+            # publish/claim. Otherwise AudioStarted could claim the request in
+            # the gap between these two checks and the hook would inject one
+            # right-Alt edge before noticing the in-process latch.
+            try:
+                return key_detection_bridge.has_pending_request(self._config_root)
+            except OSError:
+                return False
+
     def _emit_legacy_voice_key(
         self,
         target: legacy_key_suppressor_windows.PhysicalKeyTarget,
@@ -684,15 +799,10 @@ class RC003App:
         if vk_code != 0x74 or not self._legacy_voice_transform_enabled():
             return None
         if is_pressed:
-            try:
-                detection_pending = key_detection_bridge.has_pending_request(
-                    self._config_root
-                )
-            except OSError:
-                detection_pending = False
-            if detection_pending:
+            if self._key_detection_blocks_legacy_mic_transform():
                 # The bridge will report and swallow this press in
-                # _on_button_event(); do not inject right-Alt first.
+                # _on_button_event(), or another source already claimed the
+                # same detection gesture; do not inject right-Alt first.
                 return None
             if (
                 self._voice.active
@@ -924,6 +1034,21 @@ class RC003App:
         host_action_handled: bool = False,
         event_source: str = "hid",
     ) -> None:
+        if button_id == "mic":
+            detection_handled, detection_captured = (
+                self._handle_key_detection_mic_event(
+                    "physical_down" if is_pressed else "physical_up",
+                    event_source,
+                )
+            )
+            if detection_handled:
+                if detection_captured:
+                    self._logger.info(
+                        "key detection captured button=mic source=%s; "
+                        "voice action suppressed",
+                        event_source,
+                    )
+                return
         if button_id in self._key_detection_suppressed_buttons:
             if not is_pressed:
                 self._key_detection_suppressed_buttons.discard(button_id)
@@ -1176,6 +1301,16 @@ class RC003App:
                 event.capabilities.frame_size,
             )
         elif isinstance(event, MicButtonPressed):
+            detection_handled, detection_captured = (
+                self._handle_key_detection_mic_event("atvv_press", "atvv")
+            )
+            if detection_handled:
+                if detection_captured:
+                    self._logger.info(
+                        "key detection captured button=mic source=atvv; "
+                        "voice action suppressed"
+                    )
+                return
             with self._voice_trigger_lock:
                 if self._voice_toggle_close_pending:
                     self._voice_raw_input_trigger_pending = False
@@ -1207,6 +1342,19 @@ class RC003App:
                         if self._begin_voice_mic_gesture("atvv"):
                             self._handle_mic_button_pressed()
         elif isinstance(event, AudioStarted):
+            detection_handled, detection_captured = (
+                self._handle_key_detection_mic_event(
+                    "audio_started",
+                    "audio_started",
+                )
+            )
+            if detection_handled:
+                if detection_captured:
+                    self._logger.info(
+                        "key detection captured button=mic source=audio_started; "
+                        "voice action suppressed"
+                    )
+                return
             with self._voice_trigger_lock:
                 self._logger.info("voice audio started")
                 if self._voice_audio_stream_active:
@@ -1246,6 +1394,15 @@ class RC003App:
                             self._handle_mic_button_pressed(send_device_open=False)
                             self._voice_audio_start_fallback_pending = self._voice.active
         elif isinstance(event, AudioStopped):
+            detection_handled, _ = self._handle_key_detection_mic_event(
+                "audio_stopped",
+                "audio_started",
+            )
+            if detection_handled:
+                self._logger.info(
+                    "key detection mic audio stopped; voice state unchanged"
+                )
+                return
             with self._voice_trigger_lock:
                 if (
                     not self._voice_audio_stream_active
