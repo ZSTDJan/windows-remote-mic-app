@@ -293,7 +293,15 @@ HID 注入权限顺序与稳定失败提交：
 - 完整测试 1102 项通过，7 项安全或平台相关跳过，退出码 0。
 - 公开边界扫描 231 个文件通过；`compileall`、`pip check` 和
   `git diff --check` 通过。
-- 状态：源码检查点通过；冻结候选、保存后重开和 RC003 语音真机回归待完成。
+- 构建时 Git HEAD 为 `63b038d`；PyInstaller 构建与冻结入口检查通过：
+  `--dry-run=0`、`--help=0`、无效 HID 注入 PID `=4`。
+- 候选目录为源码仓库同级
+  `RemoteMicRC003-0.1.0-candidate-20260821-fix13/`；EXE SHA-256 为
+  `DB7C357419DACDC04491C50CF3BD5AFF4353467B30BE3B5E73E5C3012EC34CA6`，
+  便携 ZIP SHA-256 为
+  `B496F8DEED84DC7D8A2B28E711931EDEC11BC169A93771F56732A6339849D4FE`；
+  ZIP 内 EXE 已重新计算并与候选目录一致。
+- 状态：源码与冻结检查点通过；保存后重开和 RC003 语音真机回归待完成。
 
 ## 维护纪律
 

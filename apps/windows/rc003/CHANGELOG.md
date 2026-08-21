@@ -170,7 +170,15 @@ HID tap 身份校验、进程控制和日志隐私。自动检查与 `fix10` 候
 - `fix13` 界面代码提交：`459a0bd`。配置、设置控制器与 QML 定向测试
   174 项通过；完整测试 1102 项通过、7 项安全或平台相关跳过；公开边界扫描
   231 个文件通过；`compileall`、`pip check` 和 `git diff --check` 通过。
-- `fix13` 尚未完成冻结包与人工界面/真机验收，本条只记录源码检查点。
+- `fix13` 构建时 Git HEAD：`63b038d`；PyInstaller 构建通过，冻结入口
+  `--dry-run=0`、`--help=0`、无效 HID 注入 PID `=4`。
+- `fix13` 候选目录：源码仓库同级的
+  `RemoteMicRC003-0.1.0-candidate-20260821-fix13/`。
+- `fix13` 候选 EXE SHA-256：
+  `DB7C357419DACDC04491C50CF3BD5AFF4353467B30BE3B5E73E5C3012EC34CA6`。
+- `fix13` 便携 ZIP SHA-256：
+  `B496F8DEED84DC7D8A2B28E711931EDEC11BC169A93771F56732A6339849D4FE`；
+  ZIP 内 EXE 已重新计算并与候选目录一致。人工界面与真机语音仍待复测。
 
 ## [0.1.0-candidate] — 2026-07-31
 

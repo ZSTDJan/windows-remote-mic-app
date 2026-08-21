@@ -253,7 +253,14 @@ HID 注入权限顺序与稳定失败提交：
 - 自动结果：配置、设置帮助器、Qt 控制器和 QML 定向测试 174 项通过；完整
   测试 1102 项通过、7 项安全或平台相关跳过；公开边界扫描 231 个文件通过；
   `compileall`、`pip check` 和 `git diff --check` 通过。
-- 状态：自动验证通过，待 `fix13` 冻结界面人工复测。
+- 候选：`RemoteMicRC003-0.1.0-candidate-20260821-fix13-portable.zip`，
+  SHA-256
+  `B496F8DEED84DC7D8A2B28E711931EDEC11BC169A93771F56732A6339849D4FE`；
+  ZIP 内 EXE SHA-256
+  `DB7C357419DACDC04491C50CF3BD5AFF4353467B30BE3B5E73E5C3012EC34CA6`，
+  已与候选目录一致。冻结入口 `--dry-run=0`、`--help=0`、无效 HID 注入
+  PID `=4`。
+- 状态：自动与冻结验证通过，待 `fix13` 界面人工复测。
 
 ### CHECK-LAUNCH-001 重复桥接启动
 
