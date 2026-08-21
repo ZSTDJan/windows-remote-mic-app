@@ -124,15 +124,21 @@ from . import (
     windows_diagnostics,
 )
 
-# These are the reference-style semantic action choices offered in each
-# editable ordinary-button mapping row.  The combo box stays editable (not
-# "readonly"): any other ordinary chord or modifier-only chord is still
-# accepted as a user custom shortcut through hotkey.HotkeySpec.parse.
-_PRESET_ACTION_OPTIONS: List[str] = list(dict.fromkeys(settings_ui._PRESET_KEY_COMBOS))
-# Keep the explicit optional-gesture state selectable and stable in an
-# editable ComboBox.  Without a value that is present in the model, Qt can
-# display the first real preset while the underlying model is actually blank.
-_PRESET_ACTION_OPTIONS.insert(0, settings_ui.SECONDARY_UNCONFIGURED_DISPLAY)
+# Primary mappings may own either voice lifecycle. Secondary gestures remain
+# ordinary actions only: HOLD voice needs the physical release edge and
+# TOGGLE voice needs a stable session owner, neither of which is represented
+# by the delayed double/long callback.
+_PRIMARY_ACTION_OPTIONS: List[str] = list(
+    dict.fromkeys(
+        settings_ui._PRIMARY_VOICE_DISPLAYS + settings_ui._PRESET_KEY_COMBOS
+    )
+)
+_SECONDARY_ACTION_OPTIONS: List[str] = list(
+    dict.fromkeys(
+        (settings_ui.SECONDARY_UNCONFIGURED_DISPLAY,)
+        + settings_ui._PRESET_KEY_COMBOS
+    )
+)
 
 
 class QtUnavailableError(RuntimeError):
@@ -418,8 +424,8 @@ def _load_qt_classes() -> dict:
 
     class ButtonMappingModel(QAbstractListModel):
         """One row per physical RC003 button (13 total, in
-        remote_layout.BUTTON_ORDER - 12 ordinary HID buttons plus the fixed
-        mic), exposing both its product-photo hotspot geometry and its
+        remote_layout.BUTTON_ORDER - 12 ordinary HID buttons plus mic),
+        exposing both its product-photo hotspot geometry and its
         current mapping-action text to QML, so the photo's clickable
         hotspots and the mapping list are two views over the SAME row data
         rather than two independently-tracked selections.
@@ -496,8 +502,6 @@ def _load_qt_classes() -> dict:
             if role == self.HidUsageRole:
                 return remote_layout.hid_usage_display(button_id)
             if role == self.ActionTextRole:
-                if button_id == "mic":
-                    return settings_ui._MIC_ROW_DISPLAY
                 return self._action_text[button_id]
             if role == self.DoubleClickTextRole:
                 return self._secondary_action_text[button_id][
@@ -528,13 +532,7 @@ def _load_qt_classes() -> dict:
             display_map: Dict[str, str],
             secondary_display_map: Optional[Dict[str, Dict[str, str]]] = None,
         ) -> None:
-            """Resets every non-mic row's action text from a
-            button_id -> display-text mapping (settings_ui.DefaultDisplayState
-            or a loaded config's bindings) - the mic row is never taken from
-            here (see data()'s ActionTextRole branch: it always renders the
-            fixed settings_ui._MIC_ROW_DISPLAY regardless of what this dict
-            contains).
-            """
+            """Reset every row from the supplied primary/secondary maps."""
 
             self.beginResetModel()
             for button_id in self._button_ids:
@@ -553,18 +551,9 @@ def _load_qt_classes() -> dict:
             self.endResetModel()
 
         def to_display_map(self) -> Dict[str, str]:
-            """Inverse of load_display_map() - what build_save_model()'s
-            button_display_map argument needs. Deliberately excludes "mic"
-            (build_save_model() forces that binding to VOICE unconditionally
-            regardless of what is passed in, so there is nothing meaningful
-            to report for it here either).
-            """
+            """Inverse of load_display_map() for build_save_model()."""
 
-            return {
-                button_id: text
-                for button_id, text in self._action_text.items()
-                if button_id != "mic"
-            }
+            return dict(self._action_text)
 
         def to_secondary_display_map(self) -> Dict[str, Dict[str, str]]:
             return {
@@ -577,7 +566,6 @@ def _load_qt_classes() -> dict:
                     for trigger, text in trigger_map.items()
                 }
                 for button_id, trigger_map in self._secondary_action_text.items()
-                if button_id != "mic"
             }
 
         def index_of(self, button_id: str) -> int:
@@ -595,8 +583,6 @@ def _load_qt_classes() -> dict:
             if not (0 <= row < len(self._button_ids)):
                 return
             button_id = self._button_ids[row]
-            if button_id == "mic":
-                return  # fixed, not editable - see data()'s ActionTextRole branch
             self._action_text[button_id] = text
             model_index = self.index(row, 0)
             self.dataChanged.emit(model_index, model_index, [self.ActionTextRole])
@@ -612,8 +598,6 @@ def _load_qt_classes() -> dict:
             }:
                 return
             button_id = self._button_ids[row]
-            if button_id == "mic":
-                return
             self._secondary_action_text[button_id][trigger] = text
             model_index = self.index(row, 0)
             role = (
@@ -805,31 +789,37 @@ def _load_qt_classes() -> dict:
                 if action_dict is not None:
                     try:
                         action = key_mapping.ButtonAction.from_dict(action_dict)
+                        if action.kind == key_mapping.ActionKind.VOICE:
+                            legacy_mode = key_mapping.VoiceTriggerMode(
+                                self._config.get("voice_trigger_mode", "toggle")
+                            )
+                            action = key_mapping.voice_action_for_trigger_mode(
+                                legacy_mode
+                            )
                         display_map[button_id] = settings_ui._action_to_display(action)
                     except (KeyError, TypeError, ValueError):
                         display_map[button_id] = ""
                 else:
                     display_map[button_id] = ""
-                if button_id != "mic":
-                    secondary_display_map[button_id] = {}
-                    raw_secondary = self._bindings.get("secondary_bindings", {}).get(
-                        button_id, {}
-                    )
-                    if isinstance(raw_secondary, dict):
-                        for trigger_name in (
-                            key_mapping.ButtonTrigger.DOUBLE_CLICK.value,
-                            key_mapping.ButtonTrigger.LONG_PRESS.value,
-                        ):
-                            action_dict = raw_secondary.get(trigger_name)
-                            if not isinstance(action_dict, dict):
-                                continue
-                            try:
-                                action = key_mapping.ButtonAction.from_dict(action_dict)
-                            except (KeyError, TypeError, ValueError):
-                                continue
-                            secondary_display_map[button_id][trigger_name] = (
-                                settings_ui._action_to_display(action)
-                            )
+                secondary_display_map[button_id] = {}
+                raw_secondary = self._bindings.get("secondary_bindings", {}).get(
+                    button_id, {}
+                )
+                if isinstance(raw_secondary, dict):
+                    for trigger_name in (
+                        key_mapping.ButtonTrigger.DOUBLE_CLICK.value,
+                        key_mapping.ButtonTrigger.LONG_PRESS.value,
+                    ):
+                        action_dict = raw_secondary.get(trigger_name)
+                        if not isinstance(action_dict, dict):
+                            continue
+                        try:
+                            action = key_mapping.ButtonAction.from_dict(action_dict)
+                        except (KeyError, TypeError, ValueError):
+                            continue
+                        secondary_display_map[button_id][trigger_name] = (
+                            settings_ui._action_to_display(action)
+                        )
             self._model.load_display_map(display_map, secondary_display_map)
 
         def _selected_device_id(self) -> str:
@@ -1023,6 +1013,18 @@ def _load_qt_classes() -> dict:
 
             self._config = saved_config
             self._bindings = saved_bindings
+            saved_mode = key_mapping.VoiceTriggerMode(
+                saved_config.get("voice_trigger_mode", "toggle")
+            )
+            saved_mode_index = self._TRIGGER_MODE_ORDER.index(saved_mode)
+            if saved_mode_index != self._trigger_mode_index:
+                self._trigger_mode_index = saved_mode_index
+                self.triggerModeIndexChanged.emit()
+                self.hotkeyTextChanged.emit()
+            saved_voice_hotkeys = saved_config.get("voice_hotkeys", {})
+            for mode in self._TRIGGER_MODE_ORDER:
+                saved_text = str(saved_voice_hotkeys.get(mode.value, ""))
+                self._set_voice_hotkey_text(mode, saved_text)
             self._load_bindings_into_model()
             self._set_error_message("")
             if self._selected_device_id() == device_catalog.DJI_MIC_2_ID:
@@ -1273,15 +1275,25 @@ def _load_qt_classes() -> dict:
 
         djiControlRows = Property(list, _get_dji_control_rows, constant=True)
 
-        def _get_preset_action_options(self) -> List[str]:
-            return list(_PRESET_ACTION_OPTIONS)
+        def _get_primary_action_options(self) -> List[str]:
+            return list(_PRIMARY_ACTION_OPTIONS)
 
-        presetActionOptions = Property(list, _get_preset_action_options, constant=True)
+        primaryActionOptions = Property(
+            list, _get_primary_action_options, constant=True
+        )
 
-        def _get_mic_row_text(self) -> str:
-            return settings_ui._MIC_ROW_DISPLAY
+        def _get_secondary_action_options(self) -> List[str]:
+            return list(_SECONDARY_ACTION_OPTIONS)
 
-        micRowText = Property(str, _get_mic_row_text, constant=True)
+        secondaryActionOptions = Property(
+            list, _get_secondary_action_options, constant=True
+        )
+
+        # Compatibility alias for older QML probes. New code uses the two
+        # semantically distinct option properties above.
+        presetActionOptions = Property(
+            list, _get_primary_action_options, constant=True
+        )
 
         def _get_photo_source(self) -> str:
             photo_path = resources.find_remote_photo()

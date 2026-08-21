@@ -265,12 +265,12 @@ class ButtonMappingModelTests(unittest.TestCase):
         self.assertEqual(model.data(index, model.HeightRole), hotspot.height)
         self.assertTrue(model.data(index, model.IsVoiceRole))
 
-    def test_mic_row_always_shows_the_fixed_display_regardless_of_loaded_map(self):
+    def test_mic_row_uses_the_loaded_mapping(self):
         model = self.Model()
-        model.load_display_map({"mic": "should be ignored entirely"})
+        model.load_display_map({"mic": "Escape"})
         index = model.index(model.index_of("mic"), 0)
         self.assertTrue(model.data(index, model.IsMicRole))
-        self.assertEqual(model.data(index, model.ActionTextRole), settings_ui._MIC_ROW_DISPLAY)
+        self.assertEqual(model.data(index, model.ActionTextRole), "Escape")
 
     def test_set_action_text_at_updates_a_non_mic_row(self):
         model = self.Model()
@@ -279,12 +279,12 @@ class ButtonMappingModelTests(unittest.TestCase):
         index = model.index(row, 0)
         self.assertEqual(model.data(index, model.ActionTextRole), "escape")
 
-    def test_set_action_text_at_is_a_no_op_for_the_mic_row(self):
+    def test_set_action_text_at_updates_the_mic_row(self):
         model = self.Model()
         row = model.index_of("mic")
-        model.setActionTextAt(row, "should not apply")
+        model.setActionTextAt(row, "方向上")
         index = model.index(row, 0)
-        self.assertEqual(model.data(index, model.ActionTextRole), settings_ui._MIC_ROW_DISPLAY)
+        self.assertEqual(model.data(index, model.ActionTextRole), "方向上")
 
     def test_secondary_action_text_can_be_set_and_round_tripped(self):
         model = self.Model()
@@ -299,13 +299,22 @@ class ButtonMappingModelTests(unittest.TestCase):
             {"double_click": "f5", "long_press": "系统音量 +"},
         )
 
-    def test_to_display_map_round_trips_non_mic_entries_and_excludes_mic(self):
+    def test_mic_secondary_action_can_be_set_and_round_tripped(self):
         model = self.Model()
-        model.load_display_map({"power": "escape", "up": "up"})
+        row = model.index_of("mic")
+        model.setSecondaryActionTextAt(row, "double_click", "Escape")
+        self.assertEqual(
+            model.to_secondary_display_map()["mic"]["double_click"],
+            "Escape",
+        )
+
+    def test_to_display_map_round_trips_all_physical_buttons(self):
+        model = self.Model()
+        model.load_display_map({"power": "escape", "up": "up", "mic": "Escape"})
         result = model.to_display_map()
         self.assertEqual(result["power"], "escape")
         self.assertEqual(result["up"], "up")
-        self.assertNotIn("mic", result)
+        self.assertEqual(result["mic"], "Escape")
 
     def test_unconfigured_secondary_actions_have_an_explicit_display_value(self):
         model = self.Model()
@@ -373,18 +382,25 @@ class SettingsControllerTests(unittest.TestCase):
         controller, _ = self._make_controller()
         self.assertEqual(controller.hotkeyText, "ralt+space")
 
-    def test_trigger_mode_options_has_exactly_toggle_and_hold(self):
+    def test_primary_options_include_both_voice_lifecycles(self):
         controller, _ = self._make_controller()
-        self.assertEqual(len(controller.triggerModeOptions), 2)
+        self.assertIn(settings_ui._VOICE_TOGGLE_DISPLAY, controller.primaryActionOptions)
+        self.assertIn(settings_ui._VOICE_HOLD_DISPLAY, controller.primaryActionOptions)
 
-    def test_trigger_mode_switch_selects_each_recorded_voice_hotkey(self):
+    def test_secondary_options_exclude_voice_lifecycles(self):
         controller, _ = self._make_controller()
-        controller.toggleVoiceHotkeyText = "lalt+space"
-        controller.holdVoiceHotkeyText = "ctrl+l"
-        controller.triggerModeIndex = controller.holdTriggerModeIndex
-        self.assertEqual(controller.hotkeyText, "ctrl+l")
-        controller.triggerModeIndex = controller.toggleTriggerModeIndex
-        self.assertEqual(controller.hotkeyText, "lalt+space")
+        self.assertNotIn(
+            settings_ui._VOICE_TOGGLE_DISPLAY,
+            controller.secondaryActionOptions,
+        )
+        self.assertNotIn(
+            settings_ui._VOICE_HOLD_DISPLAY,
+            controller.secondaryActionOptions,
+        )
+        self.assertIn(
+            settings_ui.SECONDARY_UNCONFIGURED_DISPLAY,
+            controller.secondaryActionOptions,
+        )
 
     def test_recording_a_hotkey_does_not_change_trigger_semantics(self):
         controller, _ = self._make_controller()
@@ -423,10 +439,6 @@ class SettingsControllerTests(unittest.TestCase):
         self.assertIn("Windows WASAPI", selected)
         self.assertIn("WDM-KS", controller.statusMessage)
         self.assertIn("点击保存后才会写入", controller.statusMessage)
-
-    def test_mic_row_text_matches_settings_ui_constant(self):
-        controller, _ = self._make_controller()
-        self.assertEqual(controller.micRowText, settings_ui._MIC_ROW_DISPLAY)
 
     def test_photo_available_and_source_are_consistent(self):
         controller, _ = self._make_controller()
@@ -493,11 +505,15 @@ class SettingsControllerTests(unittest.TestCase):
         self.assertIn("保存失败", controller.errorMessage)
         self.assertIn("settings file is locked", controller.errorMessage)
 
-    def test_save_settings_persists_both_voice_shortcuts_and_the_selected_one(self):
-        controller, _ = self._make_controller()
+    def test_save_settings_uses_the_mapped_voice_lifecycle(self):
+        controller, model = self._make_controller()
         controller.toggleVoiceHotkeyText = "lalt+space"
         controller.holdVoiceHotkeyText = "ctrl+l"
-        controller.triggerModeIndex = controller.holdTriggerModeIndex
+        model.setActionTextAt(model.index_of("mic"), "Escape")
+        model.setActionTextAt(
+            model.index_of("up"),
+            settings_ui._VOICE_HOLD_DISPLAY,
+        )
 
         self.assertTrue(controller.saveSettings())
 
@@ -509,13 +525,13 @@ class SettingsControllerTests(unittest.TestCase):
 
     def test_save_settings_with_empty_hotkey_fails_and_reports_error(self):
         controller, _ = self._make_controller()
-        controller.hotkeyText = ""
+        controller.toggleVoiceHotkeyText = ""
         self.assertFalse(controller.saveSettings())
         self.assertNotEqual(controller.errorMessage, "")
 
     def test_save_and_launch_never_launches_when_save_fails(self):
         controller, _ = self._make_controller()
-        controller.hotkeyText = ""
+        controller.toggleVoiceHotkeyText = ""
         with mock.patch.object(bridge_launcher, "launch_bridge") as fake_launch:
             controller.saveAndLaunch()
         fake_launch.assert_not_called()
@@ -531,16 +547,19 @@ class SettingsControllerTests(unittest.TestCase):
         self.assertIn("4321", controller.launchStatusText)
         self.assertNotIn("已连接", controller.launchStatusText)
 
-    def test_restore_defaults_resets_hotkey_and_trigger_mode(self):
-        controller, _ = self._make_controller()
+    def test_restore_defaults_resets_both_hotkeys_and_mic_mapping(self):
+        controller, model = self._make_controller()
         controller.toggleVoiceHotkeyText = "shift+z"
         controller.holdVoiceHotkeyText = "ctrl+l"
-        controller.triggerModeIndex = 1
+        model.setActionTextAt(model.index_of("mic"), "Escape")
         controller.restoreDefaults()
-        self.assertEqual(controller.hotkeyText, hotkey.DEFAULT_VOICE_HOTKEY.serialize())
         self.assertEqual(controller.toggleVoiceHotkeyText, "ralt+space")
         self.assertEqual(controller.holdVoiceHotkeyText, "ralt")
-        self.assertEqual(controller.triggerModeIndex, 0)
+        mic_index = model.index(model.index_of("mic"), 0)
+        self.assertEqual(
+            model.data(mic_index, model.ActionTextRole),
+            settings_ui._VOICE_TOGGLE_DISPLAY,
+        )
 
     def test_select_button_updates_both_the_controller_and_the_model(self):
         controller, model = self._make_controller()
@@ -2103,7 +2122,7 @@ class RenderedContrastTests(unittest.TestCase):
     _LABELS = {
         "connectionTabButton": "「连接」tab label",
         "openLogButton": "「打开日志目录」button",
-        "toggleVoiceHotkeyField": "开关型宿主语音快捷键 TextField",
+        "toggleVoiceHotkeyField": "开关型语音快捷键 TextField",
     }
 
     def test_tab_button_plain_button_and_text_field_are_all_readable(self):

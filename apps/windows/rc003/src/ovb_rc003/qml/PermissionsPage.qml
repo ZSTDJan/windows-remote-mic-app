@@ -87,8 +87,8 @@ Item {
                             Label {
                                 Layout.fillWidth: true
                                 wrapMode: Text.WordWrap
-                                text: qsTr("遥控器的语音键通过合成 Win+H 触发 Windows 自带的联机语音"
-                                    + "听写；这需要 Windows「语音识别」已启用，以及系统麦克风输入选择"
+                                text: qsTr("映射为语音的遥控器按键会发送上页录入的输入法快捷键；"
+                                    + "请同时确认目标输入法允许语音输入，并把系统麦克风输入选择为"
                                     + "正确的设备（例如 VB-CABLE 的 CABLE Output）。")
                                 color: tokens.textSecondary
                                 font.pixelSize: tokens.fontSizeSmall

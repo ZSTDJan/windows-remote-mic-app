@@ -4,18 +4,16 @@ endpoint, bridge-launch and log-location status text.
 This module is deliberately Tk/Qt-free (XRBM-030 replaced the previous Tk
 view with a PySide6-Essentials + Qt Quick/QML one - see
 ``qt_settings_app.py`` and ``qml/`` - but every piece of validation/save/
-launch/log-status logic below is unchanged and stays here so it keeps being
+launch/log-status logic below stays here so it remains
 directly unit-testable without constructing any window at all, matching the
 contract fixed after XRBM-014 review RETRY P1 #7): every piece of
 validation/save logic is a plain function (``_action_to_display``,
 ``_display_to_action``, ``build_save_model``, ``_endpoint_display``,
 ``_parse_endpoint_display``, ``describe_launch_result``,
 ``describe_log_open_result``) that tests call directly - see
-tests/test_settings_ui_helpers.py. The previous bug (the default "mic"
-mapping's display string had no reverse mapping back to
-``ActionKind.VOICE``, so a user who changed nothing - or clicked "restore
-defaults" - could not save) is covered by an explicit round-trip test on
-``_VOICE_DISPLAY``.
+tests/test_settings_ui_helpers.py. Legacy ``ActionKind.VOICE`` remains
+round-trippable, while new saves use explicit toggle/hold voice actions on
+the selected physical button.
 
 ``main()`` at the bottom of this module is the only place that touches Qt at
 all, and does so via a lazy import inside the function body - importing this
@@ -102,20 +100,18 @@ def voice_hotkey_for_trigger_mode(trigger_mode: key_mapping.VoiceTriggerMode) ->
 
     return key_mapping.voice_hotkey_for_trigger_mode(trigger_mode)
 
-# The exact display string for a "mic" (ActionKind.VOICE) button mapping.
-# _display_to_action must recognize this literal string and round-trip it
-# back to ActionKind.VOICE - it must NOT be handed to HotkeySpec.parse.
+# Legacy generic voice text is still accepted so an older in-memory model can
+# be saved without being parsed as a keyboard chord. New rows always display
+# one of the two explicit lifecycle actions below.
 _VOICE_DISPLAY = "语音（使用专用组合键）"
+_VOICE_TOGGLE_DISPLAY = "开关型语音"
+_VOICE_HOLD_DISPLAY = "按住型语音"
+_PRIMARY_VOICE_DISPLAYS = (_VOICE_TOGGLE_DISPLAY, _VOICE_HOLD_DISPLAY)
 
 # Secondary gestures are optional.  Keep an explicit display value in the
 # editable ComboBox so Qt does not fall back to the first real preset (usually
 # ``escape``) when an older key_bindings.json has no secondary_bindings map.
 SECONDARY_UNCONFIGURED_DISPLAY = "未设置"
-
-# The microphone button remains a VOICE lifecycle action (it cannot be changed
-# into an unrelated normal-key mapping), but the host chord it emits is
-# editable through SettingsController.hotkeyText in the same row.
-_MIC_ROW_DISPLAY = "触发语音（生命周期与宿主快捷键分别设置）"
 
 # device_profile.ALL_BUTTON_IDS also carries "volume_mute", a HID usage-table
 # entry kept for protocol compatibility (see key_mapping.py's module
@@ -146,6 +142,10 @@ def _action_to_display(action: key_mapping.ButtonAction) -> str:
         return "禁用"
     if action.kind == key_mapping.ActionKind.VOICE:
         return _VOICE_DISPLAY
+    if action.kind == key_mapping.ActionKind.VOICE_TOGGLE:
+        return _VOICE_TOGGLE_DISPLAY
+    if action.kind == key_mapping.ActionKind.VOICE_HOLD:
+        return _VOICE_HOLD_DISPLAY
     reference_label = _REFERENCE_ACTION_LABELS.get(action.kind)
     if reference_label is not None:
         return reference_label
@@ -163,6 +163,10 @@ def _display_to_action(text: str) -> key_mapping.ButtonAction:
         return key_mapping.ButtonAction(key_mapping.ActionKind.DISABLED)
     if text == _VOICE_DISPLAY:
         return key_mapping.ButtonAction(key_mapping.ActionKind.VOICE)
+    if text == _VOICE_TOGGLE_DISPLAY:
+        return key_mapping.ButtonAction(key_mapping.ActionKind.VOICE_TOGGLE)
+    if text == _VOICE_HOLD_DISPLAY:
+        return key_mapping.ButtonAction(key_mapping.ActionKind.VOICE_HOLD)
     if text == "系统音量 -":
         text = "系统音量 −"
     reference_kind = _REFERENCE_ACTION_KINDS_BY_LABEL.get(text)
@@ -232,9 +236,38 @@ def build_save_model(
             }
         )
 
-    active_hotkey_text = mode_hotkeys[trigger_mode.value]
-    if not active_hotkey_text:
-        raise SettingsValidationError(None, "请先录入当前语音方式的宿主快捷键")
+    bindings: Dict[str, dict] = {}
+    voice_binding: Optional[Tuple[str, key_mapping.VoiceTriggerMode]] = None
+    for button_id, text in button_display_map.items():
+        text = text.strip()
+        if not text:
+            continue
+        try:
+            action = _display_to_action(text)
+        except hotkey.HotkeyParseError as exc:
+            raise SettingsValidationError(button_id, str(exc)) from exc
+        voice_mode = key_mapping.voice_trigger_mode_for_action(
+            action,
+            legacy_mode=trigger_mode,
+        )
+        if voice_mode is not None:
+            if voice_binding is not None:
+                raise SettingsValidationError(
+                    button_id,
+                    "只能设置一个语音主按键；请先把另一个按键的“开关型语音”或"
+                    "“按住型语音”改为其他动作。",
+                )
+            voice_binding = (button_id, voice_mode)
+            action = key_mapping.voice_action_for_trigger_mode(voice_mode)
+        bindings[button_id] = action.to_dict()
+
+    active_mode = voice_binding[1] if voice_binding is not None else trigger_mode
+    active_hotkey_text = mode_hotkeys[active_mode.value]
+    if voice_binding is not None and not active_hotkey_text:
+        raise SettingsValidationError(
+            voice_binding[0],
+            f"请先录入{_TRIGGER_MODE_LABELS[active_mode]}的语音快捷键",
+        )
 
     for mode in key_mapping.VoiceTriggerMode:
         candidate = mode_hotkeys[mode.value]
@@ -254,17 +287,6 @@ def build_save_model(
                 None, f"{_TRIGGER_MODE_LABELS[mode]}快捷键：{exc}"
             ) from exc
 
-    bindings: Dict[str, dict] = {}
-    for button_id, text in button_display_map.items():
-        text = text.strip()
-        if not text:
-            continue
-        try:
-            action = _display_to_action(text)
-        except hotkey.HotkeyParseError as exc:
-            raise SettingsValidationError(button_id, str(exc)) from exc
-        bindings[button_id] = action.to_dict()
-
     if secondary_display_map is None:
         raw_secondary = base_bindings.get("secondary_bindings", {})
         secondary_bindings = (
@@ -277,7 +299,7 @@ def build_save_model(
             key_mapping.ButtonTrigger.LONG_PRESS.value,
         }
         for button_id, trigger_map in secondary_display_map.items():
-            if button_id == "mic" or not isinstance(trigger_map, dict):
+            if not isinstance(trigger_map, dict):
                 continue
             for trigger_name, text in trigger_map.items():
                 if trigger_name not in valid_triggers:
@@ -297,19 +319,12 @@ def build_save_model(
                     raise SettingsValidationError(button_id, str(exc)) from exc
                 if action.kind == key_mapping.ActionKind.DISABLED:
                     continue
+                if key_mapping.is_voice_action(action):
+                    raise SettingsValidationError(
+                        button_id,
+                        "语音动作只能用于主映射，不能设置为双击或长按动作。",
+                    )
                 secondary_bindings.setdefault(button_id, {})[trigger_name] = action.to_dict()
-
-    # The physical mic button is always driven directly by the ATVV voice
-    # lifecycle (see app.py) - the runtime never consults a stored "mic"
-    # binding at all. Force it to VOICE unconditionally regardless of what
-    # button_display_map contained: the settings window no longer offers an
-    # editable mic row (see ButtonMappingModel in qt_settings_app.py), but
-    # this is the authoritative, UI-independent guarantee that this save
-    # path can never
-    # persist a stale/misleading non-voice mic action (XRBM-019 In-scope
-    # item 6, folded in from XRBM-018's independent review round 2's
-    # product-contract follow-up).
-    bindings["mic"] = key_mapping.ButtonAction(key_mapping.ActionKind.VOICE).to_dict()
 
     endpoint_name, endpoint_host_api = _parse_endpoint_display(endpoint_display_text)
 
@@ -319,7 +334,7 @@ def build_save_model(
     )
     new_config["voice_hotkey"] = active_hotkey_text
     new_config["voice_hotkeys"] = mode_hotkeys
-    new_config["voice_trigger_mode"] = trigger_mode.value
+    new_config["voice_trigger_mode"] = active_mode.value
     new_config["output_endpoint_name"] = endpoint_name
     new_config["output_endpoint_host_api"] = endpoint_host_api
 
@@ -356,7 +371,6 @@ def default_display_state() -> DefaultDisplayState:
             key_mapping.ButtonTrigger.LONG_PRESS.value: "",
         }
         for button_id in _USER_FACING_BUTTON_IDS
-        if button_id != "mic"
     }
     voice_hotkeys = {
         mode.value: key_mapping.voice_hotkey_for_trigger_mode(mode)

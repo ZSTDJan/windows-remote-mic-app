@@ -347,37 +347,12 @@ Item {
                         spacing: tokens.spacingSmall
 
                         Label {
-                            text: qsTr("语音键")
+                            text: qsTr("语音快捷键")
                             font.pixelSize: tokens.fontSizeTitle
                             font.bold: true
                             color: tokens.textPrimary
                         }
                         Item { Layout.fillWidth: true }
-                        Label {
-                            text: qsTr("遥控器触发方式")
-                            color: tokens.textSecondary
-                            font.pixelSize: tokens.fontSizeSmall
-                        }
-                        Button {
-                            id: toggleVoiceModeButton
-                            objectName: "toggleVoiceModeButton"
-                            text: qsTr("按一下切换")
-                            highlighted: SettingsController.triggerModeIndex
-                                === SettingsController.toggleTriggerModeIndex
-                            onClicked: SettingsController.triggerModeIndex
-                                = SettingsController.toggleTriggerModeIndex
-                            Accessible.name: qsTr("遥控器按一下切换语音")
-                        }
-                        Button {
-                            id: holdVoiceModeButton
-                            objectName: "holdVoiceModeButton"
-                            text: qsTr("按住说话")
-                            highlighted: SettingsController.triggerModeIndex
-                                === SettingsController.holdTriggerModeIndex
-                            onClicked: SettingsController.triggerModeIndex
-                                = SettingsController.holdTriggerModeIndex
-                            Accessible.name: qsTr("遥控器按住说话")
-                        }
                     }
 
                     GridLayout {
@@ -387,7 +362,7 @@ Item {
                         rowSpacing: tokens.spacingTiny
 
                         Label {
-                            text: qsTr("开关型宿主快捷键")
+                            text: qsTr("开关型语音快捷键")
                             color: tokens.textPrimary
                             font.pixelSize: tokens.fontSizeSmall
                         }
@@ -399,18 +374,18 @@ Item {
                             placeholderText: qsTr("例如 lalt+space")
                             selectByMouse: true
                             onEditingFinished: SettingsController.toggleVoiceHotkeyText = text
-                            Accessible.name: qsTr("开关型宿主语音快捷键")
+                            Accessible.name: qsTr("开关型语音快捷键")
                         }
                         Button {
                             text: qsTr("录")
                             Layout.preferredWidth: 34
                             Layout.minimumWidth: 30
                             onClicked: root.openShortcutRecorder("", -1, "", "toggle")
-                            Accessible.name: qsTr("录制开关型宿主语音快捷键")
+                            Accessible.name: qsTr("录制开关型语音快捷键")
                         }
 
                         Label {
-                            text: qsTr("按住型宿主快捷键")
+                            text: qsTr("按住型语音快捷键")
                             color: tokens.textPrimary
                             font.pixelSize: tokens.fontSizeSmall
                         }
@@ -422,14 +397,14 @@ Item {
                             placeholderText: qsTr("例如 ctrl+l")
                             selectByMouse: true
                             onEditingFinished: SettingsController.holdVoiceHotkeyText = text
-                            Accessible.name: qsTr("按住型宿主语音快捷键")
+                            Accessible.name: qsTr("按住型语音快捷键")
                         }
                         Button {
                             text: qsTr("录")
                             Layout.preferredWidth: 34
                             Layout.minimumWidth: 30
                             onClicked: root.openShortcutRecorder("", -1, "", "hold")
-                            Accessible.name: qsTr("录制按住型宿主语音快捷键")
+                            Accessible.name: qsTr("录制按住型语音快捷键")
                         }
                     }
 
@@ -503,7 +478,7 @@ Item {
                         anchors.left: parent.left
                         anchors.right: parent.right
                         anchors.top: parent.top
-                        anchors.bottom: mappingRow.isMic ? micHint.top : gestureRow.top
+                        anchors.bottom: gestureRow.top
                         anchors.leftMargin: tokens.spacingSmall
                         anchors.rightMargin: tokens.spacingSmall
                         anchors.topMargin: tokens.spacingSmall
@@ -539,14 +514,13 @@ Item {
                             // real, stable hook, not a fake production
                             // behavior.
                             objectName: "actionCombo_" + mappingRow.buttonId
-                            visible: !mappingRow.isMic
                             Layout.fillWidth: true
                             Layout.minimumWidth: 0
                             editable: true
-                            model: SettingsController.presetActionOptions
+                            model: SettingsController.primaryActionOptions
                             Accessible.name: mappingRow.displayName
                             ToolTip.visible: hovered
-                            ToolTip.text: qsTr("可直接输入任意单键或组合键，例如 f8、ctrl+shift+p；输入“禁用”可关闭此键。")
+                            ToolTip.text: qsTr("可选择开关型语音、按住型语音或任意单键/组合键；输入“禁用”可关闭此键。")
 
                             // Guards onEditTextChanged below against the
                             // SAME construction-time noise
@@ -555,7 +529,7 @@ Item {
                             // fires during construction, before this flag is
                             // set true) - without it, every row would
                             // immediately persist its transient default
-                            // ("escape", index 0 of presetActionOptions)
+                            // (the first primary action option)
                             // into the model the instant it's created,
                             // reintroducing the "all rows show/save escape"
                             // bug this task's own screenshot step caught
@@ -609,23 +583,8 @@ Item {
                             onActivated: ButtonMappingModel.setActionTextAt(mappingRow.index, currentText)
                         }
 
-                        Label {
-                            id: voiceActionLabel
-                            objectName: "voiceActionLabel_" + mappingRow.buttonId
-                            visible: mappingRow.isMic
-                            Layout.fillWidth: true
-                            Layout.minimumWidth: 0
-                            text: SettingsController.activeVoiceActionText
-                            color: tokens.voiceAccent
-                            font.pixelSize: tokens.fontSizeBody
-                            font.bold: true
-                            elide: Text.ElideRight
-                            Accessible.name: qsTr("当前麦克风动作")
-                        }
-
                         Button {
                             objectName: "recordShortcut_" + mappingRow.buttonId
-                            visible: !mappingRow.isMic
                             text: qsTr("录")
                             Layout.preferredWidth: 34
                             Layout.minimumWidth: 30
@@ -637,21 +596,6 @@ Item {
                         }
                     }
 
-                    Label {
-                        id: micHint
-                        anchors.left: parent.left
-                        anchors.right: parent.right
-                        anchors.bottom: parent.bottom
-                        anchors.leftMargin: tokens.spacingSmall
-                        anchors.rightMargin: tokens.spacingSmall
-                        anchors.bottomMargin: tokens.spacingSmall
-                        visible: mappingRow.isMic
-                        text: qsTr("宿主快捷键：") + SettingsController.hotkeyText
-                        color: tokens.textSecondary
-                        font.pixelSize: tokens.fontSizeSmall
-                        elide: Text.ElideRight
-                    }
-
                     RowLayout {
                         id: gestureRow
                         anchors.left: parent.left
@@ -660,7 +604,6 @@ Item {
                         anchors.leftMargin: tokens.spacingSmall
                         anchors.rightMargin: tokens.spacingSmall
                         anchors.bottomMargin: tokens.spacingSmall
-                        visible: !mappingRow.isMic
                         height: 38
                         spacing: tokens.spacingTiny
 
@@ -675,9 +618,9 @@ Item {
                             Layout.fillWidth: true
                             Layout.minimumWidth: 0
                             editable: true
-                            model: SettingsController.presetActionOptions
+                            model: SettingsController.secondaryActionOptions
                             ToolTip.visible: hovered
-                            ToolTip.text: qsTr("双击动作；配置后等待约 0.3 秒区分单击和双击")
+                            ToolTip.text: qsTr("双击动作；配置后等待约 0.3 秒区分单击和双击。语音动作仅可用于主映射。")
                             property bool _initialized: false
                             Component.onCompleted: {
                                 editText = mappingRow.doubleClickText
@@ -718,9 +661,9 @@ Item {
                             Layout.fillWidth: true
                             Layout.minimumWidth: 0
                             editable: true
-                            model: SettingsController.presetActionOptions
+                            model: SettingsController.secondaryActionOptions
                             ToolTip.visible: hovered
-                            ToolTip.text: qsTr("长按动作；按住约 0.55 秒触发并抑制单击")
+                            ToolTip.text: qsTr("长按动作；按住约 0.55 秒触发并抑制单击。语音动作仅可用于主映射。")
                             property bool _initialized: false
                             Component.onCompleted: {
                                 editText = mappingRow.longPressText

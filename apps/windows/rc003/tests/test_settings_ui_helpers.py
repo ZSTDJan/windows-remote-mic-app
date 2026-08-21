@@ -6,13 +6,16 @@ dataclasses); none of it touches ``tkinter.Tk``/``Toplevel``/mainloop.
 """
 
 import unittest
+import tempfile
 from pathlib import Path
 
-from ovb_rc003 import audio_output, bridge_launcher, hotkey, key_mapping, logging_setup, single_instance
+from ovb_rc003 import audio_output, bridge_launcher, config, hotkey, key_mapping, logging_setup, single_instance
 from ovb_rc003.settings_ui import (
     LAUNCH_NOT_STARTED_TEXT,
     SettingsValidationError,
     _VOICE_DISPLAY,
+    _VOICE_HOLD_DISPLAY,
+    _VOICE_TOGGLE_DISPLAY,
     _action_to_display,
     _display_to_action,
     _endpoint_display,
@@ -111,6 +114,16 @@ class DisplayRoundTripTests(unittest.TestCase):
         self.assertEqual(restored.kind, key_mapping.ActionKind.VOICE)
         self.assertEqual(restored.keys, ())
 
+    def test_explicit_voice_actions_round_trip(self):
+        expected = {
+            _VOICE_TOGGLE_DISPLAY: key_mapping.ActionKind.VOICE_TOGGLE,
+            _VOICE_HOLD_DISPLAY: key_mapping.ActionKind.VOICE_HOLD,
+        }
+        for display, kind in expected.items():
+            action = _display_to_action(display)
+            self.assertEqual(action.kind, kind)
+            self.assertEqual(_action_to_display(action), display)
+
     def test_unknown_key_is_rejected_before_it_can_break_runtime_input(self):
         with self.assertRaises(hotkey.HotkeyParseError):
             _display_to_action("ctrl+not_a_real_key")
@@ -163,21 +176,17 @@ class BuildSaveModelTests(unittest.TestCase):
         # Direct regression test for the P1 #7 bug via the actual save path
         # a user hits when they change nothing (or click "restore defaults").
         new_config, new_bindings = build_save_model(
-            button_display_map={"mic": _VOICE_DISPLAY, "power": "escape"},
+            button_display_map={"mic": _VOICE_TOGGLE_DISPLAY, "power": "escape"},
             hotkey_text="win+h",
             trigger_mode=key_mapping.VoiceTriggerMode.TOGGLE,
             endpoint_display_text="",
             base_config=self.base_config,
             base_bindings=self.base_bindings,
         )
-        self.assertEqual(new_bindings["bindings"]["mic"]["kind"], "voice")
+        self.assertEqual(new_bindings["bindings"]["mic"]["kind"], "voice_toggle")
         self.assertEqual(new_bindings["bindings"]["power"]["kind"], "key_combo")
 
-    def test_mic_is_forced_to_voice_even_if_the_display_map_says_otherwise(self):
-        # XRBM-019 In-scope item 6: the settings UI no longer offers an
-        # editable mic row at all, but build_save_model() is the
-        # authoritative, UI-independent guarantee - even a caller that
-        # somehow passes a non-voice "mic" entry must not have it saved.
+    def test_mic_can_be_saved_as_an_ordinary_action(self):
         new_config, new_bindings = build_save_model(
             button_display_map={"mic": "escape", "power": "escape"},
             hotkey_text="win+h",
@@ -186,13 +195,12 @@ class BuildSaveModelTests(unittest.TestCase):
             base_config=self.base_config,
             base_bindings=self.base_bindings,
         )
-        self.assertEqual(new_bindings["bindings"]["mic"], {"kind": "voice", "keys": []})
+        self.assertEqual(
+            new_bindings["bindings"]["mic"],
+            {"kind": "key_combo", "keys": ["escape"]},
+        )
 
-    def test_mic_is_forced_to_voice_even_when_absent_from_the_display_map(self):
-        # Matches the real settings window: "mic" is never in
-        # self._mapping_vars at all (see SettingsWindow._build), so the
-        # display map it hands to build_save_model() never even mentions
-        # "mic" - the save path must still produce a voice entry for it.
+    def test_absent_mic_mapping_is_not_synthesized(self):
         new_config, new_bindings = build_save_model(
             button_display_map={"power": "escape"},
             hotkey_text="win+h",
@@ -201,7 +209,7 @@ class BuildSaveModelTests(unittest.TestCase):
             base_config=self.base_config,
             base_bindings=self.base_bindings,
         )
-        self.assertEqual(new_bindings["bindings"]["mic"], {"kind": "voice", "keys": []})
+        self.assertNotIn("mic", new_bindings["bindings"])
 
     def test_restore_defaults_state_saves_without_raising(self):
         defaults = default_display_state()
@@ -213,7 +221,7 @@ class BuildSaveModelTests(unittest.TestCase):
             base_config=self.base_config,
             base_bindings=self.base_bindings,
         )
-        self.assertEqual(new_bindings["bindings"]["mic"]["kind"], "voice")
+        self.assertEqual(new_bindings["bindings"]["mic"]["kind"], "voice_toggle")
         self.assertEqual(new_config["voice_hotkey"], "ralt+space")
 
     def test_invalid_hotkey_raises_with_no_button_id(self):
@@ -266,7 +274,7 @@ class BuildSaveModelTests(unittest.TestCase):
 
     def test_two_voice_shortcuts_are_saved_and_selected_by_trigger_mode(self):
         new_config, _ = build_save_model(
-            button_display_map={},
+            button_display_map={"up": _VOICE_HOLD_DISPLAY},
             hotkey_text="ignored-active-alias",
             trigger_mode=key_mapping.VoiceTriggerMode.HOLD,
             endpoint_display_text="",
@@ -293,7 +301,7 @@ class BuildSaveModelTests(unittest.TestCase):
     def test_blank_active_voice_shortcut_is_rejected(self):
         with self.assertRaises(SettingsValidationError) as ctx:
             build_save_model(
-                button_display_map={},
+                button_display_map={"up": _VOICE_HOLD_DISPLAY},
                 hotkey_text="",
                 trigger_mode=key_mapping.VoiceTriggerMode.HOLD,
                 endpoint_display_text="",
@@ -301,7 +309,71 @@ class BuildSaveModelTests(unittest.TestCase):
                 base_bindings=self.base_bindings,
                 voice_hotkeys={"toggle": "lalt+space", "hold": ""},
             )
-        self.assertIn("当前语音方式", ctx.exception.message)
+        self.assertEqual(ctx.exception.button_id, "up")
+        self.assertIn("按住说话", ctx.exception.message)
+
+    def test_mapped_voice_mode_selects_its_own_shortcut(self):
+        new_config, _ = build_save_model(
+            button_display_map={"up": _VOICE_HOLD_DISPLAY, "mic": "Escape"},
+            hotkey_text="ignored-active-alias",
+            trigger_mode=key_mapping.VoiceTriggerMode.TOGGLE,
+            endpoint_display_text="",
+            base_config=self.base_config,
+            base_bindings=self.base_bindings,
+            voice_hotkeys={"toggle": "lalt+space", "hold": "ctrl+l"},
+        )
+        self.assertEqual(new_config["voice_trigger_mode"], "hold")
+        self.assertEqual(new_config["voice_hotkey"], "ctrl+l")
+
+    def test_two_primary_voice_buttons_are_rejected(self):
+        with self.assertRaises(SettingsValidationError) as ctx:
+            build_save_model(
+                button_display_map={
+                    "mic": _VOICE_TOGGLE_DISPLAY,
+                    "up": _VOICE_HOLD_DISPLAY,
+                },
+                hotkey_text="ralt+space",
+                trigger_mode=key_mapping.VoiceTriggerMode.TOGGLE,
+                endpoint_display_text="",
+                base_config=self.base_config,
+                base_bindings=self.base_bindings,
+            )
+        self.assertEqual(ctx.exception.button_id, "up")
+        self.assertIn("只能设置一个语音主按键", ctx.exception.message)
+
+    def test_secondary_voice_action_is_rejected(self):
+        with self.assertRaises(SettingsValidationError) as ctx:
+            build_save_model(
+                button_display_map={"mic": "Escape"},
+                secondary_display_map={
+                    "up": {"double_click": _VOICE_TOGGLE_DISPLAY}
+                },
+                hotkey_text="ralt+space",
+                trigger_mode=key_mapping.VoiceTriggerMode.TOGGLE,
+                endpoint_display_text="",
+                base_config=self.base_config,
+                base_bindings=self.base_bindings,
+            )
+        self.assertEqual(ctx.exception.button_id, "up")
+        self.assertIn("只能用于主映射", ctx.exception.message)
+
+    def test_zero_voice_buttons_are_allowed(self):
+        new_config, new_bindings = build_save_model(
+            button_display_map={"mic": "Escape", "up": "方向上"},
+            hotkey_text="",
+            trigger_mode=key_mapping.VoiceTriggerMode.TOGGLE,
+            endpoint_display_text="",
+            base_config=self.base_config,
+            base_bindings=self.base_bindings,
+            voice_hotkeys={"toggle": "", "hold": ""},
+        )
+        self.assertEqual(new_bindings["bindings"]["mic"]["kind"], "escape")
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.json"
+            config.save_config(path, new_config)
+            reloaded = config.load_config(path)
+        self.assertEqual(reloaded["voice_hotkey"], "")
+        self.assertEqual(reloaded["voice_hotkeys"], {"toggle": "", "hold": ""})
 
     def test_does_not_mutate_base_dicts(self):
         base_config_copy = dict(self.base_config)

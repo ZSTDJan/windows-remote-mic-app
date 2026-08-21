@@ -433,30 +433,22 @@ class RoundTripTests(unittest.TestCase):
         )
 
 
-class MicBindingTruthfulnessTests(unittest.TestCase):
-    """XRBM-019 In-scope item 6: the physical mic button is always driven
-    directly by the ATVV voice lifecycle - the runtime never consults a
-    stored "mic" binding. load_key_bindings() must normalize a stale
-    non-voice "mic" entry back to voice, not silently keep it around
-    looking like it does something (XRBM-018's independent review
-    round 2 product-contract follow-up).
-    """
-
-    def test_a_stale_non_voice_mic_binding_on_disk_is_normalized_on_load(self):
+class EditableMicBindingTests(unittest.TestCase):
+    def test_an_ordinary_mic_binding_on_disk_is_preserved(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "key_bindings.json"
             stale = config.default_key_bindings()
-            # Simulates a legacy file (or a hand-edited one) that saved an
-            # ordinary key-combo for "mic" - something the runtime has
-            # never actually honored.
             stale["bindings"]["mic"] = {"kind": "key_combo", "keys": ["a"]}
             path.write_text(json.dumps(stale), encoding="utf-8")
 
             loaded = config.load_key_bindings(path)
 
-            self.assertEqual(loaded["bindings"]["mic"], {"kind": "voice", "keys": []})
+            self.assertEqual(
+                loaded["bindings"]["mic"],
+                {"kind": "key_combo", "keys": ["a"]},
+            )
 
-    def test_a_missing_mic_binding_on_disk_is_filled_in_as_voice(self):
+    def test_a_missing_mic_binding_uses_the_new_toggle_default(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "key_bindings.json"
             stale = config.default_key_bindings()
@@ -465,11 +457,44 @@ class MicBindingTruthfulnessTests(unittest.TestCase):
 
             loaded = config.load_key_bindings(path)
 
-            self.assertEqual(loaded["bindings"]["mic"], {"kind": "voice", "keys": []})
+            self.assertEqual(
+                loaded["bindings"]["mic"],
+                {"kind": "voice_toggle", "keys": []},
+            )
 
-    def test_default_key_bindings_mic_is_already_voice(self):
+    def test_default_key_bindings_mic_is_explicit_toggle_voice(self):
         self.assertEqual(
-            config.default_key_bindings()["bindings"]["mic"], {"kind": "voice", "keys": []}
+            config.default_key_bindings()["bindings"]["mic"],
+            {"kind": "voice_toggle", "keys": []},
+        )
+
+    def test_legacy_generic_voice_binding_is_preserved_for_cross_file_migration(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "key_bindings.json"
+            stored = config.default_key_bindings()
+            stored["bindings"]["mic"] = {"kind": "voice", "keys": []}
+            path.write_text(json.dumps(stored), encoding="utf-8")
+
+            loaded = config.load_key_bindings(path)
+
+        self.assertEqual(loaded["bindings"]["mic"], {"kind": "voice", "keys": []})
+
+    def test_mic_secondary_mapping_is_preserved(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "key_bindings.json"
+            stored = config.default_key_bindings()
+            stored["secondary_bindings"] = {
+                "mic": {
+                    "double_click": {"kind": "escape", "keys": []}
+                }
+            }
+            path.write_text(json.dumps(stored), encoding="utf-8")
+
+            loaded = config.load_key_bindings(path)
+
+        self.assertEqual(
+            loaded["secondary_bindings"]["mic"]["double_click"]["kind"],
+            "escape",
         )
 
 

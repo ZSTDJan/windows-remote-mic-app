@@ -52,7 +52,12 @@ class ActionKind(str, Enum):
     SYSTEM_VOLUME_DOWN = "system_volume_down"
     SYSTEM_VOLUME_MUTE = "system_volume_mute"
     PLAY_PAUSE = "play_pause"
+    # ``VOICE`` is retained only for key_bindings.json files written by
+    # builds that selected the lifecycle globally. New saves use one of the
+    # explicit actions below so the lifecycle follows the mapped button.
     VOICE = "voice"
+    VOICE_TOGGLE = "voice_toggle"
+    VOICE_HOLD = "voice_hold"
     OPEN_REMOTE_MIC = "open_remote_mic"
     OPEN_CODEX = "open_codex"
     OPEN_CLAUDE = "open_claude"
@@ -78,6 +83,48 @@ class ButtonTrigger(str, Enum):
 class VoiceTriggerMode(str, Enum):
     TOGGLE = "toggle"
     HOLD = "hold"
+
+
+VOICE_ACTION_KINDS = frozenset(
+    {
+        ActionKind.VOICE,
+        ActionKind.VOICE_TOGGLE,
+        ActionKind.VOICE_HOLD,
+    }
+)
+
+
+def is_voice_action(action: "ButtonAction") -> bool:
+    """Return whether ``action`` owns the RC003 voice lifecycle."""
+
+    return action.kind in VOICE_ACTION_KINDS
+
+
+def voice_action_for_trigger_mode(trigger_mode: VoiceTriggerMode) -> "ButtonAction":
+    """Build the explicit primary mapping for one voice lifecycle."""
+
+    kind = (
+        ActionKind.VOICE_TOGGLE
+        if trigger_mode == VoiceTriggerMode.TOGGLE
+        else ActionKind.VOICE_HOLD
+    )
+    return ButtonAction(kind)
+
+
+def voice_trigger_mode_for_action(
+    action: "ButtonAction",
+    *,
+    legacy_mode: Optional[VoiceTriggerMode] = None,
+) -> Optional[VoiceTriggerMode]:
+    """Resolve an explicit voice action, preserving legacy ``VOICE`` files."""
+
+    if action.kind == ActionKind.VOICE_TOGGLE:
+        return VoiceTriggerMode.TOGGLE
+    if action.kind == ActionKind.VOICE_HOLD:
+        return VoiceTriggerMode.HOLD
+    if action.kind == ActionKind.VOICE:
+        return legacy_mode
+    return None
 
 
 VOICE_HOTKEY_PRESETS = {
@@ -149,7 +196,7 @@ def action_allows_repeat(action: "ButtonAction") -> bool:
     can repeat when the physical button itself is a repeatable control.
     """
 
-    return action.kind not in APPLICATION_ACTIONS
+    return action.kind not in APPLICATION_ACTIONS and not is_voice_action(action)
 
 
 def voice_trigger_mode_for_hotkey(hotkey_text: str) -> Optional[VoiceTriggerMode]:
@@ -277,7 +324,7 @@ DEFAULT_BUTTON_IDS = frozenset(
 
 def default_button_actions() -> Dict[str, ButtonAction]:
     return {
-        "mic": ButtonAction(ActionKind.VOICE),
+        "mic": voice_action_for_trigger_mode(VoiceTriggerMode.TOGGLE),
         "power": ButtonAction(ActionKind.ESCAPE),
         "up": ButtonAction(ActionKind.ARROW_UP),
         "down": ButtonAction(ActionKind.ARROW_DOWN),

@@ -93,6 +93,9 @@ class BridgeModeRoutingTests(_ArgvRestoringTestCase):
     def test_unexpected_bridge_runtime_failure_is_visible_and_sanitized(self):
         notice_calls = []
         single_instance.show_bridge_startup_blocked_notice = notice_calls.append
+        # Keep this runtime-failure test independent of any real bridge that
+        # may already be running on the developer machine.
+        single_instance.BridgeInstanceGuard = _make_guard_class()
         app.main = lambda: (_ for _ in ()).throw(RuntimeError("private detail"))
         sys.argv = ["ovb_rc003", "--bridge"]
 

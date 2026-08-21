@@ -213,6 +213,23 @@ class _AppWiringTestCase(unittest.TestCase):
         refreshed["voice_hotkey"] = hotkey_text
         config.save_config(self.app._config_path, refreshed)
 
+    def _set_voice_mapping(
+        self,
+        button_id: str,
+        mode: key_mapping.VoiceTriggerMode,
+    ) -> None:
+        bindings = self.app._bindings["bindings"]
+        for existing_button, raw_action in list(bindings.items()):
+            try:
+                action = key_mapping.ButtonAction.from_dict(raw_action)
+            except (KeyError, TypeError, ValueError):
+                continue
+            if key_mapping.is_voice_action(action):
+                bindings[existing_button] = key_mapping.ButtonAction(
+                    key_mapping.ActionKind.DISABLED
+                ).to_dict()
+        bindings[button_id] = key_mapping.voice_action_for_trigger_mode(mode).to_dict()
+
 
 class LiveSettingsReloadTests(_AppWiringTestCase):
     def test_voice_mode_and_hotkey_reload_while_idle(self):
@@ -225,6 +242,7 @@ class LiveSettingsReloadTests(_AppWiringTestCase):
         self.assertIsNone(self.app._pending_voice_settings)
 
     def test_audio_only_trigger_reloads_voice_settings_before_dispatch(self):
+        self._set_voice_mapping("mic", key_mapping.VoiceTriggerMode.HOLD)
         self._save_voice_settings(mode="hold", hotkey_text="ctrl+l")
         delivered = []
 
@@ -433,8 +451,9 @@ class HostHotkeyFailureSuppressesMicOpenTests(_AppWiringTestCase):
         self.assertTrue(self.app._voice.active)
 
     def test_physical_legacy_f5_transform_skips_a_second_host_shortcut(self):
+        self._set_voice_mapping("mic", key_mapping.VoiceTriggerMode.HOLD)
         self.app._voice.trigger_mode = key_mapping.VoiceTriggerMode.HOLD
-        self.app._voice_hotkey = app_module.hotkey.HotkeySpec.parse("lctrl+lwin")
+        self.app._voice_hotkey = app_module.hotkey.HotkeySpec.parse("ralt")
         self.app._voice_legacy_transform_key_down = True
         hotkey_calls = []
         original = win32_input.send_voice_key_combo_down
@@ -450,6 +469,7 @@ class HostHotkeyFailureSuppressesMicOpenTests(_AppWiringTestCase):
         self.assertTrue(self.app._voice_legacy_transform_session)
 
     def test_hold_preset_maps_f5_to_one_right_alt_down_and_up_target(self):
+        self._set_voice_mapping("mic", key_mapping.VoiceTriggerMode.HOLD)
         self.app._voice.trigger_mode = key_mapping.VoiceTriggerMode.HOLD
         self.app._voice_hotkey = app_module.hotkey.HotkeySpec.parse("lctrl+lwin")
 
@@ -522,6 +542,7 @@ class HostHotkeyFailureSuppressesMicOpenTests(_AppWiringTestCase):
         self.assertFalse(self.app._voice_legacy_transform_emitted)
 
     def test_hold_audio_start_waits_for_f5_instead_of_injecting_ahead_of_it(self):
+        self._set_voice_mapping("mic", key_mapping.VoiceTriggerMode.HOLD)
         self.app._voice.trigger_mode = key_mapping.VoiceTriggerMode.HOLD
         self.app._voice_hotkey = app_module.hotkey.HotkeySpec.parse("ralt")
         calls = []
@@ -667,6 +688,7 @@ class HostHotkeyFailureSuppressesMicOpenTests(_AppWiringTestCase):
         self.assertFalse(self.app._voice_toggle_close_pending)
 
     def test_hold_mode_multi_source_press_still_sends_one_down_and_one_up(self):
+        self._set_voice_mapping("mic", key_mapping.VoiceTriggerMode.HOLD)
         self.app._voice.trigger_mode = key_mapping.VoiceTriggerMode.HOLD
         calls = []
         original_down = win32_input.send_voice_key_combo_down
@@ -689,8 +711,8 @@ class HostHotkeyFailureSuppressesMicOpenTests(_AppWiringTestCase):
         self.assertEqual(
             calls,
             [
-                ("down", ("ralt", "space")),
-                ("up", ("ralt", "space")),
+                ("down", ("ralt",)),
+                ("up", ("ralt",)),
             ],
         )
         self.assertFalse(self.app._voice.active)
@@ -1186,6 +1208,173 @@ class OrdinaryButtonGestureWiringTests(_AppWiringTestCase):
             self.app._on_raw_input_event(event)
 
         self.assertEqual(armed, [])
+
+
+class MappedVoiceButtonTests(_AppWiringTestCase):
+    def test_non_mic_toggle_voice_press_opens_and_second_press_closes(self):
+        self._set_voice_mapping("up", key_mapping.VoiceTriggerMode.TOGGLE)
+        taps = []
+        with mock.patch.object(
+            win32_input,
+            "send_voice_key_combo_tap",
+            side_effect=lambda tokens: taps.append(tokens),
+        ):
+            self.app._on_button_event("up", True)
+            self.app._on_button_event("up", False)
+            self.app._on_button_event("up", True)
+            self.app._on_button_event("up", False)
+
+        self.assertEqual(taps, [("ralt", "space"), ("ralt", "space")])
+        self.assertEqual(self.app._ble_session.mic_open_calls, 1)
+        self.assertEqual(self.app._ble_session.mic_close_calls, 1)
+        self.assertTrue(self.app._voice_toggle_close_pending)
+        self.app._on_control_event(AudioStopped())
+        self.assertIsNone(self.app._mapped_voice_button_id)
+
+    def test_non_mic_hold_release_closes_then_audio_stop_releases_hotkey(self):
+        self._set_voice_mapping("up", key_mapping.VoiceTriggerMode.HOLD)
+        calls = []
+        with mock.patch.object(
+            win32_input,
+            "send_voice_key_combo_down",
+            side_effect=lambda tokens: calls.append(("down", tokens)),
+        ), mock.patch.object(
+            win32_input,
+            "send_voice_key_combo_up",
+            side_effect=lambda tokens: calls.append(("up", tokens)),
+        ):
+            self.app._on_button_event("up", True)
+            self.app._on_button_event("up", False)
+            self.assertEqual(calls, [("down", ("ralt",))])
+            self.assertEqual(self.app._ble_session.mic_close_calls, 1)
+            self.app._on_control_event(AudioStopped())
+
+        self.assertEqual(calls, [("down", ("ralt",)), ("up", ("ralt",))])
+        self.assertFalse(self.app._voice.active)
+        self.assertIsNone(self.app._mapped_voice_button_id)
+
+    def test_non_mic_voice_duplicate_down_is_collapsed(self):
+        self._set_voice_mapping("up", key_mapping.VoiceTriggerMode.TOGGLE)
+        taps = []
+        with mock.patch.object(
+            win32_input,
+            "send_voice_key_combo_tap",
+            side_effect=lambda tokens: taps.append(tokens),
+        ):
+            self.app._on_button_event("up", True)
+            self.app._on_button_event("up", True)
+
+        self.assertEqual(taps, [("ralt", "space")])
+        self.assertEqual(self.app._ble_session.mic_open_calls, 1)
+
+    def test_non_mic_toggle_audio_stop_waits_for_button_release_before_reopen(self):
+        self._set_voice_mapping("up", key_mapping.VoiceTriggerMode.TOGGLE)
+        with mock.patch.object(win32_input, "send_voice_key_combo_tap"):
+            self.app._on_button_event("up", True)
+            self.app._on_control_event(AudioStarted(session_id=1))
+            self.app._on_control_event(AudioStopped())
+            self.assertEqual(self.app._ble_session.mic_open_calls, 1)
+            self.app._on_button_event("up", False)
+            self._drain_event_loop()
+
+        self.assertEqual(self.app._ble_session.mic_open_calls, 2)
+
+    def test_detected_non_mic_voice_button_suppresses_voice_action(self):
+        self._set_voice_mapping("up", key_mapping.VoiceTriggerMode.TOGGLE)
+        request = key_detection_bridge.request_detection(self.app._config_root)
+        with mock.patch.object(win32_input, "send_voice_key_combo_tap") as hotkey:
+            self.app._on_button_event("up", True)
+            self.app._on_button_event("up", False)
+
+        self.assertEqual(key_detection_bridge.poll_detection(request), "up")
+        hotkey.assert_not_called()
+        self.assertEqual(self.app._ble_session.mic_open_calls, 0)
+
+    def test_mic_normal_mapping_dispatches_once_and_atvv_does_not_trigger_voice(self):
+        self.app._bindings["bindings"]["mic"] = key_mapping.ButtonAction(
+            key_mapping.ActionKind.ARROW_UP
+        ).to_dict()
+        actions = []
+        with mock.patch.object(
+            win32_input,
+            "send_arrow_up",
+            side_effect=lambda: actions.append("up"),
+        ), mock.patch.object(win32_input, "send_voice_key_combo_tap") as hotkey:
+            self.app._on_button_event("mic", True, event_source="hid")
+            self.app._on_button_event("mic", True, event_source="legacy_f5")
+            self.app._on_control_event(MicButtonPressed())
+            self.app._on_control_event(AudioStarted(session_id=1))
+            self.app._on_button_event("mic", False, event_source="hid")
+            self.app._on_button_event("mic", False, event_source="legacy_f5")
+
+        self.assertEqual(actions, ["up"])
+        hotkey.assert_not_called()
+        self.assertEqual(self.app._ble_session.mic_close_calls, 1)
+
+    def test_non_mic_hold_does_not_enable_physical_f5_transform(self):
+        self._set_voice_mapping("up", key_mapping.VoiceTriggerMode.HOLD)
+        self.app._bindings["bindings"]["mic"] = key_mapping.ButtonAction(
+            key_mapping.ActionKind.ESCAPE
+        ).to_dict()
+        self.app._voice.trigger_mode = key_mapping.VoiceTriggerMode.HOLD
+        self.app._voice_hotkey = app_module.hotkey.HotkeySpec.parse("ralt")
+
+        self.assertIsNone(self.app._transform_legacy_voice_key(0x74, True))
+
+    def test_app_issued_open_f5_echo_does_not_run_normal_mic_mapping(self):
+        self._set_voice_mapping("up", key_mapping.VoiceTriggerMode.TOGGLE)
+        self.app._bindings["bindings"]["mic"] = key_mapping.ButtonAction(
+            key_mapping.ActionKind.ARROW_UP
+        ).to_dict()
+        actions = []
+        with mock.patch.object(win32_input, "send_voice_key_combo_tap"), mock.patch.object(
+            win32_input,
+            "send_arrow_up",
+            side_effect=lambda: actions.append("up"),
+        ):
+            self.app._on_button_event("up", True)
+            self.app._on_button_event("up", False)
+            self.app._on_legacy_key_event(0x74, True)
+            self.app._on_legacy_key_event(0x74, False)
+            self._drain_event_loop()
+
+        self.assertEqual(actions, [])
+
+    def test_active_voice_mapping_reload_is_deferred_until_audio_stop(self):
+        self._set_voice_mapping("up", key_mapping.VoiceTriggerMode.HOLD)
+        with mock.patch.object(win32_input, "send_voice_key_combo_down"), mock.patch.object(
+            win32_input,
+            "send_voice_key_combo_up",
+        ):
+            self.app._on_button_event("up", True)
+            refreshed = config.default_key_bindings()
+            refreshed["bindings"]["mic"] = key_mapping.ButtonAction(
+                key_mapping.ActionKind.ESCAPE
+            ).to_dict()
+            config.save_key_bindings(self.app._bindings_path, refreshed)
+            self.app._reload_settings_if_changed()
+            self.assertIsNotNone(self.app._pending_bindings)
+
+            self.app._on_button_event("up", False)
+            self.app._on_control_event(AudioStopped())
+
+        self.assertIsNone(self.app._pending_bindings)
+        self.assertEqual(
+            self.app._bindings["bindings"]["mic"]["kind"],
+            key_mapping.ActionKind.ESCAPE.value,
+        )
+
+    def test_dirty_settings_disable_stale_f5_transform_before_reload(self):
+        self._set_voice_mapping("mic", key_mapping.VoiceTriggerMode.HOLD)
+        self.app._voice.trigger_mode = key_mapping.VoiceTriggerMode.HOLD
+        self.app._voice_hotkey = app_module.hotkey.HotkeySpec.parse("ralt")
+        refreshed = config.default_key_bindings()
+        refreshed["bindings"]["mic"] = key_mapping.ButtonAction(
+            key_mapping.ActionKind.ESCAPE
+        ).to_dict()
+        config.save_key_bindings(self.app._bindings_path, refreshed)
+
+        self.assertIsNone(self.app._transform_legacy_voice_key(0x74, True))
 
 
 class LiveBridgeKeyDetectionTests(_AppWiringTestCase):

@@ -16,7 +16,7 @@ class DefaultButtonActionsTests(unittest.TestCase):
 
     def test_matches_task_table_exactly(self):
         expected = {
-            "mic": (key_mapping.ActionKind.VOICE, ()),
+            "mic": (key_mapping.ActionKind.VOICE_TOGGLE, ()),
             "power": (key_mapping.ActionKind.ESCAPE, ()),
             "up": (key_mapping.ActionKind.ARROW_UP, ()),
             "down": (key_mapping.ActionKind.ARROW_DOWN, ()),
@@ -55,6 +55,26 @@ class ButtonActionSerializationTests(unittest.TestCase):
         self.assertEqual(data["keys"], [])
         restored = key_mapping.ButtonAction.from_dict(data)
         self.assertEqual(restored.keys, ())
+
+    def test_explicit_voice_actions_resolve_their_lifecycle(self):
+        for mode in key_mapping.VoiceTriggerMode:
+            action = key_mapping.voice_action_for_trigger_mode(mode)
+            self.assertTrue(key_mapping.is_voice_action(action))
+            self.assertEqual(
+                key_mapping.voice_trigger_mode_for_action(action),
+                mode,
+            )
+            self.assertFalse(key_mapping.action_allows_repeat(action))
+
+    def test_legacy_voice_action_uses_the_supplied_mode(self):
+        action = key_mapping.ButtonAction(key_mapping.ActionKind.VOICE)
+        self.assertEqual(
+            key_mapping.voice_trigger_mode_for_action(
+                action,
+                legacy_mode=key_mapping.VoiceTriggerMode.HOLD,
+            ),
+            key_mapping.VoiceTriggerMode.HOLD,
+        )
 
     def test_reference_actions_are_semantic_and_not_key_combos(self):
         for action_kind in (

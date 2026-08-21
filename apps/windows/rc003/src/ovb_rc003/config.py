@@ -275,7 +275,6 @@ def load_key_bindings(path: Path) -> Dict[str, Any]:
         bindings["secondary_bindings"] = {}
     _normalize_physical_bindings(bindings)
     _normalize_semantic_actions(bindings)
-    _normalize_mic_binding(bindings)
     _normalize_secondary_bindings(bindings)
     return bindings
 
@@ -316,41 +315,19 @@ def _normalize_semantic_actions(bindings: Dict[str, Any]) -> None:
                 trigger_map[trigger_name] = normalize(raw)
 
 
-def _normalize_mic_binding(bindings: Dict[str, Any]) -> None:
-    """The runtime never consults a stored ``mic`` binding at all - the
-    physical mic button is always driven directly by the ATVV voice
-    lifecycle (see app.py's ``_handle_mic_button_pressed``/
-    ``_on_control_event``), never by ``ActionKind`` dispatch. A stale
-    non-voice ``mic`` entry (from an older build, a hand-edited file, or a
-    corrupted save) must not be silently kept around looking like it does
-    something it doesn't - force it back to ``ActionKind.VOICE`` in place,
-    in memory, every time bindings are loaded (XRBM-018's independent
-    review round 2 product-contract follow-up, folded
-    into XRBM-019 In-scope item 6).
-    """
-
-    # Imported lazily, matching default_key_bindings()'s own import-order
-    # reasoning above.
-    from . import key_mapping
-
-    button_bindings = bindings.setdefault("bindings", {})
-    button_bindings["mic"] = key_mapping.ButtonAction(key_mapping.ActionKind.VOICE).to_dict()
-
-
 def _normalize_secondary_bindings(bindings: Dict[str, Any]) -> None:
     """Keep optional double/long mappings structurally safe on load.
 
     A malformed secondary entry is ignored by the runtime action lookup, but
     the container itself must still be a mapping so a damaged config cannot
-    make the settings page or save path crash.  The microphone is excluded:
-    it is always owned by the ATVV voice lifecycle, never ordinary gestures.
+    make the settings page or save path crash. Every physical button,
+    including the microphone button, may use ordinary secondary gestures.
     """
 
     secondary = bindings.get("secondary_bindings")
     if not isinstance(secondary, dict):
         bindings["secondary_bindings"] = {}
         return
-    secondary.pop("mic", None)
     for button_id in list(secondary):
         entry = secondary[button_id]
         if not isinstance(entry, dict):
