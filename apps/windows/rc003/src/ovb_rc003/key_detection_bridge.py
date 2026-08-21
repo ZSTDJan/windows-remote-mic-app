@@ -86,20 +86,32 @@ def publish_next_button(
     request_paths = list(root.glob("request-*.json"))
     request_paths.sort(key=_request_age_key)
     for request_path in request_paths:
-        request = _read_request(request_path, now=now)
-        if request is None:
-            _unlink(request_path)
+        prefix = "request-"
+        suffix = ".json"
+        if not request_path.name.startswith(prefix) or not request_path.name.endswith(
+            suffix
+        ):
             continue
+        candidate = DetectionRequest(
+            token=request_path.name[len(prefix) : -len(suffix)],
+            root=root,
+        )
         try:
             claim_fd = os.open(
-                request.claim_lock_path,
+                candidate.claim_lock_path,
                 os.O_CREAT | os.O_EXCL | os.O_WRONLY,
             )
         except FileExistsError:
             continue
         os.close(claim_fd)
+        request_claimed = False
         try:
+            request = _read_request(request_path, now=now)
+            if request is None:
+                _unlink(request_path)
+                continue
             os.replace(request.request_path, request.claimed_path)
+            request_claimed = True
             _write_json_atomic(
                 request.result_path,
                 {
@@ -110,10 +122,15 @@ def publish_next_button(
                 },
             )
         except OSError:
+            if request_claimed:
+                try:
+                    os.replace(request.claimed_path, request.request_path)
+                except OSError:
+                    pass
             continue
         finally:
-            _unlink(request.claimed_path)
-            _unlink(request.claim_lock_path)
+            _unlink(candidate.claim_lock_path)
+        _unlink(request.claimed_path)
         return True
     return False
 

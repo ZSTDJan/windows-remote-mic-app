@@ -63,6 +63,50 @@ class KeyDetectionBridgeTests(unittest.TestCase):
             {"left", "right"},
         )
 
+    def test_request_is_read_only_after_the_claim_lock_is_owned(self):
+        request = key_detection_bridge.request_detection(self.root)
+        first_reader_entered = threading.Event()
+        release_first_reader = threading.Event()
+        read_calls = []
+        results = []
+        original = key_detection_bridge._read_request
+
+        def blocked_read(path, *, now):
+            read_calls.append(path)
+            first_reader_entered.set()
+            self.assertTrue(release_first_reader.wait(timeout=5.0))
+            return original(path, now=now)
+
+        with mock.patch.object(
+            key_detection_bridge,
+            "_read_request",
+            side_effect=blocked_read,
+        ):
+            first = threading.Thread(
+                target=lambda: results.append(
+                    key_detection_bridge.publish_next_button(self.root, "left")
+                )
+            )
+            second = threading.Thread(
+                target=lambda: results.append(
+                    key_detection_bridge.publish_next_button(self.root, "right")
+                )
+            )
+            first.start()
+            self.assertTrue(first_reader_entered.wait(timeout=5.0))
+            second.start()
+            second.join(timeout=5.0)
+            self.assertFalse(second.is_alive())
+            release_first_reader.set()
+            first.join(timeout=5.0)
+
+        self.assertEqual(len(read_calls), 1)
+        self.assertEqual(sorted(results), [False, True])
+        self.assertIn(
+            key_detection_bridge.poll_detection(request),
+            {"left", "right"},
+        )
+
     def test_stale_request_is_removed_and_never_claimed(self):
         request = key_detection_bridge.request_detection(
             self.root,
