@@ -101,6 +101,8 @@
 - `bugs/BUG-011-mic-key-detection-voice-race.md`
 - `bugs/BUG-012-toggle-reopen-before-physical-release.md`
 - `bugs/BUG-013-key-detection-claim-race.md`
+- `bugs/BUG-014-toggle-reopen-f5-echo.md`
+- `bugs/BUG-015-sogou-codex-text-commit.md`
 - `TESTING.md`
 
 实施结果：
@@ -302,6 +304,20 @@ HID 注入权限顺序与稳定失败提交：
   `B496F8DEED84DC7D8A2B28E711931EDEC11BC169A93771F56732A6339849D4FE`；
   ZIP 内 EXE 已重新计算并与候选目录一致。
 - 状态：源码与冻结检查点通过；保存后重开和 RC003 语音真机回归待完成。
+
+### 2026-08-21 切换续开 F5 回声（fix14）
+
+- `fix13` 本机日志确认实体释放后已经成功续发 `MIC_OPEN`，但约 60 毫秒后又
+  出现 legacy F5 down/up；旧状态机把它当作第二次点击，立即关闭并产生
+  `frames=0 samples=0 result=empty`。
+- 代码提交 `bfd514d` 在 TOGGLE 主动续开后增加 250 毫秒有界回声保护，按
+  来源成对吞掉保护期内的物理 down/up；保护期后的真实第二次点击仍正常关闭。
+- 应用接线测试 84 项通过、1 项平台相关跳过；完整测试 1103 项通过、7 项
+  跳过；公开边界扫描 231 个文件通过；`compileall`、`pip check` 和
+  `git diff --check` 通过。
+- 同轮“记事本可上屏、Codex 不上屏”不能由本程序日志直接归因；识别文字由
+  搜狗持有，需用键盘手动触发同一快捷键区分宿主控件兼容与本程序焦点时序。
+- 状态：代码与自动检查通过，`fix14` 候选和本机真机复测待完成。
 
 ## 维护纪律
 

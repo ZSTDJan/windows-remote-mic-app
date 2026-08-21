@@ -33,7 +33,9 @@ HID tap 身份校验、进程控制和日志隐私。自动检查与 `fix10` 候
 `bugs/BUG-010-live-voice-settings-reload.md`、
 `bugs/BUG-011-mic-key-detection-voice-race.md`、
 `bugs/BUG-012-toggle-reopen-before-physical-release.md`、
-`bugs/BUG-013-key-detection-claim-race.md` 和 `TESTING.md`。
+`bugs/BUG-013-key-detection-claim-race.md`、
+`bugs/BUG-014-toggle-reopen-f5-echo.md`、
+`bugs/BUG-015-sogou-codex-text-commit.md` 和 `TESTING.md`。
 
 ### 修复
 
@@ -99,6 +101,10 @@ HID tap 身份校验、进程控制和日志隐私。自动检查与 `fix10` 候
   后再竞争认领锁；Windows 文件共享时序可能让锁胜者移动失败、败者也返回
   失败。现在先独占 claim lock 再读取和移动请求，结果写入失败会尽量恢复
   请求供后续来源重试。
+- **切换续开后约 60 毫秒又被关闭**：`fix13` 真机日志确认程序在实体松键后
+  续发 `MIC_OPEN`，紧接着出现一组新的 legacy F5 down/up，被误判成第二次
+  点击并产生空会话。现在续开后设置 250 毫秒有界回声保护，同源 down/up
+  成对吞掉；保护期后的真实第二次点击仍正常关闭。
 - **PortAudio 清理失败时丢失重试句柄**：播放流只有在 `close()` 确认成功后
   才清除内部引用；关闭失败会保留句柄供后续清理重试。
 - **隐私字段大小写绕过**：禁止持久化的设备标识字段改为大小写不敏感检查，
@@ -179,6 +185,9 @@ HID tap 身份校验、进程控制和日志隐私。自动检查与 `fix10` 候
 - `fix13` 便携 ZIP SHA-256：
   `B496F8DEED84DC7D8A2B28E711931EDEC11BC169A93771F56732A6339849D4FE`；
   ZIP 内 EXE 已重新计算并与候选目录一致。人工界面与真机语音仍待复测。
+- `fix14` F5 续开回声代码提交：`bfd514d`。应用接线测试 84 项通过、1 项
+  平台相关跳过；完整测试 1103 项通过、7 项跳过；公开边界扫描 231 个文件
+  通过；`compileall`、`pip check` 和 `git diff --check` 通过。候选待构建。
 
 ## [0.1.0-candidate] — 2026-07-31
 
