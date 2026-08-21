@@ -89,8 +89,18 @@
 - QML：完整测试中的真实 offscreen engine/load/render 契约通过；额外
   `qmllint` 返回 0，存在已有动态 singleton import/unqualified 警告，无错误。
 
-最终 fix10 冻结构建、EXE/ZIP 哈希和 ZIP 内 EXE 复核在本文后续与
-`MAINTENANCE.md`/`CHANGELOG.md` 中补记。
+最终 `fix10` 已从 Git HEAD `041c125` 构建，程序代码修复检查点为 `eafd203`：
+
+- 完整 unittest：1090 项通过，7 项安全或平台条件跳过；
+- 公开边界扫描：228 个文件通过；
+- PyInstaller 构建通过；冻结入口 `--dry-run=0`、`--help=0`、无效 HID 注入
+  PID `=4`；
+- 候选目录：`RemoteMicRC003-0.1.0-candidate-20260821-fix10/`；
+- EXE SHA-256：
+  `B499B7C665115B128FFAF49F80A9A425B82969157A4F0C6EA2ABCFA784BA15B2`；
+- portable ZIP SHA-256：
+  `69B3F76BB2590C736CFEE6359AADE5EB8848DB2937D7FDC8CDAF404F70708799`；
+- ZIP 内 EXE 已重新计算并与候选目录 EXE 一致。
 
 ## 仍需真实设备验证
 
