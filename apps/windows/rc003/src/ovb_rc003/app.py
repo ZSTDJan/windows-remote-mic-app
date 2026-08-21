@@ -113,6 +113,7 @@ _BUTTON_ACTION_KEY_TOKENS = {
 
 _KEY_DETECTION_MIC_RELEASE_GRACE_SECONDS = 1.0
 _KEY_DETECTION_MIC_MAX_SECONDS = 10.0
+_VOICE_TOGGLE_REOPEN_FALLBACK_SECONDS = 0.2
 
 
 def open_configured_application(action: key_mapping.ButtonAction) -> bool:
@@ -146,6 +147,10 @@ class RC003App:
         self._voice_audio_start_fallback_pending = False
         self._voice_audio_started_waiting_for_legacy_f5 = False
         self._voice_toggle_close_pending = False
+        self._voice_toggle_reopen_pending = False
+        self._voice_toggle_reopen_scheduled = False
+        self._voice_toggle_reopen_generation = 0
+        self._voice_toggle_reopen_handle: Optional[asyncio.TimerHandle] = None
         self._voice_hotkey_release_pending: Optional[Tuple[str, ...]] = None
         self._button_key_release_pending: Optional[Tuple[str, ...]] = None
         # Raw Input and the ATVV control channel arrive on different worker
@@ -165,6 +170,7 @@ class RC003App:
         self._voice_mic_gesture_active = False
         self._voice_mic_gesture_audio_started = False
         self._voice_mic_gesture_audio_stopped = False
+        self._voice_mic_gesture_physical_seen = False
         self._voice_mic_gesture_sources_down: set[str] = set()
         self._voice_audio_stream_active = False
         self._voice_audio_stop_processed = False
@@ -495,6 +501,7 @@ class RC003App:
                 self._voice_audio_start_fallback_pending = False
                 self._voice_audio_started_waiting_for_legacy_f5 = False
                 self._voice_toggle_close_pending = False
+                self._cancel_voice_toggle_reopen_locked("connection cleanup")
                 self._voice_raw_input_trigger_pending = False
                 self._voice_audio_stream_active = False
                 self._voice_audio_stop_processed = False
@@ -614,11 +621,13 @@ class RC003App:
 
         if self._voice_mic_gesture_active:
             if physical_down:
+                self._voice_mic_gesture_physical_seen = True
                 self._voice_mic_gesture_sources_down.add(source)
             return False
         self._voice_mic_gesture_active = True
         self._voice_mic_gesture_audio_started = source == "audio_started"
         self._voice_mic_gesture_audio_stopped = False
+        self._voice_mic_gesture_physical_seen = physical_down
         self._voice_mic_gesture_sources_down = {source} if physical_down else set()
         return True
 
@@ -628,7 +637,130 @@ class RC003App:
         self._voice_mic_gesture_active = False
         self._voice_mic_gesture_audio_started = False
         self._voice_mic_gesture_audio_stopped = False
+        self._voice_mic_gesture_physical_seen = False
         self._voice_mic_gesture_sources_down.clear()
+
+    def _cancel_voice_toggle_reopen_locked(self, reason: str = "") -> None:
+        was_pending = self._voice_toggle_reopen_pending
+        self._voice_toggle_reopen_pending = False
+        self._voice_toggle_reopen_scheduled = False
+        self._voice_toggle_reopen_generation += 1
+        handle = self._voice_toggle_reopen_handle
+        self._voice_toggle_reopen_handle = None
+        if handle is not None:
+            try:
+                self._event_loop.call_soon_threadsafe(handle.cancel)
+            except RuntimeError:
+                handle.cancel()
+        if was_pending and reason:
+            self._logger.info("voice toggle pending reopen cancelled: %s", reason)
+
+    def _schedule_voice_toggle_reopen_locked(
+        self,
+        delay: float,
+        reason: str,
+    ) -> None:
+        if (
+            not self._voice_toggle_reopen_pending
+            or self._voice_toggle_reopen_scheduled
+        ):
+            return
+        self._voice_toggle_reopen_scheduled = True
+        generation = self._voice_toggle_reopen_generation
+
+        def install_timer() -> None:
+            with self._voice_trigger_lock:
+                if (
+                    generation != self._voice_toggle_reopen_generation
+                    or not self._voice_toggle_reopen_pending
+                    or not self._voice_toggle_reopen_scheduled
+                ):
+                    return
+                self._voice_toggle_reopen_handle = self._event_loop.call_later(
+                    delay,
+                    self._complete_voice_toggle_reopen,
+                    generation,
+                    reason,
+                )
+
+        try:
+            self._event_loop.call_soon_threadsafe(install_timer)
+        except RuntimeError:
+            self._voice_toggle_reopen_pending = False
+            self._voice_toggle_reopen_scheduled = False
+            self._voice_toggle_reopen_generation += 1
+            self._logger.info(
+                "voice toggle reopen suppressed: application event loop is closing"
+            )
+
+    def _defer_voice_toggle_reopen_locked(self) -> None:
+        if self._voice_toggle_reopen_pending:
+            return
+        self._voice_toggle_reopen_pending = True
+        self._voice_toggle_reopen_generation += 1
+        if self._voice_mic_gesture_sources_down:
+            self._logger.info(
+                "voice toggle reopen deferred until physical mic release: sources=%s",
+                sorted(self._voice_mic_gesture_sources_down),
+            )
+            return
+        if self._voice_mic_gesture_physical_seen:
+            self._logger.info(
+                "voice toggle reopen queued after already-completed physical mic release"
+            )
+            self._schedule_voice_toggle_reopen_locked(
+                0.0,
+                "physical mic release",
+            )
+            return
+        self._logger.info(
+            "voice toggle reopen waiting %.0fms for a late physical mic edge",
+            _VOICE_TOGGLE_REOPEN_FALLBACK_SECONDS * 1000.0,
+        )
+        self._schedule_voice_toggle_reopen_locked(
+            _VOICE_TOGGLE_REOPEN_FALLBACK_SECONDS,
+            "BLE-only release fallback",
+        )
+
+    def _complete_voice_toggle_reopen(self, generation: int, reason: str) -> None:
+        with self._voice_trigger_lock:
+            if (
+                generation != self._voice_toggle_reopen_generation
+                or not self._voice_toggle_reopen_pending
+            ):
+                return
+            self._voice_toggle_reopen_handle = None
+            self._voice_toggle_reopen_scheduled = False
+            if self._voice_mic_gesture_sources_down:
+                self._logger.info(
+                    "voice toggle reopen still waiting for physical mic release: "
+                    "sources=%s",
+                    sorted(self._voice_mic_gesture_sources_down),
+                )
+                return
+            if (
+                self._voice.trigger_mode != key_mapping.VoiceTriggerMode.TOGGLE
+                or not self._voice.active
+                or self._voice_toggle_close_pending
+                or self._voice_audio_stream_active
+                or self._ble_session is None
+            ):
+                self._cancel_voice_toggle_reopen_locked(
+                    "voice session is no longer eligible"
+                )
+                return
+            self._voice_toggle_reopen_pending = False
+            self._voice_toggle_reopen_generation += 1
+            if (
+                self._voice_mic_gesture_active
+                and self._voice_mic_gesture_audio_stopped
+            ):
+                self._finish_voice_mic_gesture()
+            self._logger.info(
+                "voice toggle reopening device mic after %s",
+                reason,
+            )
+            self._ble_session.send_mic_open_threadsafe()
 
     def _reset_key_detection_mic_gesture_locked(self) -> None:
         self._key_detection_mic_gesture_active = False
@@ -1075,6 +1207,17 @@ class RC003App:
                 with self._voice_trigger_lock:
                     self._voice_mic_gesture_sources_down.discard(event_source)
                     if (
+                        self._voice_toggle_reopen_pending
+                        and not self._voice_mic_gesture_sources_down
+                    ):
+                        self._logger.info(
+                            "voice physical mic release completed; queueing toggle reopen"
+                        )
+                        self._schedule_voice_toggle_reopen_locked(
+                            0.0,
+                            "physical mic release",
+                        )
+                    if (
                         self._voice_mic_gesture_active
                         and not self._voice_mic_gesture_sources_down
                         and (
@@ -1436,8 +1579,6 @@ class RC003App:
                 if self._voice_mic_gesture_active:
                     self._voice_mic_gesture_audio_started = False
                     self._voice_mic_gesture_audio_stopped = True
-                    if not self._voice_mic_gesture_sources_down:
-                        self._finish_voice_mic_gesture()
                 toggle_close_completed = self._voice_toggle_close_pending
                 self._voice_toggle_close_pending = False
                 action = self._voice.on_audio_stopped()
@@ -1470,10 +1611,13 @@ class RC003App:
                     and not toggle_close_completed
                     and self._ble_session is not None
                 ):
-                    self._logger.info(
-                        "voice toggle remains active after physical release; reopening device mic"
-                    )
-                    self._ble_session.send_mic_open_threadsafe()
+                    self._defer_voice_toggle_reopen_locked()
+                elif (
+                    self._voice_mic_gesture_active
+                    and self._voice_mic_gesture_audio_stopped
+                    and not self._voice_mic_gesture_sources_down
+                ):
+                    self._finish_voice_mic_gesture()
                 self._apply_pending_voice_settings_if_idle_locked()
 
     def _handle_mic_button_pressed(
@@ -1554,6 +1698,7 @@ class RC003App:
             # error callback requests cleanup/reconnect, but must never
             # restore this logical toggle state or emit a second TAP, which
             # could reopen the host voice UI.
+            self._cancel_voice_toggle_reopen_locked("toggle close accepted")
             self._voice_toggle_close_pending = True
             self._logger.info("voice toggle closing: sending MIC_CLOSE")
             self._ble_session.send_mic_close_threadsafe()

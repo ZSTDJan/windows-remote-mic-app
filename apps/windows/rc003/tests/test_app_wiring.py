@@ -596,10 +596,16 @@ class HostHotkeyFailureSuppressesMicOpenTests(_AppWiringTestCase):
         original = win32_input.send_voice_key_combo_tap
         win32_input.send_voice_key_combo_tap = lambda tokens: hotkey_calls.append(tokens)
         try:
-            self.app._on_control_event(AudioStarted(session_id=1))
-            self.app._on_control_event(MicButtonPressed())
-            self.app._on_control_event(AudioStopped())
-            self.app._on_control_event(MicButtonPressed())
+            with mock.patch.object(
+                app_module,
+                "_VOICE_TOGGLE_REOPEN_FALLBACK_SECONDS",
+                0.0,
+            ):
+                self.app._on_control_event(AudioStarted(session_id=1))
+                self.app._on_control_event(MicButtonPressed())
+                self.app._on_control_event(AudioStopped())
+                self._drain_event_loop()
+                self.app._on_control_event(MicButtonPressed())
         finally:
             win32_input.send_voice_key_combo_tap = original
 
@@ -627,6 +633,7 @@ class HostHotkeyFailureSuppressesMicOpenTests(_AppWiringTestCase):
             self._drain_event_loop()
             self.app._on_button_event("mic", False, event_source="hid")
             self.app._on_control_event(AudioStopped())
+            self._drain_event_loop()
             self.app._on_button_event("mic", True, event_source="hid")
         finally:
             win32_input.send_voice_key_combo_tap = original
@@ -685,7 +692,7 @@ class HostHotkeyFailureSuppressesMicOpenTests(_AppWiringTestCase):
         )
         self.assertFalse(self.app._voice.active)
 
-    def test_toggle_audio_stop_reopens_device_mic_after_first_short_press(self):
+    def test_toggle_audio_stop_waits_for_physical_release_before_reopening(self):
         hotkey_calls = []
         original = win32_input.send_voice_key_combo_tap
         win32_input.send_voice_key_combo_tap = lambda tokens: hotkey_calls.append(tokens)
@@ -694,6 +701,9 @@ class HostHotkeyFailureSuppressesMicOpenTests(_AppWiringTestCase):
             self.app._on_control_event(MicButtonPressed())
             self.app._on_control_event(AudioStarted(session_id=1))
             self.app._on_control_event(AudioStopped())
+            self.assertEqual(self.app._ble_session.mic_open_calls, 0)
+            self.app._on_button_event("mic", False)
+            self._drain_event_loop()
         finally:
             win32_input.send_voice_key_combo_tap = original
 
@@ -702,7 +712,7 @@ class HostHotkeyFailureSuppressesMicOpenTests(_AppWiringTestCase):
         self.assertEqual(self.app._ble_session.mic_open_calls, 1)
         self.assertEqual(self.app._ble_session.mic_close_calls, 0)
 
-    def test_audio_stop_waits_for_all_physical_sources_before_releasing_gesture(self):
+    def test_audio_stop_waits_for_all_physical_sources_before_reopening(self):
         hotkey_calls = []
         original = win32_input.send_voice_key_combo_tap
         win32_input.send_voice_key_combo_tap = lambda tokens: hotkey_calls.append(tokens)
@@ -713,41 +723,83 @@ class HostHotkeyFailureSuppressesMicOpenTests(_AppWiringTestCase):
             self.app._on_button_event("mic", True, event_source="hid")
 
             self.app._on_control_event(AudioStopped())
-            self.app._on_control_event(AudioStarted(session_id=2))
-            self.app._on_button_event("mic", True, event_source="hid")
 
             self.assertEqual(hotkey_calls, [("ralt", "space")])
             self.assertTrue(self.app._voice.active)
             self.assertTrue(self.app._voice_mic_gesture_active)
+            self.assertEqual(self.app._ble_session.mic_open_calls, 0)
 
             self.app._on_legacy_key_event(0x74, False)
             self._drain_event_loop()
+            self.assertEqual(self.app._ble_session.mic_open_calls, 0)
             self.app._on_button_event("mic", False, event_source="hid")
+            self._drain_event_loop()
             self.assertFalse(self.app._voice_mic_gesture_active)
-
-            self.app._on_button_event("mic", True, event_source="hid")
         finally:
             win32_input.send_voice_key_combo_tap = original
 
-        self.assertEqual(
-            hotkey_calls,
-            [("ralt", "space"), ("ralt", "space")],
-        )
-        self.assertFalse(self.app._voice.active)
-        self.assertEqual(self.app._ble_session.mic_close_calls, 1)
+        self.assertEqual(hotkey_calls, [("ralt", "space")])
+        self.assertTrue(self.app._voice.active)
+        self.assertEqual(self.app._ble_session.mic_open_calls, 1)
+        self.assertEqual(self.app._ble_session.mic_close_calls, 0)
 
     def test_duplicate_audio_stop_reopens_toggle_stream_only_once(self):
         original = win32_input.send_voice_key_combo_tap
         win32_input.send_voice_key_combo_tap = lambda tokens: None
         try:
-            self.app._on_control_event(AudioStarted(session_id=1))
-            self.app._on_control_event(AudioStopped())
-            self.app._on_control_event(AudioStopped())
+            with mock.patch.object(
+                app_module,
+                "_VOICE_TOGGLE_REOPEN_FALLBACK_SECONDS",
+                0.0,
+            ):
+                self.app._on_control_event(AudioStarted(session_id=1))
+                self.app._on_control_event(AudioStopped())
+                self.app._on_control_event(AudioStopped())
+                self._drain_event_loop()
         finally:
             win32_input.send_voice_key_combo_tap = original
 
         self.assertTrue(self.app._voice.active)
         self.assertEqual(self.app._ble_session.mic_open_calls, 1)
+
+    def test_ble_only_fallback_waits_for_a_late_physical_edge(self):
+        original = win32_input.send_voice_key_combo_tap
+        win32_input.send_voice_key_combo_tap = lambda tokens: None
+        try:
+            with mock.patch.object(
+                app_module,
+                "_VOICE_TOGGLE_REOPEN_FALLBACK_SECONDS",
+                0.0,
+            ):
+                self.app._on_control_event(AudioStarted(session_id=1))
+                self.app._on_control_event(AudioStopped())
+                self.app._on_button_event("mic", True, event_source="hid")
+                self._drain_event_loop()
+                self.assertEqual(self.app._ble_session.mic_open_calls, 0)
+
+                self.app._on_button_event("mic", False, event_source="hid")
+                self._drain_event_loop()
+        finally:
+            win32_input.send_voice_key_combo_tap = original
+
+        self.assertTrue(self.app._voice.active)
+        self.assertEqual(self.app._ble_session.mic_open_calls, 1)
+
+    def test_cleanup_cancels_pending_toggle_reopen(self):
+        original = win32_input.send_voice_key_combo_tap
+        win32_input.send_voice_key_combo_tap = lambda tokens: None
+        try:
+            self.app._on_control_event(AudioStarted(session_id=1))
+            self.app._on_control_event(AudioStopped())
+            self.assertTrue(self.app._voice_toggle_reopen_pending)
+
+            self._loop.run_until_complete(self.app._cleanup_once())
+            self._drain_event_loop()
+        finally:
+            win32_input.send_voice_key_combo_tap = original
+
+        self.assertFalse(self.app._voice_toggle_reopen_pending)
+        self.assertEqual(self.app._ble_session, None)
 
     def test_duplicate_audio_start_does_not_toggle_or_reset_the_gesture(self):
         hotkey_calls = []
@@ -816,6 +868,7 @@ class HostHotkeyFailureSuppressesMicOpenTests(_AppWiringTestCase):
             self.app._on_control_event(MicButtonPressed())
             self.app._on_control_event(AudioStarted(session_id=2))
             self.app._on_control_event(AudioStopped())
+            self._drain_event_loop()
         finally:
             win32_input.send_voice_key_combo_tap = original
 
@@ -825,7 +878,7 @@ class HostHotkeyFailureSuppressesMicOpenTests(_AppWiringTestCase):
         )
         self.assertFalse(self.app._voice.active)
         self.assertFalse(self.app._voice_toggle_close_pending)
-        self.assertEqual(self.app._ble_session.mic_open_calls, 1)
+        self.assertEqual(self.app._ble_session.mic_open_calls, 0)
         self.assertEqual(self.app._ble_session.mic_close_calls, 1)
 
     def test_mic_button_before_audio_start_does_not_send_a_second_alt(self):
