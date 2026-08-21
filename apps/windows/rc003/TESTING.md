@@ -308,14 +308,19 @@ HID 注入权限顺序与稳定失败提交：
   探针通过。公开边界扫描 137 个文件通过；`compileall`、`pip check` 和
   `git diff --check` 通过。共享工作区的 1154/7 和 267 文件结果包含同期 BLE
   测试，不作为本 UI 独立候选的权威计数。
-- 候选：`RemoteMicRC003-0.1.0-candidate-20260821-ui1-portable.zip`，SHA-256
-  `9E3D8ECBFD95335720E80DE853E7BCBD97D4AC3D02FCC314FF456580E37EC718`；
+- 历史包 `ui1` 的界面文件和入口检查通过，但逐文件复核发现未包含可选 Frida
+  Gadget；它只保留作 `addc2b0` 的 UI-only 证据，不再作为完整候选验收。
+- 当前候选：`RemoteMicRC003-0.1.0-candidate-20260821-ui2-portable.zip`，SHA-256
+  `5330E2E668471E60F3AE5CEC1FBCBB172D844DFE1E49C383F8A1F51FC9383B81`；
   ZIP 内 EXE SHA-256
-  `8575F8B3FD273F5CC6915D2F8A9BEA037D0E66E27EF6929AAE15887E6ACB0988`，
-  已与候选目录一致。六个冻结 QML 与 `addc2b0` 源码逐文件一致；冻结入口
-  `--dry-run=0`、`--help=0`、无效 HID 注入 PID `=4`。
-- 状态：自动、构建与冻结验证通过；`TEST-UI-003` 人工复核待完成。该 UI-only
-  候选不包含后续 `a189a1c` 的 BLE/音频停止排序修复。
+  `03E21A6E28A3205E35A3C039A4BD681658BD0AB261DFD6C8DD3D944173561902`。
+  构建基线 `338d2cb` 的完整测试 1154 项通过、7 项跳过，公开边界扫描 270 个
+  文件通过。Frida Gadget 与 VB-CABLE 固定哈希均通过；ZIP/目录 2067 个文件
+  逐文件一致；六个项目 QML 和许可/说明文件与源码一致。冻结入口
+  `--dry-run=0`、`--help=0`、无效 HID 注入 PID `=4`，设置入口离屏 5 秒存活且
+  测试结束无残留进程。
+- 状态：自动、构建与冻结验证通过；使用 `ui2` 完成 `TEST-UI-003` 人工复核。
+  该合并候选包含 `a189a1c`，但语音真机结果仍须按语音条目单独验收。
 
 ### CHECK-UI-001 语音设置集中与双快捷键保存
 

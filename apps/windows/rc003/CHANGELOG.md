@@ -263,7 +263,18 @@ RC003 的可靠原生行为是 HOLD，主动 `MIC_OPEN` 可能只有开始控制
   `9E3D8ECBFD95335720E80DE853E7BCBD97D4AC3D02FCC314FF456580E37EC718`；
   ZIP 内 EXE 与目录 EXE 一致，六个冻结 QML 与 `addc2b0` 源码逐文件一致。
   冻结入口 `--dry-run=0`、`--help=0`、无效 HID 注入 PID `=4`。该 UI-only
-  候选不包含随后提交 `a189a1c` 的 BLE/音频停止排序修复，人工界面复核待完成。
+  候选不包含随后提交 `a189a1c` 的 BLE/音频停止排序修复；后续逐文件复核还发现
+  它未包含可选 Frida Gadget，因此 `ui1` 只保留作历史 UI 证据，不再继续交付。
+- 修正合并候选 `ui2` 从 `338d2cb` 构建，包含 `addc2b0` 界面与 `a189a1c`
+  音频停止排序修复。构建门禁 1154 项通过、7 项跳过，公开边界扫描 270 个文件
+  通过；PyInstaller 和冻结入口验证通过。
+- `ui2` 候选目录为源码仓库同级
+  `RemoteMicRC003-0.1.0-candidate-20260821-ui2/`；EXE SHA-256 为
+  `03E21A6E28A3205E35A3C039A4BD681658BD0AB261DFD6C8DD3D944173561902`，
+  便携 ZIP SHA-256 为
+  `5330E2E668471E60F3AE5CEC1FBCBB172D844DFE1E49C383F8A1F51FC9383B81`。
+  Frida Gadget 与 VB-CABLE 均存在且固定哈希通过；ZIP 和目录 2067 个文件逐项
+  一致，冻结 QML 与许可/说明文件也与源码一致。人工界面与真机语音复核待完成。
 
 ## [0.1.0-candidate] — 2026-07-31
 

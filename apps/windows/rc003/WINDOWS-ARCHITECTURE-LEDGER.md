@@ -438,6 +438,12 @@ RC003 模式显示蓝牙配对、可选 HID tap/VB-CABLE 与宿主快捷键边�
 5. PyInstaller 构建；
 6. 冻结 EXE `--dry-run`。
 
+Frida Gadget 与 VB-CABLE 的构建策略不同：VB-CABLE 是候选构建的必经下载门禁，
+而 Frida 仍由 `fetch-frida-gadget.ps1` 显式获取，`build-candidate.ps1` 不会自动
+下载它。需要保留返回键/音量键 HID tap 补齐能力的完整 RC003 候选，必须在构建
+前完成 Frida 固定哈希校验，并在成品目录和 ZIP 中再次确认资产存在；缺失该文件的
+包只能作为不含 HID tap 的降级构建，不能沿用完整候选的验收结论。
+
 `installer/RemoteMicRC003Setup.iss` 是 per-user 安装器，不自动启动、不自动
 安装驱动。升级和卸载前调用 `stop-app.ps1`，只停止安装目录下、文件名精确为
 `RemoteMicRC003.exe` 且 PID/CreationDate 仍匹配的进程。无法确认退出时，

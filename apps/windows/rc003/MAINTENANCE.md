@@ -431,17 +431,34 @@ HID 注入权限顺序与稳定失败提交：
   通过；`compileall`、`pip check` 和 `git diff --check` 通过。共享工作区开发期
   曾得到 1154 项通过、7 项跳过和 267 个文件通过，但该数字包含同期 BLE 测试，
   不作为 UI 独立候选的权威证据。
-- UI 独立候选目录为源码仓库同级
-  `RemoteMicRC003-0.1.0-candidate-20260821-ui1/`；EXE SHA-256 为
-  `8575F8B3FD273F5CC6915D2F8A9BEA037D0E66E27EF6929AAE15887E6ACB0988`。
-  便携 ZIP 为 `RemoteMicRC003-0.1.0-candidate-20260821-ui1-portable.zip`，
+- 首个 UI 独立包 `RemoteMicRC003-0.1.0-candidate-20260821-ui1/` 的 EXE
   SHA-256 为
-  `9E3D8ECBFD95335720E80DE853E7BCBD97D4AC3D02FCC314FF456580E37EC718`；
-  ZIP 内 EXE 与目录 EXE 哈希一致，六个冻结 QML 与 `addc2b0` 源码逐文件一致。
+  `8575F8B3FD273F5CC6915D2F8A9BEA037D0E66E27EF6929AAE15887E6ACB0988`，
+  ZIP SHA-256 为
+  `9E3D8ECBFD95335720E80DE853E7BCBD97D4AC3D02FCC314FF456580E37EC718`。
+  后续逐文件打包复核发现它未包含可选 Frida Gadget，因此只能保留作 UI-only
+  历史证据，不作为完整 RC003 候选继续交付，也不能代表后续 `a189a1c` 的
+  BLE/音频停止排序修复。
+- 修正后的合并候选从干净源码提交 `338d2cb` 构建，包含 `addc2b0` 界面改动、
+  `a189a1c` 音频停止排序修复和对应记录。构建门禁公开边界扫描 270 个文件通过；
+  完整测试 1154 项通过、7 项安全或平台相关跳过；PyInstaller 和冻结 EXE
+  `--dry-run` 通过。
+- 新目录为源码仓库同级 `RemoteMicRC003-0.1.0-candidate-20260821-ui2/`；EXE
+  大小 5,049,682 字节，SHA-256 为
+  `03E21A6E28A3205E35A3C039A4BD681658BD0AB261DFD6C8DD3D944173561902`。
+  便携 ZIP 大小 127,271,906 字节，SHA-256 为
+  `5330E2E668471E60F3AE5CEC1FBCBB172D844DFE1E49C383F8A1F51FC9383B81`。
+- `ui2` 明确包含 Frida Gadget，SHA-256
+  `B566D70189B6D551AD8F4E0BEA24DE08A3D4C0F559BB35B2BDB67D45182240C2`；
+  同时包含 VB-CABLE Pack45，SHA-256
+  `B950E39F01AF1D04EA623C8F6D8EB9B6EA5C477C637295FABF20631C85116BFB`。
+  ZIP 只有一个顶层目录，ZIP 与候选目录均为 2067 个文件，路径差异和内容差异
+  都为 0；六个冻结 QML 和五份许可/说明文件均与 `338d2cb` 源码逐文件一致。
 - 冻结入口 `--dry-run=0`、`--help=0`、无效 HID 注入 PID `=4`；设置入口离屏
-  运行 5 秒保持存活，停止本轮精确 PID 后无 UI1 残留进程。
-- 状态：源码、自动检查、构建与冻结验证通过；`TEST-UI-003` 人工界面复核
-  待完成。该候选不包含随后提交 `a189a1c` 的 BLE/音频停止排序修复。
+  运行 5 秒保持存活，停止本轮精确 PID 后无 UI2 残留进程。
+- 状态：源码、自动检查、构建与冻结验证通过；以 `ui2` 进入
+  `TEST-UI-003` 人工界面复核。音频尾音、HOLD 和实验性 TOGGLE 仍按各自真机
+  条目验收，不能由本次界面/冻结检查代替。
 
 ### 2026-08-21 BLE 音频停止排序与 RC003 固件边界
 
