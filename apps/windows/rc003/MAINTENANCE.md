@@ -187,6 +187,15 @@
 - `fix11` 麦克风检测隔离代码提交：`4d6a0fe`。应用接线测试 81 项通过、1 项
   平台相关跳过；完整测试 1093 项通过、7 项跳过；公开边界扫描 229 个文件
   通过；`compileall`、`pip check` 和 `git diff --check` 通过。
+- `fix11` 构建时 Git HEAD：`c135991`；PyInstaller 构建与冻结入口检查通过，
+  `--dry-run=0`、`--help=0`、无效 HID 注入 PID `=4`。
+- 最新候选目录：源码仓库同级的
+  `RemoteMicRC003-0.1.0-candidate-20260821-fix11/`。
+- `fix11` 候选 EXE SHA-256：
+  `4639AC9942C3D66525ED8EC7457F1EA7562E1B9DBD14ED5E5FD05BB2CB44ED7D`。
+- `fix11` 便携 ZIP SHA-256：
+  `DF9F50C4B9F11D703FA65BFE200A52FBD953B7591670FA3AEF89B6C96985127B`；
+  ZIP 内 EXE 已重新计算并与候选目录一致。
 - 冻结桥接实测：进程日志记录通知区域图标 ready 和 started，随后完成
   RC003 BLE/ATVV 能力连接。用户从托盘打开设置后再选择“退出桥接”，桥接
   进程消失而设置窗口继续保留；日志记录 HID tap stopped、BLE/HID/音频

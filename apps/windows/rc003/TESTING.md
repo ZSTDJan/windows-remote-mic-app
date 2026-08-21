@@ -198,6 +198,13 @@ HID 注入权限顺序与稳定失败提交：
 - 自动结果：应用接线测试 81 项通过、1 项平台相关跳过；完整测试 1093 项
   通过、7 项跳过；公开边界扫描 229 个文件通过；`compileall`、`pip check`
   和 `git diff --check` 通过。
+- 候选：`RemoteMicRC003-0.1.0-candidate-20260821-fix11-portable.zip`，
+  SHA-256
+  `DF9F50C4B9F11D703FA65BFE200A52FBD953B7591670FA3AEF89B6C96985127B`；
+  ZIP 内 EXE SHA-256
+  `4639AC9942C3D66525ED8EC7457F1EA7562E1B9DBD14ED5E5FD05BB2CB44ED7D`，
+  已与候选目录一致。冻结入口 `--dry-run=0`、`--help=0`、无效 HID 注入
+  PID `=4`。
 - 真机步骤：检测麦克风键一次，确认界面高亮且宿主语音不启动；等待约 1 秒
   后再执行正常语音按键，确认检测门闩已释放。
 - 状态：自动验证通过，待 `fix11` 本机复测。

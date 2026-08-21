@@ -127,6 +127,15 @@ HID tap 身份校验、进程控制和日志隐私。自动检查与 `fix10` 候
 - `fix11` 麦克风检测隔离代码提交：`4d6a0fe`。
 - `fix11` 构建前完整测试：1093 项通过，7 项安全或平台相关跳过；公开边界
   扫描 229 个文件通过；`compileall`、`pip check` 和 `git diff --check` 通过。
+- `fix11` 构建时 Git HEAD：`c135991`；PyInstaller 构建通过，冻结入口
+  `--dry-run=0`、`--help=0`、无效 HID 注入 PID `=4`。
+- `fix11` 候选目录：源码仓库同级的
+  `RemoteMicRC003-0.1.0-candidate-20260821-fix11/`。
+- `fix11` 候选 EXE SHA-256：
+  `4639AC9942C3D66525ED8EC7457F1EA7562E1B9DBD14ED5E5FD05BB2CB44ED7D`。
+- `fix11` 便携 ZIP SHA-256：
+  `DF9F50C4B9F11D703FA65BFE200A52FBD953B7591670FA3AEF89B6C96985127B`；
+  ZIP 内 EXE 已重新计算并与候选目录一致。
 
 ## [0.1.0-candidate] — 2026-07-31
 

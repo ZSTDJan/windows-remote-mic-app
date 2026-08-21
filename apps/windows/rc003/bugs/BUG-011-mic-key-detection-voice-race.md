@@ -65,6 +65,20 @@ legacy F5 发布结果。RC003 的 `AudioStarted` 或 `MicButtonPressed` 可以�
 - 公开边界扫描：229 个文件通过；`compileall`、`pip check` 和
   `git diff --check` 通过。
 
+## `fix11` 候选
+
+- 构建时 Git HEAD：`c135991accc081e35d1e5c53624aca7259ff1c86`。
+- 候选目录：
+  `RemoteMicRC003-0.1.0-candidate-20260821-fix11/`。
+- EXE SHA-256：
+  `4639AC9942C3D66525ED8EC7457F1EA7562E1B9DBD14ED5E5FD05BB2CB44ED7D`。
+- 便携 ZIP：
+  `RemoteMicRC003-0.1.0-candidate-20260821-fix11-portable.zip`。
+- ZIP SHA-256：
+  `DF9F50C4B9F11D703FA65BFE200A52FBD953B7591670FA3AEF89B6C96985127B`。
+- ZIP 内 EXE 已重新计算并与候选目录一致；冻结入口
+  `--dry-run=0`、`--help=0`、无效 HID 注入 PID `=4`。
+
 ## 真机复测门槛
 
 1. 运行 `fix11` 后，从托盘打开设置并检测麦克风键一次；界面应高亮麦克风，
