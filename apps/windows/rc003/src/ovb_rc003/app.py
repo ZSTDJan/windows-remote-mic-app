@@ -113,9 +113,9 @@ _BUTTON_ACTION_KEY_TOKENS = {
 
 _KEY_DETECTION_MIC_RELEASE_GRACE_SECONDS = 1.0
 _KEY_DETECTION_MIC_MAX_SECONDS = 10.0
-_VOICE_TOGGLE_REOPEN_FALLBACK_SECONDS = 0.2
-_VOICE_TOGGLE_REOPEN_ECHO_GUARD_SECONDS = 0.25
-_MAPPED_VOICE_RELEASE_GUARD_SECONDS = 0.12
+_VOICE_RELEASE_FINISH_AFTER_AUDIO_STOP_SECONDS = 0.12
+_VOICE_RELEASE_FINISH_FALLBACK_SECONDS = 0.8
+_ORDINARY_MIC_RELEASE_GUARD_SECONDS = 0.12
 
 
 def open_configured_application(action: key_mapping.ButtonAction) -> bool:
@@ -134,6 +134,10 @@ class RC003App:
         self._bindings = config.load_key_bindings(
             self._bindings_path
         )
+        self._removed_voice_bindings = config.normalize_voice_product_boundary(
+            self._config,
+            self._bindings,
+        )
         self._bindings_mtime_ns = self._settings_file_mtime_ns(self._bindings_path)
         self._button_gestures = button_gesture.ButtonGestureDispatcher(
             is_action_configured=self._is_button_action_configured,
@@ -141,9 +145,12 @@ class RC003App:
             on_trigger=self._on_button_trigger,
         )
         self._logger: logging.Logger = logging_setup.get_logger(self._config_root)
-        self._voice = voice_controller.VoiceController(
-            key_mapping.VoiceTriggerMode(self._config["voice_trigger_mode"])
-        )
+        if self._removed_voice_bindings:
+            self._logger.warning(
+                "legacy voice mappings disabled until user reselects actions: %s",
+                sorted(self._removed_voice_bindings),
+            )
+        self._voice = voice_controller.VoiceController()
         runtime_hotkey_text = str(self._config.get("voice_hotkey", "")).strip()
         if not runtime_hotkey_text:
             runtime_hotkey_text = key_mapping.voice_hotkey_for_trigger_mode(
@@ -155,14 +162,12 @@ class RC003App:
         self._pending_bindings = None
         self._voice_audio_start_fallback_pending = False
         self._voice_audio_started_waiting_for_legacy_f5 = False
-        self._voice_toggle_close_pending = False
-        self._voice_toggle_reopen_pending = False
-        self._voice_toggle_reopen_scheduled = False
-        self._voice_toggle_reopen_generation = 0
-        self._voice_toggle_reopen_handle: Optional[asyncio.TimerHandle] = None
-        self._voice_toggle_reopen_echo_guard_until = 0.0
-        self._voice_toggle_reopen_echo_sources_down: set[str] = set()
         self._voice_hotkey_release_pending: Optional[Tuple[str, ...]] = None
+        self._voice_release_finish_pending = False
+        self._voice_release_finish_generation = 0
+        self._voice_release_finish_handle: Optional[asyncio.TimerHandle] = None
+        self._voice_release_finish_tokens: Optional[Tuple[str, ...]] = None
+        self._voice_release_finish_session_eligible = False
         self._button_key_release_pending: Optional[Tuple[str, ...]] = None
         # Raw Input and the ATVV control channel arrive on different worker
         # threads. Serialize the voice state machine so one physical press
@@ -175,23 +180,13 @@ class RC003App:
         )
         # One RC003 microphone press is reported independently by the legacy
         # F5 hook, HID/Raw Input, the ATVV mic opcode, and sometimes
-        # AUDIO_STARTED first. Keep all of those reports in one gesture until
-        # the physical/audio release boundary so toggle mode changes state
-        # exactly once per real press regardless of arrival order.
+        # AUDIO_STARTED first. Keep all reports in one gesture so one real
+        # press produces one host key-down and one release.
         self._voice_mic_gesture_active = False
         self._voice_mic_gesture_audio_started = False
         self._voice_mic_gesture_audio_stopped = False
         self._voice_mic_gesture_physical_seen = False
         self._voice_mic_gesture_sources_down: set[str] = set()
-        # A non-mic button mapped to voice has one stable owner across the
-        # whole host/device session. Its physical release is required for
-        # HOLD and for fix12's deferred TOGGLE reopen, but it must not share
-        # the physical mic's multi-source gesture latch.
-        self._mapped_voice_button_id: Optional[str] = None
-        self._mapped_voice_sources_down: set[str] = set()
-        self._mapped_voice_sources_seen: set[str] = set()
-        self._mapped_voice_release_guard_until = 0.0
-        self._mapped_voice_release_requested = False
         self._ordinary_mic_lock = threading.Lock()
         self._ordinary_mic_sources_down: set[str] = set()
         self._ordinary_mic_late_sources_down: set[str] = set()
@@ -541,19 +536,12 @@ class RC003App:
             with self._voice_trigger_lock:
                 self._voice_audio_start_fallback_pending = False
                 self._voice_audio_started_waiting_for_legacy_f5 = False
-                self._voice_toggle_close_pending = False
-                self._cancel_voice_toggle_reopen_locked("connection cleanup")
-                self._voice_toggle_reopen_echo_guard_until = 0.0
-                self._voice_toggle_reopen_echo_sources_down.clear()
+                self._cancel_voice_release_finish_locked("connection cleanup")
+                self._voice_release_finish_session_eligible = False
                 self._voice_raw_input_trigger_pending = False
                 self._voice_audio_stream_active = False
                 self._voice_audio_stop_processed = False
                 self._voice_pcm_forwarding_enabled = False
-                self._mapped_voice_button_id = None
-                self._mapped_voice_sources_down.clear()
-                self._mapped_voice_sources_seen.clear()
-                self._mapped_voice_release_guard_until = 0.0
-                self._mapped_voice_release_requested = False
                 self._unsolicited_mic_close_pending = False
                 self._finish_voice_mic_gesture()
                 if self._voice_hotkey_release_pending is not None:
@@ -568,9 +556,8 @@ class RC003App:
                     # _apply_voice_action() already logged the specific failure.
                     # reset() already cleared the controller's own pending
                     # state before we knew delivery would fail - restore it so
-                    # a HOLD-mode key isn't recorded as released while it may
-                    # still be physically down, and a TOGGLE-mode closing tap
-                    # isn't forgotten (XRBM-019 review round 1 P1 #4).
+                    # a held shortcut isn't recorded as released while it may
+                    # still be physically down (XRBM-019 review round 1 P1 #4).
                     self._voice.restore_pending(reset_action)
                     failures.append("voice hotkey release did not fully deliver; state retained")
                 self._voice_legacy_transform_key_down = False
@@ -671,7 +658,7 @@ class RC003App:
         result = []
         for button_id in button_bindings:
             action = self._primary_button_action(button_id)
-            if key_mapping.is_voice_action(action):
+            if button_id == "mic" and key_mapping.is_supported_voice_action(action):
                 result.append(button_id)
         return result
 
@@ -681,22 +668,9 @@ class RC003App:
         action: Optional[key_mapping.ButtonAction] = None,
     ) -> Optional[key_mapping.VoiceTriggerMode]:
         action = action or self._primary_button_action(button_id)
-        try:
-            legacy_mode = key_mapping.VoiceTriggerMode(
-                self._config.get("voice_trigger_mode", "toggle")
-            )
-        except ValueError:
-            legacy_mode = key_mapping.VoiceTriggerMode.TOGGLE
-        mode = key_mapping.voice_trigger_mode_for_action(
-            action,
-            legacy_mode=legacy_mode,
-        )
-        if mode is None:
+        if button_id != "mic" or not key_mapping.is_supported_voice_action(action):
             return None
-        voice_buttons = self._configured_voice_buttons()
-        if len(voice_buttons) != 1 or voice_buttons[0] != button_id:
-            return None
-        return mode
+        return key_mapping.VoiceTriggerMode.HOLD
 
     def _voice_hotkey_text_for_mode(
         self, mode: key_mapping.VoiceTriggerMode
@@ -717,15 +691,15 @@ class RC003App:
         button_id: str,
         action: key_mapping.ButtonAction,
     ) -> bool:
-        mode = self._voice_mode_for_primary_button(button_id, action)
-        if mode is None:
+        if self._voice_mode_for_primary_button(button_id, action) is None:
             self._logger.warning(
-                "voice mapping ignored: expected exactly one primary voice action; "
-                "button=%s configured=%s",
+                "voice mapping ignored: only the physical microphone button "
+                "supports hold-to-talk; button=%s configured=%s",
                 button_id,
                 self._configured_voice_buttons(),
             )
             return False
+        mode = key_mapping.VoiceTriggerMode.HOLD
         try:
             voice_hotkey = hotkey.HotkeySpec.parse(
                 self._voice_hotkey_text_for_mode(mode)
@@ -808,17 +782,26 @@ class RC003App:
         self._voice_mic_gesture_physical_seen = False
         self._voice_mic_gesture_sources_down.clear()
 
-    def _release_hold_voice_on_physical_release_locked(self, reason: str) -> bool:
+    def _release_hold_voice_on_physical_release_locked(
+        self,
+        reason: str,
+        *,
+        queue_finish_tap: bool = False,
+    ) -> bool:
         """Release HOLD shortcuts without depending solely on AUDIO_STOP."""
 
         action = self._voice.on_mic_button_released()
         if action is None:
+            if queue_finish_tap:
+                self._queue_voice_release_finish_locked()
             return True
         self._voice_raw_input_trigger_pending = False
         self._voice_audio_start_fallback_pending = False
         self._voice_pcm_forwarding_enabled = False
         if self._apply_voice_action(action):
             self._logger.info("voice hold hotkey released on %s", reason)
+            if queue_finish_tap:
+                self._queue_voice_release_finish_locked()
             return True
 
         self._voice.restore_pending(action)
@@ -830,45 +813,43 @@ class RC003App:
         self._supervisor.request_reconnect()
         return False
 
-    def _cancel_voice_toggle_reopen_locked(self, reason: str = "") -> None:
-        was_pending = self._voice_toggle_reopen_pending
-        self._voice_toggle_reopen_pending = False
-        self._voice_toggle_reopen_scheduled = False
-        self._voice_toggle_reopen_generation += 1
-        handle = self._voice_toggle_reopen_handle
-        self._voice_toggle_reopen_handle = None
+    def _cancel_voice_release_finish_locked(self, reason: str = "") -> None:
+        was_pending = self._voice_release_finish_pending
+        self._voice_release_finish_pending = False
+        self._voice_release_finish_generation += 1
+        self._voice_release_finish_tokens = None
+        handle = self._voice_release_finish_handle
+        self._voice_release_finish_handle = None
         if handle is not None:
             try:
                 self._event_loop.call_soon_threadsafe(handle.cancel)
             except RuntimeError:
                 handle.cancel()
         if was_pending and reason:
-            self._logger.info("voice toggle pending reopen cancelled: %s", reason)
+            self._logger.info("voice release finish tap cancelled: %s", reason)
 
-    def _schedule_voice_toggle_reopen_locked(
+    def _schedule_voice_release_finish_locked(
         self,
         delay: float,
         reason: str,
     ) -> None:
-        if (
-            not self._voice_toggle_reopen_pending
-            or self._voice_toggle_reopen_scheduled
-        ):
+        if not self._voice_release_finish_pending:
             return
-        self._voice_toggle_reopen_scheduled = True
-        generation = self._voice_toggle_reopen_generation
+        self._voice_release_finish_generation += 1
+        generation = self._voice_release_finish_generation
 
         def install_timer() -> None:
             with self._voice_trigger_lock:
                 if (
-                    generation != self._voice_toggle_reopen_generation
-                    or not self._voice_toggle_reopen_pending
-                    or not self._voice_toggle_reopen_scheduled
+                    generation != self._voice_release_finish_generation
+                    or not self._voice_release_finish_pending
                 ):
                     return
-                self._voice_toggle_reopen_handle = self._event_loop.call_later(
+                if self._voice_release_finish_handle is not None:
+                    self._voice_release_finish_handle.cancel()
+                self._voice_release_finish_handle = self._event_loop.call_later(
                     delay,
-                    self._complete_voice_toggle_reopen,
+                    self._complete_voice_release_finish,
                     generation,
                     reason,
                 )
@@ -876,97 +857,63 @@ class RC003App:
         try:
             self._event_loop.call_soon_threadsafe(install_timer)
         except RuntimeError:
-            self._voice_toggle_reopen_pending = False
-            self._voice_toggle_reopen_scheduled = False
-            self._voice_toggle_reopen_generation += 1
-            self._logger.info(
-                "voice toggle reopen suppressed: application event loop is closing"
+            self._cancel_voice_release_finish_locked(
+                "application event loop is closing"
             )
 
-    def _defer_voice_toggle_reopen_locked(self) -> None:
-        if self._voice_toggle_reopen_pending:
+    def _queue_voice_release_finish_locked(self) -> None:
+        if not self._voice_release_finish_session_eligible:
             return
-        self._voice_toggle_reopen_pending = True
-        self._voice_toggle_reopen_generation += 1
-        if self._voice_mic_gesture_sources_down or self._mapped_voice_sources_down:
-            self._logger.info(
-                "voice toggle reopen deferred until mapped button release: "
-                "mic_sources=%s mapped_button=%s",
-                sorted(self._voice_mic_gesture_sources_down),
-                self._mapped_voice_button_id if self._mapped_voice_sources_down else "",
-            )
+        self._voice_release_finish_session_eligible = False
+        if not bool(self._config.get("voice_release_finish_tap_enabled", False)):
             return
-        if self._voice_mic_gesture_physical_seen:
-            self._logger.info(
-                "voice toggle reopen queued after already-completed physical mic release"
-            )
-            self._schedule_voice_toggle_reopen_locked(
-                0.0,
-                "physical mic release",
-            )
-            return
+        self._cancel_voice_release_finish_locked("new release superseded old finish tap")
+        self._voice_release_finish_pending = True
+        self._voice_release_finish_tokens = (
+            tuple(self._voice_hotkey.modifiers) + (self._voice_hotkey.key,)
+        )
+        if self._voice_mic_gesture_audio_stopped:
+            delay = _VOICE_RELEASE_FINISH_AFTER_AUDIO_STOP_SECONDS
+            reason = "audio already stopped"
+        else:
+            delay = _VOICE_RELEASE_FINISH_FALLBACK_SECONDS
+            reason = "audio-stop fallback"
         self._logger.info(
-            "voice toggle reopen waiting %.0fms for a late physical mic edge",
-            _VOICE_TOGGLE_REOPEN_FALLBACK_SECONDS * 1000.0,
+            "voice release finish tap queued: delay_ms=%.0f reason=%s",
+            delay * 1000.0,
+            reason,
         )
-        self._schedule_voice_toggle_reopen_locked(
-            _VOICE_TOGGLE_REOPEN_FALLBACK_SECONDS,
-            "BLE-only release fallback",
-        )
+        self._schedule_voice_release_finish_locked(delay, reason)
 
-    def _complete_voice_toggle_reopen(self, generation: int, reason: str) -> None:
+    def _complete_voice_release_finish(self, generation: int, reason: str) -> None:
         with self._voice_trigger_lock:
             if (
-                generation != self._voice_toggle_reopen_generation
-                or not self._voice_toggle_reopen_pending
+                generation != self._voice_release_finish_generation
+                or not self._voice_release_finish_pending
             ):
                 return
-            self._voice_toggle_reopen_handle = None
-            self._voice_toggle_reopen_scheduled = False
-            if self._voice_mic_gesture_sources_down or self._mapped_voice_sources_down:
+            tokens = self._voice_release_finish_tokens
+            self._voice_release_finish_pending = False
+            self._voice_release_finish_handle = None
+            self._voice_release_finish_tokens = None
+            if tokens is None or self._voice.active:
                 self._logger.info(
-                    "voice toggle reopen still waiting for mapped button release: "
-                    "mic_sources=%s mapped_button=%s",
-                    sorted(self._voice_mic_gesture_sources_down),
-                    self._mapped_voice_button_id
-                    if self._mapped_voice_sources_down
-                    else "",
+                    "voice release finish tap skipped: a new hold session is active"
                 )
                 return
-            if (
-                self._voice.trigger_mode != key_mapping.VoiceTriggerMode.TOGGLE
-                or not self._voice.active
-                or self._voice_toggle_close_pending
-                or self._voice_audio_stream_active
-                or self._ble_session is None
-            ):
-                self._cancel_voice_toggle_reopen_locked(
-                    "voice session is no longer eligible"
+            try:
+                win32_input.send_voice_key_combo_tap(tokens)
+            except win32_input.InputCleanupIncompleteError:
+                self._voice_hotkey_release_pending = tokens
+                self._logger.exception(
+                    "voice release finish tap failed and safety release remains pending"
                 )
+                self._supervisor.request_reconnect()
                 return
-            self._voice_toggle_reopen_pending = False
-            self._voice_toggle_reopen_generation += 1
-            if (
-                self._voice_mic_gesture_active
-                and self._voice_mic_gesture_audio_stopped
-            ):
-                self._finish_voice_mic_gesture()
-            self._logger.info(
-                "voice toggle reopening device mic after %s",
-                reason,
-            )
-            # Real RC003 logs show a synthetic-looking F5 down/up about 60 ms
-            # after an application-issued MIC_OPEN. Without a narrow guard it
-            # is mistaken for the user's second toggle press and immediately
-            # closes the stream that was just reopened. Keep the guard short
-            # and source-paired: the whole echo press is ignored, while a real
-            # later press still closes toggle mode normally.
-            self._voice_toggle_reopen_echo_guard_until = (
-                time.monotonic() + _VOICE_TOGGLE_REOPEN_ECHO_GUARD_SECONDS
-            )
-            self._voice_toggle_reopen_echo_sources_down.clear()
-            self._voice_pcm_forwarding_enabled = True
-            self._ble_session.send_mic_open_threadsafe()
+            except (win32_input.Win32InputUnavailableError, OSError):
+                self._logger.exception("voice release finish tap failed")
+                return
+            self._logger.info("voice release finish tap sent after %s", reason)
 
     def _reset_key_detection_mic_gesture_locked(self) -> None:
         self._key_detection_mic_gesture_active = False
@@ -1283,12 +1230,10 @@ class RC003App:
     def _voice_settings_idle_locked(self) -> bool:
         return not (
             self._voice.active
-            or self._voice_toggle_close_pending
             or self._voice_mic_gesture_active
             or self._voice_audio_stream_active
             or self._voice_legacy_transform_key_down
             or self._voice_legacy_transform_session
-            or self._mapped_voice_button_id is not None
             or self._ordinary_mic_gesture_active
             or self._voice_hotkey_release_pending is not None
         )
@@ -1298,7 +1243,11 @@ class RC003App:
         trigger_mode: key_mapping.VoiceTriggerMode,
         voice_hotkey: hotkey.HotkeySpec,
     ) -> None:
-        self._voice = voice_controller.VoiceController(trigger_mode)
+        if trigger_mode != key_mapping.VoiceTriggerMode.HOLD:
+            raise ValueError("RC003 voice settings support hold-to-talk only")
+        self._cancel_voice_release_finish_locked("voice settings changed")
+        self._voice_release_finish_session_eligible = False
+        self._voice = voice_controller.VoiceController()
         self._voice_hotkey = voice_hotkey
         self._config["voice_trigger_mode"] = trigger_mode.value
         self._config["voice_hotkey"] = voice_hotkey.serialize()
@@ -1322,6 +1271,9 @@ class RC003App:
         if self._pending_bindings is not None:
             self._bindings = self._pending_bindings
             self._pending_bindings = None
+            self._removed_voice_bindings = dict(
+                self._bindings.get(config.RUNTIME_REMOVED_VOICE_BINDINGS_KEY, {})
+            )
             self._logger.info("deferred settings mappings applied after voice became idle")
         self._refresh_legacy_voice_transform_snapshot_locked()
 
@@ -1329,220 +1281,71 @@ class RC003App:
         """Apply mapping and voice-setting edits without a bridge restart."""
 
         current_config_mtime_ns = self._settings_file_mtime_ns(self._config_path)
-        if current_config_mtime_ns != self._config_mtime_ns:
-            try:
-                refreshed_config = config.load_config(self._config_path)
-                trigger_mode = key_mapping.VoiceTriggerMode(
-                    refreshed_config["voice_trigger_mode"]
-                )
-                refreshed_hotkey_text = str(
-                    refreshed_config.get("voice_hotkey", "")
-                ).strip()
-                if not refreshed_hotkey_text:
-                    refreshed_hotkey_text = key_mapping.voice_hotkey_for_trigger_mode(
-                        trigger_mode
-                    )
-                voice_hotkey = hotkey.HotkeySpec.parse(
-                    refreshed_hotkey_text
-                )
-            except Exception as exc:  # noqa: BLE001 - keep the last valid settings
-                self._logger.warning("voice settings reload skipped: %s", exc)
-                with self._voice_trigger_lock:
-                    self._legacy_voice_transform_snapshot = False
-                    self._config_mtime_ns = current_config_mtime_ns
-            else:
-                with self._voice_trigger_lock:
-                    current_settings = (
-                        self._voice.trigger_mode,
-                        self._voice_hotkey.serialize(),
-                    )
-                    refreshed_settings = (trigger_mode, voice_hotkey.serialize())
-                    if refreshed_settings != current_settings:
-                        if self._voice_settings_idle_locked():
-                            self._config = refreshed_config
-                            self._pending_config = None
-                            self._pending_voice_settings = None
-                            self._apply_voice_settings_locked(trigger_mode, voice_hotkey)
-                        else:
-                            self._pending_config = refreshed_config
-                            self._pending_voice_settings = (trigger_mode, voice_hotkey)
-                            self._logger.info(
-                                "settings voice configuration deferred until idle: "
-                                "trigger_mode=%s hotkey=%s",
-                                trigger_mode.value,
-                                voice_hotkey.serialize(),
-                            )
-                    else:
-                        self._config = refreshed_config
-                        self._pending_config = None
-                        self._pending_voice_settings = None
-                        self._refresh_legacy_voice_transform_snapshot_locked()
-                    self._config_mtime_ns = current_config_mtime_ns
-
-        current_mtime_ns = self._settings_file_mtime_ns(self._bindings_path)
-        if current_mtime_ns == self._bindings_mtime_ns:
+        current_bindings_mtime_ns = self._settings_file_mtime_ns(self._bindings_path)
+        if (
+            current_config_mtime_ns == self._config_mtime_ns
+            and current_bindings_mtime_ns == self._bindings_mtime_ns
+        ):
             return
         try:
-            refreshed = config.load_key_bindings(self._bindings_path)
-        except Exception as exc:  # noqa: BLE001 - keep the last valid mapping
+            refreshed_config = config.load_config(self._config_path)
+            refreshed_bindings = config.load_key_bindings(self._bindings_path)
+            removed_voice_bindings = config.normalize_voice_product_boundary(
+                refreshed_config,
+                refreshed_bindings,
+            )
+            trigger_mode = key_mapping.VoiceTriggerMode.HOLD
+            refreshed_hotkey_text = str(
+                refreshed_config.get("voice_hotkey", "")
+            ).strip()
+            if not refreshed_hotkey_text:
+                refreshed_hotkey_text = key_mapping.voice_hotkey_for_trigger_mode(
+                    trigger_mode
+                )
+            voice_hotkey = hotkey.HotkeySpec.parse(refreshed_hotkey_text)
+        except Exception as exc:  # noqa: BLE001 - keep the last valid settings
             self._logger.warning("settings reload skipped: %s", exc)
             with self._voice_trigger_lock:
                 self._legacy_voice_transform_snapshot = False
-                self._bindings_mtime_ns = current_mtime_ns
+                self._config_mtime_ns = current_config_mtime_ns
+                self._bindings_mtime_ns = current_bindings_mtime_ns
             return
+
         with self._voice_trigger_lock:
+            refreshed_settings = (trigger_mode, voice_hotkey.serialize())
+            current_settings = (
+                self._voice.trigger_mode,
+                self._voice_hotkey.serialize(),
+            )
             if self._voice_settings_idle_locked():
-                self._bindings = refreshed
+                self._cancel_voice_release_finish_locked("settings reloaded")
+                self._voice_release_finish_session_eligible = False
+                self._config = refreshed_config
+                self._bindings = refreshed_bindings
+                self._removed_voice_bindings = removed_voice_bindings
+                self._pending_config = None
                 self._pending_bindings = None
-                self._refresh_legacy_voice_transform_snapshot_locked()
-            else:
-                self._pending_bindings = refreshed
-                self._logger.info(
-                    "settings mappings deferred until active voice session is idle"
-                )
-            self._bindings_mtime_ns = current_mtime_ns
-        if self._pending_bindings is None:
-            self._logger.info("settings mappings reloaded from disk")
-
-    def _maybe_finish_mapped_voice_owner_locked(self) -> None:
-        if (
-            self._mapped_voice_button_id is not None
-            and not self._mapped_voice_sources_down
-            and not self._voice.active
-            and not self._voice_audio_stream_active
-            and not self._voice_toggle_close_pending
-            and not self._voice_toggle_reopen_pending
-        ):
-            self._logger.info(
-                "mapped voice session released: button=%s",
-                self._mapped_voice_button_id,
-            )
-            self._mapped_voice_button_id = None
-            self._mapped_voice_sources_seen.clear()
-            self._mapped_voice_release_guard_until = 0.0
-            self._mapped_voice_release_requested = False
-            self._apply_pending_voice_settings_if_idle_locked()
-
-    def _handle_mapped_voice_button_edge(
-        self,
-        button_id: str,
-        action: key_mapping.ButtonAction,
-        is_pressed: bool,
-        event_source: str,
-    ) -> None:
-        """Drive voice once across Raw Input/direct-HID duplicate edges."""
-
-        with self._voice_trigger_lock:
-            owner = self._mapped_voice_button_id
-            if owner is not None and owner != button_id:
-                self._logger.info(
-                    "voice button ignored: active session is owned by %s", owner
-                )
-                return
-
-            if is_pressed:
-                if event_source in self._mapped_voice_sources_down:
-                    return
-                if self._mapped_voice_sources_down:
-                    self._mapped_voice_sources_down.add(event_source)
-                    self._mapped_voice_sources_seen.add(event_source)
-                    self._logger.info(
-                        "mapped voice duplicate source joined: button=%s source=%s",
-                        button_id,
-                        event_source,
-                    )
-                    return
-                now = time.monotonic()
-                if (
-                    owner is not None
-                    and now < self._mapped_voice_release_guard_until
-                    and event_source not in self._mapped_voice_sources_seen
-                ):
-                    self._mapped_voice_sources_down.add(event_source)
-                    self._mapped_voice_sources_seen.add(event_source)
-                    self._logger.info(
-                        "mapped voice late duplicate ignored: button=%s source=%s",
-                        button_id,
-                        event_source,
-                    )
-                    return
-                if owner is None:
-                    if not self._prepare_voice_mapping_locked(button_id, action):
-                        return
-                    self._mapped_voice_button_id = button_id
-                elif (
-                    self._voice.trigger_mode == key_mapping.VoiceTriggerMode.HOLD
-                    and self._voice.active
-                ):
-                    self._logger.info(
-                        "hold voice press ignored while audio stop is pending: button=%s",
-                        button_id,
-                    )
-                    return
-
-                self._mapped_voice_sources_down.add(event_source)
-                self._mapped_voice_sources_seen = {event_source}
-                self._mapped_voice_release_guard_until = 0.0
-                self._mapped_voice_release_requested = False
-                was_active = self._voice.active
-                self._logger.info(
-                    "mapped voice button pressed: button=%s mode=%s",
-                    button_id,
-                    self._voice.trigger_mode.value,
-                )
-                self._handle_mic_button_pressed()
-                if (
-                    not was_active
-                    and not self._voice.active
-                    and not self._voice_toggle_close_pending
-                ):
-                    self._mapped_voice_sources_down.clear()
-                    self._mapped_voice_sources_seen.clear()
-                    self._mapped_voice_button_id = None
-                    self._apply_pending_voice_settings_if_idle_locked()
-                return
-
-            if event_source not in self._mapped_voice_sources_down:
-                return
-            self._mapped_voice_sources_down.discard(event_source)
-            if self._mapped_voice_sources_down:
-                return
-            self._mapped_voice_release_guard_until = (
-                time.monotonic() + _MAPPED_VOICE_RELEASE_GUARD_SECONDS
-            )
-            if owner is None:
-                return
-            self._logger.info("mapped voice button released: button=%s", button_id)
-            if (
-                self._voice_toggle_reopen_pending
-                and not self._voice_mic_gesture_sources_down
-            ):
-                self._schedule_voice_toggle_reopen_locked(
-                    0.0,
-                    "mapped voice button release",
-                )
-            if (
-                self._voice.trigger_mode == key_mapping.VoiceTriggerMode.HOLD
-                and self._voice.active
-                and not self._mapped_voice_release_requested
-            ):
-                self._mapped_voice_release_requested = True
-                self._voice_pcm_forwarding_enabled = False
-                self._release_hold_voice_on_physical_release_locked(
-                    f"mapped button release ({button_id})"
-                )
-                if self._ble_session is None:
-                    self._logger.info(
-                        "hold voice release has no BLE session; requesting reconnect"
-                    )
-                    self._supervisor.request_reconnect()
+                self._pending_voice_settings = None
+                if refreshed_settings != current_settings:
+                    self._apply_voice_settings_locked(trigger_mode, voice_hotkey)
                 else:
-                    self._logger.info(
-                        "hold voice release: sending MIC_CLOSE for button=%s",
-                        button_id,
-                    )
-                    self._ble_session.send_mic_close_threadsafe()
-            self._maybe_finish_mapped_voice_owner_locked()
+                    self._refresh_legacy_voice_transform_snapshot_locked()
+            else:
+                self._pending_config = refreshed_config
+                self._pending_bindings = refreshed_bindings
+                self._pending_voice_settings = (trigger_mode, voice_hotkey)
+                self._logger.info(
+                    "settings reload deferred until active voice session is idle"
+                )
+            self._config_mtime_ns = current_config_mtime_ns
+            self._bindings_mtime_ns = current_bindings_mtime_ns
+        if removed_voice_bindings:
+            self._logger.warning(
+                "legacy voice mappings disabled until user reselects actions: %s",
+                sorted(removed_voice_bindings),
+            )
+        if self._pending_bindings is None:
+            self._logger.info("settings reloaded from disk")
 
     def _handle_ordinary_mic_edge(
         self, event_source: str, is_pressed: bool
@@ -1587,7 +1390,7 @@ class RC003App:
                 dispatch = not self._ordinary_mic_sources_down
                 if dispatch:
                     self._ordinary_mic_release_guard_until = (
-                        time.monotonic() + _MAPPED_VOICE_RELEASE_GUARD_SECONDS
+                        time.monotonic() + _ORDINARY_MIC_RELEASE_GUARD_SECONDS
                     )
             self._ordinary_mic_gesture_active = bool(
                 self._ordinary_mic_sources_down
@@ -1649,6 +1452,16 @@ class RC003App:
             return
         self._reload_settings_if_changed()
 
+        if button_id in self._removed_voice_bindings:
+            if not is_pressed:
+                self._button_gestures.release(button_id)
+            else:
+                self._logger.warning(
+                    "button action suppressed until removed voice mapping is reselected: %s",
+                    button_id,
+                )
+            return
+
         primary_action = self._primary_button_action(button_id)
         voice_mode = self._voice_mode_for_primary_button(
             button_id,
@@ -1656,39 +1469,6 @@ class RC003App:
         )
 
         if button_id == "mic":
-            # fix14's synthetic F5 echo can follow any app-issued MIC_OPEN,
-            # including one triggered by a different mapped button. Consume
-            # the paired down/up before deciding whether mic itself is voice
-            # or an ordinary mapping.
-            with self._voice_trigger_lock:
-                if (
-                    not is_pressed
-                    and event_source in self._voice_toggle_reopen_echo_sources_down
-                ):
-                    self._voice_toggle_reopen_echo_sources_down.discard(event_source)
-                    self._logger.info(
-                        "voice physical release ignored: application MIC_OPEN echo "
-                        "source=%s",
-                        event_source,
-                    )
-                    return
-                if (
-                    is_pressed
-                    and time.monotonic() < self._voice_toggle_reopen_echo_guard_until
-                    and (
-                        self._voice.active
-                        or self._voice_audio_stream_active
-                        or self._voice_toggle_reopen_pending
-                    )
-                ):
-                    self._voice_toggle_reopen_echo_sources_down.add(event_source)
-                    self._logger.info(
-                        "voice physical trigger ignored: application MIC_OPEN echo "
-                        "source=%s",
-                        event_source,
-                    )
-                    return
-
             if voice_mode is None:
                 self._handle_ordinary_mic_edge(event_source, is_pressed)
                 return
@@ -1714,18 +1494,8 @@ class RC003App:
                                 sorted(self._voice_mic_gesture_sources_down),
                             )
                         self._release_hold_voice_on_physical_release_locked(
-                            "physical mic release"
-                        )
-                    if (
-                        self._voice_toggle_reopen_pending
-                        and not self._voice_mic_gesture_sources_down
-                    ):
-                        self._logger.info(
-                            "voice physical mic release completed; queueing toggle reopen"
-                        )
-                        self._schedule_voice_toggle_reopen_locked(
-                            0.0,
                             "physical mic release",
+                            queue_finish_tap=True,
                         )
                     if (
                         self._voice_mic_gesture_active
@@ -1734,7 +1504,6 @@ class RC003App:
                             self._voice_mic_gesture_audio_stopped
                             or (
                                 not self._voice_mic_gesture_audio_started
-                                and not self._voice_toggle_close_pending
                             )
                         )
                     ):
@@ -1747,13 +1516,6 @@ class RC003App:
                     primary_action,
                 ):
                     return
-                if self._voice_toggle_close_pending:
-                    if self._voice_mic_gesture_active:
-                        self._voice_mic_gesture_sources_down.add(event_source)
-                    self._logger.info(
-                        "voice physical trigger ignored: toggle close still pending"
-                    )
-                    return
                 if not self._begin_voice_mic_gesture(
                     event_source,
                     physical_down=True,
@@ -1763,10 +1525,7 @@ class RC003App:
                         event_source,
                     )
                     return
-                if (
-                    self._voice.active
-                    and self._voice.trigger_mode != key_mapping.VoiceTriggerMode.TOGGLE
-                ):
+                if self._voice.active:
                     self._logger.info(
                         "voice physical trigger ignored: hold session already active"
                     )
@@ -1783,21 +1542,10 @@ class RC003App:
                     send_device_open=False,
                     host_action_handled=host_action_handled,
                 )
-                if not self._voice.active and not self._voice_toggle_close_pending:
+                if not self._voice.active:
                     self._voice_raw_input_trigger_pending = False
             return
 
-        if (
-            self._mapped_voice_button_id == button_id
-            or voice_mode is not None
-        ):
-            self._handle_mapped_voice_button_edge(
-                button_id,
-                primary_action,
-                is_pressed,
-                event_source,
-            )
-            return
         if is_pressed:
             self._button_gestures.press(button_id)
         else:
@@ -1806,6 +1554,8 @@ class RC003App:
     def _is_button_action_configured(
         self, button_id: str, trigger: button_gesture.ButtonTrigger
     ) -> bool:
+        if button_id in self._removed_voice_bindings:
+            return False
         action = key_mapping.button_action_for(self._bindings, button_id, trigger)
         if action.kind == key_mapping.ActionKind.DISABLED:
             return False
@@ -1849,6 +1599,13 @@ class RC003App:
         self, button_id: str, trigger: button_gesture.ButtonTrigger
     ) -> None:
         self._reload_settings_if_changed()
+        if button_id in self._removed_voice_bindings:
+            self._logger.warning(
+                "delayed button gesture suppressed until removed voice mapping "
+                "is reselected: %s",
+                button_id,
+            )
+            return
         action = key_mapping.button_action_for(
             self._bindings,
             button_id,
@@ -2016,12 +1773,7 @@ class RC003App:
                     if self._ble_session is not None:
                         self._ble_session.send_mic_close_threadsafe()
                     return
-                if self._voice_toggle_close_pending:
-                    self._voice_raw_input_trigger_pending = False
-                    self._logger.info(
-                        "voice mic trigger ignored: toggle close still pending"
-                    )
-                elif self._voice_mic_gesture_active:
+                if self._voice_mic_gesture_active:
                     self._voice_raw_input_trigger_pending = False
                     self._voice_audio_start_fallback_pending = False
                     self._logger.info(
@@ -2098,11 +1850,7 @@ class RC003App:
                     if self._ble_session is not None:
                         self._ble_session.send_mic_close_threadsafe()
                     return
-                if self._voice_toggle_close_pending:
-                    self._logger.info(
-                        "voice audio start ignored: toggle close still pending"
-                    )
-                elif self._voice_mic_gesture_active:
+                if self._voice_mic_gesture_active:
                     if self._voice_mic_gesture_audio_stopped:
                         self._logger.info(
                             "voice continuation audio start ignored until physical release"
@@ -2169,8 +1917,14 @@ class RC003App:
                 if self._voice_mic_gesture_active:
                     self._voice_mic_gesture_audio_started = False
                     self._voice_mic_gesture_audio_stopped = True
-                toggle_close_completed = self._voice_toggle_close_pending
-                self._voice_toggle_close_pending = False
+                if self._voice_release_finish_pending:
+                    self._logger.info(
+                        "voice release finish tap rescheduled after audio stop"
+                    )
+                    self._schedule_voice_release_finish_locked(
+                        _VOICE_RELEASE_FINISH_AFTER_AUDIO_STOP_SECONDS,
+                        "audio stopped",
+                    )
                 action = self._voice.on_audio_stopped()
                 transformed_session = self._voice_legacy_transform_session
                 action_applied = (
@@ -2183,8 +1937,8 @@ class RC003App:
                 if action is not None and not action_applied:
                     # Same rule as _cleanup_once(): on_audio_stopped() already
                     # cleared the controller's pending state before we knew
-                    # whether the closing action (HOLD's KEY_UP or TOGGLE's
-                    # closing TAP) actually delivered. A failure here must not
+                    # whether the closing key-up actually delivered. A failure
+                    # here must not
                     # be recorded as a clean close - restore the owed state and
                     # fail closed by requesting a reconnect, the same way a BLE
                     # disconnect or a playback write failure does (XRBM-019
@@ -2195,20 +1949,19 @@ class RC003App:
                         "requesting reconnect"
                     )
                     self._supervisor.request_reconnect()
-                elif (
-                    self._voice.trigger_mode == key_mapping.VoiceTriggerMode.TOGGLE
-                    and self._voice.active
-                    and not toggle_close_completed
-                    and self._ble_session is not None
-                ):
-                    self._defer_voice_toggle_reopen_locked()
+                elif action is not None:
+                    # AUDIO_STOP is the release fallback on machines where a
+                    # physical mic key-up is late or absent. Start the same
+                    # optional host-finish action here; a later physical
+                    # release sees the session as already consumed and cannot
+                    # queue a second tap.
+                    self._queue_voice_release_finish_locked()
                 elif (
                     self._voice_mic_gesture_active
                     and self._voice_mic_gesture_audio_stopped
                     and not self._voice_mic_gesture_sources_down
                 ):
                     self._finish_voice_mic_gesture()
-                self._maybe_finish_mapped_voice_owner_locked()
                 self._apply_pending_voice_settings_if_idle_locked()
 
     def _handle_mic_button_pressed(
@@ -2233,6 +1986,9 @@ class RC003App:
             self._logger.info("voice ignored: BLE voice session is not connected")
             return
 
+        self._cancel_voice_release_finish_locked("new microphone press")
+        self._voice_release_finish_session_eligible = False
+
         if self._voice_hotkey_release_pending is not None:
             if not self._release_pending_voice_hotkey():
                 self._voice_pcm_forwarding_enabled = False
@@ -2244,24 +2000,14 @@ class RC003App:
 
         self._voice_audio_started_waiting_for_legacy_f5 = False
 
-        is_toggle_close_request = (
-            self._voice.trigger_mode == key_mapping.VoiceTriggerMode.TOGGLE
-            and self._voice.active
-        )
-        if not is_toggle_close_request and not self._open_playback_for_new_session():
+        if not self._open_playback_for_new_session():
             self._voice_pcm_forwarding_enabled = False
             self._logger.info(
                 "voice failing closed: no usable output endpoint; hotkey/MIC_OPEN suppressed"
             )
             return
 
-        was_active = self._voice.active
         action = self._voice.on_mic_button_pressed()
-        is_toggle_close = (
-            self._voice.trigger_mode == key_mapping.VoiceTriggerMode.TOGGLE
-            and was_active
-            and not self._voice.active
-        )
         action_delivered = (
             True
             if host_action_handled
@@ -2273,41 +2019,18 @@ class RC003App:
             )
         if not action_delivered:
             self._voice_pcm_forwarding_enabled = False
-            if is_toggle_close:
-                # The host is still in voice mode if its closing tap failed.
-                self._voice.restore_pending(action)
-            else:
-                # Nothing physically landed (win32_input.py's own batching
-                # already rolled back any partial key-down) - clear the
-                # controller's logical state without emitting a second,
-                # likely-just-as-doomed compensating action.
-                self._voice.cancel_pending()
+            # Nothing physically landed (win32_input.py's own batching already
+            # rolled back any partial key-down), so clear the logical hold
+            # without attempting a second delivery.
+            self._voice.cancel_pending()
             self._logger.info(
                 "voice failing closed: host hotkey delivery failed; device command suppressed"
             )
             return
 
-        if is_toggle_close and self._ble_session is not None:
-            self._voice_pcm_forwarding_enabled = False
-            self._voice_toggle_reopen_echo_guard_until = 0.0
-            self._voice_toggle_reopen_echo_sources_down.clear()
-            # The host closing TAP has already landed. A later asynchronous
-            # MIC_CLOSE write failure is a transport failure only: the BLE
-            # error callback requests cleanup/reconnect, but must never
-            # restore this logical toggle state or emit a second TAP, which
-            # could reopen the host voice UI.
-            self._cancel_voice_toggle_reopen_locked("toggle close accepted")
-            self._voice_toggle_close_pending = True
-            self._logger.info("voice toggle closing: sending MIC_CLOSE")
-            self._ble_session.send_mic_close_threadsafe()
-        else:
-            self._voice_pcm_forwarding_enabled = True
-        if not is_toggle_close and send_device_open and self._ble_session is not None:
-            if self._mapped_voice_button_id is not None:
-                self._voice_toggle_reopen_echo_guard_until = (
-                    time.monotonic() + _VOICE_TOGGLE_REOPEN_ECHO_GUARD_SECONDS
-                )
-                self._voice_toggle_reopen_echo_sources_down.clear()
+        self._voice_release_finish_session_eligible = True
+        self._voice_pcm_forwarding_enabled = True
+        if send_device_open and self._ble_session is not None:
             self._ble_session.send_mic_open_threadsafe()
 
     def _apply_voice_action(self, action: voice_controller.VoiceHostAction) -> bool:

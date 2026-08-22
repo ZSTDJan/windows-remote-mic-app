@@ -55,11 +55,6 @@ built from the standalone ``src/launcher.py`` entry point - see XRBM-021):
                 the verified HID tap injector. It validates the current
                 RC003 WUDFHost target and returns a stable exit code; it never
                 falls through to settings or bridge startup.
-- ``--on-request-probe``  HIDDEN, user-invoked RC003 diagnostic. It acquires
-                the bridge single-instance guard, negotiates On-request only,
-                and records privacy-safe START_SEARCH/control/PCM counts.
-                It never starts the normal bridge, HID, shortcuts, or audio
-                output.
 - ``--help``/``-h``  print this usage and exit 0
 
 ``--settings``, ``--bridge``, ``--dry-run``,
@@ -120,7 +115,6 @@ def _dry_run() -> int:
         identity,
         key_mapping,
         logging_setup,
-        on_request_probe,
         qt_settings_app,
         raw_input_windows,
         remote_layout,
@@ -249,13 +243,6 @@ def main() -> None:
 
         flag_index = args.index("--rc003-hid-injector")
         raise SystemExit(frida_compat.injector_main(args[flag_index + 1 :]))
-    if "--on-request-probe" in args:
-        # Hidden, bounded hardware diagnostic. Its own entry point owns the
-        # shared bridge mutex and always returns a stable exit code; it must
-        # never fall through to settings or bridge startup.
-        from . import on_request_probe
-
-        raise SystemExit(on_request_probe.main())
     if "--settings" in args:
         _run_settings()
         return

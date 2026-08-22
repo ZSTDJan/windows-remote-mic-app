@@ -103,5 +103,5 @@ class HotkeySpec:
 # config files keep their saved value because config.load_config() merges them
 # over default_config().
 DEFAULT_VOICE_HOTKEY = HotkeySpec.parse(
-    key_mapping.voice_hotkey_for_trigger_mode(key_mapping.VoiceTriggerMode.TOGGLE)
+    key_mapping.voice_hotkey_for_trigger_mode(key_mapping.VoiceTriggerMode.HOLD)
 )

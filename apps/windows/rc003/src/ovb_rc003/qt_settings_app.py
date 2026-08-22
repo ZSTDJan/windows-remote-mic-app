@@ -124,13 +124,16 @@ from . import (
     windows_diagnostics,
 )
 
-# Primary mappings may own either voice lifecycle. Secondary gestures remain
-# ordinary actions only: HOLD voice needs the physical release edge and
-# TOGGLE voice needs a stable session owner, neither of which is represented
-# by the delayed double/long callback.
-_PRIMARY_ACTION_OPTIONS: List[str] = list(
+# Only the physical microphone button can own RC003 audio. Other buttons use
+# ordinary actions; secondary gestures are ordinary actions for every button.
+_ORDINARY_PRIMARY_ACTION_OPTIONS: List[str] = list(
     dict.fromkeys(
-        settings_ui._PRIMARY_VOICE_DISPLAYS + settings_ui._PRESET_KEY_COMBOS
+        settings_ui._PRESET_KEY_COMBOS
+    )
+)
+_MIC_PRIMARY_ACTION_OPTIONS: List[str] = list(
+    dict.fromkeys(
+        settings_ui._PRIMARY_VOICE_DISPLAYS + tuple(_ORDINARY_PRIMARY_ACTION_OPTIONS)
     )
 )
 _SECONDARY_ACTION_OPTIONS: List[str] = list(
@@ -629,9 +632,8 @@ def _load_qt_classes() -> dict:
         """
 
         hotkeyTextChanged = Signal()
-        toggleVoiceHotkeyTextChanged = Signal()
         holdVoiceHotkeyTextChanged = Signal()
-        triggerModeIndexChanged = Signal()
+        voiceReleaseFinishTapEnabledChanged = Signal()
         endpointOptionsChanged = Signal()
         selectedEndpointIndexChanged = Signal()
         launchStatusTextChanged = Signal()
@@ -649,7 +651,7 @@ def _load_qt_classes() -> dict:
         hotkeyCaptureError = Signal(str)
         _hotkeyCaptureResult = Signal(str)
 
-        _TRIGGER_MODE_ORDER = tuple(key_mapping.VoiceTriggerMode)
+        _TRIGGER_MODE_ORDER = (key_mapping.VoiceTriggerMode.HOLD,)
         _DEVICE_ORDER = tuple(profile.device_id for profile in device_catalog.DEVICE_PROFILES)
         _KEY_DETECTION_TIMEOUT_SECONDS = 15.0
 
@@ -661,11 +663,11 @@ def _load_qt_classes() -> dict:
             self._bindings = config.load_key_bindings(
                 config.key_bindings_path(self._config_root)
             )
-
-            saved_trigger_mode = key_mapping.VoiceTriggerMode(
-                self._config.get("voice_trigger_mode", "toggle")
+            self._removed_voice_bindings = config.normalize_voice_product_boundary(
+                self._config,
+                self._bindings,
             )
-            self._trigger_mode_index = self._TRIGGER_MODE_ORDER.index(saved_trigger_mode)
+            self._trigger_mode_index = 0
             saved_voice_hotkeys = self._config.get("voice_hotkeys", {})
             self._voice_hotkeys = {
                 mode: str(
@@ -676,6 +678,9 @@ def _load_qt_classes() -> dict:
                 )
                 for mode in self._TRIGGER_MODE_ORDER
             }
+            self._voice_release_finish_tap_enabled = bool(
+                self._config.get("voice_release_finish_tap_enabled", False)
+            )
 
             self._launch_status_text = settings_ui.LAUNCH_NOT_STARTED_TEXT
             self._status_message = ""
@@ -711,6 +716,15 @@ def _load_qt_classes() -> dict:
             self._refresh_dji_mic_status()
             self._load_bindings_into_model()
             self._model.set_selected_button(self._selected_button_id)
+            if self._removed_voice_bindings:
+                affected = "、".join(
+                    remote_layout.BUTTON_DISPLAY_NAMES.get(button_id, button_id)
+                    for button_id in sorted(self._removed_voice_bindings)
+                )
+                self._status_message = (
+                    f"旧语音配置已停用（{affected}）。请重新选择动作并保存；"
+                    "停用前不会执行该按钮的单击、双击或长按动作。"
+                )
 
         # -- internal helpers -------------------------------------------------
 
@@ -785,17 +799,14 @@ def _load_qt_classes() -> dict:
             display_map: Dict[str, str] = {}
             secondary_display_map: Dict[str, Dict[str, str]] = {}
             for button_id in remote_layout.BUTTON_ORDER:
+                if button_id in self._removed_voice_bindings:
+                    display_map[button_id] = settings_ui._REMOVED_VOICE_DISPLAY
+                    secondary_display_map[button_id] = {}
+                    continue
                 action_dict = bindings.get(button_id)
                 if action_dict is not None:
                     try:
                         action = key_mapping.ButtonAction.from_dict(action_dict)
-                        if action.kind == key_mapping.ActionKind.VOICE:
-                            legacy_mode = key_mapping.VoiceTriggerMode(
-                                self._config.get("voice_trigger_mode", "toggle")
-                            )
-                            action = key_mapping.voice_action_for_trigger_mode(
-                                legacy_mode
-                            )
                         display_map[button_id] = settings_ui._action_to_display(action)
                     except (KeyError, TypeError, ValueError):
                         display_map[button_id] = ""
@@ -952,7 +963,7 @@ def _load_qt_classes() -> dict:
             previous Tk _save_and_launch() did.
             """
 
-            trigger_mode = self._TRIGGER_MODE_ORDER[self._trigger_mode_index]
+            trigger_mode = key_mapping.VoiceTriggerMode.HOLD
             endpoint_display = (
                 self._endpoint_options[self._selected_endpoint_index]
                 if 0 <= self._selected_endpoint_index < len(self._endpoint_options)
@@ -972,6 +983,9 @@ def _load_qt_classes() -> dict:
                         mode.value: self._voice_hotkeys[mode]
                         for mode in self._TRIGGER_MODE_ORDER
                     },
+                    voice_release_finish_tap_enabled=(
+                        self._voice_release_finish_tap_enabled
+                    ),
                 )
             except settings_ui.SettingsValidationError as exc:
                 title = f"「{exc.button_id}」映射无效" if exc.button_id else "语音热键无效"
@@ -1019,18 +1033,17 @@ def _load_qt_classes() -> dict:
 
             self._config = saved_config
             self._bindings = saved_bindings
-            saved_mode = key_mapping.VoiceTriggerMode(
-                saved_config.get("voice_trigger_mode", "toggle")
+            self._removed_voice_bindings = config.normalize_voice_product_boundary(
+                self._config,
+                self._bindings,
             )
-            saved_mode_index = self._TRIGGER_MODE_ORDER.index(saved_mode)
-            if saved_mode_index != self._trigger_mode_index:
-                self._trigger_mode_index = saved_mode_index
-                self.triggerModeIndexChanged.emit()
-                self.hotkeyTextChanged.emit()
             saved_voice_hotkeys = saved_config.get("voice_hotkeys", {})
             for mode in self._TRIGGER_MODE_ORDER:
                 saved_text = str(saved_voice_hotkeys.get(mode.value, ""))
                 self._set_voice_hotkey_text(mode, saved_text)
+            self._set_voice_release_finish_tap_enabled(
+                bool(saved_config.get("voice_release_finish_tap_enabled", False))
+            )
             self._load_bindings_into_model()
             self._set_error_message("")
             if self._selected_device_id() == device_catalog.DJI_MIC_2_ID:
@@ -1062,25 +1075,8 @@ def _load_qt_classes() -> dict:
             if value == self._voice_hotkeys[mode]:
                 return
             self._voice_hotkeys[mode] = value
-            if mode == key_mapping.VoiceTriggerMode.TOGGLE:
-                self.toggleVoiceHotkeyTextChanged.emit()
-            else:
-                self.holdVoiceHotkeyTextChanged.emit()
-            if mode == self._TRIGGER_MODE_ORDER[self._trigger_mode_index]:
-                self.hotkeyTextChanged.emit()
-
-        def _get_toggle_voice_hotkey_text(self) -> str:
-            return self._voice_hotkeys[key_mapping.VoiceTriggerMode.TOGGLE]
-
-        def _set_toggle_voice_hotkey_text(self, value: str) -> None:
-            self._set_voice_hotkey_text(key_mapping.VoiceTriggerMode.TOGGLE, value)
-
-        toggleVoiceHotkeyText = Property(
-            str,
-            _get_toggle_voice_hotkey_text,
-            _set_toggle_voice_hotkey_text,
-            notify=toggleVoiceHotkeyTextChanged,
-        )
+            self.holdVoiceHotkeyTextChanged.emit()
+            self.hotkeyTextChanged.emit()
 
         def _get_hold_voice_hotkey_text(self) -> str:
             return self._voice_hotkeys[key_mapping.VoiceTriggerMode.HOLD]
@@ -1095,46 +1091,21 @@ def _load_qt_classes() -> dict:
             notify=holdVoiceHotkeyTextChanged,
         )
 
-        def _get_trigger_mode_options(self) -> List[str]:
-            return [settings_ui._TRIGGER_MODE_LABELS[mode] for mode in self._TRIGGER_MODE_ORDER]
+        def _get_voice_release_finish_tap_enabled(self) -> bool:
+            return self._voice_release_finish_tap_enabled
 
-        triggerModeOptions = Property(list, _get_trigger_mode_options, constant=True)
+        def _set_voice_release_finish_tap_enabled(self, value: bool) -> None:
+            value = bool(value)
+            if value == self._voice_release_finish_tap_enabled:
+                return
+            self._voice_release_finish_tap_enabled = value
+            self.voiceReleaseFinishTapEnabledChanged.emit()
 
-        def _get_trigger_mode_index(self) -> int:
-            return self._trigger_mode_index
-
-        def _set_trigger_mode_index(self, value: int) -> None:
-            if value != self._trigger_mode_index and 0 <= value < len(self._TRIGGER_MODE_ORDER):
-                self._trigger_mode_index = value
-                self.triggerModeIndexChanged.emit()
-                self.hotkeyTextChanged.emit()
-
-        triggerModeIndex = Property(
-            int, _get_trigger_mode_index, _set_trigger_mode_index, notify=triggerModeIndexChanged
-        )
-
-        def _get_toggle_trigger_mode_index(self) -> int:
-            return self._TRIGGER_MODE_ORDER.index(key_mapping.VoiceTriggerMode.TOGGLE)
-
-        toggleTriggerModeIndex = Property(
-            int, _get_toggle_trigger_mode_index, constant=True
-        )
-
-        def _get_hold_trigger_mode_index(self) -> int:
-            return self._TRIGGER_MODE_ORDER.index(key_mapping.VoiceTriggerMode.HOLD)
-
-        holdTriggerModeIndex = Property(int, _get_hold_trigger_mode_index, constant=True)
-
-        def _get_active_voice_action_text(self) -> str:
-            mode = self._TRIGGER_MODE_ORDER[self._trigger_mode_index]
-            return (
-                "开关型语音"
-                if mode == key_mapping.VoiceTriggerMode.TOGGLE
-                else "按住型语音"
-            )
-
-        activeVoiceActionText = Property(
-            str, _get_active_voice_action_text, notify=triggerModeIndexChanged
+        voiceReleaseFinishTapEnabled = Property(
+            bool,
+            _get_voice_release_finish_tap_enabled,
+            _set_voice_release_finish_tap_enabled,
+            notify=voiceReleaseFinishTapEnabledChanged,
         )
 
         def _get_endpoint_options(self) -> List[str]:
@@ -1282,11 +1253,17 @@ def _load_qt_classes() -> dict:
         djiControlRows = Property(list, _get_dji_control_rows, constant=True)
 
         def _get_primary_action_options(self) -> List[str]:
-            return list(_PRIMARY_ACTION_OPTIONS)
+            return list(_ORDINARY_PRIMARY_ACTION_OPTIONS)
 
         primaryActionOptions = Property(
             list, _get_primary_action_options, constant=True
         )
+
+        @Slot(str, result=list)
+        def primaryActionOptionsFor(self, button_id: str) -> List[str]:
+            if button_id == "mic":
+                return list(_MIC_PRIMARY_ACTION_OPTIONS)
+            return list(_ORDINARY_PRIMARY_ACTION_OPTIONS)
 
         def _get_secondary_action_options(self) -> List[str]:
             return list(_SECONDARY_ACTION_OPTIONS)
@@ -1568,18 +1545,10 @@ def _load_qt_classes() -> dict:
                 defaults.button_display_map,
                 defaults.secondary_display_map,
             )
-            self._set_toggle_voice_hotkey_text(
-                defaults.voice_hotkeys[key_mapping.VoiceTriggerMode.TOGGLE.value]
-            )
             self._set_hold_voice_hotkey_text(
                 defaults.voice_hotkeys[key_mapping.VoiceTriggerMode.HOLD.value]
             )
-            trigger_mode = next(
-                mode
-                for mode in self._TRIGGER_MODE_ORDER
-                if settings_ui._TRIGGER_MODE_LABELS[mode] == defaults.trigger_mode_label
-            )
-            self._set_trigger_mode_index(self._TRIGGER_MODE_ORDER.index(trigger_mode))
+            self._set_voice_release_finish_tap_enabled(False)
             self._set_error_message("")
             self._set_status_message(
                 "已恢复默认显示，尚未保存——点击「保存映射」或「仅保存设置」才会写入设置。"

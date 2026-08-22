@@ -55,9 +55,7 @@ Item {
 
         function commitShortcut(chord) {
             previewText = chord
-            if (voiceMode === "toggle")
-                SettingsController.toggleVoiceHotkeyText = chord
-            else if (voiceMode === "hold")
+            if (voiceMode === "hold")
                 SettingsController.holdVoiceHotkeyText = chord
             else if (trigger === "single_click") {
                 ButtonMappingModel.setActionTextAt(rowIndex, chord)
@@ -136,9 +134,8 @@ Item {
         property bool syncing: false
         readonly property string normalizedPrimaryText: primaryText.trim()
         readonly property bool primaryIsVoice:
-            normalizedPrimaryText === "开关型语音"
-            || normalizedPrimaryText === "按住型语音"
-            || normalizedPrimaryText === "语音（使用专用组合键）"
+            normalizedPrimaryText === "按住说话"
+            || normalizedPrimaryText.indexOf("已停用：旧语音配置") === 0
 
         function openForRow(rowIndexValue, buttonIdValue, buttonNameValue,
                             primaryValue, doubleValue, longValue) {
@@ -203,10 +200,14 @@ Item {
                     objectName: "actionEditorPrimaryCombo"
                     Layout.fillWidth: true
                     editable: true
-                    model: SettingsController.primaryActionOptions
+                    model: SettingsController.primaryActionOptionsFor(
+                        actionEditor.buttonId
+                    )
                     Accessible.name: actionEditor.buttonName + qsTr("单击动作")
                     ToolTip.visible: hovered
-                    ToolTip.text: qsTr("可选择语音动作、普通动作或输入自定义组合键。")
+                    ToolTip.text: actionEditor.buttonId === "mic"
+                        ? qsTr("话筒键可选择按住说话、普通动作或自定义组合键。")
+                        : qsTr("可选择普通动作或输入自定义组合键。")
                     onEditTextChanged: {
                         if (!actionEditor.syncing && actionEditor.rowIndex >= 0) {
                             actionEditor.primaryText = editText
@@ -460,30 +461,7 @@ Item {
                         rowSpacing: tokens.spacingTiny
 
                         Label {
-                            text: qsTr("开关型语音快捷键")
-                            color: tokens.textPrimary
-                            font.pixelSize: tokens.fontSizeSmall
-                        }
-                        TextField {
-                            id: toggleVoiceHotkeyField
-                            objectName: "toggleVoiceHotkeyField"
-                            Layout.fillWidth: true
-                            text: SettingsController.toggleVoiceHotkeyText
-                            placeholderText: qsTr("例如 lalt+space")
-                            selectByMouse: true
-                            onEditingFinished: SettingsController.toggleVoiceHotkeyText = text
-                            Accessible.name: qsTr("开关型语音快捷键")
-                        }
-                        Button {
-                            text: qsTr("录")
-                            Layout.preferredWidth: 34
-                            Layout.minimumWidth: 30
-                            onClicked: root.openShortcutRecorder("", -1, "", "toggle")
-                            Accessible.name: qsTr("录制开关型语音快捷键")
-                        }
-
-                        Label {
-                            text: qsTr("按住型语音快捷键")
+                            text: qsTr("语音快捷键")
                             color: tokens.textPrimary
                             font.pixelSize: tokens.fontSizeSmall
                         }
@@ -492,25 +470,38 @@ Item {
                             objectName: "holdVoiceHotkeyField"
                             Layout.fillWidth: true
                             text: SettingsController.holdVoiceHotkeyText
-                            placeholderText: qsTr("例如 ctrl+l")
+                            placeholderText: qsTr("例如 ralt")
                             selectByMouse: true
                             onEditingFinished: SettingsController.holdVoiceHotkeyText = text
-                            Accessible.name: qsTr("按住型语音快捷键")
+                            Accessible.name: qsTr("按住说话快捷键")
                         }
                         Button {
                             text: qsTr("录")
                             Layout.preferredWidth: 34
                             Layout.minimumWidth: 30
                             onClicked: root.openShortcutRecorder("", -1, "", "hold")
-                            Accessible.name: qsTr("录制按住型语音快捷键")
+                            Accessible.name: qsTr("录制按住说话快捷键")
                         }
+
+                        Label {
+                            text: qsTr("松手后再触发一次")
+                            color: tokens.textPrimary
+                            font.pixelSize: tokens.fontSizeSmall
+                        }
+                        Switch {
+                            id: finishTapSwitch
+                            objectName: "voiceReleaseFinishTapSwitch"
+                            Layout.fillWidth: true
+                            checked: SettingsController.voiceReleaseFinishTapEnabled
+                            text: checked ? qsTr("已开启") : qsTr("已关闭")
+                            onToggled: SettingsController.voiceReleaseFinishTapEnabled = checked
+                            Accessible.name: qsTr("松手后再触发一次语音快捷键")
+                        }
+                        Item { }
                     }
 
                     Connections {
                         target: SettingsController
-                        function onToggleVoiceHotkeyTextChanged() {
-                            toggleVoiceHotkeyField.text = SettingsController.toggleVoiceHotkeyText
-                        }
                         function onHoldVoiceHotkeyTextChanged() {
                             holdVoiceHotkeyField.text = SettingsController.holdVoiceHotkeyText
                         }
@@ -627,9 +618,8 @@ Item {
 
                     readonly property string normalizedActionText: actionText.trim()
                     readonly property bool primaryIsVoice:
-                        normalizedActionText === "开关型语音"
-                        || normalizedActionText === "按住型语音"
-                        || normalizedActionText === "语音（使用专用组合键）"
+                        normalizedActionText === "按住说话"
+                        || normalizedActionText.indexOf("已停用：旧语音配置") === 0
 
                     width: mappingList.width
                     height: 64

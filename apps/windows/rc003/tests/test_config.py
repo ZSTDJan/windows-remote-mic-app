@@ -26,9 +26,11 @@ class DefaultConfigPrivacyTests(unittest.TestCase):
     def test_default_config_preserves_existing_users_on_rc003(self):
         defaults = config.default_config()
         self.assertEqual(defaults["selected_device_profile"], "xiaomi-rc003")
-        self.assertEqual(defaults["voice_hotkey"], "ralt+space")
-        self.assertEqual(defaults["voice_hotkeys"]["toggle"], "ralt+space")
+        self.assertEqual(defaults["voice_hotkey"], "ralt")
+        self.assertEqual(defaults["voice_trigger_mode"], "hold")
         self.assertEqual(defaults["voice_hotkeys"]["hold"], "ralt")
+        self.assertNotIn("toggle", defaults["voice_hotkeys"])
+        self.assertFalse(defaults["voice_release_finish_tap_enabled"])
         self.assertEqual(defaults["gain_db"], 10.0)
 
     def test_default_config_contains_no_forbidden_identity_fields(self):
@@ -42,7 +44,7 @@ class DefaultConfigPrivacyTests(unittest.TestCase):
     def test_output_endpoint_defaults_to_empty_so_voice_fails_closed(self):
         self.assertEqual(config.default_config()["output_endpoint_name"], "")
 
-    def test_load_preserves_toggle_with_a_custom_right_alt_chord(self):
+    def test_load_disables_legacy_toggle_without_reinterpreting_its_shortcut(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "config.json"
             path.write_text(
@@ -51,7 +53,11 @@ class DefaultConfigPrivacyTests(unittest.TestCase):
             )
             loaded = config.load_config(path)
         self.assertEqual(loaded["voice_hotkey"], "ralt")
-        self.assertEqual(loaded["voice_trigger_mode"], "toggle")
+        self.assertEqual(loaded["voice_trigger_mode"], "hold")
+        self.assertEqual(
+            loaded[config.RUNTIME_LEGACY_VOICE_MODE_KEY],
+            "toggle",
+        )
 
     def test_save_preserves_hold_with_right_alt_space(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -63,7 +69,7 @@ class DefaultConfigPrivacyTests(unittest.TestCase):
         self.assertEqual(loaded["voice_hotkey"], "ralt+space")
         self.assertEqual(loaded["voice_trigger_mode"], "hold")
 
-    def test_load_preserves_a_user_custom_voice_shortcut(self):
+    def test_load_does_not_reinterpret_a_custom_toggle_shortcut_as_hold(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "config.json"
             path.write_text(
@@ -71,11 +77,11 @@ class DefaultConfigPrivacyTests(unittest.TestCase):
                 encoding="utf-8",
             )
             loaded = config.load_config(path)
-        self.assertEqual(loaded["voice_hotkey"], "win+h")
-        self.assertEqual(loaded["voice_hotkeys"]["toggle"], "win+h")
+        self.assertEqual(loaded["voice_hotkey"], "ralt")
         self.assertEqual(loaded["voice_hotkeys"]["hold"], "ralt")
+        self.assertNotIn("toggle", loaded["voice_hotkeys"])
 
-    def test_load_preserves_inactive_mode_shortcut(self):
+    def test_load_preserves_the_separately_saved_hold_shortcut(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "config.json"
             path.write_text(
@@ -92,8 +98,9 @@ class DefaultConfigPrivacyTests(unittest.TestCase):
                 encoding="utf-8",
             )
             loaded = config.load_config(path)
-        self.assertEqual(loaded["voice_hotkeys"]["toggle"], "lalt+space")
+        self.assertEqual(loaded["voice_hotkey"], "ctrl+l")
         self.assertEqual(loaded["voice_hotkeys"]["hold"], "ctrl+l")
+        self.assertNotIn("toggle", loaded["voice_hotkeys"])
 
     def test_load_repairs_recorded_left_ctrl_win_to_hold_mode(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -448,7 +455,7 @@ class EditableMicBindingTests(unittest.TestCase):
                 {"kind": "key_combo", "keys": ["a"]},
             )
 
-    def test_a_missing_mic_binding_uses_the_new_toggle_default(self):
+    def test_a_missing_mic_binding_uses_the_hold_default(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "key_bindings.json"
             stale = config.default_key_bindings()
@@ -459,14 +466,41 @@ class EditableMicBindingTests(unittest.TestCase):
 
             self.assertEqual(
                 loaded["bindings"]["mic"],
-                {"kind": "voice_toggle", "keys": []},
+                {"kind": "voice_hold", "keys": []},
             )
 
-    def test_default_key_bindings_mic_is_explicit_toggle_voice(self):
+    def test_default_key_bindings_mic_is_explicit_hold_voice(self):
         self.assertEqual(
             config.default_key_bindings()["bindings"]["mic"],
+            {"kind": "voice_hold", "keys": []},
+        )
+
+    def test_legacy_toggle_binding_is_failed_closed_without_overwriting_source(self):
+        stored = config.default_key_bindings()
+        stored["bindings"]["mic"] = {"kind": "voice_toggle", "keys": []}
+        current_config = config.default_config()
+
+        removed = config.normalize_voice_product_boundary(current_config, stored)
+
+        self.assertEqual(removed, {"mic": "voice_toggle"})
+        self.assertEqual(
+            stored["bindings"]["mic"],
             {"kind": "voice_toggle", "keys": []},
         )
+
+    def test_non_mic_voice_binding_fails_closed_for_the_whole_button(self):
+        stored = config.default_key_bindings()
+        stored["bindings"]["up"] = {"kind": "voice_hold", "keys": []}
+        stored["secondary_bindings"]["up"] = {
+            "double_click": {"kind": "escape", "keys": []}
+        }
+
+        removed = config.normalize_voice_product_boundary(
+            config.default_config(),
+            stored,
+        )
+
+        self.assertEqual(removed, {"up": "voice_hold"})
 
     def test_legacy_generic_voice_binding_is_preserved_for_cross_file_migration(self):
         with tempfile.TemporaryDirectory() as tmp:

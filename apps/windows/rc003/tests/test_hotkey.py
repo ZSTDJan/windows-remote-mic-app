@@ -4,8 +4,8 @@ from ovb_rc003 import hotkey, key_mapping
 
 
 class HotkeySpecTests(unittest.TestCase):
-    def test_default_voice_hotkey_uses_the_uncommon_configurable_chord(self):
-        self.assertEqual(hotkey.DEFAULT_VOICE_HOTKEY.serialize(), "ralt+space")
+    def test_default_voice_hotkey_uses_the_hold_to_talk_key(self):
+        self.assertEqual(hotkey.DEFAULT_VOICE_HOTKEY.serialize(), "ralt")
 
     def test_voice_hotkey_presets_are_owned_by_the_trigger_mode_model(self):
         self.assertEqual(

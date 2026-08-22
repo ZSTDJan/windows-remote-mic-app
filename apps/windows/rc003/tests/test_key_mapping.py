@@ -16,7 +16,7 @@ class DefaultButtonActionsTests(unittest.TestCase):
 
     def test_matches_task_table_exactly(self):
         expected = {
-            "mic": (key_mapping.ActionKind.VOICE_TOGGLE, ()),
+            "mic": (key_mapping.ActionKind.VOICE_HOLD, ()),
             "power": (key_mapping.ActionKind.ESCAPE, ()),
             "up": (key_mapping.ActionKind.ARROW_UP, ()),
             "down": (key_mapping.ActionKind.ARROW_DOWN, ()),
@@ -65,6 +65,28 @@ class ButtonActionSerializationTests(unittest.TestCase):
                 mode,
             )
             self.assertFalse(key_mapping.action_allows_repeat(action))
+
+    def test_only_navigation_backspace_and_volume_actions_repeat(self):
+        repeatable = {
+            key_mapping.ActionKind.ARROW_UP,
+            key_mapping.ActionKind.ARROW_DOWN,
+            key_mapping.ActionKind.ARROW_LEFT,
+            key_mapping.ActionKind.ARROW_RIGHT,
+            key_mapping.ActionKind.DELETE_BACKWARD,
+            key_mapping.ActionKind.SYSTEM_VOLUME_UP,
+            key_mapping.ActionKind.SYSTEM_VOLUME_DOWN,
+        }
+        for action_kind in key_mapping.ActionKind:
+            action = (
+                key_mapping.ButtonAction(action_kind, ("shift", "3"))
+                if action_kind == key_mapping.ActionKind.KEY_COMBO
+                else key_mapping.ButtonAction(action_kind)
+            )
+            self.assertEqual(
+                key_mapping.action_allows_repeat(action),
+                action_kind in repeatable,
+                msg=action_kind.value,
+            )
 
     def test_legacy_voice_action_uses_the_supplied_mode(self):
         action = key_mapping.ButtonAction(key_mapping.ActionKind.VOICE)

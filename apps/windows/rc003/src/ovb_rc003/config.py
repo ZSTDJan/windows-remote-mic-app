@@ -31,7 +31,16 @@ PRODUCT_ID = "RC003"
 CONFIG_FILENAME = "config.json"
 KEY_BINDINGS_FILENAME = "key_bindings.json"
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+
+RUNTIME_LEGACY_VOICE_MODE_KEY = "_legacy_voice_trigger_mode"
+RUNTIME_REMOVED_VOICE_BINDINGS_KEY = "_removed_voice_bindings"
+_RUNTIME_ONLY_KEYS = frozenset(
+    {
+        RUNTIME_LEGACY_VOICE_MODE_KEY,
+        RUNTIME_REMOVED_VOICE_BINDINGS_KEY,
+    }
+)
 
 # Any config key matching one of these names is refused at save time,
 # regardless of which file it would land in.
@@ -96,17 +105,17 @@ def default_config() -> Dict[str, Any]:
         "max_retry_delay": 60.0,
         "voice_shortcut_enabled": True,
         "voice_hotkey": key_mapping.voice_hotkey_for_trigger_mode(
-            key_mapping.VoiceTriggerMode.TOGGLE
+            key_mapping.VoiceTriggerMode.HOLD
         ),
-        "voice_trigger_mode": "toggle",
-        # Keep each host shortcut independently so switching the remote's
-        # voice lifecycle does not make the user record the other host
-        # shortcut again. ``voice_hotkey`` remains the active, runtime-facing
-        # value for backwards compatibility with the bridge.
+        # Kept fixed for backwards compatibility with older builds. RC003's
+        # supported product path is now hold-to-talk only.
+        "voice_trigger_mode": "hold",
         "voice_hotkeys": {
-            mode.value: key_mapping.voice_hotkey_for_trigger_mode(mode)
-            for mode in key_mapping.VoiceTriggerMode
+            "hold": key_mapping.voice_hotkey_for_trigger_mode(
+                key_mapping.VoiceTriggerMode.HOLD
+            )
         },
+        "voice_release_finish_tap_enabled": False,
         # Empty until the user explicitly picks one in settings; voice fails
         # closed while this is empty (see audio_output.resolve_selected_endpoint).
         # Both fields together disambiguate endpoints that share a display
@@ -160,71 +169,61 @@ def load_config(path: Path) -> Dict[str, Any]:
 
 
 def save_config(path: Path, config: Dict[str, Any]) -> None:
-    _assert_no_forbidden_keys(config)
-    persisted = dict(config)
+    persisted = _without_runtime_only_keys(config)
+    _assert_no_forbidden_keys(persisted)
     _normalize_voice_hotkey(persisted)
+    persisted = _without_runtime_only_keys(persisted)
     _save_json_atomic(path, persisted)
 
 
 def _normalize_voice_hotkey(config: Dict[str, Any]) -> None:
-    """Repair obsolete built-ins and normalize per-mode host shortcuts.
-
-    A host may define the same chord as either a toggle or a hold-to-talk
-    shortcut. ``voice_hotkeys`` therefore stores one independent chord for
-    each lifecycle while ``voice_hotkey`` remains the selected, runtime-facing
-    chord. Legacy files containing only the latter migrate without changing
-    their current mode or current shortcut.
-    """
+    """Normalize schema-1 voice settings into the hold-only product model."""
 
     current = str(config.get("voice_hotkey", "")).strip().lower()
     from . import key_mapping
 
-    # The former HOLD preset was Ctrl+Win. It is a shipped built-in, not a
-    # user customization: migrate it to the right-Alt physical bridge and
-    # repair the mode even if the two old fields were saved out of sync.
-    if current in {"lctrl+win", "lctrl+lwin"}:
-        config["voice_trigger_mode"] = key_mapping.VoiceTriggerMode.HOLD.value
-        config["voice_hotkey"] = key_mapping.voice_hotkey_for_trigger_mode(
-            key_mapping.VoiceTriggerMode.HOLD
-        )
-
-    try:
-        mode = key_mapping.VoiceTriggerMode(config.get("voice_trigger_mode"))
-    except ValueError:
-        config["voice_trigger_mode"] = key_mapping.VoiceTriggerMode.TOGGLE.value
-        mode = key_mapping.VoiceTriggerMode.TOGGLE
-
-    # ``lalt`` was an invalid recording of the RC003 F5 leak. Repair it only
-    # for the built-in HOLD mode; arbitrary user shortcuts remain untouched.
-    if mode == key_mapping.VoiceTriggerMode.HOLD and current == "lalt":
-        config["voice_hotkey"] = key_mapping.voice_hotkey_for_trigger_mode(mode)
-
+    raw_mode = str(config.get("voice_trigger_mode", "hold")).strip().lower()
     raw_mode_hotkeys = config.get("voice_hotkeys")
     if not isinstance(raw_mode_hotkeys, dict):
         raw_mode_hotkeys = {}
-    mode_hotkeys = {
-        candidate_mode.value: str(
-            raw_mode_hotkeys.get(
-                candidate_mode.value,
-                key_mapping.voice_hotkey_for_trigger_mode(candidate_mode),
-            )
-        ).strip()
-        for candidate_mode in key_mapping.VoiceTriggerMode
-    }
+    saved_hold_hotkey = str(raw_mode_hotkeys.get("hold", "")).strip()
 
-    # The legacy/current active field remains authoritative during migration
-    # and for callers that still edit only ``voice_hotkey``. The inactive
-    # mode keeps its separately stored value (or its shipped default).
-    active_hotkey = str(config.get("voice_hotkey", "")).strip()
-    if active_hotkey:
-        mode_hotkeys[mode.value] = active_hotkey
-    else:
-        active_hotkey = mode_hotkeys[mode.value]
-        config["voice_hotkey"] = active_hotkey
-    config["voice_hotkeys"] = mode_hotkeys
+    if raw_mode == key_mapping.VoiceTriggerMode.TOGGLE.value:
+        config[RUNTIME_LEGACY_VOICE_MODE_KEY] = raw_mode
+        # Never reinterpret a toggle shortcut as hold-to-talk. Use the
+        # separately stored hold shortcut when available, otherwise the safe
+        # shipped hold default. The old file remains untouched until save.
+        current = saved_hold_hotkey or key_mapping.voice_hotkey_for_trigger_mode(
+            key_mapping.VoiceTriggerMode.HOLD
+        )
+    elif saved_hold_hotkey and not current:
+        current = saved_hold_hotkey
 
-    # Current built-ins and custom chords are intentionally not inferred from
-    # ``mode``. In particular, ralt+space may legitimately be hold-to-talk.
+    # The former HOLD preset was Ctrl+Win. It is a shipped built-in, not a
+    # user customization: migrate it to the right-Alt physical bridge.
+    if current in {"lctrl+win", "lctrl+lwin"}:
+        current = key_mapping.voice_hotkey_for_trigger_mode(
+            key_mapping.VoiceTriggerMode.HOLD
+        )
+
+    # ``lalt`` was an invalid recording of the RC003 F5 leak. Repair it only
+    # for hold-to-talk; arbitrary user shortcuts remain untouched.
+    if current == "lalt":
+        current = key_mapping.voice_hotkey_for_trigger_mode(
+            key_mapping.VoiceTriggerMode.HOLD
+        )
+    if not current:
+        current = key_mapping.voice_hotkey_for_trigger_mode(
+            key_mapping.VoiceTriggerMode.HOLD
+        )
+
+    config["schema_version"] = SCHEMA_VERSION
+    config["voice_trigger_mode"] = key_mapping.VoiceTriggerMode.HOLD.value
+    config["voice_hotkey"] = current
+    config["voice_hotkeys"] = {"hold": current}
+    config["voice_release_finish_tap_enabled"] = bool(
+        config.get("voice_release_finish_tap_enabled", False)
+    )
 
 
 def default_key_bindings() -> Dict[str, Any]:
@@ -277,6 +276,65 @@ def load_key_bindings(path: Path) -> Dict[str, Any]:
     _normalize_semantic_actions(bindings)
     _normalize_secondary_bindings(bindings)
     return bindings
+
+
+def normalize_voice_product_boundary(
+    config_data: Dict[str, Any], bindings: Dict[str, Any]
+) -> Dict[str, str]:
+    """Fail closed for voice mappings the RC003 cannot actually support.
+
+    The returned map is runtime-only and names every button that requires an
+    explicit user choice. The caller may display it, log it, or suppress the
+    whole button gesture. The original file is not overwritten until save.
+    """
+
+    from . import key_mapping
+
+    primary = bindings.get("bindings")
+    if not isinstance(primary, dict):
+        bindings[RUNTIME_REMOVED_VOICE_BINDINGS_KEY] = {}
+        return {}
+    legacy_mode = str(
+        config_data.get(
+            RUNTIME_LEGACY_VOICE_MODE_KEY,
+            config_data.get("voice_trigger_mode", "hold"),
+        )
+    ).strip().lower()
+    removed: Dict[str, str] = {}
+    for button_id, raw_action in list(primary.items()):
+        try:
+            action = key_mapping.ButtonAction.from_dict(raw_action)
+        except (KeyError, TypeError, ValueError):
+            continue
+        if action.kind == key_mapping.ActionKind.VOICE:
+            if button_id == "mic" and legacy_mode == "hold":
+                primary[button_id] = key_mapping.ButtonAction(
+                    key_mapping.ActionKind.VOICE_HOLD
+                ).to_dict()
+            else:
+                removed[button_id] = action.kind.value
+        elif action.kind == key_mapping.ActionKind.VOICE_TOGGLE:
+            removed[button_id] = action.kind.value
+        elif (
+            action.kind == key_mapping.ActionKind.VOICE_HOLD
+            and button_id != "mic"
+        ):
+            removed[button_id] = action.kind.value
+
+    secondary = bindings.get("secondary_bindings")
+    if isinstance(secondary, dict):
+        for button_id, trigger_map in secondary.items():
+            if not isinstance(trigger_map, dict):
+                continue
+            for raw_action in trigger_map.values():
+                try:
+                    action = key_mapping.ButtonAction.from_dict(raw_action)
+                except (KeyError, TypeError, ValueError):
+                    continue
+                if key_mapping.is_voice_action(action):
+                    removed.setdefault(button_id, action.kind.value)
+    bindings[RUNTIME_REMOVED_VOICE_BINDINGS_KEY] = removed
+    return dict(removed)
 
 
 def _normalize_semantic_actions(bindings: Dict[str, Any]) -> None:
@@ -362,8 +420,10 @@ def _normalize_physical_bindings(bindings: Dict[str, Any]) -> None:
 
 
 def save_key_bindings(path: Path, bindings: Dict[str, Any]) -> None:
-    _assert_no_forbidden_keys(bindings)
-    _save_json_atomic(path, bindings)
+    persisted = _without_runtime_only_keys(bindings)
+    persisted["schema_version"] = SCHEMA_VERSION
+    _assert_no_forbidden_keys(persisted)
+    _save_json_atomic(path, persisted)
 
 
 def save_settings_pair(
@@ -410,6 +470,14 @@ def _save_json_atomic(path: Path, data: Dict[str, Any]) -> None:
 
     content = (json.dumps(data, indent=2, sort_keys=True) + "\n").encode("utf-8")
     _save_bytes_atomic(path, content)
+
+
+def _without_runtime_only_keys(data: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        key: value
+        for key, value in data.items()
+        if key not in _RUNTIME_ONLY_KEYS
+    }
 
 
 def _save_bytes_atomic(path: Path, content: bytes) -> None:

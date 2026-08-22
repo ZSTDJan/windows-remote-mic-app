@@ -6,14 +6,14 @@ view with a PySide6-Essentials + Qt Quick/QML one - see
 ``qt_settings_app.py`` and ``qml/`` - but every piece of validation/save/
 launch/log-status logic below stays here so it remains
 directly unit-testable without constructing any window at all, matching the
-contract fixed after XRBM-014 review RETRY P1 #7): every piece of
+   contract fixed after XRBM-014 review RETRY P1 #7): every piece of
 validation/save logic is a plain function (``_action_to_display``,
 ``_display_to_action``, ``build_save_model``, ``_endpoint_display``,
 ``_parse_endpoint_display``, ``describe_launch_result``,
 ``describe_log_open_result``) that tests call directly - see
-tests/test_settings_ui_helpers.py. Legacy ``ActionKind.VOICE`` remains
-round-trippable, while new saves use explicit toggle/hold voice actions on
-the selected physical button.
+   tests/test_settings_ui_helpers.py. Legacy voice values render as an
+   explicit disabled notice; new saves allow hold-to-talk only on the
+   physical microphone button.
 
 ``main()`` at the bottom of this module is the only place that touches Qt at
 all, and does so via a lazy import inside the function body - importing this
@@ -91,7 +91,6 @@ _PRESET_KEY_COMBOS = (
 )
 
 _TRIGGER_MODE_LABELS = {
-    key_mapping.VoiceTriggerMode.TOGGLE: "按一下切换",
     key_mapping.VoiceTriggerMode.HOLD: "按住说话",
 }
 
@@ -101,12 +100,12 @@ def voice_hotkey_for_trigger_mode(trigger_mode: key_mapping.VoiceTriggerMode) ->
     return key_mapping.voice_hotkey_for_trigger_mode(trigger_mode)
 
 # Legacy generic voice text is still accepted so an older in-memory model can
-# be saved without being parsed as a keyboard chord. New rows always display
-# one of the two explicit lifecycle actions below.
+# be saved without being parsed as a keyboard chord. New rows only expose the
+# supported hold-to-talk action below.
 _VOICE_DISPLAY = "语音（使用专用组合键）"
-_VOICE_TOGGLE_DISPLAY = "开关型语音"
-_VOICE_HOLD_DISPLAY = "按住型语音"
-_PRIMARY_VOICE_DISPLAYS = (_VOICE_TOGGLE_DISPLAY, _VOICE_HOLD_DISPLAY)
+_VOICE_HOLD_DISPLAY = "按住说话"
+_REMOVED_VOICE_DISPLAY = "已停用：旧语音配置（请重新选择）"
+_PRIMARY_VOICE_DISPLAYS = (_VOICE_HOLD_DISPLAY,)
 
 # Secondary gestures are optional.  Keep an explicit display value in the
 # editable ComboBox so Qt does not fall back to the first real preset (usually
@@ -141,9 +140,9 @@ def _action_to_display(action: key_mapping.ButtonAction) -> str:
     if action.kind == key_mapping.ActionKind.DISABLED:
         return "禁用"
     if action.kind == key_mapping.ActionKind.VOICE:
-        return _VOICE_DISPLAY
+        return _REMOVED_VOICE_DISPLAY
     if action.kind == key_mapping.ActionKind.VOICE_TOGGLE:
-        return _VOICE_TOGGLE_DISPLAY
+        return _REMOVED_VOICE_DISPLAY
     if action.kind == key_mapping.ActionKind.VOICE_HOLD:
         return _VOICE_HOLD_DISPLAY
     reference_label = _REFERENCE_ACTION_LABELS.get(action.kind)
@@ -163,8 +162,6 @@ def _display_to_action(text: str) -> key_mapping.ButtonAction:
         return key_mapping.ButtonAction(key_mapping.ActionKind.DISABLED)
     if text == _VOICE_DISPLAY:
         return key_mapping.ButtonAction(key_mapping.ActionKind.VOICE)
-    if text == _VOICE_TOGGLE_DISPLAY:
-        return key_mapping.ButtonAction(key_mapping.ActionKind.VOICE_TOGGLE)
     if text == _VOICE_HOLD_DISPLAY:
         return key_mapping.ButtonAction(key_mapping.ActionKind.VOICE_HOLD)
     if text == "系统音量 -":
@@ -215,6 +212,7 @@ def build_save_model(
     base_bindings: dict,
     selected_device_profile: str = device_catalog.RC003_ID,
     voice_hotkeys: Optional[Dict[str, str]] = None,
+    voice_release_finish_tap_enabled: Optional[bool] = None,
 ) -> Tuple[dict, dict]:
     """Pure validation+build step for "Save"/"Restore defaults", with no Tk
     dependency at all - directly unit tested without constructing any
@@ -222,19 +220,14 @@ def build_save_model(
     SettingsValidationError on invalid input; never raises a Tk exception.
     """
 
+    trigger_mode = key_mapping.VoiceTriggerMode.HOLD
     mode_hotkeys = {
-        mode.value: key_mapping.voice_hotkey_for_trigger_mode(mode)
-        for mode in key_mapping.VoiceTriggerMode
+        "hold": key_mapping.voice_hotkey_for_trigger_mode(trigger_mode)
     }
     if voice_hotkeys is None:
-        mode_hotkeys[trigger_mode.value] = hotkey_text.strip()
+        mode_hotkeys["hold"] = hotkey_text.strip()
     else:
-        mode_hotkeys.update(
-            {
-                mode.value: str(voice_hotkeys.get(mode.value, "")).strip()
-                for mode in key_mapping.VoiceTriggerMode
-            }
-        )
+        mode_hotkeys["hold"] = str(voice_hotkeys.get("hold", "")).strip()
 
     bindings: Dict[str, dict] = {}
     voice_binding: Optional[Tuple[str, key_mapping.VoiceTriggerMode]] = None
@@ -242,6 +235,11 @@ def build_save_model(
         text = text.strip()
         if not text:
             continue
+        if text == _REMOVED_VOICE_DISPLAY:
+            raise SettingsValidationError(
+                button_id,
+                "旧语音配置已经停用；请明确选择“按住说话”、普通动作或“禁用”。",
+            )
         try:
             action = _display_to_action(text)
         except hotkey.HotkeyParseError as exc:
@@ -251,26 +249,27 @@ def build_save_model(
             legacy_mode=trigger_mode,
         )
         if voice_mode is not None:
-            if voice_binding is not None:
+            if button_id != "mic":
                 raise SettingsValidationError(
                     button_id,
-                    "只能设置一个语音主按键；请先把另一个按键的“开关型语音”或"
-                    "“按住型语音”改为其他动作。",
+                    "只有实体话筒键能够传送遥控器声音；其他按键请设置为普通动作或组合键。",
                 )
             voice_binding = (button_id, voice_mode)
-            action = key_mapping.voice_action_for_trigger_mode(voice_mode)
+            action = key_mapping.voice_action_for_trigger_mode(
+                key_mapping.VoiceTriggerMode.HOLD
+            )
         bindings[button_id] = action.to_dict()
 
-    active_mode = voice_binding[1] if voice_binding is not None else trigger_mode
-    active_hotkey_text = mode_hotkeys[active_mode.value]
+    active_mode = key_mapping.VoiceTriggerMode.HOLD
+    active_hotkey_text = mode_hotkeys["hold"]
     if voice_binding is not None and not active_hotkey_text:
         raise SettingsValidationError(
             voice_binding[0],
             f"请先录入{_TRIGGER_MODE_LABELS[active_mode]}的语音快捷键",
         )
 
-    for mode in key_mapping.VoiceTriggerMode:
-        candidate = mode_hotkeys[mode.value]
+    for mode in (key_mapping.VoiceTriggerMode.HOLD,):
+        candidate = mode_hotkeys["hold"]
         if not candidate:
             continue
         try:
@@ -353,6 +352,11 @@ def build_save_model(
     new_config["voice_hotkey"] = active_hotkey_text
     new_config["voice_hotkeys"] = mode_hotkeys
     new_config["voice_trigger_mode"] = active_mode.value
+    new_config["voice_release_finish_tap_enabled"] = bool(
+        base_config.get("voice_release_finish_tap_enabled", False)
+        if voice_release_finish_tap_enabled is None
+        else voice_release_finish_tap_enabled
+    )
     new_config["output_endpoint_name"] = endpoint_name
     new_config["output_endpoint_host_api"] = endpoint_host_api
 
@@ -391,15 +395,16 @@ def default_display_state() -> DefaultDisplayState:
         for button_id in _USER_FACING_BUTTON_IDS
     }
     voice_hotkeys = {
-        mode.value: key_mapping.voice_hotkey_for_trigger_mode(mode)
-        for mode in key_mapping.VoiceTriggerMode
+        "hold": key_mapping.voice_hotkey_for_trigger_mode(
+            key_mapping.VoiceTriggerMode.HOLD
+        )
     }
     return DefaultDisplayState(
         button_display_map=button_display_map,
         secondary_display_map=secondary_display_map,
-        hotkey_text=hotkey.DEFAULT_VOICE_HOTKEY.serialize(),
+        hotkey_text=voice_hotkeys["hold"],
         voice_hotkeys=voice_hotkeys,
-        trigger_mode_label=_TRIGGER_MODE_LABELS[key_mapping.VoiceTriggerMode.TOGGLE],
+        trigger_mode_label=_TRIGGER_MODE_LABELS[key_mapping.VoiceTriggerMode.HOLD],
     )
 
 

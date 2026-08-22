@@ -380,17 +380,28 @@ class SettingsControllerTests(unittest.TestCase):
 
     def test_hotkey_text_defaults_to_the_configured_default(self):
         controller, _ = self._make_controller()
-        self.assertEqual(controller.hotkeyText, "ralt+space")
+        self.assertEqual(controller.hotkeyText, "ralt")
 
-    def test_primary_options_include_both_voice_lifecycles(self):
+    def test_only_mic_primary_options_include_hold_to_talk(self):
         controller, _ = self._make_controller()
-        self.assertIn(settings_ui._VOICE_TOGGLE_DISPLAY, controller.primaryActionOptions)
-        self.assertIn(settings_ui._VOICE_HOLD_DISPLAY, controller.primaryActionOptions)
+        self.assertNotIn(settings_ui._VOICE_HOLD_DISPLAY, controller.primaryActionOptions)
+        self.assertNotIn(
+            "开关型语音",
+            controller.primaryActionOptionsFor("mic"),
+        )
+        self.assertIn(
+            settings_ui._VOICE_HOLD_DISPLAY,
+            controller.primaryActionOptionsFor("mic"),
+        )
+        self.assertNotIn(
+            settings_ui._VOICE_HOLD_DISPLAY,
+            controller.primaryActionOptionsFor("up"),
+        )
 
     def test_secondary_options_exclude_voice_lifecycles(self):
         controller, _ = self._make_controller()
         self.assertNotIn(
-            settings_ui._VOICE_TOGGLE_DISPLAY,
+            "开关型语音",
             controller.secondaryActionOptions,
         )
         self.assertNotIn(
@@ -405,7 +416,6 @@ class SettingsControllerTests(unittest.TestCase):
     def test_recording_a_hotkey_does_not_change_trigger_semantics(self):
         controller, _ = self._make_controller()
         controller._on_hotkey_capture_result("lctrl+lwin")
-        self.assertEqual(controller.triggerModeIndex, 0)
         controller.hotkeyText = "lctrl+lwin"
         self.assertEqual(controller.hotkeyText, "lctrl+lwin")
 
@@ -505,13 +515,11 @@ class SettingsControllerTests(unittest.TestCase):
         self.assertIn("保存失败", controller.errorMessage)
         self.assertIn("settings file is locked", controller.errorMessage)
 
-    def test_save_settings_uses_the_mapped_voice_lifecycle(self):
+    def test_save_settings_uses_hold_to_talk_on_the_mic_button(self):
         controller, model = self._make_controller()
-        controller.toggleVoiceHotkeyText = "lalt+space"
         controller.holdVoiceHotkeyText = "ctrl+l"
-        model.setActionTextAt(model.index_of("mic"), "Escape")
         model.setActionTextAt(
-            model.index_of("up"),
+            model.index_of("mic"),
             settings_ui._VOICE_HOLD_DISPLAY,
         )
 
@@ -520,13 +528,11 @@ class SettingsControllerTests(unittest.TestCase):
         saved = config.load_config(config.config_path(config.config_root()))
         self.assertEqual(saved["voice_trigger_mode"], "hold")
         self.assertEqual(saved["voice_hotkey"], "ctrl+l")
-        self.assertEqual(saved["voice_hotkeys"]["toggle"], "lalt+space")
-        self.assertEqual(saved["voice_hotkeys"]["hold"], "ctrl+l")
+        self.assertEqual(saved["voice_hotkeys"], {"hold": "ctrl+l"})
         saved_bindings = config.load_key_bindings(
             config.key_bindings_path(config.config_root())
         )
-        self.assertEqual(saved_bindings["bindings"]["mic"]["kind"], "escape")
-        self.assertEqual(saved_bindings["bindings"]["up"]["kind"], "voice_hold")
+        self.assertEqual(saved_bindings["bindings"]["mic"]["kind"], "voice_hold")
 
     def test_legacy_generic_voice_mapping_saves_as_explicit_selected_mode(self):
         saved_config = config.default_config()
@@ -586,7 +592,6 @@ class SettingsControllerTests(unittest.TestCase):
         ):
             controller, model = self._make_controller()
         model.setActionTextAt(model.index_of("mic"), "Escape")
-        controller.toggleVoiceHotkeyText = ""
         controller.holdVoiceHotkeyText = ""
 
         with mock.patch.object(
@@ -598,17 +603,17 @@ class SettingsControllerTests(unittest.TestCase):
 
         preflight.assert_not_called()
         saved = config.load_config(config.config_path(config.config_root()))
-        self.assertEqual(saved["voice_hotkeys"], {"toggle": "", "hold": ""})
+        self.assertEqual(saved["voice_hotkeys"], {"hold": "ralt"})
 
     def test_save_settings_with_empty_hotkey_fails_and_reports_error(self):
         controller, _ = self._make_controller()
-        controller.toggleVoiceHotkeyText = ""
+        controller.holdVoiceHotkeyText = ""
         self.assertFalse(controller.saveSettings())
         self.assertNotEqual(controller.errorMessage, "")
 
     def test_save_and_launch_never_launches_when_save_fails(self):
         controller, _ = self._make_controller()
-        controller.toggleVoiceHotkeyText = ""
+        controller.holdVoiceHotkeyText = ""
         with mock.patch.object(bridge_launcher, "launch_bridge") as fake_launch:
             controller.saveAndLaunch()
         fake_launch.assert_not_called()
@@ -624,19 +629,28 @@ class SettingsControllerTests(unittest.TestCase):
         self.assertIn("4321", controller.launchStatusText)
         self.assertNotIn("已连接", controller.launchStatusText)
 
-    def test_restore_defaults_resets_both_hotkeys_and_mic_mapping(self):
+    def test_restore_defaults_resets_voice_settings_and_mic_mapping(self):
         controller, model = self._make_controller()
-        controller.toggleVoiceHotkeyText = "shift+z"
         controller.holdVoiceHotkeyText = "ctrl+l"
+        controller.voiceReleaseFinishTapEnabled = True
         model.setActionTextAt(model.index_of("mic"), "Escape")
         controller.restoreDefaults()
-        self.assertEqual(controller.toggleVoiceHotkeyText, "ralt+space")
         self.assertEqual(controller.holdVoiceHotkeyText, "ralt")
+        self.assertFalse(controller.voiceReleaseFinishTapEnabled)
         mic_index = model.index(model.index_of("mic"), 0)
         self.assertEqual(
             model.data(mic_index, model.ActionTextRole),
-            settings_ui._VOICE_TOGGLE_DISPLAY,
+            settings_ui._VOICE_HOLD_DISPLAY,
         )
+
+    def test_release_finish_tap_option_persists(self):
+        controller, _ = self._make_controller()
+        controller.voiceReleaseFinishTapEnabled = True
+
+        self.assertTrue(controller.saveSettings())
+
+        saved = config.load_config(config.config_path(config.config_root()))
+        self.assertTrue(saved["voice_release_finish_tap_enabled"])
 
     def test_select_button_updates_both_the_controller_and_the_model(self):
         controller, model = self._make_controller()
@@ -2493,9 +2507,9 @@ mapping_list = _find_child_by_object_name(window, "mappingList")
 assert mapping_list is not None
 assert _find_child_by_object_name(window, "toggleVoiceModeButton") is None
 assert _find_child_by_object_name(window, "holdVoiceModeButton") is None
-for field_name in ("toggleVoiceHotkeyField", "holdVoiceHotkeyField"):
-    field = _find_child_by_object_name(window, field_name)
-    assert field is not None and field.property("visible"), field_name + " missing"
+assert _find_child_by_object_name(window, "toggleVoiceHotkeyField") is None
+field = _find_child_by_object_name(window, "holdVoiceHotkeyField")
+assert field is not None and field.property("visible"), "holdVoiceHotkeyField missing"
 
 edit_button = _find_mapping_row_control(mapping_list, "mic", model, "editMapping_mic")
 assert edit_button is not None, "mic row's edit button not found - is it in view?"
@@ -2583,7 +2597,7 @@ class ButtonsPageDirectSaveIntegrationTests(unittest.TestCase):
     ``_DIRECT_SAVE_PROBE_SCRIPT`` above) proving a user can type a custom
     chord through the microphone row's matrix editor and click "保存映射"
     WITHOUT ever pressing Enter. It also locks the fix15 UI contract: both
-    host-shortcut fields exist, the old global lifecycle buttons do not, and
+    single host-shortcut field exists, the old lifecycle controls do not, and
     the editor exposes primary/double/long controls.
     """
 
@@ -2734,7 +2748,7 @@ if tab_bar is None:
     sys.exit(1)
 tab_bar.setProperty("currentIndex", 1)
 image = render()
-sample_control(results, image, "toggleVoiceHotkeyField")
+sample_control(results, image, "holdVoiceHotkeyField")
 
 print(json.dumps(results))
 """
@@ -2762,7 +2776,7 @@ class RenderedContrastTests(unittest.TestCase):
     _LABELS = {
         "connectionTabButton": "「连接」tab label",
         "openLogButton": "「打开日志目录」button",
-        "toggleVoiceHotkeyField": "开关型语音快捷键 TextField",
+        "holdVoiceHotkeyField": "语音快捷键 TextField",
     }
 
     def test_tab_button_plain_button_and_text_field_are_all_readable(self):

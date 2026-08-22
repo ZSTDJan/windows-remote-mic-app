@@ -52,9 +52,9 @@ class ActionKind(str, Enum):
     SYSTEM_VOLUME_DOWN = "system_volume_down"
     SYSTEM_VOLUME_MUTE = "system_volume_mute"
     PLAY_PAUSE = "play_pause"
-    # ``VOICE`` is retained only for key_bindings.json files written by
-    # builds that selected the lifecycle globally. New saves use one of the
-    # explicit actions below so the lifecycle follows the mapped button.
+    # ``VOICE`` and ``VOICE_TOGGLE`` remain parseable only so schema-1 files
+    # can be failed closed with an explicit migration notice. They are not
+    # selectable or executable product actions anymore.
     VOICE = "voice"
     VOICE_TOGGLE = "voice_toggle"
     VOICE_HOLD = "voice_hold"
@@ -93,11 +93,19 @@ VOICE_ACTION_KINDS = frozenset(
     }
 )
 
+SUPPORTED_VOICE_ACTION_KINDS = frozenset({ActionKind.VOICE_HOLD})
+
 
 def is_voice_action(action: "ButtonAction") -> bool:
-    """Return whether ``action`` owns the RC003 voice lifecycle."""
+    """Return whether ``action`` is current or legacy RC003 voice data."""
 
     return action.kind in VOICE_ACTION_KINDS
+
+
+def is_supported_voice_action(action: "ButtonAction") -> bool:
+    """Return whether ``action`` is an executable RC003 voice action."""
+
+    return action.kind in SUPPORTED_VOICE_ACTION_KINDS
 
 
 def voice_action_for_trigger_mode(trigger_mode: VoiceTriggerMode) -> "ButtonAction":
@@ -179,6 +187,18 @@ APPLICATION_ACTIONS = frozenset(
     }
 )
 
+REPEATABLE_ACTIONS = frozenset(
+    {
+        ActionKind.ARROW_UP,
+        ActionKind.ARROW_DOWN,
+        ActionKind.ARROW_LEFT,
+        ActionKind.ARROW_RIGHT,
+        ActionKind.DELETE_BACKWARD,
+        ActionKind.SYSTEM_VOLUME_UP,
+        ActionKind.SYSTEM_VOLUME_DOWN,
+    }
+)
+
 
 def semantic_action_for_keys(keys: Tuple[str, ...]) -> Optional["ButtonAction"]:
     """Return the semantic action represented by one legacy key tuple."""
@@ -190,26 +210,26 @@ def semantic_action_for_keys(keys: Tuple[str, ...]) -> Optional["ButtonAction"]:
 
 
 def action_allows_repeat(action: "ButtonAction") -> bool:
-    """Match the reference app's ``allowsRepeat`` behavior.
+    """Allow hold-repeat only for actions with clear repeat semantics.
 
-    Opening an application is a one-shot operation.  Keyboard/system actions
-    can repeat when the physical button itself is a repeatable control.
+    Custom key combinations remain one tap per physical press. Replaying a
+    modifier chord such as Shift+3 on a timer is both surprising and more
+    likely to expose an incomplete host key release. Navigation, backspace,
+    and volume changes keep the expected remote-control repeat behavior.
     """
 
-    return action.kind not in APPLICATION_ACTIONS and not is_voice_action(action)
+    return action.kind in REPEATABLE_ACTIONS
 
 
 def voice_trigger_mode_for_hotkey(hotkey_text: str) -> Optional[VoiceTriggerMode]:
-    """Infer the built-in voice trigger semantics from a recorded chord.
+    """Recognize current and historical built-in voice shortcuts.
 
-    The two current Doubao voice modes are not interchangeable: ``ralt+space``
-    is a toggle, while ``ralt`` is held for the duration of speech. The old
-    Ctrl+Win chord is still recognized so legacy settings and recordings can
-    be migrated, but it is not the current HOLD preset. A physical recorder
-    can return either generic or directional Win, and users may press the
-    keys in either order, so compare the normalized token set. Return ``None``
-    for a genuinely custom shortcut and leave its selected mode under user
-    control.
+    ``ralt`` is the supported hold-to-talk preset. ``ralt+space`` remains
+    recognizable only so schema-1 toggle settings can be identified and
+    failed closed instead of silently becoming hold-to-talk. The old Ctrl+Win
+    chord is also recognized for migration. A physical recorder can return
+    either generic or directional Win, and users may press keys in either
+    order, so comparison uses normalized token sets.
     """
 
     tokens = frozenset(
@@ -324,7 +344,7 @@ DEFAULT_BUTTON_IDS = frozenset(
 
 def default_button_actions() -> Dict[str, ButtonAction]:
     return {
-        "mic": voice_action_for_trigger_mode(VoiceTriggerMode.TOGGLE),
+        "mic": voice_action_for_trigger_mode(VoiceTriggerMode.HOLD),
         "power": ButtonAction(ActionKind.ESCAPE),
         "up": ButtonAction(ActionKind.ARROW_UP),
         "down": ButtonAction(ActionKind.ARROW_DOWN),

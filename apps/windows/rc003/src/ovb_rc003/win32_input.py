@@ -308,8 +308,8 @@ def send_key_combo_up(
     steps after this raises - that is done by wrapping this call, not by
     this function silently reporting success it cannot back up. Silently
     swallowing a failed key-up here previously meant a host key could be
-    left physically down (HOLD mode) or a closing tap could be lost (TOGGLE
-    mode) while the caller's own state already recorded it as released.
+    left physically down while the caller's own state already recorded it as
+    released.
 
     XRBM-020 (fixing the XRBM-019 REPLAN gap - see
     XRBM-019's independent review round 2): the generic-exception
