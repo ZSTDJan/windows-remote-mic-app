@@ -2169,6 +2169,16 @@ class SettingsShellSourceContractTests(unittest.TestCase):
             "onOpenDiagnosticsRequested: tabBar.currentIndex = 3", self.main_qml
         )
 
+    def test_buttons_page_uses_the_full_width_mapping_matrix(self):
+        self.assertIn('objectName: "mappingMatrixHeader"', self.buttons_qml)
+        for column_name in ("遥控器按键", "单击", "双击", "长按"):
+            self.assertIn(f'qsTr("{column_name}")', self.buttons_qml)
+        self.assertIn('objectName: "editMapping_" + mappingRow.buttonId', self.buttons_qml)
+        self.assertIn('objectName: "actionEditorDialog"', self.buttons_qml)
+        self.assertIn("mappingRow.index < mappingList.count - 1", self.buttons_qml)
+        self.assertIn("ListView {", self.buttons_qml)
+        self.assertNotIn("GridView {", self.buttons_qml)
+
 
 @unittest.skipUnless(_HAS_PYSIDE6, _SKIP_REASON)
 class OffscreenQmlLoadTests(unittest.TestCase):
@@ -2487,15 +2497,22 @@ for field_name in ("toggleVoiceHotkeyField", "holdVoiceHotkeyField"):
     field = _find_child_by_object_name(window, field_name)
     assert field is not None and field.property("visible"), field_name + " missing"
 
-combo = _find_mapping_row_control(mapping_list, "mic", model, "actionCombo_mic")
-double_combo = _find_mapping_row_control(
-    mapping_list, "mic", model, "doubleActionCombo_mic"
-)
-long_combo = _find_mapping_row_control(
-    mapping_list, "mic", model, "longActionCombo_mic"
-)
-assert combo is not None, "mic row's primary ComboBox not found - is it in view?"
-assert double_combo is not None and long_combo is not None
+edit_button = _find_mapping_row_control(mapping_list, "mic", model, "editMapping_mic")
+assert edit_button is not None, "mic row's edit button not found - is it in view?"
+edit_center = edit_button.mapToScene(
+    QPointF(edit_button.property("width") / 2, edit_button.property("height") / 2)
+).toPoint()
+QTest.mouseClick(window, Qt.LeftButton, Qt.NoModifier, edit_center)
+for _ in range(5):
+    window.grabWindow()
+    app.processEvents()
+
+editor = _find_child_by_object_name(window, "actionEditorDialog")
+combo = _find_child_by_object_name(window, "actionEditorPrimaryCombo")
+double_combo = _find_child_by_object_name(window, "actionEditorDoubleCombo")
+long_combo = _find_child_by_object_name(window, "actionEditorLongCombo")
+assert editor is not None and editor.property("visible")
+assert combo is not None and double_combo is not None and long_combo is not None
 assert combo.property("visible")
 assert not double_combo.property("visible") and not long_combo.property("visible")
 
@@ -2534,6 +2551,17 @@ for _ in range(3):
 assert double_combo.property("visible") and long_combo.property("visible")
 assert double_combo.property("enabled") and long_combo.property("enabled")
 
+done_button = _find_child_by_object_name(window, "actionEditorDoneButton")
+assert done_button is not None
+done_center = done_button.mapToScene(
+    QPointF(done_button.property("width") / 2, done_button.property("height") / 2)
+).toPoint()
+QTest.mouseClick(window, Qt.LeftButton, Qt.NoModifier, done_center)
+for _ in range(3):
+    window.grabWindow()
+    app.processEvents()
+assert not editor.property("visible")
+
 # Real click on "保存映射" - deliberately never press Enter/Return anywhere
 # in this test.
 save_button = _find_child_by_object_name(window, "saveMappingButton")
@@ -2553,10 +2581,10 @@ print("OK")
 class ButtonsPageDirectSaveIntegrationTests(unittest.TestCase):
     """XRBM-030 RETRY 1 blocker 1: a REAL Qt/QML interaction test (see
     ``_DIRECT_SAVE_PROBE_SCRIPT`` above) proving a user can type a custom
-    chord into the visible microphone row's ComboBox and click "保存映射"
+    chord through the microphone row's matrix editor and click "保存映射"
     WITHOUT ever pressing Enter. It also locks the fix15 UI contract: both
     host-shortcut fields exist, the old global lifecycle buttons do not, and
-    the microphone row exposes primary/double/long controls.
+    the editor exposes primary/double/long controls.
     """
 
     def test_typed_chord_survives_a_direct_save_click_with_no_enter_pressed(self):
@@ -2770,34 +2798,18 @@ class RenderedContrastTests(unittest.TestCase):
             )
 
 
-# XRBM-032: proves, against the REAL main.qml ButtonsPage rendered offscreen,
-# that (a) every one of the 13 hotspot Items' visual CENTER coincides with
-# the calibrated center fraction from remote_layout.py (mapped through
-# the live PreserveAspectFit painted geometry), and (b) a REAL QTest mouse
-# click delivered at the OK button's TRUE physical center actually selects
-# OK. Before the fix (which subtracted half the item's width/height to turn
-# the center fraction into a QML top-left) each Item's top-left sat at the
-# center fraction, so every hotspot drifted down-right by half its own size
-# and a click at OK's true center missed the OK Item entirely - so this test
-# fails on the pre-fix geometry, not just passes trivially. Run in an
-# isolated subprocess for the same per-process QQuickStyle/QQC2 reasons the
-# other engine-loading probes above document. No fixed sleeps: a
-# grabWindow()+processEvents() loop (which forces real frames) is the render
-# gate, exactly as the direct-save probe uses.
-_HOTSPOT_GEOMETRY_PROBE_SCRIPT = r"""
+# Proves, against the real rendered ButtonsPage, that the mapping matrix owns
+# exactly 13 rows and a real click on another row updates the shared selected
+# button. This replaces the old product-photo hotspot UI contract.
+_MAPPING_MATRIX_PROBE_SCRIPT = r"""
 import json
 import sys
 
 from ovb_rc003 import qt_settings_app as m
-from ovb_rc003 import remote_layout
 from PySide6.QtCore import QPointF, Qt
 from PySide6.QtTest import QTest
 
 
-# Depth-first search of the VISUAL item tree (childItems). Repeater-created
-# hotspot delegates are visual children of the photo frame but are NOT
-# QObject children reachable from the window, so a QObject.children() walk
-# misses them; a childItems() walk from the window contentItem does not.
 def _find(root, name):
     for child in root.childItems():
         if child.objectName() == name:
@@ -2839,8 +2851,7 @@ for _ in range(10):
     window.grabWindow()
     app.processEvents()
 
-# Switch to the "按键" tab (index 1) so ButtonsPage is the active page and
-# its photo/hotspots actually lay out and paint.
+# Switch to the "按键" tab (index 1) so the matrix delegates lay out.
 tab_bar = _find(content_item, "tabBar")
 assert tab_bar is not None
 tab_bar.setProperty("currentIndex", 1)
@@ -2848,77 +2859,43 @@ for _ in range(10):
     window.grabWindow()
     app.processEvents()
 
-photo = _find(content_item, "photoImage")
-assert photo is not None, "photoImage not found"
-painted_w = photo.property("paintedWidth")
-painted_h = photo.property("paintedHeight")
-assert painted_w > 0 and painted_h > 0, "photo not painted (paintedWidth/paintedHeight == 0)"
+mapping_list = _find(content_item, "mappingList")
+header = _find(content_item, "mappingMatrixHeader")
+assert mapping_list is not None, "mappingList not found"
+assert header is not None and header.property("visible"), "matrix header not visible"
+assert mapping_list.property("count") == 13
 
-# The PreserveAspectFit letterbox offset inside the Image's own box, exactly
-# as ButtonsPage.qml computes offsetX/offsetY.
-img_w = photo.property("width")
-img_h = photo.property("height")
-letterbox_x = (img_w - painted_w) / 2.0
-letterbox_y = (img_h - painted_h) / 2.0
-
-
-def expected_center_scene(hotspot):
-    return photo.mapToScene(
-        QPointF(
-            letterbox_x + hotspot.x * painted_w,
-            letterbox_y + hotspot.y * painted_h,
-        )
-    )
-
-
-results = {}
-for hotspot in remote_layout.BUTTON_HOTSPOTS:
-    item = _find(content_item, "photoHotspot_" + hotspot.button_id)
-    assert item is not None, "hotspot Item not found: " + hotspot.button_id
-    iw = item.property("width")
-    ih = item.property("height")
-    actual = item.mapToScene(QPointF(iw / 2.0, ih / 2.0))
-    expected = expected_center_scene(hotspot)
-    results[hotspot.button_id] = {
-        "dx": actual.x() - expected.x(),
-        "dy": actual.y() - expected.y(),
-        "expected": [expected.x(), expected.y()],
-        "actual": [actual.x(), actual.y()],
-    }
-
-# Real QTest click delivered at OK's TRUE physical center (computed from the
-# painted photo geometry, NOT from the OK Item's own position) - this is the
-# exact point the pre-fix geometry left OUTSIDE the OK hotspot. Selection is
-# read back from the controller the QML TapHandler drives.
-ok_hotspot = remote_layout.BUTTON_HOTSPOTS_BY_ID["ok"]
-ok_center = expected_center_scene(ok_hotspot).toPoint()
-QTest.mouseClick(window, Qt.LeftButton, Qt.NoModifier, ok_center)
+# The default selected row is OK. Move to Power so its delegate is realized,
+# then click the row body away from the edit button.
+power_index = model.index_of("power")
+mapping_list.setProperty("currentIndex", power_index)
+for _ in range(5):
+    window.grabWindow()
+    app.processEvents()
+power_row = mapping_list.property("currentItem")
+assert power_row is not None
+click_point = power_row.mapToScene(
+    QPointF(power_row.property("width") / 2.0, power_row.property("height") / 2.0)
+).toPoint()
+QTest.mouseClick(window, Qt.LeftButton, Qt.NoModifier, click_point)
 for _ in range(5):
     window.grabWindow()
     app.processEvents()
 
 results_out = {
-    "hotspots": results,
-    "selected_after_ok_click": controller.property("selectedButtonId"),
-    "painted_w": painted_w,
-    "painted_h": painted_h,
+    "row_count": mapping_list.property("count"),
+    "header_visible": header.property("visible"),
+    "selected_after_power_click": controller.property("selectedButtonId"),
 }
 print(json.dumps(results_out))
 """
 
 
 @unittest.skipUnless(_HAS_PYSIDE6, _SKIP_REASON)
-class ButtonsPageHotspotGeometryTests(unittest.TestCase):
-    """XRBM-032: every hotspot's rendered visual center must match the
-    calibrated center fraction (remote_layout.py), and a real click at
-    OK's true center must select OK. See ``_HOTSPOT_GEOMETRY_PROBE_SCRIPT``.
+class ButtonsPageMappingMatrixTests(unittest.TestCase):
+    """The full-width matrix renders all physical buttons and row clicks
+    continue to drive the shared selection used by real-key detection.
     """
-
-    # Sub-pixel: the only expected discrepancy is float rounding between the
-    # QML binding's own evaluation and this test's recomputation of the same
-    # arithmetic. The pre-fix bug offsets each hotspot by half its own size
-    # (tens of pixels), so this threshold cannot mask it.
-    _MAX_CENTER_ERROR_PX = 1.0
 
     def _run_probe(self):
         import json
@@ -2928,7 +2905,7 @@ class ButtonsPageHotspotGeometryTests(unittest.TestCase):
         env.setdefault("QT_QPA_PLATFORM", "offscreen")
         env["LOCALAPPDATA"] = tempfile.mkdtemp()
         result = subprocess.run(
-            [sys.executable, "-c", _HOTSPOT_GEOMETRY_PROBE_SCRIPT],
+            [sys.executable, "-c", _MAPPING_MATRIX_PROBE_SCRIPT],
             env=env,
             capture_output=True,
             text=True,
@@ -2937,39 +2914,21 @@ class ButtonsPageHotspotGeometryTests(unittest.TestCase):
         self.assertEqual(
             result.returncode,
             0,
-            f"hotspot geometry probe subprocess failed: {result.stdout}\n{result.stderr}",
+            f"mapping matrix probe subprocess failed: {result.stdout}\n{result.stderr}",
         )
         return json.loads(result.stdout.strip().splitlines()[-1])
 
-    def test_all_thirteen_hotspot_centers_match_calibrated_fractions(self):
+    def test_matrix_renders_all_thirteen_rows_and_header(self):
         data = self._run_probe()
-        hotspots = data["hotspots"]
-        self.assertEqual(
-            set(hotspots),
-            {h.button_id for h in remote_layout.BUTTON_HOTSPOTS},
-            "probe did not report exactly the 13 expected hotspots",
-        )
-        for button_id, geo in hotspots.items():
-            self.assertLessEqual(
-                abs(geo["dx"]),
-                self._MAX_CENTER_ERROR_PX,
-                f"{button_id} X center off by {geo['dx']:.3f}px "
-                f"(expected {geo['expected']}, got {geo['actual']})",
-            )
-            self.assertLessEqual(
-                abs(geo["dy"]),
-                self._MAX_CENTER_ERROR_PX,
-                f"{button_id} Y center off by {geo['dy']:.3f}px "
-                f"(expected {geo['expected']}, got {geo['actual']})",
-            )
+        self.assertEqual(data["row_count"], 13)
+        self.assertTrue(data["header_visible"])
 
-    def test_real_click_at_ok_true_center_selects_ok(self):
+    def test_real_click_on_power_row_selects_power(self):
         data = self._run_probe()
         self.assertEqual(
-            data["selected_after_ok_click"],
-            "ok",
-            "a real QTest click at OK's true physical center did not select "
-            "OK - the OK hotspot is not centered on its own coordinate",
+            data["selected_after_power_click"],
+            "power",
+            "a real QTest click on the Power matrix row did not select Power",
         )
 
 

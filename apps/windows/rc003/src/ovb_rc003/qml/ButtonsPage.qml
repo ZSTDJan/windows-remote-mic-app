@@ -1,12 +1,7 @@
-// "按键" tab (XRBM-030 In-scope items 4/5): the RC003 product photo with 13
-// clickable hotspots calibrated for the bundled RC003 photo (see
-// remote_layout.py) on
-// the left, the compact two-column mapping grid (Chinese name / HID usage /
-// current action) on the right. Both sides are two views over the SAME ButtonMappingModel row,
-// kept in sync through SettingsController.selectButton()/
-// SettingsController.selectedButtonId - clicking either one updates both
-// (In-scope item 4's "双向定位"). SettingsController/ButtonMappingModel are
-// QML singletons - see main.qml's module docstring for why.
+// "按键" tab: a full-width mapping matrix with one row per physical RC003
+// button and explicit single/double/long columns. The selected row is shared
+// with real-key detection through SettingsController.selectedButtonId.
+// SettingsController/ButtonMappingModel are QML singletons - see main.qml.
 import QtQuick
 import QtQuick.Controls
 import QtQuick.Layouts
@@ -15,8 +10,9 @@ import OvbRc003Settings 1.0
 Item {
     id: root
     property var tokens
-
-    readonly property real photoAspectRatio: 1030 / 508
+    readonly property real mappingKeyColumnWidth: 118
+    readonly property real mappingSecondaryColumnWidth: 112
+    readonly property real mappingEditColumnWidth: 56
 
     function openShortcutRecorder(buttonId, rowIndex, trigger, voiceMode) {
         shortcutRecorder.buttonId = buttonId
@@ -56,10 +52,13 @@ Item {
                 SettingsController.toggleVoiceHotkeyText = chord
             else if (voiceMode === "hold")
                 SettingsController.holdVoiceHotkeyText = chord
-            else if (trigger === "single_click")
+            else if (trigger === "single_click") {
                 ButtonMappingModel.setActionTextAt(rowIndex, chord)
-            else
+                actionEditor.applyCapturedShortcut(rowIndex, trigger, chord)
+            } else {
                 ButtonMappingModel.setSecondaryActionTextAt(rowIndex, trigger, chord)
+                actionEditor.applyCapturedShortcut(rowIndex, trigger, chord)
+            }
             close()
         }
 
@@ -111,136 +110,241 @@ Item {
         }
     }
 
-    RowLayout {
+    Dialog {
+        id: actionEditor
+        objectName: "actionEditorDialog"
+        modal: true
+        anchors.centerIn: parent
+        width: Math.min(620, root.width - tokens.spacingLarge * 2)
+        title: buttonName.length > 0
+            ? qsTr("编辑按键：") + buttonName
+            : qsTr("编辑按键")
+
+        property int rowIndex: -1
+        property string buttonId: ""
+        property string buttonName: ""
+        property string primaryText: ""
+        property string doubleText: "未设置"
+        property string longText: "未设置"
+        property bool syncing: false
+        readonly property string normalizedPrimaryText: primaryText.trim()
+        readonly property bool primaryIsVoice:
+            normalizedPrimaryText === "开关型语音"
+            || normalizedPrimaryText === "按住型语音"
+            || normalizedPrimaryText === "语音（使用专用组合键）"
+
+        function openForRow(rowIndexValue, buttonIdValue, buttonNameValue,
+                            primaryValue, doubleValue, longValue) {
+            syncing = true
+            rowIndex = rowIndexValue
+            buttonId = buttonIdValue
+            buttonName = buttonNameValue
+            primaryText = primaryValue
+            doubleText = doubleValue
+            longText = longValue
+            primaryCombo.editText = primaryValue
+            doubleCombo.editText = doubleValue
+            longCombo.editText = longValue
+            syncing = false
+            open()
+            primaryCombo.forceActiveFocus()
+        }
+
+        function applyCapturedShortcut(targetRow, trigger, chord) {
+            if (!visible || targetRow !== rowIndex)
+                return
+            syncing = true
+            if (trigger === "single_click") {
+                primaryText = chord
+                primaryCombo.editText = chord
+            } else if (trigger === "double_click") {
+                doubleText = chord
+                doubleCombo.editText = chord
+            } else if (trigger === "long_press") {
+                longText = chord
+                longCombo.editText = chord
+            }
+            syncing = false
+        }
+
+        onClosed: syncing = true
+
+        contentItem: ColumnLayout {
+            spacing: tokens.spacingMedium
+
+            Label {
+                Layout.fillWidth: true
+                text: qsTr("为这个遥控器按键分别设置单击、双击和长按动作。")
+                color: tokens.textSecondary
+                font.pixelSize: tokens.fontSizeSmall
+                wrapMode: Text.WordWrap
+            }
+
+            GridLayout {
+                Layout.fillWidth: true
+                columns: 3
+                columnSpacing: tokens.spacingSmall
+                rowSpacing: tokens.spacingSmall
+
+                Label {
+                    text: qsTr("单击")
+                    color: tokens.textPrimary
+                    font.bold: true
+                }
+                ComboBox {
+                    id: primaryCombo
+                    objectName: "actionEditorPrimaryCombo"
+                    Layout.fillWidth: true
+                    editable: true
+                    model: SettingsController.primaryActionOptions
+                    Accessible.name: actionEditor.buttonName + qsTr("单击动作")
+                    ToolTip.visible: hovered
+                    ToolTip.text: qsTr("可选择语音动作、普通动作或输入自定义组合键。")
+                    onEditTextChanged: {
+                        if (!actionEditor.syncing && actionEditor.rowIndex >= 0) {
+                            actionEditor.primaryText = editText
+                            ButtonMappingModel.setActionTextAt(
+                                actionEditor.rowIndex, editText
+                            )
+                        }
+                    }
+                    onAccepted: ButtonMappingModel.setActionTextAt(
+                        actionEditor.rowIndex, editText
+                    )
+                    onActivated: ButtonMappingModel.setActionTextAt(
+                        actionEditor.rowIndex, currentText
+                    )
+                }
+                Button {
+                    objectName: "actionEditorPrimaryRecordButton"
+                    text: qsTr("录入")
+                    onClicked: root.openShortcutRecorder(
+                        actionEditor.buttonId, actionEditor.rowIndex,
+                        "single_click", ""
+                    )
+                    Accessible.name: qsTr("录制单击快捷键")
+                }
+
+                Label {
+                    visible: !actionEditor.primaryIsVoice
+                    text: qsTr("双击")
+                    color: tokens.textPrimary
+                    font.bold: true
+                }
+                ComboBox {
+                    id: doubleCombo
+                    objectName: "actionEditorDoubleCombo"
+                    Layout.fillWidth: true
+                    visible: !actionEditor.primaryIsVoice
+                    enabled: !actionEditor.primaryIsVoice
+                    editable: true
+                    model: SettingsController.secondaryActionOptions
+                    Accessible.name: actionEditor.buttonName + qsTr("双击动作")
+                    ToolTip.visible: hovered
+                    ToolTip.text: qsTr("配置后，程序会等待约 0.3 秒区分单击和双击。")
+                    onEditTextChanged: {
+                        if (!actionEditor.syncing && actionEditor.rowIndex >= 0) {
+                            actionEditor.doubleText = editText
+                            ButtonMappingModel.setSecondaryActionTextAt(
+                                actionEditor.rowIndex, "double_click", editText
+                            )
+                        }
+                    }
+                    onAccepted: ButtonMappingModel.setSecondaryActionTextAt(
+                        actionEditor.rowIndex, "double_click", editText
+                    )
+                    onActivated: ButtonMappingModel.setSecondaryActionTextAt(
+                        actionEditor.rowIndex, "double_click", currentText
+                    )
+                }
+                Button {
+                    objectName: "actionEditorDoubleRecordButton"
+                    visible: !actionEditor.primaryIsVoice
+                    enabled: !actionEditor.primaryIsVoice
+                    text: qsTr("录入")
+                    onClicked: root.openShortcutRecorder(
+                        actionEditor.buttonId, actionEditor.rowIndex,
+                        "double_click", ""
+                    )
+                    Accessible.name: qsTr("录制双击快捷键")
+                }
+
+                Label {
+                    visible: !actionEditor.primaryIsVoice
+                    text: qsTr("长按")
+                    color: tokens.textPrimary
+                    font.bold: true
+                }
+                ComboBox {
+                    id: longCombo
+                    objectName: "actionEditorLongCombo"
+                    Layout.fillWidth: true
+                    visible: !actionEditor.primaryIsVoice
+                    enabled: !actionEditor.primaryIsVoice
+                    editable: true
+                    model: SettingsController.secondaryActionOptions
+                    Accessible.name: actionEditor.buttonName + qsTr("长按动作")
+                    ToolTip.visible: hovered
+                    ToolTip.text: qsTr("按住约 0.55 秒触发，并抑制本次单击动作。")
+                    onEditTextChanged: {
+                        if (!actionEditor.syncing && actionEditor.rowIndex >= 0) {
+                            actionEditor.longText = editText
+                            ButtonMappingModel.setSecondaryActionTextAt(
+                                actionEditor.rowIndex, "long_press", editText
+                            )
+                        }
+                    }
+                    onAccepted: ButtonMappingModel.setSecondaryActionTextAt(
+                        actionEditor.rowIndex, "long_press", editText
+                    )
+                    onActivated: ButtonMappingModel.setSecondaryActionTextAt(
+                        actionEditor.rowIndex, "long_press", currentText
+                    )
+                }
+                Button {
+                    objectName: "actionEditorLongRecordButton"
+                    visible: !actionEditor.primaryIsVoice
+                    enabled: !actionEditor.primaryIsVoice
+                    text: qsTr("录入")
+                    onClicked: root.openShortcutRecorder(
+                        actionEditor.buttonId, actionEditor.rowIndex,
+                        "long_press", ""
+                    )
+                    Accessible.name: qsTr("录制长按快捷键")
+                }
+            }
+
+            Label {
+                Layout.fillWidth: true
+                visible: actionEditor.primaryIsVoice
+                text: qsTr("语音动作占用完整按下/松开周期，双击和长按设置会保留，但本次不执行。")
+                color: tokens.textSecondary
+                font.pixelSize: tokens.fontSizeSmall
+                wrapMode: Text.WordWrap
+            }
+
+            RowLayout {
+                Layout.fillWidth: true
+                Item { Layout.fillWidth: true }
+                Button {
+                    objectName: "actionEditorDoneButton"
+                    text: qsTr("完成")
+                    highlighted: true
+                    onClicked: actionEditor.close()
+                }
+            }
+        }
+    }
+
+    ColumnLayout {
         id: rc003MappingLayout
         objectName: "rc003MappingLayout"
         visible: SettingsController.isRc003Device
         anchors.fill: parent
         anchors.margins: tokens.spacingMedium
-        spacing: tokens.spacingMedium
+        spacing: tokens.spacingSmall
 
-        // -- Left: product photo with hotspots -----------------------------
-        ColumnLayout {
-            Layout.preferredWidth: 215
-            Layout.fillHeight: true
-            spacing: tokens.spacingSmall
-
-            Rectangle {
-                id: photoFrame
-                Layout.preferredWidth: 200
-                Layout.preferredHeight: 200 * root.photoAspectRatio
-                Layout.alignment: Qt.AlignHCenter | Qt.AlignTop
-                radius: tokens.cornerRadiusLarge
-                color: tokens.surface
-                border.color: tokens.border
-                border.width: 1
-                clip: true
-
-                Image {
-                    id: photoImage
-                    objectName: "photoImage"  // stable hook so a real-QML test can read paintedWidth/paintedHeight and the letterbox offset to verify hotspot centers
-                    anchors.fill: parent
-                    anchors.margins: 8
-                    fillMode: Image.PreserveAspectFit
-                    source: SettingsController.photoAvailable ? SettingsController.photoSource : ""
-                    visible: SettingsController.photoAvailable
-                    smooth: true
-                    asynchronous: true
-                }
-
-                Label {
-                    anchors.centerIn: parent
-                    anchors.margins: tokens.spacingMedium
-                    width: parent.width - tokens.spacingMedium * 2
-                    horizontalAlignment: Text.AlignHCenter
-                    wrapMode: Text.WordWrap
-                    visible: !SettingsController.photoAvailable
-                    text: qsTr("实物图资源缺失")
-                    color: tokens.textSecondary
-                    font.pixelSize: tokens.fontSizeSmall
-                }
-
-                Repeater {
-                    model: ButtonMappingModel
-
-                    delegate: Item {
-                        id: hotspot
-
-                        // Stable, device-identifier-free hook so a real-QML
-                        // test can locate any one hotspot Item by button (see
-                        // tests/test_qt_settings_app.py). buttonId is an
-                        // internal action id ("ok", "power", ...), never a
-                        // hardware/BLE identifier.
-                        objectName: "photoHotspot_" + buttonId
-
-                        required property string buttonId
-                        required property string displayName
-                        required property string actionText
-                        required property real hotspotX
-                        required property real hotspotY
-                        required property real hotspotWidth
-                        required property real hotspotHeight
-                        required property bool isSelected
-
-                        readonly property string normalizedActionText: actionText.trim()
-                        readonly property bool primaryIsVoice:
-                            normalizedActionText === "开关型语音"
-                            || normalizedActionText === "按住型语音"
-                            || normalizedActionText === "语音（使用专用组合键）"
-
-                        readonly property real paintedW: photoImage.paintedWidth
-                        readonly property real paintedH: photoImage.paintedHeight
-                        readonly property real offsetX: photoImage.x + (photoImage.width - paintedW) / 2
-                        readonly property real offsetY: photoImage.y + (photoImage.height - paintedH) / 2
-
-                        // hotspotX/hotspotY are the hotspot's CENTER as a
-                        // fraction of the painted photo. A QML Item's x/y are
-                        // its TOP-LEFT, so convert center -> top-left by
-                        // subtracting half the item's own width/height while
-                        // preserving the letterbox offset.
-                        width: hotspotWidth * paintedW
-                        height: hotspotHeight * paintedH
-                        x: offsetX + hotspotX * paintedW - width / 2
-                        y: offsetY + hotspotY * paintedH - height / 2
-                        visible: SettingsController.photoAvailable
-
-                        activeFocusOnTab: true
-                        Accessible.role: Accessible.Button
-                        Accessible.name: displayName
-
-                        Rectangle {
-                            anchors.fill: parent
-                            radius: height / 2
-                            color: hotspot.isSelected
-                                ? Qt.rgba(tokens.accent.r, tokens.accent.g, tokens.accent.b, 0.28)
-                                : (hoverHandler.hovered
-                                    ? Qt.rgba(tokens.accent.r, tokens.accent.g, tokens.accent.b, 0.14)
-                                    : "transparent")
-                            border.width: hotspot.isSelected ? 2 : (hotspot.activeFocus ? 1 : 0)
-                            border.color: hotspot.primaryIsVoice
-                                ? tokens.voiceAccent : tokens.accent
-                        }
-
-                        HoverHandler { id: hoverHandler }
-                        TapHandler { onTapped: SettingsController.selectButton(hotspot.buttonId) }
-                        Keys.onReturnPressed: SettingsController.selectButton(hotspot.buttonId)
-                        Keys.onSpacePressed: SettingsController.selectButton(hotspot.buttonId)
-                    }
-                }
-            }
-
-            Label {
-                Layout.preferredWidth: 205
-                Layout.alignment: Qt.AlignHCenter
-                wrapMode: Text.WordWrap
-                horizontalAlignment: Text.AlignHCenter
-                text: qsTr("点击实物按键定位映射；任意实体按键都可设置为普通动作、开关型语音或按住型语音。遥控器没有独立静音键。")
-                color: tokens.textSecondary
-                font.pixelSize: tokens.fontSizeSmall
-            }
-        }
-
-            // -- Right: compact reference-style mapping grid -------------------
+            // -- Full-width mapping matrix ------------------------------------
         ColumnLayout {
             Layout.fillWidth: true
             Layout.fillHeight: true
@@ -254,6 +358,17 @@ Item {
                     font.pixelSize: tokens.fontSizeTitle
                     font.bold: true
                     color: tokens.textPrimary
+                }
+                Button {
+                    id: detectRealKeyButton
+                    objectName: "detectRealKeyButton"
+                    text: SettingsController.keyDetectionActive
+                        ? qsTr("停止检测") : qsTr("检测真实按键")
+                    highlighted: SettingsController.keyDetectionActive
+                    onClicked: SettingsController.keyDetectionActive
+                        ? SettingsController.stopKeyDetection()
+                        : SettingsController.startKeyDetection()
+                    Accessible.name: qsTr("检测真实遥控器按键")
                 }
                 Button {
                     text: qsTr("恢复默认")
@@ -290,18 +405,6 @@ Item {
                     anchors.fill: parent
                     anchors.margins: tokens.spacingMedium
                     spacing: tokens.spacingMedium
-
-                    Button {
-                        id: detectRealKeyButton
-                        objectName: "detectRealKeyButton"
-                        text: SettingsController.keyDetectionActive
-                            ? qsTr("停止检测") : qsTr("检测真实按键")
-                        highlighted: SettingsController.keyDetectionActive
-                        onClicked: SettingsController.keyDetectionActive
-                            ? SettingsController.stopKeyDetection()
-                            : SettingsController.startKeyDetection()
-                        Accessible.name: qsTr("检测真实遥控器按键")
-                    }
 
                     Label {
                         Layout.fillWidth: true
@@ -408,18 +511,77 @@ Item {
                 }
             }
 
-            GridView {
+            Rectangle {
+                id: mappingHeader
+                objectName: "mappingMatrixHeader"
+                Layout.fillWidth: true
+                Layout.preferredHeight: 46
+                color: tokens.surface
+                border.color: tokens.border
+                border.width: 1
+                radius: tokens.cornerRadiusSmall
+
+                GridLayout {
+                    anchors.fill: parent
+                    anchors.leftMargin: tokens.spacingMedium
+                    anchors.rightMargin: tokens.spacingMedium
+                    columns: 5
+                    columnSpacing: tokens.spacingSmall
+
+                    Label {
+                        Layout.preferredWidth: root.mappingKeyColumnWidth
+                        text: qsTr("遥控器按键")
+                        color: tokens.textPrimary
+                        font.pixelSize: tokens.fontSizeBody
+                        font.bold: true
+                    }
+                    RowLayout {
+                        Layout.fillWidth: true
+                        spacing: tokens.spacingTiny
+                        Rectangle {
+                            Layout.preferredWidth: 3
+                            Layout.preferredHeight: 18
+                            radius: 1
+                            color: tokens.accent
+                        }
+                        Label {
+                            text: qsTr("单击")
+                            color: tokens.textPrimary
+                            font.pixelSize: tokens.fontSizeBody
+                            font.bold: true
+                        }
+                    }
+                    Label {
+                        Layout.preferredWidth: root.mappingSecondaryColumnWidth
+                        text: qsTr("双击")
+                        color: tokens.textPrimary
+                        font.pixelSize: tokens.fontSizeBody
+                        font.bold: true
+                    }
+                    Label {
+                        Layout.preferredWidth: root.mappingSecondaryColumnWidth
+                        text: qsTr("长按")
+                        color: tokens.textPrimary
+                        font.pixelSize: tokens.fontSizeBody
+                        font.bold: true
+                    }
+                    Item { Layout.preferredWidth: root.mappingEditColumnWidth }
+                }
+            }
+
+            ListView {
                 id: mappingList
-                objectName: "mappingList"  // stable hook for positioning a mapping card
+                objectName: "mappingList"
                 Layout.fillWidth: true
                 Layout.fillHeight: true
                 clip: true
                 model: ButtonMappingModel
-                cellWidth: Math.max(220, Math.floor(width / 2))
-                cellHeight: 118
+                spacing: 0
+                boundsBehavior: Flickable.StopAtBounds
+                ScrollBar.vertical: ScrollBar {}
                 currentIndex: ButtonMappingModel.indexOfButton(SettingsController.selectedButtonId)
                 highlightFollowsCurrentItem: true
-                onCurrentIndexChanged: positionViewAtIndex(currentIndex, GridView.Contain)
+                onCurrentIndexChanged: positionViewAtIndex(currentIndex, ListView.Contain)
 
                 delegate: Rectangle {
                     id: mappingRow
@@ -440,56 +602,72 @@ Item {
                         || normalizedActionText === "按住型语音"
                         || normalizedActionText === "语音（使用专用组合键）"
 
-                    width: mappingList.cellWidth - tokens.spacingTiny
-                    height: mappingList.cellHeight - tokens.spacingTiny
-                    radius: tokens.cornerRadiusSmall
+                    width: mappingList.width
+                    height: 64
+                    radius: 0
                     color: isSelected
-                        ? Qt.rgba(tokens.accent.r, tokens.accent.g, tokens.accent.b, 0.12)
-                        : "transparent"
-                    border.width: isSelected ? 1 : 0
-                    border.color: tokens.accent
-
-                    // Editable QQC2 ComboBox's own internal currentIndex/
-                    // editText sync (triggered during its construction, and
-                    // again on every user selection) overwrites a plain
-                    // declarative `editText: mappingRow.actionText` binding
-                    // the moment the component finishes initializing - a
-                    // well-known ComboBox(editable:true) pitfall. Setting it
-                    // imperatively once after completion, then re-syncing it
-                    // explicitly whenever the underlying row data changes
-                    // (e.g. "恢复默认"), keeps the visible text correct
-                    // without fighting ComboBox's own internal writes.
-                    onActionTextChanged: actionCombo.editText = actionText
-                    onDoubleClickTextChanged: doubleActionCombo.editText = doubleClickText
-                    onLongPressTextChanged: longActionCombo.editText = longPressText
+                        ? Qt.rgba(tokens.accent.r, tokens.accent.g, tokens.accent.b, 0.10)
+                        : (rowHover.hovered ? tokens.surfaceMuted : "transparent")
+                    border.width: 0
 
                     TapHandler {
                         onTapped: SettingsController.selectButton(mappingRow.buttonId)
                     }
 
-                    RowLayout {
-                        id: rowContent
+                    HoverHandler { id: rowHover }
+
+                    Rectangle {
                         anchors.left: parent.left
-                        anchors.right: parent.right
-                        anchors.top: parent.top
-                        anchors.bottom: gestureRow.top
-                        anchors.leftMargin: tokens.spacingSmall
-                        anchors.rightMargin: tokens.spacingSmall
-                        anchors.topMargin: tokens.spacingSmall
-                        anchors.bottomMargin: tokens.spacingTiny
-                        spacing: tokens.spacingTiny
+                        anchors.verticalCenter: parent.verticalCenter
+                        width: 3
+                        height: parent.height - tokens.spacingMedium
+                        radius: 1
+                        visible: mappingRow.isSelected
+                        color: mappingRow.primaryIsVoice
+                            ? tokens.voiceAccent : tokens.accent
+                    }
+
+                    GridLayout {
+                        id: matrixRowContent
+                        anchors.fill: parent
+                        anchors.leftMargin: tokens.spacingMedium
+                        anchors.rightMargin: tokens.spacingMedium
+                        columns: 5
+                        columnSpacing: tokens.spacingSmall
 
                         ColumnLayout {
-                            Layout.preferredWidth: 58
-                            Layout.minimumWidth: 52
-                            Layout.fillHeight: true
-                            spacing: 0
-                            Label {
+                            Layout.preferredWidth: root.mappingKeyColumnWidth
+                            spacing: 1
+                            RowLayout {
                                 Layout.fillWidth: true
-                                text: mappingRow.displayName
-                                color: tokens.textPrimary
-                                font.pixelSize: tokens.fontSizeSmall
-                                elide: Text.ElideRight
+                                spacing: tokens.spacingTiny
+                                Label {
+                                    Layout.fillWidth: true
+                                    text: mappingRow.displayName
+                                    color: tokens.textPrimary
+                                    font.pixelSize: tokens.fontSizeBody
+                                    font.bold: mappingRow.isSelected
+                                    elide: Text.ElideRight
+                                }
+                                Rectangle {
+                                    visible: mappingRow.isMic
+                                    Layout.preferredWidth: micBadgeText.implicitWidth + 8
+                                    Layout.preferredHeight: micBadgeText.implicitHeight + 4
+                                    radius: 3
+                                    color: Qt.rgba(
+                                        tokens.voiceAccent.r,
+                                        tokens.voiceAccent.g,
+                                        tokens.voiceAccent.b,
+                                        0.14
+                                    )
+                                    Label {
+                                        id: micBadgeText
+                                        anchors.centerIn: parent
+                                        text: qsTr("语音键")
+                                        color: tokens.voiceAccent
+                                        font.pixelSize: tokens.fontSizeSmall
+                                    }
+                                }
                             }
                             Label {
                                 Layout.fillWidth: true
@@ -500,215 +678,91 @@ Item {
                             }
                         }
 
-                        ComboBox {
-                            id: actionCombo
-                            // Per-row name (not a fixed literal) so a test
-                            // can locate one specific row's ComboBox, e.g.
-                            // findChild(QObject, "actionCombo_power") - a
-                            // real, stable hook, not a fake production
-                            // behavior.
-                            objectName: "actionCombo_" + mappingRow.buttonId
+                        RowLayout {
                             Layout.fillWidth: true
-                            Layout.minimumWidth: 0
-                            editable: true
-                            model: SettingsController.primaryActionOptions
-                            Accessible.name: mappingRow.displayName
-                            ToolTip.visible: hovered
-                            ToolTip.text: qsTr("可选择开关型语音、按住型语音或任意单键/组合键；输入“禁用”可关闭此键。")
-
-                            // Guards onEditTextChanged below against the
-                            // SAME construction-time noise
-                            // Component.onCompleted works around (ComboBox's
-                            // own internal currentIndex-driven editText sync
-                            // fires during construction, before this flag is
-                            // set true) - without it, every row would
-                            // immediately persist its transient default
-                            // (the first primary action option)
-                            // into the model the instant it's created,
-                            // reintroducing the "all rows show/save escape"
-                            // bug this task's own screenshot step caught
-                            // earlier.
-                            property bool _initialized: false
-
-                            // NOT `editText: mappingRow.actionText` (a
-                            // plain declarative binding) - ComboBox's own
-                            // internal currentIndex/editText sync overwrites
-                            // that the moment construction finishes (a
-                            // well-known ComboBox(editable:true) pitfall).
-                            // Set imperatively here instead, strictly AFTER
-                            // that internal sync has already run.
-                            Component.onCompleted: {
-                                editText = mappingRow.actionText
-                                _initialized = true
+                            spacing: tokens.spacingTiny
+                            Label {
+                                Layout.fillWidth: true
+                                text: mappingRow.actionText.length > 0
+                                    ? mappingRow.actionText : qsTr("未设置")
+                                color: mappingRow.actionText.length > 0
+                                    ? tokens.textPrimary : tokens.disabledText
+                                font.pixelSize: tokens.fontSizeBody
+                                elide: Text.ElideRight
                             }
-
-                            // XRBM-030 RETRY 1 blocker 1: onAccepted (Enter)
-                            // and onActivated (picking a dropdown item)
-                            // alone are not enough - a user who types a
-                            // custom chord (e.g. "ctrl+shift+p") and clicks
-                            // a SAVE button without ever pressing Enter
-                            // previously left the model (and therefore
-                            // _save()'s persisted binding) holding the OLD
-                            // value, silently discarding the typed edit.
-                            // Committing on every live editText change closes
-                            // that gap unconditionally - by the time any
-                            // save action runs, the model already holds
-                            // whatever is visibly displayed, with no
-                            // separate "commit on blur/save" event to miss.
-                            // Guarded by _initialized (see above) so this
-                            // never fires from ComboBox's own construction-
-                            // time internal writes, only from a real,
-                            // post-construction edit (by typing or by
-                            // restoreDefaults()/onActionTextChanged
-                            // resetting editText, which harmlessly re-writes
-                            // the model with the exact same value it already
-                            // has).
-                            onEditTextChanged: {
-                                if (_initialized) {
-                                    ButtonMappingModel.setActionTextAt(mappingRow.index, editText)
-                                }
+                            Label {
+                                visible: mappingRow.normalizedActionText === "方向上"
+                                    || mappingRow.normalizedActionText === "方向下"
+                                    || mappingRow.normalizedActionText === "方向左"
+                                    || mappingRow.normalizedActionText === "方向右"
+                                text: qsTr("可连续")
+                                color: tokens.textSecondary
+                                font.pixelSize: tokens.fontSizeSmall
                             }
+                        }
 
-                            // Kept for defense-in-depth / clarity of intent
-                            // even though onEditTextChanged above already
-                            // covers both cases (accepting Enter, or picking
-                            // a dropdown item, both change editText too).
-                            onAccepted: ButtonMappingModel.setActionTextAt(mappingRow.index, editText)
-                            onActivated: ButtonMappingModel.setActionTextAt(mappingRow.index, currentText)
+                        Label {
+                            Layout.preferredWidth: root.mappingSecondaryColumnWidth
+                            text: mappingRow.primaryIsVoice
+                                ? qsTr("暂停") : mappingRow.doubleClickText
+                            color: mappingRow.primaryIsVoice
+                                || mappingRow.doubleClickText === "未设置"
+                                ? tokens.disabledText : tokens.textPrimary
+                            font.pixelSize: tokens.fontSizeBody
+                            elide: Text.ElideRight
+                        }
+
+                        Label {
+                            Layout.preferredWidth: root.mappingSecondaryColumnWidth
+                            text: mappingRow.primaryIsVoice
+                                ? qsTr("暂停") : mappingRow.longPressText
+                            color: mappingRow.primaryIsVoice
+                                || mappingRow.longPressText === "未设置"
+                                ? tokens.disabledText : tokens.textPrimary
+                            font.pixelSize: tokens.fontSizeBody
+                            elide: Text.ElideRight
                         }
 
                         Button {
-                            objectName: "recordShortcut_" + mappingRow.buttonId
-                            text: qsTr("录")
-                            Layout.preferredWidth: 34
-                            Layout.minimumWidth: 30
-                            onClicked: root.openShortcutRecorder(
-                                mappingRow.buttonId, mappingRow.index,
-                                "single_click", ""
-                            )
-                            Accessible.name: qsTr("录制") + mappingRow.displayName + qsTr("快捷键")
+                            objectName: "editMapping_" + mappingRow.buttonId
+                            Layout.preferredWidth: root.mappingEditColumnWidth
+                            text: qsTr("编辑")
+                            flat: true
+                            onClicked: {
+                                SettingsController.selectButton(mappingRow.buttonId)
+                                actionEditor.openForRow(
+                                    mappingRow.index,
+                                    mappingRow.buttonId,
+                                    mappingRow.displayName,
+                                    mappingRow.actionText,
+                                    mappingRow.doubleClickText,
+                                    mappingRow.longPressText
+                                )
+                            }
+                            Accessible.name: qsTr("编辑") + mappingRow.displayName
                         }
                     }
 
-                    RowLayout {
-                        id: gestureRow
+                    Rectangle {
                         anchors.left: parent.left
                         anchors.right: parent.right
+                        anchors.leftMargin: tokens.spacingMedium
+                        anchors.rightMargin: tokens.spacingMedium
                         anchors.bottom: parent.bottom
-                        anchors.leftMargin: tokens.spacingSmall
-                        anchors.rightMargin: tokens.spacingSmall
-                        anchors.bottomMargin: tokens.spacingSmall
-                        height: 38
-                        spacing: tokens.spacingTiny
-
-                        Label {
-                            visible: mappingRow.primaryIsVoice
-                            Layout.fillWidth: true
-                            horizontalAlignment: Text.AlignHCenter
-                            text: qsTr("双击/长按暂停，原设置保留")
-                            color: tokens.textSecondary
-                            font.pixelSize: tokens.fontSizeSmall
-                            Accessible.name: text
-                        }
-
-                        Label {
-                            visible: !mappingRow.primaryIsVoice
-                            text: qsTr("双")
-                            color: tokens.textSecondary
-                            font.pixelSize: tokens.fontSizeSmall
-                        }
-                        ComboBox {
-                            id: doubleActionCombo
-                            objectName: "doubleActionCombo_" + mappingRow.buttonId
-                            Layout.fillWidth: true
-                            Layout.minimumWidth: 0
-                            visible: !mappingRow.primaryIsVoice
-                            enabled: !mappingRow.primaryIsVoice
-                            editable: true
-                            model: SettingsController.secondaryActionOptions
-                            ToolTip.visible: hovered
-                            ToolTip.text: qsTr("双击动作；配置后等待约 0.3 秒区分单击和双击。语音动作仅可用于主映射。")
-                            property bool _initialized: false
-                            Component.onCompleted: {
-                                editText = mappingRow.doubleClickText
-                                _initialized = true
-                            }
-                            onEditTextChanged: {
-                                if (_initialized)
-                                    ButtonMappingModel.setSecondaryActionTextAt(
-                                        mappingRow.index, "double_click", editText
-                                    )
-                            }
-                            onAccepted: ButtonMappingModel.setSecondaryActionTextAt(
-                                mappingRow.index, "double_click", editText
-                            )
-                            onActivated: ButtonMappingModel.setSecondaryActionTextAt(
-                                mappingRow.index, "double_click", currentText
-                            )
-                        }
-                        Button {
-                            objectName: "recordDoubleShortcut_" + mappingRow.buttonId
-                            visible: !mappingRow.primaryIsVoice
-                            enabled: !mappingRow.primaryIsVoice
-                            text: qsTr("录")
-                            Layout.preferredWidth: 30
-                            Layout.minimumWidth: 28
-                            onClicked: root.openShortcutRecorder(
-                                mappingRow.buttonId, mappingRow.index,
-                                "double_click", ""
-                            )
-                            Accessible.name: qsTr("录制双击") + mappingRow.displayName
-                        }
-                        Label {
-                            visible: !mappingRow.primaryIsVoice
-                            text: qsTr("长")
-                            color: tokens.textSecondary
-                            font.pixelSize: tokens.fontSizeSmall
-                        }
-                        ComboBox {
-                            id: longActionCombo
-                            objectName: "longActionCombo_" + mappingRow.buttonId
-                            Layout.fillWidth: true
-                            Layout.minimumWidth: 0
-                            visible: !mappingRow.primaryIsVoice
-                            enabled: !mappingRow.primaryIsVoice
-                            editable: true
-                            model: SettingsController.secondaryActionOptions
-                            ToolTip.visible: hovered
-                            ToolTip.text: qsTr("长按动作；按住约 0.55 秒触发并抑制单击。语音动作仅可用于主映射。")
-                            property bool _initialized: false
-                            Component.onCompleted: {
-                                editText = mappingRow.longPressText
-                                _initialized = true
-                            }
-                            onEditTextChanged: {
-                                if (_initialized)
-                                    ButtonMappingModel.setSecondaryActionTextAt(
-                                        mappingRow.index, "long_press", editText
-                                    )
-                            }
-                            onAccepted: ButtonMappingModel.setSecondaryActionTextAt(
-                                mappingRow.index, "long_press", editText
-                            )
-                            onActivated: ButtonMappingModel.setSecondaryActionTextAt(
-                                mappingRow.index, "long_press", currentText
-                            )
-                        }
-                        Button {
-                            objectName: "recordLongShortcut_" + mappingRow.buttonId
-                            visible: !mappingRow.primaryIsVoice
-                            enabled: !mappingRow.primaryIsVoice
-                            text: qsTr("录")
-                            Layout.preferredWidth: 30
-                            Layout.minimumWidth: 28
-                            onClicked: root.openShortcutRecorder(
-                                mappingRow.buttonId, mappingRow.index,
-                                "long_press", ""
-                            )
-                            Accessible.name: qsTr("录制长按") + mappingRow.displayName
-                        }
+                        height: 1
+                        visible: mappingRow.index < mappingList.count - 1
+                        color: tokens.border
                     }
+
                 }
+            }
+
+            Label {
+                Layout.fillWidth: true
+                text: qsTr("设置双击或长按后，快速连点和按住重复的识别方式可能随之改变。")
+                color: tokens.textSecondary
+                font.pixelSize: tokens.fontSizeSmall
+                wrapMode: Text.WordWrap
             }
         }
     }

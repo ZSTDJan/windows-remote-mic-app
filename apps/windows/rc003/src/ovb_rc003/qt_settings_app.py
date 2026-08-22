@@ -425,10 +425,10 @@ def _load_qt_classes() -> dict:
     class ButtonMappingModel(QAbstractListModel):
         """One row per physical RC003 button (13 total, in
         remote_layout.BUTTON_ORDER - 12 ordinary HID buttons plus mic),
-        exposing both its product-photo hotspot geometry and its
-        current mapping-action text to QML, so the photo's clickable
-        hotspots and the mapping list are two views over the SAME row data
-        rather than two independently-tracked selections.
+        exposing its identity, current mapping texts and shared selected
+        state to the full-width QML mapping matrix. Hotspot roles remain for
+        compatibility with older consumers of the model, but the current
+        settings page uses the matrix as its sole RC003 mapping view.
         """
 
         ButtonIdRole = _UserRole + 1
