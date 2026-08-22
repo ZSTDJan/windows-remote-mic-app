@@ -290,6 +290,14 @@ RC003 的可靠原生行为是 HOLD，主动 `MIC_OPEN` 可能只有开始控制
   ZIP SHA-256 为
   `8CE01906978263AB93CFD16A128FE6ACE85DB0C1592885060759773E71A5B059`。
   冻结 `--dry-run=0`，真机探针仍待运行。
+- 为异机配置与测试另行组装
+  `RemoteMicRC003-0.1.0-candidate-20260822-testkit1/` 与同名 ZIP。程序本体
+  未重新编译，EXE 与 `onrequest-probe1` 的 SHA-256 相同；包内新增
+  `配置与测试说明.md` 并重新生成 `SHA256SUMS.txt`。
+- `testkit1` 目录和 ZIP 均含 2072 个文件且逐文件一致；除新增说明和校验清单
+  外，其余 2070 个文件与 `onrequest-probe1` 逐文件一致。ZIP SHA-256 为
+  `BC7D9FCEDCF2BC438630B5382661111F6669810B691569D5BC4D6973334D9BB0`。
+  冻结 `--dry-run=0`，目标电脑上的 RC003、语音链路和专项探针仍待人工测试。
 
 ## [0.1.0-candidate] — 2026-07-31
 
