@@ -1350,6 +1350,43 @@ class MappedVoiceButtonTests(_AppWiringTestCase):
             [("down", ("ralt",)), ("up", ("ralt",))],
         )
 
+    def test_direct_hid_release_does_not_wait_for_delayed_legacy_f5_up(self):
+        self._set_voice_mapping("mic", key_mapping.VoiceTriggerMode.HOLD)
+        self.app._voice.trigger_mode = key_mapping.VoiceTriggerMode.HOLD
+        calls = []
+
+        with mock.patch.object(
+            win32_input,
+            "send_voice_key_combo_down",
+            side_effect=lambda tokens: calls.append(("down", tokens)),
+        ), mock.patch.object(
+            win32_input,
+            "send_voice_key_combo_up",
+            side_effect=lambda tokens: calls.append(("up", tokens)),
+        ):
+            self.app._on_button_event("mic", True, event_source="hid_tap")
+            self.app._on_button_event("mic", True, event_source="legacy_f5")
+
+            self.app._on_button_event("mic", False, event_source="hid_tap")
+
+            self.assertEqual(
+                calls,
+                [("down", ("ralt",)), ("up", ("ralt",))],
+            )
+            self.assertFalse(self.app._voice.active)
+            self.assertEqual(
+                self.app._voice_mic_gesture_sources_down,
+                {"legacy_f5"},
+            )
+
+            self.app._on_button_event("mic", False, event_source="legacy_f5")
+            self.app._on_control_event(AudioStopped())
+
+        self.assertEqual(
+            calls,
+            [("down", ("ralt",)), ("up", ("ralt",))],
+        )
+
     def test_physical_mic_hold_release_failure_retains_state_and_reconnects(self):
         self._set_voice_mapping("mic", key_mapping.VoiceTriggerMode.HOLD)
         self.app._voice.trigger_mode = key_mapping.VoiceTriggerMode.HOLD

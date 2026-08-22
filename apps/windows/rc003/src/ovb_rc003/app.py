@@ -1699,8 +1699,20 @@ class RC003App:
                     if (
                         self._voice.trigger_mode
                         == key_mapping.VoiceTriggerMode.HOLD
-                        and not self._voice_mic_gesture_sources_down
+                        and (
+                            event_source == "hid_tap"
+                            or not self._voice_mic_gesture_sources_down
+                        )
                     ):
+                        if (
+                            event_source == "hid_tap"
+                            and self._voice_mic_gesture_sources_down
+                        ):
+                            self._logger.info(
+                                "voice hold release accepted from direct HID while "
+                                "late duplicate sources remain: %s",
+                                sorted(self._voice_mic_gesture_sources_down),
+                            )
                         self._release_hold_voice_on_physical_release_locked(
                             "physical mic release"
                         )
