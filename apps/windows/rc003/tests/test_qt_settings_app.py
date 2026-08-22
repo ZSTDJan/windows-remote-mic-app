@@ -2909,6 +2909,7 @@ def _column_geometry(names):
 
 header_columns = _column_geometry(header_column_names)
 row_columns = _column_geometry(row_column_names)
+mapping_list_pos = mapping_list.mapToScene(QPointF(0.0, 0.0))
 click_point = power_row.mapToScene(
     QPointF(power_row.property("width") / 2.0, power_row.property("height") / 2.0)
 ).toPoint()
@@ -2923,6 +2924,10 @@ results_out = {
     "selected_after_power_click": controller.property("selectedButtonId"),
     "header_columns": header_columns,
     "row_columns": row_columns,
+    "mapping_list": {
+        "x": mapping_list_pos.x(),
+        "width": mapping_list.property("width"),
+    },
 }
 print(json.dumps(results_out))
 """
@@ -2974,8 +2979,10 @@ class ButtonsPageMappingMatrixTests(unittest.TestCase):
     def test_header_columns_align_with_mapping_row(self):
         viewports = (
             ("Basic", 1024, 720),
+            ("Basic", 640, 480),
             ("Basic", 683, 480),
             ("FluentWinUI3", 1024, 720),
+            ("FluentWinUI3", 640, 480),
             ("FluentWinUI3", 683, 480),
         )
         for style, width, height in viewports:
@@ -2993,27 +3000,54 @@ class ButtonsPageMappingMatrixTests(unittest.TestCase):
                         header["width"], row["width"], delta=0.5
                     )
 
-                header_gestures = data["header_columns"]
-                row_gestures = data["row_columns"]
-                # Qt rounds layout geometry to device pixels. When the
-                # remaining width is not divisible by three, an equal share
-                # necessarily leaves one gesture column one pixel wider.
+            for columns_name in ("header_columns", "row_columns"):
+                columns = data[columns_name]
+                with self.subTest(
+                    style=style,
+                    viewport=f"{width}x{height}",
+                    geometry=columns_name,
+                ):
+                    self.assertAlmostEqual(columns["key"]["width"], 118, delta=0.5)
+                    self.assertAlmostEqual(columns["edit"]["width"], 56, delta=0.5)
+
                 for left, right in (("single", "double"), ("double", "long")):
                     with self.subTest(
                         style=style,
                         viewport=f"{width}x{height}",
+                        geometry=columns_name,
                         equal_columns=f"{left}/{right}",
                     ):
                         self.assertAlmostEqual(
-                            header_gestures[left]["width"],
-                            header_gestures[right]["width"],
-                            delta=1.0,
+                            columns[left]["width"],
+                            columns[right]["width"],
+                            delta=0.5,
                         )
-                        self.assertAlmostEqual(
-                            row_gestures[left]["width"],
-                            row_gestures[right]["width"],
-                            delta=1.0,
-                        )
+
+                ordered_columns = ("key", "single", "double", "long", "edit")
+                for left, right in zip(ordered_columns, ordered_columns[1:]):
+                    with self.subTest(
+                        style=style,
+                        viewport=f"{width}x{height}",
+                        geometry=columns_name,
+                        non_overlapping=f"{left}/{right}",
+                    ):
+                        left_edge = columns[left]["x"] + columns[left]["width"]
+                        self.assertLessEqual(left_edge, columns[right]["x"] + 0.5)
+
+            mapping_list = data["mapping_list"]
+            row_edit = data["row_columns"]["edit"]
+            right_clearance = (
+                mapping_list["x"]
+                + mapping_list["width"]
+                - row_edit["x"]
+                - row_edit["width"]
+            )
+            self.assertGreaterEqual(
+                right_clearance,
+                8,
+                f"edit column encroaches on the scrollbar at {style} "
+                f"{width}x{height}",
+            )
 
 
 if __name__ == "__main__":
