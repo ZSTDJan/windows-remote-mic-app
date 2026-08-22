@@ -523,8 +523,22 @@ HID 注入权限顺序与稳定失败提交：
 - 定向 244 项通过；完整测试 1171 项通过、7 项安全或平台条件跳过，退出码 0。
 - 公开边界扫描 276 个文件通过；`compileall`、`pip check` 和
   `git diff --check` 通过。
-- 状态：源码与自动检查通过，便携诊断包和真实 RC003 结果待完成；不能据此
-  宣称 TOGGLE 可用。
+- 源码检查点：`dc82e1a7a74c9194755e7c782a68bc37d48acf18`。构建脚本从该
+  干净提交重新执行公开边界、1171/7 完整测试、PyInstaller 和冻结
+  `--dry-run=0`，全部通过。
+- 便携目录：源码仓库同级
+  `RemoteMicRC003-0.1.0-candidate-20260822-onrequest-probe1/`；共 2071 个文件。
+  其中 2062 个冻结运行时文件与 `dist/RemoteMicRC003` 逐文件 SHA-256 一致。
+- EXE SHA-256：
+  `B5089C4DA3BFFB6823D680C62F428B95D49D4F14C0D6BF3ACC0001E4DDF1C5E1`。
+- 便携 ZIP SHA-256：
+  `8CE01906978263AB93CFD16A128FE6ACE85DB0C1592885060759773E71A5B059`；
+  ZIP 内 2071 个文件与便携目录逐文件 SHA-256 一致。
+- 包内 Frida Gadget 归档与 VB-CABLE Pack45 分别保持固定 SHA-256
+  `B566D70189B6D551AD8F4E0BEA24DE08A3D4C0F559BB35B2BDB67D45182240C2`
+  和 `B950E39F01AF1D04EA623C8F6D8EB9B6EA5C477C637295FABF20631C85116BFB`。
+- 状态：源码、自动检查、冻结构建和便携包完整性通过，真实 RC003 结果待回传；
+  不能据此宣称 TOGGLE 可用。
 
 ## 维护纪律
 

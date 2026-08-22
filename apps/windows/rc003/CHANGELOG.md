@@ -283,6 +283,13 @@ RC003 的可靠原生行为是 HOLD，主动 `MIC_OPEN` 可能只有开始控制
 - On-request 专项探针定向测试 244 项通过；完整测试 1171 项通过、7 项安全或
   平台条件跳过，公开边界扫描 276 个文件通过；`compileall`、`pip check` 和
   `git diff --check` 通过。真实 RC003 结论仍待便携诊断包运行结果。
+- 探针源码检查点为 `dc82e1a`。便携目录
+  `RemoteMicRC003-0.1.0-candidate-20260822-onrequest-probe1/` 与同名 ZIP
+  均含 2071 个文件且逐文件一致；EXE SHA-256 为
+  `B5089C4DA3BFFB6823D680C62F428B95D49D4F14C0D6BF3ACC0001E4DDF1C5E1`，
+  ZIP SHA-256 为
+  `8CE01906978263AB93CFD16A128FE6ACE85DB0C1592885060759773E71A5B059`。
+  冻结 `--dry-run=0`，真机探针仍待运行。
 
 ## [0.1.0-candidate] — 2026-07-31
 
