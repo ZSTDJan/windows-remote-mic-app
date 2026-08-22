@@ -351,8 +351,9 @@ session detach 成功即证明其脚本不再被会话持有；单独 script unl
 `qt_settings_app.py` 把 Python model/controller 暴露给 QML。主要页面：
 
 - `ConnectionPage.qml`：设备、桥接、输出端点，不重复承载语音动作设置；
-- `ButtonsPage.qml`：13 键统一主/次动作映射、真实按键检测，以及开关型/按住型
-  两套语音快捷键；
+- `ButtonsPage.qml`：13 键整宽矩阵，按单击/双击/长按统一展示和编辑主/次动作，
+  通过共享 selected state 承接真实按键检测定位，并保存开关型/按住型两套
+  语音快捷键；旧照片 hotspot roles 只留作 model 兼容，不再作为当前界面；
 - `PermissionsPage.qml`：权限和系统入口；
 - `DiagnosticsPage.qml`：BLE、音频、驱动和日志诊断；
 - `main.qml` / `Tokens.qml`：窗口、导航和设计 token。
