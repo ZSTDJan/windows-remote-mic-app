@@ -2803,6 +2803,7 @@ class RenderedContrastTests(unittest.TestCase):
 # button. This replaces the old product-photo hotspot UI contract.
 _MAPPING_MATRIX_PROBE_SCRIPT = r"""
 import json
+import os
 import sys
 
 from ovb_rc003 import qt_settings_app as m
@@ -2830,7 +2831,7 @@ ButtonMappingModel = classes["ButtonMappingModel"]
 SettingsController = classes["SettingsController"]
 DiagnosticsController = classes["DiagnosticsController"]
 
-QQuickStyle.setStyle("Basic")
+QQuickStyle.setStyle(os.environ["RC003_TEST_STYLE"])
 app = QGuiApplication.instance() or QGuiApplication([])
 model = ButtonMappingModel()
 controller = SettingsController(model)
@@ -2845,6 +2846,8 @@ engine.addImportPath(str(qml_dir))
 engine.load(QUrl.fromLocalFile(str(qml_dir / "main.qml")))
 assert len(engine.rootObjects()) == 1, "main.qml failed to load"
 window = engine.rootObjects()[0]
+window.setProperty("width", int(os.environ["RC003_TEST_VIEWPORT_WIDTH"]))
+window.setProperty("height", int(os.environ["RC003_TEST_VIEWPORT_HEIGHT"]))
 window.show()
 content_item = window.property("contentItem")
 for _ in range(10):
@@ -2874,6 +2877,38 @@ for _ in range(5):
     app.processEvents()
 power_row = mapping_list.property("currentItem")
 assert power_row is not None
+
+header_column_names = {
+    "key": "mappingHeaderKeyColumn",
+    "single": "mappingHeaderSingleColumn",
+    "double": "mappingHeaderDoubleColumn",
+    "long": "mappingHeaderLongColumn",
+    "edit": "mappingHeaderEditColumn",
+}
+row_column_names = {
+    "key": "mappingKeyCell_power",
+    "single": "mappingSingleCell_power",
+    "double": "mappingDoubleCell_power",
+    "long": "mappingLongCell_power",
+    "edit": "editMapping_power",
+}
+
+
+def _column_geometry(names):
+    result = {}
+    for key, object_name in names.items():
+        item = _find(content_item, object_name)
+        assert item is not None, f"matrix column item not found: {object_name}"
+        scene_pos = item.mapToScene(QPointF(0.0, 0.0))
+        result[key] = {
+            "x": scene_pos.x(),
+            "width": item.property("width"),
+        }
+    return result
+
+
+header_columns = _column_geometry(header_column_names)
+row_columns = _column_geometry(row_column_names)
 click_point = power_row.mapToScene(
     QPointF(power_row.property("width") / 2.0, power_row.property("height") / 2.0)
 ).toPoint()
@@ -2886,6 +2921,8 @@ results_out = {
     "row_count": mapping_list.property("count"),
     "header_visible": header.property("visible"),
     "selected_after_power_click": controller.property("selectedButtonId"),
+    "header_columns": header_columns,
+    "row_columns": row_columns,
 }
 print(json.dumps(results_out))
 """
@@ -2897,13 +2934,16 @@ class ButtonsPageMappingMatrixTests(unittest.TestCase):
     continue to drive the shared selection used by real-key detection.
     """
 
-    def _run_probe(self):
+    def _run_probe(self, width=1024, height=720, style="Basic"):
         import json
         import subprocess
 
         env = dict(os.environ)
         env.setdefault("QT_QPA_PLATFORM", "offscreen")
         env["LOCALAPPDATA"] = tempfile.mkdtemp()
+        env["RC003_TEST_VIEWPORT_WIDTH"] = str(width)
+        env["RC003_TEST_VIEWPORT_HEIGHT"] = str(height)
+        env["RC003_TEST_STYLE"] = style
         result = subprocess.run(
             [sys.executable, "-c", _MAPPING_MATRIX_PROBE_SCRIPT],
             env=env,
@@ -2930,6 +2970,28 @@ class ButtonsPageMappingMatrixTests(unittest.TestCase):
             "power",
             "a real QTest click on the Power matrix row did not select Power",
         )
+
+    def test_header_columns_align_with_mapping_row(self):
+        viewports = (
+            ("Basic", 1024, 720),
+            ("Basic", 683, 480),
+            ("FluentWinUI3", 1024, 720),
+            ("FluentWinUI3", 683, 480),
+        )
+        for style, width, height in viewports:
+            data = self._run_probe(width, height, style)
+            for column_name in ("key", "single", "double", "long", "edit"):
+                with self.subTest(
+                    style=style,
+                    viewport=f"{width}x{height}",
+                    column=column_name,
+                ):
+                    header = data["header_columns"][column_name]
+                    row = data["row_columns"][column_name]
+                    self.assertAlmostEqual(header["x"], row["x"], delta=0.5)
+                    self.assertAlmostEqual(
+                        header["width"], row["width"], delta=0.5
+                    )
 
 
 if __name__ == "__main__":

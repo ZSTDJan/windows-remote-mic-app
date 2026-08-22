@@ -529,14 +529,20 @@ Item {
                     columnSpacing: tokens.spacingSmall
 
                     Label {
+                        objectName: "mappingHeaderKeyColumn"
                         Layout.preferredWidth: root.mappingKeyColumnWidth
+                        Layout.minimumWidth: root.mappingKeyColumnWidth
+                        Layout.maximumWidth: root.mappingKeyColumnWidth
                         text: qsTr("遥控器按键")
                         color: tokens.textPrimary
                         font.pixelSize: tokens.fontSizeBody
                         font.bold: true
+                        horizontalAlignment: Text.AlignLeft
                     }
                     RowLayout {
+                        objectName: "mappingHeaderSingleColumn"
                         Layout.fillWidth: true
+                        Layout.minimumWidth: 0
                         spacing: tokens.spacingTiny
                         Rectangle {
                             Layout.preferredWidth: 3
@@ -549,23 +555,38 @@ Item {
                             color: tokens.textPrimary
                             font.pixelSize: tokens.fontSizeBody
                             font.bold: true
+                            horizontalAlignment: Text.AlignLeft
                         }
+                        Item { Layout.fillWidth: true }
                     }
                     Label {
+                        objectName: "mappingHeaderDoubleColumn"
                         Layout.preferredWidth: root.mappingSecondaryColumnWidth
+                        Layout.minimumWidth: root.mappingSecondaryColumnWidth
+                        Layout.maximumWidth: root.mappingSecondaryColumnWidth
                         text: qsTr("双击")
                         color: tokens.textPrimary
                         font.pixelSize: tokens.fontSizeBody
                         font.bold: true
+                        horizontalAlignment: Text.AlignLeft
                     }
                     Label {
+                        objectName: "mappingHeaderLongColumn"
                         Layout.preferredWidth: root.mappingSecondaryColumnWidth
+                        Layout.minimumWidth: root.mappingSecondaryColumnWidth
+                        Layout.maximumWidth: root.mappingSecondaryColumnWidth
                         text: qsTr("长按")
                         color: tokens.textPrimary
                         font.pixelSize: tokens.fontSizeBody
                         font.bold: true
+                        horizontalAlignment: Text.AlignLeft
                     }
-                    Item { Layout.preferredWidth: root.mappingEditColumnWidth }
+                    Item {
+                        objectName: "mappingHeaderEditColumn"
+                        Layout.preferredWidth: root.mappingEditColumnWidth
+                        Layout.minimumWidth: root.mappingEditColumnWidth
+                        Layout.maximumWidth: root.mappingEditColumnWidth
+                    }
                 }
             }
 
@@ -636,7 +657,11 @@ Item {
                         columnSpacing: tokens.spacingSmall
 
                         ColumnLayout {
+                            objectName: "mappingKeyCell_" + mappingRow.buttonId
                             Layout.preferredWidth: root.mappingKeyColumnWidth
+                            Layout.minimumWidth: root.mappingKeyColumnWidth
+                            Layout.maximumWidth: root.mappingKeyColumnWidth
+                            Layout.fillWidth: false
                             spacing: 1
                             RowLayout {
                                 Layout.fillWidth: true
@@ -679,7 +704,9 @@ Item {
                         }
 
                         RowLayout {
+                            objectName: "mappingSingleCell_" + mappingRow.buttonId
                             Layout.fillWidth: true
+                            Layout.minimumWidth: 0
                             spacing: tokens.spacingTiny
                             Label {
                                 Layout.fillWidth: true
@@ -689,6 +716,7 @@ Item {
                                     ? tokens.textPrimary : tokens.disabledText
                                 font.pixelSize: tokens.fontSizeBody
                                 elide: Text.ElideRight
+                                horizontalAlignment: Text.AlignLeft
                             }
                             Label {
                                 visible: mappingRow.normalizedActionText === "方向上"
@@ -702,7 +730,10 @@ Item {
                         }
 
                         Label {
+                            objectName: "mappingDoubleCell_" + mappingRow.buttonId
                             Layout.preferredWidth: root.mappingSecondaryColumnWidth
+                            Layout.minimumWidth: root.mappingSecondaryColumnWidth
+                            Layout.maximumWidth: root.mappingSecondaryColumnWidth
                             text: mappingRow.primaryIsVoice
                                 ? qsTr("暂停") : mappingRow.doubleClickText
                             color: mappingRow.primaryIsVoice
@@ -710,10 +741,14 @@ Item {
                                 ? tokens.disabledText : tokens.textPrimary
                             font.pixelSize: tokens.fontSizeBody
                             elide: Text.ElideRight
+                            horizontalAlignment: Text.AlignLeft
                         }
 
                         Label {
+                            objectName: "mappingLongCell_" + mappingRow.buttonId
                             Layout.preferredWidth: root.mappingSecondaryColumnWidth
+                            Layout.minimumWidth: root.mappingSecondaryColumnWidth
+                            Layout.maximumWidth: root.mappingSecondaryColumnWidth
                             text: mappingRow.primaryIsVoice
                                 ? qsTr("暂停") : mappingRow.longPressText
                             color: mappingRow.primaryIsVoice
@@ -721,11 +756,14 @@ Item {
                                 ? tokens.disabledText : tokens.textPrimary
                             font.pixelSize: tokens.fontSizeBody
                             elide: Text.ElideRight
+                            horizontalAlignment: Text.AlignLeft
                         }
 
                         Button {
                             objectName: "editMapping_" + mappingRow.buttonId
                             Layout.preferredWidth: root.mappingEditColumnWidth
+                            Layout.minimumWidth: root.mappingEditColumnWidth
+                            Layout.maximumWidth: root.mappingEditColumnWidth
                             text: qsTr("编辑")
                             flat: true
                             onClicked: {
