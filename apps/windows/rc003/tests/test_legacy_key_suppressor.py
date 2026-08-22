@@ -96,6 +96,71 @@ class LegacyKeySuppressorDecisionTests(unittest.TestCase):
         gate.arm_key_event(0x74, 0x3F, False, True)
         self.assertFalse(gate.consume_armed_key_event(0x74, 0x3F, False, True))
 
+    def test_tracked_hold_consumes_every_repeated_down_until_legacy_up(self):
+        gate = suppressor.LegacyKeySuppressor({0x74})
+        gate.arm_tracked_key_event(0x26, 0x48, True, True)
+
+        self.assertTrue(
+            gate.consume_armed_key_event(0x26, 0x48, True, True, wait_seconds=0)
+        )
+        self.assertTrue(
+            gate.consume_armed_key_event(0x26, 0x48, True, True, wait_seconds=0)
+        )
+        self.assertTrue(
+            gate.consume_armed_key_event(0x26, 0x48, True, True, wait_seconds=0)
+        )
+
+        self.assertTrue(
+            gate.consume_armed_key_event(0x26, 0x48, True, False, wait_seconds=0)
+        )
+        self.assertFalse(
+            gate.consume_armed_key_event(0x26, 0x48, True, True, wait_seconds=0)
+        )
+
+    def test_tracked_release_consumes_late_repeat_before_legacy_up(self):
+        gate = suppressor.LegacyKeySuppressor({0x74})
+        gate.arm_tracked_key_event(0x26, 0x48, True, True)
+        self.assertTrue(
+            gate.consume_armed_key_event(0x26, 0x48, True, True, wait_seconds=0)
+        )
+
+        gate.arm_tracked_key_event(0x26, 0x48, True, False)
+
+        self.assertTrue(
+            gate.consume_armed_key_event(0x26, 0x48, True, True, wait_seconds=0)
+        )
+        self.assertTrue(
+            gate.consume_armed_key_event(0x26, 0x48, True, False, wait_seconds=0)
+        )
+        self.assertFalse(
+            gate.consume_armed_key_event(0x26, 0x48, True, True, wait_seconds=0)
+        )
+
+    def test_tracked_key_does_not_consume_another_key(self):
+        gate = suppressor.LegacyKeySuppressor({0x74})
+        gate.arm_tracked_key_event(0x26, 0x48, True, True)
+
+        self.assertFalse(
+            gate.consume_armed_key_event(0x27, 0x4D, True, True, wait_seconds=0)
+        )
+        self.assertFalse(gate.should_suppress(0x33, suppressor.LLKHF_INJECTED))
+
+    def test_late_device_release_does_not_leave_a_stale_release_arm(self):
+        gate = suppressor.LegacyKeySuppressor({0x74})
+        gate.arm_tracked_key_event(0x26, 0x48, True, True)
+        self.assertTrue(
+            gate.consume_armed_key_event(0x26, 0x48, True, True, wait_seconds=0)
+        )
+        self.assertTrue(
+            gate.consume_armed_key_event(0x26, 0x48, True, False, wait_seconds=0)
+        )
+
+        gate.arm_tracked_key_event(0x26, 0x48, True, False)
+
+        self.assertFalse(
+            gate.consume_armed_key_event(0x26, 0x48, True, False, wait_seconds=0)
+        )
+
 
 class LegacyKeySuppressorRaceTests(unittest.TestCase):
     """The low-level hook and the Raw Input thread race for the same physical

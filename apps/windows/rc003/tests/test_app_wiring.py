@@ -1224,7 +1224,7 @@ class OrdinaryButtonGestureWiringTests(_AppWiringTestCase):
         armed = []
 
         class _Suppressor:
-            def arm_key_event(self, *args):
+            def arm_tracked_key_event(self, *args):
                 armed.append(args)
 
         self.app._legacy_key_suppressor = _Suppressor()
@@ -1240,6 +1240,31 @@ class OrdinaryButtonGestureWiringTests(_AppWiringTestCase):
         )
 
         self.assertEqual(armed, [(0x26, 0x48, True, True)])
+
+    def test_direct_hid_edges_track_the_full_physical_hold(self):
+        armed = []
+
+        class _Suppressor:
+            def arm_tracked_key_event(self, *args):
+                armed.append(args)
+
+        self.app._legacy_key_suppressor = _Suppressor()
+        usage = next(
+            usage
+            for usage, button_id in app_module.frida_compat.TAP_USAGE_TO_BUTTON.items()
+            if button_id == "up"
+        )
+
+        self.app._arm_from_direct_usage(usage, True)
+        self.app._arm_from_direct_usage(usage, False)
+
+        self.assertEqual(
+            armed,
+            [
+                (0x26, 0x48, True, True),
+                (0x26, 0x48, True, False),
+            ],
+        )
 
     def test_unknown_or_unbound_raw_keyboard_edge_is_not_armed(self):
         armed = []

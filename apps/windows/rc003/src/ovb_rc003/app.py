@@ -493,7 +493,7 @@ class RC003App:
         vk_code, make_code, extended = key
         if vk_code == 0x74:
             return
-        suppressor.arm_key_event(vk_code, make_code, extended, is_pressed)
+        suppressor.arm_tracked_key_event(vk_code, make_code, extended, is_pressed)
 
 
     async def _cleanup_once(self) -> None:
@@ -1264,7 +1264,7 @@ class RC003App:
             return
         # RAWKEYBOARD uses RI_KEY_E0 (0x02) for the extended prefix; the
         # low-level hook uses LLKHF_EXTENDED (0x01).
-        suppressor.arm_key_event(
+        suppressor.arm_tracked_key_event(
             event.vkey,
             event.make_code,
             bool((event.flags or 0) & 0x02),

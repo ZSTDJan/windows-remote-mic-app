@@ -21,7 +21,7 @@ import threading
 import time
 from ctypes import wintypes
 from dataclasses import dataclass
-from typing import Callable, FrozenSet, List, NamedTuple, Optional, Tuple
+from typing import Callable, Dict, FrozenSet, List, NamedTuple, Optional, Tuple
 
 
 WH_KEYBOARD_LL = 13
@@ -82,6 +82,12 @@ class _ArmedKeyEvent:
     expires_at: float
 
 
+@dataclass(frozen=True)
+class _TrackedKeyState:
+    is_pressed: bool
+    expires_at: float
+
+
 def build_physical_key_event(
     target: PhysicalKeyTarget, is_pressed: bool, event_time: int
 ) -> Tuple[KBDLLHOOKSTRUCT, int]:
@@ -116,6 +122,8 @@ class LegacyKeySuppressor:
         *,
         rc003_vk_codes: Optional[FrozenSet[int]] = None,
         consume_wait_seconds: float = 0.060,
+        tracked_hold_seconds: float = 10.0,
+        tracked_release_seconds: float = 2.0,
     ) -> None:
         self._suppress_vk_codes: FrozenSet[int] = frozenset(int(vk) for vk in suppress_vk_codes)
         self._on_key_event = on_key_event
@@ -138,6 +146,15 @@ class LegacyKeySuppressor:
         # use the same conservative window for the RC003 key set.
         self._consume_wait_seconds = max(0.0, float(consume_wait_seconds))
         self._armed_events: List[_ArmedKeyEvent] = []
+        # Windows repeats a held physical arrow key as many legacy key-down
+        # records, while the RC003 HID report contains just one down and one
+        # up edge. Keep the selected device's authoritative state so every
+        # repeat is swallowed, including repeats already queued when the
+        # direct HID up arrives. A matching legacy up clears the state; the
+        # deadlines are only guards for a lost release edge.
+        self._tracked_keys: Dict[Tuple[int, int, bool], _TrackedKeyState] = {}
+        self._tracked_hold_seconds = max(0.0, float(tracked_hold_seconds))
+        self._tracked_release_seconds = max(0.0, float(tracked_release_seconds))
         self._armed_events_lock = threading.Lock()
         # Raw Input and the low-level hook run on different threads, so
         # ``arm_key_event`` (Raw Input thread) and ``consume_armed_key_event``
@@ -217,32 +234,102 @@ class LegacyKeySuppressor:
         arrow.
         """
 
+        self._arm_key_event(
+            vk_code,
+            scan_code,
+            extended,
+            is_pressed,
+            lifetime_seconds=lifetime_seconds,
+            track_state=False,
+        )
+
+    def arm_tracked_key_event(
+        self,
+        vk_code: int,
+        scan_code: int,
+        extended: bool,
+        is_pressed: bool,
+        *,
+        lifetime_seconds: float = 0.180,
+    ) -> None:
+        """Arm one edge and track the selected RC003 key until legacy up.
+
+        The device-scoped HID or Raw Input source owns the physical state.
+        Tracking that state lets the global hook distinguish Windows key
+        repeat records from an unrelated keyboard event after the first edge
+        has already been consumed.
+        """
+
+        self._arm_key_event(
+            vk_code,
+            scan_code,
+            extended,
+            is_pressed,
+            lifetime_seconds=lifetime_seconds,
+            track_state=True,
+        )
+
+    def _arm_key_event(
+        self,
+        vk_code: int,
+        scan_code: int,
+        extended: bool,
+        is_pressed: bool,
+        *,
+        lifetime_seconds: float,
+        track_state: bool,
+    ) -> None:
         if int(vk_code) == 0x74:
             # F5 is handled by the dedicated voice path below.
             return
-        expires_at = time.monotonic() + max(0.0, float(lifetime_seconds))
-        armed = _ArmedKeyEvent(
-            vk_code=int(vk_code),
-            scan_code=int(scan_code),
-            extended=bool(extended),
-            is_pressed=bool(is_pressed),
-            expires_at=expires_at,
-        )
+        identity = (int(vk_code), int(scan_code), bool(extended))
         with self._armed_events_lock:
             now = time.monotonic()
             self._armed_events = [
                 event for event in self._armed_events if event.expires_at > now
             ]
-            self._armed_events.append(armed)
-            if len(self._armed_events) > 64:
-                self._armed_events = self._armed_events[-64:]
+            self._purge_tracked_keys_locked(now)
+
+            should_arm = True
+            if track_state:
+                if is_pressed:
+                    self._tracked_keys[identity] = _TrackedKeyState(
+                        is_pressed=True,
+                        expires_at=now + self._tracked_hold_seconds,
+                    )
+                elif identity in self._tracked_keys:
+                    self._tracked_keys[identity] = _TrackedKeyState(
+                        is_pressed=False,
+                        expires_at=now + self._tracked_release_seconds,
+                    )
+                else:
+                    # The matching legacy up was already observed while this
+                    # device-scoped release edge was in flight. Do not leave a
+                    # stale one-shot arm that could consume a keyboard release.
+                    should_arm = False
+
+            if should_arm:
+                self._armed_events.append(
+                    _ArmedKeyEvent(
+                        vk_code=identity[0],
+                        scan_code=identity[1],
+                        extended=identity[2],
+                        is_pressed=bool(is_pressed),
+                        expires_at=now + max(0.0, float(lifetime_seconds)),
+                    )
+                )
+                if len(self._armed_events) > 64:
+                    self._armed_events = self._armed_events[-64:]
             self._armed_events_changed.notify_all()
         _logger.info(
-            "arm key edge: vk=0x%X scan=0x%X ext=%s pressed=%s window=%.3fs thread=%s",
+            "arm key edge: vk=0x%X scan=0x%X ext=%s pressed=%s "
+            "tracked=%s armed=%s window=%.3fs thread=%s",
             int(vk_code),
             int(scan_code),
             bool(extended),
             bool(is_pressed),
+            bool(track_state),
+            bool(should_arm),
             float(lifetime_seconds),
             threading.current_thread().name,
         )
@@ -280,17 +367,29 @@ class LegacyKeySuppressor:
                 matched = self._consume_armed_key_event_locked(
                     vk_code, scan_code, extended, is_pressed, now
                 )
+                match_kind = "armed" if matched else "none"
+                if matched and not is_pressed:
+                    self._tracked_keys.pop(
+                        (int(vk_code), int(scan_code), bool(extended)), None
+                    )
+                if not matched and self._consume_tracked_key_event_locked(
+                    vk_code, scan_code, extended, is_pressed, now
+                ):
+                    matched = True
+                    match_kind = "tracked"
                 if matched or now >= deadline:
                     elapsed = now - deadline + effective_wait
                     _logger.info(
                         "consume key edge: vk=0x%X scan=0x%X ext=%s pressed=%s "
-                        "matched=%s armed=%d waited=%.3fs thread=%s",
+                        "matched=%s via=%s armed=%d tracked=%d waited=%.3fs thread=%s",
                         int(vk_code),
                         int(scan_code),
                         bool(extended),
                         bool(is_pressed),
                         bool(matched),
+                        match_kind,
                         len(self._armed_events),
+                        len(self._tracked_keys),
                         elapsed,
                         threading.current_thread().name,
                     )
@@ -323,6 +422,36 @@ class LegacyKeySuppressor:
                 kept.append(event)
         self._armed_events = kept
         return matched
+
+    def _purge_tracked_keys_locked(self, now: float) -> None:
+        self._tracked_keys = {
+            identity: state
+            for identity, state in self._tracked_keys.items()
+            if state.expires_at > now
+        }
+
+    def _consume_tracked_key_event_locked(
+        self,
+        vk_code: int,
+        scan_code: int,
+        extended: bool,
+        is_pressed: bool,
+        now: float,
+    ) -> bool:
+        self._purge_tracked_keys_locked(now)
+        identity = (int(vk_code), int(scan_code), bool(extended))
+        state = self._tracked_keys.get(identity)
+        if state is None:
+            return False
+        if not is_pressed:
+            self._tracked_keys.pop(identity, None)
+            return True
+        if state.is_pressed:
+            self._tracked_keys[identity] = _TrackedKeyState(
+                is_pressed=True,
+                expires_at=now + self._tracked_hold_seconds,
+            )
+        return True
 
     def _forward_transformed_key_event(
         self,
@@ -416,6 +545,7 @@ class LegacyKeySuppressor:
         self._stop_event.set()
         with self._armed_events_lock:
             self._armed_events.clear()
+            self._tracked_keys.clear()
         if self._thread is None:
             return
         if sys.platform == "win32" and self._thread_id.value:
