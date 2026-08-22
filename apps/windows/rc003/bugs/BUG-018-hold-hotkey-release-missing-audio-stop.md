@@ -57,6 +57,8 @@
   通过，随后完整 1175 项复跑通过。这不是按键状态机失败。
 - 公开边界扫描：277 个文件通过。
 - `compileall`、`pip check` 和 `git diff --check` 通过。
+- PyInstaller 本地冻结构建通过；EXE 的 `--dry-run` 与 `--help` 均退出 0，
+  检查后无残留进程。该 EXE 尚未经过 RC003 真机验证。
 
 ## 真机复测
 

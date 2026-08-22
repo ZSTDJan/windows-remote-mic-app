@@ -640,9 +640,12 @@ HID 注入权限顺序与稳定失败提交：
 - 首轮完整测试仅出现一次 Qt 离屏临时缓存文件占用；单项和随后完整复跑均
   通过。公开边界扫描 277 个文件、`compileall`、`pip check` 和
   `git diff --check` 均通过。
+- 本地冻结目录：`dist/RemoteMicRC003/`；EXE 大小 5,064,340 字节，SHA-256
+  为 `8144ABCF86298D81E49AC641AB0FB174466695353C21A8B116B34B4687EA96B1`。
+  冻结 `--dry-run`、`--help` 均退出 0，检查后无残留进程。
 - 详细证据：`bugs/BUG-018-hold-hotkey-release-missing-audio-stop.md`。
-- 状态：源码检查点待 RC003 真机复测；当前 `matrix1-portable` ZIP 未更新，
-  不能宣称已包含本修复。
+- 状态：本地 EXE 检查点待 RC003 真机复测；当前 `matrix1-portable` ZIP 未
+  更新，不能宣称已包含本修复。
 
 ## 维护纪律
 
