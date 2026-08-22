@@ -202,8 +202,13 @@
   unittest 1151 项通过、7 项按平台或安全条件跳过，退出码 0。
 - `compileall`、`pip check`、PowerShell parser、`git diff --check` 通过；公开
   边界扫描 278 个文件通过。QML 离屏加载和矩阵布局检查包含在完整测试中。
-- 当前仍是源码检查点，新的本机候选和冻结入口结果将在构建完成后补记；本批先
-  提供本机程序，不制作外发 ZIP。
+- 从源码提交 `b74288c` 构建本机候选
+  `D:\Wuxianmai\RemoteMicRC003-0.1.0-candidate-20260822-hold1`。目录含 2062 个
+  文件，复制后逐文件 SHA-256 一致；EXE SHA-256 为
+  `752AB73FD3A6BF841682C2D41ADDACDE9520F22CBAC438AB19A8EFA8612970C8`。
+  冻结入口 `--help=0`、`--dry-run=0`，六个 QML 文件与源码一致，Frida Gadget
+  和 VB-CABLE 固定资源校验通过，旧 On-request 专项文件为零。本批不制作外发
+  ZIP，等待用户先验收本机程序。
 - 完整测试：1006 项通过，7 项安全或平台相关跳过，退出码 0。
 - 公开边界扫描：227 个文件通过；`compileall`、`pip check` 与
   `git diff --check` 通过。

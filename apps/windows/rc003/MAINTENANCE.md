@@ -894,8 +894,16 @@ HID 注入权限顺序与稳定失败提交：
   完整 unittest 1151 项通过、7 项按平台或安全条件跳过，退出码 0。
 - `compileall`、`pip check`、PowerShell parser、公开边界扫描 278 个文件和
   `git diff --check` 通过；QML 离屏加载及矩阵布局检查包含在完整测试中。
-- 当前仍是源码检查点；本机候选构建完成后再补产物路径与哈希。本批不制作外发
-  ZIP，等待用户先验收本机程序。
+- 本机候选已从提交 `b74288c` 构建到
+  `D:\Wuxianmai\RemoteMicRC003-0.1.0-candidate-20260822-hold1`。目录含 2062 个
+  文件，复制后逐文件 SHA-256 与 `dist/RemoteMicRC003` 一致；EXE SHA-256 为
+  `752AB73FD3A6BF841682C2D41ADDACDE9520F22CBAC438AB19A8EFA8612970C8`。
+- 冻结 `--help=0`、`--dry-run=0`；六个 QML 文件与源码逐文件一致；Frida Gadget
+  SHA-256 为 `B566D70189B6D551AD8F4E0BEA24DE08A3D4C0F559BB35B2BDB67D45182240C2`，
+  VB-CABLE 原始包 SHA-256 为
+  `B950E39F01AF1D04EA623C8F6D8EB9B6EA5C477C637295FABF20631C85116BFB`；候选中
+  不含已撤下的 On-request 专项文件。
+- 本批不制作外发 ZIP，等待用户先验收本机程序。
 
 ## 维护纪律
 
