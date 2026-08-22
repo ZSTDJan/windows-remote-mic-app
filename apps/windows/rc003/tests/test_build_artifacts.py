@@ -19,6 +19,11 @@ _PACKAGE_MAIN_PATH = _RC003_ROOT / "src" / "ovb_rc003" / "__main__.py"
 _LAUNCHER_PATH = _RC003_ROOT / "src" / "launcher.py"
 _BUILD_CANDIDATE_PATH = _RC003_ROOT / "build" / "build-candidate.ps1"
 _PUBLIC_BOUNDARY_PATH = _RC003_ROOT / "build" / "check-public-boundary.ps1"
+_ON_REQUEST_PROBE_DIR = _RC003_ROOT / "build" / "on-request-probe"
+_ON_REQUEST_PROBE_LAUNCHER_PATH = (
+    _ON_REQUEST_PROBE_DIR / "Run-OnRequest-Probe.cmd"
+)
+_ON_REQUEST_PROBE_README_PATH = _ON_REQUEST_PROBE_DIR / "ON-REQUEST-PROBE.txt"
 _README_PATH = _RC003_ROOT / "README.md"
 _INSTALLED_README_PATH = _RC003_ROOT / "installer" / "readme-rc003.txt"
 _ROOT_README_PATH = _REPO_ROOT / "README.md"
@@ -1491,6 +1496,10 @@ class QtSettingsUiSpecTests(unittest.TestCase):
         ):
             self.assertIn(module, hiddenimports)
 
+    def test_spec_hidden_imports_on_request_probe(self):
+        hiddenimports = _spec_hidden_imports(self.spec_text)
+        self.assertIn("ovb_rc003.on_request_probe", hiddenimports)
+
     def test_qml_directory_name_matches_qt_settings_app_frozen_lookup(self):
         # Cross-file consistency: the exact "ovb_rc003_qml" folder name must
         # agree between the spec (producer) and qt_settings_app.py's
@@ -1504,6 +1513,29 @@ class QtSettingsUiSpecTests(unittest.TestCase):
         qt_settings_app_text = qt_settings_app_path.read_text(encoding="utf-8")
         self.assertIn('"ovb_rc003_qml"', self.spec_text)
         self.assertIn('"ovb_rc003_qml"', qt_settings_app_text)
+
+
+class OnRequestProbePortableAssetTests(unittest.TestCase):
+    def test_launcher_uses_the_sibling_executable_and_hidden_probe_flag(self):
+        text = _ON_REQUEST_PROBE_LAUNCHER_PATH.read_text(encoding="utf-8")
+        self.assertIn(
+            '"%~dp0RemoteMicRC003.exe" --on-request-probe',
+            text,
+        )
+
+    def test_readme_has_exact_steps_outputs_and_failure_outcomes(self):
+        text = _ON_REQUEST_PROBE_README_PATH.read_text(encoding="utf-8")
+        for required in (
+            "Run-OnRequest-Probe.cmd",
+            "短按一次话筒键并立即松开",
+            "on-request-probe-result.json",
+            "app.log",
+            "pcm_continued_past_1000ms",
+            "no_mic_open_audio_start",
+            "control_only_no_pcm",
+            "pcm_did_not_continue_past_1000ms",
+        ):
+            self.assertIn(required, text)
 
 
 if __name__ == "__main__":

@@ -378,6 +378,7 @@ class RC003BleSession:
         on_error: Optional[ErrorCallback] = None,
         on_disconnected: Optional[DisconnectedCallback] = None,
         gain_db: float = 10.0,
+        get_capabilities_command: bytes = proto.GET_CAPABILITIES_V10,
         winrt: Optional[WinRTModules] = None,
         loop: Optional[asyncio.AbstractEventLoop] = None,
     ) -> None:
@@ -386,6 +387,7 @@ class RC003BleSession:
         self._on_error = on_error
         self._on_disconnected = on_disconnected
         self._session = atvv_session.ATVVSession(gain_db=gain_db)
+        self._get_capabilities_command = bytes(get_capabilities_command)
         self._winrt = winrt
         self._device = None
         self._service = None
@@ -486,7 +488,7 @@ class RC003BleSession:
                 )
 
         self._start_worker(my_generation)
-        await self._write_tx(proto.GET_CAPABILITIES_V10)
+        await self._write_tx(self._get_capabilities_command)
 
     @staticmethod
     async def _require_characteristic(service, characteristic_uuid: str, winrt: WinRTModules):

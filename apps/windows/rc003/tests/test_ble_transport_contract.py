@@ -323,6 +323,27 @@ class ConnectTests(unittest.TestCase):
         self.assertTrue(env.data_writers)
         self.assertTrue(all(writer.close_calls == 1 for writer in env.data_writers))
 
+    def test_connect_can_use_the_isolated_on_request_probe_capabilities(self):
+        env = FakeWinRTEnvironment()
+
+        async def scenario():
+            session, candidate = self._connect_session(
+                env,
+                on_pcm_frame=lambda samples: None,
+                get_capabilities_command=proto.GET_CAPABILITIES_ON_REQUEST_V10,
+            )
+            await session.connect(candidate)
+            return session
+
+        session = _run(scenario())
+        try:
+            self.assertEqual(
+                env.tx_characteristic.write_history[-1],
+                proto.GET_CAPABILITIES_ON_REQUEST_V10,
+            )
+        finally:
+            _run(session.close())
+
     def test_tx_writer_is_closed_even_when_writer_close_itself_fails(self):
         env = FakeWinRTEnvironment()
         close_error = RuntimeError("simulated writer close failure")

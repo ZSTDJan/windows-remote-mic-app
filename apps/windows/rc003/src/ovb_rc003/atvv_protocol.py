@@ -23,6 +23,10 @@ VOICE_AUDIO_UUID = "AB5E0003-5A21-4F05-BC7D-AF01F617B664"
 VOICE_CONTROL_UUID = "AB5E0004-5A21-4F05-BC7D-AF01F617B664"
 
 GET_CAPABILITIES_V10 = bytes((0x0A, 0x01, 0x00, 0x00, 0x03, 0x03))
+# ATVV v1.0 treats On-request as the baseline interaction. Advertising no
+# PTT/HTT bits lets the diagnostic probe test the exact START_SEARCH ->
+# MIC_OPEN path without changing the production bridge's negotiation.
+GET_CAPABILITIES_ON_REQUEST_V10 = bytes((0x0A, 0x01, 0x00, 0x00, 0x03, 0x00))
 
 # Control-channel opcodes (first byte of every VOICE_CONTROL_UUID notification).
 OPCODE_AUDIO_STOP = 0x00

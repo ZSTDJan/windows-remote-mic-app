@@ -1,0 +1,27 @@
+RC003 On-request 语音诊断
+========================
+
+用途：验证 RC003 是否存在“短按话筒键后，松手仍持续传音”的最后一条协议路径。
+它不会触发输入法快捷键，不会使用 VB-CABLE，也不会保存或转写语音内容。
+
+操作：
+
+1. 先从通知区域退出正在运行的 Remote Mic 桥接。
+2. 双击 Run-OnRequest-Probe.cmd。
+3. 等待“连接与 On-request 协商已经完成”提示。
+4. 点击确定后，短按一次话筒键并立即松开，不要长按。
+5. 松开后马上连续说话约 3 秒。
+6. 再短按一次话筒键结束。
+7. 诊断结束后会自动打开日志文件夹。
+
+请回传：
+
+- on-request-probe-result.json
+- app.log
+
+判断：
+
+- pcm_continued_past_1000ms：短按后仍持续收到 PCM，可以继续研究开关型语音。
+- no_mic_open_audio_start：遥控器没有进入由主机 MIC_OPEN 发起的音频会话。
+- control_only_no_pcm / pcm_did_not_continue_past_1000ms：只有控制事件，或主机
+  开麦会话的音频没有持续，结果支持 RC003 正式只保留按住说话。

@@ -374,12 +374,25 @@ HID 注入权限顺序与稳定失败提交：
   数据，同连接普通语音键则立即出现连续音频。
 - 本地探针：On-request-only 协商成功，直接 `MIC_OPEN` 返回开始但四秒零
   PCM；该探针没有先收到实体 `START_SEARCH`。
-- 剩余验证：只保留一次严格的
-  `实体短按 -> START_SEARCH -> MIC_OPEN -> 松开后讲话 -> 第二次按下/关闭`
-  探针。不得用宿主窗口已经唤起或只有 `AudioStarted` 判为通过。
+- 专项程序：隐藏入口 `--on-request-probe` 已实现；便携包通过
+  `Run-OnRequest-Probe.cmd` 启动。它使用正式桥接互斥锁，但不启动 HID、宿主
+  快捷键、PortAudio 或 VB-CABLE，也不保存语音内容。
+- 真机步骤：先从通知区域退出旧桥接；运行脚本并等到 On-request 协商完成；
+  点击确定后短按一次话筒键并立即松开，马上连续说话约 3 秒，再短按一次结束。
+- 结果文件：
+  `%LOCALAPPDATA%\RemoteMic\RC003\logs\on-request-probe-result.json`；同时回传
+  同目录 `app.log`。
+- 通过判据：必须收到实体 `START_SEARCH`，主机只发一次 `MIC_OPEN`，设备报告
+  `AUDIO_START reason=0, stream_id=0`，且这个主机开麦会话自身开始一秒后仍有
+  PCM；第二次按下只发一次 `MIC_CLOSE`。普通 HTT 长按音频不能算通过。
+- 失败判据：无 `START_SEARCH`、无主机开麦开始事件、只有开始控制而零 PCM，
+  或主机开麦 PCM 未持续超过一秒。不得用宿主窗口已经唤起判断结果。
+- 自动结果：专项状态/编排/入口/构建契约测试及完整回归通过；完整测试 1171
+  项通过、7 项安全或平台条件跳过，公开边界扫描 276 个文件通过，
+  `compileall`、`pip check` 和 `git diff --check` 通过。
 - 当前判定：HOLD 为正式支持路径；TOGGLE 是待产品决策的实验路径，不能标记
   已修复。
-- 状态：协议窄路径待真机验证。
+- 状态：专项程序已完成自动验证，协议窄路径待真机运行。
 
 ### CHECK-TRAY-001 后台桥接通知区域控制
 

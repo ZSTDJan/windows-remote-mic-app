@@ -97,6 +97,20 @@ class ATVVSessionControlEventTests(unittest.TestCase):
         self.assertEqual(event.session_id, 42)
         self.assertTrue(session.mic_open)
 
+    def test_audio_start_and_stop_expose_protocol_reason_fields(self):
+        session = atvv_session.ATVVSession()
+        session.handle_control(_caps_payload())
+
+        started = session.handle_control(
+            bytes((proto.OPCODE_AUDIO_START, 0x00, 0x02, 0x00))
+        )
+        stopped = session.handle_control(bytes((proto.OPCODE_AUDIO_STOP, 0x02)))
+
+        self.assertEqual(started.reason, 0)
+        self.assertEqual(started.codec, 2)
+        self.assertEqual(started.session_id, 0)
+        self.assertEqual(stopped.reason, 2)
+
     def test_audio_start_without_session_id_byte(self):
         session = atvv_session.ATVVSession()
         event = session.handle_control(bytes((proto.OPCODE_AUDIO_START,)))

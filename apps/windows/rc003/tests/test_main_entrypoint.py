@@ -18,6 +18,7 @@ from ovb_rc003 import (
     config,
     device_catalog,
     frida_compat,
+    on_request_probe,
     single_instance,
     windows_diagnostics,
 )
@@ -422,6 +423,26 @@ class ArgumentModeBypassTests(_ArgvRestoringTestCase):
         self.assertEqual(received_args, [["--pid", "1234"]])
         self.assertEqual(enter_calls, [])
 
+    def test_on_request_probe_dispatches_without_starting_the_bridge(self):
+        enter_calls = []
+        single_instance.BridgeInstanceGuard = _make_guard_class(
+            enter_calls=enter_calls
+        )
+        app.main = lambda: self.fail(
+            "On-request probe must never call app.main()"
+        )
+        original_probe_main = on_request_probe.main
+        on_request_probe.main = lambda: 23
+        sys.argv = ["ovb_rc003", on_request_probe.ON_REQUEST_PROBE_FLAG]
+        try:
+            with self.assertRaises(SystemExit) as ctx:
+                main_module.main()
+        finally:
+            on_request_probe.main = original_probe_main
+
+        self.assertEqual(ctx.exception.code, 23)
+        self.assertEqual(enter_calls, [])
+
 
 class DiagnoseBleCandidatesDispatchTests(_ArgvRestoringTestCase):
     """XRBM-035 RETRY 1 In-scope item 6: the hidden child-process entry
@@ -497,6 +518,7 @@ class DiagnoseBleCandidatesDispatchTests(_ArgvRestoringTestCase):
             main_module.main()  # returns normally, no SystemExit
 
         self.assertNotIn("--diagnose-ble-candidates", buffer.getvalue())
+        self.assertNotIn(on_request_probe.ON_REQUEST_PROBE_FLAG, buffer.getvalue())
 
 
 if __name__ == "__main__":

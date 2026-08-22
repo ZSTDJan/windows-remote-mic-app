@@ -494,6 +494,38 @@ HID 注入权限顺序与稳定失败提交：
 - `bugs/BUG-017-toggle-firmware-audio-boundary.md`
 - `TESTING.md` 的 `CHECK-VOICE-010` 与 `CHECK-VOICE-011`
 
+### 2026-08-22 On-request 窄路径诊断程序
+
+来源与边界：
+
+- 本批只回答 RC003 在实体 `START_SEARCH` 后由主机回复 `MIC_OPEN`，是否能在
+  实体键松开后继续产生 PCM；不修改正式桥接状态机，不混入 QML/Qt 界面调整，
+  不触发输入法快捷键，也不使用 PortAudio 或 VB-CABLE。
+- 生产桥接继续使用原有 capabilities 命令；On-request-only capabilities 只
+  通过可注入构造参数交给隐藏探针，不改变普通用户运行路径。
+
+实施结果：
+
+- 新增隐藏 `--on-request-probe` 入口和便携启动脚本；探针使用正式桥接的
+  per-session mutex，避免与后台桥接并发占用 RC003。
+- 第一次实体 `START_SEARCH` 只调度一次 `MIC_OPEN`；第二次有效按下只调度一次
+  `MIC_CLOSE`。第一次 `AUDIO_STOP` 不会让观察提前结束，超时和异常路径仍执行
+  有界关闭。
+- `AudioStarted`/`AudioStopped` 事件补充 reason、codec 和 stream id 诊断字段。
+  成功只接受 `reason=MIC_OPEN, stream_id=0` 的主机开麦会话自身持续超过一秒的
+  PCM；普通 HOLD 长按不能制造假阳性。
+- 结果只写 capabilities、控制事件计数、PCM 数量和相对毫秒，路径固定为
+  `%LOCALAPPDATA%\RemoteMic\RC003\logs\on-request-probe-result.json`；不记录
+  设备身份或语音内容。
+
+自动验证：
+
+- 定向 244 项通过；完整测试 1171 项通过、7 项安全或平台条件跳过，退出码 0。
+- 公开边界扫描 276 个文件通过；`compileall`、`pip check` 和
+  `git diff --check` 通过。
+- 状态：源码与自动检查通过，便携诊断包和真实 RC003 结果待完成；不能据此
+  宣称 TOGGLE 可用。
+
 ## 维护纪律
 
 - 每次修改都应写明：上游起点、故障现象、根因、改动文件、自动检查、

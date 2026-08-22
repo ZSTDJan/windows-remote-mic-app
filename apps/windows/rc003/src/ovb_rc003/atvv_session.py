@@ -45,11 +45,13 @@ class MicButtonPressed:
 @dataclass(frozen=True)
 class AudioStarted:
     session_id: Optional[int]
+    reason: Optional[int] = None
+    codec: Optional[int] = None
 
 
 @dataclass(frozen=True)
 class AudioStopped:
-    pass
+    reason: Optional[int] = None
 
 
 @dataclass(frozen=True)
@@ -205,14 +207,21 @@ class ATVVSession:
             self._pending_sync = None
             self._mic_open = True
             session_id = payload[3] if len(payload) >= 4 else None
+            reason = payload[1] if len(payload) >= 2 else None
+            codec = payload[2] if len(payload) >= 3 else None
             self._last_session_id = session_id
-            return AudioStarted(session_id=session_id)
+            return AudioStarted(
+                session_id=session_id,
+                reason=reason,
+                codec=codec,
+            )
 
         if opcode == proto.OPCODE_AUDIO_STOP:
             self._mic_open = False
             self._last_mic_off_at = self._clock()
             self._accumulator.reset()
-            return AudioStopped()
+            reason = payload[1] if len(payload) >= 2 else None
+            return AudioStopped(reason=reason)
 
         if opcode == proto.OPCODE_AUDIO_SYNC and len(payload) >= 7:
             predictor = int.from_bytes(payload[4:6], "big", signed=True)

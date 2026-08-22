@@ -7,6 +7,12 @@ class CapabilitiesParsingTests(unittest.TestCase):
     def test_get_capabilities_v10_bytes(self):
         self.assertEqual(proto.GET_CAPABILITIES_V10, bytes((0x0A, 0x01, 0x00, 0x00, 0x03, 0x03)))
 
+    def test_on_request_probe_advertises_no_ptt_or_htt_bits(self):
+        self.assertEqual(
+            proto.GET_CAPABILITIES_ON_REQUEST_V10,
+            bytes((0x0A, 0x01, 0x00, 0x00, 0x03, 0x00)),
+        )
+
     def test_parse_rejects_wrong_opcode(self):
         payload = bytes((0x99, 0x01, 0x00, 0x02, 0x00, 0x00, 0x78))
         self.assertIsNone(proto.ATVVCapabilities.parse(payload))

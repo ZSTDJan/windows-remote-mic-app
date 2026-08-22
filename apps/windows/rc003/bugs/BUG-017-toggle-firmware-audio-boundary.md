@@ -1,6 +1,7 @@
 # BUG-017：RC003 开关型持续语音的固件边界
 
-状态：HOLD 产品路径已确认；TOGGLE 不能再标记为已修复，产品取舍待决定。
+状态：HOLD 产品路径已确认；严格 On-request 专项探针已实现，真机结论待回传；
+TOGGLE 不能再标记为已修复，产品取舍待决定。
 
 ## 用户现象
 
@@ -51,10 +52,36 @@ ATVV v1.0 的通用 On-request 交互模型并不等于 RC003 已实现持续录
 普通 HTT 的 `AUDIO_START -> AUDIO -> AUDIO_STOP`，或主动开始后仍为零 PCM，
 就应把 RC003 正式能力收敛为 HOLD。
 
+## 2026-08-22 专项诊断实现
+
+新增隐藏入口 `--on-request-probe` 和便携启动脚本
+`Run-OnRequest-Probe.cmd`，只验证上述最后一条窄路径：
+
+1. 使用与正式桥接相同的单实例互斥锁，拒绝与后台桥接同时占用设备；
+2. 只协商 On-request，不启动 HID、宿主快捷键、PortAudio 或 VB-CABLE；
+3. 等待实体 `START_SEARCH` 后只发送一次 `MIC_OPEN`；
+4. 第二次有效 `START_SEARCH` 只发送一次 `MIC_CLOSE`；
+5. 最多观察 18 秒，只记录控制事件、PCM 批次/样本计数和相对时间，不保存
+   蓝牙地址、设备路径、语音样本或转写内容；
+6. 结果写入
+   `%LOCALAPPDATA%\RemoteMic\RC003\logs\on-request-probe-result.json`。
+
+成功判据不能只看总 PCM 或“超过一秒仍有声音”。只有设备先报告
+`AUDIO_START reason=MIC_OPEN, stream_id=0`，且该主机开麦会话自身在开始一秒
+后仍有 PCM，才分类为 `pcm_continued_past_1000ms`。普通 HOLD/HTT 长按产生的
+音频、主机开麦只有控制事件、开麦流提前停止以及无 `START_SEARCH` 均不能误判
+为成功。
+
+自动验证为 1171 项通过、7 项安全或平台条件跳过；公开边界扫描 276 个文件、
+`compileall`、`pip check` 和 `git diff --check` 通过。以上只证明探针实现和
+隐私/构建边界，真实 RC003 结果仍待用户运行便携诊断包后回传。
+
 ## 当前代码边界
 
 - 保留现有 TOGGLE 代码，避免在没有用户产品决策时擅自删除配置和迁移路径。
 - TOGGLE 必须标为实验/待验证，不能在变更记录、台账或候选说明中声称完成。
+- 专项探针是一次性能力判断工具，不属于设置界面或正式后台桥接功能；真机
+  结论形成后应按结果决定 TOGGLE 的去留，而不是长期扩展探针本身。
 - `BUG-016` 的音频停止排序修复仍然有效：它保护 RC003 已经真实发送的短音频，
   但不能解决固件不发送音频的主动会话。
 - 不新增 HTTP、URL Scheme、Quicker 深度集成或与本问题无关的语音状态机重写。

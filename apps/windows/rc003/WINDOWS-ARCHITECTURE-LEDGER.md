@@ -1,6 +1,6 @@
 # RC003 Windows 项目认知与构成原理总台账
 
-当前认知基线：2026-08-21，完整源码检查点 `eafd203`，统一按键/语音映射
+当前认知基线：2026-08-22，完整源码检查点 `eafd203`，统一按键/语音映射
 检查点 `eaabde8`，全局设置框架检查点 `addc2b0`，BLE 音频停止排序检查点
 `a189a1c`。
 
@@ -126,6 +126,7 @@ RC003 原本是面向电视/机顶盒的蓝牙语音遥控器。Windows 可以�
 | `--dry-run` | 模块导入检查 | 否 |
 | `--help` | 帮助文本 | 否 |
 | `--diagnose-ble-candidates <result>` | 隐藏的有界 BLE 诊断子进程 | 短暂持有 WinRT BLE 枚举资源 |
+| `--on-request-probe` | 隐藏的 RC003 On-request 能力探针 | 短暂独占 BLE；不启动 HID、快捷键或音频输出 |
 | `--rc003-hid-injector --pid ...` | 隐藏的受限注入子进程 | 短暂持有目标进程句柄 |
 
 源码运行使用 `python -m ovb_rc003`。PyInstaller 不直接分析包内
@@ -472,7 +473,9 @@ Frida Gadget 与 VB-CABLE 包都使用固定 URL/version/SHA-256。运行时仍�
 普通按键可在映射页识别、记事本映射有效、按住语音得到非零 PCM 和识别文字、
 F5 不再向输入框泄漏日期时间。TOGGLE 松开后持续 PCM 尚未证明，且已被上游
 同型号主动开麦零音频结果强烈反证；只剩 On-request 的实体
-`START_SEARCH -> MIC_OPEN` 窄路径待探针。最新代码检查点还需要复测 HOLD
+`START_SEARCH -> MIC_OPEN` 窄路径的隔离探针已完成自动验证，真机结果待回传。
+探针只把 `reason=MIC_OPEN, stream_id=0` 的会话自身持续 PCM 视为成功，避免
+普通长按 HOLD 制造假阳性。最新代码检查点还需要复测 HOLD
 短流尾音、断连重连、休眠恢复、长期运行、权限/杀软兼容和安装器升级/卸载。
 
 ## 16. 模块索引
@@ -490,7 +493,7 @@ F5 不再向输入框泄漏日期时间。TOGGLE 松开后持续 PCM 尚未证�
 | 豆包兼容 | `doubao_rpc.py` |
 | 配置/IPC | `config.py`、`key_detection_bridge.py`、`key_testing.py` |
 | 设置界面 | `qt_settings_app.py`、`settings_ui.py`、`qml/*.qml` |
-| 诊断/日志 | `windows_diagnostics.py`、`logging_setup.py`、顶层诊断脚本 |
+| 诊断/日志 | `windows_diagnostics.py`、`on_request_probe.py`、`logging_setup.py`、顶层诊断脚本 |
 | 资源/设备目录 | `resources.py`、`device_catalog.py`、`device-profiles/` |
 | 驱动帮助 | `vb_cable_bundle.py` |
 | 构建安装 | `build/`、`installer/`、Windows CI workflow |
