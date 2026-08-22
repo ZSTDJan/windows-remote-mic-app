@@ -42,7 +42,9 @@ RC003 的可靠原生行为是 HOLD，主动 `MIC_OPEN` 可能只有开始控制
 `bugs/BUG-014-toggle-reopen-f5-echo.md`、
 `bugs/BUG-015-sogou-codex-text-commit.md`、
 `bugs/BUG-016-audio-stop-overtakes-audio.md`、
-`bugs/BUG-017-toggle-firmware-audio-boundary.md` 和 `TESTING.md`。
+`bugs/BUG-017-toggle-firmware-audio-boundary.md`、
+`bugs/BUG-018-hold-hotkey-release-missing-audio-stop.md`、
+`bugs/BUG-019-stale-candidate-probe-hangs-instance.md` 和 `TESTING.md`。
 
 ### 界面
 
@@ -114,6 +116,10 @@ RC003 的可靠原生行为是 HOLD，主动 `MIC_OPEN` 可能只有开始控制
   配对数据库保留了两个不同 RC003 记录；精确删除隐藏 PnP 节点后系统扫描
   仍会重建。桥接现在只在多候选时逐个执行 UNCACHED ATVV 语音服务探测，
   恰好一个可用才连接；零个或多个可用仍失败关闭，不按名称或顺序猜测。
+- **旧蓝牙候选让专项检测长期占用后台**：Windows 蓝牙调用面对旧配对记录时
+  可能不响应取消，使原来的八秒超时失效。真实候选检查现改在独立守护线程中
+  运行，主循环按真实八秒截止并继续检查其他候选；同一失效候选不会反复创建
+  线程。占用提示也会区分后台桥接和上一次专项检测。
 - **切换模式仍像按住说话**：同一次实体麦克风按下会分别产生
   `AudioStarted`、legacy F5、HID 和 ATVV mic 事件，旧局部门闩会把后到
   来源当成第二次点击并立即 `MIC_CLOSE`。现在首个来源认领整轮手势，其他

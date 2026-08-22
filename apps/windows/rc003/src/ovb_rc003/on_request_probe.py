@@ -526,7 +526,10 @@ def _result_message(result: dict) -> str:
     elif outcome == "no_start_search":
         conclusion = "本次没有收到 START_SEARCH，请确认操作的是话筒键并重新测试。"
     elif outcome == "bridge_already_running":
-        conclusion = "后台桥接仍在运行。请先从通知区域退出桥接，再重新运行诊断。"
+        conclusion = (
+            "后台桥接或上一次专项检测仍在运行。请先从通知区域退出桥接；"
+            "如果刚运行过专项检测，请等它结束后再重试。"
+        )
     elif outcome == "f5_suppressor_unavailable":
         conclusion = "无法安全拦截遥控器的 F5，本次诊断已停止，没有执行能力判断。"
     else:

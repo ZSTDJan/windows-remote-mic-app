@@ -351,6 +351,7 @@ class EntrypointTests(unittest.TestCase):
         )
         self.assertEqual(result["outcome"], "bridge_already_running")
         self.assertEqual(len(notices), 1)
+        self.assertIn("上一次专项检测", notices[0][1])
         self.assertEqual(len(opened), 1)
 
     def test_f5_guard_start_failure_blocks_probe(self):

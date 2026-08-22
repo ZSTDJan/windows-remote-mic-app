@@ -33,6 +33,7 @@ import threading
 import time
 import unittest
 import uuid
+from unittest import mock
 
 from ovb_rc003 import atvv_protocol as proto
 from ovb_rc003 import atvv_session
@@ -41,6 +42,7 @@ from ovb_rc003.ble_transport_winrt import (
     NoReachableCandidateError,
     RC003BleSession,
     _candidate_has_voice_service,
+    _candidate_has_voice_service_with_hard_timeout,
     discover_candidates,
     select_connectable_candidate,
 )
@@ -183,6 +185,18 @@ class SelectConnectableCandidateTests(unittest.TestCase):
 
         self.assertIs(chosen, candidates[0])
 
+    def test_real_probe_timeout_does_not_block_later_reachable_candidate(self):
+        candidates = self._candidates()
+        with mock.patch(
+            "ovb_rc003.ble_transport_winrt."
+            "_candidate_has_voice_service_with_hard_timeout",
+            side_effect=[None, True],
+        ) as hard_probe:
+            chosen = _run(select_connectable_candidate(candidates))
+
+        self.assertIs(chosen, candidates[1])
+        self.assertEqual(hard_probe.call_count, 2)
+
     def test_multiple_reachable_voice_devices_remain_ambiguous(self):
         candidates = self._candidates()
 
@@ -222,6 +236,38 @@ class SelectConnectableCandidateTests(unittest.TestCase):
         )
         self.assertTrue(env.service.closed)
         self.assertTrue(env.device.closed)
+
+    def test_hard_timeout_does_not_wait_for_stuck_platform_coroutine(self):
+        release = threading.Event()
+        env = FakeWinRTEnvironment()
+        candidate = identity.RC003Candidate(
+            name=env.name,
+            hardware_match=False,
+            handle=env.discovered_info,
+        )
+        modules = env.build_winrt_modules()
+        original_from_id = modules.bluetooth_le_device.from_id_async
+
+        async def stuck_from_id(device_id):
+            while not release.is_set():
+                await asyncio.sleep(0.01)
+            return await original_from_id(device_id)
+
+        modules.bluetooth_le_device.from_id_async = stuck_from_id
+        started = time.monotonic()
+        try:
+            result = _run(
+                _candidate_has_voice_service_with_hard_timeout(
+                    candidate,
+                    winrt=modules,
+                    timeout=0.03,
+                )
+            )
+        finally:
+            release.set()
+
+        self.assertIsNone(result)
+        self.assertLess(time.monotonic() - started, 0.5)
 
     def test_real_probe_treats_unreachable_service_as_unavailable_and_closes(self):
         env = FakeWinRTEnvironment()

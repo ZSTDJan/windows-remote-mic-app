@@ -141,6 +141,17 @@ class WinRTModules:
     bluetooth_cache_mode: Any
 
 
+@dataclass(frozen=True)
+class _CandidateDeviceHandle:
+    """Thread-safe snapshot of the one WinRT field a probe needs."""
+
+    id: str
+
+
+_candidate_probe_threads_lock = threading.Lock()
+_candidate_probe_threads: dict[str, threading.Thread] = {}
+
+
 def _import_winrt() -> WinRTModules:
     try:
         from winrt.windows.devices.bluetooth import (
@@ -301,6 +312,83 @@ async def _candidate_has_voice_service(
     return reachable and cleanup_ok
 
 
+async def _candidate_has_voice_service_with_hard_timeout(
+    candidate: identity.RC003Candidate,
+    *,
+    winrt: Optional[WinRTModules],
+    timeout: float,
+) -> Optional[bool]:
+    """Probe without letting an uncancellable WinRT call hang the bridge.
+
+    A stale paired record can leave a Windows Bluetooth operation stuck even
+    after asyncio requests cancellation. Run that operation on a daemon
+    thread with its own event loop so the bridge can abandon it at the real
+    deadline. Only the device ID string crosses the thread boundary.
+    """
+
+    device_id = str(candidate.handle.id)
+    worker_candidate = identity.RC003Candidate(
+        name=candidate.name,
+        hardware_match=candidate.hardware_match,
+        handle=_CandidateDeviceHandle(device_id),
+    )
+    loop = asyncio.get_running_loop()
+    result_future = loop.create_future()
+
+    with _candidate_probe_threads_lock:
+        existing = _candidate_probe_threads.get(device_id)
+        if existing is not None and existing.is_alive():
+            return None
+
+        def worker() -> None:
+            try:
+                modules = winrt or _import_winrt()
+                result = bool(
+                    asyncio.run(
+                        _candidate_has_voice_service(worker_candidate, modules)
+                    )
+                )
+            except BaseException as exc:  # noqa: BLE001 - sanitized below
+                _logger.info(
+                    "ATVV candidate probe worker failed: error_type=%s",
+                    type(exc).__name__,
+                )
+                result = False
+            finally:
+                with _candidate_probe_threads_lock:
+                    current = _candidate_probe_threads.get(device_id)
+                    if current is threading.current_thread():
+                        _candidate_probe_threads.pop(device_id, None)
+
+            def publish_result() -> None:
+                if not result_future.done():
+                    result_future.set_result(result)
+
+            try:
+                loop.call_soon_threadsafe(publish_result)
+            except RuntimeError:
+                # The owning loop may already be closed during process exit.
+                pass
+
+        thread = threading.Thread(
+            target=worker,
+            name="rc003-candidate-probe",
+            daemon=True,
+        )
+        _candidate_probe_threads[device_id] = thread
+        thread.start()
+
+    try:
+        return bool(
+            await asyncio.wait_for(
+                result_future,
+                timeout=max(0.001, float(timeout)),
+            )
+        )
+    except TimeoutError:
+        return None
+
+
 async def select_connectable_candidate(
     candidates: Sequence[identity.RC003Candidate],
     *,
@@ -327,21 +415,30 @@ async def select_connectable_candidate(
         "multiple RC003 candidates: probing ATVV voice service count=%d",
         len(qualifying),
     )
-    if probe is None:
-        modules = winrt or _import_winrt()
-
-        async def probe(candidate: identity.RC003Candidate) -> bool:
-            return await _candidate_has_voice_service(candidate, modules)
+    isolated_default_probe = probe is None
 
     reachable = []
     for ordinal, candidate in enumerate(qualifying, start=1):
-        try:
-            available = await asyncio.wait_for(
-                probe(candidate),
-                timeout=max(0.001, float(probe_timeout)),
+        timed_out = False
+        if isolated_default_probe:
+            result = await _candidate_has_voice_service_with_hard_timeout(
+                candidate,
+                winrt=winrt,
+                timeout=probe_timeout,
             )
-        except TimeoutError:
-            available = False
+            timed_out = result is None
+            available = bool(result)
+        else:
+            try:
+                available = await asyncio.wait_for(
+                    probe(candidate),
+                    timeout=max(0.001, float(probe_timeout)),
+                )
+            except TimeoutError:
+                timed_out = True
+                available = False
+
+        if timed_out:
             _logger.info(
                 "ATVV candidate probe timed out: candidate=%d of %d",
                 ordinal,
