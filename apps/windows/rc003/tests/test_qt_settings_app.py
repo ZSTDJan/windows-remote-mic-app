@@ -2993,6 +2993,28 @@ class ButtonsPageMappingMatrixTests(unittest.TestCase):
                         header["width"], row["width"], delta=0.5
                     )
 
+                header_gestures = data["header_columns"]
+                row_gestures = data["row_columns"]
+                # Qt rounds layout geometry to device pixels. When the
+                # remaining width is not divisible by three, an equal share
+                # necessarily leaves one gesture column one pixel wider.
+                for left, right in (("single", "double"), ("double", "long")):
+                    with self.subTest(
+                        style=style,
+                        viewport=f"{width}x{height}",
+                        equal_columns=f"{left}/{right}",
+                    ):
+                        self.assertAlmostEqual(
+                            header_gestures[left]["width"],
+                            header_gestures[right]["width"],
+                            delta=1.0,
+                        )
+                        self.assertAlmostEqual(
+                            row_gestures[left]["width"],
+                            row_gestures[right]["width"],
+                            delta=1.0,
+                        )
+
 
 if __name__ == "__main__":
     unittest.main()

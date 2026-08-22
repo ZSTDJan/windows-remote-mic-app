@@ -11,7 +11,7 @@ Item {
     id: root
     property var tokens
     readonly property real mappingKeyColumnWidth: 118
-    readonly property real mappingSecondaryColumnWidth: 112
+    readonly property real mappingGestureColumnWeight: 1
     readonly property real mappingEditColumnWidth: 56
 
     function openShortcutRecorder(buttonId, rowIndex, trigger, voiceMode) {
@@ -542,6 +542,7 @@ Item {
                     RowLayout {
                         objectName: "mappingHeaderSingleColumn"
                         Layout.fillWidth: true
+                        Layout.preferredWidth: root.mappingGestureColumnWeight
                         Layout.minimumWidth: 0
                         spacing: tokens.spacingTiny
                         Rectangle {
@@ -561,9 +562,9 @@ Item {
                     }
                     Label {
                         objectName: "mappingHeaderDoubleColumn"
-                        Layout.preferredWidth: root.mappingSecondaryColumnWidth
-                        Layout.minimumWidth: root.mappingSecondaryColumnWidth
-                        Layout.maximumWidth: root.mappingSecondaryColumnWidth
+                        Layout.fillWidth: true
+                        Layout.preferredWidth: root.mappingGestureColumnWeight
+                        Layout.minimumWidth: 0
                         text: qsTr("双击")
                         color: tokens.textPrimary
                         font.pixelSize: tokens.fontSizeBody
@@ -572,9 +573,9 @@ Item {
                     }
                     Label {
                         objectName: "mappingHeaderLongColumn"
-                        Layout.preferredWidth: root.mappingSecondaryColumnWidth
-                        Layout.minimumWidth: root.mappingSecondaryColumnWidth
-                        Layout.maximumWidth: root.mappingSecondaryColumnWidth
+                        Layout.fillWidth: true
+                        Layout.preferredWidth: root.mappingGestureColumnWeight
+                        Layout.minimumWidth: 0
                         text: qsTr("长按")
                         color: tokens.textPrimary
                         font.pixelSize: tokens.fontSizeBody
@@ -706,6 +707,7 @@ Item {
                         RowLayout {
                             objectName: "mappingSingleCell_" + mappingRow.buttonId
                             Layout.fillWidth: true
+                            Layout.preferredWidth: root.mappingGestureColumnWeight
                             Layout.minimumWidth: 0
                             spacing: tokens.spacingTiny
                             Label {
@@ -731,9 +733,9 @@ Item {
 
                         Label {
                             objectName: "mappingDoubleCell_" + mappingRow.buttonId
-                            Layout.preferredWidth: root.mappingSecondaryColumnWidth
-                            Layout.minimumWidth: root.mappingSecondaryColumnWidth
-                            Layout.maximumWidth: root.mappingSecondaryColumnWidth
+                            Layout.fillWidth: true
+                            Layout.preferredWidth: root.mappingGestureColumnWeight
+                            Layout.minimumWidth: 0
                             text: mappingRow.primaryIsVoice
                                 ? qsTr("暂停") : mappingRow.doubleClickText
                             color: mappingRow.primaryIsVoice
@@ -746,9 +748,9 @@ Item {
 
                         Label {
                             objectName: "mappingLongCell_" + mappingRow.buttonId
-                            Layout.preferredWidth: root.mappingSecondaryColumnWidth
-                            Layout.minimumWidth: root.mappingSecondaryColumnWidth
-                            Layout.maximumWidth: root.mappingSecondaryColumnWidth
+                            Layout.fillWidth: true
+                            Layout.preferredWidth: root.mappingGestureColumnWeight
+                            Layout.minimumWidth: 0
                             text: mappingRow.primaryIsVoice
                                 ? qsTr("暂停") : mappingRow.longPressText
                             color: mappingRow.primaryIsVoice
