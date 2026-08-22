@@ -262,6 +262,58 @@ class RunProbeTests(unittest.IsolatedAsyncioTestCase):
 
 
 class EntrypointTests(unittest.TestCase):
+    def test_successful_probe_swallows_f5_for_the_full_probe_lifecycle(self):
+        lifecycle = []
+        notices = []
+        opened = []
+
+        class Guard:
+            def __enter__(self):
+                lifecycle.append("guard_enter")
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                lifecycle.append("guard_exit")
+                return False
+
+        class Suppressor:
+            def start(self):
+                lifecycle.append("f5_start")
+
+            def stop(self):
+                lifecycle.append("f5_stop")
+
+        def run_probe(show_notice):
+            lifecycle.append("probe")
+            show_notice("probe", "armed")
+            return on_request_probe._failure_result("no_start_search")
+
+        with tempfile.TemporaryDirectory() as directory:
+            original_path = on_request_probe.probe_result_path
+            on_request_probe.probe_result_path = (
+                lambda: Path(directory) / "result.json"
+            )
+            try:
+                exit_code = on_request_probe.main(
+                    show_notice=lambda title, message: notices.append(
+                        (title, message)
+                    ),
+                    open_result_directory=opened.append,
+                    guard_factory=Guard,
+                    f5_suppressor_factory=Suppressor,
+                    probe_runner=run_probe,
+                )
+            finally:
+                on_request_probe.probe_result_path = original_path
+
+        self.assertEqual(exit_code, on_request_probe.PROBE_COMPLETED_EXIT_CODE)
+        self.assertEqual(
+            lifecycle,
+            ["guard_enter", "f5_start", "probe", "f5_stop", "guard_exit"],
+        )
+        self.assertEqual(len(notices), 3)
+        self.assertEqual(len(opened), 1)
+
     def test_duplicate_bridge_writes_fresh_blocked_result(self):
         notices = []
         opened = []
@@ -299,6 +351,56 @@ class EntrypointTests(unittest.TestCase):
         )
         self.assertEqual(result["outcome"], "bridge_already_running")
         self.assertEqual(len(notices), 1)
+        self.assertEqual(len(opened), 1)
+
+    def test_f5_guard_start_failure_blocks_probe(self):
+        notices = []
+        opened = []
+        probe_calls = []
+
+        class Guard:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        class Suppressor:
+            def start(self):
+                raise on_request_probe.legacy_key_suppressor_windows.LegacyKeySuppressorUnavailableError(
+                    "simulated hook failure"
+                )
+
+            def stop(self):
+                raise AssertionError("an unstarted guard must not be stopped")
+
+        with tempfile.TemporaryDirectory() as directory:
+            original_path = on_request_probe.probe_result_path
+            on_request_probe.probe_result_path = (
+                lambda: Path(directory) / "result.json"
+            )
+            try:
+                exit_code = on_request_probe.main(
+                    show_notice=lambda title, message: notices.append(
+                        (title, message)
+                    ),
+                    open_result_directory=opened.append,
+                    guard_factory=Guard,
+                    f5_suppressor_factory=Suppressor,
+                    probe_runner=lambda _show_notice: probe_calls.append(1),
+                )
+            finally:
+                on_request_probe.probe_result_path = original_path
+
+            result = json.loads(
+                (Path(directory) / "result.json").read_text("utf-8")
+            )
+
+        self.assertEqual(exit_code, on_request_probe.PROBE_FAILED_EXIT_CODE)
+        self.assertEqual(result["outcome"], "f5_suppressor_unavailable")
+        self.assertEqual(probe_calls, [])
+        self.assertEqual(len(notices), 1)
+        self.assertIn("没有执行能力判断", notices[0][1])
         self.assertEqual(len(opened), 1)
 
 

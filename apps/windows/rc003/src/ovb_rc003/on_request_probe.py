@@ -2,9 +2,11 @@
 
 This diagnostic is deliberately separate from the production bridge. It
 does not start HID capture, inject a host shortcut, open PortAudio, or write
-decoded voice content. It negotiates ATVV On-request only, waits for the
-physical remote to send START_SEARCH, replies with MIC_OPEN, and records
-privacy-safe control/PCM counts in the normal log directory.
+decoded voice content. A narrow low-level guard swallows the RC003 microphone
+button's legacy F5 leak while the probe is running. The probe negotiates ATVV
+On-request only, waits for the physical remote to send START_SEARCH, replies
+with MIC_OPEN, and records privacy-safe control/PCM counts in the normal log
+directory.
 """
 
 from __future__ import annotations
@@ -26,6 +28,7 @@ from . import atvv_protocol as proto
 from . import atvv_session
 from . import ble_transport_winrt
 from . import identity
+from . import legacy_key_suppressor_windows
 from . import logging_setup
 from . import single_instance
 
@@ -52,6 +55,8 @@ class ProbeAction(Enum):
 
 
 ClockFn = Callable[[], float]
+NoticeFn = Callable[[str, str], None]
+ProbeRunner = Callable[[NoticeFn], dict]
 
 
 @dataclass
@@ -319,6 +324,18 @@ def _open_result_directory(path: Path) -> None:
         startfile(str(path.parent))
 
 
+def _run_probe_sync(show_notice: NoticeFn) -> dict:
+    return asyncio.run(run_probe(show_notice=show_notice))
+
+
+def _create_f5_suppressor() -> legacy_key_suppressor_windows.LegacyKeySuppressor:
+    # The probe has no HID report tap, so the remote's microphone key would
+    # otherwise reach the foreground app as F5 (Notepad inserts the current
+    # date/time). The guard is intentionally active only for this short-lived
+    # diagnostic and never replaces F5 with another host shortcut.
+    return legacy_key_suppressor_windows.LegacyKeySuppressor({0x74})
+
+
 async def run_probe(
     *,
     show_notice: Callable[[str, str], None] = _show_notice,
@@ -510,6 +527,8 @@ def _result_message(result: dict) -> str:
         conclusion = "本次没有收到 START_SEARCH，请确认操作的是话筒键并重新测试。"
     elif outcome == "bridge_already_running":
         conclusion = "后台桥接仍在运行。请先从通知区域退出桥接，再重新运行诊断。"
+    elif outcome == "f5_suppressor_unavailable":
+        conclusion = "无法安全拦截遥控器的 F5，本次诊断已停止，没有执行能力判断。"
     else:
         conclusion = "诊断未完整结束，请把结果文件和 app.log 一起回传。"
     return (
@@ -520,26 +539,39 @@ def _result_message(result: dict) -> str:
 
 def main(
     *,
-    show_notice: Callable[[str, str], None] = _show_notice,
+    show_notice: NoticeFn = _show_notice,
     open_result_directory: Callable[[Path], None] = _open_result_directory,
     guard_factory: Callable[[], object] = single_instance.BridgeInstanceGuard,
+    f5_suppressor_factory: Callable[[], object] = _create_f5_suppressor,
+    probe_runner: ProbeRunner = _run_probe_sync,
 ) -> int:
     logger = logging_setup.get_logger().getChild("on_request_probe")
     result: Optional[dict] = None
     exit_code = PROBE_COMPLETED_EXIT_CODE
     try:
         with guard_factory():
-            show_notice(
-                _TITLE,
-                "这是 RC003 最后一条开关型语音能力诊断。\n\n"
-                "请先从通知区域退出正在运行的 Remote Mic 桥接。"
-                "\n诊断不会触发输入法快捷键，也不会使用 VB-CABLE。\n\n"
-                "点击“确定”后程序会连接遥控器。",
-            )
-            result = asyncio.run(run_probe(show_notice=show_notice))
+            f5_suppressor = f5_suppressor_factory()
+            f5_suppressor.start()
+            logger.info("on-request probe legacy F5 guard enabled")
+            try:
+                show_notice(
+                    _TITLE,
+                    "这是 RC003 最后一条开关型语音能力诊断。\n\n"
+                    "请先从通知区域退出正在运行的 Remote Mic 桥接。"
+                    "\n诊断期间会拦截遥控器泄漏的 F5，不会向输入框写入日期。"
+                    "\n诊断不会触发输入法快捷键，也不会使用 VB-CABLE。\n\n"
+                    "点击“确定”后程序会连接遥控器。",
+                )
+                result = probe_runner(show_notice)
+            finally:
+                f5_suppressor.stop()
+                logger.info("on-request probe legacy F5 guard stopped")
     except single_instance.DuplicateInstanceError:
         result = _failure_result("bridge_already_running")
         exit_code = PROBE_BLOCKED_EXIT_CODE
+    except legacy_key_suppressor_windows.LegacyKeySuppressorUnavailableError as exc:
+        result = _failure_result("f5_suppressor_unavailable", type(exc).__name__)
+        exit_code = PROBE_FAILED_EXIT_CODE
     except single_instance.SingleInstanceUnavailableError as exc:
         result = _failure_result(
             "single_instance_unavailable",
