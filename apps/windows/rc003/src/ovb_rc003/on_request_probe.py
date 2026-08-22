@@ -40,12 +40,14 @@ PROBE_TIMEOUT_SECONDS = 18.0
 SECOND_PRESS_MIN_SECONDS = 0.75
 SUSTAINED_PCM_THRESHOLD_SECONDS = 1.0
 FINAL_DRAIN_SECONDS = 1.0
+STARTUP_HARD_TIMEOUT_SECONDS = 32.0
+POST_READY_HARD_TIMEOUT_SECONDS = 25.0
 
 PROBE_COMPLETED_EXIT_CODE = 0
 PROBE_BLOCKED_EXIT_CODE = 21
 PROBE_FAILED_EXIT_CODE = 22
 
-_TITLE = "Remote Mic RC003 On-request 诊断"
+_TITLE = "Remote Mic RC003 开关型语音诊断"
 
 
 class ProbeAction(Enum):
@@ -57,6 +59,14 @@ class ProbeAction(Enum):
 ClockFn = Callable[[], float]
 NoticeFn = Callable[[str, str], None]
 ProbeRunner = Callable[[NoticeFn], dict]
+
+
+class ProbeStartupTimeoutError(TimeoutError):
+    """The probe did not reach the ready notice before the hard deadline."""
+
+
+class ProbeCompletionTimeoutError(TimeoutError):
+    """The probe did not finish after its ready notice was dismissed."""
 
 
 @dataclass
@@ -328,6 +338,95 @@ def _run_probe_sync(show_notice: NoticeFn) -> dict:
     return asyncio.run(run_probe(show_notice=show_notice))
 
 
+def _run_probe_with_hard_deadlines(
+    probe_runner: ProbeRunner,
+    show_notice: NoticeFn,
+    *,
+    startup_timeout: float,
+    post_ready_timeout: float,
+) -> dict:
+    """Run the probe without letting an uncooperative WinRT call own main."""
+
+    logger = logging_setup.get_logger().getChild("on_request_probe")
+    finished = threading.Event()
+    ready_notice_started = threading.Event()
+    ready_notice_returned = threading.Event()
+    expired = threading.Event()
+    outcome: dict[str, object] = {}
+
+    def supervised_notice(title: str, message: str) -> None:
+        if expired.is_set():
+            return
+        ready_notice_started.set()
+        if expired.is_set():
+            return
+        try:
+            show_notice(title, message)
+        finally:
+            ready_notice_returned.set()
+
+    def worker() -> None:
+        try:
+            outcome["result"] = probe_runner(supervised_notice)
+        except BaseException as exc:  # noqa: BLE001 - re-raised on main thread
+            outcome["error"] = exc
+        finally:
+            finished.set()
+
+    thread = threading.Thread(
+        target=worker,
+        name="rc003-on-request-probe",
+        daemon=True,
+    )
+    thread.start()
+
+    startup_deadline = time.monotonic() + max(0.0, startup_timeout)
+    while not finished.is_set() and not ready_notice_started.is_set():
+        remaining = startup_deadline - time.monotonic()
+        if remaining <= 0:
+            expired.set()
+            logger.info(
+                "on-request probe hard timeout: phase=startup timeout=%.3fs",
+                startup_timeout,
+            )
+            raise ProbeStartupTimeoutError("probe startup hard timeout")
+        finished.wait(min(remaining, 0.05))
+
+    if finished.is_set():
+        error = outcome.get("error")
+        if isinstance(error, BaseException):
+            raise error
+        return outcome["result"]  # type: ignore[return-value]
+
+    # The ready notice is intentionally user-controlled. The completion
+    # deadline starts only after the user dismisses that notice.
+    while not finished.is_set() and not ready_notice_returned.is_set():
+        finished.wait(0.05)
+
+    if finished.is_set():
+        error = outcome.get("error")
+        if isinstance(error, BaseException):
+            raise error
+        return outcome["result"]  # type: ignore[return-value]
+
+    completion_deadline = time.monotonic() + max(0.0, post_ready_timeout)
+    remaining = completion_deadline - time.monotonic()
+    if remaining > 0:
+        finished.wait(remaining)
+    if not finished.is_set():
+        expired.set()
+        logger.info(
+            "on-request probe hard timeout: phase=completion timeout=%.3fs",
+            post_ready_timeout,
+        )
+        raise ProbeCompletionTimeoutError("probe completion hard timeout")
+
+    error = outcome.get("error")
+    if isinstance(error, BaseException):
+        raise error
+    return outcome["result"]  # type: ignore[return-value]
+
+
 def _create_f5_suppressor() -> legacy_key_suppressor_windows.LegacyKeySuppressor:
     # The probe has no HID report tap, so the remote's microphone key would
     # otherwise reach the foreground app as F5 (Notepad inserts the current
@@ -461,7 +560,7 @@ async def run_probe(
 
         show_notice(
             _TITLE,
-            "连接与 On-request 协商已经完成。\n\n"
+            "连接与开关型语音协商已经完成。\n\n"
             "点击“确定”后，请严格按下面步骤操作：\n"
             "1. 短按一次话筒键并立即松开，不要长按；\n"
             "2. 松开后马上连续说话约 3 秒；\n"
@@ -515,7 +614,7 @@ def _failure_result(outcome: str, error_type: Optional[str] = None) -> dict:
 def _result_message(result: dict) -> str:
     outcome = result.get("outcome")
     if outcome == "pcm_continued_past_1000ms":
-        conclusion = "检测到短按后超过 1 秒仍有真实 PCM，这条协议路径值得继续开发。"
+        conclusion = "检测到短按后超过 1 秒仍有真实语音数据，这种方式值得继续开发。"
     elif outcome in {
         "control_only_no_pcm",
         "pcm_did_not_continue_past_1000ms",
@@ -524,18 +623,32 @@ def _result_message(result: dict) -> str:
     }:
         conclusion = "没有检测到短按后持续语音，结果支持 RC003 只正式保留按住说话。"
     elif outcome == "no_start_search":
-        conclusion = "本次没有收到 START_SEARCH，请确认操作的是话筒键并重新测试。"
+        conclusion = "本次没有收到话筒启动信号，请确认操作的是话筒键并重新测试。"
     elif outcome == "bridge_already_running":
         conclusion = (
             "后台桥接或上一次专项检测仍在运行。请先从通知区域退出桥接；"
             "如果刚运行过专项检测，请等它结束后再重试。"
         )
     elif outcome == "f5_suppressor_unavailable":
-        conclusion = "无法安全拦截遥控器的 F5，本次诊断已停止，没有执行能力判断。"
+        conclusion = (
+            "无法安全拦截遥控器话筒按钮误发的日期按键，"
+            "本次诊断已停止，没有执行能力判断。"
+        )
+    elif outcome == "startup_timeout":
+        conclusion = (
+            f"连接遥控器超过 {STARTUP_HARD_TIMEOUT_SECONDS:g} 秒仍未完成。"
+            "本次诊断已自动结束，"
+            "按键拦截和后台占用已经释放。"
+        )
+    elif outcome == "completion_timeout":
+        conclusion = (
+            "按键测试结束后程序未能正常收尾。本次诊断已强制结束，"
+            "按键拦截和后台占用已经释放。"
+        )
     else:
         conclusion = "诊断未完整结束，请把结果文件和 app.log 一起回传。"
     return (
-        f"{conclusion}\n\n结果：{outcome}\n"
+        f"{conclusion}\n\n"
         "日志文件夹将自动打开，请回传 on-request-probe-result.json 和 app.log。"
     )
 
@@ -547,6 +660,8 @@ def main(
     guard_factory: Callable[[], object] = single_instance.BridgeInstanceGuard,
     f5_suppressor_factory: Callable[[], object] = _create_f5_suppressor,
     probe_runner: ProbeRunner = _run_probe_sync,
+    startup_hard_timeout: float = STARTUP_HARD_TIMEOUT_SECONDS,
+    post_ready_hard_timeout: float = POST_READY_HARD_TIMEOUT_SECONDS,
 ) -> int:
     logger = logging_setup.get_logger().getChild("on_request_probe")
     result: Optional[dict] = None
@@ -560,12 +675,19 @@ def main(
                 show_notice(
                     _TITLE,
                     "这是 RC003 最后一条开关型语音能力诊断。\n\n"
-                    "请先从通知区域退出正在运行的 Remote Mic 桥接。"
-                    "\n诊断期间会拦截遥控器泄漏的 F5，不会向输入框写入日期。"
-                    "\n诊断不会触发输入法快捷键，也不会使用 VB-CABLE。\n\n"
-                    "点击“确定”后程序会连接遥控器。",
+                    "请先从通知区域退出正在运行的后台桥接。"
+                    "\n诊断期间会拦截遥控器话筒按钮误发的日期按键，不会向输入框写入日期。"
+                    "\n诊断不会触发输入法快捷键，也不会使用虚拟声卡。\n\n"
+                    "点击“确定”后程序会连接遥控器。"
+                    f"连接最长等待 {STARTUP_HARD_TIMEOUT_SECONDS:g} 秒，"
+                    "超时会自动结束并释放后台。",
                 )
-                result = probe_runner(show_notice)
+                result = _run_probe_with_hard_deadlines(
+                    probe_runner,
+                    show_notice,
+                    startup_timeout=startup_hard_timeout,
+                    post_ready_timeout=post_ready_hard_timeout,
+                )
             finally:
                 f5_suppressor.stop()
                 logger.info("on-request probe legacy F5 guard stopped")
@@ -598,6 +720,12 @@ def main(
             "no_reachable_candidate",
             type(exc).__name__,
         )
+        exit_code = PROBE_FAILED_EXIT_CODE
+    except ProbeStartupTimeoutError:
+        result = _failure_result("startup_timeout")
+        exit_code = PROBE_FAILED_EXIT_CODE
+    except ProbeCompletionTimeoutError:
+        result = _failure_result("completion_timeout")
         exit_code = PROBE_FAILED_EXIT_CODE
     except Exception as exc:  # noqa: BLE001 - visible, sanitized failure
         logger.info(

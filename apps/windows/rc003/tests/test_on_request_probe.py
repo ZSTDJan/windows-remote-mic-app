@@ -2,6 +2,8 @@ import asyncio
 import json
 from pathlib import Path
 import tempfile
+import threading
+import time
 import unittest
 
 from ovb_rc003 import atvv_protocol as proto
@@ -402,6 +404,144 @@ class EntrypointTests(unittest.TestCase):
         self.assertEqual(probe_calls, [])
         self.assertEqual(len(notices), 1)
         self.assertIn("没有执行能力判断", notices[0][1])
+        self.assertEqual(len(opened), 1)
+
+    def test_stuck_startup_releases_guard_and_writes_timeout_result(self):
+        lifecycle = []
+        notices = []
+        opened = []
+        release_worker = threading.Event()
+
+        class Guard:
+            def __enter__(self):
+                lifecycle.append("guard_enter")
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                lifecycle.append("guard_exit")
+                return False
+
+        class Suppressor:
+            def start(self):
+                lifecycle.append("f5_start")
+
+            def stop(self):
+                lifecycle.append("f5_stop")
+
+        late_worker_finished = threading.Event()
+
+        def stuck_probe(show_notice):
+            lifecycle.append("probe_start")
+            release_worker.wait(5.0)
+            show_notice("late", "late ready notice")
+            late_worker_finished.set()
+            return on_request_probe._failure_result("late_result")
+
+        with tempfile.TemporaryDirectory() as directory:
+            original_path = on_request_probe.probe_result_path
+            result_path = Path(directory) / "result.json"
+            on_request_probe.probe_result_path = lambda: result_path
+            started = time.monotonic()
+            try:
+                exit_code = on_request_probe.main(
+                    show_notice=lambda title, message: notices.append(
+                        (title, message)
+                    ),
+                    open_result_directory=opened.append,
+                    guard_factory=Guard,
+                    f5_suppressor_factory=Suppressor,
+                    probe_runner=stuck_probe,
+                    startup_hard_timeout=0.05,
+                )
+                elapsed = time.monotonic() - started
+                result = json.loads(result_path.read_text("utf-8"))
+            finally:
+                release_worker.set()
+                late_worker_finished.wait(1.0)
+                on_request_probe.probe_result_path = original_path
+
+        self.assertLess(elapsed, 1.0)
+        self.assertEqual(exit_code, on_request_probe.PROBE_FAILED_EXIT_CODE)
+        self.assertEqual(result["outcome"], "startup_timeout")
+        self.assertEqual(
+            lifecycle,
+            [
+                "guard_enter",
+                "f5_start",
+                "probe_start",
+                "f5_stop",
+                "guard_exit",
+            ],
+        )
+        self.assertIn("后台占用已经释放", notices[-1][1])
+        self.assertEqual(len(notices), 2)
+        self.assertEqual(len(opened), 1)
+
+    def test_stuck_completion_releases_guard_and_writes_timeout_result(self):
+        lifecycle = []
+        notices = []
+        opened = []
+        release_worker = threading.Event()
+
+        class Guard:
+            def __enter__(self):
+                lifecycle.append("guard_enter")
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                lifecycle.append("guard_exit")
+                return False
+
+        class Suppressor:
+            def start(self):
+                lifecycle.append("f5_start")
+
+            def stop(self):
+                lifecycle.append("f5_stop")
+
+        def stuck_probe(show_notice):
+            show_notice("ready", "ready")
+            lifecycle.append("probe_ready")
+            release_worker.wait(5.0)
+            return on_request_probe._failure_result("late_result")
+
+        with tempfile.TemporaryDirectory() as directory:
+            original_path = on_request_probe.probe_result_path
+            result_path = Path(directory) / "result.json"
+            on_request_probe.probe_result_path = lambda: result_path
+            started = time.monotonic()
+            try:
+                exit_code = on_request_probe.main(
+                    show_notice=lambda title, message: notices.append(
+                        (title, message)
+                    ),
+                    open_result_directory=opened.append,
+                    guard_factory=Guard,
+                    f5_suppressor_factory=Suppressor,
+                    probe_runner=stuck_probe,
+                    startup_hard_timeout=0.05,
+                    post_ready_hard_timeout=0.05,
+                )
+                elapsed = time.monotonic() - started
+                result = json.loads(result_path.read_text("utf-8"))
+            finally:
+                release_worker.set()
+                on_request_probe.probe_result_path = original_path
+
+        self.assertLess(elapsed, 1.0)
+        self.assertEqual(exit_code, on_request_probe.PROBE_FAILED_EXIT_CODE)
+        self.assertEqual(result["outcome"], "completion_timeout")
+        self.assertEqual(
+            lifecycle,
+            [
+                "guard_enter",
+                "f5_start",
+                "probe_ready",
+                "f5_stop",
+                "guard_exit",
+            ],
+        )
+        self.assertIn("后台占用已经释放", notices[-1][1])
         self.assertEqual(len(opened), 1)
 
 
