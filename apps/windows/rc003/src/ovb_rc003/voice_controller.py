@@ -14,9 +14,9 @@ Semantics:
   inactive. The device's AUDIO_STOP caused by releasing either short press
   does not change that logical state. app.py owns the corresponding
   MIC_OPEN/MIC_CLOSE writes that keep device audio aligned with it.
-- HOLD mode still holds the key down for the duration of the stream:
-  key-down on mic-button-press, key-up when the device's own AUDIO_STOP
-  arrives.
+- HOLD mode holds the key down while the physical button is held:
+  key-down on mic-button-press, key-up on physical release. The device's
+  AUDIO_STOP remains a fallback for machines that expose no release edge.
 - Both modes' cleanup is provable: reset() always reports whether a
   closing action (KEY_UP for HOLD, TAP for TOGGLE) is still owed, and
   never leaves the controller thinking a session is still active.
@@ -72,17 +72,26 @@ class VoiceController:
     def on_audio_stopped(self) -> Optional[VoiceHostAction]:
         """React to the device's own AUDIO_STOP control opcode.
 
-        HOLD mode releases the key the moment the device stops streaming.
+        HOLD mode uses this as a fallback release when Windows did not expose
+        the physical button-up edge.
         TOGGLE mode deliberately leaves its logical session unchanged. A
         short physical press ends the device's autonomous stream, but the
         application reopens it while the toggle remains active.
         """
 
-        if self.trigger_mode == VoiceTriggerMode.HOLD:
-            if self._holding:
-                self._holding = False
-                return VoiceHostAction.KEY_UP
-            return None
+        return self.on_mic_button_released()
+
+    def on_mic_button_released(self) -> Optional[VoiceHostAction]:
+        """Release an outstanding HOLD shortcut on the physical button-up.
+
+        Releasing here prevents Ctrl/Alt/Win from remaining logically down if
+        the BLE control channel never reports AUDIO_STOP. Repeating the call
+        from a later AUDIO_STOP is harmless and produces no second key-up.
+        """
+
+        if self.trigger_mode == VoiceTriggerMode.HOLD and self._holding:
+            self._holding = False
+            return VoiceHostAction.KEY_UP
         return None
 
     def reset(self) -> Optional[VoiceHostAction]:

@@ -1293,7 +1293,7 @@ class MappedVoiceButtonTests(_AppWiringTestCase):
         self.app._on_control_event(AudioStopped())
         self.assertIsNone(self.app._mapped_voice_button_id)
 
-    def test_non_mic_hold_release_closes_then_audio_stop_releases_hotkey(self):
+    def test_non_mic_hold_release_releases_hotkey_then_closes_audio(self):
         self._set_voice_mapping("up", key_mapping.VoiceTriggerMode.HOLD)
         calls = []
         with mock.patch.object(
@@ -1307,13 +1307,65 @@ class MappedVoiceButtonTests(_AppWiringTestCase):
         ):
             self.app._on_button_event("up", True)
             self.app._on_button_event("up", False)
-            self.assertEqual(calls, [("down", ("ralt",))])
+            self.assertEqual(
+                calls,
+                [("down", ("ralt",)), ("up", ("ralt",))],
+            )
             self.assertEqual(self.app._ble_session.mic_close_calls, 1)
             self.app._on_control_event(AudioStopped())
 
         self.assertEqual(calls, [("down", ("ralt",)), ("up", ("ralt",))])
         self.assertFalse(self.app._voice.active)
         self.assertIsNone(self.app._mapped_voice_button_id)
+
+    def test_physical_mic_hold_release_does_not_require_audio_stop(self):
+        self._set_voice_mapping("mic", key_mapping.VoiceTriggerMode.HOLD)
+        self.app._voice.trigger_mode = key_mapping.VoiceTriggerMode.HOLD
+        calls = []
+
+        with mock.patch.object(
+            win32_input,
+            "send_voice_key_combo_down",
+            side_effect=lambda tokens: calls.append(("down", tokens)),
+        ), mock.patch.object(
+            win32_input,
+            "send_voice_key_combo_up",
+            side_effect=lambda tokens: calls.append(("up", tokens)),
+        ):
+            self.app._on_button_event("mic", True, event_source="legacy_f5")
+            self.app._on_button_event("mic", False, event_source="legacy_f5")
+
+            self.assertEqual(
+                calls,
+                [("down", ("ralt",)), ("up", ("ralt",))],
+            )
+            self.assertFalse(self.app._voice.active)
+            self.assertFalse(self.app._voice_raw_input_trigger_pending)
+            self.assertFalse(self.app._voice_pcm_forwarding_enabled)
+
+            self.app._on_control_event(AudioStopped())
+
+        self.assertEqual(
+            calls,
+            [("down", ("ralt",)), ("up", ("ralt",))],
+        )
+
+    def test_physical_mic_hold_release_failure_retains_state_and_reconnects(self):
+        self._set_voice_mapping("mic", key_mapping.VoiceTriggerMode.HOLD)
+        self.app._voice.trigger_mode = key_mapping.VoiceTriggerMode.HOLD
+        reconnects = []
+        self.app._supervisor.request_reconnect = lambda: reconnects.append(1)
+
+        with mock.patch.object(win32_input, "send_voice_key_combo_down"), mock.patch.object(
+            win32_input,
+            "send_voice_key_combo_up",
+            side_effect=OSError("simulated key-up failure"),
+        ):
+            self.app._on_button_event("mic", True, event_source="legacy_f5")
+            self.app._on_button_event("mic", False, event_source="legacy_f5")
+
+        self.assertTrue(self.app._voice.holding)
+        self.assertEqual(reconnects, [1])
 
     def test_non_mic_voice_duplicate_down_is_collapsed(self):
         self._set_voice_mapping("up", key_mapping.VoiceTriggerMode.TOGGLE)

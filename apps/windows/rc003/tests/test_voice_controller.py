@@ -80,6 +80,16 @@ class HoldModeTests(unittest.TestCase):
         self.assertEqual(controller.on_audio_stopped(), VoiceHostAction.KEY_UP)
         self.assertFalse(controller.holding)
 
+    def test_physical_release_releases_key_before_audio_stop(self):
+        controller = VoiceController(VoiceTriggerMode.HOLD)
+        controller.on_mic_button_pressed()
+
+        self.assertEqual(
+            controller.on_mic_button_released(), VoiceHostAction.KEY_UP
+        )
+        self.assertFalse(controller.active)
+        self.assertIsNone(controller.on_audio_stopped())
+
     def test_audio_stopped_without_a_prior_press_does_nothing(self):
         controller = VoiceController(VoiceTriggerMode.HOLD)
         self.assertIsNone(controller.on_audio_stopped())

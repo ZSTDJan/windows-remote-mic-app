@@ -808,6 +808,28 @@ class RC003App:
         self._voice_mic_gesture_physical_seen = False
         self._voice_mic_gesture_sources_down.clear()
 
+    def _release_hold_voice_on_physical_release_locked(self, reason: str) -> bool:
+        """Release HOLD shortcuts without depending solely on AUDIO_STOP."""
+
+        action = self._voice.on_mic_button_released()
+        if action is None:
+            return True
+        self._voice_raw_input_trigger_pending = False
+        self._voice_audio_start_fallback_pending = False
+        self._voice_pcm_forwarding_enabled = False
+        if self._apply_voice_action(action):
+            self._logger.info("voice hold hotkey released on %s", reason)
+            return True
+
+        self._voice.restore_pending(action)
+        self._logger.info(
+            "voice hold hotkey release failed on %s; state retained, "
+            "requesting reconnect",
+            reason,
+        )
+        self._supervisor.request_reconnect()
+        return False
+
     def _cancel_voice_toggle_reopen_locked(self, reason: str = "") -> None:
         was_pending = self._voice_toggle_reopen_pending
         self._voice_toggle_reopen_pending = False
@@ -1506,6 +1528,9 @@ class RC003App:
             ):
                 self._mapped_voice_release_requested = True
                 self._voice_pcm_forwarding_enabled = False
+                self._release_hold_voice_on_physical_release_locked(
+                    f"mapped button release ({button_id})"
+                )
                 if self._ble_session is None:
                     self._logger.info(
                         "hold voice release has no BLE session; requesting reconnect"
@@ -1671,6 +1696,14 @@ class RC003App:
             if not is_pressed:
                 with self._voice_trigger_lock:
                     self._voice_mic_gesture_sources_down.discard(event_source)
+                    if (
+                        self._voice.trigger_mode
+                        == key_mapping.VoiceTriggerMode.HOLD
+                        and not self._voice_mic_gesture_sources_down
+                    ):
+                        self._release_hold_voice_on_physical_release_locked(
+                            "physical mic release"
+                        )
                     if (
                         self._voice_toggle_reopen_pending
                         and not self._voice_mic_gesture_sources_down
