@@ -643,9 +643,20 @@ HID 注入权限顺序与稳定失败提交：
 - 本地冻结目录：`dist/RemoteMicRC003/`；EXE 大小 5,064,340 字节，SHA-256
   为 `8144ABCF86298D81E49AC641AB0FB174466695353C21A8B116B34B4687EA96B1`。
   冻结 `--dry-run`、`--help` 均退出 0，检查后无残留进程。
+- 本次可交付便携目录为仓库同级
+  `RemoteMicRC003-0.1.0-candidate-20260822-holdrelease2/`，共 2072 个文件；
+  其中 2062 个冻结运行时文件与 `dist/RemoteMicRC003/` 逐文件 SHA-256
+  一致，包内关键文件校验清单通过。
+- 可交付 ZIP 为
+  `RemoteMicRC003-0.1.0-candidate-20260822-holdrelease2-portable.zip`，大小
+  127,323,390 字节，SHA-256 为
+  `22627B9E40D6008D1E94AAE89821B5AD938965623DF2E4185DD3BA608BA7C407`；
+  ZIP 只有一个版本顶层目录，2072 个文件与便携目录逐项一致，中文说明文件名
+  正常。此前用系统 `tar` 产生的 `holdrelease1-portable.zip` 中文文件名乱码，
+  只属于失败的中间产物，不得交付。
 - 详细证据：`bugs/BUG-018-hold-hotkey-release-missing-audio-stop.md`。
-- 状态：本地 EXE 检查点待 RC003 真机复测；当前 `matrix1-portable` ZIP 未
-  更新，不能宣称已包含本修复。
+- 状态：`holdrelease2-portable` 包含本修复并等待 RC003 真机复测；旧的
+  `matrix1-portable` 不包含本修复。
 
 ## 维护纪律
 
