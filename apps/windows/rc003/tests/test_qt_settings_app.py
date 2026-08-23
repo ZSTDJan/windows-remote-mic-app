@@ -436,6 +436,24 @@ class SettingsControllerTests(unittest.TestCase):
     def test_launch_status_starts_as_the_not_started_constant(self):
         controller, _ = self._make_controller()
         self.assertEqual(controller.launchStatusText, settings_ui.LAUNCH_NOT_STARTED_TEXT)
+        self.assertFalse(controller.bridgeRunning)
+
+    def test_launch_status_recognizes_an_existing_bridge(self):
+        self._bridge_status_patch.stop()
+        self._bridge_status_patch = mock.patch.object(
+            qt_settings_app.single_instance,
+            "bridge_instance_running",
+            return_value=True,
+        )
+        self._bridge_status_patch.start()
+
+        controller, _ = self._make_controller()
+
+        self.assertTrue(controller.bridgeRunning)
+        self.assertEqual(
+            controller.launchStatusText,
+            settings_ui.LAUNCH_ALREADY_RUNNING_TEXT,
+        )
 
     def test_unsupported_saved_wdmks_endpoint_preselects_preferred_cable_input(self):
         saved = config.default_config()
@@ -731,8 +749,24 @@ class SettingsControllerTests(unittest.TestCase):
         )
         with mock.patch.object(bridge_launcher, "launch_bridge", return_value=fake_result):
             controller.saveAndLaunch()
+        self.assertTrue(controller.bridgeRunning)
         self.assertIn("4321", controller.launchStatusText)
+        self.assertIn("约一分钟", controller.launchStatusText)
         self.assertNotIn("已连接", controller.launchStatusText)
+
+    def test_failed_launch_keeps_the_bridge_warning_active(self):
+        controller, _ = self._make_controller()
+        fake_result = bridge_launcher.LaunchResult(
+            outcome=bridge_launcher.LaunchOutcome.LAUNCH_FAILED,
+            command=("exe",),
+            error="missing executable",
+        )
+
+        with mock.patch.object(bridge_launcher, "launch_bridge", return_value=fake_result):
+            controller.saveAndLaunch()
+
+        self.assertFalse(controller.bridgeRunning)
+        self.assertIn("启动失败", controller.launchStatusText)
 
     def test_restore_defaults_resets_voice_settings_and_mic_mapping(self):
         controller, model = self._make_controller()
@@ -843,6 +877,61 @@ class SettingsControllerTests(unittest.TestCase):
         self.assertNotIn("gadget_connection_closed", controller.keyDetectionText)
         self.assertNotIn("Raw Input", controller.keyDetectionText)
         self.assertNotIn("HID tap", controller.keyDetectionText)
+
+    def test_local_detection_distinguishes_connecting_from_ready(self):
+        controller, _ = self._make_controller()
+        tap_instances = []
+
+        class FakeListener:
+            def __init__(self, _button_callback, _raw_callback):
+                pass
+
+            def start(self, _device_path):
+                pass
+
+            def stop(self):
+                pass
+
+        class ConnectingTap:
+            def __init__(self, _report_handler, *, status_handler):
+                self.status_handler = status_handler
+                tap_instances.append(self)
+
+            def start(self):
+                return True
+
+            def stop(self):
+                pass
+
+        with mock.patch.object(
+            qt_settings_app.raw_input_windows,
+            "enumerate_matching_device_paths",
+            return_value=["rc003-device-path"],
+        ), mock.patch.object(
+            qt_settings_app.raw_input_windows.hid_identity,
+            "select_single_device_path",
+            return_value="rc003-device-path",
+        ), mock.patch.object(
+            qt_settings_app.raw_input_windows,
+            "RawInputButtonListener",
+            FakeListener,
+        ), mock.patch.object(
+            qt_settings_app.frida_compat,
+            "RC003HidReportTap",
+            ConnectingTap,
+        ):
+            controller.startKeyDetection()
+
+        self.assertEqual(controller._KEY_DETECTION_TIMEOUT_SECONDS, 60.0)
+        self.assertIn("Windows 按键通道已启动", controller.keyDetectionText)
+        self.assertIn("补充按键通道正在连接", controller.keyDetectionText)
+        self.assertIn("约一分钟", controller.keyDetectionText)
+        self.assertNotIn("均已就绪", controller.keyDetectionText)
+
+        tap_instances[0].status_handler(frida_compat.HidTapState.READY.value, "")
+
+        self.assertIn("两条按键通道均已就绪", controller.keyDetectionText)
+        self.assertIn("13 个已知按键", controller.keyDetectionText)
 
     def test_real_key_detection_stops_when_bridge_status_is_unavailable(self):
         controller, _ = self._make_controller()
@@ -1822,6 +1911,7 @@ DiagnosticsController = classes["DiagnosticsController"]
 
 QQuickStyle.setStyle("Basic")
 app = QGuiApplication.instance() or QGuiApplication([])
+m.single_instance.bridge_instance_running = lambda: False
 model = ButtonMappingModel()
 controller = SettingsController(model)
 diagnostics_controller = DiagnosticsController(controller, m.config.config_root())
@@ -2005,6 +2095,7 @@ DiagnosticsController = classes["DiagnosticsController"]
 
 QQuickStyle.setStyle("Basic")
 app = QGuiApplication.instance() or QGuiApplication([])
+m.single_instance.bridge_instance_running = lambda: False
 model = ButtonMappingModel()
 controller = SettingsController(model)
 diagnostics_controller = DiagnosticsController(controller, m.config.config_root())
@@ -2057,6 +2148,7 @@ connection_names = (
     "rc003OutputSection",
     "endpointCombo",
     "bridgeSection",
+    "bridgeNotRunningWarning",
     "openLogButton",
     "connectionActionRow",
     "restoreDefaultsButton",
@@ -2069,6 +2161,7 @@ result["connection"] = {
     "content_width": float(connection_scroll.property("contentWidth")),
     "available_width": float(connection_scroll.property("availableWidth")),
     "launch_status": str(find_child(window, "launchStatusText").property("text")),
+    "bridge_warning": str(find_child(window, "bridgeNotRunningWarning").property("text")),
     "save_highlighted": bool(find_child(window, "deviceSaveButton").property("highlighted")),
     "launch_highlighted": bool(find_child(window, "saveAndLaunchButton").property("highlighted")),
 }
@@ -2281,6 +2374,13 @@ class SettingsShellSourceContractTests(unittest.TestCase):
         self.assertIn("已保存但当前缺失的端点", self.connection_qml)
         self.assertIn("启用语音映射时", self.connection_qml)
 
+    def test_bridge_required_warnings_are_visible_on_both_rc003_pages(self):
+        self.assertIn('objectName: "bridgeNotRunningWarning"', self.connection_qml)
+        self.assertIn('objectName: "mappingBridgeWarning"', self.buttons_qml)
+        for page_text in (self.connection_qml, self.buttons_qml):
+            self.assertIn("!SettingsController.bridgeRunning", page_text)
+            self.assertIn("话筒键不会由本程序触发语音", page_text)
+
     def test_permissions_page_states_real_boundaries_without_fake_grants(self):
         for heading in ("运行必需", "可选增强", "手动操作"):
             self.assertIn(heading, self.permissions_qml)
@@ -2431,6 +2531,8 @@ class OffscreenQmlLoadTests(unittest.TestCase):
                         self.assertLessEqual(item["right"], width + 1, item_name)
 
                 connection_items = data["connection"]["items"]
+                self.assertTrue(connection_items["bridgeNotRunningWarning"]["visible"])
+                self.assertIn("话筒键", data["connection"]["bridge_warning"])
                 self.assertLess(
                     connection_items["deviceSection"]["y"],
                     connection_items["rc003OutputSection"]["y"],

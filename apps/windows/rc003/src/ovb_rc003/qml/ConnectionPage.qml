@@ -299,6 +299,16 @@ Item {
                         font.pixelSize: tokens.fontSizeBody
                     }
                     Label {
+                        objectName: "bridgeNotRunningWarning"
+                        Layout.fillWidth: true
+                        visible: !SettingsController.bridgeRunning
+                        wrapMode: Text.WordWrap
+                        text: qsTr("后台桥接未运行或尚未确认运行：话筒键不会由本程序触发语音。请点击下方“保存并启动桥接”，首次连接可能需要约一分钟。")
+                        color: tokens.errorColor
+                        font.pixelSize: tokens.fontSizeBody
+                        font.bold: true
+                    }
+                    Label {
                         Layout.fillWidth: true
                         wrapMode: Text.WordWrap
                         text: qsTr("这里显示本设置窗口最近一次启动结果，不代表 RC003 已连接。实际连接与语音状态请以日志和真机测试为准。")

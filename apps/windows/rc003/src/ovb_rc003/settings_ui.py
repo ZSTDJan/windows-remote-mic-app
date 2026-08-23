@@ -413,14 +413,26 @@ def default_display_state() -> DefaultDisplayState:
 # alive. Whether the bridge actually reached a working BLE/HID/audio
 # connection is only observable from app.log, which every branch below
 # points the user at.
-LAUNCH_NOT_STARTED_TEXT = "未启动（本次设置窗口打开后还没有尝试启动桥接）"
+LAUNCH_NOT_STARTED_TEXT = (
+    "后台桥接未运行。话筒键此时不会由本程序触发语音；"
+    "请点击“保存并启动桥接”，并等待首次连接完成。"
+)
+LAUNCH_ALREADY_RUNNING_TEXT = (
+    "检测到后台桥接已经在运行。本设置窗口没有重复启动它；"
+    "实际设备连接、按键与语音状态请以日志和真机测试为准。"
+)
+LAUNCH_STATUS_UNKNOWN_TEXT = (
+    "暂时无法确认后台桥接是否运行。请先查看任务栏通知区域或任务管理器，"
+    "不要连续重复启动；实际状态可在 app.log 中确认。"
+)
 
 
 def describe_launch_result(result: bridge_launcher.LaunchResult) -> str:
     if result.outcome is bridge_launcher.LaunchOutcome.STARTED:
         pid_text = f"（PID {result.pid}）" if result.pid is not None else ""
         return (
-            f"已启动桥接进程{pid_text}，目前仍在运行。这只说明进程本身存活，"
+            f"已启动桥接进程{pid_text}，目前仍在运行。首次连接和补充按键通道"
+            "就绪可能需要约一分钟；请等待后再测试。这只说明进程本身存活，"
             "不代表已经与 RC003 建立连接——请用下方“打开日志目录”查看 app.log "
             "确认实际连接、按键与语音状态。"
         )

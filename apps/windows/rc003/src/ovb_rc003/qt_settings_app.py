@@ -642,6 +642,7 @@ def _load_qt_classes() -> dict:
         holdVoiceHotkeyTextChanged = Signal()
         endpointOptionsChanged = Signal()
         selectedEndpointIndexChanged = Signal()
+        bridgeRunningChanged = Signal()
         launchStatusTextChanged = Signal()
         statusMessageChanged = Signal()
         errorMessageChanged = Signal()
@@ -660,7 +661,7 @@ def _load_qt_classes() -> dict:
 
         _TRIGGER_MODE_ORDER = (key_mapping.VoiceTriggerMode.HOLD,)
         _DEVICE_ORDER = tuple(profile.device_id for profile in device_catalog.DEVICE_PROFILES)
-        _KEY_DETECTION_TIMEOUT_SECONDS = 15.0
+        _KEY_DETECTION_TIMEOUT_SECONDS = 60.0
 
         def __init__(self, model: "ButtonMappingModel", parent=None) -> None:
             super().__init__(parent)
@@ -685,7 +686,20 @@ def _load_qt_classes() -> dict:
                 )
                 for mode in self._TRIGGER_MODE_ORDER
             }
-            self._launch_status_text = settings_ui.LAUNCH_NOT_STARTED_TEXT
+            try:
+                self._bridge_running = single_instance.bridge_instance_running()
+            except (
+                single_instance.SingleInstanceUnavailableError,
+                single_instance.MutexCleanupError,
+            ):
+                self._bridge_running = False
+                self._launch_status_text = settings_ui.LAUNCH_STATUS_UNKNOWN_TEXT
+            else:
+                self._launch_status_text = (
+                    settings_ui.LAUNCH_ALREADY_RUNNING_TEXT
+                    if self._bridge_running
+                    else settings_ui.LAUNCH_NOT_STARTED_TEXT
+                )
             self._status_message = ""
             self._error_message = ""
             self._settings_dirty = bool(self._removed_voice_bindings)
@@ -856,6 +870,13 @@ def _load_qt_classes() -> dict:
             self._launch_status_text = text
             self.launchStatusTextChanged.emit()
 
+        def _set_bridge_running(self, value: bool) -> None:
+            value = bool(value)
+            if value == self._bridge_running:
+                return
+            self._bridge_running = value
+            self.bridgeRunningChanged.emit()
+
         def _set_status_message(self, text: str) -> None:
             self._status_message = text
             self.statusMessageChanged.emit()
@@ -953,10 +974,17 @@ def _load_qt_classes() -> dict:
             if not self._key_detection_active:
                 return
             if status == frida_compat.HidTapState.READY.value:
-                self._set_key_detection_text(
-                    "补充按键通道已就绪。请按要检测的遥控器按键；"
-                    "不会执行映射动作。"
-                )
+                if self._key_detection_listener is not None:
+                    ready_text = (
+                        "两条按键通道均已就绪，13 个已知按键均可检测。"
+                        "请按要检测的遥控器按键；不会执行映射动作。"
+                    )
+                else:
+                    ready_text = (
+                        "补充按键通道已就绪。请按要检测的遥控器按键；"
+                        "不会执行映射动作。"
+                    )
+                self._set_key_detection_text(ready_text)
             elif status in {
                 frida_compat.HidTapState.FAILED.value,
                 frida_compat.HidTapState.UNHEALTHY.value,
@@ -1137,6 +1165,15 @@ def _load_qt_classes() -> dict:
             _get_selected_endpoint_index,
             _set_selected_endpoint_index,
             notify=selectedEndpointIndexChanged,
+        )
+
+        def _get_bridge_running(self) -> bool:
+            return self._bridge_running
+
+        bridgeRunning = Property(
+            bool,
+            _get_bridge_running,
+            notify=bridgeRunningChanged,
         )
 
         def _get_launch_status_text(self) -> str:
@@ -1344,10 +1381,12 @@ def _load_qt_classes() -> dict:
                 single_instance.SingleInstanceUnavailableError,
                 single_instance.MutexCleanupError,
             ):
+                self._set_bridge_running(False)
                 self._set_key_detection_text(
                     "无法安全确认后台桥接状态，请关闭设置窗口和桥接后重试。"
                 )
                 return
+            self._set_bridge_running(bridge_running)
             if bridge_running:
                 try:
                     request = key_detection_bridge.request_detection(self._config_root)
@@ -1362,7 +1401,7 @@ def _load_qt_classes() -> dict:
                 self.keyDetectionActiveChanged.emit()
                 self._set_key_detection_text(
                     "后台桥接正在等待下一次 RC003 按键。请现在按一次遥控器按键；"
-                    "该次按键不会执行映射动作。"
+                    "该次按键不会执行映射动作。首次连接时请最多等待约一分钟。"
                 )
                 return
             listener = None
@@ -1439,15 +1478,24 @@ def _load_qt_classes() -> dict:
             self._key_detection_active = True
             self.keyDetectionActiveChanged.emit()
             if listener is not None and tap is not None:
-                source_text = "Windows 按键通道和补充按键通道"
+                detection_text = (
+                    "Windows 按键通道已启动；补充按键通道正在连接。"
+                    "现在可先测试 Windows 能直接识别的按键；返回键、音量键等"
+                    "请等待“补充按键通道已就绪”后再测，首次可能需要约一分钟。"
+                )
             elif tap is not None:
-                source_text = "补充按键通道"
+                detection_text = (
+                    "补充按键通道正在连接。请等待“补充按键通道已就绪”后再按键；"
+                    "首次可能需要约一分钟。"
+                )
             else:
-                source_text = "Windows 按键通道"
+                detection_text = (
+                    "Windows 按键通道已启动，但补充按键通道未能启动。"
+                    "返回键、音量键等按键可能测不到。"
+                )
             failure_text = f" 受限来源：{'；'.join(failures)}。" if failures else ""
             self._set_key_detection_text(
-                f"正在通过 {source_text} 监听 RC003。请现在按一次遥控器按键；"
-                f"不会执行该键的映射动作。{failure_text}"
+                f"{detection_text} 检测时不会执行映射动作。{failure_text}"
             )
 
         @Slot()
@@ -1551,6 +1599,13 @@ def _load_qt_classes() -> dict:
                 return
             self._set_launch_status("正在启动…")
             result = bridge_launcher.launch_bridge()
+            self._set_bridge_running(
+                result.outcome
+                in {
+                    bridge_launcher.LaunchOutcome.STARTED,
+                    bridge_launcher.LaunchOutcome.ALREADY_RUNNING,
+                }
+            )
             self._set_launch_status(settings_ui.describe_launch_result(result))
 
         @Slot()

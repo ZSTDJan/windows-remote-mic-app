@@ -11,7 +11,9 @@ from pathlib import Path
 
 from ovb_rc003 import audio_output, bridge_launcher, config, hotkey, key_mapping, logging_setup, single_instance
 from ovb_rc003.settings_ui import (
+    LAUNCH_ALREADY_RUNNING_TEXT,
     LAUNCH_NOT_STARTED_TEXT,
+    LAUNCH_STATUS_UNKNOWN_TEXT,
     SettingsValidationError,
     _REMOVED_VOICE_DISPLAY,
     _VOICE_DISPLAY,
@@ -580,7 +582,14 @@ class DescribeLaunchResultTests(unittest.TestCase):
     """
 
     def test_not_started_text_is_a_fixed_constant_shown_before_any_launch(self):
-        self.assertIn("未启动", LAUNCH_NOT_STARTED_TEXT)
+        self.assertIn("未运行", LAUNCH_NOT_STARTED_TEXT)
+        self.assertIn("话筒键", LAUNCH_NOT_STARTED_TEXT)
+
+    def test_existing_and_unknown_bridge_states_are_described_honestly(self):
+        self.assertIn("已经在运行", LAUNCH_ALREADY_RUNNING_TEXT)
+        self.assertNotIn("已连接", LAUNCH_ALREADY_RUNNING_TEXT)
+        self.assertIn("无法确认", LAUNCH_STATUS_UNKNOWN_TEXT)
+        self.assertIn("不要连续重复启动", LAUNCH_STATUS_UNKNOWN_TEXT)
 
     def test_started_never_claims_rc003_is_connected(self):
         result = bridge_launcher.LaunchResult(
@@ -590,6 +599,7 @@ class DescribeLaunchResultTests(unittest.TestCase):
         )
         text = describe_launch_result(result)
         self.assertIn("123", text)
+        self.assertIn("约一分钟", text)
         self.assertNotIn("RC003 已连接", text)
         self.assertNotIn("已连接", text)
 

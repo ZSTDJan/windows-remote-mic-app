@@ -421,6 +421,29 @@ Item {
             }
 
             Rectangle {
+                id: bridgeRequiredWarning
+                objectName: "mappingBridgeWarning"
+                Layout.fillWidth: true
+                visible: !SettingsController.bridgeRunning
+                implicitHeight: bridgeRequiredWarningText.implicitHeight + tokens.spacingMedium * 2
+                radius: tokens.cornerRadiusSmall
+                color: tokens.errorBackground
+                border.color: tokens.errorColor
+                border.width: 1
+
+                Label {
+                    id: bridgeRequiredWarningText
+                    anchors.fill: parent
+                    anchors.margins: tokens.spacingMedium
+                    wrapMode: Text.WordWrap
+                    text: qsTr("后台桥接未运行或尚未确认运行。话筒键不会由本程序触发语音；真实按键检测的补充通道首次连接可能需要约一分钟。请先到“连接”页点击“保存并启动桥接”。")
+                    color: tokens.errorColor
+                    font.pixelSize: tokens.fontSizeSmall
+                    font.bold: true
+                }
+            }
+
+            Rectangle {
                 Layout.fillWidth: true
                 implicitHeight: detectionRow.implicitHeight + tokens.spacingMedium * 2
                 radius: tokens.cornerRadiusSmall
