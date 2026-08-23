@@ -453,6 +453,7 @@ def _load_qt_classes() -> dict:
         # this directly (it reads the model back at save time via
         # to_display_map()), but it is kept for any future listener/test.
         actionEdited = Signal(str, str)
+        mappingEdited = Signal()
 
         def __init__(self, parent=None) -> None:
             super().__init__(parent)
@@ -586,10 +587,13 @@ def _load_qt_classes() -> dict:
             if not (0 <= row < len(self._button_ids)):
                 return
             button_id = self._button_ids[row]
+            if text == self._action_text[button_id]:
+                return
             self._action_text[button_id] = text
             model_index = self.index(row, 0)
             self.dataChanged.emit(model_index, model_index, [self.ActionTextRole])
             self.actionEdited.emit(button_id, text)
+            self.mappingEdited.emit()
 
         @Slot(int, str, str)
         def setSecondaryActionTextAt(self, row: int, trigger: str, text: str) -> None:
@@ -601,6 +605,8 @@ def _load_qt_classes() -> dict:
             }:
                 return
             button_id = self._button_ids[row]
+            if text == self._secondary_action_text[button_id][trigger]:
+                return
             self._secondary_action_text[button_id][trigger] = text
             model_index = self.index(row, 0)
             role = (
@@ -609,6 +615,7 @@ def _load_qt_classes() -> dict:
                 else self.LongPressTextRole
             )
             self.dataChanged.emit(model_index, model_index, [role])
+            self.mappingEdited.emit()
 
         def set_selected_button(self, button_id: str) -> None:
             if button_id == self._selected_button_id or button_id not in self._action_text:
@@ -639,6 +646,7 @@ def _load_qt_classes() -> dict:
         launchStatusTextChanged = Signal()
         statusMessageChanged = Signal()
         errorMessageChanged = Signal()
+        settingsDirtyChanged = Signal()
         selectedButtonIdChanged = Signal()
         selectedDeviceIndexChanged = Signal()
         selectedDeviceChanged = Signal()
@@ -685,6 +693,7 @@ def _load_qt_classes() -> dict:
             self._launch_status_text = settings_ui.LAUNCH_NOT_STARTED_TEXT
             self._status_message = ""
             self._error_message = ""
+            self._settings_dirty = bool(self._removed_voice_bindings)
             self._selected_button_id = "ok"
             selected_device_id = device_catalog.normalize_device_id(
                 self._config.get("selected_device_profile")
@@ -715,6 +724,7 @@ def _load_qt_classes() -> dict:
             self._refresh_endpoint_options()
             self._refresh_dji_mic_status()
             self._load_bindings_into_model()
+            self._model.mappingEdited.connect(self._mark_settings_dirty)
             self._model.set_selected_button(self._selected_button_id)
             if self._removed_voice_bindings:
                 affected = "、".join(
@@ -783,6 +793,7 @@ def _load_qt_classes() -> dict:
                     migrated_display = settings_ui._endpoint_display(
                         migrated_endpoint
                     )
+                    self._settings_dirty = True
                     self._status_message = (
                         "旧的 Windows WDM-KS 语音端点不可用于当前播放方式；"
                         f"已为本次设置预选 {migrated_display}。点击保存后才会写入。"
@@ -858,6 +869,18 @@ def _load_qt_classes() -> dict:
             self._error_message = text
             self.errorMessageChanged.emit()
 
+        def _set_settings_dirty(self, value: bool) -> None:
+            value = bool(value)
+            if value == self._settings_dirty:
+                return
+            self._settings_dirty = value
+            self.settingsDirtyChanged.emit()
+
+        def _mark_settings_dirty(self) -> None:
+            if self._status_message:
+                self._set_status_message("")
+            self._set_settings_dirty(True)
+
         def _set_key_detection_text(self, text: str) -> None:
             if text != self._key_detection_text:
                 self._key_detection_text = text
@@ -866,24 +889,22 @@ def _load_qt_classes() -> dict:
         def _on_raw_input_event(self, event: raw_input_windows.RawInputEvent) -> None:
             if not event.is_pressed:
                 return
-            signature = raw_input_windows.physical_signature(event)
             if event.source == "keyboard":
                 vkey = "--" if event.vkey is None else f"0x{event.vkey:02X}"
                 make_code = "--" if event.make_code is None else f"0x{event.make_code:02X}"
                 flags = "--" if event.flags is None else f"0x{event.flags:04X}"
                 details = (
-                    f"Raw Input 键盘事件：VKey={vkey}, "
-                    f"MakeCode={make_code}, Flags={flags}"
+                    f"Windows 按键事件：键值={vkey}，扫描码={make_code}，"
+                    f"标志={flags}"
                 )
             else:
-                details = f"Raw Input HID 报告：{event.report.hex(' ')}"
+                details = f"Windows 按键报告：{event.report.hex(' ')}"
             if event.usages:
-                details += " Usages=" + ",".join(
+                details += "，按键值=" + ",".join(
                     f"0x{usage:04X}" for usage in event.usages
                 )
             if event.decode_error:
-                details += f" 解码错误={event.decode_error}"
-            details += f" Signature={signature}"
+                details += "，报告未能完整识别"
             self._rawKeyDetected.emit(event.button_id or "", details)
 
         def _on_raw_key_detected(self, button_id: str, details: str) -> None:
@@ -905,8 +926,8 @@ def _load_qt_classes() -> dict:
                 result = f"已捕获真实按键：{display_name}（{usage}）。"
             else:
                 result = (
-                    "已捕获未预置映射的真实按键；请保留 Signature，"
-                    "再用 rc003_key_test capture --assign 适配它。"
+                    "已捕获一个尚未识别的真实按键；请保留当前提示，"
+                    "以便后续补充适配。"
                 )
             self._set_key_detection_text(
                 f"{result}{details} 现在可设置该行的 Windows 映射并保存。"
@@ -927,7 +948,7 @@ def _load_qt_classes() -> dict:
             button_id = frida_compat.MISSING_USAGE_TO_BUTTON[usage]
             self._rawKeyDetected.emit(
                 button_id,
-                f"HID tap 报告：Usage=0x{usage:04X}",
+                f"补充按键报告：按键值=0x{usage:04X}",
             )
 
         def _on_key_detection_tap_status(self, status: str, detail: str) -> None:
@@ -938,17 +959,21 @@ def _load_qt_classes() -> dict:
                 return
             if status == frida_compat.HidTapState.READY.value:
                 self._set_key_detection_text(
-                    "HID tap 已收到真实 RC003 报告。请按要检测的遥控器按键；"
+                    "补充按键通道已就绪。请按要检测的遥控器按键；"
                     "不会执行映射动作。"
                 )
             elif status in {
                 frida_compat.HidTapState.FAILED.value,
                 frida_compat.HidTapState.UNHEALTHY.value,
             }:
-                suffix = f"（{detail}）" if detail else ""
+                detail_text = {
+                    "gadget_connection_closed": "连接已关闭",
+                }.get(detail, "")
+                suffix = f"（{detail_text}）" if detail_text else ""
                 self._set_key_detection_text(
-                    f"HID tap 当前不可用{suffix}；Raw Input 仍在监听 Windows "
-                    "能够暴露的按键。"
+                    f"补充按键通道暂时不可用{suffix}。目前仍可检测 Windows "
+                    "直接识别的按键，但返回键、音量键等按键可能暂时测不到；"
+                    "请等待提示变为“补充按键通道已就绪”后再测这些按键。"
                 )
 
         def _on_hotkey_capture_result(self, chord: str) -> None:
@@ -988,7 +1013,14 @@ def _load_qt_classes() -> dict:
                     ),
                 )
             except settings_ui.SettingsValidationError as exc:
-                title = f"「{exc.button_id}」映射无效" if exc.button_id else "语音热键无效"
+                button_name = (
+                    "话筒键"
+                    if exc.button_id == "mic"
+                    else remote_layout.BUTTON_DISPLAY_NAMES.get(
+                        exc.button_id, exc.button_id
+                    )
+                )
+                title = f"「{button_name}」映射无效" if button_name else "语音热键无效"
                 self._set_error_message(f"{title}：{exc.message}")
                 return False
 
@@ -1045,6 +1077,7 @@ def _load_qt_classes() -> dict:
                 bool(saved_config.get("voice_release_finish_tap_enabled", False))
             )
             self._load_bindings_into_model()
+            self._set_settings_dirty(False)
             self._set_error_message("")
             if self._selected_device_id() == device_catalog.DJI_MIC_2_ID:
                 self._set_status_message(
@@ -1065,24 +1098,27 @@ def _load_qt_classes() -> dict:
 
         def _set_hotkey_text(self, value: str) -> None:
             mode = self._TRIGGER_MODE_ORDER[self._trigger_mode_index]
-            self._set_voice_hotkey_text(mode, value)
+            if self._set_voice_hotkey_text(mode, value):
+                self._mark_settings_dirty()
 
         hotkeyText = Property(str, _get_hotkey_text, _set_hotkey_text, notify=hotkeyTextChanged)
 
         def _set_voice_hotkey_text(
             self, mode: key_mapping.VoiceTriggerMode, value: str
-        ) -> None:
+        ) -> bool:
             if value == self._voice_hotkeys[mode]:
-                return
+                return False
             self._voice_hotkeys[mode] = value
             self.holdVoiceHotkeyTextChanged.emit()
             self.hotkeyTextChanged.emit()
+            return True
 
         def _get_hold_voice_hotkey_text(self) -> str:
             return self._voice_hotkeys[key_mapping.VoiceTriggerMode.HOLD]
 
         def _set_hold_voice_hotkey_text(self, value: str) -> None:
-            self._set_voice_hotkey_text(key_mapping.VoiceTriggerMode.HOLD, value)
+            if self._set_voice_hotkey_text(key_mapping.VoiceTriggerMode.HOLD, value):
+                self._mark_settings_dirty()
 
         holdVoiceHotkeyText = Property(
             str,
@@ -1094,12 +1130,17 @@ def _load_qt_classes() -> dict:
         def _get_voice_release_finish_tap_enabled(self) -> bool:
             return self._voice_release_finish_tap_enabled
 
-        def _set_voice_release_finish_tap_enabled(self, value: bool) -> None:
+        def _assign_voice_release_finish_tap_enabled(self, value: bool) -> bool:
             value = bool(value)
             if value == self._voice_release_finish_tap_enabled:
-                return
+                return False
             self._voice_release_finish_tap_enabled = value
             self.voiceReleaseFinishTapEnabledChanged.emit()
+            return True
+
+        def _set_voice_release_finish_tap_enabled(self, value: bool) -> None:
+            if self._assign_voice_release_finish_tap_enabled(value):
+                self._mark_settings_dirty()
 
         voiceReleaseFinishTapEnabled = Property(
             bool,
@@ -1122,6 +1163,7 @@ def _load_qt_classes() -> dict:
             if value != self._selected_endpoint_index:
                 self._selected_endpoint_index = value
                 self.selectedEndpointIndexChanged.emit()
+                self._mark_settings_dirty()
 
         selectedEndpointIndex = Property(
             int,
@@ -1144,6 +1186,15 @@ def _load_qt_classes() -> dict:
             return self._error_message
 
         errorMessage = Property(str, _get_error_message, notify=errorMessageChanged)
+
+        def _get_settings_dirty(self) -> bool:
+            return self._settings_dirty
+
+        settingsDirty = Property(
+            bool,
+            _get_settings_dirty,
+            notify=settingsDirtyChanged,
+        )
 
         def _get_selected_button_id(self) -> str:
             return self._selected_button_id
@@ -1181,6 +1232,7 @@ def _load_qt_classes() -> dict:
             self._selected_device_fallback_id = self._DEVICE_ORDER[value]
             self.selectedDeviceIndexChanged.emit()
             self.selectedDeviceChanged.emit()
+            self._mark_settings_dirty()
             if self._selected_device_id() == device_catalog.DJI_MIC_2_ID:
                 self._refresh_dji_mic_status()
 
@@ -1362,15 +1414,15 @@ def _load_qt_classes() -> dict:
                 if callable(set_physical_bindings):
                     set_physical_bindings(self._bindings.get("physical_bindings", {}))
                 listener.start(device_path)
-            except Exception as exc:  # noqa: BLE001 - surface failure in the UI
-                failures.append(f"Raw Input：{exc}")
+            except Exception:  # noqa: BLE001 - surface failure in the UI
+                failures.append("Windows 按键通道启动失败")
                 if listener is not None:
                     try:
                         listener.stop()
                     except Exception as cleanup_exc:
                         self._key_detection_listener = listener
                         self._set_key_detection_text(
-                            "Raw Input 启动失败，且监听资源未能停止："
+                            "Windows 按键通道启动失败，且监听资源未能停止："
                             f"{cleanup_exc}"
                         )
                         return
@@ -1383,10 +1435,10 @@ def _load_qt_classes() -> dict:
             )
             try:
                 if not tap.start():
-                    failures.append(f"HID tap：{tap.status}")
+                    failures.append("补充按键通道启动失败")
                     tap = None
-            except Exception as exc:  # noqa: BLE001 - surface failure in the UI
-                failures.append(f"HID tap：{type(exc).__name__}")
+            except Exception:  # noqa: BLE001 - surface failure in the UI
+                failures.append("补充按键通道启动失败")
                 try:
                     tap.stop()
                 except Exception as cleanup_exc:
@@ -1397,7 +1449,7 @@ def _load_qt_classes() -> dict:
                             self._key_detection_listener = listener
                     self._key_detection_tap = tap
                     self._set_key_detection_text(
-                        "HID tap 启动失败，且检测资源未能停止："
+                        "补充按键通道启动失败，且检测资源未能停止："
                         f"{cleanup_exc}"
                     )
                     return
@@ -1420,11 +1472,11 @@ def _load_qt_classes() -> dict:
             self._key_detection_active = True
             self.keyDetectionActiveChanged.emit()
             if listener is not None and tap is not None:
-                source_text = "Raw Input 与 HID tap"
+                source_text = "Windows 按键通道和补充按键通道"
             elif tap is not None:
-                source_text = "HID tap"
+                source_text = "补充按键通道"
             else:
-                source_text = "Raw Input"
+                source_text = "Windows 按键通道"
             failure_text = f" 受限来源：{'；'.join(failures)}。" if failures else ""
             self._set_key_detection_text(
                 f"正在通过 {source_text} 监听 RC003。请现在按一次遥控器按键；"
@@ -1499,14 +1551,18 @@ def _load_qt_classes() -> dict:
                 try:
                     listener.stop()
                 except Exception as exc:  # noqa: BLE001 - report, do not crash Qt
-                    self._set_key_detection_text(f"停止真实按键检测时出错：{exc}")
+                    self._set_key_detection_text(
+                        f"停止 Windows 按键通道时出错：{exc}"
+                    )
                 else:
                     self._key_detection_listener = None
             if tap is not None:
                 try:
                     tap.stop()
                 except Exception as exc:  # noqa: BLE001 - report, do not crash Qt
-                    self._set_key_detection_text(f"停止 HID tap 检测时出错：{exc}")
+                    self._set_key_detection_text(
+                        f"停止补充按键通道时出错：{exc}"
+                    )
                 else:
                     self._key_detection_tap = None
 
@@ -1548,7 +1604,8 @@ def _load_qt_classes() -> dict:
             self._set_hold_voice_hotkey_text(
                 defaults.voice_hotkeys[key_mapping.VoiceTriggerMode.HOLD.value]
             )
-            self._set_voice_release_finish_tap_enabled(False)
+            self._assign_voice_release_finish_tap_enabled(False)
+            self._mark_settings_dirty()
             self._set_error_message("")
             self._set_status_message(
                 "已恢复默认显示，尚未保存——点击「保存映射」或「仅保存设置」才会写入设置。"

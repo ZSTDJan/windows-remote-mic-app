@@ -219,9 +219,16 @@ Item {
                     onAccepted: ButtonMappingModel.setActionTextAt(
                         actionEditor.rowIndex, editText
                     )
-                    onActivated: ButtonMappingModel.setActionTextAt(
-                        actionEditor.rowIndex, currentText
-                    )
+                    onActivated: {
+                        const selectedText = currentText
+                        actionEditor.syncing = true
+                        editText = selectedText
+                        actionEditor.primaryText = selectedText
+                        actionEditor.syncing = false
+                        ButtonMappingModel.setActionTextAt(
+                            actionEditor.rowIndex, selectedText
+                        )
+                    }
                 }
                 Button {
                     objectName: "actionEditorPrimaryRecordButton"
@@ -261,9 +268,16 @@ Item {
                     onAccepted: ButtonMappingModel.setSecondaryActionTextAt(
                         actionEditor.rowIndex, "double_click", editText
                     )
-                    onActivated: ButtonMappingModel.setSecondaryActionTextAt(
-                        actionEditor.rowIndex, "double_click", currentText
-                    )
+                    onActivated: {
+                        const selectedText = currentText
+                        actionEditor.syncing = true
+                        editText = selectedText
+                        actionEditor.doubleText = selectedText
+                        actionEditor.syncing = false
+                        ButtonMappingModel.setSecondaryActionTextAt(
+                            actionEditor.rowIndex, "double_click", selectedText
+                        )
+                    }
                 }
                 Button {
                     objectName: "actionEditorDoubleRecordButton"
@@ -305,9 +319,16 @@ Item {
                     onAccepted: ButtonMappingModel.setSecondaryActionTextAt(
                         actionEditor.rowIndex, "long_press", editText
                     )
-                    onActivated: ButtonMappingModel.setSecondaryActionTextAt(
-                        actionEditor.rowIndex, "long_press", currentText
-                    )
+                    onActivated: {
+                        const selectedText = currentText
+                        actionEditor.syncing = true
+                        editText = selectedText
+                        actionEditor.longText = selectedText
+                        actionEditor.syncing = false
+                        ButtonMappingModel.setSecondaryActionTextAt(
+                            actionEditor.rowIndex, "long_press", selectedText
+                        )
+                    }
                 }
                 Button {
                     objectName: "actionEditorLongRecordButton"

@@ -164,8 +164,10 @@ ApplicationWindow {
                 ? Math.max(tokens.statusBarMinHeight, globalStatusText.implicitHeight + tokens.spacingSmall * 2)
                 : 0
             visible: SettingsController.errorMessage.length > 0
+                || SettingsController.settingsDirty
                 || SettingsController.statusMessage.length > 0
             color: SettingsController.errorMessage.length > 0
+                || SettingsController.settingsDirty
                 ? tokens.errorBackground
                 : tokens.statusBackground
 
@@ -175,6 +177,7 @@ ApplicationWindow {
                 anchors.top: parent.top
                 height: 1
                 color: SettingsController.errorMessage.length > 0
+                    || SettingsController.settingsDirty
                     ? tokens.errorColor
                     : tokens.accent
             }
@@ -189,8 +192,13 @@ ApplicationWindow {
                 anchors.rightMargin: tokens.pageHorizontalPadding
                 text: SettingsController.errorMessage.length > 0
                     ? SettingsController.errorMessage
+                    : SettingsController.settingsDirty
+                        ? (SettingsController.statusMessage.length > 0
+                            ? SettingsController.statusMessage
+                            : qsTr("设置已修改，尚未保存。"))
                     : SettingsController.statusMessage
                 color: SettingsController.errorMessage.length > 0
+                    || SettingsController.settingsDirty
                     ? tokens.errorColor
                     : tokens.textPrimary
                 font.pixelSize: tokens.fontSizeSmall

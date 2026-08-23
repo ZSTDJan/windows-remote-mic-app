@@ -20,6 +20,7 @@ whole point of that design is a real, OS-confirmed hard bound this project
 cannot prove any other way.
 """
 
+import json
 import os
 import sys
 import tempfile
@@ -279,6 +280,19 @@ class ButtonMappingModelTests(unittest.TestCase):
         index = model.index(row, 0)
         self.assertEqual(model.data(index, model.ActionTextRole), "escape")
 
+    def test_mapping_edited_emits_only_when_an_action_really_changes(self):
+        model = self.Model()
+        changes = []
+        model.mappingEdited.connect(lambda: changes.append(True))
+        row = model.index_of("power")
+
+        model.setActionTextAt(row, "escape")
+        model.setActionTextAt(row, "escape")
+        model.setSecondaryActionTextAt(row, "double_click", "f5")
+        model.setSecondaryActionTextAt(row, "double_click", "f5")
+
+        self.assertEqual(len(changes), 2)
+
     def test_set_action_text_at_updates_the_mic_row(self):
         model = self.Model()
         row = model.index_of("mic")
@@ -449,6 +463,7 @@ class SettingsControllerTests(unittest.TestCase):
         self.assertIn("Windows WASAPI", selected)
         self.assertIn("WDM-KS", controller.statusMessage)
         self.assertIn("点击保存后才会写入", controller.statusMessage)
+        self.assertTrue(controller.settingsDirty)
 
     def test_photo_available_and_source_are_consistent(self):
         controller, _ = self._make_controller()
@@ -502,18 +517,113 @@ class SettingsControllerTests(unittest.TestCase):
     def test_save_settings_persists_and_clears_error_message(self):
         controller, model = self._make_controller()
         model.setActionTextAt(model.index_of("power"), "escape")
+        self.assertTrue(controller.settingsDirty)
         self.assertTrue(controller.saveSettings())
+        self.assertFalse(controller.settingsDirty)
         self.assertEqual(controller.errorMessage, "")
         self.assertIn("已保存", controller.statusMessage)
 
+        model.setActionTextAt(model.index_of("power"), "Return")
+        self.assertTrue(controller.settingsDirty)
+        self.assertEqual(controller.statusMessage, "")
+
     def test_save_settings_reports_a_persistence_failure(self):
         controller, _ = self._make_controller()
+        controller.holdVoiceHotkeyText = "ctrl+l"
+        self.assertTrue(controller.settingsDirty)
         with mock.patch.object(
             config, "save_settings_pair", side_effect=OSError("settings file is locked")
         ):
             self.assertFalse(controller.saveSettings())
+        self.assertTrue(controller.settingsDirty)
         self.assertIn("保存失败", controller.errorMessage)
         self.assertIn("settings file is locked", controller.errorMessage)
+
+    def test_all_persisted_setting_controls_mark_unsaved_changes(self):
+        controller, model = self._make_controller()
+        self.assertFalse(controller.settingsDirty)
+
+        model.setSecondaryActionTextAt(
+            model.index_of("power"), "long_press", "f5"
+        )
+        self.assertTrue(controller.settingsDirty)
+        self.assertTrue(controller.saveSettings())
+        self.assertFalse(controller.settingsDirty)
+
+        controller.holdVoiceHotkeyText = "ctrl+l"
+        self.assertTrue(controller.settingsDirty)
+        self.assertTrue(controller.saveSettings())
+        self.assertFalse(controller.settingsDirty)
+
+        controller.voiceReleaseFinishTapEnabled = True
+        self.assertTrue(controller.settingsDirty)
+        self.assertTrue(controller.saveSettings())
+        self.assertFalse(controller.settingsDirty)
+
+        controller.selectedDeviceIndex = controller._DEVICE_ORDER.index(
+            device_catalog.DJI_MIC_2_ID
+        )
+        self.assertTrue(controller.settingsDirty)
+
+    def test_output_endpoint_selection_marks_unsaved_changes(self):
+        endpoints = [
+            audio_output.AudioEndpoint(
+                name="CABLE Input (VB-Audio Virtual Cable)",
+                host_api="Windows WASAPI",
+            ),
+            audio_output.AudioEndpoint(
+                name="Speakers",
+                host_api="Windows WASAPI",
+            ),
+        ]
+        with mock.patch.object(
+            audio_output, "enumerate_output_endpoints", return_value=endpoints
+        ):
+            controller, _ = self._make_controller()
+
+        self.assertFalse(controller.settingsDirty)
+        controller.selectedEndpointIndex = 0
+        self.assertTrue(controller.settingsDirty)
+
+    def test_restore_defaults_marks_unsaved_changes(self):
+        controller, _ = self._make_controller()
+        self.assertFalse(controller.settingsDirty)
+
+        controller.restoreDefaults()
+
+        self.assertTrue(controller.settingsDirty)
+        self.assertIn("尚未保存", controller.statusMessage)
+
+    def test_legacy_toggle_error_uses_the_chinese_button_name(self):
+        config_file = config.config_path(config.config_root())
+        config_file.parent.mkdir(parents=True, exist_ok=True)
+        config_file.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "voice_trigger_mode": "toggle",
+                    "voice_hotkey": "lalt+space",
+                    "voice_hotkeys": {
+                        "toggle": "lalt+space",
+                        "hold": "ralt+space",
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        bindings = config.default_key_bindings()
+        bindings["bindings"]["mic"] = {"kind": "voice_toggle", "keys": []}
+        config.save_key_bindings(
+            config.key_bindings_path(config.config_root()), bindings
+        )
+
+        controller, _ = self._make_controller()
+
+        self.assertTrue(controller.settingsDirty)
+        self.assertFalse(controller.saveSettings())
+        self.assertIn("「话筒键」映射无效", controller.errorMessage)
+        self.assertNotIn("「mic」", controller.errorMessage)
+        self.assertTrue(controller.settingsDirty)
 
     def test_save_settings_uses_hold_to_talk_on_the_mic_button(self):
         controller, model = self._make_controller()
@@ -729,7 +839,26 @@ class SettingsControllerTests(unittest.TestCase):
         ):
             controller.startKeyDetection()
         self.assertFalse(controller.keyDetectionActive)
-        self.assertIn("Raw Input unavailable", controller.keyDetectionText)
+        self.assertIn("Windows 按键通道启动失败", controller.keyDetectionText)
+        self.assertIn("补充按键通道启动失败", controller.keyDetectionText)
+        self.assertNotIn("Raw Input", controller.keyDetectionText)
+        self.assertNotIn("HID tap", controller.keyDetectionText)
+
+    def test_closed_supplemental_key_channel_explains_temporary_limit(self):
+        controller, _ = self._make_controller()
+        controller._key_detection_active = True
+
+        controller._on_hid_tap_detection_status(
+            frida_compat.HidTapState.UNHEALTHY.value,
+            "gadget_connection_closed",
+        )
+
+        self.assertIn("补充按键通道暂时不可用", controller.keyDetectionText)
+        self.assertIn("返回键、音量键", controller.keyDetectionText)
+        self.assertIn("补充按键通道已就绪", controller.keyDetectionText)
+        self.assertNotIn("gadget_connection_closed", controller.keyDetectionText)
+        self.assertNotIn("Raw Input", controller.keyDetectionText)
+        self.assertNotIn("HID tap", controller.keyDetectionText)
 
     def test_real_key_detection_stops_when_bridge_status_is_unavailable(self):
         controller, _ = self._make_controller()
@@ -2456,6 +2585,22 @@ def _find_mapping_row_control(mapping_list, button_id, model, object_name):
     return _find_child_by_object_name(current_item, object_name)
 
 
+def _select_combo_option(window, app, combo, option_index):
+    indicator_point = combo.mapToScene(
+        QPointF(combo.property("width") - 8, combo.property("height") / 2)
+    ).toPoint()
+    QTest.mouseClick(window, Qt.LeftButton, Qt.NoModifier, indicator_point)
+    app.processEvents()
+    assert combo.property("down"), "ComboBox popup did not open"
+    QTest.keyClick(window, Qt.Key_Home)
+    for _ in range(option_index):
+        QTest.keyClick(window, Qt.Key_Down)
+    QTest.keyClick(window, Qt.Key_Return)
+    for _ in range(3):
+        window.grabWindow()
+        app.processEvents()
+
+
 classes = m._load_qt_classes()
 QGuiApplication = classes["QGuiApplication"]
 QQmlApplicationEngine = classes["QQmlApplicationEngine"]
@@ -2529,6 +2674,27 @@ assert editor is not None and editor.property("visible")
 assert combo is not None and double_combo is not None and long_combo is not None
 assert combo.property("visible")
 assert not double_combo.property("visible") and not long_combo.property("visible")
+
+# Choose real preset rows through each visible ComboBox popup. The editable
+# field and backing model must change as soon as the popup activates the row;
+# clicking the dialog's "完成" button is deliberately deferred until after
+# every assertion below.
+_select_combo_option(window, app, combo, 1)
+assert combo.property("editText") == "Escape"
+assert editor.property("primaryText") == "Escape"
+assert model.to_display_map()["mic"] == "Escape"
+assert controller.settingsDirty
+assert double_combo.property("visible") and long_combo.property("visible")
+
+_select_combo_option(window, app, double_combo, 1)
+assert double_combo.property("editText") == "Escape"
+assert editor.property("doubleText") == "Escape"
+assert model.to_secondary_display_map()["mic"]["double_click"] == "Escape"
+
+_select_combo_option(window, app, long_combo, 2)
+assert long_combo.property("editText") == "Return"
+assert editor.property("longText") == "Return"
+assert model.to_secondary_display_map()["mic"]["long_press"] == "Return"
 
 # Real mouse click into the ComboBox's editable text area -
 # forceActiveFocus() on the ComboBox item alone is NOT equivalent (proven
