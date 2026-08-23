@@ -1036,6 +1036,12 @@ HID 注入权限顺序与稳定失败提交：
   Frida Gadget 和 VB-CABLE 固定资源哈希分别为
   `B566D70189B6D551AD8F4E0BEA24DE08A3D4C0F559BB35B2BDB67D45182240C2`、
   `B950E39F01AF1D04EA623C8F6D8EB9B6EA5C477C637295FABF20631C85116BFB`。
+- 便携 ZIP 为
+  `D:\Wuxianmai\RemoteMicRC003-0.1.0-candidate-20260823-hold3-portable.zip`，大小
+  127,256,558 字节，SHA-256 为
+  `33C53BB6AC59AFE8EC661D051AE60EA16290F882971E49F3D46BE6BAB697B1B2`。
+  完整解压验证只有一个版本顶层目录，2062 个文件与候选逐文件 SHA-256 一致，
+  零缺失、零新增、零内容差异。
 - 上述 18:01 真机日志证明旧 `hold2` 在桥接就绪后功能正常，不证明 `hold3`
   新增警告和等待提示已经人工验收。
 

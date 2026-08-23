@@ -531,6 +531,11 @@ HID 注入权限顺序与稳定失败提交：
   `8FF6A4840653035AA001746E0957159C33297BBBEA233AD9F6ED043112B38B0E`。
 - 资源结果：6 个 QML 与源码一致，新桥接警告已进入冻结资源；Frida Gadget、
   VB-CABLE 固定哈希通过，旧松手补发文字和 On-request 专项文件均为零。
+- 便携 ZIP：
+  `D:\Wuxianmai\RemoteMicRC003-0.1.0-candidate-20260823-hold3-portable.zip`，大小
+  127,256,558 字节，SHA-256 为
+  `33C53BB6AC59AFE8EC661D051AE60EA16290F882971E49F3D46BE6BAB697B1B2`。完整解压
+  后只有一个版本顶层目录，2062 个文件与本机候选逐文件 SHA-256 一致。
 - 状态：自动检查通过，真机见 `TEST-STARTUP-001`。
 
 ### CHECK-KEY-005 自定义组合键不参与按住连发
