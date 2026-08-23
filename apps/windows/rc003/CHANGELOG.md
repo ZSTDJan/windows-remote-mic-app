@@ -209,6 +209,11 @@
   冻结入口 `--help=0`、`--dry-run=0`，六个 QML 文件与源码一致，Frida Gadget
   和 VB-CABLE 固定资源校验通过，旧 On-request 专项文件为零。本批不制作外发
   ZIP，等待用户先验收本机程序。
+- 用户确认本机程序后，于 2026-08-23 生成便携 ZIP
+  `RemoteMicRC003-0.1.0-candidate-20260822-hold1-portable.zip`，大小
+  127,256,811 字节，SHA-256 为
+  `9A3A9B09D60B360C3C55F14BBB800AFEB0FE3E5B4C446A985CAD812E024D861D`。
+  完整解压后只有一个版本顶层目录，2062 个文件与候选目录逐文件 SHA-256 一致。
 - 完整测试：1006 项通过，7 项安全或平台相关跳过，退出码 0。
 - 公开边界扫描：227 个文件通过；`compileall`、`pip check` 与
   `git diff --check` 通过。
