@@ -1068,6 +1068,20 @@ HID 注入权限顺序与稳定失败提交：
 - 控制器、状态机、状态文字和真实离屏 QML 定向测试 211 项通过；完整 unittest
   1165 项通过、7 项跳过。真实离屏 QML 已验证外部启动/退出会自动切换警告。
 - `compileall`、`pip check`、公开边界扫描 245 个文件和 `git diff --check` 通过。
+- 修复提交为 `0b6d5aaa4d85fbab0add1252034cf0f3fd2967f0`。从该干净提交运行
+  正式构建，脚本内公开边界扫描 278 个文件，完整 unittest 1165 项通过、7 项
+  跳过，PyInstaller 和冻结 `--dry-run` 通过。
+- 本机候选为
+  `D:\Wuxianmai\RemoteMicRC003-0.1.0-candidate-20260823-hold4`，共 2062 个文件、
+  320,902,537 字节；与 `dist\RemoteMicRC003` 零缺失、零新增、零内容差异。
+  EXE SHA-256 为
+  `64A329A51BE6C181FF4928463CD9DC6078A8B6C8B6A853EFD0379E75226CFCC4`。
+- 冻结 `--help=0`、`--dry-run=0`、无效 HID 注入 PID `=4`，6 个产品 QML 与源码
+  一致。隔离配置目录中的冻结设置窗口离屏存活 5 秒，确认冻结 QML 可实际加载。
+  Frida Gadget 和 VB-CABLE 固定资源哈希分别为
+  `B566D70189B6D551AD8F4E0BEA24DE08A3D4C0F559BB35B2BDB67D45182240C2`、
+  `B950E39F01AF1D04EA623C8F6D8EB9B6EA5C477C637295FABF20631C85116BFB`。
+- 本轮未制作外发 ZIP；真实 RC003 验收通过并由用户确认后再打包。
 - 详细记录与真机步骤见
   `bugs/BUG-026-bridge-liveness-and-first-key-readiness.md`。真实 RC003 尚未复测，
   不得写成首次返回/音量键、桥接退出后的日期时间漏出或语音已经通过。
