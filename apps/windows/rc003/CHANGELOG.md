@@ -221,8 +221,13 @@
   303 项通过、1 项跳过；完整 unittest 1152 项通过、7 项按平台或安全条件
   跳过，退出码 0。
 - `compileall`、`pip check`、PowerShell parser、`git diff --check` 通过；公开
-  边界扫描 289 个文件通过。新的本机 `hold2` 候选待从已提交源码构建，本批
-  不制作外发 ZIP。
+  边界扫描 289 个文件通过。
+- 从源码提交 `90b552e` 构建本机候选
+  `D:\Wuxianmai\RemoteMicRC003-0.1.0-candidate-20260823-hold2`。目录含 2062 个
+  文件、320,898,562 字节，与构建输出逐文件 SHA-256 一致；`--help=0`、
+  `--dry-run=0`，六个产品 QML 与源码一致且不含已撤下控件。EXE SHA-256 为
+  `AE072B578FFA112F301201D8452C8A8959C656D75977BF00620A5E066819C5FF`。
+  本批不制作外发 ZIP，等待用户先验收本机程序。
 - 当前 HOLD-only 收口核心定向测试 481 项通过、1 项按平台条件跳过；完整
   unittest 1151 项通过、7 项按平台或安全条件跳过，退出码 0。
 - `compileall`、`pip check`、PowerShell parser、`git diff --check` 通过；公开

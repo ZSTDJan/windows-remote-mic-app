@@ -976,7 +976,19 @@ HID 注入权限顺序与稳定失败提交：
 - 完整 unittest 1152 项通过、7 项按平台或安全条件跳过，退出码 0；
   `compileall`、`pip check`、PowerShell parser、公开边界扫描 289 个文件和
   `git diff --check` 通过。
-- 最终提交与本机 `hold2` 候选信息在构建完成后补记。
+- 源码提交为 `90b552e`。从该干净提交重新运行 `build/build-candidate.ps1`，公开
+  边界、固定资源校验、1152/7 完整测试、PyInstaller 和冻结自检全部通过。
+- 最终本机目录为
+  `D:\Wuxianmai\RemoteMicRC003-0.1.0-candidate-20260823-hold2`，共 2062 个文件、
+  320,898,562 字节；与 `dist\RemoteMicRC003` 逐文件 SHA-256 一致。
+- 冻结 `--help=0`、`--dry-run=0`；EXE SHA-256 为
+  `AE072B578FFA112F301201D8452C8A8959C656D75977BF00620A5E066819C5FF`。
+  六个产品 QML 与源码逐文件一致，旧松手补发控件文字为零。
+- Frida Gadget SHA-256 为
+  `B566D70189B6D551AD8F4E0BEA24DE08A3D4C0F559BB35B2BDB67D45182240C2`，
+  VB-CABLE 原始包 SHA-256 为
+  `B950E39F01AF1D04EA623C8F6D8EB9B6EA5C477C637295FABF20631C85116BFB`。
+- 本批只提供本机候选，未制作外发 ZIP，等待用户真机确认。
 - 真机尚未复测，不得写成宿主语音窗口问题已经解决；本批只确认删除无收益的
   二次点按，并保留标准按住说话链路。
 
