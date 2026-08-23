@@ -640,7 +640,6 @@ def _load_qt_classes() -> dict:
 
         hotkeyTextChanged = Signal()
         holdVoiceHotkeyTextChanged = Signal()
-        voiceReleaseFinishTapEnabledChanged = Signal()
         endpointOptionsChanged = Signal()
         selectedEndpointIndexChanged = Signal()
         launchStatusTextChanged = Signal()
@@ -686,10 +685,6 @@ def _load_qt_classes() -> dict:
                 )
                 for mode in self._TRIGGER_MODE_ORDER
             }
-            self._voice_release_finish_tap_enabled = bool(
-                self._config.get("voice_release_finish_tap_enabled", False)
-            )
-
             self._launch_status_text = settings_ui.LAUNCH_NOT_STARTED_TEXT
             self._status_message = ""
             self._error_message = ""
@@ -1008,9 +1003,6 @@ def _load_qt_classes() -> dict:
                         mode.value: self._voice_hotkeys[mode]
                         for mode in self._TRIGGER_MODE_ORDER
                     },
-                    voice_release_finish_tap_enabled=(
-                        self._voice_release_finish_tap_enabled
-                    ),
                 )
             except settings_ui.SettingsValidationError as exc:
                 button_name = (
@@ -1073,9 +1065,6 @@ def _load_qt_classes() -> dict:
             for mode in self._TRIGGER_MODE_ORDER:
                 saved_text = str(saved_voice_hotkeys.get(mode.value, ""))
                 self._set_voice_hotkey_text(mode, saved_text)
-            self._set_voice_release_finish_tap_enabled(
-                bool(saved_config.get("voice_release_finish_tap_enabled", False))
-            )
             self._load_bindings_into_model()
             self._set_settings_dirty(False)
             self._set_error_message("")
@@ -1125,28 +1114,6 @@ def _load_qt_classes() -> dict:
             _get_hold_voice_hotkey_text,
             _set_hold_voice_hotkey_text,
             notify=holdVoiceHotkeyTextChanged,
-        )
-
-        def _get_voice_release_finish_tap_enabled(self) -> bool:
-            return self._voice_release_finish_tap_enabled
-
-        def _assign_voice_release_finish_tap_enabled(self, value: bool) -> bool:
-            value = bool(value)
-            if value == self._voice_release_finish_tap_enabled:
-                return False
-            self._voice_release_finish_tap_enabled = value
-            self.voiceReleaseFinishTapEnabledChanged.emit()
-            return True
-
-        def _set_voice_release_finish_tap_enabled(self, value: bool) -> None:
-            if self._assign_voice_release_finish_tap_enabled(value):
-                self._mark_settings_dirty()
-
-        voiceReleaseFinishTapEnabled = Property(
-            bool,
-            _get_voice_release_finish_tap_enabled,
-            _set_voice_release_finish_tap_enabled,
-            notify=voiceReleaseFinishTapEnabledChanged,
         )
 
         def _get_endpoint_options(self) -> List[str]:
@@ -1604,7 +1571,6 @@ def _load_qt_classes() -> dict:
             self._set_hold_voice_hotkey_text(
                 defaults.voice_hotkeys[key_mapping.VoiceTriggerMode.HOLD.value]
             )
-            self._assign_voice_release_finish_tap_enabled(False)
             self._mark_settings_dirty()
             self._set_error_message("")
             self._set_status_message(

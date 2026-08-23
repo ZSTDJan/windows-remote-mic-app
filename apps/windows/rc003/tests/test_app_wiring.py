@@ -663,189 +663,41 @@ class HostHotkeyFailureSuppressesMicOpenTests(_AppWiringTestCase):
         hotkey.assert_not_called()
         self.assertEqual(self.app._ble_session.mic_open_calls, 0)
 
-    def test_release_finish_tap_is_off_by_default(self):
-        calls = []
-        with mock.patch.object(win32_input, "send_voice_key_combo_down"), mock.patch.object(
-            win32_input, "send_voice_key_combo_up"
-        ), mock.patch.object(
-            win32_input,
-            "send_voice_key_combo_tap",
-            side_effect=lambda tokens: calls.append(tokens),
-        ), mock.patch.object(
-            app_module,
-            "_VOICE_RELEASE_FINISH_FALLBACK_SECONDS",
-            0.0,
-        ):
-            self.app._on_button_event("mic", True, event_source="hid")
-            self.app._on_button_event("mic", False, event_source="hid")
-            self._drain_event_loop()
-            self._drain_event_loop()
-
-        self.assertEqual(calls, [])
-        self.assertFalse(self.app._voice_release_finish_pending)
-
-    def test_release_finish_tap_waits_for_audio_stop_then_sends_once(self):
+    def test_removed_release_finish_setting_never_sends_an_extra_tap(self):
+        # Schema 2 exposed this field. Keep the runtime fail-safe even if an
+        # old in-memory config reaches the app before it has been re-saved.
         self.app._config["voice_release_finish_tap_enabled"] = True
         calls = []
-        with mock.patch.object(win32_input, "send_voice_key_combo_down"), mock.patch.object(
-            win32_input, "send_voice_key_combo_up"
+        with mock.patch.object(
+            win32_input,
+            "send_voice_key_combo_down",
+            side_effect=lambda tokens: calls.append(("down", tokens)),
         ), mock.patch.object(
             win32_input,
-            "send_voice_key_combo_tap",
-            side_effect=lambda tokens: calls.append(tokens),
-        ), mock.patch.object(
-            app_module,
-            "_VOICE_RELEASE_FINISH_AFTER_AUDIO_STOP_SECONDS",
-            0.0,
-        ):
+            "send_voice_key_combo_up",
+            side_effect=lambda tokens: calls.append(("up", tokens)),
+        ), mock.patch.object(win32_input, "send_voice_key_combo_tap") as finish_tap:
             self.app._on_button_event("mic", True, event_source="hid")
             self.app._on_control_event(AudioStarted(session_id=1))
             self.app._on_button_event("mic", False, event_source="hid")
-            self.assertTrue(self.app._voice_release_finish_pending)
-            self.app._on_control_event(AudioStopped())
-            self._drain_event_loop()
-            self._drain_event_loop()
             self.app._on_control_event(AudioStopped())
 
-        self.assertEqual(calls, [("ralt",)])
-        self.assertFalse(self.app._voice_release_finish_pending)
-
-    def test_audio_stop_can_queue_release_finish_before_physical_key_up(self):
-        self.app._config["voice_release_finish_tap_enabled"] = True
-        calls = []
-        with mock.patch.object(win32_input, "send_voice_key_combo_down"), mock.patch.object(
-            win32_input, "send_voice_key_combo_up"
-        ), mock.patch.object(
-            win32_input,
-            "send_voice_key_combo_tap",
-            side_effect=lambda tokens: calls.append(tokens),
-        ), mock.patch.object(
-            app_module,
-            "_VOICE_RELEASE_FINISH_AFTER_AUDIO_STOP_SECONDS",
-            0.0,
-        ):
             self.app._on_button_event("mic", True, event_source="hid")
-            self.app._on_control_event(AudioStarted(session_id=1))
+            self.app._on_control_event(AudioStarted(session_id=2))
             self.app._on_control_event(AudioStopped())
-            self.assertTrue(self.app._voice_release_finish_pending)
-            self._drain_event_loop()
-            self._drain_event_loop()
             self.app._on_button_event("mic", False, event_source="hid")
-            self._drain_event_loop()
 
-        self.assertEqual(calls, [("ralt",)])
-        self.assertFalse(self.app._voice_release_finish_pending)
-
-    def test_release_finish_tap_uses_fallback_when_audio_stop_never_arrives(self):
-        self.app._config["voice_release_finish_tap_enabled"] = True
-        calls = []
-        with mock.patch.object(win32_input, "send_voice_key_combo_down"), mock.patch.object(
-            win32_input, "send_voice_key_combo_up"
-        ), mock.patch.object(
-            win32_input,
-            "send_voice_key_combo_tap",
-            side_effect=lambda tokens: calls.append(tokens),
-        ), mock.patch.object(
-            app_module,
-            "_VOICE_RELEASE_FINISH_FALLBACK_SECONDS",
-            0.0,
-        ):
-            self.app._on_button_event("mic", True, event_source="hid")
-            self.app._on_button_event("mic", False, event_source="hid")
-            self._drain_event_loop()
-            self._drain_event_loop()
-
-        self.assertEqual(calls, [("ralt",)])
-        self.assertFalse(self.app._voice_release_finish_pending)
-
-    def test_new_press_cancels_a_pending_release_finish_tap(self):
-        self.app._config["voice_release_finish_tap_enabled"] = True
-        with mock.patch.object(win32_input, "send_voice_key_combo_down"), mock.patch.object(
-            win32_input, "send_voice_key_combo_up"
-        ), mock.patch.object(
-            win32_input, "send_voice_key_combo_tap"
-        ) as finish_tap, mock.patch.object(
-            app_module,
-            "_VOICE_RELEASE_FINISH_FALLBACK_SECONDS",
-            60.0,
-        ):
-            self.app._on_button_event("mic", True, event_source="hid")
-            self.app._on_button_event("mic", False, event_source="hid")
-            self.assertTrue(self.app._voice_release_finish_pending)
-            self.app._on_button_event("mic", True, event_source="hid")
-            self._drain_event_loop()
-
+        self.assertEqual(
+            calls,
+            [
+                ("down", ("ralt",)),
+                ("up", ("ralt",)),
+                ("down", ("ralt",)),
+                ("up", ("ralt",)),
+            ],
+        )
         finish_tap.assert_not_called()
-        self.assertFalse(self.app._voice_release_finish_pending)
-        self.assertTrue(self.app._voice.active)
-
-    def test_cleanup_cancels_a_pending_release_finish_tap(self):
-        self.app._config["voice_release_finish_tap_enabled"] = True
-        with mock.patch.object(win32_input, "send_voice_key_combo_down"), mock.patch.object(
-            win32_input, "send_voice_key_combo_up"
-        ), mock.patch.object(
-            win32_input, "send_voice_key_combo_tap"
-        ) as finish_tap, mock.patch.object(
-            app_module,
-            "_VOICE_RELEASE_FINISH_FALLBACK_SECONDS",
-            60.0,
-        ):
-            self.app._on_button_event("mic", True, event_source="hid")
-            self.app._on_button_event("mic", False, event_source="hid")
-            self.assertTrue(self.app._voice_release_finish_pending)
-            self._loop.run_until_complete(self.app._cleanup_once())
-            self._drain_event_loop()
-
-        finish_tap.assert_not_called()
-        self.assertFalse(self.app._voice_release_finish_pending)
-        self.assertIsNone(self.app._ble_session)
-
-    def test_release_finish_tap_uses_the_session_shortcut_snapshot(self):
-        self.app._config["voice_release_finish_tap_enabled"] = True
-        calls = []
-        with mock.patch.object(win32_input, "send_voice_key_combo_down"), mock.patch.object(
-            win32_input, "send_voice_key_combo_up"
-        ), mock.patch.object(
-            win32_input,
-            "send_voice_key_combo_tap",
-            side_effect=lambda tokens: calls.append(tokens),
-        ), mock.patch.object(
-            app_module,
-            "_VOICE_RELEASE_FINISH_FALLBACK_SECONDS",
-            60.0,
-        ):
-            self.app._on_button_event("mic", True, event_source="hid")
-            self.app._on_button_event("mic", False, event_source="hid")
-            generation = self.app._voice_release_finish_generation
-            self.app._voice_hotkey = app_module.hotkey.HotkeySpec.parse("ctrl+l")
-            self.app._complete_voice_release_finish(generation, "test")
-
-        self.assertEqual(calls, [("ralt",)])
-
-    def test_incomplete_release_finish_tap_retains_safety_release_and_reconnects(self):
-        self.app._config["voice_release_finish_tap_enabled"] = True
-        reconnect_calls = []
-        self.app._supervisor.request_reconnect = lambda: reconnect_calls.append(1)
-        with mock.patch.object(win32_input, "send_voice_key_combo_down"), mock.patch.object(
-            win32_input, "send_voice_key_combo_up"
-        ), mock.patch.object(
-            win32_input,
-            "send_voice_key_combo_tap",
-            side_effect=win32_input.InputCleanupIncompleteError(
-                "simulated incomplete finish tap"
-            ),
-        ), mock.patch.object(
-            app_module,
-            "_VOICE_RELEASE_FINISH_FALLBACK_SECONDS",
-            60.0,
-        ):
-            self.app._on_button_event("mic", True, event_source="hid")
-            self.app._on_button_event("mic", False, event_source="hid")
-            generation = self.app._voice_release_finish_generation
-            self.app._complete_voice_release_finish(generation, "test")
-
-        self.assertEqual(self.app._voice_hotkey_release_pending, ("ralt",))
-        self.assertEqual(reconnect_calls, [1])
+        self.assertFalse(self.app._voice.active)
 
     def test_windows_actually_delivers_the_hold_hotkey(self):
         original_platform = sys.platform

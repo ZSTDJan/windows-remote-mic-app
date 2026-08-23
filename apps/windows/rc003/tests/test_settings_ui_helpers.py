@@ -181,6 +181,20 @@ class BuildSaveModelTests(unittest.TestCase):
         self.assertEqual(new_bindings["bindings"]["mic"]["kind"], "voice_hold")
         self.assertEqual(new_bindings["bindings"]["power"]["kind"], "key_combo")
 
+    def test_save_model_removes_the_retired_release_finish_setting(self):
+        self.base_config["voice_release_finish_tap_enabled"] = True
+
+        new_config, _ = build_save_model(
+            button_display_map={"mic": _VOICE_HOLD_DISPLAY},
+            hotkey_text="ralt",
+            trigger_mode=key_mapping.VoiceTriggerMode.HOLD,
+            endpoint_display_text="",
+            base_config=self.base_config,
+            base_bindings=self.base_bindings,
+        )
+
+        self.assertNotIn("voice_release_finish_tap_enabled", new_config)
+
     def test_mic_can_be_saved_as_an_ordinary_action(self):
         new_config, new_bindings = build_save_model(
             button_display_map={"mic": "escape", "power": "escape"},

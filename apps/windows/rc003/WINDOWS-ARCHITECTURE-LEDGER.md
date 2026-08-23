@@ -314,7 +314,7 @@ session detach 成功即证明其脚本不再被会话持有；单独 script unl
 
 | 路径 | 内容 |
 | --- | --- |
-| `config.json` | 设备选择、增益、重试、按住说话快捷键、松手收尾开关、输出端点 |
+| `config.json` | 设备选择、增益、重试、按住说话快捷键、输出端点 |
 | `key_bindings.json` | 主/次手势动作、可移植物理签名映射 |
 | `logs\app.log` | 轮转运行日志 |
 | `key-detection\` | 最多 30 秒有效的一次性按键检测 IPC |
@@ -335,11 +335,12 @@ session detach 成功即证明其脚本不再被会话持有；单独 script unl
 重启桥接。若新文件无法解析，运行时保留最后一份有效配置，但会立即关闭依赖
 配置的低层 F5 语音转换快照；修复并成功加载前不继续沿用旧转换行为。
 
-配置 schema 为 2。当前只写 `voice_hotkeys.hold`、`voice_hotkey`、固定值
-`voice_trigger_mode=hold` 和 `voice_release_finish_tap_enabled`。旧 schema-1
-开关快捷键不会被解释成按住快捷键；加载器优先取旧文件中单独保存的 HOLD
-快捷键，否则使用右侧 Alt 默认值。运行时迁移标记不会写回用户文件，只有用户
-明确重新选择并保存后才生成新配置。
+配置 schema 为 3。当前语音设置只写 `voice_hotkeys.hold`、`voice_hotkey` 和
+固定值 `voice_trigger_mode=hold`。旧 schema-1 开关快捷键不会被解释成按住
+快捷键；加载器优先取旧文件中单独保存的 HOLD 快捷键，否则使用右侧 Alt
+默认值。schema-2 的 `voice_release_finish_tap_enabled` 已撤下，加载或保存时
+都会移除。运行时迁移标记不会写回用户文件，只有用户明确重新选择并保存后才
+生成新配置。
 
 配置隐私守卫递归拒绝地址、设备 ID、设备路径、接口 ID 和 token 等字段，
 且大小写不敏感。诊断捕获也不提供“包含设备路径”开关。
@@ -350,8 +351,8 @@ session detach 成功即证明其脚本不再被会话持有；单独 script unl
 
 - `ConnectionPage.qml`：设备、桥接、输出端点，不重复承载语音动作设置；
 - `ButtonsPage.qml`：13 键整宽矩阵，按单击/双击/长按统一展示和编辑主/次动作，
-  通过共享 selected state 承接真实按键检测定位，并保存按住说话快捷键与
-  松手收尾开关；旧照片 hotspot roles 只留作 model 兼容，不再作为当前界面；
+  通过共享 selected state 承接真实按键检测定位，并保存按住说话快捷键；旧照片
+  hotspot roles 只留作 model 兼容，不再作为当前界面；
 - `PermissionsPage.qml`：权限和系统入口；
 - `DiagnosticsPage.qml`：BLE、音频、驱动和日志诊断；
 - `main.qml` / `Tokens.qml`：窗口、导航和设计 token。
@@ -474,7 +475,7 @@ Frida Gadget 与 VB-CABLE 包都使用固定 URL/version/SHA-256。运行时仍�
 截至 2026-08-22，历史异机结果已证明：多候选中可选出唯一可用 RC003、全部
 普通按键可在映射页识别、记事本映射有效、按住语音得到非零 PCM 和识别文字、
 F5 不再向输入框泄漏日期时间。On-request 真机探针最终未收到 `START_SEARCH`，
-开关型已正式撤下。最新代码检查点还需要复测 HOLD 短流尾音、松手收尾开关、
+开关型已正式撤下。最新代码检查点还需要复测 HOLD 短流尾音、标准松手结束、
 旧配置停用提示、自定义组合键不连发、断连重连、休眠恢复、长期运行、权限/
 杀软兼容和安装器升级/卸载。
 

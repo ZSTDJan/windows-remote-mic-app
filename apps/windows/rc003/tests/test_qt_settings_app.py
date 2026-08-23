@@ -555,11 +555,6 @@ class SettingsControllerTests(unittest.TestCase):
         self.assertTrue(controller.saveSettings())
         self.assertFalse(controller.settingsDirty)
 
-        controller.voiceReleaseFinishTapEnabled = True
-        self.assertTrue(controller.settingsDirty)
-        self.assertTrue(controller.saveSettings())
-        self.assertFalse(controller.settingsDirty)
-
         controller.selectedDeviceIndex = controller._DEVICE_ORDER.index(
             device_catalog.DJI_MIC_2_ID
         )
@@ -742,25 +737,14 @@ class SettingsControllerTests(unittest.TestCase):
     def test_restore_defaults_resets_voice_settings_and_mic_mapping(self):
         controller, model = self._make_controller()
         controller.holdVoiceHotkeyText = "ctrl+l"
-        controller.voiceReleaseFinishTapEnabled = True
         model.setActionTextAt(model.index_of("mic"), "Escape")
         controller.restoreDefaults()
         self.assertEqual(controller.holdVoiceHotkeyText, "ralt")
-        self.assertFalse(controller.voiceReleaseFinishTapEnabled)
         mic_index = model.index(model.index_of("mic"), 0)
         self.assertEqual(
             model.data(mic_index, model.ActionTextRole),
             settings_ui._VOICE_HOLD_DISPLAY,
         )
-
-    def test_release_finish_tap_option_persists(self):
-        controller, _ = self._make_controller()
-        controller.voiceReleaseFinishTapEnabled = True
-
-        self.assertTrue(controller.saveSettings())
-
-        saved = config.load_config(config.config_path(config.config_root()))
-        self.assertTrue(saved["voice_release_finish_tap_enabled"])
 
     def test_select_button_updates_both_the_controller_and_the_model(self):
         controller, model = self._make_controller()
@@ -1824,6 +1808,7 @@ import sys
 faulthandler.enable()
 
 from ovb_rc003 import qt_settings_app as m
+from PySide6.QtCore import QObject
 
 classes = m._load_qt_classes()
 QGuiApplication = classes["QGuiApplication"]
@@ -1861,6 +1846,10 @@ result = {
     "warnings": [w.toString() for w in warnings],
     "width": root_objects[0].property("width") if root_objects else None,
     "height": root_objects[0].property("height") if root_objects else None,
+    "retired_finish_tap_control_exists": bool(
+        root_objects
+        and root_objects[0].findChild(QObject, "voiceReleaseFinishTapSwitch")
+    ),
 }
 
 # XRBM-035: the real fast-close gate this probe exists to be - calls the
@@ -2359,6 +2348,7 @@ class OffscreenQmlLoadTests(unittest.TestCase):
         )
         self.assertGreater(data["width"], 0)
         self.assertGreater(data["height"], 0)
+        self.assertFalse(data["retired_finish_tap_control_exists"])
 
     def test_dji_device_page_hides_rc003_mapping_and_shows_dji_controls(self):
         import json

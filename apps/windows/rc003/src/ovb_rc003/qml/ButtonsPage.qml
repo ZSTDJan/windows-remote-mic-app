@@ -504,21 +504,6 @@ Item {
                             Accessible.name: qsTr("录制按住说话快捷键")
                         }
 
-                        Label {
-                            text: qsTr("松手后再触发一次")
-                            color: tokens.textPrimary
-                            font.pixelSize: tokens.fontSizeSmall
-                        }
-                        Switch {
-                            id: finishTapSwitch
-                            objectName: "voiceReleaseFinishTapSwitch"
-                            Layout.fillWidth: true
-                            checked: SettingsController.voiceReleaseFinishTapEnabled
-                            text: checked ? qsTr("已开启") : qsTr("已关闭")
-                            onToggled: SettingsController.voiceReleaseFinishTapEnabled = checked
-                            Accessible.name: qsTr("松手后再触发一次语音快捷键")
-                        }
-                        Item { }
                     }
 
                     Connections {

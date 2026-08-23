@@ -113,8 +113,6 @@ _BUTTON_ACTION_KEY_TOKENS = {
 
 _KEY_DETECTION_MIC_RELEASE_GRACE_SECONDS = 1.0
 _KEY_DETECTION_MIC_MAX_SECONDS = 10.0
-_VOICE_RELEASE_FINISH_AFTER_AUDIO_STOP_SECONDS = 0.12
-_VOICE_RELEASE_FINISH_FALLBACK_SECONDS = 0.8
 _ORDINARY_MIC_RELEASE_GUARD_SECONDS = 0.12
 
 
@@ -163,11 +161,6 @@ class RC003App:
         self._voice_audio_start_fallback_pending = False
         self._voice_audio_started_waiting_for_legacy_f5 = False
         self._voice_hotkey_release_pending: Optional[Tuple[str, ...]] = None
-        self._voice_release_finish_pending = False
-        self._voice_release_finish_generation = 0
-        self._voice_release_finish_handle: Optional[asyncio.TimerHandle] = None
-        self._voice_release_finish_tokens: Optional[Tuple[str, ...]] = None
-        self._voice_release_finish_session_eligible = False
         self._button_key_release_pending: Optional[Tuple[str, ...]] = None
         # Raw Input and the ATVV control channel arrive on different worker
         # threads. Serialize the voice state machine so one physical press
@@ -536,8 +529,6 @@ class RC003App:
             with self._voice_trigger_lock:
                 self._voice_audio_start_fallback_pending = False
                 self._voice_audio_started_waiting_for_legacy_f5 = False
-                self._cancel_voice_release_finish_locked("connection cleanup")
-                self._voice_release_finish_session_eligible = False
                 self._voice_raw_input_trigger_pending = False
                 self._voice_audio_stream_active = False
                 self._voice_audio_stop_processed = False
@@ -785,23 +776,17 @@ class RC003App:
     def _release_hold_voice_on_physical_release_locked(
         self,
         reason: str,
-        *,
-        queue_finish_tap: bool = False,
     ) -> bool:
         """Release HOLD shortcuts without depending solely on AUDIO_STOP."""
 
         action = self._voice.on_mic_button_released()
         if action is None:
-            if queue_finish_tap:
-                self._queue_voice_release_finish_locked()
             return True
         self._voice_raw_input_trigger_pending = False
         self._voice_audio_start_fallback_pending = False
         self._voice_pcm_forwarding_enabled = False
         if self._apply_voice_action(action):
             self._logger.info("voice hold hotkey released on %s", reason)
-            if queue_finish_tap:
-                self._queue_voice_release_finish_locked()
             return True
 
         self._voice.restore_pending(action)
@@ -812,108 +797,6 @@ class RC003App:
         )
         self._supervisor.request_reconnect()
         return False
-
-    def _cancel_voice_release_finish_locked(self, reason: str = "") -> None:
-        was_pending = self._voice_release_finish_pending
-        self._voice_release_finish_pending = False
-        self._voice_release_finish_generation += 1
-        self._voice_release_finish_tokens = None
-        handle = self._voice_release_finish_handle
-        self._voice_release_finish_handle = None
-        if handle is not None:
-            try:
-                self._event_loop.call_soon_threadsafe(handle.cancel)
-            except RuntimeError:
-                handle.cancel()
-        if was_pending and reason:
-            self._logger.info("voice release finish tap cancelled: %s", reason)
-
-    def _schedule_voice_release_finish_locked(
-        self,
-        delay: float,
-        reason: str,
-    ) -> None:
-        if not self._voice_release_finish_pending:
-            return
-        self._voice_release_finish_generation += 1
-        generation = self._voice_release_finish_generation
-
-        def install_timer() -> None:
-            with self._voice_trigger_lock:
-                if (
-                    generation != self._voice_release_finish_generation
-                    or not self._voice_release_finish_pending
-                ):
-                    return
-                if self._voice_release_finish_handle is not None:
-                    self._voice_release_finish_handle.cancel()
-                self._voice_release_finish_handle = self._event_loop.call_later(
-                    delay,
-                    self._complete_voice_release_finish,
-                    generation,
-                    reason,
-                )
-
-        try:
-            self._event_loop.call_soon_threadsafe(install_timer)
-        except RuntimeError:
-            self._cancel_voice_release_finish_locked(
-                "application event loop is closing"
-            )
-
-    def _queue_voice_release_finish_locked(self) -> None:
-        if not self._voice_release_finish_session_eligible:
-            return
-        self._voice_release_finish_session_eligible = False
-        if not bool(self._config.get("voice_release_finish_tap_enabled", False)):
-            return
-        self._cancel_voice_release_finish_locked("new release superseded old finish tap")
-        self._voice_release_finish_pending = True
-        self._voice_release_finish_tokens = (
-            tuple(self._voice_hotkey.modifiers) + (self._voice_hotkey.key,)
-        )
-        if self._voice_mic_gesture_audio_stopped:
-            delay = _VOICE_RELEASE_FINISH_AFTER_AUDIO_STOP_SECONDS
-            reason = "audio already stopped"
-        else:
-            delay = _VOICE_RELEASE_FINISH_FALLBACK_SECONDS
-            reason = "audio-stop fallback"
-        self._logger.info(
-            "voice release finish tap queued: delay_ms=%.0f reason=%s",
-            delay * 1000.0,
-            reason,
-        )
-        self._schedule_voice_release_finish_locked(delay, reason)
-
-    def _complete_voice_release_finish(self, generation: int, reason: str) -> None:
-        with self._voice_trigger_lock:
-            if (
-                generation != self._voice_release_finish_generation
-                or not self._voice_release_finish_pending
-            ):
-                return
-            tokens = self._voice_release_finish_tokens
-            self._voice_release_finish_pending = False
-            self._voice_release_finish_handle = None
-            self._voice_release_finish_tokens = None
-            if tokens is None or self._voice.active:
-                self._logger.info(
-                    "voice release finish tap skipped: a new hold session is active"
-                )
-                return
-            try:
-                win32_input.send_voice_key_combo_tap(tokens)
-            except win32_input.InputCleanupIncompleteError:
-                self._voice_hotkey_release_pending = tokens
-                self._logger.exception(
-                    "voice release finish tap failed and safety release remains pending"
-                )
-                self._supervisor.request_reconnect()
-                return
-            except (win32_input.Win32InputUnavailableError, OSError):
-                self._logger.exception("voice release finish tap failed")
-                return
-            self._logger.info("voice release finish tap sent after %s", reason)
 
     def _reset_key_detection_mic_gesture_locked(self) -> None:
         self._key_detection_mic_gesture_active = False
@@ -1245,8 +1128,6 @@ class RC003App:
     ) -> None:
         if trigger_mode != key_mapping.VoiceTriggerMode.HOLD:
             raise ValueError("RC003 voice settings support hold-to-talk only")
-        self._cancel_voice_release_finish_locked("voice settings changed")
-        self._voice_release_finish_session_eligible = False
         self._voice = voice_controller.VoiceController()
         self._voice_hotkey = voice_hotkey
         self._config["voice_trigger_mode"] = trigger_mode.value
@@ -1318,8 +1199,6 @@ class RC003App:
                 self._voice_hotkey.serialize(),
             )
             if self._voice_settings_idle_locked():
-                self._cancel_voice_release_finish_locked("settings reloaded")
-                self._voice_release_finish_session_eligible = False
                 self._config = refreshed_config
                 self._bindings = refreshed_bindings
                 self._removed_voice_bindings = removed_voice_bindings
@@ -1495,7 +1374,6 @@ class RC003App:
                             )
                         self._release_hold_voice_on_physical_release_locked(
                             "physical mic release",
-                            queue_finish_tap=True,
                         )
                     if (
                         self._voice_mic_gesture_active
@@ -1917,14 +1795,6 @@ class RC003App:
                 if self._voice_mic_gesture_active:
                     self._voice_mic_gesture_audio_started = False
                     self._voice_mic_gesture_audio_stopped = True
-                if self._voice_release_finish_pending:
-                    self._logger.info(
-                        "voice release finish tap rescheduled after audio stop"
-                    )
-                    self._schedule_voice_release_finish_locked(
-                        _VOICE_RELEASE_FINISH_AFTER_AUDIO_STOP_SECONDS,
-                        "audio stopped",
-                    )
                 action = self._voice.on_audio_stopped()
                 transformed_session = self._voice_legacy_transform_session
                 action_applied = (
@@ -1949,13 +1819,6 @@ class RC003App:
                         "requesting reconnect"
                     )
                     self._supervisor.request_reconnect()
-                elif action is not None:
-                    # AUDIO_STOP is the release fallback on machines where a
-                    # physical mic key-up is late or absent. Start the same
-                    # optional host-finish action here; a later physical
-                    # release sees the session as already consumed and cannot
-                    # queue a second tap.
-                    self._queue_voice_release_finish_locked()
                 elif (
                     self._voice_mic_gesture_active
                     and self._voice_mic_gesture_audio_stopped
@@ -1985,9 +1848,6 @@ class RC003App:
             self._voice_pcm_forwarding_enabled = False
             self._logger.info("voice ignored: BLE voice session is not connected")
             return
-
-        self._cancel_voice_release_finish_locked("new microphone press")
-        self._voice_release_finish_session_eligible = False
 
         if self._voice_hotkey_release_pending is not None:
             if not self._release_pending_voice_hotkey():
@@ -2028,7 +1888,6 @@ class RC003App:
             )
             return
 
-        self._voice_release_finish_session_eligible = True
         self._voice_pcm_forwarding_enabled = True
         if send_device_open and self._ble_session is not None:
             self._ble_session.send_mic_open_threadsafe()

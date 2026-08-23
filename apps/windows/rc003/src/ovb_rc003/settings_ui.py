@@ -212,7 +212,6 @@ def build_save_model(
     base_bindings: dict,
     selected_device_profile: str = device_catalog.RC003_ID,
     voice_hotkeys: Optional[Dict[str, str]] = None,
-    voice_release_finish_tap_enabled: Optional[bool] = None,
 ) -> Tuple[dict, dict]:
     """Pure validation+build step for "Save"/"Restore defaults", with no Tk
     dependency at all - directly unit tested without constructing any
@@ -352,11 +351,7 @@ def build_save_model(
     new_config["voice_hotkey"] = active_hotkey_text
     new_config["voice_hotkeys"] = mode_hotkeys
     new_config["voice_trigger_mode"] = active_mode.value
-    new_config["voice_release_finish_tap_enabled"] = bool(
-        base_config.get("voice_release_finish_tap_enabled", False)
-        if voice_release_finish_tap_enabled is None
-        else voice_release_finish_tap_enabled
-    )
+    new_config.pop("voice_release_finish_tap_enabled", None)
     new_config["output_endpoint_name"] = endpoint_name
     new_config["output_endpoint_host_api"] = endpoint_host_api
 
