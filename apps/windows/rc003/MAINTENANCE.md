@@ -1026,7 +1026,16 @@ HID 注入权限顺序与稳定失败提交：
 - 定向控制器、纯状态文字和真实离屏 QML 共 172 项通过。完整 unittest 1157 项
   通过、7 项按平台或安全条件跳过；`compileall`、`pip check`、PowerShell
   parser、公开边界扫描 290 个文件和 `git diff --check` 通过。
-- 候选构建和哈希在本节后续补录。
+- 修复提交为 `83adfba`。从该干净提交运行 `build/build-candidate.ps1`，公开边界、
+  固定资源、1157/7 完整测试、PyInstaller 和冻结 `--dry-run` 均通过。
+- 本机候选为
+  `D:\Wuxianmai\RemoteMicRC003-0.1.0-candidate-20260823-hold3`，共 2062 个文件、
+  320,901,336 字节；与 `dist\RemoteMicRC003` 逐文件 SHA-256 一致。EXE SHA-256
+  为 `8FF6A4840653035AA001746E0957159C33297BBBEA233AD9F6ED043112B38B0E`。
+- 冻结 `--help=0`、`--dry-run=0`、无效 HID 注入 PID `=4`。6 个 QML 与源码一致；
+  Frida Gadget 和 VB-CABLE 固定资源哈希分别为
+  `B566D70189B6D551AD8F4E0BEA24DE08A3D4C0F559BB35B2BDB67D45182240C2`、
+  `B950E39F01AF1D04EA623C8F6D8EB9B6EA5C477C637295FABF20631C85116BFB`。
 - 上述 18:01 真机日志证明旧 `hold2` 在桥接就绪后功能正常，不证明 `hold3`
   新增警告和等待提示已经人工验收。
 

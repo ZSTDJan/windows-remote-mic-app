@@ -8,8 +8,8 @@
 
 ## [Unreleased] — 2026-08-23
 
-状态：当前源码自动检查通过，部分历史真机路径通过，新的 HOLD-only 候选待构建和
-复测。历史测试已经确认 13 个实体键可识别、普通映射可执行、按住话筒键时存在
+状态：当前源码自动检查通过，部分历史真机路径通过，新的 `hold3` HOLD-only
+候选已构建并待复测。历史测试已经确认 13 个实体键可识别、普通映射可执行、按住话筒键时存在
 有效语音数据和可见识别文字，并解决了日期时间漏出、检测抢占、设置热加载、
 短音频乱序及松键释放等问题。最后一条隔离协议探针完成协商后仍未收到实体
 `START_SEARCH`，普通按钮也只能唤起宿主而不能让遥控器传声。用户据此决定正式
@@ -43,6 +43,18 @@
 `bugs/BUG-023-host-voice-release-finish.md`、
 `bugs/BUG-024-settings-edit-state-and-stale-hold-config.md`、
 `bugs/BUG-025-bridge-startup-readiness-warning.md` 和 `TESTING.md`。
+
+### 构建
+
+- 从修复提交 `83adfba` 的干净源码运行正式构建门禁，公开边界扫描 290 个文件、
+  完整 unittest 1157 项通过和 7 项跳过，PyInstaller 与冻结自检通过。
+- 本机候选目录为
+  `D:\Wuxianmai\RemoteMicRC003-0.1.0-candidate-20260823-hold3`，共 2062 个文件、
+  320,901,336 字节；与 `dist\RemoteMicRC003` 逐文件 SHA-256 一致。EXE SHA-256
+  为 `8FF6A4840653035AA001746E0957159C33297BBBEA233AD9F6ED043112B38B0E`。
+- `--help=0`、`--dry-run=0`、无效 HID 注入 PID `=4`；6 个 QML 与源码一致，
+  新桥接警告已进入冻结资源，旧松手补发文字和 On-request 专项文件均为零。
+- 当前只完成自动验证和构建，不代表 `hold3` 已通过真机验收。
 
 ### 界面
 
