@@ -227,7 +227,12 @@
   文件、320,898,562 字节，与构建输出逐文件 SHA-256 一致；`--help=0`、
   `--dry-run=0`，六个产品 QML 与源码一致且不含已撤下控件。EXE SHA-256 为
   `AE072B578FFA112F301201D8452C8A8959C656D75977BF00620A5E066819C5FF`。
-  本批不制作外发 ZIP，等待用户先验收本机程序。
+- 用户随后要求制作便携 ZIP：
+  `RemoteMicRC003-0.1.0-candidate-20260823-hold2-portable.zip`，大小
+  127,255,338 字节，SHA-256 为
+  `3D9E900195FE99D193D4C324D09D993B1F94146C4821456B62F1EF05527D44FB`。
+  完整解压后只有一个 `hold2` 版本顶层目录，2062 个文件与本机候选逐文件
+  SHA-256 一致；制作 ZIP 不等同于真机功能已经通过。
 - 当前 HOLD-only 收口核心定向测试 481 项通过、1 项按平台条件跳过；完整
   unittest 1151 项通过、7 项按平台或安全条件跳过，退出码 0。
 - `compileall`、`pip check`、PowerShell parser、`git diff --check` 通过；公开

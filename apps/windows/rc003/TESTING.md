@@ -510,7 +510,12 @@ HID 注入权限顺序与稳定失败提交：
   `D:\Wuxianmai\RemoteMicRC003-0.1.0-candidate-20260823-hold2`。共 2062 个文件，
   复制前后逐文件 SHA-256 一致；`--help=0`、`--dry-run=0`。EXE SHA-256 为
   `AE072B578FFA112F301201D8452C8A8959C656D75977BF00620A5E066819C5FF`。
-- 六个产品 QML 与源码逐文件一致，旧松手补发控件文字为零；本批没有制作 ZIP。
+- 六个产品 QML 与源码逐文件一致，旧松手补发控件文字为零。
+- 便携 ZIP：
+  `D:\Wuxianmai\RemoteMicRC003-0.1.0-candidate-20260823-hold2-portable.zip`，大小
+  127,255,338 字节，SHA-256 为
+  `3D9E900195FE99D193D4C324D09D993B1F94146C4821456B62F1EF05527D44FB`。完整解压
+  后只有一个版本顶层目录，2062 个文件与本机候选逐文件 SHA-256 一致。
 - 状态：自动检查通过，真机见 `TEST-VOICE-005`。
 
 ### CHECK-KEY-005 自定义组合键不参与按住连发
