@@ -336,6 +336,70 @@ class TapStateTests(unittest.TestCase):
             ],
         )
 
+    def test_gadget_handshake_and_heartbeat_do_not_announce_hid_ready(self):
+        statuses = []
+        tap = frida_compat.RC003HidReportTap(
+            lambda _report_id, _payload: None,
+            enabled=False,
+            injector=lambda _pid: None,
+            client_pid_resolver=lambda _client: 2468,
+            status_handler=lambda status, detail: statuses.append((status, detail)),
+        )
+
+        class FakeClient:
+            def __init__(self):
+                self.calls = 0
+
+            def settimeout(self, _timeout):
+                pass
+
+            def recv(self, _size):
+                self.calls += 1
+                if self.calls == 1:
+                    return b'{"kind":"ready","hook_installed":true}\n'
+                tap.stop_event.set()
+                return b'{"kind":"heartbeat","pid":2468}\n'
+
+            def close(self):
+                pass
+
+        class FakeServer:
+            def setsockopt(self, *_args):
+                pass
+
+            def bind(self, _address):
+                pass
+
+            def listen(self, _backlog):
+                pass
+
+            def settimeout(self, _timeout):
+                pass
+
+            def accept(self):
+                return FakeClient(), ("127.0.0.1", 1)
+
+            def close(self):
+                pass
+
+        with mock.patch.object(
+            frida_compat.frida_hid_tap_runtime,
+            "find_rc003_hidogatt_host_pid",
+            return_value=2468,
+        ), mock.patch.object(
+            frida_compat.socket,
+            "socket",
+            return_value=FakeServer(),
+        ):
+            tap._run()
+
+        state_names = [status for status, _detail in statuses]
+        self.assertIn(
+            frida_compat.HidTapState.ATTACHED_WAITING_IO.value,
+            state_names,
+        )
+        self.assertNotIn(frida_compat.HidTapState.READY.value, state_names)
+
     def test_non_object_json_message_is_ignored_without_killing_the_tap(self):
         statuses = []
         tap = frida_compat.RC003HidReportTap(

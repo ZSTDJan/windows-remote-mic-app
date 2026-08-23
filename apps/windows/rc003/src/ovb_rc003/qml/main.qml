@@ -32,6 +32,21 @@ ApplicationWindow {
 
     color: tokens.background
 
+    Timer {
+        id: bridgeStatusRefreshTimer
+        objectName: "bridgeStatusRefreshTimer"
+        interval: 2000
+        repeat: true
+        running: window.visible
+        onTriggered: SettingsController.refreshBridgeState()
+    }
+
+    onActiveChanged: {
+        if (active) {
+            SettingsController.refreshBridgeState()
+        }
+    }
+
     // XRBM-030 RETRY 1 blocker 2: Qt Quick Controls' "FluentWinUI3" style
     // resolves its OWN default text/background colors from
     // Qt.styleHints.colorScheme independently of Tokens.qml's colors (which

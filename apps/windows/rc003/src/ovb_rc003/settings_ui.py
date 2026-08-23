@@ -431,7 +431,8 @@ def describe_launch_result(result: bridge_launcher.LaunchResult) -> str:
     if result.outcome is bridge_launcher.LaunchOutcome.STARTED:
         pid_text = f"（PID {result.pid}）" if result.pid is not None else ""
         return (
-            f"已启动桥接进程{pid_text}，目前仍在运行。首次连接和补充按键通道"
+            f"已启动桥接进程{pid_text}，本次启动检查结束时进程仍在运行。"
+            "首次连接和补充按键通道"
             "就绪可能需要约一分钟；请等待后再测试。这只说明进程本身存活，"
             "不代表已经与 RC003 建立连接——请用下方“打开日志目录”查看 app.log "
             "确认实际连接、按键与语音状态。"

@@ -662,6 +662,11 @@ def _load_qt_classes() -> dict:
         _TRIGGER_MODE_ORDER = (key_mapping.VoiceTriggerMode.HOLD,)
         _DEVICE_ORDER = tuple(profile.device_id for profile in device_catalog.DEVICE_PROFILES)
         _KEY_DETECTION_TIMEOUT_SECONDS = 60.0
+        _KEY_DETECTION_USAGE_TO_BUTTON = {
+            usage: button_id
+            for usage, button_id in frida_compat.TAP_USAGE_TO_BUTTON.items()
+            if button_id in remote_layout.BUTTON_DISPLAY_NAMES
+        }
 
         def __init__(self, model: "ButtonMappingModel", parent=None) -> None:
             super().__init__(parent)
@@ -700,6 +705,7 @@ def _load_qt_classes() -> dict:
                     if self._bridge_running
                     else settings_ui.LAUNCH_NOT_STARTED_TEXT
                 )
+            self._has_explicit_launch_result = False
             self._status_message = ""
             self._error_message = ""
             self._settings_dirty = bool(self._removed_voice_bindings)
@@ -867,6 +873,8 @@ def _load_qt_classes() -> dict:
             self.djiMicStatusTextChanged.emit()
 
         def _set_launch_status(self, text: str) -> None:
+            if text == self._launch_status_text:
+                return
             self._launch_status_text = text
             self.launchStatusTextChanged.emit()
 
@@ -876,6 +884,27 @@ def _load_qt_classes() -> dict:
                 return
             self._bridge_running = value
             self.bridgeRunningChanged.emit()
+
+        def _refresh_bridge_status(self) -> bool | None:
+            try:
+                running = single_instance.bridge_instance_running()
+            except (
+                single_instance.SingleInstanceUnavailableError,
+                single_instance.MutexCleanupError,
+            ):
+                self._set_bridge_running(False)
+                if not self._has_explicit_launch_result:
+                    self._set_launch_status(settings_ui.LAUNCH_STATUS_UNKNOWN_TEXT)
+                return None
+
+            self._set_bridge_running(running)
+            if not self._has_explicit_launch_result:
+                self._set_launch_status(
+                    settings_ui.LAUNCH_ALREADY_RUNNING_TEXT
+                    if running
+                    else settings_ui.LAUNCH_NOT_STARTED_TEXT
+                )
+            return running
 
         def _set_status_message(self, text: str) -> None:
             self._status_message = text
@@ -955,13 +984,13 @@ def _load_qt_classes() -> dict:
             active = {
                 int.from_bytes(payload[index : index + 2], "little")
                 for index in range(0, len(payload), 2)
-            } & set(frida_compat.MISSING_USAGE_TO_BUTTON)
+            } & set(self._KEY_DETECTION_USAGE_TO_BUTTON)
             pressed = active - self._key_detection_tap_usages
             self._key_detection_tap_usages = set(active)
             if not pressed:
                 return
             usage = sorted(pressed)[0]
-            button_id = frida_compat.MISSING_USAGE_TO_BUTTON[usage]
+            button_id = self._KEY_DETECTION_USAGE_TO_BUTTON[usage]
             self._rawKeyDetected.emit(
                 button_id,
                 f"补充按键报告：按键值=0x{usage:04X}",
@@ -973,7 +1002,21 @@ def _load_qt_classes() -> dict:
         def _on_hid_tap_detection_status(self, status: str, detail: str) -> None:
             if not self._key_detection_active:
                 return
-            if status == frida_compat.HidTapState.READY.value:
+            if status == frida_compat.HidTapState.ATTACHED_WAITING_IO.value:
+                if self._key_detection_listener is not None:
+                    waiting_text = (
+                        "补充按键通道已连接，正在等待首次按键确认。"
+                        "请现在按一次要检测的遥控器按键；首次有效按键会同时完成"
+                        "通道确认和捕获。Windows 能直接识别的按键也可继续检测。"
+                    )
+                else:
+                    waiting_text = (
+                        "补充按键通道已连接，正在等待首次按键确认。"
+                        "请现在按一次要检测的遥控器按键；首次有效按键会同时完成"
+                        "通道确认和捕获，不需要先等待“已就绪”。"
+                    )
+                self._set_key_detection_text(waiting_text)
+            elif status == frida_compat.HidTapState.READY.value:
                 if self._key_detection_listener is not None:
                     ready_text = (
                         "两条按键通道均已就绪，13 个已知按键均可检测。"
@@ -996,7 +1039,8 @@ def _load_qt_classes() -> dict:
                 self._set_key_detection_text(
                     f"补充按键通道暂时不可用{suffix}。目前仍可检测 Windows "
                     "直接识别的按键，但返回键、音量键等按键可能暂时测不到；"
-                    "请等待提示变为“补充按键通道已就绪”后再测这些按键。"
+                    "通道会自动重新连接。看到“补充按键通道已连接”后请直接按一次"
+                    "要测的按键，不需要先等待“已就绪”。"
                 )
 
         def _on_hotkey_capture_result(self, chord: str) -> None:
@@ -1354,6 +1398,10 @@ def _load_qt_classes() -> dict:
             return self._save()
 
         @Slot()
+        def refreshBridgeState(self) -> None:
+            self._refresh_bridge_status()
+
+        @Slot()
         def startKeyDetection(self) -> None:
             """Listen for one real RC003 press without executing its action."""
 
@@ -1375,18 +1423,12 @@ def _load_qt_classes() -> dict:
             if self._selected_device_id() != device_catalog.RC003_ID:
                 self._set_key_detection_text("当前设备不是 RC003，无法检测遥控器按键。")
                 return
-            try:
-                bridge_running = single_instance.bridge_instance_running()
-            except (
-                single_instance.SingleInstanceUnavailableError,
-                single_instance.MutexCleanupError,
-            ):
-                self._set_bridge_running(False)
+            bridge_running = self._refresh_bridge_status()
+            if bridge_running is None:
                 self._set_key_detection_text(
                     "无法安全确认后台桥接状态，请关闭设置窗口和桥接后重试。"
                 )
                 return
-            self._set_bridge_running(bridge_running)
             if bridge_running:
                 try:
                     request = key_detection_bridge.request_detection(self._config_root)
@@ -1475,18 +1517,21 @@ def _load_qt_classes() -> dict:
             self._key_detection_listener = listener
             self._key_detection_tap = tap
             self._key_detection_tap_usages.clear()
+            self._key_detection_started_at = time.monotonic()
             self._key_detection_active = True
             self.keyDetectionActiveChanged.emit()
             if listener is not None and tap is not None:
                 detection_text = (
                     "Windows 按键通道已启动；补充按键通道正在连接。"
-                    "现在可先测试 Windows 能直接识别的按键；返回键、音量键等"
-                    "请等待“补充按键通道已就绪”后再测，首次可能需要约一分钟。"
+                    "Windows 能直接识别的按键现在即可测试；返回键、音量键等请在"
+                    "看到“补充按键通道已连接”后按一次，不需要等待“已就绪”。"
+                    "首次连接可能需要约一分钟。"
                 )
             elif tap is not None:
                 detection_text = (
-                    "补充按键通道正在连接。请等待“补充按键通道已就绪”后再按键；"
-                    "首次可能需要约一分钟。"
+                    "补充按键通道正在连接。看到“补充按键通道已连接”后请按一次"
+                    "要检测的遥控器按键，不需要等待“已就绪”；首次连接可能需要"
+                    "约一分钟。"
                 )
             else:
                 detection_text = (
@@ -1501,16 +1546,30 @@ def _load_qt_classes() -> dict:
         @Slot()
         def pollKeyDetectionBridge(self) -> None:
             request = self._key_detection_bridge_request
-            if request is None or not self._key_detection_active:
+            if not self._key_detection_active:
                 return
             if (
                 time.monotonic() - self._key_detection_started_at
                 >= self._KEY_DETECTION_TIMEOUT_SECONDS
             ):
                 self.stopKeyDetection()
-                self._set_key_detection_text(
-                    "等待后台桥接按键超时。请确认遥控器已连接后重新检测。"
-                )
+                if (
+                    self._key_detection_listener is not None
+                    or self._key_detection_tap is not None
+                ):
+                    return
+                if request is not None:
+                    timeout_text = (
+                        "等待后台桥接按键超时。请确认遥控器已连接后重新检测。"
+                    )
+                else:
+                    timeout_text = (
+                        "等待真实按键超时。请确认遥控器已连接后重新检测；补充按键"
+                        "通道连接后，第一次有效按键会同时完成确认和捕获。"
+                    )
+                self._set_key_detection_text(timeout_text)
+                return
+            if request is None:
                 return
             button_id = key_detection_bridge.poll_detection(request)
             if button_id is not None:
@@ -1592,6 +1651,7 @@ def _load_qt_classes() -> dict:
 
             if not self._save():
                 return
+            self._has_explicit_launch_result = True
             if self._selected_device_id() == device_catalog.DJI_MIC_2_ID:
                 self._set_launch_status(
                     "DJI Mic 2 使用 Windows 系统录音输入，不启动 RC003 BLE/HID/ATVV 桥。"

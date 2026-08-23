@@ -311,7 +311,7 @@ Item {
                     Label {
                         Layout.fillWidth: true
                         wrapMode: Text.WordWrap
-                        text: qsTr("这里显示本设置窗口最近一次启动结果，不代表 RC003 已连接。实际连接与语音状态请以日志和真机测试为准。")
+                        text: qsTr("这里显示窗口打开时的桥接状态或本设置窗口最近一次启动结果，不代表 RC003 已连接。实际连接与语音状态请以日志和真机测试为准。")
                         color: tokens.textSecondary
                         font.pixelSize: tokens.fontSizeSmall
                     }
