@@ -3020,13 +3020,19 @@ class SettingsShellSourceContractTests(unittest.TestCase):
         self.assertIn("rightCardRepeater.itemAt(i)", self.buttons_qml)
         self.assertIn("photoHotspotRepeater.itemAt(i)", self.buttons_qml)
         self.assertNotIn("function targetY(buttonId)", self.buttons_qml)
+        self.assertIn("root.selected || root.hovered", self.mapping_card_qml)
         self.assertIn(
-            "root.selected ? root.tokens.accent : root.tokens.cardBorder",
+            "? root.tokens.accent : root.tokens.cardBorder",
             self.mapping_card_qml,
         )
         self.assertIn("padding: 3", self.mapping_card_qml)
         self.assertIn("border.width: root.selected ? 2 : 1", self.mapping_card_qml)
         self.assertNotIn("root.tokens.accentSoft", self.mapping_card_qml)
+        self.assertIn("color: root.tokens.surface", self.mapping_card_qml)
+        self.assertIn("columnSpacing: 0", self.mapping_card_qml)
+        self.assertIn("spacing: 0", self.mapping_card_qml)
+        self.assertEqual(self.mapping_card_qml.count("GestureDivider { }"), 3)
+        self.assertNotIn("color: root.tokens.surfaceMuted", self.mapping_card_qml)
         for column_name in ("单击", "双击", "长按"):
             self.assertIn(f'qsTr("{column_name}")', self.mapping_card_qml)
         self.assertIn('objectName: exposeObjectNames ? "editMapping_" + cardId', self.mapping_card_qml)

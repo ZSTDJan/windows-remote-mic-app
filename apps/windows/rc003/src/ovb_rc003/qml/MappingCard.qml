@@ -27,17 +27,25 @@ AbstractButton {
         return text && text.length > 0 ? text : qsTr("未设置")
     }
 
+    component GestureDivider: Rectangle {
+        Layout.preferredWidth: 1
+        Layout.minimumWidth: 1
+        Layout.maximumWidth: 1
+        Layout.fillHeight: true
+        color: root.tokens.border
+    }
+
     background: Rectangle {
         radius: root.tokens.cornerRadiusSmall
-        color: root.hovered && !root.selected
-            ? root.tokens.surfaceMuted : root.tokens.surface
+        color: root.tokens.surface
         border.width: root.selected ? 2 : 1
-        border.color: root.selected ? root.tokens.accent : root.tokens.cardBorder
+        border.color: root.selected || root.hovered
+            ? root.tokens.accent : root.tokens.cardBorder
     }
 
     contentItem: GridLayout {
         columns: 2
-        columnSpacing: 4
+        columnSpacing: 0
 
         UiLabel {
             objectName: root.exposeObjectNames ? "mappingKeyCell_" + root.cardId : ""
@@ -59,14 +67,14 @@ AbstractButton {
         RowLayout {
             Layout.fillWidth: true
             Layout.fillHeight: true
-            spacing: 3
+            spacing: 0
 
-            Rectangle {
+            GestureDivider { }
+
+            Item {
                 objectName: root.exposeObjectNames ? "mappingSingleCell_" + root.cardId : ""
                 Layout.fillWidth: true
                 Layout.fillHeight: true
-                radius: 4
-                color: root.tokens.surfaceMuted
                 ColumnLayout {
                     anchors.fill: parent
                     anchors.margins: 2
@@ -87,12 +95,12 @@ AbstractButton {
                 }
             }
 
-            Rectangle {
+            GestureDivider { }
+
+            Item {
                 objectName: root.exposeObjectNames ? "mappingDoubleCell_" + root.cardId : ""
                 Layout.fillWidth: true
                 Layout.fillHeight: true
-                radius: 4
-                color: root.voiceAction ? "transparent" : root.tokens.surfaceMuted
                 ColumnLayout {
                     anchors.fill: parent
                     anchors.margins: 2
@@ -113,12 +121,12 @@ AbstractButton {
                 }
             }
 
-            Rectangle {
+            GestureDivider { }
+
+            Item {
                 objectName: root.exposeObjectNames ? "mappingLongCell_" + root.cardId : ""
                 Layout.fillWidth: true
                 Layout.fillHeight: true
-                radius: 4
-                color: root.voiceAction ? "transparent" : root.tokens.surfaceMuted
                 ColumnLayout {
                     anchors.fill: parent
                     anchors.margins: 2
