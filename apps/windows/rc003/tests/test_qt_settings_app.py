@@ -3024,6 +3024,9 @@ class SettingsShellSourceContractTests(unittest.TestCase):
             "root.selected ? root.tokens.accent : root.tokens.cardBorder",
             self.mapping_card_qml,
         )
+        self.assertIn("padding: 3", self.mapping_card_qml)
+        self.assertIn("border.width: root.selected ? 2 : 1", self.mapping_card_qml)
+        self.assertNotIn("root.tokens.accentSoft", self.mapping_card_qml)
         for column_name in ("单击", "双击", "长按"):
             self.assertIn(f'qsTr("{column_name}")', self.mapping_card_qml)
         self.assertIn('objectName: exposeObjectNames ? "editMapping_" + cardId', self.mapping_card_qml)

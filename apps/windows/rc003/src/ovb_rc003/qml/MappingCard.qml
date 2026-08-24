@@ -17,6 +17,7 @@ AbstractButton {
 
     hoverEnabled: true
     implicitHeight: 42
+    padding: 3
     objectName: exposeObjectNames ? "editMapping_" + cardId : ""
     Accessible.name: buttonName + qsTr("按键映射")
 
@@ -28,17 +29,15 @@ AbstractButton {
 
     background: Rectangle {
         radius: root.tokens.cornerRadiusSmall
-        color: root.selected
-            ? root.tokens.accentSoft
-            : root.hovered ? root.tokens.surfaceMuted : root.tokens.surface
-        border.width: root.selected ? 1.5 : 1
+        color: root.hovered && !root.selected
+            ? root.tokens.surfaceMuted : root.tokens.surface
+        border.width: root.selected ? 2 : 1
         border.color: root.selected ? root.tokens.accent : root.tokens.cardBorder
     }
 
     contentItem: GridLayout {
         columns: 2
         columnSpacing: 4
-        anchors.margins: 3
 
         UiLabel {
             objectName: root.exposeObjectNames ? "mappingKeyCell_" + root.cardId : ""
