@@ -3010,6 +3010,10 @@ class SettingsShellSourceContractTests(unittest.TestCase):
             'objectName: "photoHotspotMarker_" + photoHotspot.buttonId',
             self.buttons_qml,
         )
+        self.assertIn(
+            'objectName: "photoHotspotConnector_" + photoHotspot.buttonId',
+            self.buttons_qml,
+        )
         self.assertIn("hotspotX * photoImage.paintedWidth", self.buttons_qml)
         self.assertIn("hotspotY * photoImage.paintedHeight", self.buttons_qml)
         self.assertIn("visible: photoHotspot.isSelected", self.buttons_qml)
@@ -3033,6 +3037,16 @@ class SettingsShellSourceContractTests(unittest.TestCase):
         self.assertIn("spacing: 0", self.mapping_card_qml)
         self.assertEqual(self.mapping_card_qml.count("GestureDivider { }"), 3)
         self.assertNotIn("color: root.tokens.surfaceMuted", self.mapping_card_qml)
+        self.assertNotIn(
+            "font.pixelSize: root.tokens.fontSizeSmall",
+            self.mapping_card_qml,
+        )
+        self.assertEqual(
+            self.mapping_card_qml.count(
+                "font.pixelSize: root.tokens.fontSizeTiny"
+            ),
+            7,
+        )
         for column_name in ("单击", "双击", "长按"):
             self.assertIn(f'qsTr("{column_name}")', self.mapping_card_qml)
         self.assertIn('objectName: exposeObjectNames ? "editMapping_" + cardId', self.mapping_card_qml)
@@ -3968,10 +3982,16 @@ QTest.mouseClick(window, Qt.LeftButton, Qt.NoModifier, click_point)
 _render(window, app, 5)
 
 power_hotspot = _find(window, "photoHotspot_power")
+ok_hotspot = _find(window, "photoHotspot_ok")
+power_connector = _find(window, "photoHotspotConnector_power")
+ok_connector = _find(window, "photoHotspotConnector_ok")
 power_marker = _find(window, "photoHotspotMarker_power")
 ok_marker = _find(window, "photoHotspotMarker_ok")
 editor = _find(window, "actionEditorDialog")
 assert power_hotspot is not None, "Power photo hotspot not found"
+assert ok_hotspot is not None, "OK photo hotspot not found"
+assert power_connector is not None, "Power photo connector not found"
+assert ok_connector is not None, "OK photo connector not found"
 assert power_marker is not None, "Power photo marker not found"
 assert ok_marker is not None, "OK photo marker not found"
 assert editor is not None
@@ -4008,6 +4028,10 @@ results_out = {
         "painted_height": photo_image.property("paintedHeight"),
         "power_marker_visible": power_marker.property("visible"),
         "ok_marker_visible": ok_marker.property("visible"),
+        "power_hotspot": _geometry(power_hotspot),
+        "ok_hotspot": _geometry(ok_hotspot),
+        "power_connector": _geometry(power_connector),
+        "ok_connector": _geometry(ok_connector),
         "power_center_error_x": actual_power_center.x() - expected_power_center.x(),
         "power_center_error_y": actual_power_center.y() - expected_power_center.y(),
     },
@@ -4068,6 +4092,29 @@ class ButtonsPageMappingCardTests(unittest.TestCase):
         self.assertFalse(data["photo"]["ok_marker_visible"])
         self.assertAlmostEqual(data["photo"]["power_center_error_x"], 0, delta=1)
         self.assertAlmostEqual(data["photo"]["power_center_error_y"], 0, delta=1)
+
+    def test_photo_connectors_reach_their_button_hotspots(self):
+        photo = self._run_probe(720, 464)["photo"]
+        frame = photo["frame"]
+        power_hotspot = photo["power_hotspot"]
+        power_connector = photo["power_connector"]
+        ok_hotspot = photo["ok_hotspot"]
+        ok_connector = photo["ok_connector"]
+
+        self.assertAlmostEqual(power_connector["x"], frame["x"], delta=1)
+        self.assertAlmostEqual(power_connector["right"], power_hotspot["x"], delta=1)
+        self.assertAlmostEqual(
+            power_connector["y"] + power_connector["height"] / 2,
+            power_hotspot["y"] + power_hotspot["height"] / 2,
+            delta=1,
+        )
+        self.assertAlmostEqual(ok_connector["x"], ok_hotspot["right"], delta=1)
+        self.assertAlmostEqual(ok_connector["right"], frame["right"], delta=1)
+        self.assertAlmostEqual(
+            ok_connector["y"] + ok_connector["height"] / 2,
+            ok_hotspot["y"] + ok_hotspot["height"] / 2,
+            delta=1,
+        )
 
     def test_board_fits_default_minimum_and_large_windows(self):
         viewports = (("Basic", 720, 464), ("Basic", 640, 440), ("FluentWinUI3", 720, 464), ("FluentWinUI3", 840, 720))

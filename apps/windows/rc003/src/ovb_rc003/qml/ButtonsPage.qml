@@ -625,8 +625,23 @@ Item {
                                 z: 2
 
                                 Rectangle {
+                                    objectName: "photoHotspotConnector_" + photoHotspot.buttonId
+                                    x: root.isLeftButton(photoHotspot.buttonId)
+                                        ? -photoHotspot.x : photoHotspot.width
+                                    y: (photoHotspot.height - height) / 2
+                                    width: root.isLeftButton(photoHotspot.buttonId)
+                                        ? Math.max(0, photoHotspot.x)
+                                        : Math.max(0, photoFrame.width
+                                                   - photoHotspot.x - photoHotspot.width)
+                                    height: photoHotspot.isSelected ? 2 : 1
+                                    color: photoHotspot.isSelected
+                                        ? tokens.accent : tokens.borderStrong
+                                }
+
+                                Rectangle {
                                     objectName: "photoHotspotMarker_" + photoHotspot.buttonId
                                     anchors.fill: parent
+                                    z: 1
                                     visible: photoHotspot.isSelected
                                     radius: Math.min(width, height) / 2
                                     color: photoHotspot.isVoice
@@ -645,6 +660,7 @@ Item {
                                 HoverHandler { id: hotspotHover }
                                 Rectangle {
                                     anchors.fill: parent
+                                    z: 1
                                     visible: hotspotHover.hovered && !photoHotspot.isSelected
                                     radius: Math.min(width, height) / 2
                                     color: Qt.rgba(tokens.accent.r, tokens.accent.g,

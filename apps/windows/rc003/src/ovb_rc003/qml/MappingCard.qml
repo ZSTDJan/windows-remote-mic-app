@@ -57,7 +57,7 @@ AbstractButton {
             Layout.fillHeight: true
             text: root.buttonName
             Accessible.name: text
-            font.pixelSize: root.tokens.fontSizeSmall
+            font.pixelSize: root.tokens.fontSizeTiny
             font.weight: Font.Medium
             horizontalAlignment: Text.AlignHCenter
             verticalAlignment: Text.AlignVCenter
@@ -87,7 +87,7 @@ AbstractButton {
                         Layout.fillWidth: true
                         text: root.shown(root.singleText, false)
                         color: text === qsTr("未设置") ? root.tokens.disabledText : root.tokens.textPrimary
-                        font.pixelSize: root.tokens.fontSizeSmall
+                        font.pixelSize: root.tokens.fontSizeTiny
                         font.weight: text === qsTr("未设置") ? Font.Normal : Font.Medium
                         horizontalAlignment: Text.AlignHCenter
                         elide: Text.ElideRight
@@ -113,7 +113,7 @@ AbstractButton {
                         Layout.fillWidth: true
                         text: root.shown(root.doubleText, root.voiceAction)
                         color: root.voiceAction || text === qsTr("未设置") ? root.tokens.disabledText : root.tokens.textPrimary
-                        font.pixelSize: root.tokens.fontSizeSmall
+                        font.pixelSize: root.tokens.fontSizeTiny
                         font.weight: root.voiceAction || text === qsTr("未设置") ? Font.Normal : Font.Medium
                         horizontalAlignment: Text.AlignHCenter
                         elide: Text.ElideRight
@@ -139,7 +139,7 @@ AbstractButton {
                         Layout.fillWidth: true
                         text: root.shown(root.longText, root.voiceAction)
                         color: root.voiceAction || text === qsTr("未设置") ? root.tokens.disabledText : root.tokens.textPrimary
-                        font.pixelSize: root.tokens.fontSizeSmall
+                        font.pixelSize: root.tokens.fontSizeTiny
                         font.weight: root.voiceAction || text === qsTr("未设置") ? Font.Normal : Font.Medium
                         horizontalAlignment: Text.AlignHCenter
                         elide: Text.ElideRight
