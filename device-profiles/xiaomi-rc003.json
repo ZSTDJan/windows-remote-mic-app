@@ -6,7 +6,7 @@
   "model": "RC003",
   "support": {
     "status": "research",
-    "notes": "The Windows client has a source/build candidate; real RC003 pairing, button and voice-link acceptance is still pending."
+    "notes": "Windows 客户端已具备设置与运行能力；RC003 真机配对、按键和语音链路仍需继续验收。"
   },
   "identity": {
     "bluetoothNames": [

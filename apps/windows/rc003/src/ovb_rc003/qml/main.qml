@@ -22,7 +22,9 @@ import OvbRc003Settings 1.0
 ApplicationWindow {
     id: window
     title: qsTr("Remote Mic 设置")
-    width: 1024
+    // Compact default that still preserves the full tab bar and a 640 px
+    // mapping matrix beside the fixed product-photo sidebar.
+    width: 840
     height: 720
     minimumWidth: 640
     minimumHeight: 480

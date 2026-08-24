@@ -12,7 +12,7 @@ from typing import Callable, Optional
 
 
 SCHEMA_VERSION = 1
-STALE_AFTER_SECONDS = 30.0
+STALE_AFTER_SECONDS = 60.0
 
 
 @dataclass(frozen=True)

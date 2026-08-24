@@ -17,6 +17,12 @@ class HotkeySpecTests(unittest.TestCase):
             "ralt",
         )
 
+    def test_three_key_chord_still_round_trips_as_a_custom_shortcut(self):
+        spec = hotkey.HotkeySpec.parse("ctrl+alt+f8")
+        self.assertEqual(spec.modifiers, ("ctrl", "alt"))
+        self.assertEqual(spec.key, "f8")
+        self.assertEqual(spec.serialize(), "ctrl+alt+f8")
+
     def test_right_alt_can_be_used_as_a_hold_trigger(self):
         spec = hotkey.HotkeySpec.parse("right_alt")
         self.assertEqual(spec.modifiers, ())
@@ -37,12 +43,19 @@ class HotkeySpecTests(unittest.TestCase):
 
     def test_recorded_voice_chords_infer_their_required_trigger_mode(self):
         self.assertEqual(
+            key_mapping.voice_trigger_mode_for_hotkey("ralt"),
+            key_mapping.VoiceTriggerMode.HOLD,
+        )
+        self.assertEqual(
             key_mapping.voice_trigger_mode_for_hotkey("lctrl+lwin"),
             key_mapping.VoiceTriggerMode.HOLD,
         )
         self.assertEqual(
             key_mapping.voice_trigger_mode_for_hotkey("space+ralt"),
             key_mapping.VoiceTriggerMode.TOGGLE,
+        )
+        self.assertIsNone(
+            key_mapping.voice_trigger_mode_for_hotkey("f8+alt+ctrl")
         )
         self.assertIsNone(key_mapping.voice_trigger_mode_for_hotkey("win+h"))
 

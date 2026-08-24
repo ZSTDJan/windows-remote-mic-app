@@ -135,19 +135,30 @@ def voice_trigger_mode_for_action(
     return None
 
 
+# Right Alt remains the conservative default for hold-to-talk. A proposed
+# Ctrl+Alt+F8 default was rejected after UU remote-control testing showed that
+# the forwarded key-up edge does not preserve a stable physical hold duration.
+DEFAULT_HOLD_VOICE_HOTKEY = "ralt"
+LEGACY_HOLD_VOICE_HOTKEY = "ralt"
+LEGACY_TOGGLE_VOICE_HOTKEY = "ralt+space"
+
+# HOLD is the only selectable product mode. TOGGLE remains in this lookup only
+# so schema-1 data can still be identified and failed closed during migration.
 VOICE_HOTKEY_PRESETS = {
-    VoiceTriggerMode.TOGGLE: "ralt+space",
-    # Doubao's long-press mode is configured as the physical right Alt key.
-    # The Windows bridge emits a right-Alt virtual-key edge after swallowing
-    # RC003's leaked F5, so the host never sees F5 or a left-side modifier.
-    VoiceTriggerMode.HOLD: "ralt",
+    VoiceTriggerMode.TOGGLE: LEGACY_TOGGLE_VOICE_HOTKEY,
+    VoiceTriggerMode.HOLD: DEFAULT_HOLD_VOICE_HOTKEY,
 }
 
-# These values were shipped by earlier Windows builds. They are reserved
-# built-ins rather than user customizations, so config migration may replace
-# either spelling with the current physical shortcut.
+# These values were shipped by earlier Windows builds. They remain recognizable
+# so old configuration can keep its prior compatibility behavior without being
+# mistaken for the default of a fresh installation.
 LEGACY_VOICE_HOTKEYS = frozenset(
-    {"ralt", "ralt+space", "lctrl+win", "lctrl+lwin"}
+    {
+        LEGACY_HOLD_VOICE_HOTKEY,
+        LEGACY_TOGGLE_VOICE_HOTKEY,
+        "lctrl+win",
+        "lctrl+lwin",
+    }
 )
 
 
@@ -224,11 +235,10 @@ def action_allows_repeat(action: "ButtonAction") -> bool:
 def voice_trigger_mode_for_hotkey(hotkey_text: str) -> Optional[VoiceTriggerMode]:
     """Recognize current and historical built-in voice shortcuts.
 
-    ``ralt`` is the supported hold-to-talk preset. ``ralt+space`` remains
-    recognizable only so schema-1 toggle settings can be identified and
-    failed closed instead of silently becoming hold-to-talk. The old Ctrl+Win
-    chord is also recognized for migration. A physical recorder can return
-    either generic or directional Win, and users may press keys in either
+    ``ralt`` is the current hold-to-talk preset. The old Ctrl+Win chord remains
+    recognizable as a historical HOLD value. ``ralt+space`` is recognized
+    only so schema-1 TOGGLE settings can be identified and failed closed
+    instead of silently becoming hold-to-talk. Users may press keys in either
     order, so comparison uses normalized token sets.
     """
 
@@ -237,9 +247,13 @@ def voice_trigger_mode_for_hotkey(hotkey_text: str) -> Optional[VoiceTriggerMode
         for token in str(hotkey_text).split("+")
         if token.strip()
     )
-    if tokens == frozenset({"ralt"}):
+    default_hold_tokens = frozenset(DEFAULT_HOLD_VOICE_HOTKEY.split("+"))
+    if tokens in {
+        default_hold_tokens,
+        frozenset({LEGACY_HOLD_VOICE_HOTKEY}),
+    }:
         return VoiceTriggerMode.HOLD
-    if tokens == frozenset({"ralt", "space"}):
+    if tokens == frozenset(LEGACY_TOGGLE_VOICE_HOTKEY.split("+")):
         return VoiceTriggerMode.TOGGLE
     if (
         len(tokens) == 2

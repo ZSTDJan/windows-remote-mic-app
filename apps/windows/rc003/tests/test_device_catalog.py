@@ -19,8 +19,11 @@ class DeviceCatalogTests(unittest.TestCase):
         dji = device_catalog.profile_for(device_catalog.DJI_MIC_2_ID)
         self.assertEqual(rc003.display_name, "Xiaomi Bluetooth Remote 2 Pro / RC003")
         self.assertEqual(rc003.support_status, "research")
+        self.assertIn("真机配对、按键和语音链路仍需继续验收", rc003.description)
+        self.assertNotIn("source/build candidate", rc003.description)
         self.assertEqual(dji.display_name, "DJI Mic 2")
         self.assertEqual(dji.support_status, "research")
+        self.assertIn("持续录音和发射器按键控制仍待真机验收", dji.description)
         self.assertEqual(
             next(item.status for item in dji.platforms if item.platform == "windows"),
             "planned",

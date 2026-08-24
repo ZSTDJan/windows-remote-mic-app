@@ -39,6 +39,8 @@ from ovb_rc003 import (
 )
 from ovb_rc003.atvv_session import AudioStarted, AudioStopped, MicButtonPressed
 
+DEFAULT_VOICE_TOKENS = ("ralt",)
+
 
 def _run(coro):
     # Explicitly closing the loop (XRBM-018 review round 2 evidence: a
@@ -346,6 +348,166 @@ class LiveSettingsReloadTests(_AppWiringTestCase):
         self.assertFalse(worker.is_alive())
         self.assertFalse(self.app._legacy_voice_transform_enabled())
 
+    def test_mapping_reload_waits_for_an_in_flight_legacy_transform_pair(self):
+        pending = config.default_key_bindings()
+        pending["bindings"]["mic"] = key_mapping.ButtonAction(
+            key_mapping.ActionKind.ESCAPE
+        ).to_dict()
+        self.app._pending_bindings = pending
+
+        enabled_checked = threading.Event()
+        allow_transform = threading.Event()
+        settings_started = threading.Event()
+        transform_results = []
+        failures = []
+        original_enabled = self.app._legacy_voice_transform_enabled
+
+        def paused_enabled():
+            result = original_enabled()
+            enabled_checked.set()
+            if not allow_transform.wait(timeout=2.0):
+                raise AssertionError("transform pause was not released")
+            return result
+
+        def run_transform():
+            try:
+                transform_results.append(
+                    self.app._transform_legacy_voice_key(0x74, True)
+                )
+            except BaseException as exc:  # noqa: BLE001 - surface thread failure
+                failures.append(exc)
+
+        def apply_pending_settings():
+            try:
+                settings_started.set()
+                with self.app._voice_trigger_lock:
+                    self.app._apply_pending_voice_settings_if_idle_locked()
+            except BaseException as exc:  # noqa: BLE001 - surface thread failure
+                failures.append(exc)
+
+        with mock.patch.object(
+            self.app,
+            "_legacy_voice_transform_enabled",
+            side_effect=paused_enabled,
+        ):
+            transform_thread = threading.Thread(target=run_transform)
+            settings_thread = threading.Thread(target=apply_pending_settings)
+            transform_thread.start()
+            self.assertTrue(enabled_checked.wait(timeout=1.0))
+            settings_thread.start()
+            self.assertTrue(settings_started.wait(timeout=1.0))
+            self.assertTrue(settings_thread.is_alive())
+            allow_transform.set()
+            transform_thread.join(timeout=2.0)
+            settings_thread.join(timeout=2.0)
+
+        self.assertFalse(transform_thread.is_alive())
+        self.assertFalse(settings_thread.is_alive())
+        self.assertEqual(failures, [])
+        self.assertEqual(len(transform_results), 1)
+        target = transform_results[0]
+        self.assertIsNotNone(target)
+        self.assertIsNotNone(self.app._pending_bindings)
+        self.assertEqual(
+            self.app._bindings["bindings"]["mic"]["kind"],
+            key_mapping.ActionKind.VOICE_HOLD.value,
+        )
+        self.assertTrue(self.app._legacy_voice_transform_snapshot)
+
+        calls = []
+        with mock.patch.object(
+            win32_input,
+            "send_voice_key_combo_down",
+            side_effect=lambda tokens: calls.append(("down", tokens)),
+        ), mock.patch.object(
+            win32_input,
+            "send_voice_key_combo_up",
+            side_effect=lambda tokens: calls.append(("up", tokens)),
+        ):
+            self.assertTrue(self.app._emit_legacy_voice_key(target, True))
+            self.app._on_legacy_key_event(0x74, True)
+            self._drain_event_loop()
+
+            up_target = self.app._transform_legacy_voice_key(0x74, False)
+            self.assertEqual(up_target, target)
+            self.assertTrue(self.app._emit_legacy_voice_key(up_target, False))
+            self.app._on_legacy_key_event(0x74, False)
+            self._drain_event_loop()
+            self.app._on_control_event(AudioStopped())
+
+        self.assertEqual(calls, [("down", ("ralt",)), ("up", ("ralt",))])
+        self.assertFalse(self.app._voice_legacy_transform_key_down)
+        self.assertFalse(self.app._voice_legacy_transform_session)
+        self.assertIsNone(self.app._pending_bindings)
+        self.assertEqual(
+            self.app._bindings["bindings"]["mic"]["kind"],
+            key_mapping.ActionKind.ESCAPE.value,
+        )
+        self.assertFalse(self.app._legacy_voice_transform_snapshot)
+
+    def test_idle_settings_commit_blocks_a_transform_until_snapshot_publish(self):
+        pending = config.default_key_bindings()
+        pending["bindings"]["mic"] = key_mapping.ButtonAction(
+            key_mapping.ActionKind.ESCAPE
+        ).to_dict()
+        self.app._pending_bindings = pending
+
+        idle_checked = threading.Event()
+        allow_settings_commit = threading.Event()
+        transform_results = []
+        failures = []
+        original_settings_idle = self.app._voice_settings_idle_locked
+
+        def paused_settings_idle():
+            result = original_settings_idle()
+            idle_checked.set()
+            if not allow_settings_commit.wait(timeout=2.0):
+                raise AssertionError("settings commit pause was not released")
+            return result
+
+        def apply_pending_settings():
+            try:
+                with self.app._voice_trigger_lock:
+                    self.app._apply_pending_voice_settings_if_idle_locked()
+            except BaseException as exc:  # noqa: BLE001 - surface thread failure
+                failures.append(exc)
+
+        def run_transform():
+            try:
+                transform_results.append(
+                    self.app._transform_legacy_voice_key(0x74, True)
+                )
+            except BaseException as exc:  # noqa: BLE001 - surface thread failure
+                failures.append(exc)
+
+        with mock.patch.object(
+            self.app,
+            "_voice_settings_idle_locked",
+            side_effect=paused_settings_idle,
+        ):
+            settings_thread = threading.Thread(target=apply_pending_settings)
+            transform_thread = threading.Thread(target=run_transform)
+            settings_thread.start()
+            self.assertTrue(idle_checked.wait(timeout=1.0))
+            transform_thread.start()
+            self.assertTrue(transform_thread.is_alive())
+            allow_settings_commit.set()
+            settings_thread.join(timeout=2.0)
+            transform_thread.join(timeout=2.0)
+
+        self.assertFalse(settings_thread.is_alive())
+        self.assertFalse(transform_thread.is_alive())
+        self.assertEqual(failures, [])
+        self.assertEqual(transform_results, [None])
+        self.assertIsNone(self.app._pending_bindings)
+        self.assertEqual(
+            self.app._bindings["bindings"]["mic"]["kind"],
+            key_mapping.ActionKind.ESCAPE.value,
+        )
+        self.assertFalse(self.app._legacy_voice_transform_snapshot)
+        self.assertFalse(self.app._voice_legacy_transform_key_down)
+        self.assertFalse(self.app._voice_legacy_transform_session)
+
 
 class CandidateResolutionWiringTests(_AppWiringTestCase):
     def test_connect_once_uses_connectable_candidate_resolver(self):
@@ -428,7 +590,7 @@ class HostHotkeyFailureSuppressesMicOpenTests(_AppWiringTestCase):
 
         self.assertEqual(self.app._ble_session.mic_open_calls, 0)
         self.assertFalse(self.app._voice.active)
-        self.assertEqual(self.app._voice_hotkey_release_pending, ("ralt",))
+        self.assertEqual(self.app._voice_hotkey_release_pending, DEFAULT_VOICE_TOKENS)
 
     def test_safety_release_uses_the_original_shortcut_after_settings_change(self):
         self.app._voice_hotkey_release_pending = ("ralt",)
@@ -468,7 +630,10 @@ class HostHotkeyFailureSuppressesMicOpenTests(_AppWiringTestCase):
             self.app._on_button_event("mic", False, event_source="hid")
             self.app._on_control_event(AudioStopped())
 
-        self.assertEqual(calls, [("down", ("ralt",)), ("up", ("ralt",))])
+        self.assertEqual(
+            calls,
+            [("down", DEFAULT_VOICE_TOKENS), ("up", DEFAULT_VOICE_TOKENS)],
+        )
         self.assertEqual(self.app._ble_session.mic_open_calls, 0)
         self.assertFalse(self.app._voice.active)
 
@@ -487,7 +652,10 @@ class HostHotkeyFailureSuppressesMicOpenTests(_AppWiringTestCase):
             self.app._on_legacy_key_event(0x74, False)
             self._drain_event_loop()
 
-        self.assertEqual(calls, [("down", ("ralt",)), ("up", ("ralt",))])
+        self.assertEqual(
+            calls,
+            [("down", DEFAULT_VOICE_TOKENS), ("up", DEFAULT_VOICE_TOKENS)],
+        )
         self.assertFalse(self.app._voice.active)
 
     def test_physical_legacy_f5_transform_skips_a_second_host_shortcut(self):
@@ -505,7 +673,21 @@ class HostHotkeyFailureSuppressesMicOpenTests(_AppWiringTestCase):
         self.assertTrue(self.app._voice.active)
         self.assertTrue(self.app._voice_legacy_transform_session)
 
-    def test_hold_preset_maps_f5_to_one_right_alt_down_and_up_target(self):
+    def test_fresh_default_enables_the_right_alt_f5_transform(self):
+        self.assertEqual(self.app._voice_hotkey.serialize(), "ralt")
+        self.app._refresh_legacy_voice_transform_snapshot_locked()
+
+        self.assertTrue(self.app._legacy_voice_transform_enabled())
+        target = self.app._transform_legacy_voice_key(0x74, True)
+        self.assertEqual(
+            target,
+            app_module.legacy_key_suppressor_windows.PhysicalKeyTarget(
+                0xA5, 0x38, True, True
+            ),
+        )
+        self.assertTrue(self.app._voice_legacy_transform_key_down)
+
+    def test_legacy_hold_preset_maps_f5_to_one_right_alt_target(self):
         self.app._voice_hotkey = app_module.hotkey.HotkeySpec.parse("lctrl+lwin")
         self.app._refresh_legacy_voice_transform_snapshot_locked()
 
@@ -572,6 +754,8 @@ class HostHotkeyFailureSuppressesMicOpenTests(_AppWiringTestCase):
         self.assertFalse(self.app._voice_legacy_transform_emitted)
 
     def test_audio_start_waits_for_physical_f5_when_transform_is_enabled(self):
+        self._save_voice_settings(mode="hold", hotkey_text="ralt")
+        self.app._reload_settings_if_changed()
         calls = []
         with mock.patch.object(
             win32_input,
@@ -690,10 +874,10 @@ class HostHotkeyFailureSuppressesMicOpenTests(_AppWiringTestCase):
         self.assertEqual(
             calls,
             [
-                ("down", ("ralt",)),
-                ("up", ("ralt",)),
-                ("down", ("ralt",)),
-                ("up", ("ralt",)),
+                ("down", DEFAULT_VOICE_TOKENS),
+                ("up", DEFAULT_VOICE_TOKENS),
+                ("down", DEFAULT_VOICE_TOKENS),
+                ("up", DEFAULT_VOICE_TOKENS),
             ],
         )
         finish_tap.assert_not_called()
@@ -1079,7 +1263,10 @@ class VoiceMappingProductBoundaryTests(_AppWiringTestCase):
             self.app._on_button_event("mic", True, event_source="hid")
             self.app._on_button_event("mic", False, event_source="hid")
 
-        self.assertEqual(calls, [("down", ("ralt",)), ("up", ("ralt",))])
+        self.assertEqual(
+            calls,
+            [("down", DEFAULT_VOICE_TOKENS), ("up", DEFAULT_VOICE_TOKENS)],
+        )
         self.assertFalse(self.app._voice.active)
 
     def test_direct_hid_release_does_not_wait_for_late_f5_release(self):
@@ -1098,8 +1285,716 @@ class VoiceMappingProductBoundaryTests(_AppWiringTestCase):
             self.app._on_button_event("mic", False, event_source="hid_tap")
             self.app._on_button_event("mic", False, event_source="legacy_f5")
 
+        self.assertEqual(
+            calls,
+            [("down", DEFAULT_VOICE_TOKENS), ("up", DEFAULT_VOICE_TOKENS)],
+        )
+        self.assertFalse(self.app._voice.active)
+
+    def test_next_audio_session_is_not_blocked_by_late_f5_after_direct_hid_release(self):
+        voice_tokens = ("lctrl", "lalt", "f8")
+        self.app._voice_hotkey = app_module.hotkey.HotkeySpec.parse(
+            "+".join(voice_tokens)
+        )
+        self.app._refresh_legacy_voice_transform_snapshot_locked()
+        calls = []
+        with mock.patch.object(
+            self.app,
+            "_voice_hotkey_text_for_mode",
+            return_value="+".join(voice_tokens),
+        ), mock.patch.object(
+            self.app,
+            "_open_playback_for_new_session",
+            return_value=True,
+        ), mock.patch.object(
+            win32_input,
+            "send_voice_key_combo_down",
+            side_effect=lambda tokens: calls.append(("down", tokens)),
+        ), mock.patch.object(
+            win32_input,
+            "send_voice_key_combo_up",
+            side_effect=lambda tokens: calls.append(("up", tokens)),
+        ):
+            self.app._on_button_event("mic", True, event_source="legacy_f5")
+            self.app._on_control_event(AudioStarted(session_id=1))
+            self.app._on_button_event("mic", True, event_source="hid_tap")
+            self.app._on_button_event("mic", False, event_source="hid_tap")
+            self.app._on_control_event(AudioStopped())
+
+            self.assertTrue(self.app._voice_mic_gesture_active)
+            self.assertEqual(
+                self.app._voice_mic_gesture_sources_down,
+                {"legacy_f5"},
+            )
+
+            self.app._on_control_event(AudioStarted(session_id=2))
+
+        self.assertEqual(
+            calls,
+            [
+                ("down", voice_tokens),
+                ("up", voice_tokens),
+                ("down", voice_tokens),
+            ],
+        )
+        self.assertTrue(self.app._voice.active)
+        self.assertTrue(self.app._voice_pcm_forwarding_enabled)
+        self.assertTrue(self.app._voice_mic_gesture_audio_started)
+
+    def test_late_stale_f5_up_does_not_close_rolled_over_audio_session(self):
+        voice_tokens = ("lctrl", "lalt", "f8")
+        self.app._voice_hotkey = app_module.hotkey.HotkeySpec.parse(
+            "+".join(voice_tokens)
+        )
+        self.app._refresh_legacy_voice_transform_snapshot_locked()
+        calls = []
+        with mock.patch.object(
+            self.app,
+            "_voice_hotkey_text_for_mode",
+            return_value="+".join(voice_tokens),
+        ), mock.patch.object(
+            self.app,
+            "_open_playback_for_new_session",
+            return_value=True,
+        ), mock.patch.object(
+            win32_input,
+            "send_voice_key_combo_down",
+            side_effect=lambda tokens: calls.append(("down", tokens)),
+        ), mock.patch.object(
+            win32_input,
+            "send_voice_key_combo_up",
+            side_effect=lambda tokens: calls.append(("up", tokens)),
+        ):
+            self.app._on_legacy_key_event(0x74, True)
+            self._drain_event_loop()
+            self.app._on_control_event(AudioStarted(session_id=1))
+            self.app._on_button_event("mic", True, event_source="hid_tap")
+            self.app._on_button_event("mic", False, event_source="hid_tap")
+            self.app._on_control_event(AudioStopped())
+
+            self.app._on_control_event(AudioStarted(session_id=2))
+            self.app._on_legacy_key_event(0x74, False)
+            self._drain_event_loop()
+
+            self.assertTrue(self.app._voice.active)
+            self.assertTrue(self.app._voice_pcm_forwarding_enabled)
+
+            self.app._on_button_event("mic", True, event_source="hid_tap")
+            self.app._on_control_event(AudioStopped())
+            self.app._on_button_event("mic", False, event_source="hid_tap")
+
+        self.assertEqual(
+            calls,
+            [
+                ("down", voice_tokens),
+                ("up", voice_tokens),
+                ("down", voice_tokens),
+                ("up", voice_tokens),
+            ],
+        )
+        self.assertFalse(self.app._voice.active)
+        self.assertFalse(self.app._voice_pcm_forwarding_enabled)
+
+    def test_f5_up_then_bounce_down_does_not_open_false_session(self):
+        voice_tokens = ("lctrl", "lalt", "f8")
+        self.app._voice_hotkey = app_module.hotkey.HotkeySpec.parse(
+            "+".join(voice_tokens)
+        )
+        self.app._refresh_legacy_voice_transform_snapshot_locked()
+        calls = []
+        with mock.patch.object(
+            self.app,
+            "_voice_hotkey_text_for_mode",
+            return_value="+".join(voice_tokens),
+        ), mock.patch.object(
+            self.app,
+            "_open_playback_for_new_session",
+            return_value=True,
+        ), mock.patch.object(
+            win32_input,
+            "send_voice_key_combo_down",
+            side_effect=lambda tokens: calls.append(("down", tokens)),
+        ), mock.patch.object(
+            win32_input,
+            "send_voice_key_combo_up",
+            side_effect=lambda tokens: calls.append(("up", tokens)),
+        ):
+            self.app._on_legacy_key_event(0x74, True)
+            self._drain_event_loop()
+            self.app._on_control_event(AudioStarted(session_id=1))
+            self.app._on_button_event("mic", True, event_source="hid_tap")
+            self.app._on_button_event("mic", False, event_source="hid_tap")
+            self.app._on_control_event(AudioStopped())
+            self.app._on_legacy_key_event(0x74, False)
+            self._drain_event_loop()
+
+            self.app._on_legacy_key_event(0x74, True)
+            self._drain_event_loop()
+
+        self.assertEqual(
+            calls,
+            [("down", voice_tokens), ("up", voice_tokens)],
+        )
+        self.assertTrue(self.app._legacy_f5_untrusted)
+        self.assertFalse(self.app._voice.active)
+        self.assertFalse(self.app._voice_pcm_forwarding_enabled)
+
+    def test_quarantined_legacy_only_press_falls_back_to_audio_started(self):
+        voice_tokens = ("lctrl", "lalt", "f8")
+        self.app._voice_hotkey = app_module.hotkey.HotkeySpec.parse(
+            "+".join(voice_tokens)
+        )
+        self.app._refresh_legacy_voice_transform_snapshot_locked()
+        calls = []
+        with mock.patch.object(
+            self.app,
+            "_voice_hotkey_text_for_mode",
+            return_value="+".join(voice_tokens),
+        ), mock.patch.object(
+            self.app,
+            "_open_playback_for_new_session",
+            return_value=True,
+        ), mock.patch.object(
+            win32_input,
+            "send_voice_key_combo_down",
+            side_effect=lambda tokens: calls.append(("down", tokens)),
+        ), mock.patch.object(
+            win32_input,
+            "send_voice_key_combo_up",
+            side_effect=lambda tokens: calls.append(("up", tokens)),
+        ):
+            self.app._on_legacy_key_event(0x74, True)
+            self._drain_event_loop()
+            self.app._on_control_event(AudioStarted(session_id=1))
+            self.app._on_button_event("mic", True, event_source="hid_tap")
+            self.app._on_button_event("mic", False, event_source="hid_tap")
+            self.app._on_control_event(AudioStopped())
+            self.app._on_legacy_key_event(0x74, False)
+            self._drain_event_loop()
+
+            self.app._on_legacy_key_event(0x74, True)
+            self._drain_event_loop()
+            self.app._on_control_event(AudioStarted(session_id=2))
+            self.app._on_legacy_key_event(0x74, False)
+            self._drain_event_loop()
+
+            self.assertTrue(self.app._voice.active)
+            self.assertTrue(self.app._voice_pcm_forwarding_enabled)
+
+            self.app._on_control_event(AudioStopped())
+
+        self.assertEqual(
+            calls,
+            [
+                ("down", voice_tokens),
+                ("up", voice_tokens),
+                ("down", voice_tokens),
+                ("up", voice_tokens),
+            ],
+        )
+        self.assertFalse(self.app._voice.active)
+        self.assertFalse(self.app._voice_pcm_forwarding_enabled)
+
+    def test_fresh_clean_legacy_only_press_still_works(self):
+        calls = []
+        with mock.patch.object(
+            win32_input,
+            "send_voice_key_combo_down",
+            side_effect=lambda tokens: calls.append(("down", tokens)),
+        ), mock.patch.object(
+            win32_input,
+            "send_voice_key_combo_up",
+            side_effect=lambda tokens: calls.append(("up", tokens)),
+        ):
+            self.app._on_legacy_key_event(0x74, True)
+            self._drain_event_loop()
+            self.app._on_legacy_key_event(0x74, False)
+            self._drain_event_loop()
+
+        self.assertEqual(
+            calls,
+            [
+                ("down", DEFAULT_VOICE_TOKENS),
+                ("up", DEFAULT_VOICE_TOKENS),
+            ],
+        )
+        self.assertFalse(self.app._legacy_f5_untrusted)
+
+    def test_quarantined_default_right_alt_falls_back_on_audio_started(self):
+        self.app._legacy_f5_untrusted = True
+        calls = []
+        with mock.patch.object(
+            self.app,
+            "_open_playback_for_new_session",
+            return_value=True,
+        ), mock.patch.object(
+            win32_input,
+            "send_voice_key_combo_down",
+            side_effect=lambda tokens: calls.append(("down", tokens)),
+        ), mock.patch.object(
+            win32_input,
+            "send_voice_key_combo_up",
+            side_effect=lambda tokens: calls.append(("up", tokens)),
+        ):
+            self.assertIsNone(self.app._transform_legacy_voice_key(0x74, True))
+            self.app._on_legacy_key_event(0x74, True)
+            self._drain_event_loop()
+            self.app._on_control_event(AudioStarted(session_id=2))
+
+            self.assertTrue(self.app._voice.active)
+            self.assertTrue(self.app._voice_pcm_forwarding_enabled)
+
+            self.app._on_legacy_key_event(0x74, False)
+            self._drain_event_loop()
+            self.app._on_control_event(AudioStopped())
+
+        self.assertEqual(
+            calls,
+            [
+                ("down", DEFAULT_VOICE_TOKENS),
+                ("up", DEFAULT_VOICE_TOKENS),
+            ],
+        )
+        self.assertFalse(self.app._voice.active)
+
+    def test_queued_legacy_down_is_dropped_after_direct_hid_quarantine(self):
+        calls = []
+        with mock.patch.object(
+            self.app,
+            "_open_playback_for_new_session",
+            return_value=True,
+        ), mock.patch.object(
+            win32_input,
+            "send_voice_key_combo_down",
+            side_effect=lambda tokens: calls.append(("down", tokens)),
+        ), mock.patch.object(
+            win32_input,
+            "send_voice_key_combo_up",
+            side_effect=lambda tokens: calls.append(("up", tokens)),
+        ):
+            self.app._on_button_event("mic", True, event_source="hid_tap")
+            self.app._on_legacy_key_event(0x74, True)
+            self.app._on_button_event("mic", False, event_source="hid_tap")
+            self._drain_event_loop()
+
+        self.assertEqual(
+            calls,
+            [
+                ("down", DEFAULT_VOICE_TOKENS),
+                ("up", DEFAULT_VOICE_TOKENS),
+            ],
+        )
+        self.assertTrue(self.app._legacy_f5_untrusted)
+        self.assertFalse(self.app._voice.active)
+
+    def test_transform_and_direct_hid_quarantine_are_serialized(self):
+        enabled_checked = threading.Event()
+        allow_transform = threading.Event()
+        quarantine_entered = threading.Event()
+        transform_results = []
+        failures = []
+        original_enabled = self.app._legacy_voice_transform_enabled
+        original_mark = self.app._mark_legacy_f5_untrusted_if_stale_locked
+
+        def paused_enabled():
+            result = original_enabled()
+            enabled_checked.set()
+            if not allow_transform.wait(timeout=2.0):
+                raise AssertionError("transform pause was not released")
+            return result
+
+        def observed_mark(**kwargs):
+            quarantine_entered.set()
+            return original_mark(**kwargs)
+
+        def run_transform():
+            try:
+                transform_results.append(
+                    self.app._transform_legacy_voice_key(0x74, True)
+                )
+            except BaseException as exc:  # noqa: BLE001 - surface thread failure
+                failures.append(exc)
+
+        def run_direct_release():
+            try:
+                with self.app._voice_trigger_lock:
+                    self.assertTrue(
+                        self.app._begin_voice_mic_gesture(
+                            "hid_tap",
+                            physical_down=True,
+                        )
+                    )
+                self.app._on_button_event(
+                    "mic",
+                    False,
+                    event_source="hid_tap",
+                )
+            except BaseException as exc:  # noqa: BLE001 - surface thread failure
+                failures.append(exc)
+
+        with mock.patch.object(
+            self.app,
+            "_legacy_voice_transform_enabled",
+            side_effect=paused_enabled,
+        ), mock.patch.object(
+            self.app,
+            "_mark_legacy_f5_untrusted_if_stale_locked",
+            side_effect=observed_mark,
+        ):
+            transform_thread = threading.Thread(target=run_transform)
+            release_thread = threading.Thread(target=run_direct_release)
+            transform_thread.start()
+            self.assertTrue(enabled_checked.wait(timeout=1.0))
+            release_thread.start()
+            self.assertTrue(quarantine_entered.wait(timeout=1.0))
+            self.assertTrue(release_thread.is_alive())
+            allow_transform.set()
+            transform_thread.join(timeout=2.0)
+            release_thread.join(timeout=2.0)
+
+        self.assertFalse(transform_thread.is_alive())
+        self.assertFalse(release_thread.is_alive())
+        self.assertEqual(failures, [])
+        self.assertEqual(transform_results, [None])
+        self.assertFalse(self.app._legacy_f5_untrusted)
+        self.assertFalse(self.app._voice_legacy_transform_key_down)
+        self.assertFalse(self.app._voice.active)
+
+    def test_direct_hid_down_quarantines_a_transform_waiting_to_emit(self):
+        calls = []
+        with mock.patch.object(
+            self.app,
+            "_open_playback_for_new_session",
+            return_value=True,
+        ), mock.patch.object(
+            win32_input,
+            "send_voice_key_combo_down",
+            side_effect=lambda tokens: calls.append(("down", tokens)),
+        ), mock.patch.object(
+            win32_input,
+            "send_voice_key_combo_up",
+            side_effect=lambda tokens: calls.append(("up", tokens)),
+        ):
+            target = self.app._transform_legacy_voice_key(0x74, True)
+            self.assertIsNotNone(target)
+            self.assertTrue(self.app._voice_legacy_transform_key_down)
+            self.assertFalse(self.app._voice_legacy_transform_session)
+
+            self.app._on_button_event("mic", True, event_source="hid_tap")
+
+            self.assertTrue(self.app._legacy_f5_untrusted)
+            self.assertFalse(self.app._emit_legacy_voice_key(target, True))
+            self.app._on_legacy_key_event(0x74, True)
+            self.app._on_button_event("mic", False, event_source="hid_tap")
+            self.app._on_legacy_key_event(0x74, False)
+            self._drain_event_loop()
+
+        self.assertEqual(
+            calls,
+            [
+                ("down", DEFAULT_VOICE_TOKENS),
+                ("up", DEFAULT_VOICE_TOKENS),
+            ],
+        )
+        self.assertFalse(self.app._voice.active)
+        self.assertFalse(self.app._voice_legacy_transform_key_down)
+        self.assertFalse(self.app._voice_legacy_transform_session)
+        self.assertFalse(self.app._voice_legacy_transform_emitted)
+        self.assertIsNone(self.app._voice_hotkey_release_pending)
+
+    def test_direct_hid_down_failure_keeps_only_configured_release_pending(self):
+        configured_tokens = ("lctrl", "lwin")
+        self.app._voice_hotkey = app_module.hotkey.HotkeySpec.parse(
+            "+".join(configured_tokens)
+        )
+        self.app._refresh_legacy_voice_transform_snapshot_locked()
+        calls = []
+
+        def fail_configured_down(tokens):
+            calls.append(("down", tokens))
+            raise win32_input.InputCleanupIncompleteError(
+                "simulated partially delivered configured shortcut"
+            )
+
+        with mock.patch.object(
+            self.app,
+            "_voice_hotkey_text_for_mode",
+            return_value="+".join(configured_tokens),
+        ), mock.patch.object(
+            self.app,
+            "_open_playback_for_new_session",
+            return_value=True,
+        ), mock.patch.object(
+            win32_input,
+            "send_voice_key_combo_down",
+            side_effect=fail_configured_down,
+        ), mock.patch.object(
+            win32_input,
+            "send_voice_key_combo_up",
+            side_effect=lambda tokens: calls.append(("up", tokens)),
+        ):
+            target = self.app._transform_legacy_voice_key(0x74, True)
+            self.assertIsNotNone(target)
+
+            self.app._on_button_event("mic", True, event_source="hid_tap")
+
+            self.assertTrue(self.app._legacy_f5_untrusted)
+            self.assertFalse(self.app._emit_legacy_voice_key(target, True))
+            self.assertEqual(
+                self.app._voice_hotkey_release_pending,
+                configured_tokens,
+            )
+            _run(self.app._cleanup_once())
+
+        self.assertEqual(
+            calls,
+            [
+                ("down", configured_tokens),
+                ("up", configured_tokens),
+            ],
+        )
+        self.assertNotIn(("up", ("ralt",)), calls)
+        self.assertIsNone(self.app._voice_hotkey_release_pending)
+        self.assertFalse(self.app._voice_legacy_transform_key_down)
+        self.assertFalse(self.app._voice_legacy_transform_session)
+        self.assertFalse(self.app._voice_legacy_transform_emitted)
+
+    def test_audio_stop_quarantines_a_transform_waiting_to_emit_down(self):
+        calls = []
+        with mock.patch.object(
+            win32_input,
+            "send_voice_key_combo_down",
+            side_effect=lambda tokens: calls.append(("down", tokens)),
+        ), mock.patch.object(
+            win32_input,
+            "send_voice_key_combo_up",
+            side_effect=lambda tokens: calls.append(("up", tokens)),
+        ):
+            target = self.app._transform_legacy_voice_key(0x74, True)
+            self.assertIsNotNone(target)
+            start_action = self.app._voice.on_mic_button_pressed()
+            self.assertTrue(self.app._apply_voice_action(start_action))
+            with self.app._voice_trigger_lock:
+                self.assertTrue(
+                    self.app._begin_voice_mic_gesture(
+                        "hid_tap",
+                        physical_down=True,
+                    )
+                )
+                self.app._voice_audio_stream_active = True
+                self.app._voice_pcm_forwarding_enabled = True
+
+            self.app._on_control_event(AudioStopped())
+            self.assertFalse(self.app._emit_legacy_voice_key(target, True))
+            self.app._on_legacy_key_event(0x74, True)
+            self.app._on_legacy_key_event(0x74, False)
+
+        self.assertEqual(calls, [("down", ("ralt",)), ("up", ("ralt",))])
+        self.assertTrue(self.app._legacy_f5_untrusted)
+        self.assertFalse(self.app._voice.active)
+        self.assertFalse(self.app._voice_legacy_transform_key_down)
+        self.assertFalse(self.app._voice_legacy_transform_session)
+        self.app._on_button_event("mic", False, event_source="hid_tap")
+
+    def test_audio_stop_and_late_transform_are_serialized(self):
+        calls = []
+        stop_inside_controller = threading.Event()
+        allow_audio_stop = threading.Event()
+        transform_results = []
+        failures = []
+        original_audio_stopped = self.app._voice.on_audio_stopped
+
+        def paused_audio_stopped():
+            action = original_audio_stopped()
+            stop_inside_controller.set()
+            if not allow_audio_stop.wait(timeout=2.0):
+                raise AssertionError("audio stop pause was not released")
+            return action
+
+        def run_audio_stop():
+            try:
+                self.app._on_control_event(AudioStopped())
+            except BaseException as exc:  # noqa: BLE001 - surface thread failure
+                failures.append(exc)
+
+        def run_transform():
+            try:
+                transform_results.append(
+                    self.app._transform_legacy_voice_key(0x74, True)
+                )
+            except BaseException as exc:  # noqa: BLE001 - surface thread failure
+                failures.append(exc)
+
+        with mock.patch.object(
+            win32_input,
+            "send_voice_key_combo_down",
+            side_effect=lambda tokens: calls.append(("down", tokens)),
+        ), mock.patch.object(
+            win32_input,
+            "send_voice_key_combo_up",
+            side_effect=lambda tokens: calls.append(("up", tokens)),
+        ), mock.patch.object(
+            self.app._voice,
+            "on_audio_stopped",
+            side_effect=paused_audio_stopped,
+        ):
+            start_action = self.app._voice.on_mic_button_pressed()
+            self.assertTrue(self.app._apply_voice_action(start_action))
+            with self.app._voice_trigger_lock:
+                self.assertTrue(
+                    self.app._begin_voice_mic_gesture(
+                        "hid_tap",
+                        physical_down=True,
+                    )
+                )
+                self.app._voice_audio_stream_active = True
+                self.app._voice_pcm_forwarding_enabled = True
+
+            stop_thread = threading.Thread(target=run_audio_stop)
+            transform_thread = threading.Thread(target=run_transform)
+            stop_thread.start()
+            self.assertTrue(stop_inside_controller.wait(timeout=1.0))
+            transform_thread.start()
+            self.assertTrue(transform_thread.is_alive())
+            allow_audio_stop.set()
+            stop_thread.join(timeout=2.0)
+            transform_thread.join(timeout=2.0)
+
+        self.assertFalse(stop_thread.is_alive())
+        self.assertFalse(transform_thread.is_alive())
+        self.assertEqual(failures, [])
+        self.assertEqual(transform_results, [None])
         self.assertEqual(calls, [("down", ("ralt",)), ("up", ("ralt",))])
         self.assertFalse(self.app._voice.active)
+        self.assertFalse(self.app._voice_legacy_transform_key_down)
+        self.assertFalse(self.app._voice_legacy_transform_session)
+        self.app._on_button_event("mic", False, event_source="hid_tap")
+
+    def test_audio_continuation_stays_blocked_without_a_direct_hid_release(self):
+        voice_tokens = ("lctrl", "lalt", "f8")
+        self.app._voice_hotkey = app_module.hotkey.HotkeySpec.parse(
+            "+".join(voice_tokens)
+        )
+        self.app._refresh_legacy_voice_transform_snapshot_locked()
+        calls = []
+        with mock.patch.object(
+            self.app,
+            "_voice_hotkey_text_for_mode",
+            return_value="+".join(voice_tokens),
+        ), mock.patch.object(
+            self.app,
+            "_open_playback_for_new_session",
+            return_value=True,
+        ), mock.patch.object(
+            win32_input,
+            "send_voice_key_combo_down",
+            side_effect=lambda tokens: calls.append(("down", tokens)),
+        ), mock.patch.object(
+            win32_input,
+            "send_voice_key_combo_up",
+            side_effect=lambda tokens: calls.append(("up", tokens)),
+        ):
+            self.app._on_button_event("mic", True, event_source="legacy_f5")
+            self.app._on_control_event(AudioStarted(session_id=1))
+            self.app._on_control_event(AudioStopped())
+            self.app._on_control_event(AudioStarted(session_id=2))
+
+        self.assertEqual(
+            calls,
+            [
+                ("down", voice_tokens),
+                ("up", voice_tokens),
+            ],
+        )
+        self.assertFalse(self.app._voice.active)
+        self.assertFalse(self.app._voice_pcm_forwarding_enabled)
+        self.assertTrue(self.app._voice_mic_gesture_audio_stopped)
+
+    def test_next_direct_hid_press_is_not_blocked_by_late_f5(self):
+        voice_tokens = ("lctrl", "lalt", "f8")
+        self.app._voice_hotkey = app_module.hotkey.HotkeySpec.parse(
+            "+".join(voice_tokens)
+        )
+        self.app._refresh_legacy_voice_transform_snapshot_locked()
+        calls = []
+        with mock.patch.object(
+            self.app,
+            "_voice_hotkey_text_for_mode",
+            return_value="+".join(voice_tokens),
+        ), mock.patch.object(
+            self.app,
+            "_open_playback_for_new_session",
+            return_value=True,
+        ), mock.patch.object(
+            win32_input,
+            "send_voice_key_combo_down",
+            side_effect=lambda tokens: calls.append(("down", tokens)),
+        ), mock.patch.object(
+            win32_input,
+            "send_voice_key_combo_up",
+            side_effect=lambda tokens: calls.append(("up", tokens)),
+        ):
+            self.app._on_button_event("mic", True, event_source="legacy_f5")
+            self.app._on_control_event(AudioStarted(session_id=1))
+            self.app._on_button_event("mic", True, event_source="hid_tap")
+            self.app._on_button_event("mic", False, event_source="hid_tap")
+            self.app._on_control_event(AudioStopped())
+
+            self.app._on_button_event("mic", True, event_source="hid_tap")
+            self.app._on_control_event(AudioStarted(session_id=2))
+
+        self.assertEqual(
+            calls,
+            [
+                ("down", voice_tokens),
+                ("up", voice_tokens),
+                ("down", voice_tokens),
+            ],
+        )
+        self.assertTrue(self.app._voice.active)
+        self.assertTrue(self.app._voice_pcm_forwarding_enabled)
+        self.assertTrue(self.app._voice_mic_gesture_audio_started)
+
+    def test_stray_direct_hid_release_does_not_unlock_audio_continuation(self):
+        voice_tokens = ("lctrl", "lalt", "f8")
+        self.app._voice_hotkey = app_module.hotkey.HotkeySpec.parse(
+            "+".join(voice_tokens)
+        )
+        self.app._refresh_legacy_voice_transform_snapshot_locked()
+        calls = []
+        with mock.patch.object(
+            self.app,
+            "_voice_hotkey_text_for_mode",
+            return_value="+".join(voice_tokens),
+        ), mock.patch.object(
+            self.app,
+            "_open_playback_for_new_session",
+            return_value=True,
+        ), mock.patch.object(
+            win32_input,
+            "send_voice_key_combo_down",
+            side_effect=lambda tokens: calls.append(("down", tokens)),
+        ), mock.patch.object(
+            win32_input,
+            "send_voice_key_combo_up",
+            side_effect=lambda tokens: calls.append(("up", tokens)),
+        ):
+            self.app._on_button_event("mic", True, event_source="legacy_f5")
+            self.app._on_control_event(AudioStarted(session_id=1))
+            self.app._on_button_event("mic", False, event_source="hid_tap")
+            self.app._on_control_event(AudioStopped())
+            self.app._on_control_event(AudioStarted(session_id=2))
+
+        self.assertEqual(
+            calls,
+            [
+                ("down", voice_tokens),
+                ("up", voice_tokens),
+            ],
+        )
+        self.assertFalse(self.app._voice.active)
+        self.assertFalse(self.app._voice_pcm_forwarding_enabled)
+        self.assertTrue(self.app._voice_mic_gesture_audio_stopped)
 
     def test_physical_mic_release_failure_retains_state_and_reconnects(self):
         reconnect_calls = []
@@ -1253,6 +2148,8 @@ class VoiceMappingProductBoundaryTests(_AppWiringTestCase):
         self.assertIsNone(self.app._transform_legacy_voice_key(0x74, True))
 
     def test_invalid_bindings_reload_keeps_legacy_transform_failed_closed(self):
+        self._save_voice_settings(mode="hold", hotkey_text="ralt")
+        self.app._reload_settings_if_changed()
         self.assertTrue(self.app._legacy_voice_transform_enabled())
 
         self.app._bindings_path.write_text("{", encoding="utf-8")
@@ -1265,6 +2162,8 @@ class VoiceMappingProductBoundaryTests(_AppWiringTestCase):
         self.assertFalse(self.app._legacy_voice_transform_enabled())
 
     def test_invalid_config_reload_keeps_legacy_transform_failed_closed(self):
+        self._save_voice_settings(mode="hold", hotkey_text="ralt")
+        self.app._reload_settings_if_changed()
         self.assertTrue(self.app._legacy_voice_transform_enabled())
 
         self.app._config_path.write_text("{", encoding="utf-8")
@@ -1412,7 +2311,7 @@ class LiveBridgeKeyDetectionTests(_AppWiringTestCase):
             self.app._on_button_event("mic", True, event_source="hid")
 
         self.assertEqual(key_detection_bridge.poll_detection(request), "mic")
-        self.assertEqual(hotkey_calls, [("ralt",)])
+        self.assertEqual(hotkey_calls, [DEFAULT_VOICE_TOKENS])
         self.assertTrue(self.app._voice.active)
         self.assertEqual(self.app._ble_session.mic_open_calls, 0)
 
@@ -1512,6 +2411,29 @@ class CleanupOwnershipTests(_AppWiringTestCase):
         self.assertIsNone(self.app._hid_listener)
         self.assertIsNone(self.app._ble_session)
         self.assertIsNone(self.app._playback)
+
+    def test_cleanup_resets_legacy_f5_quarantine_for_the_next_connection(self):
+        self.app._legacy_f5_untrusted = True
+
+        _run(self.app._cleanup_once())
+
+        self.assertFalse(self.app._legacy_f5_untrusted)
+        target = self.app._transform_legacy_voice_key(0x74, True)
+        self.assertEqual(
+            target,
+            app_module.legacy_key_suppressor_windows.PhysicalKeyTarget(
+                0xA5, 0x38, True, True
+            ),
+        )
+
+    def test_incomplete_cleanup_keeps_legacy_f5_quarantined(self):
+        self.app._legacy_f5_untrusted = True
+        self.app._hid_listener = _FakeHidListener(stop_raises=True)
+
+        with self.assertRaises(app_module.CleanupIncompleteError):
+            _run(self.app._cleanup_once())
+
+        self.assertTrue(self.app._legacy_f5_untrusted)
 
     def test_successful_cleanup_applies_deferred_bindings_before_reconnect(self):
         pending = config.default_key_bindings()
@@ -1820,7 +2742,10 @@ class HidTapStartupStateTests(_AppWiringTestCase):
             self.assertEqual(self.app._voice_mic_gesture_sources_down, {"hid_tap"})
             self.app._on_hid_tap_status("unhealthy", "socket_lost")
 
-        self.assertEqual(calls, [("down", ("ralt",)), ("up", ("ralt",))])
+        self.assertEqual(
+            calls,
+            [("down", DEFAULT_VOICE_TOKENS), ("up", DEFAULT_VOICE_TOKENS)],
+        )
         self.assertEqual(self.app._voice_mic_gesture_sources_down, set())
         self.assertFalse(self.app._voice.active)
         self.assertFalse(self.app._direct_hid_tap_active)

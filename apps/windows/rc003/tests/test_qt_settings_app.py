@@ -396,6 +396,16 @@ class SettingsControllerTests(unittest.TestCase):
         controller, _ = self._make_controller()
         self.assertEqual(controller.hotkeyText, "ralt")
 
+    def test_existing_right_alt_hotkey_is_preserved_when_loading_saved_config(self):
+        saved = config.default_config()
+        saved["voice_hotkey"] = "ralt"
+        saved["voice_hotkeys"] = {"hold": "ralt"}
+        config.save_config(config.config_path(config.config_root()), saved)
+
+        controller, _ = self._make_controller()
+
+        self.assertEqual(controller.holdVoiceHotkeyText, "ralt")
+
     def test_only_mic_primary_options_include_hold_to_talk(self):
         controller, _ = self._make_controller()
         self.assertNotIn(settings_ui._VOICE_HOLD_DISPLAY, controller.primaryActionOptions)
@@ -535,6 +545,117 @@ class SettingsControllerTests(unittest.TestCase):
         self.assertIn("WDM-KS", controller.statusMessage)
         self.assertIn("点击保存后才会写入", controller.statusMessage)
         self.assertTrue(controller.settingsDirty)
+
+    def test_endpoint_recommendation_prefers_unique_cable_input_wasapi(self):
+        endpoints = [
+            audio_output.AudioEndpoint(
+                name="CABLE Input (VB-Audio Virtual Cable)",
+                host_api="Windows DirectSound",
+            ),
+            audio_output.AudioEndpoint(
+                name="Speakers",
+                host_api="Windows WASAPI",
+            ),
+            audio_output.AudioEndpoint(
+                name="CABLE Input (VB-Audio Virtual Cable)",
+                host_api="Windows WASAPI",
+            ),
+        ]
+
+        with mock.patch.object(
+            audio_output, "enumerate_output_endpoints", return_value=endpoints
+        ):
+            controller, _ = self._make_controller()
+
+        self.assertEqual(
+            controller.endpointOptions[controller.recommendedEndpointIndex],
+            settings_ui._endpoint_display(endpoints[2]),
+        )
+        self.assertTrue(
+            all("推荐" not in option for option in controller.endpointOptions),
+            "the display-only recommendation must never pollute saved endpoint text",
+        )
+
+    def test_endpoint_recommendation_falls_back_to_unique_directsound_cable_input(self):
+        endpoints = [
+            audio_output.AudioEndpoint(
+                name="Speakers",
+                host_api="Windows WASAPI",
+            ),
+            audio_output.AudioEndpoint(
+                name="CABLE Input",
+                host_api="Windows DirectSound",
+            ),
+        ]
+
+        with mock.patch.object(
+            audio_output, "enumerate_output_endpoints", return_value=endpoints
+        ):
+            controller, _ = self._make_controller()
+
+        self.assertGreaterEqual(controller.recommendedEndpointIndex, 0)
+        self.assertEqual(
+            controller.endpointOptions[controller.recommendedEndpointIndex],
+            settings_ui._endpoint_display(endpoints[1]),
+        )
+
+    def test_endpoint_recommendation_fails_closed_for_unsupported_or_ambiguous_matches(self):
+        cases = (
+            [
+                audio_output.AudioEndpoint(
+                    name="CABLE Input",
+                    host_api="MME",
+                )
+            ],
+            [
+                audio_output.AudioEndpoint(
+                    name="CABLE Input",
+                    host_api="Windows WASAPI",
+                ),
+                audio_output.AudioEndpoint(
+                    name="CABLE Input",
+                    host_api="Windows WASAPI",
+                ),
+            ],
+            [
+                audio_output.AudioEndpoint(
+                    name="CABLE Input Splitter Pro",
+                    host_api="Windows WASAPI",
+                )
+            ],
+        )
+
+        for endpoints in cases:
+            with self.subTest(endpoints=endpoints), mock.patch.object(
+                audio_output, "enumerate_output_endpoints", return_value=endpoints
+            ):
+                controller, _ = self._make_controller()
+                self.assertEqual(controller.recommendedEndpointIndex, -1)
+
+    def test_missing_saved_endpoint_is_not_recommended_and_does_not_hide_live_recommendation(self):
+        saved = config.default_config()
+        saved["output_endpoint_name"] = "Missing Speakers"
+        saved["output_endpoint_host_api"] = "Windows WASAPI"
+        config.save_config(config.config_path(config.config_root()), saved)
+        live_endpoint = audio_output.AudioEndpoint(
+            name="CABLE Input",
+            host_api="Windows WASAPI",
+        )
+
+        with mock.patch.object(
+            audio_output,
+            "enumerate_output_endpoints",
+            return_value=[live_endpoint],
+        ):
+            controller, _ = self._make_controller()
+
+        self.assertEqual(controller.selectedEndpointIndex, 0)
+        self.assertEqual(controller.recommendedEndpointIndex, 1)
+        self.assertIn("Missing Speakers", controller.endpointOptions[0])
+        self.assertEqual(
+            controller.endpointOptions[1],
+            settings_ui._endpoint_display(live_endpoint),
+        )
 
     def test_photo_available_and_source_are_consistent(self):
         controller, _ = self._make_controller()
@@ -996,7 +1117,10 @@ class SettingsControllerTests(unittest.TestCase):
         ):
             controller.startKeyDetection()
 
-        self.assertEqual(controller._KEY_DETECTION_TIMEOUT_SECONDS, 60.0)
+        self.assertEqual(
+            controller._KEY_DETECTION_TIMEOUT_SECONDS,
+            key_detection_bridge.STALE_AFTER_SECONDS,
+        )
         self.assertIn("Windows 按键通道已启动", controller.keyDetectionText)
         self.assertIn("补充按键通道正在连接", controller.keyDetectionText)
         self.assertIn("约一分钟", controller.keyDetectionText)
@@ -2295,7 +2419,7 @@ ButtonMappingModel = classes["ButtonMappingModel"]
 SettingsController = classes["SettingsController"]
 DiagnosticsController = classes["DiagnosticsController"]
 
-QQuickStyle.setStyle("Basic")
+QQuickStyle.setStyle(os.environ.get("PROBE_STYLE", "Basic"))
 app = QGuiApplication.instance() or QGuiApplication([])
 bridge_state = {"running": False}
 m.single_instance.bridge_instance_running = lambda: bridge_state["running"]
@@ -2352,7 +2476,6 @@ connection_names = (
     "endpointCombo",
     "bridgeSection",
     "bridgeNotRunningWarning",
-    "openLogButton",
     "connectionActionRow",
     "restoreDefaultsButton",
     "deviceSaveButton",
@@ -2398,14 +2521,35 @@ permissions_names = (
     "manualSetupSection",
     "openMappingButton",
     "openSpeechSettingsButton",
-    "permissionsTroubleshootingSection",
-    "permissionsOpenLogButton",
 )
 permissions_scroll = find_child(window, "permissionsScroll")
 result["permissions"] = {
     "items": {name: bounds(window, name) for name in permissions_names},
     "content_width": float(permissions_scroll.property("contentWidth")),
     "available_width": float(permissions_scroll.property("availableWidth")),
+}
+
+tab_bar.setProperty("currentIndex", 3)
+render(window, app)
+diagnostics_names = (
+    "diagnosticsPageContent",
+    "refreshButton",
+    "optionalDriverSection",
+    "driverActionGrid",
+    "selectCableInputButton",
+    "launchDriverSetupButton",
+    "diagnosticsFooterSection",
+    "diagnosticsFooterActionGrid",
+    "openAppsSettingsButton",
+    "diagnosticsOpenLogButton",
+)
+diagnostics_scroll = find_child(window, "diagnosticsScroll")
+result["diagnostics"] = {
+    "items": {name: bounds(window, name) for name in diagnostics_names},
+    "content_width": float(diagnostics_scroll.property("contentWidth")),
+    "available_width": float(diagnostics_scroll.property("availableWidth")),
+    "driver_columns": int(find_child(window, "driverActionGrid").property("columns")),
+    "footer_columns": int(find_child(window, "diagnosticsFooterActionGrid").property("columns")),
 }
 
 controller._set_status_message("neutral status")
@@ -2520,7 +2664,7 @@ endpoint = find_child(window, "endpointCombo")
 launch = find_child(window, "saveAndLaunchButton")
 endpoint.forceActiveFocus(Qt.TabFocusReason)
 render(window, app)
-connection_reached = tab_to(window, app, launch, 4)
+connection_reached = tab_to(window, app, launch, 3)
 QTest.keyClick(window, Qt.Key_Tab)
 render(window, app)
 connection_escaped = not bool(launch.property("activeFocus")) and navigation_has_focus(window)
@@ -2531,13 +2675,13 @@ permissions_scroll = find_child(window, "permissionsScroll")
 permissions_flickable = permissions_scroll.property("contentItem")
 permissions_flickable.setProperty("contentY", 0)
 microphone = find_child(window, "openMicrophonePrivacyButton")
-log_button = find_child(window, "permissionsOpenLogButton")
+speech_button = find_child(window, "openSpeechSettingsButton")
 microphone.forceActiveFocus(Qt.TabFocusReason)
 render(window, app)
-permissions_reached = tab_to(window, app, log_button, 5)
+permissions_reached = tab_to(window, app, speech_button, 4)
 QTest.keyClick(window, Qt.Key_Tab)
 render(window, app)
-permissions_escaped = not bool(log_button.property("activeFocus")) and navigation_has_focus(window)
+permissions_escaped = not bool(speech_button.property("activeFocus")) and navigation_has_focus(window)
 
 result = {
     "warnings": [warning.toString() for warning in warnings],
@@ -2551,11 +2695,132 @@ result = {
         "reached": permissions_reached,
         "escaped": permissions_escaped,
         "content_y": float(permissions_flickable.property("contentY")),
-        "target_visible": visible_in_window(log_button, window),
+        "target_visible": visible_in_window(speech_button, window),
     },
 }
 m._shutdown_diagnostics_workers()
 print(json.dumps(result))
+"""
+
+
+_SELECTION_COMBO_STATE_PROBE_SCRIPT = r"""
+import json
+
+from ovb_rc003 import qt_settings_app as m
+from PySide6.QtCore import QObject, QMetaObject, Qt, QUrl
+from PySide6.QtGui import QGuiApplication
+from PySide6.QtQml import QQmlComponent, QQmlEngine
+from PySide6.QtQuickControls2 import QQuickStyle
+
+QQuickStyle.setStyle("Basic")
+app = QGuiApplication.instance() or QGuiApplication([])
+engine = QQmlEngine()
+qml_dir = m._qml_directory()
+component = QQmlComponent(engine)
+component.setData(
+    b'''import QtQuick
+import QtQuick.Controls
+ApplicationWindow {
+    visible: true
+    width: 480
+    height: 280
+    SelectionComboBox {
+        objectName: "emptyCombo"
+        model: []
+        currentIndex: -1
+        recommendedIndex: -1
+    }
+    SelectionComboBox {
+        objectName: "ordinaryCombo"
+        model: ["Speakers"]
+        currentIndex: 0
+        recommendedIndex: -1
+    }
+    SelectionComboBox {
+        objectName: "recommendedCombo"
+        model: ["CABLE Input"]
+        currentIndex: 0
+        recommendedIndex: 0
+    }
+    SelectionComboBox {
+        id: movingCombo
+        objectName: "movingCombo"
+        y: 120
+        width: 320
+        model: ["First", "Second"]
+        currentIndex: 0
+        recommendedIndex: -1
+        property bool firstBoldForProbe: false
+        property bool secondBoldForProbe: false
+        function openPopupForProbe() {
+            popup.open()
+        }
+        function selectSecondForProbe() {
+            currentIndex = 1
+        }
+        function captureBoldForProbe() {
+            const first = popup.contentItem.itemAtIndex(0)
+            const second = popup.contentItem.itemAtIndex(1)
+            firstBoldForProbe = first ? first.font.bold : false
+            secondBoldForProbe = second ? second.font.bold : false
+        }
+    }
+}''',
+    QUrl.fromLocalFile(str(qml_dir / "SelectionComboBoxProbe.qml")),
+)
+assert component.isReady(), [error.toString() for error in component.errors()]
+window = component.create()
+assert window is not None, [error.toString() for error in component.errors()]
+app.processEvents()
+
+result = {}
+for key, object_name in (
+    ("empty", "emptyCombo"),
+    ("ordinary", "ordinaryCombo"),
+    ("recommended", "recommendedCombo"),
+):
+    combo = window.findChild(QObject, object_name)
+    assert combo is not None, object_name
+    result[key] = combo.property("displayText")
+
+moving = window.findChild(QObject, "movingCombo")
+assert moving is not None
+assert QMetaObject.invokeMethod(
+    moving,
+    "openPopupForProbe",
+    Qt.ConnectionType.DirectConnection,
+)
+for _ in range(12):
+    app.processEvents()
+    window.grabWindow()
+assert QMetaObject.invokeMethod(
+    moving,
+    "captureBoldForProbe",
+    Qt.ConnectionType.DirectConnection,
+)
+result["bold_initial"] = [
+    moving.property("firstBoldForProbe"),
+    moving.property("secondBoldForProbe"),
+]
+assert QMetaObject.invokeMethod(
+    moving,
+    "selectSecondForProbe",
+    Qt.ConnectionType.DirectConnection,
+)
+for _ in range(4):
+    app.processEvents()
+    window.grabWindow()
+assert QMetaObject.invokeMethod(
+    moving,
+    "captureBoldForProbe",
+    Qt.ConnectionType.DirectConnection,
+)
+result["bold_after_move"] = [
+    moving.property("firstBoldForProbe"),
+    moving.property("secondBoldForProbe"),
+]
+
+print(json.dumps(result, ensure_ascii=False))
 """
 
 
@@ -2569,9 +2834,27 @@ class SettingsShellSourceContractTests(unittest.TestCase):
         self.permissions_qml = (qml_dir / "PermissionsPage.qml").read_text(
             encoding="utf-8"
         )
+        self.diagnostics_qml = (qml_dir / "DiagnosticsPage.qml").read_text(
+            encoding="utf-8"
+        )
         self.buttons_qml = (qml_dir / "ButtonsPage.qml").read_text(
             encoding="utf-8"
         )
+        self.section_frame_qml = (qml_dir / "SectionFrame.qml").read_text(
+            encoding="utf-8"
+        )
+        self.form_field_qml = (qml_dir / "FormField.qml").read_text(
+            encoding="utf-8"
+        )
+        self.ui_label_qml = (qml_dir / "UiLabel.qml").read_text(
+            encoding="utf-8"
+        )
+        self.selection_combo_qml = (qml_dir / "SelectionComboBox.qml").read_text(
+            encoding="utf-8"
+        )
+        self.diagnostic_result_row_qml = (
+            qml_dir / "DiagnosticResultRow.qml"
+        ).read_text(encoding="utf-8")
 
     def test_settings_feedback_has_one_global_owner(self):
         self.assertIn('objectName: "globalStatusBar"', self.main_qml)
@@ -2582,6 +2865,51 @@ class SettingsShellSourceContractTests(unittest.TestCase):
         ):
             self.assertNotIn("SettingsController.errorMessage", page_text)
             self.assertNotIn("SettingsController.statusMessage", page_text)
+
+    def test_touched_pages_reuse_shared_section_form_and_text_sources(self):
+        self.assertIn("default property alias contentData", self.section_frame_qml)
+        self.assertIn("default property alias editorData", self.form_field_qml)
+        for kind in ("bodyKind", "noteKind", "sectionTitleKind", "pageTitleKind"):
+            self.assertIn(kind, self.ui_label_qml)
+
+        for page_text in (
+            self.connection_qml,
+            self.permissions_qml,
+            self.diagnostics_qml,
+        ):
+            self.assertIn("SectionFrame {", page_text)
+            self.assertIn("UiLabel {", page_text)
+
+        self.assertIn("FormField {", self.connection_qml)
+        self.assertIn(
+            "noteText: SettingsController.selectedDeviceDescription",
+            self.connection_qml,
+        )
+        self.assertIn("DiagnosticResultRow {", self.diagnostics_qml)
+        self.assertIn("UiLabel {", self.diagnostic_result_row_qml)
+        self.assertNotIn("Layout.preferredHeight: 1", self.connection_qml)
+        self.assertNotIn("Layout.preferredHeight: 1", self.permissions_qml)
+
+    def test_connection_selectors_reuse_one_selected_option_delegate(self):
+        self.assertEqual(self.connection_qml.count("SelectionComboBox {"), 2)
+        self.assertIn(
+            "recommendedIndex: SettingsController.recommendedEndpointIndex",
+            self.connection_qml,
+        )
+        self.assertIn("font.bold: index === root.currentIndex", self.selection_combo_qml)
+        self.assertIn("recommendedIndex >= 0 && index >= 0", self.selection_combo_qml)
+        self.assertIn('qsTr("（推荐）")', self.selection_combo_qml)
+        self.assertIn("displayText: decoratedText(currentIndex, currentText)", self.selection_combo_qml)
+        self.assertEqual(self.buttons_qml.count("SelectionComboBox {"), 0)
+
+    def test_log_location_has_one_formal_entry_point(self):
+        self.assertNotIn("SettingsController.openLogLocation()", self.connection_qml)
+        self.assertNotIn("SettingsController.openLogLocation()", self.permissions_qml)
+        self.assertEqual(
+            self.diagnostics_qml.count("SettingsController.openLogLocation()"),
+            1,
+        )
+        self.assertIn("日志不记录语音内容", self.diagnostics_qml)
 
     def test_connection_keeps_save_and_launch_as_distinct_commands(self):
         self.assertIn('qsTr("仅保存设置")', self.connection_qml)
@@ -2632,15 +2960,68 @@ class SettingsShellSourceContractTests(unittest.TestCase):
             "onOpenDiagnosticsRequested: tabBar.currentIndex = 3", self.main_qml
         )
 
-    def test_buttons_page_uses_the_full_width_mapping_matrix(self):
+    def test_buttons_page_keeps_the_mapping_matrix_and_photo_sidebar(self):
+        for object_name in ("photoSidebar", "photoFrame", "photoImage"):
+            self.assertIn(f'objectName: "{object_name}"', self.buttons_qml)
+        self.assertIn("SettingsController.photoSource", self.buttons_qml)
+        self.assertIn("SettingsController.photoAvailable", self.buttons_qml)
+        self.assertIn('objectName: "photoHotspot_" + buttonId', self.buttons_qml)
+        self.assertIn(
+            'objectName: "photoHotspotMarker_" + photoHotspot.buttonId',
+            self.buttons_qml,
+        )
+        self.assertIn("hotspotX * paintedWidth", self.buttons_qml)
+        self.assertIn("hotspotY * paintedHeight", self.buttons_qml)
+        self.assertIn("visible: photoHotspot.isSelected", self.buttons_qml)
         self.assertIn('objectName: "mappingMatrixHeader"', self.buttons_qml)
         for column_name in ("遥控器按键", "单击", "双击", "长按"):
             self.assertIn(f'qsTr("{column_name}")', self.buttons_qml)
         self.assertIn('objectName: "editMapping_" + mappingRow.buttonId', self.buttons_qml)
         self.assertIn('objectName: "actionEditorDialog"', self.buttons_qml)
-        self.assertIn("mappingRow.index < mappingList.count - 1", self.buttons_qml)
+        self.assertIn('objectName: "mappingListFrame"', self.buttons_qml)
+        self.assertNotIn("mappingRow.index < mappingList.count - 1", self.buttons_qml)
         self.assertIn("ListView {", self.buttons_qml)
         self.assertNotIn("GridView {", self.buttons_qml)
+        self.assertIn('qsTr("HID 编号 ") + mappingRow.hidUsage', self.buttons_qml)
+        self.assertIn('qsTr("按住可连续触发")', self.buttons_qml)
+        self.assertIn('qsTr("不执行")', self.buttons_qml)
+        self.assertIn('kind: pageTitleKind', self.buttons_qml)
+        self.assertIn('kind: sectionTitleKind', self.buttons_qml)
+        self.assertIn('text: qsTr("按住说话")', self.buttons_qml)
+        self.assertIn('text: qsTr("快捷键")', self.buttons_qml)
+
+    def test_voice_hotkey_field_uses_the_default_hint_without_an_extra_row(self):
+        self.assertIn('placeholderText: qsTr("例如 ralt")', self.buttons_qml)
+        self.assertIn("ToolTip.visible: hovered", self.buttons_qml)
+        self.assertIn("默认右侧 Alt", self.buttons_qml)
+        self.assertNotIn("默认 Ctrl + Alt + F8", self.buttons_qml)
+
+
+@unittest.skipUnless(_HAS_PYSIDE6, _SKIP_REASON)
+class SelectionComboBoxBehaviorTests(unittest.TestCase):
+    def test_recommendation_decorates_only_a_real_recommended_index(self):
+        import subprocess
+
+        env = dict(os.environ)
+        env.setdefault("QT_QPA_PLATFORM", "offscreen")
+        result = subprocess.run(
+            [sys.executable, "-c", _SELECTION_COMBO_STATE_PROBE_SCRIPT],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        self.assertEqual(
+            result.returncode,
+            0,
+            f"selection combo probe failed: {result.stderr}",
+        )
+        data = json.loads(result.stdout.strip().splitlines()[-1])
+        self.assertEqual(data["empty"], "")
+        self.assertEqual(data["ordinary"], "Speakers")
+        self.assertEqual(data["recommended"], "（推荐） CABLE Input")
+        self.assertEqual(data["bold_initial"], [True, False])
+        self.assertEqual(data["bold_after_move"], [False, True])
 
 
 @unittest.skipUnless(_HAS_PYSIDE6, _SKIP_REASON)
@@ -2677,8 +3058,8 @@ class OffscreenQmlLoadTests(unittest.TestCase):
         self.assertEqual(
             data["warnings"], [], "main.qml produced QML warnings/errors during load"
         )
-        self.assertGreater(data["width"], 0)
-        self.assertGreater(data["height"], 0)
+        self.assertEqual(data["width"], 840)
+        self.assertEqual(data["height"], 720)
         self.assertFalse(data["retired_finish_tap_control_exists"])
 
     def test_dji_device_page_hides_rc003_mapping_and_shows_dji_controls(self):
@@ -2713,16 +3094,26 @@ class OffscreenQmlLoadTests(unittest.TestCase):
         import json
         import subprocess
 
-        # Logical sizes corresponding to the supported physical viewports:
-        # 1024x720@100%, 1366x768@125%, 1920x1080@150%, plus the stricter
-        # 1024x720@150% fallback used on small high-DPI laptops.
-        scenarios = ((1024, 720), (1093, 614), (1280, 720), (683, 480))
+        # The compact default plus logical sizes corresponding to the
+        # supported physical viewports and small high-DPI fallbacks.
+        scenarios = (
+            ("Basic", 840, 720),
+            ("Basic", 1024, 720),
+            ("Basic", 1093, 614),
+            ("Basic", 1280, 720),
+            ("Basic", 683, 480),
+            ("Basic", 640, 480),
+            ("FluentWinUI3", 840, 720),
+            ("FluentWinUI3", 683, 480),
+            ("FluentWinUI3", 640, 480),
+        )
 
-        for width, height in scenarios:
-            with self.subTest(width=width, height=height), tempfile.TemporaryDirectory() as tmpdir:
+        for style, width, height in scenarios:
+            with self.subTest(style=style, width=width, height=height), tempfile.TemporaryDirectory() as tmpdir:
                 env = dict(os.environ)
                 env.setdefault("QT_QPA_PLATFORM", "offscreen")
                 env["LOCALAPPDATA"] = tmpdir
+                env["PROBE_STYLE"] = style
                 env["PROBE_WIDTH"] = str(width)
                 env["PROBE_HEIGHT"] = str(height)
                 result = subprocess.run(
@@ -2749,7 +3140,7 @@ class OffscreenQmlLoadTests(unittest.TestCase):
                         self.assertGreaterEqual(item["x"], -1, item_name)
                         self.assertLessEqual(item["right"], width + 1, item_name)
 
-                for page_name in ("connection", "permissions"):
+                for page_name in ("connection", "permissions", "diagnostics"):
                     page = data[page_name]
                     self.assertLessEqual(
                         page["content_width"], page["available_width"] + 1
@@ -2761,7 +3152,56 @@ class OffscreenQmlLoadTests(unittest.TestCase):
                         self.assertGreaterEqual(item["x"], -1, item_name)
                         self.assertLessEqual(item["right"], width + 1, item_name)
 
+                diagnostics = data["diagnostics"]
+                diagnostics_items = diagnostics["items"]
+                driver_grid_width = diagnostics_items["driverActionGrid"]["width"]
+                footer_grid_width = diagnostics_items[
+                    "diagnosticsFooterActionGrid"
+                ]["width"]
+                self.assertEqual(
+                    diagnostics["driver_columns"],
+                    1 if driver_grid_width < 600 else 2,
+                )
+                self.assertEqual(
+                    diagnostics["footer_columns"],
+                    (
+                        2
+                        if footer_grid_width < 520
+                        else 3
+                        if footer_grid_width < 760
+                        else 5
+                    ),
+                )
+                self.assertGreater(
+                    diagnostics_items["diagnosticsFooterActionGrid"]["width"],
+                    diagnostics_items["diagnosticsOpenLogButton"]["width"],
+                )
+                self.assertGreaterEqual(
+                    diagnostics_items["diagnosticsFooterActionGrid"]["x"],
+                    diagnostics_items["diagnosticsFooterSection"]["x"],
+                )
+                self.assertLessEqual(
+                    diagnostics_items["diagnosticsFooterActionGrid"]["right"],
+                    diagnostics_items["diagnosticsFooterSection"]["right"],
+                )
+                self.assertGreater(
+                    diagnostics_items["driverActionGrid"]["width"],
+                    diagnostics_items["selectCableInputButton"]["width"],
+                )
+
                 connection_items = data["connection"]["items"]
+                if width == 840:
+                    for combo_name, section_name in (
+                        ("deviceCombo", "deviceSection"),
+                        ("endpointCombo", "rc003OutputSection"),
+                    ):
+                        combo = connection_items[combo_name]
+                        section = connection_items[section_name]
+                        self.assertGreaterEqual(combo["width"], 599)
+                        self.assertLessEqual(combo["x"] - section["x"], 145)
+                        self.assertLessEqual(
+                            section["right"] - combo["right"], 50
+                        )
                 self.assertTrue(connection_items["bridgeNotRunningWarning"]["visible"])
                 self.assertIn("话筒键", data["connection"]["bridge_warning"])
                 self.assertFalse(
@@ -2795,11 +3235,6 @@ class OffscreenQmlLoadTests(unittest.TestCase):
                     permission_items["optionalEnhancementsSection"]["y"],
                     permission_items["manualSetupSection"]["y"],
                 )
-                self.assertLess(
-                    permission_items["manualSetupSection"]["y"],
-                    permission_items["permissionsTroubleshootingSection"]["y"],
-                )
-
                 self.assertTrue(data["neutral_status"]["visible"])
                 self.assertEqual(data["neutral_status"]["text"], "neutral status")
                 self.assertTrue(data["error_status"]["visible"])
@@ -3234,7 +3669,7 @@ def sample_control(results, image, object_name):
 
 results = {}
 image = render()
-for object_name in ("connectionTabButton", "openLogButton"):
+for object_name in ("connectionTabButton", "restoreDefaultsButton"):
     sample_control(results, image, object_name)
 
 tab_bar = _find(window, "tabBar")
@@ -3270,7 +3705,7 @@ class RenderedContrastTests(unittest.TestCase):
     _MIN_CONTRAST_RATIO = 3.0
     _LABELS = {
         "connectionTabButton": "「连接」tab label",
-        "openLogButton": "「打开日志目录」button",
+        "restoreDefaultsButton": "「恢复按键与语音默认」button",
         "holdVoiceHotkeyField": "语音快捷键 TextField",
     }
 
@@ -3307,15 +3742,15 @@ class RenderedContrastTests(unittest.TestCase):
             )
 
 
-# Proves, against the real rendered ButtonsPage, that the mapping matrix owns
-# exactly 13 rows and a real click on another row updates the shared selected
-# button. This replaces the old product-photo hotspot UI contract.
+# Proves, against the real rendered ButtonsPage, that the product-photo sidebar
+# and the existing 13-row mapping matrix remain contained at supported viewport
+# widths, and that shared selection marks the calibrated position on the photo.
 _MAPPING_MATRIX_PROBE_SCRIPT = r"""
 import json
 import os
 import sys
 
-from ovb_rc003 import qt_settings_app as m
+from ovb_rc003 import qt_settings_app as m, remote_layout
 from PySide6.QtCore import QPointF, Qt
 from PySide6.QtTest import QTest
 
@@ -3373,9 +3808,23 @@ for _ in range(10):
 
 mapping_list = _find(content_item, "mappingList")
 header = _find(content_item, "mappingMatrixHeader")
+photo_sidebar = _find(content_item, "photoSidebar")
+photo_frame = _find(content_item, "photoFrame")
+photo_image = _find(content_item, "photoImage")
 assert mapping_list is not None, "mappingList not found"
 assert header is not None and header.property("visible"), "matrix header not visible"
+assert photo_sidebar is not None, "photoSidebar not found"
+assert photo_frame is not None and photo_frame.property("visible"), "photoFrame not visible"
+assert photo_image is not None and photo_image.property("visible"), "photoImage not visible"
 assert mapping_list.property("count") == 13
+
+for _ in range(100):
+    if photo_image.property("paintedWidth") > 0 and photo_image.property("paintedHeight") > 0:
+        break
+    QTest.qWait(20)
+    window.grabWindow()
+    app.processEvents()
+assert photo_image.property("paintedWidth") > 0, "photo did not paint"
 
 # The default selected row is OK. Move to Power so its delegate is realized,
 # then click the row body away from the edit button.
@@ -3416,9 +3865,32 @@ def _column_geometry(names):
     return result
 
 
+def _text_baselines(names):
+    result = {}
+    for key, object_name in names.items():
+        item = _find(content_item, object_name)
+        assert item is not None, f"matrix text item not found: {object_name}"
+        scene_pos = item.mapToScene(QPointF(0.0, 0.0))
+        result[key] = scene_pos.y() + item.property("baselineOffset")
+    return result
+
+
 header_columns = _column_geometry(header_column_names)
 row_columns = _column_geometry(row_column_names)
 mapping_list_pos = mapping_list.mapToScene(QPointF(0.0, 0.0))
+photo_sidebar_pos = photo_sidebar.mapToScene(QPointF(0.0, 0.0))
+photo_frame_pos = photo_frame.mapToScene(QPointF(0.0, 0.0))
+header_baselines = _text_baselines({
+    key: object_name
+    for key, object_name in header_column_names.items()
+    if key != "edit"
+})
+row_baselines = _text_baselines({
+    "key": "mappingKeyPrimaryText_power",
+    "single": "mappingSinglePrimaryText_power",
+    "double": "mappingDoublePrimaryText_power",
+    "long": "mappingLongPrimaryText_power",
+})
 click_point = power_row.mapToScene(
     QPointF(power_row.property("width") / 2.0, power_row.property("height") / 2.0)
 ).toPoint()
@@ -3427,16 +3899,51 @@ for _ in range(5):
     window.grabWindow()
     app.processEvents()
 
+power_hotspot = _find(content_item, "photoHotspot_power")
+power_marker = _find(content_item, "photoHotspotMarker_power")
+ok_marker = _find(content_item, "photoHotspotMarker_ok")
+assert power_hotspot is not None, "Power photo hotspot not found"
+assert power_marker is not None, "Power photo marker not found"
+assert ok_marker is not None, "OK photo marker not found"
+
+power_layout = remote_layout.hotspot_for("power")
+assert power_layout is not None
+letterbox_x = (photo_image.property("width") - photo_image.property("paintedWidth")) / 2.0
+letterbox_y = (photo_image.property("height") - photo_image.property("paintedHeight")) / 2.0
+expected_power_center = photo_image.mapToScene(QPointF(
+    letterbox_x + power_layout.x * photo_image.property("paintedWidth"),
+    letterbox_y + power_layout.y * photo_image.property("paintedHeight"),
+))
+actual_power_center = power_hotspot.mapToScene(QPointF(
+    power_hotspot.property("width") / 2.0,
+    power_hotspot.property("height") / 2.0,
+))
+
 results_out = {
     "row_count": mapping_list.property("count"),
     "header_visible": header.property("visible"),
     "selected_after_power_click": controller.property("selectedButtonId"),
     "header_columns": header_columns,
     "row_columns": row_columns,
+    "header_baselines": header_baselines,
+    "row_baselines": row_baselines,
+    "photo": {
+        "sidebar_x": photo_sidebar_pos.x(),
+        "sidebar_width": photo_sidebar.property("width"),
+        "frame_x": photo_frame_pos.x(),
+        "frame_width": photo_frame.property("width"),
+        "painted_width": photo_image.property("paintedWidth"),
+        "painted_height": photo_image.property("paintedHeight"),
+        "power_marker_visible": power_marker.property("visible"),
+        "ok_marker_visible": ok_marker.property("visible"),
+        "power_center_error_x": actual_power_center.x() - expected_power_center.x(),
+        "power_center_error_y": actual_power_center.y() - expected_power_center.y(),
+    },
     "mapping_list": {
         "x": mapping_list_pos.x(),
         "width": mapping_list.property("width"),
     },
+    "viewport_width": window.property("width"),
 }
 print(json.dumps(results_out))
 """
@@ -3444,8 +3951,8 @@ print(json.dumps(results_out))
 
 @unittest.skipUnless(_HAS_PYSIDE6, _SKIP_REASON)
 class ButtonsPageMappingMatrixTests(unittest.TestCase):
-    """The full-width matrix renders all physical buttons and row clicks
-    continue to drive the shared selection used by real-key detection.
+    """The photo marker and matrix render together while the matrix continues
+    to own selection used by real-key detection.
     """
 
     def _run_probe(self, width=1024, height=720, style="Basic"):
@@ -3485,11 +3992,68 @@ class ButtonsPageMappingMatrixTests(unittest.TestCase):
             "a real QTest click on the Power matrix row did not select Power",
         )
 
+    def test_selected_power_is_marked_at_its_calibrated_photo_position(self):
+        data = self._run_probe()
+        self.assertTrue(data["photo"]["power_marker_visible"])
+        self.assertFalse(data["photo"]["ok_marker_visible"])
+        self.assertAlmostEqual(data["photo"]["power_center_error_x"], 0, delta=1)
+        self.assertAlmostEqual(data["photo"]["power_center_error_y"], 0, delta=1)
+
+    def test_photo_sidebar_is_fixed_at_desktop_width_and_narrows_on_small_windows(self):
+        desktop = self._run_probe(1024, 720)
+        compact_default = self._run_probe(840, 720)
+        compact_640 = self._run_probe(640, 480)
+        compact_683 = self._run_probe(683, 480)
+
+        self.assertAlmostEqual(
+            desktop["photo"]["sidebar_width"], 200, delta=0.5
+        )
+        self.assertAlmostEqual(
+            compact_default["photo"]["sidebar_width"], 168, delta=0.5
+        )
+        for data in (compact_default, compact_640, compact_683):
+            self.assertGreaterEqual(data["photo"]["sidebar_width"], 136)
+            self.assertLess(
+                data["photo"]["sidebar_width"],
+                desktop["photo"]["sidebar_width"],
+            )
+            self.assertAlmostEqual(
+                data["photo"]["frame_width"],
+                data["photo"]["sidebar_width"],
+                delta=0.5,
+            )
+            self.assertLessEqual(
+                data["mapping_list"]["x"] + data["mapping_list"]["width"],
+                data["viewport_width"] + 1,
+            )
+            self.assertLessEqual(
+                data["photo"]["sidebar_x"] + data["photo"]["sidebar_width"],
+                data["mapping_list"]["x"],
+            )
+
+    def test_header_and_row_primary_text_baselines_are_aligned(self):
+        for width, height in ((840, 720), (1024, 720), (640, 480), (683, 480)):
+            data = self._run_probe(width, height)
+            for baselines_name in ("header_baselines", "row_baselines"):
+                baselines = data[baselines_name]
+                reference = baselines["key"]
+                for column in ("single", "double", "long"):
+                    with self.subTest(
+                        viewport=f"{width}x{height}",
+                        baselines=baselines_name,
+                        column=column,
+                    ):
+                        self.assertAlmostEqual(
+                            baselines[column], reference, delta=0.5
+                        )
+
     def test_header_columns_align_with_mapping_row(self):
         viewports = (
+            ("Basic", 840, 720),
             ("Basic", 1024, 720),
             ("Basic", 640, 480),
             ("Basic", 683, 480),
+            ("FluentWinUI3", 840, 720),
             ("FluentWinUI3", 1024, 720),
             ("FluentWinUI3", 640, 480),
             ("FluentWinUI3", 683, 480),

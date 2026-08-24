@@ -1,7 +1,7 @@
 import threading
 import unittest
 
-from ovb_rc003 import hotkey_capture_windows, win32_keys
+from ovb_rc003 import hotkey, hotkey_capture_windows, win32_keys
 
 
 class KeyboardTokenTests(unittest.TestCase):
@@ -73,6 +73,31 @@ class HotkeyCaptureStateTests(unittest.TestCase):
             self._event(0xA2, 0x1D, hotkey_capture_windows.LLKHF_UP),
         )
         self.assertEqual(captured, ["lctrl+lwin"])
+
+    def test_three_key_custom_shortcut_can_record_physical_modifier_sides(self):
+        captured = []
+        recorder = hotkey_capture_windows.HotkeyCapture(captured.append)
+
+        for vk, scan in ((0xA2, 0x1D), (0xA4, 0x38), (0x77, 0x42)):
+            self.assertTrue(
+                recorder._handle_event(
+                    hotkey_capture_windows.WM_KEYDOWN,
+                    self._event(vk, scan),
+                )
+            )
+        for vk, scan in ((0x77, 0x42), (0xA4, 0x38), (0xA2, 0x1D)):
+            recorder._handle_event(
+                hotkey_capture_windows.WM_KEYUP,
+                self._event(vk, scan, hotkey_capture_windows.LLKHF_UP),
+            )
+
+        self.assertEqual(captured, ["lctrl+lalt+f8"])
+        spec = hotkey.HotkeySpec.parse(captured[0])
+        self.assertEqual(spec.serialize(), "lctrl+lalt+f8")
+        self.assertEqual(
+            win32_keys.resolve_vk_codes((*spec.modifiers, spec.key)),
+            [0xA2, 0xA4, 0x77],
+        )
 
     def test_injected_events_are_not_recorded_or_suppressed(self):
         captured = []

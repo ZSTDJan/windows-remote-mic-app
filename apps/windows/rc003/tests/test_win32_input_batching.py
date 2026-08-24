@@ -304,14 +304,16 @@ class VoiceKeyComboTests(unittest.TestCase):
         calls = []
 
         win32_input.send_voice_key_combo_down(
-            ("ralt", "space"), _sender=lambda vk, key_up: calls.append((vk, key_up))
+            ("ctrl", "alt", "f8"),
+            _sender=lambda vk, key_up: calls.append((vk, key_up)),
         )
 
         self.assertEqual(
             calls,
             [
-                (win32_input.win32_keys.VK_CODES["ralt"], False),
-                (win32_input.win32_keys.VK_CODES["space"], False),
+                (win32_input.win32_keys.VK_CODES["ctrl"], False),
+                (win32_input.win32_keys.VK_CODES["alt"], False),
+                (win32_input.win32_keys.VK_CODES["f8"], False),
             ],
         )
 
@@ -319,14 +321,16 @@ class VoiceKeyComboTests(unittest.TestCase):
         calls = []
 
         win32_input.send_voice_key_combo_up(
-            ("ralt", "space"), _sender=lambda vk, key_up: calls.append((vk, key_up))
+            ("ctrl", "alt", "f8"),
+            _sender=lambda vk, key_up: calls.append((vk, key_up)),
         )
 
         self.assertEqual(
             calls,
             [
-                (win32_input.win32_keys.VK_CODES["space"], True),
-                (win32_input.win32_keys.VK_CODES["ralt"], True),
+                (win32_input.win32_keys.VK_CODES["f8"], True),
+                (win32_input.win32_keys.VK_CODES["alt"], True),
+                (win32_input.win32_keys.VK_CODES["ctrl"], True),
             ],
         )
 
@@ -347,19 +351,28 @@ class VoiceKeyComboTests(unittest.TestCase):
 
         def sender(vk, key_up):
             calls.append((vk, key_up))
-            if len(calls) == 2:
+            if len(calls) == 3:
                 raise RuntimeError("simulated voice sender failure")
 
-        with self.assertRaises(OSError):
-            win32_input.send_voice_key_combo_down(("ralt", "space"), _sender=sender)
+        with self.assertRaises(OSError) as ctx:
+            win32_input.send_voice_key_combo_down(
+                ("ctrl", "alt", "f8"), _sender=sender
+            )
+
+        self.assertNotIsInstance(
+            ctx.exception,
+            win32_input.InputCleanupIncompleteError,
+        )
 
         self.assertEqual(
             calls,
             [
-                (win32_input.win32_keys.VK_CODES["ralt"], False),
-                (win32_input.win32_keys.VK_CODES["space"], False),
-                (win32_input.win32_keys.VK_CODES["space"], True),
-                (win32_input.win32_keys.VK_CODES["ralt"], True),
+                (win32_input.win32_keys.VK_CODES["ctrl"], False),
+                (win32_input.win32_keys.VK_CODES["alt"], False),
+                (win32_input.win32_keys.VK_CODES["f8"], False),
+                (win32_input.win32_keys.VK_CODES["f8"], True),
+                (win32_input.win32_keys.VK_CODES["alt"], True),
+                (win32_input.win32_keys.VK_CODES["ctrl"], True),
             ],
         )
 
@@ -371,15 +384,50 @@ class VoiceKeyComboTests(unittest.TestCase):
             if len(calls) == 1:
                 raise RuntimeError("simulated voice sender failure")
 
-        with self.assertRaises(OSError):
-            win32_input.send_voice_key_combo_up(("ralt", "space"), _sender=sender)
+        with self.assertRaises(OSError) as ctx:
+            win32_input.send_voice_key_combo_up(
+                ("ctrl", "alt", "f8"), _sender=sender
+            )
+
+        self.assertNotIsInstance(
+            ctx.exception,
+            win32_input.InputCleanupIncompleteError,
+        )
 
         self.assertEqual(
             calls,
             [
-                (win32_input.win32_keys.VK_CODES["space"], True),
-                (win32_input.win32_keys.VK_CODES["space"], True),
-                (win32_input.win32_keys.VK_CODES["ralt"], True),
+                (win32_input.win32_keys.VK_CODES["f8"], True),
+                (win32_input.win32_keys.VK_CODES["f8"], True),
+                (win32_input.win32_keys.VK_CODES["alt"], True),
+                (win32_input.win32_keys.VK_CODES["ctrl"], True),
+            ],
+        )
+
+    def test_up_reports_when_a_retry_still_cannot_release_the_primary_key(self):
+        f8 = win32_input.win32_keys.VK_CODES["f8"]
+        alt = win32_input.win32_keys.VK_CODES["alt"]
+        ctrl = win32_input.win32_keys.VK_CODES["ctrl"]
+        calls = []
+
+        def sender(vk, key_up):
+            calls.append((vk, key_up))
+            if vk == f8 and key_up:
+                raise RuntimeError("simulated persistent F8 release failure")
+
+        with self.assertRaises(win32_input.InputCleanupIncompleteError):
+            win32_input.send_voice_key_combo_up(
+                ("ctrl", "alt", "f8"),
+                _sender=sender,
+            )
+
+        self.assertEqual(
+            calls,
+            [
+                (f8, True),
+                (f8, True),
+                (alt, True),
+                (ctrl, True),
             ],
         )
 

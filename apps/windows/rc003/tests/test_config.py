@@ -23,7 +23,7 @@ class ConfigRootTests(unittest.TestCase):
 
 
 class DefaultConfigPrivacyTests(unittest.TestCase):
-    def test_default_config_preserves_existing_users_on_rc003(self):
+    def test_default_config_uses_rc003_and_the_right_alt_hold_shortcut(self):
         defaults = config.default_config()
         self.assertEqual(defaults["selected_device_profile"], "xiaomi-rc003")
         self.assertEqual(defaults["voice_hotkey"], "ralt")
@@ -44,6 +44,60 @@ class DefaultConfigPrivacyTests(unittest.TestCase):
 
     def test_output_endpoint_defaults_to_empty_so_voice_fails_closed(self):
         self.assertEqual(config.default_config()["output_endpoint_name"], "")
+
+    def test_missing_config_file_uses_the_right_alt_hold_shortcut(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            loaded = config.load_config(Path(tmp) / "config.json")
+        self.assertEqual(loaded["voice_hotkey"], "ralt")
+        self.assertEqual(loaded["voice_hotkeys"], {"hold": "ralt"})
+
+    def test_load_preserves_an_existing_right_alt_hold_shortcut(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "voice_trigger_mode": "hold",
+                        "voice_hotkey": "ralt",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            loaded = config.load_config(path)
+        self.assertEqual(loaded["voice_hotkey"], "ralt")
+        self.assertEqual(loaded["voice_hotkeys"], {"hold": "ralt"})
+
+    def test_load_preserves_an_existing_custom_hold_shortcut(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "voice_trigger_mode": "hold",
+                        "voice_hotkey": "ctrl+l",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            loaded = config.load_config(path)
+        self.assertEqual(loaded["voice_hotkey"], "ctrl+l")
+        self.assertEqual(loaded["voice_hotkeys"], {"hold": "ctrl+l"})
+
+    def test_load_preserves_nested_hold_when_old_file_has_no_top_level_value(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "voice_trigger_mode": "hold",
+                        "voice_hotkeys": {"hold": "ctrl+l"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            loaded = config.load_config(path)
+        self.assertEqual(loaded["voice_hotkey"], "ctrl+l")
+        self.assertEqual(loaded["voice_hotkeys"], {"hold": "ctrl+l"})
 
     def test_load_disables_legacy_toggle_without_reinterpreting_its_shortcut(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -123,18 +177,23 @@ class DefaultConfigPrivacyTests(unittest.TestCase):
         self.assertEqual(loaded["voice_hotkeys"]["hold"], "ctrl+l")
         self.assertNotIn("toggle", loaded["voice_hotkeys"])
 
-    def test_load_repairs_recorded_left_ctrl_win_to_hold_mode(self):
+    def test_load_repairs_legacy_ctrl_win_values_to_historical_hold_fallback(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "config.json"
-            path.write_text(
-                json.dumps(
-                    {"voice_trigger_mode": "toggle", "voice_hotkey": "lctrl+lwin"}
-                ),
-                encoding="utf-8",
-            )
-            loaded = config.load_config(path)
-        self.assertEqual(loaded["voice_trigger_mode"], "hold")
-        self.assertEqual(loaded["voice_hotkey"], "ralt")
+            for legacy_hotkey in ("lctrl+win", "lctrl+lwin"):
+                with self.subTest(legacy_hotkey=legacy_hotkey):
+                    path.write_text(
+                        json.dumps(
+                            {
+                                "voice_trigger_mode": "hold",
+                                "voice_hotkey": legacy_hotkey,
+                            }
+                        ),
+                        encoding="utf-8",
+                    )
+                    loaded = config.load_config(path)
+                    self.assertEqual(loaded["voice_trigger_mode"], "hold")
+                    self.assertEqual(loaded["voice_hotkey"], "ralt")
 
     def test_load_repairs_recorded_left_alt_to_right_alt_in_hold_mode(self):
         with tempfile.TemporaryDirectory() as tmp:

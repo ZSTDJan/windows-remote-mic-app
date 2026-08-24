@@ -162,6 +162,11 @@ def load_config(path: Path) -> Dict[str, Any]:
         if not isinstance(stored, dict):
             raise ConfigFormatError("config.json root must be a JSON object")
         _assert_no_forbidden_keys(stored)
+        # Normalize the persisted voice fields before merging defaults. A
+        # shallow merge would otherwise make a newly introduced default look
+        # like an explicitly saved top-level/nested shortcut and could hide
+        # the old value that is actually present in the file.
+        _normalize_voice_hotkey(stored)
         config.update(stored)
     _normalize_voice_hotkey(config)
     return config
@@ -190,27 +195,22 @@ def _normalize_voice_hotkey(config: Dict[str, Any]) -> None:
     if raw_mode == key_mapping.VoiceTriggerMode.TOGGLE.value:
         config[RUNTIME_LEGACY_VOICE_MODE_KEY] = raw_mode
         # Never reinterpret a toggle shortcut as hold-to-talk. Use the
-        # separately stored hold shortcut when available, otherwise the safe
-        # shipped hold default. The old file remains untouched until save.
-        current = saved_hold_hotkey or key_mapping.voice_hotkey_for_trigger_mode(
-            key_mapping.VoiceTriggerMode.HOLD
-        )
+        # separately stored hold shortcut when available. Otherwise retain
+        # the right-Alt fallback shipped with those old files; the new-install
+        # default must not silently rewrite a historical configuration.
+        current = saved_hold_hotkey or key_mapping.LEGACY_HOLD_VOICE_HOTKEY
     elif saved_hold_hotkey and not current:
         current = saved_hold_hotkey
 
     # The former HOLD preset was Ctrl+Win. It is a shipped built-in, not a
-    # user customization: migrate it to the right-Alt physical bridge.
+    # user customization: preserve its historical right-Alt migration target.
     if current in {"lctrl+win", "lctrl+lwin"}:
-        current = key_mapping.voice_hotkey_for_trigger_mode(
-            key_mapping.VoiceTriggerMode.HOLD
-        )
+        current = key_mapping.LEGACY_HOLD_VOICE_HOTKEY
 
     # ``lalt`` was an invalid recording of the RC003 F5 leak. Repair it only
     # for hold-to-talk; arbitrary user shortcuts remain untouched.
     if current == "lalt":
-        current = key_mapping.voice_hotkey_for_trigger_mode(
-            key_mapping.VoiceTriggerMode.HOLD
-        )
+        current = key_mapping.LEGACY_HOLD_VOICE_HOTKEY
     if not current:
         current = key_mapping.voice_hotkey_for_trigger_mode(
             key_mapping.VoiceTriggerMode.HOLD

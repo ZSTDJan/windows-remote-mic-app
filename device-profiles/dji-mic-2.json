@@ -6,7 +6,7 @@
   "model": "DMT02 / DMR02",
   "support": {
     "status": "research",
-    "notes": "Windows settings can select DJI Mic 2 and report a real recording endpoint; continuous recording and transmitter-control mapping are not accepted on real hardware."
+    "notes": "Windows 设置可选择 DJI Mic 2，并能显示真实录音端点；持续录音和发射器按键控制仍待真机验收。"
   },
   "identity": {
     "bluetoothNamePrefixes": [

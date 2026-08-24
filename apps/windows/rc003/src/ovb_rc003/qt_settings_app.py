@@ -641,6 +641,7 @@ def _load_qt_classes() -> dict:
         hotkeyTextChanged = Signal()
         holdVoiceHotkeyTextChanged = Signal()
         endpointOptionsChanged = Signal()
+        recommendedEndpointIndexChanged = Signal()
         selectedEndpointIndexChanged = Signal()
         bridgeRunningChanged = Signal()
         launchStatusTextChanged = Signal()
@@ -661,7 +662,7 @@ def _load_qt_classes() -> dict:
 
         _TRIGGER_MODE_ORDER = (key_mapping.VoiceTriggerMode.HOLD,)
         _DEVICE_ORDER = tuple(profile.device_id for profile in device_catalog.DEVICE_PROFILES)
-        _KEY_DETECTION_TIMEOUT_SECONDS = 60.0
+        _KEY_DETECTION_TIMEOUT_SECONDS = key_detection_bridge.STALE_AFTER_SECONDS
         _KEY_DETECTION_USAGE_TO_BUTTON = {
             usage: button_id
             for usage, button_id in frida_compat.TAP_USAGE_TO_BUTTON.items()
@@ -735,6 +736,7 @@ def _load_qt_classes() -> dict:
             self._hotkeyCaptureResult.connect(self._on_hotkey_capture_result)
 
             self._endpoint_options: List[str] = []
+            self._recommended_endpoint_index = -1
             self._selected_endpoint_index = -1
             self._refresh_endpoint_options()
             self._refresh_dji_mic_status()
@@ -765,7 +767,27 @@ def _load_qt_classes() -> dict:
                 )
                 options = [settings_ui._endpoint_display(e) for e in endpoints]
             except audio_output.AudioOutputUnavailableError:
+                endpoints = []
                 options = []
+
+            recommended_display = ""
+            recommendation_candidates = [
+                endpoint
+                for endpoint in endpoints
+                if audio_output.is_cable_input_endpoint(endpoint.name)
+                and endpoint.host_api
+                in ("Windows WASAPI", "Windows DirectSound")
+            ]
+            try:
+                recommended_endpoint = audio_output.select_preferred_output_endpoint(
+                    recommendation_candidates
+                )
+            except audio_output.AudioOutputUnavailableError:
+                pass
+            else:
+                recommended_display = settings_ui._endpoint_display(
+                    recommended_endpoint
+                )
 
             saved_name = self._config.get("output_endpoint_name", "")
             saved_host_api = self._config.get("output_endpoint_host_api", "")
@@ -815,6 +837,11 @@ def _load_qt_classes() -> dict:
                     )
 
             self._endpoint_options = options
+            self._recommended_endpoint_index = (
+                options.index(recommended_display)
+                if recommended_display in options
+                else -1
+            )
             selected_display = migrated_display or saved_display
             self._selected_endpoint_index = (
                 options.index(selected_display) if selected_display in options else -1
@@ -1193,6 +1220,15 @@ def _load_qt_classes() -> dict:
 
         endpointOptions = Property(
             list, _get_endpoint_options, notify=endpointOptionsChanged
+        )
+
+        def _get_recommended_endpoint_index(self) -> int:
+            return self._recommended_endpoint_index
+
+        recommendedEndpointIndex = Property(
+            int,
+            _get_recommended_endpoint_index,
+            notify=recommendedEndpointIndexChanged,
         )
 
         def _get_selected_endpoint_index(self) -> int:
@@ -1787,6 +1823,7 @@ def _load_qt_classes() -> dict:
             self._config = new_config
             self._refresh_endpoint_options()
             self.endpointOptionsChanged.emit()
+            self.recommendedEndpointIndexChanged.emit()
             self.selectedEndpointIndexChanged.emit()
             return True
 

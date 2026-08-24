@@ -97,11 +97,9 @@ class HotkeySpec:
         return cls(modifiers=modifiers, key=keys[0])
 
 
-# A deliberately uncommon default for fresh installations. Users who rely on
-# Windows Voice Typing can change this back to ``win+h``; third-party input
-# methods can bind the same chord in their own shortcut settings. Existing
-# config files keep their saved value because config.load_config() merges them
-# over default_config().
+# The established right-Alt hold trigger remains the fresh-install default.
+# Existing config files keep their saved value because config.load_config()
+# normalizes persisted voice fields before merging defaults.
 DEFAULT_VOICE_HOTKEY = HotkeySpec.parse(
     key_mapping.voice_hotkey_for_trigger_mode(key_mapping.VoiceTriggerMode.HOLD)
 )

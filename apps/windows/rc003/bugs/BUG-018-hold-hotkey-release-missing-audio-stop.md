@@ -1,6 +1,7 @@
 # BUG-018：按住说缺少 AUDIO_STOP 时宿主快捷键不释放
 
-状态：第二轮根因已确认并修正，自动回归与冻结构建通过，等待 RC003 真机复测。
+状态：第三轮迟到 F5 与发送所有权缺口已修正，自动回归与冻结构建通过，等待
+RC003 真机复测。
 
 ## 现象
 
@@ -52,6 +53,17 @@
 这也解释了“键盘操作正常、遥控器松开后界面仍停留”的差异：键盘抬起会立即
 到达宿主；RC003 的直接 HID 已抬起，但旧代码错误等待了延迟的 legacy F5 up。
 
+### 2026-08-24 一般自检发现的第三层缺口
+
+直接 HID 松开后，legacy F5 还可能继续晚到并跨进下一轮。进一步强制线程顺序
+复现出：`_transform_legacy_voice_key()` 已返回替换目标、
+`_emit_legacy_voice_key()` 尚未发送时，direct HID down 先走普通配置快捷键，
+随后 emit 再发右侧 Alt。同一次实体按下因此会出现两个 down、一个 up。
+
+这不是随机猜测，测试已稳定得到重复调用序列。直接原因是旧代码只把已经完成
+emit 的 transform session 当作“宿主动作已处理”，没有给“已决定、未发送”的
+在途 F5 与物理 HID 分配唯一发送所有权。
+
 ## 修复
 
 - `VoiceController` 新增 `on_mic_button_released()`：HOLD 在物理抬起时返回
@@ -66,6 +78,10 @@
 - 第二轮修正把直接 HID tap 的话筒 usage up 视为权威物理抬起，不再等待延迟的
   legacy F5 up。晚到的 F5 up 和 `AudioStopped` 仍只清理来源状态，不重复发送
   KEY_UP。
+- 第三轮用同一状态锁串行化 F5 transform/emit、设置应用和 `AudioStopped`。
+  物理 HID 先认领时隔离尚未 emit 的 F5，并发送当前配置快捷键；F5 先 emit 时，
+  HID 识别 transform session 后不重发。两种顺序都只有一个发送者，且不等待
+  低层键盘钩子。
 
 ## 自动验证
 
@@ -78,6 +94,10 @@
 - `compileall`、`pip check` 和 `git diff --check` 通过。
 - PyInstaller 本地冻结构建通过；EXE 的 `--dry-run` 退出 0。该 EXE 尚未经过
   RC003 真机验证。
+- 2026-08-24 最新完整 unittest 1205 项通过、7 项跳过；应用接线 113 项通过、
+  1 项跳过且无资源泄漏记录。公开边界扫描 302 个文件，`compileall`、
+  `pip check`、PowerShell 全脚本解析、`git diff --check`、PyInstaller、冻结
+  `--help` / `--dry-run` 和 11 个 QML 一致性均通过。
 
 ## 真机复测
 

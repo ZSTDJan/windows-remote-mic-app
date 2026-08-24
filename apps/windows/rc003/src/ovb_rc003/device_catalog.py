@@ -277,16 +277,12 @@ def _parse_profile(raw: object, filename: str) -> DeviceUiProfile:
     if any(not isinstance(source, str) or not source.strip() for source in sources):
         raise DeviceCatalogLoadError(f"{context}.sources must contain non-empty strings")
 
-    windows_platform = next(
-        (entry for entry in platforms if entry.platform == "windows"), None
-    )
-    windows_notes = windows_platform.notes if windows_platform is not None else ""
     voice_input_only = (
         "host-key-mapping" not in capabilities
         and any(transport.role == "voice-input" for transport in transports)
     )
     prefix = "作为 Windows 录音输入使用；" if voice_input_only else ""
-    description = " ".join(part for part in (prefix + support_notes, windows_notes) if part)
+    description = prefix + support_notes
 
     return DeviceUiProfile(
         device_id=device_id,

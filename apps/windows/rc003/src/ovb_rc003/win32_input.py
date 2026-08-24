@@ -434,7 +434,12 @@ def voice_backend_name() -> str:
 
 
 def _real_voice_event(vk: int, key_up: bool) -> None:
-    """Emit a voice edge for the local hook to forward as a physical event."""
+    """Emit a marked voice edge through the legacy ``keybd_event`` path.
+
+    The optional compatibility hook clears the injected flag only for the
+    right-Alt target. Other user-configured combinations remain normal
+    injected key sequences.
+    """
 
     global _voice_backend
     if _voice_backend is None:
@@ -455,7 +460,7 @@ def _best_effort_voice_up(vk_codes: Sequence[int], sender: VoiceSender) -> bool:
 def send_voice_key_combo_down(
     tokens: Sequence[str], *, _sender: Optional[VoiceSender] = None
 ) -> None:
-    """Press a voice shortcut through the physicalized virtual-key path."""
+    """Press a voice shortcut through the marked virtual-key path."""
 
     sender = _sender or _real_voice_event
     vk_codes = win32_keys.resolve_vk_codes(tokens)

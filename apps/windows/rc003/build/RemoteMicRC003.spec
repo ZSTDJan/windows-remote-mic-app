@@ -44,10 +44,10 @@ if REMOTE_PHOTO.is_file():
     # find_remote_photo(), which checks that path first in a frozen build.
     datas.append((str(REMOTE_PHOTO), "Resources"))
 if QML_SOURCE_DIR.is_dir():
-    # XRBM-030: the settings window's own QML sources (main.qml/Tokens.qml/
-    # ConnectionPage.qml/ButtonsPage.qml/PermissionsPage.qml) are real files
-    # on disk, not a Python module - PyInstaller's Analysis never discovers
-    # them on its own, and no PySide6 hook bundles THIRD-PARTY qml/ trees
+    # XRBM-030: the settings window's entire QML source tree is made of real
+    # files on disk, not a Python module - PyInstaller's Analysis never
+    # discovers them on its own, and no PySide6 hook bundles third-party QML
+    # trees
     # (only Qt's OWN Quick Controls/QML plugin assets, handled automatically
     # by PyInstaller's bundled PySide6 hooks). Collected under
     # "ovb_rc003_qml" inside the COLLECT output, matching
