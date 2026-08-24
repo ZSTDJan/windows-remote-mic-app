@@ -1,6 +1,3 @@
-// Device, audio-route and bridge-start workflow. This page deliberately
-// keeps saving and launching as separate commands: connection/output changes
-// need a bridge restart, while button mappings can be picked up live.
 import QtQuick
 import QtQuick.Controls
 import QtQuick.Layouts
@@ -11,25 +8,17 @@ Item {
     property var tokens
 
     function ensureVisible(item) {
-        if (!item) {
+        if (!item)
             return
-        }
         Qt.callLater(function() {
             const flickable = connectionScroll.contentItem
-            if (!flickable || flickable.contentHeight <= connectionScroll.availableHeight) {
+            if (!flickable || flickable.contentHeight <= connectionScroll.availableHeight)
                 return
-            }
-            const position = item.mapToItem(pageColumn, 0, 0)
-            const top = pageColumn.y + position.y - tokens.spacingMedium
-            const bottom = pageColumn.y + position.y + item.height + tokens.spacingMedium
-            const viewportTop = flickable.contentY
-            const viewportBottom = viewportTop + connectionScroll.availableHeight
-            const maximumY = Math.max(0, flickable.contentHeight - connectionScroll.availableHeight)
-            if (top < viewportTop) {
-                flickable.contentY = Math.max(0, top)
-            } else if (bottom > viewportBottom) {
-                flickable.contentY = Math.min(maximumY, bottom - connectionScroll.availableHeight)
-            }
+            const position = item.mapToItem(pageContent, 0, 0)
+            flickable.contentY = Math.max(0, Math.min(
+                flickable.contentHeight - connectionScroll.availableHeight,
+                position.y - tokens.spacingMedium
+            ))
         })
     }
 
@@ -41,260 +30,324 @@ Item {
         contentWidth: availableWidth
         ScrollBar.horizontal.policy: ScrollBar.AlwaysOff
 
-        ColumnLayout {
-            id: pageColumn
+        Item {
+            id: pageContent
             objectName: "connectionPageContent"
-            width: Math.max(0, Math.min(
-                root.width - tokens.pageHorizontalPadding * 2,
-                tokens.pageMaxWidth
-            ))
-            x: Math.max(tokens.pageHorizontalPadding, (root.width - width) / 2)
-            y: tokens.spacingLarge
-            spacing: tokens.spacingLarge
+            width: connectionScroll.availableWidth
+            implicitHeight: connectionPanel.height + tokens.pageVerticalPadding * 2
 
-            UiLabel {
-                tokens: root.tokens
-                kind: pageTitleKind
-                text: qsTr("连接与启动")
-            }
-
-            // -- Device ------------------------------------------------------
-            SectionFrame {
-                id: deviceSection
-                objectName: "deviceSection"
-                tokens: root.tokens
-                Layout.fillWidth: true
-
-                FormField {
-                    tokens: root.tokens
-                    titleText: qsTr("设备")
-                    errorText: SettingsController.deviceCatalogAvailable
-                        ? "" : SettingsController.deviceCatalogErrorText
-                    noteText: SettingsController.selectedDeviceDescription
-                    Layout.fillWidth: true
-
-                    SelectionComboBox {
-                        id: deviceCombo
-                        objectName: "deviceCombo"
-                        tokens: root.tokens
-                        Layout.fillWidth: true
-                        model: SettingsController.deviceOptions
-                        currentIndex: SettingsController.selectedDeviceIndex
-                        onActivated: SettingsController.selectedDeviceIndex = index
-                        enabled: SettingsController.deviceCatalogAvailable
-                        Accessible.name: qsTr("设备")
-                        KeyNavigation.tab: SettingsController.isRc003Device
-                            ? endpointCombo
-                            : refreshDjiButton
-                        onActiveFocusChanged: {
-                            if (activeFocus) {
-                                root.ensureVisible(this)
-                            }
-                        }
-                    }
-                }
-            }
-
-            // -- RC003 output route -----------------------------------------
-            SectionFrame {
-                id: rc003OutputSection
-                objectName: "rc003OutputSection"
-                tokens: root.tokens
-                visible: SettingsController.isRc003Device
-                Layout.fillWidth: true
-
-                FormField {
-                    tokens: root.tokens
-                    titleText: qsTr("语音输出")
-                    errorText: SettingsController.endpointOptions.length === 0
-                        ? qsTr("当前没有检测到可用的 Windows WASAPI 或 DirectSound 输出设备。")
-                        : ""
-                    noteObjectName: "endpointAvailabilityNote"
-                    noteText: qsTr("Remote Mic 将 RC003 语音写入这里。使用 VB-CABLE 时选择 CABLE Input；目标输入法或应用应监听 CABLE Output。")
-                        + "\n"
-                        + qsTr("列表可能保留已保存但当前缺失的端点；启用语音映射时，保存会实际验证所选设备，缺失或无法打开时会拒绝保存。更换设备或语音输出后，需要重新启动后台桥接。")
-                    Layout.fillWidth: true
-
-                    SelectionComboBox {
-                        id: endpointCombo
-                        objectName: "endpointCombo"
-                        tokens: root.tokens
-                        recommendedIndex: SettingsController.recommendedEndpointIndex
-                        Layout.fillWidth: true
-                        model: SettingsController.endpointOptions
-                        currentIndex: SettingsController.selectedEndpointIndex
-                        onActivated: SettingsController.selectedEndpointIndex = index
-                        Accessible.name: qsTr("语音输出设备")
-                        KeyNavigation.tab: restoreDefaultsButton
-                        onActiveFocusChanged: {
-                            if (activeFocus) {
-                                root.ensureVisible(this)
-                            }
-                        }
-                    }
-                }
-            }
-
-            // -- DJI system-input workflow ---------------------------------
-            SectionFrame {
-                id: djiInputSection
-                objectName: "djiInputSection"
-                tokens: root.tokens
-                visible: SettingsController.isDjiMic2Device
-                Layout.fillWidth: true
-
-                UiLabel {
-                    tokens: root.tokens
-                    kind: sectionTitleKind
-                    text: qsTr("Windows 录音输入")
-                }
-                UiLabel {
-                    tokens: root.tokens
-                    kind: bodyKind
-                    Layout.fillWidth: true
-                    wrapMode: Text.WordWrap
-                    text: SettingsController.djiMicStatusText
-                }
-                UiLabel {
-                    tokens: root.tokens
-                    kind: noteKind
-                    Layout.fillWidth: true
-                    wrapMode: Text.WordWrap
-                    text: qsTr("DJI Mic 2 直接作为系统麦克风使用，不经过 RC003 的 BLE/HID/ATVV 桥，也不使用 CABLE Input。Remote Mic 不会修改 Windows 默认输入设备。")
-                }
-                RowLayout {
-                    Layout.fillWidth: true
-                    spacing: tokens.spacingSmall
-
-                    Button {
-                        id: refreshDjiButton
-                        objectName: "refreshDjiButton"
-                        text: qsTr("重新检测")
-                        onClicked: SettingsController.refreshDjiMicStatus()
-                        Accessible.name: text
-                        KeyNavigation.tab: openSoundSettingsButton
-                        onActiveFocusChanged: {
-                            if (activeFocus) {
-                                root.ensureVisible(this)
-                            }
-                        }
-                    }
-                    Button {
-                        id: openSoundSettingsButton
-                        objectName: "openSoundSettingsButton"
-                        text: qsTr("打开 Windows 声音输入设置")
-                        highlighted: true
-                        onClicked: SettingsController.openSoundSettings()
-                        Accessible.name: text
-                        KeyNavigation.tab: saveOnlyButton
-                        onActiveFocusChanged: {
-                            if (activeFocus) {
-                                root.ensureVisible(this)
-                            }
-                        }
-                    }
-                    Item { Layout.fillWidth: true }
-                }
-            }
-
-            // -- Bridge result ----------------------------------------------
-            SectionFrame {
-                id: bridgeSection
-                objectName: "bridgeSection"
-                tokens: root.tokens
-                visible: SettingsController.isRc003Device
-                Layout.fillWidth: true
-                fillColor: tokens.surfaceMuted
-
-                UiLabel {
-                    Layout.fillWidth: true
-                    tokens: root.tokens
-                    kind: sectionTitleKind
-                    text: qsTr("后台桥接")
-                }
-                UiLabel {
-                    tokens: root.tokens
-                    kind: bodyKind
-                    objectName: "launchStatusText"
-                    Layout.fillWidth: true
-                    wrapMode: Text.WordWrap
-                    text: SettingsController.launchStatusText
-                }
-                UiLabel {
-                    tokens: root.tokens
-                    kind: bodyKind
-                    objectName: "bridgeNotRunningWarning"
-                    Layout.fillWidth: true
-                    visible: !SettingsController.bridgeRunning
-                    wrapMode: Text.WordWrap
-                    text: qsTr("后台桥接未运行或尚未确认运行：话筒键不会由本程序触发语音。请点击下方“保存并启动桥接”，首次连接可能需要约一分钟。")
-                    color: tokens.errorColor
-                    font.bold: true
-                }
-                UiLabel {
-                    tokens: root.tokens
-                    kind: noteKind
-                    Layout.fillWidth: true
-                    wrapMode: Text.WordWrap
-                    text: qsTr("这里显示窗口打开时的桥接状态或本设置窗口最近一次启动结果，不代表 RC003 已连接。实际连接与语音状态请以日志和真机测试为准。")
-                }
-            }
-
-            // -- Save/start commands ----------------------------------------
             RowLayout {
-                id: actionRow
-                objectName: "connectionActionRow"
-                Layout.fillWidth: true
-                spacing: tokens.spacingSmall
+                id: connectionPanel
+                anchors.left: parent.left
+                anchors.right: parent.right
+                anchors.top: parent.top
+                anchors.margins: tokens.pageHorizontalPadding
+                height: 398
+                spacing: tokens.spacingMedium
 
-                Button {
-                    id: restoreDefaultsButton
-                    objectName: "restoreDefaultsButton"
-                    visible: SettingsController.isRc003Device
-                    text: qsTr("恢复按键与语音默认")
-                    flat: true
-                    onClicked: SettingsController.restoreDefaults()
-                    Accessible.name: text
-                    KeyNavigation.tab: saveOnlyButton
-                    onActiveFocusChanged: {
-                        if (activeFocus) {
-                            root.ensureVisible(this)
+                SectionFrame {
+                    id: deviceCard
+                    objectName: "deviceSection"
+                    tokens: root.tokens
+                    Layout.preferredWidth: 168
+                    Layout.minimumWidth: 168
+                    Layout.maximumWidth: 168
+                    Layout.fillHeight: true
+                    horizontalPadding: 12
+                    verticalPadding: 12
+                    contentSpacing: 0
+
+                    ColumnLayout {
+                        Layout.fillWidth: true
+                        Layout.fillHeight: true
+                        spacing: 0
+
+                        UiLabel {
+                            tokens: root.tokens
+                            kind: sectionTitleKind
+                            Layout.fillWidth: true
+                            horizontalAlignment: Text.AlignHCenter
+                            text: SettingsController.isRc003Device
+                                ? qsTr("小米蓝牙遥控器 2 Pro") : qsTr("DJI Mic 2")
+                            font.pixelSize: 14
+                            elide: Text.ElideRight
                         }
+                        UiLabel {
+                            tokens: root.tokens
+                            kind: noteKind
+                            Layout.fillWidth: true
+                            horizontalAlignment: Text.AlignHCenter
+                            text: SettingsController.isRc003Device
+                                ? qsTr("RC003 · 已选择") : qsTr("无线麦克风 · 已选择")
+                        }
+
+                        Item {
+                            Layout.fillWidth: true
+                            Layout.preferredHeight: 190
+                            Layout.topMargin: 8
+                            Layout.bottomMargin: 6
+
+                            Image {
+                                id: connectionPhoto
+                                anchors.centerIn: parent
+                                width: height * 240 / 360
+                                height: 190
+                                source: SettingsController.photoAvailable
+                                    && SettingsController.isRc003Device
+                                    ? SettingsController.photoSource : ""
+                                visible: source.toString().length > 0
+                                fillMode: Image.Stretch
+                                smooth: true
+                                mipmap: true
+                            }
+                            IconGlyph {
+                                anchors.centerIn: parent
+                                visible: !connectionPhoto.visible
+                                tokens: root.tokens
+                                glyph: SettingsController.isRc003Device ? "\uE7F8" : "\uE720"
+                                glyphSize: 42
+                                color: tokens.disabledText
+                            }
+                        }
+
+                        ColumnLayout {
+                            Layout.fillWidth: true
+                            spacing: 5
+
+                            RowLayout {
+                                Layout.fillWidth: true
+                                spacing: 5
+                                IconGlyph { tokens: root.tokens; glyph: "\uE702"; glyphSize: 13; Layout.preferredWidth: 15; color: tokens.accent }
+                                UiLabel { tokens: root.tokens; kind: bodyKind; text: qsTr("蓝牙配对"); Layout.fillWidth: true; font.pixelSize: tokens.fontSizeSmall }
+                                UiLabel { tokens: root.tokens; kind: noteKind; text: qsTr("系统管理"); font.pixelSize: tokens.fontSizeTiny }
+                            }
+                            RowLayout {
+                                Layout.fillWidth: true
+                                spacing: 5
+                                IconGlyph { tokens: root.tokens; glyph: "\uE767"; glyphSize: 13; Layout.preferredWidth: 15; color: tokens.accent }
+                                UiLabel { tokens: root.tokens; kind: bodyKind; text: qsTr("语音输出"); Layout.fillWidth: true; font.pixelSize: tokens.fontSizeSmall }
+                                UiLabel { tokens: root.tokens; kind: noteKind; text: qsTr("保存时检查"); font.pixelSize: tokens.fontSizeTiny }
+                            }
+                            RowLayout {
+                                Layout.fillWidth: true
+                                spacing: 5
+                                IconGlyph { tokens: root.tokens; glyph: "\uE9D9"; glyphSize: 13; Layout.preferredWidth: 15; color: SettingsController.bridgeRunning ? tokens.successColor : tokens.accent }
+                                UiLabel { tokens: root.tokens; kind: bodyKind; text: qsTr("后台桥接"); Layout.fillWidth: true; font.pixelSize: tokens.fontSizeSmall }
+                                UiLabel { tokens: root.tokens; kind: noteKind; text: qsTr("自动更新"); font.pixelSize: tokens.fontSizeTiny }
+                            }
+                        }
+
+                        Item { Layout.fillHeight: true }
                     }
                 }
-                Item { Layout.fillWidth: true }
-                Button {
-                    id: saveOnlyButton
-                    objectName: "deviceSaveButton"
-                    text: SettingsController.isRc003Device
-                        ? qsTr("仅保存设置")
-                        : qsTr("保存设备选择")
-                    highlighted: !SettingsController.isRc003Device
-                    onClicked: SettingsController.saveSettings()
-                    Accessible.name: text
-                    onActiveFocusChanged: {
-                        if (activeFocus) {
-                            root.ensureVisible(this)
+
+                SectionFrame {
+                    id: settingsSheet
+                    objectName: "rc003OutputSection"
+                    tokens: root.tokens
+                    Layout.fillWidth: true
+                    Layout.fillHeight: true
+                    horizontalPadding: 14
+                    verticalPadding: 0
+                    contentSpacing: 0
+
+                    ColumnLayout {
+                        Layout.fillWidth: true
+                        Layout.fillHeight: true
+                        Layout.bottomMargin: 10
+                        spacing: 0
+
+                        Item {
+                            Layout.fillWidth: true
+                            Layout.preferredHeight: 70
+
+                            FormField {
+                                anchors.left: parent.left
+                                anchors.right: parent.right
+                                anchors.verticalCenter: parent.verticalCenter
+                                tokens: root.tokens
+                                titleText: qsTr("当前设备")
+                                noteText: SettingsController.isRc003Device
+                                    ? qsTr("用于遥控按键和按住说话。")
+                                    : qsTr("直接使用 Windows 录音输入，不经过 RC003 桥接。")
+                                errorText: SettingsController.deviceCatalogAvailable
+                                    ? "" : SettingsController.deviceCatalogErrorText
+
+                                SelectionComboBox {
+                                    id: deviceCombo
+                                    objectName: "deviceCombo"
+                                    tokens: root.tokens
+                                    Layout.fillWidth: true
+                                    model: SettingsController.deviceOptions
+                                    currentIndex: SettingsController.selectedDeviceIndex
+                                    onActivated: SettingsController.selectedDeviceIndex = index
+                                    enabled: SettingsController.deviceCatalogAvailable
+                                    Accessible.name: qsTr("当前设备")
+                                    KeyNavigation.tab: SettingsController.isRc003Device ? endpointCombo : refreshDjiButton
+                                    onActiveFocusChanged: if (activeFocus) root.ensureVisible(this)
+                                }
+                            }
                         }
-                    }
-                }
-                Button {
-                    id: saveAndLaunchButton
-                    objectName: "saveAndLaunchButton"
-                    visible: SettingsController.isRc003Device
-                    text: qsTr("保存并启动桥接")
-                    highlighted: true
-                    onClicked: SettingsController.saveAndLaunch()
-                    Accessible.name: text
-                    onActiveFocusChanged: {
-                        if (activeFocus) {
-                            root.ensureVisible(this)
+
+                        Rectangle { Layout.fillWidth: true; Layout.preferredHeight: 1; color: tokens.border }
+
+                        Item {
+                            id: outputBlock
+                            visible: SettingsController.isRc003Device
+                            Layout.fillWidth: true
+                            Layout.preferredHeight: visible ? 70 : 0
+
+                            FormField {
+                                anchors.left: parent.left
+                                anchors.right: parent.right
+                                anchors.verticalCenter: parent.verticalCenter
+                                tokens: root.tokens
+                                titleText: qsTr("输出端点")
+                                noteObjectName: "endpointAvailabilityNote"
+                                noteText: qsTr("保存时检查；更换设备或输出后需重启。")
+                                errorText: SettingsController.endpointOptions.length === 0
+                                    ? qsTr("没有可用的 WASAPI 或 DirectSound 输出设备。") : ""
+
+                                SelectionComboBox {
+                                    id: endpointCombo
+                                    objectName: "endpointCombo"
+                                    tokens: root.tokens
+                                    recommendedIndex: SettingsController.recommendedEndpointIndex
+                                    Layout.fillWidth: true
+                                    model: SettingsController.endpointOptions
+                                    currentIndex: SettingsController.selectedEndpointIndex
+                                    onActivated: SettingsController.selectedEndpointIndex = index
+                                    Accessible.name: qsTr("输出端点")
+                                    KeyNavigation.tab: restoreDefaultsButton
+                                    onActiveFocusChanged: if (activeFocus) root.ensureVisible(this)
+                                }
+                            }
+                        }
+
+                        Item {
+                            id: djiInputSection
+                            objectName: "djiInputSection"
+                            visible: SettingsController.isDjiMic2Device
+                            Layout.fillWidth: true
+                            Layout.preferredHeight: visible ? 100 : 0
+
+                            ColumnLayout {
+                                anchors.fill: parent
+                                anchors.topMargin: 10
+                                anchors.bottomMargin: 10
+                                spacing: 5
+                                UiLabel { tokens: root.tokens; kind: sectionTitleKind; text: qsTr("Windows 录音输入") }
+                                UiLabel { tokens: root.tokens; kind: bodyKind; Layout.fillWidth: true; text: SettingsController.djiMicStatusText; wrapMode: Text.WordWrap }
+                                UiLabel { tokens: root.tokens; kind: noteKind; Layout.fillWidth: true; text: qsTr("不会修改 Windows 默认输入设备。"); wrapMode: Text.WordWrap }
+                                RowLayout {
+                                    Layout.fillWidth: true
+                                    spacing: tokens.spacingSmall
+                                    CompactButton {
+                                        id: refreshDjiButton
+                                        objectName: "refreshDjiButton"
+                                        tokens: root.tokens
+                                        text: qsTr("重新检测")
+                                        onClicked: SettingsController.refreshDjiMicStatus()
+                                        KeyNavigation.tab: openSoundSettingsButton
+                                    }
+                                    CompactButton {
+                                        id: openSoundSettingsButton
+                                        objectName: "openSoundSettingsButton"
+                                        tokens: root.tokens
+                                        text: qsTr("声音输入")
+                                        highlighted: true
+                                        onClicked: SettingsController.openSoundSettings()
+                                        KeyNavigation.tab: saveOnlyButton
+                                    }
+                                    Item { Layout.fillWidth: true }
+                                }
+                            }
+                        }
+
+                        Rectangle { Layout.fillWidth: true; Layout.preferredHeight: 1; color: tokens.border }
+
+                        ColumnLayout {
+                            id: bridgeSection
+                            objectName: "bridgeSection"
+                            visible: SettingsController.isRc003Device
+                            Layout.fillWidth: true
+                            Layout.fillHeight: true
+                            Layout.topMargin: 10
+                            spacing: 7
+
+                            UiLabel { tokens: root.tokens; kind: sectionTitleKind; text: qsTr("后台桥接") }
+                            RowLayout {
+                                Layout.fillWidth: true
+                                spacing: 7
+                                Rectangle {
+                                    Layout.preferredWidth: 8
+                                    Layout.preferredHeight: 8
+                                    radius: 4
+                                    color: SettingsController.bridgeRunning ? tokens.successColor : tokens.voiceAccent
+                                }
+                                UiLabel {
+                                    id: launchStatusText
+                                    objectName: "launchStatusText"
+                                    tokens: root.tokens
+                                    kind: bodyKind
+                                    Layout.fillWidth: true
+                                    text: SettingsController.launchStatusText
+                                    font.weight: Font.Medium
+                                    wrapMode: Text.WordWrap
+                                }
+                            }
+                            UiLabel {
+                                objectName: "bridgeNotRunningWarning"
+                                tokens: root.tokens
+                                kind: noteKind
+                                Layout.fillWidth: true
+                                text: SettingsController.bridgeRunning
+                                    ? qsTr("按键、声音和文字输入仍需实际测试。")
+                                    : qsTr("未启动时语音键无效；按键、声音和文字输入需实际测试。")
+                                wrapMode: Text.WordWrap
+                            }
+
+                            RowLayout {
+                                id: actionRow
+                                objectName: "connectionActionRow"
+                                Layout.fillWidth: true
+                                spacing: tokens.spacingSmall
+
+                                CompactButton {
+                                    id: restoreDefaultsButton
+                                    objectName: "restoreDefaultsButton"
+                                    tokens: root.tokens
+                                    text: qsTr("恢复按键与语音默认")
+                                    onClicked: SettingsController.restoreDefaults()
+                                    KeyNavigation.tab: saveOnlyButton
+                                }
+                                Item { Layout.fillWidth: true }
+                                CompactButton {
+                                    id: saveOnlyButton
+                                    objectName: "deviceSaveButton"
+                                    tokens: root.tokens
+                                    compactMinimumWidth: 116
+                                    text: SettingsController.isRc003Device ? qsTr("仅保存设置") : qsTr("保存设备选择")
+                                    highlighted: !SettingsController.isRc003Device
+                                    onClicked: SettingsController.saveSettings()
+                                }
+                                CompactButton {
+                                    id: saveAndLaunchButton
+                                    objectName: "saveAndLaunchButton"
+                                    tokens: root.tokens
+                                    visible: SettingsController.isRc003Device
+                                    compactMinimumWidth: 116
+                                    text: qsTr("保存并启动桥接")
+                                    highlighted: true
+                                    onClicked: SettingsController.saveAndLaunch()
+                                }
+                            }
+
+                            Item { Layout.fillHeight: true }
                         }
                     }
                 }
             }
-
-            Item { Layout.preferredHeight: tokens.spacingLarge }
         }
     }
 }

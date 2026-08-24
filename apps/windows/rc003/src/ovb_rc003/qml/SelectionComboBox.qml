@@ -16,16 +16,54 @@ ComboBox {
     }
 
     editable: false
+    implicitHeight: tokens ? tokens.controlHeight : 26
+    leftPadding: 7
+    rightPadding: 24
     displayText: decoratedText(currentIndex, currentText)
+    font.pixelSize: tokens ? tokens.fontSizeControl : 12
+    font.weight: Font.Medium
+
+    contentItem: Label {
+        text: root.displayText
+        color: root.enabled ? root.tokens.textPrimary : root.tokens.disabledText
+        font: root.font
+        verticalAlignment: Text.AlignVCenter
+        elide: Text.ElideRight
+    }
+
+    indicator: Label {
+        x: root.width - width - 7
+        y: (root.height - height) / 2 - 1
+        text: "⌄"
+        color: root.enabled ? root.tokens.textSecondary : root.tokens.disabledText
+        font.pixelSize: 13
+    }
+
+    background: Rectangle {
+        radius: root.tokens.cornerRadiusControl
+        color: root.tokens.fieldBackground
+        border.width: root.activeFocus ? 2 : 1
+        border.color: root.activeFocus ? root.tokens.accent : root.tokens.border
+    }
 
     delegate: ItemDelegate {
         objectName: root.objectName + "_option_" + index
         width: ListView.view ? ListView.view.width : root.width
-        text: root.decoratedText(index, modelData)
+        height: 28
+        leftPadding: 7
+        rightPadding: 7
         highlighted: root.highlightedIndex === index
-        font.pixelSize: root.tokens
-            ? root.tokens.fontSizeBody : 13
-        font.bold: index === root.currentIndex
-        Accessible.name: text
+        contentItem: Label {
+            text: root.decoratedText(index, modelData)
+            color: root.tokens.textPrimary
+            font.pixelSize: root.tokens.fontSizeControl
+            font.weight: index === root.currentIndex ? Font.DemiBold : Font.Normal
+            verticalAlignment: Text.AlignVCenter
+            elide: Text.ElideRight
+        }
+        background: Rectangle {
+            color: parent.highlighted ? root.tokens.accentSoft : root.tokens.surface
+        }
+        Accessible.name: contentItem.text
     }
 }

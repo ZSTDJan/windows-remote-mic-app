@@ -11,7 +11,7 @@ Rectangle {
     property int contentSpacing: tokens.spacingSmall
     default property alias contentData: sectionContent.data
 
-    radius: tokens.cornerRadiusSmall
+    radius: tokens.cornerRadiusLarge
     color: fillColor
     border.color: tokens.border
     border.width: 1
