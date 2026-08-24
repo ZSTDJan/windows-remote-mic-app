@@ -12,15 +12,28 @@ Item {
     readonly property string groupDictation: "dictation"
     readonly property string groupOptionalDriver: "optional_driver"
     readonly property string groupExternalMicrophone: "external_microphone"
+    property string optionalDriverDetail: ""
 
-    function rowsForGroups(groupIds) {
-        var rows = []
+    ListModel {
+        id: diagnosticsRowsModel
+    }
+
+    function refreshRenderedCheckRows() {
+        diagnosticsRowsModel.clear()
+        optionalDriverDetail = ""
         var results = DiagnosticsController.checkResults
         for (var i = 0; i < results.length; i++) {
-            if (groupIds.indexOf(results[i].group) >= 0)
-                rows.push(results[i])
+            var row = results[i]
+            diagnosticsRowsModel.append({
+                "checkId": String(row.checkId),
+                "title": String(row.title),
+                "group": String(row.group),
+                "status": String(row.status),
+                "detail": String(row.detail)
+            })
+            if (row.group === groupOptionalDriver)
+                optionalDriverDetail = row.title + "：" + row.detail
         }
-        return rows
     }
 
     function statusLabel(status) {
@@ -30,50 +43,20 @@ Item {
         return qsTr("不可用")
     }
 
-    function groupStatus(groupIds) {
-        var rows = rowsForGroups(groupIds)
-        if (DiagnosticsController.isRefreshing)
-            return "refreshing"
-        if (rows.length === 0)
-            return "pending"
-        var hasManual = false
-        var hasUnsupported = false
-        for (var i = 0; i < rows.length; i++) {
-            if (rows[i].status === "fail") return "fail"
-            if (rows[i].status === "manual") hasManual = true
-            if (rows[i].status !== "pass" && rows[i].status !== "manual") hasUnsupported = true
-        }
-        if (hasManual) return "manual"
-        if (hasUnsupported) return "unsupported"
-        return "pass"
-    }
-
-    function groupStatusText(groupIds) {
-        var status = groupStatus(groupIds)
-        if (status === "refreshing") return qsTr("检查中")
-        if (status === "pending") return qsTr("尚未检查")
-        if (status === "pass") return qsTr("正常")
-        if (status === "fail") return qsTr("有问题")
-        if (status === "manual") return qsTr("待实测")
-        return qsTr("部分不可用")
-    }
-
-    function groupStatusColor(groupIds) {
-        var status = groupStatus(groupIds)
+    function statusColor(status) {
         if (status === "pass") return tokens.successColor
         if (status === "fail") return tokens.errorColor
         if (status === "manual") return tokens.voiceAccent
         return tokens.disabledText
     }
 
-    function groupDetail(groupIds, fallback) {
-        var rows = rowsForGroups(groupIds)
-        if (rows.length === 0)
-            return fallback
-        var details = []
-        for (var i = 0; i < rows.length; i++)
-            details.push(rows[i].title + "：" + statusLabel(rows[i].status))
-        return details.join("；")
+    Component.onCompleted: refreshRenderedCheckRows()
+
+    Connections {
+        target: DiagnosticsController
+        function onCheckResultsChanged() {
+            root.refreshRenderedCheckRows()
+        }
     }
 
     Dialog {
@@ -185,54 +168,27 @@ Item {
                 SectionFrame {
                     tokens: root.tokens
                     Layout.fillWidth: true
-                    horizontalPadding: 0
-                    verticalPadding: 0
-                    contentSpacing: 0
+                    horizontalPadding: 9
+                    verticalPadding: 7
+                    contentSpacing: 6
 
-                    SettingsListRow {
-                        tokens: root.tokens
-                        iconGlyph: "\uE713"
-                        titleText: qsTr("运行环境")
-                        descriptionText: root.groupDetail(
-                            [root.groupOrdinaryButtons],
-                            qsTr("检查系统版本、程序目录、声音支持和日志位置。")
-                        )
-                        UiLabel {
+                    Repeater {
+                        model: diagnosticsRowsModel
+                        delegate: DiagnosticResultRow {
+                            required property string checkId
+                            required property string title
+                            required property string group
+                            required property string status
+                            required property string detail
+
+                            objectName: "diagnosticResult_" + checkId
+                            visible: group !== root.groupOptionalDriver
                             tokens: root.tokens
-                            kind: noteKind
-                            text: root.groupStatusText([root.groupOrdinaryButtons])
-                            color: root.groupStatusColor([root.groupOrdinaryButtons])
-                        }
-                    }
-                    SettingsListRow {
-                        tokens: root.tokens
-                        iconGlyph: "\uE702"
-                        titleText: qsTr("遥控器连接")
-                        descriptionText: root.groupDetail(
-                            [root.groupVoiceBridge],
-                            qsTr("检查蓝牙连接、后台程序和特殊按键。")
-                        )
-                        UiLabel {
-                            tokens: root.tokens
-                            kind: noteKind
-                            text: root.groupStatusText([root.groupVoiceBridge])
-                            color: root.groupStatusColor([root.groupVoiceBridge])
-                        }
-                    }
-                    SettingsListRow {
-                        tokens: root.tokens
-                        iconGlyph: "\uE767"
-                        titleText: qsTr("语音传输")
-                        descriptionText: root.groupDetail(
-                            [root.groupExternalMicrophone, root.groupDictation],
-                            qsTr("检查语音输出；文字能否输入仍需实测。")
-                        )
-                        showDivider: false
-                        UiLabel {
-                            tokens: root.tokens
-                            kind: noteKind
-                            text: root.groupStatusText([root.groupExternalMicrophone, root.groupDictation])
-                            color: root.groupStatusColor([root.groupExternalMicrophone, root.groupDictation])
+                            indicatorColor: root.statusColor(status)
+                            titleText: title
+                            statusText: root.statusLabel(status)
+                            detailText: detail
+                            titleColumnWidth: 116
                         }
                     }
                 }
@@ -256,12 +212,14 @@ Item {
                         iconGlyph: "\uE95E"
                         titleText: qsTr("虚拟音频")
                         descriptionText: DiagnosticsController.driverErrorMessage.length > 0
-                            ? DiagnosticsController.driverErrorMessage
-                            : DiagnosticsController.driverStatusMessage.length > 0
-                                ? DiagnosticsController.driverStatusMessage
-                                : DiagnosticsController.driverInfoMessage.length > 0
-                                    ? DiagnosticsController.driverInfoMessage
-                                    : root.groupDetail([root.groupOptionalDriver], qsTr("选择虚拟音频输入，或安装、修复 VB-CABLE。"))
+                                ? DiagnosticsController.driverErrorMessage
+                                : DiagnosticsController.driverStatusMessage.length > 0
+                                    ? DiagnosticsController.driverStatusMessage
+                                    : DiagnosticsController.driverInfoMessage.length > 0
+                                        ? DiagnosticsController.driverInfoMessage
+                                        : root.optionalDriverDetail.length > 0
+                                            ? root.optionalDriverDetail
+                                            : qsTr("选择虚拟音频输入，或安装、修复 VB-CABLE。")
                         CompactButton {
                             objectName: "selectCableInputButton"
                             tokens: root.tokens
@@ -284,13 +242,13 @@ Item {
                         tokens: root.tokens
                         iconGlyph: "\uE8B7"
                         titleText: qsTr("系统与日志")
-                        descriptionText: qsTr("打开系统设置或日志；日志不保存语音和设备信息。")
+                        descriptionText: qsTr("打开语音设置或日志；日志不保存语音和设备信息。")
                         showDivider: false
                         CompactButton {
-                            objectName: "openAppsSettingsButton"
+                            objectName: "openSpeechSettingsButton"
                             tokens: root.tokens
                             compactMinimumWidth: 64
-                            text: qsTr("系统设置")
+                            text: qsTr("语音设置")
                             onClicked: SettingsController.openSpeechSettings()
                         }
                         CompactButton {

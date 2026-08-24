@@ -2500,6 +2500,12 @@ result["connection"] = {
     "launch_highlighted": bool(find_child(window, "saveAndLaunchButton").property("highlighted")),
 }
 
+controller._set_launch_status("AUDIT_LAUNCH_RESULT_MUST_BE_VISIBLE")
+render(window, app)
+result["connection"]["explicit_launch_status"] = str(
+    find_child(window, "launchStatusText").property("text")
+)
+
 bridge_timer = find_child(window, "bridgeStatusRefreshTimer")
 assert bridge_timer is not None
 bridge_state["running"] = True
@@ -2566,7 +2572,7 @@ diagnostics_names = (
     "selectCableInputButton",
     "launchDriverSetupButton",
     "diagnosticsFooterSection",
-    "openAppsSettingsButton",
+    "openSpeechSettingsButton",
     "diagnosticsOpenLogButton",
 )
 diagnostics_scroll = find_child(window, "diagnosticsScroll")
@@ -2575,6 +2581,40 @@ result["diagnostics"] = {
     "content_width": float(diagnostics_scroll.property("contentWidth")),
     "available_width": float(diagnostics_scroll.property("availableWidth")),
 }
+
+diagnostics_controller._check_rows = [
+    {
+        "checkId": "audit_refresh",
+        "title": "刷新测试",
+        "group": "ordinary_buttons",
+        "status": "pass",
+        "detail": "AUDIT_DETAIL_FIRST",
+    }
+]
+diagnostics_controller.checkResultsChanged.emit()
+render(window, app)
+diagnostic_result = find_child(window, "diagnosticResult_audit_refresh")
+assert diagnostic_result is not None
+result["diagnostics"]["detail_before_refresh"] = str(
+    diagnostic_result.property("detailText")
+)
+
+diagnostics_controller._check_rows = [
+    {
+        "checkId": "audit_refresh",
+        "title": "刷新测试",
+        "group": "ordinary_buttons",
+        "status": "fail",
+        "detail": "AUDIT_DETAIL_AFTER_REFRESH",
+    }
+]
+diagnostics_controller.checkResultsChanged.emit()
+render(window, app)
+diagnostic_result = find_child(window, "diagnosticResult_audit_refresh")
+assert diagnostic_result is not None
+result["diagnostics"]["detail_after_refresh"] = str(
+    diagnostic_result.property("detailText")
+)
 
 controller._set_status_message("neutral status")
 render(window, app)
@@ -2955,10 +2995,32 @@ class SettingsShellSourceContractTests(unittest.TestCase):
         self.assertIn('qsTr("保存并启动桥接")', self.connection_qml)
         self.assertIn("SettingsController.saveSettings()", self.connection_qml)
         self.assertIn("SettingsController.saveAndLaunch()", self.connection_qml)
+        self.assertIn("text: SettingsController.launchStatusText", self.connection_qml)
         self.assertIn("恢复按键与语音默认", self.connection_qml)
         self.assertNotIn("恢复全部默认", self.connection_qml)
         self.assertIn("compactMinimumWidth: 116", self.connection_qml)
         self.assertIn("更换设备或输出后需重启", self.connection_qml)
+
+    def test_diagnostics_keeps_each_check_detail_visible(self):
+        self.assertIn("ListModel {", self.diagnostics_qml)
+        self.assertIn("diagnosticsRowsModel.clear()", self.diagnostics_qml)
+        self.assertIn("diagnosticsRowsModel.append({", self.diagnostics_qml)
+        self.assertIn("function onCheckResultsChanged()", self.diagnostics_qml)
+        self.assertIn("model: diagnosticsRowsModel", self.diagnostics_qml)
+        self.assertIn("delegate: DiagnosticResultRow", self.diagnostics_qml)
+        self.assertIn(
+            'objectName: "diagnosticResult_" + checkId',
+            self.diagnostics_qml,
+        )
+        self.assertIn(
+            "visible: group !== root.groupOptionalDriver",
+            self.diagnostics_qml,
+        )
+        self.assertIn("detailText: detail", self.diagnostics_qml)
+        self.assertNotIn(
+            "details.push(rows[i].title + \"：\" + statusLabel(rows[i].status))",
+            self.diagnostics_qml,
+        )
 
     def test_bridge_required_warnings_are_visible_on_both_rc003_pages(self):
         self.assertIn('objectName: "bridgeNotRunningWarning"', self.connection_qml)
@@ -3208,6 +3270,18 @@ class OffscreenQmlLoadTests(unittest.TestCase):
                 self.assertEqual(data["warnings"], [])
                 self.assertEqual((data["width"], data["height"]), (width, height))
                 self.assertFalse(data["initial_status_visible"])
+                self.assertEqual(
+                    data["connection"]["explicit_launch_status"],
+                    "AUDIT_LAUNCH_RESULT_MUST_BE_VISIBLE",
+                )
+                self.assertEqual(
+                    data["diagnostics"]["detail_before_refresh"],
+                    "AUDIT_DETAIL_FIRST",
+                )
+                self.assertEqual(
+                    data["diagnostics"]["detail_after_refresh"],
+                    "AUDIT_DETAIL_AFTER_REFRESH",
+                )
 
                 for group_name in ("navigation",):
                     for item_name, item in data[group_name].items():
@@ -3235,7 +3309,7 @@ class OffscreenQmlLoadTests(unittest.TestCase):
                         "optionalDriverSection",
                     ),
                     (
-                        "openAppsSettingsButton",
+                        "openSpeechSettingsButton",
                         "diagnosticsOpenLogButton",
                         "diagnosticsFooterSection",
                     ),

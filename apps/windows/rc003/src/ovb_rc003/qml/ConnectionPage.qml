@@ -168,7 +168,7 @@ Item {
                                 tokens: root.tokens
                                 titleText: qsTr("当前设备")
                                 noteText: SettingsController.isRc003Device
-                                    ? qsTr("DJI Mic 2 可直接作为电脑麦克风使用。")
+                                    ? qsTr("用于遥控按键和按住说话。")
                                     : qsTr("直接使用 Windows 录音输入，不经过 RC003 桥接。")
                                 errorText: SettingsController.deviceCatalogAvailable
                                     ? "" : SettingsController.deviceCatalogErrorText
@@ -290,11 +290,11 @@ Item {
                                     objectName: "launchStatusText"
                                     tokens: root.tokens
                                     kind: bodyKind
-                                    text: SettingsController.bridgeRunning ? qsTr("后台桥接正在运行") : qsTr("运行状态未确认")
+                                    Layout.fillWidth: true
+                                    text: SettingsController.launchStatusText
                                     font.weight: Font.Medium
+                                    wrapMode: Text.WordWrap
                                 }
-                                UiLabel { tokens: root.tokens; kind: noteKind; text: qsTr("自动刷新") }
-                                Item { Layout.fillWidth: true }
                             }
                             UiLabel {
                                 objectName: "bridgeNotRunningWarning"
