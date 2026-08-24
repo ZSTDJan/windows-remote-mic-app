@@ -12,7 +12,6 @@ Item {
     property var tokens
     readonly property var leftButtonIds: ["power", "up", "left", "back", "home", "menu"]
     readonly property real mappingCardGap: 4
-    readonly property real connectorLaneOffset: 5
     readonly property real mappingCardHeight: Math.max(
         38,
         Math.min(45, (mappingList.height - mappingCardGap * 6) / 7)
@@ -31,16 +30,103 @@ Item {
         return rows[buttonId]
     }
 
-    function connectorPortOffset(buttonId) {
-        if (buttonId === "right")
-            return -connectorLaneOffset
-        if (buttonId === "ok")
-            return connectorLaneOffset
-        return 0
+    function connectorControlRadius(startX, endX) {
+        const span = Math.abs(endX - startX)
+        return Math.min(32, Math.max(6, span * 0.42), span * 0.48)
     }
 
-    function connectorControlDistance(startX, endX) {
-        return Math.max(4, Math.abs(endX - startX) * 0.45)
+    function connectorStrokeColor(active) {
+        if (active)
+            return tokens.accent
+        return Qt.rgba(
+            tokens.borderStrong.r,
+            tokens.borderStrong.g,
+            tokens.borderStrong.b,
+            0.75
+        )
+    }
+
+    function connectorSplitParameter(
+        startX, control1X, control2X, endX, splitX
+    ) {
+        let low = 0
+        let high = 1
+        const increasing = endX >= startX
+        for (let i = 0; i < 16; i++) {
+            const t = (low + high) / 2
+            const oneMinusT = 1 - t
+            const x = oneMinusT * oneMinusT * oneMinusT * startX
+                + 3 * oneMinusT * oneMinusT * t * control1X
+                + 3 * oneMinusT * t * t * control2X
+                + t * t * t * endX
+            if ((x < splitX) === increasing)
+                low = t
+            else
+                high = t
+        }
+        return (low + high) / 2
+    }
+
+    function connectorRoute(card, hotspot, coordinateItem) {
+        if (!card || !hotspot)
+            return null
+
+        const leftSide = root.isLeftButton(hotspot.buttonId)
+        const start = card.mapToItem(
+            coordinateItem,
+            leftSide ? card.width : 0,
+            card.height / 2
+        )
+        const center = hotspot.mapToItem(
+            coordinateItem,
+            hotspot.width / 2,
+            hotspot.height / 2
+        )
+        const endX = center.x
+            + (leftSide ? -hotspot.width / 2 : hotspot.width / 2)
+        const endY = center.y
+        const direction = leftSide ? 1 : -1
+        const controlRadius = root.connectorControlRadius(start.x, endX)
+        const control1X = start.x + direction * controlRadius
+        const control1Y = start.y
+        const control2X = endX - direction * controlRadius
+        const control2Y = endY
+        const framePoint = photoFrame.mapToItem(
+            coordinateItem,
+            leftSide ? 0 : photoFrame.width,
+            0
+        )
+        const splitT = root.connectorSplitParameter(
+            start.x, control1X, control2X, endX, framePoint.x
+        )
+        const aX = start.x + (control1X - start.x) * splitT
+        const aY = start.y + (control1Y - start.y) * splitT
+        const bX = control1X + (control2X - control1X) * splitT
+        const bY = control1Y + (control2Y - control1Y) * splitT
+        const cX = control2X + (endX - control2X) * splitT
+        const cY = control2Y + (endY - control2Y) * splitT
+        const dX = aX + (bX - aX) * splitT
+        const dY = aY + (bY - aY) * splitT
+        const eX = bX + (cX - bX) * splitT
+        const eY = bY + (cY - bY) * splitT
+        const splitX = dX + (eX - dX) * splitT
+        const splitY = dY + (eY - dY) * splitT
+        return {
+            startX: start.x,
+            startY: start.y,
+            firstControl1X: aX,
+            firstControl1Y: aY,
+            firstControl2X: dX,
+            firstControl2Y: dY,
+            splitX: splitX,
+            splitY: splitY,
+            secondControl1X: eX,
+            secondControl1Y: eY,
+            secondControl2X: cX,
+            secondControl2Y: cY,
+            endX: endX,
+            endY: endY
+        }
     }
 
     function shortButtonName(buttonId) {
@@ -483,37 +569,23 @@ Item {
                                 continue
 
                             const active = SettingsController.selectedButtonId === buttonId
-                            const start = card.mapToItem(
-                                mappingLines,
-                                leftSide ? card.width : 0,
-                                card.height / 2
+                            const route = root.connectorRoute(
+                                card, hotspot, mappingLines
                             )
-                            const hotspotCenter = hotspot.mapToItem(
-                                mappingLines,
-                                hotspot.width / 2,
-                                hotspot.height / 2
-                            )
-                            const photoOrigin = photoFrame.mapToItem(mappingLines, 0, 0)
-                            const endX = leftSide
-                                ? photoOrigin.x : photoOrigin.x + photoFrame.width
-                            const endY = hotspotCenter.y
-                                + root.connectorPortOffset(buttonId)
-                            const direction = leftSide ? 1 : -1
-                            const controlDistance = root.connectorControlDistance(
-                                start.x, endX
-                            )
+                            if (!route)
+                                continue
                             ctx.beginPath()
-                            ctx.moveTo(start.x, start.y)
+                            ctx.moveTo(route.startX, route.startY)
                             ctx.bezierCurveTo(
-                                start.x + direction * controlDistance,
-                                start.y,
-                                endX - direction * controlDistance,
-                                endY,
-                                endX,
-                                endY
+                                route.firstControl1X,
+                                route.firstControl1Y,
+                                route.firstControl2X,
+                                route.firstControl2Y,
+                                route.splitX,
+                                route.splitY
                             )
-                            ctx.strokeStyle = active ? tokens.accent : tokens.borderStrong
-                            ctx.lineWidth = active ? 2 : 1
+                            ctx.strokeStyle = root.connectorStrokeColor(active)
+                            ctx.lineWidth = active ? 1.5 : 0.8
                             ctx.stroke()
                         }
                     }
@@ -629,6 +701,7 @@ Item {
                                 id: photoHotspot
                                 objectName: "photoHotspot_" + buttonId
 
+                                required property int index
                                 required property string buttonId
                                 required property real hotspotX
                                 required property real hotspotY
@@ -636,8 +709,6 @@ Item {
                                 required property real hotspotHeight
                                 required property bool isSelected
                                 required property bool isVoice
-                                readonly property real connectorPortOffset:
-                                    root.connectorPortOffset(buttonId)
 
                                 width: hotspotWidth * photoImage.paintedWidth
                                 height: hotspotHeight * photoImage.paintedHeight
@@ -658,55 +729,57 @@ Item {
                                         + photoHotspot.buttonId
                                     readonly property bool leftSide:
                                         root.isLeftButton(photoHotspot.buttonId)
-                                    readonly property real portOffset:
-                                        photoHotspot.connectorPortOffset
                                     readonly property bool active:
                                         photoHotspot.isSelected
 
-                                    x: leftSide ? -photoHotspot.x : photoHotspot.width
-                                    y: photoHotspot.height / 2
-                                        + Math.min(0, portOffset) - 2
-                                    width: Math.max(
-                                        1,
-                                        leftSide
-                                            ? photoHotspot.x
-                                            : photoFrame.width - photoHotspot.x
-                                                - photoHotspot.width
-                                    )
-                                    height: Math.abs(portOffset) + 4
+                                    x: -photoHotspot.x
+                                    y: -photoHotspot.y
+                                    width: photoFrame.width
+                                    height: photoFrame.height
                                     antialiasing: true
 
                                     onPaint: {
                                         const ctx = getContext("2d")
                                         ctx.reset()
-                                        const buttonX = leftSide ? width : 0
-                                        const frameX = leftSide ? 0 : width
-                                        const buttonY = photoHotspot.height / 2
-                                            - hotspotConnector.y
-                                        const frameY = buttonY + portOffset
-                                        const direction = leftSide ? -1 : 1
-                                        const controlDistance =
-                                            root.connectorControlDistance(buttonX, frameX)
-                                        ctx.beginPath()
-                                        ctx.moveTo(buttonX, buttonY)
-                                        ctx.bezierCurveTo(
-                                            buttonX + direction * controlDistance,
-                                            buttonY,
-                                            frameX - direction * controlDistance,
-                                            frameY,
-                                            frameX,
-                                            frameY
+                                        const card = leftSide
+                                            ? leftCardRepeater.itemAt(photoHotspot.index)
+                                            : rightCardRepeater.itemAt(photoHotspot.index)
+                                        const route = root.connectorRoute(
+                                            card, photoHotspot, hotspotConnector
                                         )
-                                        ctx.strokeStyle = active
-                                            ? tokens.accent : tokens.borderStrong
-                                        ctx.lineWidth = active ? 2 : 1
+                                        if (!route)
+                                            return
+                                        ctx.beginPath()
+                                        ctx.moveTo(route.splitX, route.splitY)
+                                        ctx.bezierCurveTo(
+                                            route.secondControl1X,
+                                            route.secondControl1Y,
+                                            route.secondControl2X,
+                                            route.secondControl2Y,
+                                            route.endX,
+                                            route.endY
+                                        )
+                                        ctx.strokeStyle =
+                                            root.connectorStrokeColor(active)
+                                        ctx.lineWidth = active ? 1.5 : 0.8
                                         ctx.stroke()
                                     }
 
                                     onWidthChanged: requestPaint()
                                     onHeightChanged: requestPaint()
-                                    onPortOffsetChanged: requestPaint()
+                                    onXChanged: requestPaint()
+                                    onYChanged: requestPaint()
                                     onActiveChanged: requestPaint()
+
+                                    Connections {
+                                        target: mappingList
+                                        function onWidthChanged() {
+                                            hotspotConnector.requestPaint()
+                                        }
+                                        function onHeightChanged() {
+                                            hotspotConnector.requestPaint()
+                                        }
+                                    }
                                 }
 
                                 Rectangle {

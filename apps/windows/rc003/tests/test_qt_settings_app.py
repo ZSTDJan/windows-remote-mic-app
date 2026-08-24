@@ -3014,8 +3014,10 @@ class SettingsShellSourceContractTests(unittest.TestCase):
             'objectName: "photoHotspotConnector_"',
             self.buttons_qml,
         )
-        self.assertIn("function connectorPortOffset(buttonId)", self.buttons_qml)
+        self.assertIn("function connectorControlRadius(startX, endX)", self.buttons_qml)
+        self.assertIn("function connectorRoute(card, hotspot, coordinateItem)", self.buttons_qml)
         self.assertGreaterEqual(self.buttons_qml.count("ctx.bezierCurveTo("), 2)
+        self.assertNotIn("ctx.quadraticCurveTo(", self.buttons_qml)
         self.assertNotIn("ctx.lineTo(endX", self.buttons_qml)
         self.assertIn("hotspotX * photoImage.paintedWidth", self.buttons_qml)
         self.assertIn("hotspotY * photoImage.paintedHeight", self.buttons_qml)
@@ -4038,10 +4040,7 @@ results_out = {
         "power_marker_visible": power_marker.property("visible"),
         "ok_marker_visible": ok_marker.property("visible"),
         "hotspots": {
-            button_id: {
-                **_geometry(item),
-                "port_offset": float(item.property("connectorPortOffset")),
-            }
+            button_id: _geometry(item)
             for button_id, item in hotspots.items()
         },
         "connectors": {
@@ -4114,49 +4113,74 @@ class ButtonsPageMappingCardTests(unittest.TestCase):
         cards = data["cards"]
         hotspots = data["photo"]["hotspots"]
         connectors = data["photo"]["connectors"]
+        frame = data["photo"]["frame"]
         groups = (
             ("power", "up", "left", "back", "home", "menu"),
             ("mic", "right", "ok", "down", "volume_up", "volume_down", "tv"),
         )
 
+        def route_for(button_id, left_side):
+            card = cards[button_id]
+            hotspot = hotspots[button_id]
+            start_x = card["right"] if left_side else card["x"]
+            start_y = card["y"] + card["height"] / 2
+            end_x = hotspot["x"] if left_side else hotspot["right"]
+            end_y = hotspot["y"] + hotspot["height"] / 2
+            span = abs(end_x - start_x)
+            radius = min(32, max(6, span * 0.42), span * 0.48)
+            direction = 1 if left_side else -1
+            return (
+                (start_x, start_y),
+                (start_x + direction * radius, start_y),
+                (end_x - direction * radius, end_y),
+                (end_x, end_y),
+            )
+
+        def point_at(route, t):
+            one_minus_t = 1 - t
+            weights = (
+                one_minus_t ** 3,
+                3 * one_minus_t * one_minus_t * t,
+                3 * one_minus_t * t * t,
+                t ** 3,
+            )
+            return (
+                sum(point[0] * weight for point, weight in zip(route, weights)),
+                sum(point[1] * weight for point, weight in zip(route, weights)),
+            )
+
+        def y_at_x(route, x):
+            increasing = route[-1][0] >= route[0][0]
+            low = 0.0
+            high = 1.0
+            for _ in range(30):
+                t = (low + high) / 2
+                current_x = point_at(route, t)[0]
+                if (current_x < x) == increasing:
+                    low = t
+                else:
+                    high = t
+            return point_at(route, (low + high) / 2)[1]
+
         for button_ids in groups:
-            starts = [
-                cards[button_id]["y"] + cards[button_id]["height"] / 2
-                for button_id in button_ids
-            ]
-            centers = [
-                hotspots[button_id]["y"] + hotspots[button_id]["height"] / 2
-                for button_id in button_ids
-            ]
-            ports = [
-                center + hotspots[button_id]["port_offset"]
-                for button_id, center in zip(button_ids, centers)
-            ]
-
-            for first, second in zip(starts, starts[1:]):
-                self.assertLess(first, second)
-            for first, second in zip(ports, ports[1:]):
-                self.assertLess(first, second)
-
-            for step in range(101):
-                t = step / 100
-                blend = t * t * (3 - 2 * t)
-                route_y = [
-                    start + (port - start) * blend
-                    for start, port in zip(starts, ports)
-                ]
-                for first, second in zip(route_y, route_y[1:]):
-                    self.assertLess(first, second)
-
-            for step in range(100):
-                t = step / 100
-                blend = t * t * (3 - 2 * t)
-                route_y = [
-                    port + (center - port) * blend
-                    for port, center in zip(ports, centers)
-                ]
-                for first, second in zip(route_y, route_y[1:]):
-                    self.assertLessEqual(first, second)
+            left_side = button_ids[0] == "power"
+            routes = [route_for(button_id, left_side) for button_id in button_ids]
+            for first_route, second_route in zip(routes, routes[1:]):
+                low_x = max(
+                    min(point[0] for point in first_route),
+                    min(point[0] for point in second_route),
+                )
+                high_x = min(
+                    max(point[0] for point in first_route),
+                    max(point[0] for point in second_route),
+                )
+                self.assertLess(low_x, high_x)
+                for step in range(101):
+                    x = low_x + (high_x - low_x) * step / 100
+                    self.assertLess(
+                        y_at_x(first_route, x),
+                        y_at_x(second_route, x),
+                    )
 
         right_hotspot = hotspots["right"]
         ok_hotspot = hotspots["ok"]
@@ -4165,8 +4189,10 @@ class ButtonsPageMappingCardTests(unittest.TestCase):
         self.assertAlmostEqual(right_center, ok_center, delta=1)
         self.assertNotAlmostEqual(right_hotspot["right"], ok_hotspot["right"], delta=1)
         for connector in connectors.values():
-            self.assertGreater(connector["width"], 0)
-            self.assertGreaterEqual(connector["height"], 4)
+            self.assertAlmostEqual(connector["x"], frame["x"], delta=1)
+            self.assertAlmostEqual(connector["y"], frame["y"], delta=1)
+            self.assertAlmostEqual(connector["right"], frame["right"], delta=1)
+            self.assertAlmostEqual(connector["bottom"], frame["bottom"], delta=1)
 
     def test_board_fits_default_minimum_and_large_windows(self):
         viewports = (("Basic", 720, 464), ("Basic", 640, 440), ("FluentWinUI3", 720, 464), ("FluentWinUI3", 840, 720))
