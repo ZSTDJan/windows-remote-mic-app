@@ -1,6 +1,3 @@
-// Windows surfaces involved in RC003 use. The page never fabricates a
-// single "authorized" state: Windows exposes these settings separately, and
-// third-party input methods own their own recording permission/input choice.
 import QtQuick
 import QtQuick.Controls
 import QtQuick.Layouts
@@ -9,30 +6,21 @@ import OvbRc003Settings 1.0
 Item {
     id: root
     property var tokens
-
     signal openMappingRequested()
     signal openDiagnosticsRequested()
 
     function ensureVisible(item) {
-        if (!item) {
+        if (!item)
             return
-        }
         Qt.callLater(function() {
             const flickable = permissionsScroll.contentItem
-            if (!flickable || flickable.contentHeight <= permissionsScroll.availableHeight) {
+            if (!flickable || flickable.contentHeight <= permissionsScroll.availableHeight)
                 return
-            }
             const position = item.mapToItem(pageColumn, 0, 0)
-            const top = pageColumn.y + position.y - tokens.spacingMedium
-            const bottom = pageColumn.y + position.y + item.height + tokens.spacingMedium
-            const viewportTop = flickable.contentY
-            const viewportBottom = viewportTop + permissionsScroll.availableHeight
-            const maximumY = Math.max(0, flickable.contentHeight - permissionsScroll.availableHeight)
-            if (top < viewportTop) {
-                flickable.contentY = Math.max(0, top)
-            } else if (bottom > viewportBottom) {
-                flickable.contentY = Math.min(maximumY, bottom - permissionsScroll.availableHeight)
-            }
+            flickable.contentY = Math.max(0, Math.min(
+                flickable.contentHeight - permissionsScroll.availableHeight,
+                position.y - tokens.spacingMedium
+            ))
         })
     }
 
@@ -47,287 +35,161 @@ Item {
         ColumnLayout {
             id: pageColumn
             objectName: "permissionsPageContent"
-            width: Math.max(0, Math.min(
-                root.width - tokens.pageHorizontalPadding * 2,
-                tokens.pageMaxWidth
-            ))
-            x: Math.max(tokens.pageHorizontalPadding, (root.width - width) / 2)
-            y: tokens.spacingLarge
+            width: Math.max(0, permissionsScroll.availableWidth - tokens.pageHorizontalPadding * 2)
+            x: tokens.pageHorizontalPadding
+            y: tokens.pageVerticalPadding
             spacing: tokens.spacingLarge
 
-            UiLabel {
-                tokens: root.tokens
-                kind: pageTitleKind
-                text: qsTr("权限与系统设置")
-            }
-
-            // -- Required ----------------------------------------------------
-            SectionFrame {
-                id: requiredSection
-                objectName: "requiredPermissionsSection"
-                tokens: root.tokens
+            ColumnLayout {
                 Layout.fillWidth: true
-                contentSpacing: tokens.spacingMedium
-
-                UiLabel {
+                spacing: 5
+                UiLabel { tokens: root.tokens; kind: sectionTitleKind; text: qsTr("运行必需") }
+                SectionFrame {
+                    id: requiredPermissionsSection
+                    objectName: "requiredPermissionsSection"
                     tokens: root.tokens
-                    kind: sectionTitleKind
-                    text: qsTr("运行必需")
-                }
-
-                ColumnLayout {
-                    id: bluetoothPermissionBlock
-                    objectName: "bluetoothPermissionBlock"
-                    visible: SettingsController.isRc003Device
                     Layout.fillWidth: true
-                    spacing: tokens.spacingSmall
+                    horizontalPadding: 0
+                    verticalPadding: 0
+                    contentSpacing: 0
 
-                    UiLabel {
+                    SettingsListRow {
+                        objectName: "bluetoothPermissionBlock"
+                        visible: SettingsController.isRc003Device
                         tokens: root.tokens
-                        kind: bodyKind
-                        text: qsTr("蓝牙配对")
-                    }
-                    UiLabel {
-                        tokens: root.tokens
-                        kind: noteKind
-                        Layout.fillWidth: true
-                        wrapMode: Text.WordWrap
-                        text: qsTr("RC003 需要先在 Windows 中完成蓝牙配对。配对成功只是连接前提，不代表后台桥接已经连上设备。")
-                    }
-                    RowLayout {
-                        Layout.fillWidth: true
-                        Button {
-                            id: openBluetoothSettingsButton
+                        iconGlyph: "\uE702"
+                        titleText: qsTr("蓝牙配对")
+                        descriptionText: qsTr("先在系统中配对遥控器，再连接本程序。")
+                        showDivider: true
+                        CompactButton {
                             objectName: "openBluetoothSettingsButton"
-                            text: qsTr("打开蓝牙设置")
+                            tokens: root.tokens
+                            compactMinimumWidth: 64
+                            text: qsTr("蓝牙设置")
                             onClicked: SettingsController.openBluetoothSettings()
-                            Accessible.name: text
-                            KeyNavigation.tab: openMicrophonePrivacyButton
-                            onActiveFocusChanged: {
-                                if (activeFocus) {
-                                    root.ensureVisible(this)
-                                }
-                            }
+                            onActiveFocusChanged: if (activeFocus) root.ensureVisible(this)
                         }
-                        Item { Layout.fillWidth: true }
                     }
-                }
 
-                ColumnLayout {
-                    id: microphonePermissionBlock
-                    objectName: "microphonePermissionBlock"
-                    Layout.fillWidth: true
-                    spacing: tokens.spacingSmall
-
-                    UiLabel {
+                    SettingsListRow {
+                        id: microphonePermissionBlock
+                        objectName: "microphonePermissionBlock"
                         tokens: root.tokens
-                        kind: bodyKind
-                        text: qsTr("目标输入法或应用的麦克风访问（仅语音）")
-                    }
-                    UiLabel {
-                        tokens: root.tokens
-                        kind: noteKind
-                        objectName: "microphonePermissionDescription"
-                        Layout.fillWidth: true
-                        wrapMode: Text.WordWrap
-                        text: SettingsController.isRc003Device
-                            ? qsTr("Remote Mic 把 RC003 语音送到选定的播放端点；真正录音的是输入法或目标应用。使用 VB-CABLE 时，它们需要获得麦克风访问权，并把输入设备选为 CABLE Output。普通按键映射不依赖这些设置。")
-                            : qsTr("DJI Mic 2 作为 Windows 录音输入，由目标应用直接读取。目标应用需要获得麦克风访问权，并在自己的输入设置中选择 DJI Mic 2；Remote Mic 不会替它修改默认输入设备。")
-                    }
-                    RowLayout {
-                        Layout.fillWidth: true
-                        spacing: tokens.spacingSmall
-
-                        Button {
-                            id: openMicrophonePrivacyButton
+                        iconGlyph: "\uE720"
+                        titleText: qsTr("目标应用麦克风访问")
+                        descriptionObjectName: "microphonePermissionDescription"
+                        descriptionText: SettingsController.isRc003Device
+                            ? qsTr("允许目标应用录音；虚拟音频请选择 CABLE Output。按键不受影响。")
+                            : qsTr("允许目标应用使用 DJI Mic 2 录音。")
+                        showDivider: false
+                        CompactButton {
                             objectName: "openMicrophonePrivacyButton"
-                            text: qsTr("打开麦克风隐私设置")
+                            tokens: root.tokens
+                            compactMinimumWidth: 64
+                            text: qsTr("麦克风隐私")
                             onClicked: SettingsController.openMicrophonePrivacySettings()
-                            Accessible.name: text
-                            KeyNavigation.tab: openSoundInputSettingsButton
-                            onActiveFocusChanged: {
-                                if (activeFocus) {
-                                    root.ensureVisible(this)
-                                }
-                            }
+                            onActiveFocusChanged: if (activeFocus) root.ensureVisible(this)
                         }
-                        Button {
-                            id: openSoundInputSettingsButton
+                        CompactButton {
                             objectName: "openSoundInputSettingsButton"
-                            text: qsTr("打开声音输入设置")
+                            tokens: root.tokens
+                            compactMinimumWidth: 64
+                            text: qsTr("声音输入")
                             onClicked: SettingsController.openSoundSettings()
-                            Accessible.name: text
-                            KeyNavigation.tab: SettingsController.isRc003Device
-                                ? openDiagnosticsButton
-                                : openSpeechSettingsButton
-                            onActiveFocusChanged: {
-                                if (activeFocus) {
-                                    root.ensureVisible(this)
-                                }
-                            }
+                            onActiveFocusChanged: if (activeFocus) root.ensureVisible(this)
                         }
-                        Item { Layout.fillWidth: true }
                     }
                 }
             }
 
-            // -- Optional enhancements --------------------------------------
-            SectionFrame {
-                id: optionalSection
+            ColumnLayout {
+                id: optionalEnhancementsSection
                 objectName: "optionalEnhancementsSection"
-                tokens: root.tokens
                 visible: SettingsController.isRc003Device
                 Layout.fillWidth: true
-                contentSpacing: tokens.spacingMedium
-
-                UiLabel {
+                spacing: 5
+                UiLabel { tokens: root.tokens; kind: sectionTitleKind; text: qsTr("按需使用") }
+                SectionFrame {
                     tokens: root.tokens
-                    kind: sectionTitleKind
-                    text: qsTr("可选增强")
-                }
-
-                ColumnLayout {
                     Layout.fillWidth: true
-                    spacing: tokens.spacingTiny
+                    horizontalPadding: 0
+                    verticalPadding: 0
+                    contentSpacing: 0
 
-                    UiLabel {
+                    SettingsListRow {
                         tokens: root.tokens
-                        kind: bodyKind
-                        text: qsTr("HID tap（补齐部分特殊键）")
-                    }
-                    UiLabel {
-                        tokens: root.tokens
-                        kind: noteKind
-                        Layout.fillWidth: true
-                        wrapMode: Text.WordWrap
-                        text: qsTr("只在 Windows 普通输入链路拿不到返回、音量等 usage 时用于补齐。仅使用 HID tap 时需要从管理员终端启动；普通 BLE、Raw Input、语音和其他按键不会因为未提权而整体失效，Remote Mic 也不会自动提权。")
-                    }
-                }
-
-                ColumnLayout {
-                    Layout.fillWidth: true
-                    spacing: tokens.spacingSmall
-
-                    UiLabel {
-                        tokens: root.tokens
-                        kind: bodyKind
-                        text: qsTr("VB-CABLE 语音路由")
-                    }
-                    UiLabel {
-                        tokens: root.tokens
-                        kind: noteKind
-                        Layout.fillWidth: true
-                        wrapMode: Text.WordWrap
-                        text: qsTr("VB-CABLE 是可选的系统音频路由。安装和端点检测仍在“检查与修复”页完成；安装器会单独请求 UAC，Remote Mic 本身不会提权，也不会修改 Windows 默认输入或输出设备。")
-                    }
-                    RowLayout {
-                        Layout.fillWidth: true
-                        Button {
-                            id: openDiagnosticsButton
+                        iconGlyph: "\uE765"
+                        titleText: qsTr("特殊按键支持（HID tap）")
+                        descriptionText: qsTr("只有部分按键无响应时才启用；需要管理员权限。")
+                        CompactButton {
                             objectName: "openDiagnosticsButton"
-                            text: qsTr("前往检查与修复")
+                            tokens: root.tokens
+                            compactMinimumWidth: 64
+                            text: qsTr("前往检查")
                             onClicked: root.openDiagnosticsRequested()
-                            Accessible.name: text
-                            KeyNavigation.tab: openMappingButton
-                            onActiveFocusChanged: {
-                                if (activeFocus) {
-                                    root.ensureVisible(this)
-                                }
-                            }
+                            onActiveFocusChanged: if (activeFocus) root.ensureVisible(this)
                         }
-                        Item { Layout.fillWidth: true }
+                    }
+                    SettingsListRow {
+                        tokens: root.tokens
+                        iconGlyph: "\uE95E"
+                        titleText: qsTr("虚拟音频（VB-CABLE）")
+                        descriptionText: qsTr("用于传送语音；安装需管理员权限和重启，不会改默认设备。")
+                        showDivider: false
+                        CompactButton {
+                            objectName: "openVirtualAudioDiagnosticsButton"
+                            tokens: root.tokens
+                            compactMinimumWidth: 64
+                            text: qsTr("前往检查")
+                            onClicked: root.openDiagnosticsRequested()
+                            onActiveFocusChanged: if (activeFocus) root.ensureVisible(this)
+                        }
                     }
                 }
             }
 
-            // -- Manual setup ------------------------------------------------
-            SectionFrame {
-                id: manualSection
+            ColumnLayout {
+                id: manualSetupSection
                 objectName: "manualSetupSection"
-                tokens: root.tokens
+                visible: SettingsController.isRc003Device
                 Layout.fillWidth: true
-                contentSpacing: tokens.spacingMedium
-
-                UiLabel {
+                spacing: 5
+                UiLabel { tokens: root.tokens; kind: sectionTitleKind; text: qsTr("相关设置") }
+                SectionFrame {
                     tokens: root.tokens
-                    kind: sectionTitleKind
-                    text: qsTr("手动操作")
-                }
-
-                ColumnLayout {
-                    id: hostVoiceSetupBlock
-                    objectName: "hostVoiceSetupBlock"
-                    visible: SettingsController.isRc003Device
                     Layout.fillWidth: true
-                    spacing: tokens.spacingSmall
+                    horizontalPadding: 0
+                    verticalPadding: 0
+                    contentSpacing: 0
 
-                    UiLabel {
+                    SettingsListRow {
+                        id: hostVoiceSetupBlock
+                        objectName: "hostVoiceSetupBlock"
                         tokens: root.tokens
-                        kind: bodyKind
-                        text: qsTr("宿主语音快捷键与输入设备")
-                    }
-                    UiLabel {
-                        tokens: root.tokens
-                        kind: noteKind
-                        Layout.fillWidth: true
-                        wrapMode: Text.WordWrap
-                        text: qsTr("输入法设置中的语音快捷键要与“按键映射”页录入的对应快捷键一致；实际由遥控器哪个键触发语音，也在按键映射中决定。语音目标还需要在输入法或应用内选对麦克风输入。")
-                    }
-                    RowLayout {
-                        Layout.fillWidth: true
-                        Button {
-                            id: openMappingButton
+                        iconGlyph: "\uE713"
+                        titleText: qsTr("输入法与应用")
+                        descriptionText: qsTr("快捷键要与“按键”页一致，目标应用要选对麦克风。")
+                        showDivider: false
+                        CompactButton {
+                            objectName: "openInputAppSettingsButton"
+                            tokens: root.tokens
+                            compactMinimumWidth: 64
+                            text: qsTr("应用设置")
+                            onClicked: SettingsController.openAppsSettings()
+                        }
+                        CompactButton {
                             objectName: "openMappingButton"
-                            text: SettingsController.mappingPageTitle
+                            tokens: root.tokens
+                            compactMinimumWidth: 64
+                            text: qsTr("前往按键")
                             onClicked: root.openMappingRequested()
-                            Accessible.name: qsTr("打开") + text
-                            KeyNavigation.tab: openSpeechSettingsButton
-                            onActiveFocusChanged: {
-                                if (activeFocus) {
-                                    root.ensureVisible(this)
-                                }
-                            }
+                            onActiveFocusChanged: if (activeFocus) root.ensureVisible(this)
                         }
-                        Item { Layout.fillWidth: true }
-                    }
-                }
-
-                ColumnLayout {
-                    Layout.fillWidth: true
-                    spacing: tokens.spacingSmall
-
-                    UiLabel {
-                        tokens: root.tokens
-                        kind: bodyKind
-                        text: qsTr("Windows 听写（仅 Win+H）")
-                    }
-                    UiLabel {
-                        tokens: root.tokens
-                        kind: noteKind
-                        Layout.fillWidth: true
-                        wrapMode: Text.WordWrap
-                        text: qsTr("只有使用 Windows 自带 Win+H 听写时，才需要检查 Windows 联机语音识别设置；它不是搜狗、豆包等第三方输入法语音功能的共同前提。")
-                    }
-                    RowLayout {
-                        Layout.fillWidth: true
-                        Button {
-                            id: openSpeechSettingsButton
-                            objectName: "openSpeechSettingsButton"
-                            text: qsTr("打开语音识别设置")
-                            onClicked: SettingsController.openSpeechSettings()
-                            Accessible.name: text
-                            onActiveFocusChanged: {
-                                if (activeFocus) {
-                                    root.ensureVisible(this)
-                                }
-                            }
-                        }
-                        Item { Layout.fillWidth: true }
                     }
                 }
             }
 
-            Item { Layout.preferredHeight: tokens.spacingLarge }
+            Item { Layout.preferredHeight: tokens.pageVerticalPadding }
         }
     }
 }

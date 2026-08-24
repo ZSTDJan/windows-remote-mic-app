@@ -9,20 +9,20 @@ GridLayout {
     property string noteText: ""
     property string errorText: ""
     property string noteObjectName: ""
-    property int titleColumnWidth: 112
+    property int titleColumnWidth: 64
     property int editorMaximumWidth: 600
-    property int inlineMinimumWidth: 520
+    property int inlineMinimumWidth: 360
     readonly property bool stacked: width < inlineMinimumWidth
     default property alias editorData: editorColumn.data
 
     Layout.fillWidth: true
     columns: stacked ? 1 : 2
-    columnSpacing: tokens.spacingMedium
+    columnSpacing: tokens.spacingSmall
     rowSpacing: tokens.spacingTiny
 
     UiLabel {
         tokens: root.tokens
-        kind: sectionTitleKind
+        kind: bodyKind
         text: root.titleText
         Layout.row: 0
         Layout.column: 0

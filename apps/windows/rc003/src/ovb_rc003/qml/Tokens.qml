@@ -1,11 +1,3 @@
-// Semantic design tokens (XRBM-030 DESIGN_VARIANCE 4 / VISUAL_DENSITY 5):
-// colors derived from the OS SystemPalette so light/dark mode is followed
-// automatically (no hand-picked dark-mode color set to keep in sync), plus
-// fixed corner-radius/spacing/font-size constants shared by every page.
-// Instantiated exactly once in main.qml and passed down to each page as a
-// `tokens` property - deliberately NOT a pragma Singleton, so this stays a
-// plain, implicitly-directory-imported QML type with no module/qmldir
-// registration to keep correct under a frozen PyInstaller build.
 import QtQuick
 
 QtObject {
@@ -14,46 +6,57 @@ QtObject {
     property SystemPalette palette: SystemPalette {
         colorGroup: SystemPalette.Active
     }
+    readonly property bool darkMode:
+        palette.window.r * 0.299
+        + palette.window.g * 0.587
+        + palette.window.b * 0.114 < 0.5
 
-    property color background: palette.window
-    property color surface: Qt.tint(palette.window, Qt.rgba(palette.windowText.r, palette.windowText.g, palette.windowText.b, 0.035))
-    property color surfaceMuted: Qt.tint(palette.window, Qt.rgba(palette.windowText.r, palette.windowText.g, palette.windowText.b, 0.018))
-    property color textPrimary: palette.windowText
-    property color textSecondary: Qt.rgba(palette.windowText.r, palette.windowText.g, palette.windowText.b, 0.62)
-    property color disabledText: Qt.rgba(palette.windowText.r, palette.windowText.g, palette.windowText.b, 0.38)
-    property color accent: palette.highlight
-    property color accentText: palette.highlightedText
-    property color border: Qt.rgba(palette.windowText.r, palette.windowText.g, palette.windowText.b, 0.16)
-    // Text-input/ComboBox field background (QQC2's "base" palette role) -
-    // distinct from `surface` (used for card backgrounds).
-    property color fieldBackground: palette.base
-    property color buttonBackground: palette.button
-    property color buttonText: palette.buttonText
+    property color background: darkMode ? "#171a1f" : "#f5f6f8"
+    property color surface: darkMode ? "#20242b" : "#ffffff"
+    property color surfaceMuted: darkMode ? "#282d35" : "#f1f3f5"
+    property color sidebar: darkMode ? "#1b1e24" : "#fafafa"
+    property color textPrimary: darkMode ? "#f3f4f6" : "#17191d"
+    property color textSecondary: darkMode ? "#aeb4be" : "#5f6670"
+    property color disabledText: darkMode ? "#888f99" : "#858c95"
+    property color border: darkMode ? "#343941" : "#e0e3e7"
+    property color borderStrong: darkMode ? "#474d57" : "#cfd4da"
+    property color cardBorder: darkMode ? "#59616c" : "#c4cad2"
+    property color accent: "#087cf0"
+    property color accentText: "#ffffff"
+    property color accentSoft: darkMode ? "#183653" : "#e7f2ff"
+    property color fieldBackground: darkMode ? "#252a31" : "#f7f8f9"
+    property color buttonBackground: surfaceMuted
+    property color buttonHover: darkMode ? "#303640" : "#e9ecef"
+    property color buttonText: textPrimary
+    property color voiceAccent: darkMode ? "#efb66b" : "#aa6410"
+    property color successColor: darkMode ? "#64d78d" : "#119c4c"
+    property color errorColor: darkMode ? "#ff6764" : "#c42b1c"
+    property color statusBackground: accentSoft
+    property color errorBackground: darkMode ? "#422421" : "#fdeceb"
 
-    // Semantic colors: only ever used for a real state (a real save error,
-    // a real save/launch success, the fixed identity of the mic hotspot) -
-    // never decorative (XRBM-030 Design read: "错误/成功只用于真实状态").
-    property color voiceAccent: "#F2914A"
-    property color successColor: "#2E7D32"
-    property color errorColor: "#C62828"
-    property color statusBackground: Qt.tint(palette.window, Qt.rgba(palette.highlight.r, palette.highlight.g, palette.highlight.b, 0.09))
-    property color errorBackground: Qt.tint(palette.window, Qt.rgba(0.78, 0.16, 0.16, 0.08))
-
-    property int cornerRadiusSmall: 8
-    property int cornerRadiusLarge: 8
-
-    property int spacingTiny: 4
-    property int spacingSmall: 8
-    property int spacingMedium: 12
-    property int spacingLarge: 20
-
+    property string fontFamily: "Microsoft YaHei UI"
+    property int fontSizeTiny: 10
     property int fontSizeSmall: 11
-    property int fontSizeBody: 13
-    property int fontSizeTitle: 16
+    property int fontSizeControl: 12
+    property int fontSizeBody: 12
+    property int fontSizeSection: 15
+    property int fontSizeTitle: 15
 
-    property int navigationHeight: 60
-    property int statusBarMinHeight: 42
+    property int cornerRadiusControl: 5
+    property int cornerRadiusSmall: 7
+    property int cornerRadiusLarge: 8
+    property int spacingTiny: 3
+    property int spacingSmall: 6
+    property int spacingMedium: 8
+    property int spacingLarge: 10
+
+    property int navigationWidth: 48
+    property int navigationItemHeight: 46
+    property int controlHeight: 26
+    property int buttonHeight: 30
+    property int statusBarMinHeight: 28
     property int pageMaxWidth: 920
-    property int pageHorizontalPadding: 24
-    property int sectionVerticalPadding: 18
+    property int pageHorizontalPadding: 10
+    property int pageVerticalPadding: 10
+    property int sectionVerticalPadding: 10
 }

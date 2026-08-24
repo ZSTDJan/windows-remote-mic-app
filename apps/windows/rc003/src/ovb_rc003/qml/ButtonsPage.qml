@@ -10,20 +10,35 @@ import OvbRc003Settings 1.0
 Item {
     id: root
     property var tokens
-    readonly property real photoAspectRatio: 1030 / 508
-    readonly property real photoSidebarWidth: Math.round(
-        Math.min(200, Math.max(136, root.width * 0.20))
+    readonly property var leftButtonIds: ["power", "up", "left", "back", "home", "menu"]
+    readonly property real mappingCardGap: 4
+    readonly property real mappingCardHeight: Math.max(
+        38,
+        Math.min(45, (mappingList.height - mappingCardGap * 6) / 7)
     )
-    readonly property real mappingKeyColumnWidth: 118
-    readonly property real mappingEditColumnWidth: 56
-    readonly property real mappingActionColumnWidth: Math.max(
-        0,
-        (mappingList.width
-         - tokens.spacingMedium * 2
-         - tokens.spacingSmall * 4
-         - mappingKeyColumnWidth
-         - mappingEditColumnWidth) / 3
-    )
+
+    function isLeftButton(buttonId) {
+        return leftButtonIds.indexOf(buttonId) >= 0
+    }
+
+    function visualRow(buttonId) {
+        const rows = {
+            "power": 0, "up": 1, "left": 2, "back": 3, "home": 4, "menu": 5,
+            "mic": 0, "right": 1, "ok": 2, "down": 3,
+            "volume_up": 4, "volume_down": 5, "tv": 6
+        }
+        return rows[buttonId]
+    }
+
+    function shortButtonName(buttonId) {
+        const names = {
+            "power": qsTr("电源"), "up": qsTr("上"), "left": qsTr("左"),
+            "back": qsTr("返回"), "home": qsTr("主页"), "menu": qsTr("菜单"),
+            "mic": qsTr("语音"), "right": qsTr("右"), "ok": qsTr("确定"),
+            "down": qsTr("下"), "volume_up": "+", "volume_down": "-", "tv": "TV"
+        }
+        return names[buttonId] || buttonId
+    }
 
     function openShortcutRecorder(buttonId, rowIndex, trigger, voiceMode) {
         shortcutRecorder.buttonId = buttonId
@@ -369,608 +384,409 @@ Item {
         }
     }
 
-    RowLayout {
+    Item {
         id: rc003MappingLayout
         objectName: "rc003MappingLayout"
         visible: SettingsController.isRc003Device
         anchors.fill: parent
-        anchors.margins: tokens.spacingMedium
-        spacing: tokens.spacingSmall
 
-        // -- Fixed product-photo sidebar -----------------------------------
         ColumnLayout {
-            id: photoSidebar
-            objectName: "photoSidebar"
-            Layout.preferredWidth: root.photoSidebarWidth
-            Layout.minimumWidth: root.photoSidebarWidth
-            Layout.maximumWidth: root.photoSidebarWidth
-            Layout.fillHeight: true
+            anchors.fill: parent
+            anchors.margins: tokens.pageHorizontalPadding
             spacing: tokens.spacingSmall
-
-            Rectangle {
-                id: photoFrame
-                objectName: "photoFrame"
-                Layout.fillWidth: true
-                Layout.preferredHeight: root.photoSidebarWidth * root.photoAspectRatio
-                Layout.alignment: Qt.AlignHCenter | Qt.AlignTop
-                radius: tokens.cornerRadiusLarge
-                color: tokens.surface
-                border.color: tokens.border
-                border.width: 1
-                clip: true
-
-                Image {
-                    id: photoImage
-                    objectName: "photoImage"
-                    anchors.fill: parent
-                    anchors.margins: tokens.spacingSmall
-                    fillMode: Image.PreserveAspectFit
-                    source: SettingsController.photoAvailable
-                        ? SettingsController.photoSource : ""
-                    visible: SettingsController.photoAvailable
-                    smooth: true
-                    asynchronous: true
-                }
-
-                Label {
-                    anchors.centerIn: parent
-                    width: parent.width - tokens.spacingMedium * 2
-                    horizontalAlignment: Text.AlignHCenter
-                    wrapMode: Text.WordWrap
-                    visible: !SettingsController.photoAvailable
-                    text: qsTr("实物图资源缺失")
-                    color: tokens.textSecondary
-                    font.pixelSize: tokens.fontSizeSmall
-                }
-
-                Repeater {
-                    model: ButtonMappingModel
-
-                    delegate: Item {
-                        id: photoHotspot
-                        objectName: "photoHotspot_" + buttonId
-
-                        required property string buttonId
-                        required property real hotspotX
-                        required property real hotspotY
-                        required property real hotspotWidth
-                        required property real hotspotHeight
-                        required property bool isSelected
-                        required property bool isVoice
-
-                        readonly property real paintedWidth: photoImage.paintedWidth
-                        readonly property real paintedHeight: photoImage.paintedHeight
-                        readonly property real paintedOffsetX:
-                            photoImage.x + (photoImage.width - paintedWidth) / 2
-                        readonly property real paintedOffsetY:
-                            photoImage.y + (photoImage.height - paintedHeight) / 2
-
-                        width: hotspotWidth * paintedWidth
-                        height: hotspotHeight * paintedHeight
-                        x: paintedOffsetX + hotspotX * paintedWidth - width / 2
-                        y: paintedOffsetY + hotspotY * paintedHeight - height / 2
-                        visible: SettingsController.photoAvailable
-                        z: 1
-
-                        Rectangle {
-                            objectName: "photoHotspotMarker_" + photoHotspot.buttonId
-                            anchors.fill: parent
-                            visible: photoHotspot.isSelected
-                            radius: Math.min(width, height) / 2
-                            color: photoHotspot.isVoice
-                                ? Qt.rgba(
-                                    tokens.voiceAccent.r,
-                                    tokens.voiceAccent.g,
-                                    tokens.voiceAccent.b,
-                                    0.30
-                                )
-                                : Qt.rgba(
-                                    tokens.accent.r,
-                                    tokens.accent.g,
-                                    tokens.accent.b,
-                                    0.30
-                                )
-                            border.width: 2
-                            border.color: photoHotspot.isVoice
-                                ? tokens.voiceAccent : tokens.accent
-                        }
-                    }
-                }
-
-            }
-
-            Label {
-                id: photoCaption
-                Layout.fillWidth: true
-                horizontalAlignment: Text.AlignHCenter
-                wrapMode: Text.WordWrap
-                text: qsTr("遥控器按键位置参考")
-                color: tokens.textSecondary
-                font.pixelSize: tokens.fontSizeSmall
-            }
-
-            Item { Layout.fillHeight: true }
-        }
-
-        // -- One-row-per-button mapping matrix -----------------------------
-        ColumnLayout {
-            Layout.fillWidth: true
-            Layout.fillHeight: true
-            spacing: tokens.spacingSmall
-
-            RowLayout {
-                Layout.fillWidth: true
-                UiLabel {
-                    tokens: root.tokens
-                    kind: pageTitleKind
-                    Layout.fillWidth: true
-                    text: qsTr("按键映射")
-                }
-                Button {
-                    id: detectRealKeyButton
-                    objectName: "detectRealKeyButton"
-                    text: SettingsController.keyDetectionActive
-                        ? qsTr("停止检测") : qsTr("检测真实按键")
-                    highlighted: SettingsController.keyDetectionActive
-                    onClicked: SettingsController.keyDetectionActive
-                        ? SettingsController.stopKeyDetection()
-                        : SettingsController.startKeyDetection()
-                    Accessible.name: qsTr("检测真实遥控器按键")
-                }
-                Button {
-                    text: qsTr("恢复默认")
-                    onClicked: SettingsController.restoreDefaults()
-                }
-                Button {
-                    // XRBM-030 RETRY 1 blocker 4: without this button, a
-                    // mapping edit made on this page could only actually be
-                    // persisted by switching to "连接" and clicking "仅保存
-                    // 设置" - a user who edits a mapping and just closes the
-                    // window loses it. Calls the exact same
-                    // SettingsController.saveSettings() slot the "连接" page
-                    // uses (same validation, same config.save_*() calls) -
-                    // no separate/duplicated save path.
-                    id: saveMappingButton
-                    objectName: "saveMappingButton"
-                    text: qsTr("保存映射")
-                    highlighted: true
-                    onClicked: SettingsController.saveSettings()
-                }
-            }
-
-            Rectangle {
-                id: bridgeRequiredWarning
-                objectName: "mappingBridgeWarning"
-                Layout.fillWidth: true
-                visible: !SettingsController.bridgeRunning
-                implicitHeight: bridgeRequiredWarningText.implicitHeight + tokens.spacingMedium * 2
-                radius: tokens.cornerRadiusSmall
-                color: tokens.errorBackground
-                border.color: tokens.errorColor
-                border.width: 1
-
-                Label {
-                    id: bridgeRequiredWarningText
-                    anchors.fill: parent
-                    anchors.margins: tokens.spacingMedium
-                    wrapMode: Text.WordWrap
-                    text: qsTr("后台桥接未运行或尚未确认运行。话筒键不会由本程序触发语音；真实按键检测的补充通道首次连接可能需要约一分钟。请先到“连接”页点击“保存并启动桥接”。")
-                    color: tokens.errorColor
-                    font.pixelSize: tokens.fontSizeSmall
-                    font.bold: true
-                }
-            }
-
-            Rectangle {
-                Layout.fillWidth: true
-                implicitHeight: detectionRow.implicitHeight + tokens.spacingMedium * 2
-                radius: tokens.cornerRadiusSmall
-                color: tokens.fieldBackground
-                border.color: SettingsController.keyDetectionActive
-                    ? tokens.accent : tokens.border
-                border.width: SettingsController.keyDetectionActive ? 2 : 1
-
-                RowLayout {
-                    id: detectionRow
-                    anchors.fill: parent
-                    anchors.margins: tokens.spacingMedium
-                    spacing: tokens.spacingMedium
-
-                    Label {
-                        Layout.fillWidth: true
-                        wrapMode: Text.WordWrap
-                        text: SettingsController.keyDetectionText
-                        color: SettingsController.keyDetectionActive
-                            ? tokens.accent : tokens.textSecondary
-                        font.pixelSize: tokens.fontSizeSmall
-                    }
-                }
-            }
 
             SectionFrame {
                 id: voiceSettingsPanel
                 objectName: "voiceSettingsPanel"
                 tokens: root.tokens
                 Layout.fillWidth: true
-                horizontalPadding: tokens.spacingMedium
-                verticalPadding: tokens.spacingMedium
+                Layout.preferredHeight: 45
+                horizontalPadding: 9
+                verticalPadding: 8
 
-                UiLabel {
-                    tokens: root.tokens
-                    kind: sectionTitleKind
-                    text: qsTr("按住说话")
-                }
-
-                GridLayout {
+                RowLayout {
                     Layout.fillWidth: true
-                    columns: 3
-                    columnSpacing: tokens.spacingSmall
-                    rowSpacing: tokens.spacingTiny
+                    spacing: tokens.spacingMedium
 
                     UiLabel {
                         tokens: root.tokens
                         kind: bodyKind
-                        text: qsTr("快捷键")
+                        Layout.preferredWidth: 126
+                        Layout.minimumWidth: 126
+                        Layout.maximumWidth: 126
+                        text: qsTr("按住说话快捷键")
+                        font.weight: Font.Medium
                     }
-                    TextField {
+                    CompactTextField {
                         id: holdVoiceHotkeyField
                         objectName: "holdVoiceHotkeyField"
+                        tokens: root.tokens
                         Layout.fillWidth: true
                         text: SettingsController.holdVoiceHotkeyText
                         placeholderText: qsTr("例如 ralt")
                         selectByMouse: true
                         onEditingFinished: SettingsController.holdVoiceHotkeyText = text
                         Accessible.name: qsTr("按住说话快捷键")
-                        Accessible.description: qsTr(
-                            "默认右侧 Alt；请与目标语音软件的快捷键保持一致。"
-                        )
-                        ToolTip.visible: hovered
-                        ToolTip.text: qsTr(
-                            "默认右侧 Alt；若被系统或其他软件占用，请重新录制。"
-                        )
+                        ToolTip.text: qsTr("默认右侧 Alt；请与目标语音软件的快捷键保持一致。")
                     }
-                    Button {
-                        text: qsTr("录")
-                        Layout.preferredWidth: 34
-                        Layout.minimumWidth: 30
+                    CompactButton {
+                        tokens: root.tokens
+                        compactMinimumWidth: 58
+                        text: qsTr("录入")
                         onClicked: root.openShortcutRecorder("", -1, "", "hold")
-                        Accessible.name: qsTr("录制按住说话快捷键")
-                    }
-                }
-
-                Connections {
-                    target: SettingsController
-                    function onHoldVoiceHotkeyTextChanged() {
-                        holdVoiceHotkeyField.text = SettingsController.holdVoiceHotkeyText
+                        Accessible.name: qsTr("录入按住说话快捷键")
                     }
                 }
             }
 
-            Rectangle {
-                id: mappingHeader
-                objectName: "mappingMatrixHeader"
-                Layout.fillWidth: true
-                Layout.preferredHeight: 46
-                color: tokens.surface
-                border.color: tokens.border
-                border.width: 1
-                radius: tokens.cornerRadiusSmall
-
-                GridLayout {
-                    anchors.fill: parent
-                    anchors.leftMargin: tokens.spacingMedium
-                    anchors.rightMargin: tokens.spacingMedium
-                    columns: 5
-                    columnSpacing: tokens.spacingSmall
-
-                    Label {
-                        objectName: "mappingHeaderKeyColumn"
-                        Layout.preferredWidth: root.mappingKeyColumnWidth
-                        Layout.minimumWidth: root.mappingKeyColumnWidth
-                        Layout.maximumWidth: root.mappingKeyColumnWidth
-                        Layout.alignment: Qt.AlignVCenter
-                        text: qsTr("遥控器按键")
-                        color: tokens.textPrimary
-                        font.pixelSize: tokens.fontSizeBody
-                        font.bold: true
-                        horizontalAlignment: Text.AlignLeft
-                    }
-                    Label {
-                        objectName: "mappingHeaderSingleColumn"
-                        Layout.preferredWidth: root.mappingActionColumnWidth
-                        Layout.minimumWidth: root.mappingActionColumnWidth
-                        Layout.maximumWidth: root.mappingActionColumnWidth
-                        Layout.alignment: Qt.AlignVCenter
-                        text: qsTr("单击")
-                        color: tokens.textPrimary
-                        font.pixelSize: tokens.fontSizeBody
-                        font.bold: true
-                        horizontalAlignment: Text.AlignLeft
-                    }
-                    Label {
-                        objectName: "mappingHeaderDoubleColumn"
-                        Layout.preferredWidth: root.mappingActionColumnWidth
-                        Layout.minimumWidth: root.mappingActionColumnWidth
-                        Layout.maximumWidth: root.mappingActionColumnWidth
-                        Layout.alignment: Qt.AlignVCenter
-                        text: qsTr("双击")
-                        color: tokens.textPrimary
-                        font.pixelSize: tokens.fontSizeBody
-                        font.bold: true
-                        horizontalAlignment: Text.AlignLeft
-                    }
-                    Label {
-                        objectName: "mappingHeaderLongColumn"
-                        Layout.preferredWidth: root.mappingActionColumnWidth
-                        Layout.minimumWidth: root.mappingActionColumnWidth
-                        Layout.maximumWidth: root.mappingActionColumnWidth
-                        Layout.alignment: Qt.AlignVCenter
-                        text: qsTr("长按")
-                        color: tokens.textPrimary
-                        font.pixelSize: tokens.fontSizeBody
-                        font.bold: true
-                        horizontalAlignment: Text.AlignLeft
-                    }
-                    Item {
-                        objectName: "mappingHeaderEditColumn"
-                        Layout.preferredWidth: root.mappingEditColumnWidth
-                        Layout.minimumWidth: root.mappingEditColumnWidth
-                        Layout.maximumWidth: root.mappingEditColumnWidth
-                    }
-                }
-            }
-
-            Rectangle {
-                id: mappingListFrame
-                objectName: "mappingListFrame"
+            Item {
+                id: mappingList
+                objectName: "mappingList"
                 Layout.fillWidth: true
                 Layout.fillHeight: true
-                radius: tokens.cornerRadiusSmall
-                color: tokens.surface
-                border.color: tokens.border
-                border.width: 1
-                clip: true
+                Layout.minimumHeight: 306
+                property int count: 13
+                property int currentIndex: ButtonMappingModel.indexOfButton(
+                    SettingsController.selectedButtonId
+                )
 
-                ListView {
-                    id: mappingList
-                    objectName: "mappingList"
+                Canvas {
+                    id: mappingLines
                     anchors.fill: parent
-                    clip: true
-                    model: ButtonMappingModel
-                    spacing: 0
-                    boundsBehavior: Flickable.StopAtBounds
-                    ScrollBar.vertical: ScrollBar {}
-                    currentIndex: ButtonMappingModel.indexOfButton(SettingsController.selectedButtonId)
-                    highlightFollowsCurrentItem: true
-                    onCurrentIndexChanged: positionViewAtIndex(currentIndex, ListView.Contain)
+                    z: 0
+                    antialiasing: true
 
-                    delegate: Rectangle {
-                        id: mappingRow
+                    onPaint: {
+                        const ctx = getContext("2d")
+                        ctx.reset()
+                        for (let i = 0; i < ButtonMappingModel.rowCount(); i++) {
+                            const leftCard = leftCardRepeater.itemAt(i)
+                            const rightCard = rightCardRepeater.itemAt(i)
+                            const hotspot = photoHotspotRepeater.itemAt(i)
+                            const buttonId = hotspot ? hotspot.buttonId : ""
+                            const leftSide = root.isLeftButton(buttonId)
+                            const card = leftSide ? leftCard : rightCard
+                            if (!card || !hotspot || !card.visible || !hotspot.visible)
+                                continue
 
-                    required property int index
-                    required property string buttonId
-                    required property string displayName
-                    required property string hidUsage
-                    required property string actionText
-                    required property string doubleClickText
-                    required property string longPressText
-                    required property bool isMic
-                    required property bool isSelected
-
-                    readonly property string normalizedActionText: actionText.trim()
-                    readonly property bool primaryIsVoice:
-                        normalizedActionText === "按住说话"
-                        || normalizedActionText.indexOf("已停用：旧语音配置") === 0
-
-                    width: mappingList.width
-                    height: 64
-                    radius: 0
-                    color: isSelected
-                        ? Qt.rgba(tokens.accent.r, tokens.accent.g, tokens.accent.b, 0.10)
-                        : (rowHover.hovered || index % 2 === 1
-                            ? tokens.surfaceMuted : tokens.surface)
-                    border.width: 0
-
-                    TapHandler {
-                        onTapped: SettingsController.selectButton(mappingRow.buttonId)
+                            const active = SettingsController.selectedButtonId === buttonId
+                            const start = card.mapToItem(
+                                mappingLines,
+                                leftSide ? card.width : 0,
+                                card.height / 2
+                            )
+                            const hotspotCenter = hotspot.mapToItem(
+                                mappingLines,
+                                hotspot.width / 2,
+                                hotspot.height / 2
+                            )
+                            const photoOrigin = photoFrame.mapToItem(mappingLines, 0, 0)
+                            const endX = leftSide
+                                ? photoOrigin.x : photoOrigin.x + photoFrame.width
+                            ctx.beginPath()
+                            ctx.moveTo(start.x, start.y)
+                            ctx.lineTo(endX, hotspotCenter.y)
+                            ctx.strokeStyle = active ? tokens.accent : tokens.borderStrong
+                            ctx.lineWidth = active ? 2 : 1
+                            ctx.stroke()
+                        }
                     }
 
-                    HoverHandler { id: rowHover }
+                    onWidthChanged: requestPaint()
+                    onHeightChanged: requestPaint()
 
-                    Rectangle {
-                        anchors.left: parent.left
-                        anchors.verticalCenter: parent.verticalCenter
-                        width: 3
-                        height: parent.height - tokens.spacingMedium
-                        radius: 1
-                        visible: mappingRow.isSelected
-                        color: mappingRow.primaryIsVoice
-                            ? tokens.voiceAccent : tokens.accent
+                    Connections {
+                        target: SettingsController
+                        function onSelectedButtonIdChanged() {
+                            mappingLines.requestPaint()
+                        }
                     }
+                }
 
-                    GridLayout {
-                        id: matrixRowContent
-                        anchors.fill: parent
-                        anchors.leftMargin: tokens.spacingMedium
-                        anchors.rightMargin: tokens.spacingMedium
-                        columns: 5
-                        columnSpacing: tokens.spacingSmall
+                GridLayout {
+                    id: leftSideCards
+                    objectName: "leftMappingCards"
+                    anchors.left: parent.left
+                    anchors.verticalCenter: parent.verticalCenter
+                    width: (parent.width - photoSidebar.width - tokens.spacingMedium * 2) / 2
+                    columns: 1
+                    rows: 6
+                    rowSpacing: root.mappingCardGap
+                    z: 1
 
-                        ColumnLayout {
-                            objectName: "mappingKeyCell_" + mappingRow.buttonId
-                            Layout.preferredWidth: root.mappingKeyColumnWidth
-                            Layout.minimumWidth: root.mappingKeyColumnWidth
-                            Layout.maximumWidth: root.mappingKeyColumnWidth
-                            Layout.fillWidth: false
-                            Layout.alignment: Qt.AlignVCenter
-                            spacing: 1
-                            Item {
-                                Layout.fillWidth: true
-                                Layout.preferredHeight: 20
-                                Label {
-                                    objectName: "mappingKeyPrimaryText_"
-                                        + mappingRow.buttonId
-                                    anchors.left: parent.left
-                                    anchors.top: parent.top
-                                    anchors.bottom: parent.bottom
-                                    anchors.right: parent.right
-                                    anchors.rightMargin: micBadge.visible
-                                        ? micBadge.width + tokens.spacingTiny : 0
-                                    text: mappingRow.displayName
-                                    color: tokens.textPrimary
-                                    font.pixelSize: tokens.fontSizeBody
-                                    font.bold: mappingRow.isSelected
-                                    elide: Text.ElideRight
-                                }
-                                Rectangle {
-                                    id: micBadge
-                                    visible: mappingRow.isMic
-                                    anchors.right: parent.right
-                                    anchors.verticalCenter: parent.verticalCenter
-                                    width: micBadgeText.implicitWidth + 8
-                                    height: micBadgeText.implicitHeight + 4
-                                    radius: 3
-                                    color: Qt.rgba(
-                                        tokens.voiceAccent.r,
-                                        tokens.voiceAccent.g,
-                                        tokens.voiceAccent.b,
-                                        0.14
-                                    )
-                                    Label {
-                                        id: micBadgeText
-                                        anchors.centerIn: parent
-                                        text: qsTr("语音键")
-                                        color: tokens.voiceAccent
-                                        font.pixelSize: tokens.fontSizeSmall
-                                    }
-                                }
-                            }
-                            Label {
-                                Layout.fillWidth: true
-                                Layout.preferredHeight: 16
-                                text: mappingRow.isMic
-                                    ? qsTr("ATVV 通道（非 HID）")
-                                    : qsTr("HID 编号 ") + mappingRow.hidUsage
-                                color: tokens.textSecondary
-                                font.pixelSize: tokens.fontSizeSmall
-                                elide: Text.ElideRight
-                            }
-                        }
+                    Repeater {
+                        id: leftCardRepeater
+                        model: ButtonMappingModel
+                        onItemAdded: mappingLines.requestPaint()
+                        delegate: MappingCard {
+                            required property int index
+                            required property string buttonId
+                            required property string displayName
+                            required property string actionText
+                            required property string doubleClickText
+                            required property string longPressText
+                            required property bool isSelected
 
-                        ColumnLayout {
-                            objectName: "mappingSingleCell_" + mappingRow.buttonId
-                            Layout.preferredWidth: root.mappingActionColumnWidth
-                            Layout.minimumWidth: root.mappingActionColumnWidth
-                            Layout.maximumWidth: root.mappingActionColumnWidth
-                            Layout.alignment: Qt.AlignVCenter
-                            spacing: 1
-                            Label {
-                                objectName: "mappingSinglePrimaryText_"
-                                    + mappingRow.buttonId
-                                Layout.fillWidth: true
-                                Layout.preferredHeight: 20
-                                text: mappingRow.actionText.length > 0
-                                    ? mappingRow.actionText : qsTr("未设置")
-                                color: mappingRow.actionText.length > 0
-                                    ? tokens.textPrimary : tokens.disabledText
-                                font.pixelSize: tokens.fontSizeBody
-                                elide: Text.ElideRight
-                                horizontalAlignment: Text.AlignLeft
-                            }
-                            Label {
-                                Layout.fillWidth: true
-                                Layout.preferredHeight: 16
-                                text: mappingRow.normalizedActionText === "方向上"
-                                    || mappingRow.normalizedActionText === "方向下"
-                                    || mappingRow.normalizedActionText === "方向左"
-                                    || mappingRow.normalizedActionText === "方向右"
-                                    ? qsTr("按住可连续触发") : ""
-                                color: tokens.textSecondary
-                                font.pixelSize: tokens.fontSizeSmall
-                                elide: Text.ElideRight
-                            }
-                        }
-
-                        ColumnLayout {
-                            objectName: "mappingDoubleCell_" + mappingRow.buttonId
-                            Layout.preferredWidth: root.mappingActionColumnWidth
-                            Layout.minimumWidth: root.mappingActionColumnWidth
-                            Layout.maximumWidth: root.mappingActionColumnWidth
-                            Layout.alignment: Qt.AlignVCenter
-                            spacing: 1
-                            Label {
-                                objectName: "mappingDoublePrimaryText_"
-                                    + mappingRow.buttonId
-                                Layout.fillWidth: true
-                                Layout.preferredHeight: 20
-                                text: mappingRow.primaryIsVoice
-                                    ? qsTr("不执行") : mappingRow.doubleClickText
-                                color: mappingRow.primaryIsVoice
-                                    || mappingRow.doubleClickText === "未设置"
-                                    ? tokens.disabledText : tokens.textPrimary
-                                font.pixelSize: tokens.fontSizeBody
-                                elide: Text.ElideRight
-                                horizontalAlignment: Text.AlignLeft
-                            }
-                            Item { Layout.preferredHeight: 16 }
-                        }
-
-                        ColumnLayout {
-                            objectName: "mappingLongCell_" + mappingRow.buttonId
-                            Layout.preferredWidth: root.mappingActionColumnWidth
-                            Layout.minimumWidth: root.mappingActionColumnWidth
-                            Layout.maximumWidth: root.mappingActionColumnWidth
-                            Layout.alignment: Qt.AlignVCenter
-                            spacing: 1
-                            Label {
-                                objectName: "mappingLongPrimaryText_"
-                                    + mappingRow.buttonId
-                                Layout.fillWidth: true
-                                Layout.preferredHeight: 20
-                                text: mappingRow.primaryIsVoice
-                                    ? qsTr("不执行") : mappingRow.longPressText
-                                color: mappingRow.primaryIsVoice
-                                    || mappingRow.longPressText === "未设置"
-                                    ? tokens.disabledText : tokens.textPrimary
-                                font.pixelSize: tokens.fontSizeBody
-                                elide: Text.ElideRight
-                                horizontalAlignment: Text.AlignLeft
-                            }
-                            Item { Layout.preferredHeight: 16 }
-                        }
-
-                        Button {
-                            objectName: "editMapping_" + mappingRow.buttonId
-                            Layout.preferredWidth: root.mappingEditColumnWidth
-                            Layout.minimumWidth: root.mappingEditColumnWidth
-                            Layout.maximumWidth: root.mappingEditColumnWidth
-                            text: qsTr("编辑")
-                            flat: true
+                            visible: root.isLeftButton(buttonId)
+                            exposeObjectNames: visible
+                            tokens: root.tokens
+                            cardId: buttonId
+                            Layout.row: root.visualRow(buttonId)
+                            Layout.fillWidth: true
+                            Layout.preferredHeight: visible ? root.mappingCardHeight : 0
+                            buttonName: root.shortButtonName(buttonId)
+                            singleText: actionText
+                            doubleText: doubleClickText
+                            longText: longPressText
+                            selected: isSelected
+                            voiceAction: actionText.trim() === "按住说话"
+                                || actionText.indexOf("已停用：旧语音配置") === 0
                             onClicked: {
-                                SettingsController.selectButton(mappingRow.buttonId)
+                                SettingsController.selectButton(buttonId)
                                 actionEditor.openForRow(
-                                    mappingRow.index,
-                                    mappingRow.buttonId,
-                                    mappingRow.displayName,
-                                    mappingRow.actionText,
-                                    mappingRow.doubleClickText,
-                                    mappingRow.longPressText
+                                    index, buttonId, displayName, actionText,
+                                    doubleClickText, longPressText
                                 )
                             }
-                            Accessible.name: qsTr("编辑") + mappingRow.displayName
+                        }
+                    }
+                }
+
+                Item {
+                    id: photoSidebar
+                    objectName: "photoSidebar"
+                    anchors.horizontalCenter: parent.horizontalCenter
+                    anchors.verticalCenter: parent.verticalCenter
+                    width: 86
+                    height: 230
+                    z: 1
+
+                    Item {
+                        id: photoFrame
+                        objectName: "photoFrame"
+                        anchors.top: parent.top
+                        anchors.horizontalCenter: parent.horizontalCenter
+                        width: 86
+                        height: 210
+                        clip: true
+
+                        Image {
+                            id: photoImage
+                            objectName: "photoImage"
+                            anchors.horizontalCenter: parent.horizontalCenter
+                            anchors.verticalCenter: parent.verticalCenter
+                            width: height * 240 / 360
+                            height: parent.height
+                            source: SettingsController.photoAvailable
+                                ? SettingsController.photoSource : ""
+                            visible: SettingsController.photoAvailable
+                            fillMode: Image.Stretch
+                            smooth: true
+                            mipmap: true
+                        }
+
+                        UiLabel {
+                            anchors.centerIn: parent
+                            width: parent.width
+                            visible: !SettingsController.photoAvailable
+                            tokens: root.tokens
+                            kind: noteKind
+                            text: qsTr("实物图缺失")
+                            horizontalAlignment: Text.AlignHCenter
+                        }
+
+                        Repeater {
+                            id: photoHotspotRepeater
+                            model: ButtonMappingModel
+                            onItemAdded: mappingLines.requestPaint()
+                            delegate: Item {
+                                id: photoHotspot
+                                objectName: "photoHotspot_" + buttonId
+
+                                required property string buttonId
+                                required property real hotspotX
+                                required property real hotspotY
+                                required property real hotspotWidth
+                                required property real hotspotHeight
+                                required property bool isSelected
+                                required property bool isVoice
+
+                                width: hotspotWidth * photoImage.paintedWidth
+                                height: hotspotHeight * photoImage.paintedHeight
+                                x: photoImage.x
+                                    + (photoImage.width - photoImage.paintedWidth) / 2
+                                    + hotspotX * photoImage.paintedWidth
+                                    - width / 2
+                                y: photoImage.y
+                                    + (photoImage.height - photoImage.paintedHeight) / 2
+                                    + hotspotY * photoImage.paintedHeight
+                                    - height / 2
+                                visible: SettingsController.photoAvailable
+                                z: 2
+
+                                Rectangle {
+                                    objectName: "photoHotspotMarker_" + photoHotspot.buttonId
+                                    anchors.fill: parent
+                                    visible: photoHotspot.isSelected
+                                    radius: Math.min(width, height) / 2
+                                    color: photoHotspot.isVoice
+                                        ? Qt.rgba(tokens.voiceAccent.r, tokens.voiceAccent.g,
+                                                  tokens.voiceAccent.b, 0.24)
+                                        : Qt.rgba(tokens.accent.r, tokens.accent.g,
+                                                  tokens.accent.b, 0.20)
+                                    border.width: 2
+                                    border.color: photoHotspot.isVoice
+                                        ? tokens.voiceAccent : tokens.accent
+                                }
+
+                                TapHandler {
+                                    onTapped: SettingsController.selectButton(photoHotspot.buttonId)
+                                }
+                                HoverHandler { id: hotspotHover }
+                                Rectangle {
+                                    anchors.fill: parent
+                                    visible: hotspotHover.hovered && !photoHotspot.isSelected
+                                    radius: Math.min(width, height) / 2
+                                    color: Qt.rgba(tokens.accent.r, tokens.accent.g,
+                                                   tokens.accent.b, 0.10)
+                                    border.color: tokens.accent
+                                }
+                            }
                         }
                     }
 
+                    UiLabel {
+                        anchors.bottom: parent.bottom
+                        anchors.horizontalCenter: parent.horizontalCenter
+                        tokens: root.tokens
+                        kind: noteKind
+                        text: qsTr("当前：") + root.shortButtonName(
+                            SettingsController.selectedButtonId
+                        )
+                        horizontalAlignment: Text.AlignHCenter
+                    }
+                }
+
+                GridLayout {
+                    id: rightSideCards
+                    objectName: "rightMappingCards"
+                    anchors.right: parent.right
+                    anchors.verticalCenter: parent.verticalCenter
+                    width: (parent.width - photoSidebar.width - tokens.spacingMedium * 2) / 2
+                    columns: 1
+                    rows: 7
+                    rowSpacing: root.mappingCardGap
+                    z: 1
+
+                    Repeater {
+                        id: rightCardRepeater
+                        model: ButtonMappingModel
+                        onItemAdded: mappingLines.requestPaint()
+                        delegate: MappingCard {
+                            required property int index
+                            required property string buttonId
+                            required property string displayName
+                            required property string actionText
+                            required property string doubleClickText
+                            required property string longPressText
+                            required property bool isSelected
+
+                            visible: !root.isLeftButton(buttonId)
+                            exposeObjectNames: visible
+                            tokens: root.tokens
+                            cardId: buttonId
+                            Layout.row: root.visualRow(buttonId)
+                            Layout.fillWidth: true
+                            Layout.preferredHeight: visible ? root.mappingCardHeight : 0
+                            buttonName: root.shortButtonName(buttonId)
+                            singleText: actionText
+                            doubleText: doubleClickText
+                            longText: longPressText
+                            selected: isSelected
+                            voiceAction: actionText.trim() === "按住说话"
+                                || actionText.indexOf("已停用：旧语音配置") === 0
+                            onClicked: {
+                                SettingsController.selectButton(buttonId)
+                                actionEditor.openForRow(
+                                    index, buttonId, displayName, actionText,
+                                    doubleClickText, longPressText
+                                )
+                            }
+                        }
                     }
                 }
             }
 
-            UiLabel {
+            SectionFrame {
+                id: mappingListFrame
+                objectName: "mappingListFrame"
                 tokens: root.tokens
-                kind: noteKind
                 Layout.fillWidth: true
-                text: qsTr("设置双击或长按后，快速连点和按住重复的识别方式可能随之改变。")
-                wrapMode: Text.WordWrap
+                Layout.preferredHeight: 40
+                horizontalPadding: 7
+                verticalPadding: 5
+
+                RowLayout {
+                    Layout.fillWidth: true
+                    spacing: tokens.spacingSmall
+
+                    Rectangle {
+                        Layout.preferredWidth: 8
+                        Layout.preferredHeight: 8
+                        radius: 4
+                        color: SettingsController.keyDetectionActive
+                            ? tokens.accent : tokens.voiceAccent
+                    }
+                    UiLabel {
+                        id: bridgeRequiredWarning
+                        objectName: "mappingBridgeWarning"
+                        tokens: root.tokens
+                        kind: noteKind
+                        Layout.fillWidth: true
+                        text: SettingsController.keyDetectionActive
+                            ? SettingsController.keyDetectionText
+                            : !SettingsController.bridgeRunning
+                                ? qsTr("后台桥接未运行；语音键和补充检测通道不可用")
+                                : qsTr("语音设为“按住说话”后，双击和长按无效")
+                        elide: Text.ElideRight
+                    }
+                    CompactButton {
+                        id: detectRealKeyButton
+                        objectName: "detectRealKeyButton"
+                        tokens: root.tokens
+                        compactMinimumWidth: 88
+                        text: SettingsController.keyDetectionActive
+                            ? qsTr("停止检测") : qsTr("检测真实按键")
+                        highlighted: SettingsController.keyDetectionActive
+                        onClicked: SettingsController.keyDetectionActive
+                            ? SettingsController.stopKeyDetection()
+                            : SettingsController.startKeyDetection()
+                        Accessible.name: qsTr("检测真实遥控器按键")
+                    }
+                    CompactButton {
+                        objectName: "restoreMappingDefaultsButton"
+                        tokens: root.tokens
+                        compactMinimumWidth: 68
+                        text: qsTr("恢复默认")
+                        onClicked: SettingsController.restoreDefaults()
+                    }
+                    CompactButton {
+                        id: saveMappingButton
+                        objectName: "saveMappingButton"
+                        tokens: root.tokens
+                        compactMinimumWidth: 68
+                        text: qsTr("保存映射")
+                        highlighted: true
+                        onClicked: SettingsController.saveSettings()
+                    }
+                }
+            }
+        }
+
+        Connections {
+            target: SettingsController
+            function onHoldVoiceHotkeyTextChanged() {
+                holdVoiceHotkeyField.text = SettingsController.holdVoiceHotkeyText
             }
         }
     }
