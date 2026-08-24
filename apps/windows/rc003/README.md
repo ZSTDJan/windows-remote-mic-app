@@ -21,6 +21,10 @@
 安装和验证边界；具体故障和批次证据再分别查阅 `bugs/`、`MAINTENANCE.md`
 与 `reviews/`。
 
+需要决定是否进入完整检查、本地测试包、候选或正式发布时，读取
+[`VALIDATION-AND-DELIVERY.md`](VALIDATION-AND-DELIVERY.md)。本文只提供实际命令和
+使用入口；普通定向检查不需要先读专项，命令存在也不表示每次修改都必须执行。
+
 设置窗口提供明确的设备选择器。选择 **小米 RC003** 时使用桥接、虚拟输出和
 13 键映射界面；选择 **DJI Mic 2（Pocket 3 套装发射器）** 时切换到独立的
 Windows 系统录音输入页面，绝不会启动 RC003 BLE/HID/ATVV 桥接。DJI 发射器
@@ -349,7 +353,9 @@ Windows 客户端围绕 RC003 使用场景实现，主要功能如下：
 
 ## 本地构建与测试
 
-在 Windows PowerShell 中进入本目录后，可以使用以下命令安装开发依赖并运行测试：
+在 Windows PowerShell 中进入本目录后，可以使用以下命令安装开发依赖并运行完整测试。
+是否需要完整测试按 `VALIDATION-AND-DELIVERY.md` 判断；普通局部任务优先运行对应的
+定向测试：
 
 ```powershell
 py -3.11 -m venv .venv
@@ -358,7 +364,7 @@ $env:PYTHONPATH = Join-Path (Get-Location) 'src'
 .\.venv\Scripts\python.exe -m unittest discover -s tests -t . -p 'test_*.py' -v
 ```
 
-构建未签名便携版和安装器候选：
+构建未签名候选目录：
 
 ```powershell
 .\build\build-candidate.ps1
@@ -388,6 +394,10 @@ Start-Process -Verb RunAs -FilePath (Join-Path $root '.venv\Scripts\python.exe')
 Inno Setup 安装器或 `SHA256SUMS.txt`。完整发布封装由 Windows CI 工作流完成，
 安装器编译需要可用的 Inno Setup。VB-CABLE 官方压缩包只通过固定哈希的显式
 获取步骤下载，程序不会在运行时静默下载驱动。
+
+该脚本成功后，公开边界、完整测试和同一构建 EXE 的 `--dry-run` 已经完成；同一源码、
+依赖、构建输入和产物状态下，不要在脚本外机械重跑。下面的独立命令用于尚未运行
+构建脚本、原结果已经失效，或单独排查冻结入口时使用。
 
 也可以只验证冻结后的程序是否能导入全部模块：
 
@@ -458,6 +468,8 @@ $env:PYTHONPATH = Join-Path (Get-Location) 'src'
 .\build\check-public-boundary.ps1
 ```
 
+如果同一状态的 `build-candidate.ps1` 已成功，该项结果直接复用。
+
 Windows GitHub Actions 工作流位于 `.github/workflows/windows-rc003-ci.yml`。运行结果
 可在 <https://github.com/miaomiaozii/windows-remote-mic-app/actions> 查看。CI 没有真实 RC003 硬件，
 因此构建和测试通过也不能替代真机配对、按键和语音链路验收。
@@ -493,6 +505,9 @@ Frida Gadget 实现；Frida 的版本、哈希和许可证见仓库根目录
 `THIRD_PARTY_NOTICES.md`。
 
 ## 发布说明
+
+正式候选和发布的触发条件、执行顺序与去重规则见
+[`VALIDATION-AND-DELIVERY.md`](VALIDATION-AND-DELIVERY.md)。
 
 Windows 候选版以预发行版发布。首个发布：
 
