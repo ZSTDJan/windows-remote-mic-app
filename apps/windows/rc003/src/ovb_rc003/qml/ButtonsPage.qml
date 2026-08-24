@@ -12,6 +12,7 @@ Item {
     property var tokens
     readonly property var leftButtonIds: ["power", "up", "left", "back", "home", "menu"]
     readonly property real mappingCardGap: 4
+    readonly property real connectorLaneOffset: 5
     readonly property real mappingCardHeight: Math.max(
         38,
         Math.min(45, (mappingList.height - mappingCardGap * 6) / 7)
@@ -28,6 +29,18 @@ Item {
             "volume_up": 4, "volume_down": 5, "tv": 6
         }
         return rows[buttonId]
+    }
+
+    function connectorPortOffset(buttonId) {
+        if (buttonId === "right")
+            return -connectorLaneOffset
+        if (buttonId === "ok")
+            return connectorLaneOffset
+        return 0
+    }
+
+    function connectorControlDistance(startX, endX) {
+        return Math.max(4, Math.abs(endX - startX) * 0.45)
     }
 
     function shortButtonName(buttonId) {
@@ -483,9 +496,22 @@ Item {
                             const photoOrigin = photoFrame.mapToItem(mappingLines, 0, 0)
                             const endX = leftSide
                                 ? photoOrigin.x : photoOrigin.x + photoFrame.width
+                            const endY = hotspotCenter.y
+                                + root.connectorPortOffset(buttonId)
+                            const direction = leftSide ? 1 : -1
+                            const controlDistance = root.connectorControlDistance(
+                                start.x, endX
+                            )
                             ctx.beginPath()
                             ctx.moveTo(start.x, start.y)
-                            ctx.lineTo(endX, hotspotCenter.y)
+                            ctx.bezierCurveTo(
+                                start.x + direction * controlDistance,
+                                start.y,
+                                endX - direction * controlDistance,
+                                endY,
+                                endX,
+                                endY
+                            )
                             ctx.strokeStyle = active ? tokens.accent : tokens.borderStrong
                             ctx.lineWidth = active ? 2 : 1
                             ctx.stroke()
@@ -610,6 +636,8 @@ Item {
                                 required property real hotspotHeight
                                 required property bool isSelected
                                 required property bool isVoice
+                                readonly property real connectorPortOffset:
+                                    root.connectorPortOffset(buttonId)
 
                                 width: hotspotWidth * photoImage.paintedWidth
                                 height: hotspotHeight * photoImage.paintedHeight
@@ -624,18 +652,61 @@ Item {
                                 visible: SettingsController.photoAvailable
                                 z: 2
 
-                                Rectangle {
-                                    objectName: "photoHotspotConnector_" + photoHotspot.buttonId
-                                    x: root.isLeftButton(photoHotspot.buttonId)
-                                        ? -photoHotspot.x : photoHotspot.width
-                                    y: (photoHotspot.height - height) / 2
-                                    width: root.isLeftButton(photoHotspot.buttonId)
-                                        ? Math.max(0, photoHotspot.x)
-                                        : Math.max(0, photoFrame.width
-                                                   - photoHotspot.x - photoHotspot.width)
-                                    height: photoHotspot.isSelected ? 2 : 1
-                                    color: photoHotspot.isSelected
-                                        ? tokens.accent : tokens.borderStrong
+                                Canvas {
+                                    id: hotspotConnector
+                                    objectName: "photoHotspotConnector_"
+                                        + photoHotspot.buttonId
+                                    readonly property bool leftSide:
+                                        root.isLeftButton(photoHotspot.buttonId)
+                                    readonly property real portOffset:
+                                        photoHotspot.connectorPortOffset
+                                    readonly property bool active:
+                                        photoHotspot.isSelected
+
+                                    x: leftSide ? -photoHotspot.x : photoHotspot.width
+                                    y: photoHotspot.height / 2
+                                        + Math.min(0, portOffset) - 2
+                                    width: Math.max(
+                                        1,
+                                        leftSide
+                                            ? photoHotspot.x
+                                            : photoFrame.width - photoHotspot.x
+                                                - photoHotspot.width
+                                    )
+                                    height: Math.abs(portOffset) + 4
+                                    antialiasing: true
+
+                                    onPaint: {
+                                        const ctx = getContext("2d")
+                                        ctx.reset()
+                                        const buttonX = leftSide ? width : 0
+                                        const frameX = leftSide ? 0 : width
+                                        const buttonY = photoHotspot.height / 2
+                                            - hotspotConnector.y
+                                        const frameY = buttonY + portOffset
+                                        const direction = leftSide ? -1 : 1
+                                        const controlDistance =
+                                            root.connectorControlDistance(buttonX, frameX)
+                                        ctx.beginPath()
+                                        ctx.moveTo(buttonX, buttonY)
+                                        ctx.bezierCurveTo(
+                                            buttonX + direction * controlDistance,
+                                            buttonY,
+                                            frameX - direction * controlDistance,
+                                            frameY,
+                                            frameX,
+                                            frameY
+                                        )
+                                        ctx.strokeStyle = active
+                                            ? tokens.accent : tokens.borderStrong
+                                        ctx.lineWidth = active ? 2 : 1
+                                        ctx.stroke()
+                                    }
+
+                                    onWidthChanged: requestPaint()
+                                    onHeightChanged: requestPaint()
+                                    onPortOffsetChanged: requestPaint()
+                                    onActiveChanged: requestPaint()
                                 }
 
                                 Rectangle {
@@ -667,6 +738,16 @@ Item {
                                                    tokens.accent.b, 0.10)
                                     border.color: tokens.accent
                                 }
+                            }
+                        }
+
+                        Connections {
+                            target: photoImage
+                            function onPaintedWidthChanged() {
+                                mappingLines.requestPaint()
+                            }
+                            function onPaintedHeightChanged() {
+                                mappingLines.requestPaint()
                             }
                         }
                     }

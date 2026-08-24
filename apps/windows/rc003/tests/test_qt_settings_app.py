@@ -3011,9 +3011,12 @@ class SettingsShellSourceContractTests(unittest.TestCase):
             self.buttons_qml,
         )
         self.assertIn(
-            'objectName: "photoHotspotConnector_" + photoHotspot.buttonId',
+            'objectName: "photoHotspotConnector_"',
             self.buttons_qml,
         )
+        self.assertIn("function connectorPortOffset(buttonId)", self.buttons_qml)
+        self.assertGreaterEqual(self.buttons_qml.count("ctx.bezierCurveTo("), 2)
+        self.assertNotIn("ctx.lineTo(endX", self.buttons_qml)
         self.assertIn("hotspotX * photoImage.paintedWidth", self.buttons_qml)
         self.assertIn("hotspotY * photoImage.paintedHeight", self.buttons_qml)
         self.assertIn("visible: photoHotspot.isSelected", self.buttons_qml)
@@ -3951,6 +3954,16 @@ card_ids = (
 )
 cards = {button_id: _find(window, "editMapping_" + button_id) for button_id in card_ids}
 assert all(item is not None and item.property("visible") for item in cards.values())
+hotspots = {
+    button_id: _find(window, "photoHotspot_" + button_id)
+    for button_id in card_ids
+}
+assert all(item is not None and item.property("visible") for item in hotspots.values())
+connectors = {
+    button_id: _find(window, "photoHotspotConnector_" + button_id)
+    for button_id in card_ids
+}
+assert all(item is not None and item.property("visible") for item in connectors.values())
 
 power_column_names = {
     "key": "mappingKeyCell_power",
@@ -3983,15 +3996,11 @@ _render(window, app, 5)
 
 power_hotspot = _find(window, "photoHotspot_power")
 ok_hotspot = _find(window, "photoHotspot_ok")
-power_connector = _find(window, "photoHotspotConnector_power")
-ok_connector = _find(window, "photoHotspotConnector_ok")
 power_marker = _find(window, "photoHotspotMarker_power")
 ok_marker = _find(window, "photoHotspotMarker_ok")
 editor = _find(window, "actionEditorDialog")
 assert power_hotspot is not None, "Power photo hotspot not found"
 assert ok_hotspot is not None, "OK photo hotspot not found"
-assert power_connector is not None, "Power photo connector not found"
-assert ok_connector is not None, "OK photo connector not found"
 assert power_marker is not None, "Power photo marker not found"
 assert ok_marker is not None, "OK photo marker not found"
 assert editor is not None
@@ -4028,10 +4037,17 @@ results_out = {
         "painted_height": photo_image.property("paintedHeight"),
         "power_marker_visible": power_marker.property("visible"),
         "ok_marker_visible": ok_marker.property("visible"),
-        "power_hotspot": _geometry(power_hotspot),
-        "ok_hotspot": _geometry(ok_hotspot),
-        "power_connector": _geometry(power_connector),
-        "ok_connector": _geometry(ok_connector),
+        "hotspots": {
+            button_id: {
+                **_geometry(item),
+                "port_offset": float(item.property("connectorPortOffset")),
+            }
+            for button_id, item in hotspots.items()
+        },
+        "connectors": {
+            button_id: _geometry(item)
+            for button_id, item in connectors.items()
+        },
         "power_center_error_x": actual_power_center.x() - expected_power_center.x(),
         "power_center_error_y": actual_power_center.y() - expected_power_center.y(),
     },
@@ -4093,28 +4109,64 @@ class ButtonsPageMappingCardTests(unittest.TestCase):
         self.assertAlmostEqual(data["photo"]["power_center_error_x"], 0, delta=1)
         self.assertAlmostEqual(data["photo"]["power_center_error_y"], 0, delta=1)
 
-    def test_photo_connectors_reach_their_button_hotspots(self):
-        photo = self._run_probe(720, 464)["photo"]
-        frame = photo["frame"]
-        power_hotspot = photo["power_hotspot"]
-        power_connector = photo["power_connector"]
-        ok_hotspot = photo["ok_hotspot"]
-        ok_connector = photo["ok_connector"]
+    def test_curved_connector_routes_stay_ordered_without_overlap(self):
+        data = self._run_probe(720, 464)
+        cards = data["cards"]
+        hotspots = data["photo"]["hotspots"]
+        connectors = data["photo"]["connectors"]
+        groups = (
+            ("power", "up", "left", "back", "home", "menu"),
+            ("mic", "right", "ok", "down", "volume_up", "volume_down", "tv"),
+        )
 
-        self.assertAlmostEqual(power_connector["x"], frame["x"], delta=1)
-        self.assertAlmostEqual(power_connector["right"], power_hotspot["x"], delta=1)
-        self.assertAlmostEqual(
-            power_connector["y"] + power_connector["height"] / 2,
-            power_hotspot["y"] + power_hotspot["height"] / 2,
-            delta=1,
-        )
-        self.assertAlmostEqual(ok_connector["x"], ok_hotspot["right"], delta=1)
-        self.assertAlmostEqual(ok_connector["right"], frame["right"], delta=1)
-        self.assertAlmostEqual(
-            ok_connector["y"] + ok_connector["height"] / 2,
-            ok_hotspot["y"] + ok_hotspot["height"] / 2,
-            delta=1,
-        )
+        for button_ids in groups:
+            starts = [
+                cards[button_id]["y"] + cards[button_id]["height"] / 2
+                for button_id in button_ids
+            ]
+            centers = [
+                hotspots[button_id]["y"] + hotspots[button_id]["height"] / 2
+                for button_id in button_ids
+            ]
+            ports = [
+                center + hotspots[button_id]["port_offset"]
+                for button_id, center in zip(button_ids, centers)
+            ]
+
+            for first, second in zip(starts, starts[1:]):
+                self.assertLess(first, second)
+            for first, second in zip(ports, ports[1:]):
+                self.assertLess(first, second)
+
+            for step in range(101):
+                t = step / 100
+                blend = t * t * (3 - 2 * t)
+                route_y = [
+                    start + (port - start) * blend
+                    for start, port in zip(starts, ports)
+                ]
+                for first, second in zip(route_y, route_y[1:]):
+                    self.assertLess(first, second)
+
+            for step in range(100):
+                t = step / 100
+                blend = t * t * (3 - 2 * t)
+                route_y = [
+                    port + (center - port) * blend
+                    for port, center in zip(ports, centers)
+                ]
+                for first, second in zip(route_y, route_y[1:]):
+                    self.assertLessEqual(first, second)
+
+        right_hotspot = hotspots["right"]
+        ok_hotspot = hotspots["ok"]
+        right_center = right_hotspot["y"] + right_hotspot["height"] / 2
+        ok_center = ok_hotspot["y"] + ok_hotspot["height"] / 2
+        self.assertAlmostEqual(right_center, ok_center, delta=1)
+        self.assertNotAlmostEqual(right_hotspot["right"], ok_hotspot["right"], delta=1)
+        for connector in connectors.values():
+            self.assertGreater(connector["width"], 0)
+            self.assertGreaterEqual(connector["height"], 4)
 
     def test_board_fits_default_minimum_and_large_windows(self):
         viewports = (("Basic", 720, 464), ("Basic", 640, 440), ("FluentWinUI3", 720, 464), ("FluentWinUI3", 840, 720))
