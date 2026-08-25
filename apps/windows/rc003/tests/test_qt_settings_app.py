@@ -2219,6 +2219,25 @@ class RunSettingsWindowShutdownCoverageTests(unittest.TestCase):
         shutdown_spy.assert_called()
         self.assertEqual(len(qt_settings_app._diagnostics_threads), 0)
 
+    def test_loaded_native_window_is_marked_for_duplicate_activation(self):
+        class _FakeWindow:
+            def winId(self):
+                return 4321
+
+        fake_classes = self._fake_classes(root_objects=[_FakeWindow()], exec_return=0)
+        with mock.patch.object(
+            qt_settings_app, "_load_qt_classes", return_value=fake_classes
+        ), mock.patch.object(
+            qt_settings_app.sys, "platform", "win32"
+        ), mock.patch.object(
+            qt_settings_app.single_instance,
+            "mark_settings_window",
+            return_value=True,
+        ) as marker:
+            self.assertEqual(qt_settings_app.run_settings_window(), 0)
+
+        marker.assert_called_once_with(4321)
+
     def test_hotkey_cleanup_failure_cannot_skip_detection_or_worker_shutdown(self):
         fake_classes = self._fake_classes(root_objects=[object()], exec_return=0)
         controller_class = fake_classes["SettingsController"]

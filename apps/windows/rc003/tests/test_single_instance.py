@@ -1,5 +1,5 @@
-"""Exercises single_instance.py's mutex acquire/duplicate/release/cleanup
-contract with injected fake Win32 callables, so it runs on any OS without
+"""Exercises bridge/settings mutex and settings-window activation contracts
+with injected fake Win32 callables, so it runs on any OS without
 needing ``ctypes.windll`` (which does not exist off Windows) - the same
 dependency-injection seam win32_input.py's ``_sender`` parameter already
 established (see that module's docstring). ``BridgeInstanceGuard`` itself
@@ -401,6 +401,84 @@ class BridgeInstanceGuardAcquisitionFailureTests(unittest.TestCase):
                 self.fail("must not enter off Windows")
 
 
+class SettingsInstanceGuardTests(unittest.TestCase):
+    def test_settings_uses_a_distinct_local_mutex(self):
+        registry = _FakeMutexRegistry()
+        with single_instance.SettingsInstanceGuard(
+            _create_mutex=registry.create_mutex,
+            _release_mutex=registry.release_mutex,
+            _close_handle=registry.close_handle,
+        ):
+            pass
+
+        self.assertTrue(registry.create_calls[0].startswith("Local\\"))
+        self.assertNotEqual(registry.create_calls[0], single_instance._MUTEX_NAME)
+
+    def test_second_settings_launch_cannot_enter(self):
+        registry = _FakeMutexRegistry()
+
+        def guard():
+            return single_instance.SettingsInstanceGuard(
+                _create_mutex=registry.create_mutex,
+                _release_mutex=registry.release_mutex,
+                _close_handle=registry.close_handle,
+            )
+
+        with guard():
+            with self.assertRaises(single_instance.DuplicateInstanceError):
+                with guard():
+                    self.fail("duplicate settings launch must never enter")
+
+    def test_access_denied_is_treated_as_an_existing_settings_instance(self):
+        guard = single_instance.SettingsInstanceGuard(
+            _create_mutex=lambda _name: single_instance.MutexCreationResult(
+                handle=0,
+                last_error=single_instance._ERROR_ACCESS_DENIED,
+            ),
+            _release_mutex=lambda _handle: True,
+            _close_handle=lambda _handle: True,
+        )
+        with self.assertRaises(single_instance.DuplicateInstanceError):
+            with guard:
+                self.fail("an inaccessible existing settings mutex must block a duplicate")
+
+
+class SettingsWindowActivationTests(unittest.TestCase):
+    def test_marks_the_native_window_with_the_shared_private_property(self):
+        calls = []
+        marked = single_instance.mark_settings_window(
+            321,
+            _set_property=lambda hwnd, name: calls.append((hwnd, name)) or True,
+        )
+
+        self.assertTrue(marked)
+        self.assertEqual(calls, [(321, single_instance._SETTINGS_WINDOW_PROPERTY)])
+
+    def test_marker_failure_does_not_block_the_first_window(self):
+        self.assertFalse(
+            single_instance.mark_settings_window(
+                321,
+                _set_property=lambda _hwnd, _name: (_ for _ in ()).throw(OSError()),
+            )
+        )
+
+    def test_duplicate_activation_uses_the_same_private_property(self):
+        calls = []
+        activated = single_instance.activate_existing_settings_window(
+            _activate=lambda name: calls.append(name) or True
+        )
+
+        self.assertTrue(activated)
+        self.assertEqual(calls, [single_instance._SETTINGS_WINDOW_PROPERTY])
+
+    def test_activation_failure_is_best_effort_and_nonfatal(self):
+        self.assertFalse(
+            single_instance.activate_existing_settings_window(
+                _activate=lambda _name: (_ for _ in ()).throw(OSError())
+            )
+        )
+
+
 class ShowBridgeStartupBlockedNoticeTests(unittest.TestCase):
     def test_calls_the_injected_message_box_with_title_and_message(self):
         calls = []
@@ -483,6 +561,28 @@ class MutexCtypesPrototypeTests(unittest.TestCase):
         self.assertIn("MessageBoxW.restype", source)
         for token in ("wintypes.HWND", "wintypes.LPCWSTR", "wintypes.UINT"):
             self.assertIn(token, source)
+
+    def test_settings_window_marker_declares_the_full_real_prototype(self):
+        source = inspect.getsource(single_instance._real_set_window_property)
+        self.assertIn("SetPropW.argtypes", source)
+        self.assertIn("SetPropW.restype", source)
+        for token in ("wintypes.HWND", "wintypes.LPCWSTR", "wintypes.HANDLE"):
+            self.assertIn(token, source)
+
+    def test_settings_window_activation_declares_pointer_safe_prototypes(self):
+        source = inspect.getsource(single_instance._real_activate_marked_window)
+        for api in (
+            "EnumWindows",
+            "GetPropW",
+            "IsWindowVisible",
+            "IsIconic",
+            "ShowWindow",
+            "BringWindowToTop",
+            "SetForegroundWindow",
+            "FlashWindow",
+        ):
+            self.assertIn(f"{api}.argtypes", source)
+            self.assertIn(f"{api}.restype", source)
 
 
 if __name__ == "__main__":

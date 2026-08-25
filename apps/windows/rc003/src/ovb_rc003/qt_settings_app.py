@@ -169,6 +169,18 @@ def _qml_directory() -> Path:
     return Path(__file__).resolve().parent / "qml"
 
 
+def _mark_settings_window_for_activation(window: object) -> bool:
+    """Mark the real native QML window for duplicate-launch reactivation."""
+
+    if sys.platform != "win32":
+        return False
+    try:
+        hwnd = int(window.winId())  # type: ignore[attr-defined]
+    except (AttributeError, TypeError, ValueError):
+        return False
+    return single_instance.mark_settings_window(hwnd)
+
+
 _qt_classes_cache: Optional[dict] = None
 
 # Every background diagnostics worker thread DiagnosticsController.
@@ -2426,8 +2438,10 @@ def run_settings_window() -> int:
 
         main_qml = qml_dir / "main.qml"
         engine.load(QUrl.fromLocalFile(str(main_qml)))
-        if not engine.rootObjects():
+        root_objects = engine.rootObjects()
+        if not root_objects:
             raise QtUnavailableError(f"无法加载 QML 设置界面：{main_qml} 未能成功加载。")
+        _mark_settings_window_for_activation(root_objects[0])
 
         return app.exec()
     finally:

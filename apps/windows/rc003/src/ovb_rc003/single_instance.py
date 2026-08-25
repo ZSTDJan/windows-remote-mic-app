@@ -1,15 +1,14 @@
-"""Windows named-mutex single-instance guard for bridge mode (XRBM-021).
+"""Windows named-mutex single-instance guards for bridge and settings modes.
 
-The no-argument bridge (``python -m ovb_rc003`` / the packaged
-``RemoteMicRC003.exe``) is a long-lived, mostly invisible owner of
-BLE, Raw Input, synthetic key and audio resources. Starting a second
+The explicit ``--bridge`` mode (``python -m ovb_rc003 --bridge`` / the
+packaged ``RemoteMicRC003.exe --bridge``) is a long-lived, mostly invisible
+owner of BLE, Raw Input, synthetic key and audio resources. Starting a second
 instance in the same Windows logon session would race both instances over
 those resources - so at most one bridge instance may hold them at a time.
-``--settings``, ``--dry-run`` and help/version inspection never touch those
-resources at all and must remain available regardless of whether the
-bridge is already running - this guard is therefore only ever constructed
-around bridge-mode startup (see ``__main__.py``), never around those other
-modes.
+Settings mode uses a separate per-session mutex. A duplicate settings launch
+never constructs another Qt/QML window; it restores the existing marked
+window instead. The settings and bridge mutexes are deliberately distinct, so
+opening or closing settings never changes bridge ownership or lifetime.
 
 Fail-closed contract (XRBM-021 review round 1 P1 #1): a caller that cannot
 PROVE it is the sole owner - whether because another instance already owns
@@ -67,6 +66,8 @@ from typing import Callable, List, NamedTuple, Optional
 # requirement - a second bridge started by a different logged-in user (or
 # in a different session) is not this guard's concern.
 _MUTEX_NAME = r"Local\RemoteMicRC003_BridgeInstance"
+_SETTINGS_MUTEX_NAME = r"Local\RemoteMicRC003_SettingsInstance"
+_SETTINGS_WINDOW_PROPERTY = "RemoteMicRC003.SettingsWindow"
 
 # https://learn.microsoft.com/windows/win32/debug/system-error-codes--0-499-
 _ERROR_ALREADY_EXISTS = 183
@@ -95,8 +96,8 @@ class SingleInstanceUnavailableError(Exception):
 
 
 class DuplicateInstanceError(Exception):
-    """Raised when another bridge-mode instance already owns the named
-    mutex in this Windows logon session."""
+    """Raised when another instance already owns the selected named mutex
+    in this Windows logon session."""
 
 
 class MutexCleanupError(RuntimeError):
@@ -138,12 +139,14 @@ CreateMutexFn = Callable[[str], MutexCreationResult]
 ReleaseMutexFn = Callable[[int], bool]
 CloseHandleFn = Callable[[int], bool]
 OpenMutexFn = Callable[[str], MutexOpenResult]
+SetWindowPropertyFn = Callable[[int, str], bool]
+ActivateMarkedWindowFn = Callable[[str], bool]
 
 
 def _require_windows() -> None:
     if sys.platform != "win32":
         raise SingleInstanceUnavailableError(
-            "the bridge single-instance mutex is only available on Windows"
+            "the single-instance Win32 helpers are only available on Windows"
         )
 
 
@@ -202,6 +205,99 @@ def _real_close_handle(handle: int) -> bool:
     kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
     kernel32.CloseHandle.restype = wintypes.BOOL
     return bool(kernel32.CloseHandle(handle))
+
+
+def _real_set_window_property(hwnd: int, property_name: str) -> bool:
+    """Mark the native settings HWND without duplicating its visible title."""
+
+    _require_windows()
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    user32.SetPropW.argtypes = (
+        wintypes.HWND,
+        wintypes.LPCWSTR,
+        wintypes.HANDLE,
+    )
+    user32.SetPropW.restype = wintypes.BOOL
+    return bool(user32.SetPropW(hwnd, property_name, wintypes.HANDLE(1)))
+
+
+def mark_settings_window(
+    hwnd: int,
+    *,
+    _set_property: SetWindowPropertyFn = _real_set_window_property,
+) -> bool:
+    """Best-effort marker used only to find and reactivate the settings HWND.
+
+    The named mutex remains the authoritative single-instance guard. A marker
+    failure must not prevent the first settings window from opening.
+    """
+
+    if not hwnd:
+        return False
+    try:
+        return bool(_set_property(hwnd, _SETTINGS_WINDOW_PROPERTY))
+    except Exception:
+        return False
+
+
+def _real_activate_marked_window(property_name: str) -> bool:
+    _require_windows()
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    enum_windows_proc = ctypes.WINFUNCTYPE(
+        wintypes.BOOL,
+        wintypes.HWND,
+        wintypes.LPARAM,
+    )
+    user32.EnumWindows.argtypes = (enum_windows_proc, wintypes.LPARAM)
+    user32.EnumWindows.restype = wintypes.BOOL
+    user32.GetPropW.argtypes = (wintypes.HWND, wintypes.LPCWSTR)
+    user32.GetPropW.restype = wintypes.HANDLE
+    user32.IsWindowVisible.argtypes = (wintypes.HWND,)
+    user32.IsWindowVisible.restype = wintypes.BOOL
+    user32.IsIconic.argtypes = (wintypes.HWND,)
+    user32.IsIconic.restype = wintypes.BOOL
+    user32.ShowWindow.argtypes = (wintypes.HWND, ctypes.c_int)
+    user32.ShowWindow.restype = wintypes.BOOL
+    user32.BringWindowToTop.argtypes = (wintypes.HWND,)
+    user32.BringWindowToTop.restype = wintypes.BOOL
+    user32.SetForegroundWindow.argtypes = (wintypes.HWND,)
+    user32.SetForegroundWindow.restype = wintypes.BOOL
+    user32.FlashWindow.argtypes = (wintypes.HWND, wintypes.BOOL)
+    user32.FlashWindow.restype = wintypes.BOOL
+
+    matches: List[int] = []
+
+    @enum_windows_proc
+    def visit(hwnd, _lparam):
+        if user32.IsWindowVisible(hwnd) and user32.GetPropW(hwnd, property_name):
+            matches.append(int(hwnd))
+            return False
+        return True
+
+    user32.EnumWindows(visit, 0)
+    if not matches:
+        return False
+
+    hwnd = matches[0]
+    _SW_SHOW = 5
+    _SW_RESTORE = 9
+    user32.ShowWindow(hwnd, _SW_RESTORE if user32.IsIconic(hwnd) else _SW_SHOW)
+    user32.BringWindowToTop(hwnd)
+    if not user32.SetForegroundWindow(hwnd):
+        user32.FlashWindow(hwnd, True)
+    return True
+
+
+def activate_existing_settings_window(
+    *,
+    _activate: ActivateMarkedWindowFn = _real_activate_marked_window,
+) -> bool:
+    """Restore the already-running settings window after a duplicate launch."""
+
+    try:
+        return bool(_activate(_SETTINGS_WINDOW_PROPERTY))
+    except Exception:
+        return False
 
 
 def bridge_instance_running(
@@ -294,25 +390,33 @@ class BridgeInstanceGuard:
         _create_mutex: CreateMutexFn = _real_create_mutex,
         _release_mutex: ReleaseMutexFn = _real_release_mutex,
         _close_handle: CloseHandleFn = _real_close_handle,
+        _duplicate_message: str = (
+            "another Remote Mic RC003 instance is already running in this Windows session"
+        ),
+        _access_denied_means_duplicate: bool = False,
     ) -> None:
         self._name = name
         self._create_mutex = _create_mutex
         self._release_mutex = _release_mutex
         self._close_handle = _close_handle
+        self._duplicate_message = _duplicate_message
+        self._access_denied_means_duplicate = _access_denied_means_duplicate
         self._handle: Optional[int] = None
 
     def __enter__(self) -> "BridgeInstanceGuard":
         result = self._create_mutex(self._name)
         if not result.handle:
+            if (
+                self._access_denied_means_duplicate
+                and result.last_error == _ERROR_ACCESS_DENIED
+            ):
+                raise DuplicateInstanceError(self._duplicate_message)
             raise SingleInstanceUnavailableError(
                 f"CreateMutexW failed (GetLastError={result.last_error})"
             )
         if result.last_error == _ERROR_ALREADY_EXISTS:
             close_failure = self._safe_close(result.handle)
-            message = (
-                "another Remote Mic RC003 instance is already "
-                "running in this Windows session"
-            )
+            message = self._duplicate_message
             if close_failure:
                 message += f" (additionally, {close_failure})"
             raise DuplicateInstanceError(message)
@@ -366,6 +470,30 @@ class BridgeInstanceGuard:
         except Exception:  # noqa: BLE001
             return "CloseHandle raised an exception"
         return None if closed else "CloseHandle returned FALSE"
+
+
+class SettingsInstanceGuard(BridgeInstanceGuard):
+    """Separate per-session guard for the user-visible settings window."""
+
+    def __init__(
+        self,
+        *,
+        name: str = _SETTINGS_MUTEX_NAME,
+        _create_mutex: CreateMutexFn = _real_create_mutex,
+        _release_mutex: ReleaseMutexFn = _real_release_mutex,
+        _close_handle: CloseHandleFn = _real_close_handle,
+    ) -> None:
+        super().__init__(
+            name=name,
+            _create_mutex=_create_mutex,
+            _release_mutex=_release_mutex,
+            _close_handle=_close_handle,
+            _duplicate_message=(
+                "another Remote Mic settings window is already running "
+                "in this Windows session"
+            ),
+            _access_denied_means_duplicate=True,
+        )
 
 
 def _real_message_box(title: str, message: str) -> int:

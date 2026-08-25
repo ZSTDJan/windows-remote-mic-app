@@ -24,9 +24,7 @@ from ovb_rc003 import (
 
 
 def _make_guard_class(*, raise_on_enter=None, enter_calls=None):
-    """Builds a fake BridgeInstanceGuard CLASS (not instance) - _run_bridge()
-    constructs it with no arguments (``single_instance.BridgeInstanceGuard()``),
-    matching real usage exactly.
+    """Build a fake instance-guard class for bridge or settings routing.
     """
 
     class _ScriptedGuard:
@@ -47,6 +45,8 @@ class _ArgvRestoringTestCase(unittest.TestCase):
     def setUp(self):
         self._original_argv = sys.argv
         self._original_guard_cls = single_instance.BridgeInstanceGuard
+        self._original_settings_guard_cls = single_instance.SettingsInstanceGuard
+        self._original_activate_settings = single_instance.activate_existing_settings_window
         self._original_app_main = app.main
         self._original_notice = single_instance.show_bridge_startup_blocked_notice
         self._original_load_config = config.load_config
@@ -60,6 +60,8 @@ class _ArgvRestoringTestCase(unittest.TestCase):
         # Tests that need to assert on the exact notice text/call count still
         # override this in their own body, same as before.
         single_instance.show_bridge_startup_blocked_notice = lambda message: None
+        single_instance.SettingsInstanceGuard = _make_guard_class()
+        single_instance.activate_existing_settings_window = lambda: True
         config.load_config = lambda path: {
             "selected_device_profile": device_catalog.RC003_ID
         }
@@ -67,6 +69,8 @@ class _ArgvRestoringTestCase(unittest.TestCase):
     def tearDown(self):
         sys.argv = self._original_argv
         single_instance.BridgeInstanceGuard = self._original_guard_cls
+        single_instance.SettingsInstanceGuard = self._original_settings_guard_cls
+        single_instance.activate_existing_settings_window = self._original_activate_settings
         app.main = self._original_app_main
         single_instance.show_bridge_startup_blocked_notice = self._original_notice
         config.load_config = self._original_load_config
@@ -266,17 +270,20 @@ class BridgeModeRoutingTests(_ArgvRestoringTestCase):
 
 
 class ArgumentModeBypassTests(_ArgvRestoringTestCase):
-    """XRBM-021 In-scope item 3: the no-argument default,
-    --settings/--dry-run/--help/--bridge must bypass the single-instance
-    guard for everything except --bridge - none of them may even construct
-    it, let alone touch the mutex.
+    """Bridge and settings modes use separate guards; utility modes use none.
     """
 
-    def test_no_arguments_opens_settings_and_never_touches_the_guard(self):
+    def test_no_arguments_opens_settings_under_only_the_settings_guard(self):
         from ovb_rc003 import settings_ui
 
-        enter_calls = []
-        single_instance.BridgeInstanceGuard = _make_guard_class(enter_calls=enter_calls)
+        bridge_enter_calls = []
+        settings_enter_calls = []
+        single_instance.BridgeInstanceGuard = _make_guard_class(
+            enter_calls=bridge_enter_calls
+        )
+        single_instance.SettingsInstanceGuard = _make_guard_class(
+            enter_calls=settings_enter_calls
+        )
         app.main = lambda: self.fail("no-argument launch must never start the bridge")
         original_settings_main = settings_ui.main
         settings_ui.main = lambda: None
@@ -287,11 +294,18 @@ class ArgumentModeBypassTests(_ArgvRestoringTestCase):
         finally:
             settings_ui.main = original_settings_main
 
-        self.assertEqual(enter_calls, [])
+        self.assertEqual(bridge_enter_calls, [])
+        self.assertEqual(settings_enter_calls, [1])
 
     def test_dry_run_never_touches_the_guard(self):
-        enter_calls = []
-        single_instance.BridgeInstanceGuard = _make_guard_class(enter_calls=enter_calls)
+        bridge_enter_calls = []
+        settings_enter_calls = []
+        single_instance.BridgeInstanceGuard = _make_guard_class(
+            enter_calls=bridge_enter_calls
+        )
+        single_instance.SettingsInstanceGuard = _make_guard_class(
+            enter_calls=settings_enter_calls
+        )
         app.main = lambda: self.fail("--dry-run must never call app.main()")
         sys.argv = ["ovb_rc003", "--dry-run"]
 
@@ -299,23 +313,37 @@ class ArgumentModeBypassTests(_ArgvRestoringTestCase):
             main_module.main()
 
         self.assertEqual(ctx.exception.code, 0)
-        self.assertEqual(enter_calls, [])
+        self.assertEqual(bridge_enter_calls, [])
+        self.assertEqual(settings_enter_calls, [])
 
     def test_help_never_touches_the_guard(self):
-        enter_calls = []
-        single_instance.BridgeInstanceGuard = _make_guard_class(enter_calls=enter_calls)
+        bridge_enter_calls = []
+        settings_enter_calls = []
+        single_instance.BridgeInstanceGuard = _make_guard_class(
+            enter_calls=bridge_enter_calls
+        )
+        single_instance.SettingsInstanceGuard = _make_guard_class(
+            enter_calls=settings_enter_calls
+        )
         app.main = lambda: self.fail("--help must never call app.main()")
         sys.argv = ["ovb_rc003", "--help"]
 
         main_module.main()  # returns normally, no SystemExit
 
-        self.assertEqual(enter_calls, [])
+        self.assertEqual(bridge_enter_calls, [])
+        self.assertEqual(settings_enter_calls, [])
 
-    def test_settings_never_touches_the_guard(self):
+    def test_settings_uses_only_the_settings_guard(self):
         from ovb_rc003 import settings_ui
 
-        enter_calls = []
-        single_instance.BridgeInstanceGuard = _make_guard_class(enter_calls=enter_calls)
+        bridge_enter_calls = []
+        settings_enter_calls = []
+        single_instance.BridgeInstanceGuard = _make_guard_class(
+            enter_calls=bridge_enter_calls
+        )
+        single_instance.SettingsInstanceGuard = _make_guard_class(
+            enter_calls=settings_enter_calls
+        )
         app.main = lambda: self.fail("--settings must never call app.main()")
         original_settings_main = settings_ui.main
         settings_ui.main = lambda: None
@@ -326,14 +354,21 @@ class ArgumentModeBypassTests(_ArgvRestoringTestCase):
         finally:
             settings_ui.main = original_settings_main
 
-        self.assertEqual(enter_calls, [])
+        self.assertEqual(bridge_enter_calls, [])
+        self.assertEqual(settings_enter_calls, [1])
 
     def test_explicit_settings_wins_when_bridge_flag_is_also_present(self):
         from ovb_rc003 import settings_ui
 
-        enter_calls = []
+        bridge_enter_calls = []
+        settings_enter_calls = []
         settings_calls = []
-        single_instance.BridgeInstanceGuard = _make_guard_class(enter_calls=enter_calls)
+        single_instance.BridgeInstanceGuard = _make_guard_class(
+            enter_calls=bridge_enter_calls
+        )
+        single_instance.SettingsInstanceGuard = _make_guard_class(
+            enter_calls=settings_enter_calls
+        )
         app.main = lambda: self.fail("--settings must take precedence over --bridge")
         original_settings_main = settings_ui.main
         settings_ui.main = lambda: settings_calls.append(1)
@@ -345,7 +380,29 @@ class ArgumentModeBypassTests(_ArgvRestoringTestCase):
             settings_ui.main = original_settings_main
 
         self.assertEqual(settings_calls, [1])
-        self.assertEqual(enter_calls, [])
+        self.assertEqual(bridge_enter_calls, [])
+        self.assertEqual(settings_enter_calls, [1])
+
+    def test_duplicate_settings_launch_activates_existing_window_without_opening_another(self):
+        from ovb_rc003 import settings_ui
+
+        activation_calls = []
+        single_instance.SettingsInstanceGuard = _make_guard_class(
+            raise_on_enter=single_instance.DuplicateInstanceError("already open")
+        )
+        single_instance.activate_existing_settings_window = (
+            lambda: activation_calls.append(1) or True
+        )
+        original_settings_main = settings_ui.main
+        settings_ui.main = lambda: self.fail("duplicate launch must not build another window")
+        sys.argv = ["ovb_rc003", "--settings"]
+
+        try:
+            main_module.main()
+        finally:
+            settings_ui.main = original_settings_main
+
+        self.assertEqual(activation_calls, [1])
 
     def test_settings_startup_failure_is_visible_and_has_a_stable_exit_code(self):
         from ovb_rc003 import settings_ui

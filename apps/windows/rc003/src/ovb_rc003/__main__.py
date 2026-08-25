@@ -2,8 +2,9 @@
 built from the standalone ``src/launcher.py`` entry point - see XRBM-021):
 
 - (no args)     open the settings window - the DEFAULT double-click
-                behavior, so a user who runs the exe always sees a window.
-                Never touches BLE/HID/audio or the single-instance guard.
+                behavior. Settings has its own per-session single-instance
+                guard: a repeat launch restores the existing window without
+                touching BLE/HID/audio or the bridge guard.
 - ``--settings``  open the settings window (explicit form of the default)
 - ``--bridge``  run the bridge - guarded by a per-session Windows named-
                 mutex (single_instance.py) so a second concurrent launch
@@ -59,9 +60,9 @@ built from the standalone ``src/launcher.py`` entry point - see XRBM-021):
 
 ``--settings``, ``--bridge``, ``--dry-run``,
 ``--diagnose-ble-candidates`` and ``--help``/``-h`` are all checked and
-dispatched BEFORE the bridge branch below is ever reached, so none of them
-touch the single-instance mutex at all (XRBM-021 changed threat model: the
-guard applies only to the ``--bridge`` mode).
+dispatched BEFORE the bridge branch below is ever reached. Settings uses its
+own mutex; dry-run, diagnostics and help touch neither settings nor bridge
+ownership.
 """
 
 from __future__ import annotations
@@ -264,7 +265,11 @@ def _run_settings() -> None:
     from . import settings_ui, single_instance
 
     try:
-        settings_ui.main()
+        with single_instance.SettingsInstanceGuard():
+            settings_ui.main()
+    except single_instance.DuplicateInstanceError:
+        single_instance.activate_existing_settings_window()
+        return
     except Exception as exc:
         print(
             f"settings startup failed: error_type={type(exc).__name__}",
