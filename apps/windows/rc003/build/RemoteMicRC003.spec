@@ -85,6 +85,7 @@ hiddenimports = [
     "ovb_rc003.qt_settings_app",  # XRBM-030
     "ovb_rc003.windows_diagnostics",  # XRBM-031
     "ovb_rc003.vb_cable_bundle",  # XRBM-031
+    "ovb_rc003.voice_program_manager",
     "ovb_rc003.ble_transport_winrt",
     "ovb_rc003.raw_input_windows",
     "ovb_rc003.audio_playback",

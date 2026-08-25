@@ -121,6 +121,7 @@ from . import (
     shell_targets,
     single_instance,
     vb_cable_bundle,
+    voice_program_manager,
     windows_diagnostics,
 )
 
@@ -651,6 +652,11 @@ def _load_qt_classes() -> dict:
         selectedButtonIdChanged = Signal()
         selectedDeviceIndexChanged = Signal()
         selectedDeviceChanged = Signal()
+        selectedVoiceProgramIndexChanged = Signal()
+        voiceProgramCustomPathChanged = Signal()
+        voiceProgramLaunchOnBridgeStartChanged = Signal()
+        voiceProgramLaunchElevatedChanged = Signal()
+        voiceProgramStatusTextChanged = Signal()
         djiMicStatusTextChanged = Signal()
         keyDetectionActiveChanged = Signal()
         keyDetectionTextChanged = Signal()
@@ -692,6 +698,12 @@ def _load_qt_classes() -> dict:
                 )
                 for mode in self._TRIGGER_MODE_ORDER
             }
+            self._voice_program_settings = (
+                voice_program_manager.normalize_voice_program_settings(
+                    self._config.get("voice_program")
+                )
+            )
+            self._voice_program_status_text = ""
             try:
                 self._bridge_running = single_instance.bridge_instance_running()
             except (
@@ -739,6 +751,7 @@ def _load_qt_classes() -> dict:
             self._recommended_endpoint_index = -1
             self._selected_endpoint_index = -1
             self._refresh_endpoint_options()
+            self._refresh_voice_program_status()
             self._refresh_dji_mic_status()
             self._load_bindings_into_model()
             self._model.mappingEdited.connect(self._mark_settings_dirty)
@@ -958,6 +971,34 @@ def _load_qt_classes() -> dict:
                 self._key_detection_text = text
                 self.keyDetectionTextChanged.emit()
 
+        def _refresh_voice_program_status(self) -> None:
+            try:
+                status = voice_program_manager.inspect_voice_program(
+                    self._voice_program_settings
+                )
+                text = voice_program_manager.status_text(status)
+            except Exception:
+                text = "无法读取语音程序状态。"
+            if text != self._voice_program_status_text:
+                self._voice_program_status_text = text
+                self.voiceProgramStatusTextChanged.emit()
+
+        def _replace_voice_program_settings(self, raw: object) -> None:
+            previous = dict(self._voice_program_settings)
+            current = voice_program_manager.normalize_voice_program_settings(raw)
+            self._voice_program_settings = current
+            if current["provider"] != previous.get("provider"):
+                self.selectedVoiceProgramIndexChanged.emit()
+            if current["custom_executable"] != previous.get("custom_executable"):
+                self.voiceProgramCustomPathChanged.emit()
+            if current["launch_on_bridge_start"] != previous.get(
+                "launch_on_bridge_start"
+            ):
+                self.voiceProgramLaunchOnBridgeStartChanged.emit()
+            if current["launch_elevated"] != previous.get("launch_elevated"):
+                self.voiceProgramLaunchElevatedChanged.emit()
+            self._refresh_voice_program_status()
+
         def _on_raw_input_event(self, event: raw_input_windows.RawInputEvent) -> None:
             if not event.is_pressed:
                 return
@@ -1115,6 +1156,8 @@ def _load_qt_classes() -> dict:
                 self._set_error_message(f"{title}：{exc.message}")
                 return False
 
+            new_config["voice_program"] = dict(self._voice_program_settings)
+
             endpoint_name = new_config.get("output_endpoint_name", "")
             endpoint_host_api = new_config.get("output_endpoint_host_api", "")
             primary_bindings = new_bindings.get("bindings", {})
@@ -1156,6 +1199,7 @@ def _load_qt_classes() -> dict:
 
             self._config = saved_config
             self._bindings = saved_bindings
+            self._replace_voice_program_settings(saved_config.get("voice_program"))
             self._removed_voice_bindings = config.normalize_voice_product_boundary(
                 self._config,
                 self._bindings,
@@ -1213,6 +1257,100 @@ def _load_qt_classes() -> dict:
             _get_hold_voice_hotkey_text,
             _set_hold_voice_hotkey_text,
             notify=holdVoiceHotkeyTextChanged,
+        )
+
+        def _get_voice_program_options(self) -> List[str]:
+            return voice_program_manager.provider_options()
+
+        voiceProgramOptions = Property(
+            list, _get_voice_program_options, constant=True
+        )
+
+        def _get_selected_voice_program_index(self) -> int:
+            return voice_program_manager.provider_index(
+                self._voice_program_settings.get("provider")
+            )
+
+        def _set_selected_voice_program_index(self, value: int) -> None:
+            provider_id = voice_program_manager.provider_id_for_index(value)
+            if provider_id == self._voice_program_settings.get("provider"):
+                return
+            updated = dict(self._voice_program_settings)
+            updated["provider"] = provider_id
+            self._replace_voice_program_settings(updated)
+            self._mark_settings_dirty()
+
+        selectedVoiceProgramIndex = Property(
+            int,
+            _get_selected_voice_program_index,
+            _set_selected_voice_program_index,
+            notify=selectedVoiceProgramIndexChanged,
+        )
+
+        def _get_voice_program_custom_path(self) -> str:
+            return str(self._voice_program_settings.get("custom_executable", ""))
+
+        def _set_voice_program_custom_path(self, value: str) -> None:
+            local_value = QUrl(value).toLocalFile() if value.startswith("file:") else value
+            local_value = local_value.strip()
+            if local_value == self._voice_program_settings.get("custom_executable"):
+                return
+            self._voice_program_settings["custom_executable"] = local_value
+            self.voiceProgramCustomPathChanged.emit()
+            self._mark_settings_dirty()
+            self._refresh_voice_program_status()
+
+        voiceProgramCustomPath = Property(
+            str,
+            _get_voice_program_custom_path,
+            _set_voice_program_custom_path,
+            notify=voiceProgramCustomPathChanged,
+        )
+
+        def _get_voice_program_launch_on_bridge_start(self) -> bool:
+            return self._voice_program_settings.get("launch_on_bridge_start") is True
+
+        def _set_voice_program_launch_on_bridge_start(self, value: bool) -> None:
+            value = bool(value)
+            if value == self._get_voice_program_launch_on_bridge_start():
+                return
+            self._voice_program_settings["launch_on_bridge_start"] = value
+            self.voiceProgramLaunchOnBridgeStartChanged.emit()
+            self._mark_settings_dirty()
+
+        voiceProgramLaunchOnBridgeStart = Property(
+            bool,
+            _get_voice_program_launch_on_bridge_start,
+            _set_voice_program_launch_on_bridge_start,
+            notify=voiceProgramLaunchOnBridgeStartChanged,
+        )
+
+        def _get_voice_program_launch_elevated(self) -> bool:
+            return self._voice_program_settings.get("launch_elevated") is True
+
+        def _set_voice_program_launch_elevated(self, value: bool) -> None:
+            value = bool(value)
+            if value == self._get_voice_program_launch_elevated():
+                return
+            self._voice_program_settings["launch_elevated"] = value
+            self.voiceProgramLaunchElevatedChanged.emit()
+            self._mark_settings_dirty()
+            self._refresh_voice_program_status()
+
+        voiceProgramLaunchElevated = Property(
+            bool,
+            _get_voice_program_launch_elevated,
+            _set_voice_program_launch_elevated,
+            notify=voiceProgramLaunchElevatedChanged,
+        )
+
+        def _get_voice_program_status_text(self) -> str:
+            return self._voice_program_status_text
+
+        voiceProgramStatusText = Property(
+            str,
+            _get_voice_program_status_text,
+            notify=voiceProgramStatusTextChanged,
         )
 
         def _get_endpoint_options(self) -> List[str]:
@@ -1432,6 +1570,24 @@ def _load_qt_classes() -> dict:
         @Slot(result=bool)
         def saveSettings(self) -> bool:
             return self._save()
+
+        @Slot()
+        def refreshVoiceProgramStatus(self) -> None:
+            self._refresh_voice_program_status()
+
+        @Slot()
+        def launchVoiceProgram(self) -> None:
+            result = voice_program_manager.launch_voice_program(
+                self._voice_program_settings
+            )
+            message = voice_program_manager.launch_result_text(result)
+            if result.code in {"not_found", "launch_failed", "restart_elevated_required"}:
+                self._set_status_message("")
+                self._set_error_message(message)
+            else:
+                self._set_error_message("")
+                self._set_status_message(message)
+            self._refresh_voice_program_status()
 
         @Slot()
         def refreshBridgeState(self) -> None:
@@ -1722,6 +1878,7 @@ def _load_qt_classes() -> dict:
             self._set_hold_voice_hotkey_text(
                 defaults.voice_hotkeys[key_mapping.VoiceTriggerMode.HOLD.value]
             )
+            self._replace_voice_program_settings({})
             self._mark_settings_dirty()
             self._set_error_message("")
             self._set_status_message(

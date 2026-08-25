@@ -80,6 +80,7 @@ from . import (
     logging_setup,
     raw_input_windows,
     voice_controller,
+    voice_program_manager,
     win32_input,
     win32_keys,
 )
@@ -143,6 +144,21 @@ class RC003App:
             on_trigger=self._on_button_trigger,
         )
         self._logger: logging.Logger = logging_setup.get_logger(self._config_root)
+        try:
+            voice_program_result = (
+                voice_program_manager.launch_configured_at_bridge_start(self._config)
+            )
+        except Exception:
+            self._logger.exception(
+                "voice program: optional bridge-start launch failed unexpectedly"
+            )
+        else:
+            if voice_program_result.code not in {"not_requested", "disabled"}:
+                self._logger.info(
+                    "voice program: provider=%s launch_result=%s",
+                    voice_program_result.provider_id,
+                    voice_program_result.code,
+                )
         if self._removed_voice_bindings:
             self._logger.warning(
                 "legacy voice mappings disabled until user reselects actions: %s",

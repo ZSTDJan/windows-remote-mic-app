@@ -4,6 +4,7 @@
 // SettingsController/ButtonMappingModel are QML singletons - see main.qml.
 import QtQuick
 import QtQuick.Controls
+import QtQuick.Dialogs
 import QtQuick.Layouts
 import OvbRc003Settings 1.0
 
@@ -155,6 +156,148 @@ Item {
         repeat: true
         running: SettingsController.keyDetectionActive
         onTriggered: SettingsController.pollKeyDetectionBridge()
+    }
+
+    FileDialog {
+        id: voiceProgramFileDialog
+        title: qsTr("选择语音程序")
+        nameFilters: [
+            qsTr("程序或快捷方式 (*.exe *.lnk)"),
+            qsTr("所有文件 (*)")
+        ]
+        onAccepted: SettingsController.voiceProgramCustomPath = selectedFile
+    }
+
+    Dialog {
+        id: voiceProgramDialog
+        objectName: "voiceProgramDialog"
+        modal: true
+        anchors.centerIn: parent
+        width: Math.min(540, root.width - tokens.spacingLarge * 2)
+        title: qsTr("语音程序")
+        standardButtons: Dialog.Close
+        onOpened: SettingsController.refreshVoiceProgramStatus()
+
+        contentItem: ColumnLayout {
+            spacing: tokens.spacingMedium
+
+            RowLayout {
+                Layout.fillWidth: true
+                spacing: tokens.spacingSmall
+                Label {
+                    Layout.preferredWidth: 92
+                    text: qsTr("语音输入程序")
+                    color: tokens.textPrimary
+                    font.weight: Font.Medium
+                }
+                SelectionComboBox {
+                    id: voiceProgramCombo
+                    objectName: "voiceProgramCombo"
+                    tokens: root.tokens
+                    Layout.fillWidth: true
+                    model: SettingsController.voiceProgramOptions
+                    currentIndex: SettingsController.selectedVoiceProgramIndex
+                    onActivated: SettingsController.selectedVoiceProgramIndex = index
+                    Accessible.name: qsTr("语音输入程序")
+                }
+            }
+
+            RowLayout {
+                Layout.fillWidth: true
+                visible: SettingsController.selectedVoiceProgramIndex === 2
+                spacing: tokens.spacingSmall
+                Label {
+                    Layout.preferredWidth: 92
+                    text: qsTr("程序路径")
+                    color: tokens.textPrimary
+                    font.weight: Font.Medium
+                }
+                CompactTextField {
+                    objectName: "voiceProgramCustomPathField"
+                    tokens: root.tokens
+                    Layout.fillWidth: true
+                    text: SettingsController.voiceProgramCustomPath
+                    placeholderText: qsTr("选择 .exe 或 .lnk")
+                    onEditingFinished: SettingsController.voiceProgramCustomPath = text
+                    Accessible.name: qsTr("自定义语音程序路径")
+                }
+                CompactButton {
+                    objectName: "browseVoiceProgramButton"
+                    tokens: root.tokens
+                    compactMinimumWidth: 58
+                    text: qsTr("选择")
+                    onClicked: voiceProgramFileDialog.open()
+                }
+            }
+
+            CheckBox {
+                objectName: "voiceProgramAutoStartCheckBox"
+                text: qsTr("随桥接启动")
+                checked: SettingsController.voiceProgramLaunchOnBridgeStart
+                enabled: SettingsController.selectedVoiceProgramIndex !== 0
+                onClicked: SettingsController.voiceProgramLaunchOnBridgeStart = checked
+            }
+
+            CheckBox {
+                objectName: "voiceProgramElevatedCheckBox"
+                text: qsTr("以管理员权限启动")
+                checked: SettingsController.voiceProgramLaunchElevated
+                enabled: SettingsController.selectedVoiceProgramIndex !== 0
+                onClicked: SettingsController.voiceProgramLaunchElevated = checked
+            }
+
+            Label {
+                Layout.fillWidth: true
+                visible: SettingsController.voiceProgramLaunchElevated
+                    && SettingsController.selectedVoiceProgramIndex !== 0
+                text: qsTr("启动时会显示 Windows 管理员确认；取消不会影响 Remote Mic。")
+                wrapMode: Text.WordWrap
+                color: tokens.textSecondary
+                font.pixelSize: tokens.fontSizeSmall
+            }
+
+            Label {
+                objectName: "voiceProgramStatusLabel"
+                Layout.fillWidth: true
+                text: SettingsController.voiceProgramStatusText
+                wrapMode: Text.WordWrap
+                color: tokens.textSecondary
+                font.pixelSize: tokens.fontSizeSmall
+            }
+
+            RowLayout {
+                Layout.fillWidth: true
+                Layout.alignment: Qt.AlignRight
+                spacing: tokens.spacingSmall
+                Item { Layout.fillWidth: true }
+                CompactButton {
+                    objectName: "refreshVoiceProgramButton"
+                    tokens: root.tokens
+                    compactMinimumWidth: 64
+                    text: qsTr("重新检测")
+                    onClicked: SettingsController.refreshVoiceProgramStatus()
+                }
+                CompactButton {
+                    objectName: "launchVoiceProgramButton"
+                    tokens: root.tokens
+                    compactMinimumWidth: 58
+                    text: qsTr("启动")
+                    enabled: SettingsController.selectedVoiceProgramIndex !== 0
+                    onClicked: SettingsController.launchVoiceProgram()
+                }
+                CompactButton {
+                    objectName: "saveVoiceProgramButton"
+                    tokens: root.tokens
+                    compactMinimumWidth: 58
+                    text: qsTr("保存")
+                    highlighted: true
+                    onClicked: {
+                        if (SettingsController.saveSettings())
+                            voiceProgramDialog.close()
+                    }
+                }
+            }
+        }
     }
 
     Dialog {
@@ -511,9 +654,9 @@ Item {
                         tokens: root.tokens
                         kind: bodyKind
                         Layout.preferredWidth: 126
-                        Layout.minimumWidth: 126
-                        Layout.maximumWidth: 126
-                        text: qsTr("按住说话快捷键")
+                        Layout.minimumWidth: 88
+                        Layout.maximumWidth: 88
+                        text: qsTr("语音快捷键")
                         font.weight: Font.Medium
                     }
                     CompactTextField {
@@ -525,7 +668,7 @@ Item {
                         placeholderText: qsTr("例如 ralt")
                         selectByMouse: true
                         onEditingFinished: SettingsController.holdVoiceHotkeyText = text
-                        Accessible.name: qsTr("按住说话快捷键")
+                        Accessible.name: qsTr("语音快捷键")
                         ToolTip.text: qsTr("默认右侧 Alt；请与目标语音软件的快捷键保持一致。")
                     }
                     CompactButton {
@@ -533,7 +676,15 @@ Item {
                         compactMinimumWidth: 58
                         text: qsTr("录入")
                         onClicked: root.openShortcutRecorder("", -1, "", "hold")
-                        Accessible.name: qsTr("录入按住说话快捷键")
+                        Accessible.name: qsTr("录入语音快捷键")
+                    }
+                    CompactButton {
+                        objectName: "voiceProgramButton"
+                        tokens: root.tokens
+                        compactMinimumWidth: 72
+                        text: qsTr("语音程序")
+                        onClicked: voiceProgramDialog.open()
+                        Accessible.name: qsTr("管理语音程序")
                     }
                 }
             }

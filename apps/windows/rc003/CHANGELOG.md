@@ -47,6 +47,14 @@
    `bugs/BUG-025-bridge-startup-readiness-warning.md`、
    `bugs/BUG-026-bridge-liveness-and-first-key-readiness.md` 和 `TESTING.md`。
 
+### 2026-08-25 语音程序管理
+
+- “按键”页把“按住说话快捷键”缩短为“语音快捷键”，并增加“语音程序”入口。
+- 新增默认关闭的可选管理层：自动发现搜狗语音组件，也支持用户选择其它
+  `.exe`/`.lnk`；可以手动启动或随桥接启动，失败不会阻止桥接。
+- 管理员启动仅在用户明确勾选后请求 Windows UAC；Remote Mic 自身不提权，也不
+  复制、安装或打包第三方输入法。搜狗、其它输入法和真实远程环境仍待人工实测。
+
 ### 2026-08-24 自检补充
 
 - **隔离迟到 legacy F5**：direct HID 已证明话筒键松开后若旧 F5 仍迟到，该来源

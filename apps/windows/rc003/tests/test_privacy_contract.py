@@ -48,15 +48,13 @@ _ELEVATION_MARKERS = (
 
 _FORBIDDEN_BINARY_SUFFIXES = (".exe", ".dll", ".pyd", ".zip", ".xz")
 
-# The SOLE, disclosed exception (XRBM-031): vb_cable_bundle.py launches the
-# THIRD-PARTY vendor's own VB-CABLE setup UI with Windows' "runas"/UAC verb,
-# only from a slot reached by an explicit user click plus a separate
-# explicit confirmation - never to elevate this application's own process,
-# and never for anything but that one vendor-controlled launch. Every other
-# module in this package must stay elevation-free; see
-# test_elevation_exception_is_scoped_to_the_vendor_vb_cable_launch_only
-# below, which proves the exemption is not a blank check.
-_ELEVATION_MARKER_EXEMPT_FILENAMES = frozenset({"vb_cable_bundle.py"})
+# Disclosed third-party launch exceptions. Neither module elevates Remote Mic
+# itself: one starts VB-CABLE's installer after confirmation, while the other
+# can start the user-selected voice-input program elevated only when that
+# option is enabled. Every other package module remains elevation-free.
+_ELEVATION_MARKER_EXEMPT_FILENAMES = frozenset(
+    {"vb_cable_bundle.py", "voice_program_manager.py"}
+)
 
 # vb_cable_bundle.py/windows_diagnostics.py/qt_settings_app.py are the three
 # SANCTIONED, reviewed modules for the explicit vendor-launch/read-only-
@@ -127,6 +125,15 @@ class NoElevationOrAutoDriverTests(unittest.TestCase):
         self.assertNotIn("PrivilegesRequired=admin", text)
         self.assertNotIn("RequireAdministrator", text)
         self.assertIn('os.startfile(path, "runas"', text)
+
+    def test_voice_program_elevation_is_scoped_to_the_selected_third_party_path(self):
+        path = _PACKAGE_ROOT / "voice_program_manager.py"
+        text = path.read_text(encoding="utf-8")
+        self.assertIn('operation = "runas" if request_elevation else "open"', text)
+        self.assertIn("os.startfile(path, operation", text)
+        self.assertNotIn("sys.executable", text)
+        self.assertIn("winreg.QueryValueEx", text)
+        self.assertNotIn("winreg.SetValueEx", text)
 
     def test_no_vbcable_install_function_exists_outside_the_sanctioned_module(self):
         offenders = []

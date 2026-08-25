@@ -80,6 +80,7 @@ _BRANDING_CHECK_EXEMPT_RELATIVE_PATHS = {
     Path("build/check-public-boundary.ps1"),
     Path("installer/readme-rc003.txt"),
     Path("src/ovb_rc003/vb_cable_bundle.py"),
+    Path("src/ovb_rc003/voice_program_manager.py"),
     # XRBM-031: README.md/ATTRIBUTION.md document the same disclosed
     # "runas"/UAC vendor-launch mechanism in prose (see README.md's
     # "VB-CABLE driver helper" section and ATTRIBUTION.md's
@@ -208,6 +209,15 @@ class BoundaryScanReplayTests(unittest.TestCase):
         self.assertTrue(any(marker in text for marker in _ELEVATION_MARKERS))
         self.assertFalse(any(pattern.search(text) for pattern in _FORBIDDEN_BRANDING_PATTERNS))
         self.assertFalse(any(marker in text for marker in _AUTOSTART_MARKERS))
+
+    def test_voice_program_manager_is_exempt_only_for_third_party_elevation(self):
+        path = _RC003_ROOT / "src" / "ovb_rc003" / "voice_program_manager.py"
+        text = path.read_text(encoding="utf-8")
+        self.assertTrue(any(marker in text for marker in _ELEVATION_MARKERS))
+        self.assertFalse(any(pattern.search(text) for pattern in _FORBIDDEN_BRANDING_PATTERNS))
+        self.assertNotIn("sys.executable", text)
+        self.assertIn("winreg.QueryValueEx", text)
+        self.assertNotIn("winreg.SetValueEx", text)
 
     def test_readme_is_exempt_only_for_its_documented_elevation_reason(self):
         path = _RC003_ROOT / "README.md"

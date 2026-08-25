@@ -108,9 +108,8 @@ $brandingCheckExemptRelativePaths = @(
     "tests/test_boundary_scan_replay.py",
     "build/check-public-boundary.ps1",
     "installer/readme-rc003.txt",
-    # XRBM-031: the SOLE production-source exemption in this list, and only
-    # for the elevation category - src/ovb_rc003/vb_cable_bundle.py
-    # legitimately requests Windows' own "runas"/UAC verb to launch the
+    # XRBM-031: scoped third-party elevation for the VB-CABLE installer.
+    # This module legitimately requests Windows' own "runas"/UAC verb to launch the
     # THIRD-PARTY VB-CABLE vendor's own setup UI (never to elevate this
     # application itself, and only from an explicit user click), which is
     # otherwise forbidden everywhere else in this source tree. See
@@ -122,6 +121,12 @@ $brandingCheckExemptRelativePaths = @(
     # that the elevation reference is exactly the one disclosed vendor-launch
     # call, not a self-elevation of this project's own process.
     "src/ovb_rc003/vb_cable_bundle.py",
+    # Optional voice-program management may request UAC only for the
+    # user-selected third-party voice application. Its CurrentVersion\Run
+    # access is read-only discovery of Sogou's existing component entry; it
+    # never writes autostart. It also never elevates Remote Mic itself and
+    # remains disabled unless the user selects a provider.
+    "src/ovb_rc003/voice_program_manager.py",
     # README.md/ATTRIBUTION.md document this same disclosed "runas"/UAC
     # vendor-launch mechanism in prose - the word itself is documentation,
     # not a directive.

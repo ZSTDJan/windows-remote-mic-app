@@ -31,7 +31,7 @@ PRODUCT_ID = "RC003"
 CONFIG_FILENAME = "config.json"
 KEY_BINDINGS_FILENAME = "key_bindings.json"
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 RUNTIME_LEGACY_VOICE_MODE_KEY = "_legacy_voice_trigger_mode"
 RUNTIME_REMOVED_VOICE_BINDINGS_KEY = "_removed_voice_bindings"
@@ -91,7 +91,7 @@ def key_bindings_path(root: Path = None) -> Path:  # type: ignore[assignment]
 
 
 def default_config() -> Dict[str, Any]:
-    from . import key_mapping
+    from . import key_mapping, voice_program_manager
 
     return {
         "schema_version": SCHEMA_VERSION,
@@ -115,6 +115,7 @@ def default_config() -> Dict[str, Any]:
                 key_mapping.VoiceTriggerMode.HOLD
             )
         },
+        "voice_program": voice_program_manager.normalize_voice_program_settings({}),
         # Empty until the user explicitly picks one in settings; voice fails
         # closed while this is empty (see audio_output.resolve_selected_endpoint).
         # Both fields together disambiguate endpoints that share a display
@@ -169,6 +170,7 @@ def load_config(path: Path) -> Dict[str, Any]:
         _normalize_voice_hotkey(stored)
         config.update(stored)
     _normalize_voice_hotkey(config)
+    _normalize_voice_program(config)
     return config
 
 
@@ -176,6 +178,7 @@ def save_config(path: Path, config: Dict[str, Any]) -> None:
     persisted = _without_runtime_only_keys(config)
     _assert_no_forbidden_keys(persisted)
     _normalize_voice_hotkey(persisted)
+    _normalize_voice_program(persisted)
     persisted = _without_runtime_only_keys(persisted)
     _save_json_atomic(path, persisted)
 
@@ -221,6 +224,14 @@ def _normalize_voice_hotkey(config: Dict[str, Any]) -> None:
     config["voice_hotkey"] = current
     config["voice_hotkeys"] = {"hold": current}
     config.pop("voice_release_finish_tap_enabled", None)
+
+
+def _normalize_voice_program(config: Dict[str, Any]) -> None:
+    from . import voice_program_manager
+
+    config["voice_program"] = voice_program_manager.normalize_voice_program_settings(
+        config.get("voice_program")
+    )
 
 
 def default_key_bindings() -> Dict[str, Any]:

@@ -31,7 +31,7 @@ class DefaultConfigPrivacyTests(unittest.TestCase):
         self.assertEqual(defaults["voice_hotkeys"]["hold"], "ralt")
         self.assertNotIn("toggle", defaults["voice_hotkeys"])
         self.assertNotIn("voice_release_finish_tap_enabled", defaults)
-        self.assertEqual(defaults["schema_version"], 3)
+        self.assertEqual(defaults["schema_version"], 4)
         self.assertEqual(defaults["gain_db"], 10.0)
 
     def test_default_config_contains_no_forbidden_identity_fields(self):
@@ -131,7 +131,7 @@ class DefaultConfigPrivacyTests(unittest.TestCase):
 
             loaded = config.load_config(path)
 
-        self.assertEqual(loaded["schema_version"], 3)
+        self.assertEqual(loaded["schema_version"], 4)
         self.assertNotIn("voice_release_finish_tap_enabled", loaded)
 
     def test_save_preserves_hold_with_right_alt_space(self):
@@ -380,7 +380,7 @@ class RoundTripTests(unittest.TestCase):
             config.save_config(path, original)
 
             persisted = json.loads(path.read_text(encoding="utf-8"))
-        self.assertEqual(persisted["schema_version"], 3)
+        self.assertEqual(persisted["schema_version"], 4)
         self.assertNotIn("voice_release_finish_tap_enabled", persisted)
 
     def test_load_missing_file_returns_defaults(self):

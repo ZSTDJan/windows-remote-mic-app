@@ -45,6 +45,7 @@ from ovb_rc003 import (
     shell_targets,
     single_instance,
     vb_cable_bundle,
+    voice_program_manager,
     windows_diagnostics,
 )
 
@@ -395,6 +396,57 @@ class SettingsControllerTests(unittest.TestCase):
     def test_hotkey_text_defaults_to_the_configured_default(self):
         controller, _ = self._make_controller()
         self.assertEqual(controller.hotkeyText, "ralt")
+
+    def test_voice_program_management_defaults_to_optional_and_disabled(self):
+        controller, _ = self._make_controller()
+        self.assertEqual(controller.voiceProgramOptions[0], "不管理")
+        self.assertEqual(controller.selectedVoiceProgramIndex, 0)
+        self.assertFalse(controller.voiceProgramLaunchOnBridgeStart)
+        self.assertFalse(controller.voiceProgramLaunchElevated)
+        self.assertIn("不会管理", controller.voiceProgramStatusText)
+
+    def test_voice_program_settings_persist_with_the_main_save(self):
+        executable = Path(self._tmpdir.name) / "voice.exe"
+        executable.touch()
+        controller, _ = self._make_controller()
+        controller.selectedVoiceProgramIndex = 2
+        controller.voiceProgramCustomPath = str(executable)
+        controller.voiceProgramLaunchOnBridgeStart = True
+        controller.voiceProgramLaunchElevated = True
+
+        self.assertTrue(controller.settingsDirty)
+        self.assertTrue(controller.saveSettings())
+
+        saved = config.load_config(config.config_path(config.config_root()))
+        self.assertEqual(
+            saved["voice_program"],
+            {
+                "provider": "custom",
+                "custom_executable": str(executable),
+                "launch_on_bridge_start": True,
+                "launch_elevated": True,
+            },
+        )
+
+    def test_voice_program_launch_reports_a_normal_provider_result(self):
+        controller, _ = self._make_controller()
+        controller.selectedVoiceProgramIndex = 1
+        result = voice_program_manager.VoiceProgramLaunchResult(
+            provider_id="sogou",
+            started=True,
+            already_running=False,
+            code="started",
+            elevated=True,
+        )
+        with mock.patch.object(
+            qt_settings_app.voice_program_manager,
+            "launch_voice_program",
+            return_value=result,
+        ):
+            controller.launchVoiceProgram()
+
+        self.assertIn("管理员权限", controller.statusMessage)
+        self.assertEqual(controller.errorMessage, "")
 
     def test_existing_right_alt_hotkey_is_preserved_when_loading_saved_config(self):
         saved = config.default_config()
@@ -2966,7 +3018,7 @@ class SettingsShellSourceContractTests(unittest.TestCase):
         self.assertIn("property string descriptionObjectName", self.settings_list_row_qml)
         self.assertIn("AbstractButton {", self.mapping_card_qml)
 
-    def test_connection_selectors_reuse_one_selected_option_delegate(self):
+    def test_all_selectors_reuse_one_selected_option_delegate(self):
         self.assertEqual(self.connection_qml.count("SelectionComboBox {"), 2)
         self.assertIn(
             "recommendedIndex: SettingsController.recommendedEndpointIndex",
@@ -2979,7 +3031,11 @@ class SettingsShellSourceContractTests(unittest.TestCase):
         self.assertIn("recommendedIndex >= 0 && index >= 0", self.selection_combo_qml)
         self.assertIn('qsTr("（推荐）")', self.selection_combo_qml)
         self.assertIn("displayText: decoratedText(currentIndex, currentText)", self.selection_combo_qml)
-        self.assertEqual(self.buttons_qml.count("SelectionComboBox {"), 0)
+        self.assertEqual(self.buttons_qml.count("SelectionComboBox {"), 1)
+        self.assertIn(
+            "model: SettingsController.voiceProgramOptions",
+            self.buttons_qml,
+        )
 
     def test_log_location_has_one_formal_entry_point(self):
         self.assertNotIn("SettingsController.openLogLocation()", self.connection_qml)
@@ -3123,7 +3179,9 @@ class SettingsShellSourceContractTests(unittest.TestCase):
         self.assertIn("property int count: 13", self.buttons_qml)
         self.assertNotIn("ListView {", self.buttons_qml)
         self.assertIn('qsTr("不执行")', self.mapping_card_qml)
-        self.assertIn('text: qsTr("按住说话快捷键")', self.buttons_qml)
+        self.assertIn('text: qsTr("语音快捷键")', self.buttons_qml)
+        self.assertIn('objectName: "voiceProgramButton"', self.buttons_qml)
+        self.assertIn('objectName: "voiceProgramDialog"', self.buttons_qml)
         self.assertIn('qsTr("检测真实按键")', self.buttons_qml)
         self.assertIn('text: qsTr("保存映射")', self.buttons_qml)
 
