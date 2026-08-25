@@ -1177,6 +1177,46 @@ HID 注入权限顺序与稳定失败提交：
 - 当前只完成源码与自动检查。真实 RC003 首键、音量加减、话筒按住说话、UU 链路，
   以及普通权限 Codex 文字上屏仍为检查点待实测。
 
+### 2026-08-25 异机冻结资产缺失与无 tap 语音残留修复
+
+异机日志确认的两个独立根因：
+
+- 旧冻结包没有携带固定的 Frida Gadget。程序只能退回 Raw Input，无法完整覆盖
+  Windows 普通键盘路径缺失的返回和音量 usages，因此出现“桥接已启动但按键识别
+  不完整”。
+- HID tap 不可用时，同一次实体话筒按压可能先结束 ATVV 音频，再出现一个迟到的
+  Raw Input `hid` down，最后收到 legacy F5 up。旧实现只移除 `legacy_f5`，残留的
+  `hid` 会把手势永久保持为按下，阻止后续语音正确开始和收尾。
+
+修复范围：
+
+- `build-candidate.ps1` 与 Windows CI 在 PyInstaller 前强制获取并校验 Gadget；
+  PyInstaller spec 再按运行模块中的同一文件名和 SHA-256 复核，缺失或错误直接停止
+  冻结构建。源码运行仍可明确降级，不改变运行时提权边界。
+- legacy F5 up 在 HID tap 未激活、且只剩同一次按压的 Raw Input `hid` 来源时清理
+  该残留；直接 HID tap 正常可用时维持原仲裁逻辑。
+- 启动日志增加版本、源码/冻结模式和包目录；音频打开日志增加实际端点名称和
+  host API，便于下一轮异机日志直接确认运行包和播放路由。
+
+自动与产物验证：
+
+- 真实失败时序、启动身份日志、音频端点日志和冻结合同定向回归通过；公开边界扫描
+  364 个文件；完整 unittest 1240 项通过、7 项按平台或安全条件跳过。
+- Frida Gadget 与 VB-CABLE 固定资产校验、PyInstaller 构建和冻结 `--dry-run`
+  通过。本地测试目录为
+  `D:\Wuxianmai\RemoteMicRC003-0.1.0-localtest-20260825-audio-hid-fix1`，共 2073 个
+  文件、320,577,781 字节；EXE SHA-256 为
+  `0ED8002B7AD72A874D41E86C9E4628BD76AF76D8B1B806794B8FE79EA9690B88`。
+- ZIP 为
+  `D:\Wuxianmai\RemoteMicRC003-0.1.0-localtest-20260825-audio-hid-fix1-portable.zip`，
+  大小 126,969,267 字节，SHA-256 为
+  `C8CEFBDF258328B917E61DA905E6C1D0F5D8CDA5C0CBD6B1D7954C8FDA17C02E`。ZIP 只有
+  一个预期顶层目录，2073 个文件与本地测试目录零缺失、零新增、零内容差异；包内
+  Gadget SHA-256 为
+  `B566D70189B6D551AD8F4E0BEA24DE08A3D4C0F559BB35B2BDB67D45182240C2`。
+- 当前状态为检查点待实测。另一台电脑仍需重新验证 13 键逐键识别与映射，以及连续
+  10 轮按住说话的非零 PCM、端点日志、识别文字和松手释放。
+
 ## 记录纪律
 
 - 只有重要维护批次、公共合同变化、正式候选、发布或需要长期复用的故障结论才新增

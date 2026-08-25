@@ -233,6 +233,35 @@ class _AppWiringTestCase(unittest.TestCase):
         bindings[button_id] = key_mapping.voice_action_for_trigger_mode(mode).to_dict()
 
 
+class StartupIdentityLoggingTests(unittest.TestCase):
+    def test_frozen_startup_logs_version_runtime_and_package_directory(self):
+        logger = mock.Mock(spec=logging.Logger)
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                package_dir = Path(tmp) / "RemoteMicRC003-localtest"
+                executable = package_dir / "RemoteMicRC003.exe"
+                with mock.patch.object(
+                    logging_setup, "get_logger", return_value=logger
+                ), mock.patch.object(
+                    app_module.sys, "frozen", True, create=True
+                ), mock.patch.object(
+                    app_module.sys, "executable", str(executable)
+                ):
+                    _build_app(Path(tmp))
+        finally:
+            asyncio.set_event_loop(None)
+            loop.close()
+
+        logger.info.assert_any_call(
+            "startup: app identity: version=%s runtime=%s package=%s",
+            app_module.__version__,
+            "frozen",
+            package_dir.name,
+        )
+
+
 class LiveSettingsReloadTests(_AppWiringTestCase):
     def test_zero_voice_blank_shortcuts_construct_without_crashing(self):
         stored_config = config.default_config()
@@ -1326,6 +1355,62 @@ class VoiceMappingProductBoundaryTests(_AppWiringTestCase):
                 self.app._voice_mic_gesture_sources_down,
                 {"legacy_f5"},
             )
+
+            self.app._on_control_event(AudioStarted(session_id=2))
+
+        self.assertEqual(
+            calls,
+            [
+                ("down", voice_tokens),
+                ("up", voice_tokens),
+                ("down", voice_tokens),
+            ],
+        )
+        self.assertTrue(self.app._voice.active)
+        self.assertTrue(self.app._voice_pcm_forwarding_enabled)
+        self.assertTrue(self.app._voice_mic_gesture_audio_started)
+
+    def test_legacy_f5_release_clears_stale_raw_input_source_without_hid_tap(self):
+        voice_tokens = ("lctrl", "lalt", "f8")
+        self.app._voice_hotkey = app_module.hotkey.HotkeySpec.parse(
+            "+".join(voice_tokens)
+        )
+        self.app._refresh_legacy_voice_transform_snapshot_locked()
+        self.app._direct_hid_tap_active = False
+        calls = []
+        with mock.patch.object(
+            self.app,
+            "_voice_hotkey_text_for_mode",
+            return_value="+".join(voice_tokens),
+        ), mock.patch.object(
+            self.app,
+            "_open_playback_for_new_session",
+            return_value=True,
+        ), mock.patch.object(
+            win32_input,
+            "send_voice_key_combo_down",
+            side_effect=lambda tokens: calls.append(("down", tokens)),
+        ), mock.patch.object(
+            win32_input,
+            "send_voice_key_combo_up",
+            side_effect=lambda tokens: calls.append(("up", tokens)),
+        ):
+            self.app._on_control_event(AudioStarted(session_id=1))
+            self.app._on_button_event("mic", True, event_source="legacy_f5")
+            self.app._on_control_event(AudioStopped())
+
+            # This is the exact failing order from the remote-machine log:
+            # Raw Input reports one late mic down after audio stopped, then
+            # the authoritative legacy F5 release arrives with no HID up.
+            self.app._on_button_event("mic", True, event_source="hid")
+            self.assertEqual(
+                self.app._voice_mic_gesture_sources_down,
+                {"legacy_f5", "hid"},
+            )
+            self.app._on_button_event("mic", False, event_source="legacy_f5")
+
+            self.assertFalse(self.app._voice_mic_gesture_active)
+            self.assertEqual(self.app._voice_mic_gesture_sources_down, set())
 
             self.app._on_control_event(AudioStarted(session_id=2))
 
@@ -2843,6 +2928,47 @@ class PlaybackCleanupOwnershipTests(_AppWiringTestCase):
     stream, and clearing the reference would hide an incompletely closed
     resource and let a reconnect open a second sink over it.
     """
+
+    def test_open_success_logs_selected_endpoint_and_host_api(self):
+        class OpenSink:
+            owns_stream = False
+            ready = True
+            output_sample_rate_hz = 48000
+            output_channels = 2
+
+            def __init__(self, _name, _host_api):
+                pass
+
+            def open(self):
+                pass
+
+        self.app._playback = None
+        self.app._config["output_endpoint_name"] = "CABLE Input"
+        self.app._config["output_endpoint_host_api"] = "Windows WASAPI"
+        endpoint = app_module.audio_output.AudioEndpoint(
+            name="CABLE Input", host_api="Windows WASAPI"
+        )
+
+        with mock.patch.object(
+            app_module.audio_output,
+            "enumerate_output_endpoints",
+            return_value=[endpoint],
+        ), mock.patch.object(
+            app_module.audio_output,
+            "resolve_selected_endpoint",
+            return_value=endpoint,
+        ), mock.patch.object(
+            app_module.audio_playback,
+            "EndpointPlaybackSink",
+            OpenSink,
+        ), self.assertLogs(self.app._logger, level="INFO") as captured:
+            self.assertTrue(self.app._open_playback_for_new_session())
+
+        self.assertIn(
+            "voice playback opened: endpoint=CABLE Input "
+            "host_api=Windows WASAPI sample_rate=48000 channels=2",
+            "\n".join(captured.output),
+        )
 
     def test_cleanup_once_retains_playback_owner_on_close_failure(self):
         sink = _FakePlaybackSink(close_raises=True)

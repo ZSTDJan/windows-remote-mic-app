@@ -56,10 +56,13 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from pathlib import Path
+import sys
 import threading
 import time
 from typing import List, Optional, Tuple
 
+from . import __version__
 from . import (
     audio_output,
     audio_playback,
@@ -144,6 +147,18 @@ class RC003App:
             on_trigger=self._on_button_trigger,
         )
         self._logger: logging.Logger = logging_setup.get_logger(self._config_root)
+        runtime_kind = "frozen" if getattr(sys, "frozen", False) else "source"
+        package_name = (
+            Path(sys.executable).resolve().parent.name
+            if runtime_kind == "frozen"
+            else "source-tree"
+        )
+        self._logger.info(
+            "startup: app identity: version=%s runtime=%s package=%s",
+            __version__,
+            runtime_kind,
+            package_name,
+        )
         try:
             voice_program_result = (
                 voice_program_manager.launch_configured_at_bridge_start(self._config)
@@ -1467,6 +1482,21 @@ class RC003App:
                     if direct_hid_released:
                         self._voice_mic_gesture_direct_hid_released = True
                     self._voice_mic_gesture_sources_down.discard(event_source)
+                    if (
+                        event_source == "legacy_f5"
+                        and not self._direct_hid_tap_active
+                        and self._voice_mic_gesture_sources_down == {"hid"}
+                    ):
+                        # Raw Input can report one delayed mic down without a
+                        # matching up on machines where the direct HID tap is
+                        # unavailable. The legacy F5 up is the release edge
+                        # for the same physical button, so do not let that
+                        # duplicate source pin the completed gesture forever.
+                        self._voice_mic_gesture_sources_down.clear()
+                        self._logger.info(
+                            "voice stale Raw Input mic source cleared by legacy "
+                            "F5 release while HID tap is inactive"
+                        )
                     if direct_hid_released:
                         self._mark_legacy_f5_untrusted_if_stale_locked(
                             legacy_source_down=(
@@ -2139,7 +2169,9 @@ class RC003App:
             self._playback = sink
             sink.open()
             self._logger.info(
-                "voice playback opened: host_api=%s sample_rate=%s channels=%s",
+                "voice playback opened: endpoint=%s host_api=%s "
+                "sample_rate=%s channels=%s",
+                endpoint_name or "unspecified",
                 endpoint_host_api or "unspecified",
                 sink.output_sample_rate_hz,
                 sink.output_channels,

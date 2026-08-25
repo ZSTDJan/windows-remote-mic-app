@@ -11,9 +11,10 @@
     no GUI/BLE/HID/audio, exits 0) so a broken build is caught here rather
     than only discovered on a real machine.
 
-    Does NOT fetch Frida Gadget, does NOT request elevation, and does NOT
-    sign the resulting binary. The optional VB-CABLE helper is downloaded
-    only by the explicit, hash-pinned fetch step below.
+    Fetches and hash-verifies the pinned Frida Gadget and VB-CABLE helper
+    before freezing so a complete RC003 build cannot silently lose the HID
+    path required for Back and volume buttons. It does NOT request elevation
+    and does NOT sign the resulting binary.
 
     Exit-code gating (XRBM-014 review RETRY P2 #3): PowerShell's
     ``$ErrorActionPreference = "Stop"`` only turns PowerShell-cmdlet errors
@@ -71,6 +72,10 @@ try {
     Write-Host "-- fetch + verify VB-CABLE driver pack --"
     & powershell -ExecutionPolicy Bypass -File (Join-Path "build" "fetch-vb-cable.ps1")
     Assert-LastExitCode "fetch-vb-cable.ps1"
+
+    Write-Host "-- fetch + verify Frida Gadget --"
+    & powershell -ExecutionPolicy Bypass -File (Join-Path "build" "fetch-frida-gadget.ps1")
+    Assert-LastExitCode "fetch-frida-gadget.ps1"
 
     Write-Host "-- test suite --"
     $env:PYTHONPATH = Join-Path $RC003Root "src"

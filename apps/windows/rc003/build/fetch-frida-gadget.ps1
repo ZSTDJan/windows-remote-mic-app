@@ -1,19 +1,19 @@
 #requires -Version 5.1
 <#
 .SYNOPSIS
-    Optionally fetches the official Frida Gadget release asset and verifies
-    its SHA-256 before use. This is the only fetch path for Frida Gadget,
-    and it never runs automatically as part
-    of a normal build - the build (see build-candidate.ps1) proceeds without
-    it and the optional RC003 HID report tap stays disabled (see
-    ovb_rc003.frida_compat.RC003HidReportTap).
+    Fetches the official Frida Gadget release asset and verifies its SHA-256
+    before a complete frozen build. This is the only fetch path for Frida
+    Gadget. build-candidate.ps1 and Windows CI require it so a distributable
+    RC003 package cannot silently lose Back and volume-button support.
 
-    No Frida binary is bundled in source control. VB-CABLE has a separate,
-    hash-pinned required candidate-build fetch step; neither fetch script
-    installs a driver or runs automatically when the application starts.
+    No Frida binary is bundled in source control. Source-only execution may
+    still omit the asset and degrade explicitly; frozen build entry points
+    fail closed when it is missing or hash-mismatched. VB-CABLE has a separate
+    hash-pinned fetch step. Neither script installs a driver or runs when the
+    application starts.
 
 .PARAMETER Destination
-    Where to place the verified asset. Defaults to the optional runtime asset
+    Where to place the verified asset. Defaults to the ignored runtime asset
     directory under src/ovb_rc003 (not committed - see .gitignore).
 #>
 
@@ -91,7 +91,7 @@ Get-VerifiedAsset -Name $AssetName -Url $AssetUrl -Destination $Destination -Exp
 
 Write-Host ""
 Write-Host "Frida Gadget license: see https://raw.githubusercontent.com/frida/frida-core/main/COPYING"
-Write-Host "This asset is optional. When present, RC003HidReportTap can inject into"
+Write-Host "Complete frozen builds require this asset. RC003HidReportTap can inject into"
 Write-Host "the paired RC003 WUDF host only when the bridge already has administrator"
 Write-Host "rights; the application does not request UAC elevation for the tap. It recovers"
 Write-Host "back and volume HID usages that Windows Raw Input drops."

@@ -3,9 +3,10 @@
 # One-dir build (COLLECT), matching the layout pattern this project's
 # upstream reference uses for its own standalone products, minus everything
 # out of scope for this candidate: no other-device (T1/V60) code, and no
-# licensing/DRM modules (none exist in this tree to begin with). The optional,
-# hash-verified Frida archive is bundled only when the explicit fetch step
-# placed it in the source tree; it is never downloaded by this spec.
+# licensing/DRM modules (none exist in this tree to begin with). The pinned,
+# hash-verified Frida archive is required for every frozen build so a package
+# cannot silently lose the HID path for Back and volume buttons. The explicit
+# fetch step supplies it; this spec verifies it again and never downloads it.
 #
 # Build with (inside a Windows virtual environment with requirements-dev.txt
 # installed):
@@ -34,6 +35,28 @@ DEVICE_PROFILES_DIR = REPO_ROOT / "device-profiles"
 # offline on the end-user machine.
 VB_CABLE_BUNDLE_ZIP = RC003_ROOT / "build" / "third_party" / "VBCABLE_Driver_Pack45.zip"
 FRIDA_ASSET_DIR = SRC_ROOT / "ovb_rc003" / "frida_assets"
+
+# Import only the stdlib-only pin/runtime helper so the build contract has one
+# authoritative filename and SHA-256. Source execution may omit the asset, but
+# every frozen build must contain the exact pinned archive.
+sys.path.insert(0, str(SRC_ROOT))
+from ovb_rc003 import frida_hid_tap_runtime  # noqa: E402
+
+FRIDA_GADGET_ARCHIVE = (
+    FRIDA_ASSET_DIR / frida_hid_tap_runtime.GADGET_ARCHIVE_NAME
+)
+if not FRIDA_GADGET_ARCHIVE.is_file():
+    raise SystemExit(
+        "required verified Frida Gadget archive is missing; run "
+        "build/fetch-frida-gadget.ps1 before PyInstaller"
+    )
+frida_archive_hash = frida_hid_tap_runtime.sha256_file(FRIDA_GADGET_ARCHIVE)
+if frida_archive_hash != frida_hid_tap_runtime.GADGET_ARCHIVE_SHA256:
+    raise SystemExit(
+        "Frida Gadget archive SHA-256 mismatch: "
+        f"expected {frida_hid_tap_runtime.GADGET_ARCHIVE_SHA256}, "
+        f"got {frida_archive_hash}"
+    )
 
 datas = []
 if REMOTE_PHOTO.is_file():
@@ -73,10 +96,7 @@ if VB_CABLE_BUNDLE_ZIP.is_file():
     # this spec ever runs for a real candidate build; this spec itself stays
     # defensive/optional, matching the existing photo/qml pattern above.
     datas.append((str(VB_CABLE_BUNDLE_ZIP), "vb_cable_bundle"))
-for frida_asset in FRIDA_ASSET_DIR.glob("*.xz"):
-    # Runtime verifies the archive again before extracting it into the locked
-    # ProgramData directory. This remains optional for source-only builds.
-    datas.append((str(frida_asset), "ovb_rc003/frida_assets"))
+datas.append((str(FRIDA_GADGET_ARCHIVE), "ovb_rc003/frida_assets"))
 
 hiddenimports = [
     "ovb_rc003.app",

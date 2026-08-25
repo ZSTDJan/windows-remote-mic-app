@@ -195,14 +195,17 @@ class PyInstallerSpecTests(unittest.TestCase):
         self.assertIn("bridges.t1", text)
         self.assertIn("bridges.hanvon", text)
 
-    def test_spec_collects_only_an_optional_verified_frida_archive(self):
-        # The archive is never stored in source control. When the explicit
-        # fetch step supplies a .xz file, the spec may copy it as opaque data;
-        # it must not hard-code a release filename or treat it as a linked
-        # binary dependency.
+    def test_spec_requires_and_reverifies_the_pinned_frida_archive(self):
+        # The archive is never stored in source control, but every frozen
+        # build must fail closed unless the explicit fetch step supplied the
+        # runtime module's exact pinned filename and hash.
         text = _strip_hash_comments(_SPEC_PATH.read_text(encoding="utf-8")).lower()
         self.assertIn("frida_assets", text)
-        self.assertIn('glob("*.xz")', text)
+        self.assertIn("gadget_archive_name", text)
+        self.assertIn("gadget_archive_sha256", text)
+        self.assertIn("sha256_file", text)
+        self.assertIn("raise systemexit", text)
+        self.assertNotIn('glob("*.xz")', text)
         self.assertNotIn("frida-gadget-17.15.3-windows-x86_64.dll.xz", text)
 
     def test_spec_bundles_the_verified_vb_cable_zip_as_data_not_a_binary_dependency(self):
@@ -934,6 +937,19 @@ class WindowsCiWorkflowTests(unittest.TestCase):
         pyinstaller_index = self.text.index("PyInstaller build (unsigned candidate)")
         self.assertLess(fetch_index, pyinstaller_index)
 
+    def test_fetches_and_verifies_frida_before_pyinstaller_build(self):
+        self.assertIn("fetch-frida-gadget.ps1", self.text)
+        fetch_index = self.text.index("fetch-frida-gadget.ps1")
+        pyinstaller_index = self.text.index("PyInstaller build (unsigned candidate)")
+        self.assertLess(fetch_index, pyinstaller_index)
+
+    def test_frida_fetch_step_is_a_required_gate_not_best_effort(self):
+        step_start = self.text.index("- name: Fetch and verify Frida Gadget")
+        next_step_start = self.text.index("- name:", step_start + 1)
+        step_text = self.text[step_start:next_step_start]
+        self.assertNotIn("continue-on-error", step_text)
+        self.assertIn("$LASTEXITCODE", step_text)
+
     def test_vb_cable_fetch_step_is_a_required_gate_not_best_effort(self):
         step_start = self.text.index("- name: Fetch and verify VB-CABLE driver pack")
         next_step_start = self.text.index("- name:", step_start + 1)
@@ -960,6 +976,16 @@ class BuildCandidateScriptTests(unittest.TestCase):
         pyinstaller_index = self.text.index("PyInstaller build (unsigned candidate)")
         self.assertLess(fetch_index, pyinstaller_index)
         assert_index = self.text.index('Assert-LastExitCode "fetch-vb-cable.ps1"')
+        self.assertGreater(assert_index, fetch_index)
+
+    def test_fetches_and_verifies_frida_before_pyinstaller_build(self):
+        self.assertIn("fetch-frida-gadget.ps1", self.text)
+        fetch_index = self.text.index("fetch-frida-gadget.ps1")
+        pyinstaller_index = self.text.index("PyInstaller build (unsigned candidate)")
+        self.assertLess(fetch_index, pyinstaller_index)
+        assert_index = self.text.index(
+            'Assert-LastExitCode "fetch-frida-gadget.ps1"'
+        )
         self.assertGreater(assert_index, fetch_index)
 
 

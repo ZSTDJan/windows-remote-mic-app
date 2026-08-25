@@ -8,8 +8,9 @@
 > 将正式语音能力收敛为“实体话筒键按住说话”；开关型语音和其他按键上的旧语音
 > 配置会整键停用，等待用户重新选择并保存。最新时序、重连、休眠和长期运行仍
 > 需要当前候选真机复测。
-> 当前产物未签名，也不会自动安装虚拟音频驱动。Frida Gadget 与 VB-CABLE 均为
-> 可选第三方组件，需要显式获取/安装（见下文）。
+> 当前产物未签名，也不会自动安装虚拟音频驱动。完整冻结包会带入固定版本、固定
+> 哈希的 Frida Gadget，但 HID tap 仍只在桥接进程已有管理员权限时可用；VB-CABLE
+> 仍是需要用户明确安装的可选第三方组件（见下文）。
 
 这是本仓库独立维护的 Windows RC003 客户端，面向小米蓝牙遥控器 2 Pro / RC003，
 提供按键映射和 ATVV
@@ -387,10 +388,12 @@ $env:PYTHONPATH = Join-Path (Get-Location) 'src'
 ```
 
 该脚本会把固定版本、固定 SHA-256 的压缩资产放到被 `.gitignore` 忽略的
-`src\ovb_rc003\frida_assets`；PyInstaller 只在该文件存在时把它带入候选产物。
-运行桥接时 tap 会验证资产，定位 RC003 的 WUDFHost，并只在当前进程已有管理员权限时
-尝试注入；普通启动不会弹出提权提示，权限不足只会让 tap 不可用，不会阻止 BLE、普通
-按键或语音链路启动。需要 tap 时可在管理员 PowerShell 中启动：
+`src\ovb_rc003\frida_assets`。源码运行可以不获取该资产并明确降级；
+`build-candidate.ps1`、Windows CI 和 PyInstaller 冻结入口都会要求并再次校验它，
+缺失或哈希不符时直接停止构建，避免分发一个返回键、音量键识别不完整的程序包。
+运行桥接时 tap 还会再次验证资产，定位 RC003 的 WUDFHost，并只在当前进程已有管理员
+权限时尝试注入；普通启动不会弹出提权提示，权限不足只会让 tap 不可用，不会阻止 BLE、
+Raw Input 可见按键或语音链路启动。需要 tap 时可在管理员 PowerShell 中启动：
 
 ```powershell
 $root = (Get-Location).Path
@@ -401,8 +404,8 @@ Start-Process -Verb RunAs -FilePath (Join-Path $root '.venv\Scripts\python.exe')
 本地 `build\build-candidate.ps1` 会先执行公开边界检查和完整测试，再构建
 `dist\RemoteMicRC003` PyInstaller 目录并检查冻结入口；它不会自行生成 ZIP、
 Inno Setup 安装器或 `SHA256SUMS.txt`。完整发布封装由 Windows CI 工作流完成，
-安装器编译需要可用的 Inno Setup。VB-CABLE 官方压缩包只通过固定哈希的显式
-获取步骤下载，程序不会在运行时静默下载驱动。
+安装器编译需要可用的 Inno Setup。构建脚本会通过固定哈希的独立步骤获取
+Frida Gadget 和 VB-CABLE 官方压缩包；程序运行时不会静默下载二进制或驱动。
 
 该脚本成功后，公开边界、完整测试和同一构建 EXE 的 `--dry-run` 已经完成；同一源码、
 依赖、构建输入和产物状态下，不要在脚本外机械重跑。下面的独立命令用于尚未运行
@@ -486,9 +489,9 @@ Windows GitHub Actions 工作流位于 `.github/workflows/windows-rc003-ci.yml`�
 ## 已知限制
 
 - 当前版本未签名，首次运行可能触发 SmartScreen 提示，属预期行为。
-- Frida Gadget 是可选的第三方二进制；没有执行显式获取脚本时，缺失 usages
-  不会被猜测或伪造。执行脚本、从管理员终端启动后，还必须在日志中看到 tap ready 和
-  真实按键边沿。
+- 完整冻结包包含经过固定哈希校验的 Frida Gadget；源码运行未执行获取脚本时，
+  缺失 usages 不会被猜测或伪造。即使资产存在，也必须从管理员终端启动，并在日志中
+  看到 tap ready 和真实按键边沿后，才能确认返回键、音量键的 HID 旁路可用。
 - VB-CABLE 是可选的语音路由方案；未安装时语音默认没有虚拟麦克风路由，需要
   用户自行配置输出端点。当前播放实现不支持 `Windows WDM-KS`，应使用
   `Windows WASAPI`，必要时回退 `Windows DirectSound`。
