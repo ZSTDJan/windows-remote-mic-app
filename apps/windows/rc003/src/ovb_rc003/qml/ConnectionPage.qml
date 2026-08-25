@@ -277,6 +277,54 @@ Item {
 
                             UiLabel { tokens: root.tokens; kind: sectionTitleKind; text: qsTr("后台桥接") }
                             RowLayout {
+                                id: bridgeLaunchProgress
+                                objectName: "bridgeLaunchProgress"
+                                Layout.fillWidth: true
+                                spacing: 7
+
+                                BusyIndicator {
+                                    id: bridgeLaunchBusyIndicator
+                                    objectName: "bridgeLaunchBusyIndicator"
+                                    Layout.preferredWidth: 18
+                                    Layout.preferredHeight: 18
+                                    visible: running
+                                    running: SettingsController.bridgeLaunchPhase === "saving"
+                                        || SettingsController.bridgeLaunchPhase === "starting"
+                                        || SettingsController.bridgeLaunchPhase === "waiting"
+                                }
+                                UiLabel {
+                                    id: bridgeLaunchStageText
+                                    objectName: "bridgeLaunchStageText"
+                                    tokens: root.tokens
+                                    kind: noteKind
+                                    Layout.fillWidth: true
+                                    text: SettingsController.bridgeLaunchPhase === "saving"
+                                        ? qsTr("保存设置… → 启动桥接 → 等待设备连接")
+                                        : SettingsController.bridgeLaunchPhase === "starting"
+                                            ? qsTr("保存设置 ✓ → 启动桥接… → 等待设备连接")
+                                            : SettingsController.bridgeLaunchPhase === "waiting"
+                                                ? qsTr("保存设置 ✓ → 桥接进程已启动 ✓ → 等待 RC003 连接…")
+                                                : SettingsController.bridgeLaunchPhase === "connected"
+                                                    ? qsTr("保存设置 ✓ → 桥接进程已启动 ✓ → RC003 已连接 ✓")
+                                                    : SettingsController.bridgeLaunchPhase === "failed"
+                                                        ? qsTr("保存或启动未完成；RC003 未连接")
+                                                        : SettingsController.bridgeLaunchPhase === "unknown"
+                                                            ? qsTr("桥接状态暂时无法确认")
+                                                            : qsTr("保存设置 → 启动桥接 → 等待设备连接")
+                                    elide: Text.ElideRight
+                                }
+                                UiLabel {
+                                    id: bridgeLaunchElapsedText
+                                    objectName: "bridgeLaunchElapsedText"
+                                    tokens: root.tokens
+                                    kind: noteKind
+                                    visible: bridgeLaunchBusyIndicator.running
+                                    text: qsTr("已等待 %1 秒").arg(
+                                        SettingsController.bridgeLaunchElapsedSeconds
+                                    )
+                                }
+                            }
+                            RowLayout {
                                 Layout.fillWidth: true
                                 spacing: 7
                                 Rectangle {
@@ -337,8 +385,10 @@ Item {
                                     tokens: root.tokens
                                     visible: SettingsController.isRc003Device
                                     compactMinimumWidth: 116
-                                    text: qsTr("保存并启动桥接")
+                                    text: SettingsController.bridgeLaunchBusy
+                                        ? qsTr("正在启动桥接") : qsTr("保存并启动桥接")
                                     highlighted: true
+                                    enabled: !SettingsController.bridgeLaunchBusy
                                     onClicked: SettingsController.saveAndLaunch()
                                 }
                             }

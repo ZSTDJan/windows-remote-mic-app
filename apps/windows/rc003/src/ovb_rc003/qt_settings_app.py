@@ -106,6 +106,7 @@ from . import (
     audio_playback,
     audio_output,
     bridge_launcher,
+    bridge_runtime_status,
     config,
     device_catalog,
     frida_compat,
@@ -419,6 +420,7 @@ def _load_qt_classes() -> dict:
             QByteArray,
             QModelIndex,
             QObject,
+            QTimer,
             Qt,
             QUrl,
             Signal,
@@ -549,13 +551,21 @@ def _load_qt_classes() -> dict:
             display_map: Dict[str, str],
             secondary_display_map: Optional[Dict[str, Dict[str, str]]] = None,
         ) -> None:
-            """Reset every row from the supplied primary/secondary maps."""
+            """Apply persisted values without rebuilding QML delegates.
 
-            self.beginResetModel()
-            for button_id in self._button_ids:
-                self._action_text[button_id] = display_map.get(button_id, "")
+            The row identity/order never changes. Emitting only the roles
+            whose text changed keeps cards, photo hotspots, selected state,
+            and connector canvases alive across a save/reload.
+            """
+
+            for row, button_id in enumerate(self._button_ids):
+                changed_roles = []
+                primary_text = display_map.get(button_id, "")
+                if primary_text != self._action_text[button_id]:
+                    self._action_text[button_id] = primary_text
+                    changed_roles.append(self.ActionTextRole)
                 trigger_map = (secondary_display_map or {}).get(button_id, {})
-                self._secondary_action_text[button_id] = {
+                next_secondary = {
                     key_mapping.ButtonTrigger.DOUBLE_CLICK.value: trigger_map.get(
                         key_mapping.ButtonTrigger.DOUBLE_CLICK.value,
                         settings_ui.SECONDARY_UNCONFIGURED_DISPLAY,
@@ -565,7 +575,21 @@ def _load_qt_classes() -> dict:
                         settings_ui.SECONDARY_UNCONFIGURED_DISPLAY,
                     ),
                 }
-            self.endResetModel()
+                current_secondary = self._secondary_action_text[button_id]
+                if (
+                    next_secondary[key_mapping.ButtonTrigger.DOUBLE_CLICK.value]
+                    != current_secondary[key_mapping.ButtonTrigger.DOUBLE_CLICK.value]
+                ):
+                    changed_roles.append(self.DoubleClickTextRole)
+                if (
+                    next_secondary[key_mapping.ButtonTrigger.LONG_PRESS.value]
+                    != current_secondary[key_mapping.ButtonTrigger.LONG_PRESS.value]
+                ):
+                    changed_roles.append(self.LongPressTextRole)
+                self._secondary_action_text[button_id] = next_secondary
+                if changed_roles:
+                    model_index = self.index(row, 0)
+                    self.dataChanged.emit(model_index, model_index, changed_roles)
 
         def to_display_map(self) -> Dict[str, str]:
             """Inverse of load_display_map() for build_save_model()."""
@@ -657,6 +681,9 @@ def _load_qt_classes() -> dict:
         recommendedEndpointIndexChanged = Signal()
         selectedEndpointIndexChanged = Signal()
         bridgeRunningChanged = Signal()
+        bridgeConnectedChanged = Signal()
+        bridgeLaunchPhaseChanged = Signal()
+        bridgeLaunchElapsedSecondsChanged = Signal()
         launchStatusTextChanged = Signal()
         statusMessageChanged = Signal()
         errorMessageChanged = Signal()
@@ -722,13 +749,47 @@ def _load_qt_classes() -> dict:
                 single_instance.SingleInstanceUnavailableError,
                 single_instance.MutexCleanupError,
             ):
+                bridge_status_known = False
                 self._bridge_running = False
                 self._launch_status_text = settings_ui.LAUNCH_STATUS_UNKNOWN_TEXT
             else:
+                bridge_status_known = True
                 self._launch_status_text = (
                     settings_ui.LAUNCH_ALREADY_RUNNING_TEXT
                     if self._bridge_running
                     else settings_ui.LAUNCH_NOT_STARTED_TEXT
+                )
+            runtime_status = (
+                bridge_runtime_status.read_status(self._config_root)
+                if self._bridge_running
+                else None
+            )
+            self._bridge_connected = bool(
+                runtime_status is not None
+                and runtime_status.state
+                is bridge_runtime_status.BridgeConnectionState.CONNECTED
+            )
+            self._bridge_launch_phase = (
+                "connected"
+                if self._bridge_connected
+                else "waiting"
+                if self._bridge_running
+                else "idle"
+                if bridge_status_known
+                else "unknown"
+            )
+            self._bridge_launch_started_at: Optional[float] = None
+            self._bridge_launch_elapsed_seconds = 0
+            self._pending_bridge_launch: Optional[
+                bridge_launcher.PendingBridgeLaunch
+            ] = None
+            if self._bridge_connected:
+                self._launch_status_text = "桥接进程已启动；RC003 已连接。"
+            elif self._bridge_running:
+                self._launch_status_text = (
+                    "桥接进程已启动；正在等待 RC003 连接。"
+                    if runtime_status is not None
+                    else "桥接进程已启动；RC003 连接状态暂时未知，正在继续检查。"
                 )
             self._has_explicit_launch_result = False
             self._status_message = ""
@@ -937,7 +998,84 @@ def _load_qt_classes() -> dict:
             self._bridge_running = value
             self.bridgeRunningChanged.emit()
 
+        def _set_bridge_connected(self, value: bool) -> None:
+            value = bool(value)
+            if value == self._bridge_connected:
+                return
+            self._bridge_connected = value
+            self.bridgeConnectedChanged.emit()
+
+        def _set_bridge_launch_phase(self, value: str) -> None:
+            if value == self._bridge_launch_phase:
+                return
+            self._bridge_launch_phase = value
+            self.bridgeLaunchPhaseChanged.emit()
+
+        def _refresh_bridge_launch_elapsed(self) -> None:
+            elapsed = (
+                0
+                if self._bridge_launch_started_at is None
+                else max(0, int(time.monotonic() - self._bridge_launch_started_at))
+            )
+            if elapsed == self._bridge_launch_elapsed_seconds:
+                return
+            self._bridge_launch_elapsed_seconds = elapsed
+            self.bridgeLaunchElapsedSecondsChanged.emit()
+
+        def _sync_bridge_connection_status(self, running: bool) -> None:
+            if self._get_bridge_launch_busy():
+                return
+            runtime_status = (
+                bridge_runtime_status.read_status(self._config_root)
+                if running
+                else None
+            )
+            connected = bool(
+                runtime_status is not None
+                and runtime_status.state
+                is bridge_runtime_status.BridgeConnectionState.CONNECTED
+            )
+            self._set_bridge_connected(connected)
+            if running:
+                if connected:
+                    self._set_bridge_launch_phase("connected")
+                    self._set_launch_status("桥接进程已启动；RC003 已连接。")
+                else:
+                    self._set_bridge_launch_phase("waiting")
+                    if self._has_explicit_launch_result:
+                        self._set_launch_status(
+                            "桥接进程已启动；正在等待 RC003 连接，首次连接可能约一分钟。"
+                        )
+                    elif runtime_status is None:
+                        self._set_launch_status(
+                            "桥接进程已启动；RC003 连接状态暂时未知，正在继续检查。"
+                        )
+                    else:
+                        self._set_launch_status(
+                            "桥接进程已启动；正在等待 RC003 连接。"
+                        )
+                return
+
+            previous_phase = self._bridge_launch_phase
+            if (
+                self._has_explicit_launch_result
+                and previous_phase in {"waiting", "connected"}
+            ):
+                self._set_bridge_launch_phase("failed")
+                self._set_launch_status(
+                    "桥接进程已经退出；RC003 当前未连接。请查看 app.log 确认原因。"
+                )
+            elif self._has_explicit_launch_result and previous_phase in {
+                "failed",
+                "unknown",
+            }:
+                return
+            elif not self._has_explicit_launch_result:
+                self._set_bridge_launch_phase("idle")
+                self._set_launch_status(settings_ui.LAUNCH_NOT_STARTED_TEXT)
+
         def _refresh_bridge_status(self) -> bool | None:
+            self._refresh_bridge_launch_elapsed()
             try:
                 running = single_instance.bridge_instance_running()
             except (
@@ -945,17 +1083,19 @@ def _load_qt_classes() -> dict:
                 single_instance.MutexCleanupError,
             ):
                 self._set_bridge_running(False)
-                if not self._has_explicit_launch_result:
+                self._set_bridge_connected(False)
+                if (
+                    self._has_explicit_launch_result
+                    and self._bridge_launch_phase == "failed"
+                ):
+                    return None
+                if not self._get_bridge_launch_busy():
+                    self._set_bridge_launch_phase("unknown")
                     self._set_launch_status(settings_ui.LAUNCH_STATUS_UNKNOWN_TEXT)
                 return None
 
             self._set_bridge_running(running)
-            if not self._has_explicit_launch_result:
-                self._set_launch_status(
-                    settings_ui.LAUNCH_ALREADY_RUNNING_TEXT
-                    if running
-                    else settings_ui.LAUNCH_NOT_STARTED_TEXT
-                )
+            self._sync_bridge_connection_status(running)
             return running
 
         def _set_status_message(self, text: str) -> None:
@@ -1406,6 +1546,42 @@ def _load_qt_classes() -> dict:
             notify=bridgeRunningChanged,
         )
 
+        def _get_bridge_connected(self) -> bool:
+            return self._bridge_connected
+
+        bridgeConnected = Property(
+            bool,
+            _get_bridge_connected,
+            notify=bridgeConnectedChanged,
+        )
+
+        def _get_bridge_launch_phase(self) -> str:
+            return self._bridge_launch_phase
+
+        bridgeLaunchPhase = Property(
+            str,
+            _get_bridge_launch_phase,
+            notify=bridgeLaunchPhaseChanged,
+        )
+
+        def _get_bridge_launch_busy(self) -> bool:
+            return self._bridge_launch_phase in {"saving", "starting"}
+
+        bridgeLaunchBusy = Property(
+            bool,
+            _get_bridge_launch_busy,
+            notify=bridgeLaunchPhaseChanged,
+        )
+
+        def _get_bridge_launch_elapsed_seconds(self) -> int:
+            return self._bridge_launch_elapsed_seconds
+
+        bridgeLaunchElapsedSeconds = Property(
+            int,
+            _get_bridge_launch_elapsed_seconds,
+            notify=bridgeLaunchElapsedSecondsChanged,
+        )
+
         def _get_launch_status_text(self) -> str:
             return self._launch_status_text
 
@@ -1846,31 +2022,83 @@ def _load_qt_classes() -> dict:
 
         @Slot()
         def saveAndLaunch(self) -> None:
-            """Saves first (using the exact same validation as
-            "仅保存设置"), and only launches the bridge if that save
-            actually succeeded - a rejected mapping/hotkey must never be
-            silently followed by starting the bridge with stale config
-            anyway (unchanged XRBM-029 contract, now driven from QML).
-            """
+            """Start the staged save/launch flow without blocking Qt."""
 
-            if not self._save():
+            if self._get_bridge_launch_busy():
                 return
             self._has_explicit_launch_result = True
+            self._bridge_launch_started_at = time.monotonic()
+            if self._bridge_launch_elapsed_seconds != 0:
+                self._bridge_launch_elapsed_seconds = 0
+                self.bridgeLaunchElapsedSecondsChanged.emit()
+            self._set_bridge_launch_phase("saving")
+            self._set_bridge_connected(False)
+            self._set_launch_status("正在保存设置…")
+            QTimer.singleShot(0, self._continue_save_and_launch)
+
+        def _continue_save_and_launch(self) -> None:
+            if self._bridge_launch_phase != "saving":
+                return
+            if not self._save():
+                self._set_bridge_launch_phase("failed")
+                self._set_launch_status("保存未完成，未启动桥接。")
+                return
             if self._selected_device_id() == device_catalog.DJI_MIC_2_ID:
+                self._set_bridge_launch_phase("idle")
                 self._set_launch_status(
                     "DJI Mic 2 使用 Windows 系统录音输入，不启动 RC003 BLE/HID/ATVV 桥。"
                 )
                 return
-            self._set_launch_status("正在启动…")
-            result = bridge_launcher.launch_bridge()
-            self._set_bridge_running(
-                result.outcome
-                in {
-                    bridge_launcher.LaunchOutcome.STARTED,
-                    bridge_launcher.LaunchOutcome.ALREADY_RUNNING,
-                }
+            self._set_bridge_launch_phase("starting")
+            self._set_launch_status("设置已保存；正在启动桥接进程…")
+            try:
+                attempt = bridge_launcher.start_bridge_launch()
+            except bridge_launcher.BridgeLaunchConfigurationError as exc:
+                self._finish_bridge_launch(
+                    bridge_launcher.LaunchResult(
+                        outcome=bridge_launcher.LaunchOutcome.LAUNCH_FAILED,
+                        command=(),
+                        error=type(exc).__name__,
+                    )
+                )
+                return
+            if isinstance(attempt, bridge_launcher.LaunchResult):
+                self._finish_bridge_launch(attempt)
+                return
+            self._pending_bridge_launch = attempt
+
+        def _finish_bridge_launch(
+            self,
+            result: bridge_launcher.LaunchResult,
+        ) -> None:
+            self._pending_bridge_launch = None
+            self._refresh_bridge_launch_elapsed()
+            if result.outcome in {
+                bridge_launcher.LaunchOutcome.STARTED,
+                bridge_launcher.LaunchOutcome.ALREADY_RUNNING,
+            }:
+                self._set_bridge_running(True)
+                self._set_bridge_launch_phase("waiting")
+                self._sync_bridge_connection_status(True)
+                return
+            self._set_bridge_running(False)
+            self._set_bridge_connected(False)
+            self._set_bridge_launch_phase(
+                "unknown"
+                if result.outcome is bridge_launcher.LaunchOutcome.STATUS_UNKNOWN
+                else "failed"
             )
             self._set_launch_status(settings_ui.describe_launch_result(result))
+
+        @Slot()
+        def pollBridgeLaunch(self) -> None:
+            self._refresh_bridge_launch_elapsed()
+            pending = self._pending_bridge_launch
+            if pending is None:
+                return
+            result = bridge_launcher.poll_bridge_launch(pending)
+            if result is not None:
+                self._finish_bridge_launch(result)
 
         @Slot()
         def restoreDefaults(self) -> None:

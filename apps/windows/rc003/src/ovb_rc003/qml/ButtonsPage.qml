@@ -17,6 +17,22 @@ Item {
         38,
         Math.min(45, (mappingList.height - mappingCardGap * 6) / 7)
     )
+    property bool connectorRepaintQueued: false
+
+    function scheduleConnectorRepaint() {
+        if (connectorRepaintQueued)
+            return
+        connectorRepaintQueued = true
+        Qt.callLater(function() {
+            connectorRepaintQueued = false
+            mappingLines.requestPaint()
+            for (let i = 0; i < photoHotspotRepeater.count; i++) {
+                const hotspot = photoHotspotRepeater.itemAt(i)
+                if (hotspot)
+                    hotspot.requestConnectorPaint()
+            }
+        })
+    }
 
     function isLeftButton(buttonId) {
         return leftButtonIds.indexOf(buttonId) >= 0
@@ -699,6 +715,10 @@ Item {
                 property int currentIndex: ButtonMappingModel.indexOfButton(
                     SettingsController.selectedButtonId
                 )
+                onXChanged: root.scheduleConnectorRepaint()
+                onYChanged: root.scheduleConnectorRepaint()
+                onWidthChanged: root.scheduleConnectorRepaint()
+                onHeightChanged: root.scheduleConnectorRepaint()
 
                 Canvas {
                     id: mappingLines
@@ -741,13 +761,13 @@ Item {
                         }
                     }
 
-                    onWidthChanged: requestPaint()
-                    onHeightChanged: requestPaint()
+                    onWidthChanged: root.scheduleConnectorRepaint()
+                    onHeightChanged: root.scheduleConnectorRepaint()
 
                     Connections {
                         target: SettingsController
                         function onSelectedButtonIdChanged() {
-                            mappingLines.requestPaint()
+                            root.scheduleConnectorRepaint()
                         }
                     }
                 }
@@ -762,11 +782,16 @@ Item {
                     rows: 6
                     rowSpacing: root.mappingCardGap
                     z: 1
+                    onXChanged: root.scheduleConnectorRepaint()
+                    onYChanged: root.scheduleConnectorRepaint()
+                    onWidthChanged: root.scheduleConnectorRepaint()
+                    onHeightChanged: root.scheduleConnectorRepaint()
 
                     Repeater {
                         id: leftCardRepeater
                         model: ButtonMappingModel
-                        onItemAdded: mappingLines.requestPaint()
+                        onItemAdded: root.scheduleConnectorRepaint()
+                        onItemRemoved: root.scheduleConnectorRepaint()
                         delegate: MappingCard {
                             required property int index
                             required property string buttonId
@@ -790,6 +815,11 @@ Item {
                             selected: isSelected
                             voiceAction: actionText.trim() === "按住说话"
                                 || actionText.indexOf("已停用：旧语音配置") === 0
+                            onXChanged: root.scheduleConnectorRepaint()
+                            onYChanged: root.scheduleConnectorRepaint()
+                            onWidthChanged: root.scheduleConnectorRepaint()
+                            onHeightChanged: root.scheduleConnectorRepaint()
+                            onVisibleChanged: root.scheduleConnectorRepaint()
                             onClicked: {
                                 SettingsController.selectButton(buttonId)
                                 actionEditor.openForRow(
@@ -809,6 +839,10 @@ Item {
                     width: 86
                     height: 230
                     z: 1
+                    onXChanged: root.scheduleConnectorRepaint()
+                    onYChanged: root.scheduleConnectorRepaint()
+                    onWidthChanged: root.scheduleConnectorRepaint()
+                    onHeightChanged: root.scheduleConnectorRepaint()
 
                     Item {
                         id: photoFrame
@@ -818,6 +852,10 @@ Item {
                         width: 86
                         height: 210
                         clip: true
+                        onXChanged: root.scheduleConnectorRepaint()
+                        onYChanged: root.scheduleConnectorRepaint()
+                        onWidthChanged: root.scheduleConnectorRepaint()
+                        onHeightChanged: root.scheduleConnectorRepaint()
 
                         Image {
                             id: photoImage
@@ -847,7 +885,8 @@ Item {
                         Repeater {
                             id: photoHotspotRepeater
                             model: ButtonMappingModel
-                            onItemAdded: mappingLines.requestPaint()
+                            onItemAdded: root.scheduleConnectorRepaint()
+                            onItemRemoved: root.scheduleConnectorRepaint()
                             delegate: Item {
                                 id: photoHotspot
                                 objectName: "photoHotspot_" + buttonId
@@ -873,6 +912,16 @@ Item {
                                     - height / 2
                                 visible: SettingsController.photoAvailable
                                 z: 2
+
+                                function requestConnectorPaint() {
+                                    hotspotConnector.requestPaint()
+                                }
+
+                                onXChanged: root.scheduleConnectorRepaint()
+                                onYChanged: root.scheduleConnectorRepaint()
+                                onWidthChanged: root.scheduleConnectorRepaint()
+                                onHeightChanged: root.scheduleConnectorRepaint()
+                                onVisibleChanged: root.scheduleConnectorRepaint()
 
                                 Canvas {
                                     id: hotspotConnector
@@ -916,19 +965,19 @@ Item {
                                         ctx.stroke()
                                     }
 
-                                    onWidthChanged: requestPaint()
-                                    onHeightChanged: requestPaint()
-                                    onXChanged: requestPaint()
-                                    onYChanged: requestPaint()
-                                    onActiveChanged: requestPaint()
+                                    onWidthChanged: root.scheduleConnectorRepaint()
+                                    onHeightChanged: root.scheduleConnectorRepaint()
+                                    onXChanged: root.scheduleConnectorRepaint()
+                                    onYChanged: root.scheduleConnectorRepaint()
+                                    onActiveChanged: root.scheduleConnectorRepaint()
 
                                     Connections {
                                         target: mappingList
                                         function onWidthChanged() {
-                                            hotspotConnector.requestPaint()
+                                            root.scheduleConnectorRepaint()
                                         }
                                         function onHeightChanged() {
-                                            hotspotConnector.requestPaint()
+                                            root.scheduleConnectorRepaint()
                                         }
                                     }
                                 }
@@ -968,10 +1017,10 @@ Item {
                         Connections {
                             target: photoImage
                             function onPaintedWidthChanged() {
-                                mappingLines.requestPaint()
+                                root.scheduleConnectorRepaint()
                             }
                             function onPaintedHeightChanged() {
-                                mappingLines.requestPaint()
+                                root.scheduleConnectorRepaint()
                             }
                         }
                     }
@@ -998,11 +1047,16 @@ Item {
                     rows: 7
                     rowSpacing: root.mappingCardGap
                     z: 1
+                    onXChanged: root.scheduleConnectorRepaint()
+                    onYChanged: root.scheduleConnectorRepaint()
+                    onWidthChanged: root.scheduleConnectorRepaint()
+                    onHeightChanged: root.scheduleConnectorRepaint()
 
                     Repeater {
                         id: rightCardRepeater
                         model: ButtonMappingModel
-                        onItemAdded: mappingLines.requestPaint()
+                        onItemAdded: root.scheduleConnectorRepaint()
+                        onItemRemoved: root.scheduleConnectorRepaint()
                         delegate: MappingCard {
                             required property int index
                             required property string buttonId
@@ -1026,6 +1080,11 @@ Item {
                             selected: isSelected
                             voiceAction: actionText.trim() === "按住说话"
                                 || actionText.indexOf("已停用：旧语音配置") === 0
+                            onXChanged: root.scheduleConnectorRepaint()
+                            onYChanged: root.scheduleConnectorRepaint()
+                            onWidthChanged: root.scheduleConnectorRepaint()
+                            onHeightChanged: root.scheduleConnectorRepaint()
+                            onVisibleChanged: root.scheduleConnectorRepaint()
                             onClicked: {
                                 SettingsController.selectButton(buttonId)
                                 actionEditor.openForRow(

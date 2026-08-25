@@ -30,6 +30,7 @@ from unittest import mock
 
 from ovb_rc003 import app as app_module
 from ovb_rc003 import (
+    bridge_runtime_status,
     config,
     key_detection_bridge,
     key_mapping,
@@ -539,6 +540,28 @@ class LiveSettingsReloadTests(_AppWiringTestCase):
 
 
 class CandidateResolutionWiringTests(_AppWiringTestCase):
+    def test_runtime_status_cleanup_only_removes_the_current_process_file(self):
+        other_pid = app_module.os.getpid() + 1
+        bridge_runtime_status.publish_status(
+            self.app._config_root,
+            bridge_runtime_status.BridgeConnectionState.CONNECTED,
+            pid=other_pid,
+        )
+
+        self.app.clear_runtime_status()
+
+        self.assertEqual(
+            bridge_runtime_status.read_status(self.app._config_root).pid,
+            other_pid,
+        )
+        bridge_runtime_status.publish_status(
+            self.app._config_root,
+            bridge_runtime_status.BridgeConnectionState.CONNECTED,
+            pid=app_module.os.getpid(),
+        )
+        self.app.clear_runtime_status()
+        self.assertIsNone(bridge_runtime_status.read_status(self.app._config_root))
+
     def test_connect_once_uses_connectable_candidate_resolver(self):
         candidates = [object(), object()]
         chosen = object()
@@ -574,13 +597,38 @@ class CandidateResolutionWiringTests(_AppWiringTestCase):
             self.app, "_start_hid_listener"
         ) as start_hid, mock.patch.object(
             self.app, "_start_hid_report_tap"
-        ) as start_tap:
+        ) as start_tap, mock.patch.object(
+            self.app, "_publish_runtime_status"
+        ) as publish_status:
             self._loop.run_until_complete(self.app._connect_once())
 
         self.assertEqual(resolver_calls, [candidates])
         self.assertEqual(connected, [chosen])
         start_hid.assert_called_once_with()
         start_tap.assert_called_once_with()
+        self.assertEqual(
+            publish_status.call_args_list,
+            [
+                mock.call(
+                    bridge_runtime_status.BridgeConnectionState.WAITING_FOR_DEVICE
+                ),
+                mock.call(bridge_runtime_status.BridgeConnectionState.CONNECTED),
+            ],
+        )
+
+    def test_disconnect_and_protocol_error_return_runtime_status_to_waiting(self):
+        reconnects = []
+        self.app._supervisor.request_reconnect = lambda: reconnects.append(True)
+        with mock.patch.object(self.app, "_publish_runtime_status") as publish_status:
+            self.app._on_disconnected()
+            self.app._on_session_error(RuntimeError("simulated protocol error"))
+
+        waiting = bridge_runtime_status.BridgeConnectionState.WAITING_FOR_DEVICE
+        self.assertEqual(
+            publish_status.call_args_list,
+            [mock.call(waiting), mock.call(waiting)],
+        )
+        self.assertEqual(reconnects, [True, True])
 
 
 class HostHotkeyFailureSuppressesMicOpenTests(_AppWiringTestCase):

@@ -27,10 +27,22 @@ ApplicationWindow {
     Timer {
         id: bridgeStatusRefreshTimer
         objectName: "bridgeStatusRefreshTimer"
-        interval: 2000
+        interval: SettingsController.bridgeLaunchPhase === "saving"
+            || SettingsController.bridgeLaunchPhase === "starting"
+            || SettingsController.bridgeLaunchPhase === "waiting"
+            ? 1000 : 2000
         repeat: true
         running: window.visible
         onTriggered: SettingsController.refreshBridgeState()
+    }
+
+    Timer {
+        id: bridgeLaunchPollTimer
+        objectName: "bridgeLaunchPollTimer"
+        interval: 150
+        repeat: true
+        running: window.visible && SettingsController.bridgeLaunchBusy
+        onTriggered: SettingsController.pollBridgeLaunch()
     }
 
     onActiveChanged: {
@@ -145,21 +157,25 @@ ApplicationWindow {
             Rectangle {
                 id: globalStatusBar
                 objectName: "globalStatusBar"
-                Layout.fillWidth: true
-                Layout.minimumHeight: visible ? tokens.statusBarMinHeight : 0
-                Layout.preferredHeight: visible ? tokens.statusBarMinHeight : 0
-                visible: SettingsController.errorMessage.length > 0
+                readonly property bool hasStatus:
+                    SettingsController.errorMessage.length > 0
                     || SettingsController.settingsDirty
                     || SettingsController.statusMessage.length > 0
-                color: SettingsController.errorMessage.length > 0
-                    || SettingsController.settingsDirty
-                    ? tokens.errorBackground : tokens.statusBackground
+                Layout.fillWidth: true
+                Layout.minimumHeight: tokens.statusBarMinHeight
+                Layout.preferredHeight: tokens.statusBarMinHeight
+                color: hasStatus
+                    ? SettingsController.errorMessage.length > 0
+                        || SettingsController.settingsDirty
+                        ? tokens.errorBackground : tokens.statusBackground
+                    : tokens.background
 
                 Rectangle {
                     anchors.left: parent.left
                     anchors.right: parent.right
                     anchors.top: parent.top
                     height: 1
+                    visible: globalStatusBar.hasStatus
                     color: SettingsController.errorMessage.length > 0
                         || SettingsController.settingsDirty
                         ? tokens.errorColor : tokens.accent
@@ -171,6 +187,7 @@ ApplicationWindow {
                     anchors.fill: parent
                     anchors.leftMargin: tokens.spacingMedium
                     anchors.rightMargin: tokens.spacingMedium
+                    visible: globalStatusBar.hasStatus
                     text: SettingsController.errorMessage.length > 0
                         ? SettingsController.errorMessage
                         : SettingsController.settingsDirty

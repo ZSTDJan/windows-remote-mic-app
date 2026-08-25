@@ -71,7 +71,7 @@ import sys
 import time
 from dataclasses import dataclass
 from enum import Enum
-from typing import Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 from . import single_instance
 
@@ -206,37 +206,60 @@ class LaunchResult:
     error: Optional[str] = None
 
 
-def launch_bridge(
+@dataclass
+class PendingBridgeLaunch:
+    """A created process whose grace-period result is still pending.
+
+    Settings keeps this object on the GUI thread and polls it from a short Qt
+    timer. No sleep or worker thread is needed, so the window can paint every
+    real launch stage while the same outcome contract remains in force.
+    """
+
+    command: Tuple[str, ...]
+    process: object
+    pid: Optional[int]
+    checks_remaining: int
+
+
+def _result_for_exit(
+    command: Tuple[str, ...],
+    pid: Optional[int],
+    exit_code: int,
+) -> LaunchResult:
+    if exit_code == ALREADY_RUNNING_EXIT_CODE:
+        outcome = LaunchOutcome.ALREADY_RUNNING
+    else:
+        outcome = LaunchOutcome.QUICK_EXIT
+    return LaunchResult(
+        outcome=outcome,
+        command=command,
+        pid=pid,
+        exit_code=exit_code,
+    )
+
+
+def start_bridge_launch(
     command: Optional[Sequence[str]] = None,
     *,
     grace_checks: int = DEFAULT_GRACE_CHECKS,
-    poll_interval_seconds: float = DEFAULT_POLL_INTERVAL_SECONDS,
     _popen: Callable[..., "subprocess.Popen"] = subprocess.Popen,
-    _sleep: Callable[[float], None] = time.sleep,
     _popen_kwargs: Optional[Dict[str, object]] = None,
-) -> LaunchResult:
-    """Starts the bridge and watches it for a short grace period to tell a
-    process that is actually running apart from one that merely got created
-    and then immediately died. Never raises for an ordinary launch failure
-    (``OSError`` from ``_popen``) - that is reported as ``LAUNCH_FAILED``
-    instead, since this is called directly from a Tk button handler that
-    must not crash the settings window over a failed launch.
+) -> Union[LaunchResult, PendingBridgeLaunch]:
+    """Create the bridge process and perform only the immediate status poll.
+
+    A still-live child is returned as ``PendingBridgeLaunch``. Callers can
+    poll it without blocking; ``launch_bridge`` below remains the synchronous
+    compatibility wrapper for non-GUI callers.
     """
 
     resolved_command: Tuple[str, ...] = (
         tuple(command) if command is not None else tuple(build_launch_command())
     )
-
     popen_kwargs = dict(_popen_kwargs) if _popen_kwargs is not None else {}
     if _popen is subprocess.Popen and sys.platform == "win32":
-        # A bridge subprocess is a console subsystem program (python.exe in a
-        # source checkout) or a frozen ``console=False`` exe; without this
-        # flag Windows flashes a black console window for the child even when
-        # the parent is a GUI app. CREATE_NO_WINDOW only exists on Windows.
         popen_kwargs.setdefault(
             "creationflags", getattr(subprocess, "CREATE_NO_WINDOW", 0)
         )
-
     try:
         process = _popen(list(resolved_command), **popen_kwargs)
     except OSError as exc:
@@ -256,32 +279,74 @@ def launch_bridge(
             pid=pid,
             error=type(exc).__name__,
         )
-    checks = 0
-    while exit_code is None and checks < grace_checks:
-        _sleep(poll_interval_seconds)
-        try:
-            exit_code = process.poll()
-        except OSError as exc:
-            return LaunchResult(
-                outcome=LaunchOutcome.STATUS_UNKNOWN,
-                command=resolved_command,
-                pid=pid,
-                error=type(exc).__name__,
-            )
-        checks += 1
-
-    if exit_code is None:
-        return LaunchResult(outcome=LaunchOutcome.STARTED, command=resolved_command, pid=pid)
-    if exit_code == ALREADY_RUNNING_EXIT_CODE:
+    if exit_code is not None:
+        return _result_for_exit(resolved_command, pid, exit_code)
+    checks_remaining = max(0, int(grace_checks))
+    if checks_remaining == 0:
         return LaunchResult(
-            outcome=LaunchOutcome.ALREADY_RUNNING,
+            outcome=LaunchOutcome.STARTED,
             command=resolved_command,
             pid=pid,
-            exit_code=exit_code,
         )
-    return LaunchResult(
-        outcome=LaunchOutcome.QUICK_EXIT,
+    return PendingBridgeLaunch(
         command=resolved_command,
+        process=process,
         pid=pid,
-        exit_code=exit_code,
+        checks_remaining=checks_remaining,
     )
+
+
+def poll_bridge_launch(pending: PendingBridgeLaunch) -> Optional[LaunchResult]:
+    """Poll one pending launch once; never sleeps or blocks."""
+
+    try:
+        exit_code = pending.process.poll()
+    except OSError as exc:
+        return LaunchResult(
+            outcome=LaunchOutcome.STATUS_UNKNOWN,
+            command=pending.command,
+            pid=pending.pid,
+            error=type(exc).__name__,
+        )
+    if exit_code is not None:
+        return _result_for_exit(pending.command, pending.pid, exit_code)
+    pending.checks_remaining -= 1
+    if pending.checks_remaining <= 0:
+        return LaunchResult(
+            outcome=LaunchOutcome.STARTED,
+            command=pending.command,
+            pid=pending.pid,
+        )
+    return None
+
+
+def launch_bridge(
+    command: Optional[Sequence[str]] = None,
+    *,
+    grace_checks: int = DEFAULT_GRACE_CHECKS,
+    poll_interval_seconds: float = DEFAULT_POLL_INTERVAL_SECONDS,
+    _popen: Callable[..., "subprocess.Popen"] = subprocess.Popen,
+    _sleep: Callable[[float], None] = time.sleep,
+    _popen_kwargs: Optional[Dict[str, object]] = None,
+) -> LaunchResult:
+    """Starts the bridge and watches it for a short grace period to tell a
+    process that is actually running apart from one that merely got created
+    and then immediately died. Never raises for an ordinary launch failure
+    (``OSError`` from ``_popen``) - that is reported as ``LAUNCH_FAILED``
+    instead, since this is called directly from a Tk button handler that
+    must not crash the settings window over a failed launch.
+    """
+
+    attempt = start_bridge_launch(
+        command,
+        grace_checks=grace_checks,
+        _popen=_popen,
+        _popen_kwargs=_popen_kwargs,
+    )
+    if isinstance(attempt, LaunchResult):
+        return attempt
+    while True:
+        _sleep(poll_interval_seconds)
+        result = poll_bridge_launch(attempt)
+        if result is not None:
+            return result

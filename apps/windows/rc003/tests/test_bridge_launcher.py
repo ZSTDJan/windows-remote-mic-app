@@ -291,6 +291,48 @@ class LaunchBridgeTests(unittest.TestCase):
         self.assertTrue(popen_calls[0])  # non-empty, host-dependent contents
 
 
+class NonBlockingLaunchTests(unittest.TestCase):
+    def test_start_returns_a_pending_launch_without_waiting(self):
+        process = _FakeProcess([None, None], pid=2468)
+
+        attempt = bridge_launcher.start_bridge_launch(
+            ["exe"],
+            grace_checks=2,
+            _popen=lambda command: process,
+        )
+
+        self.assertIsInstance(attempt, bridge_launcher.PendingBridgeLaunch)
+        self.assertEqual(attempt.pid, 2468)
+        self.assertEqual(attempt.checks_remaining, 2)
+
+    def test_poll_returns_none_until_the_grace_checks_finish(self):
+        pending = bridge_launcher.PendingBridgeLaunch(
+            command=("exe",),
+            process=_FakeProcess([None, None]),
+            pid=2468,
+            checks_remaining=2,
+        )
+
+        self.assertIsNone(bridge_launcher.poll_bridge_launch(pending))
+        result = bridge_launcher.poll_bridge_launch(pending)
+
+        self.assertEqual(result.outcome, bridge_launcher.LaunchOutcome.STARTED)
+        self.assertEqual(result.pid, 2468)
+
+    def test_poll_reports_a_quick_exit_before_grace_finishes(self):
+        pending = bridge_launcher.PendingBridgeLaunch(
+            command=("exe",),
+            process=_FakeProcess([7]),
+            pid=2468,
+            checks_remaining=5,
+        )
+
+        result = bridge_launcher.poll_bridge_launch(pending)
+
+        self.assertEqual(result.outcome, bridge_launcher.LaunchOutcome.QUICK_EXIT)
+        self.assertEqual(result.exit_code, 7)
+
+
 class LaunchSettingsTests(unittest.TestCase):
     def test_success_reports_the_created_process_pid(self):
         process = _FakeProcess([None], pid=6543)

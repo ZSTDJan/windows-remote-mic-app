@@ -33,6 +33,7 @@ from unittest import mock
 from ovb_rc003 import (
     audio_output,
     bridge_launcher,
+    bridge_runtime_status,
     config,
     device_catalog,
     frida_compat,
@@ -348,6 +349,31 @@ class ButtonMappingModelTests(unittest.TestCase):
             {"double_click": "", "long_press": ""},
         )
 
+    def test_load_display_map_updates_rows_without_resetting_or_losing_selection(self):
+        model = self.Model()
+        resets = []
+        changes = []
+        model.modelReset.connect(lambda: resets.append(True))
+        model.dataChanged.connect(
+            lambda first, last, roles: changes.append(
+                (first.row(), last.row(), tuple(roles))
+            )
+        )
+        model.set_selected_button("power")
+
+        model.load_display_map(
+            {"power": "Escape", "mic": "按住说话"},
+            {"power": {"double_click": "Return", "long_press": ""}},
+        )
+
+        self.assertEqual(resets, [])
+        self.assertTrue(changes)
+        self.assertEqual(model.selected_button_id(), "power")
+        power = model.index(model.index_of("power"), 0)
+        self.assertTrue(model.data(power, model.IsSelectedRole))
+        self.assertEqual(model.data(power, model.ActionTextRole), "Escape")
+        self.assertEqual(model.data(power, model.DoubleClickTextRole), "Return")
+
     def test_selecting_a_button_flags_only_that_row_as_selected(self):
         model = self.Model()
         self.assertEqual(model.selected_button_id(), "ok")
@@ -392,6 +418,9 @@ class SettingsControllerTests(unittest.TestCase):
         model = self.Model()
         controller = self.Controller(model)
         return controller, model
+
+    def _continue_save_and_launch(self, controller):
+        controller._continue_save_and_launch()
 
     def test_hotkey_text_defaults_to_the_configured_default(self):
         controller, _ = self._make_controller()
@@ -512,10 +541,31 @@ class SettingsControllerTests(unittest.TestCase):
         controller, _ = self._make_controller()
 
         self.assertTrue(controller.bridgeRunning)
-        self.assertEqual(
-            controller.launchStatusText,
-            settings_ui.LAUNCH_ALREADY_RUNNING_TEXT,
+        self.assertFalse(controller.bridgeConnected)
+        self.assertEqual(controller.bridgeLaunchPhase, "waiting")
+        self.assertIn("桥接进程已启动", controller.launchStatusText)
+        self.assertIn("连接状态暂时未知", controller.launchStatusText)
+
+    def test_launch_status_reads_the_bridge_reported_connected_state(self):
+        self._bridge_status_patch.stop()
+        self._bridge_status_patch = mock.patch.object(
+            qt_settings_app.single_instance,
+            "bridge_instance_running",
+            return_value=True,
         )
+        self._bridge_status_patch.start()
+        bridge_runtime_status.publish_status(
+            config.config_root(),
+            bridge_runtime_status.BridgeConnectionState.CONNECTED,
+            pid=4321,
+        )
+
+        controller, _ = self._make_controller()
+
+        self.assertTrue(controller.bridgeRunning)
+        self.assertTrue(controller.bridgeConnected)
+        self.assertEqual(controller.bridgeLaunchPhase, "connected")
+        self.assertIn("RC003 已连接", controller.launchStatusText)
 
     def test_live_bridge_refresh_tracks_external_start_and_exit(self):
         controller, _ = self._make_controller()
@@ -528,10 +578,8 @@ class SettingsControllerTests(unittest.TestCase):
             controller.refreshBridgeState()
 
         self.assertTrue(controller.bridgeRunning)
-        self.assertEqual(
-            controller.launchStatusText,
-            settings_ui.LAUNCH_ALREADY_RUNNING_TEXT,
-        )
+        self.assertEqual(controller.bridgeLaunchPhase, "waiting")
+        self.assertIn("连接状态暂时未知", controller.launchStatusText)
 
         controller.refreshBridgeState()
 
@@ -753,9 +801,12 @@ class SettingsControllerTests(unittest.TestCase):
         controller.selectedDeviceIndex = controller._DEVICE_ORDER.index(
             device_catalog.DJI_MIC_2_ID
         )
-        with mock.patch.object(bridge_launcher, "launch_bridge") as fake_launch:
+        with mock.patch.object(bridge_launcher, "start_bridge_launch") as fake_launch:
             controller.saveAndLaunch()
+            self.assertEqual(controller.bridgeLaunchPhase, "saving")
+            self._continue_save_and_launch(controller)
         fake_launch.assert_not_called()
+        self.assertEqual(controller.bridgeLaunchPhase, "idle")
         self.assertIn("不启动 RC003", controller.launchStatusText)
 
     def test_save_settings_persists_and_clears_error_message(self):
@@ -963,29 +1014,74 @@ class SettingsControllerTests(unittest.TestCase):
     def test_save_and_launch_never_launches_when_save_fails(self):
         controller, _ = self._make_controller()
         controller.holdVoiceHotkeyText = ""
-        with mock.patch.object(bridge_launcher, "launch_bridge") as fake_launch:
+        with mock.patch.object(bridge_launcher, "start_bridge_launch") as fake_launch:
             controller.saveAndLaunch()
+            self.assertEqual(controller.bridgeLaunchPhase, "saving")
+            self.assertTrue(controller.bridgeLaunchBusy)
+            self._continue_save_and_launch(controller)
         fake_launch.assert_not_called()
-        self.assertEqual(controller.launchStatusText, settings_ui.LAUNCH_NOT_STARTED_TEXT)
+        self.assertEqual(controller.bridgeLaunchPhase, "failed")
+        self.assertFalse(controller.bridgeLaunchBusy)
+        self.assertIn("保存未完成", controller.launchStatusText)
 
     def test_save_and_launch_launches_and_reports_started_when_save_succeeds(self):
         controller, _ = self._make_controller()
         fake_result = bridge_launcher.LaunchResult(
             outcome=bridge_launcher.LaunchOutcome.STARTED, command=("exe",), pid=4321
         )
-        with mock.patch.object(bridge_launcher, "launch_bridge", return_value=fake_result):
+        with mock.patch.object(
+            bridge_launcher, "start_bridge_launch", return_value=fake_result
+        ) as start_launch, mock.patch.object(
+            bridge_launcher,
+            "launch_bridge",
+            side_effect=AssertionError("GUI must not call the blocking launch wrapper"),
+        ):
             controller.saveAndLaunch()
+            self.assertEqual(controller.bridgeLaunchPhase, "saving")
+            self.assertFalse(start_launch.called)
+            self._continue_save_and_launch(controller)
         self.assertTrue(controller.bridgeRunning)
-        self.assertIn("4321", controller.launchStatusText)
+        self.assertFalse(controller.bridgeConnected)
+        self.assertEqual(controller.bridgeLaunchPhase, "waiting")
+        self.assertIn("桥接进程已启动", controller.launchStatusText)
         self.assertIn("约一分钟", controller.launchStatusText)
         self.assertNotIn("已连接", controller.launchStatusText)
 
-        launch_text = controller.launchStatusText
         controller.refreshBridgeState()
 
         self.assertFalse(controller.bridgeRunning)
-        self.assertEqual(controller.launchStatusText, launch_text)
-        self.assertIn("本次启动检查结束时", controller.launchStatusText)
+        self.assertEqual(controller.bridgeLaunchPhase, "failed")
+        self.assertIn("桥接进程已经退出", controller.launchStatusText)
+
+    def test_pending_launch_stays_in_starting_until_poll_finishes(self):
+        controller, _ = self._make_controller()
+        pending = bridge_launcher.PendingBridgeLaunch(
+            command=("exe",),
+            process=object(),
+            pid=4321,
+            checks_remaining=3,
+        )
+        started = bridge_launcher.LaunchResult(
+            outcome=bridge_launcher.LaunchOutcome.STARTED,
+            command=("exe",),
+            pid=4321,
+        )
+        with mock.patch.object(
+            bridge_launcher, "start_bridge_launch", return_value=pending
+        ), mock.patch.object(
+            bridge_launcher, "poll_bridge_launch", side_effect=[None, started]
+        ) as poll_launch:
+            controller.saveAndLaunch()
+            self._continue_save_and_launch(controller)
+            self.assertEqual(controller.bridgeLaunchPhase, "starting")
+            self.assertTrue(controller.bridgeLaunchBusy)
+            controller.pollBridgeLaunch()
+            self.assertEqual(controller.bridgeLaunchPhase, "starting")
+            controller.pollBridgeLaunch()
+
+        self.assertEqual(poll_launch.call_count, 2)
+        self.assertEqual(controller.bridgeLaunchPhase, "waiting")
+        self.assertFalse(controller.bridgeLaunchBusy)
 
     def test_failed_launch_keeps_the_bridge_warning_active(self):
         controller, _ = self._make_controller()
@@ -995,8 +1091,11 @@ class SettingsControllerTests(unittest.TestCase):
             error="missing executable",
         )
 
-        with mock.patch.object(bridge_launcher, "launch_bridge", return_value=fake_result):
+        with mock.patch.object(
+            bridge_launcher, "start_bridge_launch", return_value=fake_result
+        ):
             controller.saveAndLaunch()
+            self._continue_save_and_launch(controller)
 
         self.assertFalse(controller.bridgeRunning)
         self.assertIn("启动失败", controller.launchStatusText)
@@ -2533,6 +2632,8 @@ result = {
     "width": int(window.property("width")),
     "height": int(window.property("height")),
     "initial_status_visible": bool(status_bar.property("visible")),
+    "initial_status_has_status": bool(status_bar.property("hasStatus")),
+    "initial_status_text_visible": bool(status_text.property("visible")),
     "navigation": {
         name: bounds(window, name)
         for name in (
@@ -3107,15 +3208,35 @@ class SettingsShellSourceContractTests(unittest.TestCase):
 
     def test_main_window_owns_the_single_live_bridge_refresh_timer(self):
         self.assertIn('objectName: "bridgeStatusRefreshTimer"', self.main_qml)
-        self.assertIn("interval: 2000", self.main_qml)
+        self.assertIn("? 1000 : 2000", self.main_qml)
         self.assertIn("running: window.visible", self.main_qml)
         self.assertIn(
             "onTriggered: SettingsController.refreshBridgeState()",
             self.main_qml,
         )
         self.assertIn("onActiveChanged", self.main_qml)
+        self.assertIn('objectName: "bridgeLaunchPollTimer"', self.main_qml)
+        self.assertIn("interval: 150", self.main_qml)
+        self.assertIn("SettingsController.pollBridgeLaunch()", self.main_qml)
         for page_text in (self.connection_qml, self.buttons_qml):
             self.assertNotIn("refreshBridgeState()", page_text)
+
+    def test_connection_shows_real_bridge_launch_stages(self):
+        for object_name in (
+            "bridgeLaunchProgress",
+            "bridgeLaunchBusyIndicator",
+            "bridgeLaunchStageText",
+            "bridgeLaunchElapsedText",
+        ):
+            self.assertIn(f'objectName: "{object_name}"', self.connection_qml)
+        for stage in (
+            "保存设置… → 启动桥接 → 等待设备连接",
+            "桥接进程已启动 ✓ → 等待 RC003 连接…",
+            "RC003 已连接 ✓",
+            "已等待 %1 秒",
+        ):
+            self.assertIn(stage, self.connection_qml)
+        self.assertIn("enabled: !SettingsController.bridgeLaunchBusy", self.connection_qml)
 
     def test_permissions_page_states_real_boundaries_without_fake_grants(self):
         for heading in ("运行必需", "按需使用", "相关设置"):
@@ -3346,7 +3467,9 @@ class OffscreenQmlLoadTests(unittest.TestCase):
                 data = json.loads(result.stdout.strip().splitlines()[-1])
                 self.assertEqual(data["warnings"], [])
                 self.assertEqual((data["width"], data["height"]), (width, height))
-                self.assertFalse(data["initial_status_visible"])
+                self.assertTrue(data["initial_status_visible"])
+                self.assertFalse(data["initial_status_has_status"])
+                self.assertFalse(data["initial_status_text_visible"])
                 self.assertEqual(
                     data["connection"]["explicit_launch_status"],
                     "AUDIT_LAUNCH_RESULT_MUST_BE_VISIBLE",
@@ -3574,10 +3697,13 @@ class QmlLoadProbeCallsProductionShutdownHelperTests(unittest.TestCase):
 # via env by the outer test) is read back by the OUTER test afterward,
 # since that is real state on disk that survives the subprocess exiting.
 _DIRECT_SAVE_PROBE_SCRIPT = r"""
+import hashlib
+import json
+import os
 import sys
 
 from ovb_rc003 import qt_settings_app as m
-from PySide6.QtCore import QObject, QPointF, Qt
+from PySide6.QtCore import QByteArray, QBuffer, QIODevice, QObject, QPoint, QPointF, Qt
 from PySide6.QtGui import QKeySequence
 from PySide6.QtTest import QTest
 
@@ -3610,6 +3736,86 @@ def _select_combo_option(window, app, combo, option_index):
     for _ in range(3):
         window.grabWindow()
         app.processEvents()
+
+
+def _render(window, app, passes=10):
+    image = None
+    for _ in range(passes):
+        image = window.grabWindow()
+        app.processEvents()
+    return image
+
+
+def _geometry(item):
+    point = item.mapToScene(QPointF(0.0, 0.0))
+    return {
+        "x": float(point.x()),
+        "y": float(point.y()),
+        "width": float(item.property("width")),
+        "height": float(item.property("height")),
+        "visible": bool(item.property("visible")),
+    }
+
+
+def _png_digest(image):
+    encoded = QByteArray()
+    buffer = QBuffer(encoded)
+    assert buffer.open(QIODevice.OpenModeFlag.WriteOnly)
+    assert image.save(buffer, "PNG")
+    buffer.close()
+    return hashlib.sha256(bytes(encoded)).hexdigest()
+
+
+def _mapping_snapshot(window, app, model, controller, screenshot_env):
+    QTest.mouseMove(window, QPoint(2, 2))
+    app.processEvents()
+    image = _render(window, app)
+    mapping = _find_child_by_object_name(window, "mappingList")
+    assert mapping is not None
+    origin = mapping.mapToScene(QPointF(0.0, 0.0))
+    cropped = image.copy(
+        int(round(origin.x())),
+        int(round(origin.y())),
+        int(round(mapping.property("width"))),
+        int(round(mapping.property("height"))),
+    )
+    screenshot_path = os.environ.get(screenshot_env, "")
+    if screenshot_path:
+        assert cropped.save(screenshot_path)
+    button_ids = (
+        "power", "up", "left", "back", "home", "menu",
+        "mic", "right", "ok", "down", "volume_up", "volume_down", "tv",
+    )
+    return {
+        "mapping": _geometry(mapping),
+        "cards": {
+            button_id: _geometry(
+                _find_child_by_object_name(window, "editMapping_" + button_id)
+            )
+            for button_id in button_ids
+        },
+        "hotspots": {
+            button_id: _geometry(
+                _find_child_by_object_name(window, "photoHotspot_" + button_id)
+            )
+            for button_id in button_ids
+        },
+        "connectors": {
+            button_id: _geometry(
+                _find_child_by_object_name(
+                    window, "photoHotspotConnector_" + button_id
+                )
+            )
+            for button_id in button_ids
+        },
+        "photo_frame": _geometry(
+            _find_child_by_object_name(window, "photoFrame")
+        ),
+        "selected_button_id": controller.property("selectedButtonId"),
+        "display_map": model.to_display_map(),
+        "secondary_display_map": model.to_secondary_display_map(),
+        "pixel_sha256": _png_digest(cropped),
+    }
 
 
 classes = m._load_qt_classes()
@@ -3754,6 +3960,14 @@ for _ in range(3):
     app.processEvents()
 assert not editor.property("visible")
 
+before_save = _mapping_snapshot(
+    window,
+    app,
+    model,
+    controller,
+    "RC003_MAPPING_BEFORE_SCREENSHOT",
+)
+
 # Real click on "保存映射" - deliberately never press Enter/Return anywhere
 # in this test.
 save_button = _find_child_by_object_name(window, "saveMappingButton")
@@ -3762,10 +3976,16 @@ save_center = save_button.mapToScene(
     QPointF(save_button.property("width") / 2, save_button.property("height") / 2)
 ).toPoint()
 QTest.mouseClick(window, Qt.LeftButton, Qt.NoModifier, save_center)
-app.processEvents()
+after_save = _mapping_snapshot(
+    window,
+    app,
+    model,
+    controller,
+    "RC003_MAPPING_AFTER_SCREENSHOT",
+)
 
 assert controller.errorMessage == "", f"save reported a validation error: {controller.errorMessage}"
-print("OK")
+print(json.dumps({"before": before_save, "after": after_save}))
 """
 
 
@@ -3798,7 +4018,8 @@ class ButtonsPageDirectSaveIntegrationTests(unittest.TestCase):
                 0,
                 f"direct-save probe subprocess failed: {result.stdout}\n{result.stderr}",
             )
-            self.assertIn("OK", result.stdout)
+            visual = json.loads(result.stdout.strip().splitlines()[-1])
+            self.assertEqual(visual["before"], visual["after"])
 
             # The real, persisted file - read back from the SAME
             # LOCALAPPDATA the subprocess wrote to, after it has exited.

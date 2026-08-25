@@ -56,6 +56,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from pathlib import Path
 import sys
 import threading
@@ -69,6 +70,7 @@ from . import (
     action_executor,
     ble_transport_winrt,
     bridge_launcher,
+    bridge_runtime_status,
     bridge_tray_windows,
     button_gesture,
     config,
@@ -282,7 +284,31 @@ class RC003App:
     async def stop(self) -> None:
         await self._supervisor.stop()
 
+    def _publish_runtime_status(
+        self,
+        state: bridge_runtime_status.BridgeConnectionState,
+    ) -> None:
+        try:
+            bridge_runtime_status.publish_status(self._config_root, state)
+        except (OSError, ValueError):
+            self._logger.exception(
+                "bridge runtime status update failed: state=%s",
+                state.value,
+            )
+
+    def clear_runtime_status(self) -> None:
+        try:
+            bridge_runtime_status.clear_status(
+                self._config_root,
+                pid=os.getpid(),
+            )
+        except OSError:
+            self._logger.exception("bridge runtime status cleanup failed")
+
     async def _connect_once(self) -> None:
+        self._publish_runtime_status(
+            bridge_runtime_status.BridgeConnectionState.WAITING_FOR_DEVICE
+        )
         self._logger.info("startup: resolving RC003 identity")
         candidates = await ble_transport_winrt.discover_candidates()
         # A sole exact identity match remains the fast path. If Windows keeps
@@ -303,6 +329,9 @@ class RC003App:
 
         self._start_hid_listener()
         self._start_hid_report_tap()
+        self._publish_runtime_status(
+            bridge_runtime_status.BridgeConnectionState.CONNECTED
+        )
 
 
     def _start_hid_listener(self) -> None:
@@ -536,6 +565,9 @@ class RC003App:
         how that ends the connect/retry loop).
         """
 
+        self._publish_runtime_status(
+            bridge_runtime_status.BridgeConnectionState.WAITING_FOR_DEVICE
+        )
         failures: List[str] = []
         self._legacy_voice_event_generation += 1
 
@@ -670,10 +702,16 @@ class RC003App:
     # -- disconnect / error callbacks: hand off to the supervisor ----------
 
     def _on_disconnected(self) -> None:
+        self._publish_runtime_status(
+            bridge_runtime_status.BridgeConnectionState.WAITING_FOR_DEVICE
+        )
         self._logger.info("BLE reported disconnected; requesting reconnect")
         self._supervisor.request_reconnect()
 
     def _on_session_error(self, exc: BaseException) -> None:
+        self._publish_runtime_status(
+            bridge_runtime_status.BridgeConnectionState.WAITING_FOR_DEVICE
+        )
         self._logger.info("ATVV protocol error, requesting reconnect: %s", exc)
         self._supervisor.request_reconnect()
 
@@ -2310,7 +2348,12 @@ async def _run(
                 type(exc).__name__,
             )
         finally:
-            await app.stop()
+            try:
+                await app.stop()
+            finally:
+                clear_runtime_status = getattr(app, "clear_runtime_status", None)
+                if callable(clear_runtime_status):
+                    clear_runtime_status()
 
 
 def main() -> None:
