@@ -1789,9 +1789,11 @@ class DiagnosticsControllerTests(unittest.TestCase):
         # state - never start a test with it left set by a previous
         # test/failure, and never leave it set for the next one.
         qt_settings_app._diagnostics_shutdown_event.clear()
+        qt_settings_app._vb_cable_test_active_event.clear()
 
     def tearDown(self):
         qt_settings_app._diagnostics_shutdown_event.clear()
+        qt_settings_app._vb_cable_test_active_event.clear()
         self._env_patch.stop()
         self._tmpdir.cleanup()
 
@@ -2038,6 +2040,43 @@ class DiagnosticsControllerTests(unittest.TestCase):
         self.assertTrue(diag.isRefreshing)
         self.assertEqual(diag.checkResults, [])
 
+    def test_shutdown_helper_kills_a_hanging_vb_cable_child(self):
+        hang_script = "import time\ntime.sleep(120)\n"
+
+        def _fake_command(request_path, result_path, **kwargs):
+            return [sys.executable, "-c", hang_script]
+
+        settings_controller = self._make_settings_controller()
+        diag = self.DiagnosticsController(settings_controller, self._config_root)
+        self.assertTrue(self._pump_until(lambda: not diag.isRefreshing))
+
+        with mock.patch.object(
+            settings_controller, "_get_bridge_launch_busy", return_value=False
+        ), mock.patch.object(
+            settings_controller, "_refresh_bridge_status", return_value=False
+        ), mock.patch.object(
+            windows_diagnostics,
+            "build_vb_cable_loopback_subprocess_command",
+            _fake_command,
+        ):
+            diag.testVbCableChannel()
+            self.assertTrue(diag.vbCableTestRunning)
+            time.sleep(0.2)
+
+            started = time.monotonic()
+            qt_settings_app._shutdown_diagnostics_workers()
+            elapsed = time.monotonic() - started
+
+        self.assertLess(
+            elapsed,
+            qt_settings_app._DIAGNOSTICS_THREAD_JOIN_TIMEOUT_SECONDS + 1.0,
+        )
+        self.assertEqual(len(qt_settings_app._diagnostics_threads), 0)
+        self.assertFalse(qt_settings_app._vb_cable_test_active_event.is_set())
+        # Shutdown suppresses the result signal, so the now-closing UI is
+        # never updated from the worker after Qt teardown has begun.
+        self.assertTrue(diag.vbCableTestRunning)
+
     def test_select_detected_cable_input_persists_via_settings_controller(self):
         settings_controller = self._make_settings_controller()
         diag = self.DiagnosticsController(settings_controller, self._config_root)
@@ -2150,6 +2189,162 @@ class DiagnosticsControllerTests(unittest.TestCase):
         self.assertTrue(result)
         reloaded = config.load_config(config.config_path(self._config_root))
         self.assertEqual(reloaded["output_endpoint_host_api"], "Windows WASAPI")
+
+    def test_vb_cable_channel_test_delivers_success_back_to_the_gui_thread(self):
+        settings_controller = self._make_settings_controller()
+        diag = self.DiagnosticsController(settings_controller, self._config_root)
+        self._pump_until(lambda: not diag.isRefreshing)
+        result = windows_diagnostics.CheckResult(
+            "vb_cable_loopback",
+            "VB-CABLE 本地通道",
+            windows_diagnostics.CheckGroup.OPTIONAL_DRIVER,
+            windows_diagnostics.CheckStatus.PASS,
+            "测试信号已到达；不代表输入法已经识别文字。",
+        )
+
+        with mock.patch.object(
+            settings_controller, "_refresh_bridge_status", return_value=False
+        ), mock.patch.object(
+            windows_diagnostics, "check_vb_cable_loopback_isolated", return_value=result
+        ):
+            diag.testVbCableChannel()
+            self.assertTrue(diag.vbCableTestRunning)
+            self.assertTrue(self._pump_until(lambda: not diag.vbCableTestRunning))
+
+        self.assertEqual(diag.vbCableTestStatus, "pass")
+        self.assertIn("不代表输入法", diag.vbCableTestMessage)
+
+    def test_refresh_invalidates_an_old_vb_cable_success(self):
+        settings_controller = self._make_settings_controller()
+        diag = self.DiagnosticsController(settings_controller, self._config_root)
+        self._pump_until(lambda: not diag.isRefreshing)
+        diag._on_vb_cable_test_ready(
+            windows_diagnostics.CheckResult(
+                "vb_cable_loopback",
+                "VB-CABLE 本地通道",
+                windows_diagnostics.CheckGroup.OPTIONAL_DRIVER,
+                windows_diagnostics.CheckStatus.PASS,
+                "OLD_PASS",
+            )
+        )
+        self.assertEqual(diag.vbCableTestStatus, "pass")
+
+        with mock.patch.object(
+            windows_diagnostics,
+            "run_diagnostics",
+            return_value=windows_diagnostics.DiagnosticsReport(checks=()),
+        ):
+            diag.refreshDiagnostics()
+            self.assertEqual(diag.vbCableTestStatus, "idle")
+            self.assertEqual(diag.vbCableTestMessage, "")
+            self.assertTrue(self._pump_until(lambda: not diag.isRefreshing))
+
+    def test_endpoint_selection_change_invalidates_an_old_vb_cable_success(self):
+        settings_controller = self._make_settings_controller()
+        diag = self.DiagnosticsController(settings_controller, self._config_root)
+        self._pump_until(lambda: not diag.isRefreshing)
+        diag._on_vb_cable_test_ready(
+            windows_diagnostics.CheckResult(
+                "vb_cable_loopback",
+                "VB-CABLE 本地通道",
+                windows_diagnostics.CheckGroup.OPTIONAL_DRIVER,
+                windows_diagnostics.CheckStatus.PASS,
+                "OLD_PASS",
+            )
+        )
+
+        settings_controller.selectedEndpointIndexChanged.emit()
+
+        self.assertEqual(diag.vbCableTestStatus, "idle")
+        self.assertEqual(diag.vbCableTestMessage, "")
+
+    def test_vb_cable_channel_test_rejects_a_running_bridge(self):
+        settings_controller = self._make_settings_controller()
+        diag = self.DiagnosticsController(settings_controller, self._config_root)
+        self._pump_until(lambda: not diag.isRefreshing)
+
+        with mock.patch.object(
+            settings_controller, "_refresh_bridge_status", return_value=True
+        ), mock.patch.object(
+            windows_diagnostics, "check_vb_cable_loopback_isolated"
+        ) as loopback:
+            diag.testVbCableChannel()
+
+        self.assertFalse(diag.vbCableTestRunning)
+        self.assertEqual(diag.vbCableTestStatus, "fail")
+        self.assertIn("先停止桥接", diag.vbCableTestMessage)
+        loopback.assert_not_called()
+
+    def test_vb_cable_channel_test_rejects_a_bridge_launch_in_progress(self):
+        settings_controller = self._make_settings_controller()
+        diag = self.DiagnosticsController(settings_controller, self._config_root)
+        self._pump_until(lambda: not diag.isRefreshing)
+
+        with mock.patch.object(
+            settings_controller, "_get_bridge_launch_busy", return_value=True
+        ), mock.patch.object(
+            windows_diagnostics, "check_vb_cable_loopback_isolated"
+        ) as loopback:
+            diag.testVbCableChannel()
+
+        self.assertFalse(diag.vbCableTestRunning)
+        self.assertEqual(diag.vbCableTestStatus, "fail")
+        self.assertIn("正在启动", diag.vbCableTestMessage)
+        loopback.assert_not_called()
+
+    def test_vb_cable_channel_test_and_refresh_are_mutually_exclusive(self):
+        release_event = threading.Event()
+        call_count = {"n": 0}
+
+        def _blocking_check(*_args, **_kwargs):
+            call_count["n"] += 1
+            release_event.wait(timeout=5.0)
+            return windows_diagnostics.CheckResult(
+                "vb_cable_loopback",
+                "VB-CABLE 本地通道",
+                windows_diagnostics.CheckGroup.OPTIONAL_DRIVER,
+                windows_diagnostics.CheckStatus.FAIL,
+                "未收到测试信号。",
+            )
+
+        settings_controller = self._make_settings_controller()
+        diag = self.DiagnosticsController(settings_controller, self._config_root)
+        self._pump_until(lambda: not diag.isRefreshing)
+        with mock.patch.object(
+            settings_controller, "_refresh_bridge_status", return_value=False
+        ), mock.patch.object(
+            windows_diagnostics,
+            "check_vb_cable_loopback_isolated",
+            side_effect=_blocking_check,
+        ), mock.patch.object(
+            windows_diagnostics, "run_diagnostics", wraps=windows_diagnostics.run_diagnostics
+        ) as refresh:
+            diag.testVbCableChannel()
+            self.assertTrue(diag.vbCableTestRunning)
+            self.assertFalse(settings_controller.saveSettings())
+            self.assertIn("通道测试正在运行", settings_controller.errorMessage)
+            diag.testVbCableChannel()
+            diag.refreshDiagnostics()
+            self.assertFalse(diag.isRefreshing)
+            release_event.set()
+            self.assertTrue(self._pump_until(lambda: not diag.vbCableTestRunning))
+
+        self.assertEqual(call_count["n"], 1)
+        refresh.assert_not_called()
+
+    def test_vb_cable_channel_test_refuses_to_start_after_shutdown(self):
+        settings_controller = self._make_settings_controller()
+        diag = self.DiagnosticsController(settings_controller, self._config_root)
+        self._pump_until(lambda: not diag.isRefreshing)
+        qt_settings_app._diagnostics_shutdown_event.set()
+
+        with mock.patch.object(
+            windows_diagnostics, "check_vb_cable_loopback_isolated"
+        ) as loopback:
+            diag.testVbCableChannel()
+
+        self.assertFalse(diag.vbCableTestRunning)
+        loopback.assert_not_called()
 
     def test_launch_vb_cable_setup_reports_bundle_not_found_as_an_error(self):
         settings_controller = self._make_settings_controller()
@@ -2743,6 +2938,8 @@ diagnostics_names = (
     "optionalDriverSection",
     "selectCableInputButton",
     "launchDriverSetupButton",
+    "vbCableChannelTestSection",
+    "testVbCableChannelButton",
     "diagnosticsFooterSection",
     "openSpeechSettingsButton",
     "diagnosticsOpenLogButton",
@@ -3196,6 +3393,20 @@ class SettingsShellSourceContractTests(unittest.TestCase):
         self.assertNotIn(
             "details.push(rows[i].title + \"：\" + statusLabel(rows[i].status))",
             self.diagnostics_qml,
+        )
+
+    def test_diagnostics_exposes_loopback_as_an_explicit_nonautomatic_action(self):
+        self.assertIn('objectName: "vbCableChannelTestSection"', self.diagnostics_qml)
+        self.assertIn('objectName: "testVbCableChannelButton"', self.diagnostics_qml)
+        self.assertIn(
+            "onClicked: DiagnosticsController.testVbCableChannel()",
+            self.diagnostics_qml,
+        )
+        self.assertIn("DiagnosticsController.vbCableTestRunning", self.diagnostics_qml)
+        self.assertIn("不保存声音，也不修改默认设备", self.diagnostics_qml)
+        self.assertGreaterEqual(
+            self.connection_qml.count("!DiagnosticsController.vbCableTestRunning"),
+            4,
         )
 
     def test_bridge_required_warnings_are_visible_on_both_rc003_pages(self):

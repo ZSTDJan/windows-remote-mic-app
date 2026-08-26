@@ -456,6 +456,33 @@ class ArgumentModeBypassTests(_ArgvRestoringTestCase):
 
         self.assertEqual(enter_calls, [])
 
+    def test_vb_cable_loopback_child_never_touches_the_guard(self):
+        enter_calls = []
+        single_instance.BridgeInstanceGuard = _make_guard_class(enter_calls=enter_calls)
+        app.main = lambda: self.fail("loopback child must never call app.main()")
+        sys.argv = [
+            "ovb_rc003",
+            "--diagnose-vb-cable-loopback",
+            "/tmp/request.json",
+            "/tmp/result.json",
+        ]
+
+        original_entrypoint = (
+            windows_diagnostics.run_vb_cable_loopback_subprocess_entrypoint
+        )
+        windows_diagnostics.run_vb_cable_loopback_subprocess_entrypoint = (
+            lambda request_path, result_path: 0
+        )
+        try:
+            with self.assertRaises(SystemExit):
+                main_module.main()
+        finally:
+            windows_diagnostics.run_vb_cable_loopback_subprocess_entrypoint = (
+                original_entrypoint
+            )
+
+        self.assertEqual(enter_calls, [])
+
     def test_hid_injector_child_never_touches_the_guard(self):
         enter_calls = []
         received_args = []
@@ -554,7 +581,68 @@ class DiagnoseBleCandidatesDispatchTests(_ArgvRestoringTestCase):
             main_module.main()  # returns normally, no SystemExit
 
         self.assertNotIn("--diagnose-ble-candidates", buffer.getvalue())
+        self.assertNotIn("--diagnose-vb-cable-loopback", buffer.getvalue())
         self.assertNotIn("--on-request-probe", buffer.getvalue())
+
+
+class DiagnoseVbCableLoopbackDispatchTests(_ArgvRestoringTestCase):
+    def setUp(self):
+        super().setUp()
+        self._original_entrypoint = (
+            windows_diagnostics.run_vb_cable_loopback_subprocess_entrypoint
+        )
+
+    def tearDown(self):
+        windows_diagnostics.run_vb_cable_loopback_subprocess_entrypoint = (
+            self._original_entrypoint
+        )
+        super().tearDown()
+
+    def test_dispatches_both_paths_and_propagates_exit_code(self):
+        received = []
+        windows_diagnostics.run_vb_cable_loopback_subprocess_entrypoint = (
+            lambda request_path, result_path: received.append(
+                (request_path, result_path)
+            )
+            or 9
+        )
+        sys.argv = [
+            "ovb_rc003",
+            "--diagnose-vb-cable-loopback",
+            "/tmp/request.json",
+            "/tmp/result.json",
+        ]
+
+        with self.assertRaises(SystemExit) as ctx:
+            main_module.main()
+
+        self.assertEqual(received, [("/tmp/request.json", "/tmp/result.json")])
+        self.assertEqual(ctx.exception.code, 9)
+
+    def test_missing_paths_pass_none_through_fail_closed(self):
+        received = []
+        windows_diagnostics.run_vb_cable_loopback_subprocess_entrypoint = (
+            lambda request_path, result_path: received.append(
+                (request_path, result_path)
+            )
+            or 1
+        )
+        sys.argv = ["ovb_rc003", "--diagnose-vb-cable-loopback"]
+
+        with self.assertRaises(SystemExit) as ctx:
+            main_module.main()
+
+        self.assertEqual(received, [(None, None)])
+        self.assertEqual(ctx.exception.code, 1)
+
+    def test_flag_literal_stays_in_sync(self):
+        import inspect
+
+        source = inspect.getsource(main_module)
+        self.assertIn(
+            f'"{windows_diagnostics.VB_CABLE_LOOPBACK_SUBPROCESS_FLAG}" in args',
+            source,
+        )
 
 
 if __name__ == "__main__":

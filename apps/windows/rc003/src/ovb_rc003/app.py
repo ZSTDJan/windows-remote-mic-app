@@ -2008,6 +2008,20 @@ class RC003App:
                     stats["zero_crossings"],
                     stats["result"],
                 )
+                timing_snapshot = getattr(
+                    self._playback, "timing_snapshot", None
+                )
+                if callable(timing_snapshot):
+                    timing = timing_snapshot()
+                    self._logger.info(
+                        "voice playback timing: open_ms=%.2f writes=%s "
+                        "last_write_ms=%.2f max_write_ms=%.2f underflows=%s",
+                        timing.open_elapsed_ms,
+                        timing.write_count,
+                        timing.last_write_elapsed_ms,
+                        timing.max_write_elapsed_ms,
+                        timing.underflow_count,
+                    )
                 self._voice_audio_start_fallback_pending = False
                 self._voice_audio_started_waiting_for_legacy_f5 = False
                 self._voice_raw_input_trigger_pending = False
@@ -2206,14 +2220,27 @@ class RC003App:
             sink = audio_playback.EndpointPlaybackSink(endpoint_name, endpoint_host_api)
             self._playback = sink
             sink.open()
-            self._logger.info(
-                "voice playback opened: endpoint=%s host_api=%s "
-                "sample_rate=%s channels=%s",
-                endpoint_name or "unspecified",
-                endpoint_host_api or "unspecified",
-                sink.output_sample_rate_hz,
-                sink.output_channels,
-            )
+            timing_snapshot = getattr(sink, "timing_snapshot", None)
+            timing = timing_snapshot() if callable(timing_snapshot) else None
+            if timing is None:
+                self._logger.info(
+                    "voice playback opened: endpoint=%s host_api=%s "
+                    "sample_rate=%s channels=%s",
+                    endpoint_name or "unspecified",
+                    endpoint_host_api or "unspecified",
+                    sink.output_sample_rate_hz,
+                    sink.output_channels,
+                )
+            else:
+                self._logger.info(
+                    "voice playback opened: endpoint=%s host_api=%s "
+                    "sample_rate=%s channels=%s open_ms=%.2f",
+                    endpoint_name or "unspecified",
+                    endpoint_host_api or "unspecified",
+                    sink.output_sample_rate_hz,
+                    sink.output_channels,
+                    timing.open_elapsed_ms,
+                )
             return True
         except audio_output.AudioOutputUnavailableError as exc:
             self._logger.info("voice audio unavailable, failing closed: %s", exc)
@@ -2258,19 +2285,39 @@ class RC003App:
             return
         try:
             self._voice_pcm_stats.add(samples)
+            self._playback.write(samples)
             if self._voice_pcm_stats.frames in (1, 10) or self._voice_pcm_stats.frames % 200 == 0:
                 stats = self._voice_pcm_stats.summary()
-                self._logger.info(
-                    "voice PCM progress: frames=%s samples=%s peak=%s rms=%.1f "
-                    "mean_abs=%.1f clipped=%.3f%%",
-                    stats["frames"],
-                    stats["samples"],
-                    stats["peak"],
-                    stats["rms"],
-                    stats["mean_abs"],
-                    stats["clipped_pct"],
+                timing_snapshot = getattr(
+                    self._playback, "timing_snapshot", None
                 )
-            self._playback.write(samples)
+                timing = timing_snapshot() if callable(timing_snapshot) else None
+                if timing is None:
+                    self._logger.info(
+                        "voice PCM progress: frames=%s samples=%s peak=%s rms=%.1f "
+                        "mean_abs=%.1f clipped=%.3f%%",
+                        stats["frames"],
+                        stats["samples"],
+                        stats["peak"],
+                        stats["rms"],
+                        stats["mean_abs"],
+                        stats["clipped_pct"],
+                    )
+                else:
+                    self._logger.info(
+                        "voice PCM progress: frames=%s samples=%s peak=%s rms=%.1f "
+                        "mean_abs=%.1f clipped=%.3f%% write_ms=%.2f "
+                        "max_write_ms=%.2f underflows=%s",
+                        stats["frames"],
+                        stats["samples"],
+                        stats["peak"],
+                        stats["rms"],
+                        stats["mean_abs"],
+                        stats["clipped_pct"],
+                        timing.last_write_elapsed_ms,
+                        timing.max_write_elapsed_ms,
+                        timing.underflow_count,
+                    )
         except Exception:
             self._voice_pcm_forwarding_enabled = False
             self._logger.exception("audio playback write failed; failing closed")

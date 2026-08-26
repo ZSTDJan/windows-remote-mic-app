@@ -208,11 +208,14 @@ _diagnostics_threads_lock = threading.Lock()
 # process-global, persistent state, not per-test.
 _diagnostics_shutdown_event = threading.Event()
 
-# Safety margin ON TOP OF windows_diagnostics.BLE_DISCOVERY_MAX_
-# CANCELLATION_SECONDS below - covers the worker thread's own minimal
-# cleanup after _run_ble_diagnostics_subprocess() returns/raises (returning
-# through check_ble_candidate()/run_diagnostics()/_run_in_background()'s own
-# finally block), not the subprocess termination itself.
+# Cross-controller gate for the explicit active audio test. It prevents the
+# connection page from saving a different endpoint or launching the bridge
+# while the synthetic signal is in flight.
+_vb_cable_test_active_event = threading.Event()
+
+# Safety margin on top of the longest diagnostics-child cancellation bound
+# below. It covers the worker thread's own small amount of Python cleanup
+# after the BLE or active-audio subprocess has been confirmed stopped.
 _DIAGNOSTICS_THREAD_JOIN_SAFETY_MARGIN_SECONDS = 2.0
 
 # Per-thread bound for the best-effort atexit join below - a module-level
@@ -220,19 +223,15 @@ _DIAGNOSTICS_THREAD_JOIN_SAFETY_MARGIN_SECONDS = 2.0
 # it and prove the join is genuinely bounded/non-hanging without waiting
 # out the real default (see tests/test_qt_settings_app.py).
 #
-# XRBM-035 RETRY 1 P1 #2: DERIVED from windows_diagnostics.BLE_DISCOVERY_
-# MAX_CANCELLATION_SECONDS (poll-detection latency + both escalating
-# subprocess-termination waits), not an independently-guessed flat value -
-# an independent review found the previous flat 2.0s was actually SMALLER
-# than that module's own worst-case termination bound (poll 0.1s +
-# terminate_wait 2.0s + kill_wait 2.0s = 4.1s), so this join could return
-# "timed out" even on the happy path where the subprocess layer behaved
-# exactly as designed and eventually confirmed the child's death. Deriving
-# this value FROM that module's own constant means the two can never
-# silently drift apart again - if that module's termination bound ever
-# changes, this one moves with it automatically.
+# XRBM-035 RETRY 1 P1 #2: derive this from the subprocess layer's own
+# cancellation constants, rather than an independent flat guess. The max()
+# keeps both BLE discovery and the explicit VB-CABLE child inside the same
+# bounded shutdown contract if either implementation changes later.
 _DIAGNOSTICS_THREAD_JOIN_TIMEOUT_SECONDS = (
-    windows_diagnostics.BLE_DISCOVERY_MAX_CANCELLATION_SECONDS
+    max(
+        windows_diagnostics.BLE_DISCOVERY_MAX_CANCELLATION_SECONDS,
+        windows_diagnostics.VB_CABLE_LOOPBACK_MAX_CANCELLATION_SECONDS,
+    )
     + _DIAGNOSTICS_THREAD_JOIN_SAFETY_MARGIN_SECONDS
 )
 
@@ -1275,6 +1274,12 @@ def _load_qt_classes() -> dict:
             previous Tk _save_and_launch() did.
             """
 
+            if _vb_cable_test_active_event.is_set():
+                self._set_error_message(
+                    "VB-CABLE 通道测试正在运行；测试结束后再保存设置。"
+                )
+                return False
+
             trigger_mode = key_mapping.VoiceTriggerMode.HOLD
             endpoint_display = (
                 self._endpoint_options[self._selected_endpoint_index]
@@ -2208,6 +2213,9 @@ def _load_qt_classes() -> dict:
             rather than looking saved when it is not.
             """
 
+            if _vb_cable_test_active_event.is_set():
+                return False
+
             new_config = dict(self._config)
             new_config["output_endpoint_name"] = name
             new_config["output_endpoint_host_api"] = host_api
@@ -2246,12 +2254,14 @@ def _load_qt_classes() -> dict:
         driverStatusMessageChanged = Signal()
         driverInfoMessageChanged = Signal()
         driverErrorMessageChanged = Signal()
+        vbCableTestChanged = Signal()
         # Internal only - never connected to from QML. Carries a
         # windows_diagnostics.DiagnosticsReport (or None on an unexpected
         # worker-thread exception) back from the background thread to this
         # object's own (GUI) thread - see module docstring for why a plain
         # Signal(object) connection is sufficient here.
         _diagnosticsReady = Signal(object)
+        _vbCableTestReady = Signal(object)
 
         def __init__(self, settings_controller: "SettingsController", config_root, parent=None) -> None:
             super().__init__(parent)
@@ -2263,7 +2273,20 @@ def _load_qt_classes() -> dict:
             self._driver_status_message = ""
             self._driver_info_message = ""
             self._driver_error_message = ""
+            self._vb_cable_test_running = False
+            self._vb_cable_test_status = "idle"
+            self._vb_cable_test_message = ""
             self._diagnosticsReady.connect(self._on_diagnostics_ready)
+            self._vbCableTestReady.connect(self._on_vb_cable_test_ready)
+            self._settings_controller.endpointOptionsChanged.connect(
+                self._invalidate_vb_cable_test_result
+            )
+            self._settings_controller.selectedEndpointIndexChanged.connect(
+                self._invalidate_vb_cable_test_result
+            )
+            self._settings_controller.selectedDeviceChanged.connect(
+                self._invalidate_vb_cable_test_result
+            )
             self.refreshDiagnostics()
 
         # -- internal helpers -------------------------------------------------
@@ -2313,6 +2336,20 @@ def _load_qt_classes() -> dict:
             self.driverStatusMessageChanged.emit()
             self.driverInfoMessageChanged.emit()
 
+        def _set_vb_cable_test_state(
+            self, status: str, message: str, *, running: bool
+        ) -> None:
+            self._vb_cable_test_status = status
+            self._vb_cable_test_message = message
+            self._vb_cable_test_running = running
+            self.vbCableTestChanged.emit()
+
+        def _invalidate_vb_cable_test_result(self) -> None:
+            if self._vb_cable_test_running:
+                return
+            if self._vb_cable_test_status != "idle" or self._vb_cable_test_message:
+                self._set_vb_cable_test_state("idle", "", running=False)
+
         def _on_diagnostics_ready(self, report) -> None:
             """Delivered (cross-thread) once ``run_diagnostics()`` returns -
             or, if the background thread's own call raised something
@@ -2342,6 +2379,20 @@ def _load_qt_classes() -> dict:
             self.checkResultsChanged.emit()
             self.diagnosticsErrorMessageChanged.emit()
             self.isRefreshingChanged.emit()
+
+        def _on_vb_cable_test_ready(self, result) -> None:
+            if result is None:
+                self._set_vb_cable_test_state(
+                    "fail",
+                    "VB-CABLE 通道测试出现意外错误，未得到可信结果。",
+                    running=False,
+                )
+                return
+            self._set_vb_cable_test_state(
+                result.status.value,
+                result.detail,
+                running=False,
+            )
 
         # -- properties ---------------------------------------------------
 
@@ -2383,6 +2434,27 @@ def _load_qt_classes() -> dict:
             str, _get_driver_error_message, notify=driverErrorMessageChanged
         )
 
+        def _get_vb_cable_test_running(self) -> bool:
+            return self._vb_cable_test_running
+
+        vbCableTestRunning = Property(
+            bool, _get_vb_cable_test_running, notify=vbCableTestChanged
+        )
+
+        def _get_vb_cable_test_status(self) -> str:
+            return self._vb_cable_test_status
+
+        vbCableTestStatus = Property(
+            str, _get_vb_cable_test_status, notify=vbCableTestChanged
+        )
+
+        def _get_vb_cable_test_message(self) -> str:
+            return self._vb_cable_test_message
+
+        vbCableTestMessage = Property(
+            str, _get_vb_cable_test_message, notify=vbCableTestChanged
+        )
+
         # -- slots ----------------------------------------------------------
 
         def _emit_diagnostics_ready(self, report) -> None:
@@ -2397,6 +2469,9 @@ def _load_qt_classes() -> dict:
             """
 
             self._diagnosticsReady.emit(report)
+
+        def _emit_vb_cable_test_ready(self, result) -> None:
+            self._vbCableTestReady.emit(result)
 
         @Slot()
         def refreshDiagnostics(self) -> None:
@@ -2414,10 +2489,11 @@ def _load_qt_classes() -> dict:
             might not have time for.
             """
 
-            if self._is_refreshing:
+            if self._is_refreshing or self._vb_cable_test_running:
                 return
             if _diagnostics_shutdown_event.is_set():
                 return
+            self._invalidate_vb_cable_test_result()
             self._is_refreshing = True
             self.isRefreshingChanged.emit()
             saved_name, saved_host_api = self._saved_output_endpoint()
@@ -2463,6 +2539,78 @@ def _load_qt_classes() -> dict:
             _remember_diagnostics_thread(thread)
             thread.start()
 
+        @Slot()
+        def testVbCableChannel(self) -> None:
+            """Runs the active CABLE Input -> CABLE Output test on demand."""
+
+            if self._vb_cable_test_running or self._is_refreshing:
+                return
+            if _diagnostics_shutdown_event.is_set():
+                return
+            if self._settings_controller._get_bridge_launch_busy():
+                self._set_vb_cable_test_state(
+                    "fail",
+                    "桥接正在启动；请等待启动结束并停止桥接后，再测试 VB-CABLE 通道。",
+                    running=False,
+                )
+                return
+            bridge_running = self._settings_controller._refresh_bridge_status()
+            if bridge_running is None:
+                self._set_vb_cable_test_state(
+                    "unsupported",
+                    "当前无法确认桥接是否正在运行；为避免混入真实语音，本次未启动测试。",
+                    running=False,
+                )
+                return
+            if bridge_running:
+                self._set_vb_cable_test_state(
+                    "fail",
+                    "桥接正在运行；请先停止桥接，再测试 VB-CABLE 通道。",
+                    running=False,
+                )
+                return
+
+            saved_name, saved_host_api = self._saved_output_endpoint()
+            _vb_cable_test_active_event.set()
+            self._set_vb_cable_test_state(
+                "running",
+                "正在发送短测试信号，并检查 CABLE Output 是否收到。",
+                running=True,
+            )
+
+            def _run_in_background() -> None:
+                try:
+                    try:
+                        result = windows_diagnostics.check_vb_cable_loopback_isolated(
+                            saved_name,
+                            saved_host_api,
+                            cancel_event=_diagnostics_shutdown_event,
+                        )
+                    except Exception:  # noqa: BLE001 - never crash the worker thread
+                        result = None
+                    if _diagnostics_shutdown_event.is_set():
+                        return
+                    try:
+                        self._emit_vb_cable_test_ready(result)
+                    except Exception:  # noqa: BLE001 - Qt may already be tearing down
+                        pass
+                finally:
+                    _vb_cable_test_active_event.clear()
+                    _forget_diagnostics_thread(threading.current_thread())
+
+            thread = threading.Thread(target=_run_in_background, daemon=True)
+            _remember_diagnostics_thread(thread)
+            try:
+                thread.start()
+            except Exception:
+                _forget_diagnostics_thread(thread)
+                _vb_cable_test_active_event.clear()
+                self._set_vb_cable_test_state(
+                    "fail",
+                    "无法启动 VB-CABLE 通道测试后台任务。",
+                    running=False,
+                )
+
         @Slot(result=bool)
         def selectDetectedCableInputAsOutput(self) -> bool:
             """Re-enumerates playback endpoints (never trusts a possibly-
@@ -2479,6 +2627,9 @@ def _load_qt_classes() -> dict:
             save is never reported as if it succeeded.
             """
 
+            if self._vb_cable_test_running:
+                return False
+            self._invalidate_vb_cable_test_result()
             try:
                 endpoints = audio_output.enumerate_output_endpoints()
             except audio_output.AudioOutputUnavailableError as exc:
@@ -2518,6 +2669,7 @@ def _load_qt_classes() -> dict:
                 )
                 return False
 
+            self._set_vb_cable_test_state("idle", "", running=False)
             self._set_driver_status(f"已选择 {endpoint.name} 作为语音输出设备并保存。")
             return True
 
@@ -2531,6 +2683,7 @@ def _load_qt_classes() -> dict:
             vb_cable_bundle.py's module docstring for the full contract.
             """
 
+            self._set_vb_cable_test_state("idle", "", running=False)
             try:
                 vb_cable_bundle.prepare_and_launch_vendor_setup()
             except vb_cable_bundle.BundleNotFoundError as exc:
@@ -2687,4 +2840,6 @@ def run_settings_window() -> int:
                     # skip the diagnostics-worker shutdown contract.
                     _shutdown_diagnostics_workers()
                 finally:
-                    audio_playback.cleanup_retained_preflight_sink()
+                    audio_playback.cleanup_retained_portaudio_test_resources(
+                        blocking=False
+                    )

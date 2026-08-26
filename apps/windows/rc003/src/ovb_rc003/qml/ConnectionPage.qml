@@ -182,6 +182,7 @@ Item {
                                     currentIndex: SettingsController.selectedDeviceIndex
                                     onActivated: SettingsController.selectedDeviceIndex = index
                                     enabled: SettingsController.deviceCatalogAvailable
+                                        && !DiagnosticsController.vbCableTestRunning
                                     Accessible.name: qsTr("当前设备")
                                     KeyNavigation.tab: SettingsController.isRc003Device ? endpointCombo : refreshDjiButton
                                     onActiveFocusChanged: if (activeFocus) root.ensureVisible(this)
@@ -217,6 +218,7 @@ Item {
                                     model: SettingsController.endpointOptions
                                     currentIndex: SettingsController.selectedEndpointIndex
                                     onActivated: SettingsController.selectedEndpointIndex = index
+                                    enabled: !DiagnosticsController.vbCableTestRunning
                                     Accessible.name: qsTr("输出端点")
                                     KeyNavigation.tab: restoreDefaultsButton
                                     onActiveFocusChanged: if (activeFocus) root.ensureVisible(this)
@@ -377,6 +379,7 @@ Item {
                                     compactMinimumWidth: 116
                                     text: SettingsController.isRc003Device ? qsTr("仅保存设置") : qsTr("保存设备选择")
                                     highlighted: !SettingsController.isRc003Device
+                                    enabled: !DiagnosticsController.vbCableTestRunning
                                     onClicked: SettingsController.saveSettings()
                                 }
                                 CompactButton {
@@ -389,6 +392,7 @@ Item {
                                         ? qsTr("正在启动桥接") : qsTr("保存并启动桥接")
                                     highlighted: true
                                     enabled: !SettingsController.bridgeLaunchBusy
+                                        && !DiagnosticsController.vbCableTestRunning
                                     onClicked: SettingsController.saveAndLaunch()
                                 }
                             }

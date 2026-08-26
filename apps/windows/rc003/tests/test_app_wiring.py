@@ -2478,6 +2478,28 @@ class PlaybackWriteFailureTests(_AppWiringTestCase):
         self.assertIsNotNone(self.app._playback)
         self.assertEqual(reconnect_calls, [])
 
+    def test_write_success_logs_the_latest_playback_timing_snapshot(self):
+        class TimedSink(_FakePlaybackSink):
+            def timing_snapshot(self):
+                return app_module.audio_playback.PlaybackTimingSnapshot(
+                    open_elapsed_ms=12.0,
+                    last_write_elapsed_ms=2.5,
+                    max_write_elapsed_ms=3.5,
+                    write_count=1,
+                    underflow_count=2,
+                )
+
+        self.app._playback = TimedSink()
+        self.app._voice_pcm_forwarding_enabled = True
+
+        with self.assertLogs(self.app._logger, level="INFO") as captured:
+            self.app._on_pcm_frame([1, 2, 3])
+
+        self.assertIn(
+            "write_ms=2.50 max_write_ms=3.50 underflows=2",
+            "\n".join(captured.output),
+        )
+
     def test_no_playback_open_is_a_silent_no_op(self):
         self.app._playback = None
         self.app._voice_pcm_forwarding_enabled = True
@@ -2990,6 +3012,15 @@ class PlaybackCleanupOwnershipTests(_AppWiringTestCase):
             def open(self):
                 pass
 
+            def timing_snapshot(self):
+                return app_module.audio_playback.PlaybackTimingSnapshot(
+                    open_elapsed_ms=12.5,
+                    last_write_elapsed_ms=0.0,
+                    max_write_elapsed_ms=0.0,
+                    write_count=0,
+                    underflow_count=0,
+                )
+
         self.app._playback = None
         self.app._config["output_endpoint_name"] = "CABLE Input"
         self.app._config["output_endpoint_host_api"] = "Windows WASAPI"
@@ -3014,7 +3045,7 @@ class PlaybackCleanupOwnershipTests(_AppWiringTestCase):
 
         self.assertIn(
             "voice playback opened: endpoint=CABLE Input "
-            "host_api=Windows WASAPI sample_rate=48000 channels=2",
+            "host_api=Windows WASAPI sample_rate=48000 channels=2 open_ms=12.50",
             "\n".join(captured.output),
         )
 

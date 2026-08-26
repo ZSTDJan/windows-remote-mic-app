@@ -12,6 +12,7 @@ from unittest import mock
 
 from ovb_rc003 import (
     audio_output,
+    audio_playback,
     ble_transport_winrt,
     identity,
     raw_input_windows,
@@ -314,6 +315,170 @@ class VbCableEndpointsCheckTests(unittest.TestCase):
         self.assertEqual(result.status, diag.CheckStatus.UNSUPPORTED)
 
 
+class VbCableLoopbackCheckTests(unittest.TestCase):
+    @staticmethod
+    def _playback():
+        return [
+            audio_output.AudioEndpoint("CABLE Input", "Windows WASAPI")
+        ]
+
+    @staticmethod
+    def _recording():
+        return [
+            audio_output.AudioEndpoint("CABLE Output", "Windows WASAPI")
+        ]
+
+    @staticmethod
+    def _probe_result(*, detected=True, overflow=False, underflow=False):
+        return audio_playback.CableLoopbackProbeResult(
+            detected=detected,
+            correlation=0.99 if detected else 0.10,
+            baseline_rms=0.0,
+            signal_rms=0.1 if detected else 0.0,
+            roundtrip_latency_ms=12.5 if detected else None,
+            input_overflowed=overflow,
+            output_underflowed=underflow,
+            sample_rate_hz=48000,
+        )
+
+    def test_matching_signal_passes_without_claiming_dictation_works(self):
+        result = diag.check_vb_cable_loopback(
+            "CABLE Input",
+            "Windows WASAPI",
+            list_playback=self._playback,
+            list_recording=self._recording,
+            probe=lambda *_args, **_kwargs: self._probe_result(),
+        )
+
+        self.assertEqual(result.status, diag.CheckStatus.PASS)
+        self.assertIn("到达", result.detail)
+        self.assertIn("不代表输入法", result.detail)
+
+    def test_non_cable_saved_output_fails_without_running_probe(self):
+        probe = mock.Mock()
+        result = diag.check_vb_cable_loopback(
+            "Speakers",
+            "Windows WASAPI",
+            list_playback=lambda: [
+                audio_output.AudioEndpoint("Speakers", "Windows WASAPI")
+            ],
+            list_recording=self._recording,
+            probe=probe,
+        )
+
+        self.assertEqual(result.status, diag.CheckStatus.FAIL)
+        self.assertIn("不是 CABLE Input", result.detail)
+        probe.assert_not_called()
+
+    def test_recording_endpoint_must_share_the_selected_host_api(self):
+        result = diag.check_vb_cable_loopback(
+            "CABLE Input",
+            "Windows WASAPI",
+            list_playback=self._playback,
+            list_recording=lambda: [
+                audio_output.AudioEndpoint("CABLE Output", "MME")
+            ],
+            probe=mock.Mock(),
+        )
+
+        self.assertEqual(result.status, diag.CheckStatus.FAIL)
+        self.assertIn("同一音频接口", result.detail)
+
+    def test_silent_capture_fails(self):
+        result = diag.check_vb_cable_loopback(
+            "CABLE Input",
+            "Windows WASAPI",
+            list_playback=self._playback,
+            list_recording=self._recording,
+            probe=lambda *_args, **_kwargs: self._probe_result(detected=False),
+        )
+
+        self.assertEqual(result.status, diag.CheckStatus.FAIL)
+        self.assertIn("没有", result.detail)
+
+    def test_overflow_makes_an_otherwise_matching_capture_invalid(self):
+        result = diag.check_vb_cable_loopback(
+            "CABLE Input",
+            "Windows WASAPI",
+            list_playback=self._playback,
+            list_recording=self._recording,
+            probe=lambda *_args, **_kwargs: self._probe_result(overflow=True),
+        )
+
+        self.assertEqual(result.status, diag.CheckStatus.FAIL)
+        self.assertIn("无效", result.detail)
+
+    def test_automatic_diagnostics_never_runs_the_active_loopback(self):
+        with mock.patch.object(diag, "check_vb_cable_loopback") as loopback:
+            report = diag.run_diagnostics(cancel_event=threading.Event())
+
+        self.assertEqual(len(report.checks), 7)
+        loopback.assert_not_called()
+
+    def test_isolated_check_returns_the_validated_child_result(self):
+        expected = diag.CheckResult(
+            "vb_cable_loopback",
+            "VB-CABLE 本地通道",
+            diag.CheckGroup.OPTIONAL_DRIVER,
+            diag.CheckStatus.PASS,
+            "测试信号已到达。",
+        )
+        with mock.patch.object(
+            diag, "_run_vb_cable_loopback_in_tempdir", return_value=expected
+        ):
+            result = diag.check_vb_cable_loopback_isolated(
+                "CABLE Input", "Windows WASAPI"
+            )
+
+        self.assertEqual(result, expected)
+
+    def test_isolated_hard_timeout_is_an_honest_fail(self):
+        with mock.patch.object(
+            diag,
+            "_run_vb_cable_loopback_in_tempdir",
+            side_effect=diag.VbCableLoopbackCancelledError("timed out"),
+        ):
+            result = diag.check_vb_cable_loopback_isolated(
+                "CABLE Input", "Windows WASAPI"
+            )
+
+        self.assertEqual(result.status, diag.CheckStatus.FAIL)
+        self.assertIn("超时", result.detail)
+        self.assertIn("已停止测试进程", result.detail)
+
+    def test_isolated_shutdown_cancellation_is_not_reported_as_a_device_failure(self):
+        cancel_event = threading.Event()
+        cancel_event.set()
+        with mock.patch.object(
+            diag,
+            "_run_vb_cable_loopback_in_tempdir",
+            side_effect=diag.VbCableLoopbackCancelledError("cancelled"),
+        ):
+            result = diag.check_vb_cable_loopback_isolated(
+                "CABLE Input",
+                "Windows WASAPI",
+                cancel_event=cancel_event,
+            )
+
+        self.assertEqual(result.status, diag.CheckStatus.UNSUPPORTED)
+        self.assertIn("取消", result.detail)
+
+    def test_isolated_unconfirmed_child_shutdown_is_distinct(self):
+        with mock.patch.object(
+            diag,
+            "_run_vb_cable_loopback_in_tempdir",
+            side_effect=diag.VbCableLoopbackSubprocessShutdownUnconfirmedError(
+                "unconfirmed"
+            ),
+        ):
+            result = diag.check_vb_cable_loopback_isolated(
+                "CABLE Input", "Windows WASAPI"
+            )
+
+        self.assertEqual(result.status, diag.CheckStatus.FAIL)
+        self.assertIn("未能确认", result.detail)
+
+
 class OutputEndpointResolutionCheckTests(unittest.TestCase):
     def test_resolves_to_cable_input_passes_with_positive_note(self):
         result = diag.check_output_endpoint_resolution(
@@ -562,6 +727,44 @@ class BuildBleDiagnosticsSubprocessCommandTests(unittest.TestCase):
         self.assertEqual(command[0], sys.executable)
 
 
+class BuildVbCableLoopbackSubprocessCommandTests(unittest.TestCase):
+    def test_source_mode_passes_both_private_file_paths(self):
+        command = diag.build_vb_cable_loopback_subprocess_command(
+            "/tmp/request.json",
+            "/tmp/result.json",
+            frozen=False,
+            executable="/usr/bin/python3",
+        )
+        self.assertEqual(
+            command,
+            [
+                "/usr/bin/python3",
+                "-m",
+                "ovb_rc003",
+                diag.VB_CABLE_LOOPBACK_SUBPROCESS_FLAG,
+                "/tmp/request.json",
+                "/tmp/result.json",
+            ],
+        )
+
+    def test_frozen_mode_reinvokes_the_exe_directly(self):
+        command = diag.build_vb_cable_loopback_subprocess_command(
+            "request.json",
+            "result.json",
+            frozen=True,
+            executable="RemoteMicRC003.exe",
+        )
+        self.assertEqual(
+            command,
+            [
+                "RemoteMicRC003.exe",
+                diag.VB_CABLE_LOOPBACK_SUBPROCESS_FLAG,
+                "request.json",
+                "result.json",
+            ],
+        )
+
+
 class SanitizeVerdictPayloadTests(unittest.TestCase):
     """XRBM-035 RETRY 1 P2/D: the strict-allow-list parser is the ONLY place
     raw, untrusted result-file content is allowed to influence this
@@ -795,6 +998,84 @@ class BleDiagnosticsSubprocessEntrypointTests(unittest.TestCase):
         self.assertNotIn("boom", raw_text)
 
 
+class VbCableLoopbackSubprocessEntrypointTests(unittest.TestCase):
+    def setUp(self):
+        self._tmpdir = tempfile.mkdtemp()
+        self._request_path = os.path.join(self._tmpdir, "request.json")
+        self._result_path = os.path.join(self._tmpdir, "result.json")
+
+    def tearDown(self):
+        shutil.rmtree(self._tmpdir, ignore_errors=True)
+
+    def _write_request(self, payload=None):
+        value = payload or {
+            "saved_output_name": "CABLE Input",
+            "saved_output_host_api": "Windows WASAPI",
+        }
+        with open(self._request_path, "w", encoding="utf-8") as handle:
+            json.dump(value, handle)
+
+    def test_invalid_request_fails_closed_before_touching_audio(self):
+        self._write_request({"unexpected": "value"})
+        with mock.patch.object(diag, "check_vb_cable_loopback") as direct_check:
+            exit_code = diag.run_vb_cable_loopback_subprocess_entrypoint(
+                self._request_path, self._result_path
+            )
+
+        self.assertEqual(exit_code, 1)
+        self.assertFalse(os.path.exists(self._result_path))
+        direct_check.assert_not_called()
+
+    def test_valid_request_writes_only_the_sanitized_check_result(self):
+        self._write_request()
+        child_result = diag.CheckResult(
+            "vb_cable_loopback",
+            "VB-CABLE 本地通道",
+            diag.CheckGroup.OPTIONAL_DRIVER,
+            diag.CheckStatus.PASS,
+            "测试信号已到达，不代表输入法已经识别文字。",
+        )
+        with mock.patch.object(
+            diag, "check_vb_cable_loopback", return_value=child_result
+        ) as direct_check:
+            exit_code = diag.run_vb_cable_loopback_subprocess_entrypoint(
+                self._request_path, self._result_path
+            )
+
+        self.assertEqual(exit_code, 0)
+        direct_check.assert_called_once_with("CABLE Input", "Windows WASAPI")
+        with open(self._result_path, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+        self.assertEqual(
+            payload,
+            {
+                "status": "pass",
+                "detail": "测试信号已到达，不代表输入法已经识别文字。",
+            },
+        )
+
+
+class VbCableLoopbackResultValidationTests(unittest.TestCase):
+    def test_accepts_a_strict_well_formed_result(self):
+        result = diag._sanitize_vb_cable_loopback_result(
+            {"status": "pass", "detail": "测试通过。"}
+        )
+        self.assertIsNotNone(result)
+        self.assertEqual(result.status, diag.CheckStatus.PASS)
+
+    def test_rejects_extra_keys_or_untrusted_status(self):
+        self.assertIsNone(
+            diag._sanitize_vb_cable_loopback_result(
+                {"status": "pass", "detail": "测试通过。", "device": "secret"}
+            )
+        )
+        self.assertIsNone(
+            diag._sanitize_vb_cable_loopback_result(
+                {"status": "manual", "detail": "not allowed"}
+            )
+        )
+
+
 class _FakeProc:
     """A minimal ``Popen``-like double for exercising
     ``_attempt_termination_step()``'s own process-control exception
@@ -944,6 +1225,119 @@ class AttemptTerminationStepTests(unittest.TestCase):
         self.assertTrue(result)
         self.assertEqual(proc.terminate_calls, 1)
         self.assertEqual(proc.kill_calls, 1)
+
+
+class RunVbCableLoopbackSubprocessTests(unittest.TestCase):
+    def test_cancel_event_already_set_never_spawns(self):
+        cancel_event = threading.Event()
+        cancel_event.set()
+
+        def _unexpected_popen(*_args, **_kwargs):
+            raise AssertionError("cancelled test must not spawn")
+
+        with self.assertRaises(diag.VbCableLoopbackCancelledError):
+            diag._run_vb_cable_loopback_subprocess(
+                ["irrelevant"],
+                result_path="irrelevant",
+                cancel_event=cancel_event,
+                timeout=1.0,
+                popen=_unexpected_popen,
+            )
+
+    def test_total_timeout_terminates_and_confirms_the_child(self):
+        proc = _FakeProc(poll_returns=None)
+        with self.assertRaises(diag.VbCableLoopbackCancelledError):
+            diag._run_vb_cable_loopback_subprocess(
+                ["irrelevant"],
+                result_path="irrelevant",
+                cancel_event=threading.Event(),
+                timeout=0.0,
+                popen=lambda *_args, **_kwargs: proc,
+            )
+
+        self.assertEqual(proc.terminate_calls, 1)
+        self.assertEqual(proc.kill_calls, 0)
+        self.assertEqual(proc.wait_calls, 1)
+
+    def test_unconfirmed_termination_is_reported_distinctly(self):
+        proc = _FakeProc(
+            poll_returns=None,
+            wait_raises=subprocess.TimeoutExpired(cmd="x", timeout=0.01),
+        )
+        with self.assertRaises(
+            diag.VbCableLoopbackSubprocessShutdownUnconfirmedError
+        ):
+            diag._run_vb_cable_loopback_subprocess(
+                ["irrelevant"],
+                result_path="irrelevant",
+                cancel_event=threading.Event(),
+                timeout=0.0,
+                terminate_wait=0.01,
+                kill_wait=0.01,
+                popen=lambda *_args, **_kwargs: proc,
+            )
+
+        self.assertEqual(proc.terminate_calls, 1)
+        self.assertEqual(proc.kill_calls, 1)
+
+    def test_real_child_result_is_read_only_after_the_child_exits(self):
+        tmpdir = tempfile.mkdtemp()
+        try:
+            result_path = os.path.join(tmpdir, "result.json")
+            payload = json.dumps(
+                {"status": "fail", "detail": "isolated child completed"}
+            )
+            script = (
+                "import pathlib, sys\n"
+                f"pathlib.Path(sys.argv[1]).write_text({payload!r}, encoding='utf-8')\n"
+            )
+
+            result = diag._run_vb_cable_loopback_subprocess(
+                [sys.executable, "-c", script, result_path],
+                result_path=result_path,
+                cancel_event=threading.Event(),
+                timeout=5.0,
+            )
+
+            self.assertIsNotNone(result)
+            self.assertEqual(result.status, diag.CheckStatus.FAIL)
+            self.assertEqual(result.detail, "isolated child completed")
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_real_native_phase_hang_is_terminated_and_confirmed_dead(self):
+        process_holder = {}
+
+        def _spawning_popen(_cmd, **kwargs):
+            proc = subprocess.Popen(
+                [sys.executable, "-c", "import time; time.sleep(120)"],
+                **kwargs,
+            )
+            process_holder["proc"] = proc
+            return proc
+
+        started = time.monotonic()
+        try:
+            with self.assertRaises(diag.VbCableLoopbackCancelledError):
+                diag._run_vb_cable_loopback_subprocess(
+                    ["replaced by _spawning_popen"],
+                    result_path="irrelevant",
+                    cancel_event=threading.Event(),
+                    timeout=0.2,
+                    poll_interval=0.05,
+                    terminate_wait=1.0,
+                    kill_wait=1.0,
+                    popen=_spawning_popen,
+                )
+        finally:
+            proc = process_holder.get("proc")
+            if proc is not None and proc.poll() is None:
+                proc.kill()
+                proc.wait(timeout=5.0)
+
+        elapsed = time.monotonic() - started
+        self.assertLess(elapsed, 5.0)
+        self.assertIsNotNone(process_holder["proc"].poll())
 
 
 def _spawn_ovb_rc003(*args: str) -> "list[str]":
