@@ -96,29 +96,31 @@ Item {
             SectionFrame {
                 tokens: root.tokens
                 Layout.fillWidth: true
-                Layout.preferredHeight: 44
+                Layout.preferredHeight: 38
                 horizontalPadding: 9
-                verticalPadding: 6
+                verticalPadding: 5
 
                 RowLayout {
                     Layout.fillWidth: true
                     spacing: 7
-                    ColumnLayout {
-                        spacing: 1
-                        UiLabel {
-                            tokens: root.tokens
-                            kind: bodyKind
-                            text: DiagnosticsController.isRefreshing
-                                ? qsTr("正在检查")
-                                : DiagnosticsController.diagnosticsErrorMessage.length > 0
-                                    ? qsTr("检查失败")
-                                    : DiagnosticsController.checkResults.length > 0
-                                        ? qsTr("检查已完成") : qsTr("尚未运行检查")
-                            font.weight: Font.Medium
-                        }
-                        UiLabel { tokens: root.tokens; kind: noteKind; text: qsTr("检查系统、遥控器和语音连接") }
+                    UiLabel {
+                        tokens: root.tokens
+                        kind: bodyKind
+                        text: DiagnosticsController.isRefreshing
+                            ? qsTr("正在检查")
+                            : DiagnosticsController.diagnosticsErrorMessage.length > 0
+                                ? qsTr("检查失败")
+                                : DiagnosticsController.checkResults.length > 0
+                                    ? qsTr("检查已完成") : qsTr("尚未运行检查")
+                        font.weight: Font.Medium
                     }
-                    Item { Layout.fillWidth: true }
+                    UiLabel {
+                        tokens: root.tokens
+                        kind: noteKind
+                        Layout.fillWidth: true
+                        text: qsTr("检查系统、遥控器和语音连接")
+                        elide: Text.ElideRight
+                    }
                     BusyIndicator {
                         id: refreshBusyIndicator
                         objectName: "refreshBusyIndicator"
@@ -169,8 +171,8 @@ Item {
                     tokens: root.tokens
                     Layout.fillWidth: true
                     horizontalPadding: 9
-                    verticalPadding: 7
-                    contentSpacing: 6
+                    verticalPadding: 5
+                    contentSpacing: 4
 
                     Repeater {
                         model: diagnosticsRowsModel
@@ -223,14 +225,14 @@ Item {
                         CompactButton {
                             objectName: "selectCableInputButton"
                             tokens: root.tokens
-                            compactMinimumWidth: 64
+                            compactMinimumWidth: tokens.buttonWidth4Chars
                             text: qsTr("选择端点")
                             onClicked: DiagnosticsController.selectDetectedCableInputAsOutput()
                         }
                         CompactButton {
                             objectName: "launchDriverSetupButton"
                             tokens: root.tokens
-                            compactMinimumWidth: 64
+                            compactMinimumWidth: tokens.buttonWidth4Chars
                             text: qsTr("安装修复")
                             onClicked: driverConfirmDialog.open()
                         }
@@ -242,19 +244,19 @@ Item {
                         tokens: root.tokens
                         iconGlyph: "\uE8B7"
                         titleText: qsTr("系统与日志")
-                        descriptionText: qsTr("打开语音设置或日志；日志不保存语音和设备信息。")
+                        descriptionText: qsTr("打开系统设置或日志目录。")
                         showDivider: false
                         CompactButton {
                             objectName: "openSpeechSettingsButton"
                             tokens: root.tokens
-                            compactMinimumWidth: 64
+                            compactMinimumWidth: tokens.buttonWidth4Chars
                             text: qsTr("语音设置")
                             onClicked: SettingsController.openSpeechSettings()
                         }
                         CompactButton {
                             objectName: "diagnosticsOpenLogButton"
                             tokens: root.tokens
-                            compactMinimumWidth: 64
+                            compactMinimumWidth: tokens.buttonWidth4Chars
                             text: qsTr("日志目录")
                             onClicked: SettingsController.openLogLocation()
                         }

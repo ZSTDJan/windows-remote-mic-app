@@ -4,7 +4,6 @@
 // SettingsController/ButtonMappingModel are QML singletons - see main.qml.
 import QtQuick
 import QtQuick.Controls
-import QtQuick.Dialogs
 import QtQuick.Layouts
 import OvbRc003Settings 1.0
 
@@ -12,12 +11,14 @@ Item {
     id: root
     property var tokens
     readonly property var leftButtonIds: ["power", "up", "left", "back", "home", "menu"]
-    readonly property real mappingCardGap: 4
-    readonly property real mappingCardHeight: Math.max(
-        38,
-        Math.min(45, (mappingList.height - mappingCardGap * 6) / 7)
-    )
+    readonly property real mappingCardGap: 2
+    readonly property real mappingCardHeight: 42
+    readonly property real mappingBoardGap: 6
     property bool connectorRepaintQueued: false
+
+    onWidthChanged: scheduleConnectorRepaint()
+    onHeightChanged: scheduleConnectorRepaint()
+    Component.onCompleted: scheduleConnectorRepaint()
 
     function scheduleConnectorRepaint() {
         if (connectorRepaintQueued)
@@ -26,11 +27,7 @@ Item {
         Qt.callLater(function() {
             connectorRepaintQueued = false
             mappingLines.requestPaint()
-            for (let i = 0; i < photoHotspotRepeater.count; i++) {
-                const hotspot = photoHotspotRepeater.itemAt(i)
-                if (hotspot)
-                    hotspot.requestConnectorPaint()
-            }
+            activeMappingLine.requestPaint()
         })
     }
 
@@ -49,39 +46,14 @@ Item {
 
     function connectorControlRadius(startX, endX) {
         const span = Math.abs(endX - startX)
-        return Math.min(32, Math.max(6, span * 0.42), span * 0.48)
+        const preferred = Math.max(12, Math.min(72, span * 0.56))
+        return Math.min(preferred, span * 0.48)
     }
 
     function connectorStrokeColor(active) {
         if (active)
             return tokens.accent
-        return Qt.rgba(
-            tokens.borderStrong.r,
-            tokens.borderStrong.g,
-            tokens.borderStrong.b,
-            0.75
-        )
-    }
-
-    function connectorSplitParameter(
-        startX, control1X, control2X, endX, splitX
-    ) {
-        let low = 0
-        let high = 1
-        const increasing = endX >= startX
-        for (let i = 0; i < 16; i++) {
-            const t = (low + high) / 2
-            const oneMinusT = 1 - t
-            const x = oneMinusT * oneMinusT * oneMinusT * startX
-                + 3 * oneMinusT * oneMinusT * t * control1X
-                + 3 * oneMinusT * t * t * control2X
-                + t * t * t * endX
-            if ((x < splitX) === increasing)
-                low = t
-            else
-                high = t
-        }
-        return (low + high) / 2
+        return tokens.borderStrong
     }
 
     function connectorRoute(card, hotspot, coordinateItem) {
@@ -100,7 +72,6 @@ Item {
             hotspot.height / 2
         )
         const endX = center.x
-            + (leftSide ? -hotspot.width / 2 : hotspot.width / 2)
         const endY = center.y
         const direction = leftSide ? 1 : -1
         const controlRadius = root.connectorControlRadius(start.x, endX)
@@ -108,41 +79,50 @@ Item {
         const control1Y = start.y
         const control2X = endX - direction * controlRadius
         const control2Y = endY
-        const framePoint = photoFrame.mapToItem(
-            coordinateItem,
-            leftSide ? 0 : photoFrame.width,
-            0
-        )
-        const splitT = root.connectorSplitParameter(
-            start.x, control1X, control2X, endX, framePoint.x
-        )
-        const aX = start.x + (control1X - start.x) * splitT
-        const aY = start.y + (control1Y - start.y) * splitT
-        const bX = control1X + (control2X - control1X) * splitT
-        const bY = control1Y + (control2Y - control1Y) * splitT
-        const cX = control2X + (endX - control2X) * splitT
-        const cY = control2Y + (endY - control2Y) * splitT
-        const dX = aX + (bX - aX) * splitT
-        const dY = aY + (bY - aY) * splitT
-        const eX = bX + (cX - bX) * splitT
-        const eY = bY + (cY - bY) * splitT
-        const splitX = dX + (eX - dX) * splitT
-        const splitY = dY + (eY - dY) * splitT
         return {
             startX: start.x,
             startY: start.y,
-            firstControl1X: aX,
-            firstControl1Y: aY,
-            firstControl2X: dX,
-            firstControl2Y: dY,
-            splitX: splitX,
-            splitY: splitY,
-            secondControl1X: eX,
-            secondControl1Y: eY,
-            secondControl2X: cX,
-            secondControl2Y: cY,
+            control1X: control1X,
+            control1Y: control1Y,
+            control2X: control2X,
+            control2Y: control2Y,
             endX: endX,
             endY: endY
+        }
+    }
+
+    function paintConnectors(canvas, activeOnly) {
+        const ctx = canvas.getContext("2d")
+        ctx.reset()
+        for (let i = 0; i < ButtonMappingModel.rowCount(); i++) {
+            const leftCard = leftCardRepeater.itemAt(i)
+            const rightCard = rightCardRepeater.itemAt(i)
+            const hotspot = photoHotspotRepeater.itemAt(i)
+            const buttonId = hotspot ? hotspot.buttonId : ""
+            const active = SettingsController.selectedButtonId === buttonId
+            if (active !== activeOnly)
+                continue
+            const card = root.isLeftButton(buttonId) ? leftCard : rightCard
+            if (!card || !hotspot || !card.visible || !hotspot.visible)
+                continue
+            const route = root.connectorRoute(card, hotspot, canvas)
+            if (!route)
+                continue
+            ctx.beginPath()
+            ctx.lineCap = "round"
+            ctx.lineJoin = "round"
+            ctx.moveTo(route.startX, route.startY)
+            ctx.bezierCurveTo(
+                route.control1X,
+                route.control1Y,
+                route.control2X,
+                route.control2Y,
+                route.endX,
+                route.endY
+            )
+            ctx.strokeStyle = root.connectorStrokeColor(active)
+            ctx.lineWidth = active ? 2.2 : 1.25
+            ctx.stroke()
         }
     }
 
@@ -156,14 +136,11 @@ Item {
         return names[buttonId] || buttonId
     }
 
-    function openShortcutRecorder(buttonId, rowIndex, trigger, voiceMode) {
+    function openShortcutRecorder(buttonId, rowIndex, trigger) {
         shortcutRecorder.buttonId = buttonId
         shortcutRecorder.rowIndex = rowIndex
         shortcutRecorder.trigger = trigger || "single_click"
-        shortcutRecorder.voiceMode = voiceMode || ""
-        shortcutRecorder.previewText = voiceMode
-            ? qsTr("请按下输入法中已设置的语音快捷键")
-            : qsTr("请按下希望遥控器发送的键盘快捷键")
+        shortcutRecorder.previewText = qsTr("请按下希望遥控器发送的键盘快捷键")
         shortcutRecorder.open()
     }
 
@@ -174,173 +151,41 @@ Item {
         onTriggered: SettingsController.pollKeyDetectionBridge()
     }
 
-    FileDialog {
-        id: voiceProgramFileDialog
-        title: qsTr("选择语音程序")
-        nameFilters: [
-            qsTr("程序或快捷方式 (*.exe *.lnk)"),
-            qsTr("所有文件 (*)")
-        ]
-        onAccepted: SettingsController.voiceProgramCustomPath = selectedFile
-    }
-
-    Dialog {
-        id: voiceProgramDialog
-        objectName: "voiceProgramDialog"
-        modal: true
-        anchors.centerIn: parent
-        width: Math.min(540, root.width - tokens.spacingLarge * 2)
-        title: qsTr("语音程序")
-        standardButtons: Dialog.Close
-        onOpened: SettingsController.refreshVoiceProgramStatus()
-
-        contentItem: ColumnLayout {
-            spacing: tokens.spacingMedium
-
-            RowLayout {
-                Layout.fillWidth: true
-                spacing: tokens.spacingSmall
-                Label {
-                    Layout.preferredWidth: 92
-                    text: qsTr("语音输入程序")
-                    color: tokens.textPrimary
-                    font.weight: Font.Medium
-                }
-                SelectionComboBox {
-                    id: voiceProgramCombo
-                    objectName: "voiceProgramCombo"
-                    tokens: root.tokens
-                    Layout.fillWidth: true
-                    model: SettingsController.voiceProgramOptions
-                    currentIndex: SettingsController.selectedVoiceProgramIndex
-                    onActivated: SettingsController.selectedVoiceProgramIndex = index
-                    Accessible.name: qsTr("语音输入程序")
-                }
-            }
-
-            RowLayout {
-                Layout.fillWidth: true
-                visible: SettingsController.selectedVoiceProgramIndex === 2
-                spacing: tokens.spacingSmall
-                Label {
-                    Layout.preferredWidth: 92
-                    text: qsTr("程序路径")
-                    color: tokens.textPrimary
-                    font.weight: Font.Medium
-                }
-                CompactTextField {
-                    objectName: "voiceProgramCustomPathField"
-                    tokens: root.tokens
-                    Layout.fillWidth: true
-                    text: SettingsController.voiceProgramCustomPath
-                    placeholderText: qsTr("选择 .exe 或 .lnk")
-                    onEditingFinished: SettingsController.voiceProgramCustomPath = text
-                    Accessible.name: qsTr("自定义语音程序路径")
-                }
-                CompactButton {
-                    objectName: "browseVoiceProgramButton"
-                    tokens: root.tokens
-                    compactMinimumWidth: 58
-                    text: qsTr("选择")
-                    onClicked: voiceProgramFileDialog.open()
-                }
-            }
-
-            CheckBox {
-                objectName: "voiceProgramAutoStartCheckBox"
-                text: qsTr("随桥接启动")
-                checked: SettingsController.voiceProgramLaunchOnBridgeStart
-                enabled: SettingsController.selectedVoiceProgramIndex !== 0
-                onClicked: SettingsController.voiceProgramLaunchOnBridgeStart = checked
-            }
-
-            CheckBox {
-                objectName: "voiceProgramElevatedCheckBox"
-                text: qsTr("以管理员权限启动")
-                checked: SettingsController.voiceProgramLaunchElevated
-                enabled: SettingsController.selectedVoiceProgramIndex !== 0
-                onClicked: SettingsController.voiceProgramLaunchElevated = checked
-            }
-
-            Label {
-                Layout.fillWidth: true
-                visible: SettingsController.voiceProgramLaunchElevated
-                    && SettingsController.selectedVoiceProgramIndex !== 0
-                text: qsTr("启动时会显示 Windows 管理员确认；取消不会影响 Remote Mic。")
-                wrapMode: Text.WordWrap
-                color: tokens.textSecondary
-                font.pixelSize: tokens.fontSizeSmall
-            }
-
-            Label {
-                objectName: "voiceProgramStatusLabel"
-                Layout.fillWidth: true
-                text: SettingsController.voiceProgramStatusText
-                wrapMode: Text.WordWrap
-                color: tokens.textSecondary
-                font.pixelSize: tokens.fontSizeSmall
-            }
-
-            RowLayout {
-                Layout.fillWidth: true
-                Layout.alignment: Qt.AlignRight
-                spacing: tokens.spacingSmall
-                Item { Layout.fillWidth: true }
-                CompactButton {
-                    objectName: "refreshVoiceProgramButton"
-                    tokens: root.tokens
-                    compactMinimumWidth: 64
-                    text: qsTr("重新检测")
-                    onClicked: SettingsController.refreshVoiceProgramStatus()
-                }
-                CompactButton {
-                    objectName: "launchVoiceProgramButton"
-                    tokens: root.tokens
-                    compactMinimumWidth: 58
-                    text: qsTr("启动")
-                    enabled: SettingsController.selectedVoiceProgramIndex !== 0
-                    onClicked: SettingsController.launchVoiceProgram()
-                }
-                CompactButton {
-                    objectName: "saveVoiceProgramButton"
-                    tokens: root.tokens
-                    compactMinimumWidth: 58
-                    text: qsTr("保存")
-                    highlighted: true
-                    onClicked: {
-                        if (SettingsController.saveSettings())
-                            voiceProgramDialog.close()
-                    }
-                }
-            }
+    Connections {
+        target: ButtonMappingModel
+        function onDataChanged() {
+            root.scheduleConnectorRepaint()
         }
     }
+
 
     Dialog {
         id: shortcutRecorder
         objectName: "shortcutRecorderDialog"
         modal: true
+        popupType: Popup.Item
         anchors.centerIn: parent
-        width: 430
-        title: qsTr("录制自定义快捷键")
-        standardButtons: Dialog.Cancel
+        width: Math.min(430, root.width - 28)
+        readonly property string headerText: qsTr("录入快捷键")
+        title: headerText
+        standardButtons: Dialog.NoButton
+        leftPadding: 14
+        rightPadding: 14
+        topPadding: 0
+        bottomPadding: 11
+        leftInset: 0
+        rightInset: 0
+        topInset: 0
+        bottomInset: 0
+        closePolicy: Popup.CloseOnEscape
         property string buttonId: ""
         property int rowIndex: -1
         property string trigger: "single_click"
-        property string voiceMode: ""
         property string previewText: ""
 
         function commitShortcut(chord) {
             previewText = chord
-            if (voiceMode === "hold")
-                SettingsController.holdVoiceHotkeyText = chord
-            else if (trigger === "single_click") {
-                ButtonMappingModel.setActionTextAt(rowIndex, chord)
-                actionEditor.applyCapturedShortcut(rowIndex, trigger, chord)
-            } else {
-                ButtonMappingModel.setSecondaryActionTextAt(rowIndex, trigger, chord)
-                actionEditor.applyCapturedShortcut(rowIndex, trigger, chord)
-            }
+            actionEditor.applyCapturedShortcut(rowIndex, trigger, chord)
             close()
         }
 
@@ -350,6 +195,49 @@ Item {
         }
 
         onClosed: SettingsController.stopHotkeyCapture()
+
+        background: Rectangle {
+            radius: tokens.cornerRadiusLarge
+            color: tokens.surface
+            border.width: 1
+            border.color: tokens.borderStrong
+        }
+
+        header: Item {
+            width: shortcutRecorder.width
+            implicitHeight: 38
+
+            UiLabel {
+                anchors.left: parent.left
+                anchors.leftMargin: 14
+                anchors.verticalCenter: parent.verticalCenter
+                tokens: root.tokens
+                kind: sectionTitleKind
+                text: shortcutRecorder.headerText
+                font.weight: Font.Medium
+            }
+
+            ToolButton {
+                id: shortcutRecorderCloseButton
+                objectName: "shortcutRecorderCloseButton"
+                x: shortcutRecorder.width - width - 7
+                anchors.verticalCenter: parent.verticalCenter
+                implicitWidth: 28
+                implicitHeight: 28
+                contentItem: Label {
+                    text: "X"
+                    color: tokens.textSecondary
+                    font.family: tokens.fontFamily
+                    font.pixelSize: 18
+                    horizontalAlignment: Text.AlignHCenter
+                    verticalAlignment: Text.AlignVCenter
+                }
+                onClicked: shortcutRecorder.close()
+                Accessible.name: qsTr("关闭")
+                ToolTip.visible: hovered
+                ToolTip.text: qsTr("关闭")
+            }
+        }
 
         Connections {
             target: SettingsController
@@ -365,29 +253,88 @@ Item {
 
         contentItem: FocusScope {
             id: captureArea
-            implicitHeight: 150
+            implicitHeight: 104
             focus: true
 
             ColumnLayout {
                 anchors.fill: parent
                 spacing: tokens.spacingMedium
-                Label {
+                UiLabel {
+                    tokens: root.tokens
+                    kind: sectionTitleKind
                     Layout.fillWidth: true
                     horizontalAlignment: Text.AlignHCenter
                     text: shortcutRecorder.previewText
-                    font.pixelSize: tokens.fontSizeTitle
                     color: tokens.accent
                 }
-                Label {
+                UiLabel {
+                    tokens: root.tokens
+                    kind: noteKind
                     Layout.fillWidth: true
-                    wrapMode: Text.WordWrap
                     horizontalAlignment: Text.AlignHCenter
-                    text: shortcutRecorder.voiceMode
-                        ? qsTr("请在电脑键盘上按下输入法已配置的语音快捷键；本次只记录按键组合。")
-                        : qsTr("请在电脑键盘上按下希望遥控器发送的单键或组合键；左右修饰键会分别记录。")
-                    color: tokens.textSecondary
-                    font.pixelSize: tokens.fontSizeSmall
+                    text: qsTr("按下要发送的单键或组合键")
+                    elide: Text.ElideRight
                 }
+                RowLayout {
+                    Layout.fillWidth: true
+                    Item { Layout.fillWidth: true }
+                    CompactButton {
+                        tokens: root.tokens
+                        compactMinimumWidth: tokens.buttonWidth2Chars
+                        text: qsTr("取消")
+                        onClicked: shortcutRecorder.close()
+                    }
+                }
+            }
+        }
+    }
+
+    component EditorActionCombo: ComboBox {
+        id: editorCombo
+        property var tokens
+
+        editable: true
+        implicitHeight: tokens.controlHeight
+        leftPadding: 7
+        rightPadding: 22
+        font.family: tokens.fontFamily
+        font.pixelSize: tokens.fontSizeControl
+
+        indicator: DropDownIndicator {
+            x: editorCombo.width - width - 7
+            y: (editorCombo.height - height) / 2
+            indicatorColor: editorCombo.enabled
+                ? tokens.textSecondary : tokens.disabledText
+        }
+
+        background: Rectangle {
+            radius: tokens.cornerRadiusControl
+            color: tokens.fieldBackground
+            border.width: editorCombo.activeFocus ? 2 : 1
+            border.color: editorCombo.activeFocus ? tokens.accent : tokens.border
+        }
+
+        delegate: ItemDelegate {
+            id: optionDelegate
+            objectName: editorCombo.objectName + "_option_" + index
+            width: ListView.view ? ListView.view.width : editorCombo.width
+            height: tokens.controlHeight
+            leftPadding: 7
+            rightPadding: 7
+            highlighted: editorCombo.highlightedIndex === index
+            contentItem: Label {
+                text: modelData
+                color: tokens.textPrimary
+                font.family: tokens.fontFamily
+                font.pixelSize: tokens.fontSizeControl
+                font.weight: index === editorCombo.currentIndex
+                    ? Font.DemiBold : Font.Normal
+                verticalAlignment: Text.AlignVCenter
+                elide: Text.ElideRight
+            }
+            background: Rectangle {
+                color: optionDelegate.highlighted
+                    ? tokens.accentSoft : tokens.surface
             }
         }
     }
@@ -396,11 +343,67 @@ Item {
         id: actionEditor
         objectName: "actionEditorDialog"
         modal: true
+        popupType: Popup.Item
         anchors.centerIn: parent
-        width: Math.min(620, root.width - tokens.spacingLarge * 2)
-        title: buttonName.length > 0
-            ? qsTr("编辑按键：") + buttonName
-            : qsTr("编辑按键")
+        width: Math.min(430, root.width - tokens.spacingLarge * 2)
+        readonly property string headerText: buttonName.length > 0
+            ? qsTr("编辑：") + buttonName
+            : qsTr("编辑")
+        title: headerText
+        standardButtons: Dialog.NoButton
+        leftPadding: 14
+        rightPadding: 14
+        topPadding: 0
+        bottomPadding: 11
+        leftInset: 0
+        rightInset: 0
+        topInset: 0
+        bottomInset: 0
+        closePolicy: Popup.CloseOnEscape
+
+        background: Rectangle {
+            radius: tokens.cornerRadiusLarge
+            color: tokens.surface
+            border.width: 1
+            border.color: tokens.borderStrong
+        }
+
+        header: Item {
+            width: actionEditor.width
+            implicitHeight: 34
+
+            UiLabel {
+                anchors.left: parent.left
+                anchors.leftMargin: 14
+                anchors.verticalCenter: parent.verticalCenter
+                tokens: root.tokens
+                kind: sectionTitleKind
+                text: actionEditor.headerText
+                font.pixelSize: tokens.fontSizeTitle
+                font.weight: Font.Medium
+            }
+
+            ToolButton {
+                id: actionEditorCloseButton
+                objectName: "actionEditorCloseButton"
+                x: actionEditor.width - width - 7
+                anchors.verticalCenter: parent.verticalCenter
+                implicitWidth: 28
+                implicitHeight: 28
+                contentItem: Label {
+                    text: "X"
+                    color: tokens.textSecondary
+                    font.family: tokens.fontFamily
+                    font.pixelSize: 18
+                    horizontalAlignment: Text.AlignHCenter
+                    verticalAlignment: Text.AlignVCenter
+                }
+                onClicked: actionEditor.close()
+                Accessible.name: qsTr("关闭")
+                ToolTip.visible: hovered
+                ToolTip.text: qsTr("关闭")
+            }
+        }
 
         property int rowIndex: -1
         property string buttonId: ""
@@ -408,6 +411,9 @@ Item {
         property string primaryText: ""
         property string doubleText: "未设置"
         property string longText: "未设置"
+        property string primaryNote: ""
+        property string doubleNote: ""
+        property string longNote: ""
         property bool syncing: false
         readonly property string normalizedPrimaryText: primaryText.trim()
         readonly property bool primaryIsVoice:
@@ -415,7 +421,8 @@ Item {
             || normalizedPrimaryText.indexOf("已停用：旧语音配置") === 0
 
         function openForRow(rowIndexValue, buttonIdValue, buttonNameValue,
-                            primaryValue, doubleValue, longValue) {
+                            primaryValue, doubleValue, longValue,
+                            primaryNoteValue, doubleNoteValue, longNoteValue) {
             syncing = true
             rowIndex = rowIndexValue
             buttonId = buttonIdValue
@@ -423,9 +430,15 @@ Item {
             primaryText = primaryValue
             doubleText = doubleValue
             longText = longValue
+            primaryNote = primaryNoteValue
+            doubleNote = doubleNoteValue
+            longNote = longNoteValue
             primaryCombo.editText = primaryValue
             doubleCombo.editText = doubleValue
             longCombo.editText = longValue
+            primaryNoteField.text = primaryNoteValue
+            doubleNoteField.text = doubleNoteValue
+            longNoteField.text = longNoteValue
             syncing = false
             open()
             primaryCombo.forceActiveFocus()
@@ -448,35 +461,77 @@ Item {
             syncing = false
         }
 
-        onClosed: syncing = true
+        function saveDraft() {
+            if (rowIndex < 0)
+                return
+            ButtonMappingModel.setActionTextAt(rowIndex, primaryText)
+            ButtonMappingModel.setSecondaryActionTextAt(
+                rowIndex, "double_click", doubleText
+            )
+            ButtonMappingModel.setSecondaryActionTextAt(
+                rowIndex, "long_press", longText
+            )
+            ButtonMappingModel.setDisplayNoteAt(
+                rowIndex, "single_click", primaryNote
+            )
+            ButtonMappingModel.setDisplayNoteAt(
+                rowIndex, "double_click", doubleNote
+            )
+            ButtonMappingModel.setDisplayNoteAt(
+                rowIndex, "long_press", longNote
+            )
+            close()
+        }
+
+        onClosed: {
+            syncing = true
+            rowIndex = -1
+        }
 
         contentItem: ColumnLayout {
-            spacing: tokens.spacingMedium
-
-            Label {
-                Layout.fillWidth: true
-                text: qsTr("为这个遥控器按键分别设置单击、双击和长按动作。")
-                color: tokens.textSecondary
-                font.pixelSize: tokens.fontSizeSmall
-                wrapMode: Text.WordWrap
-            }
+            spacing: 9
 
             GridLayout {
                 Layout.fillWidth: true
                 columns: 3
-                columnSpacing: tokens.spacingSmall
+                columnSpacing: tokens.spacingMedium
                 rowSpacing: tokens.spacingSmall
 
-                Label {
-                    text: qsTr("单击")
-                    color: tokens.textPrimary
-                    font.bold: true
+                Item {
+                    Layout.preferredWidth: 34
+                    Layout.minimumWidth: 34
+                    Layout.maximumWidth: 34
                 }
-                ComboBox {
+                UiLabel {
+                    tokens: root.tokens
+                    kind: noteKind
+                    text: qsTr("按键录入")
+                }
+                UiLabel {
+                    tokens: root.tokens
+                    kind: noteKind
+                    Layout.preferredWidth: 126
+                    Layout.minimumWidth: 126
+                    Layout.maximumWidth: 126
+                    text: qsTr("备注名称")
+                }
+
+                UiLabel {
+                    tokens: root.tokens
+                    kind: bodyKind
+                    text: qsTr("单击")
+                    font.pixelSize: tokens.fontSizeControl
+                    font.weight: Font.Medium
+                }
+                RowLayout {
+                    Layout.fillWidth: true
+                    spacing: tokens.spacingSmall
+
+                    EditorActionCombo {
                     id: primaryCombo
                     objectName: "actionEditorPrimaryCombo"
+                        tokens: root.tokens
                     Layout.fillWidth: true
-                    editable: true
                     model: SettingsController.primaryActionOptionsFor(
                         actionEditor.buttonId
                     )
@@ -486,29 +541,21 @@ Item {
                         ? qsTr("话筒键可选择按住说话、普通动作或自定义组合键。")
                         : qsTr("可选择普通动作或输入自定义组合键。")
                     onEditTextChanged: {
-                        if (!actionEditor.syncing && actionEditor.rowIndex >= 0) {
+                            if (!actionEditor.syncing)
                             actionEditor.primaryText = editText
-                            ButtonMappingModel.setActionTextAt(
-                                actionEditor.rowIndex, editText
-                            )
-                        }
                     }
-                    onAccepted: ButtonMappingModel.setActionTextAt(
-                        actionEditor.rowIndex, editText
-                    )
                     onActivated: {
                         const selectedText = currentText
                         actionEditor.syncing = true
                         editText = selectedText
                         actionEditor.primaryText = selectedText
                         actionEditor.syncing = false
-                        ButtonMappingModel.setActionTextAt(
-                            actionEditor.rowIndex, selectedText
-                        )
                     }
                 }
-                Button {
+                    CompactButton {
                     objectName: "actionEditorPrimaryRecordButton"
+                        tokens: root.tokens
+                        compactMinimumWidth: tokens.buttonWidth2Chars
                     text: qsTr("录入")
                     onClicked: root.openShortcutRecorder(
                         actionEditor.buttonId, actionEditor.rowIndex,
@@ -516,49 +563,59 @@ Item {
                     )
                     Accessible.name: qsTr("录制单击快捷键")
                 }
-
-                Label {
-                    visible: !actionEditor.primaryIsVoice
-                    text: qsTr("双击")
-                    color: tokens.textPrimary
-                    font.bold: true
                 }
-                ComboBox {
+                CompactTextField {
+                    id: primaryNoteField
+                    objectName: "actionEditorPrimaryNoteField"
+                    tokens: root.tokens
+                    Layout.preferredWidth: 126
+                    Layout.minimumWidth: 126
+                    Layout.maximumWidth: 126
+                    placeholderText: qsTr("如：复制")
+                    onTextChanged: {
+                        if (!actionEditor.syncing)
+                            actionEditor.primaryNote = text
+                    }
+                    Accessible.name: qsTr("单击备注名称")
+                }
+
+                UiLabel {
+                    tokens: root.tokens
+                    kind: bodyKind
+                    text: qsTr("双击")
+                    font.pixelSize: tokens.fontSizeControl
+                    font.weight: Font.Medium
+                }
+                RowLayout {
+                    Layout.fillWidth: true
+                    spacing: tokens.spacingSmall
+
+                    EditorActionCombo {
                     id: doubleCombo
                     objectName: "actionEditorDoubleCombo"
+                        tokens: root.tokens
                     Layout.fillWidth: true
-                    visible: !actionEditor.primaryIsVoice
                     enabled: !actionEditor.primaryIsVoice
-                    editable: true
                     model: SettingsController.secondaryActionOptions
                     Accessible.name: actionEditor.buttonName + qsTr("双击动作")
                     ToolTip.visible: hovered
                     ToolTip.text: qsTr("配置后，程序会等待约 0.3 秒区分单击和双击。")
                     onEditTextChanged: {
-                        if (!actionEditor.syncing && actionEditor.rowIndex >= 0) {
+                            if (!actionEditor.syncing)
                             actionEditor.doubleText = editText
-                            ButtonMappingModel.setSecondaryActionTextAt(
-                                actionEditor.rowIndex, "double_click", editText
-                            )
-                        }
                     }
-                    onAccepted: ButtonMappingModel.setSecondaryActionTextAt(
-                        actionEditor.rowIndex, "double_click", editText
-                    )
                     onActivated: {
                         const selectedText = currentText
                         actionEditor.syncing = true
                         editText = selectedText
                         actionEditor.doubleText = selectedText
                         actionEditor.syncing = false
-                        ButtonMappingModel.setSecondaryActionTextAt(
-                            actionEditor.rowIndex, "double_click", selectedText
-                        )
                     }
                 }
-                Button {
+                    CompactButton {
                     objectName: "actionEditorDoubleRecordButton"
-                    visible: !actionEditor.primaryIsVoice
+                        tokens: root.tokens
+                        compactMinimumWidth: tokens.buttonWidth2Chars
                     enabled: !actionEditor.primaryIsVoice
                     text: qsTr("录入")
                     onClicked: root.openShortcutRecorder(
@@ -567,49 +624,60 @@ Item {
                     )
                     Accessible.name: qsTr("录制双击快捷键")
                 }
-
-                Label {
-                    visible: !actionEditor.primaryIsVoice
-                    text: qsTr("长按")
-                    color: tokens.textPrimary
-                    font.bold: true
                 }
-                ComboBox {
+                CompactTextField {
+                    id: doubleNoteField
+                    objectName: "actionEditorDoubleNoteField"
+                    tokens: root.tokens
+                    Layout.preferredWidth: 126
+                    Layout.minimumWidth: 126
+                    Layout.maximumWidth: 126
+                    enabled: !actionEditor.primaryIsVoice
+                    placeholderText: qsTr("如：复制")
+                    onTextChanged: {
+                        if (!actionEditor.syncing)
+                            actionEditor.doubleNote = text
+                    }
+                    Accessible.name: qsTr("双击备注名称")
+                }
+
+                UiLabel {
+                    tokens: root.tokens
+                    kind: bodyKind
+                    text: qsTr("长按")
+                    font.pixelSize: tokens.fontSizeControl
+                    font.weight: Font.Medium
+                }
+                RowLayout {
+                    Layout.fillWidth: true
+                    spacing: tokens.spacingSmall
+
+                    EditorActionCombo {
                     id: longCombo
                     objectName: "actionEditorLongCombo"
+                        tokens: root.tokens
                     Layout.fillWidth: true
-                    visible: !actionEditor.primaryIsVoice
                     enabled: !actionEditor.primaryIsVoice
-                    editable: true
                     model: SettingsController.secondaryActionOptions
                     Accessible.name: actionEditor.buttonName + qsTr("长按动作")
                     ToolTip.visible: hovered
                     ToolTip.text: qsTr("按住约 0.55 秒触发，并抑制本次单击动作。")
                     onEditTextChanged: {
-                        if (!actionEditor.syncing && actionEditor.rowIndex >= 0) {
+                            if (!actionEditor.syncing)
                             actionEditor.longText = editText
-                            ButtonMappingModel.setSecondaryActionTextAt(
-                                actionEditor.rowIndex, "long_press", editText
-                            )
-                        }
                     }
-                    onAccepted: ButtonMappingModel.setSecondaryActionTextAt(
-                        actionEditor.rowIndex, "long_press", editText
-                    )
                     onActivated: {
                         const selectedText = currentText
                         actionEditor.syncing = true
                         editText = selectedText
                         actionEditor.longText = selectedText
                         actionEditor.syncing = false
-                        ButtonMappingModel.setSecondaryActionTextAt(
-                            actionEditor.rowIndex, "long_press", selectedText
-                        )
                     }
                 }
-                Button {
+                    CompactButton {
                     objectName: "actionEditorLongRecordButton"
-                    visible: !actionEditor.primaryIsVoice
+                        tokens: root.tokens
+                        compactMinimumWidth: tokens.buttonWidth2Chars
                     enabled: !actionEditor.primaryIsVoice
                     text: qsTr("录入")
                     onClicked: root.openShortcutRecorder(
@@ -618,25 +686,42 @@ Item {
                     )
                     Accessible.name: qsTr("录制长按快捷键")
                 }
-            }
-
-            Label {
-                Layout.fillWidth: true
-                visible: actionEditor.primaryIsVoice
-                text: qsTr("语音动作占用完整按下/松开周期，双击和长按设置会保留，但本次不执行。")
-                color: tokens.textSecondary
-                font.pixelSize: tokens.fontSizeSmall
-                wrapMode: Text.WordWrap
+                }
+                CompactTextField {
+                    id: longNoteField
+                    objectName: "actionEditorLongNoteField"
+                    tokens: root.tokens
+                    Layout.preferredWidth: 126
+                    Layout.minimumWidth: 126
+                    Layout.maximumWidth: 126
+                    enabled: !actionEditor.primaryIsVoice
+                    placeholderText: qsTr("如：复制")
+                    onTextChanged: {
+                        if (!actionEditor.syncing)
+                            actionEditor.longNote = text
+                    }
+                    Accessible.name: qsTr("长按备注名称")
+                }
             }
 
             RowLayout {
                 Layout.fillWidth: true
+                spacing: tokens.spacingSmall
                 Item { Layout.fillWidth: true }
-                Button {
-                    objectName: "actionEditorDoneButton"
-                    text: qsTr("完成")
-                    highlighted: true
+                CompactButton {
+                    objectName: "actionEditorCancelButton"
+                    tokens: root.tokens
+                    compactMinimumWidth: tokens.buttonWidth2Chars
+                    text: qsTr("取消")
                     onClicked: actionEditor.close()
+                }
+                CompactButton {
+                    objectName: "actionEditorSaveButton"
+                    tokens: root.tokens
+                    compactMinimumWidth: tokens.buttonWidth2Chars
+                    text: qsTr("保存")
+                    highlighted: true
+                    onClicked: actionEditor.saveDraft()
                 }
             }
         }
@@ -653,54 +738,59 @@ Item {
             anchors.margins: tokens.pageHorizontalPadding
             spacing: tokens.spacingSmall
 
-            SectionFrame {
-                id: voiceSettingsPanel
-                objectName: "voiceSettingsPanel"
-                tokens: root.tokens
+            RowLayout {
                 Layout.fillWidth: true
-                Layout.preferredHeight: 45
-                horizontalPadding: 9
-                verticalPadding: 8
+                Layout.preferredHeight: 36
+                spacing: tokens.spacingSmall
 
-                RowLayout {
+
+                SectionFrame {
+                    id: mappingActionsPanel
+                    objectName: "mappingActionsPanel"
+                    tokens: root.tokens
                     Layout.fillWidth: true
-                    spacing: tokens.spacingMedium
+                    Layout.fillHeight: true
+                    horizontalPadding: 4
+                    verticalPadding: 3
+                    radius: tokens.cornerRadiusSmall
 
-                    UiLabel {
-                        tokens: root.tokens
-                        kind: bodyKind
-                        Layout.preferredWidth: 126
-                        Layout.minimumWidth: 88
-                        Layout.maximumWidth: 88
-                        text: qsTr("语音快捷键")
-                        font.weight: Font.Medium
-                    }
-                    CompactTextField {
-                        id: holdVoiceHotkeyField
-                        objectName: "holdVoiceHotkeyField"
-                        tokens: root.tokens
+                    RowLayout {
                         Layout.fillWidth: true
-                        text: SettingsController.holdVoiceHotkeyText
-                        placeholderText: qsTr("例如 ralt")
-                        selectByMouse: true
-                        onEditingFinished: SettingsController.holdVoiceHotkeyText = text
-                        Accessible.name: qsTr("语音快捷键")
-                        ToolTip.text: qsTr("默认右侧 Alt；请与目标语音软件的快捷键保持一致。")
-                    }
-                    CompactButton {
-                        tokens: root.tokens
-                        compactMinimumWidth: 58
-                        text: qsTr("录入")
-                        onClicked: root.openShortcutRecorder("", -1, "", "hold")
-                        Accessible.name: qsTr("录入语音快捷键")
-                    }
-                    CompactButton {
-                        objectName: "voiceProgramButton"
-                        tokens: root.tokens
-                        compactMinimumWidth: 72
-                        text: qsTr("语音程序")
-                        onClicked: voiceProgramDialog.open()
-                        Accessible.name: qsTr("管理语音程序")
+                        spacing: 4
+
+                        CompactButton {
+                            id: detectRealKeyButton
+                            objectName: "detectRealKeyButton"
+                            tokens: root.tokens
+                            compactMinimumWidth: tokens.buttonWidth6Chars
+                            text: SettingsController.keyDetectionActive
+                                ? qsTr("停止检测") : qsTr("检测真实按键")
+                            highlighted: SettingsController.keyDetectionActive
+                            onClicked: SettingsController.keyDetectionActive
+                                ? SettingsController.stopKeyDetection()
+                                : SettingsController.startKeyDetection()
+                            Accessible.name: qsTr("检测真实遥控器按键")
+                        }
+                        Item { Layout.fillWidth: true }
+                        CompactButton {
+                            objectName: "restoreMappingDefaultsButton"
+                            tokens: root.tokens
+                            compactMinimumWidth: tokens.buttonWidth4Chars
+                            text: qsTr("恢复默认")
+                            onClicked: SettingsController.restoreMappingDefaults()
+                        }
+                        CompactButton {
+                            id: saveMappingButton
+                            objectName: "saveMappingButton"
+                            tokens: root.tokens
+                            compactMinimumWidth: tokens.buttonWidth4Chars
+                            text: qsTr("保存映射")
+                            highlighted: true
+                            onClicked: {
+                                SettingsController.saveSettings()
+                                root.scheduleConnectorRepaint()
+                            }
+                        }
                     }
                 }
             }
@@ -711,56 +801,40 @@ Item {
                 Layout.fillWidth: true
                 Layout.fillHeight: true
                 Layout.minimumHeight: 306
+                onWidthChanged: root.scheduleConnectorRepaint()
+                onHeightChanged: root.scheduleConnectorRepaint()
                 property int count: 13
                 property int currentIndex: ButtonMappingModel.indexOfButton(
                     SettingsController.selectedButtonId
                 )
-                onXChanged: root.scheduleConnectorRepaint()
-                onYChanged: root.scheduleConnectorRepaint()
-                onWidthChanged: root.scheduleConnectorRepaint()
-                onHeightChanged: root.scheduleConnectorRepaint()
 
                 Canvas {
                     id: mappingLines
+                    objectName: "mappingLines"
                     anchors.fill: parent
                     z: 0
                     antialiasing: true
 
-                    onPaint: {
-                        const ctx = getContext("2d")
-                        ctx.reset()
-                        for (let i = 0; i < ButtonMappingModel.rowCount(); i++) {
-                            const leftCard = leftCardRepeater.itemAt(i)
-                            const rightCard = rightCardRepeater.itemAt(i)
-                            const hotspot = photoHotspotRepeater.itemAt(i)
-                            const buttonId = hotspot ? hotspot.buttonId : ""
-                            const leftSide = root.isLeftButton(buttonId)
-                            const card = leftSide ? leftCard : rightCard
-                            if (!card || !hotspot || !card.visible || !hotspot.visible)
-                                continue
+                    onPaint: root.paintConnectors(mappingLines, false)
 
-                            const active = SettingsController.selectedButtonId === buttonId
-                            const route = root.connectorRoute(
-                                card, hotspot, mappingLines
-                            )
-                            if (!route)
-                                continue
-                            ctx.beginPath()
-                            ctx.moveTo(route.startX, route.startY)
-                            ctx.bezierCurveTo(
-                                route.firstControl1X,
-                                route.firstControl1Y,
-                                route.firstControl2X,
-                                route.firstControl2Y,
-                                route.splitX,
-                                route.splitY
-                            )
-                            ctx.strokeStyle = root.connectorStrokeColor(active)
-                            ctx.lineWidth = active ? 1.5 : 0.8
-                            ctx.stroke()
+                    onWidthChanged: root.scheduleConnectorRepaint()
+                    onHeightChanged: root.scheduleConnectorRepaint()
+
+                    Connections {
+                        target: SettingsController
+                        function onSelectedButtonIdChanged() {
+                            root.scheduleConnectorRepaint()
                         }
                     }
+                }
 
+                Canvas {
+                    id: activeMappingLine
+                    objectName: "activeMappingLine"
+                    anchors.fill: parent
+                    z: 2
+                    antialiasing: true
+                    onPaint: root.paintConnectors(activeMappingLine, true)
                     onWidthChanged: root.scheduleConnectorRepaint()
                     onHeightChanged: root.scheduleConnectorRepaint()
 
@@ -777,11 +851,11 @@ Item {
                     objectName: "leftMappingCards"
                     anchors.left: parent.left
                     anchors.verticalCenter: parent.verticalCenter
-                    width: (parent.width - photoSidebar.width - tokens.spacingMedium * 2) / 2
+                    width: (parent.width - photoSidebar.width - root.mappingBoardGap * 2) / 2
                     columns: 1
                     rows: 6
                     rowSpacing: root.mappingCardGap
-                    z: 1
+                    z: 3
                     onXChanged: root.scheduleConnectorRepaint()
                     onYChanged: root.scheduleConnectorRepaint()
                     onWidthChanged: root.scheduleConnectorRepaint()
@@ -791,7 +865,6 @@ Item {
                         id: leftCardRepeater
                         model: ButtonMappingModel
                         onItemAdded: root.scheduleConnectorRepaint()
-                        onItemRemoved: root.scheduleConnectorRepaint()
                         delegate: MappingCard {
                             required property int index
                             required property string buttonId
@@ -799,6 +872,9 @@ Item {
                             required property string actionText
                             required property string doubleClickText
                             required property string longPressText
+                            required property string singleNote
+                            required property string doubleNote
+                            required property string longNote
                             required property bool isSelected
 
                             visible: root.isLeftButton(buttonId)
@@ -812,6 +888,9 @@ Item {
                             singleText: actionText
                             doubleText: doubleClickText
                             longText: longPressText
+                            singleNoteText: singleNote
+                            doubleNoteText: doubleNote
+                            longNoteText: longNote
                             selected: isSelected
                             voiceAction: actionText.trim() === "按住说话"
                                 || actionText.indexOf("已停用：旧语音配置") === 0
@@ -820,11 +899,13 @@ Item {
                             onWidthChanged: root.scheduleConnectorRepaint()
                             onHeightChanged: root.scheduleConnectorRepaint()
                             onVisibleChanged: root.scheduleConnectorRepaint()
+                            Component.onCompleted: root.scheduleConnectorRepaint()
                             onClicked: {
                                 SettingsController.selectButton(buttonId)
                                 actionEditor.openForRow(
-                                    index, buttonId, displayName, actionText,
-                                    doubleClickText, longPressText
+                                    index, buttonId, root.shortButtonName(buttonId), actionText,
+                                    doubleClickText, longPressText,
+                                    singleNote, doubleNote, longNote
                                 )
                             }
                         }
@@ -870,6 +951,10 @@ Item {
                             fillMode: Image.Stretch
                             smooth: true
                             mipmap: true
+                            onXChanged: root.scheduleConnectorRepaint()
+                            onYChanged: root.scheduleConnectorRepaint()
+                            onWidthChanged: root.scheduleConnectorRepaint()
+                            onHeightChanged: root.scheduleConnectorRepaint()
                         }
 
                         UiLabel {
@@ -886,7 +971,6 @@ Item {
                             id: photoHotspotRepeater
                             model: ButtonMappingModel
                             onItemAdded: root.scheduleConnectorRepaint()
-                            onItemRemoved: root.scheduleConnectorRepaint()
                             delegate: Item {
                                 id: photoHotspot
                                 objectName: "photoHotspot_" + buttonId
@@ -912,75 +996,12 @@ Item {
                                     - height / 2
                                 visible: SettingsController.photoAvailable
                                 z: 2
-
-                                function requestConnectorPaint() {
-                                    hotspotConnector.requestPaint()
-                                }
-
                                 onXChanged: root.scheduleConnectorRepaint()
                                 onYChanged: root.scheduleConnectorRepaint()
                                 onWidthChanged: root.scheduleConnectorRepaint()
                                 onHeightChanged: root.scheduleConnectorRepaint()
                                 onVisibleChanged: root.scheduleConnectorRepaint()
-
-                                Canvas {
-                                    id: hotspotConnector
-                                    objectName: "photoHotspotConnector_"
-                                        + photoHotspot.buttonId
-                                    readonly property bool leftSide:
-                                        root.isLeftButton(photoHotspot.buttonId)
-                                    readonly property bool active:
-                                        photoHotspot.isSelected
-
-                                    x: -photoHotspot.x
-                                    y: -photoHotspot.y
-                                    width: photoFrame.width
-                                    height: photoFrame.height
-                                    antialiasing: true
-
-                                    onPaint: {
-                                        const ctx = getContext("2d")
-                                        ctx.reset()
-                                        const card = leftSide
-                                            ? leftCardRepeater.itemAt(photoHotspot.index)
-                                            : rightCardRepeater.itemAt(photoHotspot.index)
-                                        const route = root.connectorRoute(
-                                            card, photoHotspot, hotspotConnector
-                                        )
-                                        if (!route)
-                                            return
-                                        ctx.beginPath()
-                                        ctx.moveTo(route.splitX, route.splitY)
-                                        ctx.bezierCurveTo(
-                                            route.secondControl1X,
-                                            route.secondControl1Y,
-                                            route.secondControl2X,
-                                            route.secondControl2Y,
-                                            route.endX,
-                                            route.endY
-                                        )
-                                        ctx.strokeStyle =
-                                            root.connectorStrokeColor(active)
-                                        ctx.lineWidth = active ? 1.5 : 0.8
-                                        ctx.stroke()
-                                    }
-
-                                    onWidthChanged: root.scheduleConnectorRepaint()
-                                    onHeightChanged: root.scheduleConnectorRepaint()
-                                    onXChanged: root.scheduleConnectorRepaint()
-                                    onYChanged: root.scheduleConnectorRepaint()
-                                    onActiveChanged: root.scheduleConnectorRepaint()
-
-                                    Connections {
-                                        target: mappingList
-                                        function onWidthChanged() {
-                                            root.scheduleConnectorRepaint()
-                                        }
-                                        function onHeightChanged() {
-                                            root.scheduleConnectorRepaint()
-                                        }
-                                    }
-                                }
+                                Component.onCompleted: root.scheduleConnectorRepaint()
 
                                 Rectangle {
                                     objectName: "photoHotspotMarker_" + photoHotspot.buttonId
@@ -1042,11 +1063,11 @@ Item {
                     objectName: "rightMappingCards"
                     anchors.right: parent.right
                     anchors.verticalCenter: parent.verticalCenter
-                    width: (parent.width - photoSidebar.width - tokens.spacingMedium * 2) / 2
+                    width: (parent.width - photoSidebar.width - root.mappingBoardGap * 2) / 2
                     columns: 1
                     rows: 7
                     rowSpacing: root.mappingCardGap
-                    z: 1
+                    z: 3
                     onXChanged: root.scheduleConnectorRepaint()
                     onYChanged: root.scheduleConnectorRepaint()
                     onWidthChanged: root.scheduleConnectorRepaint()
@@ -1056,7 +1077,6 @@ Item {
                         id: rightCardRepeater
                         model: ButtonMappingModel
                         onItemAdded: root.scheduleConnectorRepaint()
-                        onItemRemoved: root.scheduleConnectorRepaint()
                         delegate: MappingCard {
                             required property int index
                             required property string buttonId
@@ -1064,6 +1084,9 @@ Item {
                             required property string actionText
                             required property string doubleClickText
                             required property string longPressText
+                            required property string singleNote
+                            required property string doubleNote
+                            required property string longNote
                             required property bool isSelected
 
                             visible: !root.isLeftButton(buttonId)
@@ -1077,6 +1100,9 @@ Item {
                             singleText: actionText
                             doubleText: doubleClickText
                             longText: longPressText
+                            singleNoteText: singleNote
+                            doubleNoteText: doubleNote
+                            longNoteText: longNote
                             selected: isSelected
                             voiceAction: actionText.trim() === "按住说话"
                                 || actionText.indexOf("已停用：旧语音配置") === 0
@@ -1085,11 +1111,13 @@ Item {
                             onWidthChanged: root.scheduleConnectorRepaint()
                             onHeightChanged: root.scheduleConnectorRepaint()
                             onVisibleChanged: root.scheduleConnectorRepaint()
+                            Component.onCompleted: root.scheduleConnectorRepaint()
                             onClicked: {
                                 SettingsController.selectButton(buttonId)
                                 actionEditor.openForRow(
-                                    index, buttonId, displayName, actionText,
-                                    doubleClickText, longPressText
+                                    index, buttonId, root.shortButtonName(buttonId), actionText,
+                                    doubleClickText, longPressText,
+                                    singleNote, doubleNote, longNote
                                 )
                             }
                         }
@@ -1097,78 +1125,39 @@ Item {
                 }
             }
 
-            SectionFrame {
+            Item {
                 id: mappingListFrame
                 objectName: "mappingListFrame"
-                tokens: root.tokens
                 Layout.fillWidth: true
-                Layout.preferredHeight: 40
-                horizontalPadding: 7
-                verticalPadding: 5
+                Layout.preferredHeight: 18
 
-                RowLayout {
-                    Layout.fillWidth: true
-                    spacing: tokens.spacingSmall
+                Rectangle {
+                    anchors.left: parent.left
+                    anchors.right: parent.right
+                    anchors.top: parent.top
+                    height: 1
+                    color: tokens.border
+                }
 
-                    Rectangle {
-                        Layout.preferredWidth: 8
-                        Layout.preferredHeight: 8
-                        radius: 4
-                        color: SettingsController.keyDetectionActive
-                            ? tokens.accent : tokens.voiceAccent
-                    }
-                    UiLabel {
-                        id: bridgeRequiredWarning
-                        objectName: "mappingBridgeWarning"
-                        tokens: root.tokens
-                        kind: noteKind
-                        Layout.fillWidth: true
-                        text: SettingsController.keyDetectionActive
-                            ? SettingsController.keyDetectionText
-                            : !SettingsController.bridgeRunning
-                                ? qsTr("后台桥接未运行；语音键和补充检测通道不可用")
-                                : qsTr("语音设为“按住说话”后，双击和长按无效")
-                        elide: Text.ElideRight
-                    }
-                    CompactButton {
-                        id: detectRealKeyButton
-                        objectName: "detectRealKeyButton"
-                        tokens: root.tokens
-                        compactMinimumWidth: 88
-                        text: SettingsController.keyDetectionActive
-                            ? qsTr("停止检测") : qsTr("检测真实按键")
-                        highlighted: SettingsController.keyDetectionActive
-                        onClicked: SettingsController.keyDetectionActive
-                            ? SettingsController.stopKeyDetection()
-                            : SettingsController.startKeyDetection()
-                        Accessible.name: qsTr("检测真实遥控器按键")
-                    }
-                    CompactButton {
-                        objectName: "restoreMappingDefaultsButton"
-                        tokens: root.tokens
-                        compactMinimumWidth: 68
-                        text: qsTr("恢复默认")
-                        onClicked: SettingsController.restoreDefaults()
-                    }
-                    CompactButton {
-                        id: saveMappingButton
-                        objectName: "saveMappingButton"
-                        tokens: root.tokens
-                        compactMinimumWidth: 68
-                        text: qsTr("保存映射")
-                        highlighted: true
-                        onClicked: SettingsController.saveSettings()
-                    }
+                UiLabel {
+                    id: bridgeRequiredWarning
+                    objectName: "mappingBridgeWarning"
+                    anchors.left: parent.left
+                    anchors.right: parent.right
+                    anchors.verticalCenter: parent.verticalCenter
+                    anchors.topMargin: 1
+                    tokens: root.tokens
+                    kind: noteKind
+                    text: SettingsController.keyDetectionActive
+                        ? SettingsController.keyDetectionText
+                        : !SettingsController.bridgeRunning
+                            ? qsTr("桥接未运行，语音和真实按键检测不可用")
+                            : qsTr("按住说话时，双击和长按不执行")
+                    elide: Text.ElideRight
                 }
             }
         }
 
-        Connections {
-            target: SettingsController
-            function onHoldVoiceHotkeyTextChanged() {
-                holdVoiceHotkeyField.text = SettingsController.holdVoiceHotkeyText
-            }
-        }
     }
 
     RowLayout {

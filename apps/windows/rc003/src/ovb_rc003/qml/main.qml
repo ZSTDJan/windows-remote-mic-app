@@ -12,8 +12,25 @@ ApplicationWindow {
     minimumHeight: 440
     visible: true
 
-    property Tokens tokens: Tokens {}
+    FontLoader {
+        id: uiRegularFont
+        source: "fonts/NotoSansSC-Regular.ttf"
+    }
+    FontLoader {
+        id: uiMediumFont
+        source: "fonts/NotoSansSC-Medium.ttf"
+    }
+    FontLoader {
+        id: uiSemiBoldFont
+        source: "fonts/NotoSansSC-SemiBold.ttf"
+    }
+
+    property Tokens tokens: Tokens {
+        fontFamily: uiRegularFont.name.length > 0
+            ? uiRegularFont.name : "Noto Sans SC"
+    }
     color: tokens.background
+    font.family: tokens.fontFamily
 
     palette.window: tokens.background
     palette.windowText: tokens.textPrimary

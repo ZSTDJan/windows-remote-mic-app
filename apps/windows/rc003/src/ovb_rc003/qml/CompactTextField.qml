@@ -16,6 +16,7 @@ TextField {
     placeholderTextColor: tokens.disabledText
     selectionColor: tokens.accent
     selectedTextColor: tokens.accentText
+    font.family: tokens.fontFamily
     font.pixelSize: tokens.fontSizeControl
 
     background: Rectangle {

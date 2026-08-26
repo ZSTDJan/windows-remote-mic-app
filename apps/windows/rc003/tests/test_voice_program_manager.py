@@ -38,6 +38,30 @@ class VoiceProgramSettingsTests(unittest.TestCase):
             },
         )
 
+    def test_disabled_management_keeps_only_the_elevation_preference(self):
+        self.assertEqual(
+            manager.normalize_voice_program_settings(
+                {
+                    "provider": "none",
+                    "custom_executable": " voice.exe ",
+                    "launch_on_bridge_start": True,
+                    "launch_elevated": True,
+                }
+            ),
+            {
+                "provider": "none",
+                "custom_executable": "voice.exe",
+                "launch_on_bridge_start": False,
+                "launch_elevated": True,
+            },
+        )
+
+    def test_provider_options_use_the_expandable_custom_program_name(self):
+        self.assertEqual(
+            manager.provider_options(),
+            ["不管理", "搜狗语音输入", "其他输入法或自定义程序"],
+        )
+
 
 class SogouDiscoveryTests(unittest.TestCase):
     def test_running_process_path_is_preferred(self):

@@ -1,4 +1,5 @@
 import QtQuick
+import QtQuick.Controls
 import QtQuick.Layouts
 
 Rectangle {
@@ -14,21 +15,21 @@ Rectangle {
 
     color: "transparent"
     Layout.fillWidth: true
-    implicitHeight: Math.max(54, rowLayout.implicitHeight + 12)
+    implicitHeight: Math.max(50, rowLayout.implicitHeight + 10)
 
     RowLayout {
         id: rowLayout
         anchors.fill: parent
         anchors.leftMargin: 9
         anchors.rightMargin: 9
-        anchors.topMargin: 6
-        anchors.bottomMargin: 6
+        anchors.topMargin: 5
+        anchors.bottomMargin: 5
         spacing: 9
 
         Rectangle {
-            Layout.preferredWidth: 30
-            Layout.preferredHeight: 30
-            radius: 15
+            Layout.preferredWidth: 28
+            Layout.preferredHeight: 28
+            radius: 14
             color: root.tokens.accentSoft
             IconGlyph {
                 anchors.centerIn: parent
@@ -57,9 +58,12 @@ Rectangle {
                 kind: noteKind
                 Layout.fillWidth: true
                 text: root.descriptionText
-                maximumLineCount: 2
+                maximumLineCount: 1
                 elide: Text.ElideRight
-                wrapMode: Text.WordWrap
+                wrapMode: Text.NoWrap
+                HoverHandler { id: descriptionHover }
+                ToolTip.visible: descriptionHover.hovered
+                ToolTip.text: root.descriptionText
             }
         }
 

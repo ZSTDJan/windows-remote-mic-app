@@ -462,6 +462,9 @@ def _load_qt_classes() -> dict:
         WidthRole = _UserRole + 11
         HeightRole = _UserRole + 12
         IsVoiceRole = _UserRole + 13
+        SingleNoteRole = _UserRole + 14
+        DoubleNoteRole = _UserRole + 15
+        LongNoteRole = _UserRole + 16
 
         # Emitted whenever a QML combo box edits a row's action text
         # (button_id, new display text) - SettingsController does not need
@@ -482,6 +485,14 @@ def _load_qt_classes() -> dict:
                     key_mapping.ButtonTrigger.LONG_PRESS.value: (
                         settings_ui.SECONDARY_UNCONFIGURED_DISPLAY
                     ),
+                }
+                for bid in self._button_ids
+            }
+            self._display_notes: Dict[str, Dict[str, str]] = {
+                bid: {
+                    key_mapping.ButtonTrigger.SINGLE_CLICK.value: "",
+                    key_mapping.ButtonTrigger.DOUBLE_CLICK.value: "",
+                    key_mapping.ButtonTrigger.LONG_PRESS.value: "",
                 }
                 for bid in self._button_ids
             }
@@ -507,6 +518,9 @@ def _load_qt_classes() -> dict:
                 self.WidthRole: QByteArray(b"hotspotWidth"),
                 self.HeightRole: QByteArray(b"hotspotHeight"),
                 self.IsVoiceRole: QByteArray(b"isVoice"),
+                self.SingleNoteRole: QByteArray(b"singleNote"),
+                self.DoubleNoteRole: QByteArray(b"doubleNote"),
+                self.LongNoteRole: QByteArray(b"longNote"),
             }
 
         def data(self, index, role: int = _DisplayRole):
@@ -544,12 +558,25 @@ def _load_qt_classes() -> dict:
                 return hotspot.height if hotspot else 0.0
             if role == self.IsVoiceRole:
                 return bool(hotspot and hotspot.is_voice)
+            if role == self.SingleNoteRole:
+                return self._display_notes[button_id][
+                    key_mapping.ButtonTrigger.SINGLE_CLICK.value
+                ]
+            if role == self.DoubleNoteRole:
+                return self._display_notes[button_id][
+                    key_mapping.ButtonTrigger.DOUBLE_CLICK.value
+                ]
+            if role == self.LongNoteRole:
+                return self._display_notes[button_id][
+                    key_mapping.ButtonTrigger.LONG_PRESS.value
+                ]
             return None
 
         def load_display_map(
             self,
             display_map: Dict[str, str],
             secondary_display_map: Optional[Dict[str, Dict[str, str]]] = None,
+            display_note_map: Optional[Dict[str, Dict[str, str]]] = None,
         ) -> None:
             """Apply persisted values without rebuilding QML delegates.
 
@@ -587,6 +614,34 @@ def _load_qt_classes() -> dict:
                 ):
                     changed_roles.append(self.LongPressTextRole)
                 self._secondary_action_text[button_id] = next_secondary
+                raw_notes = (display_note_map or {}).get(button_id, {})
+                next_notes = {
+                    key_mapping.ButtonTrigger.SINGLE_CLICK.value: str(
+                        raw_notes.get(
+                            key_mapping.ButtonTrigger.SINGLE_CLICK.value, ""
+                        )
+                    ),
+                    key_mapping.ButtonTrigger.DOUBLE_CLICK.value: str(
+                        raw_notes.get(
+                            key_mapping.ButtonTrigger.DOUBLE_CLICK.value, ""
+                        )
+                    ),
+                    key_mapping.ButtonTrigger.LONG_PRESS.value: str(
+                        raw_notes.get(
+                            key_mapping.ButtonTrigger.LONG_PRESS.value, ""
+                        )
+                    ),
+                }
+                current_notes = self._display_notes[button_id]
+                note_roles = {
+                    key_mapping.ButtonTrigger.SINGLE_CLICK.value: self.SingleNoteRole,
+                    key_mapping.ButtonTrigger.DOUBLE_CLICK.value: self.DoubleNoteRole,
+                    key_mapping.ButtonTrigger.LONG_PRESS.value: self.LongNoteRole,
+                }
+                for trigger, role in note_roles.items():
+                    if next_notes[trigger] != current_notes[trigger]:
+                        changed_roles.append(role)
+                self._display_notes[button_id] = next_notes
                 if changed_roles:
                     model_index = self.index(row, 0)
                     self.dataChanged.emit(model_index, model_index, changed_roles)
@@ -607,6 +662,17 @@ def _load_qt_classes() -> dict:
                     for trigger, text in trigger_map.items()
                 }
                 for button_id, trigger_map in self._secondary_action_text.items()
+            }
+
+        def to_display_note_map(self) -> Dict[str, Dict[str, str]]:
+            return {
+                button_id: {
+                    trigger: note.strip()
+                    for trigger, note in trigger_map.items()
+                    if note.strip()
+                }
+                for button_id, trigger_map in self._display_notes.items()
+                if any(note.strip() for note in trigger_map.values())
             }
 
         def index_of(self, button_id: str) -> int:
@@ -654,6 +720,28 @@ def _load_qt_classes() -> dict:
             self.dataChanged.emit(model_index, model_index, [role])
             self.mappingEdited.emit()
 
+        @Slot(int, str, str)
+        def setDisplayNoteAt(self, row: int, trigger: str, text: str) -> None:
+            if not (0 <= row < len(self._button_ids)):
+                return
+            valid_roles = {
+                key_mapping.ButtonTrigger.SINGLE_CLICK.value: self.SingleNoteRole,
+                key_mapping.ButtonTrigger.DOUBLE_CLICK.value: self.DoubleNoteRole,
+                key_mapping.ButtonTrigger.LONG_PRESS.value: self.LongNoteRole,
+            }
+            if trigger not in valid_roles:
+                return
+            button_id = self._button_ids[row]
+            clean_text = str(text).strip()
+            if clean_text == self._display_notes[button_id][trigger]:
+                return
+            self._display_notes[button_id][trigger] = clean_text
+            model_index = self.index(row, 0)
+            self.dataChanged.emit(
+                model_index, model_index, [valid_roles[trigger]]
+            )
+            self.mappingEdited.emit()
+
         def set_selected_button(self, button_id: str) -> None:
             if button_id == self._selected_button_id or button_id not in self._action_text:
                 return
@@ -696,6 +784,7 @@ def _load_qt_classes() -> dict:
         voiceProgramLaunchOnBridgeStartChanged = Signal()
         voiceProgramLaunchElevatedChanged = Signal()
         voiceProgramStatusTextChanged = Signal()
+        voiceProgramStatusCodeChanged = Signal()
         djiMicStatusTextChanged = Signal()
         keyDetectionActiveChanged = Signal()
         keyDetectionTextChanged = Signal()
@@ -742,7 +831,16 @@ def _load_qt_classes() -> dict:
                     self._config.get("voice_program")
                 )
             )
+            voice_program_autostart_migrated = (
+                self._voice_program_settings.get("provider")
+                != voice_program_manager.VOICE_PROGRAM_NONE
+                and self._voice_program_settings.get("launch_on_bridge_start")
+                is not True
+            )
+            if voice_program_autostart_migrated:
+                self._voice_program_settings["launch_on_bridge_start"] = True
             self._voice_program_status_text = ""
+            self._voice_program_status_code = "unknown"
             try:
                 self._bridge_running = single_instance.bridge_instance_running()
             except (
@@ -792,9 +890,15 @@ def _load_qt_classes() -> dict:
                     else "桥接进程已启动；RC003 连接状态暂时未知，正在继续检查。"
                 )
             self._has_explicit_launch_result = False
-            self._status_message = ""
+            self._status_message = (
+                "语音程序将随桥接启动，保存后生效。"
+                if voice_program_autostart_migrated
+                else ""
+            )
             self._error_message = ""
-            self._settings_dirty = bool(self._removed_voice_bindings)
+            self._settings_dirty = bool(
+                self._removed_voice_bindings or voice_program_autostart_migrated
+            )
             self._selected_button_id = "ok"
             selected_device_id = device_catalog.normalize_device_id(
                 self._config.get("selected_device_profile")
@@ -937,6 +1041,10 @@ def _load_qt_classes() -> dict:
             bindings = self._bindings.get("bindings", {})
             display_map: Dict[str, str] = {}
             secondary_display_map: Dict[str, Dict[str, str]] = {}
+            raw_display_notes = self._bindings.get("display_notes", {})
+            display_note_map = (
+                raw_display_notes if isinstance(raw_display_notes, dict) else {}
+            )
             for button_id in remote_layout.BUTTON_ORDER:
                 if button_id in self._removed_voice_bindings:
                     display_map[button_id] = settings_ui._REMOVED_VOICE_DISPLAY
@@ -970,7 +1078,11 @@ def _load_qt_classes() -> dict:
                         secondary_display_map[button_id][trigger_name] = (
                             settings_ui._action_to_display(action)
                         )
-            self._model.load_display_map(display_map, secondary_display_map)
+            self._model.load_display_map(
+                display_map,
+                secondary_display_map,
+                display_note_map,
+            )
 
         def _selected_device_id(self) -> str:
             if 0 <= self._selected_device_index < len(self._DEVICE_ORDER):
@@ -1129,11 +1241,16 @@ def _load_qt_classes() -> dict:
                     self._voice_program_settings
                 )
                 text = voice_program_manager.status_text(status)
+                code = status.code
             except Exception:
                 text = "无法读取语音程序状态。"
+                code = "unknown"
             if text != self._voice_program_status_text:
                 self._voice_program_status_text = text
                 self.voiceProgramStatusTextChanged.emit()
+            if code != self._voice_program_status_code:
+                self._voice_program_status_code = code
+                self.voiceProgramStatusCodeChanged.emit()
 
         def _replace_voice_program_settings(self, raw: object) -> None:
             previous = dict(self._voice_program_settings)
@@ -1285,6 +1402,7 @@ def _load_qt_classes() -> dict:
                 new_config, new_bindings = settings_ui.build_save_model(
                     button_display_map=self._model.to_display_map(),
                     secondary_display_map=self._model.to_secondary_display_map(),
+                    display_note_map=self._model.to_display_note_map(),
                     hotkey_text=self._voice_hotkeys[trigger_mode],
                     trigger_mode=trigger_mode,
                     endpoint_display_text=endpoint_display,
@@ -1429,6 +1547,9 @@ def _load_qt_classes() -> dict:
                 return
             updated = dict(self._voice_program_settings)
             updated["provider"] = provider_id
+            updated["launch_on_bridge_start"] = (
+                provider_id != voice_program_manager.VOICE_PROGRAM_NONE
+            )
             self._replace_voice_program_settings(updated)
             self._mark_settings_dirty()
 
@@ -1503,6 +1624,15 @@ def _load_qt_classes() -> dict:
             str,
             _get_voice_program_status_text,
             notify=voiceProgramStatusTextChanged,
+        )
+
+        def _get_voice_program_status_code(self) -> str:
+            return self._voice_program_status_code
+
+        voiceProgramStatusCode = Property(
+            str,
+            _get_voice_program_status_code,
+            notify=voiceProgramStatusCodeChanged,
         )
 
         def _get_endpoint_options(self) -> List[str]:
@@ -1765,9 +1895,20 @@ def _load_qt_classes() -> dict:
 
         @Slot()
         def launchVoiceProgram(self) -> None:
-            result = voice_program_manager.launch_voice_program(
-                self._voice_program_settings
-            )
+            self._launch_voice_program()
+
+        def _launch_voice_program(self) -> None:
+            try:
+                result = voice_program_manager.launch_voice_program(
+                    self._voice_program_settings
+                )
+            except Exception:  # noqa: BLE001 - optional launch must not stop the UI
+                self._set_status_message("")
+                self._set_error_message(
+                    "语音程序启动失败；Remote Mic 和桥接不受影响。"
+                )
+                self._refresh_voice_program_status()
+                return
             message = voice_program_manager.launch_result_text(result)
             if result.code in {"not_found", "launch_failed", "restart_elevated_required"}:
                 self._set_status_message("")
@@ -2079,6 +2220,12 @@ def _load_qt_classes() -> dict:
             }:
                 self._set_bridge_running(True)
                 self._set_bridge_launch_phase("waiting")
+                if (
+                    result.outcome is bridge_launcher.LaunchOutcome.ALREADY_RUNNING
+                    and self._voice_program_settings.get("launch_on_bridge_start")
+                    is True
+                ):
+                    self._launch_voice_program()
                 self._sync_bridge_connection_status(True)
                 return
             self._set_bridge_running(False)
@@ -2101,6 +2248,22 @@ def _load_qt_classes() -> dict:
                 self._finish_bridge_launch(result)
 
         @Slot()
+        def restoreMappingDefaults(self) -> None:
+            """Reset only the button-page values without touching voice setup."""
+
+            defaults = settings_ui.default_display_state()
+            self._model.load_display_map(
+                defaults.button_display_map,
+                defaults.secondary_display_map,
+                {},
+            )
+            self._mark_settings_dirty()
+            self._set_error_message("")
+            self._set_status_message(
+                "已恢复按键默认显示，尚未保存——点击「保存映射」才会写入设置。"
+            )
+
+        @Slot()
         def restoreDefaults(self) -> None:
             """Resets every widget's DISPLAYED value to the defaults - never
             writes to config.json/key_bindings.json itself (XRBM-030 RETRY 1
@@ -2114,6 +2277,7 @@ def _load_qt_classes() -> dict:
             self._model.load_display_map(
                 defaults.button_display_map,
                 defaults.secondary_display_map,
+                {},
             )
             self._set_hold_voice_hotkey_text(
                 defaults.voice_hotkeys[key_mapping.VoiceTriggerMode.HOLD.value]

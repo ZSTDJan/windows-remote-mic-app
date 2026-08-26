@@ -1,4 +1,5 @@
 import QtQuick
+import QtQuick.Controls
 import QtQuick.Layouts
 
 RowLayout {
@@ -15,9 +16,9 @@ RowLayout {
     spacing: tokens.spacingSmall
 
     Rectangle {
-        Layout.preferredWidth: 10
-        Layout.preferredHeight: 10
-        radius: 5
+        Layout.preferredWidth: 8
+        Layout.preferredHeight: 8
+        radius: 4
         color: root.indicatorColor
     }
 
@@ -36,7 +37,12 @@ RowLayout {
         tokens: root.tokens
         kind: noteKind
         Layout.fillWidth: true
-        wrapMode: Text.WordWrap
+        maximumLineCount: 1
+        elide: Text.ElideRight
+        wrapMode: Text.NoWrap
         text: root.statusText + "：" + root.detailText
+        HoverHandler { id: detailHover }
+        ToolTip.visible: detailHover.hovered
+        ToolTip.text: text
     }
 }

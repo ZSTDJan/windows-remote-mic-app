@@ -100,53 +100,73 @@ window.show()
 render(window, app)
 
 tab_bar = find(window, "tabBar")
-tab_bar.setProperty("currentIndex", 1)
-render(window, app)
-
-button = find(window, "voiceProgramButton")
-dialog = find(window, "voiceProgramDialog")
-assert button is not None and dialog is not None
-point = button.mapToScene(
-    QPointF(button.property("width") / 2, button.property("height") / 2)
-).toPoint()
-QTest.mouseClick(window, Qt.LeftButton, Qt.NoModifier, point)
+tab_bar.setProperty("currentIndex", 0)
 render(window, app)
 
 controller.selectedVoiceProgramIndex = 1
 render(window, app)
-for name in ("voiceProgramAutoStartCheckBox", "voiceProgramElevatedCheckBox"):
-    control = find(window, name)
-    point = control.mapToScene(
-        QPointF(control.property("width") / 2, control.property("height") / 2)
-    ).toPoint()
-    QTest.mouseClick(window, Qt.LeftButton, Qt.NoModifier, point)
-    render(window, app, 3)
+elevated = find(window, "voiceProgramElevatedCheckBox")
+point = elevated.mapToScene(
+    QPointF(elevated.property("width") / 2, elevated.property("height") / 2)
+).toPoint()
+QTest.mouseClick(window, Qt.LeftButton, Qt.NoModifier, point)
+render(window, app, 3)
 image = window.grabWindow()
 screenshot = os.environ.get("VOICE_PROGRAM_SCREENSHOT")
 if screenshot:
     image.save(screenshot)
 
+controls = {
+    name: find(window, name)
+    for name in (
+        "voiceInputSection",
+        "voiceProgramCombo",
+        "holdVoiceHotkeyField",
+        "voiceProgramElevatedCheckBox",
+        "voiceProgramStatusLabel",
+    )
+}
+assert all(control is not None for control in controls.values())
+
+managed = {
+    name: {
+        "visible": bool(control.property("visible")),
+        "enabled": bool(control.property("enabled")),
+        "geometry": geometry(control),
+    }
+    for name, control in controls.items()
+}
+managed_auto_start = bool(controller.voiceProgramLaunchOnBridgeStart)
+managed_elevated = bool(controller.voiceProgramLaunchElevated)
+managed_status = str(controls["voiceProgramStatusLabel"].property("text"))
+
+controller.selectedVoiceProgramIndex = 0
+render(window, app)
+unmanaged_elevated = {
+    "visible": bool(elevated.property("visible")),
+    "enabled": bool(elevated.property("enabled")),
+}
+
 result = {
     "warnings": [value.toString() for value in warnings],
-    "dialog_visible": bool(dialog.property("visible")),
-    "dialog": geometry(dialog),
     "window_width": float(window.property("width")),
     "window_height": float(window.property("height")),
-    "button": geometry(button),
-    "status": str(find(window, "voiceProgramStatusLabel").property("text")),
-    "auto_start": bool(controller.voiceProgramLaunchOnBridgeStart),
-    "elevated": bool(controller.voiceProgramLaunchElevated),
-    "controls": {
-        name: bool(find(window, name).property("visible"))
+    "managed": managed,
+    "status": managed_status,
+    "managed_auto_start": managed_auto_start,
+    "managed_elevated": managed_elevated,
+    "unmanaged_elevated": unmanaged_elevated,
+    "retired_controls_absent": all(
+        find(window, name) is None
         for name in (
-            "voiceProgramCombo",
+            "voiceProgramButton",
+            "voiceProgramDialog",
             "voiceProgramAutoStartCheckBox",
-            "voiceProgramElevatedCheckBox",
+            "saveVoiceProgramButton",
             "refreshVoiceProgramButton",
             "launchVoiceProgramButton",
-            "saveVoiceProgramButton",
         )
-    },
+    ),
 }
 m._shutdown_diagnostics_workers()
 print(json.dumps(result, ensure_ascii=False))
@@ -154,7 +174,7 @@ print(json.dumps(result, ensure_ascii=False))
 
 
 class VoiceProgramQmlTests(unittest.TestCase):
-    def test_button_opens_a_contained_feature_complete_dialog(self):
+    def test_connection_page_owns_the_compact_optional_voice_program_controls(self):
         env = dict(os.environ)
         env.setdefault("QT_QPA_PLATFORM", "offscreen")
         env["LOCALAPPDATA"] = tempfile.mkdtemp()
@@ -172,16 +192,21 @@ class VoiceProgramQmlTests(unittest.TestCase):
         )
         data = json.loads(result.stdout.strip().splitlines()[-1])
         self.assertEqual(data["warnings"], [])
-        self.assertTrue(data["dialog_visible"])
-        self.assertTrue(all(data["controls"].values()))
-        self.assertTrue(data["auto_start"])
-        self.assertTrue(data["elevated"])
-        self.assertGreater(data["dialog"]["width"], 0)
-        self.assertGreater(data["dialog"]["height"], 0)
-        self.assertGreaterEqual(data["dialog"]["x"], 0)
-        self.assertGreaterEqual(data["dialog"]["y"], 0)
-        self.assertLessEqual(data["dialog"]["right"], data["window_width"])
-        self.assertLessEqual(data["dialog"]["bottom"], data["window_height"])
+        self.assertTrue(data["retired_controls_absent"])
+        self.assertTrue(all(item["visible"] for item in data["managed"].values()))
+        self.assertTrue(all(item["enabled"] for item in data["managed"].values()))
+        self.assertTrue(data["managed_auto_start"])
+        self.assertTrue(data["managed_elevated"])
+        self.assertTrue(data["unmanaged_elevated"]["visible"])
+        self.assertFalse(data["unmanaged_elevated"]["enabled"])
+        for item in data["managed"].values():
+            bounds = item["geometry"]
+            self.assertGreater(bounds["width"], 0)
+            self.assertGreater(bounds["height"], 0)
+            self.assertGreaterEqual(bounds["x"], 0)
+            self.assertGreaterEqual(bounds["y"], 0)
+            self.assertLessEqual(bounds["right"], data["window_width"])
+            self.assertLessEqual(bounds["bottom"], data["window_height"])
         self.assertTrue(data["status"])
 
 

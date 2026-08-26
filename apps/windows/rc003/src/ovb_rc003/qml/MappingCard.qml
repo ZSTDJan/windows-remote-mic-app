@@ -11,41 +11,191 @@ AbstractButton {
     property string singleText: ""
     property string doubleText: ""
     property string longText: ""
+    property string singleNoteText: ""
+    property string doubleNoteText: ""
+    property string longNoteText: ""
     property bool selected: false
     property bool voiceAction: false
     property bool exposeObjectNames: true
 
     hoverEnabled: true
     implicitHeight: 42
-    padding: 3
+    leftPadding: 4
+    rightPadding: 4
+    topPadding: 3
+    bottomPadding: 3
     objectName: exposeObjectNames ? "editMapping_" + cardId : ""
     Accessible.name: buttonName + qsTr("按键映射")
 
-    function shown(text, unavailable) {
-        if (unavailable)
-            return qsTr("不执行")
-        return text && text.length > 0 ? text : qsTr("未设置")
+    function displayBinding(text) {
+        const shortcuts = {
+            "Escape": "Esc",
+            "Return": "Enter",
+            "Delete": "Del",
+            "Delete（退格）": "Del",
+            "方向上": "↑",
+            "方向下": "↓",
+            "方向左": "←",
+            "方向右": "→",
+            "系统音量 +": "Vol +",
+            "系统音量 −": "Vol -"
+        }
+        if (shortcuts[text])
+            return shortcuts[text]
+        return text ? text.replace(/\+/g, " + ") : ""
     }
 
-    component GestureDivider: Rectangle {
-        Layout.preferredWidth: 1
-        Layout.minimumWidth: 1
-        Layout.maximumWidth: 1
+    component GestureCell: Item {
+        id: cell
+        property string gestureLabel: ""
+        property string bindingText: ""
+        property string noteText: ""
+        property string valueObjectName: ""
+        readonly property bool empty:
+            !bindingText || bindingText.trim().length === 0
+            || bindingText.trim() === qsTr("未设置")
+        readonly property bool usingNote:
+            !empty && noteText && noteText.trim().length > 0
+            && noteText.trim() !== qsTr("未命名")
+        readonly property string shownText: empty
+            ? qsTr("未设置")
+            : usingNote
+                ? noteText.trim() : root.displayBinding(bindingText.trim())
+
+        Layout.fillWidth: true
         Layout.fillHeight: true
-        color: root.tokens.border
+        implicitHeight: 30
+
+        Rectangle {
+            anchors.left: parent.left
+            anchors.top: parent.top
+            anchors.bottom: parent.bottom
+            width: 1
+            color: root.tokens.border
+        }
+
+        ColumnLayout {
+            anchors.fill: parent
+            anchors.leftMargin: 3
+            anchors.rightMargin: 3
+            spacing: 0
+
+            UiLabel {
+                tokens: root.tokens
+                kind: noteKind
+                Layout.fillWidth: true
+                Layout.preferredHeight: 10
+                text: cell.gestureLabel
+                color: root.tokens.disabledText
+                font.pixelSize: root.tokens.fontSizeMapGesture
+                font.weight: Font.Normal
+                horizontalAlignment: Text.AlignHCenter
+                verticalAlignment: Text.AlignVCenter
+                elide: Text.ElideRight
+            }
+
+            Rectangle {
+                Layout.fillWidth: true
+                Layout.preferredHeight: 15
+                radius: 3
+                color: !cell.usingNote && !cell.empty
+                    ? root.tokens.surfaceMuted : "transparent"
+
+                UiLabel {
+                    objectName: cell.valueObjectName
+                    anchors.fill: parent
+                    anchors.leftMargin: 3
+                    anchors.rightMargin: 3
+                    tokens: root.tokens
+                    kind: bodyKind
+                    text: cell.shownText
+                    color: cell.empty
+                        ? root.tokens.disabledText
+                        : cell.usingNote
+                            ? root.tokens.textPrimary : root.tokens.textSecondary
+                    font.family: cell.usingNote
+                        ? root.tokens.fontFamily : root.tokens.fontFamilyMono
+                    font.pixelSize: cell.usingNote
+                        ? root.tokens.fontSizeMapPrimary
+                        : root.tokens.fontSizeMapGesture
+                    font.weight: cell.usingNote ? Font.Medium : Font.Normal
+                    horizontalAlignment: Text.AlignHCenter
+                    verticalAlignment: Text.AlignVCenter
+                    elide: Text.ElideRight
+                }
+
+                HoverHandler { id: actionHover }
+                ToolTip.visible: actionHover.hovered
+                ToolTip.text: cell.usingNote
+                    ? cell.noteText.trim() + " · " + cell.bindingText.trim()
+                    : cell.bindingText.trim()
+            }
+        }
+    }
+
+    component VoicePausedCell: Item {
+        Layout.fillWidth: true
+        Layout.fillHeight: true
+        Layout.columnSpan: 2
+        implicitHeight: 30
+
+        Rectangle {
+            anchors.left: parent.left
+            anchors.top: parent.top
+            anchors.bottom: parent.bottom
+            width: 1
+            color: root.tokens.border
+        }
+
+        ColumnLayout {
+            anchors.fill: parent
+            anchors.leftMargin: 3
+            anchors.rightMargin: 3
+            spacing: 0
+
+            UiLabel {
+                tokens: root.tokens
+                kind: noteKind
+                Layout.fillWidth: true
+                Layout.preferredHeight: 10
+                text: qsTr("双击 / 长按")
+                color: root.tokens.disabledText
+                font.pixelSize: root.tokens.fontSizeMapGesture
+                horizontalAlignment: Text.AlignHCenter
+                verticalAlignment: Text.AlignVCenter
+                elide: Text.ElideRight
+            }
+            UiLabel {
+                objectName: root.exposeObjectNames
+                    ? "mappingVoicePausedText_" + root.cardId : ""
+                tokens: root.tokens
+                kind: noteKind
+                Layout.fillWidth: true
+                Layout.preferredHeight: 15
+                text: qsTr("语音模式下暂停")
+                color: root.tokens.disabledText
+                font.pixelSize: root.tokens.fontSizeMapGesture
+                font.weight: Font.Normal
+                horizontalAlignment: Text.AlignHCenter
+                verticalAlignment: Text.AlignVCenter
+                elide: Text.ElideRight
+            }
+        }
     }
 
     background: Rectangle {
         radius: root.tokens.cornerRadiusSmall
-        color: root.tokens.surface
-        border.width: root.selected ? 2 : 1
-        border.color: root.selected || root.hovered
-            ? root.tokens.accent : root.tokens.cardBorder
+        color: root.selected ? root.tokens.accentSoft : root.tokens.surface
+        border.width: 1
+        border.color: root.selected
+            ? root.tokens.accent
+            : root.hovered
+                ? root.tokens.borderStrong : root.tokens.cardBorder
     }
 
     contentItem: GridLayout {
         columns: 2
-        columnSpacing: 0
+        columnSpacing: 4
 
         UiLabel {
             objectName: root.exposeObjectNames ? "mappingKeyCell_" + root.cardId : ""
@@ -57,94 +207,53 @@ AbstractButton {
             Layout.fillHeight: true
             text: root.buttonName
             Accessible.name: text
-            font.pixelSize: root.tokens.fontSizeTiny
+            font.pixelSize: root.tokens.fontSizeSmall
             font.weight: Font.Medium
             horizontalAlignment: Text.AlignHCenter
             verticalAlignment: Text.AlignVCenter
             elide: Text.ElideRight
         }
 
-        RowLayout {
+        GridLayout {
             Layout.fillWidth: true
             Layout.fillHeight: true
-            spacing: 0
+            columns: 3
+            columnSpacing: 0
+            rowSpacing: 0
 
-            GestureDivider { }
-
-            Item {
+            GestureCell {
                 objectName: root.exposeObjectNames ? "mappingSingleCell_" + root.cardId : ""
-                Layout.fillWidth: true
-                Layout.fillHeight: true
-                ColumnLayout {
-                    anchors.fill: parent
-                    anchors.margins: 2
-                    spacing: 0
-                    UiLabel { tokens: root.tokens; kind: noteKind; Layout.fillWidth: true; text: qsTr("单击"); font.pixelSize: root.tokens.fontSizeTiny; horizontalAlignment: Text.AlignHCenter }
-                    UiLabel {
-                    objectName: root.exposeObjectNames ? "mappingSinglePrimaryText_" + root.cardId : ""
-                        tokens: root.tokens
-                        kind: bodyKind
-                        Layout.fillWidth: true
-                        text: root.shown(root.singleText, false)
-                        color: text === qsTr("未设置") ? root.tokens.disabledText : root.tokens.textPrimary
-                        font.pixelSize: root.tokens.fontSizeTiny
-                        font.weight: text === qsTr("未设置") ? Font.Normal : Font.Medium
-                        horizontalAlignment: Text.AlignHCenter
-                        elide: Text.ElideRight
-                    }
-                }
+                gestureLabel: qsTr("单击")
+                bindingText: root.singleText
+                noteText: root.singleNoteText
+                valueObjectName: root.exposeObjectNames
+                    ? "mappingSinglePrimaryText_" + root.cardId : ""
             }
 
-            GestureDivider { }
-
-            Item {
+            GestureCell {
                 objectName: root.exposeObjectNames ? "mappingDoubleCell_" + root.cardId : ""
-                Layout.fillWidth: true
-                Layout.fillHeight: true
-                ColumnLayout {
-                    anchors.fill: parent
-                    anchors.margins: 2
-                    spacing: 0
-                    UiLabel { tokens: root.tokens; kind: noteKind; Layout.fillWidth: true; text: qsTr("双击"); font.pixelSize: root.tokens.fontSizeTiny; horizontalAlignment: Text.AlignHCenter }
-                    UiLabel {
-                    objectName: root.exposeObjectNames ? "mappingDoublePrimaryText_" + root.cardId : ""
-                        tokens: root.tokens
-                        kind: bodyKind
-                        Layout.fillWidth: true
-                        text: root.shown(root.doubleText, root.voiceAction)
-                        color: root.voiceAction || text === qsTr("未设置") ? root.tokens.disabledText : root.tokens.textPrimary
-                        font.pixelSize: root.tokens.fontSizeTiny
-                        font.weight: root.voiceAction || text === qsTr("未设置") ? Font.Normal : Font.Medium
-                        horizontalAlignment: Text.AlignHCenter
-                        elide: Text.ElideRight
-                    }
-                }
+                visible: !root.voiceAction
+                gestureLabel: qsTr("双击")
+                bindingText: root.doubleText
+                noteText: root.doubleNoteText
+                valueObjectName: root.exposeObjectNames
+                    ? "mappingDoublePrimaryText_" + root.cardId : ""
             }
 
-            GestureDivider { }
-
-            Item {
+            GestureCell {
                 objectName: root.exposeObjectNames ? "mappingLongCell_" + root.cardId : ""
-                Layout.fillWidth: true
-                Layout.fillHeight: true
-                ColumnLayout {
-                    anchors.fill: parent
-                    anchors.margins: 2
-                    spacing: 0
-                    UiLabel { tokens: root.tokens; kind: noteKind; Layout.fillWidth: true; text: qsTr("长按"); font.pixelSize: root.tokens.fontSizeTiny; horizontalAlignment: Text.AlignHCenter }
-                    UiLabel {
-                    objectName: root.exposeObjectNames ? "mappingLongPrimaryText_" + root.cardId : ""
-                        tokens: root.tokens
-                        kind: bodyKind
-                        Layout.fillWidth: true
-                        text: root.shown(root.longText, root.voiceAction)
-                        color: root.voiceAction || text === qsTr("未设置") ? root.tokens.disabledText : root.tokens.textPrimary
-                        font.pixelSize: root.tokens.fontSizeTiny
-                        font.weight: root.voiceAction || text === qsTr("未设置") ? Font.Normal : Font.Medium
-                        horizontalAlignment: Text.AlignHCenter
-                        elide: Text.ElideRight
-                    }
-                }
+                visible: !root.voiceAction
+                gestureLabel: qsTr("长按")
+                bindingText: root.longText
+                noteText: root.longNoteText
+                valueObjectName: root.exposeObjectNames
+                    ? "mappingLongPrimaryText_" + root.cardId : ""
+            }
+
+            VoicePausedCell {
+                objectName: root.exposeObjectNames
+                    ? "mappingVoicePausedCell_" + root.cardId : ""
+                visible: root.voiceAction
             }
         }
     }

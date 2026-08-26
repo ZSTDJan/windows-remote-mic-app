@@ -20,6 +20,7 @@ ComboBox {
     leftPadding: 7
     rightPadding: 24
     displayText: decoratedText(currentIndex, currentText)
+    font.family: tokens ? tokens.fontFamily : "Noto Sans SC"
     font.pixelSize: tokens ? tokens.fontSizeControl : 12
     font.weight: Font.Medium
 
@@ -31,12 +32,11 @@ ComboBox {
         elide: Text.ElideRight
     }
 
-    indicator: Label {
+    indicator: DropDownIndicator {
         x: root.width - width - 7
-        y: (root.height - height) / 2 - 1
-        text: "⌄"
-        color: root.enabled ? root.tokens.textSecondary : root.tokens.disabledText
-        font.pixelSize: 13
+        y: (root.height - height) / 2
+        indicatorColor: root.enabled
+            ? root.tokens.textSecondary : root.tokens.disabledText
     }
 
     background: Rectangle {

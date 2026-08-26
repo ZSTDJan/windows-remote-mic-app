@@ -34,12 +34,15 @@ QtObject {
     property color statusBackground: accentSoft
     property color errorBackground: darkMode ? "#422421" : "#fdeceb"
 
-    property string fontFamily: "Microsoft YaHei UI"
-    property int fontSizeTiny: 10
-    property int fontSizeSmall: 11
-    property int fontSizeControl: 12
+    property string fontFamily: "Noto Sans SC"
+    property string fontFamilyMono: "Consolas"
+    property real fontSizeTiny: 9.5
+    property real fontSizeMapGesture: 8.5
+    property real fontSizeMapPrimary: 9.5
+    property real fontSizeSmall: 10.5
+    property real fontSizeControl: 11
     property int fontSizeBody: 12
-    property int fontSizeSection: 15
+    property int fontSizeSection: 14
     property int fontSizeTitle: 15
 
     property int cornerRadiusControl: 5
@@ -52,9 +55,13 @@ QtObject {
 
     property int navigationWidth: 48
     property int navigationItemHeight: 46
-    property int controlHeight: 26
-    property int buttonHeight: 30
-    property int statusBarMinHeight: 28
+    property int controlHeight: 28
+    property int buttonHeight: controlHeight
+    property int buttonWidth2Chars: 48
+    property int buttonWidth4Chars: 72
+    property int buttonWidth6Chars: 92
+    property int buttonWidth9Chars: 120
+    property int statusBarMinHeight: 20
     property int pageMaxWidth: 920
     property int pageHorizontalPadding: 10
     property int pageVerticalPadding: 10

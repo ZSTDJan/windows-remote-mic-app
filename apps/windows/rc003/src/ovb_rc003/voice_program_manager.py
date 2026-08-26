@@ -29,7 +29,7 @@ VOICE_PROGRAM_PROVIDER_ORDER = (
 VOICE_PROGRAM_PROVIDER_NAMES = {
     VOICE_PROGRAM_NONE: "不管理",
     VOICE_PROGRAM_SOGOU: "搜狗语音输入",
-    VOICE_PROGRAM_CUSTOM: "自定义程序",
+    VOICE_PROGRAM_CUSTOM: "其他输入法或自定义程序",
 }
 
 _SOGOU_PROCESS_NAME = "sogou_voice_assistant.exe"
@@ -94,7 +94,10 @@ def normalize_voice_program_settings(raw: object) -> dict[str, object]:
         "launch_on_bridge_start": (
             enabled and data.get("launch_on_bridge_start") is True
         ),
-        "launch_elevated": enabled and data.get("launch_elevated") is True,
+        # Keep the user's elevation preference while management is disabled.
+        # It has no effect for provider=none and is reused if a provider is
+        # selected again later.
+        "launch_elevated": data.get("launch_elevated") is True,
     }
 
 

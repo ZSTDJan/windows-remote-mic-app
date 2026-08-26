@@ -12,6 +12,7 @@ Label {
     property int kind: bodyKind
 
     color: kind === noteKind ? tokens.disabledText : tokens.textPrimary
+    font.family: tokens.fontFamily
     font.pixelSize: kind === pageTitleKind || kind === sectionTitleKind
         ? tokens.fontSizeSection
         : kind === noteKind

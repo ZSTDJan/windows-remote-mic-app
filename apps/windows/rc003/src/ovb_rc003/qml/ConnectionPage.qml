@@ -1,11 +1,74 @@
 import QtQuick
 import QtQuick.Controls
+import QtQuick.Dialogs
 import QtQuick.Layouts
 import OvbRc003Settings 1.0
 
 Item {
     id: root
     property var tokens
+    property bool voiceHotkeyRecording: false
+    property string voiceHotkeyCaptureError: ""
+
+    readonly property bool voiceProgramManaged:
+        SettingsController.selectedVoiceProgramIndex !== 0
+    readonly property bool bridgeLaunchInProgress:
+        SettingsController.bridgeLaunchBusy
+        || SettingsController.bridgeLaunchPhase === "waiting"
+    readonly property color voiceProgramStateColor:
+        SettingsController.voiceProgramStatusCode === "running"
+            ? tokens.successColor
+            : SettingsController.voiceProgramStatusCode === "disabled"
+                ? tokens.accent : tokens.voiceAccent
+
+    function voiceProgramStatusSummary() {
+        const code = SettingsController.voiceProgramStatusCode
+        if (!voiceProgramManaged)
+            return ""
+        if (code === "running") {
+            return SettingsController.voiceProgramStatusText.indexOf(
+                qsTr("管理员权限")
+            ) >= 0 ? qsTr("管理员运行中") : qsTr("普通权限运行中")
+        }
+        if (code === "stopped")
+            return SettingsController.bridgeRunning
+                ? qsTr("已修改 · 待应用") : qsTr("已找到 · 待启动")
+        if (code === "not_found") {
+            return SettingsController.selectedVoiceProgramIndex === 2
+                && SettingsController.voiceProgramCustomPath.length === 0
+                ? qsTr("请选择程序") : qsTr("未找到程序")
+        }
+        return qsTr("需检查")
+    }
+
+    function voiceProgramReadinessText() {
+        if (!voiceProgramManaged)
+            return qsTr("不管理")
+        const code = SettingsController.voiceProgramStatusCode
+        if (code === "running")
+            return qsTr("运行中")
+        if (code === "stopped")
+            return SettingsController.bridgeRunning ? qsTr("待应用") : qsTr("待启动")
+        return qsTr("需检查")
+    }
+
+    function startVoiceHotkeyCapture() {
+        if (voiceHotkeyRecording) {
+            stopVoiceHotkeyCapture()
+            return
+        }
+        voiceHotkeyCaptureError = ""
+        voiceHotkeyRecording = true
+        SettingsController.startHotkeyCapture()
+        voiceHotkeyField.forceActiveFocus()
+    }
+
+    function stopVoiceHotkeyCapture() {
+        if (!voiceHotkeyRecording)
+            return
+        voiceHotkeyRecording = false
+        SettingsController.stopHotkeyCapture()
+    }
 
     function ensureVisible(item) {
         if (!item)
@@ -22,6 +85,83 @@ Item {
         })
     }
 
+    component ReadinessRow: RowLayout {
+        property string labelText: ""
+        property string stateText: ""
+        property string detailText: ""
+        property color stateColor: root.tokens.accent
+
+        Layout.fillWidth: true
+        spacing: 5
+
+        Rectangle {
+            Layout.preferredWidth: 8
+            Layout.preferredHeight: 8
+            radius: 4
+            color: parent.stateColor
+        }
+        UiLabel {
+            tokens: root.tokens
+            kind: bodyKind
+            Layout.fillWidth: true
+            text: parent.labelText
+            font.pixelSize: root.tokens.fontSizeSmall
+            elide: Text.ElideRight
+            HoverHandler { id: readinessHover }
+            ToolTip.visible: readinessHover.hovered && parent.detailText.length > 0
+            ToolTip.text: parent.detailText
+        }
+        UiLabel {
+            tokens: root.tokens
+            kind: bodyKind
+            text: parent.stateText
+            color: parent.stateColor
+            font.pixelSize: root.tokens.fontSizeSmall
+            font.weight: Font.Medium
+        }
+    }
+
+    FileDialog {
+        id: voiceProgramFileDialog
+        title: qsTr("选择语音程序")
+        nameFilters: [
+            qsTr("程序或快捷方式 (*.exe *.lnk)"),
+            qsTr("所有文件 (*)")
+        ]
+        onAccepted: SettingsController.voiceProgramCustomPath = selectedFile
+    }
+
+    Connections {
+        target: SettingsController
+        function onHotkeyCaptured(chord) {
+            if (!root.voiceHotkeyRecording)
+                return
+            SettingsController.holdVoiceHotkeyText = chord
+            root.stopVoiceHotkeyCapture()
+        }
+        function onHotkeyCaptureError(message) {
+            if (!root.voiceHotkeyRecording)
+                return
+            root.voiceHotkeyCaptureError = message
+            root.stopVoiceHotkeyCapture()
+        }
+    }
+
+    Timer {
+        objectName: "voiceProgramStatusRefreshTimer"
+        interval: 1500
+        repeat: true
+        running: root.visible && root.voiceProgramManaged
+        onTriggered: SettingsController.refreshVoiceProgramStatus()
+    }
+
+    onVisibleChanged: {
+        if (visible)
+            SettingsController.refreshVoiceProgramStatus()
+        else
+            stopVoiceHotkeyCapture()
+    }
+
     ScrollView {
         id: connectionScroll
         objectName: "connectionScroll"
@@ -34,15 +174,12 @@ Item {
             id: pageContent
             objectName: "connectionPageContent"
             width: connectionScroll.availableWidth
-            implicitHeight: connectionPanel.height + tokens.pageVerticalPadding * 2
+            height: Math.max(418, connectionScroll.height)
 
             RowLayout {
                 id: connectionPanel
-                anchors.left: parent.left
-                anchors.right: parent.right
-                anchors.top: parent.top
+                anchors.fill: parent
                 anchors.margins: tokens.pageHorizontalPadding
-                height: 398
                 spacing: tokens.spacingMedium
 
                 SectionFrame {
@@ -72,20 +209,13 @@ Item {
                             font.pixelSize: 14
                             elide: Text.ElideRight
                         }
-                        UiLabel {
-                            tokens: root.tokens
-                            kind: noteKind
-                            Layout.fillWidth: true
-                            horizontalAlignment: Text.AlignHCenter
-                            text: SettingsController.isRc003Device
-                                ? qsTr("RC003 · 已选择") : qsTr("无线麦克风 · 已选择")
-                        }
 
                         Item {
                             Layout.fillWidth: true
                             Layout.preferredHeight: 190
-                            Layout.topMargin: 8
-                            Layout.bottomMargin: 6
+                            Layout.topMargin: 7
+                            Layout.bottomMargin: 5
+                            clip: true
 
                             Image {
                                 id: connectionPhoto
@@ -110,34 +240,76 @@ Item {
                             }
                         }
 
+                        Item { Layout.fillHeight: true }
+
+                        Rectangle {
+                            Layout.fillWidth: true
+                            Layout.preferredHeight: 1
+                            Layout.bottomMargin: 6
+                            color: tokens.border
+                        }
+
                         ColumnLayout {
                             Layout.fillWidth: true
-                            spacing: 5
+                            spacing: 4
 
-                            RowLayout {
-                                Layout.fillWidth: true
-                                spacing: 5
-                                IconGlyph { tokens: root.tokens; glyph: "\uE702"; glyphSize: 13; Layout.preferredWidth: 15; color: tokens.accent }
-                                UiLabel { tokens: root.tokens; kind: bodyKind; text: qsTr("蓝牙配对"); Layout.fillWidth: true; font.pixelSize: tokens.fontSizeSmall }
-                                UiLabel { tokens: root.tokens; kind: noteKind; text: qsTr("系统管理"); font.pixelSize: tokens.fontSizeTiny }
+                            ReadinessRow {
+                                labelText: qsTr("后台桥接")
+                                detailText: SettingsController.launchStatusText
+                                stateText: !SettingsController.isRc003Device
+                                    ? qsTr("不使用")
+                                    : SettingsController.bridgeLaunchPhase === "unknown"
+                                        ? qsTr("需检查")
+                                        : SettingsController.bridgeRunning
+                                            ? qsTr("运行中") : qsTr("未运行")
+                                stateColor: !SettingsController.isRc003Device
+                                    ? tokens.accent
+                                    : SettingsController.bridgeLaunchPhase === "unknown"
+                                        ? tokens.voiceAccent
+                                        : SettingsController.bridgeRunning
+                                            ? tokens.successColor : tokens.voiceAccent
                             }
-                            RowLayout {
-                                Layout.fillWidth: true
-                                spacing: 5
-                                IconGlyph { tokens: root.tokens; glyph: "\uE767"; glyphSize: 13; Layout.preferredWidth: 15; color: tokens.accent }
-                                UiLabel { tokens: root.tokens; kind: bodyKind; text: qsTr("语音输出"); Layout.fillWidth: true; font.pixelSize: tokens.fontSizeSmall }
-                                UiLabel { tokens: root.tokens; kind: noteKind; text: qsTr("保存时检查"); font.pixelSize: tokens.fontSizeTiny }
+                            ReadinessRow {
+                                labelText: qsTr("当前设备")
+                                detailText: SettingsController.deviceOptions.length > 0
+                                    && SettingsController.selectedDeviceIndex >= 0
+                                    ? SettingsController.deviceOptions[
+                                        SettingsController.selectedDeviceIndex
+                                    ] : ""
+                                stateText: SettingsController.deviceCatalogAvailable
+                                    ? qsTr("已配置") : qsTr("需检查")
+                                stateColor: SettingsController.deviceCatalogAvailable
+                                    ? tokens.accent : tokens.voiceAccent
                             }
-                            RowLayout {
-                                Layout.fillWidth: true
-                                spacing: 5
-                                IconGlyph { tokens: root.tokens; glyph: "\uE9D9"; glyphSize: 13; Layout.preferredWidth: 15; color: SettingsController.bridgeRunning ? tokens.successColor : tokens.accent }
-                                UiLabel { tokens: root.tokens; kind: bodyKind; text: qsTr("后台桥接"); Layout.fillWidth: true; font.pixelSize: tokens.fontSizeSmall }
-                                UiLabel { tokens: root.tokens; kind: noteKind; text: qsTr("自动更新"); font.pixelSize: tokens.fontSizeTiny }
+                            ReadinessRow {
+                                labelText: SettingsController.isRc003Device
+                                    ? qsTr("输出端点") : qsTr("录音输入")
+                                detailText: SettingsController.isRc003Device
+                                    && SettingsController.endpointOptions.length > 0
+                                    && SettingsController.selectedEndpointIndex >= 0
+                                    ? SettingsController.endpointOptions[
+                                        SettingsController.selectedEndpointIndex
+                                    ] : ""
+                                stateText: SettingsController.isRc003Device
+                                    ? (SettingsController.endpointOptions.length > 0
+                                        && SettingsController.selectedEndpointIndex >= 0
+                                            ? qsTr("已配置") : qsTr("未配置"))
+                                    : qsTr("系统管理")
+                                stateColor: SettingsController.isRc003Device
+                                    && (SettingsController.endpointOptions.length === 0
+                                        || SettingsController.selectedEndpointIndex < 0)
+                                    ? tokens.voiceAccent : tokens.accent
+                            }
+                            ReadinessRow {
+                                visible: SettingsController.isRc003Device
+                                labelText: qsTr("语音程序")
+                                detailText: root.voiceProgramManaged
+                                    ? SettingsController.voiceProgramStatusText : qsTr("不管理")
+                                stateText: root.voiceProgramReadinessText()
+                                stateColor: root.voiceProgramStateColor
                             }
                         }
 
-                        Item { Layout.fillHeight: true }
                     }
                 }
 
@@ -147,32 +319,30 @@ Item {
                     tokens: root.tokens
                     Layout.fillWidth: true
                     Layout.fillHeight: true
-                    horizontalPadding: 14
-                    verticalPadding: 0
+                    horizontalPadding: 12
+                    verticalPadding: 8
                     contentSpacing: 0
 
                     ColumnLayout {
                         Layout.fillWidth: true
                         Layout.fillHeight: true
-                        Layout.bottomMargin: 10
                         spacing: 0
 
-                        Item {
+                        ColumnLayout {
                             Layout.fillWidth: true
-                            Layout.preferredHeight: 70
+                            spacing: 3
 
-                            FormField {
-                                anchors.left: parent.left
-                                anchors.right: parent.right
-                                anchors.verticalCenter: parent.verticalCenter
-                                tokens: root.tokens
-                                titleText: qsTr("当前设备")
-                                noteText: SettingsController.isRc003Device
-                                    ? qsTr("用于遥控按键和按住说话。")
-                                    : qsTr("直接使用 Windows 录音输入，不经过 RC003 桥接。")
-                                errorText: SettingsController.deviceCatalogAvailable
-                                    ? "" : SettingsController.deviceCatalogErrorText
-
+                            RowLayout {
+                                Layout.fillWidth: true
+                                Layout.preferredHeight: tokens.controlHeight
+                                spacing: tokens.spacingSmall
+                                UiLabel {
+                                    tokens: root.tokens
+                                    kind: bodyKind
+                                    Layout.preferredWidth: 64
+                                    Layout.minimumWidth: 64
+                                    text: qsTr("当前设备")
+                                }
                                 SelectionComboBox {
                                     id: deviceCombo
                                     objectName: "deviceCombo"
@@ -183,31 +353,59 @@ Item {
                                     onActivated: SettingsController.selectedDeviceIndex = index
                                     enabled: SettingsController.deviceCatalogAvailable
                                     Accessible.name: qsTr("当前设备")
-                                    KeyNavigation.tab: SettingsController.isRc003Device ? endpointCombo : refreshDjiButton
+                                    KeyNavigation.tab: SettingsController.isRc003Device
+                                        ? endpointCombo : refreshDjiButton
                                     onActiveFocusChanged: if (activeFocus) root.ensureVisible(this)
                                 }
                             }
+                            UiLabel {
+                                visible: SettingsController.isDjiMic2Device
+                                tokens: root.tokens
+                                kind: noteKind
+                                Layout.fillWidth: true
+                                Layout.leftMargin: 70
+                                text: qsTr("直接使用 Windows 麦克风输入。")
+                                maximumLineCount: 1
+                                elide: Text.ElideRight
+                            }
+                            UiLabel {
+                                visible: !SettingsController.deviceCatalogAvailable
+                                tokens: root.tokens
+                                kind: noteKind
+                                Layout.fillWidth: true
+                                Layout.leftMargin: 70
+                                text: SettingsController.deviceCatalogErrorText
+                                color: tokens.errorColor
+                                maximumLineCount: 1
+                                elide: Text.ElideRight
+                            }
                         }
 
-                        Rectangle { Layout.fillWidth: true; Layout.preferredHeight: 1; color: tokens.border }
+                        Rectangle {
+                            Layout.fillWidth: true
+                            Layout.preferredHeight: 1
+                            Layout.topMargin: 6
+                            Layout.bottomMargin: 6
+                            color: tokens.border
+                        }
 
-                        Item {
+                        ColumnLayout {
                             id: outputBlock
                             visible: SettingsController.isRc003Device
                             Layout.fillWidth: true
-                            Layout.preferredHeight: visible ? 70 : 0
+                            spacing: 3
 
-                            FormField {
-                                anchors.left: parent.left
-                                anchors.right: parent.right
-                                anchors.verticalCenter: parent.verticalCenter
-                                tokens: root.tokens
-                                titleText: qsTr("输出端点")
-                                noteObjectName: "endpointAvailabilityNote"
-                                noteText: qsTr("保存时检查；更换设备或输出后需重启。")
-                                errorText: SettingsController.endpointOptions.length === 0
-                                    ? qsTr("没有可用的 WASAPI 或 DirectSound 输出设备。") : ""
-
+                            RowLayout {
+                                Layout.fillWidth: true
+                                Layout.preferredHeight: tokens.controlHeight
+                                spacing: tokens.spacingSmall
+                                UiLabel {
+                                    tokens: root.tokens
+                                    kind: bodyKind
+                                    Layout.preferredWidth: 64
+                                    Layout.minimumWidth: 64
+                                    text: qsTr("输出端点")
+                                }
                                 SelectionComboBox {
                                     id: endpointCombo
                                     objectName: "endpointCombo"
@@ -218,53 +416,283 @@ Item {
                                     currentIndex: SettingsController.selectedEndpointIndex
                                     onActivated: SettingsController.selectedEndpointIndex = index
                                     Accessible.name: qsTr("输出端点")
-                                    KeyNavigation.tab: restoreDefaultsButton
+                                    KeyNavigation.tab: voiceProgramCombo
                                     onActiveFocusChanged: if (activeFocus) root.ensureVisible(this)
                                 }
                             }
+                            UiLabel {
+                                objectName: "endpointAvailabilityNote"
+                                tokens: root.tokens
+                                kind: noteKind
+                                Layout.fillWidth: true
+                                Layout.leftMargin: 70
+                                text: SettingsController.endpointOptions.length === 0
+                                    ? qsTr("没有可用的 WASAPI 或 DirectSound 输出设备。")
+                                    : qsTr("保存时检查；更换后需重启桥接。")
+                                color: SettingsController.endpointOptions.length === 0
+                                    ? tokens.errorColor : tokens.disabledText
+                                maximumLineCount: 1
+                                elide: Text.ElideRight
+                            }
                         }
 
-                        Item {
+                        ColumnLayout {
                             id: djiInputSection
                             objectName: "djiInputSection"
                             visible: SettingsController.isDjiMic2Device
                             Layout.fillWidth: true
-                            Layout.preferredHeight: visible ? 100 : 0
+                            spacing: 4
 
-                            ColumnLayout {
-                                anchors.fill: parent
-                                anchors.topMargin: 10
-                                anchors.bottomMargin: 10
-                                spacing: 5
-                                UiLabel { tokens: root.tokens; kind: sectionTitleKind; text: qsTr("Windows 录音输入") }
-                                UiLabel { tokens: root.tokens; kind: bodyKind; Layout.fillWidth: true; text: SettingsController.djiMicStatusText; wrapMode: Text.WordWrap }
-                                UiLabel { tokens: root.tokens; kind: noteKind; Layout.fillWidth: true; text: qsTr("不会修改 Windows 默认输入设备。"); wrapMode: Text.WordWrap }
-                                RowLayout {
+                            UiLabel {
+                                tokens: root.tokens
+                                kind: bodyKind
+                                Layout.fillWidth: true
+                                text: SettingsController.djiMicStatusText
+                                maximumLineCount: 1
+                                elide: Text.ElideRight
+                            }
+                            RowLayout {
+                                Layout.fillWidth: true
+                                spacing: tokens.spacingSmall
+                                CompactButton {
+                                    id: refreshDjiButton
+                                    objectName: "refreshDjiButton"
+                                    tokens: root.tokens
+                                    compactMinimumWidth: tokens.buttonWidth4Chars
+                                    text: qsTr("重新检测")
+                                    onClicked: SettingsController.refreshDjiMicStatus()
+                                    KeyNavigation.tab: openSoundSettingsButton
+                                }
+                                CompactButton {
+                                    id: openSoundSettingsButton
+                                    objectName: "openSoundSettingsButton"
+                                    tokens: root.tokens
+                                    compactMinimumWidth: tokens.buttonWidth4Chars
+                                    text: qsTr("声音输入")
+                                    highlighted: true
+                                    onClicked: SettingsController.openSoundSettings()
+                                    KeyNavigation.tab: saveOnlyButton
+                                }
+                                Item { Layout.fillWidth: true }
+                            }
+                        }
+
+                        Rectangle {
+                            visible: SettingsController.isRc003Device
+                            Layout.fillWidth: true
+                            Layout.preferredHeight: visible ? 1 : 0
+                            Layout.topMargin: visible ? 6 : 0
+                            Layout.bottomMargin: visible ? 6 : 0
+                            color: tokens.border
+                        }
+
+                        ColumnLayout {
+                            id: voiceInputSection
+                            objectName: "voiceInputSection"
+                            visible: SettingsController.isRc003Device
+                            Layout.fillWidth: true
+                            spacing: 3
+
+                            UiLabel {
+                                tokens: root.tokens
+                                kind: sectionTitleKind
+                                text: qsTr("语音输入")
+                            }
+
+                            RowLayout {
+                                Layout.fillWidth: true
+                                Layout.preferredHeight: tokens.controlHeight
+                                spacing: tokens.spacingSmall
+                                UiLabel {
+                                    tokens: root.tokens
+                                    kind: bodyKind
+                                    Layout.preferredWidth: 64
+                                    Layout.minimumWidth: 64
+                                    text: qsTr("语音程序")
+                                }
+                                SelectionComboBox {
+                                    id: voiceProgramCombo
+                                    objectName: "voiceProgramCombo"
+                                    tokens: root.tokens
+                                    Layout.preferredWidth: 168
+                                    Layout.minimumWidth: 168
+                                    Layout.maximumWidth: 168
+                                    model: SettingsController.voiceProgramOptions
+                                    currentIndex: SettingsController.selectedVoiceProgramIndex
+                                    onActivated: SettingsController.selectedVoiceProgramIndex = index
+                                    Accessible.name: qsTr("语音程序")
+                                }
+                                UiLabel {
+                                    id: voiceProgramStatusLabel
+                                    objectName: "voiceProgramStatusLabel"
+                                    tokens: root.tokens
+                                    kind: noteKind
+                                    visible: root.voiceProgramManaged
                                     Layout.fillWidth: true
-                                    spacing: tokens.spacingSmall
-                                    CompactButton {
-                                        id: refreshDjiButton
-                                        objectName: "refreshDjiButton"
-                                        tokens: root.tokens
-                                        text: qsTr("重新检测")
-                                        onClicked: SettingsController.refreshDjiMicStatus()
-                                        KeyNavigation.tab: openSoundSettingsButton
+                                    text: root.voiceProgramStatusSummary()
+                                    color: root.voiceProgramStateColor
+                                    font.weight: Font.Medium
+                                    elide: Text.ElideRight
+                                    HoverHandler { id: voiceProgramStatusHover }
+                                    ToolTip.visible: voiceProgramStatusHover.hovered
+                                    ToolTip.text: SettingsController.voiceProgramStatusText
+                                }
+                                Item {
+                                    visible: !root.voiceProgramManaged
+                                    Layout.fillWidth: true
+                                }
+                            }
+
+                            RowLayout {
+                                visible: SettingsController.selectedVoiceProgramIndex === 2
+                                Layout.fillWidth: true
+                                Layout.preferredHeight: visible ? tokens.controlHeight : 0
+                                spacing: tokens.spacingSmall
+                                UiLabel {
+                                    tokens: root.tokens
+                                    kind: bodyKind
+                                    Layout.preferredWidth: 64
+                                    Layout.minimumWidth: 64
+                                    text: qsTr("程序路径")
+                                }
+                                CompactTextField {
+                                    objectName: "voiceProgramCustomPathField"
+                                    tokens: root.tokens
+                                    Layout.fillWidth: true
+                                    readOnly: true
+                                    text: SettingsController.voiceProgramCustomPath
+                                    placeholderText: qsTr("选择 .exe 或 .lnk")
+                                    Accessible.name: qsTr("自定义语音程序路径")
+                                }
+                                CompactButton {
+                                    objectName: "browseVoiceProgramButton"
+                                    tokens: root.tokens
+                                    compactMinimumWidth: tokens.buttonWidth2Chars
+                                    text: qsTr("选择")
+                                    onClicked: voiceProgramFileDialog.open()
+                                }
+                            }
+
+                            RowLayout {
+                                Layout.fillWidth: true
+                                Layout.preferredHeight: tokens.controlHeight
+                                spacing: tokens.spacingSmall
+                                UiLabel {
+                                    id: voiceHotkeyLabel
+                                    tokens: root.tokens
+                                    kind: bodyKind
+                                    Layout.preferredWidth: 64
+                                    Layout.minimumWidth: 64
+                                    text: qsTr("语音按键")
+                                    HoverHandler { id: voiceHotkeyLabelHover }
+                                    ToolTip.visible: voiceHotkeyLabelHover.hovered
+                                    ToolTip.text: qsTr("需要与输入法语音唤起键对应")
+                                }
+                                CompactTextField {
+                                    id: voiceHotkeyField
+                                    objectName: "holdVoiceHotkeyField"
+                                    tokens: root.tokens
+                                    Layout.preferredWidth: 168
+                                    Layout.minimumWidth: 168
+                                    Layout.maximumWidth: 168
+                                    readOnly: true
+                                    text: root.voiceHotkeyRecording
+                                        ? qsTr("请按快捷键")
+                                        : SettingsController.holdVoiceHotkeyText
+                                    color: root.voiceHotkeyRecording
+                                        ? tokens.accent : tokens.textPrimary
+                                    placeholderText: qsTr("点击录入")
+                                    Accessible.name: qsTr("语音按键，点击后直接录入")
+                                    Keys.onEscapePressed: root.stopVoiceHotkeyCapture()
+                                    TapHandler { onTapped: root.startVoiceHotkeyCapture() }
+                                    HoverHandler { id: voiceHotkeyHover }
+                                    ToolTip.visible: voiceHotkeyHover.hovered
+                                    ToolTip.text: root.voiceHotkeyCaptureError.length > 0
+                                        ? root.voiceHotkeyCaptureError
+                                        : qsTr("点击后按下快捷键")
+                                }
+                                Item { Layout.fillWidth: true }
+                            }
+
+                            RowLayout {
+                                Layout.fillWidth: true
+                                Layout.preferredHeight: tokens.controlHeight
+                                spacing: tokens.spacingSmall
+                                UiLabel {
+                                    tokens: root.tokens
+                                    kind: bodyKind
+                                    Layout.preferredWidth: 64
+                                    Layout.minimumWidth: 64
+                                    text: qsTr("程序启动")
+                                }
+                                UiLabel {
+                                    tokens: root.tokens
+                                    kind: noteKind
+                                    Layout.fillWidth: true
+                                    text: root.voiceProgramManaged
+                                        ? qsTr("随桥接启动；失败不影响桥接。")
+                                        : qsTr("不管理时仅发送语音按键，不启动外部程序。")
+                                    maximumLineCount: 1
+                                    elide: Text.ElideRight
+                                }
+                                CheckBox {
+                                    id: voiceProgramElevatedCheckBox
+                                    objectName: "voiceProgramElevatedCheckBox"
+                                    implicitHeight: tokens.controlHeight
+                                    enabled: root.voiceProgramManaged
+                                    text: qsTr("管理员启动")
+                                    font.family: tokens.fontFamily
+                                    font.pixelSize: tokens.fontSizeSmall
+                                    checked: SettingsController.voiceProgramLaunchElevated
+                                    onClicked: SettingsController.voiceProgramLaunchElevated = checked
+                                    indicator: Rectangle {
+                                        implicitWidth: 14
+                                        implicitHeight: 14
+                                        x: 0
+                                        y: (voiceProgramElevatedCheckBox.height - height) / 2
+                                        radius: 3
+                                        color: voiceProgramElevatedCheckBox.checked
+                                            ? tokens.accent : tokens.fieldBackground
+                                        border.width: 1
+                                        border.color: voiceProgramElevatedCheckBox.checked
+                                            ? tokens.accent : tokens.borderStrong
+
+                                        UiLabel {
+                                            anchors.centerIn: parent
+                                            visible: voiceProgramElevatedCheckBox.checked
+                                            tokens: root.tokens
+                                            kind: noteKind
+                                            text: "✓"
+                                            color: tokens.accentText
+                                            font.pixelSize: 10
+                                            font.weight: Font.DemiBold
+                                        }
                                     }
-                                    CompactButton {
-                                        id: openSoundSettingsButton
-                                        objectName: "openSoundSettingsButton"
+                                    contentItem: UiLabel {
                                         tokens: root.tokens
-                                        text: qsTr("声音输入")
-                                        highlighted: true
-                                        onClicked: SettingsController.openSoundSettings()
-                                        KeyNavigation.tab: saveOnlyButton
+                                        kind: bodyKind
+                                        text: voiceProgramElevatedCheckBox.text
+                                        font.pixelSize: tokens.fontSizeSmall
+                                        color: voiceProgramElevatedCheckBox.enabled
+                                            ? tokens.textPrimary : tokens.disabledText
+                                        leftPadding: voiceProgramElevatedCheckBox.indicator.width + 5
+                                        verticalAlignment: Text.AlignVCenter
                                     }
-                                    Item { Layout.fillWidth: true }
+                                    HoverHandler { id: elevatedHover }
+                                    ToolTip.visible: elevatedHover.hovered
+                                    ToolTip.text: qsTr("只提升语音程序；取消管理员确认不影响桥接")
                                 }
                             }
                         }
 
-                        Rectangle { Layout.fillWidth: true; Layout.preferredHeight: 1; color: tokens.border }
+                        Rectangle {
+                            visible: SettingsController.isRc003Device
+                            Layout.fillWidth: true
+                            Layout.preferredHeight: visible ? 1 : 0
+                            Layout.topMargin: visible ? 6 : 0
+                            Layout.bottomMargin: visible ? 6 : 0
+                            color: tokens.border
+                        }
 
                         ColumnLayout {
                             id: bridgeSection
@@ -272,25 +700,32 @@ Item {
                             visible: SettingsController.isRc003Device
                             Layout.fillWidth: true
                             Layout.fillHeight: true
-                            Layout.topMargin: 10
-                            spacing: 7
+                            spacing: 5
 
-                            UiLabel { tokens: root.tokens; kind: sectionTitleKind; text: qsTr("后台桥接") }
+                            UiLabel {
+                                tokens: root.tokens
+                                kind: sectionTitleKind
+                                text: qsTr("保存与启动")
+                            }
                             RowLayout {
                                 id: bridgeLaunchProgress
                                 objectName: "bridgeLaunchProgress"
+                                visible: root.bridgeLaunchInProgress
+                                    || SettingsController.bridgeLaunchPhase === "connected"
+                                    || SettingsController.bridgeLaunchPhase === "failed"
+                                    || SettingsController.bridgeLaunchPhase === "unknown"
                                 Layout.fillWidth: true
-                                spacing: 7
+                                Layout.preferredHeight: visible ? 20 : 0
+                                Layout.maximumHeight: visible ? 20 : 0
+                                spacing: tokens.spacingSmall
 
                                 BusyIndicator {
                                     id: bridgeLaunchBusyIndicator
                                     objectName: "bridgeLaunchBusyIndicator"
-                                    Layout.preferredWidth: 18
-                                    Layout.preferredHeight: 18
+                                    Layout.preferredWidth: 16
+                                    Layout.preferredHeight: 16
                                     visible: running
-                                    running: SettingsController.bridgeLaunchPhase === "saving"
-                                        || SettingsController.bridgeLaunchPhase === "starting"
-                                        || SettingsController.bridgeLaunchPhase === "waiting"
+                                    running: root.bridgeLaunchInProgress
                                 }
                                 UiLabel {
                                     id: bridgeLaunchStageText
@@ -303,9 +738,9 @@ Item {
                                         : SettingsController.bridgeLaunchPhase === "starting"
                                             ? qsTr("保存设置 ✓ → 启动桥接… → 等待设备连接")
                                             : SettingsController.bridgeLaunchPhase === "waiting"
-                                                ? qsTr("保存设置 ✓ → 桥接进程已启动 ✓ → 等待 RC003 连接…")
+                                                ? qsTr("保存设置 ✓ → 桥接已启动 ✓ → 等待 RC003 连接…")
                                                 : SettingsController.bridgeLaunchPhase === "connected"
-                                                    ? qsTr("保存设置 ✓ → 桥接进程已启动 ✓ → RC003 已连接 ✓")
+                                                    ? qsTr("保存设置 ✓ → 桥接已启动 ✓ → RC003 已连接 ✓")
                                                     : SettingsController.bridgeLaunchPhase === "failed"
                                                         ? qsTr("保存或启动未完成；RC003 未连接")
                                                         : SettingsController.bridgeLaunchPhase === "unknown"
@@ -318,43 +753,23 @@ Item {
                                     objectName: "bridgeLaunchElapsedText"
                                     tokens: root.tokens
                                     kind: noteKind
-                                    visible: bridgeLaunchBusyIndicator.running
-                                    text: qsTr("已等待 %1 秒").arg(
+                                    visible: SettingsController.bridgeLaunchBusy
+                                        || (SettingsController.bridgeLaunchPhase === "waiting"
+                                            && SettingsController.bridgeLaunchElapsedSeconds > 0)
+                                    text: qsTr("%1 秒").arg(
                                         SettingsController.bridgeLaunchElapsedSeconds
                                     )
                                 }
                             }
-                            RowLayout {
-                                Layout.fillWidth: true
-                                spacing: 7
-                                Rectangle {
-                                    Layout.preferredWidth: 8
-                                    Layout.preferredHeight: 8
-                                    radius: 4
-                                    color: SettingsController.bridgeRunning ? tokens.successColor : tokens.voiceAccent
-                                }
-                                UiLabel {
-                                    id: launchStatusText
-                                    objectName: "launchStatusText"
-                                    tokens: root.tokens
-                                    kind: bodyKind
-                                    Layout.fillWidth: true
-                                    text: SettingsController.launchStatusText
-                                    font.weight: Font.Medium
-                                    wrapMode: Text.WordWrap
-                                }
-                            }
                             UiLabel {
-                                objectName: "bridgeNotRunningWarning"
+                                id: launchStatusText
+                                objectName: "launchStatusText"
+                                visible: false
+                                Layout.preferredHeight: 0
                                 tokens: root.tokens
                                 kind: noteKind
-                                Layout.fillWidth: true
-                                text: SettingsController.bridgeRunning
-                                    ? qsTr("按键、声音和文字输入仍需实际测试。")
-                                    : qsTr("未启动时语音键无效；按键、声音和文字输入需实际测试。")
-                                wrapMode: Text.WordWrap
+                                text: SettingsController.launchStatusText
                             }
-
                             RowLayout {
                                 id: actionRow
                                 objectName: "connectionActionRow"
@@ -375,7 +790,8 @@ Item {
                                     objectName: "deviceSaveButton"
                                     tokens: root.tokens
                                     compactMinimumWidth: 116
-                                    text: SettingsController.isRc003Device ? qsTr("仅保存设置") : qsTr("保存设备选择")
+                                    text: SettingsController.isRc003Device
+                                        ? qsTr("仅保存设置") : qsTr("保存设备选择")
                                     highlighted: !SettingsController.isRc003Device
                                     onClicked: SettingsController.saveSettings()
                                 }
@@ -392,8 +808,23 @@ Item {
                                     onClicked: SettingsController.saveAndLaunch()
                                 }
                             }
-
-                            Item { Layout.fillHeight: true }
+                            UiLabel {
+                                objectName: "bridgeNotRunningWarning"
+                                tokens: root.tokens
+                                kind: noteKind
+                                Layout.fillWidth: true
+                                text: SettingsController.bridgeLaunchPhase === "unknown"
+                                    ? qsTr("桥接状态无法确认，请检查后再测试。")
+                                    : SettingsController.bridgeRunning
+                                        ? qsTr("桥接已运行；设备、按键、声音和文字输入仍需实测。")
+                                        : qsTr("桥接未运行，语音键无效；请保存并启动后再测试。")
+                                maximumLineCount: 1
+                                elide: Text.ElideRight
+                                Accessible.description: SettingsController.launchStatusText
+                                HoverHandler { id: launchStatusHover }
+                                ToolTip.visible: launchStatusHover.hovered
+                                ToolTip.text: SettingsController.launchStatusText
+                            }
                         }
                     }
                 }

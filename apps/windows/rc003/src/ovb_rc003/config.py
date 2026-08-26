@@ -31,7 +31,7 @@ PRODUCT_ID = "RC003"
 CONFIG_FILENAME = "config.json"
 KEY_BINDINGS_FILENAME = "key_bindings.json"
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 RUNTIME_LEGACY_VOICE_MODE_KEY = "_legacy_voice_trigger_mode"
 RUNTIME_REMOVED_VOICE_BINDINGS_KEY = "_removed_voice_bindings"
@@ -249,6 +249,9 @@ def default_key_bindings() -> Dict[str, Any]:
         # Keeping the primary action flat preserves compatibility with all
         # existing Windows config files.
         "secondary_bindings": {},
+        # Optional user-facing labels for each gesture. They never participate
+        # in action parsing or execution and are safe to omit in older files.
+        "display_notes": {},
         # Physical signatures are learned from Raw Input captures. They are
         # deliberately independent of semantic actions and contain no device
         # path or Bluetooth identity.
@@ -265,7 +268,12 @@ def load_key_bindings(path: Path) -> Dict[str, Any]:
             raise ConfigFormatError("key_bindings.json root must be a JSON object")
         _assert_no_forbidden_keys(stored)
         for key, value in stored.items():
-            if key in {"bindings", "secondary_bindings", "physical_bindings"}:
+            if key in {
+                "bindings",
+                "secondary_bindings",
+                "physical_bindings",
+                "display_notes",
+            }:
                 if isinstance(value, dict):
                     current = bindings.get(key)
                     if not isinstance(current, dict):
@@ -283,6 +291,7 @@ def load_key_bindings(path: Path) -> Dict[str, Any]:
     _normalize_physical_bindings(bindings)
     _normalize_semantic_actions(bindings)
     _normalize_secondary_bindings(bindings)
+    _normalize_display_notes(bindings)
     return bindings
 
 
@@ -425,6 +434,39 @@ def _normalize_physical_bindings(bindings: Dict[str, Any]) -> None:
         and isinstance(button_id, str)
         and button_id in device_profile.ALL_BUTTON_IDS
     }
+
+
+def _normalize_display_notes(bindings: Dict[str, Any]) -> None:
+    """Keep optional display-only labels separate from executable actions."""
+
+    from . import device_profile, key_mapping
+
+    raw_notes = bindings.get("display_notes")
+    if not isinstance(raw_notes, dict):
+        bindings["display_notes"] = {}
+        return
+    valid_triggers = {
+        key_mapping.ButtonTrigger.SINGLE_CLICK.value,
+        key_mapping.ButtonTrigger.DOUBLE_CLICK.value,
+        key_mapping.ButtonTrigger.LONG_PRESS.value,
+    }
+    normalized: Dict[str, Dict[str, str]] = {}
+    for button_id, trigger_map in raw_notes.items():
+        if button_id not in device_profile.ALL_BUTTON_IDS or not isinstance(
+            trigger_map, dict
+        ):
+            continue
+        clean_trigger_map = {
+            str(trigger): str(note).strip()
+            for trigger, note in trigger_map.items()
+            if trigger in valid_triggers
+            and isinstance(note, str)
+            and note.strip()
+            and note.strip() != "未命名"
+        }
+        if clean_trigger_map:
+            normalized[str(button_id)] = clean_trigger_map
+    bindings["display_notes"] = normalized
 
 
 def save_key_bindings(path: Path, bindings: Dict[str, Any]) -> None:

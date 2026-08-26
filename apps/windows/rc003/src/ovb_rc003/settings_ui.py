@@ -205,6 +205,7 @@ def build_save_model(
     *,
     button_display_map: Dict[str, str],
     secondary_display_map: Optional[Dict[str, Dict[str, str]]] = None,
+    display_note_map: Optional[Dict[str, Dict[str, str]]] = None,
     hotkey_text: str,
     trigger_mode: key_mapping.VoiceTriggerMode,
     endpoint_display_text: str,
@@ -342,6 +343,36 @@ def build_save_model(
                     )
                 secondary_bindings.setdefault(button_id, {})[trigger_name] = action.to_dict()
 
+    if display_note_map is None:
+        raw_display_notes = base_bindings.get("display_notes", {})
+        display_notes = (
+            copy.deepcopy(raw_display_notes)
+            if isinstance(raw_display_notes, dict)
+            else {}
+        )
+    else:
+        display_notes: Dict[str, Dict[str, str]] = {}
+        valid_note_triggers = {
+            key_mapping.ButtonTrigger.SINGLE_CLICK.value,
+            key_mapping.ButtonTrigger.DOUBLE_CLICK.value,
+            key_mapping.ButtonTrigger.LONG_PRESS.value,
+        }
+        for button_id, trigger_map in display_note_map.items():
+            if button_id not in device_profile.ALL_BUTTON_IDS or not isinstance(
+                trigger_map, dict
+            ):
+                continue
+            for trigger_name, note in trigger_map.items():
+                if trigger_name not in valid_note_triggers:
+                    continue
+                if not isinstance(note, str):
+                    continue
+                clean_note = note.strip()
+                if clean_note and clean_note != "未命名":
+                    display_notes.setdefault(button_id, {})[
+                        trigger_name
+                    ] = clean_note
+
     endpoint_name, endpoint_host_api = _parse_endpoint_display(endpoint_display_text)
 
     new_config = dict(base_config)
@@ -358,6 +389,7 @@ def build_save_model(
     new_bindings = dict(base_bindings)
     new_bindings["bindings"] = bindings
     new_bindings["secondary_bindings"] = secondary_bindings
+    new_bindings["display_notes"] = display_notes
 
     return new_config, new_bindings
 

@@ -64,7 +64,7 @@ Item {
                         CompactButton {
                             objectName: "openBluetoothSettingsButton"
                             tokens: root.tokens
-                            compactMinimumWidth: 64
+                            compactMinimumWidth: tokens.buttonWidth4Chars
                             text: qsTr("蓝牙设置")
                             onClicked: SettingsController.openBluetoothSettings()
                             onActiveFocusChanged: if (activeFocus) root.ensureVisible(this)
@@ -85,7 +85,7 @@ Item {
                         CompactButton {
                             objectName: "openMicrophonePrivacyButton"
                             tokens: root.tokens
-                            compactMinimumWidth: 64
+                            compactMinimumWidth: tokens.buttonWidth4Chars
                             text: qsTr("麦克风隐私")
                             onClicked: SettingsController.openMicrophonePrivacySettings()
                             onActiveFocusChanged: if (activeFocus) root.ensureVisible(this)
@@ -93,7 +93,7 @@ Item {
                         CompactButton {
                             objectName: "openSoundInputSettingsButton"
                             tokens: root.tokens
-                            compactMinimumWidth: 64
+                            compactMinimumWidth: tokens.buttonWidth4Chars
                             text: qsTr("声音输入")
                             onClicked: SettingsController.openSoundSettings()
                             onActiveFocusChanged: if (activeFocus) root.ensureVisible(this)
@@ -124,7 +124,7 @@ Item {
                         CompactButton {
                             objectName: "openDiagnosticsButton"
                             tokens: root.tokens
-                            compactMinimumWidth: 64
+                            compactMinimumWidth: tokens.buttonWidth4Chars
                             text: qsTr("前往检查")
                             onClicked: root.openDiagnosticsRequested()
                             onActiveFocusChanged: if (activeFocus) root.ensureVisible(this)
@@ -134,12 +134,12 @@ Item {
                         tokens: root.tokens
                         iconGlyph: "\uE95E"
                         titleText: qsTr("虚拟音频（VB-CABLE）")
-                        descriptionText: qsTr("用于传送语音；安装需管理员权限和重启，不会改默认设备。")
+                        descriptionText: qsTr("传送语音；安装需管理员权限和重启，不改默认设备。")
                         showDivider: false
                         CompactButton {
                             objectName: "openVirtualAudioDiagnosticsButton"
                             tokens: root.tokens
-                            compactMinimumWidth: 64
+                            compactMinimumWidth: tokens.buttonWidth4Chars
                             text: qsTr("前往检查")
                             onClicked: root.openDiagnosticsRequested()
                             onActiveFocusChanged: if (activeFocus) root.ensureVisible(this)
@@ -168,19 +168,19 @@ Item {
                         tokens: root.tokens
                         iconGlyph: "\uE713"
                         titleText: qsTr("输入法与应用")
-                        descriptionText: qsTr("快捷键要与“按键”页一致，目标应用要选对麦克风。")
+                        descriptionText: qsTr("语音按键需一致，目标应用需选对麦克风。")
                         showDivider: false
                         CompactButton {
                             objectName: "openInputAppSettingsButton"
                             tokens: root.tokens
-                            compactMinimumWidth: 64
+                            compactMinimumWidth: tokens.buttonWidth4Chars
                             text: qsTr("应用设置")
                             onClicked: SettingsController.openAppsSettings()
                         }
                         CompactButton {
                             objectName: "openMappingButton"
                             tokens: root.tokens
-                            compactMinimumWidth: 64
+                            compactMinimumWidth: tokens.buttonWidth4Chars
                             text: qsTr("前往按键")
                             onClicked: root.openMappingRequested()
                             onActiveFocusChanged: if (activeFocus) root.ensureVisible(this)

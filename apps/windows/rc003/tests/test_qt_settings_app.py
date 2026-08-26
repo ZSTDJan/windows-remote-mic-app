@@ -324,6 +324,17 @@ class ButtonMappingModelTests(unittest.TestCase):
             "Escape",
         )
 
+    def test_display_note_can_be_set_and_round_tripped(self):
+        model = self.Model()
+        row = model.index_of("power")
+        model.setDisplayNoteAt(row, "single_click", "  关机  ")
+        index = model.index(row, 0)
+        self.assertEqual(model.data(index, model.SingleNoteRole), "关机")
+        self.assertEqual(
+            model.to_display_note_map(),
+            {"power": {"single_click": "关机"}},
+        )
+
     def test_to_display_map_round_trips_all_physical_buttons(self):
         model = self.Model()
         model.load_display_map({"power": "escape", "up": "up", "mic": "Escape"})
@@ -364,6 +375,7 @@ class ButtonMappingModelTests(unittest.TestCase):
         model.load_display_map(
             {"power": "Escape", "mic": "按住说话"},
             {"power": {"double_click": "Return", "long_press": ""}},
+            {"power": {"single_click": "关机"}},
         )
 
         self.assertEqual(resets, [])
@@ -373,6 +385,7 @@ class ButtonMappingModelTests(unittest.TestCase):
         self.assertTrue(model.data(power, model.IsSelectedRole))
         self.assertEqual(model.data(power, model.ActionTextRole), "Escape")
         self.assertEqual(model.data(power, model.DoubleClickTextRole), "Return")
+        self.assertEqual(model.data(power, model.SingleNoteRole), "关机")
 
     def test_selecting_a_button_flags_only_that_row_as_selected(self):
         model = self.Model()
@@ -433,6 +446,53 @@ class SettingsControllerTests(unittest.TestCase):
         self.assertFalse(controller.voiceProgramLaunchOnBridgeStart)
         self.assertFalse(controller.voiceProgramLaunchElevated)
         self.assertIn("不会管理", controller.voiceProgramStatusText)
+
+    def test_selecting_a_voice_program_enables_bridge_autostart_automatically(self):
+        controller, _ = self._make_controller()
+
+        controller.selectedVoiceProgramIndex = 1
+
+        self.assertTrue(controller.voiceProgramLaunchOnBridgeStart)
+        self.assertTrue(controller.settingsDirty)
+
+    def test_disabling_management_keeps_the_elevation_preference_in_memory(self):
+        controller, _ = self._make_controller()
+        controller.selectedVoiceProgramIndex = 1
+        controller.voiceProgramLaunchElevated = True
+
+        controller.selectedVoiceProgramIndex = 0
+
+        self.assertFalse(controller.voiceProgramLaunchOnBridgeStart)
+        self.assertTrue(controller.voiceProgramLaunchElevated)
+
+    def test_disabled_management_keeps_the_elevation_preference_after_reopen(self):
+        controller, _ = self._make_controller()
+        controller.selectedVoiceProgramIndex = 1
+        controller.voiceProgramLaunchElevated = True
+        controller.selectedVoiceProgramIndex = 0
+
+        self.assertTrue(controller.saveSettings())
+
+        reopened, _ = self._make_controller()
+        self.assertEqual(reopened.selectedVoiceProgramIndex, 0)
+        self.assertFalse(reopened.voiceProgramLaunchOnBridgeStart)
+        self.assertTrue(reopened.voiceProgramLaunchElevated)
+
+    def test_existing_managed_program_without_autostart_is_migrated_as_dirty(self):
+        saved = config.default_config()
+        saved["voice_program"] = {
+            "provider": "sogou",
+            "custom_executable": "",
+            "launch_on_bridge_start": False,
+            "launch_elevated": False,
+        }
+        config.save_config(config.config_path(config.config_root()), saved)
+
+        controller, _ = self._make_controller()
+
+        self.assertTrue(controller.voiceProgramLaunchOnBridgeStart)
+        self.assertTrue(controller.settingsDirty)
+        self.assertIn("随桥接启动", controller.statusMessage)
 
     def test_voice_program_settings_persist_with_the_main_save(self):
         executable = Path(self._tmpdir.name) / "voice.exe"
@@ -822,6 +882,43 @@ class SettingsControllerTests(unittest.TestCase):
         self.assertTrue(controller.settingsDirty)
         self.assertEqual(controller.statusMessage, "")
 
+    def test_display_note_persists_after_save_and_reopen(self):
+        controller, model = self._make_controller()
+        power_row = model.index_of("power")
+        model.setActionTextAt(power_row, "ctrl+c")
+        model.setDisplayNoteAt(power_row, "single_click", "复制")
+
+        self.assertTrue(controller.saveSettings())
+
+        _, reopened_model = self._make_controller()
+        self.assertEqual(
+            reopened_model.to_display_note_map()["power"]["single_click"],
+            "复制",
+        )
+        self.assertEqual(reopened_model.to_display_map()["power"], "ctrl+c")
+
+    def test_failed_save_keeps_the_last_persisted_display_note(self):
+        controller, model = self._make_controller()
+        power_row = model.index_of("power")
+        model.setDisplayNoteAt(power_row, "single_click", "复制")
+        self.assertTrue(controller.saveSettings())
+
+        model.setDisplayNoteAt(power_row, "single_click", "粘贴")
+        with mock.patch.object(
+            config,
+            "save_settings_pair",
+            side_effect=OSError("settings file is locked"),
+        ):
+            self.assertFalse(controller.saveSettings())
+
+        persisted = config.load_key_bindings(
+            config.key_bindings_path(config.config_root())
+        )
+        self.assertEqual(
+            persisted["display_notes"]["power"]["single_click"],
+            "复制",
+        )
+
     def test_save_settings_reports_a_persistence_failure(self):
         controller, _ = self._make_controller()
         controller.holdVoiceHotkeyText = "ctrl+l"
@@ -1035,11 +1132,15 @@ class SettingsControllerTests(unittest.TestCase):
             bridge_launcher,
             "launch_bridge",
             side_effect=AssertionError("GUI must not call the blocking launch wrapper"),
-        ):
+        ), mock.patch.object(
+            qt_settings_app.voice_program_manager,
+            "launch_voice_program",
+        ) as launch_voice_program:
             controller.saveAndLaunch()
             self.assertEqual(controller.bridgeLaunchPhase, "saving")
             self.assertFalse(start_launch.called)
             self._continue_save_and_launch(controller)
+        launch_voice_program.assert_not_called()
         self.assertTrue(controller.bridgeRunning)
         self.assertFalse(controller.bridgeConnected)
         self.assertEqual(controller.bridgeLaunchPhase, "waiting")
@@ -1052,6 +1153,59 @@ class SettingsControllerTests(unittest.TestCase):
         self.assertFalse(controller.bridgeRunning)
         self.assertEqual(controller.bridgeLaunchPhase, "failed")
         self.assertIn("桥接进程已经退出", controller.launchStatusText)
+
+    def test_existing_bridge_applies_the_saved_voice_program_without_restart(self):
+        controller, _ = self._make_controller()
+        controller.selectedVoiceProgramIndex = 1
+        bridge_result = bridge_launcher.LaunchResult(
+            outcome=bridge_launcher.LaunchOutcome.ALREADY_RUNNING,
+            command=("exe",),
+            exit_code=bridge_launcher.ALREADY_RUNNING_EXIT_CODE,
+        )
+        voice_result = voice_program_manager.VoiceProgramLaunchResult(
+            provider_id="sogou",
+            started=True,
+            already_running=False,
+            code="started",
+        )
+
+        with mock.patch.object(
+            bridge_launcher, "start_bridge_launch", return_value=bridge_result
+        ), mock.patch.object(
+            qt_settings_app.voice_program_manager,
+            "launch_voice_program",
+            return_value=voice_result,
+        ) as launch_voice_program:
+            controller.saveAndLaunch()
+            self._continue_save_and_launch(controller)
+
+        launch_voice_program.assert_called_once_with(controller._voice_program_settings)
+        self.assertTrue(controller.bridgeRunning)
+        self.assertEqual(controller.bridgeLaunchPhase, "waiting")
+        self.assertIn("已启动语音程序", controller.statusMessage)
+
+    def test_existing_bridge_survives_an_unexpected_voice_program_launch_error(self):
+        controller, _ = self._make_controller()
+        controller.selectedVoiceProgramIndex = 1
+        bridge_result = bridge_launcher.LaunchResult(
+            outcome=bridge_launcher.LaunchOutcome.ALREADY_RUNNING,
+            command=("exe",),
+            exit_code=bridge_launcher.ALREADY_RUNNING_EXIT_CODE,
+        )
+
+        with mock.patch.object(
+            bridge_launcher, "start_bridge_launch", return_value=bridge_result
+        ), mock.patch.object(
+            qt_settings_app.voice_program_manager,
+            "launch_voice_program",
+            side_effect=RuntimeError("unexpected launch failure"),
+        ):
+            controller.saveAndLaunch()
+            self._continue_save_and_launch(controller)
+
+        self.assertTrue(controller.bridgeRunning)
+        self.assertEqual(controller.bridgeLaunchPhase, "waiting")
+        self.assertIn("桥接不受影响", controller.errorMessage)
 
     def test_pending_launch_stays_in_starting_until_poll_finishes(self):
         controller, _ = self._make_controller()
@@ -1124,6 +1278,24 @@ class SettingsControllerTests(unittest.TestCase):
             model.data(mic_index, model.ActionTextRole),
             settings_ui._VOICE_HOLD_DISPLAY,
         )
+
+    def test_restore_mapping_defaults_does_not_change_voice_program_or_hotkey(self):
+        controller, model = self._make_controller()
+        controller.holdVoiceHotkeyText = "ctrl+l"
+        controller.selectedVoiceProgramIndex = 1
+        controller.voiceProgramLaunchElevated = True
+        power_row = model.index_of("power")
+        model.setActionTextAt(power_row, "f5")
+        model.setDisplayNoteAt(power_row, "single_click", "刷新")
+
+        controller.restoreMappingDefaults()
+
+        self.assertEqual(controller.holdVoiceHotkeyText, "ctrl+l")
+        self.assertEqual(controller.selectedVoiceProgramIndex, 1)
+        self.assertTrue(controller.voiceProgramLaunchElevated)
+        power_index = model.index(power_row, 0)
+        self.assertNotEqual(model.data(power_index, model.ActionTextRole), "f5")
+        self.assertEqual(model.data(power_index, model.SingleNoteRole), "")
 
     def test_select_button_updates_both_the_controller_and_the_model(self):
         controller, model = self._make_controller()
@@ -2672,6 +2844,32 @@ result["connection"] = {
     "launch_highlighted": bool(find_child(window, "saveAndLaunchButton").property("highlighted")),
 }
 
+controller._bridge_launch_elapsed_seconds = 12
+controller.bridgeLaunchElapsedSecondsChanged.emit()
+controller._set_bridge_launch_phase("waiting")
+render(window, app)
+result["connection"]["waiting_progress"] = {
+    "visible": bool(find_child(window, "bridgeLaunchProgress").property("visible")),
+    "indicator_running": bool(
+        find_child(window, "bridgeLaunchBusyIndicator").property("running")
+    ),
+    "stage_text": str(find_child(window, "bridgeLaunchStageText").property("text")),
+    "elapsed_visible": bool(
+        find_child(window, "bridgeLaunchElapsedText").property("visible")
+    ),
+    "elapsed_text": str(find_child(window, "bridgeLaunchElapsedText").property("text")),
+}
+
+controller._set_bridge_launch_phase("connected")
+render(window, app)
+result["connection"]["connected_progress"] = {
+    "visible": bool(find_child(window, "bridgeLaunchProgress").property("visible")),
+    "indicator_running": bool(
+        find_child(window, "bridgeLaunchBusyIndicator").property("running")
+    ),
+    "stage_text": str(find_child(window, "bridgeLaunchStageText").property("text")),
+}
+
 controller._set_launch_status("AUDIT_LAUNCH_RESULT_MUST_BE_VISIBLE")
 render(window, app)
 result["connection"]["explicit_launch_status"] = str(
@@ -2697,9 +2895,10 @@ tab_bar.setProperty("currentIndex", 1)
 render(window, app)
 mapping_names = (
     "rc003MappingLayout",
-    "voiceSettingsPanel",
-    "holdVoiceHotkeyField",
+    "mappingActionsPanel",
     "mappingList",
+    "mappingLines",
+    "activeMappingLine",
     "leftMappingCards",
     "photoSidebar",
     "rightMappingCards",
@@ -3128,18 +3327,15 @@ class SettingsShellSourceContractTests(unittest.TestCase):
             self.assertIn("SectionFrame {", page_text)
             self.assertIn("UiLabel {", page_text)
 
-        self.assertIn("FormField {", self.connection_qml)
-        self.assertIn(
-            "noteText: SettingsController.isRc003Device",
-            self.connection_qml,
-        )
+        self.assertIn("SelectionComboBox {", self.connection_qml)
+        self.assertIn("CompactTextField {", self.connection_qml)
         self.assertIn("SettingsListRow {", self.permissions_qml)
         self.assertIn("SettingsListRow {", self.diagnostics_qml)
         self.assertIn("property string descriptionObjectName", self.settings_list_row_qml)
         self.assertIn("AbstractButton {", self.mapping_card_qml)
 
     def test_all_selectors_reuse_one_selected_option_delegate(self):
-        self.assertEqual(self.connection_qml.count("SelectionComboBox {"), 2)
+        self.assertEqual(self.connection_qml.count("SelectionComboBox {"), 3)
         self.assertIn(
             "recommendedIndex: SettingsController.recommendedEndpointIndex",
             self.connection_qml,
@@ -3151,10 +3347,10 @@ class SettingsShellSourceContractTests(unittest.TestCase):
         self.assertIn("recommendedIndex >= 0 && index >= 0", self.selection_combo_qml)
         self.assertIn('qsTr("（推荐）")', self.selection_combo_qml)
         self.assertIn("displayText: decoratedText(currentIndex, currentText)", self.selection_combo_qml)
-        self.assertEqual(self.buttons_qml.count("SelectionComboBox {"), 1)
+        self.assertEqual(self.buttons_qml.count("SelectionComboBox {"), 0)
         self.assertIn(
             "model: SettingsController.voiceProgramOptions",
-            self.buttons_qml,
+            self.connection_qml,
         )
 
     def test_log_location_has_one_formal_entry_point(self):
@@ -3164,7 +3360,7 @@ class SettingsShellSourceContractTests(unittest.TestCase):
             self.diagnostics_qml.count("SettingsController.openLogLocation()"),
             1,
         )
-        self.assertIn("日志不保存语音和设备信息", self.diagnostics_qml)
+        self.assertIn("打开系统设置或日志目录", self.diagnostics_qml)
 
     def test_connection_keeps_save_and_launch_as_distinct_commands(self):
         self.assertIn('qsTr("仅保存设置")', self.connection_qml)
@@ -3175,7 +3371,7 @@ class SettingsShellSourceContractTests(unittest.TestCase):
         self.assertIn("恢复按键与语音默认", self.connection_qml)
         self.assertNotIn("恢复全部默认", self.connection_qml)
         self.assertIn("compactMinimumWidth: 116", self.connection_qml)
-        self.assertIn("更换设备或输出后需重启", self.connection_qml)
+        self.assertIn("保存时检查；更换后需重启桥接。", self.connection_qml)
 
     def test_diagnostics_keeps_each_check_detail_visible(self):
         self.assertIn("ListModel {", self.diagnostics_qml)
@@ -3203,8 +3399,8 @@ class SettingsShellSourceContractTests(unittest.TestCase):
         self.assertIn('objectName: "mappingBridgeWarning"', self.buttons_qml)
         for page_text in (self.connection_qml, self.buttons_qml):
             self.assertIn("SettingsController.bridgeRunning", page_text)
-        self.assertIn("未启动时语音键无效", self.connection_qml)
-        self.assertIn("语音键和补充检测通道不可用", self.buttons_qml)
+        self.assertIn("桥接未运行，语音键无效", self.connection_qml)
+        self.assertIn("语音和真实按键检测不可用", self.buttons_qml)
 
     def test_main_window_owns_the_single_live_bridge_refresh_timer(self):
         self.assertIn('objectName: "bridgeStatusRefreshTimer"', self.main_qml)
@@ -3231,11 +3427,13 @@ class SettingsShellSourceContractTests(unittest.TestCase):
             self.assertIn(f'objectName: "{object_name}"', self.connection_qml)
         for stage in (
             "保存设置… → 启动桥接 → 等待设备连接",
-            "桥接进程已启动 ✓ → 等待 RC003 连接…",
+            "桥接已启动 ✓ → 等待 RC003 连接…",
             "RC003 已连接 ✓",
-            "已等待 %1 秒",
+            "%1 秒",
         ):
             self.assertIn(stage, self.connection_qml)
+        self.assertIn("readonly property bool bridgeLaunchInProgress", self.connection_qml)
+        self.assertIn('SettingsController.bridgeLaunchPhase === "waiting"', self.connection_qml)
         self.assertIn("enabled: !SettingsController.bridgeLaunchBusy", self.connection_qml)
 
     def test_permissions_page_states_real_boundaries_without_fake_grants(self):
@@ -3248,7 +3446,7 @@ class SettingsShellSourceContractTests(unittest.TestCase):
         ):
             self.assertNotIn(misleading_claim, self.permissions_qml)
         self.assertIn("按键不受影响", self.permissions_qml)
-        self.assertIn("不会改默认设备", self.permissions_qml)
+        self.assertIn("不改默认设备", self.permissions_qml)
 
     def test_permissions_navigation_reuses_existing_pages(self):
         self.assertIn("signal openMappingRequested()", self.permissions_qml)
@@ -3268,15 +3466,15 @@ class SettingsShellSourceContractTests(unittest.TestCase):
             'objectName: "photoHotspotMarker_" + photoHotspot.buttonId',
             self.buttons_qml,
         )
-        self.assertIn(
-            'objectName: "photoHotspotConnector_"',
-            self.buttons_qml,
-        )
+        self.assertIn('objectName: "mappingLines"', self.buttons_qml)
+        self.assertIn('objectName: "activeMappingLine"', self.buttons_qml)
         self.assertIn("function connectorControlRadius(startX, endX)", self.buttons_qml)
         self.assertIn("function connectorRoute(card, hotspot, coordinateItem)", self.buttons_qml)
-        self.assertGreaterEqual(self.buttons_qml.count("ctx.bezierCurveTo("), 2)
+        self.assertEqual(self.buttons_qml.count("ctx.bezierCurveTo("), 1)
         self.assertNotIn("ctx.quadraticCurveTo(", self.buttons_qml)
         self.assertNotIn("ctx.lineTo(endX", self.buttons_qml)
+        self.assertIn('ctx.lineCap = "round"', self.buttons_qml)
+        self.assertIn("active ? 2.2 : 1.25", self.buttons_qml)
         self.assertIn("hotspotX * photoImage.paintedWidth", self.buttons_qml)
         self.assertIn("hotspotY * photoImage.paintedHeight", self.buttons_qml)
         self.assertIn("visible: photoHotspot.isSelected", self.buttons_qml)
@@ -3287,49 +3485,47 @@ class SettingsShellSourceContractTests(unittest.TestCase):
         self.assertIn("rightCardRepeater.itemAt(i)", self.buttons_qml)
         self.assertIn("photoHotspotRepeater.itemAt(i)", self.buttons_qml)
         self.assertNotIn("function targetY(buttonId)", self.buttons_qml)
-        self.assertIn("root.selected || root.hovered", self.mapping_card_qml)
-        self.assertIn(
-            "? root.tokens.accent : root.tokens.cardBorder",
-            self.mapping_card_qml,
-        )
-        self.assertIn("padding: 3", self.mapping_card_qml)
-        self.assertIn("border.width: root.selected ? 2 : 1", self.mapping_card_qml)
-        self.assertNotIn("root.tokens.accentSoft", self.mapping_card_qml)
-        self.assertIn("color: root.tokens.surface", self.mapping_card_qml)
+        self.assertIn("root.selected ? root.tokens.accentSoft", self.mapping_card_qml)
+        self.assertIn("border.width: 1", self.mapping_card_qml)
+        self.assertIn("root.tokens.cardBorder", self.mapping_card_qml)
+        self.assertIn("leftPadding: 4", self.mapping_card_qml)
         self.assertIn("columnSpacing: 0", self.mapping_card_qml)
         self.assertIn("spacing: 0", self.mapping_card_qml)
-        self.assertEqual(self.mapping_card_qml.count("GestureDivider { }"), 3)
-        self.assertNotIn("color: root.tokens.surfaceMuted", self.mapping_card_qml)
-        self.assertNotIn(
-            "font.pixelSize: root.tokens.fontSizeSmall",
-            self.mapping_card_qml,
-        )
-        self.assertEqual(
-            self.mapping_card_qml.count(
-                "font.pixelSize: root.tokens.fontSizeTiny"
-            ),
-            7,
-        )
+        self.assertIn("root.tokens.surfaceMuted", self.mapping_card_qml)
+        self.assertIn("font.pixelSize: root.tokens.fontSizeSmall", self.mapping_card_qml)
+        self.assertIn("fontFamilyMono", self.mapping_card_qml)
+        self.assertIn('"Delete": "Del"', self.mapping_card_qml)
+        self.assertIn('"Delete（退格）": "Del"', self.mapping_card_qml)
+        self.assertIn('noteText.trim() !== qsTr("未命名")', self.mapping_card_qml)
+        self.assertIn("VoicePausedCell", self.mapping_card_qml)
+        self.assertIn('qsTr("语音模式下暂停")', self.mapping_card_qml)
         for column_name in ("单击", "双击", "长按"):
             self.assertIn(f'qsTr("{column_name}")', self.mapping_card_qml)
         self.assertIn('objectName: exposeObjectNames ? "editMapping_" + cardId', self.mapping_card_qml)
         self.assertEqual(self.buttons_qml.count("cardId: buttonId"), 2)
         self.assertIn('objectName: "actionEditorDialog"', self.buttons_qml)
+        self.assertIn('readonly property string headerText: buttonName.length > 0', self.buttons_qml)
+        self.assertIn('text: actionEditor.headerText', self.buttons_qml)
+        self.assertIn('text: shortcutRecorder.headerText', self.buttons_qml)
+        self.assertNotIn('text: actionEditor.title', self.buttons_qml)
+        self.assertNotIn('text: shortcutRecorder.title', self.buttons_qml)
+        self.assertNotIn('text: "×"', self.buttons_qml)
+        self.assertIn("optionDelegate.highlighted", self.buttons_qml)
         self.assertIn('objectName: "mappingListFrame"', self.buttons_qml)
         self.assertIn("property int count: 13", self.buttons_qml)
         self.assertNotIn("ListView {", self.buttons_qml)
-        self.assertIn('qsTr("不执行")', self.mapping_card_qml)
-        self.assertIn('text: qsTr("语音快捷键")', self.buttons_qml)
-        self.assertIn('objectName: "voiceProgramButton"', self.buttons_qml)
-        self.assertIn('objectName: "voiceProgramDialog"', self.buttons_qml)
+        self.assertNotIn('objectName: "voiceSettingsPanel"', self.buttons_qml)
+        self.assertNotIn('objectName: "voiceProgramDialog"', self.buttons_qml)
+        self.assertIn('objectName: "voiceProgramCombo"', self.connection_qml)
+        self.assertIn('objectName: "holdVoiceHotkeyField"', self.connection_qml)
+        self.assertIn("SettingsController.restoreMappingDefaults()", self.buttons_qml)
         self.assertIn('qsTr("检测真实按键")', self.buttons_qml)
         self.assertIn('text: qsTr("保存映射")', self.buttons_qml)
 
-    def test_voice_hotkey_field_uses_the_default_hint_without_an_extra_row(self):
-        self.assertIn('placeholderText: qsTr("例如 ralt")', self.buttons_qml)
-        self.assertIn("ToolTip.text:", self.buttons_qml)
-        self.assertIn("默认右侧 Alt", self.buttons_qml)
-        self.assertNotIn("默认 Ctrl + Alt + F8", self.buttons_qml)
+    def test_voice_hotkey_field_is_owned_by_the_connection_page(self):
+        self.assertIn('placeholderText: qsTr("点击录入")', self.connection_qml)
+        self.assertIn("需要与输入法语音唤起键对应", self.connection_qml)
+        self.assertNotIn('objectName: "holdVoiceHotkeyField"', self.buttons_qml)
 
 
 @unittest.skipUnless(_HAS_PYSIDE6, _SKIP_REASON)
@@ -3532,13 +3728,20 @@ class OffscreenQmlLoadTests(unittest.TestCase):
                     self.assertGreaterEqual(item["x"], -1, item_name)
                     self.assertLessEqual(item["right"], width + 1, item_name)
                 self.assertLess(
-                    mapping_items["voiceSettingsPanel"]["y"],
+                    mapping_items["mappingActionsPanel"]["y"],
                     mapping_items["mappingList"]["y"],
                 )
                 self.assertLess(
                     mapping_items["mappingList"]["y"],
                     mapping_items["mappingListFrame"]["y"],
                 )
+                for canvas_name in ("mappingLines", "activeMappingLine"):
+                    canvas = mapping_items[canvas_name]
+                    board = mapping_items["mappingList"]
+                    self.assertAlmostEqual(canvas["x"], board["x"], delta=1)
+                    self.assertAlmostEqual(canvas["y"], board["y"], delta=1)
+                    self.assertAlmostEqual(canvas["width"], board["width"], delta=1)
+                    self.assertAlmostEqual(canvas["height"], board["height"], delta=1)
                 self.assertLessEqual(
                     mapping_items["leftMappingCards"]["right"],
                     mapping_items["photoSidebar"]["x"],
@@ -3568,11 +3771,11 @@ class OffscreenQmlLoadTests(unittest.TestCase):
                 self.assertTrue(connection_items["bridgeNotRunningWarning"]["visible"])
                 self.assertIn("语音键", data["connection"]["bridge_warning"])
                 self.assertNotIn(
-                    "未启动",
+                    "未运行",
                     data["connection"]["warning_after_external_start"],
                 )
                 self.assertIn(
-                    "未启动",
+                    "未运行",
                     data["connection"]["warning_after_external_exit"],
                 )
                 self.assertLessEqual(
@@ -3599,6 +3802,16 @@ class OffscreenQmlLoadTests(unittest.TestCase):
                 self.assertFalse(data["connection"]["save_highlighted"])
                 self.assertTrue(data["connection"]["launch_highlighted"])
                 self.assertNotIn("RC003 已连接", data["connection"]["launch_status"])
+                waiting_progress = data["connection"]["waiting_progress"]
+                self.assertTrue(waiting_progress["visible"])
+                self.assertTrue(waiting_progress["indicator_running"])
+                self.assertIn("等待 RC003 连接", waiting_progress["stage_text"])
+                self.assertTrue(waiting_progress["elapsed_visible"])
+                self.assertEqual(waiting_progress["elapsed_text"], "12 秒")
+                connected_progress = data["connection"]["connected_progress"]
+                self.assertTrue(connected_progress["visible"])
+                self.assertFalse(connected_progress["indicator_running"])
+                self.assertIn("RC003 已连接", connected_progress["stage_text"])
 
                 permission_items = data["permissions"]["items"]
                 self.assertLess(
@@ -3800,13 +4013,9 @@ def _mapping_snapshot(window, app, model, controller, screenshot_env):
             )
             for button_id in button_ids
         },
-        "connectors": {
-            button_id: _geometry(
-                _find_child_by_object_name(
-                    window, "photoHotspotConnector_" + button_id
-                )
-            )
-            for button_id in button_ids
+        "canvases": {
+            name: _geometry(_find_child_by_object_name(window, name))
+            for name in ("mappingLines", "activeMappingLine")
         },
         "photo_frame": _geometry(
             _find_child_by_object_name(window, "photoFrame")
@@ -3814,6 +4023,7 @@ def _mapping_snapshot(window, app, model, controller, screenshot_env):
         "selected_button_id": controller.property("selectedButtonId"),
         "display_map": model.to_display_map(),
         "secondary_display_map": model.to_secondary_display_map(),
+        "display_note_map": model.to_display_note_map(),
         "pixel_sha256": _png_digest(cropped),
     }
 
@@ -3871,8 +4081,6 @@ assert mapping_list.property("count") == 13
 assert _find_child_by_object_name(window, "toggleVoiceModeButton") is None
 assert _find_child_by_object_name(window, "holdVoiceModeButton") is None
 assert _find_child_by_object_name(window, "toggleVoiceHotkeyField") is None
-field = _find_child_by_object_name(window, "holdVoiceHotkeyField")
-assert field is not None and field.property("visible"), "holdVoiceHotkeyField missing"
 
 edit_button = _find_child_by_object_name(window, "editMapping_mic")
 assert edit_button is not None, "mic row's edit button not found - is it in view?"
@@ -3891,7 +4099,33 @@ long_combo = _find_child_by_object_name(window, "actionEditorLongCombo")
 assert editor is not None and editor.property("visible")
 assert combo is not None and double_combo is not None and long_combo is not None
 assert combo.property("visible")
-assert not double_combo.property("visible") and not long_combo.property("visible")
+assert double_combo.property("visible") and long_combo.property("visible")
+assert not double_combo.property("enabled") and not long_combo.property("enabled")
+
+current_index = int(combo.property("currentIndex"))
+indicator_point = combo.mapToScene(
+    QPointF(combo.property("width") - 8, combo.property("height") / 2)
+).toPoint()
+QTest.mouseClick(window, Qt.LeftButton, Qt.NoModifier, indicator_point)
+for _ in range(5):
+    window.grabWindow()
+    app.processEvents()
+current_option = _find_child_by_object_name(
+    window,
+    "actionEditorPrimaryCombo_option_" + str(current_index),
+)
+assert current_option is not None, "current editor option was not instantiated"
+current_option_label = current_option.property("contentItem")
+current_option_state = {
+    "highlighted": bool(current_option.property("highlighted")),
+    "font_weight": int(current_option_label.property("font").weight()),
+}
+assert current_option_state["highlighted"]
+assert current_option_state["font_weight"] >= 600
+QTest.keyClick(window, Qt.Key_Escape)
+for _ in range(3):
+    window.grabWindow()
+    app.processEvents()
 
 # Choose real preset rows through each visible ComboBox popup. The editable
 # field and backing model must change as soon as the popup activates the row;
@@ -3900,19 +4134,18 @@ assert not double_combo.property("visible") and not long_combo.property("visible
 _select_combo_option(window, app, combo, 1)
 assert combo.property("editText") == "Escape"
 assert editor.property("primaryText") == "Escape"
-assert model.to_display_map()["mic"] == "Escape"
-assert controller.settingsDirty
+assert model.to_display_map()["mic"] == "按住说话"
 assert double_combo.property("visible") and long_combo.property("visible")
 
 _select_combo_option(window, app, double_combo, 1)
 assert double_combo.property("editText") == "Escape"
 assert editor.property("doubleText") == "Escape"
-assert model.to_secondary_display_map()["mic"]["double_click"] == "Escape"
+assert model.to_secondary_display_map()["mic"]["double_click"] == ""
 
 _select_combo_option(window, app, long_combo, 2)
 assert long_combo.property("editText") == "Return"
 assert editor.property("longText") == "Return"
-assert model.to_secondary_display_map()["mic"]["long_press"] == "Return"
+assert model.to_secondary_display_map()["mic"]["long_press"] == ""
 
 # Real mouse click into the ComboBox's editable text area -
 # forceActiveFocus() on the ComboBox item alone is NOT equivalent (proven
@@ -3938,27 +4171,31 @@ for ch in typed:
     app.processEvents()
 
 assert combo.property("editText") == typed
-# The model already reflects the live, uncommitted-by-Enter edit (blocker
-# 1's fix) - checked BEFORE any save runs, so a regression that removes the
-# live-commit wiring but leaves onAccepted/onActivated intact cannot
-# silently pass this test by "saving" a value it only just picked up.
-assert model.to_display_map()["mic"] == typed
+assert editor.property("primaryText") == typed
+assert model.to_display_map()["mic"] == "按住说话"
 for _ in range(3):
     window.grabWindow()
     app.processEvents()
 assert double_combo.property("visible") and long_combo.property("visible")
 assert double_combo.property("enabled") and long_combo.property("enabled")
 
-done_button = _find_child_by_object_name(window, "actionEditorDoneButton")
-assert done_button is not None
-done_center = done_button.mapToScene(
-    QPointF(done_button.property("width") / 2, done_button.property("height") / 2)
+editor_save_button = _find_child_by_object_name(window, "actionEditorSaveButton")
+assert editor_save_button is not None
+done_center = editor_save_button.mapToScene(
+    QPointF(
+        editor_save_button.property("width") / 2,
+        editor_save_button.property("height") / 2,
+    )
 ).toPoint()
 QTest.mouseClick(window, Qt.LeftButton, Qt.NoModifier, done_center)
 for _ in range(3):
     window.grabWindow()
     app.processEvents()
 assert not editor.property("visible")
+assert model.to_display_map()["mic"] == typed
+assert model.to_secondary_display_map()["mic"]["double_click"] == "Escape"
+assert model.to_secondary_display_map()["mic"]["long_press"] == "Return"
+assert controller.settingsDirty
 
 before_save = _mapping_snapshot(
     window,
@@ -3985,7 +4222,11 @@ after_save = _mapping_snapshot(
 )
 
 assert controller.errorMessage == "", f"save reported a validation error: {controller.errorMessage}"
-print(json.dumps({"before": before_save, "after": after_save}))
+print(json.dumps({
+    "before": before_save,
+    "after": after_save,
+    "current_option": current_option_state,
+}))
 """
 
 
@@ -4020,6 +4261,8 @@ class ButtonsPageDirectSaveIntegrationTests(unittest.TestCase):
             )
             visual = json.loads(result.stdout.strip().splitlines()[-1])
             self.assertEqual(visual["before"], visual["after"])
+            self.assertTrue(visual["current_option"]["highlighted"])
+            self.assertGreaterEqual(visual["current_option"]["font_weight"], 600)
 
             # The real, persisted file - read back from the SAME
             # LOCALAPPDATA the subprocess wrote to, after it has exited.
@@ -4300,15 +4543,18 @@ tab_bar.setProperty("currentIndex", 1)
 _render(window, app)
 
 mapping_list = _find(window, "mappingList")
-voice_panel = _find(window, "voiceSettingsPanel")
-toolbar = _find(window, "mappingListFrame")
+actions_panel = _find(window, "mappingActionsPanel")
+status_bar = _find(window, "mappingListFrame")
+mapping_lines = _find(window, "mappingLines")
+active_mapping_line = _find(window, "activeMappingLine")
 left_cards = _find(window, "leftMappingCards")
 right_cards = _find(window, "rightMappingCards")
 photo_sidebar = _find(window, "photoSidebar")
 photo_frame = _find(window, "photoFrame")
 photo_image = _find(window, "photoImage")
 assert mapping_list is not None, "mappingList not found"
-assert voice_panel is not None and toolbar is not None
+assert actions_panel is not None and status_bar is not None
+assert mapping_lines is not None and active_mapping_line is not None
 assert left_cards is not None and right_cards is not None
 assert photo_sidebar is not None, "photoSidebar not found"
 assert photo_frame is not None and photo_frame.property("visible"), "photoFrame not visible"
@@ -4333,12 +4579,6 @@ hotspots = {
     for button_id in card_ids
 }
 assert all(item is not None and item.property("visible") for item in hotspots.values())
-connectors = {
-    button_id: _find(window, "photoHotspotConnector_" + button_id)
-    for button_id in card_ids
-}
-assert all(item is not None and item.property("visible") for item in connectors.values())
-
 power_column_names = {
     "key": "mappingKeyCell_power",
     "single": "mappingSingleCell_power",
@@ -4396,9 +4636,13 @@ results_out = {
     "card_count": sum(bool(item.property("visible")) for item in cards.values()),
     "selected_after_power_click": controller.property("selectedButtonId"),
     "editor_visible": bool(editor.property("visible")),
-    "voice_panel": _geometry(voice_panel),
+    "actions_panel": _geometry(actions_panel),
     "mapping_list": _geometry(mapping_list),
-    "toolbar": _geometry(toolbar),
+    "status_bar": _geometry(status_bar),
+    "canvases": {
+        "base": _geometry(mapping_lines),
+        "active": _geometry(active_mapping_line),
+    },
     "left_cards": _geometry(left_cards),
     "right_cards": _geometry(right_cards),
     "cards": {button_id: _geometry(item) for button_id, item in cards.items()},
@@ -4414,10 +4658,6 @@ results_out = {
         "hotspots": {
             button_id: _geometry(item)
             for button_id, item in hotspots.items()
-        },
-        "connectors": {
-            button_id: _geometry(item)
-            for button_id, item in connectors.items()
         },
         "power_center_error_x": actual_power_center.x() - expected_power_center.x(),
         "power_center_error_y": actual_power_center.y() - expected_power_center.y(),
@@ -4461,8 +4701,10 @@ class ButtonsPageMappingCardTests(unittest.TestCase):
     def test_board_renders_all_thirteen_cards(self):
         data = self._run_probe(720, 464)
         self.assertEqual(data["card_count"], 13)
-        self.assertTrue(data["voice_panel"]["visible"])
-        self.assertTrue(data["toolbar"]["visible"])
+        self.assertTrue(data["actions_panel"]["visible"])
+        self.assertTrue(data["status_bar"]["visible"])
+        self.assertTrue(data["canvases"]["base"]["visible"])
+        self.assertTrue(data["canvases"]["active"]["visible"])
 
     def test_real_click_on_power_card_selects_power_and_opens_editor(self):
         data = self._run_probe(720, 464)
@@ -4484,8 +4726,6 @@ class ButtonsPageMappingCardTests(unittest.TestCase):
         data = self._run_probe(720, 464)
         cards = data["cards"]
         hotspots = data["photo"]["hotspots"]
-        connectors = data["photo"]["connectors"]
-        frame = data["photo"]["frame"]
         groups = (
             ("power", "up", "left", "back", "home", "menu"),
             ("mic", "right", "ok", "down", "volume_up", "volume_down", "tv"),
@@ -4496,10 +4736,11 @@ class ButtonsPageMappingCardTests(unittest.TestCase):
             hotspot = hotspots[button_id]
             start_x = card["right"] if left_side else card["x"]
             start_y = card["y"] + card["height"] / 2
-            end_x = hotspot["x"] if left_side else hotspot["right"]
+            end_x = hotspot["x"] + hotspot["width"] / 2
             end_y = hotspot["y"] + hotspot["height"] / 2
             span = abs(end_x - start_x)
-            radius = min(32, max(6, span * 0.42), span * 0.48)
+            preferred = max(12, min(72, span * 0.56))
+            radius = min(preferred, span * 0.48)
             direction = 1 if left_side else -1
             return (
                 (start_x, start_y),
@@ -4560,11 +4801,12 @@ class ButtonsPageMappingCardTests(unittest.TestCase):
         ok_center = ok_hotspot["y"] + ok_hotspot["height"] / 2
         self.assertAlmostEqual(right_center, ok_center, delta=1)
         self.assertNotAlmostEqual(right_hotspot["right"], ok_hotspot["right"], delta=1)
-        for connector in connectors.values():
-            self.assertAlmostEqual(connector["x"], frame["x"], delta=1)
-            self.assertAlmostEqual(connector["y"], frame["y"], delta=1)
-            self.assertAlmostEqual(connector["right"], frame["right"], delta=1)
-            self.assertAlmostEqual(connector["bottom"], frame["bottom"], delta=1)
+        board = data["mapping_list"]
+        for canvas in data["canvases"].values():
+            self.assertAlmostEqual(canvas["x"], board["x"], delta=1)
+            self.assertAlmostEqual(canvas["y"], board["y"], delta=1)
+            self.assertAlmostEqual(canvas["right"], board["right"], delta=1)
+            self.assertAlmostEqual(canvas["bottom"], board["bottom"], delta=1)
 
     def test_board_fits_default_minimum_and_large_windows(self):
         viewports = (("Basic", 720, 464), ("Basic", 640, 440), ("FluentWinUI3", 720, 464), ("FluentWinUI3", 840, 720))
@@ -4572,10 +4814,11 @@ class ButtonsPageMappingCardTests(unittest.TestCase):
             data = self._run_probe(width, height, style)
             self.assertAlmostEqual(data["photo"]["sidebar"]["width"], 86, delta=0.5)
             self.assertLessEqual(data["mapping_list"]["right"], width + 1)
-            self.assertLessEqual(data["toolbar"]["right"], width + 1)
-            self.assertLessEqual(data["toolbar"]["bottom"], height + 1)
-            self.assertLessEqual(data["voice_panel"]["bottom"], data["mapping_list"]["y"] + 1)
-            self.assertLessEqual(data["mapping_list"]["bottom"], data["toolbar"]["y"] + 1)
+            self.assertLessEqual(data["actions_panel"]["right"], width + 1)
+            self.assertLessEqual(data["status_bar"]["right"], width + 1)
+            self.assertLessEqual(data["status_bar"]["bottom"], height + 1)
+            self.assertLessEqual(data["actions_panel"]["bottom"], data["mapping_list"]["y"] + 1)
+            self.assertLessEqual(data["mapping_list"]["bottom"], data["status_bar"]["y"] + 1)
             self.assertLess(data["left_cards"]["x"], data["photo"]["sidebar"]["x"])
             self.assertLess(data["photo"]["sidebar"]["x"], data["right_cards"]["x"])
             for card in data["cards"].values():

@@ -542,6 +542,53 @@ class BuildSaveModelTests(unittest.TestCase):
         )
         self.assertEqual(new_bindings["secondary_bindings"], {})
 
+    def test_display_notes_are_trimmed_and_kept_separate_from_actions(self):
+        _, new_bindings = build_save_model(
+            button_display_map={"power": "ctrl+c"},
+            display_note_map={
+                "power": {
+                    "single_click": "  复制  ",
+                    "double_click": "   ",
+                    "long_press": "未命名",
+                    "unknown": "忽略",
+                },
+                "up": {"single_click": True},
+                "unknown_button": {"single_click": "忽略"},
+            },
+            hotkey_text="ralt",
+            trigger_mode=key_mapping.VoiceTriggerMode.HOLD,
+            endpoint_display_text="",
+            base_config=self.base_config,
+            base_bindings=self.base_bindings,
+        )
+
+        self.assertEqual(
+            new_bindings["display_notes"],
+            {"power": {"single_click": "复制"}},
+        )
+        self.assertEqual(
+            new_bindings["bindings"]["power"],
+            {"kind": "key_combo", "keys": ["ctrl", "c"]},
+        )
+
+    def test_omitted_display_note_map_preserves_existing_notes(self):
+        base_bindings = {
+            "schema_version": 4,
+            "bindings": {},
+            "display_notes": {"power": {"single_click": "关机"}},
+        }
+
+        _, new_bindings = build_save_model(
+            button_display_map={},
+            hotkey_text="ralt",
+            trigger_mode=key_mapping.VoiceTriggerMode.HOLD,
+            endpoint_display_text="",
+            base_config=self.base_config,
+            base_bindings=base_bindings,
+        )
+
+        self.assertEqual(new_bindings["display_notes"], base_bindings["display_notes"])
+
 
 class DefaultDisplayStateTests(unittest.TestCase):
     def test_covers_every_user_facing_button(self):

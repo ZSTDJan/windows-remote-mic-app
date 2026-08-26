@@ -9,9 +9,10 @@ Button {
 
     hoverEnabled: true
     implicitHeight: tokens ? tokens.buttonHeight : 30
-    implicitWidth: Math.max(compactMinimumWidth, contentItem.implicitWidth + 18)
-    leftPadding: 9
-    rightPadding: 9
+    implicitWidth: Math.max(compactMinimumWidth, contentItem.implicitWidth + 14)
+    leftPadding: 7
+    rightPadding: 7
+    font.family: tokens ? tokens.fontFamily : "Noto Sans SC"
     font.pixelSize: tokens ? tokens.fontSizeControl : 12
     font.weight: Font.Normal
 
