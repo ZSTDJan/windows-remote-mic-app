@@ -11,8 +11,10 @@ import ctypes
 import os
 import re
 import sys
+import uuid
 from ctypes import wintypes
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import Callable, Iterable, Mapping, Optional, Sequence
 
@@ -36,6 +38,35 @@ _SOGOU_PROCESS_NAME = "sogou_voice_assistant.exe"
 _SOGOU_RUN_VALUE_NAMES = ("搜狗语音输入法",)
 _ALLOWED_EXECUTABLE_SUFFIXES = frozenset({".exe", ".lnk"})
 _ERROR_CANCELLED = 1223
+_COINIT_APARTMENTTHREADED = 0x2
+_CLSCTX_INPROC_SERVER = 0x1
+_RPC_E_CHANGED_MODE = ctypes.c_int32(0x80010106).value
+_SLGP_RAWPATH = 0x4
+_STGM_READ = 0
+
+
+class _Guid(ctypes.Structure):
+    _fields_ = (
+        ("data1", wintypes.DWORD),
+        ("data2", wintypes.WORD),
+        ("data3", wintypes.WORD),
+        ("data4", ctypes.c_ubyte * 8),
+    )
+
+
+def _guid(value: str) -> _Guid:
+    parsed = uuid.UUID(value)
+    return _Guid(
+        parsed.time_low,
+        parsed.time_mid,
+        parsed.time_hi_version,
+        (ctypes.c_ubyte * 8)(*parsed.bytes[8:]),
+    )
+
+
+_CLSID_SHELL_LINK = _guid("00021401-0000-0000-c000-000000000046")
+_IID_ISHELL_LINK_W = _guid("000214f9-0000-0000-c000-000000000046")
+_IID_IPERSIST_FILE = _guid("0000010b-0000-0000-c000-000000000046")
 
 
 @dataclass(frozen=True)
@@ -53,6 +84,7 @@ class ResolvedVoiceProgram:
     executable: Optional[Path]
     process_names: tuple[str, ...]
     source: str
+    match_executable: Optional[Path] = None
 
     @property
     def available(self) -> bool:
@@ -161,6 +193,7 @@ def resolve_voice_program(
     platform: Optional[str] = None,
     process_iter: Optional[Callable[[], Iterable[ProcessInfo]]] = None,
     run_value_reader: Optional[Callable[[], Iterable[str]]] = None,
+    shortcut_resolver: Optional[Callable[[Path], Optional[Path]]] = None,
 ) -> ResolvedVoiceProgram:
     normalized = normalize_voice_program_settings(settings)
     provider_id = str(normalized["provider"])
@@ -170,10 +203,18 @@ def resolve_voice_program(
     if provider_id == VOICE_PROGRAM_NONE:
         return ResolvedVoiceProgram(provider_id, display_name, None, (), "disabled")
     if provider_id == VOICE_PROGRAM_CUSTOM:
+        match_executable = configured_path
+        if configured_path is not None and configured_path.suffix.casefold() == ".lnk":
+            match_executable = (shortcut_resolver or _resolve_shortcut_target)(
+                configured_path
+            )
+            if match_executable is None:
+                return ResolvedVoiceProgram(
+                    provider_id, display_name, None, (), "shortcut_unresolved"
+                )
         process_names = (
-            (configured_path.name.casefold(),)
-            if configured_path is not None
-            and configured_path.suffix.casefold() == ".exe"
+            (match_executable.name.casefold(),)
+            if match_executable is not None
             else ()
         )
         return ResolvedVoiceProgram(
@@ -182,6 +223,7 @@ def resolve_voice_program(
             configured_path,
             process_names,
             "configured" if configured_path is not None else "missing",
+            match_executable,
         )
 
     executable = discover_sogou_voice_executable(
@@ -195,6 +237,7 @@ def resolve_voice_program(
         executable,
         (_SOGOU_PROCESS_NAME,),
         "discovered" if executable is not None else "missing",
+        executable,
     )
 
 
@@ -204,12 +247,14 @@ def inspect_voice_program(
     platform: Optional[str] = None,
     process_iter: Optional[Callable[[], Iterable[ProcessInfo]]] = None,
     run_value_reader: Optional[Callable[[], Iterable[str]]] = None,
+    shortcut_resolver: Optional[Callable[[Path], Optional[Path]]] = None,
 ) -> VoiceProgramStatus:
     resolved = resolve_voice_program(
         settings,
         platform=platform,
         process_iter=process_iter,
         run_value_reader=run_value_reader,
+        shortcut_resolver=shortcut_resolver,
     )
     if resolved.provider_id == VOICE_PROGRAM_NONE:
         return VoiceProgramStatus(
@@ -253,6 +298,7 @@ def launch_voice_program(
     process_iter: Optional[Callable[[], Iterable[ProcessInfo]]] = None,
     run_value_reader: Optional[Callable[[], Iterable[str]]] = None,
     start_file: Optional[Callable[[str, str, str], None]] = None,
+    shortcut_resolver: Optional[Callable[[Path], Optional[Path]]] = None,
 ) -> VoiceProgramLaunchResult:
     """Start the configured provider without making it a bridge dependency."""
 
@@ -262,6 +308,7 @@ def launch_voice_program(
         platform=platform,
         process_iter=process_iter,
         run_value_reader=run_value_reader,
+        shortcut_resolver=shortcut_resolver,
     )
     if resolved.provider_id == VOICE_PROGRAM_NONE:
         return VoiceProgramLaunchResult(resolved.provider_id, False, False, "disabled")
@@ -388,19 +435,171 @@ def _sogou_version_key(path: Path) -> tuple[int, ...]:
 def _matching_processes(
     resolved: ResolvedVoiceProgram, processes: Sequence[ProcessInfo]
 ) -> list[ProcessInfo]:
+    match_executable = resolved.match_executable or resolved.executable
     expected_path = (
-        os.path.normcase(str(resolved.executable)) if resolved.executable else ""
+        _normalized_executable_path(match_executable) if match_executable else ""
     )
     expected_names = {name.casefold() for name in resolved.process_names}
     matches: list[ProcessInfo] = []
     for process in processes:
         if process.executable is not None and expected_path:
-            if os.path.normcase(str(process.executable)) == expected_path:
+            if _normalized_executable_path(process.executable) == expected_path:
                 matches.append(process)
-                continue
+            continue
         if process.name.casefold() in expected_names:
             matches.append(process)
     return matches
+
+
+def _normalized_executable_path(path: Path) -> str:
+    try:
+        path = path.resolve(strict=False)
+    except OSError:
+        pass
+    return os.path.normcase(os.path.normpath(str(path)))
+
+
+def _com_method(interface, index: int, result_type, *argument_types):
+    vtable = ctypes.cast(
+        interface, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p))
+    ).contents
+    return ctypes.WINFUNCTYPE(
+        result_type, ctypes.c_void_p, *argument_types
+    )(vtable[index])
+
+
+def _release_com_interface(interface: ctypes.c_void_p) -> None:
+    if not interface.value:
+        return
+    try:
+        release = _com_method(interface, 2, wintypes.ULONG)
+        release(interface)
+    except Exception:
+        pass
+
+
+def _read_windows_shortcut_target(shortcut: Path) -> Optional[Path]:
+    if sys.platform != "win32":
+        return None
+
+    ole32 = ctypes.WinDLL("ole32", use_last_error=True)
+    ole32.CoInitializeEx.argtypes = [ctypes.c_void_p, wintypes.DWORD]
+    ole32.CoInitializeEx.restype = ctypes.c_long
+    ole32.CoCreateInstance.argtypes = [
+        ctypes.POINTER(_Guid),
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        ctypes.POINTER(_Guid),
+        ctypes.POINTER(ctypes.c_void_p),
+    ]
+    ole32.CoCreateInstance.restype = ctypes.c_long
+    ole32.CoUninitialize.argtypes = []
+    ole32.CoUninitialize.restype = None
+
+    shell_link = ctypes.c_void_p()
+    persist_file = ctypes.c_void_p()
+    should_uninitialize = False
+    try:
+        result = int(ole32.CoInitializeEx(None, _COINIT_APARTMENTTHREADED))
+        if result in (0, 1):
+            should_uninitialize = True
+        elif result != _RPC_E_CHANGED_MODE:
+            return None
+
+        result = int(
+            ole32.CoCreateInstance(
+                ctypes.byref(_CLSID_SHELL_LINK),
+                None,
+                _CLSCTX_INPROC_SERVER,
+                ctypes.byref(_IID_ISHELL_LINK_W),
+                ctypes.byref(shell_link),
+            )
+        )
+        if result < 0 or not shell_link.value:
+            return None
+
+        query_interface = _com_method(
+            shell_link,
+            0,
+            ctypes.c_long,
+            ctypes.POINTER(_Guid),
+            ctypes.POINTER(ctypes.c_void_p),
+        )
+        result = int(
+            query_interface(
+                shell_link,
+                ctypes.byref(_IID_IPERSIST_FILE),
+                ctypes.byref(persist_file),
+            )
+        )
+        if result < 0 or not persist_file.value:
+            return None
+
+        load = _com_method(
+            persist_file, 5, ctypes.c_long, wintypes.LPCWSTR, wintypes.DWORD
+        )
+        if int(load(persist_file, str(shortcut), _STGM_READ)) < 0:
+            return None
+
+        target_buffer = ctypes.create_unicode_buffer(32768)
+        get_path = _com_method(
+            shell_link,
+            3,
+            ctypes.c_long,
+            wintypes.LPWSTR,
+            ctypes.c_int,
+            ctypes.c_void_p,
+            wintypes.DWORD,
+        )
+        result = int(
+            get_path(
+                shell_link,
+                target_buffer,
+                len(target_buffer),
+                None,
+                _SLGP_RAWPATH,
+            )
+        )
+        target_text = os.path.expandvars(target_buffer.value.strip())
+        if result < 0 or not target_text:
+            return None
+        return Path(target_text)
+    except Exception:
+        return None
+    finally:
+        _release_com_interface(persist_file)
+        _release_com_interface(shell_link)
+        if should_uninitialize:
+            ole32.CoUninitialize()
+
+
+@lru_cache(maxsize=32)
+def _resolve_shortcut_target_cached(
+    shortcut_text: str, modified_ns: int, file_size: int
+) -> Optional[Path]:
+    del modified_ns, file_size
+    target = _read_windows_shortcut_target(Path(shortcut_text))
+    if target is None or target.suffix.casefold() != ".exe":
+        return None
+    try:
+        return target.resolve(strict=True)
+    except OSError:
+        return None
+
+
+def _resolve_shortcut_target(shortcut: Path) -> Optional[Path]:
+    try:
+        stat = shortcut.stat()
+    except OSError:
+        return None
+    resolved = _resolve_shortcut_target_cached(
+        str(shortcut), stat.st_mtime_ns, stat.st_size
+    )
+    if resolved is None:
+        # A shortcut target can be restored without changing the .lnk file.
+        # Do not make a transient failure last until the application restarts.
+        _resolve_shortcut_target_cached.cache_clear()
+    return resolved
 
 
 def _combined_elevation(processes: Sequence[ProcessInfo]) -> Optional[bool]:

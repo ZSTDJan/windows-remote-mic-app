@@ -140,6 +140,140 @@ class VoiceProgramLaunchTests(unittest.TestCase):
         self.assertEqual(result.code, "started")
         self.assertEqual(calls[0][1], "open")
 
+    def test_custom_shortcut_matches_its_target_process(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            shortcut = root / "voice.lnk"
+            target = root / "bin" / "voice.exe"
+            shortcut.touch()
+            target.parent.mkdir()
+            target.touch()
+            status = manager.inspect_voice_program(
+                self._custom_settings(shortcut),
+                platform="win32",
+                process_iter=lambda: (
+                    manager.ProcessInfo(42, target.name, target, False),
+                ),
+                shortcut_resolver=lambda path: target,
+            )
+        self.assertTrue(status.running)
+        self.assertEqual(status.code, "running")
+
+    def test_custom_shortcut_launches_the_shortcut_not_the_target(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            shortcut = root / "voice.lnk"
+            target = root / "bin" / "voice.exe"
+            shortcut.touch()
+            target.parent.mkdir()
+            target.touch()
+            calls = []
+            result = manager.launch_voice_program(
+                self._custom_settings(shortcut),
+                platform="win32",
+                process_iter=lambda: (),
+                shortcut_resolver=lambda path: target,
+                start_file=lambda path, operation, cwd: calls.append(
+                    (path, operation, cwd)
+                ),
+            )
+        self.assertTrue(result.started)
+        self.assertEqual(Path(calls[0][0]), shortcut)
+        self.assertEqual(Path(calls[0][2]), shortcut.parent)
+
+    def test_custom_program_does_not_match_same_name_from_another_path(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            configured = root / "configured" / "voice.exe"
+            other = root / "other" / "voice.exe"
+            configured.parent.mkdir()
+            other.parent.mkdir()
+            configured.touch()
+            other.touch()
+            status = manager.inspect_voice_program(
+                self._custom_settings(configured),
+                platform="win32",
+                process_iter=lambda: (
+                    manager.ProcessInfo(43, other.name, other, False),
+                ),
+            )
+        self.assertFalse(status.running)
+        self.assertEqual(status.code, "stopped")
+
+    def test_custom_program_uses_name_only_when_process_path_is_unreadable(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            executable = Path(tmp) / "voice.exe"
+            executable.touch()
+            status = manager.inspect_voice_program(
+                self._custom_settings(executable),
+                platform="win32",
+                process_iter=lambda: (
+                    manager.ProcessInfo(44, executable.name, None, True),
+                ),
+            )
+        self.assertTrue(status.running)
+        self.assertTrue(status.elevated)
+
+    def test_unresolved_shortcut_fails_closed_without_launching(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            shortcut = Path(tmp) / "voice.lnk"
+            shortcut.touch()
+            status = manager.inspect_voice_program(
+                self._custom_settings(shortcut),
+                platform="win32",
+                shortcut_resolver=lambda path: None,
+            )
+            result = manager.launch_voice_program(
+                self._custom_settings(shortcut),
+                platform="win32",
+                process_iter=lambda: (),
+                shortcut_resolver=lambda path: None,
+                start_file=lambda *_: self.fail("unresolved shortcut must not launch"),
+            )
+        self.assertFalse(status.available)
+        self.assertEqual(status.code, "not_found")
+        self.assertEqual(result.code, "not_found")
+
+    def test_shortcut_resolution_failure_is_retried(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            shortcut = root / "voice.lnk"
+            target = root / "voice.exe"
+            shortcut.touch()
+            target.touch()
+            manager._resolve_shortcut_target_cached.cache_clear()
+            try:
+                with mock.patch.object(
+                    manager,
+                    "_read_windows_shortcut_target",
+                    side_effect=(None, target),
+                ) as reader:
+                    self.assertIsNone(manager._resolve_shortcut_target(shortcut))
+                    self.assertEqual(
+                        manager._resolve_shortcut_target(shortcut), target.resolve()
+                    )
+                    self.assertEqual(reader.call_count, 2)
+            finally:
+                manager._resolve_shortcut_target_cached.cache_clear()
+
+    def test_shortcut_target_privilege_mismatch_requires_restart(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            shortcut = root / "voice.lnk"
+            target = root / "voice.exe"
+            shortcut.touch()
+            target.touch()
+            result = manager.launch_voice_program(
+                self._custom_settings(shortcut, launch_elevated=True),
+                platform="win32",
+                process_iter=lambda: (
+                    manager.ProcessInfo(45, target.name, target, False),
+                ),
+                shortcut_resolver=lambda path: target,
+                start_file=lambda *_: self.fail("must not launch a second instance"),
+            )
+        self.assertEqual(result.code, "restart_elevated_required")
+
     def test_elevated_launch_is_explicit(self):
         with tempfile.TemporaryDirectory() as tmp:
             executable = Path(tmp) / "voice.exe"
