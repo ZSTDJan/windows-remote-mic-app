@@ -91,7 +91,7 @@ Item {
             width: Math.max(0, diagnosticsScroll.availableWidth - tokens.pageHorizontalPadding * 2)
             x: tokens.pageHorizontalPadding
             y: tokens.pageVerticalPadding
-            spacing: tokens.spacingLarge
+            spacing: tokens.spacingMedium
 
             SectionFrame {
                 tokens: root.tokens
@@ -136,6 +136,7 @@ Item {
                         text: DiagnosticsController.checkResults.length > 0 ? qsTr("重新检查") : qsTr("开始检查")
                         highlighted: true
                         enabled: !DiagnosticsController.isRefreshing
+                            && !DiagnosticsController.vbCableTestRunning
                         onClicked: DiagnosticsController.refreshDiagnostics()
                     }
                 }
@@ -211,8 +212,10 @@ Item {
                         id: optionalDriverSection
                         objectName: "optionalDriverSection"
                         tokens: root.tokens
+                        inlineDescription: true
                         iconGlyph: "\uE95E"
                         titleText: qsTr("虚拟音频")
+                        descriptionObjectName: "optionalDriverDescription"
                         descriptionText: DiagnosticsController.driverErrorMessage.length > 0
                                 ? DiagnosticsController.driverErrorMessage
                                 : DiagnosticsController.driverStatusMessage.length > 0
@@ -227,6 +230,7 @@ Item {
                             tokens: root.tokens
                             compactMinimumWidth: tokens.buttonWidth4Chars
                             text: qsTr("选择端点")
+                            enabled: !DiagnosticsController.vbCableTestRunning
                             onClicked: DiagnosticsController.selectDetectedCableInputAsOutput()
                         }
                         CompactButton {
@@ -234,7 +238,38 @@ Item {
                             tokens: root.tokens
                             compactMinimumWidth: tokens.buttonWidth4Chars
                             text: qsTr("安装修复")
+                            enabled: !DiagnosticsController.vbCableTestRunning
                             onClicked: driverConfirmDialog.open()
+                        }
+                    }
+
+                    SettingsListRow {
+                        id: vbCableChannelTestSection
+                        objectName: "vbCableChannelTestSection"
+                        visible: SettingsController.isRc003Device
+                        tokens: root.tokens
+                        inlineDescription: true
+                        iconGlyph: "\uE9D9"
+                        titleText: qsTr("VB-CABLE 通道")
+                        descriptionObjectName: "vbCableChannelDescription"
+                        descriptionText: SettingsController.bridgeRunning
+                            ? qsTr("桥接正在运行；请先停止桥接，避免测试信号和真实语音混在一起。")
+                            : DiagnosticsController.vbCableTestRunning
+                                ? qsTr("正在发送短测试信号，并检查 CABLE Output 是否收到。")
+                                : DiagnosticsController.vbCableTestMessage.length > 0
+                                    ? DiagnosticsController.vbCableTestMessage
+                                    : qsTr("测试会发送约一秒合成信号；不保存声音，也不修改默认设备。")
+                        CompactButton {
+                            objectName: "testVbCableChannelButton"
+                            tokens: root.tokens
+                            compactMinimumWidth: tokens.buttonWidth4Chars
+                            text: DiagnosticsController.vbCableTestRunning
+                                ? qsTr("测试中…") : qsTr("测试通道")
+                            enabled: !DiagnosticsController.isRefreshing
+                                && !DiagnosticsController.vbCableTestRunning
+                                && !SettingsController.bridgeRunning
+                                && !SettingsController.bridgeLaunchBusy
+                            onClicked: DiagnosticsController.testVbCableChannel()
                         }
                     }
 
@@ -242,8 +277,10 @@ Item {
                         id: diagnosticsFooterSection
                         objectName: "diagnosticsFooterSection"
                         tokens: root.tokens
+                        inlineDescription: true
                         iconGlyph: "\uE8B7"
                         titleText: qsTr("系统与日志")
+                        descriptionObjectName: "diagnosticsFooterDescription"
                         descriptionText: qsTr("打开系统设置或日志目录。")
                         showDivider: false
                         CompactButton {

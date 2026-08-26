@@ -10,12 +10,15 @@ Rectangle {
     property string titleText: ""
     property string descriptionText: ""
     property string descriptionObjectName: ""
+    property bool inlineDescription: false
     property bool showDivider: true
     default property alias actionData: actionRow.data
 
     color: "transparent"
     Layout.fillWidth: true
-    implicitHeight: Math.max(50, rowLayout.implicitHeight + 10)
+    implicitHeight: inlineDescription
+        ? rowLayout.implicitHeight + 10
+        : Math.max(50, rowLayout.implicitHeight + 10)
 
     RowLayout {
         id: rowLayout
@@ -40,13 +43,18 @@ Rectangle {
             }
         }
 
-        ColumnLayout {
+        GridLayout {
             Layout.fillWidth: true
-            spacing: 1
+            columns: root.inlineDescription ? 2 : 1
+            columnSpacing: root.tokens.spacingSmall
+            rowSpacing: 1
             UiLabel {
                 tokens: root.tokens
                 kind: bodyKind
-                Layout.fillWidth: true
+                Layout.row: 0
+                Layout.column: 0
+                Layout.fillWidth: !root.inlineDescription
+                Layout.alignment: Qt.AlignVCenter
                 text: root.titleText
                 font.pixelSize: root.tokens.fontSizeBody
                 font.weight: Font.Medium
@@ -56,7 +64,10 @@ Rectangle {
                 objectName: root.descriptionObjectName
                 tokens: root.tokens
                 kind: noteKind
+                Layout.row: root.inlineDescription ? 0 : 1
+                Layout.column: root.inlineDescription ? 1 : 0
                 Layout.fillWidth: true
+                Layout.alignment: Qt.AlignVCenter
                 text: root.descriptionText
                 maximumLineCount: 1
                 elide: Text.ElideRight

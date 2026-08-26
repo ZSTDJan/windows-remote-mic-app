@@ -52,6 +52,12 @@ built from the standalone ``src/launcher.py`` entry point - see XRBM-021):
                   location and never falling through to running the
                 bridge). Never launched by a real end user directly; not
                 part of this program's public CLI surface.
+- ``--diagnose-vb-cable-loopback <request-path> <result-path>``  HIDDEN
+                child-process entry point for the explicit active audio
+                test. The parent can terminate this disposable process if
+                PortAudio blocks while opening, running, or closing a
+                stream, so settings shutdown never depends on that native
+                call returning in-process.
 - ``--rc003-hid-injector --pid <pid>``  HIDDEN child-process entry point for
                 the verified HID tap injector. It validates the current
                 RC003 WUDFHost target and returns a stable exit code; it never
@@ -59,10 +65,10 @@ built from the standalone ``src/launcher.py`` entry point - see XRBM-021):
 - ``--help``/``-h``  print this usage and exit 0
 
 ``--settings``, ``--bridge``, ``--dry-run``,
-``--diagnose-ble-candidates`` and ``--help``/``-h`` are all checked and
-dispatched BEFORE the bridge branch below is ever reached. Settings uses its
-own mutex; dry-run, diagnostics and help touch neither settings nor bridge
-ownership.
+``--diagnose-ble-candidates``, ``--diagnose-vb-cable-loopback`` and
+``--help``/``-h`` are all checked and dispatched BEFORE the bridge branch
+below is ever reached. Settings uses its own mutex; dry-run, diagnostics and
+help touch neither settings nor bridge ownership.
 """
 
 from __future__ import annotations
@@ -236,6 +242,17 @@ def main() -> None:
         result_path = args[flag_index + 1] if flag_index + 1 < len(args) else None
         raise SystemExit(
             windows_diagnostics.run_ble_diagnostics_subprocess_entrypoint(result_path)
+        )
+    if "--diagnose-vb-cable-loopback" in args:
+        from . import windows_diagnostics
+
+        flag_index = args.index("--diagnose-vb-cable-loopback")
+        request_path = args[flag_index + 1] if flag_index + 1 < len(args) else None
+        result_path = args[flag_index + 2] if flag_index + 2 < len(args) else None
+        raise SystemExit(
+            windows_diagnostics.run_vb_cable_loopback_subprocess_entrypoint(
+                request_path, result_path
+            )
         )
     if "--rc003-hid-injector" in args:
         # Hidden entry point used only by the verified Frida Gadget tap. It

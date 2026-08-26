@@ -26,10 +26,16 @@ process, not merely a background thread of this one - see the "-- BLE
 candidate --" section below for why an in-process asyncio cancellation
 cannot give a real hard bound against the locked pywinrt wrapper's own
 unbounded post-cancel wait, and how process-level termination does.
+
+The user-triggered VB-CABLE loopback follows the same process-isolation
+boundary for PortAudio: endpoint enumeration, stream construction/start/
+stop/close, and analysis all run in a disposable child so a blocked native
+audio call cannot remain inside the settings interpreter during shutdown.
 """
 
 from __future__ import annotations
 
+import contextlib
 import functools
 import json
 import os
@@ -49,6 +55,7 @@ from . import audio_playback
 from . import ble_transport_winrt
 from . import identity
 from . import raw_input_windows
+from . import single_instance
 
 # Windows 10 version 1809's build number - the lowest build this project's
 # own README/installer already claim as the supported floor (see
@@ -310,6 +317,7 @@ def check_raw_input(
 # process.
 
 BLE_DIAGNOSTICS_SUBPROCESS_FLAG = "--diagnose-ble-candidates"
+VB_CABLE_LOOPBACK_SUBPROCESS_FLAG = "--diagnose-vb-cable-loopback"
 
 # Absolute upper bound on how long the parent waits for the child to report
 # a verdict ON ITS OWN before beginning forced termination. Generous enough
@@ -344,6 +352,15 @@ BLE_DISCOVERY_MAX_CANCELLATION_SECONDS = (
     _SUBPROCESS_POLL_SECONDS + _SUBPROCESS_TERMINATE_WAIT_SECONDS + _SUBPROCESS_KILL_WAIT_SECONDS
 )
 
+# The child includes interpreter start-up, endpoint enumeration, PortAudio
+# stream construction/start/stop/close, and signal analysis. The in-child
+# stream loop has its own shorter deadline, while this parent-side deadline
+# is the real hard bound if any native PortAudio call never returns.
+VB_CABLE_LOOPBACK_PROCESS_TIMEOUT_SECONDS = 8.0
+VB_CABLE_LOOPBACK_MAX_CANCELLATION_SECONDS = (
+    _SUBPROCESS_POLL_SECONDS + _SUBPROCESS_TERMINATE_WAIT_SECONDS + _SUBPROCESS_KILL_WAIT_SECONDS
+)
+
 # Defensive ceiling on a reported ambiguous count (XRBM-035 RETRY 1 P2/D):
 # this module never trusts an unbounded or implausible number from a result
 # file it did not fully control the writer of - a real RC003 candidate list
@@ -373,6 +390,14 @@ class BleDiscoverySubprocessShutdownUnconfirmedError(Exception):
     boundary this whole design exists for actually held, and must say so
     honestly rather than claim a safe outcome it cannot prove.
     """
+
+
+class VbCableLoopbackCancelledError(Exception):
+    """The isolated active-audio test was cancelled or exceeded its bound."""
+
+
+class VbCableLoopbackSubprocessShutdownUnconfirmedError(Exception):
+    """The active-audio child could not be confirmed to have stopped."""
 
 
 class BleDiagnosticsVerdict(Enum):
@@ -439,6 +464,34 @@ def build_ble_diagnostics_subprocess_command(
         # recognizes this flag identically either way.
         return [exe, BLE_DIAGNOSTICS_SUBPROCESS_FLAG, result_path]
     return [exe, "-m", "ovb_rc003", BLE_DIAGNOSTICS_SUBPROCESS_FLAG, result_path]
+
+
+def build_vb_cable_loopback_subprocess_command(
+    request_path: str,
+    result_path: str,
+    *,
+    frozen: Optional[bool] = None,
+    executable: Optional[str] = None,
+) -> List[str]:
+    """Build the hidden child command for the active VB-CABLE test."""
+
+    is_frozen = frozen if frozen is not None else bool(getattr(sys, "frozen", False))
+    exe = executable if executable is not None else sys.executable
+    if is_frozen:
+        return [
+            exe,
+            VB_CABLE_LOOPBACK_SUBPROCESS_FLAG,
+            request_path,
+            result_path,
+        ]
+    return [
+        exe,
+        "-m",
+        "ovb_rc003",
+        VB_CABLE_LOOPBACK_SUBPROCESS_FLAG,
+        request_path,
+        result_path,
+    ]
 
 
 def _write_verdict_atomically(result_path: str, payload: dict) -> None:
@@ -542,6 +595,67 @@ def run_ble_diagnostics_subprocess_entrypoint(result_path: Optional[str]) -> int
         # the CHILD's own last chance to report anything at all before it
         # exits, with nothing else able to observe it).
         return 0 if _write({"verdict": BleDiagnosticsVerdict.ERROR.value}) else 1
+
+
+def _read_vb_cable_loopback_request(
+    request_path: Optional[str],
+) -> Optional[Tuple[str, str]]:
+    if not request_path:
+        return None
+    try:
+        with open(request_path, "r", encoding="utf-8") as handle:
+            text = handle.read(4097)
+    except (FileNotFoundError, OSError):
+        return None
+    if not text.strip() or len(text) > 4096:
+        return None
+    try:
+        parsed = json.loads(text)
+    except ValueError:
+        return None
+    if not isinstance(parsed, dict) or set(parsed) != {
+        "saved_output_name",
+        "saved_output_host_api",
+    }:
+        return None
+    name = parsed.get("saved_output_name")
+    host_api = parsed.get("saved_output_host_api")
+    if not isinstance(name, str) or not isinstance(host_api, str):
+        return None
+    if len(name) > 512 or len(host_api) > 128:
+        return None
+    return name, host_api
+
+
+def run_vb_cable_loopback_subprocess_entrypoint(
+    request_path: Optional[str], result_path: Optional[str]
+) -> int:
+    """Run the complete active PortAudio check inside a disposable child."""
+
+    request = _read_vb_cable_loopback_request(request_path)
+    if request is None or not result_path:
+        return 1
+
+    try:
+        result = check_vb_cable_loopback(*request)
+    except Exception:  # noqa: BLE001 - sanitize at the process boundary
+        result = CheckResult(
+            "vb_cable_loopback",
+            "VB-CABLE 本地通道",
+            CheckGroup.OPTIONAL_DRIVER,
+            CheckStatus.FAIL,
+            "VB-CABLE 通道测试出现意外错误，未得到可信结果。",
+        )
+
+    payload = {
+        "status": result.status.value,
+        "detail": result.detail,
+    }
+    try:
+        _write_verdict_atomically(result_path, payload)
+    except OSError:
+        return 1
+    return 0
 
 
 def _popen_kwargs() -> dict:
@@ -817,6 +931,118 @@ def _run_ble_diagnostics_subprocess(
     return _read_subprocess_verdict(result_path, returncode)
 
 
+def _sanitize_vb_cable_loopback_result(parsed: object) -> Optional[CheckResult]:
+    if not isinstance(parsed, dict) or set(parsed) != {"status", "detail"}:
+        return None
+    status_value = parsed.get("status")
+    detail = parsed.get("detail")
+    if status_value not in {
+        CheckStatus.PASS.value,
+        CheckStatus.FAIL.value,
+        CheckStatus.UNSUPPORTED.value,
+    }:
+        return None
+    if (
+        not isinstance(detail, str)
+        or not detail.strip()
+        or len(detail) > 1024
+        or "\x00" in detail
+    ):
+        return None
+    return CheckResult(
+        "vb_cable_loopback",
+        "VB-CABLE 本地通道",
+        CheckGroup.OPTIONAL_DRIVER,
+        CheckStatus(status_value),
+        detail,
+    )
+
+
+def _read_vb_cable_loopback_result(
+    result_path: str, returncode: Optional[int]
+) -> Optional[CheckResult]:
+    if returncode != 0:
+        return None
+    try:
+        with open(result_path, "r", encoding="utf-8") as handle:
+            text = handle.read(4097)
+    except (FileNotFoundError, OSError):
+        return None
+    if not text.strip() or len(text) > 4096:
+        return None
+    try:
+        parsed = json.loads(text)
+    except ValueError:
+        return None
+    return _sanitize_vb_cable_loopback_result(parsed)
+
+
+def _run_vb_cable_loopback_subprocess(
+    command: Sequence[str],
+    *,
+    result_path: str,
+    cancel_event: threading.Event,
+    timeout: float,
+    poll_interval: float = _SUBPROCESS_POLL_SECONDS,
+    terminate_wait: float = _SUBPROCESS_TERMINATE_WAIT_SECONDS,
+    kill_wait: float = _SUBPROCESS_KILL_WAIT_SECONDS,
+    popen: Callable[..., "subprocess.Popen"] = subprocess.Popen,
+) -> Optional[CheckResult]:
+    """Run the PortAudio child with a process-enforced time bound."""
+
+    if cancel_event.is_set():
+        raise VbCableLoopbackCancelledError(
+            "VB-CABLE loopback cancelled before it could start"
+        )
+
+    proc = popen(list(command), **_popen_kwargs())
+    deadline = time.monotonic() + timeout
+    returncode = None
+    while True:
+        try:
+            returncode = proc.poll()
+        except OSError:
+            confirmed_dead = _terminate_and_confirm_exit(
+                proc, terminate_wait=terminate_wait, kill_wait=kill_wait
+            )
+            if not confirmed_dead:
+                raise VbCableLoopbackSubprocessShutdownUnconfirmedError(
+                    "VB-CABLE loopback child status failed and exit was unconfirmed"
+                )
+            raise RuntimeError(
+                "VB-CABLE loopback child status failed; child was terminated"
+            )
+        if returncode is not None:
+            break
+        if cancel_event.is_set() or time.monotonic() >= deadline:
+            break
+        time.sleep(poll_interval)
+
+    if returncode is None:
+        confirmed_dead = _terminate_and_confirm_exit(
+            proc, terminate_wait=terminate_wait, kill_wait=kill_wait
+        )
+        if not confirmed_dead:
+            raise VbCableLoopbackSubprocessShutdownUnconfirmedError(
+                "VB-CABLE loopback child could not be confirmed to have exited"
+            )
+        raise VbCableLoopbackCancelledError(
+            "VB-CABLE loopback cancelled or timed out"
+        )
+
+    return _read_vb_cable_loopback_result(result_path, returncode)
+
+
+def _vb_cable_bridge_exclusion_guard():
+    """Keep bridge startup out while the active audio child owns the route."""
+
+    if sys.platform != "win32":
+        return contextlib.nullcontext()
+    return single_instance.BridgeInstanceGuard(
+        _duplicate_message="the RC003 bridge is already running"
+    )
+
+
 def _discover_ble_candidates_sync(
     *,
     cancel_event: Optional[threading.Event] = None,
@@ -1053,6 +1279,277 @@ def check_vb_cable_endpoints(
         "尚未发现：" + "、".join(missing) + "。这是可选项——不安装 VB-CABLE 时，"
         "普通按键仍然正常工作，只有把 RC003 语音当作系统麦克风使用时才需要它。",
     )
+
+
+def check_vb_cable_loopback(
+    saved_output_name: str,
+    saved_output_host_api: str,
+    *,
+    list_playback: Callable[
+        [], Sequence[audio_output.AudioEndpoint]
+    ] = audio_output.enumerate_output_endpoints,
+    list_recording: Callable[
+        [], Sequence[audio_output.AudioEndpoint]
+    ] = audio_output.enumerate_input_endpoints,
+    probe: Callable[..., audio_playback.CableLoopbackProbeResult] = (
+        audio_playback.probe_virtual_cable_loopback
+    ),
+    cancel_event: Optional[threading.Event] = None,
+) -> CheckResult:
+    """Explicit active check; deliberately not part of ``run_diagnostics``.
+
+    It emits a short synthetic sweep into the currently selected CABLE Input
+    and checks for the same waveform on the unique CABLE Output view under
+    the same host API. It never changes Windows defaults or persists PCM.
+    """
+
+    title = "VB-CABLE 本地通道"
+    try:
+        playback = list(list_playback())
+        recording = list(list_recording())
+    except audio_output.AudioOutputUnavailableError:
+        return CheckResult(
+            "vb_cable_loopback",
+            title,
+            CheckGroup.OPTIONAL_DRIVER,
+            CheckStatus.UNSUPPORTED,
+            "无法枚举音频端点，暂时不能运行通道测试。",
+        )
+    except Exception:  # noqa: BLE001 - never expose device details
+        return CheckResult(
+            "vb_cable_loopback",
+            title,
+            CheckGroup.OPTIONAL_DRIVER,
+            CheckStatus.FAIL,
+            "枚举音频端点时出现意外错误，未运行通道测试。",
+        )
+
+    try:
+        output_endpoint = audio_output.resolve_selected_endpoint(
+            playback, saved_output_name, saved_output_host_api
+        )
+    except audio_output.AudioOutputUnavailableError:
+        return CheckResult(
+            "vb_cable_loopback",
+            title,
+            CheckGroup.OPTIONAL_DRIVER,
+            CheckStatus.FAIL,
+            "当前语音输出端点不可用；请先点击「选择端点」，再测试通道。",
+        )
+    if not audio_output.is_cable_input_endpoint(output_endpoint.name):
+        return CheckResult(
+            "vb_cable_loopback",
+            title,
+            CheckGroup.OPTIONAL_DRIVER,
+            CheckStatus.FAIL,
+            "当前语音输出不是 CABLE Input；请先点击「选择端点」，再测试通道。",
+        )
+
+    input_matches = [
+        endpoint
+        for endpoint in recording
+        if audio_output.is_cable_output_endpoint(endpoint.name)
+        and endpoint.host_api == output_endpoint.host_api
+    ]
+    if not input_matches:
+        return CheckResult(
+            "vb_cable_loopback",
+            title,
+            CheckGroup.OPTIONAL_DRIVER,
+            CheckStatus.FAIL,
+            "没有找到与当前 CABLE Input 使用同一音频接口的 CABLE Output。",
+        )
+    if len(input_matches) != 1:
+        return CheckResult(
+            "vb_cable_loopback",
+            title,
+            CheckGroup.OPTIONAL_DRIVER,
+            CheckStatus.FAIL,
+            "同一音频接口下存在多个 CABLE Output，无法唯一确定测试端点。",
+        )
+
+    try:
+        result = probe(
+            output_endpoint,
+            input_matches[0],
+            cancel_event=cancel_event,
+        )
+    except audio_playback.LoopbackProbeCancelledError:
+        return CheckResult(
+            "vb_cable_loopback",
+            title,
+            CheckGroup.OPTIONAL_DRIVER,
+            CheckStatus.UNSUPPORTED,
+            "VB-CABLE 通道测试已取消。",
+        )
+    except audio_playback.LoopbackProbeUnavailableError:
+        status = CheckStatus.UNSUPPORTED if sys.platform != "win32" else CheckStatus.FAIL
+        return CheckResult(
+            "vb_cable_loopback",
+            title,
+            CheckGroup.OPTIONAL_DRIVER,
+            status,
+            "无法完成 VB-CABLE 通道测试；请关闭占用虚拟音频端点的程序后重试。",
+        )
+    except Exception:  # noqa: BLE001 - never expose device details
+        return CheckResult(
+            "vb_cable_loopback",
+            title,
+            CheckGroup.OPTIONAL_DRIVER,
+            CheckStatus.FAIL,
+            "VB-CABLE 通道测试出现意外错误，未得到可信结果。",
+        )
+
+    if result.input_overflowed or result.output_underflowed:
+        return CheckResult(
+            "vb_cable_loopback",
+            title,
+            CheckGroup.OPTIONAL_DRIVER,
+            CheckStatus.FAIL,
+            "测试过程中发生音频溢出或欠载，本次结果无效；请关闭占用端点的程序后重试。",
+        )
+    if not result.detected:
+        return CheckResult(
+            "vb_cable_loopback",
+            title,
+            CheckGroup.OPTIONAL_DRIVER,
+            CheckStatus.FAIL,
+            "没有在 CABLE Output 收到匹配的测试信号；请检查 VB-CABLE 端点后重试。",
+        )
+
+    latency_ms = result.roundtrip_latency_ms or 0.0
+    return CheckResult(
+        "vb_cable_loopback",
+        title,
+        CheckGroup.OPTIONAL_DRIVER,
+        CheckStatus.PASS,
+        f"测试信号已从 CABLE Input 到达 CABLE Output（约 {latency_ms:.0f} ms）；"
+        "这只说明本地虚拟音频通道正常，不代表输入法已经识别文字。",
+    )
+
+
+def _run_vb_cable_loopback_in_tempdir(
+    saved_output_name: str,
+    saved_output_host_api: str,
+    *,
+    cancel_event: threading.Event,
+    timeout: float,
+    bridge_guard_factory: Callable[[], object] = _vb_cable_bridge_exclusion_guard,
+) -> Optional[CheckResult]:
+    with bridge_guard_factory():
+        result_dir = tempfile.mkdtemp(prefix="ovb-rc003-loopback-diag-")
+        request_path = os.path.join(result_dir, "request.json")
+        result_path = os.path.join(result_dir, "result.json")
+        try:
+            _write_verdict_atomically(
+                request_path,
+                {
+                    "saved_output_name": saved_output_name,
+                    "saved_output_host_api": saved_output_host_api,
+                },
+            )
+            command = build_vb_cable_loopback_subprocess_command(
+                request_path, result_path
+            )
+            return _run_vb_cable_loopback_subprocess(
+                command,
+                result_path=result_path,
+                cancel_event=cancel_event,
+                timeout=timeout,
+            )
+        finally:
+            original_exc = sys.exc_info()[1]
+            try:
+                shutil.rmtree(result_dir)
+            except FileNotFoundError:
+                pass
+            except OSError as cleanup_exc:
+                if isinstance(
+                    original_exc,
+                    VbCableLoopbackSubprocessShutdownUnconfirmedError,
+                ):
+                    raise original_exc from cleanup_exc
+                raise
+
+
+def check_vb_cable_loopback_isolated(
+    saved_output_name: str,
+    saved_output_host_api: str,
+    *,
+    cancel_event: Optional[threading.Event] = None,
+    timeout: float = VB_CABLE_LOOPBACK_PROCESS_TIMEOUT_SECONDS,
+) -> CheckResult:
+    """Run the complete active test in a child that can be forcibly ended."""
+
+    title = "VB-CABLE 本地通道"
+    event = cancel_event if cancel_event is not None else threading.Event()
+    try:
+        result = _run_vb_cable_loopback_in_tempdir(
+            saved_output_name,
+            saved_output_host_api,
+            cancel_event=event,
+            timeout=timeout,
+        )
+    except single_instance.DuplicateInstanceError:
+        return CheckResult(
+            "vb_cable_loopback",
+            title,
+            CheckGroup.OPTIONAL_DRIVER,
+            CheckStatus.FAIL,
+            "桥接已经运行或正在启动；本次未发送测试信号，请先停止桥接后重试。",
+        )
+    except (
+        single_instance.SingleInstanceUnavailableError,
+        single_instance.MutexCleanupError,
+    ):
+        return CheckResult(
+            "vb_cable_loopback",
+            title,
+            CheckGroup.OPTIONAL_DRIVER,
+            CheckStatus.FAIL,
+            "无法确认测试与桥接已经互斥；本次结果无效，请关闭设置程序后重试。",
+        )
+    except VbCableLoopbackCancelledError:
+        if event.is_set():
+            return CheckResult(
+                "vb_cable_loopback",
+                title,
+                CheckGroup.OPTIONAL_DRIVER,
+                CheckStatus.UNSUPPORTED,
+                "VB-CABLE 通道测试已取消。",
+            )
+        return CheckResult(
+            "vb_cable_loopback",
+            title,
+            CheckGroup.OPTIONAL_DRIVER,
+            CheckStatus.FAIL,
+            "VB-CABLE 通道测试超时，已停止测试进程；请关闭占用端点的程序后重试。",
+        )
+    except VbCableLoopbackSubprocessShutdownUnconfirmedError:
+        return CheckResult(
+            "vb_cable_loopback",
+            title,
+            CheckGroup.OPTIONAL_DRIVER,
+            CheckStatus.FAIL,
+            "VB-CABLE 通道测试超时，且未能确认测试进程已经停止；请先关闭设置程序后重试。",
+        )
+    except Exception:  # noqa: BLE001 - never expose paths or device details
+        return CheckResult(
+            "vb_cable_loopback",
+            title,
+            CheckGroup.OPTIONAL_DRIVER,
+            CheckStatus.FAIL,
+            "无法启动或完成 VB-CABLE 隔离通道测试，请稍后重试。",
+        )
+    if result is None:
+        return CheckResult(
+            "vb_cable_loopback",
+            title,
+            CheckGroup.OPTIONAL_DRIVER,
+            CheckStatus.FAIL,
+            "VB-CABLE 通道测试进程未返回可信结果，请稍后重试。",
+        )
+    return result
 
 
 def check_dji_mic_2_input(

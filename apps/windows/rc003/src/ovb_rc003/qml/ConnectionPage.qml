@@ -15,9 +15,19 @@ Item {
     readonly property bool bridgeLaunchInProgress:
         SettingsController.bridgeLaunchBusy
         || SettingsController.bridgeLaunchPhase === "waiting"
+    readonly property bool voiceProgramPrivilegeUnknown:
+        SettingsController.voiceProgramStatusCode === "running"
+        && SettingsController.voiceProgramElevationStatus === "unknown"
+    readonly property bool voiceProgramPrivilegeMismatch:
+        SettingsController.voiceProgramStatusCode === "running"
+        && SettingsController.voiceProgramElevationStatus !== "unknown"
+        && SettingsController.voiceProgramLaunchElevated
+            !== (SettingsController.voiceProgramElevationStatus === "elevated")
+    readonly property bool voiceProgramNeedsAttention:
+        voiceProgramPrivilegeUnknown || voiceProgramPrivilegeMismatch
     readonly property color voiceProgramStateColor:
         SettingsController.voiceProgramStatusCode === "running"
-            ? tokens.successColor
+            ? (voiceProgramNeedsAttention ? tokens.voiceAccent : tokens.successColor)
             : SettingsController.voiceProgramStatusCode === "disabled"
                 ? tokens.accent : tokens.voiceAccent
 
@@ -26,12 +36,19 @@ Item {
         if (!voiceProgramManaged)
             return ""
         if (code === "running") {
-            return SettingsController.voiceProgramStatusText.indexOf(
-                qsTr("管理员权限")
-            ) >= 0 ? qsTr("管理员运行中") : qsTr("普通权限运行中")
+            const privilege = SettingsController.voiceProgramElevationStatus
+            if (privilege === "unknown")
+                return qsTr("运行中 · 权限未知")
+            const elevated = privilege === "elevated"
+            if (SettingsController.voiceProgramLaunchElevated !== elevated) {
+                return SettingsController.voiceProgramLaunchElevated
+                    ? qsTr("需重启为管理员") : qsTr("需重启为普通权限")
+            }
+            return elevated ? qsTr("管理员运行中") : qsTr("普通权限运行中")
         }
         if (code === "stopped")
             return SettingsController.bridgeRunning
+                && SettingsController.voiceProgramSettingsDirty
                 ? qsTr("已修改 · 待应用") : qsTr("已找到 · 待启动")
         if (code === "not_found") {
             return SettingsController.selectedVoiceProgramIndex === 2
@@ -46,9 +63,11 @@ Item {
             return qsTr("不管理")
         const code = SettingsController.voiceProgramStatusCode
         if (code === "running")
-            return qsTr("运行中")
+            return voiceProgramNeedsAttention ? qsTr("需检查") : qsTr("运行中")
         if (code === "stopped")
-            return SettingsController.bridgeRunning ? qsTr("待应用") : qsTr("待启动")
+            return SettingsController.bridgeRunning
+                && SettingsController.voiceProgramSettingsDirty
+                ? qsTr("待应用") : qsTr("待启动")
         return qsTr("需检查")
     }
 
@@ -352,6 +371,7 @@ Item {
                                     currentIndex: SettingsController.selectedDeviceIndex
                                     onActivated: SettingsController.selectedDeviceIndex = index
                                     enabled: SettingsController.deviceCatalogAvailable
+                                        && !DiagnosticsController.vbCableTestRunning
                                     Accessible.name: qsTr("当前设备")
                                     KeyNavigation.tab: SettingsController.isRc003Device
                                         ? endpointCombo : refreshDjiButton
@@ -415,6 +435,7 @@ Item {
                                     model: SettingsController.endpointOptions
                                     currentIndex: SettingsController.selectedEndpointIndex
                                     onActivated: SettingsController.selectedEndpointIndex = index
+                                    enabled: !DiagnosticsController.vbCableTestRunning
                                     Accessible.name: qsTr("输出端点")
                                     KeyNavigation.tab: voiceProgramCombo
                                     onActiveFocusChanged: if (activeFocus) root.ensureVisible(this)
@@ -793,6 +814,7 @@ Item {
                                     text: SettingsController.isRc003Device
                                         ? qsTr("仅保存设置") : qsTr("保存设备选择")
                                     highlighted: !SettingsController.isRc003Device
+                                    enabled: !DiagnosticsController.vbCableTestRunning
                                     onClicked: SettingsController.saveSettings()
                                 }
                                 CompactButton {
@@ -805,6 +827,7 @@ Item {
                                         ? qsTr("正在启动桥接") : qsTr("保存并启动桥接")
                                     highlighted: true
                                     enabled: !SettingsController.bridgeLaunchBusy
+                                        && !DiagnosticsController.vbCableTestRunning
                                     onClicked: SettingsController.saveAndLaunch()
                                 }
                             }

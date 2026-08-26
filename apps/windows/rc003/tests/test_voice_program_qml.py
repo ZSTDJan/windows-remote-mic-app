@@ -140,6 +140,85 @@ managed_auto_start = bool(controller.voiceProgramLaunchOnBridgeStart)
 managed_elevated = bool(controller.voiceProgramLaunchElevated)
 managed_status = str(controls["voiceProgramStatusLabel"].property("text"))
 
+
+def rendered_status(
+    code,
+    text,
+    elevation,
+    *,
+    bridge_running,
+    settings_dirty,
+    voice_program_dirty,
+):
+    controller._set_bridge_running(bridge_running)
+    controller._set_settings_dirty(settings_dirty)
+    controller._set_voice_program_settings_dirty(voice_program_dirty)
+    controller._voice_program_status_code = code
+    controller._voice_program_status_text = text
+    controller._voice_program_elevation_status = elevation
+    controller.voiceProgramStatusCodeChanged.emit()
+    controller.voiceProgramStatusTextChanged.emit()
+    controller.voiceProgramElevationStatusChanged.emit()
+    render(window, app)
+    label = controls["voiceProgramStatusLabel"]
+    return {
+        "text": str(label.property("text")),
+        "color": label.property("color").name(),
+    }
+
+
+status_cases = {
+    "unknown_running": rendered_status(
+        "running",
+        "正在运行（权限状态未知）。",
+        "unknown",
+        bridge_running=True,
+        settings_dirty=False,
+        voice_program_dirty=False,
+    ),
+    "standard_mismatch": rendered_status(
+        "running",
+        "正在运行（普通权限）。",
+        "standard",
+        bridge_running=True,
+        settings_dirty=False,
+        voice_program_dirty=False,
+    ),
+}
+controller.voiceProgramLaunchElevated = False
+status_cases["standard_running"] = rendered_status(
+    "running",
+    "正在运行（普通权限）。",
+    "standard",
+    bridge_running=True,
+    settings_dirty=False,
+    voice_program_dirty=False,
+)
+status_cases["stopped_clean"] = rendered_status(
+    "stopped",
+    "已找到，当前未运行。",
+    "unknown",
+    bridge_running=True,
+    settings_dirty=False,
+    voice_program_dirty=False,
+)
+status_cases["stopped_unrelated_dirty"] = rendered_status(
+    "stopped",
+    "已找到，当前未运行。",
+    "unknown",
+    bridge_running=True,
+    settings_dirty=True,
+    voice_program_dirty=False,
+)
+status_cases["stopped_voice_program_dirty"] = rendered_status(
+    "stopped",
+    "已找到，当前未运行。",
+    "unknown",
+    bridge_running=True,
+    settings_dirty=True,
+    voice_program_dirty=True,
+)
+
 controller.selectedVoiceProgramIndex = 0
 render(window, app)
 unmanaged_elevated = {
@@ -155,6 +234,7 @@ result = {
     "status": managed_status,
     "managed_auto_start": managed_auto_start,
     "managed_elevated": managed_elevated,
+    "status_cases": status_cases,
     "unmanaged_elevated": unmanaged_elevated,
     "retired_controls_absent": all(
         find(window, name) is None
@@ -197,6 +277,38 @@ class VoiceProgramQmlTests(unittest.TestCase):
         self.assertTrue(all(item["enabled"] for item in data["managed"].values()))
         self.assertTrue(data["managed_auto_start"])
         self.assertTrue(data["managed_elevated"])
+        self.assertEqual(
+            data["status_cases"]["unknown_running"]["text"],
+            "运行中 · 权限未知",
+        )
+        self.assertEqual(
+            data["status_cases"]["standard_mismatch"]["text"],
+            "需重启为管理员",
+        )
+        self.assertEqual(
+            data["status_cases"]["standard_running"]["text"],
+            "普通权限运行中",
+        )
+        self.assertEqual(
+            data["status_cases"]["stopped_clean"]["text"],
+            "已找到 · 待启动",
+        )
+        self.assertEqual(
+            data["status_cases"]["stopped_unrelated_dirty"]["text"],
+            "已找到 · 待启动",
+        )
+        self.assertEqual(
+            data["status_cases"]["stopped_voice_program_dirty"]["text"],
+            "已修改 · 待应用",
+        )
+        self.assertEqual(
+            data["status_cases"]["unknown_running"]["color"],
+            data["status_cases"]["standard_mismatch"]["color"],
+        )
+        self.assertNotEqual(
+            data["status_cases"]["standard_running"]["color"],
+            data["status_cases"]["standard_mismatch"]["color"],
+        )
         self.assertTrue(data["unmanaged_elevated"]["visible"])
         self.assertFalse(data["unmanaged_elevated"]["enabled"])
         for item in data["managed"].values():
