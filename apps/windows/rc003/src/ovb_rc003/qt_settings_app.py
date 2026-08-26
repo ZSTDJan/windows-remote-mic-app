@@ -1075,6 +1075,8 @@ def _load_qt_classes() -> dict:
 
         def _refresh_bridge_status(self) -> bool | None:
             self._refresh_bridge_launch_elapsed()
+            if _vb_cable_test_active_event.is_set():
+                return self._bridge_running
             try:
                 running = single_instance.bridge_instance_running()
             except (

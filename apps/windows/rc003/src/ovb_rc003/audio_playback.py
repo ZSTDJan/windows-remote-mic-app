@@ -383,7 +383,7 @@ def _resolve_loopback_device_index(sd, endpoint, channel_count_key: str) -> int:
     return matches[0]
 
 
-def _select_loopback_stream_format(sd, input_index: int, output_index: int):
+def _loopback_stream_format_candidates(sd, input_index: int, output_index: int):
     try:
         devices = sd.query_devices()
         input_device = devices[input_index]
@@ -403,6 +403,7 @@ def _select_loopback_stream_format(sd, input_index: int, output_index: int):
         ) from exc
 
     seen = set()
+    formats = []
     for sample_rate_hz in candidates:
         if sample_rate_hz <= 0 or sample_rate_hz in seen:
             continue
@@ -428,7 +429,9 @@ def _select_loopback_stream_format(sd, input_index: int, output_index: int):
                 )
             except Exception:
                 continue
-            return sample_rate_hz, output_channels
+            formats.append((sample_rate_hz, output_channels))
+    if formats:
+        return formats
     raise LoopbackProbeUnavailableError(
         "CABLE Input 与 CABLE Output 没有可共同使用的音频格式"
     )
@@ -553,64 +556,93 @@ def probe_virtual_cable_loopback(
         input_index = _resolve_loopback_device_index(
             sd, input_endpoint, "max_input_channels"
         )
-        sample_rate_hz, output_channels = _select_loopback_stream_format(
+        format_candidates = _loopback_stream_format_candidates(
             sd, input_index, output_index
         )
-        output_signal, probe_signal, lead_samples = _build_loopback_probe(
-            np, sample_rate_hz
-        )
-        captured = np.zeros(len(output_signal), dtype="int16")
-        cursor = 0
-        finished = threading.Event()
-        callback_errors = []
-        input_overflowed = False
-        output_underflowed = False
         stream = None
         stream_started = False
+        last_open_error = None
+
+        for sample_rate_hz, output_channels in format_candidates:
+            if cancel_event is not None and cancel_event.is_set():
+                raise LoopbackProbeCancelledError("VB-CABLE 通道测试已取消")
+            output_signal, probe_signal, lead_samples = _build_loopback_probe(
+                np, sample_rate_hz
+            )
+            captured = np.zeros(len(output_signal), dtype="int16")
+            cursor = 0
+            finished = threading.Event()
+            callback_errors = []
+            input_overflowed = False
+            output_underflowed = False
+
+            def _callback(indata, outdata, frames, _time_info, status) -> None:
+                nonlocal cursor, input_overflowed, output_underflowed
+                try:
+                    input_overflowed = input_overflowed or bool(
+                        getattr(status, "input_overflow", False)
+                    )
+                    output_underflowed = output_underflowed or bool(
+                        getattr(status, "output_underflow", False)
+                    )
+                    outdata.fill(0)
+                    remaining = len(output_signal) - cursor
+                    take = min(frames, max(0, remaining))
+                    if take > 0:
+                        chunk = output_signal[cursor : cursor + take]
+                        outdata[:take, :] = chunk.reshape(-1, 1)
+                        captured[cursor : cursor + take] = indata[:take, 0]
+                        cursor += take
+                    if cursor >= len(output_signal):
+                        raise sd.CallbackStop
+                except sd.CallbackStop:
+                    raise
+                except Exception as exc:  # pragma: no cover - defensive callback gate
+                    callback_errors.append(exc)
+                    finished.set()
+                    raise sd.CallbackAbort
+
+            candidate_stream = None
+            try:
+                candidate_stream = sd.Stream(
+                    device=(input_index, output_index),
+                    samplerate=sample_rate_hz,
+                    blocksize=0,
+                    channels=(1, output_channels),
+                    dtype=("int16", "int16"),
+                    latency="low",
+                    callback=_callback,
+                    finished_callback=finished.set,
+                )
+                candidate_stream.start()
+            except Exception as exc:  # noqa: BLE001 - try the next real duplex format
+                last_open_error = exc
+                if candidate_stream is not None:
+                    try:
+                        candidate_stream.abort()
+                    except Exception:
+                        pass
+                    try:
+                        candidate_stream.close()
+                    except Exception as close_exc:
+                        _retained_loopback_stream = candidate_stream
+                        raise LoopbackProbeUnavailableError(
+                            "VB-CABLE 通道测试切换音频格式时未能释放临时音频流"
+                        ) from close_exc
+                continue
+            stream = candidate_stream
+            stream_started = True
+            break
+
+        if stream is None:
+            raise LoopbackProbeUnavailableError(
+                "无法用任何共同格式打开 VB-CABLE 双工音频流"
+            ) from last_open_error
+
         operation_error = None
         timed_out_or_cancelled = False
-        operation_started_at = time.perf_counter()
-        deadline = operation_started_at + LOOPBACK_PROBE_TIMEOUT_SECONDS
-
-        def _callback(indata, outdata, frames, _time_info, status) -> None:
-            nonlocal cursor, input_overflowed, output_underflowed
-            try:
-                input_overflowed = input_overflowed or bool(
-                    getattr(status, "input_overflow", False)
-                )
-                output_underflowed = output_underflowed or bool(
-                    getattr(status, "output_underflow", False)
-                )
-                outdata.fill(0)
-                remaining = len(output_signal) - cursor
-                take = min(frames, max(0, remaining))
-                if take > 0:
-                    chunk = output_signal[cursor : cursor + take]
-                    outdata[:take, :] = chunk.reshape(-1, 1)
-                    captured[cursor : cursor + take] = indata[:take, 0]
-                    cursor += take
-                if cursor >= len(output_signal):
-                    raise sd.CallbackStop
-            except sd.CallbackStop:
-                raise
-            except Exception as exc:  # pragma: no cover - defensive callback gate
-                callback_errors.append(exc)
-                finished.set()
-                raise sd.CallbackAbort
-
+        deadline = time.perf_counter() + LOOPBACK_PROBE_TIMEOUT_SECONDS
         try:
-            stream = sd.Stream(
-                device=(input_index, output_index),
-                samplerate=sample_rate_hz,
-                blocksize=0,
-                channels=(1, output_channels),
-                dtype=("int16", "int16"),
-                latency="low",
-                callback=_callback,
-                finished_callback=finished.set,
-            )
-            stream.start()
-            stream_started = True
             while not finished.wait(0.02):
                 if cancel_event is not None and cancel_event.is_set():
                     timed_out_or_cancelled = True

@@ -16,6 +16,7 @@ from ovb_rc003 import (
     ble_transport_winrt,
     identity,
     raw_input_windows,
+    single_instance,
     windows_diagnostics as diag,
 )
 
@@ -477,6 +478,32 @@ class VbCableLoopbackCheckTests(unittest.TestCase):
 
         self.assertEqual(result.status, diag.CheckStatus.FAIL)
         self.assertIn("未能确认", result.detail)
+
+    def test_isolated_bridge_race_fails_before_sending_audio(self):
+        with mock.patch.object(
+            diag,
+            "_run_vb_cable_loopback_in_tempdir",
+            side_effect=single_instance.DuplicateInstanceError("busy"),
+        ):
+            result = diag.check_vb_cable_loopback_isolated(
+                "CABLE Input", "Windows WASAPI"
+            )
+
+        self.assertEqual(result.status, diag.CheckStatus.FAIL)
+        self.assertIn("未发送测试信号", result.detail)
+
+    def test_isolated_mutex_failure_never_claims_a_valid_result(self):
+        with mock.patch.object(
+            diag,
+            "_run_vb_cable_loopback_in_tempdir",
+            side_effect=single_instance.MutexCleanupError("cleanup failed"),
+        ):
+            result = diag.check_vb_cable_loopback_isolated(
+                "CABLE Input", "Windows WASAPI"
+            )
+
+        self.assertEqual(result.status, diag.CheckStatus.FAIL)
+        self.assertIn("结果无效", result.detail)
 
 
 class OutputEndpointResolutionCheckTests(unittest.TestCase):
@@ -1228,6 +1255,49 @@ class AttemptTerminationStepTests(unittest.TestCase):
 
 
 class RunVbCableLoopbackSubprocessTests(unittest.TestCase):
+    def test_tempdir_runner_holds_bridge_exclusion_while_child_runs(self):
+        events = []
+
+        class Guard:
+            def __enter__(self):
+                events.append("enter")
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                events.append("exit")
+
+        expected = diag.CheckResult(
+            "vb_cable_loopback",
+            "VB-CABLE 本地通道",
+            diag.CheckGroup.OPTIONAL_DRIVER,
+            diag.CheckStatus.PASS,
+            "isolated child completed",
+        )
+
+        def _run_child(_command, **_kwargs):
+            events.append("child")
+            return expected
+
+        with mock.patch.object(
+            diag,
+            "build_vb_cable_loopback_subprocess_command",
+            return_value=["child"],
+        ), mock.patch.object(
+            diag,
+            "_run_vb_cable_loopback_subprocess",
+            side_effect=_run_child,
+        ):
+            result = diag._run_vb_cable_loopback_in_tempdir(
+                "CABLE Input",
+                "Windows WASAPI",
+                cancel_event=threading.Event(),
+                timeout=1.0,
+                bridge_guard_factory=Guard,
+            )
+
+        self.assertEqual(result, expected)
+        self.assertEqual(events, ["enter", "child", "exit"])
+
     def test_cancel_event_already_set_never_spawns(self):
         cancel_event = threading.Event()
         cancel_event.set()

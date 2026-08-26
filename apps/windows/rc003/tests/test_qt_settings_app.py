@@ -589,6 +589,22 @@ class SettingsControllerTests(unittest.TestCase):
             settings_ui.LAUNCH_NOT_STARTED_TEXT,
         )
 
+    def test_bridge_refresh_does_not_mistake_active_loopback_guard_for_bridge(self):
+        controller, _ = self._make_controller()
+        qt_settings_app._vb_cable_test_active_event.set()
+        try:
+            with mock.patch.object(
+                qt_settings_app.single_instance,
+                "bridge_instance_running",
+            ) as status_probe:
+                running = controller._refresh_bridge_status()
+        finally:
+            qt_settings_app._vb_cable_test_active_event.clear()
+
+        self.assertFalse(running)
+        self.assertFalse(controller.bridgeRunning)
+        status_probe.assert_not_called()
+
     def test_live_bridge_refresh_recovers_after_an_unknown_initial_state(self):
         self._bridge_status_patch.stop()
         self._bridge_status_patch = mock.patch.object(

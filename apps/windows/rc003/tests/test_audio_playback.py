@@ -503,11 +503,20 @@ class FakeLoopbackSoundDevice:
     CallbackStop = _FakeCallbackStop
     CallbackAbort = _FakeCallbackAbort
 
-    def __init__(self, *, gain=0.7, delay_samples=480, fail_close=False):
+    def __init__(
+        self,
+        *,
+        gain=0.7,
+        delay_samples=480,
+        fail_close=False,
+        fail_start_formats=(),
+    ):
         self.gain = gain
         self.delay_samples = delay_samples
         self.fail_close = fail_close
+        self.fail_start_formats = set(fail_start_formats)
         self.streams = []
+        self.stream_formats = []
         self.last_stream_kwargs = None
         self._devices = [
             {
@@ -543,6 +552,9 @@ class FakeLoopbackSoundDevice:
 
         owner = self
         owner.last_stream_kwargs = kwargs
+        owner.stream_formats.append(
+            (kwargs["samplerate"], kwargs["channels"][1])
+        )
 
         class Stream:
             def __init__(self):
@@ -553,6 +565,11 @@ class FakeLoopbackSoundDevice:
                 self._route_buffer = np.zeros(owner.delay_samples, dtype="int16")
 
             def start(self):
+                if (
+                    kwargs["samplerate"],
+                    kwargs["channels"][1],
+                ) in owner.fail_start_formats:
+                    raise RuntimeError("simulated duplex format failure")
                 callback = kwargs["callback"]
                 output_channels = kwargs["channels"][1]
                 block_frames = 256
@@ -638,6 +655,28 @@ class CableLoopbackProbeTests(unittest.TestCase):
         self.assertEqual(sd.last_stream_kwargs["channels"], (1, 2))
         self.assertEqual(sd.streams[0].stop_calls, 1)
         self.assertEqual(sd.streams[0].close_calls, 1)
+
+    def test_probe_retries_real_duplex_formats_after_start_failure(self):
+        sd = FakeLoopbackSoundDevice(
+            fail_start_formats={(48000, 2), (48000, 1)}
+        )
+        output_endpoint, input_endpoint = self._endpoints()
+
+        result = audio_playback.probe_virtual_cable_loopback(
+            output_endpoint,
+            input_endpoint,
+            sd_module=sd,
+        )
+
+        self.assertTrue(result.detected)
+        self.assertEqual(
+            sd.stream_formats[:3],
+            [(48000, 2), (48000, 1), (44100, 2)],
+        )
+        self.assertEqual(sd.streams[0].close_calls, 1)
+        self.assertEqual(sd.streams[1].close_calls, 1)
+        self.assertEqual(sd.streams[2].stop_calls, 1)
+        self.assertEqual(sd.streams[2].close_calls, 1)
 
     def test_silent_route_returns_an_honest_negative_result(self):
         sd = FakeLoopbackSoundDevice(gain=0.0)

@@ -35,6 +35,7 @@ audio call cannot remain inside the settings interpreter during shutdown.
 
 from __future__ import annotations
 
+import contextlib
 import functools
 import json
 import os
@@ -54,6 +55,7 @@ from . import audio_playback
 from . import ble_transport_winrt
 from . import identity
 from . import raw_input_windows
+from . import single_instance
 
 # Windows 10 version 1809's build number - the lowest build this project's
 # own README/installer already claim as the supported floor (see
@@ -1031,6 +1033,16 @@ def _run_vb_cable_loopback_subprocess(
     return _read_vb_cable_loopback_result(result_path, returncode)
 
 
+def _vb_cable_bridge_exclusion_guard():
+    """Keep bridge startup out while the active audio child owns the route."""
+
+    if sys.platform != "win32":
+        return contextlib.nullcontext()
+    return single_instance.BridgeInstanceGuard(
+        _duplicate_message="the RC003 bridge is already running"
+    )
+
+
 def _discover_ble_candidates_sync(
     *,
     cancel_event: Optional[threading.Event] = None,
@@ -1422,40 +1434,42 @@ def _run_vb_cable_loopback_in_tempdir(
     *,
     cancel_event: threading.Event,
     timeout: float,
+    bridge_guard_factory: Callable[[], object] = _vb_cable_bridge_exclusion_guard,
 ) -> Optional[CheckResult]:
-    result_dir = tempfile.mkdtemp(prefix="ovb-rc003-loopback-diag-")
-    request_path = os.path.join(result_dir, "request.json")
-    result_path = os.path.join(result_dir, "result.json")
-    try:
-        _write_verdict_atomically(
-            request_path,
-            {
-                "saved_output_name": saved_output_name,
-                "saved_output_host_api": saved_output_host_api,
-            },
-        )
-        command = build_vb_cable_loopback_subprocess_command(
-            request_path, result_path
-        )
-        return _run_vb_cable_loopback_subprocess(
-            command,
-            result_path=result_path,
-            cancel_event=cancel_event,
-            timeout=timeout,
-        )
-    finally:
-        original_exc = sys.exc_info()[1]
+    with bridge_guard_factory():
+        result_dir = tempfile.mkdtemp(prefix="ovb-rc003-loopback-diag-")
+        request_path = os.path.join(result_dir, "request.json")
+        result_path = os.path.join(result_dir, "result.json")
         try:
-            shutil.rmtree(result_dir)
-        except FileNotFoundError:
-            pass
-        except OSError as cleanup_exc:
-            if isinstance(
-                original_exc,
-                VbCableLoopbackSubprocessShutdownUnconfirmedError,
-            ):
-                raise original_exc from cleanup_exc
-            raise
+            _write_verdict_atomically(
+                request_path,
+                {
+                    "saved_output_name": saved_output_name,
+                    "saved_output_host_api": saved_output_host_api,
+                },
+            )
+            command = build_vb_cable_loopback_subprocess_command(
+                request_path, result_path
+            )
+            return _run_vb_cable_loopback_subprocess(
+                command,
+                result_path=result_path,
+                cancel_event=cancel_event,
+                timeout=timeout,
+            )
+        finally:
+            original_exc = sys.exc_info()[1]
+            try:
+                shutil.rmtree(result_dir)
+            except FileNotFoundError:
+                pass
+            except OSError as cleanup_exc:
+                if isinstance(
+                    original_exc,
+                    VbCableLoopbackSubprocessShutdownUnconfirmedError,
+                ):
+                    raise original_exc from cleanup_exc
+                raise
 
 
 def check_vb_cable_loopback_isolated(
@@ -1475,6 +1489,25 @@ def check_vb_cable_loopback_isolated(
             saved_output_host_api,
             cancel_event=event,
             timeout=timeout,
+        )
+    except single_instance.DuplicateInstanceError:
+        return CheckResult(
+            "vb_cable_loopback",
+            title,
+            CheckGroup.OPTIONAL_DRIVER,
+            CheckStatus.FAIL,
+            "桥接已经运行或正在启动；本次未发送测试信号，请先停止桥接后重试。",
+        )
+    except (
+        single_instance.SingleInstanceUnavailableError,
+        single_instance.MutexCleanupError,
+    ):
+        return CheckResult(
+            "vb_cable_loopback",
+            title,
+            CheckGroup.OPTIONAL_DRIVER,
+            CheckStatus.FAIL,
+            "无法确认测试与桥接已经互斥；本次结果无效，请关闭设置程序后重试。",
         )
     except VbCableLoopbackCancelledError:
         if event.is_set():
