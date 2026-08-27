@@ -814,6 +814,11 @@ def _run_windows(args: argparse.Namespace) -> int:
     kernel32.GetModuleHandleW.argtypes = [wintypes.LPCWSTR]
     kernel32.GetModuleHandleW.restype = wintypes.HMODULE
     user32.GetForegroundWindow.restype = wintypes.HWND
+    user32.GetWindowThreadProcessId.argtypes = [
+        wintypes.HWND,
+        ctypes.POINTER(wintypes.DWORD),
+    ]
+    user32.GetWindowThreadProcessId.restype = wintypes.DWORD
     user32.GetCursorPos.argtypes = [ctypes.POINTER(wintypes.POINT)]
     user32.GetCursorPos.restype = wintypes.BOOL
     user32.SetCursorPos.argtypes = [ctypes.c_int, ctypes.c_int]
@@ -879,14 +884,12 @@ def _run_windows(args: argparse.Namespace) -> int:
             "SpinnerControl",
         }
     )
-    action_pattern_ids = (
+    direct_action_pattern_ids = (
+        auto.PatternId.ExpandCollapsePattern,
         auto.PatternId.InvokePattern,
         auto.PatternId.TogglePattern,
         auto.PatternId.SelectionItemPattern,
-        auto.PatternId.ExpandCollapsePattern,
-        auto.PatternId.LegacyIAccessiblePattern,
     )
-    direct_action_pattern_ids = action_pattern_ids[:-1]
     wm_getobject = 0x003D
     smto_abortifhung = 0x0002
     accessibility_object_ids = (-25, -4)
@@ -895,6 +898,7 @@ def _run_windows(args: argparse.Namespace) -> int:
     rpc_e_changed_mode = ctypes.c_long(0x80010106).value
     mouseeventf_leftdown = 0x0002
     mouseeventf_leftup = 0x0004
+    awakened_chromium_windows: set[int] = set()
 
     @dataclass
     class RuntimeTarget:
@@ -918,14 +922,21 @@ def _run_windows(args: argparse.Namespace) -> int:
         except Exception:
             return ()
 
-    def supports_any_pattern(control: Any, pattern_ids: Sequence[int]) -> bool:
-        for pattern_id in pattern_ids:
+    def action_pattern_support(control: Any) -> tuple[bool, bool, bool]:
+        for pattern_id in direct_action_pattern_ids:
             try:
                 if control.GetPattern(pattern_id) is not None:
-                    return True
+                    supports_expand = (
+                        pattern_id == auto.PatternId.ExpandCollapsePattern
+                    )
+                    return True, True, supports_expand
             except Exception:
                 continue
-        return False
+        try:
+            legacy = control.GetPattern(auto.PatternId.LegacyIAccessiblePattern)
+        except Exception:
+            legacy = None
+        return legacy is not None, False, False
 
     def runtime_target_from_control(
         control: Any,
@@ -936,36 +947,41 @@ def _run_windows(args: argparse.Namespace) -> int:
     ) -> Optional[RuntimeTarget]:
         try:
             control_type = str(control.ControlTypeName or "")
+            standard = control_type in interactive_types
+            structural = control_type in STRUCTURAL_CONTROL_TYPES
+            if not standard and not structural:
+                return None
+            name = str(control.Name or "").strip()
+            automation_id = str(control.AutomationId or "").strip()
+            if structural and not structural_action_has_identity(
+                control_type, name, automation_id
+            ):
+                return None
             enabled = bool(control.IsEnabled)
             offscreen = bool(control.IsOffscreen)
             rect = rect_from_control(control)
-            name = str(control.Name or "").strip()
-            automation_id = str(control.AutomationId or "").strip()
             valid_size = 16 <= rect.width <= 1800 and 16 <= rect.height <= 1400
-            standard = control_type in interactive_types
-            structural = control_type in STRUCTURAL_CONTROL_TYPES
-            keyboard_focusable = bool(control.IsKeyboardFocusable)
-            action_pattern = supports_any_pattern(control, action_pattern_ids)
-            direct_action_pattern = supports_any_pattern(
-                control, direct_action_pattern_ids
-            )
-            actionable = (
-                standard and (keyboard_focusable or action_pattern)
-            ) or (
-                structural
-                and structural_action_has_identity(
-                    control_type, name, automation_id
-                )
-                and (keyboard_focusable or direct_action_pattern)
-            )
             if not (
-                actionable
-                and enabled
+                enabled
                 and not offscreen
                 and valid_size
                 and not is_navigation_noise(name)
                 and rect.intersects(window_rect)
             ):
+                return None
+            keyboard_focusable = bool(control.IsKeyboardFocusable)
+            (
+                action_pattern,
+                direct_action_pattern,
+                supports_expand,
+            ) = action_pattern_support(control)
+            actionable = (
+                standard and (keyboard_focusable or action_pattern)
+            ) or (
+                structural
+                and (keyboard_focusable or direct_action_pattern)
+            )
+            if not actionable:
                 return None
             return RuntimeTarget(
                 TargetSnapshot(
@@ -977,10 +993,7 @@ def _run_windows(args: argparse.Namespace) -> int:
                     depth=depth,
                     keyboard_focusable=keyboard_focusable,
                     has_action_pattern=action_pattern,
-                    supports_expand=control.GetPattern(
-                        auto.PatternId.ExpandCollapsePattern
-                    )
-                    is not None,
+                    supports_expand=supports_expand,
                     runtime_id=runtime_id_from_control(control),
                     source=source,
                 ),
@@ -1099,6 +1112,11 @@ def _run_windows(args: argparse.Namespace) -> int:
         user32.GetClassNameW(hwnd, buffer, len(buffer))
         return buffer.value
 
+    def window_process_id(hwnd: int) -> int:
+        process_id = wintypes.DWORD()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(process_id))
+        return int(process_id.value)
+
     def activate_embedded_chromium_accessibility(hwnd: int) -> bool:
         """Ask Chromium renderers to publish their UI Automation tree."""
 
@@ -1116,6 +1134,8 @@ def _run_windows(args: argparse.Namespace) -> int:
         )
         if not has_renderer:
             return False
+        if hwnd in awakened_chromium_windows:
+            return True
 
         for handle in handles:
             for object_id in accessibility_object_ids:
@@ -1133,7 +1153,39 @@ def _run_windows(args: argparse.Namespace) -> int:
         # Chromium enables renderer accessibility asynchronously after the
         # probe. A short bounded wait keeps the first scan from racing it.
         time.sleep(0.15)
+        awakened_chromium_windows.add(hwnd)
         return True
+
+    def normalize_runtime_targets(
+        targets: Sequence[RuntimeTarget],
+    ) -> list[RuntimeTarget]:
+        by_rect: dict[Rect, RuntimeTarget] = {}
+        for target in targets:
+            rect = target.snapshot.rect
+            existing = by_rect.get(rect)
+            if existing is None or target_quality_rank(
+                target.snapshot
+            ) > target_quality_rank(existing.snapshot) or (
+                target_quality_rank(target.snapshot)
+                == target_quality_rank(existing.snapshot)
+                and not existing.snapshot.name
+                and bool(target.snapshot.name)
+            ):
+                by_rect[rect] = target
+        normalized = list(by_rect.values())
+        snapshots = [target.snapshot for target in normalized]
+        normalized = [
+            normalized[index]
+            for index in nested_container_keep_indices(snapshots)
+        ]
+        normalized.sort(
+            key=lambda item: (
+                item.snapshot.rect.top,
+                item.snapshot.rect.left,
+                item.snapshot.rect.width * item.snapshot.rect.height,
+            )
+        )
+        return normalized
 
     def collect_targets(
         root: Any,
@@ -1186,16 +1238,7 @@ def _run_windows(args: argparse.Namespace) -> int:
             except Exception:
                 continue
 
-        targets = list(by_rect.values())
-        snapshots = [target.snapshot for target in targets]
-        targets = [targets[index] for index in nested_container_keep_indices(snapshots)]
-        targets.sort(
-            key=lambda item: (
-                item.snapshot.rect.top,
-                item.snapshot.rect.left,
-                item.snapshot.rect.width * item.snapshot.rect.height,
-            )
-        )
+        targets = normalize_runtime_targets(list(by_rect.values()))
         return targets, node_types, visited
 
     def enumerate_targets(
@@ -1369,6 +1412,7 @@ def _run_windows(args: argparse.Namespace) -> int:
 
     class AutomationWorker:
         _PENDING_LIMITS = {
+            "prewarm": 1,
             "move": 2,
             "parent": 1,
             "child": 1,
@@ -1376,7 +1420,10 @@ def _run_windows(args: argparse.Namespace) -> int:
             "back": 1,
             "sync_window": 1,
         }
-        _NAVIGATION_COMMANDS = frozenset(_PENDING_LIMITS)
+        _NAVIGATION_COMMANDS = frozenset(
+            {"move", "parent", "child", "activate", "back", "sync_window"}
+        )
+        _CACHE_TTL_SECONDS = 15.0
 
         def __init__(self) -> None:
             self.commands: queue.Queue[tuple[str, Any, int]] = queue.Queue()
@@ -1397,6 +1444,7 @@ def _run_windows(args: argparse.Namespace) -> int:
             self.window_rect = Rect(0, 0, 0, 0)
             self.window_name = ""
             self.visited = 0
+            self.cache_timestamp = 0.0
             self._thread = threading.Thread(
                 target=self._run,
                 name="element-navigation-uia",
@@ -1519,6 +1567,10 @@ def _run_windows(args: argparse.Namespace) -> int:
             ):
                 hierarchy.insert(0, current)
             self._set_hierarchy(hierarchy, current)
+
+        def _clear_hierarchy(self) -> None:
+            self.hierarchy = []
+            self.hierarchy_index = -1
 
         def _cycle_hierarchy(self, delta: int) -> None:
             if not self.targets or not 0 <= self.selected < len(self.targets):
@@ -1680,12 +1732,12 @@ def _run_windows(args: argparse.Namespace) -> int:
             )
             self._enumerate(self.hwnd)
             self._apply_targets(restore=previous)
-            self._reset_hierarchy_for_selected()
+            self._clear_hierarchy()
             self.events.put(("geometry_rescanned", None))
             self._emit_selection()
             return True
 
-        def _enumerate(self, hwnd: int) -> None:
+        def _enumerate(self, hwnd: int, activate_context: bool = True) -> None:
             (
                 self.all_targets,
                 self.node_types,
@@ -1695,7 +1747,52 @@ def _run_windows(args: argparse.Namespace) -> int:
             ) = enumerate_targets(hwnd)
             self.hwnd = hwnd
             self.invalid_targets.clear()
-            self.context_valid = True
+            self.context_valid = activate_context
+            self.cache_timestamp = time.perf_counter()
+
+        def _cache_is_reusable(self, hwnd: int) -> bool:
+            if (
+                hwnd != self.hwnd
+                or not self.all_targets
+                or time.perf_counter() - self.cache_timestamp
+                > self._CACHE_TTL_SECONDS
+            ):
+                return False
+            try:
+                root = auto.ControlFromHandle(hwnd)
+                if root is None or rect_from_control(root) != self.window_rect:
+                    return False
+            except Exception:
+                return False
+            for index in geometry_anchor_indices(
+                len(self.all_targets), len(self.all_targets) // 2
+            ):
+                target = self.all_targets[index]
+                if target.control is None:
+                    continue
+                try:
+                    if bool(target.control.IsOffscreen):
+                        return False
+                    if rect_from_control(target.control) != target.snapshot.rect:
+                        return False
+                except Exception:
+                    return False
+            return True
+
+        def _prewarm(self, hwnd: int) -> None:
+            if hwnd <= 0 or self._cache_is_reusable(hwnd):
+                return
+            started = time.perf_counter()
+            self._enumerate(hwnd, activate_context=False)
+            self.events.put(
+                (
+                    "prewarm_done",
+                    {
+                        "window": self.window_name,
+                        "elapsed": time.perf_counter() - started,
+                    },
+                )
+            )
 
         def _apply_targets(
             self,
@@ -1737,7 +1834,7 @@ def _run_windows(args: argparse.Namespace) -> int:
                     self._invalidate_navigation("页面内容已经滚动或重新排版")
                     return
                 self.selected = next_index
-                self._reset_hierarchy_for_selected()
+                self._clear_hierarchy()
                 self._emit_selection()
                 return
 
@@ -1759,7 +1856,12 @@ def _run_windows(args: argparse.Namespace) -> int:
         def _scan(self, hwnd: int) -> None:
             started = time.perf_counter()
             point = cursor_point()
-            self._enumerate(hwnd)
+            used_cache = self._cache_is_reusable(hwnd)
+            if used_cache:
+                self.context_valid = True
+                self.invalid_targets.clear()
+            else:
+                self._enumerate(hwnd)
             hierarchy = (
                 point_hierarchy_targets(point, self.window_rect, self.all_targets)
                 if point is not None and self.window_rect.contains_point(point)
@@ -1793,6 +1895,7 @@ def _run_windows(args: argparse.Namespace) -> int:
                         "hierarchy_index": self.hierarchy_index,
                         "hierarchy_count": len(self.hierarchy),
                         "elapsed": elapsed,
+                        "used_cache": used_cache,
                     },
                 )
             )
@@ -1826,13 +1929,8 @@ def _run_windows(args: argparse.Namespace) -> int:
                 for existing in self.all_targets
                 if not path_is_in_branch(existing.snapshot.path, branch_path)
             ]
-            self.all_targets.extend(branch_targets)
-            self.all_targets.sort(
-                key=lambda item: (
-                    item.snapshot.rect.top,
-                    item.snapshot.rect.left,
-                    item.snapshot.rect.width * item.snapshot.rect.height,
-                )
+            self.all_targets = normalize_runtime_targets(
+                [*self.all_targets, *branch_targets]
             )
             self.node_types = {
                 path: control_type
@@ -1843,6 +1941,34 @@ def _run_windows(args: argparse.Namespace) -> int:
             self.visited = visited
             self.invalid_targets.clear()
             return True
+
+        def _refresh_cached_geometry(self) -> bool:
+            refreshed: list[RuntimeTarget] = []
+            for target in self.all_targets:
+                if target.control is None:
+                    if target.snapshot.rect.intersects(self.window_rect):
+                        refreshed.append(target)
+                    continue
+                try:
+                    if not bool(target.control.IsEnabled) or bool(
+                        target.control.IsOffscreen
+                    ):
+                        continue
+                    live_rect = rect_from_control(target.control)
+                except Exception:
+                    continue
+                if (
+                    live_rect.width < 16
+                    or live_rect.height < 16
+                    or not live_rect.intersects(self.window_rect)
+                ):
+                    continue
+                if live_rect != target.snapshot.rect:
+                    target.snapshot = replace(target.snapshot, rect=live_rect)
+                target.click_point = None
+                refreshed.append(target)
+            self.all_targets = normalize_runtime_targets(refreshed)
+            return bool(self.all_targets)
 
         def _refresh_after_expand(
             self,
@@ -1873,11 +1999,14 @@ def _run_windows(args: argparse.Namespace) -> int:
                 )
                 if changed_as_expected:
                     break
+            if refresh_method == "branch" and not self._refresh_cached_geometry():
+                self._enumerate(self.hwnd)
+                refresh_method = "full"
             self._apply_targets(restore=previous)
             if not self.targets or self.selected < 0:
                 self._emit_selection()
                 return refresh_method
-            self._reset_hierarchy_for_selected()
+            self._clear_hierarchy()
             self._emit_selection()
             return refresh_method
 
@@ -1886,7 +2015,7 @@ def _run_windows(args: argparse.Namespace) -> int:
             self.events.put(("target_skipped", target.snapshot))
             self._enumerate(self.hwnd)
             self._apply_targets(restore=target.snapshot)
-            self._reset_hierarchy_for_selected()
+            self._clear_hierarchy()
             self._emit_selection()
 
         def _activate(self) -> None:
@@ -1969,6 +2098,8 @@ def _run_windows(args: argparse.Namespace) -> int:
                             return
                         if command == "scan":
                             self._scan(int(value))
+                        elif command == "prewarm":
+                            self._prewarm(int(value))
                         elif (
                             command == "move"
                             and self.context_valid
@@ -2290,6 +2421,7 @@ def _run_windows(args: argparse.Namespace) -> int:
 
     app = QApplication(sys.argv[:1])
     app.setApplicationName("Remote Mic Element Navigation Prototype")
+    prototype_process_id = int(kernel32.GetCurrentProcessId())
     overlay = NavigationOverlay()
     worker = AutomationWorker()
     worker.start()
@@ -2297,6 +2429,8 @@ def _run_windows(args: argparse.Namespace) -> int:
     active = threading.Event()
     scanning = False
     shutting_down = False
+    prewarm_hwnd = 0
+    prewarm_requested_at = 0.0
 
     def enqueue_keyboard_action(action: str) -> None:
         keyboard_events.put(action)
@@ -2362,6 +2496,7 @@ def _run_windows(args: argparse.Namespace) -> int:
                     f"全部 {payload['all_count']} 个，"
                     f"访问 {payload['visited']} 个节点，耗时 {payload['elapsed']:.2f}s，"
                     f"命中 {payload['hit_source']} / {payload['hierarchy_count']} 层"
+                    f"{'，使用预热缓存' if payload['used_cache'] else ''}"
                 )
                 if selected < 0:
                     leave_navigation()
@@ -2409,6 +2544,10 @@ def _run_windows(args: argparse.Namespace) -> int:
             elif event == "navigation_invalidated":
                 print(f"导航已暂停: {payload}，请重新按 Ctrl+Alt+N。")
                 leave_navigation()
+            elif event == "prewarm_done":
+                print(
+                    f"已预识别 {payload['window']}，耗时 {payload['elapsed']:.2f}s。"
+                )
             elif event == "target_skipped":
                 print(
                     f"已跳过当前无法命中的元素: "
@@ -2424,10 +2563,28 @@ def _run_windows(args: argparse.Namespace) -> int:
     timer.start(20)
 
     def monitor_navigation_context() -> None:
-        if not active.is_set():
-            return
+        nonlocal prewarm_hwnd, prewarm_requested_at
         foreground = int(user32.GetForegroundWindow())
-        if worker.hwnd and foreground != worker.hwnd:
+        if not active.is_set():
+            if scanning or foreground <= 0:
+                return
+            if window_process_id(foreground) == prototype_process_id:
+                return
+            now = time.perf_counter()
+            if (
+                foreground != prewarm_hwnd
+                or now - prewarm_requested_at
+                >= AutomationWorker._CACHE_TTL_SECONDS
+            ):
+                prewarm_hwnd = foreground
+                prewarm_requested_at = now
+                worker.post("prewarm", foreground)
+            return
+        if (
+            worker.hwnd
+            and foreground != worker.hwnd
+            and window_process_id(foreground) != prototype_process_id
+        ):
             print("导航已暂停: 已切换到其它窗口，请重新按 Ctrl+Alt+N。")
             leave_navigation()
             return
