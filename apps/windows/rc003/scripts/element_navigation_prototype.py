@@ -120,6 +120,26 @@ class TargetSnapshot:
     supports_expand: bool = False
 
 
+def physical_screen_rect(logical_rect: Rect, device_pixel_ratio: float) -> Rect:
+    return Rect(
+        logical_rect.left,
+        logical_rect.top,
+        logical_rect.left + round(logical_rect.width * device_pixel_ratio),
+        logical_rect.top + round(logical_rect.height * device_pixel_ratio),
+    )
+
+
+def physical_to_screen_logical_rect(
+    target: Rect, physical_screen: Rect, device_pixel_ratio: float
+) -> Rect:
+    return Rect(
+        round((target.left - physical_screen.left) / device_pixel_ratio),
+        round((target.top - physical_screen.top) / device_pixel_ratio),
+        round((target.right - physical_screen.left) / device_pixel_ratio),
+        round((target.bottom - physical_screen.top) / device_pixel_ratio),
+    )
+
+
 def _axis_gap(a_start: int, a_end: int, b_start: int, b_end: int) -> int:
     if b_start > a_end:
         return b_start - a_end
@@ -475,6 +495,13 @@ def _parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
 
 
 def _run_windows(args: argparse.Namespace) -> int:
+    # uiautomation opts into legacy system-DPI awareness during import. Set
+    # per-monitor v2 first so Qt and UIA agree on mixed-DPI screen coordinates.
+    dpi_user32 = ctypes.windll.user32
+    dpi_user32.SetProcessDpiAwarenessContext.argtypes = [ctypes.c_void_p]
+    dpi_user32.SetProcessDpiAwarenessContext.restype = ctypes.c_bool
+    dpi_user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4))
+
     import uiautomation as auto
     from ctypes import wintypes
     from PySide6.QtCore import Qt, QRect, QTimer
@@ -1038,9 +1065,10 @@ def _run_windows(args: argparse.Namespace) -> int:
     class NavigationOverlay(QWidget):
         def __init__(self) -> None:
             super().__init__()
-            self._desktop = self._virtual_desktop()
             self._target: Optional[TargetSnapshot] = None
             self._position = ""
+            self._physical_screen = Rect(0, 0, 1, 1)
+            self._device_pixel_ratio = 1.0
             self.setWindowFlags(
                 Qt.WindowType.Tool
                 | Qt.WindowType.FramelessWindowHint
@@ -1051,21 +1079,47 @@ def _run_windows(args: argparse.Namespace) -> int:
             self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
             self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
             self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
-            self.setGeometry(self._desktop)
 
         @staticmethod
-        def _virtual_desktop() -> QRect:
-            screens = QGuiApplication.screens()
-            geometry = screens[0].geometry()
-            for screen in screens[1:]:
-                geometry = geometry.united(screen.geometry())
-            return geometry
+        def _screen_rects() -> list[tuple[Any, Rect]]:
+            result = []
+            for screen in QGuiApplication.screens():
+                geometry = screen.geometry()
+                logical = Rect(
+                    geometry.left(),
+                    geometry.top(),
+                    geometry.right() + 1,
+                    geometry.bottom() + 1,
+                )
+                result.append(
+                    (
+                        screen,
+                        physical_screen_rect(logical, screen.devicePixelRatio()),
+                    )
+                )
+            return result
+
+        def _position_for_target(self, target: Rect) -> None:
+            center = (round(target.center_x), round(target.center_y))
+            screens = self._screen_rects()
+            screen, physical = next(
+                (
+                    item
+                    for item in screens
+                    if item[1].contains_point(center)
+                ),
+                screens[0],
+            )
+            self._physical_screen = physical
+            self._device_pixel_ratio = float(screen.devicePixelRatio())
+            self.setGeometry(screen.geometry())
 
         def show_target(
             self, target: TargetSnapshot, selected: int, count: int
         ) -> None:
             self._target = target
             self._position = f"{selected + 1}/{count}  {target.name or target.control_type}"
+            self._position_for_target(target.rect)
             self.show()
             self.raise_()
             self.update()
@@ -1077,10 +1131,14 @@ def _run_windows(args: argparse.Namespace) -> int:
         def paintEvent(self, _event: Any) -> None:
             if self._target is None:
                 return
-            target = self._target.rect
+            target = physical_to_screen_logical_rect(
+                self._target.rect,
+                self._physical_screen,
+                self._device_pixel_ratio,
+            )
             local = QRect(
-                target.left - self._desktop.left(),
-                target.top - self._desktop.top(),
+                target.left,
+                target.top,
                 target.width,
                 target.height,
             )

@@ -32,6 +32,28 @@ class SpatialNavigationTests(unittest.TestCase):
             prototype.direction_score(current, left, prototype.Direction.RIGHT)
         )
 
+    def test_maps_physical_uia_rect_to_scaled_qt_screen(self):
+        logical_screen = prototype.Rect(0, 0, 2560, 1440)
+        physical_screen = prototype.physical_screen_rect(logical_screen, 1.5)
+        self.assertEqual(physical_screen, prototype.Rect(0, 0, 3840, 2160))
+        self.assertEqual(
+            prototype.physical_to_screen_logical_rect(
+                prototype.Rect(1500, 450, 1800, 600), physical_screen, 1.5
+            ),
+            prototype.Rect(1000, 300, 1200, 400),
+        )
+
+    def test_keeps_physical_origin_for_unscaled_secondary_screen(self):
+        logical_screen = prototype.Rect(3840, 0, 5760, 1200)
+        physical_screen = prototype.physical_screen_rect(logical_screen, 1.0)
+        self.assertEqual(physical_screen, logical_screen)
+        self.assertEqual(
+            prototype.physical_to_screen_logical_rect(
+                prototype.Rect(4000, 100, 4200, 200), physical_screen, 1.0
+            ),
+            prototype.Rect(160, 100, 360, 200),
+        )
+
     def test_prefers_same_row_over_closer_diagonal_target(self):
         targets = [
             self.target(100, 100, 160, 140, "current"),
