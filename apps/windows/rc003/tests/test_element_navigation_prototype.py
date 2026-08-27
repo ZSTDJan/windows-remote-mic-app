@@ -1,4 +1,5 @@
 import importlib.util
+import random
 import sys
 import unittest
 from pathlib import Path
@@ -126,6 +127,85 @@ class SpatialNavigationTests(unittest.TestCase):
             prototype.next_target_index(targets, 0, prototype.Direction.RIGHT),
             2,
         )
+
+    def test_horizontal_wrap_rejects_overlapping_rows(self):
+        targets = [
+            self.target(300, 100, 500, 200, "upper right", path=(0, 1, 0)),
+            self.target(200, 180, 400, 240, "lower left", path=(0, 1, 1)),
+        ]
+        self.assertEqual(
+            prototype.next_target_index(targets, 0, prototype.Direction.RIGHT),
+            0,
+        )
+
+    def test_repeated_direction_never_cycles_in_irregular_layouts(self):
+        generator = random.Random(827)
+        for _case in range(40):
+            targets = []
+            for index in range(generator.randint(2, 35)):
+                left = generator.randint(0, 1600)
+                top = generator.randint(0, 900)
+                width = generator.randint(24, 260)
+                height = generator.randint(20, 100)
+                targets.append(
+                    self.target(
+                        left,
+                        top,
+                        left + width,
+                        top + height,
+                        str(index),
+                        path=(0, generator.randint(0, 4), index),
+                    )
+                )
+            graph = prototype.NavigationGraph(targets)
+            for start in (0, len(targets) // 2, len(targets) - 1):
+                for direction in prototype.Direction:
+                    traversal = prototype.NavigationTraversal()
+                    seen = {start}
+                    current = start
+                    for _step in range(len(targets) + 1):
+                        candidates = traversal.available(
+                            current,
+                            direction,
+                            graph.candidates(current, direction),
+                        )
+                        if not candidates:
+                            break
+                        current = candidates[0]
+                        self.assertNotIn(current, seen)
+                        seen.add(current)
+                        traversal.commit(current)
+
+    def test_changing_direction_allows_returning_to_previous_target(self):
+        targets = [
+            self.target(20, 20, 80, 60, "left"),
+            self.target(120, 20, 180, 60, "right"),
+        ]
+        graph = prototype.NavigationGraph(targets)
+        traversal = prototype.NavigationTraversal()
+        right = traversal.available(
+            0,
+            prototype.Direction.RIGHT,
+            graph.candidates(0, prototype.Direction.RIGHT),
+        )[0]
+        traversal.commit(right)
+        left = traversal.available(
+            right,
+            prototype.Direction.LEFT,
+            graph.candidates(right, prototype.Direction.LEFT),
+        )[0]
+        self.assertEqual((right, left), (1, 0))
+
+    def test_immediate_opposite_direction_prioritizes_the_previous_target(self):
+        traversal = prototype.NavigationTraversal()
+        right = traversal.available(
+            0, prototype.Direction.RIGHT, (1, 2)
+        )[0]
+        traversal.commit(right)
+        left_candidates = traversal.available(
+            right, prototype.Direction.LEFT, (2, 0)
+        )
+        self.assertEqual(left_candidates, (0, 2))
 
     def test_repeated_right_does_not_loop_from_folder_back_to_header_actions(self):
         targets = [
@@ -295,6 +375,63 @@ class SpatialNavigationTests(unittest.TestCase):
         self.assertEqual(shifted.rect, prototype.Rect(130, 80, 190, 120))
         self.assertEqual(shifted.runtime_id, (7, 8, 9))
         self.assertEqual(shifted.source, "uia-point")
+
+    def test_repeated_names_at_different_positions_are_not_the_same_target(self):
+        first = self.target(100, 100, 180, 140, "复制")
+        second = self.target(300, 100, 380, 140, "复制")
+        self.assertFalse(prototype.same_target_identity(first, second))
+        self.assertTrue(prototype.same_target_identity(first, first))
+
+    def test_runtime_id_remains_the_strongest_target_identity(self):
+        first = self.target(
+            100, 100, 180, 140, "old", runtime_id=(1, 2, 3)
+        )
+        moved = self.target(
+            500, 400, 580, 440, "new", runtime_id=(1, 2, 3)
+        )
+        self.assertTrue(prototype.same_target_identity(first, moved))
+
+    def test_native_handle_treats_missing_foreground_as_zero(self):
+        self.assertEqual(prototype.native_handle_value(None), 0)
+        self.assertEqual(prototype.native_handle_value(1234), 1234)
+
+    def test_prewarm_runs_once_after_the_foreground_is_stable(self):
+        self.assertFalse(
+            prototype.prewarm_request_due(7, 7, 10.0, 0, 10.5)
+        )
+        self.assertTrue(
+            prototype.prewarm_request_due(7, 7, 10.0, 0, 10.8)
+        )
+        self.assertFalse(
+            prototype.prewarm_request_due(7, 7, 10.0, 7, 30.0)
+        )
+
+    def test_scan_budget_can_be_cancelled_or_expire(self):
+        self.assertTrue(prototype.scan_should_stop(None, lambda: True, now=1.0))
+        self.assertTrue(prototype.scan_should_stop(1.0, None, now=1.0))
+        self.assertFalse(prototype.scan_should_stop(2.0, None, now=1.0))
+
+    def test_branch_refresh_waits_for_one_stable_observation(self):
+        observed, stable = prototype.branch_refresh_progress(
+            2, 2, 5, True, False
+        )
+        self.assertTrue(observed)
+        self.assertFalse(stable)
+        observed, stable = prototype.branch_refresh_progress(
+            2, 5, 5, True, observed
+        )
+        self.assertTrue(stable)
+
+    def test_collapsed_branch_waits_for_one_stable_observation(self):
+        observed, stable = prototype.branch_refresh_progress(
+            5, 5, 2, False, False
+        )
+        self.assertTrue(observed)
+        self.assertFalse(stable)
+        observed, stable = prototype.branch_refresh_progress(
+            5, 2, 2, False, observed
+        )
+        self.assertTrue(stable)
 
     def test_target_probe_points_cover_sparse_left_content(self):
         rect = prototype.Rect(40, 100, 540, 150)

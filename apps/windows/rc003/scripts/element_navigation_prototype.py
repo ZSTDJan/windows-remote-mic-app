@@ -23,7 +23,7 @@ import sys
 import threading
 import time
 from collections import deque
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import Any, Callable, Optional, Sequence
 
@@ -68,6 +68,7 @@ LIST_CONTAINER_TYPES = frozenset(
 ITEM_CONTAINER_TYPES = frozenset({"ListItemControl", "TreeItemControl"})
 SEMANTIC_BYPASS_MAX_WIDTH = 180
 SEMANTIC_BYPASS_MAX_HEIGHT = 96
+PREWARM_STABILITY_SECONDS = 0.75
 
 
 class Direction(str, Enum):
@@ -292,6 +293,7 @@ def horizontal_wrap_target_indices(
                 vertical_delta < minimum_row_delta
                 or current.rect.center_x - candidate.rect.center_x
                 < minimum_horizontal_reset
+                or candidate.rect.top < current.rect.bottom
             ):
                 continue
             row_gap = max(0, candidate.rect.top - current.rect.bottom)
@@ -301,6 +303,7 @@ def horizontal_wrap_target_indices(
                 vertical_delta > -minimum_row_delta
                 or candidate.rect.center_x - current.rect.center_x
                 < minimum_horizontal_reset
+                or candidate.rect.bottom > current.rect.top
             ):
                 continue
             row_gap = max(0, current.rect.top - candidate.rect.bottom)
@@ -452,6 +455,57 @@ class NavigationGraph:
         return ranked
 
 
+@dataclass
+class NavigationTraversal:
+    direction: Optional[Direction] = None
+    visited: set[int] = field(default_factory=set)
+    last_from: Optional[int] = None
+    last_to: Optional[int] = None
+    last_direction: Optional[Direction] = None
+    pending_from: Optional[int] = None
+    pending_direction: Optional[Direction] = None
+
+    def reset(self) -> None:
+        self.direction = None
+        self.visited.clear()
+        self.last_from = None
+        self.last_to = None
+        self.last_direction = None
+        self.pending_from = None
+        self.pending_direction = None
+
+    def available(
+        self,
+        current_index: int,
+        direction: Direction,
+        candidates: Sequence[int],
+    ) -> tuple[int, ...]:
+        if direction != self.direction:
+            self.direction = direction
+            self.visited = {current_index}
+        else:
+            self.visited.add(current_index)
+        ranked = tuple(candidates)
+        if (
+            self.last_direction is not None
+            and direction == OPPOSITE_DIRECTION[self.last_direction]
+            and current_index == self.last_to
+            and self.last_from is not None
+        ):
+            ranked = (self.last_from,) + tuple(
+                index for index in ranked if index != self.last_from
+            )
+        self.pending_from = current_index
+        self.pending_direction = direction
+        return tuple(index for index in ranked if index not in self.visited)
+
+    def commit(self, selected_index: int) -> None:
+        self.last_from = self.pending_from
+        self.last_to = selected_index
+        self.last_direction = self.pending_direction
+        self.visited.add(selected_index)
+
+
 def geometry_anchor_indices(count: int, selected: int) -> list[int]:
     if count <= 0:
         return []
@@ -470,6 +524,73 @@ def shifted_snapshot(target: TargetSnapshot, delta_x: int, delta_y: int) -> Targ
             rect.bottom + delta_y,
         ),
     )
+
+
+def same_target_identity(first: TargetSnapshot, second: TargetSnapshot) -> bool:
+    if first.runtime_id and second.runtime_id:
+        return first.runtime_id == second.runtime_id
+    return first.control_type == second.control_type and first.rect == second.rect
+
+
+def native_handle_value(handle: Any) -> int:
+    return int(handle or 0)
+
+
+def configure_standard_streams() -> None:
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        try:
+            reconfigure(encoding="utf-8", errors="backslashreplace")
+        except (OSError, ValueError):
+            continue
+
+
+def prewarm_request_due(
+    foreground_hwnd: int,
+    observed_hwnd: int,
+    observed_since: float,
+    requested_hwnd: int,
+    now: float,
+    stability_seconds: float = PREWARM_STABILITY_SECONDS,
+) -> bool:
+    return bool(
+        foreground_hwnd > 0
+        and foreground_hwnd == observed_hwnd
+        and foreground_hwnd != requested_hwnd
+        and now - observed_since >= stability_seconds
+    )
+
+
+def scan_should_stop(
+    deadline: Optional[float],
+    should_cancel: Optional[Callable[[], bool]],
+    now: Optional[float] = None,
+) -> bool:
+    if should_cancel is not None and should_cancel():
+        return True
+    return bool(
+        deadline is not None
+        and (time.perf_counter() if now is None else now) >= deadline
+    )
+
+
+def branch_refresh_progress(
+    previous_count: int,
+    last_count: int,
+    current_count: int,
+    expanding: bool,
+    observed_expected_change: bool,
+) -> tuple[bool, bool]:
+    changed_as_expected = (
+        current_count > previous_count
+        if expanding
+        else current_count < previous_count
+    )
+    observed_expected_change = observed_expected_change or changed_as_expected
+    stable = observed_expected_change and current_count == last_count
+    return observed_expected_change, stable
 
 
 def target_probe_points(rect: Rect) -> list[tuple[int, int]]:
@@ -1218,13 +1339,24 @@ def _run_windows(args: argparse.Namespace) -> int:
         root_path: tuple[int, ...],
         root_depth: int,
         max_relative_depth: int,
-    ) -> tuple[list[RuntimeTarget], dict[tuple[int, ...], str], int]:
+        deadline: Optional[float] = None,
+        should_cancel: Optional[Callable[[], bool]] = None,
+    ) -> tuple[
+        list[RuntimeTarget],
+        dict[tuple[int, ...], str],
+        int,
+        bool,
+    ]:
         pending = deque([(root, 0, root_path)])
         by_rect: dict[Rect, RuntimeTarget] = {}
         node_types: dict[tuple[int, ...], str] = {}
         visited = 0
+        interrupted = False
 
         while pending and visited < args.max_nodes and len(by_rect) < args.max_elements:
+            if scan_should_stop(deadline, should_cancel):
+                interrupted = True
+                break
             control, relative_depth, path = pending.popleft()
             visited += 1
             try:
@@ -1264,16 +1396,19 @@ def _run_windows(args: argparse.Namespace) -> int:
                 continue
 
         targets = normalize_runtime_targets(list(by_rect.values()))
-        return targets, node_types, visited
+        return targets, node_types, visited, interrupted
 
     def enumerate_targets(
         hwnd: int,
+        deadline: Optional[float] = None,
+        should_cancel: Optional[Callable[[], bool]] = None,
     ) -> tuple[
         list[RuntimeTarget],
         dict[tuple[int, ...], str],
         Rect,
         str,
         int,
+        bool,
     ]:
         has_chromium_renderer = activate_embedded_chromium_accessibility(hwnd)
         scan_depth = effective_scan_depth(args.max_depth, has_chromium_renderer)
@@ -1282,14 +1417,23 @@ def _run_windows(args: argparse.Namespace) -> int:
             raise RuntimeError("无法从当前窗口建立 UI Automation 根元素")
         window_rect = rect_from_control(root)
         window_name = str(root.Name or "未命名窗口")
-        targets, node_types, visited = collect_targets(
+        targets, node_types, visited, interrupted = collect_targets(
             root,
             window_rect,
             (),
             0,
             scan_depth,
+            deadline=deadline,
+            should_cancel=should_cancel,
         )
-        return targets, node_types, window_rect, window_name, visited
+        return (
+            targets,
+            node_types,
+            window_rect,
+            window_name,
+            visited,
+            interrupted,
+        )
 
     def focused_rect() -> Optional[Rect]:
         try:
@@ -1437,6 +1581,7 @@ def _run_windows(args: argparse.Namespace) -> int:
 
     class AutomationWorker:
         _PENDING_LIMITS = {
+            "scan": 1,
             "prewarm": 1,
             "move": 2,
             "parent": 1,
@@ -1449,17 +1594,20 @@ def _run_windows(args: argparse.Namespace) -> int:
             {"move", "parent", "child", "activate", "back", "sync_window"}
         )
         _CACHE_TTL_SECONDS = 15.0
+        _PREWARM_BUDGET_SECONDS = 1.5
 
         def __init__(self) -> None:
             self.commands: queue.Queue[tuple[str, Any, int]] = queue.Queue()
             self.events: queue.Queue[tuple[str, Any]] = queue.Queue()
             self._post_lock = threading.Lock()
+            self._scan_requested = threading.Event()
             self._generation = 0
             self._pending_counts: dict[str, int] = {}
             self.context_valid = False
             self.all_targets: list[RuntimeTarget] = []
             self.targets: list[RuntimeTarget] = []
             self.navigation_graph = NavigationGraph(())
+            self.traversal = NavigationTraversal()
             self.node_types: dict[tuple[int, ...], str] = {}
             self.hierarchy: list[RuntimeTarget] = []
             self.hierarchy_index = -1
@@ -1487,6 +1635,8 @@ def _run_windows(args: argparse.Namespace) -> int:
                     if pending >= limit:
                         return
                     self._pending_counts[command] = pending + 1
+                if command == "scan":
+                    self._scan_requested.set()
                 generation = self._generation
             self.commands.put((command, value, generation))
 
@@ -1501,21 +1651,7 @@ def _run_windows(args: argparse.Namespace) -> int:
 
         @staticmethod
         def _same_identity(first: TargetSnapshot, second: TargetSnapshot) -> bool:
-            if first.runtime_id and second.runtime_id:
-                return first.runtime_id == second.runtime_id
-            if (
-                first.automation_id
-                and first.automation_id == second.automation_id
-                and first.control_type == second.control_type
-            ):
-                return True
-            if (
-                first.name
-                and first.name == second.name
-                and first.control_type == second.control_type
-            ):
-                return True
-            return first.control_type == second.control_type and first.rect == second.rect
+            return same_target_identity(first, second)
 
         @staticmethod
         def _identity_token(target: TargetSnapshot) -> tuple[Any, ...]:
@@ -1549,6 +1685,7 @@ def _run_windows(args: argparse.Namespace) -> int:
             self.navigation_graph = NavigationGraph(
                 [target.snapshot for target in self.targets]
             )
+            self.traversal.reset()
 
         def _set_hierarchy(
             self,
@@ -1616,6 +1753,7 @@ def _run_windows(args: argparse.Namespace) -> int:
                 return
             self.hierarchy_index = next_index
             self._select_target(self.hierarchy[next_index])
+            self.traversal.reset()
             self._emit_selection()
 
         def _target_is_exposed(
@@ -1762,18 +1900,34 @@ def _run_windows(args: argparse.Namespace) -> int:
             self._emit_selection()
             return True
 
-        def _enumerate(self, hwnd: int, activate_context: bool = True) -> None:
+        def _enumerate(
+            self,
+            hwnd: int,
+            activate_context: bool = True,
+            deadline: Optional[float] = None,
+            should_cancel: Optional[Callable[[], bool]] = None,
+        ) -> bool:
+            result = enumerate_targets(
+                hwnd,
+                deadline=deadline,
+                should_cancel=should_cancel,
+            )
+            interrupted = result[-1]
+            if interrupted:
+                return False
             (
                 self.all_targets,
                 self.node_types,
                 self.window_rect,
                 self.window_name,
                 self.visited,
-            ) = enumerate_targets(hwnd)
+                _interrupted,
+            ) = result
             self.hwnd = hwnd
             self.invalid_targets.clear()
             self.context_valid = activate_context
             self.cache_timestamp = time.perf_counter()
+            return True
 
         def _cache_is_reusable(self, hwnd: int) -> bool:
             if (
@@ -1808,7 +1962,21 @@ def _run_windows(args: argparse.Namespace) -> int:
             if hwnd <= 0 or self._cache_is_reusable(hwnd):
                 return
             started = time.perf_counter()
-            self._enumerate(hwnd, activate_context=False)
+            cached = self._enumerate(
+                hwnd,
+                activate_context=False,
+                deadline=started + self._PREWARM_BUDGET_SECONDS,
+                should_cancel=self._scan_requested.is_set,
+            )
+            if not cached:
+                if not self._scan_requested.is_set():
+                    self.events.put(
+                        (
+                            "prewarm_skipped",
+                            {"elapsed": time.perf_counter() - started},
+                        )
+                    )
+                return
             self.events.put(
                 (
                     "prewarm_done",
@@ -1843,9 +2011,12 @@ def _run_windows(args: argparse.Namespace) -> int:
         def _move(self, direction: Direction) -> None:
             if not self._sync_window_geometry():
                 return
-            for next_index in self.navigation_graph.candidates(
-                self.selected, direction
-            ):
+            candidates = self.traversal.available(
+                self.selected,
+                direction,
+                self.navigation_graph.candidates(self.selected, direction),
+            )
+            for next_index in candidates:
                 target = self.targets[next_index]
                 token = self._identity_token(target.snapshot)
                 if token in self.invalid_targets:
@@ -1859,6 +2030,7 @@ def _run_windows(args: argparse.Namespace) -> int:
                     self._invalidate_navigation("页面内容已经滚动或重新排版")
                     return
                 self.selected = next_index
+                self.traversal.commit(next_index)
                 self._clear_hierarchy()
                 self._emit_selection()
                 return
@@ -1939,7 +2111,12 @@ def _run_windows(args: argparse.Namespace) -> int:
                 return False
 
             branch_path = target.snapshot.path[:-1]
-            branch_targets, branch_node_types, visited = collect_targets(
+            (
+                branch_targets,
+                branch_node_types,
+                visited,
+                _interrupted,
+            ) = collect_targets(
                 parent,
                 self.window_rect,
                 branch_path,
@@ -2007,7 +2184,9 @@ def _run_windows(args: argparse.Namespace) -> int:
                 for existing in self.all_targets
             )
             refresh_method = "branch"
-            for delay in (0.04, 0.05, 0.07):
+            last_count = previous_count
+            observed_expected_change = False
+            for delay in (0.04, 0.05, 0.06):
                 time.sleep(delay)
                 if not self._refresh_branch(target):
                     self._enumerate(self.hwnd)
@@ -2017,12 +2196,18 @@ def _run_windows(args: argparse.Namespace) -> int:
                     path_is_in_branch(existing.snapshot.path, branch_path)
                     for existing in self.all_targets
                 )
-                changed_as_expected = (
-                    current_count > previous_count
-                    if expanding
-                    else current_count < previous_count
+                (
+                    observed_expected_change,
+                    stable,
+                ) = branch_refresh_progress(
+                    previous_count,
+                    last_count,
+                    current_count,
+                    expanding,
+                    observed_expected_change,
                 )
-                if changed_as_expected:
+                last_count = current_count
+                if stable:
                     break
             if refresh_method == "branch" and not self._refresh_cached_geometry():
                 self._enumerate(self.hwnd)
@@ -2122,6 +2307,7 @@ def _run_windows(args: argparse.Namespace) -> int:
                         if command == "stop":
                             return
                         if command == "scan":
+                            self._scan_requested.clear()
                             self._scan(int(value))
                         elif command == "prewarm":
                             self._prewarm(int(value))
@@ -2148,7 +2334,12 @@ def _run_windows(args: argparse.Namespace) -> int:
                         elif command == "sync_window":
                             self._sync_window_geometry()
                     except Exception as exc:
-                        self.events.put(("error", str(exc)))
+                        self.events.put(
+                            (
+                                "error",
+                                {"command": command, "message": str(exc)},
+                            )
+                        )
             finally:
                 auto.UninitializeUIAutomationInCurrentThread()
 
@@ -2419,11 +2610,21 @@ def _run_windows(args: argparse.Namespace) -> int:
             self._hook = None
 
     if args.scan_only:
-        hwnd = int(user32.GetForegroundWindow())
+        hwnd = native_handle_value(user32.GetForegroundWindow())
+        if hwnd <= 0:
+            print("没有可扫描的前台窗口。", file=sys.stderr)
+            return 2
         auto.InitializeUIAutomationInCurrentThread()
         try:
             started = time.perf_counter()
-            targets, node_types, _rect, window_name, visited = enumerate_targets(hwnd)
+            (
+                targets,
+                node_types,
+                _rect,
+                window_name,
+                visited,
+                _interrupted,
+            ) = enumerate_targets(hwnd)
             snapshots = [target.snapshot for target in targets]
             del node_types
             visible = [targets[index] for index in flat_target_indices(snapshots)]
@@ -2454,8 +2655,9 @@ def _run_windows(args: argparse.Namespace) -> int:
     active = threading.Event()
     scanning = False
     shutting_down = False
-    prewarm_hwnd = 0
-    prewarm_requested_at = 0.0
+    prewarm_observed_hwnd = 0
+    prewarm_observed_at = 0.0
+    prewarm_requested_hwnd = 0
 
     def enqueue_keyboard_action(action: str) -> None:
         keyboard_events.put(action)
@@ -2484,7 +2686,10 @@ def _run_windows(args: argparse.Namespace) -> int:
             if active.is_set():
                 leave_navigation()
             elif not scanning:
-                hwnd = int(user32.GetForegroundWindow())
+                hwnd = native_handle_value(user32.GetForegroundWindow())
+                if hwnd <= 0:
+                    print("没有可扫描的前台窗口。")
+                    return
                 scanning = True
                 print("正在扫描当前窗口...")
                 worker.post("scan", hwnd)
@@ -2573,37 +2778,54 @@ def _run_windows(args: argparse.Namespace) -> int:
                 print(
                     f"已预识别 {payload['window']}，耗时 {payload['elapsed']:.2f}s。"
                 )
+            elif event == "prewarm_skipped":
+                print(
+                    f"预识别超过 {payload['elapsed']:.2f}s，已停止以免阻塞按键启动。"
+                )
             elif event == "target_skipped":
                 print(
                     f"已跳过当前无法命中的元素: "
                     f"{payload.name or payload.control_type}"
                 )
             elif event == "error":
-                scanning = False
+                command = payload["command"]
+                message = payload["message"]
+                if command == "prewarm":
+                    print(f"预识别已跳过: {message}", file=sys.stderr)
+                    continue
+                if command == "scan":
+                    scanning = False
                 leave_navigation()
-                print(f"操作失败: {payload}", file=sys.stderr)
+                print(f"操作失败: {message}", file=sys.stderr)
 
     timer = QTimer()
     timer.timeout.connect(drain_events)
     timer.start(20)
 
     def monitor_navigation_context() -> None:
-        nonlocal prewarm_hwnd, prewarm_requested_at
-        foreground = int(user32.GetForegroundWindow())
+        nonlocal prewarm_observed_hwnd, prewarm_observed_at, prewarm_requested_hwnd
+        foreground = native_handle_value(user32.GetForegroundWindow())
         if not active.is_set():
+            now = time.perf_counter()
+            if foreground != prewarm_observed_hwnd:
+                prewarm_observed_hwnd = foreground
+                prewarm_observed_at = now
+                return
             if scanning or foreground <= 0:
                 return
             if window_process_id(foreground) == prototype_process_id:
                 return
-            now = time.perf_counter()
-            if (
-                foreground != prewarm_hwnd
-                or now - prewarm_requested_at
-                >= AutomationWorker._CACHE_TTL_SECONDS
+            if prewarm_request_due(
+                foreground,
+                prewarm_observed_hwnd,
+                prewarm_observed_at,
+                prewarm_requested_hwnd,
+                now,
             ):
-                prewarm_hwnd = foreground
-                prewarm_requested_at = now
+                prewarm_requested_hwnd = foreground
                 worker.post("prewarm", foreground)
+            return
+        if foreground <= 0:
             return
         if (
             worker.hwnd
@@ -2634,6 +2856,7 @@ def _run_windows(args: argparse.Namespace) -> int:
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
+    configure_standard_streams()
     args = _parse_args(argv)
     if sys.platform != "win32":
         print("这个原型只支持 Windows。", file=sys.stderr)
