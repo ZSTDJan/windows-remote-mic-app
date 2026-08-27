@@ -50,6 +50,7 @@ class _ArgvRestoringTestCase(unittest.TestCase):
         self._original_app_main = app.main
         self._original_notice = single_instance.show_bridge_startup_blocked_notice
         self._original_load_config = config.load_config
+        self._original_qt_runtime_check = main_module._qt_runtime_check
         # XRBM-023: default every test in this suite to a safe no-op stub for
         # the visible-notice callable. show_bridge_startup_blocked_notice's
         # real implementation opens a real, SYSTEMMODAL Win32 MessageBoxW -
@@ -74,6 +75,7 @@ class _ArgvRestoringTestCase(unittest.TestCase):
         app.main = self._original_app_main
         single_instance.show_bridge_startup_blocked_notice = self._original_notice
         config.load_config = self._original_load_config
+        main_module._qt_runtime_check = self._original_qt_runtime_check
 
 
 class BridgeModeRoutingTests(_ArgvRestoringTestCase):
@@ -313,6 +315,28 @@ class ArgumentModeBypassTests(_ArgvRestoringTestCase):
             main_module.main()
 
         self.assertEqual(ctx.exception.code, 0)
+        self.assertEqual(bridge_enter_calls, [])
+        self.assertEqual(settings_enter_calls, [])
+
+    def test_qt_runtime_check_never_touches_the_guard(self):
+        bridge_enter_calls = []
+        settings_enter_calls = []
+        check_calls = []
+        single_instance.BridgeInstanceGuard = _make_guard_class(
+            enter_calls=bridge_enter_calls
+        )
+        single_instance.SettingsInstanceGuard = _make_guard_class(
+            enter_calls=settings_enter_calls
+        )
+        main_module._qt_runtime_check = lambda: check_calls.append(1) or 0
+        app.main = lambda: self.fail("Qt runtime check must never call app.main()")
+        sys.argv = ["ovb_rc003", "--qt-runtime-check"]
+
+        with self.assertRaises(SystemExit) as ctx:
+            main_module.main()
+
+        self.assertEqual(ctx.exception.code, 0)
+        self.assertEqual(check_calls, [1])
         self.assertEqual(bridge_enter_calls, [])
         self.assertEqual(settings_enter_calls, [])
 

@@ -7,9 +7,10 @@
     requirements-dev.txt, run the public-boundary scan, run the test suite
     (gated with ``-W error::ResourceWarning``, matching the CI workflow),
     invoke PyInstaller against RemoteMicRC003.spec, then smoke-check
-    the built executable with ``--dry-run`` (imports every module, touches
-    no GUI/BLE/HID/audio, exits 0) so a broken build is caught here rather
-    than only discovered on a real machine.
+    the built executable with ``--dry-run`` and ``--qt-runtime-check``. The
+    second check loads the real frozen Qt DLL chain and verifies main.qml,
+    without constructing a window or touching BLE/HID/audio, so a package
+    that cannot open settings is caught here rather than on a real machine.
 
     Fetches and hash-verifies the pinned Frida Gadget and VB-CABLE helper
     before freezing so a complete RC003 build cannot silently lose the HID
@@ -93,6 +94,10 @@ try {
     }
     & $builtExe --dry-run
     Assert-LastExitCode "$builtExe --dry-run"
+
+    Write-Host "-- built-artifact Qt runtime smoke check (no GUI/BLE/HID/audio) --"
+    & $builtExe --qt-runtime-check
+    Assert-LastExitCode "$builtExe --qt-runtime-check"
 
     Write-Host "== build complete: dist\RemoteMicRC003\ (unsigned) =="
 } finally {

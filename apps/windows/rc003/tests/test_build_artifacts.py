@@ -467,6 +467,9 @@ class WindowsCiWorkflowTests(unittest.TestCase):
     def test_runs_dry_run_smoke_check(self):
         self.assertIn("--dry-run", self.text)
 
+    def test_runs_frozen_qt_runtime_smoke_check(self):
+        self.assertIn("--qt-runtime-check", self.text)
+
     def test_compiles_inno_setup_installer(self):
         self.assertIn("ISCC.exe", self.text)
 
@@ -987,6 +990,14 @@ class BuildCandidateScriptTests(unittest.TestCase):
             'Assert-LastExitCode "fetch-frida-gadget.ps1"'
         )
         self.assertGreater(assert_index, fetch_index)
+
+    def test_checks_the_real_frozen_qt_runtime_after_building(self):
+        pyinstaller_index = self.text.index("PyInstaller build (unsigned candidate)")
+        qt_check_index = self.text.index("& $builtExe --qt-runtime-check")
+        self.assertGreater(qt_check_index, pyinstaller_index)
+        self.assertIn(
+            'Assert-LastExitCode "$builtExe --qt-runtime-check"', self.text
+        )
 
 
 class PublicBoundaryScriptTests(unittest.TestCase):
@@ -1530,6 +1541,56 @@ class QtSettingsUiSpecTests(unittest.TestCase):
         qt_settings_app_text = qt_settings_app_path.read_text(encoding="utf-8")
         self.assertIn('"ovb_rc003_qml"', self.spec_text)
         self.assertIn('"ovb_rc003_qml"', qt_settings_app_text)
+
+    def test_spec_rejects_only_ambient_icuuc_dlls(self):
+        tree = ast.parse(self.spec_text, filename=str(_SPEC_PATH))
+        predicate_node = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name == "_is_ambient_icuuc"
+        )
+        namespace = {"Path": Path}
+        exec(
+            compile(
+                ast.Module(body=[predicate_node], type_ignores=[]),
+                str(_SPEC_PATH),
+                "exec",
+            ),
+            namespace,
+        )
+        predicate = namespace["_is_ambient_icuuc"]
+
+        self.assertTrue(
+            predicate(
+                (
+                    "icuuc.dll",
+                    r"C:\external-tools\poppler\bin\icuuc.dll",
+                    "BINARY",
+                )
+            )
+        )
+        self.assertFalse(
+            predicate(
+                (
+                    "icuuc.dll",
+                    r"C:\app\.venv\Lib\site-packages\PySide6\icuuc.dll",
+                    "BINARY",
+                )
+            )
+        )
+        self.assertFalse(
+            predicate(
+                (
+                    "PySide6\\QtCore.pyd",
+                    r"C:\app\.venv\Lib\site-packages\PySide6\QtCore.pyd",
+                    "BINARY",
+                )
+            )
+        )
+        self.assertGreater(
+            self.spec_text.index("a.binaries = ["),
+            self.spec_text.index("a = Analysis("),
+        )
 
 
 if __name__ == "__main__":

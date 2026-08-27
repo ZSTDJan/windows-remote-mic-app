@@ -184,6 +184,31 @@ a = Analysis(
     noarchive=False,
 )
 
+
+def _is_ambient_icuuc(binary_entry):
+    """Reject an unrelated ICU DLL discovered through the build PATH.
+
+    Modern Windows provides its own ICU forwarder. PyInstaller may instead
+    discover another application's ``icuuc.dll`` through PATH and copy it to
+    the package root, where it shadows the Windows DLL and can make QtCore
+    fail before the settings window starts. Keep a future PySide6-owned copy,
+    but never bundle an ambient copy from another toolchain.
+    """
+
+    destination_name, source_path, _type_code = binary_entry
+    if Path(destination_name).name.casefold() != "icuuc.dll":
+        return False
+    return "pyside6" not in {
+        part.casefold() for part in Path(source_path).parts
+    }
+
+
+a.binaries = [
+    binary_entry
+    for binary_entry in a.binaries
+    if not _is_ambient_icuuc(binary_entry)
+]
+
 pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
 
 exe = EXE(

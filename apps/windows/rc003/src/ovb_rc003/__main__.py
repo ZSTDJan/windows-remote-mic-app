@@ -21,13 +21,17 @@ built from the standalone ``src/launcher.py`` entry point - see XRBM-021):
                 still exits with the same nonzero code, but skips the modal
                 notice so the parent can classify the result immediately.
 - ``--dry-run``   import every first-party module and exit 0, touching no
-                  GUI, BLE, Raw Input, or audio device - the safe smoke
+                   GUI, BLE, Raw Input, or audio device - the safe smoke
                   check build-candidate.ps1 and
                   .github/workflows/windows-rc003-ci.yml run against a
                   freshly built artifact (XRBM-014 review RETRY P2 #3: a
-                  build that produces an executable which cannot even be
-                  launched is not caught by the PyInstaller build step
-                  alone).
+                   build that produces an executable which cannot even be
+                   launched is not caught by the PyInstaller build step
+                   alone).
+- ``--qt-runtime-check``  HIDDEN build-only smoke check that imports the Qt
+                   modules used by the settings window and verifies the
+                   frozen main QML file exists. It constructs no window and
+                   touches no BLE/HID/audio resource.
 - ``--diagnose-ble-candidates <result-path>``  HIDDEN, undocumented in
                   ``--help`` on purpose (XRBM-035 RETRY 1): the settings
                   window's "检查与修复" page's BLE candidate check
@@ -64,7 +68,7 @@ built from the standalone ``src/launcher.py`` entry point - see XRBM-021):
                 falls through to settings or bridge startup.
 - ``--help``/``-h``  print this usage and exit 0
 
-``--settings``, ``--bridge``, ``--dry-run``,
+``--settings``, ``--bridge``, ``--dry-run``, ``--qt-runtime-check``,
 ``--diagnose-ble-candidates``, ``--diagnose-vb-cable-loopback`` and
 ``--help``/``-h`` are all checked and dispatched BEFORE the bridge branch
 below is ever reached. Settings uses its own mutex; dry-run, diagnostics and
@@ -135,6 +139,31 @@ def _dry_run() -> int:
     )
 
     print("dry-run: all ovb_rc003 modules imported successfully")
+    return 0
+
+
+def _qt_runtime_check() -> int:
+    """Load the frozen Qt dependency chain without constructing a window."""
+
+    import importlib
+
+    from . import qt_settings_app
+
+    qt_modules = (
+        "PySide6.QtCore",
+        "PySide6.QtGui",
+        "PySide6.QtQml",
+        "PySide6.QtQuick",
+        "PySide6.QtQuickControls2",
+    )
+    for module_name in qt_modules:
+        importlib.import_module(module_name)
+
+    main_qml = qt_settings_app._qml_directory() / "main.qml"
+    if not main_qml.is_file():
+        raise RuntimeError(f"frozen QML entry point is missing: {main_qml}")
+
+    print("qt-runtime-check: Qt modules and main.qml are available")
     return 0
 
 
@@ -226,6 +255,8 @@ def main() -> None:
         return
     if "--dry-run" in args:
         raise SystemExit(_dry_run())
+    if "--qt-runtime-check" in args:
+        raise SystemExit(_qt_runtime_check())
     if "--diagnose-ble-candidates" in args:
         # XRBM-035 RETRY 1: hidden, undocumented child-process entry point -
         # see this module's own docstring. Always raises SystemExit from

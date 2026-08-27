@@ -3,8 +3,9 @@ name: windows-rc003-ci
 # Candidate CI for the Remote Mic · RC003 Windows client
 # (apps/windows/rc003). This runs the cross-platform pure-Python test suite
 # and a public-boundary scan on a real Windows runner, builds an unsigned
-# PyInstaller artifact, smoke-checks the built executable with --dry-run
-# (imports every module, touches no GUI/BLE/HID/audio, exits 0), compiles
+# PyInstaller artifact, smoke-checks the built executable with --dry-run and
+# --qt-runtime-check (loads the real Qt DLL chain and verifies main.qml while
+# touching no GUI/BLE/HID/audio), compiles
 # the Inno Setup installer SOURCE into an unsigned installer .exe, and
 # packages a deterministic unsigned portable ZIP (a versioned staging
 # folder containing the built app plus LICENSE.txt/COPYRIGHT.txt/
@@ -198,6 +199,9 @@ jobs:
             exit 1
           }
           & $builtExe --dry-run
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          & $builtExe --qt-runtime-check
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       # XRBM-018: promoted from best-effort to a required gate - this
