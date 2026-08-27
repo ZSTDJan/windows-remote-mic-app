@@ -7,9 +7,9 @@ ApplicationWindow {
     id: window
     title: qsTr("Remote Mic 设置")
     width: 720
-    height: 464
+    height: 500
     minimumWidth: 640
-    minimumHeight: 440
+    minimumHeight: 480
     visible: true
 
     FontLoader {
@@ -25,8 +25,15 @@ ApplicationWindow {
         source: "fonts/NotoSansSC-SemiBold.ttf"
     }
 
+    readonly property string preferredWindowsUiFont: "Microsoft YaHei UI"
+    readonly property bool preferredWindowsUiFontAvailable:
+        Qt.platform.os === "windows"
+        && Qt.fontFamilies().indexOf(preferredWindowsUiFont) >= 0
+
     property Tokens tokens: Tokens {
-        fontFamily: uiRegularFont.name.length > 0
+        fontFamily: window.preferredWindowsUiFontAvailable
+            ? window.preferredWindowsUiFont
+            : uiRegularFont.name.length > 0
             ? uiRegularFont.name : "Noto Sans SC"
     }
     color: tokens.background
@@ -110,7 +117,7 @@ ApplicationWindow {
                     text: qsTr("设备")
                     glyph: "\uE71B"
                     checked: tabBar.currentIndex === 0
-                    onClicked: tabBar.currentIndex = 0
+                    onPressed: tabBar.currentIndex = 0
                     Accessible.name: text
                     KeyNavigation.tab: mappingTabButton
                 }
@@ -121,7 +128,7 @@ ApplicationWindow {
                     text: qsTr("按键")
                     glyph: "\uE765"
                     checked: tabBar.currentIndex === 1
-                    onClicked: tabBar.currentIndex = 1
+                    onPressed: tabBar.currentIndex = 1
                     Accessible.name: text
                     KeyNavigation.tab: voiceTabButton
                 }
@@ -132,7 +139,7 @@ ApplicationWindow {
                     text: qsTr("语音")
                     glyph: "\uE720"
                     checked: tabBar.currentIndex === 2
-                    onClicked: tabBar.currentIndex = 2
+                    onPressed: tabBar.currentIndex = 2
                     Accessible.name: text
                     KeyNavigation.tab: deviceTabButton
                 }

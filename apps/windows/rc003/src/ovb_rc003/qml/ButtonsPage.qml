@@ -12,7 +12,7 @@ Item {
     property var tokens
     readonly property var leftButtonIds: ["power", "up", "left", "back", "home", "menu"]
     readonly property real mappingCardGap: 2
-    readonly property real mappingCardHeight: 42
+    readonly property real mappingCardHeight: 55
     readonly property real mappingBoardGap: 6
     property bool connectorRepaintQueued: false
 
@@ -235,25 +235,14 @@ Item {
                 font.weight: Font.Medium
             }
 
-            ToolButton {
+            DialogCloseButton {
                 id: shortcutRecorderCloseButton
                 objectName: "shortcutRecorderCloseButton"
-                x: shortcutRecorder.width - width - 7
+                tokens: root.tokens
+                anchors.right: parent.right
+                anchors.rightMargin: 7
                 anchors.verticalCenter: parent.verticalCenter
-                implicitWidth: 28
-                implicitHeight: 28
-                contentItem: Label {
-                    text: "X"
-                    color: tokens.textSecondary
-                    font.family: tokens.fontFamily
-                    font.pixelSize: 18
-                    horizontalAlignment: Text.AlignHCenter
-                    verticalAlignment: Text.AlignVCenter
-                }
-                onClicked: shortcutRecorder.close()
-                Accessible.name: qsTr("关闭")
-                ToolTip.visible: hovered
-                ToolTip.text: qsTr("关闭")
+                onCloseRequested: shortcutRecorder.close()
             }
         }
 
@@ -401,25 +390,14 @@ Item {
                 font.weight: Font.Medium
             }
 
-            ToolButton {
+            DialogCloseButton {
                 id: actionEditorCloseButton
                 objectName: "actionEditorCloseButton"
-                x: actionEditor.width - width - 7
+                tokens: root.tokens
+                anchors.right: parent.right
+                anchors.rightMargin: 7
                 anchors.verticalCenter: parent.verticalCenter
-                implicitWidth: 28
-                implicitHeight: 28
-                contentItem: Label {
-                    text: "X"
-                    color: tokens.textSecondary
-                    font.family: tokens.fontFamily
-                    font.pixelSize: 18
-                    horizontalAlignment: Text.AlignHCenter
-                    verticalAlignment: Text.AlignVCenter
-                }
-                onClicked: actionEditor.close()
-                Accessible.name: qsTr("关闭")
-                ToolTip.visible: hovered
-                ToolTip.text: qsTr("关闭")
+                onCloseRequested: actionEditor.close()
             }
         }
 
@@ -794,7 +772,9 @@ Item {
                             tokens: root.tokens
                             kind: noteKind
                             Layout.fillWidth: true
-                            text: qsTr("按键设为语音键时，双击和长按不可用")
+                            text: SettingsController.keyDetectionActive
+                                ? SettingsController.keyDetectionText
+                                : qsTr("按键设为语音键时，双击和长按不可用")
                             elide: Text.ElideRight
                         }
                         Item { Layout.fillWidth: true }
@@ -1151,37 +1131,6 @@ Item {
                 }
             }
 
-            Item {
-                id: mappingListFrame
-                objectName: "mappingListFrame"
-                Layout.fillWidth: true
-                Layout.preferredHeight: 18
-
-                Rectangle {
-                    anchors.left: parent.left
-                    anchors.right: parent.right
-                    anchors.top: parent.top
-                    height: 1
-                    color: tokens.border
-                }
-
-                UiLabel {
-                    id: bridgeRequiredWarning
-                    objectName: "mappingBridgeWarning"
-                    anchors.left: parent.left
-                    anchors.right: parent.right
-                    anchors.verticalCenter: parent.verticalCenter
-                    anchors.topMargin: 1
-                    tokens: root.tokens
-                    kind: noteKind
-                    text: SettingsController.keyDetectionActive
-                        ? SettingsController.keyDetectionText
-                        : !SettingsController.bridgeRunning
-                            ? qsTr("遥控器服务未运行，语音和真实按键检测不可用")
-                            : ""
-                    elide: Text.ElideRight
-                }
-            }
         }
 
     }

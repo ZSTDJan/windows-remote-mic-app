@@ -37,8 +37,8 @@ QtObject {
     property string fontFamily: "Noto Sans SC"
     property string fontFamilyMono: "Consolas"
     property real fontSizeTiny: 9.5
-    property real fontSizeMapGesture: 8.5
-    property real fontSizeMapPrimary: 9.5
+    property real fontSizeMapGesture: 9.5
+    property real fontSizeMapPrimary: 10.5
     property real fontSizeSmall: 10.5
     property real fontSizeControl: 11
     property int fontSizeBody: 12

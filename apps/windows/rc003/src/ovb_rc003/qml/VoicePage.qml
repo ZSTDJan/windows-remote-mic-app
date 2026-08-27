@@ -191,16 +191,58 @@ Item {
     Dialog {
         id: speakTestDialog
         objectName: "speakTestDialog"
-        title: qsTr("实际说话")
         modal: true
+        popupType: Popup.Item
         anchors.centerIn: parent
         width: Math.min(480, root.width - 36)
-        height: 250
-        standardButtons: Dialog.Close
+        height: Math.min(300, root.height - 28)
+        readonly property string headerText: qsTr("实际说话")
+        title: headerText
+        standardButtons: Dialog.NoButton
+        leftPadding: 16
+        rightPadding: 16
+        topPadding: 0
+        bottomPadding: 14
+        leftInset: 0
+        rightInset: 0
+        topInset: 0
+        bottomInset: 0
+        closePolicy: Popup.CloseOnEscape
         onOpened: Qt.callLater(function() { speakTestInput.forceActiveFocus() })
 
-        ColumnLayout {
-            anchors.fill: parent
+        background: Rectangle {
+            radius: tokens.cornerRadiusLarge
+            color: tokens.surface
+            border.width: 1
+            border.color: tokens.borderStrong
+        }
+
+        header: Item {
+            width: speakTestDialog.width
+            implicitHeight: 42
+
+            UiLabel {
+                anchors.left: parent.left
+                anchors.leftMargin: 16
+                anchors.verticalCenter: parent.verticalCenter
+                tokens: root.tokens
+                kind: sectionTitleKind
+                text: speakTestDialog.headerText
+                font.pixelSize: tokens.fontSizeTitle
+                font.weight: Font.Medium
+            }
+
+            DialogCloseButton {
+                objectName: "speakTestCloseButton"
+                tokens: root.tokens
+                anchors.right: parent.right
+                anchors.rightMargin: 8
+                anchors.verticalCenter: parent.verticalCenter
+                onCloseRequested: speakTestDialog.close()
+            }
+        }
+
+        contentItem: ColumnLayout {
             spacing: tokens.spacingSmall
 
             UiLabel {
@@ -218,8 +260,11 @@ Item {
             }
 
             ScrollView {
+                id: speakTestInputFrame
+                objectName: "speakTestInputFrame"
                 Layout.fillWidth: true
                 Layout.fillHeight: true
+                Layout.minimumHeight: 150
                 TextArea {
                     id: speakTestInput
                     objectName: "speakTestInput"
@@ -229,6 +274,7 @@ Item {
                     font.family: tokens.fontFamily
                     font.pixelSize: tokens.fontSizeBody
                     color: tokens.textPrimary
+                    placeholderTextColor: tokens.disabledText
                     background: Rectangle {
                         color: tokens.fieldBackground
                         border.color: speakTestInput.activeFocus

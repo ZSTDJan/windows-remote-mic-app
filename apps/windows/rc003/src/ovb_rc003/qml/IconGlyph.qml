@@ -12,6 +12,7 @@ Label {
     color: tokens.textSecondary
     font.family: "Segoe Fluent Icons"
     font.pixelSize: glyphSize
+    renderType: Text.QtRendering
     horizontalAlignment: Text.AlignHCenter
     verticalAlignment: Text.AlignVCenter
 }

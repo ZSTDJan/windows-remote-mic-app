@@ -19,7 +19,7 @@ AbstractButton {
     property bool exposeObjectNames: true
 
     hoverEnabled: true
-    implicitHeight: 42
+    implicitHeight: 55
     leftPadding: 4
     rightPadding: 4
     topPadding: 3
@@ -70,7 +70,7 @@ AbstractButton {
             anchors.left: parent.left
             anchors.top: parent.top
             anchors.bottom: parent.bottom
-            width: 1
+            width: 0.75
             color: root.tokens.border
         }
 
@@ -84,9 +84,9 @@ AbstractButton {
                 tokens: root.tokens
                 kind: noteKind
                 Layout.fillWidth: true
-                Layout.preferredHeight: 10
+                Layout.preferredHeight: 13
                 text: cell.gestureLabel
-                color: root.tokens.disabledText
+                color: root.tokens.textSecondary
                 font.pixelSize: root.tokens.fontSizeMapGesture
                 font.weight: Font.Normal
                 horizontalAlignment: Text.AlignHCenter
@@ -96,7 +96,7 @@ AbstractButton {
 
             Rectangle {
                 Layout.fillWidth: true
-                Layout.preferredHeight: 15
+                Layout.preferredHeight: 22
                 radius: 3
                 color: !cell.usingNote && !cell.empty
                     ? root.tokens.surfaceMuted : "transparent"
@@ -111,8 +111,7 @@ AbstractButton {
                     text: cell.shownText
                     color: cell.empty
                         ? root.tokens.disabledText
-                        : cell.usingNote
-                            ? root.tokens.textPrimary : root.tokens.textSecondary
+                        : root.tokens.textPrimary
                     font.family: cell.usingNote
                         ? root.tokens.fontFamily : root.tokens.fontFamilyMono
                     font.pixelSize: cell.usingNote
@@ -143,7 +142,7 @@ AbstractButton {
             anchors.left: parent.left
             anchors.top: parent.top
             anchors.bottom: parent.bottom
-            width: 1
+            width: 0.75
             color: root.tokens.border
         }
 
@@ -157,7 +156,7 @@ AbstractButton {
                 tokens: root.tokens
                 kind: noteKind
                 Layout.fillWidth: true
-                Layout.preferredHeight: 10
+                Layout.preferredHeight: 13
                 text: qsTr("双击 / 长按")
                 color: root.tokens.disabledText
                 font.pixelSize: root.tokens.fontSizeMapGesture
@@ -171,7 +170,7 @@ AbstractButton {
                 tokens: root.tokens
                 kind: noteKind
                 Layout.fillWidth: true
-                Layout.preferredHeight: 15
+                Layout.preferredHeight: 22
                 text: qsTr("语音模式下暂停")
                 color: root.tokens.disabledText
                 font.pixelSize: root.tokens.fontSizeMapGesture
@@ -186,7 +185,7 @@ AbstractButton {
     background: Rectangle {
         radius: root.tokens.cornerRadiusSmall
         color: root.selected ? root.tokens.accentSoft : root.tokens.surface
-        border.width: 1
+        border.width: 0.75
         border.color: root.selected
             ? root.tokens.accent
             : root.hovered

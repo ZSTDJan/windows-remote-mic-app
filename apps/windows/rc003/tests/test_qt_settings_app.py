@@ -3675,7 +3675,7 @@ _THREE_PAGE_LAYOUT_PROBE_SCRIPT = r"""
 import json
 import os
 
-from PySide6.QtCore import QPointF
+from PySide6.QtCore import QMetaObject, QPointF, Qt
 from ovb_rc003 import qt_settings_app as m
 
 
@@ -3704,17 +3704,24 @@ def render(window, app, count=10):
 def bounds(window, name):
     item = find_child(window, name)
     assert item is not None, name + " missing"
-    origin = item.mapToScene(QPointF(0, 0))
+    map_to_scene = getattr(item, "mapToScene", None)
+    if callable(map_to_scene):
+        origin = map_to_scene(QPointF(0, 0))
+        origin_x = float(origin.x())
+        origin_y = float(origin.y())
+    else:
+        origin_x = float(item.property("x"))
+        origin_y = float(item.property("y"))
     width = float(item.property("width"))
     height = float(item.property("height"))
     return {
         "visible": bool(item.property("visible")),
-        "x": float(origin.x()),
-        "y": float(origin.y()),
+        "x": origin_x,
+        "y": origin_y,
         "width": width,
         "height": height,
-        "right": float(origin.x()) + width,
-        "bottom": float(origin.y()) + height,
+        "right": origin_x + width,
+        "bottom": origin_y + height,
     }
 
 
@@ -3812,7 +3819,6 @@ capture_page(
     "rc003MappingLayout",
     (
         "mappingActionsPanel",
-        "mappingListFrame",
         "mappingList",
         "photoSidebar",
     ),
@@ -3829,6 +3835,54 @@ capture_page(
         "voiceTestSection",
     ),
 )
+
+speak_dialog = find_child(window, "speakTestDialog")
+assert speak_dialog is not None
+assert QMetaObject.invokeMethod(
+    speak_dialog,
+    "open",
+    Qt.ConnectionType.DirectConnection,
+)
+render(window, app)
+result["speak_dialog"] = {
+    "dialog": bounds(window, "speakTestDialog"),
+    "input_frame": bounds(window, "speakTestInputFrame"),
+    "input": bounds(window, "speakTestInput"),
+    "close": bounds(window, "speakTestCloseButton"),
+}
+screenshot_dir = os.environ.get("PROBE_SCREENSHOT_DIR")
+if screenshot_dir:
+    render(window, app, 2).save(
+        os.path.join(
+            screenshot_dir,
+            f"{os.environ.get('PROBE_STYLE', 'Basic')}-"
+            f"{int(result['width'])}x{int(result['height'])}-speak-dialog.png",
+        )
+    )
+speak_dialog.close()
+speak_dialog.setProperty("visible", False)
+render(window, app, 2)
+
+mapping_button = find_child(window, "mappingTabButton")
+tab_bar.setProperty("currentIndex", 2)
+render(window, app, 2)
+assert QMetaObject.invokeMethod(
+    mapping_button,
+    "pressed",
+    Qt.ConnectionType.DirectConnection,
+)
+result["mapping_index_on_press"] = int(tab_bar.property("currentIndex"))
+result["navigation_backgrounds"] = {
+    name: bounds(window, name)
+    for name in (
+        "deviceTabButton",
+        "deviceTabButton_background",
+        "mappingTabButton",
+        "mappingTabButton_background",
+        "voiceTabButton",
+        "voiceTabButton_background",
+    )
+}
 
 result["warnings"] = [warning.toString() for warning in warnings]
 m._shutdown_diagnostics_workers()
@@ -3855,6 +3909,15 @@ class SettingsShellSourceContractTests(unittest.TestCase):
             encoding="utf-8"
         )
         self.selection_combo_qml = (qml_dir / "SelectionComboBox.qml").read_text(
+            encoding="utf-8"
+        )
+        self.nav_button_qml = (qml_dir / "NavButton.qml").read_text(
+            encoding="utf-8"
+        )
+        self.dialog_close_button_qml = (qml_dir / "DialogCloseButton.qml").read_text(
+            encoding="utf-8"
+        )
+        self.icon_glyph_qml = (qml_dir / "IconGlyph.qml").read_text(
             encoding="utf-8"
         )
         self.inline_settings_row_qml = (qml_dir / "InlineSettingsRow.qml").read_text(
@@ -3955,13 +4018,13 @@ class SettingsShellSourceContractTests(unittest.TestCase):
             2,
         )
 
-    def test_bridge_state_is_visible_on_device_and_buttons_pages(self):
+    def test_service_state_has_one_formal_device_page_location(self):
         self.assertIn('objectName: "remoteServiceRow"', self.device_qml)
-        self.assertIn('objectName: "mappingBridgeWarning"', self.buttons_qml)
-        for page_text in (self.device_qml, self.buttons_qml):
-            self.assertIn("SettingsController.bridgeRunning", page_text)
+        self.assertNotIn('objectName: "mappingBridgeWarning"', self.buttons_qml)
+        self.assertNotIn('objectName: "mappingListFrame"', self.buttons_qml)
+        self.assertIn("SettingsController.bridgeRunning", self.device_qml)
         self.assertIn('return qsTr("未运行")', self.device_qml)
-        self.assertIn("语音和真实按键检测不可用", self.buttons_qml)
+        self.assertNotIn("语音和真实按键检测不可用", self.buttons_qml)
 
     def test_main_window_owns_the_single_live_bridge_refresh_timer(self):
         self.assertIn('objectName: "bridgeStatusRefreshTimer"', self.main_qml)
@@ -3977,6 +4040,29 @@ class SettingsShellSourceContractTests(unittest.TestCase):
         self.assertIn("SettingsController.pollBridgeLaunch()", self.main_qml)
         for page_text in (self.device_qml, self.buttons_qml, self.voice_qml):
             self.assertNotIn("refreshBridgeState()", page_text)
+
+    def test_navigation_switches_on_press_without_internal_check_state(self):
+        self.assertIn("checkable: false", self.nav_button_qml)
+        for inset in ("leftInset", "rightInset", "topInset", "bottomInset"):
+            self.assertIn(f"{inset}: 0", self.nav_button_qml)
+        self.assertIn('objectName: root.objectName + "_background"', self.nav_button_qml)
+        self.assertEqual(self.main_qml.count("onPressed: tabBar.currentIndex ="), 3)
+        self.assertNotIn("onClicked: tabBar.currentIndex =", self.main_qml)
+
+    def test_windows_prefers_the_system_chinese_ui_font(self):
+        self.assertIn(
+            'preferredWindowsUiFont: "Microsoft YaHei UI"', self.main_qml
+        )
+        self.assertIn('Qt.platform.os === "windows"', self.main_qml)
+        self.assertIn("Qt.fontFamilies().indexOf(preferredWindowsUiFont)", self.main_qml)
+        self.assertIn("window.preferredWindowsUiFontAvailable", self.main_qml)
+
+    def test_dialogs_share_the_fluent_close_button(self):
+        self.assertIn('glyph: "\\uE711"', self.dialog_close_button_qml)
+        self.assertIn('Accessible.name: qsTr("关闭")', self.dialog_close_button_qml)
+        self.assertIn("renderType: Text.QtRendering", self.icon_glyph_qml)
+        self.assertEqual(self.buttons_qml.count("DialogCloseButton {"), 2)
+        self.assertEqual(self.voice_qml.count("DialogCloseButton {"), 1)
 
     def test_device_page_shows_real_service_state_and_start_progress(self):
         self.assertIn("SettingsController.bridgeLaunchBusy", self.device_qml)
@@ -4036,7 +4122,7 @@ class SettingsShellSourceContractTests(unittest.TestCase):
         self.assertIn("photoHotspotRepeater.itemAt(i)", self.buttons_qml)
         self.assertNotIn("function targetY(buttonId)", self.buttons_qml)
         self.assertIn("root.selected ? root.tokens.accentSoft", self.mapping_card_qml)
-        self.assertIn("border.width: 1", self.mapping_card_qml)
+        self.assertIn("border.width: 0.75", self.mapping_card_qml)
         self.assertIn("root.tokens.cardBorder", self.mapping_card_qml)
         self.assertIn("leftPadding: 4", self.mapping_card_qml)
         self.assertIn("columnSpacing: 0", self.mapping_card_qml)
@@ -4060,8 +4146,10 @@ class SettingsShellSourceContractTests(unittest.TestCase):
         self.assertNotIn('text: actionEditor.title', self.buttons_qml)
         self.assertNotIn('text: shortcutRecorder.title', self.buttons_qml)
         self.assertNotIn('text: "×"', self.buttons_qml)
+        self.assertNotIn('text: "X"', self.buttons_qml)
+        self.assertEqual(self.buttons_qml.count("DialogCloseButton {"), 2)
         self.assertIn("optionDelegate.highlighted", self.buttons_qml)
-        self.assertIn('objectName: "mappingListFrame"', self.buttons_qml)
+        self.assertNotIn('objectName: "mappingListFrame"', self.buttons_qml)
         self.assertIn("property int count: 13", self.buttons_qml)
         self.assertNotIn("ListView {", self.buttons_qml)
         self.assertNotIn('objectName: "voiceSettingsPanel"', self.buttons_qml)
@@ -4204,6 +4292,9 @@ class ThreePageSettingsSourceContractTests(unittest.TestCase):
             self.voice_qml,
         )
         self.assertIn("speakTestInput.forceActiveFocus()", self.voice_qml)
+        self.assertIn('objectName: "speakTestInputFrame"', self.voice_qml)
+        self.assertIn('objectName: "speakTestCloseButton"', self.voice_qml)
+        self.assertIn("Layout.minimumHeight: 150", self.voice_qml)
         self.assertIn("vbCableBridgeRecoveryNeeded", self.voice_qml)
 
     def test_button_page_keeps_real_cards_and_confirms_built_in_defaults(self):
@@ -4288,7 +4379,7 @@ class OffscreenQmlLoadTests(unittest.TestCase):
             data["warnings"], [], "main.qml produced QML warnings/errors during load"
         )
         self.assertEqual(data["width"], 720)
-        self.assertEqual(data["height"], 464)
+        self.assertEqual(data["height"], 500)
         self.assertFalse(data["retired_finish_tap_control_exists"])
 
     def test_rc003_only_three_page_shell_is_rendered(self):
@@ -4323,9 +4414,9 @@ class OffscreenQmlLoadTests(unittest.TestCase):
         import subprocess
 
         scenarios = (
-            ("Basic", 720, 464),
-            ("Basic", 640, 440),
-            ("FluentWinUI3", 720, 464),
+            ("Basic", 720, 500),
+            ("Basic", 640, 480),
+            ("FluentWinUI3", 720, 500),
         )
         for style, width, height in scenarios:
             with self.subTest(style=style, width=width, height=height), tempfile.TemporaryDirectory() as tmpdir:
@@ -4351,6 +4442,32 @@ class OffscreenQmlLoadTests(unittest.TestCase):
                 data = json.loads(result.stdout.strip().splitlines()[-1])
                 self.assertEqual(data["warnings"], [])
                 self.assertEqual((data["width"], data["height"]), (width, height))
+                self.assertEqual(data["mapping_index_on_press"], 1)
+
+                nav = data["navigation_backgrounds"]
+                for button_name in (
+                    "deviceTabButton",
+                    "mappingTabButton",
+                    "voiceTabButton",
+                ):
+                    background = nav[button_name + "_background"]
+                    button = nav[button_name]
+                    for edge in ("x", "y", "right", "bottom"):
+                        self.assertAlmostEqual(
+                            background[edge], button[edge], delta=0.5
+                        )
+
+                speak = data["speak_dialog"]
+                self.assertGreaterEqual(speak["input_frame"]["height"], 150)
+                self.assertGreaterEqual(speak["input"]["height"], 150)
+                self.assertEqual(speak["close"]["width"], 28)
+                self.assertEqual(speak["close"]["height"], 28)
+                self.assertGreaterEqual(
+                    speak["input_frame"]["y"], speak["dialog"]["y"]
+                )
+                self.assertLessEqual(
+                    speak["input_frame"]["bottom"], speak["dialog"]["bottom"] + 1
+                )
                 for page_name, page in data["pages"].items():
                     content = page["content"]
                     self.assertTrue(content["visible"], page_name)
@@ -5342,7 +5459,6 @@ _render(window, app)
 
 mapping_list = _find(window, "mappingList")
 actions_panel = _find(window, "mappingActionsPanel")
-status_bar = _find(window, "mappingListFrame")
 mapping_lines = _find(window, "mappingLines")
 active_mapping_line = _find(window, "activeMappingLine")
 left_cards = _find(window, "leftMappingCards")
@@ -5351,7 +5467,7 @@ photo_sidebar = _find(window, "photoSidebar")
 photo_frame = _find(window, "photoFrame")
 photo_image = _find(window, "photoImage")
 assert mapping_list is not None, "mappingList not found"
-assert actions_panel is not None and status_bar is not None
+assert actions_panel is not None
 assert mapping_lines is not None and active_mapping_line is not None
 assert left_cards is not None and right_cards is not None
 assert photo_sidebar is not None, "photoSidebar not found"
@@ -5416,6 +5532,10 @@ assert ok_hotspot is not None, "OK photo hotspot not found"
 assert power_marker is not None, "Power photo marker not found"
 assert ok_marker is not None, "OK photo marker not found"
 assert editor is not None
+editor_screenshot = os.environ.get("RC003_MAPPING_EDITOR_SCREENSHOT")
+if editor_screenshot:
+    _render(window, app, 2)
+    assert window.grabWindow().save(editor_screenshot)
 
 power_layout = remote_layout.hotspot_for("power")
 assert power_layout is not None
@@ -5436,7 +5556,6 @@ results_out = {
     "editor_visible": bool(editor.property("visible")),
     "actions_panel": _geometry(actions_panel),
     "mapping_list": _geometry(mapping_list),
-    "status_bar": _geometry(status_bar),
     "canvases": {
         "base": _geometry(mapping_lines),
         "active": _geometry(active_mapping_line),
@@ -5497,15 +5616,14 @@ class ButtonsPageMappingCardTests(unittest.TestCase):
         return json.loads(result.stdout.strip().splitlines()[-1])
 
     def test_board_renders_all_thirteen_cards(self):
-        data = self._run_probe(720, 464)
+        data = self._run_probe(720, 500)
         self.assertEqual(data["card_count"], 13)
         self.assertTrue(data["actions_panel"]["visible"])
-        self.assertTrue(data["status_bar"]["visible"])
         self.assertTrue(data["canvases"]["base"]["visible"])
         self.assertTrue(data["canvases"]["active"]["visible"])
 
     def test_real_click_on_power_card_selects_power_and_opens_editor(self):
-        data = self._run_probe(720, 464)
+        data = self._run_probe(720, 500)
         self.assertEqual(
             data["selected_after_power_click"],
             "power",
@@ -5514,14 +5632,14 @@ class ButtonsPageMappingCardTests(unittest.TestCase):
         self.assertTrue(data["editor_visible"])
 
     def test_selected_power_is_marked_at_its_calibrated_photo_position(self):
-        data = self._run_probe(720, 464)
+        data = self._run_probe(720, 500)
         self.assertTrue(data["photo"]["power_marker_visible"])
         self.assertFalse(data["photo"]["ok_marker_visible"])
         self.assertAlmostEqual(data["photo"]["power_center_error_x"], 0, delta=1)
         self.assertAlmostEqual(data["photo"]["power_center_error_y"], 0, delta=1)
 
     def test_curved_connector_routes_stay_ordered_without_overlap(self):
-        data = self._run_probe(720, 464)
+        data = self._run_probe(720, 500)
         cards = data["cards"]
         hotspots = data["photo"]["hotspots"]
         groups = (
@@ -5607,26 +5725,23 @@ class ButtonsPageMappingCardTests(unittest.TestCase):
             self.assertAlmostEqual(canvas["bottom"], board["bottom"], delta=1)
 
     def test_board_fits_default_minimum_and_large_windows(self):
-        viewports = (("Basic", 720, 464), ("Basic", 640, 440), ("FluentWinUI3", 720, 464), ("FluentWinUI3", 840, 720))
+        viewports = (("Basic", 720, 500), ("Basic", 640, 480), ("FluentWinUI3", 720, 500), ("FluentWinUI3", 840, 720))
         for style, width, height in viewports:
             data = self._run_probe(width, height, style)
             self.assertAlmostEqual(data["photo"]["sidebar"]["width"], 86, delta=0.5)
             self.assertLessEqual(data["mapping_list"]["right"], width + 1)
             self.assertLessEqual(data["actions_panel"]["right"], width + 1)
-            self.assertLessEqual(data["status_bar"]["right"], width + 1)
-            self.assertLessEqual(data["status_bar"]["bottom"], height + 1)
             self.assertLessEqual(data["actions_panel"]["bottom"], data["mapping_list"]["y"] + 1)
-            self.assertLessEqual(data["mapping_list"]["bottom"], data["status_bar"]["y"] + 1)
             self.assertLess(data["left_cards"]["x"], data["photo"]["sidebar"]["x"])
             self.assertLess(data["photo"]["sidebar"]["x"], data["right_cards"]["x"])
             for card in data["cards"].values():
-                self.assertGreaterEqual(card["height"], 38)
-                self.assertLessEqual(card["height"], 45.5)
+                self.assertGreaterEqual(card["height"], 54)
+                self.assertLessEqual(card["height"], 56)
                 self.assertLessEqual(card["right"], width + 1)
                 self.assertLessEqual(card["bottom"], height + 1)
 
     def test_power_card_gesture_cells_are_equal_and_aligned(self):
-        for style, width, height in (("Basic", 720, 464), ("Basic", 640, 440), ("FluentWinUI3", 720, 464)):
+        for style, width, height in (("Basic", 720, 500), ("Basic", 640, 480), ("FluentWinUI3", 720, 500)):
             data = self._run_probe(width, height, style)
             columns = data["power_columns"]
             for left, right in (("single", "double"), ("double", "long")):

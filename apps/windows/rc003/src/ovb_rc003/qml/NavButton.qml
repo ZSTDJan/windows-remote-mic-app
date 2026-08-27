@@ -7,10 +7,18 @@ AbstractButton {
     property var tokens
     property string glyph: ""
 
-    checkable: true
+    checkable: false
     hoverEnabled: true
     implicitWidth: 40
     implicitHeight: tokens.navigationItemHeight
+    leftPadding: 0
+    rightPadding: 0
+    topPadding: 0
+    bottomPadding: 0
+    leftInset: 0
+    rightInset: 0
+    topInset: 0
+    bottomInset: 0
 
     contentItem: Column {
         spacing: 2
@@ -34,6 +42,11 @@ AbstractButton {
     }
 
     background: Rectangle {
+        objectName: root.objectName + "_background"
+        x: 0
+        y: 0
+        width: root.width
+        height: root.height
         radius: root.tokens.cornerRadiusSmall
         color: root.checked
             ? root.tokens.accentSoft
