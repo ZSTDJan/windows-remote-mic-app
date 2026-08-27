@@ -3868,6 +3868,57 @@ capture_page(
     ),
 )
 
+voice_row_names = (
+    "virtualAudioRow",
+    "outputEndpointRow",
+    "targetApplicationRow",
+    "voiceProgramSelectionRow",
+    "voiceProgramCustomPathRow",
+    "voiceHotkeyRow",
+    "voiceProgramSpecificRow",
+    "soundChannelTestRow",
+    "actualSpeechTestRow",
+)
+result["voice_columns"] = {
+    "states": {
+        name: bounds(window, name + "_stateColumn") for name in voice_row_names
+    },
+    "actions": {
+        name: bounds(window, name + "_actionColumn") for name in voice_row_names
+    },
+    "editors": {
+        name: bounds(window, name)
+        for name in (
+            "endpointCombo",
+            "voiceProgramCombo",
+            "voiceProgramCustomPathField",
+            "holdVoiceHotkeyField",
+        )
+    },
+    "right_controls": {
+        name: bounds(window, name)
+        for name in (
+            "installVirtualAudioButton",
+            "applyVoiceSettingsButton",
+            "openSoundInputSettingsButton",
+            "browseVoiceProgramButton",
+            "voiceProgramElevatedCheckBox",
+            "testVbCableChannelButton",
+            "trySpeakingButton",
+        )
+    },
+}
+
+controller.selectedVoiceProgramIndex = 3
+render(window, app)
+result["voice_windows_actions"] = {
+    name: bounds(window, name)
+    for name in (
+        "useWindowsDictationHotkeyButton",
+        "openSpeechSettingsButton",
+    )
+}
+
 speak_dialog = find_child(window, "speakTestDialog")
 assert speak_dialog is not None
 assert QMetaObject.invokeMethod(
@@ -3987,8 +4038,13 @@ class SettingsShellSourceContractTests(unittest.TestCase):
         self.assertIn(
             "property string descriptionObjectName", self.inline_settings_row_qml
         )
+        self.assertIn("property alias editorData", self.inline_settings_row_qml)
+        self.assertIn("property int stateColumnWidth", self.inline_settings_row_qml)
+        self.assertIn("property int actionColumnWidth", self.inline_settings_row_qml)
         self.assertIn("default property alias actionData", self.inline_settings_row_qml)
         self.assertIn("AbstractButton {", self.mapping_card_qml)
+        self.assertIn("implicitHeight: 49", self.mapping_card_qml)
+        self.assertNotIn("mappingCardHeight", self.buttons_qml)
 
     def test_all_selectors_reuse_one_selected_option_delegate(self):
         self.assertEqual(self.voice_qml.count("SelectionComboBox {"), 2)
@@ -4228,11 +4284,15 @@ class SettingsShellSourceContractTests(unittest.TestCase):
         self.assertNotIn("SettingsController.settingsDirty", self.voice_qml)
         self.assertNotIn("voiceProgramStatusText.indexOf", self.voice_qml)
 
-    def test_diagnostics_uses_the_shared_four_character_button_width(self):
+    def test_voice_rows_use_the_shared_fixed_action_column(self):
+        self.assertIn(
+            "settingsActionColumnWidth: tokens.buttonWidth9Chars",
+            self.voice_qml,
+        )
         self.assertRegex(
             self.voice_qml,
             r'(?s)objectName: "testVbCableChannelButton".*?'
-            r"compactMinimumWidth: tokens\.buttonWidth4Chars",
+            r"Layout\.fillWidth: true",
         )
 
 
@@ -4468,6 +4528,7 @@ class OffscreenQmlLoadTests(unittest.TestCase):
             ("Basic", 720, 500),
             ("Basic", 640, 480),
             ("FluentWinUI3", 720, 500),
+            ("FluentWinUI3", 640, 480),
         )
         for style, width, height in scenarios:
             with self.subTest(style=style, width=width, height=height), tempfile.TemporaryDirectory() as tmpdir:
@@ -4558,6 +4619,37 @@ class OffscreenQmlLoadTests(unittest.TestCase):
                     voice_items["voiceProgramCustomPathRow"]["bottom"],
                     voice_items["voiceProgramSection"]["bottom"] + 1,
                 )
+
+                voice_columns = data["voice_columns"]
+                action_columns = list(voice_columns["actions"].values())
+                state_columns = list(voice_columns["states"].values())
+                reference_action = action_columns[0]
+                reference_state = state_columns[0]
+                for column in action_columns:
+                    self.assertTrue(column["visible"])
+                    self.assertAlmostEqual(column["x"], reference_action["x"], delta=1)
+                    self.assertAlmostEqual(column["width"], 120, delta=1)
+                for column in state_columns:
+                    self.assertTrue(column["visible"])
+                    self.assertAlmostEqual(column["x"], reference_state["x"], delta=1)
+                    self.assertAlmostEqual(column["width"], 54, delta=1)
+                    self.assertLessEqual(column["right"], reference_action["x"] + 1)
+
+                for control in (
+                    *voice_columns["right_controls"].values(),
+                    *data["voice_windows_actions"].values(),
+                ):
+                    self.assertTrue(control["visible"])
+                    self.assertAlmostEqual(control["x"], reference_action["x"], delta=1)
+                    self.assertAlmostEqual(control["width"], 120, delta=1)
+                    self.assertLessEqual(control["right"], width + 1)
+
+                editors = list(voice_columns["editors"].values())
+                for editor in editors:
+                    self.assertTrue(editor["visible"])
+                    self.assertAlmostEqual(editor["x"], editors[0]["x"], delta=1)
+                    self.assertGreaterEqual(editor["width"], 130)
+                    self.assertLessEqual(editor["right"], reference_state["x"] + 1)
 
     def _legacy_settings_shell_fits_supported_logical_viewports_without_horizontal_overflow(self):
         import json
@@ -5562,6 +5654,7 @@ _render(window, app)
 
 mapping_list = _find(window, "mappingList")
 actions_panel = _find(window, "mappingActionsPanel")
+view_switcher = _find(window, "mappingViewSwitcher")
 single_view_button = _find(window, "singleMappingViewButton")
 combo_view_button = _find(window, "comboMappingViewButton")
 mapping_lines = _find(window, "mappingLines")
@@ -5573,6 +5666,7 @@ photo_frame = _find(window, "photoFrame")
 photo_image = _find(window, "photoImage")
 assert mapping_list is not None, "mappingList not found"
 assert actions_panel is not None
+assert view_switcher is not None
 assert single_view_button is not None and combo_view_button is not None
 assert mapping_lines is not None and active_mapping_line is not None
 assert left_cards is not None and right_cards is not None
@@ -5648,11 +5742,13 @@ value_names = {
     "long": "mappingLongPrimaryText_power",
 }
 value_baselines = {}
+value_geometries = {}
 for key, object_name in value_names.items():
     item = _find(window, object_name)
     assert item is not None, object_name
     position = item.mapToScene(QPointF(0.0, 0.0))
     value_baselines[key] = position.y() + float(item.property("baselineOffset"))
+    value_geometries[key] = _geometry(item)
 
 power_card = cards["power"]
 click_point = power_card.mapToScene(
@@ -5693,6 +5789,7 @@ results_out = {
     "card_count": sum(bool(item.property("visible")) for item in cards.values()),
     "selected_after_power_click": controller.property("selectedButtonId"),
     "editor_visible": bool(editor.property("visible")),
+    "view_switcher": _geometry(view_switcher),
     "actions_panel": _geometry(actions_panel),
     "mapping_list": _geometry(mapping_list),
     "combo_view": {
@@ -5716,6 +5813,7 @@ results_out = {
     "cards": {button_id: _geometry(item) for button_id, item in cards.items()},
     "power_columns": power_columns,
     "value_baselines": value_baselines,
+    "value_geometries": value_geometries,
     "photo": {
         "sidebar": _geometry(photo_sidebar),
         "frame": _geometry(photo_frame),
@@ -5876,19 +5974,33 @@ class ButtonsPageMappingCardTests(unittest.TestCase):
             self.assertAlmostEqual(canvas["bottom"], board["bottom"], delta=1)
 
     def test_board_fits_default_minimum_and_large_windows(self):
-        viewports = (("Basic", 720, 500), ("Basic", 640, 480), ("FluentWinUI3", 720, 500), ("FluentWinUI3", 840, 720))
+        viewports = (
+            ("Basic", 720, 500),
+            ("Basic", 640, 480),
+            ("FluentWinUI3", 720, 500),
+            ("FluentWinUI3", 640, 480),
+            ("FluentWinUI3", 840, 720),
+        )
         for style, width, height in viewports:
             data = self._run_probe(width, height, style)
             self.assertAlmostEqual(data["photo"]["sidebar"]["width"], 86, delta=0.5)
             self.assertLessEqual(data["mapping_list"]["right"], width + 1)
             self.assertLessEqual(data["actions_panel"]["right"], width + 1)
+            self.assertLessEqual(
+                data["view_switcher"]["bottom"], data["mapping_list"]["y"] + 1
+            )
             self.assertLessEqual(data["mapping_list"]["bottom"], data["actions_panel"]["y"] + 1)
             self.assertLessEqual(data["combo_view"]["list"]["bottom"], data["actions_panel"]["y"] + 1)
             self.assertLess(data["left_cards"]["x"], data["photo"]["sidebar"]["x"])
             self.assertLess(data["photo"]["sidebar"]["x"], data["right_cards"]["x"])
+            for card_column in (data["left_cards"], data["right_cards"]):
+                self.assertGreaterEqual(card_column["y"], data["mapping_list"]["y"] - 1)
+                self.assertLessEqual(
+                    card_column["bottom"], data["mapping_list"]["bottom"] + 1
+                )
             for card in data["cards"].values():
-                self.assertGreaterEqual(card["height"], 54)
-                self.assertLessEqual(card["height"], 56)
+                self.assertGreaterEqual(card["height"], 48)
+                self.assertLessEqual(card["height"], 50)
                 self.assertLessEqual(card["right"], width + 1)
                 self.assertLessEqual(card["bottom"], height + 1)
             previous_bottom = None
@@ -5915,6 +6027,10 @@ class ButtonsPageMappingCardTests(unittest.TestCase):
             baselines = data["value_baselines"]
             self.assertAlmostEqual(baselines["single"], baselines["double"], delta=1)
             self.assertAlmostEqual(baselines["double"], baselines["long"], delta=1)
+            power_card = data["cards"]["power"]
+            for item in data["value_geometries"].values():
+                self.assertGreaterEqual(item["y"], power_card["y"] - 1)
+                self.assertLessEqual(item["bottom"], power_card["bottom"] + 1)
 
 
 if __name__ == "__main__":

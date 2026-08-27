@@ -19,7 +19,7 @@ AbstractButton {
     property bool exposeObjectNames: true
 
     hoverEnabled: true
-    implicitHeight: 55
+    implicitHeight: 49
     leftPadding: 4
     rightPadding: 4
     topPadding: 3

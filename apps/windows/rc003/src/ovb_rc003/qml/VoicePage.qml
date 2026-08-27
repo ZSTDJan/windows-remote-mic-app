@@ -9,6 +9,8 @@ Item {
     property var tokens
     property bool voiceHotkeyRecording: false
     property string voiceHotkeyCaptureError: ""
+    readonly property int settingsStateColumnWidth: 54
+    readonly property int settingsActionColumnWidth: tokens.buttonWidth9Chars
 
     readonly property bool voiceProgramManaged:
         SettingsController.selectedVoiceProgramIndex !== 0
@@ -367,6 +369,8 @@ Item {
                 InlineSettingsRow {
                     objectName: "virtualAudioRow"
                     tokens: root.tokens
+                    stateColumnWidth: root.settingsStateColumnWidth
+                    actionColumnWidth: root.settingsActionColumnWidth
                     titleText: qsTr("虚拟音频")
                     descriptionText: root.checkDetail(
                         "vb_cable_endpoints",
@@ -378,7 +382,7 @@ Item {
                     CompactButton {
                         objectName: "installVirtualAudioButton"
                         tokens: root.tokens
-                        compactMinimumWidth: tokens.buttonWidth6Chars
+                        Layout.fillWidth: true
                         text: qsTr("安装虚拟音频")
                         enabled: !DiagnosticsController.vbCableTestRunning
                         onClicked: driverConfirmDialog.open()
@@ -388,28 +392,32 @@ Item {
                 InlineSettingsRow {
                     objectName: "outputEndpointRow"
                     tokens: root.tokens
+                    stateColumnWidth: root.settingsStateColumnWidth
+                    actionColumnWidth: root.settingsActionColumnWidth
                     titleText: qsTr("输出端点")
                     descriptionText: ""
                     stateText: root.checkState("output_endpoint")
                     stateColor: root.checkColor("output_endpoint")
 
-                    SelectionComboBox {
-                        id: endpointCombo
-                        objectName: "endpointCombo"
-                        tokens: root.tokens
-                        recommendedIndex: SettingsController.recommendedEndpointIndex
-                        Layout.preferredWidth: 220
-                        Layout.minimumWidth: 180
-                        model: SettingsController.endpointOptions
-                        currentIndex: SettingsController.selectedEndpointIndex
-                        onActivated: SettingsController.selectedEndpointIndex = index
-                        enabled: !DiagnosticsController.vbCableTestRunning
-                        Accessible.name: qsTr("输出端点")
-                    }
+                    editorData: [
+                        SelectionComboBox {
+                            id: endpointCombo
+                            objectName: "endpointCombo"
+                            tokens: root.tokens
+                            recommendedIndex: SettingsController.recommendedEndpointIndex
+                            Layout.fillWidth: true
+                            Layout.minimumWidth: 180
+                            model: SettingsController.endpointOptions
+                            currentIndex: SettingsController.selectedEndpointIndex
+                            onActivated: SettingsController.selectedEndpointIndex = index
+                            enabled: !DiagnosticsController.vbCableTestRunning
+                            Accessible.name: qsTr("输出端点")
+                        }
+                    ]
                     CompactButton {
                         objectName: "applyVoiceSettingsButton"
                         tokens: root.tokens
-                        compactMinimumWidth: tokens.buttonWidth2Chars
+                        Layout.fillWidth: true
                         text: qsTr("应用")
                         highlighted: true
                         enabled: !DiagnosticsController.vbCableTestRunning
@@ -421,23 +429,27 @@ Item {
                 InlineSettingsRow {
                     objectName: "targetApplicationRow"
                     tokens: root.tokens
+                    stateColumnWidth: root.settingsStateColumnWidth
+                    actionColumnWidth: root.settingsActionColumnWidth
                     titleText: qsTr("目标应用")
                     descriptionText: qsTr("麦克风输入请选择 CABLE Output")
                     stateText: root.checkState("dictation")
                     stateColor: root.checkColor("dictation")
                     showDivider: false
 
-                    CompactButton {
-                        objectName: "openMicrophonePrivacyButton"
-                        tokens: root.tokens
-                        compactMinimumWidth: tokens.buttonWidth4Chars
-                        text: qsTr("麦克风隐私")
-                        onClicked: SettingsController.openMicrophonePrivacySettings()
-                    }
+                    editorData: [
+                        CompactButton {
+                            objectName: "openMicrophonePrivacyButton"
+                            tokens: root.tokens
+                            compactMinimumWidth: tokens.buttonWidth4Chars
+                            text: qsTr("麦克风隐私")
+                            onClicked: SettingsController.openMicrophonePrivacySettings()
+                        }
+                    ]
                     CompactButton {
                         objectName: "openSoundInputSettingsButton"
                         tokens: root.tokens
-                        compactMinimumWidth: tokens.buttonWidth4Chars
+                        Layout.fillWidth: true
                         text: qsTr("声音输入")
                         onClicked: SettingsController.openSoundSettings()
                     }
@@ -462,46 +474,54 @@ Item {
                 InlineSettingsRow {
                     objectName: "voiceProgramSelectionRow"
                     tokens: root.tokens
+                    stateColumnWidth: root.settingsStateColumnWidth
+                    actionColumnWidth: root.settingsActionColumnWidth
                     titleText: qsTr("选择程序")
                     descriptionObjectName: "voiceProgramStatusLabel"
                     descriptionText: root.voiceProgramStatusSummary()
                     stateText: root.voiceProgramManaged ? qsTr("已选择") : qsTr("不管理")
                     stateColor: root.voiceProgramStateColor
 
-                    SelectionComboBox {
-                        id: voiceProgramCombo
-                        objectName: "voiceProgramCombo"
-                        tokens: root.tokens
-                        Layout.preferredWidth: 220
-                        Layout.minimumWidth: 180
-                        model: SettingsController.voiceProgramOptions
-                        currentIndex: SettingsController.selectedVoiceProgramIndex
-                        onActivated: SettingsController.selectedVoiceProgramIndex = index
-                        Accessible.name: qsTr("语音程序")
-                    }
+                    editorData: [
+                        SelectionComboBox {
+                            id: voiceProgramCombo
+                            objectName: "voiceProgramCombo"
+                            tokens: root.tokens
+                            Layout.fillWidth: true
+                            Layout.minimumWidth: 180
+                            model: SettingsController.voiceProgramOptions
+                            currentIndex: SettingsController.selectedVoiceProgramIndex
+                            onActivated: SettingsController.selectedVoiceProgramIndex = index
+                            Accessible.name: qsTr("语音程序")
+                        }
+                    ]
                 }
 
                 InlineSettingsRow {
                     objectName: "voiceProgramCustomPathRow"
                     visible: root.customProgramSelected
                     tokens: root.tokens
+                    stateColumnWidth: root.settingsStateColumnWidth
+                    actionColumnWidth: root.settingsActionColumnWidth
                     titleText: qsTr("程序路径")
                     descriptionText: ""
 
-                    CompactTextField {
-                        objectName: "voiceProgramCustomPathField"
-                        tokens: root.tokens
-                        Layout.fillWidth: true
-                        Layout.minimumWidth: 180
-                        readOnly: true
-                        text: SettingsController.voiceProgramCustomPath
-                        placeholderText: qsTr("选择 .exe 或 .lnk")
-                        Accessible.name: qsTr("自定义语音程序路径")
-                    }
+                    editorData: [
+                        CompactTextField {
+                            objectName: "voiceProgramCustomPathField"
+                            tokens: root.tokens
+                            Layout.fillWidth: true
+                            Layout.minimumWidth: 180
+                            readOnly: true
+                            text: SettingsController.voiceProgramCustomPath
+                            placeholderText: qsTr("选择 .exe 或 .lnk")
+                            Accessible.name: qsTr("自定义语音程序路径")
+                        }
+                    ]
                     CompactButton {
                         objectName: "browseVoiceProgramButton"
                         tokens: root.tokens
-                        compactMinimumWidth: tokens.buttonWidth2Chars
+                        Layout.fillWidth: true
                         text: qsTr("选择")
                         onClicked: voiceProgramFileDialog.open()
                     }
@@ -510,6 +530,8 @@ Item {
                 InlineSettingsRow {
                     objectName: "voiceHotkeyRow"
                     tokens: root.tokens
+                    stateColumnWidth: root.settingsStateColumnWidth
+                    actionColumnWidth: root.settingsActionColumnWidth
                     titleText: qsTr("语音按键")
                     descriptionText: root.voiceHotkeyCaptureError.length > 0
                         ? root.voiceHotkeyCaptureError
@@ -517,28 +539,30 @@ Item {
                             ? qsTr("Windows 语音输入建议使用 Win+H")
                             : qsTr("需要与语音程序的唤起键一致")
 
-                    CompactTextField {
-                        id: voiceHotkeyField
-                        objectName: "holdVoiceHotkeyField"
-                        tokens: root.tokens
-                        Layout.preferredWidth: 150
-                        Layout.minimumWidth: 130
-                        readOnly: true
-                        text: root.voiceHotkeyRecording
-                            ? qsTr("请按快捷键")
-                            : SettingsController.holdVoiceHotkeyText
-                        color: root.voiceHotkeyRecording
-                            ? tokens.accent : tokens.textPrimary
-                        placeholderText: qsTr("点击录入")
-                        Accessible.name: qsTr("语音按键，点击后直接录入")
-                        Keys.onEscapePressed: root.stopVoiceHotkeyCapture()
-                        TapHandler { onTapped: root.startVoiceHotkeyCapture() }
-                    }
+                    editorData: [
+                        CompactTextField {
+                            id: voiceHotkeyField
+                            objectName: "holdVoiceHotkeyField"
+                            tokens: root.tokens
+                            Layout.fillWidth: true
+                            Layout.minimumWidth: 130
+                            readOnly: true
+                            text: root.voiceHotkeyRecording
+                                ? qsTr("请按快捷键")
+                                : SettingsController.holdVoiceHotkeyText
+                            color: root.voiceHotkeyRecording
+                                ? tokens.accent : tokens.textPrimary
+                            placeholderText: qsTr("点击录入")
+                            Accessible.name: qsTr("语音按键，点击后直接录入")
+                            Keys.onEscapePressed: root.stopVoiceHotkeyCapture()
+                            TapHandler { onTapped: root.startVoiceHotkeyCapture() }
+                        }
+                    ]
                     CompactButton {
                         objectName: "useWindowsDictationHotkeyButton"
                         visible: root.windowsDictationSelected
                         tokens: root.tokens
-                        compactMinimumWidth: tokens.buttonWidth6Chars
+                        Layout.fillWidth: true
                         text: qsTr("使用 Win+H")
                         onClicked: SettingsController.useWindowsDictationHotkey()
                     }
@@ -547,6 +571,8 @@ Item {
                 InlineSettingsRow {
                     objectName: "voiceProgramSpecificRow"
                     tokens: root.tokens
+                    stateColumnWidth: root.settingsStateColumnWidth
+                    actionColumnWidth: root.settingsActionColumnWidth
                     titleText: root.windowsDictationSelected
                         ? qsTr("系统设置") : qsTr("程序启动")
                     descriptionObjectName: "voiceProgramLaunchText"
@@ -563,7 +589,7 @@ Item {
                         objectName: "openSpeechSettingsButton"
                         visible: root.windowsDictationSelected
                         tokens: root.tokens
-                        compactMinimumWidth: tokens.buttonWidth6Chars
+                        Layout.fillWidth: true
                         text: qsTr("Windows 语音设置")
                         onClicked: SettingsController.openSpeechSettings()
                     }
@@ -573,6 +599,7 @@ Item {
                         visible: !root.windowsDictationSelected
                             && !root.voiceProgramSystemManaged
                         implicitHeight: tokens.controlHeight
+                        Layout.fillWidth: true
                         enabled: root.voiceProgramManaged
                         text: qsTr("管理员启动")
                         font.family: tokens.fontFamily
@@ -601,6 +628,8 @@ Item {
                 InlineSettingsRow {
                     objectName: "soundChannelTestRow"
                     tokens: root.tokens
+                    stateColumnWidth: root.settingsStateColumnWidth
+                    actionColumnWidth: root.settingsActionColumnWidth
                     titleText: qsTr("声音通道")
                     descriptionText: DiagnosticsController.vbCableTestMessage.length > 0
                         ? DiagnosticsController.vbCableTestMessage
@@ -618,20 +647,22 @@ Item {
                             : DiagnosticsController.vbCableTestStatus === "fail"
                                 ? tokens.errorColor : tokens.disabledText
 
-                    CompactButton {
-                        objectName: "recoverBridgeButton"
-                        visible: DiagnosticsController.vbCableBridgeRecoveryNeeded
-                        tokens: root.tokens
-                        compactMinimumWidth: tokens.buttonWidth4Chars
-                        text: qsTr("启动服务")
-                        highlighted: true
-                        enabled: !SettingsController.bridgeLaunchBusy
-                        onClicked: SettingsController.startBridge()
-                    }
+                    editorData: [
+                        CompactButton {
+                            objectName: "recoverBridgeButton"
+                            visible: DiagnosticsController.vbCableBridgeRecoveryNeeded
+                            tokens: root.tokens
+                            compactMinimumWidth: tokens.buttonWidth4Chars
+                            text: qsTr("启动服务")
+                            highlighted: true
+                            enabled: !SettingsController.bridgeLaunchBusy
+                            onClicked: SettingsController.startBridge()
+                        }
+                    ]
                     CompactButton {
                         objectName: "testVbCableChannelButton"
                         tokens: root.tokens
-                        compactMinimumWidth: tokens.buttonWidth4Chars
+                        Layout.fillWidth: true
                         text: DiagnosticsController.vbCableTestRunning
                             ? qsTr("测试中…") : qsTr("测试通道")
                         enabled: !DiagnosticsController.isRefreshing
@@ -646,6 +677,8 @@ Item {
                 InlineSettingsRow {
                     objectName: "actualSpeechTestRow"
                     tokens: root.tokens
+                    stateColumnWidth: root.settingsStateColumnWidth
+                    actionColumnWidth: root.settingsActionColumnWidth
                     titleText: qsTr("实际说话")
                     descriptionText: qsTr("打开输入框，由所选语音程序直接输入文字")
                     stateText: qsTr("待实测")
@@ -655,7 +688,7 @@ Item {
                     CompactButton {
                         objectName: "trySpeakingButton"
                         tokens: root.tokens
-                        compactMinimumWidth: tokens.buttonWidth4Chars
+                        Layout.fillWidth: true
                         text: qsTr("试说一句")
                         highlighted: true
                         onClicked: speakTestDialog.open()

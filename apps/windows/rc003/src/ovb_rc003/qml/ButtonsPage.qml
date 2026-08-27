@@ -12,7 +12,6 @@ Item {
     property var tokens
     readonly property var leftButtonIds: ["power", "up", "left", "back", "home", "menu"]
     readonly property real mappingCardGap: 2
-    readonly property real mappingCardHeight: 55
     readonly property real mappingBoardGap: 6
     property int mappingViewIndex: 0
     property bool connectorRepaintQueued: false
@@ -871,7 +870,7 @@ Item {
                             cardId: buttonId
                             Layout.row: root.visualRow(buttonId)
                             Layout.fillWidth: true
-                            Layout.preferredHeight: visible ? root.mappingCardHeight : 0
+                            Layout.preferredHeight: visible ? implicitHeight : 0
                             buttonName: root.shortButtonName(buttonId)
                             singleText: actionText
                             doubleText: doubleClickText
@@ -1083,7 +1082,7 @@ Item {
                             cardId: buttonId
                             Layout.row: root.visualRow(buttonId)
                             Layout.fillWidth: true
-                            Layout.preferredHeight: visible ? root.mappingCardHeight : 0
+                            Layout.preferredHeight: visible ? implicitHeight : 0
                             buttonName: root.shortButtonName(buttonId)
                             singleText: actionText
                             doubleText: doubleClickText
