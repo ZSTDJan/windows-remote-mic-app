@@ -217,8 +217,8 @@ def open_quicker_uri(
 def _launch_uri(uri: str) -> None:
     if sys.platform != "win32" or not hasattr(os, "startfile"):
         raise OSError("Windows URI protocol launch is unavailable")
-    # Passing the URI directly to ShellExecute avoids cmd.exe/PowerShell and
-    # therefore does not reinterpret action parameters as shell syntax.
+    # Passing the URI directly to Windows' registered protocol handler avoids
+    # cmd.exe/PowerShell reinterpreting action parameters as shell syntax.
     os.startfile(uri)  # type: ignore[attr-defined]
 
 
