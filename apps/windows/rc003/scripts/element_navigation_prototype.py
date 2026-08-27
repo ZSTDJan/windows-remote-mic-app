@@ -267,7 +267,7 @@ def _common_path_prefix_length(
 def horizontal_wrap_target_indices(
     targets: Sequence[TargetSnapshot], current_index: int, direction: Direction
 ) -> list[int]:
-    """Wrap right/left between visual rows inside the same UIA content branch."""
+    """Wrap right/left to a nearby visual row when the current row ends."""
 
     if direction not in {Direction.RIGHT, Direction.LEFT}:
         return []
@@ -304,14 +304,23 @@ def horizontal_wrap_target_indices(
             row_gap = max(0, current.rect.top - candidate.rect.bottom)
             edge_order = -candidate.rect.right
 
+        max_row_gap = max(
+            96.0,
+            min(
+                320.0,
+                max(current.rect.height, candidate.rect.height) * 4.0,
+            ),
+        )
+        if row_gap > max_row_gap:
+            continue
         common_prefix = _common_path_prefix_length(current.path, candidate.path)
         if current.path and candidate.path and common_prefix == 0:
             continue
         candidates.append(
             (
-                -common_prefix,
                 row_gap,
                 abs(vertical_delta),
+                -common_prefix,
                 edge_order,
                 index,
             )
@@ -339,7 +348,32 @@ def ranked_target_indices(
                 targets[current_index].path, target.path
             )
             scored.append((score, common_prefix, index))
-    scored.sort(key=lambda item: (item[0][0], -item[1], *item[0][1:]))
+    affinity_unit = max(
+        48.0,
+        min(120.0, max(current.width, current.height) * 0.55),
+    )
+
+    def rank_key(
+        item: tuple[
+            tuple[int, float, float, float, float, int, int], int, int
+        ],
+    ) -> tuple[float, ...]:
+        score, common_prefix, _index = item
+        path_bonus = min(common_prefix, 4) * (
+            24.0 if score[0] == 0 else affinity_unit
+        )
+        return (
+            float(score[0]),
+            max(0.0, score[1] - path_bonus),
+            score[2],
+            score[3] - path_bonus,
+            score[4],
+            float(-common_prefix),
+            float(score[5]),
+            float(score[6]),
+        )
+
+    scored.sort(key=rank_key)
     if direction not in {Direction.RIGHT, Direction.LEFT}:
         return [index for _score, _prefix, index in scored]
 
@@ -353,6 +387,58 @@ def ranked_target_indices(
     ranked.extend(index for index in wrapped if index not in ranked)
     ranked.extend(index for index in diagonal if index not in ranked)
     return ranked
+
+
+OPPOSITE_DIRECTION = {
+    Direction.UP: Direction.DOWN,
+    Direction.DOWN: Direction.UP,
+    Direction.LEFT: Direction.RIGHT,
+    Direction.RIGHT: Direction.LEFT,
+}
+
+
+class NavigationGraph:
+    """Lazily cache four-way neighbors for one stable target layout."""
+
+    def __init__(self, targets: Sequence[TargetSnapshot]) -> None:
+        self.targets = tuple(targets)
+        self._ranked: dict[tuple[int, Direction], tuple[int, ...]] = {}
+
+    def candidates(self, current_index: int, direction: Direction) -> tuple[int, ...]:
+        key = (current_index, direction)
+        cached = self._ranked.get(key)
+        if cached is not None:
+            return cached
+
+        ranked = tuple(
+            ranked_target_indices(self.targets, current_index, direction)
+        )
+        self._ranked[key] = ranked
+        if ranked:
+            neighbor = ranked[0]
+            reverse_key = (neighbor, OPPOSITE_DIRECTION[direction])
+            if reverse_key not in self._ranked:
+                reverse = tuple(
+                    ranked_target_indices(
+                        self.targets,
+                        neighbor,
+                        OPPOSITE_DIRECTION[direction],
+                    )
+                )
+                if not reverse or reverse[0] == current_index:
+                    self._ranked[reverse_key] = (
+                        (current_index,) + tuple(
+                            index for index in reverse if index != current_index
+                        )
+                    )
+        return ranked
+
+
+def geometry_anchor_indices(count: int, selected: int) -> list[int]:
+    if count <= 0:
+        return []
+    candidates = [selected, 0, count // 2, count - 1]
+    return list(dict.fromkeys(index for index in candidates if 0 <= index < count))
 
 
 def shifted_snapshot(target: TargetSnapshot, delta_x: int, delta_y: int) -> TargetSnapshot:
@@ -1282,13 +1368,26 @@ def _run_windows(args: argparse.Namespace) -> int:
         return "mouse fallback"
 
     class AutomationWorker:
+        _PENDING_LIMITS = {
+            "move": 2,
+            "parent": 1,
+            "child": 1,
+            "activate": 1,
+            "back": 1,
+            "sync_window": 1,
+        }
+        _NAVIGATION_COMMANDS = frozenset(_PENDING_LIMITS)
+
         def __init__(self) -> None:
-            self.commands: queue.Queue[tuple[str, Any]] = queue.Queue()
+            self.commands: queue.Queue[tuple[str, Any, int]] = queue.Queue()
             self.events: queue.Queue[tuple[str, Any]] = queue.Queue()
             self._post_lock = threading.Lock()
-            self._sync_pending = False
+            self._generation = 0
+            self._pending_counts: dict[str, int] = {}
+            self.context_valid = False
             self.all_targets: list[RuntimeTarget] = []
             self.targets: list[RuntimeTarget] = []
+            self.navigation_graph = NavigationGraph(())
             self.node_types: dict[tuple[int, ...], str] = {}
             self.hierarchy: list[RuntimeTarget] = []
             self.hierarchy_index = -1
@@ -1308,12 +1407,20 @@ def _run_windows(args: argparse.Namespace) -> int:
             self._thread.start()
 
         def post(self, command: str, value: Any = None) -> None:
-            if command == "sync_window":
-                with self._post_lock:
-                    if self._sync_pending:
+            with self._post_lock:
+                limit = self._PENDING_LIMITS.get(command)
+                if limit is not None:
+                    pending = self._pending_counts.get(command, 0)
+                    if pending >= limit:
                         return
-                    self._sync_pending = True
-            self.commands.put((command, value))
+                    self._pending_counts[command] = pending + 1
+                generation = self._generation
+            self.commands.put((command, value, generation))
+
+        def deactivate(self) -> None:
+            with self._post_lock:
+                self._generation += 1
+                self.context_valid = False
 
         def stop(self) -> None:
             self.post("stop")
@@ -1363,6 +1470,12 @@ def _run_windows(args: argparse.Namespace) -> int:
                     return
             self.targets.append(target)
             self.selected = len(self.targets) - 1
+            self._rebuild_navigation_graph()
+
+        def _rebuild_navigation_graph(self) -> None:
+            self.navigation_graph = NavigationGraph(
+                [target.snapshot for target in self.targets]
+            )
 
         def _set_hierarchy(
             self,
@@ -1496,18 +1609,48 @@ def _run_windows(args: argparse.Namespace) -> int:
             except Exception:
                 return False
 
-        def _sync_window_geometry(self) -> None:
-            if not self.hwnd or not self.targets:
+        def _target_is_navigable(self, target: RuntimeTarget) -> bool:
+            if semantic_action_can_bypass_point_hit(target.snapshot):
+                return self._update_live_target(target)
+            return self._target_is_exposed(target)
+
+        def _invalidate_navigation(self, reason: str) -> None:
+            if not self.context_valid:
                 return
+            self.context_valid = False
+            self.events.put(("navigation_invalidated", reason))
+
+        def _content_geometry_is_current(self) -> bool:
+            for index in geometry_anchor_indices(len(self.targets), self.selected):
+                target = self.targets[index]
+                if target.control is None:
+                    continue
+                try:
+                    if bool(target.control.IsOffscreen):
+                        return False
+                    if rect_from_control(target.control) != target.snapshot.rect:
+                        return False
+                except Exception:
+                    return False
+            return True
+
+        def _sync_window_geometry(self) -> bool:
+            if not self.context_valid or not self.hwnd or not self.targets:
+                return False
             try:
                 root = auto.ControlFromHandle(self.hwnd)
                 if root is None:
-                    return
+                    self._invalidate_navigation("目标窗口已经关闭")
+                    return False
                 current_window_rect = rect_from_control(root)
             except Exception:
-                return
+                self._invalidate_navigation("无法继续读取目标窗口")
+                return False
             if current_window_rect == self.window_rect:
-                return
+                if not self._content_geometry_is_current():
+                    self._invalidate_navigation("页面内容已经滚动或重新排版")
+                    return False
+                return True
 
             if (
                 current_window_rect.width == self.window_rect.width
@@ -1528,7 +1671,7 @@ def _run_windows(args: argparse.Namespace) -> int:
                     )
                 )
                 self._emit_selection()
-                return
+                return True
 
             previous = (
                 self.targets[self.selected].snapshot
@@ -1540,6 +1683,7 @@ def _run_windows(args: argparse.Namespace) -> int:
             self._reset_hierarchy_for_selected()
             self.events.put(("geometry_rescanned", None))
             self._emit_selection()
+            return True
 
         def _enumerate(self, hwnd: int) -> None:
             (
@@ -1551,6 +1695,7 @@ def _run_windows(args: argparse.Namespace) -> int:
             ) = enumerate_targets(hwnd)
             self.hwnd = hwnd
             self.invalid_targets.clear()
+            self.context_valid = True
 
         def _apply_targets(
             self,
@@ -1561,6 +1706,7 @@ def _run_windows(args: argparse.Namespace) -> int:
             snapshots = [target.snapshot for target in self.all_targets]
             visible_indices = flat_target_indices(snapshots)
             self.targets = [self.all_targets[index] for index in visible_indices]
+            self._rebuild_navigation_graph()
             visible_snapshots = [target.snapshot for target in self.targets]
             if restore is not None:
                 self.selected = restore_target_index(visible_snapshots, restore)
@@ -1571,6 +1717,29 @@ def _run_windows(args: argparse.Namespace) -> int:
                     self.window_rect,
                     cursor_point() if use_cursor else None,
                 )
+
+        def _move(self, direction: Direction) -> None:
+            if not self._sync_window_geometry():
+                return
+            for next_index in self.navigation_graph.candidates(
+                self.selected, direction
+            ):
+                target = self.targets[next_index]
+                token = self._identity_token(target.snapshot)
+                if token in self.invalid_targets:
+                    continue
+                previous_rect = target.snapshot.rect
+                if not self._target_is_navigable(target):
+                    self.invalid_targets.add(token)
+                    self.events.put(("target_skipped", target.snapshot))
+                    continue
+                if target.snapshot.rect != previous_rect:
+                    self._invalidate_navigation("页面内容已经滚动或重新排版")
+                    return
+                self.selected = next_index
+                self._reset_hierarchy_for_selected()
+                self._emit_selection()
+                return
 
         def _selection_payload(self) -> dict[str, Any]:
             snapshots = [target.snapshot for target in self.targets]
@@ -1724,7 +1893,8 @@ def _run_windows(args: argparse.Namespace) -> int:
             if not self.targets or self.selected < 0:
                 return
             started = time.perf_counter()
-            self._sync_window_geometry()
+            if not self._sync_window_geometry():
+                return
             target = self.targets[self.selected]
             if not self._update_live_target(target):
                 self._refresh_invalid_target(target)
@@ -1782,40 +1952,40 @@ def _run_windows(args: argparse.Namespace) -> int:
             auto.InitializeUIAutomationInCurrentThread()
             try:
                 while True:
-                    command, value = self.commands.get()
+                    command, value, generation = self.commands.get()
                     try:
-                        if command == "sync_window":
-                            with self._post_lock:
-                                self._sync_pending = False
+                        with self._post_lock:
+                            if command in self._pending_counts:
+                                self._pending_counts[command] = max(
+                                    0, self._pending_counts[command] - 1
+                                )
+                            current_generation = self._generation
+                        if (
+                            command in self._NAVIGATION_COMMANDS
+                            and generation != current_generation
+                        ):
+                            continue
                         if command == "stop":
                             return
                         if command == "scan":
                             self._scan(int(value))
-                        elif command == "move" and self.targets and self.selected >= 0:
-                            self._sync_window_geometry()
-                            snapshots = [target.snapshot for target in self.targets]
-                            for next_index in ranked_target_indices(
-                                snapshots, self.selected, Direction(value)
-                            ):
-                                target = self.targets[next_index]
-                                token = self._identity_token(target.snapshot)
-                                if token in self.invalid_targets:
-                                    continue
-                                if not self._target_is_exposed(target):
-                                    self.invalid_targets.add(token)
-                                    self.events.put(("target_skipped", target.snapshot))
-                                    continue
-                                self.selected = next_index
-                                self._reset_hierarchy_for_selected()
-                                self._emit_selection()
-                                break
-                        elif command == "parent":
-                            self._sync_window_geometry()
+                        elif (
+                            command == "move"
+                            and self.context_valid
+                            and self.targets
+                            and self.selected >= 0
+                        ):
+                            self._move(Direction(value))
+                        elif command == "parent" and self._sync_window_geometry():
                             self._cycle_hierarchy(1)
-                        elif command == "child":
-                            self._sync_window_geometry()
+                        elif command == "child" and self._sync_window_geometry():
                             self._cycle_hierarchy(-1)
-                        elif command == "activate" and self.targets and self.selected >= 0:
+                        elif (
+                            command == "activate"
+                            and self.context_valid
+                            and self.targets
+                            and self.selected >= 0
+                        ):
                             self._activate()
                         elif command == "back":
                             self._back()
@@ -2136,6 +2306,7 @@ def _run_windows(args: argparse.Namespace) -> int:
 
     def leave_navigation() -> None:
         active.clear()
+        worker.deactivate()
         overlay.clear_target()
 
     def request_quit() -> None:
@@ -2205,14 +2376,14 @@ def _run_windows(args: argparse.Namespace) -> int:
                         payload["hierarchy_count"],
                     )
             elif event == "selection":
-                active.set()
-                overlay.show_target(
-                    payload["target"],
-                    payload["selected"],
-                    payload["count"],
-                    payload["hierarchy_index"],
-                    payload["hierarchy_count"],
-                )
+                if active.is_set():
+                    overlay.show_target(
+                        payload["target"],
+                        payload["selected"],
+                        payload["count"],
+                        payload["hierarchy_index"],
+                        payload["hierarchy_count"],
+                    )
             elif event == "expanded":
                 target = payload["target"]
                 print(
@@ -2235,6 +2406,9 @@ def _run_windows(args: argparse.Namespace) -> int:
                 )
             elif event == "geometry_rescanned":
                 print("窗口尺寸或缩放变化，已重新扫描。")
+            elif event == "navigation_invalidated":
+                print(f"导航已暂停: {payload}，请重新按 Ctrl+Alt+N。")
+                leave_navigation()
             elif event == "target_skipped":
                 print(
                     f"已跳过当前无法命中的元素: "
@@ -2249,11 +2423,19 @@ def _run_windows(args: argparse.Namespace) -> int:
     timer.timeout.connect(drain_events)
     timer.start(20)
 
+    def monitor_navigation_context() -> None:
+        if not active.is_set():
+            return
+        foreground = int(user32.GetForegroundWindow())
+        if worker.hwnd and foreground != worker.hwnd:
+            print("导航已暂停: 已切换到其它窗口，请重新按 Ctrl+Alt+N。")
+            leave_navigation()
+            return
+        worker.post("sync_window")
+
     geometry_timer = QTimer()
-    geometry_timer.timeout.connect(
-        lambda: worker.post("sync_window") if active.is_set() else None
-    )
-    geometry_timer.start(150)
+    geometry_timer.timeout.connect(monitor_navigation_context)
+    geometry_timer.start(250)
 
     def cleanup() -> None:
         hook.stop()

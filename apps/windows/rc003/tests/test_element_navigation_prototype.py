@@ -105,6 +105,28 @@ class SpatialNavigationTests(unittest.TestCase):
             [1, 2],
         )
 
+    def test_visual_distance_beats_deeper_uia_branch(self):
+        targets = [
+            self.target(500, 100, 600, 150, "current", path=(0, 2, 0)),
+            self.target(900, 100, 1000, 150, "same branch", path=(0, 2, 5)),
+            self.target(620, 100, 720, 150, "near branch", path=(0, 1, 0)),
+        ]
+        self.assertEqual(
+            prototype.next_target_index(targets, 0, prototype.Direction.RIGHT),
+            2,
+        )
+
+    def test_horizontal_wrap_does_not_cross_a_distant_blank_region(self):
+        targets = [
+            self.target(900, 100, 960, 140, "current", path=(0, 2, 0)),
+            self.target(500, 900, 560, 940, "far next row", path=(0, 2, 1)),
+            self.target(980, 210, 1040, 250, "near diagonal", path=(0, 1, 0)),
+        ]
+        self.assertEqual(
+            prototype.next_target_index(targets, 0, prototype.Direction.RIGHT),
+            2,
+        )
+
     def test_right_does_not_treat_slightly_indented_sidebar_row_as_wrap(self):
         targets = [
             self.target(40, 100, 340, 150, "sidebar current", path=(0, 1, 0)),
@@ -181,6 +203,55 @@ class SpatialNavigationTests(unittest.TestCase):
             prototype.next_target_index(targets, 0, prototype.Direction.LEFT),
             0,
         )
+
+    def test_navigation_graph_caches_natural_reverse_edge(self):
+        targets = [
+            self.target(20, 20, 80, 60, "left"),
+            self.target(120, 20, 180, 60, "right"),
+        ]
+        graph = prototype.NavigationGraph(targets)
+        self.assertEqual(
+            graph.candidates(0, prototype.Direction.RIGHT)[0], 1
+        )
+        self.assertEqual(
+            graph.candidates(1, prototype.Direction.LEFT)[0], 0
+        )
+
+    def test_regular_grid_is_reachable_and_reversible_in_all_directions(self):
+        targets = [
+            self.target(
+                column * 100,
+                row * 80,
+                column * 100 + 70,
+                row * 80 + 50,
+                f"{row},{column}",
+                path=(0, row, column),
+            )
+            for row in range(3)
+            for column in range(3)
+        ]
+        graph = prototype.NavigationGraph(targets)
+        visited = {4}
+        pending = [4]
+        while pending:
+            current = pending.pop()
+            for direction in prototype.Direction:
+                candidates = graph.candidates(current, direction)
+                if not candidates:
+                    continue
+                neighbor = candidates[0]
+                reverse = graph.candidates(
+                    neighbor, prototype.OPPOSITE_DIRECTION[direction]
+                )
+                self.assertEqual(reverse[0], current)
+                if neighbor not in visited:
+                    visited.add(neighbor)
+                    pending.append(neighbor)
+        self.assertEqual(visited, set(range(9)))
+
+    def test_geometry_anchors_cover_selection_and_layout_extremes(self):
+        self.assertEqual(prototype.geometry_anchor_indices(8, 3), [3, 0, 4, 7])
+        self.assertEqual(prototype.geometry_anchor_indices(1, 0), [0])
 
     def test_shifts_cached_snapshot_without_losing_identity(self):
         target = self.target(
