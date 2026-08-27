@@ -8,8 +8,8 @@ does spatial element navigation feel useful in the user's fixed Windows apps?
 Controls:
     Ctrl+Alt+N  scan the foreground window and enter/leave navigation
     Arrow keys  move the highlighted target
-    Enter       invoke the highlighted target, then leave navigation
-    Esc         leave navigation without touching the target
+    Enter       enter/expand a group, or invoke a leaf target
+    Esc         return to the parent group, or leave at the root
     Ctrl+Alt+Q  quit the prototype
 """
 
@@ -30,8 +30,30 @@ from typing import Any, Callable, Optional, Sequence
 STRUCTURAL_CONTROL_TYPES = frozenset(
     {"CustomControl", "PaneControl", "GroupControl", "ImageControl"}
 )
+PRIMARY_ACTION_CONTROL_TYPES = frozenset(
+    {
+        "ButtonControl",
+        "SplitButtonControl",
+        "HyperlinkControl",
+        "EditControl",
+        "CheckBoxControl",
+        "RadioButtonControl",
+        "ComboBoxControl",
+        "MenuItemControl",
+        "TabItemControl",
+        "SliderControl",
+        "SpinnerControl",
+    }
+)
+WRAPPER_CONTROL_TYPES = STRUCTURAL_CONTROL_TYPES | frozenset(
+    {"ListItemControl", "DataItemControl"}
+)
+NOISE_NAME_PREFIXES = ("跳转到用户消息 ", "Jump to user message ")
 CHROMIUM_RENDERER_CLASS = "Chrome_RenderWidgetHostHWND"
-CHROMIUM_MIN_SCAN_DEPTH = 24
+CHROMIUM_MIN_SCAN_DEPTH = 32
+LIST_CONTAINER_TYPES = frozenset(
+    {"ListControl", "TreeControl", "TableControl", "DataGridControl"}
+)
 
 
 class Direction(str, Enum):
@@ -80,6 +102,10 @@ class Rect:
             and self.bottom >= other.bottom
         )
 
+    def contains_point(self, point: tuple[int, int]) -> bool:
+        x, y = point
+        return self.left <= x <= self.right and self.top <= y <= self.bottom
+
 
 @dataclass(frozen=True)
 class TargetSnapshot:
@@ -87,6 +113,11 @@ class TargetSnapshot:
     name: str
     control_type: str
     automation_id: str = ""
+    path: tuple[int, ...] = ()
+    depth: int = 0
+    keyboard_focusable: bool = False
+    has_action_pattern: bool = False
+    supports_expand: bool = False
 
 
 def _axis_gap(a_start: int, a_end: int, b_start: int, b_end: int) -> int:
@@ -199,9 +230,37 @@ def initial_target_index(
     targets: Sequence[TargetSnapshot],
     focused_rect: Optional[Rect],
     window_rect: Rect,
+    cursor_point: Optional[tuple[int, int]] = None,
 ) -> int:
     if not targets:
         return -1
+    if cursor_point is not None and window_rect.contains_point(cursor_point):
+        containing = [
+            (target.rect.width * target.rect.height, index)
+            for index, target in enumerate(targets)
+            if target.rect.contains_point(cursor_point)
+        ]
+        if containing:
+            containing.sort()
+            return containing[0][1]
+
+        cursor_x, cursor_y = cursor_point
+
+        def point_distance(index: int) -> tuple[int, float, int]:
+            rect = targets[index].rect
+            gap_x = max(rect.left - cursor_x, 0, cursor_x - rect.right)
+            gap_y = max(rect.top - cursor_y, 0, cursor_y - rect.bottom)
+            center_distance = abs(rect.center_x - cursor_x) + abs(
+                rect.center_y - cursor_y
+            )
+            return (
+                gap_x * gap_x + gap_y * gap_y,
+                center_distance,
+                rect.width * rect.height,
+            )
+
+        return min(range(len(targets)), key=point_distance)
+
     if focused_rect is not None:
         focused_x = focused_rect.center_x
         focused_y = focused_rect.center_y
@@ -228,25 +287,172 @@ def initial_target_index(
 
 
 def nested_container_keep_indices(targets: Sequence[TargetSnapshot]) -> list[int]:
-    """Drop structural wrappers when they contain a more specific target."""
+    """Drop wrappers and secondary descendants around a primary action."""
 
     keep = []
     for index, target in enumerate(targets):
-        if target.control_type not in STRUCTURAL_CONTROL_TYPES:
-            keep.append(index)
-            continue
         area = target.rect.width * target.rect.height
-        contains_specific_target = any(
+        if (
+            target.control_type in WRAPPER_CONTROL_TYPES
+            and not target.supports_expand
+        ):
+            contains_specific_target = any(
+                other_index != index
+                and target.rect != other.rect
+                and target.rect.contains(other.rect)
+                and (
+                    (
+                        target.control_type
+                        in {"ListItemControl", "DataItemControl"}
+                        and other.control_type in PRIMARY_ACTION_CONTROL_TYPES
+                        and other.path[: len(target.path)] == target.path
+                    )
+                    or area
+                    > (other.rect.width * other.rect.height) * 1.5
+                )
+                for other_index, other in enumerate(targets)
+            )
+            if contains_specific_target:
+                continue
+
+        nested_under_primary_action = any(
             other_index != index
-            and target.rect != other.rect
-            and target.rect.contains(other.rect)
-            and area
-            > (other.rect.width * other.rect.height) * 1.5
+            and other.path
+            and len(other.path) < len(target.path)
+            and target.path[: len(other.path)] == other.path
+            and other.control_type in PRIMARY_ACTION_CONTROL_TYPES
+            and other.rect.contains(target.rect)
             for other_index, other in enumerate(targets)
         )
-        if not contains_specific_target:
+        if not nested_under_primary_action:
             keep.append(index)
     return keep
+
+
+def target_quality_rank(target: TargetSnapshot) -> tuple[int, int, int, int]:
+    """Rank same-rectangle candidates by how directly they can be operated."""
+
+    primary_type = target.control_type in PRIMARY_ACTION_CONTROL_TYPES
+    return (
+        int(target.has_action_pattern),
+        int(target.keyboard_focusable),
+        int(primary_type),
+        target.depth,
+    )
+
+
+def discover_group_scopes(
+    targets: Sequence[TargetSnapshot],
+    node_types: dict[tuple[int, ...], str],
+) -> dict[tuple[int, ...], int]:
+    """Map a folder-like scope path to its expandable representative target."""
+
+    groups: dict[tuple[int, ...], int] = {}
+    for index, target in enumerate(targets):
+        if (
+            not target.supports_expand
+            or not target.path
+            or target.rect.width < 120
+        ):
+            continue
+        parent_path = target.path[:-1]
+        has_list_child = any(
+            len(path) == len(parent_path) + 1
+            and path[:-1] == parent_path
+            and control_type in LIST_CONTAINER_TYPES
+            for path, control_type in node_types.items()
+        )
+        has_child_target = any(
+            other_index != index
+            and len(other.path) > len(parent_path)
+            and other.path[: len(parent_path)] == parent_path
+            and not (
+                len(other.path) >= len(target.path)
+                and other.path[: len(target.path)] == target.path
+            )
+            for other_index, other in enumerate(targets)
+        )
+        if has_list_child and has_child_target:
+            groups[parent_path] = index
+    return groups
+
+
+def scope_target_indices(
+    targets: Sequence[TargetSnapshot],
+    groups: dict[tuple[int, ...], int],
+    scope_path: tuple[int, ...] = (),
+) -> list[int]:
+    """Return targets visible at one navigation level."""
+
+    visible: list[int] = []
+    current_representative = groups.get(scope_path)
+    for index, target in enumerate(targets):
+        if scope_path and (
+            len(target.path) <= len(scope_path)
+            or target.path[: len(scope_path)] != scope_path
+        ):
+            continue
+        if index == current_representative:
+            continue
+
+        hidden_by_child_group = False
+        for group_path, representative in groups.items():
+            if group_path == scope_path:
+                continue
+            is_nested_group = (
+                len(group_path) > len(scope_path)
+                and group_path[: len(scope_path)] == scope_path
+            )
+            if (
+                is_nested_group
+                and len(target.path) > len(group_path)
+                and target.path[: len(group_path)] == group_path
+                and index != representative
+            ):
+                hidden_by_child_group = True
+                break
+        if not hidden_by_child_group:
+            visible.append(index)
+    return visible
+
+
+def restore_target_index(
+    targets: Sequence[TargetSnapshot], previous: TargetSnapshot
+) -> int:
+    if not targets:
+        return -1
+
+    def score(index: int) -> tuple[int, float, float]:
+        candidate = targets[index]
+        if (
+            previous.automation_id
+            and candidate.automation_id == previous.automation_id
+            and candidate.control_type == previous.control_type
+        ):
+            identity_rank = 0
+        elif (
+            previous.name
+            and candidate.name == previous.name
+            and candidate.control_type == previous.control_type
+        ):
+            identity_rank = 1
+        elif candidate.control_type == previous.control_type:
+            identity_rank = 2
+        else:
+            identity_rank = 3
+        center_distance = abs(candidate.rect.center_x - previous.rect.center_x) + abs(
+            candidate.rect.center_y - previous.rect.center_y
+        )
+        size_distance = abs(candidate.rect.width - previous.rect.width) + abs(
+            candidate.rect.height - previous.rect.height
+        )
+        return identity_rank, center_distance, size_distance
+
+    return min(range(len(targets)), key=score)
+
+
+def is_navigation_noise(name: str) -> bool:
+    return any(name.startswith(prefix) for prefix in NOISE_NAME_PREFIXES)
 
 
 def effective_scan_depth(configured_depth: int, has_chromium_renderer: bool) -> int:
@@ -283,6 +489,8 @@ def _run_windows(args: argparse.Namespace) -> int:
     kernel32.GetModuleHandleW.argtypes = [wintypes.LPCWSTR]
     kernel32.GetModuleHandleW.restype = wintypes.HMODULE
     user32.GetForegroundWindow.restype = wintypes.HWND
+    user32.GetCursorPos.argtypes = [ctypes.POINTER(wintypes.POINT)]
+    user32.GetCursorPos.restype = wintypes.BOOL
     user32.GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
     user32.GetClassNameW.restype = ctypes.c_int
     user32.GetAsyncKeyState.argtypes = [ctypes.c_int]
@@ -331,7 +539,9 @@ def _run_windows(args: argparse.Namespace) -> int:
         auto.PatternId.TogglePattern,
         auto.PatternId.SelectionItemPattern,
         auto.PatternId.ExpandCollapsePattern,
+        auto.PatternId.LegacyIAccessiblePattern,
     )
+    direct_action_pattern_ids = action_pattern_ids[:-1]
     wm_getobject = 0x003D
     smto_abortifhung = 0x0002
     accessibility_object_ids = (-25, -4)
@@ -350,8 +560,8 @@ def _run_windows(args: argparse.Namespace) -> int:
             int(bounds.bottom),
         )
 
-    def has_action_pattern(control: Any) -> bool:
-        for pattern_id in action_pattern_ids:
+    def supports_any_pattern(control: Any, pattern_ids: Sequence[int]) -> bool:
+        for pattern_id in pattern_ids:
             try:
                 if control.GetPattern(pattern_id) is not None:
                     return True
@@ -400,7 +610,15 @@ def _run_windows(args: argparse.Namespace) -> int:
         time.sleep(0.15)
         return True
 
-    def enumerate_targets(hwnd: int) -> tuple[list[RuntimeTarget], Rect, str, int]:
+    def enumerate_targets(
+        hwnd: int,
+    ) -> tuple[
+        list[RuntimeTarget],
+        dict[tuple[int, ...], str],
+        Rect,
+        str,
+        int,
+    ]:
         has_chromium_renderer = activate_embedded_chromium_accessibility(hwnd)
         scan_depth = effective_scan_depth(args.max_depth, has_chromium_renderer)
         root = auto.ControlFromHandle(hwnd)
@@ -408,43 +626,69 @@ def _run_windows(args: argparse.Namespace) -> int:
             raise RuntimeError("无法从当前窗口建立 UI Automation 根元素")
         window_rect = rect_from_control(root)
         window_name = str(root.Name or "未命名窗口")
-        pending = deque([(root, 0)])
+        pending = deque([(root, 0, ())])
         by_rect: dict[Rect, RuntimeTarget] = {}
+        node_types: dict[tuple[int, ...], str] = {}
         visited = 0
 
         while pending and visited < args.max_nodes and len(by_rect) < args.max_elements:
-            control, depth = pending.popleft()
+            control, depth, path = pending.popleft()
             visited += 1
             if depth > 0:
                 try:
                     control_type = str(control.ControlTypeName or "")
+                    node_types[path] = control_type
                     enabled = bool(control.IsEnabled)
                     offscreen = bool(control.IsOffscreen)
                     rect = rect_from_control(control)
                     name = str(control.Name or "").strip()
                     automation_id = str(control.AutomationId or "").strip()
-                    valid_size = 10 <= rect.width <= 1800 and 10 <= rect.height <= 1400
+                    valid_size = 16 <= rect.width <= 1800 and 16 <= rect.height <= 1400
                     standard = control_type in interactive_types
                     structural = control_type in STRUCTURAL_CONTROL_TYPES
-                    actionable = standard or (
+                    keyboard_focusable = bool(control.IsKeyboardFocusable)
+                    action_pattern = supports_any_pattern(control, action_pattern_ids)
+                    direct_action_pattern = supports_any_pattern(
+                        control, direct_action_pattern_ids
+                    )
+                    actionable = (
+                        standard and (keyboard_focusable or action_pattern)
+                    ) or (
                         structural
-                        and valid_size
-                        and (bool(control.IsKeyboardFocusable) or has_action_pattern(control))
+                        and bool(name or automation_id)
+                        and (keyboard_focusable or direct_action_pattern)
                     )
                     if (
                         actionable
                         and enabled
                         and not offscreen
                         and valid_size
+                        and not is_navigation_noise(name)
                         and rect.intersects(window_rect)
                     ):
                         candidate = RuntimeTarget(
-                            TargetSnapshot(rect, name, control_type, automation_id),
+                            TargetSnapshot(
+                                rect,
+                                name,
+                                control_type,
+                                automation_id,
+                                path,
+                                depth,
+                                keyboard_focusable,
+                                action_pattern,
+                                control.GetPattern(auto.PatternId.ExpandCollapsePattern)
+                                is not None,
+                            ),
                             control,
                         )
                         existing = by_rect.get(rect)
-                        if existing is None or (
-                            not existing.snapshot.name and candidate.snapshot.name
+                        if existing is None or target_quality_rank(
+                            candidate.snapshot
+                        ) > target_quality_rank(existing.snapshot) or (
+                            target_quality_rank(candidate.snapshot)
+                            == target_quality_rank(existing.snapshot)
+                            and not existing.snapshot.name
+                            and bool(candidate.snapshot.name)
                         ):
                             by_rect[rect] = candidate
                 except Exception:
@@ -453,8 +697,8 @@ def _run_windows(args: argparse.Namespace) -> int:
             if depth >= scan_depth:
                 continue
             try:
-                for child in control.GetChildren():
-                    pending.append((child, depth + 1))
+                for child_index, child in enumerate(control.GetChildren()):
+                    pending.append((child, depth + 1, path + (child_index,)))
             except Exception:
                 continue
 
@@ -468,12 +712,43 @@ def _run_windows(args: argparse.Namespace) -> int:
                 item.snapshot.rect.width * item.snapshot.rect.height,
             )
         )
-        return targets, window_rect, window_name, visited
+        return targets, node_types, window_rect, window_name, visited
 
     def focused_rect() -> Optional[Rect]:
         try:
             focused = auto.GetFocusedControl()
             return rect_from_control(focused) if focused is not None else None
+        except Exception:
+            return None
+
+    def cursor_point() -> Optional[tuple[int, int]]:
+        point = wintypes.POINT()
+        if not user32.GetCursorPos(ctypes.byref(point)):
+            return None
+        return int(point.x), int(point.y)
+
+    def expand_state(control: Any) -> Optional[int]:
+        try:
+            pattern = control.GetPattern(auto.PatternId.ExpandCollapsePattern)
+            if pattern is None:
+                return None
+            return int(pattern.ExpandCollapseState)
+        except Exception:
+            return None
+
+    def set_expanded(control: Any, expanded: bool) -> Optional[str]:
+        try:
+            pattern = control.GetPattern(auto.PatternId.ExpandCollapsePattern)
+            if pattern is None:
+                return None
+            state = int(pattern.ExpandCollapseState)
+            if expanded and state == 0:
+                pattern.Expand(waitTime=0)
+                return "Expand"
+            if not expanded and state in (1, 2):
+                pattern.Collapse(waitTime=0)
+                return "Collapse"
+            return "Expanded" if state in (1, 2) else "Collapsed"
         except Exception:
             return None
 
@@ -507,9 +782,17 @@ def _run_windows(args: argparse.Namespace) -> int:
         def __init__(self) -> None:
             self.commands: queue.Queue[tuple[str, Any]] = queue.Queue()
             self.events: queue.Queue[tuple[str, Any]] = queue.Queue()
+            self.all_targets: list[RuntimeTarget] = []
             self.targets: list[RuntimeTarget] = []
+            self.node_types: dict[tuple[int, ...], str] = {}
+            self.groups: dict[tuple[int, ...], int] = {}
+            self.scope_stack: list[TargetSnapshot] = []
+            self.scope_path: tuple[int, ...] = ()
             self.selected = -1
             self.hwnd = 0
+            self.window_rect = Rect(0, 0, 0, 0)
+            self.window_name = ""
+            self.visited = 0
             self._thread = threading.Thread(
                 target=self._run,
                 name="element-navigation-uia",
@@ -526,27 +809,206 @@ def _run_windows(args: argparse.Namespace) -> int:
             self.post("stop")
             self._thread.join(timeout=2)
 
+        @staticmethod
+        def _same_identity(first: TargetSnapshot, second: TargetSnapshot) -> bool:
+            if (
+                first.automation_id
+                and first.automation_id == second.automation_id
+                and first.control_type == second.control_type
+            ):
+                return True
+            if (
+                first.name
+                and first.name == second.name
+                and first.control_type == second.control_type
+            ):
+                return True
+            return first.control_type == second.control_type and first.rect == second.rect
+
+        def _enumerate(self, hwnd: int) -> None:
+            (
+                self.all_targets,
+                self.node_types,
+                self.window_rect,
+                self.window_name,
+                self.visited,
+            ) = enumerate_targets(hwnd)
+            self.groups = discover_group_scopes(
+                [target.snapshot for target in self.all_targets], self.node_types
+            )
+            self.hwnd = hwnd
+
+        def _resolve_scope_path(self) -> tuple[int, ...]:
+            resolved_path: tuple[int, ...] = ()
+            resolved_frames: list[TargetSnapshot] = []
+            for frame in self.scope_stack:
+                candidates = [
+                    (path, self.all_targets[index].snapshot)
+                    for path, index in self.groups.items()
+                    if len(path) > len(resolved_path)
+                    and path[: len(resolved_path)] == resolved_path
+                ]
+                matching = [
+                    (path, snapshot)
+                    for path, snapshot in candidates
+                    if self._same_identity(frame, snapshot)
+                ]
+                if not matching:
+                    break
+                resolved_path, resolved_snapshot = min(
+                    matching,
+                    key=lambda item: (
+                        abs(item[1].rect.center_x - frame.rect.center_x)
+                        + abs(item[1].rect.center_y - frame.rect.center_y)
+                    ),
+                )
+                resolved_frames.append(resolved_snapshot)
+            self.scope_stack = resolved_frames
+            return resolved_path
+
+        def _apply_scope(
+            self,
+            restore: Optional[TargetSnapshot] = None,
+            focused: Optional[Rect] = None,
+            use_cursor: bool = False,
+        ) -> None:
+            self.scope_path = self._resolve_scope_path()
+            snapshots = [target.snapshot for target in self.all_targets]
+            visible_indices = scope_target_indices(
+                snapshots, self.groups, self.scope_path
+            )
+            self.targets = [self.all_targets[index] for index in visible_indices]
+            visible_snapshots = [target.snapshot for target in self.targets]
+            if restore is not None:
+                self.selected = restore_target_index(visible_snapshots, restore)
+            else:
+                self.selected = initial_target_index(
+                    visible_snapshots,
+                    focused,
+                    self.window_rect,
+                    cursor_point() if use_cursor else None,
+                )
+
+        def _selection_payload(self) -> dict[str, Any]:
+            snapshots = [target.snapshot for target in self.targets]
+            return {
+                "target": snapshots[self.selected],
+                "selected": self.selected,
+                "count": len(snapshots),
+                "scope_depth": len(self.scope_stack),
+            }
+
+        def _emit_selection(self) -> None:
+            if self.targets and self.selected >= 0:
+                self.events.put(("selection", self._selection_payload()))
+
+        def _group_path_for_target(
+            self, target: RuntimeTarget
+        ) -> Optional[tuple[int, ...]]:
+            for path, index in self.groups.items():
+                if self.all_targets[index].snapshot.path == target.snapshot.path:
+                    return path
+            for path, index in self.groups.items():
+                if self._same_identity(
+                    self.all_targets[index].snapshot, target.snapshot
+                ):
+                    return path
+            return None
+
+        def _enter_group(self, target: RuntimeTarget) -> bool:
+            group_path = self._group_path_for_target(target)
+            if group_path is None:
+                return False
+            self.scope_stack.append(target.snapshot)
+            self._apply_scope(focused=target.snapshot.rect)
+            if self.selected < 0:
+                self.scope_stack.pop()
+                self._apply_scope(restore=target.snapshot)
+                return False
+            self._emit_selection()
+            return True
+
         def _scan(self, hwnd: int) -> None:
             started = time.perf_counter()
-            targets, window_rect, window_name, visited = enumerate_targets(hwnd)
-            snapshots = [target.snapshot for target in targets]
-            selected = initial_target_index(snapshots, focused_rect(), window_rect)
-            self.targets = targets
-            self.selected = selected
-            self.hwnd = hwnd
+            self.scope_stack = []
+            self._enumerate(hwnd)
+            self._apply_scope(focused=focused_rect(), use_cursor=True)
+            snapshots = [target.snapshot for target in self.targets]
             elapsed = time.perf_counter() - started
             self.events.put(
                 (
                     "scan_done",
                     {
                         "targets": snapshots,
-                        "selected": selected,
-                        "window": window_name,
-                        "visited": visited,
+                        "selected": self.selected,
+                        "window": self.window_name,
+                        "visited": self.visited,
+                        "all_count": len(self.all_targets),
                         "elapsed": elapsed,
                     },
                 )
             )
+
+        def _refresh_after_expand(
+            self, previous: TargetSnapshot, enter_group: bool
+        ) -> None:
+            frames = list(self.scope_stack)
+            time.sleep(0.18)
+            self._enumerate(self.hwnd)
+            self.scope_stack = frames
+            self._apply_scope(restore=previous)
+            if not self.targets or self.selected < 0:
+                self._emit_selection()
+                return
+            refreshed = self.targets[self.selected]
+            if enter_group and self._enter_group(refreshed):
+                return
+            self._emit_selection()
+
+        def _activate(self) -> None:
+            if not self.targets or self.selected < 0:
+                return
+            target = self.targets[self.selected]
+            group_path = self._group_path_for_target(target)
+            state = expand_state(target.control) if target.snapshot.supports_expand else None
+            if state == 0:
+                method = set_expanded(target.control, True)
+                self._refresh_after_expand(target.snapshot, enter_group=True)
+                self.events.put(
+                    (
+                        "expanded",
+                        {"target": target.snapshot, "method": method or "Expand"},
+                    )
+                )
+                return
+            if group_path is not None and self._enter_group(target):
+                return
+            if state in (1, 2):
+                method = set_expanded(target.control, False)
+                self._refresh_after_expand(target.snapshot, enter_group=False)
+                self.events.put(
+                    (
+                        "expanded",
+                        {"target": target.snapshot, "method": method or "Collapse"},
+                    )
+                )
+                return
+
+            method = smart_invoke(target.control)
+            self.events.put(
+                (
+                    "activated",
+                    {"target": target.snapshot, "method": method},
+                )
+            )
+
+        def _back(self) -> None:
+            if not self.scope_stack:
+                self.events.put(("exit_requested", None))
+                return
+            parent_target = self.scope_stack.pop()
+            self._apply_scope(restore=parent_target)
+            self._emit_selection()
 
         def _run(self) -> None:
             auto.InitializeUIAutomationInCurrentThread()
@@ -563,28 +1025,11 @@ def _run_windows(args: argparse.Namespace) -> int:
                             self.selected = next_target_index(
                                 snapshots, self.selected, Direction(value)
                             )
-                            self.events.put(
-                                (
-                                    "selection",
-                                    {
-                                        "target": snapshots[self.selected],
-                                        "selected": self.selected,
-                                        "count": len(snapshots),
-                                    },
-                                )
-                            )
+                            self._emit_selection()
                         elif command == "activate" and self.targets and self.selected >= 0:
-                            target = self.targets[self.selected]
-                            method = smart_invoke(target.control)
-                            self.events.put(
-                                (
-                                    "activated",
-                                    {
-                                        "target": target.snapshot,
-                                        "method": method,
-                                    },
-                                )
-                            )
+                            self._activate()
+                        elif command == "back":
+                            self._back()
                     except Exception as exc:
                         self.events.put(("error", str(exc)))
             finally:
@@ -815,13 +1260,17 @@ def _run_windows(args: argparse.Namespace) -> int:
         auto.InitializeUIAutomationInCurrentThread()
         try:
             started = time.perf_counter()
-            targets, _rect, window_name, visited = enumerate_targets(hwnd)
+            targets, node_types, _rect, window_name, visited = enumerate_targets(hwnd)
+            snapshots = [target.snapshot for target in targets]
+            groups = discover_group_scopes(snapshots, node_types)
+            visible = [targets[index] for index in scope_target_indices(snapshots, groups)]
             elapsed = time.perf_counter() - started
             print(
-                f"窗口: {window_name}\n元素: {len(targets)}，访问节点: {visited}，"
+                f"窗口: {window_name}\n根层: {len(visible)}，全部元素: {len(targets)}，"
+                f"访问节点: {visited}，"
                 f"耗时: {elapsed:.2f}s"
             )
-            for index, target in enumerate(targets[:80], 1):
+            for index, target in enumerate(visible[:80], 1):
                 item = target.snapshot
                 print(
                     f"{index:>3}. {item.control_type:<22} "
@@ -873,10 +1322,9 @@ def _run_windows(args: argparse.Namespace) -> int:
                 print("正在扫描当前窗口...")
                 worker.post("scan", hwnd)
         elif action == "cancel":
-            leave_navigation()
+            if active.is_set():
+                worker.post("back")
         elif action == "activate" and active.is_set():
-            active.clear()
-            overlay.clear_target()
             worker.post("activate")
         elif action in {direction.value for direction in Direction} and active.is_set():
             worker.post("move", action)
@@ -900,7 +1348,8 @@ def _run_windows(args: argparse.Namespace) -> int:
                 targets = payload["targets"]
                 selected = payload["selected"]
                 print(
-                    f"已扫描 {payload['window']}: {len(targets)} 个元素，"
+                    f"已扫描 {payload['window']}: 根层 {len(targets)} 个，"
+                    f"全部 {payload['all_count']} 个，"
                     f"访问 {payload['visited']} 个节点，耗时 {payload['elapsed']:.2f}s"
                 )
                 if selected < 0:
@@ -910,8 +1359,15 @@ def _run_windows(args: argparse.Namespace) -> int:
                     active.set()
                     overlay.show_target(targets[selected], selected, len(targets))
             elif event == "selection":
+                active.set()
                 overlay.show_target(
                     payload["target"], payload["selected"], payload["count"]
+                )
+            elif event == "expanded":
+                target = payload["target"]
+                print(
+                    f"已切换: {target.name or target.control_type} "
+                    f"({payload['method']})"
                 )
             elif event == "activated":
                 target = payload["target"]
@@ -919,6 +1375,8 @@ def _run_windows(args: argparse.Namespace) -> int:
                     f"已执行: {target.name or target.control_type} "
                     f"({payload['method']})"
                 )
+                leave_navigation()
+            elif event == "exit_requested":
                 leave_navigation()
             elif event == "error":
                 scanning = False
@@ -935,7 +1393,10 @@ def _run_windows(args: argparse.Namespace) -> int:
 
     app.aboutToQuit.connect(cleanup)
     print("元素导航键盘原型已启动。")
-    print("Ctrl+Alt+N 开始/退出，方向键移动，Enter 执行，Esc 退出，Ctrl+Alt+Q 关闭。")
+    print(
+        "Ctrl+Alt+N 开始/退出，方向键移动，Enter 进入/执行，"
+        "Esc 返回/退出，Ctrl+Alt+Q 关闭。"
+    )
     return int(app.exec())
 
 
