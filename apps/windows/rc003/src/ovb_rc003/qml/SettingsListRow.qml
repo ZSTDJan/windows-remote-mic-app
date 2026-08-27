@@ -1,5 +1,4 @@
 import QtQuick
-import QtQuick.Controls
 import QtQuick.Layouts
 
 Rectangle {
@@ -49,6 +48,7 @@ Rectangle {
             columnSpacing: root.tokens.spacingSmall
             rowSpacing: 1
             UiLabel {
+                id: titleLabel
                 tokens: root.tokens
                 kind: bodyKind
                 Layout.row: 0
@@ -59,8 +59,15 @@ Rectangle {
                 font.pixelSize: root.tokens.fontSizeBody
                 font.weight: Font.Medium
                 elide: Text.ElideRight
+                HoverHandler { id: titleHover }
+                CompactToolTip {
+                    tokens: root.tokens
+                    active: titleHover.hovered && descriptionLabel.truncated
+                    text: root.descriptionText
+                }
             }
             UiLabel {
+                id: descriptionLabel
                 objectName: root.descriptionObjectName
                 tokens: root.tokens
                 kind: noteKind
@@ -72,9 +79,6 @@ Rectangle {
                 maximumLineCount: 1
                 elide: Text.ElideRight
                 wrapMode: Text.NoWrap
-                HoverHandler { id: descriptionHover }
-                ToolTip.visible: descriptionHover.hovered
-                ToolTip.text: root.descriptionText
             }
         }
 

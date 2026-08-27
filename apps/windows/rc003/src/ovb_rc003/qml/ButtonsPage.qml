@@ -524,11 +524,22 @@ Item {
                 }
 
                 UiLabel {
+                    id: primaryGestureTitle
+                    objectName: "actionEditorPrimaryTitle"
                     tokens: root.tokens
                     kind: bodyKind
                     text: qsTr("单击")
                     font.pixelSize: tokens.fontSizeControl
                     font.weight: Font.Medium
+                    HoverHandler { id: primaryGestureTitleHover }
+                    CompactToolTip {
+                        objectName: "actionEditorPrimaryHelp"
+                        tokens: root.tokens
+                        active: primaryGestureTitleHover.hovered
+                        text: actionEditor.buttonId === "mic"
+                            ? qsTr("话筒键可选择按住说话、普通动作、自定义组合键或 Quicker URI。")
+                            : qsTr("可选择普通动作，也可输入自定义组合键或 Quicker URI。")
+                    }
                 }
                 RowLayout {
                     Layout.fillWidth: true
@@ -543,10 +554,6 @@ Item {
                         actionEditor.buttonId
                     )
                     Accessible.name: actionEditor.buttonName + qsTr("单击动作")
-                    ToolTip.visible: hovered
-                    ToolTip.text: actionEditor.buttonId === "mic"
-                        ? qsTr("话筒键可选择按住说话、普通动作、自定义组合键或 Quicker URI。")
-                        : qsTr("可选择普通动作，也可输入自定义组合键或 Quicker URI。")
                     onEditTextChanged: {
                             if (!actionEditor.syncing)
                             actionEditor.primaryText = editText
@@ -587,11 +594,19 @@ Item {
                 }
 
                 UiLabel {
+                    id: doubleGestureTitle
+                    objectName: "actionEditorDoubleTitle"
                     tokens: root.tokens
                     kind: bodyKind
                     text: qsTr("双击")
                     font.pixelSize: tokens.fontSizeControl
                     font.weight: Font.Medium
+                    HoverHandler { id: doubleGestureTitleHover }
+                    CompactToolTip {
+                        tokens: root.tokens
+                        active: doubleGestureTitleHover.hovered
+                        text: qsTr("配置后，程序会等待约 0.3 秒区分单击和双击。")
+                    }
                 }
                 RowLayout {
                     Layout.fillWidth: true
@@ -605,8 +620,6 @@ Item {
                     enabled: !actionEditor.primaryIsVoice
                     model: SettingsController.secondaryActionOptions
                     Accessible.name: actionEditor.buttonName + qsTr("双击动作")
-                    ToolTip.visible: hovered
-                    ToolTip.text: qsTr("配置后，程序会等待约 0.3 秒区分单击和双击。")
                     onEditTextChanged: {
                             if (!actionEditor.syncing)
                             actionEditor.doubleText = editText
@@ -649,11 +662,19 @@ Item {
                 }
 
                 UiLabel {
+                    id: longGestureTitle
+                    objectName: "actionEditorLongTitle"
                     tokens: root.tokens
                     kind: bodyKind
                     text: qsTr("长按")
                     font.pixelSize: tokens.fontSizeControl
                     font.weight: Font.Medium
+                    HoverHandler { id: longGestureTitleHover }
+                    CompactToolTip {
+                        tokens: root.tokens
+                        active: longGestureTitleHover.hovered
+                        text: qsTr("按住约 0.55 秒触发，并抑制本次单击动作。")
+                    }
                 }
                 RowLayout {
                     Layout.fillWidth: true
@@ -667,8 +688,6 @@ Item {
                     enabled: !actionEditor.primaryIsVoice
                     model: SettingsController.secondaryActionOptions
                     Accessible.name: actionEditor.buttonName + qsTr("长按动作")
-                    ToolTip.visible: hovered
-                    ToolTip.text: qsTr("按住约 0.55 秒触发，并抑制本次单击动作。")
                     onEditTextChanged: {
                             if (!actionEditor.syncing)
                             actionEditor.longText = editText
@@ -1234,6 +1253,7 @@ Item {
                                     spacing: tokens.spacingSmall
 
                                     UiLabel {
+                                        id: comboGestureTitle
                                         tokens: root.tokens
                                         kind: bodyKind
                                         Layout.preferredWidth: 92
@@ -1241,6 +1261,12 @@ Item {
                                             + " + " + root.shortButtonName(buttonId)
                                         font.weight: Font.Medium
                                         elide: Text.ElideRight
+                                        HoverHandler { id: comboGestureTitleHover }
+                                        CompactToolTip {
+                                            tokens: root.tokens
+                                            active: comboGestureTitleHover.hovered
+                                            text: qsTr("可选择普通动作，也可输入电脑快捷键或 Quicker URI。")
+                                        }
                                     }
                                     EditorActionCombo {
                                         id: comboActionEditor
@@ -1258,8 +1284,6 @@ Item {
                                                 buttonId, currentText
                                             )
                                         }
-                                        ToolTip.visible: hovered
-                                        ToolTip.text: qsTr("可选择普通动作，也可输入电脑快捷键或 Quicker URI。")
                                         Accessible.name: SettingsController.comboModifierText
                                             + " + " + buttonName + qsTr("执行动作")
                                     }

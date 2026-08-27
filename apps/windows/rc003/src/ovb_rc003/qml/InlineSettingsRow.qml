@@ -1,5 +1,4 @@
 import QtQuick
-import QtQuick.Controls
 import QtQuick.Layouts
 
 Rectangle {
@@ -31,6 +30,7 @@ Rectangle {
         spacing: root.tokens.spacingSmall
 
         UiLabel {
+            id: titleLabel
             tokens: root.tokens
             kind: bodyKind
             Layout.preferredWidth: root.titleWidth
@@ -39,6 +39,12 @@ Rectangle {
             text: root.titleText
             font.weight: Font.Medium
             elide: Text.ElideRight
+            HoverHandler { id: titleHover }
+            CompactToolTip {
+                tokens: root.tokens
+                active: titleHover.hovered && descriptionLabel.truncated
+                text: root.descriptionText
+            }
         }
 
         RowLayout {
@@ -61,10 +67,6 @@ Rectangle {
             Layout.minimumWidth: 0
             text: root.descriptionText
             elide: Text.ElideRight
-            HoverHandler { id: descriptionHover }
-            ToolTip.visible: descriptionHover.hovered
-                && root.descriptionText.length > 0
-            ToolTip.text: root.descriptionText
         }
 
         Item {

@@ -25,6 +25,4 @@ ToolButton {
 
     onClicked: closeRequested()
     Accessible.name: qsTr("关闭")
-    ToolTip.visible: hovered
-    ToolTip.text: qsTr("关闭")
 }

@@ -1,5 +1,4 @@
 import QtQuick
-import QtQuick.Controls
 import QtQuick.Layouts
 
 RowLayout {
@@ -23,6 +22,7 @@ RowLayout {
     }
 
     UiLabel {
+        id: titleLabel
         tokens: root.tokens
         kind: noteKind
         Layout.preferredWidth: root.titleColumnWidth
@@ -31,9 +31,16 @@ RowLayout {
         text: root.titleText
         color: root.tokens.textPrimary
         elide: Text.ElideRight
+        HoverHandler { id: titleHover }
+        CompactToolTip {
+            tokens: root.tokens
+            active: titleHover.hovered && detailLabel.truncated
+            text: detailLabel.text
+        }
     }
 
     UiLabel {
+        id: detailLabel
         tokens: root.tokens
         kind: noteKind
         Layout.fillWidth: true
@@ -41,8 +48,5 @@ RowLayout {
         elide: Text.ElideRight
         wrapMode: Text.NoWrap
         text: root.statusText + "：" + root.detailText
-        HoverHandler { id: detailHover }
-        ToolTip.visible: detailHover.hovered
-        ToolTip.text: text
     }
 }

@@ -4009,6 +4009,15 @@ class SettingsShellSourceContractTests(unittest.TestCase):
         self.mapping_card_qml = (qml_dir / "MappingCard.qml").read_text(
             encoding="utf-8"
         )
+        self.compact_tooltip_qml = (qml_dir / "CompactToolTip.qml").read_text(
+            encoding="utf-8"
+        )
+        self.settings_list_row_qml = (qml_dir / "SettingsListRow.qml").read_text(
+            encoding="utf-8"
+        )
+        self.diagnostic_result_row_qml = (
+            qml_dir / "DiagnosticResultRow.qml"
+        ).read_text(encoding="utf-8")
 
     def test_settings_feedback_has_one_global_owner(self):
         self.assertIn('objectName: "globalStatusBar"', self.main_qml)
@@ -4152,9 +4161,37 @@ class SettingsShellSourceContractTests(unittest.TestCase):
     def test_dialogs_share_the_fluent_close_button(self):
         self.assertIn('glyph: "\\uE711"', self.dialog_close_button_qml)
         self.assertIn('Accessible.name: qsTr("关闭")', self.dialog_close_button_qml)
+        self.assertNotIn("ToolTip", self.dialog_close_button_qml)
         self.assertIn("renderType: Text.QtRendering", self.icon_glyph_qml)
         self.assertEqual(self.buttons_qml.count("DialogCloseButton {"), 2)
         self.assertEqual(self.voice_qml.count("DialogCloseButton {"), 1)
+
+    def test_tooltips_are_compact_and_only_owned_by_explanatory_titles(self):
+        self.assertIn("ToolTip {", self.compact_tooltip_qml)
+        self.assertIn("delay: 450", self.compact_tooltip_qml)
+        self.assertIn("font.pixelSize: root.tokens.fontSizeTiny", self.compact_tooltip_qml)
+        self.assertIn("y: -implicitHeight - root.tokens.spacingSmall", self.compact_tooltip_qml)
+        self.assertIn("maximumTextWidth: 260", self.compact_tooltip_qml)
+        self.assertEqual(self.buttons_qml.count("CompactToolTip {"), 4)
+        for title_id in (
+            "primaryGestureTitle",
+            "doubleGestureTitle",
+            "longGestureTitle",
+            "comboGestureTitle",
+        ):
+            self.assertIn(f"id: {title_id}", self.buttons_qml)
+        self.assertNotIn("ToolTip.visible", self.buttons_qml)
+        self.assertIn("gestureHover.hovered && !cell.empty", self.mapping_card_qml)
+        self.assertIn("cell.usingNote || valueLabel.truncated", self.mapping_card_qml)
+        self.assertNotIn("actionHover", self.mapping_card_qml)
+        for row_qml in (
+            self.inline_settings_row_qml,
+            self.settings_list_row_qml,
+            self.diagnostic_result_row_qml,
+        ):
+            self.assertIn("HoverHandler { id: titleHover }", row_qml)
+            self.assertIn("CompactToolTip {", row_qml)
+            self.assertNotIn("ToolTip.visible", row_qml)
 
     def test_device_page_shows_real_service_state_and_start_progress(self):
         self.assertIn("SettingsController.bridgeLaunchBusy", self.device_qml)
@@ -5767,6 +5804,18 @@ assert ok_hotspot is not None, "OK photo hotspot not found"
 assert power_marker is not None, "Power photo marker not found"
 assert ok_marker is not None, "OK photo marker not found"
 assert editor is not None
+primary_title = _find(window, "actionEditorPrimaryTitle")
+primary_combo = _find(window, "actionEditorPrimaryCombo")
+assert primary_title is not None and primary_combo is not None
+primary_title_center = primary_title.mapToScene(QPointF(
+    primary_title.property("width") / 2.0,
+    primary_title.property("height") / 2.0,
+)).toPoint()
+QTest.mouseMove(window, primary_title_center)
+QTest.qWait(520)
+_render(window, app, 5)
+primary_help_background = _find(window, "actionEditorPrimaryHelp_background")
+assert primary_help_background is not None
 editor_screenshot = os.environ.get("RC003_MAPPING_EDITOR_SCREENSHOT")
 if editor_screenshot:
     _render(window, app, 2)
@@ -5789,6 +5838,10 @@ results_out = {
     "card_count": sum(bool(item.property("visible")) for item in cards.values()),
     "selected_after_power_click": controller.property("selectedButtonId"),
     "editor_visible": bool(editor.property("visible")),
+    "primary_help": {
+        "tooltip": _geometry(primary_help_background),
+        "input": _geometry(primary_combo),
+    },
     "view_switcher": _geometry(view_switcher),
     "actions_panel": _geometry(actions_panel),
     "mapping_list": _geometry(mapping_list),
@@ -5879,6 +5932,14 @@ class ButtonsPageMappingCardTests(unittest.TestCase):
             "a real QTest click on the Power card did not select Power",
         )
         self.assertTrue(data["editor_visible"])
+
+    def test_editor_help_tooltip_is_compact_and_does_not_cover_the_input(self):
+        data = self._run_probe(720, 500)
+        tooltip = data["primary_help"]["tooltip"]
+        action_input = data["primary_help"]["input"]
+        self.assertTrue(tooltip["visible"])
+        self.assertLessEqual(tooltip["width"], 274)
+        self.assertLessEqual(tooltip["bottom"], action_input["y"])
 
     def test_selected_power_is_marked_at_its_calibrated_photo_position(self):
         data = self._run_probe(720, 500)

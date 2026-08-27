@@ -81,6 +81,7 @@ AbstractButton {
             spacing: 0
 
             UiLabel {
+                id: gestureTitle
                 tokens: root.tokens
                 kind: noteKind
                 Layout.fillWidth: true
@@ -92,6 +93,15 @@ AbstractButton {
                 horizontalAlignment: Text.AlignHCenter
                 verticalAlignment: Text.AlignVCenter
                 elide: Text.ElideRight
+                HoverHandler { id: gestureHover }
+                CompactToolTip {
+                    tokens: root.tokens
+                    active: gestureHover.hovered && !cell.empty
+                        && (cell.usingNote || valueLabel.truncated)
+                    text: cell.usingNote
+                        ? cell.noteText.trim() + " · " + cell.bindingText.trim()
+                        : cell.bindingText.trim()
+                }
             }
 
             Rectangle {
@@ -102,6 +112,7 @@ AbstractButton {
                     ? root.tokens.surfaceMuted : "transparent"
 
                 UiLabel {
+                    id: valueLabel
                     objectName: cell.valueObjectName
                     anchors.fill: parent
                     anchors.leftMargin: 3
@@ -122,12 +133,6 @@ AbstractButton {
                     verticalAlignment: Text.AlignVCenter
                     elide: Text.ElideRight
                 }
-
-                HoverHandler { id: actionHover }
-                ToolTip.visible: actionHover.hovered
-                ToolTip.text: cell.usingNote
-                    ? cell.noteText.trim() + " · " + cell.bindingText.trim()
-                    : cell.bindingText.trim()
             }
         }
     }
