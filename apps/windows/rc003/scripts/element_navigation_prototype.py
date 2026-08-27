@@ -657,6 +657,15 @@ def semantic_action_can_bypass_point_hit(target: TargetSnapshot) -> bool:
     )
 
 
+def path_is_in_branch(
+    path: tuple[int, ...], branch_path: tuple[int, ...]
+) -> bool:
+    return bool(
+        len(path) > len(branch_path)
+        and path[: len(branch_path)] == branch_path
+    )
+
+
 def effective_scan_depth(configured_depth: int, has_chromium_renderer: bool) -> int:
     if has_chromium_renderer:
         return max(configured_depth, CHROMIUM_MIN_SCAN_DEPTH)
@@ -1040,6 +1049,69 @@ def _run_windows(args: argparse.Namespace) -> int:
         time.sleep(0.15)
         return True
 
+    def collect_targets(
+        root: Any,
+        window_rect: Rect,
+        root_path: tuple[int, ...],
+        root_depth: int,
+        max_relative_depth: int,
+    ) -> tuple[list[RuntimeTarget], dict[tuple[int, ...], str], int]:
+        pending = deque([(root, 0, root_path)])
+        by_rect: dict[Rect, RuntimeTarget] = {}
+        node_types: dict[tuple[int, ...], str] = {}
+        visited = 0
+
+        while pending and visited < args.max_nodes and len(by_rect) < args.max_elements:
+            control, relative_depth, path = pending.popleft()
+            visited += 1
+            try:
+                control_type = str(control.ControlTypeName or "")
+                if path:
+                    node_types[path] = control_type
+                if relative_depth > 0:
+                    candidate = runtime_target_from_control(
+                        control,
+                        window_rect,
+                        path=path,
+                        depth=root_depth + relative_depth,
+                    )
+                    if candidate is not None:
+                        rect = candidate.snapshot.rect
+                        existing = by_rect.get(rect)
+                        if existing is None or target_quality_rank(
+                            candidate.snapshot
+                        ) > target_quality_rank(existing.snapshot) or (
+                            target_quality_rank(candidate.snapshot)
+                            == target_quality_rank(existing.snapshot)
+                            and not existing.snapshot.name
+                            and bool(candidate.snapshot.name)
+                        ):
+                            by_rect[rect] = candidate
+            except Exception:
+                pass
+
+            if relative_depth >= max_relative_depth:
+                continue
+            try:
+                for child_index, child in enumerate(control.GetChildren()):
+                    pending.append(
+                        (child, relative_depth + 1, path + (child_index,))
+                    )
+            except Exception:
+                continue
+
+        targets = list(by_rect.values())
+        snapshots = [target.snapshot for target in targets]
+        targets = [targets[index] for index in nested_container_keep_indices(snapshots)]
+        targets.sort(
+            key=lambda item: (
+                item.snapshot.rect.top,
+                item.snapshot.rect.left,
+                item.snapshot.rect.width * item.snapshot.rect.height,
+            )
+        )
+        return targets, node_types, visited
+
     def enumerate_targets(
         hwnd: int,
     ) -> tuple[
@@ -1056,56 +1128,12 @@ def _run_windows(args: argparse.Namespace) -> int:
             raise RuntimeError("无法从当前窗口建立 UI Automation 根元素")
         window_rect = rect_from_control(root)
         window_name = str(root.Name or "未命名窗口")
-        pending = deque([(root, 0, ())])
-        by_rect: dict[Rect, RuntimeTarget] = {}
-        node_types: dict[tuple[int, ...], str] = {}
-        visited = 0
-
-        while pending and visited < args.max_nodes and len(by_rect) < args.max_elements:
-            control, depth, path = pending.popleft()
-            visited += 1
-            if depth > 0:
-                try:
-                    control_type = str(control.ControlTypeName or "")
-                    node_types[path] = control_type
-                    candidate = runtime_target_from_control(
-                        control,
-                        window_rect,
-                        path=path,
-                        depth=depth,
-                    )
-                    if candidate is not None:
-                        rect = candidate.snapshot.rect
-                        existing = by_rect.get(rect)
-                        if existing is None or target_quality_rank(
-                            candidate.snapshot
-                        ) > target_quality_rank(existing.snapshot) or (
-                            target_quality_rank(candidate.snapshot)
-                            == target_quality_rank(existing.snapshot)
-                            and not existing.snapshot.name
-                            and bool(candidate.snapshot.name)
-                        ):
-                            by_rect[rect] = candidate
-                except Exception:
-                    pass
-
-            if depth >= scan_depth:
-                continue
-            try:
-                for child_index, child in enumerate(control.GetChildren()):
-                    pending.append((child, depth + 1, path + (child_index,)))
-            except Exception:
-                continue
-
-        targets = list(by_rect.values())
-        snapshots = [target.snapshot for target in targets]
-        targets = [targets[index] for index in nested_container_keep_indices(snapshots)]
-        targets.sort(
-            key=lambda item: (
-                item.snapshot.rect.top,
-                item.snapshot.rect.left,
-                item.snapshot.rect.width * item.snapshot.rect.height,
-            )
+        targets, node_types, visited = collect_targets(
+            root,
+            window_rect,
+            (),
+            0,
+            scan_depth,
         )
         return targets, node_types, window_rect, window_name, visited
 
@@ -1198,36 +1226,26 @@ def _run_windows(args: argparse.Namespace) -> int:
             )
         ]
 
-    def expand_state(control: Any) -> Optional[int]:
-        try:
-            pattern = control.GetPattern(auto.PatternId.ExpandCollapsePattern)
-            if pattern is None:
-                return None
-            return int(pattern.ExpandCollapseState)
-        except Exception:
-            return None
-
-    def set_expanded(control: Any, expanded: bool) -> Optional[str]:
+    def toggle_expanded(control: Any) -> Optional[tuple[str, bool]]:
         try:
             pattern = control.GetPattern(auto.PatternId.ExpandCollapsePattern)
             if pattern is None:
                 return None
             state = int(pattern.ExpandCollapseState)
-            if expanded and state == 0:
+            if state == 0:
                 pattern.Expand(waitTime=0)
-                return "Expand"
-            if not expanded and state in (1, 2):
+                return "Expand", True
+            if state in (1, 2):
                 pattern.Collapse(waitTime=0)
-                return "Collapse"
-            return "Expanded" if state in (1, 2) else "Collapsed"
+                return "Collapse", False
+            return None
         except Exception:
             return None
 
-    def smart_invoke(target: RuntimeTarget) -> str:
+    def try_semantic_invoke(target: RuntimeTarget) -> Optional[str]:
         control = target.control
         if control is None:
-            click_rect_center(target.snapshot.rect)
-            return "MSAA coordinate click"
+            return None
         attempts: tuple[tuple[int, str, str], ...] = (
             (auto.PatternId.InvokePattern, "Invoke", "Invoke"),
             (auto.PatternId.TogglePattern, "Toggle", "Toggle"),
@@ -1250,6 +1268,13 @@ def _run_windows(args: argparse.Namespace) -> int:
                     return label
             except Exception:
                 continue
+        return None
+
+    def click_target(target: RuntimeTarget) -> str:
+        control = target.control
+        if control is None:
+            click_rect_center(target.snapshot.rect)
+            return "MSAA coordinate click"
         if target.click_point is not None:
             click_point(target.click_point)
             return "verified coordinate click"
@@ -1260,6 +1285,8 @@ def _run_windows(args: argparse.Namespace) -> int:
         def __init__(self) -> None:
             self.commands: queue.Queue[tuple[str, Any]] = queue.Queue()
             self.events: queue.Queue[tuple[str, Any]] = queue.Queue()
+            self._post_lock = threading.Lock()
+            self._sync_pending = False
             self.all_targets: list[RuntimeTarget] = []
             self.targets: list[RuntimeTarget] = []
             self.node_types: dict[tuple[int, ...], str] = {}
@@ -1281,6 +1308,11 @@ def _run_windows(args: argparse.Namespace) -> int:
             self._thread.start()
 
         def post(self, command: str, value: Any = None) -> None:
+            if command == "sync_window":
+                with self._post_lock:
+                    if self._sync_pending:
+                        return
+                    self._sync_pending = True
             self.commands.put((command, value))
 
         def stop(self) -> None:
@@ -1396,22 +1428,18 @@ def _run_windows(args: argparse.Namespace) -> int:
             self._select_target(self.hierarchy[next_index])
             self._emit_selection()
 
-        def _target_is_exposed(self, target: RuntimeTarget) -> bool:
+        def _target_is_exposed(
+            self,
+            target: RuntimeTarget,
+            allow_semantic_bypass: bool = True,
+        ) -> bool:
             if target.control is None:
                 return True
             target.click_point = None
             try:
-                if not bool(target.control.IsEnabled) or bool(target.control.IsOffscreen):
+                if not self._update_live_target(target):
                     return False
-                live_rect = rect_from_control(target.control)
-                if (
-                    live_rect.width < 16
-                    or live_rect.height < 16
-                    or not live_rect.intersects(self.window_rect)
-                ):
-                    return False
-                if live_rect != target.snapshot.rect:
-                    target.snapshot = replace(target.snapshot, rect=live_rect)
+                live_rect = target.snapshot.rect
 
                 for point in target_probe_points(live_rect):
                     control = auto.ControlFromPoint(point[0], point[1])
@@ -1444,7 +1472,29 @@ def _run_windows(args: argparse.Namespace) -> int:
                         control = control.GetParentControl()
             except Exception:
                 return False
-            return semantic_action_can_bypass_point_hit(target.snapshot)
+            return bool(
+                allow_semantic_bypass
+                and semantic_action_can_bypass_point_hit(target.snapshot)
+            )
+
+        def _update_live_target(self, target: RuntimeTarget) -> bool:
+            if target.control is None:
+                return True
+            try:
+                if not bool(target.control.IsEnabled) or bool(target.control.IsOffscreen):
+                    return False
+                live_rect = rect_from_control(target.control)
+                if (
+                    live_rect.width < 16
+                    or live_rect.height < 16
+                    or not live_rect.intersects(self.window_rect)
+                ):
+                    return False
+                if live_rect != target.snapshot.rect:
+                    target.snapshot = replace(target.snapshot, rect=live_rect)
+                return True
+            except Exception:
+                return False
 
         def _sync_window_geometry(self) -> None:
             if not self.hwnd or not self.targets:
@@ -1578,56 +1628,150 @@ def _run_windows(args: argparse.Namespace) -> int:
                 )
             )
 
-        def _refresh_after_expand(self, previous: TargetSnapshot) -> None:
-            time.sleep(0.18)
-            self._enumerate(self.hwnd)
+        def _refresh_branch(
+            self,
+            target: RuntimeTarget,
+        ) -> bool:
+            if target.control is None or not target.snapshot.path:
+                return False
+            try:
+                parent = target.control.GetParentControl()
+            except Exception:
+                return False
+            if parent is None:
+                return False
+
+            branch_path = target.snapshot.path[:-1]
+            branch_targets, branch_node_types, visited = collect_targets(
+                parent,
+                self.window_rect,
+                branch_path,
+                len(branch_path),
+                max(args.max_depth, 16),
+            )
+            if not branch_targets:
+                return False
+
+            self.all_targets = [
+                existing
+                for existing in self.all_targets
+                if not path_is_in_branch(existing.snapshot.path, branch_path)
+            ]
+            self.all_targets.extend(branch_targets)
+            self.all_targets.sort(
+                key=lambda item: (
+                    item.snapshot.rect.top,
+                    item.snapshot.rect.left,
+                    item.snapshot.rect.width * item.snapshot.rect.height,
+                )
+            )
+            self.node_types = {
+                path: control_type
+                for path, control_type in self.node_types.items()
+                if not path_is_in_branch(path, branch_path)
+            }
+            self.node_types.update(branch_node_types)
+            self.visited = visited
+            self.invalid_targets.clear()
+            return True
+
+        def _refresh_after_expand(
+            self,
+            target: RuntimeTarget,
+            previous: TargetSnapshot,
+            expanding: bool,
+        ) -> str:
+            branch_path = target.snapshot.path[:-1]
+            previous_count = sum(
+                path_is_in_branch(existing.snapshot.path, branch_path)
+                for existing in self.all_targets
+            )
+            refresh_method = "branch"
+            for delay in (0.04, 0.05, 0.07):
+                time.sleep(delay)
+                if not self._refresh_branch(target):
+                    self._enumerate(self.hwnd)
+                    refresh_method = "full"
+                    break
+                current_count = sum(
+                    path_is_in_branch(existing.snapshot.path, branch_path)
+                    for existing in self.all_targets
+                )
+                changed_as_expected = (
+                    current_count > previous_count
+                    if expanding
+                    else current_count < previous_count
+                )
+                if changed_as_expected:
+                    break
             self._apply_targets(restore=previous)
             if not self.targets or self.selected < 0:
                 self._emit_selection()
-                return
+                return refresh_method
+            self._reset_hierarchy_for_selected()
+            self._emit_selection()
+            return refresh_method
+
+        def _refresh_invalid_target(self, target: RuntimeTarget) -> None:
+            self.invalid_targets.add(self._identity_token(target.snapshot))
+            self.events.put(("target_skipped", target.snapshot))
+            self._enumerate(self.hwnd)
+            self._apply_targets(restore=target.snapshot)
             self._reset_hierarchy_for_selected()
             self._emit_selection()
 
         def _activate(self) -> None:
             if not self.targets or self.selected < 0:
                 return
+            started = time.perf_counter()
             self._sync_window_geometry()
             target = self.targets[self.selected]
-            if not self._target_is_exposed(target):
-                self.invalid_targets.add(self._identity_token(target.snapshot))
-                self.events.put(("target_skipped", target.snapshot))
-                self._enumerate(self.hwnd)
-                self._apply_targets(restore=target.snapshot)
-                self._reset_hierarchy_for_selected()
-                self._emit_selection()
+            if not self._update_live_target(target):
+                self._refresh_invalid_target(target)
                 return
-            state = expand_state(target.control) if target.snapshot.supports_expand else None
-            if state == 0:
-                method = set_expanded(target.control, True)
-                self._refresh_after_expand(target.snapshot)
-                self.events.put(
-                    (
-                        "expanded",
-                        {"target": target.snapshot, "method": method or "Expand"},
-                    )
+            expansion = (
+                toggle_expanded(target.control)
+                if target.snapshot.supports_expand
+                else None
+            )
+            if expansion is not None:
+                method, expanding = expansion
+                refresh = self._refresh_after_expand(
+                    target, target.snapshot, expanding=expanding
                 )
-                return
-            if state in (1, 2):
-                method = set_expanded(target.control, False)
-                self._refresh_after_expand(target.snapshot)
                 self.events.put(
                     (
                         "expanded",
-                        {"target": target.snapshot, "method": method or "Collapse"},
+                        {
+                            "target": target.snapshot,
+                            "method": method or "Expand",
+                            "refresh": refresh,
+                            "elapsed": time.perf_counter() - started,
+                        },
                     )
                 )
                 return
 
-            method = smart_invoke(target)
+            method = (
+                try_semantic_invoke(target)
+                if target.snapshot.has_action_pattern
+                else None
+            )
+            if method is None:
+                if not self._target_is_exposed(
+                    target, allow_semantic_bypass=False
+                ):
+                    self._refresh_invalid_target(target)
+                    return
+                method = click_target(target)
             self.events.put(
                 (
                     "activated",
-                    {"target": target.snapshot, "method": method},
+                    {
+                        "target": target.snapshot,
+                        "method": method,
+                        "elapsed": time.perf_counter() - started,
+                    },
                 )
             )
 
@@ -1640,6 +1784,9 @@ def _run_windows(args: argparse.Namespace) -> int:
                 while True:
                     command, value = self.commands.get()
                     try:
+                        if command == "sync_window":
+                            with self._post_lock:
+                                self._sync_pending = False
                         if command == "stop":
                             return
                         if command == "scan":
@@ -2070,13 +2217,14 @@ def _run_windows(args: argparse.Namespace) -> int:
                 target = payload["target"]
                 print(
                     f"已切换: {target.name or target.control_type} "
-                    f"({payload['method']})"
+                    f"({payload['method']} / {payload['refresh']} refresh / "
+                    f"{payload['elapsed']:.3f}s)"
                 )
             elif event == "activated":
                 target = payload["target"]
                 print(
                     f"已执行: {target.name or target.control_type} "
-                    f"({payload['method']})"
+                    f"({payload['method']} / {payload['elapsed']:.3f}s)"
                 )
                 leave_navigation()
             elif event == "exit_requested":

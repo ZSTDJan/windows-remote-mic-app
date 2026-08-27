@@ -447,6 +447,14 @@ class SpatialNavigationTests(unittest.TestCase):
             )
         )
 
+    def test_branch_path_only_matches_descendants(self):
+        branch = (0, 2, 4)
+        self.assertTrue(prototype.path_is_in_branch((0, 2, 4, 0), branch))
+        self.assertTrue(prototype.path_is_in_branch((0, 2, 4, 1, 3), branch))
+        self.assertFalse(prototype.path_is_in_branch(branch, branch))
+        self.assertFalse(prototype.path_is_in_branch((0, 2, 5, 0), branch))
+        self.assertFalse(prototype.path_is_in_branch((0, 2), branch))
+
     def test_same_rectangle_prefers_deeper_real_action(self):
         wrapper = prototype.TargetSnapshot(
             prototype.Rect(40, 40, 240, 90),
