@@ -796,7 +796,7 @@ def _load_qt_classes() -> dict:
         _hotkeyCaptureResult = Signal(str)
 
         _TRIGGER_MODE_ORDER = (key_mapping.VoiceTriggerMode.HOLD,)
-        _DEVICE_ORDER = tuple(profile.device_id for profile in device_catalog.DEVICE_PROFILES)
+        _DEVICE_ORDER = (device_catalog.RC003_ID,)
         _KEY_DETECTION_TIMEOUT_SECONDS = key_detection_bridge.STALE_AFTER_SECONDS
         _KEY_DETECTION_USAGE_TO_BUTTON = {
             usage: button_id
@@ -835,6 +835,9 @@ def _load_qt_classes() -> dict:
             voice_program_autostart_migrated = (
                 self._voice_program_settings.get("provider")
                 != voice_program_manager.VOICE_PROGRAM_NONE
+                and not voice_program_manager.is_system_managed_provider(
+                    self._voice_program_settings.get("provider")
+                )
                 and self._voice_program_settings.get("launch_on_bridge_start")
                 is not True
             )
@@ -906,12 +909,10 @@ def _load_qt_classes() -> dict:
             selected_device_id = device_catalog.normalize_device_id(
                 self._config.get("selected_device_profile")
             )
+            if selected_device_id not in self._DEVICE_ORDER:
+                selected_device_id = device_catalog.RC003_ID
             self._selected_device_fallback_id = selected_device_id
-            self._selected_device_index = (
-                self._DEVICE_ORDER.index(selected_device_id)
-                if selected_device_id in self._DEVICE_ORDER
-                else -1
-            )
+            self._selected_device_index = self._DEVICE_ORDER.index(selected_device_id)
             self._dji_mic_status_text = ""
             self._key_detection_listener = None
             self._key_detection_tap = None
@@ -932,7 +933,8 @@ def _load_qt_classes() -> dict:
             self._selected_endpoint_index = -1
             self._refresh_endpoint_options()
             self._refresh_voice_program_status()
-            self._refresh_dji_mic_status()
+            if self._selected_device_id() == device_catalog.DJI_MIC_2_ID:
+                self._refresh_dji_mic_status()
             self._load_bindings_into_model()
             self._model.mappingEdited.connect(self._mark_settings_dirty)
             self._model.set_selected_button(self._selected_button_id)
@@ -1579,6 +1581,7 @@ def _load_qt_classes() -> dict:
             updated["provider"] = provider_id
             updated["launch_on_bridge_start"] = (
                 provider_id != voice_program_manager.VOICE_PROGRAM_NONE
+                and not voice_program_manager.is_system_managed_provider(provider_id)
             )
             self._replace_voice_program_settings(updated)
             self._set_voice_program_settings_dirty(True)
@@ -1588,6 +1591,17 @@ def _load_qt_classes() -> dict:
             int,
             _get_selected_voice_program_index,
             _set_selected_voice_program_index,
+            notify=selectedVoiceProgramIndexChanged,
+        )
+
+        def _get_voice_program_system_managed(self) -> bool:
+            return voice_program_manager.is_system_managed_provider(
+                self._voice_program_settings.get("provider")
+            )
+
+        voiceProgramSystemManaged = Property(
+            bool,
+            _get_voice_program_system_managed,
             notify=selectedVoiceProgramIndexChanged,
         )
 
@@ -1794,7 +1808,10 @@ def _load_qt_classes() -> dict:
         selectedButtonId = Property(str, _get_selected_button_id, notify=selectedButtonIdChanged)
 
         def _get_device_options(self) -> List[str]:
-            return [profile.display_name for profile in device_catalog.DEVICE_PROFILES]
+            return [
+                device_catalog.profile_for(device_id).display_name
+                for device_id in self._DEVICE_ORDER
+            ]
 
         deviceOptions = Property(list, _get_device_options, constant=True)
 

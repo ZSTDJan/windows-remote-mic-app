@@ -12,21 +12,29 @@ Item {
 
     readonly property bool voiceProgramManaged:
         SettingsController.selectedVoiceProgramIndex !== 0
+    readonly property bool voiceProgramSystemManaged:
+        SettingsController.voiceProgramSystemManaged
     readonly property bool bridgeLaunchInProgress:
         SettingsController.bridgeLaunchBusy
         || SettingsController.bridgeLaunchPhase === "waiting"
     readonly property bool voiceProgramPrivilegeUnknown:
-        SettingsController.voiceProgramStatusCode === "running"
+        !voiceProgramSystemManaged
+        && SettingsController.voiceProgramStatusCode === "running"
         && SettingsController.voiceProgramElevationStatus === "unknown"
     readonly property bool voiceProgramPrivilegeMismatch:
-        SettingsController.voiceProgramStatusCode === "running"
+        !voiceProgramSystemManaged
+        && SettingsController.voiceProgramStatusCode === "running"
         && SettingsController.voiceProgramElevationStatus !== "unknown"
         && SettingsController.voiceProgramLaunchElevated
             !== (SettingsController.voiceProgramElevationStatus === "elevated")
     readonly property bool voiceProgramNeedsAttention:
         voiceProgramPrivilegeUnknown || voiceProgramPrivilegeMismatch
     readonly property color voiceProgramStateColor:
-        SettingsController.voiceProgramStatusCode === "running"
+        voiceProgramSystemManaged
+            && (SettingsController.voiceProgramStatusCode === "running"
+                || SettingsController.voiceProgramStatusCode === "stopped")
+            ? tokens.successColor
+            : SettingsController.voiceProgramStatusCode === "running"
             ? (voiceProgramNeedsAttention ? tokens.voiceAccent : tokens.successColor)
             : SettingsController.voiceProgramStatusCode === "disabled"
                 ? tokens.accent : tokens.voiceAccent
@@ -35,6 +43,13 @@ Item {
         const code = SettingsController.voiceProgramStatusCode
         if (!voiceProgramManaged)
             return ""
+        if (voiceProgramSystemManaged) {
+            if (code === "running" || code === "stopped")
+                return qsTr("已识别 · 系统管理")
+            if (code === "not_found")
+                return qsTr("未找到程序")
+            return qsTr("需检查")
+        }
         if (code === "running") {
             const privilege = SettingsController.voiceProgramElevationStatus
             if (privilege === "unknown")
@@ -51,7 +66,7 @@ Item {
                 && SettingsController.voiceProgramSettingsDirty
                 ? qsTr("已修改 · 待应用") : qsTr("已找到 · 待启动")
         if (code === "not_found") {
-            return SettingsController.selectedVoiceProgramIndex === 2
+            return SettingsController.selectedVoiceProgramIndex === 3
                 && SettingsController.voiceProgramCustomPath.length === 0
                 ? qsTr("请选择程序") : qsTr("未找到程序")
         }
@@ -62,6 +77,9 @@ Item {
         if (!voiceProgramManaged)
             return qsTr("不管理")
         const code = SettingsController.voiceProgramStatusCode
+        if (voiceProgramSystemManaged)
+            return code === "running" || code === "stopped"
+                ? qsTr("已识别") : qsTr("需检查")
         if (code === "running")
             return voiceProgramNeedsAttention ? qsTr("需检查") : qsTr("运行中")
         if (code === "stopped")
@@ -565,7 +583,7 @@ Item {
                             }
 
                             RowLayout {
-                                visible: SettingsController.selectedVoiceProgramIndex === 2
+                                visible: SettingsController.selectedVoiceProgramIndex === 3
                                 Layout.fillWidth: true
                                 Layout.preferredHeight: visible ? tokens.controlHeight : 0
                                 spacing: tokens.spacingSmall
@@ -647,18 +665,22 @@ Item {
                                     text: qsTr("程序启动")
                                 }
                                 UiLabel {
+                                    objectName: "voiceProgramLaunchText"
                                     tokens: root.tokens
                                     kind: noteKind
                                     Layout.fillWidth: true
-                                    text: root.voiceProgramManaged
-                                        ? qsTr("随桥接启动；失败不影响桥接。")
-                                        : qsTr("不管理时仅发送语音按键，不启动外部程序。")
+                                    text: root.voiceProgramSystemManaged
+                                        ? qsTr("由 Windows 管理，无需本程序启动。")
+                                        : root.voiceProgramManaged
+                                            ? qsTr("随桥接启动；失败不影响桥接。")
+                                            : qsTr("不管理时仅发送语音按键，不启动外部程序。")
                                     maximumLineCount: 1
                                     elide: Text.ElideRight
                                 }
                                 CheckBox {
                                     id: voiceProgramElevatedCheckBox
                                     objectName: "voiceProgramElevatedCheckBox"
+                                    visible: !root.voiceProgramSystemManaged
                                     implicitHeight: tokens.controlHeight
                                     enabled: root.voiceProgramManaged
                                     text: qsTr("管理员启动")

@@ -1736,7 +1736,7 @@ def run_diagnostics(
     leaving it to run to completion or to an unbounded process exit.
 
     Every check is isolated (see ``_isolated()``): one check's unexpected
-    failure can never prevent the other six from rendering their own real
+    failure can never prevent the other five from rendering their own real
     result - UNLESS ``cancel_event`` becomes set (XRBM-035 RETRY 1 P1 #2):
     once shutdown has been requested, this function stops running any
     FURTHER checks after whichever one just completed and returns
@@ -1748,7 +1748,7 @@ def run_diagnostics(
     the background worker thread takes to actually finish, for no
     observable benefit, working directly against the whole point of a
     bounded shutdown. With no ``cancel_event`` (the default), this early
-    stop never triggers and all seven checks always run.
+    stop never triggers and all six checks always run.
     """
 
     ble_discover = functools.partial(
@@ -1774,12 +1774,6 @@ def run_diagnostics(
             "语音输出端点",
             CheckGroup.VOICE_BRIDGE,
             lambda: check_output_endpoint_resolution(saved_output_name, saved_output_host_api),
-        ),
-        (
-            "dji_mic_2_input",
-            "DJI Mic 2 录音输入",
-            CheckGroup.EXTERNAL_MICROPHONE,
-            check_dji_mic_2_input,
         ),
         ("dictation", "Windows 听写 (Win+H)", CheckGroup.DICTATION, check_dictation_manual),
     )

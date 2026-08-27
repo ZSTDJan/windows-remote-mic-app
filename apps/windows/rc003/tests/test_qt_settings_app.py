@@ -442,7 +442,9 @@ class SettingsControllerTests(unittest.TestCase):
     def test_voice_program_management_defaults_to_optional_and_disabled(self):
         controller, _ = self._make_controller()
         self.assertEqual(controller.voiceProgramOptions[0], "不管理")
+        self.assertEqual(controller.voiceProgramOptions[2], "微信输入法")
         self.assertEqual(controller.selectedVoiceProgramIndex, 0)
+        self.assertFalse(controller.voiceProgramSystemManaged)
         self.assertFalse(controller.voiceProgramLaunchOnBridgeStart)
         self.assertFalse(controller.voiceProgramLaunchElevated)
         self.assertFalse(controller.voiceProgramSettingsDirty)
@@ -481,6 +483,15 @@ class SettingsControllerTests(unittest.TestCase):
         self.assertTrue(controller.voiceProgramLaunchOnBridgeStart)
         self.assertTrue(controller.voiceProgramSettingsDirty)
         self.assertTrue(controller.settingsDirty)
+
+    def test_selecting_wetype_uses_windows_management_without_autostart(self):
+        controller, _ = self._make_controller()
+
+        controller.selectedVoiceProgramIndex = 2
+
+        self.assertTrue(controller.voiceProgramSystemManaged)
+        self.assertFalse(controller.voiceProgramLaunchOnBridgeStart)
+        self.assertTrue(controller.voiceProgramSettingsDirty)
 
     def test_unrelated_mapping_edit_does_not_mark_voice_program_dirty(self):
         controller, model = self._make_controller()
@@ -534,7 +545,7 @@ class SettingsControllerTests(unittest.TestCase):
         executable = Path(self._tmpdir.name) / "voice.exe"
         executable.touch()
         controller, _ = self._make_controller()
-        controller.selectedVoiceProgramIndex = 2
+        controller.selectedVoiceProgramIndex = 3
         controller.voiceProgramCustomPath = str(executable)
         controller.voiceProgramLaunchOnBridgeStart = True
         controller.voiceProgramLaunchElevated = True
@@ -881,6 +892,10 @@ class SettingsControllerTests(unittest.TestCase):
     def test_device_selector_defaults_to_rc003_for_existing_users(self):
         controller, _ = self._make_controller()
         self.assertEqual(
+            controller.deviceOptions,
+            [device_catalog.profile_for(device_catalog.RC003_ID).display_name],
+        )
+        self.assertEqual(
             controller.selectedDeviceIndex,
             controller._DEVICE_ORDER.index(device_catalog.RC003_ID),
         )
@@ -888,18 +903,24 @@ class SettingsControllerTests(unittest.TestCase):
         self.assertFalse(controller.isDjiMic2Device)
         self.assertEqual(controller.mappingPageTitle, "按键映射")
 
-    def test_selecting_dji_changes_the_ui_contract_and_persists(self):
+    def test_legacy_dji_selection_falls_back_to_rc003_without_rewriting_on_open(self):
+        saved = config.default_config()
+        saved["selected_device_profile"] = device_catalog.DJI_MIC_2_ID
+        path = config.config_path(config.config_root())
+        config.save_config(path, saved)
+
         controller, _ = self._make_controller()
-        controller.selectedDeviceIndex = controller._DEVICE_ORDER.index(
-            device_catalog.DJI_MIC_2_ID
+
+        self.assertEqual(
+            controller.deviceOptions,
+            [device_catalog.profile_for(device_catalog.RC003_ID).display_name],
         )
-        self.assertFalse(controller.isRc003Device)
-        self.assertTrue(controller.isDjiMic2Device)
-        self.assertEqual(controller.mappingPageTitle, "设备控制")
-        self.assertIn("Windows 录音输入", controller.selectedDeviceDescription)
-        self.assertTrue(controller.saveSettings())
-        stored = config.load_config(config.config_path(Path(self._tmpdir.name) / "RemoteMic" / "RC003"))
-        self.assertEqual(stored["selected_device_profile"], device_catalog.DJI_MIC_2_ID)
+        self.assertTrue(controller.isRc003Device)
+        self.assertFalse(controller.isDjiMic2Device)
+        self.assertEqual(
+            config.load_config(path)["selected_device_profile"],
+            device_catalog.DJI_MIC_2_ID,
+        )
 
     def test_dji_control_rows_match_the_truthful_device_catalog(self):
         controller, _ = self._make_controller()
@@ -911,9 +932,8 @@ class SettingsControllerTests(unittest.TestCase):
 
     def test_dji_save_and_launch_never_starts_the_rc003_bridge(self):
         controller, _ = self._make_controller()
-        controller.selectedDeviceIndex = controller._DEVICE_ORDER.index(
-            device_catalog.DJI_MIC_2_ID
-        )
+        controller._selected_device_index = -1
+        controller._selected_device_fallback_id = device_catalog.DJI_MIC_2_ID
         with mock.patch.object(bridge_launcher, "start_bridge_launch") as fake_launch:
             controller.saveAndLaunch()
             self.assertEqual(controller.bridgeLaunchPhase, "saving")
@@ -1000,9 +1020,7 @@ class SettingsControllerTests(unittest.TestCase):
         self.assertTrue(controller.saveSettings())
         self.assertFalse(controller.settingsDirty)
 
-        controller.selectedDeviceIndex = controller._DEVICE_ORDER.index(
-            device_catalog.DJI_MIC_2_ID
-        )
+        controller.selectedVoiceProgramIndex = 1
         self.assertTrue(controller.settingsDirty)
 
     def test_output_endpoint_selection_marks_unsaved_changes(self):
@@ -2040,7 +2058,7 @@ class DiagnosticsControllerTests(unittest.TestCase):
         diag = self.DiagnosticsController(settings_controller, self._config_root)
         self.assertTrue(diag.isRefreshing)
         self.assertTrue(self._pump_until(lambda: not diag.isRefreshing))
-        self.assertEqual(len(diag.checkResults), 7)
+        self.assertEqual(len(diag.checkResults), 6)
         ids = {row["checkId"] for row in diag.checkResults}
         self.assertIn("dictation", ids)
 
@@ -2061,7 +2079,7 @@ class DiagnosticsControllerTests(unittest.TestCase):
         settings_controller = self._make_settings_controller()
         diag = self.DiagnosticsController(settings_controller, self._config_root)
         self.assertTrue(self._pump_until(lambda: not diag.isRefreshing))
-        self.assertEqual(len(diag.checkResults), 7)  # a real prior run populated these
+        self.assertEqual(len(diag.checkResults), 6)  # a real prior run populated these
         self.assertEqual(diag.diagnosticsErrorMessage, "")
 
         with mock.patch.object(
@@ -2089,7 +2107,7 @@ class DiagnosticsControllerTests(unittest.TestCase):
         diag.refreshDiagnostics()
         self.assertTrue(self._pump_until(lambda: not diag.isRefreshing))
         self.assertEqual(diag.diagnosticsErrorMessage, "")
-        self.assertEqual(len(diag.checkResults), 7)
+        self.assertEqual(len(diag.checkResults), 6)
 
     def test_worker_thread_is_deregistered_once_finished(self):
         settings_controller = self._make_settings_controller()
@@ -2874,7 +2892,7 @@ print(json.dumps(result))
 """
 
 
-_DJI_DEVICE_PAGE_PROBE_SCRIPT = r"""
+_RC003_ONLY_DEVICE_PAGE_PROBE_SCRIPT = r"""
 import json
 
 from ovb_rc003 import qt_settings_app as m
@@ -2906,9 +2924,9 @@ DiagnosticsController = classes["DiagnosticsController"]
 
 QQuickStyle.setStyle("Basic")
 app = QGuiApplication.instance() or QGuiApplication([])
+m.single_instance.bridge_instance_running = lambda: False
 model = ButtonMappingModel()
 controller = SettingsController(model)
-controller.selectedDeviceIndex = controller._DEVICE_ORDER.index(m.device_catalog.DJI_MIC_2_ID)
 diagnostics_controller = DiagnosticsController(controller, m.config.config_root())
 qmlRegisterSingletonInstance(SettingsController, "OvbRc003Settings", 1, 0, "SettingsController", controller)
 qmlRegisterSingletonInstance(ButtonMappingModel, "OvbRc003Settings", 1, 0, "ButtonMappingModel", model)
@@ -2936,7 +2954,7 @@ result = {
     "dji_visible": bool(dji_layout.property("visible")),
     "rc003_visible": bool(rc003_layout.property("visible")),
     "mapping_page_title": controller.mappingPageTitle,
-    "control_names": [row["name"] for row in controller.djiControlRows],
+    "device_options": list(controller.deviceOptions),
 }
 tab_bar.setProperty("currentIndex", 2)
 for _ in range(10):
@@ -3880,7 +3898,7 @@ class OffscreenQmlLoadTests(unittest.TestCase):
         self.assertEqual(data["height"], 464)
         self.assertFalse(data["retired_finish_tap_control_exists"])
 
-    def test_dji_device_page_hides_rc003_mapping_and_shows_dji_controls(self):
+    def test_dji_device_is_not_offered_by_the_settings_controller(self):
         import json
         import subprocess
 
@@ -3888,23 +3906,25 @@ class OffscreenQmlLoadTests(unittest.TestCase):
         env.setdefault("QT_QPA_PLATFORM", "offscreen")
         env["LOCALAPPDATA"] = tempfile.mkdtemp()
         result = subprocess.run(
-            [sys.executable, "-c", _DJI_DEVICE_PAGE_PROBE_SCRIPT],
+            [sys.executable, "-c", _RC003_ONLY_DEVICE_PAGE_PROBE_SCRIPT],
             env=env,
             capture_output=True,
             text=True,
             timeout=60,
         )
         self.assertEqual(
-            result.returncode, 0, f"DJI QML page probe failed: {result.stderr}"
+            result.returncode, 0, f"RC003-only QML probe failed: {result.stderr}"
         )
         data = json.loads(result.stdout.strip().splitlines()[-1])
-        self.assertTrue(data["dji_visible"])
-        self.assertFalse(data["rc003_visible"])
-        self.assertEqual(data["mapping_page_title"], "设备控制")
-        self.assertEqual(data["control_names"], ["录音键", "连接键", "电源键"])
-        self.assertFalse(data["bluetooth_permission_visible"])
-        self.assertIn("DJI Mic 2", data["microphone_permission_text"])
-        self.assertNotIn("CABLE Output", data["microphone_permission_text"])
+        self.assertEqual(
+            data["device_options"],
+            [device_catalog.profile_for(device_catalog.RC003_ID).display_name],
+        )
+        self.assertFalse(data["dji_visible"])
+        self.assertTrue(data["rc003_visible"])
+        self.assertEqual(data["mapping_page_title"], "按键映射")
+        self.assertTrue(data["bluetooth_permission_visible"])
+        self.assertNotIn("DJI Mic 2", data["microphone_permission_text"])
 
     def test_settings_shell_fits_supported_logical_viewports_without_horizontal_overflow(self):
         import json

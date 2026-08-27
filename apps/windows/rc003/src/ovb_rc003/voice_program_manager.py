@@ -20,22 +20,28 @@ from typing import Callable, Iterable, Mapping, Optional, Sequence
 
 VOICE_PROGRAM_NONE = "none"
 VOICE_PROGRAM_SOGOU = "sogou"
+VOICE_PROGRAM_WETYPE = "wetype"
 VOICE_PROGRAM_CUSTOM = "custom"
 
 VOICE_PROGRAM_PROVIDER_ORDER = (
     VOICE_PROGRAM_NONE,
     VOICE_PROGRAM_SOGOU,
+    VOICE_PROGRAM_WETYPE,
     VOICE_PROGRAM_CUSTOM,
 )
 
 VOICE_PROGRAM_PROVIDER_NAMES = {
     VOICE_PROGRAM_NONE: "不管理",
     VOICE_PROGRAM_SOGOU: "搜狗语音输入",
+    VOICE_PROGRAM_WETYPE: "微信输入法",
     VOICE_PROGRAM_CUSTOM: "其他输入法或自定义程序",
 }
 
 _SOGOU_PROCESS_NAME = "sogou_voice_assistant.exe"
 _SOGOU_RUN_VALUE_NAMES = ("搜狗语音输入法",)
+_WETYPE_SERVER_NAME = "wetype_server.exe"
+_WETYPE_PROCESS_NAMES = (_WETYPE_SERVER_NAME, "wetype_service.exe")
+_SYSTEM_MANAGED_PROVIDERS = frozenset({VOICE_PROGRAM_WETYPE})
 _ALLOWED_EXECUTABLE_SUFFIXES = frozenset({".exe", ".lnk"})
 _ERROR_CANCELLED = 1223
 _COINIT_APARTMENTTHREADED = 0x2
@@ -124,13 +130,19 @@ def normalize_voice_program_settings(raw: object) -> dict[str, object]:
         "provider": provider_id,
         "custom_executable": executable,
         "launch_on_bridge_start": (
-            enabled and data.get("launch_on_bridge_start") is True
+            enabled
+            and not is_system_managed_provider(provider_id)
+            and data.get("launch_on_bridge_start") is True
         ),
         # Keep the user's elevation preference while management is disabled.
         # It has no effect for provider=none and is reused if a provider is
         # selected again later.
         "launch_elevated": data.get("launch_elevated") is True,
     }
+
+
+def is_system_managed_provider(provider_id: object) -> bool:
+    return str(provider_id).strip().lower() in _SYSTEM_MANAGED_PROVIDERS
 
 
 def provider_options() -> list[str]:
@@ -152,6 +164,13 @@ def provider_index(provider_id: object) -> int:
 
 
 def status_text(status: VoiceProgramStatus) -> str:
+    if status.provider_id == VOICE_PROGRAM_WETYPE:
+        if status.code == "not_found":
+            return "未找到微信输入法；正常安装后会自动识别，无需手选路径。"
+        if status.code == "stopped":
+            return "已找到微信输入法；由 Windows 管理，当前未检测到后台进程。"
+        if status.code == "running":
+            return "微信输入法已安装并正在运行（由 Windows 管理）。"
     if status.code == "disabled":
         return "未启用；Remote Mic 不会管理语音程序。"
     if status.code == "not_found":
@@ -183,6 +202,7 @@ def launch_result_text(result: VoiceProgramLaunchResult) -> str:
         "cancelled": "已取消管理员启动。",
         "launch_failed": "语音程序启动失败。",
         "not_requested": "没有设置随桥接启动。",
+        "system_managed": "微信输入法由 Windows 管理，Remote Mic 不单独启动它。",
     }
     return messages.get(result.code, "语音程序状态未知。")
 
@@ -193,6 +213,8 @@ def resolve_voice_program(
     platform: Optional[str] = None,
     process_iter: Optional[Callable[[], Iterable[ProcessInfo]]] = None,
     run_value_reader: Optional[Callable[[], Iterable[str]]] = None,
+    wetype_install_value_reader: Optional[Callable[[], Iterable[str]]] = None,
+    wetype_shortcut_iter: Optional[Callable[[], Iterable[Path]]] = None,
     shortcut_resolver: Optional[Callable[[Path], Optional[Path]]] = None,
 ) -> ResolvedVoiceProgram:
     normalized = normalize_voice_program_settings(settings)
@@ -226,6 +248,23 @@ def resolve_voice_program(
             match_executable,
         )
 
+    if provider_id == VOICE_PROGRAM_WETYPE:
+        executable = discover_wetype_executable(
+            platform=platform,
+            process_iter=process_iter,
+            install_value_reader=wetype_install_value_reader,
+            shortcut_iter=wetype_shortcut_iter,
+            shortcut_resolver=shortcut_resolver,
+        )
+        return ResolvedVoiceProgram(
+            provider_id,
+            display_name,
+            executable,
+            _WETYPE_PROCESS_NAMES,
+            "discovered" if executable is not None else "missing",
+            executable,
+        )
+
     executable = discover_sogou_voice_executable(
         platform=platform,
         process_iter=process_iter,
@@ -247,6 +286,8 @@ def inspect_voice_program(
     platform: Optional[str] = None,
     process_iter: Optional[Callable[[], Iterable[ProcessInfo]]] = None,
     run_value_reader: Optional[Callable[[], Iterable[str]]] = None,
+    wetype_install_value_reader: Optional[Callable[[], Iterable[str]]] = None,
+    wetype_shortcut_iter: Optional[Callable[[], Iterable[Path]]] = None,
     shortcut_resolver: Optional[Callable[[Path], Optional[Path]]] = None,
 ) -> VoiceProgramStatus:
     resolved = resolve_voice_program(
@@ -254,6 +295,8 @@ def inspect_voice_program(
         platform=platform,
         process_iter=process_iter,
         run_value_reader=run_value_reader,
+        wetype_install_value_reader=wetype_install_value_reader,
+        wetype_shortcut_iter=wetype_shortcut_iter,
         shortcut_resolver=shortcut_resolver,
     )
     if resolved.provider_id == VOICE_PROGRAM_NONE:
@@ -297,6 +340,8 @@ def launch_voice_program(
     platform: Optional[str] = None,
     process_iter: Optional[Callable[[], Iterable[ProcessInfo]]] = None,
     run_value_reader: Optional[Callable[[], Iterable[str]]] = None,
+    wetype_install_value_reader: Optional[Callable[[], Iterable[str]]] = None,
+    wetype_shortcut_iter: Optional[Callable[[], Iterable[Path]]] = None,
     start_file: Optional[Callable[[str, str, str], None]] = None,
     shortcut_resolver: Optional[Callable[[Path], Optional[Path]]] = None,
 ) -> VoiceProgramLaunchResult:
@@ -308,6 +353,8 @@ def launch_voice_program(
         platform=platform,
         process_iter=process_iter,
         run_value_reader=run_value_reader,
+        wetype_install_value_reader=wetype_install_value_reader,
+        wetype_shortcut_iter=wetype_shortcut_iter,
         shortcut_resolver=shortcut_resolver,
     )
     if resolved.provider_id == VOICE_PROGRAM_NONE:
@@ -317,6 +364,14 @@ def launch_voice_program(
 
     processes = list((process_iter or _iter_windows_processes)())
     matches = _matching_processes(resolved, processes)
+    if is_system_managed_provider(resolved.provider_id):
+        return VoiceProgramLaunchResult(
+            resolved.provider_id,
+            False,
+            bool(matches),
+            "system_managed",
+            elevated=_combined_elevation(matches),
+        )
     request_elevation = normalized["launch_elevated"] is True
     running_elevation = _combined_elevation(matches)
     if matches:
@@ -406,6 +461,47 @@ def discover_sogou_voice_executable(
     return max(existing, key=_sogou_version_key)
 
 
+def discover_wetype_executable(
+    *,
+    platform: Optional[str] = None,
+    process_iter: Optional[Callable[[], Iterable[ProcessInfo]]] = None,
+    install_value_reader: Optional[Callable[[], Iterable[str]]] = None,
+    shortcut_iter: Optional[Callable[[], Iterable[Path]]] = None,
+    shortcut_resolver: Optional[Callable[[Path], Optional[Path]]] = None,
+) -> Optional[Path]:
+    current_platform = sys.platform if platform is None else platform
+    if current_platform != "win32":
+        return None
+
+    for process in (process_iter or _iter_windows_processes)():
+        if (
+            process.name.casefold() == _WETYPE_SERVER_NAME
+            and process.executable is not None
+            and process.executable.is_file()
+        ):
+            return process.executable
+
+    candidates: list[Path] = []
+    for raw_value in (install_value_reader or _read_wetype_install_values)():
+        candidates.extend(_wetype_candidates_from_value(raw_value))
+
+    resolver = shortcut_resolver or _resolve_shortcut_target
+    for shortcut in (shortcut_iter or _iter_wetype_shortcuts)():
+        target = resolver(shortcut)
+        if target is None:
+            continue
+        candidates.extend(_wetype_candidates_from_path(target.parent))
+        candidates.extend(_wetype_candidates_from_path(target.parent.parent))
+
+    for root in _wetype_default_roots():
+        candidates.extend(_wetype_candidates_from_path(root))
+
+    existing = list(dict.fromkeys(path for path in candidates if path.is_file()))
+    if not existing:
+        return None
+    return max(existing, key=_wetype_version_key)
+
+
 def _validated_configured_path(raw: object) -> Optional[Path]:
     text = str(raw).strip()
     if not text:
@@ -430,6 +526,39 @@ def _sogou_version_key(path: Path) -> tuple[int, ...]:
     version_text = path.parents[1].name if len(path.parents) > 1 else ""
     numbers = tuple(int(item) for item in re.findall(r"\d+", version_text))
     return numbers or (0,)
+
+
+def _wetype_candidates_from_value(raw: object) -> list[Path]:
+    text = os.path.expandvars(str(raw).strip())
+    if not text:
+        return []
+    if ".exe" in text.casefold():
+        candidate = _command_executable(text)
+        if candidate is None:
+            return []
+        return _wetype_candidates_from_path(candidate)
+    return _wetype_candidates_from_path(Path(text.strip('"')))
+
+
+def _wetype_candidates_from_path(path: Path) -> list[Path]:
+    if path.name.casefold() == _WETYPE_SERVER_NAME:
+        return [path]
+    if path.suffix:
+        path = path.parent
+    candidates = [path / _WETYPE_SERVER_NAME]
+    try:
+        candidates.extend(path.glob(f"*/{_WETYPE_SERVER_NAME}"))
+    except OSError:
+        pass
+    return candidates
+
+
+def _wetype_version_key(path: Path) -> tuple[int, ...]:
+    for part in (path.parent.name, path.parent.parent.name):
+        numbers = tuple(int(item) for item in re.findall(r"\d+", part))
+        if numbers:
+            return numbers
+    return (0,)
 
 
 def _matching_processes(
@@ -629,6 +758,76 @@ def _read_sogou_run_values() -> Iterable[str]:
             return tuple(values)
     except OSError:
         return ()
+
+
+def _read_wetype_install_values() -> Iterable[str]:
+    if sys.platform != "win32":
+        return ()
+    try:
+        import winreg
+
+        subkey = r"Software\Microsoft\Windows\CurrentVersion\Uninstall\WeType"
+        values: list[str] = []
+        views = tuple(
+            dict.fromkeys(
+                (
+                    0,
+                    getattr(winreg, "KEY_WOW64_64KEY", 0),
+                    getattr(winreg, "KEY_WOW64_32KEY", 0),
+                )
+            )
+        )
+        for hive in (winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE):
+            for view in views:
+                try:
+                    with winreg.OpenKey(
+                        hive,
+                        subkey,
+                        0,
+                        winreg.KEY_READ | view,
+                    ) as key:
+                        for name in ("DisplayIcon", "InstallLocation"):
+                            try:
+                                value, _ = winreg.QueryValueEx(key, name)
+                            except OSError:
+                                continue
+                            text = str(value).strip()
+                            if text:
+                                values.append(text)
+                except OSError:
+                    continue
+        return tuple(dict.fromkeys(values))
+    except OSError:
+        return ()
+
+
+def _iter_wetype_shortcuts() -> Iterable[Path]:
+    candidates: list[Path] = []
+    for variable, suffix in (
+        ("APPDATA", Path("Microsoft", "Windows", "Start Menu", "Programs")),
+        ("PROGRAMDATA", Path("Microsoft", "Windows", "Start Menu", "Programs")),
+    ):
+        root_text = os.environ.get(variable)
+        if not root_text:
+            continue
+        root = Path(root_text) / suffix
+        candidates.extend(
+            (
+                root / "微信输入法" / "微信输入法.lnk",
+                root / "微信输入法.lnk",
+                root / "WeType" / "WeType.lnk",
+            )
+        )
+    return tuple(path for path in candidates if path.is_file())
+
+
+def _wetype_default_roots() -> Iterable[Path]:
+    roots: list[Path] = []
+    for variable in ("ProgramFiles", "ProgramFiles(x86)", "LOCALAPPDATA"):
+        root_text = os.environ.get(variable)
+        if root_text:
+            roots.append(Path(root_text) / "Tencent" / "WeType")
+    return tuple(dict.fromkeys(roots))
 
 
 def _default_start_file(path: str, operation: str, cwd: str) -> None:

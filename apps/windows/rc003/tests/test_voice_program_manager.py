@@ -59,8 +59,21 @@ class VoiceProgramSettingsTests(unittest.TestCase):
     def test_provider_options_use_the_expandable_custom_program_name(self):
         self.assertEqual(
             manager.provider_options(),
-            ["不管理", "搜狗语音输入", "其他输入法或自定义程序"],
+            ["不管理", "搜狗语音输入", "微信输入法", "其他输入法或自定义程序"],
         )
+
+    def test_system_managed_provider_never_requests_bridge_autostart(self):
+        normalized = manager.normalize_voice_program_settings(
+            {
+                "provider": "wetype",
+                "launch_on_bridge_start": True,
+                "launch_elevated": True,
+            }
+        )
+
+        self.assertFalse(normalized["launch_on_bridge_start"])
+        self.assertTrue(normalized["launch_elevated"])
+        self.assertTrue(manager.is_system_managed_provider("wetype"))
 
 
 class SogouDiscoveryTests(unittest.TestCase):
@@ -110,6 +123,68 @@ class SogouDiscoveryTests(unittest.TestCase):
                 ),
             )
         self.assertEqual(found, newer)
+
+
+class WeTypeDiscoveryTests(unittest.TestCase):
+    def test_running_server_path_is_preferred(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            executable = Path(tmp) / "wetype_server.exe"
+            executable.touch()
+            found = manager.discover_wetype_executable(
+                platform="win32",
+                process_iter=lambda: (
+                    manager.ProcessInfo(12, executable.name, executable, False),
+                ),
+                install_value_reader=lambda: (),
+                shortcut_iter=lambda: (),
+            )
+
+        self.assertEqual(found, executable)
+
+    def test_install_location_finds_the_server_without_a_saved_user_path(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            install_root = Path(tmp) / "Tencent" / "WeType"
+            executable = install_root / "wetype_server.exe"
+            install_root.mkdir(parents=True)
+            executable.touch()
+            with mock.patch.object(manager, "_wetype_default_roots", return_value=()):
+                found = manager.discover_wetype_executable(
+                    platform="win32",
+                    process_iter=lambda: (),
+                    install_value_reader=lambda: (str(install_root),),
+                    shortcut_iter=lambda: (),
+                )
+
+        self.assertEqual(found, executable)
+
+    def test_system_managed_provider_is_detected_but_never_launched(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            install_root = Path(tmp) / "Tencent" / "WeType"
+            executable = install_root / "wetype_server.exe"
+            install_root.mkdir(parents=True)
+            executable.touch()
+            settings = {"provider": "wetype", "launch_on_bridge_start": True}
+            with mock.patch.object(manager, "_wetype_default_roots", return_value=()):
+                status = manager.inspect_voice_program(
+                    settings,
+                    platform="win32",
+                    process_iter=lambda: (),
+                    wetype_install_value_reader=lambda: (str(install_root),),
+                    wetype_shortcut_iter=lambda: (),
+                )
+                result = manager.launch_voice_program(
+                    settings,
+                    platform="win32",
+                    process_iter=lambda: (),
+                    wetype_install_value_reader=lambda: (str(install_root),),
+                    wetype_shortcut_iter=lambda: (),
+                    start_file=lambda *_: self.fail("微信输入法不应由 Remote Mic 启动"),
+                )
+
+        self.assertTrue(status.available)
+        self.assertFalse(status.running)
+        self.assertEqual(status.code, "stopped")
+        self.assertEqual(result.code, "system_managed")
 
 
 class VoiceProgramLaunchTests(unittest.TestCase):

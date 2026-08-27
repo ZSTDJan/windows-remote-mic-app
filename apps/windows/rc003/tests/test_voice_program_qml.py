@@ -219,6 +219,18 @@ status_cases["stopped_voice_program_dirty"] = rendered_status(
     voice_program_dirty=True,
 )
 
+controller.selectedVoiceProgramIndex = 2
+render(window, app)
+system_managed = {
+    "provider": bool(controller.voiceProgramSystemManaged),
+    "auto_start": bool(controller.voiceProgramLaunchOnBridgeStart),
+    "elevated_visible": bool(elevated.property("visible")),
+    "launch_text": str(find(window, "voiceProgramLaunchText").property("text")),
+    "custom_path_visible": bool(
+        find(window, "voiceProgramCustomPathField").property("visible")
+    ),
+}
+
 controller.selectedVoiceProgramIndex = 0
 render(window, app)
 unmanaged_elevated = {
@@ -235,6 +247,7 @@ result = {
     "managed_auto_start": managed_auto_start,
     "managed_elevated": managed_elevated,
     "status_cases": status_cases,
+    "system_managed": system_managed,
     "unmanaged_elevated": unmanaged_elevated,
     "retired_controls_absent": all(
         find(window, name) is None
@@ -277,6 +290,14 @@ class VoiceProgramQmlTests(unittest.TestCase):
         self.assertTrue(all(item["enabled"] for item in data["managed"].values()))
         self.assertTrue(data["managed_auto_start"])
         self.assertTrue(data["managed_elevated"])
+        self.assertTrue(data["system_managed"]["provider"])
+        self.assertFalse(data["system_managed"]["auto_start"])
+        self.assertFalse(data["system_managed"]["elevated_visible"])
+        self.assertFalse(data["system_managed"]["custom_path_visible"])
+        self.assertEqual(
+            data["system_managed"]["launch_text"],
+            "由 Windows 管理，无需本程序启动。",
+        )
         self.assertEqual(
             data["status_cases"]["unknown_running"]["text"],
             "运行中 · 权限未知",
