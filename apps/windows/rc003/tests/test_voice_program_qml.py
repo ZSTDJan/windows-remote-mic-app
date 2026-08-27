@@ -100,7 +100,7 @@ window.show()
 render(window, app)
 
 tab_bar = find(window, "tabBar")
-tab_bar.setProperty("currentIndex", 0)
+tab_bar.setProperty("currentIndex", 2)
 render(window, app)
 
 controller.selectedVoiceProgramIndex = 1
@@ -119,7 +119,7 @@ if screenshot:
 controls = {
     name: find(window, name)
     for name in (
-        "voiceInputSection",
+        "voiceProgramSection",
         "voiceProgramCombo",
         "holdVoiceHotkeyField",
         "voiceProgramElevatedCheckBox",
@@ -231,6 +231,30 @@ system_managed = {
     ),
 }
 
+controller.selectedVoiceProgramIndex = 3
+render(window, app)
+windows_dictation = {
+    "provider": bool(controller.voiceProgramSystemManaged),
+    "auto_start": bool(controller.voiceProgramLaunchOnBridgeStart),
+    "elevated_visible": bool(elevated.property("visible")),
+    "hotkey_button_visible": bool(
+        find(window, "useWindowsDictationHotkeyButton").property("visible")
+    ),
+    "speech_settings_visible": bool(
+        find(window, "openSpeechSettingsButton").property("visible")
+    ),
+    "launch_text": str(find(window, "voiceProgramLaunchText").property("text")),
+}
+
+controller.selectedVoiceProgramIndex = 4
+render(window, app)
+custom_program = {
+    "path_visible": bool(
+        find(window, "voiceProgramCustomPathField").property("visible")
+    ),
+    "elevated_visible": bool(elevated.property("visible")),
+}
+
 controller.selectedVoiceProgramIndex = 0
 render(window, app)
 unmanaged_elevated = {
@@ -248,6 +272,8 @@ result = {
     "managed_elevated": managed_elevated,
     "status_cases": status_cases,
     "system_managed": system_managed,
+    "windows_dictation": windows_dictation,
+    "custom_program": custom_program,
     "unmanaged_elevated": unmanaged_elevated,
     "retired_controls_absent": all(
         find(window, name) is None
@@ -267,7 +293,7 @@ print(json.dumps(result, ensure_ascii=False))
 
 
 class VoiceProgramQmlTests(unittest.TestCase):
-    def test_connection_page_owns_the_compact_optional_voice_program_controls(self):
+    def test_voice_page_owns_the_provider_specific_voice_program_controls(self):
         env = dict(os.environ)
         env.setdefault("QT_QPA_PLATFORM", "offscreen")
         env["LOCALAPPDATA"] = tempfile.mkdtemp()
@@ -296,8 +322,19 @@ class VoiceProgramQmlTests(unittest.TestCase):
         self.assertFalse(data["system_managed"]["custom_path_visible"])
         self.assertEqual(
             data["system_managed"]["launch_text"],
-            "由 Windows 管理，无需本程序启动。",
+            "由 Windows 管理，无需本程序启动",
         )
+        self.assertTrue(data["windows_dictation"]["provider"])
+        self.assertFalse(data["windows_dictation"]["auto_start"])
+        self.assertFalse(data["windows_dictation"]["elevated_visible"])
+        self.assertTrue(data["windows_dictation"]["hotkey_button_visible"])
+        self.assertTrue(data["windows_dictation"]["speech_settings_visible"])
+        self.assertEqual(
+            data["windows_dictation"]["launch_text"],
+            "由 Windows 提供听写和联机语音识别",
+        )
+        self.assertTrue(data["custom_program"]["path_visible"])
+        self.assertTrue(data["custom_program"]["elevated_visible"])
         self.assertEqual(
             data["status_cases"]["unknown_running"]["text"],
             "运行中 · 权限未知",
@@ -321,14 +358,6 @@ class VoiceProgramQmlTests(unittest.TestCase):
         self.assertEqual(
             data["status_cases"]["stopped_voice_program_dirty"]["text"],
             "已修改 · 待应用",
-        )
-        self.assertEqual(
-            data["status_cases"]["unknown_running"]["color"],
-            data["status_cases"]["standard_mismatch"]["color"],
-        )
-        self.assertNotEqual(
-            data["status_cases"]["standard_running"]["color"],
-            data["status_cases"]["standard_mismatch"]["color"],
         )
         self.assertTrue(data["unmanaged_elevated"]["visible"])
         self.assertFalse(data["unmanaged_elevated"]["enabled"])

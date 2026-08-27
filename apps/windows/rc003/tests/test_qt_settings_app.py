@@ -32,6 +32,7 @@ from unittest import mock
 
 from ovb_rc003 import (
     audio_output,
+    bridge_control_windows,
     bridge_launcher,
     bridge_runtime_status,
     config,
@@ -443,6 +444,10 @@ class SettingsControllerTests(unittest.TestCase):
         controller, _ = self._make_controller()
         self.assertEqual(controller.voiceProgramOptions[0], "不管理")
         self.assertEqual(controller.voiceProgramOptions[2], "微信输入法")
+        self.assertEqual(
+            controller.voiceProgramOptions[3], "Windows 语音输入（Win+H）"
+        )
+        self.assertEqual(controller.voiceProgramOptions[4], "自定义程序")
         self.assertEqual(controller.selectedVoiceProgramIndex, 0)
         self.assertFalse(controller.voiceProgramSystemManaged)
         self.assertFalse(controller.voiceProgramLaunchOnBridgeStart)
@@ -492,6 +497,17 @@ class SettingsControllerTests(unittest.TestCase):
         self.assertTrue(controller.voiceProgramSystemManaged)
         self.assertFalse(controller.voiceProgramLaunchOnBridgeStart)
         self.assertTrue(controller.voiceProgramSettingsDirty)
+
+    def test_selecting_windows_dictation_uses_system_management_and_win_h_helper(self):
+        controller, _ = self._make_controller()
+
+        controller.selectedVoiceProgramIndex = 3
+        controller.useWindowsDictationHotkey()
+
+        self.assertTrue(controller.voiceProgramSystemManaged)
+        self.assertFalse(controller.voiceProgramLaunchOnBridgeStart)
+        self.assertEqual(controller.holdVoiceHotkeyText, "win+h")
+        self.assertTrue(controller.settingsDirty)
 
     def test_unrelated_mapping_edit_does_not_mark_voice_program_dirty(self):
         controller, model = self._make_controller()
@@ -545,7 +561,7 @@ class SettingsControllerTests(unittest.TestCase):
         executable = Path(self._tmpdir.name) / "voice.exe"
         executable.touch()
         controller, _ = self._make_controller()
-        controller.selectedVoiceProgramIndex = 3
+        controller.selectedVoiceProgramIndex = 4
         controller.voiceProgramCustomPath = str(executable)
         controller.voiceProgramLaunchOnBridgeStart = True
         controller.voiceProgramLaunchElevated = True
@@ -651,7 +667,7 @@ class SettingsControllerTests(unittest.TestCase):
         self.assertTrue(controller.bridgeRunning)
         self.assertFalse(controller.bridgeConnected)
         self.assertEqual(controller.bridgeLaunchPhase, "waiting")
-        self.assertIn("桥接进程已启动", controller.launchStatusText)
+        self.assertIn("遥控器服务已启动", controller.launchStatusText)
         self.assertIn("连接状态暂时未知", controller.launchStatusText)
 
     def test_launch_status_reads_the_bridge_reported_connected_state(self):
@@ -1215,7 +1231,7 @@ class SettingsControllerTests(unittest.TestCase):
         self.assertTrue(controller.bridgeRunning)
         self.assertFalse(controller.bridgeConnected)
         self.assertEqual(controller.bridgeLaunchPhase, "waiting")
-        self.assertIn("桥接进程已启动", controller.launchStatusText)
+        self.assertIn("遥控器服务已启动", controller.launchStatusText)
         self.assertIn("约一分钟", controller.launchStatusText)
         self.assertNotIn("已连接", controller.launchStatusText)
 
@@ -1223,7 +1239,27 @@ class SettingsControllerTests(unittest.TestCase):
 
         self.assertFalse(controller.bridgeRunning)
         self.assertEqual(controller.bridgeLaunchPhase, "failed")
-        self.assertIn("桥接进程已经退出", controller.launchStatusText)
+        self.assertIn("遥控器服务已经退出", controller.launchStatusText)
+
+    def test_device_page_start_bridge_does_not_save_unrelated_dirty_edits(self):
+        controller, model = self._make_controller()
+        model.setActionTextAt(model.index_of("power"), "f5")
+        fake_result = bridge_launcher.LaunchResult(
+            outcome=bridge_launcher.LaunchOutcome.STARTED,
+            command=("exe",),
+            pid=4321,
+        )
+
+        with mock.patch.object(controller, "_save") as save, mock.patch.object(
+            bridge_launcher, "start_bridge_launch", return_value=fake_result
+        ):
+            controller.startBridge()
+            controller._start_bridge_process()
+
+        save.assert_not_called()
+        self.assertTrue(controller.settingsDirty)
+        self.assertTrue(controller.bridgeRunning)
+        self.assertEqual(controller.bridgeLaunchPhase, "waiting")
 
     def test_existing_bridge_applies_the_saved_voice_program_without_restart(self):
         controller, _ = self._make_controller()
@@ -2515,7 +2551,105 @@ class DiagnosticsControllerTests(unittest.TestCase):
 
         self.assertFalse(diag.vbCableTestRunning)
         self.assertEqual(diag.vbCableTestStatus, "fail")
-        self.assertIn("先停止桥接", diag.vbCableTestMessage)
+        self.assertIn("临时停止", diag.vbCableTestMessage)
+        loopback.assert_not_called()
+
+    def test_vb_cable_channel_test_temporarily_stops_and_restores_bridge(self):
+        settings_controller = self._make_settings_controller()
+        diag = self.DiagnosticsController(settings_controller, self._config_root)
+        self._pump_until(lambda: not diag.isRefreshing)
+        loopback_result = windows_diagnostics.CheckResult(
+            "vb_cable_loopback",
+            "VB-CABLE 本地通道",
+            windows_diagnostics.CheckGroup.OPTIONAL_DRIVER,
+            windows_diagnostics.CheckStatus.PASS,
+            "测试信号已到达。",
+        )
+        restart_result = bridge_launcher.LaunchResult(
+            outcome=bridge_launcher.LaunchOutcome.STARTED,
+            command=("RemoteMicRC003.exe", "--bridge"),
+        )
+
+        with mock.patch.object(
+            settings_controller, "_refresh_bridge_status", return_value=True
+        ), mock.patch.object(
+            bridge_control_windows,
+            "request_bridge_exit",
+            return_value=bridge_control_windows.BridgeExitResult(True, True),
+        ), mock.patch.object(
+            windows_diagnostics,
+            "check_vb_cable_loopback_isolated",
+            return_value=loopback_result,
+        ), mock.patch.object(
+            bridge_launcher, "launch_bridge", return_value=restart_result
+        ):
+            diag.testVbCableChannelWithBridgeRestart()
+            self.assertTrue(diag.vbCableTestRunning)
+            self.assertTrue(self._pump_until(lambda: not diag.vbCableTestRunning))
+
+        self.assertEqual(diag.vbCableTestStatus, "pass")
+        self.assertIn("自动恢复", diag.vbCableTestMessage)
+        self.assertFalse(diag.vbCableBridgeRecoveryNeeded)
+
+    def test_vb_cable_channel_test_exposes_manual_recovery_when_restart_fails(self):
+        settings_controller = self._make_settings_controller()
+        diag = self.DiagnosticsController(settings_controller, self._config_root)
+        self._pump_until(lambda: not diag.isRefreshing)
+        loopback_result = windows_diagnostics.CheckResult(
+            "vb_cable_loopback",
+            "VB-CABLE 本地通道",
+            windows_diagnostics.CheckGroup.OPTIONAL_DRIVER,
+            windows_diagnostics.CheckStatus.PASS,
+            "测试信号已到达。",
+        )
+        restart_result = bridge_launcher.LaunchResult(
+            outcome=bridge_launcher.LaunchOutcome.LAUNCH_FAILED,
+            command=(),
+            error="denied",
+        )
+
+        with mock.patch.object(
+            settings_controller, "_refresh_bridge_status", return_value=True
+        ), mock.patch.object(
+            bridge_control_windows,
+            "request_bridge_exit",
+            return_value=bridge_control_windows.BridgeExitResult(True, True),
+        ), mock.patch.object(
+            windows_diagnostics,
+            "check_vb_cable_loopback_isolated",
+            return_value=loopback_result,
+        ), mock.patch.object(
+            bridge_launcher, "launch_bridge", return_value=restart_result
+        ):
+            diag.testVbCableChannelWithBridgeRestart()
+            self.assertTrue(self._pump_until(lambda: not diag.vbCableTestRunning))
+
+        self.assertEqual(diag.vbCableTestStatus, "fail")
+        self.assertTrue(diag.vbCableBridgeRecoveryNeeded)
+        self.assertIn("未能自动恢复", diag.vbCableTestMessage)
+
+    def test_vb_cable_channel_test_does_not_run_when_graceful_stop_fails(self):
+        settings_controller = self._make_settings_controller()
+        diag = self.DiagnosticsController(settings_controller, self._config_root)
+        self._pump_until(lambda: not diag.isRefreshing)
+
+        with mock.patch.object(
+            settings_controller, "_refresh_bridge_status", return_value=True
+        ), mock.patch.object(
+            bridge_control_windows,
+            "request_bridge_exit",
+            return_value=bridge_control_windows.BridgeExitResult(
+                True, False, "服务未停止"
+            ),
+        ), mock.patch.object(
+            windows_diagnostics, "check_vb_cable_loopback_isolated"
+        ) as loopback:
+            diag.testVbCableChannelWithBridgeRestart()
+            self.assertTrue(self._pump_until(lambda: not diag.vbCableTestRunning))
+
+        self.assertEqual(diag.vbCableTestStatus, "fail")
+        self.assertIn("服务未停止", diag.vbCableTestMessage)
+        self.assertFalse(diag.vbCableBridgeRecoveryNeeded)
         loopback.assert_not_called()
 
     def test_vb_cable_channel_test_rejects_a_bridge_launch_in_progress(self):
@@ -2946,29 +3080,37 @@ for _ in range(10):
     window.grabWindow()
     app.processEvents()
 
-dji_layout = find_child(window, "djiControlLayout")
 rc003_layout = find_child(window, "rc003MappingLayout")
-assert dji_layout is not None
 assert rc003_layout is not None
 result = {
-    "dji_visible": bool(dji_layout.property("visible")),
     "rc003_visible": bool(rc003_layout.property("visible")),
     "mapping_page_title": controller.mappingPageTitle,
     "device_options": list(controller.deviceOptions),
 }
+tab_bar.setProperty("currentIndex", 0)
+for _ in range(10):
+    window.grabWindow()
+    app.processEvents()
+result["device_rows"] = all(
+    find_child(window, name) is not None
+    for name in (
+        "currentDeviceRow",
+        "buttonReceiverRow",
+        "remoteServiceRow",
+        "runtimeLogRow",
+    )
+)
 tab_bar.setProperty("currentIndex", 2)
 for _ in range(10):
     window.grabWindow()
     app.processEvents()
-result.update(
-    {
-        "bluetooth_permission_visible": bool(
-            find_child(window, "bluetoothPermissionBlock").property("visible")
-        ),
-        "microphone_permission_text": str(
-            find_child(window, "microphonePermissionDescription").property("text")
-        ),
-    }
+result["voice_sections"] = all(
+    find_child(window, name) is not None
+    for name in (
+        "audioPrerequisiteSection",
+        "voiceProgramSection",
+        "voiceTestSection",
+    )
 )
 m._shutdown_diagnostics_workers()
 print(json.dumps(result))
@@ -3529,19 +3671,177 @@ print(json.dumps(result, ensure_ascii=False))
 """
 
 
+_THREE_PAGE_LAYOUT_PROBE_SCRIPT = r"""
+import json
+import os
+
+from PySide6.QtCore import QPointF
+from ovb_rc003 import qt_settings_app as m
+
+
+def find_child(root, name):
+    children = list(root.children())
+    child_items = getattr(root, "childItems", None)
+    if callable(child_items):
+        children.extend(child for child in child_items() if child not in children)
+    for child in children:
+        if child.objectName() == name:
+            return child
+        found = find_child(child, name)
+        if found is not None:
+            return found
+    return None
+
+
+def render(window, app, count=10):
+    image = None
+    for _ in range(count):
+        image = window.grabWindow()
+        app.processEvents()
+    return image
+
+
+def bounds(window, name):
+    item = find_child(window, name)
+    assert item is not None, name + " missing"
+    origin = item.mapToScene(QPointF(0, 0))
+    width = float(item.property("width"))
+    height = float(item.property("height"))
+    return {
+        "visible": bool(item.property("visible")),
+        "x": float(origin.x()),
+        "y": float(origin.y()),
+        "width": width,
+        "height": height,
+        "right": float(origin.x()) + width,
+        "bottom": float(origin.y()) + height,
+    }
+
+
+classes = m._load_qt_classes()
+QGuiApplication = classes["QGuiApplication"]
+QQmlApplicationEngine = classes["QQmlApplicationEngine"]
+QQuickStyle = classes["QQuickStyle"]
+QUrl = classes["QUrl"]
+qmlRegisterSingletonInstance = classes["qmlRegisterSingletonInstance"]
+ButtonMappingModel = classes["ButtonMappingModel"]
+SettingsController = classes["SettingsController"]
+DiagnosticsController = classes["DiagnosticsController"]
+
+QQuickStyle.setStyle(os.environ.get("PROBE_STYLE", "Basic"))
+app = QGuiApplication.instance() or QGuiApplication([])
+m.single_instance.bridge_instance_running = lambda: False
+m.windows_diagnostics.run_diagnostics = lambda **_kwargs: (
+    m.windows_diagnostics.DiagnosticsReport(checks=())
+)
+model = ButtonMappingModel()
+controller = SettingsController(model)
+diagnostics_controller = DiagnosticsController(controller, m.config.config_root())
+qmlRegisterSingletonInstance(
+    SettingsController, "OvbRc003Settings", 1, 0, "SettingsController", controller
+)
+qmlRegisterSingletonInstance(
+    ButtonMappingModel, "OvbRc003Settings", 1, 0, "ButtonMappingModel", model
+)
+qmlRegisterSingletonInstance(
+    DiagnosticsController,
+    "OvbRc003Settings",
+    1,
+    0,
+    "DiagnosticsController",
+    diagnostics_controller,
+)
+
+engine = QQmlApplicationEngine()
+qml_dir = m._qml_directory()
+engine.addImportPath(str(qml_dir))
+warnings = []
+engine.warnings.connect(lambda values: warnings.extend(values))
+engine.load(QUrl.fromLocalFile(str(qml_dir / "main.qml")))
+assert len(engine.rootObjects()) == 1, "main.qml failed to load"
+window = engine.rootObjects()[0]
+window.setWidth(int(os.environ["PROBE_WIDTH"]))
+window.setHeight(int(os.environ["PROBE_HEIGHT"]))
+window.show()
+render(window, app)
+
+tab_bar = find_child(window, "tabBar")
+assert tab_bar is not None
+result = {
+    "width": float(window.property("width")),
+    "height": float(window.property("height")),
+    "warnings": [],
+    "pages": {},
+}
+
+
+def capture_page(index, name, content_name, item_names):
+    tab_bar.setProperty("currentIndex", index)
+    render(window, app)
+    screenshot_dir = os.environ.get("PROBE_SCREENSHOT_DIR")
+    if screenshot_dir:
+        os.makedirs(screenshot_dir, exist_ok=True)
+        render(window, app, 2).save(
+            os.path.join(
+                screenshot_dir,
+                f"{os.environ.get('PROBE_STYLE', 'Basic')}-"
+                f"{int(result['width'])}x{int(result['height'])}-{name}.png",
+            )
+        )
+    result["pages"][name] = {
+        "content": bounds(window, content_name),
+        "items": {item_name: bounds(window, item_name) for item_name in item_names},
+    }
+
+
+capture_page(
+    0,
+    "device",
+    "devicePageContent",
+    (
+        "devicePrerequisiteSection",
+        "currentDeviceRow",
+        "buttonReceiverRow",
+        "remoteServiceRow",
+        "runtimeLogRow",
+    ),
+)
+capture_page(
+    1,
+    "buttons",
+    "rc003MappingLayout",
+    (
+        "mappingActionsPanel",
+        "mappingListFrame",
+        "mappingList",
+        "photoSidebar",
+    ),
+)
+controller.selectedVoiceProgramIndex = 4
+capture_page(
+    2,
+    "voice",
+    "voicePageContent",
+    (
+        "audioPrerequisiteSection",
+        "voiceProgramSection",
+        "voiceProgramCustomPathRow",
+        "voiceTestSection",
+    ),
+)
+
+result["warnings"] = [warning.toString() for warning in warnings]
+m._shutdown_diagnostics_workers()
+print(json.dumps(result))
+"""
+
+
 class SettingsShellSourceContractTests(unittest.TestCase):
     def setUp(self):
         qml_dir = Path(qt_settings_app.__file__).resolve().parent / "qml"
         self.main_qml = (qml_dir / "main.qml").read_text(encoding="utf-8")
-        self.connection_qml = (qml_dir / "ConnectionPage.qml").read_text(
-            encoding="utf-8"
-        )
-        self.permissions_qml = (qml_dir / "PermissionsPage.qml").read_text(
-            encoding="utf-8"
-        )
-        self.diagnostics_qml = (qml_dir / "DiagnosticsPage.qml").read_text(
-            encoding="utf-8"
-        )
+        self.device_qml = (qml_dir / "DevicePage.qml").read_text(encoding="utf-8")
+        self.voice_qml = (qml_dir / "VoicePage.qml").read_text(encoding="utf-8")
         self.buttons_qml = (qml_dir / "ButtonsPage.qml").read_text(
             encoding="utf-8"
         )
@@ -3557,21 +3857,18 @@ class SettingsShellSourceContractTests(unittest.TestCase):
         self.selection_combo_qml = (qml_dir / "SelectionComboBox.qml").read_text(
             encoding="utf-8"
         )
-        self.settings_list_row_qml = (qml_dir / "SettingsListRow.qml").read_text(
+        self.inline_settings_row_qml = (qml_dir / "InlineSettingsRow.qml").read_text(
             encoding="utf-8"
         )
         self.mapping_card_qml = (qml_dir / "MappingCard.qml").read_text(
             encoding="utf-8"
         )
-        self.diagnostic_result_row_qml = (
-            qml_dir / "DiagnosticResultRow.qml"
-        ).read_text(encoding="utf-8")
 
     def test_settings_feedback_has_one_global_owner(self):
         self.assertIn('objectName: "globalStatusBar"', self.main_qml)
         for page_text in (
-            self.connection_qml,
-            self.permissions_qml,
+            self.device_qml,
+            self.voice_qml,
             self.buttons_qml,
         ):
             self.assertNotIn("SettingsController.errorMessage", page_text)
@@ -3584,27 +3881,25 @@ class SettingsShellSourceContractTests(unittest.TestCase):
             self.assertIn(kind, self.ui_label_qml)
 
         for page_text in (
-            self.connection_qml,
-            self.permissions_qml,
-            self.diagnostics_qml,
+            self.device_qml,
+            self.voice_qml,
         ):
             self.assertIn("SectionFrame {", page_text)
-            self.assertIn("UiLabel {", page_text)
+            self.assertIn("InlineSettingsRow {", page_text)
 
-        self.assertIn("SelectionComboBox {", self.connection_qml)
-        self.assertIn("CompactTextField {", self.connection_qml)
-        self.assertIn("SettingsListRow {", self.permissions_qml)
-        self.assertIn("SettingsListRow {", self.diagnostics_qml)
-        self.assertIn("property string descriptionObjectName", self.settings_list_row_qml)
-        self.assertIn("property bool inlineDescription", self.settings_list_row_qml)
-        self.assertEqual(self.diagnostics_qml.count("inlineDescription: true"), 3)
+        self.assertIn("SelectionComboBox {", self.voice_qml)
+        self.assertIn("CompactTextField {", self.voice_qml)
+        self.assertIn(
+            "property string descriptionObjectName", self.inline_settings_row_qml
+        )
+        self.assertIn("default property alias actionData", self.inline_settings_row_qml)
         self.assertIn("AbstractButton {", self.mapping_card_qml)
 
     def test_all_selectors_reuse_one_selected_option_delegate(self):
-        self.assertEqual(self.connection_qml.count("SelectionComboBox {"), 3)
+        self.assertEqual(self.voice_qml.count("SelectionComboBox {"), 2)
         self.assertIn(
             "recommendedIndex: SettingsController.recommendedEndpointIndex",
-            self.connection_qml,
+            self.voice_qml,
         )
         self.assertIn(
             "font.weight: index === root.currentIndex ? Font.DemiBold : Font.Normal",
@@ -3616,70 +3911,56 @@ class SettingsShellSourceContractTests(unittest.TestCase):
         self.assertEqual(self.buttons_qml.count("SelectionComboBox {"), 0)
         self.assertIn(
             "model: SettingsController.voiceProgramOptions",
-            self.connection_qml,
+            self.voice_qml,
         )
 
     def test_log_location_has_one_formal_entry_point(self):
-        self.assertNotIn("SettingsController.openLogLocation()", self.connection_qml)
-        self.assertNotIn("SettingsController.openLogLocation()", self.permissions_qml)
+        self.assertNotIn("SettingsController.openLogLocation()", self.voice_qml)
+        self.assertNotIn("SettingsController.openLogLocation()", self.buttons_qml)
         self.assertEqual(
-            self.diagnostics_qml.count("SettingsController.openLogLocation()"),
+            self.device_qml.count("SettingsController.openLogLocation()"),
             1,
         )
-        self.assertIn("打开系统设置或日志目录", self.diagnostics_qml)
+        self.assertIn('titleText: qsTr("运行日志")', self.device_qml)
 
-    def test_connection_keeps_save_and_launch_as_distinct_commands(self):
-        self.assertIn('qsTr("仅保存设置")', self.connection_qml)
-        self.assertIn('qsTr("保存并启动桥接")', self.connection_qml)
-        self.assertIn("SettingsController.saveSettings()", self.connection_qml)
-        self.assertIn("SettingsController.saveAndLaunch()", self.connection_qml)
-        self.assertIn("text: SettingsController.launchStatusText", self.connection_qml)
-        self.assertIn("恢复按键与语音默认", self.connection_qml)
-        self.assertNotIn("恢复全部默认", self.connection_qml)
-        self.assertIn("compactMinimumWidth: 116", self.connection_qml)
-        self.assertIn("保存时检查；更换后需重启桥接。", self.connection_qml)
+    def test_device_start_and_voice_apply_keep_distinct_commands(self):
+        self.assertIn("SettingsController.startBridge()", self.device_qml)
+        self.assertNotIn("SettingsController.saveSettings()", self.device_qml)
+        self.assertIn("SettingsController.saveSettings()", self.voice_qml)
+        self.assertIn(
+            "descriptionText: SettingsController.launchStatusText", self.device_qml
+        )
+        self.assertNotIn("saveAndLaunch", self.device_qml)
+        self.assertNotIn("stopBridge", self.device_qml)
 
-    def test_diagnostics_keeps_each_check_detail_visible(self):
-        self.assertIn("ListModel {", self.diagnostics_qml)
-        self.assertIn("diagnosticsRowsModel.clear()", self.diagnostics_qml)
-        self.assertIn("diagnosticsRowsModel.append({", self.diagnostics_qml)
-        self.assertIn("function onCheckResultsChanged()", self.diagnostics_qml)
-        self.assertIn("model: diagnosticsRowsModel", self.diagnostics_qml)
-        self.assertIn("delegate: DiagnosticResultRow", self.diagnostics_qml)
-        self.assertIn(
-            'objectName: "diagnosticResult_" + checkId',
-            self.diagnostics_qml,
-        )
-        self.assertIn(
-            "visible: group !== root.groupOptionalDriver",
-            self.diagnostics_qml,
-        )
-        self.assertIn("detailText: detail", self.diagnostics_qml)
-        self.assertNotIn(
-            "details.push(rows[i].title + \"：\" + statusLabel(rows[i].status))",
-            self.diagnostics_qml,
-        )
+    def test_diagnostics_keep_details_in_the_rows_that_use_them(self):
+        self.assertIn("function combinedDetail(checkIds, fallback)", self.device_qml)
+        self.assertIn("function checkDetail(checkId, fallback)", self.voice_qml)
+        for check_id in ("ble_candidate", "os_version", "raw_input"):
+            self.assertIn(f'"{check_id}"', self.device_qml)
+        for check_id in ("vb_cable_endpoints", "output_endpoint", "dictation"):
+            self.assertIn(f'"{check_id}"', self.voice_qml)
 
     def test_diagnostics_exposes_loopback_as_an_explicit_nonautomatic_action(self):
-        self.assertIn('objectName: "vbCableChannelTestSection"', self.diagnostics_qml)
-        self.assertIn('objectName: "testVbCableChannelButton"', self.diagnostics_qml)
+        self.assertIn('objectName: "soundChannelTestRow"', self.voice_qml)
+        self.assertIn('objectName: "testVbCableChannelButton"', self.voice_qml)
         self.assertIn(
-            "onClicked: DiagnosticsController.testVbCableChannel()",
-            self.diagnostics_qml,
+            "DiagnosticsController.testVbCableChannelWithBridgeRestart()",
+            self.voice_qml,
         )
-        self.assertIn("DiagnosticsController.vbCableTestRunning", self.diagnostics_qml)
-        self.assertIn("不保存声音，也不修改默认设备", self.diagnostics_qml)
+        self.assertIn("DiagnosticsController.vbCableTestRunning", self.voice_qml)
+        self.assertIn('objectName: "bridgeTestConfirmDialog"', self.voice_qml)
         self.assertGreaterEqual(
-            self.connection_qml.count("!DiagnosticsController.vbCableTestRunning"),
-            4,
+            self.voice_qml.count("!DiagnosticsController.vbCableTestRunning"),
+            2,
         )
 
-    def test_bridge_required_warnings_are_visible_on_both_rc003_pages(self):
-        self.assertIn('objectName: "bridgeNotRunningWarning"', self.connection_qml)
+    def test_bridge_state_is_visible_on_device_and_buttons_pages(self):
+        self.assertIn('objectName: "remoteServiceRow"', self.device_qml)
         self.assertIn('objectName: "mappingBridgeWarning"', self.buttons_qml)
-        for page_text in (self.connection_qml, self.buttons_qml):
+        for page_text in (self.device_qml, self.buttons_qml):
             self.assertIn("SettingsController.bridgeRunning", page_text)
-        self.assertIn("桥接未运行，语音键无效", self.connection_qml)
+        self.assertIn('return qsTr("未运行")', self.device_qml)
         self.assertIn("语音和真实按键检测不可用", self.buttons_qml)
 
     def test_main_window_owns_the_single_live_bridge_refresh_timer(self):
@@ -3694,53 +3975,36 @@ class SettingsShellSourceContractTests(unittest.TestCase):
         self.assertIn('objectName: "bridgeLaunchPollTimer"', self.main_qml)
         self.assertIn("interval: 150", self.main_qml)
         self.assertIn("SettingsController.pollBridgeLaunch()", self.main_qml)
-        for page_text in (self.connection_qml, self.buttons_qml):
+        for page_text in (self.device_qml, self.buttons_qml, self.voice_qml):
             self.assertNotIn("refreshBridgeState()", page_text)
 
-    def test_connection_shows_real_bridge_launch_stages(self):
-        for object_name in (
-            "bridgeLaunchProgress",
-            "bridgeLaunchBusyIndicator",
-            "bridgeLaunchStageText",
-            "bridgeLaunchElapsedText",
-        ):
-            self.assertIn(f'objectName: "{object_name}"', self.connection_qml)
-        for stage in (
-            "保存设置… → 启动桥接 → 等待设备连接",
-            "桥接已启动 ✓ → 等待 RC003 连接…",
-            "RC003 已连接 ✓",
-            "%1 秒",
-        ):
-            self.assertIn(stage, self.connection_qml)
-        self.assertIn("readonly property bool bridgeLaunchInProgress", self.connection_qml)
-        self.assertIn('SettingsController.bridgeLaunchPhase === "waiting"', self.connection_qml)
-        self.assertIn("enabled: !SettingsController.bridgeLaunchBusy", self.connection_qml)
+    def test_device_page_shows_real_service_state_and_start_progress(self):
+        self.assertIn("SettingsController.bridgeLaunchBusy", self.device_qml)
+        self.assertIn("SettingsController.bridgeConnected", self.device_qml)
+        self.assertIn("SettingsController.bridgeRunning", self.device_qml)
+        self.assertIn("SettingsController.bridgeLaunchPhase", self.device_qml)
+        self.assertIn('qsTr("启动中…")', self.device_qml)
+        self.assertIn("enabled: !SettingsController.bridgeLaunchBusy", self.device_qml)
 
-    def test_permissions_page_states_real_boundaries_without_fake_grants(self):
-        self.assertIn("运行必需", self.permissions_qml)
-        for removed_copy in (
-            "按需使用",
-            "相关设置",
-            "特殊按键支持（HID tap）",
-            "虚拟音频（VB-CABLE）",
-            "输入法与应用",
-            "应用设置",
-            "前往按键",
+    def test_voice_page_states_real_windows_boundaries_without_fake_grants(self):
+        for object_name in (
+            "openMicrophonePrivacyButton",
+            "openSoundInputSettingsButton",
+            "openSpeechSettingsButton",
         ):
-            self.assertNotIn(removed_copy, self.permissions_qml)
+            self.assertIn(f'objectName: "{object_name}"', self.voice_qml)
         for misleading_claim in (
             "已授权",
             "Remote Mic 需要管理员权限",
             "VB-CABLE 安装成功",
         ):
-            self.assertNotIn(misleading_claim, self.permissions_qml)
-        self.assertIn("按键不受影响", self.permissions_qml)
+            self.assertNotIn(misleading_claim, self.voice_qml)
+        self.assertIn("由 Windows 管理", self.voice_qml)
 
-    def test_permissions_page_does_not_duplicate_internal_navigation(self):
-        self.assertNotIn("signal openMappingRequested()", self.permissions_qml)
-        self.assertNotIn("signal openDiagnosticsRequested()", self.permissions_qml)
-        self.assertNotIn("onOpenMappingRequested", self.main_qml)
-        self.assertNotIn("onOpenDiagnosticsRequested", self.main_qml)
+    def test_only_device_page_owns_internal_navigation_to_buttons(self):
+        self.assertIn("signal openButtonsRequested()", self.device_qml)
+        self.assertIn("onOpenButtonsRequested: tabBar.currentIndex = 1", self.main_qml)
+        self.assertNotIn("openButtonsRequested", self.voice_qml)
 
     def test_buttons_page_keeps_the_mapping_cards_and_photo_sidebar(self):
         for object_name in ("photoSidebar", "photoFrame", "photoImage"):
@@ -3802,35 +4066,164 @@ class SettingsShellSourceContractTests(unittest.TestCase):
         self.assertNotIn("ListView {", self.buttons_qml)
         self.assertNotIn('objectName: "voiceSettingsPanel"', self.buttons_qml)
         self.assertNotIn('objectName: "voiceProgramDialog"', self.buttons_qml)
-        self.assertIn('objectName: "voiceProgramCombo"', self.connection_qml)
-        self.assertIn('objectName: "holdVoiceHotkeyField"', self.connection_qml)
+        self.assertIn('objectName: "voiceProgramCombo"', self.voice_qml)
+        self.assertIn('objectName: "holdVoiceHotkeyField"', self.voice_qml)
         self.assertIn("SettingsController.restoreMappingDefaults()", self.buttons_qml)
         self.assertIn('qsTr("检测真实按键")', self.buttons_qml)
         self.assertIn('text: qsTr("保存映射")', self.buttons_qml)
 
-    def test_voice_hotkey_field_is_owned_by_the_connection_page(self):
-        self.assertIn('placeholderText: qsTr("点击录入")', self.connection_qml)
-        self.assertIn("需要与输入法语音唤起键对应", self.connection_qml)
+    def test_voice_hotkey_field_is_owned_by_the_voice_page(self):
+        self.assertIn('placeholderText: qsTr("点击录入")', self.voice_qml)
+        self.assertIn("需要与语音程序的唤起键一致", self.voice_qml)
         self.assertNotIn('objectName: "holdVoiceHotkeyField"', self.buttons_qml)
 
     def test_voice_program_status_uses_structured_privilege_and_dirty_state(self):
         self.assertIn(
             "SettingsController.voiceProgramElevationStatus",
-            self.connection_qml,
+            self.voice_qml,
         )
         self.assertIn(
             "SettingsController.voiceProgramSettingsDirty",
-            self.connection_qml,
+            self.voice_qml,
         )
-        self.assertNotIn("SettingsController.settingsDirty", self.connection_qml)
-        self.assertNotIn("voiceProgramStatusText.indexOf", self.connection_qml)
+        self.assertNotIn("SettingsController.settingsDirty", self.voice_qml)
+        self.assertNotIn("voiceProgramStatusText.indexOf", self.voice_qml)
 
     def test_diagnostics_uses_the_shared_four_character_button_width(self):
         self.assertRegex(
-            self.diagnostics_qml,
+            self.voice_qml,
             r'(?s)objectName: "testVbCableChannelButton".*?'
             r"compactMinimumWidth: tokens\.buttonWidth4Chars",
         )
+
+
+class ThreePageSettingsSourceContractTests(unittest.TestCase):
+    def setUp(self):
+        qml_dir = Path(qt_settings_app.__file__).resolve().parent / "qml"
+        self.main_qml = (qml_dir / "main.qml").read_text(encoding="utf-8")
+        self.device_qml = (qml_dir / "DevicePage.qml").read_text(encoding="utf-8")
+        self.voice_qml = (qml_dir / "VoicePage.qml").read_text(encoding="utf-8")
+        self.buttons_qml = (qml_dir / "ButtonsPage.qml").read_text(encoding="utf-8")
+        self.inline_row_qml = (qml_dir / "InlineSettingsRow.qml").read_text(
+            encoding="utf-8"
+        )
+        self.mapping_card_qml = (qml_dir / "MappingCard.qml").read_text(
+            encoding="utf-8"
+        )
+
+    def test_navigation_has_only_device_buttons_and_voice(self):
+        for object_name, label in (
+            ("deviceTabButton", "设备"),
+            ("mappingTabButton", "按键"),
+            ("voiceTabButton", "语音"),
+        ):
+            self.assertIn(f'objectName: "{object_name}"', self.main_qml)
+            self.assertIn(f'text: qsTr("{label}")', self.main_qml)
+        for retired in (
+            "connectionTabButton",
+            "permissionsTabButton",
+            "diagnosticsTabButton",
+            "PermissionsPage",
+            "DiagnosticsPage",
+        ):
+            self.assertNotIn(retired, self.main_qml)
+        self.assertIn("DevicePage {", self.main_qml)
+        self.assertIn("ButtonsPage {", self.main_qml)
+        self.assertIn("VoicePage {", self.main_qml)
+
+    def test_device_page_is_four_inline_rows_without_save_or_stop(self):
+        for object_name in (
+            "currentDeviceRow",
+            "buttonReceiverRow",
+            "remoteServiceRow",
+            "runtimeLogRow",
+        ):
+            self.assertIn(f'objectName: "{object_name}"', self.device_qml)
+        for button_name in (
+            "refreshDeviceChecksButton",
+            "openBluetoothSettingsButton",
+            "openButtonSettingsButton",
+            "startBridgeButton",
+            "deviceOpenLogButton",
+        ):
+            self.assertIn(f'objectName: "{button_name}"', self.device_qml)
+        self.assertIn("SettingsController.startBridge()", self.device_qml)
+        self.assertNotIn("SettingsController.saveSettings()", self.device_qml)
+        self.assertNotIn("stopBridge", self.device_qml)
+        self.assertNotIn('text: qsTr("设备")', self.device_qml)
+
+    def test_diagnostics_are_reused_inside_their_own_rows(self):
+        for check_id in ("os_version", "raw_input", "ble_candidate"):
+            self.assertIn(f'"{check_id}"', self.device_qml)
+        for check_id in (
+            "vb_cable_endpoints",
+            "output_endpoint",
+            "dictation",
+        ):
+            self.assertIn(f'"{check_id}"', self.voice_qml)
+        self.assertIn("DiagnosticsController.refreshDiagnostics()", self.device_qml)
+
+    def test_voice_page_has_three_sections_and_provider_specific_content(self):
+        for object_name in (
+            "audioPrerequisiteSection",
+            "voiceProgramSection",
+            "voiceTestSection",
+        ):
+            self.assertIn(f'objectName: "{object_name}"', self.voice_qml)
+        self.assertIn('objectName: "voiceProgramCombo"', self.voice_qml)
+        self.assertIn('objectName: "voiceProgramCustomPathRow"', self.voice_qml)
+        self.assertIn('objectName: "useWindowsDictationHotkeyButton"', self.voice_qml)
+        self.assertIn('objectName: "openSpeechSettingsButton"', self.voice_qml)
+        self.assertIn("SettingsController.selectedVoiceProgramIndex === 3", self.voice_qml)
+        self.assertIn("SettingsController.selectedVoiceProgramIndex === 4", self.voice_qml)
+
+    def test_voice_audio_row_keeps_install_dropdown_and_apply(self):
+        for object_name in (
+            "installVirtualAudioButton",
+            "endpointCombo",
+            "applyVoiceSettingsButton",
+            "openMicrophonePrivacyButton",
+            "openSoundInputSettingsButton",
+        ):
+            self.assertIn(f'objectName: "{object_name}"', self.voice_qml)
+        self.assertIn("recommendedIndex: SettingsController.recommendedEndpointIndex", self.voice_qml)
+        self.assertIn("SettingsController.saveSettings()", self.voice_qml)
+
+    def test_voice_tests_use_a_focused_text_box_and_safe_service_recovery(self):
+        for object_name in (
+            "bridgeTestConfirmDialog",
+            "testVbCableChannelButton",
+            "recoverBridgeButton",
+            "trySpeakingButton",
+            "speakTestDialog",
+            "speakTestInput",
+        ):
+            self.assertIn(f'objectName: "{object_name}"', self.voice_qml)
+        self.assertIn(
+            "DiagnosticsController.testVbCableChannelWithBridgeRestart()",
+            self.voice_qml,
+        )
+        self.assertIn("speakTestInput.forceActiveFocus()", self.voice_qml)
+        self.assertIn("vbCableBridgeRecoveryNeeded", self.voice_qml)
+
+    def test_button_page_keeps_real_cards_and_confirms_built_in_defaults(self):
+        self.assertIn("MappingCard {", self.buttons_qml)
+        self.assertEqual(self.buttons_qml.count("cardId: buttonId"), 2)
+        self.assertIn('objectName: "restoreMappingDefaultsDialog"', self.buttons_qml)
+        self.assertIn('text: qsTr("恢复内置默认")', self.buttons_qml)
+        self.assertIn("SettingsController.restoreMappingDefaults()", self.buttons_qml)
+        detect_index = self.buttons_qml.index('objectName: "detectRealKeyButton"')
+        note_index = self.buttons_qml.index('objectName: "voiceGestureRestrictionText"')
+        self.assertLess(detect_index, note_index)
+        self.assertIn("按键设为语音键时，双击和长按不可用", self.buttons_qml)
+        self.assertIn('qsTr("语音模式下暂停")', self.mapping_card_qml)
+
+    def test_inline_rows_do_not_restore_the_old_blue_circle_icon(self):
+        self.assertNotIn("iconGlyph", self.inline_row_qml)
+        self.assertNotIn("radius: 14", self.inline_row_qml)
+        self.assertIn("titleText", self.inline_row_qml)
+        self.assertIn("descriptionText", self.inline_row_qml)
+        self.assertIn("stateText", self.inline_row_qml)
 
 
 @unittest.skipUnless(_HAS_PYSIDE6, _SKIP_REASON)
@@ -3898,7 +4291,7 @@ class OffscreenQmlLoadTests(unittest.TestCase):
         self.assertEqual(data["height"], 464)
         self.assertFalse(data["retired_finish_tap_control_exists"])
 
-    def test_dji_device_is_not_offered_by_the_settings_controller(self):
+    def test_rc003_only_three_page_shell_is_rendered(self):
         import json
         import subprocess
 
@@ -3920,13 +4313,85 @@ class OffscreenQmlLoadTests(unittest.TestCase):
             data["device_options"],
             [device_catalog.profile_for(device_catalog.RC003_ID).display_name],
         )
-        self.assertFalse(data["dji_visible"])
         self.assertTrue(data["rc003_visible"])
         self.assertEqual(data["mapping_page_title"], "按键映射")
-        self.assertTrue(data["bluetooth_permission_visible"])
-        self.assertNotIn("DJI Mic 2", data["microphone_permission_text"])
+        self.assertTrue(data["device_rows"])
+        self.assertTrue(data["voice_sections"])
 
-    def test_settings_shell_fits_supported_logical_viewports_without_horizontal_overflow(self):
+    def test_three_page_shell_fits_compact_viewports_without_horizontal_overflow(self):
+        import json
+        import subprocess
+
+        scenarios = (
+            ("Basic", 720, 464),
+            ("Basic", 640, 440),
+            ("FluentWinUI3", 720, 464),
+        )
+        for style, width, height in scenarios:
+            with self.subTest(style=style, width=width, height=height), tempfile.TemporaryDirectory() as tmpdir:
+                env = dict(os.environ)
+                env.setdefault("QT_QPA_PLATFORM", "offscreen")
+                env["LOCALAPPDATA"] = tmpdir
+                env["PROBE_STYLE"] = style
+                env["PROBE_WIDTH"] = str(width)
+                env["PROBE_HEIGHT"] = str(height)
+                result = subprocess.run(
+                    [sys.executable, "-c", _THREE_PAGE_LAYOUT_PROBE_SCRIPT],
+                    env=env,
+                    capture_output=True,
+                    text=True,
+                    timeout=60,
+                )
+                self.assertEqual(
+                    result.returncode,
+                    0,
+                    "three-page layout probe failed at "
+                    f"{width}x{height}: {result.stdout}\n{result.stderr}",
+                )
+                data = json.loads(result.stdout.strip().splitlines()[-1])
+                self.assertEqual(data["warnings"], [])
+                self.assertEqual((data["width"], data["height"]), (width, height))
+                for page_name, page in data["pages"].items():
+                    content = page["content"]
+                    self.assertTrue(content["visible"], page_name)
+                    self.assertGreater(content["width"], 0, page_name)
+                    self.assertGreaterEqual(content["x"], -1, page_name)
+                    self.assertLessEqual(content["right"], width + 1, page_name)
+                    for item_name, item in page["items"].items():
+                        self.assertTrue(item["visible"], item_name)
+                        self.assertGreater(item["width"], 0, item_name)
+                        self.assertGreaterEqual(item["x"], -1, item_name)
+                        self.assertLessEqual(item["right"], width + 1, item_name)
+
+                device_items = data["pages"]["device"]["items"]
+                for first, second in (
+                    ("currentDeviceRow", "buttonReceiverRow"),
+                    ("buttonReceiverRow", "remoteServiceRow"),
+                    ("remoteServiceRow", "runtimeLogRow"),
+                ):
+                    self.assertLessEqual(
+                        device_items[first]["bottom"], device_items[second]["y"] + 1
+                    )
+
+                voice_items = data["pages"]["voice"]["items"]
+                self.assertLessEqual(
+                    voice_items["audioPrerequisiteSection"]["bottom"],
+                    voice_items["voiceProgramSection"]["y"] + 1,
+                )
+                self.assertLessEqual(
+                    voice_items["voiceProgramSection"]["bottom"],
+                    voice_items["voiceTestSection"]["y"] + 1,
+                )
+                self.assertGreaterEqual(
+                    voice_items["voiceProgramCustomPathRow"]["y"],
+                    voice_items["voiceProgramSection"]["y"],
+                )
+                self.assertLessEqual(
+                    voice_items["voiceProgramCustomPathRow"]["bottom"],
+                    voice_items["voiceProgramSection"]["bottom"] + 1,
+                )
+
+    def _legacy_settings_shell_fits_supported_logical_viewports_without_horizontal_overflow(self):
         import json
         import subprocess
 
@@ -4155,7 +4620,7 @@ class OffscreenQmlLoadTests(unittest.TestCase):
                 self.assertTrue(data["error_status"]["visible"])
                 self.assertEqual(data["error_status"]["text"], "priority error")
 
-    def test_tab_focus_scrolls_connection_and_permissions_commands_into_view(self):
+    def _legacy_tab_focus_scrolls_connection_and_permissions_commands_into_view(self):
         import json
         import subprocess
 
@@ -4713,14 +5178,17 @@ def sample_control(results, image, object_name):
 
 results = {}
 image = render()
-for object_name in ("connectionTabButton", "restoreDefaultsButton"):
-    sample_control(results, image, object_name)
+sample_control(results, image, "deviceTabButton")
 
 tab_bar = _find(window, "tabBar")
 if tab_bar is None:
     print(json.dumps({"error": "tabBar not found"}))
     sys.exit(1)
 tab_bar.setProperty("currentIndex", 1)
+image = render()
+sample_control(results, image, "restoreMappingDefaultsButton")
+
+tab_bar.setProperty("currentIndex", 2)
 image = render()
 sample_control(results, image, "holdVoiceHotkeyField")
 
@@ -4748,9 +5216,9 @@ class RenderedContrastTests(unittest.TestCase):
 
     _MIN_CONTRAST_RATIO = 3.0
     _LABELS = {
-        "connectionTabButton": "「连接」tab label",
-        "restoreDefaultsButton": "「恢复按键与语音默认」button",
-        "holdVoiceHotkeyField": "语音快捷键 TextField",
+        "deviceTabButton": "「设备」tab label",
+        "restoreMappingDefaultsButton": "「恢复内置默认」button",
+        "holdVoiceHotkeyField": "语音按键 TextField",
     }
 
     def test_tab_button_plain_button_and_text_field_are_all_readable(self):
@@ -4768,7 +5236,9 @@ class RenderedContrastTests(unittest.TestCase):
             timeout=60,
         )
         self.assertEqual(
-            result.returncode, 0, f"contrast probe subprocess failed: {result.stderr}"
+            result.returncode,
+            0,
+            f"contrast probe subprocess failed: {result.stdout}\n{result.stderr}",
         )
         last_line = result.stdout.strip().splitlines()[-1]
         data = json.loads(last_line)

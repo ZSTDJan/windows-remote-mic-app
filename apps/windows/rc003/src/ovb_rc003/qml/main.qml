@@ -104,10 +104,10 @@ ApplicationWindow {
                 spacing: 3
 
                 NavButton {
-                    id: connectionTabButton
-                    objectName: "connectionTabButton"
+                    id: deviceTabButton
+                    objectName: "deviceTabButton"
                     tokens: window.tokens
-                    text: qsTr("连接")
+                    text: qsTr("设备")
                     glyph: "\uE71B"
                     checked: tabBar.currentIndex === 0
                     onClicked: tabBar.currentIndex = 0
@@ -123,29 +123,18 @@ ApplicationWindow {
                     checked: tabBar.currentIndex === 1
                     onClicked: tabBar.currentIndex = 1
                     Accessible.name: text
-                    KeyNavigation.tab: permissionsTabButton
+                    KeyNavigation.tab: voiceTabButton
                 }
                 NavButton {
-                    id: permissionsTabButton
-                    objectName: "permissionsTabButton"
+                    id: voiceTabButton
+                    objectName: "voiceTabButton"
                     tokens: window.tokens
-                    text: qsTr("权限")
-                    glyph: "\uEA18"
+                    text: qsTr("语音")
+                    glyph: "\uE720"
                     checked: tabBar.currentIndex === 2
                     onClicked: tabBar.currentIndex = 2
                     Accessible.name: text
-                    KeyNavigation.tab: diagnosticsTabButton
-                }
-                NavButton {
-                    id: diagnosticsTabButton
-                    objectName: "diagnosticsTabButton"
-                    tokens: window.tokens
-                    text: qsTr("诊断")
-                    glyph: "\uE90F"
-                    checked: tabBar.currentIndex === 3
-                    onClicked: tabBar.currentIndex = 3
-                    Accessible.name: text
-                    KeyNavigation.tab: connectionTabButton
+                    KeyNavigation.tab: deviceTabButton
                 }
             }
         }
@@ -161,10 +150,12 @@ ApplicationWindow {
                 Layout.fillHeight: true
                 currentIndex: tabBar.currentIndex
 
-                ConnectionPage { tokens: window.tokens }
+                DevicePage {
+                    tokens: window.tokens
+                    onOpenButtonsRequested: tabBar.currentIndex = 1
+                }
                 ButtonsPage { tokens: window.tokens }
-                PermissionsPage { tokens: window.tokens }
-                DiagnosticsPage { tokens: window.tokens }
+                VoicePage { tokens: window.tokens }
             }
 
             Rectangle {

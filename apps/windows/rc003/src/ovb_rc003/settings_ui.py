@@ -445,16 +445,16 @@ def default_display_state() -> DefaultDisplayState:
 # alive. The settings controller continues polling the runtime status and
 # promotes the UI to the connected state only after the bridge reports it.
 LAUNCH_NOT_STARTED_TEXT = (
-    "后台桥接未运行。话筒键此时不会由本程序触发语音；"
-    "请点击“保存并启动桥接”，并等待首次连接完成。"
+    "遥控器服务未运行。话筒键此时不会由本程序触发语音；"
+    "请在设备页点击“启动”，并等待首次连接完成。"
 )
 LAUNCH_ALREADY_RUNNING_TEXT = (
-    "检测到后台桥接已经在运行。本设置窗口没有重复启动它；"
+    "检测到遥控器服务已经在运行。本设置窗口没有重复启动它；"
     "界面会继续检查 RC003 连接状态，按键与语音仍需真机测试。"
 )
 LAUNCH_STATUS_UNKNOWN_TEXT = (
-    "暂时无法确认后台桥接是否运行。请先查看任务栏通知区域或任务管理器，"
-    "不要连续重复启动；可在“诊断”页打开 app.log 确认。"
+    "暂时无法确认遥控器服务是否运行。请先查看任务栏通知区域或任务管理器，"
+    "不要连续重复启动；可在设备页打开日志目录查看 app.log。"
 )
 
 
@@ -462,7 +462,7 @@ def describe_launch_result(result: bridge_launcher.LaunchResult) -> str:
     if result.outcome is bridge_launcher.LaunchOutcome.STARTED:
         pid_text = f"（PID {result.pid}）" if result.pid is not None else ""
         return (
-            f"已启动桥接进程{pid_text}，本次启动检查结束时进程仍在运行。"
+            f"已启动遥控器服务{pid_text}，本次启动检查结束时进程仍在运行。"
             "首次连接和补充按键通道"
             "就绪可能需要约一分钟；请等待后再测试。这只说明进程本身存活，"
             "界面会继续检查设备，并在运行状态确认后更新阶段。"
@@ -477,18 +477,18 @@ def describe_launch_result(result: bridge_launcher.LaunchResult) -> str:
     if result.outcome is bridge_launcher.LaunchOutcome.STATUS_UNKNOWN:
         pid_text = f"（PID {result.pid}）" if result.pid is not None else ""
         return (
-            f"桥接进程已经创建{pid_text}，但 Windows 未能确认它当前是否仍在运行"
+            f"遥控器服务已经创建{pid_text}，但 Windows 未能确认它当前是否仍在运行"
             f"（{result.error}）。请先不要重复启动；查看任务栏通知区域、任务管理器和 "
             "app.log 确认状态。"
         )
     if result.outcome is bridge_launcher.LaunchOutcome.QUICK_EXIT:
         return (
             f"启动异常：进程在短时间内退出（退出码 {result.exit_code}），可能没有成功"
-            "建立 BLE/HID/音频连接。请在“诊断”页打开日志目录查看 app.log。"
+            "建立 BLE/HID/音频连接。请在设备页打开日志目录查看 app.log。"
         )
     # LAUNCH_FAILED
     return (
-        f"启动失败：无法创建桥接进程（{result.error}）。请在“诊断”页打开日志目录查看 "
+        f"启动失败：无法创建遥控器服务（{result.error}）。请在设备页打开日志目录查看 "
         "app.log，并确认安装/便携版文件是否完整。"
     )
 

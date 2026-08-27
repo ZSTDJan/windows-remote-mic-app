@@ -21,12 +21,14 @@ from typing import Callable, Iterable, Mapping, Optional, Sequence
 VOICE_PROGRAM_NONE = "none"
 VOICE_PROGRAM_SOGOU = "sogou"
 VOICE_PROGRAM_WETYPE = "wetype"
+VOICE_PROGRAM_WINDOWS_DICTATION = "windows_dictation"
 VOICE_PROGRAM_CUSTOM = "custom"
 
 VOICE_PROGRAM_PROVIDER_ORDER = (
     VOICE_PROGRAM_NONE,
     VOICE_PROGRAM_SOGOU,
     VOICE_PROGRAM_WETYPE,
+    VOICE_PROGRAM_WINDOWS_DICTATION,
     VOICE_PROGRAM_CUSTOM,
 )
 
@@ -34,14 +36,17 @@ VOICE_PROGRAM_PROVIDER_NAMES = {
     VOICE_PROGRAM_NONE: "不管理",
     VOICE_PROGRAM_SOGOU: "搜狗语音输入",
     VOICE_PROGRAM_WETYPE: "微信输入法",
-    VOICE_PROGRAM_CUSTOM: "其他输入法或自定义程序",
+    VOICE_PROGRAM_WINDOWS_DICTATION: "Windows 语音输入（Win+H）",
+    VOICE_PROGRAM_CUSTOM: "自定义程序",
 }
 
 _SOGOU_PROCESS_NAME = "sogou_voice_assistant.exe"
 _SOGOU_RUN_VALUE_NAMES = ("搜狗语音输入法",)
 _WETYPE_SERVER_NAME = "wetype_server.exe"
 _WETYPE_PROCESS_NAMES = (_WETYPE_SERVER_NAME, "wetype_service.exe")
-_SYSTEM_MANAGED_PROVIDERS = frozenset({VOICE_PROGRAM_WETYPE})
+_SYSTEM_MANAGED_PROVIDERS = frozenset(
+    {VOICE_PROGRAM_WETYPE, VOICE_PROGRAM_WINDOWS_DICTATION}
+)
 _ALLOWED_EXECUTABLE_SUFFIXES = frozenset({".exe", ".lnk"})
 _ERROR_CANCELLED = 1223
 _COINIT_APARTMENTTHREADED = 0x2
@@ -164,6 +169,8 @@ def provider_index(provider_id: object) -> int:
 
 
 def status_text(status: VoiceProgramStatus) -> str:
+    if status.provider_id == VOICE_PROGRAM_WINDOWS_DICTATION:
+        return "Windows 内置语音输入；按 Win+H 打开，由系统管理。"
     if status.provider_id == VOICE_PROGRAM_WETYPE:
         if status.code == "not_found":
             return "未找到微信输入法；正常安装后会自动识别，无需手选路径。"
@@ -202,7 +209,7 @@ def launch_result_text(result: VoiceProgramLaunchResult) -> str:
         "cancelled": "已取消管理员启动。",
         "launch_failed": "语音程序启动失败。",
         "not_requested": "没有设置随桥接启动。",
-        "system_managed": "微信输入法由 Windows 管理，Remote Mic 不单独启动它。",
+        "system_managed": "该语音程序由 Windows 管理，Remote Mic 不单独启动它。",
     }
     return messages.get(result.code, "语音程序状态未知。")
 
@@ -224,6 +231,8 @@ def resolve_voice_program(
 
     if provider_id == VOICE_PROGRAM_NONE:
         return ResolvedVoiceProgram(provider_id, display_name, None, (), "disabled")
+    if provider_id == VOICE_PROGRAM_WINDOWS_DICTATION:
+        return ResolvedVoiceProgram(provider_id, display_name, None, (), "system")
     if provider_id == VOICE_PROGRAM_CUSTOM:
         match_executable = configured_path
         if configured_path is not None and configured_path.suffix.casefold() == ".lnk":
@@ -299,6 +308,16 @@ def inspect_voice_program(
         wetype_shortcut_iter=wetype_shortcut_iter,
         shortcut_resolver=shortcut_resolver,
     )
+    if resolved.provider_id == VOICE_PROGRAM_WINDOWS_DICTATION:
+        return VoiceProgramStatus(
+            resolved.provider_id,
+            resolved.display_name,
+            True,
+            False,
+            None,
+            None,
+            "stopped",
+        )
     if resolved.provider_id == VOICE_PROGRAM_NONE:
         return VoiceProgramStatus(
             resolved.provider_id,
@@ -359,6 +378,10 @@ def launch_voice_program(
     )
     if resolved.provider_id == VOICE_PROGRAM_NONE:
         return VoiceProgramLaunchResult(resolved.provider_id, False, False, "disabled")
+    if resolved.provider_id == VOICE_PROGRAM_WINDOWS_DICTATION:
+        return VoiceProgramLaunchResult(
+            resolved.provider_id, False, False, "system_managed"
+        )
     if resolved.executable is None:
         return VoiceProgramLaunchResult(resolved.provider_id, False, False, "not_found")
 

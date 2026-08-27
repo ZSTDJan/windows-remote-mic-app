@@ -40,6 +40,7 @@ TPM_RETURNCMD = 0x0100
 
 MENU_OPEN_SETTINGS = 1001
 MENU_EXIT_BRIDGE = 1002
+BRIDGE_TRAY_WINDOW_TITLE = "Remote Mic RC003 bridge tray"
 
 
 def dispatch_menu_command(
@@ -338,7 +339,7 @@ class BridgeTray:
             hwnd = user32.CreateWindowExW(
                 0,
                 class_name,
-                "Remote Mic RC003 bridge tray",
+                BRIDGE_TRAY_WINDOW_TITLE,
                 0,
                 0,
                 0,

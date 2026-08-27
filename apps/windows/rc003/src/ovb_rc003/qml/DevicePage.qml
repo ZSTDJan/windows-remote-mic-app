@@ -1,0 +1,200 @@
+import QtQuick
+import QtQuick.Controls
+import QtQuick.Layouts
+import OvbRc003Settings 1.0
+
+Item {
+    id: root
+    property var tokens
+    signal openButtonsRequested()
+
+    function checkResult(checkId) {
+        const rows = DiagnosticsController.checkResults
+        for (var i = 0; i < rows.length; i++) {
+            if (String(rows[i].checkId) === checkId)
+                return rows[i]
+        }
+        return null
+    }
+
+    function combinedStatus(checkIds) {
+        if (DiagnosticsController.isRefreshing)
+            return qsTr("检查中")
+        var sawManual = false
+        var sawPass = false
+        for (var i = 0; i < checkIds.length; i++) {
+            const row = checkResult(checkIds[i])
+            if (!row)
+                continue
+            if (row.status === "fail" || row.status === "unsupported")
+                return qsTr("需处理")
+            if (row.status === "manual")
+                sawManual = true
+            if (row.status === "pass")
+                sawPass = true
+        }
+        if (sawManual)
+            return qsTr("待实测")
+        return sawPass ? qsTr("正常") : qsTr("未检查")
+    }
+
+    function combinedColor(checkIds) {
+        const status = combinedStatus(checkIds)
+        if (status === qsTr("正常"))
+            return tokens.successColor
+        if (status === qsTr("需处理"))
+            return tokens.errorColor
+        if (status === qsTr("检查中") || status === qsTr("待实测"))
+            return tokens.voiceAccent
+        return tokens.disabledText
+    }
+
+    function combinedDetail(checkIds, fallback) {
+        var details = []
+        for (var i = 0; i < checkIds.length; i++) {
+            const row = checkResult(checkIds[i])
+            if (row && String(row.detail).length > 0)
+                details.push(String(row.detail))
+        }
+        return details.length > 0 ? details.join(qsTr("；")) : fallback
+    }
+
+    function bridgeStateText() {
+        if (SettingsController.bridgeLaunchBusy)
+            return qsTr("启动中")
+        if (SettingsController.bridgeConnected)
+            return qsTr("已连接")
+        if (SettingsController.bridgeRunning)
+            return qsTr("运行中")
+        if (SettingsController.bridgeLaunchPhase === "unknown")
+            return qsTr("需检查")
+        return qsTr("未运行")
+    }
+
+    function bridgeStateColor() {
+        if (SettingsController.bridgeConnected || SettingsController.bridgeRunning)
+            return tokens.successColor
+        if (SettingsController.bridgeLaunchBusy
+                || SettingsController.bridgeLaunchPhase === "unknown")
+            return tokens.voiceAccent
+        return tokens.errorColor
+    }
+
+    ScrollView {
+        id: deviceScroll
+        objectName: "deviceScroll"
+        anchors.fill: parent
+        clip: true
+        contentWidth: availableWidth
+        ScrollBar.horizontal.policy: ScrollBar.AlwaysOff
+
+        ColumnLayout {
+            id: devicePageContent
+            objectName: "devicePageContent"
+            width: Math.max(0, deviceScroll.availableWidth
+                - tokens.pageHorizontalPadding * 2)
+            x: tokens.pageHorizontalPadding
+            y: tokens.pageVerticalPadding
+            spacing: tokens.spacingMedium
+
+            SectionFrame {
+                objectName: "devicePrerequisiteSection"
+                tokens: root.tokens
+                Layout.fillWidth: true
+                horizontalPadding: 0
+                verticalPadding: 0
+                contentSpacing: 0
+
+                InlineSettingsRow {
+                    objectName: "currentDeviceRow"
+                    tokens: root.tokens
+                    titleText: qsTr("当前设备")
+                    descriptionText: root.combinedDetail(
+                        ["ble_candidate"],
+                        qsTr("小米蓝牙语音遥控器 2 Pro（RC003）")
+                    )
+                    stateText: root.combinedStatus(["ble_candidate"])
+                    stateColor: root.combinedColor(["ble_candidate"])
+
+                    CompactButton {
+                        objectName: "refreshDeviceChecksButton"
+                        tokens: root.tokens
+                        compactMinimumWidth: tokens.buttonWidth4Chars
+                        text: DiagnosticsController.isRefreshing
+                            ? qsTr("检查中…") : qsTr("重新检查")
+                        enabled: !DiagnosticsController.isRefreshing
+                            && !DiagnosticsController.vbCableTestRunning
+                        onClicked: DiagnosticsController.refreshDiagnostics()
+                    }
+                    CompactButton {
+                        objectName: "openBluetoothSettingsButton"
+                        tokens: root.tokens
+                        compactMinimumWidth: tokens.buttonWidth4Chars
+                        text: qsTr("蓝牙设置")
+                        onClicked: SettingsController.openBluetoothSettings()
+                    }
+                }
+
+                InlineSettingsRow {
+                    objectName: "buttonReceiverRow"
+                    tokens: root.tokens
+                    titleText: qsTr("按键接收")
+                    descriptionText: root.combinedDetail(
+                        ["os_version", "raw_input"],
+                        qsTr("检查 Windows 与遥控器按键接收通道")
+                    )
+                    stateText: root.combinedStatus(["os_version", "raw_input"])
+                    stateColor: root.combinedColor(["os_version", "raw_input"])
+
+                    CompactButton {
+                        objectName: "openButtonSettingsButton"
+                        tokens: root.tokens
+                        compactMinimumWidth: tokens.buttonWidth4Chars
+                        text: qsTr("按键设置")
+                        onClicked: root.openButtonsRequested()
+                    }
+                }
+
+                InlineSettingsRow {
+                    objectName: "remoteServiceRow"
+                    tokens: root.tokens
+                    titleText: qsTr("遥控器服务")
+                    descriptionText: SettingsController.launchStatusText
+                    stateText: root.bridgeStateText()
+                    stateColor: root.bridgeStateColor()
+
+                    CompactButton {
+                        objectName: "startBridgeButton"
+                        visible: !SettingsController.bridgeRunning
+                        tokens: root.tokens
+                        compactMinimumWidth: tokens.buttonWidth4Chars
+                        text: SettingsController.bridgeLaunchBusy
+                            ? qsTr("启动中…") : qsTr("启动")
+                        highlighted: true
+                        enabled: !SettingsController.bridgeLaunchBusy
+                            && !DiagnosticsController.vbCableTestRunning
+                        onClicked: SettingsController.startBridge()
+                    }
+                }
+
+                InlineSettingsRow {
+                    objectName: "runtimeLogRow"
+                    tokens: root.tokens
+                    titleText: qsTr("运行日志")
+                    descriptionText: qsTr("查看连接、按键、声音和语音程序记录")
+                    showDivider: false
+
+                    CompactButton {
+                        objectName: "deviceOpenLogButton"
+                        tokens: root.tokens
+                        compactMinimumWidth: tokens.buttonWidth4Chars
+                        text: qsTr("日志目录")
+                        onClicked: SettingsController.openLogLocation()
+                    }
+                }
+            }
+
+            Item { Layout.preferredHeight: tokens.pageVerticalPadding }
+        }
+    }
+}

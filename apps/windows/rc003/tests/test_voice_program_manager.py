@@ -56,10 +56,16 @@ class VoiceProgramSettingsTests(unittest.TestCase):
             },
         )
 
-    def test_provider_options_use_the_expandable_custom_program_name(self):
+    def test_provider_options_include_windows_dictation_and_custom_program(self):
         self.assertEqual(
             manager.provider_options(),
-            ["不管理", "搜狗语音输入", "微信输入法", "其他输入法或自定义程序"],
+            [
+                "不管理",
+                "搜狗语音输入",
+                "微信输入法",
+                "Windows 语音输入（Win+H）",
+                "自定义程序",
+            ],
         )
 
     def test_system_managed_provider_never_requests_bridge_autostart(self):
@@ -74,6 +80,40 @@ class VoiceProgramSettingsTests(unittest.TestCase):
         self.assertFalse(normalized["launch_on_bridge_start"])
         self.assertTrue(normalized["launch_elevated"])
         self.assertTrue(manager.is_system_managed_provider("wetype"))
+
+    def test_windows_dictation_is_system_managed_and_never_autostarts(self):
+        normalized = manager.normalize_voice_program_settings(
+            {
+                "provider": "windows_dictation",
+                "launch_on_bridge_start": True,
+                "launch_elevated": True,
+            }
+        )
+
+        self.assertFalse(normalized["launch_on_bridge_start"])
+        self.assertTrue(normalized["launch_elevated"])
+        self.assertTrue(manager.is_system_managed_provider("windows_dictation"))
+
+
+class WindowsDictationTests(unittest.TestCase):
+    def test_windows_dictation_is_available_without_an_executable(self):
+        status = manager.inspect_voice_program(
+            {"provider": "windows_dictation"},
+            platform="win32",
+            process_iter=lambda: (),
+        )
+        result = manager.launch_voice_program(
+            {"provider": "windows_dictation"},
+            platform="win32",
+            process_iter=lambda: (),
+            start_file=lambda *_: self.fail("Windows 听写不应由 Remote Mic 启动进程"),
+        )
+
+        self.assertTrue(status.available)
+        self.assertFalse(status.running)
+        self.assertEqual(status.code, "stopped")
+        self.assertIn("Win+H", manager.status_text(status))
+        self.assertEqual(result.code, "system_managed")
 
 
 class SogouDiscoveryTests(unittest.TestCase):

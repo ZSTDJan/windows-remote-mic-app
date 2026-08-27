@@ -95,6 +95,7 @@ functions (see that function's docstring for the full story).
 from __future__ import annotations
 
 import atexit
+from dataclasses import dataclass
 import gc
 import sys
 import threading
@@ -105,6 +106,7 @@ from typing import Dict, List, Optional
 from . import (
     audio_playback,
     audio_output,
+    bridge_control_windows,
     bridge_launcher,
     bridge_runtime_status,
     config,
@@ -227,13 +229,27 @@ _DIAGNOSTICS_THREAD_JOIN_SAFETY_MARGIN_SECONDS = 2.0
 # cancellation constants, rather than an independent flat guess. The max()
 # keeps both BLE discovery and the explicit VB-CABLE child inside the same
 # bounded shutdown contract if either implementation changes later.
+_VB_CABLE_BRIDGE_RECOVERY_SECONDS = (
+    bridge_control_windows.DEFAULT_EXIT_TIMEOUT_SECONDS
+    + bridge_launcher.DEFAULT_GRACE_CHECKS
+    * bridge_launcher.DEFAULT_POLL_INTERVAL_SECONDS
+)
 _DIAGNOSTICS_THREAD_JOIN_TIMEOUT_SECONDS = (
     max(
         windows_diagnostics.BLE_DISCOVERY_MAX_CANCELLATION_SECONDS,
-        windows_diagnostics.VB_CABLE_LOOPBACK_MAX_CANCELLATION_SECONDS,
+        windows_diagnostics.VB_CABLE_LOOPBACK_MAX_CANCELLATION_SECONDS
+        + _VB_CABLE_BRIDGE_RECOVERY_SECONDS,
     )
     + _DIAGNOSTICS_THREAD_JOIN_SAFETY_MARGIN_SECONDS
 )
+
+
+@dataclass(frozen=True)
+class _VbCableTestWorkflowResult:
+    loopback_result: object = None
+    bridge_was_running: bool = False
+    stop_error: str = ""
+    restart_result: object = None
 
 
 def _remember_diagnostics_thread(thread: "threading.Thread") -> None:
@@ -888,12 +904,12 @@ def _load_qt_classes() -> dict:
                 bridge_launcher.PendingBridgeLaunch
             ] = None
             if self._bridge_connected:
-                self._launch_status_text = "桥接进程已启动；RC003 已连接。"
+                self._launch_status_text = "遥控器服务已启动；RC003 已连接。"
             elif self._bridge_running:
                 self._launch_status_text = (
-                    "桥接进程已启动；正在等待 RC003 连接。"
+                    "遥控器服务已启动；正在等待 RC003 连接。"
                     if runtime_status is not None
-                    else "桥接进程已启动；RC003 连接状态暂时未知，正在继续检查。"
+                    else "遥控器服务已启动；RC003 连接状态暂时未知，正在继续检查。"
                 )
             self._has_explicit_launch_result = False
             self._status_message = (
@@ -1156,20 +1172,20 @@ def _load_qt_classes() -> dict:
             if running:
                 if connected:
                     self._set_bridge_launch_phase("connected")
-                    self._set_launch_status("桥接进程已启动；RC003 已连接。")
+                    self._set_launch_status("遥控器服务已启动；RC003 已连接。")
                 else:
                     self._set_bridge_launch_phase("waiting")
                     if self._has_explicit_launch_result:
                         self._set_launch_status(
-                            "桥接进程已启动；正在等待 RC003 连接，首次连接可能约一分钟。"
+                            "遥控器服务已启动；正在等待 RC003 连接，首次连接可能约一分钟。"
                         )
                     elif runtime_status is None:
                         self._set_launch_status(
-                            "桥接进程已启动；RC003 连接状态暂时未知，正在继续检查。"
+                            "遥控器服务已启动；RC003 连接状态暂时未知，正在继续检查。"
                         )
                     else:
                         self._set_launch_status(
-                            "桥接进程已启动；正在等待 RC003 连接。"
+                            "遥控器服务已启动；正在等待 RC003 连接。"
                         )
                 return
 
@@ -1180,7 +1196,7 @@ def _load_qt_classes() -> dict:
             ):
                 self._set_bridge_launch_phase("failed")
                 self._set_launch_status(
-                    "桥接进程已经退出；RC003 当前未连接。请查看 app.log 确认原因。"
+                    "遥控器服务已经退出；RC003 当前未连接。请查看 app.log 确认原因。"
                 )
             elif self._has_explicit_launch_result and previous_phase in {
                 "failed",
@@ -2259,8 +2275,15 @@ def _load_qt_classes() -> dict:
                     "DJI Mic 2 使用 Windows 系统录音输入，不启动 RC003 BLE/HID/ATVV 桥。"
                 )
                 return
+            self._start_bridge_process()
+
+        def _start_bridge_process(self) -> None:
+            saved_before_launch = self._bridge_launch_phase == "saving"
             self._set_bridge_launch_phase("starting")
-            self._set_launch_status("设置已保存；正在启动桥接进程…")
+            if saved_before_launch:
+                self._set_launch_status("设置已保存；正在启动遥控器服务…")
+            else:
+                self._set_launch_status("正在按上次保存的设置启动遥控器服务…")
             try:
                 attempt = bridge_launcher.start_bridge_launch()
             except bridge_launcher.BridgeLaunchConfigurationError as exc:
@@ -2276,6 +2299,26 @@ def _load_qt_classes() -> dict:
                 self._finish_bridge_launch(attempt)
                 return
             self._pending_bridge_launch = attempt
+
+        @Slot()
+        def startBridge(self) -> None:
+            """Start the bridge without saving unrelated unsaved page edits."""
+
+            if self._get_bridge_launch_busy():
+                return
+            if _vb_cable_test_active_event.is_set():
+                self._set_error_message(
+                    "声音通道测试正在运行；测试结束后再启动遥控器服务。"
+                )
+                return
+            self._has_explicit_launch_result = True
+            self._bridge_launch_started_at = time.monotonic()
+            if self._bridge_launch_elapsed_seconds != 0:
+                self._bridge_launch_elapsed_seconds = 0
+                self.bridgeLaunchElapsedSecondsChanged.emit()
+            self._set_bridge_connected(False)
+            self._set_error_message("")
+            QTimer.singleShot(0, self._start_bridge_process)
 
         def _finish_bridge_launch(
             self,
@@ -2330,6 +2373,17 @@ def _load_qt_classes() -> dict:
             self._set_error_message("")
             self._set_status_message(
                 "已恢复按键默认显示，尚未保存——点击「保存映射」才会写入设置。"
+            )
+
+        @Slot()
+        def useWindowsDictationHotkey(self) -> None:
+            if self._set_voice_hotkey_text(
+                key_mapping.VoiceTriggerMode.HOLD, "win+h"
+            ):
+                self._mark_settings_dirty()
+            self._set_error_message("")
+            self._set_status_message(
+                "语音按键已改为 Win+H，尚未保存；点击语音页“应用”后生效。"
             )
 
         @Slot()
@@ -2484,6 +2538,7 @@ def _load_qt_classes() -> dict:
         driverInfoMessageChanged = Signal()
         driverErrorMessageChanged = Signal()
         vbCableTestChanged = Signal()
+        vbCableBridgeRecoveryChanged = Signal()
         # Internal only - never connected to from QML. Carries a
         # windows_diagnostics.DiagnosticsReport (or None on an unexpected
         # worker-thread exception) back from the background thread to this
@@ -2505,6 +2560,7 @@ def _load_qt_classes() -> dict:
             self._vb_cable_test_running = False
             self._vb_cable_test_status = "idle"
             self._vb_cable_test_message = ""
+            self._vb_cable_bridge_recovery_needed = False
             self._diagnosticsReady.connect(self._on_diagnostics_ready)
             self._vbCableTestReady.connect(self._on_vb_cable_test_ready)
             self._settings_controller.endpointOptionsChanged.connect(
@@ -2573,6 +2629,13 @@ def _load_qt_classes() -> dict:
             self._vb_cable_test_running = running
             self.vbCableTestChanged.emit()
 
+        def _set_vb_cable_bridge_recovery_needed(self, value: bool) -> None:
+            value = bool(value)
+            if value == self._vb_cable_bridge_recovery_needed:
+                return
+            self._vb_cable_bridge_recovery_needed = value
+            self.vbCableBridgeRecoveryChanged.emit()
+
         def _invalidate_vb_cable_test_result(self) -> None:
             if self._vb_cable_test_running:
                 return
@@ -2611,12 +2674,76 @@ def _load_qt_classes() -> dict:
 
         def _on_vb_cable_test_ready(self, result) -> None:
             if result is None:
+                self._set_vb_cable_bridge_recovery_needed(False)
                 self._set_vb_cable_test_state(
                     "fail",
                     "VB-CABLE 通道测试出现意外错误，未得到可信结果。",
                     running=False,
                 )
                 return
+            if isinstance(result, _VbCableTestWorkflowResult):
+                if result.stop_error:
+                    self._set_vb_cable_bridge_recovery_needed(False)
+                    self._set_vb_cable_test_state(
+                        "fail",
+                        result.stop_error,
+                        running=False,
+                    )
+                    self._settings_controller._refresh_bridge_status()
+                    return
+                loopback_result = result.loopback_result
+                restart_result = result.restart_result
+                restart_ok = bool(
+                    restart_result is not None
+                    and restart_result.outcome
+                    in {
+                        bridge_launcher.LaunchOutcome.STARTED,
+                        bridge_launcher.LaunchOutcome.ALREADY_RUNNING,
+                    }
+                )
+                if result.bridge_was_running and not restart_ok:
+                    self._set_vb_cable_bridge_recovery_needed(True)
+                    recovery_text = (
+                        settings_ui.describe_launch_result(restart_result)
+                        if restart_result is not None
+                        else "没有得到启动结果。"
+                    )
+                    loopback_text = (
+                        loopback_result.detail
+                        if loopback_result is not None
+                        else "声音通道测试没有得到可信结果。"
+                    )
+                    self._set_vb_cable_test_state(
+                        "fail",
+                        f"{loopback_text} 遥控器服务未能自动恢复：{recovery_text}",
+                        running=False,
+                    )
+                    self._settings_controller._refresh_bridge_status()
+                    return
+                self._set_vb_cable_bridge_recovery_needed(False)
+                if loopback_result is None:
+                    self._set_vb_cable_test_state(
+                        "fail",
+                        "声音通道测试出现意外错误，未得到可信结果。"
+                        + (
+                            " 遥控器服务已自动恢复。"
+                            if result.bridge_was_running else ""
+                        ),
+                        running=False,
+                    )
+                else:
+                    suffix = (
+                        " 遥控器服务已自动恢复。"
+                        if result.bridge_was_running else ""
+                    )
+                    self._set_vb_cable_test_state(
+                        loopback_result.status.value,
+                        loopback_result.detail + suffix,
+                        running=False,
+                    )
+                self._settings_controller._refresh_bridge_status()
+                return
+            self._set_vb_cable_bridge_recovery_needed(False)
             self._set_vb_cable_test_state(
                 result.status.value,
                 result.detail,
@@ -2682,6 +2809,15 @@ def _load_qt_classes() -> dict:
 
         vbCableTestMessage = Property(
             str, _get_vb_cable_test_message, notify=vbCableTestChanged
+        )
+
+        def _get_vb_cable_bridge_recovery_needed(self) -> bool:
+            return self._vb_cable_bridge_recovery_needed
+
+        vbCableBridgeRecoveryNeeded = Property(
+            bool,
+            _get_vb_cable_bridge_recovery_needed,
+            notify=vbCableBridgeRecoveryChanged,
         )
 
         # -- slots ----------------------------------------------------------
@@ -2772,6 +2908,16 @@ def _load_qt_classes() -> dict:
         def testVbCableChannel(self) -> None:
             """Runs the active CABLE Input -> CABLE Output test on demand."""
 
+            self._start_vb_cable_test(allow_bridge_restart=False)
+
+        @Slot()
+        def testVbCableChannelWithBridgeRestart(self) -> None:
+            """Temporarily stop a running bridge, test, then restore it."""
+
+            self._start_vb_cable_test(allow_bridge_restart=True)
+
+        def _start_vb_cable_test(self, *, allow_bridge_restart: bool) -> None:
+
             if self._vb_cable_test_running or self._is_refreshing:
                 return
             if _diagnostics_shutdown_event.is_set():
@@ -2792,31 +2938,75 @@ def _load_qt_classes() -> dict:
                 )
                 return
             if bridge_running:
-                self._set_vb_cable_test_state(
-                    "fail",
-                    "桥接正在运行；请先停止桥接，再测试 VB-CABLE 通道。",
-                    running=False,
-                )
-                return
+                if not allow_bridge_restart:
+                    self._set_vb_cable_test_state(
+                        "fail",
+                        "遥控器服务正在运行；确认临时停止并自动恢复后才能测试声音通道。",
+                        running=False,
+                    )
+                    return
 
             saved_name, saved_host_api = self._saved_output_endpoint()
             _vb_cable_test_active_event.set()
+            self._set_vb_cable_bridge_recovery_needed(False)
             self._set_vb_cable_test_state(
                 "running",
-                "正在发送短测试信号，并检查 CABLE Output 是否收到。",
+                (
+                    "正在临时停止遥控器服务；随后测试声音通道并自动恢复。"
+                    if bridge_running
+                    else "正在发送短测试信号，并检查 CABLE Output 是否收到。"
+                ),
                 running=True,
             )
 
             def _run_in_background() -> None:
                 try:
+                    stop_error = ""
+                    loopback_result = None
+                    restart_result = None
+                    bridge_stopped = False
+                    if bridge_running:
+                        stop_result = bridge_control_windows.request_bridge_exit()
+                        if not stop_result.stopped:
+                            stop_error = stop_result.error or (
+                                "未能临时停止遥控器服务，本次未开始声音通道测试。"
+                            )
+                        else:
+                            bridge_stopped = True
                     try:
-                        result = windows_diagnostics.check_vb_cable_loopback_isolated(
-                            saved_name,
-                            saved_host_api,
-                            cancel_event=_diagnostics_shutdown_event,
-                        )
+                        if not stop_error and not _diagnostics_shutdown_event.is_set():
+                            loopback_result = (
+                                windows_diagnostics.check_vb_cable_loopback_isolated(
+                                    saved_name,
+                                    saved_host_api,
+                                    cancel_event=_diagnostics_shutdown_event,
+                                )
+                            )
                     except Exception:  # noqa: BLE001 - never crash the worker thread
-                        result = None
+                        loopback_result = None
+                    finally:
+                        if bridge_stopped:
+                            try:
+                                restart_result = bridge_launcher.launch_bridge()
+                            except bridge_launcher.BridgeLaunchConfigurationError as exc:
+                                restart_result = bridge_launcher.LaunchResult(
+                                    outcome=bridge_launcher.LaunchOutcome.LAUNCH_FAILED,
+                                    command=(),
+                                    error=type(exc).__name__,
+                                )
+                            except Exception as exc:  # noqa: BLE001 - report recovery failure
+                                restart_result = bridge_launcher.LaunchResult(
+                                    outcome=bridge_launcher.LaunchOutcome.LAUNCH_FAILED,
+                                    command=(),
+                                    error=type(exc).__name__,
+                                )
+                    result = _VbCableTestWorkflowResult(
+                        loopback_result=loopback_result,
+                        bridge_was_running=bool(bridge_running),
+                        stop_error=stop_error,
+                        restart_result=restart_result,
+                    )
+                    _vb_cable_test_active_event.clear()
                     if _diagnostics_shutdown_event.is_set():
                         return
                     try:

@@ -158,6 +158,24 @@ Item {
         }
     }
 
+    Dialog {
+        id: restoreMappingDefaultsDialog
+        objectName: "restoreMappingDefaultsDialog"
+        title: qsTr("恢复内置默认？")
+        modal: true
+        anchors.centerIn: parent
+        standardButtons: Dialog.Ok | Dialog.Cancel
+        onAccepted: SettingsController.restoreMappingDefaults()
+
+        UiLabel {
+            tokens: root.tokens
+            kind: bodyKind
+            width: 340
+            wrapMode: Text.WordWrap
+            text: qsTr("这会把 13 个按键恢复为程序内置映射，不是全部清空。确认后仍需点击“保存映射”才会写入设置。")
+        }
+    }
+
 
     Dialog {
         id: shortcutRecorder
@@ -771,13 +789,21 @@ Item {
                                 : SettingsController.startKeyDetection()
                             Accessible.name: qsTr("检测真实遥控器按键")
                         }
+                        UiLabel {
+                            objectName: "voiceGestureRestrictionText"
+                            tokens: root.tokens
+                            kind: noteKind
+                            Layout.fillWidth: true
+                            text: qsTr("按键设为语音键时，双击和长按不可用")
+                            elide: Text.ElideRight
+                        }
                         Item { Layout.fillWidth: true }
                         CompactButton {
                             objectName: "restoreMappingDefaultsButton"
                             tokens: root.tokens
-                            compactMinimumWidth: tokens.buttonWidth4Chars
-                            text: qsTr("恢复默认")
-                            onClicked: SettingsController.restoreMappingDefaults()
+                            compactMinimumWidth: tokens.buttonWidth6Chars
+                            text: qsTr("恢复内置默认")
+                            onClicked: restoreMappingDefaultsDialog.open()
                         }
                         CompactButton {
                             id: saveMappingButton
@@ -1151,8 +1177,8 @@ Item {
                     text: SettingsController.keyDetectionActive
                         ? SettingsController.keyDetectionText
                         : !SettingsController.bridgeRunning
-                            ? qsTr("桥接未运行，语音和真实按键检测不可用")
-                            : qsTr("按住说话时，双击和长按不执行")
+                            ? qsTr("遥控器服务未运行，语音和真实按键检测不可用")
+                            : ""
                     elide: Text.ElideRight
                 }
             }
