@@ -54,6 +54,7 @@ CHROMIUM_MIN_SCAN_DEPTH = 32
 LIST_CONTAINER_TYPES = frozenset(
     {"ListControl", "TreeControl", "TableControl", "DataGridControl"}
 )
+ITEM_CONTAINER_TYPES = frozenset({"ListItemControl", "TreeItemControl"})
 
 
 class Direction(str, Enum):
@@ -381,6 +382,12 @@ def discover_group_scopes(
         ):
             continue
         parent_path = target.path[:-1]
+        inside_item_container = target.control_type == "TreeItemControl" or any(
+            node_types.get(parent_path[:depth]) in ITEM_CONTAINER_TYPES
+            for depth in range(1, len(parent_path) + 1)
+        )
+        if not inside_item_container:
+            continue
         has_list_child = any(
             len(path) == len(parent_path) + 1
             and path[:-1] == parent_path

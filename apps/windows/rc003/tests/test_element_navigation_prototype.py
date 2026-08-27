@@ -258,15 +258,27 @@ class SpatialNavigationTests(unittest.TestCase):
             220,
             60,
             "folder",
-            path=(0, 0),
+            path=(0, 0, 0),
             supports_expand=True,
             has_action_pattern=True,
         )
         first = self.target(
-            20, 70, 220, 110, "first", path=(0, 1, 0), has_action_pattern=True
+            20,
+            70,
+            220,
+            110,
+            "first",
+            path=(0, 0, 1, 0),
+            has_action_pattern=True,
         )
         second = self.target(
-            20, 115, 220, 155, "second", path=(0, 1, 1), has_action_pattern=True
+            20,
+            115,
+            220,
+            155,
+            "second",
+            path=(0, 0, 1, 1),
+            has_action_pattern=True,
         )
         outside = self.target(
             300, 20, 380, 60, "outside", path=(1,), has_action_pattern=True
@@ -275,15 +287,39 @@ class SpatialNavigationTests(unittest.TestCase):
         groups = prototype.discover_group_scopes(
             targets,
             {
-                (0, 0): "ButtonControl",
-                (0, 1): "ListControl",
+                (0,): "ListItemControl",
+                (0, 0, 0): "ButtonControl",
+                (0, 0, 1): "ListControl",
                 (1,): "ButtonControl",
             },
         )
-        self.assertEqual(groups, {(0,): 0})
+        self.assertEqual(groups, {(0, 0): 0})
         self.assertEqual(prototype.scope_target_indices(targets, groups), [0, 3])
         self.assertEqual(
-            prototype.scope_target_indices(targets, groups, (0,)), [1, 2]
+            prototype.scope_target_indices(targets, groups, (0, 0)), [1, 2]
+        )
+
+    def test_section_header_does_not_hide_the_whole_project_list(self):
+        section = self.target(
+            20,
+            20,
+            220,
+            60,
+            "projects",
+            path=(0, 0),
+            supports_expand=True,
+            has_action_pattern=True,
+        )
+        folder = self.target(
+            20, 70, 220, 110, "folder", path=(0, 1, 0), has_action_pattern=True
+        )
+        groups = prototype.discover_group_scopes(
+            [section, folder],
+            {(0, 0): "ButtonControl", (0, 1): "ListControl"},
+        )
+        self.assertEqual(groups, {})
+        self.assertEqual(
+            prototype.scope_target_indices([section, folder], groups), [0, 1]
         )
 
     def test_small_options_button_does_not_claim_neighboring_list(self):
