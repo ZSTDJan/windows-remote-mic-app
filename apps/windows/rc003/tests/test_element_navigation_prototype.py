@@ -76,6 +76,21 @@ class SpatialNavigationTests(unittest.TestCase):
             2,
         )
 
+    def test_vertical_navigation_stays_in_main_content_lane(self):
+        targets = [
+            self.target(440, 50, 780, 100, "title"),
+            self.target(50, 130, 400, 175, "near sidebar"),
+            self.target(530, 300, 800, 340, "far main content"),
+        ]
+        self.assertEqual(
+            prototype.next_target_index(targets, 0, prototype.Direction.DOWN),
+            2,
+        )
+        self.assertEqual(
+            prototype.next_target_index(targets, 2, prototype.Direction.UP),
+            0,
+        )
+
     def test_keeps_current_target_when_no_candidate_exists(self):
         targets = [self.target(100, 100, 160, 140, "only")]
         self.assertEqual(

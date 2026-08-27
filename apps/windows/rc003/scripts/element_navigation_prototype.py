@@ -154,7 +154,7 @@ def _axis_overlap(a_start: int, a_end: int, b_start: int, b_end: int) -> int:
 
 def direction_score(
     current: Rect, candidate: Rect, direction: Direction
-) -> Optional[tuple[float, float, float, float, int, int]]:
+) -> Optional[tuple[int, float, float, float, float, int, int]]:
     """Return a stable spatial-navigation score, or None for wrong direction.
 
     This is an independent prototype heuristic based on the same general
@@ -217,7 +217,12 @@ def direction_score(
         + center_offset * 0.25
         - overlap * 0.15
     )
+    # TV-style navigation should stay in the current visual lane when one
+    # exists. Without this beam priority, a nearer sidebar item can beat a
+    # farther control directly above or below the current target.
+    beam_rank = 0 if overlap > 0 else 1
     return (
+        beam_rank,
         score,
         float(primary_gap),
         float(perpendicular_gap),
