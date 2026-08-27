@@ -116,6 +116,17 @@ class SpatialNavigationTests(unittest.TestCase):
             2,
         )
 
+    def test_left_reaches_sidebar_before_wrapping_to_upper_right(self):
+        targets = [
+            self.target(40, 420, 340, 470, "sidebar", path=(0, 1, 8)),
+            self.target(720, 420, 1760, 475, "file row", path=(0, 2, 4)),
+            self.target(1670, 350, 1760, 395, "review", path=(0, 2, 3)),
+        ]
+        self.assertEqual(
+            prototype.next_target_index(targets, 1, prototype.Direction.LEFT),
+            0,
+        )
+
     def test_prefers_nearest_target_in_a_vertical_column(self):
         targets = [
             self.target(100, 100, 160, 140, "current"),
@@ -460,7 +471,7 @@ class SpatialNavigationTests(unittest.TestCase):
             prototype.target_quality_rank(wrapper),
         )
 
-    def test_folder_scope_hides_children_until_entered(self):
+    def test_expanded_folder_and_children_share_flat_navigation(self):
         folder = self.target(
             20,
             20,
@@ -503,9 +514,12 @@ class SpatialNavigationTests(unittest.TestCase):
             },
         )
         self.assertEqual(groups, {(0, 0): 0})
-        self.assertEqual(prototype.scope_target_indices(targets, groups), [0, 3])
         self.assertEqual(
-            prototype.scope_target_indices(targets, groups, (0, 0)), [1, 2]
+            prototype.flat_target_indices(targets), [0, 1, 2, 3]
+        )
+        self.assertEqual(
+            prototype.next_target_index(targets, 0, prototype.Direction.DOWN),
+            1,
         )
 
     def test_section_header_does_not_hide_the_whole_project_list(self):
@@ -528,7 +542,7 @@ class SpatialNavigationTests(unittest.TestCase):
         )
         self.assertEqual(groups, {})
         self.assertEqual(
-            prototype.scope_target_indices([section, folder], groups), [0, 1]
+            prototype.flat_target_indices([section, folder]), [0, 1]
         )
 
     def test_small_options_button_does_not_claim_neighboring_list(self):

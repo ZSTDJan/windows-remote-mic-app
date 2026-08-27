@@ -9,8 +9,8 @@ Controls:
     Ctrl+Alt+N  scan the foreground window and enter/leave navigation
     Arrow keys  move the highlighted target
     PageUp/Down move to the parent/child element at the same location
-    Enter       enter/expand a group, or invoke a leaf target
-    Esc         return to the parent group, or leave at the root
+    Enter       expand/collapse a group, or invoke a leaf target
+    Esc         leave navigation
     Ctrl+Alt+Q  quit the prototype
 """
 
@@ -591,43 +591,10 @@ def discover_group_scopes(
     return groups
 
 
-def scope_target_indices(
-    targets: Sequence[TargetSnapshot],
-    groups: dict[tuple[int, ...], int],
-    scope_path: tuple[int, ...] = (),
-) -> list[int]:
-    """Return targets visible at one navigation level."""
+def flat_target_indices(targets: Sequence[TargetSnapshot]) -> list[int]:
+    """Keep every currently visible target in one flat navigation surface."""
 
-    visible: list[int] = []
-    current_representative = groups.get(scope_path)
-    for index, target in enumerate(targets):
-        if scope_path and (
-            len(target.path) <= len(scope_path)
-            or target.path[: len(scope_path)] != scope_path
-        ):
-            continue
-        if index == current_representative:
-            continue
-
-        hidden_by_child_group = False
-        for group_path, representative in groups.items():
-            if group_path == scope_path:
-                continue
-            is_nested_group = (
-                len(group_path) > len(scope_path)
-                and group_path[: len(scope_path)] == scope_path
-            )
-            if (
-                is_nested_group
-                and len(target.path) > len(group_path)
-                and target.path[: len(group_path)] == group_path
-                and index != representative
-            ):
-                hidden_by_child_group = True
-                break
-        if not hidden_by_child_group:
-            visible.append(index)
-    return visible
+    return list(range(len(targets)))
 
 
 def restore_target_index(
@@ -1296,9 +1263,6 @@ def _run_windows(args: argparse.Namespace) -> int:
             self.all_targets: list[RuntimeTarget] = []
             self.targets: list[RuntimeTarget] = []
             self.node_types: dict[tuple[int, ...], str] = {}
-            self.groups: dict[tuple[int, ...], int] = {}
-            self.scope_stack: list[TargetSnapshot] = []
-            self.scope_path: tuple[int, ...] = ()
             self.hierarchy: list[RuntimeTarget] = []
             self.hierarchy_index = -1
             self.invalid_targets: set[tuple[Any, ...]] = set()
@@ -1505,10 +1469,6 @@ def _run_windows(args: argparse.Namespace) -> int:
                     target.snapshot = shifted_snapshot(
                         target.snapshot, delta_x, delta_y
                     )
-                self.scope_stack = [
-                    shifted_snapshot(frame, delta_x, delta_y)
-                    for frame in self.scope_stack
-                ]
                 self.window_rect = current_window_rect
                 self.invalid_targets.clear()
                 self.events.put(
@@ -1525,10 +1485,8 @@ def _run_windows(args: argparse.Namespace) -> int:
                 if 0 <= self.selected < len(self.targets)
                 else None
             )
-            frames = list(self.scope_stack)
             self._enumerate(self.hwnd)
-            self.scope_stack = frames
-            self._apply_scope(restore=previous)
+            self._apply_targets(restore=previous)
             self._reset_hierarchy_for_selected()
             self.events.put(("geometry_rescanned", None))
             self._emit_selection()
@@ -1541,51 +1499,17 @@ def _run_windows(args: argparse.Namespace) -> int:
                 self.window_name,
                 self.visited,
             ) = enumerate_targets(hwnd)
-            self.groups = discover_group_scopes(
-                [target.snapshot for target in self.all_targets], self.node_types
-            )
             self.hwnd = hwnd
             self.invalid_targets.clear()
 
-        def _resolve_scope_path(self) -> tuple[int, ...]:
-            resolved_path: tuple[int, ...] = ()
-            resolved_frames: list[TargetSnapshot] = []
-            for frame in self.scope_stack:
-                candidates = [
-                    (path, self.all_targets[index].snapshot)
-                    for path, index in self.groups.items()
-                    if len(path) > len(resolved_path)
-                    and path[: len(resolved_path)] == resolved_path
-                ]
-                matching = [
-                    (path, snapshot)
-                    for path, snapshot in candidates
-                    if self._same_identity(frame, snapshot)
-                ]
-                if not matching:
-                    break
-                resolved_path, resolved_snapshot = min(
-                    matching,
-                    key=lambda item: (
-                        abs(item[1].rect.center_x - frame.rect.center_x)
-                        + abs(item[1].rect.center_y - frame.rect.center_y)
-                    ),
-                )
-                resolved_frames.append(resolved_snapshot)
-            self.scope_stack = resolved_frames
-            return resolved_path
-
-        def _apply_scope(
+        def _apply_targets(
             self,
             restore: Optional[TargetSnapshot] = None,
             focused: Optional[Rect] = None,
             use_cursor: bool = False,
         ) -> None:
-            self.scope_path = self._resolve_scope_path()
             snapshots = [target.snapshot for target in self.all_targets]
-            visible_indices = scope_target_indices(
-                snapshots, self.groups, self.scope_path
-            )
+            visible_indices = flat_target_indices(snapshots)
             self.targets = [self.all_targets[index] for index in visible_indices]
             visible_snapshots = [target.snapshot for target in self.targets]
             if restore is not None:
@@ -1604,7 +1528,7 @@ def _run_windows(args: argparse.Namespace) -> int:
                 "target": snapshots[self.selected],
                 "selected": self.selected,
                 "count": len(snapshots),
-                "scope_depth": len(self.scope_stack),
+                "scope_depth": 0,
                 "hierarchy_index": self.hierarchy_index,
                 "hierarchy_count": len(self.hierarchy),
             }
@@ -1613,36 +1537,8 @@ def _run_windows(args: argparse.Namespace) -> int:
             if self.targets and self.selected >= 0:
                 self.events.put(("selection", self._selection_payload()))
 
-        def _group_path_for_target(
-            self, target: RuntimeTarget
-        ) -> Optional[tuple[int, ...]]:
-            for path, index in self.groups.items():
-                if self.all_targets[index].snapshot.path == target.snapshot.path:
-                    return path
-            for path, index in self.groups.items():
-                if self._same_identity(
-                    self.all_targets[index].snapshot, target.snapshot
-                ):
-                    return path
-            return None
-
-        def _enter_group(self, target: RuntimeTarget) -> bool:
-            group_path = self._group_path_for_target(target)
-            if group_path is None:
-                return False
-            self.scope_stack.append(target.snapshot)
-            self._apply_scope(focused=target.snapshot.rect)
-            if self.selected < 0:
-                self.scope_stack.pop()
-                self._apply_scope(restore=target.snapshot)
-                return False
-            self._reset_hierarchy_for_selected()
-            self._emit_selection()
-            return True
-
         def _scan(self, hwnd: int) -> None:
             started = time.perf_counter()
-            self.scope_stack = []
             point = cursor_point()
             self._enumerate(hwnd)
             hierarchy = (
@@ -1651,16 +1547,13 @@ def _run_windows(args: argparse.Namespace) -> int:
                 else []
             )
             self._set_hierarchy(hierarchy)
-            self.groups = discover_group_scopes(
-                [target.snapshot for target in self.all_targets], self.node_types
-            )
             if self.hierarchy:
-                self._apply_scope(restore=self.hierarchy[0].snapshot)
+                self._apply_targets(restore=self.hierarchy[0].snapshot)
                 if self.targets and self.selected >= 0:
                     current = self.targets[self.selected]
                     self._set_hierarchy(self.hierarchy, current)
             else:
-                self._apply_scope(focused=focused_rect(), use_cursor=True)
+                self._apply_targets(focused=focused_rect(), use_cursor=True)
                 self._reset_hierarchy_for_selected()
             snapshots = [target.snapshot for target in self.targets]
             elapsed = time.perf_counter() - started
@@ -1685,19 +1578,12 @@ def _run_windows(args: argparse.Namespace) -> int:
                 )
             )
 
-        def _refresh_after_expand(
-            self, previous: TargetSnapshot, enter_group: bool
-        ) -> None:
-            frames = list(self.scope_stack)
+        def _refresh_after_expand(self, previous: TargetSnapshot) -> None:
             time.sleep(0.18)
             self._enumerate(self.hwnd)
-            self.scope_stack = frames
-            self._apply_scope(restore=previous)
+            self._apply_targets(restore=previous)
             if not self.targets or self.selected < 0:
                 self._emit_selection()
-                return
-            refreshed = self.targets[self.selected]
-            if enter_group and self._enter_group(refreshed):
                 return
             self._reset_hierarchy_for_selected()
             self._emit_selection()
@@ -1711,15 +1597,14 @@ def _run_windows(args: argparse.Namespace) -> int:
                 self.invalid_targets.add(self._identity_token(target.snapshot))
                 self.events.put(("target_skipped", target.snapshot))
                 self._enumerate(self.hwnd)
-                self._apply_scope(restore=target.snapshot)
+                self._apply_targets(restore=target.snapshot)
                 self._reset_hierarchy_for_selected()
                 self._emit_selection()
                 return
-            group_path = self._group_path_for_target(target)
             state = expand_state(target.control) if target.snapshot.supports_expand else None
             if state == 0:
                 method = set_expanded(target.control, True)
-                self._refresh_after_expand(target.snapshot, enter_group=True)
+                self._refresh_after_expand(target.snapshot)
                 self.events.put(
                     (
                         "expanded",
@@ -1727,11 +1612,9 @@ def _run_windows(args: argparse.Namespace) -> int:
                     )
                 )
                 return
-            if group_path is not None and self._enter_group(target):
-                return
             if state in (1, 2):
                 method = set_expanded(target.control, False)
-                self._refresh_after_expand(target.snapshot, enter_group=False)
+                self._refresh_after_expand(target.snapshot)
                 self.events.put(
                     (
                         "expanded",
@@ -1749,13 +1632,7 @@ def _run_windows(args: argparse.Namespace) -> int:
             )
 
         def _back(self) -> None:
-            if not self.scope_stack:
-                self.events.put(("exit_requested", None))
-                return
-            parent_target = self.scope_stack.pop()
-            self._apply_scope(restore=parent_target)
-            self._reset_hierarchy_for_selected()
-            self._emit_selection()
+            self.events.put(("exit_requested", None))
 
         def _run(self) -> None:
             auto.InitializeUIAutomationInCurrentThread()
@@ -2075,8 +1952,8 @@ def _run_windows(args: argparse.Namespace) -> int:
             started = time.perf_counter()
             targets, node_types, _rect, window_name, visited = enumerate_targets(hwnd)
             snapshots = [target.snapshot for target in targets]
-            groups = discover_group_scopes(snapshots, node_types)
-            visible = [targets[index] for index in scope_target_indices(snapshots, groups)]
+            del node_types
+            visible = [targets[index] for index in flat_target_indices(snapshots)]
             elapsed = time.perf_counter() - started
             print(
                 f"窗口: {window_name}\n根层: {len(visible)}，全部元素: {len(targets)}，"
@@ -2238,8 +2115,8 @@ def _run_windows(args: argparse.Namespace) -> int:
     print("元素导航键盘原型已启动。")
     print(
         "Ctrl+Alt+N 开始/退出，方向键移动，PageUp/PageDown 切换父子元素，"
-        "Enter 进入/执行，"
-        "Esc 返回/退出，Ctrl+Alt+Q 关闭。"
+        "Enter 展开/收起或执行，"
+        "Esc 退出，Ctrl+Alt+Q 关闭。"
     )
     return int(app.exec())
 
