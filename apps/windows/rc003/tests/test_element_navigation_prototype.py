@@ -64,6 +64,46 @@ class SpatialNavigationTests(unittest.TestCase):
             prototype.next_target_index(targets, 0, prototype.Direction.RIGHT),
             2,
         )
+        self.assertEqual(
+            prototype.ranked_target_indices(
+                targets, 0, prototype.Direction.RIGHT
+            )[:2],
+            [2, 1],
+        )
+
+    def test_right_wraps_from_row_end_to_next_row_start(self):
+        targets = [
+            self.target(900, 100, 960, 140, "p1", path=(0, 2, 0)),
+            self.target(500, 180, 560, 220, "p2", path=(0, 2, 1)),
+            self.target(700, 180, 760, 220, "next row second", path=(0, 2, 2)),
+        ]
+        self.assertEqual(
+            prototype.next_target_index(targets, 0, prototype.Direction.RIGHT),
+            1,
+        )
+
+    def test_left_wraps_from_row_start_to_previous_row_end(self):
+        targets = [
+            self.target(900, 100, 960, 140, "p1", path=(0, 2, 0)),
+            self.target(500, 180, 560, 220, "p2", path=(0, 2, 1)),
+        ]
+        self.assertEqual(
+            prototype.next_target_index(targets, 1, prototype.Direction.LEFT),
+            0,
+        )
+
+    def test_horizontal_wrap_beats_closer_diagonal_sidebar_target(self):
+        targets = [
+            self.target(900, 100, 960, 140, "p1", path=(0, 2, 0)),
+            self.target(500, 180, 560, 220, "p2", path=(0, 2, 1)),
+            self.target(980, 155, 1040, 195, "sidebar", path=(0, 1, 0)),
+        ]
+        self.assertEqual(
+            prototype.ranked_target_indices(
+                targets, 0, prototype.Direction.RIGHT
+            )[:2],
+            [1, 2],
+        )
 
     def test_prefers_nearest_target_in_a_vertical_column(self):
         targets = [
@@ -96,6 +136,30 @@ class SpatialNavigationTests(unittest.TestCase):
         self.assertEqual(
             prototype.next_target_index(targets, 0, prototype.Direction.LEFT),
             0,
+        )
+
+    def test_shifts_cached_snapshot_without_losing_identity(self):
+        target = self.target(
+            100,
+            100,
+            160,
+            140,
+            "button",
+            runtime_id=(7, 8, 9),
+            source="uia-point",
+        )
+        shifted = prototype.shifted_snapshot(target, 30, -20)
+        self.assertEqual(shifted.rect, prototype.Rect(130, 80, 190, 120))
+        self.assertEqual(shifted.runtime_id, (7, 8, 9))
+        self.assertEqual(shifted.source, "uia-point")
+
+    def test_target_probe_points_cover_sparse_left_content(self):
+        rect = prototype.Rect(40, 100, 540, 150)
+        points = prototype.target_probe_points(rect)
+        self.assertEqual(points[0], (290, 125))
+        self.assertIn((64, 125), points)
+        self.assertTrue(
+            all(rect.contains_point(point) for point in points)
         )
 
     def test_initial_target_uses_focused_element(self):
@@ -155,6 +219,50 @@ class SpatialNavigationTests(unittest.TestCase):
                 (280, 180),
             ),
             1,
+        )
+
+    def test_point_hit_prefers_exact_runtime_id(self):
+        targets = [
+            self.target(
+                20,
+                20,
+                120,
+                60,
+                "same",
+                runtime_id=(1, 2, 3),
+            ),
+            self.target(
+                20,
+                20,
+                120,
+                60,
+                "same",
+                runtime_id=(4, 5, 6),
+            ),
+        ]
+        self.assertEqual(
+            prototype.hit_target_match_index(
+                targets, prototype.Rect(20, 20, 120, 60), (4, 5, 6)
+            ),
+            1,
+        )
+
+    def test_point_hit_accepts_small_cross_api_rectangle_difference(self):
+        targets = [self.target(100, 100, 200, 150, "button")]
+        self.assertEqual(
+            prototype.hit_target_match_index(
+                targets, prototype.Rect(102, 99, 202, 151)
+            ),
+            0,
+        )
+
+    def test_point_hit_rejects_unrelated_overlapping_container(self):
+        targets = [self.target(0, 0, 600, 400, "container")]
+        self.assertEqual(
+            prototype.hit_target_match_index(
+                targets, prototype.Rect(100, 100, 140, 140)
+            ),
+            -1,
         )
 
     def test_drops_large_structural_wrapper_around_real_button(self):
@@ -349,6 +457,16 @@ class SpatialNavigationTests(unittest.TestCase):
         targets = [
             self.target(20, 200, 120, 240, "other"),
             self.target(20, 80, 120, 120, "folder"),
+        ]
+        self.assertEqual(prototype.restore_target_index(targets, previous), 1)
+
+    def test_restore_target_uses_runtime_id_before_repeated_name(self):
+        previous = self.target(
+            20, 20, 120, 60, "copy", runtime_id=(7, 8, 9)
+        )
+        targets = [
+            self.target(20, 80, 120, 120, "copy", runtime_id=(1, 2, 3)),
+            self.target(200, 80, 300, 120, "copy", runtime_id=(7, 8, 9)),
         ]
         self.assertEqual(prototype.restore_target_index(targets, previous), 1)
 

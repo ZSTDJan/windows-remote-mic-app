@@ -8,6 +8,7 @@ does spatial element navigation feel useful in the user's fixed Windows apps?
 Controls:
     Ctrl+Alt+N  scan the foreground window and enter/leave navigation
     Arrow keys  move the highlighted target
+    PageUp/Down move to the parent/child element at the same location
     Enter       enter/expand a group, or invoke a leaf target
     Esc         return to the parent group, or leave at the root
     Ctrl+Alt+Q  quit the prototype
@@ -22,7 +23,7 @@ import sys
 import threading
 import time
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 from typing import Any, Callable, Optional, Sequence
 
@@ -119,6 +120,8 @@ class TargetSnapshot:
     keyboard_focusable: bool = False
     has_action_pattern: bool = False
     supports_expand: bool = False
+    runtime_id: tuple[int, ...] = ()
+    source: str = "uia"
 
 
 def physical_screen_rect(logical_rect: Rect, device_pixel_ratio: float) -> Rect:
@@ -236,8 +239,78 @@ def direction_score(
 def next_target_index(
     targets: Sequence[TargetSnapshot], current_index: int, direction: Direction
 ) -> int:
+    ranked = ranked_target_indices(targets, current_index, direction)
+    return ranked[0] if ranked else current_index
+
+
+def _common_path_prefix_length(
+    first: tuple[int, ...], second: tuple[int, ...]
+) -> int:
+    length = 0
+    for first_part, second_part in zip(first, second):
+        if first_part != second_part:
+            break
+        length += 1
+    return length
+
+
+def horizontal_wrap_target_indices(
+    targets: Sequence[TargetSnapshot], current_index: int, direction: Direction
+) -> list[int]:
+    """Wrap right/left between visual rows inside the same UIA content branch."""
+
+    if direction not in {Direction.RIGHT, Direction.LEFT}:
+        return []
     if not targets or not 0 <= current_index < len(targets):
-        return current_index
+        return []
+    current = targets[current_index]
+    candidates: list[tuple[int, int, float, float, int]] = []
+    for index, candidate in enumerate(targets):
+        if index == current_index:
+            continue
+        vertical_delta = candidate.rect.center_y - current.rect.center_y
+        minimum_row_delta = max(
+            12.0, min(current.rect.height, candidate.rect.height) * 0.60
+        )
+        if direction == Direction.RIGHT:
+            if (
+                vertical_delta < minimum_row_delta
+                or candidate.rect.center_x >= current.rect.center_x
+            ):
+                continue
+            row_gap = max(0, candidate.rect.top - current.rect.bottom)
+            edge_order = candidate.rect.left
+        else:
+            if (
+                vertical_delta > -minimum_row_delta
+                or candidate.rect.center_x <= current.rect.center_x
+            ):
+                continue
+            row_gap = max(0, current.rect.top - candidate.rect.bottom)
+            edge_order = -candidate.rect.right
+
+        common_prefix = _common_path_prefix_length(current.path, candidate.path)
+        if current.path and candidate.path and common_prefix == 0:
+            continue
+        candidates.append(
+            (
+                -common_prefix,
+                row_gap,
+                abs(vertical_delta),
+                edge_order,
+                index,
+            )
+        )
+
+    candidates.sort()
+    return [index for *_score, index in candidates]
+
+
+def ranked_target_indices(
+    targets: Sequence[TargetSnapshot], current_index: int, direction: Direction
+) -> list[int]:
+    if not targets or not 0 <= current_index < len(targets):
+        return []
     current = targets[current_index].rect
     scored = []
     for index, target in enumerate(targets):
@@ -246,10 +319,50 @@ def next_target_index(
         score = direction_score(current, target.rect, direction)
         if score is not None:
             scored.append((score, index))
-    if not scored:
-        return current_index
     scored.sort(key=lambda item: item[0])
-    return scored[0][1]
+    if direction not in {Direction.RIGHT, Direction.LEFT}:
+        return [index for _score, index in scored]
+
+    # Horizontal navigation behaves like a reading-order grid: finish the
+    # current row, wrap to the adjacent row inside the same content branch,
+    # then consider diagonal targets in the requested half-plane.
+    in_row = [index for score, index in scored if score[0] == 0]
+    diagonal = [index for score, index in scored if score[0] != 0]
+    wrapped = horizontal_wrap_target_indices(targets, current_index, direction)
+    ranked = list(in_row)
+    ranked.extend(index for index in wrapped if index not in ranked)
+    ranked.extend(index for index in diagonal if index not in ranked)
+    return ranked
+
+
+def shifted_snapshot(target: TargetSnapshot, delta_x: int, delta_y: int) -> TargetSnapshot:
+    rect = target.rect
+    return replace(
+        target,
+        rect=Rect(
+            rect.left + delta_x,
+            rect.top + delta_y,
+            rect.right + delta_x,
+            rect.bottom + delta_y,
+        ),
+    )
+
+
+def target_probe_points(rect: Rect) -> list[tuple[int, int]]:
+    """Return stable in-bounds hit-test points for sparse clickable regions."""
+
+    inset_x = max(2, min(24, (rect.width - 1) // 4))
+    inset_y = max(2, min(12, (rect.height - 1) // 4))
+    center_x = round(rect.center_x)
+    center_y = round(rect.center_y)
+    points = [
+        (center_x, center_y),
+        (rect.left + inset_x, center_y),
+        (rect.right - inset_x, center_y),
+        (rect.left + inset_x, rect.top + inset_y),
+        (rect.left + inset_x, rect.bottom - inset_y),
+    ]
+    return list(dict.fromkeys(points))
 
 
 def initial_target_index(
@@ -310,6 +423,54 @@ def initial_target_index(
             targets[index].rect.width * targets[index].rect.height,
         ),
     )
+
+
+def hit_target_match_index(
+    targets: Sequence[TargetSnapshot],
+    hit_rect: Rect,
+    runtime_id: tuple[int, ...] = (),
+) -> int:
+    """Map a point-hit element back to the enumerated navigation candidates."""
+
+    if not targets:
+        return -1
+    if runtime_id:
+        for index, target in enumerate(targets):
+            if target.runtime_id == runtime_id:
+                return index
+
+    exact = [index for index, target in enumerate(targets) if target.rect == hit_rect]
+    if exact:
+        return max(exact, key=lambda index: target_quality_rank(targets[index]))
+
+    hit_area = max(1, hit_rect.width * hit_rect.height)
+    matches: list[tuple[float, float, int, int]] = []
+    for index, target in enumerate(targets):
+        intersection_width = max(
+            0, min(hit_rect.right, target.rect.right) - max(hit_rect.left, target.rect.left)
+        )
+        intersection_height = max(
+            0, min(hit_rect.bottom, target.rect.bottom) - max(hit_rect.top, target.rect.top)
+        )
+        intersection = intersection_width * intersection_height
+        if intersection <= 0:
+            continue
+        target_area = max(1, target.rect.width * target.rect.height)
+        overlap = intersection / min(hit_area, target_area)
+        size_ratio = min(hit_area, target_area) / max(hit_area, target_area)
+        if overlap < 0.70 or size_ratio < 0.45:
+            continue
+        edge_delta = (
+            abs(hit_rect.left - target.rect.left)
+            + abs(hit_rect.top - target.rect.top)
+            + abs(hit_rect.right - target.rect.right)
+            + abs(hit_rect.bottom - target.rect.bottom)
+        )
+        matches.append((overlap, size_ratio, -edge_delta, index))
+
+    if not matches:
+        return -1
+    return max(matches)[-1]
 
 
 def nested_container_keep_indices(targets: Sequence[TargetSnapshot]) -> list[int]:
@@ -457,21 +618,26 @@ def restore_target_index(
     def score(index: int) -> tuple[int, float, float]:
         candidate = targets[index]
         if (
+            previous.runtime_id
+            and candidate.runtime_id == previous.runtime_id
+        ):
+            identity_rank = 0
+        elif (
             previous.automation_id
             and candidate.automation_id == previous.automation_id
             and candidate.control_type == previous.control_type
         ):
-            identity_rank = 0
+            identity_rank = 1
         elif (
             previous.name
             and candidate.name == previous.name
             and candidate.control_type == previous.control_type
         ):
-            identity_rank = 1
-        elif candidate.control_type == previous.control_type:
             identity_rank = 2
-        else:
+        elif candidate.control_type == previous.control_type:
             identity_rank = 3
+        else:
+            identity_rank = 4
         center_distance = abs(candidate.rect.center_x - previous.rect.center_x) + abs(
             candidate.rect.center_y - previous.rect.center_y
         )
@@ -522,7 +688,28 @@ def _run_windows(args: argparse.Namespace) -> int:
 
     user32 = ctypes.windll.user32
     kernel32 = ctypes.windll.kernel32
+    oleacc = ctypes.WinDLL("oleacc")
+    oleaut32 = ctypes.WinDLL("oleaut32")
+    ole32 = ctypes.WinDLL("ole32")
     lresult = ctypes.c_ssize_t
+
+    class VariantValue(ctypes.Union):
+        _fields_ = [
+            ("ll_value", ctypes.c_longlong),
+            ("long_value", ctypes.c_long),
+            ("unknown", ctypes.c_void_p),
+            ("dispatch", ctypes.c_void_p),
+        ]
+
+    class Variant(ctypes.Structure):
+        _anonymous_ = ("value",)
+        _fields_ = [
+            ("vt", ctypes.c_ushort),
+            ("reserved1", ctypes.c_ushort),
+            ("reserved2", ctypes.c_ushort),
+            ("reserved3", ctypes.c_ushort),
+            ("value", VariantValue),
+        ]
 
     kernel32.GetCurrentThreadId.restype = wintypes.DWORD
     kernel32.GetModuleHandleW.argtypes = [wintypes.LPCWSTR]
@@ -530,6 +717,15 @@ def _run_windows(args: argparse.Namespace) -> int:
     user32.GetForegroundWindow.restype = wintypes.HWND
     user32.GetCursorPos.argtypes = [ctypes.POINTER(wintypes.POINT)]
     user32.GetCursorPos.restype = wintypes.BOOL
+    user32.SetCursorPos.argtypes = [ctypes.c_int, ctypes.c_int]
+    user32.SetCursorPos.restype = wintypes.BOOL
+    user32.mouse_event.argtypes = [
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        ctypes.c_size_t,
+    ]
     user32.GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
     user32.GetClassNameW.restype = ctypes.c_int
     user32.GetAsyncKeyState.argtypes = [ctypes.c_int]
@@ -554,6 +750,17 @@ def _run_windows(args: argparse.Namespace) -> int:
         ctypes.POINTER(ctypes.c_size_t),
     ]
     user32.SendMessageTimeoutW.restype = lresult
+    oleacc.AccessibleObjectFromPoint.argtypes = [
+        wintypes.POINT,
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.POINTER(Variant),
+    ]
+    oleacc.AccessibleObjectFromPoint.restype = ctypes.c_long
+    oleaut32.VariantClear.argtypes = [ctypes.POINTER(Variant)]
+    oleaut32.VariantClear.restype = ctypes.c_long
+    ole32.CoInitializeEx.argtypes = [ctypes.c_void_p, wintypes.DWORD]
+    ole32.CoInitializeEx.restype = ctypes.c_long
+    ole32.CoUninitialize.argtypes = []
 
     interactive_types = frozenset(
         {
@@ -584,11 +791,17 @@ def _run_windows(args: argparse.Namespace) -> int:
     wm_getobject = 0x003D
     smto_abortifhung = 0x0002
     accessibility_object_ids = (-25, -4)
+    child_id_self = 0
+    coinit_apartment_threaded = 0x2
+    rpc_e_changed_mode = ctypes.c_long(0x80010106).value
+    mouseeventf_leftdown = 0x0002
+    mouseeventf_leftup = 0x0004
 
     @dataclass
     class RuntimeTarget:
         snapshot: TargetSnapshot
         control: Any
+        click_point: Optional[tuple[int, int]] = None
 
     def rect_from_control(control: Any) -> Rect:
         bounds = control.BoundingRectangle
@@ -599,6 +812,13 @@ def _run_windows(args: argparse.Namespace) -> int:
             int(bounds.bottom),
         )
 
+    def runtime_id_from_control(control: Any) -> tuple[int, ...]:
+        try:
+            runtime_id = control.GetRuntimeId()
+            return tuple(int(value) for value in runtime_id) if runtime_id else ()
+        except Exception:
+            return ()
+
     def supports_any_pattern(control: Any, pattern_ids: Sequence[int]) -> bool:
         for pattern_id in pattern_ids:
             try:
@@ -607,6 +827,171 @@ def _run_windows(args: argparse.Namespace) -> int:
             except Exception:
                 continue
         return False
+
+    def runtime_target_from_control(
+        control: Any,
+        window_rect: Rect,
+        path: tuple[int, ...] = (),
+        depth: int = 0,
+        source: str = "uia",
+    ) -> Optional[RuntimeTarget]:
+        try:
+            control_type = str(control.ControlTypeName or "")
+            enabled = bool(control.IsEnabled)
+            offscreen = bool(control.IsOffscreen)
+            rect = rect_from_control(control)
+            name = str(control.Name or "").strip()
+            automation_id = str(control.AutomationId or "").strip()
+            valid_size = 16 <= rect.width <= 1800 and 16 <= rect.height <= 1400
+            standard = control_type in interactive_types
+            structural = control_type in STRUCTURAL_CONTROL_TYPES
+            keyboard_focusable = bool(control.IsKeyboardFocusable)
+            action_pattern = supports_any_pattern(control, action_pattern_ids)
+            direct_action_pattern = supports_any_pattern(
+                control, direct_action_pattern_ids
+            )
+            actionable = (
+                standard and (keyboard_focusable or action_pattern)
+            ) or (
+                structural
+                and bool(name or automation_id)
+                and (keyboard_focusable or direct_action_pattern)
+            )
+            if not (
+                actionable
+                and enabled
+                and not offscreen
+                and valid_size
+                and not is_navigation_noise(name)
+                and rect.intersects(window_rect)
+            ):
+                return None
+            return RuntimeTarget(
+                TargetSnapshot(
+                    rect=rect,
+                    name=name,
+                    control_type=control_type,
+                    automation_id=automation_id,
+                    path=path,
+                    depth=depth,
+                    keyboard_focusable=keyboard_focusable,
+                    has_action_pattern=action_pattern,
+                    supports_expand=control.GetPattern(
+                        auto.PatternId.ExpandCollapsePattern
+                    )
+                    is not None,
+                    runtime_id=runtime_id_from_control(control),
+                    source=source,
+                ),
+                control,
+            )
+        except Exception:
+            return None
+
+    def _msaa_rect_at_point_core(point: tuple[int, int]) -> Optional[Rect]:
+        initialized = False
+        accessible = ctypes.c_void_p()
+        child = Variant()
+        try:
+            init_hr = int(ole32.CoInitializeEx(None, coinit_apartment_threaded))
+            initialized = init_hr >= 0
+            if init_hr < 0 and init_hr != rpc_e_changed_mode:
+                return None
+
+            native_point = wintypes.POINT(point[0], point[1])
+            hr = int(
+                oleacc.AccessibleObjectFromPoint(
+                    native_point, ctypes.byref(accessible), ctypes.byref(child)
+                )
+            )
+            if hr < 0 or not accessible.value:
+                return None
+
+            vtable = ctypes.cast(
+                accessible, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p))
+            ).contents
+            acc_location_type = ctypes.WINFUNCTYPE(
+                ctypes.c_long,
+                ctypes.c_void_p,
+                ctypes.POINTER(ctypes.c_long),
+                ctypes.POINTER(ctypes.c_long),
+                ctypes.POINTER(ctypes.c_long),
+                ctypes.POINTER(ctypes.c_long),
+                Variant,
+            )
+            acc_location = acc_location_type(vtable[22])
+            left = ctypes.c_long()
+            top = ctypes.c_long()
+            width = ctypes.c_long()
+            height = ctypes.c_long()
+            location_hr = int(
+                acc_location(
+                    accessible,
+                    ctypes.byref(left),
+                    ctypes.byref(top),
+                    ctypes.byref(width),
+                    ctypes.byref(height),
+                    child,
+                )
+            )
+            if location_hr < 0 or width.value <= 0 or height.value <= 0:
+                return None
+            return Rect(
+                left.value,
+                top.value,
+                left.value + width.value,
+                top.value + height.value,
+            )
+        except Exception:
+            return None
+        finally:
+            try:
+                oleaut32.VariantClear(ctypes.byref(child))
+            except Exception:
+                pass
+            if accessible.value:
+                try:
+                    vtable = ctypes.cast(
+                        accessible, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p))
+                    ).contents
+                    release_type = ctypes.WINFUNCTYPE(ctypes.c_ulong, ctypes.c_void_p)
+                    release_type(vtable[2])(accessible)
+                except Exception:
+                    pass
+            if initialized:
+                try:
+                    ole32.CoUninitialize()
+                except Exception:
+                    pass
+
+    def msaa_rect_at_point(
+        point: tuple[int, int], timeout_ms: int = 80
+    ) -> Optional[Rect]:
+        result: queue.Queue[Optional[Rect]] = queue.Queue(maxsize=1)
+
+        def detect() -> None:
+            try:
+                result.put_nowait(_msaa_rect_at_point_core(point))
+            except Exception:
+                pass
+
+        threading.Thread(
+            target=detect,
+            name="element-navigation-msaa-hit",
+            daemon=True,
+        ).start()
+        try:
+            return result.get(timeout=max(1, timeout_ms) / 1000)
+        except queue.Empty:
+            return None
+
+    def click_rect_center(rect: Rect) -> None:
+        click_point((round(rect.center_x), round(rect.center_y)))
+
+    def click_point(point: tuple[int, int]) -> None:
+        user32.SetCursorPos(point[0], point[1])
+        user32.mouse_event(mouseeventf_leftdown, 0, 0, 0, 0)
+        user32.mouse_event(mouseeventf_leftup, 0, 0, 0, 0)
 
     def window_class_name(hwnd: int) -> str:
         buffer = ctypes.create_unicode_buffer(256)
@@ -677,49 +1062,14 @@ def _run_windows(args: argparse.Namespace) -> int:
                 try:
                     control_type = str(control.ControlTypeName or "")
                     node_types[path] = control_type
-                    enabled = bool(control.IsEnabled)
-                    offscreen = bool(control.IsOffscreen)
-                    rect = rect_from_control(control)
-                    name = str(control.Name or "").strip()
-                    automation_id = str(control.AutomationId or "").strip()
-                    valid_size = 16 <= rect.width <= 1800 and 16 <= rect.height <= 1400
-                    standard = control_type in interactive_types
-                    structural = control_type in STRUCTURAL_CONTROL_TYPES
-                    keyboard_focusable = bool(control.IsKeyboardFocusable)
-                    action_pattern = supports_any_pattern(control, action_pattern_ids)
-                    direct_action_pattern = supports_any_pattern(
-                        control, direct_action_pattern_ids
+                    candidate = runtime_target_from_control(
+                        control,
+                        window_rect,
+                        path=path,
+                        depth=depth,
                     )
-                    actionable = (
-                        standard and (keyboard_focusable or action_pattern)
-                    ) or (
-                        structural
-                        and bool(name or automation_id)
-                        and (keyboard_focusable or direct_action_pattern)
-                    )
-                    if (
-                        actionable
-                        and enabled
-                        and not offscreen
-                        and valid_size
-                        and not is_navigation_noise(name)
-                        and rect.intersects(window_rect)
-                    ):
-                        candidate = RuntimeTarget(
-                            TargetSnapshot(
-                                rect,
-                                name,
-                                control_type,
-                                automation_id,
-                                path,
-                                depth,
-                                keyboard_focusable,
-                                action_pattern,
-                                control.GetPattern(auto.PatternId.ExpandCollapsePattern)
-                                is not None,
-                            ),
-                            control,
-                        )
+                    if candidate is not None:
+                        rect = candidate.snapshot.rect
                         existing = by_rect.get(rect)
                         if existing is None or target_quality_rank(
                             candidate.snapshot
@@ -766,6 +1116,82 @@ def _run_windows(args: argparse.Namespace) -> int:
             return None
         return int(point.x), int(point.y)
 
+    def point_hierarchy_targets(
+        point: tuple[int, int],
+        window_rect: Rect,
+        existing_targets: Sequence[RuntimeTarget],
+    ) -> list[RuntimeTarget]:
+        """Return actionable UIA ancestors under the point, leaf first."""
+
+        hierarchy: list[RuntimeTarget] = []
+        seen_runtime_ids: set[tuple[int, ...]] = set()
+        seen_geometry: set[tuple[Rect, str]] = set()
+        try:
+            control = auto.ControlFromPoint(point[0], point[1])
+        except Exception:
+            control = None
+
+        for depth in range(40):
+            if control is None:
+                break
+            candidate = runtime_target_from_control(
+                control,
+                window_rect,
+                depth=depth,
+                source="uia-point",
+            )
+            if candidate is not None:
+                match = hit_target_match_index(
+                    [target.snapshot for target in existing_targets],
+                    candidate.snapshot.rect,
+                    candidate.snapshot.runtime_id,
+                )
+                if match >= 0:
+                    candidate = existing_targets[match]
+                identity = candidate.snapshot.runtime_id
+                geometry = (
+                    candidate.snapshot.rect,
+                    candidate.snapshot.control_type,
+                )
+                if (
+                    (not identity or identity not in seen_runtime_ids)
+                    and geometry not in seen_geometry
+                ):
+                    hierarchy.append(candidate)
+                    if identity:
+                        seen_runtime_ids.add(identity)
+                    seen_geometry.add(geometry)
+            try:
+                control = control.GetParentControl()
+            except Exception:
+                break
+
+        if hierarchy:
+            return hierarchy
+
+        msaa_rect = msaa_rect_at_point(point)
+        if msaa_rect is None or not msaa_rect.intersects(window_rect):
+            return []
+        match = hit_target_match_index(
+            [target.snapshot for target in existing_targets], msaa_rect
+        )
+        if match >= 0:
+            return [existing_targets[match]]
+        if msaa_rect.width < 16 or msaa_rect.height < 16:
+            return []
+        return [
+            RuntimeTarget(
+                TargetSnapshot(
+                    rect=msaa_rect,
+                    name="MSAA 元素",
+                    control_type="LegacyControl",
+                    has_action_pattern=True,
+                    source="msaa",
+                ),
+                None,
+            )
+        ]
+
     def expand_state(control: Any) -> Optional[int]:
         try:
             pattern = control.GetPattern(auto.PatternId.ExpandCollapsePattern)
@@ -791,7 +1217,11 @@ def _run_windows(args: argparse.Namespace) -> int:
         except Exception:
             return None
 
-    def smart_invoke(control: Any) -> str:
+    def smart_invoke(target: RuntimeTarget) -> str:
+        control = target.control
+        if control is None:
+            click_rect_center(target.snapshot.rect)
+            return "MSAA coordinate click"
         attempts: tuple[tuple[int, str, str], ...] = (
             (auto.PatternId.InvokePattern, "Invoke", "Invoke"),
             (auto.PatternId.TogglePattern, "Toggle", "Toggle"),
@@ -814,6 +1244,9 @@ def _run_windows(args: argparse.Namespace) -> int:
                     return label
             except Exception:
                 continue
+        if target.click_point is not None:
+            click_point(target.click_point)
+            return "verified coordinate click"
         control.Click(simulateMove=False, waitTime=0)
         return "mouse fallback"
 
@@ -827,6 +1260,9 @@ def _run_windows(args: argparse.Namespace) -> int:
             self.groups: dict[tuple[int, ...], int] = {}
             self.scope_stack: list[TargetSnapshot] = []
             self.scope_path: tuple[int, ...] = ()
+            self.hierarchy: list[RuntimeTarget] = []
+            self.hierarchy_index = -1
+            self.invalid_targets: set[tuple[Any, ...]] = set()
             self.selected = -1
             self.hwnd = 0
             self.window_rect = Rect(0, 0, 0, 0)
@@ -850,6 +1286,8 @@ def _run_windows(args: argparse.Namespace) -> int:
 
         @staticmethod
         def _same_identity(first: TargetSnapshot, second: TargetSnapshot) -> bool:
+            if first.runtime_id and second.runtime_id:
+                return first.runtime_id == second.runtime_id
             if (
                 first.automation_id
                 and first.automation_id == second.automation_id
@@ -864,6 +1302,198 @@ def _run_windows(args: argparse.Namespace) -> int:
                 return True
             return first.control_type == second.control_type and first.rect == second.rect
 
+        @staticmethod
+        def _identity_token(target: TargetSnapshot) -> tuple[Any, ...]:
+            if target.runtime_id:
+                return ("runtime", target.runtime_id)
+            return (
+                "fallback",
+                target.control_type,
+                target.automation_id,
+                target.name,
+                target.rect,
+            )
+
+        def _merge_all_target(self, target: RuntimeTarget) -> RuntimeTarget:
+            for existing in self.all_targets:
+                if self._same_identity(existing.snapshot, target.snapshot):
+                    return existing
+            self.all_targets.append(target)
+            return target
+
+        def _select_target(self, target: RuntimeTarget) -> None:
+            for index, existing in enumerate(self.targets):
+                if self._same_identity(existing.snapshot, target.snapshot):
+                    self.selected = index
+                    return
+            self.targets.append(target)
+            self.selected = len(self.targets) - 1
+
+        def _set_hierarchy(
+            self,
+            hierarchy: Sequence[RuntimeTarget],
+            current: Optional[RuntimeTarget] = None,
+        ) -> None:
+            merged: list[RuntimeTarget] = []
+            for target in hierarchy:
+                target = self._merge_all_target(target)
+                if not any(
+                    self._same_identity(existing.snapshot, target.snapshot)
+                    for existing in merged
+                ):
+                    merged.append(target)
+            self.hierarchy = merged
+            self.hierarchy_index = -1
+            if current is not None:
+                for index, target in enumerate(self.hierarchy):
+                    if self._same_identity(target.snapshot, current.snapshot):
+                        self.hierarchy_index = index
+                        break
+            if self.hierarchy_index < 0 and self.hierarchy:
+                self.hierarchy_index = 0
+
+        def _reset_hierarchy_for_selected(self) -> None:
+            if not self.targets or not 0 <= self.selected < len(self.targets):
+                self.hierarchy = []
+                self.hierarchy_index = -1
+                return
+            current = self.targets[self.selected]
+            center = (
+                round(current.snapshot.rect.center_x),
+                round(current.snapshot.rect.center_y),
+            )
+            hierarchy = point_hierarchy_targets(
+                center, self.window_rect, self.all_targets
+            )
+            if not any(
+                self._same_identity(target.snapshot, current.snapshot)
+                for target in hierarchy
+            ):
+                hierarchy.insert(0, current)
+            self._set_hierarchy(hierarchy, current)
+
+        def _cycle_hierarchy(self, delta: int) -> None:
+            if not self.targets or not 0 <= self.selected < len(self.targets):
+                return
+            current = self.targets[self.selected]
+            if not self.hierarchy or not 0 <= self.hierarchy_index < len(
+                self.hierarchy
+            ) or not self._same_identity(
+                self.hierarchy[self.hierarchy_index].snapshot, current.snapshot
+            ):
+                self._reset_hierarchy_for_selected()
+            if not self.hierarchy:
+                return
+            next_index = max(
+                0, min(len(self.hierarchy) - 1, self.hierarchy_index + delta)
+            )
+            if next_index == self.hierarchy_index:
+                return
+            self.hierarchy_index = next_index
+            self._select_target(self.hierarchy[next_index])
+            self._emit_selection()
+
+        def _target_is_exposed(self, target: RuntimeTarget) -> bool:
+            if target.control is None:
+                return True
+            target.click_point = None
+            try:
+                if not bool(target.control.IsEnabled) or bool(target.control.IsOffscreen):
+                    return False
+                live_rect = rect_from_control(target.control)
+                if (
+                    live_rect.width < 16
+                    or live_rect.height < 16
+                    or not live_rect.intersects(self.window_rect)
+                ):
+                    return False
+                if live_rect != target.snapshot.rect:
+                    target.snapshot = replace(target.snapshot, rect=live_rect)
+
+                for point in target_probe_points(live_rect):
+                    control = auto.ControlFromPoint(point[0], point[1])
+                    for _depth in range(40):
+                        if control is None:
+                            break
+                        runtime_id = runtime_id_from_control(control)
+                        if (
+                            target.snapshot.runtime_id
+                            and runtime_id == target.snapshot.runtime_id
+                        ):
+                            target.click_point = point
+                            return True
+                        try:
+                            control_type = str(control.ControlTypeName or "")
+                            name = str(control.Name or "").strip()
+                            rect = rect_from_control(control)
+                        except Exception:
+                            control_type = ""
+                            name = ""
+                            rect = Rect(0, 0, 0, 0)
+                        if (
+                            not target.snapshot.runtime_id
+                            and control_type == target.snapshot.control_type
+                            and rect == live_rect
+                            and (not target.snapshot.name or name == target.snapshot.name)
+                        ):
+                            target.click_point = point
+                            return True
+                        control = control.GetParentControl()
+            except Exception:
+                return False
+            return False
+
+        def _sync_window_geometry(self) -> None:
+            if not self.hwnd or not self.targets:
+                return
+            try:
+                root = auto.ControlFromHandle(self.hwnd)
+                if root is None:
+                    return
+                current_window_rect = rect_from_control(root)
+            except Exception:
+                return
+            if current_window_rect == self.window_rect:
+                return
+
+            if (
+                current_window_rect.width == self.window_rect.width
+                and current_window_rect.height == self.window_rect.height
+            ):
+                delta_x = current_window_rect.left - self.window_rect.left
+                delta_y = current_window_rect.top - self.window_rect.top
+                for target in self.all_targets:
+                    target.snapshot = shifted_snapshot(
+                        target.snapshot, delta_x, delta_y
+                    )
+                self.scope_stack = [
+                    shifted_snapshot(frame, delta_x, delta_y)
+                    for frame in self.scope_stack
+                ]
+                self.window_rect = current_window_rect
+                self.invalid_targets.clear()
+                self.events.put(
+                    (
+                        "geometry_synced",
+                        {"delta_x": delta_x, "delta_y": delta_y},
+                    )
+                )
+                self._emit_selection()
+                return
+
+            previous = (
+                self.targets[self.selected].snapshot
+                if 0 <= self.selected < len(self.targets)
+                else None
+            )
+            frames = list(self.scope_stack)
+            self._enumerate(self.hwnd)
+            self.scope_stack = frames
+            self._apply_scope(restore=previous)
+            self._reset_hierarchy_for_selected()
+            self.events.put(("geometry_rescanned", None))
+            self._emit_selection()
+
         def _enumerate(self, hwnd: int) -> None:
             (
                 self.all_targets,
@@ -876,6 +1506,7 @@ def _run_windows(args: argparse.Namespace) -> int:
                 [target.snapshot for target in self.all_targets], self.node_types
             )
             self.hwnd = hwnd
+            self.invalid_targets.clear()
 
         def _resolve_scope_path(self) -> tuple[int, ...]:
             resolved_path: tuple[int, ...] = ()
@@ -935,6 +1566,8 @@ def _run_windows(args: argparse.Namespace) -> int:
                 "selected": self.selected,
                 "count": len(snapshots),
                 "scope_depth": len(self.scope_stack),
+                "hierarchy_index": self.hierarchy_index,
+                "hierarchy_count": len(self.hierarchy),
             }
 
         def _emit_selection(self) -> None:
@@ -964,14 +1597,32 @@ def _run_windows(args: argparse.Namespace) -> int:
                 self.scope_stack.pop()
                 self._apply_scope(restore=target.snapshot)
                 return False
+            self._reset_hierarchy_for_selected()
             self._emit_selection()
             return True
 
         def _scan(self, hwnd: int) -> None:
             started = time.perf_counter()
             self.scope_stack = []
+            point = cursor_point()
             self._enumerate(hwnd)
-            self._apply_scope(focused=focused_rect(), use_cursor=True)
+            hierarchy = (
+                point_hierarchy_targets(point, self.window_rect, self.all_targets)
+                if point is not None and self.window_rect.contains_point(point)
+                else []
+            )
+            self._set_hierarchy(hierarchy)
+            self.groups = discover_group_scopes(
+                [target.snapshot for target in self.all_targets], self.node_types
+            )
+            if self.hierarchy:
+                self._apply_scope(restore=self.hierarchy[0].snapshot)
+                if self.targets and self.selected >= 0:
+                    current = self.targets[self.selected]
+                    self._set_hierarchy(self.hierarchy, current)
+            else:
+                self._apply_scope(focused=focused_rect(), use_cursor=True)
+                self._reset_hierarchy_for_selected()
             snapshots = [target.snapshot for target in self.targets]
             elapsed = time.perf_counter() - started
             self.events.put(
@@ -983,6 +1634,13 @@ def _run_windows(args: argparse.Namespace) -> int:
                         "window": self.window_name,
                         "visited": self.visited,
                         "all_count": len(self.all_targets),
+                        "hit_source": (
+                            self.hierarchy[0].snapshot.source
+                            if self.hierarchy
+                            else "geometry"
+                        ),
+                        "hierarchy_index": self.hierarchy_index,
+                        "hierarchy_count": len(self.hierarchy),
                         "elapsed": elapsed,
                     },
                 )
@@ -1002,12 +1660,22 @@ def _run_windows(args: argparse.Namespace) -> int:
             refreshed = self.targets[self.selected]
             if enter_group and self._enter_group(refreshed):
                 return
+            self._reset_hierarchy_for_selected()
             self._emit_selection()
 
         def _activate(self) -> None:
             if not self.targets or self.selected < 0:
                 return
+            self._sync_window_geometry()
             target = self.targets[self.selected]
+            if not self._target_is_exposed(target):
+                self.invalid_targets.add(self._identity_token(target.snapshot))
+                self.events.put(("target_skipped", target.snapshot))
+                self._enumerate(self.hwnd)
+                self._apply_scope(restore=target.snapshot)
+                self._reset_hierarchy_for_selected()
+                self._emit_selection()
+                return
             group_path = self._group_path_for_target(target)
             state = expand_state(target.control) if target.snapshot.supports_expand else None
             if state == 0:
@@ -1033,7 +1701,7 @@ def _run_windows(args: argparse.Namespace) -> int:
                 )
                 return
 
-            method = smart_invoke(target.control)
+            method = smart_invoke(target)
             self.events.put(
                 (
                     "activated",
@@ -1047,6 +1715,7 @@ def _run_windows(args: argparse.Namespace) -> int:
                 return
             parent_target = self.scope_stack.pop()
             self._apply_scope(restore=parent_target)
+            self._reset_hierarchy_for_selected()
             self._emit_selection()
 
         def _run(self) -> None:
@@ -1060,15 +1729,35 @@ def _run_windows(args: argparse.Namespace) -> int:
                         if command == "scan":
                             self._scan(int(value))
                         elif command == "move" and self.targets and self.selected >= 0:
+                            self._sync_window_geometry()
                             snapshots = [target.snapshot for target in self.targets]
-                            self.selected = next_target_index(
+                            for next_index in ranked_target_indices(
                                 snapshots, self.selected, Direction(value)
-                            )
-                            self._emit_selection()
+                            ):
+                                target = self.targets[next_index]
+                                token = self._identity_token(target.snapshot)
+                                if token in self.invalid_targets:
+                                    continue
+                                if not self._target_is_exposed(target):
+                                    self.invalid_targets.add(token)
+                                    self.events.put(("target_skipped", target.snapshot))
+                                    continue
+                                self.selected = next_index
+                                self._reset_hierarchy_for_selected()
+                                self._emit_selection()
+                                break
+                        elif command == "parent":
+                            self._sync_window_geometry()
+                            self._cycle_hierarchy(1)
+                        elif command == "child":
+                            self._sync_window_geometry()
+                            self._cycle_hierarchy(-1)
                         elif command == "activate" and self.targets and self.selected >= 0:
                             self._activate()
                         elif command == "back":
                             self._back()
+                        elif command == "sync_window":
+                            self._sync_window_geometry()
                     except Exception as exc:
                         self.events.put(("error", str(exc)))
             finally:
@@ -1127,10 +1816,21 @@ def _run_windows(args: argparse.Namespace) -> int:
             self.setGeometry(screen.geometry())
 
         def show_target(
-            self, target: TargetSnapshot, selected: int, count: int
+            self,
+            target: TargetSnapshot,
+            selected: int,
+            count: int,
+            hierarchy_index: int = -1,
+            hierarchy_count: int = 0,
         ) -> None:
             self._target = target
             self._position = f"{selected + 1}/{count}  {target.name or target.control_type}"
+            if hierarchy_count > 1 and hierarchy_index >= 0:
+                self._position += (
+                    f"  层级 {hierarchy_index + 1}/{hierarchy_count}"
+                )
+            if target.source == "msaa":
+                self._position += "  MSAA"
             self._position_for_target(target.rect)
             self.show()
             self.raise_()
@@ -1196,6 +1896,8 @@ def _run_windows(args: argparse.Namespace) -> int:
         VK_DOWN = 0x28
         VK_RETURN = 0x0D
         VK_ESCAPE = 0x1B
+        VK_PAGEUP = 0x21
+        VK_PAGEDOWN = 0x22
         VK_N = 0x4E
         VK_Q = 0x51
 
@@ -1295,6 +1997,8 @@ def _run_windows(args: argparse.Namespace) -> int:
                 self.VK_DOWN: "down",
                 self.VK_LEFT: "left",
                 self.VK_RIGHT: "right",
+                self.VK_PAGEUP: "parent",
+                self.VK_PAGEDOWN: "child",
                 self.VK_RETURN: "activate",
                 self.VK_ESCAPE: "cancel",
             }
@@ -1396,6 +2100,8 @@ def _run_windows(args: argparse.Namespace) -> int:
                 worker.post("back")
         elif action == "activate" and active.is_set():
             worker.post("activate")
+        elif action in {"parent", "child"} and active.is_set():
+            worker.post(action)
         elif action in {direction.value for direction in Direction} and active.is_set():
             worker.post("move", action)
 
@@ -1420,18 +2126,29 @@ def _run_windows(args: argparse.Namespace) -> int:
                 print(
                     f"已扫描 {payload['window']}: 根层 {len(targets)} 个，"
                     f"全部 {payload['all_count']} 个，"
-                    f"访问 {payload['visited']} 个节点，耗时 {payload['elapsed']:.2f}s"
+                    f"访问 {payload['visited']} 个节点，耗时 {payload['elapsed']:.2f}s，"
+                    f"命中 {payload['hit_source']} / {payload['hierarchy_count']} 层"
                 )
                 if selected < 0:
                     leave_navigation()
                     print("没有找到可导航元素。")
                 else:
                     active.set()
-                    overlay.show_target(targets[selected], selected, len(targets))
+                    overlay.show_target(
+                        targets[selected],
+                        selected,
+                        len(targets),
+                        payload["hierarchy_index"],
+                        payload["hierarchy_count"],
+                    )
             elif event == "selection":
                 active.set()
                 overlay.show_target(
-                    payload["target"], payload["selected"], payload["count"]
+                    payload["target"],
+                    payload["selected"],
+                    payload["count"],
+                    payload["hierarchy_index"],
+                    payload["hierarchy_count"],
                 )
             elif event == "expanded":
                 target = payload["target"]
@@ -1448,6 +2165,17 @@ def _run_windows(args: argparse.Namespace) -> int:
                 leave_navigation()
             elif event == "exit_requested":
                 leave_navigation()
+            elif event == "geometry_synced":
+                print(
+                    f"窗口位置已同步: {payload['delta_x']:+d}, {payload['delta_y']:+d}"
+                )
+            elif event == "geometry_rescanned":
+                print("窗口尺寸或缩放变化，已重新扫描。")
+            elif event == "target_skipped":
+                print(
+                    f"已跳过当前无法命中的元素: "
+                    f"{payload.name or payload.control_type}"
+                )
             elif event == "error":
                 scanning = False
                 leave_navigation()
@@ -1457,6 +2185,12 @@ def _run_windows(args: argparse.Namespace) -> int:
     timer.timeout.connect(drain_events)
     timer.start(20)
 
+    geometry_timer = QTimer()
+    geometry_timer.timeout.connect(
+        lambda: worker.post("sync_window") if active.is_set() else None
+    )
+    geometry_timer.start(150)
+
     def cleanup() -> None:
         hook.stop()
         worker.stop()
@@ -1464,7 +2198,8 @@ def _run_windows(args: argparse.Namespace) -> int:
     app.aboutToQuit.connect(cleanup)
     print("元素导航键盘原型已启动。")
     print(
-        "Ctrl+Alt+N 开始/退出，方向键移动，Enter 进入/执行，"
+        "Ctrl+Alt+N 开始/退出，方向键移动，PageUp/PageDown 切换父子元素，"
+        "Enter 进入/执行，"
         "Esc 返回/退出，Ctrl+Alt+Q 关闭。"
     )
     return int(app.exec())
