@@ -2,7 +2,7 @@
 
 日期：2026-08-27
 
-状态：调研完成，实施未授权
+状态：调研完成；独立键盘原型已授权实施，正式 RC003 接入未授权
 
 范围：Windows RC003 使用按钮在固定软件的按钮、输入框、列表项等可交互元素之间导航
 
@@ -440,3 +440,37 @@ Remote Mic 增加一个明确的外部工具动作，不再通过全局快捷键
 
 这样能先用现成产品回答“元素识别到底够不够”，避免在最关键事实未知时投入一套新的
 导航器。
+
+## 12. 独立键盘原型
+
+2026-08-27 已新增 `scripts/element_navigation_prototype.py`，先验证电视式方向导航本身，
+不接 RC003，也不进入 Remote Mic 正式运行时、配置、安装包或候选构建。
+
+原型采用 `uiautomation 2.0.29` 读取当前前台窗口，PySide6 绘制不抢焦点的蓝色选中框，
+低层键盘钩子只在导航期间吞掉方向键、Enter 和 Esc。它是可整块删除的实验入口，不能
+替代 Keyhop 的成熟过滤、Chromium 唤醒、缓存和动作兼容层；原型失败也不能直接证明
+Keyhop 不可用。
+
+在 `apps/windows/rc003` 下运行：
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install -r scripts\requirements-element-navigation.txt
+.\.venv\Scripts\python.exe scripts\element_navigation_prototype.py
+```
+
+键盘操作：
+
+- `Ctrl+Alt+N`：扫描当前前台窗口并进入导航；再次按下退出；
+- 方向键：移动蓝色焦点框；
+- `Enter`：执行当前元素后退出导航；
+- `Esc`：不执行元素，直接退出导航；
+- `Ctrl+Alt+Q`：关闭原型。
+
+也可只扫描当前窗口并在控制台列出元素，不安装全局键盘钩子：
+
+```powershell
+.\.venv\Scripts\python.exe scripts\element_navigation_prototype.py --scan-only
+```
+
+退出条件：目标固定软件的 UIA 覆盖率完成实测后，这个 Python 原型不继续扩成正式产品；
+正式接入仍按本文结论，优先采用 Keyhop 元素底座和本地 IPC。
