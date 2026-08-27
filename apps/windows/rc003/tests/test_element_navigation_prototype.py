@@ -105,6 +105,17 @@ class SpatialNavigationTests(unittest.TestCase):
             [1, 2],
         )
 
+    def test_right_does_not_treat_slightly_indented_sidebar_row_as_wrap(self):
+        targets = [
+            self.target(40, 100, 340, 150, "sidebar current", path=(0, 1, 0)),
+            self.target(35, 165, 335, 215, "sidebar below", path=(0, 1, 1)),
+            self.target(500, 260, 1000, 360, "main content", path=(0, 2, 0)),
+        ]
+        self.assertEqual(
+            prototype.next_target_index(targets, 0, prototype.Direction.RIGHT),
+            2,
+        )
+
     def test_prefers_nearest_target_in_a_vertical_column(self):
         targets = [
             self.target(100, 100, 160, 140, "current"),
@@ -129,6 +140,28 @@ class SpatialNavigationTests(unittest.TestCase):
         self.assertEqual(
             prototype.next_target_index(targets, 2, prototype.Direction.UP),
             0,
+        )
+
+    def test_vertical_navigation_prefers_same_content_branch_over_sidebar(self):
+        targets = [
+            self.target(400, 80, 620, 130, "main tab", path=(0, 2, 0)),
+            self.target(40, 350, 340, 400, "sidebar", path=(0, 1, 5)),
+            self.target(660, 460, 1200, 560, "main content", path=(0, 2, 3)),
+        ]
+        self.assertEqual(
+            prototype.next_target_index(targets, 0, prototype.Direction.DOWN),
+            2,
+        )
+
+    def test_vertical_navigation_reaches_near_message_action_before_next_block(self):
+        targets = [
+            self.target(500, 100, 1200, 240, "message"),
+            self.target(495, 250, 535, 290, "复制"),
+            self.target(500, 330, 1200, 430, "next message"),
+        ]
+        self.assertEqual(
+            prototype.next_target_index(targets, 0, prototype.Direction.DOWN),
+            1,
         )
 
     def test_keeps_current_target_when_no_candidate_exists(self):
@@ -305,6 +338,40 @@ class SpatialNavigationTests(unittest.TestCase):
         ]
         self.assertEqual(prototype.nested_container_keep_indices(targets), [0])
 
+    def test_keeps_message_actions_nested_inside_message_button(self):
+        targets = [
+            self.target(
+                40,
+                40,
+                640,
+                180,
+                "message",
+                path=(0, 1),
+                has_action_pattern=True,
+            ),
+            self.target(
+                50,
+                130,
+                90,
+                170,
+                "复制消息",
+                path=(0, 1, 0, 2),
+                has_action_pattern=True,
+            ),
+            self.target(
+                95,
+                130,
+                135,
+                170,
+                "从这里创建聊天分支",
+                path=(0, 1, 0, 3),
+                has_action_pattern=True,
+            ),
+        ]
+        self.assertEqual(
+            prototype.nested_container_keep_indices(targets), [0, 1, 2]
+        )
+
     def test_drops_project_list_wrapper_but_keeps_folder_and_rows(self):
         wrapper = prototype.TargetSnapshot(
             prototype.Rect(20, 20, 260, 300),
@@ -334,6 +401,40 @@ class SpatialNavigationTests(unittest.TestCase):
         self.assertTrue(prototype.is_navigation_noise("跳转到用户消息 12"))
         self.assertTrue(prototype.is_navigation_noise("Jump to user message 12"))
         self.assertFalse(prototype.is_navigation_noise("发送"))
+
+    def test_rejects_unnamed_group_even_with_automation_id(self):
+        self.assertFalse(
+            prototype.structural_action_has_identity(
+                "GroupControl", "", "radix-_r_2rhf_"
+            )
+        )
+
+    def test_trusts_named_semantic_button_when_hover_hit_is_transparent(self):
+        target = self.target(
+            100,
+            100,
+            140,
+            140,
+            "复制消息",
+            has_action_pattern=True,
+        )
+        self.assertTrue(prototype.semantic_action_can_bypass_point_hit(target))
+        self.assertFalse(
+            prototype.semantic_action_can_bypass_point_hit(
+                prototype.TargetSnapshot(
+                    prototype.Rect(100, 100, 240, 140),
+                    "",
+                    "GroupControl",
+                    automation_id="radix-_r_2rhf_",
+                    has_action_pattern=True,
+                )
+            )
+        )
+        self.assertTrue(
+            prototype.structural_action_has_identity(
+                "CustomControl", "", "canvas-action"
+            )
+        )
 
     def test_same_rectangle_prefers_deeper_real_action(self):
         wrapper = prototype.TargetSnapshot(

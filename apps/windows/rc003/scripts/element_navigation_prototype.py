@@ -50,6 +50,16 @@ WRAPPER_CONTROL_TYPES = STRUCTURAL_CONTROL_TYPES | frozenset(
     {"ListItemControl", "DataItemControl"}
 )
 NOISE_NAME_PREFIXES = ("跳转到用户消息 ", "Jump to user message ")
+PRESERVED_NESTED_ACTION_NAMES = frozenset(
+    {
+        "复制",
+        "复制消息",
+        "从这里创建聊天分支",
+        "Copy",
+        "Copy message",
+        "Branch in new chat",
+    }
+)
 CHROMIUM_RENDERER_CLASS = "Chrome_RenderWidgetHostHWND"
 CHROMIUM_MIN_SCAN_DEPTH = 32
 LIST_CONTAINER_TYPES = frozenset(
@@ -227,9 +237,9 @@ def direction_score(
     beam_rank = 0 if overlap > 0 else 1
     return (
         beam_rank,
-        score,
         float(primary_gap),
         float(perpendicular_gap),
+        score,
         center_offset,
         candidate.top,
         candidate.left,
@@ -272,10 +282,14 @@ def horizontal_wrap_target_indices(
         minimum_row_delta = max(
             12.0, min(current.rect.height, candidate.rect.height) * 0.60
         )
+        minimum_horizontal_reset = max(
+            24.0, min(current.rect.width, candidate.rect.width) * 0.35
+        )
         if direction == Direction.RIGHT:
             if (
                 vertical_delta < minimum_row_delta
-                or candidate.rect.center_x >= current.rect.center_x
+                or current.rect.center_x - candidate.rect.center_x
+                < minimum_horizontal_reset
             ):
                 continue
             row_gap = max(0, candidate.rect.top - current.rect.bottom)
@@ -283,7 +297,8 @@ def horizontal_wrap_target_indices(
         else:
             if (
                 vertical_delta > -minimum_row_delta
-                or candidate.rect.center_x <= current.rect.center_x
+                or candidate.rect.center_x - current.rect.center_x
+                < minimum_horizontal_reset
             ):
                 continue
             row_gap = max(0, current.rect.top - candidate.rect.bottom)
@@ -312,22 +327,27 @@ def ranked_target_indices(
     if not targets or not 0 <= current_index < len(targets):
         return []
     current = targets[current_index].rect
-    scored = []
+    scored: list[
+        tuple[tuple[int, float, float, float, float, int, int], int, int]
+    ] = []
     for index, target in enumerate(targets):
         if index == current_index:
             continue
         score = direction_score(current, target.rect, direction)
         if score is not None:
-            scored.append((score, index))
-    scored.sort(key=lambda item: item[0])
+            common_prefix = _common_path_prefix_length(
+                targets[current_index].path, target.path
+            )
+            scored.append((score, common_prefix, index))
+    scored.sort(key=lambda item: (item[0][0], -item[1], *item[0][1:]))
     if direction not in {Direction.RIGHT, Direction.LEFT}:
-        return [index for _score, index in scored]
+        return [index for _score, _prefix, index in scored]
 
     # Horizontal navigation behaves like a reading-order grid: finish the
     # current row, wrap to the adjacent row inside the same content branch,
     # then consider diagonal targets in the requested half-plane.
-    in_row = [index for score, index in scored if score[0] == 0]
-    diagonal = [index for score, index in scored if score[0] != 0]
+    in_row = [index for score, _prefix, index in scored if score[0] == 0]
+    diagonal = [index for score, _prefix, index in scored if score[0] != 0]
     wrapped = horizontal_wrap_target_indices(targets, current_index, direction)
     ranked = list(in_row)
     ranked.extend(index for index in wrapped if index not in ranked)
@@ -504,6 +524,7 @@ def nested_container_keep_indices(targets: Sequence[TargetSnapshot]) -> list[int
 
         nested_under_primary_action = any(
             other_index != index
+            and target.name not in PRESERVED_NESTED_ACTION_NAMES
             and other.path
             and len(other.path) < len(target.path)
             and target.path[: len(other.path)] == other.path
@@ -651,6 +672,22 @@ def restore_target_index(
 
 def is_navigation_noise(name: str) -> bool:
     return any(name.startswith(prefix) for prefix in NOISE_NAME_PREFIXES)
+
+
+def structural_action_has_identity(
+    control_type: str, name: str, automation_id: str
+) -> bool:
+    if control_type in {"GroupControl", "PaneControl"}:
+        return bool(name)
+    return bool(name or automation_id)
+
+
+def semantic_action_can_bypass_point_hit(target: TargetSnapshot) -> bool:
+    return bool(
+        target.name
+        and target.has_action_pattern
+        and target.control_type in PRIMARY_ACTION_CONTROL_TYPES
+    )
 
 
 def effective_scan_depth(configured_depth: int, has_chromium_renderer: bool) -> int:
@@ -854,7 +891,9 @@ def _run_windows(args: argparse.Namespace) -> int:
                 standard and (keyboard_focusable or action_pattern)
             ) or (
                 structural
-                and bool(name or automation_id)
+                and structural_action_has_identity(
+                    control_type, name, automation_id
+                )
                 and (keyboard_focusable or direct_action_pattern)
             )
             if not (
@@ -1441,7 +1480,7 @@ def _run_windows(args: argparse.Namespace) -> int:
                         control = control.GetParentControl()
             except Exception:
                 return False
-            return False
+            return semantic_action_can_bypass_point_hit(target.snapshot)
 
         def _sync_window_geometry(self) -> None:
             if not self.hwnd or not self.targets:
