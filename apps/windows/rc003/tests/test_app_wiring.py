@@ -1150,6 +1150,63 @@ class OrdinaryButtonGestureWiringTests(_AppWiringTestCase):
 
         self.app._on_button_event("up", False)
 
+    def test_remote_button_combo_consumes_both_single_actions(self):
+        self.app._bindings["bindings"]["tv"] = {
+            "kind": "escape",
+            "keys": [],
+        }
+        self.app._bindings["bindings"]["up"] = {
+            "kind": "arrow_up",
+            "keys": [],
+        }
+        self.app._bindings["combo_bindings"] = {
+            "modifier": "tv",
+            "bindings": {"up": {"kind": "return", "keys": []}},
+            "display_notes": {},
+        }
+
+        with mock.patch.object(win32_input, "send_escape") as tv_action, mock.patch.object(
+            win32_input, "send_arrow_up"
+        ) as up_action, mock.patch.object(win32_input, "send_return") as combo_action:
+            self.app._on_button_event("tv", True)
+            self.app._on_button_event("up", True)
+            self.app._on_button_event("up", False)
+            self.app._on_button_event("tv", False)
+
+        combo_action.assert_called_once_with()
+        tv_action.assert_not_called()
+        up_action.assert_not_called()
+
+    def test_unused_remote_combo_modifier_keeps_its_single_click(self):
+        self.app._bindings["bindings"]["tv"] = {
+            "kind": "escape",
+            "keys": [],
+        }
+        self.app._bindings["combo_bindings"] = {
+            "modifier": "tv",
+            "bindings": {"up": {"kind": "return", "keys": []}},
+            "display_notes": {},
+        }
+
+        with mock.patch.object(win32_input, "send_escape") as tv_action:
+            self.app._on_button_event("tv", True)
+            self.app._on_button_event("tv", False)
+
+        tv_action.assert_called_once_with()
+
+    def test_quicker_uri_action_uses_the_protocol_executor(self):
+        action = key_mapping.ButtonAction(
+            key_mapping.ActionKind.QUICKER_URI,
+            uri="quicker:runaction:pin-window",
+        )
+
+        with mock.patch.object(
+            app_module.action_executor, "open_quicker_uri"
+        ) as launcher:
+            self.app._apply_button_action(action)
+
+        launcher.assert_called_once_with(action)
+
     def test_raw_keyboard_edge_is_armed_for_low_level_duplicate_suppression(self):
         armed = []
 

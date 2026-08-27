@@ -38,6 +38,7 @@ from typing import Dict, Optional, Tuple
 class ActionKind(str, Enum):
     DISABLED = "disabled"
     KEY_COMBO = "key_combo"
+    QUICKER_URI = "quicker_uri"
     ESCAPE = "escape"
     RETURN = "return"
     ARROW_UP = "arrow_up"
@@ -211,6 +212,46 @@ REPEATABLE_ACTIONS = frozenset(
 )
 
 
+QUICKER_URI_PREFIX = "quicker:runaction:"
+MAX_QUICKER_URI_LENGTH = 2048
+
+# The first combination implementation deliberately behaves like one Fn
+# layer.  Only a non-repeating utility key may be the modifier, while the
+# second key stays in the ordinary navigation cluster.  This avoids exposing
+# the microphone lifecycle, power behavior, or the Home+Menu pairing chord.
+COMBO_MODIFIER_BUTTON_IDS = ("tv", "menu", "home")
+COMBO_ACTION_BUTTON_IDS = (
+    "up",
+    "down",
+    "left",
+    "right",
+    "ok",
+    "back",
+    "volume_up",
+    "volume_down",
+)
+
+
+def normalize_quicker_uri(uri: str) -> str:
+    """Validate the narrow Quicker action URI accepted by button mappings."""
+
+    if not isinstance(uri, str):
+        raise TypeError("Quicker URI must be text")
+    normalized = uri.strip()
+    if not normalized:
+        raise ValueError("Quicker URI must not be empty")
+    if len(normalized) > MAX_QUICKER_URI_LENGTH:
+        raise ValueError("Quicker URI is too long")
+    if any(character in normalized for character in ("\x00", "\r", "\n")):
+        raise ValueError("Quicker URI must stay on one line")
+    if not normalized.casefold().startswith(QUICKER_URI_PREFIX):
+        raise ValueError("only quicker:runaction: URIs are supported")
+    action_identifier = normalized[len(QUICKER_URI_PREFIX) :].partition("?")[0]
+    if not action_identifier.strip():
+        raise ValueError("Quicker URI must contain an action identifier")
+    return QUICKER_URI_PREFIX + normalized[len(QUICKER_URI_PREFIX) :]
+
+
 def semantic_action_for_keys(keys: Tuple[str, ...]) -> Optional["ButtonAction"]:
     """Return the semantic action represented by one legacy key tuple."""
 
@@ -274,9 +315,13 @@ def voice_hotkey_for_trigger_mode(trigger_mode: VoiceTriggerMode) -> str:
 class ButtonAction:
     kind: ActionKind
     keys: Tuple[str, ...] = field(default_factory=tuple)
+    uri: str = ""
 
     def to_dict(self) -> dict:
-        return {"kind": self.kind.value, "keys": list(self.keys)}
+        data = {"kind": self.kind.value, "keys": list(self.keys)}
+        if self.kind == ActionKind.QUICKER_URI:
+            data["uri"] = normalize_quicker_uri(self.uri)
+        return data
 
     @classmethod
     def from_dict(cls, data: dict) -> "ButtonAction":
@@ -289,11 +334,19 @@ class ButtonAction:
         ):
             raise ValueError("button action keys must be non-empty strings")
         keys = tuple(key.strip().lower() for key in raw_keys)
+        raw_uri = data.get("uri", "")
+        if not isinstance(raw_uri, str):
+            raise ValueError("button action URI must be text")
+        uri = raw_uri.strip()
         if kind == ActionKind.KEY_COMBO and not keys:
             raise ValueError("key_combo action must contain at least one key")
         if kind != ActionKind.KEY_COMBO and keys:
             raise ValueError("non-key action must not contain keys")
-        return cls(kind=kind, keys=keys)
+        if kind == ActionKind.QUICKER_URI:
+            uri = normalize_quicker_uri(uri)
+        elif uri:
+            raise ValueError("non-URI action must not contain a URI")
+        return cls(kind=kind, keys=keys, uri=uri)
 
 
 def button_action_for(
@@ -333,6 +386,47 @@ def has_secondary_action(bindings: Dict[str, object], button_id: str) -> bool:
         button_action_for(bindings, button_id, trigger).kind != ActionKind.DISABLED
         for trigger in (ButtonTrigger.DOUBLE_CLICK, ButtonTrigger.LONG_PRESS)
     )
+
+
+def button_combo_modifier(bindings: Dict[str, object]) -> Optional[str]:
+    raw = bindings.get("combo_bindings", {})
+    if not isinstance(raw, dict):
+        return None
+    modifier = raw.get("modifier")
+    if modifier not in COMBO_MODIFIER_BUTTON_IDS:
+        return None
+    actions = raw.get("bindings", {})
+    if not isinstance(actions, dict):
+        return None
+    if not any(
+        button_combo_action_for(bindings, button_id).kind != ActionKind.DISABLED
+        for button_id in COMBO_ACTION_BUTTON_IDS
+    ):
+        return None
+    return str(modifier)
+
+
+def button_combo_action_for(
+    bindings: Dict[str, object], button_id: str
+) -> ButtonAction:
+    if button_id not in COMBO_ACTION_BUTTON_IDS:
+        return ButtonAction(ActionKind.DISABLED)
+    raw_combo = bindings.get("combo_bindings", {})
+    if not isinstance(raw_combo, dict):
+        return ButtonAction(ActionKind.DISABLED)
+    raw_actions = raw_combo.get("bindings", {})
+    if not isinstance(raw_actions, dict):
+        return ButtonAction(ActionKind.DISABLED)
+    raw_action = raw_actions.get(button_id)
+    if not isinstance(raw_action, dict):
+        return ButtonAction(ActionKind.DISABLED)
+    try:
+        action = ButtonAction.from_dict(raw_action)
+    except (KeyError, TypeError, ValueError):
+        return ButtonAction(ActionKind.DISABLED)
+    if is_voice_action(action):
+        return ButtonAction(ActionKind.DISABLED)
+    return action
 
 
 # Buttons that have a defined default action out of the box. "volume_mute" is

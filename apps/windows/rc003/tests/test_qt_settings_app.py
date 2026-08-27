@@ -642,6 +642,32 @@ class SettingsControllerTests(unittest.TestCase):
             controller.secondaryActionOptions,
         )
 
+    def test_combo_rows_cover_the_supported_second_keys(self):
+        controller, _ = self._make_controller()
+        self.assertEqual(controller.comboModifierOptions, ["TV", "菜单", "主页"])
+        self.assertEqual(controller.comboModifierIndex, 0)
+        self.assertEqual(
+            [row["buttonId"] for row in controller.comboRows],
+            list(key_mapping.COMBO_ACTION_BUTTON_IDS),
+        )
+
+    def test_combo_edits_persist_with_the_mapping_save(self):
+        controller, _ = self._make_controller()
+        controller.comboModifierIndex = 1
+        controller.setComboActionText("up", "quicker:runaction:pin-window")
+        controller.setComboNoteText("up", "置顶窗口")
+
+        self.assertTrue(controller.settingsDirty)
+        self.assertTrue(controller.saveSettings())
+
+        saved = config.load_key_bindings(config.key_bindings_path(config.config_root()))
+        self.assertEqual(saved["combo_bindings"]["modifier"], "menu")
+        self.assertEqual(
+            saved["combo_bindings"]["bindings"]["up"]["uri"],
+            "quicker:runaction:pin-window",
+        )
+        self.assertEqual(saved["combo_bindings"]["display_notes"], {"up": "置顶窗口"})
+
     def test_recording_a_hotkey_does_not_change_trigger_semantics(self):
         controller, _ = self._make_controller()
         controller._on_hotkey_capture_result("lctrl+lwin")
@@ -1378,8 +1404,12 @@ class SettingsControllerTests(unittest.TestCase):
         controller, model = self._make_controller()
         controller.holdVoiceHotkeyText = "ctrl+l"
         model.setActionTextAt(model.index_of("mic"), "Escape")
+        controller.comboModifierIndex = 2
+        controller.setComboActionText("up", "Escape")
         controller.restoreDefaults()
         self.assertEqual(controller.holdVoiceHotkeyText, "ralt")
+        self.assertEqual(controller.comboModifierIndex, 0)
+        self.assertTrue(all(not row["actionText"] for row in controller.comboRows))
         mic_index = model.index(model.index_of("mic"), 0)
         self.assertEqual(
             model.data(mic_index, model.ActionTextRole),
@@ -1403,6 +1433,8 @@ class SettingsControllerTests(unittest.TestCase):
         power_index = model.index(power_row, 0)
         self.assertNotEqual(model.data(power_index, model.ActionTextRole), "f5")
         self.assertEqual(model.data(power_index, model.SingleNoteRole), "")
+        self.assertEqual(controller.comboModifierIndex, 0)
+        self.assertTrue(all(not row["actionText"] for row in controller.comboRows))
 
     def test_select_button_updates_both_the_controller_and_the_model(self):
         controller, model = self._make_controller()
@@ -3971,7 +4003,11 @@ class SettingsShellSourceContractTests(unittest.TestCase):
         self.assertIn("recommendedIndex >= 0 && index >= 0", self.selection_combo_qml)
         self.assertIn('qsTr("（推荐）")', self.selection_combo_qml)
         self.assertIn("displayText: decoratedText(currentIndex, currentText)", self.selection_combo_qml)
-        self.assertEqual(self.buttons_qml.count("SelectionComboBox {"), 0)
+        self.assertEqual(self.buttons_qml.count("SelectionComboBox {"), 1)
+        self.assertIn(
+            "model: SettingsController.comboModifierOptions",
+            self.buttons_qml,
+        )
         self.assertIn(
             "model: SettingsController.voiceProgramOptions",
             self.voice_qml,
@@ -4159,6 +4195,21 @@ class SettingsShellSourceContractTests(unittest.TestCase):
         self.assertIn("SettingsController.restoreMappingDefaults()", self.buttons_qml)
         self.assertIn('qsTr("检测真实按键")', self.buttons_qml)
         self.assertIn('text: qsTr("保存映射")', self.buttons_qml)
+
+    def test_buttons_page_switches_views_above_content_and_keeps_actions_below(self):
+        switch_index = self.buttons_qml.index('objectName: "mappingViewSwitcher"')
+        single_index = self.buttons_qml.index('objectName: "mappingList"')
+        combo_index = self.buttons_qml.index('objectName: "comboMappingList"')
+        actions_index = self.buttons_qml.index('objectName: "mappingActionsPanel"')
+
+        self.assertLess(switch_index, single_index)
+        self.assertLess(switch_index, combo_index)
+        self.assertLess(single_index, actions_index)
+        self.assertLess(combo_index, actions_index)
+        self.assertIn('text: qsTr("单键与手势")', self.buttons_qml)
+        self.assertIn('text: qsTr("遥控器组合")', self.buttons_qml)
+        self.assertIn("model: SettingsController.comboRows", self.buttons_qml)
+        self.assertIn('objectName: "comboActionEditor_" + buttonId', self.buttons_qml)
 
     def test_voice_hotkey_field_is_owned_by_the_voice_page(self):
         self.assertIn('placeholderText: qsTr("点击录入")', self.voice_qml)
@@ -5132,10 +5183,56 @@ after_save = _mapping_snapshot(
 )
 
 assert controller.errorMessage == "", f"save reported a validation error: {controller.errorMessage}"
+
+# Switch to the remote-combination view and exercise its real editable field
+# through the same direct-save path. This catches a QML-only regression where
+# the visible text changes but SettingsController never receives it.
+combo_view_button = _find_child_by_object_name(window, "comboMappingViewButton")
+assert combo_view_button is not None
+combo_view_center = combo_view_button.mapToScene(
+    QPointF(
+        combo_view_button.property("width") / 2,
+        combo_view_button.property("height") / 2,
+    )
+).toPoint()
+QTest.mouseClick(window, Qt.LeftButton, Qt.NoModifier, combo_view_center)
+for _ in range(5):
+    window.grabWindow()
+    app.processEvents()
+
+combo_editor = _find_child_by_object_name(window, "comboActionEditor_up")
+assert combo_editor is not None and combo_editor.property("visible")
+combo_editor_center = combo_editor.mapToScene(
+    QPointF(
+        combo_editor.property("width") / 2,
+        combo_editor.property("height") / 2,
+    )
+).toPoint()
+QTest.mouseClick(window, Qt.LeftButton, Qt.NoModifier, combo_editor_center)
+app.processEvents()
+assert combo_editor.property("activeFocus")
+QTest.keySequence(window, QKeySequence.SelectAll)
+app.processEvents()
+combo_typed = "ctrl+alt+p"
+for ch in combo_typed:
+    QTest.keyClick(window, Qt.Key_Plus if ch == "+" else ord(ch))
+    app.processEvents()
+assert combo_editor.property("editText") == combo_typed
+
+save_center = save_button.mapToScene(
+    QPointF(save_button.property("width") / 2, save_button.property("height") / 2)
+).toPoint()
+QTest.mouseClick(window, Qt.LeftButton, Qt.NoModifier, save_center)
+for _ in range(3):
+    window.grabWindow()
+    app.processEvents()
+assert controller.errorMessage == "", f"combo save reported a validation error: {controller.errorMessage}"
+
 print(json.dumps({
     "before": before_save,
     "after": after_save,
     "current_option": current_option_state,
+    "combo_typed": combo_typed,
 }))
 """
 
@@ -5183,6 +5280,12 @@ class ButtonsPageDirectSaveIntegrationTests(unittest.TestCase):
             action = key_mapping.ButtonAction.from_dict(bindings["bindings"]["mic"])
             self.assertEqual(action.kind, key_mapping.ActionKind.KEY_COMBO)
             self.assertEqual(action.keys, ("ctrl", "shift", "p"))
+            combo_action = key_mapping.ButtonAction.from_dict(
+                bindings["combo_bindings"]["bindings"]["up"]
+            )
+            self.assertEqual(combo_action.kind, key_mapping.ActionKind.KEY_COMBO)
+            self.assertEqual(combo_action.keys, ("ctrl", "alt", "p"))
+            self.assertEqual(visual["combo_typed"], "ctrl+alt+p")
 
 
 def _contrast_ratio(luminance_a, luminance_b):
@@ -5459,6 +5562,8 @@ _render(window, app)
 
 mapping_list = _find(window, "mappingList")
 actions_panel = _find(window, "mappingActionsPanel")
+single_view_button = _find(window, "singleMappingViewButton")
+combo_view_button = _find(window, "comboMappingViewButton")
 mapping_lines = _find(window, "mappingLines")
 active_mapping_line = _find(window, "activeMappingLine")
 left_cards = _find(window, "leftMappingCards")
@@ -5468,12 +5573,46 @@ photo_frame = _find(window, "photoFrame")
 photo_image = _find(window, "photoImage")
 assert mapping_list is not None, "mappingList not found"
 assert actions_panel is not None
+assert single_view_button is not None and combo_view_button is not None
 assert mapping_lines is not None and active_mapping_line is not None
 assert left_cards is not None and right_cards is not None
 assert photo_sidebar is not None, "photoSidebar not found"
 assert photo_frame is not None and photo_frame.property("visible"), "photoFrame not visible"
 assert photo_image is not None and photo_image.property("visible"), "photoImage not visible"
 assert mapping_list.property("count") == 13
+
+combo_click = combo_view_button.mapToScene(QPointF(
+    combo_view_button.property("width") / 2.0,
+    combo_view_button.property("height") / 2.0,
+)).toPoint()
+QTest.mouseClick(window, Qt.LeftButton, Qt.NoModifier, combo_click)
+_render(window, app, 5)
+combo_mapping_list = _find(window, "comboMappingList")
+combo_modifier = _find(window, "comboModifierCombo")
+combo_rows = {
+    button_id: _find(window, "comboMappingRow_" + button_id)
+    for button_id in ("up", "down", "left", "right", "ok", "back", "volume_up", "volume_down")
+}
+combo_editors = {
+    button_id: _find(window, "comboActionEditor_" + button_id)
+    for button_id in combo_rows
+}
+assert combo_mapping_list is not None and combo_mapping_list.property("visible")
+assert combo_modifier is not None and combo_modifier.property("visible")
+assert all(item is not None and item.property("visible") for item in combo_rows.values())
+assert all(item is not None and item.property("visible") for item in combo_editors.values())
+combo_screenshot = os.environ.get("RC003_COMBO_MAPPING_SCREENSHOT")
+if combo_screenshot:
+    _render(window, app, 2)
+    assert window.grabWindow().save(combo_screenshot)
+
+single_click = single_view_button.mapToScene(QPointF(
+    single_view_button.property("width") / 2.0,
+    single_view_button.property("height") / 2.0,
+)).toPoint()
+QTest.mouseClick(window, Qt.LeftButton, Qt.NoModifier, single_click)
+_render(window, app, 5)
+assert mapping_list.property("visible")
 
 for _ in range(100):
     if photo_image.property("paintedWidth") > 0 and photo_image.property("paintedHeight") > 0:
@@ -5556,6 +5695,18 @@ results_out = {
     "editor_visible": bool(editor.property("visible")),
     "actions_panel": _geometry(actions_panel),
     "mapping_list": _geometry(mapping_list),
+    "combo_view": {
+        "list": _geometry(combo_mapping_list),
+        "modifier": _geometry(combo_modifier),
+        "rows": {
+            button_id: _geometry(item)
+            for button_id, item in combo_rows.items()
+        },
+        "editors": {
+            button_id: _geometry(item)
+            for button_id, item in combo_editors.items()
+        },
+    },
     "canvases": {
         "base": _geometry(mapping_lines),
         "active": _geometry(active_mapping_line),
@@ -5731,7 +5882,8 @@ class ButtonsPageMappingCardTests(unittest.TestCase):
             self.assertAlmostEqual(data["photo"]["sidebar"]["width"], 86, delta=0.5)
             self.assertLessEqual(data["mapping_list"]["right"], width + 1)
             self.assertLessEqual(data["actions_panel"]["right"], width + 1)
-            self.assertLessEqual(data["actions_panel"]["bottom"], data["mapping_list"]["y"] + 1)
+            self.assertLessEqual(data["mapping_list"]["bottom"], data["actions_panel"]["y"] + 1)
+            self.assertLessEqual(data["combo_view"]["list"]["bottom"], data["actions_panel"]["y"] + 1)
             self.assertLess(data["left_cards"]["x"], data["photo"]["sidebar"]["x"])
             self.assertLess(data["photo"]["sidebar"]["x"], data["right_cards"]["x"])
             for card in data["cards"].values():
@@ -5739,6 +5891,19 @@ class ButtonsPageMappingCardTests(unittest.TestCase):
                 self.assertLessEqual(card["height"], 56)
                 self.assertLessEqual(card["right"], width + 1)
                 self.assertLessEqual(card["bottom"], height + 1)
+            previous_bottom = None
+            for button_id in key_mapping.COMBO_ACTION_BUTTON_IDS:
+                row = data["combo_view"]["rows"][button_id]
+                editor = data["combo_view"]["editors"][button_id]
+                self.assertLessEqual(row["right"], width + 1)
+                self.assertLessEqual(row["bottom"], height + 1)
+                self.assertLessEqual(
+                    row["bottom"], data["combo_view"]["list"]["bottom"] + 1
+                )
+                self.assertGreater(editor["width"], 120)
+                if previous_bottom is not None:
+                    self.assertLessEqual(previous_bottom, row["y"] + 1)
+                previous_bottom = row["bottom"]
 
     def test_power_card_gesture_cells_are_equal_and_aligned(self):
         for style, width, height in (("Basic", 720, 500), ("Basic", 640, 480), ("FluentWinUI3", 720, 500)):

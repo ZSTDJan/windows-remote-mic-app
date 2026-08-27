@@ -542,6 +542,48 @@ class BuildSaveModelTests(unittest.TestCase):
         )
         self.assertEqual(new_bindings["secondary_bindings"], {})
 
+    def test_combo_actions_and_notes_are_saved_under_one_modifier(self):
+        _, new_bindings = build_save_model(
+            button_display_map={"power": "escape"},
+            secondary_display_map={},
+            combo_modifier="menu",
+            combo_display_map={
+                "up": "quicker:runaction:pin-window?mode=toggle",
+                "ok": "ctrl+enter",
+            },
+            combo_note_map={"up": "  置顶窗口  ", "ok": "提交"},
+            hotkey_text="ralt",
+            trigger_mode=key_mapping.VoiceTriggerMode.HOLD,
+            endpoint_display_text="",
+            base_config=self.base_config,
+            base_bindings=self.base_bindings,
+        )
+
+        combo = new_bindings["combo_bindings"]
+        self.assertEqual(combo["modifier"], "menu")
+        self.assertEqual(combo["bindings"]["up"]["kind"], "quicker_uri")
+        self.assertEqual(combo["bindings"]["ok"]["keys"], ["ctrl", "enter"])
+        self.assertEqual(combo["display_notes"], {"up": "置顶窗口", "ok": "提交"})
+
+    def test_combo_modifier_cannot_keep_double_or_long_press(self):
+        with self.assertRaises(SettingsValidationError) as ctx:
+            build_save_model(
+                button_display_map={"tv": "escape"},
+                secondary_display_map={
+                    "tv": {"double_click": "Return", "long_press": ""}
+                },
+                combo_modifier="tv",
+                combo_display_map={"up": "escape"},
+                hotkey_text="ralt",
+                trigger_mode=key_mapping.VoiceTriggerMode.HOLD,
+                endpoint_display_text="",
+                base_config=self.base_config,
+                base_bindings=self.base_bindings,
+            )
+
+        self.assertEqual(ctx.exception.button_id, "tv")
+        self.assertIn("组合主键", ctx.exception.message)
+
     def test_display_notes_are_trimmed_and_kept_separate_from_actions(self):
         _, new_bindings = build_save_model(
             button_display_map={"power": "ctrl+c"},

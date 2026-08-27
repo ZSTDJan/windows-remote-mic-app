@@ -22,6 +22,7 @@ from . import key_mapping
 
 Command = Tuple[str, ...]
 Launcher = Callable[[Sequence[str]], object]
+UriLauncher = Callable[[str], object]
 
 
 # These are executable names rather than guessed window titles.  We resolve
@@ -196,6 +197,29 @@ def open_configured_application(
     starter = launcher or _launch_command
     starter(command)
     return True
+
+
+def open_quicker_uri(
+    action: key_mapping.ButtonAction,
+    *,
+    launcher: Optional[UriLauncher] = None,
+) -> bool:
+    """Open one validated Quicker action URI through the Windows handler."""
+
+    if action.kind != key_mapping.ActionKind.QUICKER_URI:
+        return False
+    uri = key_mapping.normalize_quicker_uri(action.uri)
+    starter = launcher or _launch_uri
+    starter(uri)
+    return True
+
+
+def _launch_uri(uri: str) -> None:
+    if sys.platform != "win32" or not hasattr(os, "startfile"):
+        raise OSError("Windows URI protocol launch is unavailable")
+    # Passing the URI directly to ShellExecute avoids cmd.exe/PowerShell and
+    # therefore does not reinterpret action parameters as shell syntax.
+    os.startfile(uri)  # type: ignore[attr-defined]
 
 
 def _launch_command(command: Sequence[str]) -> None:

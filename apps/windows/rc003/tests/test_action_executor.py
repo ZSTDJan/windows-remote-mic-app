@@ -92,6 +92,31 @@ class SemanticApplicationActionTests(unittest.TestCase):
         ):
             self.assertFalse(action_executor.open_configured_application(action))
 
+    def test_quicker_uri_is_opened_directly_without_a_shell_command(self):
+        action = key_mapping.ButtonAction(
+            key_mapping.ActionKind.QUICKER_URI,
+            uri="quicker:runaction:test-action?hello",
+        )
+        calls = []
+
+        self.assertTrue(
+            action_executor.open_quicker_uri(
+                action,
+                launcher=lambda uri: calls.append(uri),
+            )
+        )
+        self.assertEqual(calls, ["quicker:runaction:test-action?hello"])
+
+    def test_non_quicker_action_is_not_sent_to_the_uri_launcher(self):
+        calls = []
+        self.assertFalse(
+            action_executor.open_quicker_uri(
+                key_mapping.ButtonAction(key_mapping.ActionKind.ESCAPE),
+                launcher=lambda uri: calls.append(uri),
+            )
+        )
+        self.assertEqual(calls, [])
+
 
 if __name__ == "__main__":
     unittest.main()

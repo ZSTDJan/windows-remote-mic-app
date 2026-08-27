@@ -145,6 +145,8 @@ def _action_to_display(action: key_mapping.ButtonAction) -> str:
         return _REMOVED_VOICE_DISPLAY
     if action.kind == key_mapping.ActionKind.VOICE_HOLD:
         return _VOICE_HOLD_DISPLAY
+    if action.kind == key_mapping.ActionKind.QUICKER_URI:
+        return action.uri
     reference_label = _REFERENCE_ACTION_LABELS.get(action.kind)
     if reference_label is not None:
         return reference_label
@@ -173,6 +175,17 @@ def _display_to_action(text: str) -> key_mapping.ButtonAction:
     # reference label into the Windows field.
     if text == "Command-Tab":
         return key_mapping.ButtonAction(key_mapping.ActionKind.APP_SWITCHER)
+    if text.casefold().startswith("quicker:"):
+        try:
+            uri = key_mapping.normalize_quicker_uri(text)
+        except (TypeError, ValueError) as exc:
+            raise hotkey.HotkeyParseError(
+                "Quicker URI 必须使用 quicker:runaction:动作ID或名称，可在末尾附加 ?参数。"
+            ) from exc
+        return key_mapping.ButtonAction(
+            key_mapping.ActionKind.QUICKER_URI,
+            uri=uri,
+        )
     parsed = hotkey.HotkeySpec.parse(text)
     try:
         win32_keys.resolve_vk_codes(tuple(parsed.modifiers) + (parsed.key,))
@@ -213,6 +226,9 @@ def build_save_model(
     base_bindings: dict,
     selected_device_profile: str = device_catalog.RC003_ID,
     voice_hotkeys: Optional[Dict[str, str]] = None,
+    combo_modifier: Optional[str] = None,
+    combo_display_map: Optional[Dict[str, str]] = None,
+    combo_note_map: Optional[Dict[str, str]] = None,
 ) -> Tuple[dict, dict]:
     """Pure validation+build step for "Save"/"Restore defaults", with no Tk
     dependency at all - directly unit tested without constructing any
@@ -373,6 +389,71 @@ def build_save_model(
                         trigger_name
                     ] = clean_note
 
+    if combo_display_map is None:
+        raw_combo = base_bindings.get("combo_bindings", {})
+        combo_bindings = copy.deepcopy(raw_combo) if isinstance(raw_combo, dict) else {}
+    else:
+        selected_modifier = str(combo_modifier or "").strip()
+        combo_actions: Dict[str, dict] = {}
+        for button_id in key_mapping.COMBO_ACTION_BUTTON_IDS:
+            text = str(combo_display_map.get(button_id, "")).strip()
+            if not text or text in (
+                "禁用",
+                "disabled",
+                SECONDARY_UNCONFIGURED_DISPLAY,
+            ):
+                continue
+            try:
+                action = _display_to_action(text)
+            except hotkey.HotkeyParseError as exc:
+                raise SettingsValidationError(button_id, str(exc)) from exc
+            if action.kind == key_mapping.ActionKind.DISABLED:
+                continue
+            if key_mapping.is_voice_action(action):
+                raise SettingsValidationError(
+                    button_id,
+                    "遥控器组合只能执行普通动作、电脑快捷键或 Quicker URI。",
+                )
+            combo_actions[button_id] = action.to_dict()
+
+        if combo_actions and selected_modifier not in key_mapping.COMBO_MODIFIER_BUTTON_IDS:
+            raise SettingsValidationError(
+                None,
+                "请为遥控器组合选择 TV、菜单或主页作为组合主键。",
+            )
+        modifier_secondary = (
+            secondary_bindings.get(selected_modifier, {})
+            if isinstance(secondary_bindings, dict)
+            else {}
+        )
+        if combo_actions and isinstance(modifier_secondary, dict) and any(
+            modifier_secondary.get(trigger)
+            for trigger in (
+                key_mapping.ButtonTrigger.DOUBLE_CLICK.value,
+                key_mapping.ButtonTrigger.LONG_PRESS.value,
+            )
+        ):
+            raise SettingsValidationError(
+                selected_modifier,
+                "组合主键不能同时设置双击或长按动作；请先清除这两个动作。",
+            )
+
+        combo_notes = {
+            button_id: str((combo_note_map or {}).get(button_id, "")).strip()
+            for button_id in combo_actions
+            if str((combo_note_map or {}).get(button_id, "")).strip()
+            and str((combo_note_map or {}).get(button_id, "")).strip() != "未命名"
+        }
+        combo_bindings = {
+            "modifier": (
+                selected_modifier
+                if selected_modifier in key_mapping.COMBO_MODIFIER_BUTTON_IDS
+                else key_mapping.COMBO_MODIFIER_BUTTON_IDS[0]
+            ),
+            "bindings": combo_actions,
+            "display_notes": combo_notes,
+        }
+
     endpoint_name, endpoint_host_api = _parse_endpoint_display(endpoint_display_text)
 
     new_config = dict(base_config)
@@ -390,6 +471,7 @@ def build_save_model(
     new_bindings["bindings"] = bindings
     new_bindings["secondary_bindings"] = secondary_bindings
     new_bindings["display_notes"] = display_notes
+    new_bindings["combo_bindings"] = combo_bindings
 
     return new_config, new_bindings
 

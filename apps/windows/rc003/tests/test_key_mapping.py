@@ -127,6 +127,35 @@ class ButtonActionSerializationTests(unittest.TestCase):
                 key_mapping.ButtonAction.from_dict(action.to_dict()), action
             )
 
+    def test_quicker_uri_round_trips_as_a_first_class_action(self):
+        action = key_mapping.ButtonAction(
+            key_mapping.ActionKind.QUICKER_URI,
+            uri="quicker:runaction:25d718df-0f37-43ae-9fac-58fca1888113?hello",
+        )
+        self.assertEqual(
+            key_mapping.ButtonAction.from_dict(action.to_dict()), action
+        )
+
+    def test_quicker_uri_rejects_other_protocol_operations(self):
+        with self.assertRaises(ValueError):
+            key_mapping.ButtonAction.from_dict(
+                {
+                    "kind": "quicker_uri",
+                    "keys": [],
+                    "uri": "quicker:showmessage:hello",
+                }
+            )
+
+    def test_quicker_uri_rejects_an_empty_action_identifier(self):
+        with self.assertRaises(ValueError):
+            key_mapping.ButtonAction.from_dict(
+                {
+                    "kind": "quicker_uri",
+                    "keys": [],
+                    "uri": "quicker:runaction:?hello",
+                }
+            )
+
 
 class GestureBindingLookupTests(unittest.TestCase):
     def test_legacy_flat_binding_is_single_click_only(self):
@@ -181,6 +210,33 @@ class GestureBindingLookupTests(unittest.TestCase):
             key_mapping.ActionKind.SYSTEM_VOLUME_UP,
         )
         self.assertTrue(key_mapping.has_secondary_action(bindings, "power"))
+
+    def test_combo_modifier_exists_only_when_an_action_is_enabled(self):
+        empty = {
+            "combo_bindings": {
+                "modifier": "tv",
+                "bindings": {},
+            }
+        }
+        self.assertIsNone(key_mapping.button_combo_modifier(empty))
+
+        configured = {
+            "combo_bindings": {
+                "modifier": "tv",
+                "bindings": {
+                    "up": {
+                        "kind": "quicker_uri",
+                        "keys": [],
+                        "uri": "quicker:runaction:test-action",
+                    }
+                },
+            }
+        }
+        self.assertEqual(key_mapping.button_combo_modifier(configured), "tv")
+        self.assertEqual(
+            key_mapping.button_combo_action_for(configured, "up").kind,
+            key_mapping.ActionKind.QUICKER_URI,
+        )
 
 
 if __name__ == "__main__":

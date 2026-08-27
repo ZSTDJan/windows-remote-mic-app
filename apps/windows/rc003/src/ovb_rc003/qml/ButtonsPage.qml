@@ -14,6 +14,7 @@ Item {
     readonly property real mappingCardGap: 2
     readonly property real mappingCardHeight: 55
     readonly property real mappingBoardGap: 6
+    property int mappingViewIndex: 0
     property bool connectorRepaintQueued: false
 
     onWidthChanged: scheduleConnectorRepaint()
@@ -136,10 +137,11 @@ Item {
         return names[buttonId] || buttonId
     }
 
-    function openShortcutRecorder(buttonId, rowIndex, trigger) {
+    function openShortcutRecorder(buttonId, rowIndex, trigger, targetEditor) {
         shortcutRecorder.buttonId = buttonId
         shortcutRecorder.rowIndex = rowIndex
         shortcutRecorder.trigger = trigger || "single_click"
+        shortcutRecorder.targetEditor = targetEditor || null
         shortcutRecorder.previewText = qsTr("请按下希望遥控器发送的键盘快捷键")
         shortcutRecorder.open()
     }
@@ -172,7 +174,7 @@ Item {
             kind: bodyKind
             width: 340
             wrapMode: Text.WordWrap
-            text: qsTr("这会把 13 个按键恢复为程序内置映射，不是全部清空。确认后仍需点击“保存映射”才会写入设置。")
+            text: qsTr("这会把 13 个按键恢复为程序内置映射，并清空遥控器组合。确认后仍需点击“保存映射”才会写入设置。")
         }
     }
 
@@ -200,9 +202,16 @@ Item {
         property int rowIndex: -1
         property string trigger: "single_click"
         property string previewText: ""
+        property var targetEditor: null
 
         function commitShortcut(chord) {
             previewText = chord
+            if (targetEditor) {
+                targetEditor.editText = chord
+                targetEditor = null
+                close()
+                return
+            }
             actionEditor.applyCapturedShortcut(rowIndex, trigger, chord)
             close()
         }
@@ -212,7 +221,10 @@ Item {
             SettingsController.startHotkeyCapture()
         }
 
-        onClosed: SettingsController.stopHotkeyCapture()
+        onClosed: {
+            SettingsController.stopHotkeyCapture()
+            targetEditor = null
+        }
 
         background: Rectangle {
             radius: tokens.cornerRadiusLarge
@@ -534,8 +546,8 @@ Item {
                     Accessible.name: actionEditor.buttonName + qsTr("单击动作")
                     ToolTip.visible: hovered
                     ToolTip.text: actionEditor.buttonId === "mic"
-                        ? qsTr("话筒键可选择按住说话、普通动作或自定义组合键。")
-                        : qsTr("可选择普通动作或输入自定义组合键。")
+                        ? qsTr("话筒键可选择按住说话、普通动作、自定义组合键或 Quicker URI。")
+                        : qsTr("可选择普通动作，也可输入自定义组合键或 Quicker URI。")
                     onEditTextChanged: {
                             if (!actionEditor.syncing)
                             actionEditor.primaryText = editText
@@ -734,69 +746,38 @@ Item {
             anchors.margins: tokens.pageHorizontalPadding
             spacing: tokens.spacingSmall
 
-            RowLayout {
+            SectionFrame {
+                id: mappingViewSwitcher
+                objectName: "mappingViewSwitcher"
+                tokens: root.tokens
                 Layout.fillWidth: true
                 Layout.preferredHeight: 36
-                spacing: tokens.spacingSmall
+                horizontalPadding: 3
+                verticalPadding: 3
+                radius: tokens.cornerRadiusSmall
 
-
-                SectionFrame {
-                    id: mappingActionsPanel
-                    objectName: "mappingActionsPanel"
-                    tokens: root.tokens
+                RowLayout {
                     Layout.fillWidth: true
                     Layout.fillHeight: true
-                    horizontalPadding: 4
-                    verticalPadding: 3
-                    radius: tokens.cornerRadiusSmall
+                    spacing: 3
 
-                    RowLayout {
+                    CompactButton {
+                        id: singleMappingViewButton
+                        objectName: "singleMappingViewButton"
+                        tokens: root.tokens
                         Layout.fillWidth: true
-                        spacing: 4
-
-                        CompactButton {
-                            id: detectRealKeyButton
-                            objectName: "detectRealKeyButton"
-                            tokens: root.tokens
-                            compactMinimumWidth: tokens.buttonWidth6Chars
-                            text: SettingsController.keyDetectionActive
-                                ? qsTr("停止检测") : qsTr("检测真实按键")
-                            highlighted: SettingsController.keyDetectionActive
-                            onClicked: SettingsController.keyDetectionActive
-                                ? SettingsController.stopKeyDetection()
-                                : SettingsController.startKeyDetection()
-                            Accessible.name: qsTr("检测真实遥控器按键")
-                        }
-                        UiLabel {
-                            objectName: "voiceGestureRestrictionText"
-                            tokens: root.tokens
-                            kind: noteKind
-                            Layout.fillWidth: true
-                            text: SettingsController.keyDetectionActive
-                                ? SettingsController.keyDetectionText
-                                : qsTr("按键设为语音键时，双击和长按不可用")
-                            elide: Text.ElideRight
-                        }
-                        Item { Layout.fillWidth: true }
-                        CompactButton {
-                            objectName: "restoreMappingDefaultsButton"
-                            tokens: root.tokens
-                            compactMinimumWidth: tokens.buttonWidth6Chars
-                            text: qsTr("恢复内置默认")
-                            onClicked: restoreMappingDefaultsDialog.open()
-                        }
-                        CompactButton {
-                            id: saveMappingButton
-                            objectName: "saveMappingButton"
-                            tokens: root.tokens
-                            compactMinimumWidth: tokens.buttonWidth4Chars
-                            text: qsTr("保存映射")
-                            highlighted: true
-                            onClicked: {
-                                SettingsController.saveSettings()
-                                root.scheduleConnectorRepaint()
-                            }
-                        }
+                        text: qsTr("单键与手势")
+                        highlighted: root.mappingViewIndex === 0
+                        onClicked: root.mappingViewIndex = 0
+                    }
+                    CompactButton {
+                        id: comboMappingViewButton
+                        objectName: "comboMappingViewButton"
+                        tokens: root.tokens
+                        Layout.fillWidth: true
+                        text: qsTr("遥控器组合")
+                        highlighted: root.mappingViewIndex === 1
+                        onClicked: root.mappingViewIndex = 1
                     }
                 }
             }
@@ -804,6 +785,7 @@ Item {
             Item {
                 id: mappingList
                 objectName: "mappingList"
+                visible: root.mappingViewIndex === 0
                 Layout.fillWidth: true
                 Layout.fillHeight: true
                 Layout.minimumHeight: 306
@@ -1126,6 +1108,251 @@ Item {
                                     singleNote, doubleNote, longNote
                                 )
                             }
+                        }
+                    }
+                }
+            }
+
+            Item {
+                id: comboMappingList
+                objectName: "comboMappingList"
+                visible: root.mappingViewIndex === 1
+                Layout.fillWidth: true
+                Layout.fillHeight: true
+                Layout.minimumHeight: 306
+
+                ColumnLayout {
+                    anchors.fill: parent
+                    spacing: tokens.spacingSmall
+
+                    SectionFrame {
+                        id: comboModifierPanel
+                        objectName: "comboModifierPanel"
+                        tokens: root.tokens
+                        Layout.fillWidth: true
+                        Layout.preferredHeight: 38
+                        horizontalPadding: tokens.spacingMedium
+                        verticalPadding: tokens.spacingSmall
+                        radius: tokens.cornerRadiusSmall
+
+                        RowLayout {
+                            Layout.fillWidth: true
+                            spacing: tokens.spacingMedium
+
+                            UiLabel {
+                                tokens: root.tokens
+                                kind: bodyKind
+                                text: qsTr("组合主键")
+                                font.weight: Font.Medium
+                            }
+                            SelectionComboBox {
+                                id: comboModifierCombo
+                                objectName: "comboModifierCombo"
+                                tokens: root.tokens
+                                Layout.preferredWidth: 112
+                                model: SettingsController.comboModifierOptions
+                                currentIndex: SettingsController.comboModifierIndex
+                                onActivated: SettingsController.comboModifierIndex = index
+                                Accessible.name: qsTr("遥控器组合主键")
+                            }
+                            UiLabel {
+                                objectName: "comboModifierRestrictionText"
+                                tokens: root.tokens
+                                kind: noteKind
+                                Layout.fillWidth: true
+                                text: qsTr("主键只能选 TV、菜单或主页；启用组合后不能再设置该键的双击和长按")
+                                elide: Text.ElideRight
+                            }
+                        }
+                    }
+
+                    Rectangle {
+                        objectName: "comboMappingHeader"
+                        Layout.fillWidth: true
+                        Layout.preferredHeight: 24
+                        radius: tokens.cornerRadiusControl
+                        color: tokens.surfaceMuted
+                        border.color: tokens.border
+                        border.width: 1
+
+                        RowLayout {
+                            anchors.fill: parent
+                            anchors.leftMargin: tokens.spacingMedium
+                            anchors.rightMargin: tokens.spacingMedium
+                            spacing: tokens.spacingSmall
+
+                            UiLabel {
+                                tokens: root.tokens
+                                kind: noteKind
+                                Layout.preferredWidth: 92
+                                text: qsTr("遥控器按键")
+                            }
+                            UiLabel {
+                                tokens: root.tokens
+                                kind: noteKind
+                                Layout.fillWidth: true
+                                text: qsTr("执行动作")
+                            }
+                            Item { Layout.preferredWidth: tokens.buttonWidth2Chars }
+                            UiLabel {
+                                tokens: root.tokens
+                                kind: noteKind
+                                Layout.preferredWidth: 154
+                                text: qsTr("备注名称")
+                            }
+                        }
+                    }
+
+                    ColumnLayout {
+                        id: comboMappingRows
+                        objectName: "comboMappingRows"
+                        Layout.fillWidth: true
+                        Layout.fillHeight: true
+                        spacing: 2
+
+                        Repeater {
+                            model: SettingsController.comboRows
+
+                            delegate: Rectangle {
+                                required property int index
+                                required property string buttonId
+                                required property string buttonName
+                                required property string actionText
+                                required property string noteText
+
+                                Layout.fillWidth: true
+                                Layout.preferredHeight: 32
+                                radius: tokens.cornerRadiusControl
+                                color: index % 2 === 0 ? tokens.surface : tokens.fieldBackground
+                                border.color: tokens.border
+                                border.width: 1
+                                objectName: "comboMappingRow_" + buttonId
+
+                                RowLayout {
+                                    anchors.fill: parent
+                                    anchors.leftMargin: tokens.spacingMedium
+                                    anchors.rightMargin: tokens.spacingMedium
+                                    spacing: tokens.spacingSmall
+
+                                    UiLabel {
+                                        tokens: root.tokens
+                                        kind: bodyKind
+                                        Layout.preferredWidth: 92
+                                        text: SettingsController.comboModifierText
+                                            + " + " + root.shortButtonName(buttonId)
+                                        font.weight: Font.Medium
+                                        elide: Text.ElideRight
+                                    }
+                                    EditorActionCombo {
+                                        id: comboActionEditor
+                                        objectName: "comboActionEditor_" + buttonId
+                                        tokens: root.tokens
+                                        Layout.fillWidth: true
+                                        model: SettingsController.secondaryActionOptions
+                                        Component.onCompleted: editText = actionText
+                                        onEditTextChanged: SettingsController.setComboActionText(
+                                            buttonId, editText
+                                        )
+                                        onActivated: {
+                                            editText = currentText
+                                            SettingsController.setComboActionText(
+                                                buttonId, currentText
+                                            )
+                                        }
+                                        ToolTip.visible: hovered
+                                        ToolTip.text: qsTr("可选择普通动作，也可输入电脑快捷键或 Quicker URI。")
+                                        Accessible.name: SettingsController.comboModifierText
+                                            + " + " + buttonName + qsTr("执行动作")
+                                    }
+                                    CompactButton {
+                                        objectName: "comboRecordButton_" + buttonId
+                                        tokens: root.tokens
+                                        compactMinimumWidth: tokens.buttonWidth2Chars
+                                        text: qsTr("录入")
+                                        onClicked: root.openShortcutRecorder(
+                                            buttonId, -1, "combo", comboActionEditor
+                                        )
+                                        Accessible.name: SettingsController.comboModifierText
+                                            + " + " + buttonName + qsTr("录制电脑快捷键")
+                                    }
+                                    CompactTextField {
+                                        id: comboNoteEditor
+                                        objectName: "comboNoteEditor_" + buttonId
+                                        tokens: root.tokens
+                                        Layout.preferredWidth: 154
+                                        text: noteText
+                                        placeholderText: qsTr("如：置顶窗口")
+                                        onTextChanged: SettingsController.setComboNoteText(
+                                            buttonId, text
+                                        )
+                                        Accessible.name: SettingsController.comboModifierText
+                                            + " + " + buttonName + qsTr("备注名称")
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            SectionFrame {
+                id: mappingActionsPanel
+                objectName: "mappingActionsPanel"
+                tokens: root.tokens
+                Layout.fillWidth: true
+                Layout.preferredHeight: 36
+                horizontalPadding: 4
+                verticalPadding: 3
+                radius: tokens.cornerRadiusSmall
+
+                RowLayout {
+                    Layout.fillWidth: true
+                    spacing: 4
+
+                    CompactButton {
+                        id: detectRealKeyButton
+                        objectName: "detectRealKeyButton"
+                        visible: root.mappingViewIndex === 0
+                        tokens: root.tokens
+                        compactMinimumWidth: tokens.buttonWidth6Chars
+                        text: SettingsController.keyDetectionActive
+                            ? qsTr("停止检测") : qsTr("检测真实按键")
+                        highlighted: SettingsController.keyDetectionActive
+                        onClicked: SettingsController.keyDetectionActive
+                            ? SettingsController.stopKeyDetection()
+                            : SettingsController.startKeyDetection()
+                        Accessible.name: qsTr("检测真实遥控器按键")
+                    }
+                    UiLabel {
+                        objectName: "voiceGestureRestrictionText"
+                        tokens: root.tokens
+                        kind: noteKind
+                        Layout.fillWidth: true
+                        text: root.mappingViewIndex === 0
+                            ? (SettingsController.keyDetectionActive
+                                ? SettingsController.keyDetectionText
+                                : qsTr("按键设为语音键时，双击和长按不可用"))
+                            : qsTr("组合命中后不会再执行主键和第二键的单键动作")
+                        elide: Text.ElideRight
+                    }
+                    Item { Layout.fillWidth: true }
+                    CompactButton {
+                        objectName: "restoreMappingDefaultsButton"
+                        tokens: root.tokens
+                        compactMinimumWidth: tokens.buttonWidth6Chars
+                        text: qsTr("恢复内置默认")
+                        onClicked: restoreMappingDefaultsDialog.open()
+                    }
+                    CompactButton {
+                        id: saveMappingButton
+                        objectName: "saveMappingButton"
+                        tokens: root.tokens
+                        compactMinimumWidth: tokens.buttonWidth4Chars
+                        text: qsTr("保存映射")
+                        highlighted: true
+                        onClicked: {
+                            SettingsController.saveSettings()
+                            root.scheduleConnectorRepaint()
                         }
                     }
                 }

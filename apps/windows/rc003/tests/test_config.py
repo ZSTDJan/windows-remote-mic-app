@@ -31,7 +31,7 @@ class DefaultConfigPrivacyTests(unittest.TestCase):
         self.assertEqual(defaults["voice_hotkeys"]["hold"], "ralt")
         self.assertNotIn("toggle", defaults["voice_hotkeys"])
         self.assertNotIn("voice_release_finish_tap_enabled", defaults)
-        self.assertEqual(defaults["schema_version"], 5)
+        self.assertEqual(defaults["schema_version"], config.SCHEMA_VERSION)
         self.assertEqual(defaults["gain_db"], 10.0)
 
     def test_default_config_contains_no_forbidden_identity_fields(self):
@@ -42,6 +42,10 @@ class DefaultConfigPrivacyTests(unittest.TestCase):
         defaults = config.default_key_bindings()
         self.assertFalse(config.FORBIDDEN_KEYS.intersection(defaults.keys()))
         self.assertEqual(defaults["display_notes"], {})
+        self.assertEqual(
+            defaults["combo_bindings"],
+            {"modifier": "tv", "bindings": {}, "display_notes": {}},
+        )
 
     def test_output_endpoint_defaults_to_empty_so_voice_fails_closed(self):
         self.assertEqual(config.default_config()["output_endpoint_name"], "")
@@ -132,7 +136,7 @@ class DefaultConfigPrivacyTests(unittest.TestCase):
 
             loaded = config.load_config(path)
 
-        self.assertEqual(loaded["schema_version"], 5)
+        self.assertEqual(loaded["schema_version"], config.SCHEMA_VERSION)
         self.assertNotIn("voice_release_finish_tap_enabled", loaded)
 
     def test_save_preserves_hold_with_right_alt_space(self):
@@ -381,7 +385,7 @@ class RoundTripTests(unittest.TestCase):
             config.save_config(path, original)
 
             persisted = json.loads(path.read_text(encoding="utf-8"))
-        self.assertEqual(persisted["schema_version"], 5)
+        self.assertEqual(persisted["schema_version"], config.SCHEMA_VERSION)
         self.assertNotIn("voice_release_finish_tap_enabled", persisted)
 
     def test_load_missing_file_returns_defaults(self):
@@ -404,6 +408,89 @@ class RoundTripTests(unittest.TestCase):
             loaded["display_notes"],
             {"power": {"single_click": "关机"}},
         )
+
+    def test_combo_bindings_round_trip_with_a_quicker_action(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "key_bindings.json"
+            original = config.default_key_bindings()
+            original["combo_bindings"] = {
+                "modifier": "tv",
+                "bindings": {
+                    "up": {
+                        "kind": "quicker_uri",
+                        "keys": [],
+                        "uri": "quicker:runaction:test-action",
+                    }
+                },
+                "display_notes": {"up": "置顶窗口"},
+            }
+
+            config.save_key_bindings(path, original)
+            loaded = config.load_key_bindings(path)
+
+        self.assertEqual(loaded["combo_bindings"], original["combo_bindings"])
+
+    def test_combo_bindings_fail_closed_for_forbidden_buttons_and_actions(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "key_bindings.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "combo_bindings": {
+                            "modifier": "mic",
+                            "bindings": {
+                                "mic": {"kind": "escape", "keys": []},
+                                "power": {"kind": "escape", "keys": []},
+                                "up": {"kind": "voice_hold", "keys": []},
+                                "ok": {"kind": "return", "keys": []},
+                            },
+                            "display_notes": {
+                                "mic": "忽略",
+                                "ok": "确认",
+                            },
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            loaded = config.load_key_bindings(path)
+
+        self.assertEqual(loaded["combo_bindings"]["modifier"], "tv")
+        self.assertEqual(
+            loaded["combo_bindings"]["bindings"],
+            {"ok": {"kind": "return", "keys": []}},
+        )
+        self.assertEqual(loaded["combo_bindings"]["display_notes"], {"ok": "确认"})
+
+    def test_combo_bindings_fail_closed_when_modifier_has_delayed_gestures(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "key_bindings.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "secondary_bindings": {
+                            "tv": {
+                                "double_click": {"kind": "escape", "keys": []}
+                            }
+                        },
+                        "combo_bindings": {
+                            "modifier": "tv",
+                            "bindings": {
+                                "up": {"kind": "return", "keys": []}
+                            },
+                            "display_notes": {"up": "确认"},
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            loaded = config.load_key_bindings(path)
+
+        self.assertIn("tv", loaded["secondary_bindings"])
+        self.assertEqual(loaded["combo_bindings"]["bindings"], {})
+        self.assertEqual(loaded["combo_bindings"]["display_notes"], {})
 
     def test_load_key_bindings_cleans_unknown_or_empty_display_notes(self):
         with tempfile.TemporaryDirectory() as tmp:

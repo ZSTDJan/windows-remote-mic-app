@@ -147,6 +147,12 @@ _SECONDARY_ACTION_OPTIONS: List[str] = list(
     )
 )
 
+_COMBO_MODIFIER_LABELS = {
+    "tv": "TV",
+    "menu": "菜单",
+    "home": "主页",
+}
+
 
 class QtUnavailableError(RuntimeError):
     """Raised by run_settings_window() when PySide6-Essentials is not
@@ -792,6 +798,8 @@ def _load_qt_classes() -> dict:
         errorMessageChanged = Signal()
         settingsDirtyChanged = Signal()
         selectedButtonIdChanged = Signal()
+        comboModifierIndexChanged = Signal()
+        comboRowsChanged = Signal()
         selectedDeviceIndexChanged = Signal()
         selectedDeviceChanged = Signal()
         selectedVoiceProgramIndexChanged = Signal()
@@ -922,6 +930,13 @@ def _load_qt_classes() -> dict:
                 self._removed_voice_bindings or voice_program_autostart_migrated
             )
             self._selected_button_id = "ok"
+            self._combo_modifier_id = key_mapping.COMBO_MODIFIER_BUTTON_IDS[0]
+            self._combo_action_text = {
+                button_id: "" for button_id in key_mapping.COMBO_ACTION_BUTTON_IDS
+            }
+            self._combo_note_text = {
+                button_id: "" for button_id in key_mapping.COMBO_ACTION_BUTTON_IDS
+            }
             selected_device_id = device_catalog.normalize_device_id(
                 self._config.get("selected_device_profile")
             )
@@ -1104,6 +1119,48 @@ def _load_qt_classes() -> dict:
                 secondary_display_map,
                 display_note_map,
             )
+            raw_combo = self._bindings.get("combo_bindings", {})
+            if not isinstance(raw_combo, dict):
+                raw_combo = {}
+            modifier = raw_combo.get("modifier")
+            if modifier not in key_mapping.COMBO_MODIFIER_BUTTON_IDS:
+                modifier = key_mapping.COMBO_MODIFIER_BUTTON_IDS[0]
+            self._combo_modifier_id = str(modifier)
+            raw_combo_actions = raw_combo.get("bindings", {})
+            raw_combo_notes = raw_combo.get("display_notes", {})
+            if not isinstance(raw_combo_actions, dict):
+                raw_combo_actions = {}
+            if not isinstance(raw_combo_notes, dict):
+                raw_combo_notes = {}
+            for button_id in key_mapping.COMBO_ACTION_BUTTON_IDS:
+                action_text = ""
+                raw_action = raw_combo_actions.get(button_id)
+                if isinstance(raw_action, dict):
+                    try:
+                        action = key_mapping.ButtonAction.from_dict(raw_action)
+                    except (KeyError, TypeError, ValueError):
+                        pass
+                    else:
+                        if (
+                            action.kind != key_mapping.ActionKind.DISABLED
+                            and not key_mapping.is_voice_action(action)
+                        ):
+                            action_text = settings_ui._action_to_display(action)
+                self._combo_action_text[button_id] = action_text
+                note = raw_combo_notes.get(button_id, "")
+                self._combo_note_text[button_id] = (
+                    note.strip() if isinstance(note, str) else ""
+                )
+            self.comboModifierIndexChanged.emit()
+            self.comboRowsChanged.emit()
+
+        def _reset_combo_mapping_display(self) -> None:
+            self._combo_modifier_id = key_mapping.COMBO_MODIFIER_BUTTON_IDS[0]
+            for button_id in key_mapping.COMBO_ACTION_BUTTON_IDS:
+                self._combo_action_text[button_id] = ""
+                self._combo_note_text[button_id] = ""
+            self.comboModifierIndexChanged.emit()
+            self.comboRowsChanged.emit()
 
         def _selected_device_id(self) -> str:
             if 0 <= self._selected_device_index < len(self._DEVICE_ORDER):
@@ -1460,6 +1517,9 @@ def _load_qt_classes() -> dict:
                         mode.value: self._voice_hotkeys[mode]
                         for mode in self._TRIGGER_MODE_ORDER
                     },
+                    combo_modifier=self._combo_modifier_id,
+                    combo_display_map=dict(self._combo_action_text),
+                    combo_note_map=dict(self._combo_note_text),
                 )
             except settings_ui.SettingsValidationError as exc:
                 button_name = (
@@ -1949,6 +2009,85 @@ def _load_qt_classes() -> dict:
             list, _get_secondary_action_options, constant=True
         )
 
+        def _get_combo_modifier_options(self) -> List[str]:
+            return [
+                _COMBO_MODIFIER_LABELS[button_id]
+                for button_id in key_mapping.COMBO_MODIFIER_BUTTON_IDS
+            ]
+
+        comboModifierOptions = Property(
+            list, _get_combo_modifier_options, constant=True
+        )
+
+        def _get_combo_modifier_index(self) -> int:
+            try:
+                return key_mapping.COMBO_MODIFIER_BUTTON_IDS.index(
+                    self._combo_modifier_id
+                )
+            except ValueError:
+                return 0
+
+        def _set_combo_modifier_index(self, index: int) -> None:
+            if not (0 <= index < len(key_mapping.COMBO_MODIFIER_BUTTON_IDS)):
+                return
+            modifier = key_mapping.COMBO_MODIFIER_BUTTON_IDS[index]
+            if modifier == self._combo_modifier_id:
+                return
+            self._combo_modifier_id = modifier
+            self.comboModifierIndexChanged.emit()
+            self._mark_settings_dirty()
+
+        comboModifierIndex = Property(
+            int,
+            _get_combo_modifier_index,
+            _set_combo_modifier_index,
+            notify=comboModifierIndexChanged,
+        )
+
+        def _get_combo_modifier_text(self) -> str:
+            return _COMBO_MODIFIER_LABELS.get(self._combo_modifier_id, "TV")
+
+        comboModifierText = Property(
+            str,
+            _get_combo_modifier_text,
+            notify=comboModifierIndexChanged,
+        )
+
+        def _get_combo_rows(self) -> List[dict]:
+            return [
+                {
+                    "buttonId": button_id,
+                    "buttonName": remote_layout.BUTTON_DISPLAY_NAMES.get(
+                        button_id, button_id
+                    ),
+                    "actionText": self._combo_action_text[button_id],
+                    "noteText": self._combo_note_text[button_id],
+                }
+                for button_id in key_mapping.COMBO_ACTION_BUTTON_IDS
+            ]
+
+        comboRows = Property(list, _get_combo_rows, notify=comboRowsChanged)
+
+        @Slot(str, str)
+        def setComboActionText(self, button_id: str, text: str) -> None:
+            if button_id not in self._combo_action_text:
+                return
+            value = str(text)
+            if value == self._combo_action_text[button_id]:
+                return
+            self._combo_action_text[button_id] = value
+            self._mark_settings_dirty()
+
+        @Slot(str, str)
+        def setComboNoteText(self, button_id: str, text: str) -> None:
+            if button_id not in self._combo_note_text:
+                return
+            value = str(text)
+            if value == self._combo_note_text[button_id]:
+                return
+            self._combo_note_text[button_id] = value
+            self._mark_settings_dirty()
+
         # Compatibility alias for older QML probes. New code uses the two
         # semantically distinct option properties above.
         presetActionOptions = Property(
@@ -2369,10 +2508,12 @@ def _load_qt_classes() -> dict:
                 defaults.secondary_display_map,
                 {},
             )
+            self._reset_combo_mapping_display()
             self._mark_settings_dirty()
             self._set_error_message("")
             self._set_status_message(
-                "已恢复按键默认显示，尚未保存——点击「保存映射」才会写入设置。"
+                "已恢复按键默认显示并清空遥控器组合，尚未保存——"
+                "点击「保存映射」才会写入设置。"
             )
 
         @Slot()
@@ -2402,6 +2543,7 @@ def _load_qt_classes() -> dict:
                 defaults.secondary_display_map,
                 {},
             )
+            self._reset_combo_mapping_display()
             self._set_hold_voice_hotkey_text(
                 defaults.voice_hotkeys[key_mapping.VoiceTriggerMode.HOLD.value]
             )

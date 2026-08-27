@@ -31,7 +31,7 @@ PRODUCT_ID = "RC003"
 CONFIG_FILENAME = "config.json"
 KEY_BINDINGS_FILENAME = "key_bindings.json"
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 RUNTIME_LEGACY_VOICE_MODE_KEY = "_legacy_voice_trigger_mode"
 RUNTIME_REMOVED_VOICE_BINDINGS_KEY = "_removed_voice_bindings"
@@ -249,6 +249,13 @@ def default_key_bindings() -> Dict[str, Any]:
         # Keeping the primary action flat preserves compatibility with all
         # existing Windows config files.
         "secondary_bindings": {},
+        # One optional remote-button combination layer.  The modifier is
+        # inert until at least one second-key action is configured.
+        "combo_bindings": {
+            "modifier": key_mapping.COMBO_MODIFIER_BUTTON_IDS[0],
+            "bindings": {},
+            "display_notes": {},
+        },
         # Optional user-facing labels for each gesture. They never participate
         # in action parsing or execution and are safe to omit in older files.
         "display_notes": {},
@@ -271,6 +278,7 @@ def load_key_bindings(path: Path) -> Dict[str, Any]:
             if key in {
                 "bindings",
                 "secondary_bindings",
+                "combo_bindings",
                 "physical_bindings",
                 "display_notes",
             }:
@@ -291,7 +299,9 @@ def load_key_bindings(path: Path) -> Dict[str, Any]:
     _normalize_physical_bindings(bindings)
     _normalize_semantic_actions(bindings)
     _normalize_secondary_bindings(bindings)
+    _normalize_combo_bindings(bindings)
     _normalize_display_notes(bindings)
+    bindings["schema_version"] = SCHEMA_VERSION
     return bindings
 
 
@@ -389,6 +399,13 @@ def _normalize_semantic_actions(bindings: Dict[str, Any]) -> None:
             for trigger_name, raw in list(trigger_map.items()):
                 trigger_map[trigger_name] = normalize(raw)
 
+    combo = bindings.get("combo_bindings")
+    if isinstance(combo, dict):
+        combo_actions = combo.get("bindings")
+        if isinstance(combo_actions, dict):
+            for button_id, raw in list(combo_actions.items()):
+                combo_actions[button_id] = normalize(raw)
+
 
 def _normalize_secondary_bindings(bindings: Dict[str, Any]) -> None:
     """Keep optional double/long mappings structurally safe on load.
@@ -415,6 +432,59 @@ def _normalize_secondary_bindings(bindings: Dict[str, Any]) -> None:
                 entry.pop(trigger, None)
         if not entry:
             secondary.pop(button_id, None)
+
+
+def _normalize_combo_bindings(bindings: Dict[str, Any]) -> None:
+    """Keep the optional one-modifier combination layer fail-closed."""
+
+    from . import key_mapping
+
+    raw_combo = bindings.get("combo_bindings")
+    if not isinstance(raw_combo, dict):
+        raw_combo = {}
+    modifier = raw_combo.get("modifier")
+    if modifier not in key_mapping.COMBO_MODIFIER_BUTTON_IDS:
+        modifier = key_mapping.COMBO_MODIFIER_BUTTON_IDS[0]
+
+    normalized_actions: Dict[str, dict] = {}
+    raw_actions = raw_combo.get("bindings")
+    if isinstance(raw_actions, dict):
+        for button_id in key_mapping.COMBO_ACTION_BUTTON_IDS:
+            raw_action = raw_actions.get(button_id)
+            if not isinstance(raw_action, dict):
+                continue
+            try:
+                action = key_mapping.ButtonAction.from_dict(raw_action)
+            except (KeyError, TypeError, ValueError):
+                continue
+            if (
+                action.kind != key_mapping.ActionKind.DISABLED
+                and not key_mapping.is_voice_action(action)
+            ):
+                normalized_actions[button_id] = action.to_dict()
+
+    # A hand-edited file must not let the same physical modifier own both
+    # the Fn-style combination layer and delayed double/long gestures. Keep
+    # the older single-button gestures and fail the newer combination layer
+    # closed until the conflict is resolved in Settings.
+    if normalized_actions and key_mapping.has_secondary_action(
+        bindings, str(modifier)
+    ):
+        normalized_actions = {}
+
+    normalized_notes: Dict[str, str] = {}
+    raw_notes = raw_combo.get("display_notes")
+    if isinstance(raw_notes, dict):
+        for button_id in normalized_actions:
+            note = raw_notes.get(button_id)
+            if isinstance(note, str) and note.strip() and note.strip() != "未命名":
+                normalized_notes[button_id] = note.strip()
+
+    bindings["combo_bindings"] = {
+        "modifier": str(modifier),
+        "bindings": normalized_actions,
+        "display_notes": normalized_notes,
+    }
 
 
 def _normalize_physical_bindings(bindings: Dict[str, Any]) -> None:

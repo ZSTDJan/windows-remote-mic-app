@@ -72,6 +72,7 @@ from . import (
     bridge_launcher,
     bridge_runtime_status,
     bridge_tray_windows,
+    button_combo,
     button_gesture,
     config,
     connection_supervisor,
@@ -148,6 +149,7 @@ class RC003App:
             is_repeatable=self._is_button_repeatable,
             on_trigger=self._on_button_trigger,
         )
+        self._button_combos = button_combo.ButtonComboRecognizer()
         self._logger: logging.Logger = logging_setup.get_logger(self._config_root)
         runtime_kind = "frozen" if getattr(sys, "frozen", False) else "source"
         package_name = (
@@ -594,6 +596,7 @@ class RC003App:
         # Cancel gesture timers before stopping Raw Input. The listener's
         # forced releases then clear the dispatcher state without a late
         # double/long callback racing the next connection generation.
+        self._button_combos.reset()
         self._button_gestures.reset()
 
         try:
@@ -1242,7 +1245,7 @@ class RC003App:
         if not any(
             self._is_button_action_configured(event.button_id, trigger)
             for trigger in button_gesture.ButtonTrigger
-        ):
+        ) and not self._is_button_combo_participant(event.button_id):
             return
         # RAWKEYBOARD uses RI_KEY_E0 (0x02) for the extended prefix; the
         # low-level hook uses LLKHF_EXTENDED (0x01).
@@ -1307,6 +1310,7 @@ class RC003App:
                 self._pending_voice_settings = None
                 self._apply_voice_settings_locked(trigger_mode, voice_hotkey)
             if self._pending_bindings is not None:
+                self._button_combos.reset()
                 self._bindings = self._pending_bindings
                 self._pending_bindings = None
                 self._removed_voice_bindings = dict(
@@ -1359,6 +1363,7 @@ class RC003App:
             )
             if self._voice_settings_idle_locked():
                 self._config = refreshed_config
+                self._button_combos.reset()
                 self._bindings = refreshed_bindings
                 self._removed_voice_bindings = removed_voice_bindings
                 self._pending_config = None
@@ -1629,10 +1634,57 @@ class RC003App:
                     self._voice_raw_input_trigger_pending = False
             return
 
-        if is_pressed:
-            self._button_gestures.press(button_id)
-        else:
-            self._button_gestures.release(button_id)
+        modifier = key_mapping.button_combo_modifier(self._bindings)
+        configured_combo_buttons = frozenset(
+            candidate
+            for candidate in key_mapping.COMBO_ACTION_BUTTON_IDS
+            if key_mapping.button_combo_action_for(
+                self._bindings, candidate
+            ).kind
+            != key_mapping.ActionKind.DISABLED
+        )
+        commands = (
+            self._button_combos.press(
+                button_id,
+                modifier=modifier,
+                configured_buttons=configured_combo_buttons,
+            )
+            if is_pressed
+            else self._button_combos.release(button_id)
+        )
+        self._dispatch_button_combo_commands(commands)
+
+    def _dispatch_button_combo_commands(
+        self, commands: List[button_combo.ComboCommand]
+    ) -> None:
+        for command in commands:
+            if command.kind == button_combo.ComboCommandKind.FORWARD_PRESS:
+                self._button_gestures.press(command.button_id)
+            elif command.kind == button_combo.ComboCommandKind.FORWARD_RELEASE:
+                self._button_gestures.release(command.button_id)
+            elif command.kind == button_combo.ComboCommandKind.TRIGGER:
+                self._on_button_combo_trigger(command.button_id)
+
+    def _on_button_combo_trigger(self, button_id: str) -> None:
+        action = key_mapping.button_combo_action_for(self._bindings, button_id)
+        if action.kind == key_mapping.ActionKind.DISABLED:
+            return
+        self._logger.info(
+            "button combination triggered: modifier=%s button=%s action=%s",
+            key_mapping.button_combo_modifier(self._bindings),
+            button_id,
+            action.kind.value,
+        )
+        self._apply_button_action(action)
+
+    def _is_button_combo_participant(self, button_id: str) -> bool:
+        modifier = key_mapping.button_combo_modifier(self._bindings)
+        if modifier is None:
+            return False
+        return button_id == modifier or (
+            key_mapping.button_combo_action_for(self._bindings, button_id).kind
+            != key_mapping.ActionKind.DISABLED
+        )
 
     def _is_button_action_configured(
         self, button_id: str, trigger: button_gesture.ButtonTrigger
@@ -1758,6 +1810,8 @@ class RC003App:
                 win32_input.send_volume_mute()
             elif action.kind == key_mapping.ActionKind.PLAY_PAUSE:
                 win32_input.send_play_pause()
+            elif action.kind == key_mapping.ActionKind.QUICKER_URI:
+                action_executor.open_quicker_uri(action)
             elif action_executor.is_application_action(action):
                 if not open_configured_application(action):
                     self._logger.warning(
