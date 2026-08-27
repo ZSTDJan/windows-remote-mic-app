@@ -2947,12 +2947,6 @@ result.update(
         "bluetooth_permission_visible": bool(
             find_child(window, "bluetoothPermissionBlock").property("visible")
         ),
-        "optional_enhancements_visible": bool(
-            find_child(window, "optionalEnhancementsSection").property("visible")
-        ),
-        "host_voice_setup_visible": bool(
-            find_child(window, "hostVoiceSetupBlock").property("visible")
-        ),
         "microphone_permission_text": str(
             find_child(window, "microphonePermissionDescription").property("text")
         ),
@@ -3171,11 +3165,6 @@ permissions_names = (
     "openBluetoothSettingsButton",
     "openMicrophonePrivacyButton",
     "openSoundInputSettingsButton",
-    "optionalEnhancementsSection",
-    "openDiagnosticsButton",
-    "manualSetupSection",
-    "openMappingButton",
-    "openInputAppSettingsButton",
 )
 permissions_scroll = find_child(window, "permissionsScroll")
 result["permissions"] = {
@@ -3373,13 +3362,13 @@ permissions_scroll = find_child(window, "permissionsScroll")
 permissions_flickable = permissions_scroll.property("contentItem")
 permissions_flickable.setProperty("contentY", 0)
 microphone = find_child(window, "openMicrophonePrivacyButton")
-speech_button = find_child(window, "openMappingButton")
+sound_button = find_child(window, "openSoundInputSettingsButton")
 microphone.forceActiveFocus(Qt.TabFocusReason)
 render(window, app)
-permissions_reached = tab_to(window, app, speech_button)
+permissions_reached = tab_to(window, app, sound_button)
 QTest.keyClick(window, Qt.Key_Tab)
 render(window, app)
-permissions_escaped = not bool(speech_button.property("activeFocus")) and navigation_has_focus(window)
+permissions_escaped = not bool(sound_button.property("activeFocus")) and navigation_has_focus(window)
 
 result = {
     "warnings": [warning.toString() for warning in warnings],
@@ -3393,7 +3382,7 @@ result = {
         "reached": permissions_reached,
         "escaped": permissions_escaped,
         "content_y": float(permissions_flickable.property("contentY")),
-        "target_visible": visible_in_window(speech_button, window),
+        "target_visible": visible_in_window(sound_button, window),
     },
 }
 m._shutdown_diagnostics_workers()
@@ -3710,8 +3699,17 @@ class SettingsShellSourceContractTests(unittest.TestCase):
         self.assertIn("enabled: !SettingsController.bridgeLaunchBusy", self.connection_qml)
 
     def test_permissions_page_states_real_boundaries_without_fake_grants(self):
-        for heading in ("运行必需", "按需使用", "相关设置"):
-            self.assertIn(heading, self.permissions_qml)
+        self.assertIn("运行必需", self.permissions_qml)
+        for removed_copy in (
+            "按需使用",
+            "相关设置",
+            "特殊按键支持（HID tap）",
+            "虚拟音频（VB-CABLE）",
+            "输入法与应用",
+            "应用设置",
+            "前往按键",
+        ):
+            self.assertNotIn(removed_copy, self.permissions_qml)
         for misleading_claim in (
             "已授权",
             "Remote Mic 需要管理员权限",
@@ -3719,15 +3717,12 @@ class SettingsShellSourceContractTests(unittest.TestCase):
         ):
             self.assertNotIn(misleading_claim, self.permissions_qml)
         self.assertIn("按键不受影响", self.permissions_qml)
-        self.assertIn("不改默认设备", self.permissions_qml)
 
-    def test_permissions_navigation_reuses_existing_pages(self):
-        self.assertIn("signal openMappingRequested()", self.permissions_qml)
-        self.assertIn("signal openDiagnosticsRequested()", self.permissions_qml)
-        self.assertIn("onOpenMappingRequested: tabBar.currentIndex = 1", self.main_qml)
-        self.assertIn(
-            "onOpenDiagnosticsRequested: tabBar.currentIndex = 3", self.main_qml
-        )
+    def test_permissions_page_does_not_duplicate_internal_navigation(self):
+        self.assertNotIn("signal openMappingRequested()", self.permissions_qml)
+        self.assertNotIn("signal openDiagnosticsRequested()", self.permissions_qml)
+        self.assertNotIn("onOpenMappingRequested", self.main_qml)
+        self.assertNotIn("onOpenDiagnosticsRequested", self.main_qml)
 
     def test_buttons_page_keeps_the_mapping_cards_and_photo_sidebar(self):
         for object_name in ("photoSidebar", "photoFrame", "photoImage"):
@@ -3908,8 +3903,6 @@ class OffscreenQmlLoadTests(unittest.TestCase):
         self.assertEqual(data["mapping_page_title"], "设备控制")
         self.assertEqual(data["control_names"], ["录音键", "连接键", "电源键"])
         self.assertFalse(data["bluetooth_permission_visible"])
-        self.assertFalse(data["optional_enhancements_visible"])
-        self.assertFalse(data["host_voice_setup_visible"])
         self.assertIn("DJI Mic 2", data["microphone_permission_text"])
         self.assertNotIn("CABLE Output", data["microphone_permission_text"])
 
@@ -4136,14 +4129,7 @@ class OffscreenQmlLoadTests(unittest.TestCase):
                 self.assertIn("RC003 已连接", connected_progress["stage_text"])
 
                 permission_items = data["permissions"]["items"]
-                self.assertLess(
-                    permission_items["requiredPermissionsSection"]["y"],
-                    permission_items["optionalEnhancementsSection"]["y"],
-                )
-                self.assertLess(
-                    permission_items["optionalEnhancementsSection"]["y"],
-                    permission_items["manualSetupSection"]["y"],
-                )
+                self.assertTrue(permission_items["requiredPermissionsSection"]["visible"])
                 self.assertTrue(data["neutral_status"]["visible"])
                 self.assertEqual(data["neutral_status"]["text"], "neutral status")
                 self.assertTrue(data["error_status"]["visible"])

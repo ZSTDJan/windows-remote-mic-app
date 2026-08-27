@@ -163,11 +163,7 @@ ApplicationWindow {
 
                 ConnectionPage { tokens: window.tokens }
                 ButtonsPage { tokens: window.tokens }
-                PermissionsPage {
-                    tokens: window.tokens
-                    onOpenMappingRequested: tabBar.currentIndex = 1
-                    onOpenDiagnosticsRequested: tabBar.currentIndex = 3
-                }
+                PermissionsPage { tokens: window.tokens }
                 DiagnosticsPage { tokens: window.tokens }
             }
 

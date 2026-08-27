@@ -6,8 +6,6 @@ import OvbRc003Settings 1.0
 Item {
     id: root
     property var tokens
-    signal openMappingRequested()
-    signal openDiagnosticsRequested()
 
     function ensureVisible(item) {
         if (!item)
@@ -96,93 +94,6 @@ Item {
                             compactMinimumWidth: tokens.buttonWidth4Chars
                             text: qsTr("声音输入")
                             onClicked: SettingsController.openSoundSettings()
-                            onActiveFocusChanged: if (activeFocus) root.ensureVisible(this)
-                        }
-                    }
-                }
-            }
-
-            ColumnLayout {
-                id: optionalEnhancementsSection
-                objectName: "optionalEnhancementsSection"
-                visible: SettingsController.isRc003Device
-                Layout.fillWidth: true
-                spacing: 5
-                UiLabel { tokens: root.tokens; kind: sectionTitleKind; text: qsTr("按需使用") }
-                SectionFrame {
-                    tokens: root.tokens
-                    Layout.fillWidth: true
-                    horizontalPadding: 0
-                    verticalPadding: 0
-                    contentSpacing: 0
-
-                    SettingsListRow {
-                        tokens: root.tokens
-                        iconGlyph: "\uE765"
-                        titleText: qsTr("特殊按键支持（HID tap）")
-                        descriptionText: qsTr("只有部分按键无响应时才启用；需要管理员权限。")
-                        CompactButton {
-                            objectName: "openDiagnosticsButton"
-                            tokens: root.tokens
-                            compactMinimumWidth: tokens.buttonWidth4Chars
-                            text: qsTr("前往检查")
-                            onClicked: root.openDiagnosticsRequested()
-                            onActiveFocusChanged: if (activeFocus) root.ensureVisible(this)
-                        }
-                    }
-                    SettingsListRow {
-                        tokens: root.tokens
-                        iconGlyph: "\uE95E"
-                        titleText: qsTr("虚拟音频（VB-CABLE）")
-                        descriptionText: qsTr("传送语音；安装需管理员权限和重启，不改默认设备。")
-                        showDivider: false
-                        CompactButton {
-                            objectName: "openVirtualAudioDiagnosticsButton"
-                            tokens: root.tokens
-                            compactMinimumWidth: tokens.buttonWidth4Chars
-                            text: qsTr("前往检查")
-                            onClicked: root.openDiagnosticsRequested()
-                            onActiveFocusChanged: if (activeFocus) root.ensureVisible(this)
-                        }
-                    }
-                }
-            }
-
-            ColumnLayout {
-                id: manualSetupSection
-                objectName: "manualSetupSection"
-                visible: SettingsController.isRc003Device
-                Layout.fillWidth: true
-                spacing: 5
-                UiLabel { tokens: root.tokens; kind: sectionTitleKind; text: qsTr("相关设置") }
-                SectionFrame {
-                    tokens: root.tokens
-                    Layout.fillWidth: true
-                    horizontalPadding: 0
-                    verticalPadding: 0
-                    contentSpacing: 0
-
-                    SettingsListRow {
-                        id: hostVoiceSetupBlock
-                        objectName: "hostVoiceSetupBlock"
-                        tokens: root.tokens
-                        iconGlyph: "\uE713"
-                        titleText: qsTr("输入法与应用")
-                        descriptionText: qsTr("语音按键需一致，目标应用需选对麦克风。")
-                        showDivider: false
-                        CompactButton {
-                            objectName: "openInputAppSettingsButton"
-                            tokens: root.tokens
-                            compactMinimumWidth: tokens.buttonWidth4Chars
-                            text: qsTr("应用设置")
-                            onClicked: SettingsController.openAppsSettings()
-                        }
-                        CompactButton {
-                            objectName: "openMappingButton"
-                            tokens: root.tokens
-                            compactMinimumWidth: tokens.buttonWidth4Chars
-                            text: qsTr("前往按键")
-                            onClicked: root.openMappingRequested()
                             onActiveFocusChanged: if (activeFocus) root.ensureVisible(this)
                         }
                     }
