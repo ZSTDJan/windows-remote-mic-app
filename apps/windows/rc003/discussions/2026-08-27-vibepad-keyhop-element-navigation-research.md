@@ -451,6 +451,13 @@ Remote Mic 增加一个明确的外部工具动作，不再通过全局快捷键
 替代 Keyhop 的成熟过滤、Chromium 唤醒、缓存和动作兼容层；原型失败也不能直接证明
 Keyhop 不可用。
 
+首次实测 ChatGPT/Codex 桌面窗口时，未唤醒状态只访问 61 个 UIA 节点并得到 14 个候选，
+主要是窗口外壳。向其 `Chrome_RenderWidgetHostHWND` 及子窗口发送 `WM_GETOBJECT`
+（`UIA_ROOT_OBJECT_ID=-25`、`OBJID_CLIENT=-4`）后，树扩展到 116 个节点并出现 28 个
+按钮，左侧列表和正文控件开始可见。原型因此补入与 Keyhop 同类的 Chromium 无障碍树
+唤醒，并把包含渲染窗口的扫描深度至少提高到 24；该结果只证明 ChatGPT/Codex 当前
+窗口，不代表所有 Electron/Chromium 软件都已通过。
+
 在 `apps/windows/rc003` 下运行：
 
 ```powershell

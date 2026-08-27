@@ -106,6 +106,13 @@ class SpatialNavigationTests(unittest.TestCase):
         ]
         self.assertEqual(prototype.nested_container_keep_indices(targets), [0])
 
+    def test_chromium_renderer_raises_scan_depth(self):
+        self.assertEqual(prototype.effective_scan_depth(16, True), 24)
+        self.assertEqual(prototype.effective_scan_depth(30, True), 30)
+
+    def test_desktop_scan_keeps_configured_depth(self):
+        self.assertEqual(prototype.effective_scan_depth(16, False), 16)
+
 
 if __name__ == "__main__":
     unittest.main()

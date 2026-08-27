@@ -30,6 +30,8 @@ from typing import Any, Callable, Optional, Sequence
 STRUCTURAL_CONTROL_TYPES = frozenset(
     {"CustomControl", "PaneControl", "GroupControl", "ImageControl"}
 )
+CHROMIUM_RENDERER_CLASS = "Chrome_RenderWidgetHostHWND"
+CHROMIUM_MIN_SCAN_DEPTH = 24
 
 
 class Direction(str, Enum):
@@ -247,6 +249,12 @@ def nested_container_keep_indices(targets: Sequence[TargetSnapshot]) -> list[int
     return keep
 
 
+def effective_scan_depth(configured_depth: int, has_chromium_renderer: bool) -> int:
+    if has_chromium_renderer:
+        return max(configured_depth, CHROMIUM_MIN_SCAN_DEPTH)
+    return configured_depth
+
+
 def _parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--max-depth", type=int, default=16)
@@ -275,6 +283,8 @@ def _run_windows(args: argparse.Namespace) -> int:
     kernel32.GetModuleHandleW.argtypes = [wintypes.LPCWSTR]
     kernel32.GetModuleHandleW.restype = wintypes.HMODULE
     user32.GetForegroundWindow.restype = wintypes.HWND
+    user32.GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+    user32.GetClassNameW.restype = ctypes.c_int
     user32.GetAsyncKeyState.argtypes = [ctypes.c_int]
     user32.GetAsyncKeyState.restype = ctypes.c_short
     user32.CallNextHookEx.restype = lresult
@@ -287,6 +297,16 @@ def _run_windows(args: argparse.Namespace) -> int:
         wintypes.LPARAM,
     ]
     user32.PostThreadMessageW.restype = wintypes.BOOL
+    user32.SendMessageTimeoutW.argtypes = [
+        wintypes.HWND,
+        wintypes.UINT,
+        wintypes.WPARAM,
+        wintypes.LPARAM,
+        wintypes.UINT,
+        wintypes.UINT,
+        ctypes.POINTER(ctypes.c_size_t),
+    ]
+    user32.SendMessageTimeoutW.restype = lresult
 
     interactive_types = frozenset(
         {
@@ -312,6 +332,9 @@ def _run_windows(args: argparse.Namespace) -> int:
         auto.PatternId.SelectionItemPattern,
         auto.PatternId.ExpandCollapsePattern,
     )
+    wm_getobject = 0x003D
+    smto_abortifhung = 0x0002
+    accessibility_object_ids = (-25, -4)
 
     @dataclass
     class RuntimeTarget:
@@ -336,7 +359,50 @@ def _run_windows(args: argparse.Namespace) -> int:
                 continue
         return False
 
+    def window_class_name(hwnd: int) -> str:
+        buffer = ctypes.create_unicode_buffer(256)
+        user32.GetClassNameW(hwnd, buffer, len(buffer))
+        return buffer.value
+
+    def activate_embedded_chromium_accessibility(hwnd: int) -> bool:
+        """Ask Chromium renderers to publish their UI Automation tree."""
+
+        handles = [hwnd]
+
+        @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+        def collect_child(child: int, _lparam: int) -> bool:
+            handles.append(child)
+            return True
+
+        user32.EnumChildWindows(hwnd, collect_child, 0)
+        has_renderer = any(
+            window_class_name(handle) == CHROMIUM_RENDERER_CLASS
+            for handle in handles
+        )
+        if not has_renderer:
+            return False
+
+        for handle in handles:
+            for object_id in accessibility_object_ids:
+                result = ctypes.c_size_t()
+                user32.SendMessageTimeoutW(
+                    handle,
+                    wm_getobject,
+                    0,
+                    object_id,
+                    smto_abortifhung,
+                    100,
+                    ctypes.byref(result),
+                )
+
+        # Chromium enables renderer accessibility asynchronously after the
+        # probe. A short bounded wait keeps the first scan from racing it.
+        time.sleep(0.15)
+        return True
+
     def enumerate_targets(hwnd: int) -> tuple[list[RuntimeTarget], Rect, str, int]:
+        has_chromium_renderer = activate_embedded_chromium_accessibility(hwnd)
+        scan_depth = effective_scan_depth(args.max_depth, has_chromium_renderer)
         root = auto.ControlFromHandle(hwnd)
         if root is None:
             raise RuntimeError("无法从当前窗口建立 UI Automation 根元素")
@@ -384,7 +450,7 @@ def _run_windows(args: argparse.Namespace) -> int:
                 except Exception:
                     pass
 
-            if depth >= args.max_depth:
+            if depth >= scan_depth:
                 continue
             try:
                 for child in control.GetChildren():
