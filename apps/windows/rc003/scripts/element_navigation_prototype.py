@@ -66,6 +66,8 @@ LIST_CONTAINER_TYPES = frozenset(
     {"ListControl", "TreeControl", "TableControl", "DataGridControl"}
 )
 ITEM_CONTAINER_TYPES = frozenset({"ListItemControl", "TreeItemControl"})
+SEMANTIC_BYPASS_MAX_WIDTH = 180
+SEMANTIC_BYPASS_MAX_HEIGHT = 96
 
 
 class Direction(str, Enum):
@@ -756,6 +758,13 @@ def semantic_action_can_bypass_point_hit(target: TargetSnapshot) -> bool:
         target.name
         and target.has_action_pattern
         and target.control_type in PRIMARY_ACTION_CONTROL_TYPES
+        and (
+            target.name in PRESERVED_NESTED_ACTION_NAMES
+            or (
+                target.rect.width <= SEMANTIC_BYPASS_MAX_WIDTH
+                and target.rect.height <= SEMANTIC_BYPASS_MAX_HEIGHT
+            )
+        )
     )
 
 

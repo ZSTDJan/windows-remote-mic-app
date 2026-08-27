@@ -546,6 +546,30 @@ class SpatialNavigationTests(unittest.TestCase):
             )
         )
 
+    def test_large_semantic_row_requires_a_real_point_hit(self):
+        ghost_row = self.target(
+            100,
+            100,
+            430,
+            145,
+            "hidden embedded row",
+            has_action_pattern=True,
+        )
+        compact_text_action = self.target(
+            100,
+            160,
+            220,
+            200,
+            "展开显示",
+            has_action_pattern=True,
+        )
+        self.assertFalse(
+            prototype.semantic_action_can_bypass_point_hit(ghost_row)
+        )
+        self.assertTrue(
+            prototype.semantic_action_can_bypass_point_hit(compact_text_action)
+        )
+
     def test_branch_path_only_matches_descendants(self):
         branch = (0, 2, 4)
         self.assertTrue(prototype.path_is_in_branch((0, 2, 4, 0), branch))
