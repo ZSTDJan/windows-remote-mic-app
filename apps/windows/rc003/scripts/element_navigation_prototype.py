@@ -379,9 +379,25 @@ def ranked_target_indices(
 
     # Horizontal navigation behaves like a reading-order grid: finish the
     # current row, wrap to the adjacent row inside the same content branch,
-    # then consider diagonal targets in the requested half-plane.
+    # then consider diagonals that keep progressing in the same reading
+    # direction. Right must not climb back to an earlier row, and left must
+    # not drop into a later row, otherwise repeated presses can form loops.
     in_row = [index for score, _prefix, index in scored if score[0] == 0]
-    diagonal = [index for score, _prefix, index in scored if score[0] != 0]
+    diagonal = [
+        index
+        for score, _prefix, index in scored
+        if score[0] != 0
+        and (
+            (
+                direction == Direction.RIGHT
+                and targets[index].rect.center_y >= current.center_y
+            )
+            or (
+                direction == Direction.LEFT
+                and targets[index].rect.center_y <= current.center_y
+            )
+        )
+    ]
     wrapped = horizontal_wrap_target_indices(targets, current_index, direction)
     ranked = list(in_row)
     ranked.extend(index for index in wrapped if index not in ranked)

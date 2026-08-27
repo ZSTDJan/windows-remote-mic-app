@@ -127,6 +127,34 @@ class SpatialNavigationTests(unittest.TestCase):
             2,
         )
 
+    def test_repeated_right_does_not_loop_from_folder_back_to_header_actions(self):
+        targets = [
+            self.target(300, 100, 340, 140, "options", path=(0, 1, 0)),
+            self.target(360, 100, 400, 140, "add", path=(0, 1, 1)),
+            self.target(20, 150, 280, 195, "folder", path=(0, 1, 2)),
+        ]
+        first = prototype.next_target_index(
+            targets, 0, prototype.Direction.RIGHT
+        )
+        second = prototype.next_target_index(
+            targets, first, prototype.Direction.RIGHT
+        )
+        third = prototype.next_target_index(
+            targets, second, prototype.Direction.RIGHT
+        )
+        self.assertEqual((first, second, third), (1, 2, 2))
+
+    def test_repeated_left_does_not_loop_from_header_back_to_lower_folder(self):
+        targets = [
+            self.target(300, 100, 340, 140, "options", path=(0, 1, 0)),
+            self.target(360, 100, 400, 140, "add", path=(0, 1, 1)),
+            self.target(20, 150, 280, 195, "folder", path=(0, 1, 2)),
+        ]
+        self.assertEqual(
+            prototype.next_target_index(targets, 0, prototype.Direction.LEFT),
+            0,
+        )
+
     def test_right_does_not_treat_slightly_indented_sidebar_row_as_wrap(self):
         targets = [
             self.target(40, 100, 340, 150, "sidebar current", path=(0, 1, 0)),
