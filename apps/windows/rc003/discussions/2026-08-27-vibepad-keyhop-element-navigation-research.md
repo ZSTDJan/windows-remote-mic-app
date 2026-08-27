@@ -45,6 +45,10 @@
 - [Keyhop v0.5.0 发布](https://github.com/rsaz/keyhop/releases/tag/v0.5.0)
 - [Keyhop 问题 #25：原生 Tab 导航、标签稳定性和修饰键冲突](https://github.com/rsaz/keyhop/issues/25)
 - [Keyhop 问题 #27：IntelliJ IDEA 中找不到元素](https://github.com/rsaz/keyhop/issues/27)
+- [PixPin 静态截图：UI 元素识别与父子切换](https://pixpin.cn/docs/capture/static-capture)
+- [PixPin 截图配置：UI 检测模式与回退边界](https://pixpin.cn/docs/configuration/screenshot)
+- [PixPin 脚本核心函数：公开矩形能力](https://pixpin.cn/docs/script/functions/core.html)
+- [yuSnip 仓库](https://github.com/yusnip/yuSnip)
 - [Microsoft UI Automation 概览](https://learn.microsoft.com/en-us/dotnet/framework/ui-automation/ui-automation-overview)
 - [Microsoft UI Automation 安全概览](https://learn.microsoft.com/en-us/dotnet/framework/ui-automation/ui-automation-security-overview)
 - [W3C CSS Spatial Navigation Level 1](https://www.w3.org/TR/css-nav-1/)
@@ -510,3 +514,98 @@ Per-Monitor V2，并改为按目标所在显示器单独覆盖、按该屏缩放
 
 退出条件：目标固定软件的 UIA 覆盖率完成实测后，这个 Python 原型不继续扩成正式产品；
 正式接入仍按本文结论，优先采用 Keyhop 元素底座和本地 IPC。
+
+## 13. PixPin 与 yuSnip 补充深挖
+
+### 13.1 PixPin 真正证明了什么
+
+PixPin 官方文档明确提供三档 UI 检测：“检测元素”“仅窗口”“不检测”。进入截图后，
+鼠标停在目标位置会自动高亮元素或窗口，还可以用滚轮在同一点的父子元素之间切换。
+这说明截图工具的成熟交互不是把全屏矩形一次性摊平，而是同时保留“当前点”和“祖先链”。
+
+但 PixPin 也明确说明：元素识别依赖目标软件提供的系统 UI 辅助接口；软件不提供接口或
+主动屏蔽时，只能退回窗口范围，不能继续识别内部按钮和文本框。因此不能把 PixPin 的
+OCR 或图像模型理解成“任何图标都能自动变成可点击按钮”。
+
+2026-08-27 对本机安装做了只读核实：
+
+- 版本为 `3.5.2.2`，安装路径为
+  `C:\Users\DELL\AppData\Local\Programs\PixPin`；
+- `UiSpy.dll` 和 `UiRegionDetector.dll` 中可见 `IUIAutomation`、`ElementFromPoint`、
+  `IAccessible`、`AccessibleObjectFromWindow` 和 `WindowFromPoint`；
+- 安装目录同时包含 `PixVision.dll`、`PixOCR.dll`、`PixOCR2.dll`、`onnxruntime.dll`、
+  `detect.caffemodel` 和 `paragraph_recognition.onnx`。
+
+这些证据只能证明 PixPin 整个产品同时拥有无障碍命中、窗口命中和视觉/OCR 模块，不能
+证明视觉模块参与了普通 UI 元素框选。结合官方回退说明，当前应按“UIA/MSAA 识别元素，
+Win32 识别窗口，视觉能力服务其它图像功能”理解，除非以后有更直接证据。
+
+PixPin 没有公开任意元素枚举、父子遍历或执行按钮动作的外部接口。公开脚本目前能取得
+活动窗口、鼠标所在屏幕和历史截图区域等矩形，但不能把内部 UI 元素对象交给 Remote Mic。
+因此它适合作为产品交互和分层架构参考，不适合作为正式运行时依赖，也不应逆向调用私有
+DLL。
+
+本轮曾尝试用当前本机快捷键自动触发一次截图并在同一点发送滚轮，屏幕没有出现可确认的
+截图高亮变化，因此没有把这次自动化尝试当作行为证据。父子切换能力仅按 PixPin 官方文档
+记录，后续如需比较手感，应由用户在真实界面手动实测。
+
+### 13.2 yuSnip 当前实现的调用链
+
+2026-08-27 核实 yuSnip `main` 提交
+`b929de962d971feb2ae726bac67f0fa6be8af5dd`。当前自动检测入口有三种用户可选模式：
+“检测元素”“仅窗口”“不检测”；旧的 `Auto` 枚举实际会映射回“仅窗口”。
+
+“检测元素”的真实顺序是：
+
+1. 用 `IUIAutomation::ElementFromPoint` 获取鼠标点下元素及其矩形；
+2. UIA 失败后，用 MSAA 的 `IAccessible.accHitTest` 和 `accLocation` 回退；
+3. 单次元素调用超过 80 ms 就放弃等待，避免拖住截图界面；
+4. 专用 STA 后台线程只处理最新鼠标点，旧点直接覆盖，最短检测间隔 20 ms；
+5. 截图覆盖层临时设置为命中穿透，防止检测到自己的全屏窗口。
+
+“仅窗口”则使用 `WindowFromPoint` 命中深层 HWND，再用 `GetAncestor(GA_ROOT)` 升到顶层，
+优先读取 DWM 视觉边框，失败才回退普通窗口矩形；命中失败时使用提前缓存的顶层窗口
+Z 序列表兜底。
+
+yuSnip 当前没有实现 PixPin 式“滚轮切换父子元素”。截图尚未形成手动选区时，滚轮没有
+接入自动检测层级；形成选区后，滚轮用于扩缩选区或调整标注参数。其自动检测结果也只有
+一个 `Rectangle`，没有保留元素名称、控件类型、AutomationId、动作模式、父元素链或可
+执行对象，所以不能直接承担电视式方向导航和确定操作。
+
+另外，仓库根目录没有 `LICENSE`、`COPYING` 或其它明确许可文件，README 只写“遵循开源
+软件协议”。在作者补充明确许可证前，可以研究公开行为和重新实现技术思路，但不能直接
+复制源码进入 Remote Mic，也不能把其二进制作为正式依赖分发。
+
+### 13.3 与现有原型的正确结合方式
+
+PixPin、yuSnip 和当前原型解决的是不同问题，合理组合不是三选一：
+
+1. **全树候选仍以现有 UIA 扫描为主。** 方向导航必须同时知道屏幕上多个可操作元素，
+   还要保留名称、类型、动作和层级；单点截图命中无法替代这一步。
+2. **增加 yuSnip 式单点命中作为入口。** 进入导航时先对当前鼠标点执行 UIA
+   `ElementFromPoint`，失败再做 MSAA `accHitTest`，然后把命中对象映射到全树候选。
+   这比“从所有候选中找包含鼠标点的最小矩形”更准确，也有机会找到深层小图标。
+3. **保留 PixPin 式祖先链。** 单点命中后记录从叶子到窗口的可操作祖先，允许在同一点
+   切换“图标按钮、消息块、对话区域、整个窗口”。正式按键如何映射需另行确认，不能
+   直接照搬鼠标滚轮。
+4. **Win32 只做窗口兜底。** UIA/MSAA 都失败时，至少定位鼠标下窗口；窗口内部不能
+   凭空推断按钮，可退回软件原生键盘导航、普通鼠标模式或专用应用规则。
+5. **视觉/OCR 只作为低置信度补救。** 它可以提出“看起来像按钮或文字块”的矩形，但
+   没有按钮语义和可靠动作。若未来确需加入，应单独标记为坐标点击候选，并按固定软件
+   建立白名单，不能与可执行 UIA 元素混为一类。
+
+建议的正式检测层因此调整为：
+
+```text
+全树 UIA 候选与语义动作
+  + 当前点 UIA ElementFromPoint
+  + MSAA accHitTest 回退
+  + Win32 窗口回退
+  + 固定软件规则
+  + 可选的低置信度视觉/OCR 坐标候选
+```
+
+这条路径能直接回应当前实测问题：方向导航继续使用全局候选；启动时更准确地落在鼠标
+所在小元素；父子层级不再只靠原型对列表结构的猜测；UIA 树漏掉但 MSAA 暴露的旧式控件
+还有一次补救机会。对完全自绘且不暴露无障碍信息的图标，PixPin 和 yuSnip 也没有现成的
+“识别后可靠执行”能力，仍需专用规则或视觉坐标方案。
