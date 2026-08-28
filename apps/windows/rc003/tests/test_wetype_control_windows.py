@@ -16,7 +16,10 @@ class FakeClock:
 
 
 class WeTypeVoiceControlTests(unittest.TestCase):
-    def _controller(self, state, calls, clock):
+    def _controller(self, state, calls, clock, scheduled=None):
+        if scheduled is None:
+            scheduled = []
+
         def find_panel():
             return 101 if state["panel"] else None
 
@@ -42,19 +45,22 @@ class WeTypeVoiceControlTests(unittest.TestCase):
             hotkey_tap=hotkey_tap,
             sleep=clock.sleep,
             monotonic=clock.monotonic,
+            schedule=scheduled.append,
         )
 
     def test_toolbar_path_is_used_for_start_and_stop(self):
         state = {"panel": False}
         calls = []
+        scheduled = []
         clock = FakeClock()
-        controller = self._controller(state, calls, clock)
+        controller = self._controller(state, calls, clock, scheduled)
 
         self.assertTrue(controller.start(("lctrl", "win")))
         self.assertTrue(controller.stop(("lctrl", "win")))
 
         self.assertEqual(calls, ["toolbar", "toolbar"])
         self.assertFalse(state["panel"])
+        self.assertEqual(len(scheduled), 1)
 
     def test_hotkey_fallback_uses_same_path_to_submit(self):
         state = {"panel": False}
@@ -83,6 +89,7 @@ class WeTypeVoiceControlTests(unittest.TestCase):
             hotkey_tap=hotkey_tap,
             sleep=clock.sleep,
             monotonic=clock.monotonic,
+            schedule=lambda _callback: None,
         )
 
         tokens = ("lctrl", "lshift", "f9")
@@ -105,6 +112,112 @@ class WeTypeVoiceControlTests(unittest.TestCase):
         self.assertTrue(controller.start(("lctrl", "win")))
 
         self.assertEqual(calls[:2], ["close", "toolbar"])
+
+    def test_submit_timeout_closes_a_panel_that_stays_open(self):
+        state = {"panel": False}
+        calls = []
+        scheduled = []
+        clock = FakeClock()
+        toolbar_calls = 0
+
+        def click_toolbar():
+            nonlocal toolbar_calls
+            toolbar_calls += 1
+            calls.append("toolbar")
+            if toolbar_calls == 1:
+                state["panel"] = True
+            return True
+
+        def close_panel(_panel):
+            calls.append("close")
+            state["panel"] = False
+            return True
+
+        controller = wetype_control_windows.WeTypeVoiceControl(
+            logger=logging.getLogger("test"),
+            find_panel=lambda: 101 if state["panel"] else None,
+            click_toolbar=click_toolbar,
+            close_panel=close_panel,
+            hotkey_tap=lambda _tokens: None,
+            sleep=clock.sleep,
+            monotonic=clock.monotonic,
+            schedule=scheduled.append,
+        )
+
+        self.assertTrue(controller.start(("lctrl", "win")))
+        self.assertTrue(controller.stop(("lctrl", "win")))
+        self.assertEqual(len(scheduled), 1)
+
+        scheduled[0]()
+
+        self.assertEqual(calls, ["toolbar", "toolbar", "close"])
+        self.assertFalse(state["panel"])
+
+    def test_submit_completion_does_not_close_an_already_finished_panel(self):
+        state = {"panel": False}
+        calls = []
+        scheduled = []
+        clock = FakeClock()
+        controller = self._controller(state, calls, clock, scheduled)
+
+        self.assertTrue(controller.start(("lctrl", "win")))
+        self.assertTrue(controller.stop(("lctrl", "win")))
+        self.assertEqual(len(scheduled), 1)
+
+        scheduled[0]()
+
+        self.assertEqual(calls, ["toolbar", "toolbar"])
+        self.assertNotIn("close", calls)
+
+    def test_new_session_supersedes_previous_completion_cleanup(self):
+        state = {"panel": False}
+        calls = []
+        scheduled = []
+        clock = FakeClock()
+        controller = self._controller(state, calls, clock, scheduled)
+
+        self.assertTrue(controller.start(("lctrl", "win")))
+        self.assertTrue(controller.stop(("lctrl", "win")))
+        self.assertTrue(controller.start(("lctrl", "win")))
+
+        scheduled[0]()
+
+        self.assertTrue(state["panel"])
+        self.assertNotIn("close", calls)
+
+    def test_clear_supersedes_previous_completion_cleanup(self):
+        state = {"panel": False}
+        calls = []
+        scheduled = []
+        clock = FakeClock()
+        toolbar_calls = 0
+
+        def click_toolbar():
+            nonlocal toolbar_calls
+            toolbar_calls += 1
+            calls.append("toolbar")
+            if toolbar_calls == 1:
+                state["panel"] = True
+            return True
+
+        controller = wetype_control_windows.WeTypeVoiceControl(
+            logger=logging.getLogger("test"),
+            find_panel=lambda: 101 if state["panel"] else None,
+            click_toolbar=click_toolbar,
+            close_panel=lambda _panel: calls.append("close") or True,
+            hotkey_tap=lambda _tokens: None,
+            sleep=clock.sleep,
+            monotonic=clock.monotonic,
+            schedule=scheduled.append,
+        )
+
+        self.assertTrue(controller.start(("lctrl", "win")))
+        self.assertTrue(controller.stop(("lctrl", "win")))
+        controller.clear()
+
+        scheduled[0]()
+
+        self.assertNotIn("close", calls)
 
 
 if __name__ == "__main__":
