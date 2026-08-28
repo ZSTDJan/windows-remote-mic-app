@@ -7,6 +7,7 @@ does spatial element navigation feel useful in the user's fixed Windows apps?
 
 Controls:
     Ctrl+Alt+N  scan the foreground window and enter/leave navigation
+    Ctrl+Alt+D  enable/disable navigation diagnostics
     Arrow keys  move the highlighted target
     PageUp/Down move to the parent/child element at the same location
     Enter       left-click the highlighted target; press twice to double-click
@@ -75,6 +76,9 @@ VK_LEFT = 0x25
 VK_UP = 0x26
 VK_RIGHT = 0x27
 VK_DOWN = 0x28
+VK_D = 0x44
+VK_N = 0x4E
+VK_Q = 0x51
 VK_APPS = 0x5D
 VK_VOLUME_DOWN = 0xAE
 VK_VOLUME_UP = 0xAF
@@ -94,6 +98,11 @@ NAVIGATION_KEY_ACTIONS = {
 NATIVE_MENU_NAVIGATION_KEYS = frozenset(
     {VK_UP, VK_DOWN, VK_LEFT, VK_RIGHT, VK_RETURN, VK_ESCAPE}
 )
+GLOBAL_HOTKEY_ACTIONS = {
+    VK_D: "toggle_diagnostics",
+    VK_N: "toggle",
+    VK_Q: "quit",
+}
 
 
 class Direction(str, Enum):
@@ -160,6 +169,34 @@ class TargetSnapshot:
     supports_expand: bool = False
     runtime_id: tuple[int, ...] = ()
     source: str = "uia"
+
+
+@dataclass(frozen=True)
+class CandidateDiagnostic:
+    index: int
+    target: TargetSnapshot
+    rank: int
+    route: str
+    common_path_prefix: int
+    beam_rank: Optional[int]
+    primary_gap: Optional[float]
+    perpendicular_gap: Optional[float]
+    score: Optional[float]
+    center_offset: Optional[float]
+
+
+@dataclass(frozen=True)
+class NavigationDiagnostic:
+    current_index: int
+    current: TargetSnapshot
+    direction: Direction
+    candidates: tuple[CandidateDiagnostic, ...]
+    available_indices: tuple[int, ...]
+    invalid_cached_indices: tuple[int, ...]
+    unhittable_indices: tuple[int, ...]
+    selected_index: Optional[int]
+    outcome: str
+    rejected_counts: tuple[tuple[str, int], ...]
 
 
 def physical_screen_rect(logical_rect: Rect, device_pixel_ratio: float) -> Rect:
@@ -456,6 +493,223 @@ def ranked_target_indices(
     return ranked
 
 
+DIAGNOSTIC_REJECTION_ORDER = (
+    "wrong_direction",
+    "containing_container",
+    "same_rectangle",
+    "horizontal_side_filter",
+)
+DIAGNOSTIC_REJECTION_LABELS = {
+    "wrong_direction": "不在请求方向",
+    "containing_container": "包住当前元素的底层容器",
+    "same_rectangle": "与当前元素同一矩形",
+    "horizontal_side_filter": "横向绕回侧别不符",
+}
+DIAGNOSTIC_ROUTE_LABELS = {
+    "lane": "同一通道",
+    "diagonal": "斜向候选",
+    "wrap": "跨行补充",
+    "reverse": "反向返回",
+}
+DIAGNOSTIC_DIRECTION_LABELS = {
+    Direction.UP: "上",
+    Direction.DOWN: "下",
+    Direction.LEFT: "左",
+    Direction.RIGHT: "右",
+}
+DIAGNOSTIC_OUTCOME_LABELS = {
+    "selected": "已移动",
+    "no_candidate": "没有可用候选，保持原位",
+    "geometry_changed": "候选位置变化，已重新扫描",
+}
+
+
+def build_navigation_diagnostic(
+    targets: Sequence[TargetSnapshot],
+    current_index: int,
+    direction: Direction,
+    *,
+    ranked_indices: Optional[Sequence[int]] = None,
+    available_indices: Sequence[int] = (),
+    invalid_cached_indices: Sequence[int] = (),
+    unhittable_indices: Sequence[int] = (),
+    selected_index: Optional[int] = None,
+    outcome: str = "no_candidate",
+) -> Optional[NavigationDiagnostic]:
+    if not targets or not 0 <= current_index < len(targets):
+        return None
+
+    current = targets[current_index]
+    ranked = tuple(
+        ranked_target_indices(targets, current_index, direction)
+        if ranked_indices is None
+        else ranked_indices
+    )
+    wrapped = set(horizontal_wrap_target_indices(targets, current_index, direction))
+    candidates: list[CandidateDiagnostic] = []
+    for rank, index in enumerate(ranked, 1):
+        if not 0 <= index < len(targets) or index == current_index:
+            continue
+        target = targets[index]
+        score = direction_score(current.rect, target.rect, direction)
+        if index in wrapped:
+            route = "wrap"
+        elif score is None:
+            route = "reverse"
+        elif score is not None and score[0] == 0:
+            route = "lane"
+        else:
+            route = "diagonal"
+        candidates.append(
+            CandidateDiagnostic(
+                index=index,
+                target=target,
+                rank=rank,
+                route=route,
+                common_path_prefix=_common_path_prefix_length(
+                    current.path, target.path
+                ),
+                beam_rank=None if score is None else score[0],
+                primary_gap=None if score is None else score[1],
+                perpendicular_gap=None if score is None else score[2],
+                score=None if score is None else score[3],
+                center_offset=None if score is None else score[4],
+            )
+        )
+
+    ranked_set = set(ranked)
+    rejected_counts = {reason: 0 for reason in DIAGNOSTIC_REJECTION_ORDER}
+    for index, target in enumerate(targets):
+        if index == current_index or index in ranked_set:
+            continue
+        if target.rect == current.rect:
+            reason = "same_rectangle"
+        elif target.rect.contains(current.rect):
+            reason = "containing_container"
+        elif direction_score(current.rect, target.rect, direction) is None:
+            reason = "wrong_direction"
+        else:
+            reason = "horizontal_side_filter"
+        rejected_counts[reason] += 1
+
+    return NavigationDiagnostic(
+        current_index=current_index,
+        current=current,
+        direction=direction,
+        candidates=tuple(candidates),
+        available_indices=tuple(available_indices),
+        invalid_cached_indices=tuple(invalid_cached_indices),
+        unhittable_indices=tuple(unhittable_indices),
+        selected_index=selected_index,
+        outcome=outcome,
+        rejected_counts=tuple(
+            (reason, rejected_counts[reason])
+            for reason in DIAGNOSTIC_REJECTION_ORDER
+            if rejected_counts[reason]
+        ),
+    )
+
+
+def _diagnostic_target_label(index: int, target: TargetSnapshot) -> str:
+    label = " ".join((target.name or target.automation_id or target.control_type).split())
+    if len(label) > 60:
+        label = label[:57] + "..."
+    rect = target.rect
+    return (
+        f"#{index + 1} {label} "
+        f"[{rect.left},{rect.top},{rect.width}x{rect.height}]"
+    )
+
+
+def format_navigation_diagnostic(
+    diagnostic: NavigationDiagnostic,
+    *,
+    candidate_limit: int = 8,
+) -> str:
+    lines = [
+        f"[导航诊断] 方向={DIAGNOSTIC_DIRECTION_LABELS[diagnostic.direction]}",
+        "当前: "
+        + _diagnostic_target_label(
+            diagnostic.current_index, diagnostic.current
+        ),
+    ]
+    if diagnostic.selected_index is None:
+        result = DIAGNOSTIC_OUTCOME_LABELS.get(
+            diagnostic.outcome, diagnostic.outcome
+        )
+    else:
+        selected = next(
+            (
+                item.target
+                for item in diagnostic.candidates
+                if item.index == diagnostic.selected_index
+            ),
+            None,
+        )
+        result = DIAGNOSTIC_OUTCOME_LABELS.get(
+            diagnostic.outcome, diagnostic.outcome
+        )
+        if selected is not None:
+            result += ": " + _diagnostic_target_label(
+                diagnostic.selected_index, selected
+            )
+    lines.append("结果: " + result)
+
+    displayed = list(diagnostic.candidates[: max(0, candidate_limit)])
+    if diagnostic.selected_index is not None and not any(
+        item.index == diagnostic.selected_index for item in displayed
+    ):
+        selected_item = next(
+            (
+                item
+                for item in diagnostic.candidates
+                if item.index == diagnostic.selected_index
+            ),
+            None,
+        )
+        if selected_item is not None:
+            displayed.append(selected_item)
+
+    available = set(diagnostic.available_indices)
+    invalid_cached = set(diagnostic.invalid_cached_indices)
+    unhittable = set(diagnostic.unhittable_indices)
+    if displayed:
+        lines.append("候选（距离数值越小越优先）:")
+    for item in displayed:
+        status = []
+        if item.index == diagnostic.selected_index:
+            status.append("最终选中")
+        elif item.index in invalid_cached:
+            status.append("此前已失效")
+        elif item.index in unhittable:
+            status.append("当前无法命中")
+        elif item.index not in available:
+            status.append("本轮历史去重")
+        else:
+            status.append("可用")
+        metrics = ""
+        if item.score is not None:
+            metrics = (
+                f"，向前距离={item.primary_gap:.0f}，横向偏离={item.perpendicular_gap:.0f}，"
+                f"综合值={item.score:.1f}"
+            )
+        lines.append(
+            f"  {item.rank}. {_diagnostic_target_label(item.index, item.target)}；"
+            f"{DIAGNOSTIC_ROUTE_LABELS[item.route]}，共同层级={item.common_path_prefix}"
+            f"{metrics}；{'/'.join(status)}"
+        )
+
+    if diagnostic.rejected_counts:
+        lines.append(
+            "未进入候选: "
+            + "，".join(
+                f"{DIAGNOSTIC_REJECTION_LABELS[reason]} {count} 个"
+                for reason, count in diagnostic.rejected_counts
+            )
+        )
+    return "\n".join(lines)
+
+
 OPPOSITE_DIRECTION = {
     Direction.UP: Direction.DOWN,
     Direction.DOWN: Direction.UP,
@@ -584,6 +838,10 @@ def native_handle_value(handle: Any) -> int:
 
 def keyboard_navigation_action(vk: int) -> Optional[str]:
     return NAVIGATION_KEY_ACTIONS.get(vk)
+
+
+def global_hotkey_action(vk: int) -> Optional[str]:
+    return GLOBAL_HOTKEY_ACTIONS.get(vk)
 
 
 def should_pass_through_native_menu(vk: int, menu_mode_active: bool) -> bool:
@@ -1000,6 +1258,11 @@ def _parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         "--scan-only",
         action="store_true",
         help="scan the current foreground window once and print the targets",
+    )
+    parser.add_argument(
+        "--diagnostics",
+        action="store_true",
+        help="start with navigation candidate diagnostics enabled",
     )
     return parser.parse_args(argv)
 
@@ -1724,7 +1987,7 @@ def _run_windows(args: argparse.Namespace) -> int:
         _PREWARM_BUDGET_SECONDS = 1.5
         _SCROLL_BURST_SECONDS = 0.35
 
-        def __init__(self) -> None:
+        def __init__(self, diagnostics_enabled: bool = False) -> None:
             self.commands: queue.Queue[tuple[str, Any, int]] = queue.Queue()
             self.events: queue.Queue[tuple[str, Any]] = queue.Queue()
             self._post_lock = threading.Lock()
@@ -1753,6 +2016,7 @@ def _run_windows(args: argparse.Namespace) -> int:
             self._scroll_cache_point: Optional[tuple[int, int]] = None
             self._scroll_cache_at = 0.0
             self._content_settle_until = 0.0
+            self.diagnostics_enabled = diagnostics_enabled
             self._double_click_seconds = max(
                 0.2, int(user32.GetDoubleClickTime()) / 1000
             )
@@ -2212,22 +2476,51 @@ def _run_windows(args: argparse.Namespace) -> int:
         def _move(self, direction: Direction) -> None:
             if not self._sync_window_geometry():
                 return
+            current_index = self.selected
+            snapshots = [target.snapshot for target in self.targets]
+            ranked = self.navigation_graph.candidates(current_index, direction)
             candidates = self.traversal.available(
-                self.selected,
+                current_index,
                 direction,
-                self.navigation_graph.candidates(self.selected, direction),
+                ranked,
             )
+            invalid_cached: list[int] = []
+            unhittable: list[int] = []
+
+            def emit_diagnostic(
+                outcome: str,
+                selected_index: Optional[int] = None,
+            ) -> None:
+                if not self.diagnostics_enabled:
+                    return
+                diagnostic = build_navigation_diagnostic(
+                    snapshots,
+                    current_index,
+                    direction,
+                    ranked_indices=ranked,
+                    available_indices=candidates,
+                    invalid_cached_indices=invalid_cached,
+                    unhittable_indices=unhittable,
+                    selected_index=selected_index,
+                    outcome=outcome,
+                )
+                if diagnostic is not None:
+                    self.events.put(("navigation_diagnostic", diagnostic))
+
             for next_index in candidates:
                 target = self.targets[next_index]
                 token = self._identity_token(target.snapshot)
                 if token in self.invalid_targets:
+                    invalid_cached.append(next_index)
                     continue
                 previous_rect = target.snapshot.rect
                 if not self._target_is_navigable(target):
                     self.invalid_targets.add(token)
+                    unhittable.append(next_index)
                     self.events.put(("target_skipped", target.snapshot))
                     continue
                 if target.snapshot.rect != previous_rect:
+                    emit_diagnostic("geometry_changed")
                     previous = self.targets[self.selected].snapshot
                     self._enumerate(self.hwnd)
                     self._apply_targets(restore=previous)
@@ -2237,8 +2530,10 @@ def _run_windows(args: argparse.Namespace) -> int:
                 self.selected = next_index
                 self.traversal.commit(next_index)
                 self._clear_hierarchy()
+                emit_diagnostic("selected", next_index)
                 self._emit_selection()
                 return
+            emit_diagnostic("no_candidate")
 
         def _selection_payload(self) -> dict[str, Any]:
             snapshots = [target.snapshot for target in self.targets]
@@ -2506,6 +2801,8 @@ def _run_windows(args: argparse.Namespace) -> int:
                             self._scan(int(value))
                         elif command == "prewarm":
                             self._prewarm(int(value))
+                        elif command == "diagnostics":
+                            self.diagnostics_enabled = bool(value)
                         elif (
                             command == "move"
                             and self.context_valid
@@ -2676,8 +2973,6 @@ def _run_windows(args: argparse.Namespace) -> int:
         WM_QUIT = 0x0012
         VK_CONTROL = 0x11
         VK_MENU = 0x12
-        VK_N = 0x4E
-        VK_Q = 0x51
 
         def __init__(
             self,
@@ -2771,10 +3066,11 @@ def _run_windows(args: argparse.Namespace) -> int:
                 return 1
 
             ctrl_alt = self._pressed(self.VK_CONTROL) and self._pressed(self.VK_MENU)
-            if is_down and ctrl_alt and vk in (self.VK_N, self.VK_Q):
+            hotkey_action = global_hotkey_action(vk)
+            if is_down and ctrl_alt and hotkey_action is not None:
                 self._swallowed.add(vk)
                 if not was_down:
-                    self._on_action("toggle" if vk == self.VK_N else "quit")
+                    self._on_action(hotkey_action)
                 return 1
 
             action = keyboard_navigation_action(vk)
@@ -2852,7 +3148,7 @@ def _run_windows(args: argparse.Namespace) -> int:
     app.setApplicationName("Remote Mic Element Navigation Prototype")
     prototype_process_id = int(kernel32.GetCurrentProcessId())
     overlay = NavigationOverlay()
-    worker = AutomationWorker()
+    worker = AutomationWorker(diagnostics_enabled=bool(args.diagnostics))
     worker.start()
     keyboard_events: queue.Queue[str] = queue.Queue()
     active = threading.Event()
@@ -2863,6 +3159,7 @@ def _run_windows(args: argparse.Namespace) -> int:
     prewarm_requested_hwnd = 0
     navigation_root_hwnd = 0
     navigation_process_id = 0
+    diagnostics_enabled = bool(args.diagnostics)
 
     def enqueue_keyboard_action(action: str) -> None:
         keyboard_events.put(action)
@@ -2888,8 +3185,17 @@ def _run_windows(args: argparse.Namespace) -> int:
 
     def handle_keyboard_action(action: str) -> None:
         nonlocal scanning, navigation_root_hwnd, navigation_process_id
+        nonlocal diagnostics_enabled
         if action == "quit":
             request_quit()
+        elif action == "toggle_diagnostics":
+            diagnostics_enabled = not diagnostics_enabled
+            worker.post("diagnostics", diagnostics_enabled)
+            print(
+                "导航诊断已开启。每次方向移动都会解释候选排序。"
+                if diagnostics_enabled
+                else "导航诊断已关闭。"
+            )
         elif action == "toggle":
             if active.is_set():
                 leave_navigation()
@@ -3034,6 +3340,8 @@ def _run_windows(args: argparse.Namespace) -> int:
                     f"已跳过当前无法命中的元素: "
                     f"{payload.name or payload.control_type}"
                 )
+            elif event == "navigation_diagnostic":
+                print(format_navigation_diagnostic(payload), flush=True)
             elif event == "error":
                 command = payload["command"]
                 message = payload["message"]
@@ -3105,10 +3413,13 @@ def _run_windows(args: argparse.Namespace) -> int:
     app.aboutToQuit.connect(cleanup)
     print("元素导航键盘原型已启动。")
     print(
-        "Ctrl+Alt+N 开始/退出，方向键移动，PageUp/PageDown 切换父子元素，"
+        "Ctrl+Alt+N 开始/退出，Ctrl+Alt+D 开关导航诊断，"
+        "方向键移动，PageUp/PageDown 切换父子元素，"
         "Enter 左击（快速两次为双击），菜单键右击，音量键滚动，"
         "Esc 退出，Ctrl+Alt+Q 关闭。"
     )
+    if diagnostics_enabled:
+        print("导航诊断已开启。每次方向移动都会解释候选排序。")
     return int(app.exec())
 
 

@@ -346,6 +346,82 @@ class SpatialNavigationTests(unittest.TestCase):
             0,
         )
 
+    def test_navigation_diagnostic_explains_ranking_and_rejections(self):
+        targets = [
+            self.target(100, 100, 160, 140, "current", path=(0, 2, 0)),
+            self.target(190, 100, 250, 140, "same lane", path=(0, 2, 1)),
+            self.target(180, 180, 240, 220, "diagonal", path=(0, 2, 2)),
+            self.target(20, 100, 80, 140, "wrong way", path=(0, 1, 0)),
+        ]
+        ranked = prototype.ranked_target_indices(
+            targets, 0, prototype.Direction.RIGHT
+        )
+        diagnostic = prototype.build_navigation_diagnostic(
+            targets,
+            0,
+            prototype.Direction.RIGHT,
+            ranked_indices=ranked,
+            available_indices=ranked,
+            selected_index=1,
+            outcome="selected",
+        )
+
+        self.assertIsNotNone(diagnostic)
+        assert diagnostic is not None
+        self.assertEqual([item.index for item in diagnostic.candidates], [1, 2])
+        self.assertEqual([item.route for item in diagnostic.candidates], ["lane", "diagonal"])
+        self.assertEqual(dict(diagnostic.rejected_counts)["wrong_direction"], 1)
+        rendered = prototype.format_navigation_diagnostic(diagnostic)
+        self.assertIn("最终选中", rendered)
+        self.assertIn("同一通道", rendered)
+        self.assertIn("不在请求方向 1 个", rendered)
+
+    def test_navigation_diagnostic_marks_horizontal_wrap(self):
+        targets = [
+            self.target(900, 100, 960, 140, "row end", path=(0, 2, 0)),
+            self.target(500, 180, 560, 220, "next row", path=(0, 2, 1)),
+        ]
+        diagnostic = prototype.build_navigation_diagnostic(
+            targets,
+            0,
+            prototype.Direction.RIGHT,
+            available_indices=(1,),
+            selected_index=1,
+            outcome="selected",
+        )
+
+        self.assertIsNotNone(diagnostic)
+        assert diagnostic is not None
+        self.assertEqual(diagnostic.candidates[0].route, "wrap")
+        self.assertIn("跨行补充", prototype.format_navigation_diagnostic(diagnostic))
+
+    def test_navigation_diagnostic_marks_cached_reverse_return(self):
+        targets = [
+            self.target(100, 100, 300, 300, "parent"),
+            self.target(120, 200, 180, 240, "child"),
+        ]
+        graph = prototype.NavigationGraph(targets)
+        self.assertEqual(graph.candidates(0, prototype.Direction.DOWN)[0], 1)
+        reverse = graph.candidates(1, prototype.Direction.UP)
+        diagnostic = prototype.build_navigation_diagnostic(
+            targets,
+            1,
+            prototype.Direction.UP,
+            ranked_indices=reverse,
+            available_indices=reverse,
+            selected_index=0,
+            outcome="selected",
+        )
+
+        self.assertIsNotNone(diagnostic)
+        assert diagnostic is not None
+        self.assertEqual(diagnostic.candidates[0].route, "reverse")
+        self.assertIn("反向返回", prototype.format_navigation_diagnostic(diagnostic))
+
+    def test_navigation_diagnostics_are_opt_in(self):
+        self.assertFalse(prototype._parse_args([]).diagnostics)
+        self.assertTrue(prototype._parse_args(["--diagnostics"]).diagnostics)
+
     def test_navigation_graph_caches_natural_reverse_edge(self):
         targets = [
             self.target(20, 20, 80, 60, "left"),
@@ -445,6 +521,15 @@ class SpatialNavigationTests(unittest.TestCase):
             expected,
         )
         self.assertIsNone(prototype.keyboard_navigation_action(0x70))
+
+    def test_global_hotkey_maps_the_diagnostics_toggle(self):
+        self.assertEqual(
+            prototype.global_hotkey_action(prototype.VK_D),
+            "toggle_diagnostics",
+        )
+        self.assertEqual(prototype.global_hotkey_action(prototype.VK_N), "toggle")
+        self.assertEqual(prototype.global_hotkey_action(prototype.VK_Q), "quit")
+        self.assertIsNone(prototype.global_hotkey_action(0x70))
 
     def test_native_menu_temporarily_receives_navigation_keys(self):
         for vk in (
