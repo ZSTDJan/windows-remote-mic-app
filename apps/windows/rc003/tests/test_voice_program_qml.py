@@ -106,6 +106,7 @@ render(window, app)
 controller.selectedVoiceProgramIndex = 1
 render(window, app)
 elevated = find(window, "voiceProgramElevatedCheckBox")
+elevated_indicator = elevated.property("indicator")
 point = elevated.mapToScene(
     QPointF(elevated.property("width") / 2, elevated.property("height") / 2)
 ).toPoint()
@@ -123,7 +124,7 @@ controls = {
         "voiceProgramCombo",
         "holdVoiceHotkeyField",
         "voiceProgramElevatedCheckBox",
-        "voiceProgramStatusLabel",
+        "voiceProgramLaunchText",
     )
 }
 assert all(control is not None for control in controls.values())
@@ -138,7 +139,7 @@ managed = {
 }
 managed_auto_start = bool(controller.voiceProgramLaunchOnBridgeStart)
 managed_elevated = bool(controller.voiceProgramLaunchElevated)
-managed_status = str(controls["voiceProgramStatusLabel"].property("text"))
+managed_status = str(controls["voiceProgramLaunchText"].property("text"))
 
 
 def rendered_status(
@@ -160,7 +161,7 @@ def rendered_status(
     controller.voiceProgramStatusTextChanged.emit()
     controller.voiceProgramElevationStatusChanged.emit()
     render(window, app)
-    label = controls["voiceProgramStatusLabel"]
+    label = controls["voiceProgramLaunchText"]
     return {
         "text": str(label.property("text")),
         "color": label.property("color").name(),
@@ -267,6 +268,7 @@ result = {
     "window_width": float(window.property("width")),
     "window_height": float(window.property("height")),
     "managed": managed,
+    "elevated_indicator": geometry(elevated_indicator),
     "status": managed_status,
     "managed_auto_start": managed_auto_start,
     "managed_elevated": managed_elevated,
@@ -316,6 +318,13 @@ class VoiceProgramQmlTests(unittest.TestCase):
         self.assertTrue(all(item["enabled"] for item in data["managed"].values()))
         self.assertTrue(data["managed_auto_start"])
         self.assertTrue(data["managed_elevated"])
+        self.assertEqual(data["elevated_indicator"]["width"], 16)
+        self.assertEqual(data["elevated_indicator"]["height"], 16)
+        self.assertAlmostEqual(
+            data["managed"]["voiceProgramCombo"]["geometry"]["y"],
+            data["managed"]["voiceProgramElevatedCheckBox"]["geometry"]["y"],
+            delta=1,
+        )
         self.assertTrue(data["system_managed"]["provider"])
         self.assertFalse(data["system_managed"]["auto_start"])
         self.assertFalse(data["system_managed"]["elevated_visible"])
@@ -345,7 +354,7 @@ class VoiceProgramQmlTests(unittest.TestCase):
         )
         self.assertEqual(
             data["status_cases"]["standard_running"]["text"],
-            "普通权限运行中",
+            "随遥控器服务启动；失败不影响服务",
         )
         self.assertEqual(
             data["status_cases"]["stopped_clean"]["text"],

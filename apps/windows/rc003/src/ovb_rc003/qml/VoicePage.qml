@@ -10,7 +10,9 @@ Item {
     property bool voiceHotkeyRecording: false
     property string voiceHotkeyCaptureError: ""
     readonly property int settingsStateColumnWidth: 54
-    readonly property int settingsActionColumnWidth: tokens.buttonWidth9Chars
+    readonly property int settingsActionColumnWidth: 84
+    readonly property real voiceHotkeyEditorWidth:
+        Math.max(130, endpointCombo.width / 2)
 
     readonly property bool voiceProgramManaged:
         SettingsController.selectedVoiceProgramIndex !== 0
@@ -115,6 +117,22 @@ Item {
                 && SettingsController.voiceProgramCustomPath.length === 0
                 ? qsTr("请选择程序") : qsTr("未找到程序")
         return qsTr("需检查")
+    }
+
+    function voiceProgramLaunchDescription() {
+        const code = SettingsController.voiceProgramStatusCode
+        if (!voiceProgramManaged)
+            return qsTr("只发送语音按键，不启动外部程序")
+        if (windowsDictationSelected)
+            return qsTr("由 Windows 提供听写和联机语音识别")
+        if (voiceProgramNeedsAttention
+                || code === "not_found"
+                || code === "stopped") {
+            return voiceProgramStatusSummary()
+        }
+        if (voiceProgramSystemManaged)
+            return qsTr("由 Windows 管理，无需本程序启动")
+        return qsTr("随遥控器服务启动；失败不影响服务")
     }
 
     function startVoiceHotkeyCapture() {
@@ -477,8 +495,7 @@ Item {
                     stateColumnWidth: root.settingsStateColumnWidth
                     actionColumnWidth: root.settingsActionColumnWidth
                     titleText: qsTr("选择程序")
-                    descriptionObjectName: "voiceProgramStatusLabel"
-                    descriptionText: root.voiceProgramStatusSummary()
+                    descriptionText: ""
                     stateText: root.voiceProgramManaged ? qsTr("已选择") : qsTr("不管理")
                     stateColor: root.voiceProgramStateColor
 
@@ -495,6 +512,25 @@ Item {
                             Accessible.name: qsTr("语音程序")
                         }
                     ]
+                    CheckBox {
+                        id: voiceProgramElevatedCheckBox
+                        objectName: "voiceProgramElevatedCheckBox"
+                        visible: !root.windowsDictationSelected
+                            && !root.voiceProgramSystemManaged
+                        implicitHeight: tokens.controlHeight
+                        Layout.fillWidth: true
+                        leftPadding: 0
+                        rightPadding: 0
+                        spacing: tokens.spacingSmall
+                        indicator.width: 16
+                        indicator.height: 16
+                        enabled: root.voiceProgramManaged
+                        text: qsTr("管理员启动")
+                        font.family: tokens.fontFamily
+                        font.pixelSize: tokens.fontSizeSmall
+                        checked: SettingsController.voiceProgramLaunchElevated
+                        onClicked: SettingsController.voiceProgramLaunchElevated = checked
+                    }
                 }
 
                 InlineSettingsRow {
@@ -530,6 +566,7 @@ Item {
                 InlineSettingsRow {
                     objectName: "voiceHotkeyRow"
                     tokens: root.tokens
+                    editorColumnWidth: root.voiceHotkeyEditorWidth
                     stateColumnWidth: root.settingsStateColumnWidth
                     actionColumnWidth: root.settingsActionColumnWidth
                     titleText: qsTr("语音按键")
@@ -545,7 +582,6 @@ Item {
                             objectName: "holdVoiceHotkeyField"
                             tokens: root.tokens
                             Layout.fillWidth: true
-                            Layout.minimumWidth: 130
                             readOnly: true
                             text: root.voiceHotkeyRecording
                                 ? qsTr("请按快捷键")
@@ -563,7 +599,7 @@ Item {
                         visible: root.windowsDictationSelected
                         tokens: root.tokens
                         Layout.fillWidth: true
-                        text: qsTr("使用 Win+H")
+                        text: qsTr("Win+H")
                         onClicked: SettingsController.useWindowsDictationHotkey()
                     }
                 }
@@ -576,13 +612,7 @@ Item {
                     titleText: root.windowsDictationSelected
                         ? qsTr("系统设置") : qsTr("程序启动")
                     descriptionObjectName: "voiceProgramLaunchText"
-                    descriptionText: root.windowsDictationSelected
-                        ? qsTr("由 Windows 提供听写和联机语音识别")
-                        : root.voiceProgramSystemManaged
-                            ? qsTr("由 Windows 管理，无需本程序启动")
-                            : root.voiceProgramManaged
-                                ? qsTr("随遥控器服务启动；失败不影响服务")
-                                : qsTr("只发送语音按键，不启动外部程序")
+                    descriptionText: root.voiceProgramLaunchDescription()
                     showDivider: false
 
                     CompactButton {
@@ -590,22 +620,8 @@ Item {
                         visible: root.windowsDictationSelected
                         tokens: root.tokens
                         Layout.fillWidth: true
-                        text: qsTr("Windows 语音设置")
+                        text: qsTr("语音设置")
                         onClicked: SettingsController.openSpeechSettings()
-                    }
-                    CheckBox {
-                        id: voiceProgramElevatedCheckBox
-                        objectName: "voiceProgramElevatedCheckBox"
-                        visible: !root.windowsDictationSelected
-                            && !root.voiceProgramSystemManaged
-                        implicitHeight: tokens.controlHeight
-                        Layout.fillWidth: true
-                        enabled: root.voiceProgramManaged
-                        text: qsTr("管理员启动")
-                        font.family: tokens.fontFamily
-                        font.pixelSize: tokens.fontSizeSmall
-                        checked: SettingsController.voiceProgramLaunchElevated
-                        onClicked: SettingsController.voiceProgramLaunchElevated = checked
                     }
                 }
             }

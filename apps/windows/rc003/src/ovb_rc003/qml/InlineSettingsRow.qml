@@ -11,6 +11,7 @@ Rectangle {
     property string stateText: ""
     property color stateColor: tokens.textSecondary
     property int titleWidth: 72
+    property real editorColumnWidth: 0
     property int stateColumnWidth: 0
     property int actionColumnWidth: 0
     property bool showDivider: true
@@ -53,8 +54,13 @@ Rectangle {
                 ? root.objectName + "_editorColumn" : ""
             visible: children.length > 0
             spacing: root.tokens.spacingSmall
-            Layout.fillWidth: visible
-            Layout.minimumWidth: 0
+            Layout.fillWidth: visible && root.editorColumnWidth <= 0
+            Layout.preferredWidth: root.editorColumnWidth > 0
+                ? root.editorColumnWidth : implicitWidth
+            Layout.minimumWidth: root.editorColumnWidth > 0
+                ? root.editorColumnWidth : 0
+            Layout.maximumWidth: root.editorColumnWidth > 0
+                ? root.editorColumnWidth : 16777215
         }
 
         UiLabel {

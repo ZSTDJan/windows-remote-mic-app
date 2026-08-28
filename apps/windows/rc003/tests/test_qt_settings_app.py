@@ -4323,7 +4323,7 @@ class SettingsShellSourceContractTests(unittest.TestCase):
 
     def test_voice_rows_use_the_shared_fixed_action_column(self):
         self.assertIn(
-            "settingsActionColumnWidth: tokens.buttonWidth9Chars",
+            "settingsActionColumnWidth: 84",
             self.voice_qml,
         )
         self.assertRegex(
@@ -4665,7 +4665,7 @@ class OffscreenQmlLoadTests(unittest.TestCase):
                 for column in action_columns:
                     self.assertTrue(column["visible"])
                     self.assertAlmostEqual(column["x"], reference_action["x"], delta=1)
-                    self.assertAlmostEqual(column["width"], 120, delta=1)
+                    self.assertAlmostEqual(column["width"], 84, delta=1)
                 for column in state_columns:
                     self.assertTrue(column["visible"])
                     self.assertAlmostEqual(column["x"], reference_state["x"], delta=1)
@@ -4678,15 +4678,26 @@ class OffscreenQmlLoadTests(unittest.TestCase):
                 ):
                     self.assertTrue(control["visible"])
                     self.assertAlmostEqual(control["x"], reference_action["x"], delta=1)
-                    self.assertAlmostEqual(control["width"], 120, delta=1)
+                    self.assertAlmostEqual(control["width"], 84, delta=1)
                     self.assertLessEqual(control["right"], width + 1)
 
-                editors = list(voice_columns["editors"].values())
+                editor_map = voice_columns["editors"]
+                editors = list(editor_map.values())
                 for editor in editors:
                     self.assertTrue(editor["visible"])
                     self.assertAlmostEqual(editor["x"], editors[0]["x"], delta=1)
                     self.assertGreaterEqual(editor["width"], 130)
                     self.assertLessEqual(editor["right"], reference_state["x"] + 1)
+                self.assertAlmostEqual(
+                    editor_map["voiceProgramCombo"]["width"],
+                    editor_map["endpointCombo"]["width"],
+                    delta=1,
+                )
+                self.assertAlmostEqual(
+                    editor_map["holdVoiceHotkeyField"]["width"],
+                    editor_map["endpointCombo"]["width"] / 2,
+                    delta=1,
+                )
 
     def _legacy_settings_shell_fits_supported_logical_viewports_without_horizontal_overflow(self):
         import json
