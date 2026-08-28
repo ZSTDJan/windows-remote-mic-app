@@ -103,6 +103,11 @@ HORIZONTAL_LANE_MIN_OVERLAP_RATIO = 0.50
 HORIZONTAL_LANE_MIN_CENTER_TOLERANCE = 12.0
 HORIZONTAL_LANE_MAX_CENTER_TOLERANCE = 48.0
 HORIZONTAL_LANE_SIZE_MULTIPLIER = 0.75
+VERTICAL_LANE_MIN_OVERLAP_RATIO = 0.35
+VERTICAL_LANE_MIN_CENTER_TOLERANCE = 16.0
+VERTICAL_LANE_MAX_CENTER_TOLERANCE = 96.0
+VERTICAL_LANE_SIZE_MULTIPLIER = 0.35
+GRID_SAFE_CELL_MAX_CHILDREN = 24
 VK_RETURN = 0x0D
 VK_ESCAPE = 0x1B
 VK_PAGEUP = 0x21
@@ -437,85 +442,142 @@ def target_has_finer_descendant(
     )
 
 
-def defer_broad_targets_after_descendants(
-    targets: Sequence[TargetSnapshot],
-    ordered_indices: Sequence[int],
-    descendants_by_target: Sequence[Sequence[int]],
-    current: Optional[Rect] = None,
-    direction: Optional[Direction] = None,
-) -> list[int]:
-    """Let a broad target yield only to its own suitable finer actions."""
-
-    ordered = list(ordered_indices)
-    broad_indices = sorted(
-        (
-            index
-            for index in ordered
-            if 0 <= index < len(descendants_by_target)
-            and descendants_by_target[index]
-        ),
-        key=lambda index: targets[index].rect.width * targets[index].rect.height,
+def _clip_rect(rect: Rect, bounds: Rect) -> Optional[Rect]:
+    clipped = Rect(
+        max(rect.left, bounds.left),
+        max(rect.top, bounds.top),
+        min(rect.right, bounds.right),
+        min(rect.bottom, bounds.bottom),
     )
-    for broad_index in broad_indices:
-        if broad_index not in ordered:
+    return clipped if clipped.width > 0 and clipped.height > 0 else None
+
+
+def _merged_intervals(
+    intervals: Sequence[tuple[int, int]], start: int, end: int
+) -> list[tuple[int, int]]:
+    merged: list[tuple[int, int]] = []
+    for interval_start, interval_end in sorted(intervals):
+        interval_start = max(start, interval_start)
+        interval_end = min(end, interval_end)
+        if interval_end <= interval_start:
             continue
-        broad_score = (
-            direction_score(current, targets[broad_index].rect, direction)
-            if current is not None and direction is not None
-            else None
+        if merged and interval_start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], interval_end))
+        else:
+            merged.append((interval_start, interval_end))
+    return merged
+
+
+def _interval_gaps(
+    occupied: Sequence[tuple[int, int]], start: int, end: int
+) -> list[tuple[int, int]]:
+    gaps: list[tuple[int, int]] = []
+    cursor = start
+    for interval_start, interval_end in occupied:
+        if interval_start > cursor:
+            gaps.append((cursor, interval_start))
+        cursor = max(cursor, interval_end)
+    if cursor < end:
+        gaps.append((cursor, end))
+    return gaps
+
+
+def target_grid_rect(
+    targets: Sequence[TargetSnapshot],
+    target_index: int,
+    descendants_by_target: Sequence[Sequence[int]],
+) -> Rect:
+    """Return the target's own clickable cell, excluding retained child actions."""
+
+    target = targets[target_index]
+    child_rects = [
+        clipped
+        for child_index in descendants_by_target[target_index]
+        if target_is_action_descendant(target, targets[child_index])
+        and (clipped := _clip_rect(targets[child_index].rect, target.rect))
+        is not None
+    ]
+    if not child_rects:
+        return target.rect
+
+    candidates: list[Rect] = []
+    occupied_x = _merged_intervals(
+        [(rect.left, rect.right) for rect in child_rects],
+        target.rect.left,
+        target.rect.right,
+    )
+    occupied_y = _merged_intervals(
+        [(rect.top, rect.bottom) for rect in child_rects],
+        target.rect.top,
+        target.rect.bottom,
+    )
+    for left, right in _interval_gaps(
+        occupied_x, target.rect.left, target.rect.right
+    ):
+        candidates.append(Rect(left, target.rect.top, right, target.rect.bottom))
+    for top, bottom in _interval_gaps(
+        occupied_y, target.rect.top, target.rect.bottom
+    ):
+        candidates.append(Rect(target.rect.left, top, target.rect.right, bottom))
+
+    # Sparse embedded controls can leave a useful cell between their X/Y bands.
+    # Adjacent partition cells find that space without an expensive rectangle search.
+    if len(child_rects) <= GRID_SAFE_CELL_MAX_CHILDREN:
+        x_edges = sorted(
+            {
+                target.rect.left,
+                target.rect.right,
+                *(edge for rect in child_rects for edge in (rect.left, rect.right)),
+            }
         )
-        suitable_descendants = []
-        for descendant_index in descendants_by_target[broad_index]:
-            if descendant_index not in ordered:
-                continue
-            if current is not None and direction is not None:
-                descendant_score = direction_score(
-                    current, targets[descendant_index].rect, direction
-                )
-                if broad_score is not None and (
-                    descendant_score is None
-                    or descendant_score[0] > broad_score[0]
+        y_edges = sorted(
+            {
+                target.rect.top,
+                target.rect.bottom,
+                *(edge for rect in child_rects for edge in (rect.top, rect.bottom)),
+            }
+        )
+        for left, right in zip(x_edges, x_edges[1:]):
+            for top, bottom in zip(y_edges, y_edges[1:]):
+                cell = Rect(left, top, right, bottom)
+                if (
+                    cell.width > 0
+                    and cell.height > 0
+                    and not any(cell.intersects(child) for child in child_rects)
                 ):
-                    continue
-                if broad_score is not None and descendant_score is not None:
-                    current_axis_size = (
-                        current.width
-                        if direction in {Direction.LEFT, Direction.RIGHT}
-                        else current.height
-                    )
-                    local_tolerance = max(
-                        96.0,
-                        min(240.0, current_axis_size * 2.5),
-                    )
-                    if (
-                        descendant_score[1]
-                        > broad_score[1] + local_tolerance
-                    ):
-                        continue
-                    current_perpendicular_size = (
-                        current.height
-                        if direction in {Direction.LEFT, Direction.RIGHT}
-                        else current.width
-                    )
-                    perpendicular_tolerance = max(
-                        96.0,
-                        min(240.0, current_perpendicular_size * 2.5),
-                    )
-                    if (
-                        descendant_score[4]
-                        > broad_score[4] + perpendicular_tolerance
-                    ):
-                        continue
-            suitable_descendants.append(descendant_index)
-        if not suitable_descendants:
-            continue
-        broad_position = ordered.index(broad_index)
-        if broad_position >= max(ordered.index(index) for index in suitable_descendants):
-            continue
-        ordered.pop(broad_position)
-        insert_at = max(ordered.index(index) for index in suitable_descendants) + 1
-        ordered.insert(insert_at, broad_index)
-    return ordered
+                    candidates.append(cell)
+
+    usable = [
+        rect
+        for rect in candidates
+        if rect.width > 0
+        and rect.height > 0
+        and not any(rect.intersects(child) for child in child_rects)
+    ]
+    if not usable:
+        return target.rect
+    return max(
+        usable,
+        key=lambda rect: (
+            rect.width * rect.height,
+            -abs(rect.center_y - target.rect.center_y),
+            -abs(rect.center_x - target.rect.center_x),
+            -rect.top,
+            -rect.left,
+        ),
+    )
+
+
+def navigation_grid_rects(
+    targets: Sequence[TargetSnapshot],
+    descendants_by_target: Optional[Sequence[Sequence[int]]] = None,
+) -> tuple[Rect, ...]:
+    if descendants_by_target is None:
+        descendants_by_target = finer_descendant_index_map(targets)
+    return tuple(
+        target_grid_rect(targets, index, descendants_by_target)
+        for index in range(len(targets))
+    )
 
 
 def direction_score(
@@ -531,12 +593,6 @@ def direction_score(
 
     if current == candidate:
         return None
-    # Chromium spatial navigation skips an underlying container when moving
-    # out of an element, while allowing an actionable child inside the current
-    # rectangle to be reached directly.
-    if candidate.contains(current):
-        return None
-
     if direction == Direction.RIGHT:
         if candidate.center_x <= current.center_x:
             return None
@@ -605,8 +661,19 @@ def direction_score(
             or center_offset <= center_tolerance
         ) else 1
     else:
-        # Vertical layouts commonly mix wide rows with narrow child actions.
-        beam_rank = 0 if overlap > 0 else 1
+        smaller_width = max(1, min(current.width, candidate.width))
+        overlap_ratio = overlap / smaller_width
+        center_tolerance = max(
+            VERTICAL_LANE_MIN_CENTER_TOLERANCE,
+            min(
+                VERTICAL_LANE_MAX_CENTER_TOLERANCE,
+                smaller_width * VERTICAL_LANE_SIZE_MULTIPLIER,
+            ),
+        )
+        beam_rank = 0 if (
+            overlap_ratio >= VERTICAL_LANE_MIN_OVERLAP_RATIO
+            or center_offset <= center_tolerance
+        ) else 1
     return (
         beam_rank,
         float(primary_gap),
@@ -768,74 +835,6 @@ def infer_navigation_section_path(
     return section_path
 
 
-def horizontal_wrap_target_indices(
-    targets: Sequence[TargetSnapshot], current_index: int, direction: Direction
-) -> list[int]:
-    """Wrap right/left to a nearby visual row when the current row ends."""
-
-    if direction not in {Direction.RIGHT, Direction.LEFT}:
-        return []
-    if not targets or not 0 <= current_index < len(targets):
-        return []
-    current = targets[current_index]
-    candidates: list[tuple[int, int, float, float, int]] = []
-    for index, candidate in enumerate(targets):
-        if index == current_index:
-            continue
-        vertical_delta = candidate.rect.center_y - current.rect.center_y
-        minimum_row_delta = max(
-            12.0, min(current.rect.height, candidate.rect.height) * 0.60
-        )
-        minimum_horizontal_reset = max(
-            24.0, min(current.rect.width, candidate.rect.width) * 0.35
-        )
-        if direction == Direction.RIGHT:
-            if (
-                vertical_delta < minimum_row_delta
-                or current.rect.center_x - candidate.rect.center_x
-                < minimum_horizontal_reset
-                or candidate.rect.top < current.rect.bottom
-            ):
-                continue
-            row_gap = max(0, candidate.rect.top - current.rect.bottom)
-            edge_order = candidate.rect.left
-        else:
-            if (
-                vertical_delta > -minimum_row_delta
-                or candidate.rect.center_x - current.rect.center_x
-                < minimum_horizontal_reset
-                or candidate.rect.bottom > current.rect.top
-            ):
-                continue
-            row_gap = max(0, current.rect.top - candidate.rect.bottom)
-            edge_order = -candidate.rect.right
-
-        max_row_gap = max(
-            96.0,
-            min(
-                320.0,
-                max(current.rect.height, candidate.rect.height) * 4.0,
-            ),
-        )
-        if row_gap > max_row_gap:
-            continue
-        common_prefix = _common_path_prefix_length(current.path, candidate.path)
-        if current.path and candidate.path and common_prefix == 0:
-            continue
-        candidates.append(
-            (
-                row_gap,
-                abs(vertical_delta),
-                -common_prefix,
-                edge_order,
-                index,
-            )
-        )
-
-    candidates.sort()
-    return [index for *_score, index in candidates]
-
-
 def _horizontal_section_gap(
     current: Rect, candidate: Rect, direction: Direction
 ) -> Optional[float]:
@@ -884,6 +883,7 @@ def horizontal_adjacent_section_target_indices(
     current_index: int,
     direction: Direction,
     candidate_indices: Sequence[int],
+    grid_rects: Optional[Sequence[Rect]] = None,
 ) -> list[int]:
     if (
         direction not in {Direction.RIGHT, Direction.LEFT}
@@ -891,6 +891,9 @@ def horizontal_adjacent_section_target_indices(
     ):
         return []
     current = targets[current_index]
+    current_rect = (
+        current.rect if grid_rects is None else grid_rects[current_index]
+    )
     if not current.section_path or current.section_rect is None:
         return []
 
@@ -908,7 +911,10 @@ def horizontal_adjacent_section_target_indices(
         )
         if section_gap is None:
             continue
-        score = direction_score(current.rect, candidate.rect, direction)
+        candidate_rect = (
+            candidate.rect if grid_rects is None else grid_rects[index]
+        )
+        score = direction_score(current_rect, candidate_rect, direction)
         if score is None:
             continue
         adjacent.append((section_gap, index))
@@ -955,6 +961,7 @@ def horizontal_section_target_indices(
     direction: Direction,
     candidate_indices: Sequence[int],
     adjacent_section_indices: Sequence[int],
+    grid_rects: Optional[Sequence[Rect]] = None,
 ) -> list[int]:
     """Order the current and immediately adjacent horizontal regions."""
 
@@ -964,6 +971,9 @@ def horizontal_section_target_indices(
     ):
         return []
     current = targets[current_index]
+    current_rect = (
+        current.rect if grid_rects is None else grid_rects[current_index]
+    )
     if not current.section_path or current.section_rect is None:
         return []
 
@@ -991,22 +1001,33 @@ def horizontal_section_target_indices(
         return ordered
 
     same_score = direction_score(
-        current.rect, targets[best_same].rect, direction
+        current_rect,
+        targets[best_same].rect if grid_rects is None else grid_rects[best_same],
+        direction,
     )
     adjacent_score = direction_score(
-        current.rect, targets[best_adjacent].rect, direction
+        current_rect,
+        (
+            targets[best_adjacent].rect
+            if grid_rects is None
+            else grid_rects[best_adjacent]
+        ),
+        direction,
     )
     if same_score is None or adjacent_score is None:
         return ordered
 
     same_target = targets[best_same]
+    same_target_rect = (
+        same_target.rect if grid_rects is None else grid_rects[best_same]
+    )
     maximum_center_offset = max(
         SECTION_BRIDGE_BASE_DISTANCE,
-        current.rect.height * SECTION_BRIDGE_SIZE_MULTIPLIER,
-        same_target.rect.height * SECTION_BRIDGE_SIZE_MULTIPLIER,
+        current_rect.height * SECTION_BRIDGE_SIZE_MULTIPLIER,
+        same_target_rect.height * SECTION_BRIDGE_SIZE_MULTIPLIER,
     )
     primary_center_distance = abs(
-        same_target.rect.center_x - current.rect.center_x
+        same_target_rect.center_x - current_rect.center_x
     )
     relative_center_offset = max(
         SECTION_BRIDGE_MIN_PERPENDICULAR,
@@ -1021,24 +1042,63 @@ def horizontal_section_target_indices(
     return ordered
 
 
+def _direction_rank_key(
+    current: Rect,
+    candidate: Rect,
+    direction: Direction,
+    score: tuple[int, float, float, float, float, int, int],
+    common_prefix: int,
+) -> tuple[float, ...]:
+    if direction == Direction.RIGHT:
+        forward_center_distance = candidate.center_x - current.center_x
+    elif direction == Direction.LEFT:
+        forward_center_distance = current.center_x - candidate.center_x
+    elif direction == Direction.DOWN:
+        forward_center_distance = candidate.center_y - current.center_y
+    else:
+        forward_center_distance = current.center_y - candidate.center_y
+    if score[0] == 0:
+        axis_distance = score[1]
+        secondary_distance = score[4]
+        forward_distance = score[2]
+    else:
+        axis_distance = score[4] / max(1.0, forward_center_distance)
+        secondary_distance = score[2]
+        forward_distance = forward_center_distance
+    return (
+        float(score[0]),
+        axis_distance,
+        secondary_distance,
+        forward_distance,
+        forward_center_distance,
+        score[3],
+        float(-common_prefix),
+        float(score[5]),
+        float(score[6]),
+    )
+
+
 def ranked_target_indices(
     targets: Sequence[TargetSnapshot],
     current_index: int,
     direction: Direction,
     descendants_by_target: Optional[Sequence[Sequence[int]]] = None,
+    grid_rects: Optional[Sequence[Rect]] = None,
 ) -> list[int]:
     if not targets or not 0 <= current_index < len(targets):
         return []
-    current = targets[current_index].rect
     if descendants_by_target is None:
         descendants_by_target = finer_descendant_index_map(targets)
+    if grid_rects is None:
+        grid_rects = navigation_grid_rects(targets, descendants_by_target)
+    current = grid_rects[current_index]
     scored: list[
         tuple[tuple[int, float, float, float, float, int, int], int, int]
     ] = []
     for index, target in enumerate(targets):
         if index == current_index:
             continue
-        score = direction_score(current, target.rect, direction)
+        score = direction_score(current, grid_rects[index], direction)
         if score is not None:
             common_prefix = _common_path_prefix_length(
                 targets[current_index].path, target.path
@@ -1051,57 +1111,24 @@ def ranked_target_indices(
         ],
     ) -> tuple[float, ...]:
         score, common_prefix, index = item
-        candidate = targets[index].rect
-        contained_rank = 0.0 if current.contains(candidate) else 1.0
-        if direction == Direction.RIGHT:
-            forward_center_distance = candidate.center_x - current.center_x
-        elif direction == Direction.LEFT:
-            forward_center_distance = current.center_x - candidate.center_x
-        elif direction == Direction.DOWN:
-            forward_center_distance = candidate.center_y - current.center_y
-        else:
-            forward_center_distance = current.center_y - candidate.center_y
-        if score[0] == 0:
-            axis_distance = score[1]
-            secondary_distance = score[4]
-            forward_distance = score[2]
-        else:
-            axis_distance = score[2]
-            secondary_distance = score[4]
-            forward_distance = score[1]
-        return (
-            contained_rank,
-            float(score[0]),
-            axis_distance,
-            secondary_distance,
-            forward_distance,
-            forward_center_distance,
-            score[3],
-            float(-common_prefix),
-            float(score[5]),
-            float(score[6]),
+        return _direction_rank_key(
+            current,
+            grid_rects[index],
+            direction,
+            score,
+            common_prefix,
         )
 
     scored.sort(key=rank_key)
-    directional = defer_broad_targets_after_descendants(
-        targets,
-        [index for _score, _prefix, index in scored],
-        descendants_by_target,
-        current,
-        direction,
-    )
+    directional = [index for _score, _prefix, index in scored]
     if direction not in {Direction.RIGHT, Direction.LEFT}:
         return directional
-
-    # Horizontal keys first exhaust real candidates in the requested
-    # half-plane. Reading-order wrap is only a final fallback for a row end;
-    # it never outranks an element that is actually to the left or right.
-    wrapped = horizontal_wrap_target_indices(targets, current_index, direction)
     section_exits = horizontal_adjacent_section_target_indices(
         targets,
         current_index,
         direction,
         directional,
+        grid_rects,
     )
     section_targets = horizontal_section_target_indices(
         targets,
@@ -1109,85 +1136,125 @@ def ranked_target_indices(
         direction,
         directional,
         section_exits,
+        grid_rects,
     )
-    ranked = list(section_targets or directional)
-    ranked.extend(index for index in directional if index not in ranked)
-    ranked.extend(index for index in wrapped if index not in ranked)
-    return defer_broad_targets_after_descendants(
-        targets,
-        ranked,
-        descendants_by_target,
-        current,
-        direction,
-    )
+    if not section_targets:
+        return directional
+    return section_targets + [
+        index for index in directional if index not in section_targets
+    ]
 
 
-def visual_traversal_indices(
+def best_grid_target_index(
     targets: Sequence[TargetSnapshot],
     current_index: int,
     direction: Direction,
-    descendants_by_target: Optional[Sequence[Sequence[int]]] = None,
-) -> list[int]:
-    """Return a cyclic visual order used only after spatial candidates run out."""
+    grid_rects: Sequence[Rect],
+) -> Optional[int]:
+    """Return only the first grid neighbor without sorting every candidate."""
 
-    if not targets or not 0 <= current_index < len(targets):
-        return []
-    if descendants_by_target is None:
-        descendants_by_target = finer_descendant_index_map(targets)
-    if direction in {Direction.RIGHT, Direction.LEFT}:
-        ordered = sorted(
-            range(len(targets)),
-            key=lambda index: (
-                targets[index].rect.top,
-                targets[index].rect.left,
-                targets[index].rect.width * targets[index].rect.height,
-                index,
+    current = grid_rects[current_index]
+    scored: dict[
+        int,
+        tuple[
+            tuple[int, float, float, float, float, int, int],
+            tuple[float, ...],
+        ],
+    ] = {}
+    for index, target in enumerate(targets):
+        if index == current_index:
+            continue
+        score = direction_score(current, grid_rects[index], direction)
+        if score is None:
+            continue
+        common_prefix = _common_path_prefix_length(
+            targets[current_index].path, target.path
+        )
+        scored[index] = (
+            score,
+            _direction_rank_key(
+                current,
+                grid_rects[index],
+                direction,
+                score,
+                common_prefix,
             ),
         )
-    else:
-        ordered = sorted(
-            range(len(targets)),
-            key=lambda index: (
-                targets[index].rect.left,
-                targets[index].rect.top,
-                targets[index].rect.width * targets[index].rect.height,
-                index,
-            ),
+    if not scored:
+        return None
+    best_directional = min(scored, key=lambda index: scored[index][1])
+    if direction not in {Direction.RIGHT, Direction.LEFT}:
+        return best_directional
+
+    current_target = targets[current_index]
+    if not current_target.section_path or current_target.section_rect is None:
+        return best_directional
+    directional = tuple(scored)
+    adjacent = set(
+        horizontal_adjacent_section_target_indices(
+            targets,
+            current_index,
+            direction,
+            directional,
+            grid_rects,
         )
-    position = ordered.index(current_index)
-    if direction in {Direction.RIGHT, Direction.DOWN}:
-        coverage = ordered[position + 1 :] + ordered[:position]
-    else:
-        coverage = list(reversed(ordered[:position])) + list(
-            reversed(ordered[position + 1 :])
-        )
-    return defer_broad_targets_after_descendants(
-        targets,
-        coverage,
-        descendants_by_target,
-        targets[current_index].rect,
-        direction,
     )
+    same_section = [
+        index
+        for index in directional
+        if targets[index].section_path == current_target.section_path
+    ]
+    adjacent_section = [index for index in directional if index in adjacent]
+    eligible = same_section + [
+        index for index in adjacent_section if index not in same_section
+    ]
+    if not eligible:
+        return best_directional
+    best_eligible = min(eligible, key=lambda index: scored[index][1])
+    if not same_section or not adjacent_section:
+        return best_eligible
+    best_same = min(same_section, key=lambda index: scored[index][1])
+    best_adjacent = min(adjacent_section, key=lambda index: scored[index][1])
+    if best_eligible == best_same:
+        return best_same
+
+    same_score = scored[best_same][0]
+    adjacent_score = scored[best_adjacent][0]
+    same_target_rect = grid_rects[best_same]
+    maximum_center_offset = max(
+        SECTION_BRIDGE_BASE_DISTANCE,
+        current.height * SECTION_BRIDGE_SIZE_MULTIPLIER,
+        same_target_rect.height * SECTION_BRIDGE_SIZE_MULTIPLIER,
+    )
+    primary_center_distance = abs(
+        same_target_rect.center_x - current.center_x
+    )
+    relative_center_offset = max(
+        SECTION_BRIDGE_MIN_PERPENDICULAR,
+        primary_center_distance * SECTION_BRIDGE_PRIMARY_RATIO,
+    )
+    if (
+        same_score[1] <= adjacent_score[1]
+        and same_score[4]
+        <= min(maximum_center_offset, relative_center_offset)
+    ):
+        return best_same
+    return best_eligible
 
 
 DIAGNOSTIC_REJECTION_ORDER = (
     "wrong_direction",
-    "containing_container",
     "same_rectangle",
-    "horizontal_side_filter",
 )
 DIAGNOSTIC_REJECTION_LABELS = {
     "wrong_direction": "不在请求方向",
-    "containing_container": "包住当前元素的底层容器",
     "same_rectangle": "与当前元素同一矩形",
-    "horizontal_side_filter": "横向绕回侧别不符",
 }
 DIAGNOSTIC_ROUTE_LABELS = {
     "lane": "同一通道",
     "diagonal": "斜向候选",
-    "wrap": "跨行补充",
     "reverse": "反向返回",
-    "coverage": "全目标补充",
+    "parent_cell": "父级单元格",
     "section_bridge": "同区网格",
     "section_exit": "相邻区出口",
 }
@@ -1220,41 +1287,58 @@ def build_navigation_diagnostic(
         return None
 
     current = targets[current_index]
+    descendants_by_target = finer_descendant_index_map(targets)
+    grid_rects = navigation_grid_rects(targets, descendants_by_target)
+    current_rect = grid_rects[current_index]
     ranked = tuple(
-        ranked_target_indices(targets, current_index, direction)
+        ranked_target_indices(
+            targets,
+            current_index,
+            direction,
+            descendants_by_target,
+            grid_rects,
+        )
         if ranked_indices is None
         else ranked_indices
     )
-    natural = set(ranked_target_indices(targets, current_index, direction))
-    wrapped_indices = horizontal_wrap_target_indices(
-        targets, current_index, direction
+    natural = set(
+        ranked_target_indices(
+            targets,
+            current_index,
+            direction,
+            descendants_by_target,
+            grid_rects,
+        )
     )
-    wrapped = set(wrapped_indices)
     scored_by_index = {
-        index: direction_score(current.rect, targets[index].rect, direction)
+        index: direction_score(current_rect, grid_rects[index], direction)
         for index in ranked
         if 0 <= index < len(targets) and index != current_index
     }
     all_directional = tuple(
         index for index in ranked if scored_by_index.get(index) is not None
     )
-    section_exit_indices = horizontal_adjacent_section_target_indices(
-        targets,
-        current_index,
-        direction,
-        all_directional,
+    section_exits = set(
+        horizontal_adjacent_section_target_indices(
+            targets,
+            current_index,
+            direction,
+            all_directional,
+            grid_rects,
+        )
     )
-    section_exits = set(section_exit_indices)
     candidates: list[CandidateDiagnostic] = []
     for rank, index in enumerate(ranked, 1):
         if not 0 <= index < len(targets) or index == current_index:
             continue
         target = targets[index]
-        score = direction_score(current.rect, target.rect, direction)
-        if index not in natural and target.rect.contains(current.rect):
+        score = direction_score(current_rect, grid_rects[index], direction)
+        if target.rect.contains(current.rect) and target.rect != current.rect:
+            route = "parent_cell"
+        elif index not in natural and target.rect.contains(current.rect):
             route = "reverse"
         elif index not in natural:
-            route = "coverage"
+            route = "reverse"
         elif index in section_exits:
             route = "section_exit"
         elif (
@@ -1263,10 +1347,8 @@ def build_navigation_diagnostic(
             and target.section_path == current.section_path
         ):
             route = "section_bridge"
-        elif index in wrapped:
-            route = "wrap"
         elif score is None:
-            route = "coverage"
+            route = "reverse"
         elif score is not None and score[0] == 0:
             route = "lane"
         else:
@@ -1293,14 +1375,13 @@ def build_navigation_diagnostic(
     for index, target in enumerate(targets):
         if index == current_index or index in ranked_set:
             continue
-        if target.rect == current.rect:
+        target_rect = grid_rects[index]
+        if target_rect == current_rect:
             reason = "same_rectangle"
-        elif target.rect.contains(current.rect):
-            reason = "containing_container"
-        elif direction_score(current.rect, target.rect, direction) is None:
+        elif direction_score(current_rect, target_rect, direction) is None:
             reason = "wrong_direction"
         else:
-            reason = "horizontal_side_filter"
+            continue
         rejected_counts[reason] += 1
 
     return NavigationDiagnostic(
@@ -1430,31 +1511,295 @@ OPPOSITE_DIRECTION = {
 
 
 class NavigationGraph:
-    """Lazily cache four-way neighbors for one stable target layout."""
+    """Build a stable four-way grid for one target layout."""
 
     def __init__(self, targets: Sequence[TargetSnapshot]) -> None:
         self.targets = tuple(targets)
         self._descendants_by_target = finer_descendant_index_map(self.targets)
+        self.grid_rects = navigation_grid_rects(
+            self.targets, self._descendants_by_target
+        )
         self._natural: dict[tuple[int, Direction], tuple[int, ...]] = {}
         self._ranked: dict[tuple[int, Direction], tuple[int, ...]] = {}
+        self._primary: dict[tuple[int, Direction], int] = {}
+        for current_index in range(len(self.targets)):
+            for direction in Direction:
+                key = (current_index, direction)
+                primary = best_grid_target_index(
+                    self.targets,
+                    current_index,
+                    direction,
+                    self.grid_rects,
+                )
+                if primary is not None:
+                    self._primary[key] = primary
+        self._connect_orphan_cells()
+        self._connect_grid_components()
+
+    def _incoming_counts(self) -> list[int]:
+        counts = [0] * len(self.targets)
+        for target_index in self._primary.values():
+            counts[target_index] += 1
+        return counts
+
+    def _connect_orphan_cells(self) -> None:
+        """Insert otherwise unreachable cells into the nearest mutual grid edge."""
+
+        if len(self.targets) < 3:
+            return
+        while True:
+            incoming = self._incoming_counts()
+            orphan_indices = [
+                index for index, count in enumerate(incoming) if count == 0
+            ]
+            if not orphan_indices:
+                return
+
+            best_bridge: Optional[
+                tuple[float, float, float, int, Direction, int, int]
+            ] = None
+            for orphan_index in orphan_indices:
+                orphan = self.grid_rects[orphan_index]
+                for (source_index, direction), destination_index in tuple(
+                    self._primary.items()
+                ):
+                    if orphan_index in {source_index, destination_index}:
+                        continue
+                    opposite = OPPOSITE_DIRECTION[direction]
+                    if (
+                        self._primary.get((destination_index, opposite))
+                        != source_index
+                    ):
+                        continue
+                    source = self.grid_rects[source_index]
+                    destination = self.grid_rects[destination_index]
+                    source_score = direction_score(source, orphan, direction)
+                    destination_score = direction_score(
+                        orphan, destination, direction
+                    )
+                    if source_score is None or destination_score is None:
+                        continue
+                    if direction in {Direction.LEFT, Direction.RIGHT}:
+                        span = abs(destination.center_x - source.center_x)
+                        orphan_axis = abs(orphan.center_x - source.center_x)
+                    else:
+                        span = abs(destination.center_y - source.center_y)
+                        orphan_axis = abs(orphan.center_y - source.center_y)
+                    if span <= 0 or orphan_axis >= span:
+                        continue
+                    perpendicular = max(source_score[4], destination_score[4])
+                    detour = source_score[3] + destination_score[3]
+                    midpoint_offset = abs(orphan_axis - span / 2)
+                    bridge = (
+                        perpendicular / span,
+                        detour / span,
+                        midpoint_offset / span,
+                        source_index,
+                        direction,
+                        destination_index,
+                        orphan_index,
+                    )
+                    if best_bridge is None or bridge < best_bridge:
+                        best_bridge = bridge
+            if best_bridge is None:
+                return
+
+            (
+                _perpendicular,
+                _detour,
+                _midpoint,
+                source_index,
+                direction,
+                destination_index,
+                orphan_index,
+            ) = best_bridge
+            opposite = OPPOSITE_DIRECTION[direction]
+            self._primary[(source_index, direction)] = orphan_index
+            self._primary[(orphan_index, direction)] = destination_index
+            self._primary[(destination_index, opposite)] = orphan_index
+            self._primary[(orphan_index, opposite)] = source_index
+
+    def _strong_components(self) -> list[tuple[int, ...]]:
+        next_index = 0
+        stack: list[int] = []
+        on_stack: set[int] = set()
+        indices: dict[int, int] = {}
+        low_links: dict[int, int] = {}
+        components: list[tuple[int, ...]] = []
+
+        def visit(node: int) -> None:
+            nonlocal next_index
+            indices[node] = next_index
+            low_links[node] = next_index
+            next_index += 1
+            stack.append(node)
+            on_stack.add(node)
+            neighbors = {
+                target
+                for (source, _direction), target in self._primary.items()
+                if source == node
+            }
+            for neighbor in neighbors:
+                if neighbor not in indices:
+                    visit(neighbor)
+                    low_links[node] = min(low_links[node], low_links[neighbor])
+                elif neighbor in on_stack:
+                    low_links[node] = min(low_links[node], indices[neighbor])
+            if low_links[node] != indices[node]:
+                return
+            component: list[int] = []
+            while stack:
+                member = stack.pop()
+                on_stack.remove(member)
+                component.append(member)
+                if member == node:
+                    break
+            components.append(tuple(component))
+
+        for node in range(len(self.targets)):
+            if node not in indices:
+                visit(node)
+        return components
+
+    def _replacement_penalty(
+        self, source_index: int, direction: Direction
+    ) -> int:
+        existing_index = self._primary.get((source_index, direction))
+        if existing_index is None:
+            return 0
+        score = direction_score(
+            self.grid_rects[source_index],
+            self.grid_rects[existing_index],
+            direction,
+        )
+        return 4 if score is not None and score[0] == 0 else 2
+
+    def _connect_grid_components(self) -> None:
+        """Make the first-neighbor grid reachable from every starting cell."""
+
+        while True:
+            components = self._strong_components()
+            if len(components) <= 1:
+                return
+            component_by_index = {
+                index: component_index
+                for component_index, component in enumerate(components)
+                for index in component
+            }
+            bridges: list[
+                tuple[float, float, float, int, Direction, int]
+            ] = []
+            for first_index in range(len(self.targets)):
+                first = self.grid_rects[first_index]
+                for second_index in range(first_index + 1, len(self.targets)):
+                    if (
+                        component_by_index[first_index]
+                        == component_by_index[second_index]
+                    ):
+                        continue
+                    second = self.grid_rects[second_index]
+                    axes: list[tuple[int, Direction, int]] = []
+                    if first.center_x < second.center_x:
+                        axes.append((first_index, Direction.RIGHT, second_index))
+                    elif second.center_x < first.center_x:
+                        axes.append((second_index, Direction.RIGHT, first_index))
+                    if first.center_y < second.center_y:
+                        axes.append((first_index, Direction.DOWN, second_index))
+                    elif second.center_y < first.center_y:
+                        axes.append((second_index, Direction.DOWN, first_index))
+                    for source_index, direction, destination_index in axes:
+                        opposite = OPPOSITE_DIRECTION[direction]
+                        source_score = direction_score(
+                            self.grid_rects[source_index],
+                            self.grid_rects[destination_index],
+                            direction,
+                        )
+                        destination_score = direction_score(
+                            self.grid_rects[destination_index],
+                            self.grid_rects[source_index],
+                            opposite,
+                        )
+                        if source_score is None or destination_score is None:
+                            continue
+                        replacement = self._replacement_penalty(
+                            source_index, direction
+                        ) + self._replacement_penalty(destination_index, opposite)
+                        forward_distance = (
+                            abs(
+                                self.grid_rects[destination_index].center_x
+                                - self.grid_rects[source_index].center_x
+                            )
+                            if direction == Direction.RIGHT
+                            else abs(
+                                self.grid_rects[destination_index].center_y
+                                - self.grid_rects[source_index].center_y
+                            )
+                        )
+                        angular_offset = max(
+                            source_score[4], destination_score[4]
+                        ) / max(1.0, forward_distance)
+                        bridges.append(
+                            (
+                                float(replacement),
+                                float(max(source_score[0], destination_score[0])),
+                                angular_offset + forward_distance / 10000.0,
+                                source_index,
+                                direction,
+                                destination_index,
+                            )
+                        )
+            bridges.sort()
+            original_count = len(components)
+            connected = False
+            for (
+                _replacement,
+                _lane_rank,
+                _geometry,
+                source_index,
+                direction,
+                destination_index,
+            ) in bridges:
+                opposite = OPPOSITE_DIRECTION[direction]
+                source_key = (source_index, direction)
+                destination_key = (destination_index, opposite)
+                old_source = self._primary.get(source_key)
+                old_destination = self._primary.get(destination_key)
+                self._primary[source_key] = destination_index
+                self._primary[destination_key] = source_index
+                if len(self._strong_components()) < original_count:
+                    connected = True
+                    break
+                if old_source is None:
+                    self._primary.pop(source_key, None)
+                else:
+                    self._primary[source_key] = old_source
+                if old_destination is None:
+                    self._primary.pop(destination_key, None)
+                else:
+                    self._primary[destination_key] = old_destination
+            if not connected:
+                return
 
     def natural_candidates(
         self, current_index: int, direction: Direction
     ) -> tuple[int, ...]:
         key = (current_index, direction)
-        cached = self._natural.get(key)
-        if cached is not None:
-            return cached
-        natural = tuple(
-            ranked_target_indices(
-                self.targets,
-                current_index,
-                direction,
-                self._descendants_by_target,
+        natural = self._natural.get(key)
+        if natural is None:
+            natural = tuple(
+                ranked_target_indices(
+                    self.targets,
+                    current_index,
+                    direction,
+                    self._descendants_by_target,
+                    self.grid_rects,
+                )
             )
-        )
-        self._natural[key] = natural
-        return natural
+            self._natural[key] = natural
+        primary = self._primary.get(key)
+        if primary is None:
+            return natural
+        return (primary,) + tuple(index for index in natural if index != primary)
 
     def candidates(self, current_index: int, direction: Direction) -> tuple[int, ...]:
         key = (current_index, direction)
@@ -1462,14 +1807,7 @@ class NavigationGraph:
         if cached is not None:
             return cached
 
-        natural = self.natural_candidates(current_index, direction)
-        coverage = visual_traversal_indices(
-            self.targets,
-            current_index,
-            direction,
-            self._descendants_by_target,
-        )
-        ranked = natural + tuple(index for index in coverage if index not in natural)
+        ranked = self.natural_candidates(current_index, direction)
         self._ranked[key] = ranked
         return ranked
 
