@@ -747,3 +747,70 @@ UIA/MSAA 的自绘控件仍无法可靠识别；拖拽和任意坐标移动明�
 这不是照搬网页或 Android 源码，而是使用其候选边界和包含关系原则修正 Windows
 UIA 原型。截图回归、真实 Codex 窗口扫描、随机布局和完整测试结果登记在
 `TESTING.md` 的 `CHECK-NAV-003`。
+
+## 17. 2026-08-28 改后横向对照
+
+本轮在修正代码后继续核对 Windows、Qt 和电视端开源实现，目的是确认当前路径没有
+围绕 Codex 截图形成一套只对单一窗口有效的规则。
+
+### 17.1 成熟实现的共同结构
+
+Microsoft WinUI 的 XY Focus 没有只提供一个固定公式，而是提供三种策略：边缘投影、
+靠近方向轴、主轴与次轴曼哈顿距离；同时允许界面对四个方向显式指定目标。没有方向候选
+时默认停在原处，不做全局循环：
+
+- `https://learn.microsoft.com/en-us/uwp/api/windows.ui.xaml.input.xyfocusnavigationstrategy`
+- `https://learn.microsoft.com/en-us/windows/apps/develop/input/gamepad-and-remote-interactions`
+
+Norigin Spatial Navigation 是面向 Tizen、webOS、电视盒子和 React Native TV 的生产库。
+它先要求候选的前缘越过当前元素的后缘，再比较主轴和次轴距离；与当前元素在正交轴上
+相邻重叠的候选会得到更低次轴权重。它还允许按布局选择角点、边缘或中心距离，提供按键
+重复节流、可视化调试和容器级 `nextFocusResolver`：
+
+- `https://github.com/NoriginMedia/Norigin-Spatial-Navigation`
+- `https://devportal.noriginmedia.com/docs/Norigin-Spatial-Navigation/guides/distance-calculation`
+- `https://devportal.noriginmedia.com/docs/Norigin-Spatial-Navigation/api-reference/SpatialNavigation/`
+
+`js-spatial-navigation` 把元素分成显式 section，默认同 section 优先；还能设置直线重叠
+阈值、记住来源、重新进入区域时回到上次焦点，并用 `leaveFor` 或四方向属性覆盖特殊路径。
+隐藏或禁用元素会被过滤：
+
+- `https://github.com/luke-chang/js-spatial-navigation`
+
+Qt Quick `KeyNavigation` 则代表另一端：不猜距离，直接声明上下左右目标；它会自动补反向
+关系，并跳过不可见或禁用项：
+
+- `https://doc.qt.io/qt-6/qml-qtquick-keynavigation.html`
+
+### 17.2 当前原型与它们的关系
+
+当前原型已经具备成熟实现共有的底层能力：先限制请求方向，再优先视觉通道和正交轴重叠，
+比较距离；移动前检查 UIA 元素仍启用、可见和可命中；同方向连续移动防重复，立即反向优先
+回到刚离开的元素；稳定布局缓存四向结果，按键队列限制重复任务。
+
+仍有三点差异：
+
+1. 原型的“跨行绕回”是为本项目实测网格增加的补充，不是 Windows、W3C 或 Norigin 的
+   通用默认。现在它只在正常方向候选不足且 UIA 路径显示同分支更近时优先，边界合理。
+2. 成熟库由界面作者明确提供 section/container；跨软件 UIA 原型只能从控件树和路径推断。
+   原始 UIA path 会随动态页面重排，因此只能作为辅助，不能继续提高到压过明显空间目标。
+3. 成熟库普遍允许固定界面覆盖特殊方向，并提供候选路径调试图。原型目前只有蓝框和控制台
+   结果，遇到新反例时仍要靠额外扫描还原每个候选为什么胜出。
+
+### 17.3 建议
+
+当前不需要替换距离算法，也不建议直接引入上述库。它们运行在自己拥有的 DOM、React、
+XAML 或 QML 元素树中，不能直接控制其它 Windows 软件的 UIA 元素；强行接入只会增加一层
+坐标转换和状态同步。
+
+进入正式 RC003 接入前，建议按以下顺序继续：
+
+1. 先增加可选的导航诊断输出，记录当前元素、候选方向、通道重叠、距离、容器亲和度和最终
+   胜者；只在诊断模式启用，不增加日常按键开销。
+2. 把“同区域”从单纯 path 前缀升级为语义容器：优先识别最近的 List、Tree、Tab、菜单、
+   对话框和主内容 Pane，path 只作回退。这更接近成熟库的 section。
+3. 只有固定软件连续出现无法由通用规则解决的真实路径时，再增加可选的软件级四方向覆盖；
+   不提前维护大量坐标规则，也不把截图编号写进正式逻辑。
+
+因此，改后复核没有发现必须立即推翻的算法问题。当前版本可以继续实测；下一项值得做的是
+“可解释的候选诊断”，不是继续微调权重、增加自由鼠标模式或引入另一套运行时。
