@@ -774,6 +774,12 @@ class RC003App:
             return _VOICE_HOTKEY_BACKEND_WETYPE
         return _VOICE_HOTKEY_BACKEND_MARKED
 
+    def _voice_hotkey_uses_toggle_protocol(self) -> bool:
+        return (
+            self._voice_hotkey_active_backend
+            or self._configured_voice_hotkey_backend()
+        ) == _VOICE_HOTKEY_BACKEND_WETYPE
+
     def _prepare_voice_mapping_locked(
         self,
         button_id: str,
@@ -950,6 +956,16 @@ class RC003App:
         reason: str,
     ) -> bool:
         """Release HOLD shortcuts without depending solely on AUDIO_STOP."""
+
+        if (
+            self._voice_hotkey_uses_toggle_protocol()
+            and self._voice_audio_stream_active
+        ):
+            self._logger.info(
+                "voice provider toggle stop deferred until audio stop on %s",
+                reason,
+            )
+            return True
 
         action = self._voice.on_mic_button_released()
         if action is None:
@@ -2271,8 +2287,22 @@ class RC003App:
                 or self._voice_hotkey_release_pending_backend
                 or backend
             )
+        provider_action = action
+        if (
+            backend == _VOICE_HOTKEY_BACKEND_WETYPE
+            and action
+            in {
+                voice_controller.VoiceHostAction.KEY_DOWN,
+                voice_controller.VoiceHostAction.KEY_UP,
+            }
+        ):
+            provider_action = voice_controller.VoiceHostAction.TAP
+            self._logger.info(
+                "voice provider protocol translated logical %s to shortcut tap",
+                action.value,
+            )
         try:
-            self._send_voice_hotkey_action(action, tokens, backend)
+            self._send_voice_hotkey_action(provider_action, tokens, backend)
             if action == voice_controller.VoiceHostAction.KEY_DOWN:
                 self._voice_hotkey_active_backend = backend
             if action in {

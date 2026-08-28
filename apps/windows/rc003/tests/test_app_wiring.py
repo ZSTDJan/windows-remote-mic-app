@@ -684,7 +684,7 @@ class HostHotkeyFailureSuppressesMicOpenTests(_AppWiringTestCase):
 
         self.assertEqual(calls, [("ralt",)])
 
-    def test_wetype_provider_routes_hold_edges_to_virtual_key_sendinput(self):
+    def test_wetype_provider_translates_physical_hold_edges_to_toggle_taps(self):
         self.app._config["voice_program"] = (
             voice_program_manager.normalize_voice_program_settings(
                 {"provider": voice_program_manager.VOICE_PROGRAM_WETYPE}
@@ -697,13 +697,17 @@ class HostHotkeyFailureSuppressesMicOpenTests(_AppWiringTestCase):
 
         with mock.patch.object(
             win32_input,
-            "send_wetype_voice_key_combo_down",
-            side_effect=lambda tokens: calls.append(("wetype_down", tokens)),
+            "send_wetype_voice_key_combo_tap",
+            side_effect=lambda tokens: calls.append(("wetype_tap", tokens)),
         ), mock.patch.object(
             win32_input,
+            "send_wetype_voice_key_combo_down",
+        ) as wetype_down, mock.patch.object(
+            win32_input,
             "send_wetype_voice_key_combo_up",
-            side_effect=lambda tokens: calls.append(("wetype_up", tokens)),
-        ), mock.patch.object(
+        ) as wetype_up, mock.patch.object(
+            win32_input, "send_voice_key_combo_tap"
+        ) as marked_tap, mock.patch.object(
             win32_input, "send_voice_key_combo_down"
         ) as marked_down, mock.patch.object(
             win32_input, "send_voice_key_combo_up"
@@ -723,12 +727,57 @@ class HostHotkeyFailureSuppressesMicOpenTests(_AppWiringTestCase):
         self.assertEqual(
             calls,
             [
-                ("wetype_down", expected_tokens),
-                ("wetype_up", expected_tokens),
+                ("wetype_tap", expected_tokens),
+                ("wetype_tap", expected_tokens),
             ],
         )
+        wetype_down.assert_not_called()
+        wetype_up.assert_not_called()
+        marked_tap.assert_not_called()
         marked_down.assert_not_called()
         marked_up.assert_not_called()
+
+    def test_wetype_physical_release_waits_for_audio_stop_before_second_tap(self):
+        self.app._config["voice_program"] = (
+            voice_program_manager.normalize_voice_program_settings(
+                {"provider": voice_program_manager.VOICE_PROGRAM_WETYPE}
+            )
+        )
+        self.app._voice_hotkey = app_module.hotkey.HotkeySpec.parse(
+            "lctrl+lshift+f9"
+        )
+        calls = []
+
+        with mock.patch.object(
+            win32_input,
+            "send_wetype_voice_key_combo_tap",
+            side_effect=lambda tokens: calls.append(tokens),
+        ):
+            self.app._handle_mic_button_pressed()
+            self.app._voice_audio_stream_active = True
+            self.assertTrue(self.app._voice_pcm_forwarding_enabled)
+
+            self.assertTrue(
+                self.app._release_hold_voice_on_physical_release_locked(
+                    "test physical release"
+                )
+            )
+
+            self.assertTrue(self.app._voice.active)
+            self.assertTrue(self.app._voice_pcm_forwarding_enabled)
+            self.assertEqual(calls, [("lctrl", "lshift", "f9")])
+
+            self.app._on_control_event(AudioStopped())
+
+        self.assertFalse(self.app._voice.active)
+        self.assertFalse(self.app._voice_pcm_forwarding_enabled)
+        self.assertEqual(
+            calls,
+            [
+                ("lctrl", "lshift", "f9"),
+                ("lctrl", "lshift", "f9"),
+            ],
+        )
 
     def test_non_wetype_providers_keep_the_marked_voice_backend(self):
         providers = (
@@ -767,7 +816,7 @@ class HostHotkeyFailureSuppressesMicOpenTests(_AppWiringTestCase):
         )
         with mock.patch.object(
             win32_input,
-            "send_wetype_voice_key_combo_down",
+            "send_wetype_voice_key_combo_tap",
             side_effect=win32_input.InputCleanupIncompleteError(
                 "simulated stuck WeType modifier"
             ),

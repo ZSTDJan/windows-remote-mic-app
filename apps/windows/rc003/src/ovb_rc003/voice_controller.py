@@ -2,13 +2,14 @@
 
 The RC003 device autonomously tells the host when its own physical mic button
 is pressed (ATVV control opcode 0x08) and when its audio stream stops
-(opcode 0x00) - see atvv_session.py. This module only decides, given the
-configured trigger mode, what host key action that should produce. It
-performs no I/O itself, so it's fully unit testable; the actual SendInput
-call lives in app.py.
+(opcode 0x00) - see atvv_session.py. This module emits logical start/stop
+edges for the physical hold gesture. It performs no I/O itself, so it's
+fully unit testable; app.py translates those edges into the selected
+provider's host shortcut protocol.
 
-- The controller holds the key down while the physical button is held:
-  key-down on mic-button-press, key-up on physical release. The device's
+- The controller reports key-down on mic-button-press and key-up on physical
+  release. Hold providers receive those edges directly; toggle providers may
+  translate each edge into one completed shortcut tap. The device's
   AUDIO_STOP remains a fallback for machines that expose no release edge.
 - Cleanup is provable: reset() reports whether KEY_UP is still owed and never
   leaves the controller thinking a session is active.
