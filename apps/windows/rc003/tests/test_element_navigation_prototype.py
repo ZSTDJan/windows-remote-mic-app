@@ -1,3 +1,4 @@
+import ast
 import importlib.util
 import random
 import sys
@@ -70,6 +71,60 @@ class SpatialNavigationTests(unittest.TestCase):
                 targets, 0, prototype.Direction.RIGHT
             )[:2],
             [2, 1],
+        )
+
+    def test_horizontal_route_uses_an_intermediate_cell_only_in_the_same_row(self):
+        targets = [
+            self.target(100, 100, 160, 140, "current"),
+            self.target(180, 105, 240, 145, "near-row intermediate"),
+            self.target(300, 100, 360, 140, "far row target"),
+        ]
+
+        self.assertEqual(
+            prototype.ranked_target_indices(
+                targets, 0, prototype.Direction.RIGHT
+            )[:2],
+            [1, 2],
+        )
+
+    def test_horizontal_route_skips_an_off_row_intermediate_in_both_directions(self):
+        targets = [
+            self.target(100, 100, 160, 140, "left row target"),
+            self.target(180, 165, 240, 205, "off-row intermediate"),
+            self.target(300, 100, 360, 140, "right row target"),
+        ]
+
+        self.assertEqual(
+            prototype.next_target_index(
+                targets, 0, prototype.Direction.RIGHT
+            ),
+            2,
+        )
+        self.assertEqual(
+            prototype.next_target_index(
+                targets, 2, prototype.Direction.LEFT
+            ),
+            0,
+        )
+
+    def test_horizontal_route_does_not_treat_one_pixel_overlap_as_a_row(self):
+        targets = [
+            self.target(100, 100, 160, 140, "left row target"),
+            self.target(180, 139, 240, 179, "one-pixel overlap"),
+            self.target(300, 100, 360, 140, "right row target"),
+        ]
+
+        self.assertEqual(
+            prototype.next_target_index(
+                targets, 0, prototype.Direction.RIGHT
+            ),
+            2,
+        )
+        self.assertEqual(
+            prototype.next_target_index(
+                targets, 2, prototype.Direction.LEFT
+            ),
+            0,
         )
 
     def test_overlapping_candidates_use_forward_center_distance(self):
@@ -612,6 +667,53 @@ class SpatialNavigationTests(unittest.TestCase):
             2,
         )
 
+    def test_adjacent_pane_includes_its_indented_inner_list(self):
+        body_section = (0, 2)
+        sidebar_section = (0, 1)
+        inner_list_section = sidebar_section + (3,)
+        targets = [
+            self.target(
+                947,
+                1334,
+                2052,
+                1389,
+                "current file action",
+                section_path=body_section,
+                section_rect=prototype.Rect(773, 376, 2226, 1823),
+            ),
+            self.target(
+                345,
+                486,
+                738,
+                531,
+                "outer sidebar row",
+                section_path=sidebar_section,
+                section_rect=prototype.Rect(333, 421, 773, 1754),
+            ),
+            self.target(
+                345,
+                879,
+                738,
+                924,
+                "aligned inner list row",
+                section_path=inner_list_section,
+                section_rect=prototype.Rect(345, 693, 738, 1017),
+            ),
+        ]
+
+        self.assertEqual(
+            prototype.ranked_target_indices(
+                targets, 0, prototype.Direction.LEFT
+            )[:2],
+            [2, 1],
+        )
+        self.assertEqual(
+            prototype.next_target_index(
+                targets, 2, prototype.Direction.RIGHT
+            ),
+            0,
+        )
+
     def test_same_section_left_compares_upper_and_lower_targets_equally(self):
         section = (0, 2)
         section_rect = prototype.Rect(0, 0, 1000, 800)
@@ -860,6 +962,46 @@ class SpatialNavigationTests(unittest.TestCase):
                 path=(0, 1, 0),
                 section_path=(0, 1),
                 section_rect=adjacent_rect,
+            ),
+        ]
+
+        self.assertEqual(
+            prototype.next_target_index(
+                targets, 0, prototype.Direction.LEFT
+            ),
+            2,
+        )
+
+    def test_steep_same_region_diagonal_does_not_beat_an_aligned_adjacent_pane(self):
+        main_section = (0, 2)
+        sidebar_section = (0, 1)
+        targets = [
+            self.target(
+                700,
+                400,
+                740,
+                440,
+                "current",
+                section_path=main_section,
+                section_rect=prototype.Rect(480, 0, 1000, 800),
+            ),
+            self.target(
+                500,
+                625,
+                540,
+                665,
+                "steep same-region diagonal",
+                section_path=main_section,
+                section_rect=prototype.Rect(480, 0, 1000, 800),
+            ),
+            self.target(
+                200,
+                400,
+                440,
+                440,
+                "aligned adjacent pane",
+                section_path=sidebar_section,
+                section_rect=prototype.Rect(0, 0, 480, 800),
             ),
         ]
 
@@ -1200,7 +1342,7 @@ class SpatialNavigationTests(unittest.TestCase):
         tracker.watch(300, 99)
         self.assertIsNone(tracker.state(100, 42))
 
-    def test_dynamic_refresh_only_precedes_wraps_or_distant_diagonals(self):
+    def test_suspicious_moves_only_request_a_later_refresh(self):
         window = prototype.Rect(0, 0, 1600, 900)
         current = prototype.Rect(600, 400, 660, 440)
         self.assertFalse(
@@ -1238,68 +1380,242 @@ class SpatialNavigationTests(unittest.TestCase):
 
         dirty = prototype.DirtyWindowState(1, 20.0)
         self.assertFalse(
-            prototype.dynamic_refresh_due(
+            prototype.background_refresh_due(
                 dirty,
                 20.1,
-                current,
-                prototype.Rect(700, 400, 760, 440),
-                prototype.Direction.RIGHT,
-                window,
-                True,
+                1.0,
+            )
+        )
+        self.assertTrue(
+            prototype.background_refresh_due(
+                dirty,
+                20.2,
+                1.0,
+            )
+        )
+        self.assertTrue(
+            prototype.background_refresh_due(
+                None,
+                20.2,
+                1.0,
+                requested=True,
+                input_idle_for=0.15,
             )
         )
         self.assertFalse(
-            prototype.dynamic_refresh_due(
-                dirty,
+            prototype.background_refresh_due(
+                None,
                 20.2,
-                current,
-                prototype.Rect(700, 400, 760, 440),
-                prototype.Direction.RIGHT,
-                window,
-                True,
-            )
-        )
-        self.assertTrue(
-            prototype.dynamic_refresh_due(
-                dirty,
-                20.2,
-                current,
-                prototype.Rect(1100, 400, 1160, 440),
-                prototype.Direction.RIGHT,
-                window,
-                True,
-            )
-        )
-        self.assertTrue(
-            prototype.dynamic_refresh_due(
-                dirty,
-                20.2,
-                current,
-                prototype.Rect(700, 400, 760, 440),
-                prototype.Direction.RIGHT,
-                window,
-                False,
+                31.0,
+                requested=True,
+                input_idle_for=0.149,
             )
         )
         newly_changed = prototype.DirtyWindowState(2, 20.19)
-        self.assertTrue(
-            prototype.dynamic_refresh_due(
+        self.assertFalse(
+            prototype.background_refresh_due(
                 newly_changed,
                 20.2,
-                current,
-                prototype.Rect(1100, 400, 1160, 440),
-                prototype.Direction.RIGHT,
-                window,
-                True,
-                settle_waited=True,
+                31.0,
+                requested=True,
             )
         )
+        self.assertFalse(prototype.background_refresh_due(None, 20.2, 29.9))
+        self.assertTrue(prototype.background_refresh_due(None, 20.2, 30.0))
 
     def test_dynamic_refresh_fallback_has_a_maximum_cache_age(self):
         self.assertFalse(prototype.dynamic_refresh_fallback_due(4.9, True))
         self.assertTrue(prototype.dynamic_refresh_fallback_due(5.0, True))
         self.assertFalse(prototype.dynamic_refresh_fallback_due(29.9, False))
         self.assertTrue(prototype.dynamic_refresh_fallback_due(30.0, False))
+
+    def test_follow_window_scan_uses_a_short_cooperative_budget(self):
+        self.assertGreater(prototype.FOLLOW_WINDOW_SCAN_BUDGET_SECONDS, 0.0)
+        self.assertLessEqual(prototype.FOLLOW_WINDOW_SCAN_BUDGET_SECONDS, 0.2)
+        self.assertEqual(
+            prototype.bounded_scan_timeout_ms(None, 100, now=10.0), 100
+        )
+        self.assertEqual(
+            prototype.bounded_scan_timeout_ms(9.0, 100, now=10.0), 0
+        )
+        self.assertEqual(
+            prototype.bounded_scan_timeout_ms(10.001, 100, now=10.0), 1
+        )
+        self.assertEqual(
+            prototype.bounded_scan_timeout_ms(11.0, 100, now=10.0), 100
+        )
+
+    def test_interrupted_follow_scan_can_commit_partial_targets(self):
+        self.assertEqual(
+            prototype.scan_commit_decision(3, 3, True, False, True),
+            (True, True),
+        )
+        self.assertEqual(
+            prototype.scan_commit_decision(3, 3, False, True, True),
+            (True, True),
+        )
+        self.assertEqual(
+            prototype.scan_commit_decision(3, 3, True, False, False),
+            (False, False),
+        )
+
+    def test_empty_follow_refresh_has_a_bounded_retry_window(self):
+        self.assertEqual(prototype.FOLLOW_WINDOW_EMPTY_REFRESH_RETRIES, 2)
+        self.assertTrue(
+            prototype.empty_follow_refresh_should_retry(200, 200, 0)
+        )
+        self.assertTrue(
+            prototype.empty_follow_refresh_should_retry(200, 200, 1)
+        )
+        self.assertFalse(
+            prototype.empty_follow_refresh_should_retry(200, 200, 2)
+        )
+        self.assertFalse(
+            prototype.empty_follow_refresh_should_retry(100, 200, 0)
+        )
+
+    def test_stale_scan_result_never_reactivates_navigation(self):
+        self.assertEqual(
+            prototype.scan_commit_decision(3, 4, False, False, True),
+            (False, False),
+        )
+        self.assertEqual(
+            prototype.scan_commit_decision(3, 4, True, True, True),
+            (False, False),
+        )
+        self.assertEqual(
+            prototype.scan_commit_decision(3, 3, False, False, False),
+            (True, False),
+        )
+
+    def test_worker_scan_contract_is_budgeted_and_generation_guarded(self):
+        tree = ast.parse(SCRIPT_PATH.read_text(encoding="utf-8"))
+        functions = {
+            node.name: node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef)
+        }
+        automation_worker = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.ClassDef)
+            and node.name == "AutomationWorker"
+        )
+        worker_functions = {
+            node.name: node
+            for node in automation_worker.body
+            if isinstance(node, ast.FunctionDef)
+        }
+        enumerate_function = worker_functions["_enumerate"]
+        enumerate_args = {
+            argument.arg for argument in enumerate_function.args.args
+        }
+        self.assertIn("allow_partial", enumerate_args)
+        self.assertIn("expected_generation", enumerate_args)
+
+        guarded_commit = False
+        for with_node in (
+            node
+            for node in ast.walk(enumerate_function)
+            if isinstance(node, ast.With)
+        ):
+            calls = {
+                call.func.id
+                for call in ast.walk(with_node)
+                if isinstance(call, ast.Call)
+                and isinstance(call.func, ast.Name)
+            }
+            assigned_attributes = {
+                target.attr
+                for assignment in ast.walk(with_node)
+                if isinstance(assignment, ast.Assign)
+                for target in assignment.targets
+                if isinstance(target, ast.Attribute)
+            }
+            if (
+                "scan_commit_decision" in calls
+                and "context_valid" in assigned_attributes
+            ):
+                guarded_commit = True
+                break
+        self.assertTrue(guarded_commit)
+
+        follow_function = worker_functions["_follow_window"]
+        enumerate_calls = [
+            call
+            for call in ast.walk(follow_function)
+            if isinstance(call, ast.Call)
+            and isinstance(call.func, ast.Attribute)
+            and call.func.attr == "_enumerate"
+        ]
+        self.assertEqual(len(enumerate_calls), 1)
+        keywords = {
+            keyword.arg: keyword.value
+            for keyword in enumerate_calls[0].keywords
+            if keyword.arg is not None
+        }
+        self.assertIn("deadline", keywords)
+        self.assertIn("expected_generation", keywords)
+        self.assertIsInstance(keywords.get("allow_partial"), ast.Constant)
+        self.assertTrue(keywords["allow_partial"].value)
+        self.assertTrue(
+            any(
+                isinstance(call, ast.Call)
+                and isinstance(call.func, ast.Attribute)
+                and call.func.attr == "_request_background_refresh"
+                for call in ast.walk(follow_function)
+            )
+        )
+
+        refresh_function = worker_functions["_refresh_targets"]
+        refresh_enumerations = [
+            call
+            for call in ast.walk(refresh_function)
+            if isinstance(call, ast.Call)
+            and isinstance(call.func, ast.Attribute)
+            and call.func.attr == "_enumerate"
+        ]
+        self.assertEqual(len(refresh_enumerations), 1)
+        self.assertIn(
+            "commit_empty",
+            {
+                keyword.arg
+                for keyword in refresh_enumerations[0].keywords
+                if keyword.arg is not None
+            },
+        )
+
+        handle_function = functions["handle_keyboard_action"]
+        self.assertTrue(
+            any(
+                isinstance(call, ast.Call)
+                and isinstance(call.func, ast.Name)
+                and call.func.id == "prepare_navigation_action"
+                for call in ast.walk(handle_function)
+            )
+        )
+        run_function = worker_functions["_run"]
+        self.assertTrue(
+            any(
+                isinstance(call, ast.Call)
+                and isinstance(call.func, ast.Attribute)
+                and call.func.attr == "_defer_move"
+                for call in ast.walk(run_function)
+            )
+        )
+
+        chromium_activation = functions[
+            "activate_embedded_chromium_accessibility"
+        ]
+        self.assertTrue(
+            any(
+                isinstance(attribute, ast.Attribute)
+                and isinstance(attribute.value, ast.Name)
+                and attribute.value.id == "result"
+                and attribute.attr == "value"
+                for attribute in ast.walk(chromium_activation)
+            )
+        )
 
     def test_global_hotkey_maps_the_diagnostics_toggle(self):
         self.assertEqual(
@@ -1823,6 +2139,45 @@ class SpatialNavigationTests(unittest.TestCase):
         self.assertTrue(prototype.is_navigation_noise("跳转到用户消息 12"))
         self.assertTrue(prototype.is_navigation_noise("Jump to user message 12"))
         self.assertFalse(prototype.is_navigation_noise("发送"))
+
+    def test_legacy_only_list_and_data_items_are_not_actionable(self):
+        for control_type in ("ListItemControl", "DataItemControl"):
+            self.assertFalse(
+                prototype.standard_control_has_actionable_semantics(
+                    control_type,
+                    keyboard_focusable=False,
+                    has_action_pattern=True,
+                    has_direct_action_pattern=False,
+                )
+            )
+
+    def test_native_list_items_keep_real_focus_or_direct_actions(self):
+        self.assertTrue(
+            prototype.standard_control_has_actionable_semantics(
+                "ListItemControl",
+                keyboard_focusable=True,
+                has_action_pattern=True,
+                has_direct_action_pattern=False,
+            )
+        )
+        self.assertTrue(
+            prototype.standard_control_has_actionable_semantics(
+                "DataItemControl",
+                keyboard_focusable=False,
+                has_action_pattern=False,
+                has_direct_action_pattern=True,
+            )
+        )
+
+    def test_legacy_primary_button_remains_actionable(self):
+        self.assertTrue(
+            prototype.standard_control_has_actionable_semantics(
+                "ButtonControl",
+                keyboard_focusable=False,
+                has_action_pattern=True,
+                has_direct_action_pattern=False,
+            )
+        )
 
     def test_rejects_unnamed_group_even_with_automation_id(self):
         self.assertFalse(

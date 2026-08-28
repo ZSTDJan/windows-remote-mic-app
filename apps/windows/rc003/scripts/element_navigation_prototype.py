@@ -52,6 +52,9 @@ PRIMARY_ACTION_CONTROL_TYPES = frozenset(
 WRAPPER_CONTROL_TYPES = STRUCTURAL_CONTROL_TYPES | frozenset(
     {"ListItemControl", "DataItemControl"}
 )
+LEGACY_ONLY_WEAK_CONTROL_TYPES = frozenset(
+    {"ListItemControl", "DataItemControl"}
+)
 NOISE_NAME_PREFIXES = ("跳转到用户消息 ", "Jump to user message ")
 PRESERVED_NESTED_ACTION_NAMES = frozenset(
     {
@@ -71,6 +74,8 @@ PREWARM_STABILITY_SECONDS = 0.75
 DYNAMIC_REFRESH_FALLBACK_SECONDS = 5.0
 DYNAMIC_REFRESH_MAX_CACHE_SECONDS = 30.0
 DYNAMIC_REFRESH_SETTLE_SECONDS = 0.15
+FOLLOW_WINDOW_SCAN_BUDGET_SECONDS = 0.2
+FOLLOW_WINDOW_EMPTY_REFRESH_RETRIES = 2
 NAVIGATION_STRUCTURE_EVENTS = frozenset(
     {
         0x8000,  # EVENT_OBJECT_CREATE
@@ -91,7 +96,13 @@ SECTION_HEADER_MAX_TOP_OFFSET_RATIO = 0.15
 SECTION_MIN_HEIGHT = 32
 SECTION_BRIDGE_BASE_DISTANCE = 240.0
 SECTION_BRIDGE_SIZE_MULTIPLIER = 6.0
+SECTION_BRIDGE_PRIMARY_RATIO = 0.35
+SECTION_BRIDGE_MIN_PERPENDICULAR = 96.0
 SECTION_EDGE_TOLERANCE = 16
+HORIZONTAL_LANE_MIN_OVERLAP_RATIO = 0.50
+HORIZONTAL_LANE_MIN_CENTER_TOLERANCE = 12.0
+HORIZONTAL_LANE_MAX_CENTER_TOLERANCE = 48.0
+HORIZONTAL_LANE_SIZE_MULTIPLIER = 0.75
 VK_RETURN = 0x0D
 VK_ESCAPE = 0x1B
 VK_PAGEUP = 0x21
@@ -351,6 +362,19 @@ def target_has_interaction_evidence(target: TargetSnapshot) -> bool:
     )
 
 
+def standard_control_has_actionable_semantics(
+    control_type: str,
+    keyboard_focusable: bool,
+    has_action_pattern: bool,
+    has_direct_action_pattern: bool,
+) -> bool:
+    """Treat Legacy-only list/data items as content rather than actions."""
+
+    if control_type in LEGACY_ONLY_WEAK_CONTROL_TYPES:
+        return keyboard_focusable or has_direct_action_pattern
+    return keyboard_focusable or has_action_pattern
+
+
 def target_is_finer_descendant(
     target: TargetSnapshot, candidate: TargetSnapshot
 ) -> bool:
@@ -564,10 +588,25 @@ def direction_score(
         + center_offset * 0.25
         - overlap * 0.15
     )
-    # TV-style navigation should stay in the current visual lane when one
-    # exists. Without this beam priority, a nearer sidebar item can beat a
-    # farther control directly above or below the current target.
-    beam_rank = 0 if overlap > 0 else 1
+    if direction in {Direction.LEFT, Direction.RIGHT}:
+        smaller_height = max(1, min(current.height, candidate.height))
+        overlap_ratio = overlap / smaller_height
+        center_tolerance = max(
+            HORIZONTAL_LANE_MIN_CENTER_TOLERANCE,
+            min(
+                HORIZONTAL_LANE_MAX_CENTER_TOLERANCE,
+                smaller_height * HORIZONTAL_LANE_SIZE_MULTIPLIER,
+            ),
+        )
+        # A one-pixel edge touch is not a row. Keep an intermediate target in
+        # the horizontal route only when its Y projection or centers are close.
+        beam_rank = 0 if (
+            overlap_ratio >= HORIZONTAL_LANE_MIN_OVERLAP_RATIO
+            or center_offset <= center_tolerance
+        ) else 1
+    else:
+        # Vertical layouts commonly mix wide rows with narrow child actions.
+        beam_rank = 0 if overlap > 0 else 1
     return (
         beam_rank,
         float(primary_gap),
@@ -617,28 +656,28 @@ def move_should_refresh_dynamic_targets(
     return score[2] > max(96.0, perpendicular_span * 0.12)
 
 
-def dynamic_refresh_due(
+def background_refresh_due(
     dirty_state: Optional[DirtyWindowState],
     now: float,
-    current: Rect,
-    candidate: Optional[Rect],
-    direction: Direction,
-    window_rect: Rect,
-    candidate_is_natural: bool,
-    settle_waited: bool = False,
+    cache_age: float,
+    requested: bool = False,
+    input_idle_for: Optional[float] = None,
 ) -> bool:
-    if dirty_state is None:
+    """Refresh only after the latest structure event has gone quiet."""
+
+    if (
+        input_idle_for is not None
+        and input_idle_for < DYNAMIC_REFRESH_SETTLE_SECONDS
+    ):
         return False
     if (
-        not settle_waited
+        dirty_state is not None
         and now - dirty_state.changed_at < DYNAMIC_REFRESH_SETTLE_SECONDS
     ):
         return False
-    if not candidate_is_natural:
+    if requested or dirty_state is not None:
         return True
-    return move_should_refresh_dynamic_targets(
-        current, candidate, direction, window_rect
-    )
+    return cache_age >= DYNAMIC_REFRESH_MAX_CACHE_SECONDS
 
 
 def dynamic_refresh_fallback_due(
@@ -816,6 +855,30 @@ def _horizontal_section_gap(
     return float(max(0, gap))
 
 
+def _section_path_is_prefix(
+    prefix: tuple[int, ...], path: tuple[int, ...]
+) -> bool:
+    return bool(
+        prefix
+        and len(prefix) <= len(path)
+        and path[: len(prefix)] == prefix
+    )
+
+
+def _navigation_sections_share_pane(
+    first: TargetSnapshot, second: TargetSnapshot
+) -> bool:
+    if _section_path_is_prefix(first.section_path, second.section_path) or (
+        _section_path_is_prefix(second.section_path, first.section_path)
+    ):
+        return True
+    if first.section_rect is None or second.section_rect is None:
+        return False
+    return first.section_rect.contains(second.section_rect) or (
+        second.section_rect.contains(first.section_rect)
+    )
+
+
 def horizontal_adjacent_section_target_indices(
     targets: Sequence[TargetSnapshot],
     current_index: int,
@@ -852,12 +915,33 @@ def horizontal_adjacent_section_target_indices(
     if not adjacent:
         return []
 
-    nearest_gap = min(gap for gap, _index in adjacent)
+    section_representatives: dict[tuple[int, ...], int] = {}
+    section_gaps: dict[tuple[int, ...], float] = {}
+    for gap, index in adjacent:
+        section_path = targets[index].section_path
+        section_representatives.setdefault(section_path, index)
+        section_gaps[section_path] = min(
+            gap, section_gaps.get(section_path, gap)
+        )
+    nearest_gap = min(section_gaps.values())
     adjacent_sections = {
-        targets[index].section_path
-        for gap, index in adjacent
+        section_path
+        for section_path, gap in section_gaps.items()
         if gap <= nearest_gap + SECTION_EDGE_TOLERANCE
     }
+    # UIA often exposes an outer pane and an indented ListControl as separate
+    # sections. Expand the nearest section through nested sections so a 35px
+    # content inset cannot hide the visually aligned row inside the same pane.
+    pending_sections = list(adjacent_sections)
+    while pending_sections:
+        kept_section = pending_sections.pop()
+        kept = targets[section_representatives[kept_section]]
+        for section_path, index in section_representatives.items():
+            if section_path in adjacent_sections:
+                continue
+            if _navigation_sections_share_pane(targets[index], kept):
+                adjacent_sections.add(section_path)
+                pending_sections.append(section_path)
     return [
         index
         for index in candidate_indices
@@ -921,9 +1005,17 @@ def horizontal_section_target_indices(
         current.rect.height * SECTION_BRIDGE_SIZE_MULTIPLIER,
         same_target.rect.height * SECTION_BRIDGE_SIZE_MULTIPLIER,
     )
+    primary_center_distance = abs(
+        same_target.rect.center_x - current.rect.center_x
+    )
+    relative_center_offset = max(
+        SECTION_BRIDGE_MIN_PERPENDICULAR,
+        primary_center_distance * SECTION_BRIDGE_PRIMARY_RATIO,
+    )
     if (
         same_score[1] <= adjacent_score[1]
-        and same_score[4] <= maximum_center_offset
+        and same_score[4]
+        <= min(maximum_center_offset, relative_center_offset)
     ):
         return [best_same] + [index for index in ordered if index != best_same]
     return ordered
@@ -1606,6 +1698,51 @@ def scan_should_stop(
     )
 
 
+def bounded_scan_timeout_ms(
+    deadline: Optional[float],
+    maximum_ms: int,
+    now: Optional[float] = None,
+) -> int:
+    """Return a per-call timeout that cannot outlive the scan deadline."""
+
+    if deadline is None:
+        return max(1, maximum_ms)
+    remaining = deadline - (time.perf_counter() if now is None else now)
+    if remaining <= 0:
+        return 0
+    return max(1, min(maximum_ms, int(remaining * 1000)))
+
+
+def scan_commit_decision(
+    expected_generation: int,
+    current_generation: int,
+    interrupted: bool,
+    cancellation_requested: bool,
+    allow_partial: bool,
+) -> tuple[bool, bool]:
+    """Return commit and partial flags for a completed worker scan."""
+
+    if expected_generation != current_generation:
+        return False, False
+    if interrupted or cancellation_requested:
+        return (True, True) if allow_partial else (False, False)
+    return True, False
+
+
+def empty_follow_refresh_should_retry(
+    pending_window: int,
+    current_window: int,
+    attempts: int,
+) -> bool:
+    """Keep a followed window alive while its async tree is still empty."""
+
+    return bool(
+        pending_window > 0
+        and pending_window == current_window
+        and attempts < FOLLOW_WINDOW_EMPTY_REFRESH_RETRIES
+    )
+
+
 def target_probe_points(rect: Rect) -> list[tuple[int, int]]:
     """Return stable in-bounds hit-test points for sparse clickable regions."""
 
@@ -2193,7 +2330,13 @@ def _run_windows(args: argparse.Namespace) -> int:
                 supports_expand,
             ) = action_pattern_support(control)
             actionable = (
-                standard and (keyboard_focusable or action_pattern)
+                standard
+                and standard_control_has_actionable_semantics(
+                    control_type,
+                    keyboard_focusable,
+                    action_pattern,
+                    direct_action_pattern,
+                )
             ) or (
                 structural
                 and (
@@ -2371,7 +2514,11 @@ def _run_windows(args: argparse.Namespace) -> int:
             and int(info.flags) & gui_menu_mode_flags
         )
 
-    def activate_embedded_chromium_accessibility(hwnd: int) -> bool:
+    def activate_embedded_chromium_accessibility(
+        hwnd: int,
+        deadline: Optional[float] = None,
+        should_cancel: Optional[Callable[[], bool]] = None,
+    ) -> bool:
         """Ask Chromium renderers to publish their UI Automation tree."""
 
         handles = [hwnd]
@@ -2382,32 +2529,65 @@ def _run_windows(args: argparse.Namespace) -> int:
             return True
 
         user32.EnumChildWindows(hwnd, collect_child, 0)
-        has_renderer = any(
-            window_class_name(handle) == CHROMIUM_RENDERER_CLASS
+        renderer_handles = {
+            handle
             for handle in handles
-        )
-        if not has_renderer:
+            if window_class_name(handle) == CHROMIUM_RENDERER_CLASS
+        }
+        if not renderer_handles:
             return False
         if hwnd in awakened_chromium_windows:
             return True
 
+        probe_completed = True
+        renderer_probe_succeeded = False
         for handle in handles:
             for object_id in accessibility_object_ids:
+                if scan_should_stop(deadline, should_cancel):
+                    probe_completed = False
+                    break
+                timeout_ms = bounded_scan_timeout_ms(deadline, 100)
+                if timeout_ms <= 0:
+                    probe_completed = False
+                    break
                 result = ctypes.c_size_t()
-                user32.SendMessageTimeoutW(
-                    handle,
-                    wm_getobject,
-                    0,
-                    object_id,
-                    smto_abortifhung,
-                    100,
-                    ctypes.byref(result),
+                succeeded = bool(
+                    user32.SendMessageTimeoutW(
+                        handle,
+                        wm_getobject,
+                        0,
+                        object_id,
+                        smto_abortifhung,
+                        timeout_ms,
+                        ctypes.byref(result),
+                    )
                 )
+                if (
+                    succeeded
+                    and result.value != 0
+                    and handle in renderer_handles
+                ):
+                    renderer_probe_succeeded = True
+            if scan_should_stop(deadline, should_cancel):
+                probe_completed = False
+                break
 
         # Chromium enables renderer accessibility asynchronously after the
         # probe. A short bounded wait keeps the first scan from racing it.
-        time.sleep(0.15)
-        awakened_chromium_windows.add(hwnd)
+        wait_seconds = 0.15
+        if deadline is not None:
+            wait_seconds = min(
+                wait_seconds,
+                max(0.0, deadline - time.perf_counter()),
+            )
+        if (
+            renderer_probe_succeeded
+            and wait_seconds > 0
+            and not scan_should_stop(None, should_cancel)
+        ):
+            time.sleep(wait_seconds)
+        if probe_completed and renderer_probe_succeeded:
+            awakened_chromium_windows.add(hwnd)
         return True
 
     def normalize_runtime_targets(
@@ -2530,7 +2710,20 @@ def _run_windows(args: argparse.Namespace) -> int:
         int,
         bool,
     ]:
-        has_chromium_renderer = activate_embedded_chromium_accessibility(hwnd)
+        has_chromium_renderer = activate_embedded_chromium_accessibility(
+            hwnd,
+            deadline=deadline,
+            should_cancel=should_cancel,
+        )
+        if scan_should_stop(deadline, should_cancel):
+            return (
+                [],
+                {},
+                Rect(0, 0, 0, 0),
+                "未命名窗口",
+                0,
+                True,
+            )
         scan_depth = effective_scan_depth(args.max_depth, has_chromium_renderer)
         root = auto.ControlFromHandle(hwnd)
         if root is None:
@@ -2578,6 +2771,7 @@ def _run_windows(args: argparse.Namespace) -> int:
         hierarchy: list[RuntimeTarget] = []
         seen_runtime_ids: set[tuple[int, ...]] = set()
         seen_geometry: set[tuple[Rect, str]] = set()
+        saw_rejected_legacy_content = False
         try:
             control = auto.ControlFromPoint(point[0], point[1])
         except Exception:
@@ -2586,6 +2780,24 @@ def _run_windows(args: argparse.Namespace) -> int:
         for depth in range(40):
             if control is None:
                 break
+            try:
+                control_type = str(control.ControlTypeName or "")
+                if control_type in LEGACY_ONLY_WEAK_CONTROL_TYPES:
+                    keyboard_focusable = bool(control.IsKeyboardFocusable)
+                    (
+                        action_pattern,
+                        direct_action_pattern,
+                        _supports_expand,
+                    ) = action_pattern_support(control)
+                    if not standard_control_has_actionable_semantics(
+                        control_type,
+                        keyboard_focusable,
+                        action_pattern,
+                        direct_action_pattern,
+                    ):
+                        saw_rejected_legacy_content = True
+            except Exception:
+                pass
             candidate = runtime_target_from_control(
                 control,
                 window_rect,
@@ -2620,6 +2832,8 @@ def _run_windows(args: argparse.Namespace) -> int:
 
         if hierarchy:
             return hierarchy
+        if saw_rejected_legacy_content:
+            return []
 
         msaa_rect = msaa_rect_at_point(point)
         if msaa_rect is None or not msaa_rect.intersects(window_rect):
@@ -2703,15 +2917,35 @@ def _run_windows(args: argparse.Namespace) -> int:
                 "follow_window",
             }
         )
+        _REFRESH_INTERRUPT_COMMANDS = frozenset(
+            {
+                "scan",
+                "move",
+                "parent",
+                "child",
+                "activate",
+                "context",
+                "scroll_up",
+                "scroll_down",
+                "back",
+                "follow_window",
+                "stop",
+            }
+        )
         _CACHE_TTL_SECONDS = 15.0
         _PREWARM_BUDGET_SECONDS = 1.5
         _SCROLL_BURST_SECONDS = 0.35
+        _IDLE_REFRESH_POLL_SECONDS = 0.05
 
         def __init__(self, diagnostics_enabled: bool = False) -> None:
             self.commands: queue.Queue[tuple[str, Any, int]] = queue.Queue()
             self.events: queue.Queue[tuple[str, Any]] = queue.Queue()
             self._post_lock = threading.Lock()
             self._scan_requested = threading.Event()
+            self._refresh_cancel_requested = threading.Event()
+            self._pending_refresh_interrupts = 0
+            self._last_refresh_interrupt_at = 0.0
+            self._refresh_interrupt_generation = 0
             self._generation = 0
             self._pending_counts: dict[str, int] = {}
             self.context_valid = False
@@ -2729,6 +2963,13 @@ def _run_windows(args: argparse.Namespace) -> int:
             self.window_name = ""
             self.visited = 0
             self.cache_timestamp = 0.0
+            self._background_refresh_requested = False
+            self._background_refresh_retry_at = 0.0
+            self._pending_follow_completion_hwnd = 0
+            self._empty_follow_refresh_attempts = 0
+            self._deferred_moves: deque[Direction] = deque(
+                maxlen=self._PENDING_LIMITS["move"]
+            )
             self._pointer_cache_token: Optional[tuple[Any, ...]] = None
             self._pointer_cache_point: Optional[tuple[int, int]] = None
             self._pointer_cache_at = 0.0
@@ -2755,10 +2996,19 @@ def _run_windows(args: argparse.Namespace) -> int:
                 if limit is not None:
                     pending = self._pending_counts.get(command, 0)
                     if pending >= limit:
+                        if command in self._REFRESH_INTERRUPT_COMMANDS:
+                            self._refresh_interrupt_generation += 1
+                            self._last_refresh_interrupt_at = time.perf_counter()
+                            self._refresh_cancel_requested.set()
                         return
                     self._pending_counts[command] = pending + 1
                 if command == "scan":
                     self._scan_requested.set()
+                if command in self._REFRESH_INTERRUPT_COMMANDS:
+                    self._refresh_interrupt_generation += 1
+                    self._pending_refresh_interrupts += 1
+                    self._last_refresh_interrupt_at = time.perf_counter()
+                    self._refresh_cancel_requested.set()
                 generation = self._generation
             self.commands.put((command, value, generation))
 
@@ -2766,6 +3016,21 @@ def _run_windows(args: argparse.Namespace) -> int:
             with self._post_lock:
                 self._generation += 1
                 self.context_valid = False
+                self._pending_follow_completion_hwnd = 0
+                self._empty_follow_refresh_attempts = 0
+                self._deferred_moves.clear()
+                self._refresh_cancel_requested.set()
+
+        def _finish_refresh_interrupt(self, command: str) -> None:
+            if command not in self._REFRESH_INTERRUPT_COMMANDS:
+                return
+            with self._post_lock:
+                self._pending_refresh_interrupts = max(
+                    0, self._pending_refresh_interrupts - 1
+                )
+                self._last_refresh_interrupt_at = time.perf_counter()
+                if self._pending_refresh_interrupts == 0 and self.context_valid:
+                    self._refresh_cancel_requested.clear()
 
         def stop(self) -> None:
             self.post("stop")
@@ -3062,9 +3327,27 @@ def _run_windows(args: argparse.Namespace) -> int:
                     return False
             return True
 
-        def _sync_window_geometry(self) -> bool:
-            if not self.context_valid or not self.hwnd or not self.targets:
+        def _request_background_refresh(self) -> None:
+            self._background_refresh_requested = True
+
+        def _refresh_selected_geometry(self) -> bool:
+            if not self.targets or not 0 <= self.selected < len(self.targets):
                 return False
+            target = self.targets[self.selected]
+            previous_rect = target.snapshot.rect
+            if not self._update_live_target(target):
+                return False
+            if target.snapshot.rect != previous_rect:
+                self._rebuild_navigation_graph()
+                self._clear_hierarchy()
+                self._emit_selection()
+            return True
+
+        def _sync_window_geometry(self, allow_full_rescan: bool = False) -> bool:
+            with self._post_lock:
+                expected_generation = self._generation
+                if not self.context_valid or not self.hwnd or not self.targets:
+                    return False
             try:
                 root = auto.ControlFromHandle(self.hwnd)
                 if root is None:
@@ -3076,12 +3359,20 @@ def _run_windows(args: argparse.Namespace) -> int:
                 return False
             if current_window_rect == self.window_rect:
                 if not self._content_geometry_is_current():
+                    if not allow_full_rescan:
+                        self._request_background_refresh()
+                        return self._refresh_selected_geometry()
                     previous = (
                         self.targets[self.selected].snapshot
                         if 0 <= self.selected < len(self.targets)
                         else None
                     )
-                    self._enumerate(self.hwnd)
+                    committed, _partial, _empty = self._enumerate(
+                        self.hwnd,
+                        expected_generation=expected_generation,
+                    )
+                    if not committed:
+                        return False
                     self._apply_targets(restore=previous)
                     self._clear_hierarchy()
                     self._clear_input_cache()
@@ -3112,12 +3403,24 @@ def _run_windows(args: argparse.Namespace) -> int:
                 self._emit_selection()
                 return True
 
+            if not allow_full_rescan:
+                self.window_rect = current_window_rect
+                self.invalid_targets.clear()
+                self._clear_input_cache()
+                self._request_background_refresh()
+                return self._refresh_selected_geometry()
+
             previous = (
                 self.targets[self.selected].snapshot
                 if 0 <= self.selected < len(self.targets)
                 else None
             )
-            self._enumerate(self.hwnd)
+            committed, _partial, _empty = self._enumerate(
+                self.hwnd,
+                expected_generation=expected_generation,
+            )
+            if not committed:
+                return False
             self._apply_targets(restore=previous)
             self._clear_hierarchy()
             self._clear_input_cache()
@@ -3131,7 +3434,18 @@ def _run_windows(args: argparse.Namespace) -> int:
             activate_context: bool = True,
             deadline: Optional[float] = None,
             should_cancel: Optional[Callable[[], bool]] = None,
-        ) -> bool:
+            allow_partial: bool = False,
+            expected_generation: Optional[int] = None,
+            commit_empty: bool = True,
+        ) -> tuple[bool, bool, bool]:
+            with self._post_lock:
+                scan_generation = (
+                    self._generation
+                    if expected_generation is None
+                    else expected_generation
+                )
+                if scan_generation != self._generation:
+                    return False, False, False
             previous_hwnd = self.hwnd
             previous_process_id = (
                 window_process_id(previous_hwnd) if previous_hwnd > 0 else 0
@@ -3147,35 +3461,56 @@ def _run_windows(args: argparse.Namespace) -> int:
                 )
             except Exception:
                 dirty_windows.watch(previous_hwnd, previous_process_id)
-                if previous_hwnd != hwnd:
-                    self.cache_timestamp = 0.0
                 raise
-            interrupted = result[-1]
-            if interrupted:
-                dirty_windows.watch(previous_hwnd, previous_process_id)
-                if previous_hwnd != hwnd:
-                    self.cache_timestamp = 0.0
-                return False
-            (
-                self.all_targets,
-                self.node_types,
-                self.window_rect,
-                self.window_name,
-                self.visited,
-                _interrupted,
-            ) = result
-            if dirty_before_scan is not None:
-                dirty_windows.consume(
-                    hwnd,
-                    process_id,
-                    through_generation=dirty_before_scan.generation,
+            interrupted = bool(result[-1])
+            empty = not bool(result[0])
+            cancellation_requested = bool(
+                should_cancel is not None and should_cancel()
+            )
+            with self._post_lock:
+                cancellation_requested = cancellation_requested or bool(
+                    should_cancel is not None and should_cancel()
                 )
-            self.hwnd = hwnd
-            self.invalid_targets.clear()
-            self._clear_input_cache()
-            self.context_valid = activate_context
-            self.cache_timestamp = time.perf_counter()
-            return True
+                committed, partial = scan_commit_decision(
+                    scan_generation,
+                    self._generation,
+                    interrupted,
+                    cancellation_requested,
+                    allow_partial,
+                )
+                if committed and empty and not commit_empty:
+                    committed = False
+                    partial = False
+                if committed:
+                    (
+                        self.all_targets,
+                        self.node_types,
+                        self.window_rect,
+                        self.window_name,
+                        self.visited,
+                        _interrupted,
+                    ) = result
+                    if previous_hwnd != hwnd:
+                        self._pending_follow_completion_hwnd = 0
+                        self._empty_follow_refresh_attempts = 0
+                        self._deferred_moves.clear()
+                    if not partial and dirty_before_scan is not None:
+                        dirty_windows.consume(
+                            hwnd,
+                            process_id,
+                            through_generation=dirty_before_scan.generation,
+                        )
+                    self.hwnd = hwnd
+                    self.invalid_targets.clear()
+                    self._clear_input_cache()
+                    self.context_valid = activate_context
+                    self.cache_timestamp = time.perf_counter()
+                    self._background_refresh_requested = partial
+                    self._background_refresh_retry_at = 0.0
+            if not committed:
+                dirty_windows.watch(previous_hwnd, previous_process_id)
+                return False, False, empty
+            return True, partial, empty
 
         def _cache_is_reusable(self, hwnd: int) -> bool:
             if (
@@ -3208,15 +3543,16 @@ def _run_windows(args: argparse.Namespace) -> int:
                     return False
             return True
 
-        def _prewarm(self, hwnd: int) -> None:
+        def _prewarm(self, hwnd: int, expected_generation: int) -> None:
             if hwnd <= 0 or self._cache_is_reusable(hwnd):
                 return
             started = time.perf_counter()
-            cached = self._enumerate(
+            cached, _partial, _empty = self._enumerate(
                 hwnd,
                 activate_context=False,
                 deadline=started + self._PREWARM_BUDGET_SECONDS,
                 should_cancel=self._scan_requested.is_set,
+                expected_generation=expected_generation,
             )
             if not cached:
                 if not self._scan_requested.is_set():
@@ -3258,25 +3594,119 @@ def _run_windows(args: argparse.Namespace) -> int:
                     cursor_point() if use_cursor else None,
                 )
 
-        def _refresh_targets(self) -> bool:
-            if not self.context_valid or not self.hwnd:
-                return False
+        def _refresh_targets(self, interruptible: bool = False) -> bool:
+            with self._post_lock:
+                expected_generation = self._generation
+                if not self.context_valid or not self.hwnd:
+                    return False
+                retry_empty_follow = empty_follow_refresh_should_retry(
+                    self._pending_follow_completion_hwnd,
+                    self.hwnd,
+                    self._empty_follow_refresh_attempts,
+                )
             previous = (
                 self.targets[self.selected].snapshot
                 if 0 <= self.selected < len(self.targets)
                 else None
             )
-            if not self._enumerate(self.hwnd):
+            committed, _partial, empty = self._enumerate(
+                self.hwnd,
+                should_cancel=(
+                    self._refresh_cancel_requested.is_set
+                    if interruptible
+                    else None
+                ),
+                expected_generation=expected_generation,
+                commit_empty=not retry_empty_follow,
+            )
+            if not committed:
+                if empty and retry_empty_follow:
+                    with self._post_lock:
+                        if (
+                            expected_generation == self._generation
+                            and self.context_valid
+                            and not self._refresh_cancel_requested.is_set()
+                        ):
+                            self._empty_follow_refresh_attempts += 1
+                            self._background_refresh_requested = True
+                            self._background_refresh_retry_at = (
+                                time.perf_counter() + 0.25
+                            )
                 return False
             self._apply_targets(restore=previous)
             self._clear_hierarchy()
             if not self.targets or self.selected < 0:
+                with self._post_lock:
+                    self._pending_follow_completion_hwnd = 0
+                    self._empty_follow_refresh_attempts = 0
+                    self._deferred_moves.clear()
                 self._invalidate_navigation("页面变化后没有找到可导航元素")
                 return False
+            with self._post_lock:
+                self._pending_follow_completion_hwnd = 0
+                self._empty_follow_refresh_attempts = 0
+                deferred_moves = tuple(self._deferred_moves)
+                self._deferred_moves.clear()
             self.events.put(("content_refreshed", self._selection_payload()))
+            for direction in deferred_moves:
+                if not self.context_valid:
+                    break
+                self._move(direction)
             return True
 
-        def _move(self, direction: Direction) -> None:
+        def _refresh_if_idle(self) -> None:
+            if (
+                not self.context_valid
+                or not self.hwnd
+                or self._refresh_cancel_requested.is_set()
+            ):
+                return
+            now = time.perf_counter()
+            if now < self._background_refresh_retry_at:
+                return
+            process_id = window_process_id(self.hwnd)
+            dirty_state = dirty_windows.state(self.hwnd, process_id)
+            with self._post_lock:
+                input_idle_for = now - self._last_refresh_interrupt_at
+            if not background_refresh_due(
+                dirty_state,
+                now,
+                now - self.cache_timestamp,
+                self._background_refresh_requested,
+                input_idle_for,
+            ):
+                return
+            try:
+                refreshed = self._refresh_targets(interruptible=True)
+            except Exception as exc:
+                self._background_refresh_retry_at = now + 1.0
+                self.events.put(("refresh_failed", str(exc)))
+                return
+            if refreshed:
+                self._background_refresh_requested = False
+                self._background_refresh_retry_at = 0.0
+            elif (
+                self.context_valid
+                and not self._refresh_cancel_requested.is_set()
+            ):
+                self._background_refresh_retry_at = now + 0.25
+
+        def _defer_move(
+            self,
+            direction: Direction,
+            expected_generation: int,
+        ) -> None:
+            with self._post_lock:
+                if (
+                    expected_generation == self._generation
+                    and self.context_valid
+                    and self._background_refresh_requested
+                ):
+                    self._deferred_moves.append(direction)
+
+        def _move(
+            self, direction: Direction, allow_geometry_retry: bool = True
+        ) -> None:
             if not self._sync_window_geometry():
                 return
 
@@ -3326,39 +3756,12 @@ def _run_windows(args: argparse.Namespace) -> int:
                     self.window_rect,
                 )
             )
-            settle_waited = False
-            if dirty_state is not None and suspicious_move:
-                settle_remaining = DYNAMIC_REFRESH_SETTLE_SECONDS - (
-                    now - dirty_state.changed_at
-                )
-                if settle_remaining > 0:
-                    time.sleep(settle_remaining)
-                    now = time.perf_counter()
-                    dirty_state = dirty_windows.state(self.hwnd, process_id)
-                settle_waited = True
-
-            refresh_due = dynamic_refresh_due(
-                dirty_state,
-                now,
-                snapshots[current_index].rect,
-                first_rect,
-                direction,
-                self.window_rect,
-                candidate_is_natural,
-                settle_waited=settle_waited,
-            )
             fallback_due = dynamic_refresh_fallback_due(
                 now - self.cache_timestamp,
                 suspicious_move,
             )
-            if refresh_due or fallback_due:
-                if not self._refresh_targets():
-                    return
-                if not self._sync_window_geometry():
-                    return
-                current_index, snapshots, natural, ranked, candidates = (
-                    load_candidates()
-                )
+            if dirty_state is not None or fallback_due:
+                self._request_background_refresh()
             invalid_cached: list[int] = []
             unhittable: list[int] = []
 
@@ -3396,11 +3799,12 @@ def _run_windows(args: argparse.Namespace) -> int:
                     continue
                 if target.snapshot.rect != previous_rect:
                     emit_diagnostic("geometry_changed")
-                    previous = self.targets[self.selected].snapshot
-                    self._enumerate(self.hwnd)
-                    self._apply_targets(restore=previous)
-                    self._clear_hierarchy()
-                    self._emit_selection()
+                    self._request_background_refresh()
+                    self._rebuild_navigation_graph()
+                    if allow_geometry_retry:
+                        self._move(direction, allow_geometry_retry=False)
+                    else:
+                        self._emit_selection()
                     return
                 self.selected = next_index
                 self.traversal.commit(next_index)
@@ -3425,17 +3829,35 @@ def _run_windows(args: argparse.Namespace) -> int:
             if self.targets and self.selected >= 0:
                 self.events.put(("selection", self._selection_payload()))
 
-        def _scan(self, hwnd: int) -> None:
+        def _scan(self, hwnd: int, expected_generation: int) -> None:
             started = time.perf_counter()
+            with self._post_lock:
+                if expected_generation != self._generation:
+                    self.events.put(("scan_cancelled", None))
+                    return
             point = cursor_point()
             process_id = window_process_id(hwnd)
             watcher_changed = dirty_windows.watch(hwnd, process_id)
             used_cache = not watcher_changed and self._cache_is_reusable(hwnd)
             if used_cache:
-                self.context_valid = True
-                self.invalid_targets.clear()
+                with self._post_lock:
+                    if expected_generation != self._generation:
+                        self.events.put(("scan_cancelled", None))
+                        return
+                    self.context_valid = True
+                    self.invalid_targets.clear()
             else:
-                self._enumerate(hwnd)
+                committed, _partial, _empty = self._enumerate(
+                    hwnd,
+                    expected_generation=expected_generation,
+                )
+                if not committed:
+                    previous_process_id = (
+                        window_process_id(self.hwnd) if self.hwnd > 0 else 0
+                    )
+                    dirty_windows.watch(self.hwnd, previous_process_id)
+                    self.events.put(("scan_cancelled", None))
+                    return
             hierarchy = (
                 point_hierarchy_targets(point, self.window_rect, self.all_targets)
                 if point is not None and self.window_rect.contains_point(point)
@@ -3477,9 +3899,7 @@ def _run_windows(args: argparse.Namespace) -> int:
         def _refresh_invalid_target(self, target: RuntimeTarget) -> None:
             self.invalid_targets.add(self._identity_token(target.snapshot))
             self.events.put(("target_skipped", target.snapshot))
-            self._enumerate(self.hwnd)
-            self._apply_targets(restore=target.snapshot)
-            self._clear_hierarchy()
+            self._request_background_refresh()
             self._emit_selection()
 
         def _activate(self) -> None:
@@ -3613,30 +4033,60 @@ def _run_windows(args: argparse.Namespace) -> int:
                 )
             )
 
-        def _follow_window(self, hwnd: int) -> None:
+        def _follow_window(self, hwnd: int, expected_generation: int) -> None:
             if hwnd <= 0:
                 return
             if hwnd == self.hwnd:
                 self._sync_window_geometry()
                 return
-            self._enumerate(hwnd)
-            self._apply_targets(focused=focused_rect(), use_cursor=True)
-            self._reset_hierarchy_for_selected()
+            started = time.perf_counter()
+            with self._post_lock:
+                if expected_generation != self._generation:
+                    return
+                interrupt_generation = self._refresh_interrupt_generation
+            committed, partial, _empty = self._enumerate(
+                hwnd,
+                deadline=started + FOLLOW_WINDOW_SCAN_BUDGET_SECONDS,
+                should_cancel=lambda: (
+                    self._generation != expected_generation
+                    or self._refresh_interrupt_generation != interrupt_generation
+                ),
+                allow_partial=True,
+                expected_generation=expected_generation,
+            )
+            if not committed:
+                return
+            with self._post_lock:
+                if expected_generation != self._generation:
+                    return
+                self._pending_follow_completion_hwnd = hwnd
+                self._empty_follow_refresh_attempts = 0
+            self._apply_targets(use_cursor=True)
+            self._clear_hierarchy()
+            # A deadline-limited first pass can finish before an async provider
+            # publishes the rest of its tree, even when it found some targets.
+            self._request_background_refresh()
             if not self.targets or self.selected < 0:
-                self._invalidate_navigation("新窗口中没有找到可导航元素")
+                self.events.put(
+                    (
+                        "window_follow_pending",
+                        {"window": self.window_name},
+                    )
+                )
                 return
             self.events.put(
                 (
                     "window_followed",
                     {
                         "window": self.window_name,
+                        "partial": partial,
                         **self._selection_payload(),
                     },
                 )
             )
 
         def _refresh_content(self) -> None:
-            self._refresh_targets()
+            self._request_background_refresh()
 
         def _back(self) -> None:
             self.events.put(("exit_requested", None))
@@ -3645,7 +4095,13 @@ def _run_windows(args: argparse.Namespace) -> int:
             auto.InitializeUIAutomationInCurrentThread()
             try:
                 while True:
-                    command, value, generation = self.commands.get()
+                    try:
+                        command, value, generation = self.commands.get(
+                            timeout=self._IDLE_REFRESH_POLL_SECONDS
+                        )
+                    except queue.Empty:
+                        self._refresh_if_idle()
+                        continue
                     try:
                         with self._post_lock:
                             if command in self._pending_counts:
@@ -3662,18 +4118,17 @@ def _run_windows(args: argparse.Namespace) -> int:
                             return
                         if command == "scan":
                             self._scan_requested.clear()
-                            self._scan(int(value))
+                            self._scan(int(value), generation)
                         elif command == "prewarm":
-                            self._prewarm(int(value))
+                            self._prewarm(int(value), generation)
                         elif command == "diagnostics":
                             self.diagnostics_enabled = bool(value)
-                        elif (
-                            command == "move"
-                            and self.context_valid
-                            and self.targets
-                            and self.selected >= 0
-                        ):
-                            self._move(Direction(value))
+                        elif command == "move" and self.context_valid:
+                            direction = Direction(value)
+                            if self.targets and self.selected >= 0:
+                                self._move(direction)
+                            else:
+                                self._defer_move(direction, generation)
                         elif command == "parent" and self._sync_window_geometry():
                             self._cycle_hierarchy(1)
                         elif command == "child" and self._sync_window_geometry():
@@ -3694,12 +4149,16 @@ def _run_windows(args: argparse.Namespace) -> int:
                         elif command == "back":
                             self._back()
                         elif command == "sync_window":
-                            if time.perf_counter() >= self._content_settle_until:
+                            if (
+                                not self._refresh_cancel_requested.is_set()
+                                and time.perf_counter()
+                                >= self._content_settle_until
+                            ):
                                 self._sync_window_geometry()
                         elif command == "refresh_content":
                             self._refresh_content()
                         elif command == "follow_window":
-                            self._follow_window(int(value))
+                            self._follow_window(int(value), generation)
                     except Exception as exc:
                         self.events.put(
                             (
@@ -3707,6 +4166,8 @@ def _run_windows(args: argparse.Namespace) -> int:
                                 {"command": command, "message": str(exc)},
                             )
                         )
+                    finally:
+                        self._finish_refresh_interrupt(command)
             finally:
                 auto.UninitializeUIAutomationInCurrentThread()
 
@@ -4135,6 +4596,25 @@ def _run_windows(args: argparse.Namespace) -> int:
         leave_navigation()
         app.quit()
 
+    def prepare_navigation_action() -> bool:
+        foreground = native_handle_value(user32.GetForegroundWindow())
+        foreground_action = navigation_foreground_action(
+            foreground,
+            worker.hwnd,
+            navigation_root_hwnd,
+            navigation_process_id,
+            prototype_process_id,
+            window_process_id,
+            window_owner,
+        )
+        if foreground_action == "leave":
+            print("导航已暂停: 已切换到其它窗口，请重新按 Ctrl+Alt+N。")
+            leave_navigation()
+            return False
+        if foreground_action == "follow":
+            worker.post("follow_window", foreground)
+        return True
+
     def handle_keyboard_action(action: str) -> None:
         nonlocal scanning, navigation_root_hwnd, navigation_process_id
         nonlocal diagnostics_enabled
@@ -4165,13 +4645,17 @@ def _run_windows(args: argparse.Namespace) -> int:
             if active.is_set():
                 worker.post("back")
         elif action == "activate" and active.is_set():
-            worker.post("activate")
+            if prepare_navigation_action():
+                worker.post("activate")
         elif action in {"context", "scroll_up", "scroll_down"} and active.is_set():
-            worker.post(action)
+            if prepare_navigation_action():
+                worker.post(action)
         elif action in {"parent", "child"} and active.is_set():
-            worker.post(action)
+            if prepare_navigation_action():
+                worker.post(action)
         elif action in {direction.value for direction in Direction} and active.is_set():
-            worker.post("move", action)
+            if prepare_navigation_action():
+                worker.post("move", action)
 
     def drain_events() -> None:
         nonlocal scanning
@@ -4210,6 +4694,8 @@ def _run_windows(args: argparse.Namespace) -> int:
                         payload["hierarchy_index"],
                         payload["hierarchy_count"],
                     )
+            elif event == "scan_cancelled":
+                scanning = False
             elif event == "selection":
                 if active.is_set():
                     overlay.show_target(
@@ -4258,7 +4744,13 @@ def _run_windows(args: argparse.Namespace) -> int:
             elif event == "geometry_rescanned":
                 print("页面或窗口变化，已重新扫描。")
             elif event == "window_followed":
-                print(f"已跟随同一软件窗口: {payload['window']}")
+                if payload.get("partial"):
+                    print(
+                        f"已快速跟随同一软件窗口: {payload['window']}，"
+                        "后台继续识别。"
+                    )
+                else:
+                    print(f"已跟随同一软件窗口: {payload['window']}")
                 if active.is_set():
                     overlay.show_target(
                         payload["target"],
@@ -4267,6 +4759,12 @@ def _run_windows(args: argparse.Namespace) -> int:
                         payload["hierarchy_index"],
                         payload["hierarchy_count"],
                     )
+            elif event == "window_follow_pending":
+                print(
+                    f"已切换到同一软件窗口: {payload['window']}，后台继续识别。"
+                )
+                if active.is_set():
+                    overlay.clear_target()
             elif event == "content_refreshed":
                 if active.is_set():
                     overlay.show_target(
@@ -4294,6 +4792,8 @@ def _run_windows(args: argparse.Namespace) -> int:
                 )
             elif event == "navigation_diagnostic":
                 print(format_navigation_diagnostic(payload), flush=True)
+            elif event == "refresh_failed":
+                print(f"后台刷新稍后重试: {payload}", file=sys.stderr)
             elif event == "error":
                 command = payload["command"]
                 message = payload["message"]
