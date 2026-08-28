@@ -104,6 +104,20 @@ class SpatialNavigationTests(unittest.TestCase):
             [2, 1],
         )
 
+    def test_long_overlapping_cell_does_not_claim_a_distant_column(self):
+        targets = [
+            self.target(1100, 500, 1168, 568, "current action"),
+            self.target(100, 400, 1200, 440, "long passive-looking row"),
+            self.target(1100, 300, 1168, 368, "upper action"),
+        ]
+
+        self.assertEqual(
+            prototype.ranked_target_indices(
+                targets, 0, prototype.Direction.UP
+            )[:2],
+            [2, 1],
+        )
+
     def test_horizontal_route_uses_an_intermediate_cell_only_in_the_same_row(self):
         targets = [
             self.target(100, 100, 160, 140, "current"),
@@ -1179,7 +1193,7 @@ class SpatialNavigationTests(unittest.TestCase):
             2,
         )
 
-    def test_vertical_navigation_reaches_near_message_action_before_next_block(self):
+    def test_vertical_navigation_keeps_long_message_in_its_center_column(self):
         targets = [
             self.target(500, 100, 1200, 240, "message"),
             self.target(495, 250, 535, 290, "复制"),
@@ -1187,6 +1201,10 @@ class SpatialNavigationTests(unittest.TestCase):
         ]
         self.assertEqual(
             prototype.next_target_index(targets, 0, prototype.Direction.DOWN),
+            2,
+        )
+        self.assertEqual(
+            prototype.next_target_index(targets, 0, prototype.Direction.LEFT),
             1,
         )
 
@@ -1910,6 +1928,7 @@ class SpatialNavigationTests(unittest.TestCase):
                         "",
                         "GroupControl",
                         (0, index),
+                        has_direct_action_pattern=True,
                     ),
                     self.element(
                         92,
@@ -1936,6 +1955,47 @@ class SpatialNavigationTests(unittest.TestCase):
             ["张三", "李四", "项目群"],
         )
         self.assertEqual(specs[0].click_point, (151, 64))
+
+        passive_rows = [
+            self.element(
+                30,
+                40 + index * 52,
+                950,
+                80 + index * 52,
+                "",
+                "GroupControl",
+                (2, index),
+                keyboard_focusable=(index == 1),
+                has_legacy_pattern=True,
+            )
+            for index in range(3)
+        ]
+        passive_text = [
+            self.element(
+                40,
+                48 + index * 52,
+                940,
+                72 + index * 52,
+                f"状态文字 {index}",
+                path=(2, index, 0),
+            )
+            for index in range(3)
+        ]
+        passive_parent = self.element(
+            20,
+            20,
+            970,
+            240,
+            "状态区",
+            "PaneControl",
+            (2,),
+        )
+        self.assertEqual(
+            prototype.repeated_content_target_specs(
+                [passive_parent, *passive_rows, *passive_text], window
+            ),
+            [],
+        )
 
         layout = self.element(
             400,
@@ -2158,9 +2218,10 @@ class SpatialNavigationTests(unittest.TestCase):
             )
         )
 
-    def test_associated_or_trusted_quicker_overlay_can_sit_outside_root(self):
+    def test_only_associated_quicker_overlay_can_sit_far_outside_root(self):
         root = prototype.Rect(100, 100, 1100, 900)
         outside = prototype.Rect(1200, 200, 1268, 268)
+        nearby = prototype.Rect(1120, 200, 1188, 268)
         common = dict(
             visible=True,
             minimized=False,
@@ -2175,7 +2236,7 @@ class SpatialNavigationTests(unittest.TestCase):
                 **common,
             )
         )
-        self.assertTrue(
+        self.assertFalse(
             prototype.overlay_window_is_candidate(
                 root,
                 outside,
@@ -2183,8 +2244,36 @@ class SpatialNavigationTests(unittest.TestCase):
                 **common,
             )
         )
+        self.assertTrue(
+            prototype.overlay_window_is_candidate(
+                root,
+                nearby,
+                trusted_small_overlay=True,
+                **common,
+            )
+        )
         self.assertFalse(
             prototype.overlay_window_is_candidate(root, outside, **common)
+        )
+
+        codex_root = prototype.Rect(320, 278, 1998, 1850)
+        linked_stack = prototype.Rect(1847, 1367, 1915, 1435)
+        unrelated_desktop_action = prototype.Rect(3317, 175, 3437, 295)
+        self.assertTrue(
+            prototype.overlay_window_is_candidate(
+                codex_root,
+                linked_stack,
+                trusted_small_overlay=True,
+                **common,
+            )
+        )
+        self.assertFalse(
+            prototype.overlay_window_is_candidate(
+                codex_root,
+                unrelated_desktop_action,
+                trusted_small_overlay=True,
+                **common,
+            )
         )
 
     def test_reads_quicker_process_association_snapshot(self):
@@ -2620,7 +2709,7 @@ class SpatialNavigationTests(unittest.TestCase):
             [0, 1],
         )
 
-    def test_nested_show_more_remains_the_next_down_target(self):
+    def test_nested_show_more_uses_its_center_column(self):
         folder = self.target(
             20,
             140,
@@ -2655,6 +2744,12 @@ class SpatialNavigationTests(unittest.TestCase):
         self.assertEqual(
             prototype.next_target_index(
                 visible, 0, prototype.Direction.DOWN
+            ),
+            2,
+        )
+        self.assertEqual(
+            prototype.next_target_index(
+                visible, 0, prototype.Direction.LEFT
             ),
             1,
         )

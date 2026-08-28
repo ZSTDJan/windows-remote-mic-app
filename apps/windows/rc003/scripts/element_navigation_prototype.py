@@ -96,11 +96,9 @@ SECTION_HEADER_MIN_WINDOW_WIDTH_RATIO = 0.65
 SECTION_HEADER_MAX_WINDOW_HEIGHT_RATIO = 0.15
 SECTION_HEADER_MAX_TOP_OFFSET_RATIO = 0.15
 SECTION_MIN_HEIGHT = 32
-HORIZONTAL_LANE_MIN_OVERLAP_RATIO = 0.50
 HORIZONTAL_LANE_MIN_CENTER_TOLERANCE = 12.0
 HORIZONTAL_LANE_MAX_CENTER_TOLERANCE = 48.0
 HORIZONTAL_LANE_SIZE_MULTIPLIER = 0.75
-VERTICAL_LANE_MIN_OVERLAP_RATIO = 0.35
 VERTICAL_LANE_MIN_CENTER_TOLERANCE = 16.0
 VERTICAL_LANE_MAX_CENTER_TOLERANCE = 96.0
 VERTICAL_LANE_SIZE_MULTIPLIER = 0.35
@@ -172,6 +170,7 @@ VISUAL_SURFACE_MIN_WINDOW_AREA_RATIO = 0.06
 OVERLAY_MAX_ROOT_AREA_RATIO = 0.35
 OVERLAY_MIN_INTERSECTION_RATIO = 0.65
 OVERLAY_ROOT_TARGET_MAX_SIZE = 200
+OVERLAY_UNASSOCIATED_MAX_GAP = 48
 QUICKER_FLOAT_WINDOW_TITLES = frozenset(
     {"FloatButtonWindow", "FloatPanelWindow", "TextFloatPanelWindow"}
 )
@@ -267,6 +266,7 @@ class ElementSnapshot:
     enabled: bool = True
     offscreen: bool = False
     keyboard_focusable: bool = False
+    has_direct_action_pattern: bool = False
     has_legacy_pattern: bool = False
     has_scroll_pattern: bool = False
 
@@ -597,6 +597,15 @@ def repeated_content_target_specs(
         content_by_path[path] = content[:16]
 
     specs: list[SyntheticTargetSpec] = []
+    direct_action_descendants: dict[
+        tuple[int, ...], list[ElementSnapshot]
+    ] = defaultdict(list)
+    for element in elements:
+        if not element.has_direct_action_pattern:
+            continue
+        for depth in range(1, len(element.path) + 1):
+            direct_action_descendants[element.path[:depth]].append(element)
+
     for parent_path, child_paths in children.items():
         parent = by_path.get(parent_path)
         if (
@@ -617,6 +626,17 @@ def repeated_content_target_specs(
                 or child.rect.width < 24
                 or child.rect.height < 24
             ):
+                continue
+            action_evidence = child.has_direct_action_pattern or any(
+                _rect_intersection_area(child.rect, action.rect)
+                >= min(
+                    child.rect.width * child.rect.height,
+                    action.rect.width * action.rect.height,
+                )
+                * 0.85
+                for action in direct_action_descendants.get(child.path, ())
+            )
+            if not action_evidence:
                 continue
             content = content_by_path.get(child_path, [])
             if not content:
@@ -1250,8 +1270,8 @@ def direction_score(
 
     This is an independent prototype heuristic based on the same general
     geometry used by TV and CSS spatial navigation: stay in the requested
-    half-plane, prefer the smallest forward gap, strongly penalize leaving the
-    current row/column, and reward overlap on the perpendicular axis.
+    half-plane, use center lines to identify the current row/column, then rank
+    by forward distance and remaining perpendicular geometry.
     """
 
     if current == candidate:
@@ -1309,7 +1329,6 @@ def direction_score(
     )
     if direction in {Direction.LEFT, Direction.RIGHT}:
         smaller_height = max(1, min(current.height, candidate.height))
-        overlap_ratio = overlap / smaller_height
         center_tolerance = max(
             HORIZONTAL_LANE_MIN_CENTER_TOLERANCE,
             min(
@@ -1317,15 +1336,11 @@ def direction_score(
                 smaller_height * HORIZONTAL_LANE_SIZE_MULTIPLIER,
             ),
         )
-        # A one-pixel edge touch is not a row. Keep an intermediate target in
-        # the horizontal route only when its Y projection or centers are close.
-        beam_rank = 0 if (
-            overlap_ratio >= HORIZONTAL_LANE_MIN_OVERLAP_RATIO
-            or center_offset <= center_tolerance
-        ) else 1
+        # Rectangle overlap alone cannot create a row: a tall target must not
+        # claim every horizontal track that crosses its bounds.
+        beam_rank = 0 if center_offset <= center_tolerance else 1
     else:
         smaller_width = max(1, min(current.width, candidate.width))
-        overlap_ratio = overlap / smaller_width
         center_tolerance = max(
             VERTICAL_LANE_MIN_CENTER_TOLERANCE,
             min(
@@ -1333,10 +1348,7 @@ def direction_score(
                 smaller_width * VERTICAL_LANE_SIZE_MULTIPLIER,
             ),
         )
-        beam_rank = 0 if (
-            overlap_ratio >= VERTICAL_LANE_MIN_OVERLAP_RATIO
-            or center_offset <= center_tolerance
-        ) else 1
+        beam_rank = 0 if center_offset <= center_tolerance else 1
     return (
         beam_rank,
         float(primary_gap),
@@ -2062,14 +2074,31 @@ def overlay_window_is_candidate(
         return False
     if explicitly_associated:
         return True
-    if (
+    intersection = _rect_intersection_area(root_rect, candidate_rect)
+    if intersection >= candidate_area * OVERLAY_MIN_INTERSECTION_RATIO:
+        return True
+    if not (
         trusted_small_overlay
         and candidate_rect.width <= OVERLAY_ROOT_TARGET_MAX_SIZE
         and candidate_rect.height <= OVERLAY_ROOT_TARGET_MAX_SIZE
     ):
-        return True
-    intersection = _rect_intersection_area(root_rect, candidate_rect)
-    return intersection >= candidate_area * OVERLAY_MIN_INTERSECTION_RATIO
+        return False
+    horizontal_gap = _axis_gap(
+        root_rect.left,
+        root_rect.right,
+        candidate_rect.left,
+        candidate_rect.right,
+    )
+    vertical_gap = _axis_gap(
+        root_rect.top,
+        root_rect.bottom,
+        candidate_rect.top,
+        candidate_rect.bottom,
+    )
+    return (
+        horizontal_gap <= OVERLAY_UNASSOCIATED_MAX_GAP
+        and vertical_gap <= OVERLAY_UNASSOCIATED_MAX_GAP
+    )
 
 
 def root_only_overlay_target_spec(
@@ -3463,6 +3492,28 @@ def _run_windows(args: argparse.Namespace) -> int:
                 enabled = bool(control.IsEnabled)
                 offscreen = bool(control.IsOffscreen)
                 keyboard_focusable = bool(control.IsKeyboardFocusable)
+                repeated_content_action = False
+                if (
+                    enabled
+                    and not offscreen
+                    and control_rect.width >= 24
+                    and control_rect.height >= 24
+                    and control_rect.intersects(window_rect)
+                    and control_type in REPEATED_CONTENT_ITEM_TYPES
+                ):
+                    repeated_content_action = control_supports_pattern(
+                        control,
+                        auto.PatternId.InvokePattern,
+                    )
+                    if (
+                        not repeated_content_action
+                        and control_type
+                        in {"DataItemControl", "ListItemControl"}
+                    ):
+                        repeated_content_action = control_supports_pattern(
+                            control,
+                            auto.PatternId.SelectionItemPattern,
+                        )
                 elements.append(
                     ElementSnapshot(
                         rect=control_rect,
@@ -3473,6 +3524,7 @@ def _run_windows(args: argparse.Namespace) -> int:
                         enabled=enabled,
                         offscreen=offscreen,
                         keyboard_focusable=keyboard_focusable,
+                        has_direct_action_pattern=repeated_content_action,
                         has_legacy_pattern=(
                             control_type in VISUAL_SURFACE_CONTROL_TYPES
                             and control_supports_pattern(
