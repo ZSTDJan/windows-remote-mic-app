@@ -1,6 +1,8 @@
+import os
 import threading
 import time
 import unittest
+from unittest import mock
 
 from ovb_rc003 import legacy_key_suppressor_windows as suppressor
 
@@ -235,6 +237,12 @@ class LegacyKeySuppressorRaceTests(unittest.TestCase):
 
 
 class LegacyKeySuppressorLifecycleTests(unittest.TestCase):
+    def test_build_gate_rejects_a_real_keyboard_hook(self):
+        gate = suppressor.LegacyKeySuppressor({0x74})
+        with mock.patch.dict(os.environ, {"RC003_DISABLE_LIVE_INPUT": "1"}):
+            with self.assertRaises(suppressor.LegacyKeySuppressorUnavailableError):
+                gate.start()
+
     def test_real_hook_creates_its_message_queue_before_reporting_ready(self):
         import inspect
 

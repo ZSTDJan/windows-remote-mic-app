@@ -39,6 +39,7 @@ without needing ``ctypes.windll`` (which does not exist off Windows) at all.
 from __future__ import annotations
 
 import ctypes
+import os
 import sys
 import time
 from ctypes import wintypes
@@ -152,6 +153,13 @@ class Win32InputUnavailableError(Exception):
     """Raised when SendInput is invoked on a non-Windows platform."""
 
 
+def _require_live_input_allowed() -> None:
+    if os.environ.get("RC003_DISABLE_LIVE_INPUT") == "1":
+        raise Win32InputUnavailableError(
+            "live Windows input is disabled for this process"
+        )
+
+
 class InputCleanupIncompleteError(OSError):
     """Raised when delivery failed and a compensating key-up could not be
     confirmed.
@@ -222,6 +230,7 @@ def _build_virtual_key_input_array(events: Sequence[Tuple[int, bool]]):
 def _real_send_input_batch_with_builder(events, builder) -> int:
     """Submit one keyboard batch using the requested INPUT-array builder."""
 
+    _require_live_input_allowed()
     _require_windows()
     if not events:
         return 0
@@ -431,6 +440,7 @@ def _real_keybd_event(vk: int, key_up: bool) -> None:
     by Windows but is not recognized reliably by Doubao.
     """
 
+    _require_live_input_allowed()
     _require_windows()
     user32 = ctypes.windll.user32  # type: ignore[attr-defined]
     user32.MapVirtualKeyW.argtypes = (wintypes.UINT, wintypes.UINT)

@@ -1246,16 +1246,23 @@ class OrdinaryButtonGestureWiringTests(_AppWiringTestCase):
             self.app._on_legacy_key_event(0x74, True)
             returned.append(True)
 
-        self.app._voice_trigger_lock.acquire()
-        worker = threading.Thread(target=invoke)
-        try:
-            worker.start()
-            worker.join(timeout=0.2)
-            returned_without_lock = not worker.is_alive()
-        finally:
-            self.app._voice_trigger_lock.release()
-        worker.join(timeout=1.0)
-        self._drain_event_loop()
+        with mock.patch.object(
+            win32_input,
+            "send_voice_key_combo_down",
+        ), mock.patch.object(
+            win32_input,
+            "send_voice_key_combo_up",
+        ):
+            self.app._voice_trigger_lock.acquire()
+            worker = threading.Thread(target=invoke)
+            try:
+                worker.start()
+                worker.join(timeout=0.2)
+                returned_without_lock = not worker.is_alive()
+            finally:
+                self.app._voice_trigger_lock.release()
+            worker.join(timeout=1.0)
+            self._drain_event_loop()
 
         self.assertTrue(returned_without_lock)
         self.assertEqual(returned, [True])

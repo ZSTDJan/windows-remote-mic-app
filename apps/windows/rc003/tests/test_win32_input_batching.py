@@ -47,6 +47,20 @@ class RaiseOnceThenRecordSender:
         return len(events)
 
 
+class LiveInputSafetyGateTests(unittest.TestCase):
+    def test_real_input_backends_are_blocked_when_build_gate_is_enabled(self):
+        with mock.patch.dict(
+            "os.environ",
+            {"RC003_DISABLE_LIVE_INPUT": "1"},
+        ):
+            with self.assertRaises(win32_input.Win32InputUnavailableError):
+                win32_input._real_send_input_batch([(0x41, False)])
+            with self.assertRaises(win32_input.Win32InputUnavailableError):
+                win32_input._real_send_virtual_key_input_batch([(0x41, False)])
+            with self.assertRaises(win32_input.Win32InputUnavailableError):
+                win32_input._real_keybd_event(0xA5, False)
+
+
 class SendKeyComboDownTests(unittest.TestCase):
     def test_full_delivery_sends_one_batched_call_in_order(self):
         sender = RecordingSender()

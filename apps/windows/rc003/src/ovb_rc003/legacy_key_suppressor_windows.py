@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import ctypes
 import logging
+import os
 import sys
 import threading
 import time
@@ -513,6 +514,10 @@ class LegacyKeySuppressor:
         if not self._suppress_vk_codes:
             return
         if _run_target is None:
+            if os.environ.get("RC003_DISABLE_LIVE_INPUT") == "1":
+                raise LegacyKeySuppressorUnavailableError(
+                    "live Windows keyboard hooks are disabled for this process"
+                )
             _require_windows()
         self._ready_event.clear()
         self._stop_event.clear()

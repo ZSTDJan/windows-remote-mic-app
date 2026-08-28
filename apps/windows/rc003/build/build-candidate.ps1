@@ -48,6 +48,11 @@ Write-Host "== Remote Mic · RC003 candidate build =="
 
 Push-Location $RC003Root
 try {
+    # Candidate builds run on a developer's interactive desktop. Tests must
+    # never install a real keyboard hook or inject an actual key edge there.
+    $env:RC003_DISABLE_LIVE_INPUT = "1"
+    $env:RC003_ALLOW_LIVE_INPUT_TESTS = "0"
+
     Write-Host "-- stop marked source development session --"
     & powershell -ExecutionPolicy Bypass -File (Join-Path "build" "stop-dev.ps1")
     Assert-LastExitCode "stop-dev.ps1"

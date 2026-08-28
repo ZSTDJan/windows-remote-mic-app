@@ -974,6 +974,10 @@ class BuildCandidateScriptTests(unittest.TestCase):
         # workflow's test-suite step, not just document it in prose.
         self.assertIn("-W error::ResourceWarning -m unittest discover", self.text)
 
+    def test_local_build_disables_all_live_keyboard_input(self):
+        self.assertIn('$env:RC003_DISABLE_LIVE_INPUT = "1"', self.text)
+        self.assertIn('$env:RC003_ALLOW_LIVE_INPUT_TESTS = "0"', self.text)
+
     def test_stops_the_marked_development_session_before_touching_the_venv(self):
         stop_index = self.text.index("stop-dev.ps1")
         pip_index = self.text.index("pip install --upgrade pip")
