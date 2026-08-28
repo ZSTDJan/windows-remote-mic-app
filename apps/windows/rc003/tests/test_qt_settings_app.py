@@ -5340,6 +5340,12 @@ assert combo is not None and double_combo is not None and long_combo is not None
 assert combo.property("visible")
 assert double_combo.property("visible") and long_combo.property("visible")
 assert not double_combo.property("enabled") and not long_combo.property("enabled")
+assert combo.property("selectTextByMouse")
+assert double_combo.property("selectTextByMouse")
+assert long_combo.property("selectTextByMouse")
+assert combo.property("contentItem").property("selectByMouse")
+assert double_combo.property("contentItem").property("selectByMouse")
+assert long_combo.property("contentItem").property("selectByMouse")
 
 current_index = int(combo.property("currentIndex"))
 indicator_point = combo.mapToScene(

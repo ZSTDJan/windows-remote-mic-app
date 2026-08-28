@@ -312,6 +312,7 @@ Item {
         property var tokens
 
         editable: true
+        selectTextByMouse: true
         implicitHeight: tokens.controlHeight
         leftPadding: 7
         rightPadding: 22
