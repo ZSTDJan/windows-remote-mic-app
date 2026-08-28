@@ -646,10 +646,12 @@ Item {
                     tokens: root.tokens
                     stateColumnWidth: root.settingsStateColumnWidth
                     actionColumnWidth: root.settingsActionColumnWidth
+                    editorColumnVisible: DiagnosticsController.vbCableBridgeRecoveryNeeded
                     titleText: qsTr("声音通道")
                     descriptionText: DiagnosticsController.vbCableTestMessage.length > 0
                         ? DiagnosticsController.vbCableTestMessage
                         : qsTr("测试 CABLE Input → CABLE Output")
+                    descriptionObjectName: "soundChannelTestDescription"
                     stateText: DiagnosticsController.vbCableTestRunning
                         ? qsTr("测试中")
                         : DiagnosticsController.vbCableTestStatus === "pass"
@@ -697,6 +699,7 @@ Item {
                     actionColumnWidth: root.settingsActionColumnWidth
                     titleText: qsTr("实际说话")
                     descriptionText: qsTr("在输入框中验证语音文字")
+                    descriptionObjectName: "actualSpeechTestDescription"
                     stateText: qsTr("待实测")
                     stateColor: tokens.voiceAccent
                     showDivider: false

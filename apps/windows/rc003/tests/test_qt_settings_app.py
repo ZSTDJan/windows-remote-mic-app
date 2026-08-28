@@ -3902,7 +3902,32 @@ result["voice_columns"] = {
             "trySpeakingButton",
         )
     },
+    "descriptions": {
+        name: bounds(window, name)
+        for name in (
+            "voiceProgramLaunchText",
+            "soundChannelTestDescription",
+            "actualSpeechTestDescription",
+        )
+    },
+    "editor_columns": {
+        name: bounds(window, name + "_editorColumn")
+        for name in (
+            "voiceProgramSpecificRow",
+            "soundChannelTestRow",
+            "actualSpeechTestRow",
+        )
+    },
 }
+
+diagnostics_controller._set_vb_cable_bridge_recovery_needed(True)
+render(window, app)
+result["voice_recovery_editor"] = {
+    "column": bounds(window, "soundChannelTestRow_editorColumn"),
+    "button": bounds(window, "recoverBridgeButton"),
+}
+diagnostics_controller._set_vb_cable_bridge_recovery_needed(False)
+render(window, app)
 
 controller.selectedVoiceProgramIndex = 3
 render(window, app)
@@ -4043,6 +4068,7 @@ class SettingsShellSourceContractTests(unittest.TestCase):
             "property string descriptionObjectName", self.inline_settings_row_qml
         )
         self.assertIn("property alias editorData", self.inline_settings_row_qml)
+        self.assertIn("property bool editorColumnVisible", self.inline_settings_row_qml)
         self.assertIn("property int stateColumnWidth", self.inline_settings_row_qml)
         self.assertIn("property int actionColumnWidth", self.inline_settings_row_qml)
         self.assertIn("default property alias actionData", self.inline_settings_row_qml)
@@ -4592,6 +4618,25 @@ class OffscreenQmlLoadTests(unittest.TestCase):
                 self.assertEqual(data["warnings"], [])
                 self.assertEqual((data["width"], data["height"]), (width, height))
                 self.assertEqual(data["mapping_index_on_press"], 1)
+
+                descriptions = data["voice_columns"]["descriptions"]
+                launch_x = descriptions["voiceProgramLaunchText"]["x"]
+                self.assertAlmostEqual(
+                    descriptions["soundChannelTestDescription"]["x"],
+                    launch_x,
+                    delta=0.5,
+                )
+                self.assertAlmostEqual(
+                    descriptions["actualSpeechTestDescription"]["x"],
+                    launch_x,
+                    delta=0.5,
+                )
+                editor_columns = data["voice_columns"]["editor_columns"]
+                self.assertFalse(editor_columns["voiceProgramSpecificRow"]["visible"])
+                self.assertFalse(editor_columns["soundChannelTestRow"]["visible"])
+                self.assertFalse(editor_columns["actualSpeechTestRow"]["visible"])
+                self.assertTrue(data["voice_recovery_editor"]["column"]["visible"])
+                self.assertTrue(data["voice_recovery_editor"]["button"]["visible"])
 
                 nav = data["navigation_backgrounds"]
                 for button_name in (

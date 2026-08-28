@@ -12,6 +12,7 @@ Rectangle {
     property color stateColor: tokens.textSecondary
     property int titleWidth: 72
     property real editorColumnWidth: 0
+    property bool editorColumnVisible: editorRow.children.length > 0
     property int stateColumnWidth: 0
     property int actionColumnWidth: 0
     property bool showDivider: true
@@ -52,7 +53,7 @@ Rectangle {
             id: editorRow
             objectName: root.objectName.length > 0
                 ? root.objectName + "_editorColumn" : ""
-            visible: children.length > 0
+            visible: root.editorColumnVisible
             spacing: root.tokens.spacingSmall
             Layout.fillWidth: visible && root.editorColumnWidth <= 0
             Layout.preferredWidth: root.editorColumnWidth > 0
