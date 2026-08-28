@@ -68,10 +68,17 @@ CHROMIUM_MIN_SCAN_DEPTH = 32
 SEMANTIC_BYPASS_MAX_WIDTH = 180
 SEMANTIC_BYPASS_MAX_HEIGHT = 96
 PREWARM_STABILITY_SECONDS = 0.75
-SECTION_MAX_WINDOW_RATIO = 0.88
-SECTION_MIN_WINDOW_RATIO = 0.15
+SECTION_MAX_WINDOW_WIDTH_RATIO = 0.88
+SECTION_MIN_WINDOW_WIDTH_RATIO = 0.15
+SECTION_BODY_MIN_WINDOW_HEIGHT_RATIO = 0.40
+SECTION_BODY_MAX_WINDOW_HEIGHT_RATIO = 1.25
+SECTION_HEADER_MIN_WINDOW_WIDTH_RATIO = 0.65
+SECTION_HEADER_MAX_WINDOW_HEIGHT_RATIO = 0.15
+SECTION_HEADER_MAX_TOP_OFFSET_RATIO = 0.15
+SECTION_MIN_HEIGHT = 32
 SECTION_BRIDGE_BASE_DISTANCE = 240.0
 SECTION_BRIDGE_SIZE_MULTIPLIER = 6.0
+SECTION_EDGE_TOLERANCE = 16
 VK_RETURN = 0x0D
 VK_ESCAPE = 0x1B
 VK_PAGEUP = 0x21
@@ -107,6 +114,17 @@ GLOBAL_HOTKEY_ACTIONS = {
     VK_N: "toggle",
     VK_Q: "quit",
 }
+NAVIGATION_SECTION_CONTROL_TYPES = frozenset(
+    {
+        "DataGridControl",
+        "ListControl",
+        "MenuControl",
+        "TabControl",
+        "TableControl",
+        "ToolBarControl",
+        "TreeControl",
+    }
+)
 
 
 class Direction(str, Enum):
@@ -174,6 +192,7 @@ class TargetSnapshot:
     runtime_id: tuple[int, ...] = ()
     source: str = "uia"
     section_path: tuple[int, ...] = ()
+    section_rect: Optional[Rect] = None
 
 
 @dataclass(frozen=True)
@@ -343,24 +362,55 @@ def infer_navigation_section_path(
     path: tuple[int, ...],
     ancestor_rects: dict[tuple[int, ...], Rect],
     window_rect: Rect,
+    ancestor_types: Optional[dict[tuple[int, ...], str]] = None,
 ) -> tuple[int, ...]:
-    """Return the first large UIA region narrower than window-wide wrappers."""
+    """Return the deepest usable UIA navigation region around a target."""
 
     if window_rect.width <= 0 or window_rect.height <= 0:
         return ()
-    minimum_width = window_rect.width * SECTION_MIN_WINDOW_RATIO
-    minimum_height = window_rect.height * SECTION_MIN_WINDOW_RATIO
+    minimum_width = window_rect.width * SECTION_MIN_WINDOW_WIDTH_RATIO
+    maximum_width = window_rect.width * SECTION_MAX_WINDOW_WIDTH_RATIO
+    body_minimum_height = (
+        window_rect.height * SECTION_BODY_MIN_WINDOW_HEIGHT_RATIO
+    )
+    body_maximum_height = (
+        window_rect.height * SECTION_BODY_MAX_WINDOW_HEIGHT_RATIO
+    )
+    header_minimum_width = (
+        window_rect.width * SECTION_HEADER_MIN_WINDOW_WIDTH_RATIO
+    )
+    header_maximum_height = (
+        window_rect.height * SECTION_HEADER_MAX_WINDOW_HEIGHT_RATIO
+    )
+    header_maximum_top = (
+        window_rect.top
+        + window_rect.height * SECTION_HEADER_MAX_TOP_OFFSET_RATIO
+    )
+    section_path: tuple[int, ...] = ()
     for depth in range(1, len(path)):
         prefix = path[:depth]
         rect = ancestor_rects.get(prefix)
         if rect is None or not rect.intersects(window_rect):
             continue
-        if rect.width < minimum_width or rect.height < minimum_height:
+        if (
+            rect.width < minimum_width
+            or rect.width > maximum_width
+            or rect.height < SECTION_MIN_HEIGHT
+        ):
             continue
-        width_ratio = rect.width / window_rect.width
-        if width_ratio <= SECTION_MAX_WINDOW_RATIO:
-            return prefix
-    return ()
+        control_type = (
+            "" if ancestor_types is None else ancestor_types.get(prefix, "")
+        )
+        semantic_container = control_type in NAVIGATION_SECTION_CONTROL_TYPES
+        body_region = body_minimum_height <= rect.height <= body_maximum_height
+        header_region = (
+            rect.width >= header_minimum_width
+            and rect.height <= header_maximum_height
+            and rect.top <= header_maximum_top
+        )
+        if semantic_container or body_region or header_region:
+            section_path = prefix
+    return section_path
 
 
 def horizontal_wrap_target_indices(
@@ -431,63 +481,136 @@ def horizontal_wrap_target_indices(
     return [index for *_score, index in candidates]
 
 
-def horizontal_section_bridge_target_index(
+def _horizontal_section_gap(
+    current: Rect, candidate: Rect, direction: Direction
+) -> Optional[float]:
+    vertical_overlap = min(current.bottom, candidate.bottom) - max(
+        current.top, candidate.top
+    )
+    if vertical_overlap <= 0:
+        return None
+    if direction == Direction.LEFT:
+        gap = current.left - candidate.right
+    elif direction == Direction.RIGHT:
+        gap = candidate.left - current.right
+    else:
+        return None
+    if gap < -SECTION_EDGE_TOLERANCE:
+        return None
+    return float(max(0, gap))
+
+
+def horizontal_adjacent_section_target_indices(
     targets: Sequence[TargetSnapshot],
     current_index: int,
     direction: Direction,
-    lane_indices: Sequence[int],
-    diagonal_indices: Sequence[int],
-) -> Optional[int]:
-    """Prefer a nearby diagonal in the same large UI region over another pane."""
+    candidate_indices: Sequence[int],
+) -> list[int]:
+    if (
+        direction not in {Direction.RIGHT, Direction.LEFT}
+        or not 0 <= current_index < len(targets)
+    ):
+        return []
+    current = targets[current_index]
+    if not current.section_path or current.section_rect is None:
+        return []
+
+    adjacent: list[tuple[float, int]] = []
+    for index in candidate_indices:
+        candidate = targets[index]
+        if (
+            candidate.section_path == current.section_path
+            or not candidate.section_path
+            or candidate.section_rect is None
+        ):
+            continue
+        section_gap = _horizontal_section_gap(
+            current.section_rect, candidate.section_rect, direction
+        )
+        if section_gap is None:
+            continue
+        score = direction_score(current.rect, candidate.rect, direction)
+        if score is None:
+            continue
+        adjacent.append((section_gap, index))
+    if not adjacent:
+        return []
+
+    nearest_gap = min(gap for gap, _index in adjacent)
+    adjacent_sections = {
+        targets[index].section_path
+        for gap, index in adjacent
+        if gap <= nearest_gap + SECTION_EDGE_TOLERANCE
+    }
+    return [
+        index
+        for index in candidate_indices
+        if targets[index].section_path in adjacent_sections
+    ]
+
+
+def horizontal_section_target_indices(
+    targets: Sequence[TargetSnapshot],
+    current_index: int,
+    direction: Direction,
+    candidate_indices: Sequence[int],
+    adjacent_section_indices: Sequence[int],
+) -> list[int]:
+    """Order the current and immediately adjacent horizontal regions."""
 
     if (
         direction not in {Direction.RIGHT, Direction.LEFT}
-        or not lane_indices
-        or not diagonal_indices
         or not 0 <= current_index < len(targets)
     ):
-        return None
+        return []
     current = targets[current_index]
-    if not current.section_path:
-        return None
+    if not current.section_path or current.section_rect is None:
+        return []
 
-    lane_index = lane_indices[0]
-    lane = targets[lane_index]
-    if not lane.section_path or lane.section_path == current.section_path:
-        return None
-    lane_score = direction_score(current.rect, lane.rect, direction)
-    if lane_score is None or lane_score[0] != 0:
-        return None
+    adjacent = set(adjacent_section_indices)
+    same_section = [
+        index
+        for index in candidate_indices
+        if targets[index].section_path == current.section_path
+    ]
+    adjacent_section = [
+        index for index in candidate_indices if index in adjacent
+    ]
+    ordered = [
+        index
+        for index in candidate_indices
+        if index in adjacent
+        or targets[index].section_path == current.section_path
+    ]
+    if not same_section or not adjacent_section:
+        return ordered
 
-    for candidate_index in diagonal_indices:
-        candidate = targets[candidate_index]
-        if candidate.section_path != current.section_path:
-            continue
-        candidate_score = direction_score(
-            current.rect, candidate.rect, direction
-        )
-        if candidate_score is None or candidate_score[0] == 0:
-            continue
-        if _common_path_prefix_length(
-            current.path, candidate.path
-        ) <= _common_path_prefix_length(current.path, lane.path):
-            continue
-        maximum_center_offset = max(
-            SECTION_BRIDGE_BASE_DISTANCE,
-            current.rect.height * SECTION_BRIDGE_SIZE_MULTIPLIER,
-            candidate.rect.height * SECTION_BRIDGE_SIZE_MULTIPLIER,
-        )
-        maximum_forward_gap = lane_score[1] + max(
-            SECTION_BRIDGE_BASE_DISTANCE,
-            current.rect.width * SECTION_BRIDGE_SIZE_MULTIPLIER,
-            candidate.rect.width * SECTION_BRIDGE_SIZE_MULTIPLIER,
-        )
-        if (
-            candidate_score[4] <= maximum_center_offset
-            and candidate_score[1] <= maximum_forward_gap
-        ):
-            return candidate_index
-    return None
+    best_same = same_section[0]
+    best_adjacent = adjacent_section[0]
+    if ordered[0] == best_same:
+        return ordered
+
+    same_score = direction_score(
+        current.rect, targets[best_same].rect, direction
+    )
+    adjacent_score = direction_score(
+        current.rect, targets[best_adjacent].rect, direction
+    )
+    if same_score is None or adjacent_score is None:
+        return ordered
+
+    same_target = targets[best_same]
+    maximum_center_offset = max(
+        SECTION_BRIDGE_BASE_DISTANCE,
+        current.rect.height * SECTION_BRIDGE_SIZE_MULTIPLIER,
+        same_target.rect.height * SECTION_BRIDGE_SIZE_MULTIPLIER,
+    )
+    if (
+        same_score[1] <= adjacent_score[1]
+        and same_score[4] <= maximum_center_offset
+    ):
+        return [best_same] + [index for index in ordered if index != best_same]
+    return ordered
 
 
 def ranked_target_indices(
@@ -508,10 +631,6 @@ def ranked_target_indices(
                 targets[current_index].path, target.path
             )
             scored.append((score, common_prefix, index))
-    affinity_unit = max(
-        48.0,
-        min(120.0, max(current.width, current.height) * 0.55),
-    )
 
     def rank_key(
         item: tuple[
@@ -519,17 +638,32 @@ def ranked_target_indices(
         ],
     ) -> tuple[float, ...]:
         score, common_prefix, index = item
-        contained_rank = 0.0 if current.contains(targets[index].rect) else 1.0
-        path_bonus = min(common_prefix, 4) * (
-            24.0 if score[0] == 0 else affinity_unit
-        )
+        candidate = targets[index].rect
+        contained_rank = 0.0 if current.contains(candidate) else 1.0
+        if direction == Direction.RIGHT:
+            forward_center_distance = candidate.center_x - current.center_x
+        elif direction == Direction.LEFT:
+            forward_center_distance = current.center_x - candidate.center_x
+        elif direction == Direction.DOWN:
+            forward_center_distance = candidate.center_y - current.center_y
+        else:
+            forward_center_distance = current.center_y - candidate.center_y
+        if score[0] == 0:
+            axis_distance = score[1]
+            secondary_distance = score[4]
+            forward_distance = score[2]
+        else:
+            axis_distance = score[2]
+            secondary_distance = score[4]
+            forward_distance = score[1]
         return (
             contained_rank,
             float(score[0]),
-            max(0.0, score[1] - path_bonus),
-            score[2],
-            score[3] - path_bonus,
-            score[4],
+            axis_distance,
+            secondary_distance,
+            forward_distance,
+            forward_center_distance,
+            score[3],
             float(-common_prefix),
             float(score[5]),
             float(score[6]),
@@ -539,55 +673,27 @@ def ranked_target_indices(
     if direction not in {Direction.RIGHT, Direction.LEFT}:
         return [index for _score, _prefix, index in scored]
 
-    # A real candidate in the requested half-plane is the default, matching
-    # established spatial-navigation algorithms. Reading-order wrap is a
-    # fallback for grids whose next item starts on the other side of the next
-    # row. It may win only when UIA paths show that the wrap stays in a more
-    # closely related branch than the best diagonal candidate.
-    in_row = [index for score, _prefix, index in scored if score[0] == 0]
-    diagonal = [
-        index
-        for score, _prefix, index in scored
-        if score[0] != 0
-        and (
-            (
-                direction == Direction.RIGHT
-                and targets[index].rect.center_y >= current.center_y
-            )
-            or (
-                direction == Direction.LEFT
-                and targets[index].rect.center_y <= current.center_y
-            )
-        )
-    ]
-    section_bridge = horizontal_section_bridge_target_index(
+    # Horizontal keys first exhaust real candidates in the requested
+    # half-plane. Reading-order wrap is only a final fallback for a row end;
+    # it never outranks an element that is actually to the left or right.
+    directional = [index for _score, _prefix, index in scored]
+    wrapped = horizontal_wrap_target_indices(targets, current_index, direction)
+    section_exits = horizontal_adjacent_section_target_indices(
         targets,
         current_index,
         direction,
-        in_row,
-        diagonal,
+        directional,
     )
-    if section_bridge is not None:
-        diagonal = [index for index in diagonal if index != section_bridge]
-    wrapped = horizontal_wrap_target_indices(targets, current_index, direction)
-    ranked = [section_bridge] if section_bridge is not None else []
-    ranked.extend(in_row)
-    if diagonal and wrapped:
-        diagonal_affinity = _common_path_prefix_length(
-            targets[current_index].path, targets[diagonal[0]].path
-        )
-        wrap_affinity = _common_path_prefix_length(
-            targets[current_index].path, targets[wrapped[0]].path
-        )
-        fallback_groups = (
-            (wrapped, diagonal)
-            if wrap_affinity > diagonal_affinity
-            else (diagonal, wrapped)
-        )
-    else:
-        fallback_groups = (diagonal, wrapped)
-    for group in fallback_groups:
-        ranked.extend(index for index in group if index not in ranked)
+    section_targets = horizontal_section_target_indices(
+        targets,
+        current_index,
+        direction,
+        directional,
+        section_exits,
+    )
+    ranked = list(section_targets or directional)
+    ranked.extend(index for index in directional if index not in ranked)
+    ranked.extend(index for index in wrapped if index not in ranked)
     return ranked
 
 
@@ -608,7 +714,8 @@ DIAGNOSTIC_ROUTE_LABELS = {
     "diagonal": "斜向候选",
     "wrap": "跨行补充",
     "reverse": "反向返回",
-    "section_bridge": "同区优先",
+    "section_bridge": "同区网格",
+    "section_exit": "相邻区出口",
 }
 DIAGNOSTIC_DIRECTION_LABELS = {
     Direction.UP: "上",
@@ -644,38 +751,38 @@ def build_navigation_diagnostic(
         if ranked_indices is None
         else ranked_indices
     )
-    wrapped = set(horizontal_wrap_target_indices(targets, current_index, direction))
+    wrapped_indices = horizontal_wrap_target_indices(
+        targets, current_index, direction
+    )
+    wrapped = set(wrapped_indices)
     scored_by_index = {
         index: direction_score(current.rect, targets[index].rect, direction)
         for index in ranked
         if 0 <= index < len(targets) and index != current_index
     }
-    lane_indices = [
-        index
-        for index in ranked
-        if scored_by_index.get(index) is not None
-        and scored_by_index[index][0] == 0
-    ]
-    diagonal_indices = [
-        index
-        for index in ranked
-        if scored_by_index.get(index) is not None
-        and scored_by_index[index][0] != 0
-    ]
-    section_bridge = horizontal_section_bridge_target_index(
+    all_directional = tuple(
+        index for index in ranked if scored_by_index.get(index) is not None
+    )
+    section_exit_indices = horizontal_adjacent_section_target_indices(
         targets,
         current_index,
         direction,
-        lane_indices,
-        diagonal_indices,
+        all_directional,
     )
+    section_exits = set(section_exit_indices)
     candidates: list[CandidateDiagnostic] = []
     for rank, index in enumerate(ranked, 1):
         if not 0 <= index < len(targets) or index == current_index:
             continue
         target = targets[index]
         score = direction_score(current.rect, target.rect, direction)
-        if index == section_bridge:
+        if index in section_exits:
+            route = "section_exit"
+        elif (
+            current.section_path
+            and current.section_rect is not None
+            and target.section_path == current.section_path
+        ):
             route = "section_bridge"
         elif index in wrapped:
             route = "wrap"
@@ -940,6 +1047,7 @@ def geometry_anchor_indices(count: int, selected: int) -> list[int]:
 
 def shifted_snapshot(target: TargetSnapshot, delta_x: int, delta_y: int) -> TargetSnapshot:
     rect = target.rect
+    section_rect = target.section_rect
     return replace(
         target,
         rect=Rect(
@@ -947,6 +1055,16 @@ def shifted_snapshot(target: TargetSnapshot, delta_x: int, delta_y: int) -> Targ
             rect.top + delta_y,
             rect.right + delta_x,
             rect.bottom + delta_y,
+        ),
+        section_rect=(
+            None
+            if section_rect is None
+            else Rect(
+                section_rect.left + delta_x,
+                section_rect.top + delta_y,
+                section_rect.right + delta_x,
+                section_rect.bottom + delta_y,
+            )
         ),
     )
 
@@ -1594,6 +1712,7 @@ def _run_windows(args: argparse.Namespace) -> int:
         depth: int = 0,
         source: str = "uia",
         section_path: tuple[int, ...] = (),
+        section_rect: Optional[Rect] = None,
         precomputed_rect: Optional[Rect] = None,
     ) -> Optional[RuntimeTarget]:
         try:
@@ -1652,6 +1771,7 @@ def _run_windows(args: argparse.Namespace) -> int:
                     runtime_id=runtime_id_from_control(control),
                     source=source,
                     section_path=section_path,
+                    section_rect=section_rect,
                 ),
                 control,
             )
@@ -1899,16 +2019,19 @@ def _run_windows(args: argparse.Namespace) -> int:
                     node_types[path] = control_type
                     node_rects[path] = control_rect
                 if relative_depth > 0:
+                    section_path = infer_navigation_section_path(
+                        path,
+                        node_rects,
+                        window_rect,
+                        node_types,
+                    )
                     candidate = runtime_target_from_control(
                         control,
                         window_rect,
                         path=path,
                         depth=root_depth + relative_depth,
-                        section_path=infer_navigation_section_path(
-                            path,
-                            node_rects,
-                            window_rect,
-                        ),
+                        section_path=section_path,
+                        section_rect=node_rects.get(section_path),
                         precomputed_rect=control_rect,
                     )
                     if candidate is not None:

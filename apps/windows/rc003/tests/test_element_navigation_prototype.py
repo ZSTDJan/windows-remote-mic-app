@@ -72,6 +72,20 @@ class SpatialNavigationTests(unittest.TestCase):
             [2, 1],
         )
 
+    def test_overlapping_candidates_use_forward_center_distance(self):
+        targets = [
+            self.target(100, 100, 200, 140, "current"),
+            self.target(80, 100, 160, 140, "near overlapping left"),
+            self.target(0, 100, 180, 140, "far overlapping left"),
+        ]
+
+        self.assertEqual(
+            prototype.ranked_target_indices(
+                targets, 0, prototype.Direction.LEFT
+            )[:2],
+            [1, 2],
+        )
+
     def test_right_wraps_from_row_end_to_next_row_start(self):
         targets = [
             self.target(900, 100, 960, 140, "p1", path=(0, 2, 0)),
@@ -93,7 +107,7 @@ class SpatialNavigationTests(unittest.TestCase):
             0,
         )
 
-    def test_horizontal_wrap_beats_closer_diagonal_sidebar_target(self):
+    def test_true_direction_target_beats_reading_order_wrap(self):
         targets = [
             self.target(900, 100, 960, 140, "p1", path=(0, 2, 0)),
             self.target(500, 180, 560, 220, "p2", path=(0, 2, 1)),
@@ -103,7 +117,7 @@ class SpatialNavigationTests(unittest.TestCase):
             prototype.ranked_target_indices(
                 targets, 0, prototype.Direction.RIGHT
             )[:2],
-            [1, 2],
+            [2, 1],
         )
 
     def test_forward_same_branch_target_beats_wrap_to_sidebar(self):
@@ -241,24 +255,37 @@ class SpatialNavigationTests(unittest.TestCase):
         )
         self.assertEqual(left_candidates, (0, 2))
 
-    def test_repeated_right_does_not_loop_from_folder_back_to_header_actions(self):
+    def test_repeated_right_traversal_does_not_loop_back_to_header_actions(self):
         targets = [
             self.target(300, 100, 340, 140, "options", path=(0, 1, 0)),
             self.target(360, 100, 400, 140, "add", path=(0, 1, 1)),
             self.target(20, 150, 280, 195, "folder", path=(0, 1, 2)),
         ]
-        first = prototype.next_target_index(
-            targets, 0, prototype.Direction.RIGHT
+        graph = prototype.NavigationGraph(targets)
+        traversal = prototype.NavigationTraversal()
+        current = 0
+        moved = []
+        for _step in range(2):
+            candidates = traversal.available(
+                current,
+                prototype.Direction.RIGHT,
+                graph.candidates(current, prototype.Direction.RIGHT),
+            )
+            self.assertTrue(candidates)
+            current = candidates[0]
+            moved.append(current)
+            traversal.commit(current)
+        self.assertEqual(moved, [1, 2])
+        self.assertEqual(
+            traversal.available(
+                current,
+                prototype.Direction.RIGHT,
+                graph.candidates(current, prototype.Direction.RIGHT),
+            ),
+            (),
         )
-        second = prototype.next_target_index(
-            targets, first, prototype.Direction.RIGHT
-        )
-        third = prototype.next_target_index(
-            targets, second, prototype.Direction.RIGHT
-        )
-        self.assertEqual((first, second, third), (1, 2, 2))
 
-    def test_repeated_left_does_not_loop_from_header_back_to_lower_folder(self):
+    def test_left_can_reach_a_lower_target_in_the_left_half_plane(self):
         targets = [
             self.target(300, 100, 340, 140, "options", path=(0, 1, 0)),
             self.target(360, 100, 400, 140, "add", path=(0, 1, 1)),
@@ -266,7 +293,7 @@ class SpatialNavigationTests(unittest.TestCase):
         ]
         self.assertEqual(
             prototype.next_target_index(targets, 0, prototype.Direction.LEFT),
-            0,
+            2,
         )
 
     def test_right_does_not_treat_slightly_indented_sidebar_row_as_wrap(self):
@@ -319,8 +346,240 @@ class SpatialNavigationTests(unittest.TestCase):
             main,
         )
 
+    def test_distinguishes_main_header_from_scrollable_content_region(self):
+        window = prototype.Rect(216, 183, 2108, 1753)
+        main = (1, 4, 1)
+        header = main + (1,)
+        body = main + (2, 0, 0)
+        sidebar = (1, 4, 0)
+        project_list = sidebar + (3, 3)
+        rects = {
+            main: prototype.Rect(652, 237, 2109, 1754),
+            header: prototype.Rect(652, 237, 2109, 306),
+            body: prototype.Rect(653, 307, 2109, 1754),
+            sidebar: prototype.Rect(216, 237, 653, 1754),
+            project_list: prototype.Rect(228, 535, 618, 906),
+        }
+        types = {project_list: "ListControl"}
+
+        self.assertEqual(
+            prototype.infer_navigation_section_path(
+                header + (1, 0), rects, window
+            ),
+            header,
+        )
+        self.assertEqual(
+            prototype.infer_navigation_section_path(
+                body + (0, 0, 1), rects, window
+            ),
+            body,
+        )
+        self.assertEqual(
+            prototype.infer_navigation_section_path(
+                project_list + (0, 0), rects, window, types
+            ),
+            project_list,
+        )
+
+    def test_adjacent_section_exit_treats_above_and_below_equally(self):
+        body_section = (0, 2)
+        sidebar_section = (0, 1)
+        body_rect = prototype.Rect(300, 0, 1000, 800)
+        sidebar_rect = prototype.Rect(0, 0, 280, 800)
+        targets = [
+            self.target(
+                300,
+                200,
+                340,
+                240,
+                "current",
+                section_path=body_section,
+                section_rect=body_rect,
+            ),
+            self.target(
+                100,
+                100,
+                140,
+                140,
+                "upper left",
+                section_path=sidebar_section,
+                section_rect=sidebar_rect,
+            ),
+            self.target(
+                100,
+                250,
+                140,
+                290,
+                "lower left",
+                section_path=sidebar_section,
+                section_rect=sidebar_rect,
+            ),
+        ]
+
+        self.assertEqual(
+            prototype.next_target_index(
+                targets, 0, prototype.Direction.LEFT
+            ),
+            2,
+        )
+
+    def test_same_section_left_compares_upper_and_lower_targets_equally(self):
+        section = (0, 2)
+        section_rect = prototype.Rect(0, 0, 1000, 800)
+        targets = [
+            self.target(
+                300,
+                200,
+                340,
+                240,
+                "current",
+                section_path=section,
+                section_rect=section_rect,
+            ),
+            self.target(
+                100,
+                20,
+                140,
+                60,
+                "far upper left",
+                section_path=section,
+                section_rect=section_rect,
+            ),
+            self.target(
+                100,
+                250,
+                140,
+                290,
+                "near lower left",
+                section_path=section,
+                section_rect=section_rect,
+            ),
+        ]
+
+        self.assertEqual(
+            prototype.next_target_index(
+                targets, 0, prototype.Direction.LEFT
+            ),
+            2,
+        )
+
+    def test_right_prefers_axis_alignment_over_almost_vertical_target(self):
+        section = (0, 2)
+        section_rect = prototype.Rect(120, 200, 1260, 700)
+        targets = [
+            self.target(
+                155,
+                271,
+                197,
+                313,
+                "current",
+                section_path=section,
+                section_rect=section_rect,
+            ),
+            self.target(
+                170,
+                568,
+                220,
+                608,
+                "almost below",
+                section_path=section,
+                section_rect=section_rect,
+            ),
+            self.target(
+                1090,
+                325,
+                1225,
+                392,
+                "corresponding right",
+                section_path=section,
+                section_rect=section_rect,
+            ),
+        ]
+
+        self.assertEqual(
+            prototype.next_target_index(
+                targets, 0, prototype.Direction.RIGHT
+            ),
+            2,
+        )
+
+    def test_left_exits_content_to_aligned_sidebar_not_upper_header(self):
+        body_section = (0, 2, 1)
+        header_section = (0, 2, 0)
+        sidebar_section = (0, 1)
+        body_rect = prototype.Rect(653, 307, 2109, 1754)
+        header_rect = prototype.Rect(652, 237, 2109, 306)
+        sidebar_rect = prototype.Rect(216, 397, 653, 1722)
+        targets = [
+            self.target(
+                823,
+                295,
+                862,
+                334,
+                "复制",
+                path=body_section + (0, 39),
+                section_path=body_section,
+                section_rect=body_rect,
+            ),
+            self.target(
+                706,
+                253,
+                932,
+                290,
+                "窗口标题",
+                path=header_section + (1, 1),
+                section_path=header_section,
+                section_rect=header_rect,
+            ),
+            self.target(
+                228,
+                397,
+                618,
+                443,
+                "对应的左侧行",
+                path=sidebar_section + (3, 0),
+                section_path=sidebar_section,
+                section_rect=sidebar_rect,
+            ),
+            self.target(
+                228,
+                700,
+                618,
+                746,
+                "更远的左侧行",
+                path=sidebar_section + (8, 0),
+                section_path=sidebar_section,
+                section_rect=sidebar_rect,
+            ),
+        ]
+
+        ranked = prototype.ranked_target_indices(
+            targets, 0, prototype.Direction.LEFT
+        )
+        self.assertEqual(ranked[:3], [2, 3, 1])
+        graph = prototype.NavigationGraph(targets)
+        self.assertEqual(graph.candidates(0, prototype.Direction.LEFT)[0], 2)
+        self.assertEqual(graph.candidates(2, prototype.Direction.RIGHT)[0], 0)
+        diagnostic = prototype.build_navigation_diagnostic(
+            targets,
+            0,
+            prototype.Direction.LEFT,
+            ranked_indices=ranked,
+            available_indices=ranked,
+            selected_index=2,
+            outcome="selected",
+        )
+        self.assertIsNotNone(diagnostic)
+        assert diagnostic is not None
+        self.assertEqual(diagnostic.candidates[0].route, "section_exit")
+        self.assertIn(
+            "相邻区出口", prototype.format_navigation_diagnostic(diagnostic)
+        )
+
     def test_same_content_region_beats_distant_sidebar_lane(self):
         main_section = (0, 2)
+        main_rect = prototype.Rect(934, 242, 2390, 1759)
+        sidebar_rect = prototype.Rect(497, 242, 934, 1759)
         targets = [
             self.target(
                 1104,
@@ -330,6 +589,7 @@ class SpatialNavigationTests(unittest.TestCase):
                 "复制",
                 path=main_section + (0, 0, 52),
                 section_path=main_section,
+                section_rect=main_rect,
             ),
             self.target(
                 2170,
@@ -339,6 +599,7 @@ class SpatialNavigationTests(unittest.TestCase):
                 "复制消息",
                 path=main_section + (0, 0, 58),
                 section_path=main_section,
+                section_rect=main_rect,
             ),
             self.target(
                 509,
@@ -348,6 +609,7 @@ class SpatialNavigationTests(unittest.TestCase):
                 "窗口对话列表",
                 path=(0, 1, 3, 3, 1),
                 section_path=(0, 1),
+                section_rect=sidebar_rect,
             ),
         ]
 
@@ -373,10 +635,12 @@ class SpatialNavigationTests(unittest.TestCase):
         assert diagnostic is not None
         self.assertEqual(diagnostic.candidates[0].route, "section_bridge")
         self.assertIn(
-            "同区优先", prototype.format_navigation_diagnostic(diagnostic)
+            "同区网格", prototype.format_navigation_diagnostic(diagnostic)
         )
 
     def test_same_region_does_not_lock_out_a_much_nearer_other_pane(self):
+        main_rect = prototype.Rect(480, 0, 1000, 800)
+        adjacent_rect = prototype.Rect(0, 0, 480, 800)
         targets = [
             self.target(
                 500,
@@ -386,6 +650,7 @@ class SpatialNavigationTests(unittest.TestCase):
                 "current",
                 path=(0, 2, 0),
                 section_path=(0, 2),
+                section_rect=main_rect,
             ),
             self.target(
                 100,
@@ -395,6 +660,7 @@ class SpatialNavigationTests(unittest.TestCase):
                 "far same region",
                 path=(0, 2, 1),
                 section_path=(0, 2),
+                section_rect=main_rect,
             ),
             self.target(
                 420,
@@ -404,6 +670,7 @@ class SpatialNavigationTests(unittest.TestCase):
                 "near other pane",
                 path=(0, 1, 0),
                 section_path=(0, 1),
+                section_rect=adjacent_rect,
             ),
         ]
 
@@ -603,9 +870,13 @@ class SpatialNavigationTests(unittest.TestCase):
             "button",
             runtime_id=(7, 8, 9),
             source="uia-point",
+            section_rect=prototype.Rect(80, 60, 240, 300),
         )
         shifted = prototype.shifted_snapshot(target, 30, -20)
         self.assertEqual(shifted.rect, prototype.Rect(130, 80, 190, 120))
+        self.assertEqual(
+            shifted.section_rect, prototype.Rect(110, 40, 270, 280)
+        )
         self.assertEqual(shifted.runtime_id, (7, 8, 9))
         self.assertEqual(shifted.source, "uia-point")
 
