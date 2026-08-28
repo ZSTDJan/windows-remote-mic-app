@@ -27,6 +27,35 @@ class SpatialNavigationTests(unittest.TestCase):
             **kwargs,
         )
 
+    def element(
+        self,
+        left,
+        top,
+        right,
+        bottom,
+        name="",
+        control_type="TextControl",
+        path=(),
+        **kwargs,
+    ):
+        return prototype.ElementSnapshot(
+            prototype.Rect(left, top, right, bottom),
+            name,
+            control_type,
+            "",
+            path,
+            **kwargs,
+        )
+
+    def rgb_image(self, width, height, ink_rects):
+        pixels = bytearray([255] * (width * height * 3))
+        for left, top, right, bottom in ink_rects:
+            for y in range(top, bottom):
+                for x in range(left, right):
+                    offset = (y * width + x) * 3
+                    pixels[offset : offset + 3] = b"\x00\x00\x00"
+        return bytes(pixels)
+
     def test_ignores_elements_in_the_opposite_direction(self):
         current = prototype.Rect(100, 100, 160, 140)
         left = prototype.Rect(20, 100, 80, 140)
@@ -1241,6 +1270,13 @@ class SpatialNavigationTests(unittest.TestCase):
         self.assertFalse(prototype._parse_args([]).diagnostics)
         self.assertTrue(prototype._parse_args(["--diagnostics"]).diagnostics)
 
+    def test_scan_can_target_a_specific_native_window(self):
+        self.assertEqual(prototype._parse_args([]).window_handle, 0)
+        self.assertEqual(
+            prototype._parse_args(["--window-handle", "0x1234"]).window_handle,
+            0x1234,
+        )
+
     def test_navigation_graph_caches_natural_reverse_edge(self):
         targets = [
             self.target(20, 20, 80, 60, "left"),
@@ -1441,6 +1477,7 @@ class SpatialNavigationTests(unittest.TestCase):
         )
         self.assertEqual(shifted.runtime_id, (7, 8, 9))
         self.assertEqual(shifted.source, "uia-point")
+        self.assertEqual(prototype.shifted_point((112, 220), 30, -20), (142, 200))
 
     def test_repeated_names_at_different_positions_are_not_the_same_target(self):
         first = self.target(100, 100, 180, 140, "复制")
@@ -1844,6 +1881,278 @@ class SpatialNavigationTests(unittest.TestCase):
         self.assertFalse(prototype.owner_chain_contains(10, 30, owner_of))
         self.assertFalse(prototype.owner_chain_contains(40, 10, owner_of))
 
+    def test_promotes_repeated_named_content_rows_without_promoting_layout_groups(self):
+        window = prototype.Rect(0, 0, 1000, 800)
+        parent = self.element(
+            20,
+            20,
+            360,
+            500,
+            "会话列表",
+            "PaneControl",
+            (0,),
+        )
+        rows = []
+        for index, name in enumerate(("张三", "李四", "项目群")):
+            top = 40 + index * 72
+            rows.extend(
+                [
+                    self.element(
+                        30,
+                        top,
+                        350,
+                        top + 64,
+                        "",
+                        "GroupControl",
+                        (0, index),
+                    ),
+                    self.element(
+                        92,
+                        top + 12,
+                        210,
+                        top + 36,
+                        name,
+                        "TextControl",
+                        (0, index, 0),
+                    ),
+                ]
+            )
+
+        specs = prototype.repeated_content_target_specs(
+            [parent, *rows], window
+        )
+        self.assertEqual(len(specs), 3)
+        self.assertEqual(
+            [spec.snapshot.control_type for spec in specs],
+            ["ContentItemControl"] * 3,
+        )
+        self.assertEqual(
+            [spec.snapshot.name for spec in specs],
+            ["张三", "李四", "项目群"],
+        )
+        self.assertEqual(specs[0].click_point, (151, 64))
+
+        layout = self.element(
+            400,
+            20,
+            900,
+            500,
+            "普通布局",
+            "GroupControl",
+            (1,),
+        )
+        two_cards = [
+            self.element(420, 50, 640, 180, "", "GroupControl", (1, 0)),
+            self.element(660, 50, 880, 180, "", "GroupControl", (1, 1)),
+            self.element(440, 80, 560, 110, "卡片一", path=(1, 0, 0)),
+            self.element(680, 80, 800, 110, "卡片二", path=(1, 1, 0)),
+        ]
+        self.assertEqual(
+            prototype.repeated_content_target_specs(
+                [layout, *two_cards], window
+            ),
+            [],
+        )
+
+    def test_opaque_visual_surface_requires_a_legacy_list_like_pane(self):
+        window = prototype.Rect(0, 0, 1200, 800)
+        pane = self.element(
+            100,
+            80,
+            600,
+            700,
+            "文件列表",
+            "PaneControl",
+            (0,),
+            keyboard_focusable=True,
+            has_legacy_pattern=True,
+        )
+        header = self.element(
+            100,
+            80,
+            600,
+            116,
+            "名称",
+            "HeaderControl",
+            (0, 0),
+        )
+        surfaces = prototype.opaque_visual_surfaces(
+            [pane, header], [], window
+        )
+        self.assertEqual(
+            surfaces,
+            [
+                prototype.OpaqueVisualSurface(
+                    prototype.Rect(100, 116, 600, 700), (0,), "文件列表"
+                )
+            ],
+        )
+
+        ordinary_pane = self.element(
+            650,
+            80,
+            1150,
+            700,
+            "普通内容",
+            "PaneControl",
+            (1,),
+            keyboard_focusable=True,
+            has_legacy_pattern=True,
+        )
+        self.assertEqual(
+            prototype.opaque_visual_surfaces([ordinary_pane], [], window),
+            [],
+        )
+
+        covered_target = prototype.TargetSnapshot(
+            prototype.Rect(100, 116, 600, 500),
+            "真实文件列表",
+            "ListControl",
+            path=(0, 1),
+            has_action_pattern=True,
+        )
+        self.assertEqual(
+            prototype.opaque_visual_surfaces(
+                [pane, header], [covered_target], window
+            ),
+            [],
+        )
+
+    def test_visual_fallback_detects_regular_detail_rows(self):
+        width, height = 200, 220
+        rgb = self.rgb_image(
+            width,
+            height,
+            [
+                (20, 10, 100, 14),
+                (20, 26, 100, 30),
+                (20, 42, 100, 46),
+                (20, 86, 100, 90),
+                (20, 102, 100, 106),
+                (20, 118, 100, 122),
+                (20, 134, 100, 138),
+                (20, 182, 60, 186),
+                (20, 192, 60, 196),
+            ],
+        )
+        specs = prototype.visual_grid_target_specs(
+            rgb,
+            width,
+            height,
+            width * 3,
+            prototype.Rect(0, 0, width, height),
+            [prototype.OpaqueVisualSurface(prototype.Rect(0, 0, width, height), (0,))],
+        )
+        self.assertEqual(len(specs), 7)
+        self.assertEqual(
+            [spec.snapshot.control_type for spec in specs],
+            ["VisualItemControl"] * 7,
+        )
+        self.assertEqual(
+            [point.click_point[1] for point in specs],
+            [12, 28, 44, 88, 104, 120, 136],
+        )
+
+    def test_visual_fallback_detects_a_thumbnail_grid_by_cells(self):
+        width, height = 200, 100
+        rgb = self.rgb_image(
+            width,
+            height,
+            [
+                (10, 10, 30, 20),
+                (80, 10, 100, 20),
+                (10, 60, 30, 70),
+                (80, 60, 100, 70),
+            ],
+        )
+        specs = prototype.visual_grid_target_specs(
+            rgb,
+            width,
+            height,
+            width * 3,
+            prototype.Rect(0, 0, width, height),
+            [prototype.OpaqueVisualSurface(prototype.Rect(0, 0, width, height), (0,))],
+        )
+        self.assertEqual(len(specs), 4)
+        self.assertEqual(len({spec.click_point for spec in specs}), 4)
+        self.assertTrue(
+            all(spec.snapshot.source == "visual-grid" for spec in specs)
+        )
+
+    def test_overlay_requires_a_real_window_relationship(self):
+        self.assertTrue(
+            prototype.overlay_window_is_related(
+                100,
+                100,
+                candidate_owned_by_root=False,
+                root_owned_by_candidate=False,
+                extended_style=0,
+            )
+        )
+        self.assertTrue(
+            prototype.overlay_window_is_related(
+                200,
+                100,
+                candidate_owned_by_root=True,
+                root_owned_by_candidate=False,
+                extended_style=0,
+            )
+        )
+        for style in (
+            prototype.WS_EX_TOPMOST,
+            prototype.WS_EX_TOOLWINDOW,
+            prototype.WS_EX_NOACTIVATE,
+        ):
+            self.assertTrue(
+                prototype.overlay_window_is_related(
+                    200,
+                    100,
+                    candidate_owned_by_root=False,
+                    root_owned_by_candidate=False,
+                    extended_style=style,
+                )
+            )
+        self.assertFalse(
+            prototype.overlay_window_is_related(
+                200,
+                100,
+                candidate_owned_by_root=False,
+                root_owned_by_candidate=False,
+                extended_style=0,
+            )
+        )
+
+    def test_overlay_must_be_small_visible_and_mostly_over_the_root(self):
+        root = prototype.Rect(100, 100, 1100, 900)
+        accepted = dict(
+            visible=True,
+            minimized=False,
+            cloaked=False,
+            related=True,
+        )
+        self.assertTrue(
+            prototype.overlay_window_is_candidate(
+                root, prototype.Rect(700, 180, 1000, 380), **accepted
+            )
+        )
+        self.assertFalse(
+            prototype.overlay_window_is_candidate(
+                root, prototype.Rect(850, 180, 1250, 380), **accepted
+            )
+        )
+        self.assertFalse(
+            prototype.overlay_window_is_candidate(
+                root, prototype.Rect(150, 150, 1000, 700), **accepted
+            )
+        )
+        self.assertFalse(
+            prototype.overlay_window_is_candidate(
+                root,
+                prototype.Rect(700, 180, 1000, 380),
+                **{**accepted, "related": False},
+            )
+        )
+
     def test_foreground_context_follows_same_process_popup(self):
         process_ids = {10: 100, 20: 100, 90: 900}
         action = prototype.navigation_foreground_action(
@@ -1896,6 +2205,20 @@ class SpatialNavigationTests(unittest.TestCase):
             prototype.navigation_foreground_action(30, *common),
             "leave",
         )
+
+    def test_foreground_context_keeps_an_associated_cross_process_overlay(self):
+        process_ids = {10: 100, 20: 200, 90: 900}
+        action = prototype.navigation_foreground_action(
+            20,
+            10,
+            10,
+            100,
+            900,
+            process_ids.get,
+            lambda _hwnd: 0,
+            associated_hwnds=(20,),
+        )
+        self.assertEqual(action, "sync")
 
     def test_prewarm_runs_once_after_the_foreground_is_stable(self):
         self.assertFalse(

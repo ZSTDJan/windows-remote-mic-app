@@ -25,7 +25,7 @@ import queue
 import sys
 import threading
 import time
-from collections import deque
+from collections import defaultdict, deque
 from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import Any, Callable, Optional, Sequence
@@ -154,6 +154,37 @@ NAVIGATION_SECTION_CONTROL_TYPES = frozenset(
         "TreeControl",
     }
 )
+REPEATED_CONTENT_PARENT_TYPES = frozenset(
+    {
+        "ApplicationControl",
+        "CustomControl",
+        "DataGridControl",
+        "GroupControl",
+        "ListControl",
+        "PaneControl",
+        "TableControl",
+    }
+)
+REPEATED_CONTENT_ITEM_TYPES = frozenset(
+    {"DataItemControl", "GroupControl", "ListItemControl"}
+)
+VISUAL_SURFACE_CONTROL_TYPES = frozenset({"CustomControl", "PaneControl"})
+VISUAL_SURFACE_MIN_WIDTH = 220
+VISUAL_SURFACE_MIN_HEIGHT = 120
+VISUAL_SURFACE_MIN_WINDOW_AREA_RATIO = 0.06
+OVERLAY_MAX_ROOT_AREA_RATIO = 0.35
+OVERLAY_MIN_INTERSECTION_RATIO = 0.65
+WS_EX_TOPMOST = 0x00000008
+WS_EX_TOOLWINDOW = 0x00000080
+WS_EX_NOACTIVATE = 0x08000000
+NON_NAVIGATION_OVERLAY_CLASSES = frozenset(
+    {
+        "Progman",
+        "Shell_SecondaryTrayWnd",
+        "Shell_TrayWnd",
+        "WorkerW",
+    }
+)
 
 
 class Direction(str, Enum):
@@ -222,6 +253,33 @@ class TargetSnapshot:
     source: str = "uia"
     section_path: tuple[int, ...] = ()
     section_rect: Optional[Rect] = None
+
+
+@dataclass(frozen=True)
+class ElementSnapshot:
+    rect: Rect
+    name: str
+    control_type: str
+    automation_id: str
+    path: tuple[int, ...]
+    enabled: bool = True
+    offscreen: bool = False
+    keyboard_focusable: bool = False
+    has_legacy_pattern: bool = False
+    has_scroll_pattern: bool = False
+
+
+@dataclass(frozen=True)
+class SyntheticTargetSpec:
+    snapshot: TargetSnapshot
+    click_point: tuple[int, int]
+
+
+@dataclass(frozen=True)
+class OpaqueVisualSurface:
+    rect: Rect
+    path: tuple[int, ...]
+    name: str = ""
 
 
 @dataclass(frozen=True)
@@ -412,6 +470,539 @@ def target_is_action_descendant(
             and candidate.path[: len(target.path)] == target.path
         )
     return target_is_finer_descendant(target, candidate)
+
+
+def _path_is_descendant(path: tuple[int, ...], parent: tuple[int, ...]) -> bool:
+    return bool(
+        len(path) > len(parent)
+        and path[: len(parent)] == parent
+    )
+
+
+def _median_number(values: Sequence[float]) -> float:
+    ordered = sorted(values)
+    if not ordered:
+        return 0.0
+    middle = len(ordered) // 2
+    if len(ordered) % 2:
+        return float(ordered[middle])
+    return (float(ordered[middle - 1]) + float(ordered[middle])) / 2
+
+
+def _rect_intersection_area(first: Rect, second: Rect) -> int:
+    width = max(0, min(first.right, second.right) - max(first.left, second.left))
+    height = max(0, min(first.bottom, second.bottom) - max(first.top, second.top))
+    return width * height
+
+
+def repeated_content_target_specs(
+    elements: Sequence[ElementSnapshot],
+    window_rect: Rect,
+) -> list[SyntheticTargetSpec]:
+    """Promote repeated Chromium/Electron content rows to coordinate targets."""
+
+    by_path = {element.path: element for element in elements}
+    children: dict[tuple[int, ...], list[tuple[int, ...]]] = defaultdict(list)
+    for element in elements:
+        if element.path:
+            children[element.path[:-1]].append(element.path)
+
+    content_by_path: dict[tuple[int, ...], list[ElementSnapshot]] = {}
+    for path in sorted(by_path, key=len, reverse=True):
+        element = by_path[path]
+        content: list[ElementSnapshot] = []
+        if (
+            element.name
+            and element.control_type in {"ImageControl", "TextControl"}
+            and element.rect.width >= 4
+            and element.rect.height >= 4
+        ):
+            content.append(element)
+        for child_path in children.get(path, ()):
+            content.extend(content_by_path.get(child_path, ()))
+            if len(content) >= 16:
+                break
+        content_by_path[path] = content[:16]
+
+    specs: list[SyntheticTargetSpec] = []
+    for parent_path, child_paths in children.items():
+        parent = by_path.get(parent_path)
+        if (
+            parent is None
+            or parent.control_type not in REPEATED_CONTENT_PARENT_TYPES
+            or parent.rect.width < 80
+            or parent.rect.height < 80
+        ):
+            continue
+
+        repeated: list[tuple[ElementSnapshot, list[ElementSnapshot]]] = []
+        for child_path in child_paths:
+            child = by_path.get(child_path)
+            if (
+                child is None
+                or child.control_type not in REPEATED_CONTENT_ITEM_TYPES
+                or not child.enabled
+                or child.rect.width < 24
+                or child.rect.height < 24
+            ):
+                continue
+            content = content_by_path.get(child_path, [])
+            if not content:
+                continue
+            child_area = max(1, child.rect.width * child.rect.height)
+            parent_area = max(1, parent.rect.width * parent.rect.height)
+            if child_area > parent_area * 0.72:
+                continue
+            repeated.append((child, content))
+
+        if len(repeated) < 3:
+            continue
+        median_width = _median_number([item.rect.width for item, _content in repeated])
+        if median_width <= 0:
+            continue
+
+        for item, content in repeated:
+            if (
+                item.offscreen
+                or not item.rect.intersects(window_rect)
+                or item.rect.width < median_width * 0.55
+                or item.rect.width > median_width * 1.8
+                or item.rect.height > max(480, parent.rect.height * 0.55)
+            ):
+                continue
+            visible_content = [
+                leaf
+                for leaf in content
+                if not leaf.offscreen
+                and leaf.rect.intersects(window_rect)
+                and item.rect.intersects(leaf.rect)
+            ]
+            if not visible_content:
+                continue
+            ordered_content = sorted(
+                visible_content,
+                key=lambda leaf: (leaf.rect.top, leaf.rect.left, leaf.name),
+            )
+            names = list(dict.fromkeys(leaf.name for leaf in ordered_content if leaf.name))
+            label = " / ".join(names[:3])[:120]
+            click_leaf = max(
+                ordered_content,
+                key=lambda leaf: (
+                    int(leaf.control_type == "TextControl"),
+                    leaf.rect.width * leaf.rect.height,
+                ),
+            )
+            click_point = (
+                round(click_leaf.rect.center_x),
+                round(click_leaf.rect.center_y),
+            )
+            specs.append(
+                SyntheticTargetSpec(
+                    TargetSnapshot(
+                        rect=item.rect,
+                        name=label or item.name or "内容项",
+                        control_type="ContentItemControl",
+                        automation_id=item.automation_id,
+                        path=item.path,
+                        depth=len(item.path),
+                        has_action_pattern=True,
+                        source="uia-content",
+                        section_path=parent.path,
+                        section_rect=parent.rect,
+                    ),
+                    click_point,
+                )
+            )
+    return specs
+
+
+def opaque_visual_surfaces(
+    elements: Sequence[ElementSnapshot],
+    targets: Sequence[TargetSnapshot],
+    window_rect: Rect,
+) -> list[OpaqueVisualSurface]:
+    """Find legacy focusable panes whose repeated items are not exposed by UIA."""
+
+    window_area = max(1, window_rect.width * window_rect.height)
+    candidates: list[OpaqueVisualSurface] = []
+    for element in elements:
+        rect = element.rect
+        if (
+            element.control_type not in VISUAL_SURFACE_CONTROL_TYPES
+            or not element.enabled
+            or element.offscreen
+            or not element.keyboard_focusable
+            or not element.has_legacy_pattern
+            or rect.width < VISUAL_SURFACE_MIN_WIDTH
+            or rect.height < VISUAL_SURFACE_MIN_HEIGHT
+            or rect.width * rect.height
+            < window_area * VISUAL_SURFACE_MIN_WINDOW_AREA_RATIO
+            or not rect.intersects(window_rect)
+        ):
+            continue
+
+        descendants = [
+            candidate
+            for candidate in elements
+            if _path_is_descendant(candidate.path, element.path)
+            and candidate.rect.intersects(rect)
+        ]
+        header_bottoms = [
+            candidate.rect.bottom
+            for candidate in descendants
+            if candidate.control_type == "HeaderControl"
+            and candidate.rect.width >= rect.width * 0.5
+        ]
+        if not element.has_scroll_pattern and not header_bottoms:
+            continue
+        scrollbar_tops = [
+            candidate.rect.top
+            for candidate in descendants
+            if candidate.control_type == "ScrollBarControl"
+            and candidate.rect.width >= rect.width * 0.5
+            and candidate.rect.top > rect.top + rect.height * 0.5
+        ]
+        content_rect = Rect(
+            rect.left,
+            max([rect.top, *header_bottoms]),
+            rect.right,
+            min([rect.bottom, *scrollbar_tops]),
+        )
+        if content_rect.width < VISUAL_SURFACE_MIN_WIDTH or content_rect.height < 80:
+            continue
+
+        target_descendants = [
+            target
+            for target in targets
+            if _path_is_descendant(target.path, element.path)
+            and target.rect.intersects(content_rect)
+        ]
+        if len(target_descendants) > 24:
+            continue
+        covered_area = sum(
+            _rect_intersection_area(target.rect, content_rect)
+            for target in target_descendants
+        )
+        if covered_area > content_rect.width * content_rect.height * 0.35:
+            continue
+        candidates.append(
+            OpaqueVisualSurface(content_rect, element.path, element.name)
+        )
+
+    selected: list[OpaqueVisualSurface] = []
+    for candidate in sorted(
+        candidates, key=lambda item: item.rect.width * item.rect.height
+    ):
+        if any(candidate.rect.contains(existing.rect) for existing in selected):
+            continue
+        selected.append(candidate)
+    return selected
+
+
+def _filled_activity_runs(
+    activity: Sequence[bool],
+    max_gap: int = 1,
+    min_length: int = 2,
+) -> list[tuple[int, int]]:
+    filled = list(activity)
+    index = 0
+    while index < len(filled):
+        if filled[index]:
+            index += 1
+            continue
+        gap_end = index
+        while gap_end < len(filled) and not filled[gap_end]:
+            gap_end += 1
+        if index > 0 and gap_end < len(filled) and gap_end - index <= max_gap:
+            filled[index:gap_end] = [True] * (gap_end - index)
+        index = gap_end
+
+    runs: list[tuple[int, int]] = []
+    index = 0
+    while index < len(filled):
+        if not filled[index]:
+            index += 1
+            continue
+        run_end = index + 1
+        while run_end < len(filled) and filled[run_end]:
+            run_end += 1
+        if run_end - index >= min_length:
+            runs.append((index, run_end))
+        index = run_end
+    return runs
+
+
+def _substantial_regular_run_clusters(
+    runs: Sequence[tuple[int, int]],
+    median_gap: float,
+) -> list[list[tuple[int, int]]]:
+    if len(runs) < 3 or median_gap <= 0:
+        return [list(runs)]
+    maximum_gap = max(18.0, median_gap * 1.9)
+    clusters: list[list[tuple[int, int]]] = [[runs[0]]]
+    previous_center = (runs[0][0] + runs[0][1]) / 2
+    for run in runs[1:]:
+        center = (run[0] + run[1]) / 2
+        if center - previous_center > maximum_gap:
+            clusters.append([])
+        clusters[-1].append(run)
+        previous_center = center
+    largest_length = max(len(cluster) for cluster in clusters)
+    minimum_length = min(
+        largest_length,
+        max(3, (largest_length + 2) // 3),
+    )
+    return [cluster for cluster in clusters if len(cluster) >= minimum_length]
+
+
+def _screen_to_image_rect(
+    rect: Rect,
+    window_rect: Rect,
+    image_width: int,
+    image_height: int,
+) -> Rect:
+    if window_rect.width <= 0 or window_rect.height <= 0:
+        return Rect(0, 0, 0, 0)
+    return Rect(
+        max(
+            0,
+            min(
+                image_width,
+                round((rect.left - window_rect.left) * image_width / window_rect.width),
+            ),
+        ),
+        max(
+            0,
+            min(
+                image_height,
+                round((rect.top - window_rect.top) * image_height / window_rect.height),
+            ),
+        ),
+        max(
+            0,
+            min(
+                image_width,
+                round((rect.right - window_rect.left) * image_width / window_rect.width),
+            ),
+        ),
+        max(
+            0,
+            min(
+                image_height,
+                round((rect.bottom - window_rect.top) * image_height / window_rect.height),
+            ),
+        ),
+    )
+
+
+def _image_to_screen_rect(
+    rect: Rect,
+    window_rect: Rect,
+    image_width: int,
+    image_height: int,
+) -> Rect:
+    return Rect(
+        window_rect.left + round(rect.left * window_rect.width / image_width),
+        window_rect.top + round(rect.top * window_rect.height / image_height),
+        window_rect.left + round(rect.right * window_rect.width / image_width),
+        window_rect.top + round(rect.bottom * window_rect.height / image_height),
+    )
+
+
+def visual_grid_target_specs(
+    rgb: bytes,
+    image_width: int,
+    image_height: int,
+    bytes_per_line: int,
+    window_rect: Rect,
+    surfaces: Sequence[OpaqueVisualSurface],
+) -> list[SyntheticTargetSpec]:
+    """Detect regular text rows or thumbnail cells inside opaque legacy panes."""
+
+    if image_width <= 0 or image_height <= 0 or bytes_per_line < image_width * 3:
+        return []
+
+    def is_ink(x: int, y: int) -> bool:
+        offset = y * bytes_per_line + x * 3
+        red, green, blue = rgb[offset : offset + 3]
+        high = max(red, green, blue)
+        low = min(red, green, blue)
+        return bool(high < 178 or (high - low > 72 and low < 92))
+
+    specs: list[SyntheticTargetSpec] = []
+    for surface_index, surface in enumerate(surfaces):
+        pixel_rect = _screen_to_image_rect(
+            surface.rect, window_rect, image_width, image_height
+        )
+        if pixel_rect.width < 48 or pixel_rect.height < 32:
+            continue
+        x_start = min(pixel_rect.right - 1, pixel_rect.left + 2)
+        x_end = max(x_start + 1, pixel_rect.right - 2)
+        row_counts: list[int] = []
+        for y in range(pixel_rect.top, pixel_rect.bottom):
+            row_counts.append(
+                sum(1 for x in range(x_start, x_end) if is_ink(x, y))
+            )
+        row_threshold = max(3, pixel_rect.width // 110)
+        raw_runs = _filled_activity_runs(
+            [count >= row_threshold for count in row_counts],
+            max_gap=1,
+            min_length=2,
+        )
+        if len(raw_runs) < 2:
+            continue
+        runs = [
+            (pixel_rect.top + start, pixel_rect.top + end)
+            for start, end in raw_runs
+        ]
+        merged_runs: list[tuple[int, int]] = []
+        for run in runs:
+            if (
+                merged_runs
+                and run[0] - merged_runs[-1][1] <= 8
+                and (
+                    merged_runs[-1][1] - merged_runs[-1][0] >= 14
+                    or run[1] - run[0] >= 14
+                )
+            ):
+                merged_runs[-1] = (merged_runs[-1][0], run[1])
+            else:
+                merged_runs.append(run)
+        runs = merged_runs
+        centers = [(top + bottom) / 2 for top, bottom in runs]
+        gaps = [centers[index + 1] - centers[index] for index in range(len(centers) - 1)]
+        median_gap = _median_number(gaps)
+        detail_mode = bool(
+            len(runs) >= 3
+            and median_gap <= max(18.0, pixel_rect.height * 0.08)
+            and sum(
+                median_gap * 0.45 <= gap <= median_gap * 1.9 for gap in gaps
+            )
+            >= max(1, round(len(gaps) * 0.6))
+        )
+
+        surface_specs: list[SyntheticTargetSpec] = []
+        if detail_mode:
+            row_index = 0
+            for cluster in _substantial_regular_run_clusters(runs, median_gap):
+                cluster_centers = [
+                    (top + bottom) / 2 for top, bottom in cluster
+                ]
+                cluster_gaps = [
+                    cluster_centers[index + 1] - cluster_centers[index]
+                    for index in range(len(cluster_centers) - 1)
+                ]
+                cluster_gap = _median_number(cluster_gaps) or median_gap
+                for cluster_index, center in enumerate(cluster_centers):
+                    previous_center = (
+                        cluster_centers[cluster_index - 1]
+                        if cluster_index
+                        else center - cluster_gap
+                    )
+                    next_center = (
+                        cluster_centers[cluster_index + 1]
+                        if cluster_index + 1 < len(cluster_centers)
+                        else center + cluster_gap
+                    )
+                    top = max(
+                        pixel_rect.top,
+                        round((previous_center + center) / 2),
+                    )
+                    bottom = min(
+                        pixel_rect.bottom,
+                        round((center + next_center) / 2),
+                    )
+                    if bottom - top < 3:
+                        continue
+                    image_cell = Rect(
+                        pixel_rect.left, top, pixel_rect.right, bottom
+                    )
+                    screen_cell = _image_to_screen_rect(
+                        image_cell, window_rect, image_width, image_height
+                    )
+                    click_x = pixel_rect.left + max(
+                        8, min(pixel_rect.width // 7, 48)
+                    )
+                    click_point_rect = _image_to_screen_rect(
+                        Rect(
+                            click_x,
+                            round(center),
+                            click_x + 1,
+                            round(center) + 1,
+                        ),
+                        window_rect,
+                        image_width,
+                        image_height,
+                    )
+                    surface_specs.append(
+                        SyntheticTargetSpec(
+                            TargetSnapshot(
+                                rect=screen_cell,
+                                name=f"视觉行 {row_index + 1}",
+                                control_type="VisualItemControl",
+                                path=surface.path + (1_000_000 + row_index,),
+                                depth=len(surface.path) + 1,
+                                has_action_pattern=True,
+                                source="visual-grid",
+                                section_path=surface.path,
+                                section_rect=surface.rect,
+                            ),
+                            (click_point_rect.left, click_point_rect.top),
+                        )
+                    )
+                    row_index += 1
+        else:
+            cell_index = 0
+            for run_top, run_bottom in runs:
+                run_height = run_bottom - run_top
+                column_counts = [
+                    sum(1 for y in range(run_top, run_bottom) if is_ink(x, y))
+                    for x in range(pixel_rect.left, pixel_rect.right)
+                ]
+                column_threshold = max(2, run_height // 10)
+                column_runs = _filled_activity_runs(
+                    [count >= column_threshold for count in column_counts],
+                    max_gap=3,
+                    min_length=max(5, pixel_rect.width // 70),
+                )
+                cells = [
+                    (
+                        pixel_rect.left + left,
+                        pixel_rect.left + right,
+                    )
+                    for left, right in column_runs
+                    if right - left >= max(6, pixel_rect.width // 50)
+                ]
+                if len(cells) < 2:
+                    cells = [(pixel_rect.left, pixel_rect.right)]
+                for left, right in cells:
+                    image_cell = Rect(left, run_top, right, run_bottom)
+                    screen_cell = _image_to_screen_rect(
+                        image_cell, window_rect, image_width, image_height
+                    )
+                    surface_specs.append(
+                        SyntheticTargetSpec(
+                            TargetSnapshot(
+                                rect=screen_cell,
+                                name=f"视觉项 {cell_index + 1}",
+                                control_type="VisualItemControl",
+                                path=surface.path + (1_000_000 + cell_index,),
+                                depth=len(surface.path) + 1,
+                                has_action_pattern=True,
+                                source="visual-grid",
+                                section_path=surface.path,
+                                section_rect=surface.rect,
+                            ),
+                            (
+                                round(screen_cell.center_x),
+                                round(screen_cell.center_y),
+                            ),
+                        )
+                    )
+                    cell_index += 1
+        if len(surface_specs) >= 2:
+            specs.extend(surface_specs)
+    return specs
 
 
 def finer_descendant_index_map(
@@ -1894,6 +2485,12 @@ def shifted_snapshot(target: TargetSnapshot, delta_x: int, delta_y: int) -> Targ
     )
 
 
+def shifted_point(
+    point: tuple[int, int], delta_x: int, delta_y: int
+) -> tuple[int, int]:
+    return point[0] + delta_x, point[1] + delta_y
+
+
 def same_target_identity(first: TargetSnapshot, second: TargetSnapshot) -> bool:
     if first.runtime_id and second.runtime_id:
         return first.runtime_id == second.runtime_id
@@ -1951,6 +2548,48 @@ def owner_chain_contains(
     return False
 
 
+def overlay_window_is_related(
+    candidate_process_id: int,
+    root_process_id: int,
+    *,
+    candidate_owned_by_root: bool,
+    root_owned_by_candidate: bool,
+    extended_style: int,
+) -> bool:
+    return bool(
+        candidate_process_id == root_process_id
+        or candidate_owned_by_root
+        or root_owned_by_candidate
+        or extended_style & (WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE)
+    )
+
+
+def overlay_window_is_candidate(
+    root_rect: Rect,
+    candidate_rect: Rect,
+    *,
+    visible: bool,
+    minimized: bool,
+    cloaked: bool,
+    related: bool,
+) -> bool:
+    if (
+        not visible
+        or minimized
+        or cloaked
+        or not related
+        or candidate_rect.width < 16
+        or candidate_rect.height < 16
+    ):
+        return False
+    candidate_area = candidate_rect.width * candidate_rect.height
+    root_area = max(1, root_rect.width * root_rect.height)
+    if candidate_area > root_area * OVERLAY_MAX_ROOT_AREA_RATIO:
+        return False
+    intersection = _rect_intersection_area(root_rect, candidate_rect)
+    return intersection >= candidate_area * OVERLAY_MIN_INTERSECTION_RATIO
+
+
 def navigation_foreground_action(
     foreground_hwnd: int,
     current_hwnd: int,
@@ -1959,10 +2598,13 @@ def navigation_foreground_action(
     prototype_process_id: int,
     process_id_of: Callable[[int], int],
     owner_of: Callable[[int], int],
+    associated_hwnds: Sequence[int] = (),
 ) -> str:
     """Choose whether to keep, follow, ignore, or leave the active context."""
 
     if foreground_hwnd <= 0 or foreground_hwnd == current_hwnd:
+        return "sync"
+    if foreground_hwnd in associated_hwnds:
         return "sync"
     try:
         foreground_process_id = int(process_id_of(foreground_hwnd))
@@ -2385,6 +3027,12 @@ def _parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         help="scan the current foreground window once and print the targets",
     )
     parser.add_argument(
+        "--window-handle",
+        type=lambda value: int(value, 0),
+        default=0,
+        help="scan this native window handle instead of the foreground window",
+    )
+    parser.add_argument(
         "--diagnostics",
         action="store_true",
         help="start with navigation candidate diagnostics enabled",
@@ -2408,9 +3056,11 @@ def _run_windows(args: argparse.Namespace) -> int:
 
     user32 = ctypes.windll.user32
     kernel32 = ctypes.windll.kernel32
+    gdi32 = ctypes.windll.gdi32
     oleacc = ctypes.WinDLL("oleacc")
     oleaut32 = ctypes.WinDLL("oleaut32")
     ole32 = ctypes.WinDLL("ole32")
+    dwmapi = ctypes.WinDLL("dwmapi")
     lresult = ctypes.c_ssize_t
 
     class VariantValue(ctypes.Union):
@@ -2444,6 +3094,27 @@ def _run_windows(args: argparse.Namespace) -> int:
             ("rcCaret", wintypes.RECT),
         ]
 
+    class BitmapInfoHeader(ctypes.Structure):
+        _fields_ = [
+            ("size", wintypes.DWORD),
+            ("width", ctypes.c_long),
+            ("height", ctypes.c_long),
+            ("planes", wintypes.WORD),
+            ("bit_count", wintypes.WORD),
+            ("compression", wintypes.DWORD),
+            ("image_size", wintypes.DWORD),
+            ("x_pixels_per_meter", ctypes.c_long),
+            ("y_pixels_per_meter", ctypes.c_long),
+            ("colors_used", wintypes.DWORD),
+            ("colors_important", wintypes.DWORD),
+        ]
+
+    class BitmapInfo(ctypes.Structure):
+        _fields_ = [
+            ("header", BitmapInfoHeader),
+            ("colors", wintypes.DWORD * 3),
+        ]
+
     kernel32.GetCurrentThreadId.restype = wintypes.DWORD
     kernel32.GetModuleHandleW.argtypes = [wintypes.LPCWSTR]
     kernel32.GetModuleHandleW.restype = wintypes.HMODULE
@@ -2452,6 +3123,50 @@ def _run_windows(args: argparse.Namespace) -> int:
     user32.GetAncestor.restype = wintypes.HWND
     user32.GetWindow.argtypes = [wintypes.HWND, wintypes.UINT]
     user32.GetWindow.restype = wintypes.HWND
+    user32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
+    user32.GetWindowRect.restype = wintypes.BOOL
+    user32.IsWindowVisible.argtypes = [wintypes.HWND]
+    user32.IsWindowVisible.restype = wintypes.BOOL
+    user32.IsIconic.argtypes = [wintypes.HWND]
+    user32.IsIconic.restype = wintypes.BOOL
+    user32.GetWindowLongPtrW.argtypes = [wintypes.HWND, ctypes.c_int]
+    user32.GetWindowLongPtrW.restype = ctypes.c_ssize_t
+    user32.GetDC.argtypes = [wintypes.HWND]
+    user32.GetDC.restype = wintypes.HDC
+    user32.ReleaseDC.argtypes = [wintypes.HWND, wintypes.HDC]
+    user32.ReleaseDC.restype = ctypes.c_int
+    gdi32.CreateCompatibleDC.argtypes = [wintypes.HDC]
+    gdi32.CreateCompatibleDC.restype = wintypes.HDC
+    gdi32.CreateCompatibleBitmap.argtypes = [wintypes.HDC, ctypes.c_int, ctypes.c_int]
+    gdi32.CreateCompatibleBitmap.restype = wintypes.HBITMAP
+    gdi32.SelectObject.argtypes = [wintypes.HDC, wintypes.HGDIOBJ]
+    gdi32.SelectObject.restype = wintypes.HGDIOBJ
+    gdi32.BitBlt.argtypes = [
+        wintypes.HDC,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        wintypes.HDC,
+        ctypes.c_int,
+        ctypes.c_int,
+        wintypes.DWORD,
+    ]
+    gdi32.BitBlt.restype = wintypes.BOOL
+    gdi32.GetDIBits.argtypes = [
+        wintypes.HDC,
+        wintypes.HBITMAP,
+        wintypes.UINT,
+        wintypes.UINT,
+        ctypes.c_void_p,
+        ctypes.POINTER(BitmapInfo),
+        wintypes.UINT,
+    ]
+    gdi32.GetDIBits.restype = ctypes.c_int
+    gdi32.DeleteObject.argtypes = [wintypes.HGDIOBJ]
+    gdi32.DeleteObject.restype = wintypes.BOOL
+    gdi32.DeleteDC.argtypes = [wintypes.HDC]
+    gdi32.DeleteDC.restype = wintypes.BOOL
     user32.GetWindowThreadProcessId.argtypes = [
         wintypes.HWND,
         ctypes.POINTER(wintypes.DWORD),
@@ -2529,6 +3244,13 @@ def _run_windows(args: argparse.Namespace) -> int:
         ctypes.POINTER(ctypes.c_size_t),
     ]
     user32.SendMessageTimeoutW.restype = lresult
+    dwmapi.DwmGetWindowAttribute.argtypes = [
+        wintypes.HWND,
+        wintypes.DWORD,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+    ]
+    dwmapi.DwmGetWindowAttribute.restype = ctypes.c_long
     oleacc.AccessibleObjectFromPoint.argtypes = [
         wintypes.POINT,
         ctypes.POINTER(ctypes.c_void_p),
@@ -2579,6 +3301,11 @@ def _run_windows(args: argparse.Namespace) -> int:
     wheel_delta = 120
     gw_owner = 4
     ga_root = 2
+    gwl_exstyle = -20
+    dwmwa_cloaked = 14
+    srccopy = 0x00CC0020
+    bi_rgb = 0
+    dib_rgb_colors = 0
     pm_noremove = 0
     gui_menu_mode_flags = 0x0004 | 0x0008 | 0x0010
     winevent_outofcontext = 0x0000
@@ -2622,6 +3349,12 @@ def _run_windows(args: argparse.Namespace) -> int:
         except Exception:
             legacy = None
         return legacy is not None, False, False
+
+    def control_supports_pattern(control: Any, pattern_id: int) -> bool:
+        try:
+            return control.GetPattern(pattern_id) is not None
+        except Exception:
+            return False
 
     def runtime_target_from_control(
         control: Any,
@@ -2844,6 +3577,155 @@ def _run_windows(args: argparse.Namespace) -> int:
     def window_owner(hwnd: int) -> int:
         return native_handle_value(user32.GetWindow(hwnd, gw_owner))
 
+    def window_rect_from_handle(hwnd: int) -> Rect:
+        native_rect = wintypes.RECT()
+        if not user32.GetWindowRect(hwnd, ctypes.byref(native_rect)):
+            return Rect(0, 0, 0, 0)
+        return Rect(
+            int(native_rect.left),
+            int(native_rect.top),
+            int(native_rect.right),
+            int(native_rect.bottom),
+        )
+
+    def window_is_cloaked(hwnd: int) -> bool:
+        cloaked = wintypes.DWORD()
+        result = int(
+            dwmapi.DwmGetWindowAttribute(
+                hwnd,
+                dwmwa_cloaked,
+                ctypes.byref(cloaked),
+                ctypes.sizeof(cloaked),
+            )
+        )
+        return bool(result >= 0 and cloaked.value)
+
+    def associated_overlay_window_signature(
+        root_hwnd: int,
+        root_rect: Optional[Rect] = None,
+        excluded_process_id: int = 0,
+    ) -> tuple[tuple[int, Rect], ...]:
+        if root_hwnd <= 0:
+            return ()
+        if root_rect is None:
+            root_rect = window_rect_from_handle(root_hwnd)
+        if root_rect.width <= 0 or root_rect.height <= 0:
+            return ()
+        root_process_id = window_process_id(root_hwnd)
+        associated: list[tuple[int, Rect]] = []
+
+        @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+        def collect(hwnd: int, _lparam: int) -> bool:
+            handle = native_handle_value(hwnd)
+            if handle == root_hwnd:
+                return False
+            if window_class_name(handle) in NON_NAVIGATION_OVERLAY_CLASSES:
+                return True
+            process_id = window_process_id(handle)
+            if excluded_process_id > 0 and process_id == excluded_process_id:
+                return True
+            exstyle = int(user32.GetWindowLongPtrW(handle, gwl_exstyle))
+            related = overlay_window_is_related(
+                process_id,
+                root_process_id,
+                candidate_owned_by_root=owner_chain_contains(
+                    handle, root_hwnd, window_owner
+                ),
+                root_owned_by_candidate=owner_chain_contains(
+                    root_hwnd, handle, window_owner
+                ),
+                extended_style=exstyle,
+            )
+            rect = window_rect_from_handle(handle)
+            if overlay_window_is_candidate(
+                root_rect,
+                rect,
+                visible=bool(user32.IsWindowVisible(handle)),
+                minimized=bool(user32.IsIconic(handle)),
+                cloaked=window_is_cloaked(handle),
+                related=related,
+            ):
+                associated.append((handle, rect))
+            return True
+
+        user32.EnumWindows(collect, 0)
+        return tuple(associated)
+
+    def capture_window_rgb(
+        window_rect: Rect,
+        max_width: int = 720,
+    ) -> Optional[tuple[bytes, int, int, int]]:
+        width = window_rect.width
+        height = window_rect.height
+        if width <= 0 or height <= 0:
+            return None
+        screen_dc = user32.GetDC(None)
+        if not screen_dc:
+            return None
+        memory_dc = gdi32.CreateCompatibleDC(screen_dc)
+        bitmap = gdi32.CreateCompatibleBitmap(screen_dc, width, height)
+        old_bitmap = None
+        try:
+            if not memory_dc or not bitmap:
+                return None
+            old_bitmap = gdi32.SelectObject(memory_dc, bitmap)
+            if not gdi32.BitBlt(
+                memory_dc,
+                0,
+                0,
+                width,
+                height,
+                screen_dc,
+                window_rect.left,
+                window_rect.top,
+                srccopy,
+            ):
+                return None
+            source_stride = width * 4
+            source = (ctypes.c_ubyte * (source_stride * height))()
+            bitmap_info = BitmapInfo()
+            bitmap_info.header.size = ctypes.sizeof(BitmapInfoHeader)
+            bitmap_info.header.width = width
+            bitmap_info.header.height = -height
+            bitmap_info.header.planes = 1
+            bitmap_info.header.bit_count = 32
+            bitmap_info.header.compression = bi_rgb
+            if not gdi32.GetDIBits(
+                memory_dc,
+                bitmap,
+                0,
+                height,
+                source,
+                ctypes.byref(bitmap_info),
+                dib_rgb_colors,
+            ):
+                return None
+            step = max(1, (width + max_width - 1) // max_width)
+            sampled_width = (width + step - 1) // step
+            sampled_height = (height + step - 1) // step
+            sampled_stride = sampled_width * 3
+            sampled = bytearray(sampled_stride * sampled_height)
+            for sampled_y in range(sampled_height):
+                source_y = min(height - 1, sampled_y * step)
+                source_row = source_y * source_stride
+                target_row = sampled_y * sampled_stride
+                for sampled_x in range(sampled_width):
+                    source_x = min(width - 1, sampled_x * step)
+                    source_offset = source_row + source_x * 4
+                    target_offset = target_row + sampled_x * 3
+                    sampled[target_offset] = source[source_offset + 2]
+                    sampled[target_offset + 1] = source[source_offset + 1]
+                    sampled[target_offset + 2] = source[source_offset]
+            return bytes(sampled), sampled_width, sampled_height, sampled_stride
+        finally:
+            if old_bitmap and memory_dc:
+                gdi32.SelectObject(memory_dc, old_bitmap)
+            if bitmap:
+                gdi32.DeleteObject(bitmap)
+            if memory_dc:
+                gdi32.DeleteDC(memory_dc)
+            user32.ReleaseDC(None, screen_dc)
+
     def native_menu_mode_active() -> bool:
         info = GuiThreadInfo()
         info.cbSize = ctypes.sizeof(info)
@@ -2970,6 +3852,7 @@ def _run_windows(args: argparse.Namespace) -> int:
     ) -> tuple[
         list[RuntimeTarget],
         dict[tuple[int, ...], str],
+        list[ElementSnapshot],
         int,
         bool,
     ]:
@@ -2977,6 +3860,7 @@ def _run_windows(args: argparse.Namespace) -> int:
         by_rect: dict[Rect, RuntimeTarget] = {}
         node_types: dict[tuple[int, ...], str] = {}
         node_rects: dict[tuple[int, ...], Rect] = {}
+        elements: list[ElementSnapshot] = []
         visited = 0
         interrupted = False
 
@@ -2989,6 +3873,35 @@ def _run_windows(args: argparse.Namespace) -> int:
             try:
                 control_type = str(control.ControlTypeName or "")
                 control_rect = rect_from_control(control)
+                name = str(control.Name or "").strip()
+                automation_id = str(control.AutomationId or "").strip()
+                enabled = bool(control.IsEnabled)
+                offscreen = bool(control.IsOffscreen)
+                keyboard_focusable = bool(control.IsKeyboardFocusable)
+                elements.append(
+                    ElementSnapshot(
+                        rect=control_rect,
+                        name=name,
+                        control_type=control_type,
+                        automation_id=automation_id,
+                        path=path,
+                        enabled=enabled,
+                        offscreen=offscreen,
+                        keyboard_focusable=keyboard_focusable,
+                        has_legacy_pattern=(
+                            control_type in VISUAL_SURFACE_CONTROL_TYPES
+                            and control_supports_pattern(
+                                control, auto.PatternId.LegacyIAccessiblePattern
+                            )
+                        ),
+                        has_scroll_pattern=(
+                            control_type in VISUAL_SURFACE_CONTROL_TYPES
+                            and control_supports_pattern(
+                                control, auto.PatternId.ScrollPattern
+                            )
+                        ),
+                    )
+                )
                 if path:
                     node_types[path] = control_type
                     node_rects[path] = control_rect
@@ -3034,9 +3947,12 @@ def _run_windows(args: argparse.Namespace) -> int:
                 continue
 
         targets = normalize_runtime_targets(list(by_rect.values()))
-        return targets, node_types, visited, interrupted
+        for spec in repeated_content_target_specs(elements, window_rect):
+            targets.append(RuntimeTarget(spec.snapshot, None, spec.click_point))
+        targets = normalize_runtime_targets(targets)[: args.max_elements]
+        return targets, node_types, elements, visited, interrupted
 
-    def enumerate_targets(
+    def enumerate_window_targets(
         hwnd: int,
         deadline: Optional[float] = None,
         should_cancel: Optional[Callable[[], bool]] = None,
@@ -3068,7 +3984,7 @@ def _run_windows(args: argparse.Namespace) -> int:
             raise RuntimeError("无法从当前窗口建立 UI Automation 根元素")
         window_rect = rect_from_control(root)
         window_name = str(root.Name or "未命名窗口")
-        targets, node_types, visited, interrupted = collect_targets(
+        targets, node_types, elements, visited, interrupted = collect_targets(
             root,
             window_rect,
             (),
@@ -3077,11 +3993,126 @@ def _run_windows(args: argparse.Namespace) -> int:
             deadline=deadline,
             should_cancel=should_cancel,
         )
+        surfaces = opaque_visual_surfaces(
+            elements,
+            [target.snapshot for target in targets],
+            window_rect,
+        )
+        can_capture_visuals = bool(
+            surfaces
+            and not interrupted
+            and not scan_should_stop(deadline, should_cancel)
+            and (
+                deadline is None
+                or deadline - time.perf_counter() >= 0.20
+            )
+        )
+        if can_capture_visuals:
+            capture = capture_window_rgb(window_rect)
+            if capture is not None:
+                rgb, image_width, image_height, bytes_per_line = capture
+                for spec in visual_grid_target_specs(
+                    rgb,
+                    image_width,
+                    image_height,
+                    bytes_per_line,
+                    window_rect,
+                    surfaces,
+                ):
+                    targets.append(RuntimeTarget(spec.snapshot, None, spec.click_point))
+                targets = normalize_runtime_targets(targets)[: args.max_elements]
         return (
             targets,
             node_types,
             window_rect,
             window_name,
+            visited,
+            interrupted,
+        )
+
+    def enumerate_targets(
+        hwnd: int,
+        deadline: Optional[float] = None,
+        should_cancel: Optional[Callable[[], bool]] = None,
+    ) -> tuple[
+        list[RuntimeTarget],
+        dict[tuple[int, ...], str],
+        Rect,
+        str,
+        int,
+        bool,
+    ]:
+        (
+            root_targets,
+            root_node_types,
+            root_rect,
+            root_name,
+            visited,
+            interrupted,
+        ) = enumerate_window_targets(
+            hwnd,
+            deadline=deadline,
+            should_cancel=should_cancel,
+        )
+        overlay_targets: list[RuntimeTarget] = []
+        node_types = dict(root_node_types)
+        overlay_signature = associated_overlay_window_signature(
+            hwnd,
+            root_rect,
+            excluded_process_id=int(kernel32.GetCurrentProcessId()),
+        )
+        for overlay_index, (overlay_hwnd, _overlay_rect) in enumerate(
+            overlay_signature
+        ):
+            if scan_should_stop(deadline, should_cancel):
+                interrupted = True
+                break
+            try:
+                (
+                    targets,
+                    overlay_node_types,
+                    _rect,
+                    _name,
+                    overlay_visited,
+                    overlay_interrupted,
+                ) = enumerate_window_targets(
+                    overlay_hwnd,
+                    deadline=deadline,
+                    should_cancel=should_cancel,
+                )
+            except Exception:
+                continue
+            scope = (2_000_000 + overlay_index,)
+            for target in targets:
+                snapshot = target.snapshot
+                scoped_path = scope + snapshot.path
+                scoped_section = (
+                    scope + snapshot.section_path
+                    if snapshot.section_path
+                    else scope
+                )
+                target.snapshot = replace(
+                    snapshot,
+                    path=scoped_path,
+                    section_path=scoped_section,
+                    source=f"{snapshot.source}-overlay",
+                )
+                overlay_targets.append(target)
+            node_types.update(
+                {scope + path: control_type for path, control_type in overlay_node_types.items()}
+            )
+            visited += overlay_visited
+            interrupted = interrupted or overlay_interrupted
+
+        root_limit = max(0, args.max_elements - len(overlay_targets))
+        combined = normalize_runtime_targets(
+            [*root_targets[:root_limit], *overlay_targets[: args.max_elements]]
+        )[: args.max_elements]
+        return (
+            combined,
+            node_types,
+            root_rect,
+            root_name,
             visited,
             interrupted,
         )
@@ -3729,6 +4760,12 @@ def _run_windows(args: argparse.Namespace) -> int:
                     target.snapshot = shifted_snapshot(
                         target.snapshot, delta_x, delta_y
                     )
+                    if target.click_point is not None:
+                        target.click_point = shifted_point(
+                            target.click_point,
+                            delta_x,
+                            delta_y,
+                        )
                 self.window_rect = current_window_rect
                 self.invalid_targets.clear()
                 self._clear_input_cache()
@@ -4854,7 +5891,9 @@ def _run_windows(args: argparse.Namespace) -> int:
             self._hook = None
 
     if args.scan_only:
-        hwnd = native_handle_value(user32.GetForegroundWindow())
+        hwnd = native_handle_value(
+            args.window_handle or user32.GetForegroundWindow()
+        )
         if hwnd <= 0:
             print("没有可扫描的前台窗口。", file=sys.stderr)
             return 2
@@ -4904,6 +5943,7 @@ def _run_windows(args: argparse.Namespace) -> int:
     prewarm_requested_hwnd = 0
     navigation_root_hwnd = 0
     navigation_process_id = 0
+    navigation_overlay_signature: tuple[tuple[int, Rect], ...] = ()
     diagnostics_enabled = bool(args.diagnostics)
 
     def enqueue_keyboard_action(action: str) -> None:
@@ -4920,11 +5960,13 @@ def _run_windows(args: argparse.Namespace) -> int:
 
     def leave_navigation() -> None:
         nonlocal navigation_root_hwnd, navigation_process_id
+        nonlocal navigation_overlay_signature
         active.clear()
         worker.deactivate()
         overlay.clear_target()
         navigation_root_hwnd = 0
         navigation_process_id = 0
+        navigation_overlay_signature = ()
 
     def request_quit() -> None:
         nonlocal shutting_down
@@ -4944,6 +5986,7 @@ def _run_windows(args: argparse.Namespace) -> int:
             prototype_process_id,
             window_process_id,
             window_owner,
+            tuple(handle for handle, _rect in navigation_overlay_signature),
         )
         if foreground_action == "leave":
             print("导航已暂停: 已切换到其它窗口，请重新按 Ctrl+Alt+N。")
@@ -4955,7 +5998,7 @@ def _run_windows(args: argparse.Namespace) -> int:
 
     def handle_keyboard_action(action: str) -> None:
         nonlocal scanning, navigation_root_hwnd, navigation_process_id
-        nonlocal diagnostics_enabled
+        nonlocal navigation_overlay_signature, diagnostics_enabled
         if action == "quit":
             request_quit()
         elif action == "toggle_diagnostics":
@@ -4976,6 +6019,10 @@ def _run_windows(args: argparse.Namespace) -> int:
                     return
                 navigation_root_hwnd = hwnd
                 navigation_process_id = window_process_id(hwnd)
+                navigation_overlay_signature = associated_overlay_window_signature(
+                    hwnd,
+                    excluded_process_id=prototype_process_id,
+                )
                 scanning = True
                 print("正在扫描当前窗口...")
                 worker.post("scan", hwnd)
@@ -5073,6 +6120,8 @@ def _run_windows(args: argparse.Namespace) -> int:
                     f"已滚动: {target.name or target.control_type} "
                     f"({payload['steps']:+d} / {payload['elapsed']:.3f}s)"
                 )
+                if target.source == "visual-grid" and active.is_set():
+                    QTimer.singleShot(180, lambda: worker.post("refresh_content"))
             elif event == "exit_requested":
                 leave_navigation()
             elif event == "geometry_synced":
@@ -5149,6 +6198,7 @@ def _run_windows(args: argparse.Namespace) -> int:
 
     def monitor_navigation_context() -> None:
         nonlocal prewarm_observed_hwnd, prewarm_observed_at, prewarm_requested_hwnd
+        nonlocal navigation_overlay_signature
         foreground = native_handle_value(user32.GetForegroundWindow())
         if not active.is_set():
             now = time.perf_counter()
@@ -5172,6 +6222,13 @@ def _run_windows(args: argparse.Namespace) -> int:
             return
         if foreground <= 0:
             return
+        current_overlay_signature = associated_overlay_window_signature(
+            navigation_root_hwnd,
+            excluded_process_id=prototype_process_id,
+        )
+        if current_overlay_signature != navigation_overlay_signature:
+            navigation_overlay_signature = current_overlay_signature
+            worker.post("refresh_content")
         foreground_action = navigation_foreground_action(
             foreground,
             worker.hwnd,
@@ -5180,6 +6237,7 @@ def _run_windows(args: argparse.Namespace) -> int:
             prototype_process_id,
             window_process_id,
             window_owner,
+            tuple(handle for handle, _rect in navigation_overlay_signature),
         )
         if foreground_action == "ignore":
             return
