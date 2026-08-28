@@ -41,6 +41,7 @@ class OsVersionCheckTests(unittest.TestCase):
         info = diag.WindowsVersionInfo(major=10, minor=0, build=19045, is_64bit=True)
         result = diag.check_os_version(probe=lambda: info)
         self.assertEqual(result.status, diag.CheckStatus.PASS)
+        self.assertEqual(result.detail, "Windows 19045（64 位）")
 
     def test_exact_minimum_build_passes(self):
         info = diag.WindowsVersionInfo(
@@ -58,6 +59,7 @@ class RawInputCheckTests(unittest.TestCase):
     def test_exactly_one_match_passes(self):
         result = diag.check_raw_input(enumerate_paths=lambda: ["\\\\?\\HID#VID_2717&PID_32B8#..."])
         self.assertEqual(result.status, diag.CheckStatus.PASS)
+        self.assertEqual(result.detail, "RC003 按键设备已找到")
 
     def test_ambiguous_matches_fails(self):
         result = diag.check_raw_input(enumerate_paths=lambda: ["path1", "path2"])
@@ -298,7 +300,7 @@ class VbCableEndpointsCheckTests(unittest.TestCase):
             list_recording=lambda: [audio_output.AudioEndpoint(name="Microphone")],
         )
         self.assertEqual(result.status, diag.CheckStatus.FAIL)
-        self.assertIn("可选", result.detail)
+        self.assertIn("不影响按键", result.detail)
 
     def test_only_playback_present_fails_with_specific_missing_note(self):
         result = diag.check_vb_cable_endpoints(
@@ -352,8 +354,8 @@ class VbCableLoopbackCheckTests(unittest.TestCase):
         )
 
         self.assertEqual(result.status, diag.CheckStatus.PASS)
-        self.assertIn("到达", result.detail)
-        self.assertIn("不代表输入法", result.detail)
+        self.assertIn("CABLE Input → CABLE Output", result.detail)
+        self.assertIn("不代表语音识别", result.detail)
 
     def test_non_cable_saved_output_fails_without_running_probe(self):
         probe = mock.Mock()
@@ -395,7 +397,7 @@ class VbCableLoopbackCheckTests(unittest.TestCase):
         )
 
         self.assertEqual(result.status, diag.CheckStatus.FAIL)
-        self.assertIn("没有", result.detail)
+        self.assertIn("未收到", result.detail)
 
     def test_overflow_makes_an_otherwise_matching_capture_invalid(self):
         result = diag.check_vb_cable_loopback(
@@ -529,7 +531,7 @@ class OutputEndpointResolutionCheckTests(unittest.TestCase):
         )
         self.assertEqual(result.status, diag.CheckStatus.FAIL)
         self.assertIn("不是 CABLE Input", result.detail)
-        self.assertIn("选择检测到的", result.detail)
+        self.assertIn("输出端点", result.detail)
 
     def test_empty_selection_fails(self):
         result = diag.check_output_endpoint_resolution(
@@ -562,7 +564,7 @@ class OutputEndpointResolutionCheckTests(unittest.TestCase):
             ),
         )
         self.assertEqual(result.status, diag.CheckStatus.FAIL)
-        self.assertIn("无法实际打开", result.detail)
+        self.assertIn("无法播放", result.detail)
         self.assertNotIn("private endpoint detail", result.detail)
 
 

@@ -139,7 +139,7 @@ def check_os_version(
             "Windows 版本与 64 位架构",
             CheckGroup.ORDINARY_BUTTONS,
             CheckStatus.UNSUPPORTED,
-            "当前不是 Windows，无法核验版本/位数契约。",
+            "仅支持 Windows，无法检查版本与位数",
         )
     if not version_info.is_64bit:
         return CheckResult(
@@ -147,7 +147,7 @@ def check_os_version(
             "Windows 版本与 64 位架构",
             CheckGroup.ORDINARY_BUTTONS,
             CheckStatus.FAIL,
-            "检测到非 64 位系统；本程序需要 64 位 Windows 10 1809 (17763) 或以上。",
+            "需要 64 位 Windows 10 1809（17763）或更高版本",
         )
     if version_info.build < MIN_SUPPORTED_BUILD:
         return CheckResult(
@@ -155,15 +155,14 @@ def check_os_version(
             "Windows 版本与 64 位架构",
             CheckGroup.ORDINARY_BUTTONS,
             CheckStatus.FAIL,
-            f"当前 build {version_info.build} 低于 Windows 10 1809 "
-            f"({MIN_SUPPORTED_BUILD}) 的支持下限。",
+            f"Windows build {version_info.build}，最低要求 {MIN_SUPPORTED_BUILD}",
         )
     return CheckResult(
         "os_version",
         "Windows 版本与 64 位架构",
         CheckGroup.ORDINARY_BUTTONS,
         CheckStatus.PASS,
-        f"Windows build {version_info.build}，64 位，满足 1809+ 契约。",
+        f"Windows {version_info.build}（64 位）",
     )
 
 
@@ -185,7 +184,7 @@ def check_raw_input(
                 "Raw Input 按键设备",
                 CheckGroup.ORDINARY_BUTTONS,
                 CheckStatus.UNSUPPORTED,
-                "当前不是 Windows，无法枚举 Raw Input 设备。",
+                "仅 Windows 可检测 Raw Input 按键设备",
             )
         # RETRY 3 (independent review): this used to interpolate str(exc)
         # here. RawInputUnavailableError's real production message is
@@ -200,8 +199,7 @@ def check_raw_input(
             "Raw Input 按键设备",
             CheckGroup.ORDINARY_BUTTONS,
             CheckStatus.FAIL,
-            "Raw Input 设备枚举失败，出现意外错误；请检查遥控器连接后点击"
-            "「重新检测」重试。",
+            "Raw Input 检测失败；检查遥控器连接后重新检测",
         )
 
     count = len(paths)
@@ -212,7 +210,7 @@ def check_raw_input(
             "Raw Input 按键设备",
             CheckGroup.ORDINARY_BUTTONS,
             CheckStatus.FAIL,
-            "未发现匹配 RC003 VID/PID 的 Raw Input 设备；请先在 Windows 蓝牙设置中配对。",
+            "未找到 RC003 Raw Input 设备；请先完成蓝牙配对",
         )
     if count > 1:
         return CheckResult(
@@ -220,14 +218,14 @@ def check_raw_input(
             "Raw Input 按键设备",
             CheckGroup.ORDINARY_BUTTONS,
             CheckStatus.FAIL,
-            f"发现 {count} 个匹配设备，无法唯一确定；请仅保留一个已连接设备后重试。",
+            f"找到 {count} 个匹配设备；请只保留 1 个已连接设备",
         )
     return CheckResult(
         "raw_input",
         "Raw Input 按键设备",
         CheckGroup.ORDINARY_BUTTONS,
         CheckStatus.PASS,
-        "发现恰好一个匹配的 Raw Input 设备。",
+        "RC003 按键设备已找到",
     )
 
 
@@ -1141,7 +1139,7 @@ def check_ble_candidate(
                 "已配对的 RC003 (BLE)",
                 CheckGroup.VOICE_BRIDGE,
                 CheckStatus.UNSUPPORTED,
-                "当前不是 Windows，无法枚举已配对的 BLE 候选。",
+                "仅 Windows 可检测已配对的 RC003",
             )
         # RETRY 3 (independent review): this used to interpolate str(exc)
         # here. The real production message this raises today is API-only,
@@ -1155,7 +1153,7 @@ def check_ble_candidate(
             "已配对的 RC003 (BLE)",
             CheckGroup.VOICE_BRIDGE,
             CheckStatus.UNSUPPORTED,
-            "WinRT 蓝牙依赖不可用；请确认已按 requirements.txt 安装 winrt 组件后重试。",
+            "WinRT 蓝牙组件不可用；请检查安装后重试",
         )
     except BleDiscoverySubprocessShutdownUnconfirmedError:
         # XRBM-035 RETRY 1: distinct from a normal cancel/timeout below -
@@ -1168,7 +1166,7 @@ def check_ble_candidate(
             "已配对的 RC003 (BLE)",
             CheckGroup.VOICE_BRIDGE,
             CheckStatus.FAIL,
-            "BLE 检测子进程未能确认已退出，可能仍在后台运行；建议重启应用后再试。",
+            "未能确认蓝牙检测进程已退出；请重启应用后重试",
         )
     except BleDiscoveryCancelledError:
         # XRBM-035: an honest "did not complete" result - never a FAIL
@@ -1184,7 +1182,7 @@ def check_ble_candidate(
             "已配对的 RC003 (BLE)",
             CheckGroup.VOICE_BRIDGE,
             CheckStatus.FAIL,
-            "BLE 候选检测被取消或超时，未能得到结果；请点击「重新检测」重试。",
+            "蓝牙检测已取消或超时；请重新检测",
         )
     except Exception:  # noqa: BLE001 - report, never crash the diagnostics page
         # RETRY 3 (independent review): a genuinely unexpected exception
@@ -1197,7 +1195,7 @@ def check_ble_candidate(
             "已配对的 RC003 (BLE)",
             CheckGroup.VOICE_BRIDGE,
             CheckStatus.FAIL,
-            "BLE 候选枚举失败，出现意外错误；请点击「重新检测」重试。",
+            "BLE 检测失败；请重新检测",
         )
 
     try:
@@ -1208,7 +1206,7 @@ def check_ble_candidate(
             "已配对的 RC003 (BLE)",
             CheckGroup.VOICE_BRIDGE,
             CheckStatus.FAIL,
-            "未发现已配对的 RC003；请在 Windows 蓝牙设置中完成配对后重试。",
+            "未找到已配对的 RC003；请先完成蓝牙配对",
         )
     except identity.AmbiguousCandidateError as exc:
         return CheckResult(
@@ -1216,14 +1214,14 @@ def check_ble_candidate(
             "已配对的 RC003 (BLE)",
             CheckGroup.VOICE_BRIDGE,
             CheckStatus.FAIL,
-            f"发现 {exc.count} 个候选，无法唯一确定；请仅保留一个已配对设备后重试。",
+            f"找到 {exc.count} 个 RC003；请只保留 1 个已配对设备",
         )
     return CheckResult(
         "ble_candidate",
         "已配对的 RC003 (BLE)",
         CheckGroup.VOICE_BRIDGE,
         CheckStatus.PASS,
-        "发现恰好一个已配对的 RC003 候选。",
+        "已找到 1 个已配对的 RC003",
     )
 
 
@@ -1248,7 +1246,7 @@ def check_vb_cable_endpoints(
             "VB-CABLE 虚拟音频端点（可选）",
             CheckGroup.OPTIONAL_DRIVER,
             CheckStatus.UNSUPPORTED,
-            f"无法枚举音频端点：{exc}",
+            f"无法检测音频端点：{exc}",
         )
 
     has_input = any(
@@ -1264,7 +1262,7 @@ def check_vb_cable_endpoints(
             "VB-CABLE 虚拟音频端点（可选）",
             CheckGroup.OPTIONAL_DRIVER,
             CheckStatus.PASS,
-            "已发现 CABLE Input（播放）与 CABLE Output（录音）两个端点。",
+            "已找到 CABLE Input（播放）和 CABLE Output（录音）",
         )
     missing = []
     if not has_input:
@@ -1276,8 +1274,7 @@ def check_vb_cable_endpoints(
         "VB-CABLE 虚拟音频端点（可选）",
         CheckGroup.OPTIONAL_DRIVER,
         CheckStatus.FAIL,
-        "尚未发现：" + "、".join(missing) + "。这是可选项——不安装 VB-CABLE 时，"
-        "普通按键仍然正常工作，只有把 RC003 语音当作系统麦克风使用时才需要它。",
+        "缺少：" + "、".join(missing) + "；只影响系统麦克风语音，不影响按键",
     )
 
 
@@ -1313,7 +1310,7 @@ def check_vb_cable_loopback(
             title,
             CheckGroup.OPTIONAL_DRIVER,
             CheckStatus.UNSUPPORTED,
-            "无法枚举音频端点，暂时不能运行通道测试。",
+            "无法检测音频端点；未运行测试",
         )
     except Exception:  # noqa: BLE001 - never expose device details
         return CheckResult(
@@ -1321,7 +1318,7 @@ def check_vb_cable_loopback(
             title,
             CheckGroup.OPTIONAL_DRIVER,
             CheckStatus.FAIL,
-            "枚举音频端点时出现意外错误，未运行通道测试。",
+            "音频端点检测失败；未运行测试",
         )
 
     try:
@@ -1334,7 +1331,7 @@ def check_vb_cable_loopback(
             title,
             CheckGroup.OPTIONAL_DRIVER,
             CheckStatus.FAIL,
-            "当前语音输出端点不可用；请先点击「选择端点」，再测试通道。",
+            "输出端点不可用；请重新选择并应用",
         )
     if not audio_output.is_cable_input_endpoint(output_endpoint.name):
         return CheckResult(
@@ -1342,7 +1339,7 @@ def check_vb_cable_loopback(
             title,
             CheckGroup.OPTIONAL_DRIVER,
             CheckStatus.FAIL,
-            "当前语音输出不是 CABLE Input；请先点击「选择端点」，再测试通道。",
+            "输出端点不是 CABLE Input；请重新选择并应用",
         )
 
     input_matches = [
@@ -1357,7 +1354,7 @@ def check_vb_cable_loopback(
             title,
             CheckGroup.OPTIONAL_DRIVER,
             CheckStatus.FAIL,
-            "没有找到与当前 CABLE Input 使用同一音频接口的 CABLE Output。",
+            "未找到同一音频接口的 CABLE Output",
         )
     if len(input_matches) != 1:
         return CheckResult(
@@ -1365,7 +1362,7 @@ def check_vb_cable_loopback(
             title,
             CheckGroup.OPTIONAL_DRIVER,
             CheckStatus.FAIL,
-            "同一音频接口下存在多个 CABLE Output，无法唯一确定测试端点。",
+            "同一音频接口有多个 CABLE Output；无法确定测试端点",
         )
 
     try:
@@ -1380,7 +1377,7 @@ def check_vb_cable_loopback(
             title,
             CheckGroup.OPTIONAL_DRIVER,
             CheckStatus.UNSUPPORTED,
-            "VB-CABLE 通道测试已取消。",
+            "通道测试已取消",
         )
     except audio_playback.LoopbackProbeUnavailableError:
         status = CheckStatus.UNSUPPORTED if sys.platform != "win32" else CheckStatus.FAIL
@@ -1389,7 +1386,7 @@ def check_vb_cable_loopback(
             title,
             CheckGroup.OPTIONAL_DRIVER,
             status,
-            "无法完成 VB-CABLE 通道测试；请关闭占用虚拟音频端点的程序后重试。",
+            "无法完成通道测试；请关闭占用端点的程序后重试",
         )
     except Exception:  # noqa: BLE001 - never expose device details
         return CheckResult(
@@ -1397,7 +1394,7 @@ def check_vb_cable_loopback(
             title,
             CheckGroup.OPTIONAL_DRIVER,
             CheckStatus.FAIL,
-            "VB-CABLE 通道测试出现意外错误，未得到可信结果。",
+            "通道测试失败；未得到可信结果",
         )
 
     if result.input_overflowed or result.output_underflowed:
@@ -1406,7 +1403,7 @@ def check_vb_cable_loopback(
             title,
             CheckGroup.OPTIONAL_DRIVER,
             CheckStatus.FAIL,
-            "测试过程中发生音频溢出或欠载，本次结果无效；请关闭占用端点的程序后重试。",
+            "音频溢出或欠载，本次结果无效；请关闭占用端点的程序后重试",
         )
     if not result.detected:
         return CheckResult(
@@ -1414,7 +1411,7 @@ def check_vb_cable_loopback(
             title,
             CheckGroup.OPTIONAL_DRIVER,
             CheckStatus.FAIL,
-            "没有在 CABLE Output 收到匹配的测试信号；请检查 VB-CABLE 端点后重试。",
+            "CABLE Output 未收到测试信号；请检查端点后重试",
         )
 
     latency_ms = result.roundtrip_latency_ms or 0.0
@@ -1423,8 +1420,8 @@ def check_vb_cable_loopback(
         title,
         CheckGroup.OPTIONAL_DRIVER,
         CheckStatus.PASS,
-        f"测试信号已从 CABLE Input 到达 CABLE Output（约 {latency_ms:.0f} ms）；"
-        "这只说明本地虚拟音频通道正常，不代表输入法已经识别文字。",
+        f"CABLE Input → CABLE Output 正常（约 {latency_ms:.0f} ms）；"
+        "不代表语音识别已通过",
     )
 
 
@@ -1496,7 +1493,7 @@ def check_vb_cable_loopback_isolated(
             title,
             CheckGroup.OPTIONAL_DRIVER,
             CheckStatus.FAIL,
-            "桥接已经运行或正在启动；本次未发送测试信号，请先停止桥接后重试。",
+            "遥控器服务正在运行；本次未发送测试信号",
         )
     except (
         single_instance.SingleInstanceUnavailableError,
@@ -1507,7 +1504,7 @@ def check_vb_cable_loopback_isolated(
             title,
             CheckGroup.OPTIONAL_DRIVER,
             CheckStatus.FAIL,
-            "无法确认测试与桥接已经互斥；本次结果无效，请关闭设置程序后重试。",
+            "无法确认测试与服务互斥；结果无效，请关闭设置后重试",
         )
     except VbCableLoopbackCancelledError:
         if event.is_set():
@@ -1516,14 +1513,14 @@ def check_vb_cable_loopback_isolated(
                 title,
                 CheckGroup.OPTIONAL_DRIVER,
                 CheckStatus.UNSUPPORTED,
-                "VB-CABLE 通道测试已取消。",
+                "通道测试已取消",
             )
         return CheckResult(
             "vb_cable_loopback",
             title,
             CheckGroup.OPTIONAL_DRIVER,
             CheckStatus.FAIL,
-            "VB-CABLE 通道测试超时，已停止测试进程；请关闭占用端点的程序后重试。",
+            "通道测试超时，已停止测试进程；请关闭占用端点的程序后重试",
         )
     except VbCableLoopbackSubprocessShutdownUnconfirmedError:
         return CheckResult(
@@ -1531,7 +1528,7 @@ def check_vb_cable_loopback_isolated(
             title,
             CheckGroup.OPTIONAL_DRIVER,
             CheckStatus.FAIL,
-            "VB-CABLE 通道测试超时，且未能确认测试进程已经停止；请先关闭设置程序后重试。",
+            "通道测试超时，且未能确认测试进程已停止；请关闭设置后重试",
         )
     except Exception:  # noqa: BLE001 - never expose paths or device details
         return CheckResult(
@@ -1539,7 +1536,7 @@ def check_vb_cable_loopback_isolated(
             title,
             CheckGroup.OPTIONAL_DRIVER,
             CheckStatus.FAIL,
-            "无法启动或完成 VB-CABLE 隔离通道测试，请稍后重试。",
+            "无法启动或完成通道测试；请稍后重试",
         )
     if result is None:
         return CheckResult(
@@ -1547,7 +1544,7 @@ def check_vb_cable_loopback_isolated(
             title,
             CheckGroup.OPTIONAL_DRIVER,
             CheckStatus.FAIL,
-            "VB-CABLE 通道测试进程未返回可信结果，请稍后重试。",
+            "通道测试未返回可信结果；请稍后重试",
         )
     return result
 
@@ -1570,7 +1567,7 @@ def check_dji_mic_2_input(
             "DJI Mic 2 录音输入",
             CheckGroup.EXTERNAL_MICROPHONE,
             CheckStatus.UNSUPPORTED,
-            "无法枚举 Windows 录音端点，暂不能核验 DJI Mic 2。",
+            "无法检测 Windows 录音端点",
         )
     matches = [e for e in recording if audio_output.is_dji_mic_2_input_endpoint(e.name)]
     if not matches:
@@ -1579,18 +1576,18 @@ def check_dji_mic_2_input(
             "DJI Mic 2 录音输入",
             CheckGroup.EXTERNAL_MICROPHONE,
             CheckStatus.FAIL,
-            "未发现可用的 DJI Mic 2 录音端点；请确认发射器已开机并在蓝牙设置中处于已连接状态。",
+            "未找到 DJI Mic 2 录音端点；请确认发射器已开机并已连接",
         )
     host_apis = {e.host_api for e in matches if e.host_api}
-    detail = "已发现可用的 DJI Mic 2 录音端点"
+    detail = "已找到 DJI Mic 2 录音端点"
     if host_apis:
-        detail += f"（{len(host_apis)} 个音频接口视图）"
+        detail += f"（{len(host_apis)} 个音频接口）"
     return CheckResult(
         "dji_mic_2_input",
         "DJI Mic 2 录音输入",
         CheckGroup.EXTERNAL_MICROPHONE,
         CheckStatus.PASS,
-        detail + "；未修改 Windows 默认麦克风。",
+        detail + "；未更改默认麦克风",
     )
 
 
@@ -1614,7 +1611,7 @@ def check_output_endpoint_resolution(
             "语音输出端点",
             CheckGroup.VOICE_BRIDGE,
             CheckStatus.UNSUPPORTED,
-            f"无法枚举播放端点：{exc}",
+            f"无法检测播放端点：{exc}",
         )
 
     try:
@@ -1638,8 +1635,7 @@ def check_output_endpoint_resolution(
             "语音输出端点",
             CheckGroup.VOICE_BRIDGE,
             CheckStatus.FAIL,
-            "所选端点存在，但当前无法实际打开阻塞播放流；请选择 Windows "
-            "WASAPI 或 Windows DirectSound 后重试。",
+            "端点存在但无法播放；请选择 Windows WASAPI 或 DirectSound",
         )
 
     if audio_output.is_cable_input_endpoint(endpoint.name):
@@ -1648,7 +1644,7 @@ def check_output_endpoint_resolution(
             "语音输出端点",
             CheckGroup.VOICE_BRIDGE,
             CheckStatus.PASS,
-            f"已选择端点 {endpoint.name!r} 存在，且为 CABLE Input（VB-CABLE 语音链路）。",
+            f"已选择 CABLE Input：{endpoint.name}",
         )
     # RETRY 1 (independent review): resolving to a real but non-CABLE-Input
     # endpoint used to still return PASS here - a false green readiness
@@ -1662,9 +1658,7 @@ def check_output_endpoint_resolution(
         "语音输出端点",
         CheckGroup.VOICE_BRIDGE,
         CheckStatus.FAIL,
-        f"已选择端点 {endpoint.name!r} 存在，但不是 CABLE Input——如果计划使用"
-        "本页的 VB-CABLE 语音链路，需要在「检查与修复」页点击「选择检测到的 "
-        "CABLE Input 作为输出」，或在「连接」页手动改选 CABLE Input。",
+        "所选端点不是 CABLE Input；请在“输出端点”中重新选择并应用",
     )
 
 
@@ -1677,10 +1671,8 @@ def check_dictation_manual() -> CheckResult:
         "Windows 听写 (Win+H)",
         CheckGroup.DICTATION,
         CheckStatus.MANUAL,
-        "Windows 未公开一个可核验听写是否可用的 API，这里不能给出自动结论。"
-        "请手动验证：打开记事本等可编辑文本框并点入光标，确认已启用「联机语音"
-        "识别」（Windows 11：设置 → 隐私和安全性 → 语音；Windows 10：设置 → "
-        "隐私 → 语音），按一次 Win+H，说话后确认文字被输入。",
+        "请手动测试 Win+H：打开文本框并说话，确认文字输入；"
+        "语音识别需在 Windows 中启用",
     )
 
 
@@ -1710,8 +1702,7 @@ def _isolated(
             title,
             group,
             CheckStatus.FAIL,
-            "该检测项出现意外错误，未能得出结论；其他检测项结果不受影响，可点击"
-            "「重新检测」重试。",
+            "检测失败；其他项目不受影响，请重新检测",
         )
 
 

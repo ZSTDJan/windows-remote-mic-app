@@ -526,53 +526,24 @@ def default_display_state() -> DefaultDisplayState:
 # "RC003 已连接"/"RC003 connected" - only as the process itself still being
 # alive. The settings controller continues polling the runtime status and
 # promotes the UI to the connected state only after the bridge reports it.
-LAUNCH_NOT_STARTED_TEXT = (
-    "遥控器服务未运行。话筒键此时不会由本程序触发语音；"
-    "请在设备页点击“启动”，并等待首次连接完成。"
-)
-LAUNCH_ALREADY_RUNNING_TEXT = (
-    "检测到遥控器服务已经在运行。本设置窗口没有重复启动它；"
-    "界面会继续检查 RC003 连接状态，按键与语音仍需真机测试。"
-)
-LAUNCH_STATUS_UNKNOWN_TEXT = (
-    "暂时无法确认遥控器服务是否运行。请先查看任务栏通知区域或任务管理器，"
-    "不要连续重复启动；可在设备页打开日志目录查看 app.log。"
-)
+LAUNCH_NOT_STARTED_TEXT = "服务未运行；点击“启动”后，按键和语音才会生效"
+LAUNCH_ALREADY_RUNNING_TEXT = "服务已在运行；正在检查 RC003 连接"
+LAUNCH_STATUS_UNKNOWN_TEXT = "无法确认服务状态；请查看 app.log，勿重复启动"
 
 
 def describe_launch_result(result: bridge_launcher.LaunchResult) -> str:
     if result.outcome is bridge_launcher.LaunchOutcome.STARTED:
         pid_text = f"（PID {result.pid}）" if result.pid is not None else ""
-        return (
-            f"已启动遥控器服务{pid_text}，本次启动检查结束时进程仍在运行。"
-            "首次连接和补充按键通道"
-            "就绪可能需要约一分钟；请等待后再测试。这只说明进程本身存活，"
-            "界面会继续检查设备，并在运行状态确认后更新阶段。"
-        )
+        return f"服务已启动{pid_text}；正在连接 RC003，首次可能约 1 分钟"
     if result.outcome is bridge_launcher.LaunchOutcome.ALREADY_RUNNING:
-        return (
-            "已经在运行：这次启动被单实例保护拒绝，进程立即退出（退出码 "
-            f"{result.exit_code}）。不需要再次启动；如需重启，请先从任务管理器结束 "
-            "现有 RemoteMicRC003 进程，或使用 Start Menu 的“停止”条目/"
-            "便携版的手动停止步骤。"
-        )
+        return f"服务已在运行（代码 {result.exit_code}）；无需重复启动"
     if result.outcome is bridge_launcher.LaunchOutcome.STATUS_UNKNOWN:
         pid_text = f"（PID {result.pid}）" if result.pid is not None else ""
-        return (
-            f"遥控器服务已经创建{pid_text}，但 Windows 未能确认它当前是否仍在运行"
-            f"（{result.error}）。请先不要重复启动；查看任务栏通知区域、任务管理器和 "
-            "app.log 确认状态。"
-        )
+        return f"服务已创建{pid_text}，但状态未知；请查看 app.log，勿重复启动"
     if result.outcome is bridge_launcher.LaunchOutcome.QUICK_EXIT:
-        return (
-            f"启动异常：进程在短时间内退出（退出码 {result.exit_code}），可能没有成功"
-            "建立 BLE/HID/音频连接。请在设备页打开日志目录查看 app.log。"
-        )
+        return f"服务启动后立即退出（代码 {result.exit_code}）；请查看 app.log"
     # LAUNCH_FAILED
-    return (
-        f"启动失败：无法创建遥控器服务（{result.error}）。请在设备页打开日志目录查看 "
-        "app.log，并确认安装/便携版文件是否完整。"
-    )
+    return f"服务启动失败：{result.error}；请查看 app.log"
 
 
 def describe_log_open_result(result: logging_setup.LogOpenResult) -> str:

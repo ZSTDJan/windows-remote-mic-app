@@ -693,8 +693,8 @@ class SettingsControllerTests(unittest.TestCase):
         self.assertTrue(controller.bridgeRunning)
         self.assertFalse(controller.bridgeConnected)
         self.assertEqual(controller.bridgeLaunchPhase, "waiting")
-        self.assertIn("遥控器服务已启动", controller.launchStatusText)
-        self.assertIn("连接状态暂时未知", controller.launchStatusText)
+        self.assertIn("服务运行中", controller.launchStatusText)
+        self.assertIn("状态未知", controller.launchStatusText)
 
     def test_launch_status_reads_the_bridge_reported_connected_state(self):
         self._bridge_status_patch.stop()
@@ -729,7 +729,7 @@ class SettingsControllerTests(unittest.TestCase):
 
         self.assertTrue(controller.bridgeRunning)
         self.assertEqual(controller.bridgeLaunchPhase, "waiting")
-        self.assertIn("连接状态暂时未知", controller.launchStatusText)
+        self.assertIn("状态未知", controller.launchStatusText)
 
         controller.refreshBridgeState()
 
@@ -1257,15 +1257,15 @@ class SettingsControllerTests(unittest.TestCase):
         self.assertTrue(controller.bridgeRunning)
         self.assertFalse(controller.bridgeConnected)
         self.assertEqual(controller.bridgeLaunchPhase, "waiting")
-        self.assertIn("遥控器服务已启动", controller.launchStatusText)
-        self.assertIn("约一分钟", controller.launchStatusText)
+        self.assertIn("服务运行中", controller.launchStatusText)
+        self.assertIn("约 1 分钟", controller.launchStatusText)
         self.assertNotIn("已连接", controller.launchStatusText)
 
         controller.refreshBridgeState()
 
         self.assertFalse(controller.bridgeRunning)
         self.assertEqual(controller.bridgeLaunchPhase, "failed")
-        self.assertIn("遥控器服务已经退出", controller.launchStatusText)
+        self.assertIn("服务已退出", controller.launchStatusText)
 
     def test_device_page_start_bridge_does_not_save_unrelated_dirty_edits(self):
         controller, model = self._make_controller()
@@ -1527,10 +1527,9 @@ class SettingsControllerTests(unittest.TestCase):
             "gadget_connection_closed",
         )
 
-        self.assertIn("补充按键通道暂时不可用", controller.keyDetectionText)
+        self.assertIn("补充按键通道暂不可用", controller.keyDetectionText)
         self.assertIn("返回键、音量键", controller.keyDetectionText)
-        self.assertIn("补充按键通道已连接", controller.keyDetectionText)
-        self.assertIn("不需要先等待“已就绪”", controller.keyDetectionText)
+        self.assertIn("正在重连", controller.keyDetectionText)
         self.assertNotIn("gadget_connection_closed", controller.keyDetectionText)
         self.assertNotIn("Raw Input", controller.keyDetectionText)
         self.assertNotIn("HID tap", controller.keyDetectionText)
@@ -1584,9 +1583,8 @@ class SettingsControllerTests(unittest.TestCase):
             key_detection_bridge.STALE_AFTER_SECONDS,
         )
         self.assertIn("Windows 按键通道已启动", controller.keyDetectionText)
-        self.assertIn("补充按键通道正在连接", controller.keyDetectionText)
-        self.assertIn("约一分钟", controller.keyDetectionText)
-        self.assertIn("不需要等待“已就绪”", controller.keyDetectionText)
+        self.assertIn("等待补充通道连接", controller.keyDetectionText)
+        self.assertIn("约 1 分钟", controller.keyDetectionText)
         self.assertNotIn("均已就绪", controller.keyDetectionText)
         self.assertGreater(controller._key_detection_started_at, 0.0)
 
@@ -1596,8 +1594,7 @@ class SettingsControllerTests(unittest.TestCase):
         )
 
         self.assertIn("补充按键通道已连接", controller.keyDetectionText)
-        self.assertIn("首次有效按键", controller.keyDetectionText)
-        self.assertIn("请现在按一次", controller.keyDetectionText)
+        self.assertIn("请按要检测的按键", controller.keyDetectionText)
 
         tap_instances[0].status_handler(frida_compat.HidTapState.READY.value, "")
 
@@ -1632,17 +1629,15 @@ class SettingsControllerTests(unittest.TestCase):
             controller.startKeyDetection()
 
         self.assertTrue(controller.keyDetectionActive)
-        self.assertIn("补充按键通道正在连接", controller.keyDetectionText)
-        self.assertIn("看到“补充按键通道已连接”后请按一次", controller.keyDetectionText)
-        self.assertIn("不需要等待“已就绪”", controller.keyDetectionText)
+        self.assertIn("补充按键通道连接中", controller.keyDetectionText)
+        self.assertIn("连接后请按要检测的按键", controller.keyDetectionText)
 
         tap_instances[0].status_handler(
             frida_compat.HidTapState.ATTACHED_WAITING_IO.value,
             "",
         )
 
-        self.assertIn("请现在按一次", controller.keyDetectionText)
-        self.assertIn("同时完成通道确认和捕获", controller.keyDetectionText)
+        self.assertIn("请按要检测的按键", controller.keyDetectionText)
 
         tap_instances[0].report_handler(1, bytes.fromhex("520000000000"))
 
@@ -1701,7 +1696,7 @@ class SettingsControllerTests(unittest.TestCase):
         self.assertIsNone(controller._key_detection_tap)
         listener.stop.assert_called_once_with()
         tap.stop.assert_called_once_with()
-        self.assertIn("等待真实按键超时", controller.keyDetectionText)
+        self.assertIn("等待按键超时", controller.keyDetectionText)
 
     def test_local_detection_timeout_preserves_a_cleanup_error(self):
         controller, _ = self._make_controller()
@@ -1739,7 +1734,7 @@ class SettingsControllerTests(unittest.TestCase):
             controller.startKeyDetection()
 
         self.assertFalse(controller.keyDetectionActive)
-        self.assertIn("无法安全确认后台桥接状态", controller.keyDetectionText)
+        self.assertIn("无法确认后台服务状态", controller.keyDetectionText)
         enumerate_paths.assert_not_called()
         tap.assert_not_called()
 
@@ -1760,7 +1755,7 @@ class SettingsControllerTests(unittest.TestCase):
             controller.startKeyDetection()
 
         self.assertFalse(controller.keyDetectionActive)
-        self.assertIn("无法安全确认后台桥接状态", controller.keyDetectionText)
+        self.assertIn("无法确认后台服务状态", controller.keyDetectionText)
         enumerate_paths.assert_not_called()
         tap.assert_not_called()
 
@@ -2417,7 +2412,7 @@ class DiagnosticsControllerTests(unittest.TestCase):
             result = diag.selectDetectedCableInputAsOutput()
 
         self.assertFalse(result)
-        self.assertIn("未检测到", diag.driverErrorMessage)
+        self.assertIn("未找到", diag.driverErrorMessage)
 
     def test_select_detected_cable_input_reports_an_honest_error_on_persistence_failure(self):
         # XRBM-031 RETRY 1 item 3: a config persistence failure must never
@@ -2477,7 +2472,7 @@ class DiagnosticsControllerTests(unittest.TestCase):
             result = diag.selectDetectedCableInputAsOutput()
 
         self.assertFalse(result)
-        self.assertIn("无法唯一确定", diag.driverErrorMessage)
+        self.assertIn("请在语音页", diag.driverErrorMessage)
 
     def test_select_detected_cable_input_prefers_wasapi_over_directsound(self):
         settings_controller = self._make_settings_controller()
@@ -2803,7 +2798,7 @@ class DiagnosticsControllerTests(unittest.TestCase):
 
         self.assertEqual(diag.driverErrorMessage, "")
         self.assertEqual(diag.driverStatusMessage, "")
-        self.assertIn("重新检测", diag.driverInfoMessage)
+        self.assertIn("重新检查", diag.driverInfoMessage)
         self.assertNotIn("安装成功", diag.driverInfoMessage)
 
 
@@ -4306,7 +4301,7 @@ class SettingsShellSourceContractTests(unittest.TestCase):
 
     def test_voice_hotkey_field_is_owned_by_the_voice_page(self):
         self.assertIn('placeholderText: qsTr("点击录入")', self.voice_qml)
-        self.assertIn("需要与语音程序的唤起键一致", self.voice_qml)
+        self.assertIn("需与语音程序快捷键一致", self.voice_qml)
         self.assertNotIn('objectName: "holdVoiceHotkeyField"', self.buttons_qml)
 
     def test_voice_program_status_uses_structured_privilege_and_dirty_state(self):
@@ -4454,7 +4449,7 @@ class ThreePageSettingsSourceContractTests(unittest.TestCase):
         detect_index = self.buttons_qml.index('objectName: "detectRealKeyButton"')
         note_index = self.buttons_qml.index('objectName: "voiceGestureRestrictionText"')
         self.assertLess(detect_index, note_index)
-        self.assertIn("按键设为语音键时，双击和长按不可用", self.buttons_qml)
+        self.assertIn("设为语音动作后，双击和长按不可用", self.buttons_qml)
         self.assertIn('qsTr("语音模式下暂停")', self.mapping_card_qml)
 
     def test_inline_rows_do_not_restore_the_old_blue_circle_icon(self):
@@ -4463,6 +4458,11 @@ class ThreePageSettingsSourceContractTests(unittest.TestCase):
         self.assertIn("titleText", self.inline_row_qml)
         self.assertIn("descriptionText", self.inline_row_qml)
         self.assertIn("stateText", self.inline_row_qml)
+
+    def test_inline_diagnostic_notes_strip_terminal_sentence_marks(self):
+        normalization = 'replace(/[。；;]+$/, "")'
+        self.assertIn(normalization, self.device_qml)
+        self.assertIn(normalization, self.voice_qml)
 
 
 @unittest.skipUnless(_HAS_PYSIDE6, _SKIP_REASON)

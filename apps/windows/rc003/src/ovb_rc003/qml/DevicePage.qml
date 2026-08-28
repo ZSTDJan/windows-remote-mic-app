@@ -53,8 +53,11 @@ Item {
         var details = []
         for (var i = 0; i < checkIds.length; i++) {
             const row = checkResult(checkIds[i])
-            if (row && String(row.detail).length > 0)
-                details.push(String(row.detail))
+            if (row && String(row.detail).length > 0) {
+                const detail = String(row.detail).trim().replace(/[。；;]+$/, "")
+                if (detail.length > 0)
+                    details.push(detail)
+            }
         }
         return details.length > 0 ? details.join(qsTr("；")) : fallback
     }
@@ -141,7 +144,7 @@ Item {
                     titleText: qsTr("按键接收")
                     descriptionText: root.combinedDetail(
                         ["os_version", "raw_input"],
-                        qsTr("检查 Windows 与遥控器按键接收通道")
+                        qsTr("检查系统与按键接收")
                     )
                     stateText: root.combinedStatus(["os_version", "raw_input"])
                     stateColor: root.combinedColor(["os_version", "raw_input"])
@@ -181,7 +184,7 @@ Item {
                     objectName: "runtimeLogRow"
                     tokens: root.tokens
                     titleText: qsTr("运行日志")
-                    descriptionText: qsTr("查看连接、按键、声音和语音程序记录")
+                    descriptionText: qsTr("查看连接、按键、音频和程序日志")
                     showDivider: false
 
                     CompactButton {

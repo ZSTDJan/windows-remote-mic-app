@@ -537,8 +537,8 @@ Item {
                         tokens: root.tokens
                         active: primaryGestureTitleHover.hovered
                         text: actionEditor.buttonId === "mic"
-                            ? qsTr("话筒键可选择按住说话、普通动作、自定义组合键或 Quicker URI。")
-                            : qsTr("可选择普通动作，也可输入自定义组合键或 Quicker URI。")
+                            ? qsTr("话筒键可选按住说话、普通动作、快捷键或 Quicker URI")
+                            : qsTr("可选普通动作、快捷键或 Quicker URI")
                     }
                 }
                 RowLayout {
@@ -605,7 +605,7 @@ Item {
                     CompactToolTip {
                         tokens: root.tokens
                         active: doubleGestureTitleHover.hovered
-                        text: qsTr("配置后，程序会等待约 0.3 秒区分单击和双击。")
+                        text: qsTr("会等待约 0.3 秒区分单击和双击")
                     }
                 }
                 RowLayout {
@@ -673,7 +673,7 @@ Item {
                     CompactToolTip {
                         tokens: root.tokens
                         active: longGestureTitleHover.hovered
-                        text: qsTr("按住约 0.55 秒触发，并抑制本次单击动作。")
+                        text: qsTr("按住约 0.55 秒触发；本次不执行单击")
                     }
                 }
                 RowLayout {
@@ -1178,7 +1178,7 @@ Item {
                                 tokens: root.tokens
                                 kind: noteKind
                                 Layout.fillWidth: true
-                                text: qsTr("主键只能选 TV、菜单或主页；启用组合后不能再设置该键的双击和长按")
+                                text: qsTr("主键限 TV、菜单或主页；启用后不能设置该键的双击和长按")
                                 elide: Text.ElideRight
                             }
                         }
@@ -1265,7 +1265,7 @@ Item {
                                         CompactToolTip {
                                             tokens: root.tokens
                                             active: comboGestureTitleHover.hovered
-                                            text: qsTr("可选择普通动作，也可输入电脑快捷键或 Quicker URI。")
+                                            text: qsTr("可选普通动作、快捷键或 Quicker URI")
                                         }
                                     }
                                     EditorActionCombo {
@@ -1354,8 +1354,8 @@ Item {
                         text: root.mappingViewIndex === 0
                             ? (SettingsController.keyDetectionActive
                                 ? SettingsController.keyDetectionText
-                                : qsTr("按键设为语音键时，双击和长按不可用"))
-                            : qsTr("组合命中后不会再执行主键和第二键的单键动作")
+                                : qsTr("设为语音动作后，双击和长按不可用"))
+                            : qsTr("组合触发后，不执行两个按键的单键动作")
                         elide: Text.ElideRight
                     }
                     Item { Layout.fillWidth: true }
@@ -1494,7 +1494,7 @@ Item {
                 Layout.alignment: Qt.AlignHCenter
                 horizontalAlignment: Text.AlignHCenter
                 wrapMode: Text.WordWrap
-                text: qsTr("DJI Mic 2 在 Windows 中首先是录音输入设备，不继承 RC003 的 13 键映射。")
+                text: qsTr("DJI Mic 2 是 Windows 录音设备，不使用 RC003 的 13 键映射")
                 color: tokens.textSecondary
                 font.pixelSize: tokens.fontSizeSmall
             }
@@ -1514,7 +1514,7 @@ Item {
             Label {
                 Layout.fillWidth: true
                 wrapMode: Text.WordWrap
-                text: qsTr("当前可自定义映射：0。只有在真实 Windows 捕获到某个实体键的独立输入事件后，才会开放该键的映射选项。")
+                text: qsTr("当前可映射：0 个；检测到独立按键事件后才会开放映射")
                 color: tokens.textSecondary
                 font.pixelSize: tokens.fontSizeSmall
             }

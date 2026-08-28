@@ -912,12 +912,12 @@ def _load_qt_classes() -> dict:
                 bridge_launcher.PendingBridgeLaunch
             ] = None
             if self._bridge_connected:
-                self._launch_status_text = "遥控器服务已启动；RC003 已连接。"
+                self._launch_status_text = "服务运行中；RC003 已连接"
             elif self._bridge_running:
                 self._launch_status_text = (
-                    "遥控器服务已启动；正在等待 RC003 连接。"
+                    "服务运行中；等待 RC003 连接"
                     if runtime_status is not None
-                    else "遥控器服务已启动；RC003 连接状态暂时未知，正在继续检查。"
+                    else "服务运行中；RC003 状态未知，正在检查"
                 )
             self._has_explicit_launch_result = False
             self._status_message = (
@@ -951,9 +951,7 @@ def _load_qt_classes() -> dict:
             self._key_detection_started_at = 0.0
             self._key_detection_tap_usages = set()
             self._key_detection_active = False
-            self._key_detection_text = (
-                "尚未检测真实按键。点击“检测真实按键”后，再按一次遥控器按键。"
-            )
+            self._key_detection_text = "尚未检测；点击“检测真实按键”，再按一次遥控器按键"
             self._rawKeyDetected.connect(self._on_raw_key_detected)
             self._hidTapDetectionStatus.connect(self._on_hid_tap_detection_status)
             self._hotkey_capture = None
@@ -1229,21 +1227,19 @@ def _load_qt_classes() -> dict:
             if running:
                 if connected:
                     self._set_bridge_launch_phase("connected")
-                    self._set_launch_status("遥控器服务已启动；RC003 已连接。")
+                    self._set_launch_status("服务运行中；RC003 已连接")
                 else:
                     self._set_bridge_launch_phase("waiting")
                     if self._has_explicit_launch_result:
                         self._set_launch_status(
-                            "遥控器服务已启动；正在等待 RC003 连接，首次连接可能约一分钟。"
+                            "服务运行中；等待 RC003 连接，首次可能约 1 分钟"
                         )
                     elif runtime_status is None:
                         self._set_launch_status(
-                            "遥控器服务已启动；RC003 连接状态暂时未知，正在继续检查。"
+                            "服务运行中；RC003 状态未知，正在检查"
                         )
                     else:
-                        self._set_launch_status(
-                            "遥控器服务已启动；正在等待 RC003 连接。"
-                        )
+                        self._set_launch_status("服务运行中；等待 RC003 连接")
                 return
 
             previous_phase = self._bridge_launch_phase
@@ -1252,9 +1248,7 @@ def _load_qt_classes() -> dict:
                 and previous_phase in {"waiting", "connected"}
             ):
                 self._set_bridge_launch_phase("failed")
-                self._set_launch_status(
-                    "遥控器服务已经退出；RC003 当前未连接。请查看 app.log 确认原因。"
-                )
+                self._set_launch_status("服务已退出；请查看 app.log")
             elif self._has_explicit_launch_result and previous_phase in {
                 "failed",
                 "unknown",
@@ -1337,7 +1331,7 @@ def _load_qt_classes() -> dict:
                     else "unknown"
                 )
             except Exception:
-                text = "无法读取语音程序状态。"
+                text = "无法读取语音程序状态"
                 code = "unknown"
                 elevation_status = "unknown"
             if elevation_status != self._voice_program_elevation_status:
@@ -1403,15 +1397,14 @@ def _load_qt_classes() -> dict:
                 self.selectButton(button_id)
                 display_name = remote_layout.BUTTON_DISPLAY_NAMES.get(button_id, button_id)
                 usage = remote_layout.hid_usage_display(button_id)
-                result = f"已捕获真实按键：{display_name}（{usage}）。"
+                result = f"已检测：{display_name}（{usage}）"
             else:
-                result = (
-                    "已捕获一个尚未识别的真实按键；请保留当前提示，"
-                    "以便后续补充适配。"
-                )
-            self._set_key_detection_text(
-                f"{result}{details} 现在可设置该行的 Windows 映射并保存。"
-            )
+                result = "检测到未知按键"
+            detail_text = details.strip().rstrip("。")
+            if detail_text:
+                result += f"；{detail_text}"
+            result += "；可设置并保存映射" if button_id else "；请保留提示用于适配"
+            self._set_key_detection_text(result)
 
         def _on_key_detection_hid_report(self, report_id: int, payload: bytes) -> None:
             if report_id != 1 or len(payload) != 6 or not self._key_detection_active:
@@ -1440,28 +1433,18 @@ def _load_qt_classes() -> dict:
             if status == frida_compat.HidTapState.ATTACHED_WAITING_IO.value:
                 if self._key_detection_listener is not None:
                     waiting_text = (
-                        "补充按键通道已连接，正在等待首次按键确认。"
-                        "请现在按一次要检测的遥控器按键；首次有效按键会同时完成"
-                        "通道确认和捕获。Windows 能直接识别的按键也可继续检测。"
+                        "补充按键通道已连接；请按要检测的按键，常规按键也可继续检测"
                     )
                 else:
-                    waiting_text = (
-                        "补充按键通道已连接，正在等待首次按键确认。"
-                        "请现在按一次要检测的遥控器按键；首次有效按键会同时完成"
-                        "通道确认和捕获，不需要先等待“已就绪”。"
-                    )
+                    waiting_text = "补充按键通道已连接；请按要检测的按键"
                 self._set_key_detection_text(waiting_text)
             elif status == frida_compat.HidTapState.READY.value:
                 if self._key_detection_listener is not None:
                     ready_text = (
-                        "两条按键通道均已就绪，13 个已知按键均可检测。"
-                        "请按要检测的遥控器按键；不会执行映射动作。"
+                        "两条按键通道均已就绪；13 个已知按键均可检测，检测时不执行映射"
                     )
                 else:
-                    ready_text = (
-                        "补充按键通道已就绪。请按要检测的遥控器按键；"
-                        "不会执行映射动作。"
-                    )
+                    ready_text = "补充按键通道已就绪；请按要检测的按键，检测时不执行映射"
                 self._set_key_detection_text(ready_text)
             elif status in {
                 frida_compat.HidTapState.FAILED.value,
@@ -1472,10 +1455,7 @@ def _load_qt_classes() -> dict:
                 }.get(detail, "")
                 suffix = f"（{detail_text}）" if detail_text else ""
                 self._set_key_detection_text(
-                    f"补充按键通道暂时不可用{suffix}。目前仍可检测 Windows "
-                    "直接识别的按键，但返回键、音量键等按键可能暂时测不到；"
-                    "通道会自动重新连接。看到“补充按键通道已连接”后请直接按一次"
-                    "要测的按键，不需要先等待“已就绪”。"
+                    f"补充按键通道暂不可用{suffix}；返回键、音量键可能测不到，正在重连"
                 )
 
         def _on_hotkey_capture_result(self, chord: str) -> None:
@@ -2162,16 +2142,16 @@ def _load_qt_classes() -> dict:
                     or self._key_detection_tap is not None
                 ):
                     self._set_key_detection_text(
-                        "上一次真实按键检测仍有资源未能停止，请关闭设置窗口后重试。"
+                        "上次按键检测未能停止；请关闭设置窗口后重试"
                     )
                     return
             if self._selected_device_id() != device_catalog.RC003_ID:
-                self._set_key_detection_text("当前设备不是 RC003，无法检测遥控器按键。")
+                self._set_key_detection_text("当前设备不是 RC003；无法检测遥控器按键")
                 return
             bridge_running = self._refresh_bridge_status()
             if bridge_running is None:
                 self._set_key_detection_text(
-                    "无法安全确认后台桥接状态，请关闭设置窗口和桥接后重试。"
+                    "无法确认后台服务状态；请关闭设置窗口和服务后重试"
                 )
                 return
             if bridge_running:
@@ -2187,8 +2167,7 @@ def _load_qt_classes() -> dict:
                 self._key_detection_active = True
                 self.keyDetectionActiveChanged.emit()
                 self._set_key_detection_text(
-                    "后台桥接正在等待下一次 RC003 按键。请现在按一次遥控器按键；"
-                    "该次按键不会执行映射动作。首次连接时请最多等待约一分钟。"
+                    "后台服务等待按键；请按一次，首次连接可能约 1 分钟，检测时不执行映射"
                 )
                 return
             listener = None
@@ -2267,25 +2246,20 @@ def _load_qt_classes() -> dict:
             self.keyDetectionActiveChanged.emit()
             if listener is not None and tap is not None:
                 detection_text = (
-                    "Windows 按键通道已启动；补充按键通道正在连接。"
-                    "Windows 能直接识别的按键现在即可测试；返回键、音量键等请在"
-                    "看到“补充按键通道已连接”后按一次，不需要等待“已就绪”。"
-                    "首次连接可能需要约一分钟。"
+                    "Windows 按键通道已启动；常规按键可立即检测，"
+                    "返回键、音量键请等待补充通道连接（约 1 分钟）"
                 )
             elif tap is not None:
                 detection_text = (
-                    "补充按键通道正在连接。看到“补充按键通道已连接”后请按一次"
-                    "要检测的遥控器按键，不需要等待“已就绪”；首次连接可能需要"
-                    "约一分钟。"
+                    "补充按键通道连接中；连接后请按要检测的按键（约 1 分钟）"
                 )
             else:
                 detection_text = (
-                    "Windows 按键通道已启动，但补充按键通道未能启动。"
-                    "返回键、音量键等按键可能测不到。"
+                    "只能检测 Windows 可识别按键；返回键、音量键可能测不到"
                 )
-            failure_text = f" 受限来源：{'；'.join(failures)}。" if failures else ""
+            failure_text = f"；受限：{'；'.join(failures)}" if failures else ""
             self._set_key_detection_text(
-                f"{detection_text} 检测时不会执行映射动作。{failure_text}"
+                f"{detection_text}；检测时不执行映射{failure_text}"
             )
 
         @Slot()
@@ -2304,14 +2278,9 @@ def _load_qt_classes() -> dict:
                 ):
                     return
                 if request is not None:
-                    timeout_text = (
-                        "等待后台桥接按键超时。请确认遥控器已连接后重新检测。"
-                    )
+                    timeout_text = "等待后台按键超时；确认遥控器已连接后重试"
                 else:
-                    timeout_text = (
-                        "等待真实按键超时。请确认遥控器已连接后重新检测；补充按键"
-                        "通道连接后，第一次有效按键会同时完成确认和捕获。"
-                    )
+                    timeout_text = "等待按键超时；确认遥控器已连接后重试"
                 self._set_key_detection_text(timeout_text)
                 return
             if request is None:
@@ -2806,9 +2775,7 @@ def _load_qt_classes() -> dict:
                 self._diagnostics_error_message = ""
             else:
                 self._check_rows = []
-                self._diagnostics_error_message = (
-                    "检测过程出现意外错误，未能得到任何结果；请点击「重新检测」重试。"
-                )
+                self._diagnostics_error_message = "检测失败；请重新检测"
             self._is_refreshing = False
             self.checkResultsChanged.emit()
             self.diagnosticsErrorMessageChanged.emit()
@@ -2819,7 +2786,7 @@ def _load_qt_classes() -> dict:
                 self._set_vb_cable_bridge_recovery_needed(False)
                 self._set_vb_cable_test_state(
                     "fail",
-                    "VB-CABLE 通道测试出现意外错误，未得到可信结果。",
+                    "通道测试失败；未得到可信结果",
                     running=False,
                 )
                 return
@@ -2848,12 +2815,12 @@ def _load_qt_classes() -> dict:
                     recovery_text = (
                         settings_ui.describe_launch_result(restart_result)
                         if restart_result is not None
-                        else "没有得到启动结果。"
+                        else "未得到启动结果"
                     )
                     loopback_text = (
                         loopback_result.detail
                         if loopback_result is not None
-                        else "声音通道测试没有得到可信结果。"
+                        else "声音通道测试未得到可信结果"
                     )
                     self._set_vb_cable_test_state(
                         "fail",
@@ -2866,16 +2833,16 @@ def _load_qt_classes() -> dict:
                 if loopback_result is None:
                     self._set_vb_cable_test_state(
                         "fail",
-                        "声音通道测试出现意外错误，未得到可信结果。"
+                        "声音通道测试失败；未得到可信结果"
                         + (
-                            " 遥控器服务已自动恢复。"
+                            "；服务已自动恢复"
                             if result.bridge_was_running else ""
                         ),
                         running=False,
                     )
                 else:
                     suffix = (
-                        " 遥控器服务已自动恢复。"
+                        "；服务已自动恢复"
                         if result.bridge_was_running else ""
                     )
                     self._set_vb_cable_test_state(
@@ -3067,7 +3034,7 @@ def _load_qt_classes() -> dict:
             if self._settings_controller._get_bridge_launch_busy():
                 self._set_vb_cable_test_state(
                     "fail",
-                    "桥接正在启动；请等待启动结束并停止桥接后，再测试 VB-CABLE 通道。",
+                    "服务正在启动；停止后再测试声音通道",
                     running=False,
                 )
                 return
@@ -3075,7 +3042,7 @@ def _load_qt_classes() -> dict:
             if bridge_running is None:
                 self._set_vb_cable_test_state(
                     "unsupported",
-                    "当前无法确认桥接是否正在运行；为避免混入真实语音，本次未启动测试。",
+                    "无法确认服务状态；为避免混入真实语音，未启动测试",
                     running=False,
                 )
                 return
@@ -3083,7 +3050,7 @@ def _load_qt_classes() -> dict:
                 if not allow_bridge_restart:
                     self._set_vb_cable_test_state(
                         "fail",
-                        "遥控器服务正在运行；确认临时停止并自动恢复后才能测试声音通道。",
+                        "服务正在运行；需先确认临时停止并自动恢复",
                         running=False,
                     )
                     return
@@ -3094,9 +3061,9 @@ def _load_qt_classes() -> dict:
             self._set_vb_cable_test_state(
                 "running",
                 (
-                    "正在临时停止遥控器服务；随后测试声音通道并自动恢复。"
+                    "正在停止服务；随后测试并自动恢复"
                     if bridge_running
-                    else "正在发送短测试信号，并检查 CABLE Output 是否收到。"
+                    else "正在发送测试信号；检查 CABLE Output"
                 ),
                 running=True,
             )
@@ -3111,7 +3078,7 @@ def _load_qt_classes() -> dict:
                         stop_result = bridge_control_windows.request_bridge_exit()
                         if not stop_result.stopped:
                             stop_error = stop_result.error or (
-                                "未能临时停止遥控器服务，本次未开始声音通道测试。"
+                                "未能临时停止服务；未运行声音通道测试"
                             )
                         else:
                             bridge_stopped = True
@@ -3194,24 +3161,23 @@ def _load_qt_classes() -> dict:
             try:
                 endpoints = audio_output.enumerate_output_endpoints()
             except audio_output.AudioOutputUnavailableError as exc:
-                self._set_driver_error(f"无法枚举播放端点：{exc}")
+                self._set_driver_error(f"无法检测播放端点：{exc}")
                 return False
             except Exception:  # noqa: BLE001 - never let an unexpected enumeration failure escape this Slot
-                self._set_driver_error("枚举播放端点时出现意外错误。")
+                self._set_driver_error("播放端点检测失败")
                 return False
 
             matches = [e for e in endpoints if audio_output.is_cable_input_endpoint(e.name)]
             if not matches:
                 self._set_driver_error(
-                    "未检测到 CABLE Input 端点；请先确认 VB-CABLE 已安装，安装后需要重启电脑。"
+                    "未找到 CABLE Input；请安装 VB-CABLE 并重启电脑"
                 )
                 return False
             try:
                 endpoint = audio_output.select_preferred_output_endpoint(matches)
             except audio_output.AudioOutputUnavailableError:
                 self._set_driver_error(
-                    f"检测到 {len(matches)} 个 CABLE Input 端点，无法唯一确定，请手动在"
-                    "「连接」页选择。"
+                    f"找到 {len(matches)} 个 CABLE Input；请在语音页的“输出端点”中选择"
                 )
                 return False
             try:
@@ -3226,12 +3192,12 @@ def _load_qt_classes() -> dict:
 
             if not persisted:
                 self._set_driver_error(
-                    "保存语音输出设置失败，请重试，或稍后在「连接」页手动选择该端点。"
+                    "输出端点保存失败；请在语音页重新选择并应用"
                 )
                 return False
 
             self._set_vb_cable_test_state("idle", "", running=False)
-            self._set_driver_status(f"已选择 {endpoint.name} 作为语音输出设备并保存。")
+            self._set_driver_status(f"已保存输出端点：{endpoint.name}")
             return True
 
         @Slot()
@@ -3261,8 +3227,7 @@ def _load_qt_classes() -> dict:
                 # install - that is only ever established later, by a
                 # diagnostics recheck finding both endpoints present.
                 self._set_driver_info(
-                    "已启动 VB-CABLE 官方安装程序（会请求管理员权限）。请按提示完成安装并"
-                    "重启电脑，然后点击「重新检测」确认两个虚拟音频端点已出现。"
+                    "已启动 VB-CABLE 安装程序；完成安装并重启电脑后，请重新检查"
                 )
 
     _qt_classes_cache = {

@@ -340,7 +340,7 @@ class VoiceProgramQmlTests(unittest.TestCase):
         self.assertTrue(data["windows_dictation"]["speech_settings_visible"])
         self.assertEqual(
             data["windows_dictation"]["launch_text"],
-            "由 Windows 提供听写和联机语音识别",
+            "使用 Windows 听写与联机语音识别",
         )
         self.assertTrue(data["custom_program"]["path_visible"])
         self.assertTrue(data["custom_program"]["elevated_visible"])

@@ -81,7 +81,7 @@ Item {
     function checkDetail(checkId, fallback) {
         const row = checkResult(checkId)
         return row && String(row.detail).length > 0
-            ? String(row.detail) : fallback
+            ? String(row.detail).trim().replace(/[。；;]+$/, "") : fallback
     }
 
     function voiceProgramStatusSummary() {
@@ -122,9 +122,9 @@ Item {
     function voiceProgramLaunchDescription() {
         const code = SettingsController.voiceProgramStatusCode
         if (!voiceProgramManaged)
-            return qsTr("只发送语音按键，不启动外部程序")
+            return qsTr("只发送语音快捷键，不启动程序")
         if (windowsDictationSelected)
-            return qsTr("由 Windows 提供听写和联机语音识别")
+            return qsTr("使用 Windows 听写与联机语音识别")
         if (voiceProgramNeedsAttention
                 || code === "not_found"
                 || code === "stopped") {
@@ -392,7 +392,7 @@ Item {
                     titleText: qsTr("虚拟音频")
                     descriptionText: root.checkDetail(
                         "vb_cable_endpoints",
-                        qsTr("把遥控器声音送给语音程序")
+                        qsTr("将遥控器声音送入语音程序")
                     )
                     stateText: root.checkState("vb_cable_endpoints")
                     stateColor: root.checkColor("vb_cable_endpoints")
@@ -450,7 +450,7 @@ Item {
                     stateColumnWidth: root.settingsStateColumnWidth
                     actionColumnWidth: root.settingsActionColumnWidth
                     titleText: qsTr("目标应用")
-                    descriptionText: qsTr("麦克风输入请选择 CABLE Output")
+                    descriptionText: qsTr("将麦克风输入设为 CABLE Output")
                     stateText: root.checkState("dictation")
                     stateColor: root.checkColor("dictation")
                     showDivider: false
@@ -573,8 +573,8 @@ Item {
                     descriptionText: root.voiceHotkeyCaptureError.length > 0
                         ? root.voiceHotkeyCaptureError
                         : root.windowsDictationSelected
-                            ? qsTr("Windows 语音输入建议使用 Win+H")
-                            : qsTr("需要与语音程序的唤起键一致")
+                            ? qsTr("Windows 语音输入使用 Win+H")
+                            : qsTr("需与语音程序快捷键一致")
 
                     editorData: [
                         CompactTextField {
@@ -649,7 +649,7 @@ Item {
                     titleText: qsTr("声音通道")
                     descriptionText: DiagnosticsController.vbCableTestMessage.length > 0
                         ? DiagnosticsController.vbCableTestMessage
-                        : qsTr("确认 CABLE Input 能到达 CABLE Output")
+                        : qsTr("测试 CABLE Input → CABLE Output")
                     stateText: DiagnosticsController.vbCableTestRunning
                         ? qsTr("测试中")
                         : DiagnosticsController.vbCableTestStatus === "pass"
@@ -696,7 +696,7 @@ Item {
                     stateColumnWidth: root.settingsStateColumnWidth
                     actionColumnWidth: root.settingsActionColumnWidth
                     titleText: qsTr("实际说话")
-                    descriptionText: qsTr("打开输入框，由所选语音程序直接输入文字")
+                    descriptionText: qsTr("在输入框中验证语音文字")
                     stateText: qsTr("待实测")
                     stateColor: tokens.voiceAccent
                     showDivider: false

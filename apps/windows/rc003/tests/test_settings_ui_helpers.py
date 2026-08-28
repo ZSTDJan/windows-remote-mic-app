@@ -672,13 +672,13 @@ class DescribeLaunchResultTests(unittest.TestCase):
 
     def test_not_started_text_is_a_fixed_constant_shown_before_any_launch(self):
         self.assertIn("未运行", LAUNCH_NOT_STARTED_TEXT)
-        self.assertIn("话筒键", LAUNCH_NOT_STARTED_TEXT)
+        self.assertIn("按键和语音", LAUNCH_NOT_STARTED_TEXT)
 
     def test_existing_and_unknown_bridge_states_are_described_honestly(self):
-        self.assertIn("已经在运行", LAUNCH_ALREADY_RUNNING_TEXT)
+        self.assertIn("已在运行", LAUNCH_ALREADY_RUNNING_TEXT)
         self.assertNotIn("已连接", LAUNCH_ALREADY_RUNNING_TEXT)
         self.assertIn("无法确认", LAUNCH_STATUS_UNKNOWN_TEXT)
-        self.assertIn("不要连续重复启动", LAUNCH_STATUS_UNKNOWN_TEXT)
+        self.assertIn("勿重复启动", LAUNCH_STATUS_UNKNOWN_TEXT)
 
     def test_started_never_claims_rc003_is_connected(self):
         result = bridge_launcher.LaunchResult(
@@ -688,7 +688,7 @@ class DescribeLaunchResultTests(unittest.TestCase):
         )
         text = describe_launch_result(result)
         self.assertIn("123", text)
-        self.assertIn("约一分钟", text)
+        self.assertIn("约 1 分钟", text)
         self.assertNotIn("RC003 已连接", text)
         self.assertNotIn("已连接", text)
 
@@ -717,7 +717,7 @@ class DescribeLaunchResultTests(unittest.TestCase):
         )
         text = describe_launch_result(result)
         self.assertIn("9", text)
-        self.assertIn("日志", text)
+        self.assertIn("app.log", text)
 
     def test_status_unknown_warns_against_restarting_the_created_process(self):
         result = bridge_launcher.LaunchResult(
@@ -728,7 +728,7 @@ class DescribeLaunchResultTests(unittest.TestCase):
         )
         text = describe_launch_result(result)
         self.assertIn("456", text)
-        self.assertIn("不要重复启动", text)
+        self.assertIn("勿重复启动", text)
         self.assertIn("app.log", text)
 
     def test_launch_failed_surfaces_the_error_and_points_at_the_log(self):
@@ -739,7 +739,7 @@ class DescribeLaunchResultTests(unittest.TestCase):
         )
         text = describe_launch_result(result)
         self.assertIn("WinError 2", text)
-        self.assertIn("日志", text)
+        self.assertIn("app.log", text)
 
 
 class DescribeLogOpenResultTests(unittest.TestCase):
