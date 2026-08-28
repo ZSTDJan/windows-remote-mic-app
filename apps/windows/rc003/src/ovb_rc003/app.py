@@ -215,6 +215,8 @@ class RC003App:
         self._voice_mic_gesture_audio_stopped = False
         self._voice_mic_gesture_physical_seen = False
         self._voice_mic_gesture_direct_hid_released = False
+        self._voice_mic_gesture_started_without_direct_hid = False
+        self._voice_mic_gesture_direct_hid_seen = False
         self._voice_mic_gesture_sources_down: set[str] = set()
         self._ordinary_mic_lock = threading.Lock()
         self._ordinary_mic_sources_down: set[str] = set()
@@ -872,12 +874,20 @@ class RC003App:
             if physical_down:
                 self._voice_mic_gesture_physical_seen = True
                 self._voice_mic_gesture_sources_down.add(source)
+                if source == "hid_tap":
+                    self._voice_mic_gesture_direct_hid_seen = True
             return False
         self._voice_mic_gesture_active = True
         self._voice_mic_gesture_audio_started = source == "audio_started"
         self._voice_mic_gesture_audio_stopped = False
         self._voice_mic_gesture_physical_seen = physical_down
         self._voice_mic_gesture_direct_hid_released = False
+        self._voice_mic_gesture_started_without_direct_hid = (
+            not self._direct_hid_tap_active
+        )
+        self._voice_mic_gesture_direct_hid_seen = (
+            physical_down and source == "hid_tap"
+        )
         self._voice_mic_gesture_sources_down = {source} if physical_down else set()
         return True
 
@@ -889,16 +899,26 @@ class RC003App:
         self._voice_mic_gesture_audio_stopped = False
         self._voice_mic_gesture_physical_seen = False
         self._voice_mic_gesture_direct_hid_released = False
+        self._voice_mic_gesture_started_without_direct_hid = False
+        self._voice_mic_gesture_direct_hid_seen = False
         self._voice_mic_gesture_sources_down.clear()
 
     def _rollover_completed_voice_mic_gesture_locked(self, next_source: str) -> bool:
-        """Detach late duplicate sources after direct HID already ended a session."""
+        """Detach stale sources once direct HID proves a new press can proceed."""
 
+        startup_hid_handoff = (
+            next_source == "hid_tap"
+            and self._voice_mic_gesture_started_without_direct_hid
+            and not self._voice_mic_gesture_direct_hid_seen
+        )
         if not (
             self._voice_mic_gesture_active
             and self._voice_mic_gesture_audio_stopped
-            and self._voice_mic_gesture_direct_hid_released
             and not self._voice.active
+            and (
+                self._voice_mic_gesture_direct_hid_released
+                or startup_hid_handoff
+            )
         ):
             return False
         stale_sources = sorted(self._voice_mic_gesture_sources_down)

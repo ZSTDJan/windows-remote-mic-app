@@ -2066,6 +2066,7 @@ class VoiceMappingProductBoundaryTests(_AppWiringTestCase):
             "+".join(voice_tokens)
         )
         self.app._refresh_legacy_voice_transform_snapshot_locked()
+        self.app._direct_hid_tap_active = True
         calls = []
         with mock.patch.object(
             self.app,
@@ -2088,6 +2089,7 @@ class VoiceMappingProductBoundaryTests(_AppWiringTestCase):
             self.app._on_control_event(AudioStarted(session_id=1))
             self.app._on_control_event(AudioStopped())
             self.app._on_control_event(AudioStarted(session_id=2))
+            self.app._on_button_event("mic", True, event_source="hid_tap")
 
         self.assertEqual(
             calls,
@@ -2099,6 +2101,67 @@ class VoiceMappingProductBoundaryTests(_AppWiringTestCase):
         self.assertFalse(self.app._voice.active)
         self.assertFalse(self.app._voice_pcm_forwarding_enabled)
         self.assertTrue(self.app._voice_mic_gesture_audio_stopped)
+
+    def test_first_direct_hid_press_retires_stopped_startup_gesture(self):
+        voice_tokens = ("lctrl", "lalt", "f8")
+        self.app._voice_hotkey = app_module.hotkey.HotkeySpec.parse(
+            "+".join(voice_tokens)
+        )
+        self.app._refresh_legacy_voice_transform_snapshot_locked()
+        self.app._direct_hid_tap_active = False
+        mic_usage = next(
+            usage
+            for usage, button_id in app_module.frida_compat.TAP_USAGE_TO_BUTTON.items()
+            if button_id == "mic"
+        )
+        mic_report = mic_usage.to_bytes(2, "little") + b"\x00\x00\x00\x00"
+        calls = []
+        with mock.patch.object(
+            self.app,
+            "_voice_hotkey_text_for_mode",
+            return_value="+".join(voice_tokens),
+        ), mock.patch.object(
+            self.app,
+            "_open_playback_for_new_session",
+            return_value=True,
+        ), mock.patch.object(
+            win32_input,
+            "send_voice_key_combo_down",
+            side_effect=lambda tokens: calls.append(("down", tokens)),
+        ), mock.patch.object(
+            win32_input,
+            "send_voice_key_combo_up",
+            side_effect=lambda tokens: calls.append(("up", tokens)),
+        ):
+            self.app._on_control_event(AudioStarted(session_id=1))
+            self.app._on_button_event("mic", True, event_source="legacy_f5")
+            self.app._on_control_event(AudioStopped())
+            self.app._on_button_event("mic", True, event_source="hid")
+
+            self.assertTrue(self.app._voice_mic_gesture_audio_stopped)
+            self.assertEqual(
+                self.app._voice_mic_gesture_sources_down,
+                {"hid", "legacy_f5"},
+            )
+
+            self.app._on_control_event(AudioStarted(session_id=2))
+            self.app._on_direct_hid_report(1, mic_report)
+
+        self.assertEqual(
+            calls,
+            [
+                ("down", voice_tokens),
+                ("up", voice_tokens),
+                ("down", voice_tokens),
+            ],
+        )
+        self.assertTrue(self.app._voice.active)
+        self.assertTrue(self.app._voice_audio_stream_active)
+        self.assertTrue(self.app._voice_pcm_forwarding_enabled)
+        self.assertEqual(
+            self.app._voice_mic_gesture_sources_down,
+            {"hid_tap"},
+        )
 
     def test_next_direct_hid_press_is_not_blocked_by_late_f5(self):
         voice_tokens = ("lctrl", "lalt", "f8")
