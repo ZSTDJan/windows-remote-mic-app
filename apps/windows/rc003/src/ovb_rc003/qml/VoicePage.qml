@@ -458,12 +458,9 @@ Item {
                 InlineSettingsRow {
                     objectName: "microphonePrivacyRow"
                     tokens: root.tokens
-                    stateColumnWidth: root.settingsStateColumnWidth
                     actionColumnWidth: root.settingsActionColumnWidth
                     titleText: qsTr("麦克风权限")
                     descriptionText: qsTr("确认桌面语音软件可以访问麦克风")
-                    stateText: qsTr("待确认")
-                    stateColor: tokens.voiceAccent
                     showDivider: false
 
                     CompactButton {
@@ -498,7 +495,9 @@ Item {
                     actionColumnWidth: root.settingsActionColumnWidth
                     titleText: qsTr("选择程序")
                     descriptionText: ""
-                    stateText: root.voiceProgramManaged ? qsTr("已选择") : qsTr("不管理")
+                    stateText: SettingsController.voiceProgramSettingsDirty
+                        ? qsTr("待保存")
+                        : root.voiceProgramManaged ? qsTr("已保存") : qsTr("不管理")
                     stateColor: root.voiceProgramStateColor
 
                     editorData: [
@@ -576,7 +575,11 @@ Item {
                         ? root.voiceHotkeyCaptureError
                         : root.windowsDictationSelected
                             ? qsTr("Windows 语音输入使用 Win+H")
-                            : qsTr("需与语音程序快捷键一致")
+                            : qsTr("录入后自动保存，需与语音程序快捷键一致")
+                    stateText: root.voiceHotkeyRecording
+                        ? qsTr("录入中") : qsTr("已保存")
+                    stateColor: root.voiceHotkeyRecording
+                        ? tokens.voiceAccent : tokens.successColor
 
                     editorData: [
                         CompactTextField {

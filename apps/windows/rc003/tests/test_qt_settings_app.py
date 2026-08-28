@@ -3087,6 +3087,15 @@ engine.load(QUrl.fromLocalFile(str(qml_dir / "main.qml")))
 print("STAGE:loaded", file=sys.stderr, flush=True)
 
 root_objects = engine.rootObjects()
+voice_scroll = (
+    root_objects[0].findChild(QObject, "voiceScroll") if root_objects else None
+)
+voice_page = voice_scroll.parent() if voice_scroll is not None else None
+if voice_page is not None:
+    voice_page.setProperty("voiceHotkeyRecording", True)
+    controller.hotkeyCaptured.emit("ctrl+shift+f8")
+    app.processEvents()
+saved_config = m.config.load_config(m.config.config_path(m.config.config_root()))
 result = {
     "root_count": len(root_objects),
     "warnings": [w.toString() for w in warnings],
@@ -3096,6 +3105,12 @@ result = {
         root_objects
         and root_objects[0].findChild(QObject, "voiceReleaseFinishTapSwitch")
     ),
+    "voice_hotkey_recording": (
+        voice_page.property("voiceHotkeyRecording")
+        if voice_page is not None else None
+    ),
+    "saved_voice_hotkey": saved_config.get("voice_hotkeys", {}).get("hold"),
+    "voice_save_status": controller.statusMessage,
 }
 
 # XRBM-035: the real fast-close gate this probe exists to be - calls the
@@ -4299,7 +4314,9 @@ class SettingsShellSourceContractTests(unittest.TestCase):
             self.assertIn(f'objectName: "{object_name}"', self.voice_qml)
         self.assertNotIn('objectName: "openSoundInputSettingsButton"', self.voice_qml)
         self.assertIn('titleText: qsTr("麦克风权限")', self.voice_qml)
-        self.assertIn('stateText: qsTr("待确认")', self.voice_qml)
+        self.assertNotIn('stateText: qsTr("待确认")', self.voice_qml)
+        self.assertIn('qsTr("录入后自动保存，需与语音程序快捷键一致")', self.voice_qml)
+        self.assertIn('? qsTr("录入中") : qsTr("已保存")', self.voice_qml)
         for misleading_claim in (
             "已授权",
             "Remote Mic 需要管理员权限",
@@ -4635,6 +4652,9 @@ class OffscreenQmlLoadTests(unittest.TestCase):
         self.assertEqual(data["width"], 720)
         self.assertEqual(data["height"], 500)
         self.assertFalse(data["retired_finish_tap_control_exists"])
+        self.assertFalse(data["voice_hotkey_recording"])
+        self.assertEqual(data["saved_voice_hotkey"], "ctrl+shift+f8")
+        self.assertIn("自动保存", data["voice_save_status"])
 
     def test_rc003_only_three_page_shell_is_rendered(self):
         import json
@@ -4784,9 +4804,15 @@ class OffscreenQmlLoadTests(unittest.TestCase):
 
                 voice_columns = data["voice_columns"]
                 action_columns = list(voice_columns["actions"].values())
-                state_columns = list(voice_columns["states"].values())
+                privacy_state = voice_columns["states"]["microphonePrivacyRow"]
+                state_columns = [
+                    column
+                    for name, column in voice_columns["states"].items()
+                    if name != "microphonePrivacyRow"
+                ]
                 reference_action = action_columns[0]
                 reference_state = state_columns[0]
+                self.assertFalse(privacy_state["visible"])
                 for column in action_columns:
                     self.assertTrue(column["visible"])
                     self.assertAlmostEqual(column["x"], reference_action["x"], delta=1)
