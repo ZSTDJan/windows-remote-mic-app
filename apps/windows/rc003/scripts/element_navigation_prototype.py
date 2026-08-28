@@ -102,6 +102,8 @@ HORIZONTAL_LANE_SIZE_MULTIPLIER = 0.75
 VERTICAL_LANE_MIN_CENTER_TOLERANCE = 16.0
 VERTICAL_LANE_MAX_CENTER_TOLERANCE = 96.0
 VERTICAL_LANE_SIZE_MULTIPLIER = 0.35
+VERTICAL_MAJOR_AXIS_WEIGHT = 13.0
+VERTICAL_SOFT_ESCAPE_FAR_EDGE_MULTIPLIER = 2.0
 GRID_SAFE_CELL_MAX_CHILDREN = 24
 VK_RETURN = 0x0D
 VK_ESCAPE = 0x1B
@@ -1546,6 +1548,97 @@ def _direction_rank_key(
     )
 
 
+def _vertical_far_edge_distance(
+    current: Rect,
+    candidate: Rect,
+    direction: Direction,
+) -> float:
+    if direction == Direction.UP:
+        return float(max(1, current.top - candidate.top))
+    return float(max(1, candidate.bottom - current.bottom))
+
+
+def _vertical_weighted_distance(
+    score: tuple[int, float, float, float, float, int, int],
+) -> float:
+    major_distance = max(1.0, score[1])
+    return (
+        VERTICAL_MAJOR_AXIS_WEIGHT * major_distance * major_distance
+        + score[4] * score[4]
+    )
+
+
+def _vertical_lane_keeps_priority(
+    current: Rect,
+    beam_score: tuple[int, float, float, float, float, int, int],
+    diagonal: Rect,
+    direction: Direction,
+) -> bool:
+    protected_distance = (
+        _vertical_far_edge_distance(current, diagonal, direction)
+        * VERTICAL_SOFT_ESCAPE_FAR_EDGE_MULTIPLIER
+        + current.height
+    )
+    return beam_score[1] <= protected_distance
+
+
+def _vertical_soft_escape_index(
+    targets: Sequence[TargetSnapshot],
+    current_index: int,
+    directional: Sequence[int],
+    direction: Direction,
+    grid_rects: Sequence[Rect],
+) -> Optional[int]:
+    if not directional:
+        return None
+    current = grid_rects[current_index]
+    incumbent_index = directional[0]
+    incumbent = grid_rects[incumbent_index]
+    incumbent_score = direction_score(current, incumbent, direction)
+    if incumbent_score is None or incumbent_score[0] != 0:
+        return None
+    incumbent_weighted_distance = _vertical_weighted_distance(incumbent_score)
+
+    current_path = targets[current_index].path
+    eligible: list[tuple[float, int, int]] = []
+    for natural_rank, candidate_index in enumerate(directional[1:], 1):
+        candidate = grid_rects[candidate_index]
+        candidate_score = direction_score(current, candidate, direction)
+        if candidate_score is None or candidate_score[0] == 0:
+            continue
+        candidate_path = targets[candidate_index].path
+        candidate_is_related_child = bool(
+            current_path
+            and candidate_path
+            and (
+                _path_is_descendant(candidate_path, current_path)
+                or _path_is_descendant(current_path, candidate_path)
+            )
+        )
+        candidate_weighted_distance = _vertical_weighted_distance(candidate_score)
+        if (
+            candidate_is_related_child
+            or _vertical_lane_keeps_priority(
+                current,
+                incumbent_score,
+                candidate,
+                direction,
+            )
+            or candidate_weighted_distance >= incumbent_weighted_distance
+        ):
+            continue
+        eligible.append(
+            (
+                candidate_weighted_distance,
+                natural_rank,
+                candidate_index,
+            )
+        )
+    if not eligible:
+        return None
+    return min(eligible)[2]
+
+
 def ranked_target_indices(
     targets: Sequence[TargetSnapshot],
     current_index: int,
@@ -1588,7 +1681,22 @@ def ranked_target_indices(
         )
 
     scored.sort(key=rank_key)
-    return [index for _score, _prefix, index in scored]
+    directional = [index for _score, _prefix, index in scored]
+    if direction not in {Direction.UP, Direction.DOWN} or len(directional) < 2:
+        return directional
+
+    escape_index = _vertical_soft_escape_index(
+        targets,
+        current_index,
+        directional,
+        direction,
+        grid_rects,
+    )
+    if escape_index is None:
+        return directional
+    return [escape_index] + [
+        index for index in directional if index != escape_index
+    ]
 
 
 def best_grid_target_index(

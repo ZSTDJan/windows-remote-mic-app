@@ -118,6 +118,69 @@ class SpatialNavigationTests(unittest.TestCase):
             [2, 1],
         )
 
+    def test_vertical_soft_lane_reaches_nearby_offset_actions_before_far_column(self):
+        targets = [
+            self.target(440, 1460, 540, 1510, "1"),
+            self.target(480, 10, 530, 60, "2"),
+            self.target(1360, 1219, 1428, 1287, "继续"),
+            self.target(1360, 1149, 1428, 1217, "然后"),
+            self.target(1360, 1079, 1428, 1147, "概述"),
+        ]
+        graph = prototype.NavigationGraph(targets)
+
+        self.assertEqual(graph.candidates(0, prototype.Direction.UP)[0], 2)
+        self.assertEqual(graph.candidates(2, prototype.Direction.UP)[0], 3)
+        self.assertEqual(graph.candidates(3, prototype.Direction.UP)[0], 4)
+        self.assertEqual(graph.candidates(4, prototype.Direction.UP)[0], 1)
+
+    def test_vertical_soft_lane_keeps_a_nearby_same_column_target(self):
+        targets = [
+            self.target(0, 500, 40, 540, "current"),
+            self.target(0, 350, 40, 390, "same column"),
+            self.target(200, 450, 240, 490, "near diagonal"),
+        ]
+
+        self.assertEqual(
+            prototype.next_target_index(targets, 0, prototype.Direction.UP),
+            1,
+        )
+
+    def test_vertical_soft_lane_rejects_an_extremely_distant_side_target(self):
+        targets = [
+            self.target(0, 1000, 40, 1040, "current"),
+            self.target(0, 0, 40, 40, "far same column"),
+            self.target(4000, 800, 4040, 840, "extreme side target"),
+        ]
+
+        self.assertEqual(
+            prototype.next_target_index(targets, 0, prototype.Direction.UP),
+            1,
+        )
+
+    def test_vertical_soft_lane_does_not_intercept_parent_child_actions(self):
+        targets = [
+            self.target(0, 500, 40, 540, "current", path=(0, 1)),
+            self.target(0, 0, 40, 40, "far same column", path=(0, 2)),
+            self.target(200, 450, 240, 490, "child", path=(0, 1, 0)),
+        ]
+
+        self.assertEqual(
+            prototype.next_target_index(targets, 0, prototype.Direction.UP),
+            1,
+        )
+
+    def test_vertical_soft_lane_is_symmetric_when_moving_down(self):
+        targets = [
+            self.target(440, 10, 540, 60, "top"),
+            self.target(480, 1460, 530, 1510, "far same column"),
+            self.target(1360, 233, 1428, 301, "near action"),
+        ]
+
+        self.assertEqual(
+            prototype.next_target_index(targets, 0, prototype.Direction.DOWN),
+            2,
+        )
+
     def test_horizontal_route_uses_an_intermediate_cell_only_in_the_same_row(self):
         targets = [
             self.target(100, 100, 160, 140, "current"),
