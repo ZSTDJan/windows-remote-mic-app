@@ -165,6 +165,195 @@ class SpatialNavigationTests(unittest.TestCase):
             2,
         )
 
+    def test_specific_child_beats_a_broad_action_parent(self):
+        targets = [
+            self.target(20, 100, 80, 140, "current", path=(0, 0)),
+            self.target(
+                120,
+                60,
+                420,
+                220,
+                "broad action",
+                path=(0, 1),
+                has_action_pattern=True,
+            ),
+            self.target(
+                150,
+                100,
+                190,
+                140,
+                "specific button",
+                path=(0, 1, 0),
+                has_action_pattern=True,
+            ),
+        ]
+        self.assertTrue(prototype.target_has_finer_descendant(targets, 1))
+        self.assertFalse(prototype.target_has_finer_descendant(targets, 2))
+        self.assertEqual(
+            prototype.next_target_index(targets, 0, prototype.Direction.RIGHT),
+            2,
+        )
+
+    def test_broad_target_keeps_priority_over_an_off_lane_child(self):
+        targets = [
+            self.target(20, 100, 80, 140, "current", path=(0, 0)),
+            self.target(
+                120,
+                90,
+                420,
+                240,
+                "broad action",
+                path=(0, 1),
+                has_action_pattern=True,
+            ),
+            self.target(
+                150,
+                190,
+                190,
+                230,
+                "off lane child",
+                path=(0, 1, 0),
+                has_action_pattern=True,
+            ),
+        ]
+        self.assertEqual(
+            prototype.next_target_index(targets, 0, prototype.Direction.RIGHT),
+            1,
+        )
+
+    def test_broad_target_keeps_priority_over_a_far_child_in_the_same_lane(self):
+        targets = [
+            self.target(0, 100, 40, 140, "current", path=(0, 0)),
+            self.target(
+                60,
+                80,
+                1000,
+                180,
+                "near broad action",
+                path=(0, 1),
+                has_action_pattern=True,
+            ),
+            self.target(
+                900,
+                100,
+                940,
+                140,
+                "far child action",
+                path=(0, 1, 0),
+                has_action_pattern=True,
+            ),
+        ]
+        self.assertEqual(
+            prototype.ranked_target_indices(
+                targets, 0, prototype.Direction.RIGHT
+            )[:2],
+            [1, 2],
+        )
+
+    def test_broad_target_keeps_priority_over_a_far_perpendicular_child(self):
+        targets = [
+            self.target(0, 0, 40, 1000, "current", path=(0, 0)),
+            self.target(
+                60,
+                0,
+                500,
+                1000,
+                "near broad action",
+                path=(0, 1),
+                has_action_pattern=True,
+            ),
+            self.target(
+                80,
+                900,
+                120,
+                940,
+                "far lower child",
+                path=(0, 1, 0),
+                has_action_pattern=True,
+            ),
+        ]
+        self.assertEqual(
+            prototype.ranked_target_indices(
+                targets, 0, prototype.Direction.RIGHT
+            )[:2],
+            [1, 2],
+        )
+
+    def test_visual_coverage_defers_a_broad_parent_until_its_child(self):
+        targets = [
+            self.target(500, 0, 560, 40, "current", path=(0, 0)),
+            self.target(
+                100,
+                100,
+                400,
+                260,
+                "broad action",
+                path=(0, 1),
+                has_action_pattern=True,
+            ),
+            self.target(
+                140,
+                140,
+                180,
+                180,
+                "specific button",
+                path=(0, 1, 0),
+                has_action_pattern=True,
+            ),
+        ]
+        self.assertEqual(
+            prototype.visual_traversal_indices(
+                targets, 0, prototype.Direction.RIGHT
+            )[:2],
+            [2, 1],
+        )
+
+    def test_visual_coverage_finishes_remaining_children_before_broad_parent(self):
+        targets = [
+            self.target(
+                100,
+                100,
+                400,
+                260,
+                "broad action",
+                path=(0, 1),
+                has_action_pattern=True,
+            ),
+            self.target(
+                120,
+                140,
+                160,
+                180,
+                "child 1",
+                path=(0, 1, 0),
+                has_action_pattern=True,
+            ),
+            self.target(
+                180,
+                140,
+                220,
+                180,
+                "child 2",
+                path=(0, 1, 1),
+                has_action_pattern=True,
+            ),
+            self.target(
+                240,
+                140,
+                280,
+                180,
+                "child 3",
+                path=(0, 1, 2),
+                has_action_pattern=True,
+            ),
+        ]
+        self.assertEqual(
+            prototype.visual_traversal_indices(
+                targets, 2, prototype.Direction.RIGHT
+            ),
+            [3, 1, 0],
+        )
+
     def test_horizontal_wrap_does_not_cross_a_distant_blank_region(self):
         targets = [
             self.target(900, 100, 960, 140, "current", path=(0, 2, 0)),
@@ -825,6 +1014,68 @@ class SpatialNavigationTests(unittest.TestCase):
             graph.candidates(1, prototype.Direction.LEFT)[0], 0
         )
 
+    def test_navigation_graph_is_independent_of_query_order(self):
+        targets = [
+            self.target(100, 100, 300, 300, "parent"),
+            self.target(120, 200, 180, 240, "child"),
+        ]
+        child_first = prototype.NavigationGraph(targets)
+        self.assertEqual(
+            child_first.candidates(1, prototype.Direction.UP), (0,)
+        )
+        self.assertEqual(
+            child_first.candidates(0, prototype.Direction.DOWN)[0], 1
+        )
+        self.assertEqual(
+            child_first.candidates(1, prototype.Direction.UP), (0,)
+        )
+
+        parent_first = prototype.NavigationGraph(targets)
+        self.assertEqual(
+            parent_first.candidates(0, prototype.Direction.DOWN)[0], 1
+        )
+        self.assertEqual(
+            parent_first.candidates(1, prototype.Direction.UP), (0,)
+        )
+
+    def test_repeated_right_reaches_every_target_in_an_irregular_layout(self):
+        targets = [
+            self.target(750, 0, 780, 30, "0"),
+            self.target(650, 200, 680, 230, "1"),
+            self.target(350, 50, 380, 80, "2"),
+            self.target(750, 350, 780, 380, "3"),
+            self.target(150, 450, 180, 480, "4"),
+        ]
+        graph = prototype.NavigationGraph(targets)
+        for start in range(len(targets)):
+            traversal = prototype.NavigationTraversal()
+            visited = {start}
+            current = start
+            for _step in range(len(targets) - 1):
+                candidates = traversal.available(
+                    current,
+                    prototype.Direction.RIGHT,
+                    graph.candidates(current, prototype.Direction.RIGHT),
+                )
+                self.assertTrue(candidates)
+                current = candidates[0]
+                traversal.commit(current)
+                visited.add(current)
+            self.assertEqual(visited, set(range(len(targets))))
+
+    def test_adjacent_message_actions_remain_directly_reachable(self):
+        targets = [
+            self.target(1300, 500, 1339, 539, "复制消息"),
+            self.target(1341, 500, 1380, 539, "编辑消息"),
+        ]
+        graph = prototype.NavigationGraph(targets)
+        self.assertEqual(
+            graph.candidates(0, prototype.Direction.RIGHT)[0], 1
+        )
+        self.assertEqual(
+            graph.candidates(1, prototype.Direction.LEFT)[0], 0
+        )
+
     def test_regular_grid_is_reachable_and_reversible_in_all_directions(self):
         targets = [
             self.target(
@@ -915,6 +1166,140 @@ class SpatialNavigationTests(unittest.TestCase):
             expected,
         )
         self.assertIsNone(prototype.keyboard_navigation_action(0x70))
+
+    def test_tracks_only_relevant_structure_changes(self):
+        self.assertTrue(prototype.is_navigation_structure_event(0x8000))
+        self.assertTrue(prototype.is_navigation_structure_event(0x800A))
+        self.assertFalse(prototype.is_navigation_structure_event(0x8005))
+
+        now = [10.0]
+        tracker = prototype.DirtyWindowTracker(lambda: now[0])
+        self.assertTrue(tracker.watch(100, 42))
+        self.assertFalse(tracker.watch(100, 42))
+        self.assertFalse(tracker.mark(200, 42))
+        self.assertFalse(tracker.mark(100, 43))
+        self.assertTrue(tracker.mark(100, 42))
+        first = tracker.state(100, 42)
+        self.assertEqual(first, prototype.DirtyWindowState(1, 10.0))
+
+        now[0] = 11.0
+        self.assertTrue(tracker.mark(100, 42))
+        self.assertTrue(
+            tracker.consume(
+                100,
+                42,
+                through_generation=first.generation if first is not None else 0,
+            )
+        )
+        self.assertEqual(
+            tracker.state(100, 42), prototype.DirtyWindowState(2, 11.0)
+        )
+        self.assertTrue(tracker.consume(100, 42))
+        self.assertIsNone(tracker.state(100, 42))
+
+        tracker.watch(300, 99)
+        self.assertIsNone(tracker.state(100, 42))
+
+    def test_dynamic_refresh_only_precedes_wraps_or_distant_diagonals(self):
+        window = prototype.Rect(0, 0, 1600, 900)
+        current = prototype.Rect(600, 400, 660, 440)
+        self.assertFalse(
+            prototype.move_should_refresh_dynamic_targets(
+                current,
+                prototype.Rect(700, 400, 760, 440),
+                prototype.Direction.RIGHT,
+                window,
+            )
+        )
+        self.assertTrue(
+            prototype.move_should_refresh_dynamic_targets(
+                current,
+                prototype.Rect(1200, 100, 1260, 140),
+                prototype.Direction.RIGHT,
+                window,
+            )
+        )
+        self.assertTrue(
+            prototype.move_should_refresh_dynamic_targets(
+                current,
+                prototype.Rect(1100, 400, 1160, 440),
+                prototype.Direction.RIGHT,
+                window,
+            )
+        )
+        self.assertTrue(
+            prototype.move_should_refresh_dynamic_targets(
+                current,
+                prototype.Rect(300, 450, 360, 490),
+                prototype.Direction.RIGHT,
+                window,
+            )
+        )
+
+        dirty = prototype.DirtyWindowState(1, 20.0)
+        self.assertFalse(
+            prototype.dynamic_refresh_due(
+                dirty,
+                20.1,
+                current,
+                prototype.Rect(700, 400, 760, 440),
+                prototype.Direction.RIGHT,
+                window,
+                True,
+            )
+        )
+        self.assertFalse(
+            prototype.dynamic_refresh_due(
+                dirty,
+                20.2,
+                current,
+                prototype.Rect(700, 400, 760, 440),
+                prototype.Direction.RIGHT,
+                window,
+                True,
+            )
+        )
+        self.assertTrue(
+            prototype.dynamic_refresh_due(
+                dirty,
+                20.2,
+                current,
+                prototype.Rect(1100, 400, 1160, 440),
+                prototype.Direction.RIGHT,
+                window,
+                True,
+            )
+        )
+        self.assertTrue(
+            prototype.dynamic_refresh_due(
+                dirty,
+                20.2,
+                current,
+                prototype.Rect(700, 400, 760, 440),
+                prototype.Direction.RIGHT,
+                window,
+                False,
+            )
+        )
+        newly_changed = prototype.DirtyWindowState(2, 20.19)
+        self.assertTrue(
+            prototype.dynamic_refresh_due(
+                newly_changed,
+                20.2,
+                current,
+                prototype.Rect(1100, 400, 1160, 440),
+                prototype.Direction.RIGHT,
+                window,
+                True,
+                settle_waited=True,
+            )
+        )
+
+    def test_dynamic_refresh_fallback_has_a_maximum_cache_age(self):
+        self.assertFalse(prototype.dynamic_refresh_fallback_due(4.9, True))
+        self.assertTrue(prototype.dynamic_refresh_fallback_due(5.0, True))
+        self.assertFalse(prototype.dynamic_refresh_fallback_due(29.9, False))
+        self.assertTrue(prototype.dynamic_refresh_fallback_due(30.0, False))
 
     def test_global_hotkey_maps_the_diagnostics_toggle(self):
         self.assertEqual(
@@ -1048,8 +1433,78 @@ class SpatialNavigationTests(unittest.TestCase):
         points = prototype.target_probe_points(rect)
         self.assertEqual(points[0], (290, 125))
         self.assertIn((64, 125), points)
+        self.assertIn((516, 112), points)
+        self.assertIn((516, 138), points)
         self.assertTrue(
             all(rect.contains_point(point) for point in points)
+        )
+
+    def test_parent_probe_points_avoid_retained_child_actions(self):
+        parent = self.target(
+            100,
+            100,
+            500,
+            260,
+            "card",
+            path=(0, 1),
+            has_action_pattern=True,
+        )
+        child = self.target(
+            276,
+            160,
+            324,
+            208,
+            "delete",
+            path=(0, 1, 0),
+            has_action_pattern=True,
+        )
+        points = prototype.available_target_probe_points(parent, [parent, child])
+        self.assertNotIn((300, 180), points)
+        self.assertTrue(points)
+        self.assertTrue(
+            all(not child.rect.contains_point(point) for point in points)
+        )
+
+    def test_action_descendant_ignores_area_ratio_and_one_pixel_overflow(self):
+        parent = self.target(
+            100,
+            100,
+            500,
+            260,
+            "card",
+            path=(0,),
+            has_action_pattern=True,
+        )
+        child = self.target(
+            276,
+            160,
+            324,
+            261,
+            "delete",
+            path=(0, 1),
+            has_action_pattern=True,
+        )
+        self.assertFalse(prototype.target_is_finer_descendant(parent, child))
+        self.assertTrue(prototype.target_is_action_descendant(parent, child))
+        self.assertNotIn(
+            (300, 180),
+            prototype.available_target_probe_points(parent, [parent, child]),
+        )
+
+        near_equal_child = self.target(
+            102,
+            101,
+            498,
+            259,
+            "full child",
+            path=(0, 2),
+            has_action_pattern=True,
+        )
+        self.assertFalse(
+            prototype.target_is_finer_descendant(parent, near_equal_child)
+        )
+        self.assertTrue(
+            prototype.target_is_action_descendant(parent, near_equal_child)
         )
 
     def test_initial_target_uses_focused_element(self):
@@ -1158,21 +1613,27 @@ class SpatialNavigationTests(unittest.TestCase):
     def test_drops_large_structural_wrapper_around_real_button(self):
         targets = [
             prototype.TargetSnapshot(
-                prototype.Rect(0, 0, 600, 400), "", "GroupControl"
+                prototype.Rect(0, 0, 600, 400),
+                "wrapper",
+                "GroupControl",
+                path=(0,),
             ),
-            self.target(40, 40, 140, 90, "button"),
+            self.target(40, 40, 140, 90, "button", path=(0, 0)),
         ]
         self.assertEqual(prototype.nested_container_keep_indices(targets), [1])
 
     def test_keeps_standalone_structural_action(self):
         targets = [
             prototype.TargetSnapshot(
-                prototype.Rect(40, 40, 140, 90), "canvas action", "CustomControl"
+                prototype.Rect(40, 40, 140, 90),
+                "canvas action",
+                "CustomControl",
+                has_action_pattern=True,
             )
         ]
         self.assertEqual(prototype.nested_container_keep_indices(targets), [0])
 
-    def test_drops_same_row_hover_action_nested_inside_primary_button(self):
+    def test_keeps_same_row_interactive_child_inside_primary_button(self):
         targets = [
             self.target(
                 40,
@@ -1193,7 +1654,72 @@ class SpatialNavigationTests(unittest.TestCase):
                 has_action_pattern=True,
             ),
         ]
-        self.assertEqual(prototype.nested_container_keep_indices(targets), [0])
+        self.assertEqual(prototype.nested_container_keep_indices(targets), [0, 1])
+
+    def test_keeps_anonymous_interactive_child_inside_primary_button(self):
+        targets = [
+            self.target(
+                0,
+                0,
+                500,
+                80,
+                "row",
+                path=(0, 1),
+                has_action_pattern=True,
+            ),
+            self.target(
+                440,
+                20,
+                472,
+                52,
+                "",
+                path=(0, 1, 0),
+                has_action_pattern=True,
+            ),
+        ]
+        self.assertEqual(prototype.nested_container_keep_indices(targets), [0, 1])
+
+    def test_keeps_interactive_custom_card_and_child_button(self):
+        card = prototype.TargetSnapshot(
+            prototype.Rect(100, 100, 600, 300),
+            "card",
+            "CustomControl",
+            path=(0, 1),
+            has_action_pattern=True,
+        )
+        more = self.target(
+            540,
+            120,
+            580,
+            160,
+            "more",
+            path=(0, 1, 0),
+            has_action_pattern=True,
+        )
+        self.assertEqual(
+            prototype.nested_container_keep_indices([card, more]), [0, 1]
+        )
+
+    def test_overlapping_different_branches_do_not_remove_weak_parent(self):
+        wrapper = prototype.TargetSnapshot(
+            prototype.Rect(100, 100, 600, 300),
+            "wrapper",
+            "GroupControl",
+            path=(0, 1),
+        )
+        unrelated = self.target(
+            540,
+            120,
+            580,
+            160,
+            "other branch",
+            path=(0, 2, 0),
+            has_action_pattern=True,
+        )
+        self.assertEqual(
+            prototype.nested_container_keep_indices([wrapper, unrelated]),
+            [0, 1],
+        )
 
     def test_nested_show_more_remains_the_next_down_target(self):
         folder = self.target(
@@ -1274,7 +1800,7 @@ class SpatialNavigationTests(unittest.TestCase):
             "project contents",
             "ListItemControl",
             path=(0,),
-            has_action_pattern=True,
+            keyboard_focusable=True,
         )
         folder = self.target(
             20,
@@ -1302,6 +1828,24 @@ class SpatialNavigationTests(unittest.TestCase):
         self.assertFalse(
             prototype.structural_action_has_identity(
                 "GroupControl", "", "radix-_r_2rhf_"
+            )
+        )
+
+    def test_focus_only_structural_target_must_be_compact(self):
+        self.assertFalse(
+            prototype.focus_only_structural_target_is_specific(
+                "PaneControl",
+                "blank content",
+                "",
+                prototype.Rect(0, 0, 1200, 800),
+            )
+        )
+        self.assertTrue(
+            prototype.focus_only_structural_target_is_specific(
+                "CustomControl",
+                "",
+                "toolbar-action",
+                prototype.Rect(100, 100, 140, 140),
             )
         )
 

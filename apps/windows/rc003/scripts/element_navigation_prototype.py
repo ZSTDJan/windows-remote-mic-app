@@ -68,6 +68,19 @@ CHROMIUM_MIN_SCAN_DEPTH = 32
 SEMANTIC_BYPASS_MAX_WIDTH = 180
 SEMANTIC_BYPASS_MAX_HEIGHT = 96
 PREWARM_STABILITY_SECONDS = 0.75
+DYNAMIC_REFRESH_FALLBACK_SECONDS = 5.0
+DYNAMIC_REFRESH_MAX_CACHE_SECONDS = 30.0
+DYNAMIC_REFRESH_SETTLE_SECONDS = 0.15
+NAVIGATION_STRUCTURE_EVENTS = frozenset(
+    {
+        0x8000,  # EVENT_OBJECT_CREATE
+        0x8001,  # EVENT_OBJECT_DESTROY
+        0x8002,  # EVENT_OBJECT_SHOW
+        0x8003,  # EVENT_OBJECT_HIDE
+        0x8004,  # EVENT_OBJECT_REORDER
+        0x800A,  # EVENT_OBJECT_STATECHANGE
+    }
+)
 SECTION_MAX_WINDOW_WIDTH_RATIO = 0.88
 SECTION_MIN_WINDOW_WIDTH_RATIO = 0.15
 SECTION_BODY_MIN_WINDOW_HEIGHT_RATIO = 0.40
@@ -223,6 +236,75 @@ class NavigationDiagnostic:
     rejected_counts: tuple[tuple[str, int], ...]
 
 
+@dataclass(frozen=True)
+class DirtyWindowState:
+    generation: int
+    changed_at: float
+
+
+class DirtyWindowTracker:
+    """Track changes for one watched window without scanning in callbacks."""
+
+    def __init__(self, clock: Callable[[], float] = time.perf_counter) -> None:
+        self._lock = threading.Lock()
+        self._clock = clock
+        self._window_id = 0
+        self._process_id = 0
+        self._generation = 0
+        self._consumed_generation = 0
+        self._changed_at = 0.0
+
+    def watch(self, window_id: int, process_id: int) -> bool:
+        with self._lock:
+            if window_id == self._window_id and process_id == self._process_id:
+                return False
+            self._window_id = window_id
+            self._process_id = process_id
+            self._generation = 0
+            self._consumed_generation = 0
+            self._changed_at = 0.0
+            return True
+
+    def mark(self, window_id: int, process_id: int) -> bool:
+        if window_id <= 0 or process_id <= 0:
+            return False
+        with self._lock:
+            if window_id != self._window_id or process_id != self._process_id:
+                return False
+            self._generation += 1
+            self._changed_at = self._clock()
+            return True
+
+    def state(self, window_id: int, process_id: int) -> Optional[DirtyWindowState]:
+        with self._lock:
+            if (
+                window_id != self._window_id
+                or process_id != self._process_id
+                or self._generation <= self._consumed_generation
+            ):
+                return None
+            return DirtyWindowState(self._generation, self._changed_at)
+
+    def consume(
+        self,
+        window_id: int,
+        process_id: int,
+        through_generation: Optional[int] = None,
+    ) -> bool:
+        with self._lock:
+            if window_id != self._window_id or process_id != self._process_id:
+                return False
+            generation = (
+                self._generation
+                if through_generation is None
+                else min(self._generation, through_generation)
+            )
+            if generation <= self._consumed_generation:
+                return False
+            self._consumed_generation = generation
+            return True
+
+
 def physical_screen_rect(logical_rect: Rect, device_pixel_ratio: float) -> Rect:
     return Rect(
         logical_rect.left,
@@ -253,6 +335,163 @@ def _axis_gap(a_start: int, a_end: int, b_start: int, b_end: int) -> int:
 
 def _axis_overlap(a_start: int, a_end: int, b_start: int, b_end: int) -> int:
     return max(0, min(a_end, b_end) - max(a_start, b_start))
+
+
+def is_navigation_structure_event(event_id: int) -> bool:
+    return event_id in NAVIGATION_STRUCTURE_EVENTS
+
+
+def target_has_interaction_evidence(target: TargetSnapshot) -> bool:
+    """Return whether the element itself represents an operable action."""
+
+    return bool(
+        target.has_action_pattern
+        or target.supports_expand
+        or target.control_type in PRIMARY_ACTION_CONTROL_TYPES
+    )
+
+
+def target_is_finer_descendant(
+    target: TargetSnapshot, candidate: TargetSnapshot
+) -> bool:
+    if target.rect == candidate.rect:
+        return False
+    target_area = max(1, target.rect.width * target.rect.height)
+    candidate_area = max(1, candidate.rect.width * candidate.rect.height)
+    if target_area <= candidate_area * 1.25:
+        return False
+    if not target.rect.contains(candidate.rect):
+        return False
+    if target.path and candidate.path:
+        return bool(
+            len(candidate.path) > len(target.path)
+            and candidate.path[: len(target.path)] == target.path
+        )
+    return True
+
+
+def target_is_action_descendant(
+    target: TargetSnapshot, candidate: TargetSnapshot
+) -> bool:
+    """Match a retained UIA action child without geometry-size heuristics."""
+
+    if not target_has_interaction_evidence(candidate):
+        return False
+    if target.path and candidate.path:
+        return bool(
+            len(candidate.path) > len(target.path)
+            and candidate.path[: len(target.path)] == target.path
+        )
+    return target_is_finer_descendant(target, candidate)
+
+
+def finer_descendant_index_map(
+    targets: Sequence[TargetSnapshot],
+) -> tuple[tuple[int, ...], ...]:
+    return tuple(
+        tuple(
+            candidate_index
+            for candidate_index, candidate in enumerate(targets)
+            if candidate_index != target_index
+            and target_is_finer_descendant(target, candidate)
+        )
+        for target_index, target in enumerate(targets)
+    )
+
+
+def target_has_finer_descendant(
+    targets: Sequence[TargetSnapshot], target_index: int
+) -> bool:
+    """Return whether a broad target contains a more specific action target."""
+
+    if not 0 <= target_index < len(targets):
+        return False
+    return any(
+        index != target_index
+        and target_is_finer_descendant(targets[target_index], candidate)
+        for index, candidate in enumerate(targets)
+    )
+
+
+def defer_broad_targets_after_descendants(
+    targets: Sequence[TargetSnapshot],
+    ordered_indices: Sequence[int],
+    descendants_by_target: Sequence[Sequence[int]],
+    current: Optional[Rect] = None,
+    direction: Optional[Direction] = None,
+) -> list[int]:
+    """Let a broad target yield only to its own suitable finer actions."""
+
+    ordered = list(ordered_indices)
+    broad_indices = sorted(
+        (
+            index
+            for index in ordered
+            if 0 <= index < len(descendants_by_target)
+            and descendants_by_target[index]
+        ),
+        key=lambda index: targets[index].rect.width * targets[index].rect.height,
+    )
+    for broad_index in broad_indices:
+        if broad_index not in ordered:
+            continue
+        broad_score = (
+            direction_score(current, targets[broad_index].rect, direction)
+            if current is not None and direction is not None
+            else None
+        )
+        suitable_descendants = []
+        for descendant_index in descendants_by_target[broad_index]:
+            if descendant_index not in ordered:
+                continue
+            if current is not None and direction is not None:
+                descendant_score = direction_score(
+                    current, targets[descendant_index].rect, direction
+                )
+                if broad_score is not None and (
+                    descendant_score is None
+                    or descendant_score[0] > broad_score[0]
+                ):
+                    continue
+                if broad_score is not None and descendant_score is not None:
+                    current_axis_size = (
+                        current.width
+                        if direction in {Direction.LEFT, Direction.RIGHT}
+                        else current.height
+                    )
+                    local_tolerance = max(
+                        96.0,
+                        min(240.0, current_axis_size * 2.5),
+                    )
+                    if (
+                        descendant_score[1]
+                        > broad_score[1] + local_tolerance
+                    ):
+                        continue
+                    current_perpendicular_size = (
+                        current.height
+                        if direction in {Direction.LEFT, Direction.RIGHT}
+                        else current.width
+                    )
+                    perpendicular_tolerance = max(
+                        96.0,
+                        min(240.0, current_perpendicular_size * 2.5),
+                    )
+                    if (
+                        descendant_score[4]
+                        > broad_score[4] + perpendicular_tolerance
+                    ):
+                        continue
+            suitable_descendants.append(descendant_index)
+        if not suitable_descendants:
+            continue
+        broad_position = ordered.index(broad_index)
+        if broad_position >= max(ordered.index(index) for index in suitable_descendants):
+            continue
+        ordered.pop(broad_position)
+        insert_at = max(ordered.index(index) for index in suitable_descendants) + 1
+        ordered.insert(insert_at, broad_index)
+    return ordered
 
 
 def direction_score(
@@ -337,6 +576,83 @@ def direction_score(
         center_offset,
         candidate.top,
         candidate.left,
+    )
+
+
+def move_should_refresh_dynamic_targets(
+    current: Rect,
+    candidate: Optional[Rect],
+    direction: Direction,
+    window_rect: Rect,
+) -> bool:
+    """Refresh before accepting a wrap or a distant diagonal from old data."""
+
+    if candidate is None:
+        return True
+    score = direction_score(current, candidate, direction)
+    if score is None:
+        return True
+    if score[0] == 0:
+        primary_span = (
+            window_rect.width
+            if direction in {Direction.LEFT, Direction.RIGHT}
+            else window_rect.height
+        )
+        current_size = (
+            current.width
+            if direction in {Direction.LEFT, Direction.RIGHT}
+            else current.height
+        )
+        local_gap = max(
+            96.0,
+            min(240.0, primary_span * 0.08),
+            current_size * 2.5,
+        )
+        return score[1] > local_gap
+    perpendicular_span = (
+        window_rect.height
+        if direction in {Direction.LEFT, Direction.RIGHT}
+        else window_rect.width
+    )
+    return score[2] > max(96.0, perpendicular_span * 0.12)
+
+
+def dynamic_refresh_due(
+    dirty_state: Optional[DirtyWindowState],
+    now: float,
+    current: Rect,
+    candidate: Optional[Rect],
+    direction: Direction,
+    window_rect: Rect,
+    candidate_is_natural: bool,
+    settle_waited: bool = False,
+) -> bool:
+    if dirty_state is None:
+        return False
+    if (
+        not settle_waited
+        and now - dirty_state.changed_at < DYNAMIC_REFRESH_SETTLE_SECONDS
+    ):
+        return False
+    if not candidate_is_natural:
+        return True
+    return move_should_refresh_dynamic_targets(
+        current, candidate, direction, window_rect
+    )
+
+
+def dynamic_refresh_fallback_due(
+    cache_age: float,
+    suspicious_move: bool,
+) -> bool:
+    """Eventually refresh even when an accessibility provider misses events."""
+
+    return bool(
+        cache_age >= DYNAMIC_REFRESH_MAX_CACHE_SECONDS
+        or (
+            suspicious_move
+            and cache_age >= DYNAMIC_REFRESH_FALLBACK_SECONDS
+        )
     )
 
 
@@ -614,11 +930,16 @@ def horizontal_section_target_indices(
 
 
 def ranked_target_indices(
-    targets: Sequence[TargetSnapshot], current_index: int, direction: Direction
+    targets: Sequence[TargetSnapshot],
+    current_index: int,
+    direction: Direction,
+    descendants_by_target: Optional[Sequence[Sequence[int]]] = None,
 ) -> list[int]:
     if not targets or not 0 <= current_index < len(targets):
         return []
     current = targets[current_index].rect
+    if descendants_by_target is None:
+        descendants_by_target = finer_descendant_index_map(targets)
     scored: list[
         tuple[tuple[int, float, float, float, float, int, int], int, int]
     ] = []
@@ -670,13 +991,19 @@ def ranked_target_indices(
         )
 
     scored.sort(key=rank_key)
+    directional = defer_broad_targets_after_descendants(
+        targets,
+        [index for _score, _prefix, index in scored],
+        descendants_by_target,
+        current,
+        direction,
+    )
     if direction not in {Direction.RIGHT, Direction.LEFT}:
-        return [index for _score, _prefix, index in scored]
+        return directional
 
     # Horizontal keys first exhaust real candidates in the requested
     # half-plane. Reading-order wrap is only a final fallback for a row end;
     # it never outranks an element that is actually to the left or right.
-    directional = [index for _score, _prefix, index in scored]
     wrapped = horizontal_wrap_target_indices(targets, current_index, direction)
     section_exits = horizontal_adjacent_section_target_indices(
         targets,
@@ -694,7 +1021,61 @@ def ranked_target_indices(
     ranked = list(section_targets or directional)
     ranked.extend(index for index in directional if index not in ranked)
     ranked.extend(index for index in wrapped if index not in ranked)
-    return ranked
+    return defer_broad_targets_after_descendants(
+        targets,
+        ranked,
+        descendants_by_target,
+        current,
+        direction,
+    )
+
+
+def visual_traversal_indices(
+    targets: Sequence[TargetSnapshot],
+    current_index: int,
+    direction: Direction,
+    descendants_by_target: Optional[Sequence[Sequence[int]]] = None,
+) -> list[int]:
+    """Return a cyclic visual order used only after spatial candidates run out."""
+
+    if not targets or not 0 <= current_index < len(targets):
+        return []
+    if descendants_by_target is None:
+        descendants_by_target = finer_descendant_index_map(targets)
+    if direction in {Direction.RIGHT, Direction.LEFT}:
+        ordered = sorted(
+            range(len(targets)),
+            key=lambda index: (
+                targets[index].rect.top,
+                targets[index].rect.left,
+                targets[index].rect.width * targets[index].rect.height,
+                index,
+            ),
+        )
+    else:
+        ordered = sorted(
+            range(len(targets)),
+            key=lambda index: (
+                targets[index].rect.left,
+                targets[index].rect.top,
+                targets[index].rect.width * targets[index].rect.height,
+                index,
+            ),
+        )
+    position = ordered.index(current_index)
+    if direction in {Direction.RIGHT, Direction.DOWN}:
+        coverage = ordered[position + 1 :] + ordered[:position]
+    else:
+        coverage = list(reversed(ordered[:position])) + list(
+            reversed(ordered[position + 1 :])
+        )
+    return defer_broad_targets_after_descendants(
+        targets,
+        coverage,
+        descendants_by_target,
+        targets[current_index].rect,
+        direction,
+    )
 
 
 DIAGNOSTIC_REJECTION_ORDER = (
@@ -714,6 +1095,7 @@ DIAGNOSTIC_ROUTE_LABELS = {
     "diagonal": "斜向候选",
     "wrap": "跨行补充",
     "reverse": "反向返回",
+    "coverage": "全目标补充",
     "section_bridge": "同区网格",
     "section_exit": "相邻区出口",
 }
@@ -751,6 +1133,7 @@ def build_navigation_diagnostic(
         if ranked_indices is None
         else ranked_indices
     )
+    natural = set(ranked_target_indices(targets, current_index, direction))
     wrapped_indices = horizontal_wrap_target_indices(
         targets, current_index, direction
     )
@@ -776,7 +1159,11 @@ def build_navigation_diagnostic(
             continue
         target = targets[index]
         score = direction_score(current.rect, target.rect, direction)
-        if index in section_exits:
+        if index not in natural and target.rect.contains(current.rect):
+            route = "reverse"
+        elif index not in natural:
+            route = "coverage"
+        elif index in section_exits:
             route = "section_exit"
         elif (
             current.section_path
@@ -787,7 +1174,7 @@ def build_navigation_diagnostic(
         elif index in wrapped:
             route = "wrap"
         elif score is None:
-            route = "reverse"
+            route = "coverage"
         elif score is not None and score[0] == 0:
             route = "lane"
         else:
@@ -955,7 +1342,27 @@ class NavigationGraph:
 
     def __init__(self, targets: Sequence[TargetSnapshot]) -> None:
         self.targets = tuple(targets)
+        self._descendants_by_target = finer_descendant_index_map(self.targets)
+        self._natural: dict[tuple[int, Direction], tuple[int, ...]] = {}
         self._ranked: dict[tuple[int, Direction], tuple[int, ...]] = {}
+
+    def natural_candidates(
+        self, current_index: int, direction: Direction
+    ) -> tuple[int, ...]:
+        key = (current_index, direction)
+        cached = self._natural.get(key)
+        if cached is not None:
+            return cached
+        natural = tuple(
+            ranked_target_indices(
+                self.targets,
+                current_index,
+                direction,
+                self._descendants_by_target,
+            )
+        )
+        self._natural[key] = natural
+        return natural
 
     def candidates(self, current_index: int, direction: Direction) -> tuple[int, ...]:
         key = (current_index, direction)
@@ -963,27 +1370,15 @@ class NavigationGraph:
         if cached is not None:
             return cached
 
-        ranked = tuple(
-            ranked_target_indices(self.targets, current_index, direction)
+        natural = self.natural_candidates(current_index, direction)
+        coverage = visual_traversal_indices(
+            self.targets,
+            current_index,
+            direction,
+            self._descendants_by_target,
         )
+        ranked = natural + tuple(index for index in coverage if index not in natural)
         self._ranked[key] = ranked
-        if ranked:
-            neighbor = ranked[0]
-            reverse_key = (neighbor, OPPOSITE_DIRECTION[direction])
-            if reverse_key not in self._ranked:
-                reverse = tuple(
-                    ranked_target_indices(
-                        self.targets,
-                        neighbor,
-                        OPPOSITE_DIRECTION[direction],
-                    )
-                )
-                if not reverse or reverse[0] == current_index:
-                    self._ranked[reverse_key] = (
-                        (current_index,) + tuple(
-                            index for index in reverse if index != current_index
-                        )
-                    )
         return ranked
 
 
@@ -1224,8 +1619,28 @@ def target_probe_points(rect: Rect) -> list[tuple[int, int]]:
         (rect.right - inset_x, center_y),
         (rect.left + inset_x, rect.top + inset_y),
         (rect.left + inset_x, rect.bottom - inset_y),
+        (rect.right - inset_x, rect.top + inset_y),
+        (rect.right - inset_x, rect.bottom - inset_y),
     ]
     return list(dict.fromkeys(points))
+
+
+def available_target_probe_points(
+    target: TargetSnapshot,
+    targets: Sequence[TargetSnapshot],
+) -> list[tuple[int, int]]:
+    """Return points that are not occupied by a retained finer action."""
+
+    finer_rects = [
+        candidate.rect
+        for candidate in targets
+        if candidate is not target and target_is_action_descendant(target, candidate)
+    ]
+    return [
+        point
+        for point in target_probe_points(target.rect)
+        if not any(rect.contains_point(point) for rect in finer_rects)
+    ]
 
 
 def initial_target_index(
@@ -1336,67 +1751,43 @@ def hit_target_match_index(
     return max(matches)[-1]
 
 
-def nested_semantic_action_is_distinct(
-    target: TargetSnapshot, parent: TargetSnapshot
-) -> bool:
-    """Keep a real child action only when it forms a separate visual row."""
-
-    if not semantic_action_can_bypass_point_hit(target):
-        return False
-    if target.name in PRESERVED_NESTED_ACTION_NAMES:
-        return True
-    minimum_parent_height = max(
-        target.rect.height + 24.0,
-        target.rect.height * 1.75,
-    )
-    minimum_vertical_offset = max(12.0, target.rect.height * 0.40)
-    return bool(
-        parent.rect.height >= minimum_parent_height
-        and abs(target.rect.center_y - parent.rect.center_y)
-        >= minimum_vertical_offset
-    )
-
-
 def nested_container_keep_indices(targets: Sequence[TargetSnapshot]) -> list[int]:
-    """Drop wrappers and secondary descendants around a primary action."""
+    """Drop only weak UIA wrappers, preserving real parent and child actions."""
 
     keep = []
     for index, target in enumerate(targets):
-        area = target.rect.width * target.rect.height
         if (
             target.control_type in WRAPPER_CONTROL_TYPES
+            and not target_has_interaction_evidence(target)
             and not target.supports_expand
         ):
-            contains_specific_target = any(
+            contains_nested_target = any(
                 other_index != index
+                and target.path
+                and other.path
+                and len(other.path) > len(target.path)
+                and other.path[: len(target.path)] == target.path
                 and target.rect != other.rect
                 and target.rect.contains(other.rect)
-                and (
-                    (
-                        target.control_type
-                        in {"ListItemControl", "DataItemControl"}
-                        and other.control_type in PRIMARY_ACTION_CONTROL_TYPES
-                        and other.path[: len(target.path)] == target.path
-                    )
-                    or area
-                    > (other.rect.width * other.rect.height) * 1.5
-                )
                 for other_index, other in enumerate(targets)
             )
-            if contains_specific_target:
+            if contains_nested_target:
                 continue
 
-        nested_under_primary_action = any(
-            other_index != index
-            and not nested_semantic_action_is_distinct(target, other)
-            and other.path
-            and len(other.path) < len(target.path)
-            and target.path[: len(other.path)] == other.path
-            and other.control_type in PRIMARY_ACTION_CONTROL_TYPES
-            and other.rect.contains(target.rect)
-            for other_index, other in enumerate(targets)
+        weak_target_under_action = bool(
+            not target_has_interaction_evidence(target)
+            and any(
+                other_index != index
+                and target.path
+                and other.path
+                and len(other.path) < len(target.path)
+                and target.path[: len(other.path)] == other.path
+                and target_has_interaction_evidence(other)
+                and other.rect.contains(target.rect)
+                for other_index, other in enumerate(targets)
+            )
         )
-        if not nested_under_primary_action:
+        if not weak_target_under_action:
             keep.append(index)
     return keep
 
@@ -1469,6 +1860,22 @@ def structural_action_has_identity(
     if control_type in {"GroupControl", "PaneControl"}:
         return bool(name)
     return bool(name or automation_id)
+
+
+def focus_only_structural_target_is_specific(
+    control_type: str,
+    name: str,
+    automation_id: str,
+    rect: Rect,
+) -> bool:
+    """Allow compact focus-only custom controls, not broad layout containers."""
+
+    return bool(
+        control_type in STRUCTURAL_CONTROL_TYPES
+        and structural_action_has_identity(control_type, name, automation_id)
+        and rect.width <= SEMANTIC_BYPASS_MAX_WIDTH
+        and rect.height <= SEMANTIC_BYPASS_MAX_HEIGHT
+    )
 
 
 def semantic_action_can_bypass_point_hit(target: TargetSnapshot) -> bool:
@@ -1566,6 +1973,8 @@ def _run_windows(args: argparse.Namespace) -> int:
     kernel32.GetModuleHandleW.argtypes = [wintypes.LPCWSTR]
     kernel32.GetModuleHandleW.restype = wintypes.HMODULE
     user32.GetForegroundWindow.restype = wintypes.HWND
+    user32.GetAncestor.argtypes = [wintypes.HWND, wintypes.UINT]
+    user32.GetAncestor.restype = wintypes.HWND
     user32.GetWindow.argtypes = [wintypes.HWND, wintypes.UINT]
     user32.GetWindow.restype = wintypes.HWND
     user32.GetWindowThreadProcessId.argtypes = [
@@ -1605,6 +2014,36 @@ def _run_windows(args: argparse.Namespace) -> int:
         wintypes.LPARAM,
     ]
     user32.PostThreadMessageW.restype = wintypes.BOOL
+    user32.PeekMessageW.argtypes = [
+        ctypes.POINTER(wintypes.MSG),
+        wintypes.HWND,
+        wintypes.UINT,
+        wintypes.UINT,
+        wintypes.UINT,
+    ]
+    user32.PeekMessageW.restype = wintypes.BOOL
+    win_event_proc_type = ctypes.WINFUNCTYPE(
+        None,
+        wintypes.HANDLE,
+        wintypes.DWORD,
+        wintypes.HWND,
+        ctypes.c_long,
+        ctypes.c_long,
+        wintypes.DWORD,
+        wintypes.DWORD,
+    )
+    user32.SetWinEventHook.argtypes = [
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HMODULE,
+        win_event_proc_type,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.DWORD,
+    ]
+    user32.SetWinEventHook.restype = wintypes.HANDLE
+    user32.UnhookWinEvent.argtypes = [wintypes.HANDLE]
+    user32.UnhookWinEvent.restype = wintypes.BOOL
     user32.SendMessageTimeoutW.argtypes = [
         wintypes.HWND,
         wintypes.UINT,
@@ -1664,7 +2103,11 @@ def _run_windows(args: argparse.Namespace) -> int:
     mouseeventf_wheel = 0x0800
     wheel_delta = 120
     gw_owner = 4
+    ga_root = 2
+    pm_noremove = 0
     gui_menu_mode_flags = 0x0004 | 0x0008 | 0x0010
+    winevent_outofcontext = 0x0000
+    winevent_skipownprocess = 0x0002
     awakened_chromium_windows: set[int] = set()
 
     @dataclass
@@ -1753,7 +2196,18 @@ def _run_windows(args: argparse.Namespace) -> int:
                 standard and (keyboard_focusable or action_pattern)
             ) or (
                 structural
-                and (keyboard_focusable or direct_action_pattern)
+                and (
+                    direct_action_pattern
+                    or (
+                        keyboard_focusable
+                        and focus_only_structural_target_is_specific(
+                            control_type,
+                            name,
+                            automation_id,
+                            rect,
+                        )
+                    )
+                )
             )
             if not actionable:
                 return None
@@ -1903,6 +2357,8 @@ def _run_windows(args: argparse.Namespace) -> int:
         process_id = wintypes.DWORD()
         user32.GetWindowThreadProcessId(hwnd, ctypes.byref(process_id))
         return int(process_id.value)
+
+    dirty_windows = DirtyWindowTracker()
 
     def window_owner(hwnd: int) -> int:
         return native_handle_value(user32.GetWindow(hwnd, gw_owner))
@@ -2484,19 +2940,42 @@ def _run_windows(args: argparse.Namespace) -> int:
                 if not self._update_live_target(target):
                     return False
                 live_rect = target.snapshot.rect
+                snapshots = [item.snapshot for item in self.targets]
+                finer_targets = [
+                    snapshot
+                    for snapshot in snapshots
+                    if snapshot is not target.snapshot
+                    and target_is_action_descendant(target.snapshot, snapshot)
+                ]
+                finer_runtime_ids = {
+                    snapshot.runtime_id
+                    for snapshot in finer_targets
+                    if snapshot.runtime_id
+                }
+                finer_named_geometry = {
+                    (snapshot.rect, snapshot.control_type, snapshot.name)
+                    for snapshot in finer_targets
+                    if snapshot.name
+                }
+                finer_unnamed_geometry = {
+                    (snapshot.rect, snapshot.control_type)
+                    for snapshot in finer_targets
+                    if not snapshot.name
+                }
 
-                for point in target_probe_points(live_rect):
+                for point in available_target_probe_points(
+                    target.snapshot, snapshots
+                ):
                     control = auto.ControlFromPoint(point[0], point[1])
+                    intercepted_by_finer_target = False
                     for _depth in range(40):
                         if control is None:
                             break
                         runtime_id = runtime_id_from_control(control)
-                        if (
+                        matches_target = bool(
                             target.snapshot.runtime_id
                             and runtime_id == target.snapshot.runtime_id
-                        ):
-                            target.click_point = point
-                            return True
+                        )
                         try:
                             control_type = str(control.ControlTypeName or "")
                             name = str(control.Name or "").strip()
@@ -2505,14 +2984,32 @@ def _run_windows(args: argparse.Namespace) -> int:
                             control_type = ""
                             name = ""
                             rect = Rect(0, 0, 0, 0)
-                        if (
+                        if not matches_target and (
                             not target.snapshot.runtime_id
                             and control_type == target.snapshot.control_type
                             and rect == live_rect
                             and (not target.snapshot.name or name == target.snapshot.name)
                         ):
+                            matches_target = True
+                        if matches_target:
+                            if intercepted_by_finer_target:
+                                break
                             target.click_point = point
                             return True
+                        if (
+                            (runtime_id and runtime_id in finer_runtime_ids)
+                            or (
+                                name
+                                and (rect, control_type, name)
+                                in finer_named_geometry
+                            )
+                            or (
+                                not name
+                                and (rect, control_type)
+                                in finer_unnamed_geometry
+                            )
+                        ):
+                            intercepted_by_finer_target = True
                         control = control.GetParentControl()
             except Exception:
                 return False
@@ -2635,13 +3132,29 @@ def _run_windows(args: argparse.Namespace) -> int:
             deadline: Optional[float] = None,
             should_cancel: Optional[Callable[[], bool]] = None,
         ) -> bool:
-            result = enumerate_targets(
-                hwnd,
-                deadline=deadline,
-                should_cancel=should_cancel,
+            previous_hwnd = self.hwnd
+            previous_process_id = (
+                window_process_id(previous_hwnd) if previous_hwnd > 0 else 0
             )
+            process_id = window_process_id(hwnd)
+            dirty_windows.watch(hwnd, process_id)
+            dirty_before_scan = dirty_windows.state(hwnd, process_id)
+            try:
+                result = enumerate_targets(
+                    hwnd,
+                    deadline=deadline,
+                    should_cancel=should_cancel,
+                )
+            except Exception:
+                dirty_windows.watch(previous_hwnd, previous_process_id)
+                if previous_hwnd != hwnd:
+                    self.cache_timestamp = 0.0
+                raise
             interrupted = result[-1]
             if interrupted:
+                dirty_windows.watch(previous_hwnd, previous_process_id)
+                if previous_hwnd != hwnd:
+                    self.cache_timestamp = 0.0
                 return False
             (
                 self.all_targets,
@@ -2651,6 +3164,12 @@ def _run_windows(args: argparse.Namespace) -> int:
                 self.visited,
                 _interrupted,
             ) = result
+            if dirty_before_scan is not None:
+                dirty_windows.consume(
+                    hwnd,
+                    process_id,
+                    through_generation=dirty_before_scan.generation,
+                )
             self.hwnd = hwnd
             self.invalid_targets.clear()
             self._clear_input_cache()
@@ -2665,6 +3184,8 @@ def _run_windows(args: argparse.Namespace) -> int:
                 or time.perf_counter() - self.cache_timestamp
                 > self._CACHE_TTL_SECONDS
             ):
+                return False
+            if dirty_windows.state(hwnd, window_process_id(hwnd)) is not None:
                 return False
             try:
                 root = auto.ControlFromHandle(hwnd)
@@ -2737,17 +3258,107 @@ def _run_windows(args: argparse.Namespace) -> int:
                     cursor_point() if use_cursor else None,
                 )
 
+        def _refresh_targets(self) -> bool:
+            if not self.context_valid or not self.hwnd:
+                return False
+            previous = (
+                self.targets[self.selected].snapshot
+                if 0 <= self.selected < len(self.targets)
+                else None
+            )
+            if not self._enumerate(self.hwnd):
+                return False
+            self._apply_targets(restore=previous)
+            self._clear_hierarchy()
+            if not self.targets or self.selected < 0:
+                self._invalidate_navigation("页面变化后没有找到可导航元素")
+                return False
+            self.events.put(("content_refreshed", self._selection_payload()))
+            return True
+
         def _move(self, direction: Direction) -> None:
             if not self._sync_window_geometry():
                 return
-            current_index = self.selected
-            snapshots = [target.snapshot for target in self.targets]
-            ranked = self.navigation_graph.candidates(current_index, direction)
-            candidates = self.traversal.available(
-                current_index,
-                direction,
-                ranked,
+
+            def load_candidates() -> tuple[
+                int,
+                list[TargetSnapshot],
+                tuple[int, ...],
+                tuple[int, ...],
+                tuple[int, ...],
+            ]:
+                current = self.selected
+                current_snapshots = [target.snapshot for target in self.targets]
+                natural_candidates = self.navigation_graph.natural_candidates(
+                    current, direction
+                )
+                ranked_candidates = self.navigation_graph.candidates(
+                    current, direction
+                )
+                available_candidates = self.traversal.available(
+                    current, direction, ranked_candidates
+                )
+                return (
+                    current,
+                    current_snapshots,
+                    natural_candidates,
+                    ranked_candidates,
+                    available_candidates,
+                )
+
+            current_index, snapshots, natural, ranked, candidates = load_candidates()
+            first_index = candidates[0] if candidates else None
+            first_rect = (
+                self.targets[first_index].snapshot.rect
+                if first_index is not None
+                else None
             )
+            candidate_is_natural = first_index is not None and first_index in natural
+            process_id = window_process_id(self.hwnd)
+            dirty_state = dirty_windows.state(self.hwnd, process_id)
+            now = time.perf_counter()
+            suspicious_move = (
+                not candidate_is_natural
+                or move_should_refresh_dynamic_targets(
+                    snapshots[current_index].rect,
+                    first_rect,
+                    direction,
+                    self.window_rect,
+                )
+            )
+            settle_waited = False
+            if dirty_state is not None and suspicious_move:
+                settle_remaining = DYNAMIC_REFRESH_SETTLE_SECONDS - (
+                    now - dirty_state.changed_at
+                )
+                if settle_remaining > 0:
+                    time.sleep(settle_remaining)
+                    now = time.perf_counter()
+                    dirty_state = dirty_windows.state(self.hwnd, process_id)
+                settle_waited = True
+
+            refresh_due = dynamic_refresh_due(
+                dirty_state,
+                now,
+                snapshots[current_index].rect,
+                first_rect,
+                direction,
+                self.window_rect,
+                candidate_is_natural,
+                settle_waited=settle_waited,
+            )
+            fallback_due = dynamic_refresh_fallback_due(
+                now - self.cache_timestamp,
+                suspicious_move,
+            )
+            if refresh_due or fallback_due:
+                if not self._refresh_targets():
+                    return
+                if not self._sync_window_geometry():
+                    return
+                current_index, snapshots, natural, ranked, candidates = (
+                    load_candidates()
+                )
             invalid_cached: list[int] = []
             unhittable: list[int] = []
 
@@ -2817,7 +3428,9 @@ def _run_windows(args: argparse.Namespace) -> int:
         def _scan(self, hwnd: int) -> None:
             started = time.perf_counter()
             point = cursor_point()
-            used_cache = self._cache_is_reusable(hwnd)
+            process_id = window_process_id(hwnd)
+            watcher_changed = dirty_windows.watch(hwnd, process_id)
+            used_cache = not watcher_changed and self._cache_is_reusable(hwnd)
             if used_cache:
                 self.context_valid = True
                 self.invalid_targets.clear()
@@ -3023,20 +3636,7 @@ def _run_windows(args: argparse.Namespace) -> int:
             )
 
         def _refresh_content(self) -> None:
-            if not self.context_valid or not self.hwnd:
-                return
-            previous = (
-                self.targets[self.selected].snapshot
-                if 0 <= self.selected < len(self.targets)
-                else None
-            )
-            self._enumerate(self.hwnd)
-            self._apply_targets(restore=previous)
-            self._clear_hierarchy()
-            if not self.targets or self.selected < 0:
-                self._invalidate_navigation("页面变化后没有找到可导航元素")
-                return
-            self.events.put(("content_refreshed", self._selection_payload()))
+            self._refresh_targets()
 
         def _back(self) -> None:
             self.events.put(("exit_requested", None))
@@ -3227,6 +3827,88 @@ def _run_windows(args: argparse.Namespace) -> int:
                 Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
                 self._position,
             )
+
+    class StructureChangeWatcher:
+        HOOK_RANGES = ((0x8000, 0x8004), (0x800A, 0x800A))
+        WM_QUIT = 0x0012
+
+        def __init__(self) -> None:
+            self._hooks: list[int] = []
+            self._callback = None
+            self._thread_id = 0
+            self._ready = threading.Event()
+            self._thread = threading.Thread(
+                target=self._run,
+                name="element-navigation-structure-events",
+                daemon=True,
+            )
+
+        def start(self) -> bool:
+            self._thread.start()
+            return bool(
+                self._ready.wait(3)
+                and len(self._hooks) == len(self.HOOK_RANGES)
+            )
+
+        def stop(self) -> None:
+            if self._thread_id and self._thread.is_alive():
+                if not user32.PostThreadMessageW(
+                    self._thread_id, self.WM_QUIT, 0, 0
+                ):
+                    print("界面变化监听退出消息发送失败。", file=sys.stderr)
+            self._thread.join(timeout=3)
+            if self._thread.is_alive():
+                print("界面变化监听未能及时退出。", file=sys.stderr)
+
+        def _handle(
+            self,
+            _hook: Any,
+            event_id: int,
+            hwnd: int,
+            _object_id: int,
+            _child_id: int,
+            _event_thread: int,
+            _event_time: int,
+        ) -> None:
+            if not hwnd or not is_navigation_structure_event(int(event_id)):
+                return
+            event_hwnd = native_handle_value(hwnd)
+            root_hwnd = native_handle_value(user32.GetAncestor(event_hwnd, ga_root))
+            if root_hwnd <= 0:
+                root_hwnd = event_hwnd
+            dirty_windows.mark(root_hwnd, window_process_id(root_hwnd))
+
+        def _run(self) -> None:
+            self._thread_id = int(kernel32.GetCurrentThreadId())
+            message = wintypes.MSG()
+            user32.PeekMessageW(
+                ctypes.byref(message), None, 0, 0, pm_noremove
+            )
+            self._callback = win_event_proc_type(self._handle)
+            for event_min, event_max in self.HOOK_RANGES:
+                hook = user32.SetWinEventHook(
+                    event_min,
+                    event_max,
+                    None,
+                    self._callback,
+                    0,
+                    0,
+                    winevent_outofcontext | winevent_skipownprocess,
+                )
+                if hook:
+                    self._hooks.append(native_handle_value(hook))
+            self._ready.set()
+            if not self._hooks:
+                return
+            try:
+                while user32.GetMessageW(ctypes.byref(message), None, 0, 0) > 0:
+                    user32.TranslateMessage(ctypes.byref(message))
+                    user32.DispatchMessageW(ctypes.byref(message))
+            finally:
+                for hook in self._hooks:
+                    user32.UnhookWinEvent(hook)
+                self._hooks.clear()
+                self._thread_id = 0
 
     class KeyboardHook:
         WH_KEYBOARD_LL = 13
@@ -3430,6 +4112,12 @@ def _run_windows(args: argparse.Namespace) -> int:
 
     hook = KeyboardHook(enqueue_keyboard_action, active)
     hook.start()
+    structure_watcher = StructureChangeWatcher()
+    if not structure_watcher.start():
+        print(
+            "界面变化监听未完整启用，将按缓存时限兜底刷新。",
+            file=sys.stderr,
+        )
 
     def leave_navigation() -> None:
         nonlocal navigation_root_hwnd, navigation_process_id
@@ -3670,8 +4358,15 @@ def _run_windows(args: argparse.Namespace) -> int:
     geometry_timer.timeout.connect(monitor_navigation_context)
     geometry_timer.start(250)
 
+    cleanup_complete = False
+
     def cleanup() -> None:
+        nonlocal cleanup_complete
+        if cleanup_complete:
+            return
+        cleanup_complete = True
         hook.stop()
+        structure_watcher.stop()
         worker.stop()
 
     app.aboutToQuit.connect(cleanup)
@@ -3684,7 +4379,10 @@ def _run_windows(args: argparse.Namespace) -> int:
     )
     if diagnostics_enabled:
         print("导航诊断已开启。每次方向移动都会解释候选排序。")
-    return int(app.exec())
+    try:
+        return int(app.exec())
+    finally:
+        cleanup()
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
