@@ -719,3 +719,31 @@ UIA 语义执行。右键不对仅有语义、实际无法命中的隐藏控件�
 伴随原型，没有接入正式按键出口、配置、依赖或冻结包。正式接入前只剩两项产品选择需要
 确认：用哪个遥控器动作进入/退出元素导航，以及首批启用哪些固定软件。完全不暴露
 UIA/MSAA 的自绘控件仍无法可靠识别；拖拽和任意坐标移动明确不在本模式范围内。
+
+## 16. 2026-08-28 空间路径算法二次校正
+
+本轮针对两个实测反例重新核对成熟空间导航实现，不再继续凭截图调整距离权重：
+
+- W3C CSS Spatial Navigation Level 1 先筛选请求方向内的候选，再按主轴距离、正交轴
+  距离、重叠和对齐度选优；规范本身没有把“从下一行左端绕回”置于正常方向候选之前。
+- Android `FocusFinder` 使用 `isCandidate`、`beamBeats` 和主轴/次轴加权距离；同一条
+  方向通道里的候选优先，方向外元素不能因为更近就抢走焦点。
+- Chromium `spatial_navigation.cc` 明确处理矩形包含和重叠：离开子元素时跳过包住当前
+  元素的底层容器，当前大块内部独立可操作的子元素则优先于外部下一项。
+
+官方入口：
+
+- `https://www.w3.org/TR/css-nav-1/`
+- `https://android.googlesource.com/platform/frameworks/base/+/refs/heads/main/core/java/android/view/FocusFinder.java`
+- `https://chromium.googlesource.com/chromium/src/+/refs/heads/main/third_party/blink/renderer/core/page/spatial_navigation.cc`
+
+原型据此保留已有四向距离和视觉通道规则，只修正两处通用边界：
+
+1. 请求方向内已有正常候选时，默认先走正常候选；跨行绕回只作为网格末端补充。只有
+   UIA 路径明确表明绕回仍在更近的同一内容分支时，才允许它先于斜向的其它分支候选。
+2. 父块内部、纵向位置明显独立的小操作保留并优先，例如文件夹下方的“展开显示”；
+   与父行重合的隐藏悬停按钮仍过滤，避免重新产生空白区域和侧栏假元素。
+
+这不是照搬网页或 Android 源码，而是使用其候选边界和包含关系原则修正 Windows
+UIA 原型。截图回归、真实 Codex 窗口扫描、随机布局和完整测试结果登记在
+`TESTING.md` 的 `CHECK-NAV-003`。

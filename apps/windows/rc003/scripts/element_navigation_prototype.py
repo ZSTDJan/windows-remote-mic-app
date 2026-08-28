@@ -207,6 +207,11 @@ def direction_score(
 
     if current == candidate:
         return None
+    # Chromium spatial navigation skips an underlying container when moving
+    # out of an element, while allowing an actionable child inside the current
+    # rectangle to be reached directly.
+    if candidate.contains(current):
+        return None
 
     if direction == Direction.RIGHT:
         if candidate.center_x <= current.center_x:
@@ -388,11 +393,13 @@ def ranked_target_indices(
             tuple[int, float, float, float, float, int, int], int, int
         ],
     ) -> tuple[float, ...]:
-        score, common_prefix, _index = item
+        score, common_prefix, index = item
+        contained_rank = 0.0 if current.contains(targets[index].rect) else 1.0
         path_bonus = min(common_prefix, 4) * (
             24.0 if score[0] == 0 else affinity_unit
         )
         return (
+            contained_rank,
             float(score[0]),
             max(0.0, score[1] - path_bonus),
             score[2],
@@ -407,11 +414,11 @@ def ranked_target_indices(
     if direction not in {Direction.RIGHT, Direction.LEFT}:
         return [index for _score, _prefix, index in scored]
 
-    # Horizontal navigation behaves like a reading-order grid: finish the
-    # current row, wrap to the adjacent row inside the same content branch,
-    # then consider diagonals that keep progressing in the same reading
-    # direction. Right must not climb back to an earlier row, and left must
-    # not drop into a later row, otherwise repeated presses can form loops.
+    # A real candidate in the requested half-plane is the default, matching
+    # established spatial-navigation algorithms. Reading-order wrap is a
+    # fallback for grids whose next item starts on the other side of the next
+    # row. It may win only when UIA paths show that the wrap stays in a more
+    # closely related branch than the best diagonal candidate.
     in_row = [index for score, _prefix, index in scored if score[0] == 0]
     diagonal = [
         index
@@ -430,8 +437,22 @@ def ranked_target_indices(
     ]
     wrapped = horizontal_wrap_target_indices(targets, current_index, direction)
     ranked = list(in_row)
-    ranked.extend(index for index in wrapped if index not in ranked)
-    ranked.extend(index for index in diagonal if index not in ranked)
+    if diagonal and wrapped:
+        diagonal_affinity = _common_path_prefix_length(
+            targets[current_index].path, targets[diagonal[0]].path
+        )
+        wrap_affinity = _common_path_prefix_length(
+            targets[current_index].path, targets[wrapped[0]].path
+        )
+        fallback_groups = (
+            (wrapped, diagonal)
+            if wrap_affinity > diagonal_affinity
+            else (diagonal, wrapped)
+        )
+    else:
+        fallback_groups = (diagonal, wrapped)
+    for group in fallback_groups:
+        ranked.extend(index for index in group if index not in ranked)
     return ranked
 
 
@@ -814,6 +835,27 @@ def hit_target_match_index(
     return max(matches)[-1]
 
 
+def nested_semantic_action_is_distinct(
+    target: TargetSnapshot, parent: TargetSnapshot
+) -> bool:
+    """Keep a real child action only when it forms a separate visual row."""
+
+    if not semantic_action_can_bypass_point_hit(target):
+        return False
+    if target.name in PRESERVED_NESTED_ACTION_NAMES:
+        return True
+    minimum_parent_height = max(
+        target.rect.height + 24.0,
+        target.rect.height * 1.75,
+    )
+    minimum_vertical_offset = max(12.0, target.rect.height * 0.40)
+    return bool(
+        parent.rect.height >= minimum_parent_height
+        and abs(target.rect.center_y - parent.rect.center_y)
+        >= minimum_vertical_offset
+    )
+
+
 def nested_container_keep_indices(targets: Sequence[TargetSnapshot]) -> list[int]:
     """Drop wrappers and secondary descendants around a primary action."""
 
@@ -845,7 +887,7 @@ def nested_container_keep_indices(targets: Sequence[TargetSnapshot]) -> list[int
 
         nested_under_primary_action = any(
             other_index != index
-            and target.name not in PRESERVED_NESTED_ACTION_NAMES
+            and not nested_semantic_action_is_distinct(target, other)
             and other.path
             and len(other.path) < len(target.path)
             and target.path[: len(other.path)] == other.path

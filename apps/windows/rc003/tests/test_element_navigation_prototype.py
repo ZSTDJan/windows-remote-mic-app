@@ -106,6 +106,40 @@ class SpatialNavigationTests(unittest.TestCase):
             [1, 2],
         )
 
+    def test_forward_same_branch_target_beats_wrap_to_sidebar(self):
+        targets = [
+            self.target(
+                760,
+                350,
+                800,
+                390,
+                "current message action",
+                path=(0, 2, 4, 8),
+            ),
+            self.target(
+                1640,
+                405,
+                1730,
+                460,
+                "continue",
+                path=(0, 2, 5, 0),
+            ),
+            self.target(
+                40,
+                425,
+                390,
+                470,
+                "sidebar conversation",
+                path=(0, 1, 7),
+            ),
+        ]
+        self.assertEqual(
+            prototype.ranked_target_indices(
+                targets, 0, prototype.Direction.RIGHT
+            )[:2],
+            [1, 2],
+        )
+
     def test_visual_distance_beats_deeper_uia_branch(self):
         targets = [
             self.target(500, 100, 600, 150, "current", path=(0, 2, 0)),
@@ -659,7 +693,7 @@ class SpatialNavigationTests(unittest.TestCase):
         ]
         self.assertEqual(prototype.nested_container_keep_indices(targets), [0])
 
-    def test_drops_secondary_action_nested_inside_primary_button(self):
+    def test_drops_same_row_hover_action_nested_inside_primary_button(self):
         targets = [
             self.target(
                 40,
@@ -681,6 +715,45 @@ class SpatialNavigationTests(unittest.TestCase):
             ),
         ]
         self.assertEqual(prototype.nested_container_keep_indices(targets), [0])
+
+    def test_nested_show_more_remains_the_next_down_target(self):
+        folder = self.target(
+            20,
+            140,
+            360,
+            245,
+            "folder",
+            path=(0, 1),
+            has_action_pattern=True,
+        )
+        show_more = self.target(
+            45,
+            200,
+            175,
+            238,
+            "展开显示",
+            path=(0, 1, 0),
+            has_action_pattern=True,
+        )
+        next_folder = self.target(
+            20,
+            265,
+            360,
+            310,
+            "next folder",
+            path=(0, 2),
+            has_action_pattern=True,
+        )
+        targets = [folder, show_more, next_folder]
+        kept = prototype.nested_container_keep_indices(targets)
+        visible = [targets[index] for index in kept]
+        self.assertEqual(kept, [0, 1, 2])
+        self.assertEqual(
+            prototype.next_target_index(
+                visible, 0, prototype.Direction.DOWN
+            ),
+            1,
+        )
 
     def test_keeps_message_actions_nested_inside_message_button(self):
         targets = [
