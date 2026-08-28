@@ -684,6 +684,41 @@ class RoundTripTests(unittest.TestCase):
                         config.default_key_bindings(),
                     )
 
+    def test_single_config_save_restores_previous_file_when_readback_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.json"
+            previous = b'{"old": true}\n'
+            path.write_bytes(previous)
+
+            with mock.patch.object(
+                config,
+                "load_config",
+                side_effect=config.ConfigFormatError("readback failed"),
+            ):
+                with self.assertRaisesRegex(
+                    config.ConfigFormatError, "readback failed"
+                ):
+                    config.save_config_and_load(path, config.default_config())
+
+            self.assertEqual(path.read_bytes(), previous)
+
+    def test_single_config_save_reports_an_incomplete_rollback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.json"
+            path.write_text('{"old": true}\n', encoding="utf-8")
+
+            with mock.patch.object(
+                config,
+                "load_config",
+                side_effect=config.ConfigFormatError("readback failed"),
+            ), mock.patch.object(
+                config,
+                "_restore_file_snapshot",
+                side_effect=OSError("rollback locked"),
+            ):
+                with self.assertRaises(config.ConfigTransactionError):
+                    config.save_config_and_load(path, config.default_config())
+
     def test_legacy_reference_chords_are_migrated_to_semantic_actions(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "key_bindings.json"

@@ -1374,6 +1374,7 @@ Item {
                         compactMinimumWidth: tokens.buttonWidth4Chars
                         text: qsTr("保存映射")
                         highlighted: true
+                        enabled: !SettingsController.voiceHotkeyBusy
                         onClicked: {
                             SettingsController.saveSettings()
                             root.scheduleConnectorRepaint()

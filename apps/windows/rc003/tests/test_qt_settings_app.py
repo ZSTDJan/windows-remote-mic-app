@@ -571,6 +571,104 @@ class SettingsControllerTests(unittest.TestCase):
         self.assertEqual(controller.holdVoiceHotkeyText, previous)
         self.assertIn("WeType rejected", controller.errorMessage)
 
+    def test_reentering_the_current_provider_refreshes_its_shortcut(self):
+        controller, _ = self._make_controller()
+        controller.selectedVoiceProgramIndex = 2
+        self._voice_hotkey_read_mock.reset_mock()
+
+        controller.selectedVoiceProgramIndex = 2
+
+        self._voice_hotkey_read_mock.assert_called_once_with("wetype")
+        self.assertFalse(controller.voiceHotkeyBusy)
+
+    def test_reentering_the_same_hotkey_still_synchronizes_the_provider(self):
+        controller, _ = self._make_controller()
+        controller.selectedVoiceProgramIndex = 2
+        current = controller.holdVoiceHotkeyText
+        self._voice_hotkey_sync_mock.reset_mock()
+
+        controller.holdVoiceHotkeyText = current
+
+        self._voice_hotkey_sync_mock.assert_called_once_with("wetype", current)
+        self.assertFalse(controller.voiceHotkeyBusy)
+
+    def test_provider_sync_exception_keeps_the_saved_shortcut_and_clears_busy(self):
+        controller, _ = self._make_controller()
+        controller.selectedVoiceProgramIndex = 2
+        previous = controller.holdVoiceHotkeyText
+        self._voice_hotkey_sync_mock.side_effect = OSError("provider unavailable")
+
+        controller.holdVoiceHotkeyText = "lctrl+lshift+f9"
+
+        self.assertEqual(controller.holdVoiceHotkeyText, previous)
+        self.assertFalse(controller.voiceHotkeyBusy)
+        self.assertIn("provider unavailable", controller.errorMessage)
+
+    def test_failed_provider_value_adoption_restores_the_saved_display(self):
+        controller, _ = self._make_controller()
+        controller.selectedVoiceProgramIndex = 2
+        previous = controller.holdVoiceHotkeyText
+        self._voice_hotkey_sync_mock.side_effect = None
+        self._voice_hotkey_sync_mock.return_value = (
+            qt_settings_app.voice_hotkey_sync_windows.VoiceHotkeySyncResult(
+                "wetype",
+                False,
+                "rollback_failed",
+                "lctrl+lshift+f8",
+                "provider remains changed",
+            )
+        )
+
+        with mock.patch.object(
+            config, "save_config", side_effect=OSError("settings file is locked")
+        ):
+            controller.holdVoiceHotkeyText = "lctrl+lshift+f9"
+
+        self.assertEqual(controller.holdVoiceHotkeyText, previous)
+        self.assertIn("两边仍不一致", controller.errorMessage)
+
+    def test_readback_failure_restores_disk_ui_and_provider_to_previous_hotkey(self):
+        controller, _ = self._make_controller()
+        controller.selectedVoiceProgramIndex = 2
+        previous = controller.holdVoiceHotkeyText
+        config_path = config.config_path(config.config_root())
+        previous_bytes = config_path.read_bytes()
+        self._voice_hotkey_sync_mock.side_effect = [
+            qt_settings_app.voice_hotkey_sync_windows.VoiceHotkeySyncResult(
+                "wetype",
+                True,
+                "synced",
+                "lctrl+lshift+f9",
+                "shortcut synchronized",
+            ),
+            qt_settings_app.voice_hotkey_sync_windows.VoiceHotkeySyncResult(
+                "wetype",
+                True,
+                "synced",
+                previous,
+                "shortcut restored",
+            ),
+        ]
+
+        with mock.patch.object(
+            config,
+            "load_config",
+            side_effect=config.ConfigFormatError("readback failed"),
+        ):
+            controller.holdVoiceHotkeyText = "lctrl+lshift+f9"
+
+        self.assertEqual(config_path.read_bytes(), previous_bytes)
+        self.assertEqual(controller.holdVoiceHotkeyText, previous)
+        self.assertFalse(controller.voiceHotkeyBusy)
+        self.assertIn("语音程序快捷键已恢复原值", controller.errorMessage)
+        self.assertEqual(
+            self._voice_hotkey_sync_mock.call_args_list,
+            [
+                mock.call("wetype", "lctrl+lshift+f9"),
+                mock.call("wetype", previous),
+            ],
+        )
+
     def test_failed_local_save_reports_when_provider_rollback_also_fails(self):
         controller, _ = self._make_controller()
         controller.selectedVoiceProgramIndex = 2
@@ -629,6 +727,16 @@ class SettingsControllerTests(unittest.TestCase):
             saved["voice_hotkeys_by_provider"]["wetype"]["hold"],
             "lctrl+lshift+f9",
         )
+
+    def test_refreshing_local_only_provider_does_not_leave_processing_status(self):
+        controller, _ = self._make_controller()
+        controller._set_status_message("existing voice result", 2)
+
+        controller.refreshVoiceHotkeyFromProvider()
+
+        self.assertFalse(controller.voiceHotkeyBusy)
+        self.assertEqual(controller.statusMessage, "existing voice result")
+        self._voice_hotkey_read_mock.assert_not_called()
 
     def test_selecting_windows_dictation_uses_system_management_and_win_h_helper(self):
         controller, _ = self._make_controller()
@@ -733,6 +841,16 @@ class SettingsControllerTests(unittest.TestCase):
 
         self.assertEqual(controller.holdVoiceHotkeyText, "ralt")
         self.assertIn("语音设置保存失败", controller.errorMessage)
+
+    def test_mapping_save_is_rejected_during_voice_hotkey_work(self):
+        controller, _ = self._make_controller()
+        controller._set_voice_hotkey_busy(True)
+
+        with mock.patch.object(config, "save_settings_pair") as save_pair:
+            self.assertFalse(controller.saveSettings())
+
+        save_pair.assert_not_called()
+        self.assertIn("语音快捷键正在处理", controller.errorMessage)
 
     def test_voice_program_launch_reports_a_normal_provider_result(self):
         controller, _ = self._make_controller()
@@ -2921,6 +3039,22 @@ class DiagnosticsControllerTests(unittest.TestCase):
         self.assertIn("正在启动", diag.vbCableTestMessage)
         loopback.assert_not_called()
 
+    def test_vb_cable_channel_test_rejects_voice_hotkey_work_in_progress(self):
+        settings_controller = self._make_settings_controller()
+        diag = self.DiagnosticsController(settings_controller, self._config_root)
+        self._pump_until(lambda: not diag.isRefreshing)
+        settings_controller._set_voice_hotkey_busy(True)
+
+        with mock.patch.object(
+            windows_diagnostics, "check_vb_cable_loopback_isolated"
+        ) as loopback:
+            diag.testVbCableChannel()
+
+        self.assertFalse(diag.vbCableTestRunning)
+        self.assertEqual(diag.vbCableTestStatus, "fail")
+        self.assertIn("语音快捷键正在处理", diag.vbCableTestMessage)
+        loopback.assert_not_called()
+
     def test_vb_cable_channel_test_and_refresh_are_mutually_exclusive(self):
         release_event = threading.Event()
         call_count = {"n": 0}
@@ -4511,7 +4645,11 @@ class SettingsShellSourceContractTests(unittest.TestCase):
         self.assertIn('titleText: qsTr("麦克风权限")', self.voice_qml)
         self.assertNotIn('stateText: qsTr("待确认")', self.voice_qml)
         self.assertIn('qsTr("切换程序时自动读取；录入后同步并保存")', self.voice_qml)
-        self.assertIn('? qsTr("录入中") : qsTr("已保存")', self.voice_qml)
+        self.assertIn('? qsTr("录入中")', self.voice_qml)
+        self.assertIn(
+            'root.voiceHotkeyBusy ? qsTr("处理中") : qsTr("已保存")',
+            self.voice_qml,
+        )
         for misleading_claim in (
             "已授权",
             "Remote Mic 需要管理员权限",
@@ -4715,6 +4853,10 @@ class ThreePageSettingsSourceContractTests(unittest.TestCase):
         self.assertIn('objectName: "openSpeechSettingsButton"', self.voice_qml)
         self.assertIn("SettingsController.selectedVoiceProgramIndex === 3", self.voice_qml)
         self.assertIn("SettingsController.selectedVoiceProgramIndex === 4", self.voice_qml)
+        self.assertIn(
+            "SettingsController.refreshVoiceHotkeyFromProvider()", self.voice_qml
+        )
+        self.assertIn("readonly property bool voiceHotkeyBusy", self.voice_qml)
 
     def test_voice_audio_rows_auto_save_and_keep_manual_privacy_only(self):
         for object_name in (

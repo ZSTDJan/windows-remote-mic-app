@@ -250,14 +250,34 @@ def _read_sogou_hotkey(*, appdata: Optional[Path]) -> VoiceHotkeySyncResult:
     )
 
 
-def _sogou_voice_process_running() -> bool:
+def _sogou_voice_process_running() -> Optional[bool]:
     try:
         status = voice_program_manager.inspect_voice_program(
             {"provider": voice_program_manager.VOICE_PROGRAM_SOGOU}
         )
+        return bool(status.running)
     except Exception:
-        return False
-    return status.running
+        return None
+
+
+def _replace_bytes_atomically(path: Path, content: bytes) -> None:
+    temporary: Optional[Path] = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="wb", dir=path.parent, prefix=f".{path.name}.", delete=False
+        ) as handle:
+            temporary = Path(handle.name)
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        temporary = None
+    finally:
+        if temporary is not None:
+            try:
+                temporary.unlink()
+            except OSError:
+                pass
 
 
 def _sync_sogou_hotkey(
@@ -265,7 +285,15 @@ def _sync_sogou_hotkey(
 ) -> VoiceHotkeySyncResult:
     provider = voice_program_manager.VOICE_PROGRAM_SOGOU
     path = _sogou_config_path(appdata)
-    if _sogou_voice_process_running():
+    process_running = _sogou_voice_process_running()
+    if process_running is None:
+        return VoiceHotkeySyncResult(
+            provider,
+            False,
+            "process_check_failed",
+            message="无法确认搜狗语音助手是否正在运行；为避免覆盖运行中的配置，本次未写入。",
+        )
+    if process_running:
         return VoiceHotkeySyncResult(
             provider,
             False,
@@ -277,9 +305,20 @@ def _sync_sogou_hotkey(
             provider, False, "not_found", message="未找到搜狗语音快捷键配置。"
         )
 
-    original = path.read_bytes()
+    try:
+        original = path.read_bytes()
+    except OSError as exc:
+        return VoiceHotkeySyncResult(
+            provider, False, "read_failed", message=f"读取搜狗快捷键失败：{exc}"
+        )
+
+    replaced = False
+    previous_shortcut = ""
     try:
         document = _load_sogou_document(path)
+        previous_shortcut = _provider_tokens_to_hotkey(
+            document["setting"].get("shortcutKeysPress")
+        )
         document["setting"]["shortcutKeysPress"] = _hotkey_to_provider_tokens(
             shortcut
         )
@@ -288,24 +327,34 @@ def _sync_sogou_hotkey(
             json.dumps(document, ensure_ascii=False, indent="\t") + "\n"
         ).encode("utf-8")
         path.parent.mkdir(parents=True, exist_ok=True)
-        with tempfile.NamedTemporaryFile(
-            mode="wb", dir=path.parent, prefix=f".{path.name}.", delete=False
-        ) as handle:
-            temporary = Path(handle.name)
-            handle.write(payload)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary, path)
+        _replace_bytes_atomically(path, payload)
+        replaced = True
         verification = _read_sogou_hotkey(appdata=appdata)
         if not verification.ok or verification.hotkey != shortcut:
             raise RuntimeError("写入后读回不一致")
     except Exception as exc:
-        try:
-            path.write_bytes(original)
-        except OSError:
-            pass
+        if replaced:
+            try:
+                _replace_bytes_atomically(path, original)
+                if path.read_bytes() != original:
+                    raise OSError("恢复后内容不一致")
+            except Exception as rollback_exc:
+                current = _read_sogou_hotkey(appdata=appdata)
+                return VoiceHotkeySyncResult(
+                    provider,
+                    False,
+                    "rollback_failed",
+                    current.hotkey if current.ok else "",
+                    message=(
+                        f"同步搜狗快捷键失败：{exc}；原快捷键也未能恢复：{rollback_exc}。"
+                    ),
+                )
         return VoiceHotkeySyncResult(
-            provider, False, "write_failed", message=f"同步搜狗快捷键失败：{exc}"
+            provider,
+            False,
+            "write_failed",
+            previous_shortcut,
+            message=f"同步搜狗快捷键失败：{exc}",
         )
     return VoiceHotkeySyncResult(
         provider, True, "synced", shortcut, "已同步到搜狗的按住说快捷键。"
@@ -502,6 +551,42 @@ def _read_wetype_hotkey() -> VoiceHotkeySyncResult:
         )
 
 
+def _wait_for_wetype_hotkey(window, expected: str) -> tuple[bool, str]:
+    deadline = time.monotonic() + _WETYPE_CONTROL_WAIT_SECONDS
+    current = ""
+    while True:
+        try:
+            current = _wetype_name_to_hotkey(
+                _find_wetype_hotkey_group(window).Name
+            )
+        except (RuntimeError, ValueError):
+            current = ""
+        if current == expected:
+            return True, current
+        if time.monotonic() >= deadline:
+            return False, current
+        time.sleep(0.05)
+
+
+def _restore_wetype_hotkey(window, previous: str) -> tuple[bool, str, str]:
+    try:
+        previous_spec = hotkey.HotkeySpec.parse(previous)
+        rollback_tokens = (*previous_spec.modifiers, previous_spec.key)
+        _find_wetype_hotkey_group(window).Click()
+        time.sleep(0.35)
+        win32_input.send_wetype_voice_key_combo_tap(rollback_tokens)
+        restored, current = _wait_for_wetype_hotkey(window, previous)
+        return restored, current, "" if restored else "恢复后读回不一致"
+    except Exception as exc:
+        try:
+            current = _wetype_name_to_hotkey(
+                _find_wetype_hotkey_group(window).Name
+            )
+        except Exception:
+            current = ""
+        return False, current, str(exc)
+
+
 def _sync_wetype_hotkey(
     shortcut: str, tokens: Sequence[str]
 ) -> VoiceHotkeySyncResult:
@@ -510,34 +595,52 @@ def _sync_wetype_hotkey(
     def write(window):
         group = _find_wetype_hotkey_group(window)
         previous = _wetype_name_to_hotkey(group.Name)
-        group.Click()
-        time.sleep(0.35)
-        win32_input.send_wetype_voice_key_combo_tap(tokens)
-        deadline = time.monotonic() + _WETYPE_CONTROL_WAIT_SECONDS
-        while time.monotonic() < deadline:
-            try:
-                current = _wetype_name_to_hotkey(
-                    _find_wetype_hotkey_group(window).Name
-                )
-            except (RuntimeError, ValueError):
-                time.sleep(0.05)
-                continue
-            if current == shortcut:
-                return VoiceHotkeySyncResult(
-                    provider, True, "synced", shortcut, "已同步到微信输入法的按住说快捷键。"
-                )
-            time.sleep(0.05)
+        if previous == shortcut:
+            return VoiceHotkeySyncResult(
+                provider, True, "synced", shortcut, "微信输入法快捷键已经一致。"
+            )
 
-        if previous != shortcut:
-            try:
-                previous_spec = hotkey.HotkeySpec.parse(previous)
-                rollback_tokens = (*previous_spec.modifiers, previous_spec.key)
-                _find_wetype_hotkey_group(window).Click()
-                time.sleep(0.35)
-                win32_input.send_wetype_voice_key_combo_tap(rollback_tokens)
-            except Exception:
-                pass
-        raise RuntimeError("微信输入法写入后读回不一致")
+        write_started = False
+        try:
+            group.Click()
+            write_started = True
+            time.sleep(0.35)
+            win32_input.send_wetype_voice_key_combo_tap(tokens)
+            matched, _ = _wait_for_wetype_hotkey(window, shortcut)
+            if matched:
+                return VoiceHotkeySyncResult(
+                    provider,
+                    True,
+                    "synced",
+                    shortcut,
+                    "已同步到微信输入法的按住说快捷键。",
+                )
+            failure = RuntimeError("微信输入法写入后读回不一致")
+        except Exception as exc:
+            failure = exc
+
+        if not write_started:
+            raise failure
+        restored, current, rollback_error = _restore_wetype_hotkey(window, previous)
+        if restored:
+            return VoiceHotkeySyncResult(
+                provider,
+                False,
+                "write_failed",
+                previous,
+                f"同步微信快捷键失败：{failure}；已恢复原快捷键。",
+            )
+        current_text = f" 当前读到 {current}。" if current else ""
+        return VoiceHotkeySyncResult(
+            provider,
+            False,
+            "rollback_failed",
+            current,
+            message=(
+                f"同步微信快捷键失败：{failure}；原快捷键也未能恢复："
+                f"{rollback_error or '恢复后读回不一致'}。{current_text}"
+            ),
+        )
 
     try:
         return _with_wetype_window(write)

@@ -102,6 +102,91 @@ class SogouVoiceHotkeyTests(unittest.TestCase):
         self.assertEqual(result.code, "restart_required")
         self.assertEqual(self.path.read_bytes(), before)
 
+    def test_refuses_to_write_when_sogou_process_state_cannot_be_checked(self):
+        before = self.path.read_bytes()
+        with mock.patch.object(
+            voice_hotkey_sync_windows,
+            "_sogou_voice_process_running",
+            return_value=None,
+        ):
+            result = voice_hotkey_sync_windows.sync_provider_hotkey(
+                "sogou",
+                "rctrl",
+                platform="win32",
+                appdata=self.appdata,
+            )
+
+        self.assertFalse(result.ok)
+        self.assertEqual(result.code, "process_check_failed")
+        self.assertEqual(self.path.read_bytes(), before)
+
+    def test_reports_sogou_config_read_permission_error_without_raising(self):
+        with mock.patch.object(
+            Path,
+            "read_bytes",
+            side_effect=PermissionError("access denied"),
+        ), mock.patch.object(
+            voice_hotkey_sync_windows,
+            "_sogou_voice_process_running",
+            return_value=False,
+        ):
+            result = voice_hotkey_sync_windows.sync_provider_hotkey(
+                "sogou",
+                "rctrl",
+                platform="win32",
+                appdata=self.appdata,
+            )
+
+        self.assertFalse(result.ok)
+        self.assertEqual(result.code, "read_failed")
+        self.assertIn("access denied", result.message)
+
+    def test_reports_actual_sogou_hotkey_when_rollback_fails(self):
+        real_read = voice_hotkey_sync_windows._read_sogou_hotkey
+        real_replace = voice_hotkey_sync_windows._replace_bytes_atomically
+        read_count = 0
+        replace_count = 0
+
+        def read_with_first_verification_failure(*, appdata):
+            nonlocal read_count
+            read_count += 1
+            if read_count == 1:
+                return voice_hotkey_sync_windows.VoiceHotkeySyncResult(
+                    "sogou", False, "read_failed", message="verification failed"
+                )
+            return real_read(appdata=appdata)
+
+        def replace_with_rollback_failure(path, content):
+            nonlocal replace_count
+            replace_count += 1
+            if replace_count == 2:
+                raise OSError("rollback locked")
+            real_replace(path, content)
+
+        with mock.patch.object(
+            voice_hotkey_sync_windows,
+            "_sogou_voice_process_running",
+            return_value=False,
+        ), mock.patch.object(
+            voice_hotkey_sync_windows,
+            "_read_sogou_hotkey",
+            side_effect=read_with_first_verification_failure,
+        ), mock.patch.object(
+            voice_hotkey_sync_windows,
+            "_replace_bytes_atomically",
+            side_effect=replace_with_rollback_failure,
+        ):
+            result = voice_hotkey_sync_windows.sync_provider_hotkey(
+                "sogou",
+                "lctrl+lshift+f9",
+                platform="win32",
+                appdata=self.appdata,
+            )
+
+        self.assertFalse(result.ok)
+        self.assertEqual(result.code, "rollback_failed")
+        self.assertEqual(result.hotkey, "lctrl+lshift+f9")
+
 
 class FakeHotkeyGroup:
     def __init__(self, name):
@@ -180,6 +265,82 @@ class WeTypeVoiceHotkeyTests(unittest.TestCase):
         self.assertTrue(result.ok)
         self.assertEqual(result.hotkey, "lctrl+lshift+f8")
         self.assertEqual(group.clicks, 1)
+
+    def test_does_not_reinject_an_already_matching_wetype_hotkey(self):
+        group = FakeHotkeyGroup("左\nCtrl\n左\nShift\nF9")
+        with mock.patch.object(
+            voice_hotkey_sync_windows,
+            "_with_wetype_window",
+            side_effect=lambda callback: callback(object()),
+        ), mock.patch.object(
+            voice_hotkey_sync_windows,
+            "_find_wetype_hotkey_group",
+            return_value=group,
+        ), mock.patch.object(
+            voice_hotkey_sync_windows.win32_input,
+            "send_wetype_voice_key_combo_tap",
+        ) as sender:
+            result = voice_hotkey_sync_windows.sync_provider_hotkey(
+                "wetype", "lctrl+lshift+f9", platform="win32"
+            )
+
+        self.assertTrue(result.ok)
+        sender.assert_not_called()
+        self.assertEqual(group.clicks, 0)
+
+    def test_restores_wetype_hotkey_after_failed_write_verification(self):
+        group = FakeHotkeyGroup("左\nCtrl\n左\nShift\nF9")
+        with mock.patch.object(
+            voice_hotkey_sync_windows,
+            "_with_wetype_window",
+            side_effect=lambda callback: callback(object()),
+        ), mock.patch.object(
+            voice_hotkey_sync_windows,
+            "_find_wetype_hotkey_group",
+            return_value=group,
+        ), mock.patch.object(
+            voice_hotkey_sync_windows,
+            "_wait_for_wetype_hotkey",
+            side_effect=[(False, "lctrl+lshift+f7"), (True, "lctrl+lshift+f9")],
+        ), mock.patch.object(
+            voice_hotkey_sync_windows.win32_input,
+            "send_wetype_voice_key_combo_tap",
+        ) as sender:
+            result = voice_hotkey_sync_windows.sync_provider_hotkey(
+                "wetype", "lctrl+lshift+f8", platform="win32"
+            )
+
+        self.assertFalse(result.ok)
+        self.assertEqual(result.code, "write_failed")
+        self.assertEqual(result.hotkey, "lctrl+lshift+f9")
+        self.assertEqual(sender.call_count, 2)
+        self.assertEqual(group.clicks, 2)
+
+    def test_reports_observed_wetype_hotkey_when_rollback_fails(self):
+        group = FakeHotkeyGroup("左\nCtrl\n左\nShift\nF9")
+        with mock.patch.object(
+            voice_hotkey_sync_windows,
+            "_with_wetype_window",
+            side_effect=lambda callback: callback(object()),
+        ), mock.patch.object(
+            voice_hotkey_sync_windows,
+            "_find_wetype_hotkey_group",
+            return_value=group,
+        ), mock.patch.object(
+            voice_hotkey_sync_windows,
+            "_wait_for_wetype_hotkey",
+            side_effect=[(False, "lctrl+lshift+f7"), (False, "lctrl+lshift+f7")],
+        ), mock.patch.object(
+            voice_hotkey_sync_windows.win32_input,
+            "send_wetype_voice_key_combo_tap",
+        ):
+            result = voice_hotkey_sync_windows.sync_provider_hotkey(
+                "wetype", "lctrl+lshift+f8", platform="win32"
+            )
+
+        self.assertFalse(result.ok)
+        self.assertEqual(result.code, "rollback_failed")
+        self.assertEqual(result.hotkey, "lctrl+lshift+f7")
 
 
 if __name__ == "__main__":

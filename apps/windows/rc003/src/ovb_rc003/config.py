@@ -183,6 +183,27 @@ def save_config(path: Path, config: Dict[str, Any]) -> None:
     _save_json_atomic(path, persisted)
 
 
+def save_config_and_load(path: Path, config_data: Dict[str, Any]) -> Dict[str, Any]:
+    """Atomically save one config and restore the previous file if verification fails."""
+
+    previous = _read_file_snapshot(path)
+    saved = False
+    try:
+        save_config(path, config_data)
+        saved = True
+        return load_config(path)
+    except BaseException as save_exc:
+        if saved:
+            try:
+                _restore_file_snapshot(path, previous)
+                _verify_file_snapshot(path, previous)
+            except Exception as rollback_exc:
+                raise ConfigTransactionError(
+                    "config save verification failed and rollback was incomplete"
+                ) from save_exc
+        raise
+
+
 def _normalize_voice_hotkey(config: Dict[str, Any]) -> None:
     """Normalize legacy voice settings into provider-scoped hold shortcuts."""
 
@@ -637,9 +658,7 @@ def save_settings_pair(
     _assert_no_forbidden_keys(config_data)
     _assert_no_forbidden_keys(bindings_data)
 
-    previous_config = (
-        config_file.read_bytes() if config_file.is_file() else None
-    )
+    previous_config = _read_file_snapshot(config_file)
     config_saved = False
     try:
         save_config(config_file, config_data)
@@ -695,3 +714,21 @@ def _restore_file_snapshot(path: Path, content: bytes | None) -> None:
         path.unlink(missing_ok=True)
         return
     _save_bytes_atomic(path, content)
+
+
+def _read_file_snapshot(path: Path) -> bytes | None:
+    try:
+        return path.read_bytes()
+    except FileNotFoundError:
+        return None
+
+
+def _verify_file_snapshot(path: Path, content: bytes | None) -> None:
+    if content is None:
+        try:
+            path.stat()
+        except FileNotFoundError:
+            return
+        raise OSError("restored file should not exist")
+    if not path.is_file() or path.read_bytes() != content:
+        raise OSError("restored file does not match its previous contents")

@@ -22,6 +22,7 @@ Item {
         SettingsController.selectedVoiceProgramIndex === 3
     readonly property bool customProgramSelected:
         SettingsController.selectedVoiceProgramIndex === 4
+    readonly property bool voiceHotkeyBusy: SettingsController.voiceHotkeyBusy
     readonly property bool voiceProgramPrivilegeUnknown:
         !voiceProgramSystemManaged
         && SettingsController.voiceProgramStatusCode === "running"
@@ -339,6 +340,7 @@ Item {
     onVisibleChanged: {
         if (visible) {
             SettingsController.refreshVoiceProgramStatus()
+            SettingsController.refreshVoiceHotkeyFromProvider()
         } else {
             stopVoiceHotkeyCapture()
         }
@@ -425,6 +427,7 @@ Item {
                         highlighted: true
                         enabled: !DiagnosticsController.vbCableTestRunning
                             && !SettingsController.bridgeLaunchBusy
+                            && !root.voiceHotkeyBusy
                         onClicked: DiagnosticsController.selectDetectedCableInputAsOutput()
                     }
                 }
@@ -451,6 +454,7 @@ Item {
                             currentIndex: SettingsController.selectedEndpointIndex
                             onActivated: SettingsController.selectAndPersistOutputEndpointIndex(index)
                             enabled: !DiagnosticsController.vbCableTestRunning
+                                && !root.voiceHotkeyBusy
                             Accessible.name: qsTr("输出端点")
                         }
                     ]
@@ -510,6 +514,7 @@ Item {
                             Layout.minimumWidth: 180
                             model: SettingsController.voiceProgramOptions
                             currentIndex: SettingsController.selectedVoiceProgramIndex
+                            enabled: !root.voiceHotkeyBusy
                             onActivated: SettingsController.selectedVoiceProgramIndex = index
                             Accessible.name: qsTr("语音程序")
                         }
@@ -526,7 +531,7 @@ Item {
                         spacing: tokens.spacingSmall
                         indicator.width: 16
                         indicator.height: 16
-                        enabled: root.voiceProgramManaged
+                        enabled: root.voiceProgramManaged && !root.voiceHotkeyBusy
                         text: qsTr("管理员启动")
                         font.family: tokens.fontFamily
                         font.pixelSize: tokens.fontSizeSmall
@@ -556,13 +561,14 @@ Item {
                             Accessible.name: qsTr("自定义语音程序路径")
                         }
                     ]
-                    CompactButton {
-                        objectName: "browseVoiceProgramButton"
-                        tokens: root.tokens
-                        Layout.fillWidth: true
-                        text: qsTr("选择")
-                        onClicked: voiceProgramFileDialog.open()
-                    }
+                        CompactButton {
+                            objectName: "browseVoiceProgramButton"
+                            tokens: root.tokens
+                            Layout.fillWidth: true
+                            text: qsTr("选择")
+                            enabled: !root.voiceHotkeyBusy
+                            onClicked: voiceProgramFileDialog.open()
+                        }
                 }
 
                 InlineSettingsRow {
@@ -578,8 +584,9 @@ Item {
                             ? qsTr("Windows 语音输入使用 Win+H")
                             : qsTr("切换程序时自动读取；录入后同步并保存")
                     stateText: root.voiceHotkeyRecording
-                        ? qsTr("录入中") : qsTr("已保存")
-                    stateColor: root.voiceHotkeyRecording
+                        ? qsTr("录入中")
+                        : root.voiceHotkeyBusy ? qsTr("处理中") : qsTr("已保存")
+                    stateColor: root.voiceHotkeyRecording || root.voiceHotkeyBusy
                         ? tokens.voiceAccent : tokens.successColor
 
                     editorData: [
@@ -589,6 +596,7 @@ Item {
                             tokens: root.tokens
                             Layout.fillWidth: true
                             readOnly: true
+                            enabled: !root.voiceHotkeyBusy
                             text: root.voiceHotkeyRecording
                                 ? qsTr("请按快捷键")
                                 : SettingsController.holdVoiceHotkeyText
@@ -606,6 +614,7 @@ Item {
                         tokens: root.tokens
                         Layout.fillWidth: true
                         text: qsTr("Win+H")
+                        enabled: !root.voiceHotkeyBusy
                         onClicked: SettingsController.useWindowsDictationHotkey()
                     }
                 }
@@ -680,6 +689,7 @@ Item {
                             text: qsTr("启动服务")
                             highlighted: true
                             enabled: !SettingsController.bridgeLaunchBusy
+                                && !root.voiceHotkeyBusy
                             onClicked: SettingsController.startBridge()
                         }
                     ]
@@ -692,6 +702,7 @@ Item {
                         enabled: !DiagnosticsController.isRefreshing
                             && !DiagnosticsController.vbCableTestRunning
                             && !SettingsController.bridgeLaunchBusy
+                            && !root.voiceHotkeyBusy
                         onClicked: SettingsController.bridgeRunning
                             ? bridgeTestConfirmDialog.open()
                             : DiagnosticsController.testVbCableChannel()

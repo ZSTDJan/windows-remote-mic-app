@@ -176,6 +176,7 @@ Item {
                         highlighted: true
                         enabled: !SettingsController.bridgeLaunchBusy
                             && !DiagnosticsController.vbCableTestRunning
+                            && !SettingsController.voiceHotkeyBusy
                         onClicked: SettingsController.startBridge()
                     }
                 }
