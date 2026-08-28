@@ -517,6 +517,56 @@ class VoiceKeyComboTests(unittest.TestCase):
         self.assertGreaterEqual(len(calls), 4)
 
 
+class WeTypeVoiceKeyComboTests(unittest.TestCase):
+    def test_hold_down_and_up_are_each_submitted_as_one_ordered_batch(self):
+        sender = RecordingSender()
+        tokens = ("lctrl", "lshift", "f9")
+
+        win32_input.send_wetype_voice_key_combo_down(tokens, _sender=sender)
+        win32_input.send_wetype_voice_key_combo_up(tokens, _sender=sender)
+
+        ctrl, shift, f9 = [
+            win32_input.win32_keys.VK_CODES[name]
+            for name in ("lctrl", "lshift", "f9")
+        ]
+        self.assertEqual(
+            sender.calls,
+            [
+                [(ctrl, False), (shift, False), (f9, False)],
+                [(f9, True), (shift, True), (ctrl, True)],
+            ],
+        )
+
+    def test_partial_wetype_key_down_releases_only_delivered_keys(self):
+        sender = RecordingSender(sent_counts=[2])
+
+        with self.assertRaises(OSError):
+            win32_input.send_wetype_voice_key_combo_down(
+                ("lctrl", "lshift", "f9"),
+                _sender=sender,
+            )
+
+        ctrl = win32_input.win32_keys.VK_CODES["lctrl"]
+        shift = win32_input.win32_keys.VK_CODES["lshift"]
+        self.assertEqual(sender.calls[1], [(shift, True)])
+        self.assertEqual(sender.calls[2], [(ctrl, True)])
+
+    def test_wetype_tap_keeps_down_and_up_in_one_batch(self):
+        sender = RecordingSender()
+
+        win32_input.send_wetype_voice_key_combo_tap(
+            ("lctrl", "f9"),
+            _sender=sender,
+        )
+
+        ctrl = win32_input.win32_keys.VK_CODES["lctrl"]
+        f9 = win32_input.win32_keys.VK_CODES["f9"]
+        self.assertEqual(
+            sender.calls,
+            [[(ctrl, False), (f9, False), (f9, True), (ctrl, True)]],
+        )
+
+
 class VolumeTests(unittest.TestCase):
     def test_volume_up_taps_the_volume_up_key(self):
         sender = RecordingSender()

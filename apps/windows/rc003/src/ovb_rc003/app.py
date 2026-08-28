@@ -121,6 +121,8 @@ _BUTTON_ACTION_KEY_TOKENS = {
 _KEY_DETECTION_MIC_RELEASE_GRACE_SECONDS = 1.0
 _KEY_DETECTION_MIC_MAX_SECONDS = 10.0
 _ORDINARY_MIC_RELEASE_GUARD_SECONDS = 0.12
+_VOICE_HOTKEY_BACKEND_MARKED = "marked_keybd_event"
+_VOICE_HOTKEY_BACKEND_WETYPE = "wetype_virtual_key_sendinput"
 
 
 def open_configured_application(action: key_mapping.ButtonAction) -> bool:
@@ -196,6 +198,8 @@ class RC003App:
         self._voice_audio_start_fallback_pending = False
         self._voice_audio_started_waiting_for_legacy_f5 = False
         self._voice_hotkey_release_pending: Optional[Tuple[str, ...]] = None
+        self._voice_hotkey_active_backend: Optional[str] = None
+        self._voice_hotkey_release_pending_backend: Optional[str] = None
         self._button_key_release_pending: Optional[Tuple[str, ...]] = None
         # Raw Input and the ATVV control channel arrive on different worker
         # threads. Serialize the voice state machine so one physical press
@@ -762,6 +766,14 @@ class RC003App:
                 return candidate
         return key_mapping.voice_hotkey_for_trigger_mode(mode)
 
+    def _configured_voice_hotkey_backend(self) -> str:
+        settings = voice_program_manager.normalize_voice_program_settings(
+            self._config.get("voice_program")
+        )
+        if settings["provider"] == voice_program_manager.VOICE_PROGRAM_WETYPE:
+            return _VOICE_HOTKEY_BACKEND_WETYPE
+        return _VOICE_HOTKEY_BACKEND_MARKED
+
     def _prepare_voice_mapping_locked(
         self,
         button_id: str,
@@ -811,6 +823,8 @@ class RC003App:
         snapshot = (
             mode == key_mapping.VoiceTriggerMode.HOLD
             and self._voice.trigger_mode == key_mapping.VoiceTriggerMode.HOLD
+            and self._configured_voice_hotkey_backend()
+            != _VOICE_HOTKEY_BACKEND_WETYPE
             and self._voice_hotkey.serialize()
             in {"ralt", "lctrl+win", "lctrl+lwin"}
         )
@@ -1090,9 +1104,14 @@ class RC003App:
                 if is_pressed:
                     win32_input.send_voice_key_combo_down(("ralt",))
                     self._voice_legacy_transform_session = True
+                    self._voice_hotkey_active_backend = (
+                        _VOICE_HOTKEY_BACKEND_MARKED
+                    )
                 else:
                     win32_input.send_voice_key_combo_up(("ralt",))
                     self._voice_hotkey_release_pending = None
+                    self._voice_hotkey_release_pending_backend = None
+                    self._voice_hotkey_active_backend = None
                 self._voice_legacy_transform_emitted = True
                 self._logger.info(
                     "voice physical F5 replaced with one right-Alt edge via %s: %s",
@@ -1102,6 +1121,9 @@ class RC003App:
                 return True
             except win32_input.InputCleanupIncompleteError:
                 self._voice_hotkey_release_pending = ("ralt",)
+                self._voice_hotkey_release_pending_backend = (
+                    _VOICE_HOTKEY_BACKEND_MARKED
+                )
                 self._voice_legacy_transform_emitted = False
                 self._logger.exception(
                     "voice physical right-Alt replacement failed and safety "
@@ -2215,6 +2237,8 @@ class RC003App:
                     try:
                         win32_input.send_voice_key_combo_up(("ralt",))
                         self._voice_hotkey_release_pending = None
+                        self._voice_hotkey_release_pending_backend = None
+                        self._voice_hotkey_active_backend = None
                         self._voice_legacy_transform_key_down = False
                         self._voice_legacy_transform_session = False
                         self._logger.info(
@@ -2223,6 +2247,9 @@ class RC003App:
                         return True
                     except win32_input.InputCleanupIncompleteError:
                         self._voice_hotkey_release_pending = ("ralt",)
+                        self._voice_hotkey_release_pending_backend = (
+                            _VOICE_HOTKEY_BACKEND_MARKED
+                        )
                         self._logger.exception(
                             "voice right-Alt replacement release remains pending"
                         )
@@ -2237,24 +2264,31 @@ class RC003App:
                     action.value,
                 )
                 return True
+        backend = self._configured_voice_hotkey_backend()
+        if action == voice_controller.VoiceHostAction.KEY_UP:
+            backend = (
+                self._voice_hotkey_active_backend
+                or self._voice_hotkey_release_pending_backend
+                or backend
+            )
         try:
-            if action == voice_controller.VoiceHostAction.TAP:
-                win32_input.send_voice_key_combo_tap(tokens)
-            elif action == voice_controller.VoiceHostAction.KEY_DOWN:
-                win32_input.send_voice_key_combo_down(tokens)
-            else:
-                win32_input.send_voice_key_combo_up(tokens)
+            self._send_voice_hotkey_action(action, tokens, backend)
+            if action == voice_controller.VoiceHostAction.KEY_DOWN:
+                self._voice_hotkey_active_backend = backend
             if action in {
                 voice_controller.VoiceHostAction.TAP,
                 voice_controller.VoiceHostAction.KEY_UP,
             }:
                 self._voice_hotkey_release_pending = None
+                self._voice_hotkey_release_pending_backend = None
+                self._voice_hotkey_active_backend = None
             return True
         except win32_input.Win32InputUnavailableError:
             self._logger.info("voice hotkey action skipped: no usable voice input backend")
             return False
         except win32_input.InputCleanupIncompleteError:
             self._voice_hotkey_release_pending = tokens
+            self._voice_hotkey_release_pending_backend = backend
             self._logger.exception(
                 "voice hotkey action failed and safety key-up remains pending"
             )
@@ -2263,15 +2297,49 @@ class RC003App:
             self._logger.exception("voice hotkey action failed to fully deliver")
             return False
 
+    @staticmethod
+    def _send_voice_hotkey_action(
+        action: voice_controller.VoiceHostAction,
+        tokens: Tuple[str, ...],
+        backend: str,
+    ) -> None:
+        if backend == _VOICE_HOTKEY_BACKEND_WETYPE:
+            if action == voice_controller.VoiceHostAction.TAP:
+                win32_input.send_wetype_voice_key_combo_tap(tokens)
+            elif action == voice_controller.VoiceHostAction.KEY_DOWN:
+                win32_input.send_wetype_voice_key_combo_down(tokens)
+            else:
+                win32_input.send_wetype_voice_key_combo_up(tokens)
+            return
+        if action == voice_controller.VoiceHostAction.TAP:
+            win32_input.send_voice_key_combo_tap(tokens)
+        elif action == voice_controller.VoiceHostAction.KEY_DOWN:
+            win32_input.send_voice_key_combo_down(tokens)
+        else:
+            win32_input.send_voice_key_combo_up(tokens)
+
     def _release_pending_voice_hotkey(self) -> bool:
         tokens = self._voice_hotkey_release_pending
         if tokens is None:
             return True
+        backend = (
+            self._voice_hotkey_release_pending_backend
+            or self._voice_hotkey_active_backend
+            or self._configured_voice_hotkey_backend()
+        )
         try:
-            win32_input.send_voice_key_combo_up(tokens)
+            self._send_voice_hotkey_action(
+                voice_controller.VoiceHostAction.KEY_UP,
+                tokens,
+                backend,
+            )
         except (win32_input.Win32InputUnavailableError, OSError):
             self._logger.exception("voice hotkey safety release failed")
             return False
+        self._voice_hotkey_release_pending = None
+        self._voice_hotkey_release_pending_backend = None
+        if not self._voice.active:
+            self._voice_hotkey_active_backend = None
         self._logger.info("voice hotkey safety release completed")
         return True
 

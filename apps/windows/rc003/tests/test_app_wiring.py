@@ -36,6 +36,7 @@ from ovb_rc003 import (
     key_mapping,
     logging_setup,
     raw_input_windows,
+    voice_program_manager,
     win32_input,
 )
 from ovb_rc003.atvv_session import AudioStarted, AudioStopped, MicButtonPressed
@@ -682,6 +683,126 @@ class HostHotkeyFailureSuppressesMicOpenTests(_AppWiringTestCase):
             self.assertTrue(self.app._release_pending_voice_hotkey())
 
         self.assertEqual(calls, [("ralt",)])
+
+    def test_wetype_provider_routes_hold_edges_to_virtual_key_sendinput(self):
+        self.app._config["voice_program"] = (
+            voice_program_manager.normalize_voice_program_settings(
+                {"provider": voice_program_manager.VOICE_PROGRAM_WETYPE}
+            )
+        )
+        self.app._voice_hotkey = app_module.hotkey.HotkeySpec.parse(
+            "lctrl+lshift+f9"
+        )
+        calls = []
+
+        with mock.patch.object(
+            win32_input,
+            "send_wetype_voice_key_combo_down",
+            side_effect=lambda tokens: calls.append(("wetype_down", tokens)),
+        ), mock.patch.object(
+            win32_input,
+            "send_wetype_voice_key_combo_up",
+            side_effect=lambda tokens: calls.append(("wetype_up", tokens)),
+        ), mock.patch.object(
+            win32_input, "send_voice_key_combo_down"
+        ) as marked_down, mock.patch.object(
+            win32_input, "send_voice_key_combo_up"
+        ) as marked_up:
+            self.assertTrue(
+                self.app._apply_voice_action(
+                    app_module.voice_controller.VoiceHostAction.KEY_DOWN
+                )
+            )
+            self.assertTrue(
+                self.app._apply_voice_action(
+                    app_module.voice_controller.VoiceHostAction.KEY_UP
+                )
+            )
+
+        expected_tokens = ("lctrl", "lshift", "f9")
+        self.assertEqual(
+            calls,
+            [
+                ("wetype_down", expected_tokens),
+                ("wetype_up", expected_tokens),
+            ],
+        )
+        marked_down.assert_not_called()
+        marked_up.assert_not_called()
+
+    def test_non_wetype_providers_keep_the_marked_voice_backend(self):
+        providers = (
+            voice_program_manager.VOICE_PROGRAM_NONE,
+            voice_program_manager.VOICE_PROGRAM_SOGOU,
+            voice_program_manager.VOICE_PROGRAM_WINDOWS_DICTATION,
+            voice_program_manager.VOICE_PROGRAM_CUSTOM,
+        )
+        for provider in providers:
+            with self.subTest(provider=provider):
+                self.app._config["voice_program"] = (
+                    voice_program_manager.normalize_voice_program_settings(
+                        {"provider": provider}
+                    )
+                )
+                self.app._voice_hotkey_active_backend = None
+                with mock.patch.object(
+                    win32_input, "send_voice_key_combo_down"
+                ) as marked_down, mock.patch.object(
+                    win32_input, "send_wetype_voice_key_combo_down"
+                ) as wetype_down:
+                    self.assertTrue(
+                        self.app._apply_voice_action(
+                            app_module.voice_controller.VoiceHostAction.KEY_DOWN
+                        )
+                    )
+
+                marked_down.assert_called_once_with(DEFAULT_VOICE_TOKENS)
+                wetype_down.assert_not_called()
+
+    def test_wetype_safety_release_keeps_the_failed_session_backend(self):
+        self.app._config["voice_program"] = (
+            voice_program_manager.normalize_voice_program_settings(
+                {"provider": voice_program_manager.VOICE_PROGRAM_WETYPE}
+            )
+        )
+        with mock.patch.object(
+            win32_input,
+            "send_wetype_voice_key_combo_down",
+            side_effect=win32_input.InputCleanupIncompleteError(
+                "simulated stuck WeType modifier"
+            ),
+        ):
+            self.assertFalse(
+                self.app._apply_voice_action(
+                    app_module.voice_controller.VoiceHostAction.KEY_DOWN
+                )
+            )
+
+        self.app._config["voice_program"] = (
+            voice_program_manager.normalize_voice_program_settings(
+                {"provider": voice_program_manager.VOICE_PROGRAM_SOGOU}
+            )
+        )
+        with mock.patch.object(
+            win32_input, "send_wetype_voice_key_combo_up"
+        ) as wetype_up, mock.patch.object(
+            win32_input, "send_voice_key_combo_up"
+        ) as marked_up:
+            self.assertTrue(self.app._release_pending_voice_hotkey())
+
+        wetype_up.assert_called_once_with(DEFAULT_VOICE_TOKENS)
+        marked_up.assert_not_called()
+
+    def test_wetype_provider_disables_the_legacy_right_alt_physicalizer(self):
+        self.app._config["voice_program"] = (
+            voice_program_manager.normalize_voice_program_settings(
+                {"provider": voice_program_manager.VOICE_PROGRAM_WETYPE}
+            )
+        )
+        self.app._voice_hotkey = app_module.hotkey.HotkeySpec.parse("ralt")
+        self.app._refresh_legacy_voice_transform_snapshot_locked()
+
+        self.assertIsNone(self.app._transform_legacy_voice_key(0x74, True))
 
     def test_hotkey_success_sends_mic_open(self):
         with mock.patch.object(win32_input, "send_voice_key_combo_down"):

@@ -22,6 +22,12 @@ an observable ``OSError``, never swallowed - the sole exception is
 platform-availability signal re-raised as-is with no rollback attempted,
 since nothing could have landed.
 
+WeType compatibility is deliberately narrower than the ordinary mapping
+path. It uses the same batching/rollback contract, but builds every keyboard
+event with ``wVk`` populated, ``wScan=0``, no ``KEYEVENTF_SCANCODE``, and
+``dwExtraInfo=0``. Other providers retain the marked ``keybd_event`` voice
+path that is required by the existing Doubao compatibility layer.
+
 Testability: every public function accepts an optional ``_sender`` keyword
 (a callable matching ``RawSender``) used only by tests. Production callers
 never pass it, so the real ``ctypes``/``user32.SendInput`` path is used -
@@ -194,21 +200,33 @@ def _build_input_array(events: Sequence[Tuple[int, bool]]):
     return array, INPUT
 
 
-def _real_send_input_batch(events: Sequence[Tuple[int, bool]]) -> int:
-    """Submits every (vk, key_up) pair in ``events`` as ONE real SendInput
-    call. Returns the number of events SendInput reports it queued (may be
-    less than ``len(events)`` on partial delivery). This is the only
-    function in this module that is fundamentally impossible to exercise
-    off Windows (``ctypes.windll`` does not exist there) - see the module
-    docstring for how the rest of the batching/rollback logic is still
-    tested via dependency injection.
-    """
+def _build_virtual_key_input_array(events: Sequence[Tuple[int, bool]]):
+    """Build unmarked virtual-key events for WeType's global shortcut."""
+
+    array = (INPUT * len(events))()
+    for index, (vk, key_up) in enumerate(events):
+        flags = _KEYEVENTF_KEYUP if key_up else 0
+        if vk in _EXTENDED_KEYS:
+            flags |= _KEYEVENTF_EXTENDEDKEY
+        keybd_input = KEYBDINPUT(
+            wVk=vk,
+            wScan=0,
+            dwFlags=flags,
+            time=0,
+            dwExtraInfo=0,
+        )
+        array[index] = INPUT(type=_INPUT_KEYBOARD, union=_INPUT_UNION(ki=keybd_input))
+    return array, INPUT
+
+
+def _real_send_input_batch_with_builder(events, builder) -> int:
+    """Submit one keyboard batch using the requested INPUT-array builder."""
 
     _require_windows()
     if not events:
         return 0
 
-    array, input_type = _build_input_array(events)
+    array, input_type = builder(events)
     user32 = ctypes.windll.user32  # type: ignore[attr-defined]
     # Declared explicitly (XRBM-014 review round 2 P1 #8) rather than left at
     # ctypes defaults: without an explicit restype, ctypes assumes a 32-bit
@@ -227,6 +245,18 @@ def _real_send_input_batch(events: Sequence[Tuple[int, bool]]) -> int:
     # only correct for a pointer to a single instance, never to an array.
     sent = user32.SendInput(len(events), array, ctypes.sizeof(input_type))
     return int(sent)
+
+
+def _real_send_input_batch(events: Sequence[Tuple[int, bool]]) -> int:
+    """Submit ordinary scan-aware keyboard events in one real SendInput call."""
+
+    return _real_send_input_batch_with_builder(events, _build_input_array)
+
+
+def _real_send_virtual_key_input_batch(events: Sequence[Tuple[int, bool]]) -> int:
+    """Submit unmarked, virtual-key-only events in one real SendInput call."""
+
+    return _real_send_input_batch_with_builder(events, _build_virtual_key_input_array)
 
 
 def _best_effort_release(vk_codes: Sequence[int], sender: RawSender) -> bool:
@@ -531,6 +561,39 @@ def send_voice_key_combo_tap(
                 "voice key tap failed but final safety key-up completed"
             ) from exc
         raise
+
+
+def send_wetype_voice_key_combo_down(
+    tokens: Sequence[str], *, _sender: Optional[RawSender] = None
+) -> None:
+    """Press WeType's shortcut through unmarked virtual-key SendInput."""
+
+    send_key_combo_down(
+        tokens,
+        _sender=_sender or _real_send_virtual_key_input_batch,
+    )
+
+
+def send_wetype_voice_key_combo_up(
+    tokens: Sequence[str], *, _sender: Optional[RawSender] = None
+) -> None:
+    """Release WeType's shortcut through the same virtual-key transport."""
+
+    send_key_combo_up(
+        tokens,
+        _sender=_sender or _real_send_virtual_key_input_batch,
+    )
+
+
+def send_wetype_voice_key_combo_tap(
+    tokens: Sequence[str], *, _sender: Optional[RawSender] = None
+) -> None:
+    """Send one completed WeType shortcut through virtual-key SendInput."""
+
+    send_key_combo_tap(
+        tokens,
+        _sender=_sender or _real_send_virtual_key_input_batch,
+    )
 
 
 def send_volume_up(*, _sender: Optional[RawSender] = None) -> None:
