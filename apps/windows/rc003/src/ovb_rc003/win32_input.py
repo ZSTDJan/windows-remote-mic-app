@@ -23,10 +23,11 @@ platform-availability signal re-raised as-is with no rollback attempted,
 since nothing could have landed.
 
 WeType compatibility is deliberately narrower than the ordinary mapping
-path. It uses the same batching/rollback contract, but builds every keyboard
-event with ``wVk`` populated, ``wScan=0``, no ``KEYEVENTF_SCANCODE``, and
-``dwExtraInfo=0``. Other providers retain the marked ``keybd_event`` voice
-path that is required by the existing Doubao compatibility layer.
+path. It mirrors Vibe Flow's proven shortcut sender: separate virtual-key
+``SendInput`` batches for key-down and key-up, an 80 ms hold between them,
+``wScan=0``, no ``KEYEVENTF_SCANCODE``, and ``dwExtraInfo=0``. Other providers
+retain the marked ``keybd_event`` voice path required by the existing Doubao
+compatibility layer.
 
 Testability: every public function accepts an optional ``_sender`` keyword
 (a callable matching ``RawSender``) used only by tests. Production callers
@@ -596,14 +597,30 @@ def send_wetype_voice_key_combo_up(
 
 
 def send_wetype_voice_key_combo_tap(
-    tokens: Sequence[str], *, _sender: Optional[RawSender] = None
+    tokens: Sequence[str],
+    *,
+    _sender: Optional[RawSender] = None,
+    _sleep: Callable[[float], None] = time.sleep,
 ) -> None:
-    """Send one completed WeType shortcut through virtual-key SendInput."""
+    """Send one Vibe Flow-compatible 80 ms WeType shortcut tap."""
 
-    send_key_combo_tap(
-        tokens,
-        _sender=_sender or _real_send_virtual_key_input_batch,
-    )
+    sender = _sender or _real_send_virtual_key_input_batch
+    vk_codes = win32_keys.resolve_vk_codes(tokens)
+    send_wetype_voice_key_combo_down(tokens, _sender=sender)
+    try:
+        _sleep(0.08)
+        send_wetype_voice_key_combo_up(tokens, _sender=sender)
+    except BaseException as exc:
+        cleanup_complete = _best_effort_release(list(reversed(vk_codes)), sender)
+        if not cleanup_complete:
+            raise InputCleanupIncompleteError(
+                "WeType key tap failed and final key-up could not be confirmed"
+            ) from exc
+        if isinstance(exc, InputCleanupIncompleteError):
+            raise OSError(
+                "WeType key tap failed but final safety key-up completed"
+            ) from exc
+        raise
 
 
 def send_volume_up(*, _sender: Optional[RawSender] = None) -> None:

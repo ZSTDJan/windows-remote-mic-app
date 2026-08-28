@@ -87,6 +87,7 @@ from . import (
     raw_input_windows,
     voice_controller,
     voice_program_manager,
+    wetype_control_windows,
     win32_input,
     win32_keys,
 )
@@ -200,6 +201,9 @@ class RC003App:
         self._voice_hotkey_release_pending: Optional[Tuple[str, ...]] = None
         self._voice_hotkey_active_backend: Optional[str] = None
         self._voice_hotkey_release_pending_backend: Optional[str] = None
+        self._wetype_voice_control = wetype_control_windows.WeTypeVoiceControl(
+            logger=self._logger
+        )
         self._button_key_release_pending: Optional[Tuple[str, ...]] = None
         # Raw Input and the ATVV control channel arrive on different worker
         # threads. Serialize the voice state machine so one physical press
@@ -651,6 +655,7 @@ class RC003App:
                 self._voice_legacy_transform_session = False
                 self._voice_legacy_transform_emitted = False
                 self._legacy_f5_is_down = False
+                self._wetype_voice_control.clear()
         except Exception:
             self._logger.exception("cleanup: releasing the voice hotkey failed")
             failures.append("voice hotkey cleanup failed; state retained")
@@ -2327,20 +2332,43 @@ class RC003App:
                 or self._voice_hotkey_release_pending_backend
                 or backend
             )
-        provider_action = action
-        if (
-            backend == _VOICE_HOTKEY_BACKEND_WETYPE
-            and action
-            in {
-                voice_controller.VoiceHostAction.KEY_DOWN,
-                voice_controller.VoiceHostAction.KEY_UP,
-            }
-        ):
-            provider_action = voice_controller.VoiceHostAction.TAP
-            self._logger.info(
-                "voice provider protocol translated logical %s to shortcut tap",
+        if backend == _VOICE_HOTKEY_BACKEND_WETYPE:
+            try:
+                delivered = (
+                    self._wetype_voice_control.start(tokens)
+                    if action == voice_controller.VoiceHostAction.KEY_DOWN
+                    else self._wetype_voice_control.stop(tokens)
+                )
+            except win32_input.Win32InputUnavailableError:
+                self._logger.info(
+                    "WeType voice control skipped: no usable Windows input backend"
+                )
+                return False
+            except win32_input.InputCleanupIncompleteError:
+                self._voice_hotkey_release_pending = tokens
+                self._voice_hotkey_release_pending_backend = backend
+                self._logger.exception(
+                    "WeType voice control failed and safety key-up remains pending"
+                )
+                return False
+            except OSError:
+                self._logger.exception("WeType voice control failed to fully deliver")
+                return False
+            if delivered:
+                if action == voice_controller.VoiceHostAction.KEY_DOWN:
+                    self._voice_hotkey_active_backend = backend
+                else:
+                    self._voice_hotkey_active_backend = None
+                self._voice_hotkey_release_pending = None
+                self._voice_hotkey_release_pending_backend = None
+                return True
+            self._logger.warning(
+                "WeType voice control did not confirm the panel for logical %s",
                 action.value,
             )
+            return False
+
+        provider_action = action
         try:
             if provider_action == voice_controller.VoiceHostAction.KEY_DOWN:
                 self._voice_hotkey_release_pending = tokens

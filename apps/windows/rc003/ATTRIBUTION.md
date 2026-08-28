@@ -28,6 +28,14 @@ RC003 的 ATVV UUID、控制命令、IMA/DVI ADPCM 解码和 HID 映射事实见
 [`THIRD_PARTY_NOTICES.md`](../../../THIRD_PARTY_NOTICES.md)；本分支不依赖另一个平台
 的实现文件。
 
+微信输入法的宿主控制顺序参考 GPL-3.0-only 项目
+[`richlearntodo-debug/vibe-flow`](https://github.com/richlearntodo-debug/vibe-flow)
+提交 `047f9d3ead54bf30de9b884adf8f7b5adefe9993`：优先点击
+`wetype.statusbar.window` 状态栏语音按钮，失败时使用分开的虚拟键 `SendInput`
+按下/抬起批次并保持 80 ms，再按本轮实际成功路径结束。Remote Mic 保留自身的
+RC003 多来源去重、音频输出、失败关闭和程序选择结构，没有复制言灵的界面或完整
+会话框架。
+
 VB-CABLE 是 VB-Audio 的独立第三方软件，不属于本项目的 GPL 代码。Windows 构建
 脚本只在显式执行、哈希固定的步骤中获取官方安装包；应用不会静默安装或修改系统
 默认音频设备。使用 VB-CABLE 前请阅读 Windows README 中的方向说明和许可证信息。
