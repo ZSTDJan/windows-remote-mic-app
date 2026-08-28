@@ -153,15 +153,6 @@ Item {
         SettingsController.stopHotkeyCapture()
     }
 
-    function applyVoiceSettings() {
-        if (SettingsController.selectedEndpointIndex < 0
-                && SettingsController.recommendedEndpointIndex >= 0) {
-            SettingsController.selectedEndpointIndex =
-                SettingsController.recommendedEndpointIndex
-        }
-        SettingsController.saveSettings()
-    }
-
     FileDialog {
         id: voiceProgramFileDialog
         title: qsTr("选择语音程序")
@@ -390,20 +381,50 @@ Item {
                     stateColumnWidth: root.settingsStateColumnWidth
                     actionColumnWidth: root.settingsActionColumnWidth
                     titleText: qsTr("虚拟音频")
-                    descriptionText: root.checkDetail(
-                        "vb_cable_endpoints",
-                        qsTr("将遥控器声音送入语音程序")
-                    )
-                    stateText: root.checkState("vb_cable_endpoints")
-                    stateColor: root.checkColor("vb_cable_endpoints")
+                    descriptionText: DiagnosticsController.driverErrorMessage.length > 0
+                        ? DiagnosticsController.driverErrorMessage
+                        : DiagnosticsController.driverStatusMessage.length > 0
+                            ? DiagnosticsController.driverStatusMessage
+                            : DiagnosticsController.driverInfoMessage.length > 0
+                                ? DiagnosticsController.driverInfoMessage
+                                : root.checkDetail(
+                                    "vb_cable_endpoints",
+                                    qsTr("检测并选择 CABLE Input")
+                                )
+                    stateText: DiagnosticsController.driverErrorMessage.length > 0
+                        ? qsTr("需处理")
+                        : DiagnosticsController.driverStatusMessage.length > 0
+                            ? qsTr("正常")
+                            : DiagnosticsController.driverInfoMessage.length > 0
+                                ? qsTr("待完成")
+                                : root.checkState("vb_cable_endpoints")
+                    stateColor: DiagnosticsController.driverErrorMessage.length > 0
+                        ? tokens.errorColor
+                        : DiagnosticsController.driverStatusMessage.length > 0
+                            ? tokens.successColor
+                            : DiagnosticsController.driverInfoMessage.length > 0
+                                ? tokens.voiceAccent
+                                : root.checkColor("vb_cable_endpoints")
 
+                    editorData: [
+                        CompactButton {
+                            objectName: "installVirtualAudioButton"
+                            tokens: root.tokens
+                            Layout.fillWidth: true
+                            text: qsTr("安装虚拟音频")
+                            enabled: !DiagnosticsController.vbCableTestRunning
+                            onClicked: driverConfirmDialog.open()
+                        }
+                    ]
                     CompactButton {
-                        objectName: "installVirtualAudioButton"
+                        objectName: "applyVirtualAudioButton"
                         tokens: root.tokens
                         Layout.fillWidth: true
-                        text: qsTr("安装虚拟音频")
+                        text: qsTr("应用")
+                        highlighted: true
                         enabled: !DiagnosticsController.vbCableTestRunning
-                        onClicked: driverConfirmDialog.open()
+                            && !SettingsController.bridgeLaunchBusy
+                        onClicked: DiagnosticsController.selectDetectedCableInputAsOutput()
                     }
                 }
 
@@ -427,49 +448,30 @@ Item {
                             Layout.minimumWidth: 180
                             model: SettingsController.endpointOptions
                             currentIndex: SettingsController.selectedEndpointIndex
-                            onActivated: SettingsController.selectedEndpointIndex = index
+                            onActivated: SettingsController.selectAndPersistOutputEndpointIndex(index)
                             enabled: !DiagnosticsController.vbCableTestRunning
                             Accessible.name: qsTr("输出端点")
                         }
                     ]
-                    CompactButton {
-                        objectName: "applyVoiceSettingsButton"
-                        tokens: root.tokens
-                        Layout.fillWidth: true
-                        text: qsTr("应用")
-                        highlighted: true
-                        enabled: !DiagnosticsController.vbCableTestRunning
-                            && !SettingsController.bridgeLaunchBusy
-                        onClicked: root.applyVoiceSettings()
-                    }
                 }
 
                 InlineSettingsRow {
-                    objectName: "targetApplicationRow"
+                    objectName: "microphonePrivacyRow"
                     tokens: root.tokens
                     stateColumnWidth: root.settingsStateColumnWidth
                     actionColumnWidth: root.settingsActionColumnWidth
-                    titleText: qsTr("目标应用")
-                    descriptionText: qsTr("将麦克风输入设为 CABLE Output")
-                    stateText: root.checkState("dictation")
-                    stateColor: root.checkColor("dictation")
+                    titleText: qsTr("麦克风权限")
+                    descriptionText: qsTr("确认桌面语音软件可以访问麦克风")
+                    stateText: qsTr("待确认")
+                    stateColor: tokens.voiceAccent
                     showDivider: false
 
-                    editorData: [
-                        CompactButton {
-                            objectName: "openMicrophonePrivacyButton"
-                            tokens: root.tokens
-                            compactMinimumWidth: tokens.buttonWidth4Chars
-                            text: qsTr("麦克风隐私")
-                            onClicked: SettingsController.openMicrophonePrivacySettings()
-                        }
-                    ]
                     CompactButton {
-                        objectName: "openSoundInputSettingsButton"
+                        objectName: "openMicrophonePrivacyButton"
                         tokens: root.tokens
                         Layout.fillWidth: true
-                        text: qsTr("声音输入")
-                        onClicked: SettingsController.openSoundSettings()
+                        text: qsTr("麦克风隐私")
+                        onClicked: SettingsController.openMicrophonePrivacySettings()
                     }
                 }
             }

@@ -486,8 +486,11 @@ class SettingsControllerTests(unittest.TestCase):
         controller.selectedVoiceProgramIndex = 1
 
         self.assertTrue(controller.voiceProgramLaunchOnBridgeStart)
-        self.assertTrue(controller.voiceProgramSettingsDirty)
-        self.assertTrue(controller.settingsDirty)
+        self.assertFalse(controller.voiceProgramSettingsDirty)
+        self.assertFalse(controller.settingsDirty)
+        saved = config.load_config(config.config_path(config.config_root()))
+        self.assertEqual(saved["voice_program"]["provider"], "sogou")
+        self.assertTrue(saved["voice_program"]["launch_on_bridge_start"])
 
     def test_selecting_wetype_uses_windows_management_without_autostart(self):
         controller, _ = self._make_controller()
@@ -496,7 +499,7 @@ class SettingsControllerTests(unittest.TestCase):
 
         self.assertTrue(controller.voiceProgramSystemManaged)
         self.assertFalse(controller.voiceProgramLaunchOnBridgeStart)
-        self.assertTrue(controller.voiceProgramSettingsDirty)
+        self.assertFalse(controller.voiceProgramSettingsDirty)
 
     def test_selecting_windows_dictation_uses_system_management_and_win_h_helper(self):
         controller, _ = self._make_controller()
@@ -507,7 +510,9 @@ class SettingsControllerTests(unittest.TestCase):
         self.assertTrue(controller.voiceProgramSystemManaged)
         self.assertFalse(controller.voiceProgramLaunchOnBridgeStart)
         self.assertEqual(controller.holdVoiceHotkeyText, "win+h")
-        self.assertTrue(controller.settingsDirty)
+        self.assertFalse(controller.settingsDirty)
+        saved = config.load_config(config.config_path(config.config_root()))
+        self.assertEqual(saved["voice_hotkeys"], {"hold": "win+h"})
 
     def test_unrelated_mapping_edit_does_not_mark_voice_program_dirty(self):
         controller, model = self._make_controller()
@@ -557,7 +562,7 @@ class SettingsControllerTests(unittest.TestCase):
         self.assertTrue(controller.settingsDirty)
         self.assertIn("随桥接启动", controller.statusMessage)
 
-    def test_voice_program_settings_persist_with_the_main_save(self):
+    def test_voice_program_settings_persist_without_the_mapping_save(self):
         executable = Path(self._tmpdir.name) / "voice.exe"
         executable.touch()
         controller, _ = self._make_controller()
@@ -566,8 +571,7 @@ class SettingsControllerTests(unittest.TestCase):
         controller.voiceProgramLaunchOnBridgeStart = True
         controller.voiceProgramLaunchElevated = True
 
-        self.assertTrue(controller.settingsDirty)
-        self.assertTrue(controller.saveSettings())
+        self.assertFalse(controller.settingsDirty)
         self.assertFalse(controller.voiceProgramSettingsDirty)
 
         saved = config.load_config(config.config_path(config.config_root()))
@@ -580,6 +584,26 @@ class SettingsControllerTests(unittest.TestCase):
                 "launch_elevated": True,
             },
         )
+
+    def test_voice_auto_save_failure_restores_the_last_saved_values(self):
+        controller, _ = self._make_controller()
+
+        with mock.patch.object(
+            config, "save_config", side_effect=OSError("settings file is locked")
+        ):
+            controller.selectedVoiceProgramIndex = 1
+
+        self.assertEqual(controller.selectedVoiceProgramIndex, 0)
+        self.assertFalse(controller.voiceProgramSettingsDirty)
+        self.assertIn("语音设置保存失败", controller.errorMessage)
+
+        with mock.patch.object(
+            config, "save_config", side_effect=OSError("settings file is locked")
+        ):
+            controller.holdVoiceHotkeyText = "ctrl+l"
+
+        self.assertEqual(controller.holdVoiceHotkeyText, "ralt")
+        self.assertIn("语音设置保存失败", controller.errorMessage)
 
     def test_voice_program_launch_reports_a_normal_provider_result(self):
         controller, _ = self._make_controller()
@@ -1035,8 +1059,8 @@ class SettingsControllerTests(unittest.TestCase):
         )
 
     def test_save_settings_reports_a_persistence_failure(self):
-        controller, _ = self._make_controller()
-        controller.holdVoiceHotkeyText = "ctrl+l"
+        controller, model = self._make_controller()
+        model.setActionTextAt(model.index_of("power"), "ctrl+l")
         self.assertTrue(controller.settingsDirty)
         with mock.patch.object(
             config, "save_settings_pair", side_effect=OSError("settings file is locked")
@@ -1046,7 +1070,7 @@ class SettingsControllerTests(unittest.TestCase):
         self.assertIn("保存失败", controller.errorMessage)
         self.assertIn("settings file is locked", controller.errorMessage)
 
-    def test_all_persisted_setting_controls_mark_unsaved_changes(self):
+    def test_voice_controls_auto_save_without_clearing_mapping_edits(self):
         controller, model = self._make_controller()
         self.assertFalse(controller.settingsDirty)
 
@@ -1058,14 +1082,20 @@ class SettingsControllerTests(unittest.TestCase):
         self.assertFalse(controller.settingsDirty)
 
         controller.holdVoiceHotkeyText = "ctrl+l"
-        self.assertTrue(controller.settingsDirty)
-        self.assertTrue(controller.saveSettings())
         self.assertFalse(controller.settingsDirty)
+        saved = config.load_config(config.config_path(config.config_root()))
+        self.assertEqual(saved["voice_hotkeys"], {"hold": "ctrl+l"})
+
+        model.setActionTextAt(model.index_of("power"), "escape")
+        self.assertTrue(controller.settingsDirty)
 
         controller.selectedVoiceProgramIndex = 1
         self.assertTrue(controller.settingsDirty)
+        self.assertIn("按键映射仍未保存", controller.statusMessage)
+        saved = config.load_config(config.config_path(config.config_root()))
+        self.assertEqual(saved["voice_program"]["provider"], "sogou")
 
-    def test_output_endpoint_selection_marks_unsaved_changes(self):
+    def test_output_endpoint_selection_auto_saves_without_mapping_changes(self):
         endpoints = [
             audio_output.AudioEndpoint(
                 name="CABLE Input (VB-Audio Virtual Cable)",
@@ -1078,12 +1108,44 @@ class SettingsControllerTests(unittest.TestCase):
         ]
         with mock.patch.object(
             audio_output, "enumerate_output_endpoints", return_value=endpoints
+        ), mock.patch.object(
+            qt_settings_app.audio_playback, "preflight_output_endpoint"
+        ) as preflight:
+            controller, _ = self._make_controller()
+            self.assertFalse(controller.settingsDirty)
+            controller.selectedEndpointIndex = 0
+
+        self.assertFalse(controller.settingsDirty)
+        preflight.assert_called_once_with(
+            "CABLE Input (VB-Audio Virtual Cable)", "Windows WASAPI"
+        )
+        saved = config.load_config(config.config_path(config.config_root()))
+        self.assertEqual(
+            saved["output_endpoint_name"],
+            "CABLE Input (VB-Audio Virtual Cable)",
+        )
+
+    def test_output_endpoint_auto_save_failure_keeps_the_saved_selection(self):
+        endpoints = [
+            audio_output.AudioEndpoint(
+                name="CABLE Input",
+                host_api="Windows WASAPI",
+            )
+        ]
+        with mock.patch.object(
+            audio_output, "enumerate_output_endpoints", return_value=endpoints
         ):
             controller, _ = self._make_controller()
 
-        self.assertFalse(controller.settingsDirty)
-        controller.selectedEndpointIndex = 0
-        self.assertTrue(controller.settingsDirty)
+        with mock.patch.object(
+            qt_settings_app.audio_playback, "preflight_output_endpoint"
+        ), mock.patch.object(
+            config, "save_config", side_effect=OSError("disk full")
+        ):
+            controller.selectedEndpointIndex = 0
+
+        self.assertEqual(controller.selectedEndpointIndex, -1)
+        self.assertIn("输出端点保存失败", controller.errorMessage)
 
     def test_restore_defaults_marks_unsaved_changes(self):
         controller, _ = self._make_controller()
@@ -1217,13 +1279,13 @@ class SettingsControllerTests(unittest.TestCase):
 
     def test_save_settings_with_empty_hotkey_fails_and_reports_error(self):
         controller, _ = self._make_controller()
-        controller.holdVoiceHotkeyText = ""
+        controller._voice_hotkeys[key_mapping.VoiceTriggerMode.HOLD] = ""
         self.assertFalse(controller.saveSettings())
         self.assertNotEqual(controller.errorMessage, "")
 
     def test_save_and_launch_never_launches_when_save_fails(self):
         controller, _ = self._make_controller()
-        controller.holdVoiceHotkeyText = ""
+        controller._voice_hotkeys[key_mapping.VoiceTriggerMode.HOLD] = ""
         with mock.patch.object(bridge_launcher, "start_bridge_launch") as fake_launch:
             controller.saveAndLaunch()
             self.assertEqual(controller.bridgeLaunchPhase, "saving")
@@ -3866,7 +3928,7 @@ capture_page(
 voice_row_names = (
     "virtualAudioRow",
     "outputEndpointRow",
-    "targetApplicationRow",
+    "microphonePrivacyRow",
     "voiceProgramSelectionRow",
     "voiceProgramCustomPathRow",
     "voiceHotkeyRow",
@@ -3893,14 +3955,16 @@ result["voice_columns"] = {
     "right_controls": {
         name: bounds(window, name)
         for name in (
-            "installVirtualAudioButton",
-            "applyVoiceSettingsButton",
-            "openSoundInputSettingsButton",
+            "applyVirtualAudioButton",
+            "openMicrophonePrivacyButton",
             "browseVoiceProgramButton",
             "voiceProgramElevatedCheckBox",
             "testVbCableChannelButton",
             "trySpeakingButton",
         )
+    },
+    "left_controls": {
+        "installVirtualAudioButton": bounds(window, "installVirtualAudioButton"),
     },
     "descriptions": {
         name: bounds(window, name)
@@ -4108,10 +4172,14 @@ class SettingsShellSourceContractTests(unittest.TestCase):
         )
         self.assertIn('titleText: qsTr("运行日志")', self.device_qml)
 
-    def test_device_start_and_voice_apply_keep_distinct_commands(self):
+    def test_device_start_and_virtual_audio_apply_keep_distinct_commands(self):
         self.assertIn("SettingsController.startBridge()", self.device_qml)
         self.assertNotIn("SettingsController.saveSettings()", self.device_qml)
-        self.assertIn("SettingsController.saveSettings()", self.voice_qml)
+        self.assertIn(
+            "DiagnosticsController.selectDetectedCableInputAsOutput()",
+            self.voice_qml,
+        )
+        self.assertNotIn("SettingsController.saveSettings()", self.voice_qml)
         self.assertIn(
             "descriptionText: SettingsController.launchStatusText", self.device_qml
         )
@@ -4123,8 +4191,9 @@ class SettingsShellSourceContractTests(unittest.TestCase):
         self.assertIn("function checkDetail(checkId, fallback)", self.voice_qml)
         for check_id in ("ble_candidate", "os_version", "raw_input"):
             self.assertIn(f'"{check_id}"', self.device_qml)
-        for check_id in ("vb_cable_endpoints", "output_endpoint", "dictation"):
+        for check_id in ("vb_cable_endpoints", "output_endpoint"):
             self.assertIn(f'"{check_id}"', self.voice_qml)
+        self.assertNotIn('checkState("dictation")', self.voice_qml)
 
     def test_diagnostics_exposes_loopback_as_an_explicit_nonautomatic_action(self):
         self.assertIn('objectName: "soundChannelTestRow"', self.voice_qml)
@@ -4225,10 +4294,12 @@ class SettingsShellSourceContractTests(unittest.TestCase):
     def test_voice_page_states_real_windows_boundaries_without_fake_grants(self):
         for object_name in (
             "openMicrophonePrivacyButton",
-            "openSoundInputSettingsButton",
             "openSpeechSettingsButton",
         ):
             self.assertIn(f'objectName: "{object_name}"', self.voice_qml)
+        self.assertNotIn('objectName: "openSoundInputSettingsButton"', self.voice_qml)
+        self.assertIn('titleText: qsTr("麦克风权限")', self.voice_qml)
+        self.assertIn('stateText: qsTr("待确认")', self.voice_qml)
         for misleading_claim in (
             "已授权",
             "Remote Mic 需要管理员权限",
@@ -4415,7 +4486,6 @@ class ThreePageSettingsSourceContractTests(unittest.TestCase):
         for check_id in (
             "vb_cable_endpoints",
             "output_endpoint",
-            "dictation",
         ):
             self.assertIn(f'"{check_id}"', self.voice_qml)
         self.assertIn("DiagnosticsController.refreshDiagnostics()", self.device_qml)
@@ -4434,17 +4504,27 @@ class ThreePageSettingsSourceContractTests(unittest.TestCase):
         self.assertIn("SettingsController.selectedVoiceProgramIndex === 3", self.voice_qml)
         self.assertIn("SettingsController.selectedVoiceProgramIndex === 4", self.voice_qml)
 
-    def test_voice_audio_row_keeps_install_dropdown_and_apply(self):
+    def test_voice_audio_rows_auto_save_and_keep_manual_privacy_only(self):
         for object_name in (
             "installVirtualAudioButton",
             "endpointCombo",
-            "applyVoiceSettingsButton",
+            "applyVirtualAudioButton",
             "openMicrophonePrivacyButton",
-            "openSoundInputSettingsButton",
+            "microphonePrivacyRow",
         ):
             self.assertIn(f'objectName: "{object_name}"', self.voice_qml)
         self.assertIn("recommendedIndex: SettingsController.recommendedEndpointIndex", self.voice_qml)
-        self.assertIn("SettingsController.saveSettings()", self.voice_qml)
+        self.assertIn(
+            "SettingsController.selectAndPersistOutputEndpointIndex(index)",
+            self.voice_qml,
+        )
+        self.assertIn(
+            "DiagnosticsController.selectDetectedCableInputAsOutput()",
+            self.voice_qml,
+        )
+        self.assertNotIn("SettingsController.saveSettings()", self.voice_qml)
+        self.assertNotIn('objectName: "openSoundInputSettingsButton"', self.voice_qml)
+        self.assertNotIn('text: qsTr("声音输入")', self.voice_qml)
 
     def test_voice_tests_use_a_focused_text_box_and_safe_service_recovery(self):
         for object_name in (
@@ -4725,6 +4805,19 @@ class OffscreenQmlLoadTests(unittest.TestCase):
                     self.assertAlmostEqual(control["x"], reference_action["x"], delta=1)
                     self.assertAlmostEqual(control["width"], 84, delta=1)
                     self.assertLessEqual(control["right"], width + 1)
+
+                install_button = voice_columns["left_controls"][
+                    "installVirtualAudioButton"
+                ]
+                self.assertTrue(install_button["visible"])
+                self.assertAlmostEqual(
+                    install_button["x"],
+                    voice_columns["editors"]["endpointCombo"]["x"],
+                    delta=1,
+                )
+                self.assertLessEqual(
+                    install_button["right"], reference_state["x"] + 1
+                )
 
                 editor_map = voice_columns["editors"]
                 editors = list(editor_map.values())

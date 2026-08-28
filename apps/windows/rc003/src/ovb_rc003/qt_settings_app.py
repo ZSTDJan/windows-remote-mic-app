@@ -125,6 +125,7 @@ from . import (
     single_instance,
     vb_cable_bundle,
     voice_program_manager,
+    win32_keys,
     windows_diagnostics,
 )
 
@@ -958,6 +959,7 @@ def _load_qt_classes() -> dict:
             self._hotkeyCaptureResult.connect(self._on_hotkey_capture_result)
 
             self._endpoint_options: List[str] = []
+            self._endpoint_values: List[audio_output.AudioEndpoint] = []
             self._recommended_endpoint_index = -1
             self._selected_endpoint_index = -1
             self._refresh_endpoint_options()
@@ -993,6 +995,8 @@ def _load_qt_classes() -> dict:
             except audio_output.AudioOutputUnavailableError:
                 endpoints = []
                 options = []
+
+            endpoint_values = list(endpoints)
 
             recommended_display = ""
             recommendation_candidates = [
@@ -1035,6 +1039,12 @@ def _load_qt_classes() -> dict:
                 # choice, matching build_save_model()/_parse_endpoint_display()
                 # round-tripping whatever text is present at save time.
                 options = [saved_display] + options
+                endpoint_values = [
+                    audio_output.AudioEndpoint(
+                        name=saved_name,
+                        host_api=saved_host_api,
+                    )
+                ] + endpoint_values
 
             if saved_name and not audio_output.is_supported_output_host_api(
                 saved_host_api
@@ -1061,6 +1071,7 @@ def _load_qt_classes() -> dict:
                     )
 
             self._endpoint_options = options
+            self._endpoint_values = endpoint_values
             self._recommended_endpoint_index = (
                 options.index(recommended_display)
                 if recommended_display in options
@@ -1360,6 +1371,79 @@ def _load_qt_classes() -> dict:
                 self.voiceProgramLaunchElevatedChanged.emit()
             self._refresh_voice_program_status()
 
+        def _persist_voice_settings(self) -> bool:
+            if _vb_cable_test_active_event.is_set():
+                self._set_error_message(
+                    "VB-CABLE 通道测试正在运行；测试结束后再修改语音设置。"
+                )
+                return False
+
+            hotkey_text = self._voice_hotkeys[
+                key_mapping.VoiceTriggerMode.HOLD
+            ].strip()
+            try:
+                parsed_hotkey = hotkey.HotkeySpec.parse(hotkey_text)
+                win32_keys.resolve_vk_codes(
+                    tuple(parsed_hotkey.modifiers) + (parsed_hotkey.key,)
+                )
+            except (hotkey.HotkeyParseError, win32_keys.UnknownKeyTokenError) as exc:
+                self._set_error_message(f"语音按键无效：{exc}")
+                return False
+
+            new_config = dict(self._config)
+            new_config["voice_hotkey"] = hotkey_text
+            new_config["voice_hotkeys"] = {"hold": hotkey_text}
+            new_config["voice_trigger_mode"] = (
+                key_mapping.VoiceTriggerMode.HOLD.value
+            )
+            new_config.pop("voice_release_finish_tap_enabled", None)
+            new_config["voice_program"] = dict(self._voice_program_settings)
+            config_path = config.config_path(self._config_root)
+            try:
+                config.save_config(config_path, new_config)
+                saved_config = config.load_config(config_path)
+            except Exception as exc:  # noqa: BLE001 - a Qt slot must not escape
+                self._set_error_message(f"语音设置保存失败：{exc}")
+                return False
+
+            self._config = saved_config
+            saved_hotkey = str(
+                saved_config.get("voice_hotkeys", {}).get("hold", "")
+            )
+            self._set_voice_hotkey_text(
+                key_mapping.VoiceTriggerMode.HOLD, saved_hotkey
+            )
+            self._replace_voice_program_settings(saved_config.get("voice_program"))
+            self._set_voice_program_settings_dirty(False)
+            self._set_error_message("")
+            self._set_status_message(
+                "语音设置已自动保存；按键映射仍未保存。"
+                if self._settings_dirty
+                else "语音设置已自动保存。"
+            )
+            return True
+
+        def _update_and_persist_voice_hotkey(self, value: str) -> bool:
+            mode = key_mapping.VoiceTriggerMode.HOLD
+            previous = self._voice_hotkeys[mode]
+            if not self._set_voice_hotkey_text(mode, value):
+                return True
+            if self._persist_voice_settings():
+                return True
+            self._set_voice_hotkey_text(mode, previous)
+            return False
+
+        def _update_and_persist_voice_program(self, updated: dict) -> bool:
+            previous = dict(self._voice_program_settings)
+            previous_dirty = self._voice_program_settings_dirty
+            self._replace_voice_program_settings(updated)
+            self._set_voice_program_settings_dirty(True)
+            if self._persist_voice_settings():
+                return True
+            self._replace_voice_program_settings(previous)
+            self._set_voice_program_settings_dirty(previous_dirty)
+            return False
+
         def _on_raw_input_event(self, event: raw_input_windows.RawInputEvent) -> None:
             if not event.is_pressed:
                 return
@@ -1607,8 +1691,7 @@ def _load_qt_classes() -> dict:
             return self._voice_hotkeys[key_mapping.VoiceTriggerMode.HOLD]
 
         def _set_hold_voice_hotkey_text(self, value: str) -> None:
-            if self._set_voice_hotkey_text(key_mapping.VoiceTriggerMode.HOLD, value):
-                self._mark_settings_dirty()
+            self._update_and_persist_voice_hotkey(value)
 
         holdVoiceHotkeyText = Property(
             str,
@@ -1639,9 +1722,7 @@ def _load_qt_classes() -> dict:
                 provider_id != voice_program_manager.VOICE_PROGRAM_NONE
                 and not voice_program_manager.is_system_managed_provider(provider_id)
             )
-            self._replace_voice_program_settings(updated)
-            self._set_voice_program_settings_dirty(True)
-            self._mark_settings_dirty()
+            self._update_and_persist_voice_program(updated)
 
         selectedVoiceProgramIndex = Property(
             int,
@@ -1669,11 +1750,9 @@ def _load_qt_classes() -> dict:
             local_value = local_value.strip()
             if local_value == self._voice_program_settings.get("custom_executable"):
                 return
-            self._voice_program_settings["custom_executable"] = local_value
-            self.voiceProgramCustomPathChanged.emit()
-            self._set_voice_program_settings_dirty(True)
-            self._mark_settings_dirty()
-            self._refresh_voice_program_status()
+            updated = dict(self._voice_program_settings)
+            updated["custom_executable"] = local_value
+            self._update_and_persist_voice_program(updated)
 
         voiceProgramCustomPath = Property(
             str,
@@ -1689,10 +1768,9 @@ def _load_qt_classes() -> dict:
             value = bool(value)
             if value == self._get_voice_program_launch_on_bridge_start():
                 return
-            self._voice_program_settings["launch_on_bridge_start"] = value
-            self.voiceProgramLaunchOnBridgeStartChanged.emit()
-            self._set_voice_program_settings_dirty(True)
-            self._mark_settings_dirty()
+            updated = dict(self._voice_program_settings)
+            updated["launch_on_bridge_start"] = value
+            self._update_and_persist_voice_program(updated)
 
         voiceProgramLaunchOnBridgeStart = Property(
             bool,
@@ -1708,11 +1786,9 @@ def _load_qt_classes() -> dict:
             value = bool(value)
             if value == self._get_voice_program_launch_elevated():
                 return
-            self._voice_program_settings["launch_elevated"] = value
-            self.voiceProgramLaunchElevatedChanged.emit()
-            self._set_voice_program_settings_dirty(True)
-            self._mark_settings_dirty()
-            self._refresh_voice_program_status()
+            updated = dict(self._voice_program_settings)
+            updated["launch_elevated"] = value
+            self._update_and_persist_voice_program(updated)
 
         voiceProgramLaunchElevated = Property(
             bool,
@@ -1778,9 +1854,7 @@ def _load_qt_classes() -> dict:
 
         def _set_selected_endpoint_index(self, value: int) -> None:
             if value != self._selected_endpoint_index:
-                self._selected_endpoint_index = value
-                self.selectedEndpointIndexChanged.emit()
-                self._mark_settings_dirty()
+                self.selectAndPersistOutputEndpointIndex(value)
 
         selectedEndpointIndex = Property(
             int,
@@ -2487,14 +2561,7 @@ def _load_qt_classes() -> dict:
 
         @Slot()
         def useWindowsDictationHotkey(self) -> None:
-            if self._set_voice_hotkey_text(
-                key_mapping.VoiceTriggerMode.HOLD, "win+h"
-            ):
-                self._mark_settings_dirty()
-            self._set_error_message("")
-            self._set_status_message(
-                "语音按键已改为 Win+H，尚未保存；点击语音页“应用”后生效。"
-            )
+            self._update_and_persist_voice_hotkey("win+h")
 
         @Slot()
         def restoreDefaults(self) -> None:
@@ -2583,19 +2650,12 @@ def _load_qt_classes() -> dict:
 
         @Slot(str, str, result=bool)
         def selectAndPersistOutputEndpoint(self, name: str, host_api: str) -> bool:
-            """Persists a SPECIFIC (name, host_api) pair directly - used by
-            the "检查与修复" page's "选择检测到的 CABLE Input" action (XRBM-031
-            In-scope item 5), which already knows the exact endpoint from its
-            own enumeration rather than a combo-box display string. Bypasses
-            build_save_model()'s hotkey/mapping validation entirely (there is
-            nothing to validate about an endpoint name/host-API pair coming
-            from a real enumeration) but still goes through the same
-            config.save_config() persistence and refreshes this
-            controller's own endpoint options/selection, so the "连接" page's
-            dropdown reflects the change immediately without needing a
-            restart. Only ever called after an explicit user click (see
-            DiagnosticsController.selectDetectedCableInputAsOutput()) - never
-            automatically.
+            """Persist a specific enumerated output endpoint independently.
+
+            This path is shared by the voice page's auto-saving dropdown and
+            the explicit VB-CABLE detection action. It intentionally bypasses
+            mapping/hotkey validation so an unrelated unsaved mapping cannot
+            block an output-endpoint change.
 
             Returns ``False`` (never raises) if persistence itself fails
             (XRBM-031 RETRY 1 item 3) - e.g. a disk-full/permission error
@@ -2624,6 +2684,32 @@ def _load_qt_classes() -> dict:
             self.endpointOptionsChanged.emit()
             self.recommendedEndpointIndexChanged.emit()
             self.selectedEndpointIndexChanged.emit()
+            return True
+
+        @Slot(int, result=bool)
+        def selectAndPersistOutputEndpointIndex(self, index: int) -> bool:
+            if not 0 <= index < len(self._endpoint_values):
+                self._set_error_message("输出端点保存失败：所选端点已经不可用。")
+                self.selectedEndpointIndexChanged.emit()
+                return False
+
+            endpoint = self._endpoint_values[index]
+            if not self.selectAndPersistOutputEndpoint(
+                endpoint.name, endpoint.host_api
+            ):
+                self._set_error_message(
+                    "输出端点保存失败：所选设备无法打开或设置无法写入。"
+                )
+                self.selectedEndpointIndexChanged.emit()
+                return False
+
+            self._set_error_message("")
+            self._set_status_message(
+                "输出端点已自动保存；按键映射仍未保存。"
+                "重启遥控器服务后端点生效。"
+                if self._settings_dirty
+                else "输出端点已自动保存；重启遥控器服务后生效。"
+            )
             return True
 
     def _diagnostics_check_to_row(check: "windows_diagnostics.CheckResult") -> dict:
@@ -3192,7 +3278,7 @@ def _load_qt_classes() -> dict:
 
             if not persisted:
                 self._set_driver_error(
-                    "输出端点保存失败；请在语音页重新选择并应用"
+                    "输出端点保存失败；请在语音页重新选择"
                 )
                 return False
 

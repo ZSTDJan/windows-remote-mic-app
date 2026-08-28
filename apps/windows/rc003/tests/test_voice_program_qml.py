@@ -140,6 +140,7 @@ managed = {
 managed_auto_start = bool(controller.voiceProgramLaunchOnBridgeStart)
 managed_elevated = bool(controller.voiceProgramLaunchElevated)
 managed_status = str(controls["voiceProgramLaunchText"].property("text"))
+find(window, "voiceProgramStatusRefreshTimer").setProperty("running", False)
 
 
 def rendered_status(
