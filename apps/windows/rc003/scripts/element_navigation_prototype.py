@@ -21,6 +21,8 @@ from __future__ import annotations
 
 import argparse
 import ctypes
+import json
+import os
 import queue
 import sys
 import threading
@@ -94,11 +96,6 @@ SECTION_HEADER_MIN_WINDOW_WIDTH_RATIO = 0.65
 SECTION_HEADER_MAX_WINDOW_HEIGHT_RATIO = 0.15
 SECTION_HEADER_MAX_TOP_OFFSET_RATIO = 0.15
 SECTION_MIN_HEIGHT = 32
-SECTION_BRIDGE_BASE_DISTANCE = 240.0
-SECTION_BRIDGE_SIZE_MULTIPLIER = 6.0
-SECTION_BRIDGE_PRIMARY_RATIO = 0.35
-SECTION_BRIDGE_MIN_PERPENDICULAR = 96.0
-SECTION_EDGE_TOLERANCE = 16
 HORIZONTAL_LANE_MIN_OVERLAP_RATIO = 0.50
 HORIZONTAL_LANE_MIN_CENTER_TOLERANCE = 12.0
 HORIZONTAL_LANE_MAX_CENTER_TOLERANCE = 48.0
@@ -174,6 +171,11 @@ VISUAL_SURFACE_MIN_HEIGHT = 120
 VISUAL_SURFACE_MIN_WINDOW_AREA_RATIO = 0.06
 OVERLAY_MAX_ROOT_AREA_RATIO = 0.35
 OVERLAY_MIN_INTERSECTION_RATIO = 0.65
+OVERLAY_ROOT_TARGET_MAX_SIZE = 200
+QUICKER_FLOAT_WINDOW_TITLES = frozenset(
+    {"FloatButtonWindow", "FloatPanelWindow", "TextFloatPanelWindow"}
+)
+QUICKER_STATE_FILE_ENV = "REMOTE_MIC_QUICKER_STATE_FILE"
 WS_EX_TOPMOST = 0x00000008
 WS_EX_TOOLWINDOW = 0x00000080
 WS_EX_NOACTIVATE = 0x08000000
@@ -273,6 +275,76 @@ class ElementSnapshot:
 class SyntheticTargetSpec:
     snapshot: TargetSnapshot
     click_point: tuple[int, int]
+
+
+@dataclass(frozen=True)
+class QuickerOverlayAssociation:
+    hwnd: int
+    bind_process_name: str
+
+
+def normalized_process_name(value: str) -> str:
+    name = os.path.basename(str(value or "").strip()).casefold()
+    return name[:-4] if name.endswith(".exe") else name
+
+
+def default_quicker_state_file() -> str:
+    local_app_data = os.environ.get("LOCALAPPDATA", "").strip()
+    if not local_app_data:
+        return ""
+    return os.path.join(
+        local_app_data,
+        "RemoteMic",
+        "RC003",
+        "quicker-navigation.json",
+    )
+
+
+def load_quicker_overlay_associations(
+    path: str,
+) -> dict[int, QuickerOverlayAssociation]:
+    """Read an optional snapshot produced by a Quicker-side bridge action."""
+
+    if not path:
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as stream:
+            payload = json.load(stream)
+    except (OSError, ValueError, TypeError):
+        return {}
+    items = payload.get("items", ()) if isinstance(payload, dict) else ()
+    associations: dict[int, QuickerOverlayAssociation] = {}
+    for item in items if isinstance(items, list) else ():
+        if not isinstance(item, dict):
+            continue
+        try:
+            hwnd = int(item.get("hwnd", 0))
+        except (TypeError, ValueError):
+            continue
+        bind_process_name = normalized_process_name(
+            str(item.get("bindProcessName", item.get("bindProcess", "")))
+        )
+        if (
+            hwnd > 0
+            and bind_process_name
+            and bool(item.get("isBound", item.get("isBindProcess", False)))
+            and bool(item.get("visible", True))
+        ):
+            associations[hwnd] = QuickerOverlayAssociation(
+                hwnd,
+                bind_process_name,
+            )
+    return associations
+
+
+def quicker_overlay_matches_process(
+    association: Optional[QuickerOverlayAssociation],
+    process_name: str,
+) -> bool:
+    return bool(
+        association is not None
+        and association.bind_process_name == normalized_process_name(process_name)
+    )
 
 
 @dataclass(frozen=True)
@@ -1426,213 +1498,6 @@ def infer_navigation_section_path(
     return section_path
 
 
-def _horizontal_section_gap(
-    current: Rect, candidate: Rect, direction: Direction
-) -> Optional[float]:
-    vertical_overlap = min(current.bottom, candidate.bottom) - max(
-        current.top, candidate.top
-    )
-    if vertical_overlap <= 0:
-        return None
-    if direction == Direction.LEFT:
-        gap = current.left - candidate.right
-    elif direction == Direction.RIGHT:
-        gap = candidate.left - current.right
-    else:
-        return None
-    if gap < -SECTION_EDGE_TOLERANCE:
-        return None
-    return float(max(0, gap))
-
-
-def _section_path_is_prefix(
-    prefix: tuple[int, ...], path: tuple[int, ...]
-) -> bool:
-    return bool(
-        prefix
-        and len(prefix) <= len(path)
-        and path[: len(prefix)] == prefix
-    )
-
-
-def _navigation_sections_share_pane(
-    first: TargetSnapshot, second: TargetSnapshot
-) -> bool:
-    if _section_path_is_prefix(first.section_path, second.section_path) or (
-        _section_path_is_prefix(second.section_path, first.section_path)
-    ):
-        return True
-    if first.section_rect is None or second.section_rect is None:
-        return False
-    return first.section_rect.contains(second.section_rect) or (
-        second.section_rect.contains(first.section_rect)
-    )
-
-
-def horizontal_adjacent_section_target_indices(
-    targets: Sequence[TargetSnapshot],
-    current_index: int,
-    direction: Direction,
-    candidate_indices: Sequence[int],
-    grid_rects: Optional[Sequence[Rect]] = None,
-) -> list[int]:
-    if (
-        direction not in {Direction.RIGHT, Direction.LEFT}
-        or not 0 <= current_index < len(targets)
-    ):
-        return []
-    current = targets[current_index]
-    current_rect = (
-        current.rect if grid_rects is None else grid_rects[current_index]
-    )
-    if not current.section_path or current.section_rect is None:
-        return []
-
-    adjacent: list[tuple[float, int]] = []
-    for index in candidate_indices:
-        candidate = targets[index]
-        if (
-            candidate.section_path == current.section_path
-            or not candidate.section_path
-            or candidate.section_rect is None
-        ):
-            continue
-        section_gap = _horizontal_section_gap(
-            current.section_rect, candidate.section_rect, direction
-        )
-        if section_gap is None:
-            continue
-        candidate_rect = (
-            candidate.rect if grid_rects is None else grid_rects[index]
-        )
-        score = direction_score(current_rect, candidate_rect, direction)
-        if score is None:
-            continue
-        adjacent.append((section_gap, index))
-    if not adjacent:
-        return []
-
-    section_representatives: dict[tuple[int, ...], int] = {}
-    section_gaps: dict[tuple[int, ...], float] = {}
-    for gap, index in adjacent:
-        section_path = targets[index].section_path
-        section_representatives.setdefault(section_path, index)
-        section_gaps[section_path] = min(
-            gap, section_gaps.get(section_path, gap)
-        )
-    nearest_gap = min(section_gaps.values())
-    adjacent_sections = {
-        section_path
-        for section_path, gap in section_gaps.items()
-        if gap <= nearest_gap + SECTION_EDGE_TOLERANCE
-    }
-    # UIA often exposes an outer pane and an indented ListControl as separate
-    # sections. Expand the nearest section through nested sections so a 35px
-    # content inset cannot hide the visually aligned row inside the same pane.
-    pending_sections = list(adjacent_sections)
-    while pending_sections:
-        kept_section = pending_sections.pop()
-        kept = targets[section_representatives[kept_section]]
-        for section_path, index in section_representatives.items():
-            if section_path in adjacent_sections:
-                continue
-            if _navigation_sections_share_pane(targets[index], kept):
-                adjacent_sections.add(section_path)
-                pending_sections.append(section_path)
-    return [
-        index
-        for index in candidate_indices
-        if targets[index].section_path in adjacent_sections
-    ]
-
-
-def horizontal_section_target_indices(
-    targets: Sequence[TargetSnapshot],
-    current_index: int,
-    direction: Direction,
-    candidate_indices: Sequence[int],
-    adjacent_section_indices: Sequence[int],
-    grid_rects: Optional[Sequence[Rect]] = None,
-) -> list[int]:
-    """Order the current and immediately adjacent horizontal regions."""
-
-    if (
-        direction not in {Direction.RIGHT, Direction.LEFT}
-        or not 0 <= current_index < len(targets)
-    ):
-        return []
-    current = targets[current_index]
-    current_rect = (
-        current.rect if grid_rects is None else grid_rects[current_index]
-    )
-    if not current.section_path or current.section_rect is None:
-        return []
-
-    adjacent = set(adjacent_section_indices)
-    same_section = [
-        index
-        for index in candidate_indices
-        if targets[index].section_path == current.section_path
-    ]
-    adjacent_section = [
-        index for index in candidate_indices if index in adjacent
-    ]
-    ordered = [
-        index
-        for index in candidate_indices
-        if index in adjacent
-        or targets[index].section_path == current.section_path
-    ]
-    if not same_section or not adjacent_section:
-        return ordered
-
-    best_same = same_section[0]
-    best_adjacent = adjacent_section[0]
-    if ordered[0] == best_same:
-        return ordered
-
-    same_score = direction_score(
-        current_rect,
-        targets[best_same].rect if grid_rects is None else grid_rects[best_same],
-        direction,
-    )
-    adjacent_score = direction_score(
-        current_rect,
-        (
-            targets[best_adjacent].rect
-            if grid_rects is None
-            else grid_rects[best_adjacent]
-        ),
-        direction,
-    )
-    if same_score is None or adjacent_score is None:
-        return ordered
-
-    same_target = targets[best_same]
-    same_target_rect = (
-        same_target.rect if grid_rects is None else grid_rects[best_same]
-    )
-    maximum_center_offset = max(
-        SECTION_BRIDGE_BASE_DISTANCE,
-        current_rect.height * SECTION_BRIDGE_SIZE_MULTIPLIER,
-        same_target_rect.height * SECTION_BRIDGE_SIZE_MULTIPLIER,
-    )
-    primary_center_distance = abs(
-        same_target_rect.center_x - current_rect.center_x
-    )
-    relative_center_offset = max(
-        SECTION_BRIDGE_MIN_PERPENDICULAR,
-        primary_center_distance * SECTION_BRIDGE_PRIMARY_RATIO,
-    )
-    if (
-        same_score[1] <= adjacent_score[1]
-        and same_score[4]
-        <= min(maximum_center_offset, relative_center_offset)
-    ):
-        return [best_same] + [index for index in ordered if index != best_same]
-    return ordered
-
-
 def _direction_rank_key(
     current: Rect,
     candidate: Rect,
@@ -1711,29 +1576,7 @@ def ranked_target_indices(
         )
 
     scored.sort(key=rank_key)
-    directional = [index for _score, _prefix, index in scored]
-    if direction not in {Direction.RIGHT, Direction.LEFT}:
-        return directional
-    section_exits = horizontal_adjacent_section_target_indices(
-        targets,
-        current_index,
-        direction,
-        directional,
-        grid_rects,
-    )
-    section_targets = horizontal_section_target_indices(
-        targets,
-        current_index,
-        direction,
-        directional,
-        section_exits,
-        grid_rects,
-    )
-    if not section_targets:
-        return directional
-    return section_targets + [
-        index for index in directional if index not in section_targets
-    ]
+    return [index for _score, _prefix, index in scored]
 
 
 def best_grid_target_index(
@@ -1742,95 +1585,15 @@ def best_grid_target_index(
     direction: Direction,
     grid_rects: Sequence[Rect],
 ) -> Optional[int]:
-    """Return only the first grid neighbor without sorting every candidate."""
+    """Return the first neighbor from the same geometry-only ranking."""
 
-    current = grid_rects[current_index]
-    scored: dict[
-        int,
-        tuple[
-            tuple[int, float, float, float, float, int, int],
-            tuple[float, ...],
-        ],
-    ] = {}
-    for index, target in enumerate(targets):
-        if index == current_index:
-            continue
-        score = direction_score(current, grid_rects[index], direction)
-        if score is None:
-            continue
-        common_prefix = _common_path_prefix_length(
-            targets[current_index].path, target.path
-        )
-        scored[index] = (
-            score,
-            _direction_rank_key(
-                current,
-                grid_rects[index],
-                direction,
-                score,
-                common_prefix,
-            ),
-        )
-    if not scored:
-        return None
-    best_directional = min(scored, key=lambda index: scored[index][1])
-    if direction not in {Direction.RIGHT, Direction.LEFT}:
-        return best_directional
-
-    current_target = targets[current_index]
-    if not current_target.section_path or current_target.section_rect is None:
-        return best_directional
-    directional = tuple(scored)
-    adjacent = set(
-        horizontal_adjacent_section_target_indices(
-            targets,
-            current_index,
-            direction,
-            directional,
-            grid_rects,
-        )
+    ranked = ranked_target_indices(
+        targets,
+        current_index,
+        direction,
+        grid_rects=grid_rects,
     )
-    same_section = [
-        index
-        for index in directional
-        if targets[index].section_path == current_target.section_path
-    ]
-    adjacent_section = [index for index in directional if index in adjacent]
-    eligible = same_section + [
-        index for index in adjacent_section if index not in same_section
-    ]
-    if not eligible:
-        return best_directional
-    best_eligible = min(eligible, key=lambda index: scored[index][1])
-    if not same_section or not adjacent_section:
-        return best_eligible
-    best_same = min(same_section, key=lambda index: scored[index][1])
-    best_adjacent = min(adjacent_section, key=lambda index: scored[index][1])
-    if best_eligible == best_same:
-        return best_same
-
-    same_score = scored[best_same][0]
-    adjacent_score = scored[best_adjacent][0]
-    same_target_rect = grid_rects[best_same]
-    maximum_center_offset = max(
-        SECTION_BRIDGE_BASE_DISTANCE,
-        current.height * SECTION_BRIDGE_SIZE_MULTIPLIER,
-        same_target_rect.height * SECTION_BRIDGE_SIZE_MULTIPLIER,
-    )
-    primary_center_distance = abs(
-        same_target_rect.center_x - current.center_x
-    )
-    relative_center_offset = max(
-        SECTION_BRIDGE_MIN_PERPENDICULAR,
-        primary_center_distance * SECTION_BRIDGE_PRIMARY_RATIO,
-    )
-    if (
-        same_score[1] <= adjacent_score[1]
-        and same_score[4]
-        <= min(maximum_center_offset, relative_center_offset)
-    ):
-        return best_same
-    return best_eligible
+    return ranked[0] if ranked else None
 
 
 DIAGNOSTIC_REJECTION_ORDER = (
@@ -1846,8 +1609,6 @@ DIAGNOSTIC_ROUTE_LABELS = {
     "diagonal": "斜向候选",
     "reverse": "反向返回",
     "parent_cell": "父级单元格",
-    "section_bridge": "同区网格",
-    "section_exit": "相邻区出口",
 }
 DIAGNOSTIC_DIRECTION_LABELS = {
     Direction.UP: "上",
@@ -1906,18 +1667,6 @@ def build_navigation_diagnostic(
         for index in ranked
         if 0 <= index < len(targets) and index != current_index
     }
-    all_directional = tuple(
-        index for index in ranked if scored_by_index.get(index) is not None
-    )
-    section_exits = set(
-        horizontal_adjacent_section_target_indices(
-            targets,
-            current_index,
-            direction,
-            all_directional,
-            grid_rects,
-        )
-    )
     candidates: list[CandidateDiagnostic] = []
     for rank, index in enumerate(ranked, 1):
         if not 0 <= index < len(targets) or index == current_index:
@@ -1930,14 +1679,6 @@ def build_navigation_diagnostic(
             route = "reverse"
         elif index not in natural:
             route = "reverse"
-        elif index in section_exits:
-            route = "section_exit"
-        elif (
-            current.section_path
-            and current.section_rect is not None
-            and target.section_path == current.section_path
-        ):
-            route = "section_bridge"
         elif score is None:
             route = "reverse"
         elif score is not None and score[0] == 0:
@@ -2102,7 +1843,7 @@ OPPOSITE_DIRECTION = {
 
 
 class NavigationGraph:
-    """Build a stable four-way grid for one target layout."""
+    """Cache geometry-only candidates for one flat screen layout."""
 
     def __init__(self, targets: Sequence[TargetSnapshot]) -> None:
         self.targets = tuple(targets)
@@ -2111,265 +1852,6 @@ class NavigationGraph:
             self.targets, self._descendants_by_target
         )
         self._natural: dict[tuple[int, Direction], tuple[int, ...]] = {}
-        self._ranked: dict[tuple[int, Direction], tuple[int, ...]] = {}
-        self._primary: dict[tuple[int, Direction], int] = {}
-        for current_index in range(len(self.targets)):
-            for direction in Direction:
-                key = (current_index, direction)
-                primary = best_grid_target_index(
-                    self.targets,
-                    current_index,
-                    direction,
-                    self.grid_rects,
-                )
-                if primary is not None:
-                    self._primary[key] = primary
-        self._connect_orphan_cells()
-        self._connect_grid_components()
-
-    def _incoming_counts(self) -> list[int]:
-        counts = [0] * len(self.targets)
-        for target_index in self._primary.values():
-            counts[target_index] += 1
-        return counts
-
-    def _connect_orphan_cells(self) -> None:
-        """Insert otherwise unreachable cells into the nearest mutual grid edge."""
-
-        if len(self.targets) < 3:
-            return
-        while True:
-            incoming = self._incoming_counts()
-            orphan_indices = [
-                index for index, count in enumerate(incoming) if count == 0
-            ]
-            if not orphan_indices:
-                return
-
-            best_bridge: Optional[
-                tuple[float, float, float, int, Direction, int, int]
-            ] = None
-            for orphan_index in orphan_indices:
-                orphan = self.grid_rects[orphan_index]
-                for (source_index, direction), destination_index in tuple(
-                    self._primary.items()
-                ):
-                    if orphan_index in {source_index, destination_index}:
-                        continue
-                    opposite = OPPOSITE_DIRECTION[direction]
-                    if (
-                        self._primary.get((destination_index, opposite))
-                        != source_index
-                    ):
-                        continue
-                    source = self.grid_rects[source_index]
-                    destination = self.grid_rects[destination_index]
-                    source_score = direction_score(source, orphan, direction)
-                    destination_score = direction_score(
-                        orphan, destination, direction
-                    )
-                    if source_score is None or destination_score is None:
-                        continue
-                    if direction in {Direction.LEFT, Direction.RIGHT}:
-                        span = abs(destination.center_x - source.center_x)
-                        orphan_axis = abs(orphan.center_x - source.center_x)
-                    else:
-                        span = abs(destination.center_y - source.center_y)
-                        orphan_axis = abs(orphan.center_y - source.center_y)
-                    if span <= 0 or orphan_axis >= span:
-                        continue
-                    perpendicular = max(source_score[4], destination_score[4])
-                    detour = source_score[3] + destination_score[3]
-                    midpoint_offset = abs(orphan_axis - span / 2)
-                    bridge = (
-                        perpendicular / span,
-                        detour / span,
-                        midpoint_offset / span,
-                        source_index,
-                        direction,
-                        destination_index,
-                        orphan_index,
-                    )
-                    if best_bridge is None or bridge < best_bridge:
-                        best_bridge = bridge
-            if best_bridge is None:
-                return
-
-            (
-                _perpendicular,
-                _detour,
-                _midpoint,
-                source_index,
-                direction,
-                destination_index,
-                orphan_index,
-            ) = best_bridge
-            opposite = OPPOSITE_DIRECTION[direction]
-            self._primary[(source_index, direction)] = orphan_index
-            self._primary[(orphan_index, direction)] = destination_index
-            self._primary[(destination_index, opposite)] = orphan_index
-            self._primary[(orphan_index, opposite)] = source_index
-
-    def _strong_components(self) -> list[tuple[int, ...]]:
-        next_index = 0
-        stack: list[int] = []
-        on_stack: set[int] = set()
-        indices: dict[int, int] = {}
-        low_links: dict[int, int] = {}
-        components: list[tuple[int, ...]] = []
-
-        def visit(node: int) -> None:
-            nonlocal next_index
-            indices[node] = next_index
-            low_links[node] = next_index
-            next_index += 1
-            stack.append(node)
-            on_stack.add(node)
-            neighbors = {
-                target
-                for (source, _direction), target in self._primary.items()
-                if source == node
-            }
-            for neighbor in neighbors:
-                if neighbor not in indices:
-                    visit(neighbor)
-                    low_links[node] = min(low_links[node], low_links[neighbor])
-                elif neighbor in on_stack:
-                    low_links[node] = min(low_links[node], indices[neighbor])
-            if low_links[node] != indices[node]:
-                return
-            component: list[int] = []
-            while stack:
-                member = stack.pop()
-                on_stack.remove(member)
-                component.append(member)
-                if member == node:
-                    break
-            components.append(tuple(component))
-
-        for node in range(len(self.targets)):
-            if node not in indices:
-                visit(node)
-        return components
-
-    def _replacement_penalty(
-        self, source_index: int, direction: Direction
-    ) -> int:
-        existing_index = self._primary.get((source_index, direction))
-        if existing_index is None:
-            return 0
-        score = direction_score(
-            self.grid_rects[source_index],
-            self.grid_rects[existing_index],
-            direction,
-        )
-        return 4 if score is not None and score[0] == 0 else 2
-
-    def _connect_grid_components(self) -> None:
-        """Make the first-neighbor grid reachable from every starting cell."""
-
-        while True:
-            components = self._strong_components()
-            if len(components) <= 1:
-                return
-            component_by_index = {
-                index: component_index
-                for component_index, component in enumerate(components)
-                for index in component
-            }
-            bridges: list[
-                tuple[float, float, float, int, Direction, int]
-            ] = []
-            for first_index in range(len(self.targets)):
-                first = self.grid_rects[first_index]
-                for second_index in range(first_index + 1, len(self.targets)):
-                    if (
-                        component_by_index[first_index]
-                        == component_by_index[second_index]
-                    ):
-                        continue
-                    second = self.grid_rects[second_index]
-                    axes: list[tuple[int, Direction, int]] = []
-                    if first.center_x < second.center_x:
-                        axes.append((first_index, Direction.RIGHT, second_index))
-                    elif second.center_x < first.center_x:
-                        axes.append((second_index, Direction.RIGHT, first_index))
-                    if first.center_y < second.center_y:
-                        axes.append((first_index, Direction.DOWN, second_index))
-                    elif second.center_y < first.center_y:
-                        axes.append((second_index, Direction.DOWN, first_index))
-                    for source_index, direction, destination_index in axes:
-                        opposite = OPPOSITE_DIRECTION[direction]
-                        source_score = direction_score(
-                            self.grid_rects[source_index],
-                            self.grid_rects[destination_index],
-                            direction,
-                        )
-                        destination_score = direction_score(
-                            self.grid_rects[destination_index],
-                            self.grid_rects[source_index],
-                            opposite,
-                        )
-                        if source_score is None or destination_score is None:
-                            continue
-                        replacement = self._replacement_penalty(
-                            source_index, direction
-                        ) + self._replacement_penalty(destination_index, opposite)
-                        forward_distance = (
-                            abs(
-                                self.grid_rects[destination_index].center_x
-                                - self.grid_rects[source_index].center_x
-                            )
-                            if direction == Direction.RIGHT
-                            else abs(
-                                self.grid_rects[destination_index].center_y
-                                - self.grid_rects[source_index].center_y
-                            )
-                        )
-                        angular_offset = max(
-                            source_score[4], destination_score[4]
-                        ) / max(1.0, forward_distance)
-                        bridges.append(
-                            (
-                                float(replacement),
-                                float(max(source_score[0], destination_score[0])),
-                                angular_offset + forward_distance / 10000.0,
-                                source_index,
-                                direction,
-                                destination_index,
-                            )
-                        )
-            bridges.sort()
-            original_count = len(components)
-            connected = False
-            for (
-                _replacement,
-                _lane_rank,
-                _geometry,
-                source_index,
-                direction,
-                destination_index,
-            ) in bridges:
-                opposite = OPPOSITE_DIRECTION[direction]
-                source_key = (source_index, direction)
-                destination_key = (destination_index, opposite)
-                old_source = self._primary.get(source_key)
-                old_destination = self._primary.get(destination_key)
-                self._primary[source_key] = destination_index
-                self._primary[destination_key] = source_index
-                if len(self._strong_components()) < original_count:
-                    connected = True
-                    break
-                if old_source is None:
-                    self._primary.pop(source_key, None)
-                else:
-                    self._primary[source_key] = old_source
-                if old_destination is None:
-                    self._primary.pop(destination_key, None)
-                else:
-                    self._primary[destination_key] = old_destination
-            if not connected:
-                return
 
     def natural_candidates(
         self, current_index: int, direction: Direction
@@ -2387,20 +1869,10 @@ class NavigationGraph:
                 )
             )
             self._natural[key] = natural
-        primary = self._primary.get(key)
-        if primary is None:
-            return natural
-        return (primary,) + tuple(index for index in natural if index != primary)
+        return natural
 
     def candidates(self, current_index: int, direction: Direction) -> tuple[int, ...]:
-        key = (current_index, direction)
-        cached = self._ranked.get(key)
-        if cached is not None:
-            return cached
-
-        ranked = self.natural_candidates(current_index, direction)
-        self._ranked[key] = ranked
-        return ranked
+        return self.natural_candidates(current_index, direction)
 
 
 @dataclass
@@ -2572,6 +2044,8 @@ def overlay_window_is_candidate(
     minimized: bool,
     cloaked: bool,
     related: bool,
+    explicitly_associated: bool = False,
+    trusted_small_overlay: bool = False,
 ) -> bool:
     if (
         not visible
@@ -2586,8 +2060,45 @@ def overlay_window_is_candidate(
     root_area = max(1, root_rect.width * root_rect.height)
     if candidate_area > root_area * OVERLAY_MAX_ROOT_AREA_RATIO:
         return False
+    if explicitly_associated:
+        return True
+    if (
+        trusted_small_overlay
+        and candidate_rect.width <= OVERLAY_ROOT_TARGET_MAX_SIZE
+        and candidate_rect.height <= OVERLAY_ROOT_TARGET_MAX_SIZE
+    ):
+        return True
     intersection = _rect_intersection_area(root_rect, candidate_rect)
     return intersection >= candidate_area * OVERLAY_MIN_INTERSECTION_RATIO
+
+
+def root_only_overlay_target_spec(
+    rect: Rect,
+    name: str = "",
+) -> Optional[SyntheticTargetSpec]:
+    if (
+        rect.width < 16
+        or rect.height < 16
+        or rect.width > OVERLAY_ROOT_TARGET_MAX_SIZE
+        or rect.height > OVERLAY_ROOT_TARGET_MAX_SIZE
+    ):
+        return None
+    label = name.strip()
+    if not label or label == "CustomWindowAutomationPeer":
+        label = "悬浮操作"
+    return SyntheticTargetSpec(
+        TargetSnapshot(
+            rect=rect,
+            name=label,
+            control_type="OverlayWindowControl",
+            path=(),
+            depth=0,
+            has_action_pattern=True,
+            source="window-root",
+            section_rect=rect,
+        ),
+        (round(rect.center_x), round(rect.center_y)),
+    )
 
 
 def navigation_foreground_action(
@@ -3037,6 +2548,14 @@ def _parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         action="store_true",
         help="start with navigation candidate diagnostics enabled",
     )
+    parser.add_argument(
+        "--quicker-state-file",
+        default=os.environ.get(
+            QUICKER_STATE_FILE_ENV,
+            default_quicker_state_file(),
+        ),
+        help="optional JSON snapshot exported by a Quicker bridge action",
+    )
     return parser.parse_args(argv)
 
 
@@ -3118,6 +2637,17 @@ def _run_windows(args: argparse.Namespace) -> int:
     kernel32.GetCurrentThreadId.restype = wintypes.DWORD
     kernel32.GetModuleHandleW.argtypes = [wintypes.LPCWSTR]
     kernel32.GetModuleHandleW.restype = wintypes.HMODULE
+    kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.QueryFullProcessImageNameW.argtypes = [
+        wintypes.HANDLE,
+        wintypes.DWORD,
+        wintypes.LPWSTR,
+        ctypes.POINTER(wintypes.DWORD),
+    ]
+    kernel32.QueryFullProcessImageNameW.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
     user32.GetForegroundWindow.restype = wintypes.HWND
     user32.GetAncestor.argtypes = [wintypes.HWND, wintypes.UINT]
     user32.GetAncestor.restype = wintypes.HWND
@@ -3192,6 +2722,8 @@ def _run_windows(args: argparse.Namespace) -> int:
     ]
     user32.GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
     user32.GetClassNameW.restype = ctypes.c_int
+    user32.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+    user32.GetWindowTextW.restype = ctypes.c_int
     user32.GetAsyncKeyState.argtypes = [ctypes.c_int]
     user32.GetAsyncKeyState.restype = ctypes.c_short
     user32.CallNextHookEx.restype = lresult
@@ -3302,6 +2834,7 @@ def _run_windows(args: argparse.Namespace) -> int:
     gw_owner = 4
     ga_root = 2
     gwl_exstyle = -20
+    process_query_limited_information = 0x1000
     dwmwa_cloaked = 14
     srccopy = 0x00CC0020
     bi_rgb = 0
@@ -3567,6 +3100,36 @@ def _run_windows(args: argparse.Namespace) -> int:
         user32.GetClassNameW(hwnd, buffer, len(buffer))
         return buffer.value
 
+    def window_text(hwnd: int) -> str:
+        buffer = ctypes.create_unicode_buffer(512)
+        if user32.GetWindowTextW(hwnd, buffer, len(buffer)) <= 0:
+            return ""
+        return buffer.value
+
+    def process_name_from_id(process_id: int) -> str:
+        if process_id <= 0:
+            return ""
+        handle = kernel32.OpenProcess(
+            process_query_limited_information,
+            False,
+            process_id,
+        )
+        if not handle:
+            return ""
+        try:
+            size = wintypes.DWORD(32768)
+            buffer = ctypes.create_unicode_buffer(size.value)
+            if not kernel32.QueryFullProcessImageNameW(
+                handle,
+                0,
+                buffer,
+                ctypes.byref(size),
+            ):
+                return ""
+            return normalized_process_name(buffer.value)
+        finally:
+            kernel32.CloseHandle(handle)
+
     def window_process_id(hwnd: int) -> int:
         process_id = wintypes.DWORD()
         user32.GetWindowThreadProcessId(hwnd, ctypes.byref(process_id))
@@ -3612,6 +3175,11 @@ def _run_windows(args: argparse.Namespace) -> int:
         if root_rect.width <= 0 or root_rect.height <= 0:
             return ()
         root_process_id = window_process_id(root_hwnd)
+        root_process_name = process_name_from_id(root_process_id)
+        process_names = {root_process_id: root_process_name}
+        quicker_associations = load_quicker_overlay_associations(
+            args.quicker_state_file
+        )
         associated: list[tuple[int, Rect]] = []
 
         @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
@@ -3625,6 +3193,19 @@ def _run_windows(args: argparse.Namespace) -> int:
             if excluded_process_id > 0 and process_id == excluded_process_id:
                 return True
             exstyle = int(user32.GetWindowLongPtrW(handle, gwl_exstyle))
+            process_name = process_names.get(process_id)
+            if process_name is None:
+                process_name = process_name_from_id(process_id)
+                process_names[process_id] = process_name
+            title = window_text(handle)
+            is_quicker_float = bool(
+                process_name == "quicker"
+                and title in QUICKER_FLOAT_WINDOW_TITLES
+            )
+            explicitly_associated = quicker_overlay_matches_process(
+                quicker_associations.get(handle),
+                root_process_name,
+            )
             related = overlay_window_is_related(
                 process_id,
                 root_process_id,
@@ -3635,7 +3216,7 @@ def _run_windows(args: argparse.Namespace) -> int:
                     root_hwnd, handle, window_owner
                 ),
                 extended_style=exstyle,
-            )
+            ) or explicitly_associated or is_quicker_float
             rect = window_rect_from_handle(handle)
             if overlay_window_is_candidate(
                 root_rect,
@@ -3644,6 +3225,10 @@ def _run_windows(args: argparse.Namespace) -> int:
                 minimized=bool(user32.IsIconic(handle)),
                 cloaked=window_is_cloaked(handle),
                 related=related,
+                explicitly_associated=explicitly_associated,
+                trusted_small_overlay=(
+                    is_quicker_float and title == "FloatButtonWindow"
+                ),
             ):
                 associated.append((handle, rect))
             return True
@@ -4082,6 +3667,19 @@ def _run_windows(args: argparse.Namespace) -> int:
                 )
             except Exception:
                 continue
+            if not targets:
+                root_spec = root_only_overlay_target_spec(
+                    _overlay_rect,
+                    _name,
+                )
+                if root_spec is not None:
+                    targets = [
+                        RuntimeTarget(
+                            root_spec.snapshot,
+                            None,
+                            root_spec.click_point,
+                        )
+                    ]
             scope = (2_000_000 + overlay_index,)
             for target in targets:
                 snapshot = target.snapshot

@@ -1,7 +1,9 @@
 import ast
 import importlib.util
+import json
 import random
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -321,7 +323,7 @@ class SpatialNavigationTests(unittest.TestCase):
             0,
         )
 
-    def test_orphan_cell_is_inserted_into_the_nearest_grid_edge(self):
+    def test_irregular_cell_does_not_rewire_the_nearest_column(self):
         targets = [
             self.target(0, 0, 40, 40, "A"),
             self.target(200, 0, 240, 40, "B"),
@@ -331,9 +333,9 @@ class SpatialNavigationTests(unittest.TestCase):
         ]
         graph = prototype.NavigationGraph(targets)
 
-        self.assertEqual(graph.candidates(1, prototype.Direction.DOWN)[0], 2)
+        self.assertEqual(graph.candidates(1, prototype.Direction.DOWN)[:2], (4, 2))
         self.assertEqual(graph.candidates(2, prototype.Direction.DOWN)[0], 4)
-        self.assertEqual(graph.candidates(4, prototype.Direction.UP)[0], 2)
+        self.assertEqual(graph.candidates(4, prototype.Direction.UP)[:2], (1, 2))
         self.assertEqual(graph.candidates(2, prototype.Direction.UP)[0], 1)
 
     def test_overlapping_candidates_use_forward_center_distance(self):
@@ -990,12 +992,12 @@ class SpatialNavigationTests(unittest.TestCase):
         )
         self.assertIsNotNone(diagnostic)
         assert diagnostic is not None
-        self.assertEqual(diagnostic.candidates[0].route, "section_exit")
+        self.assertEqual(diagnostic.candidates[0].route, "diagonal")
         self.assertIn(
-            "相邻区出口", prototype.format_navigation_diagnostic(diagnostic)
+            "斜向候选", prototype.format_navigation_diagnostic(diagnostic)
         )
 
-    def test_same_content_region_beats_distant_sidebar_lane(self):
+    def test_geometry_beats_region_membership(self):
         main_section = (0, 2)
         main_rect = prototype.Rect(934, 242, 2390, 1759)
         sidebar_rect = prototype.Rect(497, 242, 934, 1759)
@@ -1036,25 +1038,25 @@ class SpatialNavigationTests(unittest.TestCase):
             prototype.ranked_target_indices(
                 targets, 1, prototype.Direction.LEFT
             )[:2],
-            [0, 2],
+            [2, 0],
         )
         graph = prototype.NavigationGraph(targets)
-        self.assertEqual(graph.candidates(1, prototype.Direction.LEFT)[0], 0)
-        self.assertEqual(graph.candidates(0, prototype.Direction.RIGHT)[0], 1)
+        self.assertEqual(graph.candidates(1, prototype.Direction.LEFT)[0], 2)
+        self.assertEqual(graph.candidates(2, prototype.Direction.RIGHT)[0], 1)
 
         diagnostic = prototype.build_navigation_diagnostic(
             targets,
             1,
             prototype.Direction.LEFT,
             available_indices=graph.candidates(1, prototype.Direction.LEFT),
-            selected_index=0,
+            selected_index=2,
             outcome="selected",
         )
         self.assertIsNotNone(diagnostic)
         assert diagnostic is not None
-        self.assertEqual(diagnostic.candidates[0].route, "section_bridge")
+        self.assertEqual(diagnostic.candidates[0].route, "lane")
         self.assertIn(
-            "同区网格", prototype.format_navigation_diagnostic(diagnostic)
+            "同一通道", prototype.format_navigation_diagnostic(diagnostic)
         )
 
     def test_same_region_does_not_lock_out_a_much_nearer_other_pane(self):
@@ -1314,7 +1316,7 @@ class SpatialNavigationTests(unittest.TestCase):
             parent_first.candidates(1, prototype.Direction.UP), (0,)
         )
 
-    def test_four_way_grid_reaches_every_target_in_an_irregular_layout(self):
+    def test_irregular_layout_keeps_every_target_in_directional_rankings(self):
         targets = [
             self.target(750, 0, 780, 30, "0"),
             self.target(650, 200, 680, 230, "1"),
@@ -1323,20 +1325,13 @@ class SpatialNavigationTests(unittest.TestCase):
             self.target(150, 450, 180, 480, "4"),
         ]
         graph = prototype.NavigationGraph(targets)
-        for start in range(len(targets)):
-            visited = {start}
-            pending = [start]
-            while pending:
-                current = pending.pop()
-                for direction in prototype.Direction:
-                    candidates = graph.candidates(current, direction)
-                    if not candidates or candidates[0] in visited:
-                        continue
-                    visited.add(candidates[0])
-                    pending.append(candidates[0])
-            self.assertEqual(visited, set(range(len(targets))))
+        reachable = set()
+        for current in range(len(targets)):
+            for direction in prototype.Direction:
+                reachable.update(graph.candidates(current, direction))
+        self.assertEqual(reachable, set(range(len(targets))))
 
-    def test_random_four_way_grids_have_no_unreachable_cells(self):
+    def test_random_grids_keep_every_cell_in_directional_rankings(self):
         generator = random.Random(828)
         for _case in range(120):
             targets = []
@@ -1356,18 +1351,11 @@ class SpatialNavigationTests(unittest.TestCase):
                     )
                 )
             graph = prototype.NavigationGraph(targets)
-            for start in range(len(targets)):
-                visited = {start}
-                pending = [start]
-                while pending:
-                    current = pending.pop()
-                    for direction in prototype.Direction:
-                        candidates = graph.candidates(current, direction)
-                        if not candidates or candidates[0] in visited:
-                            continue
-                        visited.add(candidates[0])
-                        pending.append(candidates[0])
-                self.assertEqual(visited, set(range(len(targets))))
+            reachable = set()
+            for current in range(len(targets)):
+                for direction in prototype.Direction:
+                    reachable.update(graph.candidates(current, direction))
+            self.assertEqual(reachable, set(range(len(targets))))
 
     def test_fast_primary_grid_neighbor_matches_full_ranking(self):
         generator = random.Random(829)
@@ -1416,6 +1404,23 @@ class SpatialNavigationTests(unittest.TestCase):
             self.target(1341, 500, 1380, 539, "编辑消息"),
         ]
         graph = prototype.NavigationGraph(targets)
+        self.assertEqual(
+            graph.candidates(0, prototype.Direction.RIGHT)[0], 1
+        )
+        self.assertEqual(
+            graph.candidates(1, prototype.Direction.LEFT)[0], 0
+        )
+
+    def test_window_edge_action_reaches_nearby_quicker_float_before_upper_copy(self):
+        targets = [
+            self.target(2106, 1746, 2149, 1788, "加入队列"),
+            self.target(2186, 1695, 2254, 1763, "Quicker 底部"),
+            self.target(2116, 982, 2155, 1021, "复制消息"),
+            self.target(2116, 525, 2155, 564, "复制消息"),
+            self.target(2186, 1625, 2254, 1693, "Quicker 中部"),
+        ]
+        graph = prototype.NavigationGraph(targets)
+
         self.assertEqual(
             graph.candidates(0, prototype.Direction.RIGHT)[0], 1
         )
@@ -2150,6 +2155,92 @@ class SpatialNavigationTests(unittest.TestCase):
                 root,
                 prototype.Rect(700, 180, 1000, 380),
                 **{**accepted, "related": False},
+            )
+        )
+
+    def test_associated_or_trusted_quicker_overlay_can_sit_outside_root(self):
+        root = prototype.Rect(100, 100, 1100, 900)
+        outside = prototype.Rect(1200, 200, 1268, 268)
+        common = dict(
+            visible=True,
+            minimized=False,
+            cloaked=False,
+            related=True,
+        )
+        self.assertTrue(
+            prototype.overlay_window_is_candidate(
+                root,
+                outside,
+                explicitly_associated=True,
+                **common,
+            )
+        )
+        self.assertTrue(
+            prototype.overlay_window_is_candidate(
+                root,
+                outside,
+                trusted_small_overlay=True,
+                **common,
+            )
+        )
+        self.assertFalse(
+            prototype.overlay_window_is_candidate(root, outside, **common)
+        )
+
+    def test_reads_quicker_process_association_snapshot(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "quicker-navigation.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "items": [
+                            {
+                                "hwnd": 1234,
+                                "isBound": True,
+                                "bindProcessName": "C:/Apps/Codex.exe",
+                                "visible": True,
+                            },
+                            {
+                                "hwnd": 5678,
+                                "isBound": False,
+                                "bindProcessName": "QQ.exe",
+                            },
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            associations = prototype.load_quicker_overlay_associations(str(path))
+
+        self.assertEqual(set(associations), {1234})
+        self.assertTrue(
+            prototype.quicker_overlay_matches_process(
+                associations[1234], "CODEX.EXE"
+            )
+        )
+        self.assertFalse(
+            prototype.quicker_overlay_matches_process(
+                associations[1234], "QQ.exe"
+            )
+        )
+        self.assertEqual(
+            prototype.load_quicker_overlay_associations("missing.json"), {}
+        )
+
+    def test_root_only_small_overlay_becomes_one_clickable_cell(self):
+        spec = prototype.root_only_overlay_target_spec(
+            prototype.Rect(1457, 1037, 1502, 1082),
+            "CustomWindowAutomationPeer",
+        )
+        self.assertIsNotNone(spec)
+        assert spec is not None
+        self.assertEqual(spec.snapshot.control_type, "OverlayWindowControl")
+        self.assertEqual(spec.snapshot.name, "悬浮操作")
+        self.assertEqual(spec.click_point, (1480, 1060))
+        self.assertIsNone(
+            prototype.root_only_overlay_target_spec(
+                prototype.Rect(100, 100, 500, 500),
+                "large popup",
             )
         )
 
