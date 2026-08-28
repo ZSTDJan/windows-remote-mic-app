@@ -18,6 +18,9 @@ _CI_PATH = _REPO_ROOT / ".github" / "workflows" / "windows-rc003-ci.yml"
 _PACKAGE_MAIN_PATH = _RC003_ROOT / "src" / "ovb_rc003" / "__main__.py"
 _LAUNCHER_PATH = _RC003_ROOT / "src" / "launcher.py"
 _BUILD_CANDIDATE_PATH = _RC003_ROOT / "build" / "build-candidate.ps1"
+_RUN_DEV_PATH = _RC003_ROOT / "build" / "run-dev.ps1"
+_STOP_DEV_PATH = _RC003_ROOT / "build" / "stop-dev.ps1"
+_INSTALL_DEV_SHORTCUT_PATH = _RC003_ROOT / "build" / "install-dev-shortcut.ps1"
 _PUBLIC_BOUNDARY_PATH = _RC003_ROOT / "build" / "check-public-boundary.ps1"
 _README_PATH = _RC003_ROOT / "README.md"
 _INSTALLED_README_PATH = _RC003_ROOT / "installer" / "readme-rc003.txt"
@@ -971,6 +974,12 @@ class BuildCandidateScriptTests(unittest.TestCase):
         # workflow's test-suite step, not just document it in prose.
         self.assertIn("-W error::ResourceWarning -m unittest discover", self.text)
 
+    def test_stops_the_marked_development_session_before_touching_the_venv(self):
+        stop_index = self.text.index("stop-dev.ps1")
+        pip_index = self.text.index("pip install --upgrade pip")
+        self.assertLess(stop_index, pip_index)
+        self.assertIn('Assert-LastExitCode "stop-dev.ps1"', self.text)
+
     def test_fetches_and_verifies_vb_cable_before_pyinstaller_build(self):
         # XRBM-031 In-scope item 8: same ordering requirement as the CI
         # workflow (see WindowsCiWorkflowTests above) for the local build.
@@ -998,6 +1007,37 @@ class BuildCandidateScriptTests(unittest.TestCase):
         self.assertIn(
             'Assert-LastExitCode "$builtExe --qt-runtime-check"', self.text
         )
+
+
+class DeveloperEntryScriptTests(unittest.TestCase):
+    def setUp(self):
+        self.run_text = _RUN_DEV_PATH.read_text(encoding="utf-8")
+        self.stop_text = _STOP_DEV_PATH.read_text(encoding="utf-8")
+        self.install_text = _INSTALL_DEV_SHORTCUT_PATH.read_text(encoding="utf-8")
+
+    def test_launcher_uses_the_current_checkout_source_and_private_marker(self):
+        self.assertIn(r".venv\Scripts\pythonw.exe", self.run_text)
+        self.assertIn("PYTHONPATH", self.run_text)
+        self.assertIn("-m", self.run_text)
+        self.assertIn("ovb_rc003", self.run_text)
+        self.assertIn("--settings", self.run_text)
+        self.assertIn("--remote-mic-dev-session", self.run_text)
+
+    def test_stopper_requires_exact_local_interpreter_and_private_marker(self):
+        self.assertIn("ExecutablePath", self.stop_text)
+        self.assertIn(r".venv\Scripts\python.exe", self.stop_text)
+        self.assertIn(r".venv\Scripts\pythonw.exe", self.stop_text)
+        self.assertIn("OrdinalIgnoreCase", self.stop_text)
+        self.assertIn("--remote-mic-dev-session", self.stop_text)
+        self.assertIn("Stop-Process", self.stop_text)
+
+    def test_shortcut_targets_the_source_launcher(self):
+        self.assertIn('GetFolderPath("Desktop")', self.install_text)
+        self.assertIn("[char]0x5F00", self.install_text)
+        self.assertIn("[char]0x53D1", self.install_text)
+        self.assertIn("[char]0x7248", self.install_text)
+        self.assertIn("run-dev.ps1", self.install_text)
+        self.assertIn("-WindowStyle Hidden", self.install_text)
 
 
 class PublicBoundaryScriptTests(unittest.TestCase):

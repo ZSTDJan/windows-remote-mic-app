@@ -80,6 +80,7 @@ from __future__ import annotations
 import sys
 
 from . import __version__
+from . import dev_session
 
 SETTINGS_STARTUP_FAILED_EXIT_CODE = 15
 BRIDGE_CONFIG_FAILED_EXIT_CODE = 16
@@ -120,6 +121,7 @@ def _dry_run() -> int:
         connection_supervisor,
         device_catalog,
         device_profile,
+        dev_session,
         frida_compat,
         hid_identity,
         hotkey,
@@ -249,7 +251,7 @@ def _run_bridge(*, quiet_duplicate: bool = False) -> None:
 
 
 def main() -> None:
-    args = sys.argv[1:]
+    args = dev_session.consume_marker(sys.argv[1:])
     if "--help" in args or "-h" in args:
         _print_help()
         return

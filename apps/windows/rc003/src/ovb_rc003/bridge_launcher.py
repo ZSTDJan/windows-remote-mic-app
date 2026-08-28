@@ -73,7 +73,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Callable, Dict, List, Optional, Sequence, Tuple, Union
 
-from . import single_instance
+from . import dev_session, single_instance
 
 # Reused, not redefined - see module docstring's ALREADY_RUNNING note.
 ALREADY_RUNNING_EXIT_CODE = single_instance.DUPLICATE_INSTANCE_EXIT_CODE
@@ -129,15 +129,19 @@ def build_launch_command(
         # The same frozen exe handles both modes: with no arguments (or
         # --settings) it opens the settings window, and with --bridge (as
         # launched here) it starts the bridge - see __main__.py's dispatch.
-        return [executable, "--bridge", SETTINGS_LAUNCH_FLAG]
+        return dev_session.mark_command(
+            [executable, "--bridge", SETTINGS_LAUNCH_FLAG]
+        )
     # The current interpreter, `-m ovb_rc003 --bridge`.
-    return [
-        executable,
-        "-m",
-        "ovb_rc003",
-        "--bridge",
-        SETTINGS_LAUNCH_FLAG,
-    ]
+    return dev_session.mark_command(
+        [
+            executable,
+            "-m",
+            "ovb_rc003",
+            "--bridge",
+            SETTINGS_LAUNCH_FLAG,
+        ]
+    )
 
 
 def build_settings_command(
@@ -156,8 +160,10 @@ def build_settings_command(
             "sys.executable is empty; cannot construct a settings launch command"
         )
     if frozen:
-        return [executable, "--settings"]
-    return [executable, "-m", "ovb_rc003", "--settings"]
+        return dev_session.mark_command([executable, "--settings"])
+    return dev_session.mark_command(
+        [executable, "-m", "ovb_rc003", "--settings"]
+    )
 
 
 def launch_settings(

@@ -388,6 +388,17 @@ $env:PYTHONPATH = Join-Path (Get-Location) 'src'
 .\.venv\Scripts\python.exe -m unittest discover -s tests -t . -p 'test_*.py' -v
 ```
 
+需要日常查看当前源码界面时，可以安装一次固定的桌面开发入口：
+
+```powershell
+.\build\install-dev-shortcut.ps1
+```
+
+桌面的“Remote Mic 开发版”会直接运行当前工作区的 Python 与 QML 源码，不使用
+`dist` 中的冻结快照；代码修改后关闭并重新打开该入口即可看到最新内容。它依赖本目录
+现有的 `.venv`。构建脚本开始时会结束由该入口启动并继承了开发标记的源码设置与
+桥接进程，不会结束已安装版、便携版或其它 Python 程序。
+
 构建未签名候选目录：
 
 ```powershell

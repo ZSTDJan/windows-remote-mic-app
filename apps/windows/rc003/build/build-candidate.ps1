@@ -48,6 +48,10 @@ Write-Host "== Remote Mic · RC003 candidate build =="
 
 Push-Location $RC003Root
 try {
+    Write-Host "-- stop marked source development session --"
+    & powershell -ExecutionPolicy Bypass -File (Join-Path "build" "stop-dev.ps1")
+    Assert-LastExitCode "stop-dev.ps1"
+
     if (-not (Test-Path ".venv")) {
         & $PythonExecutable -m venv .venv
         Assert-LastExitCode "python -m venv"
