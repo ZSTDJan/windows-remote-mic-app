@@ -291,6 +291,129 @@ class SpatialNavigationTests(unittest.TestCase):
             0,
         )
 
+    def test_infers_first_large_split_region_as_navigation_section(self):
+        window = prototype.Rect(496, 188, 2388, 1758)
+        shared = (1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 4)
+        full_width_content = shared + (0,)
+        sidebar = full_width_content + (0,)
+        main = full_width_content + (1,)
+        sidebar_target_path = sidebar + (3, 3, 1)
+        target_path = main + (2, 0, 0, 0, 0, 0, 1, 0, 0, 0)
+        rects = {
+            shared: prototype.Rect(497, 242, 2390, 1759),
+            full_width_content: prototype.Rect(497, 400, 2390, 1759),
+            sidebar: prototype.Rect(497, 242, 934, 1759),
+            main: prototype.Rect(934, 242, 2390, 1759),
+        }
+
+        self.assertEqual(
+            prototype.infer_navigation_section_path(
+                sidebar_target_path, rects, window
+            ),
+            sidebar,
+        )
+        self.assertEqual(
+            prototype.infer_navigation_section_path(
+                target_path, rects, window
+            ),
+            main,
+        )
+
+    def test_same_content_region_beats_distant_sidebar_lane(self):
+        main_section = (0, 2)
+        targets = [
+            self.target(
+                1104,
+                688,
+                1143,
+                727,
+                "复制",
+                path=main_section + (0, 0, 52),
+                section_path=main_section,
+            ),
+            self.target(
+                2170,
+                875,
+                2209,
+                914,
+                "复制消息",
+                path=main_section + (0, 0, 58),
+                section_path=main_section,
+            ),
+            self.target(
+                509,
+                891,
+                899,
+                937,
+                "窗口对话列表",
+                path=(0, 1, 3, 3, 1),
+                section_path=(0, 1),
+            ),
+        ]
+
+        self.assertEqual(
+            prototype.ranked_target_indices(
+                targets, 1, prototype.Direction.LEFT
+            )[:2],
+            [0, 2],
+        )
+        graph = prototype.NavigationGraph(targets)
+        self.assertEqual(graph.candidates(1, prototype.Direction.LEFT)[0], 0)
+        self.assertEqual(graph.candidates(0, prototype.Direction.RIGHT)[0], 1)
+
+        diagnostic = prototype.build_navigation_diagnostic(
+            targets,
+            1,
+            prototype.Direction.LEFT,
+            available_indices=graph.candidates(1, prototype.Direction.LEFT),
+            selected_index=0,
+            outcome="selected",
+        )
+        self.assertIsNotNone(diagnostic)
+        assert diagnostic is not None
+        self.assertEqual(diagnostic.candidates[0].route, "section_bridge")
+        self.assertIn(
+            "同区优先", prototype.format_navigation_diagnostic(diagnostic)
+        )
+
+    def test_same_region_does_not_lock_out_a_much_nearer_other_pane(self):
+        targets = [
+            self.target(
+                500,
+                400,
+                540,
+                440,
+                "current",
+                path=(0, 2, 0),
+                section_path=(0, 2),
+            ),
+            self.target(
+                100,
+                100,
+                140,
+                140,
+                "far same region",
+                path=(0, 2, 1),
+                section_path=(0, 2),
+            ),
+            self.target(
+                420,
+                400,
+                470,
+                440,
+                "near other pane",
+                path=(0, 1, 0),
+                section_path=(0, 1),
+            ),
+        ]
+
+        self.assertEqual(
+            prototype.next_target_index(
+                targets, 0, prototype.Direction.LEFT
+            ),
+            2,
+        )
+
     def test_prefers_nearest_target_in_a_vertical_column(self):
         targets = [
             self.target(100, 100, 160, 140, "current"),
