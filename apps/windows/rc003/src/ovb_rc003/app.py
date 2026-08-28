@@ -274,6 +274,9 @@ class RC003App:
         self._voice_pcm_stats = PcmStats()
         self._event_loop = asyncio.get_event_loop()
         self._legacy_voice_event_generation = 0
+        # Cleanup disables every input callback before releasing host keys.
+        # A reconnect explicitly re-enables the next generation.
+        self._accept_input_events = True
 
         self._supervisor = connection_supervisor.ConnectionSupervisor(
             connect=self._connect_once,
@@ -314,6 +317,9 @@ class RC003App:
             self._logger.exception("bridge runtime status cleanup failed")
 
     async def _connect_once(self) -> None:
+        with self._voice_trigger_lock, self._legacy_f5_state_lock:
+            self._accept_input_events = True
+            self._refresh_legacy_voice_transform_snapshot_locked()
         self._publish_runtime_status(
             bridge_runtime_status.BridgeConnectionState.WAITING_FOR_DEVICE
         )
@@ -506,7 +512,7 @@ class RC003App:
         mapping; app-level source tracking collapses its F5/Raw/HID reports.
         """
 
-        if report_id != 1 or len(payload) != 6:
+        if not self._accept_input_events or report_id != 1 or len(payload) != 6:
             return
         active = {
             int.from_bytes(payload[index : index + 2], "little")
@@ -555,6 +561,8 @@ class RC003App:
         if key is None:
             return
         vk_code, make_code, extended = key
+        if not self._accept_input_events:
+            return
         if vk_code == 0x74:
             return
         suppressor.arm_tracked_key_event(vk_code, make_code, extended, is_pressed)
@@ -577,7 +585,10 @@ class RC003App:
             bridge_runtime_status.BridgeConnectionState.WAITING_FOR_DEVICE
         )
         failures: List[str] = []
-        self._legacy_voice_event_generation += 1
+        with self._voice_trigger_lock, self._legacy_f5_state_lock:
+            self._accept_input_events = False
+            self._legacy_voice_transform_snapshot = False
+            self._legacy_voice_event_generation += 1
 
         if self._hid_report_tap is not None:
             try:
@@ -606,7 +617,7 @@ class RC003App:
         self._button_gestures.reset()
 
         try:
-            with self._voice_trigger_lock:
+            with self._voice_trigger_lock, self._legacy_f5_state_lock:
                 self._voice_audio_start_fallback_pending = False
                 self._voice_audio_started_waiting_for_legacy_f5 = False
                 self._voice_raw_input_trigger_pending = False
@@ -617,25 +628,29 @@ class RC003App:
                 self._finish_voice_mic_gesture()
                 if self._voice_hotkey_release_pending is not None:
                     if self._release_pending_voice_hotkey():
-                        self._voice_hotkey_release_pending = None
+                        self._voice.cancel_pending()
                     else:
                         failures.append(
                             "voice hotkey safety release did not fully deliver; state retained"
                         )
-                reset_action = self._voice.reset()
-                if reset_action is not None and not self._apply_voice_action(reset_action):
-                    # _apply_voice_action() already logged the specific failure.
-                    # reset() already cleared the controller's own pending
-                    # state before we knew delivery would fail - restore it so
-                    # a held shortcut isn't recorded as released while it may
-                    # still be physically down (XRBM-019 review round 1 P1 #4).
-                    self._voice.restore_pending(reset_action)
-                    failures.append("voice hotkey release did not fully deliver; state retained")
-                with self._legacy_f5_state_lock:
-                    self._voice_legacy_transform_key_down = False
-                    self._voice_legacy_transform_session = False
-                    self._voice_legacy_transform_emitted = False
-                    self._legacy_f5_is_down = False
+                else:
+                    reset_action = self._voice.reset()
+                    if reset_action is not None and not self._apply_voice_action(
+                        reset_action
+                    ):
+                        # _apply_voice_action() already logged the specific failure.
+                        # reset() already cleared the controller's own pending
+                        # state before we knew delivery would fail - restore it so
+                        # a held shortcut isn't recorded as released while it may
+                        # still be physically down (XRBM-019 review round 1 P1 #4).
+                        self._voice.restore_pending(reset_action)
+                        failures.append(
+                            "voice hotkey release did not fully deliver; state retained"
+                        )
+                self._voice_legacy_transform_key_down = False
+                self._voice_legacy_transform_session = False
+                self._voice_legacy_transform_emitted = False
+                self._legacy_f5_is_down = False
         except Exception:
             self._logger.exception("cleanup: releasing the voice hotkey failed")
             failures.append("voice hotkey cleanup failed; state retained")
@@ -1111,18 +1126,22 @@ class RC003App:
             if target != expected:
                 self._voice_legacy_transform_emitted = False
                 return False
-            if self._legacy_f5_untrusted:
+            if not self._accept_input_events or self._legacy_f5_untrusted:
                 self._voice_legacy_transform_emitted = False
                 if is_pressed:
                     self._voice_legacy_transform_key_down = False
                 return False
             try:
                 if is_pressed:
-                    win32_input.send_voice_key_combo_down(("ralt",))
-                    self._voice_legacy_transform_session = True
+                    self._voice_hotkey_release_pending = ("ralt",)
+                    self._voice_hotkey_release_pending_backend = (
+                        _VOICE_HOTKEY_BACKEND_MARKED
+                    )
                     self._voice_hotkey_active_backend = (
                         _VOICE_HOTKEY_BACKEND_MARKED
                     )
+                    win32_input.send_voice_key_combo_down(("ralt",))
+                    self._voice_legacy_transform_session = True
                 else:
                     win32_input.send_voice_key_combo_up(("ralt",))
                     self._voice_hotkey_release_pending = None
@@ -1149,6 +1168,9 @@ class RC003App:
             except (win32_input.Win32InputUnavailableError, OSError):
                 self._voice_legacy_transform_emitted = False
                 if is_pressed:
+                    self._voice_hotkey_release_pending = None
+                    self._voice_hotkey_release_pending_backend = None
+                    self._voice_hotkey_active_backend = None
                     self._voice_legacy_transform_key_down = False
                     self._voice_legacy_transform_session = False
                 self._logger.exception(
@@ -1169,7 +1191,11 @@ class RC003App:
         """
 
         with self._legacy_f5_state_lock:
-            if vk_code != 0x74 or not self._legacy_voice_transform_enabled():
+            if (
+                not self._accept_input_events
+                or vk_code != 0x74
+                or not self._legacy_voice_transform_enabled()
+            ):
                 return None
             if is_pressed:
                 if self._key_detection_blocks_legacy_mic_transform():
@@ -1181,6 +1207,7 @@ class RC003App:
                     self._voice.active
                     or self._voice_mic_gesture_active
                     or self._voice_raw_input_trigger_pending
+                    or self._voice_hotkey_release_pending is not None
                     or self._voice_legacy_transform_key_down
                     or self._legacy_f5_is_down
                 ):
@@ -1280,6 +1307,8 @@ class RC003App:
         action is delivered.
         """
 
+        if not self._accept_input_events:
+            return
         suppressor = self._legacy_key_suppressor
         if (
             suppressor is None
@@ -1513,6 +1542,8 @@ class RC003App:
         host_action_handled: bool = False,
         event_source: str = "hid",
     ) -> None:
+        if not self._accept_input_events:
+            return
         if button_id == "mic":
             detection_handled, detection_captured = (
                 self._handle_key_detection_mic_event(
@@ -1922,6 +1953,8 @@ class RC003App:
     # -- ATVV control-channel events (mic button + audio start/stop) ------
 
     def _on_control_event(self, event: object) -> None:
+        if not self._accept_input_events:
+            return
         # Some machines expose no usable Raw Input/F5 edge for the mic key,
         # leaving AudioStarted as the first event of the next physical press.
         # Refresh here as well so saved voice mode/hotkey edits do not depend
@@ -2191,12 +2224,19 @@ class RC003App:
         endpoint.
         """
 
+        if not self._accept_input_events:
+            self._voice_pcm_forwarding_enabled = False
+            return
+
         if self._ble_session is None:
             self._voice_pcm_forwarding_enabled = False
             self._logger.info("voice ignored: BLE voice session is not connected")
             return
 
-        if self._voice_hotkey_release_pending is not None:
+        if (
+            self._voice_hotkey_release_pending is not None
+            and not host_action_handled
+        ):
             if not self._release_pending_voice_hotkey():
                 self._voice_pcm_forwarding_enabled = False
                 self._logger.info(
@@ -2302,6 +2342,9 @@ class RC003App:
                 action.value,
             )
         try:
+            if provider_action == voice_controller.VoiceHostAction.KEY_DOWN:
+                self._voice_hotkey_release_pending = tokens
+                self._voice_hotkey_release_pending_backend = backend
             self._send_voice_hotkey_action(provider_action, tokens, backend)
             if action == voice_controller.VoiceHostAction.KEY_DOWN:
                 self._voice_hotkey_active_backend = backend
@@ -2314,6 +2357,10 @@ class RC003App:
                 self._voice_hotkey_active_backend = None
             return True
         except win32_input.Win32InputUnavailableError:
+            if provider_action == voice_controller.VoiceHostAction.KEY_DOWN:
+                self._voice_hotkey_release_pending = None
+                self._voice_hotkey_release_pending_backend = None
+                self._voice_hotkey_active_backend = None
             self._logger.info("voice hotkey action skipped: no usable voice input backend")
             return False
         except win32_input.InputCleanupIncompleteError:
@@ -2324,6 +2371,10 @@ class RC003App:
             )
             return False
         except OSError:
+            if provider_action == voice_controller.VoiceHostAction.KEY_DOWN:
+                self._voice_hotkey_release_pending = None
+                self._voice_hotkey_release_pending_backend = None
+                self._voice_hotkey_active_backend = None
             self._logger.exception("voice hotkey action failed to fully deliver")
             return False
 
@@ -2368,8 +2419,7 @@ class RC003App:
             return False
         self._voice_hotkey_release_pending = None
         self._voice_hotkey_release_pending_backend = None
-        if not self._voice.active:
-            self._voice_hotkey_active_backend = None
+        self._voice_hotkey_active_backend = None
         self._logger.info("voice hotkey safety release completed")
         return True
 

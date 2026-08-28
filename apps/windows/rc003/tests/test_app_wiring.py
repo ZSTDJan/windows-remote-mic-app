@@ -736,6 +736,39 @@ class HostHotkeyFailureSuppressesMicOpenTests(_AppWiringTestCase):
         marked_tap.assert_not_called()
         marked_down.assert_not_called()
         marked_up.assert_not_called()
+        self.assertIsNone(self.app._voice_hotkey_release_pending)
+
+    def test_successful_hold_down_is_owned_until_matching_key_up(self):
+        calls = []
+        with mock.patch.object(
+            win32_input,
+            "send_voice_key_combo_down",
+            side_effect=lambda tokens: calls.append(("down", tokens)),
+        ), mock.patch.object(
+            win32_input,
+            "send_voice_key_combo_up",
+            side_effect=lambda tokens: calls.append(("up", tokens)),
+        ):
+            self.assertTrue(
+                self.app._apply_voice_action(
+                    app_module.voice_controller.VoiceHostAction.KEY_DOWN
+                )
+            )
+            self.assertEqual(
+                self.app._voice_hotkey_release_pending,
+                DEFAULT_VOICE_TOKENS,
+            )
+            self.assertTrue(
+                self.app._apply_voice_action(
+                    app_module.voice_controller.VoiceHostAction.KEY_UP
+                )
+            )
+
+        self.assertEqual(
+            calls,
+            [("down", DEFAULT_VOICE_TOKENS), ("up", DEFAULT_VOICE_TOKENS)],
+        )
+        self.assertIsNone(self.app._voice_hotkey_release_pending)
 
     def test_wetype_physical_release_waits_for_audio_stop_before_second_tap(self):
         self.app._config["voice_program"] = (
@@ -967,6 +1000,21 @@ class HostHotkeyFailureSuppressesMicOpenTests(_AppWiringTestCase):
 
         self.assertEqual(calls, [("down", ("ralt",)), ("up", ("ralt",))])
         self.assertTrue(self.app._voice_legacy_transform_emitted)
+        self.assertIsNone(self.app._voice_hotkey_release_pending)
+
+    def test_transformed_f5_down_immediately_records_owned_release(self):
+        target = app_module.legacy_key_suppressor_windows.PhysicalKeyTarget(
+            0xA5, 0x38, True, True
+        )
+
+        with mock.patch.object(win32_input, "send_voice_key_combo_down"):
+            self.assertTrue(self.app._emit_legacy_voice_key(target, True))
+
+        self.assertEqual(self.app._voice_hotkey_release_pending, ("ralt",))
+        self.assertEqual(
+            self.app._voice_hotkey_release_pending_backend,
+            app_module._VOICE_HOTKEY_BACKEND_MARKED,
+        )
 
     def test_transformed_f5_down_incomplete_cleanup_retains_safety_release(self):
         target = app_module.legacy_key_suppressor_windows.PhysicalKeyTarget(
@@ -2857,12 +2905,44 @@ class CleanupOwnershipTests(_AppWiringTestCase):
         self.assertIsNone(self.app._ble_session)
         self.assertIsNone(self.app._playback)
 
+    def test_cleanup_releases_transform_down_when_queued_f5_event_is_stale(self):
+        target = self.app._transform_legacy_voice_key(0x74, True)
+        self.assertIsNotNone(target)
+        calls = []
+
+        with mock.patch.object(
+            win32_input,
+            "send_voice_key_combo_down",
+            side_effect=lambda tokens: calls.append(("down", tokens)),
+        ), mock.patch.object(
+            win32_input,
+            "send_voice_key_combo_up",
+            side_effect=lambda tokens: calls.append(("up", tokens)),
+        ):
+            self.assertTrue(self.app._emit_legacy_voice_key(target, True))
+            self.app._on_legacy_key_event(0x74, True)
+            _run(self.app._cleanup_once())
+            self._drain_event_loop()
+
+        self.assertEqual(calls, [("down", ("ralt",)), ("up", ("ralt",))])
+        self.assertFalse(self.app._voice.active)
+        self.assertIsNone(self.app._voice_hotkey_release_pending)
+
+    def test_cleanup_never_releases_alt_without_bridge_owned_down(self):
+        with mock.patch.object(win32_input, "send_voice_key_combo_up") as release:
+            _run(self.app._cleanup_once())
+
+        release.assert_not_called()
+
     def test_cleanup_resets_legacy_f5_quarantine_for_the_next_connection(self):
         self.app._legacy_f5_untrusted = True
 
         _run(self.app._cleanup_once())
 
         self.assertFalse(self.app._legacy_f5_untrusted)
+        self.assertIsNone(self.app._transform_legacy_voice_key(0x74, True))
+        self.app._accept_input_events = True
+        self.app._refresh_legacy_voice_transform_snapshot_locked()
         target = self.app._transform_legacy_voice_key(0x74, True)
         self.assertEqual(
             target,

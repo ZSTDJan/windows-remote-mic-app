@@ -1,7 +1,7 @@
 # BUG-018：按住说缺少 AUDIO_STOP 时宿主快捷键不释放
 
-状态：第三轮迟到 F5 与发送所有权缺口已修正，自动回归与冻结构建通过，等待
-RC003 真机复测。
+状态：第四轮注入所有权与退出清理缺口已修正，自动回归通过，等待 RC003
+真机复测。
 
 ## 现象
 
@@ -64,6 +64,23 @@ RC003 真机复测。
 emit 的 transform session 当作“宿主动作已处理”，没有给“已决定、未发送”的
 在途 F5 与物理 HID 分配唯一发送所有权。
 
+### 2026-08-28 监控确认的第四层缺口
+
+2026-08-28 只读核对 `%LOCALAPPDATA%\UUKeyGuard\UUKeyGuard.log`：带
+`0x524D494352433033`（`RMICRC03`）标记的右 Alt 共 22 轮、27 条 DOWN、0 条
+同标记 UP；其中 19 轮由外部防锁程序自动解除，另 3 轮由无该标记的普通松键结束。
+该标记只由 `legacy_key_suppressor_windows.VOICE_EVENT_EXTRA_INFO` 定义，并由
+`win32_input._real_keybd_event()` 传给 `keybd_event`，因此本批缺失 UP 的直接来源
+是 RC003，不是 UU。
+
+第三轮只解决了 transform 与 direct HID 谁负责发送，却仍把
+`_voice_hotkey_release_pending` 当成“发送失败后的补救状态”。成功注入右 Alt DOWN
+时只记录 transform session 和后端，没有立即登记已经欠下一个 UP。若随后排队的
+legacy F5 业务回调因断连、退出或事件代次切换被丢弃，`VoiceController` 尚未进入
+holding；旧 cleanup 同时看到“没有 pending、没有 holding”，便不会发 UP。低层
+F5 变换已经成功，应用层却从未接过释放所有权，这就是已有 BUG-018 修复后仍会漏发
+的具体路径。
+
 ## 修复
 
 - `VoiceController` 新增 `on_mic_button_released()`：HOLD 在物理抬起时返回
@@ -82,6 +99,16 @@ emit 的 transform session 当作“宿主动作已处理”，没有给“已�
   物理 HID 先认领时隔离尚未 emit 的 F5，并发送当前配置快捷键；F5 先 emit 时，
   HID 识别 transform session 后不重发。两种顺序都只有一个发送者，且不等待
   低层键盘钩子。
+- 第四轮把 `_voice_hotkey_release_pending` 改为真实注入所有权：在调用原生 DOWN
+  前先登记具体按键和后端，只有匹配 UP 已确认或 DOWN 失败且内部回滚完成后才清除。
+- cleanup 开始即关闭本代输入回调和 F5 变换快照，并与 transform/emit 共用状态锁；
+  在途事件要么先完成并留下待释放所有权，要么被退出门禁拒绝，不能在最终释放后
+  再补发一个 DOWN。
+- direct HID up、legacy F5 up、`AudioStopped`、连接清理和正常退出继续共用同一
+  所有权；成功释放后同步清除逻辑 holding，避免重复 UP。设置热切换在所有权未清除
+  前保持延后。
+- 兜底只释放 RC003 明确登记为自己已注入的按键；没有桥接所有权时绝不根据系统 Alt
+  状态猜测性补松，因此不会主动释放用户真实按住的 Alt。
 
 ## 自动验证
 
@@ -98,6 +125,9 @@ emit 的 transform session 当作“宿主动作已处理”，没有给“已�
   1 项跳过且无资源泄漏记录。公开边界扫描 302 个文件，`compileall`、
   `pip check`、PowerShell 全脚本解析、`git diff --check`、PyInstaller、冻结
   `--help` / `--dry-run` 和 11 个 QML 一致性均通过。
+- 2026-08-28 第四轮定向覆盖应用接线、语音状态机、F5 抑制、Win32 输入批处理和
+  连接清理，共 213 项通过、1 项按平台条件跳过；完整 unittest 1536 项通过、
+  7 项跳过，`compileall` 通过。本轮未构建或打包。
 
 ## 真机复测
 
