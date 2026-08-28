@@ -78,6 +78,8 @@ ApplicationWindow {
         objectName: "tabBar"
         visible: false
         property int currentIndex: 0
+        onCurrentIndexChanged:
+            SettingsController.activePageIndex = currentIndex
     }
 
     RowLayout {
@@ -168,16 +170,23 @@ ApplicationWindow {
             Rectangle {
                 id: globalStatusBar
                 objectName: "globalStatusBar"
+                readonly property bool feedbackBelongsToCurrentPage:
+                    SettingsController.feedbackPageIndex === tabBar.currentIndex
+                readonly property bool hasError:
+                    feedbackBelongsToCurrentPage
+                    && SettingsController.errorMessage.length > 0
+                readonly property bool hasDirtySettings:
+                    tabBar.currentIndex === 1 && SettingsController.settingsDirty
+                readonly property bool hasMessage:
+                    feedbackBelongsToCurrentPage
+                    && SettingsController.statusMessage.length > 0
                 readonly property bool hasStatus:
-                    SettingsController.errorMessage.length > 0
-                    || SettingsController.settingsDirty
-                    || SettingsController.statusMessage.length > 0
+                    hasError || hasDirtySettings || hasMessage
                 Layout.fillWidth: true
                 Layout.minimumHeight: tokens.statusBarMinHeight
                 Layout.preferredHeight: tokens.statusBarMinHeight
                 color: hasStatus
-                    ? SettingsController.errorMessage.length > 0
-                        || SettingsController.settingsDirty
+                    ? hasError || hasDirtySettings
                         ? tokens.errorBackground : tokens.statusBackground
                     : tokens.background
 
@@ -187,8 +196,8 @@ ApplicationWindow {
                     anchors.top: parent.top
                     height: 1
                     visible: globalStatusBar.hasStatus
-                    color: SettingsController.errorMessage.length > 0
-                        || SettingsController.settingsDirty
+                    color: globalStatusBar.hasError
+                        || globalStatusBar.hasDirtySettings
                         ? tokens.errorColor : tokens.accent
                 }
 
@@ -199,15 +208,15 @@ ApplicationWindow {
                     anchors.leftMargin: tokens.spacingMedium
                     anchors.rightMargin: tokens.spacingMedium
                     visible: globalStatusBar.hasStatus
-                    text: SettingsController.errorMessage.length > 0
+                    text: globalStatusBar.hasError
                         ? SettingsController.errorMessage
-                        : SettingsController.settingsDirty
-                            ? (SettingsController.statusMessage.length > 0
+                        : globalStatusBar.hasDirtySettings
+                            ? (globalStatusBar.hasMessage
                                 ? SettingsController.statusMessage
                                 : qsTr("设置已修改，尚未保存。"))
                             : SettingsController.statusMessage
-                    color: SettingsController.errorMessage.length > 0
-                        || SettingsController.settingsDirty
+                    color: globalStatusBar.hasError
+                        || globalStatusBar.hasDirtySettings
                         ? tokens.errorColor : tokens.textSecondary
                     font.pixelSize: tokens.fontSizeSmall
                     verticalAlignment: Text.AlignVCenter

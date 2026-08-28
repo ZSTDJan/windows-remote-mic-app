@@ -1095,6 +1095,40 @@ class SettingsControllerTests(unittest.TestCase):
         saved = config.load_config(config.config_path(config.config_root()))
         self.assertEqual(saved["voice_program"]["provider"], "sogou")
 
+    def test_feedback_is_scoped_to_the_page_that_owns_the_action(self):
+        controller, model = self._make_controller()
+
+        controller.activePageIndex = 0
+        controller.holdVoiceHotkeyText = "ctrl+l"
+        self.assertEqual(controller.feedbackPageIndex, 2)
+
+        controller.activePageIndex = 2
+        model.setActionTextAt(model.index_of("power"), "escape")
+        self.assertTrue(controller.saveSettings())
+        self.assertEqual(controller.feedbackPageIndex, 1)
+
+        opened = shell_targets.ExternalTargetResult(
+            outcome=shell_targets.ExternalTargetOutcome.OPENED,
+            target=shell_targets.BLUETOOTH_SETTINGS_URI,
+            error="",
+        )
+        with mock.patch.object(
+            shell_targets,
+            "open_external_target",
+            return_value=opened,
+        ):
+            controller.openBluetoothSettings()
+        self.assertEqual(controller.feedbackPageIndex, 0)
+
+        controller.activePageIndex = 0
+        with mock.patch.object(
+            shell_targets,
+            "open_external_target",
+            return_value=opened,
+        ):
+            controller.openMicrophonePrivacySettings()
+        self.assertEqual(controller.feedbackPageIndex, 2)
+
     def test_output_endpoint_selection_auto_saves_without_mapping_changes(self):
         endpoints = [
             audio_output.AudioEndpoint(
@@ -3096,6 +3130,22 @@ if voice_page is not None:
     controller.hotkeyCaptured.emit("ctrl+shift+f8")
     app.processEvents()
 saved_config = m.config.load_config(m.config.config_path(m.config.config_root()))
+voice_save_status = controller.statusMessage
+status_bar = (
+    root_objects[0].findChild(QObject, "globalStatusBar") if root_objects else None
+)
+tab_bar = root_objects[0].findChild(QObject, "tabBar") if root_objects else None
+voice_feedback_on_device = bool(status_bar.property("hasStatus"))
+tab_bar.setProperty("currentIndex", 2)
+app.processEvents()
+voice_feedback_on_voice = bool(status_bar.property("hasStatus"))
+tab_bar.setProperty("currentIndex", 1)
+model.setActionTextAt(model.index_of("power"), "escape")
+app.processEvents()
+mapping_dirty_on_buttons = bool(status_bar.property("hasStatus"))
+tab_bar.setProperty("currentIndex", 2)
+app.processEvents()
+mapping_dirty_on_voice = bool(status_bar.property("hasStatus"))
 result = {
     "root_count": len(root_objects),
     "warnings": [w.toString() for w in warnings],
@@ -3110,7 +3160,11 @@ result = {
         if voice_page is not None else None
     ),
     "saved_voice_hotkey": saved_config.get("voice_hotkeys", {}).get("hold"),
-    "voice_save_status": controller.statusMessage,
+    "voice_save_status": voice_save_status,
+    "voice_feedback_on_device": voice_feedback_on_device,
+    "voice_feedback_on_voice": voice_feedback_on_voice,
+    "mapping_dirty_on_buttons": mapping_dirty_on_buttons,
+    "mapping_dirty_on_voice": mapping_dirty_on_voice,
 }
 
 # XRBM-035: the real fast-close gate this probe exists to be - calls the
@@ -4120,6 +4174,18 @@ class SettingsShellSourceContractTests(unittest.TestCase):
 
     def test_settings_feedback_has_one_global_owner(self):
         self.assertIn('objectName: "globalStatusBar"', self.main_qml)
+        self.assertIn(
+            "SettingsController.activePageIndex = currentIndex",
+            self.main_qml,
+        )
+        self.assertIn(
+            "SettingsController.feedbackPageIndex === tabBar.currentIndex",
+            self.main_qml,
+        )
+        self.assertIn(
+            "tabBar.currentIndex === 1 && SettingsController.settingsDirty",
+            self.main_qml,
+        )
         for page_text in (
             self.device_qml,
             self.voice_qml,
@@ -4655,6 +4721,10 @@ class OffscreenQmlLoadTests(unittest.TestCase):
         self.assertFalse(data["voice_hotkey_recording"])
         self.assertEqual(data["saved_voice_hotkey"], "ctrl+shift+f8")
         self.assertIn("自动保存", data["voice_save_status"])
+        self.assertFalse(data["voice_feedback_on_device"])
+        self.assertTrue(data["voice_feedback_on_voice"])
+        self.assertTrue(data["mapping_dirty_on_buttons"])
+        self.assertFalse(data["mapping_dirty_on_voice"])
 
     def test_rc003_only_three_page_shell_is_rendered(self):
         import json

@@ -798,6 +798,8 @@ def _load_qt_classes() -> dict:
         statusMessageChanged = Signal()
         errorMessageChanged = Signal()
         settingsDirtyChanged = Signal()
+        activePageIndexChanged = Signal()
+        feedbackPageIndexChanged = Signal()
         selectedButtonIdChanged = Signal()
         comboModifierIndexChanged = Signal()
         comboRowsChanged = Signal()
@@ -822,6 +824,9 @@ def _load_qt_classes() -> dict:
 
         _TRIGGER_MODE_ORDER = (key_mapping.VoiceTriggerMode.HOLD,)
         _DEVICE_ORDER = (device_catalog.RC003_ID,)
+        _DEVICE_PAGE_INDEX = 0
+        _BUTTONS_PAGE_INDEX = 1
+        _VOICE_PAGE_INDEX = 2
         _KEY_DETECTION_TIMEOUT_SECONDS = key_detection_bridge.STALE_AFTER_SECONDS
         _KEY_DETECTION_USAGE_TO_BUTTON = {
             usage: button_id
@@ -929,6 +934,14 @@ def _load_qt_classes() -> dict:
             self._error_message = ""
             self._settings_dirty = bool(
                 self._removed_voice_bindings or voice_program_autostart_migrated
+            )
+            self._active_page_index = self._DEVICE_PAGE_INDEX
+            self._feedback_page_index = (
+                self._BUTTONS_PAGE_INDEX
+                if self._removed_voice_bindings
+                else self._VOICE_PAGE_INDEX
+                if voice_program_autostart_migrated
+                else self._DEVICE_PAGE_INDEX
             )
             self._selected_button_id = "ok"
             self._combo_modifier_id = key_mapping.COMBO_MODIFIER_BUTTON_IDS[0]
@@ -1295,11 +1308,37 @@ def _load_qt_classes() -> dict:
             self._sync_bridge_connection_status(running)
             return running
 
-        def _set_status_message(self, text: str) -> None:
+        def _set_feedback_page_index(self, value: int) -> None:
+            value = max(
+                self._DEVICE_PAGE_INDEX,
+                min(self._VOICE_PAGE_INDEX, int(value)),
+            )
+            if value == self._feedback_page_index:
+                return
+            self._feedback_page_index = value
+            self.feedbackPageIndexChanged.emit()
+
+        def _set_status_message(
+            self,
+            text: str,
+            page_index: Optional[int] = None,
+        ) -> None:
+            if text:
+                self._set_feedback_page_index(
+                    self._active_page_index if page_index is None else page_index
+                )
             self._status_message = text
             self.statusMessageChanged.emit()
 
-        def _set_error_message(self, text: str) -> None:
+        def _set_error_message(
+            self,
+            text: str,
+            page_index: Optional[int] = None,
+        ) -> None:
+            if text:
+                self._set_feedback_page_index(
+                    self._active_page_index if page_index is None else page_index
+                )
             self._error_message = text
             self.errorMessageChanged.emit()
 
@@ -1374,7 +1413,8 @@ def _load_qt_classes() -> dict:
         def _persist_voice_settings(self) -> bool:
             if _vb_cable_test_active_event.is_set():
                 self._set_error_message(
-                    "VB-CABLE 通道测试正在运行；测试结束后再修改语音设置。"
+                    "VB-CABLE 通道测试正在运行；测试结束后再修改语音设置。",
+                    self._VOICE_PAGE_INDEX,
                 )
                 return False
 
@@ -1387,7 +1427,10 @@ def _load_qt_classes() -> dict:
                     tuple(parsed_hotkey.modifiers) + (parsed_hotkey.key,)
                 )
             except (hotkey.HotkeyParseError, win32_keys.UnknownKeyTokenError) as exc:
-                self._set_error_message(f"语音按键无效：{exc}")
+                self._set_error_message(
+                    f"语音按键无效：{exc}",
+                    self._VOICE_PAGE_INDEX,
+                )
                 return False
 
             new_config = dict(self._config)
@@ -1403,7 +1446,10 @@ def _load_qt_classes() -> dict:
                 config.save_config(config_path, new_config)
                 saved_config = config.load_config(config_path)
             except Exception as exc:  # noqa: BLE001 - a Qt slot must not escape
-                self._set_error_message(f"语音设置保存失败：{exc}")
+                self._set_error_message(
+                    f"语音设置保存失败：{exc}",
+                    self._VOICE_PAGE_INDEX,
+                )
                 return False
 
             self._config = saved_config
@@ -1419,7 +1465,8 @@ def _load_qt_classes() -> dict:
             self._set_status_message(
                 "语音设置已自动保存；按键映射仍未保存。"
                 if self._settings_dirty
-                else "语音设置已自动保存。"
+                else "语音设置已自动保存。",
+                self._VOICE_PAGE_INDEX,
             )
             return True
 
@@ -1556,7 +1603,8 @@ def _load_qt_classes() -> dict:
 
             if _vb_cable_test_active_event.is_set():
                 self._set_error_message(
-                    "VB-CABLE 通道测试正在运行；测试结束后再保存设置。"
+                    "VB-CABLE 通道测试正在运行；测试结束后再保存设置。",
+                    self._BUTTONS_PAGE_INDEX,
                 )
                 return False
 
@@ -1594,7 +1642,10 @@ def _load_qt_classes() -> dict:
                     )
                 )
                 title = f"「{button_name}」映射无效" if button_name else "语音热键无效"
-                self._set_error_message(f"{title}：{exc.message}")
+                self._set_error_message(
+                    f"{title}：{exc.message}",
+                    self._BUTTONS_PAGE_INDEX,
+                )
                 return False
 
             new_config["voice_program"] = dict(self._voice_program_settings)
@@ -1615,7 +1666,8 @@ def _load_qt_classes() -> dict:
                 except audio_output.AudioOutputUnavailableError:
                     self._set_error_message(
                         "保存失败：所选语音输出设备无法实际打开。请选择 "
-                        "Windows WASAPI 或 Windows DirectSound 端点后重试。"
+                        "Windows WASAPI 或 Windows DirectSound 端点后重试。",
+                        self._BUTTONS_PAGE_INDEX,
                     )
                     return False
 
@@ -1635,7 +1687,10 @@ def _load_qt_classes() -> dict:
                 saved_config = config.load_config(config_path)
                 saved_bindings = config.load_key_bindings(bindings_path)
             except Exception as exc:  # noqa: BLE001 - a Qt slot must not escape
-                self._set_error_message(f"保存失败：{exc}")
+                self._set_error_message(
+                    f"保存失败：{exc}",
+                    self._BUTTONS_PAGE_INDEX,
+                )
                 return False
 
             self._config = saved_config
@@ -1655,12 +1710,14 @@ def _load_qt_classes() -> dict:
             self._set_error_message("")
             if self._selected_device_id() == device_catalog.DJI_MIC_2_ID:
                 self._set_status_message(
-                    "已保存 DJI Mic 2 设备选择。它使用 Windows 系统录音输入，不需要启动 RC003 桥。"
+                    "已保存 DJI Mic 2 设备选择。它使用 Windows 系统录音输入，不需要启动 RC003 桥。",
+                    self._BUTTONS_PAGE_INDEX,
                 )
             else:
                 self._set_status_message(
                     "已保存。按键映射和语音触发将在下一次按键时应用；"
-                    "连接/输出设置需重启桥接。"
+                    "连接/输出设置需重启桥接。",
+                    self._BUTTONS_PAGE_INDEX,
                 )
             return True
 
@@ -1932,6 +1989,35 @@ def _load_qt_classes() -> dict:
             notify=settingsDirtyChanged,
         )
 
+        def _get_active_page_index(self) -> int:
+            return self._active_page_index
+
+        def _set_active_page_index(self, value: int) -> None:
+            value = max(
+                self._DEVICE_PAGE_INDEX,
+                min(self._VOICE_PAGE_INDEX, int(value)),
+            )
+            if value == self._active_page_index:
+                return
+            self._active_page_index = value
+            self.activePageIndexChanged.emit()
+
+        activePageIndex = Property(
+            int,
+            _get_active_page_index,
+            _set_active_page_index,
+            notify=activePageIndexChanged,
+        )
+
+        def _get_feedback_page_index(self) -> int:
+            return self._feedback_page_index
+
+        feedbackPageIndex = Property(
+            int,
+            _get_feedback_page_index,
+            notify=feedbackPageIndexChanged,
+        )
+
         def _get_selected_button_id(self) -> str:
             return self._selected_button_id
 
@@ -2173,9 +2259,15 @@ def _load_qt_classes() -> dict:
 
         @Slot()
         def launchVoiceProgram(self) -> None:
-            self._launch_voice_program()
+            self._launch_voice_program(
+                feedback_page_index=self._VOICE_PAGE_INDEX
+            )
 
-        def _launch_voice_program(self) -> None:
+        def _launch_voice_program(
+            self,
+            *,
+            feedback_page_index: int,
+        ) -> None:
             try:
                 result = voice_program_manager.launch_voice_program(
                     self._voice_program_settings
@@ -2183,17 +2275,18 @@ def _load_qt_classes() -> dict:
             except Exception:  # noqa: BLE001 - optional launch must not stop the UI
                 self._set_status_message("")
                 self._set_error_message(
-                    "语音程序启动失败；Remote Mic 和桥接不受影响。"
+                    "语音程序启动失败；Remote Mic 和桥接不受影响。",
+                    feedback_page_index,
                 )
                 self._refresh_voice_program_status()
                 return
             message = voice_program_manager.launch_result_text(result)
             if result.code in {"not_found", "launch_failed", "restart_elevated_required"}:
                 self._set_status_message("")
-                self._set_error_message(message)
+                self._set_error_message(message, feedback_page_index)
             else:
                 self._set_error_message("")
-                self._set_status_message(message)
+                self._set_status_message(message, feedback_page_index)
             self._refresh_voice_program_status()
 
         @Slot()
@@ -2490,7 +2583,8 @@ def _load_qt_classes() -> dict:
                 return
             if _vb_cable_test_active_event.is_set():
                 self._set_error_message(
-                    "声音通道测试正在运行；测试结束后再启动遥控器服务。"
+                    "声音通道测试正在运行；测试结束后再启动遥控器服务。",
+                    self._DEVICE_PAGE_INDEX,
                 )
                 return
             self._has_explicit_launch_result = True
@@ -2519,7 +2613,9 @@ def _load_qt_classes() -> dict:
                     and self._voice_program_settings.get("launch_on_bridge_start")
                     is True
                 ):
-                    self._launch_voice_program()
+                    self._launch_voice_program(
+                        feedback_page_index=self._DEVICE_PAGE_INDEX
+                    )
                 self._sync_bridge_connection_status(True)
                 return
             self._set_bridge_running(False)
@@ -2556,7 +2652,8 @@ def _load_qt_classes() -> dict:
             self._set_error_message("")
             self._set_status_message(
                 "已恢复按键默认显示并清空遥控器组合，尚未保存——"
-                "点击「保存映射」才会写入设置。"
+                "点击「保存映射」才会写入设置。",
+                self._BUTTONS_PAGE_INDEX,
             )
 
         @Slot()
@@ -2588,13 +2685,17 @@ def _load_qt_classes() -> dict:
             self._mark_settings_dirty()
             self._set_error_message("")
             self._set_status_message(
-                "已恢复默认显示，尚未保存——点击「保存映射」或「仅保存设置」才会写入设置。"
+                "已恢复默认显示，尚未保存——点击「保存映射」或「仅保存设置」才会写入设置。",
+                self._BUTTONS_PAGE_INDEX,
             )
 
         @Slot()
         def openLogLocation(self) -> None:
             result = logging_setup.open_log_location()
-            self._set_status_message(settings_ui.describe_log_open_result(result))
+            self._set_status_message(
+                settings_ui.describe_log_open_result(result),
+                self._DEVICE_PAGE_INDEX,
+            )
 
         @Slot(str)
         def selectButton(self, button_id: str) -> None:
@@ -2604,18 +2705,22 @@ def _load_qt_classes() -> dict:
             self._selected_button_id = self._model.selected_button_id()
             self.selectedButtonIdChanged.emit()
 
-        def _report_external_target(self, result) -> None:
+        def _report_external_target(self, result, page_index: int) -> None:
             if result.outcome is shell_targets.ExternalTargetOutcome.OPENED:
                 self._set_error_message("")
-                self._set_status_message(f"已打开：{result.target}")
+                self._set_status_message(f"已打开：{result.target}", page_index)
             else:
                 self._set_status_message("")
-                self._set_error_message(f"无法打开 {result.target}（{result.error}）")
+                self._set_error_message(
+                    f"无法打开 {result.target}（{result.error}）",
+                    page_index,
+                )
 
         @Slot()
         def openBluetoothSettings(self) -> None:
             self._report_external_target(
-                shell_targets.open_external_target(shell_targets.BLUETOOTH_SETTINGS_URI)
+                shell_targets.open_external_target(shell_targets.BLUETOOTH_SETTINGS_URI),
+                self._DEVICE_PAGE_INDEX,
             )
 
         @Slot()
@@ -2623,19 +2728,22 @@ def _load_qt_classes() -> dict:
             self._report_external_target(
                 shell_targets.open_external_target(
                     shell_targets.MICROPHONE_PRIVACY_SETTINGS_URI
-                )
+                ),
+                self._VOICE_PAGE_INDEX,
             )
 
         @Slot()
         def openSpeechSettings(self) -> None:
             self._report_external_target(
-                shell_targets.open_external_target(shell_targets.SPEECH_SETTINGS_URI)
+                shell_targets.open_external_target(shell_targets.SPEECH_SETTINGS_URI),
+                self._VOICE_PAGE_INDEX,
             )
 
         @Slot()
         def openSoundSettings(self) -> None:
             self._report_external_target(
-                shell_targets.open_external_target(shell_targets.SOUND_SETTINGS_URI)
+                shell_targets.open_external_target(shell_targets.SOUND_SETTINGS_URI),
+                self._VOICE_PAGE_INDEX,
             )
 
         @Slot()
@@ -2645,7 +2753,8 @@ def _load_qt_classes() -> dict:
         @Slot()
         def openAppsSettings(self) -> None:
             self._report_external_target(
-                shell_targets.open_external_target(shell_targets.APPS_SETTINGS_URI)
+                shell_targets.open_external_target(shell_targets.APPS_SETTINGS_URI),
+                self._DEVICE_PAGE_INDEX,
             )
 
         @Slot(str, str, result=bool)
@@ -2689,7 +2798,10 @@ def _load_qt_classes() -> dict:
         @Slot(int, result=bool)
         def selectAndPersistOutputEndpointIndex(self, index: int) -> bool:
             if not 0 <= index < len(self._endpoint_values):
-                self._set_error_message("输出端点保存失败：所选端点已经不可用。")
+                self._set_error_message(
+                    "输出端点保存失败：所选端点已经不可用。",
+                    self._VOICE_PAGE_INDEX,
+                )
                 self.selectedEndpointIndexChanged.emit()
                 return False
 
@@ -2698,7 +2810,8 @@ def _load_qt_classes() -> dict:
                 endpoint.name, endpoint.host_api
             ):
                 self._set_error_message(
-                    "输出端点保存失败：所选设备无法打开或设置无法写入。"
+                    "输出端点保存失败：所选设备无法打开或设置无法写入。",
+                    self._VOICE_PAGE_INDEX,
                 )
                 self.selectedEndpointIndexChanged.emit()
                 return False
@@ -2708,7 +2821,8 @@ def _load_qt_classes() -> dict:
                 "输出端点已自动保存；按键映射仍未保存。"
                 "重启遥控器服务后端点生效。"
                 if self._settings_dirty
-                else "输出端点已自动保存；重启遥控器服务后生效。"
+                else "输出端点已自动保存；重启遥控器服务后生效。",
+                self._VOICE_PAGE_INDEX,
             )
             return True
 
