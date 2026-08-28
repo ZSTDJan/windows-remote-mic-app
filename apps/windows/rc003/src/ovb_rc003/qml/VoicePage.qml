@@ -337,10 +337,11 @@ Item {
     }
 
     onVisibleChanged: {
-        if (visible)
+        if (visible) {
             SettingsController.refreshVoiceProgramStatus()
-        else
+        } else {
             stopVoiceHotkeyCapture()
+        }
     }
 
     ScrollView {
@@ -575,7 +576,7 @@ Item {
                         ? root.voiceHotkeyCaptureError
                         : root.windowsDictationSelected
                             ? qsTr("Windows 语音输入使用 Win+H")
-                            : qsTr("录入后自动保存，需与语音程序快捷键一致")
+                            : qsTr("切换程序时自动读取；录入后同步并保存")
                     stateText: root.voiceHotkeyRecording
                         ? qsTr("录入中") : qsTr("已保存")
                     stateColor: root.voiceHotkeyRecording

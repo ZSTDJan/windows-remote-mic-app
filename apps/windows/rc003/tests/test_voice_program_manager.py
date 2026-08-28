@@ -238,6 +238,31 @@ class VoiceProgramLaunchTests(unittest.TestCase):
         settings.update(updates)
         return settings
 
+    def test_provider_settings_launch_uses_open_with_explicit_arguments(self):
+        executable = Path(r"C:\Program Files\Tencent\WeType\wetype_update.exe")
+        calls = []
+
+        manager.open_voice_program_settings(
+            executable,
+            "-showsetting",
+            platform="win32",
+            start_file=lambda path, operation, arguments, cwd: calls.append(
+                (path, operation, arguments, cwd)
+            ),
+        )
+
+        self.assertEqual(
+            calls,
+            [
+                (
+                    str(executable),
+                    "open",
+                    "-showsetting",
+                    str(executable.parent),
+                )
+            ],
+        )
+
     def test_custom_program_launches_with_current_permissions(self):
         with tempfile.TemporaryDirectory() as tmp:
             executable = Path(tmp) / "voice.exe"

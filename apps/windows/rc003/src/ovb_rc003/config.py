@@ -31,7 +31,7 @@ PRODUCT_ID = "RC003"
 CONFIG_FILENAME = "config.json"
 KEY_BINDINGS_FILENAME = "key_bindings.json"
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 RUNTIME_LEGACY_VOICE_MODE_KEY = "_legacy_voice_trigger_mode"
 RUNTIME_REMOVED_VOICE_BINDINGS_KEY = "_removed_voice_bindings"
@@ -91,7 +91,11 @@ def key_bindings_path(root: Path = None) -> Path:  # type: ignore[assignment]
 
 
 def default_config() -> Dict[str, Any]:
-    from . import key_mapping, voice_program_manager
+    from . import key_mapping, voice_hotkey_sync_windows, voice_program_manager
+
+    voice_program = voice_program_manager.normalize_voice_program_settings({})
+    provider_hotkeys = voice_hotkey_sync_windows.default_hotkeys_by_provider()
+    current_hotkey = provider_hotkeys[str(voice_program["provider"])]["hold"]
 
     return {
         "schema_version": SCHEMA_VERSION,
@@ -104,18 +108,13 @@ def default_config() -> Dict[str, Any]:
         "retry_delay": 5.0,
         "max_retry_delay": 60.0,
         "voice_shortcut_enabled": True,
-        "voice_hotkey": key_mapping.voice_hotkey_for_trigger_mode(
-            key_mapping.VoiceTriggerMode.HOLD
-        ),
+        "voice_hotkey": current_hotkey,
         # Kept fixed for backwards compatibility with older builds. RC003's
         # supported product path is now hold-to-talk only.
         "voice_trigger_mode": "hold",
-        "voice_hotkeys": {
-            "hold": key_mapping.voice_hotkey_for_trigger_mode(
-                key_mapping.VoiceTriggerMode.HOLD
-            )
-        },
-        "voice_program": voice_program_manager.normalize_voice_program_settings({}),
+        "voice_hotkeys": {"hold": current_hotkey},
+        "voice_hotkeys_by_provider": provider_hotkeys,
+        "voice_program": voice_program,
         # Empty until the user explicitly picks one in settings; voice fails
         # closed while this is empty (see audio_output.resolve_selected_endpoint).
         # Both fields together disambiguate endpoints that share a display
@@ -167,10 +166,11 @@ def load_config(path: Path) -> Dict[str, Any]:
         # shallow merge would otherwise make a newly introduced default look
         # like an explicitly saved top-level/nested shortcut and could hide
         # the old value that is actually present in the file.
+        _normalize_voice_program(stored)
         _normalize_voice_hotkey(stored)
         config.update(stored)
-    _normalize_voice_hotkey(config)
     _normalize_voice_program(config)
+    _normalize_voice_hotkey(config)
     return config
 
 
@@ -184,16 +184,25 @@ def save_config(path: Path, config: Dict[str, Any]) -> None:
 
 
 def _normalize_voice_hotkey(config: Dict[str, Any]) -> None:
-    """Normalize legacy voice settings into the hold-only product model."""
+    """Normalize legacy voice settings into provider-scoped hold shortcuts."""
 
     current = str(config.get("voice_hotkey", "")).strip().lower()
-    from . import key_mapping
+    from . import key_mapping, voice_hotkey_sync_windows, voice_program_manager
+
+    provider_settings = voice_program_manager.normalize_voice_program_settings(
+        config.get("voice_program")
+    )
+    provider_id = str(provider_settings["provider"])
+    config["voice_program"] = provider_settings
 
     raw_mode = str(config.get("voice_trigger_mode", "hold")).strip().lower()
     raw_mode_hotkeys = config.get("voice_hotkeys")
     if not isinstance(raw_mode_hotkeys, dict):
         raw_mode_hotkeys = {}
     saved_hold_hotkey = str(raw_mode_hotkeys.get("hold", "")).strip()
+    explicit_current_override = bool(
+        current and saved_hold_hotkey and current != saved_hold_hotkey
+    )
 
     if raw_mode == key_mapping.VoiceTriggerMode.TOGGLE.value:
         config[RUNTIME_LEGACY_VOICE_MODE_KEY] = raw_mode
@@ -205,25 +214,87 @@ def _normalize_voice_hotkey(config: Dict[str, Any]) -> None:
     elif saved_hold_hotkey and not current:
         current = saved_hold_hotkey
 
-    # The former HOLD preset was Ctrl+Win. It is a shipped built-in, not a
-    # user customization: preserve its historical right-Alt migration target.
-    if current in {"lctrl+win", "lctrl+lwin"}:
-        current = key_mapping.LEGACY_HOLD_VOICE_HOTKEY
-
-    # ``lalt`` was an invalid recording of the RC003 F5 leak. Repair it only
-    # for hold-to-talk; arbitrary user shortcuts remain untouched.
-    if current == "lalt":
-        current = key_mapping.LEGACY_HOLD_VOICE_HOTKEY
     if not current:
         current = key_mapping.voice_hotkey_for_trigger_mode(
             key_mapping.VoiceTriggerMode.HOLD
         )
 
+    raw_provider_hotkeys = config.get("voice_hotkeys_by_provider")
+    has_provider_hotkeys = isinstance(raw_provider_hotkeys, dict)
+    if not has_provider_hotkeys:
+        # These two repairs apply only to the old global field. They must not
+        # rewrite WeType's real native Ctrl+Win default after schema 7.
+        if current in {"lctrl+win", "lctrl+lwin"}:
+            current = key_mapping.LEGACY_HOLD_VOICE_HOTKEY
+        if current == "lalt":
+            current = key_mapping.LEGACY_HOLD_VOICE_HOTKEY
+        raw_provider_hotkeys = {}
+
+    provider_hotkeys = voice_hotkey_sync_windows.default_hotkeys_by_provider()
+    for candidate_provider in voice_program_manager.VOICE_PROGRAM_PROVIDER_ORDER:
+        raw_entry = raw_provider_hotkeys.get(candidate_provider)
+        if not isinstance(raw_entry, dict):
+            continue
+        candidate = str(raw_entry.get("hold", "")).strip().lower()
+        if candidate:
+            provider_hotkeys[candidate_provider] = {"hold": candidate}
+
+    if (
+        explicit_current_override
+        or not has_provider_hotkeys
+        or provider_id not in raw_provider_hotkeys
+    ):
+        provider_hotkeys[provider_id] = {"hold": current}
+
+    current = provider_hotkeys[provider_id]["hold"]
+
     config["schema_version"] = SCHEMA_VERSION
     config["voice_trigger_mode"] = key_mapping.VoiceTriggerMode.HOLD.value
     config["voice_hotkey"] = current
     config["voice_hotkeys"] = {"hold": current}
+    config["voice_hotkeys_by_provider"] = provider_hotkeys
     config.pop("voice_release_finish_tap_enabled", None)
+
+
+def voice_hotkey_for_provider(
+    config_data: Dict[str, Any], provider_id: object
+) -> str:
+    """Return one provider's normalized hold shortcut without changing selection."""
+
+    from . import voice_hotkey_sync_windows
+
+    provider = str(provider_id).strip().lower()
+    entries = config_data.get("voice_hotkeys_by_provider")
+    if isinstance(entries, dict):
+        entry = entries.get(provider)
+        if isinstance(entry, dict):
+            candidate = str(entry.get("hold", "")).strip().lower()
+            if candidate:
+                return candidate
+    return voice_hotkey_sync_windows.default_hotkey(provider)
+
+
+def set_voice_hotkey_for_provider(
+    config_data: Dict[str, Any], provider_id: object, shortcut: str
+) -> None:
+    """Update one provider and keep legacy current-provider mirrors coherent."""
+
+    from . import voice_program_manager
+
+    provider = str(provider_id).strip().lower()
+    normalized = str(shortcut).strip().lower()
+    entries = config_data.get("voice_hotkeys_by_provider")
+    next_entries = dict(entries) if isinstance(entries, dict) else {}
+    next_entries[provider] = {"hold": normalized}
+    config_data["voice_hotkeys_by_provider"] = next_entries
+    current_provider = str(
+        voice_program_manager.normalize_voice_program_settings(
+            config_data.get("voice_program")
+        )["provider"]
+    )
+    if provider == current_provider:
+        config_data["voice_hotkey"] = normalized
+        config_data["voice_hotkeys"] = {"hold": normalized}
 
 
 def _normalize_voice_program(config: Dict[str, Any]) -> None:

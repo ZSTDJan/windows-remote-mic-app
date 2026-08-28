@@ -105,6 +105,7 @@ hiddenimports = [
     "ovb_rc003.qt_settings_app",  # XRBM-030
     "ovb_rc003.windows_diagnostics",  # XRBM-031
     "ovb_rc003.vb_cable_bundle",  # XRBM-031
+    "ovb_rc003.voice_hotkey_sync_windows",
     "ovb_rc003.voice_program_manager",
     "ovb_rc003.ble_transport_winrt",
     "ovb_rc003.raw_input_windows",
@@ -119,6 +120,9 @@ hiddenimports = [
     # __main__.py's _run_bridge(), same as the other lazily-imported
     # modules above.
     "frida",
+    "uiautomation",
+    "comtypes",
+    "comtypes.client",
     # Optional runtime dependencies, imported lazily inside functions in
     # audio_output.py/audio_playback.py/ble_transport_winrt.py, which
     # PyInstaller's static analysis cannot always auto-detect:

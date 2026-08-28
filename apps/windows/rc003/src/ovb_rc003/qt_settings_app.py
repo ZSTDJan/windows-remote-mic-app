@@ -124,6 +124,7 @@ from . import (
     shell_targets,
     single_instance,
     vb_cable_bundle,
+    voice_hotkey_sync_windows,
     voice_program_manager,
     win32_keys,
     windows_diagnostics,
@@ -1434,13 +1435,16 @@ def _load_qt_classes() -> dict:
                 return False
 
             new_config = dict(self._config)
-            new_config["voice_hotkey"] = hotkey_text
-            new_config["voice_hotkeys"] = {"hold": hotkey_text}
             new_config["voice_trigger_mode"] = (
                 key_mapping.VoiceTriggerMode.HOLD.value
             )
             new_config.pop("voice_release_finish_tap_enabled", None)
             new_config["voice_program"] = dict(self._voice_program_settings)
+            config.set_voice_hotkey_for_provider(
+                new_config,
+                self._voice_program_settings.get("provider"),
+                hotkey_text,
+            )
             config_path = config.config_path(self._config_root)
             try:
                 config.save_config(config_path, new_config)
@@ -1475,8 +1479,38 @@ def _load_qt_classes() -> dict:
             previous = self._voice_hotkeys[mode]
             if not self._set_voice_hotkey_text(mode, value):
                 return True
+            provider_id = str(self._voice_program_settings.get("provider", ""))
+            result = voice_hotkey_sync_windows.sync_provider_hotkey(
+                provider_id,
+                value,
+            )
+            if not result.ok:
+                self._set_voice_hotkey_text(mode, previous)
+                self._set_status_message("")
+                self._set_error_message(result.message, self._VOICE_PAGE_INDEX)
+                return False
             if self._persist_voice_settings():
+                self._set_status_message(
+                    result.message
+                    + ("；按键映射仍未保存。" if self._settings_dirty else ""),
+                    self._VOICE_PAGE_INDEX,
+                )
                 return True
+            if provider_id not in {
+                voice_program_manager.VOICE_PROGRAM_NONE,
+                voice_program_manager.VOICE_PROGRAM_CUSTOM,
+                voice_program_manager.VOICE_PROGRAM_WINDOWS_DICTATION,
+            }:
+                rollback = voice_hotkey_sync_windows.sync_provider_hotkey(
+                    provider_id,
+                    previous,
+                )
+                if not rollback.ok:
+                    self._set_error_message(
+                        self._error_message
+                        + "；第三方程序快捷键也未能恢复，请重新切换该程序读取当前值。",
+                        self._VOICE_PAGE_INDEX,
+                    )
             self._set_voice_hotkey_text(mode, previous)
             return False
 
@@ -1649,6 +1683,11 @@ def _load_qt_classes() -> dict:
                 return False
 
             new_config["voice_program"] = dict(self._voice_program_settings)
+            config.set_voice_hotkey_for_provider(
+                new_config,
+                self._voice_program_settings.get("provider"),
+                self._voice_hotkeys[trigger_mode],
+            )
 
             endpoint_name = new_config.get("output_endpoint_name", "")
             endpoint_host_api = new_config.get("output_endpoint_host_api", "")
@@ -1773,13 +1812,42 @@ def _load_qt_classes() -> dict:
             provider_id = voice_program_manager.provider_id_for_index(value)
             if provider_id == self._voice_program_settings.get("provider"):
                 return
+            remembered_hotkey = config.voice_hotkey_for_provider(
+                self._config, provider_id
+            )
+            read_result = voice_hotkey_sync_windows.read_provider_hotkey(provider_id)
+            selected_hotkey = (
+                read_result.hotkey if read_result.ok else remembered_hotkey
+            )
+            previous_hotkey = self._get_hold_voice_hotkey_text()
+            self._set_voice_hotkey_text(
+                key_mapping.VoiceTriggerMode.HOLD,
+                selected_hotkey,
+            )
             updated = dict(self._voice_program_settings)
             updated["provider"] = provider_id
             updated["launch_on_bridge_start"] = (
                 provider_id != voice_program_manager.VOICE_PROGRAM_NONE
                 and not voice_program_manager.is_system_managed_provider(provider_id)
             )
-            self._update_and_persist_voice_program(updated)
+            if not self._update_and_persist_voice_program(updated):
+                self._set_voice_hotkey_text(
+                    key_mapping.VoiceTriggerMode.HOLD,
+                    previous_hotkey,
+                )
+                return
+            if read_result.ok:
+                self._set_status_message(
+                    read_result.message
+                    + ("；按键映射仍未保存。" if self._settings_dirty else ""),
+                    self._VOICE_PAGE_INDEX,
+                )
+            elif read_result.code != "local_only":
+                self._set_status_message("")
+                self._set_error_message(
+                    read_result.message + " 已改用该程序上次保存的快捷键。",
+                    self._VOICE_PAGE_INDEX,
+                )
 
         selectedVoiceProgramIndex = Property(
             int,
@@ -2256,6 +2324,36 @@ def _load_qt_classes() -> dict:
         @Slot()
         def refreshVoiceProgramStatus(self) -> None:
             self._refresh_voice_program_status()
+
+        @Slot()
+        def refreshVoiceHotkeyFromProvider(self) -> None:
+            provider_id = str(self._voice_program_settings.get("provider", ""))
+            result = voice_hotkey_sync_windows.read_provider_hotkey(provider_id)
+            if not result.ok:
+                if result.code != "local_only":
+                    self._set_status_message("")
+                    self._set_error_message(result.message, self._VOICE_PAGE_INDEX)
+                return
+            current = self._get_hold_voice_hotkey_text()
+            if result.hotkey == current:
+                self._set_error_message("")
+                self._set_status_message(result.message, self._VOICE_PAGE_INDEX)
+                return
+            self._set_voice_hotkey_text(
+                key_mapping.VoiceTriggerMode.HOLD,
+                result.hotkey,
+            )
+            if not self._persist_voice_settings():
+                self._set_voice_hotkey_text(
+                    key_mapping.VoiceTriggerMode.HOLD,
+                    current,
+                )
+                return
+            self._set_status_message(
+                result.message
+                + ("；按键映射仍未保存。" if self._settings_dirty else ""),
+                self._VOICE_PAGE_INDEX,
+            )
 
         @Slot()
         def launchVoiceProgram(self) -> None:

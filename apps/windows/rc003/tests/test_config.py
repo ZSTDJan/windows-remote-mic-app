@@ -31,6 +31,18 @@ class DefaultConfigPrivacyTests(unittest.TestCase):
         self.assertEqual(defaults["voice_hotkeys"]["hold"], "ralt")
         self.assertNotIn("toggle", defaults["voice_hotkeys"])
         self.assertNotIn("voice_release_finish_tap_enabled", defaults)
+        self.assertEqual(
+            defaults["voice_hotkeys_by_provider"]["sogou"]["hold"],
+            "rctrl",
+        )
+        self.assertEqual(
+            defaults["voice_hotkeys_by_provider"]["wetype"]["hold"],
+            "lctrl+lwin",
+        )
+        self.assertEqual(
+            defaults["voice_hotkeys_by_provider"]["windows_dictation"]["hold"],
+            "win+h",
+        )
         self.assertEqual(defaults["schema_version"], config.SCHEMA_VERSION)
         self.assertEqual(defaults["gain_db"], 10.0)
 
@@ -87,6 +99,69 @@ class DefaultConfigPrivacyTests(unittest.TestCase):
             loaded = config.load_config(path)
         self.assertEqual(loaded["voice_hotkey"], "ctrl+l")
         self.assertEqual(loaded["voice_hotkeys"], {"hold": "ctrl+l"})
+
+    def test_legacy_global_shortcut_is_assigned_to_the_selected_provider(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 6,
+                        "voice_program": {"provider": "wetype"},
+                        "voice_hotkey": "lctrl+lshift+f9",
+                        "voice_hotkeys": {"hold": "lctrl+lshift+f9"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            loaded = config.load_config(path)
+
+        self.assertEqual(loaded["voice_hotkey"], "lctrl+lshift+f9")
+        self.assertEqual(
+            loaded["voice_hotkeys_by_provider"]["wetype"]["hold"],
+            "lctrl+lshift+f9",
+        )
+        self.assertEqual(
+            loaded["voice_hotkeys_by_provider"]["sogou"]["hold"],
+            "rctrl",
+        )
+
+    def test_switching_provider_uses_its_own_remembered_shortcut(self):
+        data = config.default_config()
+        data["voice_program"] = {"provider": "wetype"}
+        config.set_voice_hotkey_for_provider(
+            data, "wetype", "lctrl+lshift+f9"
+        )
+        config.set_voice_hotkey_for_provider(
+            data, "sogou", "lctrl+lshift+f7"
+        )
+        data["voice_program"] = {"provider": "sogou"}
+        config._normalize_voice_program(data)
+        config._normalize_voice_hotkey(data)
+
+        self.assertEqual(data["voice_hotkey"], "lctrl+lshift+f7")
+        self.assertEqual(data["voice_hotkeys"], {"hold": "lctrl+lshift+f7"})
+
+    def test_provider_scoped_wetype_native_ctrl_win_is_not_legacy_repaired(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 7,
+                        "voice_program": {"provider": "wetype"},
+                        "voice_hotkeys_by_provider": {
+                            "wetype": {"hold": "lctrl+lwin"}
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            loaded = config.load_config(path)
+
+        self.assertEqual(loaded["voice_hotkey"], "lctrl+lwin")
 
     def test_load_preserves_nested_hold_when_old_file_has_no_top_level_value(self):
         with tempfile.TemporaryDirectory() as tmp:

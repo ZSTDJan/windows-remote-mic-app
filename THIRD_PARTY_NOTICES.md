@@ -43,6 +43,27 @@ The Windows RC003 implementation in `apps/windows/rc003` is adapted from the
 upstream Windows client. Attribution and the changes made in this repository
 are summarized in `apps/windows/rc003/ATTRIBUTION.md`.
 
+## Python UIAutomation for Windows
+
+- Project: `yinkaisheng/Python-UIAutomation-for-Windows`
+- Version: `2.0.29`
+- Source: <https://github.com/yinkaisheng/Python-UIAutomation-for-Windows>
+- License: Apache License 2.0
+
+Remote Mic uses this package only to read and operate the semantic Windows UI
+Automation controls exposed by supported voice-program settings windows. It
+does not inject code into those programs or read their private process memory.
+
+## comtypes
+
+- Project: `enthought/comtypes`
+- Version: `1.4.16`
+- Source: <https://github.com/enthought/comtypes>
+- License: MIT
+
+`comtypes` is the COM runtime dependency used by Python UIAutomation for
+Windows.
+
 ## RC003 product photo
 
 The RC003 product photo bundled as `RC003-remote-photo.png` was supplied by the user on 2026-07-17 for the physical-button mapping interface. It is preserved at its original 508 x 1030 aspect ratio. Copyright and trademark rights in the photo and depicted products remain with their respective owners; the GPL-3.0-only license for the program does not grant additional rights to this image or the Xiaomi marks.

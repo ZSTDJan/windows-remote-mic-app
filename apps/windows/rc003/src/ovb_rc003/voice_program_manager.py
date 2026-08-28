@@ -448,6 +448,23 @@ def launch_configured_at_bridge_start(
     return (launcher or launch_voice_program)(settings)
 
 
+def open_voice_program_settings(
+    executable: Path,
+    arguments: str,
+    *,
+    platform: Optional[str] = None,
+    start_file: Optional[Callable[[str, str, str, str], None]] = None,
+) -> None:
+    """Open a provider-owned settings executable with explicit arguments."""
+
+    current_platform = platform or sys.platform
+    if current_platform != "win32":
+        raise OSError("voice program settings require Windows")
+    path = Path(executable)
+    launcher = start_file or _default_start_file_with_arguments
+    launcher(str(path), "open", str(arguments), str(path.parent))
+
+
 def discover_sogou_voice_executable(
     *,
     platform: Optional[str] = None,
@@ -857,6 +874,22 @@ def _default_start_file(path: str, operation: str, cwd: str) -> None:
     if sys.platform != "win32" or not hasattr(os, "startfile"):
         raise OSError("voice program launch requires Windows")
     os.startfile(path, operation, cwd=cwd)  # type: ignore[attr-defined,call-arg]
+
+
+def _default_start_file_with_arguments(
+    path: str,
+    operation: str,
+    arguments: str,
+    cwd: str,
+) -> None:
+    if sys.platform != "win32" or not hasattr(os, "startfile"):
+        raise OSError("voice program settings require Windows")
+    os.startfile(  # type: ignore[attr-defined,call-arg]
+        path,
+        operation,
+        arguments,
+        cwd,
+    )
 
 
 def _iter_windows_processes() -> Iterable[ProcessInfo]:

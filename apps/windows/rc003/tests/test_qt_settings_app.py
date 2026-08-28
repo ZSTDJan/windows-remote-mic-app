@@ -422,8 +422,37 @@ class SettingsControllerTests(unittest.TestCase):
             return_value=False,
         )
         self._bridge_status_patch.start()
+        self._voice_hotkey_read_patch = mock.patch.object(
+            qt_settings_app.voice_hotkey_sync_windows,
+            "read_provider_hotkey",
+            side_effect=lambda provider_id: (
+                qt_settings_app.voice_hotkey_sync_windows.VoiceHotkeySyncResult(
+                    str(provider_id),
+                    False,
+                    "local_only",
+                    message="test uses remembered shortcut",
+                )
+            ),
+        )
+        self._voice_hotkey_read_mock = self._voice_hotkey_read_patch.start()
+        self._voice_hotkey_sync_patch = mock.patch.object(
+            qt_settings_app.voice_hotkey_sync_windows,
+            "sync_provider_hotkey",
+            side_effect=lambda provider_id, shortcut: (
+                qt_settings_app.voice_hotkey_sync_windows.VoiceHotkeySyncResult(
+                    str(provider_id),
+                    True,
+                    "synced",
+                    shortcut,
+                    "test shortcut synchronized",
+                )
+            ),
+        )
+        self._voice_hotkey_sync_mock = self._voice_hotkey_sync_patch.start()
 
     def tearDown(self):
+        self._voice_hotkey_sync_patch.stop()
+        self._voice_hotkey_read_patch.stop()
         self._bridge_status_patch.stop()
         self._env_patch.stop()
         self._tmpdir.cleanup()
@@ -500,6 +529,106 @@ class SettingsControllerTests(unittest.TestCase):
         self.assertTrue(controller.voiceProgramSystemManaged)
         self.assertFalse(controller.voiceProgramLaunchOnBridgeStart)
         self.assertFalse(controller.voiceProgramSettingsDirty)
+
+    def test_selecting_provider_adopts_and_remembers_its_detected_shortcut(self):
+        self._voice_hotkey_read_mock.side_effect = None
+        self._voice_hotkey_read_mock.return_value = (
+            qt_settings_app.voice_hotkey_sync_windows.VoiceHotkeySyncResult(
+                "wetype",
+                True,
+                "read",
+                "lctrl+lshift+f9",
+                "read from WeType",
+            )
+        )
+        controller, _ = self._make_controller()
+
+        controller.selectedVoiceProgramIndex = 2
+
+        self.assertEqual(controller.holdVoiceHotkeyText, "lctrl+lshift+f9")
+        saved = config.load_config(config.config_path(config.config_root()))
+        self.assertEqual(
+            saved["voice_hotkeys_by_provider"]["wetype"]["hold"],
+            "lctrl+lshift+f9",
+        )
+
+    def test_provider_sync_failure_restores_the_previous_shortcut(self):
+        controller, _ = self._make_controller()
+        controller.selectedVoiceProgramIndex = 2
+        previous = controller.holdVoiceHotkeyText
+        self._voice_hotkey_sync_mock.side_effect = None
+        self._voice_hotkey_sync_mock.return_value = (
+            qt_settings_app.voice_hotkey_sync_windows.VoiceHotkeySyncResult(
+                "wetype",
+                False,
+                "write_failed",
+                message="WeType rejected shortcut",
+            )
+        )
+
+        controller.holdVoiceHotkeyText = "lctrl+lshift+f9"
+
+        self.assertEqual(controller.holdVoiceHotkeyText, previous)
+        self.assertIn("WeType rejected", controller.errorMessage)
+
+    def test_failed_local_save_reports_when_provider_rollback_also_fails(self):
+        controller, _ = self._make_controller()
+        controller.selectedVoiceProgramIndex = 2
+        previous = controller.holdVoiceHotkeyText
+        self._voice_hotkey_sync_mock.side_effect = [
+            qt_settings_app.voice_hotkey_sync_windows.VoiceHotkeySyncResult(
+                "wetype",
+                True,
+                "synced",
+                "lctrl+lshift+f9",
+                "shortcut synchronized",
+            ),
+            qt_settings_app.voice_hotkey_sync_windows.VoiceHotkeySyncResult(
+                "wetype",
+                False,
+                "write_failed",
+                message="rollback failed",
+            ),
+        ]
+
+        with mock.patch.object(
+            config, "save_config", side_effect=OSError("settings file is locked")
+        ):
+            controller.holdVoiceHotkeyText = "lctrl+lshift+f9"
+
+        self.assertEqual(controller.holdVoiceHotkeyText, previous)
+        self.assertIn("语音设置保存失败", controller.errorMessage)
+        self.assertIn("第三方程序快捷键也未能恢复", controller.errorMessage)
+        self.assertEqual(
+            self._voice_hotkey_sync_mock.call_args_list,
+            [
+                mock.call("wetype", "lctrl+lshift+f9"),
+                mock.call("wetype", previous),
+            ],
+        )
+
+    def test_refresh_adopts_an_external_provider_change(self):
+        controller, _ = self._make_controller()
+        controller.selectedVoiceProgramIndex = 2
+        self._voice_hotkey_read_mock.side_effect = None
+        self._voice_hotkey_read_mock.return_value = (
+            qt_settings_app.voice_hotkey_sync_windows.VoiceHotkeySyncResult(
+                "wetype",
+                True,
+                "read",
+                "lctrl+lshift+f9",
+                "read from WeType",
+            )
+        )
+
+        controller.refreshVoiceHotkeyFromProvider()
+
+        self.assertEqual(controller.holdVoiceHotkeyText, "lctrl+lshift+f9")
+        saved = config.load_config(config.config_path(config.config_root()))
+        self.assertEqual(
+            saved["voice_hotkeys_by_provider"]["wetype"]["hold"],
+            "lctrl+lshift+f9",
+        )
 
     def test_selecting_windows_dictation_uses_system_management_and_win_h_helper(self):
         controller, _ = self._make_controller()
@@ -1514,8 +1643,8 @@ class SettingsControllerTests(unittest.TestCase):
 
     def test_restore_mapping_defaults_does_not_change_voice_program_or_hotkey(self):
         controller, model = self._make_controller()
-        controller.holdVoiceHotkeyText = "ctrl+l"
         controller.selectedVoiceProgramIndex = 1
+        controller.holdVoiceHotkeyText = "ctrl+l"
         controller.voiceProgramLaunchElevated = True
         power_row = model.index_of("power")
         model.setActionTextAt(power_row, "f5")
@@ -4381,7 +4510,7 @@ class SettingsShellSourceContractTests(unittest.TestCase):
         self.assertNotIn('objectName: "openSoundInputSettingsButton"', self.voice_qml)
         self.assertIn('titleText: qsTr("麦克风权限")', self.voice_qml)
         self.assertNotIn('stateText: qsTr("待确认")', self.voice_qml)
-        self.assertIn('qsTr("录入后自动保存，需与语音程序快捷键一致")', self.voice_qml)
+        self.assertIn('qsTr("切换程序时自动读取；录入后同步并保存")', self.voice_qml)
         self.assertIn('? qsTr("录入中") : qsTr("已保存")', self.voice_qml)
         for misleading_claim in (
             "已授权",
@@ -4481,7 +4610,7 @@ class SettingsShellSourceContractTests(unittest.TestCase):
 
     def test_voice_hotkey_field_is_owned_by_the_voice_page(self):
         self.assertIn('placeholderText: qsTr("点击录入")', self.voice_qml)
-        self.assertIn("需与语音程序快捷键一致", self.voice_qml)
+        self.assertIn("切换程序时自动读取；录入后同步并保存", self.voice_qml)
         self.assertNotIn('objectName: "holdVoiceHotkeyField"', self.buttons_qml)
 
     def test_voice_program_status_uses_structured_privilege_and_dirty_state(self):
@@ -4720,7 +4849,7 @@ class OffscreenQmlLoadTests(unittest.TestCase):
         self.assertFalse(data["retired_finish_tap_control_exists"])
         self.assertFalse(data["voice_hotkey_recording"])
         self.assertEqual(data["saved_voice_hotkey"], "ctrl+shift+f8")
-        self.assertIn("自动保存", data["voice_save_status"])
+        self.assertIn("快捷键已保存到 Remote Mic", data["voice_save_status"])
         self.assertFalse(data["voice_feedback_on_device"])
         self.assertTrue(data["voice_feedback_on_voice"])
         self.assertTrue(data["mapping_dirty_on_buttons"])
