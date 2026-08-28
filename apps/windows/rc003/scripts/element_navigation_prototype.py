@@ -9,7 +9,9 @@ Controls:
     Ctrl+Alt+N  scan the foreground window and enter/leave navigation
     Arrow keys  move the highlighted target
     PageUp/Down move to the parent/child element at the same location
-    Enter       expand/collapse a group, or invoke a leaf target
+    Enter       left-click the highlighted target; press twice to double-click
+    Menu        right-click the highlighted target
+    Volume +/-  scroll up/down at the highlighted target
     Esc         leave navigation
     Ctrl+Alt+Q  quit the prototype
 """
@@ -62,13 +64,36 @@ PRESERVED_NESTED_ACTION_NAMES = frozenset(
 )
 CHROMIUM_RENDERER_CLASS = "Chrome_RenderWidgetHostHWND"
 CHROMIUM_MIN_SCAN_DEPTH = 32
-LIST_CONTAINER_TYPES = frozenset(
-    {"ListControl", "TreeControl", "TableControl", "DataGridControl"}
-)
-ITEM_CONTAINER_TYPES = frozenset({"ListItemControl", "TreeItemControl"})
 SEMANTIC_BYPASS_MAX_WIDTH = 180
 SEMANTIC_BYPASS_MAX_HEIGHT = 96
 PREWARM_STABILITY_SECONDS = 0.75
+VK_RETURN = 0x0D
+VK_ESCAPE = 0x1B
+VK_PAGEUP = 0x21
+VK_PAGEDOWN = 0x22
+VK_LEFT = 0x25
+VK_UP = 0x26
+VK_RIGHT = 0x27
+VK_DOWN = 0x28
+VK_APPS = 0x5D
+VK_VOLUME_DOWN = 0xAE
+VK_VOLUME_UP = 0xAF
+NAVIGATION_KEY_ACTIONS = {
+    VK_UP: "up",
+    VK_DOWN: "down",
+    VK_LEFT: "left",
+    VK_RIGHT: "right",
+    VK_PAGEUP: "parent",
+    VK_PAGEDOWN: "child",
+    VK_RETURN: "activate",
+    VK_APPS: "context",
+    VK_VOLUME_DOWN: "scroll_down",
+    VK_VOLUME_UP: "scroll_up",
+    VK_ESCAPE: "cancel",
+}
+NATIVE_MENU_NAVIGATION_KEYS = frozenset(
+    {VK_UP, VK_DOWN, VK_LEFT, VK_RIGHT, VK_RETURN, VK_ESCAPE}
+)
 
 
 class Direction(str, Enum):
@@ -536,6 +561,94 @@ def native_handle_value(handle: Any) -> int:
     return int(handle or 0)
 
 
+def keyboard_navigation_action(vk: int) -> Optional[str]:
+    return NAVIGATION_KEY_ACTIONS.get(vk)
+
+
+def should_pass_through_native_menu(vk: int, menu_mode_active: bool) -> bool:
+    return menu_mode_active and vk in NATIVE_MENU_NAVIGATION_KEYS
+
+
+def content_refresh_delay_ms(event: str, repeated_activation: bool = False) -> int:
+    if event == "contexted":
+        return 120
+    if event == "activated" and repeated_activation:
+        return 180
+    return 0
+
+
+def mouse_wheel_data(delta: int) -> int:
+    return delta & 0xFFFFFFFF
+
+
+def owner_chain_contains(
+    start_hwnd: int,
+    expected_hwnd: int,
+    owner_of: Callable[[int], int],
+    max_depth: int = 16,
+) -> bool:
+    if start_hwnd <= 0 or expected_hwnd <= 0:
+        return False
+    current = start_hwnd
+    seen = {current}
+    for _depth in range(max_depth):
+        try:
+            current = native_handle_value(owner_of(current))
+        except Exception:
+            return False
+        if current <= 0 or current in seen:
+            return False
+        if current == expected_hwnd:
+            return True
+        seen.add(current)
+    return False
+
+
+def navigation_foreground_action(
+    foreground_hwnd: int,
+    current_hwnd: int,
+    root_hwnd: int,
+    root_process_id: int,
+    prototype_process_id: int,
+    process_id_of: Callable[[int], int],
+    owner_of: Callable[[int], int],
+) -> str:
+    """Choose whether to keep, follow, ignore, or leave the active context."""
+
+    if foreground_hwnd <= 0 or foreground_hwnd == current_hwnd:
+        return "sync"
+    try:
+        foreground_process_id = int(process_id_of(foreground_hwnd))
+    except Exception:
+        return "leave"
+    if foreground_process_id == prototype_process_id:
+        return "ignore"
+    if root_process_id > 0 and foreground_process_id == root_process_id:
+        return "follow"
+    related_handles = tuple(
+        handle for handle in (current_hwnd, root_hwnd) if handle > 0
+    )
+    if any(
+        owner_chain_contains(foreground_hwnd, handle, owner_of)
+        or owner_chain_contains(handle, foreground_hwnd, owner_of)
+        for handle in related_handles
+    ):
+        return "follow"
+    return "leave"
+
+
+def target_pointer_point(
+    target: TargetSnapshot,
+    verified_point: Optional[tuple[int, int]],
+    allow_rect_center: bool,
+) -> Optional[tuple[int, int]]:
+    if verified_point is not None:
+        return verified_point
+    if allow_rect_center:
+        return round(target.rect.center_x), round(target.rect.center_y)
+    return None
+
+
 def configure_standard_streams() -> None:
     for stream in (sys.stdout, sys.stderr):
         reconfigure = getattr(stream, "reconfigure", None)
@@ -574,23 +687,6 @@ def scan_should_stop(
         deadline is not None
         and (time.perf_counter() if now is None else now) >= deadline
     )
-
-
-def branch_refresh_progress(
-    previous_count: int,
-    last_count: int,
-    current_count: int,
-    expanding: bool,
-    observed_expected_change: bool,
-) -> tuple[bool, bool]:
-    changed_as_expected = (
-        current_count > previous_count
-        if expanding
-        else current_count < previous_count
-    )
-    observed_expected_change = observed_expected_change or changed_as_expected
-    stable = observed_expected_change and current_count == last_count
-    return observed_expected_change, stable
 
 
 def target_probe_points(rect: Rect) -> list[tuple[int, int]]:
@@ -774,48 +870,6 @@ def target_quality_rank(target: TargetSnapshot) -> tuple[int, int, int, int]:
     )
 
 
-def discover_group_scopes(
-    targets: Sequence[TargetSnapshot],
-    node_types: dict[tuple[int, ...], str],
-) -> dict[tuple[int, ...], int]:
-    """Map a folder-like scope path to its expandable representative target."""
-
-    groups: dict[tuple[int, ...], int] = {}
-    for index, target in enumerate(targets):
-        if (
-            not target.supports_expand
-            or not target.path
-            or target.rect.width < 120
-        ):
-            continue
-        parent_path = target.path[:-1]
-        inside_item_container = target.control_type == "TreeItemControl" or any(
-            node_types.get(parent_path[:depth]) in ITEM_CONTAINER_TYPES
-            for depth in range(1, len(parent_path) + 1)
-        )
-        if not inside_item_container:
-            continue
-        has_list_child = any(
-            len(path) == len(parent_path) + 1
-            and path[:-1] == parent_path
-            and control_type in LIST_CONTAINER_TYPES
-            for path, control_type in node_types.items()
-        )
-        has_child_target = any(
-            other_index != index
-            and len(other.path) > len(parent_path)
-            and other.path[: len(parent_path)] == parent_path
-            and not (
-                len(other.path) >= len(target.path)
-                and other.path[: len(target.path)] == target.path
-            )
-            for other_index, other in enumerate(targets)
-        )
-        if has_list_child and has_child_target:
-            groups[parent_path] = index
-    return groups
-
-
 def flat_target_indices(targets: Sequence[TargetSnapshot]) -> list[int]:
     """Keep every currently visible target in one flat navigation surface."""
 
@@ -889,15 +943,6 @@ def semantic_action_can_bypass_point_hit(target: TargetSnapshot) -> bool:
     )
 
 
-def path_is_in_branch(
-    path: tuple[int, ...], branch_path: tuple[int, ...]
-) -> bool:
-    return bool(
-        len(path) > len(branch_path)
-        and path[: len(branch_path)] == branch_path
-    )
-
-
 def effective_scan_depth(configured_depth: int, has_chromium_renderer: bool) -> int:
     if has_chromium_renderer:
         return max(configured_depth, CHROMIUM_MIN_SCAN_DEPTH)
@@ -956,10 +1001,25 @@ def _run_windows(args: argparse.Namespace) -> int:
             ("value", VariantValue),
         ]
 
+    class GuiThreadInfo(ctypes.Structure):
+        _fields_ = [
+            ("cbSize", wintypes.DWORD),
+            ("flags", wintypes.DWORD),
+            ("hwndActive", wintypes.HWND),
+            ("hwndFocus", wintypes.HWND),
+            ("hwndCapture", wintypes.HWND),
+            ("hwndMenuOwner", wintypes.HWND),
+            ("hwndMoveSize", wintypes.HWND),
+            ("hwndCaret", wintypes.HWND),
+            ("rcCaret", wintypes.RECT),
+        ]
+
     kernel32.GetCurrentThreadId.restype = wintypes.DWORD
     kernel32.GetModuleHandleW.argtypes = [wintypes.LPCWSTR]
     kernel32.GetModuleHandleW.restype = wintypes.HMODULE
     user32.GetForegroundWindow.restype = wintypes.HWND
+    user32.GetWindow.argtypes = [wintypes.HWND, wintypes.UINT]
+    user32.GetWindow.restype = wintypes.HWND
     user32.GetWindowThreadProcessId.argtypes = [
         wintypes.HWND,
         ctypes.POINTER(wintypes.DWORD),
@@ -967,6 +1027,13 @@ def _run_windows(args: argparse.Namespace) -> int:
     user32.GetWindowThreadProcessId.restype = wintypes.DWORD
     user32.GetCursorPos.argtypes = [ctypes.POINTER(wintypes.POINT)]
     user32.GetCursorPos.restype = wintypes.BOOL
+    user32.GetDoubleClickTime.argtypes = []
+    user32.GetDoubleClickTime.restype = wintypes.UINT
+    user32.GetGUIThreadInfo.argtypes = [
+        wintypes.DWORD,
+        ctypes.POINTER(GuiThreadInfo),
+    ]
+    user32.GetGUIThreadInfo.restype = wintypes.BOOL
     user32.SetCursorPos.argtypes = [ctypes.c_int, ctypes.c_int]
     user32.SetCursorPos.restype = wintypes.BOOL
     user32.mouse_event.argtypes = [
@@ -1044,6 +1111,12 @@ def _run_windows(args: argparse.Namespace) -> int:
     rpc_e_changed_mode = ctypes.c_long(0x80010106).value
     mouseeventf_leftdown = 0x0002
     mouseeventf_leftup = 0x0004
+    mouseeventf_rightdown = 0x0008
+    mouseeventf_rightup = 0x0010
+    mouseeventf_wheel = 0x0800
+    wheel_delta = 120
+    gw_owner = 4
+    gui_menu_mode_flags = 0x0004 | 0x0008 | 0x0010
     awakened_chromium_windows: set[int] = set()
 
     @dataclass
@@ -1245,13 +1318,24 @@ def _run_windows(args: argparse.Namespace) -> int:
         except queue.Empty:
             return None
 
-    def click_rect_center(rect: Rect) -> None:
-        click_point((round(rect.center_x), round(rect.center_y)))
-
-    def click_point(point: tuple[int, int]) -> None:
+    def click_point(point: tuple[int, int], button: str = "left") -> None:
         user32.SetCursorPos(point[0], point[1])
-        user32.mouse_event(mouseeventf_leftdown, 0, 0, 0, 0)
-        user32.mouse_event(mouseeventf_leftup, 0, 0, 0, 0)
+        if button == "right":
+            down, up = mouseeventf_rightdown, mouseeventf_rightup
+        else:
+            down, up = mouseeventf_leftdown, mouseeventf_leftup
+        user32.mouse_event(down, 0, 0, 0, 0)
+        user32.mouse_event(up, 0, 0, 0, 0)
+
+    def scroll_point(point: tuple[int, int], steps: int) -> None:
+        user32.SetCursorPos(point[0], point[1])
+        user32.mouse_event(
+            mouseeventf_wheel,
+            0,
+            0,
+            mouse_wheel_data(steps * wheel_delta),
+            0,
+        )
 
     def window_class_name(hwnd: int) -> str:
         buffer = ctypes.create_unicode_buffer(256)
@@ -1262,6 +1346,17 @@ def _run_windows(args: argparse.Namespace) -> int:
         process_id = wintypes.DWORD()
         user32.GetWindowThreadProcessId(hwnd, ctypes.byref(process_id))
         return int(process_id.value)
+
+    def window_owner(hwnd: int) -> int:
+        return native_handle_value(user32.GetWindow(hwnd, gw_owner))
+
+    def native_menu_mode_active() -> bool:
+        info = GuiThreadInfo()
+        info.cbSize = ctypes.sizeof(info)
+        return bool(
+            user32.GetGUIThreadInfo(0, ctypes.byref(info))
+            and int(info.flags) & gui_menu_mode_flags
+        )
 
     def activate_embedded_chromium_accessibility(hwnd: int) -> bool:
         """Ask Chromium renderers to publish their UI Automation tree."""
@@ -1524,22 +1619,6 @@ def _run_windows(args: argparse.Namespace) -> int:
             )
         ]
 
-    def toggle_expanded(control: Any) -> Optional[tuple[str, bool]]:
-        try:
-            pattern = control.GetPattern(auto.PatternId.ExpandCollapsePattern)
-            if pattern is None:
-                return None
-            state = int(pattern.ExpandCollapseState)
-            if state == 0:
-                pattern.Expand(waitTime=0)
-                return "Expand", True
-            if state in (1, 2):
-                pattern.Collapse(waitTime=0)
-                return "Collapse", False
-            return None
-        except Exception:
-            return None
-
     def try_semantic_invoke(target: RuntimeTarget) -> Optional[str]:
         control = target.control
         if control is None:
@@ -1568,17 +1647,6 @@ def _run_windows(args: argparse.Namespace) -> int:
                 continue
         return None
 
-    def click_target(target: RuntimeTarget) -> str:
-        control = target.control
-        if control is None:
-            click_rect_center(target.snapshot.rect)
-            return "MSAA coordinate click"
-        if target.click_point is not None:
-            click_point(target.click_point)
-            return "verified coordinate click"
-        control.Click(simulateMove=False, waitTime=0)
-        return "mouse fallback"
-
     class AutomationWorker:
         _PENDING_LIMITS = {
             "scan": 1,
@@ -1586,15 +1654,33 @@ def _run_windows(args: argparse.Namespace) -> int:
             "move": 2,
             "parent": 1,
             "child": 1,
-            "activate": 1,
+            "activate": 2,
+            "context": 1,
+            "scroll_up": 2,
+            "scroll_down": 2,
             "back": 1,
             "sync_window": 1,
+            "refresh_content": 1,
+            "follow_window": 1,
         }
         _NAVIGATION_COMMANDS = frozenset(
-            {"move", "parent", "child", "activate", "back", "sync_window"}
+            {
+                "move",
+                "parent",
+                "child",
+                "activate",
+                "context",
+                "scroll_up",
+                "scroll_down",
+                "back",
+                "sync_window",
+                "refresh_content",
+                "follow_window",
+            }
         )
         _CACHE_TTL_SECONDS = 15.0
         _PREWARM_BUDGET_SECONDS = 1.5
+        _SCROLL_BURST_SECONDS = 0.35
 
         def __init__(self) -> None:
             self.commands: queue.Queue[tuple[str, Any, int]] = queue.Queue()
@@ -1618,6 +1704,16 @@ def _run_windows(args: argparse.Namespace) -> int:
             self.window_name = ""
             self.visited = 0
             self.cache_timestamp = 0.0
+            self._pointer_cache_token: Optional[tuple[Any, ...]] = None
+            self._pointer_cache_point: Optional[tuple[int, int]] = None
+            self._pointer_cache_at = 0.0
+            self._scroll_cache_token: Optional[tuple[Any, ...]] = None
+            self._scroll_cache_point: Optional[tuple[int, int]] = None
+            self._scroll_cache_at = 0.0
+            self._content_settle_until = 0.0
+            self._double_click_seconds = max(
+                0.2, int(user32.GetDoubleClickTime()) / 1000
+            )
             self._thread = threading.Thread(
                 target=self._run,
                 name="element-navigation-uia",
@@ -1733,6 +1829,56 @@ def _run_windows(args: argparse.Namespace) -> int:
         def _clear_hierarchy(self) -> None:
             self.hierarchy = []
             self.hierarchy_index = -1
+
+        def _clear_input_cache(self) -> None:
+            self._pointer_cache_token = None
+            self._pointer_cache_point = None
+            self._pointer_cache_at = 0.0
+            self._scroll_cache_token = None
+            self._scroll_cache_point = None
+            self._scroll_cache_at = 0.0
+            self._content_settle_until = 0.0
+
+        def _remember_pointer_point(
+            self, target: RuntimeTarget, point: tuple[int, int]
+        ) -> None:
+            self._pointer_cache_token = self._identity_token(target.snapshot)
+            self._pointer_cache_point = point
+            self._pointer_cache_at = time.perf_counter()
+
+        def _cached_pointer_point(
+            self, target: RuntimeTarget
+        ) -> Optional[tuple[int, int]]:
+            if (
+                self._pointer_cache_point is not None
+                and self._pointer_cache_token
+                == self._identity_token(target.snapshot)
+                and time.perf_counter() - self._pointer_cache_at
+                <= self._double_click_seconds
+            ):
+                return self._pointer_cache_point
+            return None
+
+        def _remember_scroll_point(
+            self, target: RuntimeTarget, point: tuple[int, int]
+        ) -> None:
+            now = time.perf_counter()
+            self._scroll_cache_token = self._identity_token(target.snapshot)
+            self._scroll_cache_point = point
+            self._scroll_cache_at = now
+            self._content_settle_until = now + self._SCROLL_BURST_SECONDS
+
+        def _cached_scroll_point(
+            self, target: RuntimeTarget
+        ) -> Optional[tuple[int, int]]:
+            if (
+                self._scroll_cache_point is not None
+                and self._scroll_cache_token == self._identity_token(target.snapshot)
+                and time.perf_counter() - self._scroll_cache_at
+                <= self._SCROLL_BURST_SECONDS
+            ):
+                return self._scroll_cache_point
+            return None
 
         def _cycle_hierarchy(self, delta: int) -> None:
             if not self.targets or not 0 <= self.selected < len(self.targets):
@@ -1863,8 +2009,18 @@ def _run_windows(args: argparse.Namespace) -> int:
                 return False
             if current_window_rect == self.window_rect:
                 if not self._content_geometry_is_current():
-                    self._invalidate_navigation("页面内容已经滚动或重新排版")
-                    return False
+                    previous = (
+                        self.targets[self.selected].snapshot
+                        if 0 <= self.selected < len(self.targets)
+                        else None
+                    )
+                    self._enumerate(self.hwnd)
+                    self._apply_targets(restore=previous)
+                    self._clear_hierarchy()
+                    self._clear_input_cache()
+                    self.events.put(("geometry_rescanned", None))
+                    self._emit_selection()
+                    return bool(self.targets and self.selected >= 0)
                 return True
 
             if (
@@ -1879,6 +2035,7 @@ def _run_windows(args: argparse.Namespace) -> int:
                     )
                 self.window_rect = current_window_rect
                 self.invalid_targets.clear()
+                self._clear_input_cache()
                 self.events.put(
                     (
                         "geometry_synced",
@@ -1896,9 +2053,10 @@ def _run_windows(args: argparse.Namespace) -> int:
             self._enumerate(self.hwnd)
             self._apply_targets(restore=previous)
             self._clear_hierarchy()
+            self._clear_input_cache()
             self.events.put(("geometry_rescanned", None))
             self._emit_selection()
-            return True
+            return bool(self.targets and self.selected >= 0)
 
         def _enumerate(
             self,
@@ -1925,6 +2083,7 @@ def _run_windows(args: argparse.Namespace) -> int:
             ) = result
             self.hwnd = hwnd
             self.invalid_targets.clear()
+            self._clear_input_cache()
             self.context_valid = activate_context
             self.cache_timestamp = time.perf_counter()
             return True
@@ -2027,7 +2186,11 @@ def _run_windows(args: argparse.Namespace) -> int:
                     self.events.put(("target_skipped", target.snapshot))
                     continue
                 if target.snapshot.rect != previous_rect:
-                    self._invalidate_navigation("页面内容已经滚动或重新排版")
+                    previous = self.targets[self.selected].snapshot
+                    self._enumerate(self.hwnd)
+                    self._apply_targets(restore=previous)
+                    self._clear_hierarchy()
+                    self._emit_selection()
                     return
                 self.selected = next_index
                 self.traversal.commit(next_index)
@@ -2097,129 +2260,6 @@ def _run_windows(args: argparse.Namespace) -> int:
                 )
             )
 
-        def _refresh_branch(
-            self,
-            target: RuntimeTarget,
-        ) -> bool:
-            if target.control is None or not target.snapshot.path:
-                return False
-            try:
-                parent = target.control.GetParentControl()
-            except Exception:
-                return False
-            if parent is None:
-                return False
-
-            branch_path = target.snapshot.path[:-1]
-            (
-                branch_targets,
-                branch_node_types,
-                visited,
-                _interrupted,
-            ) = collect_targets(
-                parent,
-                self.window_rect,
-                branch_path,
-                len(branch_path),
-                max(args.max_depth, 16),
-            )
-            if not branch_targets:
-                return False
-
-            self.all_targets = [
-                existing
-                for existing in self.all_targets
-                if not path_is_in_branch(existing.snapshot.path, branch_path)
-            ]
-            self.all_targets = normalize_runtime_targets(
-                [*self.all_targets, *branch_targets]
-            )
-            self.node_types = {
-                path: control_type
-                for path, control_type in self.node_types.items()
-                if not path_is_in_branch(path, branch_path)
-            }
-            self.node_types.update(branch_node_types)
-            self.visited = visited
-            self.invalid_targets.clear()
-            return True
-
-        def _refresh_cached_geometry(self) -> bool:
-            refreshed: list[RuntimeTarget] = []
-            for target in self.all_targets:
-                if target.control is None:
-                    if target.snapshot.rect.intersects(self.window_rect):
-                        refreshed.append(target)
-                    continue
-                try:
-                    if not bool(target.control.IsEnabled) or bool(
-                        target.control.IsOffscreen
-                    ):
-                        continue
-                    live_rect = rect_from_control(target.control)
-                except Exception:
-                    continue
-                if (
-                    live_rect.width < 16
-                    or live_rect.height < 16
-                    or not live_rect.intersects(self.window_rect)
-                ):
-                    continue
-                if live_rect != target.snapshot.rect:
-                    target.snapshot = replace(target.snapshot, rect=live_rect)
-                target.click_point = None
-                refreshed.append(target)
-            self.all_targets = normalize_runtime_targets(refreshed)
-            return bool(self.all_targets)
-
-        def _refresh_after_expand(
-            self,
-            target: RuntimeTarget,
-            previous: TargetSnapshot,
-            expanding: bool,
-        ) -> str:
-            branch_path = target.snapshot.path[:-1]
-            previous_count = sum(
-                path_is_in_branch(existing.snapshot.path, branch_path)
-                for existing in self.all_targets
-            )
-            refresh_method = "branch"
-            last_count = previous_count
-            observed_expected_change = False
-            for delay in (0.04, 0.05, 0.06):
-                time.sleep(delay)
-                if not self._refresh_branch(target):
-                    self._enumerate(self.hwnd)
-                    refresh_method = "full"
-                    break
-                current_count = sum(
-                    path_is_in_branch(existing.snapshot.path, branch_path)
-                    for existing in self.all_targets
-                )
-                (
-                    observed_expected_change,
-                    stable,
-                ) = branch_refresh_progress(
-                    previous_count,
-                    last_count,
-                    current_count,
-                    expanding,
-                    observed_expected_change,
-                )
-                last_count = current_count
-                if stable:
-                    break
-            if refresh_method == "branch" and not self._refresh_cached_geometry():
-                self._enumerate(self.hwnd)
-                refresh_method = "full"
-            self._apply_targets(restore=previous)
-            if not self.targets or self.selected < 0:
-                self._emit_selection()
-                return refresh_method
-            self._clear_hierarchy()
-            self._emit_selection()
-            return refresh_method
-
         def _refresh_invalid_target(self, target: RuntimeTarget) -> None:
             self.invalid_targets.add(self._identity_token(target.snapshot))
             self.events.put(("target_skipped", target.snapshot))
@@ -2232,57 +2272,170 @@ def _run_windows(args: argparse.Namespace) -> int:
             if not self.targets or self.selected < 0:
                 return
             started = time.perf_counter()
+            target = self.targets[self.selected]
+            cached_point = self._cached_pointer_point(target)
+            if cached_point is not None:
+                click_point(cached_point)
+                self._remember_pointer_point(target, cached_point)
+                self.events.put(
+                    (
+                        "activated",
+                        {
+                            "target": target.snapshot,
+                            "method": "verified coordinate click (repeat)",
+                            "repeat": True,
+                            "elapsed": time.perf_counter() - started,
+                        },
+                    )
+                )
+                return
             if not self._sync_window_geometry():
                 return
             target = self.targets[self.selected]
             if not self._update_live_target(target):
                 self._refresh_invalid_target(target)
                 return
-            expansion = (
-                toggle_expanded(target.control)
-                if target.snapshot.supports_expand
-                else None
+            exposed = self._target_is_exposed(
+                target, allow_semantic_bypass=False
             )
-            if expansion is not None:
-                method, expanding = expansion
-                refresh = self._refresh_after_expand(
-                    target, target.snapshot, expanding=expanding
-                )
-                self.events.put(
-                    (
-                        "expanded",
-                        {
-                            "target": target.snapshot,
-                            "method": method or "Expand",
-                            "refresh": refresh,
-                            "elapsed": time.perf_counter() - started,
-                        },
-                    )
-                )
-                return
-
-            method = (
-                try_semantic_invoke(target)
-                if target.snapshot.has_action_pattern
-                else None
+            point = target_pointer_point(
+                target.snapshot,
+                target.click_point,
+                allow_rect_center=target.control is None,
             )
-            if method is None:
-                if not self._target_is_exposed(
-                    target, allow_semantic_bypass=False
-                ):
+            if exposed and point is not None:
+                click_point(point)
+                self._remember_pointer_point(target, point)
+                method = (
+                    "MSAA coordinate click"
+                    if target.control is None
+                    else "verified coordinate click"
+                )
+            else:
+                method = (
+                    try_semantic_invoke(target)
+                    if target.snapshot.has_action_pattern
+                    else None
+                )
+                if method is None:
                     self._refresh_invalid_target(target)
                     return
-                method = click_target(target)
             self.events.put(
                 (
                     "activated",
                     {
                         "target": target.snapshot,
                         "method": method,
+                        "repeat": False,
                         "elapsed": time.perf_counter() - started,
                     },
                 )
             )
+
+        def _context_click(self) -> None:
+            if not self.targets or self.selected < 0:
+                return
+            started = time.perf_counter()
+            if not self._sync_window_geometry():
+                return
+            target = self.targets[self.selected]
+            if not self._target_is_exposed(
+                target, allow_semantic_bypass=False
+            ):
+                self._refresh_invalid_target(target)
+                return
+            point = target_pointer_point(
+                target.snapshot,
+                target.click_point,
+                allow_rect_center=target.control is None,
+            )
+            if point is None:
+                self._refresh_invalid_target(target)
+                return
+            click_point(point, button="right")
+            self.events.put(
+                (
+                    "contexted",
+                    {
+                        "target": target.snapshot,
+                        "elapsed": time.perf_counter() - started,
+                    },
+                )
+            )
+
+        def _scroll(self, steps: int) -> None:
+            if not self.targets or self.selected < 0:
+                return
+            started = time.perf_counter()
+            target = self.targets[self.selected]
+            point = self._cached_scroll_point(target)
+            if point is None:
+                if not self._sync_window_geometry():
+                    return
+                target = self.targets[self.selected]
+                if not self._target_is_exposed(
+                    target, allow_semantic_bypass=False
+                ):
+                    self._refresh_invalid_target(target)
+                    return
+                point = target_pointer_point(
+                    target.snapshot,
+                    target.click_point,
+                    allow_rect_center=target.control is None,
+                )
+                if point is None:
+                    self._refresh_invalid_target(target)
+                    return
+            scroll_point(point, steps)
+            self._remember_scroll_point(target, point)
+            self.events.put(
+                (
+                    "scrolled",
+                    {
+                        "target": target.snapshot,
+                        "steps": steps,
+                        "elapsed": time.perf_counter() - started,
+                    },
+                )
+            )
+
+        def _follow_window(self, hwnd: int) -> None:
+            if hwnd <= 0:
+                return
+            if hwnd == self.hwnd:
+                self._sync_window_geometry()
+                return
+            self._enumerate(hwnd)
+            self._apply_targets(focused=focused_rect(), use_cursor=True)
+            self._reset_hierarchy_for_selected()
+            if not self.targets or self.selected < 0:
+                self._invalidate_navigation("新窗口中没有找到可导航元素")
+                return
+            self.events.put(
+                (
+                    "window_followed",
+                    {
+                        "window": self.window_name,
+                        **self._selection_payload(),
+                    },
+                )
+            )
+
+        def _refresh_content(self) -> None:
+            if not self.context_valid or not self.hwnd:
+                return
+            previous = (
+                self.targets[self.selected].snapshot
+                if 0 <= self.selected < len(self.targets)
+                else None
+            )
+            self._enumerate(self.hwnd)
+            self._apply_targets(restore=previous)
+            self._clear_hierarchy()
+            if not self.targets or self.selected < 0:
+                self._invalidate_navigation("页面变化后没有找到可导航元素")
+                return
+            self.events.put(("content_refreshed", self._selection_payload()))
 
         def _back(self) -> None:
             self.events.put(("exit_requested", None))
@@ -2329,10 +2482,21 @@ def _run_windows(args: argparse.Namespace) -> int:
                             and self.selected >= 0
                         ):
                             self._activate()
+                        elif command == "context" and self.context_valid:
+                            self._context_click()
+                        elif command == "scroll_up" and self.context_valid:
+                            self._scroll(1)
+                        elif command == "scroll_down" and self.context_valid:
+                            self._scroll(-1)
                         elif command == "back":
                             self._back()
                         elif command == "sync_window":
-                            self._sync_window_geometry()
+                            if time.perf_counter() >= self._content_settle_until:
+                                self._sync_window_geometry()
+                        elif command == "refresh_content":
+                            self._refresh_content()
+                        elif command == "follow_window":
+                            self._follow_window(int(value))
                     except Exception as exc:
                         self.events.put(
                             (
@@ -2470,14 +2634,6 @@ def _run_windows(args: argparse.Namespace) -> int:
         WM_QUIT = 0x0012
         VK_CONTROL = 0x11
         VK_MENU = 0x12
-        VK_LEFT = 0x25
-        VK_UP = 0x26
-        VK_RIGHT = 0x27
-        VK_DOWN = 0x28
-        VK_RETURN = 0x0D
-        VK_ESCAPE = 0x1B
-        VK_PAGEUP = 0x21
-        VK_PAGEDOWN = 0x22
         VK_N = 0x4E
         VK_Q = 0x51
 
@@ -2525,6 +2681,7 @@ def _run_windows(args: argparse.Namespace) -> int:
             self._ready = threading.Event()
             self._down: set[int] = set()
             self._swallowed: set[int] = set()
+            self._passthrough: set[int] = set()
             self._thread = threading.Thread(
                 target=self._run,
                 name="element-navigation-keyboard-hook",
@@ -2561,6 +2718,12 @@ def _run_windows(args: argparse.Namespace) -> int:
             else:
                 self._down.discard(vk)
 
+            if is_up and vk in self._passthrough:
+                self._passthrough.discard(vk)
+                return user32.CallNextHookEx(
+                    self._hook, code, wparam, lparam
+                )
+
             if is_up and vk in self._swallowed:
                 self._swallowed.discard(vk)
                 return 1
@@ -2572,21 +2735,19 @@ def _run_windows(args: argparse.Namespace) -> int:
                     self._on_action("toggle" if vk == self.VK_N else "quit")
                 return 1
 
-            navigation = {
-                self.VK_UP: "up",
-                self.VK_DOWN: "down",
-                self.VK_LEFT: "left",
-                self.VK_RIGHT: "right",
-                self.VK_PAGEUP: "parent",
-                self.VK_PAGEDOWN: "child",
-                self.VK_RETURN: "activate",
-                self.VK_ESCAPE: "cancel",
-            }
-            if self._active.is_set() and vk in navigation:
+            action = keyboard_navigation_action(vk)
+            if self._active.is_set() and action is not None:
+                if should_pass_through_native_menu(
+                    vk, native_menu_mode_active()
+                ):
+                    if is_down:
+                        self._passthrough.add(vk)
+                    return user32.CallNextHookEx(
+                        self._hook, code, wparam, lparam
+                    )
                 self._swallowed.add(vk)
                 if is_down and (vk in self._down):
-                    action = navigation[vk]
-                    if vk in (self.VK_RETURN, self.VK_ESCAPE) and was_down:
+                    if vk in (VK_RETURN, VK_APPS, VK_ESCAPE) and was_down:
                         return 1
                     self._on_action(action)
                 return 1
@@ -2658,6 +2819,8 @@ def _run_windows(args: argparse.Namespace) -> int:
     prewarm_observed_hwnd = 0
     prewarm_observed_at = 0.0
     prewarm_requested_hwnd = 0
+    navigation_root_hwnd = 0
+    navigation_process_id = 0
 
     def enqueue_keyboard_action(action: str) -> None:
         keyboard_events.put(action)
@@ -2666,9 +2829,12 @@ def _run_windows(args: argparse.Namespace) -> int:
     hook.start()
 
     def leave_navigation() -> None:
+        nonlocal navigation_root_hwnd, navigation_process_id
         active.clear()
         worker.deactivate()
         overlay.clear_target()
+        navigation_root_hwnd = 0
+        navigation_process_id = 0
 
     def request_quit() -> None:
         nonlocal shutting_down
@@ -2679,7 +2845,7 @@ def _run_windows(args: argparse.Namespace) -> int:
         app.quit()
 
     def handle_keyboard_action(action: str) -> None:
-        nonlocal scanning
+        nonlocal scanning, navigation_root_hwnd, navigation_process_id
         if action == "quit":
             request_quit()
         elif action == "toggle":
@@ -2690,6 +2856,8 @@ def _run_windows(args: argparse.Namespace) -> int:
                 if hwnd <= 0:
                     print("没有可扫描的前台窗口。")
                     return
+                navigation_root_hwnd = hwnd
+                navigation_process_id = window_process_id(hwnd)
                 scanning = True
                 print("正在扫描当前窗口...")
                 worker.post("scan", hwnd)
@@ -2698,6 +2866,8 @@ def _run_windows(args: argparse.Namespace) -> int:
                 worker.post("back")
         elif action == "activate" and active.is_set():
             worker.post("activate")
+        elif action in {"context", "scroll_up", "scroll_down"} and active.is_set():
+            worker.post(action)
         elif action in {"parent", "child"} and active.is_set():
             worker.post(action)
         elif action in {direction.value for direction in Direction} and active.is_set():
@@ -2749,20 +2919,36 @@ def _run_windows(args: argparse.Namespace) -> int:
                         payload["hierarchy_index"],
                         payload["hierarchy_count"],
                     )
-            elif event == "expanded":
-                target = payload["target"]
-                print(
-                    f"已切换: {target.name or target.control_type} "
-                    f"({payload['method']} / {payload['refresh']} refresh / "
-                    f"{payload['elapsed']:.3f}s)"
-                )
             elif event == "activated":
                 target = payload["target"]
                 print(
                     f"已执行: {target.name or target.control_type} "
                     f"({payload['method']} / {payload['elapsed']:.3f}s)"
                 )
-                leave_navigation()
+                refresh_delay = content_refresh_delay_ms(
+                    event, payload["repeat"]
+                )
+                if refresh_delay and active.is_set():
+                    QTimer.singleShot(
+                        refresh_delay, lambda: worker.post("refresh_content")
+                    )
+            elif event == "contexted":
+                target = payload["target"]
+                print(
+                    f"已右击: {target.name or target.control_type} "
+                    f"({payload['elapsed']:.3f}s)"
+                )
+                refresh_delay = content_refresh_delay_ms(event)
+                if refresh_delay and active.is_set():
+                    QTimer.singleShot(
+                        refresh_delay, lambda: worker.post("refresh_content")
+                    )
+            elif event == "scrolled":
+                target = payload["target"]
+                print(
+                    f"已滚动: {target.name or target.control_type} "
+                    f"({payload['steps']:+d} / {payload['elapsed']:.3f}s)"
+                )
             elif event == "exit_requested":
                 leave_navigation()
             elif event == "geometry_synced":
@@ -2770,7 +2956,26 @@ def _run_windows(args: argparse.Namespace) -> int:
                     f"窗口位置已同步: {payload['delta_x']:+d}, {payload['delta_y']:+d}"
                 )
             elif event == "geometry_rescanned":
-                print("窗口尺寸或缩放变化，已重新扫描。")
+                print("页面或窗口变化，已重新扫描。")
+            elif event == "window_followed":
+                print(f"已跟随同一软件窗口: {payload['window']}")
+                if active.is_set():
+                    overlay.show_target(
+                        payload["target"],
+                        payload["selected"],
+                        payload["count"],
+                        payload["hierarchy_index"],
+                        payload["hierarchy_count"],
+                    )
+            elif event == "content_refreshed":
+                if active.is_set():
+                    overlay.show_target(
+                        payload["target"],
+                        payload["selected"],
+                        payload["count"],
+                        payload["hierarchy_index"],
+                        payload["hierarchy_count"],
+                    )
             elif event == "navigation_invalidated":
                 print(f"导航已暂停: {payload}，请重新按 Ctrl+Alt+N。")
                 leave_navigation()
@@ -2827,15 +3032,25 @@ def _run_windows(args: argparse.Namespace) -> int:
             return
         if foreground <= 0:
             return
-        if (
-            worker.hwnd
-            and foreground != worker.hwnd
-            and window_process_id(foreground) != prototype_process_id
-        ):
+        foreground_action = navigation_foreground_action(
+            foreground,
+            worker.hwnd,
+            navigation_root_hwnd,
+            navigation_process_id,
+            prototype_process_id,
+            window_process_id,
+            window_owner,
+        )
+        if foreground_action == "ignore":
+            return
+        if foreground_action == "leave":
             print("导航已暂停: 已切换到其它窗口，请重新按 Ctrl+Alt+N。")
             leave_navigation()
             return
-        worker.post("sync_window")
+        if foreground_action == "follow":
+            worker.post("follow_window", foreground)
+        else:
+            worker.post("sync_window")
 
     geometry_timer = QTimer()
     geometry_timer.timeout.connect(monitor_navigation_context)
@@ -2849,7 +3064,7 @@ def _run_windows(args: argparse.Namespace) -> int:
     print("元素导航键盘原型已启动。")
     print(
         "Ctrl+Alt+N 开始/退出，方向键移动，PageUp/PageDown 切换父子元素，"
-        "Enter 展开/收起或执行，"
+        "Enter 左击（快速两次为双击），菜单键右击，音量键滚动，"
         "Esc 退出，Ctrl+Alt+Q 关闭。"
     )
     return int(app.exec())

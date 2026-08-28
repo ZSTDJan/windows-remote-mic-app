@@ -395,6 +395,125 @@ class SpatialNavigationTests(unittest.TestCase):
         self.assertEqual(prototype.native_handle_value(None), 0)
         self.assertEqual(prototype.native_handle_value(1234), 1234)
 
+    def test_keyboard_navigation_maps_mouse_like_remote_actions(self):
+        expected = {
+            prototype.VK_RETURN: "activate",
+            prototype.VK_APPS: "context",
+            prototype.VK_VOLUME_UP: "scroll_up",
+            prototype.VK_VOLUME_DOWN: "scroll_down",
+            prototype.VK_ESCAPE: "cancel",
+        }
+        self.assertEqual(
+            {
+                vk: prototype.keyboard_navigation_action(vk)
+                for vk in expected
+            },
+            expected,
+        )
+        self.assertIsNone(prototype.keyboard_navigation_action(0x70))
+
+    def test_native_menu_temporarily_receives_navigation_keys(self):
+        for vk in (
+            prototype.VK_UP,
+            prototype.VK_DOWN,
+            prototype.VK_LEFT,
+            prototype.VK_RIGHT,
+            prototype.VK_RETURN,
+            prototype.VK_ESCAPE,
+        ):
+            self.assertTrue(prototype.should_pass_through_native_menu(vk, True))
+            self.assertFalse(prototype.should_pass_through_native_menu(vk, False))
+        self.assertFalse(
+            prototype.should_pass_through_native_menu(
+                prototype.VK_VOLUME_UP, True
+            )
+        )
+
+    def test_content_refresh_only_follows_context_or_double_click(self):
+        self.assertEqual(prototype.content_refresh_delay_ms("contexted"), 120)
+        self.assertEqual(
+            prototype.content_refresh_delay_ms("activated", True), 180
+        )
+        self.assertEqual(
+            prototype.content_refresh_delay_ms("activated", False), 0
+        )
+
+    def test_negative_wheel_delta_is_encoded_as_a_windows_dword(self):
+        self.assertEqual(prototype.mouse_wheel_data(120), 120)
+        self.assertEqual(prototype.mouse_wheel_data(-120), 0xFFFFFF88)
+
+    def test_pointer_point_requires_a_verified_uia_hit(self):
+        target = self.target(100, 200, 180, 240, "button")
+        self.assertEqual(
+            prototype.target_pointer_point(target, (112, 220), False),
+            (112, 220),
+        )
+        self.assertIsNone(prototype.target_pointer_point(target, None, False))
+        self.assertEqual(
+            prototype.target_pointer_point(target, None, True),
+            (140, 220),
+        )
+
+    def test_owner_chain_follows_a_nested_popup_without_looping(self):
+        owners = {30: 20, 20: 10, 10: 0, 40: 40}
+        owner_of = lambda hwnd: owners.get(hwnd, 0)
+        self.assertTrue(prototype.owner_chain_contains(30, 10, owner_of))
+        self.assertFalse(prototype.owner_chain_contains(10, 30, owner_of))
+        self.assertFalse(prototype.owner_chain_contains(40, 10, owner_of))
+
+    def test_foreground_context_follows_same_process_popup(self):
+        process_ids = {10: 100, 20: 100, 90: 900}
+        action = prototype.navigation_foreground_action(
+            20,
+            10,
+            10,
+            100,
+            900,
+            process_ids.get,
+            lambda _hwnd: 0,
+        )
+        self.assertEqual(action, "follow")
+
+    def test_foreground_context_follows_owned_cross_process_dialog(self):
+        process_ids = {10: 100, 20: 200, 90: 900}
+        owners = {20: 10}
+        action = prototype.navigation_foreground_action(
+            20,
+            10,
+            10,
+            100,
+            900,
+            process_ids.get,
+            lambda hwnd: owners.get(hwnd, 0),
+        )
+        self.assertEqual(action, "follow")
+
+    def test_foreground_context_returns_from_owned_dialog_to_root(self):
+        process_ids = {10: 100, 20: 200, 90: 900}
+        owners = {20: 10}
+        action = prototype.navigation_foreground_action(
+            10,
+            20,
+            10,
+            100,
+            900,
+            process_ids.get,
+            lambda hwnd: owners.get(hwnd, 0),
+        )
+        self.assertEqual(action, "follow")
+
+    def test_foreground_context_ignores_overlay_and_leaves_unrelated_app(self):
+        process_ids = {10: 100, 30: 300, 90: 900}
+        common = (10, 10, 100, 900, process_ids.get, lambda _hwnd: 0)
+        self.assertEqual(
+            prototype.navigation_foreground_action(90, *common),
+            "ignore",
+        )
+        self.assertEqual(
+            prototype.navigation_foreground_action(30, *common),
+            "leave",
+        )
+
     def test_prewarm_runs_once_after_the_foreground_is_stable(self):
         self.assertFalse(
             prototype.prewarm_request_due(7, 7, 10.0, 0, 10.5)
@@ -410,28 +529,6 @@ class SpatialNavigationTests(unittest.TestCase):
         self.assertTrue(prototype.scan_should_stop(None, lambda: True, now=1.0))
         self.assertTrue(prototype.scan_should_stop(1.0, None, now=1.0))
         self.assertFalse(prototype.scan_should_stop(2.0, None, now=1.0))
-
-    def test_branch_refresh_waits_for_one_stable_observation(self):
-        observed, stable = prototype.branch_refresh_progress(
-            2, 2, 5, True, False
-        )
-        self.assertTrue(observed)
-        self.assertFalse(stable)
-        observed, stable = prototype.branch_refresh_progress(
-            2, 5, 5, True, observed
-        )
-        self.assertTrue(stable)
-
-    def test_collapsed_branch_waits_for_one_stable_observation(self):
-        observed, stable = prototype.branch_refresh_progress(
-            5, 5, 2, False, False
-        )
-        self.assertTrue(observed)
-        self.assertFalse(stable)
-        observed, stable = prototype.branch_refresh_progress(
-            5, 2, 2, False, observed
-        )
-        self.assertTrue(stable)
 
     def test_target_probe_points_cover_sparse_left_content(self):
         rect = prototype.Rect(40, 100, 540, 150)
@@ -707,14 +804,6 @@ class SpatialNavigationTests(unittest.TestCase):
             prototype.semantic_action_can_bypass_point_hit(compact_text_action)
         )
 
-    def test_branch_path_only_matches_descendants(self):
-        branch = (0, 2, 4)
-        self.assertTrue(prototype.path_is_in_branch((0, 2, 4, 0), branch))
-        self.assertTrue(prototype.path_is_in_branch((0, 2, 4, 1, 3), branch))
-        self.assertFalse(prototype.path_is_in_branch(branch, branch))
-        self.assertFalse(prototype.path_is_in_branch((0, 2, 5, 0), branch))
-        self.assertFalse(prototype.path_is_in_branch((0, 2), branch))
-
     def test_same_rectangle_prefers_deeper_real_action(self):
         wrapper = prototype.TargetSnapshot(
             prototype.Rect(40, 40, 240, 90),
@@ -772,16 +861,6 @@ class SpatialNavigationTests(unittest.TestCase):
             300, 20, 380, 60, "outside", path=(1,), has_action_pattern=True
         )
         targets = [folder, first, second, outside]
-        groups = prototype.discover_group_scopes(
-            targets,
-            {
-                (0,): "ListItemControl",
-                (0, 0, 0): "ButtonControl",
-                (0, 0, 1): "ListControl",
-                (1,): "ButtonControl",
-            },
-        )
-        self.assertEqual(groups, {(0, 0): 0})
         self.assertEqual(
             prototype.flat_target_indices(targets), [0, 1, 2, 3]
         )
@@ -804,35 +883,8 @@ class SpatialNavigationTests(unittest.TestCase):
         folder = self.target(
             20, 70, 220, 110, "folder", path=(0, 1, 0), has_action_pattern=True
         )
-        groups = prototype.discover_group_scopes(
-            [section, folder],
-            {(0, 0): "ButtonControl", (0, 1): "ListControl"},
-        )
-        self.assertEqual(groups, {})
         self.assertEqual(
             prototype.flat_target_indices([section, folder]), [0, 1]
-        )
-
-    def test_small_options_button_does_not_claim_neighboring_list(self):
-        options = self.target(
-            220,
-            20,
-            255,
-            55,
-            "options",
-            path=(0, 0),
-            supports_expand=True,
-            has_action_pattern=True,
-        )
-        row = self.target(
-            20, 70, 260, 110, "conversation", path=(0, 1, 0), has_action_pattern=True
-        )
-        self.assertEqual(
-            prototype.discover_group_scopes(
-                [options, row],
-                {(0, 0): "ButtonControl", (0, 1): "ListControl"},
-            ),
-            {},
         )
 
     def test_restore_target_uses_name_and_type_after_layout_moves(self):
