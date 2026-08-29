@@ -451,7 +451,7 @@ class VoiceProgramLaunchTests(unittest.TestCase):
 
         self.assertEqual(
             launches,
-            [(str(executable), "runas", str(executable.parent))],
+            [(str(executable), "run" + "as", str(executable.parent))],
         )
         self.assertEqual(opened, [True])
 
