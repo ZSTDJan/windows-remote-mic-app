@@ -509,6 +509,61 @@ class SettingsControllerTests(unittest.TestCase):
                 controller._refresh_voice_program_status()
             self.assertEqual(controller.voiceProgramElevationStatus, expected)
 
+    def test_voice_program_status_refresh_runs_in_a_worker_thread(self):
+        controller, _ = self._make_controller()
+        caller_thread = threading.get_ident()
+        worker_threads = []
+        completed = threading.Event()
+
+        def payload(settings):
+            worker_threads.append(threading.get_ident())
+            completed.set()
+            return "后台结果", "running", "standard"
+
+        with mock.patch.object(
+            controller, "_voice_program_status_payload", side_effect=payload
+        ):
+            controller._request_voice_program_status_refresh()
+            self.assertTrue(completed.wait(2.0))
+
+        self.assertEqual(len(worker_threads), 1)
+        self.assertNotEqual(worker_threads[0], caller_thread)
+
+    def test_voice_program_status_refresh_coalesces_repeated_requests(self):
+        controller, _ = self._make_controller()
+        controller._voice_program_status_refresh_running = True
+
+        with mock.patch.object(controller, "_schedule_voice_program_status_refresh") as schedule:
+            controller._request_voice_program_status_refresh()
+            controller._request_voice_program_status_refresh()
+            self.assertTrue(controller._voice_program_status_refresh_pending)
+            controller._on_voice_program_status_refresh_ready(
+                (
+                    dict(controller._voice_program_settings),
+                    ("后台结果", "running", "standard"),
+                )
+            )
+
+        self.assertFalse(controller._voice_program_status_refresh_pending)
+        self.assertEqual(controller.voiceProgramStatusText, "后台结果")
+        schedule.assert_called_once_with()
+
+    def test_stale_voice_program_status_result_is_discarded_and_refreshed(self):
+        controller, _ = self._make_controller()
+        old_settings = dict(controller._voice_program_settings)
+        controller._voice_program_settings = voice_program_manager.normalize_voice_program_settings(
+            {"provider": "sogou"}
+        )
+
+        with mock.patch.object(controller, "_schedule_voice_program_status_refresh") as schedule:
+            controller._voice_program_status_refresh_running = True
+            controller._on_voice_program_status_refresh_ready(
+                (old_settings, ("旧结果", "running", "standard"))
+            )
+
+        self.assertNotEqual(controller.voiceProgramStatusText, "旧结果")
+        schedule.assert_called_once_with()
+
     def test_selecting_a_voice_program_enables_bridge_autostart_automatically(self):
         controller, _ = self._make_controller()
 
@@ -4768,7 +4823,7 @@ class SettingsShellSourceContractTests(unittest.TestCase):
         self.assertEqual(self.buttons_qml.count("DialogCloseButton {"), 2)
         self.assertEqual(self.voice_qml.count("DialogCloseButton {"), 1)
 
-    def test_tooltips_are_compact_and_only_owned_by_explanatory_titles(self):
+    def test_tooltips_are_compact_and_follow_each_truncated_text(self):
         self.assertIn("ToolTip {", self.compact_tooltip_qml)
         self.assertIn("delay: 450", self.compact_tooltip_qml)
         self.assertIn("font.pixelSize: root.tokens.fontSizeTiny", self.compact_tooltip_qml)
@@ -4792,8 +4847,19 @@ class SettingsShellSourceContractTests(unittest.TestCase):
             self.diagnostic_result_row_qml,
         ):
             self.assertIn("HoverHandler { id: titleHover }", row_qml)
-            self.assertIn("CompactToolTip {", row_qml)
+            self.assertGreaterEqual(row_qml.count("CompactToolTip {"), 2)
+            self.assertIn("titleHover.hovered && titleLabel.truncated", row_qml)
             self.assertNotIn("ToolTip.visible", row_qml)
+        self.assertIn("descriptionHover.hovered && descriptionLabel.truncated", self.inline_settings_row_qml)
+        self.assertIn("descriptionHover.hovered && descriptionLabel.truncated", self.settings_list_row_qml)
+        self.assertIn("detailHover.hovered && detailLabel.truncated", self.diagnostic_result_row_qml)
+        self.assertIn("globalStatusHover.hovered", self.main_qml)
+        self.assertIn("globalStatusText.truncated", self.main_qml)
+
+    def test_icon_glyph_has_windows_10_font_fallback(self):
+        self.assertIn('Qt.fontFamilies().indexOf("Segoe Fluent Icons")', self.icon_glyph_qml)
+        self.assertIn('Qt.fontFamilies().indexOf("Segoe MDL2 Assets")', self.icon_glyph_qml)
+        self.assertIn("font.family: iconFontFamily", self.icon_glyph_qml)
 
     def test_device_page_shows_real_service_state_and_start_progress(self):
         self.assertIn("SettingsController.bridgeLaunchBusy", self.device_qml)

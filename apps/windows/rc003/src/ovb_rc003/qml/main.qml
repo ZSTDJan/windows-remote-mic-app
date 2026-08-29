@@ -207,6 +207,14 @@ ApplicationWindow {
                     verticalAlignment: Text.AlignVCenter
                     elide: Text.ElideRight
                     Accessible.name: text
+                    HoverHandler { id: globalStatusHover }
+                    CompactToolTip {
+                        tokens: window.tokens
+                        active: globalStatusHover.hovered
+                            && globalStatusText.truncated
+                        text: globalStatusText.text
+                        maximumTextWidth: 420
+                    }
                 }
             }
         }

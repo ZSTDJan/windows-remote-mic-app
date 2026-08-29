@@ -434,10 +434,21 @@ def inspect_voice_program(
     wetype_shortcut_iter: Optional[Callable[[], Iterable[Path]]] = None,
     shortcut_resolver: Optional[Callable[[Path], Optional[Path]]] = None,
 ) -> VoiceProgramStatus:
+    normalized = normalize_voice_program_settings(settings)
+    provider_id = str(normalized["provider"])
+    current_platform = sys.platform if platform is None else platform
+    processes: Optional[list[ProcessInfo]] = None
+    resolve_process_iter = process_iter
+    if (
+        current_platform == "win32"
+        and provider_id in {VOICE_PROGRAM_SOGOU, VOICE_PROGRAM_WETYPE}
+    ):
+        processes = list((process_iter or _iter_windows_processes)())
+        resolve_process_iter = lambda: processes or []
     resolved = resolve_voice_program(
-        settings,
-        platform=platform,
-        process_iter=process_iter,
+        normalized,
+        platform=current_platform,
+        process_iter=resolve_process_iter,
         run_value_reader=run_value_reader,
         wetype_install_value_reader=wetype_install_value_reader,
         wetype_shortcut_iter=wetype_shortcut_iter,
@@ -474,7 +485,8 @@ def inspect_voice_program(
             "not_found",
         )
 
-    processes = list((process_iter or _iter_windows_processes)())
+    if processes is None:
+        processes = list((process_iter or _iter_windows_processes)())
     matches = _matching_processes(resolved, processes)
     elevated = _combined_elevation(matches)
     return VoiceProgramStatus(

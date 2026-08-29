@@ -34,8 +34,8 @@ RowLayout {
         HoverHandler { id: titleHover }
         CompactToolTip {
             tokens: root.tokens
-            active: titleHover.hovered && detailLabel.truncated
-            text: detailLabel.text
+            active: titleHover.hovered && titleLabel.truncated
+            text: root.titleText
         }
     }
 
@@ -48,5 +48,11 @@ RowLayout {
         elide: Text.ElideRight
         wrapMode: Text.NoWrap
         text: root.statusText + "：" + root.detailText
+        HoverHandler { id: detailHover }
+        CompactToolTip {
+            tokens: root.tokens
+            active: detailHover.hovered && detailLabel.truncated
+            text: detailLabel.text
+        }
     }
 }

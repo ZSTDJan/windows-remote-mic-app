@@ -62,8 +62,8 @@ Rectangle {
                 HoverHandler { id: titleHover }
                 CompactToolTip {
                     tokens: root.tokens
-                    active: titleHover.hovered && descriptionLabel.truncated
-                    text: root.descriptionText
+                    active: titleHover.hovered && titleLabel.truncated
+                    text: root.titleText
                 }
             }
             UiLabel {
@@ -79,6 +79,12 @@ Rectangle {
                 maximumLineCount: 1
                 elide: Text.ElideRight
                 wrapMode: Text.NoWrap
+                HoverHandler { id: descriptionHover }
+                CompactToolTip {
+                    tokens: root.tokens
+                    active: descriptionHover.hovered && descriptionLabel.truncated
+                    text: root.descriptionText
+                }
             }
         }
 

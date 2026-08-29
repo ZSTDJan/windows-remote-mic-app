@@ -46,6 +46,36 @@ class VoiceProgramSettingsTests(unittest.TestCase):
             },
         )
 
+    def test_inspection_reuses_one_process_snapshot_for_sogou(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            executable = Path(tmp) / "sogou_voice_assistant.exe"
+            executable.touch()
+            calls = []
+
+            def process_iter():
+                calls.append(True)
+                return (manager.ProcessInfo(12, executable.name, executable, False),)
+
+            status = manager.inspect_voice_program(
+                {"provider": "sogou"},
+                platform="win32",
+                process_iter=process_iter,
+            )
+
+        self.assertEqual(len(calls), 1)
+        self.assertTrue(status.running)
+        self.assertEqual(status.executable, executable)
+
+    def test_unsupported_inspection_does_not_enumerate_windows_processes(self):
+        status = manager.inspect_voice_program(
+            {"provider": "sogou"},
+            platform="linux",
+            process_iter=lambda: self.fail("must not enumerate Windows processes"),
+        )
+
+        self.assertFalse(status.available)
+        self.assertEqual(status.code, "not_found")
+
     def test_disabled_management_keeps_only_the_elevation_preference(self):
         self.assertEqual(
             manager.normalize_voice_program_settings(

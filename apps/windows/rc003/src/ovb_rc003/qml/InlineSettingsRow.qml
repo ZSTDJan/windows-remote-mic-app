@@ -44,8 +44,8 @@ Rectangle {
             HoverHandler { id: titleHover }
             CompactToolTip {
                 tokens: root.tokens
-                active: titleHover.hovered && descriptionLabel.truncated
-                text: root.descriptionText
+                active: titleHover.hovered && titleLabel.truncated
+                text: root.titleText
             }
         }
 
@@ -74,6 +74,12 @@ Rectangle {
             Layout.minimumWidth: 0
             text: root.descriptionText
             elide: Text.ElideRight
+            HoverHandler { id: descriptionHover }
+            CompactToolTip {
+                tokens: root.tokens
+                active: descriptionHover.hovered && descriptionLabel.truncated
+                text: root.descriptionText
+            }
         }
 
         Item {

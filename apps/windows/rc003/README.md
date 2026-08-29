@@ -39,11 +39,13 @@ DJI Mic 2 不再出现在当前设备选择和自动诊断中；既有设备档�
 
 ### 界面截图
 
-![连接设置页](../../../docs/screenshots/settings-connection.png)
+![设备页](../../../docs/screenshots/settings-connection.png)
 
 ![按键映射页](../../../docs/screenshots/settings-buttons.png)
 
-> 截图在 Windows 11 + RC003 实测环境拍摄；如与你的系统主题/分辨率不同属正常差异。
+![语音页](../../../docs/screenshots/settings-voice.png)
+
+> 截图由 Windows 11 上的当前源码界面生成；状态文字、系统主题和分辨率会随实际环境变化。
 
 ### 系统要求
 

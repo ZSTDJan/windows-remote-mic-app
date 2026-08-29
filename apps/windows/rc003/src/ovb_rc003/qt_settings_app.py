@@ -823,6 +823,7 @@ def _load_qt_classes() -> dict:
         hotkeyCaptured = Signal(str)
         hotkeyCaptureError = Signal(str)
         _hotkeyCaptureResult = Signal(str)
+        _voiceProgramStatusRefreshReady = Signal(object)
 
         _TRIGGER_MODE_ORDER = (key_mapping.VoiceTriggerMode.HOLD,)
         _DEVICE_ORDER = (device_catalog.RC003_ID,)
@@ -879,6 +880,11 @@ def _load_qt_classes() -> dict:
             self._voice_program_status_text = ""
             self._voice_program_status_code = "unknown"
             self._voice_program_elevation_status = "unknown"
+            self._voice_program_status_refresh_running = False
+            self._voice_program_status_refresh_pending = False
+            self._voiceProgramStatusRefreshReady.connect(
+                self._on_voice_program_status_refresh_ready
+            )
             self._voice_hotkey_busy = False
             try:
                 self._bridge_running = single_instance.bridge_instance_running()
@@ -1404,10 +1410,12 @@ def _load_qt_classes() -> dict:
                 self._key_detection_text = text
                 self.keyDetectionTextChanged.emit()
 
-        def _refresh_voice_program_status(self) -> None:
+        def _voice_program_status_payload(
+            self, settings: dict
+        ) -> tuple[str, str, str]:
             try:
                 status = voice_program_manager.inspect_voice_program(
-                    self._voice_program_settings
+                    settings
                 )
                 text = voice_program_manager.status_text(status)
                 code = status.code
@@ -1422,6 +1430,12 @@ def _load_qt_classes() -> dict:
                 text = "无法读取语音程序状态"
                 code = "unknown"
                 elevation_status = "unknown"
+            return text, code, elevation_status
+
+        def _apply_voice_program_status_payload(
+            self, payload: tuple[str, str, str]
+        ) -> None:
+            text, code, elevation_status = payload
             if elevation_status != self._voice_program_elevation_status:
                 self._voice_program_elevation_status = elevation_status
                 self.voiceProgramElevationStatusChanged.emit()
@@ -1431,6 +1445,58 @@ def _load_qt_classes() -> dict:
             if code != self._voice_program_status_code:
                 self._voice_program_status_code = code
                 self.voiceProgramStatusCodeChanged.emit()
+
+        def _refresh_voice_program_status(self) -> None:
+            self._apply_voice_program_status_payload(
+                self._voice_program_status_payload(
+                    dict(self._voice_program_settings)
+                )
+            )
+
+        def _request_voice_program_status_refresh(self) -> None:
+            if self._voice_program_status_refresh_running:
+                self._voice_program_status_refresh_pending = True
+                return
+
+            settings_snapshot = dict(self._voice_program_settings)
+            self._voice_program_status_refresh_running = True
+
+            def run() -> None:
+                payload = self._voice_program_status_payload(settings_snapshot)
+                try:
+                    self._voiceProgramStatusRefreshReady.emit(
+                        (settings_snapshot, payload)
+                    )
+                except RuntimeError:
+                    pass
+
+            thread = threading.Thread(
+                target=run,
+                name="voice-program-status-refresh",
+                daemon=True,
+            )
+            try:
+                thread.start()
+            except Exception:
+                self._voice_program_status_refresh_running = False
+                self._apply_voice_program_status_payload(
+                    ("无法读取语音程序状态", "unknown", "unknown")
+                )
+
+        def _on_voice_program_status_refresh_ready(self, result: object) -> None:
+            self._voice_program_status_refresh_running = False
+            settings_snapshot, payload = result
+            stale = settings_snapshot != self._voice_program_settings
+            if not stale:
+                self._apply_voice_program_status_payload(payload)
+
+            refresh_again = self._voice_program_status_refresh_pending or stale
+            self._voice_program_status_refresh_pending = False
+            if refresh_again:
+                self._schedule_voice_program_status_refresh()
+
+        def _schedule_voice_program_status_refresh(self) -> None:
+            QTimer.singleShot(0, self._request_voice_program_status_refresh)
 
         def _replace_voice_program_settings(self, raw: object) -> None:
             previous = dict(self._voice_program_settings)
@@ -2518,7 +2584,7 @@ def _load_qt_classes() -> dict:
 
         @Slot()
         def refreshVoiceProgramStatus(self) -> None:
-            self._refresh_voice_program_status()
+            self._request_voice_program_status_refresh()
 
         @Slot()
         def refreshVoiceHotkeyFromProvider(self) -> None:
