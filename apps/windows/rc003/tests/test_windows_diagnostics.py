@@ -568,35 +568,6 @@ class OutputEndpointResolutionCheckTests(unittest.TestCase):
         self.assertNotIn("private endpoint detail", result.detail)
 
 
-class DjiMic2InputCheckTests(unittest.TestCase):
-    def test_present_recording_endpoint_passes(self):
-        result = diag.check_dji_mic_2_input(
-            list_recording=lambda: [
-                audio_output.AudioEndpoint(
-                    name="DJI-MIC2-ABCDEF Hands-Free", host_api="Windows WASAPI"
-                )
-            ]
-        )
-        self.assertEqual(result.status, diag.CheckStatus.PASS)
-        self.assertEqual(result.group, diag.CheckGroup.EXTERNAL_MICROPHONE)
-        self.assertNotIn("ABCDEF", result.detail)
-
-    def test_pairing_without_recording_endpoint_fails(self):
-        result = diag.check_dji_mic_2_input(
-            list_recording=lambda: [audio_output.AudioEndpoint(name="Microphone Array")]
-        )
-        self.assertEqual(result.status, diag.CheckStatus.FAIL)
-        self.assertIn("已连接", result.detail)
-
-    def test_enumeration_failure_is_unsupported_without_exception_detail(self):
-        def _raise():
-            raise audio_output.AudioOutputUnavailableError("secret endpoint")
-
-        result = diag.check_dji_mic_2_input(list_recording=_raise)
-        self.assertEqual(result.status, diag.CheckStatus.UNSUPPORTED)
-        self.assertNotIn("secret endpoint", result.detail)
-
-
 class DictationCheckTests(unittest.TestCase):
     def test_always_manual_never_fabricates_a_verdict(self):
         result = diag.check_dictation_manual()

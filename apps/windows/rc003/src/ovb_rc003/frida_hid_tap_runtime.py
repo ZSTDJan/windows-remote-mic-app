@@ -8,7 +8,6 @@ preparation and the small Gadget script; button policy stays in the app.
 
 from __future__ import annotations
 
-from functools import lru_cache
 import hashlib
 import json
 import lzma
@@ -182,15 +181,6 @@ def sha256_file(path: Path) -> str:
 
 def gadget_archive_path() -> Path:
     return Path(__file__).resolve().with_name("frida_assets") / GADGET_ARCHIVE_NAME
-
-
-@lru_cache(maxsize=1)
-def gadget_archive_available() -> bool:
-    archive = gadget_archive_path()
-    try:
-        return archive.is_file() and sha256_file(archive) == GADGET_ARCHIVE_SHA256
-    except OSError:
-        return False
 
 
 def secure_runtime_directory() -> Path:

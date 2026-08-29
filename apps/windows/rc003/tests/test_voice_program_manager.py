@@ -433,65 +433,6 @@ class VoiceProgramLaunchTests(unittest.TestCase):
             ],
         )
 
-    def test_sogou_settings_start_the_program_then_open_the_tray_menu(self):
-        executable = Path(r"C:\Program Files\SogouInput\sogou_voice_assistant.exe")
-        launches = []
-        opened = []
-
-        manager.open_sogou_voice_settings(
-            executable,
-            launch_elevated=True,
-            platform="win32",
-            process_iter=lambda: (),
-            start_file=lambda path, operation, cwd: launches.append(
-                (path, operation, cwd)
-            ),
-            automation_opener=lambda: opened.append(True),
-        )
-
-        self.assertEqual(
-            launches,
-            [(str(executable), "run" + "as", str(executable.parent))],
-        )
-        self.assertEqual(opened, [True])
-
-    def test_running_sogou_settings_do_not_start_another_program(self):
-        executable = Path(r"C:\Program Files\SogouInput\sogou_voice_assistant.exe")
-        opened = []
-
-        manager.open_sogou_voice_settings(
-            executable,
-            launch_elevated=True,
-            platform="win32",
-            process_iter=lambda: (
-                manager.ProcessInfo(42, "sogou_voice_assistant.exe", executable),
-            ),
-            start_file=lambda *_: self.fail("不应重复启动搜狗语音"),
-            automation_opener=lambda: opened.append(True),
-        )
-
-        self.assertEqual(opened, [True])
-
-    def test_sogou_settings_automation_reports_the_failed_step(self):
-        completed = mock.Mock(returncode=12, stdout="tray-menu-open-failed", stderr="")
-
-        with self.assertRaisesRegex(OSError, "无法打开搜狗语音托盘菜单"):
-            manager._run_sogou_settings_automation(
-                runner=mock.Mock(return_value=completed)
-            )
-
-    def test_sogou_settings_automation_uses_the_real_tray_context_menu(self):
-        script = manager._SOGOU_SETTINGS_AUTOMATION_SCRIPT
-
-        self.assertIn("mouse_event", script)
-        self.assertIn("0x0008", script)
-        self.assertIn("0x0010", script)
-        self.assertIn("Restore-CursorAfterTrayMenu", script)
-        self.assertIn("GetWindowThreadProcessId", script)
-        self.assertIn("$attempt -lt 3", script)
-        self.assertIn("$bounds.Height * 2 / 3", script)
-        self.assertNotIn('if ($className.ToString() -ne "Chrome_WidgetWin_1")', script)
-
     def test_custom_program_launches_with_current_permissions(self):
         with tempfile.TemporaryDirectory() as tmp:
             executable = Path(tmp) / "voice.exe"

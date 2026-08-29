@@ -461,13 +461,6 @@ def _real_keybd_event(vk: int, key_up: bool) -> None:
     user32.keybd_event(vk, scan_code, flags, VOICE_EVENT_EXTRA_INFO)
 
 
-def reset_voice_backend() -> None:
-    """Forget the selected voice transport so a later call can re-probe it."""
-
-    global _voice_backend
-    _voice_backend = None
-
-
 def voice_backend_name() -> str:
     """Return the transport selected for the current voice session."""
 

@@ -816,7 +816,6 @@ def _load_qt_classes() -> dict:
         voiceProgramStatusCodeChanged = Signal()
         voiceProgramElevationStatusChanged = Signal()
         voiceHotkeyBusyChanged = Signal()
-        djiMicStatusTextChanged = Signal()
         keyDetectionActiveChanged = Signal()
         keyDetectionTextChanged = Signal()
         _rawKeyDetected = Signal(str, str)
@@ -962,7 +961,6 @@ def _load_qt_classes() -> dict:
                 selected_device_id = device_catalog.RC003_ID
             self._selected_device_fallback_id = selected_device_id
             self._selected_device_index = self._DEVICE_ORDER.index(selected_device_id)
-            self._dji_mic_status_text = ""
             self._key_detection_listener = None
             self._key_detection_tap = None
             self._key_detection_bridge_request = None
@@ -981,8 +979,6 @@ def _load_qt_classes() -> dict:
             self._selected_endpoint_index = -1
             self._refresh_endpoint_options()
             self._refresh_voice_program_status()
-            if self._selected_device_id() == device_catalog.DJI_MIC_2_ID:
-                self._refresh_dji_mic_status()
             self._load_bindings_into_model()
             self._model.mappingEdited.connect(self._mark_settings_dirty)
             self._model.set_selected_button(self._selected_button_id)
@@ -1192,14 +1188,6 @@ def _load_qt_classes() -> dict:
             if 0 <= self._selected_device_index < len(self._DEVICE_ORDER):
                 return self._DEVICE_ORDER[self._selected_device_index]
             return self._selected_device_fallback_id
-
-        def _refresh_dji_mic_status(self) -> None:
-            try:
-                endpoints = audio_output.enumerate_input_endpoints()
-            except audio_output.AudioOutputUnavailableError:
-                endpoints = []
-            self._dji_mic_status_text = device_catalog.dji_mic_2_input_status(endpoints)
-            self.djiMicStatusTextChanged.emit()
 
         def _set_launch_status(self, text: str) -> None:
             if text == self._launch_status_text:
@@ -1901,17 +1889,11 @@ def _load_qt_classes() -> dict:
             self._load_bindings_into_model()
             self._set_settings_dirty(False)
             self._set_error_message("")
-            if self._selected_device_id() == device_catalog.DJI_MIC_2_ID:
-                self._set_status_message(
-                    "已保存 DJI Mic 2 设备选择。它使用 Windows 系统录音输入，不需要启动 RC003 桥。",
-                    self._BUTTONS_PAGE_INDEX,
-                )
-            else:
-                self._set_status_message(
-                    "已保存。按键映射和语音触发将在下一次按键时应用；"
-                    "连接/输出设置需重启桥接。",
-                    self._BUTTONS_PAGE_INDEX,
-                )
+            self._set_status_message(
+                "已保存。按键映射和语音触发将在下一次按键时应用；"
+                "连接/输出设置需重启桥接。",
+                self._BUTTONS_PAGE_INDEX,
+            )
             return True
 
         # -- properties ---------------------------------------------------
@@ -2034,6 +2016,45 @@ def _load_qt_classes() -> dict:
             int,
             _get_selected_voice_program_index,
             _set_selected_voice_program_index,
+            notify=selectedVoiceProgramIndexChanged,
+        )
+
+        def _selected_voice_program_is(self, provider_id: str) -> bool:
+            return self._voice_program_settings.get("provider") == provider_id
+
+        voiceProgramManaged = Property(
+            bool,
+            lambda self: not self._selected_voice_program_is(
+                voice_program_manager.VOICE_PROGRAM_NONE
+            ),
+            notify=selectedVoiceProgramIndexChanged,
+        )
+        voiceProgramSogouSelected = Property(
+            bool,
+            lambda self: self._selected_voice_program_is(
+                voice_program_manager.VOICE_PROGRAM_SOGOU
+            ),
+            notify=selectedVoiceProgramIndexChanged,
+        )
+        voiceProgramWeTypeSelected = Property(
+            bool,
+            lambda self: self._selected_voice_program_is(
+                voice_program_manager.VOICE_PROGRAM_WETYPE
+            ),
+            notify=selectedVoiceProgramIndexChanged,
+        )
+        voiceProgramWindowsDictationSelected = Property(
+            bool,
+            lambda self: self._selected_voice_program_is(
+                voice_program_manager.VOICE_PROGRAM_WINDOWS_DICTATION
+            ),
+            notify=selectedVoiceProgramIndexChanged,
+        )
+        voiceProgramCustomSelected = Property(
+            bool,
+            lambda self: self._selected_voice_program_is(
+                voice_program_manager.VOICE_PROGRAM_CUSTOM
+            ),
             notify=selectedVoiceProgramIndexChanged,
         )
 
@@ -2329,8 +2350,6 @@ def _load_qt_classes() -> dict:
             self.selectedDeviceIndexChanged.emit()
             self.selectedDeviceChanged.emit()
             self._mark_settings_dirty()
-            if self._selected_device_id() == device_catalog.DJI_MIC_2_ID:
-                self._refresh_dji_mic_status()
 
         selectedDeviceIndex = Property(
             int,
@@ -2344,11 +2363,6 @@ def _load_qt_classes() -> dict:
 
         isRc003Device = Property(bool, _get_is_rc003_device, notify=selectedDeviceChanged)
 
-        def _get_is_dji_mic_2_device(self) -> bool:
-            return self._selected_device_id() == device_catalog.DJI_MIC_2_ID
-
-        isDjiMic2Device = Property(bool, _get_is_dji_mic_2_device, notify=selectedDeviceChanged)
-
         def _get_selected_device_description(self) -> str:
             if device_catalog.CATALOG_ERROR is not None:
                 return self._get_device_catalog_error_text()
@@ -2358,17 +2372,7 @@ def _load_qt_classes() -> dict:
             str, _get_selected_device_description, notify=selectedDeviceChanged
         )
 
-        def _get_mapping_page_title(self) -> str:
-            return "按键映射" if self._get_is_rc003_device() else "设备控制"
-
-        mappingPageTitle = Property(str, _get_mapping_page_title, notify=selectedDeviceChanged)
-
-        def _get_dji_mic_status_text(self) -> str:
-            return self._dji_mic_status_text
-
-        djiMicStatusText = Property(
-            str, _get_dji_mic_status_text, notify=djiMicStatusTextChanged
-        )
+        mappingPageTitle = Property(str, lambda self: "按键映射", constant=True)
 
         def _get_key_detection_active(self) -> bool:
             return self._key_detection_active
@@ -2387,18 +2391,6 @@ def _load_qt_classes() -> dict:
             _get_key_detection_text,
             notify=keyDetectionTextChanged,
         )
-
-        def _get_dji_control_rows(self) -> List[dict]:
-            return [
-                {
-                    "name": control.display_name,
-                    "behavior": control.hardware_behavior,
-                    "mapping": control.windows_mapping,
-                }
-                for control in device_catalog.DJI_MIC_2_CONTROLS
-            ]
-
-        djiControlRows = Property(list, _get_dji_control_rows, constant=True)
 
         def _get_primary_action_options(self) -> List[str]:
             return list(_ORDINARY_PRIMARY_ACTION_OPTIONS)
@@ -2868,12 +2860,6 @@ def _load_qt_classes() -> dict:
                 self._set_bridge_launch_phase("failed")
                 self._set_launch_status("保存未完成，未启动桥接。")
                 return
-            if self._selected_device_id() == device_catalog.DJI_MIC_2_ID:
-                self._set_bridge_launch_phase("idle")
-                self._set_launch_status(
-                    "DJI Mic 2 使用 Windows 系统录音输入，不启动 RC003 BLE/HID/ATVV 桥。"
-                )
-                return
             self._start_bridge_process()
 
         def _start_bridge_process(self) -> None:
@@ -3170,10 +3156,6 @@ def _load_qt_classes() -> dict:
             )
 
         @Slot()
-        def refreshDjiMicStatus(self) -> None:
-            self._refresh_dji_mic_status()
-
-        @Slot()
         def openAppsSettings(self) -> None:
             self._report_external_target(
                 shell_targets.open_external_target(shell_targets.APPS_SETTINGS_URI),
@@ -3307,9 +3289,6 @@ def _load_qt_classes() -> dict:
                 self._invalidate_vb_cable_test_result
             )
             self._settings_controller.selectedEndpointIndexChanged.connect(
-                self._invalidate_vb_cable_test_result
-            )
-            self._settings_controller.selectedDeviceChanged.connect(
                 self._invalidate_vb_cable_test_result
             )
             self._settings_controller.bridgeConnectedChanged.connect(

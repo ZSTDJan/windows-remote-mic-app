@@ -273,38 +273,6 @@ def action_allows_repeat(action: "ButtonAction") -> bool:
     return action.kind in REPEATABLE_ACTIONS
 
 
-def voice_trigger_mode_for_hotkey(hotkey_text: str) -> Optional[VoiceTriggerMode]:
-    """Recognize current and historical built-in voice shortcuts.
-
-    ``ralt`` is the current hold-to-talk preset. The old Ctrl+Win chord remains
-    recognizable as a historical HOLD value. ``ralt+space`` is recognized
-    only so schema-1 TOGGLE settings can be identified and failed closed
-    instead of silently becoming hold-to-talk. Users may press keys in either
-    order, so comparison uses normalized token sets.
-    """
-
-    tokens = frozenset(
-        token.strip().lower()
-        for token in str(hotkey_text).split("+")
-        if token.strip()
-    )
-    default_hold_tokens = frozenset(DEFAULT_HOLD_VOICE_HOTKEY.split("+"))
-    if tokens in {
-        default_hold_tokens,
-        frozenset({LEGACY_HOLD_VOICE_HOTKEY}),
-    }:
-        return VoiceTriggerMode.HOLD
-    if tokens == frozenset(LEGACY_TOGGLE_VOICE_HOTKEY.split("+")):
-        return VoiceTriggerMode.TOGGLE
-    if (
-        len(tokens) == 2
-        and "lctrl" in tokens
-        and bool(tokens & {"win", "lwin", "rwin"})
-    ):
-        return VoiceTriggerMode.HOLD
-    return None
-
-
 def voice_hotkey_for_trigger_mode(trigger_mode: VoiceTriggerMode) -> str:
     """Return the host shortcut paired with a voice trigger mode."""
 

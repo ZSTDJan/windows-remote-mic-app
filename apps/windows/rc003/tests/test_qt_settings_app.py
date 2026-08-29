@@ -1248,7 +1248,6 @@ class SettingsControllerTests(unittest.TestCase):
             controller._DEVICE_ORDER.index(device_catalog.RC003_ID),
         )
         self.assertTrue(controller.isRc003Device)
-        self.assertFalse(controller.isDjiMic2Device)
         self.assertEqual(controller.mappingPageTitle, "按键映射")
 
     def test_legacy_dji_selection_falls_back_to_rc003_without_rewriting_on_open(self):
@@ -1264,31 +1263,10 @@ class SettingsControllerTests(unittest.TestCase):
             [device_catalog.profile_for(device_catalog.RC003_ID).display_name],
         )
         self.assertTrue(controller.isRc003Device)
-        self.assertFalse(controller.isDjiMic2Device)
         self.assertEqual(
             config.load_config(path)["selected_device_profile"],
             device_catalog.DJI_MIC_2_ID,
         )
-
-    def test_dji_control_rows_match_the_truthful_device_catalog(self):
-        controller, _ = self._make_controller()
-        self.assertEqual(
-            [row["name"] for row in controller.djiControlRows],
-            ["录音键", "连接键", "电源键"],
-        )
-        self.assertTrue(all("映射" in row["mapping"] for row in controller.djiControlRows))
-
-    def test_dji_save_and_launch_never_starts_the_rc003_bridge(self):
-        controller, _ = self._make_controller()
-        controller._selected_device_index = -1
-        controller._selected_device_fallback_id = device_catalog.DJI_MIC_2_ID
-        with mock.patch.object(bridge_launcher, "start_bridge_launch") as fake_launch:
-            controller.saveAndLaunch()
-            self.assertEqual(controller.bridgeLaunchPhase, "saving")
-            self._continue_save_and_launch(controller)
-        fake_launch.assert_not_called()
-        self.assertEqual(controller.bridgeLaunchPhase, "idle")
-        self.assertIn("不启动 RC003", controller.launchStatusText)
 
     def test_save_settings_persists_and_clears_error_message(self):
         controller, model = self._make_controller()
@@ -5056,8 +5034,15 @@ class ThreePageSettingsSourceContractTests(unittest.TestCase):
         self.assertIn('objectName: "voiceProgramCustomPathRow"', self.voice_qml)
         self.assertIn('objectName: "useWindowsDictationHotkeyButton"', self.voice_qml)
         self.assertIn('objectName: "openVoiceProgramSettingsButton"', self.voice_qml)
-        self.assertIn("SettingsController.selectedVoiceProgramIndex === 3", self.voice_qml)
-        self.assertIn("SettingsController.selectedVoiceProgramIndex === 4", self.voice_qml)
+        self.assertIn(
+            "SettingsController.voiceProgramWindowsDictationSelected",
+            self.voice_qml,
+        )
+        self.assertIn(
+            "SettingsController.voiceProgramCustomSelected",
+            self.voice_qml,
+        )
+        self.assertNotIn("selectedVoiceProgramIndex ===", self.voice_qml)
         self.assertIn(
             "SettingsController.refreshVoiceHotkeyFromProvider()", self.voice_qml
         )

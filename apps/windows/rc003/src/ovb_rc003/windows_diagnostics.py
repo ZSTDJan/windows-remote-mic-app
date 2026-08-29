@@ -1549,48 +1549,6 @@ def check_vb_cable_loopback_isolated(
     return result
 
 
-def check_dji_mic_2_input(
-    *,
-    list_recording: Callable[
-        [], Sequence[audio_output.AudioEndpoint]
-    ] = audio_output.enumerate_input_endpoints,
-) -> CheckResult:
-    """A paired Bluetooth device is not sufficient evidence. PASS only when
-    PortAudio can see a usable DJI Mic 2 recording endpoint right now.
-    """
-
-    try:
-        recording = list(list_recording())
-    except audio_output.AudioOutputUnavailableError:
-        return CheckResult(
-            "dji_mic_2_input",
-            "DJI Mic 2 录音输入",
-            CheckGroup.EXTERNAL_MICROPHONE,
-            CheckStatus.UNSUPPORTED,
-            "无法检测 Windows 录音端点",
-        )
-    matches = [e for e in recording if audio_output.is_dji_mic_2_input_endpoint(e.name)]
-    if not matches:
-        return CheckResult(
-            "dji_mic_2_input",
-            "DJI Mic 2 录音输入",
-            CheckGroup.EXTERNAL_MICROPHONE,
-            CheckStatus.FAIL,
-            "未找到 DJI Mic 2 录音端点；请确认发射器已开机并已连接",
-        )
-    host_apis = {e.host_api for e in matches if e.host_api}
-    detail = "已找到 DJI Mic 2 录音端点"
-    if host_apis:
-        detail += f"（{len(host_apis)} 个音频接口）"
-    return CheckResult(
-        "dji_mic_2_input",
-        "DJI Mic 2 录音输入",
-        CheckGroup.EXTERNAL_MICROPHONE,
-        CheckStatus.PASS,
-        detail + "；未更改默认麦克风",
-    )
-
-
 # -- Output endpoint resolution (voice bridge) ------------------------------
 
 

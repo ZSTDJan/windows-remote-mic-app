@@ -15,15 +15,17 @@ Item {
         Math.max(130, endpointCombo.width / 2)
 
     readonly property bool voiceProgramManaged:
-        SettingsController.selectedVoiceProgramIndex !== 0
+        SettingsController.voiceProgramManaged
     readonly property bool voiceProgramSystemManaged:
         SettingsController.voiceProgramSystemManaged
     readonly property bool windowsDictationSelected:
-        SettingsController.selectedVoiceProgramIndex === 3
+        SettingsController.voiceProgramWindowsDictationSelected
     readonly property bool sogouSelected:
-        SettingsController.selectedVoiceProgramIndex === 1
+        SettingsController.voiceProgramSogouSelected
+    readonly property bool wetypeSelected:
+        SettingsController.voiceProgramWeTypeSelected
     readonly property bool customProgramSelected:
-        SettingsController.selectedVoiceProgramIndex === 4
+        SettingsController.voiceProgramCustomSelected
     readonly property bool voiceHotkeyBusy: SettingsController.voiceHotkeyBusy
     readonly property bool voiceProgramPrivilegeUnknown:
         !voiceProgramSystemManaged
@@ -143,12 +145,11 @@ Item {
     }
 
     function voiceHotkeyDescription() {
-        const selected = SettingsController.selectedVoiceProgramIndex
-        if (selected === 1)
+        if (sogouSelected)
             return qsTr("自动读取并同步搜狗当前的按住说快捷键")
-        if (selected === 2)
+        if (wetypeSelected)
             return qsTr("按程序记忆；请在微信输入法设置中保持一致")
-        if (selected === 3)
+        if (windowsDictationSelected)
             return qsTr("Windows 语音输入固定使用 Win+H")
         return qsTr("仅在 Remote Mic 中按程序记忆")
     }
@@ -638,13 +639,13 @@ Item {
                     ]
                     CompactButton {
                         objectName: "openVoiceProgramSettingsButton"
-                        visible: SettingsController.selectedVoiceProgramIndex === 2
-                            || SettingsController.selectedVoiceProgramIndex === 3
-                            || (SettingsController.selectedVoiceProgramIndex === 1
+                        visible: root.wetypeSelected
+                            || root.windowsDictationSelected
+                            || (root.sogouSelected
                                 && SettingsController.voiceProgramStatusCode === "not_found")
                         tokens: root.tokens
                         Layout.fillWidth: true
-                        text: SettingsController.selectedVoiceProgramIndex === 1
+                        text: root.sogouSelected
                             && SettingsController.voiceProgramStatusCode === "not_found"
                             ? qsTr("去安装") : qsTr("打开设置")
                         enabled: !root.voiceHotkeyBusy

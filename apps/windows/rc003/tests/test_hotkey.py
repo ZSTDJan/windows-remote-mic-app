@@ -41,24 +41,6 @@ class HotkeySpecTests(unittest.TestCase):
         self.assertEqual(spec.key, "win")
         self.assertEqual(spec.serialize(), "lctrl+win")
 
-    def test_recorded_voice_chords_infer_their_required_trigger_mode(self):
-        self.assertEqual(
-            key_mapping.voice_trigger_mode_for_hotkey("ralt"),
-            key_mapping.VoiceTriggerMode.HOLD,
-        )
-        self.assertEqual(
-            key_mapping.voice_trigger_mode_for_hotkey("lctrl+lwin"),
-            key_mapping.VoiceTriggerMode.HOLD,
-        )
-        self.assertEqual(
-            key_mapping.voice_trigger_mode_for_hotkey("space+ralt"),
-            key_mapping.VoiceTriggerMode.TOGGLE,
-        )
-        self.assertIsNone(
-            key_mapping.voice_trigger_mode_for_hotkey("f8+alt+ctrl")
-        )
-        self.assertIsNone(key_mapping.voice_trigger_mode_for_hotkey("win+h"))
-
     def test_duplicate_modifiers_are_normalized(self):
         self.assertEqual(hotkey.HotkeySpec.parse("ctrl+ctrl+shift+p").serialize(), "ctrl+shift+p")
 
