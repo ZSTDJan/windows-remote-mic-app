@@ -1410,6 +1410,168 @@ class SpatialNavigationTests(unittest.TestCase):
             )
         )
 
+    def test_orthogonal_step_requires_a_real_turn_to_the_candidate(self):
+        targets = [
+            self.target(400, 400, 440, 440, "current"),
+            self.target(100, 100, 140, 140, "upper left"),
+            self.target(300, 400, 340, 440, "left dead end"),
+        ]
+        graph = prototype.NavigationGraph(targets)
+        graph._contacts = {
+            (0, prototype.Direction.UP): (
+                prototype.NavigationContact(1, 0, 40),
+            ),
+            (0, prototype.Direction.LEFT): (
+                prototype.NavigationContact(2, 0, 40),
+            ),
+            (2, prototype.Direction.RIGHT): (
+                prototype.NavigationContact(0, 0, 40),
+            ),
+        }
+
+        self.assertFalse(
+            graph.requires_orthogonal_grid_step(
+                0,
+                prototype.Direction.UP,
+                graph.anchor_rects[0],
+                1,
+            )
+        )
+
+    def test_navigation_thresholds_scale_with_the_layout(self):
+        base_current = prototype.Rect(400, 400, 440, 440)
+        base_target = prototype.Rect(300, 300, 340, 340)
+        base_rects = [base_current, base_target, prototype.Rect(0, 0, 40, 40)]
+        base_unit = prototype.navigation_scale_unit(base_rects)
+        base_tolerance = prototype._navigation_lane_tolerance(
+            base_current,
+            base_target,
+            prototype.Direction.UP,
+            base_unit,
+        )
+
+        for factor in (0.5, 1.5, 2.0):
+            def scaled(rect):
+                return prototype.Rect(
+                    round(rect.left * factor),
+                    round(rect.top * factor),
+                    round(rect.right * factor),
+                    round(rect.bottom * factor),
+                )
+
+            scaled_rects = [scaled(rect) for rect in base_rects]
+            scaled_unit = prototype.navigation_scale_unit(scaled_rects)
+            scaled_tolerance = prototype._navigation_lane_tolerance(
+                scaled_rects[0],
+                scaled_rects[1],
+                prototype.Direction.UP,
+                scaled_unit,
+            )
+            self.assertAlmostEqual(scaled_unit, base_unit * factor)
+            self.assertAlmostEqual(scaled_tolerance, base_tolerance * factor)
+
+    def test_section_boundary_only_assists_parallel_movement(self):
+        left = self.target(
+            100,
+            300,
+            140,
+            340,
+            "left",
+            section_rect=prototype.Rect(0, 0, 300, 800),
+        )
+        right = self.target(
+            500,
+            100,
+            540,
+            140,
+            "right",
+            section_rect=prototype.Rect(300, 0, 800, 800),
+        )
+        top = self.target(
+            100,
+            100,
+            140,
+            140,
+            "top",
+            section_rect=prototype.Rect(0, 0, 800, 300),
+        )
+        bottom = self.target(
+            500,
+            500,
+            540,
+            540,
+            "bottom",
+            section_rect=prototype.Rect(0, 300, 800, 800),
+        )
+
+        self.assertTrue(
+            prototype.navigation_crosses_parallel_section_boundary(
+                left, right, prototype.Direction.UP
+            )
+        )
+        self.assertFalse(
+            prototype.navigation_crosses_parallel_section_boundary(
+                left, right, prototype.Direction.RIGHT
+            )
+        )
+        self.assertTrue(
+            prototype.navigation_crosses_parallel_section_boundary(
+                top, bottom, prototype.Direction.LEFT
+            )
+        )
+        self.assertFalse(
+            prototype.navigation_crosses_parallel_section_boundary(
+                top, bottom, prototype.Direction.DOWN
+            )
+        )
+
+    def test_parallel_section_bonus_prefers_the_same_column(self):
+        left_section = prototype.Rect(0, 0, 300, 800)
+        right_section = prototype.Rect(300, 0, 800, 800)
+        targets = [
+            self.target(
+                280,
+                400,
+                320,
+                440,
+                "current",
+                section_rect=left_section,
+            ),
+            self.target(
+                260,
+                100,
+                300,
+                140,
+                "same column",
+                section_rect=left_section,
+            ),
+            self.target(
+                300,
+                200,
+                340,
+                240,
+                "near other column",
+                section_rect=right_section,
+            ),
+        ]
+        graph = prototype.NavigationGraph(targets)
+        graph._contacts[(0, prototype.Direction.UP)] = (
+            prototype.NavigationContact(2, 0, 40),
+            prototype.NavigationContact(1, 0, 40),
+        )
+        graph._natural.clear()
+
+        self.assertEqual(graph.candidates(0, prototype.Direction.UP)[0], 1)
+
+        graph._contacts[(0, prototype.Direction.UP)] = (
+            prototype.NavigationContact(2, 0, 40),
+        )
+        graph._natural.clear()
+        self.assertEqual(
+            graph.candidates(0, prototype.Direction.UP),
+            (2,),
+        )
+
     def test_codex_bottom_controls_cross_full_width_rows_before_branching(self):
         targets = [
             self.target(996, 786, 1099, 823, "button mouse"),
@@ -1454,6 +1616,61 @@ class SpatialNavigationTests(unittest.TestCase):
         self.assertEqual(move_up_twice(8), (6, 5))
         self.assertEqual(move_up_twice(9), (6, 5))
         self.assertEqual(move_up_twice(10), (6, 5))
+
+    def test_codex_navigation_routes_are_stable_under_uniform_scale(self):
+        coordinates = [
+            (996, 786, 1099, 823, "button mouse"),
+            (1049, 849, 1088, 888, "upper branch"),
+            (1998, 901, 2119, 1022, "attachment"),
+            (2074, 1137, 2113, 1176, "message copy"),
+            (1014, 1199, 1183, 1234, "elapsed"),
+            (1049, 1566, 1088, 1605, "lower branch"),
+            (1032, 1667, 2101, 1733, "input"),
+            (1026, 1739, 1069, 1781, "add"),
+            (1075, 1739, 1210, 1781, "permission"),
+            (1933, 1739, 2065, 1781, "model"),
+            (2064, 1739, 2107, 1781, "stop"),
+        ]
+
+        def routes(factor):
+            targets = [
+                self.target(
+                    round(left * factor),
+                    round(top * factor),
+                    round(right * factor),
+                    round(bottom * factor),
+                    name,
+                )
+                for left, top, right, bottom, name in coordinates
+            ]
+            graph = prototype.NavigationGraph(targets)
+            result = []
+            for index in range(len(targets)):
+                for direction in prototype.Direction:
+                    candidates = graph.candidates(
+                        index,
+                        direction,
+                        graph.anchor_rects[index],
+                    )
+                    first = candidates[0] if candidates else None
+                    result.append(
+                        (
+                            first,
+                            bool(
+                                first is not None
+                                and graph.requires_orthogonal_grid_step(
+                                    index,
+                                    direction,
+                                    graph.anchor_rects[index],
+                                    first,
+                                )
+                            ),
+                        )
+                    )
+            return tuple(result)
+
+        self.assertEqual(routes(0.75), routes(1.0))
+        self.assertEqual(routes(1.25), routes(1.0))
 
     def test_contact_cell_immediate_reverse_returns_to_the_previous_target(self):
         generator = random.Random(830)
@@ -2054,6 +2271,24 @@ class SpatialNavigationTests(unittest.TestCase):
 
         self.assertEqual(corner_contacts, {})
         self.assertEqual(short_edge_contacts, {})
+
+    def test_shared_edge_floor_does_not_consume_a_small_target(self):
+        contacts = prototype.range_occupancy_navigation_contacts(
+            (
+                prototype.Rect(0, 0, 100, 100),
+                prototype.Rect(100, 92, 200, 160),
+            ),
+            (
+                prototype.Rect(20, 60, 60, 100),
+                prototype.Rect(120, 92, 160, 108),
+            ),
+            scale_unit=40,
+        )
+
+        self.assertEqual(
+            contacts[(0, prototype.Direction.RIGHT)][0].target_index,
+            1,
+        )
 
     def test_range_occupancy_grid_build_time_stays_bounded(self):
         generator = random.Random(831)

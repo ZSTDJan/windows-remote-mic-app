@@ -107,7 +107,7 @@ VERTICAL_LANE_MIN_CENTER_TOLERANCE = 16.0
 VERTICAL_LANE_MAX_CENTER_TOLERANCE = 96.0
 VERTICAL_LANE_SIZE_MULTIPLIER = 0.35
 GRID_SAFE_CELL_MAX_CHILDREN = 24
-RECTANGULAR_GRID_MIN_SHARED_EDGE = 10
+RECTANGULAR_GRID_MIN_SHARED_EDGE_UNITS = 0.32
 RECTANGULAR_GRID_SHARED_EDGE_RATIO = 0.18
 RECTANGULAR_GRID_BALANCE_WEIGHT = 0.08
 RECTANGULAR_GRID_DISTANT_GAP_MIN = 2400
@@ -1729,16 +1729,21 @@ def _minimum_navigation_contact(
     first_anchor: Rect,
     second_anchor: Rect,
     direction: Direction,
+    scale_unit: float,
 ) -> int:
     smaller = (
         min(first_anchor.height, second_anchor.height)
         if direction in {Direction.LEFT, Direction.RIGHT}
         else min(first_anchor.width, second_anchor.width)
     )
+    scale_floor = min(
+        max(1, round(scale_unit * RECTANGULAR_GRID_MIN_SHARED_EDGE_UNITS)),
+        max(1, round(smaller * 0.5)),
+    )
     return min(
         max(1, smaller),
         max(
-            RECTANGULAR_GRID_MIN_SHARED_EDGE,
+            scale_floor,
             round(smaller * RECTANGULAR_GRID_SHARED_EDGE_RATIO),
         ),
     )
@@ -1747,7 +1752,10 @@ def _minimum_navigation_contact(
 def range_occupancy_navigation_contacts(
     territories: Sequence[Rect],
     anchor_rects: Sequence[Rect],
+    scale_unit: Optional[float] = None,
 ) -> dict[tuple[int, Direction], tuple[NavigationContact, ...]]:
+    if scale_unit is None:
+        scale_unit = navigation_scale_unit(anchor_rects)
     contacts: dict[tuple[int, Direction], list[NavigationContact]] = defaultdict(list)
     for first_index, first in enumerate(territories):
         for second_index in range(first_index + 1, len(territories)):
@@ -1770,9 +1778,10 @@ def range_occupancy_navigation_contacts(
                         )
                         is not None
                         and end - start >= _minimum_navigation_contact(
-                        anchor_rects[first_index],
-                        anchor_rects[second_index],
-                        first_direction,
+                            anchor_rects[first_index],
+                            anchor_rects[second_index],
+                            first_direction,
+                            scale_unit,
                         )
                     ):
                         contacts[(first_index, first_direction)].append(
@@ -1799,9 +1808,10 @@ def range_occupancy_navigation_contacts(
                         )
                         is not None
                         and end - start >= _minimum_navigation_contact(
-                        anchor_rects[first_index],
-                        anchor_rects[second_index],
-                        first_direction,
+                            anchor_rects[first_index],
+                            anchor_rects[second_index],
+                            first_direction,
+                            scale_unit,
                         )
                     ):
                         contacts[(first_index, first_direction)].append(
@@ -1818,6 +1828,7 @@ def _navigation_contact_rank(
     target_rect: Rect,
     direction: Direction,
     contact: NavigationContact,
+    crosses_parallel_section_boundary: bool = False,
 ) -> tuple[float, ...]:
     if direction in {Direction.LEFT, Direction.RIGHT}:
         active_start, active_end = active_rect.top, active_rect.bottom
@@ -1845,6 +1856,7 @@ def _navigation_contact_rank(
         )
     return (
         float(target_lane_gap > 0),
+        float(crosses_parallel_section_boundary),
         float(target_lane_gap),
         float(lane_gap > 0),
         float(lane_gap),
@@ -1870,6 +1882,7 @@ def _navigation_lane_tolerance(
     current: Rect,
     target: Rect,
     direction: Direction,
+    scale_unit: float,
 ) -> float:
     if direction in {Direction.LEFT, Direction.RIGHT}:
         current_span = current.height
@@ -1877,7 +1890,54 @@ def _navigation_lane_tolerance(
     else:
         current_span = current.width
         target_span = target.width
-    return max(24.0, min(160.0, (current_span + target_span) * 0.75))
+    minimum = max(1.0, scale_unit * 0.75)
+    maximum = max(minimum, scale_unit * 5.0)
+    return max(minimum, min(maximum, (current_span + target_span) * 0.75))
+
+
+def navigation_scale_unit(rects: Sequence[Rect]) -> float:
+    """Return a layout-relative unit for scale-stable navigation thresholds."""
+
+    extents = sorted(
+        min(rect.width, rect.height)
+        for rect in rects
+        if rect.width > 0 and rect.height > 0
+    )
+    if not extents:
+        return 1.0
+    middle = len(extents) // 2
+    if len(extents) % 2:
+        return float(extents[middle])
+    return (float(extents[middle - 1]) + float(extents[middle])) / 2
+
+
+def navigation_crosses_parallel_section_boundary(
+    current: TargetSnapshot,
+    target: TargetSnapshot,
+    direction: Direction,
+) -> bool:
+    """Prefer the same visual band only when moving parallel to its divider."""
+
+    current_section = current.section_rect
+    target_section = target.section_rect
+    if current_section is None or target_section is None:
+        return False
+    if direction in {Direction.UP, Direction.DOWN}:
+        current_start, current_end = current_section.left, current_section.right
+        target_start, target_end = target_section.left, target_section.right
+    else:
+        current_start, current_end = current_section.top, current_section.bottom
+        target_start, target_end = target_section.top, target_section.bottom
+    smaller_span = min(current_end - current_start, target_end - target_start)
+    if smaller_span <= 0:
+        return False
+    overlap = _axis_overlap(
+        current_start,
+        current_end,
+        target_start,
+        target_end,
+    )
+    return overlap < smaller_span * 0.5
 
 
 def _orthogonal_direction_toward(
@@ -2578,11 +2638,14 @@ class NavigationGraph:
         self.anchor_rects = navigation_grid_rects(
             self.targets, self._descendants_by_target
         )
+        self.scale_unit = navigation_scale_unit(self.anchor_rects)
         self.grid_rects = range_occupancy_grid_rects(
             self.targets, self.anchor_rects
         )
         self._contacts = range_occupancy_navigation_contacts(
-            self.grid_rects, self.anchor_rects
+            self.grid_rects,
+            self.anchor_rects,
+            self.scale_unit,
         )
         self._natural: dict[tuple[int, Direction], tuple[int, ...]] = {}
 
@@ -2600,7 +2663,12 @@ class NavigationGraph:
             active_rect,
             candidate,
             direction,
-        ) <= _navigation_lane_tolerance(active_rect, candidate, direction):
+        ) <= _navigation_lane_tolerance(
+            active_rect,
+            candidate,
+            direction,
+            self.scale_unit,
+        ):
             return False
         side_direction = _orthogonal_direction_toward(
             active_rect,
@@ -2609,19 +2677,87 @@ class NavigationGraph:
         )
         if side_direction is None:
             return False
-        for contact in self._contacts.get((current_index, side_direction), ()):
-            side_target = self.anchor_rects[contact.target_index]
-            if _navigation_lane_gap(
-                active_rect,
-                side_target,
-                side_direction,
-            ) <= _navigation_lane_tolerance(
-                active_rect,
-                side_target,
-                side_direction,
+        return self._orthogonal_route_reaches_candidate(
+            current_index,
+            side_direction,
+            direction,
+            candidate_index,
+            active_rect,
+        )
+
+    def _orthogonal_route_reaches_candidate(
+        self,
+        current_index: int,
+        side_direction: Direction,
+        requested_direction: Direction,
+        candidate_index: int,
+        active_rect: Rect,
+    ) -> bool:
+        candidate = self.anchor_rects[candidate_index]
+        pending = deque([(current_index, active_rect)])
+        visited = {current_index}
+        while pending:
+            node_index, node_rect = pending.popleft()
+            for requested_contact in self._contacts.get(
+                (node_index, requested_direction), ()
             ):
-                return True
+                if requested_contact.target_index != candidate_index:
+                    continue
+                if _navigation_lane_gap(
+                    node_rect,
+                    candidate,
+                    requested_direction,
+                ) <= _navigation_lane_tolerance(
+                    node_rect,
+                    candidate,
+                    requested_direction,
+                    self.scale_unit,
+                ):
+                    return node_index != current_index
+
+            node_distance = (
+                abs(candidate.center_x - node_rect.center_x)
+                if side_direction in {Direction.LEFT, Direction.RIGHT}
+                else abs(candidate.center_y - node_rect.center_y)
+            )
+            for contact in self._contacts.get((node_index, side_direction), ()):
+                side_index = contact.target_index
+                if side_index in visited:
+                    continue
+                side_target = self.anchor_rects[side_index]
+                if _navigation_lane_gap(
+                    node_rect,
+                    side_target,
+                    side_direction,
+                ) > _navigation_lane_tolerance(
+                    node_rect,
+                    side_target,
+                    side_direction,
+                    self.scale_unit,
+                ):
+                    continue
+                side_distance = (
+                    abs(candidate.center_x - side_target.center_x)
+                    if side_direction in {Direction.LEFT, Direction.RIGHT}
+                    else abs(candidate.center_y - side_target.center_y)
+                )
+                if side_distance >= node_distance:
+                    continue
+                visited.add(side_index)
+                pending.append((side_index, side_target))
         return False
+
+    def _crosses_parallel_section_boundary(
+        self,
+        current_index: int,
+        target_index: int,
+        direction: Direction,
+    ) -> bool:
+        return navigation_crosses_parallel_section_boundary(
+            self.targets[current_index],
+            self.targets[target_index],
+            direction,
+        )
 
     def natural_candidates(
         self,
@@ -2647,6 +2783,11 @@ class NavigationGraph:
                         self.anchor_rects[contact.target_index],
                         direction,
                         contact,
+                        self._crosses_parallel_section_boundary(
+                            current_index,
+                            contact.target_index,
+                            direction,
+                        ),
                     ),
                 )
             )
@@ -2657,12 +2798,17 @@ class NavigationGraph:
                 contact.target_index
                 for contact in sorted(
                 contacts,
-                key=lambda contact: _navigation_contact_rank(
-                    active_rect,
-                    self.anchor_rects[contact.target_index],
-                    direction,
-                    contact,
-                ),
+                    key=lambda contact: _navigation_contact_rank(
+                        active_rect,
+                        self.anchor_rects[contact.target_index],
+                        direction,
+                        contact,
+                        self._crosses_parallel_section_boundary(
+                            current_index,
+                            contact.target_index,
+                            direction,
+                        ),
+                    ),
                 )
             )
             self._natural[key] = natural
