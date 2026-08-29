@@ -118,92 +118,6 @@ class SpatialNavigationTests(unittest.TestCase):
             [2, 1],
         )
 
-    def test_vertical_soft_lane_reaches_nearby_offset_actions_before_far_column(self):
-        targets = [
-            self.target(440, 1460, 540, 1510, "1"),
-            self.target(480, 10, 530, 60, "2"),
-            self.target(1360, 1219, 1428, 1287, "继续"),
-            self.target(1360, 1149, 1428, 1217, "然后"),
-            self.target(1360, 1079, 1428, 1147, "概述"),
-        ]
-        graph = prototype.NavigationGraph(targets)
-
-        self.assertEqual(graph.candidates(0, prototype.Direction.UP)[0], 2)
-        self.assertEqual(graph.candidates(2, prototype.Direction.UP)[0], 3)
-        self.assertEqual(graph.candidates(3, prototype.Direction.UP)[0], 4)
-        self.assertEqual(graph.candidates(4, prototype.Direction.UP)[0], 1)
-
-    def test_vertical_soft_lane_keeps_a_nearby_same_column_target(self):
-        targets = [
-            self.target(0, 500, 40, 540, "current"),
-            self.target(0, 350, 40, 390, "same column"),
-            self.target(200, 450, 240, 490, "near diagonal"),
-        ]
-
-        self.assertEqual(
-            prototype.next_target_index(targets, 0, prototype.Direction.UP),
-            1,
-        )
-
-    def test_vertical_soft_lane_rejects_an_extremely_distant_side_target(self):
-        targets = [
-            self.target(0, 1000, 40, 1040, "current"),
-            self.target(0, 0, 40, 40, "far same column"),
-            self.target(4000, 800, 4040, 840, "extreme side target"),
-        ]
-
-        self.assertEqual(
-            prototype.next_target_index(targets, 0, prototype.Direction.UP),
-            1,
-        )
-
-    def test_vertical_soft_lane_does_not_intercept_parent_child_actions(self):
-        targets = [
-            self.target(0, 500, 40, 540, "current", path=(0, 1)),
-            self.target(0, 0, 40, 40, "far same column", path=(0, 2)),
-            self.target(200, 450, 240, 490, "child", path=(0, 1, 0)),
-        ]
-
-        self.assertEqual(
-            prototype.next_target_index(targets, 0, prototype.Direction.UP),
-            1,
-        )
-
-    def test_vertical_soft_lane_is_symmetric_when_moving_down(self):
-        targets = [
-            self.target(440, 10, 540, 60, "top"),
-            self.target(480, 1460, 530, 1510, "far same column"),
-            self.target(1360, 233, 1428, 301, "near action"),
-        ]
-
-        self.assertEqual(
-            prototype.next_target_index(targets, 0, prototype.Direction.DOWN),
-            2,
-        )
-
-    def test_bottom_attachment_moves_up_to_nearest_input_before_distant_actions(self):
-        targets = [
-            self.target(90, 1095, 135, 1140, "添加文件", path=(0, 2, 9)),
-            self.target(80, 1005, 820, 1085, "输入框", path=(0, 2, 8)),
-            self.target(82, 625, 122, 665, "复制", path=(0, 2, 7, 0)),
-            self.target(125, 625, 165, 665, "分叉", path=(0, 2, 7, 1)),
-            self.target(80, 20, 820, 65, "顶部路径", path=(0, 2, 0)),
-        ]
-        graph = prototype.NavigationGraph(targets)
-
-        self.assertEqual(graph.candidates(0, prototype.Direction.UP)[0], 1)
-
-    def test_top_sidebar_button_moves_down_to_nearest_row_not_bottom_action(self):
-        targets = [
-            self.target(95, 35, 122, 65, "侧栏按钮", path=(0, 1, 0)),
-            self.target(138, 145, 450, 190, "第一行", path=(0, 1, 1)),
-            self.target(138, 200, 450, 245, "第二行", path=(0, 1, 2)),
-            self.target(138, 1450, 484, 1500, "底部动作", path=(0, 1, 30)),
-        ]
-        graph = prototype.NavigationGraph(targets)
-
-        self.assertEqual(graph.candidates(0, prototype.Direction.DOWN)[0], 1)
-
     def test_horizontal_route_uses_an_intermediate_cell_only_in_the_same_row(self):
         targets = [
             self.target(100, 100, 160, 140, "current"),
@@ -423,7 +337,7 @@ class SpatialNavigationTests(unittest.TestCase):
             0,
         )
 
-    def test_irregular_cell_uses_one_bridge_and_keeps_the_reverse_column(self):
+    def test_irregular_cell_does_not_rewire_the_nearest_column(self):
         targets = [
             self.target(0, 0, 40, 40, "A"),
             self.target(200, 0, 240, 40, "B"),
@@ -433,74 +347,10 @@ class SpatialNavigationTests(unittest.TestCase):
         ]
         graph = prototype.NavigationGraph(targets)
 
-        self.assertEqual(graph.candidates(1, prototype.Direction.DOWN)[:2], (2, 4))
+        self.assertEqual(graph.candidates(1, prototype.Direction.DOWN)[:2], (4, 2))
         self.assertEqual(graph.candidates(2, prototype.Direction.DOWN)[0], 4)
         self.assertEqual(graph.candidates(4, prototype.Direction.UP)[:2], (1, 2))
         self.assertEqual(graph.candidates(2, prototype.Direction.UP)[0], 1)
-
-    def test_irregular_layout_connects_without_forcing_a_repair(self):
-        targets = [
-            self.target(617, 211, 684, 273, "0"),
-            self.target(668, 490, 700, 512, "1"),
-            self.target(57, 73, 176, 94, "2"),
-            self.target(34, 451, 66, 509, "3"),
-            self.target(167, 360, 247, 388, "4"),
-        ]
-        graph = prototype.NavigationGraph(targets)
-
-        self.assertEqual(graph._repairs, {})
-        self.assertEqual(
-            prototype.preferred_navigation_components(
-                len(targets), graph._preferred
-            ),
-            (tuple(range(len(targets))),),
-        )
-
-    def test_connectivity_repair_reaches_an_isolated_irregular_cell(self):
-        rects = [
-            (428, 158, 530, 234),
-            (720, 43, 824, 79),
-            (141, 83, 217, 105),
-            (386, 215, 513, 283),
-            (730, 333, 830, 405),
-            (260, 325, 293, 363),
-            (289, 402, 315, 437),
-            (308, 259, 366, 301),
-            (629, 423, 675, 497),
-            (50, 453, 86, 527),
-            (638, 186, 760, 239),
-            (463, 422, 498, 443),
-        ]
-        branches = [0, 2, 2, 1, 2, 3, 2, 3, 3, 0, 3, 0]
-        targets = [
-            self.target(*rect, str(index), path=(0, branches[index], index))
-            for index, rect in enumerate(rects)
-        ]
-        graph = prototype.NavigationGraph(targets)
-
-        self.assertEqual(len(graph._repairs), 1)
-        self.assertEqual(
-            prototype.preferred_navigation_components(
-                len(targets), graph._preferred
-            ),
-            (tuple(range(len(targets))),),
-        )
-        for (source, direction), target in graph._repairs.items():
-            score = prototype.direction_score(
-                graph.grid_rects[source],
-                graph.grid_rects[target],
-                direction,
-            )
-            self.assertIsNotNone(score)
-            assert score is not None
-            self.assertTrue(
-                prototype._direction_candidate_is_reasonable(
-                    graph.grid_rects[source],
-                    graph.grid_rects[target],
-                    direction,
-                    score,
-                )
-            )
 
     def test_overlapping_candidates_use_forward_center_distance(self):
         targets = [
@@ -526,31 +376,6 @@ class SpatialNavigationTests(unittest.TestCase):
             prototype.next_target_index(targets, 0, prototype.Direction.RIGHT),
             0,
         )
-
-    def test_bottom_send_does_not_jump_right_across_the_whole_window(self):
-        targets = [
-            self.target(205, 1600, 250, 1645, "发送", path=(0, 2, 9)),
-            self.target(205, 1350, 265, 1400, "继续", path=(0, 2, 8, 2)),
-            self.target(205, 1280, 265, 1330, "然后", path=(0, 2, 8, 1)),
-            self.target(205, 1210, 265, 1260, "概述", path=(0, 2, 8, 0)),
-            self.target(370, 85, 410, 125, "右上按钮", path=(0, 2, 0)),
-            self.target(300, 85, 340, 125, "顶部列表", path=(0, 2, 0, 0)),
-        ]
-        graph = prototype.NavigationGraph(targets)
-
-        self.assertEqual(graph.candidates(0, prototype.Direction.RIGHT), ())
-        self.assertEqual(graph.candidates(0, prototype.Direction.UP)[0], 1)
-        self.assertEqual(graph.candidates(3, prototype.Direction.UP)[0], 5)
-        diagnostic = prototype.build_navigation_diagnostic(
-            targets,
-            0,
-            prototype.Direction.RIGHT,
-            ranked_indices=(),
-            available_indices=(),
-        )
-        self.assertIsNotNone(diagnostic)
-        assert diagnostic is not None
-        self.assertIn("偏离方向过远", prototype.format_navigation_diagnostic(diagnostic))
 
     def test_left_stops_at_the_start_of_a_grid_row(self):
         targets = [
@@ -1550,33 +1375,6 @@ class SpatialNavigationTests(unittest.TestCase):
                     reachable.update(graph.candidates(current, direction))
             self.assertEqual(reachable, set(range(len(targets))))
 
-    def test_random_irregular_grids_have_no_first_choice_islands(self):
-        generator = random.Random(20260829)
-        for _case in range(200):
-            targets = []
-            for index in range(generator.randint(2, 35)):
-                left = generator.randint(0, 1600)
-                top = generator.randint(0, 900)
-                width = generator.randint(24, 260)
-                height = generator.randint(20, 100)
-                targets.append(
-                    self.target(
-                        left,
-                        top,
-                        left + width,
-                        top + height,
-                        str(index),
-                        path=(0, generator.randint(0, 5), index),
-                    )
-                )
-            graph = prototype.NavigationGraph(targets)
-            self.assertEqual(
-                prototype.preferred_navigation_components(
-                    len(targets), graph._preferred
-                ),
-                (tuple(range(len(targets))),),
-            )
-
     def test_fast_primary_grid_neighbor_matches_full_ranking(self):
         generator = random.Random(829)
         for _case in range(40):
@@ -1662,7 +1460,6 @@ class SpatialNavigationTests(unittest.TestCase):
             for column in range(3)
         ]
         graph = prototype.NavigationGraph(targets)
-        self.assertEqual(graph._repairs, {})
         visited = {4}
         pending = [4]
         while pending:
@@ -1774,17 +1571,6 @@ class SpatialNavigationTests(unittest.TestCase):
         tracker.watch(300, 99)
         self.assertIsNone(tracker.state(100, 42))
 
-    def test_related_overlay_changes_dirty_the_root_navigation_scene(self):
-        tracker = prototype.DirtyWindowTracker(lambda: 12.0)
-        tracker.watch(100, 42, ((200, 77),))
-
-        self.assertTrue(tracker.mark(200, 77))
-        self.assertEqual(
-            tracker.state(100, 42), prototype.DirtyWindowState(1, 12.0)
-        )
-        tracker.watch(100, 42, ())
-        self.assertFalse(tracker.mark(200, 77))
-
     def test_suspicious_moves_only_request_a_later_refresh(self):
         window = prototype.Rect(0, 0, 1600, 900)
         current = prototype.Rect(600, 400, 660, 440)
@@ -1873,7 +1659,6 @@ class SpatialNavigationTests(unittest.TestCase):
         self.assertTrue(prototype.dynamic_refresh_fallback_due(30.0, False))
 
     def test_follow_window_scan_uses_a_short_cooperative_budget(self):
-        self.assertEqual(prototype.ACTIVE_SCAN_BUDGET_SECONDS, 4.0)
         self.assertGreater(prototype.FOLLOW_WINDOW_SCAN_BUDGET_SECONDS, 0.0)
         self.assertLessEqual(prototype.FOLLOW_WINDOW_SCAN_BUDGET_SECONDS, 0.2)
         self.assertEqual(
@@ -2028,66 +1813,6 @@ class SpatialNavigationTests(unittest.TestCase):
                 if keyword.arg is not None
             },
         )
-        refresh_keywords = {
-            keyword.arg: keyword.value
-            for keyword in refresh_enumerations[0].keywords
-            if keyword.arg is not None
-        }
-        self.assertIn("deadline", refresh_keywords)
-        self.assertIsInstance(refresh_keywords.get("allow_partial"), ast.Constant)
-        self.assertTrue(refresh_keywords["allow_partial"].value)
-
-        scan_function = worker_functions["_scan"]
-        scan_enumerations = [
-            call
-            for call in ast.walk(scan_function)
-            if isinstance(call, ast.Call)
-            and isinstance(call.func, ast.Attribute)
-            and call.func.attr == "_enumerate"
-        ]
-        self.assertEqual(len(scan_enumerations), 1)
-        scan_keywords = {
-            keyword.arg: keyword.value
-            for keyword in scan_enumerations[0].keywords
-            if keyword.arg is not None
-        }
-        self.assertIn("deadline", scan_keywords)
-        self.assertIsInstance(scan_keywords.get("allow_partial"), ast.Constant)
-        self.assertTrue(scan_keywords["allow_partial"].value)
-
-        activate_function = worker_functions["_activate"]
-        self.assertTrue(
-            any(
-                isinstance(call, ast.Call)
-                and isinstance(call.func, ast.Name)
-                and call.func.id == "semantic_action_can_bypass_point_hit"
-                for call in ast.walk(activate_function)
-            )
-        )
-
-        runtime_target = next(
-            node
-            for node in ast.walk(tree)
-            if isinstance(node, ast.ClassDef)
-            and node.name == "RuntimeTarget"
-        )
-        runtime_fields = {
-            node.target.id
-            for node in runtime_target.body
-            if isinstance(node, ast.AnnAssign)
-            and isinstance(node.target, ast.Name)
-        }
-        self.assertTrue({"owner_hwnd", "owner_rect"} <= runtime_fields)
-
-        enumerate_window = functions["enumerate_window_targets"]
-        owner_assignments = {
-            target.attr
-            for assignment in ast.walk(enumerate_window)
-            if isinstance(assignment, ast.Assign)
-            for target in assignment.targets
-            if isinstance(target, ast.Attribute)
-        }
-        self.assertTrue({"owner_hwnd", "owner_rect"} <= owner_assignments)
 
         handle_function = functions["handle_keyboard_action"]
         self.assertTrue(
@@ -2147,15 +1872,14 @@ class SpatialNavigationTests(unittest.TestCase):
             )
         )
 
-    def test_pointer_actions_schedule_a_settled_content_refresh(self):
+    def test_content_refresh_only_follows_context_or_double_click(self):
         self.assertEqual(prototype.content_refresh_delay_ms("contexted"), 120)
         self.assertEqual(
             prototype.content_refresh_delay_ms("activated", True), 180
         )
         self.assertEqual(
-            prototype.content_refresh_delay_ms("activated", False), 120
+            prototype.content_refresh_delay_ms("activated", False), 0
         )
-        self.assertEqual(prototype.content_refresh_delay_ms("scrolled"), 180)
 
     def test_negative_wheel_delta_is_encoded_as_a_windows_dword(self):
         self.assertEqual(prototype.mouse_wheel_data(120), 120)
@@ -2676,62 +2400,15 @@ class SpatialNavigationTests(unittest.TestCase):
         )
         self.assertEqual(action, "sync")
 
-    def test_prewarm_waits_for_foreground_stability(self):
+    def test_prewarm_runs_once_after_the_foreground_is_stable(self):
         self.assertFalse(
-            prototype.prewarm_request_due(7, 7, 10.0, 0, 10.2)
+            prototype.prewarm_request_due(7, 7, 10.0, 0, 10.5)
         )
         self.assertTrue(
-            prototype.prewarm_request_due(7, 7, 10.0, 0, 10.4)
+            prototype.prewarm_request_due(7, 7, 10.0, 0, 10.8)
         )
         self.assertFalse(
             prototype.prewarm_request_due(7, 7, 10.0, 7, 30.0)
-        )
-
-    def test_prewarm_rearms_after_cache_expiry_and_retry_cooldown(self):
-        self.assertFalse(
-            prototype.prewarm_request_due(
-                7,
-                7,
-                10.0,
-                7,
-                13.0,
-                requested_at=10.0,
-                cache_needs_refresh=True,
-            )
-        )
-        self.assertTrue(
-            prototype.prewarm_request_due(
-                7,
-                7,
-                10.0,
-                7,
-                15.1,
-                requested_at=10.0,
-                cache_needs_refresh=True,
-            )
-        )
-
-    def test_prewarm_cache_refresh_waits_for_dynamic_content_to_settle(self):
-        common = (7, 7, True, 10.0)
-        self.assertFalse(
-            prototype.prewarm_cache_refresh_ready(*common, 20.0)
-        )
-        self.assertTrue(
-            prototype.prewarm_cache_refresh_ready(*common, 25.1)
-        )
-        self.assertFalse(
-            prototype.prewarm_cache_refresh_ready(
-                *common,
-                20.0,
-                dirty_changed_at=19.8,
-            )
-        )
-        self.assertTrue(
-            prototype.prewarm_cache_refresh_ready(
-                *common,
-                20.0,
-                dirty_changed_at=19.5,
-            )
         )
 
     def test_scan_budget_can_be_cancelled_or_expire(self):
