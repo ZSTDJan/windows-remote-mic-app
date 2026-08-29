@@ -181,6 +181,29 @@ class SpatialNavigationTests(unittest.TestCase):
             2,
         )
 
+    def test_bottom_attachment_moves_up_to_nearest_input_before_distant_actions(self):
+        targets = [
+            self.target(90, 1095, 135, 1140, "添加文件", path=(0, 2, 9)),
+            self.target(80, 1005, 820, 1085, "输入框", path=(0, 2, 8)),
+            self.target(82, 625, 122, 665, "复制", path=(0, 2, 7, 0)),
+            self.target(125, 625, 165, 665, "分叉", path=(0, 2, 7, 1)),
+            self.target(80, 20, 820, 65, "顶部路径", path=(0, 2, 0)),
+        ]
+        graph = prototype.NavigationGraph(targets)
+
+        self.assertEqual(graph.candidates(0, prototype.Direction.UP)[0], 1)
+
+    def test_top_sidebar_button_moves_down_to_nearest_row_not_bottom_action(self):
+        targets = [
+            self.target(95, 35, 122, 65, "侧栏按钮", path=(0, 1, 0)),
+            self.target(138, 145, 450, 190, "第一行", path=(0, 1, 1)),
+            self.target(138, 200, 450, 245, "第二行", path=(0, 1, 2)),
+            self.target(138, 1450, 484, 1500, "底部动作", path=(0, 1, 30)),
+        ]
+        graph = prototype.NavigationGraph(targets)
+
+        self.assertEqual(graph.candidates(0, prototype.Direction.DOWN)[0], 1)
+
     def test_horizontal_route_uses_an_intermediate_cell_only_in_the_same_row(self):
         targets = [
             self.target(100, 100, 160, 140, "current"),
@@ -415,13 +438,43 @@ class SpatialNavigationTests(unittest.TestCase):
         self.assertEqual(graph.candidates(4, prototype.Direction.UP)[:2], (1, 2))
         self.assertEqual(graph.candidates(2, prototype.Direction.UP)[0], 1)
 
-    def test_connectivity_repair_reaches_an_isolated_irregular_cell(self):
+    def test_irregular_layout_connects_without_forcing_a_repair(self):
         targets = [
             self.target(617, 211, 684, 273, "0"),
             self.target(668, 490, 700, 512, "1"),
             self.target(57, 73, 176, 94, "2"),
             self.target(34, 451, 66, 509, "3"),
             self.target(167, 360, 247, 388, "4"),
+        ]
+        graph = prototype.NavigationGraph(targets)
+
+        self.assertEqual(graph._repairs, {})
+        self.assertEqual(
+            prototype.preferred_navigation_components(
+                len(targets), graph._preferred
+            ),
+            (tuple(range(len(targets))),),
+        )
+
+    def test_connectivity_repair_reaches_an_isolated_irregular_cell(self):
+        rects = [
+            (428, 158, 530, 234),
+            (720, 43, 824, 79),
+            (141, 83, 217, 105),
+            (386, 215, 513, 283),
+            (730, 333, 830, 405),
+            (260, 325, 293, 363),
+            (289, 402, 315, 437),
+            (308, 259, 366, 301),
+            (629, 423, 675, 497),
+            (50, 453, 86, 527),
+            (638, 186, 760, 239),
+            (463, 422, 498, 443),
+        ]
+        branches = [0, 2, 2, 1, 2, 3, 2, 3, 3, 0, 3, 0]
+        targets = [
+            self.target(*rect, str(index), path=(0, branches[index], index))
+            for index, rect in enumerate(rects)
         ]
         graph = prototype.NavigationGraph(targets)
 
@@ -433,11 +486,19 @@ class SpatialNavigationTests(unittest.TestCase):
             (tuple(range(len(targets))),),
         )
         for (source, direction), target in graph._repairs.items():
-            self.assertIsNotNone(
-                prototype.direction_score(
+            score = prototype.direction_score(
+                graph.grid_rects[source],
+                graph.grid_rects[target],
+                direction,
+            )
+            self.assertIsNotNone(score)
+            assert score is not None
+            self.assertTrue(
+                prototype._direction_candidate_is_reasonable(
                     graph.grid_rects[source],
                     graph.grid_rects[target],
                     direction,
+                    score,
                 )
             )
 
@@ -465,6 +526,31 @@ class SpatialNavigationTests(unittest.TestCase):
             prototype.next_target_index(targets, 0, prototype.Direction.RIGHT),
             0,
         )
+
+    def test_bottom_send_does_not_jump_right_across_the_whole_window(self):
+        targets = [
+            self.target(205, 1600, 250, 1645, "发送", path=(0, 2, 9)),
+            self.target(205, 1350, 265, 1400, "继续", path=(0, 2, 8, 2)),
+            self.target(205, 1280, 265, 1330, "然后", path=(0, 2, 8, 1)),
+            self.target(205, 1210, 265, 1260, "概述", path=(0, 2, 8, 0)),
+            self.target(370, 85, 410, 125, "右上按钮", path=(0, 2, 0)),
+            self.target(300, 85, 340, 125, "顶部列表", path=(0, 2, 0, 0)),
+        ]
+        graph = prototype.NavigationGraph(targets)
+
+        self.assertEqual(graph.candidates(0, prototype.Direction.RIGHT), ())
+        self.assertEqual(graph.candidates(0, prototype.Direction.UP)[0], 1)
+        self.assertEqual(graph.candidates(3, prototype.Direction.UP)[0], 5)
+        diagnostic = prototype.build_navigation_diagnostic(
+            targets,
+            0,
+            prototype.Direction.RIGHT,
+            ranked_indices=(),
+            available_indices=(),
+        )
+        self.assertIsNotNone(diagnostic)
+        assert diagnostic is not None
+        self.assertIn("偏离方向过远", prototype.format_navigation_diagnostic(diagnostic))
 
     def test_left_stops_at_the_start_of_a_grid_row(self):
         targets = [

@@ -107,6 +107,13 @@ VERTICAL_LANE_MAX_CENTER_TOLERANCE = 96.0
 VERTICAL_LANE_SIZE_MULTIPLIER = 0.35
 VERTICAL_MAJOR_AXIS_WEIGHT = 13.0
 VERTICAL_SOFT_ESCAPE_FAR_EDGE_MULTIPLIER = 2.0
+HORIZONTAL_DIAGONAL_BASE_ALLOWANCE = 96.0
+HORIZONTAL_DIAGONAL_MAX_SLOPE = 1.25
+VERTICAL_DIAGONAL_BASE_ALLOWANCE = 160.0
+VERTICAL_DIAGONAL_MAX_SLOPE = 4.0
+DIRECTION_LAYER_MIN_SPAN = 32.0
+DIRECTION_LAYER_MAX_SPAN = 96.0
+DIRECTION_LAYER_SIZE_MULTIPLIER = 1.5
 GRID_SAFE_CELL_MAX_CHILDREN = 24
 VK_RETURN = 0x0D
 VK_ESCAPE = 0x1B
@@ -1553,24 +1560,92 @@ def _direction_rank_key(
     else:
         forward_center_distance = current.center_y - candidate.center_y
     if score[0] == 0:
-        axis_distance = score[1]
-        secondary_distance = score[4]
-        forward_distance = score[2]
-    else:
-        axis_distance = score[4] / max(1.0, forward_center_distance)
-        secondary_distance = score[2]
-        forward_distance = forward_center_distance
+        return (
+            0.0,
+            score[1],
+            score[4],
+            score[2],
+            forward_center_distance,
+            score[3],
+            float(-common_prefix),
+            float(score[5]),
+            float(score[6]),
+        )
+    if direction in {Direction.LEFT, Direction.RIGHT}:
+        return (
+            1.0,
+            score[4] / max(1.0, forward_center_distance),
+            score[2],
+            forward_center_distance,
+            forward_center_distance,
+            score[3],
+            float(-common_prefix),
+            float(score[5]),
+            float(score[6]),
+        )
+    layer_span = max(
+        DIRECTION_LAYER_MIN_SPAN,
+        min(
+            DIRECTION_LAYER_MAX_SPAN,
+            current.height * DIRECTION_LAYER_SIZE_MULTIPLIER,
+        ),
+    )
+    forward_layer = float(
+        int(max(0.0, forward_center_distance - 1.0) // layer_span)
+    )
     return (
-        float(score[0]),
-        axis_distance,
-        secondary_distance,
-        forward_distance,
+        1.0,
+        float(-common_prefix),
+        forward_layer,
+        score[2],
+        score[4],
         forward_center_distance,
         score[3],
-        float(-common_prefix),
         float(score[5]),
         float(score[6]),
     )
+
+
+def _direction_forward_center_distance(
+    current: Rect,
+    candidate: Rect,
+    direction: Direction,
+) -> float:
+    if direction == Direction.RIGHT:
+        return candidate.center_x - current.center_x
+    if direction == Direction.LEFT:
+        return current.center_x - candidate.center_x
+    if direction == Direction.DOWN:
+        return candidate.center_y - current.center_y
+    return current.center_y - candidate.center_y
+
+
+def _direction_candidate_is_reasonable(
+    current: Rect,
+    candidate: Rect,
+    direction: Direction,
+    score: tuple[int, float, float, float, float, int, int],
+) -> bool:
+    if score[0] == 0 or score[2] <= 0:
+        return True
+    forward_center_distance = _direction_forward_center_distance(
+        current, candidate, direction
+    )
+    if forward_center_distance <= 0:
+        return False
+    if direction in {Direction.LEFT, Direction.RIGHT}:
+        allowance = max(
+            HORIZONTAL_DIAGONAL_BASE_ALLOWANCE,
+            forward_center_distance * HORIZONTAL_DIAGONAL_MAX_SLOPE,
+            current.height * 3.0,
+        )
+    else:
+        allowance = max(
+            VERTICAL_DIAGONAL_BASE_ALLOWANCE,
+            forward_center_distance * VERTICAL_DIAGONAL_MAX_SLOPE,
+            current.width * 4.0,
+        )
+    return score[2] <= allowance
 
 
 def _vertical_far_edge_distance(
@@ -1678,18 +1753,47 @@ def ranked_target_indices(
     if grid_rects is None:
         grid_rects = navigation_grid_rects(targets, descendants_by_target)
     current = grid_rects[current_index]
+    if direction in {Direction.LEFT, Direction.RIGHT}:
+        diagonal_floor = max(
+            HORIZONTAL_DIAGONAL_BASE_ALLOWANCE,
+            current.height * 3.0,
+        )
+        diagonal_slope = HORIZONTAL_DIAGONAL_MAX_SLOPE
+    else:
+        diagonal_floor = max(
+            VERTICAL_DIAGONAL_BASE_ALLOWANCE,
+            current.width * 4.0,
+        )
+        diagonal_slope = VERTICAL_DIAGONAL_MAX_SLOPE
     scored: list[
         tuple[tuple[int, float, float, float, float, int, int], int, int]
     ] = []
     for index, target in enumerate(targets):
         if index == current_index:
             continue
-        score = direction_score(current, grid_rects[index], direction)
-        if score is not None:
-            common_prefix = _common_path_prefix_length(
-                targets[current_index].path, target.path
-            )
-            scored.append((score, common_prefix, index))
+        candidate = grid_rects[index]
+        score = direction_score(current, candidate, direction)
+        if score is None:
+            continue
+        if direction == Direction.RIGHT:
+            forward_center_distance = candidate.center_x - current.center_x
+        elif direction == Direction.LEFT:
+            forward_center_distance = current.center_x - candidate.center_x
+        elif direction == Direction.DOWN:
+            forward_center_distance = candidate.center_y - current.center_y
+        else:
+            forward_center_distance = current.center_y - candidate.center_y
+        if (
+            score[0] != 0
+            and score[2] > 0
+            and score[2]
+            > max(diagonal_floor, forward_center_distance * diagonal_slope)
+        ):
+            continue
+        common_prefix = _common_path_prefix_length(
+            targets[current_index].path, target.path
+        )
+        scored.append((score, common_prefix, index))
 
     def rank_key(
         item: tuple[
@@ -1761,6 +1865,21 @@ def _preferred_grid_targets_for_index(
     current_height = max(0, current_bottom - current_top)
     current_center_x = (current_left + current_right) / 2
     current_center_y = (current_top + current_bottom) / 2
+    horizontal_diagonal_floor = max(
+        HORIZONTAL_DIAGONAL_BASE_ALLOWANCE,
+        current_height * 3.0,
+    )
+    vertical_diagonal_floor = max(
+        VERTICAL_DIAGONAL_BASE_ALLOWANCE,
+        current_width * 4.0,
+    )
+    vertical_layer_span = max(
+        DIRECTION_LAYER_MIN_SPAN,
+        min(
+            DIRECTION_LAYER_MAX_SPAN,
+            current_height * DIRECTION_LAYER_SIZE_MULTIPLIER,
+        ),
+    )
     for index, target in enumerate(targets):
         if index == current_index:
             continue
@@ -1815,16 +1934,6 @@ def _preferred_grid_targets_for_index(
             forward_center_distance = abs(
                 candidate_center_x - current_center_x
             )
-            if beam_rank == 0:
-                axis_distance = primary_gap
-                secondary_distance = center_offset
-                forward_distance = perpendicular_gap
-            else:
-                axis_distance = center_offset / max(
-                    1.0, forward_center_distance
-                )
-                secondary_distance = perpendicular_gap
-                forward_distance = forward_center_distance
             score = (
                 beam_rank,
                 float(primary_gap),
@@ -1834,27 +1943,51 @@ def _preferred_grid_targets_for_index(
                 candidate_top,
                 candidate_left,
             )
-            item = (
-                (
-                    float(beam_rank),
-                    axis_distance,
-                    secondary_distance,
-                    forward_distance,
-                    forward_center_distance,
-                    score_value,
-                    float(-common_prefix),
-                    float(candidate_top),
-                    float(candidate_left),
-                ),
-                index,
-                score,
+            reasonable = bool(
+                beam_rank == 0
+                or perpendicular_gap <= 0
+                or perpendicular_gap
+                <= max(
+                    horizontal_diagonal_floor,
+                    forward_center_distance * HORIZONTAL_DIAGONAL_MAX_SLOPE,
+                )
             )
-            previous = best.get(direction)
-            if previous is None or (item[0], item[1]) < (
-                previous[0],
-                previous[1],
-            ):
-                best[direction] = item
+            if reasonable:
+                if beam_rank == 0:
+                    rank_key = (
+                        0.0,
+                        float(primary_gap),
+                        center_offset,
+                        float(perpendicular_gap),
+                        forward_center_distance,
+                        score_value,
+                        float(-common_prefix),
+                        float(candidate_top),
+                        float(candidate_left),
+                    )
+                else:
+                    rank_key = (
+                        1.0,
+                        center_offset / max(1.0, forward_center_distance),
+                        float(perpendicular_gap),
+                        forward_center_distance,
+                        forward_center_distance,
+                        score_value,
+                        float(-common_prefix),
+                        float(candidate_top),
+                        float(candidate_left),
+                    )
+                item = (
+                    rank_key,
+                    index,
+                    score,
+                )
+                previous = best.get(direction)
+                if previous is None or (item[0], item[1]) < (
+                    previous[0],
+                    previous[1],
+                ):
+                    best[direction] = item
         if candidate_center_y != current_center_y:
             direction = (
                 Direction.DOWN
@@ -1896,16 +2029,6 @@ def _preferred_grid_targets_for_index(
             forward_center_distance = abs(
                 candidate_center_y - current_center_y
             )
-            if beam_rank == 0:
-                axis_distance = primary_gap
-                secondary_distance = center_offset
-                forward_distance = perpendicular_gap
-            else:
-                axis_distance = center_offset / max(
-                    1.0, forward_center_distance
-                )
-                secondary_distance = perpendicular_gap
-                forward_distance = forward_center_distance
             score = (
                 beam_rank,
                 float(primary_gap),
@@ -1915,29 +2038,58 @@ def _preferred_grid_targets_for_index(
                 candidate_top,
                 candidate_left,
             )
-            item = (
-                (
-                    float(beam_rank),
-                    axis_distance,
-                    secondary_distance,
-                    forward_distance,
-                    forward_center_distance,
-                    score_value,
-                    float(-common_prefix),
-                    float(candidate_top),
-                    float(candidate_left),
-                ),
-                index,
-                score,
+            reasonable = bool(
+                beam_rank == 0
+                or perpendicular_gap <= 0
+                or perpendicular_gap
+                <= max(
+                    vertical_diagonal_floor,
+                    forward_center_distance * VERTICAL_DIAGONAL_MAX_SLOPE,
+                )
             )
-            previous = best.get(direction)
-            if previous is None or (item[0], item[1]) < (
-                previous[0],
-                previous[1],
-            ):
-                best[direction] = item
-            if score[0] != 0:
-                vertical_diagonals[direction].append(item)
+            if reasonable:
+                if beam_rank == 0:
+                    rank_key = (
+                        0.0,
+                        float(primary_gap),
+                        center_offset,
+                        float(perpendicular_gap),
+                        forward_center_distance,
+                        score_value,
+                        float(-common_prefix),
+                        float(candidate_top),
+                        float(candidate_left),
+                    )
+                else:
+                    rank_key = (
+                        1.0,
+                        float(-common_prefix),
+                        float(
+                            int(
+                                max(0.0, forward_center_distance - 1.0)
+                                // vertical_layer_span
+                            )
+                        ),
+                        float(perpendicular_gap),
+                        center_offset,
+                        forward_center_distance,
+                        score_value,
+                        float(candidate_top),
+                        float(candidate_left),
+                    )
+                item = (
+                    rank_key,
+                    index,
+                    score,
+                )
+                previous = best.get(direction)
+                if previous is None or (item[0], item[1]) < (
+                    previous[0],
+                    previous[1],
+                ):
+                    best[direction] = item
+                if score[0] != 0:
+                    vertical_diagonals[direction].append(item)
 
     preferred = {
         direction: item[1] for direction, item in best.items()
@@ -2001,10 +2153,12 @@ def best_grid_target_index(
 DIAGNOSTIC_REJECTION_ORDER = (
     "wrong_direction",
     "same_rectangle",
+    "too_far_off_axis",
 )
 DIAGNOSTIC_REJECTION_LABELS = {
     "wrong_direction": "不在请求方向",
     "same_rectangle": "与当前元素同一矩形",
+    "too_far_off_axis": "偏离方向过远",
 }
 DIAGNOSTIC_ROUTE_LABELS = {
     "lane": "同一通道",
@@ -2112,10 +2266,16 @@ def build_navigation_diagnostic(
         target_rect = grid_rects[index]
         if target_rect == current_rect:
             reason = "same_rectangle"
-        elif direction_score(current_rect, target_rect, direction) is None:
-            reason = "wrong_direction"
         else:
-            continue
+            score = direction_score(current_rect, target_rect, direction)
+            if score is None:
+                reason = "wrong_direction"
+            elif not _direction_candidate_is_reasonable(
+                current_rect, target_rect, direction, score
+            ):
+                reason = "too_far_off_axis"
+            else:
+                continue
         rejected_counts[reason] += 1
 
     return NavigationDiagnostic(
@@ -2347,6 +2507,13 @@ class NavigationGraph:
                         direction,
                     )
                     if score is None:
+                        continue
+                    if not _direction_candidate_is_reasonable(
+                        current,
+                        self.grid_rects[candidate_index],
+                        direction,
+                        score,
+                    ):
                         continue
                     rank_key = _direction_rank_key(
                         current,
