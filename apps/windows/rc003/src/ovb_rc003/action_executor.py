@@ -14,6 +14,8 @@ import os
 import shutil
 import subprocess
 import sys
+import threading
+import time
 from pathlib import Path
 from typing import Callable, Dict, Iterable, Optional, Sequence, Tuple
 
@@ -23,6 +25,12 @@ from . import key_mapping
 Command = Tuple[str, ...]
 Launcher = Callable[[Sequence[str]], object]
 UriLauncher = Callable[[str], object]
+
+_MISSING_COMMAND_CACHE_SECONDS = 30.0
+_application_command_cache: Dict[
+    key_mapping.ActionKind, Tuple[float, Optional[Command]]
+] = {}
+_application_command_cache_lock = threading.Lock()
 
 
 # These are executable names rather than guessed window titles.  We resolve
@@ -143,10 +151,14 @@ def _packaged_codex_paths() -> Iterable[Path]:
             continue
 
 
-def resolve_application_command(
+def _path_is_file(path: Path) -> bool:
+    return path.is_file()
+
+
+def _resolve_application_command_uncached(
     action: key_mapping.ButtonAction,
     *,
-    executable_exists: Callable[[Path], bool] = lambda path: path.is_file(),
+    executable_exists: Callable[[Path], bool],
 ) -> Optional[Command]:
     """Resolve an application action to an executable command.
 
@@ -184,6 +196,50 @@ def resolve_application_command(
     return None
 
 
+def clear_application_command_cache(
+    action_kind: Optional[key_mapping.ActionKind] = None,
+) -> None:
+    with _application_command_cache_lock:
+        if action_kind is None:
+            _application_command_cache.clear()
+        else:
+            _application_command_cache.pop(action_kind, None)
+
+
+def resolve_application_command(
+    action: key_mapping.ButtonAction,
+    *,
+    executable_exists: Callable[[Path], bool] = _path_is_file,
+) -> Optional[Command]:
+    """Resolve an application action with a process-local install cache."""
+
+    if executable_exists is not _path_is_file:
+        return _resolve_application_command_uncached(
+            action,
+            executable_exists=executable_exists,
+        )
+
+    now = time.monotonic()
+    with _application_command_cache_lock:
+        cached = _application_command_cache.get(action.kind)
+    if cached is not None:
+        cached_at, command = cached
+        if command is not None:
+            if _path_is_file(Path(command[0])):
+                return command
+            clear_application_command_cache(action.kind)
+        elif now - cached_at < _MISSING_COMMAND_CACHE_SECONDS:
+            return None
+
+    command = _resolve_application_command_uncached(
+        action,
+        executable_exists=_path_is_file,
+    )
+    with _application_command_cache_lock:
+        _application_command_cache[action.kind] = (now, command)
+    return command
+
+
 def open_configured_application(
     action: key_mapping.ButtonAction,
     *,
@@ -195,7 +251,11 @@ def open_configured_application(
     if command is None:
         return False
     starter = launcher or _launch_command
-    starter(command)
+    try:
+        starter(command)
+    except Exception:
+        clear_application_command_cache(action.kind)
+        raise
     return True
 
 

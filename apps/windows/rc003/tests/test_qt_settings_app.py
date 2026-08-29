@@ -459,7 +459,10 @@ class SettingsControllerTests(unittest.TestCase):
 
     def _make_controller(self):
         model = self.Model()
-        controller = self.Controller(model)
+        controller = self.Controller(
+            model,
+            background_task_runner=lambda target, _name: target(),
+        )
         return controller, model
 
     def _continue_save_and_launch(self, controller):
@@ -511,6 +514,7 @@ class SettingsControllerTests(unittest.TestCase):
 
     def test_voice_program_status_refresh_runs_in_a_worker_thread(self):
         controller, _ = self._make_controller()
+        controller._background_task_runner = None
         caller_thread = threading.get_ident()
         worker_threads = []
         completed = threading.Event()
@@ -528,6 +532,94 @@ class SettingsControllerTests(unittest.TestCase):
 
         self.assertEqual(len(worker_threads), 1)
         self.assertNotEqual(worker_threads[0], caller_thread)
+
+    def test_background_shutdown_joins_workers_and_suppresses_all_results(self):
+        controller, _ = self._make_controller()
+        controller._background_task_runner = None
+        endpoint_started = threading.Event()
+        status_started = threading.Event()
+        hotkey_started = threading.Event()
+        release_workers = threading.Event()
+        hotkey_completions = []
+        original_options = list(controller.endpointOptions)
+        original_status = controller.voiceProgramStatusText
+
+        def endpoint_payload(_config_snapshot):
+            endpoint_started.set()
+            release_workers.wait(2.0)
+            return {
+                "options": ["关闭后结果"],
+                "values": [],
+                "recommended_index": -1,
+                "selected_index": -1,
+                "migration_message": "",
+            }
+
+        def status_payload(_settings_snapshot):
+            status_started.set()
+            release_workers.wait(2.0)
+            return "关闭后状态", "running", "standard"
+
+        def hotkey_payload():
+            hotkey_started.set()
+            release_workers.wait(2.0)
+            return "关闭后快捷键"
+
+        with mock.patch.object(
+            controller, "_endpoint_options_payload", side_effect=endpoint_payload
+        ), mock.patch.object(
+            controller, "_voice_program_status_payload", side_effect=status_payload
+        ):
+            controller._request_endpoint_options_refresh()
+            controller._request_voice_program_status_refresh()
+            controller._submit_voice_hotkey_step(
+                hotkey_payload,
+                lambda ok, payload: hotkey_completions.append((ok, payload)),
+            )
+            self.assertTrue(endpoint_started.wait(1.0))
+            self.assertTrue(status_started.wait(1.0))
+            self.assertTrue(hotkey_started.wait(1.0))
+
+            releaser = threading.Timer(0.05, release_workers.set)
+            releaser.start()
+            controller.shutdownBackgroundTasks()
+            releaser.join()
+
+        self.assertEqual(len(controller._background_threads), 0)
+        self.assertEqual(controller.endpointOptions, original_options)
+        self.assertEqual(controller.voiceProgramStatusText, original_status)
+        self.assertEqual(hotkey_completions, [])
+        self.assertFalse(controller.voiceHotkeyBusy)
+
+        controller._on_endpoint_options_refresh_ready(
+            (
+                dict(controller._config),
+                {
+                    "options": ["迟到端点"],
+                    "values": [],
+                    "recommended_index": -1,
+                    "selected_index": -1,
+                    "migration_message": "",
+                },
+            )
+        )
+        controller._on_voice_program_status_refresh_ready(
+            (dict(controller._voice_program_settings), ("迟到状态", "running", "standard"))
+        )
+        controller._on_voice_hotkey_task_ready(
+            (controller._voice_hotkey_task_token, (True, "迟到快捷键"))
+        )
+        self.assertEqual(controller.endpointOptions, original_options)
+        self.assertEqual(controller.voiceProgramStatusText, original_status)
+        self.assertEqual(hotkey_completions, [])
+
+    def test_injected_background_runner_does_not_register_threads(self):
+        controller, _ = self._make_controller()
+
+        self.assertEqual(len(controller._background_threads), 0)
+
+        controller.shutdownBackgroundTasks()
+        self.assertTrue(controller._background_shutdown_event.is_set())
 
     def test_voice_program_status_refresh_coalesces_repeated_requests(self):
         controller, _ = self._make_controller()
@@ -2606,7 +2698,10 @@ class DiagnosticsControllerTests(unittest.TestCase):
 
     def _make_settings_controller(self):
         model = self.Model()
-        return self.SettingsController(model)
+        return self.SettingsController(
+            model,
+            background_task_runner=lambda target, _name: target(),
+        )
 
     def _pump_until(self, predicate, timeout_seconds=5.0):
         deadline = time.monotonic() + timeout_seconds
@@ -3386,9 +3481,9 @@ class DiagnosticsControllerTests(unittest.TestCase):
 class RunSettingsWindowShutdownCoverageTests(unittest.TestCase):
     """XRBM-035 RETRY 1 P2/E: ``run_settings_window()``'s production
     shutdown contract must cover every exit path starting right after
-    ``DiagnosticsController`` is constructed (that constructor already
-    started a real background worker) - not only ``app.exec()`` returning
-    normally, which is all the previous round's ``try/finally`` covered.
+    both controllers are constructed, not only ``app.exec()`` returning.
+    ``SettingsController`` already owns endpoint/program workers at that
+    point; diagnostics are deferred until QML reports its first frame.
     Drives the REAL function end to end (never a source-level/AST proxy) -
     only the Qt WINDOW plumbing (``QGuiApplication``/``QQmlApplicationEngine``
     /``QQuickStyle``/``QUrl``/``qmlRegisterSingletonInstance``) is replaced
@@ -3396,8 +3491,8 @@ class RunSettingsWindowShutdownCoverageTests(unittest.TestCase):
     are not reliably monkeypatchable, and no real QML window needs to exist
     to prove this contract) - ``ButtonMappingModel``/``SettingsController``/
     ``DiagnosticsController`` stay the REAL classes ``_load_qt_classes()``
-    itself already produced, so the background worker this test is actually
-    about is completely real.
+    itself already produced, so their cleanup methods and worker lifecycle
+    remain the production implementations.
     """
 
     def setUp(self):
@@ -3520,6 +3615,7 @@ class RunSettingsWindowShutdownCoverageTests(unittest.TestCase):
         fake_classes = self._fake_classes(root_objects=[object()], exec_return=0)
         controller_class = fake_classes["SettingsController"]
         detection_calls = []
+        settings_shutdown_calls = []
         with mock.patch.object(
             qt_settings_app, "_load_qt_classes", return_value=fake_classes
         ), mock.patch.object(
@@ -3532,6 +3628,11 @@ class RunSettingsWindowShutdownCoverageTests(unittest.TestCase):
             side_effect=lambda instance: detection_calls.append(instance),
             autospec=True,
         ), mock.patch.object(
+            controller_class,
+            "shutdownBackgroundTasks",
+            side_effect=lambda instance: settings_shutdown_calls.append(instance),
+            autospec=True,
+        ), mock.patch.object(
             qt_settings_app,
             "_shutdown_diagnostics_workers",
             wraps=qt_settings_app._shutdown_diagnostics_workers,
@@ -3540,6 +3641,7 @@ class RunSettingsWindowShutdownCoverageTests(unittest.TestCase):
                 qt_settings_app.run_settings_window()
 
         self.assertEqual(len(detection_calls), 1)
+        self.assertEqual(len(settings_shutdown_calls), 1)
         shutdown_spy.assert_called()
         self.assertEqual(len(qt_settings_app._diagnostics_threads), 0)
 
@@ -3607,6 +3709,10 @@ print("STAGE:loaded", file=sys.stderr, flush=True)
 root_objects = engine.rootObjects()
 app.processEvents()
 initial_settings_dirty = bool(controller.settingsDirty)
+tab_bar = root_objects[0].findChild(QObject, "tabBar") if root_objects else None
+if tab_bar is not None:
+    tab_bar.setProperty("currentIndex", 2)
+    app.processEvents()
 voice_scroll = (
     root_objects[0].findChild(QObject, "voiceScroll") if root_objects else None
 )
@@ -3620,7 +3726,8 @@ voice_save_status = controller.statusMessage
 status_bar = (
     root_objects[0].findChild(QObject, "globalStatusBar") if root_objects else None
 )
-tab_bar = root_objects[0].findChild(QObject, "tabBar") if root_objects else None
+tab_bar.setProperty("currentIndex", 0)
+app.processEvents()
 voice_feedback_on_device = bool(status_bar.property("hasStatus"))
 tab_bar.setProperty("currentIndex", 2)
 app.processEvents()
@@ -3664,6 +3771,7 @@ result = {
 # __init__ - never faked/skipped here) is still fully alive. This is what
 # actually reproduces the real settings-window-closes-quickly race, and
 # actually exercises the fix for it.
+controller.shutdownBackgroundTasks()
 m._shutdown_diagnostics_workers()
 print("STAGE:shutdown", file=sys.stderr, flush=True)
 
@@ -3757,6 +3865,7 @@ result["voice_sections"] = all(
         "voiceTestSection",
     )
 )
+controller.shutdownBackgroundTasks()
 m._shutdown_diagnostics_workers()
 print(json.dumps(result))
 """
@@ -4052,6 +4161,7 @@ result["error_status"] = {
 }
 result["warnings"] = [warning.toString() for warning in warnings]
 
+controller.shutdownBackgroundTasks()
 m._shutdown_diagnostics_workers()
 print(json.dumps(result))
 """
@@ -4190,6 +4300,7 @@ result = {
         "target_visible": visible_in_window(sound_button, window),
     },
 }
+controller.shutdownBackgroundTasks()
 m._shutdown_diagnostics_workers()
 print(json.dumps(result))
 """
@@ -4607,6 +4718,7 @@ result["navigation_backgrounds"] = {
 }
 
 result["warnings"] = [warning.toString() for warning in warnings]
+controller.shutdownBackgroundTasks()
 m._shutdown_diagnostics_workers()
 print(json.dumps(result))
 """
@@ -6663,6 +6775,7 @@ results_out = {
     "viewport_width": window.property("width"),
     "viewport_height": window.property("height"),
 }
+controller.shutdownBackgroundTasks()
 m._shutdown_diagnostics_workers()
 print(json.dumps(results_out))
 """

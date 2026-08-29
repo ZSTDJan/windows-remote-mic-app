@@ -8,6 +8,12 @@ from ovb_rc003 import action_executor, key_mapping
 
 
 class SemanticApplicationActionTests(unittest.TestCase):
+    def setUp(self):
+        action_executor.clear_application_command_cache()
+
+    def tearDown(self):
+        action_executor.clear_application_command_cache()
+
     def test_wechat_shortcut_lookup_does_not_select_enterprise_wechat(self):
         with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as tmp2:
             start_menu = (
@@ -84,6 +90,56 @@ class SemanticApplicationActionTests(unittest.TestCase):
 
         self.assertTrue(started)
         self.assertEqual(calls, [("C:/Apps/Chrome.exe",)])
+
+    def test_successful_application_resolution_is_cached_while_target_exists(self):
+        action = key_mapping.ButtonAction(key_mapping.ActionKind.OPEN_CODEX)
+        with tempfile.TemporaryDirectory() as tmp:
+            executable = Path(tmp) / "Codex.exe"
+            executable.write_bytes(b"not executed")
+            with mock.patch.object(
+                action_executor,
+                "_candidate_paths",
+                return_value=[executable],
+            ) as candidates:
+                first = action_executor.resolve_application_command(action)
+                second = action_executor.resolve_application_command(action)
+
+        self.assertEqual(first, (str(executable),))
+        self.assertEqual(second, first)
+        self.assertEqual(candidates.call_count, 1)
+
+    def test_missing_application_cache_expires(self):
+        action = key_mapping.ButtonAction(key_mapping.ActionKind.OPEN_CMUX)
+        with mock.patch.object(
+            action_executor,
+            "_candidate_paths",
+            return_value=[],
+        ) as candidates, mock.patch.object(
+            action_executor.time,
+            "monotonic",
+            side_effect=[10.0, 20.0, 50.1],
+        ):
+            self.assertIsNone(action_executor.resolve_application_command(action))
+            self.assertIsNone(action_executor.resolve_application_command(action))
+            self.assertIsNone(action_executor.resolve_application_command(action))
+
+        self.assertEqual(candidates.call_count, 2)
+
+    def test_launch_failure_invalidates_cached_application_command(self):
+        action = key_mapping.ButtonAction(key_mapping.ActionKind.OPEN_CHROME)
+        command = ("C:/Apps/Chrome.exe",)
+        action_executor._application_command_cache[action.kind] = (1.0, command)
+        with mock.patch.object(
+            action_executor,
+            "resolve_application_command",
+            return_value=command,
+        ), self.assertRaises(OSError):
+            action_executor.open_configured_application(
+                action,
+                launcher=lambda _command: (_ for _ in ()).throw(OSError("boom")),
+            )
+
+        self.assertNotIn(action.kind, action_executor._application_command_cache)
 
     def test_missing_application_is_reported_without_launching_anything(self):
         action = key_mapping.ButtonAction(key_mapping.ActionKind.OPEN_CMUX)

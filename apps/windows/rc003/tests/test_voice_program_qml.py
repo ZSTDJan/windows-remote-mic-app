@@ -380,6 +380,7 @@ result = {
         )
     ),
 }
+controller.shutdownBackgroundTasks()
 m._shutdown_diagnostics_workers()
 print(json.dumps(result, ensure_ascii=False))
 """

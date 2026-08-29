@@ -21,6 +21,14 @@ ApplicationWindow {
         fontFamily: window.preferredWindowsUiFontAvailable
             ? window.preferredWindowsUiFont : Qt.application.font.family
     }
+    property bool initialDiagnosticsStarted: false
+
+    onFrameSwapped: {
+        if (initialDiagnosticsStarted)
+            return
+        initialDiagnosticsStarted = true
+        DiagnosticsController.startInitialDiagnostics()
+    }
     color: tokens.background
     font.family: tokens.fontFamily
 
@@ -148,8 +156,22 @@ ApplicationWindow {
                     tokens: window.tokens
                     onOpenButtonsRequested: tabBar.currentIndex = 1
                 }
-                ButtonsPage { tokens: window.tokens }
-                VoicePage { tokens: window.tokens }
+                Loader {
+                    id: buttonsPageLoader
+                    objectName: "buttonsPageLoader"
+                    active: tabBar.currentIndex === 1 || status === Loader.Ready
+                    sourceComponent: Component {
+                        ButtonsPage { tokens: window.tokens }
+                    }
+                }
+                Loader {
+                    id: voicePageLoader
+                    objectName: "voicePageLoader"
+                    active: tabBar.currentIndex === 2 || status === Loader.Ready
+                    sourceComponent: Component {
+                        VoicePage { tokens: window.tokens }
+                    }
+                }
             }
 
             Rectangle {
