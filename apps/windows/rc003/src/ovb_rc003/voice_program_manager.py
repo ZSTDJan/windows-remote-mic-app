@@ -81,6 +81,12 @@ public static class RemoteMicSogouSettingsNative {
     public delegate bool EnumWindowsProc(IntPtr hwnd, IntPtr lparam);
 
     [StructLayout(LayoutKind.Sequential)]
+    public struct Point {
+        public int X;
+        public int Y;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
     public struct Rect {
         public int Left;
         public int Top;
@@ -104,10 +110,28 @@ public static class RemoteMicSogouSettingsNative {
     public static extern bool GetWindowRect(IntPtr hwnd, out Rect rect);
 
     [DllImport("user32.dll")]
+    public static extern uint GetWindowThreadProcessId(IntPtr hwnd, out uint processId);
+
+    [DllImport("user32.dll")]
     public static extern bool ShowWindowAsync(IntPtr hwnd, int command);
 
     [DllImport("user32.dll")]
     public static extern bool SetForegroundWindow(IntPtr hwnd);
+
+    [DllImport("user32.dll")]
+    public static extern bool GetCursorPos(out Point point);
+
+    [DllImport("user32.dll")]
+    public static extern bool SetCursorPos(int x, int y);
+
+    [DllImport("user32.dll")]
+    public static extern void mouse_event(
+        uint flags,
+        uint dx,
+        uint dy,
+        uint data,
+        UIntPtr extra
+    );
 
     [DllImport("user32.dll")]
     public static extern void keybd_event(byte key, byte scan, uint flags, UIntPtr extra);
@@ -153,11 +177,84 @@ function Find-SogouTrayButton {
     return $null
 }
 
+function Open-SogouTrayMenu {
+    param($trayButton)
+    try {
+        $bounds = $trayButton.Current.BoundingRectangle
+    } catch {
+        return $false
+    }
+    if ($bounds.Width -le 0 -or $bounds.Height -le 0) {
+        return $false
+    }
+
+    $original = New-Object RemoteMicSogouSettingsNative+Point
+    if (-not [RemoteMicSogouSettingsNative]::GetCursorPos([ref]$original)) {
+        return $false
+    }
+    $slotWidth = [Math]::Min(
+        $bounds.Width,
+        [Math]::Max(24, [Math]::Round($bounds.Height * 2 / 3))
+    )
+    $x = [int]($bounds.Left + ($slotWidth / 2))
+    $y = [int]($bounds.Top + ($bounds.Height / 2))
+    if (-not [RemoteMicSogouSettingsNative]::SetCursorPos($x, $y)) {
+        return $false
+    }
+    $script:trayMenuOriginalCursor = $original
+    $script:trayMenuClickX = $x
+    $script:trayMenuClickY = $y
+    Start-Sleep -Milliseconds 100
+    [RemoteMicSogouSettingsNative]::mouse_event(
+        0x0008,
+        0,
+        0,
+        0,
+        [UIntPtr]::Zero
+    )
+    [RemoteMicSogouSettingsNative]::mouse_event(
+        0x0010,
+        0,
+        0,
+        0,
+        [UIntPtr]::Zero
+    )
+    return $true
+}
+
+function Restore-CursorAfterTrayMenu {
+    if ($null -eq $script:trayMenuOriginalCursor) {
+        return
+    }
+    $current = New-Object RemoteMicSogouSettingsNative+Point
+    if ([RemoteMicSogouSettingsNative]::GetCursorPos([ref]$current) -and
+            [Math]::Abs($current.X - $script:trayMenuClickX) -le 8 -and
+            [Math]::Abs($current.Y - $script:trayMenuClickY) -le 8) {
+        [void][RemoteMicSogouSettingsNative]::SetCursorPos(
+            $script:trayMenuOriginalCursor.X,
+            $script:trayMenuOriginalCursor.Y
+        )
+    }
+    $script:trayMenuOriginalCursor = $null
+}
+
 function Find-SettingsMenuItem {
     $script:settingsMenuResult = $null
+    $script:sogouProcessIds = @(
+        Get-Process -Name "sogou_voice_assistant" -ErrorAction SilentlyContinue |
+            ForEach-Object { $_.Id }
+    )
     [RemoteMicSogouSettingsNative]::EnumWindows({
         param($window, $unused)
         if (-not [RemoteMicSogouSettingsNative]::IsWindowVisible($window)) {
+            return $true
+        }
+        [uint32]$processId = 0
+        [void][RemoteMicSogouSettingsNative]::GetWindowThreadProcessId(
+            $window,
+            [ref]$processId
+        )
+        if ($script:sogouProcessIds -notcontains [int]$processId) {
             return $true
         }
         $className = New-Object System.Text.StringBuilder 128
@@ -166,13 +263,10 @@ function Find-SettingsMenuItem {
             $className,
             $className.Capacity
         )
-        if ($className.ToString() -ne "Chrome_WidgetWin_1") {
-            return $true
-        }
         $rect = New-Object RemoteMicSogouSettingsNative+Rect
         [void][RemoteMicSogouSettingsNative]::GetWindowRect($window, [ref]$rect)
-        if (($rect.Right - $rect.Left) -gt 500 -or
-                ($rect.Bottom - $rect.Top) -gt 800) {
+        if (($rect.Right - $rect.Left) -gt 800 -or
+                ($rect.Bottom - $rect.Top) -gt 1000) {
             return $true
         }
         try {
@@ -181,17 +275,9 @@ function Find-SettingsMenuItem {
                 [System.Windows.Automation.AutomationElement]::NameProperty,
                 "设置"
             )
-            $typeCondition = New-Object System.Windows.Automation.PropertyCondition(
-                [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
-                [System.Windows.Automation.ControlType]::MenuItem
-            )
-            $condition = New-Object System.Windows.Automation.AndCondition(
-                $nameCondition,
-                $typeCondition
-            )
             $candidate = $root.FindFirst(
-                [System.Windows.Automation.TreeScope]::Descendants,
-                $condition
+                [System.Windows.Automation.TreeScope]::Subtree,
+                $nameCondition
             )
             if ($null -ne $candidate) {
                 $script:settingsMenuResult = $candidate
@@ -202,6 +288,27 @@ function Find-SettingsMenuItem {
         return $true
     }, [IntPtr]::Zero) | Out-Null
     return $script:settingsMenuResult
+}
+
+function Invoke-SettingsMenuItem {
+    param($settingsItem)
+    try {
+        $invoke = $settingsItem.GetCurrentPattern(
+            [System.Windows.Automation.InvokePattern]::Pattern
+        )
+        $invoke.Invoke()
+        return $true
+    } catch {
+    }
+    try {
+        $legacy = $settingsItem.GetCurrentPattern(
+            [System.Windows.Automation.LegacyIAccessiblePattern]::Pattern
+        )
+        $legacy.DoDefaultAction()
+        return $true
+    } catch {
+    }
+    return $false
 }
 
 if (Show-ExistingSettingsWindow) {
@@ -225,27 +332,26 @@ $settingsItem = $null
 for ($attempt = 0; $attempt -lt 3 -and $null -eq $settingsItem; $attempt++) {
     [RemoteMicSogouSettingsNative]::keybd_event(27, 0, 0, [UIntPtr]::Zero)
     [RemoteMicSogouSettingsNative]::keybd_event(27, 0, 2, [UIntPtr]::Zero)
-    $trayButton.SetFocus()
-    Start-Sleep -Milliseconds 250
-    [RemoteMicSogouSettingsNative]::keybd_event(0x5D, 0, 0, [UIntPtr]::Zero)
-    [RemoteMicSogouSettingsNative]::keybd_event(0x5D, 0, 2, [UIntPtr]::Zero)
-    Start-Sleep -Milliseconds 700
+    if (-not (Open-SogouTrayMenu $trayButton)) {
+        continue
+    }
+    Start-Sleep -Milliseconds 650
     $settingsItem = Find-SettingsMenuItem
+    if ($null -eq $settingsItem) {
+        Restore-CursorAfterTrayMenu
+    }
 }
 if ($null -eq $settingsItem) {
-    Write-Output "settings-menu-not-found"
+    Write-Output "tray-menu-open-failed"
     exit 12
 }
 
-try {
-    $invoke = $settingsItem.GetCurrentPattern(
-        [System.Windows.Automation.InvokePattern]::Pattern
-    )
-    $invoke.Invoke()
-} catch {
+if (-not (Invoke-SettingsMenuItem $settingsItem)) {
+    Restore-CursorAfterTrayMenu
     Write-Output "settings-menu-invoke-failed"
     exit 13
 }
+Restore-CursorAfterTrayMenu
 
 for ($attempt = 0; $attempt -lt 40; $attempt++) {
     Start-Sleep -Milliseconds 150
@@ -1401,7 +1507,7 @@ def _run_sogou_settings_automation(
     detail = str(completed.stdout or completed.stderr or "").strip()
     messages = {
         11: "未找到搜狗语音托盘图标",
-        12: "未找到搜狗语音托盘菜单中的设置项",
+        12: "无法打开搜狗语音托盘菜单",
         13: "无法调用搜狗语音托盘菜单中的设置项",
         14: "搜狗语音设置窗口没有出现",
     }
