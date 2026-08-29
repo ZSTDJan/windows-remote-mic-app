@@ -34,7 +34,7 @@ QtObject {
     property color statusBackground: accentSoft
     property color errorBackground: darkMode ? "#422421" : "#fdeceb"
 
-    property string fontFamily: "Noto Sans SC"
+    property string fontFamily: "Microsoft YaHei UI"
     property string fontFamilyMono: "Consolas"
     property real fontSizeTiny: 9.5
     property real fontSizeMapGesture: 9.5

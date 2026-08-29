@@ -68,18 +68,6 @@ Windows.
 
 The RC003 product photo bundled as `RC003-remote-photo.png` was supplied by the user on 2026-07-17 for the physical-button mapping interface. It is preserved at its original 508 x 1030 aspect ratio. Copyright and trademark rights in the photo and depicted products remain with their respective owners; the GPL-3.0-only license for the program does not grant additional rights to this image or the Xiaomi marks.
 
-## Noto Sans SC
-
-- Project: `notofonts/noto-cjk`
-- Source: <https://github.com/notofonts/noto-cjk>
-- Bundled weights: Regular, Medium, SemiBold
-- License: SIL Open Font License 1.1 (`OFL-1.1`)
-
-The Windows settings interface bundles these font files unchanged for consistent
-Simplified Chinese rendering. The copyright notice and full license text are
-included at `apps/windows/rc003/src/ovb_rc003/qml/fonts/OFL.txt` and are copied
-with the QML resource tree into frozen builds.
-
 ## VB-CABLE
 
 - Project: `VB-Audio VB-CABLE`

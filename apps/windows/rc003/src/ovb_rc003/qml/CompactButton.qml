@@ -12,7 +12,7 @@ Button {
     implicitWidth: Math.max(compactMinimumWidth, contentItem.implicitWidth + 14)
     leftPadding: 7
     rightPadding: 7
-    font.family: tokens ? tokens.fontFamily : "Noto Sans SC"
+    font.family: tokens ? tokens.fontFamily : "Microsoft YaHei UI"
     font.pixelSize: tokens ? tokens.fontSizeControl : 12
     font.weight: Font.Normal
 

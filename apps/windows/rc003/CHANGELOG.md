@@ -48,6 +48,14 @@
    `bugs/BUG-025-bridge-startup-readiness-warning.md`、
    `bugs/BUG-026-bridge-liveness-and-first-key-readiness.md` 和 `TESTING.md`。
 
+### 2026-08-29 恢复系统字体打包方案
+
+- 当前开发分支重新统一使用 Windows 系统中文 UI 字体，删除三套 Noto Sans SC
+  字体及加载入口，冻结目录和本地测试 ZIP 均不再包含字体文件。
+- 系统字体使按键编辑提示框边界变化后，共享提示框按自身边框增加避让距离，真实
+  QML 渲染检查确认不再压住输入框。完整构建门禁 1599 项通过、7 项按平台条件跳过，
+  PyInstaller 冻结与 EXE 自检通过；真实 RC003 和宿主输入法仍待人工实测。
+
 ### 2026-08-28 语音程序快捷键自动读取与同步
 
 - 配置 schema 升到 7，搜狗、微信输入法、Windows 语音输入和自定义程序分别记忆

@@ -20,7 +20,7 @@ ComboBox {
     leftPadding: 7
     rightPadding: 24
     displayText: decoratedText(currentIndex, currentText)
-    font.family: tokens ? tokens.fontFamily : "Noto Sans SC"
+    font.family: tokens ? tokens.fontFamily : "Microsoft YaHei UI"
     font.pixelSize: tokens ? tokens.fontSizeControl : 12
     font.weight: Font.Medium
 

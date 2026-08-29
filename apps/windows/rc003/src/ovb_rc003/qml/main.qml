@@ -12,19 +12,6 @@ ApplicationWindow {
     minimumHeight: 480
     visible: true
 
-    FontLoader {
-        id: uiRegularFont
-        source: "fonts/NotoSansSC-Regular.ttf"
-    }
-    FontLoader {
-        id: uiMediumFont
-        source: "fonts/NotoSansSC-Medium.ttf"
-    }
-    FontLoader {
-        id: uiSemiBoldFont
-        source: "fonts/NotoSansSC-SemiBold.ttf"
-    }
-
     readonly property string preferredWindowsUiFont: "Microsoft YaHei UI"
     readonly property bool preferredWindowsUiFontAvailable:
         Qt.platform.os === "windows"
@@ -32,9 +19,7 @@ ApplicationWindow {
 
     property Tokens tokens: Tokens {
         fontFamily: window.preferredWindowsUiFontAvailable
-            ? window.preferredWindowsUiFont
-            : uiRegularFont.name.length > 0
-            ? uiRegularFont.name : "Noto Sans SC"
+            ? window.preferredWindowsUiFont : Qt.application.font.family
     }
     color: tokens.background
     font.family: tokens.fontFamily

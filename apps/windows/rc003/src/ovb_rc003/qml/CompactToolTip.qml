@@ -12,7 +12,7 @@ ToolTip {
     delay: 450
     timeout: 5000
     x: 0
-    y: -implicitHeight - root.tokens.spacingSmall
+    y: -implicitHeight - root.tokens.spacingSmall - tooltipBackground.border.width
     leftMargin: tokens.spacingSmall
     rightMargin: tokens.spacingSmall
     topMargin: tokens.spacingSmall
@@ -42,6 +42,7 @@ ToolTip {
     }
 
     background: Rectangle {
+        id: tooltipBackground
         objectName: root.objectName.length > 0 ? root.objectName + "_background" : ""
         radius: root.tokens.cornerRadiusControl
         color: root.tokens.surface
