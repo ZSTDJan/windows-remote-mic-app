@@ -30,8 +30,10 @@ deliver, MIC_OPEN is never sent at all - a device streaming into Windows
 without ever having actually tapped/held the configured hotkey is exactly
 the "voice opened after host-trigger failure" defect the round-2 review
 found. A playback write failure now also fails closed (closes and discards
-the sink) and requests a reconnect, instead of logging indefinitely while
-the device keeps streaming into nothing.
+the sink during reconnect cleanup) and requests a reconnect, instead of
+logging indefinitely while the device keeps streaming into nothing. Blocking
+writes run on a bounded FIFO worker, so ordinary BLE control handling does not
+wait for every PortAudio write.
 
 Cleanup ownership (XRBM-019 P1 #2, fixing XRBM-018 round 2 finding #2):
 stopping the Raw Input listener or closing the BLE session can now each
@@ -67,6 +69,7 @@ from . import __version__
 from . import (
     audio_output,
     audio_playback,
+    audio_playback_worker,
     action_executor,
     ble_transport_winrt,
     bridge_launcher,
@@ -275,6 +278,9 @@ class RC003App:
         self._key_detection_mic_audio_started = False
         self._key_detection_mic_sources_down: set[str] = set()
         self._playback: Optional[audio_playback.EndpointPlaybackSink] = None
+        self._playback_writer: Optional[
+            audio_playback_worker.PlaybackWriteWorker
+        ] = None
         self._voice_pcm_stats = PcmStats()
         self._event_loop = asyncio.get_event_loop()
         self._legacy_voice_event_generation = 0
@@ -628,6 +634,11 @@ class RC003App:
                 self._voice_audio_stream_active = False
                 self._voice_audio_stop_processed = False
                 self._voice_pcm_forwarding_enabled = False
+                flush_result = self._flush_playback_writer_locked("cleanup")
+                if not flush_result.completed:
+                    failures.append(
+                        "audio playback queue did not flush; owner retained"
+                    )
                 self._unsolicited_mic_close_pending = False
                 self._finish_voice_mic_gesture()
                 if self._voice_hotkey_release_pending is not None:
@@ -702,7 +713,17 @@ class RC003App:
                 failures.append("BLE session did not fully close; owner retained")
                 # self._ble_session is intentionally NOT cleared here either.
 
-        if self._playback is not None:
+        playback_writer_stopped = True
+        if self._playback_writer is not None:
+            playback_writer_stopped = self._playback_writer.stop()
+            if playback_writer_stopped:
+                self._playback_writer = None
+            else:
+                failures.append(
+                    "audio playback writer did not stop; owner retained"
+                )
+
+        if self._playback is not None and playback_writer_stopped:
             try:
                 self._playback.close()
                 self._playback = None
@@ -2140,6 +2161,12 @@ class RC003App:
                 self._voice_audio_stream_active = False
                 self._voice_audio_stop_processed = True
                 self._voice_pcm_forwarding_enabled = False
+                flush_result = self._flush_playback_writer_locked("audio stop")
+                if flush_result.error is not None:
+                    self._logger.error(
+                        "voice playback flush completed with failure: %s",
+                        flush_result.error,
+                    )
                 self._logger.info("voice audio stopped")
                 stats = self._voice_pcm_stats.summary()
                 self._logger.info(
@@ -2454,7 +2481,7 @@ class RC003App:
     def _open_playback_for_new_session(self) -> bool:
         if self._playback is not None:
             if getattr(self._playback, "ready", True):
-                return True
+                return self._ensure_playback_writer(self._playback)
             self._logger.warning(
                 "voice playback cannot reopen while a failed stream remains owned; "
                 "requesting cleanup"
@@ -2470,6 +2497,10 @@ class RC003App:
             sink = audio_playback.EndpointPlaybackSink(endpoint_name, endpoint_host_api)
             self._playback = sink
             sink.open()
+            if not self._ensure_playback_writer(sink):
+                raise audio_output.AudioOutputUnavailableError(
+                    "audio playback writer could not start"
+                )
             timing_snapshot = getattr(sink, "timing_snapshot", None)
             timing = timing_snapshot() if callable(timing_snapshot) else None
             if timing is None:
@@ -2513,72 +2544,107 @@ class RC003App:
                 self._supervisor.request_reconnect()
             return False
 
-    def _on_pcm_frame(self, samples) -> None:
-        """Fails closed on a write failure (XRBM-014 review round 2 P1 #6):
-        a broken playback sink must not be left open logging indefinitely
-        while the device keeps streaming into it - request a reconnect so
-        the next attempt starts from a clean state, unconditionally either
-        way. Whether ``self._playback`` itself is cleared here depends on
-        whether the follow-up ``close()`` actually succeeds (XRBM-019
-        review round 1 P1 #5): a sink whose close call also failed still
-        owns a PortAudio stream, and clearing the reference would hide that
-        incompletely closed resource and let a reconnect open a second sink
-        over it - the owner is only cleared once close() confirms success,
-        same rule as ``_cleanup_once()``'s HID/BLE/playback steps.
-
-        Runs on ble_transport_winrt.py's dedicated worker thread (not the
-        event loop thread), so ``request_reconnect()`` must be - and is -
-        safe to call cross-thread (see connection_supervisor.py).
-        """
-
-        if self._playback is None or not self._voice_pcm_forwarding_enabled:
-            return
-        try:
-            self._voice_pcm_stats.add(samples)
-            self._playback.write(samples)
-            if self._voice_pcm_stats.frames in (1, 10) or self._voice_pcm_stats.frames % 200 == 0:
-                stats = self._voice_pcm_stats.summary()
-                timing_snapshot = getattr(
-                    self._playback, "timing_snapshot", None
-                )
-                timing = timing_snapshot() if callable(timing_snapshot) else None
-                if timing is None:
-                    self._logger.info(
-                        "voice PCM progress: frames=%s samples=%s peak=%s rms=%.1f "
-                        "mean_abs=%.1f clipped=%.3f%%",
-                        stats["frames"],
-                        stats["samples"],
-                        stats["peak"],
-                        stats["rms"],
-                        stats["mean_abs"],
-                        stats["clipped_pct"],
-                    )
-                else:
-                    self._logger.info(
-                        "voice PCM progress: frames=%s samples=%s peak=%s rms=%.1f "
-                        "mean_abs=%.1f clipped=%.3f%% write_ms=%.2f "
-                        "max_write_ms=%.2f underflows=%s",
-                        stats["frames"],
-                        stats["samples"],
-                        stats["peak"],
-                        stats["rms"],
-                        stats["mean_abs"],
-                        stats["clipped_pct"],
-                        timing.last_write_elapsed_ms,
-                        timing.max_write_elapsed_ms,
-                        timing.underflow_count,
-                    )
-        except Exception:
-            self._voice_pcm_forwarding_enabled = False
-            self._logger.exception("audio playback write failed; failing closed")
-            try:
-                self._playback.close()
-                self._playback = None
-            except Exception:
-                self._logger.exception("cleanup: closing the failed playback sink failed")
-                # self._playback is intentionally NOT cleared here: it may
-                # still own a live PortAudio stream.
+    def _ensure_playback_writer(self, sink) -> bool:
+        writer = self._playback_writer
+        if writer is not None:
+            if writer.is_alive and writer.failure is None:
+                return True
+            self._logger.warning(
+                "voice playback writer is unavailable; requesting cleanup"
+            )
             self._supervisor.request_reconnect()
+            return False
+        writer = audio_playback_worker.PlaybackWriteWorker(
+            lambda samples: self._write_playback_frame(sink, samples),
+            self._on_playback_worker_error,
+        )
+        try:
+            writer.start()
+        except Exception:
+            self._logger.exception("voice playback writer failed to start")
+            return False
+        self._playback_writer = writer
+        return True
+
+    def _on_playback_worker_error(self, error: BaseException) -> None:
+        self._voice_pcm_forwarding_enabled = False
+        self._logger.error("audio playback worker failed; failing closed: %s", error)
+        self._supervisor.request_reconnect()
+
+    def _flush_playback_writer_locked(
+        self,
+        reason: str,
+    ) -> audio_playback_worker.PlaybackFlushResult:
+        writer = self._playback_writer
+        if writer is None:
+            return audio_playback_worker.PlaybackFlushResult(True)
+        result = writer.flush()
+        if not result.completed:
+            self._voice_pcm_forwarding_enabled = False
+            self._logger.error(
+                "audio playback flush failed during %s: %s",
+                reason,
+                result.error or "unknown error",
+            )
+            self._supervisor.request_reconnect()
+        return result
+
+    def _write_playback_frame(self, sink, samples) -> None:
+        if sink is not self._playback:
+            raise RuntimeError("audio playback sink changed while a write was queued")
+        self._voice_pcm_stats.add(samples)
+        sink.write(samples)
+        if (
+            self._voice_pcm_stats.frames in (1, 10)
+            or self._voice_pcm_stats.frames % 200 == 0
+        ):
+            stats = self._voice_pcm_stats.summary()
+            timing_snapshot = getattr(sink, "timing_snapshot", None)
+            timing = timing_snapshot() if callable(timing_snapshot) else None
+            if timing is None:
+                self._logger.info(
+                    "voice PCM progress: frames=%s samples=%s peak=%s rms=%.1f "
+                    "mean_abs=%.1f clipped=%.3f%%",
+                    stats["frames"],
+                    stats["samples"],
+                    stats["peak"],
+                    stats["rms"],
+                    stats["mean_abs"],
+                    stats["clipped_pct"],
+                )
+            else:
+                self._logger.info(
+                    "voice PCM progress: frames=%s samples=%s peak=%s rms=%.1f "
+                    "mean_abs=%.1f clipped=%.3f%% write_ms=%.2f "
+                    "max_write_ms=%.2f underflows=%s",
+                    stats["frames"],
+                    stats["samples"],
+                    stats["peak"],
+                    stats["rms"],
+                    stats["mean_abs"],
+                    stats["clipped_pct"],
+                    timing.last_write_elapsed_ms,
+                    timing.max_write_elapsed_ms,
+                    timing.underflow_count,
+                )
+
+    def _on_pcm_frame(self, samples) -> None:
+        """Queue one immutable PCM frame without blocking the BLE worker."""
+
+        with self._voice_trigger_lock:
+            sink = self._playback
+            if (
+                sink is None
+                or not self._accept_input_events
+                or not self._voice_pcm_forwarding_enabled
+            ):
+                return
+            if not self._ensure_playback_writer(sink):
+                self._voice_pcm_forwarding_enabled = False
+                return
+            writer = self._playback_writer
+            if writer is None or not writer.submit(samples):
+                self._voice_pcm_forwarding_enabled = False
 
 
 async def _run(

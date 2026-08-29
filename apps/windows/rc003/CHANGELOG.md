@@ -48,6 +48,15 @@
    `bugs/BUG-025-bridge-startup-readiness-warning.md`、
    `bugs/BUG-026-bridge-liveness-and-first-key-readiness.md` 和 `TESTING.md`。
 
+### 2026-08-29 BLE 控制与阻塞音频播放隔离
+
+- 解码后 PCM 改为快速进入 64 帧有界 FIFO，PortAudio 阻塞写入由独立播放
+  worker 串行执行，不再占用 BLE 解码与普通控制事件回调。
+- `AUDIO_STOP` 等待 FIFO 屏障后再执行宿主收尾；队列满、写失败、屏障超时
+  都停止转发并请求重连。清理保持 worker 先停、sink 后关的所有权顺序。
+- 完整 unittest 1651 项通过、7 项按平台或安全条件跳过。本轮不构建、
+  不打包；真实 RC003 短说、长说、连续两次、断开/重连和休眠恢复为检查点待实测。
+
 ### 2026-08-29 恢复系统字体打包方案
 
 - 当前开发分支重新统一使用 Windows 系统中文 UI 字体，删除三套 Noto Sans SC

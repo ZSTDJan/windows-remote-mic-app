@@ -24,6 +24,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -184,6 +185,11 @@ class _AppWiringTestCase(unittest.TestCase):
         self.app._ble_session = _FakeBleSession()
 
     def tearDown(self):
+        playback_writer = self.app._playback_writer
+        if playback_writer is not None:
+            playback_writer.flush(1.0)
+            playback_writer.stop(1.0)
+            self.app._playback_writer = None
         # XRBM-023: logging_setup.get_logger() configures its FileHandler
         # exactly once per process (module-global ``_configured``) and never
         # closes it - correct for a real long-running app, but in this suite
@@ -210,6 +216,11 @@ class _AppWiringTestCase(unittest.TestCase):
 
     def _drain_event_loop(self):
         self._loop.run_until_complete(asyncio.sleep(0))
+
+    def _flush_playback(self):
+        writer = self.app._playback_writer
+        self.assertIsNotNone(writer)
+        return writer.flush(1.0)
 
     def _save_voice_settings(self, *, mode: str, hotkey_text: str) -> None:
         refreshed = config.load_config(self.app._config_path)
@@ -2811,7 +2822,7 @@ class PlaybackWriteFailureTests(_AppWiringTestCase):
     while the device keeps streaming.
     """
 
-    def test_write_failure_closes_sink_and_requests_reconnect(self):
+    def test_write_failure_requests_reconnect_and_cleanup_closes_sink(self):
         sink = _FakePlaybackSink(fail_write=True)
         self.app._playback = sink
         self.app._voice_pcm_forwarding_enabled = True
@@ -2819,10 +2830,17 @@ class PlaybackWriteFailureTests(_AppWiringTestCase):
         self.app._supervisor.request_reconnect = lambda: reconnect_calls.append(1)
 
         self.app._on_pcm_frame([0, 0])
+        result = self._flush_playback()
 
+        self.assertTrue(result.completed)
+        self.assertIsInstance(result.error, OSError)
+        self.assertFalse(sink.closed)
+        self.assertIs(self.app._playback, sink)
+        self.assertEqual(reconnect_calls, [1])
+
+        _run(self.app._cleanup_once())
         self.assertTrue(sink.closed)
         self.assertIsNone(self.app._playback)
-        self.assertEqual(reconnect_calls, [1])
 
     def test_write_success_does_not_touch_playback_or_reconnect(self):
         self.app._voice_pcm_forwarding_enabled = True
@@ -2830,6 +2848,7 @@ class PlaybackWriteFailureTests(_AppWiringTestCase):
         self.app._supervisor.request_reconnect = lambda: reconnect_calls.append(1)
 
         self.app._on_pcm_frame([0, 0])
+        self.assertTrue(self._flush_playback().ok)
 
         self.assertIsNotNone(self.app._playback)
         self.assertEqual(reconnect_calls, [])
@@ -2850,11 +2869,107 @@ class PlaybackWriteFailureTests(_AppWiringTestCase):
 
         with self.assertLogs(self.app._logger, level="INFO") as captured:
             self.app._on_pcm_frame([1, 2, 3])
+            self.assertTrue(self._flush_playback().ok)
 
         self.assertIn(
             "write_ms=2.50 max_write_ms=3.50 underflows=2",
             "\n".join(captured.output),
         )
+
+    def test_pcm_enqueue_does_not_wait_for_a_blocking_sink_write(self):
+        write_started = threading.Event()
+        release_write = threading.Event()
+
+        class BlockingSink(_FakePlaybackSink):
+            def write(self, samples):
+                write_started.set()
+                release_write.wait(2.0)
+                super().write(samples)
+
+        self.app._playback = BlockingSink()
+        self.app._voice_pcm_forwarding_enabled = True
+
+        started = time.monotonic()
+        self.app._on_pcm_frame([1, 2, 3])
+        elapsed = time.monotonic() - started
+
+        self.assertTrue(write_started.wait(1.0))
+        self.assertLess(elapsed, 0.1)
+        release_write.set()
+        self.assertTrue(self._flush_playback().ok)
+
+    def test_audio_stop_waits_for_queued_pcm_before_releasing_hotkey(self):
+        write_started = threading.Event()
+        release_write = threading.Event()
+        key_up_calls = []
+
+        class BlockingSink(_FakePlaybackSink):
+            def write(self, samples):
+                write_started.set()
+                release_write.wait(2.0)
+                super().write(samples)
+
+        self.app._playback = BlockingSink()
+        self.app._voice.on_mic_button_pressed()
+        self.app._voice_audio_stream_active = True
+        self.app._voice_audio_stop_processed = False
+        self.app._voice_pcm_forwarding_enabled = True
+        self.app._on_pcm_frame([1, 2, 3])
+        self.assertTrue(write_started.wait(1.0))
+
+        with mock.patch.object(
+            win32_input,
+            "send_voice_key_combo_up",
+            side_effect=lambda tokens: key_up_calls.append(tokens),
+        ):
+            stop_thread = threading.Thread(
+                target=self.app._on_control_event,
+                args=(AudioStopped(),),
+            )
+            stop_thread.start()
+            time.sleep(0.05)
+            self.assertTrue(stop_thread.is_alive())
+            self.assertEqual(key_up_calls, [])
+            release_write.set()
+            stop_thread.join(1.0)
+
+        self.assertFalse(stop_thread.is_alive())
+        self.assertEqual(key_up_calls, [DEFAULT_VOICE_TOKENS])
+
+    def test_full_playback_queue_disables_forwarding_and_requests_reconnect(self):
+        write_started = threading.Event()
+        release_write = threading.Event()
+        reconnect_calls = []
+        sink = _FakePlaybackSink()
+
+        def write(samples):
+            write_started.set()
+            release_write.wait(2.0)
+            self.app._write_playback_frame(sink, samples)
+
+        self.app._playback = sink
+        self.app._supervisor.request_reconnect = lambda: reconnect_calls.append(1)
+        writer = app_module.audio_playback_worker.PlaybackWriteWorker(
+            write,
+            self.app._on_playback_worker_error,
+            max_pending_frames=1,
+        )
+        writer.start()
+        self.app._playback_writer = writer
+        self.app._voice_pcm_forwarding_enabled = True
+        self.app._on_pcm_frame([1])
+        self.assertTrue(write_started.wait(1.0))
+        self.app._on_pcm_frame([2])
+        self.app._on_pcm_frame([3])
+
+        self.assertFalse(self.app._voice_pcm_forwarding_enabled)
+        self.assertEqual(reconnect_calls, [1])
+        self.assertIsInstance(
+            writer.failure,
+            app_module.audio_playback_worker.PlaybackBackpressureError,
+        )
+        release_write.set()
+        self.assertTrue(self._flush_playback().completed)
 
     def test_no_playback_open_is_a_silent_no_op(self):
         self.app._playback = None
@@ -2897,6 +3012,7 @@ class CrossThreadReconnectTests(_AppWiringTestCase):
         worker = threading.Thread(target=self.app._on_pcm_frame, args=([0, 0],))
         worker.start()
         worker.join(timeout=2.0)
+        self._flush_playback()
 
         self.assertEqual(len(reconnect_calls), 1)
         self.assertNotEqual(reconnect_calls[0], threading.main_thread())
@@ -3451,7 +3567,35 @@ class PlaybackCleanupOwnershipTests(_AppWiringTestCase):
         self.assertEqual(sink.close_calls, 1)
         self.assertFalse(sink.closed)
 
-    def test_on_pcm_frame_write_fail_then_close_raise_retains_owner(self):
+    def test_cleanup_retains_sink_when_playback_writer_does_not_stop(self):
+        sink = _FakePlaybackSink()
+
+        class StuckWriter:
+            def flush(self, _timeout=None):
+                return app_module.audio_playback_worker.PlaybackFlushResult(
+                    False,
+                    app_module.audio_playback_worker.PlaybackFlushTimeoutError(
+                        "stuck"
+                    ),
+                )
+
+            def stop(self, _timeout=None):
+                return False
+
+        self.app._hid_listener = None
+        self.app._ble_session = _FakeBleSession()
+        self.app._playback = sink
+        self.app._playback_writer = StuckWriter()
+
+        with self.assertRaises(app_module.CleanupIncompleteError) as ctx:
+            _run(self.app._cleanup_once())
+
+        self.assertIn("audio playback writer", str(ctx.exception))
+        self.assertIs(self.app._playback, sink)
+        self.assertIsNotNone(self.app._playback_writer)
+        self.assertEqual(sink.close_calls, 0)
+
+    def test_write_fail_then_cleanup_close_raise_retains_owner(self):
         sink = _FakePlaybackSink(fail_write=True, close_raises=True)
         self.app._playback = sink
         self.app._voice_pcm_forwarding_enabled = True
@@ -3459,6 +3603,12 @@ class PlaybackCleanupOwnershipTests(_AppWiringTestCase):
         self.app._supervisor.request_reconnect = lambda: reconnect_calls.append(1)
 
         self.app._on_pcm_frame([0, 0])  # must not raise
+        result = self._flush_playback()
+        self.assertTrue(result.completed)
+        self.assertIsInstance(result.error, OSError)
+
+        with self.assertRaises(app_module.CleanupIncompleteError):
+            _run(self.app._cleanup_once())
 
         # Retained, not discarded - close() also failed:
         self.assertIs(self.app._playback, sink)

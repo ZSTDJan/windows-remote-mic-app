@@ -271,6 +271,12 @@ producer lock 保护。一般控制仍优先，但 `AUDIO_STOP` 必须先排空�
 - 16 kHz 单声道 PCM 按端点能力转换采样率和声道；
 - 流关闭失败时保留对象引用，后续清理继续重试。
 
+`audio_playback_worker.py` 在 BLE 解码回调与 PortAudio 阻塞写入之间维护 64 帧
+有界 FIFO。PCM 回调只做不可变副本和快速入队；音频停止使用 FIFO 屏障，
+屏障前的块已写完后才执行宿主收尾。队列满、写失败或屏障超时会停止
+本轮转发并请求重连。清理必须先停播放 worker，worker 未停止时不得关闭
+或丢失它仍可能使用的 sink。
+
 通常输出端点选择 `CABLE Input`，VB-CABLE 再把它暴露为录音端点供输入法或
 语音应用使用。软件不会静默安装驱动；设置页只能在用户明确确认后启动随包、
 哈希校验通过的厂商安装程序。
@@ -427,6 +433,7 @@ VB-CABLE 的检测、确认和 UAC 安装继续只有 `DiagnosticsPage.qml` 一�
 | --- | --- | --- |
 | asyncio 主线程 | supervisor、BLE 生命周期、托盘退出协调 | cleanup 失败则停止重连循环 |
 | BLE worker | CONTROL/AUDIO 队列和解码回调 | 异常通知 supervisor，不静默死亡 |
+| 音频播放 worker | 64 帧 PCM FIFO、停止屏障和阻塞式 PortAudio 写入 | 队列满/写失败/屏障超时停止转发并请求重连；未停止时保留 sink |
 | Raw Input 线程 | 隐藏窗口、设备通知、按键状态 | join 超时保留 listener 引用 |
 | 低层钩子线程 | F5/原生键抑制 | 消息队列 ready 后才报告启动成功 |
 | HID tap 线程/注入子进程 | loopback server、目标进程句柄、Gadget 消息 | 验证客户端 PID，心跳/大小有界 |
@@ -521,7 +528,7 @@ F5 不再向输入框泄漏日期时间。On-request 真机探针最终未收到
 | 入口与总装 | `launcher.py`、`__main__.py`、`app.py` |
 | 连接监督 | `connection_supervisor.py`、`single_instance.py` |
 | BLE/ATVV | `ble_transport_winrt.py`、`atvv_protocol.py`、`atvv_session.py` |
-| 音频 | `audio_output.py`、`audio_playback.py` |
+| 音频 | `audio_output.py`、`audio_playback.py`、`audio_playback_worker.py` |
 | 普通按键 | `raw_input_windows.py`、`hid_identity.py`、`button_gesture.py` |
 | 动作输出 | `key_mapping.py`、`win32_input.py`、`action_executor.py` |
 | F5/去重 | `legacy_key_suppressor_windows.py`、`hotkey_capture_windows.py` |
