@@ -614,6 +614,10 @@ Item {
                             placeholderText: qsTr("点击录入")
                             Accessible.name: qsTr("语音按键，点击后直接录入")
                             Keys.onEscapePressed: root.stopVoiceHotkeyCapture()
+                            onActiveFocusChanged: {
+                                if (!activeFocus && root.voiceHotkeyRecording)
+                                    root.stopVoiceHotkeyCapture()
+                            }
                             TapHandler { onTapped: root.startVoiceHotkeyCapture() }
                         },
                         CompactButton {
@@ -745,6 +749,26 @@ Item {
             }
 
             Item { Layout.preferredHeight: tokens.pageVerticalPadding }
+        }
+    }
+
+    TapHandler {
+        parent: voiceScroll.contentItem
+        objectName: "voiceHotkeyOutsideTapHandler"
+        enabled: root.voiceHotkeyRecording
+        acceptedButtons: Qt.AllButtons
+        onTapped: function(eventPoint, button) {
+            const fieldPoint = voiceHotkeyField.mapFromItem(
+                voiceScroll.contentItem,
+                eventPoint.position.x,
+                eventPoint.position.y
+            )
+            const insideField = fieldPoint.x >= 0
+                && fieldPoint.y >= 0
+                && fieldPoint.x < voiceHotkeyField.width
+                && fieldPoint.y < voiceHotkeyField.height
+            if (!insideField)
+                root.stopVoiceHotkeyCapture()
         }
     }
 }

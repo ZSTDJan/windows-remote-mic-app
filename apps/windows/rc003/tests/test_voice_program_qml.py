@@ -10,7 +10,8 @@ _PROBE = r"""
 import json
 import os
 
-from PySide6.QtCore import QPointF
+from PySide6.QtCore import QPointF, Qt
+from PySide6.QtTest import QTest
 from ovb_rc003 import qt_settings_app as m
 
 
@@ -65,6 +66,21 @@ qmlRegisterSingletonInstance = classes["qmlRegisterSingletonInstance"]
 ButtonMappingModel = classes["ButtonMappingModel"]
 SettingsController = classes["SettingsController"]
 DiagnosticsController = classes["DiagnosticsController"]
+
+
+class FakeHotkeyCapture:
+    def __init__(self, on_captured):
+        self.on_captured = on_captured
+        self.is_running = False
+
+    def start(self):
+        self.is_running = True
+
+    def stop(self):
+        self.is_running = False
+
+
+m.hotkey_capture_windows.HotkeyCapture = FakeHotkeyCapture
 
 QQuickStyle.setStyle("Basic")
 app = QGuiApplication.instance() or QGuiApplication([])
@@ -126,6 +142,60 @@ controls = {
     )
 }
 assert all(control is not None for control in controls.values())
+find(window, "voiceProgramStatusRefreshTimer").setProperty("running", False)
+
+voice_page = find(window, "voiceScroll").parent()
+hotkey_field = controls["holdVoiceHotkeyField"]
+original_hotkey = str(controller.holdVoiceHotkeyText)
+hotkey_center = hotkey_field.mapToScene(
+    QPointF(
+        hotkey_field.property("width") / 2,
+        hotkey_field.property("height") / 2,
+    )
+).toPoint()
+QTest.mouseClick(window, Qt.LeftButton, Qt.NoModifier, hotkey_center)
+render(window, app)
+recording_prompt = str(hotkey_field.property("text"))
+outside_target = controls["voiceProgramLaunchText"]
+outside_center = outside_target.mapToScene(
+    QPointF(
+        outside_target.property("width") / 2,
+        outside_target.property("height") / 2,
+    )
+).toPoint()
+QTest.mouseClick(window, Qt.LeftButton, Qt.NoModifier, outside_center)
+render(window, app)
+hotkey_cancel = {
+    "recording_prompt": recording_prompt,
+    "recording": bool(voice_page.property("voiceHotkeyRecording")),
+    "field_text": str(hotkey_field.property("text")),
+    "controller_text": str(controller.holdVoiceHotkeyText),
+    "original_text": original_hotkey,
+}
+
+elevated = controls["voiceProgramElevatedCheckBox"]
+elevated_before = bool(controller.voiceProgramLaunchElevated)
+QTest.mouseClick(window, Qt.LeftButton, Qt.NoModifier, hotkey_center)
+render(window, app)
+elevated_center = elevated.mapToScene(
+    QPointF(
+        elevated.property("width") / 2,
+        elevated.property("height") / 2,
+    )
+).toPoint()
+QTest.mouseClick(window, Qt.LeftButton, Qt.NoModifier, elevated_center)
+render(window, app)
+hotkey_other_action = {
+    "recording": bool(voice_page.property("voiceHotkeyRecording")),
+    "action_completed": bool(controller.voiceProgramLaunchElevated)
+    != elevated_before,
+    "field_text": str(hotkey_field.property("text")),
+    "original_text": original_hotkey,
+}
+controller.voiceProgramLaunchElevated = elevated_before
+controller._voice_program_status_code = "not_found"
+controller.voiceProgramStatusCodeChanged.emit()
+render(window, app)
 
 managed = {
     name: {
@@ -140,7 +210,6 @@ managed = {
 managed_auto_start = bool(controller.voiceProgramLaunchOnBridgeStart)
 managed_elevated = bool(controller.voiceProgramLaunchElevated)
 managed_status = str(controls["voiceProgramLaunchText"].property("text"))
-find(window, "voiceProgramStatusRefreshTimer").setProperty("running", False)
 
 
 def rendered_status(
@@ -289,6 +358,8 @@ result = {
     "status": managed_status,
     "managed_auto_start": managed_auto_start,
     "managed_elevated": managed_elevated,
+    "hotkey_cancel": hotkey_cancel,
+    "hotkey_other_action": hotkey_other_action,
     "status_cases": status_cases,
     "system_managed": system_managed,
     "windows_dictation": windows_dictation,
@@ -339,6 +410,22 @@ class VoiceProgramQmlTests(unittest.TestCase):
         )
         self.assertTrue(data["managed_auto_start"])
         self.assertTrue(data["managed_elevated"])
+        self.assertEqual(data["hotkey_cancel"]["recording_prompt"], "请按快捷键")
+        self.assertFalse(data["hotkey_cancel"]["recording"])
+        self.assertEqual(
+            data["hotkey_cancel"]["field_text"],
+            data["hotkey_cancel"]["original_text"],
+        )
+        self.assertEqual(
+            data["hotkey_cancel"]["controller_text"],
+            data["hotkey_cancel"]["original_text"],
+        )
+        self.assertFalse(data["hotkey_other_action"]["recording"])
+        self.assertTrue(data["hotkey_other_action"]["action_completed"])
+        self.assertEqual(
+            data["hotkey_other_action"]["field_text"],
+            data["hotkey_other_action"]["original_text"],
+        )
         self.assertEqual(data["elevated_indicator"]["width"], 16)
         self.assertEqual(data["elevated_indicator"]["height"], 16)
         self.assertAlmostEqual(
