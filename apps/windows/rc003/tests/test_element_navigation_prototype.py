@@ -193,39 +193,6 @@ class SpatialNavigationTests(unittest.TestCase):
 
         self.assertEqual(graph.candidates(0, prototype.Direction.UP)[0], 1)
 
-    def test_wide_edit_is_one_cell_spanning_two_vertical_tracks(self):
-        targets = [
-            prototype.TargetSnapshot(
-                prototype.Rect(100, 400, 900, 470),
-                "输入框",
-                "EditControl",
-                path=(0, 2, 9),
-                keyboard_focusable=True,
-            ),
-            self.target(140, 520, 200, 560, "红色下方", path=(0, 2, 10, 0)),
-            self.target(800, 520, 860, 560, "蓝色下方", path=(0, 2, 10, 1)),
-            self.target(140, 250, 200, 290, "红色上方", path=(0, 2, 7, 0)),
-            self.target(800, 320, 860, 360, "蓝色上方", path=(0, 2, 8, 0)),
-        ]
-        graph = prototype.NavigationGraph(targets)
-
-        self.assertEqual(graph.candidates(1, prototype.Direction.UP)[0], 0)
-        self.assertEqual(graph.candidates(2, prototype.Direction.UP)[0], 0)
-        self.assertEqual(graph.candidates(0, prototype.Direction.UP)[:2], (4, 3))
-        self.assertEqual(graph.candidates(0, prototype.Direction.DOWN)[:2], (1, 2))
-
-    def test_wide_non_edit_action_does_not_claim_multiple_vertical_tracks(self):
-        targets = [
-            self.target(100, 400, 900, 470, "通长动作", path=(0, 2, 9)),
-            self.target(140, 520, 200, 560, "当前", path=(0, 2, 10, 0)),
-            self.target(140, 250, 200, 290, "同列上方", path=(0, 2, 7, 0)),
-        ]
-
-        self.assertEqual(
-            prototype.next_target_index(targets, 1, prototype.Direction.UP),
-            2,
-        )
-
     def test_top_sidebar_button_moves_down_to_nearest_row_not_bottom_action(self):
         targets = [
             self.target(95, 35, 122, 65, "侧栏按钮", path=(0, 1, 0)),

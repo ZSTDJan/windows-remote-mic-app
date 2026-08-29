@@ -114,9 +114,6 @@ VERTICAL_DIAGONAL_MAX_SLOPE = 4.0
 DIRECTION_LAYER_MIN_SPAN = 32.0
 DIRECTION_LAYER_MAX_SPAN = 96.0
 DIRECTION_LAYER_SIZE_MULTIPLIER = 1.5
-VERTICAL_SPANNING_CONTROL_TYPES = frozenset({"EditControl"})
-VERTICAL_SPANNING_MIN_WIDTH = 240
-VERTICAL_SPANNING_MIN_ASPECT_RATIO = 3.0
 GRID_SAFE_CELL_MAX_CHILDREN = 24
 VK_RETURN = 0x0D
 VK_ESCAPE = 0x1B
@@ -531,28 +528,6 @@ def target_has_interaction_evidence(target: TargetSnapshot) -> bool:
         target.has_action_pattern
         or target.supports_expand
         or target.control_type in PRIMARY_ACTION_CONTROL_TYPES
-    )
-
-
-def target_spans_vertical_tracks(target: TargetSnapshot, rect: Rect) -> bool:
-    """Return whether one real control may occupy several vertical tracks."""
-
-    return bool(
-        target.control_type in VERTICAL_SPANNING_CONTROL_TYPES
-        and target_has_interaction_evidence(target)
-        and rect.width >= VERTICAL_SPANNING_MIN_WIDTH
-        and rect.width
-        >= max(1, rect.height) * VERTICAL_SPANNING_MIN_ASPECT_RATIO
-    )
-
-
-def vertical_spanning_track_flags(
-    targets: Sequence[TargetSnapshot],
-    rects: Sequence[Rect],
-) -> tuple[bool, ...]:
-    return tuple(
-        target_spans_vertical_tracks(target, rects[index])
-        for index, target in enumerate(targets)
     )
 
 
@@ -1419,80 +1394,6 @@ def direction_score(
     )
 
 
-def _axis_point_gap(point: float, start: int, end: int) -> float:
-    if point < start:
-        return float(start - point)
-    if point > end:
-        return float(point - end)
-    return 0.0
-
-
-def _vertical_spanning_track_offset(
-    current_target: TargetSnapshot,
-    current: Rect,
-    candidate_target: TargetSnapshot,
-    candidate: Rect,
-    current_spans: Optional[bool] = None,
-    candidate_spans: Optional[bool] = None,
-) -> Optional[float]:
-    if current_spans is None:
-        current_spans = target_spans_vertical_tracks(current_target, current)
-    if candidate_spans is None:
-        candidate_spans = target_spans_vertical_tracks(candidate_target, candidate)
-    if not current_spans and not candidate_spans:
-        return None
-    current_offset = (
-        _axis_point_gap(candidate.center_x, current.left, current.right)
-        if current_spans
-        else None
-    )
-    candidate_offset = (
-        _axis_point_gap(current.center_x, candidate.left, candidate.right)
-        if candidate_spans
-        else None
-    )
-    if current_spans:
-        if candidate_offset is None:
-            return current_offset
-        return min(current_offset, candidate_offset)
-    return candidate_offset
-
-
-def _target_direction_score(
-    current_target: TargetSnapshot,
-    current: Rect,
-    candidate_target: TargetSnapshot,
-    candidate: Rect,
-    direction: Direction,
-    current_spans: Optional[bool] = None,
-    candidate_spans: Optional[bool] = None,
-) -> Optional[tuple[int, float, float, float, float, int, int]]:
-    score = direction_score(current, candidate, direction)
-    if score is None or direction in {Direction.LEFT, Direction.RIGHT}:
-        return score
-    if current_spans is False and candidate_spans is False:
-        return score
-    spanning_offset = _vertical_spanning_track_offset(
-        current_target,
-        current,
-        candidate_target,
-        candidate,
-        current_spans,
-        candidate_spans,
-    )
-    if spanning_offset != 0:
-        return score
-    return (
-        0,
-        score[1],
-        score[2],
-        score[3] - score[4] * 0.25,
-        0.0,
-        score[5],
-        score[6],
-    )
-
-
 def move_should_refresh_dynamic_targets(
     current: Rect,
     candidate: Optional[Rect],
@@ -1787,28 +1688,13 @@ def _vertical_soft_escape_index(
     directional: Sequence[int],
     direction: Direction,
     grid_rects: Sequence[Rect],
-    vertical_spans: Sequence[bool],
 ) -> Optional[int]:
     if not directional:
         return None
     current = grid_rects[current_index]
-    current_target = targets[current_index]
-    current_spans = vertical_spans[current_index]
     incumbent_index = directional[0]
     incumbent = grid_rects[incumbent_index]
-    incumbent_spans = vertical_spans[incumbent_index]
-    if current_spans or incumbent_spans:
-        incumbent_score = _target_direction_score(
-            current_target,
-            current,
-            targets[incumbent_index],
-            incumbent,
-            direction,
-            current_spans,
-            incumbent_spans,
-        )
-    else:
-        incumbent_score = direction_score(current, incumbent, direction)
+    incumbent_score = direction_score(current, incumbent, direction)
     if incumbent_score is None or incumbent_score[0] != 0:
         return None
     incumbent_weighted_distance = _vertical_weighted_distance(incumbent_score)
@@ -1817,19 +1703,7 @@ def _vertical_soft_escape_index(
     eligible: list[tuple[float, int, int]] = []
     for natural_rank, candidate_index in enumerate(directional[1:], 1):
         candidate = grid_rects[candidate_index]
-        candidate_spans = vertical_spans[candidate_index]
-        if current_spans or candidate_spans:
-            candidate_score = _target_direction_score(
-                current_target,
-                current,
-                targets[candidate_index],
-                candidate,
-                direction,
-                current_spans,
-                candidate_spans,
-            )
-        else:
-            candidate_score = direction_score(current, candidate, direction)
+        candidate_score = direction_score(current, candidate, direction)
         if candidate_score is None or candidate_score[0] == 0:
             continue
         candidate_path = targets[candidate_index].path
@@ -1871,7 +1745,6 @@ def ranked_target_indices(
     direction: Direction,
     descendants_by_target: Optional[Sequence[Sequence[int]]] = None,
     grid_rects: Optional[Sequence[Rect]] = None,
-    vertical_spans: Optional[Sequence[bool]] = None,
 ) -> list[int]:
     if not targets or not 0 <= current_index < len(targets):
         return []
@@ -1879,12 +1752,7 @@ def ranked_target_indices(
         descendants_by_target = finer_descendant_index_map(targets)
     if grid_rects is None:
         grid_rects = navigation_grid_rects(targets, descendants_by_target)
-    if vertical_spans is None:
-        vertical_spans = vertical_spanning_track_flags(targets, grid_rects)
     current = grid_rects[current_index]
-    current_target = targets[current_index]
-    current_spans = vertical_spans[current_index]
-    vertical_direction = direction in {Direction.UP, Direction.DOWN}
     if direction in {Direction.LEFT, Direction.RIGHT}:
         diagonal_floor = max(
             HORIZONTAL_DIAGONAL_BASE_ALLOWANCE,
@@ -1904,19 +1772,7 @@ def ranked_target_indices(
         if index == current_index:
             continue
         candidate = grid_rects[index]
-        candidate_spans = vertical_spans[index]
-        if vertical_direction and (current_spans or candidate_spans):
-            score = _target_direction_score(
-                current_target,
-                current,
-                target,
-                candidate,
-                direction,
-                current_spans,
-                candidate_spans,
-            )
-        else:
-            score = direction_score(current, candidate, direction)
+        score = direction_score(current, candidate, direction)
         if score is None:
             continue
         if direction == Direction.RIGHT:
@@ -1964,7 +1820,6 @@ def ranked_target_indices(
         directional,
         direction,
         grid_rects,
-        vertical_spans,
     )
     if escape_index is None:
         return directional
@@ -1977,18 +1832,13 @@ def _preferred_grid_targets_for_index(
     targets: Sequence[TargetSnapshot],
     current_index: int,
     grid_rects: Sequence[Rect],
-    vertical_spans: Optional[Sequence[bool]] = None,
 ) -> dict[Direction, int]:
     """Calculate all four first-choice neighbors in one geometry pass."""
 
     if not targets or not 0 <= current_index < len(targets):
         return {}
-    if vertical_spans is None:
-        vertical_spans = vertical_spanning_track_flags(targets, grid_rects)
     current = grid_rects[current_index]
-    current_target = targets[current_index]
-    current_spans = vertical_spans[current_index]
-    current_path = current_target.path
+    current_path = targets[current_index].path
     best: dict[
         Direction,
         tuple[
@@ -2156,14 +2006,6 @@ def _preferred_grid_targets_for_index(
             else:
                 perpendicular_gap = 0
             center_offset = abs(candidate_center_x - current_center_x)
-            if (
-                current_spans
-                and current_left <= candidate_center_x <= current_right
-            ) or (
-                vertical_spans[index]
-                and candidate_left <= current_center_x <= candidate_right
-            ):
-                center_offset = 0.0
             overlap = max(
                 0,
                 min(current_right, candidate_right)
@@ -2300,15 +2142,11 @@ def best_grid_target_index(
     current_index: int,
     direction: Direction,
     grid_rects: Sequence[Rect],
-    vertical_spans: Optional[Sequence[bool]] = None,
 ) -> Optional[int]:
     """Return the first neighbor without sorting every fallback candidate."""
 
     return _preferred_grid_targets_for_index(
-        targets,
-        current_index,
-        grid_rects,
-        vertical_spans,
+        targets, current_index, grid_rects
     ).get(direction)
 
 
@@ -2359,7 +2197,6 @@ def build_navigation_diagnostic(
     current = targets[current_index]
     descendants_by_target = finer_descendant_index_map(targets)
     grid_rects = navigation_grid_rects(targets, descendants_by_target)
-    vertical_spans = vertical_spanning_track_flags(targets, grid_rects)
     current_rect = grid_rects[current_index]
     ranked = tuple(
         ranked_target_indices(
@@ -2368,7 +2205,6 @@ def build_navigation_diagnostic(
             direction,
             descendants_by_target,
             grid_rects,
-            vertical_spans,
         )
         if ranked_indices is None
         else ranked_indices
@@ -2380,19 +2216,10 @@ def build_navigation_diagnostic(
             direction,
             descendants_by_target,
             grid_rects,
-            vertical_spans,
         )
     )
     scored_by_index = {
-        index: _target_direction_score(
-            current,
-            current_rect,
-            targets[index],
-            grid_rects[index],
-            direction,
-            vertical_spans[current_index],
-            vertical_spans[index],
-        )
+        index: direction_score(current_rect, grid_rects[index], direction)
         for index in ranked
         if 0 <= index < len(targets) and index != current_index
     }
@@ -2401,15 +2228,7 @@ def build_navigation_diagnostic(
         if not 0 <= index < len(targets) or index == current_index:
             continue
         target = targets[index]
-        score = _target_direction_score(
-            current,
-            current_rect,
-            target,
-            grid_rects[index],
-            direction,
-            vertical_spans[current_index],
-            vertical_spans[index],
-        )
+        score = direction_score(current_rect, grid_rects[index], direction)
         if target.rect.contains(current.rect) and target.rect != current.rect:
             route = "parent_cell"
         elif index not in natural and target.rect.contains(current.rect):
@@ -2448,15 +2267,7 @@ def build_navigation_diagnostic(
         if target_rect == current_rect:
             reason = "same_rectangle"
         else:
-            score = _target_direction_score(
-                current,
-                current_rect,
-                target,
-                target_rect,
-                direction,
-                vertical_spans[current_index],
-                vertical_spans[index],
-            )
+            score = direction_score(current_rect, target_rect, direction)
             if score is None:
                 reason = "wrong_direction"
             elif not _direction_candidate_is_reasonable(
@@ -2649,9 +2460,6 @@ class NavigationGraph:
         self.grid_rects = navigation_grid_rects(
             self.targets, self._descendants_by_target
         )
-        self._vertical_spans = vertical_spanning_track_flags(
-            self.targets, self.grid_rects
-        )
         self._natural: dict[tuple[int, Direction], tuple[int, ...]] = {}
         self._preferred: dict[tuple[int, Direction], int] = {}
         self._repairs: dict[tuple[int, Direction], int] = {}
@@ -2660,7 +2468,6 @@ class NavigationGraph:
                 self.targets,
                 current_index,
                 self.grid_rects,
-                self._vertical_spans,
             ).items():
                 self._preferred[(current_index, direction)] = preferred
         self._repair_connectivity()
@@ -2686,9 +2493,7 @@ class NavigationGraph:
         for current_index, current_target in enumerate(self.targets):
             current = self.grid_rects[current_index]
             current_component = component_by_target[current_index]
-            current_spans = self._vertical_spans[current_index]
             for direction in Direction:
-                vertical_direction = direction in {Direction.UP, Direction.DOWN}
                 best_by_component: dict[
                     int, tuple[tuple[float, ...], int]
                 ] = {}
@@ -2696,25 +2501,11 @@ class NavigationGraph:
                     candidate_component = component_by_target[candidate_index]
                     if candidate_component == current_component:
                         continue
-                    candidate_spans = self._vertical_spans[candidate_index]
-                    if vertical_direction and (
-                        current_spans or candidate_spans
-                    ):
-                        score = _target_direction_score(
-                            current_target,
-                            current,
-                            candidate_target,
-                            self.grid_rects[candidate_index],
-                            direction,
-                            current_spans,
-                            candidate_spans,
-                        )
-                    else:
-                        score = direction_score(
-                            current,
-                            self.grid_rects[candidate_index],
-                            direction,
-                        )
+                    score = direction_score(
+                        current,
+                        self.grid_rects[candidate_index],
+                        direction,
+                    )
                     if score is None:
                         continue
                     if not _direction_candidate_is_reasonable(
@@ -2830,7 +2621,6 @@ class NavigationGraph:
                     direction,
                     self._descendants_by_target,
                     self.grid_rects,
-                    self._vertical_spans,
                 )
             )
             self._natural[key] = natural
