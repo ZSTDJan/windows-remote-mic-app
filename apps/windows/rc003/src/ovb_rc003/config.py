@@ -31,7 +31,7 @@ PRODUCT_ID = "RC003"
 CONFIG_FILENAME = "config.json"
 KEY_BINDINGS_FILENAME = "key_bindings.json"
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 RUNTIME_LEGACY_VOICE_MODE_KEY = "_legacy_voice_trigger_mode"
 RUNTIME_REMOVED_VOICE_BINDINGS_KEY = "_removed_voice_bindings"

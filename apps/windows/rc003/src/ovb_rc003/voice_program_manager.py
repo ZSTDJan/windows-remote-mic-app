@@ -42,11 +42,21 @@ VOICE_PROGRAM_PROVIDER_NAMES = {
 
 _SOGOU_PROCESS_NAME = "sogou_voice_assistant.exe"
 _SOGOU_RUN_VALUE_NAMES = ("搜狗语音输入法",)
+_SOGOU_SETTINGS_URI = (
+    "sgbiz:sg_process?module=sgmyinput.exe&param=-page%3Dkeyset"
+)
 _WETYPE_SERVER_NAME = "wetype_server.exe"
 _WETYPE_PROCESS_NAMES = (_WETYPE_SERVER_NAME, "wetype_service.exe")
+_WETYPE_SETTINGS_EXE = "wetype_update.exe"
+_WETYPE_SETTINGS_ARGUMENTS = "-showsetting"
+_WINDOWS_SPEECH_SETTINGS_URI = "ms-settings:speech"
 _SYSTEM_MANAGED_PROVIDERS = frozenset(
     {VOICE_PROGRAM_WETYPE, VOICE_PROGRAM_WINDOWS_DICTATION}
 )
+_LAUNCH_ELEVATED_DEFAULTS = {
+    VOICE_PROGRAM_SOGOU: True,
+    VOICE_PROGRAM_CUSTOM: False,
+}
 _ALLOWED_EXECUTABLE_SUFFIXES = frozenset({".exe", ".lnk"})
 _ERROR_CANCELLED = 1223
 _COINIT_APARTMENTTHREADED = 0x2
@@ -122,6 +132,19 @@ class VoiceProgramLaunchResult:
     elevated: Optional[bool] = None
 
 
+@dataclass(frozen=True)
+class VoiceProgramSettingsTarget:
+    provider_id: str
+    display_name: str
+    kind: str
+    target: str = ""
+    arguments: str = ""
+
+    @property
+    def available(self) -> bool:
+        return bool(self.target)
+
+
 def normalize_voice_program_settings(raw: object) -> dict[str, object]:
     """Return the stable persisted shape for optional provider management."""
 
@@ -131,6 +154,33 @@ def normalize_voice_program_settings(raw: object) -> dict[str, object]:
         provider_id = VOICE_PROGRAM_NONE
     executable = str(data.get("custom_executable", "")).strip()
     enabled = provider_id != VOICE_PROGRAM_NONE
+    raw_elevation_preferences = data.get("launch_elevated_by_provider")
+    if isinstance(raw_elevation_preferences, Mapping):
+        elevation_preferences = dict(_LAUNCH_ELEVATED_DEFAULTS)
+        for candidate_provider in _LAUNCH_ELEVATED_DEFAULTS:
+            if candidate_provider in raw_elevation_preferences:
+                elevation_preferences[candidate_provider] = (
+                    raw_elevation_preferences.get(candidate_provider) is True
+                )
+    elif "launch_elevated" in data:
+        # Schema 7 and older stored one shared switch. Preserve that exact
+        # choice for both launchable providers instead of applying a new
+        # default over an existing user's configuration.
+        legacy_elevated = data.get("launch_elevated") is True
+        elevation_preferences = {
+            candidate_provider: legacy_elevated
+            for candidate_provider in _LAUNCH_ELEVATED_DEFAULTS
+        }
+    else:
+        elevation_preferences = dict(_LAUNCH_ELEVATED_DEFAULTS)
+
+    if provider_id in elevation_preferences:
+        current_elevated = elevation_preferences[provider_id]
+    else:
+        # System-managed/disabled selections have no applicable switch. Keep
+        # the compatibility mirror so switching away and back does not erase
+        # the most recently selected launchable provider's preference.
+        current_elevated = data.get("launch_elevated") is True
     return {
         "provider": provider_id,
         "custom_executable": executable,
@@ -139,10 +189,8 @@ def normalize_voice_program_settings(raw: object) -> dict[str, object]:
             and not is_system_managed_provider(provider_id)
             and data.get("launch_on_bridge_start") is True
         ),
-        # Keep the user's elevation preference while management is disabled.
-        # It has no effect for provider=none and is reused if a provider is
-        # selected again later.
-        "launch_elevated": data.get("launch_elevated") is True,
+        "launch_elevated": current_elevated,
+        "launch_elevated_by_provider": elevation_preferences,
     }
 
 
@@ -287,6 +335,63 @@ def resolve_voice_program(
         "discovered" if executable is not None else "missing",
         executable,
     )
+
+
+def resolve_voice_program_settings_target(
+    settings: Mapping[str, object],
+    *,
+    platform: Optional[str] = None,
+    process_iter: Optional[Callable[[], Iterable[ProcessInfo]]] = None,
+    wetype_install_value_reader: Optional[Callable[[], Iterable[str]]] = None,
+    wetype_shortcut_iter: Optional[Callable[[], Iterable[Path]]] = None,
+    shortcut_resolver: Optional[Callable[[Path], Optional[Path]]] = None,
+) -> VoiceProgramSettingsTarget:
+    """Resolve the provider-owned settings entry without opening it."""
+
+    normalized = normalize_voice_program_settings(settings)
+    provider_id = str(normalized["provider"])
+    display_name = VOICE_PROGRAM_PROVIDER_NAMES[provider_id]
+    current_platform = sys.platform if platform is None else platform
+    if current_platform != "win32":
+        return VoiceProgramSettingsTarget(
+            provider_id, display_name, "unsupported"
+        )
+    if provider_id == VOICE_PROGRAM_SOGOU:
+        return VoiceProgramSettingsTarget(
+            provider_id, display_name, "uri", _SOGOU_SETTINGS_URI
+        )
+    if provider_id == VOICE_PROGRAM_WINDOWS_DICTATION:
+        return VoiceProgramSettingsTarget(
+            provider_id,
+            display_name,
+            "uri",
+            _WINDOWS_SPEECH_SETTINGS_URI,
+        )
+    if provider_id == VOICE_PROGRAM_WETYPE:
+        resolved = resolve_voice_program(
+            normalized,
+            platform=current_platform,
+            process_iter=process_iter,
+            wetype_install_value_reader=wetype_install_value_reader,
+            wetype_shortcut_iter=wetype_shortcut_iter,
+            shortcut_resolver=shortcut_resolver,
+        )
+        executable = resolved.executable
+        settings_executable = (
+            executable.parent / _WETYPE_SETTINGS_EXE
+            if executable is not None
+            else None
+        )
+        if settings_executable is not None and settings_executable.is_file():
+            return VoiceProgramSettingsTarget(
+                provider_id,
+                display_name,
+                "executable",
+                str(settings_executable),
+                _WETYPE_SETTINGS_ARGUMENTS,
+            )
+        return VoiceProgramSettingsTarget(provider_id, display_name, "missing")
+    return VoiceProgramSettingsTarget(provider_id, display_name, "unsupported")
 
 
 def inspect_voice_program(

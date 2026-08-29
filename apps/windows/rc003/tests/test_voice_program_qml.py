@@ -10,8 +10,7 @@ _PROBE = r"""
 import json
 import os
 
-from PySide6.QtCore import QPointF, Qt
-from PySide6.QtTest import QTest
+from PySide6.QtCore import QPointF
 from ovb_rc003 import qt_settings_app as m
 
 
@@ -107,11 +106,6 @@ controller.selectedVoiceProgramIndex = 1
 render(window, app)
 elevated = find(window, "voiceProgramElevatedCheckBox")
 elevated_indicator = elevated.property("indicator")
-point = elevated.mapToScene(
-    QPointF(elevated.property("width") / 2, elevated.property("height") / 2)
-).toPoint()
-QTest.mouseClick(window, Qt.LeftButton, Qt.NoModifier, point)
-render(window, app, 3)
 image = window.grabWindow()
 screenshot = os.environ.get("VOICE_PROGRAM_SCREENSHOT")
 if screenshot:
@@ -125,6 +119,7 @@ controls = {
         "holdVoiceHotkeyField",
         "voiceProgramElevatedCheckBox",
         "voiceProgramLaunchText",
+        "openVoiceProgramSettingsButton",
     )
 }
 assert all(control is not None for control in controls.values())
@@ -231,6 +226,9 @@ system_managed = {
     "custom_path_visible": bool(
         find(window, "voiceProgramCustomPathField").property("visible")
     ),
+    "settings_visible": bool(
+        find(window, "openVoiceProgramSettingsButton").property("visible")
+    ),
 }
 
 controller.selectedVoiceProgramIndex = 3
@@ -242,8 +240,15 @@ windows_dictation = {
     "hotkey_button_visible": bool(
         find(window, "useWindowsDictationHotkeyButton").property("visible")
     ),
-    "speech_settings_visible": bool(
-        find(window, "openSpeechSettingsButton").property("visible")
+    "settings_visible": bool(
+        find(window, "openVoiceProgramSettingsButton").property("visible")
+    ),
+    "hotkey_field_geometry": geometry(find(window, "holdVoiceHotkeyField")),
+    "hotkey_button_geometry": geometry(
+        find(window, "useWindowsDictationHotkeyButton")
+    ),
+    "settings_button_geometry": geometry(
+        find(window, "openVoiceProgramSettingsButton")
     ),
     "launch_text": str(find(window, "voiceProgramLaunchText").property("text")),
 }
@@ -255,6 +260,9 @@ custom_program = {
         find(window, "voiceProgramCustomPathField").property("visible")
     ),
     "elevated_visible": bool(elevated.property("visible")),
+    "settings_visible": bool(
+        find(window, "openVoiceProgramSettingsButton").property("visible")
+    ),
 }
 
 controller.selectedVoiceProgramIndex = 0
@@ -330,6 +338,7 @@ class VoiceProgramQmlTests(unittest.TestCase):
         self.assertFalse(data["system_managed"]["auto_start"])
         self.assertFalse(data["system_managed"]["elevated_visible"])
         self.assertFalse(data["system_managed"]["custom_path_visible"])
+        self.assertTrue(data["system_managed"]["settings_visible"])
         self.assertEqual(
             data["system_managed"]["launch_text"],
             "由 Windows 管理，无需本程序启动",
@@ -338,13 +347,26 @@ class VoiceProgramQmlTests(unittest.TestCase):
         self.assertFalse(data["windows_dictation"]["auto_start"])
         self.assertFalse(data["windows_dictation"]["elevated_visible"])
         self.assertTrue(data["windows_dictation"]["hotkey_button_visible"])
-        self.assertTrue(data["windows_dictation"]["speech_settings_visible"])
+        self.assertTrue(data["windows_dictation"]["settings_visible"])
+        self.assertLessEqual(
+            data["windows_dictation"]["hotkey_field_geometry"]["right"],
+            data["windows_dictation"]["hotkey_button_geometry"]["x"] + 1,
+        )
+        self.assertLessEqual(
+            data["windows_dictation"]["hotkey_button_geometry"]["right"],
+            data["windows_dictation"]["settings_button_geometry"]["x"] + 1,
+        )
+        self.assertLessEqual(
+            data["windows_dictation"]["settings_button_geometry"]["right"],
+            data["window_width"] + 1,
+        )
         self.assertEqual(
             data["windows_dictation"]["launch_text"],
             "使用 Windows 听写与联机语音识别",
         )
         self.assertTrue(data["custom_program"]["path_visible"])
         self.assertTrue(data["custom_program"]["elevated_visible"])
+        self.assertFalse(data["custom_program"]["settings_visible"])
         self.assertEqual(
             data["status_cases"]["unknown_running"]["text"],
             "运行中 · 权限未知",

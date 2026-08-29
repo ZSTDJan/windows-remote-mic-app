@@ -1585,6 +1585,7 @@ def _load_qt_classes() -> dict:
                 if provider_id in {
                     voice_program_manager.VOICE_PROGRAM_NONE,
                     voice_program_manager.VOICE_PROGRAM_CUSTOM,
+                    voice_program_manager.VOICE_PROGRAM_WETYPE,
                     voice_program_manager.VOICE_PROGRAM_WINDOWS_DICTATION,
                 }:
                     self._set_status_message("")
@@ -2107,6 +2108,13 @@ def _load_qt_classes() -> dict:
             if value == self._get_voice_program_launch_elevated():
                 return
             updated = dict(self._voice_program_settings)
+            provider_id = str(updated.get("provider", ""))
+            preferences = updated.get("launch_elevated_by_provider")
+            next_preferences = (
+                dict(preferences) if isinstance(preferences, dict) else {}
+            )
+            next_preferences[provider_id] = value
+            updated["launch_elevated_by_provider"] = next_preferences
             updated["launch_elevated"] = value
             self._update_and_persist_voice_program(updated)
 
@@ -2528,6 +2536,7 @@ def _load_qt_classes() -> dict:
             if provider_id in {
                 voice_program_manager.VOICE_PROGRAM_NONE,
                 voice_program_manager.VOICE_PROGRAM_CUSTOM,
+                voice_program_manager.VOICE_PROGRAM_WETYPE,
             }:
                 return
             self._set_voice_hotkey_busy(True)
@@ -3058,6 +3067,61 @@ def _load_qt_classes() -> dict:
             )
 
         @Slot()
+        def openVoiceProgramSettings(self) -> None:
+            try:
+                target = (
+                    voice_program_manager.resolve_voice_program_settings_target(
+                        self._voice_program_settings
+                    )
+                )
+            except Exception as exc:  # noqa: BLE001 - Qt slot must not escape
+                self._set_status_message("")
+                self._set_error_message(
+                    f"无法查找语音程序设置入口（{exc}）",
+                    self._VOICE_PAGE_INDEX,
+                )
+                return
+            if not target.available:
+                self._set_status_message("")
+                message = (
+                    "未找到微信输入法设置程序。"
+                    if target.provider_id
+                    == voice_program_manager.VOICE_PROGRAM_WETYPE
+                    else "当前语音程序没有可打开的设置入口。"
+                )
+                self._set_error_message(message, self._VOICE_PAGE_INDEX)
+                return
+
+            if target.kind == "uri":
+                result = shell_targets.open_external_target(target.target)
+                if result.outcome is not shell_targets.ExternalTargetOutcome.OPENED:
+                    self._set_status_message("")
+                    self._set_error_message(
+                        f"无法打开{target.display_name}设置（{result.error}）",
+                        self._VOICE_PAGE_INDEX,
+                    )
+                    return
+            else:
+                try:
+                    voice_program_manager.open_voice_program_settings(
+                        Path(target.target),
+                        target.arguments,
+                    )
+                except Exception as exc:  # noqa: BLE001 - Qt slot must not escape
+                    self._set_status_message("")
+                    self._set_error_message(
+                        f"无法打开{target.display_name}设置（{exc}）",
+                        self._VOICE_PAGE_INDEX,
+                    )
+                    return
+
+            self._set_error_message("")
+            self._set_status_message(
+                f"已打开{target.display_name}设置。",
+                self._VOICE_PAGE_INDEX,
+            )
+
+        @Slot()
         def openSpeechSettings(self) -> None:
             self._report_external_target(
                 shell_targets.open_external_target(shell_targets.SPEECH_SETTINGS_URI),
@@ -3199,6 +3263,10 @@ def _load_qt_classes() -> dict:
             self._vb_cable_test_status = "idle"
             self._vb_cable_test_message = ""
             self._vb_cable_bridge_recovery_needed = False
+            self._bridge_diagnostics_refresh_pending = False
+            self._last_bridge_connected = bool(
+                self._settings_controller.bridgeConnected
+            )
             self._diagnosticsReady.connect(self._on_diagnostics_ready)
             self._vbCableTestReady.connect(self._on_vb_cable_test_ready)
             self._settings_controller.endpointOptionsChanged.connect(
@@ -3209,6 +3277,9 @@ def _load_qt_classes() -> dict:
             )
             self._settings_controller.selectedDeviceChanged.connect(
                 self._invalidate_vb_cable_test_result
+            )
+            self._settings_controller.bridgeConnectedChanged.connect(
+                self._on_bridge_connected_changed
             )
             self.refreshDiagnostics()
 
@@ -3266,6 +3337,10 @@ def _load_qt_classes() -> dict:
             self._vb_cable_test_message = message
             self._vb_cable_test_running = running
             self.vbCableTestChanged.emit()
+            if not running and self._bridge_diagnostics_refresh_pending:
+                QTimer.singleShot(
+                    0, self._try_pending_bridge_diagnostics_refresh
+                )
 
         def _set_vb_cable_bridge_recovery_needed(self, value: bool) -> None:
             value = bool(value)
@@ -3279,6 +3354,33 @@ def _load_qt_classes() -> dict:
                 return
             if self._vb_cable_test_status != "idle" or self._vb_cable_test_message:
                 self._set_vb_cable_test_state("idle", "", running=False)
+
+        def _on_bridge_connected_changed(self) -> None:
+            connected = bool(self._settings_controller.bridgeConnected)
+            transitioned_to_connected = connected and not self._last_bridge_connected
+            self._last_bridge_connected = connected
+            if not connected:
+                self._bridge_diagnostics_refresh_pending = False
+                return
+            if not transitioned_to_connected:
+                return
+            self._bridge_diagnostics_refresh_pending = True
+            QTimer.singleShot(0, self._try_pending_bridge_diagnostics_refresh)
+
+        def _try_pending_bridge_diagnostics_refresh(self) -> None:
+            if not self._bridge_diagnostics_refresh_pending:
+                return
+            if not self._settings_controller.bridgeConnected:
+                self._bridge_diagnostics_refresh_pending = False
+                return
+            if (
+                self._is_refreshing
+                or self._vb_cable_test_running
+                or _diagnostics_shutdown_event.is_set()
+            ):
+                return
+            self._bridge_diagnostics_refresh_pending = False
+            self.refreshDiagnostics()
 
         def _on_diagnostics_ready(self, report) -> None:
             """Delivered (cross-thread) once ``run_diagnostics()`` returns -
@@ -3307,6 +3409,10 @@ def _load_qt_classes() -> dict:
             self.checkResultsChanged.emit()
             self.diagnosticsErrorMessageChanged.emit()
             self.isRefreshingChanged.emit()
+            if self._bridge_diagnostics_refresh_pending:
+                QTimer.singleShot(
+                    0, self._try_pending_bridge_diagnostics_refresh
+                )
 
         def _on_vb_cable_test_ready(self, result) -> None:
             if result is None:

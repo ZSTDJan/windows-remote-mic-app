@@ -1272,19 +1272,23 @@ Item {
                                     EditorActionCombo {
                                         id: comboActionEditor
                                         objectName: "comboActionEditor_" + buttonId
+                                        property bool acceptsUserEdits: false
                                         tokens: root.tokens
                                         Layout.fillWidth: true
                                         model: SettingsController.secondaryActionOptions
-                                        Component.onCompleted: editText = actionText
-                                        onEditTextChanged: SettingsController.setComboActionText(
-                                            buttonId, editText
-                                        )
-                                        onActivated: {
-                                            editText = currentText
-                                            SettingsController.setComboActionText(
-                                                buttonId, currentText
-                                            )
+                                        Component.onCompleted: {
+                                            editText = actionText
+                                            acceptsUserEdits = true
                                         }
+                                        onEditTextChanged: {
+                                            if (acceptsUserEdits) {
+                                                SettingsController.setComboActionText(
+                                                    buttonId, editText
+                                                )
+                                            }
+                                        }
+                                        onActivated:
+                                            editText = currentText
                                         Accessible.name: SettingsController.comboModifierText
                                             + " + " + buttonName + qsTr("执行动作")
                                     }

@@ -136,6 +136,17 @@ Item {
         return qsTr("随遥控器服务启动；失败不影响服务")
     }
 
+    function voiceHotkeyDescription() {
+        const selected = SettingsController.selectedVoiceProgramIndex
+        if (selected === 1)
+            return qsTr("自动读取并同步搜狗当前的按住说快捷键")
+        if (selected === 2)
+            return qsTr("按程序记忆；请在微信输入法设置中保持一致")
+        if (selected === 3)
+            return qsTr("Windows 语音输入固定使用 Win+H")
+        return qsTr("仅在 Remote Mic 中按程序记忆")
+    }
+
     function startVoiceHotkeyCapture() {
         if (voiceHotkeyRecording) {
             stopVoiceHotkeyCapture()
@@ -580,9 +591,7 @@ Item {
                     titleText: qsTr("语音按键")
                     descriptionText: root.voiceHotkeyCaptureError.length > 0
                         ? root.voiceHotkeyCaptureError
-                        : root.windowsDictationSelected
-                            ? qsTr("Windows 语音输入使用 Win+H")
-                            : qsTr("切换程序时自动读取；录入后同步并保存")
+                        : root.voiceHotkeyDescription()
                     stateText: root.voiceHotkeyRecording
                         ? qsTr("录入中")
                         : root.voiceHotkeyBusy ? qsTr("处理中") : qsTr("已保存")
@@ -606,16 +615,26 @@ Item {
                             Accessible.name: qsTr("语音按键，点击后直接录入")
                             Keys.onEscapePressed: root.stopVoiceHotkeyCapture()
                             TapHandler { onTapped: root.startVoiceHotkeyCapture() }
+                        },
+                        CompactButton {
+                            objectName: "useWindowsDictationHotkeyButton"
+                            visible: root.windowsDictationSelected
+                            tokens: root.tokens
+                            compactMinimumWidth: tokens.buttonWidth4Chars
+                            text: qsTr("Win+H")
+                            enabled: !root.voiceHotkeyBusy
+                            onClicked: SettingsController.useWindowsDictationHotkey()
                         }
                     ]
                     CompactButton {
-                        objectName: "useWindowsDictationHotkeyButton"
-                        visible: root.windowsDictationSelected
+                        objectName: "openVoiceProgramSettingsButton"
+                        visible: SettingsController.selectedVoiceProgramIndex >= 1
+                            && SettingsController.selectedVoiceProgramIndex <= 3
                         tokens: root.tokens
                         Layout.fillWidth: true
-                        text: qsTr("Win+H")
+                        text: qsTr("打开设置")
                         enabled: !root.voiceHotkeyBusy
-                        onClicked: SettingsController.useWindowsDictationHotkey()
+                        onClicked: SettingsController.openVoiceProgramSettings()
                     }
                 }
 
@@ -629,15 +648,6 @@ Item {
                     descriptionObjectName: "voiceProgramLaunchText"
                     descriptionText: root.voiceProgramLaunchDescription()
                     showDivider: false
-
-                    CompactButton {
-                        objectName: "openSpeechSettingsButton"
-                        visible: root.windowsDictationSelected
-                        tokens: root.tokens
-                        Layout.fillWidth: true
-                        text: qsTr("语音设置")
-                        onClicked: SettingsController.openSpeechSettings()
-                    }
                 }
             }
 

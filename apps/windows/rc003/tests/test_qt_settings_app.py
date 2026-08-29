@@ -517,9 +517,11 @@ class SettingsControllerTests(unittest.TestCase):
         self.assertTrue(controller.voiceProgramLaunchOnBridgeStart)
         self.assertFalse(controller.voiceProgramSettingsDirty)
         self.assertFalse(controller.settingsDirty)
+        self.assertTrue(controller.voiceProgramLaunchElevated)
         saved = config.load_config(config.config_path(config.config_root()))
         self.assertEqual(saved["voice_program"]["provider"], "sogou")
         self.assertTrue(saved["voice_program"]["launch_on_bridge_start"])
+        self.assertTrue(saved["voice_program"]["launch_elevated"])
 
     def test_selecting_wetype_uses_windows_management_without_autostart(self):
         controller, _ = self._make_controller()
@@ -530,71 +532,79 @@ class SettingsControllerTests(unittest.TestCase):
         self.assertFalse(controller.voiceProgramLaunchOnBridgeStart)
         self.assertFalse(controller.voiceProgramSettingsDirty)
 
-    def test_selecting_provider_adopts_and_remembers_its_detected_shortcut(self):
+    def test_selecting_sogou_adopts_and_remembers_its_detected_shortcut(self):
         self._voice_hotkey_read_mock.side_effect = None
         self._voice_hotkey_read_mock.return_value = (
             qt_settings_app.voice_hotkey_sync_windows.VoiceHotkeySyncResult(
-                "wetype",
+                "sogou",
                 True,
                 "read",
                 "lctrl+lshift+f9",
-                "read from WeType",
+                "read from Sogou",
             )
         )
         controller, _ = self._make_controller()
 
-        controller.selectedVoiceProgramIndex = 2
+        controller.selectedVoiceProgramIndex = 1
 
         self.assertEqual(controller.holdVoiceHotkeyText, "lctrl+lshift+f9")
         saved = config.load_config(config.config_path(config.config_root()))
         self.assertEqual(
-            saved["voice_hotkeys_by_provider"]["wetype"]["hold"],
+            saved["voice_hotkeys_by_provider"]["sogou"]["hold"],
             "lctrl+lshift+f9",
         )
 
+    def test_selecting_wetype_uses_its_remembered_default_without_an_error(self):
+        controller, _ = self._make_controller()
+
+        controller.selectedVoiceProgramIndex = 2
+
+        self.assertEqual(controller.holdVoiceHotkeyText, "lctrl+lwin")
+        self.assertEqual(controller.errorMessage, "")
+
     def test_provider_sync_failure_restores_the_previous_shortcut(self):
         controller, _ = self._make_controller()
-        controller.selectedVoiceProgramIndex = 2
+        controller.selectedVoiceProgramIndex = 1
         previous = controller.holdVoiceHotkeyText
         self._voice_hotkey_sync_mock.side_effect = None
         self._voice_hotkey_sync_mock.return_value = (
             qt_settings_app.voice_hotkey_sync_windows.VoiceHotkeySyncResult(
-                "wetype",
+                "sogou",
                 False,
                 "write_failed",
-                message="WeType rejected shortcut",
+                message="Sogou rejected shortcut",
             )
         )
 
         controller.holdVoiceHotkeyText = "lctrl+lshift+f9"
 
         self.assertEqual(controller.holdVoiceHotkeyText, previous)
-        self.assertIn("WeType rejected", controller.errorMessage)
+        self.assertIn("Sogou rejected", controller.errorMessage)
 
     def test_reentering_the_current_provider_refreshes_its_shortcut(self):
         controller, _ = self._make_controller()
-        controller.selectedVoiceProgramIndex = 2
+        controller.selectedVoiceProgramIndex = 1
         self._voice_hotkey_read_mock.reset_mock()
 
-        controller.selectedVoiceProgramIndex = 2
+        controller.selectedVoiceProgramIndex = 1
 
-        self._voice_hotkey_read_mock.assert_called_once_with("wetype")
+        self._voice_hotkey_read_mock.assert_called_once_with("sogou")
         self.assertFalse(controller.voiceHotkeyBusy)
 
     def test_reentering_the_same_hotkey_still_synchronizes_the_provider(self):
         controller, _ = self._make_controller()
-        controller.selectedVoiceProgramIndex = 2
+        controller.selectedVoiceProgramIndex = 1
         current = controller.holdVoiceHotkeyText
         self._voice_hotkey_sync_mock.reset_mock()
 
         controller.holdVoiceHotkeyText = current
 
-        self._voice_hotkey_sync_mock.assert_called_once_with("wetype", current)
+        self._voice_hotkey_sync_mock.assert_called_once_with("sogou", current)
         self.assertFalse(controller.voiceHotkeyBusy)
 
     def test_provider_sync_exception_keeps_the_saved_shortcut_and_clears_busy(self):
         controller, _ = self._make_controller()
-        controller.selectedVoiceProgramIndex = 2
+        controller.selectedVoiceProgramIndex = 1
         previous = controller.holdVoiceHotkeyText
         self._voice_hotkey_sync_mock.side_effect = OSError("provider unavailable")
 
@@ -606,12 +616,12 @@ class SettingsControllerTests(unittest.TestCase):
 
     def test_failed_provider_value_adoption_restores_the_saved_display(self):
         controller, _ = self._make_controller()
-        controller.selectedVoiceProgramIndex = 2
+        controller.selectedVoiceProgramIndex = 1
         previous = controller.holdVoiceHotkeyText
         self._voice_hotkey_sync_mock.side_effect = None
         self._voice_hotkey_sync_mock.return_value = (
             qt_settings_app.voice_hotkey_sync_windows.VoiceHotkeySyncResult(
-                "wetype",
+                "sogou",
                 False,
                 "rollback_failed",
                 "lctrl+lshift+f8",
@@ -629,20 +639,20 @@ class SettingsControllerTests(unittest.TestCase):
 
     def test_readback_failure_restores_disk_ui_and_provider_to_previous_hotkey(self):
         controller, _ = self._make_controller()
-        controller.selectedVoiceProgramIndex = 2
+        controller.selectedVoiceProgramIndex = 1
         previous = controller.holdVoiceHotkeyText
         config_path = config.config_path(config.config_root())
         previous_bytes = config_path.read_bytes()
         self._voice_hotkey_sync_mock.side_effect = [
             qt_settings_app.voice_hotkey_sync_windows.VoiceHotkeySyncResult(
-                "wetype",
+                "sogou",
                 True,
                 "synced",
                 "lctrl+lshift+f9",
                 "shortcut synchronized",
             ),
             qt_settings_app.voice_hotkey_sync_windows.VoiceHotkeySyncResult(
-                "wetype",
+                "sogou",
                 True,
                 "synced",
                 previous,
@@ -664,25 +674,25 @@ class SettingsControllerTests(unittest.TestCase):
         self.assertEqual(
             self._voice_hotkey_sync_mock.call_args_list,
             [
-                mock.call("wetype", "lctrl+lshift+f9"),
-                mock.call("wetype", previous),
+                mock.call("sogou", "lctrl+lshift+f9"),
+                mock.call("sogou", previous),
             ],
         )
 
     def test_failed_local_save_reports_when_provider_rollback_also_fails(self):
         controller, _ = self._make_controller()
-        controller.selectedVoiceProgramIndex = 2
+        controller.selectedVoiceProgramIndex = 1
         previous = controller.holdVoiceHotkeyText
         self._voice_hotkey_sync_mock.side_effect = [
             qt_settings_app.voice_hotkey_sync_windows.VoiceHotkeySyncResult(
-                "wetype",
+                "sogou",
                 True,
                 "synced",
                 "lctrl+lshift+f9",
                 "shortcut synchronized",
             ),
             qt_settings_app.voice_hotkey_sync_windows.VoiceHotkeySyncResult(
-                "wetype",
+                "sogou",
                 False,
                 "write_failed",
                 message="rollback failed",
@@ -700,22 +710,22 @@ class SettingsControllerTests(unittest.TestCase):
         self.assertEqual(
             self._voice_hotkey_sync_mock.call_args_list,
             [
-                mock.call("wetype", "lctrl+lshift+f9"),
-                mock.call("wetype", previous),
+                mock.call("sogou", "lctrl+lshift+f9"),
+                mock.call("sogou", previous),
             ],
         )
 
     def test_refresh_adopts_an_external_provider_change(self):
         controller, _ = self._make_controller()
-        controller.selectedVoiceProgramIndex = 2
+        controller.selectedVoiceProgramIndex = 1
         self._voice_hotkey_read_mock.side_effect = None
         self._voice_hotkey_read_mock.return_value = (
             qt_settings_app.voice_hotkey_sync_windows.VoiceHotkeySyncResult(
-                "wetype",
+                "sogou",
                 True,
                 "read",
                 "lctrl+lshift+f9",
-                "read from WeType",
+                "read from Sogou",
             )
         )
 
@@ -724,7 +734,7 @@ class SettingsControllerTests(unittest.TestCase):
         self.assertEqual(controller.holdVoiceHotkeyText, "lctrl+lshift+f9")
         saved = config.load_config(config.config_path(config.config_root()))
         self.assertEqual(
-            saved["voice_hotkeys_by_provider"]["wetype"]["hold"],
+            saved["voice_hotkeys_by_provider"]["sogou"]["hold"],
             "lctrl+lshift+f9",
         )
 
@@ -759,20 +769,20 @@ class SettingsControllerTests(unittest.TestCase):
         self.assertTrue(controller.settingsDirty)
         self.assertFalse(controller.voiceProgramSettingsDirty)
 
-    def test_disabling_management_keeps_the_elevation_preference_in_memory(self):
+    def test_disabling_management_keeps_a_disabled_elevation_preference_in_memory(self):
         controller, _ = self._make_controller()
         controller.selectedVoiceProgramIndex = 1
-        controller.voiceProgramLaunchElevated = True
+        controller.voiceProgramLaunchElevated = False
 
         controller.selectedVoiceProgramIndex = 0
 
         self.assertFalse(controller.voiceProgramLaunchOnBridgeStart)
-        self.assertTrue(controller.voiceProgramLaunchElevated)
+        self.assertFalse(controller.voiceProgramLaunchElevated)
 
-    def test_disabled_management_keeps_the_elevation_preference_after_reopen(self):
+    def test_disabled_management_keeps_a_disabled_elevation_preference_after_reopen(self):
         controller, _ = self._make_controller()
         controller.selectedVoiceProgramIndex = 1
-        controller.voiceProgramLaunchElevated = True
+        controller.voiceProgramLaunchElevated = False
         controller.selectedVoiceProgramIndex = 0
 
         self.assertTrue(controller.saveSettings())
@@ -780,7 +790,27 @@ class SettingsControllerTests(unittest.TestCase):
         reopened, _ = self._make_controller()
         self.assertEqual(reopened.selectedVoiceProgramIndex, 0)
         self.assertFalse(reopened.voiceProgramLaunchOnBridgeStart)
+        self.assertFalse(reopened.voiceProgramLaunchElevated)
+
+    def test_sogou_and_custom_elevation_preferences_are_remembered_separately(self):
+        controller, _ = self._make_controller()
+
+        controller.selectedVoiceProgramIndex = 1
+        self.assertTrue(controller.voiceProgramLaunchElevated)
+        controller.voiceProgramLaunchElevated = False
+        controller.selectedVoiceProgramIndex = 4
+        self.assertFalse(controller.voiceProgramLaunchElevated)
+        controller.voiceProgramLaunchElevated = True
+        controller.selectedVoiceProgramIndex = 1
+        self.assertFalse(controller.voiceProgramLaunchElevated)
+        controller.selectedVoiceProgramIndex = 4
+        self.assertTrue(controller.voiceProgramLaunchElevated)
+
+        reopened, _ = self._make_controller()
+        self.assertEqual(reopened.selectedVoiceProgramIndex, 4)
         self.assertTrue(reopened.voiceProgramLaunchElevated)
+        reopened.selectedVoiceProgramIndex = 1
+        self.assertFalse(reopened.voiceProgramLaunchElevated)
 
     def test_existing_managed_program_without_autostart_is_migrated_as_dirty(self):
         saved = config.default_config()
@@ -795,6 +825,7 @@ class SettingsControllerTests(unittest.TestCase):
         controller, _ = self._make_controller()
 
         self.assertTrue(controller.voiceProgramLaunchOnBridgeStart)
+        self.assertFalse(controller.voiceProgramLaunchElevated)
         self.assertTrue(controller.voiceProgramSettingsDirty)
         self.assertTrue(controller.settingsDirty)
         self.assertIn("随桥接启动", controller.statusMessage)
@@ -819,6 +850,10 @@ class SettingsControllerTests(unittest.TestCase):
                 "custom_executable": str(executable),
                 "launch_on_bridge_start": True,
                 "launch_elevated": True,
+                "launch_elevated_by_provider": {
+                    "sogou": True,
+                    "custom": True,
+                },
             },
         )
 
@@ -2354,6 +2389,55 @@ class SettingsControllerTests(unittest.TestCase):
         self.assertEqual(controller.statusMessage, "")
         self.assertIn("no handler registered", controller.errorMessage)
 
+    def test_open_sogou_settings_uses_the_provider_owned_uri(self):
+        controller, _ = self._make_controller()
+        controller.selectedVoiceProgramIndex = 1
+        target = voice_program_manager.VoiceProgramSettingsTarget(
+            "sogou",
+            "搜狗语音输入",
+            "uri",
+            "sgbiz:sg_process?module=sgmyinput.exe&param=-page%3Dkeyset",
+        )
+        opened = shell_targets.ExternalTargetResult(
+            shell_targets.ExternalTargetOutcome.OPENED,
+            target.target,
+        )
+        with mock.patch.object(
+            qt_settings_app.voice_program_manager,
+            "resolve_voice_program_settings_target",
+            return_value=target,
+        ), mock.patch.object(
+            shell_targets, "open_external_target", return_value=opened
+        ) as open_target:
+            controller.openVoiceProgramSettings()
+
+        open_target.assert_called_once_with(target.target)
+        self.assertIn("已打开搜狗语音输入设置", controller.statusMessage)
+
+    def test_open_wetype_settings_uses_the_installed_settings_program(self):
+        controller, _ = self._make_controller()
+        controller.selectedVoiceProgramIndex = 2
+        executable = Path(r"C:\Program Files\Tencent\WeType\wetype_update.exe")
+        target = voice_program_manager.VoiceProgramSettingsTarget(
+            "wetype",
+            "微信输入法",
+            "executable",
+            str(executable),
+            "-showsetting",
+        )
+        with mock.patch.object(
+            qt_settings_app.voice_program_manager,
+            "resolve_voice_program_settings_target",
+            return_value=target,
+        ), mock.patch.object(
+            qt_settings_app.voice_program_manager,
+            "open_voice_program_settings",
+        ) as open_settings:
+            controller.openVoiceProgramSettings()
+
+        open_settings.assert_called_once_with(executable, "-showsetting")
+        self.assertIn("已打开微信输入法设置", controller.statusMessage)
+
     def test_select_and_persist_output_endpoint_succeeds_and_updates_options(self):
         controller, _ = self._make_controller()
         with mock.patch.object(
@@ -2545,6 +2629,69 @@ class DiagnosticsControllerTests(unittest.TestCase):
             release_event.set()
             self.assertTrue(self._pump_until(lambda: not diag.isRefreshing))
         self.assertEqual(call_count["n"], 1)
+
+    def test_bridge_connection_automatically_refreshes_stale_diagnostics(self):
+        call_count = {"n": 0}
+
+        def _run_diagnostics(**kwargs):
+            call_count["n"] += 1
+            return windows_diagnostics.DiagnosticsReport(checks=())
+
+        settings_controller = self._make_settings_controller()
+        with mock.patch.object(
+            windows_diagnostics,
+            "run_diagnostics",
+            side_effect=_run_diagnostics,
+        ):
+            diag = self.DiagnosticsController(settings_controller, self._config_root)
+            self.assertTrue(self._pump_until(lambda: not diag.isRefreshing))
+            self.assertEqual(call_count["n"], 1)
+
+            settings_controller._set_bridge_connected(True)
+            self.assertTrue(
+                self._pump_until(
+                    lambda: call_count["n"] == 2 and not diag.isRefreshing
+                )
+            )
+
+        self.assertEqual(call_count["n"], 2)
+
+    def test_bridge_connection_refresh_waits_for_the_active_check(self):
+        release_first = threading.Event()
+        state = {"calls": 0, "active": 0, "max_active": 0}
+
+        def _run_diagnostics(**kwargs):
+            state["calls"] += 1
+            state["active"] += 1
+            state["max_active"] = max(state["max_active"], state["active"])
+            try:
+                if state["calls"] == 1:
+                    release_first.wait(timeout=5.0)
+                return windows_diagnostics.DiagnosticsReport(checks=())
+            finally:
+                state["active"] -= 1
+
+        settings_controller = self._make_settings_controller()
+        with mock.patch.object(
+            windows_diagnostics,
+            "run_diagnostics",
+            side_effect=_run_diagnostics,
+        ):
+            diag = self.DiagnosticsController(settings_controller, self._config_root)
+            self.assertTrue(diag.isRefreshing)
+            settings_controller._set_bridge_connected(True)
+            self.app.processEvents()
+            self.assertEqual(state["calls"], 1)
+
+            release_first.set()
+            self.assertTrue(
+                self._pump_until(
+                    lambda: state["calls"] == 2 and not diag.isRefreshing
+                )
+            )
+
+        self.assertEqual(state["calls"], 2)
+        self.assertEqual(state["max_active"], 1)
 
     def test_no_worker_thread_survives_after_completion(self):
         settings_controller = self._make_settings_controller()
@@ -3384,6 +3531,8 @@ engine.load(QUrl.fromLocalFile(str(qml_dir / "main.qml")))
 print("STAGE:loaded", file=sys.stderr, flush=True)
 
 root_objects = engine.rootObjects()
+app.processEvents()
+initial_settings_dirty = bool(controller.settingsDirty)
 voice_scroll = (
     root_objects[0].findChild(QObject, "voiceScroll") if root_objects else None
 )
@@ -3414,6 +3563,7 @@ result = {
     "warnings": [w.toString() for w in warnings],
     "width": root_objects[0].property("width") if root_objects else None,
     "height": root_objects[0].property("height") if root_objects else None,
+    "initial_settings_dirty": initial_settings_dirty,
     "retired_finish_tap_control_exists": bool(
         root_objects
         and root_objects[0].findChild(QObject, "voiceReleaseFinishTapSwitch")
@@ -4330,8 +4480,7 @@ render(window, app)
 result["voice_windows_actions"] = {
     name: bounds(window, name)
     for name in (
-        "useWindowsDictationHotkeyButton",
-        "openSpeechSettingsButton",
+        "openVoiceProgramSettingsButton",
     )
 }
 
@@ -4638,13 +4787,20 @@ class SettingsShellSourceContractTests(unittest.TestCase):
     def test_voice_page_states_real_windows_boundaries_without_fake_grants(self):
         for object_name in (
             "openMicrophonePrivacyButton",
-            "openSpeechSettingsButton",
+            "openVoiceProgramSettingsButton",
         ):
             self.assertIn(f'objectName: "{object_name}"', self.voice_qml)
         self.assertNotIn('objectName: "openSoundInputSettingsButton"', self.voice_qml)
         self.assertIn('titleText: qsTr("麦克风权限")', self.voice_qml)
         self.assertNotIn('stateText: qsTr("待确认")', self.voice_qml)
-        self.assertIn('qsTr("切换程序时自动读取；录入后同步并保存")', self.voice_qml)
+        self.assertIn(
+            'qsTr("自动读取并同步搜狗当前的按住说快捷键")',
+            self.voice_qml,
+        )
+        self.assertIn(
+            'qsTr("按程序记忆；请在微信输入法设置中保持一致")',
+            self.voice_qml,
+        )
         self.assertIn('? qsTr("录入中")', self.voice_qml)
         self.assertIn(
             'root.voiceHotkeyBusy ? qsTr("处理中") : qsTr("已保存")',
@@ -4748,7 +4904,15 @@ class SettingsShellSourceContractTests(unittest.TestCase):
 
     def test_voice_hotkey_field_is_owned_by_the_voice_page(self):
         self.assertIn('placeholderText: qsTr("点击录入")', self.voice_qml)
-        self.assertIn("切换程序时自动读取；录入后同步并保存", self.voice_qml)
+        self.assertIn(
+            'qsTr("自动读取并同步搜狗当前的按住说快捷键")',
+            self.voice_qml,
+        )
+        self.assertIn(
+            'qsTr("按程序记忆；请在微信输入法设置中保持一致")',
+            self.voice_qml,
+        )
+        self.assertIn('objectName: "openVoiceProgramSettingsButton"', self.voice_qml)
         self.assertNotIn('objectName: "holdVoiceHotkeyField"', self.buttons_qml)
 
     def test_voice_program_status_uses_structured_privilege_and_dirty_state(self):
@@ -4850,7 +5014,7 @@ class ThreePageSettingsSourceContractTests(unittest.TestCase):
         self.assertIn('objectName: "voiceProgramCombo"', self.voice_qml)
         self.assertIn('objectName: "voiceProgramCustomPathRow"', self.voice_qml)
         self.assertIn('objectName: "useWindowsDictationHotkeyButton"', self.voice_qml)
-        self.assertIn('objectName: "openSpeechSettingsButton"', self.voice_qml)
+        self.assertIn('objectName: "openVoiceProgramSettingsButton"', self.voice_qml)
         self.assertIn("SettingsController.selectedVoiceProgramIndex === 3", self.voice_qml)
         self.assertIn("SettingsController.selectedVoiceProgramIndex === 4", self.voice_qml)
         self.assertIn(
@@ -4988,6 +5152,7 @@ class OffscreenQmlLoadTests(unittest.TestCase):
         )
         self.assertEqual(data["width"], 720)
         self.assertEqual(data["height"], 500)
+        self.assertFalse(data["initial_settings_dirty"])
         self.assertFalse(data["retired_finish_tap_control_exists"])
         self.assertFalse(data["voice_hotkey_recording"])
         self.assertEqual(data["saved_voice_hotkey"], "ctrl+shift+f8")

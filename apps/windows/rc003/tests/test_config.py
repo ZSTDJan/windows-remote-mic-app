@@ -44,6 +44,10 @@ class DefaultConfigPrivacyTests(unittest.TestCase):
             "win+h",
         )
         self.assertEqual(defaults["schema_version"], config.SCHEMA_VERSION)
+        self.assertEqual(
+            defaults["voice_program"]["launch_elevated_by_provider"],
+            {"sogou": True, "custom": False},
+        )
         self.assertEqual(defaults["gain_db"], 10.0)
 
     def test_default_config_contains_no_forbidden_identity_fields(self):
@@ -162,6 +166,56 @@ class DefaultConfigPrivacyTests(unittest.TestCase):
             loaded = config.load_config(path)
 
         self.assertEqual(loaded["voice_hotkey"], "lctrl+lwin")
+
+    def test_schema_7_false_elevation_choice_is_not_replaced_by_sogou_default(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 7,
+                        "voice_program": {
+                            "provider": "sogou",
+                            "launch_on_bridge_start": True,
+                            "launch_elevated": False,
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            loaded = config.load_config(path)
+
+        self.assertFalse(loaded["voice_program"]["launch_elevated"])
+        self.assertEqual(
+            loaded["voice_program"]["launch_elevated_by_provider"],
+            {"sogou": False, "custom": False},
+        )
+
+    def test_schema_7_true_elevation_choice_is_preserved_for_both_programs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 7,
+                        "voice_program": {
+                            "provider": "custom",
+                            "launch_on_bridge_start": True,
+                            "launch_elevated": True,
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            loaded = config.load_config(path)
+
+        self.assertTrue(loaded["voice_program"]["launch_elevated"])
+        self.assertEqual(
+            loaded["voice_program"]["launch_elevated_by_provider"],
+            {"sogou": True, "custom": True},
+        )
 
     def test_load_preserves_nested_hold_when_old_file_has_no_top_level_value(self):
         with tempfile.TemporaryDirectory() as tmp:

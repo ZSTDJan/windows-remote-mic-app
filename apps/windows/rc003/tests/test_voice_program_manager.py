@@ -17,6 +17,10 @@ class VoiceProgramSettingsTests(unittest.TestCase):
                 "custom_executable": "",
                 "launch_on_bridge_start": False,
                 "launch_elevated": False,
+                "launch_elevated_by_provider": {
+                    "sogou": True,
+                    "custom": False,
+                },
             },
         )
 
@@ -35,6 +39,10 @@ class VoiceProgramSettingsTests(unittest.TestCase):
                 "custom_executable": "voice.exe",
                 "launch_on_bridge_start": False,
                 "launch_elevated": False,
+                "launch_elevated_by_provider": {
+                    "sogou": False,
+                    "custom": False,
+                },
             },
         )
 
@@ -53,8 +61,71 @@ class VoiceProgramSettingsTests(unittest.TestCase):
                 "custom_executable": "voice.exe",
                 "launch_on_bridge_start": False,
                 "launch_elevated": True,
+                "launch_elevated_by_provider": {
+                    "sogou": True,
+                    "custom": True,
+                },
             },
         )
+
+    def test_new_sogou_selection_defaults_to_elevated_launch(self):
+        normalized = manager.normalize_voice_program_settings(
+            {"provider": "sogou"}
+        )
+
+        self.assertTrue(normalized["launch_elevated"])
+        self.assertEqual(
+            normalized["launch_elevated_by_provider"],
+            {"sogou": True, "custom": False},
+        )
+
+    def test_new_custom_selection_defaults_to_standard_launch(self):
+        normalized = manager.normalize_voice_program_settings(
+            {"provider": "custom"}
+        )
+
+        self.assertFalse(normalized["launch_elevated"])
+        self.assertEqual(
+            normalized["launch_elevated_by_provider"],
+            {"sogou": True, "custom": False},
+        )
+
+    def test_legacy_elevation_choice_is_migrated_to_both_launchable_providers(self):
+        for legacy_value in (False, True):
+            with self.subTest(legacy_value=legacy_value):
+                normalized = manager.normalize_voice_program_settings(
+                    {
+                        "provider": "sogou",
+                        "launch_elevated": legacy_value,
+                    }
+                )
+
+                self.assertIs(normalized["launch_elevated"], legacy_value)
+                self.assertEqual(
+                    normalized["launch_elevated_by_provider"],
+                    {"sogou": legacy_value, "custom": legacy_value},
+                )
+
+    def test_scoped_elevation_preference_follows_the_selected_provider(self):
+        preferences = {"sogou": False, "custom": True}
+
+        sogou = manager.normalize_voice_program_settings(
+            {
+                "provider": "sogou",
+                "launch_elevated": True,
+                "launch_elevated_by_provider": preferences,
+            }
+        )
+        custom = manager.normalize_voice_program_settings(
+            {
+                "provider": "custom",
+                "launch_elevated": False,
+                "launch_elevated_by_provider": preferences,
+            }
+        )
+
+        self.assertFalse(sogou["launch_elevated"])
+        self.assertTrue(custom["launch_elevated"])
 
     def test_provider_options_include_windows_dictation_and_custom_program(self):
         self.assertEqual(
@@ -225,6 +296,53 @@ class WeTypeDiscoveryTests(unittest.TestCase):
         self.assertFalse(status.running)
         self.assertEqual(status.code, "stopped")
         self.assertEqual(result.code, "system_managed")
+
+
+class VoiceProgramSettingsTargetTests(unittest.TestCase):
+    def test_sogou_settings_use_the_provider_owned_keyset_uri(self):
+        target = manager.resolve_voice_program_settings_target(
+            {"provider": "sogou"}, platform="win32"
+        )
+
+        self.assertTrue(target.available)
+        self.assertEqual(target.kind, "uri")
+        self.assertEqual(
+            target.target,
+            "sgbiz:sg_process?module=sgmyinput.exe&param=-page%3Dkeyset",
+        )
+
+    def test_wetype_settings_use_the_installed_update_program(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            install_root = Path(tmp) / "Tencent" / "WeType"
+            server = install_root / "wetype_server.exe"
+            settings = install_root / "wetype_update.exe"
+            install_root.mkdir(parents=True)
+            server.touch()
+            settings.touch()
+
+            target = manager.resolve_voice_program_settings_target(
+                {"provider": "wetype"},
+                platform="win32",
+                process_iter=lambda: (
+                    manager.ProcessInfo(12, server.name, server, False),
+                ),
+                wetype_install_value_reader=lambda: (),
+                wetype_shortcut_iter=lambda: (),
+            )
+
+        self.assertTrue(target.available)
+        self.assertEqual(target.kind, "executable")
+        self.assertEqual(Path(target.target), settings)
+        self.assertEqual(target.arguments, "-showsetting")
+
+    def test_windows_dictation_settings_use_the_system_speech_uri(self):
+        target = manager.resolve_voice_program_settings_target(
+            {"provider": "windows_dictation"}, platform="win32"
+        )
+
+        self.assertTrue(target.available)
+        self.assertEqual(target.kind, "uri")
+        self.assertEqual(target.target, "ms-settings:speech")
 
 
 class VoiceProgramLaunchTests(unittest.TestCase):
