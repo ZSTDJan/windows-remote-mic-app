@@ -328,6 +328,8 @@ HID tap；后者补齐 Windows 普通输入链路丢失的返回和音量键。
 把任意 URI 或命令交给 shell；触发后由 Windows 交给已安装的 Quicker 处理。Quicker
 需要正常注册该协议，且按其[外部启动说明](https://getquicker.net/kc/manual/doc/quicker-starter)
 不应以管理员身份运行。普通权限桥接和管理员桥接下的实际触发仍要分别真机验证。
+后续对接边界、实现入口、浮窗导航原型和待实测项统一维护在
+[Quicker 对接专项资料](discussions/quicker-integration.md)。
 
 “按键”页顶部可在“单键与手势”和“遥控器组合”之间切换，恢复默认和保存操作固定
 在页面底部。遥控器组合只提供一层类似 Fn 的主键：主键只能选 TV、菜单或主页，
