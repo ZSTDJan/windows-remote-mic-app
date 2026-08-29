@@ -542,6 +542,7 @@ F5 不再向输入框泄漏日期时间。On-request 真机探针最终未收到
 | 安装、配置、运行、测试和构建命令 | `README.md` |
 | 上游归属、许可证和第三方边界 | `ATTRIBUTION.md`、仓库根目录许可文件 |
 | 当前测试方法与人工验收项目 | `TESTING.md` |
+| 性能基线、真实性能问题和优化路线 | `PERFORMANCE.md` |
 | 单个已知故障的现象、原因和修复 | `bugs/BUG-*.md` |
 | 维护批次、源码基线和验证证据 | `MAINTENANCE.md` |
 | 用户可见版本变化 | `CHANGELOG.md` |

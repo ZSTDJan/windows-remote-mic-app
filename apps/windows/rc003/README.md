@@ -20,7 +20,8 @@
 维护者需要先阅读 `WINDOWS-ARCHITECTURE-LEDGER.md`。它集中说明项目背景、
 当前范围、Windows 版的进程、线程、BLE/ATVV、Raw Input、Frida、音频、配置、
 安装和验证边界；具体故障和批次证据再分别查阅 `bugs/`、`MAINTENANCE.md`
-与 `reviews/`。
+与 `reviews/`。性能基线、已确认性能问题和优化顺序统一查阅
+[`PERFORMANCE.md`](PERFORMANCE.md)。
 
 需要决定是否进入完整检查、本地测试包、候选、正式发布、复用已有结果，或长任务
 确需分阶段和安排复核批次时，读取
