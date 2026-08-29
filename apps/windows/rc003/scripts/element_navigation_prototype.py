@@ -3294,6 +3294,19 @@ def target_pointer_point(
     return None
 
 
+def navigation_overlay_label(
+    target: TargetSnapshot,
+    hierarchy_index: int = -1,
+    hierarchy_count: int = 0,
+) -> str:
+    label = target.name or target.control_type
+    if hierarchy_count > 1 and hierarchy_index >= 0:
+        label += f"  层级 {hierarchy_index + 1}/{hierarchy_count}"
+    if target.source == "msaa":
+        label += "  MSAA"
+    return label
+
+
 def configure_standard_streams() -> None:
     for stream in (sys.stdout, sys.stderr):
         reconfigure = getattr(stream, "reconfigure", None)
@@ -6412,19 +6425,15 @@ def _run_windows(args: argparse.Namespace) -> int:
         def show_target(
             self,
             target: TargetSnapshot,
-            selected: int,
-            count: int,
             hierarchy_index: int = -1,
             hierarchy_count: int = 0,
         ) -> None:
             self._target = target
-            self._position = f"{selected + 1}/{count}  {target.name or target.control_type}"
-            if hierarchy_count > 1 and hierarchy_index >= 0:
-                self._position += (
-                    f"  层级 {hierarchy_index + 1}/{hierarchy_count}"
-                )
-            if target.source == "msaa":
-                self._position += "  MSAA"
+            self._position = navigation_overlay_label(
+                target,
+                hierarchy_index,
+                hierarchy_count,
+            )
             self._position_for_target(target.rect)
             self.show()
             self.raise_()
@@ -6887,8 +6896,6 @@ def _run_windows(args: argparse.Namespace) -> int:
                     active.set()
                     overlay.show_target(
                         targets[selected],
-                        selected,
-                        len(targets),
                         payload["hierarchy_index"],
                         payload["hierarchy_count"],
                     )
@@ -6898,8 +6905,6 @@ def _run_windows(args: argparse.Namespace) -> int:
                 if active.is_set():
                     overlay.show_target(
                         payload["target"],
-                        payload["selected"],
-                        payload["count"],
                         payload["hierarchy_index"],
                         payload["hierarchy_count"],
                     )
@@ -6957,8 +6962,6 @@ def _run_windows(args: argparse.Namespace) -> int:
                 if active.is_set():
                     overlay.show_target(
                         payload["target"],
-                        payload["selected"],
-                        payload["count"],
                         payload["hierarchy_index"],
                         payload["hierarchy_count"],
                     )
@@ -6972,8 +6975,6 @@ def _run_windows(args: argparse.Namespace) -> int:
                 if active.is_set():
                     overlay.show_target(
                         payload["target"],
-                        payload["selected"],
-                        payload["count"],
                         payload["hierarchy_index"],
                         payload["hierarchy_count"],
                     )

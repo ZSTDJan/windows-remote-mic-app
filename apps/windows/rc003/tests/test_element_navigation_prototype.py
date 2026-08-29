@@ -3000,6 +3000,29 @@ class SpatialNavigationTests(unittest.TestCase):
             (140, 220),
         )
 
+    def test_navigation_overlay_label_omits_position_counter(self):
+        target = self.target(100, 100, 160, 140, "编辑消息")
+
+        self.assertEqual(
+            prototype.navigation_overlay_label(target),
+            "编辑消息",
+        )
+
+    def test_navigation_overlay_label_keeps_meaningful_state(self):
+        target = self.target(
+            100,
+            100,
+            160,
+            140,
+            "动作",
+            source="msaa",
+        )
+
+        self.assertEqual(
+            prototype.navigation_overlay_label(target, 1, 3),
+            "动作  层级 2/3  MSAA",
+        )
+
     def test_owner_chain_follows_a_nested_popup_without_looping(self):
         owners = {30: 20, 20: 10, 10: 0, 40: 40}
         owner_of = lambda hwnd: owners.get(hwnd, 0)
