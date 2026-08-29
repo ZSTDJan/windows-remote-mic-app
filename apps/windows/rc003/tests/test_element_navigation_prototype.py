@@ -2463,15 +2463,62 @@ class SpatialNavigationTests(unittest.TestCase):
         )
         self.assertEqual(action, "sync")
 
-    def test_prewarm_runs_once_after_the_foreground_is_stable(self):
+    def test_prewarm_waits_for_foreground_stability(self):
         self.assertFalse(
-            prototype.prewarm_request_due(7, 7, 10.0, 0, 10.5)
+            prototype.prewarm_request_due(7, 7, 10.0, 0, 10.2)
         )
         self.assertTrue(
-            prototype.prewarm_request_due(7, 7, 10.0, 0, 10.8)
+            prototype.prewarm_request_due(7, 7, 10.0, 0, 10.4)
         )
         self.assertFalse(
             prototype.prewarm_request_due(7, 7, 10.0, 7, 30.0)
+        )
+
+    def test_prewarm_rearms_after_cache_expiry_and_retry_cooldown(self):
+        self.assertFalse(
+            prototype.prewarm_request_due(
+                7,
+                7,
+                10.0,
+                7,
+                13.0,
+                requested_at=10.0,
+                cache_needs_refresh=True,
+            )
+        )
+        self.assertTrue(
+            prototype.prewarm_request_due(
+                7,
+                7,
+                10.0,
+                7,
+                15.1,
+                requested_at=10.0,
+                cache_needs_refresh=True,
+            )
+        )
+
+    def test_prewarm_cache_refresh_waits_for_dynamic_content_to_settle(self):
+        common = (7, 7, True, 10.0)
+        self.assertFalse(
+            prototype.prewarm_cache_refresh_ready(*common, 20.0)
+        )
+        self.assertTrue(
+            prototype.prewarm_cache_refresh_ready(*common, 25.1)
+        )
+        self.assertFalse(
+            prototype.prewarm_cache_refresh_ready(
+                *common,
+                20.0,
+                dirty_changed_at=19.8,
+            )
+        )
+        self.assertTrue(
+            prototype.prewarm_cache_refresh_ready(
+                *common,
+                20.0,
+                dirty_changed_at=19.5,
+            )
         )
 
     def test_scan_budget_can_be_cancelled_or_expire(self):

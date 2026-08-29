@@ -72,7 +72,9 @@ CHROMIUM_RENDERER_CLASS = "Chrome_RenderWidgetHostHWND"
 CHROMIUM_MIN_SCAN_DEPTH = 32
 SEMANTIC_BYPASS_MAX_WIDTH = 180
 SEMANTIC_BYPASS_MAX_HEIGHT = 96
-PREWARM_STABILITY_SECONDS = 0.75
+PREWARM_STABILITY_SECONDS = 0.35
+PREWARM_RETRY_SECONDS = 5.0
+PREWARM_CACHE_TTL_SECONDS = 15.0
 DYNAMIC_REFRESH_FALLBACK_SECONDS = 5.0
 DYNAMIC_REFRESH_MAX_CACHE_SECONDS = 30.0
 DYNAMIC_REFRESH_SETTLE_SECONDS = 0.15
@@ -2303,13 +2305,43 @@ def prewarm_request_due(
     observed_since: float,
     requested_hwnd: int,
     now: float,
+    requested_at: float = 0.0,
+    cache_needs_refresh: bool = False,
     stability_seconds: float = PREWARM_STABILITY_SECONDS,
+    retry_seconds: float = PREWARM_RETRY_SECONDS,
 ) -> bool:
     return bool(
         foreground_hwnd > 0
         and foreground_hwnd == observed_hwnd
-        and foreground_hwnd != requested_hwnd
         and now - observed_since >= stability_seconds
+        and (
+            foreground_hwnd != requested_hwnd
+            or (
+                cache_needs_refresh
+                and now - requested_at >= retry_seconds
+            )
+        )
+    )
+
+
+def prewarm_cache_refresh_ready(
+    foreground_hwnd: int,
+    cached_hwnd: int,
+    has_cached_targets: bool,
+    cache_timestamp: float,
+    now: float,
+    dirty_changed_at: Optional[float] = None,
+    cache_ttl_seconds: float = PREWARM_CACHE_TTL_SECONDS,
+    stability_seconds: float = PREWARM_STABILITY_SECONDS,
+) -> bool:
+    if foreground_hwnd <= 0:
+        return False
+    if dirty_changed_at is not None:
+        return now - dirty_changed_at >= stability_seconds
+    return bool(
+        foreground_hwnd != cached_hwnd
+        or not has_cached_targets
+        or now - cache_timestamp > cache_ttl_seconds
     )
 
 
@@ -3034,27 +3066,33 @@ def _run_windows(args: argparse.Namespace) -> int:
         source: str = "uia",
         section_path: tuple[int, ...] = (),
         section_rect: Optional[Rect] = None,
-        precomputed_rect: Optional[Rect] = None,
+        precomputed_element: Optional[ElementSnapshot] = None,
     ) -> Optional[RuntimeTarget]:
         try:
-            control_type = str(control.ControlTypeName or "")
+            if precomputed_element is None:
+                control_type = str(control.ControlTypeName or "")
+                name = str(control.Name or "").strip()
+                automation_id = str(control.AutomationId or "").strip()
+                enabled = bool(control.IsEnabled)
+                offscreen = bool(control.IsOffscreen)
+                keyboard_focusable = bool(control.IsKeyboardFocusable)
+                rect = rect_from_control(control)
+            else:
+                control_type = precomputed_element.control_type
+                name = precomputed_element.name
+                automation_id = precomputed_element.automation_id
+                enabled = precomputed_element.enabled
+                offscreen = precomputed_element.offscreen
+                keyboard_focusable = precomputed_element.keyboard_focusable
+                rect = precomputed_element.rect
             standard = control_type in interactive_types
             structural = control_type in STRUCTURAL_CONTROL_TYPES
             if not standard and not structural:
                 return None
-            name = str(control.Name or "").strip()
-            automation_id = str(control.AutomationId or "").strip()
             if structural and not structural_action_has_identity(
                 control_type, name, automation_id
             ):
                 return None
-            enabled = bool(control.IsEnabled)
-            offscreen = bool(control.IsOffscreen)
-            rect = (
-                precomputed_rect
-                if precomputed_rect is not None
-                else rect_from_control(control)
-            )
             valid_size = 16 <= rect.width <= 1800 and 16 <= rect.height <= 1400
             if not (
                 enabled
@@ -3064,7 +3102,6 @@ def _run_windows(args: argparse.Namespace) -> int:
                 and rect.intersects(window_rect)
             ):
                 return None
-            keyboard_focusable = bool(control.IsKeyboardFocusable)
             (
                 action_pattern,
                 direct_action_pattern,
@@ -3622,31 +3659,30 @@ def _run_windows(args: argparse.Namespace) -> int:
                             control,
                             auto.PatternId.SelectionItemPattern,
                         )
-                elements.append(
-                    ElementSnapshot(
-                        rect=control_rect,
-                        name=name,
-                        control_type=control_type,
-                        automation_id=automation_id,
-                        path=path,
-                        enabled=enabled,
-                        offscreen=offscreen,
-                        keyboard_focusable=keyboard_focusable,
-                        has_direct_action_pattern=repeated_content_action,
-                        has_legacy_pattern=(
-                            control_type in VISUAL_SURFACE_CONTROL_TYPES
-                            and control_supports_pattern(
-                                control, auto.PatternId.LegacyIAccessiblePattern
-                            )
-                        ),
-                        has_scroll_pattern=(
-                            control_type in VISUAL_SURFACE_CONTROL_TYPES
-                            and control_supports_pattern(
-                                control, auto.PatternId.ScrollPattern
-                            )
-                        ),
-                    )
+                element = ElementSnapshot(
+                    rect=control_rect,
+                    name=name,
+                    control_type=control_type,
+                    automation_id=automation_id,
+                    path=path,
+                    enabled=enabled,
+                    offscreen=offscreen,
+                    keyboard_focusable=keyboard_focusable,
+                    has_direct_action_pattern=repeated_content_action,
+                    has_legacy_pattern=(
+                        control_type in VISUAL_SURFACE_CONTROL_TYPES
+                        and control_supports_pattern(
+                            control, auto.PatternId.LegacyIAccessiblePattern
+                        )
+                    ),
+                    has_scroll_pattern=(
+                        control_type in VISUAL_SURFACE_CONTROL_TYPES
+                        and control_supports_pattern(
+                            control, auto.PatternId.ScrollPattern
+                        )
+                    ),
                 )
+                elements.append(element)
                 if path:
                     node_types[path] = control_type
                     node_rects[path] = control_rect
@@ -3664,7 +3700,7 @@ def _run_windows(args: argparse.Namespace) -> int:
                         depth=root_depth + relative_depth,
                         section_path=section_path,
                         section_rect=node_rects.get(section_path),
-                        precomputed_rect=control_rect,
+                        precomputed_element=element,
                     )
                     if candidate is not None:
                         rect = candidate.snapshot.rect
@@ -4059,8 +4095,8 @@ def _run_windows(args: argparse.Namespace) -> int:
                 "stop",
             }
         )
-        _CACHE_TTL_SECONDS = 15.0
-        _PREWARM_BUDGET_SECONDS = 1.5
+        _CACHE_TTL_SECONDS = PREWARM_CACHE_TTL_SECONDS
+        _PREWARM_BUDGET_SECONDS = 2.0
         _SCROLL_BURST_SECONDS = 0.35
         _IDLE_REFRESH_POLL_SECONDS = 0.05
 
@@ -4676,6 +4712,27 @@ def _run_windows(args: argparse.Namespace) -> int:
                     return False
             return True
 
+        def prewarm_refresh_ready(self, hwnd: int, now: float) -> bool:
+            if hwnd <= 0:
+                return False
+            process_id = window_process_id(hwnd)
+            dirty_state = dirty_windows.state(hwnd, process_id)
+            with self._post_lock:
+                cached_hwnd = self.hwnd
+                has_cached_targets = bool(self.all_targets)
+                cache_timestamp = self.cache_timestamp
+            return prewarm_cache_refresh_ready(
+                hwnd,
+                cached_hwnd,
+                has_cached_targets,
+                cache_timestamp,
+                now,
+                dirty_changed_at=(
+                    dirty_state.changed_at if dirty_state is not None else None
+                ),
+                cache_ttl_seconds=self._CACHE_TTL_SECONDS,
+            )
+
         def _prewarm(self, hwnd: int, expected_generation: int) -> None:
             if hwnd <= 0 or self._cache_is_reusable(hwnd):
                 return
@@ -4684,7 +4741,7 @@ def _run_windows(args: argparse.Namespace) -> int:
                 hwnd,
                 activate_context=False,
                 deadline=started + self._PREWARM_BUDGET_SECONDS,
-                should_cancel=self._scan_requested.is_set,
+                should_cancel=lambda: self._generation != expected_generation,
                 expected_generation=expected_generation,
             )
             if not cached:
@@ -5696,9 +5753,10 @@ def _run_windows(args: argparse.Namespace) -> int:
     active = threading.Event()
     scanning = False
     shutting_down = False
-    prewarm_observed_hwnd = 0
-    prewarm_observed_at = 0.0
+    prewarm_observed_hwnd = native_handle_value(user32.GetForegroundWindow())
+    prewarm_observed_at = time.perf_counter()
     prewarm_requested_hwnd = 0
+    prewarm_requested_at = 0.0
     navigation_root_hwnd = 0
     navigation_process_id = 0
     navigation_overlay_signature: tuple[tuple[int, Rect], ...] = ()
@@ -5801,7 +5859,7 @@ def _run_windows(args: argparse.Namespace) -> int:
                 worker.post("move", action)
 
     def drain_events() -> None:
-        nonlocal scanning
+        nonlocal scanning, prewarm_requested_at
         while True:
             try:
                 action = keyboard_events.get_nowait()
@@ -5923,10 +5981,12 @@ def _run_windows(args: argparse.Namespace) -> int:
                 print(f"导航已暂停: {payload}，请重新按 Ctrl+Alt+N。")
                 leave_navigation()
             elif event == "prewarm_done":
+                prewarm_requested_at = time.perf_counter()
                 print(
                     f"已预识别 {payload['window']}，耗时 {payload['elapsed']:.2f}s。"
                 )
             elif event == "prewarm_skipped":
+                prewarm_requested_at = time.perf_counter()
                 print(
                     f"预识别超过 {payload['elapsed']:.2f}s，已停止以免阻塞按键启动。"
                 )
@@ -5956,6 +6016,7 @@ def _run_windows(args: argparse.Namespace) -> int:
 
     def monitor_navigation_context() -> None:
         nonlocal prewarm_observed_hwnd, prewarm_observed_at, prewarm_requested_hwnd
+        nonlocal prewarm_requested_at
         nonlocal navigation_overlay_signature
         foreground = native_handle_value(user32.GetForegroundWindow())
         if not active.is_set():
@@ -5974,8 +6035,13 @@ def _run_windows(args: argparse.Namespace) -> int:
                 prewarm_observed_at,
                 prewarm_requested_hwnd,
                 now,
+                requested_at=prewarm_requested_at,
+                cache_needs_refresh=worker.prewarm_refresh_ready(
+                    foreground, now
+                ),
             ):
                 prewarm_requested_hwnd = foreground
+                prewarm_requested_at = now
                 worker.post("prewarm", foreground)
             return
         if foreground <= 0:
