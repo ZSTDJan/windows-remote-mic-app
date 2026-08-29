@@ -669,7 +669,7 @@ def resolve_voice_program_settings_target(
             return VoiceProgramSettingsTarget(
                 provider_id,
                 display_name,
-                "sogou_tray",
+                "sogou_manual",
                 str(executable),
             )
         toolbox = discover_sogou_ai_toolbox_executable(

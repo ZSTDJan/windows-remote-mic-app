@@ -299,7 +299,7 @@ class WeTypeDiscoveryTests(unittest.TestCase):
 
 
 class VoiceProgramSettingsTargetTests(unittest.TestCase):
-    def test_sogou_settings_use_the_installed_voice_tray(self):
+    def test_installed_sogou_settings_are_manual(self):
         with tempfile.TemporaryDirectory() as tmp:
             components = Path(tmp) / "SogouInput" / "Components"
             executable = (
@@ -321,7 +321,7 @@ class VoiceProgramSettingsTargetTests(unittest.TestCase):
             )
 
         self.assertTrue(target.available)
-        self.assertEqual(target.kind, "sogou_tray")
+        self.assertEqual(target.kind, "sogou_manual")
         self.assertEqual(Path(target.target), executable)
 
     def test_missing_sogou_voice_uses_the_ai_toolbox(self):

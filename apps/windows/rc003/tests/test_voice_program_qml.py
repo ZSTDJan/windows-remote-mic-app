@@ -238,6 +238,9 @@ def rendered_status(
         "settings_button_text": str(
             controls["openVoiceProgramSettingsButton"].property("text")
         ),
+        "settings_button_visible": bool(
+            controls["openVoiceProgramSettingsButton"].property("visible")
+        ),
     }
 
 
@@ -408,8 +411,17 @@ class VoiceProgramQmlTests(unittest.TestCase):
             data["managed"]["openVoiceProgramSettingsButton"]["text"],
             "去安装",
         )
+        self.assertTrue(
+            data["managed"]["openVoiceProgramSettingsButton"]["visible"]
+        )
         self.assertTrue(data["managed_auto_start"])
         self.assertTrue(data["managed_elevated"])
+        self.assertTrue(
+            all(
+                not case["settings_button_visible"]
+                for case in data["status_cases"].values()
+            )
+        )
         self.assertEqual(data["hotkey_cancel"]["recording_prompt"], "请按快捷键")
         self.assertFalse(data["hotkey_cancel"]["recording"])
         self.assertEqual(
@@ -468,32 +480,25 @@ class VoiceProgramQmlTests(unittest.TestCase):
         self.assertFalse(data["custom_program"]["settings_visible"])
         self.assertEqual(
             data["status_cases"]["unknown_running"]["text"],
-            "运行中 · 权限未知",
+            "运行中 · 权限未知；设置：在任务栏（含隐藏图标）右键搜狗语音图标",
         )
         self.assertEqual(
             data["status_cases"]["unknown_running"]["settings_button_text"],
             "打开设置",
         )
-        self.assertEqual(
-            data["status_cases"]["standard_mismatch"]["text"],
-            "需重启为管理员",
-        )
-        self.assertEqual(
-            data["status_cases"]["standard_running"]["text"],
-            "随遥控器服务启动；失败不影响服务",
-        )
-        self.assertEqual(
-            data["status_cases"]["stopped_clean"]["text"],
-            "已找到 · 待启动",
-        )
-        self.assertEqual(
-            data["status_cases"]["stopped_unrelated_dirty"]["text"],
-            "已找到 · 待启动",
-        )
-        self.assertEqual(
-            data["status_cases"]["stopped_voice_program_dirty"]["text"],
-            "已修改 · 待应用",
-        )
+        expected_sogou_status = {
+            "standard_mismatch": "需重启为管理员",
+            "standard_running": "普通权限运行中",
+            "stopped_clean": "已找到 · 待启动",
+            "stopped_unrelated_dirty": "已找到 · 待启动",
+            "stopped_voice_program_dirty": "已修改 · 待应用",
+        }
+        for case_name, status_text in expected_sogou_status.items():
+            self.assertEqual(
+                data["status_cases"][case_name]["text"],
+                status_text
+                + "；设置：在任务栏（含隐藏图标）右键搜狗语音图标",
+            )
         self.assertTrue(data["unmanaged_elevated"]["visible"])
         self.assertFalse(data["unmanaged_elevated"]["enabled"])
         for item in data["managed"].values():

@@ -20,6 +20,8 @@ Item {
         SettingsController.voiceProgramSystemManaged
     readonly property bool windowsDictationSelected:
         SettingsController.selectedVoiceProgramIndex === 3
+    readonly property bool sogouSelected:
+        SettingsController.selectedVoiceProgramIndex === 1
     readonly property bool customProgramSelected:
         SettingsController.selectedVoiceProgramIndex === 4
     readonly property bool voiceHotkeyBusy: SettingsController.voiceHotkeyBusy
@@ -126,6 +128,10 @@ Item {
             return qsTr("只发送语音快捷键，不启动程序")
         if (windowsDictationSelected)
             return qsTr("使用 Windows 听写与联机语音识别")
+        if (sogouSelected && code !== "not_found") {
+            return voiceProgramStatusSummary()
+                + qsTr("；设置：在任务栏（含隐藏图标）右键搜狗语音图标")
+        }
         if (voiceProgramNeedsAttention
                 || code === "not_found"
                 || code === "stopped") {
@@ -632,8 +638,10 @@ Item {
                     ]
                     CompactButton {
                         objectName: "openVoiceProgramSettingsButton"
-                        visible: SettingsController.selectedVoiceProgramIndex >= 1
-                            && SettingsController.selectedVoiceProgramIndex <= 3
+                        visible: SettingsController.selectedVoiceProgramIndex === 2
+                            || SettingsController.selectedVoiceProgramIndex === 3
+                            || (SettingsController.selectedVoiceProgramIndex === 1
+                                && SettingsController.voiceProgramStatusCode === "not_found")
                         tokens: root.tokens
                         Layout.fillWidth: true
                         text: SettingsController.selectedVoiceProgramIndex === 1

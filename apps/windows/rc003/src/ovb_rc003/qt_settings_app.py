@@ -3103,23 +3103,14 @@ def _load_qt_classes() -> dict:
                 return
 
             success_message = f"已打开{target.display_name}设置。"
-            if target.kind == "sogou_tray":
-                try:
-                    voice_program_manager.open_sogou_voice_settings(
-                        Path(target.target),
-                        launch_elevated=(
-                            self._voice_program_settings.get("launch_elevated")
-                            is True
-                        ),
-                    )
-                except Exception as exc:  # noqa: BLE001 - Qt slot must not escape
-                    self._set_status_message("")
-                    self._set_error_message(
-                        f"无法打开搜狗语音设置（{exc}）",
-                        self._VOICE_PAGE_INDEX,
-                    )
-                    return
-            elif target.kind == "sogou_toolbox":
+            if target.kind == "sogou_manual":
+                self._set_error_message("")
+                self._set_status_message(
+                    "请在任务栏通知区域（必要时先展开隐藏图标）右键搜狗语音图标，选择“设置”。",
+                    self._VOICE_PAGE_INDEX,
+                )
+                return
+            if target.kind == "sogou_toolbox":
                 try:
                     voice_program_manager.open_voice_program_settings(
                         Path(target.target),
