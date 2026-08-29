@@ -104,7 +104,7 @@ class SpatialNavigationTests(unittest.TestCase):
             [2, 1],
         )
 
-    def test_long_overlapping_cell_does_not_claim_a_distant_column(self):
+    def test_long_overlapping_cell_claims_its_contacted_range(self):
         targets = [
             self.target(1100, 500, 1168, 568, "current action"),
             self.target(100, 400, 1200, 440, "long passive-looking row"),
@@ -115,7 +115,7 @@ class SpatialNavigationTests(unittest.TestCase):
             prototype.ranked_target_indices(
                 targets, 0, prototype.Direction.UP
             )[:2],
-            [2, 1],
+            [1, 2],
         )
 
     def test_horizontal_route_uses_an_intermediate_cell_only_in_the_same_row(self):
@@ -155,7 +155,7 @@ class SpatialNavigationTests(unittest.TestCase):
         self.assertEqual(graph.candidates(0, prototype.Direction.RIGHT)[0], 2)
         self.assertEqual(graph.candidates(2, prototype.Direction.LEFT)[0], 0)
 
-    def test_horizontal_route_does_not_treat_one_pixel_overlap_as_a_row(self):
+    def test_horizontal_route_treats_one_pixel_overlap_as_contact(self):
         targets = [
             self.target(100, 100, 160, 140, "left row target"),
             self.target(180, 139, 240, 179, "one-pixel overlap"),
@@ -166,13 +166,13 @@ class SpatialNavigationTests(unittest.TestCase):
             prototype.next_target_index(
                 targets, 0, prototype.Direction.RIGHT
             ),
-            2,
+            1,
         )
         self.assertEqual(
             prototype.next_target_index(
                 targets, 2, prototype.Direction.LEFT
             ),
-            0,
+            1,
         )
 
     def test_parent_body_and_inline_action_are_separate_grid_cells(self):
@@ -605,18 +605,31 @@ class SpatialNavigationTests(unittest.TestCase):
                     traversal = prototype.NavigationTraversal()
                     seen = {start}
                     current = start
+                    current_cell = graph.grid_rects[current]
                     for _step in range(len(targets) + 1):
                         candidates = traversal.available(
                             current,
                             direction,
-                            graph.candidates(current, direction),
+                            graph.candidates(
+                                current, direction, current_cell
+                            ),
                         )
                         if not candidates:
                             break
-                        current = candidates[0]
-                        self.assertNotIn(current, seen)
-                        seen.add(current)
-                        traversal.commit(current)
+                        next_index = candidates[0]
+                        next_cell = prototype.navigation_contact_cell(
+                            current_cell,
+                            graph.grid_rects[next_index],
+                            direction,
+                        )
+                        self.assertTrue(
+                            graph.grid_rects[next_index].contains(next_cell)
+                        )
+                        self.assertNotIn(next_index, seen)
+                        seen.add(next_index)
+                        traversal.commit(next_index, next_cell)
+                        current = next_index
+                        current_cell = next_cell
 
     def test_changing_direction_allows_returning_to_previous_target(self):
         targets = [
@@ -1193,7 +1206,7 @@ class SpatialNavigationTests(unittest.TestCase):
             2,
         )
 
-    def test_vertical_navigation_keeps_long_message_in_its_center_column(self):
+    def test_vertical_navigation_uses_the_long_message_range(self):
         targets = [
             self.target(500, 100, 1200, 240, "message"),
             self.target(495, 250, 535, 290, "复制"),
@@ -1201,12 +1214,168 @@ class SpatialNavigationTests(unittest.TestCase):
         ]
         self.assertEqual(
             prototype.next_target_index(targets, 0, prototype.Direction.DOWN),
-            2,
+            1,
         )
         self.assertEqual(
             prototype.next_target_index(targets, 0, prototype.Direction.LEFT),
             1,
         )
+
+    def test_bottom_controls_enter_the_wide_input_before_distant_headers(self):
+        targets = [
+            self.target(530, 952, 1599, 1018, "input"),
+            self.target(524, 1024, 567, 1066, "add"),
+            self.target(573, 1024, 708, 1066, "permission"),
+            self.target(1431, 1024, 1563, 1066, "model"),
+            self.target(1562, 1024, 1605, 1066, "stop"),
+            self.target(494, 71, 597, 108, "left header"),
+            self.target(1271, 7, 1477, 49, "right header"),
+        ]
+        graph = prototype.NavigationGraph(targets)
+
+        for current in range(1, 5):
+            with self.subTest(target=targets[current].name):
+                self.assertEqual(
+                    graph.candidates(current, prototype.Direction.UP)[0],
+                    0,
+                )
+
+    def test_wide_input_keeps_the_column_where_navigation_entered(self):
+        targets = [
+            self.target(524, 1024, 567, 1066, "add"),
+            self.target(530, 952, 1599, 1018, "input"),
+            self.target(506, 851, 545, 890, "copy"),
+            self.target(547, 851, 586, 890, "branch"),
+            self.target(1040, 847, 1089, 895, "scroll"),
+        ]
+        graph = prototype.NavigationGraph(targets)
+        current_cell = graph.grid_rects[0]
+
+        input_index = graph.candidates(
+            0, prototype.Direction.UP, current_cell
+        )[0]
+        self.assertEqual(input_index, 1)
+        input_cell = prototype.navigation_contact_cell(
+            current_cell,
+            graph.grid_rects[input_index],
+            prototype.Direction.UP,
+        )
+        self.assertEqual(input_cell, prototype.Rect(530, 952, 567, 1018))
+        self.assertEqual(
+            graph.candidates(
+                input_index, prototype.Direction.UP, input_cell
+            )[0],
+            3,
+        )
+
+    def test_codex_bottom_controls_follow_their_contacted_input_columns(self):
+        targets = [
+            self.target(996, 786, 1099, 823, "button mouse"),
+            self.target(1049, 849, 1088, 888, "upper branch"),
+            self.target(1998, 901, 2119, 1022, "attachment"),
+            self.target(2074, 1137, 2113, 1176, "message copy"),
+            self.target(1014, 1199, 1183, 1234, "elapsed"),
+            self.target(1049, 1566, 1088, 1605, "lower branch"),
+            self.target(1032, 1667, 2101, 1733, "input"),
+            self.target(1026, 1739, 1069, 1781, "add"),
+            self.target(1075, 1739, 1210, 1781, "permission"),
+            self.target(1933, 1739, 2065, 1781, "model"),
+            self.target(2064, 1739, 2107, 1781, "stop"),
+        ]
+        graph = prototype.NavigationGraph(targets)
+
+        def move_up_twice(start: int) -> tuple[int, int]:
+            traversal = prototype.NavigationTraversal()
+            current = start
+            current_cell = graph.grid_rects[current]
+            path = []
+            for _step in range(2):
+                candidates = traversal.available(
+                    current,
+                    prototype.Direction.UP,
+                    graph.candidates(
+                        current, prototype.Direction.UP, current_cell
+                    ),
+                )
+                next_index = candidates[0]
+                current_cell = prototype.navigation_contact_cell(
+                    current_cell,
+                    graph.grid_rects[next_index],
+                    prototype.Direction.UP,
+                )
+                traversal.commit(next_index, current_cell)
+                current = next_index
+                path.append(current)
+            return tuple(path)
+
+        self.assertEqual(move_up_twice(7), (6, 5))
+        self.assertEqual(move_up_twice(8), (6, 5))
+        self.assertEqual(move_up_twice(9), (6, 2))
+        self.assertEqual(move_up_twice(10), (6, 3))
+
+    def test_contact_cell_immediate_reverse_returns_to_the_previous_target(self):
+        generator = random.Random(830)
+        for _case in range(80):
+            targets = []
+            for index in range(generator.randint(2, 35)):
+                left = generator.randint(0, 1600)
+                top = generator.randint(0, 900)
+                width = generator.randint(24, 360)
+                height = generator.randint(20, 120)
+                targets.append(
+                    self.target(
+                        left,
+                        top,
+                        left + width,
+                        top + height,
+                        str(index),
+                        path=(0, generator.randint(0, 4), index),
+                    )
+                )
+            graph = prototype.NavigationGraph(targets)
+            for start in (0, len(targets) // 2, len(targets) - 1):
+                for direction in prototype.Direction:
+                    traversal = prototype.NavigationTraversal()
+                    current_cell = graph.grid_rects[start]
+                    candidates = traversal.available(
+                        start,
+                        direction,
+                        graph.candidates(start, direction, current_cell),
+                    )
+                    if not candidates:
+                        continue
+                    next_index = candidates[0]
+                    next_cell = prototype.navigation_contact_cell(
+                        current_cell,
+                        graph.grid_rects[next_index],
+                        direction,
+                    )
+                    traversal.commit(next_index, next_cell)
+                    reverse = prototype.OPPOSITE_DIRECTION[direction]
+                    reverse_candidates = traversal.available(
+                        next_index,
+                        reverse,
+                        graph.candidates(next_index, reverse, next_cell),
+                    )
+                    self.assertEqual(reverse_candidates[0], start)
+
+    def test_navigation_diagnostic_uses_the_active_contact_cell(self):
+        targets = [
+            self.target(530, 952, 1599, 1018, "input"),
+            self.target(506, 851, 545, 890, "left action"),
+            self.target(1500, 851, 1539, 890, "right action"),
+        ]
+        active_cell = prototype.Rect(1490, 952, 1590, 1018)
+        diagnostic = prototype.build_navigation_diagnostic(
+            targets,
+            0,
+            prototype.Direction.UP,
+            current_rect=active_cell,
+        )
+
+        self.assertIsNotNone(diagnostic)
+        assert diagnostic is not None
+        self.assertEqual(diagnostic.candidates[0].index, 2)
 
     def test_keeps_current_target_when_no_candidate_exists(self):
         targets = [self.target(100, 100, 160, 140, "only")]
@@ -2730,7 +2899,7 @@ class SpatialNavigationTests(unittest.TestCase):
             [0, 1],
         )
 
-    def test_nested_show_more_uses_its_center_column(self):
+    def test_nested_show_more_occupies_the_folder_range(self):
         folder = self.target(
             20,
             140,
@@ -2766,7 +2935,7 @@ class SpatialNavigationTests(unittest.TestCase):
             prototype.next_target_index(
                 visible, 0, prototype.Direction.DOWN
             ),
-            2,
+            1,
         )
         self.assertEqual(
             prototype.next_target_index(

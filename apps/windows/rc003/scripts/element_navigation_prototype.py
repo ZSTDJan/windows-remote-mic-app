@@ -1561,12 +1561,55 @@ def _direction_rank_key(
     )
 
 
+def _range_frontier_rank_key(
+    current: Rect,
+    candidate: Rect,
+    direction: Direction,
+    score: tuple[int, float, float, float, float, int, int],
+    common_prefix: int,
+) -> tuple[float, ...]:
+    """Prefer the first full-range contact before center-line alignment."""
+
+    if direction in {Direction.LEFT, Direction.RIGHT}:
+        overlap = _axis_overlap(
+            current.top, current.bottom, candidate.top, candidate.bottom
+        )
+        forward_center_distance = abs(candidate.center_x - current.center_x)
+    else:
+        overlap = _axis_overlap(
+            current.left, current.right, candidate.left, candidate.right
+        )
+        forward_center_distance = abs(candidate.center_y - current.center_y)
+    if overlap > 0:
+        return (
+            0.0,
+            score[1],
+            float(-overlap),
+            score[4],
+            forward_center_distance,
+            float(-common_prefix),
+            float(score[5]),
+            float(score[6]),
+        )
+    return (
+        1.0,
+        *_direction_rank_key(
+            current,
+            candidate,
+            direction,
+            score,
+            common_prefix,
+        ),
+    )
+
+
 def ranked_target_indices(
     targets: Sequence[TargetSnapshot],
     current_index: int,
     direction: Direction,
     descendants_by_target: Optional[Sequence[Sequence[int]]] = None,
     grid_rects: Optional[Sequence[Rect]] = None,
+    current_rect: Optional[Rect] = None,
 ) -> list[int]:
     if not targets or not 0 <= current_index < len(targets):
         return []
@@ -1574,7 +1617,7 @@ def ranked_target_indices(
         descendants_by_target = finer_descendant_index_map(targets)
     if grid_rects is None:
         grid_rects = navigation_grid_rects(targets, descendants_by_target)
-    current = grid_rects[current_index]
+    current = grid_rects[current_index] if current_rect is None else current_rect
     scored: list[
         tuple[tuple[int, float, float, float, float, int, int], int, int]
     ] = []
@@ -1594,7 +1637,7 @@ def ranked_target_indices(
         ],
     ) -> tuple[float, ...]:
         score, common_prefix, index = item
-        return _direction_rank_key(
+        return _range_frontier_rank_key(
             current,
             grid_rects[index],
             direction,
@@ -1655,6 +1698,7 @@ def build_navigation_diagnostic(
     current_index: int,
     direction: Direction,
     *,
+    current_rect: Optional[Rect] = None,
     ranked_indices: Optional[Sequence[int]] = None,
     available_indices: Sequence[int] = (),
     invalid_cached_indices: Sequence[int] = (),
@@ -1668,7 +1712,9 @@ def build_navigation_diagnostic(
     current = targets[current_index]
     descendants_by_target = finer_descendant_index_map(targets)
     grid_rects = navigation_grid_rects(targets, descendants_by_target)
-    current_rect = grid_rects[current_index]
+    active_rect = (
+        grid_rects[current_index] if current_rect is None else current_rect
+    )
     ranked = tuple(
         ranked_target_indices(
             targets,
@@ -1676,6 +1722,7 @@ def build_navigation_diagnostic(
             direction,
             descendants_by_target,
             grid_rects,
+            active_rect,
         )
         if ranked_indices is None
         else ranked_indices
@@ -1687,10 +1734,11 @@ def build_navigation_diagnostic(
             direction,
             descendants_by_target,
             grid_rects,
+            active_rect,
         )
     )
     scored_by_index = {
-        index: direction_score(current_rect, grid_rects[index], direction)
+        index: direction_score(active_rect, grid_rects[index], direction)
         for index in ranked
         if 0 <= index < len(targets) and index != current_index
     }
@@ -1699,7 +1747,7 @@ def build_navigation_diagnostic(
         if not 0 <= index < len(targets) or index == current_index:
             continue
         target = targets[index]
-        score = direction_score(current_rect, grid_rects[index], direction)
+        score = direction_score(active_rect, grid_rects[index], direction)
         if target.rect.contains(current.rect) and target.rect != current.rect:
             route = "parent_cell"
         elif index not in natural and target.rect.contains(current.rect):
@@ -1735,9 +1783,9 @@ def build_navigation_diagnostic(
         if index == current_index or index in ranked_set:
             continue
         target_rect = grid_rects[index]
-        if target_rect == current_rect:
+        if target_rect == active_rect:
             reason = "same_rectangle"
-        elif direction_score(current_rect, target_rect, direction) is None:
+        elif direction_score(active_rect, target_rect, direction) is None:
             reason = "wrong_direction"
         else:
             continue
@@ -1869,6 +1917,33 @@ OPPOSITE_DIRECTION = {
 }
 
 
+def navigation_contact_cell(
+    current: Rect, target: Rect, direction: Direction
+) -> Rect:
+    """Keep the contacted strip when entering a target that spans many cells."""
+
+    if direction in {Direction.UP, Direction.DOWN}:
+        left = max(current.left, target.left)
+        right = min(current.right, target.right)
+        if right <= left:
+            width = max(1, min(current.width, target.width))
+            center = min(max(current.center_x, target.left), target.right)
+            left = max(target.left, round(center - width / 2))
+            right = min(target.right, left + width)
+            left = max(target.left, right - width)
+        return Rect(left, target.top, right, target.bottom)
+
+    top = max(current.top, target.top)
+    bottom = min(current.bottom, target.bottom)
+    if bottom <= top:
+        height = max(1, min(current.height, target.height))
+        center = min(max(current.center_y, target.top), target.bottom)
+        top = max(target.top, round(center - height / 2))
+        bottom = min(target.bottom, top + height)
+        top = max(target.top, bottom - height)
+    return Rect(target.left, top, target.right, bottom)
+
+
 class NavigationGraph:
     """Cache geometry-only candidates for one flat screen layout."""
 
@@ -1881,8 +1956,22 @@ class NavigationGraph:
         self._natural: dict[tuple[int, Direction], tuple[int, ...]] = {}
 
     def natural_candidates(
-        self, current_index: int, direction: Direction
+        self,
+        current_index: int,
+        direction: Direction,
+        current_rect: Optional[Rect] = None,
     ) -> tuple[int, ...]:
+        if current_rect is not None and current_rect != self.grid_rects[current_index]:
+            return tuple(
+                ranked_target_indices(
+                    self.targets,
+                    current_index,
+                    direction,
+                    self._descendants_by_target,
+                    self.grid_rects,
+                    current_rect,
+                )
+            )
         key = (current_index, direction)
         natural = self._natural.get(key)
         if natural is None:
@@ -1898,8 +1987,13 @@ class NavigationGraph:
             self._natural[key] = natural
         return natural
 
-    def candidates(self, current_index: int, direction: Direction) -> tuple[int, ...]:
-        return self.natural_candidates(current_index, direction)
+    def candidates(
+        self,
+        current_index: int,
+        direction: Direction,
+        current_rect: Optional[Rect] = None,
+    ) -> tuple[int, ...]:
+        return self.natural_candidates(current_index, direction, current_rect)
 
 
 @dataclass
@@ -1911,6 +2005,8 @@ class NavigationTraversal:
     last_direction: Optional[Direction] = None
     pending_from: Optional[int] = None
     pending_direction: Optional[Direction] = None
+    active_index: Optional[int] = None
+    active_rect: Optional[Rect] = None
 
     def reset(self) -> None:
         self.direction = None
@@ -1920,6 +2016,14 @@ class NavigationTraversal:
         self.last_direction = None
         self.pending_from = None
         self.pending_direction = None
+        self.active_index = None
+        self.active_rect = None
+
+    def current_cell(self, current_index: int, default_rect: Rect) -> Rect:
+        if self.active_index != current_index or self.active_rect is None:
+            self.active_index = current_index
+            self.active_rect = default_rect
+        return self.active_rect
 
     def available(
         self,
@@ -1946,11 +2050,15 @@ class NavigationTraversal:
         self.pending_direction = direction
         return tuple(index for index in ranked if index not in self.visited)
 
-    def commit(self, selected_index: int) -> None:
+    def commit(
+        self, selected_index: int, active_rect: Optional[Rect] = None
+    ) -> None:
         self.last_from = self.pending_from
         self.last_to = selected_index
         self.last_direction = self.pending_direction
         self.visited.add(selected_index)
+        self.active_index = selected_index
+        self.active_rect = active_rect
 
 
 def geometry_anchor_indices(count: int, selected: int) -> list[int]:
@@ -4754,6 +4862,7 @@ def _run_windows(args: argparse.Namespace) -> int:
 
             def load_candidates() -> tuple[
                 int,
+                Rect,
                 list[TargetSnapshot],
                 tuple[int, ...],
                 tuple[int, ...],
@@ -4761,24 +4870,33 @@ def _run_windows(args: argparse.Namespace) -> int:
             ]:
                 current = self.selected
                 current_snapshots = [target.snapshot for target in self.targets]
-                natural_candidates = self.navigation_graph.natural_candidates(
-                    current, direction
+                current_cell = self.traversal.current_cell(
+                    current, self.navigation_graph.grid_rects[current]
                 )
                 ranked_candidates = self.navigation_graph.candidates(
-                    current, direction
+                    current, direction, current_cell
                 )
+                natural_candidates = ranked_candidates
                 available_candidates = self.traversal.available(
                     current, direction, ranked_candidates
                 )
                 return (
                     current,
+                    current_cell,
                     current_snapshots,
                     natural_candidates,
                     ranked_candidates,
                     available_candidates,
                 )
 
-            current_index, snapshots, natural, ranked, candidates = load_candidates()
+            (
+                current_index,
+                current_cell,
+                snapshots,
+                natural,
+                ranked,
+                candidates,
+            ) = load_candidates()
             first_index = candidates[0] if candidates else None
             first_rect = (
                 self.targets[first_index].snapshot.rect
@@ -4817,6 +4935,7 @@ def _run_windows(args: argparse.Namespace) -> int:
                     snapshots,
                     current_index,
                     direction,
+                    current_rect=current_cell,
                     ranked_indices=ranked,
                     available_indices=candidates,
                     invalid_cached_indices=invalid_cached,
@@ -4849,7 +4968,14 @@ def _run_windows(args: argparse.Namespace) -> int:
                         self._emit_selection()
                     return
                 self.selected = next_index
-                self.traversal.commit(next_index)
+                self.traversal.commit(
+                    next_index,
+                    navigation_contact_cell(
+                        current_cell,
+                        self.navigation_graph.grid_rects[next_index],
+                        direction,
+                    ),
+                )
                 self._clear_hierarchy()
                 emit_diagnostic("selected", next_index)
                 self._emit_selection()
