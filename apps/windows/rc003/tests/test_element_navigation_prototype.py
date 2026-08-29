@@ -1882,6 +1882,184 @@ class SpatialNavigationTests(unittest.TestCase):
             parent_first.candidates(1, prototype.Direction.RIGHT), (0,)
         )
 
+    def test_hybrid_plan_keeps_an_existing_territory_route(self):
+        targets = [
+            self.target(20, 20, 80, 60, "left"),
+            self.target(120, 20, 180, 60, "right"),
+        ]
+        graph = prototype.NavigationGraph(targets)
+
+        plan = prototype.navigation_candidate_plan(
+            graph,
+            0,
+            prototype.Direction.RIGHT,
+            graph.anchor_rects[0],
+        )
+
+        self.assertEqual(plan.natural, (1,))
+        self.assertEqual(plan.ranked, plan.natural)
+        self.assertFalse(plan.orthogonal_step_required)
+        self.assertFalse(plan.uses_xy_fallback)
+
+    def test_xy_fallback_prefers_the_same_section_before_global_space(self):
+        targets = [
+            self.target(
+                100,
+                100,
+                150,
+                150,
+                "current",
+                section_path=(1,),
+            ),
+            self.target(
+                500,
+                100,
+                550,
+                150,
+                "same section",
+                section_path=(1,),
+            ),
+            self.target(
+                220,
+                100,
+                270,
+                150,
+                "other section",
+                section_path=(2,),
+            ),
+        ]
+        graph = prototype.NavigationGraph(targets)
+
+        self.assertEqual(
+            graph.xy_focus_candidates(0, prototype.Direction.RIGHT),
+            (1, 2),
+        )
+
+    def test_xy_fallback_fills_a_direction_without_a_territory_route(self):
+        targets = [
+            self.target(60, 220, 140, 260, "current"),
+            self.target(420, 240, 440, 280, "lower right"),
+        ]
+        graph = prototype.NavigationGraph(targets)
+
+        plan = prototype.navigation_candidate_plan(
+            graph,
+            0,
+            prototype.Direction.DOWN,
+            graph.anchor_rects[0],
+        )
+
+        self.assertEqual(plan.natural, ())
+        self.assertEqual(plan.ranked, (1,))
+        self.assertFalse(plan.orthogonal_step_required)
+        self.assertTrue(plan.uses_xy_fallback)
+
+    def test_xy_fallback_immediately_returns_in_the_opposite_direction(self):
+        targets = [
+            self.target(60, 220, 140, 260, "current"),
+            self.target(420, 240, 440, 280, "lower right"),
+        ]
+        graph = prototype.NavigationGraph(targets)
+        traversal = prototype.NavigationTraversal()
+        plan = prototype.navigation_candidate_plan(
+            graph,
+            0,
+            prototype.Direction.DOWN,
+            graph.anchor_rects[0],
+        )
+        selected = traversal.available(
+            0, prototype.Direction.DOWN, plan.ranked
+        )[0]
+        traversal.commit(selected, graph.anchor_rects[selected])
+        reverse_plan = prototype.navigation_candidate_plan(
+            graph,
+            selected,
+            prototype.Direction.UP,
+            graph.anchor_rects[selected],
+        )
+
+        self.assertEqual(
+            traversal.available(
+                selected,
+                prototype.Direction.UP,
+                reverse_plan.ranked,
+            )[0],
+            0,
+        )
+
+    def test_xy_fallback_replaces_only_an_orthogonally_blocked_route(self):
+        coordinates = (
+            (460, 20, 560, 60),
+            (300, 160, 340, 180),
+            (60, 260, 80, 320),
+            (360, 60, 400, 100),
+            (480, 20, 520, 80),
+            (400, 320, 440, 360),
+            (0, 200, 120, 240),
+        )
+        targets = [
+            self.target(left, top, right, bottom, str(index))
+            for index, (left, top, right, bottom) in enumerate(coordinates)
+        ]
+        graph = prototype.NavigationGraph(targets)
+
+        plan = prototype.navigation_candidate_plan(
+            graph,
+            3,
+            prototype.Direction.LEFT,
+            graph.anchor_rects[3],
+        )
+
+        self.assertEqual(plan.natural[0], 6)
+        self.assertEqual(plan.ranked[0], 1)
+        self.assertTrue(plan.orthogonal_step_required)
+        self.assertTrue(plan.uses_xy_fallback)
+
+    def test_random_hybrid_plans_never_rewire_a_usable_territory_route(self):
+        generator = random.Random(914)
+        for _case in range(120):
+            targets = []
+            for index in range(generator.randint(2, 25)):
+                left = generator.randint(0, 1600)
+                top = generator.randint(0, 900)
+                width = generator.randint(24, 260)
+                height = generator.randint(20, 100)
+                targets.append(
+                    self.target(
+                        left,
+                        top,
+                        left + width,
+                        top + height,
+                        str(index),
+                        path=(index,),
+                        section_path=(generator.randint(0, 5),),
+                    )
+                )
+            graph = prototype.NavigationGraph(targets)
+            for current in range(len(targets)):
+                for direction in prototype.Direction:
+                    plan = prototype.navigation_candidate_plan(
+                        graph,
+                        current,
+                        direction,
+                        graph.anchor_rects[current],
+                    )
+                    if plan.natural and not plan.orthogonal_step_required:
+                        self.assertEqual(plan.ranked, plan.natural)
+                        self.assertFalse(plan.uses_xy_fallback)
+                        continue
+                    if not plan.ranked:
+                        self.assertFalse(plan.uses_xy_fallback)
+                        continue
+                    self.assertTrue(plan.uses_xy_fallback)
+                    self.assertTrue(
+                        prototype._xy_focus_is_candidate(
+                            graph.anchor_rects[current],
+                            graph.anchor_rects[plan.ranked[0]],
+                            direction,
+                        )
+                    )
+
     def test_projection_candidate_precedes_a_closer_territory_contact(self):
         targets = [
             self.target(657, 89, 770, 164, "directly above"),
@@ -2387,6 +2565,41 @@ class SpatialNavigationTests(unittest.TestCase):
 
         self.assertLess(small_elapsed, 0.75)
         self.assertLess(large_elapsed, 2.5)
+
+    def test_xy_fallback_lookup_is_cached_and_stays_bounded(self):
+        generator = random.Random(913)
+        targets = []
+        for index in range(300):
+            left = generator.randint(0, 3000)
+            top = generator.randint(0, 1800)
+            width = generator.randint(24, 280)
+            height = generator.randint(20, 110)
+            targets.append(
+                self.target(
+                    left,
+                    top,
+                    left + width,
+                    top + height,
+                    str(index),
+                    path=(index,),
+                    section_path=(generator.randint(0, 8),),
+                )
+            )
+        graph = prototype.NavigationGraph(targets)
+
+        started = time.perf_counter()
+        for current in range(len(targets)):
+            for direction in prototype.Direction:
+                graph.xy_focus_candidates(current, direction)
+        cold_elapsed = time.perf_counter() - started
+        started = time.perf_counter()
+        for current in range(len(targets)):
+            for direction in prototype.Direction:
+                graph.xy_focus_candidates(current, direction)
+        cached_elapsed = time.perf_counter() - started
+
+        self.assertLess(cold_elapsed, 1.5)
+        self.assertLess(cached_elapsed, 0.05)
 
     def test_irregular_layout_keeps_every_target_in_directional_rankings(self):
         targets = [

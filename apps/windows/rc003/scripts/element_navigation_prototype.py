@@ -2391,6 +2391,7 @@ DIAGNOSTIC_DIRECTION_LABELS = {
 }
 DIAGNOSTIC_OUTCOME_LABELS = {
     "selected": "已移动",
+    "selected_xy_fallback": "已移动（XY 兜底）",
     "no_candidate": "没有可用候选，保持原位",
     "orthogonal_step": "目标偏离当前通道，请先横向或纵向对齐",
     "geometry_changed": "候选位置变化，已重新扫描",
@@ -2625,6 +2626,161 @@ OPPOSITE_DIRECTION = {
 }
 
 
+def _xy_focus_is_candidate(
+    source: Rect, candidate: Rect, direction: Direction
+) -> bool:
+    if direction == Direction.LEFT:
+        return (
+            (source.right > candidate.right or source.left >= candidate.right)
+            and source.left > candidate.left
+        )
+    if direction == Direction.RIGHT:
+        return (
+            (source.left < candidate.left or source.right <= candidate.left)
+            and source.right < candidate.right
+        )
+    if direction == Direction.UP:
+        return (
+            (source.bottom > candidate.bottom or source.top >= candidate.bottom)
+            and source.top > candidate.top
+        )
+    return (
+        (source.top < candidate.top or source.bottom <= candidate.top)
+        and source.bottom < candidate.bottom
+    )
+
+
+def _xy_focus_beams_overlap(
+    source: Rect, candidate: Rect, direction: Direction
+) -> bool:
+    if direction in {Direction.LEFT, Direction.RIGHT}:
+        return candidate.bottom >= source.top and candidate.top <= source.bottom
+    return candidate.right >= source.left and candidate.left <= source.right
+
+
+def _xy_focus_is_strictly_in_direction(
+    source: Rect, candidate: Rect, direction: Direction
+) -> bool:
+    if direction == Direction.LEFT:
+        return source.left >= candidate.right
+    if direction == Direction.RIGHT:
+        return source.right <= candidate.left
+    if direction == Direction.UP:
+        return source.top >= candidate.bottom
+    return source.bottom <= candidate.top
+
+
+def _xy_focus_major_axis_distance(
+    source: Rect, candidate: Rect, direction: Direction
+) -> float:
+    if direction == Direction.LEFT:
+        return max(0, source.left - candidate.right)
+    if direction == Direction.RIGHT:
+        return max(0, candidate.left - source.right)
+    if direction == Direction.UP:
+        return max(0, source.top - candidate.bottom)
+    return max(0, candidate.top - source.bottom)
+
+
+def _xy_focus_major_axis_far_edge_distance(
+    source: Rect, candidate: Rect, direction: Direction
+) -> float:
+    if direction == Direction.LEFT:
+        return max(1, source.left - candidate.left)
+    if direction == Direction.RIGHT:
+        return max(1, candidate.right - source.right)
+    if direction == Direction.UP:
+        return max(1, source.top - candidate.top)
+    return max(1, candidate.bottom - source.bottom)
+
+
+def _xy_focus_minor_axis_distance(
+    source: Rect, candidate: Rect, direction: Direction
+) -> float:
+    if direction in {Direction.LEFT, Direction.RIGHT}:
+        return abs(source.center_y - candidate.center_y)
+    return abs(source.center_x - candidate.center_x)
+
+
+def _xy_focus_beam_beats(
+    source: Rect, first: Rect, second: Rect, direction: Direction
+) -> bool:
+    first_in_beam = _xy_focus_beams_overlap(source, first, direction)
+    second_in_beam = _xy_focus_beams_overlap(source, second, direction)
+    if second_in_beam or not first_in_beam:
+        return False
+    if not _xy_focus_is_strictly_in_direction(source, second, direction):
+        return True
+    if direction in {Direction.LEFT, Direction.RIGHT}:
+        return True
+    return _xy_focus_major_axis_distance(
+        source, first, direction
+    ) < _xy_focus_major_axis_far_edge_distance(source, second, direction)
+
+
+def _xy_focus_weighted_distance(
+    source: Rect, candidate: Rect, direction: Direction
+) -> float:
+    major = _xy_focus_major_axis_distance(source, candidate, direction)
+    minor = _xy_focus_minor_axis_distance(source, candidate, direction)
+    return 13 * major * major + minor * minor
+
+
+def _xy_focus_better(
+    source: Rect,
+    candidate: Rect,
+    incumbent: Optional[Rect],
+    direction: Direction,
+) -> bool:
+    if not _xy_focus_is_candidate(source, candidate, direction):
+        return False
+    if incumbent is None or not _xy_focus_is_candidate(
+        source, incumbent, direction
+    ):
+        return True
+    if _xy_focus_beam_beats(source, candidate, incumbent, direction):
+        return True
+    if _xy_focus_beam_beats(source, incumbent, candidate, direction):
+        return False
+    return _xy_focus_weighted_distance(
+        source, candidate, direction
+    ) < _xy_focus_weighted_distance(source, incumbent, direction)
+
+
+def xy_focus_target_index(
+    targets: Sequence[TargetSnapshot],
+    rects: Sequence[Rect],
+    current_index: int,
+    direction: Direction,
+    allowed_indices: Optional[set[int]] = None,
+) -> Optional[int]:
+    """Select one Android-style XY target with deterministic tie-breaking."""
+
+    if not 0 <= current_index < len(rects):
+        return None
+    source = rects[current_index]
+    best_index: Optional[int] = None
+    best_rect: Optional[Rect] = None
+    for index, candidate in enumerate(rects):
+        if index == current_index:
+            continue
+        if allowed_indices is not None and index not in allowed_indices:
+            continue
+        candidate_is_better = _xy_focus_better(
+            source, candidate, best_rect, direction
+        )
+        if not candidate_is_better and best_index is not None:
+            candidate_is_better = bool(
+                not _xy_focus_better(source, best_rect, candidate, direction)
+                and _range_occupancy_stable_key(targets[index], candidate)
+                < _range_occupancy_stable_key(targets[best_index], best_rect)
+            )
+        if candidate_is_better:
+            best_index = index
+            best_rect = candidate
+    return best_index
+
+
 def navigation_contact_cell(
     current: Rect, target: Rect, direction: Direction
 ) -> Rect:
@@ -2671,6 +2827,7 @@ class NavigationGraph:
             self.scale_unit,
         )
         self._natural: dict[tuple[int, Direction], tuple[int, ...]] = {}
+        self._xy_fallback: dict[tuple[int, Direction], tuple[int, ...]] = {}
 
     def _projected_candidates(
         self,
@@ -2974,6 +3131,91 @@ class NavigationGraph:
         current_rect: Optional[Rect] = None,
     ) -> tuple[int, ...]:
         return self.natural_candidates(current_index, direction, current_rect)
+
+    def xy_focus_candidates(
+        self, current_index: int, direction: Direction
+    ) -> tuple[int, ...]:
+        """Return a same-section-first XY fallback without changing local routes."""
+
+        if not 0 <= current_index < len(self.targets):
+            return ()
+        key = (current_index, direction)
+        cached = self._xy_fallback.get(key)
+        if cached is not None:
+            return cached
+        section_path = self.targets[current_index].section_path
+        same_section = {
+            index
+            for index, target in enumerate(self.targets)
+            if target.section_path == section_path
+        }
+        contained = xy_focus_target_index(
+            self.targets,
+            self.anchor_rects,
+            current_index,
+            direction,
+            same_section,
+        )
+        global_target = xy_focus_target_index(
+            self.targets,
+            self.anchor_rects,
+            current_index,
+            direction,
+        )
+        fallback = tuple(
+            dict.fromkeys(
+                index
+                for index in (contained, global_target)
+                if index is not None
+            )
+        )
+        self._xy_fallback[key] = fallback
+        return fallback
+
+
+@dataclass(frozen=True)
+class NavigationCandidatePlan:
+    natural: tuple[int, ...]
+    ranked: tuple[int, ...]
+    orthogonal_step_required: bool
+    uses_xy_fallback: bool
+
+
+def navigation_candidate_plan(
+    graph: NavigationGraph,
+    current_index: int,
+    direction: Direction,
+    current_rect: Optional[Rect] = None,
+) -> NavigationCandidatePlan:
+    natural = graph.candidates(current_index, direction, current_rect)
+    active_rect = (
+        graph.anchor_rects[current_index]
+        if current_rect is None
+        else current_rect
+    )
+    orthogonal_step_required = bool(
+        natural
+        and graph.requires_orthogonal_grid_step(
+            current_index,
+            direction,
+            active_rect,
+            natural[0],
+        )
+    )
+    if natural and not orthogonal_step_required:
+        return NavigationCandidatePlan(
+            natural=natural,
+            ranked=natural,
+            orthogonal_step_required=False,
+            uses_xy_fallback=False,
+        )
+    fallback = graph.xy_focus_candidates(current_index, direction)
+    return NavigationCandidatePlan(
+        natural=natural,
+        ranked=fallback,
+        orthogonal_step_required=orthogonal_step_required,
+        uses_xy_fallback=bool(fallback),
+    )
 
 
 @dataclass
@@ -5872,6 +6114,7 @@ def _run_windows(args: argparse.Namespace) -> int:
                 tuple[int, ...],
                 tuple[int, ...],
                 bool,
+                bool,
             ]:
                 current = self.selected
                 current_snapshots = [target.snapshot for target in self.targets]
@@ -5880,32 +6123,24 @@ def _run_windows(args: argparse.Namespace) -> int:
                     self.navigation_graph.anchor_rects[current],
                     direction,
                 )
-                natural_candidates = self.navigation_graph.candidates(
+                plan = navigation_candidate_plan(
+                    self.navigation_graph,
                     current, direction, current_cell
-                )
-                ranked_candidates = natural_candidates
-                orthogonal_step_required = bool(
-                    ranked_candidates
-                    and self.navigation_graph.requires_orthogonal_grid_step(
-                        current,
-                        direction,
-                        current_cell,
-                        ranked_candidates[0],
-                    )
                 )
                 available_candidates = self.traversal.available(
                     current,
                     direction,
-                    () if orthogonal_step_required else ranked_candidates,
+                    plan.ranked,
                 )
                 return (
                     current,
                     current_cell,
                     current_snapshots,
-                    natural_candidates,
-                    ranked_candidates,
+                    plan.natural,
+                    plan.ranked,
                     available_candidates,
-                    orthogonal_step_required,
+                    plan.orthogonal_step_required,
+                    plan.uses_xy_fallback,
                 )
 
             (
@@ -5916,6 +6151,7 @@ def _run_windows(args: argparse.Namespace) -> int:
                 ranked,
                 candidates,
                 orthogonal_step_required,
+                uses_xy_fallback,
             ) = load_candidates()
             first_index = candidates[0] if candidates else None
             first_rect = (
@@ -6004,7 +6240,10 @@ def _run_windows(args: argparse.Namespace) -> int:
                     ),
                 )
                 self._clear_hierarchy()
-                emit_diagnostic("selected", next_index)
+                emit_diagnostic(
+                    "selected_xy_fallback" if uses_xy_fallback else "selected",
+                    next_index,
+                )
                 self._emit_selection()
                 return
             emit_diagnostic(
