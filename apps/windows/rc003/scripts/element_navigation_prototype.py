@@ -78,6 +78,7 @@ PREWARM_CACHE_TTL_SECONDS = 15.0
 DYNAMIC_REFRESH_FALLBACK_SECONDS = 5.0
 DYNAMIC_REFRESH_MAX_CACHE_SECONDS = 30.0
 DYNAMIC_REFRESH_SETTLE_SECONDS = 0.15
+ACTIVE_SCAN_BUDGET_SECONDS = 4.0
 FOLLOW_WINDOW_SCAN_BUDGET_SECONDS = 0.2
 FOLLOW_WINDOW_EMPTY_REFRESH_RETRIES = 2
 NAVIGATION_STRUCTURE_EVENTS = frozenset(
@@ -403,23 +404,45 @@ class DirtyWindowTracker:
         self._generation = 0
         self._consumed_generation = 0
         self._changed_at = 0.0
+        self._related_windows: set[tuple[int, int]] = set()
 
-    def watch(self, window_id: int, process_id: int) -> bool:
+    def watch(
+        self,
+        window_id: int,
+        process_id: int,
+        related_windows: Optional[Sequence[tuple[int, int]]] = None,
+    ) -> bool:
+        related = (
+            None
+            if related_windows is None
+            else {
+                (related_window_id, related_process_id)
+                for related_window_id, related_process_id in related_windows
+                if related_window_id > 0 and related_process_id > 0
+            }
+        )
         with self._lock:
             if window_id == self._window_id and process_id == self._process_id:
+                if related is not None:
+                    self._related_windows = related
                 return False
             self._window_id = window_id
             self._process_id = process_id
             self._generation = 0
             self._consumed_generation = 0
             self._changed_at = 0.0
+            self._related_windows = related or set()
             return True
 
     def mark(self, window_id: int, process_id: int) -> bool:
         if window_id <= 0 or process_id <= 0:
             return False
         with self._lock:
-            if window_id != self._window_id or process_id != self._process_id:
+            if (
+                (window_id, process_id)
+                != (self._window_id, self._process_id)
+                and (window_id, process_id) not in self._related_windows
+            ):
                 return False
             self._generation += 1
             self._changed_at = self._clock()
@@ -1701,21 +1724,278 @@ def ranked_target_indices(
     ]
 
 
+def _preferred_grid_targets_for_index(
+    targets: Sequence[TargetSnapshot],
+    current_index: int,
+    grid_rects: Sequence[Rect],
+) -> dict[Direction, int]:
+    """Calculate all four first-choice neighbors in one geometry pass."""
+
+    if not targets or not 0 <= current_index < len(targets):
+        return {}
+    current = grid_rects[current_index]
+    current_path = targets[current_index].path
+    best: dict[
+        Direction,
+        tuple[
+            tuple[float, ...],
+            int,
+            tuple[int, float, float, float, float, int, int],
+        ],
+    ] = {}
+    vertical_diagonals: dict[
+        Direction,
+        list[
+            tuple[
+                tuple[float, ...],
+                int,
+                tuple[int, float, float, float, float, int, int],
+            ]
+        ],
+    ] = {Direction.UP: [], Direction.DOWN: []}
+    current_left = current.left
+    current_top = current.top
+    current_right = current.right
+    current_bottom = current.bottom
+    current_width = max(0, current_right - current_left)
+    current_height = max(0, current_bottom - current_top)
+    current_center_x = (current_left + current_right) / 2
+    current_center_y = (current_top + current_bottom) / 2
+    for index, target in enumerate(targets):
+        if index == current_index:
+            continue
+        candidate = grid_rects[index]
+        candidate_left = candidate.left
+        candidate_top = candidate.top
+        candidate_right = candidate.right
+        candidate_bottom = candidate.bottom
+        candidate_width = max(0, candidate_right - candidate_left)
+        candidate_height = max(0, candidate_bottom - candidate_top)
+        candidate_center_x = (candidate_left + candidate_right) / 2
+        candidate_center_y = (candidate_top + candidate_bottom) / 2
+        common_prefix = _common_path_prefix_length(current_path, target.path)
+        if candidate_center_x != current_center_x:
+            direction = (
+                Direction.RIGHT
+                if candidate_center_x > current_center_x
+                else Direction.LEFT
+            )
+            primary_gap = (
+                max(0, candidate_left - current_right)
+                if direction == Direction.RIGHT
+                else max(0, current_left - candidate_right)
+            )
+            if candidate_top > current_bottom:
+                perpendicular_gap = candidate_top - current_bottom
+            elif current_top > candidate_bottom:
+                perpendicular_gap = current_top - candidate_bottom
+            else:
+                perpendicular_gap = 0
+            center_offset = abs(candidate_center_y - current_center_y)
+            overlap = max(
+                0,
+                min(current_bottom, candidate_bottom)
+                - max(current_top, candidate_top),
+            )
+            score_value = (
+                primary_gap
+                + perpendicular_gap * 2.5
+                + center_offset * 0.25
+                - overlap * 0.15
+            )
+            smaller_height = max(1, min(current_height, candidate_height))
+            center_tolerance = max(
+                HORIZONTAL_LANE_MIN_CENTER_TOLERANCE,
+                min(
+                    HORIZONTAL_LANE_MAX_CENTER_TOLERANCE,
+                    smaller_height * HORIZONTAL_LANE_SIZE_MULTIPLIER,
+                ),
+            )
+            beam_rank = 0 if center_offset <= center_tolerance else 1
+            forward_center_distance = abs(
+                candidate_center_x - current_center_x
+            )
+            if beam_rank == 0:
+                axis_distance = primary_gap
+                secondary_distance = center_offset
+                forward_distance = perpendicular_gap
+            else:
+                axis_distance = center_offset / max(
+                    1.0, forward_center_distance
+                )
+                secondary_distance = perpendicular_gap
+                forward_distance = forward_center_distance
+            score = (
+                beam_rank,
+                float(primary_gap),
+                float(perpendicular_gap),
+                score_value,
+                center_offset,
+                candidate_top,
+                candidate_left,
+            )
+            item = (
+                (
+                    float(beam_rank),
+                    axis_distance,
+                    secondary_distance,
+                    forward_distance,
+                    forward_center_distance,
+                    score_value,
+                    float(-common_prefix),
+                    float(candidate_top),
+                    float(candidate_left),
+                ),
+                index,
+                score,
+            )
+            previous = best.get(direction)
+            if previous is None or (item[0], item[1]) < (
+                previous[0],
+                previous[1],
+            ):
+                best[direction] = item
+        if candidate_center_y != current_center_y:
+            direction = (
+                Direction.DOWN
+                if candidate_center_y > current_center_y
+                else Direction.UP
+            )
+            primary_gap = (
+                max(0, candidate_top - current_bottom)
+                if direction == Direction.DOWN
+                else max(0, current_top - candidate_bottom)
+            )
+            if candidate_left > current_right:
+                perpendicular_gap = candidate_left - current_right
+            elif current_left > candidate_right:
+                perpendicular_gap = current_left - candidate_right
+            else:
+                perpendicular_gap = 0
+            center_offset = abs(candidate_center_x - current_center_x)
+            overlap = max(
+                0,
+                min(current_right, candidate_right)
+                - max(current_left, candidate_left),
+            )
+            score_value = (
+                primary_gap
+                + perpendicular_gap * 2.5
+                + center_offset * 0.25
+                - overlap * 0.15
+            )
+            smaller_width = max(1, min(current_width, candidate_width))
+            center_tolerance = max(
+                VERTICAL_LANE_MIN_CENTER_TOLERANCE,
+                min(
+                    VERTICAL_LANE_MAX_CENTER_TOLERANCE,
+                    smaller_width * VERTICAL_LANE_SIZE_MULTIPLIER,
+                ),
+            )
+            beam_rank = 0 if center_offset <= center_tolerance else 1
+            forward_center_distance = abs(
+                candidate_center_y - current_center_y
+            )
+            if beam_rank == 0:
+                axis_distance = primary_gap
+                secondary_distance = center_offset
+                forward_distance = perpendicular_gap
+            else:
+                axis_distance = center_offset / max(
+                    1.0, forward_center_distance
+                )
+                secondary_distance = perpendicular_gap
+                forward_distance = forward_center_distance
+            score = (
+                beam_rank,
+                float(primary_gap),
+                float(perpendicular_gap),
+                score_value,
+                center_offset,
+                candidate_top,
+                candidate_left,
+            )
+            item = (
+                (
+                    float(beam_rank),
+                    axis_distance,
+                    secondary_distance,
+                    forward_distance,
+                    forward_center_distance,
+                    score_value,
+                    float(-common_prefix),
+                    float(candidate_top),
+                    float(candidate_left),
+                ),
+                index,
+                score,
+            )
+            previous = best.get(direction)
+            if previous is None or (item[0], item[1]) < (
+                previous[0],
+                previous[1],
+            ):
+                best[direction] = item
+            if score[0] != 0:
+                vertical_diagonals[direction].append(item)
+
+    preferred = {
+        direction: item[1] for direction, item in best.items()
+    }
+    for direction in (Direction.UP, Direction.DOWN):
+        incumbent = best.get(direction)
+        if incumbent is None or incumbent[2][0] != 0:
+            continue
+        incumbent_score = incumbent[2]
+        incumbent_weighted_distance = _vertical_weighted_distance(
+            incumbent_score
+        )
+        eligible: list[tuple[float, tuple[float, ...], int]] = []
+        for rank_key, candidate_index, candidate_score in vertical_diagonals[
+            direction
+        ]:
+            candidate_path = targets[candidate_index].path
+            candidate_is_related_child = bool(
+                current_path
+                and candidate_path
+                and (
+                    _path_is_descendant(candidate_path, current_path)
+                    or _path_is_descendant(current_path, candidate_path)
+                )
+            )
+            candidate_weighted_distance = _vertical_weighted_distance(
+                candidate_score
+            )
+            if (
+                candidate_is_related_child
+                or _vertical_lane_keeps_priority(
+                    current,
+                    incumbent_score,
+                    grid_rects[candidate_index],
+                    direction,
+                )
+                or candidate_weighted_distance >= incumbent_weighted_distance
+            ):
+                continue
+            eligible.append(
+                (candidate_weighted_distance, rank_key, candidate_index)
+            )
+        if eligible:
+            preferred[direction] = min(eligible)[2]
+    return preferred
+
+
 def best_grid_target_index(
     targets: Sequence[TargetSnapshot],
     current_index: int,
     direction: Direction,
     grid_rects: Sequence[Rect],
 ) -> Optional[int]:
-    """Return the first neighbor from the same geometry-only ranking."""
+    """Return the first neighbor without sorting every fallback candidate."""
 
-    ranked = ranked_target_indices(
-        targets,
-        current_index,
-        direction,
-        grid_rects=grid_rects,
-    )
-    return ranked[0] if ranked else None
+    return _preferred_grid_targets_for_index(
+        targets, current_index, grid_rects
+    ).get(direction)
 
 
 DIAGNOSTIC_REJECTION_ORDER = (
@@ -1964,6 +2244,53 @@ OPPOSITE_DIRECTION = {
 }
 
 
+def preferred_navigation_components(
+    target_count: int,
+    preferred: dict[tuple[int, Direction], int],
+) -> tuple[tuple[int, ...], ...]:
+    """Return strongly connected regions in the current first-choice graph."""
+
+    outgoing: list[list[int]] = [[] for _ in range(target_count)]
+    incoming: list[list[int]] = [[] for _ in range(target_count)]
+    for (source, _direction), target in preferred.items():
+        if not (0 <= source < target_count and 0 <= target < target_count):
+            continue
+        outgoing[source].append(target)
+        incoming[target].append(source)
+
+    visited: set[int] = set()
+    order: list[int] = []
+
+    def visit(index: int) -> None:
+        visited.add(index)
+        for neighbor in outgoing[index]:
+            if neighbor not in visited:
+                visit(neighbor)
+        order.append(index)
+
+    for index in range(target_count):
+        if index not in visited:
+            visit(index)
+
+    visited.clear()
+    components: list[tuple[int, ...]] = []
+
+    def collect(index: int, component: list[int]) -> None:
+        visited.add(index)
+        component.append(index)
+        for neighbor in incoming[index]:
+            if neighbor not in visited:
+                collect(neighbor, component)
+
+    for index in reversed(order):
+        if index in visited:
+            continue
+        component: list[int] = []
+        collect(index, component)
+        components.append(tuple(sorted(component)))
+    return tuple(components)
+
+
 class NavigationGraph:
     """Cache geometry-only candidates for one flat screen layout."""
 
@@ -1974,6 +2301,145 @@ class NavigationGraph:
             self.targets, self._descendants_by_target
         )
         self._natural: dict[tuple[int, Direction], tuple[int, ...]] = {}
+        self._preferred: dict[tuple[int, Direction], int] = {}
+        self._repairs: dict[tuple[int, Direction], int] = {}
+        for current_index in range(len(self.targets)):
+            for direction, preferred in _preferred_grid_targets_for_index(
+                self.targets,
+                current_index,
+                self.grid_rects,
+            ).items():
+                self._preferred[(current_index, direction)] = preferred
+        self._repair_connectivity()
+
+    def _repair_options(
+        self,
+        components: Sequence[Sequence[int]],
+    ) -> list[
+        tuple[
+            tuple[float, ...],
+            tuple[int, Direction],
+            int,
+        ]
+    ]:
+        component_by_target = {
+            target: component_index
+            for component_index, component in enumerate(components)
+            for target in component
+        }
+        options: list[
+            tuple[tuple[float, ...], tuple[int, Direction], int]
+        ] = []
+        for current_index, current_target in enumerate(self.targets):
+            current = self.grid_rects[current_index]
+            current_component = component_by_target[current_index]
+            for direction in Direction:
+                best_by_component: dict[
+                    int, tuple[tuple[float, ...], int]
+                ] = {}
+                for candidate_index, candidate_target in enumerate(self.targets):
+                    candidate_component = component_by_target[candidate_index]
+                    if candidate_component == current_component:
+                        continue
+                    score = direction_score(
+                        current,
+                        self.grid_rects[candidate_index],
+                        direction,
+                    )
+                    if score is None:
+                        continue
+                    rank_key = _direction_rank_key(
+                        current,
+                        self.grid_rects[candidate_index],
+                        direction,
+                        score,
+                        _common_path_prefix_length(
+                            current_target.path, candidate_target.path
+                        ),
+                    )
+                    ranked = (rank_key, candidate_index)
+                    previous = best_by_component.get(candidate_component)
+                    if previous is None or ranked < previous:
+                        best_by_component[candidate_component] = ranked
+                for rank_key, candidate_index in best_by_component.values():
+                    options.append(
+                        (
+                            rank_key,
+                            (current_index, direction),
+                            candidate_index,
+                        )
+                    )
+        return options
+
+    def _install_repair(
+        self, key: tuple[int, Direction], candidate_index: int
+    ) -> None:
+        self._preferred[key] = candidate_index
+        self._repairs[key] = candidate_index
+
+    def _install_chain_fallback(self) -> None:
+        ordered = sorted(
+            range(len(self.targets)),
+            key=lambda index: (
+                self.grid_rects[index].center_x,
+                self.grid_rects[index].center_y,
+                index,
+            ),
+        )
+        for first_index, second_index in zip(ordered, ordered[1:]):
+            first = self.grid_rects[first_index]
+            second = self.grid_rects[second_index]
+            if second.center_x > first.center_x:
+                forward = Direction.RIGHT
+            elif second.center_y > first.center_y:
+                forward = Direction.DOWN
+            else:
+                continue
+            self._install_repair((first_index, forward), second_index)
+            self._install_repair(
+                (second_index, OPPOSITE_DIRECTION[forward]), first_index
+            )
+
+    def _repair_connectivity(self) -> None:
+        target_count = len(self.targets)
+        if target_count < 2:
+            return
+        for _attempt in range(target_count * 4):
+            components = preferred_navigation_components(
+                target_count, self._preferred
+            )
+            if len(components) <= 1:
+                return
+            installed = False
+            options = sorted(
+                self._repair_options(components),
+                key=lambda option: (
+                    option[0],
+                    option[1][0],
+                    tuple(Direction).index(option[1][1]),
+                    option[2],
+                ),
+            )
+            for _rank_key, key, candidate_index in options:
+                if self._preferred.get(key) == candidate_index:
+                    continue
+                trial = dict(self._preferred)
+                trial[key] = candidate_index
+                component_count = len(
+                    preferred_navigation_components(target_count, trial)
+                )
+                if component_count >= len(components):
+                    continue
+                self._install_repair(key, candidate_index)
+                installed = True
+                break
+            if not installed:
+                break
+
+        if len(
+            preferred_navigation_components(target_count, self._preferred)
+        ) > 1:
+            self._install_chain_fallback()
 
     def natural_candidates(
         self, current_index: int, direction: Direction
@@ -1994,7 +2460,13 @@ class NavigationGraph:
         return natural
 
     def candidates(self, current_index: int, direction: Direction) -> tuple[int, ...]:
-        return self.natural_candidates(current_index, direction)
+        natural = self.natural_candidates(current_index, direction)
+        preferred = self._preferred.get((current_index, direction))
+        if preferred is None or (natural and preferred == natural[0]):
+            return natural
+        return (preferred,) + tuple(
+            index for index in natural if index != preferred
+        )
 
 
 @dataclass
@@ -2110,7 +2582,9 @@ def should_pass_through_native_menu(vk: int, menu_mode_active: bool) -> bool:
 def content_refresh_delay_ms(event: str, repeated_activation: bool = False) -> int:
     if event == "contexted":
         return 120
-    if event == "activated" and repeated_activation:
+    if event == "activated":
+        return 180 if repeated_activation else 120
+    if event == "scrolled":
         return 180
     return 0
 
@@ -3019,6 +3493,8 @@ def _run_windows(args: argparse.Namespace) -> int:
         snapshot: TargetSnapshot
         control: Any
         click_point: Optional[tuple[int, int]] = None
+        owner_hwnd: int = 0
+        owner_rect: Optional[Rect] = None
 
     def rect_from_control(control: Any) -> Rect:
         bounds = control.BoundingRectangle
@@ -3802,6 +4278,9 @@ def _run_windows(args: argparse.Namespace) -> int:
                 ):
                     targets.append(RuntimeTarget(spec.snapshot, None, spec.click_point))
                 targets = normalize_runtime_targets(targets)[: args.max_elements]
+        for target in targets:
+            target.owner_hwnd = hwnd
+            target.owner_rect = window_rect
         return (
             targets,
             node_types,
@@ -4446,9 +4925,40 @@ def _run_windows(args: argparse.Namespace) -> int:
                 and semantic_action_can_bypass_point_hit(target.snapshot)
             )
 
+        def _current_target_owner_rect(
+            self, target: RuntimeTarget
+        ) -> Optional[Rect]:
+            if target.owner_hwnd <= 0 or target.owner_hwnd == self.hwnd:
+                target.owner_rect = self.window_rect
+                return self.window_rect
+            current = window_rect_from_handle(target.owner_hwnd)
+            if current.width <= 0 or current.height <= 0:
+                return None
+            previous = target.owner_rect
+            if previous is not None and current != previous:
+                if (
+                    current.width != previous.width
+                    or current.height != previous.height
+                ):
+                    return None
+                delta_x = current.left - previous.left
+                delta_y = current.top - previous.top
+                target.snapshot = shifted_snapshot(
+                    target.snapshot, delta_x, delta_y
+                )
+                if target.click_point is not None:
+                    target.click_point = shifted_point(
+                        target.click_point, delta_x, delta_y
+                    )
+            target.owner_rect = current
+            return current
+
         def _update_live_target(self, target: RuntimeTarget) -> bool:
+            owner_rect = self._current_target_owner_rect(target)
+            if owner_rect is None:
+                return False
             if target.control is None:
-                return True
+                return target.snapshot.rect.intersects(owner_rect)
             try:
                 if not bool(target.control.IsEnabled) or bool(target.control.IsOffscreen):
                     return False
@@ -4456,7 +4966,7 @@ def _run_windows(args: argparse.Namespace) -> int:
                 if (
                     live_rect.width < 16
                     or live_rect.height < 16
-                    or not live_rect.intersects(self.window_rect)
+                    or not live_rect.intersects(owner_rect)
                 ):
                     return False
                 if live_rect != target.snapshot.rect:
@@ -4506,6 +5016,52 @@ def _run_windows(args: argparse.Namespace) -> int:
                 self._emit_selection()
             return True
 
+        def _sync_external_window_geometry(self) -> bool:
+            changed = False
+            targets_by_owner: dict[int, list[RuntimeTarget]] = defaultdict(list)
+            for target in self.all_targets:
+                if target.owner_hwnd > 0 and target.owner_hwnd != self.hwnd:
+                    targets_by_owner[target.owner_hwnd].append(target)
+            for owner_hwnd, targets in targets_by_owner.items():
+                current = window_rect_from_handle(owner_hwnd)
+                previous = next(
+                    (
+                        target.owner_rect
+                        for target in targets
+                        if target.owner_rect is not None
+                    ),
+                    None,
+                )
+                if (
+                    previous is None
+                    or current.width <= 0
+                    or current.height <= 0
+                    or current.width != previous.width
+                    or current.height != previous.height
+                ):
+                    self._request_background_refresh()
+                    continue
+                if current != previous:
+                    delta_x = current.left - previous.left
+                    delta_y = current.top - previous.top
+                    for target in targets:
+                        target.snapshot = shifted_snapshot(
+                            target.snapshot, delta_x, delta_y
+                        )
+                        if target.click_point is not None:
+                            target.click_point = shifted_point(
+                                target.click_point, delta_x, delta_y
+                            )
+                        target.owner_rect = current
+                    changed = True
+            if changed:
+                self.invalid_targets.clear()
+                self._clear_input_cache()
+                self._rebuild_navigation_graph()
+                self._clear_hierarchy()
+                self._emit_selection()
+            return changed
+
         def _sync_window_geometry(self, allow_full_rescan: bool = False) -> bool:
             with self._post_lock:
                 expected_generation = self._generation
@@ -4521,6 +5077,7 @@ def _run_windows(args: argparse.Namespace) -> int:
                 self._invalidate_navigation("无法继续读取目标窗口")
                 return False
             if current_window_rect == self.window_rect:
+                self._sync_external_window_geometry()
                 if not self._content_geometry_is_current():
                     if not allow_full_rescan:
                         self._request_background_refresh()
@@ -4551,6 +5108,8 @@ def _run_windows(args: argparse.Namespace) -> int:
                 delta_x = current_window_rect.left - self.window_rect.left
                 delta_y = current_window_rect.top - self.window_rect.top
                 for target in self.all_targets:
+                    if target.owner_hwnd not in {0, self.hwnd}:
+                        continue
                     target.snapshot = shifted_snapshot(
                         target.snapshot, delta_x, delta_y
                     )
@@ -4560,9 +5119,13 @@ def _run_windows(args: argparse.Namespace) -> int:
                             delta_x,
                             delta_y,
                         )
+                    target.owner_rect = current_window_rect
                 self.window_rect = current_window_rect
+                self._sync_external_window_geometry()
                 self.invalid_targets.clear()
                 self._clear_input_cache()
+                self._rebuild_navigation_graph()
+                self._clear_hierarchy()
                 self.events.put(
                     (
                         "geometry_synced",
@@ -4659,6 +5222,19 @@ def _run_windows(args: argparse.Namespace) -> int:
                         self.visited,
                         _interrupted,
                     ) = result
+                    related_windows = {
+                        (
+                            target.owner_hwnd,
+                            window_process_id(target.owner_hwnd),
+                        )
+                        for target in self.all_targets
+                        if target.owner_hwnd > 0 and target.owner_hwnd != hwnd
+                    }
+                    dirty_windows.watch(
+                        hwnd,
+                        process_id,
+                        tuple(related_windows),
+                    )
                     if previous_hwnd != hwnd:
                         self._pending_follow_completion_hwnd = 0
                         self._empty_follow_refresh_attempts = 0
@@ -4784,11 +5360,13 @@ def _run_windows(args: argparse.Namespace) -> int:
                     cursor_point() if use_cursor else None,
                 )
 
-        def _refresh_targets(self, interruptible: bool = False) -> bool:
+        def _refresh_targets(
+            self, interruptible: bool = False
+        ) -> tuple[bool, bool]:
             with self._post_lock:
                 expected_generation = self._generation
                 if not self.context_valid or not self.hwnd:
-                    return False
+                    return False, False
                 retry_empty_follow = empty_follow_refresh_should_retry(
                     self._pending_follow_completion_hwnd,
                     self.hwnd,
@@ -4799,13 +5377,16 @@ def _run_windows(args: argparse.Namespace) -> int:
                 if 0 <= self.selected < len(self.targets)
                 else None
             )
-            committed, _partial, empty = self._enumerate(
+            started = time.perf_counter()
+            committed, partial, empty = self._enumerate(
                 self.hwnd,
+                deadline=started + ACTIVE_SCAN_BUDGET_SECONDS,
                 should_cancel=(
                     self._refresh_cancel_requested.is_set
                     if interruptible
                     else None
                 ),
+                allow_partial=True,
                 expected_generation=expected_generation,
                 commit_empty=not retry_empty_follow,
             )
@@ -4822,7 +5403,7 @@ def _run_windows(args: argparse.Namespace) -> int:
                             self._background_refresh_retry_at = (
                                 time.perf_counter() + 0.25
                             )
-                return False
+                return False, False
             self._apply_targets(restore=previous)
             self._clear_hierarchy()
             if not self.targets or self.selected < 0:
@@ -4831,7 +5412,7 @@ def _run_windows(args: argparse.Namespace) -> int:
                     self._empty_follow_refresh_attempts = 0
                     self._deferred_moves.clear()
                 self._invalidate_navigation("页面变化后没有找到可导航元素")
-                return False
+                return False, False
             with self._post_lock:
                 self._pending_follow_completion_hwnd = 0
                 self._empty_follow_refresh_attempts = 0
@@ -4842,7 +5423,7 @@ def _run_windows(args: argparse.Namespace) -> int:
                 if not self.context_valid:
                     break
                 self._move(direction)
-            return True
+            return True, partial
 
         def _refresh_if_idle(self) -> None:
             if (
@@ -4867,14 +5448,16 @@ def _run_windows(args: argparse.Namespace) -> int:
             ):
                 return
             try:
-                refreshed = self._refresh_targets(interruptible=True)
+                refreshed, partial = self._refresh_targets(interruptible=True)
             except Exception as exc:
                 self._background_refresh_retry_at = now + 1.0
                 self.events.put(("refresh_failed", str(exc)))
                 return
             if refreshed:
-                self._background_refresh_requested = False
-                self._background_refresh_retry_at = 0.0
+                self._background_refresh_requested = partial
+                self._background_refresh_retry_at = (
+                    now + 0.25 if partial else 0.0
+                )
             elif (
                 self.context_valid
                 and not self._refresh_cancel_requested.is_set()
@@ -5039,6 +5622,8 @@ def _run_windows(args: argparse.Namespace) -> int:
             else:
                 committed, _partial, _empty = self._enumerate(
                     hwnd,
+                    deadline=started + ACTIVE_SCAN_BUDGET_SECONDS,
+                    allow_partial=True,
                     expected_generation=expected_generation,
                 )
                 if not committed:
@@ -5096,11 +5681,26 @@ def _run_windows(args: argparse.Namespace) -> int:
             if not self.targets or self.selected < 0:
                 return
             started = time.perf_counter()
+            if not self._sync_window_geometry():
+                return
             target = self.targets[self.selected]
             cached_point = self._cached_pointer_point(target)
             if cached_point is not None:
-                click_point(cached_point)
-                self._remember_pointer_point(target, cached_point)
+                if not self._target_is_exposed(
+                    target, allow_semantic_bypass=False
+                ):
+                    self._refresh_invalid_target(target)
+                    return
+                point = target_pointer_point(
+                    target.snapshot,
+                    target.click_point,
+                    allow_rect_center=target.control is None,
+                )
+                if point is None:
+                    self._refresh_invalid_target(target)
+                    return
+                click_point(point)
+                self._remember_pointer_point(target, point)
                 self.events.put(
                     (
                         "activated",
@@ -5112,8 +5712,6 @@ def _run_windows(args: argparse.Namespace) -> int:
                         },
                     )
                 )
-                return
-            if not self._sync_window_geometry():
                 return
             target = self.targets[self.selected]
             if not self._update_live_target(target):
@@ -5138,7 +5736,7 @@ def _run_windows(args: argparse.Namespace) -> int:
             else:
                 method = (
                     try_semantic_invoke(target)
-                    if target.snapshot.has_action_pattern
+                    if semantic_action_can_bypass_point_hit(target.snapshot)
                     else None
                 )
                 if method is None:
@@ -5936,8 +6534,11 @@ def _run_windows(args: argparse.Namespace) -> int:
                     f"已滚动: {target.name or target.control_type} "
                     f"({payload['steps']:+d} / {payload['elapsed']:.3f}s)"
                 )
-                if target.source == "visual-grid" and active.is_set():
-                    QTimer.singleShot(180, lambda: worker.post("refresh_content"))
+                refresh_delay = content_refresh_delay_ms(event)
+                if refresh_delay and active.is_set():
+                    QTimer.singleShot(
+                        refresh_delay, lambda: worker.post("refresh_content")
+                    )
             elif event == "exit_requested":
                 leave_navigation()
             elif event == "geometry_synced":

@@ -400,7 +400,7 @@ class SpatialNavigationTests(unittest.TestCase):
             0,
         )
 
-    def test_irregular_cell_does_not_rewire_the_nearest_column(self):
+    def test_irregular_cell_uses_one_bridge_and_keeps_the_reverse_column(self):
         targets = [
             self.target(0, 0, 40, 40, "A"),
             self.target(200, 0, 240, 40, "B"),
@@ -410,10 +410,36 @@ class SpatialNavigationTests(unittest.TestCase):
         ]
         graph = prototype.NavigationGraph(targets)
 
-        self.assertEqual(graph.candidates(1, prototype.Direction.DOWN)[:2], (4, 2))
+        self.assertEqual(graph.candidates(1, prototype.Direction.DOWN)[:2], (2, 4))
         self.assertEqual(graph.candidates(2, prototype.Direction.DOWN)[0], 4)
         self.assertEqual(graph.candidates(4, prototype.Direction.UP)[:2], (1, 2))
         self.assertEqual(graph.candidates(2, prototype.Direction.UP)[0], 1)
+
+    def test_connectivity_repair_reaches_an_isolated_irregular_cell(self):
+        targets = [
+            self.target(617, 211, 684, 273, "0"),
+            self.target(668, 490, 700, 512, "1"),
+            self.target(57, 73, 176, 94, "2"),
+            self.target(34, 451, 66, 509, "3"),
+            self.target(167, 360, 247, 388, "4"),
+        ]
+        graph = prototype.NavigationGraph(targets)
+
+        self.assertEqual(len(graph._repairs), 1)
+        self.assertEqual(
+            prototype.preferred_navigation_components(
+                len(targets), graph._preferred
+            ),
+            (tuple(range(len(targets))),),
+        )
+        for (source, direction), target in graph._repairs.items():
+            self.assertIsNotNone(
+                prototype.direction_score(
+                    graph.grid_rects[source],
+                    graph.grid_rects[target],
+                    direction,
+                )
+            )
 
     def test_overlapping_candidates_use_forward_center_distance(self):
         targets = [
@@ -1438,6 +1464,33 @@ class SpatialNavigationTests(unittest.TestCase):
                     reachable.update(graph.candidates(current, direction))
             self.assertEqual(reachable, set(range(len(targets))))
 
+    def test_random_irregular_grids_have_no_first_choice_islands(self):
+        generator = random.Random(20260829)
+        for _case in range(200):
+            targets = []
+            for index in range(generator.randint(2, 35)):
+                left = generator.randint(0, 1600)
+                top = generator.randint(0, 900)
+                width = generator.randint(24, 260)
+                height = generator.randint(20, 100)
+                targets.append(
+                    self.target(
+                        left,
+                        top,
+                        left + width,
+                        top + height,
+                        str(index),
+                        path=(0, generator.randint(0, 5), index),
+                    )
+                )
+            graph = prototype.NavigationGraph(targets)
+            self.assertEqual(
+                prototype.preferred_navigation_components(
+                    len(targets), graph._preferred
+                ),
+                (tuple(range(len(targets))),),
+            )
+
     def test_fast_primary_grid_neighbor_matches_full_ranking(self):
         generator = random.Random(829)
         for _case in range(40):
@@ -1523,6 +1576,7 @@ class SpatialNavigationTests(unittest.TestCase):
             for column in range(3)
         ]
         graph = prototype.NavigationGraph(targets)
+        self.assertEqual(graph._repairs, {})
         visited = {4}
         pending = [4]
         while pending:
@@ -1634,6 +1688,17 @@ class SpatialNavigationTests(unittest.TestCase):
         tracker.watch(300, 99)
         self.assertIsNone(tracker.state(100, 42))
 
+    def test_related_overlay_changes_dirty_the_root_navigation_scene(self):
+        tracker = prototype.DirtyWindowTracker(lambda: 12.0)
+        tracker.watch(100, 42, ((200, 77),))
+
+        self.assertTrue(tracker.mark(200, 77))
+        self.assertEqual(
+            tracker.state(100, 42), prototype.DirtyWindowState(1, 12.0)
+        )
+        tracker.watch(100, 42, ())
+        self.assertFalse(tracker.mark(200, 77))
+
     def test_suspicious_moves_only_request_a_later_refresh(self):
         window = prototype.Rect(0, 0, 1600, 900)
         current = prototype.Rect(600, 400, 660, 440)
@@ -1722,6 +1787,7 @@ class SpatialNavigationTests(unittest.TestCase):
         self.assertTrue(prototype.dynamic_refresh_fallback_due(30.0, False))
 
     def test_follow_window_scan_uses_a_short_cooperative_budget(self):
+        self.assertEqual(prototype.ACTIVE_SCAN_BUDGET_SECONDS, 4.0)
         self.assertGreater(prototype.FOLLOW_WINDOW_SCAN_BUDGET_SECONDS, 0.0)
         self.assertLessEqual(prototype.FOLLOW_WINDOW_SCAN_BUDGET_SECONDS, 0.2)
         self.assertEqual(
@@ -1876,6 +1942,66 @@ class SpatialNavigationTests(unittest.TestCase):
                 if keyword.arg is not None
             },
         )
+        refresh_keywords = {
+            keyword.arg: keyword.value
+            for keyword in refresh_enumerations[0].keywords
+            if keyword.arg is not None
+        }
+        self.assertIn("deadline", refresh_keywords)
+        self.assertIsInstance(refresh_keywords.get("allow_partial"), ast.Constant)
+        self.assertTrue(refresh_keywords["allow_partial"].value)
+
+        scan_function = worker_functions["_scan"]
+        scan_enumerations = [
+            call
+            for call in ast.walk(scan_function)
+            if isinstance(call, ast.Call)
+            and isinstance(call.func, ast.Attribute)
+            and call.func.attr == "_enumerate"
+        ]
+        self.assertEqual(len(scan_enumerations), 1)
+        scan_keywords = {
+            keyword.arg: keyword.value
+            for keyword in scan_enumerations[0].keywords
+            if keyword.arg is not None
+        }
+        self.assertIn("deadline", scan_keywords)
+        self.assertIsInstance(scan_keywords.get("allow_partial"), ast.Constant)
+        self.assertTrue(scan_keywords["allow_partial"].value)
+
+        activate_function = worker_functions["_activate"]
+        self.assertTrue(
+            any(
+                isinstance(call, ast.Call)
+                and isinstance(call.func, ast.Name)
+                and call.func.id == "semantic_action_can_bypass_point_hit"
+                for call in ast.walk(activate_function)
+            )
+        )
+
+        runtime_target = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.ClassDef)
+            and node.name == "RuntimeTarget"
+        )
+        runtime_fields = {
+            node.target.id
+            for node in runtime_target.body
+            if isinstance(node, ast.AnnAssign)
+            and isinstance(node.target, ast.Name)
+        }
+        self.assertTrue({"owner_hwnd", "owner_rect"} <= runtime_fields)
+
+        enumerate_window = functions["enumerate_window_targets"]
+        owner_assignments = {
+            target.attr
+            for assignment in ast.walk(enumerate_window)
+            if isinstance(assignment, ast.Assign)
+            for target in assignment.targets
+            if isinstance(target, ast.Attribute)
+        }
+        self.assertTrue({"owner_hwnd", "owner_rect"} <= owner_assignments)
 
         handle_function = functions["handle_keyboard_action"]
         self.assertTrue(
@@ -1935,14 +2061,15 @@ class SpatialNavigationTests(unittest.TestCase):
             )
         )
 
-    def test_content_refresh_only_follows_context_or_double_click(self):
+    def test_pointer_actions_schedule_a_settled_content_refresh(self):
         self.assertEqual(prototype.content_refresh_delay_ms("contexted"), 120)
         self.assertEqual(
             prototype.content_refresh_delay_ms("activated", True), 180
         )
         self.assertEqual(
-            prototype.content_refresh_delay_ms("activated", False), 0
+            prototype.content_refresh_delay_ms("activated", False), 120
         )
+        self.assertEqual(prototype.content_refresh_delay_ms("scrolled"), 180)
 
     def test_negative_wheel_delta_is_encoded_as_a_windows_dword(self):
         self.assertEqual(prototype.mouse_wheel_data(120), 120)
