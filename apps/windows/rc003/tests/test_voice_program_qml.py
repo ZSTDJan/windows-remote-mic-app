@@ -104,6 +104,9 @@ render(window, app)
 
 controller.selectedVoiceProgramIndex = 1
 render(window, app)
+controller._voice_program_status_code = "not_found"
+controller.voiceProgramStatusCodeChanged.emit()
+render(window, app)
 elevated = find(window, "voiceProgramElevatedCheckBox")
 elevated_indicator = elevated.property("indicator")
 image = window.grabWindow()
@@ -129,6 +132,8 @@ managed = {
         "visible": bool(control.property("visible")),
         "enabled": bool(control.property("enabled")),
         "geometry": geometry(control),
+        "text": str(control.property("text"))
+        if name == "openVoiceProgramSettingsButton" else "",
     }
     for name, control in controls.items()
 }
@@ -161,6 +166,9 @@ def rendered_status(
     return {
         "text": str(label.property("text")),
         "color": label.property("color").name(),
+        "settings_button_text": str(
+            controls["openVoiceProgramSettingsButton"].property("text")
+        ),
     }
 
 
@@ -325,6 +333,10 @@ class VoiceProgramQmlTests(unittest.TestCase):
         self.assertTrue(data["retired_controls_absent"])
         self.assertTrue(all(item["visible"] for item in data["managed"].values()))
         self.assertTrue(all(item["enabled"] for item in data["managed"].values()))
+        self.assertEqual(
+            data["managed"]["openVoiceProgramSettingsButton"]["text"],
+            "去安装",
+        )
         self.assertTrue(data["managed_auto_start"])
         self.assertTrue(data["managed_elevated"])
         self.assertEqual(data["elevated_indicator"]["width"], 16)
@@ -370,6 +382,10 @@ class VoiceProgramQmlTests(unittest.TestCase):
         self.assertEqual(
             data["status_cases"]["unknown_running"]["text"],
             "运行中 · 权限未知",
+        )
+        self.assertEqual(
+            data["status_cases"]["unknown_running"]["settings_button_text"],
+            "打开设置",
         )
         self.assertEqual(
             data["status_cases"]["standard_mismatch"]["text"],

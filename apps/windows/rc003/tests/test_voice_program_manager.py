@@ -299,17 +299,69 @@ class WeTypeDiscoveryTests(unittest.TestCase):
 
 
 class VoiceProgramSettingsTargetTests(unittest.TestCase):
-    def test_sogou_settings_use_the_provider_owned_keyset_uri(self):
-        target = manager.resolve_voice_program_settings_target(
-            {"provider": "sogou"}, platform="win32"
-        )
+    def test_sogou_settings_use_the_installed_voice_tray(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            components = Path(tmp) / "SogouInput" / "Components"
+            executable = (
+                components
+                / "ai_voice_input"
+                / "1.0.1.2"
+                / "bin"
+                / "sogou_voice_assistant.exe"
+            )
+            executable.parent.mkdir(parents=True)
+            executable.touch()
+            manager_executable = components / "SogouComMgr.exe"
+
+            target = manager.resolve_voice_program_settings_target(
+                {"provider": "sogou"},
+                platform="win32",
+                process_iter=lambda: (),
+                run_value_reader=lambda: (f'"{manager_executable}" --show',),
+            )
 
         self.assertTrue(target.available)
-        self.assertEqual(target.kind, "uri")
-        self.assertEqual(
-            target.target,
-            "sgbiz:sg_process?module=sgmyinput.exe&param=-page%3Dkeyset",
+        self.assertEqual(target.kind, "sogou_tray")
+        self.assertEqual(Path(target.target), executable)
+
+    def test_missing_sogou_voice_uses_the_ai_toolbox(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            components = Path(tmp) / "SogouInput" / "Components"
+            toolbox = (
+                components
+                / "IChat"
+                / "1.0.2.3"
+                / "SOGOUSmartAssistant.exe"
+            )
+            toolbox.parent.mkdir(parents=True)
+            toolbox.touch()
+
+            target = manager.resolve_voice_program_settings_target(
+                {"provider": "sogou"},
+                platform="win32",
+                process_iter=lambda: (),
+                run_value_reader=lambda: (),
+                sogou_install_value_reader=lambda: (
+                    str(components.parent),
+                ),
+            )
+
+        self.assertTrue(target.available)
+        self.assertEqual(target.kind, "sogou_toolbox")
+        self.assertEqual(Path(target.target), toolbox)
+        self.assertEqual(target.arguments, "--from=menutool")
+
+    def test_missing_sogou_voice_and_toolbox_stays_missing(self):
+        target = manager.resolve_voice_program_settings_target(
+            {"provider": "sogou"},
+            platform="win32",
+            process_iter=lambda: (),
+            run_value_reader=lambda: (),
+            sogou_install_value_reader=lambda: (),
         )
+
+        self.assertFalse(target.available)
+        self.assertEqual(target.kind, "missing")
 
     def test_wetype_settings_use_the_installed_update_program(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -380,6 +432,53 @@ class VoiceProgramLaunchTests(unittest.TestCase):
                 )
             ],
         )
+
+    def test_sogou_settings_start_the_program_then_open_the_tray_menu(self):
+        executable = Path(r"C:\Program Files\SogouInput\sogou_voice_assistant.exe")
+        launches = []
+        opened = []
+
+        manager.open_sogou_voice_settings(
+            executable,
+            launch_elevated=True,
+            platform="win32",
+            process_iter=lambda: (),
+            start_file=lambda path, operation, cwd: launches.append(
+                (path, operation, cwd)
+            ),
+            automation_opener=lambda: opened.append(True),
+        )
+
+        self.assertEqual(
+            launches,
+            [(str(executable), "runas", str(executable.parent))],
+        )
+        self.assertEqual(opened, [True])
+
+    def test_running_sogou_settings_do_not_start_another_program(self):
+        executable = Path(r"C:\Program Files\SogouInput\sogou_voice_assistant.exe")
+        opened = []
+
+        manager.open_sogou_voice_settings(
+            executable,
+            launch_elevated=True,
+            platform="win32",
+            process_iter=lambda: (
+                manager.ProcessInfo(42, "sogou_voice_assistant.exe", executable),
+            ),
+            start_file=lambda *_: self.fail("不应重复启动搜狗语音"),
+            automation_opener=lambda: opened.append(True),
+        )
+
+        self.assertEqual(opened, [True])
+
+    def test_sogou_settings_automation_reports_the_failed_step(self):
+        completed = mock.Mock(returncode=12, stdout="settings-menu-not-found", stderr="")
+
+        with self.assertRaisesRegex(OSError, "未找到搜狗语音托盘菜单中的设置项"):
+            manager._run_sogou_settings_automation(
+                runner=mock.Mock(return_value=completed)
+            )
 
     def test_custom_program_launches_with_current_permissions(self):
         with tempfile.TemporaryDirectory() as tmp:

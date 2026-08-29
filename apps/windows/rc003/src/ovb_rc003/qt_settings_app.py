@@ -3082,6 +3082,16 @@ def _load_qt_classes() -> dict:
                 )
                 return
             if not target.available:
+                if (
+                    target.provider_id
+                    == voice_program_manager.VOICE_PROGRAM_SOGOU
+                ):
+                    self._set_error_message("")
+                    self._set_status_message(
+                        "未安装搜狗语音，请在搜狗输入法 AI 工具箱中手动安装。",
+                        self._VOICE_PAGE_INDEX,
+                    )
+                    return
                 self._set_status_message("")
                 message = (
                     "未找到微信输入法设置程序。"
@@ -3092,7 +3102,40 @@ def _load_qt_classes() -> dict:
                 self._set_error_message(message, self._VOICE_PAGE_INDEX)
                 return
 
-            if target.kind == "uri":
+            success_message = f"已打开{target.display_name}设置。"
+            if target.kind == "sogou_tray":
+                try:
+                    voice_program_manager.open_sogou_voice_settings(
+                        Path(target.target),
+                        launch_elevated=(
+                            self._voice_program_settings.get("launch_elevated")
+                            is True
+                        ),
+                    )
+                except Exception as exc:  # noqa: BLE001 - Qt slot must not escape
+                    self._set_status_message("")
+                    self._set_error_message(
+                        f"无法打开搜狗语音设置（{exc}）",
+                        self._VOICE_PAGE_INDEX,
+                    )
+                    return
+            elif target.kind == "sogou_toolbox":
+                try:
+                    voice_program_manager.open_voice_program_settings(
+                        Path(target.target),
+                        target.arguments,
+                    )
+                except Exception as exc:  # noqa: BLE001 - Qt slot must not escape
+                    self._set_status_message("")
+                    self._set_error_message(
+                        f"无法打开搜狗输入法 AI 工具箱（{exc}）",
+                        self._VOICE_PAGE_INDEX,
+                    )
+                    return
+                success_message = (
+                    "未安装搜狗语音，已打开 AI 工具箱，请手动安装。"
+                )
+            elif target.kind == "uri":
                 result = shell_targets.open_external_target(target.target)
                 if result.outcome is not shell_targets.ExternalTargetOutcome.OPENED:
                     self._set_status_message("")
@@ -3117,7 +3160,7 @@ def _load_qt_classes() -> dict:
 
             self._set_error_message("")
             self._set_status_message(
-                f"已打开{target.display_name}设置。",
+                success_message,
                 self._VOICE_PAGE_INDEX,
             )
 

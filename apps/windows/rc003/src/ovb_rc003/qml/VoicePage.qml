@@ -632,7 +632,9 @@ Item {
                             && SettingsController.selectedVoiceProgramIndex <= 3
                         tokens: root.tokens
                         Layout.fillWidth: true
-                        text: qsTr("打开设置")
+                        text: SettingsController.selectedVoiceProgramIndex === 1
+                            && SettingsController.voiceProgramStatusCode === "not_found"
+                            ? qsTr("去安装") : qsTr("打开设置")
                         enabled: !root.voiceHotkeyBusy
                         onClicked: SettingsController.openVoiceProgramSettings()
                     }

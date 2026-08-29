@@ -2389,30 +2389,73 @@ class SettingsControllerTests(unittest.TestCase):
         self.assertEqual(controller.statusMessage, "")
         self.assertIn("no handler registered", controller.errorMessage)
 
-    def test_open_sogou_settings_uses_the_provider_owned_uri(self):
+    def test_open_sogou_settings_uses_the_voice_tray_menu(self):
         controller, _ = self._make_controller()
         controller.selectedVoiceProgramIndex = 1
+        executable = Path(
+            r"C:\Program Files\SogouInput\sogou_voice_assistant.exe"
+        )
         target = voice_program_manager.VoiceProgramSettingsTarget(
             "sogou",
             "搜狗语音输入",
-            "uri",
-            "sgbiz:sg_process?module=sgmyinput.exe&param=-page%3Dkeyset",
-        )
-        opened = shell_targets.ExternalTargetResult(
-            shell_targets.ExternalTargetOutcome.OPENED,
-            target.target,
+            "sogou_tray",
+            str(executable),
         )
         with mock.patch.object(
             qt_settings_app.voice_program_manager,
             "resolve_voice_program_settings_target",
             return_value=target,
         ), mock.patch.object(
-            shell_targets, "open_external_target", return_value=opened
-        ) as open_target:
+            qt_settings_app.voice_program_manager,
+            "open_sogou_voice_settings",
+        ) as open_settings:
             controller.openVoiceProgramSettings()
 
-        open_target.assert_called_once_with(target.target)
+        open_settings.assert_called_once_with(executable, launch_elevated=True)
         self.assertIn("已打开搜狗语音输入设置", controller.statusMessage)
+
+    def test_missing_sogou_voice_opens_the_ai_toolbox(self):
+        controller, _ = self._make_controller()
+        controller.selectedVoiceProgramIndex = 1
+        toolbox = Path(r"C:\Program Files\SogouInput\SOGOUSmartAssistant.exe")
+        target = voice_program_manager.VoiceProgramSettingsTarget(
+            "sogou",
+            "搜狗语音输入",
+            "sogou_toolbox",
+            str(toolbox),
+            "--from=menutool",
+        )
+        with mock.patch.object(
+            qt_settings_app.voice_program_manager,
+            "resolve_voice_program_settings_target",
+            return_value=target,
+        ), mock.patch.object(
+            qt_settings_app.voice_program_manager,
+            "open_voice_program_settings",
+        ) as open_settings:
+            controller.openVoiceProgramSettings()
+
+        open_settings.assert_called_once_with(toolbox, "--from=menutool")
+        self.assertEqual(controller.errorMessage, "")
+        self.assertIn("请手动安装", controller.statusMessage)
+
+    def test_missing_sogou_toolbox_uses_the_status_bar(self):
+        controller, _ = self._make_controller()
+        controller.selectedVoiceProgramIndex = 1
+        target = voice_program_manager.VoiceProgramSettingsTarget(
+            "sogou",
+            "搜狗语音输入",
+            "missing",
+        )
+        with mock.patch.object(
+            qt_settings_app.voice_program_manager,
+            "resolve_voice_program_settings_target",
+            return_value=target,
+        ):
+            controller.openVoiceProgramSettings()
+
+        self.assertEqual(controller.errorMessage, "")
+        self.assertIn("AI 工具箱中手动安装", controller.statusMessage)
 
     def test_open_wetype_settings_uses_the_installed_settings_program(self):
         controller, _ = self._make_controller()

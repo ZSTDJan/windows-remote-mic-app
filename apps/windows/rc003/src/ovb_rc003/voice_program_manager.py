@@ -7,9 +7,11 @@ failure is reported as a provider status rather than a bridge startup error.
 
 from __future__ import annotations
 
+import base64
 import ctypes
 import os
 import re
+import subprocess
 import sys
 import uuid
 from ctypes import wintypes
@@ -42,9 +44,9 @@ VOICE_PROGRAM_PROVIDER_NAMES = {
 
 _SOGOU_PROCESS_NAME = "sogou_voice_assistant.exe"
 _SOGOU_RUN_VALUE_NAMES = ("搜狗语音输入法",)
-_SOGOU_SETTINGS_URI = (
-    "sgbiz:sg_process?module=sgmyinput.exe&param=-page%3Dkeyset"
-)
+_SOGOU_UNINSTALL_SUBKEY = "Sogou Input"
+_SOGOU_TOOLBOX_PROCESS_NAME = "SOGOUSmartAssistant.exe"
+_SOGOU_TOOLBOX_ARGUMENTS = "--from=menutool"
 _WETYPE_SERVER_NAME = "wetype_server.exe"
 _WETYPE_PROCESS_NAMES = (_WETYPE_SERVER_NAME, "wetype_service.exe")
 _WETYPE_SETTINGS_EXE = "wetype_update.exe"
@@ -64,6 +66,197 @@ _CLSCTX_INPROC_SERVER = 0x1
 _RPC_E_CHANGED_MODE = ctypes.c_int32(0x80010106).value
 _SLGP_RAWPATH = 0x4
 _STGM_READ = 0
+
+_SOGOU_SETTINGS_AUTOMATION_SCRIPT = r"""
+$ErrorActionPreference = "Stop"
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+Add-Type -AssemblyName UIAutomationClient
+Add-Type -AssemblyName UIAutomationTypes
+Add-Type @'
+using System;
+using System.Text;
+using System.Runtime.InteropServices;
+
+public static class RemoteMicSogouSettingsNative {
+    public delegate bool EnumWindowsProc(IntPtr hwnd, IntPtr lparam);
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct Rect {
+        public int Left;
+        public int Top;
+        public int Right;
+        public int Bottom;
+    }
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    public static extern IntPtr FindWindow(string className, string windowName);
+
+    [DllImport("user32.dll")]
+    public static extern bool EnumWindows(EnumWindowsProc callback, IntPtr lparam);
+
+    [DllImport("user32.dll")]
+    public static extern bool IsWindowVisible(IntPtr hwnd);
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    public static extern int GetClassName(IntPtr hwnd, StringBuilder text, int size);
+
+    [DllImport("user32.dll")]
+    public static extern bool GetWindowRect(IntPtr hwnd, out Rect rect);
+
+    [DllImport("user32.dll")]
+    public static extern bool ShowWindowAsync(IntPtr hwnd, int command);
+
+    [DllImport("user32.dll")]
+    public static extern bool SetForegroundWindow(IntPtr hwnd);
+
+    [DllImport("user32.dll")]
+    public static extern void keybd_event(byte key, byte scan, uint flags, UIntPtr extra);
+}
+'@
+
+function Show-ExistingSettingsWindow {
+    $window = [RemoteMicSogouSettingsNative]::FindWindow(
+        "Chrome_WidgetWin_1",
+        "搜狗语音输入法-设置"
+    )
+    if ($window -eq [IntPtr]::Zero) {
+        return $false
+    }
+    [void][RemoteMicSogouSettingsNative]::ShowWindowAsync($window, 9)
+    [void][RemoteMicSogouSettingsNative]::SetForegroundWindow($window)
+    return $true
+}
+
+function Find-SogouTrayButton {
+    $taskbar = [RemoteMicSogouSettingsNative]::FindWindow("Shell_TrayWnd", $null)
+    if ($taskbar -eq [IntPtr]::Zero) {
+        return $null
+    }
+    $root = [System.Windows.Automation.AutomationElement]::FromHandle($taskbar)
+    $items = $root.FindAll(
+        [System.Windows.Automation.TreeScope]::Descendants,
+        [System.Windows.Automation.Condition]::TrueCondition
+    )
+    for ($index = 0; $index -lt $items.Count; $index++) {
+        $item = $items.Item($index)
+        try {
+            $name = $item.Current.Name.Trim()
+            $className = $item.Current.ClassName
+        } catch {
+            continue
+        }
+        if ($className -eq "SystemTray.NormalButton" -and
+                $name.StartsWith("搜狗语音输入法")) {
+            return $item
+        }
+    }
+    return $null
+}
+
+function Find-SettingsMenuItem {
+    $script:settingsMenuResult = $null
+    [RemoteMicSogouSettingsNative]::EnumWindows({
+        param($window, $unused)
+        if (-not [RemoteMicSogouSettingsNative]::IsWindowVisible($window)) {
+            return $true
+        }
+        $className = New-Object System.Text.StringBuilder 128
+        [void][RemoteMicSogouSettingsNative]::GetClassName(
+            $window,
+            $className,
+            $className.Capacity
+        )
+        if ($className.ToString() -ne "Chrome_WidgetWin_1") {
+            return $true
+        }
+        $rect = New-Object RemoteMicSogouSettingsNative+Rect
+        [void][RemoteMicSogouSettingsNative]::GetWindowRect($window, [ref]$rect)
+        if (($rect.Right - $rect.Left) -gt 500 -or
+                ($rect.Bottom - $rect.Top) -gt 800) {
+            return $true
+        }
+        try {
+            $root = [System.Windows.Automation.AutomationElement]::FromHandle($window)
+            $nameCondition = New-Object System.Windows.Automation.PropertyCondition(
+                [System.Windows.Automation.AutomationElement]::NameProperty,
+                "设置"
+            )
+            $typeCondition = New-Object System.Windows.Automation.PropertyCondition(
+                [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+                [System.Windows.Automation.ControlType]::MenuItem
+            )
+            $condition = New-Object System.Windows.Automation.AndCondition(
+                $nameCondition,
+                $typeCondition
+            )
+            $candidate = $root.FindFirst(
+                [System.Windows.Automation.TreeScope]::Descendants,
+                $condition
+            )
+            if ($null -ne $candidate) {
+                $script:settingsMenuResult = $candidate
+                return $false
+            }
+        } catch {
+        }
+        return $true
+    }, [IntPtr]::Zero) | Out-Null
+    return $script:settingsMenuResult
+}
+
+if (Show-ExistingSettingsWindow) {
+    Write-Output "opened"
+    exit 0
+}
+
+$trayButton = $null
+for ($attempt = 0; $attempt -lt 12 -and $null -eq $trayButton; $attempt++) {
+    $trayButton = Find-SogouTrayButton
+    if ($null -eq $trayButton) {
+        Start-Sleep -Milliseconds 350
+    }
+}
+if ($null -eq $trayButton) {
+    Write-Output "tray-not-found"
+    exit 11
+}
+
+$settingsItem = $null
+for ($attempt = 0; $attempt -lt 3 -and $null -eq $settingsItem; $attempt++) {
+    [RemoteMicSogouSettingsNative]::keybd_event(27, 0, 0, [UIntPtr]::Zero)
+    [RemoteMicSogouSettingsNative]::keybd_event(27, 0, 2, [UIntPtr]::Zero)
+    $trayButton.SetFocus()
+    Start-Sleep -Milliseconds 250
+    [RemoteMicSogouSettingsNative]::keybd_event(0x5D, 0, 0, [UIntPtr]::Zero)
+    [RemoteMicSogouSettingsNative]::keybd_event(0x5D, 0, 2, [UIntPtr]::Zero)
+    Start-Sleep -Milliseconds 700
+    $settingsItem = Find-SettingsMenuItem
+}
+if ($null -eq $settingsItem) {
+    Write-Output "settings-menu-not-found"
+    exit 12
+}
+
+try {
+    $invoke = $settingsItem.GetCurrentPattern(
+        [System.Windows.Automation.InvokePattern]::Pattern
+    )
+    $invoke.Invoke()
+} catch {
+    Write-Output "settings-menu-invoke-failed"
+    exit 13
+}
+
+for ($attempt = 0; $attempt -lt 40; $attempt++) {
+    Start-Sleep -Milliseconds 150
+    if (Show-ExistingSettingsWindow) {
+        Write-Output "opened"
+        exit 0
+    }
+}
+Write-Output "settings-window-not-found"
+exit 14
+"""
 
 
 class _Guid(ctypes.Structure):
@@ -342,6 +535,8 @@ def resolve_voice_program_settings_target(
     *,
     platform: Optional[str] = None,
     process_iter: Optional[Callable[[], Iterable[ProcessInfo]]] = None,
+    run_value_reader: Optional[Callable[[], Iterable[str]]] = None,
+    sogou_install_value_reader: Optional[Callable[[], Iterable[str]]] = None,
     wetype_install_value_reader: Optional[Callable[[], Iterable[str]]] = None,
     wetype_shortcut_iter: Optional[Callable[[], Iterable[Path]]] = None,
     shortcut_resolver: Optional[Callable[[Path], Optional[Path]]] = None,
@@ -357,8 +552,36 @@ def resolve_voice_program_settings_target(
             provider_id, display_name, "unsupported"
         )
     if provider_id == VOICE_PROGRAM_SOGOU:
+        processes = tuple((process_iter or _iter_windows_processes)())
+        process_snapshot = lambda: processes
+        executable = discover_sogou_voice_executable(
+            platform=current_platform,
+            process_iter=process_snapshot,
+            run_value_reader=run_value_reader,
+        )
+        if executable is not None:
+            return VoiceProgramSettingsTarget(
+                provider_id,
+                display_name,
+                "sogou_tray",
+                str(executable),
+            )
+        toolbox = discover_sogou_ai_toolbox_executable(
+            platform=current_platform,
+            process_iter=process_snapshot,
+            run_value_reader=run_value_reader,
+            install_value_reader=sogou_install_value_reader,
+        )
+        if toolbox is not None:
+            return VoiceProgramSettingsTarget(
+                provider_id,
+                display_name,
+                "sogou_toolbox",
+                str(toolbox),
+                _SOGOU_TOOLBOX_ARGUMENTS,
+            )
         return VoiceProgramSettingsTarget(
-            provider_id, display_name, "uri", _SOGOU_SETTINGS_URI
+            provider_id, display_name, "missing"
         )
     if provider_id == VOICE_PROGRAM_WINDOWS_DICTATION:
         return VoiceProgramSettingsTarget(
@@ -570,6 +793,32 @@ def open_voice_program_settings(
     launcher(str(path), "open", str(arguments), str(path.parent))
 
 
+def open_sogou_voice_settings(
+    executable: Path,
+    *,
+    launch_elevated: bool,
+    platform: Optional[str] = None,
+    process_iter: Optional[Callable[[], Iterable[ProcessInfo]]] = None,
+    start_file: Optional[Callable[[str, str, str], None]] = None,
+    automation_opener: Optional[Callable[[], None]] = None,
+) -> None:
+    """Open Sogou Voice's own settings through its tray-owned menu."""
+
+    current_platform = platform or sys.platform
+    if current_platform != "win32":
+        raise OSError("Sogou voice settings require Windows")
+    path = Path(executable)
+    running = any(
+        process.name.casefold() == _SOGOU_PROCESS_NAME
+        for process in (process_iter or _iter_windows_processes)()
+    )
+    if not running:
+        operation = "runas" if launch_elevated else "open"
+        launcher = start_file or _default_start_file
+        launcher(str(path), operation, str(path.parent))
+    (automation_opener or _run_sogou_settings_automation)()
+
+
 def discover_sogou_voice_executable(
     *,
     platform: Optional[str] = None,
@@ -604,6 +853,75 @@ def discover_sogou_voice_executable(
     if not existing:
         return None
     return max(existing, key=_sogou_version_key)
+
+
+def discover_sogou_ai_toolbox_executable(
+    *,
+    platform: Optional[str] = None,
+    process_iter: Optional[Callable[[], Iterable[ProcessInfo]]] = None,
+    run_value_reader: Optional[Callable[[], Iterable[str]]] = None,
+    install_value_reader: Optional[Callable[[], Iterable[str]]] = None,
+) -> Optional[Path]:
+    current_platform = sys.platform if platform is None else platform
+    if current_platform != "win32":
+        return None
+
+    processes = tuple((process_iter or _iter_windows_processes)())
+    for process in processes:
+        if (
+            process.name.casefold() == _SOGOU_TOOLBOX_PROCESS_NAME.casefold()
+            and process.executable is not None
+            and process.executable.is_file()
+        ):
+            return process.executable
+
+    component_dirs: list[Path] = []
+    for process in processes:
+        executable = process.executable
+        if executable is None:
+            continue
+        for parent in executable.parents:
+            if parent.name.casefold() == "components":
+                component_dirs.append(parent)
+                break
+        for parent in executable.parents[:4]:
+            candidate = parent / "Components"
+            if candidate.is_dir():
+                component_dirs.append(candidate)
+
+    for command in (run_value_reader or _read_sogou_run_values)():
+        manager_path = _command_executable(command)
+        if manager_path is not None:
+            component_dirs.append(manager_path.parent)
+
+    for raw_value in (install_value_reader or _read_sogou_install_values)():
+        text = os.path.expandvars(str(raw_value).strip())
+        if not text:
+            continue
+        path = (
+            _command_executable(text)
+            if ".exe" in text.casefold()
+            else Path(text.strip('"'))
+        )
+        if path is None:
+            continue
+        root = path.parent if path.suffix else path
+        for parent in (root, *root.parents[:3]):
+            candidate = parent / "Components"
+            if candidate.is_dir():
+                component_dirs.append(candidate)
+
+    candidates: list[Path] = []
+    for components_dir in dict.fromkeys(component_dirs):
+        candidates.extend(
+            components_dir.glob(
+                f"IChat/*/{_SOGOU_TOOLBOX_PROCESS_NAME}"
+            )
+        )
+    existing = [path for path in dict.fromkeys(candidates) if path.is_file()]
+    if not existing:
+        return None
+    return max(existing, key=_sogou_toolbox_version_key)
 
 
 def discover_wetype_executable(
@@ -670,6 +988,11 @@ def _command_executable(command: str) -> Optional[Path]:
 def _sogou_version_key(path: Path) -> tuple[int, ...]:
     version_text = path.parents[1].name if len(path.parents) > 1 else ""
     numbers = tuple(int(item) for item in re.findall(r"\d+", version_text))
+    return numbers or (0,)
+
+
+def _sogou_toolbox_version_key(path: Path) -> tuple[int, ...]:
+    numbers = tuple(int(item) for item in re.findall(r"\d+", path.parent.name))
     return numbers or (0,)
 
 
@@ -905,6 +1228,50 @@ def _read_sogou_run_values() -> Iterable[str]:
         return ()
 
 
+def _read_sogou_install_values() -> Iterable[str]:
+    if sys.platform != "win32":
+        return ()
+    try:
+        import winreg
+
+        subkey = (
+            "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\"
+            + _SOGOU_UNINSTALL_SUBKEY
+        )
+        values: list[str] = []
+        views = tuple(
+            dict.fromkeys(
+                (
+                    0,
+                    getattr(winreg, "KEY_WOW64_64KEY", 0),
+                    getattr(winreg, "KEY_WOW64_32KEY", 0),
+                )
+            )
+        )
+        for hive in (winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE):
+            for view in views:
+                try:
+                    with winreg.OpenKey(
+                        hive,
+                        subkey,
+                        0,
+                        winreg.KEY_READ | view,
+                    ) as key:
+                        for name in ("InstallLocation", "DisplayIcon"):
+                            try:
+                                value, _ = winreg.QueryValueEx(key, name)
+                            except OSError:
+                                continue
+                            text = str(value).strip()
+                            if text:
+                                values.append(text)
+                except OSError:
+                    continue
+        return tuple(dict.fromkeys(values))
+    except OSError:
+        return ()
+
+
 def _read_wetype_install_values() -> Iterable[str]:
     if sys.platform != "win32":
         return ()
@@ -995,6 +1362,53 @@ def _default_start_file_with_arguments(
         arguments,
         cwd,
     )
+
+
+def _run_sogou_settings_automation(
+    *,
+    runner: Optional[Callable[..., subprocess.CompletedProcess[str]]] = None,
+) -> None:
+    encoded_script = base64.b64encode(
+        _SOGOU_SETTINGS_AUTOMATION_SCRIPT.encode("utf-16-le")
+    ).decode("ascii")
+    command = (
+        "powershell.exe",
+        "-NoLogo",
+        "-NoProfile",
+        "-NonInteractive",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-EncodedCommand",
+        encoded_script,
+    )
+    actual_runner = runner or subprocess.run
+    kwargs: dict[str, object] = {
+        "capture_output": True,
+        "text": True,
+        "encoding": "utf-8",
+        "errors": "replace",
+        "timeout": 20,
+        "check": False,
+    }
+    if actual_runner is subprocess.run and sys.platform == "win32":
+        kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    try:
+        completed = actual_runner(command, **kwargs)
+    except subprocess.TimeoutExpired as exc:
+        raise OSError("等待搜狗语音设置窗口超时") from exc
+    if completed.returncode == 0:
+        return
+    detail = str(completed.stdout or completed.stderr or "").strip()
+    messages = {
+        11: "未找到搜狗语音托盘图标",
+        12: "未找到搜狗语音托盘菜单中的设置项",
+        13: "无法调用搜狗语音托盘菜单中的设置项",
+        14: "搜狗语音设置窗口没有出现",
+    }
+    message = messages.get(completed.returncode, "无法打开搜狗语音设置")
+    if detail:
+        message = f"{message}（{detail}）"
+    raise OSError(message)
 
 
 def _iter_windows_processes() -> Iterable[ProcessInfo]:
