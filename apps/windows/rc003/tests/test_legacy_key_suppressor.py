@@ -8,22 +8,6 @@ from ovb_rc003 import legacy_key_suppressor_windows as suppressor
 
 
 class LegacyKeySuppressorDecisionTests(unittest.TestCase):
-    def test_right_alt_transform_event_has_one_physical_identity(self):
-        target = suppressor.PhysicalKeyTarget(
-            vk_code=0xA5,
-            scan_code=0x38,
-            extended=True,
-            system_key=True,
-        )
-
-        down, down_message = suppressor.build_physical_key_event(target, True, 123)
-        up, up_message = suppressor.build_physical_key_event(target, False, 124)
-
-        self.assertEqual((down.vkCode, down.scanCode, down.flags, down.time), (0xA5, 0x38, suppressor.LLKHF_EXTENDED, 123))
-        self.assertEqual((up.vkCode, up.scanCode, up.flags, up.time), (0xA5, 0x38, suppressor.LLKHF_EXTENDED | suppressor.LLKHF_UP, 124))
-        self.assertEqual(down_message, suppressor.WM_SYSKEYDOWN)
-        self.assertEqual(up_message, suppressor.WM_SYSKEYUP)
-
     def test_suppresses_configured_non_injected_vk(self):
         gate = suppressor.LegacyKeySuppressor({0x74})
         self.assertTrue(gate.should_suppress(0x74, 0))

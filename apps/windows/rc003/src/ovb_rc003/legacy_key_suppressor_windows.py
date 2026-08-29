@@ -5,11 +5,11 @@ deliver the same translated HID Keyboard-page usage to the foreground app as a
 normal legacy keyboard event. The real RC003 microphone key does this as F5.
 
 This module installs a narrow low-level keyboard hook that swallows only the
-configured non-injected virtual-key codes. The RC003 voice replacement path
-rewrites the original F5 record in place while forwarding it to later hooks,
-so host applications see a physical right-Alt-shaped record rather than a new
-injected event. The private ``dwExtraInfo`` marker remains for the optional
-keybd_event fallback and is never accepted for unrelated injected input.
+configured non-injected virtual-key codes. Suppressed events may be reported
+to the application through a lightweight callback, but the hook never turns
+F5 into another key or enters the voice/audio state machine. The private
+``dwExtraInfo`` marker remains for the optional keybd_event compatibility path
+and is never accepted for unrelated injected input.
 """
 
 from __future__ import annotations
@@ -22,7 +22,7 @@ import threading
 import time
 from ctypes import wintypes
 from dataclasses import dataclass
-from typing import Callable, Dict, FrozenSet, List, NamedTuple, Optional, Tuple
+from typing import Callable, Dict, FrozenSet, List, Optional, Tuple
 
 
 WH_KEYBOARD_LL = 13
@@ -33,7 +33,6 @@ WM_SYSKEYUP = 0x0105
 LLKHF_INJECTED = 0x00000010
 LLKHF_LOWER_IL_INJECTED = 0x00000002
 LLKHF_EXTENDED = 0x00000001
-LLKHF_UP = 0x00000080
 PM_NOREMOVE = 0x0000
 
 # "RMICRC03" as a pointer-sized value. It is cleared before the event reaches
@@ -65,15 +64,6 @@ class KBDLLHOOKSTRUCT(ctypes.Structure):
     ]
 
 
-class PhysicalKeyTarget(NamedTuple):
-    """The physical low-level-hook identity to expose downstream."""
-
-    vk_code: int
-    scan_code: int
-    extended: bool = False
-    system_key: bool = False
-
-
 @dataclass(frozen=True)
 class _ArmedKeyEvent:
     vk_code: int
@@ -89,37 +79,11 @@ class _TrackedKeyState:
     expires_at: float
 
 
-def build_physical_key_event(
-    target: PhysicalKeyTarget, is_pressed: bool, event_time: int
-) -> Tuple[KBDLLHOOKSTRUCT, int]:
-    """Build one non-injected low-level event and its keyboard message."""
-
-    flags = LLKHF_EXTENDED if target.extended else 0
-    if not is_pressed:
-        flags |= LLKHF_UP
-    event = KBDLLHOOKSTRUCT(
-        vkCode=int(target.vk_code),
-        scanCode=int(target.scan_code),
-        flags=flags,
-        time=int(event_time),
-        dwExtraInfo=0,
-    )
-    if target.system_key:
-        message = WM_SYSKEYDOWN if is_pressed else WM_SYSKEYUP
-    else:
-        message = WM_KEYDOWN if is_pressed else WM_KEYUP
-    return event, message
-
-
 class LegacyKeySuppressor:
     def __init__(
         self,
         suppress_vk_codes,
         on_key_event: Optional[Callable[[int, bool], None]] = None,
-        on_key_transform: Optional[
-            Callable[[int, bool], Optional[PhysicalKeyTarget]]
-        ] = None,
-        on_key_emit: Optional[Callable[[PhysicalKeyTarget, bool], bool]] = None,
         *,
         rc003_vk_codes: Optional[FrozenSet[int]] = None,
         consume_wait_seconds: float = 0.060,
@@ -128,11 +92,6 @@ class LegacyKeySuppressor:
     ) -> None:
         self._suppress_vk_codes: FrozenSet[int] = frozenset(int(vk) for vk in suppress_vk_codes)
         self._on_key_event = on_key_event
-        self._on_key_transform = on_key_transform
-        # Production callers can replace a swallowed physical edge with a
-        # real Win32 input edge. Returning False keeps the original event
-        # swallowed while allowing the application to use its fallback path.
-        self._on_key_emit = on_key_emit
         # The RC003 keyboard surface is a small, known set of VK codes. The
         # low-level hook only ever needs to wait for an arming Raw Input edge
         # for those codes; every other keyboard (and any other key) must pass
@@ -454,53 +413,6 @@ class LegacyKeySuppressor:
             )
         return True
 
-    def _forward_transformed_key_event(
-        self,
-        n_code: int,
-        target: PhysicalKeyTarget,
-        is_pressed: bool,
-        event_time: int,
-        event: KBDLLHOOKSTRUCT,
-        event_address: int,
-    ) -> None:
-        user32 = ctypes.windll.user32  # type: ignore[attr-defined]
-        user32.CallNextHookEx.argtypes = (
-            wintypes.HHOOK,
-            ctypes.c_int,
-            wintypes.WPARAM,
-            wintypes.LPARAM,
-        )
-        user32.CallNextHookEx.restype = ctypes.c_ssize_t
-        transformed, message = build_physical_key_event(
-            target, is_pressed, event_time
-        )
-        original = (
-            event.vkCode,
-            event.scanCode,
-            event.flags,
-            event.time,
-            event.dwExtraInfo,
-        )
-        # The incoming event is already a physical low-level-hook record.
-        # Mutate that record in place for the duration of CallNextHookEx so
-        # the native consumer sees the same callback memory, with no
-        # SendInput marker and no separately allocated/fabricated pointer.
-        event.vkCode = transformed.vkCode
-        event.scanCode = transformed.scanCode
-        event.flags = transformed.flags
-        event.time = transformed.time
-        event.dwExtraInfo = transformed.dwExtraInfo
-        try:
-            user32.CallNextHookEx(self._hook, n_code, message, event_address)
-        finally:
-            (
-                event.vkCode,
-                event.scanCode,
-                event.flags,
-                event.time,
-                event.dwExtraInfo,
-            ) = original
-
     def start(
         self,
         *,
@@ -671,44 +583,9 @@ class LegacyKeySuppressor:
                     event.flags = original_flags
                     event.dwExtraInfo = original_extra_info
             if self.should_suppress(event.vkCode, event.flags):
-                if self._on_key_transform is not None:
-                    try:
-                        target = self._on_key_transform(
-                            int(event.vkCode), is_pressed
-                        )
-                    except Exception:
-                        target = None
-                    if target is not None:
-                        if self._on_key_emit is not None:
-                            try:
-                                self._on_key_emit(target, is_pressed)
-                            except Exception:
-                                # Never leak the original F5 if replacement
-                                # delivery fails. The app callback still gets
-                                # the edge and can use its normal fallback.
-                                pass
-                        else:
-                            # Kept for isolated consumers of this helper. RC003
-                            # production wiring leaves on_key_emit unset so
-                            # the original hook record is forwarded directly
-                            # through the native hook chain.
-                            try:
-                                self._forward_transformed_key_event(
-                                    n_code,
-                                    target,
-                                    is_pressed,
-                                    int(event.time),
-                                    event,
-                                    int(l_param),
-                                )
-                            except Exception:
-                                pass
-                        if self._on_key_event is not None:
-                            try:
-                                self._on_key_event(int(event.vkCode), is_pressed)
-                            except Exception:
-                                pass
-                        return 1
+                return 1 if self.handle_key_event(
+                    int(event.vkCode), int(event.flags), is_pressed
+                ) else 0
             if (
                 not (int(event.flags) & LLKHF_INJECTED)
                 and self.consume_armed_key_event(
