@@ -1541,7 +1541,27 @@ class SpatialNavigationTests(unittest.TestCase):
     def test_tracks_only_relevant_structure_changes(self):
         self.assertTrue(prototype.is_navigation_structure_event(0x8000))
         self.assertTrue(prototype.is_navigation_structure_event(0x800A))
+        self.assertTrue(
+            prototype.is_navigation_structure_event(
+                prototype.EVENT_OBJECT_LOCATIONCHANGE
+            )
+        )
         self.assertFalse(prototype.is_navigation_structure_event(0x8005))
+
+        event = prototype.EVENT_OBJECT_LOCATIONCHANGE
+        self.assertTrue(
+            prototype.navigation_structure_event_affects_targets(event, -4)
+        )
+        self.assertFalse(
+            prototype.navigation_structure_event_affects_targets(
+                event, prototype.OBJID_CARET
+            )
+        )
+        self.assertFalse(
+            prototype.navigation_structure_event_affects_targets(
+                event, prototype.OBJID_CURSOR
+            )
+        )
 
         now = [10.0]
         tracker = prototype.DirtyWindowTracker(lambda: now[0])
@@ -1872,7 +1892,7 @@ class SpatialNavigationTests(unittest.TestCase):
             )
         )
 
-    def test_content_refresh_only_follows_context_or_double_click(self):
+    def test_content_refresh_follows_context_double_click_or_scroll(self):
         self.assertEqual(prototype.content_refresh_delay_ms("contexted"), 120)
         self.assertEqual(
             prototype.content_refresh_delay_ms("activated", True), 180
@@ -1880,6 +1900,7 @@ class SpatialNavigationTests(unittest.TestCase):
         self.assertEqual(
             prototype.content_refresh_delay_ms("activated", False), 0
         )
+        self.assertEqual(prototype.content_refresh_delay_ms("scrolled"), 180)
 
     def test_negative_wheel_delta_is_encoded_as_a_windows_dword(self):
         self.assertEqual(prototype.mouse_wheel_data(120), 120)

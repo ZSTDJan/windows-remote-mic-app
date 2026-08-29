@@ -78,6 +78,9 @@ DYNAMIC_REFRESH_MAX_CACHE_SECONDS = 30.0
 DYNAMIC_REFRESH_SETTLE_SECONDS = 0.15
 FOLLOW_WINDOW_SCAN_BUDGET_SECONDS = 0.2
 FOLLOW_WINDOW_EMPTY_REFRESH_RETRIES = 2
+EVENT_OBJECT_LOCATIONCHANGE = 0x800B
+OBJID_CARET = -8
+OBJID_CURSOR = -9
 NAVIGATION_STRUCTURE_EVENTS = frozenset(
     {
         0x8000,  # EVENT_OBJECT_CREATE
@@ -86,6 +89,7 @@ NAVIGATION_STRUCTURE_EVENTS = frozenset(
         0x8003,  # EVENT_OBJECT_HIDE
         0x8004,  # EVENT_OBJECT_REORDER
         0x800A,  # EVENT_OBJECT_STATECHANGE
+        EVENT_OBJECT_LOCATIONCHANGE,
     }
 )
 SECTION_MAX_WINDOW_WIDTH_RATIO = 0.88
@@ -485,6 +489,17 @@ def _axis_overlap(a_start: int, a_end: int, b_start: int, b_end: int) -> int:
 
 def is_navigation_structure_event(event_id: int) -> bool:
     return event_id in NAVIGATION_STRUCTURE_EVENTS
+
+
+def navigation_structure_event_affects_targets(
+    event_id: int, object_id: int
+) -> bool:
+    if not is_navigation_structure_event(event_id):
+        return False
+    return not (
+        event_id == EVENT_OBJECT_LOCATIONCHANGE
+        and object_id in {OBJID_CARET, OBJID_CURSOR}
+    )
 
 
 def target_has_interaction_evidence(target: TargetSnapshot) -> bool:
@@ -2001,6 +2016,8 @@ def content_refresh_delay_ms(event: str, repeated_activation: bool = False) -> i
     if event == "contexted":
         return 120
     if event == "activated" and repeated_activation:
+        return 180
+    if event == "scrolled":
         return 180
     return 0
 
@@ -5315,7 +5332,7 @@ def _run_windows(args: argparse.Namespace) -> int:
             )
 
     class StructureChangeWatcher:
-        HOOK_RANGES = ((0x8000, 0x8004), (0x800A, 0x800A))
+        HOOK_RANGES = ((0x8000, 0x8004), (0x800A, EVENT_OBJECT_LOCATIONCHANGE))
         WM_QUIT = 0x0012
 
         def __init__(self) -> None:
@@ -5351,12 +5368,14 @@ def _run_windows(args: argparse.Namespace) -> int:
             _hook: Any,
             event_id: int,
             hwnd: int,
-            _object_id: int,
+            object_id: int,
             _child_id: int,
             _event_thread: int,
             _event_time: int,
         ) -> None:
-            if not hwnd or not is_navigation_structure_event(int(event_id)):
+            if not hwnd or not navigation_structure_event_affects_targets(
+                int(event_id), int(object_id)
+            ):
                 return
             event_hwnd = native_handle_value(hwnd)
             root_hwnd = native_handle_value(user32.GetAncestor(event_hwnd, ga_root))
@@ -5770,8 +5789,11 @@ def _run_windows(args: argparse.Namespace) -> int:
                     f"已滚动: {target.name or target.control_type} "
                     f"({payload['steps']:+d} / {payload['elapsed']:.3f}s)"
                 )
-                if target.source == "visual-grid" and active.is_set():
-                    QTimer.singleShot(180, lambda: worker.post("refresh_content"))
+                refresh_delay = content_refresh_delay_ms(event)
+                if refresh_delay and active.is_set():
+                    QTimer.singleShot(
+                        refresh_delay, lambda: worker.post("refresh_content")
+                    )
             elif event == "exit_requested":
                 leave_navigation()
             elif event == "geometry_synced":
