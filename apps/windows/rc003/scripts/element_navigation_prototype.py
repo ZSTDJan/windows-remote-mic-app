@@ -1895,6 +1895,29 @@ def _navigation_lane_tolerance(
     return max(minimum, min(maximum, (current_span + target_span) * 0.75))
 
 
+def _navigation_forward_gap(
+    current: Rect,
+    target: Rect,
+    direction: Direction,
+) -> float:
+    score = direction_score(current, target, direction)
+    return float("inf") if score is None else score[1]
+
+
+def _navigation_forward_far_edge_distance(
+    current: Rect,
+    target: Rect,
+    direction: Direction,
+) -> float:
+    if direction == Direction.LEFT:
+        return max(0.0, float(current.left - target.left))
+    if direction == Direction.RIGHT:
+        return max(0.0, float(target.right - current.right))
+    if direction == Direction.UP:
+        return max(0.0, float(current.top - target.top))
+    return max(0.0, float(target.bottom - current.bottom))
+
+
 def navigation_scale_unit(rects: Sequence[Rect]) -> float:
     """Return a layout-relative unit for scale-stable navigation thresholds."""
 
@@ -2630,7 +2653,7 @@ def navigation_contact_cell(
 
 
 class NavigationGraph:
-    """Cache one rectangular territory and its edge neighbors per target."""
+    """Cache projection-aware routes over one rectangular territory map."""
 
     def __init__(self, targets: Sequence[TargetSnapshot]) -> None:
         self.targets = tuple(targets)
@@ -2648,6 +2671,112 @@ class NavigationGraph:
             self.scale_unit,
         )
         self._natural: dict[tuple[int, Direction], tuple[int, ...]] = {}
+
+    def _projected_candidates(
+        self,
+        current_index: int,
+        direction: Direction,
+        active_rect: Rect,
+    ) -> tuple[int, ...]:
+        """Return real controls intersected by the requested direction beam."""
+
+        ranked = ranked_target_indices(
+            self.targets,
+            current_index,
+            direction,
+            self._descendants_by_target,
+            self.anchor_rects,
+            active_rect,
+        )
+        projected = [
+            index
+            for index in ranked
+            if _navigation_lane_gap(
+                active_rect,
+                self.anchor_rects[index],
+                direction,
+            )
+            <= 0
+        ]
+        rank_by_index = {
+            index: rank for rank, index in enumerate(ranked)
+        }
+        projected.sort(
+            key=lambda index: (
+                self._crosses_parallel_section_boundary(
+                    current_index,
+                    index,
+                    direction,
+                ),
+                rank_by_index[index],
+            )
+        )
+        return tuple(projected)
+
+    def _merge_projected_and_adjacent(
+        self,
+        current_index: int,
+        active_rect: Rect,
+        direction: Direction,
+        projected: Sequence[int],
+        adjacent: Sequence[int],
+    ) -> tuple[int, ...]:
+        """Merge direct beam hits without skipping a nearer visual row."""
+
+        pending = list(dict.fromkeys(projected))
+        merged: list[int] = []
+        for adjacent_index in adjacent:
+            frontier = _navigation_forward_far_edge_distance(
+                active_rect,
+                self.anchor_rects[adjacent_index],
+                direction,
+            )
+            before_frontier = [
+                index
+                for index in pending
+                if _navigation_forward_gap(
+                    active_rect,
+                    self.anchor_rects[index],
+                    direction,
+                )
+                <= frontier
+            ]
+            frontier_group = list(
+                dict.fromkeys([*before_frontier, adjacent_index])
+            )
+
+            def frontier_rank(index: int) -> tuple[float, ...]:
+                score = direction_score(
+                    active_rect,
+                    self.anchor_rects[index],
+                    direction,
+                )
+                if score is None:
+                    return (1.0, float("inf"), float(index))
+                return (
+                    float(
+                        self._crosses_parallel_section_boundary(
+                            current_index,
+                            index,
+                            direction,
+                        )
+                    ),
+                    score[3],
+                    score[1],
+                    score[2],
+                    score[4],
+                    float(index),
+                )
+
+            frontier_group.sort(key=frontier_rank)
+            merged.extend(
+                index for index in frontier_group if index not in merged
+            )
+            pending = [
+                index for index in pending if index not in before_frontier
+            ]
+        merged.extend(index for index in pending if index not in merged)
+        return tuple(merged)
 
     def requires_orthogonal_grid_step(
         self,
@@ -2768,13 +2897,24 @@ class NavigationGraph:
         if not 0 <= current_index < len(self.targets):
             return ()
         active_rect = (
-            self.grid_rects[current_index]
+            self.anchor_rects[current_index]
             if current_rect is None
             else current_rect
         )
+        use_cache = active_rect == self.anchor_rects[current_index]
+        key = (current_index, direction)
+        if use_cache:
+            natural = self._natural.get(key)
+            if natural is not None:
+                return natural
+        projected = self._projected_candidates(
+            current_index,
+            direction,
+            active_rect,
+        )
         contacts = self._contacts.get((current_index, direction), ())
-        if current_rect is not None and current_rect != self.grid_rects[current_index]:
-            return tuple(
+        if not use_cache:
+            adjacent = tuple(
                 contact.target_index
                 for contact in sorted(
                     contacts,
@@ -2791,27 +2931,40 @@ class NavigationGraph:
                     ),
                 )
             )
-        key = (current_index, direction)
-        natural = self._natural.get(key)
-        if natural is None:
-            natural = tuple(
-                contact.target_index
-                for contact in sorted(
-                contacts,
-                    key=lambda contact: _navigation_contact_rank(
-                        active_rect,
-                        self.anchor_rects[contact.target_index],
-                        direction,
-                        contact,
-                        self._crosses_parallel_section_boundary(
-                            current_index,
-                            contact.target_index,
-                            direction,
-                        ),
-                    ),
-                )
+            return self._merge_projected_and_adjacent(
+                current_index,
+                active_rect,
+                direction,
+                projected,
+                adjacent,
             )
-            self._natural[key] = natural
+        adjacent = tuple(
+            contact.target_index
+            for contact in sorted(
+                contacts,
+                key=lambda contact: _navigation_contact_rank(
+                    active_rect,
+                    self.anchor_rects[contact.target_index],
+                    direction,
+                    contact,
+                    self._crosses_parallel_section_boundary(
+                        current_index,
+                        contact.target_index,
+                        direction,
+                    ),
+                ),
+            )
+        )
+        # Territory adjacency keeps gaps and sparse layouts traversable,
+        # but it must not hide a real control hit by the requested beam.
+        natural = self._merge_projected_and_adjacent(
+            current_index,
+            active_rect,
+            direction,
+            projected,
+            adjacent,
+        )
+        self._natural[key] = natural
         return natural
 
     def candidates(

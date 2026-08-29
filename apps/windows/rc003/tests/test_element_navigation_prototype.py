@@ -1567,10 +1567,9 @@ class SpatialNavigationTests(unittest.TestCase):
             prototype.NavigationContact(2, 0, 40),
         )
         graph._natural.clear()
-        self.assertEqual(
-            graph.candidates(0, prototype.Direction.UP),
-            (2,),
-        )
+        candidates = graph.candidates(0, prototype.Direction.UP)
+        self.assertEqual(candidates[0], 2)
+        self.assertIn(1, candidates)
 
     def test_codex_bottom_controls_cross_full_width_rows_before_branching(self):
         targets = [
@@ -1882,6 +1881,74 @@ class SpatialNavigationTests(unittest.TestCase):
         self.assertEqual(
             parent_first.candidates(1, prototype.Direction.RIGHT), (0,)
         )
+
+    def test_projection_candidate_precedes_a_closer_territory_contact(self):
+        targets = [
+            self.target(657, 89, 770, 164, "directly above"),
+            self.target(700, 266, 869, 290, "current"),
+            self.target(539, 138, 673, 158, "upper left"),
+        ]
+        graph = prototype.NavigationGraph(targets)
+
+        self.assertNotIn(
+            0,
+            [
+                contact.target_index
+                for contact in graph._contacts.get(
+                    (1, prototype.Direction.UP), ()
+                )
+            ],
+        )
+        self.assertEqual(
+            graph.candidates(
+                1,
+                prototype.Direction.UP,
+                graph.anchor_rects[1],
+            )[0],
+            0,
+        )
+
+    def test_projection_priority_applies_in_all_four_directions(self):
+        cases = (
+            (
+                prototype.Direction.UP,
+                self.target(100, 220, 180, 260, "current"),
+                self.target(90, 120, 190, 160, "projected"),
+                self.target(210, 170, 260, 210, "diagonal"),
+            ),
+            (
+                prototype.Direction.DOWN,
+                self.target(100, 120, 180, 160, "current"),
+                self.target(90, 220, 190, 260, "projected"),
+                self.target(210, 170, 260, 210, "diagonal"),
+            ),
+            (
+                prototype.Direction.LEFT,
+                self.target(220, 100, 260, 180, "current"),
+                self.target(120, 90, 160, 190, "projected"),
+                self.target(170, 210, 210, 260, "diagonal"),
+            ),
+            (
+                prototype.Direction.RIGHT,
+                self.target(120, 100, 160, 180, "current"),
+                self.target(220, 90, 260, 190, "projected"),
+                self.target(170, 210, 210, 260, "diagonal"),
+            ),
+        )
+
+        for direction, current, projected, diagonal in cases:
+            with self.subTest(direction=direction):
+                graph = prototype.NavigationGraph(
+                    [current, projected, diagonal]
+                )
+                self.assertEqual(
+                    graph.candidates(
+                        0,
+                        direction,
+                        graph.anchor_rects[0],
+                    )[0],
+                    1,
+                )
 
     def test_range_occupancy_grid_is_one_gapless_non_overlapping_cell_per_target(self):
         targets = [
