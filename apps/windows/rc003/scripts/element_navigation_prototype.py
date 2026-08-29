@@ -1821,12 +1821,20 @@ def _navigation_contact_rank(
 ) -> tuple[float, ...]:
     if direction in {Direction.LEFT, Direction.RIGHT}:
         active_start, active_end = active_rect.top, active_rect.bottom
+        target_start, target_end = target_rect.top, target_rect.bottom
         active_center = active_rect.center_y
         target_center = target_rect.center_y
     else:
         active_start, active_end = active_rect.left, active_rect.right
+        target_start, target_end = target_rect.left, target_rect.right
         active_center = active_rect.center_x
         target_center = target_rect.center_x
+    target_lane_gap = _axis_gap(
+        active_start,
+        active_end,
+        target_start,
+        target_end,
+    )
     lane_gap = _axis_gap(active_start, active_end, contact.start, contact.end)
     if contact.start <= active_center <= contact.end:
         center_gap = 0.0
@@ -1836,6 +1844,8 @@ def _navigation_contact_rank(
             abs(active_center - contact.end),
         )
     return (
+        float(target_lane_gap > 0),
+        float(target_lane_gap),
         float(lane_gap > 0),
         float(lane_gap),
         center_gap,
@@ -1844,6 +1854,48 @@ def _navigation_contact_rank(
         float(target_rect.left),
         float(contact.target_index),
     )
+
+
+def _navigation_lane_gap(
+    current: Rect,
+    target: Rect,
+    direction: Direction,
+) -> float:
+    if direction in {Direction.LEFT, Direction.RIGHT}:
+        return _axis_gap(current.top, current.bottom, target.top, target.bottom)
+    return _axis_gap(current.left, current.right, target.left, target.right)
+
+
+def _navigation_lane_tolerance(
+    current: Rect,
+    target: Rect,
+    direction: Direction,
+) -> float:
+    if direction in {Direction.LEFT, Direction.RIGHT}:
+        current_span = current.height
+        target_span = target.height
+    else:
+        current_span = current.width
+        target_span = target.width
+    return max(24.0, min(160.0, (current_span + target_span) * 0.75))
+
+
+def _orthogonal_direction_toward(
+    current: Rect,
+    target: Rect,
+    direction: Direction,
+) -> Optional[Direction]:
+    if direction in {Direction.UP, Direction.DOWN}:
+        if target.center_x < current.center_x:
+            return Direction.LEFT
+        if target.center_x > current.center_x:
+            return Direction.RIGHT
+    else:
+        if target.center_y < current.center_y:
+            return Direction.UP
+        if target.center_y > current.center_y:
+            return Direction.DOWN
+    return None
 
 
 def direction_score(
@@ -2257,6 +2309,7 @@ DIAGNOSTIC_DIRECTION_LABELS = {
 DIAGNOSTIC_OUTCOME_LABELS = {
     "selected": "已移动",
     "no_candidate": "没有可用候选，保持原位",
+    "orthogonal_step": "目标偏离当前通道，请先横向或纵向对齐",
     "geometry_changed": "候选位置变化，已重新扫描",
 }
 
@@ -2533,6 +2586,43 @@ class NavigationGraph:
         )
         self._natural: dict[tuple[int, Direction], tuple[int, ...]] = {}
 
+    def requires_orthogonal_grid_step(
+        self,
+        current_index: int,
+        direction: Direction,
+        active_rect: Rect,
+        candidate_index: int,
+    ) -> bool:
+        if not 0 <= candidate_index < len(self.anchor_rects):
+            return False
+        candidate = self.anchor_rects[candidate_index]
+        if _navigation_lane_gap(
+            active_rect,
+            candidate,
+            direction,
+        ) <= _navigation_lane_tolerance(active_rect, candidate, direction):
+            return False
+        side_direction = _orthogonal_direction_toward(
+            active_rect,
+            candidate,
+            direction,
+        )
+        if side_direction is None:
+            return False
+        for contact in self._contacts.get((current_index, side_direction), ()):
+            side_target = self.anchor_rects[contact.target_index]
+            if _navigation_lane_gap(
+                active_rect,
+                side_target,
+                side_direction,
+            ) <= _navigation_lane_tolerance(
+                active_rect,
+                side_target,
+                side_direction,
+            ):
+                return True
+        return False
+
     def natural_candidates(
         self,
         current_index: int,
@@ -2610,9 +2700,20 @@ class NavigationTraversal:
         self.active_index = None
         self.active_rect = None
 
-    def current_cell(self, current_index: int, default_rect: Rect) -> Rect:
+    def current_cell(
+        self,
+        current_index: int,
+        default_rect: Rect,
+        direction: Optional[Direction] = None,
+    ) -> Rect:
         if self.active_index != current_index or self.active_rect is None:
             self.active_index = current_index
+            self.active_rect = default_rect
+        elif (
+            direction is not None
+            and self.direction is not None
+            and direction != self.direction
+        ):
             self.active_rect = default_rect
         return self.active_rect
 
@@ -5458,18 +5559,32 @@ def _run_windows(args: argparse.Namespace) -> int:
                 tuple[int, ...],
                 tuple[int, ...],
                 tuple[int, ...],
+                bool,
             ]:
                 current = self.selected
                 current_snapshots = [target.snapshot for target in self.targets]
                 current_cell = self.traversal.current_cell(
-                    current, self.navigation_graph.anchor_rects[current]
+                    current,
+                    self.navigation_graph.anchor_rects[current],
+                    direction,
                 )
-                ranked_candidates = self.navigation_graph.candidates(
+                natural_candidates = self.navigation_graph.candidates(
                     current, direction, current_cell
                 )
-                natural_candidates = ranked_candidates
+                ranked_candidates = natural_candidates
+                orthogonal_step_required = bool(
+                    ranked_candidates
+                    and self.navigation_graph.requires_orthogonal_grid_step(
+                        current,
+                        direction,
+                        current_cell,
+                        ranked_candidates[0],
+                    )
+                )
                 available_candidates = self.traversal.available(
-                    current, direction, ranked_candidates
+                    current,
+                    direction,
+                    () if orthogonal_step_required else ranked_candidates,
                 )
                 return (
                     current,
@@ -5478,6 +5593,7 @@ def _run_windows(args: argparse.Namespace) -> int:
                     natural_candidates,
                     ranked_candidates,
                     available_candidates,
+                    orthogonal_step_required,
                 )
 
             (
@@ -5487,6 +5603,7 @@ def _run_windows(args: argparse.Namespace) -> int:
                 natural,
                 ranked,
                 candidates,
+                orthogonal_step_required,
             ) = load_candidates()
             first_index = candidates[0] if candidates else None
             first_rect = (
@@ -5494,17 +5611,23 @@ def _run_windows(args: argparse.Namespace) -> int:
                 if first_index is not None
                 else None
             )
-            candidate_is_natural = first_index is not None and first_index in natural
+            candidate_is_natural = bool(
+                orthogonal_step_required
+                or (first_index is not None and first_index in natural)
+            )
             process_id = window_process_id(self.hwnd)
             dirty_state = dirty_windows.state(self.hwnd, process_id)
             now = time.perf_counter()
-            suspicious_move = (
-                not candidate_is_natural
-                or move_should_refresh_dynamic_targets(
-                    snapshots[current_index].rect,
-                    first_rect,
-                    direction,
-                    self.window_rect,
+            suspicious_move = bool(
+                not orthogonal_step_required
+                and (
+                    not candidate_is_natural
+                    or move_should_refresh_dynamic_targets(
+                        snapshots[current_index].rect,
+                        first_rect,
+                        direction,
+                        self.window_rect,
+                    )
                 )
             )
             fallback_due = dynamic_refresh_fallback_due(
@@ -5572,7 +5695,11 @@ def _run_windows(args: argparse.Namespace) -> int:
                 emit_diagnostic("selected", next_index)
                 self._emit_selection()
                 return
-            emit_diagnostic("no_candidate")
+            emit_diagnostic(
+                "orthogonal_step"
+                if orthogonal_step_required
+                else "no_candidate"
+            )
 
         def _selection_payload(self) -> dict[str, Any]:
             snapshots = [target.snapshot for target in self.targets]

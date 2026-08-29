@@ -1314,6 +1314,102 @@ class SpatialNavigationTests(unittest.TestCase):
             2,
         )
 
+    def test_direction_change_recenters_the_virtual_contact_lane(self):
+        traversal = prototype.NavigationTraversal()
+        anchor = prototype.Rect(320, 35, 360, 75)
+        virtual_lane = prototype.Rect(80, 20, 120, 100)
+
+        traversal.available(0, prototype.Direction.RIGHT, (1,))
+        traversal.commit(1, virtual_lane)
+
+        self.assertEqual(
+            traversal.current_cell(1, anchor, prototype.Direction.RIGHT),
+            virtual_lane,
+        )
+        self.assertEqual(
+            traversal.current_cell(1, anchor, prototype.Direction.UP),
+            anchor,
+        )
+
+    def test_far_vertical_candidate_requires_the_available_horizontal_step(self):
+        coordinates = [
+            (43, 336, 112, 378),
+            (572, 590, 661, 680),
+            (405, 459, 454, 544),
+            (45, 414, 124, 481),
+            (313, 375, 446, 438),
+            (892, 589, 952, 656),
+            (678, 589, 747, 649),
+            (497, 161, 538, 205),
+            (384, 585, 456, 633),
+        ]
+        targets = [
+            self.target(left, top, right, bottom, str(index))
+            for index, (left, top, right, bottom) in enumerate(coordinates)
+        ]
+        graph = prototype.NavigationGraph(targets)
+
+        upper = graph.candidates(
+            5,
+            prototype.Direction.UP,
+            graph.anchor_rects[5],
+        )[0]
+        self.assertEqual(upper, 7)
+        self.assertTrue(
+            graph.requires_orthogonal_grid_step(
+                5,
+                prototype.Direction.UP,
+                graph.anchor_rects[5],
+                upper,
+            )
+        )
+        self.assertEqual(
+            graph.candidates(
+                5,
+                prototype.Direction.LEFT,
+                graph.anchor_rects[5],
+            )[0],
+            6,
+        )
+        self.assertEqual(
+            graph.candidates(
+                1,
+                prototype.Direction.UP,
+                graph.anchor_rects[1],
+            )[0],
+            7,
+        )
+        self.assertFalse(
+            graph.requires_orthogonal_grid_step(
+                1,
+                prototype.Direction.UP,
+                graph.anchor_rects[1],
+                7,
+            )
+        )
+
+    def test_far_diagonal_remains_available_without_an_orthogonal_step(self):
+        targets = [
+            self.target(400, 400, 440, 440, "current"),
+            self.target(100, 100, 140, 140, "upper left"),
+        ]
+        graph = prototype.NavigationGraph(targets)
+
+        candidate = graph.candidates(
+            0,
+            prototype.Direction.UP,
+            graph.anchor_rects[0],
+        )[0]
+        self.assertEqual(candidate, 1)
+        self.assertFalse(
+            graph.requires_orthogonal_grid_step(
+                0,
+                prototype.Direction.UP,
+                graph.anchor_rects[0],
+                candidate,
+            )
+        )
+
     def test_codex_bottom_controls_cross_full_width_rows_before_branching(self):
         targets = [
             self.target(996, 786, 1099, 823, "button mouse"),
@@ -1477,6 +1573,26 @@ class SpatialNavigationTests(unittest.TestCase):
         assert diagnostic is not None
         self.assertEqual(diagnostic.candidates, ())
         self.assertIn("保持原位", prototype.format_navigation_diagnostic(diagnostic))
+
+    def test_navigation_diagnostic_explains_required_grid_alignment(self):
+        diagnostic = prototype.build_navigation_diagnostic(
+            [
+                self.target(400, 400, 440, 440, "current"),
+                self.target(100, 100, 140, 140, "upper left"),
+            ],
+            0,
+            prototype.Direction.UP,
+            ranked_indices=(1,),
+            available_indices=(),
+            outcome="orthogonal_step",
+        )
+
+        self.assertIsNotNone(diagnostic)
+        assert diagnostic is not None
+        self.assertIn(
+            "请先横向或纵向对齐",
+            prototype.format_navigation_diagnostic(diagnostic),
+        )
 
     def test_navigation_diagnostic_marks_parent_grid_cell(self):
         targets = [
