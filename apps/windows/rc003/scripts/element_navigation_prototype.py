@@ -107,6 +107,12 @@ VERTICAL_LANE_MIN_CENTER_TOLERANCE = 16.0
 VERTICAL_LANE_MAX_CENTER_TOLERANCE = 96.0
 VERTICAL_LANE_SIZE_MULTIPLIER = 0.35
 GRID_SAFE_CELL_MAX_CHILDREN = 24
+RECTANGULAR_GRID_MIN_SHARED_EDGE = 10
+RECTANGULAR_GRID_SHARED_EDGE_RATIO = 0.18
+RECTANGULAR_GRID_BALANCE_WEIGHT = 0.08
+RECTANGULAR_GRID_DISTANT_GAP_MIN = 2400
+RECTANGULAR_GRID_DISTANT_GAP_RATIO = 3.0
+RECTANGULAR_GRID_DISTANT_EXTENT_RATIO = 4.0
 VK_RETURN = 0x0D
 VK_ESCAPE = 0x1B
 VK_PAGEUP = 0x21
@@ -1278,6 +1284,568 @@ def navigation_grid_rects(
     )
 
 
+def _union_rect(rects: Sequence[Rect]) -> Rect:
+    return Rect(
+        min(rect.left for rect in rects),
+        min(rect.top for rect in rects),
+        max(rect.right for rect in rects),
+        max(rect.bottom for rect in rects),
+    )
+
+
+def _rectangular_grid_prefers_rows(
+    indices: Sequence[int],
+    anchor_rects: Sequence[Rect],
+    bounds: Rect,
+) -> bool:
+    if len(indices) < 3:
+        return False
+    heights = sorted(max(1, anchor_rects[index].height) for index in indices)
+    median_height = heights[len(heights) // 2]
+    tolerance = max(8.0, median_height * 0.75)
+    row_centers: list[list[float]] = []
+    for center in sorted(anchor_rects[index].center_y for index in indices):
+        if not row_centers or center - row_centers[-1][-1] > tolerance:
+            row_centers.append([center])
+        else:
+            row_centers[-1].append(center)
+    repeated_rows = sum(1 for row in row_centers if len(row) >= 2)
+    widths = sorted(max(1, anchor_rects[index].width) for index in indices)
+    median_width = widths[len(widths) // 2]
+    column_tolerance = max(8.0, median_width * 0.75)
+    column_centers: list[list[float]] = []
+    for center in sorted(anchor_rects[index].center_x for index in indices):
+        if (
+            not column_centers
+            or center - column_centers[-1][-1] > column_tolerance
+        ):
+            column_centers.append([center])
+        else:
+            column_centers[-1].append(center)
+    repeated_columns = sum(
+        1 for column in column_centers if len(column) >= 2
+    )
+    has_wide_row = any(
+        anchor_rects[index].width >= bounds.width * 0.6
+        for index in indices
+    )
+    if repeated_columns >= 2 and repeated_rows < 2 and not has_wide_row:
+        return False
+    return (
+        len(row_centers) >= 2
+        and (
+            repeated_rows >= 2
+            or has_wide_row
+            or (
+                len(column_centers) == 1
+                and bounds.height >= bounds.width * 1.1
+            )
+        )
+    )
+
+
+def _rectangular_partition(
+    indices: Sequence[int],
+    bounds: Rect,
+    anchor_rects: Sequence[Rect],
+    stable_keys: Sequence[tuple[Any, ...]],
+    output: list[Optional[Rect]],
+    *,
+    preferred_axis: Optional[str] = None,
+) -> None:
+    if not indices or bounds.width <= 0 or bounds.height <= 0:
+        return
+    if len(indices) == 1:
+        output[indices[0]] = bounds
+        return
+
+    def center(index: int, axis: str) -> float:
+        rect = anchor_rects[index]
+        return rect.center_x if axis == "x" else rect.center_y
+
+    candidates: list[
+        tuple[int, float, float, str, int, int, list[int]]
+    ] = []
+    for axis in ("x", "y"):
+        start = bounds.left if axis == "x" else bounds.top
+        end = bounds.right if axis == "x" else bounds.bottom
+        if end - start < 2:
+            continue
+
+        def edge_start(index: int) -> int:
+            rect = anchor_rects[index]
+            return rect.left if axis == "x" else rect.top
+
+        def edge_end(index: int) -> int:
+            rect = anchor_rects[index]
+            return rect.right if axis == "x" else rect.bottom
+
+        # A cut through real controls creates thin, unstable bands. Prefer
+        # empty range gaps before considering center-only separation.
+        ordered = sorted(
+            indices,
+            key=lambda index: (center(index, axis), stable_keys[index]),
+        )
+        prefix_end: list[int] = []
+        maximum_end = edge_end(ordered[0])
+        for index in ordered:
+            maximum_end = max(maximum_end, edge_end(index))
+            prefix_end.append(maximum_end)
+        suffix_start = [0] * len(ordered)
+        minimum_start = edge_start(ordered[-1])
+        for offset in range(len(ordered) - 1, -1, -1):
+            minimum_start = min(minimum_start, edge_start(ordered[offset]))
+            suffix_start[offset] = minimum_start
+
+        for offset in range(1, len(ordered)):
+            before = center(ordered[offset - 1], axis)
+            after = center(ordered[offset], axis)
+            if after <= before:
+                continue
+            first_end = prefix_end[offset - 1]
+            second_start = suffix_start[offset]
+            if first_end <= second_start:
+                split = round((first_end + second_start) / 2)
+                clearance = second_start - first_end
+                overlap = 0
+            else:
+                split = round((before + after) / 2)
+                clearance = 0
+                overlap = first_end - second_start
+            split = max(start + 1, min(end - 1, split))
+            crossings = sum(
+                edge_start(index) < split < edge_end(index)
+                for index in indices
+            )
+            balance = 1.0 - abs(offset - (len(ordered) - offset)) / len(ordered)
+            gap = (after - before) / max(1, end - start)
+            priority = (
+                clearance / max(1, end - start)
+                + gap
+                + balance * RECTANGULAR_GRID_BALANCE_WEIGHT
+                + (0.015 if axis == preferred_axis else 0.0)
+            )
+            candidates.append(
+                (
+                    crossings,
+                    overlap / max(1, end - start),
+                    -priority,
+                    axis,
+                    split,
+                    offset,
+                    ordered,
+                )
+            )
+
+    if candidates:
+        _crossings, _overlap, _priority, axis, split, offset, ordered = min(
+            candidates,
+            key=lambda item: (
+                item[0],
+                item[1],
+                item[2],
+                item[3] != "y",
+                item[4],
+            ),
+        )
+    else:
+        axis = "x" if bounds.width >= bounds.height else "y"
+        start = bounds.left if axis == "x" else bounds.top
+        end = bounds.right if axis == "x" else bounds.bottom
+        if end - start < 2:
+            axis = "y" if axis == "x" else "x"
+            start = bounds.left if axis == "x" else bounds.top
+            end = bounds.right if axis == "x" else bounds.bottom
+        ordered = sorted(
+            indices,
+            key=lambda index: (center(index, axis), stable_keys[index]),
+        )
+        offset = max(1, min(len(ordered) - 1, len(ordered) // 2))
+        shared_center = center(ordered[0], axis)
+        split = max(start + 1, min(end - 1, round(shared_center)))
+
+    first_bounds = bounds
+    second_bounds = bounds
+    if axis == "x":
+        first_bounds = Rect(bounds.left, bounds.top, split, bounds.bottom)
+        second_bounds = Rect(split, bounds.top, bounds.right, bounds.bottom)
+    else:
+        first_bounds = Rect(bounds.left, bounds.top, bounds.right, split)
+        second_bounds = Rect(bounds.left, split, bounds.right, bounds.bottom)
+    _rectangular_partition(
+        ordered[:offset],
+        first_bounds,
+        anchor_rects,
+        stable_keys,
+        output,
+        preferred_axis=preferred_axis,
+    )
+    _rectangular_partition(
+        ordered[offset:],
+        second_bounds,
+        anchor_rects,
+        stable_keys,
+        output,
+        preferred_axis=preferred_axis,
+    )
+
+
+def _range_occupancy_stable_key(
+    target: TargetSnapshot, anchor_rect: Rect
+) -> tuple[Any, ...]:
+    return (
+        anchor_rect.top,
+        anchor_rect.left,
+        anchor_rect.bottom,
+        anchor_rect.right,
+        target.control_type,
+        target.name,
+        target.automation_id,
+        target.runtime_id,
+        target.path,
+    )
+
+
+def _distant_cluster_split(
+    indices: Sequence[int],
+    anchor_rects: Sequence[Rect],
+    stable_keys: Sequence[tuple[Any, ...]],
+) -> Optional[tuple[str, int, int, list[int]]]:
+    choices: list[tuple[float, str, int, int, list[int]]] = []
+    for axis in ("x", "y"):
+        ordered = sorted(
+            indices,
+            key=lambda index: (
+                anchor_rects[index].center_x
+                if axis == "x"
+                else anchor_rects[index].center_y,
+                stable_keys[index],
+            ),
+        )
+        centers = [
+            anchor_rects[index].center_x
+            if axis == "x"
+            else anchor_rects[index].center_y
+            for index in ordered
+        ]
+        gaps = [
+            (centers[offset] - centers[offset - 1], offset)
+            for offset in range(1, len(centers))
+            if centers[offset] > centers[offset - 1]
+        ]
+        if not gaps:
+            continue
+        best_gap, offset = max(gaps)
+        other_gaps = sorted(
+            (gap for gap, other_offset in gaps if other_offset != offset),
+            reverse=True,
+        )
+        comparison_gap = other_gaps[0] if other_gaps else 0.0
+        extents = sorted(
+            max(
+                1,
+                anchor_rects[index].width
+                if axis == "x"
+                else anchor_rects[index].height,
+            )
+            for index in indices
+        )
+        median_extent = extents[len(extents) // 2]
+        required_gap = max(
+            RECTANGULAR_GRID_DISTANT_GAP_MIN,
+            comparison_gap * RECTANGULAR_GRID_DISTANT_GAP_RATIO,
+            median_extent * RECTANGULAR_GRID_DISTANT_EXTENT_RATIO,
+        )
+        if best_gap < required_gap:
+            continue
+        split = round((centers[offset - 1] + centers[offset]) / 2)
+        choices.append((best_gap / required_gap, axis, split, offset, ordered))
+    if not choices:
+        return None
+    _strength, axis, split, offset, ordered = max(
+        choices,
+        key=lambda item: (item[0], item[1] == "y", -item[2]),
+    )
+    return axis, split, offset, ordered
+
+
+def _expand_partition_to_bounds(
+    indices: Sequence[int],
+    local_bounds: Rect,
+    allocated_bounds: Rect,
+    output: list[Optional[Rect]],
+) -> None:
+    if local_bounds == allocated_bounds:
+        return
+    for index in indices:
+        rect = output[index]
+        if rect is None:
+            continue
+        output[index] = Rect(
+            allocated_bounds.left if rect.left == local_bounds.left else rect.left,
+            allocated_bounds.top if rect.top == local_bounds.top else rect.top,
+            allocated_bounds.right if rect.right == local_bounds.right else rect.right,
+            allocated_bounds.bottom if rect.bottom == local_bounds.bottom else rect.bottom,
+        )
+
+
+def _partition_distant_clusters(
+    indices: Sequence[int],
+    allocated_bounds: Rect,
+    anchor_rects: Sequence[Rect],
+    stable_keys: Sequence[tuple[Any, ...]],
+    output: list[Optional[Rect]],
+) -> None:
+    split = _distant_cluster_split(indices, anchor_rects, stable_keys)
+    if split is None:
+        local_bounds = _union_rect([anchor_rects[index] for index in indices])
+        preferred_axis = (
+            "y"
+            if _rectangular_grid_prefers_rows(
+                indices, anchor_rects, local_bounds
+            )
+            else None
+        )
+        _rectangular_partition(
+            indices,
+            local_bounds,
+            anchor_rects,
+            stable_keys,
+            output,
+            preferred_axis=preferred_axis,
+        )
+        _expand_partition_to_bounds(
+            indices, local_bounds, allocated_bounds, output
+        )
+        return
+
+    axis, split_at, offset, ordered = split
+    if axis == "x":
+        split_at = max(
+            allocated_bounds.left + 1,
+            min(allocated_bounds.right - 1, split_at),
+        )
+        first_bounds = Rect(
+            allocated_bounds.left,
+            allocated_bounds.top,
+            split_at,
+            allocated_bounds.bottom,
+        )
+        second_bounds = Rect(
+            split_at,
+            allocated_bounds.top,
+            allocated_bounds.right,
+            allocated_bounds.bottom,
+        )
+    else:
+        split_at = max(
+            allocated_bounds.top + 1,
+            min(allocated_bounds.bottom - 1, split_at),
+        )
+        first_bounds = Rect(
+            allocated_bounds.left,
+            allocated_bounds.top,
+            allocated_bounds.right,
+            split_at,
+        )
+        second_bounds = Rect(
+            allocated_bounds.left,
+            split_at,
+            allocated_bounds.right,
+            allocated_bounds.bottom,
+        )
+    _partition_distant_clusters(
+        ordered[:offset],
+        first_bounds,
+        anchor_rects,
+        stable_keys,
+        output,
+    )
+    _partition_distant_clusters(
+        ordered[offset:],
+        second_bounds,
+        anchor_rects,
+        stable_keys,
+        output,
+    )
+
+
+def range_occupancy_grid_rects(
+    targets: Sequence[TargetSnapshot],
+    anchor_rects: Optional[Sequence[Rect]] = None,
+) -> tuple[Rect, ...]:
+    """Build one gapless orthogonal territory map from visible screen geometry.
+
+    UIA ancestry remains useful for recognizing actions, but it cannot move an
+    element away from its visible position. Every split therefore operates on
+    the single flat screen plane and keeps the target center inside its own
+    territory.
+    """
+
+    if not targets:
+        return ()
+    if anchor_rects is None:
+        anchor_rects = navigation_grid_rects(targets)
+    anchors = tuple(anchor_rects)
+    output: list[Optional[Rect]] = [None] * len(targets)
+    indices = list(range(len(targets)))
+    bounds = _union_rect(anchors)
+    stable_keys = tuple(
+        _range_occupancy_stable_key(target, anchors[index])
+        for index, target in enumerate(targets)
+    )
+    _partition_distant_clusters(
+        indices,
+        bounds,
+        anchors,
+        stable_keys,
+        output,
+    )
+    return tuple(
+        rect if rect is not None else anchors[index]
+        for index, rect in enumerate(output)
+    )
+
+
+def territory_contains_anchor_center(territory: Rect, anchor: Rect) -> bool:
+    return bool(
+        territory.left <= anchor.center_x <= territory.right
+        and territory.top <= anchor.center_y <= territory.bottom
+    )
+
+
+@dataclass(frozen=True)
+class NavigationContact:
+    target_index: int
+    start: int
+    end: int
+
+    @property
+    def length(self) -> int:
+        return max(0, self.end - self.start)
+
+
+def _minimum_navigation_contact(
+    first_anchor: Rect,
+    second_anchor: Rect,
+    direction: Direction,
+) -> int:
+    smaller = (
+        min(first_anchor.height, second_anchor.height)
+        if direction in {Direction.LEFT, Direction.RIGHT}
+        else min(first_anchor.width, second_anchor.width)
+    )
+    return min(
+        max(1, smaller),
+        max(
+            RECTANGULAR_GRID_MIN_SHARED_EDGE,
+            round(smaller * RECTANGULAR_GRID_SHARED_EDGE_RATIO),
+        ),
+    )
+
+
+def range_occupancy_navigation_contacts(
+    territories: Sequence[Rect],
+    anchor_rects: Sequence[Rect],
+) -> dict[tuple[int, Direction], tuple[NavigationContact, ...]]:
+    contacts: dict[tuple[int, Direction], list[NavigationContact]] = defaultdict(list)
+    for first_index, first in enumerate(territories):
+        for second_index in range(first_index + 1, len(territories)):
+            second = territories[second_index]
+            if first.right == second.left or second.right == first.left:
+                start = max(first.top, second.top)
+                end = min(first.bottom, second.bottom)
+                if end > start:
+                    if first.right == second.left:
+                        first_direction = Direction.RIGHT
+                        second_direction = Direction.LEFT
+                    else:
+                        first_direction = Direction.LEFT
+                        second_direction = Direction.RIGHT
+                    if (
+                        direction_score(
+                            anchor_rects[first_index],
+                            anchor_rects[second_index],
+                            first_direction,
+                        )
+                        is not None
+                        and end - start >= _minimum_navigation_contact(
+                        anchor_rects[first_index],
+                        anchor_rects[second_index],
+                        first_direction,
+                        )
+                    ):
+                        contacts[(first_index, first_direction)].append(
+                            NavigationContact(second_index, start, end)
+                        )
+                        contacts[(second_index, second_direction)].append(
+                            NavigationContact(first_index, start, end)
+                        )
+            if first.bottom == second.top or second.bottom == first.top:
+                start = max(first.left, second.left)
+                end = min(first.right, second.right)
+                if end > start:
+                    if first.bottom == second.top:
+                        first_direction = Direction.DOWN
+                        second_direction = Direction.UP
+                    else:
+                        first_direction = Direction.UP
+                        second_direction = Direction.DOWN
+                    if (
+                        direction_score(
+                            anchor_rects[first_index],
+                            anchor_rects[second_index],
+                            first_direction,
+                        )
+                        is not None
+                        and end - start >= _minimum_navigation_contact(
+                        anchor_rects[first_index],
+                        anchor_rects[second_index],
+                        first_direction,
+                        )
+                    ):
+                        contacts[(first_index, first_direction)].append(
+                            NavigationContact(second_index, start, end)
+                        )
+                        contacts[(second_index, second_direction)].append(
+                            NavigationContact(first_index, start, end)
+                        )
+    return {key: tuple(value) for key, value in contacts.items()}
+
+
+def _navigation_contact_rank(
+    active_rect: Rect,
+    target_rect: Rect,
+    direction: Direction,
+    contact: NavigationContact,
+) -> tuple[float, ...]:
+    if direction in {Direction.LEFT, Direction.RIGHT}:
+        active_start, active_end = active_rect.top, active_rect.bottom
+        active_center = active_rect.center_y
+        target_center = target_rect.center_y
+    else:
+        active_start, active_end = active_rect.left, active_rect.right
+        active_center = active_rect.center_x
+        target_center = target_rect.center_x
+    lane_gap = _axis_gap(active_start, active_end, contact.start, contact.end)
+    if contact.start <= active_center <= contact.end:
+        center_gap = 0.0
+    else:
+        center_gap = min(
+            abs(active_center - contact.start),
+            abs(active_center - contact.end),
+        )
+    return (
+        float(lane_gap > 0),
+        float(lane_gap),
+        center_gap,
+        abs(target_center - active_center),
+        float(target_rect.top),
+        float(target_rect.left),
+        float(contact.target_index),
+    )
+
+
 def direction_score(
     current: Rect, candidate: Rect, direction: Direction
 ) -> Optional[tuple[int, float, float, float, float, int, int]]:
@@ -1699,6 +2267,7 @@ def build_navigation_diagnostic(
     direction: Direction,
     *,
     current_rect: Optional[Rect] = None,
+    grid_rects: Optional[Sequence[Rect]] = None,
     ranked_indices: Optional[Sequence[int]] = None,
     available_indices: Sequence[int] = (),
     invalid_cached_indices: Sequence[int] = (),
@@ -1711,7 +2280,10 @@ def build_navigation_diagnostic(
 
     current = targets[current_index]
     descendants_by_target = finer_descendant_index_map(targets)
-    grid_rects = navigation_grid_rects(targets, descendants_by_target)
+    if grid_rects is None:
+        grid_rects = navigation_grid_rects(targets, descendants_by_target)
+    else:
+        grid_rects = tuple(grid_rects)
     active_rect = (
         grid_rects[current_index] if current_rect is None else current_rect
     )
@@ -1945,13 +2517,19 @@ def navigation_contact_cell(
 
 
 class NavigationGraph:
-    """Cache geometry-only candidates for one flat screen layout."""
+    """Cache one rectangular territory and its edge neighbors per target."""
 
     def __init__(self, targets: Sequence[TargetSnapshot]) -> None:
         self.targets = tuple(targets)
         self._descendants_by_target = finer_descendant_index_map(self.targets)
-        self.grid_rects = navigation_grid_rects(
+        self.anchor_rects = navigation_grid_rects(
             self.targets, self._descendants_by_target
+        )
+        self.grid_rects = range_occupancy_grid_rects(
+            self.targets, self.anchor_rects
+        )
+        self._contacts = range_occupancy_navigation_contacts(
+            self.grid_rects, self.anchor_rects
         )
         self._natural: dict[tuple[int, Direction], tuple[int, ...]] = {}
 
@@ -1961,27 +2539,40 @@ class NavigationGraph:
         direction: Direction,
         current_rect: Optional[Rect] = None,
     ) -> tuple[int, ...]:
+        if not 0 <= current_index < len(self.targets):
+            return ()
+        active_rect = (
+            self.grid_rects[current_index]
+            if current_rect is None
+            else current_rect
+        )
+        contacts = self._contacts.get((current_index, direction), ())
         if current_rect is not None and current_rect != self.grid_rects[current_index]:
             return tuple(
-                ranked_target_indices(
-                    self.targets,
-                    current_index,
-                    direction,
-                    self._descendants_by_target,
-                    self.grid_rects,
-                    current_rect,
+                contact.target_index
+                for contact in sorted(
+                    contacts,
+                    key=lambda contact: _navigation_contact_rank(
+                        active_rect,
+                        self.anchor_rects[contact.target_index],
+                        direction,
+                        contact,
+                    ),
                 )
             )
         key = (current_index, direction)
         natural = self._natural.get(key)
         if natural is None:
             natural = tuple(
-                ranked_target_indices(
-                    self.targets,
-                    current_index,
+                contact.target_index
+                for contact in sorted(
+                contacts,
+                key=lambda contact: _navigation_contact_rank(
+                    active_rect,
+                    self.anchor_rects[contact.target_index],
                     direction,
-                    self._descendants_by_target,
-                    self.grid_rects,
+                    contact,
+                ),
                 )
             )
             self._natural[key] = natural
@@ -4871,7 +5462,7 @@ def _run_windows(args: argparse.Namespace) -> int:
                 current = self.selected
                 current_snapshots = [target.snapshot for target in self.targets]
                 current_cell = self.traversal.current_cell(
-                    current, self.navigation_graph.grid_rects[current]
+                    current, self.navigation_graph.anchor_rects[current]
                 )
                 ranked_candidates = self.navigation_graph.candidates(
                     current, direction, current_cell
@@ -4936,6 +5527,7 @@ def _run_windows(args: argparse.Namespace) -> int:
                     current_index,
                     direction,
                     current_rect=current_cell,
+                    grid_rects=self.navigation_graph.grid_rects,
                     ranked_indices=ranked,
                     available_indices=candidates,
                     invalid_cached_indices=invalid_cached,

@@ -4,6 +4,7 @@ import json
 import random
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -198,9 +199,11 @@ class SpatialNavigationTests(unittest.TestCase):
         ]
         graph = prototype.NavigationGraph(targets)
 
-        self.assertEqual(
-            graph.grid_rects[0], prototype.Rect(100, 100, 450, 150)
-        )
+        body, action = graph.grid_rects
+        self.assertEqual(body.left, 100)
+        self.assertEqual(action.right, 490)
+        self.assertEqual(body.right, action.left)
+        self.assertEqual((body.top, body.bottom), (action.top, action.bottom))
         self.assertEqual(graph.candidates(0, prototype.Direction.RIGHT)[0], 1)
         self.assertEqual(graph.candidates(1, prototype.Direction.LEFT)[0], 0)
 
@@ -294,7 +297,28 @@ class SpatialNavigationTests(unittest.TestCase):
         self.assertEqual(graph.candidates(1, prototype.Direction.RIGHT)[0], 2)
         self.assertEqual(graph.candidates(0, prototype.Direction.DOWN)[0], 3)
         self.assertEqual(graph.candidates(1, prototype.Direction.DOWN)[0], 4)
-        self.assertEqual(graph.candidates(2, prototype.Direction.DOWN)[0], 7)
+        traversal = prototype.NavigationTraversal()
+        current_cell = graph.anchor_rects[2]
+        middle = graph.candidates(
+            2, prototype.Direction.DOWN, current_cell
+        )[0]
+        self.assertEqual(middle, 4)
+        current_cell = prototype.navigation_contact_cell(
+            current_cell,
+            graph.grid_rects[middle],
+            prototype.Direction.DOWN,
+        )
+        traversal.commit(middle, current_cell)
+        self.assertEqual(
+            traversal.available(
+                middle,
+                prototype.Direction.DOWN,
+                graph.candidates(
+                    middle, prototype.Direction.DOWN, current_cell
+                ),
+            )[0],
+            7,
+        )
 
     def test_missing_grid_cell_skips_within_the_same_column(self):
         targets = [
@@ -347,10 +371,28 @@ class SpatialNavigationTests(unittest.TestCase):
         ]
         graph = prototype.NavigationGraph(targets)
 
-        self.assertEqual(graph.candidates(1, prototype.Direction.DOWN)[:2], (4, 2))
-        self.assertEqual(graph.candidates(2, prototype.Direction.DOWN)[0], 4)
-        self.assertEqual(graph.candidates(4, prototype.Direction.UP)[:2], (1, 2))
-        self.assertEqual(graph.candidates(2, prototype.Direction.UP)[0], 1)
+        traversal = prototype.NavigationTraversal()
+        current_cell = graph.anchor_rects[1]
+        middle = graph.candidates(
+            1, prototype.Direction.DOWN, current_cell
+        )[0]
+        self.assertEqual(middle, 2)
+        current_cell = prototype.navigation_contact_cell(
+            current_cell,
+            graph.grid_rects[middle],
+            prototype.Direction.DOWN,
+        )
+        traversal.commit(middle, current_cell)
+        self.assertEqual(
+            traversal.available(
+                middle,
+                prototype.Direction.DOWN,
+                graph.candidates(
+                    middle, prototype.Direction.DOWN, current_cell
+                ),
+            )[0],
+            4,
+        )
 
     def test_overlapping_candidates_use_forward_center_distance(self):
         targets = [
@@ -1024,7 +1066,7 @@ class SpatialNavigationTests(unittest.TestCase):
             "斜向候选", prototype.format_navigation_diagnostic(diagnostic)
         )
 
-    def test_geometry_beats_region_membership(self):
+    def test_range_occupancy_grid_ignores_hierarchy_and_uses_spatial_order(self):
         main_section = (0, 2)
         main_rect = prototype.Rect(934, 242, 2390, 1759)
         sidebar_rect = prototype.Rect(497, 242, 934, 1759)
@@ -1071,20 +1113,21 @@ class SpatialNavigationTests(unittest.TestCase):
         self.assertEqual(graph.candidates(1, prototype.Direction.LEFT)[0], 2)
         self.assertEqual(graph.candidates(2, prototype.Direction.RIGHT)[0], 1)
 
+        ranked = graph.candidates(1, prototype.Direction.LEFT)
         diagnostic = prototype.build_navigation_diagnostic(
             targets,
             1,
             prototype.Direction.LEFT,
-            available_indices=graph.candidates(1, prototype.Direction.LEFT),
+            current_rect=graph.anchor_rects[1],
+            grid_rects=graph.grid_rects,
+            ranked_indices=ranked,
+            available_indices=ranked,
             selected_index=2,
             outcome="selected",
         )
         self.assertIsNotNone(diagnostic)
         assert diagnostic is not None
-        self.assertEqual(diagnostic.candidates[0].route, "lane")
-        self.assertIn(
-            "同一通道", prototype.format_navigation_diagnostic(diagnostic)
-        )
+        self.assertEqual(diagnostic.candidates[0].index, 2)
 
     def test_same_region_does_not_lock_out_a_much_nearer_other_pane(self):
         main_rect = prototype.Rect(480, 0, 1000, 800)
@@ -1249,7 +1292,7 @@ class SpatialNavigationTests(unittest.TestCase):
             self.target(1040, 847, 1089, 895, "scroll"),
         ]
         graph = prototype.NavigationGraph(targets)
-        current_cell = graph.grid_rects[0]
+        current_cell = graph.anchor_rects[0]
 
         input_index = graph.candidates(
             0, prototype.Direction.UP, current_cell
@@ -1260,15 +1303,18 @@ class SpatialNavigationTests(unittest.TestCase):
             graph.grid_rects[input_index],
             prototype.Direction.UP,
         )
-        self.assertEqual(input_cell, prototype.Rect(530, 952, 567, 1018))
+        self.assertEqual(
+            (input_cell.left, input_cell.right),
+            (current_cell.left, current_cell.right),
+        )
         self.assertEqual(
             graph.candidates(
                 input_index, prototype.Direction.UP, input_cell
             )[0],
-            3,
+            2,
         )
 
-    def test_codex_bottom_controls_follow_their_contacted_input_columns(self):
+    def test_codex_bottom_controls_cross_full_width_rows_before_branching(self):
         targets = [
             self.target(996, 786, 1099, 823, "button mouse"),
             self.target(1049, 849, 1088, 888, "upper branch"),
@@ -1287,7 +1333,7 @@ class SpatialNavigationTests(unittest.TestCase):
         def move_up_twice(start: int) -> tuple[int, int]:
             traversal = prototype.NavigationTraversal()
             current = start
-            current_cell = graph.grid_rects[current]
+            current_cell = graph.anchor_rects[current]
             path = []
             for _step in range(2):
                 candidates = traversal.available(
@@ -1310,8 +1356,8 @@ class SpatialNavigationTests(unittest.TestCase):
 
         self.assertEqual(move_up_twice(7), (6, 5))
         self.assertEqual(move_up_twice(8), (6, 5))
-        self.assertEqual(move_up_twice(9), (6, 2))
-        self.assertEqual(move_up_twice(10), (6, 3))
+        self.assertEqual(move_up_twice(9), (6, 5))
+        self.assertEqual(move_up_twice(10), (6, 5))
 
     def test_contact_cell_immediate_reverse_returns_to_the_previous_target(self):
         generator = random.Random(830)
@@ -1438,12 +1484,13 @@ class SpatialNavigationTests(unittest.TestCase):
             self.target(120, 200, 180, 240, "child"),
         ]
         graph = prototype.NavigationGraph(targets)
-        self.assertEqual(graph.candidates(0, prototype.Direction.DOWN)[0], 1)
-        reverse = graph.candidates(1, prototype.Direction.UP)
+        self.assertEqual(graph.candidates(0, prototype.Direction.LEFT)[0], 1)
+        reverse = graph.candidates(1, prototype.Direction.RIGHT)
         diagnostic = prototype.build_navigation_diagnostic(
             targets,
             1,
-            prototype.Direction.UP,
+            prototype.Direction.RIGHT,
+            grid_rects=graph.grid_rects,
             ranked_indices=reverse,
             available_indices=reverse,
             selected_index=0,
@@ -1486,22 +1533,442 @@ class SpatialNavigationTests(unittest.TestCase):
         ]
         child_first = prototype.NavigationGraph(targets)
         self.assertEqual(
-            child_first.candidates(1, prototype.Direction.UP), (0,)
+            child_first.candidates(1, prototype.Direction.RIGHT), (0,)
         )
         self.assertEqual(
-            child_first.candidates(0, prototype.Direction.DOWN)[0], 1
+            child_first.candidates(0, prototype.Direction.LEFT)[0], 1
         )
         self.assertEqual(
-            child_first.candidates(1, prototype.Direction.UP), (0,)
+            child_first.candidates(1, prototype.Direction.RIGHT), (0,)
         )
 
         parent_first = prototype.NavigationGraph(targets)
         self.assertEqual(
-            parent_first.candidates(0, prototype.Direction.DOWN)[0], 1
+            parent_first.candidates(0, prototype.Direction.LEFT)[0], 1
         )
         self.assertEqual(
-            parent_first.candidates(1, prototype.Direction.UP), (0,)
+            parent_first.candidates(1, prototype.Direction.RIGHT), (0,)
         )
+
+    def test_range_occupancy_grid_is_one_gapless_non_overlapping_cell_per_target(self):
+        targets = [
+            self.target(40, 30, 120, 70, "A"),
+            self.target(240, 20, 300, 80, "B"),
+            self.target(130, 120, 190, 160, "C"),
+            self.target(20, 220, 100, 280, "D"),
+            self.target(250, 210, 330, 270, "E"),
+        ]
+        graph = prototype.NavigationGraph(targets)
+        territories = graph.grid_rects
+        bounds = prototype.Rect(
+            min(rect.left for rect in territories),
+            min(rect.top for rect in territories),
+            max(rect.right for rect in territories),
+            max(rect.bottom for rect in territories),
+        )
+
+        self.assertEqual(len(territories), len(targets))
+        self.assertTrue(all(rect.width > 0 and rect.height > 0 for rect in territories))
+        self.assertTrue(
+            all(
+                prototype.territory_contains_anchor_center(territory, anchor)
+                for territory, anchor in zip(territories, graph.anchor_rects)
+            )
+        )
+        self.assertEqual(
+            sum(rect.width * rect.height for rect in territories),
+            bounds.width * bounds.height,
+        )
+        for first_index, first in enumerate(territories):
+            for second in territories[first_index + 1 :]:
+                overlap_width = min(first.right, second.right) - max(
+                    first.left, second.left
+                )
+                overlap_height = min(first.bottom, second.bottom) - max(
+                    first.top, second.top
+                )
+                self.assertFalse(overlap_width > 0 and overlap_height > 0)
+
+    def test_deep_uia_sections_cannot_move_targets_away_from_their_screen_cells(self):
+        coordinates = [
+            (554, 218, 628, 254, "file"),
+            (852, 276, 895, 319, "project"),
+            (2345, 210, 2415, 263, "close"),
+            (413, 1002, 658, 1048, "above"),
+            (413, 1049, 658, 1094, "current"),
+            (413, 1095, 658, 1141, "below"),
+            (413, 1712, 806, 1757, "eagle"),
+            (425, 1781, 713, 1819, "recent"),
+        ]
+        window = prototype.Rect(400, 200, 2420, 1820)
+        targets = [
+            self.target(
+                left,
+                top,
+                right,
+                bottom,
+                name,
+                section_path=(1, index, 0, 0, index),
+                section_rect=window,
+            )
+            for index, (left, top, right, bottom, name) in enumerate(
+                coordinates
+            )
+        ]
+        graph = prototype.NavigationGraph(targets)
+
+        self.assertTrue(
+            all(
+                prototype.territory_contains_anchor_center(territory, anchor)
+                for territory, anchor in zip(
+                    graph.grid_rects, graph.anchor_rects
+                )
+            )
+        )
+        expectations = [
+            (0, prototype.Direction.DOWN),
+            (1, prototype.Direction.LEFT),
+            (4, prototype.Direction.UP),
+            (4, prototype.Direction.DOWN),
+            (6, prototype.Direction.UP),
+            (6, prototype.Direction.DOWN),
+        ]
+        for current, direction in expectations:
+            with self.subTest(target=targets[current].name, direction=direction):
+                next_index = graph.candidates(
+                    current, direction, graph.anchor_rects[current]
+                )[0]
+                self.assertIsNotNone(
+                    prototype.direction_score(
+                        graph.anchor_rects[current],
+                        graph.anchor_rects[next_index],
+                        direction,
+                    )
+                )
+
+    def test_range_occupancy_routes_are_independent_of_target_scan_order(self):
+        generator = random.Random(832)
+        targets = [
+            self.target(
+                column * 140 + generator.randint(-8, 8),
+                row * 90 + generator.randint(-6, 6),
+                column * 140 + 90 + generator.randint(-8, 8),
+                row * 90 + 54 + generator.randint(-6, 6),
+                f"target-{row}-{column}",
+                path=(0, row, column),
+            )
+            for row in range(4)
+            for column in range(5)
+        ]
+
+        def first_neighbors(items):
+            graph = prototype.NavigationGraph(items)
+            result = {}
+            for index, target in enumerate(items):
+                result[target.name] = {
+                    direction: (
+                        items[candidates[0]].name if candidates else None
+                    )
+                    for direction in prototype.Direction
+                    for candidates in [
+                        graph.candidates(
+                            index, direction, graph.anchor_rects[index]
+                        )
+                    ]
+                }
+            return result
+
+        expected = first_neighbors(targets)
+        for _case in range(20):
+            shuffled = list(targets)
+            generator.shuffle(shuffled)
+            self.assertEqual(first_neighbors(shuffled), expected)
+
+    def test_every_navigation_edge_stays_in_the_requested_real_direction(self):
+        generator = random.Random(833)
+        for _case in range(100):
+            targets = []
+            for index in range(generator.randint(2, 35)):
+                left = generator.randint(0, 1800)
+                top = generator.randint(0, 1000)
+                width = generator.randint(24, 280)
+                height = generator.randint(20, 120)
+                targets.append(
+                    self.target(
+                        left,
+                        top,
+                        left + width,
+                        top + height,
+                        str(index),
+                        section_path=(0, generator.randint(0, 8), index),
+                    )
+                )
+            graph = prototype.NavigationGraph(targets)
+            for current in range(len(targets)):
+                for direction in prototype.Direction:
+                    for candidate in graph.candidates(
+                        current, direction, graph.anchor_rects[current]
+                    ):
+                        self.assertIsNotNone(
+                            prototype.direction_score(
+                                graph.anchor_rects[current],
+                                graph.anchor_rects[candidate],
+                                direction,
+                            )
+                        )
+
+    def test_distant_target_does_not_rewire_existing_local_routes(self):
+        targets = [
+            self.target(
+                column * 120,
+                row * 80,
+                column * 120 + 80,
+                row * 80 + 50,
+                f"{row},{column}",
+            )
+            for row in range(4)
+            for column in range(5)
+        ]
+        original = prototype.NavigationGraph(targets)
+        expanded_targets = [
+            *targets,
+            self.target(4000, 300, 4060, 360, "distant"),
+        ]
+        expanded = prototype.NavigationGraph(expanded_targets)
+
+        for current in range(len(targets)):
+            for direction in prototype.Direction:
+                expected = original.candidates(
+                    current, direction, original.anchor_rects[current]
+                )[:1]
+                actual = tuple(
+                    index
+                    for index in expanded.candidates(
+                        current, direction, expanded.anchor_rects[current]
+                    )
+                    if index < len(targets)
+                )[:1]
+                self.assertEqual(actual, expected)
+
+    def test_random_distant_target_does_not_rewire_local_routes(self):
+        generator = random.Random(834)
+        for _case in range(80):
+            targets = []
+            for index in range(generator.randint(8, 40)):
+                left = generator.randint(0, 1600)
+                top = generator.randint(0, 900)
+                width = generator.randint(25, 240)
+                height = generator.randint(20, 100)
+                targets.append(
+                    self.target(
+                        left,
+                        top,
+                        left + width,
+                        top + height,
+                        str(index),
+                        path=(index,),
+                    )
+                )
+            original = prototype.NavigationGraph(targets)
+            far_left = 6000 + generator.randint(0, 300)
+            expanded = prototype.NavigationGraph(
+                [
+                    *targets,
+                    self.target(
+                        far_left,
+                        generator.randint(0, 900),
+                        far_left + generator.randint(30, 300),
+                        generator.randint(901, 1100),
+                        "distant",
+                        path=(9999,),
+                    ),
+                ]
+            )
+
+            for current in range(len(targets)):
+                for direction in prototype.Direction:
+                    expected = original.candidates(
+                        current,
+                        direction,
+                        original.anchor_rects[current],
+                    )[:1]
+                    actual = tuple(
+                        index
+                        for index in expanded.candidates(
+                            current,
+                            direction,
+                            expanded.anchor_rects[current],
+                        )
+                        if index < len(targets)
+                    )[:1]
+                    self.assertEqual(actual, expected)
+
+    def test_two_targets_with_the_same_center_share_the_split_boundary(self):
+        targets = [
+            self.target(100, 80, 300, 160, "wide"),
+            self.target(150, 100, 250, 140, "nested"),
+        ]
+        graph = prototype.NavigationGraph(targets)
+
+        self.assertTrue(
+            all(
+                prototype.territory_contains_anchor_center(territory, anchor)
+                for territory, anchor in zip(
+                    graph.grid_rects, graph.anchor_rects
+                )
+            )
+        )
+        self.assertFalse(graph.grid_rects[0].intersects(graph.grid_rects[1]))
+
+    def test_same_visual_row_is_not_squeezed_into_thin_horizontal_bands(self):
+        coordinates = [
+            (2823, 369, 2892, 414, "minimize"),
+            (2892, 369, 2961, 414, "maximize"),
+            (2961, 369, 3030, 414, "close"),
+            (2907, 424, 2952, 469, "filter"),
+            (2964, 424, 3009, 469, "layout"),
+            (894, 426, 1218, 468, "search"),
+            (896, 482, 954, 515, "year"),
+            (954, 482, 982, 515, "month"),
+            (1151, 482, 1184, 515, "previous"),
+            (2922, 490, 2967, 535, "more"),
+            (2973, 490, 3018, 535, "close-detail"),
+            (894, 494, 940, 541, "day-1"),
+            (940, 494, 986, 541, "day-2"),
+            (987, 494, 1033, 541, "day-3"),
+            (1033, 494, 1079, 541, "day-4"),
+            (1079, 494, 1125, 541, "day-5"),
+            (1125, 494, 1171, 541, "day-6"),
+            (1172, 494, 1218, 541, "day-7"),
+            (2382, 494, 2514, 533, "adjust-date"),
+            (820, 495, 868, 543, "sidebar"),
+            (1258, 501, 2348, 615, "input"),
+        ]
+        graph = prototype.NavigationGraph(
+            [
+                self.target(left, top, right, bottom, name)
+                for left, top, right, bottom, name in coordinates
+            ]
+        )
+
+        self.assertGreaterEqual(
+            min(
+                min(territory.width, territory.height)
+                for territory in graph.grid_rects
+            ),
+            20,
+        )
+        for current, expected in zip(range(11, 17), range(12, 18)):
+            self.assertEqual(
+                graph.candidates(
+                    current,
+                    prototype.Direction.RIGHT,
+                    graph.anchor_rects[current],
+                )[0],
+                expected,
+            )
+
+    def test_outer_territory_growth_uses_real_centers_for_local_ranking(self):
+        coordinates = [
+            (-118, 124, -84, 201),
+            (1390, -280, 1542, -215),
+            (-852, 636, -675, 697),
+            (-953, 673, -846, 747),
+            (1477, 1177, 1594, 1222),
+            (-894, 121, -799, 220),
+            (-663, 528, -584, 635),
+            (1715, 36, 1758, 133),
+            (1060, 52, 1218, 124),
+            (1175, 1173, 1447, 1210),
+            (1420, 1173, 1671, 1273),
+            (-788, 460, -622, 532),
+            (647, 284, 812, 391),
+            (-1124, 884, -919, 961),
+            (284, -4, 562, 19),
+            (899, 305, 1146, 400),
+            (1238, 900, 1385, 927),
+            (-826, 620, -740, 663),
+            (-398, 727, -211, 757),
+            (46, 933, 289, 1013),
+            (641, -101, 842, -79),
+            (362, 844, 500, 954),
+        ]
+        targets = [
+            self.target(left, top, right, bottom, str(index))
+            for index, (left, top, right, bottom) in enumerate(coordinates)
+        ]
+        original = prototype.NavigationGraph(targets)
+        expanded = prototype.NavigationGraph(
+            [
+                *targets,
+                self.target(9210, -207, 9256, 1447, "distant"),
+            ]
+        )
+
+        expected = original.candidates(
+            1, prototype.Direction.DOWN, original.anchor_rects[1]
+        )[:1]
+        self.assertTrue(expected)
+        self.assertEqual(
+            expanded.candidates(
+                1, prototype.Direction.DOWN, expanded.anchor_rects[1]
+            )[:1],
+            expected,
+        )
+
+    def test_corner_and_short_edge_contacts_are_not_navigation_neighbors(self):
+        anchors = (
+            prototype.Rect(10, 10, 30, 30),
+            prototype.Rect(60, 60, 80, 80),
+        )
+        corner_contacts = prototype.range_occupancy_navigation_contacts(
+            (
+                prototype.Rect(0, 0, 50, 50),
+                prototype.Rect(50, 50, 100, 100),
+            ),
+            anchors,
+        )
+        short_edge_contacts = prototype.range_occupancy_navigation_contacts(
+            (
+                prototype.Rect(0, 0, 50, 50),
+                prototype.Rect(50, 45, 100, 95),
+            ),
+            anchors,
+        )
+
+        self.assertEqual(corner_contacts, {})
+        self.assertEqual(short_edge_contacts, {})
+
+    def test_range_occupancy_grid_build_time_stays_bounded(self):
+        generator = random.Random(831)
+
+        def build_targets(count):
+            targets = []
+            for index in range(count):
+                left = generator.randint(0, 3000)
+                top = generator.randint(0, 1800)
+                width = generator.randint(24, 280)
+                height = generator.randint(20, 110)
+                targets.append(
+                    self.target(
+                        left,
+                        top,
+                        left + width,
+                        top + height,
+                        str(index),
+                    )
+                )
+            return targets
+
+        started = time.perf_counter()
+        prototype.NavigationGraph(build_targets(99))
+        small_elapsed = time.perf_counter() - started
+        started = time.perf_counter()
+        prototype.NavigationGraph(build_targets(300))
+        large_elapsed = time.perf_counter() - started
+
+        self.assertLess(small_elapsed, 0.75)
+        self.assertLess(large_elapsed, 2.5)
 
     def test_irregular_layout_keeps_every_target_in_directional_rankings(self):
         targets = [
@@ -1599,20 +2066,48 @@ class SpatialNavigationTests(unittest.TestCase):
         )
 
     def test_window_edge_action_reaches_nearby_quicker_float_before_upper_copy(self):
+        main_section = (1,)
+        quicker_section = (2_000_000,)
         targets = [
-            self.target(2106, 1746, 2149, 1788, "加入队列"),
-            self.target(2186, 1695, 2254, 1763, "Quicker 底部"),
-            self.target(2116, 982, 2155, 1021, "复制消息"),
-            self.target(2116, 525, 2155, 564, "复制消息"),
-            self.target(2186, 1625, 2254, 1693, "Quicker 中部"),
+            self.target(
+                2106, 1746, 2149, 1788, "加入队列", section_path=main_section
+            ),
+            self.target(
+                2186,
+                1695,
+                2254,
+                1763,
+                "Quicker 底部",
+                section_path=quicker_section,
+            ),
+            self.target(
+                2116, 982, 2155, 1021, "复制消息", section_path=main_section
+            ),
+            self.target(
+                2116, 525, 2155, 564, "复制消息", section_path=main_section
+            ),
+            self.target(
+                2186,
+                1625,
+                2254,
+                1693,
+                "Quicker 中部",
+                section_path=quicker_section,
+            ),
         ]
         graph = prototype.NavigationGraph(targets)
 
         self.assertEqual(
-            graph.candidates(0, prototype.Direction.RIGHT)[0], 1
+            graph.candidates(
+                0, prototype.Direction.RIGHT, graph.anchor_rects[0]
+            )[0],
+            1,
         )
         self.assertEqual(
-            graph.candidates(1, prototype.Direction.LEFT)[0], 0
+            graph.candidates(
+                1, prototype.Direction.LEFT, graph.anchor_rects[1]
+            )[0],
+            0,
         )
 
     def test_regular_grid_is_reachable_and_reversible_in_all_directions(self):
