@@ -1341,6 +1341,27 @@ class SpatialNavigationTests(unittest.TestCase):
             anchor,
         )
 
+    def test_failed_direction_change_preserves_the_previous_contact_lane(self):
+        traversal = prototype.NavigationTraversal()
+        anchor = prototype.Rect(50, 260, 1150, 360)
+        vertical_lane = prototype.Rect(280, 260, 380, 360)
+
+        traversal.available(0, prototype.Direction.UP, (1,))
+        traversal.commit(1, vertical_lane)
+
+        self.assertEqual(
+            traversal.current_cell(1, anchor, prototype.Direction.LEFT),
+            anchor,
+        )
+        self.assertEqual(
+            traversal.available(1, prototype.Direction.LEFT, ()),
+            (),
+        )
+        self.assertEqual(
+            traversal.current_cell(1, anchor, prototype.Direction.UP),
+            vertical_lane,
+        )
+
     def test_far_vertical_candidate_requires_the_available_horizontal_step(self):
         coordinates = [
             (43, 336, 112, 378),

@@ -3913,12 +3913,13 @@ class NavigationTraversal:
         if self.active_index != current_index or self.active_rect is None:
             self.active_index = current_index
             self.active_rect = default_rect
-        elif (
+        if (
             direction is not None
-            and self.direction is not None
-            and direction != self.direction
+            and self.last_direction is not None
+            and direction != self.last_direction
         ):
-            self.active_rect = default_rect
+            # A failed turn is only a probe; keep the last committed lane.
+            return default_rect
         return self.active_rect
 
     def available(
