@@ -4776,6 +4776,111 @@ class SpatialNavigationTests(unittest.TestCase):
             )
         )
 
+    def test_text_edit_pattern_keeps_a_large_structural_editor(self):
+        editor = prototype.Rect(100, 200, 900, 460)
+
+        self.assertTrue(
+            prototype.structural_target_has_actionable_semantics(
+                "GroupControl",
+                "",
+                "",
+                editor,
+                keyboard_focusable=True,
+                has_direct_action_pattern=False,
+                has_text_edit_pattern=True,
+            )
+        )
+        self.assertFalse(
+            prototype.structural_target_has_actionable_semantics(
+                "GroupControl",
+                "",
+                "",
+                editor,
+                keyboard_focusable=True,
+                has_direct_action_pattern=False,
+                has_text_edit_pattern=False,
+            )
+        )
+        self.assertFalse(
+            prototype.structural_target_has_actionable_semantics(
+                "DocumentControl",
+                "document root",
+                "RootWebArea",
+                editor,
+                keyboard_focusable=True,
+                has_direct_action_pattern=False,
+                has_text_edit_pattern=True,
+            )
+        )
+
+    def test_msaa_window_wrapper_is_dropped_only_with_finer_targets(self):
+        window = prototype.Rect(0, 0, 1000, 800)
+        wrapper = prototype.Rect(0, 0, 1000, 800)
+        children = [
+            self.target(40, 40, 140, 90, "first"),
+            self.target(200, 120, 320, 180, "second"),
+        ]
+
+        self.assertTrue(
+            prototype.msaa_wrapper_should_be_ignored(
+                wrapper,
+                window,
+                children,
+            )
+        )
+        self.assertFalse(
+            prototype.msaa_wrapper_should_be_ignored(
+                wrapper,
+                window,
+                children[:1],
+            )
+        )
+        self.assertFalse(
+            prototype.msaa_wrapper_should_be_ignored(
+                wrapper,
+                window,
+                [],
+            )
+        )
+        self.assertFalse(
+            prototype.msaa_wrapper_should_be_ignored(
+                prototype.Rect(100, 100, 500, 400),
+                window,
+                children,
+            )
+        )
+
+    def test_runtime_scan_wires_editor_and_msaa_wrapper_rules(self):
+        tree = ast.parse(SCRIPT_PATH.read_text(encoding="utf-8"))
+        runtime_target = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "runtime_target_from_control"
+        )
+        point_hierarchy = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "point_hierarchy_targets"
+        )
+
+        self.assertTrue(
+            any(
+                isinstance(attribute, ast.Attribute)
+                and attribute.attr == "TextEditPattern"
+                for attribute in ast.walk(runtime_target)
+            )
+        )
+        self.assertTrue(
+            any(
+                isinstance(call, ast.Call)
+                and isinstance(call.func, ast.Name)
+                and call.func.id == "msaa_wrapper_should_be_ignored"
+                for call in ast.walk(point_hierarchy)
+            )
+        )
+
     def test_trusts_named_semantic_button_when_hover_hit_is_transparent(self):
         target = self.target(
             100,

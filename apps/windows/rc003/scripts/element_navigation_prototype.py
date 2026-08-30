@@ -4323,6 +4323,27 @@ def hit_target_match_index(
     return max(matches)[-1]
 
 
+def msaa_wrapper_should_be_ignored(
+    msaa_rect: Rect,
+    window_rect: Rect,
+    existing_targets: Sequence[TargetSnapshot],
+) -> bool:
+    """Ignore a window-sized legacy shell when finer UIA actions exist."""
+
+    if not existing_targets:
+        return False
+    window_area = max(1, window_rect.width * window_rect.height)
+    coverage = _rect_intersection_area(msaa_rect, window_rect) / window_area
+    if coverage < 0.85:
+        return False
+    contained_targets = sum(
+        target.rect != msaa_rect
+        and msaa_rect.contains(target.rect)
+        for target in existing_targets
+    )
+    return contained_targets >= 2
+
+
 def nested_container_keep_indices(targets: Sequence[TargetSnapshot]) -> list[int]:
     """Drop only weak UIA wrappers, preserving real parent and child actions."""
 
@@ -4447,6 +4468,36 @@ def focus_only_structural_target_is_specific(
         and structural_action_has_identity(control_type, name, automation_id)
         and rect.width <= SEMANTIC_BYPASS_MAX_WIDTH
         and rect.height <= SEMANTIC_BYPASS_MAX_HEIGHT
+    )
+
+
+def structural_target_has_actionable_semantics(
+    control_type: str,
+    name: str,
+    automation_id: str,
+    rect: Rect,
+    *,
+    keyboard_focusable: bool,
+    has_direct_action_pattern: bool,
+    has_text_edit_pattern: bool,
+) -> bool:
+    if control_type not in STRUCTURAL_CONTROL_TYPES:
+        return False
+    if keyboard_focusable and has_text_edit_pattern:
+        return True
+    if not structural_action_has_identity(control_type, name, automation_id):
+        return False
+    return bool(
+        has_direct_action_pattern
+        or (
+            keyboard_focusable
+            and focus_only_structural_target_is_specific(
+                control_type,
+                name,
+                automation_id,
+                rect,
+            )
+        )
     )
 
 
@@ -4851,10 +4902,6 @@ def _run_windows(args: argparse.Namespace) -> int:
                 return None
             name = str(control.Name or "").strip()
             automation_id = str(control.AutomationId or "").strip()
-            if structural and not structural_action_has_identity(
-                control_type, name, automation_id
-            ):
-                return None
             enabled = bool(control.IsEnabled)
             offscreen = bool(control.IsOffscreen)
             rect = (
@@ -4877,6 +4924,27 @@ def _run_windows(args: argparse.Namespace) -> int:
                 direct_action_pattern,
                 supports_expand,
             ) = action_pattern_support(control)
+            existing_structural_action = bool(
+                structural
+                and structural_target_has_actionable_semantics(
+                    control_type,
+                    name,
+                    automation_id,
+                    rect,
+                    keyboard_focusable=keyboard_focusable,
+                    has_direct_action_pattern=direct_action_pattern,
+                    has_text_edit_pattern=False,
+                )
+            )
+            has_text_edit_pattern = bool(
+                structural
+                and keyboard_focusable
+                and not existing_structural_action
+                and control_supports_pattern(
+                    control,
+                    auto.PatternId.TextEditPattern,
+                )
+            )
             actionable = (
                 standard
                 and standard_control_has_actionable_semantics(
@@ -4887,17 +4955,14 @@ def _run_windows(args: argparse.Namespace) -> int:
                 )
             ) or (
                 structural
-                and (
-                    direct_action_pattern
-                    or (
-                        keyboard_focusable
-                        and focus_only_structural_target_is_specific(
-                            control_type,
-                            name,
-                            automation_id,
-                            rect,
-                        )
-                    )
+                and structural_target_has_actionable_semantics(
+                    control_type,
+                    name,
+                    automation_id,
+                    rect,
+                    keyboard_focusable=keyboard_focusable,
+                    has_direct_action_pattern=direct_action_pattern,
+                    has_text_edit_pattern=has_text_edit_pattern,
                 )
             )
             if not actionable:
@@ -5772,8 +5837,15 @@ def _run_windows(args: argparse.Namespace) -> int:
         msaa_rect = msaa_rect_at_point(point)
         if msaa_rect is None or not msaa_rect.intersects(window_rect):
             return []
+        snapshots = [target.snapshot for target in existing_targets]
+        if msaa_wrapper_should_be_ignored(
+            msaa_rect,
+            window_rect,
+            snapshots,
+        ):
+            return []
         match = hit_target_match_index(
-            [target.snapshot for target in existing_targets], msaa_rect
+            snapshots, msaa_rect
         )
         if match >= 0:
             return [existing_targets[match]]
