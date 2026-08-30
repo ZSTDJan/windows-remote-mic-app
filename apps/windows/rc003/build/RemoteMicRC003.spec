@@ -69,14 +69,18 @@ if frida_archive_hash != frida_hid_tap_runtime.GADGET_ARCHIVE_SHA256:
         f"got {frida_archive_hash}"
     )
 
+if not REMOTE_PHOTO.is_file():
+    raise SystemExit(
+        "required 小米遥控器2 Pro photo is missing: "
+        f"{REMOTE_PHOTO}"
+    )
+
 datas = []
-if REMOTE_PHOTO.is_file():
-    # Re-verified correct for this one-dir COLLECT build (XRBM-018 RETRY 1
-    # P2 #4): this places the photo under Resources/ inside the COLLECT
-    # output, which PyInstaller's bootloader exposes at runtime as
-    # sys._MEIPASS/Resources/ - see ovb_rc003/resources.py's
-    # find_remote_photo(), which checks that path first in a frozen build.
-    datas.append((str(REMOTE_PHOTO), "Resources"))
+# This places the photo under Resources/ inside the one-dir COLLECT output,
+# which PyInstaller exposes at runtime as sys._MEIPASS/Resources/. A source
+# checkout may still degrade if a user deletes the file after startup, but a
+# frozen candidate is incomplete without the real button-layout reference.
+datas.append((str(REMOTE_PHOTO), "Resources"))
 if QML_SOURCE_DIR.is_dir():
     # XRBM-030: the settings window's entire QML source tree is made of real
     # files on disk, not a Python module - PyInstaller's Analysis never

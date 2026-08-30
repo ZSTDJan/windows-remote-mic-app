@@ -9,8 +9,11 @@ internally rather than taking a parameter, so each test temporarily
 replaces ``sys.argv`` and restores it in ``finally``.
 """
 
+import os
+import subprocess
 import sys
 import unittest
+from pathlib import Path
 
 from ovb_rc003 import __main__ as main_module
 from ovb_rc003 import (
@@ -23,6 +26,48 @@ from ovb_rc003 import (
     single_instance,
     windows_diagnostics,
 )
+
+
+class DryRunCoverageTests(unittest.TestCase):
+    def test_dry_run_imports_every_top_level_first_party_module_in_a_fresh_process(self):
+        src_root = Path(__file__).resolve().parents[1] / "src"
+        script = """
+import pkgutil
+import sys
+
+import ovb_rc003
+from ovb_rc003 import __main__ as entrypoint
+
+expected = {item.name for item in pkgutil.iter_modules(ovb_rc003.__path__)}
+entrypoint._dry_run()
+missing = sorted(
+    name for name in expected if f"ovb_rc003.{name}" not in sys.modules
+)
+if missing:
+    print("missing first-party modules: " + ", ".join(missing))
+    raise SystemExit(1)
+"""
+        env = dict(os.environ)
+        existing_pythonpath = env.get("PYTHONPATH", "")
+        env["PYTHONPATH"] = os.pathsep.join(
+            part for part in (str(src_root), existing_pythonpath) if part
+        )
+
+        result = subprocess.run(
+            [sys.executable, "-c", script],
+            cwd=src_root.parent,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+
+        self.assertEqual(
+            result.returncode,
+            0,
+            result.stdout + result.stderr,
+        )
 
 
 def _make_guard_class(*, raise_on_enter=None, enter_calls=None):
@@ -704,6 +749,7 @@ class DiagnoseBleCandidatesDispatchTests(_ArgvRestoringTestCase):
 
         self.assertNotIn("--diagnose-ble-candidates", buffer.getvalue())
         self.assertNotIn("--diagnose-vb-cable-loopback", buffer.getvalue())
+        self.assertNotIn("--preflight-output-endpoint", buffer.getvalue())
         self.assertNotIn("--on-request-probe", buffer.getvalue())
 
 
@@ -763,6 +809,66 @@ class DiagnoseVbCableLoopbackDispatchTests(_ArgvRestoringTestCase):
         source = inspect.getsource(main_module)
         self.assertIn(
             f'"{windows_diagnostics.VB_CABLE_LOOPBACK_SUBPROCESS_FLAG}" in args',
+            source,
+        )
+
+
+class OutputEndpointPreflightDispatchTests(_ArgvRestoringTestCase):
+    def setUp(self):
+        super().setUp()
+        self._original_entrypoint = (
+            windows_diagnostics.run_output_endpoint_preflight_subprocess_entrypoint
+        )
+
+    def tearDown(self):
+        windows_diagnostics.run_output_endpoint_preflight_subprocess_entrypoint = (
+            self._original_entrypoint
+        )
+        super().tearDown()
+
+    def test_dispatches_both_paths_and_propagates_exit_code(self):
+        received = []
+        windows_diagnostics.run_output_endpoint_preflight_subprocess_entrypoint = (
+            lambda request_path, result_path: received.append(
+                (request_path, result_path)
+            )
+            or 11
+        )
+        sys.argv = [
+            "ovb_rc003",
+            "--preflight-output-endpoint",
+            "/tmp/request.json",
+            "/tmp/result.json",
+        ]
+
+        with self.assertRaises(SystemExit) as ctx:
+            main_module.main()
+
+        self.assertEqual(received, [("/tmp/request.json", "/tmp/result.json")])
+        self.assertEqual(ctx.exception.code, 11)
+
+    def test_missing_paths_pass_none_through_fail_closed(self):
+        received = []
+        windows_diagnostics.run_output_endpoint_preflight_subprocess_entrypoint = (
+            lambda request_path, result_path: received.append(
+                (request_path, result_path)
+            )
+            or 1
+        )
+        sys.argv = ["ovb_rc003", "--preflight-output-endpoint"]
+
+        with self.assertRaises(SystemExit) as ctx:
+            main_module.main()
+
+        self.assertEqual(received, [(None, None)])
+        self.assertEqual(ctx.exception.code, 1)
+
+    def test_flag_literal_stays_in_sync(self):
+        import inspect
+
+        source = inspect.getsource(main_module)
+        self.assertIn(
+            f'"{windows_diagnostics.OUTPUT_ENDPOINT_PREFLIGHT_SUBPROCESS_FLAG}" in args',
             source,
         )
 

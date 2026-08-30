@@ -63,6 +63,11 @@ built from the standalone ``src/launcher.py`` entry point - see XRBM-021):
                 PortAudio blocks while opening, running, or closing a
                 stream, so settings shutdown never depends on that native
                 call returning in-process.
+- ``--preflight-output-endpoint <request-path> <result-path>``  HIDDEN
+                child-process entry point for opening one selected audio
+                endpoint. It uses the same bounded disposable-process
+                boundary, so a blocked PortAudio open/close cannot freeze
+                the settings window.
 - ``--rc003-hid-injector --pid <pid>``  HIDDEN child-process entry point for
                 the verified HID tap injector. It validates the current
                 RC003 WUDFHost target and returns a stable exit code; it never
@@ -74,7 +79,8 @@ built from the standalone ``src/launcher.py`` entry point - see XRBM-021):
 - ``--help``/``-h``  print this usage and exit 0
 
 ``--settings``, ``--bridge``, ``--dry-run``, ``--qt-runtime-check``,
-``--diagnose-ble-candidates``, ``--diagnose-vb-cable-loopback`` and
+``--diagnose-ble-candidates``, ``--diagnose-vb-cable-loopback``,
+``--preflight-output-endpoint`` and
 ``--help``/``-h`` are all checked and dispatched BEFORE the bridge branch
 below is ever reached. Settings uses its own mutex; dry-run, diagnostics and
 help touch neither settings nor bridge ownership.
@@ -133,12 +139,15 @@ def _dry_run() -> int:
         device_catalog,
         device_profile,
         dev_session,
+        doubao_rpc,
         element_navigation_control_windows,
         element_navigation_runtime,
         frida_compat,
+        frida_hid_tap_injector,
         hid_identity,
         hotkey,
         identity,
+        key_testing,
         key_mapping,
         logging_setup,
         product_identity,
@@ -306,6 +315,17 @@ def main() -> None:
         result_path = args[flag_index + 2] if flag_index + 2 < len(args) else None
         raise SystemExit(
             windows_diagnostics.run_vb_cable_loopback_subprocess_entrypoint(
+                request_path, result_path
+            )
+        )
+    if "--preflight-output-endpoint" in args:
+        from . import windows_diagnostics
+
+        flag_index = args.index("--preflight-output-endpoint")
+        request_path = args[flag_index + 1] if flag_index + 1 < len(args) else None
+        result_path = args[flag_index + 2] if flag_index + 2 < len(args) else None
+        raise SystemExit(
+            windows_diagnostics.run_output_endpoint_preflight_subprocess_entrypoint(
                 request_path, result_path
             )
         )

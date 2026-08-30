@@ -7,6 +7,10 @@ import OvbRc003Settings 1.0
 Item {
     id: root
     property var tokens
+    property var backTabTarget: null
+    property var tabTarget: null
+    readonly property var firstFocusItem: installVirtualAudioButton
+    readonly property var lastFocusItem: trySpeakingButton
     property bool voiceHotkeyRecording: false
     property string voiceHotkeyCaptureError: ""
     readonly property int settingsStateColumnWidth: 54
@@ -27,6 +31,13 @@ Item {
     readonly property bool customProgramSelected:
         SettingsController.voiceProgramCustomSelected
     readonly property bool voiceHotkeyBusy: SettingsController.voiceHotkeyBusy
+    readonly property bool endpointPreflightBusy:
+        SettingsController.endpointPreflightBusy
+    readonly property bool configurationWriteBusy:
+        DiagnosticsController.driverActionRunning
+        || DiagnosticsController.vbCableTestRunning
+        || SettingsController.bridgeLaunchBusy
+        || root.endpointPreflightBusy
     readonly property bool voiceProgramPrivilegeUnknown:
         !voiceProgramSystemManaged
         && SettingsController.voiceProgramStatusCode === "running"
@@ -156,6 +167,8 @@ Item {
     }
 
     function startVoiceHotkeyCapture() {
+        if (windowsDictationSelected)
+            return
         if (voiceHotkeyRecording) {
             stopVoiceHotkeyCapture()
             return
@@ -168,9 +181,19 @@ Item {
 
     function stopVoiceHotkeyCapture() {
         if (!voiceHotkeyRecording)
-            return
-        voiceHotkeyRecording = false
-        SettingsController.stopHotkeyCapture()
+            return true
+        if (!SettingsController.stopHotkeyCapture()) {
+            voiceHotkeyCaptureError = qsTr("无法停止快捷键录入，请重试")
+            return false
+        }
+        if (!SettingsController.hotkeyCaptureActive)
+            voiceHotkeyRecording = false
+        return true
+    }
+
+    function settleInputUiAfterStop() {
+        if (!SettingsController.hotkeyCaptureActive)
+            voiceHotkeyRecording = false
     }
 
     FileDialog {
@@ -344,13 +367,18 @@ Item {
             if (!root.voiceHotkeyRecording)
                 return
             root.voiceHotkeyCaptureError = message
-            root.stopVoiceHotkeyCapture()
+        }
+        function onHotkeyCaptureActiveChanged() {
+            if (root.voiceHotkeyRecording
+                    && !SettingsController.hotkeyCaptureActive) {
+                root.voiceHotkeyRecording = false
+            }
         }
     }
 
     Timer {
         objectName: "voiceProgramStatusRefreshTimer"
-        interval: 1500
+        interval: 5000
         repeat: true
         running: root.visible && root.voiceProgramManaged
         onTriggered: SettingsController.refreshVoiceProgramStatus()
@@ -359,6 +387,7 @@ Item {
     onVisibleChanged: {
         if (visible) {
             SettingsController.refreshVoiceProgramStatus()
+            SettingsController.refreshVoiceProgramOptions()
             SettingsController.refreshVoiceHotkeyFromProvider()
         } else {
             stopVoiceHotkeyCapture()
@@ -429,12 +458,15 @@ Item {
 
                     editorData: [
                         CompactButton {
+                            id: installVirtualAudioButton
                             objectName: "installVirtualAudioButton"
                             tokens: root.tokens
                             Layout.fillWidth: true
                             text: qsTr("安装虚拟音频")
-                            enabled: !DiagnosticsController.vbCableTestRunning
+                            enabled: !root.configurationWriteBusy
+                                && !root.voiceHotkeyBusy
                             onClicked: driverConfirmDialog.open()
+                            KeyNavigation.backtab: root.backTabTarget
                         }
                     ]
                     CompactButton {
@@ -443,8 +475,7 @@ Item {
                         Layout.fillWidth: true
                         text: qsTr("应用")
                         highlighted: true
-                        enabled: !DiagnosticsController.vbCableTestRunning
-                            && !SettingsController.bridgeLaunchBusy
+                        enabled: !root.configurationWriteBusy
                             && !root.voiceHotkeyBusy
                         onClicked: DiagnosticsController.selectDetectedCableInputAsOutput()
                     }
@@ -471,7 +502,7 @@ Item {
                             model: SettingsController.endpointOptions
                             currentIndex: SettingsController.selectedEndpointIndex
                             onActivated: SettingsController.selectAndPersistOutputEndpointIndex(index)
-                            enabled: !DiagnosticsController.vbCableTestRunning
+                            enabled: !root.configurationWriteBusy
                                 && !root.voiceHotkeyBusy
                             Accessible.name: qsTr("输出端点")
                         }
@@ -532,6 +563,7 @@ Item {
                             model: SettingsController.voiceProgramOptions
                             currentIndex: SettingsController.selectedVoiceProgramIndex
                             enabled: !root.voiceHotkeyBusy
+                                && !root.configurationWriteBusy
                             onActivated: SettingsController.selectedVoiceProgramIndex = index
                             Accessible.name: qsTr("语音程序")
                         }
@@ -548,7 +580,9 @@ Item {
                         spacing: tokens.spacingSmall
                         indicator.width: 16
                         indicator.height: 16
-                        enabled: root.voiceProgramManaged && !root.voiceHotkeyBusy
+                        enabled: root.voiceProgramManaged
+                            && !root.voiceHotkeyBusy
+                            && !root.configurationWriteBusy
                         text: qsTr("管理员启动")
                         font.family: tokens.fontFamily
                         font.pixelSize: tokens.fontSizeSmall
@@ -584,6 +618,7 @@ Item {
                             Layout.fillWidth: true
                             text: qsTr("选择")
                             enabled: !root.voiceHotkeyBusy
+                                && !root.configurationWriteBusy
                             onClicked: voiceProgramFileDialog.open()
                         }
                 }
@@ -612,6 +647,8 @@ Item {
                             Layout.fillWidth: true
                             readOnly: true
                             enabled: !root.voiceHotkeyBusy
+                                && !root.windowsDictationSelected
+                                && !root.configurationWriteBusy
                             text: root.voiceHotkeyRecording
                                 ? qsTr("请按快捷键")
                                 : SettingsController.holdVoiceHotkeyText
@@ -624,7 +661,10 @@ Item {
                                 if (!activeFocus && root.voiceHotkeyRecording)
                                     root.stopVoiceHotkeyCapture()
                             }
-                            TapHandler { onTapped: root.startVoiceHotkeyCapture() }
+                            TapHandler {
+                                enabled: !root.windowsDictationSelected
+                                onTapped: root.startVoiceHotkeyCapture()
+                            }
                         },
                         CompactButton {
                             objectName: "useWindowsDictationHotkeyButton"
@@ -633,6 +673,7 @@ Item {
                             compactMinimumWidth: tokens.buttonWidth4Chars
                             text: qsTr("Win+H")
                             enabled: !root.voiceHotkeyBusy
+                                && !root.configurationWriteBusy
                             onClicked: SettingsController.useWindowsDictationHotkey()
                         }
                     ]
@@ -711,7 +752,7 @@ Item {
                             compactMinimumWidth: tokens.buttonWidth4Chars
                             text: qsTr("启动服务")
                             highlighted: true
-                            enabled: !SettingsController.bridgeLaunchBusy
+                            enabled: !root.configurationWriteBusy
                                 && !root.voiceHotkeyBusy
                             onClicked: SettingsController.startBridge()
                         }
@@ -723,8 +764,7 @@ Item {
                         text: DiagnosticsController.vbCableTestRunning
                             ? qsTr("测试中…") : qsTr("测试通道")
                         enabled: !DiagnosticsController.isRefreshing
-                            && !DiagnosticsController.vbCableTestRunning
-                            && !SettingsController.bridgeLaunchBusy
+                            && !root.configurationWriteBusy
                             && !root.voiceHotkeyBusy
                         onClicked: SettingsController.bridgeRunning
                             ? bridgeTestConfirmDialog.open()
@@ -745,12 +785,14 @@ Item {
                     showDivider: false
 
                     CompactButton {
+                        id: trySpeakingButton
                         objectName: "trySpeakingButton"
                         tokens: root.tokens
                         Layout.fillWidth: true
                         text: qsTr("试说一句")
                         highlighted: true
                         onClicked: speakTestDialog.open()
+                        KeyNavigation.tab: root.tabTarget
                     }
                 }
             }

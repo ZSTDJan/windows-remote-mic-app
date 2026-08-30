@@ -76,11 +76,14 @@ class ProductIdentityTests(unittest.TestCase):
         qt_settings_app._apply_application_identity(FakeApplication())
         self.assertEqual(calls, [product_identity.DISPLAY_NAME])
 
+    def test_element_navigation_keeps_its_standalone_process_identity(self):
         navigation_host = (
             _RC003_ROOT / "scripts" / "element_navigation_windows_host.py"
         ).read_text(encoding="utf-8")
-        self.assertIn("from ovb_rc003 import product_identity", navigation_host)
-        self.assertIn("product_identity.DISPLAY_NAME", navigation_host)
+
+        self.assertIn('app.setApplicationName("元素导航")', navigation_host)
+        self.assertNotIn("from ovb_rc003 import product_identity", navigation_host)
+        self.assertNotIn("product_identity.DISPLAY_NAME", navigation_host)
         self.assertNotIn("Remote Mic Element Navigation", navigation_host)
 
     def test_installer_changes_only_user_visible_identity_and_cleans_old_shortcuts(self):

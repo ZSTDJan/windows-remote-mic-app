@@ -447,8 +447,8 @@ $env:PYTHONPATH = Join-Path (Get-Location) 'src'
 .\build\build-candidate.ps1
 ```
 
-如果需要恢复 Windows Raw Input 丢失的返回/音量 usages，可在构建前显式获取
-上游 Frida Gadget（不会由构建脚本自动下载）：
+源码手动运行如果需要恢复 Windows Raw Input 丢失的返回/音量 usages，可单独执行
+下面的脚本获取上游 Frida Gadget：
 
 ```powershell
 .\build\fetch-frida-gadget.ps1
@@ -456,8 +456,9 @@ $env:PYTHONPATH = Join-Path (Get-Location) 'src'
 
 该脚本会把固定版本、固定 SHA-256 的压缩资产放到被 `.gitignore` 忽略的
 `src\ovb_rc003\frida_assets`。源码运行可以不获取该资产并明确降级；
-`build-candidate.ps1`、Windows CI 和 PyInstaller 冻结入口都会要求并再次校验它，
-缺失或哈希不符时直接停止构建，避免分发一个返回键、音量键识别不完整的程序包。
+`build-candidate.ps1` 和 Windows CI 会自动执行同一个固定哈希获取脚本。直接单独运行
+PyInstaller 时则要求资产已经存在，并会再次校验；缺失或哈希不符时直接停止构建，
+避免分发一个返回键、音量键识别不完整的程序包。
 运行桥接时 tap 还会再次验证资产，定位 RC003 的 WUDFHost，并只在当前进程已有管理员
 权限时尝试注入；普通启动不会弹出提权提示，权限不足只会让 tap 不可用，不会阻止 BLE、
 Raw Input 可见按键或语音链路启动。需要 tap 时可在管理员 PowerShell 中启动：

@@ -5,7 +5,8 @@
 
     Steps: create/activate a virtual environment, install
     requirements-dev.txt, run the public-boundary scan, run the test suite
-    (gated with ``-W error::ResourceWarning``, matching the CI workflow),
+    (gated with ``-W error::ResourceWarning`` plus a complete log scan for
+    late resource leaks, matching the CI workflow),
     invoke PyInstaller against RemoteMicRC003.spec, then smoke-check
     the built executable with ``--dry-run`` and ``--qt-runtime-check``. The
     second check loads the real frozen Qt DLL chain and verifies main.qml,
@@ -93,8 +94,34 @@ try {
 
     Write-Host "-- test suite --"
     $env:PYTHONPATH = Join-Path $RC003Root "src"
-    & $venvPython -W error::ResourceWarning -m unittest discover -s tests -t . -p "test_*.py"
-    Assert-LastExitCode "python -m unittest discover"
+    $testLogPath = Join-Path ([System.IO.Path]::GetTempPath()) (
+        "remote-mic-rc003-tests-{0}.log" -f [guid]::NewGuid().ToString("N")
+    )
+    try {
+        & $venvPython -u -W error::ResourceWarning -m unittest discover -s tests -t . -p "test_*.py" -v 2>&1 |
+            Tee-Object -FilePath $testLogPath
+        $testExitCode = $LASTEXITCODE
+        if ($testExitCode -ne 0) {
+            throw "python -m unittest discover failed with exit code $testExitCode"
+        }
+
+        # Resource warnings raised during interpreter shutdown can print
+        # after unittest has already decided to exit 0. Scan the complete
+        # captured output so the local candidate gate cannot miss them.
+        $logContent = Get-Content -LiteralPath $testLogPath -Raw
+        $forbiddenPatterns = @(
+            "ResourceWarning:",
+            "unclosed event loop",
+            "unclosed <socket.socket"
+        )
+        foreach ($pattern in $forbiddenPatterns) {
+            if ($logContent -match [regex]::Escape($pattern)) {
+                throw "test log contains forbidden resource-leak pattern '$pattern'"
+            }
+        }
+    } finally {
+        Remove-Item -LiteralPath $testLogPath -Force -ErrorAction SilentlyContinue
+    }
 
     Write-Host "-- PyInstaller build (unsigned candidate) --"
     & $venvPython -m PyInstaller (Join-Path "build" "RemoteMicRC003.spec") --distpath dist --workpath build\pyinstaller-work --noconfirm

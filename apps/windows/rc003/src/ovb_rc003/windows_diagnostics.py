@@ -320,6 +320,7 @@ def check_raw_input(
 
 BLE_DIAGNOSTICS_SUBPROCESS_FLAG = "--diagnose-ble-candidates"
 VB_CABLE_LOOPBACK_SUBPROCESS_FLAG = "--diagnose-vb-cable-loopback"
+OUTPUT_ENDPOINT_PREFLIGHT_SUBPROCESS_FLAG = "--preflight-output-endpoint"
 
 # Absolute upper bound on how long the parent waits for the child to report
 # a verdict ON ITS OWN before beginning forced termination. Generous enough
@@ -362,6 +363,10 @@ VB_CABLE_LOOPBACK_PROCESS_TIMEOUT_SECONDS = 8.0
 VB_CABLE_LOOPBACK_MAX_CANCELLATION_SECONDS = (
     _SUBPROCESS_POLL_SECONDS + _SUBPROCESS_TERMINATE_WAIT_SECONDS + _SUBPROCESS_KILL_WAIT_SECONDS
 )
+OUTPUT_ENDPOINT_PREFLIGHT_PROCESS_TIMEOUT_SECONDS = 8.0
+OUTPUT_ENDPOINT_PREFLIGHT_MAX_CANCELLATION_SECONDS = (
+    _SUBPROCESS_POLL_SECONDS + _SUBPROCESS_TERMINATE_WAIT_SECONDS + _SUBPROCESS_KILL_WAIT_SECONDS
+)
 
 # Defensive ceiling on a reported ambiguous count (XRBM-035 RETRY 1 P2/D):
 # this module never trusts an unbounded or implausible number from a result
@@ -400,6 +405,14 @@ class VbCableLoopbackCancelledError(Exception):
 
 class VbCableLoopbackSubprocessShutdownUnconfirmedError(Exception):
     """The active-audio child could not be confirmed to have stopped."""
+
+
+class OutputEndpointPreflightCancelledError(Exception):
+    """The isolated output-endpoint preflight was cancelled or timed out."""
+
+
+class OutputEndpointPreflightShutdownUnconfirmedError(Exception):
+    """The endpoint-preflight child could not be confirmed to have stopped."""
 
 
 class BleDiagnosticsVerdict(Enum):
@@ -491,6 +504,34 @@ def build_vb_cable_loopback_subprocess_command(
         "-m",
         "ovb_rc003",
         VB_CABLE_LOOPBACK_SUBPROCESS_FLAG,
+        request_path,
+        result_path,
+    ]
+
+
+def build_output_endpoint_preflight_subprocess_command(
+    request_path: str,
+    result_path: str,
+    *,
+    frozen: Optional[bool] = None,
+    executable: Optional[str] = None,
+) -> List[str]:
+    """Build the hidden child command for one endpoint-open preflight."""
+
+    is_frozen = frozen if frozen is not None else bool(getattr(sys, "frozen", False))
+    exe = executable if executable is not None else sys.executable
+    if is_frozen:
+        return [
+            exe,
+            OUTPUT_ENDPOINT_PREFLIGHT_SUBPROCESS_FLAG,
+            request_path,
+            result_path,
+        ]
+    return [
+        exe,
+        "-m",
+        "ovb_rc003",
+        OUTPUT_ENDPOINT_PREFLIGHT_SUBPROCESS_FLAG,
         request_path,
         result_path,
     ]
@@ -653,6 +694,28 @@ def run_vb_cable_loopback_subprocess_entrypoint(
         "status": result.status.value,
         "detail": result.detail,
     }
+    try:
+        _write_verdict_atomically(result_path, payload)
+    except OSError:
+        return 1
+    return 0
+
+
+def run_output_endpoint_preflight_subprocess_entrypoint(
+    request_path: Optional[str], result_path: Optional[str]
+) -> int:
+    """Open/start/stop/close one endpoint inside a disposable child."""
+
+    request = _read_vb_cable_loopback_request(request_path)
+    if request is None or not result_path:
+        return 1
+
+    try:
+        audio_playback.preflight_output_endpoint(*request)
+    except Exception:  # noqa: BLE001 - sanitize at the process boundary
+        payload = {"verdict": "unavailable"}
+    else:
+        payload = {"verdict": "ok"}
     try:
         _write_verdict_atomically(result_path, payload)
     except OSError:
@@ -1033,6 +1096,88 @@ def _run_vb_cable_loopback_subprocess(
         )
 
     return _read_vb_cable_loopback_result(result_path, returncode)
+
+
+def _read_output_endpoint_preflight_result(
+    result_path: str, returncode: Optional[int]
+) -> Optional[bool]:
+    if returncode != 0:
+        return None
+    try:
+        with open(result_path, "r", encoding="utf-8") as handle:
+            text = handle.read(257)
+    except (FileNotFoundError, OSError):
+        return None
+    if not text.strip() or len(text) > 256:
+        return None
+    try:
+        parsed = json.loads(text)
+    except ValueError:
+        return None
+    if not isinstance(parsed, dict) or set(parsed) != {"verdict"}:
+        return None
+    verdict = parsed.get("verdict")
+    if verdict == "ok":
+        return True
+    if verdict == "unavailable":
+        return False
+    return None
+
+
+def _run_output_endpoint_preflight_subprocess(
+    command: Sequence[str],
+    *,
+    result_path: str,
+    cancel_event: threading.Event,
+    timeout: float,
+    poll_interval: float = _SUBPROCESS_POLL_SECONDS,
+    terminate_wait: float = _SUBPROCESS_TERMINATE_WAIT_SECONDS,
+    kill_wait: float = _SUBPROCESS_KILL_WAIT_SECONDS,
+    popen: Callable[..., "subprocess.Popen"] = subprocess.Popen,
+) -> Optional[bool]:
+    """Run one endpoint-open preflight with a process-enforced bound."""
+
+    if cancel_event.is_set():
+        raise OutputEndpointPreflightCancelledError(
+            "output endpoint preflight cancelled before it could start"
+        )
+
+    proc = popen(list(command), **_popen_kwargs())
+    deadline = time.monotonic() + timeout
+    returncode = None
+    while True:
+        try:
+            returncode = proc.poll()
+        except OSError:
+            confirmed_dead = _terminate_and_confirm_exit(
+                proc, terminate_wait=terminate_wait, kill_wait=kill_wait
+            )
+            if not confirmed_dead:
+                raise OutputEndpointPreflightShutdownUnconfirmedError(
+                    "output endpoint preflight status failed and exit was unconfirmed"
+                )
+            raise RuntimeError(
+                "output endpoint preflight status failed; child was terminated"
+            )
+        if returncode is not None:
+            break
+        if cancel_event.is_set() or time.monotonic() >= deadline:
+            break
+        time.sleep(poll_interval)
+
+    if returncode is None:
+        confirmed_dead = _terminate_and_confirm_exit(
+            proc, terminate_wait=terminate_wait, kill_wait=kill_wait
+        )
+        if not confirmed_dead:
+            raise OutputEndpointPreflightShutdownUnconfirmedError(
+                "output endpoint preflight child could not be confirmed to have exited"
+            )
+        raise OutputEndpointPreflightCancelledError(
+            "output endpoint preflight cancelled or timed out"
+        )
+
+    return _read_output_endpoint_preflight_result(result_path, returncode)
 
 
 def _vb_cable_bridge_exclusion_guard():
@@ -1553,6 +1698,87 @@ def check_vb_cable_loopback_isolated(
     return result
 
 
+def _run_output_endpoint_preflight_in_tempdir(
+    endpoint_name: str,
+    endpoint_host_api: str,
+    *,
+    cancel_event: threading.Event,
+    timeout: float,
+) -> Optional[bool]:
+    result_dir = tempfile.mkdtemp(prefix="ovb-rc003-endpoint-preflight-")
+    request_path = os.path.join(result_dir, "request.json")
+    result_path = os.path.join(result_dir, "result.json")
+    try:
+        _write_verdict_atomically(
+            request_path,
+            {
+                "saved_output_name": endpoint_name,
+                "saved_output_host_api": endpoint_host_api,
+            },
+        )
+        command = build_output_endpoint_preflight_subprocess_command(
+            request_path, result_path
+        )
+        return _run_output_endpoint_preflight_subprocess(
+            command,
+            result_path=result_path,
+            cancel_event=cancel_event,
+            timeout=timeout,
+        )
+    finally:
+        original_exc = sys.exc_info()[1]
+        try:
+            shutil.rmtree(result_dir)
+        except FileNotFoundError:
+            pass
+        except OSError as cleanup_exc:
+            if isinstance(
+                original_exc,
+                OutputEndpointPreflightShutdownUnconfirmedError,
+            ):
+                raise original_exc from cleanup_exc
+            raise
+
+
+def preflight_output_endpoint_isolated(
+    endpoint_name: str,
+    endpoint_host_api: str,
+    *,
+    cancel_event: Optional[threading.Event] = None,
+    timeout: float = OUTPUT_ENDPOINT_PREFLIGHT_PROCESS_TIMEOUT_SECONDS,
+) -> None:
+    """Verify one output endpoint without running PortAudio in this process."""
+
+    event = cancel_event if cancel_event is not None else threading.Event()
+    try:
+        result = _run_output_endpoint_preflight_in_tempdir(
+            endpoint_name,
+            endpoint_host_api,
+            cancel_event=event,
+            timeout=timeout,
+        )
+    except OutputEndpointPreflightCancelledError as exc:
+        if event.is_set():
+            raise audio_output.AudioOutputUnavailableError(
+                "output endpoint preflight was cancelled"
+            ) from exc
+        raise audio_output.AudioOutputUnavailableError(
+            "output endpoint preflight timed out"
+        ) from exc
+    except OutputEndpointPreflightShutdownUnconfirmedError as exc:
+        raise audio_output.AudioOutputUnavailableError(
+            "output endpoint preflight process did not stop"
+        ) from exc
+    except Exception as exc:  # noqa: BLE001 - sanitize the process boundary
+        raise audio_output.AudioOutputUnavailableError(
+            "output endpoint preflight failed"
+        ) from exc
+    if result is not True:
+        raise audio_output.AudioOutputUnavailableError(
+            "output endpoint is unavailable"
+        )
+
+
 # -- Output endpoint resolution (voice bridge) ------------------------------
 
 
@@ -1679,14 +1905,11 @@ def run_diagnostics(
     intended to be called from a background thread (see
     ``qt_settings_app.DiagnosticsController``), never on the Qt GUI thread.
 
-    ``cancel_event`` (XRBM-035), when given, is forwarded only to the BLE
-    candidate check's discovery call (the one real check with a native
-    async WinRT call that can run long/hang - see
-    ``_run_ble_diagnostics_subprocess()``): setting it from another thread
-    (e.g. the settings window closing) cancels an in-flight discovery
-    attempt in bounded time - via a real, OS-confirmed process termination,
-    not merely an in-process asyncio cancellation request - instead of
-    leaving it to run to completion or to an unbounded process exit.
+    ``cancel_event`` (XRBM-035), when given, is forwarded to both subprocess-
+    isolated native checks: BLE discovery and output-endpoint preflight.
+    Setting it from another thread cancels either child in bounded time via
+    confirmed process termination rather than leaving a native call alive
+    during interpreter shutdown.
 
     Every check is isolated (see ``_isolated()``): one check's unexpected
     failure can never prevent the other five from rendering their own real
@@ -1707,6 +1930,10 @@ def run_diagnostics(
     ble_discover = functools.partial(
         _discover_ble_candidates_sync, cancel_event=cancel_event
     )
+    endpoint_preflight = functools.partial(
+        preflight_output_endpoint_isolated,
+        cancel_event=cancel_event,
+    )
     check_specs = (
         ("os_version", "Windows 版本与 64 位架构", CheckGroup.ORDINARY_BUTTONS, check_os_version),
         ("raw_input", "Raw Input 按键设备", CheckGroup.ORDINARY_BUTTONS, check_raw_input),
@@ -1726,7 +1953,11 @@ def run_diagnostics(
             "output_endpoint",
             "语音输出端点",
             CheckGroup.VOICE_BRIDGE,
-            lambda: check_output_endpoint_resolution(saved_output_name, saved_output_host_api),
+            lambda: check_output_endpoint_resolution(
+                saved_output_name,
+                saved_output_host_api,
+                preflight=endpoint_preflight,
+            ),
         ),
         ("dictation", "Windows 听写 (Win+H)", CheckGroup.DICTATION, check_dictation_manual),
     )

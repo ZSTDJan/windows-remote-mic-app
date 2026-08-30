@@ -33,6 +33,7 @@ from pathlib import Path
 _RC003_ROOT = Path(__file__).resolve().parents[1]
 _REPO_ROOT = _RC003_ROOT.parents[2]
 _CI_PATH = _REPO_ROOT / ".github" / "workflows" / "windows-rc003-ci.yml"
+_BUILD_CANDIDATE_PATH = _RC003_ROOT / "build" / "build-candidate.ps1"
 
 # Mirrors $forbiddenPatterns in windows-rc003-ci.yml's "Run test suite" step
 # exactly - keep both lists in sync. "ResourceWarning:" (colon included, not
@@ -158,15 +159,25 @@ class WorkflowGateTextConsistencyTests(unittest.TestCase):
 
     def setUp(self):
         self.ci_text = _CI_PATH.read_text(encoding="utf-8")
+        self.build_text = _BUILD_CANDIDATE_PATH.read_text(encoding="utf-8")
 
-    def test_every_forbidden_pattern_appears_in_the_workflow_gate(self):
-        for pattern in _FORBIDDEN_LOG_PATTERNS:
-            self.assertIn(f'"{pattern}"', self.ci_text)
+    def test_every_forbidden_pattern_appears_in_both_delivery_gates(self):
+        for gate_text in (self.ci_text, self.build_text):
+            for pattern in _FORBIDDEN_LOG_PATTERNS:
+                self.assertIn(f'"{pattern}"', gate_text)
 
-    def test_gate_scans_captured_log_content_not_just_exit_code(self):
+    def test_ci_gate_scans_captured_log_content_not_just_exit_code(self):
         self.assertIn("Tee-Object -FilePath", self.ci_text)
         self.assertIn("Get-Content -Path $logPath -Raw", self.ci_text)
         self.assertIn("[regex]::Escape($pattern)", self.ci_text)
+
+    def test_local_build_gate_scans_captured_log_content_not_just_exit_code(self):
+        self.assertIn("Tee-Object -FilePath", self.build_text)
+        self.assertIn(
+            "Get-Content -LiteralPath $testLogPath -Raw",
+            self.build_text,
+        )
+        self.assertIn("[regex]::Escape($pattern)", self.build_text)
 
     def test_gate_runs_after_the_test_suite_but_still_fails_the_step(self):
         run_step_start = self.ci_text.index("- name: Run test suite")

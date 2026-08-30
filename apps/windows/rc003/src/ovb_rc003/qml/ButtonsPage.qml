@@ -15,6 +15,34 @@ Item {
     readonly property real mappingBoardGap: 6
     property int mappingViewIndex: 0
     property bool connectorRepaintQueued: false
+    property var backTabTarget: null
+    property var tabTarget: null
+    readonly property var firstFocusItem: singleMappingViewButton
+    readonly property var lastFocusItem: saveMappingButton
+    readonly property bool hasPendingEditorDraft:
+        actionEditor.visible && actionEditor.draftDirty
+
+    function commitPendingEditorDraft() {
+        if (!actionEditor.visible)
+            return true
+        return actionEditor.saveDraft()
+    }
+
+    function discardPendingEditorDraft() {
+        if (actionEditor.visible)
+            actionEditor.close()
+    }
+
+    function settleInputUiAfterStop() {
+        if (shortcutRecorder.visible && !SettingsController.hotkeyCaptureActive)
+            shortcutRecorder.finishClose()
+    }
+
+    function prepareForLifecyclePrompt() {
+        if (!shortcutRecorder.visible)
+            return true
+        return shortcutRecorder.requestClose()
+    }
 
     onWidthChanged: scheduleConnectorRepaint()
     onHeightChanged: scheduleConnectorRepaint()
@@ -196,33 +224,65 @@ Item {
         rightInset: 0
         topInset: 0
         bottomInset: 0
-        closePolicy: Popup.CloseOnEscape
+        closePolicy: Popup.NoAutoClose
         property string buttonId: ""
         property int rowIndex: -1
         property string trigger: "single_click"
         property string previewText: ""
         property var targetEditor: null
+        property bool pendingClose: false
+        property string pendingChord: ""
 
         function commitShortcut(chord) {
             previewText = chord
-            if (targetEditor) {
-                targetEditor.editText = chord
-                targetEditor = null
-                close()
-                return
+            pendingChord = chord
+            requestClose()
+        }
+
+        function finishClose() {
+            if (pendingChord.length > 0) {
+                if (targetEditor) {
+                    targetEditor.editText = pendingChord
+                } else {
+                    actionEditor.applyCapturedShortcut(
+                        rowIndex, trigger, pendingChord
+                    )
+                }
             }
-            actionEditor.applyCapturedShortcut(rowIndex, trigger, chord)
+            pendingChord = ""
+            pendingClose = false
             close()
         }
 
+        function requestClose() {
+            pendingClose = true
+            if (!SettingsController.hotkeyCaptureActive) {
+                finishClose()
+                return true
+            }
+            if (!SettingsController.stopHotkeyCapture()) {
+                pendingClose = false
+                previewText = qsTr("无法停止快捷键录入，请重试")
+                return false
+            }
+            if (!SettingsController.hotkeyCaptureActive)
+                finishClose()
+            return true
+        }
+
         onOpened: {
+            pendingClose = false
+            pendingChord = ""
             captureArea.forceActiveFocus()
             SettingsController.startHotkeyCapture()
         }
 
         onClosed: {
-            SettingsController.stopHotkeyCapture()
+            if (SettingsController.hotkeyCaptureActive)
+                SettingsController.stopHotkeyCapture()
             targetEditor = null
+            pendingClose = false
+            pendingChord = ""
         }
 
         background: Rectangle {
@@ -253,7 +313,7 @@ Item {
                 anchors.right: parent.right
                 anchors.rightMargin: 7
                 anchors.verticalCenter: parent.verticalCenter
-                onCloseRequested: shortcutRecorder.close()
+                onCloseRequested: shortcutRecorder.requestClose()
             }
         }
 
@@ -264,8 +324,17 @@ Item {
                     shortcutRecorder.commitShortcut(chord)
             }
             function onHotkeyCaptureError(message) {
-                if (shortcutRecorder.visible)
+                if (shortcutRecorder.visible) {
                     shortcutRecorder.previewText = message
+                    shortcutRecorder.pendingClose = false
+                }
+            }
+            function onHotkeyCaptureActiveChanged() {
+                if (shortcutRecorder.visible
+                        && shortcutRecorder.pendingClose
+                        && !SettingsController.hotkeyCaptureActive) {
+                    shortcutRecorder.finishClose()
+                }
             }
         }
 
@@ -273,6 +342,7 @@ Item {
             id: captureArea
             implicitHeight: 104
             focus: true
+            Keys.onEscapePressed: shortcutRecorder.requestClose()
 
             ColumnLayout {
                 anchors.fill: parent
@@ -470,11 +540,24 @@ Item {
         property string primaryNote: ""
         property string doubleNote: ""
         property string longNote: ""
+        property string originalPrimaryText: ""
+        property string originalDoubleText: "未设置"
+        property string originalLongText: "未设置"
+        property string originalPrimaryNote: ""
+        property string originalDoubleNote: ""
+        property string originalLongNote: ""
         property bool syncing: false
         readonly property string normalizedPrimaryText: primaryText.trim()
         readonly property bool primaryIsVoice:
             normalizedPrimaryText === "按住说话"
             || normalizedPrimaryText.indexOf("已停用：旧语音配置") === 0
+        readonly property bool draftDirty:
+            primaryText !== originalPrimaryText
+            || doubleText !== originalDoubleText
+            || longText !== originalLongText
+            || primaryNote !== originalPrimaryNote
+            || doubleNote !== originalDoubleNote
+            || longNote !== originalLongNote
 
         function openForRow(rowIndexValue, buttonIdValue, buttonNameValue,
                             primaryValue, doubleValue, longValue,
@@ -489,6 +572,12 @@ Item {
             primaryNote = primaryNoteValue
             doubleNote = doubleNoteValue
             longNote = longNoteValue
+            originalPrimaryText = primaryValue
+            originalDoubleText = doubleValue
+            originalLongText = longValue
+            originalPrimaryNote = primaryNoteValue
+            originalDoubleNote = doubleNoteValue
+            originalLongNote = longNoteValue
             primaryCombo.editText = primaryValue
             doubleCombo.editText = doubleValue
             longCombo.editText = longValue
@@ -519,7 +608,7 @@ Item {
 
         function saveDraft() {
             if (rowIndex < 0)
-                return
+                return false
             ButtonMappingModel.setActionTextAt(rowIndex, primaryText)
             ButtonMappingModel.setSecondaryActionTextAt(
                 rowIndex, "double_click", doubleText
@@ -537,6 +626,7 @@ Item {
                 rowIndex, "long_press", longNote
             )
             close()
+            return true
         }
 
         onClosed: {
@@ -794,7 +884,7 @@ Item {
                     objectName: "actionEditorSaveButton"
                     tokens: root.tokens
                     compactMinimumWidth: tokens.buttonWidth2Chars
-                    text: qsTr("保存")
+                    text: qsTr("完成")
                     highlighted: true
                     onClicked: actionEditor.saveDraft()
                 }
@@ -835,6 +925,7 @@ Item {
                         text: qsTr("单键映射")
                         highlighted: root.mappingViewIndex === 0
                         onClicked: root.mappingViewIndex = 0
+                        KeyNavigation.backtab: root.backTabTarget
                     }
                     CompactButton {
                         id: comboMappingViewButton
@@ -1426,6 +1517,11 @@ Item {
                         text: qsTr("保存映射")
                         highlighted: true
                         enabled: !SettingsController.voiceHotkeyBusy
+                            && !SettingsController.bridgeLaunchBusy
+                            && !SettingsController.endpointPreflightBusy
+                            && !DiagnosticsController.driverActionRunning
+                            && !DiagnosticsController.vbCableTestRunning
+                        KeyNavigation.tab: root.tabTarget
                         onClicked: {
                             SettingsController.saveSettings()
                             root.scheduleConnectorRepaint()

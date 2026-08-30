@@ -255,6 +255,12 @@ _diagnostics_shutdown_event = threading.Event()
 # while the synthetic signal is in flight.
 _vb_cable_test_active_event = threading.Event()
 
+# Tracks the multi-step "detect and save CABLE Input" workflow across the
+# DiagnosticsController and SettingsController. Full application exit waits
+# for this event to clear so a late enumeration/preflight result cannot race
+# Qt teardown or persist settings after exit has begun.
+_driver_action_active_event = threading.Event()
+
 # Safety margin on top of the longest diagnostics-child cancellation bound
 # below. It covers the worker thread's own small amount of Python cleanup
 # after the BLE or active-audio subprocess has been confirmed stopped.
@@ -279,15 +285,38 @@ _DIAGNOSTICS_THREAD_JOIN_TIMEOUT_SECONDS = (
         windows_diagnostics.BLE_DISCOVERY_MAX_CANCELLATION_SECONDS,
         windows_diagnostics.VB_CABLE_LOOPBACK_MAX_CANCELLATION_SECONDS
         + _VB_CABLE_BRIDGE_RECOVERY_SECONDS,
+        windows_diagnostics.OUTPUT_ENDPOINT_PREFLIGHT_MAX_CANCELLATION_SECONDS,
     )
     + _DIAGNOSTICS_THREAD_JOIN_SAFETY_MARGIN_SECONDS
 )
 
-# SettingsController's endpoint/program/hotkey workers do not own cancellable
-# child processes. Window shutdown therefore stops accepting new work and
-# results first, then gives already-running system calls one short, shared
-# grace period to finish before Qt objects are released.
-_SETTINGS_BACKGROUND_JOIN_TIMEOUT_SECONDS = 2.0
+# A cancelled input start can spend up to five seconds waiting for its native
+# hook/window to become ready, then another five seconds stopping the Raw
+# Input listener and HID tap. Endpoint preflight has its own process-level
+# cancellation bound. Derive the shared join ceiling from the longer path and
+# leave a small margin for Python cleanup before Qt objects are released.
+_INPUT_WORKER_MAX_START_SECONDS = 5.0
+_INPUT_WORKER_MAX_STOP_SECONDS = 5.0
+_SETTINGS_BACKGROUND_JOIN_SAFETY_MARGIN_SECONDS = 2.0
+_SETTINGS_BACKGROUND_JOIN_TIMEOUT_SECONDS = (
+    max(
+        _INPUT_WORKER_MAX_START_SECONDS + _INPUT_WORKER_MAX_STOP_SECONDS,
+        windows_diagnostics.OUTPUT_ENDPOINT_PREFLIGHT_MAX_CANCELLATION_SECONDS,
+    )
+    + _SETTINGS_BACKGROUND_JOIN_SAFETY_MARGIN_SECONDS
+)
+_APPLICATION_EXIT_WAIT_SAFETY_MARGIN_SECONDS = 2.0
+_APPLICATION_EXIT_WAIT_TIMEOUT_SECONDS = (
+    _SETTINGS_BACKGROUND_JOIN_TIMEOUT_SECONDS
+    + bridge_control_windows.DEFAULT_EXIT_TIMEOUT_SECONDS
+    + _APPLICATION_EXIT_WAIT_SAFETY_MARGIN_SECONDS
+)
+_APPLICATION_EXIT_SAVE_WAIT_TIMEOUT_SECONDS = (
+    windows_diagnostics.OUTPUT_ENDPOINT_PREFLIGHT_PROCESS_TIMEOUT_SECONDS
+    + windows_diagnostics.OUTPUT_ENDPOINT_PREFLIGHT_MAX_CANCELLATION_SECONDS
+    + _SETTINGS_BACKGROUND_JOIN_SAFETY_MARGIN_SECONDS
+)
+_APPLICATION_EXIT_POLL_INTERVAL_MS = 100
 
 
 @dataclass(frozen=True)
@@ -296,6 +325,40 @@ class _VbCableTestWorkflowResult:
     bridge_was_running: bool = False
     stop_error: str = ""
     restart_result: object = None
+    restart_skipped_for_exit: bool = False
+
+
+@dataclass(frozen=True)
+class _InputStartResult:
+    kind: str
+    ok: bool
+    message: str = ""
+    hotkey_capture: object = None
+    bridge_request: object = None
+    listener: object = None
+    tap: object = None
+    failures: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class _InputStopResult:
+    kind: str
+    ok: bool
+    message: str = ""
+    hotkey_capture: object = None
+    bridge_request: object = None
+    listener: object = None
+    tap: object = None
+
+
+class _AnyEvent:
+    """Read-only event view that is set when any source event is set."""
+
+    def __init__(self, *events: threading.Event) -> None:
+        self._events = events
+
+    def is_set(self) -> bool:
+        return any(event.is_set() for event in self._events)
 
 
 def _remember_diagnostics_thread(thread: "threading.Thread") -> None:
@@ -837,10 +900,13 @@ def _load_qt_classes() -> dict:
         trayStateChanged = Signal()
         applicationExitReady = Signal()
         applicationExitFailed = Signal(str)
+        windowHideReady = Signal()
+        windowHideFailed = Signal(str)
         launchStatusTextChanged = Signal()
         statusMessageChanged = Signal()
         errorMessageChanged = Signal()
         settingsDirtyChanged = Signal()
+        settingsSaveBusyChanged = Signal()
         activePageIndexChanged = Signal()
         feedbackPageIndexChanged = Signal()
         selectedButtonIdChanged = Signal()
@@ -849,6 +915,7 @@ def _load_qt_classes() -> dict:
         selectedDeviceIndexChanged = Signal()
         selectedDeviceChanged = Signal()
         selectedVoiceProgramIndexChanged = Signal()
+        voiceProgramOptionsChanged = Signal()
         voiceProgramCustomPathChanged = Signal()
         voiceProgramLaunchOnBridgeStartChanged = Signal()
         voiceProgramLaunchElevatedChanged = Signal()
@@ -857,16 +924,26 @@ def _load_qt_classes() -> dict:
         voiceProgramStatusCodeChanged = Signal()
         voiceProgramElevationStatusChanged = Signal()
         voiceHotkeyBusyChanged = Signal()
+        endpointPreflightBusyChanged = Signal()
         keyDetectionActiveChanged = Signal()
         keyDetectionTextChanged = Signal()
+        hotkeyCaptureActiveChanged = Signal()
+        inputOperationChanged = Signal()
         _rawKeyDetected = Signal(str, str)
         _hidTapDetectionStatus = Signal(str, str)
         hotkeyCaptured = Signal(str)
         hotkeyCaptureError = Signal(str)
+        inputCleanupReady = Signal()
+        inputCleanupFailed = Signal(str)
+        saveSettingsAndExitFinished = Signal(bool)
         _hotkeyCaptureResult = Signal(str)
         _endpointOptionsRefreshReady = Signal(object)
         _voiceProgramStatusRefreshReady = Signal(object)
+        _voiceProgramOptionsRefreshReady = Signal(object)
         _voiceHotkeyTaskReady = Signal(object)
+        _endpointPreflightReady = Signal(object)
+        _inputOperationReady = Signal(object)
+        _applicationExitStopReady = Signal(object)
 
         _TRIGGER_MODE_ORDER = (key_mapping.VoiceTriggerMode.HOLD,)
         _DEVICE_ORDER = (device_catalog.RC003_ID,)
@@ -900,6 +977,8 @@ def _load_qt_classes() -> dict:
             # synchronously submit the next serialized hotkey step while this
             # guard is held. Production signals are queued across threads.
             self._background_threads_lock = threading.RLock()
+            self._input_worker_result_lock = threading.Lock()
+            self._input_worker_result = None
             self._config_root = config.config_root()
             self._config = config.load_config(config.config_path(self._config_root))
             self._start_hidden = bool(start_hidden)
@@ -915,6 +994,16 @@ def _load_qt_classes() -> dict:
             self._launch_at_login = startup_state.enabled
             self._application_exit_requested = False
             self._application_exit_confirmed = False
+            self._application_exit_intent = threading.Event()
+            self._application_exit_deadline = 0.0
+            self._application_exit_poll_scheduled = False
+            self._application_exit_stop_running = False
+            self._application_exit_waiting_for_save = False
+            self._save_then_exit_requested = False
+            self._applicationExitStopReady.connect(
+                self._on_application_exit_stop_ready
+            )
+            self._window_hide_requested = False
             self._bindings = config.load_key_bindings(
                 config.key_bindings_path(self._config_root)
             )
@@ -938,31 +1027,32 @@ def _load_qt_classes() -> dict:
                     self._config.get("voice_program")
                 )
             )
-            voice_program_autostart_migrated = (
-                self._voice_program_settings.get("provider")
-                != voice_program_manager.VOICE_PROGRAM_NONE
-                and not voice_program_manager.is_system_managed_provider(
-                    self._voice_program_settings.get("provider")
-                )
-                and self._voice_program_settings.get("launch_on_bridge_start")
-                is not True
-            )
-            if voice_program_autostart_migrated:
-                self._voice_program_settings["launch_on_bridge_start"] = True
-            self._voice_program_settings_dirty = voice_program_autostart_migrated
+            self._voice_program_settings_dirty = False
             self._voice_program_status_text = ""
             self._voice_program_status_code = "unknown"
             self._voice_program_elevation_status = "unknown"
+            self._voice_program_options = voice_program_manager.provider_options()
             self._voice_program_status_refresh_running = False
             self._voice_program_status_refresh_pending = False
             self._voiceProgramStatusRefreshReady.connect(
                 self._on_voice_program_status_refresh_ready
+            )
+            self._voice_program_options_refresh_running = False
+            self._voice_program_options_refresh_pending = False
+            self._voiceProgramOptionsRefreshReady.connect(
+                self._on_voice_program_options_refresh_ready
             )
             self._voice_hotkey_busy = False
             self._voice_hotkey_task_token = 0
             self._voice_hotkey_task_completion = None
             self._voiceHotkeyTaskReady.connect(
                 self._on_voice_hotkey_task_ready
+            )
+            self._endpoint_preflight_busy = False
+            self._endpoint_preflight_token = 0
+            self._endpoint_preflight_completion = None
+            self._endpointPreflightReady.connect(
+                self._on_endpoint_preflight_ready
             )
             try:
                 self._bridge_running = single_instance.bridge_instance_running()
@@ -1018,21 +1108,15 @@ def _load_qt_classes() -> dict:
                     )
                 )
             self._has_explicit_launch_result = False
-            self._status_message = (
-                "语音程序将随桥接启动，保存后生效。"
-                if voice_program_autostart_migrated
-                else ""
-            )
+            self._status_message = ""
             self._error_message = ""
-            self._settings_dirty = bool(
-                self._removed_voice_bindings or voice_program_autostart_migrated
-            )
+            self._settings_dirty = bool(self._removed_voice_bindings)
+            self._settings_revision = 0
+            self._settings_save_busy = False
             self._active_page_index = self._DEVICE_PAGE_INDEX
             self._feedback_page_index = (
                 self._BUTTONS_PAGE_INDEX
                 if self._removed_voice_bindings
-                else self._VOICE_PAGE_INDEX
-                if voice_program_autostart_migrated
                 else self._DEVICE_PAGE_INDEX
             )
             self._selected_button_id = "ok"
@@ -1061,6 +1145,13 @@ def _load_qt_classes() -> dict:
             self._hidTapDetectionStatus.connect(self._on_hid_tap_detection_status)
             self._hotkey_capture = None
             self._hotkeyCaptureResult.connect(self._on_hotkey_capture_result)
+            self._input_operation_kind = ""
+            self._input_operation_phase = "idle"
+            self._input_operation_token = 0
+            self._input_operation_cancel_event: Optional[threading.Event] = None
+            self._input_cleanup_requested = False
+            self._pending_key_detection_stop_message = ""
+            self._inputOperationReady.connect(self._on_input_operation_ready)
 
             self._endpoint_options: List[str] = []
             self._endpoint_values: List[audio_output.AudioEndpoint] = []
@@ -1121,14 +1212,33 @@ def _load_qt_classes() -> dict:
                     self._background_threads.discard(thread)
                     raise
 
-        def _emit_background_result(self, signal, payload: object) -> None:
+        def _emit_background_result(self, signal, payload: object) -> bool:
             with self._background_threads_lock:
                 if self._background_shutdown_event.is_set():
-                    return
+                    return False
                 try:
                     signal.emit(payload)
                 except RuntimeError:
-                    pass
+                    return False
+                return True
+
+        def _record_input_worker_result(
+            self, token: int, action: str, result: object
+        ) -> None:
+            with self._input_worker_result_lock:
+                self._input_worker_result = (token, action, result)
+
+        def _take_input_worker_result(self):
+            with self._input_worker_result_lock:
+                result = self._input_worker_result
+                self._input_worker_result = None
+                return result
+
+        def _clear_input_worker_result(self, token: int, action: str) -> None:
+            with self._input_worker_result_lock:
+                current = self._input_worker_result
+                if current is not None and current[:2] == (token, action):
+                    self._input_worker_result = None
 
         def shutdownBackgroundTasks(self) -> None:
             """Stop accepting background results and bounded-wait for workers."""
@@ -1138,9 +1248,12 @@ def _load_qt_classes() -> dict:
                 threads = list(self._background_threads)
             self._endpoint_options_refresh_pending = False
             self._voice_program_status_refresh_pending = False
+            self._voice_program_options_refresh_pending = False
             self._voice_hotkey_task_token += 1
             self._voice_hotkey_task_completion = None
             self._voice_hotkey_busy = False
+            self._endpoint_preflight_token += 1
+            self._endpoint_preflight_completion = None
 
             deadline = time.monotonic() + _SETTINGS_BACKGROUND_JOIN_TIMEOUT_SECONDS
             current_thread = threading.current_thread()
@@ -1151,6 +1264,39 @@ def _load_qt_classes() -> dict:
                 if remaining <= 0:
                     break
                 thread.join(timeout=remaining)
+
+        def shutdownForProcessExit(self) -> None:
+            """Synchronously release input hooks before Qt objects disappear."""
+
+            self._application_exit_intent.set()
+            _driver_action_active_event.clear()
+            cancel_event = self._input_operation_cancel_event
+            if cancel_event is not None:
+                cancel_event.set()
+            try:
+                self.shutdownBackgroundTasks()
+            finally:
+                worker_result = self._take_input_worker_result()
+                if worker_result is not None:
+                    _token, _action, result = worker_result
+                    self._hotkey_capture = result.hotkey_capture
+                    self._key_detection_bridge_request = result.bridge_request
+                    self._key_detection_listener = result.listener
+                    self._key_detection_tap = result.tap
+                result = self._stop_input_resources(
+                    self._input_operation_kind,
+                    hotkey_capture=self._hotkey_capture,
+                    bridge_request=self._key_detection_bridge_request,
+                    listener=self._key_detection_listener,
+                    tap=self._key_detection_tap,
+                )
+                self._hotkey_capture = result.hotkey_capture
+                self._key_detection_bridge_request = result.bridge_request
+                self._key_detection_listener = result.listener
+                self._key_detection_tap = result.tap
+                self._input_operation_cancel_event = None
+                self._set_key_detection_active_state(False)
+                self._set_input_operation_state("", "idle")
 
         def _endpoint_options_payload(self, config_snapshot: dict) -> dict:
             try:
@@ -1461,6 +1607,7 @@ def _load_qt_classes() -> dict:
                 )
                 return False
             self._config = saved
+            self._bump_settings_revision()
             self._set_error_message("")
             self._set_status_message(
                 "启动与窗口设置已保存。",
@@ -1617,9 +1764,20 @@ def _load_qt_classes() -> dict:
             self._settings_dirty = value
             self.settingsDirtyChanged.emit()
 
+        def _set_settings_save_busy(self, value: bool) -> None:
+            value = bool(value)
+            if value == self._settings_save_busy:
+                return
+            self._settings_save_busy = value
+            self.settingsSaveBusyChanged.emit()
+
+        def _bump_settings_revision(self) -> None:
+            self._settings_revision += 1
+
         def _mark_settings_dirty(self) -> None:
             if self._status_message:
                 self._set_status_message("")
+            self._bump_settings_revision()
             self._set_settings_dirty(True)
 
         def _set_voice_program_settings_dirty(self, value: bool) -> None:
@@ -1635,6 +1793,71 @@ def _load_qt_classes() -> dict:
                 return
             self._voice_hotkey_busy = value
             self.voiceHotkeyBusyChanged.emit()
+
+        def _set_endpoint_preflight_busy(self, value: bool) -> None:
+            value = bool(value)
+            if value == self._endpoint_preflight_busy:
+                return
+            self._endpoint_preflight_busy = value
+            self.endpointPreflightBusyChanged.emit()
+
+        def _request_endpoint_preflight(
+            self,
+            endpoint_name: str,
+            endpoint_host_api: str,
+            completion: Callable[[bool, str], None],
+        ) -> bool:
+            if self._endpoint_preflight_busy:
+                completion(False, "另一个输出端点正在检查，请稍后重试。")
+                return False
+            self._endpoint_preflight_token += 1
+            token = self._endpoint_preflight_token
+            self._endpoint_preflight_completion = completion
+            self._set_endpoint_preflight_busy(True)
+
+            def run() -> None:
+                try:
+                    windows_diagnostics.preflight_output_endpoint_isolated(
+                        endpoint_name,
+                        endpoint_host_api,
+                        cancel_event=_AnyEvent(
+                            self._background_shutdown_event,
+                            self._application_exit_intent,
+                        ),
+                    )
+                except audio_output.AudioOutputUnavailableError:
+                    result = (False, "所选语音输出设备无法实际打开。")
+                except Exception:  # noqa: BLE001 - keep UI text sanitized
+                    result = (False, "输出端点检查失败，请稍后重试。")
+                else:
+                    result = (True, "")
+                self._emit_background_result(
+                    self._endpointPreflightReady,
+                    (token, result),
+                )
+
+            try:
+                self._start_background_task(run, "audio-endpoint-preflight")
+            except Exception:
+                self._endpoint_preflight_completion = None
+                self._set_endpoint_preflight_busy(False)
+                completion(False, "无法启动输出端点检查。")
+                return False
+            return True
+
+        def _on_endpoint_preflight_ready(self, result: object) -> None:
+            if self._background_shutdown_event.is_set():
+                return
+            token, payload = result
+            if token != self._endpoint_preflight_token:
+                return
+            completion = self._endpoint_preflight_completion
+            self._endpoint_preflight_completion = None
+            self._set_endpoint_preflight_busy(False)
+            if completion is not None:
+                ok, message = payload
+                completion(bool(ok), str(message))
+            self._schedule_application_exit_poll()
 
         def _submit_voice_hotkey_step(
             self,
@@ -1679,11 +1902,533 @@ def _load_qt_classes() -> dict:
         def _finish_voice_hotkey_operation(self) -> None:
             self._voice_hotkey_task_completion = None
             self._set_voice_hotkey_busy(False)
+            self._schedule_application_exit_poll()
 
         def _set_key_detection_text(self, text: str) -> None:
             if text != self._key_detection_text:
                 self._key_detection_text = text
                 self.keyDetectionTextChanged.emit()
+
+        def _get_hotkey_capture_active(self) -> bool:
+            return self._hotkey_capture is not None or (
+                self._input_operation_kind == "hotkey"
+                and self._input_operation_phase != "idle"
+            )
+
+        def _get_input_capture_in_use(self) -> bool:
+            return bool(
+                self._input_operation_phase != "idle"
+                or self._hotkey_capture is not None
+                or self._key_detection_bridge_request is not None
+                or self._key_detection_listener is not None
+                or self._key_detection_tap is not None
+            )
+
+        def _set_key_detection_active_state(self, value: bool) -> None:
+            value = bool(value)
+            if value == self._key_detection_active:
+                return
+            self._key_detection_active = value
+            self.keyDetectionActiveChanged.emit()
+
+        def _set_input_operation_state(self, kind: str, phase: str) -> None:
+            previous_hotkey_active = self._get_hotkey_capture_active()
+            previous_in_use = self._get_input_capture_in_use()
+            changed = (
+                kind != self._input_operation_kind
+                or phase != self._input_operation_phase
+            )
+            self._input_operation_kind = kind
+            self._input_operation_phase = phase
+            if changed or previous_in_use != self._get_input_capture_in_use():
+                self.inputOperationChanged.emit()
+            if previous_hotkey_active != self._get_hotkey_capture_active():
+                self.hotkeyCaptureActiveChanged.emit()
+
+        def _stop_input_resources(
+            self,
+            kind: str,
+            *,
+            hotkey_capture=None,
+            bridge_request=None,
+            listener=None,
+            tap=None,
+        ) -> _InputStopResult:
+            errors: List[str] = []
+            remaining_capture = hotkey_capture
+            remaining_request = bridge_request
+            remaining_listener = listener
+            remaining_tap = tap
+
+            if hotkey_capture is not None:
+                try:
+                    hotkey_capture.stop()
+                except Exception as exc:  # noqa: BLE001 - returned to Qt
+                    errors.append(f"停止真实键盘录制时出错：{exc}")
+                else:
+                    remaining_capture = None
+            if bridge_request is not None:
+                try:
+                    key_detection_bridge.cancel_detection(bridge_request)
+                except Exception as exc:  # noqa: BLE001 - returned to Qt
+                    errors.append(f"停止后台按键检测时出错：{exc}")
+                else:
+                    remaining_request = None
+            if listener is not None:
+                try:
+                    listener.stop()
+                except Exception as exc:  # noqa: BLE001 - returned to Qt
+                    errors.append(f"停止 Windows 按键通道时出错：{exc}")
+                else:
+                    remaining_listener = None
+            if tap is not None:
+                try:
+                    tap.stop()
+                except Exception as exc:  # noqa: BLE001 - returned to Qt
+                    errors.append(f"停止补充按键通道时出错：{exc}")
+                else:
+                    remaining_tap = None
+            return _InputStopResult(
+                kind=kind,
+                ok=not errors,
+                message="；".join(errors),
+                hotkey_capture=remaining_capture,
+                bridge_request=remaining_request,
+                listener=remaining_listener,
+                tap=remaining_tap,
+            )
+
+        def _start_hotkey_capture_worker(
+            self, cancel_event: threading.Event
+        ) -> _InputStartResult:
+            capture = hotkey_capture_windows.HotkeyCapture(
+                lambda chord: self._hotkeyCaptureResult.emit(chord)
+            )
+            try:
+                capture.start()
+            except Exception as exc:  # noqa: BLE001 - returned to Qt
+                if getattr(capture, "is_running", False):
+                    return _InputStartResult(
+                        "hotkey",
+                        False,
+                        f"无法启动真实键盘录制：{exc}",
+                        hotkey_capture=capture,
+                    )
+                return _InputStartResult(
+                    "hotkey",
+                    False,
+                    f"无法启动真实键盘录制：{exc}",
+                )
+            if cancel_event.is_set():
+                stopped = self._stop_input_resources(
+                    "hotkey", hotkey_capture=capture
+                )
+                return _InputStartResult(
+                    "hotkey",
+                    False,
+                    stopped.message,
+                    hotkey_capture=stopped.hotkey_capture,
+                )
+            return _InputStartResult(
+                "hotkey", True, hotkey_capture=capture
+            )
+
+        def _start_key_detection_worker(
+            self,
+            cancel_event: threading.Event,
+            *,
+            bridge_running: bool,
+            physical_bindings: dict,
+        ) -> _InputStartResult:
+            if bridge_running:
+                try:
+                    request = key_detection_bridge.request_detection(
+                        self._config_root
+                    )
+                except OSError as exc:
+                    return _InputStartResult(
+                        "key_detection",
+                        False,
+                        f"无法向后台桥接启动真实按键检测：{exc}",
+                    )
+                if cancel_event.is_set():
+                    stopped = self._stop_input_resources(
+                        "key_detection", bridge_request=request
+                    )
+                    return _InputStartResult(
+                        "key_detection",
+                        False,
+                        stopped.message,
+                        bridge_request=stopped.bridge_request,
+                    )
+                return _InputStartResult(
+                    "key_detection", True, bridge_request=request
+                )
+
+            listener = None
+            tap = None
+            failures: List[str] = []
+            try:
+                paths = raw_input_windows.enumerate_matching_device_paths()
+                device_path = (
+                    raw_input_windows.hid_identity.select_single_device_path(paths)
+                )
+                listener = raw_input_windows.RawInputButtonListener(
+                    lambda *_: None,
+                    self._on_raw_input_event,
+                )
+                set_physical_bindings = getattr(
+                    listener, "set_physical_bindings", None
+                )
+                if callable(set_physical_bindings):
+                    set_physical_bindings(physical_bindings)
+                listener.start(device_path)
+            except Exception:  # noqa: BLE001 - keep user text stable
+                failures.append("Windows 按键通道启动失败")
+                if listener is not None:
+                    stopped = self._stop_input_resources(
+                        "key_detection", listener=listener
+                    )
+                    listener = stopped.listener
+                    if listener is not None:
+                        return _InputStartResult(
+                            "key_detection",
+                            False,
+                            stopped.message,
+                            listener=listener,
+                        )
+
+            tap = frida_compat.RC003HidReportTap(
+                self._on_key_detection_hid_report,
+                status_handler=self._on_key_detection_tap_status,
+            )
+            try:
+                if not tap.start():
+                    failures.append("补充按键通道启动失败")
+                    tap = None
+            except Exception:  # noqa: BLE001 - keep user text stable
+                failures.append("补充按键通道启动失败")
+                stopped = self._stop_input_resources(
+                    "key_detection", listener=listener, tap=tap
+                )
+                if stopped.listener is not None or stopped.tap is not None:
+                    return _InputStartResult(
+                        "key_detection",
+                        False,
+                        stopped.message,
+                        listener=stopped.listener,
+                        tap=stopped.tap,
+                    )
+                listener = None
+                tap = None
+
+            if cancel_event.is_set():
+                stopped = self._stop_input_resources(
+                    "key_detection", listener=listener, tap=tap
+                )
+                return _InputStartResult(
+                    "key_detection",
+                    False,
+                    stopped.message,
+                    listener=stopped.listener,
+                    tap=stopped.tap,
+                )
+            if listener is None and tap is None:
+                return _InputStartResult(
+                    "key_detection",
+                    False,
+                    "无法启动真实按键检测：" + "；".join(failures),
+                    failures=tuple(failures),
+                )
+            return _InputStartResult(
+                "key_detection",
+                True,
+                listener=listener,
+                tap=tap,
+                failures=tuple(failures),
+            )
+
+        def _begin_input_operation_start(
+            self,
+            kind: str,
+            worker: Callable[[threading.Event], _InputStartResult],
+        ) -> bool:
+            if self._application_exit_requested or self._window_hide_requested:
+                return False
+            if self._get_input_capture_in_use():
+                message = "另一项按键输入操作正在进行，请先结束。"
+                if kind == "hotkey":
+                    self.hotkeyCaptureError.emit(message)
+                else:
+                    self._set_key_detection_text(message)
+                return False
+            self._input_operation_token += 1
+            token = self._input_operation_token
+            self._take_input_worker_result()
+            cancel_event = threading.Event()
+            self._input_operation_cancel_event = cancel_event
+            self._set_input_operation_state(kind, "starting")
+
+            def run() -> None:
+                try:
+                    result = worker(cancel_event)
+                except Exception as exc:  # noqa: BLE001 - marshal to Qt
+                    result = _InputStartResult(
+                        kind,
+                        False,
+                        f"按键输入操作启动失败：{type(exc).__name__}",
+                    )
+                self._record_input_worker_result(token, "start", result)
+                self._emit_background_result(
+                    self._inputOperationReady,
+                    (token, "start", result),
+                )
+
+            try:
+                self._start_background_task(run, f"{kind}-start")
+            except Exception as exc:
+                self._input_operation_cancel_event = None
+                self._set_input_operation_state("", "idle")
+                message = f"无法启动按键输入后台任务：{exc}"
+                if kind == "hotkey":
+                    self.hotkeyCaptureError.emit(message)
+                else:
+                    self._set_key_detection_text(message)
+                return False
+            return True
+
+        def _request_input_stop(
+            self,
+            *,
+            kind: str = "",
+            key_detection_success_message: str = "",
+        ) -> bool:
+            if key_detection_success_message:
+                self._pending_key_detection_stop_message = (
+                    key_detection_success_message
+                )
+            if self._input_operation_phase == "starting":
+                if kind and kind != self._input_operation_kind:
+                    return False
+                cancel_event = self._input_operation_cancel_event
+                if cancel_event is not None:
+                    cancel_event.set()
+                return True
+            if self._input_operation_phase == "stopping":
+                return not kind or kind == self._input_operation_kind
+
+            active_kind = self._input_operation_kind
+            if not active_kind:
+                if self._hotkey_capture is not None:
+                    active_kind = "hotkey"
+                elif (
+                    self._key_detection_bridge_request is not None
+                    or self._key_detection_listener is not None
+                    or self._key_detection_tap is not None
+                ):
+                    active_kind = "key_detection"
+            if kind and active_kind and kind != active_kind:
+                return False
+            if not active_kind:
+                self._set_key_detection_active_state(False)
+                self._set_input_operation_state("", "idle")
+                self._after_input_operation_change()
+                return True
+
+            self._input_operation_token += 1
+            token = self._input_operation_token
+            self._take_input_worker_result()
+            self._set_input_operation_state(active_kind, "stopping")
+            capture = self._hotkey_capture
+            bridge_request = self._key_detection_bridge_request
+            listener = self._key_detection_listener
+            tap = self._key_detection_tap
+            self._hotkey_capture = None
+            self._key_detection_bridge_request = None
+            self._key_detection_listener = None
+            self._key_detection_tap = None
+
+            def run() -> None:
+                result = self._stop_input_resources(
+                    active_kind,
+                    hotkey_capture=capture,
+                    bridge_request=bridge_request,
+                    listener=listener,
+                    tap=tap,
+                )
+                self._record_input_worker_result(token, "stop", result)
+                self._emit_background_result(
+                    self._inputOperationReady,
+                    (token, "stop", result),
+                )
+
+            try:
+                self._start_background_task(run, f"{active_kind}-stop")
+            except Exception as exc:
+                self._hotkey_capture = capture
+                self._key_detection_bridge_request = bridge_request
+                self._key_detection_listener = listener
+                self._key_detection_tap = tap
+                self._set_input_operation_state(active_kind, "active")
+                message = f"无法启动按键输入停止任务：{exc}"
+                if active_kind == "hotkey":
+                    self.hotkeyCaptureError.emit(message)
+                else:
+                    self._set_key_detection_text(message)
+                self._fail_pending_input_cleanup(message)
+                return False
+            return True
+
+        def _on_input_operation_ready(self, payload: object) -> None:
+            if self._background_shutdown_event.is_set():
+                return
+            token, action, result = payload
+            if token != self._input_operation_token:
+                return
+            self._clear_input_worker_result(token, action)
+            self._input_operation_cancel_event = None
+            if action == "start":
+                self._hotkey_capture = result.hotkey_capture
+                self._key_detection_bridge_request = result.bridge_request
+                self._key_detection_listener = result.listener
+                self._key_detection_tap = result.tap
+                has_resource = bool(
+                    result.hotkey_capture is not None
+                    or result.bridge_request is not None
+                    or result.listener is not None
+                    or result.tap is not None
+                )
+                if result.ok or has_resource:
+                    self._set_input_operation_state(result.kind, "active")
+                else:
+                    self._set_input_operation_state("", "idle")
+                if result.kind == "hotkey":
+                    if result.message:
+                        self.hotkeyCaptureError.emit(result.message)
+                else:
+                    self._set_key_detection_active_state(has_resource)
+                    if result.ok:
+                        self._key_detection_tap_usages.clear()
+                        self._key_detection_started_at = time.monotonic()
+                        if result.bridge_request is not None:
+                            message = (
+                                "后台服务等待按键；请按一次，首次连接可能约 1 分钟，"
+                                "检测时不执行映射"
+                            )
+                        elif result.listener is not None and result.tap is not None:
+                            message = (
+                                "Windows 按键通道已启动；常规按键可立即检测，"
+                                "返回键、音量键请等待补充通道连接（约 1 分钟）"
+                            )
+                        elif result.tap is not None:
+                            message = (
+                                "补充按键通道连接中；连接后请按要检测的按键"
+                                "（约 1 分钟）"
+                            )
+                        else:
+                            message = (
+                                "只能检测 Windows 可识别按键；"
+                                "返回键、音量键可能测不到"
+                            )
+                        limited = (
+                            f"；受限：{'；'.join(result.failures)}"
+                            if result.failures else ""
+                        )
+                        self._set_key_detection_text(
+                            f"{message}；检测时不执行映射{limited}"
+                        )
+                    elif result.message:
+                        self._set_key_detection_text(result.message)
+                if (
+                    self._window_hide_requested
+                    or self._application_exit_requested
+                    or self._input_cleanup_requested
+                ) and self._get_input_capture_in_use():
+                    self._request_input_stop()
+                else:
+                    self._after_input_operation_change()
+                return
+
+            self._hotkey_capture = result.hotkey_capture
+            self._key_detection_bridge_request = result.bridge_request
+            self._key_detection_listener = result.listener
+            self._key_detection_tap = result.tap
+            has_resource = bool(
+                result.hotkey_capture is not None
+                or result.bridge_request is not None
+                or result.listener is not None
+                or result.tap is not None
+            )
+            if has_resource:
+                self._set_input_operation_state(result.kind, "active")
+            else:
+                self._set_input_operation_state("", "idle")
+            if result.kind == "key_detection":
+                self._set_key_detection_active_state(has_resource)
+                if not has_resource and self._pending_key_detection_stop_message:
+                    self._set_key_detection_text(
+                        self._pending_key_detection_stop_message
+                    )
+                self._pending_key_detection_stop_message = ""
+            if result.message:
+                if result.kind == "hotkey":
+                    self.hotkeyCaptureError.emit(result.message)
+                else:
+                    self._set_key_detection_text(result.message)
+                self._fail_pending_input_cleanup(result.message)
+                return
+            self._after_input_operation_change()
+
+        def _fail_pending_input_cleanup(self, message: str) -> None:
+            if self._input_cleanup_requested:
+                self._input_cleanup_requested = False
+                self.inputCleanupFailed.emit(message)
+            if self._window_hide_requested:
+                self._window_hide_requested = False
+                self.windowHideFailed.emit(message)
+            if self._application_exit_requested:
+                self._fail_application_exit(message)
+
+        def _after_input_operation_change(self) -> None:
+            if self._input_cleanup_requested and not self._get_input_capture_in_use():
+                self._input_cleanup_requested = False
+                self.inputCleanupReady.emit()
+            if self._window_hide_requested and not self._get_input_capture_in_use():
+                self._window_hide_requested = False
+                self.windowHideReady.emit()
+            self._schedule_application_exit_poll()
+
+        @Slot()
+        def prepareForWindowHide(self) -> None:
+            if self._window_hide_requested:
+                return
+            if not self._get_input_capture_in_use():
+                self.windowHideReady.emit()
+                return
+            self._window_hide_requested = True
+            if not self._request_input_stop():
+                self._window_hide_requested = False
+                self.windowHideFailed.emit(
+                    "无法停止正在进行的按键录入或检测。"
+                )
+
+        @Slot(result=bool)
+        def stopInputCapture(self) -> bool:
+            """Stop any active input operation before navigation or prompts."""
+
+            if self._input_cleanup_requested:
+                return True
+            if not self._get_input_capture_in_use():
+                self.inputCleanupReady.emit()
+                return True
+            self._input_cleanup_requested = True
+            if self._request_input_stop():
+                return True
+            self._input_cleanup_requested = False
+            self.inputCleanupFailed.emit(
+                "无法停止正在进行的按键录入或检测。"
+            )
+            return False
 
         def _voice_program_status_payload(
             self, settings: dict
@@ -1771,6 +2516,59 @@ def _load_qt_classes() -> dict:
         def _schedule_voice_program_status_refresh(self) -> None:
             QTimer.singleShot(0, self._request_voice_program_status_refresh)
 
+        def _voice_program_options_payload(self, settings_snapshot: dict) -> List[str]:
+            options = voice_program_manager.provider_options()
+            for provider_id in (
+                voice_program_manager.VOICE_PROGRAM_SOGOU,
+                voice_program_manager.VOICE_PROGRAM_WETYPE,
+            ):
+                candidate = dict(settings_snapshot)
+                candidate["provider"] = provider_id
+                try:
+                    status = voice_program_manager.inspect_voice_program(candidate)
+                except Exception:  # noqa: BLE001 - leave the stable name intact
+                    continue
+                if status.code != "not_found":
+                    continue
+                index = voice_program_manager.provider_index(provider_id)
+                options[index] += "（未安装）"
+            return options
+
+        def _request_voice_program_options_refresh(self) -> None:
+            if self._voice_program_options_refresh_running:
+                self._voice_program_options_refresh_pending = True
+                return
+            settings_snapshot = dict(self._voice_program_settings)
+            self._voice_program_options_refresh_running = True
+
+            def run() -> None:
+                payload = self._voice_program_options_payload(settings_snapshot)
+                self._emit_background_result(
+                    self._voiceProgramOptionsRefreshReady,
+                    payload,
+                )
+
+            try:
+                self._start_background_task(
+                    run,
+                    "voice-program-options-refresh",
+                )
+            except Exception:
+                self._voice_program_options_refresh_running = False
+
+        def _on_voice_program_options_refresh_ready(self, payload: object) -> None:
+            if self._background_shutdown_event.is_set():
+                return
+            self._voice_program_options_refresh_running = False
+            options = [str(item) for item in payload]
+            if options != self._voice_program_options:
+                self._voice_program_options = options
+                self.voiceProgramOptionsChanged.emit()
+            refresh_again = self._voice_program_options_refresh_pending
+            self._voice_program_options_refresh_pending = False
+            if refresh_again:
+                QTimer.singleShot(0, self._request_voice_program_options_refresh)
+
         def _replace_voice_program_settings(self, raw: object) -> None:
             previous = dict(self._voice_program_settings)
             current = voice_program_manager.normalize_voice_program_settings(raw)
@@ -1792,12 +2590,27 @@ def _load_qt_classes() -> dict:
                 self.voiceProgramLaunchElevatedChanged.emit()
             self._request_voice_program_status_refresh()
 
-        def _persist_voice_settings(self) -> bool:
+        def _voice_settings_write_block_reason(self) -> str:
             if _vb_cable_test_active_event.is_set():
-                self._set_error_message(
-                    "VB-CABLE 通道测试正在运行；测试结束后再修改语音设置。",
-                    self._VOICE_PAGE_INDEX,
-                )
+                return "VB-CABLE 通道测试正在运行；测试结束后再修改语音设置。"
+            if self._get_bridge_launch_busy():
+                return "遥控器服务正在启动；完成后再修改语音设置。"
+            if self._endpoint_preflight_busy or _driver_action_active_event.is_set():
+                return "输出端点正在处理；完成后再修改语音设置。"
+            return ""
+
+        def _voice_settings_write_start_blocked(self) -> bool:
+            return bool(
+                self._voice_settings_write_block_reason()
+                or self._application_exit_requested
+                or self._application_exit_confirmed
+                or self._application_exit_intent.is_set()
+            )
+
+        def _persist_voice_settings(self) -> bool:
+            block_reason = self._voice_settings_write_block_reason()
+            if block_reason:
+                self._set_error_message(block_reason, self._VOICE_PAGE_INDEX)
                 return False
 
             hotkey_text = self._voice_hotkeys[
@@ -1837,6 +2650,7 @@ def _load_qt_classes() -> dict:
                 return False
 
             self._config = saved_config
+            self._bump_settings_revision()
             saved_hotkey = str(
                 saved_config.get("voice_hotkeys", {}).get("hold", "")
             )
@@ -1857,9 +2671,11 @@ def _load_qt_classes() -> dict:
         def _update_and_persist_voice_hotkey(self, value: str) -> bool:
             mode = key_mapping.VoiceTriggerMode.HOLD
             previous = self._voice_hotkeys[mode]
-            if self._voice_hotkey_busy:
+            if self._voice_hotkey_busy or self._voice_settings_write_start_blocked():
                 return False
             provider_id = str(self._voice_program_settings.get("provider", ""))
+            if provider_id == voice_program_manager.VOICE_PROGRAM_WINDOWS_DICTATION:
+                value = "win+h"
             self._set_voice_hotkey_busy(True)
             self._set_status_message("正在同步语音快捷键…", self._VOICE_PAGE_INDEX)
             self._set_error_message("")
@@ -2106,7 +2922,10 @@ def _load_qt_classes() -> dict:
             choosing/saving the Windows mapping.
             """
 
-            if not self._key_detection_active:
+            if (
+                not self._key_detection_active
+                or self._input_operation_phase != "active"
+            ):
                 return
             self.stopKeyDetection()
             if button_id:
@@ -2123,7 +2942,12 @@ def _load_qt_classes() -> dict:
             self._set_key_detection_text(result)
 
         def _on_key_detection_hid_report(self, report_id: int, payload: bytes) -> None:
-            if report_id != 1 or len(payload) != 6 or not self._key_detection_active:
+            if (
+                report_id != 1
+                or len(payload) != 6
+                or not self._key_detection_active
+                or self._input_operation_phase != "active"
+            ):
                 return
             active = {
                 int.from_bytes(payload[index : index + 2], "little")
@@ -2144,7 +2968,10 @@ def _load_qt_classes() -> dict:
             self._hidTapDetectionStatus.emit(status, detail)
 
         def _on_hid_tap_detection_status(self, status: str, detail: str) -> None:
-            if not self._key_detection_active:
+            if (
+                not self._key_detection_active
+                or self._input_operation_phase != "active"
+            ):
                 return
             if status == frida_compat.HidTapState.ATTACHED_WAITING_IO.value:
                 if self._key_detection_listener is not None:
@@ -2177,28 +3004,61 @@ def _load_qt_classes() -> dict:
         def _on_hotkey_capture_result(self, chord: str) -> None:
             """Forward a hook-thread result to QML on the GUI thread."""
 
+            if (
+                self._input_operation_kind != "hotkey"
+                or self._input_operation_phase != "active"
+                or self._hotkey_capture is None
+                or self._input_cleanup_requested
+                or self._window_hide_requested
+                or self._application_exit_requested
+                or self._application_exit_confirmed
+                or self._application_exit_intent.is_set()
+            ):
+                return
             self.hotkeyCaptured.emit(chord)
 
-        def _save(self) -> bool:
+        def _save(
+            self,
+            completion: Optional[Callable[[bool], None]] = None,
+        ) -> bool:
             """Same validation as before (settings_ui.build_save_model);
             returns True only on an actual successful save, so
             saveAndLaunch() can gate the launch on it exactly like the
             previous Tk _save_and_launch() did.
             """
 
+            def finish(result: bool) -> bool:
+                if completion is not None:
+                    completion(bool(result))
+                if self._application_exit_waiting_for_save:
+                    if result:
+                        self._begin_application_exit()
+                    else:
+                        self._fail_application_exit(
+                            "设置保存未完成，程序没有退出。"
+                        )
+                return bool(result)
+
+            if self._settings_save_busy:
+                self._set_error_message(
+                    "按键映射正在保存，请等待完成。",
+                    self._BUTTONS_PAGE_INDEX,
+                )
+                return finish(False)
+
             if self._voice_hotkey_busy:
                 self._set_error_message(
                     "语音快捷键正在处理；完成后再保存设置。",
                     self._BUTTONS_PAGE_INDEX,
                 )
-                return False
+                return finish(False)
 
             if _vb_cable_test_active_event.is_set():
                 self._set_error_message(
                     "VB-CABLE 通道测试正在运行；测试结束后再保存设置。",
                     self._BUTTONS_PAGE_INDEX,
                 )
-                return False
+                return finish(False)
 
             trigger_mode = key_mapping.VoiceTriggerMode.HOLD
             endpoint_display = (
@@ -2238,7 +3098,7 @@ def _load_qt_classes() -> dict:
                     f"{title}：{exc.message}",
                     self._BUTTONS_PAGE_INDEX,
                 )
-                return False
+                return finish(False)
 
             new_config["voice_program"] = dict(self._voice_program_settings)
             config.set_voice_hotkey_for_provider(
@@ -2249,68 +3109,127 @@ def _load_qt_classes() -> dict:
 
             endpoint_name = new_config.get("output_endpoint_name", "")
             endpoint_host_api = new_config.get("output_endpoint_host_api", "")
-            primary_bindings = new_bindings.get("bindings", {})
-            voice_mapping_enabled = any(
-                key_mapping.is_voice_action(key_mapping.ButtonAction.from_dict(raw_action))
-                for raw_action in primary_bindings.values()
-                if isinstance(raw_action, dict)
-            )
-            if endpoint_name and voice_mapping_enabled:
-                try:
-                    audio_playback.preflight_output_endpoint(
-                        endpoint_name, endpoint_host_api
-                    )
-                except audio_output.AudioOutputUnavailableError:
-                    self._set_error_message(
-                        "保存失败：所选语音输出设备无法实际打开。请选择 "
-                        "Windows WASAPI 或 Windows DirectSound 端点后重试。",
-                        self._BUTTONS_PAGE_INDEX,
-                    )
-                    return False
+            save_revision = self._settings_revision
 
-            config_path = config.config_path(self._config_root)
-            bindings_path = config.key_bindings_path(self._config_root)
-            try:
-                config.save_settings_pair(
-                    config_path,
-                    new_config,
-                    bindings_path,
-                    new_bindings,
-                )
-                # Read the files back through the same normalizers the bridge
-                # uses. This prevents the UI from claiming success when the
-                # file was not actually writable or the persisted shape was
-                # not usable by the runtime.
-                saved_config = config.load_config(config_path)
-                saved_bindings = config.load_key_bindings(bindings_path)
-            except Exception as exc:  # noqa: BLE001 - a Qt slot must not escape
-                self._set_error_message(
-                    f"保存失败：{exc}",
-                    self._BUTTONS_PAGE_INDEX,
-                )
+            def primary_voice_enabled(document: dict) -> bool:
+                raw_bindings = document.get("bindings", {})
+                if not isinstance(raw_bindings, dict):
+                    return False
+                for raw_action in raw_bindings.values():
+                    if not isinstance(raw_action, dict):
+                        continue
+                    try:
+                        action = key_mapping.ButtonAction.from_dict(raw_action)
+                    except (KeyError, TypeError, ValueError):
+                        continue
+                    if key_mapping.is_voice_action(action):
+                        return True
                 return False
 
-            self._config = saved_config
-            self._bindings = saved_bindings
-            self._replace_voice_program_settings(saved_config.get("voice_program"))
-            self._set_voice_program_settings_dirty(False)
-            self._removed_voice_bindings = config.normalize_voice_product_boundary(
-                self._config,
-                self._bindings,
+            primary_bindings = new_bindings.get("bindings", {})
+            voice_mapping_enabled = primary_voice_enabled(
+                {"bindings": primary_bindings}
             )
-            saved_voice_hotkeys = saved_config.get("voice_hotkeys", {})
-            for mode in self._TRIGGER_MODE_ORDER:
-                saved_text = str(saved_voice_hotkeys.get(mode.value, ""))
-                self._set_voice_hotkey_text(mode, saved_text)
-            self._load_bindings_into_model()
-            self._set_settings_dirty(False)
+            previous_voice_mapping_enabled = primary_voice_enabled(self._bindings)
+            endpoint_changed = (
+                endpoint_name != self._config.get("output_endpoint_name", "")
+                or endpoint_host_api
+                != self._config.get("output_endpoint_host_api", "")
+            )
+            requires_preflight = bool(
+                endpoint_name
+                and voice_mapping_enabled
+                and (endpoint_changed or not previous_voice_mapping_enabled)
+            )
+
+            def persist_candidate() -> bool:
+                config_path = config.config_path(self._config_root)
+                bindings_path = config.key_bindings_path(self._config_root)
+                try:
+                    config.save_settings_pair(
+                        config_path,
+                        new_config,
+                        bindings_path,
+                        new_bindings,
+                    )
+                    saved_config = config.load_config(config_path)
+                    saved_bindings = config.load_key_bindings(bindings_path)
+                except Exception as exc:  # noqa: BLE001 - a Qt slot must not escape
+                    self._set_error_message(
+                        f"保存失败：{exc}",
+                        self._BUTTONS_PAGE_INDEX,
+                    )
+                    return finish(False)
+
+                self._config = saved_config
+                self._bindings = saved_bindings
+                self._bump_settings_revision()
+                self._replace_voice_program_settings(
+                    saved_config.get("voice_program")
+                )
+                self._set_voice_program_settings_dirty(False)
+                self._removed_voice_bindings = (
+                    config.normalize_voice_product_boundary(
+                        self._config,
+                        self._bindings,
+                    )
+                )
+                saved_voice_hotkeys = saved_config.get("voice_hotkeys", {})
+                for mode in self._TRIGGER_MODE_ORDER:
+                    saved_text = str(saved_voice_hotkeys.get(mode.value, ""))
+                    self._set_voice_hotkey_text(mode, saved_text)
+                self._load_bindings_into_model()
+                self._set_settings_dirty(False)
+                self._set_error_message("")
+                self._set_status_message(
+                    "已保存。按键映射和语音触发将在下一次按键时应用；"
+                    "连接/输出设置需重启桥接。",
+                    self._BUTTONS_PAGE_INDEX,
+                )
+                return finish(True)
+
+            if not requires_preflight:
+                return persist_candidate()
+
+            self._set_settings_save_busy(True)
             self._set_error_message("")
             self._set_status_message(
-                "已保存。按键映射和语音触发将在下一次按键时应用；"
-                "连接/输出设置需重启桥接。",
+                "正在检查语音输出端点…",
                 self._BUTTONS_PAGE_INDEX,
             )
-            return True
+            settled = False
+            settled_result = False
+
+            def after_preflight(ok: bool, message: str) -> None:
+                nonlocal settled, settled_result
+                self._set_settings_save_busy(False)
+                if not ok:
+                    self._set_status_message("")
+                    self._set_error_message(
+                        "保存失败："
+                        + (message or "所选语音输出设备无法实际打开。"),
+                        self._BUTTONS_PAGE_INDEX,
+                    )
+                    settled_result = finish(False)
+                elif self._settings_revision != save_revision:
+                    self._set_status_message("")
+                    self._set_settings_dirty(True)
+                    self._set_error_message(
+                        "保存期间设置又发生了变化；为避免覆盖新修改，请重新保存。",
+                        self._BUTTONS_PAGE_INDEX,
+                    )
+                    settled_result = finish(False)
+                else:
+                    settled_result = persist_candidate()
+                settled = True
+                self._schedule_application_exit_poll()
+
+            accepted = self._request_endpoint_preflight(
+                str(endpoint_name),
+                str(endpoint_host_api),
+                after_preflight,
+            )
+            return settled_result if settled else accepted
 
         # -- properties ---------------------------------------------------
 
@@ -2349,10 +3268,12 @@ def _load_qt_classes() -> dict:
         )
 
         def _get_voice_program_options(self) -> List[str]:
-            return voice_program_manager.provider_options()
+            return list(self._voice_program_options)
 
         voiceProgramOptions = Property(
-            list, _get_voice_program_options, constant=True
+            list,
+            _get_voice_program_options,
+            notify=voiceProgramOptionsChanged,
         )
 
         def _get_selected_voice_program_index(self) -> int:
@@ -2361,11 +3282,11 @@ def _load_qt_classes() -> dict:
             )
 
         def _set_selected_voice_program_index(self, value: int) -> None:
+            if self._voice_hotkey_busy or self._voice_settings_write_start_blocked():
+                return
             provider_id = voice_program_manager.provider_id_for_index(value)
             if provider_id == self._voice_program_settings.get("provider"):
                 self.refreshVoiceHotkeyFromProvider()
-                return
-            if self._voice_hotkey_busy:
                 return
             remembered_hotkey = config.voice_hotkey_for_provider(
                 self._config, provider_id
@@ -2406,6 +3327,8 @@ def _load_qt_classes() -> dict:
             selected_hotkey = (
                 read_result.hotkey if read_result.ok else remembered_hotkey
             )
+            if provider_id == voice_program_manager.VOICE_PROGRAM_WINDOWS_DICTATION:
+                selected_hotkey = "win+h"
             self._set_voice_hotkey_text(
                 key_mapping.VoiceTriggerMode.HOLD,
                 selected_hotkey,
@@ -2510,11 +3433,17 @@ def _load_qt_classes() -> dict:
             notify=voiceHotkeyBusyChanged,
         )
 
+        endpointPreflightBusy = Property(
+            bool,
+            lambda self: self._endpoint_preflight_busy,
+            notify=endpointPreflightBusyChanged,
+        )
+
         def _get_voice_program_custom_path(self) -> str:
             return str(self._voice_program_settings.get("custom_executable", ""))
 
         def _set_voice_program_custom_path(self, value: str) -> None:
-            if self._voice_hotkey_busy:
+            if self._voice_hotkey_busy or self._voice_settings_write_start_blocked():
                 return
             local_value = QUrl(value).toLocalFile() if value.startswith("file:") else value
             local_value = local_value.strip()
@@ -2535,7 +3464,7 @@ def _load_qt_classes() -> dict:
             return self._voice_program_settings.get("launch_on_bridge_start") is True
 
         def _set_voice_program_launch_on_bridge_start(self, value: bool) -> None:
-            if self._voice_hotkey_busy:
+            if self._voice_hotkey_busy or self._voice_settings_write_start_blocked():
                 return
             value = bool(value)
             if value == self._get_voice_program_launch_on_bridge_start():
@@ -2555,7 +3484,7 @@ def _load_qt_classes() -> dict:
             return self._voice_program_settings.get("launch_elevated") is True
 
         def _set_voice_program_launch_elevated(self, value: bool) -> None:
-            if self._voice_hotkey_busy:
+            if self._voice_hotkey_busy or self._voice_settings_write_start_blocked():
                 return
             value = bool(value)
             if value == self._get_voice_program_launch_elevated():
@@ -2756,6 +3685,12 @@ def _load_qt_classes() -> dict:
             notify=settingsDirtyChanged,
         )
 
+        settingsSaveBusy = Property(
+            bool,
+            lambda self: self._settings_save_busy,
+            notify=settingsSaveBusyChanged,
+        )
+
         def _get_active_page_index(self) -> int:
             return self._active_page_index
 
@@ -2875,6 +3810,18 @@ def _load_qt_classes() -> dict:
             str,
             _get_key_detection_text,
             notify=keyDetectionTextChanged,
+        )
+
+        hotkeyCaptureActive = Property(
+            bool,
+            _get_hotkey_capture_active,
+            notify=hotkeyCaptureActiveChanged,
+        )
+
+        inputCaptureInUse = Property(
+            bool,
+            _get_input_capture_in_use,
+            notify=inputOperationChanged,
         )
 
         def _get_primary_action_options(self) -> List[str]:
@@ -3007,6 +3954,19 @@ def _load_qt_classes() -> dict:
 
         @Slot(result=bool)
         def saveSettings(self) -> bool:
+            if (
+                self._get_bridge_launch_busy()
+                or self._endpoint_preflight_busy
+                or _driver_action_active_event.is_set()
+                or self._application_exit_requested
+                or self._application_exit_confirmed
+                or self._application_exit_intent.is_set()
+            ):
+                self._set_error_message(
+                    "当前有其它操作正在进行；完成后再保存按键映射。",
+                    self._BUTTONS_PAGE_INDEX,
+                )
+                return False
             return self._save()
 
         @Slot(bool)
@@ -3067,60 +4027,180 @@ def _load_qt_classes() -> dict:
                 self.startBridge()
 
         @Slot()
-        def requestApplicationExit(self) -> None:
-            if self._application_exit_requested:
-                return
-
-            try:
-                bridge_running = single_instance.bridge_instance_running()
-            except (
-                single_instance.SingleInstanceUnavailableError,
-                single_instance.MutexCleanupError,
+        def saveSettingsAndExit(self) -> None:
+            if (
+                self._application_exit_requested
+                or self._application_exit_confirmed
+                or self._save_then_exit_requested
             ):
-                bridge_running = True
+                return
+            self._save_then_exit_requested = True
 
-            if not bridge_running:
-                # Keep the common tray-menu path on Qt's thread. There is no
-                # bridge cleanup to wait for, so the application can quit now.
-                self._application_exit_confirmed = True
-                self.applicationExitReady.emit()
+            def finish(saved: bool) -> None:
+                self._save_then_exit_requested = False
+                self.saveSettingsAndExitFinished.emit(bool(saved))
+                if saved:
+                    self.requestApplicationExit()
+
+            self._save(completion=finish)
+
+        @Slot()
+        def requestApplicationExit(self) -> None:
+            if (
+                self._application_exit_requested
+                or self._application_exit_confirmed
+            ):
+                return
+            self._application_exit_requested = True
+            self._application_exit_deadline = 0.0
+            self._window_hide_requested = False
+            if self._settings_save_busy:
+                self._application_exit_waiting_for_save = True
+                self._application_exit_deadline = (
+                    time.monotonic()
+                    + _APPLICATION_EXIT_SAVE_WAIT_TIMEOUT_SECONDS
+                )
+                self._schedule_application_exit_poll()
+                return
+            self._begin_application_exit()
+
+        def _begin_application_exit(self) -> None:
+            self._application_exit_waiting_for_save = False
+            self._application_exit_deadline = (
+                time.monotonic() + _APPLICATION_EXIT_WAIT_TIMEOUT_SECONDS
+            )
+            self._application_exit_intent.set()
+            if self._get_input_capture_in_use():
+                self._request_input_stop()
+            if self._application_exit_poll_scheduled:
+                return
+            self._continue_application_exit()
+
+        def _schedule_application_exit_poll(self) -> None:
+            if (
+                not self._application_exit_requested
+                or self._application_exit_confirmed
+                or self._application_exit_poll_scheduled
+                or self._application_exit_stop_running
+            ):
+                return
+            self._application_exit_poll_scheduled = True
+            QTimer.singleShot(
+                _APPLICATION_EXIT_POLL_INTERVAL_MS,
+                self._continue_application_exit,
+            )
+
+        def _continue_application_exit(self) -> None:
+            self._application_exit_poll_scheduled = False
+            if (
+                not self._application_exit_requested
+                or self._application_exit_confirmed
+                or self._application_exit_stop_running
+            ):
+                return
+            if self._application_exit_waiting_for_save:
+                if time.monotonic() >= self._application_exit_deadline:
+                    self._fail_application_exit(
+                        "完全退出超时：设置仍在保存，请稍后重试。"
+                    )
+                    return
+                self._schedule_application_exit_poll()
+                return
+            if time.monotonic() >= self._application_exit_deadline:
+                self._fail_application_exit(
+                    "完全退出超时：后台操作尚未结束，请稍后重试。"
+                )
                 return
 
-            self._application_exit_requested = True
+            if self._get_input_capture_in_use():
+                self._request_input_stop()
+                self._schedule_application_exit_poll()
+                return
+            if (
+                self._voice_hotkey_busy
+                or self._settings_save_busy
+                or self._endpoint_preflight_busy
+                or _vb_cable_test_active_event.is_set()
+                or _driver_action_active_event.is_set()
+            ):
+                self._schedule_application_exit_poll()
+                return
+
+            if self._pending_bridge_launch is not None:
+                self.pollBridgeLaunch()
+                if self._pending_bridge_launch is not None:
+                    self._schedule_application_exit_poll()
+                    return
+            if (
+                self._bridge_launch_phase in {"saving", "starting"}
+                and self._pending_bridge_launch is None
+            ):
+                self._set_bridge_launch_phase("idle")
+
+            bridge_running = self._refresh_bridge_status()
+            if bridge_running is False:
+                self._on_application_exit_stop_ready((True, ""))
+                return
+
+            self._application_exit_stop_running = True
 
             def stop_and_exit() -> None:
                 try:
                     result = bridge_control_windows.request_bridge_exit()
                 except Exception as exc:  # noqa: BLE001 - must remain retryable
-                    self._application_exit_requested = False
-                    self.applicationExitFailed.emit(
-                        f"完全退出失败：{type(exc).__name__}"
+                    payload = (False, f"完全退出失败：{type(exc).__name__}")
+                else:
+                    payload = (
+                        bool(result.stopped),
+                        result.error or "遥控器服务未能正常停止。",
                     )
-                    return
-                if result.stopped:
-                    self._application_exit_requested = False
-                    self._application_exit_confirmed = True
-                    self.applicationExitReady.emit()
-                    return
-                self._application_exit_requested = False
-                message = result.error or "遥控器服务未能正常停止。"
-                self.applicationExitFailed.emit(message)
+                self._emit_background_result(
+                    self._applicationExitStopReady,
+                    payload,
+                )
 
             try:
                 self._start_background_task(
                     stop_and_exit, "remote-mic-application-exit"
                 )
             except RuntimeError as exc:
+                self._application_exit_stop_running = False
+                self._fail_application_exit(str(exc))
+
+        def _on_application_exit_stop_ready(self, payload: object) -> None:
+            self._application_exit_stop_running = False
+            if not self._application_exit_requested:
+                return
+            stopped, message = payload
+            if stopped:
                 self._application_exit_requested = False
-                self.applicationExitFailed.emit(str(exc))
+                self._application_exit_waiting_for_save = False
+                self._application_exit_confirmed = True
+                self._application_exit_intent.set()
+                self.applicationExitReady.emit()
+                return
+            self._fail_application_exit(str(message))
+
+        def _fail_application_exit(self, message: str) -> None:
+            self._application_exit_requested = False
+            self._application_exit_stop_running = False
+            self._application_exit_poll_scheduled = False
+            self._application_exit_waiting_for_save = False
+            self._application_exit_deadline = 0.0
+            self._application_exit_intent.clear()
+            self.applicationExitFailed.emit(message)
 
         @Slot()
         def refreshVoiceProgramStatus(self) -> None:
             self._request_voice_program_status_refresh()
 
         @Slot()
+        def refreshVoiceProgramOptions(self) -> None:
+            self._request_voice_program_options_refresh()
+
+        @Slot()
         def refreshVoiceHotkeyFromProvider(self) -> None:
-            if self._voice_hotkey_busy:
+            if self._voice_hotkey_busy or self._voice_settings_write_start_blocked():
                 return
             provider_id = str(self._voice_program_settings.get("provider", ""))
             if provider_id in {
@@ -3219,21 +4299,18 @@ def _load_qt_classes() -> dict:
         def startKeyDetection(self) -> None:
             """Listen for one real RC003 press without executing its action."""
 
-            if self._key_detection_active:
+            if self._key_detection_active or self._get_input_capture_in_use():
                 return
-            if (
-                self._key_detection_listener is not None
-                or self._key_detection_tap is not None
-            ):
-                self.stopKeyDetection()
-                if (
-                    self._key_detection_listener is not None
-                    or self._key_detection_tap is not None
-                ):
-                    self._set_key_detection_text(
-                        "上次按键检测未能停止；请关闭设置窗口后重试"
-                    )
-                    return
+            if self._get_bridge_launch_busy():
+                self._set_key_detection_text(
+                    "遥控器服务正在启动；完成后再检测真实按键"
+                )
+                return
+            if _vb_cable_test_active_event.is_set():
+                self._set_key_detection_text(
+                    "声音通道测试正在运行；结束后再检测真实按键"
+                )
+                return
             if self._selected_device_id() != device_catalog.RC003_ID:
                 self._set_key_detection_text(
                     f"当前设备不是{device_catalog.RC003_DISPLAY_NAME}；无法检测遥控器按键"
@@ -3245,112 +4322,19 @@ def _load_qt_classes() -> dict:
                     "无法确认后台服务状态；请关闭设置窗口和服务后重试"
                 )
                 return
-            if bridge_running:
-                try:
-                    request = key_detection_bridge.request_detection(self._config_root)
-                except OSError as exc:
-                    self._set_key_detection_text(
-                        f"无法向后台桥接启动真实按键检测：{exc}"
-                    )
-                    return
-                self._key_detection_bridge_request = request
-                self._key_detection_started_at = time.monotonic()
-                self._key_detection_active = True
-                self.keyDetectionActiveChanged.emit()
-                self._set_key_detection_text(
-                    "后台服务等待按键；请按一次，首次连接可能约 1 分钟，检测时不执行映射"
-                )
-                return
-            listener = None
-            tap = None
-            failures = []
-            try:
-                paths = raw_input_windows.enumerate_matching_device_paths()
-                device_path = raw_input_windows.hid_identity.select_single_device_path(paths)
-                listener = raw_input_windows.RawInputButtonListener(
-                    lambda *_: None,
-                    self._on_raw_input_event,
-                )
-                set_physical_bindings = getattr(
-                    listener, "set_physical_bindings", None
-                )
-                if callable(set_physical_bindings):
-                    set_physical_bindings(self._bindings.get("physical_bindings", {}))
-                listener.start(device_path)
-            except Exception:  # noqa: BLE001 - surface failure in the UI
-                failures.append("Windows 按键通道启动失败")
-                if listener is not None:
-                    try:
-                        listener.stop()
-                    except Exception as cleanup_exc:
-                        self._key_detection_listener = listener
-                        self._set_key_detection_text(
-                            "Windows 按键通道启动失败，且监听资源未能停止："
-                            f"{cleanup_exc}"
-                        )
-                        return
-                    else:
-                        listener = None
-
-            tap = frida_compat.RC003HidReportTap(
-                self._on_key_detection_hid_report,
-                status_handler=self._on_key_detection_tap_status,
-            )
-            try:
-                if not tap.start():
-                    failures.append("补充按键通道启动失败")
-                    tap = None
-            except Exception:  # noqa: BLE001 - surface failure in the UI
-                failures.append("补充按键通道启动失败")
-                try:
-                    tap.stop()
-                except Exception as cleanup_exc:
-                    if listener is not None:
-                        try:
-                            listener.stop()
-                        except Exception:
-                            self._key_detection_listener = listener
-                    self._key_detection_tap = tap
-                    self._set_key_detection_text(
-                        "补充按键通道启动失败，且检测资源未能停止："
-                        f"{cleanup_exc}"
-                    )
-                    return
-                else:
-                    tap = None
-
-            if listener is None and tap is None:
-                self._key_detection_listener = None
-                self._key_detection_tap = None
-                self._key_detection_active = False
-                self.keyDetectionActiveChanged.emit()
-                self._set_key_detection_text(
-                    "无法启动真实按键检测：" + "；".join(failures)
-                )
-                return
-
-            self._key_detection_listener = listener
-            self._key_detection_tap = tap
-            self._key_detection_tap_usages.clear()
-            self._key_detection_started_at = time.monotonic()
-            self._key_detection_active = True
-            self.keyDetectionActiveChanged.emit()
-            if listener is not None and tap is not None:
-                detection_text = (
-                    "Windows 按键通道已启动；常规按键可立即检测，"
-                    "返回键、音量键请等待补充通道连接（约 1 分钟）"
-                )
-            elif tap is not None:
-                detection_text = (
-                    "补充按键通道连接中；连接后请按要检测的按键（约 1 分钟）"
-                )
-            else:
-                detection_text = (
-                    "只能检测 Windows 可识别按键；返回键、音量键可能测不到"
-                )
-            failure_text = f"；受限：{'；'.join(failures)}" if failures else ""
             self._set_key_detection_text(
-                f"{detection_text}；检测时不执行映射{failure_text}"
+                "正在启动真实按键检测…"
+            )
+            physical_bindings = dict(
+                self._bindings.get("physical_bindings", {})
+            )
+            self._begin_input_operation_start(
+                "key_detection",
+                lambda cancel_event: self._start_key_detection_worker(
+                    cancel_event,
+                    bridge_running=bool(bridge_running),
+                    physical_bindings=physical_bindings,
+                ),
             )
 
         @Slot()
@@ -3362,17 +4346,16 @@ def _load_qt_classes() -> dict:
                 time.monotonic() - self._key_detection_started_at
                 >= self._KEY_DETECTION_TIMEOUT_SECONDS
             ):
-                self.stopKeyDetection()
-                if (
-                    self._key_detection_listener is not None
-                    or self._key_detection_tap is not None
-                ):
-                    return
                 if request is not None:
                     timeout_text = "等待后台按键超时；确认遥控器已连接后重试"
                 else:
                     timeout_text = "等待按键超时；确认遥控器已连接后重试"
-                self._set_key_detection_text(timeout_text)
+                self._key_detection_started_at = 0.0
+                self._key_detection_tap_usages.clear()
+                self._request_input_stop(
+                    kind="key_detection",
+                    key_detection_success_message=timeout_text,
+                )
                 return
             if request is None:
                 return
@@ -3384,72 +4367,33 @@ def _load_qt_classes() -> dict:
         def startHotkeyCapture(self) -> None:
             """Start the EXE-owned physical keyboard shortcut recorder."""
 
-            if self._hotkey_capture is not None:
-                return
-            capture = hotkey_capture_windows.HotkeyCapture(
-                lambda chord: self._hotkeyCaptureResult.emit(chord)
+            self._begin_input_operation_start(
+                "hotkey", self._start_hotkey_capture_worker
             )
-            self._hotkey_capture = capture
-            try:
-                capture.start()
-            except Exception as exc:  # noqa: BLE001 - surface in the dialog
-                if not capture.is_running:
-                    self._hotkey_capture = None
-                self.hotkeyCaptureError.emit(f"无法启动真实键盘录制：{exc}")
-                return
 
-        @Slot()
-        def stopHotkeyCapture(self) -> None:
+        @Slot(result=bool)
+        def stopHotkeyCapture(self) -> bool:
             """Stop the physical recorder, including Cancel/window close."""
 
-            capture = self._hotkey_capture
-            if capture is None:
-                return
-            try:
-                capture.stop()
-            except Exception as exc:  # noqa: BLE001 - never crash the settings UI
-                self.hotkeyCaptureError.emit(f"停止真实键盘录制时出错：{exc}")
-            else:
-                self._hotkey_capture = None
+            return self._request_input_stop(kind="hotkey")
 
-        @Slot()
-        def stopKeyDetection(self) -> None:
-            bridge_request = self._key_detection_bridge_request
-            self._key_detection_bridge_request = None
+        @Slot(result=bool)
+        def stopKeyDetection(self) -> bool:
             self._key_detection_started_at = 0.0
-            listener = self._key_detection_listener
-            tap = self._key_detection_tap
-            was_active = self._key_detection_active
-            self._key_detection_active = False
             self._key_detection_tap_usages.clear()
-            if was_active:
-                self.keyDetectionActiveChanged.emit()
-            if bridge_request is not None:
-                key_detection_bridge.cancel_detection(bridge_request)
-            if listener is not None:
-                try:
-                    listener.stop()
-                except Exception as exc:  # noqa: BLE001 - report, do not crash Qt
-                    self._set_key_detection_text(
-                        f"停止 Windows 按键通道时出错：{exc}"
-                    )
-                else:
-                    self._key_detection_listener = None
-            if tap is not None:
-                try:
-                    tap.stop()
-                except Exception as exc:  # noqa: BLE001 - report, do not crash Qt
-                    self._set_key_detection_text(
-                        f"停止补充按键通道时出错：{exc}"
-                    )
-                else:
-                    self._key_detection_tap = None
+            return self._request_input_stop(kind="key_detection")
 
         @Slot()
         def saveAndLaunch(self) -> None:
             """Start the staged save/launch flow without blocking Qt."""
 
             if self._get_bridge_launch_busy():
+                return
+            if self._get_input_capture_in_use():
+                self._set_error_message(
+                    "按键录入或检测正在进行；结束后再启动遥控器服务。",
+                    self._DEVICE_PAGE_INDEX,
+                )
                 return
             self._has_explicit_launch_result = True
             self._bridge_launch_started_at = time.monotonic()
@@ -3464,13 +4408,29 @@ def _load_qt_classes() -> dict:
         def _continue_save_and_launch(self) -> None:
             if self._bridge_launch_phase != "saving":
                 return
-            if not self._save():
+            self._save(completion=self._on_save_for_launch_complete)
+
+        def _on_save_for_launch_complete(self, saved: bool) -> None:
+            if self._bridge_launch_phase != "saving":
+                return
+            if not saved:
                 self._set_bridge_launch_phase("failed")
                 self._set_launch_status("保存未完成，未启动桥接。")
                 return
             self._start_bridge_process()
 
         def _start_bridge_process(self) -> None:
+            if self._bridge_launch_phase not in {"saving", "starting"}:
+                return
+            if (
+                self._application_exit_requested
+                or self._application_exit_confirmed
+                or self._application_exit_intent.is_set()
+            ):
+                self._pending_bridge_launch = None
+                self._set_bridge_launch_phase("idle")
+                self._schedule_application_exit_poll()
+                return
             saved_before_launch = self._bridge_launch_phase == "saving"
             self._set_bridge_launch_phase("starting")
             if saved_before_launch:
@@ -3497,7 +4457,31 @@ def _load_qt_classes() -> dict:
         def startBridge(self) -> None:
             """Start the bridge without saving unrelated unsaved page edits."""
 
+            if (
+                self._application_exit_requested
+                or self._application_exit_confirmed
+                or self._application_exit_intent.is_set()
+            ):
+                return
             if self._get_bridge_launch_busy():
+                return
+            if self._settings_save_busy:
+                self._set_error_message(
+                    "按键映射正在保存；完成后再启动遥控器服务。",
+                    self._DEVICE_PAGE_INDEX,
+                )
+                return
+            if self._endpoint_preflight_busy or _driver_action_active_event.is_set():
+                self._set_error_message(
+                    "输出端点正在处理；完成后再启动遥控器服务。",
+                    self._DEVICE_PAGE_INDEX,
+                )
+                return
+            if self._get_input_capture_in_use():
+                self._set_error_message(
+                    "按键录入或检测正在进行；结束后再启动遥控器服务。",
+                    self._DEVICE_PAGE_INDEX,
+                )
                 return
             if self._voice_hotkey_busy:
                 self._set_error_message(
@@ -3518,6 +4502,10 @@ def _load_qt_classes() -> dict:
                 self.bridgeLaunchElapsedSecondsChanged.emit()
             self._set_bridge_connected(False)
             self._set_error_message("")
+            self._set_bridge_launch_phase("starting")
+            self._set_launch_status(
+                "正在按上次保存的设置启动遥控器服务…"
+            )
             QTimer.singleShot(0, self._start_bridge_process)
 
         def _finish_bridge_launch(
@@ -3534,6 +4522,7 @@ def _load_qt_classes() -> dict:
                 self._set_bridge_launch_phase("waiting")
                 if (
                     result.outcome is bridge_launcher.LaunchOutcome.ALREADY_RUNNING
+                    and not self._application_exit_requested
                     and self._voice_program_settings.get("launch_on_bridge_start")
                     is True
                 ):
@@ -3541,6 +4530,7 @@ def _load_qt_classes() -> dict:
                         feedback_page_index=self._DEVICE_PAGE_INDEX
                     )
                 self._sync_bridge_connection_status(True)
+                self._schedule_application_exit_poll()
                 return
             self._set_bridge_running(False)
             self._set_bridge_connected(False)
@@ -3550,6 +4540,7 @@ def _load_qt_classes() -> dict:
                 else "failed"
             )
             self._set_launch_status(settings_ui.describe_launch_result(result))
+            self._schedule_application_exit_poll()
 
         @Slot()
         def pollBridgeLaunch(self) -> None:
@@ -3770,42 +4761,83 @@ def _load_qt_classes() -> dict:
                 self._DEVICE_PAGE_INDEX,
             )
 
+        def _select_and_persist_output_endpoint(
+            self,
+            name: str,
+            host_api: str,
+            completion: Optional[Callable[[bool, str], None]] = None,
+            *,
+            allow_driver_action: bool = False,
+        ) -> bool:
+            if (
+                _vb_cable_test_active_event.is_set()
+                or self._voice_hotkey_busy
+                or self._settings_save_busy
+                or self._get_bridge_launch_busy()
+                or (
+                    _driver_action_active_event.is_set()
+                    and not allow_driver_action
+                )
+                or self._application_exit_requested
+                or self._application_exit_confirmed
+                or self._application_exit_intent.is_set()
+            ):
+                if completion is not None:
+                    completion(False, "当前有其它操作正在进行。")
+                return False
+
+            current = (
+                str(self._config.get("output_endpoint_name", "")),
+                str(self._config.get("output_endpoint_host_api", "")),
+            )
+            requested = (str(name), str(host_api))
+            if requested == current:
+                if completion is not None:
+                    completion(True, "")
+                return True
+
+            settled = False
+            settled_result = False
+
+            def finish(ok: bool, message: str) -> None:
+                nonlocal settled, settled_result
+                if (
+                    self._application_exit_requested
+                    or self._application_exit_confirmed
+                    or self._application_exit_intent.is_set()
+                ):
+                    ok = False
+                    message = "程序正在退出，未保存输出端点。"
+                if ok:
+                    new_config = dict(self._config)
+                    new_config["output_endpoint_name"] = requested[0]
+                    new_config["output_endpoint_host_api"] = requested[1]
+                    try:
+                        saved_config = config.save_config_and_load(
+                            config.config_path(self._config_root), new_config
+                        )
+                    except Exception:  # noqa: BLE001 - keep UI text sanitized
+                        ok = False
+                        message = "输出端点设置无法写入。"
+                    else:
+                        self._config = saved_config
+                        self._bump_settings_revision()
+                        self._request_endpoint_options_refresh()
+                settled = True
+                settled_result = bool(ok)
+                if completion is not None:
+                    completion(bool(ok), str(message))
+
+            accepted = self._request_endpoint_preflight(
+                requested[0], requested[1], finish
+            )
+            return settled_result if settled else accepted
+
         @Slot(str, str, result=bool)
         def selectAndPersistOutputEndpoint(self, name: str, host_api: str) -> bool:
-            """Persist a specific enumerated output endpoint independently.
+            """Queue an isolated endpoint preflight and persist on success."""
 
-            This path is shared by the voice page's auto-saving dropdown and
-            the explicit VB-CABLE detection action. It intentionally bypasses
-            mapping/hotkey validation so an unrelated unsaved mapping cannot
-            block an output-endpoint change.
-
-            Returns ``False`` (never raises) if persistence itself fails
-            (XRBM-031 RETRY 1 item 3) - e.g. a disk-full/permission error
-            from ``config.save_config()`` - so this Slot can never let an
-            uncaught exception escape into Qt's C++ call boundary, and so a
-            caller can never mistake a failed save for a successful one.
-            The in-memory config is only mutated AFTER a successful write,
-            so a failed attempt leaves the previously-saved state intact
-            rather than looking saved when it is not.
-            """
-
-            if _vb_cable_test_active_event.is_set():
-                return False
-            if self._voice_hotkey_busy:
-                return False
-
-            new_config = dict(self._config)
-            new_config["output_endpoint_name"] = name
-            new_config["output_endpoint_host_api"] = host_api
-            try:
-                audio_playback.preflight_output_endpoint(name, host_api)
-                config.save_config(config.config_path(self._config_root), new_config)
-            except Exception:  # noqa: BLE001 - never let preflight/persistence escape this Slot
-                return False
-
-            self._config = new_config
-            self._request_endpoint_options_refresh()
-            return True
+            return self._select_and_persist_output_endpoint(name, host_api)
 
         @Slot(int, result=bool)
         def selectAndPersistOutputEndpointIndex(self, index: int) -> bool:
@@ -3818,25 +4850,39 @@ def _load_qt_classes() -> dict:
                 return False
 
             endpoint = self._endpoint_values[index]
-            if not self.selectAndPersistOutputEndpoint(
-                endpoint.name, endpoint.host_api
-            ):
-                self._set_error_message(
-                    "输出端点保存失败：所选设备无法打开或设置无法写入。",
-                    self._VOICE_PAGE_INDEX,
-                )
-                self.selectedEndpointIndexChanged.emit()
-                return False
-
             self._set_error_message("")
             self._set_status_message(
-                "输出端点已自动保存；按键映射仍未保存。"
-                "重启遥控器服务后端点生效。"
-                if self._settings_dirty
-                else "输出端点已自动保存；重启遥控器服务后生效。",
+                "正在检查输出端点…",
                 self._VOICE_PAGE_INDEX,
             )
-            return True
+
+            def finished(ok: bool, message: str) -> None:
+                if not ok:
+                    self._set_status_message("")
+                    self._set_error_message(
+                        "输出端点保存失败："
+                        + (message or "所选设备无法打开或设置无法写入。"),
+                        self._VOICE_PAGE_INDEX,
+                    )
+                    self.selectedEndpointIndexChanged.emit()
+                    return
+                self._set_error_message("")
+                self._set_status_message(
+                    "输出端点已自动保存；按键映射仍未保存。"
+                    "重启遥控器服务后端点生效。"
+                    if self._settings_dirty
+                    else "输出端点已自动保存；重启遥控器服务后生效。",
+                    self._VOICE_PAGE_INDEX,
+                )
+
+            accepted = self._select_and_persist_output_endpoint(
+                endpoint.name,
+                endpoint.host_api,
+                finished,
+            )
+            if not accepted and not self._endpoint_preflight_busy:
+                self.selectedEndpointIndexChanged.emit()
+            return accepted
 
     def _diagnostics_check_to_row(check: "windows_diagnostics.CheckResult") -> dict:
         return {
@@ -3860,6 +4906,7 @@ def _load_qt_classes() -> dict:
         driverStatusMessageChanged = Signal()
         driverInfoMessageChanged = Signal()
         driverErrorMessageChanged = Signal()
+        driverActionRunningChanged = Signal()
         vbCableTestChanged = Signal()
         vbCableBridgeRecoveryChanged = Signal()
         # Internal only - never connected to from QML. Carries a
@@ -3869,6 +4916,7 @@ def _load_qt_classes() -> dict:
         # Signal(object) connection is sufficient here.
         _diagnosticsReady = Signal(object)
         _vbCableTestReady = Signal(object)
+        _detectedEndpointReady = Signal(object)
 
         def __init__(
             self,
@@ -3887,6 +4935,7 @@ def _load_qt_classes() -> dict:
             self._driver_status_message = ""
             self._driver_info_message = ""
             self._driver_error_message = ""
+            self._driver_action_running = False
             self._vb_cable_test_running = False
             self._vb_cable_test_status = "idle"
             self._vb_cable_test_message = ""
@@ -3897,6 +4946,9 @@ def _load_qt_classes() -> dict:
             )
             self._diagnosticsReady.connect(self._on_diagnostics_ready)
             self._vbCableTestReady.connect(self._on_vb_cable_test_ready)
+            self._detectedEndpointReady.connect(
+                self._on_detected_endpoint_ready
+            )
             self._settings_controller.endpointOptionsChanged.connect(
                 self._invalidate_vb_cable_test_result
             )
@@ -3955,6 +5007,21 @@ def _load_qt_classes() -> dict:
             self.driverErrorMessageChanged.emit()
             self.driverStatusMessageChanged.emit()
             self.driverInfoMessageChanged.emit()
+
+        def _set_driver_action_running(self, value: bool) -> None:
+            value = bool(value)
+            if value:
+                _driver_action_active_event.set()
+            else:
+                _driver_action_active_event.clear()
+            if value == self._driver_action_running:
+                if not value:
+                    self._settings_controller._schedule_application_exit_poll()
+                return
+            self._driver_action_running = value
+            self.driverActionRunningChanged.emit()
+            if not value:
+                self._settings_controller._schedule_application_exit_poll()
 
         def _set_vb_cable_test_state(
             self, status: str, message: str, *, running: bool
@@ -4059,6 +5126,15 @@ def _load_qt_classes() -> dict:
                     )
                     self._settings_controller._refresh_bridge_status()
                     return
+                if result.restart_skipped_for_exit:
+                    self._set_vb_cable_bridge_recovery_needed(False)
+                    self._set_vb_cable_test_state(
+                        "unsupported",
+                        "完全退出中，声音通道测试已停止，服务不再恢复",
+                        running=False,
+                    )
+                    self._settings_controller._refresh_bridge_status()
+                    return
                 loopback_result = result.loopback_result
                 restart_result = result.restart_result
                 restart_ok = bool(
@@ -4156,6 +5232,12 @@ def _load_qt_classes() -> dict:
 
         driverErrorMessage = Property(
             str, _get_driver_error_message, notify=driverErrorMessageChanged
+        )
+
+        driverActionRunning = Property(
+            bool,
+            lambda self: self._driver_action_running,
+            notify=driverActionRunningChanged,
         )
 
         def _get_vb_cable_test_running(self) -> bool:
@@ -4296,10 +5378,37 @@ def _load_qt_classes() -> dict:
                 return
             if _diagnostics_shutdown_event.is_set():
                 return
+            if (
+                self._settings_controller._application_exit_requested
+                or self._settings_controller._application_exit_confirmed
+                or self._settings_controller._application_exit_intent.is_set()
+            ):
+                return
+            if self._driver_action_running:
+                self._set_vb_cable_test_state(
+                    "fail",
+                    "输出端点正在处理；完成后再测试声音通道",
+                    running=False,
+                )
+                return
             if self._settings_controller._get_voice_hotkey_busy():
                 self._set_vb_cable_test_state(
                     "fail",
                     "语音快捷键正在处理；完成后再测试声音通道",
+                    running=False,
+                )
+                return
+            if self._settings_controller._get_input_capture_in_use():
+                self._set_vb_cable_test_state(
+                    "fail",
+                    "按键录入或检测正在进行；结束后再测试声音通道",
+                    running=False,
+                )
+                return
+            if self._settings_controller._endpoint_preflight_busy:
+                self._set_vb_cable_test_state(
+                    "fail",
+                    "输出端点正在检查；完成后再测试声音通道",
                     running=False,
                 )
                 return
@@ -4346,6 +5455,7 @@ def _load_qt_classes() -> dict:
                     loopback_result = None
                     restart_result = None
                     bridge_stopped = False
+                    restart_skipped_for_exit = False
                     if bridge_running:
                         stop_result = bridge_control_windows.request_bridge_exit()
                         if not stop_result.stopped:
@@ -4355,18 +5465,28 @@ def _load_qt_classes() -> dict:
                         else:
                             bridge_stopped = True
                     try:
-                        if not stop_error and not _diagnostics_shutdown_event.is_set():
+                        if (
+                            not stop_error
+                            and not _diagnostics_shutdown_event.is_set()
+                            and not self._settings_controller._application_exit_intent.is_set()
+                        ):
                             loopback_result = (
                                 windows_diagnostics.check_vb_cable_loopback_isolated(
                                     saved_name,
                                     saved_host_api,
-                                    cancel_event=_diagnostics_shutdown_event,
+                                    cancel_event=_AnyEvent(
+                                        _diagnostics_shutdown_event,
+                                        self._settings_controller._application_exit_intent,
+                                    ),
                                 )
                             )
                     except Exception:  # noqa: BLE001 - never crash the worker thread
                         loopback_result = None
                     finally:
-                        if bridge_stopped:
+                        if bridge_stopped and (
+                            not self._settings_controller._application_exit_intent.is_set()
+                            and not _diagnostics_shutdown_event.is_set()
+                        ):
                             try:
                                 restart_result = bridge_launcher.launch_bridge()
                             except bridge_launcher.BridgeLaunchConfigurationError as exc:
@@ -4381,11 +5501,14 @@ def _load_qt_classes() -> dict:
                                     command=(),
                                     error=type(exc).__name__,
                                 )
+                        elif bridge_stopped:
+                            restart_skipped_for_exit = True
                     result = _VbCableTestWorkflowResult(
                         loopback_result=loopback_result,
                         bridge_was_running=bool(bridge_running),
                         stop_error=stop_error,
                         restart_result=restart_result,
+                        restart_skipped_for_exit=restart_skipped_for_exit,
                     )
                     _vb_cable_test_active_event.clear()
                     if _diagnostics_shutdown_event.is_set():
@@ -4413,64 +5536,111 @@ def _load_qt_classes() -> dict:
 
         @Slot(result=bool)
         def selectDetectedCableInputAsOutput(self) -> bool:
-            """Re-enumerates playback endpoints (never trusts a possibly-
-            stale prior diagnostics snapshot) and persists the unique
-            detected CABLE Input endpoint as this app's voice output - only
-            ever called from an explicit button click (XRBM-031 In-scope
-            item 5), and only after this method itself confirms exactly one
-            such endpoint currently exists.
+            """Detect and save CABLE Input without blocking the Qt thread."""
 
-            Never raises out of this Slot (XRBM-031 RETRY 1 item 3): both
-            enumeration and persistence failures are caught and reported as
-            an honest ``driverErrorMessage``, with no local path/device
-            identifier in the text, and ``False`` is returned - a failed
-            save is never reported as if it succeeded.
-            """
-
-            if self._vb_cable_test_running:
+            if (
+                self._vb_cable_test_running
+                or self._driver_action_running
+                or self._settings_controller._settings_save_busy
+                or self._settings_controller._endpoint_preflight_busy
+                or self._settings_controller._get_bridge_launch_busy()
+                or self._settings_controller._get_voice_hotkey_busy()
+                or _diagnostics_shutdown_event.is_set()
+                or self._settings_controller._application_exit_requested
+                or self._settings_controller._application_exit_intent.is_set()
+                or self._settings_controller._application_exit_confirmed
+            ):
                 return False
             self._invalidate_vb_cable_test_result()
-            try:
-                endpoints = audio_output.enumerate_output_endpoints()
-            except audio_output.AudioOutputUnavailableError as exc:
-                self._set_driver_error(f"无法检测播放端点：{exc}")
-                return False
-            except Exception:  # noqa: BLE001 - never let an unexpected enumeration failure escape this Slot
-                self._set_driver_error("播放端点检测失败")
-                return False
+            self._set_driver_action_running(True)
+            self._set_driver_info("正在检测并检查 CABLE Input…")
 
-            matches = [e for e in endpoints if audio_output.is_cable_input_endpoint(e.name)]
-            if not matches:
-                self._set_driver_error(
-                    "未找到 CABLE Input；请安装 VB-CABLE 并重启电脑"
+            def run() -> None:
+                try:
+                    endpoints = audio_output.enumerate_output_endpoints()
+                    matches = [
+                        endpoint
+                        for endpoint in endpoints
+                        if audio_output.is_cable_input_endpoint(endpoint.name)
+                    ]
+                    if not matches:
+                        payload = (
+                            None,
+                            "未找到 CABLE Input；请安装 VB-CABLE 并重启电脑",
+                        )
+                    else:
+                        try:
+                            endpoint = audio_output.select_preferred_output_endpoint(
+                                matches
+                            )
+                        except audio_output.AudioOutputUnavailableError:
+                            payload = (
+                                None,
+                                f"找到 {len(matches)} 个 CABLE Input；"
+                                "请在语音页的“输出端点”中选择",
+                            )
+                        else:
+                            payload = (endpoint, "")
+                except audio_output.AudioOutputUnavailableError:
+                    payload = (None, "无法检测播放端点")
+                except Exception:  # noqa: BLE001 - keep UI text sanitized
+                    payload = (None, "播放端点检测失败")
+                emitted = self._settings_controller._emit_background_result(
+                    self._detectedEndpointReady,
+                    payload,
                 )
-                return False
-            try:
-                endpoint = audio_output.select_preferred_output_endpoint(matches)
-            except audio_output.AudioOutputUnavailableError:
-                self._set_driver_error(
-                    f"找到 {len(matches)} 个 CABLE Input；请在语音页的“输出端点”中选择"
-                )
-                return False
-            try:
-                persisted = self._settings_controller.selectAndPersistOutputEndpoint(
-                    endpoint.name, endpoint.host_api
-                )
-            except Exception:  # noqa: BLE001 - defense in depth: selectAndPersistOutputEndpoint
-                # already catches its own persistence failures and returns
-                # False rather than raising, but this Slot must still never
-                # propagate an uncaught exception regardless.
-                persisted = False
+                if not emitted:
+                    _driver_action_active_event.clear()
 
-            if not persisted:
+            try:
+                self._settings_controller._start_background_task(
+                    run, "detect-cable-output-endpoint"
+                )
+            except Exception:
+                self._set_driver_action_running(False)
+                self._set_driver_error("无法启动播放端点检测")
+                return False
+            return True
+
+        def _on_detected_endpoint_ready(self, payload: object) -> None:
+            if (
+                _diagnostics_shutdown_event.is_set()
+                or self._settings_controller._application_exit_intent.is_set()
+                or self._settings_controller._application_exit_confirmed
+            ):
+                self._set_driver_action_running(False)
+                return
+            endpoint, message = payload
+            if endpoint is None:
+                self._set_driver_action_running(False)
+                self._set_driver_error(str(message))
+                return
+
+            def finished(ok: bool, error: str) -> None:
+                self._set_driver_action_running(False)
+                if not ok:
+                    self._set_driver_error(
+                        "输出端点保存失败；"
+                        + (error or "请在语音页重新选择")
+                    )
+                    return
+                self._set_vb_cable_test_state("idle", "", running=False)
+                self._set_driver_status(f"已保存输出端点：{endpoint.name}")
+
+            try:
+                accepted = self._settings_controller._select_and_persist_output_endpoint(
+                    endpoint.name,
+                    endpoint.host_api,
+                    finished,
+                    allow_driver_action=True,
+                )
+            except Exception:  # noqa: BLE001 - keep the async slot retryable
+                accepted = False
+            if not accepted and self._driver_action_running:
+                self._set_driver_action_running(False)
                 self._set_driver_error(
                     "输出端点保存失败；请在语音页重新选择"
                 )
-                return False
-
-            self._set_vb_cable_test_state("idle", "", running=False)
-            self._set_driver_status(f"已保存输出端点：{endpoint.name}")
-            return True
 
         @Slot()
         def launchVbCableSetup(self) -> None:
@@ -4643,22 +5813,16 @@ def run_settings_window(*, start_hidden: bool = False) -> int:
         return app.exec()
     finally:
         try:
-            controller.stopHotkeyCapture()
+            controller.shutdownForProcessExit()
         finally:
             try:
-                controller.stopKeyDetection()
+                # XRBM-035: called HERE, synchronously - whether app.exec()
+                # returned normally, engine.load() raised, rootObjects()
+                # was empty, input cleanup raised, or anything else in this
+                # block raised. Independent cleanup steps cannot skip the
+                # diagnostics-worker shutdown contract.
+                _shutdown_diagnostics_workers()
             finally:
-                try:
-                    controller.shutdownBackgroundTasks()
-                finally:
-                    try:
-                        # XRBM-035: called HERE, synchronously - whether app.exec()
-                        # returned normally, engine.load() raised, rootObjects()
-                        # was empty, either input cleanup raised, or anything else
-                        # in this block raised. Independent cleanup steps cannot
-                        # skip the diagnostics-worker shutdown contract.
-                        _shutdown_diagnostics_workers()
-                    finally:
-                        audio_playback.cleanup_retained_portaudio_test_resources(
-                            blocking=False
-                        )
+                audio_playback.cleanup_retained_portaudio_test_resources(
+                    blocking=False
+                )

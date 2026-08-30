@@ -49,6 +49,7 @@ on:
       - "COPYRIGHT.md"
       - "LICENSE.md"
       - "THIRD_PARTY_NOTICES.md"
+      - "Resources/RC003-remote-photo.png"
       - "device-profiles/xiaomi-rc003.json"
       - "device-profiles/dji-mic-2.json"
   pull_request:
@@ -58,6 +59,7 @@ on:
       - "COPYRIGHT.md"
       - "LICENSE.md"
       - "THIRD_PARTY_NOTICES.md"
+      - "Resources/RC003-remote-photo.png"
       - "device-profiles/xiaomi-rc003.json"
       - "device-profiles/dji-mic-2.json"
 

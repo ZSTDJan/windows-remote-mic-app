@@ -616,6 +616,58 @@ class RunDiagnosticsOrchestrationTests(unittest.TestCase):
                 f"{check_id} unexpectedly reported {result.status} on a non-real-hardware host",
             )
 
+    def test_output_endpoint_check_uses_the_isolated_preflight_and_cancel_event(self):
+        cancel_event = threading.Event()
+        captured = []
+
+        def _isolated_preflight(name, host_api, *, cancel_event=None, timeout=None):
+            captured.append((name, host_api, cancel_event, timeout))
+
+        def _output_check(saved_name, saved_host_api, *, preflight, **_kwargs):
+            preflight(saved_name, saved_host_api)
+            return diag.CheckResult(
+                "output_endpoint",
+                "语音输出端点",
+                diag.CheckGroup.VOICE_BRIDGE,
+                diag.CheckStatus.PASS,
+                "isolated",
+            )
+
+        simple_result = diag.CheckResult(
+            "placeholder",
+            "placeholder",
+            diag.CheckGroup.ORDINARY_BUTTONS,
+            diag.CheckStatus.PASS,
+            "ok",
+        )
+        with mock.patch.object(
+            diag,
+            "preflight_output_endpoint_isolated",
+            side_effect=_isolated_preflight,
+        ), mock.patch.object(
+            diag, "check_output_endpoint_resolution", side_effect=_output_check
+        ), mock.patch.object(
+            diag, "check_os_version", return_value=simple_result
+        ), mock.patch.object(
+            diag, "check_raw_input", return_value=simple_result
+        ), mock.patch.object(
+            diag, "check_ble_candidate", return_value=simple_result
+        ), mock.patch.object(
+            diag, "check_vb_cable_endpoints", return_value=simple_result
+        ), mock.patch.object(
+            diag, "check_dictation_manual", return_value=simple_result
+        ):
+            diag.run_diagnostics(
+                saved_output_name="CABLE Input",
+                saved_output_host_api="Windows WASAPI",
+                cancel_event=cancel_event,
+            )
+
+        self.assertEqual(len(captured), 1)
+        self.assertEqual(captured[0][:2], ("CABLE Input", "Windows WASAPI"))
+        self.assertIs(captured[0][2], cancel_event)
+        self.assertIsNone(captured[0][3])
+
 
 class RunDiagnosticsIsolationTests(unittest.TestCase):
     """XRBM-031 RETRY 1 item 2: an unexpected exception from any ONE check
@@ -758,6 +810,44 @@ class BuildVbCableLoopbackSubprocessCommandTests(unittest.TestCase):
             [
                 "RemoteMicRC003.exe",
                 diag.VB_CABLE_LOOPBACK_SUBPROCESS_FLAG,
+                "request.json",
+                "result.json",
+            ],
+        )
+
+
+class BuildOutputEndpointPreflightSubprocessCommandTests(unittest.TestCase):
+    def test_source_mode_passes_both_private_file_paths(self):
+        command = diag.build_output_endpoint_preflight_subprocess_command(
+            "/tmp/request.json",
+            "/tmp/result.json",
+            frozen=False,
+            executable="/usr/bin/python3",
+        )
+        self.assertEqual(
+            command,
+            [
+                "/usr/bin/python3",
+                "-m",
+                "ovb_rc003",
+                diag.OUTPUT_ENDPOINT_PREFLIGHT_SUBPROCESS_FLAG,
+                "/tmp/request.json",
+                "/tmp/result.json",
+            ],
+        )
+
+    def test_frozen_mode_reinvokes_the_exe_directly(self):
+        command = diag.build_output_endpoint_preflight_subprocess_command(
+            "request.json",
+            "result.json",
+            frozen=True,
+            executable="RemoteMicRC003.exe",
+        )
+        self.assertEqual(
+            command,
+            [
+                "RemoteMicRC003.exe",
+                diag.OUTPUT_ENDPOINT_PREFLIGHT_SUBPROCESS_FLAG,
                 "request.json",
                 "result.json",
             ],
@@ -1052,6 +1142,111 @@ class VbCableLoopbackSubprocessEntrypointTests(unittest.TestCase):
                 "detail": "测试信号已到达，不代表输入法已经识别文字。",
             },
         )
+
+
+class OutputEndpointPreflightSubprocessEntrypointTests(unittest.TestCase):
+    def setUp(self):
+        self._tmpdir = tempfile.mkdtemp()
+        self._request_path = os.path.join(self._tmpdir, "request.json")
+        self._result_path = os.path.join(self._tmpdir, "result.json")
+
+    def tearDown(self):
+        shutil.rmtree(self._tmpdir, ignore_errors=True)
+
+    def _write_request(self, payload=None):
+        value = payload or {
+            "saved_output_name": "CABLE Input",
+            "saved_output_host_api": "Windows WASAPI",
+        }
+        with open(self._request_path, "w", encoding="utf-8") as handle:
+            json.dump(value, handle)
+
+    def _read_result(self):
+        with open(self._result_path, "r", encoding="utf-8") as handle:
+            return json.load(handle)
+
+    def test_invalid_request_fails_closed_before_touching_audio(self):
+        self._write_request({"unexpected": "value"})
+        with mock.patch.object(
+            audio_playback, "preflight_output_endpoint"
+        ) as direct_check:
+            exit_code = diag.run_output_endpoint_preflight_subprocess_entrypoint(
+                self._request_path, self._result_path
+            )
+
+        self.assertEqual(exit_code, 1)
+        self.assertFalse(os.path.exists(self._result_path))
+        direct_check.assert_not_called()
+
+    def test_success_writes_only_the_ok_verdict(self):
+        self._write_request()
+        with mock.patch.object(
+            audio_playback, "preflight_output_endpoint"
+        ) as direct_check:
+            exit_code = diag.run_output_endpoint_preflight_subprocess_entrypoint(
+                self._request_path, self._result_path
+            )
+
+        self.assertEqual(exit_code, 0)
+        direct_check.assert_called_once_with("CABLE Input", "Windows WASAPI")
+        self.assertEqual(self._read_result(), {"verdict": "ok"})
+
+    def test_failure_writes_only_the_unavailable_verdict(self):
+        self._write_request()
+        with mock.patch.object(
+            audio_playback,
+            "preflight_output_endpoint",
+            side_effect=RuntimeError("private endpoint detail"),
+        ):
+            exit_code = diag.run_output_endpoint_preflight_subprocess_entrypoint(
+                self._request_path, self._result_path
+            )
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(self._read_result(), {"verdict": "unavailable"})
+        with open(self._result_path, "r", encoding="utf-8") as handle:
+            raw_text = handle.read()
+        self.assertNotIn("private endpoint detail", raw_text)
+
+    def test_result_write_failure_returns_nonzero(self):
+        self._write_request()
+        with mock.patch.object(
+            audio_playback,
+            "preflight_output_endpoint",
+        ), mock.patch.object(
+            diag,
+            "_write_verdict_atomically",
+            side_effect=OSError("disk unavailable"),
+        ):
+            exit_code = diag.run_output_endpoint_preflight_subprocess_entrypoint(
+                self._request_path,
+                self._result_path,
+            )
+
+        self.assertEqual(exit_code, 1)
+
+    def test_missing_required_path_fails_before_touching_audio(self):
+        self._write_request()
+        with mock.patch.object(
+            audio_playback,
+            "preflight_output_endpoint",
+        ) as direct_check:
+            self.assertEqual(
+                diag.run_output_endpoint_preflight_subprocess_entrypoint(
+                    self._request_path,
+                    None,
+                ),
+                1,
+            )
+            self.assertEqual(
+                diag.run_output_endpoint_preflight_subprocess_entrypoint(
+                    None,
+                    self._result_path,
+                ),
+                1,
+            )
+
+        direct_check.assert_not_called()
 
 
 class VbCableLoopbackResultValidationTests(unittest.TestCase):
@@ -1380,6 +1575,283 @@ class RunVbCableLoopbackSubprocessTests(unittest.TestCase):
         elapsed = time.monotonic() - started
         self.assertLess(elapsed, 5.0)
         self.assertIsNotNone(process_holder["proc"].poll())
+
+
+class RunOutputEndpointPreflightSubprocessTests(unittest.TestCase):
+    def test_cancel_event_already_set_never_spawns(self):
+        cancel_event = threading.Event()
+        cancel_event.set()
+
+        def _unexpected_popen(*_args, **_kwargs):
+            raise AssertionError("cancelled preflight must not spawn")
+
+        with self.assertRaises(diag.OutputEndpointPreflightCancelledError):
+            diag._run_output_endpoint_preflight_subprocess(
+                ["irrelevant"],
+                result_path="irrelevant",
+                cancel_event=cancel_event,
+                timeout=1.0,
+                popen=_unexpected_popen,
+            )
+
+    def test_total_timeout_terminates_and_confirms_the_child(self):
+        proc = _FakeProc(poll_returns=None)
+        with self.assertRaises(diag.OutputEndpointPreflightCancelledError):
+            diag._run_output_endpoint_preflight_subprocess(
+                ["irrelevant"],
+                result_path="irrelevant",
+                cancel_event=threading.Event(),
+                timeout=0.0,
+                popen=lambda *_args, **_kwargs: proc,
+            )
+
+        self.assertEqual(proc.terminate_calls, 1)
+        self.assertEqual(proc.kill_calls, 0)
+        self.assertEqual(proc.wait_calls, 1)
+
+    def test_unconfirmed_termination_is_reported_distinctly(self):
+        proc = _FakeProc(
+            poll_returns=None,
+            wait_raises=subprocess.TimeoutExpired(cmd="x", timeout=0.01),
+        )
+        with self.assertRaises(
+            diag.OutputEndpointPreflightShutdownUnconfirmedError
+        ):
+            diag._run_output_endpoint_preflight_subprocess(
+                ["irrelevant"],
+                result_path="irrelevant",
+                cancel_event=threading.Event(),
+                timeout=0.0,
+                terminate_wait=0.01,
+                kill_wait=0.01,
+                popen=lambda *_args, **_kwargs: proc,
+            )
+
+        self.assertEqual(proc.terminate_calls, 1)
+        self.assertEqual(proc.kill_calls, 1)
+
+    def test_poll_failure_terminates_the_child_before_reporting_failure(self):
+        proc = _FakeProc(poll_raises=OSError("poll failed"))
+
+        with self.assertRaises(RuntimeError):
+            diag._run_output_endpoint_preflight_subprocess(
+                ["irrelevant"],
+                result_path="irrelevant",
+                cancel_event=threading.Event(),
+                timeout=1.0,
+                popen=lambda *_args, **_kwargs: proc,
+            )
+
+        self.assertEqual(proc.terminate_calls, 1)
+        self.assertEqual(proc.kill_calls, 0)
+        self.assertEqual(proc.wait_calls, 1)
+
+    def test_poll_failure_reports_unconfirmed_shutdown_distinctly(self):
+        proc = _FakeProc(
+            poll_raises=OSError("poll failed"),
+            wait_raises=subprocess.TimeoutExpired(cmd="x", timeout=0.01),
+        )
+
+        with self.assertRaises(
+            diag.OutputEndpointPreflightShutdownUnconfirmedError
+        ):
+            diag._run_output_endpoint_preflight_subprocess(
+                ["irrelevant"],
+                result_path="irrelevant",
+                cancel_event=threading.Event(),
+                timeout=1.0,
+                terminate_wait=0.01,
+                kill_wait=0.01,
+                popen=lambda *_args, **_kwargs: proc,
+            )
+
+        self.assertEqual(proc.terminate_calls, 1)
+        self.assertEqual(proc.kill_calls, 1)
+
+    def test_parent_accepts_only_the_strict_ok_or_unavailable_verdicts(self):
+        tmpdir = tempfile.mkdtemp()
+        try:
+            result_path = os.path.join(tmpdir, "result.json")
+            proc = _FakeProc(poll_returns=0)
+
+            with open(result_path, "w", encoding="utf-8") as handle:
+                json.dump({"verdict": "ok"}, handle)
+            self.assertIs(
+                diag._run_output_endpoint_preflight_subprocess(
+                    ["irrelevant"],
+                    result_path=result_path,
+                    cancel_event=threading.Event(),
+                    timeout=1.0,
+                    popen=lambda *_args, **_kwargs: proc,
+                ),
+                True,
+            )
+
+            with open(result_path, "w", encoding="utf-8") as handle:
+                json.dump({"verdict": "unavailable"}, handle)
+            self.assertIs(
+                diag._read_output_endpoint_preflight_result(result_path, 0),
+                False,
+            )
+
+            with open(result_path, "w", encoding="utf-8") as handle:
+                json.dump({"verdict": "ok", "detail": "untrusted"}, handle)
+            self.assertIsNone(
+                diag._read_output_endpoint_preflight_result(result_path, 0)
+            )
+
+            for payload, returncode in (
+                ({"verdict": "ok"}, 1),
+                ({"verdict": "unknown"}, 0),
+                ({"verdict": "ok", "padding": "x" * 300}, 0),
+            ):
+                with self.subTest(payload=payload, returncode=returncode):
+                    with open(result_path, "w", encoding="utf-8") as handle:
+                        json.dump(payload, handle)
+                    self.assertIsNone(
+                        diag._read_output_endpoint_preflight_result(
+                            result_path,
+                            returncode,
+                        )
+                    )
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_temp_directory_is_removed_after_the_child_result(self):
+        created_dirs = []
+        real_mkdtemp = tempfile.mkdtemp
+
+        def _tracking_mkdtemp(*args, **kwargs):
+            path = real_mkdtemp(*args, **kwargs)
+            created_dirs.append(path)
+            return path
+
+        with mock.patch.object(tempfile, "mkdtemp", _tracking_mkdtemp), mock.patch.object(
+            diag,
+            "build_output_endpoint_preflight_subprocess_command",
+            return_value=["child"],
+        ), mock.patch.object(
+            diag,
+            "_run_output_endpoint_preflight_subprocess",
+            return_value=True,
+        ):
+            result = diag._run_output_endpoint_preflight_in_tempdir(
+                "CABLE Input",
+                "Windows WASAPI",
+                cancel_event=threading.Event(),
+                timeout=1.0,
+            )
+
+        self.assertIs(result, True)
+        self.assertEqual(len(created_dirs), 1)
+        self.assertFalse(os.path.exists(created_dirs[0]))
+
+    def test_temp_directory_cleanup_failure_is_reported(self):
+        created_dirs = []
+        real_mkdtemp = tempfile.mkdtemp
+
+        def _tracking_mkdtemp(*args, **kwargs):
+            path = real_mkdtemp(*args, **kwargs)
+            created_dirs.append(path)
+            return path
+
+        try:
+            with mock.patch.object(
+                tempfile,
+                "mkdtemp",
+                _tracking_mkdtemp,
+            ), mock.patch.object(
+                diag,
+                "build_output_endpoint_preflight_subprocess_command",
+                return_value=["child"],
+            ), mock.patch.object(
+                diag,
+                "_run_output_endpoint_preflight_subprocess",
+                return_value=True,
+            ), mock.patch.object(
+                diag.shutil,
+                "rmtree",
+                side_effect=OSError("cleanup failed"),
+            ):
+                with self.assertRaisesRegex(OSError, "cleanup failed"):
+                    diag._run_output_endpoint_preflight_in_tempdir(
+                        "CABLE Input",
+                        "Windows WASAPI",
+                        cancel_event=threading.Event(),
+                        timeout=1.0,
+                    )
+        finally:
+            for path in created_dirs:
+                shutil.rmtree(path, ignore_errors=True)
+
+    def test_unconfirmed_child_shutdown_remains_primary_if_cleanup_also_fails(self):
+        created_dirs = []
+        real_mkdtemp = tempfile.mkdtemp
+        shutdown_error = diag.OutputEndpointPreflightShutdownUnconfirmedError(
+            "child still running"
+        )
+        cleanup_error = OSError("cleanup failed")
+
+        def _tracking_mkdtemp(*args, **kwargs):
+            path = real_mkdtemp(*args, **kwargs)
+            created_dirs.append(path)
+            return path
+
+        try:
+            with mock.patch.object(
+                tempfile,
+                "mkdtemp",
+                _tracking_mkdtemp,
+            ), mock.patch.object(
+                diag,
+                "build_output_endpoint_preflight_subprocess_command",
+                return_value=["child"],
+            ), mock.patch.object(
+                diag,
+                "_run_output_endpoint_preflight_subprocess",
+                side_effect=shutdown_error,
+            ), mock.patch.object(
+                diag.shutil,
+                "rmtree",
+                side_effect=cleanup_error,
+            ):
+                with self.assertRaises(
+                    diag.OutputEndpointPreflightShutdownUnconfirmedError
+                ) as ctx:
+                    diag._run_output_endpoint_preflight_in_tempdir(
+                        "CABLE Input",
+                        "Windows WASAPI",
+                        cancel_event=threading.Event(),
+                        timeout=1.0,
+                    )
+        finally:
+            for path in created_dirs:
+                shutil.rmtree(path, ignore_errors=True)
+
+        self.assertIs(ctx.exception, shutdown_error)
+        self.assertIs(ctx.exception.__cause__, cleanup_error)
+
+    def test_public_wrapper_turns_every_non_success_into_a_sanitized_error(self):
+        with mock.patch.object(
+            diag, "_run_output_endpoint_preflight_in_tempdir", return_value=True
+        ):
+            diag.preflight_output_endpoint_isolated("name", "host")
+
+        with mock.patch.object(
+            diag, "_run_output_endpoint_preflight_in_tempdir", return_value=False
+        ):
+            with self.assertRaises(audio_output.AudioOutputUnavailableError) as ctx:
+                diag.preflight_output_endpoint_isolated("name", "host")
+        self.assertIn("unavailable", str(ctx.exception))
+
+        with mock.patch.object(
+            diag,
+            "_run_output_endpoint_preflight_in_tempdir",
+            side_effect=RuntimeError("private endpoint detail"),
+        ):
+            with self.assertRaises(audio_output.AudioOutputUnavailableError) as ctx:
+                diag.preflight_output_endpoint_isolated("name", "host")
+        self.assertNotIn("private endpoint detail", str(ctx.exception))
 
 
 def _spawn_ovb_rc003(*args: str) -> "list[str]":

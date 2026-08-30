@@ -6,6 +6,10 @@ import OvbRc003Settings 1.0
 Item {
     id: root
     property var tokens
+    property var backTabTarget: null
+    property var tabTarget: null
+    readonly property var firstFocusItem: refreshDeviceChecksButton
+    readonly property var lastFocusItem: closeBehaviorCombo
     signal openButtonsRequested()
 
     function checkResult(checkId) {
@@ -127,6 +131,7 @@ Item {
 
                     CompactButton {
                         objectName: "refreshDeviceChecksButton"
+                        id: refreshDeviceChecksButton
                         tokens: root.tokens
                         compactMinimumWidth: tokens.buttonWidth4Chars
                         text: DiagnosticsController.isRefreshing
@@ -134,6 +139,7 @@ Item {
                         enabled: !DiagnosticsController.isRefreshing
                             && !DiagnosticsController.vbCableTestRunning
                         onClicked: DiagnosticsController.refreshDiagnostics()
+                        KeyNavigation.backtab: root.backTabTarget
                     }
                     CompactButton {
                         objectName: "openBluetoothSettingsButton"
@@ -182,7 +188,9 @@ Item {
                         highlighted: true
                         enabled: !SettingsController.bridgeLaunchBusy
                             && !DiagnosticsController.vbCableTestRunning
+                            && !DiagnosticsController.driverActionRunning
                             && !SettingsController.voiceHotkeyBusy
+                            && !SettingsController.endpointPreflightBusy
                         onClicked: SettingsController.startBridge()
                     }
                 }
@@ -271,6 +279,7 @@ Item {
                         currentIndex: SettingsController.closeBehavior === "quit" ? 1 : 0
                         Accessible.name: qsTr("关闭窗口时")
                         onActivated: SettingsController.setCloseBehaviorIndex(index)
+                        KeyNavigation.tab: root.tabTarget
                     }
                 }
             }

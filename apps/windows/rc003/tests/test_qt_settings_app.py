@@ -149,6 +149,17 @@ class DiagnosticsThreadLifecycleAtExitTests(unittest.TestCase):
         source = inspect.getsource(qt_settings_app)
         self.assertIn('threading.Thread(target=_run_in_background, daemon=True)', source)
 
+    def test_full_exit_budget_covers_background_cleanup_bridge_stop_and_margin(self):
+        minimum = (
+            qt_settings_app._SETTINGS_BACKGROUND_JOIN_TIMEOUT_SECONDS
+            + bridge_control_windows.DEFAULT_EXIT_TIMEOUT_SECONDS
+            + 1.0
+        )
+        self.assertGreaterEqual(
+            qt_settings_app._APPLICATION_EXIT_WAIT_TIMEOUT_SECONDS,
+            minimum,
+        )
+
 
 class DiagnosticsShutdownOrderingTests(unittest.TestCase):
     """XRBM-031 RETRY 2: an independent review found that the previous fix
@@ -456,8 +467,12 @@ class SettingsControllerTests(unittest.TestCase):
             ),
         )
         self._voice_hotkey_sync_mock = self._voice_hotkey_sync_patch.start()
+        qt_settings_app._vb_cable_test_active_event.clear()
+        qt_settings_app._driver_action_active_event.clear()
 
     def tearDown(self):
+        qt_settings_app._vb_cable_test_active_event.clear()
+        qt_settings_app._driver_action_active_event.clear()
         self._startup_state_patch.stop()
         self._voice_hotkey_sync_patch.stop()
         self._voice_hotkey_read_patch.stop()
@@ -533,6 +548,314 @@ class SettingsControllerTests(unittest.TestCase):
         self.assertEqual(ready, [True])
         request_exit.assert_not_called()
         self.assertFalse(controller._application_exit_requested)
+
+    def test_full_exit_waits_for_an_in_progress_settings_save(self):
+        controller, _model = self._make_controller()
+        callbacks = []
+        ready = []
+        controller.applicationExitReady.connect(lambda: ready.append(True))
+        controller._set_settings_save_busy(True)
+
+        with mock.patch(
+            "PySide6.QtCore.QTimer.singleShot",
+            side_effect=lambda _delay, callback: callbacks.append(callback),
+        ):
+            controller.requestApplicationExit()
+
+            self.assertEqual(ready, [])
+            self.assertTrue(controller._application_exit_requested)
+            self.assertTrue(controller._application_exit_waiting_for_save)
+            self.assertFalse(controller._application_exit_intent.is_set())
+
+            controller._set_settings_save_busy(False)
+            controller._begin_application_exit()
+            self.assertEqual(ready, [])
+            callbacks.pop()()
+
+        self.assertEqual(ready, [True])
+        self.assertFalse(controller._application_exit_requested)
+        self.assertFalse(controller._application_exit_waiting_for_save)
+
+    def test_full_exit_save_wait_is_bounded_without_spending_the_cleanup_budget(self):
+        controller, _model = self._make_controller()
+        callbacks = []
+        failures = []
+        now = [10.0]
+        controller.applicationExitFailed.connect(failures.append)
+        controller._set_settings_save_busy(True)
+
+        with mock.patch.object(
+            qt_settings_app.time,
+            "monotonic",
+            side_effect=lambda: now[0],
+        ), mock.patch(
+            "PySide6.QtCore.QTimer.singleShot",
+            side_effect=lambda _delay, callback: callbacks.append(callback),
+        ):
+            controller.requestApplicationExit()
+            save_deadline = controller._application_exit_deadline
+            self.assertEqual(
+                save_deadline,
+                now[0]
+                + qt_settings_app._APPLICATION_EXIT_SAVE_WAIT_TIMEOUT_SECONDS,
+            )
+
+            now[0] += 5.0
+            controller._set_settings_save_busy(False)
+            controller._begin_application_exit()
+
+            self.assertEqual(
+                controller._application_exit_deadline,
+                now[0] + qt_settings_app._APPLICATION_EXIT_WAIT_TIMEOUT_SECONDS,
+            )
+            self.assertEqual(failures, [])
+            callbacks.pop()()
+
+        self.assertFalse(controller._application_exit_requested)
+
+    def test_full_exit_save_wait_times_out_instead_of_polling_forever(self):
+        controller, _model = self._make_controller()
+        callbacks = []
+        failures = []
+        now = [10.0]
+        controller.applicationExitFailed.connect(failures.append)
+        controller._set_settings_save_busy(True)
+
+        with mock.patch.object(
+            qt_settings_app.time,
+            "monotonic",
+            side_effect=lambda: now[0],
+        ), mock.patch(
+            "PySide6.QtCore.QTimer.singleShot",
+            side_effect=lambda _delay, callback: callbacks.append(callback),
+        ):
+            controller.requestApplicationExit()
+            now[0] = controller._application_exit_deadline
+            callbacks.pop()()
+
+        self.assertEqual(
+            failures,
+            ["完全退出超时：设置仍在保存，请稍后重试。"],
+        )
+        self.assertFalse(controller._application_exit_requested)
+        self.assertFalse(controller._application_exit_waiting_for_save)
+
+    def test_full_exit_reuses_the_existing_poll_and_starts_one_bridge_stop(self):
+        model = self.Model()
+        background_tasks = []
+        callbacks = []
+
+        def runner(target, name):
+            if name == "remote-mic-application-exit":
+                background_tasks.append((target, name))
+            else:
+                target()
+
+        controller = self.Controller(
+            model,
+            background_task_runner=runner,
+        )
+        controller._set_settings_save_busy(True)
+
+        with mock.patch(
+            "PySide6.QtCore.QTimer.singleShot",
+            side_effect=lambda _delay, callback: callbacks.append(callback),
+        ), mock.patch.object(
+            qt_settings_app.single_instance,
+            "bridge_instance_running",
+            return_value=True,
+        ):
+            controller.requestApplicationExit()
+            self.assertEqual(len(callbacks), 1)
+
+            controller._set_settings_save_busy(False)
+            controller._begin_application_exit()
+            self.assertEqual(background_tasks, [])
+
+            callbacks.pop()()
+            self.assertEqual(len(background_tasks), 1)
+            self.assertEqual(
+                background_tasks[0][1],
+                "remote-mic-application-exit",
+            )
+
+            controller._continue_application_exit()
+            self.assertEqual(len(background_tasks), 1)
+
+    def test_full_exit_stays_open_when_an_in_progress_save_fails(self):
+        saved_config = config.default_config()
+        saved_config["output_endpoint_name"] = "CABLE Input"
+        saved_config["output_endpoint_host_api"] = "Windows WASAPI"
+        config.save_config(config.config_path(config.config_root()), saved_config)
+        saved_bindings = config.default_key_bindings()
+        saved_bindings["bindings"]["mic"] = key_mapping.ButtonAction(
+            key_mapping.ActionKind.ESCAPE,
+        ).to_dict()
+        config.save_key_bindings(
+            config.key_bindings_path(config.config_root()),
+            saved_bindings,
+        )
+        endpoint = audio_output.AudioEndpoint(
+            name="CABLE Input",
+            host_api="Windows WASAPI",
+        )
+        deferred = []
+
+        def runner(target, name):
+            if name == "audio-endpoint-preflight":
+                deferred.append(target)
+            else:
+                target()
+
+        failures = []
+        with mock.patch.object(
+            audio_output,
+            "enumerate_output_endpoints",
+            return_value=[endpoint],
+        ), mock.patch.object(
+            qt_settings_app.windows_diagnostics,
+            "preflight_output_endpoint_isolated",
+            side_effect=audio_output.AudioOutputUnavailableError("cannot open"),
+        ):
+            model = self.Model()
+            controller = self.Controller(
+                model,
+                background_task_runner=runner,
+            )
+            model.setActionTextAt(
+                model.index_of("mic"),
+                settings_ui._VOICE_HOLD_DISPLAY,
+            )
+            controller.applicationExitFailed.connect(failures.append)
+
+            self.assertTrue(controller.saveSettings())
+            self.assertTrue(controller.settingsSaveBusy)
+            self.assertEqual(len(deferred), 1)
+
+            controller.requestApplicationExit()
+
+            self.assertTrue(controller._application_exit_requested)
+            self.assertTrue(controller._application_exit_waiting_for_save)
+            self.assertFalse(controller._application_exit_intent.is_set())
+            deferred.pop()()
+
+        self.assertEqual(failures, ["设置保存未完成，程序没有退出。"])
+        self.assertTrue(controller.settingsDirty)
+        self.assertFalse(controller._application_exit_requested)
+        self.assertFalse(controller._application_exit_waiting_for_save)
+        self.assertFalse(controller._application_exit_intent.is_set())
+
+    def test_full_exit_continues_after_a_real_async_save_succeeds(self):
+        saved_config = config.default_config()
+        saved_config["output_endpoint_name"] = "CABLE Input"
+        saved_config["output_endpoint_host_api"] = "Windows WASAPI"
+        config.save_config(config.config_path(config.config_root()), saved_config)
+        saved_bindings = config.default_key_bindings()
+        saved_bindings["bindings"]["mic"] = key_mapping.ButtonAction(
+            key_mapping.ActionKind.ESCAPE,
+        ).to_dict()
+        config.save_key_bindings(
+            config.key_bindings_path(config.config_root()),
+            saved_bindings,
+        )
+        endpoint = audio_output.AudioEndpoint(
+            name="CABLE Input",
+            host_api="Windows WASAPI",
+        )
+        deferred = []
+        callbacks = []
+
+        def runner(target, name):
+            if name == "audio-endpoint-preflight":
+                deferred.append(target)
+            else:
+                target()
+
+        ready = []
+        with mock.patch.object(
+            audio_output,
+            "enumerate_output_endpoints",
+            return_value=[endpoint],
+        ), mock.patch.object(
+            qt_settings_app.windows_diagnostics,
+            "preflight_output_endpoint_isolated",
+        ), mock.patch(
+            "PySide6.QtCore.QTimer.singleShot",
+            side_effect=lambda _delay, callback: callbacks.append(callback),
+        ):
+            model = self.Model()
+            controller = self.Controller(
+                model,
+                background_task_runner=runner,
+            )
+            model.setActionTextAt(
+                model.index_of("mic"),
+                settings_ui._VOICE_HOLD_DISPLAY,
+            )
+            controller.applicationExitReady.connect(lambda: ready.append(True))
+
+            self.assertTrue(controller.saveSettings())
+            controller.requestApplicationExit()
+            deferred.pop()()
+
+            self.assertTrue(controller._application_exit_requested)
+            self.assertFalse(controller._application_exit_waiting_for_save)
+            self.assertTrue(controller._application_exit_intent.is_set())
+            self.assertEqual(ready, [])
+            callbacks.pop()()
+
+        self.assertEqual(ready, [True])
+        self.assertFalse(controller._application_exit_requested)
+
+    def test_full_exit_waits_for_detect_and_save_driver_action(self):
+        controller, _model = self._make_controller()
+        ready = []
+        controller.applicationExitReady.connect(lambda: ready.append(True))
+        qt_settings_app._driver_action_active_event.set()
+
+        controller.requestApplicationExit()
+
+        self.assertEqual(ready, [])
+        self.assertTrue(controller._application_exit_requested)
+
+        qt_settings_app._driver_action_active_event.clear()
+        controller._continue_application_exit()
+
+        self.assertEqual(ready, [True])
+
+    def test_save_settings_and_exit_waits_for_the_save_result(self):
+        controller, _model = self._make_controller()
+        completions = []
+        finished = []
+        controller.saveSettingsAndExitFinished.connect(finished.append)
+        controller._save = lambda completion=None: (
+            completions.append(completion) or True
+        )
+        controller.requestApplicationExit = mock.Mock()
+
+        controller.saveSettingsAndExit()
+
+        controller.requestApplicationExit.assert_not_called()
+        self.assertEqual(len(completions), 1)
+        completions[0](True)
+        self.assertEqual(finished, [True])
+        controller.requestApplicationExit.assert_called_once_with()
+
+    def test_save_settings_and_exit_stays_open_when_save_fails(self):
+        controller, _model = self._make_controller()
+        completions = []
+        finished = []
+        controller.saveSettingsAndExitFinished.connect(finished.append)
+        controller._save = lambda completion=None: (
+            completions.append(completion) or True
+        )
+        controller.requestApplicationExit = mock.Mock()
+
+        controller.saveSettingsAndExit()
+        completions[0](False)
+
+        self.assertEqual(finished, [False])
+        controller.requestApplicationExit.assert_not_called()
 
     def test_full_exit_waits_for_the_bridge_to_stop(self):
         controller, _model = self._make_controller()
@@ -1036,7 +1359,7 @@ class SettingsControllerTests(unittest.TestCase):
         controller, _ = self._make_controller()
 
         controller.selectedVoiceProgramIndex = 3
-        controller.useWindowsDictationHotkey()
+        controller.holdVoiceHotkeyText = "ctrl+shift+x"
 
         self.assertTrue(controller.voiceProgramSystemManaged)
         self.assertFalse(controller.voiceProgramLaunchOnBridgeStart)
@@ -1044,6 +1367,38 @@ class SettingsControllerTests(unittest.TestCase):
         self.assertFalse(controller.settingsDirty)
         saved = config.load_config(config.config_path(config.config_root()))
         self.assertEqual(saved["voice_hotkeys"], {"hold": "win+h"})
+
+    def test_voice_program_options_keep_missing_apps_and_mark_them(self):
+        controller, _ = self._make_controller()
+
+        def inspect(settings):
+            provider_id = settings["provider"]
+            return voice_program_manager.VoiceProgramStatus(
+                provider_id=provider_id,
+                display_name=voice_program_manager.VOICE_PROGRAM_PROVIDER_NAMES[
+                    provider_id
+                ],
+                available=provider_id != voice_program_manager.VOICE_PROGRAM_SOGOU,
+                running=False,
+                elevated=None,
+                executable=None,
+                code=(
+                    "not_found"
+                    if provider_id == voice_program_manager.VOICE_PROGRAM_SOGOU
+                    else "stopped"
+                ),
+            )
+
+        with mock.patch.object(
+            qt_settings_app.voice_program_manager,
+            "inspect_voice_program",
+            side_effect=inspect,
+        ):
+            controller.refreshVoiceProgramOptions()
+
+        self.assertEqual(controller.voiceProgramOptions[1], "搜狗语音输入（未安装）")
+        self.assertEqual(controller.voiceProgramOptions[2], "微信输入法")
+        self.assertEqual(len(controller.voiceProgramOptions), 5)
 
     def test_unrelated_mapping_edit_does_not_mark_voice_program_dirty(self):
         controller, model = self._make_controller()
@@ -1096,7 +1451,7 @@ class SettingsControllerTests(unittest.TestCase):
         reopened.selectedVoiceProgramIndex = 1
         self.assertFalse(reopened.voiceProgramLaunchElevated)
 
-    def test_existing_managed_program_without_autostart_is_migrated_as_dirty(self):
+    def test_existing_managed_program_without_autostart_is_preserved(self):
         saved = config.default_config()
         saved["voice_program"] = {
             "provider": "sogou",
@@ -1108,11 +1463,11 @@ class SettingsControllerTests(unittest.TestCase):
 
         controller, _ = self._make_controller()
 
-        self.assertTrue(controller.voiceProgramLaunchOnBridgeStart)
+        self.assertFalse(controller.voiceProgramLaunchOnBridgeStart)
         self.assertFalse(controller.voiceProgramLaunchElevated)
-        self.assertTrue(controller.voiceProgramSettingsDirty)
-        self.assertTrue(controller.settingsDirty)
-        self.assertIn("随桥接启动", controller.statusMessage)
+        self.assertFalse(controller.voiceProgramSettingsDirty)
+        self.assertFalse(controller.settingsDirty)
+        self.assertNotIn("随桥接启动", controller.statusMessage)
 
     def test_voice_program_settings_persist_without_the_mapping_save(self):
         executable = Path(self._tmpdir.name) / "voice.exe"
@@ -1170,6 +1525,80 @@ class SettingsControllerTests(unittest.TestCase):
 
         save_pair.assert_not_called()
         self.assertIn("语音快捷键正在处理", controller.errorMessage)
+
+    def test_voice_settings_do_not_start_during_conflicting_audio_work(self):
+        blockers = (
+            (
+                "channel_test",
+                lambda controller: qt_settings_app._vb_cable_test_active_event.set(),
+                lambda controller: qt_settings_app._vb_cable_test_active_event.clear(),
+            ),
+            (
+                "bridge_launch",
+                lambda controller: controller._set_bridge_launch_phase("starting"),
+                lambda controller: controller._set_bridge_launch_phase("idle"),
+            ),
+            (
+                "endpoint_preflight",
+                lambda controller: setattr(controller, "_endpoint_preflight_busy", True),
+                lambda controller: setattr(controller, "_endpoint_preflight_busy", False),
+            ),
+            (
+                "driver_action",
+                lambda controller: qt_settings_app._driver_action_active_event.set(),
+                lambda controller: qt_settings_app._driver_action_active_event.clear(),
+            ),
+        )
+
+        for name, start, stop in blockers:
+            with self.subTest(name=name):
+                controller, _ = self._make_controller()
+                self._voice_hotkey_read_mock.reset_mock()
+                self._voice_hotkey_sync_mock.reset_mock()
+                start(controller)
+                try:
+                    controller.holdVoiceHotkeyText = "ctrl+l"
+                    controller.selectedVoiceProgramIndex = 1
+                    controller.refreshVoiceHotkeyFromProvider()
+                finally:
+                    stop(controller)
+
+                self.assertEqual(controller.holdVoiceHotkeyText, "ralt")
+                self.assertEqual(controller.selectedVoiceProgramIndex, 0)
+                self._voice_hotkey_read_mock.assert_not_called()
+                self._voice_hotkey_sync_mock.assert_not_called()
+
+    def test_mapping_save_is_rejected_during_audio_configuration_work(self):
+        blockers = (
+            (
+                "bridge_launch",
+                lambda controller: controller._set_bridge_launch_phase("starting"),
+                lambda controller: controller._set_bridge_launch_phase("idle"),
+            ),
+            (
+                "endpoint_preflight",
+                lambda controller: setattr(controller, "_endpoint_preflight_busy", True),
+                lambda controller: setattr(controller, "_endpoint_preflight_busy", False),
+            ),
+            (
+                "driver_action",
+                lambda controller: qt_settings_app._driver_action_active_event.set(),
+                lambda controller: qt_settings_app._driver_action_active_event.clear(),
+            ),
+        )
+
+        for name, start, stop in blockers:
+            with self.subTest(name=name):
+                controller, _ = self._make_controller()
+                start(controller)
+                try:
+                    with mock.patch.object(controller, "_save") as save:
+                        self.assertFalse(controller.saveSettings())
+                finally:
+                    stop(controller)
+
+                save.assert_not_called()
+                self.assertIn("其它操作正在进行", controller.errorMessage)
 
     def test_voice_program_launch_reports_a_normal_provider_result(self):
         controller, _ = self._make_controller()
@@ -1291,9 +1720,47 @@ class SettingsControllerTests(unittest.TestCase):
 
     def test_recording_a_hotkey_does_not_change_trigger_semantics(self):
         controller, _ = self._make_controller()
+        captured = []
+        controller.hotkeyCaptured.connect(captured.append)
+        controller._hotkey_capture = object()
+        controller._set_input_operation_state("hotkey", "active")
         controller._on_hotkey_capture_result("lctrl+lwin")
+        self.assertEqual(captured, ["lctrl+lwin"])
         controller.hotkeyText = "lctrl+lwin"
         self.assertEqual(controller.hotkeyText, "lctrl+lwin")
+
+    def test_late_hotkey_results_are_ignored_after_cleanup_or_exit_begins(self):
+        cases = (
+            "stopping",
+            "cleanup",
+            "hide",
+            "exit_requested",
+            "exit_confirmed",
+            "exit_intent",
+        )
+        for case in cases:
+            with self.subTest(case=case):
+                controller, _ = self._make_controller()
+                captured = []
+                controller.hotkeyCaptured.connect(captured.append)
+                controller._hotkey_capture = object()
+                controller._set_input_operation_state("hotkey", "active")
+                if case == "stopping":
+                    controller._set_input_operation_state("hotkey", "stopping")
+                elif case == "cleanup":
+                    controller._input_cleanup_requested = True
+                elif case == "hide":
+                    controller._window_hide_requested = True
+                elif case == "exit_requested":
+                    controller._application_exit_requested = True
+                elif case == "exit_confirmed":
+                    controller._application_exit_confirmed = True
+                else:
+                    controller._application_exit_intent.set()
+
+                controller._on_hotkey_capture_result("ctrl+alt+n")
+
+                self.assertEqual(captured, [])
 
     def test_launch_status_starts_as_the_not_started_constant(self):
         controller, _ = self._make_controller()
@@ -1718,7 +2185,8 @@ class SettingsControllerTests(unittest.TestCase):
         with mock.patch.object(
             audio_output, "enumerate_output_endpoints", return_value=endpoints
         ), mock.patch.object(
-            qt_settings_app.audio_playback, "preflight_output_endpoint"
+            qt_settings_app.windows_diagnostics,
+            "preflight_output_endpoint_isolated",
         ) as preflight:
             controller, _ = self._make_controller()
             self.assertFalse(controller.settingsDirty)
@@ -1726,8 +2194,15 @@ class SettingsControllerTests(unittest.TestCase):
 
         self.assertFalse(controller.settingsDirty)
         preflight.assert_called_once_with(
-            "CABLE Input (VB-Audio Virtual Cable)", "Windows WASAPI"
+            "CABLE Input (VB-Audio Virtual Cable)",
+            "Windows WASAPI",
+            cancel_event=mock.ANY,
         )
+        cancel_event = preflight.call_args.kwargs["cancel_event"]
+        self.assertFalse(cancel_event.is_set())
+        controller._application_exit_intent.set()
+        self.assertTrue(cancel_event.is_set())
+        controller._application_exit_intent.clear()
         saved = config.load_config(config.config_path(config.config_root()))
         self.assertEqual(
             saved["output_endpoint_name"],
@@ -1747,7 +2222,8 @@ class SettingsControllerTests(unittest.TestCase):
             controller, _ = self._make_controller()
 
         with mock.patch.object(
-            qt_settings_app.audio_playback, "preflight_output_endpoint"
+            qt_settings_app.windows_diagnostics,
+            "preflight_output_endpoint_isolated",
         ), mock.patch.object(
             config, "save_config", side_effect=OSError("disk full")
         ):
@@ -1755,6 +2231,64 @@ class SettingsControllerTests(unittest.TestCase):
 
         self.assertEqual(controller.selectedEndpointIndex, -1)
         self.assertIn("输出端点保存失败", controller.errorMessage)
+
+    def test_async_save_does_not_overwrite_an_edit_made_during_preflight(self):
+        saved_config = config.default_config()
+        saved_config["output_endpoint_name"] = "CABLE Input"
+        saved_config["output_endpoint_host_api"] = "Windows WASAPI"
+        config.save_config(config.config_path(config.config_root()), saved_config)
+        saved_bindings = config.default_key_bindings()
+        saved_bindings["bindings"]["mic"] = key_mapping.ButtonAction(
+            key_mapping.ActionKind.ESCAPE,
+        ).to_dict()
+        config.save_key_bindings(
+            config.key_bindings_path(config.config_root()),
+            saved_bindings,
+        )
+        endpoint = audio_output.AudioEndpoint(
+            name="CABLE Input",
+            host_api="Windows WASAPI",
+        )
+        deferred = []
+
+        def runner(target, name):
+            if name == "audio-endpoint-preflight":
+                deferred.append(target)
+            else:
+                target()
+
+        with mock.patch.object(
+            audio_output,
+            "enumerate_output_endpoints",
+            return_value=[endpoint],
+        ), mock.patch.object(
+            qt_settings_app.windows_diagnostics,
+            "preflight_output_endpoint_isolated",
+        ), mock.patch.object(config, "save_settings_pair") as save_pair:
+            model = self.Model()
+            controller = self.Controller(
+                model,
+                background_task_runner=runner,
+            )
+            model.setActionTextAt(
+                model.index_of("mic"),
+                settings_ui._VOICE_HOLD_DISPLAY,
+            )
+            completion = []
+
+            self.assertTrue(controller._save(completion=completion.append))
+            self.assertTrue(controller.settingsSaveBusy)
+            self.assertEqual(len(deferred), 1)
+
+            model.setActionTextAt(model.index_of("power"), "f5")
+            deferred.pop()()
+
+        save_pair.assert_not_called()
+        self.assertEqual(model.to_display_map()["power"], "f5")
+        self.assertTrue(controller.settingsDirty)
+        self.assertFalse(controller.settingsSaveBusy)
+        self.assertEqual(completion, [False])
+        self.assertIn("避免覆盖新修改", controller.errorMessage)
 
     def test_restore_defaults_marks_unsaved_changes(self):
         controller, _ = self._make_controller()
@@ -1876,8 +2410,8 @@ class SettingsControllerTests(unittest.TestCase):
         controller.holdVoiceHotkeyText = ""
 
         with mock.patch.object(
-            qt_settings_app.audio_playback,
-            "preflight_output_endpoint",
+            qt_settings_app.windows_diagnostics,
+            "preflight_output_endpoint_isolated",
             side_effect=AssertionError("preflight must be skipped without voice"),
         ) as preflight:
             self.assertTrue(controller.saveSettings())
@@ -1904,6 +2438,22 @@ class SettingsControllerTests(unittest.TestCase):
         self.assertEqual(controller.bridgeLaunchPhase, "failed")
         self.assertFalse(controller.bridgeLaunchBusy)
         self.assertIn("保存未完成", controller.launchStatusText)
+
+    def test_save_and_launch_waits_for_async_endpoint_preflight(self):
+        controller, _ = self._make_controller()
+        completions = []
+        controller._save = lambda completion=None: (
+            completions.append(completion) or True
+        )
+        controller._start_bridge_process = mock.Mock()
+
+        controller.saveAndLaunch()
+        self._continue_save_and_launch(controller)
+
+        controller._start_bridge_process.assert_not_called()
+        self.assertEqual(controller.bridgeLaunchPhase, "saving")
+        completions[0](True)
+        controller._start_bridge_process.assert_called_once_with()
 
     def test_save_and_launch_launches_and_reports_started_when_save_succeeds(self):
         controller, _ = self._make_controller()
@@ -1941,6 +2491,7 @@ class SettingsControllerTests(unittest.TestCase):
     def test_device_page_start_bridge_does_not_save_unrelated_dirty_edits(self):
         controller, model = self._make_controller()
         model.setActionTextAt(model.index_of("power"), "f5")
+        callbacks = []
         fake_result = bridge_launcher.LaunchResult(
             outcome=bridge_launcher.LaunchOutcome.STARTED,
             command=("exe",),
@@ -1949,14 +2500,95 @@ class SettingsControllerTests(unittest.TestCase):
 
         with mock.patch.object(controller, "_save") as save, mock.patch.object(
             bridge_launcher, "start_bridge_launch", return_value=fake_result
+        ), mock.patch(
+            "PySide6.QtCore.QTimer.singleShot",
+            side_effect=lambda _delay, callback: callbacks.append(callback),
         ):
             controller.startBridge()
-            controller._start_bridge_process()
+            self.assertEqual(controller.bridgeLaunchPhase, "starting")
+            self.assertEqual(len(callbacks), 1)
+            callbacks.pop()()
 
         save.assert_not_called()
         self.assertTrue(controller.settingsDirty)
         self.assertTrue(controller.bridgeRunning)
         self.assertEqual(controller.bridgeLaunchPhase, "waiting")
+
+    def test_start_bridge_double_press_queues_only_one_launch(self):
+        controller, _ = self._make_controller()
+        callbacks = []
+        fake_result = bridge_launcher.LaunchResult(
+            outcome=bridge_launcher.LaunchOutcome.STARTED,
+            command=("exe",),
+            pid=4321,
+        )
+        with mock.patch(
+            "PySide6.QtCore.QTimer.singleShot",
+            side_effect=lambda _delay, callback: callbacks.append(callback),
+        ), mock.patch.object(
+            bridge_launcher,
+            "start_bridge_launch",
+            return_value=fake_result,
+        ) as start_launch:
+            controller.startBridge()
+            controller.startBridge()
+
+            self.assertEqual(controller.bridgeLaunchPhase, "starting")
+            self.assertEqual(len(callbacks), 1)
+            callbacks.pop()()
+
+        start_launch.assert_called_once_with()
+
+    def test_start_bridge_rejects_output_configuration_work(self):
+        blockers = (
+            (
+                "endpoint_preflight",
+                lambda controller: setattr(controller, "_endpoint_preflight_busy", True),
+                lambda controller: setattr(controller, "_endpoint_preflight_busy", False),
+            ),
+            (
+                "driver_action",
+                lambda controller: qt_settings_app._driver_action_active_event.set(),
+                lambda controller: qt_settings_app._driver_action_active_event.clear(),
+            ),
+        )
+
+        for name, start, stop in blockers:
+            with self.subTest(name=name):
+                controller, _ = self._make_controller()
+                start(controller)
+                try:
+                    with mock.patch("PySide6.QtCore.QTimer.singleShot") as single_shot:
+                        controller.startBridge()
+                finally:
+                    stop(controller)
+
+                single_shot.assert_not_called()
+                self.assertEqual(controller.bridgeLaunchPhase, "idle")
+                self.assertIn("输出端点正在处理", controller.errorMessage)
+
+    def test_queued_bridge_start_is_cancelled_after_exit_confirmation(self):
+        controller, _ = self._make_controller()
+        callbacks = []
+        ready = []
+        controller.applicationExitReady.connect(lambda: ready.append(True))
+        with mock.patch(
+            "PySide6.QtCore.QTimer.singleShot",
+            side_effect=lambda _delay, callback: callbacks.append(callback),
+        ), mock.patch.object(
+            bridge_launcher,
+            "start_bridge_launch",
+        ) as start_launch:
+            controller.startBridge()
+            self.assertEqual(len(callbacks), 1)
+
+            controller.requestApplicationExit()
+            self.assertEqual(ready, [True])
+            self.assertTrue(controller.applicationExitConfirmed)
+            callbacks.pop()()
+
+        start_launch.assert_not_called()
+        self.assertEqual(controller.bridgeLaunchPhase, "idle")
 
     def test_existing_bridge_applies_the_saved_voice_program_without_restart(self):
         controller, _ = self._make_controller()
@@ -2192,6 +2824,7 @@ class SettingsControllerTests(unittest.TestCase):
     def test_closed_supplemental_key_channel_explains_temporary_limit(self):
         controller, _ = self._make_controller()
         controller._key_detection_active = True
+        controller._set_input_operation_state("key_detection", "active")
 
         controller._on_hid_tap_detection_status(
             frida_compat.HidTapState.UNHEALTHY.value,
@@ -2381,7 +3014,7 @@ class SettingsControllerTests(unittest.TestCase):
 
         controller.pollKeyDetectionBridge()
 
-        self.assertFalse(controller.keyDetectionActive)
+        self.assertTrue(controller.keyDetectionActive)
         self.assertIs(controller._key_detection_listener, listener)
         self.assertIn("停止 Windows 按键通道时出错", controller.keyDetectionText)
         self.assertNotIn("等待真实按键超时", controller.keyDetectionText)
@@ -2463,7 +3096,7 @@ class SettingsControllerTests(unittest.TestCase):
             controller.startKeyDetection()
 
         self.assertIs(controller._key_detection_listener, instances[0])
-        self.assertFalse(controller.keyDetectionActive)
+        self.assertTrue(controller.keyDetectionActive)
         tap.assert_not_called()
 
     def test_stop_key_detection_retains_each_owner_that_failed_to_stop(self):
@@ -2480,7 +3113,7 @@ class SettingsControllerTests(unittest.TestCase):
 
         self.assertIs(controller._key_detection_listener, listener)
         self.assertIs(controller._key_detection_tap, tap)
-        self.assertFalse(controller.keyDetectionActive)
+        self.assertTrue(controller.keyDetectionActive)
 
     def test_hotkey_start_failure_retains_a_still_running_capture(self):
         controller, _ = self._make_controller()
@@ -2506,6 +3139,62 @@ class SettingsControllerTests(unittest.TestCase):
         controller.stopHotkeyCapture()
 
         self.assertIs(controller._hotkey_capture, capture)
+
+    def test_input_stop_worker_owns_the_resource_during_process_shutdown(self):
+        controller, _ = self._make_controller()
+        controller._background_task_runner = None
+        entered = threading.Event()
+        release = threading.Event()
+        capture = mock.Mock()
+
+        def stop_capture():
+            entered.set()
+            self.assertTrue(release.wait(timeout=2.0))
+
+        capture.stop.side_effect = stop_capture
+        controller._hotkey_capture = capture
+        controller._set_input_operation_state("hotkey", "active")
+
+        self.assertTrue(controller.stopHotkeyCapture())
+        self.assertTrue(entered.wait(timeout=2.0))
+        release.set()
+        controller.shutdownForProcessExit()
+
+        capture.stop.assert_called_once_with()
+        self.assertIsNone(controller._hotkey_capture)
+
+    def test_stop_worker_start_failure_restores_the_transferred_resource(self):
+        controller, _ = self._make_controller()
+        capture = mock.Mock()
+        controller._hotkey_capture = capture
+        controller._set_input_operation_state("hotkey", "active")
+
+        def runner(_target, name):
+            if name == "hotkey-stop":
+                raise RuntimeError("worker unavailable")
+            _target()
+
+        controller._background_task_runner = runner
+
+        self.assertFalse(controller.stopHotkeyCapture())
+        self.assertIs(controller._hotkey_capture, capture)
+        self.assertEqual(controller._input_operation_phase, "active")
+        capture.stop.assert_not_called()
+
+    def test_process_exit_still_releases_input_after_worker_shutdown_failure(self):
+        controller, _ = self._make_controller()
+        capture = mock.Mock()
+        controller._hotkey_capture = capture
+        controller._set_input_operation_state("hotkey", "active")
+        controller.shutdownBackgroundTasks = mock.Mock(
+            side_effect=RuntimeError("worker shutdown failed")
+        )
+
+        with self.assertRaises(RuntimeError):
+            controller.shutdownForProcessExit()
+
+        capture.stop.assert_called_once_with()
+        self.assertIsNone(controller._hotkey_capture)
 
     def test_real_key_detection_accepts_missing_usage_from_hid_tap_and_stops_both(self):
         controller, model = self._make_controller()
@@ -2775,16 +3464,58 @@ class SettingsControllerTests(unittest.TestCase):
     def test_select_and_persist_output_endpoint_succeeds_and_updates_options(self):
         controller, _ = self._make_controller()
         with mock.patch.object(
-            qt_settings_app.audio_playback, "preflight_output_endpoint"
+            qt_settings_app.windows_diagnostics,
+            "preflight_output_endpoint_isolated",
         ) as preflight:
             result = controller.selectAndPersistOutputEndpoint(
                 "CABLE Input", "Windows WASAPI"
             )
         self.assertTrue(result)
-        preflight.assert_called_once_with("CABLE Input", "Windows WASAPI")
+        preflight.assert_called_once_with(
+            "CABLE Input",
+            "Windows WASAPI",
+            cancel_event=mock.ANY,
+        )
+        cancel_event = preflight.call_args.kwargs["cancel_event"]
+        self.assertFalse(cancel_event.is_set())
+        controller._application_exit_intent.set()
+        self.assertTrue(cancel_event.is_set())
+        controller._application_exit_intent.clear()
         reloaded = config.load_config(config.config_path(controller._config_root))
         self.assertEqual(reloaded["output_endpoint_name"], "CABLE Input")
         self.assertEqual(reloaded["output_endpoint_host_api"], "Windows WASAPI")
+
+    def test_output_endpoint_change_rejects_bridge_and_driver_actions(self):
+        blockers = (
+            (
+                "bridge_launch",
+                lambda controller: controller._set_bridge_launch_phase("starting"),
+                lambda controller: controller._set_bridge_launch_phase("idle"),
+            ),
+            (
+                "driver_action",
+                lambda controller: qt_settings_app._driver_action_active_event.set(),
+                lambda controller: qt_settings_app._driver_action_active_event.clear(),
+            ),
+        )
+
+        for name, start, stop in blockers:
+            with self.subTest(name=name):
+                controller, _ = self._make_controller()
+                start(controller)
+                try:
+                    with mock.patch.object(
+                        qt_settings_app.windows_diagnostics,
+                        "preflight_output_endpoint_isolated",
+                    ) as preflight:
+                        result = controller.selectAndPersistOutputEndpoint(
+                            "CABLE Input", "Windows WASAPI"
+                        )
+                finally:
+                    stop(controller)
+
+                self.assertFalse(result)
+                preflight.assert_not_called()
 
     def test_select_and_persist_output_endpoint_returns_false_on_persistence_failure(self):
         # XRBM-031 RETRY 1 item 3: a config-save failure (disk full,
@@ -2793,7 +3524,8 @@ class SettingsControllerTests(unittest.TestCase):
         controller, _ = self._make_controller()
         original_config = dict(controller._config)
         with mock.patch.object(
-            qt_settings_app.audio_playback, "preflight_output_endpoint"
+            qt_settings_app.windows_diagnostics,
+            "preflight_output_endpoint_isolated",
         ), mock.patch.object(config, "save_config", side_effect=OSError("disk full")):
             result = controller.selectAndPersistOutputEndpoint("CABLE Input", "Windows WASAPI")
         self.assertFalse(result)
@@ -2803,7 +3535,8 @@ class SettingsControllerTests(unittest.TestCase):
     def test_select_and_persist_output_endpoint_never_raises_on_unexpected_error(self):
         controller, _ = self._make_controller()
         with mock.patch.object(
-            qt_settings_app.audio_playback, "preflight_output_endpoint"
+            qt_settings_app.windows_diagnostics,
+            "preflight_output_endpoint_isolated",
         ), mock.patch.object(config, "save_config", side_effect=RuntimeError("boom")):
             result = controller.selectAndPersistOutputEndpoint("CABLE Input", "")
         self.assertFalse(result)
@@ -2812,14 +3545,55 @@ class SettingsControllerTests(unittest.TestCase):
         controller, _ = self._make_controller()
         original_config = dict(controller._config)
         with mock.patch.object(
-            qt_settings_app.audio_playback,
-            "preflight_output_endpoint",
+            qt_settings_app.windows_diagnostics,
+            "preflight_output_endpoint_isolated",
             side_effect=audio_output.AudioOutputUnavailableError("cannot open"),
         ), mock.patch.object(config, "save_config") as save_config:
             result = controller.selectAndPersistOutputEndpoint(
                 "CABLE Input", "Windows WASAPI"
             )
         self.assertFalse(result)
+        save_config.assert_not_called()
+        self.assertEqual(controller._config, original_config)
+
+    def test_output_endpoint_preflight_cancelled_by_exit_reports_exit_reason(self):
+        model = self.Model()
+        background_tasks = []
+        completions = []
+
+        def runner(target, name):
+            if name == "audio-endpoint-preflight":
+                background_tasks.append((target, name))
+            else:
+                target()
+
+        controller = self.Controller(
+            model,
+            background_task_runner=runner,
+        )
+        original_config = dict(controller._config)
+
+        with mock.patch.object(
+            qt_settings_app.windows_diagnostics,
+            "preflight_output_endpoint_isolated",
+            side_effect=audio_output.AudioOutputUnavailableError("cancelled"),
+        ), mock.patch.object(config, "save_config") as save_config:
+            self.assertTrue(
+                controller._select_and_persist_output_endpoint(
+                    "CABLE Input",
+                    "Windows WASAPI",
+                    lambda ok, message: completions.append((ok, message)),
+                )
+            )
+            self.assertEqual(len(background_tasks), 1)
+
+            controller.requestApplicationExit()
+            background_tasks.pop()[0]()
+
+        self.assertEqual(
+            completions,
+            [(False, "程序正在退出，未保存输出端点。")],
+        )
         save_config.assert_not_called()
         self.assertEqual(controller._config, original_config)
 
@@ -2857,10 +3631,12 @@ class DiagnosticsControllerTests(unittest.TestCase):
         # test/failure, and never leave it set for the next one.
         qt_settings_app._diagnostics_shutdown_event.clear()
         qt_settings_app._vb_cable_test_active_event.clear()
+        qt_settings_app._driver_action_active_event.clear()
 
     def tearDown(self):
         qt_settings_app._diagnostics_shutdown_event.clear()
         qt_settings_app._vb_cable_test_active_event.clear()
+        qt_settings_app._driver_action_active_event.clear()
         self._env_patch.stop()
         self._tmpdir.cleanup()
 
@@ -3219,11 +3995,13 @@ class DiagnosticsControllerTests(unittest.TestCase):
         with mock.patch.object(
             audio_output, "enumerate_output_endpoints", return_value=[endpoint]
         ), mock.patch.object(
-            qt_settings_app.audio_playback, "preflight_output_endpoint"
+            qt_settings_app.windows_diagnostics,
+            "preflight_output_endpoint_isolated",
         ):
             result = diag.selectDetectedCableInputAsOutput()
 
         self.assertTrue(result)
+        self.assertTrue(self._pump_until(lambda: not diag.driverActionRunning))
         self.assertIn("CABLE Input", diag.driverStatusMessage)
         # Persisted for real - reloading config from disk shows the change.
         reloaded = config.load_config(config.config_path(self._config_root))
@@ -3238,8 +4016,58 @@ class DiagnosticsControllerTests(unittest.TestCase):
         with mock.patch.object(audio_output, "enumerate_output_endpoints", return_value=[]):
             result = diag.selectDetectedCableInputAsOutput()
 
-        self.assertFalse(result)
+        self.assertTrue(result)
+        self.assertTrue(self._pump_until(lambda: not diag.driverActionRunning))
         self.assertIn("未找到", diag.driverErrorMessage)
+
+    def test_select_detected_cable_input_refuses_to_start_during_exit(self):
+        settings_controller = self._make_settings_controller()
+        diag = self.DiagnosticsController(settings_controller, self._config_root)
+        self._pump_until(lambda: not diag.isRefreshing)
+        settings_controller._application_exit_intent.set()
+
+        with mock.patch.object(
+            audio_output,
+            "enumerate_output_endpoints",
+        ) as enumerate_endpoints:
+            self.assertFalse(diag.selectDetectedCableInputAsOutput())
+
+        enumerate_endpoints.assert_not_called()
+        self.assertFalse(diag.driverActionRunning)
+        self.assertFalse(qt_settings_app._driver_action_active_event.is_set())
+
+    def test_select_detected_cable_input_refuses_bridge_and_endpoint_work(self):
+        blockers = (
+            (
+                "bridge_launch",
+                lambda controller: controller._set_bridge_launch_phase("starting"),
+                lambda controller: controller._set_bridge_launch_phase("idle"),
+            ),
+            (
+                "endpoint_preflight",
+                lambda controller: setattr(controller, "_endpoint_preflight_busy", True),
+                lambda controller: setattr(controller, "_endpoint_preflight_busy", False),
+            ),
+        )
+
+        for name, start, stop in blockers:
+            with self.subTest(name=name):
+                settings_controller = self._make_settings_controller()
+                diag = self.DiagnosticsController(
+                    settings_controller, self._config_root
+                )
+                self._pump_until(lambda: not diag.isRefreshing)
+                start(settings_controller)
+                try:
+                    with mock.patch.object(
+                        audio_output, "enumerate_output_endpoints"
+                    ) as enumerate_endpoints:
+                        self.assertFalse(diag.selectDetectedCableInputAsOutput())
+                finally:
+                    stop(settings_controller)
+
+                enumerate_endpoints.assert_not_called()
+                self.assertFalse(diag.driverActionRunning)
 
     def test_select_detected_cable_input_reports_an_honest_error_on_persistence_failure(self):
         # XRBM-031 RETRY 1 item 3: a config persistence failure must never
@@ -3255,12 +4083,13 @@ class DiagnosticsControllerTests(unittest.TestCase):
         ):
             with mock.patch.object(
                 settings_controller,
-                "selectAndPersistOutputEndpoint",
+                "_select_and_persist_output_endpoint",
                 side_effect=RuntimeError("boom"),
             ):
                 result = diag.selectDetectedCableInputAsOutput()
 
-        self.assertFalse(result)
+        self.assertTrue(result)
+        self.assertTrue(self._pump_until(lambda: not diag.driverActionRunning))
         self.assertNotIn("boom", diag.driverErrorMessage)
         self.assertEqual(diag.driverStatusMessage, "")
         error_lower = diag.driverErrorMessage.lower()
@@ -3276,11 +4105,14 @@ class DiagnosticsControllerTests(unittest.TestCase):
             audio_output, "enumerate_output_endpoints", return_value=[endpoint]
         ):
             with mock.patch.object(
-                settings_controller, "selectAndPersistOutputEndpoint", return_value=False
+                settings_controller,
+                "_select_and_persist_output_endpoint",
+                return_value=False,
             ):
                 result = diag.selectDetectedCableInputAsOutput()
 
-        self.assertFalse(result)
+        self.assertTrue(result)
+        self.assertTrue(self._pump_until(lambda: not diag.driverActionRunning))
         self.assertNotEqual(diag.driverErrorMessage, "")
         self.assertEqual(diag.driverStatusMessage, "")
 
@@ -3298,7 +4130,8 @@ class DiagnosticsControllerTests(unittest.TestCase):
         ):
             result = diag.selectDetectedCableInputAsOutput()
 
-        self.assertFalse(result)
+        self.assertTrue(result)
+        self.assertTrue(self._pump_until(lambda: not diag.driverActionRunning))
         self.assertIn("请在语音页", diag.driverErrorMessage)
 
     def test_select_detected_cable_input_prefers_wasapi_over_directsound(self):
@@ -3315,11 +4148,13 @@ class DiagnosticsControllerTests(unittest.TestCase):
         with mock.patch.object(
             audio_output, "enumerate_output_endpoints", return_value=endpoints
         ), mock.patch.object(
-            qt_settings_app.audio_playback, "preflight_output_endpoint"
+            qt_settings_app.windows_diagnostics,
+            "preflight_output_endpoint_isolated",
         ):
             result = diag.selectDetectedCableInputAsOutput()
 
         self.assertTrue(result)
+        self.assertTrue(self._pump_until(lambda: not diag.driverActionRunning))
         reloaded = config.load_config(config.config_path(self._config_root))
         self.assertEqual(reloaded["output_endpoint_host_api"], "Windows WASAPI")
 
@@ -3521,6 +4356,25 @@ class DiagnosticsControllerTests(unittest.TestCase):
         self.assertFalse(diag.vbCableTestRunning)
         self.assertEqual(diag.vbCableTestStatus, "fail")
         self.assertIn("正在启动", diag.vbCableTestMessage)
+        loopback.assert_not_called()
+
+    def test_vb_cable_channel_test_rejects_a_driver_action_in_progress(self):
+        settings_controller = self._make_settings_controller()
+        diag = self.DiagnosticsController(settings_controller, self._config_root)
+        self._pump_until(lambda: not diag.isRefreshing)
+        diag._set_driver_action_running(True)
+
+        try:
+            with mock.patch.object(
+                windows_diagnostics, "check_vb_cable_loopback_isolated"
+            ) as loopback:
+                diag.testVbCableChannel()
+        finally:
+            diag._set_driver_action_running(False)
+
+        self.assertFalse(diag.vbCableTestRunning)
+        self.assertEqual(diag.vbCableTestStatus, "fail")
+        self.assertIn("输出端点正在处理", diag.vbCableTestMessage)
         loopback.assert_not_called()
 
     def test_vb_cable_channel_test_rejects_voice_hotkey_work_in_progress(self):
@@ -3782,26 +4636,21 @@ class RunSettingsWindowShutdownCoverageTests(unittest.TestCase):
 
         marker.assert_called_once_with(4321)
 
-    def test_hotkey_cleanup_failure_cannot_skip_detection_or_worker_shutdown(self):
+    def test_settings_cleanup_failure_cannot_skip_diagnostics_shutdown(self):
         fake_classes = self._fake_classes(root_objects=[object()], exec_return=0)
         controller_class = fake_classes["SettingsController"]
-        detection_calls = []
-        settings_shutdown_calls = []
+        cleanup_calls = []
+
+        def fail_cleanup(instance):
+            cleanup_calls.append(instance)
+            raise RuntimeError("simulated settings cleanup failure")
+
         with mock.patch.object(
             qt_settings_app, "_load_qt_classes", return_value=fake_classes
         ), mock.patch.object(
             controller_class,
-            "stopHotkeyCapture",
-            side_effect=RuntimeError("simulated capture cleanup failure"),
-        ), mock.patch.object(
-            controller_class,
-            "stopKeyDetection",
-            side_effect=lambda instance: detection_calls.append(instance),
-            autospec=True,
-        ), mock.patch.object(
-            controller_class,
-            "shutdownBackgroundTasks",
-            side_effect=lambda instance: settings_shutdown_calls.append(instance),
+            "shutdownForProcessExit",
+            side_effect=fail_cleanup,
             autospec=True,
         ), mock.patch.object(
             qt_settings_app,
@@ -3811,8 +4660,7 @@ class RunSettingsWindowShutdownCoverageTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 qt_settings_app.run_settings_window()
 
-        self.assertEqual(len(detection_calls), 1)
-        self.assertEqual(len(settings_shutdown_calls), 1)
+        self.assertEqual(len(cleanup_calls), 1)
         shutdown_spy.assert_called()
         self.assertEqual(len(qt_settings_app._diagnostics_threads), 0)
 
@@ -5153,7 +6001,7 @@ class SettingsShellSourceContractTests(unittest.TestCase):
         self.assertIn("DiagnosticsController.vbCableTestRunning", self.voice_qml)
         self.assertIn('objectName: "bridgeTestConfirmDialog"', self.voice_qml)
         self.assertGreaterEqual(
-            self.voice_qml.count("!DiagnosticsController.vbCableTestRunning"),
+            self.voice_qml.count("!root.configurationWriteBusy"),
             2,
         )
 
@@ -5185,8 +6033,45 @@ class SettingsShellSourceContractTests(unittest.TestCase):
         for inset in ("leftInset", "rightInset", "topInset", "bottomInset"):
             self.assertIn(f"{inset}: 0", self.nav_button_qml)
         self.assertIn('objectName: root.objectName + "_background"', self.nav_button_qml)
-        self.assertEqual(self.main_qml.count("onPressed: tabBar.currentIndex ="), 3)
+        self.assertEqual(self.main_qml.count("onPressed: window.requestPage("), 3)
+        self.assertNotIn("onPressed: tabBar.currentIndex =", self.main_qml)
         self.assertNotIn("onClicked: tabBar.currentIndex =", self.main_qml)
+
+    def test_navigation_and_unsaved_exit_wait_for_cleanup_and_lock_during_save(self):
+        self.assertIn("function requestPage(index)", self.main_qml)
+        self.assertIn("SettingsController.stopInputCapture()", self.main_qml)
+        self.assertIn("function onInputCleanupReady()", self.main_qml)
+        self.assertIn("function onInputCleanupFailed(message)", self.main_qml)
+        self.assertIn("pendingExitPrompt", self.main_qml)
+        self.assertGreaterEqual(
+            self.main_qml.count("!SettingsController.settingsSaveBusy"),
+            4,
+        )
+        self.assertIn("Popup.NoAutoClose", self.main_qml)
+        save_function = self.main_qml[
+            self.main_qml.index("function saveAndExit()"):
+            self.main_qml.index("function discardAndExit()")
+        ]
+        self.assertNotIn("unsavedExitDialog.close()", save_function)
+        self.assertIn("onSaveSettingsAndExitFinished", self.main_qml)
+        exit_function = self.main_qml[
+            self.main_qml.index("function requestFullExit()"):
+            self.main_qml.index("function saveAndExit()")
+        ]
+        busy_index = exit_function.index("SettingsController.settingsSaveBusy")
+        dirty_index = exit_function.index("SettingsController.settingsDirty")
+        self.assertLess(busy_index, dirty_index)
+        self.assertIn("SettingsController.requestApplicationExit()", exit_function)
+        self.assertIn("property bool applicationExitInProgress: false", self.main_qml)
+        self.assertIn("window.applicationExitInProgress = true", exit_function)
+        self.assertGreaterEqual(
+            self.main_qml.count("&& !window.applicationExitInProgress"),
+            2,
+        )
+        self.assertGreaterEqual(
+            self.main_qml.count("window.applicationExitInProgress = false"),
+            2,
+        )
 
     def test_device_page_owns_the_three_desktop_behavior_options(self):
         self.assertIn('objectName: "desktopBehaviorSection"', self.device_qml)
@@ -5317,7 +6202,7 @@ class SettingsShellSourceContractTests(unittest.TestCase):
 
     def test_only_device_page_owns_internal_navigation_to_buttons(self):
         self.assertIn("signal openButtonsRequested()", self.device_qml)
-        self.assertIn("onOpenButtonsRequested: tabBar.currentIndex = 1", self.main_qml)
+        self.assertIn("onOpenButtonsRequested: window.requestPage(1)", self.main_qml)
         self.assertNotIn("openButtonsRequested", self.voice_qml)
 
     def test_buttons_page_keeps_the_mapping_cards_and_photo_sidebar(self):
@@ -5463,6 +6348,39 @@ class SettingsShellSourceContractTests(unittest.TestCase):
             r'(?s)objectName: "testVbCableChannelButton".*?'
             r"Layout\.fillWidth: true",
         )
+
+    def test_conflicting_audio_work_temporarily_locks_configuration_writes(self):
+        self.assertIn(
+            "readonly property bool endpointPreflightBusy:",
+            self.voice_qml,
+        )
+        self.assertIn("readonly property bool configurationWriteBusy:", self.voice_qml)
+        for busy_source in (
+            "DiagnosticsController.driverActionRunning",
+            "DiagnosticsController.vbCableTestRunning",
+            "SettingsController.bridgeLaunchBusy",
+            "root.endpointPreflightBusy",
+        ):
+            self.assertIn(busy_source, self.voice_qml)
+        self.assertGreaterEqual(
+            self.voice_qml.count("!root.configurationWriteBusy"),
+            9,
+        )
+        self.assertIn(
+            "&& !SettingsController.endpointPreflightBusy",
+            self.device_qml,
+        )
+        self.assertIn(
+            "&& !DiagnosticsController.driverActionRunning",
+            self.device_qml,
+        )
+        for busy_source in (
+            "&& !SettingsController.bridgeLaunchBusy",
+            "&& !SettingsController.endpointPreflightBusy",
+            "&& !DiagnosticsController.driverActionRunning",
+            "&& !DiagnosticsController.vbCableTestRunning",
+        ):
+            self.assertIn(busy_source, self.buttons_qml)
 
 
 class ThreePageSettingsSourceContractTests(unittest.TestCase):
@@ -5636,11 +6554,13 @@ class SelectionComboBoxBehaviorTests(unittest.TestCase):
 
         env = dict(os.environ)
         env.setdefault("QT_QPA_PLATFORM", "offscreen")
+        env["PYTHONIOENCODING"] = "utf-8"
         result = subprocess.run(
             [sys.executable, "-c", _SELECTION_COMBO_STATE_PROBE_SCRIPT],
             env=env,
             capture_output=True,
             text=True,
+            encoding="utf-8",
             timeout=60,
         )
         self.assertEqual(

@@ -211,6 +211,17 @@ class PyInstallerSpecTests(unittest.TestCase):
         self.assertNotIn('glob("*.xz")', text)
         self.assertNotIn("frida-gadget-17.15.3-windows-x86_64.dll.xz", text)
 
+    def test_spec_requires_and_bundles_the_remote_photo(self):
+        text = _strip_hash_comments(_SPEC_PATH.read_text(encoding="utf-8"))
+        self.assertIn('REMOTE_PHOTO = REPO_ROOT / "Resources"', text)
+        self.assertIn('if not REMOTE_PHOTO.is_file():', text)
+        self.assertIn("raise SystemExit", text)
+        self.assertIn(
+            'datas.append((str(REMOTE_PHOTO), "Resources"))',
+            text,
+        )
+        self.assertNotIn("if REMOTE_PHOTO.is_file():", text)
+
     def test_spec_bundles_the_verified_vb_cable_zip_as_data_not_a_binary_dependency(self):
         # XRBM-031: unlike Frida, the pinned VB-CABLE base package IS now
         # bundled - but only as opaque `datas` (an ordinary file PyInstaller
@@ -566,6 +577,7 @@ class WindowsCiWorkflowTests(unittest.TestCase):
             "COPYRIGHT.md",
             "LICENSE.md",
             "THIRD_PARTY_NOTICES.md",
+            "Resources/RC003-remote-photo.png",
             "device-profiles/xiaomi-rc003.json",
         ):
             trigger_line = f'      - "{path_trigger}"'
@@ -1006,6 +1018,17 @@ class BuildCandidateScriptTests(unittest.TestCase):
         # workflow's test-suite step, not just document it in prose.
         self.assertIn("-W error::ResourceWarning -m unittest discover", self.text)
 
+    def test_test_suite_full_log_is_scanned_for_late_resource_leaks(self):
+        self.assertIn("Tee-Object -FilePath", self.text)
+        self.assertIn("Get-Content -LiteralPath $testLogPath -Raw", self.text)
+        for pattern in (
+            "ResourceWarning:",
+            "unclosed event loop",
+            "unclosed <socket.socket",
+        ):
+            self.assertIn(f'"{pattern}"', self.text)
+        self.assertIn("Remove-Item -LiteralPath $testLogPath", self.text)
+
     def test_local_build_disables_all_live_keyboard_input(self):
         self.assertIn('$env:RC003_DISABLE_LIVE_INPUT = "1"', self.text)
         self.assertIn('$env:RC003_ALLOW_LIVE_INPUT_TESTS = "0"', self.text)
@@ -1201,6 +1224,34 @@ class UserFacingDocumentationContractTests(unittest.TestCase):
             self.assertIn("13", text)
             self.assertIn("没有独立的物理静音键", text)
             self.assertIn("返回", text)
+
+    def test_installed_readme_matches_the_current_three_page_workflow(self):
+        text = self.installed_readme_text
+        for current_term in (
+            "设备”“按键”“语音",
+            "启动桥接",
+            "安装虚拟音频",
+            "应用",
+            "日志目录",
+            "通知区域",
+            "完全退出",
+            "小米遥控器2 Pro",
+        ):
+            self.assertIn(current_term, text)
+        for obsolete_term in (
+            "保存并启动桥接",
+            "退出桥接",
+            "“连接”“按键”“权限”“诊断”四个页面",
+            "从“诊断”页",
+            "不会开机自动启动",
+        ):
+            self.assertNotIn(obsolete_term, text)
+
+    def test_frida_fetch_wording_matches_the_real_build_entrypoints(self):
+        self.assertNotIn("不会由构建脚本自动下载", self.readme_text)
+        self.assertIn("build-candidate.ps1", self.readme_text)
+        self.assertIn("Windows CI", self.readme_text)
+        self.assertIn("自动执行", self.readme_text)
 
 
 class RootDocumentConsistencyTests(unittest.TestCase):
