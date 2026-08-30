@@ -16,6 +16,7 @@ SCRIPT_PATH = (
     / "element_navigation_prototype.py"
 )
 TARGETING_CORE_PATH = SCRIPT_PATH.with_name("element_targeting_core.py")
+SUPPORT_PATH = SCRIPT_PATH.with_name("element_navigation_support.py")
 SPEC = importlib.util.spec_from_file_location("element_navigation_prototype", SCRIPT_PATH)
 assert SPEC is not None and SPEC.loader is not None
 prototype = importlib.util.module_from_spec(SPEC)
@@ -131,6 +132,42 @@ class SpatialNavigationTests(unittest.TestCase):
                 "spatial_navigation_core",
                 "threading",
                 "time",
+                "typing",
+            },
+        )
+
+    def test_legacy_entry_reexports_every_navigation_support_symbol(self):
+        support = prototype._element_navigation_support
+        existing_exports = set(prototype._spatial_navigation_core.__all__) | set(
+            prototype._element_targeting_core.__all__
+        )
+
+        self.assertEqual(Path(support.__file__).resolve(), SUPPORT_PATH)
+        self.assertTrue(set(support.__all__).isdisjoint(existing_exports))
+        for name in support.__all__:
+            with self.subTest(name=name):
+                self.assertIs(getattr(prototype, name), getattr(support, name))
+
+    def test_navigation_support_has_no_platform_or_entry_dependencies(self):
+        tree = ast.parse(SUPPORT_PATH.read_text(encoding="utf-8"))
+        imported_modules = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                imported_modules.update(
+                    alias.name.split(".", 1)[0] for alias in node.names
+                )
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                imported_modules.add(node.module.split(".", 1)[0])
+
+        self.assertEqual(
+            imported_modules,
+            {
+                "__future__",
+                "dataclasses",
+                "element_targeting_core",
+                "json",
+                "os",
+                "spatial_navigation_core",
                 "typing",
             },
         )
