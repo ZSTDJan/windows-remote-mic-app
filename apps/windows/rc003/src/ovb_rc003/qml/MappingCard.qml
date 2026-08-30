@@ -201,21 +201,17 @@ AbstractButton {
         columns: 2
         columnSpacing: 4
 
-        UiLabel {
+        MappingKeyLabel {
             objectName: root.exposeObjectNames ? "mappingKeyCell_" + root.cardId : ""
             tokens: root.tokens
-            kind: bodyKind
             Layout.preferredWidth: 32
             Layout.minimumWidth: 32
             Layout.maximumWidth: 32
             Layout.fillHeight: true
             text: root.buttonName
             Accessible.name: text
-            font.pixelSize: root.tokens.fontSizeSmall
-            font.weight: Font.Medium
             horizontalAlignment: Text.AlignHCenter
             verticalAlignment: Text.AlignVCenter
-            elide: Text.ElideRight
         }
 
         GridLayout {

@@ -1187,7 +1187,7 @@ Item {
                     Rectangle {
                         objectName: "comboMappingHeader"
                         Layout.fillWidth: true
-                        Layout.preferredHeight: 24
+                        Layout.preferredHeight: tokens.comboMappingHeaderHeight
                         radius: tokens.cornerRadiusControl
                         color: tokens.surfaceMuted
                         border.color: tokens.border
@@ -1195,14 +1195,14 @@ Item {
 
                         RowLayout {
                             anchors.fill: parent
-                            anchors.leftMargin: tokens.spacingMedium
-                            anchors.rightMargin: tokens.spacingMedium
-                            spacing: tokens.spacingSmall
+                            anchors.leftMargin: tokens.comboMappingHorizontalPadding
+                            anchors.rightMargin: tokens.comboMappingHorizontalPadding
+                            spacing: tokens.comboMappingColumnSpacing
 
                             UiLabel {
                                 tokens: root.tokens
                                 kind: noteKind
-                                Layout.preferredWidth: 92
+                                Layout.preferredWidth: tokens.comboMappingKeyColumnWidth
                                 text: qsTr("遥控器按键")
                             }
                             UiLabel {
@@ -1215,7 +1215,7 @@ Item {
                             UiLabel {
                                 tokens: root.tokens
                                 kind: noteKind
-                                Layout.preferredWidth: 154
+                                Layout.preferredWidth: tokens.comboMappingNoteColumnWidth
                                 text: qsTr("备注名称")
                             }
                         }
@@ -1225,8 +1225,8 @@ Item {
                         id: comboMappingRows
                         objectName: "comboMappingRows"
                         Layout.fillWidth: true
-                        Layout.fillHeight: true
-                        spacing: 2
+                        Layout.fillHeight: false
+                        spacing: tokens.comboMappingRowSpacing
 
                         Repeater {
                             model: SettingsController.comboRows
@@ -1239,7 +1239,7 @@ Item {
                                 required property string noteText
 
                                 Layout.fillWidth: true
-                                Layout.preferredHeight: 32
+                                Layout.preferredHeight: tokens.comboMappingRowHeight
                                 radius: tokens.cornerRadiusControl
                                 color: index % 2 === 0 ? tokens.surface : tokens.fieldBackground
                                 border.color: tokens.border
@@ -1248,19 +1248,17 @@ Item {
 
                                 RowLayout {
                                     anchors.fill: parent
-                                    anchors.leftMargin: tokens.spacingMedium
-                                    anchors.rightMargin: tokens.spacingMedium
-                                    spacing: tokens.spacingSmall
+                                    anchors.leftMargin: tokens.comboMappingHorizontalPadding
+                                    anchors.rightMargin: tokens.comboMappingHorizontalPadding
+                                    spacing: tokens.comboMappingColumnSpacing
 
-                                    UiLabel {
+                                    MappingKeyLabel {
                                         id: comboGestureTitle
+                                        objectName: "comboMappingTitle_" + buttonId
                                         tokens: root.tokens
-                                        kind: bodyKind
-                                        Layout.preferredWidth: 92
+                                        Layout.preferredWidth: tokens.comboMappingKeyColumnWidth
                                         text: SettingsController.comboModifierText
                                             + " + " + root.shortButtonName(buttonId)
-                                        font.weight: Font.Medium
-                                        elide: Text.ElideRight
                                         HoverHandler { id: comboGestureTitleHover }
                                         CompactToolTip {
                                             tokens: root.tokens
@@ -1306,7 +1304,7 @@ Item {
                                         id: comboNoteEditor
                                         objectName: "comboNoteEditor_" + buttonId
                                         tokens: root.tokens
-                                        Layout.preferredWidth: 154
+                                        Layout.preferredWidth: tokens.comboMappingNoteColumnWidth
                                         text: noteText
                                         placeholderText: qsTr("如：置顶窗口")
                                         onTextChanged: SettingsController.setComboNoteText(
@@ -1319,6 +1317,8 @@ Item {
                             }
                         }
                     }
+
+                    Item { Layout.fillHeight: true }
                 }
             }
 

@@ -4760,6 +4760,10 @@ class SettingsShellSourceContractTests(unittest.TestCase):
         self.mapping_card_qml = (qml_dir / "MappingCard.qml").read_text(
             encoding="utf-8"
         )
+        self.mapping_key_label_qml = (qml_dir / "MappingKeyLabel.qml").read_text(
+            encoding="utf-8"
+        )
+        self.tokens_qml = (qml_dir / "Tokens.qml").read_text(encoding="utf-8")
         self.compact_tooltip_qml = (qml_dir / "CompactToolTip.qml").read_text(
             encoding="utf-8"
         )
@@ -4818,6 +4822,33 @@ class SettingsShellSourceContractTests(unittest.TestCase):
         self.assertIn("AbstractButton {", self.mapping_card_qml)
         self.assertIn("implicitHeight: 49", self.mapping_card_qml)
         self.assertNotIn("mappingCardHeight", self.buttons_qml)
+
+    def test_mapping_views_share_key_titles_and_combo_table_metrics(self):
+        self.assertIn(
+            "font.pixelSize: root.tokens.fontSizeMappingKey",
+            self.mapping_key_label_qml,
+        )
+        self.assertIn("font.weight: Font.Medium", self.mapping_key_label_qml)
+        self.assertEqual(self.mapping_card_qml.count("MappingKeyLabel {"), 1)
+        self.assertEqual(self.buttons_qml.count("MappingKeyLabel {"), 1)
+
+        for token_name in (
+            "comboMappingKeyColumnWidth",
+            "comboMappingNoteColumnWidth",
+            "comboMappingHeaderHeight",
+            "comboMappingRowHeight",
+            "comboMappingRowSpacing",
+            "comboMappingHorizontalPadding",
+            "comboMappingColumnSpacing",
+        ):
+            self.assertIn(f"property int {token_name}", self.tokens_qml)
+            self.assertIn(f"tokens.{token_name}", self.buttons_qml)
+
+        combo_rows_index = self.buttons_qml.index('objectName: "comboMappingRows"')
+        combo_rows_end = self.buttons_qml.index("Repeater {", combo_rows_index)
+        combo_rows_contract = self.buttons_qml[combo_rows_index:combo_rows_end]
+        self.assertIn("Layout.fillHeight: false", combo_rows_contract)
+        self.assertIn("Item { Layout.fillHeight: true }", self.buttons_qml)
 
     def test_all_selectors_reuse_one_selected_option_delegate(self):
         self.assertEqual(self.voice_qml.count("SelectionComboBox {"), 2)
@@ -5052,7 +5083,7 @@ class SettingsShellSourceContractTests(unittest.TestCase):
         self.assertIn("columnSpacing: 0", self.mapping_card_qml)
         self.assertIn("spacing: 0", self.mapping_card_qml)
         self.assertIn("root.tokens.surfaceMuted", self.mapping_card_qml)
-        self.assertIn("font.pixelSize: root.tokens.fontSizeSmall", self.mapping_card_qml)
+        self.assertIn("MappingKeyLabel {", self.mapping_card_qml)
         self.assertIn("fontFamilyMono", self.mapping_card_qml)
         self.assertIn('"Delete": "Del"', self.mapping_card_qml)
         self.assertIn('"Delete（退格）": "Del"', self.mapping_card_qml)
@@ -6611,6 +6642,8 @@ QTest.mouseClick(window, Qt.LeftButton, Qt.NoModifier, combo_click)
 _render(window, app, 5)
 combo_mapping_list = _find(window, "comboMappingList")
 combo_modifier = _find(window, "comboModifierCombo")
+combo_mapping_header = _find(window, "comboMappingHeader")
+combo_mapping_rows = _find(window, "comboMappingRows")
 combo_rows = {
     button_id: _find(window, "comboMappingRow_" + button_id)
     for button_id in ("up", "down", "left", "right", "ok", "back", "volume_up", "volume_down")
@@ -6619,10 +6652,17 @@ combo_editors = {
     button_id: _find(window, "comboActionEditor_" + button_id)
     for button_id in combo_rows
 }
+combo_titles = {
+    button_id: _find(window, "comboMappingTitle_" + button_id)
+    for button_id in combo_rows
+}
 assert combo_mapping_list is not None and combo_mapping_list.property("visible")
 assert combo_modifier is not None and combo_modifier.property("visible")
+assert combo_mapping_header is not None and combo_mapping_header.property("visible")
+assert combo_mapping_rows is not None and combo_mapping_rows.property("visible")
 assert all(item is not None and item.property("visible") for item in combo_rows.values())
 assert all(item is not None and item.property("visible") for item in combo_editors.values())
+assert all(item is not None and item.property("visible") for item in combo_titles.values())
 combo_screenshot = os.environ.get("RC003_COMBO_MAPPING_SCREENSHOT")
 if combo_screenshot:
     _render(window, app, 2)
@@ -6649,6 +6689,8 @@ card_ids = (
 )
 cards = {button_id: _find(window, "editMapping_" + button_id) for button_id in card_ids}
 assert all(item is not None and item.property("visible") for item in cards.values())
+single_key_title = _find(window, "mappingKeyCell_power")
+assert single_key_title is not None and single_key_title.property("visible")
 hotspots = {
     button_id: _find(window, "photoHotspot_" + button_id)
     for button_id in card_ids
@@ -6739,6 +6781,12 @@ results_out = {
     "combo_view": {
         "list": _geometry(combo_mapping_list),
         "modifier": _geometry(combo_modifier),
+        "header": _geometry(combo_mapping_header),
+        "rows_container": _geometry(combo_mapping_rows),
+        "key_title_pixel_sizes": {
+            "single": int(single_key_title.property("font").pixelSize()),
+            "combo": int(combo_titles["up"].property("font").pixelSize()),
+        },
         "rows": {
             button_id: _geometry(item)
             for button_id, item in combo_rows.items()
@@ -6969,6 +7017,32 @@ class ButtonsPageMappingCardTests(unittest.TestCase):
                 if previous_bottom is not None:
                     self.assertLessEqual(previous_bottom, row["y"] + 1)
                 previous_bottom = row["bottom"]
+
+            first_combo_row = data["combo_view"]["rows"][
+                key_mapping.COMBO_ACTION_BUTTON_IDS[0]
+            ]
+            last_combo_row = data["combo_view"]["rows"][
+                key_mapping.COMBO_ACTION_BUTTON_IDS[-1]
+            ]
+            self.assertAlmostEqual(
+                first_combo_row["y"] - data["combo_view"]["header"]["bottom"],
+                6,
+                delta=1,
+            )
+            self.assertAlmostEqual(
+                data["combo_view"]["rows_container"]["y"],
+                first_combo_row["y"],
+                delta=1,
+            )
+            self.assertAlmostEqual(
+                data["combo_view"]["rows_container"]["height"],
+                last_combo_row["bottom"] - first_combo_row["y"],
+                delta=1,
+            )
+            self.assertEqual(
+                data["combo_view"]["key_title_pixel_sizes"]["single"],
+                data["combo_view"]["key_title_pixel_sizes"]["combo"],
+            )
 
     def test_power_card_gesture_cells_are_equal_and_aligned(self):
         for style, width, height in (("Basic", 720, 500), ("Basic", 640, 480), ("FluentWinUI3", 720, 500)):

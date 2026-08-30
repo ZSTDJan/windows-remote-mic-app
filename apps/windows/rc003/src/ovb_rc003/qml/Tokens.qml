@@ -40,6 +40,7 @@ QtObject {
     property real fontSizeMapGesture: 9.5
     property real fontSizeMapPrimary: 10.5
     property real fontSizeSmall: 10.5
+    property real fontSizeMappingKey: fontSizeSmall
     property real fontSizeControl: 11
     property int fontSizeBody: 12
     property int fontSizeSection: 14
@@ -66,4 +67,12 @@ QtObject {
     property int pageHorizontalPadding: 10
     property int pageVerticalPadding: 10
     property int sectionVerticalPadding: 10
+
+    property int comboMappingKeyColumnWidth: 92
+    property int comboMappingNoteColumnWidth: 154
+    property int comboMappingHeaderHeight: 24
+    property int comboMappingRowHeight: 32
+    property int comboMappingRowSpacing: 2
+    property int comboMappingHorizontalPadding: spacingMedium
+    property int comboMappingColumnSpacing: spacingSmall
 }
