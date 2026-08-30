@@ -3913,6 +3913,112 @@ class SpatialNavigationTests(unittest.TestCase):
             [],
         )
 
+    def test_keeps_the_menu_half_of_a_wrapped_split_button(self):
+        window = prototype.Rect(0, 0, 1000, 800)
+        parent = self.element(
+            700, 650, 825, 698, "", "GroupControl", (0,)
+        )
+        main_half = self.element(
+            700,
+            650,
+            790,
+            698,
+            "",
+            "GroupControl",
+            (0, 0),
+            has_direct_action_pattern=True,
+        )
+        disabled_send = self.element(
+            724,
+            653,
+            766,
+            695,
+            "发送",
+            "ButtonControl",
+            (0, 0, 0),
+            enabled=False,
+        )
+        menu_half = self.element(
+            791,
+            650,
+            825,
+            698,
+            "",
+            "GroupControl",
+            (0, 1),
+            has_direct_action_pattern=True,
+        )
+        menu_icon = self.element(
+            803, 660, 825, 682, "", "ImageControl", (0, 1, 0)
+        )
+
+        specs = prototype.split_button_companion_target_specs(
+            [parent, main_half, disabled_send, menu_half, menu_icon],
+            window,
+        )
+
+        self.assertEqual(len(specs), 1)
+        self.assertEqual(specs[0].snapshot.rect, menu_half.rect)
+        self.assertEqual(specs[0].snapshot.name, "发送的更多选项")
+        self.assertEqual(specs[0].snapshot.source, "uia-split-action")
+        self.assertEqual(specs[0].click_point, (808, 674))
+
+    def test_split_button_companion_also_survives_when_main_action_is_enabled(self):
+        window = prototype.Rect(0, 0, 1000, 800)
+        elements = [
+            self.element(700, 650, 825, 698, "", "GroupControl", (0,)),
+            self.element(
+                700,
+                650,
+                790,
+                698,
+                "",
+                "GroupControl",
+                (0, 0),
+                has_direct_action_pattern=True,
+            ),
+            self.element(
+                724, 653, 766, 695, "发送", "ButtonControl", (0, 0, 0)
+            ),
+            self.element(
+                791,
+                650,
+                825,
+                698,
+                "",
+                "GroupControl",
+                (0, 1),
+                has_direct_action_pattern=True,
+            ),
+        ]
+
+        self.assertEqual(
+            len(prototype.split_button_companion_target_specs(elements, window)),
+            1,
+        )
+
+    def test_does_not_promote_anonymous_action_groups_without_a_split_button(self):
+        window = prototype.Rect(0, 0, 1000, 800)
+        layout_groups = [
+            self.element(600, 200, 690, 248, "", "GroupControl", (0, 0)),
+            self.element(
+                691,
+                200,
+                725,
+                248,
+                "",
+                "GroupControl",
+                (0, 1),
+                has_direct_action_pattern=True,
+            ),
+            self.element(612, 212, 660, 236, "状态", path=(0, 0, 0)),
+        ]
+
+        self.assertEqual(
+            prototype.split_button_companion_target_specs(layout_groups, window),
+            [],
+        )
+
     def test_opaque_visual_surface_requires_a_legacy_list_like_pane(self):
         window = prototype.Rect(0, 0, 1200, 800)
         pane = self.element(

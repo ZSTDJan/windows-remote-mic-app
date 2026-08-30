@@ -51,6 +51,9 @@ PRIMARY_ACTION_CONTROL_TYPES = frozenset(
         "SpinnerControl",
     }
 )
+SPLIT_ACTION_ANCHOR_CONTROL_TYPES = frozenset(
+    {"ButtonControl", "SplitButtonControl", "ComboBoxControl"}
+)
 WRAPPER_CONTROL_TYPES = STRUCTURAL_CONTROL_TYPES | frozenset(
     {"ListItemControl", "DataItemControl"}
 )
@@ -72,6 +75,9 @@ CHROMIUM_RENDERER_CLASS = "Chrome_RenderWidgetHostHWND"
 CHROMIUM_MIN_SCAN_DEPTH = 32
 SEMANTIC_BYPASS_MAX_WIDTH = 180
 SEMANTIC_BYPASS_MAX_HEIGHT = 96
+SPLIT_COMPANION_MAX_WIDTH = 64
+SPLIT_COMPANION_MAX_HEIGHT = 96
+SPLIT_COMPANION_MAX_GAP = 4
 PREWARM_STABILITY_SECONDS = 0.75
 DYNAMIC_REFRESH_FALLBACK_SECONDS = 5.0
 DYNAMIC_REFRESH_MAX_CACHE_SECONDS = 30.0
@@ -732,6 +738,112 @@ def repeated_content_target_specs(
                     click_point,
                 )
             )
+    return specs
+
+
+def split_button_companion_target_specs(
+    elements: Sequence[ElementSnapshot],
+    window_rect: Rect,
+) -> list[SyntheticTargetSpec]:
+    """Expose a compact menu half next to a separately wrapped main button."""
+
+    children: dict[tuple[int, ...], list[ElementSnapshot]] = defaultdict(list)
+    action_descendants: dict[tuple[int, ...], list[ElementSnapshot]] = defaultdict(list)
+    for element in elements:
+        if element.path:
+            children[element.path[:-1]].append(element)
+        if (
+            element.control_type in SPLIT_ACTION_ANCHOR_CONTROL_TYPES
+            and (element.name or element.automation_id)
+        ):
+            for depth in range(1, len(element.path)):
+                action_descendants[element.path[:depth]].append(element)
+
+    specs: list[SyntheticTargetSpec] = []
+    for candidate in elements:
+        rect = candidate.rect
+        if (
+            not candidate.path
+            or candidate.control_type != "GroupControl"
+            or candidate.name
+            or candidate.automation_id
+            or not candidate.enabled
+            or candidate.offscreen
+            or not candidate.has_direct_action_pattern
+            or not 16 <= rect.width <= SPLIT_COMPANION_MAX_WIDTH
+            or not 24 <= rect.height <= SPLIT_COMPANION_MAX_HEIGHT
+            or not rect.intersects(window_rect)
+            or action_descendants.get(candidate.path)
+        ):
+            continue
+
+        matched_anchor: Optional[ElementSnapshot] = None
+        for peer in children.get(candidate.path[:-1], ()):
+            peer_rect = peer.rect
+            gap = rect.left - peer_rect.right
+            vertical_overlap = _axis_overlap(
+                rect.top,
+                rect.bottom,
+                peer_rect.top,
+                peer_rect.bottom,
+            )
+            if (
+                peer.path == candidate.path
+                or peer.control_type != "GroupControl"
+                or not peer.enabled
+                or peer.offscreen
+                or not peer.has_direct_action_pattern
+                or peer_rect.center_x >= rect.center_x
+                or gap < -2
+                or gap > SPLIT_COMPANION_MAX_GAP
+                or peer_rect.width < rect.width
+                or peer_rect.width > 240
+                or vertical_overlap
+                < min(rect.height, peer_rect.height) * 0.75
+            ):
+                continue
+
+            anchors = [
+                action
+                for action in action_descendants.get(peer.path, ())
+                if not action.offscreen
+                and action.rect.width >= 16
+                and action.rect.height >= 16
+                and _rect_intersection_area(peer_rect, action.rect)
+                >= action.rect.width * action.rect.height * 0.75
+            ]
+            if anchors:
+                matched_anchor = min(
+                    anchors,
+                    key=lambda action: (
+                        len(action.path),
+                        -action.rect.width * action.rect.height,
+                    ),
+                )
+                break
+
+        if matched_anchor is None:
+            continue
+        label = (
+            f"{matched_anchor.name}的更多选项"
+            if matched_anchor.name
+            else "更多选项"
+        )
+        specs.append(
+            SyntheticTargetSpec(
+                TargetSnapshot(
+                    rect=rect,
+                    name=label,
+                    control_type="GroupControl",
+                    automation_id=candidate.automation_id,
+                    path=candidate.path,
+                    depth=len(candidate.path),
+                    has_action_pattern=True,
+                    source="uia-split-action",
+                ),
+                (round(rect.center_x), round(rect.center_y)),
+            )
+        )
     return specs
 
 
@@ -5454,6 +5566,7 @@ def _run_windows(args: argparse.Namespace) -> int:
         by_rect: dict[Rect, RuntimeTarget] = {}
         node_types: dict[tuple[int, ...], str] = {}
         node_rects: dict[tuple[int, ...], Rect] = {}
+        split_controls_by_path: dict[tuple[int, ...], Any] = {}
         elements: list[ElementSnapshot] = []
         visited = 0
         interrupted = False
@@ -5522,6 +5635,17 @@ def _run_windows(args: argparse.Namespace) -> int:
                 if path:
                     node_types[path] = control_type
                     node_rects[path] = control_rect
+                    if (
+                        control_type == "GroupControl"
+                        and not name
+                        and not automation_id
+                        and enabled
+                        and not offscreen
+                        and repeated_content_action
+                        and 16 <= control_rect.width <= SPLIT_COMPANION_MAX_WIDTH
+                        and 24 <= control_rect.height <= SPLIT_COMPANION_MAX_HEIGHT
+                    ):
+                        split_controls_by_path[path] = control
                 if relative_depth > 0:
                     section_path = infer_navigation_section_path(
                         path,
@@ -5566,6 +5690,26 @@ def _run_windows(args: argparse.Namespace) -> int:
         targets = normalize_runtime_targets(list(by_rect.values()))
         for spec in repeated_content_target_specs(elements, window_rect):
             targets.append(RuntimeTarget(spec.snapshot, None, spec.click_point))
+        for spec in split_button_companion_target_specs(elements, window_rect):
+            snapshot = spec.snapshot
+            section_path = infer_navigation_section_path(
+                snapshot.path,
+                node_rects,
+                window_rect,
+                node_types,
+            )
+            targets.append(
+                RuntimeTarget(
+                    replace(
+                        snapshot,
+                        depth=root_depth + len(snapshot.path) - len(root_path),
+                        section_path=section_path,
+                        section_rect=node_rects.get(section_path),
+                    ),
+                    split_controls_by_path.get(snapshot.path),
+                    spec.click_point,
+                )
+            )
         targets = normalize_runtime_targets(targets)[: args.max_elements]
         return targets, node_types, elements, visited, interrupted
 
