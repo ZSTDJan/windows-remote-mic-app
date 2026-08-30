@@ -533,6 +533,45 @@ class SettingsControllerTests(unittest.TestCase):
             controller.requestApplicationExit()
 
         self.assertEqual(ready, [True])
+        self.assertFalse(controller._application_exit_requested)
+
+    def test_full_exit_control_failure_is_visible_and_retryable(self):
+        controller, _model = self._make_controller()
+        failures = []
+        controller.applicationExitFailed.connect(failures.append)
+        with mock.patch.object(
+            qt_settings_app.bridge_control_windows,
+            "request_bridge_exit",
+            side_effect=RuntimeError("simulated control failure"),
+        ) as request_exit:
+            controller.requestApplicationExit()
+            controller.requestApplicationExit()
+
+        self.assertEqual(request_exit.call_count, 2)
+        self.assertEqual(failures, ["完全退出失败：RuntimeError"] * 2)
+        self.assertFalse(controller._application_exit_requested)
+
+    def test_application_exit_ready_is_connected_to_qt_quit(self):
+        callbacks = []
+        quit_calls = []
+
+        class FakeSignal:
+            def connect(self, callback):
+                callbacks.append(callback)
+
+        class FakeController:
+            applicationExitReady = FakeSignal()
+
+        class FakeApplication:
+            def quit(self):
+                quit_calls.append(True)
+
+        qt_settings_app._connect_application_exit(
+            FakeApplication(), FakeController()
+        )
+        callbacks[0]()
+
+        self.assertEqual(quit_calls, [True])
 
     def test_hotkey_text_defaults_to_the_configured_default(self):
         controller, _ = self._make_controller()

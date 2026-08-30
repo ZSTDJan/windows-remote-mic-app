@@ -184,6 +184,12 @@ def _apply_application_identity(app) -> None:
         set_application_name(product_identity.DISPLAY_NAME)
 
 
+def _connect_application_exit(app, controller) -> None:
+    """Make full exit a host responsibility instead of relying only on QML."""
+
+    controller.applicationExitReady.connect(app.quit)
+
+
 def _qml_directory() -> Path:
     """Locates the ``qml/`` directory this module's QML files live in,
     mirroring resources.py's frozen-vs-source-checkout lookup: in a frozen
@@ -3050,8 +3056,16 @@ def _load_qt_classes() -> dict:
             self._application_exit_requested = True
 
             def stop_and_exit() -> None:
-                result = bridge_control_windows.request_bridge_exit()
+                try:
+                    result = bridge_control_windows.request_bridge_exit()
+                except Exception as exc:  # noqa: BLE001 - must remain retryable
+                    self._application_exit_requested = False
+                    self.applicationExitFailed.emit(
+                        f"完全退出失败：{type(exc).__name__}"
+                    )
+                    return
                 if result.stopped:
+                    self._application_exit_requested = False
                     self.applicationExitReady.emit()
                     return
                 self._application_exit_requested = False
@@ -4516,6 +4530,7 @@ def run_settings_window(*, start_hidden: bool = False) -> int:
 
     model = ButtonMappingModel()
     controller = SettingsController(model, start_hidden=start_hidden)
+    _connect_application_exit(app, controller)
 
     root_window = None
 
