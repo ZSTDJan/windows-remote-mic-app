@@ -25,6 +25,8 @@ SRC_ROOT = RC003_ROOT / "src"
 REPO_ROOT = RC003_ROOT.parents[2]
 REMOTE_PHOTO = REPO_ROOT / "Resources" / "RC003-remote-photo.png"
 QML_SOURCE_DIR = SRC_ROOT / "ovb_rc003" / "qml"
+APP_ICON_DIR = SRC_ROOT / "ovb_rc003" / "assets" / "icons"
+APP_ICON = APP_ICON_DIR / "remote-mic.ico"
 DEVICE_PROFILES_DIR = REPO_ROOT / "device-profiles"
 # XRBM-031: build/fetch-vb-cable.ps1 (a REQUIRED step in both
 # build-candidate.ps1 and windows-rc003-ci.yml, run before this spec) writes
@@ -79,6 +81,8 @@ if QML_SOURCE_DIR.is_dir():
     # sys._MEIPASS-relative reasoning as the photo above (see
     # resources.py's module docstring).
     datas.append((str(QML_SOURCE_DIR), "ovb_rc003_qml"))
+if APP_ICON_DIR.is_dir():
+    datas.append((str(APP_ICON_DIR), "app_icons"))
 if DEVICE_PROFILES_DIR.is_dir():
     # The exact repository JSON files are the runtime catalog for Windows. The
     # frozen loader reads them from
@@ -153,6 +157,7 @@ hiddenimports = [
     "PySide6.QtQml",
     "PySide6.QtQuick",
     "PySide6.QtQuickControls2",
+    "PySide6.QtSvg",
 ]
 
 a = Analysis(
@@ -226,6 +231,7 @@ exe = EXE(
     strip=False,
     upx=False,
     console=False,
+    icon=str(APP_ICON),
 )
 
 coll = COLLECT(

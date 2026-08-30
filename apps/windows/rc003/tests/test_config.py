@@ -49,6 +49,10 @@ class DefaultConfigPrivacyTests(unittest.TestCase):
             {"sogou": True, "custom": False},
         )
         self.assertEqual(defaults["gain_db"], 10.0)
+        self.assertFalse(defaults["launch_bridge_on_app_start"])
+        self.assertEqual(
+            defaults["close_behavior"], config.CLOSE_BEHAVIOR_HIDE_TO_TRAY
+        )
 
     def test_default_config_contains_no_forbidden_identity_fields(self):
         defaults = config.default_config()
@@ -71,6 +75,24 @@ class DefaultConfigPrivacyTests(unittest.TestCase):
             loaded = config.load_config(Path(tmp) / "config.json")
         self.assertEqual(loaded["voice_hotkey"], "ralt")
         self.assertEqual(loaded["voice_hotkeys"], {"hold": "ralt"})
+
+    def test_invalid_desktop_behavior_falls_back_safely(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "launch_bridge_on_app_start": 1,
+                        "close_behavior": "unexpected",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            loaded = config.load_config(path)
+        self.assertTrue(loaded["launch_bridge_on_app_start"])
+        self.assertEqual(
+            loaded["close_behavior"], config.CLOSE_BEHAVIOR_HIDE_TO_TRAY
+        )
 
     def test_load_preserves_an_existing_right_alt_hold_shortcut(self):
         with tempfile.TemporaryDirectory() as tmp:

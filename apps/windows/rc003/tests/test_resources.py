@@ -50,6 +50,16 @@ class FindRemotePhotoFrozenBundleTests(unittest.TestCase):
         except Exception as exc:  # pragma: no cover - defensive
             self.fail(f"find_remote_photo() raised unexpectedly: {exc}")
 
+    def test_frozen_icon_lookup_uses_the_bundled_icon_directory(self):
+        root = Path(self._tmpdir.name)
+        icon_dir = root / "app_icons"
+        icon_dir.mkdir()
+        expected = icon_dir / "remote-mic-connected.svg"
+        expected.write_text("<svg/>", encoding="utf-8")
+        sys._MEIPASS = str(root)
+
+        self.assertEqual(resources.find_app_icon("connected"), expected)
+
 
 class FindRemotePhotoTests(unittest.TestCase):
     def test_finds_the_repository_root_photo_during_source_checkout(self):
@@ -70,6 +80,12 @@ class FindRemotePhotoTests(unittest.TestCase):
             resources.find_remote_photo()
         except Exception as exc:  # pragma: no cover - defensive
             self.fail(f"find_remote_photo() raised unexpectedly: {exc}")
+
+    def test_source_checkout_exposes_all_three_application_icon_states(self):
+        for state in ("off", "waiting", "connected"):
+            icon = resources.find_app_icon(state)
+            self.assertIsNotNone(icon)
+            self.assertTrue(icon.is_file())
 
 
 if __name__ == "__main__":

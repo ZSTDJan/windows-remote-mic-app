@@ -269,7 +269,7 @@ def _real_activate_marked_window(property_name: str) -> bool:
 
     @enum_windows_proc
     def visit(hwnd, _lparam):
-        if user32.IsWindowVisible(hwnd) and user32.GetPropW(hwnd, property_name):
+        if user32.GetPropW(hwnd, property_name):
             matches.append(int(hwnd))
             return False
         return True

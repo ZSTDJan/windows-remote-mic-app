@@ -47,6 +47,12 @@ from typing import Iterator, Optional
 
 _PHOTO_FILENAME = "RC003-remote-photo.png"
 _DEVICE_PROFILES_DIRECTORY = "device-profiles"
+_APP_ICON_DIRECTORY = "app_icons"
+_APP_ICON_FILENAMES = {
+    "off": "remote-mic-off.svg",
+    "waiting": "remote-mic-waiting.svg",
+    "connected": "remote-mic-connected.svg",
+}
 
 
 def _candidate_paths() -> Iterator[Path]:
@@ -85,5 +91,22 @@ def find_device_profiles_directory() -> Optional[Path]:
 
     for candidate in _device_profile_directory_candidates():
         if candidate.is_dir():
+            return candidate
+    return None
+
+
+def _app_icon_directory_candidates() -> Iterator[Path]:
+    frozen_root = getattr(sys, "_MEIPASS", None)
+    if frozen_root:
+        yield Path(frozen_root) / _APP_ICON_DIRECTORY
+        return
+    yield Path(__file__).resolve().parent / "assets" / "icons"
+
+
+def find_app_icon(state: str = "waiting") -> Optional[Path]:
+    filename = _APP_ICON_FILENAMES.get(str(state), _APP_ICON_FILENAMES["waiting"])
+    for directory in _app_icon_directory_candidates():
+        candidate = directory / filename
+        if candidate.is_file():
             return candidate
     return None

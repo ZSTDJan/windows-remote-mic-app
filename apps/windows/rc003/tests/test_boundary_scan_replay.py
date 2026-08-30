@@ -91,6 +91,16 @@ _BRANDING_CHECK_EXEMPT_RELATIVE_PATHS = {
     Path("ATTRIBUTION.md"),
 }
 
+_AUTOSTART_CHECK_EXEMPT_RELATIVE_PATHS = {
+    Path("tests/test_privacy_contract.py"),
+    Path("tests/test_build_artifacts.py"),
+    Path("tests/test_boundary_scan_replay.py"),
+    Path("build/check-public-boundary.ps1"),
+    Path("src/ovb_rc003/voice_program_manager.py"),
+    Path("src/ovb_rc003/startup_windows.py"),
+    Path("installer/RemoteMicRC003Setup.iss"),
+}
+
 _COMMENT_PREFIX_BY_EXTENSION = {".ps1": "#", ".iss": ";"}
 
 
@@ -137,7 +147,8 @@ def _scan(root: Path):
             continue
 
         relative_path = path.relative_to(root)
-        is_exempt = relative_path in _BRANDING_CHECK_EXEMPT_RELATIVE_PATHS
+        is_branding_exempt = relative_path in _BRANDING_CHECK_EXEMPT_RELATIVE_PATHS
+        is_autostart_exempt = relative_path in _AUTOSTART_CHECK_EXEMPT_RELATIVE_PATHS
 
         try:
             text = path.read_text(encoding="utf-8")
@@ -154,14 +165,15 @@ def _scan(root: Path):
         if _CREDENTIAL_RE.search(text):
             violations.append(f"credential-shaped literal in: {path}")
 
-        if not is_exempt:
-            effective_text = _remove_comment_lines(text, ext)
+        effective_text = _remove_comment_lines(text, ext)
+        if not is_branding_exempt:
             for pattern in _FORBIDDEN_BRANDING_PATTERNS:
                 if pattern.search(effective_text):
                     violations.append(f"forbidden branding ({pattern.pattern!r}) in: {path}")
             for marker in _ELEVATION_MARKERS:
                 if marker in effective_text:
                     violations.append(f"elevation marker ({marker!r}) in: {path}")
+        if not is_autostart_exempt:
             for marker in _AUTOSTART_MARKERS:
                 if marker in effective_text:
                     violations.append(f"autostart marker ({marker!r}) in: {path}")
@@ -197,6 +209,16 @@ class BoundaryScanReplayTests(unittest.TestCase):
                 f"{relative} was expected to legitimately reference a forbidden term "
                 "(as a scanner pattern, fixture, exclusion statement, or comment) - if "
                 "it no longer does, it may not need to stay in the exemption list",
+            )
+
+    def test_autostart_exemptions_are_narrow_and_live(self):
+        for relative in _AUTOSTART_CHECK_EXEMPT_RELATIVE_PATHS:
+            path = _RC003_ROOT / relative
+            self.assertTrue(path.is_file(), f"expected exempt file missing: {path}")
+            text = path.read_text(encoding="utf-8")
+            self.assertTrue(
+                any(marker in text for marker in _AUTOSTART_MARKERS),
+                f"{relative} no longer contains an autostart marker",
             )
 
     def test_vb_cable_bundle_py_is_exempt_only_for_its_documented_elevation_reason(self):

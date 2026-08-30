@@ -311,6 +311,12 @@ class InnoSetupScriptTests(unittest.TestCase):
         self.assertNotIn("userstartup", self.effective_text.lower())
         self.assertNotIn("Tasks: \"startup\"", self.effective_text)
 
+    def test_installer_uses_the_shared_application_icon(self):
+        self.assertIn(
+            r"SetupIconFile=..\src\ovb_rc003\assets\icons\remote-mic.ico",
+            self.text,
+        )
+
     def test_no_vbcable_reference(self):
         # This installer SCRIPT's own directives never mention VB-CABLE at
         # all (checked against the effective, comment-stripped text) - it
@@ -406,32 +412,38 @@ class InnoSetupScriptTests(unittest.TestCase):
 
     def test_primary_start_menu_shortcut_opens_settings_not_bridge(self):
         self.assertIn(
-            'Name: "{group}\\{#AppName}"; Filename: "{app}\\{#AppExeName}"; Parameters: "--settings"',
+            'Name: "{group}\\{#AppName}"; Filename: "{app}\\{#AppExeName}"',
             self.text,
         )
+        primary_line = next(
+            line
+            for line in _iss_section(self.text, "Icons").splitlines()
+            if 'Name: "{group}\\{#AppName}";' in line
+        )
+        self.assertNotIn("--bridge", primary_line)
 
     def test_desktop_shortcut_opens_settings_not_bridge(self):
         self.assertIn(
             'Name: "{userdesktop}\\{#AppName}"; Filename: "{app}\\{#AppExeName}"; '
-            'Parameters: "--settings"; Tasks: desktopicon',
+            'Tasks: desktopicon',
             self.text,
         )
 
-    def test_explicit_settings_start_stop_uninstall_shortcuts_all_exist(self):
+    def test_explicit_settings_stop_uninstall_shortcuts_all_exist(self):
         icons_section = _iss_section(self.text, "Icons")
         self.assertIn("设置", icons_section)
-        self.assertIn("启动 {#AppName}", icons_section)
         self.assertIn("停止 {#AppName}", icons_section)
         self.assertIn("卸载 {#AppName}", icons_section)
 
-    def test_start_shortcut_uses_the_explicit_bridge_flag(self):
-        # The no-argument exe now opens the settings window, so the Start
-        # Menu "启动" entry must request bridge mode explicitly.
-        self.assertIn(
-            'Name: "{group}\\启动 {#AppName}"; Filename: "{app}\\{#AppExeName}"; '
-            'Parameters: "--bridge"',
-            self.text,
-        )
+    def test_installer_does_not_create_a_second_direct_bridge_shortcut(self):
+        self.assertNotIn("启动 {#AppName}", _iss_section(self.text, "Icons"))
+
+    def test_uninstall_removes_only_the_owned_login_startup_value(self):
+        code_section = _iss_section(self.text, "Code")
+        self.assertIn("CurUninstallStepChanged", code_section)
+        self.assertIn("RegDeleteValue", code_section)
+        self.assertIn("RemoteMicRC003", code_section)
+        self.assertIn(r"Software\Microsoft\Windows\CurrentVersion\Run", code_section)
 
     def test_postinstall_run_opens_settings_and_never_the_bare_no_arg_bridge(self):
         run_section = _iss_section(self.text, "Run")
@@ -1383,9 +1395,9 @@ class PortableAndInstallerFlowContractTests(unittest.TestCase):
             r"`.\RemoteMicRC003.exe --bridge` 启动桥接", self.normalized
         )
 
-    def test_portable_stop_prefers_notification_area_with_task_manager_fallback(self):
+    def test_portable_full_exit_prefers_notification_area_with_task_manager_fallback(self):
         self.assertIn("通知区域", self.text)
-        self.assertIn("退出桥接", self.text)
+        self.assertIn("完全退出", self.text)
         self.assertIn("正常清理 BLE、HID、语音热键与音频资源", self.normalized)
         self.assertIn("任务管理器", self.text)
         self.assertIn("只有托盘不可用且程序无法正常退出时", self.normalized)

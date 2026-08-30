@@ -560,7 +560,7 @@ def describe_log_open_result(result: logging_setup.LogOpenResult) -> str:
     return f"无法打开日志目录（{result.error}）：{result.location.directory}"
 
 
-def main() -> None:
+def main(*, start_hidden: bool = False) -> None:
     """Launches the Qt Quick/QML settings window (XRBM-030). Imports
     ``qt_settings_app`` lazily so importing THIS module (e.g. from
     ``__main__.py``'s ``--dry-run`` smoke check, or from any test that only
@@ -571,7 +571,7 @@ def main() -> None:
 
     from . import qt_settings_app
 
-    qt_settings_app.run_settings_window()
+    qt_settings_app.run_settings_window(start_hidden=start_hidden)
 
 
 if __name__ == "__main__":

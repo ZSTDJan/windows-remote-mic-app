@@ -2422,6 +2422,7 @@ async def _run(
     app_factory=None,
     tray_factory=None,
     settings_launcher=None,
+    show_notification_icon: bool = True,
 ) -> None:
     app_factory = app_factory or RC003App
     tray_factory = tray_factory or bridge_tray_windows.BridgeTray
@@ -2448,15 +2449,23 @@ async def _run(
     tray = None
     try:
         try:
-            tray = tray_factory(
+            tray_kwargs = dict(
                 on_open_settings=open_settings,
                 on_exit_requested=request_exit,
                 status_handler=lambda message: app._logger.info(
                     "notification area: %s", message
                 ),
             )
+            if not show_notification_icon:
+                tray_kwargs["show_icon"] = False
+            tray = tray_factory(**tray_kwargs)
             if tray.start():
-                app._logger.info("notification area: bridge control icon started")
+                app._logger.info(
+                    "notification area: %s started",
+                    "bridge control icon"
+                    if show_notification_icon
+                    else "hidden bridge control",
+                )
             else:
                 app._logger.warning(
                     "notification area unavailable: %s",
@@ -2489,8 +2498,8 @@ async def _run(
                     clear_runtime_status()
 
 
-def main() -> None:
-    asyncio.run(_run())
+def main(*, show_notification_icon: bool = True) -> None:
+    asyncio.run(_run(show_notification_icon=show_notification_icon))
 
 
 if __name__ == "__main__":

@@ -120,11 +120,13 @@ class BridgeTray:
         on_exit_requested: Callable[[], None],
         status_handler: Callable[[str], None] | None = None,
         tooltip: str = "Remote Mic · RC003 bridge",
+        show_icon: bool = True,
     ) -> None:
         self._on_open_settings = on_open_settings
         self._on_exit_requested = on_exit_requested
         self._status_handler = status_handler or (lambda _message: None)
         self._tooltip = tooltip[:127]
+        self._show_icon = bool(show_icon)
         self._thread: threading.Thread | None = None
         self._ready = threading.Event()
         self._stop_requested = threading.Event()
@@ -311,7 +313,8 @@ class BridgeTray:
                     self._show_menu(user32, hwnd)
                     return 0
             if taskbar_created and message == taskbar_created:
-                self._add_icon(user32, shell32, hwnd)
+                if self._show_icon:
+                    self._add_icon(user32, shell32, hwnd)
                 return 0
             if message == WM_COMMAND:
                 self._dispatch_command(int(wparam) & 0xFFFF, hwnd, user32)
@@ -353,9 +356,14 @@ class BridgeTray:
             if not hwnd:
                 raise ctypes.WinError(ctypes.get_last_error())
             self._hwnd = int(hwnd)
-            self._add_icon(user32, shell32, hwnd)
+            if self._show_icon:
+                self._add_icon(user32, shell32, hwnd)
             self._ready.set()
-            self._report("notification area icon ready")
+            self._report(
+                "notification area icon ready"
+                if self._show_icon
+                else "background bridge control ready"
+            )
 
             if self._stop_requested.is_set():
                 user32.DestroyWindow(hwnd)

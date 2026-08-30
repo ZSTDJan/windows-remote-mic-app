@@ -422,6 +422,12 @@ class SettingsControllerTests(unittest.TestCase):
             return_value=False,
         )
         self._bridge_status_patch.start()
+        self._startup_state_patch = mock.patch.object(
+            qt_settings_app.startup_windows,
+            "read_startup_state",
+            return_value=qt_settings_app.startup_windows.StartupState(False),
+        )
+        self._startup_state_patch.start()
         self._voice_hotkey_read_patch = mock.patch.object(
             qt_settings_app.voice_hotkey_sync_windows,
             "read_provider_hotkey",
@@ -451,6 +457,7 @@ class SettingsControllerTests(unittest.TestCase):
         self._voice_hotkey_sync_mock = self._voice_hotkey_sync_patch.start()
 
     def tearDown(self):
+        self._startup_state_patch.stop()
         self._voice_hotkey_sync_patch.stop()
         self._voice_hotkey_read_patch.stop()
         self._bridge_status_patch.stop()
@@ -467,6 +474,60 @@ class SettingsControllerTests(unittest.TestCase):
 
     def _continue_save_and_launch(self, controller):
         controller._continue_save_and_launch()
+
+    def test_desktop_behavior_defaults_hide_close_and_do_not_auto_start_bridge(self):
+        controller, _model = self._make_controller()
+        self.assertFalse(controller.launchAtLogin)
+        self.assertFalse(controller.launchBridgeOnAppStart)
+        self.assertEqual(controller.closeBehavior, "hide_to_tray")
+        self.assertTrue(controller.trayIconSource.endswith("remote-mic-off.svg"))
+
+    def test_desktop_behavior_changes_are_persisted_immediately(self):
+        controller, _model = self._make_controller()
+        controller.setLaunchBridgeOnAppStart(True)
+        controller.setCloseBehaviorIndex(1)
+
+        saved = config.load_config(config.config_path(Path(self._tmpdir.name) / "RemoteMic" / "RC003"))
+        self.assertTrue(saved["launch_bridge_on_app_start"])
+        self.assertEqual(saved["close_behavior"], "quit")
+
+    def test_launch_at_login_uses_the_scoped_windows_owner(self):
+        controller, _model = self._make_controller()
+        with mock.patch.object(
+            qt_settings_app.startup_windows,
+            "set_startup_enabled",
+            return_value=qt_settings_app.startup_windows.StartupState(True),
+        ) as setter:
+            controller.setLaunchAtLogin(True)
+
+        setter.assert_called_once_with(True)
+        self.assertTrue(controller.launchAtLogin)
+
+    def test_application_start_option_reuses_the_normal_bridge_start(self):
+        controller, _model = self._make_controller()
+        controller._launch_bridge_on_app_start = True
+        calls = []
+        controller.startBridge = lambda: calls.append(True)
+
+        controller.startBridgeOnApplicationStart()
+
+        self.assertEqual(calls, [True])
+
+    def test_full_exit_waits_for_the_bridge_to_stop(self):
+        controller, _model = self._make_controller()
+        ready = []
+        controller.applicationExitReady.connect(lambda: ready.append(True))
+        with mock.patch.object(
+            qt_settings_app.bridge_control_windows,
+            "request_bridge_exit",
+            return_value=qt_settings_app.bridge_control_windows.BridgeExitResult(
+                requested=True,
+                stopped=True,
+            ),
+        ):
+            controller.requestApplicationExit()
+
+        self.assertEqual(ready, [True])
 
     def test_hotkey_text_defaults_to_the_configured_default(self):
         controller, _ = self._make_controller()
@@ -4730,6 +4791,7 @@ class SettingsShellSourceContractTests(unittest.TestCase):
         self.main_qml = (qml_dir / "main.qml").read_text(encoding="utf-8")
         self.device_qml = (qml_dir / "DevicePage.qml").read_text(encoding="utf-8")
         self.voice_qml = (qml_dir / "VoicePage.qml").read_text(encoding="utf-8")
+        self.general_qml = (qml_dir / "GeneralPage.qml").read_text(encoding="utf-8")
         self.buttons_qml = (qml_dir / "ButtonsPage.qml").read_text(
             encoding="utf-8"
         )
@@ -4930,7 +4992,7 @@ class SettingsShellSourceContractTests(unittest.TestCase):
     def test_main_window_owns_the_single_live_bridge_refresh_timer(self):
         self.assertIn('objectName: "bridgeStatusRefreshTimer"', self.main_qml)
         self.assertIn("? 1000 : 2000", self.main_qml)
-        self.assertIn("running: window.visible", self.main_qml)
+        self.assertIn("running: true", self.main_qml)
         self.assertIn(
             "onTriggered: SettingsController.refreshBridgeState()",
             self.main_qml,
@@ -4947,8 +5009,18 @@ class SettingsShellSourceContractTests(unittest.TestCase):
         for inset in ("leftInset", "rightInset", "topInset", "bottomInset"):
             self.assertIn(f"{inset}: 0", self.nav_button_qml)
         self.assertIn('objectName: root.objectName + "_background"', self.nav_button_qml)
-        self.assertEqual(self.main_qml.count("onPressed: tabBar.currentIndex ="), 3)
+        self.assertEqual(self.main_qml.count("onPressed: tabBar.currentIndex ="), 4)
         self.assertNotIn("onClicked: tabBar.currentIndex =", self.main_qml)
+
+    def test_general_page_owns_the_three_desktop_behavior_options(self):
+        self.assertIn('objectName: "launchAtLoginSwitch"', self.general_qml)
+        self.assertIn('objectName: "launchBridgeOnAppStartSwitch"', self.general_qml)
+        self.assertIn('objectName: "closeBehaviorCombo"', self.general_qml)
+        self.assertIn("SettingsController.setLaunchAtLogin", self.general_qml)
+        self.assertIn("SettingsController.setLaunchBridgeOnAppStart", self.general_qml)
+        self.assertIn("SettingsController.setCloseBehaviorIndex", self.general_qml)
+        self.assertIn('objectName: "systemTrayIcon"', self.main_qml)
+        self.assertIn("SettingsController.requestApplicationExit()", self.main_qml)
 
     def test_windows_prefers_the_system_chinese_ui_font(self):
         self.assertIn(

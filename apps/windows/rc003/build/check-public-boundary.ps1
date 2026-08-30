@@ -86,7 +86,7 @@ $personalPathPattern = "[A-Za-z]:\\Users\\[^\\""'\s]+"
 $credentialPattern = "(api[_-]?key|client[_-]?secret|password)\s*[:=]\s*[""'][^""']{8,}[""']"
 $forbiddenBrandingPatterns = @("2655\s*AI", "2655ai\.com", "T1RemoteBridge", "V60PenBridge", "PV60", "汉王")
 $elevationMarkers = @("runas", "ShellExecute", "IsUserAnAdmin", "RequireAdministrator", "PrivilegesRequired=admin")
-$autostartMarkers = @("CurrentVersion\\Run", "userstartup")
+$autostartMarkers = @("CurrentVersion\Run", "userstartup")
 
 # Generated/build-output directories - never source, always safe to
 # regenerate, and routinely contain forbidden-binary-extension files
@@ -132,6 +132,19 @@ $brandingCheckExemptRelativePaths = @(
     # not a directive.
     "README.md",
     "ATTRIBUTION.md"
+)
+
+# Login startup is now a user-visible, per-user feature. Keep its exception
+# narrower than branding/elevation: only the owner module, uninstall cleanup,
+# and scanner/test definitions may contain the implementation marker.
+$autostartCheckExemptRelativePaths = @(
+    "tests/test_privacy_contract.py",
+    "tests/test_build_artifacts.py",
+    "tests/test_boundary_scan_replay.py",
+    "build/check-public-boundary.ps1",
+    "src/ovb_rc003/voice_program_manager.py",
+    "src/ovb_rc003/startup_windows.py",
+    "installer/RemoteMicRC003Setup.iss"
 )
 
 function Get-NormalizedRelativePath {
@@ -214,7 +227,8 @@ try {
             continue
         }
 
-        $isExempt = $brandingCheckExemptRelativePaths -contains $relativePath
+        $isBrandingExempt = $brandingCheckExemptRelativePaths -contains $relativePath
+        $isAutostartExempt = $autostartCheckExemptRelativePaths -contains $relativePath
 
         $text = Get-Content -Raw -LiteralPath $file.FullName -ErrorAction SilentlyContinue
         if (-not $text) { continue }
@@ -234,9 +248,8 @@ try {
             $violations.Add("credential-shaped literal in: $($file.FullName)")
         }
 
-        if (-not $isExempt) {
-            $effectiveText = Remove-CommentLines -Text $text -Extension $ext
-
+        $effectiveText = Remove-CommentLines -Text $text -Extension $ext
+        if (-not $isBrandingExempt) {
             foreach ($pattern in $forbiddenBrandingPatterns) {
                 if ($effectiveText -match $pattern) {
                     $violations.Add("forbidden branding ('$pattern') in: $($file.FullName)")
@@ -247,6 +260,8 @@ try {
                     $violations.Add("elevation marker ('$marker') in: $($file.FullName)")
                 }
             }
+        }
+        if (-not $isAutostartExempt) {
             foreach ($marker in $autostartMarkers) {
                 if ($effectiveText.Contains($marker)) {
                     $violations.Add("autostart marker ('$marker') in: $($file.FullName)")

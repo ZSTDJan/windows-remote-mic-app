@@ -123,6 +123,7 @@ from . import (
     settings_ui,
     shell_targets,
     single_instance,
+    startup_windows,
     vb_cable_bundle,
     voice_hotkey_sync_windows,
     voice_program_manager,
@@ -455,7 +456,7 @@ def _load_qt_classes() -> dict:
             Signal,
             Slot,
         )
-        from PySide6.QtGui import QGuiApplication
+        from PySide6.QtGui import QGuiApplication, QIcon
         from PySide6.QtQml import QQmlApplicationEngine, qmlRegisterSingletonInstance
         from PySide6.QtQuickControls2 import QQuickStyle
     except ImportError as exc:
@@ -801,6 +802,10 @@ def _load_qt_classes() -> dict:
         bridgeConnectedChanged = Signal()
         bridgeLaunchPhaseChanged = Signal()
         bridgeLaunchElapsedSecondsChanged = Signal()
+        desktopBehaviorChanged = Signal()
+        trayStateChanged = Signal()
+        applicationExitReady = Signal()
+        applicationExitFailed = Signal(str)
         launchStatusTextChanged = Signal()
         statusMessageChanged = Signal()
         errorMessageChanged = Signal()
@@ -837,6 +842,7 @@ def _load_qt_classes() -> dict:
         _DEVICE_PAGE_INDEX = 0
         _BUTTONS_PAGE_INDEX = 1
         _VOICE_PAGE_INDEX = 2
+        _GENERAL_PAGE_INDEX = 3
         _KEY_DETECTION_TIMEOUT_SECONDS = key_detection_bridge.STALE_AFTER_SECONDS
         _KEY_DETECTION_USAGE_TO_BUTTON = {
             usage: button_id
@@ -849,6 +855,7 @@ def _load_qt_classes() -> dict:
             model: "ButtonMappingModel",
             parent=None,
             *,
+            start_hidden: bool = False,
             background_task_runner: Optional[
                 Callable[[Callable[[], None], str], None]
             ] = None,
@@ -864,6 +871,18 @@ def _load_qt_classes() -> dict:
             self._background_threads_lock = threading.RLock()
             self._config_root = config.config_root()
             self._config = config.load_config(config.config_path(self._config_root))
+            self._start_hidden = bool(start_hidden)
+            self._launch_bridge_on_app_start = bool(
+                self._config.get("launch_bridge_on_app_start", False)
+            )
+            self._close_behavior = str(
+                self._config.get(
+                    "close_behavior", config.CLOSE_BEHAVIOR_HIDE_TO_TRAY
+                )
+            )
+            startup_state = startup_windows.read_startup_state()
+            self._launch_at_login = startup_state.enabled
+            self._application_exit_requested = False
             self._bindings = config.load_key_bindings(
                 config.key_bindings_path(self._config_root)
             )
@@ -1380,6 +1399,7 @@ def _load_qt_classes() -> dict:
                 return
             self._bridge_running = value
             self.bridgeRunningChanged.emit()
+            self.trayStateChanged.emit()
 
         def _set_bridge_connected(self, value: bool) -> None:
             value = bool(value)
@@ -1387,6 +1407,37 @@ def _load_qt_classes() -> dict:
                 return
             self._bridge_connected = value
             self.bridgeConnectedChanged.emit()
+            self.trayStateChanged.emit()
+
+        def _persist_desktop_behavior(self, key: str, value: object) -> bool:
+            next_config = dict(self._config)
+            next_config[key] = value
+            try:
+                saved = config.save_config_and_load(
+                    config.config_path(self._config_root), next_config
+                )
+            except Exception as exc:  # noqa: BLE001 - surfaced in the UI
+                self._set_status_message("")
+                self._set_error_message(
+                    f"常规设置保存失败：{type(exc).__name__}",
+                    self._GENERAL_PAGE_INDEX,
+                )
+                return False
+            self._config = saved
+            self._set_error_message("")
+            self._set_status_message("常规设置已保存。", self._GENERAL_PAGE_INDEX)
+            return True
+
+        def _tray_icon_state(self) -> str:
+            if self._bridge_connected:
+                return "connected"
+            if self._bridge_running:
+                return "waiting"
+            return "off"
+
+        def _tray_icon_source(self) -> str:
+            path = resources.find_app_icon(self._tray_icon_state())
+            return QUrl.fromLocalFile(str(path)).toString() if path else ""
 
         def _set_bridge_launch_phase(self, value: str) -> None:
             if value == self._bridge_launch_phase:
@@ -2562,6 +2613,44 @@ def _load_qt_classes() -> dict:
             notify=bridgeConnectedChanged,
         )
 
+        startHidden = Property(bool, lambda self: self._start_hidden, constant=True)
+        launchAtLogin = Property(
+            bool,
+            lambda self: self._launch_at_login,
+            notify=desktopBehaviorChanged,
+        )
+        launchBridgeOnAppStart = Property(
+            bool,
+            lambda self: self._launch_bridge_on_app_start,
+            notify=desktopBehaviorChanged,
+        )
+        closeBehavior = Property(
+            str,
+            lambda self: self._close_behavior,
+            notify=desktopBehaviorChanged,
+        )
+        closeBehaviorOptions = Property(
+            list,
+            lambda self: ["隐藏到通知区域", "完全退出"],
+            constant=True,
+        )
+        trayIconSource = Property(
+            str,
+            _tray_icon_source,
+            notify=trayStateChanged,
+        )
+        trayTooltip = Property(
+            str,
+            lambda self: (
+                "Remote Mic：RC003 已连接"
+                if self._bridge_connected
+                else "Remote Mic：服务运行中，等待 RC003"
+                if self._bridge_running
+                else "Remote Mic：服务未启动"
+            ),
+            notify=trayStateChanged,
+        )
+
         def _get_bridge_launch_phase(self) -> str:
             return self._bridge_launch_phase
 
@@ -2619,7 +2708,7 @@ def _load_qt_classes() -> dict:
         def _set_active_page_index(self, value: int) -> None:
             value = max(
                 self._DEVICE_PAGE_INDEX,
-                min(self._VOICE_PAGE_INDEX, int(value)),
+                min(self._GENERAL_PAGE_INDEX, int(value)),
             )
             if value == self._active_page_index:
                 return
@@ -2847,6 +2936,86 @@ def _load_qt_classes() -> dict:
         @Slot(result=bool)
         def saveSettings(self) -> bool:
             return self._save()
+
+        @Slot(bool)
+        def setLaunchAtLogin(self, enabled: bool) -> None:
+            enabled = bool(enabled)
+            if enabled == self._launch_at_login:
+                return
+            result = startup_windows.set_startup_enabled(enabled)
+            if result.error:
+                self.desktopBehaviorChanged.emit()
+                self._set_status_message("")
+                self._set_error_message(
+                    f"无法修改随 Windows 启动：{result.error}",
+                    self._GENERAL_PAGE_INDEX,
+                )
+                return
+            self._launch_at_login = result.enabled
+            self.desktopBehaviorChanged.emit()
+            self._set_error_message("")
+            self._set_status_message(
+                "已启用随 Windows 启动。"
+                if result.enabled
+                else "已关闭随 Windows 启动。",
+                self._GENERAL_PAGE_INDEX,
+            )
+
+        @Slot(bool)
+        def setLaunchBridgeOnAppStart(self, enabled: bool) -> None:
+            enabled = bool(enabled)
+            if enabled == self._launch_bridge_on_app_start:
+                return
+            if not self._persist_desktop_behavior(
+                "launch_bridge_on_app_start", enabled
+            ):
+                self.desktopBehaviorChanged.emit()
+                return
+            self._launch_bridge_on_app_start = enabled
+            self.desktopBehaviorChanged.emit()
+
+        @Slot(int)
+        def setCloseBehaviorIndex(self, index: int) -> None:
+            value = (
+                config.CLOSE_BEHAVIOR_QUIT
+                if int(index) == 1
+                else config.CLOSE_BEHAVIOR_HIDE_TO_TRAY
+            )
+            if value == self._close_behavior:
+                return
+            if not self._persist_desktop_behavior("close_behavior", value):
+                self.desktopBehaviorChanged.emit()
+                return
+            self._close_behavior = value
+            self.desktopBehaviorChanged.emit()
+
+        @Slot()
+        def startBridgeOnApplicationStart(self) -> None:
+            if self._launch_bridge_on_app_start and not self._bridge_running:
+                self.startBridge()
+
+        @Slot()
+        def requestApplicationExit(self) -> None:
+            if self._application_exit_requested:
+                return
+            self._application_exit_requested = True
+
+            def stop_and_exit() -> None:
+                result = bridge_control_windows.request_bridge_exit()
+                if result.stopped:
+                    self.applicationExitReady.emit()
+                    return
+                self._application_exit_requested = False
+                message = result.error or "遥控器服务未能正常停止。"
+                self.applicationExitFailed.emit(message)
+
+            try:
+                self._start_background_task(
+                    stop_and_exit, "remote-mic-application-exit"
+                )
+            except RuntimeError as exc:
+                self._application_exit_requested = False
+                self.applicationExitFailed.emit(str(exc))
 
         @Slot()
         def refreshVoiceProgramStatus(self) -> None:
@@ -4236,6 +4405,7 @@ def _load_qt_classes() -> dict:
 
     _qt_classes_cache = {
         "QGuiApplication": QGuiApplication,
+        "QIcon": QIcon,
         "QQmlApplicationEngine": QQmlApplicationEngine,
         "QQuickStyle": QQuickStyle,
         "QUrl": QUrl,
@@ -4257,7 +4427,7 @@ _QML_MAPPING_MODEL_TYPE_NAME = "ButtonMappingModel"
 _QML_DIAGNOSTICS_TYPE_NAME = "DiagnosticsController"  # XRBM-031
 
 
-def run_settings_window() -> int:
+def run_settings_window(*, start_hidden: bool = False) -> int:
     """Builds and runs the Qt Quick/QML settings window. Blocks until the
     window is closed (``QGuiApplication.exec()``), then returns its exit
     code. Raises ``QtUnavailableError`` (via ``_load_qt_classes()``) if
@@ -4268,6 +4438,7 @@ def run_settings_window() -> int:
 
     classes = _load_qt_classes()
     QGuiApplication = classes["QGuiApplication"]
+    QIcon = classes["QIcon"]
     QQmlApplicationEngine = classes["QQmlApplicationEngine"]
     QQuickStyle = classes["QQuickStyle"]
     QUrl = classes["QUrl"]
@@ -4285,9 +4456,22 @@ def run_settings_window() -> int:
     QQuickStyle.setStyle("FluentWinUI3")
 
     app = QGuiApplication.instance() or QGuiApplication(sys.argv)
+    set_quit_on_last_window_closed = getattr(
+        app, "setQuitOnLastWindowClosed", None
+    )
+    if callable(set_quit_on_last_window_closed):
+        set_quit_on_last_window_closed(False)
 
     model = ButtonMappingModel()
-    controller = SettingsController(model)
+    controller = SettingsController(model, start_hidden=start_hidden)
+
+    def update_application_icon() -> None:
+        path = resources.find_app_icon(controller._tray_icon_state())
+        if path is not None and hasattr(app, "setWindowIcon"):
+            app.setWindowIcon(QIcon(str(path)))
+
+    update_application_icon()
+    controller.trayStateChanged.connect(update_application_icon)
     diagnostics_controller = DiagnosticsController(
         controller,
         config.config_root(),

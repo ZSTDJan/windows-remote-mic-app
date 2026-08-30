@@ -279,16 +279,29 @@ class ConfigPrivacyKeysNotHardcodedElsewhereTests(unittest.TestCase):
         )
 
 
-class NoAutoStartOnLoginTests(unittest.TestCase):
-    def test_source_never_references_startup_folder_or_run_key(self):
+class UserControlledAutoStartTests(unittest.TestCase):
+    def test_run_key_is_scoped_to_the_two_reviewed_modules(self):
         offenders = []
-        markers = ("CurrentVersion\\\\Run", "userstartup", "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Run")
+        markers = (
+            "CurrentVersion\\Run",
+            "userstartup",
+            "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Run",
+        )
+        allowed = {"startup_windows.py", "voice_program_manager.py"}
         for path in _PY_FILES:
             text = path.read_text(encoding="utf-8")
             for marker in markers:
-                if marker in text:
+                if marker in text and path.name not in allowed:
                     offenders.append((str(path), marker))
         self.assertEqual(offenders, [], f"autostart marker found: {offenders}")
+
+    def test_only_startup_owner_writes_the_run_value(self):
+        writers = []
+        for path in _PY_FILES:
+            text = path.read_text(encoding="utf-8")
+            if "winreg.SetValueEx" in text or "winreg.DeleteValue" in text:
+                writers.append(path.name)
+        self.assertEqual(writers, ["startup_windows.py"])
 
 
 if __name__ == "__main__":

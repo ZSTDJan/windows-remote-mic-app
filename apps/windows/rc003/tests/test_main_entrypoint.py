@@ -206,6 +206,16 @@ class BridgeModeRoutingTests(_ArgvRestoringTestCase):
         self.assertEqual(ctx.exception.code, single_instance.DUPLICATE_INSTANCE_EXIT_CODE)
         self.assertEqual(notice_calls, [])
 
+    def test_settings_managed_bridge_suppresses_the_second_tray_icon(self):
+        calls = []
+        app.main = lambda **kwargs: calls.append(kwargs)
+        single_instance.BridgeInstanceGuard = _make_guard_class()
+        sys.argv = ["ovb_rc003", "--bridge", "--bridge-from-settings"]
+
+        main_module.main()
+
+        self.assertEqual(calls, [{"show_notification_icon": False}])
+
     def test_guard_unavailable_fails_closed_and_never_calls_app_main(self):
         # XRBM-021 review round 1 P1 #1: the guard FAILS CLOSED - an
         # acquisition failure it cannot resolve is treated the same as a
@@ -380,6 +390,42 @@ class ArgumentModeBypassTests(_ArgvRestoringTestCase):
 
         self.assertEqual(bridge_enter_calls, [])
         self.assertEqual(settings_enter_calls, [1])
+
+    def test_background_start_keeps_the_existing_window_hidden(self):
+        from ovb_rc003 import settings_ui
+
+        settings_calls = []
+        original_settings_main = settings_ui.main
+        settings_ui.main = lambda **kwargs: settings_calls.append(kwargs)
+        sys.argv = ["ovb_rc003", "--background"]
+        try:
+            main_module.main()
+        finally:
+            settings_ui.main = original_settings_main
+
+        self.assertEqual(settings_calls, [{"start_hidden": True}])
+
+    def test_duplicate_background_start_does_not_pop_the_window_open(self):
+        from ovb_rc003 import settings_ui
+
+        activation_calls = []
+        single_instance.SettingsInstanceGuard = _make_guard_class(
+            raise_on_enter=single_instance.DuplicateInstanceError("already open")
+        )
+        single_instance.activate_existing_settings_window = (
+            lambda: activation_calls.append(1) or True
+        )
+        original_settings_main = settings_ui.main
+        settings_ui.main = lambda **kwargs: self.fail(
+            "duplicate background start must not build another window"
+        )
+        sys.argv = ["ovb_rc003", "--background"]
+        try:
+            main_module.main()
+        finally:
+            settings_ui.main = original_settings_main
+
+        self.assertEqual(activation_calls, [])
 
     def test_explicit_settings_wins_when_bridge_flag_is_also_present(self):
         from ovb_rc003 import settings_ui

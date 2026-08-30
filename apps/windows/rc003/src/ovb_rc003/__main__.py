@@ -6,6 +6,7 @@ built from the standalone ``src/launcher.py`` entry point - see XRBM-021):
                 guard: a repeat launch restores the existing window without
                 touching BLE/HID/audio or the bridge guard.
 - ``--settings``  open the settings window (explicit form of the default)
+- ``--background``  start the desktop shell hidden in the notification area
 - ``--bridge``  run the bridge - guarded by a per-session Windows named-
                 mutex (single_instance.py) so a second concurrent launch
                 never starts BLE/HID/audio: it shows a visible notice and
@@ -94,6 +95,7 @@ def _print_help() -> None:
     print("Usage:")
     print("  python -m ovb_rc003               open the settings window (default)")
     print("  python -m ovb_rc003 --settings    open the settings window")
+    print("  python -m ovb_rc003 --background  start hidden in the notification area")
     print("  python -m ovb_rc003 --bridge      run the bridge")
     print("  python -m ovb_rc003 --dry-run     import every module and exit 0 (CI smoke check)")
     print("  python -m ovb_rc003 --help        show this message and exit 0")
@@ -135,6 +137,7 @@ def _dry_run() -> int:
         settings_ui,
         shell_targets,
         single_instance,
+        startup_windows,
         voice_controller,
         win32_input,
         win32_keys,
@@ -157,6 +160,7 @@ def _qt_runtime_check() -> int:
         "PySide6.QtQml",
         "PySide6.QtQuick",
         "PySide6.QtQuickControls2",
+        "PySide6.QtSvg",
     )
     for module_name in qt_modules:
         importlib.import_module(module_name)
@@ -214,7 +218,10 @@ def _run_bridge(*, quiet_duplicate: bool = False) -> None:
 
     try:
         with single_instance.BridgeInstanceGuard():
-            app.main()
+            if quiet_duplicate:
+                app.main(show_notification_icon=False)
+            else:
+                app.main()
     except single_instance.DuplicateInstanceError as exc:
         if not quiet_duplicate:
             single_instance.show_bridge_startup_blocked_notice(str(exc))
@@ -297,6 +304,9 @@ def main() -> None:
     if "--settings" in args:
         _run_settings()
         return
+    if "--background" in args:
+        _run_settings(start_hidden=True, activate_duplicate=False)
+        return
     if "--bridge" in args:
         from . import bridge_launcher
 
@@ -311,14 +321,20 @@ def main() -> None:
     _run_settings()
 
 
-def _run_settings() -> None:
+def _run_settings(
+    *, start_hidden: bool = False, activate_duplicate: bool = True
+) -> None:
     from . import settings_ui, single_instance
 
     try:
         with single_instance.SettingsInstanceGuard():
-            settings_ui.main()
+            if start_hidden:
+                settings_ui.main(start_hidden=True)
+            else:
+                settings_ui.main()
     except single_instance.DuplicateInstanceError:
-        single_instance.activate_existing_settings_window()
+        if activate_duplicate:
+            single_instance.activate_existing_settings_window()
         return
     except Exception as exc:
         print(

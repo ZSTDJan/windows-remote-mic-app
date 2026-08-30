@@ -1,6 +1,7 @@
 import QtQuick
 import QtQuick.Controls
 import QtQuick.Layouts
+import Qt.labs.platform as Platform
 import OvbRc003Settings 1.0
 
 ApplicationWindow {
@@ -11,7 +12,6 @@ ApplicationWindow {
     minimumWidth: 640
     minimumHeight: 480
     visible: true
-
     readonly property string preferredWindowsUiFont: "Microsoft YaHei UI"
     readonly property bool preferredWindowsUiFontAvailable:
         Qt.platform.os === "windows"
@@ -22,6 +22,79 @@ ApplicationWindow {
             ? window.preferredWindowsUiFont : Qt.application.font.family
     }
     property bool initialDiagnosticsStarted: false
+    property string applicationExitError: ""
+
+    function restoreWindow() {
+        window.show()
+        window.raise()
+        window.requestActivate()
+        SettingsController.refreshBridgeState()
+    }
+
+    Component.onCompleted: {
+        if (SettingsController.startHidden)
+            window.hide()
+        SettingsController.startBridgeOnApplicationStart()
+    }
+
+    onClosing: function(close) {
+        close.accepted = false
+        if (SettingsController.closeBehavior === "quit") {
+            window.hide()
+            SettingsController.requestApplicationExit()
+        } else {
+            window.hide()
+        }
+    }
+
+    Connections {
+        target: SettingsController
+        function onApplicationExitReady() { Qt.quit() }
+        function onApplicationExitFailed(message) {
+            window.restoreWindow()
+            window.applicationExitError = message
+            exitFailedDialog.open()
+        }
+    }
+
+    Dialog {
+        id: exitFailedDialog
+        objectName: "exitFailedDialog"
+        anchors.centerIn: parent
+        modal: true
+        title: qsTr("无法完全退出")
+        standardButtons: Dialog.Ok
+        Label {
+            width: 360
+            text: window.applicationExitError
+            wrapMode: Text.Wrap
+            color: window.tokens.textPrimary
+        }
+    }
+
+    Platform.SystemTrayIcon {
+        id: systemTrayIcon
+        objectName: "systemTrayIcon"
+        visible: true
+        icon.source: SettingsController.trayIconSource
+        tooltip: SettingsController.trayTooltip
+        onActivated: function(reason) {
+            if (reason === Platform.SystemTrayIcon.Trigger
+                    || reason === Platform.SystemTrayIcon.DoubleClick)
+                window.restoreWindow()
+        }
+        menu: Platform.Menu {
+            Platform.MenuItem {
+                text: qsTr("打开 Remote Mic")
+                onTriggered: window.restoreWindow()
+            }
+            Platform.MenuSeparator {}
+            Platform.MenuItem {
+                text: qsTr("完全退出")
+                onTriggered: SettingsController.requestApplicationExit()
+            }
+        }
+    }
 
     onFrameSwapped: {
         if (initialDiagnosticsStarted)
@@ -49,7 +122,7 @@ ApplicationWindow {
             || SettingsController.bridgeLaunchPhase === "waiting"
             ? 1000 : 2000
         repeat: true
-        running: window.visible
+        running: true
         onTriggered: SettingsController.refreshBridgeState()
     }
 
@@ -58,7 +131,7 @@ ApplicationWindow {
         objectName: "bridgeLaunchPollTimer"
         interval: 150
         repeat: true
-        running: window.visible && SettingsController.bridgeLaunchBusy
+        running: SettingsController.bridgeLaunchBusy
         onTriggered: SettingsController.pollBridgeLaunch()
     }
 
@@ -136,6 +209,17 @@ ApplicationWindow {
                     checked: tabBar.currentIndex === 2
                     onPressed: tabBar.currentIndex = 2
                     Accessible.name: text
+                    KeyNavigation.tab: generalTabButton
+                }
+                NavButton {
+                    id: generalTabButton
+                    objectName: "generalTabButton"
+                    tokens: window.tokens
+                    text: qsTr("常规")
+                    glyph: "\uE713"
+                    checked: tabBar.currentIndex === 3
+                    onPressed: tabBar.currentIndex = 3
+                    Accessible.name: text
                     KeyNavigation.tab: deviceTabButton
                 }
             }
@@ -172,6 +256,7 @@ ApplicationWindow {
                         VoicePage { tokens: window.tokens }
                     }
                 }
+                GeneralPage { tokens: window.tokens }
             }
 
             Rectangle {

@@ -5,7 +5,8 @@
 ;
 ; Hard boundaries enforced by this script:
 ;   - PrivilegesRequired=lowest (no admin elevation requested, ever).
-;   - No [Tasks]/[Icons] entry adds a login-autostart shortcut.
+;   - No [Tasks]/[Icons] entry adds login startup. The installed app exposes
+;     an explicit per-user option and uninstall removes only its owned value.
 ;   - This INSTALLER SCRIPT never installs, configures, silently modifies,
 ;     or removes VB-CABLE or any other driver, and never elevates itself to
 ;     do so, during install OR uninstall (XRBM-031 RETRY 1 item 5 - this
@@ -47,6 +48,7 @@ Compression=lzma2/ultra64
 SolidCompression=yes
 WizardStyle=modern
 SetupLogging=yes
+SetupIconFile=..\src\ovb_rc003\assets\icons\remote-mic.ico
 OutputBaseFilename=RemoteMicRC003Setup-{#AppVersion}-unsigned
 OutputDir=..\dist\installer
 UninstallDisplayName={#AppName}
@@ -75,16 +77,14 @@ Name: "desktopicon"; Description: "创建桌面快捷方式"; GroupDescription: 
 ; Deliberately no "start on login" task here.
 
 [Icons]
-; Primary Start Menu and optional desktop shortcuts both open Settings -
-; neither silently starts bridge mode (BLE/HID/audio) without the user
-; having seen/confirmed configuration first. The exe's no-argument form
-; already opens Settings; --settings is kept explicit for clarity.
-Name: "{group}\{#AppName}"; Filename: "{app}\{#AppExeName}"; Parameters: "--settings"
+; Normal shortcuts open the one desktop shell. It owns both the taskbar
+; window and notification-area icon; bridge startup remains controlled by
+; the saved in-app option.
+Name: "{group}\{#AppName}"; Filename: "{app}\{#AppExeName}"
 Name: "{group}\{#AppName} 设置"; Filename: "{app}\{#AppExeName}"; Parameters: "--settings"
-Name: "{group}\启动 {#AppName}"; Filename: "{app}\{#AppExeName}"; Parameters: "--bridge"
 Name: "{group}\停止 {#AppName}"; Filename: "powershell.exe"; Parameters: "-ExecutionPolicy Bypass -File ""{app}\stop-app.ps1"" -AppPath ""{app}"""; WorkingDir: "{app}"; Flags: runminimized
 Name: "{group}\卸载 {#AppName}"; Filename: "{uninstallexe}"
-Name: "{userdesktop}\{#AppName}"; Filename: "{app}\{#AppExeName}"; Parameters: "--settings"; Tasks: desktopicon
+Name: "{userdesktop}\{#AppName}"; Filename: "{app}\{#AppExeName}"; Tasks: desktopicon
 ; Deliberately no {userstartup} icon anywhere in this file.
 
 [Run]
@@ -147,4 +147,14 @@ begin
     );
     Result := False;
   end;
+end;
+
+procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
+begin
+  if CurUninstallStep = usUninstall then
+    RegDeleteValue(
+      HKCU,
+      'Software\Microsoft\Windows\CurrentVersion\Run',
+      'RemoteMicRC003'
+    );
 end;

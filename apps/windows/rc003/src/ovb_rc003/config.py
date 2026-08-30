@@ -31,7 +31,13 @@ PRODUCT_ID = "RC003"
 CONFIG_FILENAME = "config.json"
 KEY_BINDINGS_FILENAME = "key_bindings.json"
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
+
+CLOSE_BEHAVIOR_HIDE_TO_TRAY = "hide_to_tray"
+CLOSE_BEHAVIOR_QUIT = "quit"
+VALID_CLOSE_BEHAVIORS = frozenset(
+    {CLOSE_BEHAVIOR_HIDE_TO_TRAY, CLOSE_BEHAVIOR_QUIT}
+)
 
 RUNTIME_LEGACY_VOICE_MODE_KEY = "_legacy_voice_trigger_mode"
 RUNTIME_REMOVED_VOICE_BINDINGS_KEY = "_removed_voice_bindings"
@@ -122,6 +128,10 @@ def default_config() -> Dict[str, Any]:
         # Windows WASAPI and MME) - name alone is not always unique.
         "output_endpoint_name": "",
         "output_endpoint_host_api": "",
+        # Desktop-shell behavior. Windows login startup itself is owned by
+        # the user's HKCU Run value and is deliberately not mirrored here.
+        "launch_bridge_on_app_start": False,
+        "close_behavior": CLOSE_BEHAVIOR_HIDE_TO_TRAY,
     }
 
 
@@ -168,9 +178,11 @@ def load_config(path: Path) -> Dict[str, Any]:
         # the old value that is actually present in the file.
         _normalize_voice_program(stored)
         _normalize_voice_hotkey(stored)
+        _normalize_desktop_behavior(stored)
         config.update(stored)
     _normalize_voice_program(config)
     _normalize_voice_hotkey(config)
+    _normalize_desktop_behavior(config)
     return config
 
 
@@ -179,6 +191,7 @@ def save_config(path: Path, config: Dict[str, Any]) -> None:
     _assert_no_forbidden_keys(persisted)
     _normalize_voice_hotkey(persisted)
     _normalize_voice_program(persisted)
+    _normalize_desktop_behavior(persisted)
     persisted = _without_runtime_only_keys(persisted)
     _save_json_atomic(path, persisted)
 
@@ -324,6 +337,19 @@ def _normalize_voice_program(config: Dict[str, Any]) -> None:
     config["voice_program"] = voice_program_manager.normalize_voice_program_settings(
         config.get("voice_program")
     )
+
+
+def _normalize_desktop_behavior(config: Dict[str, Any]) -> None:
+    config["launch_bridge_on_app_start"] = bool(
+        config.get("launch_bridge_on_app_start", False)
+    )
+    close_behavior = str(
+        config.get("close_behavior", CLOSE_BEHAVIOR_HIDE_TO_TRAY)
+    ).strip()
+    if close_behavior not in VALID_CLOSE_BEHAVIORS:
+        close_behavior = CLOSE_BEHAVIOR_HIDE_TO_TRAY
+    config["close_behavior"] = close_behavior
+    config["schema_version"] = SCHEMA_VERSION
 
 
 def default_key_bindings() -> Dict[str, Any]:
