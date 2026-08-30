@@ -693,7 +693,7 @@ class SpatialNavigationTests(unittest.TestCase):
         )[0]
         self.assertEqual((right, left), (1, 0))
 
-    def test_immediate_opposite_direction_prioritizes_the_previous_target(self):
+    def test_immediate_opposite_direction_keeps_static_route_order(self):
         traversal = prototype.NavigationTraversal()
         right = traversal.available(
             0, prototype.Direction.RIGHT, (1, 2)
@@ -702,7 +702,17 @@ class SpatialNavigationTests(unittest.TestCase):
         left_candidates = traversal.available(
             right, prototype.Direction.LEFT, (2, 0)
         )
-        self.assertEqual(left_candidates, (0, 2))
+        self.assertEqual(left_candidates, (2, 0))
+
+    def test_immediate_opposite_direction_returns_when_no_static_route_exists(self):
+        traversal = prototype.NavigationTraversal()
+        right = traversal.available(0, prototype.Direction.RIGHT, (1,))[0]
+        traversal.commit(right)
+
+        self.assertEqual(
+            traversal.available(right, prototype.Direction.LEFT, ()),
+            (0,),
+        )
 
     def test_right_stops_instead_of_wrapping_to_a_lower_folder(self):
         targets = [
@@ -1671,7 +1681,7 @@ class SpatialNavigationTests(unittest.TestCase):
         self.assertEqual(routes(0.75), routes(1.0))
         self.assertEqual(routes(1.25), routes(1.0))
 
-    def test_contact_cell_immediate_reverse_returns_to_the_previous_target(self):
+    def test_contact_cell_direction_change_uses_the_recentered_static_route(self):
         generator = random.Random(830)
         for _case in range(80):
             targets = []
@@ -1710,12 +1720,25 @@ class SpatialNavigationTests(unittest.TestCase):
                     )
                     traversal.commit(next_index, next_cell)
                     reverse = prototype.OPPOSITE_DIRECTION[direction]
+                    reverse_cell = traversal.current_cell(
+                        next_index,
+                        graph.anchor_rects[next_index],
+                        reverse,
+                    )
+                    static_reverse = graph.candidates(
+                        next_index,
+                        reverse,
+                        reverse_cell,
+                    )
                     reverse_candidates = traversal.available(
                         next_index,
                         reverse,
-                        graph.candidates(next_index, reverse, next_cell),
+                        static_reverse,
                     )
-                    self.assertEqual(reverse_candidates[0], start)
+                    self.assertEqual(
+                        reverse_candidates[0],
+                        static_reverse[0] if static_reverse else start,
+                    )
 
     def test_navigation_diagnostic_uses_the_active_contact_cell(self):
         targets = [
@@ -2012,8 +2035,92 @@ class SpatialNavigationTests(unittest.TestCase):
 
         self.assertEqual(plan.natural[0], 6)
         self.assertEqual(plan.ranked[0], 1)
+        self.assertNotIn(plan.natural[0], plan.ranked)
         self.assertTrue(plan.orthogonal_step_required)
         self.assertTrue(plan.uses_xy_fallback)
+
+    def test_xy_fallback_does_not_restore_the_blocked_natural_route(self):
+        targets = [
+            self.target(1107, 855, 1278, 909, "current"),
+            self.target(426, 500, 603, 589, "blocked"),
+            self.target(1063, 694, 1303, 787, "bridge"),
+        ]
+        graph = prototype.NavigationGraph(targets)
+
+        plan = prototype.navigation_candidate_plan(
+            graph,
+            0,
+            prototype.Direction.LEFT,
+            graph.anchor_rects[0],
+        )
+
+        self.assertEqual(
+            graph.xy_focus_candidates(0, prototype.Direction.LEFT),
+            (1,),
+        )
+        self.assertEqual(plan.natural, (1,))
+        self.assertEqual(plan.ranked, ())
+        self.assertTrue(plan.orthogonal_step_required)
+        self.assertFalse(plan.uses_xy_fallback)
+
+    def test_reverse_history_does_not_restore_an_orthogonally_blocked_route(self):
+        targets = [
+            self.target(357, 554, 461, 592, "start"),
+            self.target(593, 252, 782, 313, "upper"),
+            self.target(482, 386, 549, 438, "bridge"),
+            self.target(743, 591, 786, 649, "destination"),
+        ]
+        graph = prototype.NavigationGraph(targets)
+        traversal = prototype.NavigationTraversal()
+        current_cell = traversal.current_cell(
+            0,
+            graph.anchor_rects[0],
+            prototype.Direction.DOWN,
+        )
+        forward_plan = prototype.navigation_candidate_plan(
+            graph,
+            0,
+            prototype.Direction.DOWN,
+            current_cell,
+        )
+        selected = traversal.available(
+            0,
+            prototype.Direction.DOWN,
+            forward_plan.ranked,
+            allow_previous_fallback=not forward_plan.orthogonal_step_required,
+        )[0]
+        self.assertEqual(selected, 3)
+        traversal.commit(
+            selected,
+            prototype.navigation_contact_cell(
+                current_cell,
+                graph.grid_rects[selected],
+                prototype.Direction.DOWN,
+            ),
+        )
+        reverse_cell = traversal.current_cell(
+            selected,
+            graph.anchor_rects[selected],
+            prototype.Direction.UP,
+        )
+        plan = prototype.navigation_candidate_plan(
+            graph,
+            selected,
+            prototype.Direction.UP,
+            reverse_cell,
+        )
+
+        self.assertEqual(plan.natural, (2, 1))
+        self.assertTrue(plan.orthogonal_step_required)
+        self.assertEqual(
+            traversal.available(
+                selected,
+                prototype.Direction.UP,
+                plan.ranked,
+                allow_previous_fallback=not plan.orthogonal_step_required,
+            ),
+            (),
+        )
 
     def test_random_hybrid_plans_never_rewire_a_usable_territory_route(self):
         generator = random.Random(914)

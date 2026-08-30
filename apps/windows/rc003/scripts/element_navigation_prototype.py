@@ -3803,6 +3803,9 @@ def navigation_candidate_plan(
             natural[0],
         )
     )
+    blocked_natural_index = (
+        natural[0] if natural and orthogonal_step_required else None
+    )
     fallback: tuple[int, ...] = ()
     if not natural:
         fallback = graph.xy_focus_candidates(current_index, direction)
@@ -3866,6 +3869,10 @@ def navigation_candidate_plan(
         )
     if not fallback:
         fallback = graph.xy_focus_candidates(current_index, direction)
+    if blocked_natural_index is not None:
+        fallback = tuple(
+            index for index in fallback if index != blocked_natural_index
+        )
     return NavigationCandidatePlan(
         natural=natural,
         ranked=fallback,
@@ -3919,6 +3926,8 @@ class NavigationTraversal:
         current_index: int,
         direction: Direction,
         candidates: Sequence[int],
+        *,
+        allow_previous_fallback: bool = True,
     ) -> tuple[int, ...]:
         if direction != self.direction:
             self.direction = direction
@@ -3927,14 +3936,14 @@ class NavigationTraversal:
             self.visited.add(current_index)
         ranked = tuple(candidates)
         if (
-            self.last_direction is not None
+            not ranked
+            and allow_previous_fallback
+            and self.last_direction is not None
             and direction == OPPOSITE_DIRECTION[self.last_direction]
             and current_index == self.last_to
             and self.last_from is not None
         ):
-            ranked = (self.last_from,) + tuple(
-                index for index in ranked if index != self.last_from
-            )
+            ranked = (self.last_from,)
         self.pending_from = current_index
         self.pending_direction = direction
         return tuple(index for index in ranked if index not in self.visited)
@@ -6891,6 +6900,7 @@ def _run_windows(args: argparse.Namespace) -> int:
                     current,
                     direction,
                     plan.ranked,
+                    allow_previous_fallback=not plan.orthogonal_step_required,
                 )
                 return (
                     current,
