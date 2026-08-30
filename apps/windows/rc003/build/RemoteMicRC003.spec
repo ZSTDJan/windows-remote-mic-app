@@ -30,6 +30,7 @@ APP_ICON = APP_ICON_DIR / "remote-mic.ico"
 ELEMENT_NAVIGATION_SOURCE_DIR = RC003_ROOT / "scripts"
 ELEMENT_NAVIGATION_SOURCE_FILES = (
     "element_navigation_prototype.py",
+    "element_navigation_command_windows.py",
     "element_navigation_support.py",
     "element_navigation_windows_host.py",
     "element_targeting_core.py",

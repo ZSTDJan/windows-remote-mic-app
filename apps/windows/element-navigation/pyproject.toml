@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "element-navigation"
+version = "0.1.0"
+description = "Keyboard-driven spatial navigation for interactive Windows UI elements"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "PySide6-Essentials==6.11.1",
+    "uiautomation==2.0.29",
+    "comtypes==1.4.16",
+]
+classifiers = [
+    "Operating System :: Microsoft :: Windows :: Windows 10",
+    "Operating System :: Microsoft :: Windows :: Windows 11",
+    "Programming Language :: Python :: 3",
+]
+
+[project.scripts]
+element-navigation = "element_navigation_prototype:main"
+
+[tool.setuptools]
+package-dir = {"" = "scripts"}
+py-modules = [
+    "element_navigation_command_windows",
+    "element_navigation_prototype",
+    "element_navigation_support",
+    "element_navigation_windows_host",
+    "element_targeting_core",
+    "spatial_navigation_core",
+]

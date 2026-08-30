@@ -252,6 +252,7 @@ class PyInstallerSpecTests(unittest.TestCase):
         text = _SPEC_PATH.read_text(encoding="utf-8")
         for source_name in (
             "element_navigation_prototype.py",
+            "element_navigation_command_windows.py",
             "element_navigation_support.py",
             "element_navigation_windows_host.py",
             "element_targeting_core.py",

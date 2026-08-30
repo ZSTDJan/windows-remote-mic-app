@@ -194,6 +194,7 @@ class SpatialNavigationTests(unittest.TestCase):
                 "collections",
                 "ctypes",
                 "dataclasses",
+                "element_navigation_command_windows",
                 "element_navigation_support",
                 "element_targeting_core",
                 "queue",

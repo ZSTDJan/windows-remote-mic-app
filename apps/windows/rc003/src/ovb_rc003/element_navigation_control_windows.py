@@ -23,9 +23,9 @@ from typing import Callable, Deque, Optional, Sequence, Tuple
 from . import dev_session, single_instance
 
 
-ELEMENT_NAVIGATION_WINDOW_CLASS = "RemoteMicRC003.ElementNavigation.Command.v1"
-ELEMENT_NAVIGATION_WINDOW_TITLE = "Remote Mic Element Navigation Command"
-ELEMENT_NAVIGATION_MESSAGE_NAME = "RemoteMicRC003.ElementNavigation.Command.v1"
+ELEMENT_NAVIGATION_WINDOW_CLASS = "ElementNavigation.Command.v1"
+ELEMENT_NAVIGATION_WINDOW_TITLE = "Element Navigation Command"
+ELEMENT_NAVIGATION_MESSAGE_NAME = "ElementNavigation.Command.v1"
 
 ELEMENT_NAVIGATION_COMMAND_TOGGLE = 1
 ELEMENT_NAVIGATION_COMMAND_QUIT = 2
@@ -38,6 +38,18 @@ _SHUTDOWN_WORKER_JOIN_GRACE_SECONDS = 0.25
 _PROCESS_STOP_TIMEOUT_SECONDS = 1.0
 
 _LOGGER = logging.getLogger(__name__)
+
+
+def _remote_mic_quicker_state_file() -> str:
+    local_app_data = os.environ.get("LOCALAPPDATA", "").strip()
+    if not local_app_data:
+        return ""
+    return os.path.join(
+        local_app_data,
+        "RemoteMic",
+        "RC003",
+        "quicker-navigation.json",
+    )
 
 
 class CommandSendResult(Enum):
@@ -162,6 +174,11 @@ def build_element_navigation_command(
         "--owner-pid",
         str(max(0, int(owner_pid))),
     ]
+    quicker_state_file = _remote_mic_quicker_state_file()
+    if quicker_state_file:
+        managed_arguments.extend(
+            ["--quicker-state-file", quicker_state_file]
+        )
     if frozen:
         return dev_session.mark_command(
             [executable, "--element-navigation", *managed_arguments]

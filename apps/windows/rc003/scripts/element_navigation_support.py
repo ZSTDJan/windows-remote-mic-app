@@ -92,7 +92,7 @@ QUICKER_FLOAT_WINDOW_TITLES = frozenset(
     {"FloatButtonWindow", "FloatPanelWindow", "TextFloatPanelWindow"}
 )
 
-QUICKER_STATE_FILE_ENV = "REMOTE_MIC_QUICKER_STATE_FILE"
+QUICKER_STATE_FILE_ENV = "ELEMENT_NAVIGATION_QUICKER_STATE_FILE"
 
 WS_EX_TOPMOST = 0x00000008
 
@@ -132,8 +132,7 @@ def default_quicker_state_file() -> str:
         return ""
     return os.path.join(
         local_app_data,
-        "RemoteMic",
-        "RC003",
+        "ElementNavigation",
         "quicker-navigation.json",
     )
 

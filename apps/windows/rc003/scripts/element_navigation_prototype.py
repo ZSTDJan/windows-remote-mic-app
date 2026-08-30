@@ -1,7 +1,7 @@
 """Keyboard-driven UI Automation spatial navigator.
 
 This file remains the single navigation source used by both the standalone
-developer command and Remote Mic's isolated companion-process entry.
+command and embedded companion-process entries.
 
 Controls:
     Ctrl+Alt+N  scan the foreground window and enter/leave navigation
@@ -22,14 +22,6 @@ import importlib.util
 import os
 import sys
 from typing import Any, Optional, Sequence
-
-
-_RC003_SOURCE_ROOT = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-    "src",
-)
-if _RC003_SOURCE_ROOT not in sys.path:
-    sys.path.insert(0, _RC003_SOURCE_ROOT)
 
 
 _SPATIAL_NAVIGATION_CORE_NAME = "spatial_navigation_core"
@@ -187,6 +179,47 @@ for _support_export in _element_navigation_support.__all__:
     )
 del _overlapping_support_exports
 del _support_export
+
+
+_ELEMENT_NAVIGATION_COMMAND_NAME = "element_navigation_command_windows"
+_ELEMENT_NAVIGATION_COMMAND_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "element_navigation_command_windows.py",
+)
+
+
+def _load_element_navigation_command() -> Any:
+    expected_path = os.path.normcase(
+        os.path.abspath(_ELEMENT_NAVIGATION_COMMAND_PATH)
+    )
+    existing = sys.modules.get(_ELEMENT_NAVIGATION_COMMAND_NAME)
+    if existing is not None:
+        existing_path = os.path.normcase(
+            os.path.abspath(str(getattr(existing, "__file__", "")))
+        )
+        if existing_path != expected_path:
+            raise ImportError(
+                "element_navigation_command_windows already refers to a different file"
+            )
+        return existing
+
+    spec = importlib.util.spec_from_file_location(
+        _ELEMENT_NAVIGATION_COMMAND_NAME,
+        _ELEMENT_NAVIGATION_COMMAND_PATH,
+    )
+    if spec is None or spec.loader is None:
+        raise ImportError("cannot load element_navigation_command_windows")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[_ELEMENT_NAVIGATION_COMMAND_NAME] = module
+    try:
+        spec.loader.exec_module(module)
+    except Exception:
+        sys.modules.pop(_ELEMENT_NAVIGATION_COMMAND_NAME, None)
+        raise
+    return module
+
+
+_element_navigation_command = _load_element_navigation_command()
 
 
 def configure_standard_streams() -> None:

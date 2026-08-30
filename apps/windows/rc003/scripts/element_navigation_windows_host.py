@@ -20,6 +20,11 @@ from typing import Any, Callable, Optional, Sequence
 from spatial_navigation_core import *
 from element_targeting_core import *
 from element_navigation_support import *
+from element_navigation_command_windows import (
+    ELEMENT_NAVIGATION_COMMAND_QUIT,
+    ELEMENT_NAVIGATION_COMMAND_TOGGLE,
+    ElementNavigationCommandServer,
+)
 
 
 def _run_windows(args: argparse.Namespace) -> int:
@@ -35,13 +40,6 @@ def _run_windows(args: argparse.Namespace) -> int:
     from PySide6.QtCore import Qt, QRect, QTimer
     from PySide6.QtGui import QColor, QFont, QGuiApplication, QPainter, QPen
     from PySide6.QtWidgets import QApplication, QWidget
-    from ovb_rc003.element_navigation_control_windows import (
-        ELEMENT_NAVIGATION_COMMAND_QUIT,
-        ELEMENT_NAVIGATION_COMMAND_TOGGLE,
-        ElementNavigationCommandServer,
-    )
-    from ovb_rc003 import product_identity
-
     user32 = ctypes.windll.user32
     kernel32 = ctypes.windll.kernel32
     gdi32 = ctypes.windll.gdi32
@@ -3185,7 +3183,7 @@ def _run_windows(args: argparse.Namespace) -> int:
             auto.UninitializeUIAutomationInCurrentThread()
 
     app = QApplication(sys.argv[:1])
-    app.setApplicationName(f"{product_identity.DISPLAY_NAME} 元素导航")
+    app.setApplicationName("元素导航")
     prototype_process_id = int(kernel32.GetCurrentProcessId())
     overlay = NavigationOverlay()
     worker = AutomationWorker(diagnostics_enabled=bool(args.diagnostics))

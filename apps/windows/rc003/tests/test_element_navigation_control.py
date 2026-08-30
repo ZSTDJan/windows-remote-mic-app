@@ -1,8 +1,10 @@
 import inspect
+import importlib.util
 import sys
 import threading
 import time
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
@@ -11,6 +13,20 @@ from ovb_rc003 import (
     element_navigation_runtime as runtime,
     single_instance,
 )
+
+
+COMMAND_SOURCE_PATH = (
+    Path(__file__).resolve().parents[1]
+    / "scripts"
+    / "element_navigation_command_windows.py"
+)
+COMMAND_SPEC = importlib.util.spec_from_file_location(
+    "standalone_element_navigation_command_windows",
+    COMMAND_SOURCE_PATH,
+)
+assert COMMAND_SPEC is not None and COMMAND_SPEC.loader is not None
+standalone_command = importlib.util.module_from_spec(COMMAND_SPEC)
+COMMAND_SPEC.loader.exec_module(standalone_command)
 
 
 class ElementNavigationCommandTests(unittest.TestCase):
@@ -38,6 +54,23 @@ class ElementNavigationCommandTests(unittest.TestCase):
         for command in (source_command, frozen_command):
             owner_index = command.index("--owner-pid")
             self.assertEqual(command[owner_index + 1], "4321")
+
+    def test_embedded_command_preserves_remote_mic_quicker_state_location(self):
+        with mock.patch.dict(
+            control.os.environ,
+            {"LOCALAPPDATA": r"C:\LocalData"},
+        ):
+            command = control.build_element_navigation_command(
+                frozen=False,
+                executable="python.exe",
+                owner_pid=4321,
+            )
+
+        state_index = command.index("--quicker-state-file")
+        self.assertEqual(
+            command[state_index + 1],
+            r"C:\LocalData\RemoteMic\RC003\quicker-navigation.json",
+        )
 
     def test_send_command_distinguishes_absent_delivered_and_failed(self):
         self.assertEqual(
@@ -71,7 +104,7 @@ class ElementNavigationCommandTests(unittest.TestCase):
         )
 
     def test_win32_message_loop_declares_pointer_sized_ctypes_prototypes(self):
-        source = inspect.getsource(control.ElementNavigationCommandServer._run)
+        source = inspect.getsource(standalone_command.ElementNavigationCommandServer._run)
         for token in (
             "RegisterWindowMessageW.argtypes",
             "RegisterWindowMessageW.restype",
@@ -85,6 +118,16 @@ class ElementNavigationCommandTests(unittest.TestCase):
             "DispatchMessageW.argtypes",
         ):
             self.assertIn(token, source)
+
+    def test_embedded_client_uses_the_standalone_command_protocol(self):
+        for name in (
+            "ELEMENT_NAVIGATION_WINDOW_CLASS",
+            "ELEMENT_NAVIGATION_WINDOW_TITLE",
+            "ELEMENT_NAVIGATION_MESSAGE_NAME",
+            "ELEMENT_NAVIGATION_COMMAND_TOGGLE",
+            "ELEMENT_NAVIGATION_COMMAND_QUIT",
+        ):
+            self.assertEqual(getattr(control, name), getattr(standalone_command, name))
 
 
 class ElementNavigationClientTests(unittest.TestCase):

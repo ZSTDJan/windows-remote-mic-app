@@ -1,4 +1,4 @@
-# Compatibility install entry for the standalone navigation script.
-# Element navigation is now part of Remote Mic; runtime pins have one
-# authoritative source in ../requirements.txt and candidate builds bundle them.
--r ../requirements.txt
+# Runtime dependencies for the standalone element-navigation source.
+PySide6-Essentials==6.11.1
+uiautomation==2.0.29
+comtypes==1.4.16
