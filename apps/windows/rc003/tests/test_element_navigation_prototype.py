@@ -17,6 +17,7 @@ SCRIPT_PATH = (
 )
 TARGETING_CORE_PATH = SCRIPT_PATH.with_name("element_targeting_core.py")
 SUPPORT_PATH = SCRIPT_PATH.with_name("element_navigation_support.py")
+WINDOWS_HOST_PATH = SCRIPT_PATH.with_name("element_navigation_windows_host.py")
 SPEC = importlib.util.spec_from_file_location("element_navigation_prototype", SCRIPT_PATH)
 assert SPEC is not None and SPEC.loader is not None
 prototype = importlib.util.module_from_spec(SPEC)
@@ -171,6 +172,90 @@ class SpatialNavigationTests(unittest.TestCase):
                 "typing",
             },
         )
+
+    def test_windows_host_keeps_platform_imports_lazy_and_dpi_ordered(self):
+        tree = ast.parse(WINDOWS_HOST_PATH.read_text(encoding="utf-8"))
+        top_level_imports = set()
+        for node in tree.body:
+            if isinstance(node, ast.Import):
+                top_level_imports.update(
+                    alias.name.split(".", 1)[0] for alias in node.names
+                )
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                top_level_imports.add(node.module.split(".", 1)[0])
+
+        self.assertEqual(
+            top_level_imports,
+            {
+                "__future__",
+                "argparse",
+                "collections",
+                "ctypes",
+                "dataclasses",
+                "element_navigation_support",
+                "element_targeting_core",
+                "queue",
+                "spatial_navigation_core",
+                "sys",
+                "threading",
+                "time",
+                "typing",
+            },
+        )
+
+        run_windows = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name == "_run_windows"
+        )
+        dpi_call_line = min(
+            node.lineno
+            for node in ast.walk(run_windows)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "SetProcessDpiAwarenessContext"
+        )
+        platform_import_line = min(
+            node.lineno
+            for node in ast.walk(run_windows)
+            if (
+                isinstance(node, ast.Import)
+                and any(alias.name == "uiautomation" for alias in node.names)
+            )
+            or (
+                isinstance(node, ast.ImportFrom)
+                and node.module
+                and node.module.startswith("PySide6")
+            )
+        )
+        self.assertLess(dpi_call_line, platform_import_line)
+
+    def test_windows_host_loads_without_importing_uia_or_qt(self):
+        code = f"""
+import importlib.util
+import sys
+
+path = {str(SCRIPT_PATH)!r}
+spec = importlib.util.spec_from_file_location("isolated_element_navigation", path)
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+host = module._load_element_navigation_windows_host()
+assert host.__file__ == {str(WINDOWS_HOST_PATH)!r}
+assert "uiautomation" not in sys.modules
+assert not any(name == "PySide6" or name.startswith("PySide6.") for name in sys.modules)
+"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            completed = subprocess.run(
+                [sys.executable, "-c", code],
+                cwd=temp_dir,
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
 
     def test_legacy_entry_help_works_from_an_arbitrary_directory(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -3843,7 +3928,7 @@ class SpatialNavigationTests(unittest.TestCase):
         )
 
     def test_worker_scan_contract_is_budgeted_and_generation_guarded(self):
-        tree = ast.parse(SCRIPT_PATH.read_text(encoding="utf-8"))
+        tree = ast.parse(WINDOWS_HOST_PATH.read_text(encoding="utf-8"))
         functions = {
             node.name: node
             for node in ast.walk(tree)
@@ -5212,7 +5297,7 @@ class SpatialNavigationTests(unittest.TestCase):
         )
 
     def test_runtime_scan_wires_editor_and_msaa_wrapper_rules(self):
-        tree = ast.parse(SCRIPT_PATH.read_text(encoding="utf-8"))
+        tree = ast.parse(WINDOWS_HOST_PATH.read_text(encoding="utf-8"))
         runtime_target = next(
             node
             for node in ast.walk(tree)
