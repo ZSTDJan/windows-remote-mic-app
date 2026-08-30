@@ -7,7 +7,7 @@ from pathlib import Path
 
 RC003_ROOT = Path(__file__).resolve().parents[1]
 WINDOWS_ROOT = RC003_ROOT.parent
-TEMPLATE_ROOT = WINDOWS_ROOT / "element-navigation"
+TEMPLATE_ROOT = WINDOWS_ROOT / "orthofocus"
 EXPORT_SCRIPT = TEMPLATE_ROOT / "tools" / "export-source.ps1"
 
 
@@ -19,7 +19,7 @@ class ElementNavigationExportTests(unittest.TestCase):
         )
 
         self.assertIn(
-            'element-navigation = "element_navigation_prototype:main"',
+            'orthofocus = "element_navigation_prototype:main"',
             pyproject,
         )
         for dependency in (
@@ -30,6 +30,8 @@ class ElementNavigationExportTests(unittest.TestCase):
             self.assertIn(dependency, pyproject)
             self.assertIn(dependency, requirements)
         self.assertNotIn("../requirements.txt", requirements)
+        self.assertIn('license = {text = "GPL-3.0-only"}', pyproject)
+        self.assertIn("https://github.com/ZSTDJan/orthofocus", pyproject)
 
     def test_exported_source_has_no_remote_mic_runtime_import(self):
         source_names = (
@@ -48,7 +50,7 @@ class ElementNavigationExportTests(unittest.TestCase):
 
     def test_export_script_produces_a_self_contained_testable_tree(self):
         with tempfile.TemporaryDirectory() as temporary:
-            destination = Path(temporary) / "ElementNavigation"
+            destination = Path(temporary) / "OrthoFocus"
             subprocess.run(
                 [
                     "powershell",
@@ -72,8 +74,18 @@ class ElementNavigationExportTests(unittest.TestCase):
             self.assertEqual(len(snapshot["files"]), 6)
             self.assertTrue(snapshot["sourceCommit"])
             self.assertTrue((destination / "tests" / "test_element_navigation_prototype.py").is_file())
-            self.assertFalse((destination / "LICENSE").exists())
-            self.assertFalse((destination / "LICENSE.md").exists())
+            self.assertTrue((destination / "LICENSE").is_file())
+            self.assertIn(
+                "GNU GENERAL PUBLIC LICENSE",
+                (destination / "LICENSE").read_text(encoding="utf-8"),
+            )
+            self.assertTrue((destination / "COPYRIGHT.md").is_file())
+            self.assertTrue(
+                (destination / "docs" / "screenshots" / "directional-navigation.png").is_file()
+            )
+            self.assertTrue(
+                (destination / "docs" / "screenshots" / "orthogonal-territory-grid.png").is_file()
+            )
 
 
 if __name__ == "__main__":

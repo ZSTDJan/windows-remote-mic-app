@@ -9,10 +9,10 @@ Windows 客户端位于 [`apps/windows/rc003`](apps/windows/rc003/README.md)，�
 - 语音输出到用户明确选择的音频端点（配合虚拟声卡供输入法识别）；
 - PySide6/Qt Quick 三页桌面程序、通知区域控制、分项检查和 PyInstaller/Inno Setup 构建。
 
-元素导航的独立发布模板位于
-[`apps/windows/element-navigation`](apps/windows/element-navigation/README.md)。它从 RC003
-当前使用的同一份导航源码导出可独立安装和测试的项目，不复制维护第二套算法；目前尚未
-建立独立 Git 仓库或公开发布，导出版本的许可证仍是发布前待办。
+元素导航的独立项目 **OrthoFocus** 位于
+[`apps/windows/orthofocus`](apps/windows/orthofocus/README.md)。它从 RC003
+当前使用的同一份导航源码导出可独立安装和测试的项目，不复制维护第二套算法；独立源码
+按 `GPL-3.0-only` 发布于 [`ZSTDJan/orthofocus`](https://github.com/ZSTDJan/orthofocus)。
 
 当前版本是**已获得部分真实硬件验证、仍待完整复测的源码/构建候选**：真实
 小米遥控器2 Pro 已验证多候选连接、13 个实体按键在映射页识别、记事本普通映射、有效语音
@@ -101,7 +101,7 @@ Windows 实现的改动说明与第三方边界见
 ## 维护边界
 
 - 主程序源码只在 `apps/windows/rc003`；
-- 元素导航独立发布模板位于 `apps/windows/element-navigation`，正式导航源码仍由
+- OrthoFocus 独立发布模板位于 `apps/windows/orthofocus`，正式导航源码仍由
   `apps/windows/rc003/scripts` 单一维护；
 - Windows CI 位于 `.github/workflows/windows-rc003-ci.yml`；
 - `device-profiles` 只保留 Windows 客户端使用的设备目录；

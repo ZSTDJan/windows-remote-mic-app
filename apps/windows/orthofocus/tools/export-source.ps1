@@ -44,6 +44,7 @@ $sourceFiles = @(
 $metadataFiles = @(
     ".gitignore",
     "ATTRIBUTION.md",
+    "COPYRIGHT.md",
     "pyproject.toml",
     "README.md",
     "RELEASE-CHECKLIST.md",
@@ -81,6 +82,10 @@ $destinationTests = New-Item -ItemType Directory -Path (
 foreach ($name in $metadataFiles) {
     Copy-Item -LiteralPath (Join-Path $templateRoot $name) -Destination $destinationPath
 }
+Copy-Item -LiteralPath (Join-Path $repositoryRoot "LICENSE.md") -Destination (
+    Join-Path $destinationPath "LICENSE"
+)
+Copy-Item -LiteralPath (Join-Path $templateRoot "docs") -Destination $destinationPath -Recurse
 foreach ($name in $sourceFiles) {
     Copy-Item -LiteralPath (Join-Path $sourceRoot $name) -Destination $destinationScripts
 }
@@ -108,4 +113,4 @@ $snapshot | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (
     Join-Path $destinationPath "SOURCE-SNAPSHOT.json"
 ) -Encoding UTF8
 
-Write-Host "Exported standalone element navigation source to $destinationPath"
+Write-Host "Exported OrthoFocus source to $destinationPath"

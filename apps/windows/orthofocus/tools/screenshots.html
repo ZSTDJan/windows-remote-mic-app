@@ -1,0 +1,128 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<style>
+* { box-sizing: border-box; }
+body { margin: 0; background: #dfe5ec; font-family: "Segoe UI", Arial, sans-serif; color: #17202b; }
+.shot { width: 1440px; height: 900px; background: #f7f9fb; position: relative; overflow: hidden; }
+.top { height: 96px; display: flex; align-items: center; padding: 0 62px; border-bottom: 1px solid #cbd4de; background: #ffffff; }
+.brand { font-size: 34px; font-weight: 700; }
+.tag { margin-left: 22px; color: #536273; font-size: 20px; }
+.stage { position: absolute; left: 62px; right: 62px; top: 132px; bottom: 52px; display: grid; grid-template-columns: 920px 1fr; gap: 38px; }
+.window { background: #ffffff; border: 1px solid #aeb9c5; border-radius: 8px; overflow: hidden; box-shadow: 0 16px 38px rgba(31, 45, 61, .12); }
+.chrome { height: 54px; background: #edf1f5; border-bottom: 1px solid #cbd4de; display: flex; align-items: center; padding: 0 18px; gap: 9px; }
+.dot { width: 12px; height: 12px; border-radius: 50%; background: #9ba8b6; }
+.app { height: calc(100% - 54px); display: grid; grid-template-columns: 210px 1fr; }
+.sidebar { background: #f1f4f7; border-right: 1px solid #d3dae2; padding: 26px 18px; }
+.nav { height: 42px; margin-bottom: 12px; border-radius: 5px; background: #dce3ea; }
+.nav.active { background: #c5d8ed; border-left: 4px solid #1769aa; }
+.content { position: relative; padding: 30px; }
+.toolbar { display: flex; justify-content: space-between; align-items: center; height: 50px; }
+.title-line { width: 290px; height: 23px; background: #bcc7d2; border-radius: 4px; }
+.small-button { width: 92px; height: 38px; border: 1px solid #8fa0b1; border-radius: 5px; background: #f7f9fb; }
+.row { height: 84px; border-bottom: 1px solid #d9e0e7; position: relative; display: flex; align-items: center; gap: 16px; }
+.avatar { width: 42px; height: 42px; border-radius: 6px; background: #9eb0c1; }
+.line { height: 14px; background: #c5ced7; border-radius: 3px; }
+.line.long { width: 390px; }
+.line.short { width: 190px; margin-top: 10px; }
+.row-action { margin-left: auto; width: 76px; height: 34px; border: 1px solid #92a2b3; border-radius: 5px; background: #ffffff; }
+.input { position: absolute; left: 30px; right: 30px; bottom: 28px; height: 86px; border: 1px solid #8e9cab; border-radius: 7px; background: #fafbfd; }
+.send { position: absolute; width: 82px; height: 38px; right: 16px; bottom: 16px; background: #1769aa; border-radius: 5px; }
+.focus { position: absolute; border: 4px solid #1387d4; background: rgba(19,135,212,.08); border-radius: 7px; box-shadow: 0 0 0 3px rgba(19,135,212,.16); }
+.focus::after { content: "Selected"; position: absolute; inset: 0; display: grid; place-items: center; color: #075f9b; font-size: 14px; font-weight: 700; }
+.focus.center { left: 500px; top: 222px; width: 92px; height: 42px; }
+.arrow { position: absolute; color: #1769aa; font-size: 52px; font-weight: 700; line-height: 1; }
+.arrow.up { left: 527px; top: 159px; }
+.arrow.down { left: 527px; top: 270px; }
+.arrow.left { left: 445px; top: 215px; }
+.arrow.right { left: 596px; top: 215px; }
+.target-mark { position: absolute; border: 3px solid #54a66d; border-radius: 6px; }
+.target-mark.up { left: 500px; top: 92px; width: 92px; height: 42px; }
+.target-mark.down { left: 500px; top: 342px; width: 92px; height: 42px; }
+.target-mark.left { left: 310px; top: 222px; width: 112px; height: 42px; }
+.target-mark.right { left: 640px; top: 222px; width: 62px; height: 42px; }
+.explain { padding-top: 18px; }
+.explain h2 { font-size: 30px; margin: 0 0 24px; }
+.point { display: grid; grid-template-columns: 42px 1fr; gap: 14px; margin-bottom: 26px; }
+.num { width: 38px; height: 38px; border-radius: 5px; background: #1769aa; color: white; display: grid; place-items: center; font-weight: 700; font-size: 20px; }
+.point strong { display: block; font-size: 20px; margin: 3px 0 6px; }
+.point span { color: #5d6a78; font-size: 17px; line-height: 1.45; }
+.grid-stage { position: absolute; left: 62px; right: 62px; top: 132px; bottom: 52px; display: grid; grid-template-columns: 1000px 1fr; gap: 34px; }
+.territory { position: relative; background: #ffffff; border: 1px solid #aeb9c5; border-radius: 8px; overflow: hidden; box-shadow: 0 16px 38px rgba(31,45,61,.12); }
+.zone { position: absolute; border: 2px solid rgba(50,67,84,.42); padding: 12px; font-size: 18px; font-weight: 700; }
+.z1 { left: 0; top: 0; width: 230px; height: 260px; background: #dce9f7; }
+.z2 { left: 230px; top: 0; width: 430px; height: 180px; background: #e4f1e6; }
+.z3 { left: 660px; top: 0; width: 340px; height: 300px; background: #f7ead4; }
+.z4 { left: 0; top: 260px; width: 230px; height: 456px; background: #f0e3f4; }
+.z5 { left: 230px; top: 180px; width: 430px; height: 310px; background: #d9eef0; }
+.z6 { left: 660px; top: 300px; width: 340px; height: 416px; background: #f4dedf; }
+.z7 { left: 230px; top: 490px; width: 430px; height: 226px; background: #e8e7d5; }
+.control { position: absolute; background: #ffffff; border: 2px solid #53677b; border-radius: 5px; height: 38px; display: flex; align-items: center; justify-content: center; font-weight: 600; color: #253545; z-index: 4; }
+.c1 { left: 58px; top: 95px; width: 120px; }
+.c2 { left: 355px; top: 72px; width: 180px; }
+.c3 { left: 760px; top: 148px; width: 142px; }
+.c4 { left: 40px; top: 420px; width: 150px; }
+.c5 { left: 365px; top: 312px; width: 160px; border-color: #1387d4; box-shadow: 0 0 0 4px rgba(19,135,212,.18); }
+.c6 { left: 780px; top: 478px; width: 112px; }
+.c7 { left: 382px; top: 590px; width: 126px; }
+.axis { position: absolute; z-index: 5; background: #1769aa; }
+.axis.h { left: 445px; top: 350px; width: 365px; height: 4px; }
+.axis.v { left: 443px; top: 240px; width: 4px; height: 260px; }
+.axis-label { position: absolute; z-index: 6; background: #1769aa; color: #fff; padding: 6px 10px; border-radius: 4px; font-size: 15px; font-weight: 700; }
+.axis-label.row { left: 610px; top: 319px; }
+.axis-label.col { left: 455px; top: 242px; }
+.principles { padding-top: 16px; }
+.principles h2 { font-size: 28px; margin: 0 0 24px; }
+.rule { border-left: 5px solid #1769aa; padding: 4px 0 4px 16px; margin-bottom: 25px; }
+.rule strong { display: block; font-size: 20px; margin-bottom: 6px; }
+.rule span { color: #5d6a78; font-size: 17px; line-height: 1.42; }
+</style>
+</head>
+<body>
+<section class="shot" id="directional-navigation">
+  <div class="top"><div class="brand">OrthoFocus</div><div class="tag">Directional UI navigation / 四向元素导航</div></div>
+  <div class="stage">
+    <div class="window">
+      <div class="chrome"><span class="dot"></span><span class="dot"></span><span class="dot"></span></div>
+      <div class="app">
+        <div class="sidebar"><div class="nav active"></div><div class="nav"></div><div class="nav"></div><div class="nav"></div></div>
+        <div class="content">
+          <div class="toolbar"><div class="title-line"></div><div class="small-button"></div></div>
+          <div class="row"><div class="avatar"></div><div><div class="line long"></div><div class="line short"></div></div><div class="row-action"></div></div>
+          <div class="row"><div class="avatar"></div><div><div class="line long"></div><div class="line short"></div></div><div class="row-action"></div></div>
+          <div class="row"><div class="avatar"></div><div><div class="line long"></div><div class="line short"></div></div><div class="row-action"></div></div>
+          <div class="input"><div class="send"></div></div>
+          <div class="focus center"></div>
+          <div class="target-mark up"></div><div class="target-mark down"></div><div class="target-mark left"></div><div class="target-mark right"></div>
+          <div class="arrow up">↑</div><div class="arrow down">↓</div><div class="arrow left">←</div><div class="arrow right">→</div>
+        </div>
+      </div>
+    </div>
+    <div class="explain">
+      <h2>Pointer-like control, without moving a pointer</h2>
+      <div class="point"><div class="num">1</div><div><strong>Find interactive elements</strong><span>UI Automation and MSAA expose buttons, inputs, list items and floating actions.</span></div></div>
+      <div class="point"><div class="num">2</div><div><strong>Build stable four-way neighbors</strong><span>The selected element gets meaningful up, down, left and right routes.</span></div></div>
+      <div class="point"><div class="num">3</div><div><strong>Activate with familiar keys</strong><span>Enter clicks, Menu opens context actions, and volume keys scroll.</span></div></div>
+    </div>
+  </div>
+</section>
+<section class="shot" id="orthogonal-territory-grid">
+  <div class="top"><div class="brand">OrthoFocus</div><div class="tag">Orthogonal territory grid / 正交领地网格</div></div>
+  <div class="grid-stage">
+    <div class="territory">
+      <div class="zone z1">A</div><div class="zone z2">B</div><div class="zone z3">C</div><div class="zone z4">D</div><div class="zone z5">Selected</div><div class="zone z6">F</div><div class="zone z7">G</div>
+      <div class="control c1">Sidebar item</div><div class="control c2">Toolbar action</div><div class="control c3">Small button</div><div class="control c4">List row</div><div class="control c5">Selected input</div><div class="control c6">Floating action</div><div class="control c7">Bottom action</div>
+      <div class="axis h"></div><div class="axis v"></div><div class="axis-label row">soft row</div><div class="axis-label col">soft column</div>
+    </div>
+    <div class="principles">
+      <h2>Stable structure before distance</h2>
+      <div class="rule"><strong>Axis-aligned boundaries</strong><span>Territories expand horizontally or vertically, never diagonally.</span></div>
+      <div class="rule"><strong>No flying islands</strong><span>Each element keeps one connected territory instead of scattered fragments.</span></div>
+      <div class="rule"><strong>Shared edges create neighbors</strong><span>Corner touches do not steal focus; meaningful shared edges form routes.</span></div>
+      <div class="rule"><strong>Soft row and column skeleton</strong><span>Loose alignment helps small controls join a usable row or column without rigid snapping.</span></div>
+    </div>
+  </div>
+</section>
+</body>
+</html>
