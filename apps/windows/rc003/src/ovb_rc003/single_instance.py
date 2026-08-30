@@ -69,6 +69,7 @@ from . import product_identity
 # in a different session) is not this guard's concern.
 _MUTEX_NAME = r"Local\RemoteMicRC003_BridgeInstance"
 _SETTINGS_MUTEX_NAME = r"Local\RemoteMicRC003_SettingsInstance"
+_ELEMENT_NAVIGATION_MUTEX_NAME = r"Local\RemoteMicRC003_ElementNavigationInstance"
 _SETTINGS_WINDOW_PROPERTY = "RemoteMicRC003.SettingsWindow"
 
 # https://learn.microsoft.com/windows/win32/debug/system-error-codes--0-499-
@@ -302,13 +303,13 @@ def activate_existing_settings_window(
         return False
 
 
-def bridge_instance_running(
+def _named_mutex_running(
     *,
-    name: str = _MUTEX_NAME,
+    name: str,
     _open_mutex: OpenMutexFn = _real_open_mutex,
     _close_handle: CloseHandleFn = _real_close_handle,
 ) -> bool:
-    """Return whether bridge mode already owns the per-session mutex."""
+    """Return whether one named per-session mutex currently exists."""
 
     try:
         result = _open_mutex(name)
@@ -337,8 +338,36 @@ def bridge_instance_running(
     if result.last_error == _ERROR_FILE_NOT_FOUND:
         return False
     raise SingleInstanceUnavailableError(
-        f"OpenMutexW failed while checking bridge status "
+        f"OpenMutexW failed while checking instance status "
         f"(GetLastError={result.last_error})"
+    )
+
+
+def bridge_instance_running(
+    *,
+    name: str = _MUTEX_NAME,
+    _open_mutex: OpenMutexFn = _real_open_mutex,
+    _close_handle: CloseHandleFn = _real_close_handle,
+) -> bool:
+    """Return whether bridge mode already owns the per-session mutex."""
+
+    return _named_mutex_running(
+        name=name,
+        _open_mutex=_open_mutex,
+        _close_handle=_close_handle,
+    )
+
+
+def element_navigation_instance_running(
+    *,
+    name: str = _ELEMENT_NAVIGATION_MUTEX_NAME,
+    _open_mutex: OpenMutexFn = _real_open_mutex,
+    _close_handle: CloseHandleFn = _real_close_handle,
+) -> bool:
+    return _named_mutex_running(
+        name=name,
+        _open_mutex=_open_mutex,
+        _close_handle=_close_handle,
     )
 
 
@@ -492,6 +521,29 @@ class SettingsInstanceGuard(BridgeInstanceGuard):
             _close_handle=_close_handle,
             _duplicate_message=(
                 f"{product_identity.DISPLAY_NAME}设置窗口已在当前 Windows 会话中运行"
+            ),
+            _access_denied_means_duplicate=True,
+        )
+
+
+class ElementNavigationInstanceGuard(BridgeInstanceGuard):
+    """Separate per-session guard for the element-navigation companion."""
+
+    def __init__(
+        self,
+        *,
+        name: str = _ELEMENT_NAVIGATION_MUTEX_NAME,
+        _create_mutex: CreateMutexFn = _real_create_mutex,
+        _release_mutex: ReleaseMutexFn = _real_release_mutex,
+        _close_handle: CloseHandleFn = _real_close_handle,
+    ) -> None:
+        super().__init__(
+            name=name,
+            _create_mutex=_create_mutex,
+            _release_mutex=_release_mutex,
+            _close_handle=_close_handle,
+            _duplicate_message=(
+                f"{product_identity.DISPLAY_NAME}元素导航已在当前 Windows 会话中运行"
             ),
             _access_denied_means_duplicate=True,
         )

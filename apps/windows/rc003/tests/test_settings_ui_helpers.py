@@ -9,7 +9,7 @@ import unittest
 import tempfile
 from pathlib import Path
 
-from ovb_rc003 import audio_output, bridge_launcher, config, hotkey, key_mapping, logging_setup, single_instance
+from ovb_rc003 import audio_output, bridge_launcher, config, hotkey, key_mapping, logging_setup, settings_ui, single_instance
 from ovb_rc003.settings_ui import (
     LAUNCH_ALREADY_RUNNING_TEXT,
     LAUNCH_NOT_STARTED_TEXT,
@@ -48,21 +48,48 @@ class DisplayRoundTripTests(unittest.TestCase):
     def test_reference_action_labels_round_trip_to_windows_chords(self):
         expected = {
             "Escape": key_mapping.ActionKind.ESCAPE,
-            "Return": key_mapping.ActionKind.RETURN,
-            "Delete（退格）": key_mapping.ActionKind.DELETE_BACKWARD,
+            "回车": key_mapping.ActionKind.RETURN,
+            "退格": key_mapping.ActionKind.DELETE_BACKWARD,
             "方向上": key_mapping.ActionKind.ARROW_UP,
             "方向下": key_mapping.ActionKind.ARROW_DOWN,
             "方向左": key_mapping.ActionKind.ARROW_LEFT,
             "方向右": key_mapping.ActionKind.ARROW_RIGHT,
             "显示桌面": key_mapping.ActionKind.SHOW_DESKTOP,
-            "上下文菜单": key_mapping.ActionKind.CONTEXT_MENU,
+            "右键菜单": key_mapping.ActionKind.CONTEXT_MENU,
             "应用切换": key_mapping.ActionKind.APP_SWITCHER,
+            "元素导航开关": key_mapping.ActionKind.ELEMENT_NAVIGATION_TOGGLE,
         }
         for label, action_kind in expected.items():
             restored = _display_to_action(label)
             self.assertEqual(restored.kind, action_kind, label)
             self.assertEqual(restored.keys, (), label)
             self.assertEqual(_action_to_display(restored), label)
+
+    def test_legacy_reference_labels_remain_accepted_but_render_current_names(self):
+        expected = {
+            "Return": (key_mapping.ActionKind.RETURN, "回车"),
+            "Delete（退格）": (key_mapping.ActionKind.DELETE_BACKWARD, "退格"),
+            "上下文菜单": (key_mapping.ActionKind.CONTEXT_MENU, "右键菜单"),
+        }
+        for legacy_label, (action_kind, current_label) in expected.items():
+            restored = _display_to_action(legacy_label)
+            self.assertEqual(restored.kind, action_kind, legacy_label)
+            self.assertEqual(_action_to_display(restored), current_label)
+
+    def test_action_groups_flatten_to_real_options_without_separator_items(self):
+        flattened = tuple(
+            option
+            for _group_title, group_options in settings_ui.ACTION_OPTION_GROUPS
+            for option in group_options
+        )
+        self.assertEqual(flattened, settings_ui._PRESET_KEY_COMBOS)
+        self.assertEqual(
+            settings_ui.ACTION_OPTION_GROUP_STARTS,
+            frozenset(group_options[0] for _, group_options in settings_ui.ACTION_OPTION_GROUPS),
+        )
+        self.assertNotIn("lctrl+win", flattened)
+        self.assertNotIn("ralt", flattened)
+        self.assertNotIn("ralt+space", flattened)
 
     def test_legacy_alt_escape_app_switch_is_displayed_as_reference_action(self):
         action = key_mapping.ButtonAction(

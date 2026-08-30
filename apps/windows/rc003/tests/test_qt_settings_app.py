@@ -1199,6 +1199,16 @@ class SettingsControllerTests(unittest.TestCase):
             settings_ui.SECONDARY_UNCONFIGURED_DISPLAY,
             controller.secondaryActionOptions,
         )
+        self.assertNotIn("禁用", controller.secondaryActionOptions)
+
+    def test_element_navigation_is_available_to_every_mapping_entry(self):
+        controller, _ = self._make_controller()
+        self.assertIn("元素导航开关", controller.primaryActionOptions)
+        self.assertIn(
+            "元素导航开关",
+            controller.primaryActionOptionsFor("mic"),
+        )
+        self.assertIn("元素导航开关", controller.secondaryActionOptions)
 
     def test_application_display_name_comes_from_product_identity(self):
         controller, _ = self._make_controller()
@@ -1206,6 +1216,20 @@ class SettingsControllerTests(unittest.TestCase):
             controller.applicationDisplayName,
             product_identity.DISPLAY_NAME,
         )
+
+    def test_action_group_metadata_only_marks_real_group_starts(self):
+        controller, _ = self._make_controller()
+        self.assertEqual(controller.actionOptionGroupTitle("Escape"), "按键操作")
+        self.assertTrue(controller.actionOptionStartsGroup("Escape"))
+        self.assertEqual(
+            controller.actionOptionGroupTitle("元素导航开关"),
+            "鼠标与导航",
+        )
+        self.assertTrue(controller.actionOptionStartsGroup("元素导航开关"))
+        self.assertEqual(controller.actionOptionGroupTitle("方向上"), "按键操作")
+        self.assertFalse(controller.actionOptionStartsGroup("方向上"))
+        self.assertEqual(controller.actionOptionGroupTitle("未设置"), "")
+        self.assertFalse(controller.actionOptionStartsGroup("未设置"))
 
     def test_combo_rows_cover_the_supported_second_keys(self):
         controller, _ = self._make_controller()
@@ -3644,6 +3668,9 @@ class RunSettingsWindowShutdownCoverageTests(unittest.TestCase):
             def exec(self):
                 return exec_return
 
+            def quit(self):
+                pass
+
         class _FakeQQuickStyle:
             @staticmethod
             def setStyle(name):
@@ -5220,6 +5247,31 @@ class SettingsShellSourceContractTests(unittest.TestCase):
         for column_name in ("单击", "双击", "长按"):
             self.assertIn(f'qsTr("{column_name}")', self.mapping_card_qml)
         self.assertIn('objectName: exposeObjectNames ? "editMapping_" + cardId', self.mapping_card_qml)
+
+    def test_action_combo_group_headers_do_not_add_model_rows(self):
+        self.assertIn(
+            "SettingsController.actionOptionGroupTitle(String(modelData))",
+            self.buttons_qml,
+        )
+        self.assertIn(
+            "SettingsController.actionOptionStartsGroup(String(modelData))",
+            self.buttons_qml,
+        )
+        self.assertIn("Math.ceil(tokens.fontSizeTiny) + tokens.spacingMedium", self.buttons_qml)
+        self.assertIn("topPadding: groupHeaderHeight", self.buttons_qml)
+        self.assertIn("bottomPadding: 0", self.buttons_qml)
+        self.assertIn("color: tokens.textSecondary", self.buttons_qml)
+        self.assertIn("color: tokens.border", self.buttons_qml)
+        self.assertIn("height: optionDelegate.groupHeaderHeight", self.buttons_qml)
+        self.assertNotIn('ListElement { text: "按键操作"', self.buttons_qml)
+
+    def test_all_four_mapping_inputs_share_the_grouped_action_sources(self):
+        self.assertIn("model: SettingsController.primaryActionOptionsFor(", self.buttons_qml)
+        self.assertIn("actionEditor.buttonId", self.buttons_qml)
+        self.assertGreaterEqual(
+            self.buttons_qml.count("model: SettingsController.secondaryActionOptions"),
+            3,
+        )
         self.assertEqual(self.buttons_qml.count("cardId: buttonId"), 2)
         self.assertIn('objectName: "actionEditorDialog"', self.buttons_qml)
         self.assertIn('readonly property string headerText: buttonName.length > 0', self.buttons_qml)
@@ -5252,8 +5304,8 @@ class SettingsShellSourceContractTests(unittest.TestCase):
         self.assertLess(switch_index, combo_index)
         self.assertLess(single_index, actions_index)
         self.assertLess(combo_index, actions_index)
-        self.assertIn('text: qsTr("单键与手势")', self.buttons_qml)
-        self.assertIn('text: qsTr("遥控器组合")', self.buttons_qml)
+        self.assertIn('text: qsTr("单键映射")', self.buttons_qml)
+        self.assertIn('text: qsTr("组合按键映射")', self.buttons_qml)
         self.assertIn("model: SettingsController.comboRows", self.buttons_qml)
         self.assertIn('objectName: "comboActionEditor_" + buttonId', self.buttons_qml)
 
@@ -6240,6 +6292,9 @@ assert editor is not None and editor.property("visible")
 assert combo is not None and double_combo is not None and long_combo is not None
 assert combo.property("visible")
 assert double_combo.property("visible") and long_combo.property("visible")
+assert int(combo.property("count")) == len(controller.primaryActionOptionsFor("mic"))
+assert int(double_combo.property("count")) == len(controller.secondaryActionOptions)
+assert int(long_combo.property("count")) == len(controller.secondaryActionOptions)
 assert not double_combo.property("enabled") and not long_combo.property("enabled")
 assert combo.property("selectTextByMouse")
 assert double_combo.property("selectTextByMouse")
@@ -6268,20 +6323,66 @@ current_option_state = {
 }
 assert current_option_state["highlighted"]
 assert current_option_state["font_weight"] >= 600
-QTest.keyClick(window, Qt.Key_Escape)
+grouped_option = _find_child_by_object_name(
+    window,
+    "actionEditorPrimaryCombo_option_1",
+)
+assert grouped_option is not None
+assert int(grouped_option.property("groupHeaderHeight")) > 0
+before_header_click = (
+    int(combo.property("currentIndex")),
+    str(combo.property("editText")),
+)
+header_point = grouped_option.mapToScene(
+    QPointF(
+        grouped_option.property("width") / 2,
+        grouped_option.property("groupHeaderHeight") / 2,
+    )
+).toPoint()
+QTest.mouseClick(window, Qt.LeftButton, Qt.NoModifier, header_point)
 for _ in range(3):
     window.grabWindow()
     app.processEvents()
+assert combo.property("down"), "group header click unexpectedly closed the popup"
+assert (
+    int(combo.property("currentIndex")),
+    str(combo.property("editText")),
+) == before_header_click
+body_point = grouped_option.mapToScene(
+    QPointF(
+        grouped_option.property("width") / 2,
+        grouped_option.property("height") - 4,
+    )
+).toPoint()
+QTest.mouseClick(window, Qt.LeftButton, Qt.NoModifier, body_point)
+for _ in range(3):
+    window.grabWindow()
+    app.processEvents()
+assert not combo.property("down")
+assert combo.property("editText") == "Escape"
+assert editor.property("primaryText") == "Escape"
 
 # Choose real preset rows through each visible ComboBox popup. The editable
 # field and backing model must change as soon as the popup activates the row;
 # clicking the dialog's "完成" button is deliberately deferred until after
 # every assertion below.
-_select_combo_option(window, app, combo, 1)
-assert combo.property("editText") == "Escape"
-assert editor.property("primaryText") == "Escape"
 assert model.to_display_map()["mic"] == "按住说话"
 assert double_combo.property("visible") and long_combo.property("visible")
+
+_select_combo_option(window, app, double_combo, 10)
+assert double_combo.property("editText") == "f5"
+double_indicator = double_combo.mapToScene(
+    QPointF(double_combo.property("width") - 8, double_combo.property("height") / 2)
+).toPoint()
+QTest.mouseClick(window, Qt.LeftButton, Qt.NoModifier, double_indicator)
+app.processEvents()
+assert double_combo.property("down")
+QTest.keyClick(window, Qt.Key_Down)
+QTest.keyClick(window, Qt.Key_Return)
+for _ in range(3):
+    window.grabWindow()
+    app.processEvents()
+assert double_combo.property("editText") == "元素导航开关"
 
 _select_combo_option(window, app, double_combo, 1)
 assert double_combo.property("editText") == "Escape"
@@ -6289,8 +6390,8 @@ assert editor.property("doubleText") == "Escape"
 assert model.to_secondary_display_map()["mic"]["double_click"] == ""
 
 _select_combo_option(window, app, long_combo, 2)
-assert long_combo.property("editText") == "Return"
-assert editor.property("longText") == "Return"
+assert long_combo.property("editText") == "回车"
+assert editor.property("longText") == "回车"
 assert model.to_secondary_display_map()["mic"]["long_press"] == ""
 
 # Real mouse click into the ComboBox's editable text area -
@@ -6340,7 +6441,7 @@ for _ in range(3):
 assert not editor.property("visible")
 assert model.to_display_map()["mic"] == typed
 assert model.to_secondary_display_map()["mic"]["double_click"] == "Escape"
-assert model.to_secondary_display_map()["mic"]["long_press"] == "Return"
+assert model.to_secondary_display_map()["mic"]["long_press"] == "回车"
 assert controller.settingsDirty
 
 before_save = _mapping_snapshot(

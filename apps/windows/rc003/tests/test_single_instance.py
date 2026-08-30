@@ -443,6 +443,50 @@ class SettingsInstanceGuardTests(unittest.TestCase):
                 self.fail("an inaccessible existing settings mutex must block a duplicate")
 
 
+class ElementNavigationInstanceGuardTests(unittest.TestCase):
+    def test_element_navigation_uses_a_distinct_local_mutex(self):
+        registry = _FakeMutexRegistry()
+        with single_instance.ElementNavigationInstanceGuard(
+            _create_mutex=registry.create_mutex,
+            _release_mutex=registry.release_mutex,
+            _close_handle=registry.close_handle,
+        ):
+            pass
+
+        name = registry.create_calls[0]
+        self.assertTrue(name.startswith("Local\\"))
+        self.assertNotEqual(name, single_instance._MUTEX_NAME)
+        self.assertNotEqual(name, single_instance._SETTINGS_MUTEX_NAME)
+
+    def test_second_element_navigation_launch_cannot_enter(self):
+        registry = _FakeMutexRegistry()
+
+        def guard():
+            return single_instance.ElementNavigationInstanceGuard(
+                _create_mutex=registry.create_mutex,
+                _release_mutex=registry.release_mutex,
+                _close_handle=registry.close_handle,
+            )
+
+        with guard():
+            with self.assertRaises(single_instance.DuplicateInstanceError):
+                with guard():
+                    self.fail("duplicate element navigation launch must never enter")
+
+    def test_access_denied_is_treated_as_an_existing_navigation_instance(self):
+        guard = single_instance.ElementNavigationInstanceGuard(
+            _create_mutex=lambda _name: single_instance.MutexCreationResult(
+                handle=0,
+                last_error=single_instance._ERROR_ACCESS_DENIED,
+            ),
+            _release_mutex=lambda _handle: True,
+            _close_handle=lambda _handle: True,
+        )
+        with self.assertRaises(single_instance.DuplicateInstanceError):
+            with guard:
+                self.fail("an inaccessible navigation mutex must block a duplicate")
+
+
 class SettingsWindowActivationTests(unittest.TestCase):
     def test_marks_the_native_window_with_the_shared_private_property(self):
         calls = []

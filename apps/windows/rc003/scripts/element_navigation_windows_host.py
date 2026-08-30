@@ -35,6 +35,11 @@ def _run_windows(args: argparse.Namespace) -> int:
     from PySide6.QtCore import Qt, QRect, QTimer
     from PySide6.QtGui import QColor, QFont, QGuiApplication, QPainter, QPen
     from PySide6.QtWidgets import QApplication, QWidget
+    from ovb_rc003.element_navigation_control_windows import (
+        ELEMENT_NAVIGATION_COMMAND_QUIT,
+        ELEMENT_NAVIGATION_COMMAND_TOGGLE,
+        ElementNavigationCommandServer,
+    )
     from ovb_rc003 import product_identity
 
     user32 = ctypes.windll.user32
@@ -110,6 +115,8 @@ def _run_windows(args: argparse.Namespace) -> int:
         ctypes.POINTER(wintypes.DWORD),
     ]
     kernel32.QueryFullProcessImageNameW.restype = wintypes.BOOL
+    kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    kernel32.WaitForSingleObject.restype = wintypes.DWORD
     kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
     kernel32.CloseHandle.restype = wintypes.BOOL
     user32.GetForegroundWindow.restype = wintypes.HWND
@@ -299,6 +306,8 @@ def _run_windows(args: argparse.Namespace) -> int:
     ga_root = 2
     gwl_exstyle = -20
     process_query_limited_information = 0x1000
+    synchronize_process = 0x00100000
+    wait_timeout = 0x00000102
     dwmwa_cloaked = 14
     srccopy = 0x00CC0020
     bi_rgb = 0
@@ -584,9 +593,18 @@ def _run_windows(args: argparse.Namespace) -> int:
             return ""
         return buffer.value
 
+    process_name_cache: dict[int, tuple[float, str]] = {}
+    process_name_cache_lock = threading.Lock()
+    process_name_cache_seconds = 2.0
+
     def process_name_from_id(process_id: int) -> str:
         if process_id <= 0:
             return ""
+        now = time.perf_counter()
+        with process_name_cache_lock:
+            cached = process_name_cache.get(process_id)
+            if cached is not None and now - cached[0] < process_name_cache_seconds:
+                return cached[1]
         handle = kernel32.OpenProcess(
             process_query_limited_information,
             False,
@@ -594,17 +612,35 @@ def _run_windows(args: argparse.Namespace) -> int:
         )
         if not handle:
             return ""
+        process_name = ""
         try:
             size = wintypes.DWORD(32768)
             buffer = ctypes.create_unicode_buffer(size.value)
-            if not kernel32.QueryFullProcessImageNameW(
+            if kernel32.QueryFullProcessImageNameW(
                 handle,
                 0,
                 buffer,
                 ctypes.byref(size),
             ):
-                return ""
-            return normalized_process_name(buffer.value)
+                process_name = normalized_process_name(buffer.value)
+        finally:
+            kernel32.CloseHandle(handle)
+        with process_name_cache_lock:
+            process_name_cache[process_id] = (now, process_name)
+        return process_name
+
+    def owner_process_is_alive(process_id: int) -> bool:
+        if process_id <= 0:
+            return True
+        handle = kernel32.OpenProcess(
+            synchronize_process,
+            False,
+            process_id,
+        )
+        if not handle:
+            return False
+        try:
+            return int(kernel32.WaitForSingleObject(handle, 0)) == wait_timeout
         finally:
             kernel32.CloseHandle(handle)
 
@@ -1523,6 +1559,7 @@ def _run_windows(args: argparse.Namespace) -> int:
             with self._post_lock:
                 self._generation += 1
                 self.context_valid = False
+                self._pending_counts["scan"] = 0
                 self._pending_follow_completion_hwnd = 0
                 self._empty_follow_refresh_attempts = 0
                 self._deferred_moves.clear()
@@ -2385,11 +2422,18 @@ def _run_windows(args: argparse.Namespace) -> int:
             if self.targets and self.selected >= 0:
                 self.events.put(("selection", self._selection_payload()))
 
-        def _scan(self, hwnd: int, expected_generation: int) -> None:
+        def _scan(
+            self,
+            hwnd: int,
+            expected_generation: int,
+            scan_token: int,
+        ) -> None:
             started = time.perf_counter()
             with self._post_lock:
                 if expected_generation != self._generation:
-                    self.events.put(("scan_cancelled", None))
+                    self.events.put(
+                        ("scan_cancelled", {"scan_token": scan_token})
+                    )
                     return
             point = cursor_point()
             process_id = window_process_id(hwnd)
@@ -2398,13 +2442,16 @@ def _run_windows(args: argparse.Namespace) -> int:
             if used_cache:
                 with self._post_lock:
                     if expected_generation != self._generation:
-                        self.events.put(("scan_cancelled", None))
+                        self.events.put(
+                            ("scan_cancelled", {"scan_token": scan_token})
+                        )
                         return
                     self.context_valid = True
                     self.invalid_targets.clear()
             else:
                 committed, _partial, _empty = self._enumerate(
                     hwnd,
+                    should_cancel=lambda: self._generation != expected_generation,
                     expected_generation=expected_generation,
                 )
                 if not committed:
@@ -2412,7 +2459,9 @@ def _run_windows(args: argparse.Namespace) -> int:
                         window_process_id(self.hwnd) if self.hwnd > 0 else 0
                     )
                     dirty_windows.watch(self.hwnd, previous_process_id)
-                    self.events.put(("scan_cancelled", None))
+                    self.events.put(
+                        ("scan_cancelled", {"scan_token": scan_token})
+                    )
                     return
             hierarchy = (
                 point_hierarchy_targets(point, self.window_rect, self.all_targets)
@@ -2448,6 +2497,7 @@ def _run_windows(args: argparse.Namespace) -> int:
                         "hierarchy_count": len(self.hierarchy),
                         "elapsed": elapsed,
                         "used_cache": used_cache,
+                        "scan_token": scan_token,
                     },
                 )
             )
@@ -2674,7 +2724,12 @@ def _run_windows(args: argparse.Namespace) -> int:
                             return
                         if command == "scan":
                             self._scan_requested.clear()
-                            self._scan(int(value), generation)
+                            scan_hwnd, scan_token = value
+                            self._scan(
+                                int(scan_hwnd),
+                                generation,
+                                int(scan_token),
+                            )
                         elif command == "prewarm":
                             self._prewarm(int(value), generation)
                         elif command == "diagnostics":
@@ -2716,10 +2771,21 @@ def _run_windows(args: argparse.Namespace) -> int:
                         elif command == "follow_window":
                             self._follow_window(int(value), generation)
                     except Exception as exc:
+                        scan_token = (
+                            int(value[1])
+                            if command == "scan"
+                            and isinstance(value, tuple)
+                            and len(value) == 2
+                            else 0
+                        )
                         self.events.put(
                             (
                                 "error",
-                                {"command": command, "message": str(exc)},
+                                {
+                                    "command": command,
+                                    "message": str(exc),
+                                    "scan_token": scan_token,
+                                },
                             )
                         )
                     finally:
@@ -2939,6 +3005,9 @@ def _run_windows(args: argparse.Namespace) -> int:
             self,
             on_action: Callable[[str], None],
             active: threading.Event,
+            intercepting: Optional[threading.Event] = None,
+            *,
+            include_developer_hotkeys: bool = True,
         ) -> None:
             ulong_ptr = wintypes.WPARAM
 
@@ -2973,6 +3042,8 @@ def _run_windows(args: argparse.Namespace) -> int:
             ]
             self._on_action = on_action
             self._active = active
+            self._intercepting = intercepting or active
+            self._include_developer_hotkeys = include_developer_hotkeys
             self._hook = None
             self._callback = None
             self._thread_id = 0
@@ -3016,8 +3087,9 @@ def _run_windows(args: argparse.Namespace) -> int:
             else:
                 self._down.discard(vk)
 
-            if is_up and vk in self._passthrough:
-                self._passthrough.discard(vk)
+            if vk in self._passthrough:
+                if is_up:
+                    self._passthrough.discard(vk)
                 return user32.CallNextHookEx(
                     self._hook, code, wparam, lparam
                 )
@@ -3027,7 +3099,10 @@ def _run_windows(args: argparse.Namespace) -> int:
                 return 1
 
             ctrl_alt = self._pressed(self.VK_CONTROL) and self._pressed(self.VK_MENU)
-            hotkey_action = global_hotkey_action(vk)
+            hotkey_action = global_hotkey_action(
+                vk,
+                include_developer_actions=self._include_developer_hotkeys,
+            )
             if is_down and ctrl_alt and hotkey_action is not None:
                 self._swallowed.add(vk)
                 if not was_down:
@@ -3035,8 +3110,8 @@ def _run_windows(args: argparse.Namespace) -> int:
                 return 1
 
             action = keyboard_navigation_action(vk)
-            if self._active.is_set() and action is not None:
-                if should_pass_through_native_menu(
+            if self._intercepting.is_set() and action is not None:
+                if self._active.is_set() and should_pass_through_native_menu(
                     vk, native_menu_mode_active()
                 ):
                     if is_down:
@@ -3051,6 +3126,8 @@ def _run_windows(args: argparse.Namespace) -> int:
                     self._on_action(action)
                 return 1
 
+            if is_down and action is not None:
+                self._passthrough.add(vk)
             return user32.CallNextHookEx(self._hook, code, wparam, lparam)
 
         def _run(self) -> None:
@@ -3113,9 +3190,12 @@ def _run_windows(args: argparse.Namespace) -> int:
     overlay = NavigationOverlay()
     worker = AutomationWorker(diagnostics_enabled=bool(args.diagnostics))
     worker.start()
-    keyboard_events: queue.Queue[str] = queue.Queue()
+    keyboard_events: queue.Queue[tuple[str, int]] = queue.Queue()
     active = threading.Event()
+    intercepting = threading.Event()
     scanning = False
+    scan_token_counter = 0
+    current_scan_token = 0
     shutting_down = False
     prewarm_observed_hwnd = 0
     prewarm_observed_at = 0.0
@@ -3123,12 +3203,28 @@ def _run_windows(args: argparse.Namespace) -> int:
     navigation_root_hwnd = 0
     navigation_process_id = 0
     navigation_overlay_signature: tuple[tuple[int, Rect], ...] = ()
+    navigation_overlay_checked_at = 0.0
+    overlay_signature_poll_seconds = 1.0
     diagnostics_enabled = bool(args.diagnostics)
+    managed_companion = bool(getattr(args, "managed_companion", False))
+    owner_pid = max(0, int(getattr(args, "owner_pid", 0) or 0))
+    include_developer_hotkeys = not managed_companion or diagnostics_enabled
 
     def enqueue_keyboard_action(action: str) -> None:
-        keyboard_events.put(action)
+        keyboard_events.put((action, 0))
 
-    hook = KeyboardHook(enqueue_keyboard_action, active)
+    def enqueue_external_command(command: int, target_hwnd: int) -> None:
+        if command == ELEMENT_NAVIGATION_COMMAND_TOGGLE:
+            keyboard_events.put(("toggle", max(0, int(target_hwnd))))
+        elif command == ELEMENT_NAVIGATION_COMMAND_QUIT:
+            keyboard_events.put(("quit", 0))
+
+    hook = KeyboardHook(
+        enqueue_keyboard_action,
+        active,
+        intercepting,
+        include_developer_hotkeys=include_developer_hotkeys,
+    )
     hook.start()
     structure_watcher = StructureChangeWatcher()
     if not structure_watcher.start():
@@ -3136,16 +3232,29 @@ def _run_windows(args: argparse.Namespace) -> int:
             "界面变化监听未完整启用，将按缓存时限兜底刷新。",
             file=sys.stderr,
         )
+    command_server = ElementNavigationCommandServer(enqueue_external_command)
+    try:
+        command_server.start()
+    except Exception:
+        hook.stop()
+        structure_watcher.stop()
+        worker.stop()
+        raise
 
     def leave_navigation() -> None:
         nonlocal navigation_root_hwnd, navigation_process_id
-        nonlocal navigation_overlay_signature
+        nonlocal navigation_overlay_signature, navigation_overlay_checked_at
+        nonlocal scanning, current_scan_token
         active.clear()
+        intercepting.clear()
+        scanning = False
+        current_scan_token = 0
         worker.deactivate()
         overlay.clear_target()
         navigation_root_hwnd = 0
         navigation_process_id = 0
         navigation_overlay_signature = ()
+        navigation_overlay_checked_at = 0.0
 
     def request_quit() -> None:
         nonlocal shutting_down
@@ -3155,9 +3264,28 @@ def _run_windows(args: argparse.Namespace) -> int:
         leave_navigation()
         app.quit()
 
-    def prepare_navigation_action() -> bool:
-        foreground = native_handle_value(user32.GetForegroundWindow())
-        foreground_action = navigation_foreground_action(
+    def refresh_navigation_overlay_signature(*, force: bool = False) -> bool:
+        nonlocal navigation_overlay_signature, navigation_overlay_checked_at
+        now = time.perf_counter()
+        if not force and not periodic_check_due(
+            now,
+            navigation_overlay_checked_at,
+            overlay_signature_poll_seconds,
+        ):
+            return False
+        navigation_overlay_checked_at = now
+        current_signature = associated_overlay_window_signature(
+            navigation_root_hwnd,
+            excluded_process_id=prototype_process_id,
+        )
+        if current_signature != navigation_overlay_signature:
+            navigation_overlay_signature = current_signature
+            if active.is_set():
+                worker.post("refresh_content")
+        return True
+
+    def navigation_action_for_foreground(foreground: int) -> str:
+        return navigation_foreground_action(
             foreground,
             worker.hwnd,
             navigation_root_hwnd,
@@ -3167,6 +3295,13 @@ def _run_windows(args: argparse.Namespace) -> int:
             window_owner,
             tuple(handle for handle, _rect in navigation_overlay_signature),
         )
+
+    def prepare_navigation_action() -> bool:
+        foreground = native_handle_value(user32.GetForegroundWindow())
+        foreground_action = navigation_action_for_foreground(foreground)
+        if foreground_action == "leave":
+            refresh_navigation_overlay_signature(force=True)
+            foreground_action = navigation_action_for_foreground(foreground)
         if foreground_action == "leave":
             print("导航已暂停: 已切换到其它窗口，请重新按 Ctrl+Alt+N。")
             leave_navigation()
@@ -3175,9 +3310,10 @@ def _run_windows(args: argparse.Namespace) -> int:
             worker.post("follow_window", foreground)
         return True
 
-    def handle_keyboard_action(action: str) -> None:
+    def handle_keyboard_action(action: str, target_hwnd: int = 0) -> None:
         nonlocal scanning, navigation_root_hwnd, navigation_process_id
-        nonlocal navigation_overlay_signature, diagnostics_enabled
+        nonlocal navigation_overlay_signature, navigation_overlay_checked_at
+        nonlocal diagnostics_enabled, scan_token_counter, current_scan_token
         if action == "quit":
             request_quit()
         elif action == "toggle_diagnostics":
@@ -3189,10 +3325,12 @@ def _run_windows(args: argparse.Namespace) -> int:
                 else "导航诊断已关闭。"
             )
         elif action == "toggle":
-            if active.is_set():
+            if active.is_set() or scanning:
                 leave_navigation()
-            elif not scanning:
-                hwnd = native_handle_value(user32.GetForegroundWindow())
+            else:
+                hwnd = native_handle_value(
+                    target_hwnd or user32.GetForegroundWindow()
+                )
                 if hwnd <= 0:
                     print("没有可扫描的前台窗口。")
                     return
@@ -3202,12 +3340,18 @@ def _run_windows(args: argparse.Namespace) -> int:
                     hwnd,
                     excluded_process_id=prototype_process_id,
                 )
+                navigation_overlay_checked_at = time.perf_counter()
+                scan_token_counter += 1
+                current_scan_token = scan_token_counter
                 scanning = True
+                intercepting.set()
                 print("正在扫描当前窗口...")
-                worker.post("scan", hwnd)
+                worker.post("scan", (hwnd, current_scan_token))
         elif action == "cancel":
             if active.is_set():
                 worker.post("back")
+            elif scanning:
+                leave_navigation()
         elif action == "activate" and active.is_set():
             if prepare_navigation_action():
                 worker.post("activate")
@@ -3222,13 +3366,13 @@ def _run_windows(args: argparse.Namespace) -> int:
                 worker.post("move", action)
 
     def drain_events() -> None:
-        nonlocal scanning
+        nonlocal scanning, current_scan_token
         while True:
             try:
-                action = keyboard_events.get_nowait()
+                action, target_hwnd = keyboard_events.get_nowait()
             except queue.Empty:
                 break
-            handle_keyboard_action(action)
+            handle_keyboard_action(action, target_hwnd)
 
         while True:
             try:
@@ -3236,7 +3380,14 @@ def _run_windows(args: argparse.Namespace) -> int:
             except queue.Empty:
                 break
             if event == "scan_done":
+                if not scan_event_is_current(
+                    int(payload.get("scan_token", 0)),
+                    current_scan_token,
+                    scanning,
+                ):
+                    continue
                 scanning = False
+                current_scan_token = 0
                 targets = payload["targets"]
                 selected = payload["selected"]
                 print(
@@ -3257,7 +3408,13 @@ def _run_windows(args: argparse.Namespace) -> int:
                         payload["hierarchy_count"],
                     )
             elif event == "scan_cancelled":
-                scanning = False
+                if not scan_event_is_current(
+                    int(payload.get("scan_token", 0)),
+                    current_scan_token,
+                    scanning,
+                ):
+                    continue
+                leave_navigation()
             elif event == "selection":
                 if active.is_set():
                     overlay.show_target(
@@ -3362,7 +3519,12 @@ def _run_windows(args: argparse.Namespace) -> int:
                     print(f"预识别已跳过: {message}", file=sys.stderr)
                     continue
                 if command == "scan":
-                    scanning = False
+                    if not scan_event_is_current(
+                        int(payload.get("scan_token", 0)),
+                        current_scan_token,
+                        scanning,
+                    ):
+                        continue
                 leave_navigation()
                 print(f"操作失败: {message}", file=sys.stderr)
 
@@ -3372,7 +3534,7 @@ def _run_windows(args: argparse.Namespace) -> int:
 
     def monitor_navigation_context() -> None:
         nonlocal prewarm_observed_hwnd, prewarm_observed_at, prewarm_requested_hwnd
-        nonlocal navigation_overlay_signature
+        nonlocal navigation_overlay_signature, navigation_overlay_checked_at
         foreground = native_handle_value(user32.GetForegroundWindow())
         if not active.is_set():
             now = time.perf_counter()
@@ -3396,23 +3558,11 @@ def _run_windows(args: argparse.Namespace) -> int:
             return
         if foreground <= 0:
             return
-        current_overlay_signature = associated_overlay_window_signature(
-            navigation_root_hwnd,
-            excluded_process_id=prototype_process_id,
-        )
-        if current_overlay_signature != navigation_overlay_signature:
-            navigation_overlay_signature = current_overlay_signature
-            worker.post("refresh_content")
-        foreground_action = navigation_foreground_action(
-            foreground,
-            worker.hwnd,
-            navigation_root_hwnd,
-            navigation_process_id,
-            prototype_process_id,
-            window_process_id,
-            window_owner,
-            tuple(handle for handle, _rect in navigation_overlay_signature),
-        )
+        overlay_signature_checked = refresh_navigation_overlay_signature()
+        foreground_action = navigation_action_for_foreground(foreground)
+        if foreground_action == "leave" and not overlay_signature_checked:
+            refresh_navigation_overlay_signature(force=True)
+            foreground_action = navigation_action_for_foreground(foreground)
         if foreground_action == "ignore":
             return
         if foreground_action == "leave":
@@ -3428,6 +3578,16 @@ def _run_windows(args: argparse.Namespace) -> int:
     geometry_timer.timeout.connect(monitor_navigation_context)
     geometry_timer.start(250)
 
+    owner_timer = QTimer()
+
+    def monitor_owner_process() -> None:
+        if owner_pid > 0 and not owner_process_is_alive(owner_pid):
+            request_quit()
+
+    if managed_companion and owner_pid > 0:
+        owner_timer.timeout.connect(monitor_owner_process)
+        owner_timer.start(500)
+
     cleanup_complete = False
 
     def cleanup() -> None:
@@ -3435,18 +3595,27 @@ def _run_windows(args: argparse.Namespace) -> int:
         if cleanup_complete:
             return
         cleanup_complete = True
+        command_server.stop()
         hook.stop()
         structure_watcher.stop()
         worker.stop()
 
     app.aboutToQuit.connect(cleanup)
-    print("元素导航键盘原型已启动。")
-    print(
-        "Ctrl+Alt+N 开始/退出，Ctrl+Alt+D 开关导航诊断，"
-        "方向键移动，PageUp/PageDown 切换父子元素，"
-        "Enter 左击（快速两次为双击），菜单键右击，音量键滚动，"
-        "Esc 退出，Ctrl+Alt+Q 关闭。"
+    if managed_companion and owner_pid > 0:
+        QTimer.singleShot(0, monitor_owner_process)
+    if bool(getattr(args, "activate", False)):
+        enqueue_external_command(
+            ELEMENT_NAVIGATION_COMMAND_TOGGLE,
+            int(getattr(args, "window_handle", 0) or 0),
+        )
+    print("元素导航已启动。")
+    controls = (
+        "Ctrl+Alt+N 开始/退出，方向键移动，PageUp/PageDown 切换父子元素，"
+        "Enter 左击（快速两次为双击），菜单键右击，音量键滚动，Esc 退出。"
     )
+    if include_developer_hotkeys:
+        controls += " Ctrl+Alt+D 开关导航诊断，Ctrl+Alt+Q 关闭。"
+    print(controls)
     if diagnostics_enabled:
         print("导航诊断已开启。每次方向移动都会解释候选排序。")
     try:

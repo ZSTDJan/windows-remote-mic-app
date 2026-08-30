@@ -1,9 +1,7 @@
-"""Experimental keyboard-driven UI Automation spatial navigator.
+"""Keyboard-driven UI Automation spatial navigator.
 
-This developer-only prototype is intentionally outside ``ovb_rc003``. It is
-not imported by Remote Mic, included in candidate builds, or connected to the
-RC003 input/configuration path. Its job is to answer one question cheaply:
-does spatial element navigation feel useful in the user's fixed Windows apps?
+This file remains the single navigation source used by both the standalone
+developer command and Remote Mic's isolated companion-process entry.
 
 Controls:
     Ctrl+Alt+N  scan the foreground window and enter/leave navigation
@@ -24,6 +22,14 @@ import importlib.util
 import os
 import sys
 from typing import Any, Optional, Sequence
+
+
+_RC003_SOURCE_ROOT = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "src",
+)
+if _RC003_SOURCE_ROOT not in sys.path:
+    sys.path.insert(0, _RC003_SOURCE_ROOT)
 
 
 _SPATIAL_NAVIGATION_CORE_NAME = "spatial_navigation_core"
@@ -209,6 +215,22 @@ def _parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         type=lambda value: int(value, 0),
         default=0,
         help="scan this native window handle instead of the foreground window",
+    )
+    parser.add_argument(
+        "--activate",
+        action="store_true",
+        help="enter navigation after the companion process is ready",
+    )
+    parser.add_argument(
+        "--managed-companion",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--owner-pid",
+        type=int,
+        default=0,
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--diagnostics",

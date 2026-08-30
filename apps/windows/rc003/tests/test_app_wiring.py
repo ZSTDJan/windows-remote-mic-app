@@ -1014,6 +1014,40 @@ class OrdinaryButtonGestureWiringTests(_AppWiringTestCase):
 
         self.assertEqual(calls, ["arrow_up"])
 
+    def test_element_navigation_action_uses_the_isolated_controller(self):
+        result = app_module.element_navigation_control_windows.ToggleResult(
+            app_module.element_navigation_control_windows.ToggleResultKind.DELIVERED,
+            321,
+        )
+        with mock.patch.object(
+            app_module.element_navigation_control_windows,
+            "toggle_element_navigation",
+            return_value=result,
+        ) as toggle:
+            self.app._apply_button_action(
+                key_mapping.ButtonAction(
+                    key_mapping.ActionKind.ELEMENT_NAVIGATION_TOGGLE
+                )
+            )
+
+        toggle.assert_called_once_with()
+
+    def test_element_navigation_failure_does_not_stop_button_processing(self):
+        with mock.patch.object(
+            app_module.element_navigation_control_windows,
+            "toggle_element_navigation",
+            side_effect=RuntimeError("simulated companion failure"),
+        ), self.assertLogs(level="ERROR") as captured:
+            self.app._apply_button_action(
+                key_mapping.ButtonAction(
+                    key_mapping.ActionKind.ELEMENT_NAVIGATION_TOGGLE
+                )
+            )
+
+        self.assertTrue(
+            any("element navigation toggle failed" in line for line in captured.output)
+        )
+
     def test_incomplete_button_rollback_is_released_before_the_next_action(self):
         original_up = win32_input.send_arrow_up
         original_down = win32_input.send_arrow_down

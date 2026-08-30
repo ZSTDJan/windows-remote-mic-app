@@ -50,19 +50,20 @@ _OPEN_APPLICATION_DISPLAY = f"打开{product_identity.DISPLAY_NAME}"
 # a key event to deliver it.
 _REFERENCE_ACTION_LABELS: Dict[key_mapping.ActionKind, str] = {
     key_mapping.ActionKind.ESCAPE: "Escape",
-    key_mapping.ActionKind.RETURN: "Return",
+    key_mapping.ActionKind.RETURN: "回车",
     key_mapping.ActionKind.ARROW_UP: "方向上",
     key_mapping.ActionKind.ARROW_DOWN: "方向下",
     key_mapping.ActionKind.ARROW_LEFT: "方向左",
     key_mapping.ActionKind.ARROW_RIGHT: "方向右",
-    key_mapping.ActionKind.DELETE_BACKWARD: "Delete（退格）",
+    key_mapping.ActionKind.DELETE_BACKWARD: "退格",
     key_mapping.ActionKind.SHOW_DESKTOP: "显示桌面",
-    key_mapping.ActionKind.CONTEXT_MENU: "上下文菜单",
+    key_mapping.ActionKind.CONTEXT_MENU: "右键菜单",
     key_mapping.ActionKind.APP_SWITCHER: "应用切换",
     key_mapping.ActionKind.SYSTEM_VOLUME_UP: "系统音量 +",
     key_mapping.ActionKind.SYSTEM_VOLUME_DOWN: "系统音量 −",
     key_mapping.ActionKind.SYSTEM_VOLUME_MUTE: "系统静音",
     key_mapping.ActionKind.PLAY_PAUSE: "播放 / 暂停",
+    key_mapping.ActionKind.ELEMENT_NAVIGATION_TOGGLE: "元素导航开关",
     key_mapping.ActionKind.OPEN_REMOTE_MIC: _OPEN_APPLICATION_DISPLAY,
     key_mapping.ActionKind.OPEN_CODEX: "打开 Codex",
     key_mapping.ActionKind.OPEN_CLAUDE: "打开 Claude",
@@ -80,17 +81,61 @@ _REFERENCE_ACTION_KINDS_BY_LABEL: Dict[str, key_mapping.ActionKind] = {
     label: action_kind for action_kind, label in _REFERENCE_ACTION_LABELS.items()
 }
 
+# Older display spellings remain accepted for editable fields and tests that
+# construct the UI model directly. Persisted bindings store semantic action
+# kinds, so rendering always uses the current labels above.
+_LEGACY_REFERENCE_ACTION_KINDS_BY_LABEL: Dict[str, key_mapping.ActionKind] = {
+    "Return": key_mapping.ActionKind.RETURN,
+    "Delete（退格）": key_mapping.ActionKind.DELETE_BACKWARD,
+    "上下文菜单": key_mapping.ActionKind.CONTEXT_MENU,
+}
+
 # Preset choices shown in the mapping dropdown. Any other
 # "mod+mod+key" text is still accepted as a custom shortcut through
 # hotkey.HotkeySpec.parse.
-_PRESET_KEY_COMBOS = (
-    "Escape", "Return", "Delete（退格）", "方向上", "方向下", "方向左", "方向右",
-    "显示桌面", "上下文菜单", "应用切换", "系统音量 +", "系统音量 −",
-    "系统静音", "播放 / 暂停",
-    _OPEN_APPLICATION_DISPLAY, "打开 Codex", "打开 Claude", "打开 cmux", "打开微信",
-    "打开 Cursor", "打开 Slack", "打开企业微信", "打开网易云音乐",
-    "打开 Chrome", "打开 Edge", "打开 Zed",
-    "lctrl+win", "ralt", "ralt+space", "tab", "space", "f5", "禁用",
+ACTION_OPTION_GROUPS: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
+    (
+        "按键操作",
+        (
+            "Escape", "回车", "退格", "方向上", "方向下", "方向左", "方向右",
+            "tab", "space", "f5",
+        ),
+    ),
+    ("鼠标与导航", ("元素导航开关", "右键菜单")),
+    (
+        "系统与媒体",
+        (
+            "显示桌面", "应用切换", "系统音量 +", "系统音量 −",
+            "系统静音", "播放 / 暂停",
+        ),
+    ),
+    (
+        "启动应用",
+        (
+            _OPEN_APPLICATION_DISPLAY, "打开 Codex", "打开 Claude", "打开 cmux", "打开微信",
+            "打开 Cursor", "打开 Slack", "打开企业微信", "打开网易云音乐",
+            "打开 Chrome", "打开 Edge", "打开 Zed",
+        ),
+    ),
+    ("其他", ("禁用",)),
+)
+
+_PRESET_KEY_COMBOS = tuple(
+    option
+    for _group_title, group_options in ACTION_OPTION_GROUPS
+    for option in group_options
+)
+
+ACTION_OPTION_GROUP_BY_LABEL = {
+    option: group_title
+    for group_title, group_options in ACTION_OPTION_GROUPS
+    for option in group_options
+}
+
+ACTION_OPTION_GROUP_STARTS = frozenset(
+    group_options[0]
+    for _group_title, group_options in ACTION_OPTION_GROUPS
+    if group_options
 )
 
 _TRIGGER_MODE_LABELS = {
@@ -172,6 +217,8 @@ def _display_to_action(text: str) -> key_mapping.ButtonAction:
     if text == "系统音量 -":
         text = "系统音量 −"
     reference_kind = _REFERENCE_ACTION_KINDS_BY_LABEL.get(text)
+    if reference_kind is None:
+        reference_kind = _LEGACY_REFERENCE_ACTION_KINDS_BY_LABEL.get(text)
     if reference_kind is not None:
         return key_mapping.ButtonAction(reference_kind)
     # Keep the previous spelling accepted for users who copied the macOS

@@ -17,6 +17,7 @@ from ovb_rc003 import (
     app,
     config,
     device_catalog,
+    element_navigation_runtime,
     frida_compat,
     product_identity,
     single_instance,
@@ -52,6 +53,9 @@ class _ArgvRestoringTestCase(unittest.TestCase):
         self._original_notice = single_instance.show_bridge_startup_blocked_notice
         self._original_load_config = config.load_config
         self._original_qt_runtime_check = main_module._qt_runtime_check
+        self._original_element_navigation_runtime = (
+            element_navigation_runtime.run_element_navigation
+        )
         # XRBM-023: default every test in this suite to a safe no-op stub for
         # the visible-notice callable. show_bridge_startup_blocked_notice's
         # real implementation opens a real, SYSTEMMODAL Win32 MessageBoxW -
@@ -77,6 +81,9 @@ class _ArgvRestoringTestCase(unittest.TestCase):
         single_instance.show_bridge_startup_blocked_notice = self._original_notice
         config.load_config = self._original_load_config
         main_module._qt_runtime_check = self._original_qt_runtime_check
+        element_navigation_runtime.run_element_navigation = (
+            self._original_element_navigation_runtime
+        )
 
 
 class BridgeModeRoutingTests(_ArgvRestoringTestCase):
@@ -578,6 +585,48 @@ class ArgumentModeBypassTests(_ArgvRestoringTestCase):
         self.assertEqual(ctx.exception.code, 4)
         self.assertEqual(received_args, [["--pid", "1234"]])
         self.assertEqual(enter_calls, [])
+
+
+class ElementNavigationDispatchTests(_ArgvRestoringTestCase):
+    def test_hidden_entrypoint_passes_arguments_and_propagates_exit_code(self):
+        calls = []
+        element_navigation_runtime.run_element_navigation = (
+            lambda arguments: calls.append(list(arguments)) or 7
+        )
+        sys.argv = [
+            "ovb_rc003",
+            "--element-navigation",
+            "--activate",
+            "--window-handle",
+            "321",
+        ]
+
+        with self.assertRaises(SystemExit) as ctx:
+            main_module.main()
+
+        self.assertEqual(ctx.exception.code, 7)
+        self.assertEqual(calls, [["--activate", "--window-handle", "321"]])
+
+    def test_runtime_failure_is_sanitized_and_never_falls_through(self):
+        import contextlib
+        import io
+
+        element_navigation_runtime.run_element_navigation = lambda _arguments: (
+            (_ for _ in ()).throw(RuntimeError("private navigation detail"))
+        )
+        app.main = lambda: self.fail("navigation failure must not start the bridge")
+        sys.argv = ["ovb_rc003", "--element-navigation"]
+        stderr = io.StringIO()
+
+        with contextlib.redirect_stderr(stderr), self.assertRaises(SystemExit) as ctx:
+            main_module.main()
+
+        self.assertEqual(
+            ctx.exception.code,
+            main_module.ELEMENT_NAVIGATION_RUNTIME_FAILED_EXIT_CODE,
+        )
+        self.assertIn("RuntimeError", stderr.getvalue())
+        self.assertNotIn("private navigation detail", stderr.getvalue())
 
 
 class DiagnoseBleCandidatesDispatchTests(_ArgvRestoringTestCase):

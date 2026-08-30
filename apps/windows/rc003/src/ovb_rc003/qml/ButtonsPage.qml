@@ -335,9 +335,17 @@ Item {
 
         delegate: ItemDelegate {
             id: optionDelegate
+            readonly property string groupTitle:
+                SettingsController.actionOptionGroupTitle(String(modelData))
+            readonly property bool startsGroup:
+                SettingsController.actionOptionStartsGroup(String(modelData))
+            readonly property int groupHeaderHeight: startsGroup
+                ? Math.ceil(tokens.fontSizeTiny) + tokens.spacingMedium : 0
             objectName: editorCombo.objectName + "_option_" + index
             width: ListView.view ? ListView.view.width : editorCombo.width
-            height: tokens.controlHeight
+            height: tokens.controlHeight + groupHeaderHeight
+            topPadding: groupHeaderHeight
+            bottomPadding: 0
             leftPadding: 7
             rightPadding: 7
             highlighted: editorCombo.highlightedIndex === index
@@ -351,10 +359,50 @@ Item {
                 verticalAlignment: Text.AlignVCenter
                 elide: Text.ElideRight
             }
-            background: Rectangle {
-                color: optionDelegate.highlighted
+            background: Item {
+                Rectangle {
+                    visible: optionDelegate.startsGroup
+                    anchors.left: parent.left
+                    anchors.right: parent.right
+                    anchors.top: parent.top
+                    height: 1
+                    color: tokens.border
+                }
+                Label {
+                    visible: optionDelegate.startsGroup
+                    anchors.left: parent.left
+                    anchors.right: parent.right
+                    anchors.top: parent.top
+                    anchors.leftMargin: 7
+                    anchors.rightMargin: 7
+                    anchors.topMargin: 1
+                    height: optionDelegate.groupHeaderHeight - 1
+                    text: optionDelegate.groupTitle
+                    color: tokens.textSecondary
+                    font.family: tokens.fontFamily
+                    font.pixelSize: tokens.fontSizeTiny
+                    font.weight: Font.Medium
+                    verticalAlignment: Text.AlignVCenter
+                    elide: Text.ElideRight
+                }
+                Rectangle {
+                    anchors.left: parent.left
+                    anchors.right: parent.right
+                    anchors.bottom: parent.bottom
+                    height: tokens.controlHeight
+                    color: optionDelegate.highlighted
                     ? tokens.accentSoft : tokens.surface
+                }
             }
+            MouseArea {
+                visible: optionDelegate.startsGroup
+                anchors.left: parent.left
+                anchors.right: parent.right
+                anchors.top: parent.top
+                height: optionDelegate.groupHeaderHeight
+                acceptedButtons: Qt.LeftButton
+            }
+            Accessible.name: String(modelData)
         }
     }
 
@@ -606,7 +654,7 @@ Item {
                     CompactToolTip {
                         tokens: root.tokens
                         active: doubleGestureTitleHover.hovered
-                        text: qsTr("会等待约 0.3 秒区分单击和双击")
+                        text: qsTr("会等待约 0.3 秒区分单击和双击；设置双击或长按后，此键不再支持按住连发")
                     }
                 }
                 RowLayout {
@@ -674,7 +722,7 @@ Item {
                     CompactToolTip {
                         tokens: root.tokens
                         active: longGestureTitleHover.hovered
-                        text: qsTr("按住约 0.55 秒触发；本次不执行单击")
+                        text: qsTr("按住约 0.55 秒触发；设置双击或长按后，此键不再支持按住连发")
                     }
                 }
                 RowLayout {
@@ -784,7 +832,7 @@ Item {
                         objectName: "singleMappingViewButton"
                         tokens: root.tokens
                         Layout.fillWidth: true
-                        text: qsTr("单键与手势")
+                        text: qsTr("单键映射")
                         highlighted: root.mappingViewIndex === 0
                         onClicked: root.mappingViewIndex = 0
                     }
@@ -793,7 +841,7 @@ Item {
                         objectName: "comboMappingViewButton"
                         tokens: root.tokens
                         Layout.fillWidth: true
-                        text: qsTr("遥控器组合")
+                        text: qsTr("组合按键映射")
                         highlighted: root.mappingViewIndex === 1
                         onClicked: root.mappingViewIndex = 1
                     }

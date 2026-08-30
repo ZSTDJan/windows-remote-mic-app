@@ -8,6 +8,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 SCRIPT_PATH = (
@@ -169,6 +170,7 @@ class SpatialNavigationTests(unittest.TestCase):
                 "json",
                 "os",
                 "spatial_navigation_core",
+                "threading",
                 "typing",
             },
         )
@@ -3926,6 +3928,59 @@ assert not any(name == "PySide6" or name.startswith("PySide6.") for name in sys.
             prototype.scan_commit_decision(3, 3, False, False, False),
             (True, False),
         )
+        self.assertTrue(prototype.scan_event_is_current(4, 4, True))
+        self.assertFalse(prototype.scan_event_is_current(3, 4, True))
+        self.assertFalse(prototype.scan_event_is_current(4, 4, False))
+        self.assertFalse(prototype.scan_event_is_current(0, 0, True))
+
+    def test_managed_companion_intercepts_scan_keys_and_hides_dev_hotkeys(self):
+        source = WINDOWS_HOST_PATH.read_text(encoding="utf-8")
+        self.assertIn("intercepting.set()", source)
+        self.assertIn("intercepting.clear()", source)
+        self.assertIn(
+            "if self._intercepting.is_set() and action is not None:",
+            source,
+        )
+
+        tree = ast.parse(source)
+        functions = {
+            node.name: node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef)
+        }
+        for function_name in (
+            "prepare_navigation_action",
+            "monitor_navigation_context",
+        ):
+            force_refreshes = [
+                call
+                for call in ast.walk(functions[function_name])
+                if isinstance(call, ast.Call)
+                and isinstance(call.func, ast.Name)
+                and call.func.id == "refresh_navigation_overlay_signature"
+                and any(
+                    keyword.arg == "force"
+                    and isinstance(keyword.value, ast.Constant)
+                    and keyword.value.value is True
+                    for keyword in call.keywords
+                )
+            ]
+            self.assertEqual(len(force_refreshes), 1, function_name)
+        self.assertIn(
+            "include_developer_hotkeys = not managed_companion or diagnostics_enabled",
+            source,
+        )
+        self.assertIn("def owner_process_is_alive(process_id: int)", source)
+        self.assertIn("owner_timer.start(500)", source)
+        self.assertIn("QTimer.singleShot(0, monitor_owner_process)", source)
+        self.assertIn("if vk in self._passthrough:", source)
+        self.assertIn("if is_down and action is not None:", source)
+        self.assertIn("self._passthrough.add(vk)", source)
+
+    def test_overlay_signature_checks_are_rate_limited(self):
+        self.assertTrue(prototype.periodic_check_due(10.0, 0.0, 1.0))
+        self.assertFalse(prototype.periodic_check_due(10.5, 10.0, 1.0))
+        self.assertTrue(prototype.periodic_check_due(11.0, 10.0, 1.0))
 
     def test_worker_scan_contract_is_budgeted_and_generation_guarded(self):
         tree = ast.parse(WINDOWS_HOST_PATH.read_text(encoding="utf-8"))
@@ -3945,6 +4000,33 @@ assert not any(name == "PySide6" or name.startswith("PySide6.") for name in sys.
             for node in automation_worker.body
             if isinstance(node, ast.FunctionDef)
         }
+        scan_function = worker_functions["_scan"]
+        used_cache_branch = next(
+            node
+            for node in scan_function.body
+            if isinstance(node, ast.If)
+            and isinstance(node.test, ast.Name)
+            and node.test.id == "used_cache"
+        )
+        self.assertIsInstance(used_cache_branch.body[0], ast.With)
+        cache_lock = used_cache_branch.body[0]
+        cache_lock_attributes = {
+            node.attr
+            for node in ast.walk(cache_lock)
+            if isinstance(node, ast.Attribute)
+            and isinstance(node.ctx, ast.Store)
+        }
+        self.assertIn("context_valid", cache_lock_attributes)
+        self.assertTrue(
+            any(
+                isinstance(call, ast.Call)
+                and isinstance(call.func, ast.Attribute)
+                and call.func.attr == "clear"
+                and isinstance(call.func.value, ast.Attribute)
+                and call.func.value.attr == "invalid_targets"
+                for call in ast.walk(cache_lock)
+            )
+        )
         enumerate_function = worker_functions["_enumerate"]
         enumerate_args = {
             argument.arg for argument in enumerate_function.args.args
@@ -4064,6 +4146,25 @@ assert not any(name == "PySide6" or name.startswith("PySide6.") for name in sys.
         self.assertEqual(prototype.global_hotkey_action(prototype.VK_N), "toggle")
         self.assertEqual(prototype.global_hotkey_action(prototype.VK_Q), "quit")
         self.assertIsNone(prototype.global_hotkey_action(0x70))
+        self.assertEqual(
+            prototype.global_hotkey_action(
+                prototype.VK_N,
+                include_developer_actions=False,
+            ),
+            "toggle",
+        )
+        self.assertIsNone(
+            prototype.global_hotkey_action(
+                prototype.VK_D,
+                include_developer_actions=False,
+            )
+        )
+        self.assertIsNone(
+            prototype.global_hotkey_action(
+                prototype.VK_Q,
+                include_developer_actions=False,
+            )
+        )
 
     def test_native_menu_temporarily_receives_navigation_keys(self):
         for vk in (
@@ -4655,6 +4756,36 @@ assert not any(name == "PySide6" or name.startswith("PySide6.") for name in sys.
         self.assertEqual(
             prototype.load_quicker_overlay_associations("missing.json"), {}
         )
+
+    def test_quicker_process_association_snapshot_is_cached_by_file_signature(self):
+        support = prototype._element_navigation_support
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "quicker-navigation.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "items": [
+                            {
+                                "hwnd": 1234,
+                                "isBound": True,
+                                "bindProcessName": "Codex.exe",
+                                "visible": True,
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            support._QUICKER_ASSOCIATION_CACHE.clear()
+            with mock.patch("builtins.open", wraps=open) as patched_open:
+                first = prototype.load_quicker_overlay_associations(str(path))
+                second = prototype.load_quicker_overlay_associations(str(path))
+            support._QUICKER_ASSOCIATION_CACHE.clear()
+
+        self.assertEqual(set(first), {1234})
+        self.assertEqual(first, second)
+        self.assertIsNot(first, second)
+        self.assertEqual(patched_open.call_count, 1)
 
     def test_root_only_small_overlay_becomes_one_clickable_cell(self):
         spec = prototype.root_only_overlay_target_spec(

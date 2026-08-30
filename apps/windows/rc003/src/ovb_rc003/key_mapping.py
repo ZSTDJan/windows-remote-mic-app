@@ -14,11 +14,11 @@ Default table matches the reference app's action choices:
 | 麦克风 | 专用语音生命周期 |
 | 电源 | Escape |
 | 上 / 下 / 左 / 右 | 对应方向动作 |
-| 确定 | Return |
-| 返回 | Delete（退格） |
+| 确定 | 回车 |
+| 返回 | 退格 |
 | 音量 + / − | 系统音量 + / − |
 | 主页 | 显示桌面 |
-| 菜单 | 上下文菜单 |
+| 菜单 | 右键菜单 |
 | TV | 应用切换 |
 
 The RC003 HID usage table also defines a "volume_mute" usage (see
@@ -53,6 +53,7 @@ class ActionKind(str, Enum):
     SYSTEM_VOLUME_DOWN = "system_volume_down"
     SYSTEM_VOLUME_MUTE = "system_volume_mute"
     PLAY_PAUSE = "play_pause"
+    ELEMENT_NAVIGATION_TOGGLE = "element_navigation_toggle"
     # ``VOICE`` and ``VOICE_TOGGLE`` remain parseable only so schema-1 files
     # can be failed closed with an explicit migration notice. They are not
     # selectable or executable product actions anymore.

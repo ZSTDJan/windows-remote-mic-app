@@ -1,5 +1,4 @@
-# Developer-only dependency for element_navigation_prototype.py.
-# Not part of Remote Mic runtime requirements or candidate packaging.
-# Project: https://github.com/yinkaisheng/Python-UIAutomation-for-Windows
-# License: Apache-2.0
-uiautomation==2.0.29
+# Compatibility install entry for the standalone navigation script.
+# Element navigation is now part of Remote Mic; runtime pins have one
+# authoritative source in ../requirements.txt and candidate builds bundle them.
+-r ../requirements.txt

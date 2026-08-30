@@ -79,6 +79,7 @@ from . import (
     button_gesture,
     config,
     connection_supervisor,
+    element_navigation_control_windows,
     frida_compat,
     hid_identity,
     hotkey,
@@ -1774,6 +1775,22 @@ class RC003App:
                 win32_input.send_volume_mute()
             elif action.kind == key_mapping.ActionKind.PLAY_PAUSE:
                 win32_input.send_play_pause()
+            elif action.kind == key_mapping.ActionKind.ELEMENT_NAVIGATION_TOGGLE:
+                try:
+                    result = (
+                        element_navigation_control_windows.toggle_element_navigation()
+                    )
+                except Exception:
+                    self._logger.exception("element navigation toggle failed unexpectedly")
+                    return
+                if (
+                    result.kind
+                    == element_navigation_control_windows.ToggleResultKind.FAILED
+                ):
+                    self._logger.warning(
+                        "element navigation toggle failed: %s",
+                        result.error or "unknown_error",
+                    )
             elif action.kind == key_mapping.ActionKind.QUICKER_URI:
                 action_executor.open_quicker_uri(action)
             elif action_executor.is_application_action(action):
@@ -2491,11 +2508,28 @@ async def _run(
             )
         finally:
             try:
-                await app.stop()
+                try:
+                    await app.stop()
+                finally:
+                    clear_runtime_status = getattr(app, "clear_runtime_status", None)
+                    if callable(clear_runtime_status):
+                        clear_runtime_status()
             finally:
-                clear_runtime_status = getattr(app, "clear_runtime_status", None)
-                if callable(clear_runtime_status):
-                    clear_runtime_status()
+                try:
+                    result = (
+                        element_navigation_control_windows.shutdown_element_navigation()
+                    )
+                    if (
+                        result
+                        == element_navigation_control_windows.CommandSendResult.FAILED
+                    ):
+                        app._logger.warning(
+                            "element navigation companion did not stop cleanly"
+                        )
+                except Exception:
+                    app._logger.exception(
+                        "element navigation companion shutdown failed unexpectedly"
+                    )
 
 
 def main(*, show_notification_icon: bool = True) -> None:

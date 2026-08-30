@@ -147,7 +147,11 @@ _MIC_PRIMARY_ACTION_OPTIONS: List[str] = list(
 _SECONDARY_ACTION_OPTIONS: List[str] = list(
     dict.fromkeys(
         (settings_ui.SECONDARY_UNCONFIGURED_DISPLAY,)
-        + settings_ui._PRESET_KEY_COMBOS
+        + tuple(
+            option
+            for option in settings_ui._PRESET_KEY_COMBOS
+            if option != "禁用"
+        )
     )
 )
 
@@ -2880,6 +2884,14 @@ def _load_qt_classes() -> dict:
             if button_id == "mic":
                 return list(_MIC_PRIMARY_ACTION_OPTIONS)
             return list(_ORDINARY_PRIMARY_ACTION_OPTIONS)
+
+        @Slot(str, result=str)
+        def actionOptionGroupTitle(self, option: str) -> str:
+            return settings_ui.ACTION_OPTION_GROUP_BY_LABEL.get(option, "")
+
+        @Slot(str, result=bool)
+        def actionOptionStartsGroup(self, option: str) -> bool:
+            return option in settings_ui.ACTION_OPTION_GROUP_STARTS
 
         def _get_secondary_action_options(self) -> List[str]:
             return list(_SECONDARY_ACTION_OPTIONS)

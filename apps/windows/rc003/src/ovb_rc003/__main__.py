@@ -66,7 +66,11 @@ built from the standalone ``src/launcher.py`` entry point - see XRBM-021):
 - ``--rc003-hid-injector --pid <pid>``  HIDDEN child-process entry point for
                 the verified HID tap injector. It validates the current
                 RC003 WUDFHost target and returns a stable exit code; it never
-                falls through to settings or bridge startup.
+                 falls through to settings or bridge startup.
+- ``--element-navigation``  HIDDEN companion-process entry point for the
+                  isolated UI Automation navigator. The bridge communicates
+                  with it through a local Win32 command window; it never
+                  falls through to settings or bridge startup.
 - ``--help``/``-h``  print this usage and exit 0
 
 ``--settings``, ``--bridge``, ``--dry-run``, ``--qt-runtime-check``,
@@ -87,6 +91,7 @@ from . import product_identity
 SETTINGS_STARTUP_FAILED_EXIT_CODE = 15
 BRIDGE_CONFIG_FAILED_EXIT_CODE = 16
 BRIDGE_RUNTIME_FAILED_EXIT_CODE = 17
+ELEMENT_NAVIGATION_RUNTIME_FAILED_EXIT_CODE = 18
 
 
 def _print_help() -> None:
@@ -128,6 +133,8 @@ def _dry_run() -> int:
         device_catalog,
         device_profile,
         dev_session,
+        element_navigation_control_windows,
+        element_navigation_runtime,
         frida_compat,
         hid_identity,
         hotkey,
@@ -166,6 +173,7 @@ def _qt_runtime_check() -> int:
         "PySide6.QtQuick",
         "PySide6.QtQuickControls2",
         "PySide6.QtSvg",
+        "PySide6.QtWidgets",
     )
     for module_name in qt_modules:
         importlib.import_module(module_name)
@@ -308,6 +316,22 @@ def main() -> None:
 
         flag_index = args.index("--rc003-hid-injector")
         raise SystemExit(frida_compat.injector_main(args[flag_index + 1 :]))
+    if "--element-navigation" in args:
+        from . import element_navigation_runtime
+
+        flag_index = args.index("--element-navigation")
+        try:
+            exit_code = element_navigation_runtime.run_element_navigation(
+                args[flag_index + 1 :]
+            )
+        except Exception as exc:
+            print(
+                "element navigation runtime failed: "
+                f"error_type={type(exc).__name__}",
+                file=sys.stderr,
+            )
+            exit_code = ELEMENT_NAVIGATION_RUNTIME_FAILED_EXIT_CODE
+        raise SystemExit(exit_code)
     if "--settings" in args:
         _run_settings()
         return

@@ -248,6 +248,25 @@ class PyInstallerSpecTests(unittest.TestCase):
             'datas.append((str(DEVICE_PROFILES_DIR), "device-profiles"))', text
         )
 
+    def test_spec_bundles_the_element_navigation_companion_sources(self):
+        text = _SPEC_PATH.read_text(encoding="utf-8")
+        for source_name in (
+            "element_navigation_prototype.py",
+            "element_navigation_support.py",
+            "element_navigation_windows_host.py",
+            "element_targeting_core.py",
+            "spatial_navigation_core.py",
+        ):
+            self.assertIn(source_name, text)
+        self.assertIn('datas.append((str(source_path), "element_navigation"))', text)
+        hiddenimports = _spec_hidden_imports(text)
+        for module in (
+            "ovb_rc003.element_navigation_control_windows",
+            "ovb_rc003.element_navigation_runtime",
+            "PySide6.QtWidgets",
+        ):
+            self.assertIn(module, hiddenimports)
+
 
 class LauncherEntryPointTests(unittest.TestCase):
     """XRBM-021 In-scope item 1/5: structural regression coverage for the

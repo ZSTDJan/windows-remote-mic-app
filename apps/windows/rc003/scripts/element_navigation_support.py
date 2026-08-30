@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 from dataclasses import dataclass
 from typing import Any, Callable, Optional, Sequence
 
@@ -113,6 +114,14 @@ class QuickerOverlayAssociation:
     hwnd: int
     bind_process_name: str
 
+
+_QUICKER_ASSOCIATION_CACHE_LOCK = threading.Lock()
+_QUICKER_ASSOCIATION_CACHE: dict[
+    str,
+    tuple[tuple[int, int, int], dict[int, QuickerOverlayAssociation]],
+] = {}
+
+
 def normalized_process_name(value: str) -> str:
     name = os.path.basename(str(value or "").strip()).casefold()
     return name[:-4] if name.endswith(".exe") else name
@@ -131,14 +140,26 @@ def default_quicker_state_file() -> str:
 def load_quicker_overlay_associations(
     path: str,
 ) -> dict[int, QuickerOverlayAssociation]:
-    """Read an optional snapshot produced by a Quicker-side bridge action."""
+    """Read and cache an optional Quicker-side association snapshot."""
 
     if not path:
         return {}
+    normalized_path = os.path.abspath(path)
     try:
-        with open(path, "r", encoding="utf-8") as stream:
+        stat = os.stat(normalized_path)
+        signature = (int(stat.st_mtime_ns), int(stat.st_ctime_ns), int(stat.st_size))
+    except OSError:
+        return {}
+    with _QUICKER_ASSOCIATION_CACHE_LOCK:
+        cached = _QUICKER_ASSOCIATION_CACHE.get(normalized_path)
+        if cached is not None and cached[0] == signature:
+            return dict(cached[1])
+    try:
+        with open(normalized_path, "r", encoding="utf-8") as stream:
             payload = json.load(stream)
     except (OSError, ValueError, TypeError):
+        with _QUICKER_ASSOCIATION_CACHE_LOCK:
+            _QUICKER_ASSOCIATION_CACHE[normalized_path] = (signature, {})
         return {}
     items = payload.get("items", ()) if isinstance(payload, dict) else ()
     associations: dict[int, QuickerOverlayAssociation] = {}
@@ -162,7 +183,12 @@ def load_quicker_overlay_associations(
                 hwnd,
                 bind_process_name,
             )
-    return associations
+    with _QUICKER_ASSOCIATION_CACHE_LOCK:
+        _QUICKER_ASSOCIATION_CACHE[normalized_path] = (
+            signature,
+            dict(associations),
+        )
+    return dict(associations)
 
 def quicker_overlay_matches_process(
     association: Optional[QuickerOverlayAssociation],
@@ -472,8 +498,31 @@ def native_handle_value(handle: Any) -> int:
 def keyboard_navigation_action(vk: int) -> Optional[str]:
     return NAVIGATION_KEY_ACTIONS.get(vk)
 
-def global_hotkey_action(vk: int) -> Optional[str]:
-    return GLOBAL_HOTKEY_ACTIONS.get(vk)
+def global_hotkey_action(
+    vk: int,
+    *,
+    include_developer_actions: bool = True,
+) -> Optional[str]:
+    action = GLOBAL_HOTKEY_ACTIONS.get(vk)
+    if action in {"toggle_diagnostics", "quit"} and not include_developer_actions:
+        return None
+    return action
+
+
+def scan_event_is_current(
+    event_token: int,
+    current_token: int,
+    scanning: bool,
+) -> bool:
+    return bool(scanning and event_token > 0 and event_token == current_token)
+
+
+def periodic_check_due(
+    now: float,
+    last_checked_at: float,
+    interval_seconds: float,
+) -> bool:
+    return bool(last_checked_at <= 0.0 or now - last_checked_at >= interval_seconds)
 
 def should_pass_through_native_menu(vk: int, menu_mode_active: bool) -> bool:
     return menu_mode_active and vk in NATIVE_MENU_NAVIGATION_KEYS
@@ -706,6 +755,8 @@ __all__ = (
     'native_handle_value',
     'keyboard_navigation_action',
     'global_hotkey_action',
+    'scan_event_is_current',
+    'periodic_check_due',
     'should_pass_through_native_menu',
     'mouse_wheel_data',
     'owner_chain_contains',

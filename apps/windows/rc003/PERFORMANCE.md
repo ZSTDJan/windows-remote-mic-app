@@ -19,9 +19,9 @@
 也不表示已经进入候选构建或发布。实施结果和真机验收仍分别写入
 `MAINTENANCE.md`、`TESTING.md` 或对应故障记录。
 
-`scripts/element_navigation_prototype.py` 是实验性元素导航，不属于当前 RC003
-生产桥接热路径。它的 UI Automation 性能建议单独放在本文附录，不能与主程序
-的 BLE、按键或音频结论混在一起。
+`scripts/element_navigation_prototype.py` 仍是元素识别与空间导航的单一算法来源，
+现在由按需启动的独立伴随进程加载。它已经进入按键映射，但不属于 RC003 生产桥接
+热路径；UI Automation 性能继续单独放在本文附录，不能与 BLE、按键或音频结论混在一起。
 
 ## 2. 本轮结论
 
@@ -284,14 +284,20 @@ PERF-001 代码、队列、屏障、关闭和重连检查已完成。剩余的 R
 - [PyInstaller 运行模式](https://pyinstaller.org/en/stable/operating-mode.html)：本项目
   继续使用 one-dir，避免 one-file 启动时提取依赖。
 
-## 9. 元素导航原型附录
+## 9. 元素导航伴随进程附录
 
-实验性元素导航若以后进入产品，需要单独测量目标窗口枚举、UIA 树遍历、属性读取、
-命中测试和覆盖层绘制，不能复用本次 RC003 主程序基线。
+元素导航已通过“元素导航开关”进入按键映射，但仍在独立进程中按需启动。首次触发的
+主要耗时来自 Qt/UI Automation 冷加载、目标窗口枚举、UIA 树遍历和跨进程属性读取；
+缓存建立后的方向移动明显更轻。桥接线程只发送一个本地窗口消息，不承担扫描、命中
+测试、覆盖层绘制或点击，因此导航卡顿不会堵住 BLE、普通按键和音频主链。
 
 Microsoft 明确指出逐元素、逐属性读取会产生大量跨进程调用；应使用
 [UI Automation 缓存请求](https://learn.microsoft.com/en-us/windows/win32/winauto/uiauto-cachingforclients)
 批量获取需要的属性和 Control Pattern，并根据 UI 变化事件刷新快照。UIA 调用还应
 放在独立非 UI 线程，遵守
 [UI Automation 线程规则](https://learn.microsoft.com/en-us/windows/win32/winauto/uiauto-threading)。
-这只适用于元素导航原型，不是当前 BLE、按键或音频主链的优化依据。
+后续优化优先减少重复属性读取、缩短主线程窗口枚举，并控制高分辨率视觉回退的瞬时
+位图占用；这些结论只适用于元素导航伴随进程，不是 BLE、按键或音频主链的优化依据。
+当前实现已按文件签名缓存 Quicker 关联状态、短时缓存进程名，并把关联悬浮窗全量枚举
+降为约每秒一次；只有旧缓存即将把前台判成无关窗口时才强制补查一次，避免用性能优化
+换来错误退出。

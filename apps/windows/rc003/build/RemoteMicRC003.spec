@@ -27,6 +27,14 @@ REMOTE_PHOTO = REPO_ROOT / "Resources" / "RC003-remote-photo.png"
 QML_SOURCE_DIR = SRC_ROOT / "ovb_rc003" / "qml"
 APP_ICON_DIR = SRC_ROOT / "ovb_rc003" / "assets" / "icons"
 APP_ICON = APP_ICON_DIR / "remote-mic.ico"
+ELEMENT_NAVIGATION_SOURCE_DIR = RC003_ROOT / "scripts"
+ELEMENT_NAVIGATION_SOURCE_FILES = (
+    "element_navigation_prototype.py",
+    "element_navigation_support.py",
+    "element_navigation_windows_host.py",
+    "element_targeting_core.py",
+    "spatial_navigation_core.py",
+)
 DEVICE_PROFILES_DIR = REPO_ROOT / "device-profiles"
 # XRBM-031: build/fetch-vb-cable.ps1 (a REQUIRED step in both
 # build-candidate.ps1 and windows-rc003-ci.yml, run before this spec) writes
@@ -83,6 +91,11 @@ if QML_SOURCE_DIR.is_dir():
     datas.append((str(QML_SOURCE_DIR), "ovb_rc003_qml"))
 if APP_ICON_DIR.is_dir():
     datas.append((str(APP_ICON_DIR), "app_icons"))
+for source_name in ELEMENT_NAVIGATION_SOURCE_FILES:
+    source_path = ELEMENT_NAVIGATION_SOURCE_DIR / source_name
+    if not source_path.is_file():
+        raise SystemExit(f"required element-navigation source is missing: {source_path}")
+    datas.append((str(source_path), "element_navigation"))
 if DEVICE_PROFILES_DIR.is_dir():
     # The exact repository JSON files are the runtime catalog for Windows. The
     # frozen loader reads them from
@@ -106,6 +119,8 @@ hiddenimports = [
     "ovb_rc003.app",
     "ovb_rc003.device_catalog",  # XRBM-036: multi-device settings/runtime gate
     "ovb_rc003.settings_ui",
+    "ovb_rc003.element_navigation_control_windows",
+    "ovb_rc003.element_navigation_runtime",
     "ovb_rc003.qt_settings_app",  # XRBM-030
     "ovb_rc003.windows_diagnostics",  # XRBM-031
     "ovb_rc003.vb_cable_bundle",  # XRBM-031
@@ -158,6 +173,7 @@ hiddenimports = [
     "PySide6.QtQuick",
     "PySide6.QtQuickControls2",
     "PySide6.QtSvg",
+    "PySide6.QtWidgets",
 ]
 
 a = Analysis(

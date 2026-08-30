@@ -31,8 +31,10 @@ AbstractButton {
         const shortcuts = {
             "Escape": "Esc",
             "Return": "Enter",
+            "回车": "Enter",
             "Delete": "Del",
             "Delete（退格）": "Del",
+            "退格": "Del",
             "方向上": "↑",
             "方向下": "↓",
             "方向左": "←",
