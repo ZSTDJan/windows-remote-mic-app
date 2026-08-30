@@ -223,9 +223,10 @@ class RC003App:
         self._voice_mic_gesture_audio_started = False
         self._voice_mic_gesture_audio_stopped = False
         self._voice_mic_gesture_physical_seen = False
-        self._voice_mic_gesture_direct_hid_released = False
+        self._voice_mic_gesture_hid_released = False
         self._voice_mic_gesture_started_without_direct_hid = False
         self._voice_mic_gesture_direct_hid_seen = False
+        self._voice_mic_gesture_legacy_f5_released = False
         self._voice_mic_gesture_sources_down: set[str] = set()
         self._ordinary_mic_lock = threading.Lock()
         self._ordinary_mic_sources_down: set[str] = set()
@@ -239,10 +240,15 @@ class RC003App:
         self._voice_pcm_forwarding_enabled = False
         self._voice_raw_input_trigger_pending = False
         # WH_KEYBOARD_LL must never wait for the voice/audio state machine.
-        # This private lock only collapses repeated legacy F5 records before
-        # they are queued; no other application path acquires it.
+        # This private lock collapses repeated legacy F5 records before they
+        # are queued and exposes a brief down-state snapshot to the voice
+        # state machine. No hook callback holds it while acquiring voice state.
         self._legacy_f5_hook_lock = threading.Lock()
         self._legacy_f5_is_down = False
+        # A matched HID release can retire a still-down F5 duplicate before its
+        # delayed up arrives. Keep that old pair quarantined so it cannot attach
+        # to the next voice gesture.
+        self._legacy_f5_voice_blocked_until_up = False
         self._ble_session: Optional[ble_transport_winrt.RC003BleSession] = None
         self._hid_listener: Optional[raw_input_windows.RawInputButtonListener] = None
         self._legacy_key_suppressor: Optional[
@@ -566,6 +572,7 @@ class RC003App:
         with self._voice_trigger_lock:
             self._accept_input_events = False
             self._legacy_voice_event_generation += 1
+            self._legacy_f5_voice_blocked_until_up = False
         with self._legacy_f5_hook_lock:
             self._legacy_f5_is_down = False
 
@@ -833,19 +840,22 @@ class RC003App:
                 self._voice_mic_gesture_sources_down.add(source)
                 if source == "hid_tap":
                     self._voice_mic_gesture_direct_hid_seen = True
+            self._track_legacy_f5_down_snapshot_locked()
             return False
         self._voice_mic_gesture_active = True
         self._voice_mic_gesture_audio_started = source == "audio_started"
         self._voice_mic_gesture_audio_stopped = False
         self._voice_mic_gesture_physical_seen = physical_down
-        self._voice_mic_gesture_direct_hid_released = False
+        self._voice_mic_gesture_hid_released = False
         self._voice_mic_gesture_started_without_direct_hid = (
             not self._direct_hid_tap_active
         )
         self._voice_mic_gesture_direct_hid_seen = (
             physical_down and source == "hid_tap"
         )
+        self._voice_mic_gesture_legacy_f5_released = False
         self._voice_mic_gesture_sources_down = {source} if physical_down else set()
+        self._track_legacy_f5_down_snapshot_locked()
         return True
 
     def _finish_voice_mic_gesture(self) -> None:
@@ -855,13 +865,14 @@ class RC003App:
         self._voice_mic_gesture_audio_started = False
         self._voice_mic_gesture_audio_stopped = False
         self._voice_mic_gesture_physical_seen = False
-        self._voice_mic_gesture_direct_hid_released = False
+        self._voice_mic_gesture_hid_released = False
         self._voice_mic_gesture_started_without_direct_hid = False
         self._voice_mic_gesture_direct_hid_seen = False
+        self._voice_mic_gesture_legacy_f5_released = False
         self._voice_mic_gesture_sources_down.clear()
 
     def _rollover_completed_voice_mic_gesture_locked(self, next_source: str) -> bool:
-        """Detach stale sources once direct HID proves a new press can proceed."""
+        """Detach stale sources once a matched HID release proves a new press."""
 
         startup_hid_handoff = (
             next_source == "hid_tap"
@@ -873,12 +884,14 @@ class RC003App:
             and self._voice_mic_gesture_audio_stopped
             and not self._voice.active
             and (
-                self._voice_mic_gesture_direct_hid_released
+                self._voice_mic_gesture_hid_released
                 or startup_hid_handoff
             )
         ):
             return False
         stale_sources = sorted(self._voice_mic_gesture_sources_down)
+        if "legacy_f5" in self._voice_mic_gesture_sources_down:
+            self._legacy_f5_voice_blocked_until_up = True
         self._finish_voice_mic_gesture()
         self._logger.info(
             "voice completed gesture rolled over for new source=%s; "
@@ -887,6 +900,44 @@ class RC003App:
             stale_sources,
         )
         return True
+
+    def _track_legacy_f5_down_snapshot_locked(self) -> bool:
+        """Attach the current F5 pair to an existing voice gesture only.
+
+        The caller holds ``_voice_trigger_lock``. The hook lock is held only
+        long enough to copy its down latch; the low-level hook never acquires
+        the voice lock, so this lock order has no reverse path.
+        """
+
+        if (
+            not self._voice_mic_gesture_active
+            or self._voice_mic_gesture_direct_hid_seen
+            or self._legacy_f5_voice_blocked_until_up
+            or self._voice_mic_gesture_legacy_f5_released
+            or "legacy_f5" in self._voice_mic_gesture_sources_down
+        ):
+            return False
+        with self._legacy_f5_hook_lock:
+            legacy_f5_is_down = self._legacy_f5_is_down
+        if not legacy_f5_is_down:
+            return False
+        self._voice_mic_gesture_sources_down.add("legacy_f5")
+        self._logger.info(
+            "voice legacy F5 down attached for release bookkeeping only"
+        )
+        return True
+
+    def _retire_legacy_f5_on_matched_hid_release_locked(self) -> None:
+        """Detach a duplicate F5 pair once matching HID already proved release."""
+
+        if "legacy_f5" not in self._voice_mic_gesture_sources_down:
+            return
+        self._voice_mic_gesture_sources_down.discard("legacy_f5")
+        self._voice_mic_gesture_legacy_f5_released = False
+        self._legacy_f5_voice_blocked_until_up = True
+        self._logger.info(
+            "voice legacy F5 pair retired by matched HID release; late up quarantined"
+        )
 
     def _release_hold_voice_on_physical_release_locked(
         self,
@@ -962,68 +1013,81 @@ class RC003App:
             "atvv_press",
             "audio_started",
         }
-        with self._key_detection_mic_lock:
-            self._expire_key_detection_mic_gesture_locked(now)
-            newly_captured = False
-            if not self._key_detection_mic_gesture_active:
-                if not starts_gesture:
-                    return False, False
-                try:
-                    newly_captured = key_detection_bridge.publish_next_button(
-                        self._config_root,
-                        "mic",
-                    )
-                except OSError as exc:
-                    self._logger.warning("key detection IPC unavailable: %s", exc)
-                    return False, False
-                if not newly_captured:
-                    return False, False
-                self._key_detection_mic_gesture_active = True
-                self._key_detection_mic_gesture_started_at = now
+        with self._voice_trigger_lock:
+            # A detection request may appear while a real voice press is still
+            # active. Its late HID/F5/audio edges belong to that owned press and
+            # must remain available to close the host shortcut. Leave the
+            # request pending for the next independent press instead.
+            if self._voice_mic_gesture_active:
+                return False, False
+            with self._key_detection_mic_lock:
+                self._expire_key_detection_mic_gesture_locked(now)
+                newly_captured = False
+                if not self._key_detection_mic_gesture_active:
+                    if not starts_gesture:
+                        return False, False
+                    try:
+                        newly_captured = key_detection_bridge.publish_next_button(
+                            self._config_root,
+                            "mic",
+                        )
+                    except OSError as exc:
+                        self._logger.warning("key detection IPC unavailable: %s", exc)
+                        return False, False
+                    if not newly_captured:
+                        return False, False
+                    self._key_detection_mic_gesture_active = True
+                    self._key_detection_mic_gesture_started_at = now
 
-            if event_kind == "physical_down":
-                self._key_detection_mic_sources_down.add(source)
-                self._key_detection_mic_release_deadline = None
-            elif event_kind == "physical_up":
-                self._key_detection_mic_sources_down.discard(source)
-                if (
-                    not self._key_detection_mic_sources_down
-                    and not self._key_detection_mic_audio_started
-                ):
+                if event_kind == "physical_down":
+                    self._key_detection_mic_sources_down.add(source)
+                    self._key_detection_mic_release_deadline = None
+                elif event_kind == "physical_up":
+                    self._key_detection_mic_sources_down.discard(source)
+                    if (
+                        not self._key_detection_mic_sources_down
+                        and not self._key_detection_mic_audio_started
+                    ):
+                        self._key_detection_mic_release_deadline = (
+                            now + _KEY_DETECTION_MIC_RELEASE_GRACE_SECONDS
+                        )
+                elif event_kind == "audio_started":
+                    self._key_detection_mic_audio_started = True
+                    self._key_detection_mic_release_deadline = None
+                elif event_kind == "audio_stopped":
+                    self._key_detection_mic_audio_started = False
+                    if not self._key_detection_mic_sources_down:
+                        self._key_detection_mic_release_deadline = (
+                            now + _KEY_DETECTION_MIC_RELEASE_GRACE_SECONDS
+                        )
+                elif not self._key_detection_mic_sources_down:
+                    # MicButtonPressed has no matching release opcode. Give the
+                    # physical/audio paths time to join, then let a future press
+                    # through even if neither companion event ever arrives.
                     self._key_detection_mic_release_deadline = (
                         now + _KEY_DETECTION_MIC_RELEASE_GRACE_SECONDS
                     )
-            elif event_kind == "audio_started":
-                self._key_detection_mic_audio_started = True
-                self._key_detection_mic_release_deadline = None
-            elif event_kind == "audio_stopped":
-                self._key_detection_mic_audio_started = False
-                if not self._key_detection_mic_sources_down:
-                    self._key_detection_mic_release_deadline = (
-                        now + _KEY_DETECTION_MIC_RELEASE_GRACE_SECONDS
-                    )
-            elif not self._key_detection_mic_sources_down:
-                # MicButtonPressed has no matching release opcode. Give the
-                # physical/audio paths time to join, then let a future press
-                # through even if neither companion event ever arrives.
-                self._key_detection_mic_release_deadline = (
-                    now + _KEY_DETECTION_MIC_RELEASE_GRACE_SECONDS
-                )
-            return True, newly_captured
+                return True, newly_captured
 
     def _on_legacy_key_event(self, vk_code: int, is_pressed: bool) -> None:
         """Deduplicate and queue an already-suppressed legacy F5 edge.
 
-        The callback runs inside WH_KEYBOARD_LL. Its private lock is never used
-        by voice, audio, HID, settings, or cleanup work, so it cannot wait for
-        PortAudio or the application state machine. The queued edge may support
-        key detection or an ordinary mic mapping, but never owns the voice
-        shortcut lifecycle.
+        The callback runs inside WH_KEYBOARD_LL. It only updates the private F5
+        latch and releases that lock before queueing application work, so it
+        never waits for PortAudio or the voice state machine. Voice code may
+        briefly snapshot the latch later. The queued edge may support key
+        detection or an ordinary mic mapping, but never owns the voice shortcut
+        lifecycle.
         """
 
-        if vk_code != 0x74 or not self._accept_input_events:
+        if vk_code != 0x74:
             return
         with self._legacy_f5_hook_lock:
+            # Cleanup can close input after the hook callback passed its first
+            # instruction but before it acquired this lock. Recheck here so a
+            # stale callback cannot re-arm the down latch after cleanup reset it.
+            if not self._accept_input_events:
+                return
             if is_pressed:
                 if self._legacy_f5_is_down:
                     return
@@ -1053,6 +1117,14 @@ class RC003App:
             or not self._accept_input_events
         ):
             return
+        if not is_pressed:
+            with self._voice_trigger_lock:
+                if self._legacy_f5_voice_blocked_until_up:
+                    self._legacy_f5_voice_blocked_until_up = False
+                    self._logger.info(
+                        "voice retired legacy F5 up consumed before dispatch"
+                    )
+                    return
         self._reload_settings_if_changed()
         mic_action = self._primary_button_action("mic")
         if self._voice_mode_for_primary_button("mic", mic_action) is None:
@@ -1062,15 +1134,78 @@ class RC003App:
             "physical_down" if is_pressed else "physical_up",
             "legacy_f5",
         )
-        if detection_handled and detection_captured:
-            self._logger.info(
-                "key detection captured button=mic source=legacy_f5; "
-                "voice action suppressed"
-            )
-        elif is_pressed:
+        if detection_handled:
+            if detection_captured:
+                self._logger.info(
+                    "key detection captured button=mic source=legacy_f5; "
+                    "voice action suppressed"
+                )
+            return
+        tracked = self._handle_voice_legacy_f5_edge(is_pressed)
+        if is_pressed and not tracked:
             self._logger.info(
                 "voice legacy F5 swallowed; HID/ATVV owns the voice session"
             )
+
+    def _handle_voice_legacy_f5_edge(self, is_pressed: bool) -> bool:
+        """Track an F5 pair only as release bookkeeping for an owned gesture.
+
+        Some Windows stacks report the RC003 microphone down through Raw Input
+        but omit its matching up while still producing the global legacy F5 up.
+        F5 may keep that already-owned gesture open long enough to absorb a late
+        Raw Input down, but it never opens or releases the host shortcut.
+        """
+
+        with self._voice_trigger_lock:
+            if is_pressed:
+                if (
+                    self._voice_mic_gesture_direct_hid_seen
+                    or self._legacy_f5_voice_blocked_until_up
+                    or not self._voice_mic_gesture_active
+                    or self._voice_mic_gesture_legacy_f5_released
+                    or "legacy_f5" in self._voice_mic_gesture_sources_down
+                ):
+                    return False
+                self._voice_mic_gesture_sources_down.add("legacy_f5")
+                self._logger.info(
+                    "voice legacy F5 down attached for release bookkeeping only"
+                )
+                return True
+
+            if (
+                not self._voice_mic_gesture_active
+                or "legacy_f5" not in self._voice_mic_gesture_sources_down
+            ):
+                return False
+
+            self._voice_mic_gesture_sources_down.discard("legacy_f5")
+            self._voice_mic_gesture_legacy_f5_released = True
+            self._logger.info(
+                "voice legacy F5 up recorded for release bookkeeping only"
+            )
+
+            if (
+                self._voice_mic_gesture_audio_stopped
+                and not self._voice.active
+                and not self._voice_mic_gesture_direct_hid_seen
+                and self._voice_mic_gesture_sources_down == {"hid"}
+            ):
+                self._voice_mic_gesture_sources_down.clear()
+                self._logger.info(
+                    "voice missing Raw Input mic up cleared after legacy F5 release"
+                )
+            if (
+                self._voice_mic_gesture_active
+                and not self._voice_mic_gesture_sources_down
+                and not self._voice.active
+                and (
+                    self._voice_mic_gesture_audio_stopped
+                    or not self._voice_mic_gesture_audio_started
+                )
+            ):
+                self._finish_voice_mic_gesture()
+            self._apply_pending_voice_settings_if_idle_locked()
+            return True
 
     def _on_raw_input_event(self, event: raw_input_windows.RawInputEvent) -> None:
         """Arm the exact original keyboard edge for duplicate suppression.
@@ -1326,7 +1461,7 @@ class RC003App:
                 self._key_detection_suppressed_buttons.discard(button_id)
             return
         detection_captured = False
-        if is_pressed:
+        if is_pressed and button_id != "mic":
             try:
                 detection_captured = key_detection_bridge.publish_next_button(
                     self._config_root,
@@ -1375,18 +1510,30 @@ class RC003App:
 
             if not is_pressed:
                 with self._voice_trigger_lock:
-                    direct_hid_released = (
-                        event_source == "hid_tap"
+                    source_was_down = (
+                        self._voice_mic_gesture_active
                         and event_source in self._voice_mic_gesture_sources_down
                     )
-                    if direct_hid_released:
-                        self._voice_mic_gesture_direct_hid_released = True
+                    if not source_was_down:
+                        self._logger.info(
+                            "voice physical release ignored without matching down: "
+                            "source=%s",
+                            event_source,
+                        )
+                        self._apply_pending_voice_settings_if_idle_locked()
+                        return
+
+                    self._track_legacy_f5_down_snapshot_locked()
+                    matched_hid_released = event_source in {"hid", "hid_tap"}
+                    if matched_hid_released:
+                        self._voice_mic_gesture_hid_released = True
+                        self._retire_legacy_f5_on_matched_hid_release_locked()
                     self._voice_mic_gesture_sources_down.discard(event_source)
                     if (
                         self._voice.trigger_mode
                         == key_mapping.VoiceTriggerMode.HOLD
                         and (
-                            event_source == "hid_tap"
+                            matched_hid_released
                             or not self._voice_mic_gesture_sources_down
                         )
                     ):
@@ -1873,6 +2020,7 @@ class RC003App:
                 self._voice_raw_input_trigger_pending = False
                 self._unsolicited_mic_close_pending = False
                 if self._voice_mic_gesture_active:
+                    self._track_legacy_f5_down_snapshot_locked()
                     self._voice_mic_gesture_audio_started = False
                     self._voice_mic_gesture_audio_stopped = True
                 action = self._voice.on_audio_stopped()
@@ -1894,12 +2042,24 @@ class RC003App:
                         "requesting reconnect"
                     )
                     self._supervisor.request_reconnect()
-                elif (
-                    self._voice_mic_gesture_active
-                    and self._voice_mic_gesture_audio_stopped
-                    and not self._voice_mic_gesture_sources_down
-                ):
-                    self._finish_voice_mic_gesture()
+                else:
+                    if (
+                        self._voice_mic_gesture_active
+                        and self._voice_mic_gesture_legacy_f5_released
+                        and not self._voice_mic_gesture_direct_hid_seen
+                        and self._voice_mic_gesture_sources_down == {"hid"}
+                    ):
+                        self._voice_mic_gesture_sources_down.clear()
+                        self._logger.info(
+                            "voice missing Raw Input mic up cleared at audio stop "
+                            "after legacy F5 release"
+                        )
+                    if (
+                        self._voice_mic_gesture_active
+                        and self._voice_mic_gesture_audio_stopped
+                        and not self._voice_mic_gesture_sources_down
+                    ):
+                        self._finish_voice_mic_gesture()
                 self._apply_pending_voice_settings_if_idle_locked()
 
     def _handle_mic_button_pressed(

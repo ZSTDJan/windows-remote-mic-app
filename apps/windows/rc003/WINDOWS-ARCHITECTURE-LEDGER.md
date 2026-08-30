@@ -176,6 +176,11 @@ RC003 遥控器
 首个来源已经释放后迟到；两种情况都必须在有界保护期内折叠，不能把迟到来源
 误判为下一次点击。
 
+语音映射只有 HID、ATVV 或音频事件可以认领宿主快捷键。legacy F5 只作为已经
+存在手势的收尾记账，不能新建会话，也不能发送或释放宿主快捷键。已经匹配过
+按下的 HID 来源才接受对应抬起；游离抬起直接忽略。HID 已确认松开时，仍未到达的
+旧 F5 抬起会被隔离到自己的旧按键对，不能附着到下一次语音手势。
+
 ## 8. 按键与动作映射链路
 
 ### 8.1 输入来源
@@ -202,8 +207,10 @@ Frida Gadget。服务端通过 `GetExtendedTcpTable` 核对 TCP 客户端进程 
 
 麦克风的原生 F5 是特殊路径：部分 RC003/Windows 组合只把麦克风键暴露成
 无法关联设备来源的 legacy F5。桥接运行时，专用钩子会吞掉非注入 F5，避免
-它泄漏给记事本或输入框并触发“插入日期时间”。麦克风键映射为语音时，符合
-当前手势条件的边沿进入对应语音状态机；映射为普通动作时，经跨来源去重后进入
+它泄漏给记事本或输入框并触发“插入日期时间”。麦克风键映射为语音时，F5
+按下/抬起都不会启动语音或发送宿主快捷键，语音会话只由 HID、ATVV 和音频
+事件拥有；仅当 HID tap 不可用、Raw Input 已报告麦克风按下却缺少对应抬起时，
+legacy F5 抬起可补齐这一次物理释放。映射为普通动作时，F5 经跨来源去重后进入
 普通手势分发。代价是桥接钩子启用期间，用户键盘上任何非注入的真实 F5 同样
 会被吞掉；这是当前已知架构边界，不能描述成钩子直接识别了 RC003 设备来源。
 
@@ -316,6 +323,10 @@ SHA-256 匹配的 `ImeService.exe` 安装 Frida callback hook。hook 仅处理�
 无法稳定保留它的按住时长，因此没有作为默认值发包。自动键序测试不能代替
 UU 远程与目标输入法真机验收。
 
+兼容层只处理 `app.py` 的语音状态机已经取得所有权后发出的宿主动作。legacy F5
+本身不会被转换成右侧 Alt 或其它语音快捷键，因此兼容层与 F5 抑制路径之间没有
+第二个宿主按键发送者。
+
 Frida script/session 的引用只有在卸载或 session detach 成功后才清除。
 session detach 成功即证明其脚本不再被会话持有；单独 script unload 报错不再
 把兼容层永久误判为“仍需清理”。
@@ -371,8 +382,8 @@ session detach 成功即证明其脚本不再被会话持有；单独 script unl
 
 桥接按 mtime 一起热加载按键动作和按住说话设置。活跃语音会话不会中途切换
 状态机，新设置会等本次手势完整收尾后应用。设备 profile 与音频端点仍要求
-重启桥接。若新文件无法解析，运行时保留最后一份有效配置，但会立即关闭依赖
-配置的低层 F5 语音转换快照；修复并成功加载前不继续沿用旧转换行为。
+重启桥接。若新文件无法解析，运行时保留最后一份有效配置。F5 防漏不依赖语音
+快捷键配置，低层钩子不会把 F5 转换成任何宿主快捷键。
 
 配置 schema 为 3。当前语音设置只写 `voice_hotkeys.hold`、`voice_hotkey` 和
 固定值 `voice_trigger_mode=hold`。旧 schema-1 开关快捷键不会被解释成按住
@@ -531,7 +542,7 @@ F5 不再向输入框泄漏日期时间。On-request 真机探针最终未收到
 | 音频 | `audio_output.py`、`audio_playback.py`、`audio_playback_worker.py` |
 | 普通按键 | `raw_input_windows.py`、`hid_identity.py`、`button_gesture.py` |
 | 动作输出 | `key_mapping.py`、`win32_input.py`、`action_executor.py` |
-| F5/去重 | `legacy_key_suppressor_windows.py`、`hotkey_capture_windows.py` |
+| F5/跨来源语音仲裁 | `app.py`、`legacy_key_suppressor_windows.py`、`hotkey_capture_windows.py` |
 | HID tap | `frida_compat.py`、`frida_hid_tap_runtime.py`、`frida_hid_tap_injector.py` |
 | 豆包兼容 | `doubao_rpc.py` |
 | 配置/IPC | `config.py`、`key_detection_bridge.py`、`key_testing.py` |

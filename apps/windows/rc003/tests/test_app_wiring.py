@@ -972,6 +972,32 @@ class OrdinaryButtonGestureWiringTests(_AppWiringTestCase):
         self.assertTrue(returned_without_lock)
         self.assertEqual(returned, [True])
 
+    def test_legacy_f5_hook_rechecks_input_after_cleanup_wins_the_lock(self):
+        dispatched = []
+
+        class CleanupWinsGate:
+            def __enter__(inner_self):
+                self.app._accept_input_events = False
+                self.app._legacy_f5_is_down = False
+                return inner_self
+
+            def __exit__(inner_self, exc_type, exc, traceback):
+                return False
+
+        self.app._legacy_f5_hook_lock = CleanupWinsGate()
+        with mock.patch.object(
+            self.app,
+            "_dispatch_legacy_key_event",
+            side_effect=lambda generation, is_pressed: dispatched.append(
+                (generation, is_pressed)
+            ),
+        ):
+            self.app._on_legacy_key_event(0x74, True)
+            self._drain_event_loop()
+
+        self.assertFalse(self.app._legacy_f5_is_down)
+        self.assertEqual(dispatched, [])
+
     def test_semantic_arrow_action_uses_its_function_executor(self):
         calls = []
         original = getattr(win32_input, "send_arrow_up", None)
@@ -1351,8 +1377,383 @@ class VoiceMappingProductBoundaryTests(_AppWiringTestCase):
         self.assertEqual(calls, [])
         self.assertFalse(self.app._voice.active)
 
+    def test_legacy_f5_release_absorbs_late_raw_input_down_after_audio_stop(self):
+        calls = []
+        self.app._direct_hid_tap_active = False
+        with mock.patch.object(
+            win32_input,
+            "send_voice_key_combo_down",
+            side_effect=lambda tokens: calls.append(("down", tokens)),
+        ), mock.patch.object(
+            win32_input,
+            "send_voice_key_combo_up",
+            side_effect=lambda tokens: calls.append(("up", tokens)),
+        ):
+            # Exact order captured on the remote machine: audio owns the first
+            # session, F5 remains down through AudioStopped, then Raw Input
+            # reports one late down without a matching up.
+            self.app._on_control_event(AudioStarted(session_id=1))
+            self.app._on_legacy_key_event(0x74, True)
+            self._drain_event_loop()
+            self.app._on_control_event(AudioStopped())
+
+            self.assertEqual(
+                calls,
+                [
+                    ("down", DEFAULT_VOICE_TOKENS),
+                    ("up", DEFAULT_VOICE_TOKENS),
+                ],
+            )
+            self.assertEqual(
+                self.app._voice_mic_gesture_sources_down,
+                {"legacy_f5"},
+            )
+            self.assertTrue(self.app._voice_mic_gesture_audio_stopped)
+
+            self.app._on_button_event("mic", True, event_source="hid")
+            self.assertEqual(
+                self.app._voice_mic_gesture_sources_down,
+                {"legacy_f5", "hid"},
+            )
+            self.assertEqual(len(calls), 2)
+
+            self.app._on_legacy_key_event(0x74, False)
+            self._drain_event_loop()
+
+            self.assertEqual(self.app._voice_mic_gesture_sources_down, set())
+            self.assertFalse(self.app._voice_mic_gesture_active)
+
+            self.app._on_button_event("mic", True, event_source="hid")
+            self.app._on_control_event(AudioStarted(session_id=2))
+            self.app._on_button_event("mic", False, event_source="hid")
+            self.app._on_control_event(AudioStopped())
+
+        self.assertEqual(
+            calls,
+            [
+                ("down", DEFAULT_VOICE_TOKENS),
+                ("up", DEFAULT_VOICE_TOKENS),
+                ("down", DEFAULT_VOICE_TOKENS),
+                ("up", DEFAULT_VOICE_TOKENS),
+            ],
+        )
+        self.assertFalse(self.app._voice.active)
+
+    def test_legacy_f5_up_before_audio_stop_never_releases_the_host_shortcut(self):
+        calls = []
+        self.app._direct_hid_tap_active = False
+        with mock.patch.object(
+            win32_input,
+            "send_voice_key_combo_down",
+            side_effect=lambda tokens: calls.append(("down", tokens)),
+        ), mock.patch.object(
+            win32_input,
+            "send_voice_key_combo_up",
+            side_effect=lambda tokens: calls.append(("up", tokens)),
+        ):
+            self.app._on_control_event(AudioStarted(session_id=1))
+            self.app._on_legacy_key_event(0x74, True)
+            self._drain_event_loop()
+            self.app._on_button_event("mic", True, event_source="hid")
+
+            self.app._on_legacy_key_event(0x74, False)
+            self._drain_event_loop()
+
+            self.assertEqual(calls, [("down", DEFAULT_VOICE_TOKENS)])
+            self.assertTrue(self.app._voice.active)
+            self.assertEqual(self.app._voice_mic_gesture_sources_down, {"hid"})
+
+            self.app._on_control_event(AudioStopped())
+
+        self.assertEqual(
+            calls,
+            [("down", DEFAULT_VOICE_TOKENS), ("up", DEFAULT_VOICE_TOKENS)],
+        )
+        self.assertFalse(self.app._voice_mic_gesture_active)
+
+    def test_tap_status_change_does_not_pin_a_raw_input_source(self):
+        calls = []
+        self.app._direct_hid_tap_active = False
+        with mock.patch.object(
+            win32_input,
+            "send_voice_key_combo_down",
+            side_effect=lambda tokens: calls.append(("down", tokens)),
+        ), mock.patch.object(
+            win32_input,
+            "send_voice_key_combo_up",
+            side_effect=lambda tokens: calls.append(("up", tokens)),
+        ):
+            self.app._on_control_event(AudioStarted(session_id=1))
+            self.app._on_legacy_key_event(0x74, True)
+            self._drain_event_loop()
+
+            # The tap may become globally ready because of another usage even
+            # though this mic gesture never produced a direct HID mic edge.
+            self.app._direct_hid_tap_active = True
+            self.app._on_control_event(AudioStopped())
+            self.app._on_button_event("mic", True, event_source="hid")
+            self.app._on_legacy_key_event(0x74, False)
+            self._drain_event_loop()
+
+            self.assertFalse(self.app._voice_mic_gesture_active)
+            self.assertEqual(self.app._voice_mic_gesture_sources_down, set())
+
+            self.app._on_control_event(AudioStarted(session_id=2))
+            self.app._on_control_event(AudioStopped())
+
+        self.assertEqual(
+            calls,
+            [
+                ("down", DEFAULT_VOICE_TOKENS),
+                ("up", DEFAULT_VOICE_TOKENS),
+                ("down", DEFAULT_VOICE_TOKENS),
+                ("up", DEFAULT_VOICE_TOKENS),
+            ],
+        )
+
+    def test_late_f5_up_cannot_close_the_next_raw_input_session(self):
+        calls = []
+        self.app._direct_hid_tap_active = False
+        with mock.patch.object(
+            win32_input,
+            "send_voice_key_combo_down",
+            side_effect=lambda tokens: calls.append(("down", tokens)),
+        ), mock.patch.object(
+            win32_input,
+            "send_voice_key_combo_up",
+            side_effect=lambda tokens: calls.append(("up", tokens)),
+        ):
+            self.app._on_button_event("mic", True, event_source="hid")
+            self.app._on_legacy_key_event(0x74, True)
+            self._drain_event_loop()
+            self.app._on_control_event(AudioStarted(session_id=1))
+            self.app._on_button_event("mic", False, event_source="hid")
+            self.app._on_control_event(AudioStopped())
+
+            self.assertFalse(self.app._voice_mic_gesture_active)
+            self.assertTrue(self.app._legacy_f5_voice_blocked_until_up)
+
+            self.app._on_button_event("mic", True, event_source="hid")
+            self.assertTrue(self.app._voice.active)
+
+            self.app._on_legacy_key_event(0x74, False)
+            self._drain_event_loop()
+
+            self.assertTrue(self.app._voice.active)
+            self.assertEqual(self.app._voice_mic_gesture_sources_down, {"hid"})
+            self.assertEqual(
+                calls,
+                [
+                    ("down", DEFAULT_VOICE_TOKENS),
+                    ("up", DEFAULT_VOICE_TOKENS),
+                    ("down", DEFAULT_VOICE_TOKENS),
+                ],
+            )
+
+            self.app._on_button_event("mic", False, event_source="hid")
+            self.app._on_control_event(AudioStopped())
+
+        self.assertEqual(
+            calls,
+            [
+                ("down", DEFAULT_VOICE_TOKENS),
+                ("up", DEFAULT_VOICE_TOKENS),
+                ("down", DEFAULT_VOICE_TOKENS),
+                ("up", DEFAULT_VOICE_TOKENS),
+            ],
+        )
+        self.assertFalse(self.app._voice.active)
+
+    def test_retired_f5_up_is_consumed_before_an_ordinary_mapping_reload(self):
+        calls = []
+        default_mic_action = dict(self.app._bindings["bindings"]["mic"])
+        self.app._direct_hid_tap_active = False
+        with mock.patch.object(
+            win32_input,
+            "send_voice_key_combo_down",
+            side_effect=lambda tokens: calls.append(("down", tokens)),
+        ), mock.patch.object(
+            win32_input,
+            "send_voice_key_combo_up",
+            side_effect=lambda tokens: calls.append(("up", tokens)),
+        ), mock.patch.object(win32_input, "send_arrow_up") as ordinary_action:
+            self.app._on_button_event("mic", True, event_source="hid")
+            self.app._on_legacy_key_event(0x74, True)
+            self._drain_event_loop()
+            self.app._on_control_event(AudioStarted(session_id=1))
+            self.app._on_button_event("mic", False, event_source="hid")
+            self.app._on_control_event(AudioStopped())
+
+            self.assertTrue(self.app._legacy_f5_voice_blocked_until_up)
+            self.app._bindings["bindings"]["mic"] = key_mapping.ButtonAction(
+                key_mapping.ActionKind.ARROW_UP
+            ).to_dict()
+            request = key_detection_bridge.request_detection(self.app._config_root)
+
+            self.app._on_legacy_key_event(0x74, False)
+            self._drain_event_loop()
+
+            self.assertFalse(self.app._legacy_f5_voice_blocked_until_up)
+            ordinary_action.assert_not_called()
+            self.assertIsNone(key_detection_bridge.poll_detection(request))
+            key_detection_bridge.cancel_detection(request)
+
+            self.app._bindings["bindings"]["mic"] = default_mic_action
+            self.app._on_control_event(AudioStarted(session_id=2))
+            self.app._on_legacy_key_event(0x74, True)
+            self._drain_event_loop()
+            self.assertEqual(
+                self.app._voice_mic_gesture_sources_down,
+                {"legacy_f5"},
+            )
+            self.app._on_control_event(AudioStopped())
+            self.app._on_legacy_key_event(0x74, False)
+            self._drain_event_loop()
+
+        self.assertEqual(
+            calls,
+            [
+                ("down", DEFAULT_VOICE_TOKENS),
+                ("up", DEFAULT_VOICE_TOKENS),
+                ("down", DEFAULT_VOICE_TOKENS),
+                ("up", DEFAULT_VOICE_TOKENS),
+            ],
+        )
+        self.assertFalse(self.app._voice_mic_gesture_active)
+
+    def test_retired_f5_up_does_not_join_an_active_detection_gesture(self):
+        self.app._direct_hid_tap_active = False
+        self.app._on_button_event("mic", True, event_source="hid")
+        self.app._on_legacy_key_event(0x74, True)
+        self._drain_event_loop()
+        self.app._on_button_event("mic", False, event_source="hid")
+        self.app._on_control_event(AudioStopped())
+
+        self.assertTrue(self.app._legacy_f5_voice_blocked_until_up)
+        request = key_detection_bridge.request_detection(self.app._config_root)
+        self.app._on_button_event("mic", True, event_source="hid")
+        self.assertEqual(key_detection_bridge.poll_detection(request), "mic")
+        self.assertEqual(self.app._key_detection_mic_sources_down, {"hid"})
+
+        self.app._on_legacy_key_event(0x74, False)
+        self._drain_event_loop()
+
+        self.assertFalse(self.app._legacy_f5_voice_blocked_until_up)
+        self.assertEqual(self.app._key_detection_mic_sources_down, {"hid"})
+        self.app._on_button_event("mic", False, event_source="hid")
+
+    def test_stray_hid_tap_up_does_not_unlock_audio_continuation(self):
+        calls = []
+        with mock.patch.object(
+            win32_input,
+            "send_voice_key_combo_down",
+            side_effect=lambda tokens: calls.append(("down", tokens)),
+        ), mock.patch.object(
+            win32_input,
+            "send_voice_key_combo_up",
+            side_effect=lambda tokens: calls.append(("up", tokens)),
+        ):
+            # Leave the queued down undispatched so AudioStarted must use the
+            # hook-state snapshot rather than event-loop timing.
+            self.app._on_legacy_key_event(0x74, True)
+            self.app._on_control_event(AudioStarted(session_id=1))
+            self.app._on_button_event("mic", False, event_source="hid_tap")
+
+            self.assertEqual(calls, [("down", DEFAULT_VOICE_TOKENS)])
+            self.assertTrue(self.app._voice.active)
+            self.assertTrue(self.app._voice_audio_stream_active)
+
+            self.app._on_control_event(AudioStopped())
+            self.app._on_control_event(AudioStarted(session_id=2))
+
+            self.assertEqual(
+                calls,
+                [
+                    ("down", DEFAULT_VOICE_TOKENS),
+                    ("up", DEFAULT_VOICE_TOKENS),
+                ],
+            )
+            self.assertFalse(self.app._voice.active)
+            self.assertEqual(
+                self.app._voice_mic_gesture_sources_down,
+                {"legacy_f5"},
+            )
+
+            self.app._on_control_event(AudioStopped())
+            self.app._on_legacy_key_event(0x74, False)
+            self._drain_event_loop()
+            self.assertFalse(self.app._voice_mic_gesture_active)
+
+            self.app._on_control_event(AudioStarted(session_id=3))
+            self.app._on_control_event(AudioStopped())
+
+        self.assertEqual(
+            calls,
+            [
+                ("down", DEFAULT_VOICE_TOKENS),
+                ("up", DEFAULT_VOICE_TOKENS),
+                ("down", DEFAULT_VOICE_TOKENS),
+                ("up", DEFAULT_VOICE_TOKENS),
+            ],
+        )
+
+    def test_first_hid_tap_press_retires_a_stopped_startup_gesture(self):
+        calls = []
+        self.app._direct_hid_tap_active = False
+        with mock.patch.object(
+            win32_input,
+            "send_voice_key_combo_down",
+            side_effect=lambda tokens: calls.append(("down", tokens)),
+        ), mock.patch.object(
+            win32_input,
+            "send_voice_key_combo_up",
+            side_effect=lambda tokens: calls.append(("up", tokens)),
+        ):
+            self.app._on_legacy_key_event(0x74, True)
+            self._drain_event_loop()
+            self.app._on_control_event(AudioStarted(session_id=1))
+            self.app._on_control_event(AudioStopped())
+            self.app._on_button_event("mic", True, event_source="hid")
+            self.app._on_control_event(AudioStarted(session_id=2))
+
+            self.app._direct_hid_tap_active = True
+            self.app._on_button_event("mic", True, event_source="hid_tap")
+
+            self.assertEqual(
+                calls,
+                [
+                    ("down", DEFAULT_VOICE_TOKENS),
+                    ("up", DEFAULT_VOICE_TOKENS),
+                    ("down", DEFAULT_VOICE_TOKENS),
+                ],
+            )
+            self.assertEqual(
+                self.app._voice_mic_gesture_sources_down,
+                {"hid_tap"},
+            )
+            self.assertTrue(self.app._legacy_f5_voice_blocked_until_up)
+
+            self.app._on_legacy_key_event(0x74, False)
+            self._drain_event_loop()
+            self.assertTrue(self.app._voice.active)
+
+            self.app._on_button_event("mic", False, event_source="hid_tap")
+            self.app._on_control_event(AudioStopped())
+
+        self.assertEqual(
+            calls,
+            [
+                ("down", DEFAULT_VOICE_TOKENS),
+                ("up", DEFAULT_VOICE_TOKENS),
+                ("down", DEFAULT_VOICE_TOKENS),
+                ("up", DEFAULT_VOICE_TOKENS),
+            ],
+        )
+        self.assertFalse(self.app._voice.active)
+
     def test_direct_hid_session_is_independent_from_legacy_f5(self):
         calls = []
+        self.app._direct_hid_tap_active = True
         with mock.patch.object(
             win32_input,
             "send_voice_key_combo_down",
@@ -1367,6 +1768,10 @@ class VoiceMappingProductBoundaryTests(_AppWiringTestCase):
             self.app._on_legacy_key_event(0x74, False)
             self._drain_event_loop()
             self.assertTrue(self.app._voice.active)
+            self.assertEqual(
+                self.app._voice_mic_gesture_sources_down,
+                {"hid_tap"},
+            )
             self.app._on_button_event("mic", False, event_source="hid_tap")
 
         self.assertEqual(
@@ -1649,6 +2054,44 @@ class LiveBridgeKeyDetectionTests(_AppWiringTestCase):
         self.assertEqual(self.app._ble_session.mic_open_calls, 0)
         self.assertEqual(self.app._ble_session.mic_close_calls, 0)
 
+    def test_detection_requested_mid_voice_waits_for_the_next_press(self):
+        calls = []
+        with mock.patch.object(
+            win32_input,
+            "send_voice_key_combo_down",
+            side_effect=lambda tokens: calls.append(("down", tokens)),
+        ), mock.patch.object(
+            win32_input,
+            "send_voice_key_combo_up",
+            side_effect=lambda tokens: calls.append(("up", tokens)),
+        ):
+            self.app._on_control_event(AudioStarted(session_id=1))
+            self.app._on_legacy_key_event(0x74, True)
+            self._drain_event_loop()
+
+            request = key_detection_bridge.request_detection(self.app._config_root)
+            self.app._on_button_event("mic", True, event_source="hid")
+            self.app._on_control_event(AudioStopped())
+            self.app._on_legacy_key_event(0x74, False)
+            self._drain_event_loop()
+
+            self.assertEqual(
+                calls,
+                [
+                    ("down", DEFAULT_VOICE_TOKENS),
+                    ("up", DEFAULT_VOICE_TOKENS),
+                ],
+            )
+            self.assertFalse(self.app._voice.active)
+            self.assertFalse(self.app._voice_mic_gesture_active)
+            self.assertIsNone(key_detection_bridge.poll_detection(request))
+
+            self.app._on_legacy_key_event(0x74, True)
+            self._drain_event_loop()
+            self.assertEqual(key_detection_bridge.poll_detection(request), "mic")
+            self.app._on_legacy_key_event(0x74, False)
+            self._drain_event_loop()
+
     def test_atvv_first_detection_expires_and_next_normal_press_triggers_voice(self):
         clock = [100.0]
         request = key_detection_bridge.request_detection(self.app._config_root)
@@ -1900,6 +2343,7 @@ class CleanupOwnershipTests(_AppWiringTestCase):
 
     def test_cleanup_drops_queued_f5_and_resets_hook_deduplication(self):
         calls = []
+        dispatched = []
 
         with mock.patch.object(
             win32_input,
@@ -1919,6 +2363,22 @@ class CleanupOwnershipTests(_AppWiringTestCase):
         self.assertFalse(self.app._legacy_f5_is_down)
         self.assertFalse(self.app._voice.active)
         self.assertIsNone(self.app._voice_hotkey_release_pending)
+
+        self.app._accept_input_events = True
+        generation = self.app._legacy_voice_event_generation
+        with mock.patch.object(
+            self.app,
+            "_dispatch_legacy_key_event",
+            side_effect=lambda queued_generation, is_pressed: dispatched.append(
+                (queued_generation, is_pressed)
+            ),
+        ):
+            self.app._on_legacy_key_event(0x74, True)
+            self.app._on_legacy_key_event(0x74, False)
+            self._drain_event_loop()
+
+        self.assertEqual(dispatched, [(generation, True), (generation, False)])
+        self.assertFalse(self.app._legacy_f5_is_down)
 
     def test_cleanup_never_releases_alt_without_bridge_owned_down(self):
         with mock.patch.object(win32_input, "send_voice_key_combo_up") as release:

@@ -48,6 +48,16 @@
    `bugs/BUG-025-bridge-startup-readiness-warning.md`、
    `bugs/BUG-026-bridge-liveness-and-first-key-readiness.md` 和 `TESTING.md`。
 
+### 2026-08-30 修正语音长按后的跨轮按键残留
+
+- 修正音频已经停止、Raw Input 话筒 down 却迟到时被误认成下一轮的问题；迟到边沿
+  现在并回原手势，不会额外发送一个没有匹配抬起的宿主快捷键按下。
+- legacy F5 继续只负责阻止原生 F5 泄漏，并辅助已有手势收尾；它不会启动、发送或
+  释放宿主语音快捷键。迟到 F5 up 也不能串入下一轮、普通映射或按键检测。
+- 完整 unittest 1633 项通过、7 项按平台条件跳过，公开边界、语法、依赖和 diff
+  检查通过。本轮不构建、不打包；真实 RC003 长按后立即键入和操作鼠标仍为检查点
+  待实测。
+
 ### 2026-08-29 BLE 控制与阻塞音频播放隔离
 
 - 解码后 PCM 改为快速进入 64 帧有界 FIFO，PortAudio 阻塞写入由独立播放
