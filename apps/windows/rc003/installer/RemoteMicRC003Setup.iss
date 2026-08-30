@@ -25,7 +25,7 @@
 ;     before PyInstaller ran, the frozen DistDir may contain it as optional
 ;     application data; runtime verifies it again before use.
 
-#define AppName "Remote Mic · RC003"
+#define AppName "Remote Mic · 小米遥控器2 Pro"
 #define AppPublisher "Remote Mic contributors"
 #define AppVersion "0.1.0-candidate"
 #define AppExeName "RemoteMicRC003.exe"

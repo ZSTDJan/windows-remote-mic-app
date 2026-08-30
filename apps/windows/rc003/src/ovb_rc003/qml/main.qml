@@ -209,17 +209,6 @@ ApplicationWindow {
                     checked: tabBar.currentIndex === 2
                     onPressed: tabBar.currentIndex = 2
                     Accessible.name: text
-                    KeyNavigation.tab: generalTabButton
-                }
-                NavButton {
-                    id: generalTabButton
-                    objectName: "generalTabButton"
-                    tokens: window.tokens
-                    text: qsTr("常规")
-                    glyph: "\uE713"
-                    checked: tabBar.currentIndex === 3
-                    onPressed: tabBar.currentIndex = 3
-                    Accessible.name: text
                     KeyNavigation.tab: deviceTabButton
                 }
             }
@@ -256,7 +245,6 @@ ApplicationWindow {
                         VoicePage { tokens: window.tokens }
                     }
                 }
-                GeneralPage { tokens: window.tokens }
             }
 
             Rectangle {

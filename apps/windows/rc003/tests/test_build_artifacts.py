@@ -1187,7 +1187,7 @@ class RootDocumentConsistencyTests(unittest.TestCase):
         self.notices_text = _THIRD_PARTY_NOTICES_PATH.read_text(encoding="utf-8")
 
     def test_root_readme_does_not_lump_windows_in_with_planned_research(self):
-        self.assertIn("Windows 版本（RC003）", self.root_readme_text)
+        self.assertIn("Windows 版本（小米遥控器2 Pro）", self.root_readme_text)
         self.assertIn("Windows 客户端位于", self.root_readme_text)
         self.assertIn("源码/构建候选", self.root_readme_text)
         self.assertIn("不能替代", self.root_readme_text)
@@ -1420,7 +1420,7 @@ class PortableAndInstallerFlowContractTests(unittest.TestCase):
 
     def test_portable_flow_explicitly_denies_start_menu_entries(self):
         portable_section_start = self.text.index("方式二：便携版")
-        portable_section_end = self.text.index("### 配对 RC003")
+        portable_section_end = self.text.index("### 配对小米遥控器2 Pro")
         portable_section = self.text[portable_section_start:portable_section_end]
         self.assertIn("没有", portable_section)
         self.assertIn("Start Menu", portable_section)

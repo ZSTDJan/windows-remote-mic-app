@@ -15,6 +15,8 @@ import sys
 import threading
 from typing import Callable
 
+from . import device_catalog
+
 
 WM_DESTROY = 0x0002
 WM_CLOSE = 0x0010
@@ -119,7 +121,7 @@ class BridgeTray:
         on_open_settings: Callable[[], None],
         on_exit_requested: Callable[[], None],
         status_handler: Callable[[str], None] | None = None,
-        tooltip: str = "Remote Mic · RC003 bridge",
+        tooltip: str = f"Remote Mic · {device_catalog.RC003_DISPLAY_NAME}",
         show_icon: bool = True,
     ) -> None:
         self._on_open_settings = on_open_settings

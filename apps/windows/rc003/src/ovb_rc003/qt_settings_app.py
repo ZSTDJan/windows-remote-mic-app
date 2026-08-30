@@ -842,7 +842,7 @@ def _load_qt_classes() -> dict:
         _DEVICE_PAGE_INDEX = 0
         _BUTTONS_PAGE_INDEX = 1
         _VOICE_PAGE_INDEX = 2
-        _GENERAL_PAGE_INDEX = 3
+        _DESKTOP_BEHAVIOR_PAGE_INDEX = _DEVICE_PAGE_INDEX
         _KEY_DETECTION_TIMEOUT_SECONDS = key_detection_bridge.STALE_AFTER_SECONDS
         _KEY_DETECTION_USAGE_TO_BUTTON = {
             usage: button_id
@@ -973,12 +973,17 @@ def _load_qt_classes() -> dict:
                 bridge_launcher.PendingBridgeLaunch
             ] = None
             if self._bridge_connected:
-                self._launch_status_text = "服务运行中；RC003 已连接"
+                self._launch_status_text = (
+                    f"服务运行中；{device_catalog.RC003_DISPLAY_NAME} 已连接"
+                )
             elif self._bridge_running:
                 self._launch_status_text = (
-                    "服务运行中；等待 RC003 连接"
+                    f"服务运行中；等待{device_catalog.RC003_DISPLAY_NAME} 连接"
                     if runtime_status is not None
-                    else "服务运行中；RC003 状态未知，正在检查"
+                    else (
+                        f"服务运行中；{device_catalog.RC003_DISPLAY_NAME} 状态未知，"
+                        "正在检查"
+                    )
                 )
             self._has_explicit_launch_result = False
             self._status_message = (
@@ -1420,12 +1425,15 @@ def _load_qt_classes() -> dict:
                 self._set_status_message("")
                 self._set_error_message(
                     f"常规设置保存失败：{type(exc).__name__}",
-                    self._GENERAL_PAGE_INDEX,
+                    self._DESKTOP_BEHAVIOR_PAGE_INDEX,
                 )
                 return False
             self._config = saved
             self._set_error_message("")
-            self._set_status_message("常规设置已保存。", self._GENERAL_PAGE_INDEX)
+            self._set_status_message(
+                "启动与窗口设置已保存。",
+                self._DESKTOP_BEHAVIOR_PAGE_INDEX,
+            )
             return True
 
         def _tray_icon_state(self) -> str:
@@ -1473,19 +1481,25 @@ def _load_qt_classes() -> dict:
             if running:
                 if connected:
                     self._set_bridge_launch_phase("connected")
-                    self._set_launch_status("服务运行中；RC003 已连接")
+                    self._set_launch_status(
+                        f"服务运行中；{device_catalog.RC003_DISPLAY_NAME} 已连接"
+                    )
                 else:
                     self._set_bridge_launch_phase("waiting")
                     if self._has_explicit_launch_result:
                         self._set_launch_status(
-                            "服务运行中；等待 RC003 连接，首次可能约 1 分钟"
+                            f"服务运行中；等待{device_catalog.RC003_DISPLAY_NAME} 连接，"
+                            "首次可能约 1 分钟"
                         )
                     elif runtime_status is None:
                         self._set_launch_status(
-                            "服务运行中；RC003 状态未知，正在检查"
+                            f"服务运行中；{device_catalog.RC003_DISPLAY_NAME} 状态未知，"
+                            "正在检查"
                         )
                     else:
-                        self._set_launch_status("服务运行中；等待 RC003 连接")
+                        self._set_launch_status(
+                            f"服务运行中；等待{device_catalog.RC003_DISPLAY_NAME} 连接"
+                        )
                 return
 
             previous_phase = self._bridge_launch_phase
@@ -2642,9 +2656,9 @@ def _load_qt_classes() -> dict:
         trayTooltip = Property(
             str,
             lambda self: (
-                "Remote Mic：RC003 已连接"
+                f"Remote Mic：{device_catalog.RC003_DISPLAY_NAME} 已连接"
                 if self._bridge_connected
-                else "Remote Mic：服务运行中，等待 RC003"
+                else f"Remote Mic：服务运行中，等待{device_catalog.RC003_DISPLAY_NAME}"
                 if self._bridge_running
                 else "Remote Mic：服务未启动"
             ),
@@ -2708,7 +2722,7 @@ def _load_qt_classes() -> dict:
         def _set_active_page_index(self, value: int) -> None:
             value = max(
                 self._DEVICE_PAGE_INDEX,
-                min(self._GENERAL_PAGE_INDEX, int(value)),
+                min(self._VOICE_PAGE_INDEX, int(value)),
             )
             if value == self._active_page_index:
                 return
@@ -2743,6 +2757,11 @@ def _load_qt_classes() -> dict:
             ]
 
         deviceOptions = Property(list, _get_device_options, constant=True)
+        remoteDisplayName = Property(
+            str,
+            lambda self: device_catalog.RC003_DISPLAY_NAME,
+            constant=True,
+        )
 
         def _get_device_catalog_available(self) -> bool:
             return device_catalog.CATALOG_ERROR is None
@@ -2948,7 +2967,7 @@ def _load_qt_classes() -> dict:
                 self._set_status_message("")
                 self._set_error_message(
                     f"无法修改随 Windows 启动：{result.error}",
-                    self._GENERAL_PAGE_INDEX,
+                    self._DESKTOP_BEHAVIOR_PAGE_INDEX,
                 )
                 return
             self._launch_at_login = result.enabled
@@ -2958,7 +2977,7 @@ def _load_qt_classes() -> dict:
                 "已启用随 Windows 启动。"
                 if result.enabled
                 else "已关闭随 Windows 启动。",
-                self._GENERAL_PAGE_INDEX,
+                self._DESKTOP_BEHAVIOR_PAGE_INDEX,
             )
 
         @Slot(bool)
@@ -3138,7 +3157,9 @@ def _load_qt_classes() -> dict:
                     )
                     return
             if self._selected_device_id() != device_catalog.RC003_ID:
-                self._set_key_detection_text("当前设备不是 RC003；无法检测遥控器按键")
+                self._set_key_detection_text(
+                    f"当前设备不是{device_catalog.RC003_DISPLAY_NAME}；无法检测遥控器按键"
+                )
                 return
             bridge_running = self._refresh_bridge_status()
             if bridge_running is None:

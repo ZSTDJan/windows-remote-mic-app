@@ -17,7 +17,7 @@ class DeviceCatalogTests(unittest.TestCase):
         )
         rc003 = device_catalog.profile_for(device_catalog.RC003_ID)
         dji = device_catalog.profile_for(device_catalog.DJI_MIC_2_ID)
-        self.assertEqual(rc003.display_name, "Xiaomi Bluetooth Remote 2 Pro / RC003")
+        self.assertEqual(rc003.display_name, "小米遥控器2 Pro")
         self.assertEqual(rc003.support_status, "research")
         self.assertIn("真机配对、按键和语音链路仍需继续验收", rc003.description)
         self.assertNotIn("source/build candidate", rc003.description)

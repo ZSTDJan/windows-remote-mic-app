@@ -526,15 +526,20 @@ def default_display_state() -> DefaultDisplayState:
 # "RC003 已连接"/"RC003 connected" - only as the process itself still being
 # alive. The settings controller continues polling the runtime status and
 # promotes the UI to the connected state only after the bridge reports it.
-LAUNCH_NOT_STARTED_TEXT = "服务未运行；点击“启动”后，按键和语音才会生效"
-LAUNCH_ALREADY_RUNNING_TEXT = "服务已在运行；正在检查 RC003 连接"
+LAUNCH_NOT_STARTED_TEXT = "服务未运行；点击“启动桥接”后，按键和语音才会生效"
+LAUNCH_ALREADY_RUNNING_TEXT = (
+    f"服务已在运行；正在检查{device_catalog.RC003_DISPLAY_NAME}的连接"
+)
 LAUNCH_STATUS_UNKNOWN_TEXT = "无法确认服务状态；请查看 app.log，勿重复启动"
 
 
 def describe_launch_result(result: bridge_launcher.LaunchResult) -> str:
     if result.outcome is bridge_launcher.LaunchOutcome.STARTED:
         pid_text = f"（PID {result.pid}）" if result.pid is not None else ""
-        return f"服务已启动{pid_text}；正在连接 RC003，首次可能约 1 分钟"
+        return (
+            f"服务已启动{pid_text}；正在连接{device_catalog.RC003_DISPLAY_NAME}，"
+            "首次可能约 1 分钟"
+        )
     if result.outcome is bridge_launcher.LaunchOutcome.ALREADY_RUNNING:
         return f"服务已在运行（代码 {result.exit_code}）；无需重复启动"
     if result.outcome is bridge_launcher.LaunchOutcome.STATUS_UNKNOWN:

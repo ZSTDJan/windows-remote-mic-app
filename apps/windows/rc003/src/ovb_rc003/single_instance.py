@@ -391,7 +391,7 @@ class BridgeInstanceGuard:
         _release_mutex: ReleaseMutexFn = _real_release_mutex,
         _close_handle: CloseHandleFn = _real_close_handle,
         _duplicate_message: str = (
-            "another Remote Mic RC003 instance is already running in this Windows session"
+            "another Remote Mic bridge instance is already running in this Windows session"
         ),
         _access_denied_means_duplicate: bool = False,
     ) -> None:
@@ -511,7 +511,7 @@ def _real_message_box(title: str, message: str) -> int:
 def show_bridge_startup_blocked_notice(
     message: str,
     *,
-    title: str = "Remote Mic · RC003",
+    title: str = "Remote Mic",
     _message_box: Callable[[str, str], int] = _real_message_box,
 ) -> None:
     """Shows a visible Windows message box for a bridge launch the
@@ -529,4 +529,4 @@ def show_bridge_startup_blocked_notice(
     try:
         _message_box(title, message)
     except Exception:
-        print(f"Remote Mic RC003: {message}", file=sys.stderr)
+        print(f"Remote Mic: {message}", file=sys.stderr)

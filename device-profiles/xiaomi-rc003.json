@@ -1,12 +1,12 @@
 {
   "schemaVersion": 1,
   "id": "xiaomi-rc003",
-  "displayName": "Xiaomi Bluetooth Remote 2 Pro / RC003",
+  "displayName": "小米遥控器2 Pro",
   "vendor": "Xiaomi",
   "model": "RC003",
   "support": {
     "status": "research",
-    "notes": "Windows 客户端已具备设置与运行能力；RC003 真机配对、按键和语音链路仍需继续验收。"
+    "notes": "Windows 客户端已具备设置与运行能力；小米遥控器2 Pro 真机配对、按键和语音链路仍需继续验收。"
   },
   "identity": {
     "bluetoothNames": [

@@ -342,6 +342,11 @@ DEVICE_PROFILES: Tuple[DeviceUiProfile, ...] = (
     DEFAULT_CATALOG.profiles if DEFAULT_CATALOG is not None else ()
 )
 DEVICE_PROFILE_BY_ID = {profile.device_id: profile for profile in DEVICE_PROFILES}
+RC003_DISPLAY_NAME = (
+    DEVICE_PROFILE_BY_ID[RC003_ID].display_name
+    if RC003_ID in DEVICE_PROFILE_BY_ID
+    else "小米遥控器2 Pro"
+)
 
 
 def normalize_device_id(value: object) -> str:

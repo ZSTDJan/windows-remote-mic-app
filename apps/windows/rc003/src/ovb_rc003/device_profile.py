@@ -11,7 +11,7 @@ token "dev_vid&012717_pid&32b8_rev&00a4" confirms VID 0x2717 / PID 0x32B8).
 
 from __future__ import annotations
 
-DISPLAY_NAME = "Xiaomi Bluetooth Remote 2 Pro / RC003"
+DISPLAY_NAME = "小米遥控器2 Pro"
 VENDOR = "Xiaomi"
 MODEL = "RC003"
 

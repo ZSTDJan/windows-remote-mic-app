@@ -114,7 +114,7 @@ Item {
                     titleText: qsTr("当前设备")
                     descriptionText: root.combinedDetail(
                         ["ble_candidate"],
-                        qsTr("小米蓝牙语音遥控器 2 Pro（RC003）")
+                        SettingsController.remoteDisplayName
                     )
                     stateText: root.combinedStatus(["ble_candidate"])
                     stateColor: root.combinedColor(["ble_candidate"])
@@ -172,7 +172,7 @@ Item {
                         tokens: root.tokens
                         compactMinimumWidth: tokens.buttonWidth4Chars
                         text: SettingsController.bridgeLaunchBusy
-                            ? qsTr("启动中…") : qsTr("启动")
+                            ? qsTr("启动中…") : qsTr("启动桥接")
                         highlighted: true
                         enabled: !SettingsController.bridgeLaunchBusy
                             && !DiagnosticsController.vbCableTestRunning
@@ -194,6 +194,73 @@ Item {
                         compactMinimumWidth: tokens.buttonWidth4Chars
                         text: qsTr("日志目录")
                         onClicked: SettingsController.openLogLocation()
+                    }
+                }
+            }
+
+            SectionFrame {
+                objectName: "desktopBehaviorSection"
+                tokens: root.tokens
+                Layout.fillWidth: true
+                horizontalPadding: 0
+                verticalPadding: 0
+                contentSpacing: 0
+
+                SettingsListRow {
+                    objectName: "launchAtLoginRow"
+                    tokens: root.tokens
+                    iconGlyph: "\uE7E8"
+                    titleText: qsTr("随 Windows 启动")
+                    descriptionText: qsTr("登录后在通知区域后台运行 Remote Mic")
+
+                    Switch {
+                        id: launchAtLoginSwitch
+                        objectName: "launchAtLoginSwitch"
+                        checked: SettingsController.launchAtLogin
+                        Accessible.name: qsTr("随 Windows 启动")
+                        onToggled: {
+                            if (checked !== SettingsController.launchAtLogin)
+                                SettingsController.setLaunchAtLogin(checked)
+                        }
+                    }
+                }
+
+                SettingsListRow {
+                    objectName: "launchBridgeOnAppStartRow"
+                    tokens: root.tokens
+                    iconGlyph: "\uE768"
+                    titleText: qsTr("启动程序时自动启动桥接")
+                    descriptionText: qsTr("相当于自动点击一次“启动桥接”，与随 Windows 启动互不绑定")
+
+                    Switch {
+                        id: launchBridgeOnAppStartSwitch
+                        objectName: "launchBridgeOnAppStartSwitch"
+                        checked: SettingsController.launchBridgeOnAppStart
+                        Accessible.name: qsTr("启动程序时自动启动桥接")
+                        onToggled: {
+                            if (checked !== SettingsController.launchBridgeOnAppStart)
+                                SettingsController.setLaunchBridgeOnAppStart(checked)
+                        }
+                    }
+                }
+
+                SettingsListRow {
+                    objectName: "closeBehaviorRow"
+                    tokens: root.tokens
+                    iconGlyph: "\uE711"
+                    titleText: qsTr("关闭窗口时")
+                    descriptionText: qsTr("最小化按钮仍正常保留在任务栏")
+                    showDivider: false
+
+                    SelectionComboBox {
+                        id: closeBehaviorCombo
+                        objectName: "closeBehaviorCombo"
+                        tokens: root.tokens
+                        implicitWidth: 148
+                        model: SettingsController.closeBehaviorOptions
+                        currentIndex: SettingsController.closeBehavior === "quit" ? 1 : 0
+                        Accessible.name: qsTr("关闭窗口时")
+                        onActivated: SettingsController.setCloseBehaviorIndex(index)
                     }
                 }
             }

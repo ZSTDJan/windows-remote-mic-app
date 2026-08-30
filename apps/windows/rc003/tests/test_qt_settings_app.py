@@ -502,6 +502,7 @@ class SettingsControllerTests(unittest.TestCase):
 
         setter.assert_called_once_with(True)
         self.assertTrue(controller.launchAtLogin)
+        self.assertFalse(controller.launchBridgeOnAppStart)
 
     def test_application_start_option_reuses_the_normal_bridge_start(self):
         controller, _model = self._make_controller()
@@ -512,6 +513,7 @@ class SettingsControllerTests(unittest.TestCase):
         controller.startBridgeOnApplicationStart()
 
         self.assertEqual(calls, [True])
+        self.assertFalse(controller.launchAtLogin)
 
     def test_full_exit_waits_for_the_bridge_to_stop(self):
         controller, _model = self._make_controller()
@@ -1229,7 +1231,7 @@ class SettingsControllerTests(unittest.TestCase):
         self.assertTrue(controller.bridgeRunning)
         self.assertTrue(controller.bridgeConnected)
         self.assertEqual(controller.bridgeLaunchPhase, "connected")
-        self.assertIn("RC003 已连接", controller.launchStatusText)
+        self.assertIn("小米遥控器2 Pro 已连接", controller.launchStatusText)
 
     def test_live_bridge_refresh_tracks_external_start_and_exit(self):
         controller, _ = self._make_controller()
@@ -4791,7 +4793,6 @@ class SettingsShellSourceContractTests(unittest.TestCase):
         self.main_qml = (qml_dir / "main.qml").read_text(encoding="utf-8")
         self.device_qml = (qml_dir / "DevicePage.qml").read_text(encoding="utf-8")
         self.voice_qml = (qml_dir / "VoicePage.qml").read_text(encoding="utf-8")
-        self.general_qml = (qml_dir / "GeneralPage.qml").read_text(encoding="utf-8")
         self.buttons_qml = (qml_dir / "ButtonsPage.qml").read_text(
             encoding="utf-8"
         )
@@ -5009,16 +5010,21 @@ class SettingsShellSourceContractTests(unittest.TestCase):
         for inset in ("leftInset", "rightInset", "topInset", "bottomInset"):
             self.assertIn(f"{inset}: 0", self.nav_button_qml)
         self.assertIn('objectName: root.objectName + "_background"', self.nav_button_qml)
-        self.assertEqual(self.main_qml.count("onPressed: tabBar.currentIndex ="), 4)
+        self.assertEqual(self.main_qml.count("onPressed: tabBar.currentIndex ="), 3)
         self.assertNotIn("onClicked: tabBar.currentIndex =", self.main_qml)
 
-    def test_general_page_owns_the_three_desktop_behavior_options(self):
-        self.assertIn('objectName: "launchAtLoginSwitch"', self.general_qml)
-        self.assertIn('objectName: "launchBridgeOnAppStartSwitch"', self.general_qml)
-        self.assertIn('objectName: "closeBehaviorCombo"', self.general_qml)
-        self.assertIn("SettingsController.setLaunchAtLogin", self.general_qml)
-        self.assertIn("SettingsController.setLaunchBridgeOnAppStart", self.general_qml)
-        self.assertIn("SettingsController.setCloseBehaviorIndex", self.general_qml)
+    def test_device_page_owns_the_three_desktop_behavior_options(self):
+        self.assertIn('objectName: "desktopBehaviorSection"', self.device_qml)
+        self.assertIn('objectName: "launchAtLoginSwitch"', self.device_qml)
+        self.assertIn('objectName: "launchBridgeOnAppStartSwitch"', self.device_qml)
+        self.assertIn('objectName: "closeBehaviorCombo"', self.device_qml)
+        self.assertIn("SettingsController.setLaunchAtLogin", self.device_qml)
+        self.assertIn("SettingsController.setLaunchBridgeOnAppStart", self.device_qml)
+        self.assertIn("SettingsController.setCloseBehaviorIndex", self.device_qml)
+        self.assertIn('titleText: qsTr("启动程序时自动启动桥接")', self.device_qml)
+        self.assertIn("与随 Windows 启动互不绑定", self.device_qml)
+        self.assertNotIn("GeneralPage", self.main_qml)
+        self.assertNotIn('objectName: "generalTabButton"', self.main_qml)
         self.assertIn('objectName: "systemTrayIcon"', self.main_qml)
         self.assertIn("SettingsController.requestApplicationExit()", self.main_qml)
 
@@ -5265,20 +5271,25 @@ class ThreePageSettingsSourceContractTests(unittest.TestCase):
             "connectionTabButton",
             "permissionsTabButton",
             "diagnosticsTabButton",
+            "generalTabButton",
             "PermissionsPage",
             "DiagnosticsPage",
+            "GeneralPage",
         ):
             self.assertNotIn(retired, self.main_qml)
         self.assertIn("DevicePage {", self.main_qml)
         self.assertIn("ButtonsPage {", self.main_qml)
         self.assertIn("VoicePage {", self.main_qml)
 
-    def test_device_page_is_four_inline_rows_without_save_or_stop(self):
+    def test_device_page_contains_device_and_desktop_behavior_rows(self):
         for object_name in (
             "currentDeviceRow",
             "buttonReceiverRow",
             "remoteServiceRow",
             "runtimeLogRow",
+            "launchAtLoginRow",
+            "launchBridgeOnAppStartRow",
+            "closeBehaviorRow",
         ):
             self.assertIn(f'objectName: "{object_name}"', self.device_qml)
         for button_name in (
@@ -5293,6 +5304,8 @@ class ThreePageSettingsSourceContractTests(unittest.TestCase):
         self.assertNotIn("SettingsController.saveSettings()", self.device_qml)
         self.assertNotIn("stopBridge", self.device_qml)
         self.assertNotIn('text: qsTr("设备")', self.device_qml)
+        self.assertIn("SettingsController.remoteDisplayName", self.device_qml)
+        self.assertIn('qsTr("启动桥接")', self.device_qml)
 
     def test_diagnostics_are_reused_inside_their_own_rows(self):
         for check_id in ("os_version", "raw_input", "ble_candidate"):
@@ -5886,17 +5899,17 @@ class OffscreenQmlLoadTests(unittest.TestCase):
                 )
                 self.assertFalse(data["connection"]["save_highlighted"])
                 self.assertTrue(data["connection"]["launch_highlighted"])
-                self.assertNotIn("RC003 已连接", data["connection"]["launch_status"])
+                self.assertNotIn("小米遥控器2 Pro 已连接", data["connection"]["launch_status"])
                 waiting_progress = data["connection"]["waiting_progress"]
                 self.assertTrue(waiting_progress["visible"])
                 self.assertTrue(waiting_progress["indicator_running"])
-                self.assertIn("等待 RC003 连接", waiting_progress["stage_text"])
+                self.assertIn("等待小米遥控器2 Pro 连接", waiting_progress["stage_text"])
                 self.assertTrue(waiting_progress["elapsed_visible"])
                 self.assertEqual(waiting_progress["elapsed_text"], "12 秒")
                 connected_progress = data["connection"]["connected_progress"]
                 self.assertTrue(connected_progress["visible"])
                 self.assertFalse(connected_progress["indicator_running"])
-                self.assertIn("RC003 已连接", connected_progress["stage_text"])
+                self.assertIn("小米遥控器2 Pro 已连接", connected_progress["stage_text"])
 
                 permission_items = data["permissions"]["items"]
                 self.assertTrue(permission_items["requiredPermissionsSection"]["visible"])

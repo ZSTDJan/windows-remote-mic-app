@@ -53,9 +53,13 @@ from typing import Callable, List, Optional, Sequence, Tuple
 from . import audio_output
 from . import audio_playback
 from . import ble_transport_winrt
+from . import device_catalog
 from . import identity
 from . import raw_input_windows
 from . import single_instance
+
+_REMOTE_DISPLAY_NAME = device_catalog.RC003_DISPLAY_NAME
+_BLE_CANDIDATE_TITLE = f"{_REMOTE_DISPLAY_NAME} 蓝牙配对"
 
 # Windows 10 version 1809's build number - the lowest build this project's
 # own README/installer already claim as the supported floor (see
@@ -210,7 +214,7 @@ def check_raw_input(
             "Raw Input 按键设备",
             CheckGroup.ORDINARY_BUTTONS,
             CheckStatus.FAIL,
-            "未找到 RC003 Raw Input 设备；请先完成蓝牙配对",
+            f"未找到{_REMOTE_DISPLAY_NAME}的按键设备；请先完成蓝牙配对",
         )
     if count > 1:
         return CheckResult(
@@ -225,7 +229,7 @@ def check_raw_input(
         "Raw Input 按键设备",
         CheckGroup.ORDINARY_BUTTONS,
         CheckStatus.PASS,
-        "RC003 按键设备已找到",
+        f"{_REMOTE_DISPLAY_NAME} 按键设备已找到",
     )
 
 
@@ -1136,10 +1140,10 @@ def check_ble_candidate(
         if sys.platform != "win32":
             return CheckResult(
                 "ble_candidate",
-                "已配对的 RC003 (BLE)",
+                _BLE_CANDIDATE_TITLE,
                 CheckGroup.VOICE_BRIDGE,
                 CheckStatus.UNSUPPORTED,
-                "仅 Windows 可检测已配对的 RC003",
+                f"仅 Windows 可检测已配对的{_REMOTE_DISPLAY_NAME}",
             )
         # RETRY 3 (independent review): this used to interpolate str(exc)
         # here. The real production message this raises today is API-only,
@@ -1150,7 +1154,7 @@ def check_ble_candidate(
         # thing its docstring promises never happens).
         return CheckResult(
             "ble_candidate",
-            "已配对的 RC003 (BLE)",
+            _BLE_CANDIDATE_TITLE,
             CheckGroup.VOICE_BRIDGE,
             CheckStatus.UNSUPPORTED,
             "WinRT 蓝牙组件不可用；请检查安装后重试",
@@ -1163,7 +1167,7 @@ def check_ble_candidate(
         # routine "please retry" cancellation.
         return CheckResult(
             "ble_candidate",
-            "已配对的 RC003 (BLE)",
+            _BLE_CANDIDATE_TITLE,
             CheckGroup.VOICE_BRIDGE,
             CheckStatus.FAIL,
             "未能确认蓝牙检测进程已退出；请重启应用后重试",
@@ -1179,7 +1183,7 @@ def check_ble_candidate(
         # _run_ble_diagnostics_subprocess()).
         return CheckResult(
             "ble_candidate",
-            "已配对的 RC003 (BLE)",
+            _BLE_CANDIDATE_TITLE,
             CheckGroup.VOICE_BRIDGE,
             CheckStatus.FAIL,
             "蓝牙检测已取消或超时；请重新检测",
@@ -1192,7 +1196,7 @@ def check_ble_candidate(
         # never-surface-an-identifier contract.
         return CheckResult(
             "ble_candidate",
-            "已配对的 RC003 (BLE)",
+            _BLE_CANDIDATE_TITLE,
             CheckGroup.VOICE_BRIDGE,
             CheckStatus.FAIL,
             "BLE 检测失败；请重新检测",
@@ -1203,25 +1207,25 @@ def check_ble_candidate(
     except identity.NoCandidateFoundError:
         return CheckResult(
             "ble_candidate",
-            "已配对的 RC003 (BLE)",
+            _BLE_CANDIDATE_TITLE,
             CheckGroup.VOICE_BRIDGE,
             CheckStatus.FAIL,
-            "未找到已配对的 RC003；请先完成蓝牙配对",
+            f"未找到已配对的{_REMOTE_DISPLAY_NAME}；请先完成蓝牙配对",
         )
     except identity.AmbiguousCandidateError as exc:
         return CheckResult(
             "ble_candidate",
-            "已配对的 RC003 (BLE)",
+            _BLE_CANDIDATE_TITLE,
             CheckGroup.VOICE_BRIDGE,
             CheckStatus.FAIL,
-            f"找到 {exc.count} 个 RC003；请只保留 1 个已配对设备",
+            f"找到 {exc.count} 个{_REMOTE_DISPLAY_NAME}；请只保留 1 个已配对设备",
         )
     return CheckResult(
         "ble_candidate",
-        "已配对的 RC003 (BLE)",
+        _BLE_CANDIDATE_TITLE,
         CheckGroup.VOICE_BRIDGE,
         CheckStatus.PASS,
-        "已找到 1 个已配对的 RC003",
+        f"已找到 1 个已配对的{_REMOTE_DISPLAY_NAME}",
     )
 
 
@@ -1708,7 +1712,7 @@ def run_diagnostics(
         ("raw_input", "Raw Input 按键设备", CheckGroup.ORDINARY_BUTTONS, check_raw_input),
         (
             "ble_candidate",
-            "已配对的 RC003 (BLE)",
+            _BLE_CANDIDATE_TITLE,
             CheckGroup.VOICE_BRIDGE,
             lambda: check_ble_candidate(discover=ble_discover),
         ),

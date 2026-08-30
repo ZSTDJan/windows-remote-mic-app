@@ -689,7 +689,7 @@ class DescribeLaunchResultTests(unittest.TestCase):
         text = describe_launch_result(result)
         self.assertIn("123", text)
         self.assertIn("约 1 分钟", text)
-        self.assertNotIn("RC003 已连接", text)
+        self.assertNotIn("小米遥控器2 Pro 已连接", text)
         self.assertNotIn("已连接", text)
 
     def test_already_running_mentions_the_exit_code_and_is_distinct_from_quick_exit(self):
