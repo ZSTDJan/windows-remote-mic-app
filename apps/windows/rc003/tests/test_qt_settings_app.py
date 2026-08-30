@@ -4702,6 +4702,7 @@ capture_page(
     "devicePageContent",
     (
         "devicePrerequisiteSection",
+        "devicePrerequisiteSectionTitle",
         "currentDeviceRow",
         "buttonReceiverRow",
         "remoteServiceRow",
@@ -4730,9 +4731,12 @@ capture_page(
     "voicePageContent",
     (
         "audioPrerequisiteSection",
+        "audioPrerequisiteSectionTitle",
         "voiceProgramSection",
+        "voiceProgramSectionTitle",
         "voiceProgramCustomPathRow",
         "voiceTestSection",
+        "voiceTestSectionTitle",
     ),
 )
 
@@ -4914,6 +4918,9 @@ class SettingsShellSourceContractTests(unittest.TestCase):
         self.settings_list_row_qml = (qml_dir / "SettingsListRow.qml").read_text(
             encoding="utf-8"
         )
+        self.settings_section_title_qml = (
+            qml_dir / "SettingsSectionTitle.qml"
+        ).read_text(encoding="utf-8")
         self.diagnostic_result_row_qml = (
             qml_dir / "DiagnosticResultRow.qml"
         ).read_text(encoding="utf-8")
@@ -4966,6 +4973,35 @@ class SettingsShellSourceContractTests(unittest.TestCase):
         self.assertIn("AbstractButton {", self.mapping_card_qml)
         self.assertIn("implicitHeight: 49", self.mapping_card_qml)
         self.assertNotIn("mappingCardHeight", self.buttons_qml)
+
+    def test_settings_card_section_titles_share_one_compact_style(self):
+        self.assertIn("kind: bodyKind", self.settings_section_title_qml)
+        self.assertIn("font.weight: Font.Bold", self.settings_section_title_qml)
+        self.assertIn(
+            "Layout.leftMargin: tokens.spacingLarge",
+            self.settings_section_title_qml,
+        )
+        self.assertIn(
+            "Layout.topMargin: tokens.spacingSmall",
+            self.settings_section_title_qml,
+        )
+        self.assertIn(
+            "Layout.bottomMargin: tokens.spacingSmall",
+            self.settings_section_title_qml,
+        )
+        self.assertEqual(self.device_qml.count("SettingsSectionTitle {"), 2)
+        self.assertEqual(self.voice_qml.count("SettingsSectionTitle {"), 3)
+        for object_name in (
+            "devicePrerequisiteSectionTitle",
+            "desktopBehaviorSectionTitle",
+        ):
+            self.assertIn(f'objectName: "{object_name}"', self.device_qml)
+        for object_name in (
+            "audioPrerequisiteSectionTitle",
+            "voiceProgramSectionTitle",
+            "voiceTestSectionTitle",
+        ):
+            self.assertIn(f'objectName: "{object_name}"', self.voice_qml)
 
     def test_mapping_views_share_key_titles_and_combo_table_metrics(self):
         self.assertIn(
@@ -5726,6 +5762,14 @@ class OffscreenQmlLoadTests(unittest.TestCase):
                         self.assertLessEqual(item["right"], width + 1, item_name)
 
                 device_items = data["pages"]["device"]["items"]
+                self.assertGreaterEqual(
+                    device_items["devicePrerequisiteSectionTitle"]["y"],
+                    device_items["devicePrerequisiteSection"]["y"],
+                )
+                self.assertLessEqual(
+                    device_items["devicePrerequisiteSectionTitle"]["bottom"],
+                    device_items["currentDeviceRow"]["y"] + 1,
+                )
                 for first, second in (
                     ("currentDeviceRow", "buttonReceiverRow"),
                     ("buttonReceiverRow", "remoteServiceRow"),
@@ -5773,6 +5817,19 @@ class OffscreenQmlLoadTests(unittest.TestCase):
                     voice_items["voiceProgramCustomPathRow"]["bottom"],
                     voice_items["voiceProgramSection"]["bottom"] + 1,
                 )
+                for section_name, title_name in (
+                    ("audioPrerequisiteSection", "audioPrerequisiteSectionTitle"),
+                    ("voiceProgramSection", "voiceProgramSectionTitle"),
+                    ("voiceTestSection", "voiceTestSectionTitle"),
+                ):
+                    self.assertGreaterEqual(
+                        voice_items[title_name]["y"],
+                        voice_items[section_name]["y"],
+                    )
+                    self.assertLessEqual(
+                        voice_items[title_name]["bottom"],
+                        voice_items[section_name]["bottom"] + 1,
+                    )
 
                 voice_columns = data["voice_columns"]
                 action_columns = list(voice_columns["actions"].values())

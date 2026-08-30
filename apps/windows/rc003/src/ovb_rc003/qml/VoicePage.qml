@@ -390,10 +390,9 @@ Item {
                 verticalPadding: 4
                 contentSpacing: 0
 
-                UiLabel {
+                SettingsSectionTitle {
+                    objectName: "audioPrerequisiteSectionTitle"
                     tokens: root.tokens
-                    kind: sectionTitleKind
-                    Layout.leftMargin: 10
                     text: qsTr("音频前置")
                 }
 
@@ -505,10 +504,9 @@ Item {
                 verticalPadding: 4
                 contentSpacing: 0
 
-                UiLabel {
+                SettingsSectionTitle {
+                    objectName: "voiceProgramSectionTitle"
                     tokens: root.tokens
-                    kind: sectionTitleKind
-                    Layout.leftMargin: 10
                     text: qsTr("语音程序")
                 }
 
@@ -675,10 +673,9 @@ Item {
                 verticalPadding: 4
                 contentSpacing: 0
 
-                UiLabel {
+                SettingsSectionTitle {
+                    objectName: "voiceTestSectionTitle"
                     tokens: root.tokens
-                    kind: sectionTitleKind
-                    Layout.leftMargin: 10
                     text: qsTr("测试验证")
                 }
 

@@ -105,8 +105,14 @@ Item {
                 tokens: root.tokens
                 Layout.fillWidth: true
                 horizontalPadding: 0
-                verticalPadding: 0
+                verticalPadding: 4
                 contentSpacing: 0
+
+                SettingsSectionTitle {
+                    objectName: "devicePrerequisiteSectionTitle"
+                    tokens: root.tokens
+                    text: qsTr("设备状态")
+                }
 
                 InlineSettingsRow {
                     objectName: "currentDeviceRow"
@@ -206,11 +212,9 @@ Item {
                 verticalPadding: 4
                 contentSpacing: 0
 
-                UiLabel {
+                SettingsSectionTitle {
                     objectName: "desktopBehaviorSectionTitle"
                     tokens: root.tokens
-                    kind: sectionTitleKind
-                    Layout.leftMargin: 10
                     text: qsTr("通用设置")
                 }
 
