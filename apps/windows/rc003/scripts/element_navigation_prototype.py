@@ -113,6 +113,12 @@ RECTANGULAR_GRID_BALANCE_WEIGHT = 0.08
 RECTANGULAR_GRID_DISTANT_GAP_MIN = 2400
 RECTANGULAR_GRID_DISTANT_GAP_RATIO = 3.0
 RECTANGULAR_GRID_DISTANT_EXTENT_RATIO = 4.0
+SKELETON_LANE_MIN_UNITS = 0.75
+SKELETON_LANE_MAX_UNITS = 1.75
+SKELETON_LANE_SPAN_MULTIPLIER = 1.5
+SKELETON_PROMOTION_MIN_UNITS = 1.5
+SKELETON_ROUNDING_REFERENCE_UNIT = 60.0
+SKELETON_SUPPORT_MAX_GAP_UNITS = 32.0
 VK_RETURN = 0x0D
 VK_ESCAPE = 0x1B
 VK_PAGEUP = 0x21
@@ -1895,6 +1901,129 @@ def _navigation_lane_tolerance(
     return max(minimum, min(maximum, (current_span + target_span) * 0.75))
 
 
+def _navigation_perpendicular_center_offset(
+    current: Rect,
+    target: Rect,
+    direction: Direction,
+) -> float:
+    if direction in {Direction.LEFT, Direction.RIGHT}:
+        return abs(target.center_y - current.center_y)
+    return abs(target.center_x - current.center_x)
+
+
+def _navigation_forward_center_distance(
+    current: Rect,
+    target: Rect,
+    direction: Direction,
+) -> float:
+    if direction == Direction.LEFT:
+        return current.center_x - target.center_x
+    if direction == Direction.RIGHT:
+        return target.center_x - current.center_x
+    if direction == Direction.UP:
+        return current.center_y - target.center_y
+    return target.center_y - current.center_y
+
+
+def _skeleton_lane_tolerance(
+    current: Rect,
+    target: Rect,
+    direction: Direction,
+) -> float:
+    if direction in {Direction.LEFT, Direction.RIGHT}:
+        smaller_span = min(current.height, target.height)
+    else:
+        smaller_span = min(current.width, target.width)
+    local_unit = navigation_scale_unit((current, target))
+    minimum = max(1.0, local_unit * SKELETON_LANE_MIN_UNITS)
+    maximum = max(minimum, local_unit * SKELETON_LANE_MAX_UNITS)
+    return max(
+        minimum,
+        min(maximum, max(1, smaller_span) * SKELETON_LANE_SPAN_MULTIPLIER),
+    )
+
+
+def _skeleton_rounding_epsilon(current: Rect, target: Rect) -> float:
+    return max(
+        1.0,
+        navigation_scale_unit((current, target))
+        / SKELETON_ROUNDING_REFERENCE_UNIT,
+    )
+
+
+def _skeleton_lane_matches(
+    current: Rect,
+    target: Rect,
+    direction: Direction,
+) -> bool:
+    tolerance = _skeleton_lane_tolerance(
+        current,
+        target,
+        direction,
+    )
+    center_offset = _navigation_perpendicular_center_offset(
+        current,
+        target,
+        direction,
+    )
+    rounding_epsilon = _skeleton_rounding_epsilon(current, target)
+    return bool(
+        _navigation_lane_gap(current, target, direction)
+        <= tolerance + rounding_epsilon
+        and center_offset <= tolerance + rounding_epsilon
+        and _navigation_forward_center_distance(
+            current,
+            target,
+            direction,
+        )
+        + rounding_epsilon
+        >= center_offset
+        and (
+            center_offset <= rounding_epsilon
+            or _navigation_forward_gap(current, target, direction)
+            + rounding_epsilon
+            >= center_offset * 0.75
+        )
+    )
+
+
+def _skeleton_support_lane_matches(
+    current: Rect,
+    target: Rect,
+    direction: Direction,
+) -> bool:
+    tolerance = _skeleton_lane_tolerance(current, target, direction)
+    center_offset = _navigation_perpendicular_center_offset(
+        current,
+        target,
+        direction,
+    )
+    if direction in {Direction.LEFT, Direction.RIGHT}:
+        centers_are_separate = bool(
+            not target.left <= current.center_x <= target.right
+            and not current.left <= target.center_x <= current.right
+        )
+    else:
+        centers_are_separate = bool(
+            not target.top <= current.center_y <= target.bottom
+            and not current.top <= target.center_y <= current.bottom
+        )
+    rounding_epsilon = _skeleton_rounding_epsilon(current, target)
+    return bool(
+        centers_are_separate
+        and _navigation_lane_gap(current, target, direction)
+        <= tolerance + rounding_epsilon
+        and center_offset <= tolerance + rounding_epsilon
+        and _navigation_forward_center_distance(
+            current,
+            target,
+            direction,
+        )
+        + rounding_epsilon
+        >= center_offset
+    )
+
+
 def _navigation_forward_gap(
     current: Rect,
     target: Rect,
@@ -1902,6 +2031,23 @@ def _navigation_forward_gap(
 ) -> float:
     score = direction_score(current, target, direction)
     return float("inf") if score is None else score[1]
+
+
+def _skeleton_support_is_local(
+    current: Rect,
+    target: Rect,
+    direction: Direction,
+) -> bool:
+    if direction in {Direction.LEFT, Direction.RIGHT}:
+        local_extent = max(current.width, target.width)
+    else:
+        local_extent = max(current.height, target.height)
+    local_unit = navigation_scale_unit((current, target))
+    distance_limit = max(
+        local_extent * RECTANGULAR_GRID_DISTANT_EXTENT_RATIO,
+        local_unit * SKELETON_SUPPORT_MAX_GAP_UNITS,
+    )
+    return _navigation_forward_gap(current, target, direction) < distance_limit
 
 
 def _navigation_forward_far_edge_distance(
@@ -2827,7 +2973,235 @@ class NavigationGraph:
             self.scale_unit,
         )
         self._natural: dict[tuple[int, Direction], tuple[int, ...]] = {}
+        self._skeleton: dict[tuple[int, Direction], tuple[int, ...]] = {}
+        self._skeleton_support: dict[tuple[int, bool], bool] = {}
         self._xy_fallback: dict[tuple[int, Direction], tuple[int, ...]] = {}
+
+    def _has_skeleton_track_support(
+        self,
+        target_index: int,
+        direction: Direction,
+    ) -> bool:
+        horizontal = direction in {Direction.LEFT, Direction.RIGHT}
+        key = (target_index, horizontal)
+        cached = self._skeleton_support.get(key)
+        if cached is not None:
+            return cached
+        support_directions = (
+            (Direction.UP, Direction.DOWN)
+            if horizontal
+            else (Direction.LEFT, Direction.RIGHT)
+        )
+        current = self.anchor_rects[target_index]
+        supported = False
+        for index, candidate in enumerate(self.anchor_rects):
+            if index == target_index:
+                continue
+            for support_direction in support_directions:
+                score = direction_score(current, candidate, support_direction)
+                if (
+                    score is not None
+                    and _skeleton_support_lane_matches(
+                        current,
+                        candidate,
+                        support_direction,
+                    )
+                    and _skeleton_support_is_local(
+                        current,
+                        candidate,
+                        support_direction,
+                    )
+                ):
+                    supported = True
+                    break
+            if supported:
+                break
+        self._skeleton_support[key] = supported
+        return supported
+
+    def _skeleton_candidates(
+        self,
+        current_index: int,
+        direction: Direction,
+        active_rect: Rect,
+    ) -> tuple[int, ...]:
+        use_cache = active_rect == self.anchor_rects[current_index]
+        key = (current_index, direction)
+        if use_cache:
+            cached = self._skeleton.get(key)
+            if cached is not None:
+                return cached
+        candidates = []
+        current_supported = self._has_skeleton_track_support(
+            current_index,
+            direction,
+        )
+        for index, candidate in enumerate(self.anchor_rects):
+            if index == current_index:
+                continue
+            score = direction_score(active_rect, candidate, direction)
+            if score is None or not _skeleton_lane_matches(
+                active_rect,
+                candidate,
+                direction,
+            ):
+                continue
+            if not current_supported or not self._has_skeleton_track_support(
+                index, direction
+            ):
+                continue
+            candidates.append((index, score))
+        candidates.sort(
+            key=lambda item: (
+                self._crosses_parallel_section_boundary(
+                    current_index,
+                    item[0],
+                    direction,
+                ),
+                _navigation_forward_gap(
+                    active_rect,
+                    self.anchor_rects[item[0]],
+                    direction,
+                ),
+                _navigation_perpendicular_center_offset(
+                    active_rect,
+                    self.anchor_rects[item[0]],
+                    direction,
+                ),
+                _navigation_lane_gap(
+                    active_rect,
+                    self.anchor_rects[item[0]],
+                    direction,
+                ),
+                item[1][3],
+                _range_occupancy_stable_key(
+                    self.targets[item[0]],
+                    self.anchor_rects[item[0]],
+                ),
+            )
+        )
+        result = tuple(index for index, _score in candidates)
+        if use_cache:
+            self._skeleton[key] = result
+        return result
+
+    def _skeleton_axis_is_stable(
+        self,
+        current_index: int,
+        direction: Direction,
+        active_rect: Rect,
+    ) -> bool:
+        return bool(
+            self._skeleton_candidates(current_index, direction, active_rect)
+            or self._skeleton_candidates(
+                current_index,
+                OPPOSITE_DIRECTION[direction],
+                active_rect,
+            )
+        )
+
+    def _skeleton_accepts(
+        self,
+        active_rect: Rect,
+        candidate_index: int,
+        direction: Direction,
+    ) -> bool:
+        return bool(
+            0 <= candidate_index < len(self.anchor_rects)
+            and _skeleton_lane_matches(
+                active_rect,
+                self.anchor_rects[candidate_index],
+                direction,
+            )
+        )
+
+    def _skeleton_requires_orthogonal_step(
+        self,
+        current_index: int,
+        direction: Direction,
+        active_rect: Rect,
+        candidate_index: int,
+    ) -> bool:
+        if (
+            not 0 <= candidate_index < len(self.anchor_rects)
+            or not self._skeleton_axis_is_stable(
+                current_index,
+                direction,
+                active_rect,
+            )
+            or self._skeleton_accepts(
+                active_rect,
+                candidate_index,
+                direction,
+            )
+        ):
+            return False
+        side_direction = _orthogonal_direction_toward(
+            active_rect,
+            self.anchor_rects[candidate_index],
+            direction,
+        )
+        if side_direction is None:
+            return False
+        return self._orthogonal_route_reaches_candidate(
+            current_index,
+            side_direction,
+            direction,
+            candidate_index,
+            active_rect,
+            primary_only=True,
+        )
+
+    def _promote_skeleton_candidate(
+        self,
+        current_index: int,
+        direction: Direction,
+        active_rect: Rect,
+        natural: Sequence[int],
+    ) -> tuple[int, ...]:
+        skeleton = self._skeleton_candidates(
+            current_index,
+            direction,
+            active_rect,
+        )
+        if not skeleton:
+            return tuple(natural)
+        if not natural:
+            return skeleton
+        best = skeleton[0]
+        incumbent = natural[0]
+        if best == incumbent:
+            return tuple(natural)
+        best_gap = _navigation_forward_gap(
+            active_rect,
+            self.anchor_rects[best],
+            direction,
+        )
+        incumbent_gap = _navigation_forward_gap(
+            active_rect,
+            self.anchor_rects[incumbent],
+            direction,
+        )
+        local_unit = navigation_scale_unit(
+            (
+                self.anchor_rects[current_index],
+                self.anchor_rects[best],
+                self.anchor_rects[incumbent],
+            )
+        )
+        material_margin = max(
+            local_unit * SKELETON_PROMOTION_MIN_UNITS,
+            incumbent_gap * 0.2,
+        )
+        if best_gap + material_margin >= incumbent_gap:
+            if incumbent_gap > 0 or not self._skeleton_requires_orthogonal_step(
+                current_index,
+                direction,
+                active_rect,
+                incumbent,
+            ):
+                return tuple(natural)
+        return tuple(dict.fromkeys((*skeleton, *natural)))
 
     def _projected_candidates(
         self,
@@ -2935,6 +3309,108 @@ class NavigationGraph:
         merged.extend(index for index in pending if index not in merged)
         return tuple(merged)
 
+    def _unpromoted_candidates(
+        self,
+        current_index: int,
+        direction: Direction,
+        active_rect: Rect,
+    ) -> tuple[int, ...]:
+        projected = self._projected_candidates(
+            current_index,
+            direction,
+            active_rect,
+        )
+        contacts = self._contacts.get((current_index, direction), ())
+        adjacent = tuple(
+            contact.target_index
+            for contact in sorted(
+                contacts,
+                key=lambda contact: _navigation_contact_rank(
+                    active_rect,
+                    self.anchor_rects[contact.target_index],
+                    direction,
+                    contact,
+                    self._crosses_parallel_section_boundary(
+                        current_index,
+                        contact.target_index,
+                        direction,
+                    ),
+                ),
+            )
+        )
+        return self._merge_projected_and_adjacent(
+            current_index,
+            active_rect,
+            direction,
+            projected,
+            adjacent,
+        )
+
+    def _anchor_primary_candidate(
+        self,
+        current_index: int,
+        direction: Direction,
+        active_rect: Rect,
+    ) -> Optional[int]:
+        candidates: list[tuple[int, tuple[float, ...]]] = []
+        for index, candidate in enumerate(self.anchor_rects):
+            if index == current_index:
+                continue
+            score = direction_score(active_rect, candidate, direction)
+            if score is None:
+                continue
+            tolerance = _skeleton_lane_tolerance(
+                active_rect,
+                candidate,
+                direction,
+            )
+            rounding_epsilon = _skeleton_rounding_epsilon(
+                active_rect,
+                candidate,
+            )
+            if (
+                _navigation_lane_gap(active_rect, candidate, direction)
+                > tolerance + rounding_epsilon
+                or _navigation_perpendicular_center_offset(
+                    active_rect,
+                    candidate,
+                    direction,
+                )
+                > tolerance + rounding_epsilon
+            ):
+                continue
+            candidates.append((index, score))
+        candidates.sort(
+            key=lambda item: (
+                self._crosses_parallel_section_boundary(
+                    current_index,
+                    item[0],
+                    direction,
+                ),
+                _navigation_forward_gap(
+                    active_rect,
+                    self.anchor_rects[item[0]],
+                    direction,
+                ),
+                _navigation_perpendicular_center_offset(
+                    active_rect,
+                    self.anchor_rects[item[0]],
+                    direction,
+                ),
+                _navigation_lane_gap(
+                    active_rect,
+                    self.anchor_rects[item[0]],
+                    direction,
+                ),
+                item[1][3],
+                _range_occupancy_stable_key(
+                    self.targets[item[0]],
+                    self.anchor_rects[item[0]],
+                ),
+            )
+        )
+        return candidates[0][0] if candidates else None
+
     def requires_orthogonal_grid_step(
         self,
         current_index: int,
@@ -2978,8 +3454,58 @@ class NavigationGraph:
         requested_direction: Direction,
         candidate_index: int,
         active_rect: Rect,
+        *,
+        primary_only: bool = False,
     ) -> bool:
         candidate = self.anchor_rects[candidate_index]
+        if primary_only:
+            node_index = current_index
+            node_rect = active_rect
+            visited = {current_index}
+            while True:
+                requested_index = self._anchor_primary_candidate(
+                    node_index,
+                    requested_direction,
+                    node_rect,
+                )
+                if (
+                    node_index != current_index
+                    and requested_index == candidate_index
+                ):
+                    return True
+
+                side_index = self._anchor_primary_candidate(
+                    node_index,
+                    side_direction,
+                    node_rect,
+                )
+                if (
+                    side_index is None
+                    or side_index == candidate_index
+                    or side_index in visited
+                ):
+                    return False
+                side_target = self.anchor_rects[side_index]
+                node_distance = (
+                    abs(candidate.center_x - node_rect.center_x)
+                    if side_direction in {Direction.LEFT, Direction.RIGHT}
+                    else abs(candidate.center_y - node_rect.center_y)
+                )
+                side_distance = (
+                    abs(candidate.center_x - side_target.center_x)
+                    if side_direction in {Direction.LEFT, Direction.RIGHT}
+                    else abs(candidate.center_y - side_target.center_y)
+                )
+                if side_distance >= node_distance:
+                    return False
+                visited.add(side_index)
+                node_rect = navigation_contact_cell(
+                    node_rect,
+                    self.anchor_rects[side_index],
+                    side_direction,
+                )
+                node_index = side_index
+
         pending = deque([(current_index, active_rect)])
         visited = {current_index}
         while pending:
@@ -3064,62 +3590,25 @@ class NavigationGraph:
             natural = self._natural.get(key)
             if natural is not None:
                 return natural
-        projected = self._projected_candidates(
+        natural = self._unpromoted_candidates(
             current_index,
             direction,
             active_rect,
         )
-        contacts = self._contacts.get((current_index, direction), ())
         if not use_cache:
-            adjacent = tuple(
-                contact.target_index
-                for contact in sorted(
-                    contacts,
-                    key=lambda contact: _navigation_contact_rank(
-                        active_rect,
-                        self.anchor_rects[contact.target_index],
-                        direction,
-                        contact,
-                        self._crosses_parallel_section_boundary(
-                            current_index,
-                            contact.target_index,
-                            direction,
-                        ),
-                    ),
-                )
-            )
-            return self._merge_projected_and_adjacent(
+            return self._promote_skeleton_candidate(
                 current_index,
-                active_rect,
                 direction,
-                projected,
-                adjacent,
+                active_rect,
+                natural,
             )
-        adjacent = tuple(
-            contact.target_index
-            for contact in sorted(
-                contacts,
-                key=lambda contact: _navigation_contact_rank(
-                    active_rect,
-                    self.anchor_rects[contact.target_index],
-                    direction,
-                    contact,
-                    self._crosses_parallel_section_boundary(
-                        current_index,
-                        contact.target_index,
-                        direction,
-                    ),
-                ),
-            )
-        )
         # Territory adjacency keeps gaps and sparse layouts traversable,
         # but it must not hide a real control hit by the requested beam.
-        natural = self._merge_projected_and_adjacent(
+        natural = self._promote_skeleton_candidate(
             current_index,
-            active_rect,
             direction,
-            projected,
-            adjacent,
+            active_rect,
+            natural,
         )
         self._natural[key] = natural
         return natural
@@ -3202,6 +3691,53 @@ def navigation_candidate_plan(
             natural[0],
         )
     )
+    fallback: tuple[int, ...] = ()
+    if not natural:
+        fallback = graph.xy_focus_candidates(current_index, direction)
+    candidate_index = natural[0] if natural else (fallback[0] if fallback else None)
+    skeleton_step_required = bool(
+        candidate_index is not None
+        and not orthogonal_step_required
+        and graph._skeleton_requires_orthogonal_step(
+            current_index,
+            direction,
+            active_rect,
+            candidate_index,
+        )
+    )
+    if skeleton_step_required:
+        ranked_source = natural if natural else fallback
+        lane_candidates = tuple(
+            dict.fromkeys(
+                (
+                    *ranked_source,
+                    *graph._skeleton_candidates(
+                        current_index,
+                        direction,
+                        active_rect,
+                    ),
+                )
+            )
+        )
+        same_lane = next(
+            (
+                index
+                for index in lane_candidates
+                if index != candidate_index
+                if graph._skeleton_accepts(active_rect, index, direction)
+            ),
+            None,
+        )
+        if same_lane is not None:
+            promoted = tuple(dict.fromkeys((same_lane, *ranked_source)))
+            if natural:
+                natural = promoted
+            else:
+                fallback = promoted
+            skeleton_step_required = False
+    orthogonal_step_required = bool(
+        orthogonal_step_required or skeleton_step_required
+    )
     if natural and not orthogonal_step_required:
         return NavigationCandidatePlan(
             natural=natural,
@@ -3209,7 +3745,15 @@ def navigation_candidate_plan(
             orthogonal_step_required=False,
             uses_xy_fallback=False,
         )
-    fallback = graph.xy_focus_candidates(current_index, direction)
+    if skeleton_step_required:
+        return NavigationCandidatePlan(
+            natural=natural,
+            ranked=(),
+            orthogonal_step_required=True,
+            uses_xy_fallback=False,
+        )
+    if not fallback:
+        fallback = graph.xy_focus_candidates(current_index, direction)
     return NavigationCandidatePlan(
         natural=natural,
         ranked=fallback,

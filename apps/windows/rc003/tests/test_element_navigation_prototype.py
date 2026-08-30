@@ -2128,6 +2128,520 @@ class SpatialNavigationTests(unittest.TestCase):
                     1,
                 )
 
+    def test_skeleton_promotes_a_nearer_offset_track_stably(self):
+        base_rects = (
+            (500, 100, 540, 140, "current"),
+            (270, 155, 310, 195, "near"),
+            (200, 100, 240, 140, "far"),
+            (500, 240, 540, 280, "current support"),
+            (270, 275, 310, 315, "near support"),
+            (200, 240, 240, 280, "far support"),
+        )
+
+        for transpose in (False, True):
+            direction = (
+                prototype.Direction.UP
+                if transpose
+                else prototype.Direction.LEFT
+            )
+            for scale in (0.75, 1.0, 1.5):
+                for reverse_order in (False, True):
+                    coordinates = []
+                    for left, top, right, bottom, name in base_rects:
+                        if transpose:
+                            left, top, right, bottom = top, left, bottom, right
+                        coordinates.append(
+                            (
+                                round(left * scale),
+                                round(top * scale),
+                                round(right * scale),
+                                round(bottom * scale),
+                                name,
+                            )
+                        )
+                    if reverse_order:
+                        coordinates.reverse()
+                    targets = [
+                        self.target(left, top, right, bottom, name)
+                        for left, top, right, bottom, name in coordinates
+                    ]
+                    graph = prototype.NavigationGraph(targets)
+                    index_by_name = {
+                        target.name: index for index, target in enumerate(targets)
+                    }
+                    current_index = index_by_name["current"]
+                    current_cell = graph.anchor_rects[current_index]
+                    traversal = prototype.NavigationTraversal()
+                    plan = prototype.navigation_candidate_plan(
+                        graph,
+                        current_index,
+                        direction,
+                        current_cell,
+                    )
+
+                    with self.subTest(
+                        transpose=transpose,
+                        scale=scale,
+                        reverse_order=reverse_order,
+                    ):
+                        selected = traversal.available(
+                            current_index,
+                            direction,
+                            plan.ranked,
+                        )[0]
+                        self.assertEqual(targets[selected].name, "near")
+                        next_cell = prototype.navigation_contact_cell(
+                            current_cell,
+                            graph.grid_rects[selected],
+                            direction,
+                        )
+                        traversal.commit(selected, next_cell)
+                        reverse = prototype.OPPOSITE_DIRECTION[direction]
+                        reverse_plan = prototype.navigation_candidate_plan(
+                            graph,
+                            selected,
+                            reverse,
+                            next_cell,
+                        )
+                        returned = traversal.available(
+                            selected,
+                            reverse,
+                            reverse_plan.ranked,
+                        )[0]
+                        self.assertEqual(targets[returned].name, "current")
+
+    def test_skeleton_does_not_replace_a_reasonable_same_row_target(self):
+        targets = [
+            self.target(13, 67, 141, 115, "current"),
+            self.target(231, 10, 305, 46, "near upper track"),
+            self.target(344, 73, 381, 109, "same row"),
+            self.target(13, 170, 141, 210, "current support"),
+            self.target(231, 170, 305, 210, "upper track support"),
+            self.target(344, 170, 381, 210, "same row support"),
+        ]
+        graph = prototype.NavigationGraph(targets)
+
+        plan = prototype.navigation_candidate_plan(
+            graph,
+            0,
+            prototype.Direction.RIGHT,
+            graph.anchor_rects[0],
+        )
+
+        self.assertEqual(plan.ranked[0], 2)
+
+    def test_skeleton_falls_back_to_an_existing_same_row_target(self):
+        coordinates = (
+            (402, 101, 443, 152),
+            (148, 206, 210, 251),
+            (253, 4, 308, 36),
+            (203, -4, 241, 23),
+            (101, 303, 152, 326),
+            (301, -3, 368, 35),
+            (103, 157, 153, 198),
+            (105, 258, 137, 304),
+            (354, 154, 406, 179),
+            (402, 206, 469, 232),
+            (194, 155, 258, 206),
+            (155, 153, 201, 207),
+        )
+        targets = [
+            self.target(
+                left,
+                top,
+                right,
+                bottom,
+                str(index),
+                path=(index,),
+            )
+            for index, (left, top, right, bottom) in enumerate(coordinates)
+        ]
+        graph = prototype.NavigationGraph(targets)
+
+        plan = prototype.navigation_candidate_plan(
+            graph,
+            1,
+            prototype.Direction.RIGHT,
+            graph.anchor_rects[1],
+        )
+
+        self.assertEqual(plan.natural[:2], (9, 10))
+        self.assertEqual(plan.ranked, plan.natural)
+        self.assertFalse(plan.orthogonal_step_required)
+        self.assertFalse(plan.uses_xy_fallback)
+
+    def test_skeleton_uses_an_existing_same_lane_target_before_stopping(self):
+        coordinates = (
+            (1002, 672, 1210, 759),
+            (552, 583, 605, 627),
+            (1043, 282, 1225, 347),
+            (433, 558, 555, 657),
+            (441, 640, 484, 721),
+            (521, 624, 613, 724),
+        )
+        names = ("3", "6", "10", "12", "13", "15")
+        targets = [
+            self.target(left, top, right, bottom, name, path=(index,))
+            for index, (name, (left, top, right, bottom)) in enumerate(
+                zip(names, coordinates)
+            )
+        ]
+        graph = prototype.NavigationGraph(targets)
+
+        plan = prototype.navigation_candidate_plan(
+            graph,
+            5,
+            prototype.Direction.LEFT,
+            graph.anchor_rects[5],
+        )
+
+        self.assertEqual(targets[plan.ranked[0]].name, "13")
+        self.assertFalse(plan.orthogonal_step_required)
+        self.assertFalse(plan.uses_xy_fallback)
+
+    def test_skeleton_keeps_contained_row_actions_stable_under_scale(self):
+        base_rects = (
+            (13, 565, 406, 610, "current"),
+            (258, 572, 289, 603, "inline action"),
+            (13, 518, 406, 564, "current support"),
+            (258, 526, 289, 556, "inline support"),
+        )
+
+        for scale in (0.75, 1.0, 1.25, 1.5):
+            targets = [
+                self.target(
+                    round(left * scale),
+                    round(top * scale),
+                    round(right * scale),
+                    round(bottom * scale),
+                    name,
+                )
+                for left, top, right, bottom, name in base_rects
+            ]
+            graph = prototype.NavigationGraph(targets)
+
+            with self.subTest(scale=scale):
+                self.assertEqual(
+                    graph._skeleton_candidates(
+                        0,
+                        prototype.Direction.RIGHT,
+                        graph.anchor_rects[0],
+                    ),
+                    (1,),
+                )
+
+    def test_distant_element_cannot_create_local_skeleton_support(self):
+        base_rects = (
+            (100, 100, 140, 140, "current"),
+            (103, 300, 143, 340, "candidate"),
+            (160, 100, 200, 140, "current support"),
+            (2100, 300, 2140, 340, "distant support"),
+        )
+
+        for scale in (0.75, 1.0, 1.5):
+            for reverse_order in (False, True):
+                coordinates = [
+                    (
+                        round(left * scale),
+                        round(top * scale),
+                        round(right * scale),
+                        round(bottom * scale),
+                        name,
+                    )
+                    for left, top, right, bottom, name in base_rects
+                ]
+                if reverse_order:
+                    coordinates.reverse()
+                targets = [
+                    self.target(left, top, right, bottom, name)
+                    for left, top, right, bottom, name in coordinates
+                ]
+                graph = prototype.NavigationGraph(targets)
+                index_by_name = {
+                    target.name: index for index, target in enumerate(targets)
+                }
+                current = index_by_name["current"]
+                candidate = index_by_name["candidate"]
+
+                with self.subTest(scale=scale, reverse_order=reverse_order):
+                    self.assertTrue(
+                        graph._has_skeleton_track_support(
+                            current,
+                            prototype.Direction.DOWN,
+                        )
+                    )
+                    self.assertFalse(
+                        graph._has_skeleton_track_support(
+                            candidate,
+                            prototype.Direction.DOWN,
+                        )
+                    )
+                    self.assertNotIn(
+                        candidate,
+                        graph._skeleton_candidates(
+                            current,
+                            prototype.Direction.DOWN,
+                            graph.anchor_rects[current],
+                        ),
+                    )
+
+    def test_skeleton_support_overlap_is_stable_under_scale(self):
+        for scale in (0.75, 1.0, 1.25, 1.5):
+            targets = [
+                self.target(
+                    round(left * scale),
+                    round(top * scale),
+                    round(right * scale),
+                    round(bottom * scale),
+                    name,
+                )
+                for left, top, right, bottom, name in (
+                    (100, 100, 140, 140, "current"),
+                    (116, 160, 156, 200, "support"),
+                )
+            ]
+            graph = prototype.NavigationGraph(targets)
+
+            with self.subTest(scale=scale):
+                self.assertTrue(
+                    graph._has_skeleton_track_support(
+                        0,
+                        prototype.Direction.RIGHT,
+                    )
+                )
+
+        tall_targets = [
+            self.target(100, 100, 140, 140, "current"),
+            self.target(120, -500, 160, 500, "tall unrelated target"),
+        ]
+        tall_graph = prototype.NavigationGraph(tall_targets)
+        self.assertFalse(
+            tall_graph._has_skeleton_track_support(
+                0,
+                prototype.Direction.RIGHT,
+            )
+        )
+
+    def test_skeleton_sparse_exit_is_stable_under_scale(self):
+        base_rects = (
+            (280, 54, 344, 102),
+            (708, 62, 812, 118),
+            (944, 38, 1088, 94),
+            (1172, 42, 1324, 74),
+            (76, 166, 212, 238),
+            (264, 174, 424, 206),
+            (732, 170, 844, 210),
+            (928, 166, 976, 246),
+            (1148, 162, 1284, 202),
+            (276, 290, 380, 330),
+            (508, 282, 652, 314),
+            (712, 294, 864, 350),
+            (956, 302, 1092, 358),
+            (1160, 290, 1272, 338),
+            (284, 414, 332, 470),
+            (728, 406, 872, 462),
+            (956, 402, 1100, 466),
+            (1144, 402, 1240, 442),
+            (52, 538, 124, 570),
+            (292, 518, 364, 550),
+            (504, 538, 624, 594),
+            (724, 522, 868, 562),
+            (928, 538, 984, 602),
+            (60, 650, 172, 714),
+            (272, 654, 320, 718),
+            (488, 662, 648, 710),
+            (716, 638, 764, 686),
+            (952, 662, 1064, 726),
+            (1144, 646, 1224, 694),
+            (60, 770, 140, 834),
+            (268, 770, 308, 802),
+            (708, 766, 812, 846),
+            (928, 782, 976, 830),
+            (1156, 766, 1276, 822),
+        )
+
+        for scale in (0.75, 1.0, 1.25, 1.5):
+            targets = [
+                self.target(
+                    round(left * scale),
+                    round(top * scale),
+                    round(right * scale),
+                    round(bottom * scale),
+                    f"n{index}",
+                )
+                for index, (left, top, right, bottom) in enumerate(base_rects)
+            ]
+            graph = prototype.NavigationGraph(targets)
+            plan = prototype.navigation_candidate_plan(
+                graph,
+                30,
+                prototype.Direction.DOWN,
+                graph.anchor_rects[30],
+            )
+
+            with self.subTest(scale=scale):
+                self.assertEqual(targets[plan.ranked[0]].name, "n32")
+                self.assertFalse(plan.orthogonal_step_required)
+                self.assertTrue(plan.uses_xy_fallback)
+
+    def test_skeleton_orthogonal_path_is_stable_under_rounding_scale(self):
+        base_rects = (
+            (504, 158, 560, 230),
+            (276, 414, 404, 494),
+            (504, 406, 568, 470),
+            (68, 538, 164, 586),
+            (268, 538, 332, 594),
+            (500, 542, 604, 622),
+            (56, 654, 176, 694),
+            (296, 646, 440, 678),
+        )
+        names = ("n5", "n9", "n10", "n11", "n12", "n13", "n14", "n15")
+
+        for scale in (0.75, 1.0, 1.25, 1.5):
+            targets = [
+                self.target(
+                    round(left * scale),
+                    round(top * scale),
+                    round(right * scale),
+                    round(bottom * scale),
+                    name,
+                )
+                for name, (left, top, right, bottom) in zip(names, base_rects)
+            ]
+            graph = prototype.NavigationGraph(targets)
+            plan = prototype.navigation_candidate_plan(
+                graph,
+                7,
+                prototype.Direction.RIGHT,
+                graph.anchor_rects[7],
+            )
+
+            with self.subTest(scale=scale):
+                self.assertEqual(plan.ranked, ())
+                self.assertTrue(plan.orthogonal_step_required)
+                self.assertFalse(plan.uses_xy_fallback)
+
+    def test_skeleton_orthogonal_path_uses_anchor_geometry_across_scale(self):
+        base_rects = (
+            (516, 162, 644, 242, "n6"),
+            (76, 294, 204, 374, "n9"),
+            (512, 286, 616, 358, "n10"),
+            (76, 406, 116, 446, "n13"),
+            (280, 410, 328, 474, "n14"),
+            (60, 530, 100, 562, "n17"),
+            (940, 526, 1100, 582, "n21"),
+        )
+
+        for scale in (0.75, 1.0, 1.25, 1.5):
+            targets = [
+                self.target(
+                    round(left * scale),
+                    round(top * scale),
+                    round(right * scale),
+                    round(bottom * scale),
+                    name,
+                )
+                for left, top, right, bottom, name in base_rects
+            ]
+            graph = prototype.NavigationGraph(targets)
+            current = next(
+                index
+                for index, target in enumerate(targets)
+                if target.name == "n9"
+            )
+            plan = prototype.navigation_candidate_plan(
+                graph,
+                current,
+                prototype.Direction.RIGHT,
+                graph.anchor_rects[current],
+            )
+
+            with self.subTest(scale=scale):
+                self.assertTrue(plan.ranked)
+                self.assertEqual(targets[plan.ranked[0]].name, "n10")
+
+    def test_skeleton_rounding_margin_scales_with_local_geometry(self):
+        base_rects = (
+            (956, 278, 1092, 342, "n15"),
+            (288, 530, 344, 610, "n21"),
+            (1172, 522, 1316, 594, "n25"),
+            (56, 650, 152, 730, "n26"),
+            (276, 662, 436, 742, "n27"),
+            (1164, 782, 1252, 814, "n33"),
+        )
+
+        for scale in (0.75, 1.0, 1.25, 1.5):
+            targets = [
+                self.target(
+                    round(left * scale),
+                    round(top * scale),
+                    round(right * scale),
+                    round(bottom * scale),
+                    name,
+                )
+                for left, top, right, bottom, name in base_rects
+            ]
+            graph = prototype.NavigationGraph(targets)
+            plan = prototype.navigation_candidate_plan(
+                graph,
+                1,
+                prototype.Direction.LEFT,
+                graph.anchor_rects[1],
+            )
+
+            with self.subTest(scale=scale):
+                self.assertTrue(plan.ranked)
+                self.assertEqual(targets[plan.ranked[0]].name, "n26")
+                self.assertFalse(plan.orthogonal_step_required)
+                self.assertFalse(plan.uses_xy_fallback)
+
+    def test_skeleton_blocks_xy_only_when_a_grid_step_exists(self):
+        targets = [
+            self.target(80, 100, 110, 130, "top left"),
+            self.target(120, 100, 150, 130, "top right"),
+            self.target(80, 140, 110, 170, "bottom left"),
+            self.target(120, 140, 150, 170, "bottom right"),
+            self.target(151, 150, 231, 190, "sparse target"),
+        ]
+        graph = prototype.NavigationGraph(targets)
+        top_right = graph.anchor_rects[1]
+
+        self.assertEqual(
+            graph.candidates(1, prototype.Direction.RIGHT, top_right),
+            (),
+        )
+        self.assertEqual(
+            graph.xy_focus_candidates(1, prototype.Direction.RIGHT),
+            (4,),
+        )
+        blocked = prototype.navigation_candidate_plan(
+            graph,
+            1,
+            prototype.Direction.RIGHT,
+            top_right,
+        )
+        self.assertEqual(blocked.ranked, ())
+        self.assertTrue(blocked.orthogonal_step_required)
+        self.assertFalse(blocked.uses_xy_fallback)
+
+        down = prototype.navigation_candidate_plan(
+            graph,
+            1,
+            prototype.Direction.DOWN,
+            top_right,
+        )
+        self.assertEqual(down.ranked[0], 3)
+
+        sparse_exit = prototype.navigation_candidate_plan(
+            graph,
+            3,
+            prototype.Direction.DOWN,
+            graph.anchor_rects[3],
+        )
+        self.assertEqual(sparse_exit.natural, ())
+        self.assertEqual(sparse_exit.ranked, (4,))
+        self.assertTrue(sparse_exit.uses_xy_fallback)
+
     def test_range_occupancy_grid_is_one_gapless_non_overlapping_cell_per_target(self):
         targets = [
             self.target(40, 30, 120, 70, "A"),
@@ -2600,6 +3114,47 @@ class SpatialNavigationTests(unittest.TestCase):
 
         self.assertLess(cold_elapsed, 1.5)
         self.assertLess(cached_elapsed, 0.05)
+
+    def test_skeleton_lookup_for_300_targets_stays_bounded(self):
+        targets = []
+        for row in range(15):
+            for column in range(20):
+                left = column * 70 + (row % 3) * 2
+                top = row * 55 + (column % 3) * 2
+                targets.append(
+                    self.target(
+                        left,
+                        top,
+                        left + 40,
+                        top + 30,
+                        f"{row}:{column}",
+                    )
+                )
+        graph = prototype.NavigationGraph(targets)
+
+        started = time.perf_counter()
+        for current in range(len(targets)):
+            for direction in prototype.Direction:
+                prototype.navigation_candidate_plan(
+                    graph,
+                    current,
+                    direction,
+                    graph.anchor_rects[current],
+                )
+        cold_elapsed = time.perf_counter() - started
+        started = time.perf_counter()
+        for current in range(len(targets)):
+            for direction in prototype.Direction:
+                prototype.navigation_candidate_plan(
+                    graph,
+                    current,
+                    direction,
+                    graph.anchor_rects[current],
+                )
+        cached_elapsed = time.perf_counter() - started
+
+        self.assertLess(cold_elapsed, 4.0)
+        self.assertLess(cached_elapsed, 0.1)
 
     def test_irregular_layout_keeps_every_target_in_directional_rankings(self):
         targets = [
