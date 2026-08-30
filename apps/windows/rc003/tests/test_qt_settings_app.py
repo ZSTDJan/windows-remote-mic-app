@@ -5091,6 +5091,10 @@ class SettingsShellSourceContractTests(unittest.TestCase):
 
     def test_device_page_owns_the_three_desktop_behavior_options(self):
         self.assertIn('objectName: "desktopBehaviorSection"', self.device_qml)
+        self.assertIn(
+            'objectName: "desktopBehaviorSectionTitle"', self.device_qml
+        )
+        self.assertIn('text: qsTr("通用设置")', self.device_qml)
         self.assertIn('objectName: "launchAtLoginSwitch"', self.device_qml)
         self.assertIn('objectName: "launchBridgeOnAppStartSwitch"', self.device_qml)
         self.assertIn('objectName: "closeBehaviorCombo"', self.device_qml)
@@ -5103,6 +5107,21 @@ class SettingsShellSourceContractTests(unittest.TestCase):
         self.assertNotIn('objectName: "generalTabButton"', self.main_qml)
         self.assertIn('objectName: "systemTrayIcon"', self.main_qml)
         self.assertIn("SettingsController.requestApplicationExit()", self.main_qml)
+
+        runtime_log_index = self.device_qml.index(
+            'objectName: "runtimeLogRow"'
+        )
+        general_title_index = self.device_qml.index(
+            'objectName: "desktopBehaviorSectionTitle"'
+        )
+        first_option_index = self.device_qml.index(
+            'objectName: "launchAtLoginRow"'
+        )
+        self.assertLess(runtime_log_index, general_title_index)
+        self.assertLess(general_title_index, first_option_index)
+        self.assertNotIn("iconGlyph:", self.device_qml)
+        self.assertNotIn("property string iconGlyph", self.settings_list_row_qml)
+        self.assertNotIn("IconGlyph {", self.settings_list_row_qml)
 
     def test_windows_prefers_the_system_chinese_ui_font(self):
         self.assertIn(

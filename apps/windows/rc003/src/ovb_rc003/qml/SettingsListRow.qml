@@ -5,7 +5,6 @@ Rectangle {
     id: root
 
     property var tokens
-    property string iconGlyph: ""
     property string titleText: ""
     property string descriptionText: ""
     property string descriptionObjectName: ""
@@ -27,20 +26,6 @@ Rectangle {
         anchors.topMargin: 5
         anchors.bottomMargin: 5
         spacing: 9
-
-        Rectangle {
-            Layout.preferredWidth: 28
-            Layout.preferredHeight: 28
-            radius: 14
-            color: root.tokens.accentSoft
-            IconGlyph {
-                anchors.centerIn: parent
-                tokens: root.tokens
-                glyph: root.iconGlyph
-                glyphSize: 15
-                color: root.tokens.accent
-            }
-        }
 
         GridLayout {
             Layout.fillWidth: true
