@@ -38,7 +38,7 @@
 `bugs/BUG-015-sogou-codex-text-commit.md`、
 `bugs/BUG-016-audio-stop-overtakes-audio.md`、
 `bugs/BUG-017-toggle-firmware-audio-boundary.md`、
-`bugs/BUG-018-hold-hotkey-release-missing-audio-stop.md`、
+`bugs/Alt键锁死问题.md`、
 `bugs/BUG-019-stale-candidate-probe-hangs-instance.md`、
 `bugs/BUG-020-direction-hold-repeat-leak.md`、
 `bugs/BUG-021-hold-only-voice-product-boundary.md`、

@@ -657,7 +657,7 @@ HID 注入权限顺序与稳定失败提交：
   ZIP 只有一个版本顶层目录，2072 个文件与便携目录逐项一致，中文说明文件名
   正常。此前用系统 `tar` 产生的 `holdrelease1-portable.zip` 中文文件名乱码，
   只属于失败的中间产物，不得交付。
-- 详细证据：`bugs/BUG-018-hold-hotkey-release-missing-audio-stop.md`。
+- 详细证据：`bugs/Alt键锁死问题.md`。
 - 状态：`holdrelease2-portable` 包含本修复并等待 RC003 真机复测；旧的
   `matrix1-portable` 不包含本修复。
 
@@ -1590,7 +1590,7 @@ HID 注入权限顺序与稳定失败提交：
 - 只读核对当天防锁日志：`RMICRC03` 私有标记共出现 22 轮右 Alt 异常、27 条 DOWN、
   0 条同标记 UP；19 轮由外部防锁程序解除。标记定义与 `keybd_event` 调用均位于
   RC003，确认本次缺失 UP 的直接来源不是 UU，本批未修改 UU。
-- 已有 BUG-018 修复仍漏了一层：F5 hook 成功发出右 Alt DOWN 后没有立即登记欠下的
+- 已有 Alt 锁死修复仍漏了一层：F5 hook 成功发出右 Alt DOWN 后没有立即登记欠下的
   UP；若排队的应用回调在断连或退出时被事件代次淘汰，逻辑 holding 尚未建立，旧
   cleanup 会误判为无需释放。
 - 现在原生 DOWN 调用前先登记具体按键与后端，匹配 UP 确认后才清除；cleanup 先关闭
