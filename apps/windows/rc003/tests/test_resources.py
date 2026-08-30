@@ -87,6 +87,15 @@ class FindRemotePhotoTests(unittest.TestCase):
             self.assertIsNotNone(icon)
             self.assertTrue(icon.is_file())
 
+    def test_unavailable_states_share_one_crossed_microphone_icon(self):
+        off = resources.find_app_icon("off")
+        waiting = resources.find_app_icon("waiting")
+        connected = resources.find_app_icon("connected")
+
+        self.assertEqual(off, waiting)
+        self.assertEqual(off.name, "remote-mic-unavailable.svg")
+        self.assertNotEqual(off, connected)
+
 
 if __name__ == "__main__":
     unittest.main()

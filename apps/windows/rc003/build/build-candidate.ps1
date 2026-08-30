@@ -68,6 +68,10 @@ try {
     & $venvPython -m pip install -r requirements-dev.txt
     Assert-LastExitCode "pip install -r requirements-dev.txt"
 
+    Write-Host "-- generate shared Windows application icon --"
+    & $venvPython (Join-Path "build" "generate-app-icon.py")
+    Assert-LastExitCode "generate-app-icon.py"
+
     Write-Host "-- public boundary scan --"
     & powershell -ExecutionPolicy Bypass -File (Join-Path "build" "check-public-boundary.ps1")
     Assert-LastExitCode "check-public-boundary.ps1"

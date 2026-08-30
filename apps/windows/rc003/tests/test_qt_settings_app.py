@@ -480,7 +480,9 @@ class SettingsControllerTests(unittest.TestCase):
         self.assertFalse(controller.launchAtLogin)
         self.assertFalse(controller.launchBridgeOnAppStart)
         self.assertEqual(controller.closeBehavior, "hide_to_tray")
-        self.assertTrue(controller.trayIconSource.endswith("remote-mic-off.svg"))
+        self.assertTrue(
+            controller.trayIconSource.endswith("remote-mic-unavailable.svg")
+        )
 
     def test_desktop_behavior_changes_are_persisted_immediately(self):
         controller, _model = self._make_controller()

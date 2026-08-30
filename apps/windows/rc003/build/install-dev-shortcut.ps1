@@ -33,9 +33,9 @@ $Shortcut.Arguments = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -F
 $Shortcut.WorkingDirectory = $RC003Root
 $Shortcut.Description = "Open the current Remote Mic source checkout"
 
-$BuiltExe = Join-Path $RC003Root "dist\RemoteMicRC003\RemoteMicRC003.exe"
-if (Test-Path -LiteralPath $BuiltExe -PathType Leaf) {
-    $Shortcut.IconLocation = "$BuiltExe,0"
+$AppIcon = Join-Path $RC003Root "src\ovb_rc003\assets\icons\remote-mic.ico"
+if (Test-Path -LiteralPath $AppIcon -PathType Leaf) {
+    $Shortcut.IconLocation = "$AppIcon,0"
 }
 
 $Shortcut.Save()

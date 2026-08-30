@@ -49,8 +49,8 @@ _PHOTO_FILENAME = "RC003-remote-photo.png"
 _DEVICE_PROFILES_DIRECTORY = "device-profiles"
 _APP_ICON_DIRECTORY = "app_icons"
 _APP_ICON_FILENAMES = {
-    "off": "remote-mic-off.svg",
-    "waiting": "remote-mic-waiting.svg",
+    "off": "remote-mic-unavailable.svg",
+    "waiting": "remote-mic-unavailable.svg",
     "connected": "remote-mic-connected.svg",
 }
 

@@ -163,6 +163,18 @@ class QtUnavailableError(RuntimeError):
     """
 
 
+def _apply_application_icon(app, window, icon_type, icon_path: Path) -> None:
+    """Applies one state icon to Qt's default and the loaded native window."""
+
+    icon = icon_type(str(icon_path))
+    set_application_icon = getattr(app, "setWindowIcon", None)
+    if callable(set_application_icon):
+        set_application_icon(icon)
+    set_window_icon = getattr(window, "setIcon", None)
+    if callable(set_window_icon):
+        set_window_icon(icon)
+
+
 def _qml_directory() -> Path:
     """Locates the ``qml/`` directory this module's QML files live in,
     mirroring resources.py's frozen-vs-source-checkout lookup: in a frozen
@@ -4486,10 +4498,12 @@ def run_settings_window(*, start_hidden: bool = False) -> int:
     model = ButtonMappingModel()
     controller = SettingsController(model, start_hidden=start_hidden)
 
+    root_window = None
+
     def update_application_icon() -> None:
         path = resources.find_app_icon(controller._tray_icon_state())
-        if path is not None and hasattr(app, "setWindowIcon"):
-            app.setWindowIcon(QIcon(str(path)))
+        if path is not None:
+            _apply_application_icon(app, root_window, QIcon, path)
 
     update_application_icon()
     controller.trayStateChanged.connect(update_application_icon)
@@ -4554,7 +4568,9 @@ def run_settings_window(*, start_hidden: bool = False) -> int:
         root_objects = engine.rootObjects()
         if not root_objects:
             raise QtUnavailableError(f"无法加载 QML 设置界面：{main_qml} 未能成功加载。")
-        _mark_settings_window_for_activation(root_objects[0])
+        root_window = root_objects[0]
+        update_application_icon()
+        _mark_settings_window_for_activation(root_window)
 
         return app.exec()
     finally:

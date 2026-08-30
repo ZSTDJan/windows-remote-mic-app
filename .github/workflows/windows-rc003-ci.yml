@@ -93,6 +93,12 @@ jobs:
           python -m pip install -r requirements-dev.txt
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
+      - name: Generate shared Windows application icon
+        shell: pwsh
+        run: |
+          python build/generate-app-icon.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
       - name: Compile check
         shell: pwsh
         run: |
