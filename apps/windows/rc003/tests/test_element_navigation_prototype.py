@@ -2,6 +2,7 @@ import ast
 import importlib.util
 import json
 import random
+import subprocess
 import sys
 import tempfile
 import time
@@ -58,6 +59,57 @@ class SpatialNavigationTests(unittest.TestCase):
                     offset = (y * width + x) * 3
                     pixels[offset : offset + 3] = b"\x00\x00\x00"
         return bytes(pixels)
+
+    def test_legacy_entry_reexports_the_spatial_core_objects(self):
+        core = prototype._spatial_navigation_core
+
+        self.assertEqual(
+            Path(core.__file__).resolve(),
+            SCRIPT_PATH.with_name("spatial_navigation_core.py"),
+        )
+        self.assertIs(prototype.Direction, core.Direction)
+        self.assertIs(prototype.Rect, core.Rect)
+        self.assertIs(prototype.TargetSnapshot, core.TargetSnapshot)
+        self.assertIs(prototype.NavigationGraph, core.NavigationGraph)
+        self.assertIs(prototype.NavigationTraversal, core.NavigationTraversal)
+
+    def test_legacy_entry_reexports_every_spatial_core_symbol(self):
+        core = prototype._spatial_navigation_core
+
+        for name in core.__all__:
+            with self.subTest(name=name):
+                self.assertIs(getattr(prototype, name), getattr(core, name))
+
+    def test_spatial_core_imports_only_declared_standard_library_modules(self):
+        core_path = SCRIPT_PATH.with_name("spatial_navigation_core.py")
+        tree = ast.parse(core_path.read_text(encoding="utf-8"))
+        imported_modules = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                imported_modules.update(
+                    alias.name.split(".", 1)[0] for alias in node.names
+                )
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                imported_modules.add(node.module.split(".", 1)[0])
+
+        self.assertEqual(
+            imported_modules,
+            {"__future__", "collections", "dataclasses", "enum", "typing"},
+        )
+
+    def test_legacy_entry_help_works_from_an_arbitrary_directory(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            completed = subprocess.run(
+                [sys.executable, str(SCRIPT_PATH), "--help"],
+                cwd=temp_dir,
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn("--scan-only", completed.stdout)
 
     def test_ignores_elements_in_the_opposite_direction(self):
         current = prototype.Rect(100, 100, 160, 140)
