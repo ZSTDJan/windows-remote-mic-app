@@ -18,6 +18,8 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Callable, Iterable, Mapping, Optional, Sequence
 
+from . import product_identity
+
 VOICE_PROGRAM_NONE = "none"
 VOICE_PROGRAM_SOGOU = "sogou"
 VOICE_PROGRAM_WETYPE = "wetype"
@@ -227,7 +229,7 @@ def status_text(status: VoiceProgramStatus) -> str:
         if status.code == "running":
             return "微信输入法已安装并正在运行（由 Windows 管理）。"
     if status.code == "disabled":
-        return "未启用；Remote Mic 不会管理语音程序。"
+        return f"未启用；{product_identity.DISPLAY_NAME}不会管理语音程序。"
     if status.code == "not_found":
         return f"未找到{status.display_name}。"
     if status.code == "stopped":
@@ -257,7 +259,9 @@ def launch_result_text(result: VoiceProgramLaunchResult) -> str:
         "cancelled": "已取消管理员启动。",
         "launch_failed": "语音程序启动失败。",
         "not_requested": "没有设置随桥接启动。",
-        "system_managed": "该语音程序由 Windows 管理，Remote Mic 不单独启动它。",
+        "system_managed": (
+            f"该语音程序由 Windows 管理，{product_identity.DISPLAY_NAME}不单独启动它。"
+        ),
     }
     return messages.get(result.code, "语音程序状态未知。")
 

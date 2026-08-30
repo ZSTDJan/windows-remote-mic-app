@@ -18,6 +18,7 @@ from ovb_rc003 import (
     config,
     device_catalog,
     frida_compat,
+    product_identity,
     single_instance,
     windows_diagnostics,
 )
@@ -94,7 +95,9 @@ class BridgeModeRoutingTests(_ArgvRestoringTestCase):
 
         self.assertEqual(len(notice_calls), 1)
         self.assertIn("DJI Mic 2", notice_calls[0][0])
-        self.assertEqual(notice_calls[0][1]["title"], "Remote Mic")
+        self.assertEqual(
+            notice_calls[0][1]["title"], product_identity.DISPLAY_NAME
+        )
 
     def test_unexpected_bridge_runtime_failure_is_visible_and_sanitized(self):
         notice_calls = []

@@ -38,8 +38,11 @@ from . import (
     hotkey,
     key_mapping,
     logging_setup,
+    product_identity,
     win32_keys,
 )
+
+_OPEN_APPLICATION_DISPLAY = f"打开{product_identity.DISPLAY_NAME}"
 
 # Reference action names map to semantic values.  The Windows implementation
 # is intentionally behind these values; the dropdown must never turn
@@ -60,7 +63,7 @@ _REFERENCE_ACTION_LABELS: Dict[key_mapping.ActionKind, str] = {
     key_mapping.ActionKind.SYSTEM_VOLUME_DOWN: "系统音量 −",
     key_mapping.ActionKind.SYSTEM_VOLUME_MUTE: "系统静音",
     key_mapping.ActionKind.PLAY_PAUSE: "播放 / 暂停",
-    key_mapping.ActionKind.OPEN_REMOTE_MIC: "打开无线麦",
+    key_mapping.ActionKind.OPEN_REMOTE_MIC: _OPEN_APPLICATION_DISPLAY,
     key_mapping.ActionKind.OPEN_CODEX: "打开 Codex",
     key_mapping.ActionKind.OPEN_CLAUDE: "打开 Claude",
     key_mapping.ActionKind.OPEN_CMUX: "打开 cmux",
@@ -84,7 +87,7 @@ _PRESET_KEY_COMBOS = (
     "Escape", "Return", "Delete（退格）", "方向上", "方向下", "方向左", "方向右",
     "显示桌面", "上下文菜单", "应用切换", "系统音量 +", "系统音量 −",
     "系统静音", "播放 / 暂停",
-    "打开无线麦", "打开 Codex", "打开 Claude", "打开 cmux", "打开微信",
+    _OPEN_APPLICATION_DISPLAY, "打开 Codex", "打开 Claude", "打开 cmux", "打开微信",
     "打开 Cursor", "打开 Slack", "打开企业微信", "打开网易云音乐",
     "打开 Chrome", "打开 Edge", "打开 Zed",
     "lctrl+win", "ralt", "ralt+space", "tab", "space", "f5", "禁用",

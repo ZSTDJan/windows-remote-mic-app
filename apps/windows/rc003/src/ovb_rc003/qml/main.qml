@@ -6,7 +6,7 @@ import OvbRc003Settings 1.0
 
 ApplicationWindow {
     id: window
-    title: qsTr("Remote Mic 设置")
+    title: qsTr("%1 设置").arg(SettingsController.applicationDisplayName)
     width: 720
     height: 500
     minimumWidth: 640
@@ -85,7 +85,7 @@ ApplicationWindow {
         }
         menu: Platform.Menu {
             Platform.MenuItem {
-                text: qsTr("打开 Remote Mic")
+                text: qsTr("打开%1").arg(SettingsController.applicationDisplayName)
                 onTriggered: window.restoreWindow()
             }
             Platform.MenuSeparator {}

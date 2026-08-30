@@ -13,12 +13,22 @@
 $ErrorActionPreference = "Stop"
 $RC003Root = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $VenvPythonw = Join-Path $RC003Root ".venv\Scripts\pythonw.exe"
+$ProductName = -join @(
+    [char]0x65E0,
+    [char]0x7EBF,
+    [char]0x9EA6
+)
+$DevLabel = -join @(
+    [char]0x5F00,
+    [char]0x53D1,
+    [char]0x7248
+)
 
 function Show-LaunchError([string]$Message) {
     Add-Type -AssemblyName System.Windows.Forms
     [System.Windows.Forms.MessageBox]::Show(
         $Message,
-        "Remote Mic Dev",
+        "$ProductName $DevLabel",
         [System.Windows.Forms.MessageBoxButtons]::OK,
         [System.Windows.Forms.MessageBoxIcon]::Error
     ) | Out-Null

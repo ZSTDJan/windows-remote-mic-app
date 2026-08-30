@@ -9,9 +9,10 @@
 上游项目已经提供了 RC003 的 Windows 参考实现，包括 WinRT BLE、ATVV 语音协议、
 Windows Raw Input、SendInput、PortAudio 音频输出、Qt/QML 设置页、诊断、测试和
 PyInstaller/Inno Setup 构建流程。本仓库在 GPL-3.0-only 条件下保留并适配这些能力，
-并做了以下面向 Remote Mic 的改动：
+并做了以下面向无线麦的改动：
 
-- 应用、配置目录、互斥锁、安装器和发布产物统一使用 `Remote Mic` 名称；
+- 用户可见名称统一为“无线麦”；配置目录、互斥锁、EXE、安装器文件名和发布产物
+  继续保留 `RemoteMic` / `RC003` 内部兼容标识；
 - 适配本仓库现有的 `LICENSE.md`、`COPYRIGHT.md` 和第三方声明文件；
 - 补充中文安装、配对、VB-CABLE 配置、按键映射和故障排查说明；
 - 保留上游的失败关闭策略、隐私约束、跨平台协议测试和 Windows CI 校验；
@@ -32,7 +33,7 @@ RC003 的 ATVV UUID、控制命令、IMA/DVI ADPCM 解码和 HID 映射事实见
 [`richlearntodo-debug/vibe-flow`](https://github.com/richlearntodo-debug/vibe-flow)
 提交 `047f9d3ead54bf30de9b884adf8f7b5adefe9993`：优先点击
 `wetype.statusbar.window` 状态栏语音按钮，失败时使用分开的虚拟键 `SendInput`
-按下/抬起批次并保持 80 ms，再按本轮实际成功路径结束。Remote Mic 保留自身的
+按下/抬起批次并保持 80 ms，再按本轮实际成功路径结束。无线麦保留自身的
 RC003 多来源去重、音频输出、失败关闭和程序选择结构，没有复制言灵的界面或完整
 会话框架。
 
@@ -43,5 +44,5 @@ VB-CABLE 是 VB-Audio 的独立第三方软件，不属于本项目的 GPL 代�
 自身进程不会提权。
 
 搜狗及用户选择的其它语音输入程序同样是独立第三方软件，不属于本项目，也不会
-随 Remote Mic 打包。可选的语音程序管理只负责发现或启动本机已有程序；管理员
-启动必须由用户明确选择并通过 Windows UAC，Remote Mic 自身进程不会因此提权。
+随无线麦打包。可选的语音程序管理只负责发现或启动本机已有程序；管理员
+启动必须由用户明确选择并通过 Windows UAC，无线麦自身进程不会因此提权。

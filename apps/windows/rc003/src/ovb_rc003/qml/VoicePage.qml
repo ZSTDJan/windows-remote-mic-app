@@ -151,7 +151,8 @@ Item {
             return qsTr("按程序记忆；请在微信输入法设置中保持一致")
         if (windowsDictationSelected)
             return qsTr("Windows 语音输入固定使用 Win+H")
-        return qsTr("仅在 Remote Mic 中按程序记忆")
+        return qsTr("仅在%1中按程序记忆")
+            .arg(SettingsController.applicationDisplayName)
     }
 
     function startVoiceHotkeyCapture() {

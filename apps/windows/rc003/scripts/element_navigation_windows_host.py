@@ -35,6 +35,7 @@ def _run_windows(args: argparse.Namespace) -> int:
     from PySide6.QtCore import Qt, QRect, QTimer
     from PySide6.QtGui import QColor, QFont, QGuiApplication, QPainter, QPen
     from PySide6.QtWidgets import QApplication, QWidget
+    from ovb_rc003 import product_identity
 
     user32 = ctypes.windll.user32
     kernel32 = ctypes.windll.kernel32
@@ -3107,7 +3108,7 @@ def _run_windows(args: argparse.Namespace) -> int:
             auto.UninitializeUIAutomationInCurrentThread()
 
     app = QApplication(sys.argv[:1])
-    app.setApplicationName("Remote Mic Element Navigation Prototype")
+    app.setApplicationName(f"{product_identity.DISPLAY_NAME} 元素导航")
     prototype_process_id = int(kernel32.GetCurrentProcessId())
     overlay = NavigationOverlay()
     worker = AutomationWorker(diagnostics_enabled=bool(args.diagnostics))

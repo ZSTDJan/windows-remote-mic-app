@@ -336,7 +336,7 @@ class BridgeInstanceGuardDuplicateTests(unittest.TestCase):
                 ):
                     self.fail("the duplicate guard's body must never run")
         self.assertEqual(len(duplicate_close_calls), 1)
-        self.assertIn("already running", str(ctx.exception))
+        self.assertIn("无线麦", str(ctx.exception))
         self.assertIn("CloseHandle returned FALSE", str(ctx.exception))
 
     def test_duplicate_error_message_never_contains_the_raw_handle_value(self):
@@ -492,7 +492,7 @@ class ShowBridgeStartupBlockedNoticeTests(unittest.TestCase):
         )
         self.assertEqual(len(calls), 1)
         title, message = calls[0]
-        self.assertIn("Remote Mic", title)
+        self.assertEqual(title, "无线麦")
         self.assertEqual(message, "custom duplicate message")
 
     def test_falls_back_to_stderr_when_the_message_box_itself_fails(self):

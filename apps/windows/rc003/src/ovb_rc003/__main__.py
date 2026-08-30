@@ -82,6 +82,7 @@ import sys
 
 from . import __version__
 from . import dev_session
+from . import product_identity
 
 SETTINGS_STARTUP_FAILED_EXIT_CODE = 15
 BRIDGE_CONFIG_FAILED_EXIT_CODE = 16
@@ -89,7 +90,10 @@ BRIDGE_RUNTIME_FAILED_EXIT_CODE = 17
 
 
 def _print_help() -> None:
-    print(f"Remote Mic - 小米遥控器2 Pro Windows 客户端 {__version__}")
+    print(
+        f"{product_identity.DISPLAY_NAME} - 小米遥控器2 Pro Windows 客户端 "
+        f"{__version__}"
+    )
     print("Partially real-device verified - see this package's README.md and TESTING.md.")
     print()
     print("Usage:")
@@ -130,6 +134,7 @@ def _dry_run() -> int:
         identity,
         key_mapping,
         logging_setup,
+        product_identity,
         qt_settings_app,
         raw_input_windows,
         remote_layout,
@@ -204,15 +209,17 @@ def _run_bridge(*, quiet_duplicate: bool = False) -> None:
             file=sys.stderr,
         )
         single_instance.show_bridge_startup_blocked_notice(
-            "Remote Mic 无法读取现有配置，因此不会启动桥接，也不会覆盖原配置。"
+            f"{product_identity.DISPLAY_NAME}无法读取现有配置，因此不会启动桥接，"
+            "也不会覆盖原配置。"
             "请先打开设置目录检查 config.json 和 key_bindings.json。"
         )
         raise SystemExit(BRIDGE_CONFIG_FAILED_EXIT_CODE)
     if selected_device_id == device_catalog.DJI_MIC_2_ID:
         single_instance.show_bridge_startup_blocked_notice(
             "当前设备是 DJI Mic 2。它由 Windows 作为系统录音输入使用，不需要也不会启动 "
-            "小米遥控器2 Pro 的蓝牙按键与语音桥接。请在 Remote Mic 设置中检查录音端点。",
-            title="Remote Mic",
+            f"小米遥控器2 Pro 的蓝牙按键与语音桥接。请在{product_identity.DISPLAY_NAME}"
+            "设置中检查录音端点。",
+            title=product_identity.DISPLAY_NAME,
         )
         return
 
@@ -228,7 +235,7 @@ def _run_bridge(*, quiet_duplicate: bool = False) -> None:
         raise SystemExit(single_instance.DUPLICATE_INSTANCE_EXIT_CODE)
     except single_instance.SingleInstanceUnavailableError as exc:
         single_instance.show_bridge_startup_blocked_notice(
-            "Remote Mic could not verify no other instance "
+            f"{product_identity.DISPLAY_NAME} could not verify no other instance "
             f"is already running, so it will not start. ({exc})"
         )
         raise SystemExit(single_instance.GUARD_UNAVAILABLE_EXIT_CODE)
@@ -240,7 +247,7 @@ def _run_bridge(*, quiet_duplicate: bool = False) -> None:
         # sentence regardless of the exact underlying failure.
         print(f"single-instance mutex cleanup failed: {exc}", file=sys.stderr)
         single_instance.show_bridge_startup_blocked_notice(
-            "Remote Mic closed, but could not fully release "
+            f"{product_identity.DISPLAY_NAME} closed, but could not fully release "
             "its single-instance lock. If it will not start again, check "
             "Task Manager for a lingering process before retrying."
         )
@@ -251,7 +258,7 @@ def _run_bridge(*, quiet_duplicate: bool = False) -> None:
             file=sys.stderr,
         )
         single_instance.show_bridge_startup_blocked_notice(
-            "Remote Mic 桥接启动或运行失败，已停止本次进程。"
+            f"{product_identity.DISPLAY_NAME}桥接启动或运行失败，已停止本次进程。"
             "请打开日志目录查看固定诊断标记后重试。"
         )
         raise SystemExit(BRIDGE_RUNTIME_FAILED_EXIT_CODE)
@@ -342,7 +349,7 @@ def _run_settings(
             file=sys.stderr,
         )
         single_instance.show_bridge_startup_blocked_notice(
-            "Remote Mic 设置窗口无法启动。现有配置不会被自动覆盖；"
+            f"{product_identity.DISPLAY_NAME}设置窗口无法启动。现有配置不会被自动覆盖；"
             "请检查日志目录和配置文件后重试。"
         )
         raise SystemExit(SETTINGS_STARTUP_FAILED_EXIT_CODE)

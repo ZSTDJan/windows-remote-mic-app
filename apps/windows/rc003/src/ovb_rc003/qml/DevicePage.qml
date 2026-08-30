@@ -211,7 +211,8 @@ Item {
                     tokens: root.tokens
                     iconGlyph: "\uE7E8"
                     titleText: qsTr("随 Windows 启动")
-                    descriptionText: qsTr("登录后在通知区域后台运行 Remote Mic")
+                    descriptionText: qsTr("登录后在通知区域后台运行%1")
+                        .arg(SettingsController.applicationDisplayName)
 
                     Switch {
                         id: launchAtLoginSwitch

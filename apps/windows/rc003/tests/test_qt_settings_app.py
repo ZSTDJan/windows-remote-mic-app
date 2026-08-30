@@ -41,6 +41,7 @@ from ovb_rc003 import (
     hotkey,
     key_detection_bridge,
     key_mapping,
+    product_identity,
     qt_settings_app,
     remote_layout,
     settings_ui,
@@ -1158,6 +1159,13 @@ class SettingsControllerTests(unittest.TestCase):
         self.assertIn(
             settings_ui.SECONDARY_UNCONFIGURED_DISPLAY,
             controller.secondaryActionOptions,
+        )
+
+    def test_application_display_name_comes_from_product_identity(self):
+        controller, _ = self._make_controller()
+        self.assertEqual(
+            controller.applicationDisplayName,
+            product_identity.DISPLAY_NAME,
         )
 
     def test_combo_rows_cover_the_supported_second_keys(self):
@@ -5116,7 +5124,7 @@ class SettingsShellSourceContractTests(unittest.TestCase):
         )
         for misleading_claim in (
             "已授权",
-            "Remote Mic 需要管理员权限",
+            "无线麦需要管理员权限",
             "VB-CABLE 安装成功",
         ):
             self.assertNotIn(misleading_claim, self.voice_qml)
@@ -5478,7 +5486,7 @@ class OffscreenQmlLoadTests(unittest.TestCase):
         self.assertFalse(data["retired_finish_tap_control_exists"])
         self.assertFalse(data["voice_hotkey_recording"])
         self.assertEqual(data["saved_voice_hotkey"], "ctrl+shift+f8")
-        self.assertIn("快捷键已保存到 Remote Mic", data["voice_save_status"])
+        self.assertIn("快捷键已保存到无线麦", data["voice_save_status"])
         self.assertFalse(data["voice_feedback_on_device"])
         self.assertTrue(data["voice_feedback_on_voice"])
         self.assertTrue(data["mapping_dirty_on_buttons"])

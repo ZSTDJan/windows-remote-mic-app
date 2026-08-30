@@ -24,6 +24,11 @@ $root = [System.IO.Path]::GetFullPath($normalizedAppPath.Path).TrimEnd(
 )
 $rootPrefix = $root + [System.IO.Path]::DirectorySeparatorChar
 $targetExecutableName = "RemoteMicRC003.exe"
+$productName = -join @(
+    [char]0x65E0,
+    [char]0x7EBF,
+    [char]0x9EA6
+)
 
 $targetProcesses = @(
     Get-CimInstance Win32_Process |
@@ -111,7 +116,7 @@ try {
         }
     }
 } catch {
-    Write-Error "Remote Mic process could not be stopped."
+    Write-Error "$productName process could not be stopped."
     exit 1
 }
 
@@ -130,5 +135,5 @@ do {
     Start-Sleep -Milliseconds 100
 } while ([DateTime]::UtcNow -lt $deadline)
 
-Write-Error "Remote Mic process did not exit within the bounded timeout."
+Write-Error "$productName process did not exit within the bounded timeout."
 exit 2

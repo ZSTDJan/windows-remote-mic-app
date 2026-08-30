@@ -25,8 +25,8 @@
 ;     before PyInstaller ran, the frozen DistDir may contain it as optional
 ;     application data; runtime verifies it again before use.
 
-#define AppName "Remote Mic · 小米遥控器2 Pro"
-#define AppPublisher "Remote Mic contributors"
+#define AppName "无线麦"
+#define AppPublisher "无线麦项目"
 #define AppVersion "0.1.0-candidate"
 #define AppExeName "RemoteMicRC003.exe"
 #define AppFolder "RC003"
@@ -38,7 +38,8 @@ AppName={#AppName}
 AppVersion={#AppVersion}
 AppPublisher={#AppPublisher}
 DefaultDirName={localappdata}\RemoteMic\{#AppFolder}
-DefaultGroupName=Remote Mic
+DefaultGroupName=无线麦
+UsePreviousGroup=no
 DisableProgramGroupPage=yes
 PrivilegesRequired=lowest
 ArchitecturesAllowed=x64compatible
@@ -71,6 +72,20 @@ Source: "..\..\..\..\COPYRIGHT.md"; DestDir: "{app}"; DestName: "COPYRIGHT.txt";
 ;     below both depend on existing on disk AFTER install completes.
 Source: "stop-app.ps1"; DestDir: "{app}"; Flags: ignoreversion
 Source: "stop-app.ps1"; DestDir: "{tmp}"; Flags: dontcopy
+
+[InstallDelete]
+; Remove only shortcut names created by earlier releases with the same AppId.
+Type: files; Name: "{userdesktop}\Remote Mic · 小米遥控器2 Pro.lnk"
+Type: files; Name: "{userdesktop}\Remote Mic · RC003.lnk"
+Type: files; Name: "{userprograms}\Remote Mic\Remote Mic · 小米遥控器2 Pro.lnk"
+Type: files; Name: "{userprograms}\Remote Mic\Remote Mic · 小米遥控器2 Pro 设置.lnk"
+Type: files; Name: "{userprograms}\Remote Mic\停止 Remote Mic · 小米遥控器2 Pro.lnk"
+Type: files; Name: "{userprograms}\Remote Mic\卸载 Remote Mic · 小米遥控器2 Pro.lnk"
+Type: files; Name: "{userprograms}\Remote Mic\Remote Mic · RC003.lnk"
+Type: files; Name: "{userprograms}\Remote Mic\Remote Mic · RC003 设置.lnk"
+Type: files; Name: "{userprograms}\Remote Mic\停止 Remote Mic · RC003.lnk"
+Type: files; Name: "{userprograms}\Remote Mic\卸载 Remote Mic · RC003.lnk"
+Type: dirifempty; Name: "{userprograms}\Remote Mic"
 
 [Tasks]
 Name: "desktopicon"; Description: "创建桌面快捷方式"; GroupDescription: "附加图标:"; Flags: unchecked
@@ -111,7 +126,7 @@ begin
   end;
   if ResultCode <> 0 then
   begin
-    Result := 'Remote Mic 仍在运行或未能确认退出；请先退出程序后再重试安装。';
+    Result := '无线麦仍在运行或未能确认退出；请先退出程序后再重试安装。';
     exit;
   end;
 end;
@@ -127,7 +142,7 @@ begin
   if not FileExists(StopScript) then
   begin
     MsgBox(
-      '无法找到 Remote Mic 进程清理程序。卸载尚未开始，请修复或重新安装当前版本后重试。',
+      '无法找到无线麦进程清理程序。卸载尚未开始，请修复或重新安装当前版本后重试。',
       mbError,
       MB_OK
     );
@@ -141,7 +156,7 @@ begin
   if (not Started) or (ResultCode <> 0) then
   begin
     MsgBox(
-      'Remote Mic 仍在运行或未能确认退出。卸载尚未开始，请先退出程序后重试。',
+      '无线麦仍在运行或未能确认退出。卸载尚未开始，请先退出程序后重试。',
       mbError,
       MB_OK
     );

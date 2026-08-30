@@ -16,7 +16,7 @@ import sys
 import tempfile
 from typing import Optional
 
-from . import hotkey, voice_program_manager, win32_keys
+from . import hotkey, product_identity, voice_program_manager, win32_keys
 
 
 DEFAULT_PROVIDER_HOTKEYS = {
@@ -103,9 +103,10 @@ def read_provider_hotkey(
         voice_program_manager.VOICE_PROGRAM_CUSTOM,
     }:
         message = (
-            "微信输入法快捷键由 Remote Mic 按程序记忆，不自动打开或修改微信设置。"
+            f"微信输入法快捷键由{product_identity.DISPLAY_NAME}按程序记忆，"
+            "不自动打开或修改微信设置。"
             if provider == voice_program_manager.VOICE_PROGRAM_WETYPE
-            else "该程序只使用 Remote Mic 内的快捷键。"
+            else f"该程序只使用{product_identity.DISPLAY_NAME}内的快捷键。"
         )
         return VoiceHotkeySyncResult(
             provider, False, "local_only", message=message
@@ -146,9 +147,10 @@ def sync_provider_hotkey(
         voice_program_manager.VOICE_PROGRAM_CUSTOM,
     }:
         message = (
-            "快捷键已保存到 Remote Mic；请在微信输入法设置中保持一致。"
+            f"快捷键已保存到{product_identity.DISPLAY_NAME}；"
+            "请在微信输入法设置中保持一致。"
             if provider == voice_program_manager.VOICE_PROGRAM_WETYPE
-            else "快捷键已保存到 Remote Mic。"
+            else f"快捷键已保存到{product_identity.DISPLAY_NAME}。"
         )
         return VoiceHotkeySyncResult(
             provider, True, "local_only", normalized, message

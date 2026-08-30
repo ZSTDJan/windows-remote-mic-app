@@ -117,6 +117,7 @@ from . import (
     key_detection_bridge,
     key_mapping,
     logging_setup,
+    product_identity,
     remote_layout,
     raw_input_windows,
     resources,
@@ -173,6 +174,14 @@ def _apply_application_icon(app, window, icon_type, icon_path: Path) -> None:
     set_window_icon = getattr(window, "setIcon", None)
     if callable(set_window_icon):
         set_window_icon(icon)
+
+
+def _apply_application_identity(app) -> None:
+    """Applies the shared user-visible name to Qt's process identity."""
+
+    set_application_name = getattr(app, "setApplicationName", None)
+    if callable(set_application_name):
+        set_application_name(product_identity.DISPLAY_NAME)
 
 
 def _qml_directory() -> Path:
@@ -1885,7 +1894,7 @@ def _load_qt_classes() -> dict:
                         self._set_status_message("")
                         self._set_error_message(
                             result.message
-                            + " Remote Mic 已按语音程序当前值更新。",
+                            + f" {product_identity.DISPLAY_NAME}已按语音程序当前值更新。",
                             self._VOICE_PAGE_INDEX,
                         )
                     else:
@@ -1895,7 +1904,8 @@ def _load_qt_classes() -> dict:
                         self._set_error_message(
                             result.message
                             + f"；{adoption_error}"
-                            + " 语音程序当前值未能保存到 Remote Mic，两边仍不一致。",
+                            + f" 语音程序当前值未能保存到{product_identity.DISPLAY_NAME}，"
+                            "两边仍不一致。",
                             self._VOICE_PAGE_INDEX,
                         )
                 else:
@@ -2016,7 +2026,8 @@ def _load_qt_classes() -> dict:
                     self._set_status_message("")
                     self._set_error_message(
                         local_error
-                        + "；语音程序未能恢复原值，Remote Mic 已按其当前值更新。",
+                        + f"；语音程序未能恢复原值，{product_identity.DISPLAY_NAME}"
+                        "已按其当前值更新。",
                         self._VOICE_PAGE_INDEX,
                     )
                     self._finish_voice_hotkey_operation()
@@ -2028,7 +2039,8 @@ def _load_qt_classes() -> dict:
                     local_error
                     + f"；第三方程序快捷键未能恢复：{rollback.message}"
                     + f"；{reconciliation_error}"
-                    + " 语音程序当前值未能保存到 Remote Mic，两边仍不一致。",
+                    + f" 语音程序当前值未能保存到{product_identity.DISPLAY_NAME}，"
+                    "两边仍不一致。",
                     self._VOICE_PAGE_INDEX,
                 )
                 self._finish_voice_hotkey_operation()
@@ -2668,11 +2680,12 @@ def _load_qt_classes() -> dict:
         trayTooltip = Property(
             str,
             lambda self: (
-                f"Remote Mic：{device_catalog.RC003_DISPLAY_NAME} 已连接"
+                f"{product_identity.DISPLAY_NAME}：{device_catalog.RC003_DISPLAY_NAME} 已连接"
                 if self._bridge_connected
-                else f"Remote Mic：服务运行中，等待{device_catalog.RC003_DISPLAY_NAME}"
+                else f"{product_identity.DISPLAY_NAME}：服务运行中，等待"
+                f"{device_catalog.RC003_DISPLAY_NAME}"
                 if self._bridge_running
-                else "Remote Mic：服务未启动"
+                else f"{product_identity.DISPLAY_NAME}：服务未启动"
             ),
             notify=trayStateChanged,
         )
@@ -2772,6 +2785,11 @@ def _load_qt_classes() -> dict:
         remoteDisplayName = Property(
             str,
             lambda self: device_catalog.RC003_DISPLAY_NAME,
+            constant=True,
+        )
+        applicationDisplayName = Property(
+            str,
+            lambda self: product_identity.DISPLAY_NAME,
             constant=True,
         )
 
@@ -3131,7 +3149,7 @@ def _load_qt_classes() -> dict:
             except Exception:  # noqa: BLE001 - optional launch must not stop the UI
                 self._set_status_message("")
                 self._set_error_message(
-                    "语音程序启动失败；Remote Mic 和桥接不受影响。",
+                    f"语音程序启动失败；{product_identity.DISPLAY_NAME}和桥接不受影响。",
                     feedback_page_index,
                 )
                 self._request_voice_program_status_refresh()
@@ -4489,6 +4507,7 @@ def run_settings_window(*, start_hidden: bool = False) -> int:
     QQuickStyle.setStyle("FluentWinUI3")
 
     app = QGuiApplication.instance() or QGuiApplication(sys.argv)
+    _apply_application_identity(app)
     set_quit_on_last_window_closed = getattr(
         app, "setQuitOnLastWindowClosed", None
     )

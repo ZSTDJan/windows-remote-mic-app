@@ -1,4 +1,4 @@
-# Changelog — Remote Mic RC003 (Windows)
+# Changelog — 无线麦 RC003 (Windows)
 
 本项目按“候选发布”打标签。内部构建版本号固定在
 `installer/RemoteMicRC003Setup.iss` 的 `AppVersion`（当前 `0.1.0-candidate`），
@@ -47,6 +47,13 @@
 `bugs/BUG-024-settings-edit-state-and-stale-hold-config.md`、
    `bugs/BUG-025-bridge-startup-readiness-warning.md`、
    `bugs/BUG-026-bridge-liveness-and-first-key-readiness.md` 和 `TESTING.md`。
+
+### 2026-08-30 对外显示名统一为“无线麦”
+
+- 窗口标题、通知区域、用户提示、安装器、开始菜单、桌面快捷方式和公开使用说明统一
+  显示“无线麦”。升级安装会删除本项目旧版创建的精确旧名称快捷方式，避免两套入口并存。
+- `RemoteMicRC003.exe`、安装包文件名、`%LOCALAPPDATA%\RemoteMic\RC003`、自动
+  启动键、Mutex 和内部模块名保持不变，现有安装与用户配置无需迁移。
 
 ### 2026-08-30 统一桌面程序生命周期与三态图标
 

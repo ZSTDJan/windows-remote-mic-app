@@ -61,6 +61,8 @@ import sys
 from ctypes import wintypes
 from typing import Callable, List, NamedTuple, Optional
 
+from . import product_identity
+
 # Local\ (not Global\) scopes the mutex to the current Terminal Services /
 # Windows logon session, matching the task's "per-session/local name"
 # requirement - a second bridge started by a different logged-in user (or
@@ -391,7 +393,7 @@ class BridgeInstanceGuard:
         _release_mutex: ReleaseMutexFn = _real_release_mutex,
         _close_handle: CloseHandleFn = _real_close_handle,
         _duplicate_message: str = (
-            "another Remote Mic bridge instance is already running in this Windows session"
+            f"{product_identity.DISPLAY_NAME}的遥控器服务已在当前 Windows 会话中运行"
         ),
         _access_denied_means_duplicate: bool = False,
     ) -> None:
@@ -489,8 +491,7 @@ class SettingsInstanceGuard(BridgeInstanceGuard):
             _release_mutex=_release_mutex,
             _close_handle=_close_handle,
             _duplicate_message=(
-                "another Remote Mic settings window is already running "
-                "in this Windows session"
+                f"{product_identity.DISPLAY_NAME}设置窗口已在当前 Windows 会话中运行"
             ),
             _access_denied_means_duplicate=True,
         )
@@ -511,7 +512,7 @@ def _real_message_box(title: str, message: str) -> int:
 def show_bridge_startup_blocked_notice(
     message: str,
     *,
-    title: str = "Remote Mic",
+    title: str = product_identity.DISPLAY_NAME,
     _message_box: Callable[[str, str], int] = _real_message_box,
 ) -> None:
     """Shows a visible Windows message box for a bridge launch the
@@ -529,4 +530,4 @@ def show_bridge_startup_blocked_notice(
     try:
         _message_box(title, message)
     except Exception:
-        print(f"Remote Mic: {message}", file=sys.stderr)
+        print(f"{product_identity.DISPLAY_NAME}: {message}", file=sys.stderr)
