@@ -1074,6 +1074,14 @@ class DeveloperEntryScriptTests(unittest.TestCase):
         self.assertIn("run-dev.ps1", self.install_text)
         self.assertIn("-WindowStyle Hidden", self.install_text)
 
+    def test_shortcut_uses_a_stable_powershell_executable(self):
+        self.assertIn(
+            r"System32\WindowsPowerShell\v1.0\powershell.exe",
+            self.install_text,
+        )
+        self.assertIn("GetCurrentProcess().MainModule.FileName", self.install_text)
+        self.assertNotIn('Join-Path $PSHOME "powershell.exe"', self.install_text)
+
 
 class PublicBoundaryScriptTests(unittest.TestCase):
     def setUp(self):

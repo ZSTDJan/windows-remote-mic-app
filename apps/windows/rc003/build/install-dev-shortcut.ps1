@@ -32,7 +32,15 @@ if (-not $ShortcutPath) {
     $ShortcutPath = Join-Path $Desktop ($ProductName + " " + $DevLabel + ".lnk")
 }
 
-$PowerShellExe = Join-Path $PSHOME "powershell.exe"
+$WindowsPowerShellExe = Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe"
+if (Test-Path -LiteralPath $WindowsPowerShellExe -PathType Leaf) {
+    $PowerShellExe = $WindowsPowerShellExe
+} else {
+    $PowerShellExe = [System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
+    if (-not $PowerShellExe -or -not (Test-Path -LiteralPath $PowerShellExe -PathType Leaf)) {
+        throw "A usable PowerShell executable could not be found."
+    }
+}
 $ShortcutArguments = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File ""$RunScript"""
 $Shell = New-Object -ComObject WScript.Shell
 
