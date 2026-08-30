@@ -15,6 +15,7 @@ SCRIPT_PATH = (
     / "scripts"
     / "element_navigation_prototype.py"
 )
+TARGETING_CORE_PATH = SCRIPT_PATH.with_name("element_targeting_core.py")
 SPEC = importlib.util.spec_from_file_location("element_navigation_prototype", SCRIPT_PATH)
 assert SPEC is not None and SPEC.loader is not None
 prototype = importlib.util.module_from_spec(SPEC)
@@ -95,6 +96,43 @@ class SpatialNavigationTests(unittest.TestCase):
         self.assertEqual(
             imported_modules,
             {"__future__", "collections", "dataclasses", "enum", "typing"},
+        )
+
+    def test_legacy_entry_reexports_every_element_targeting_symbol(self):
+        targeting = prototype._element_targeting_core
+
+        self.assertEqual(Path(targeting.__file__).resolve(), TARGETING_CORE_PATH)
+        self.assertTrue(
+            set(targeting.__all__).isdisjoint(
+                prototype._spatial_navigation_core.__all__
+            )
+        )
+        for name in targeting.__all__:
+            with self.subTest(name=name):
+                self.assertIs(getattr(prototype, name), getattr(targeting, name))
+
+    def test_element_targeting_core_has_no_platform_or_entry_dependencies(self):
+        tree = ast.parse(TARGETING_CORE_PATH.read_text(encoding="utf-8"))
+        imported_modules = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                imported_modules.update(
+                    alias.name.split(".", 1)[0] for alias in node.names
+                )
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                imported_modules.add(node.module.split(".", 1)[0])
+
+        self.assertEqual(
+            imported_modules,
+            {
+                "__future__",
+                "collections",
+                "dataclasses",
+                "spatial_navigation_core",
+                "threading",
+                "time",
+                "typing",
+            },
         )
 
     def test_legacy_entry_help_works_from_an_arbitrary_directory(self):
