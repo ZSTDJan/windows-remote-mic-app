@@ -38,6 +38,10 @@ ApplicationWindow {
     }
 
     onClosing: function(close) {
+        if (SettingsController.applicationExitConfirmed) {
+            close.accepted = true
+            return
+        }
         close.accepted = false
         if (SettingsController.closeBehavior === "quit") {
             window.hide()

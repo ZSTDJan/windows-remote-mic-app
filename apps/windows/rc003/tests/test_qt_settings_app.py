@@ -518,16 +518,41 @@ class SettingsControllerTests(unittest.TestCase):
         self.assertEqual(calls, [True])
         self.assertFalse(controller.launchAtLogin)
 
-    def test_full_exit_waits_for_the_bridge_to_stop(self):
+    def test_full_exit_without_a_bridge_is_immediate(self):
         controller, _model = self._make_controller()
         ready = []
-        controller.applicationExitReady.connect(lambda: ready.append(True))
+        controller.applicationExitReady.connect(
+            lambda: ready.append(controller.applicationExitConfirmed)
+        )
         with mock.patch.object(
             qt_settings_app.bridge_control_windows,
             "request_bridge_exit",
-            return_value=qt_settings_app.bridge_control_windows.BridgeExitResult(
-                requested=True,
-                stopped=True,
+        ) as request_exit:
+            controller.requestApplicationExit()
+
+        self.assertEqual(ready, [True])
+        request_exit.assert_not_called()
+        self.assertFalse(controller._application_exit_requested)
+
+    def test_full_exit_waits_for_the_bridge_to_stop(self):
+        controller, _model = self._make_controller()
+        ready = []
+        controller.applicationExitReady.connect(
+            lambda: ready.append(controller.applicationExitConfirmed)
+        )
+        with (
+            mock.patch.object(
+                qt_settings_app.single_instance,
+                "bridge_instance_running",
+                return_value=True,
+            ),
+            mock.patch.object(
+                qt_settings_app.bridge_control_windows,
+                "request_bridge_exit",
+                return_value=qt_settings_app.bridge_control_windows.BridgeExitResult(
+                    requested=True,
+                    stopped=True,
+                ),
             ),
         ):
             controller.requestApplicationExit()
@@ -539,11 +564,18 @@ class SettingsControllerTests(unittest.TestCase):
         controller, _model = self._make_controller()
         failures = []
         controller.applicationExitFailed.connect(failures.append)
-        with mock.patch.object(
-            qt_settings_app.bridge_control_windows,
-            "request_bridge_exit",
-            side_effect=RuntimeError("simulated control failure"),
-        ) as request_exit:
+        with (
+            mock.patch.object(
+                qt_settings_app.single_instance,
+                "bridge_instance_running",
+                return_value=True,
+            ),
+            mock.patch.object(
+                qt_settings_app.bridge_control_windows,
+                "request_bridge_exit",
+                side_effect=RuntimeError("simulated control failure"),
+            ) as request_exit,
+        ):
             controller.requestApplicationExit()
             controller.requestApplicationExit()
 
@@ -3794,6 +3826,32 @@ class RunSettingsWindowShutdownCoverageTests(unittest.TestCase):
 # unavailable" / "TextEditingContextMenu unavailable", a separate QQC2
 # per-process-singleton limitation from the FluentWinUI3 Config one
 # documented on RenderedContrastTests above).
+_APPLICATION_EXIT_PROBE_SCRIPT = r"""
+import json
+import time
+
+from PySide6.QtCore import QTimer
+from ovb_rc003 import qt_settings_app as m
+
+m.single_instance.bridge_instance_running = lambda: False
+original_connect_application_exit = m._connect_application_exit
+
+
+def connect_application_exit_and_schedule(app, controller):
+    original_connect_application_exit(app, controller)
+    QTimer.singleShot(50, controller.requestApplicationExit)
+
+
+m._connect_application_exit = connect_application_exit_and_schedule
+started = time.monotonic()
+result = m.run_settings_window(start_hidden=True)
+print(json.dumps({
+    "result": result,
+    "elapsed": time.monotonic() - started,
+}))
+"""
+
+
 _QML_LOAD_PROBE_SCRIPT = r"""
 import faulthandler
 import json
@@ -5148,6 +5206,7 @@ class SettingsShellSourceContractTests(unittest.TestCase):
         self.assertNotIn('objectName: "generalTabButton"', self.main_qml)
         self.assertIn('objectName: "systemTrayIcon"', self.main_qml)
         self.assertIn("SettingsController.requestApplicationExit()", self.main_qml)
+        self.assertIn("SettingsController.applicationExitConfirmed", self.main_qml)
 
         runtime_log_index = self.device_qml.index(
             'objectName: "runtimeLogRow"'
@@ -5595,6 +5654,33 @@ class SelectionComboBoxBehaviorTests(unittest.TestCase):
         self.assertEqual(data["recommended"], "（推荐） CABLE Input")
         self.assertEqual(data["bold_initial"], [True, False])
         self.assertEqual(data["bold_after_move"], [False, True])
+
+
+@unittest.skipUnless(_HAS_PYSIDE6, _SKIP_REASON)
+class ApplicationExitIntegrationTests(unittest.TestCase):
+    def test_full_exit_closes_the_real_hidden_qml_window(self):
+        import subprocess
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            env = dict(os.environ)
+            env.setdefault("QT_QPA_PLATFORM", "offscreen")
+            env["LOCALAPPDATA"] = tmpdir
+            result = subprocess.run(
+                [sys.executable, "-c", _APPLICATION_EXIT_PROBE_SCRIPT],
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+
+        self.assertEqual(
+            result.returncode,
+            0,
+            f"application exit probe failed: {result.stderr}",
+        )
+        data = json.loads(result.stdout.strip().splitlines()[-1])
+        self.assertEqual(data["result"], 0)
+        self.assertLess(data["elapsed"], 5.0)
 
 
 @unittest.skipUnless(_HAS_PYSIDE6, _SKIP_REASON)

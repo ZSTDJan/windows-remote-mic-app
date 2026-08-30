@@ -914,6 +914,7 @@ def _load_qt_classes() -> dict:
             startup_state = startup_windows.read_startup_state()
             self._launch_at_login = startup_state.enabled
             self._application_exit_requested = False
+            self._application_exit_confirmed = False
             self._bindings = config.load_key_bindings(
                 config.key_bindings_path(self._config_root)
             )
@@ -2677,6 +2678,10 @@ def _load_qt_classes() -> dict:
             lambda self: self._close_behavior,
             notify=desktopBehaviorChanged,
         )
+        applicationExitConfirmed = Property(
+            bool,
+            lambda self: self._application_exit_confirmed,
+        )
         closeBehaviorOptions = Property(
             list,
             lambda self: ["隐藏到通知区域", "完全退出"],
@@ -3065,6 +3070,22 @@ def _load_qt_classes() -> dict:
         def requestApplicationExit(self) -> None:
             if self._application_exit_requested:
                 return
+
+            try:
+                bridge_running = single_instance.bridge_instance_running()
+            except (
+                single_instance.SingleInstanceUnavailableError,
+                single_instance.MutexCleanupError,
+            ):
+                bridge_running = True
+
+            if not bridge_running:
+                # Keep the common tray-menu path on Qt's thread. There is no
+                # bridge cleanup to wait for, so the application can quit now.
+                self._application_exit_confirmed = True
+                self.applicationExitReady.emit()
+                return
+
             self._application_exit_requested = True
 
             def stop_and_exit() -> None:
@@ -3078,6 +3099,7 @@ def _load_qt_classes() -> dict:
                     return
                 if result.stopped:
                     self._application_exit_requested = False
+                    self._application_exit_confirmed = True
                     self.applicationExitReady.emit()
                     return
                 self._application_exit_requested = False
