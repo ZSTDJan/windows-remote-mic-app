@@ -4706,6 +4706,11 @@ capture_page(
         "buttonReceiverRow",
         "remoteServiceRow",
         "runtimeLogRow",
+        "desktopBehaviorSection",
+        "desktopBehaviorSectionTitle",
+        "launchAtLoginRow",
+        "launchBridgeOnAppStartRow",
+        "closeBehaviorRow",
     ),
 )
 capture_page(
@@ -5729,6 +5734,27 @@ class OffscreenQmlLoadTests(unittest.TestCase):
                     self.assertLessEqual(
                         device_items[first]["bottom"], device_items[second]["y"] + 1
                     )
+                self.assertLessEqual(
+                    device_items["runtimeLogRow"]["bottom"],
+                    device_items["desktopBehaviorSection"]["y"] + 1,
+                )
+                self.assertGreaterEqual(
+                    device_items["desktopBehaviorSectionTitle"]["y"],
+                    device_items["desktopBehaviorSection"]["y"],
+                )
+                for first, second in (
+                    ("desktopBehaviorSectionTitle", "launchAtLoginRow"),
+                    ("launchAtLoginRow", "launchBridgeOnAppStartRow"),
+                    ("launchBridgeOnAppStartRow", "closeBehaviorRow"),
+                ):
+                    self.assertLessEqual(
+                        device_items[first]["bottom"],
+                        device_items[second]["y"] + 1,
+                    )
+                self.assertLessEqual(
+                    device_items["closeBehaviorRow"]["bottom"],
+                    device_items["desktopBehaviorSection"]["bottom"] + 1,
+                )
 
                 voice_items = data["pages"]["voice"]["items"]
                 self.assertLessEqual(
