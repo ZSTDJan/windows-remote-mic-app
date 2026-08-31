@@ -66,6 +66,10 @@ class ProductIdentityTests(unittest.TestCase):
             self.assertIn("SettingsController.applicationDisplayName", text)
             self.assertNotIn("Remote Mic", text)
 
+        main_qml = (qml_dir / "main.qml").read_text(encoding="utf-8")
+        self.assertIn("title: SettingsController.applicationDisplayName", main_qml)
+        self.assertNotIn('title: qsTr("%1 设置")', main_qml)
+
     def test_qt_process_identity_uses_the_shared_display_name(self):
         calls = []
 
