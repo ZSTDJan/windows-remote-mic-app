@@ -98,9 +98,19 @@ try {
         "remote-mic-rc003-tests-{0}.log" -f [guid]::NewGuid().ToString("N")
     )
     try {
-        & $venvPython -u -W error::ResourceWarning -m unittest discover -s tests -t . -p "test_*.py" -v 2>&1 |
-            Tee-Object -FilePath $testLogPath
-        $testExitCode = $LASTEXITCODE
+        # unittest writes normal progress to stderr. Windows PowerShell turns
+        # redirected native stderr into non-terminating ErrorRecord objects;
+        # with the script-wide Stop policy those ordinary lines would abort
+        # the build before the real process exit code can be checked.
+        $previousErrorActionPreference = $ErrorActionPreference
+        try {
+            $ErrorActionPreference = "Continue"
+            & $venvPython -u -W error::ResourceWarning -m unittest discover -s tests -t . -p "test_*.py" -v 2>&1 |
+                Tee-Object -FilePath $testLogPath
+            $testExitCode = $LASTEXITCODE
+        } finally {
+            $ErrorActionPreference = $previousErrorActionPreference
+        }
         if ($testExitCode -ne 0) {
             throw "python -m unittest discover failed with exit code $testExitCode"
         }

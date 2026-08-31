@@ -1029,6 +1029,19 @@ class BuildCandidateScriptTests(unittest.TestCase):
             self.assertIn(f'"{pattern}"', self.text)
         self.assertIn("Remove-Item -LiteralPath $testLogPath", self.text)
 
+    def test_unittest_stderr_progress_does_not_bypass_the_exit_code_gate(self):
+        self.assertIn(
+            "$previousErrorActionPreference = $ErrorActionPreference",
+            self.text,
+        )
+        self.assertIn('$ErrorActionPreference = "Continue"', self.text)
+        self.assertIn(
+            "$ErrorActionPreference = $previousErrorActionPreference",
+            self.text,
+        )
+        self.assertIn("$testExitCode = $LASTEXITCODE", self.text)
+        self.assertIn("if ($testExitCode -ne 0)", self.text)
+
     def test_local_build_disables_all_live_keyboard_input(self):
         self.assertIn('$env:RC003_DISABLE_LIVE_INPUT = "1"', self.text)
         self.assertIn('$env:RC003_ALLOW_LIVE_INPUT_TESTS = "0"', self.text)
