@@ -1,5 +1,6 @@
 import QtQuick
 import QtQuick.Controls
+import QtQuick.Effects
 import QtQuick.Layouts
 import Qt.labs.platform as Platform
 import OvbRc003Settings 1.0
@@ -431,29 +432,28 @@ ApplicationWindow {
     }
 
     Rectangle {
-        id: clientShellShadowFar
-        objectName: "clientShellShadowFar"
+        id: clientShellShadowSource
+        objectName: "clientShellShadowSource"
         anchors.fill: clientShell
-        anchors.margins: -tokens.windowShadowFarSpread
-        color: "transparent"
-        radius: tokens.windowClientRadius + tokens.windowShadowFarSpread
-        border.width: 1
-        border.color: "#000000"
-        opacity: tokens.windowShadowFarOpacity
-        antialiasing: true
+        radius: tokens.windowClientRadius
+        color: tokens.background
+        layer.enabled: true
     }
 
-    Rectangle {
-        id: clientShellShadowNear
-        objectName: "clientShellShadowNear"
-        anchors.fill: clientShell
-        anchors.margins: -tokens.windowShadowNearSpread
-        color: "transparent"
-        radius: tokens.windowClientRadius + tokens.windowShadowNearSpread
-        border.width: 1
-        border.color: "#000000"
-        opacity: tokens.windowShadowNearOpacity
-        antialiasing: true
+    MultiEffect {
+        id: clientShellShadow
+        objectName: "clientShellShadow"
+        anchors.fill: clientShellShadowSource
+        source: clientShellShadowSource
+        autoPaddingEnabled: true
+        shadowEnabled: true
+        shadowColor: "#000000"
+        shadowOpacity: tokens.windowShadowOpacity
+        shadowBlur: 1
+        shadowScale: tokens.windowShadowScale
+        shadowHorizontalOffset: 0
+        shadowVerticalOffset: tokens.windowShadowVerticalOffset
+        blurMax: tokens.windowShadowBlurMax
     }
 
     Rectangle {

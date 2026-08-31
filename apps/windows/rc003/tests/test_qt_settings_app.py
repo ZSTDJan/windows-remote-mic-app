@@ -6585,7 +6585,7 @@ class ThreePageSettingsSourceContractTests(unittest.TestCase):
         self.assertIn("radius: tokens.windowClientRadius", self.main_qml)
         self.assertIn("border.color: tokens.windowFrameBorder", self.main_qml)
         self.assertIn(
-            'property color windowFrame: darkMode ? "#101318" : "#f5f6f8"',
+            'property color windowFrame: darkMode ? "#101318" : "#eef0f2"',
             self.tokens_qml,
         )
         self.assertIn(
@@ -6593,10 +6593,14 @@ class ThreePageSettingsSourceContractTests(unittest.TestCase):
             self.tokens_qml,
         )
         self.assertIn("property real hairlineWidth: 0.5", self.tokens_qml)
-        self.assertIn('objectName: "clientShellShadowNear"', self.main_qml)
-        self.assertIn('objectName: "clientShellShadowFar"', self.main_qml)
-        self.assertIn("opacity: tokens.windowShadowNearOpacity", self.main_qml)
-        self.assertIn("opacity: tokens.windowShadowFarOpacity", self.main_qml)
+        self.assertIn("import QtQuick.Effects", self.main_qml)
+        self.assertIn('objectName: "clientShellShadowSource"', self.main_qml)
+        self.assertIn('objectName: "clientShellShadow"', self.main_qml)
+        self.assertIn("shadowOpacity: tokens.windowShadowOpacity", self.main_qml)
+        self.assertIn("shadowScale: tokens.windowShadowScale", self.main_qml)
+        self.assertIn("blurMax: tokens.windowShadowBlurMax", self.main_qml)
+        self.assertNotIn("clientShellShadowNear", self.main_qml)
+        self.assertNotIn("clientShellShadowFar", self.main_qml)
 
     def test_regular_frames_share_one_hairline_width(self):
         for source in (

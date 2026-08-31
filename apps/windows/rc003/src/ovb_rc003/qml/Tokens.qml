@@ -12,7 +12,7 @@ QtObject {
         + palette.window.b * 0.114 < 0.5
 
     property color background: darkMode ? "#171a1f" : "#f5f6f8"
-    property color windowFrame: darkMode ? "#101318" : "#f5f6f8"
+    property color windowFrame: darkMode ? "#101318" : "#eef0f2"
     property color windowFrameBorder: darkMode ? "#343941" : "#dfe1e4"
     property color surface: darkMode ? "#20242b" : "#ffffff"
     property color surfaceMuted: darkMode ? "#282d35" : "#f1f3f5"
@@ -54,10 +54,10 @@ QtObject {
     property int windowClientRadius: 9
     property int windowFrameGap: 3
     property real hairlineWidth: 0.5
-    property real windowShadowNearSpread: 1
-    property real windowShadowFarSpread: 2
-    property real windowShadowNearOpacity: darkMode ? 0.24 : 0.10
-    property real windowShadowFarOpacity: darkMode ? 0.12 : 0.05
+    property int windowShadowBlurMax: 8
+    property real windowShadowOpacity: darkMode ? 0.30 : 0.22
+    property real windowShadowScale: 1.006
+    property int windowShadowVerticalOffset: 1
     property int spacingTiny: 3
     property int spacingSmall: 6
     property int spacingMedium: 8
