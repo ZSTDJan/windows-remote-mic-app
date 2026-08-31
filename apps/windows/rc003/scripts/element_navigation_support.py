@@ -83,10 +83,10 @@ class DirectionRepeatGate:
     def __init__(
         self,
         *,
-        repeat_suspect_after: float = 0.300,
-        repeat_suspect_until: float = 0.600,
+        repeat_suspect_after: float = 0.220,
+        repeat_suspect_until: float = 0.750,
         repeat_confirm_min_gap: float = 0.070,
-        repeat_confirm_max_gap: float = 0.240,
+        repeat_confirm_max_gap: float = 0.400,
         repeat_output_min_gap: float = 0.080,
     ) -> None:
         self.repeat_suspect_after = repeat_suspect_after

@@ -3754,6 +3754,20 @@ assert not any(name == "PySide6" or name.startswith("PySide6.") for name in sys.
         self.assertTrue(gate.allow(prototype.VK_UP, 20.530, injected=True))
         self.assertTrue(gate.allow(prototype.VK_UP, 20.720, injected=True))
 
+    def test_rc003_early_repeat_does_not_skip_the_next_target(self):
+        for vk in (
+            prototype.VK_UP,
+            prototype.VK_DOWN,
+            prototype.VK_LEFT,
+            prototype.VK_RIGHT,
+        ):
+            with self.subTest(vk=vk):
+                gate = prototype.DirectionRepeatGate()
+                self.assertTrue(gate.allow(vk, 60.000, injected=True))
+                self.assertFalse(gate.allow(vk, 60.274, injected=True))
+                self.assertTrue(gate.allow(vk, 60.511, injected=True))
+                self.assertTrue(gate.allow(vk, 60.748, injected=True))
+
     def test_fast_deliberate_injected_taps_remain_independent(self):
         gate = prototype.DirectionRepeatGate()
 
