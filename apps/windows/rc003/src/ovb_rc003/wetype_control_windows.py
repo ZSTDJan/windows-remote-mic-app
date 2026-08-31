@@ -210,7 +210,10 @@ class WeTypeVoiceControl:
                 self._logger.info("WeType completion wait superseded by a new session")
                 return
             if self._find_panel() is None:
-                self._logger.info("WeType voice completion observed after submit")
+                self._logger.info(
+                    "WeType voice panel closed after submit; target text insertion "
+                    "requires the separate focus/result diagnostic"
+                )
                 return
             self._sleep(_COMPLETION_POLL_SECONDS)
 
@@ -220,7 +223,10 @@ class WeTypeVoiceControl:
                 return
             panel = self._find_panel()
             if panel is None:
-                self._logger.info("WeType voice completion observed after submit")
+                self._logger.info(
+                    "WeType voice panel closed after submit; target text insertion "
+                    "requires the separate focus/result diagnostic"
+                )
                 return
             sent = self._close_panel(panel)
         self._logger.info(

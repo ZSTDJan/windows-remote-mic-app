@@ -50,6 +50,7 @@ Item {
             !== (SettingsController.voiceProgramElevationStatus === "elevated")
     readonly property bool voiceProgramNeedsAttention:
         voiceProgramPrivilegeUnknown || voiceProgramPrivilegeMismatch
+        || SettingsController.voiceProgramStatusCode === "running_not_ready"
     readonly property color voiceProgramStateColor:
         voiceProgramSystemManaged
             && (SettingsController.voiceProgramStatusCode === "running"
@@ -124,6 +125,8 @@ Item {
             }
             return elevated ? qsTr("管理员运行中") : qsTr("普通权限运行中")
         }
+        if (code === "running_not_ready")
+            return qsTr("运行中 · 窗口未就绪")
         if (code === "stopped")
             return SettingsController.bridgeRunning
                 && SettingsController.voiceProgramSettingsDirty

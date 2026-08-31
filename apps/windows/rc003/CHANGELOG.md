@@ -46,7 +46,23 @@
 `bugs/BUG-023-host-voice-release-finish.md`、
 `bugs/BUG-024-settings-edit-state-and-stale-hold-config.md`、
    `bugs/BUG-025-bridge-startup-readiness-warning.md`、
-   `bugs/BUG-026-bridge-liveness-and-first-key-readiness.md` 和 `TESTING.md`。
+`bugs/BUG-026-bridge-liveness-and-first-key-readiness.md` 和 `TESTING.md`。
+
+### 2026-08-31 服务自检、语音结果诊断与首次唤起修复
+
+- 桥接运行状态升级为兼容旧文件的 schema 2，增加版本/构建来源、BLE、Raw Input、
+  HID tap、最近按键和语音活动，并以 5 秒心跳保持新鲜度。设置页不再只凭互斥锁显示
+  “已运行”；其它构建或两个按键通道明确失败时仅在语音空闲状态正常恢复一次，旧状态
+  或心跳滞后只提供人工“重新启动”。
+- 语音开始和结束增加隐私受限诊断，只比较前台进程、控件类名、焦点和文本长度，明确
+  区分“面板关闭”与“文字已上屏”，不读取窗口标题、文字或语音内容。
+- 搜狗通过已登记的 `SogouComMgr.exe` 组件入口在桥接启动时预热一次；实际按键后若可见
+  语音窗口仍未就绪，只再修复检查一次，不循环发送快捷键。微信复用同一结果诊断，
+  不套用搜狗预热。
+- “显示桌面”由切换型 `Win+D` 改为单向 `Win+M`，遥控器重复上报不会再把窗口恢复；
+  其它内置动作保持现有行为。完全退出继续等待桥接正常清理，不新增强杀路径。
+- 自动检查完成后仍需用真实 RC003、搜狗/微信输入法和目标输入框验证首次唤起、文字上屏、
+  显示桌面连按和完全退出；本轮不构建、不打包、不发布。
 
 ### 2026-08-30 对外显示名统一为“无线麦”
 

@@ -104,6 +104,7 @@ from pathlib import Path
 from typing import Callable, Dict, List, Optional
 
 from . import (
+    __version__,
     audio_playback,
     audio_output,
     bridge_control_windows,
@@ -317,6 +318,7 @@ _APPLICATION_EXIT_SAVE_WAIT_TIMEOUT_SECONDS = (
     + _SETTINGS_BACKGROUND_JOIN_SAFETY_MARGIN_SECONDS
 )
 _APPLICATION_EXIT_POLL_INTERVAL_MS = 100
+_BRIDGE_STATUS_STALE_AFTER_SECONDS = 20.0
 
 
 @dataclass(frozen=True)
@@ -896,6 +898,7 @@ def _load_qt_classes() -> dict:
         bridgeConnectedChanged = Signal()
         bridgeLaunchPhaseChanged = Signal()
         bridgeLaunchElapsedSecondsChanged = Signal()
+        bridgeRestartRecommendedChanged = Signal()
         desktopBehaviorChanged = Signal()
         trayStateChanged = Signal()
         applicationExitReady = Signal()
@@ -944,6 +947,7 @@ def _load_qt_classes() -> dict:
         _endpointPreflightReady = Signal(object)
         _inputOperationReady = Signal(object)
         _applicationExitStopReady = Signal(object)
+        _bridgeRestartStopReady = Signal(object)
 
         _TRIGGER_MODE_ORDER = (key_mapping.VoiceTriggerMode.HOLD,)
         _DEVICE_ORDER = (device_catalog.RC003_ID,)
@@ -1002,6 +1006,9 @@ def _load_qt_classes() -> dict:
             self._save_then_exit_requested = False
             self._applicationExitStopReady.connect(
                 self._on_application_exit_stop_ready
+            )
+            self._bridgeRestartStopReady.connect(
+                self._on_bridge_restart_stop_ready
             )
             self._window_hide_requested = False
             self._bindings = config.load_key_bindings(
@@ -1070,6 +1077,12 @@ def _load_qt_classes() -> dict:
                     if self._bridge_running
                     else settings_ui.LAUNCH_NOT_STARTED_TEXT
                 )
+            self._current_runtime_identity = (
+                bridge_runtime_status.current_runtime_identity(__version__)
+            )
+            self._bridge_restart_recommended = False
+            self._bridge_recovery_attempted = False
+            self._bridge_recovery_running = False
             runtime_status = (
                 bridge_runtime_status.read_status(self._config_root)
                 if self._bridge_running
@@ -1106,6 +1119,18 @@ def _load_qt_classes() -> dict:
                         f"服务运行中；{device_catalog.RC003_DISPLAY_NAME} 状态未知，"
                         "正在检查"
                     )
+                )
+            if self._bridge_running and runtime_status is not None:
+                self._launch_status_text = self._describe_runtime_status(
+                    runtime_status
+                )
+                identity_match = bridge_runtime_status.runtime_identity_matches(
+                    runtime_status,
+                    self._current_runtime_identity,
+                )
+                self._bridge_restart_recommended = (
+                    identity_match is not True
+                    or bridge_runtime_status.input_channels_failed(runtime_status)
                 )
             self._has_explicit_launch_result = False
             self._status_message = ""
@@ -1592,6 +1617,105 @@ def _load_qt_classes() -> dict:
             self.bridgeConnectedChanged.emit()
             self.trayStateChanged.emit()
 
+        def _set_bridge_restart_recommended(self, value: bool) -> None:
+            value = bool(value)
+            if value == self._bridge_restart_recommended:
+                return
+            self._bridge_restart_recommended = value
+            self.bridgeRestartRecommendedChanged.emit()
+
+        def _describe_runtime_status(
+            self,
+            status: bridge_runtime_status.BridgeRuntimeStatus,
+        ) -> str:
+            connected = (
+                status.state
+                is bridge_runtime_status.BridgeConnectionState.CONNECTED
+            )
+            connection_text = (
+                f"{device_catalog.RC003_DISPLAY_NAME} 已连接"
+                if connected
+                else f"等待{device_catalog.RC003_DISPLAY_NAME}连接"
+            )
+            identity_match = bridge_runtime_status.runtime_identity_matches(
+                status,
+                self._current_runtime_identity,
+            )
+            if identity_match is True:
+                identity_text = f"当前版本 {status.app_version}"
+            elif identity_match is False:
+                identity_text = f"其它版本 {status.app_version or '未知'}"
+            else:
+                identity_text = "旧版服务，来源未确认"
+
+            ready_hid_states = {
+                frida_compat.HidTapState.READY.value,
+                frida_compat.HidTapState.ATTACHED_WAITING_IO.value,
+                frida_compat.HidTapState.INJECTING.value,
+            }
+            raw_ready = status.raw_input_state == "ready"
+            tap_ready = status.hid_tap_state in ready_hid_states
+            if raw_ready and tap_ready:
+                input_text = "两个按键通道正常"
+            elif raw_ready or tap_ready:
+                input_text = "按键通道可用"
+            elif bridge_runtime_status.input_channels_failed(status):
+                input_text = "两个按键通道异常"
+            else:
+                input_text = "按键通道正在检查"
+            if status.last_button_at is not None:
+                age = max(0.0, time.time() - status.last_button_at)
+                if age <= 10.0:
+                    input_text += f"，刚收到按键（{status.last_button_source or '来源未知'}）"
+            voice_text = "语音进行中" if status.voice_active else "语音空闲"
+            stale_text = (
+                "；状态更新滞后"
+                if time.time() - status.updated_at
+                > _BRIDGE_STATUS_STALE_AFTER_SECONDS
+                else ""
+            )
+            return (
+                f"服务运行中；{connection_text}；{identity_text}；"
+                f"{input_text}；{voice_text}{stale_text}"
+            )
+
+        def _update_bridge_restart_recommendation(
+            self,
+            status: Optional[bridge_runtime_status.BridgeRuntimeStatus],
+            *,
+            schedule_recovery: bool,
+        ) -> None:
+            recommended = False
+            automatic = False
+            if status is not None:
+                identity_match = bridge_runtime_status.runtime_identity_matches(
+                    status,
+                    self._current_runtime_identity,
+                )
+                if identity_match is not True:
+                    recommended = True
+                    automatic = identity_match is False and not status.voice_active
+                elif bridge_runtime_status.input_channels_failed(status):
+                    recommended = True
+                    automatic = not status.voice_active
+                elif (
+                    time.time() - status.updated_at
+                    > _BRIDGE_STATUS_STALE_AFTER_SECONDS
+                ):
+                    recommended = True
+            self._set_bridge_restart_recommended(recommended)
+            if (
+                automatic
+                and schedule_recovery
+                and not self._bridge_recovery_attempted
+                and not self._bridge_recovery_running
+                and not self._get_bridge_launch_busy()
+                and not self._application_exit_requested
+                and not self._application_exit_confirmed
+            ):
+                self._bridge_recovery_attempted = True
+                QTimer.singleShot(0, self._start_automatic_bridge_recovery)
+
         def _persist_desktop_behavior(self, key: str, value: object) -> bool:
             next_config = dict(self._config)
             next_config[key] = value
@@ -1658,6 +1782,18 @@ def _load_qt_classes() -> dict:
             )
             self._set_bridge_connected(connected)
             if running:
+                self._update_bridge_restart_recommendation(
+                    runtime_status,
+                    schedule_recovery=True,
+                )
+                if runtime_status is not None:
+                    self._set_bridge_launch_phase(
+                        "connected" if connected else "waiting"
+                    )
+                    self._set_launch_status(
+                        self._describe_runtime_status(runtime_status)
+                    )
+                    return
                 if connected:
                     self._set_bridge_launch_phase("connected")
                     self._set_launch_status(
@@ -1680,6 +1816,8 @@ def _load_qt_classes() -> dict:
                             f"服务运行中；等待{device_catalog.RC003_DISPLAY_NAME} 连接"
                         )
                 return
+
+            self._set_bridge_restart_recommended(False)
 
             previous_phase = self._bridge_launch_phase
             if (
@@ -3591,6 +3729,12 @@ def _load_qt_classes() -> dict:
             notify=bridgeConnectedChanged,
         )
 
+        bridgeRestartRecommended = Property(
+            bool,
+            lambda self: self._bridge_restart_recommended,
+            notify=bridgeRestartRecommendedChanged,
+        )
+
         startHidden = Property(bool, lambda self: self._start_hidden, constant=True)
         launchAtLogin = Property(
             bool,
@@ -3644,7 +3788,7 @@ def _load_qt_classes() -> dict:
         )
 
         def _get_bridge_launch_busy(self) -> bool:
-            return self._bridge_launch_phase in {"saving", "starting"}
+            return self._bridge_launch_phase in {"saving", "starting", "restarting"}
 
         bridgeLaunchBusy = Property(
             bool,
@@ -4120,6 +4264,7 @@ def _load_qt_classes() -> dict:
                 self._voice_hotkey_busy
                 or self._settings_save_busy
                 or self._endpoint_preflight_busy
+                or self._bridge_recovery_running
                 or _vb_cable_test_active_event.is_set()
                 or _driver_action_active_event.is_set()
             ):
@@ -4418,6 +4563,94 @@ def _load_qt_classes() -> dict:
                 self._set_launch_status("保存未完成，未启动桥接。")
                 return
             self._start_bridge_process()
+
+        def _start_automatic_bridge_recovery(self) -> None:
+            if not self._bridge_running or self._bridge_recovery_running:
+                return
+            status = bridge_runtime_status.read_status(self._config_root)
+            if status is None or status.voice_active:
+                return
+            identity_match = bridge_runtime_status.runtime_identity_matches(
+                status,
+                self._current_runtime_identity,
+            )
+            if identity_match is True and not bridge_runtime_status.input_channels_failed(
+                status
+            ):
+                self._set_bridge_restart_recommended(False)
+                return
+            self._begin_bridge_restart(automatic=True)
+
+        @Slot()
+        def restartBridge(self) -> None:
+            self._begin_bridge_restart(automatic=False)
+
+        def _begin_bridge_restart(self, *, automatic: bool) -> None:
+            if (
+                self._bridge_recovery_running
+                or self._application_exit_requested
+                or self._application_exit_confirmed
+                or self._application_exit_intent.is_set()
+            ):
+                return
+            if not self._bridge_running:
+                self.startBridge()
+                return
+            status = bridge_runtime_status.read_status(self._config_root)
+            if status is not None and status.voice_active:
+                self._set_error_message(
+                    "当前正在语音输入；结束本次语音后再重新启动服务。",
+                    self._DEVICE_PAGE_INDEX,
+                )
+                return
+            self._bridge_recovery_running = True
+            self._has_explicit_launch_result = True
+            self._bridge_launch_started_at = time.monotonic()
+            self._set_bridge_launch_phase("restarting")
+            self._set_bridge_restart_recommended(False)
+            self._set_error_message("")
+            self._set_launch_status(
+                "检测到旧版或按键通道异常；正在正常停止服务并启动当前版本…"
+                if automatic
+                else "正在正常停止服务并启动当前版本…"
+            )
+
+            def stop_for_restart() -> None:
+                try:
+                    result = bridge_control_windows.request_bridge_exit()
+                except Exception as exc:  # noqa: BLE001 - surfaced in the UI
+                    payload = (False, f"重新启动失败：{type(exc).__name__}")
+                else:
+                    payload = (
+                        bool(result.stopped),
+                        result.error or "遥控器服务未能正常停止。",
+                    )
+                self._emit_background_result(self._bridgeRestartStopReady, payload)
+
+            try:
+                self._start_background_task(
+                    stop_for_restart,
+                    "remote-mic-bridge-restart",
+                )
+            except RuntimeError as exc:
+                self._bridge_recovery_running = False
+                self._set_bridge_launch_phase("failed")
+                self._set_bridge_restart_recommended(True)
+                self._set_launch_status(str(exc))
+
+        def _on_bridge_restart_stop_ready(self, payload: object) -> None:
+            self._bridge_recovery_running = False
+            stopped, message = payload
+            if not stopped:
+                self._set_bridge_launch_phase("failed")
+                self._set_bridge_restart_recommended(True)
+                self._set_launch_status(str(message))
+                return
+            self._set_bridge_running(False)
+            self._set_bridge_connected(False)
+            self._set_bridge_launch_phase("starting")
+            self._set_launch_status("旧服务已退出；正在启动当前版本…")
+            QTimer.singleShot(0, self._start_bridge_process)
 
         def _start_bridge_process(self) -> None:
             if self._bridge_launch_phase not in {"saving", "starting"}:

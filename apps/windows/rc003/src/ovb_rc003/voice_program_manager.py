@@ -10,7 +10,9 @@ from __future__ import annotations
 import ctypes
 import os
 import re
+import subprocess
 import sys
+import time
 import uuid
 from ctypes import wintypes
 from dataclasses import dataclass
@@ -44,6 +46,15 @@ VOICE_PROGRAM_PROVIDER_NAMES = {
 
 _SOGOU_PROCESS_NAME = "sogou_voice_assistant.exe"
 _SOGOU_RUN_VALUE_NAMES = ("搜狗语音输入法",)
+_SOGOU_COMPONENT_MANAGER_NAME = "sogoucommgr.exe"
+_SOGOU_COMPONENT_PREWARM_ARGUMENTS = (
+    "-invoke",
+    "AIVoiceInputComBundle",
+    "AIVoiceInputCom",
+    "-uwr",
+    "-param",
+    "--auto-launch",
+)
 _SOGOU_UNINSTALL_SUBKEY = "Sogou Input"
 _SOGOU_TOOLBOX_PROCESS_NAME = "SOGOUSmartAssistant.exe"
 _SOGOU_TOOLBOX_ARGUMENTS = "--from=menutool"
@@ -132,6 +143,12 @@ class VoiceProgramLaunchResult:
     already_running: bool
     code: str
     elevated: Optional[bool] = None
+
+
+@dataclass(frozen=True)
+class SogouComponentPrewarmResult:
+    attempted: bool
+    code: str
 
 
 @dataclass(frozen=True)
@@ -240,6 +257,8 @@ def status_text(status: VoiceProgramStatus) -> str:
         if status.elevated is False:
             return "正在运行（普通权限）。"
         return "正在运行（权限状态未知）。"
+    if status.code == "running_not_ready":
+        return "进程正在运行，但语音窗口尚未就绪；遥控器服务会尝试一次组件预热。"
     return "状态未知。"
 
 
@@ -437,6 +456,7 @@ def inspect_voice_program(
     wetype_install_value_reader: Optional[Callable[[], Iterable[str]]] = None,
     wetype_shortcut_iter: Optional[Callable[[], Iterable[Path]]] = None,
     shortcut_resolver: Optional[Callable[[Path], Optional[Path]]] = None,
+    visible_window_pids: Optional[Callable[[], Iterable[int]]] = None,
 ) -> VoiceProgramStatus:
     normalized = normalize_voice_program_settings(settings)
     provider_id = str(normalized["provider"])
@@ -493,6 +513,17 @@ def inspect_voice_program(
         processes = list((process_iter or _iter_windows_processes)())
     matches = _matching_processes(resolved, processes)
     elevated = _combined_elevation(matches)
+    code = "running" if matches else "stopped"
+    if (
+        resolved.provider_id == VOICE_PROGRAM_SOGOU
+        and matches
+        and not _matching_sogou_window_exists(
+            matches,
+            platform=current_platform,
+            visible_window_pids=visible_window_pids,
+        )
+    ):
+        code = "running_not_ready"
     return VoiceProgramStatus(
         resolved.provider_id,
         resolved.display_name,
@@ -500,8 +531,131 @@ def inspect_voice_program(
         bool(matches),
         elevated,
         resolved.executable,
-        "running" if matches else "stopped",
+        code,
     )
+
+
+def discover_sogou_component_manager(
+    *,
+    platform: Optional[str] = None,
+    run_value_reader: Optional[Callable[[], Iterable[str]]] = None,
+) -> Optional[Path]:
+    current_platform = sys.platform if platform is None else platform
+    if current_platform != "win32":
+        return None
+    for command in (run_value_reader or _read_sogou_run_values)():
+        executable = _command_executable(command)
+        if (
+            executable is not None
+            and executable.name.casefold() == _SOGOU_COMPONENT_MANAGER_NAME
+            and executable.is_file()
+        ):
+            return executable
+    return None
+
+
+def prewarm_sogou_voice_component(
+    *,
+    platform: Optional[str] = None,
+    run_value_reader: Optional[Callable[[], Iterable[str]]] = None,
+    popen: Callable[..., subprocess.Popen] = subprocess.Popen,
+) -> SogouComponentPrewarmResult:
+    current_platform = sys.platform if platform is None else platform
+    if current_platform != "win32":
+        return SogouComponentPrewarmResult(False, "unsupported")
+    manager = discover_sogou_component_manager(
+        platform=current_platform,
+        run_value_reader=run_value_reader,
+    )
+    if manager is None:
+        return SogouComponentPrewarmResult(False, "manager_not_found")
+    kwargs: dict[str, object] = {"cwd": str(manager.parent)}
+    if popen is subprocess.Popen:
+        kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    try:
+        popen([str(manager), *_SOGOU_COMPONENT_PREWARM_ARGUMENTS], **kwargs)
+    except (OSError, ValueError):
+        return SogouComponentPrewarmResult(True, "launch_failed")
+    return SogouComponentPrewarmResult(True, "started")
+
+
+def _visible_window_process_ids() -> Iterable[int]:
+    if sys.platform != "win32":
+        return ()
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    callback_type = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    user32.EnumWindows.argtypes = (callback_type, wintypes.LPARAM)
+    user32.EnumWindows.restype = wintypes.BOOL
+    user32.IsWindowVisible.argtypes = (wintypes.HWND,)
+    user32.IsWindowVisible.restype = wintypes.BOOL
+    user32.GetWindowThreadProcessId.argtypes = (
+        wintypes.HWND,
+        ctypes.POINTER(wintypes.DWORD),
+    )
+    user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+    pids: set[int] = set()
+
+    @callback_type
+    def visit(hwnd, _lparam):
+        if user32.IsWindowVisible(hwnd):
+            pid = wintypes.DWORD(0)
+            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+            if pid.value:
+                pids.add(int(pid.value))
+        return True
+
+    user32.EnumWindows(visit, 0)
+    return tuple(pids)
+
+
+def _matching_sogou_window_exists(
+    processes: Sequence[ProcessInfo],
+    *,
+    platform: Optional[str] = None,
+    visible_window_pids: Optional[Callable[[], Iterable[int]]] = None,
+) -> bool:
+    current_platform = sys.platform if platform is None else platform
+    if current_platform != "win32":
+        return False
+    process_pids = {
+        process.pid
+        for process in processes
+        if process.name.casefold() == _SOGOU_PROCESS_NAME
+    }
+    if not process_pids:
+        return False
+    try:
+        window_pids = set((visible_window_pids or _visible_window_process_ids)())
+    except (AttributeError, OSError, ValueError):
+        return False
+    return bool(process_pids & window_pids)
+
+
+def wait_for_sogou_voice_window(
+    *,
+    timeout: float = 0.6,
+    poll_interval: float = 0.1,
+    platform: Optional[str] = None,
+    process_iter: Optional[Callable[[], Iterable[ProcessInfo]]] = None,
+    visible_window_pids: Optional[Callable[[], Iterable[int]]] = None,
+    sleep: Callable[[float], None] = time.sleep,
+    monotonic: Callable[[], float] = time.monotonic,
+) -> bool:
+    current_platform = sys.platform if platform is None else platform
+    if current_platform != "win32":
+        return False
+    deadline = monotonic() + max(0.0, float(timeout))
+    while True:
+        processes = list((process_iter or _iter_windows_processes)())
+        if _matching_sogou_window_exists(
+            processes,
+            platform=current_platform,
+            visible_window_pids=visible_window_pids,
+        ):
+            return True
+        if monotonic() >= deadline:
+            return False
+        sleep(max(0.01, float(poll_interval)))
 
 
 def launch_voice_program(

@@ -33,6 +33,7 @@ from ovb_rc003 import app as app_module
 from ovb_rc003 import (
     bridge_runtime_status,
     config,
+    frida_compat,
     key_detection_bridge,
     key_mapping,
     logging_setup,
@@ -349,6 +350,30 @@ class LiveSettingsReloadTests(_AppWiringTestCase):
 
 
 class CandidateResolutionWiringTests(_AppWiringTestCase):
+    def test_runtime_status_identifies_build_channels_recent_button_and_voice(self):
+        self.app._runtime_raw_input_state = "ready"
+        self.app._runtime_hid_tap_state = frida_compat.HidTapState.READY.value
+        with mock.patch.object(app_module.time, "time", return_value=123.0), mock.patch.object(
+            app_module.time,
+            "monotonic",
+            return_value=10.0,
+        ):
+            self.app._record_runtime_button("hid")
+        self.app._set_runtime_voice_active(True)
+        self.app._publish_runtime_status(
+            bridge_runtime_status.BridgeConnectionState.CONNECTED
+        )
+
+        status = bridge_runtime_status.read_status(self.app._config_root)
+
+        self.assertEqual(status.app_version, app_module.__version__)
+        self.assertTrue(status.runtime_id)
+        self.assertEqual(status.raw_input_state, "ready")
+        self.assertEqual(status.hid_tap_state, frida_compat.HidTapState.READY.value)
+        self.assertEqual(status.last_button_at, 123.0)
+        self.assertEqual(status.last_button_source, "hid")
+        self.assertTrue(status.voice_active)
+
     def test_runtime_status_cleanup_only_removes_the_current_process_file(self):
         other_pid = app_module.os.getpid() + 1
         bridge_runtime_status.publish_status(

@@ -265,6 +265,57 @@ class SogouDiscoveryTests(unittest.TestCase):
             )
         self.assertEqual(found, newer)
 
+    def test_component_prewarm_uses_the_registered_manager_without_a_shell(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            manager_path = Path(tmp) / "SogouComMgr.exe"
+            manager_path.touch()
+            calls = []
+
+            result = manager.prewarm_sogou_voice_component(
+                platform="win32",
+                run_value_reader=lambda: (
+                    f'"{manager_path}" -invoke AIVoiceInputComBundle',
+                ),
+                popen=lambda command, **kwargs: calls.append((command, kwargs)),
+            )
+
+        self.assertTrue(result.attempted)
+        self.assertEqual(result.code, "started")
+        self.assertEqual(calls[0][0][0], str(manager_path))
+        self.assertIn("--auto-launch", calls[0][0])
+        self.assertNotIn("shell", calls[0][1])
+
+    def test_running_sogou_process_without_visible_window_is_not_ready(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            executable = Path(tmp) / "sogou_voice_assistant.exe"
+            executable.touch()
+            status = manager.inspect_voice_program(
+                {"provider": "sogou"},
+                platform="win32",
+                process_iter=lambda: (
+                    manager.ProcessInfo(12, executable.name, executable, False),
+                ),
+                visible_window_pids=lambda: (),
+            )
+
+        self.assertEqual(status.code, "running_not_ready")
+        self.assertIn("尚未就绪", manager.status_text(status))
+
+    def test_running_sogou_process_with_visible_window_is_ready(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            executable = Path(tmp) / "sogou_voice_assistant.exe"
+            executable.touch()
+            status = manager.inspect_voice_program(
+                {"provider": "sogou"},
+                platform="win32",
+                process_iter=lambda: (
+                    manager.ProcessInfo(12, executable.name, executable, False),
+                ),
+                visible_window_pids=lambda: (12,),
+            )
+
+        self.assertEqual(status.code, "running")
+
 
 class WeTypeDiscoveryTests(unittest.TestCase):
     def test_running_server_path_is_preferred(self):

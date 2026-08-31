@@ -179,6 +179,18 @@ Item {
                     stateColor: root.bridgeStateColor()
 
                     CompactButton {
+                        objectName: "restartBridgeButton"
+                        visible: SettingsController.bridgeRunning
+                            && SettingsController.bridgeRestartRecommended
+                        tokens: root.tokens
+                        compactMinimumWidth: tokens.buttonWidth4Chars
+                        text: qsTr("重新启动")
+                        highlighted: true
+                        enabled: !SettingsController.bridgeLaunchBusy
+                        onClicked: SettingsController.restartBridge()
+                    }
+
+                    CompactButton {
                         objectName: "startBridgeButton"
                         visible: !SettingsController.bridgeRunning
                         tokens: root.tokens

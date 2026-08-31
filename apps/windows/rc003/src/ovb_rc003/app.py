@@ -89,6 +89,7 @@ from . import (
     logging_setup,
     raw_input_windows,
     voice_controller,
+    voice_interaction_diagnostics_windows,
     voice_program_manager,
     wetype_control_windows,
     win32_input,
@@ -113,7 +114,7 @@ _BUTTON_ACTION_KEY_TOKENS = {
     key_mapping.ActionKind.ARROW_LEFT: ("left",),
     key_mapping.ActionKind.ARROW_RIGHT: ("right",),
     key_mapping.ActionKind.DELETE_BACKWARD: ("backspace",),
-    key_mapping.ActionKind.SHOW_DESKTOP: ("win", "d"),
+    key_mapping.ActionKind.SHOW_DESKTOP: ("win", "m"),
     key_mapping.ActionKind.CONTEXT_MENU: ("apps",),
     key_mapping.ActionKind.APP_SWITCHER: ("alt", "tab"),
     key_mapping.ActionKind.SYSTEM_VOLUME_UP: ("volume_up",),
@@ -125,6 +126,7 @@ _BUTTON_ACTION_KEY_TOKENS = {
 _KEY_DETECTION_MIC_RELEASE_GRACE_SECONDS = 1.0
 _KEY_DETECTION_MIC_MAX_SECONDS = 10.0
 _ORDINARY_MIC_RELEASE_GUARD_SECONDS = 0.12
+_RUNTIME_STATUS_HEARTBEAT_SECONDS = 5.0
 _VOICE_HOTKEY_BACKEND_MARKED = "marked_keybd_event"
 _VOICE_HOTKEY_BACKEND_WETYPE = "wetype_virtual_key_sendinput"
 
@@ -157,17 +159,24 @@ class RC003App:
         )
         self._button_combos = button_combo.ButtonComboRecognizer()
         self._logger: logging.Logger = logging_setup.get_logger(self._config_root)
-        runtime_kind = "frozen" if getattr(sys, "frozen", False) else "source"
-        package_name = (
-            Path(sys.executable).resolve().parent.name
-            if runtime_kind == "frozen"
-            else "source-tree"
+        self._runtime_identity = bridge_runtime_status.current_runtime_identity(
+            __version__
         )
+        self._runtime_status_lock = threading.Lock()
+        self._runtime_connection_state = (
+            bridge_runtime_status.BridgeConnectionState.WAITING_FOR_DEVICE
+        )
+        self._runtime_raw_input_state = "starting"
+        self._runtime_hid_tap_state = "starting"
+        self._runtime_last_button_at: Optional[float] = None
+        self._runtime_last_button_source = ""
+        self._runtime_voice_active = False
+        self._runtime_last_button_publish_monotonic = 0.0
         self._logger.info(
             "startup: app identity: version=%s runtime=%s package=%s",
-            __version__,
-            runtime_kind,
-            package_name,
+            self._runtime_identity.app_version,
+            self._runtime_identity.runtime_kind,
+            self._runtime_identity.package_name,
         )
         try:
             voice_program_result = (
@@ -184,6 +193,17 @@ class RC003App:
                     voice_program_result.provider_id,
                     voice_program_result.code,
                 )
+        configured_voice_program = (
+            voice_program_manager.normalize_voice_program_settings(
+                self._config.get("voice_program")
+            )
+        )
+        if configured_voice_program["provider"] == voice_program_manager.VOICE_PROGRAM_SOGOU:
+            sogou_prewarm = voice_program_manager.prewarm_sogou_voice_component()
+            self._logger.info(
+                "voice program: Sogou component prewarm=%s",
+                sogou_prewarm.code,
+            )
         if self._removed_voice_bindings:
             self._logger.warning(
                 "legacy voice mappings disabled until user reselects actions: %s",
@@ -203,6 +223,13 @@ class RC003App:
         self._voice_hotkey_release_pending: Optional[Tuple[str, ...]] = None
         self._voice_hotkey_active_backend: Optional[str] = None
         self._voice_hotkey_release_pending_backend: Optional[str] = None
+        self._voice_focus_before: Optional[
+            voice_interaction_diagnostics_windows.FocusSnapshot
+        ] = None
+        self._voice_focus_provider = ""
+        self._voice_focus_submit_method = ""
+        self._sogou_readiness_lock = threading.Lock()
+        self._sogou_readiness_check_running = False
         self._wetype_voice_control = wetype_control_windows.WeTypeVoiceControl(
             logger=self._logger
         )
@@ -292,22 +319,78 @@ class RC003App:
     # -- lifecycle: driven by ConnectionSupervisor -------------------------
 
     async def run_forever(self) -> None:
-        await self._supervisor.run_forever()
+        heartbeat = self._event_loop.create_task(
+            self._runtime_status_heartbeat()
+        )
+        try:
+            await self._supervisor.run_forever()
+        finally:
+            heartbeat.cancel()
+            await asyncio.gather(heartbeat, return_exceptions=True)
 
     async def stop(self) -> None:
         await self._supervisor.stop()
 
+    async def _runtime_status_heartbeat(self) -> None:
+        while True:
+            self._publish_runtime_status()
+            await asyncio.sleep(_RUNTIME_STATUS_HEARTBEAT_SECONDS)
+
     def _publish_runtime_status(
         self,
-        state: bridge_runtime_status.BridgeConnectionState,
+        state: Optional[bridge_runtime_status.BridgeConnectionState] = None,
     ) -> None:
-        try:
-            bridge_runtime_status.publish_status(self._config_root, state)
-        except (OSError, ValueError):
-            self._logger.exception(
-                "bridge runtime status update failed: state=%s",
-                state.value,
-            )
+        with self._runtime_status_lock:
+            if state is not None:
+                self._runtime_connection_state = state
+            try:
+                bridge_runtime_status.publish_status(
+                    self._config_root,
+                    self._runtime_connection_state,
+                    identity=self._runtime_identity,
+                    raw_input_state=self._runtime_raw_input_state,
+                    hid_tap_state=self._runtime_hid_tap_state,
+                    last_button_at=self._runtime_last_button_at,
+                    last_button_source=self._runtime_last_button_source,
+                    voice_active=self._runtime_voice_active,
+                )
+            except (OSError, ValueError):
+                self._logger.exception(
+                    "bridge runtime status update failed: state=%s",
+                    self._runtime_connection_state.value,
+                )
+
+    def _set_runtime_input_state(
+        self,
+        *,
+        raw_input_state: Optional[str] = None,
+        hid_tap_state: Optional[str] = None,
+    ) -> None:
+        with self._runtime_status_lock:
+            if raw_input_state is not None:
+                self._runtime_raw_input_state = str(raw_input_state)
+            if hid_tap_state is not None:
+                self._runtime_hid_tap_state = str(hid_tap_state)
+        self._publish_runtime_status()
+
+    def _set_runtime_voice_active(self, active: bool) -> None:
+        active = bool(active)
+        with self._runtime_status_lock:
+            if active == self._runtime_voice_active:
+                return
+            self._runtime_voice_active = active
+        self._publish_runtime_status()
+
+    def _record_runtime_button(self, event_source: str) -> None:
+        now_wall = time.time()
+        now_monotonic = time.monotonic()
+        with self._runtime_status_lock:
+            self._runtime_last_button_at = now_wall
+            self._runtime_last_button_source = str(event_source)
+            if now_monotonic - self._runtime_last_button_publish_monotonic < 0.5:
+                return
+            self._runtime_last_button_publish_monotonic = now_monotonic
+        self._publish_runtime_status()
 
     def clear_runtime_status(self) -> None:
         try:
@@ -324,6 +407,7 @@ class RC003App:
         self._publish_runtime_status(
             bridge_runtime_status.BridgeConnectionState.WAITING_FOR_DEVICE
         )
+        self._set_runtime_voice_active(False)
         self._logger.info("startup: resolving RC003 identity")
         candidates = await ble_transport_winrt.discover_candidates()
         # A sole exact identity match remains the fast path. If Windows keeps
@@ -371,16 +455,20 @@ class RC003App:
         retry stopping it, exactly like any other retained-owner failure.
         """
 
+        self._set_runtime_input_state(raw_input_state="starting")
         try:
             paths = raw_input_windows.enumerate_matching_device_paths()
             device_path = hid_identity.select_single_device_path(paths)
         except raw_input_windows.RawInputUnavailableError as exc:
+            self._set_runtime_input_state(raw_input_state="unavailable")
             self._logger.info("startup: Raw Input unavailable; buttons disabled: %s", exc)
             return
         except hid_identity.NoDevicePathFoundError:
+            self._set_runtime_input_state(raw_input_state="no_device")
             self._logger.info("startup: no RC003 HID device path found; buttons unavailable")
             return
         except hid_identity.AmbiguousDevicePathError as exc:
+            self._set_runtime_input_state(raw_input_state="ambiguous")
             self._logger.info(
                 "startup: buttons failing closed, ambiguous HID device paths: %s", exc
             )
@@ -399,6 +487,7 @@ class RC003App:
             self._hid_listener.start(device_path)
         except raw_input_windows.RawInputUnavailableError as exc:
             if self._hid_listener.is_running:
+                self._set_runtime_input_state(raw_input_state="failed_running")
                 self._logger.exception(
                     "startup: Raw Input listener failed to start but is still running; "
                     "owner retained for cleanup to retry"
@@ -406,7 +495,9 @@ class RC003App:
                 raise
             self._logger.info("startup: Raw Input listener failed to start: %s", exc)
             self._hid_listener = None
+            self._set_runtime_input_state(raw_input_state="failed")
             return
+        self._set_runtime_input_state(raw_input_state="ready")
 
         # RC003's voice key is also reported as a legacy F5. Keep that record
         # out of the foreground application, but never turn it into the host
@@ -439,6 +530,7 @@ class RC003App:
         BLE voice from starting.
         """
 
+        self._set_runtime_input_state(hid_tap_state="starting")
         tap = frida_compat.RC003HidReportTap(
             self._on_direct_hid_report,
             status_handler=self._on_hid_tap_status,
@@ -451,10 +543,14 @@ class RC003App:
                     tap.status,
                 )
             else:
+                self._set_runtime_input_state(hid_tap_state=tap.status)
                 self._logger.info(
                     "startup: RC003 HID report tap unavailable: %s", tap.status
                 )
         except Exception:
+            self._set_runtime_input_state(
+                hid_tap_state=frida_compat.HidTapState.FAILED.value
+            )
             self._logger.exception("startup: RC003 HID report tap failed to start")
             try:
                 tap.stop()
@@ -464,6 +560,7 @@ class RC003App:
                 raise
 
     def _on_hid_tap_status(self, status: str, detail: str) -> None:
+        self._set_runtime_input_state(hid_tap_state=status)
         message = "RC003 HID report tap state: %s"
         args = [status]
         if detail:
@@ -581,9 +678,13 @@ class RC003App:
             try:
                 self._hid_report_tap.stop()
                 self._hid_report_tap = None
+                self._set_runtime_input_state(hid_tap_state="stopped")
             except Exception:
+                self._set_runtime_input_state(hid_tap_state="failed_stopping")
                 self._logger.exception("cleanup: stopping the RC003 HID report tap failed")
                 failures.append("RC003 HID report tap did not stop; owner retained")
+        else:
+            self._set_runtime_input_state(hid_tap_state="stopped")
         with self._direct_hid_lock:
             self._direct_hid_usages.clear()
         self._direct_hid_tap_active = False
@@ -639,6 +740,9 @@ class RC003App:
                             "voice hotkey release did not fully deliver; state retained"
                         )
                 self._wetype_voice_control.clear()
+                self._voice_focus_before = None
+                self._voice_focus_provider = ""
+                self._voice_focus_submit_method = ""
         except Exception:
             self._logger.exception("cleanup: releasing the voice hotkey failed")
             failures.append("voice hotkey cleanup failed; state retained")
@@ -656,11 +760,15 @@ class RC003App:
             try:
                 self._hid_listener.stop()
                 self._hid_listener = None
+                self._set_runtime_input_state(raw_input_state="stopped")
             except Exception:
+                self._set_runtime_input_state(raw_input_state="failed_stopping")
                 self._logger.exception("cleanup: stopping the Raw Input listener failed")
                 failures.append("Raw Input listener did not stop; owner retained")
                 # self._hid_listener is intentionally NOT cleared here: it
                 # may still be a live thread/window.
+        else:
+            self._set_runtime_input_state(raw_input_state="stopped")
 
         if self._legacy_key_suppressor is not None:
             try:
@@ -964,6 +1072,9 @@ class RC003App:
         self._voice_pcm_forwarding_enabled = False
         if self._apply_voice_action(action):
             self._logger.info("voice hold hotkey released on %s", reason)
+            if not self._voice_audio_stream_active:
+                self._set_runtime_voice_active(False)
+                self._log_voice_submission_observation()
             return True
 
         self._voice.restore_pending(action)
@@ -1442,6 +1553,8 @@ class RC003App:
     ) -> None:
         if not self._accept_input_events:
             return
+        if is_pressed:
+            self._record_runtime_button(event_source)
         if button_id == "mic":
             detection_handled, detection_captured = (
                 self._handle_key_detection_mic_event(
@@ -1995,6 +2108,7 @@ class RC003App:
                 self._voice_audio_stream_active = False
                 self._voice_audio_stop_processed = True
                 self._voice_pcm_forwarding_enabled = False
+                self._set_runtime_voice_active(False)
                 flush_result = self._flush_playback_writer_locked("audio stop")
                 if flush_result.error is not None:
                     self._logger.error(
@@ -2077,6 +2191,7 @@ class RC003App:
                         and not self._voice_mic_gesture_sources_down
                     ):
                         self._finish_voice_mic_gesture()
+                self._log_voice_submission_observation()
                 self._apply_pending_voice_settings_if_idle_locked()
 
     def _handle_mic_button_pressed(
@@ -2120,9 +2235,13 @@ class RC003App:
             )
             return
 
+        self._capture_voice_focus_before()
         action = self._voice.on_mic_button_pressed()
         action_delivered = self._apply_voice_action(action)
         if not action_delivered:
+            self._voice_focus_before = None
+            self._voice_focus_provider = ""
+            self._voice_focus_submit_method = ""
             self._voice_pcm_forwarding_enabled = False
             # Nothing physically landed (win32_input.py's own batching already
             # rolled back any partial key-down), so clear the logical hold
@@ -2134,8 +2253,108 @@ class RC003App:
             return
 
         self._voice_pcm_forwarding_enabled = True
+        self._set_runtime_voice_active(True)
+        self._schedule_sogou_readiness_check()
         if send_device_open and self._ble_session is not None:
             self._ble_session.send_mic_open_threadsafe()
+
+    def _schedule_sogou_readiness_check(self) -> None:
+        provider_settings = voice_program_manager.normalize_voice_program_settings(
+            self._config.get("voice_program")
+        )
+        if provider_settings["provider"] != voice_program_manager.VOICE_PROGRAM_SOGOU:
+            return
+        with self._sogou_readiness_lock:
+            if self._sogou_readiness_check_running:
+                return
+            self._sogou_readiness_check_running = True
+
+        def check() -> None:
+            try:
+                if voice_program_manager.wait_for_sogou_voice_window(timeout=0.7):
+                    self._logger.info("voice program: Sogou voice window ready")
+                    return
+                if not self._accept_input_events:
+                    return
+                repair = voice_program_manager.prewarm_sogou_voice_component()
+                ready_after_repair = (
+                    repair.code == "started"
+                    and self._accept_input_events
+                    and voice_program_manager.wait_for_sogou_voice_window(timeout=0.8)
+                )
+                if ready_after_repair:
+                    self._logger.info(
+                        "voice program: Sogou voice window became ready after one prewarm"
+                    )
+                else:
+                    self._logger.warning(
+                        "voice program: Sogou process may be running but the voice "
+                        "window is not ready after one prewarm; no shortcut retry sent"
+                    )
+            finally:
+                with self._sogou_readiness_lock:
+                    self._sogou_readiness_check_running = False
+
+        try:
+            threading.Thread(
+                target=check,
+                name="sogou-voice-readiness",
+                daemon=True,
+            ).start()
+        except RuntimeError:
+            with self._sogou_readiness_lock:
+                self._sogou_readiness_check_running = False
+            self._logger.exception("voice program: Sogou readiness check could not start")
+
+    def _capture_voice_focus_before(self) -> None:
+        provider_settings = voice_program_manager.normalize_voice_program_settings(
+            self._config.get("voice_program")
+        )
+        self._voice_focus_provider = str(provider_settings["provider"])
+        self._voice_focus_submit_method = (
+            "wetype_panel"
+            if self._configured_voice_hotkey_backend() == _VOICE_HOTKEY_BACKEND_WETYPE
+            else "hotkey_hold"
+        )
+        snapshot = voice_interaction_diagnostics_windows.capture_focus_snapshot()
+        self._voice_focus_before = snapshot
+        self._logger.info(
+            "voice interaction start: provider=%s method=%s foreground_pid=%s "
+            "foreground_class=%s focus_class=%s text_length=%s diagnostic=%s",
+            self._voice_focus_provider,
+            self._voice_focus_submit_method,
+            snapshot.foreground_pid,
+            snapshot.foreground_class or "unknown",
+            snapshot.focus_class or "unknown",
+            snapshot.text_length if snapshot.text_length is not None else "unavailable",
+            snapshot.error or "captured",
+        )
+
+    def _log_voice_submission_observation(self) -> None:
+        before = self._voice_focus_before
+        if before is None:
+            return
+        after = voice_interaction_diagnostics_windows.capture_focus_snapshot()
+        observation = voice_interaction_diagnostics_windows.compare_submission(
+            before,
+            after,
+        )
+        self._logger.info(
+            "voice interaction result: provider=%s method=%s focus=%s "
+            "text_length=%s delta=%s; panel close alone does not prove text insertion",
+            self._voice_focus_provider or "unknown",
+            self._voice_focus_submit_method or "unknown",
+            observation.focus_state,
+            observation.text_state,
+            (
+                observation.text_delta
+                if observation.text_delta is not None
+                else "unavailable"
+            ),
+        )
+        self._voice_focus_before = None
+        self._voice_focus_provider = ""
+        self._voice_focus_submit_method = ""
 
     def _apply_voice_action(self, action: voice_controller.VoiceHostAction) -> bool:
         tokens = tuple(self._voice_hotkey.modifiers) + (self._voice_hotkey.key,)

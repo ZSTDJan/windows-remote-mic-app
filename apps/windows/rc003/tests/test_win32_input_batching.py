@@ -230,6 +230,18 @@ class SendKeyComboUpTests(unittest.TestCase):
 
 
 class SendKeyComboTapTests(unittest.TestCase):
+    def test_show_desktop_uses_idempotent_minimize_combo(self):
+        sender = RecordingSender()
+
+        win32_input.send_show_desktop(_sender=sender)
+
+        vk_win = win32_input.win32_keys.VK_CODES["win"]
+        vk_m = win32_input.win32_keys.VK_CODES["m"]
+        self.assertEqual(
+            sender.calls,
+            [[(vk_win, False), (vk_m, False), (vk_m, True), (vk_win, True)]],
+        )
+
     def test_full_delivery_is_one_batched_call_down_then_up_reversed(self):
         sender = RecordingSender()
         win32_input.send_key_combo_tap(("win", "d"), _sender=sender)

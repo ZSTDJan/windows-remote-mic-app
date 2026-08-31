@@ -1805,6 +1805,131 @@ class SettingsControllerTests(unittest.TestCase):
         self.assertEqual(controller.bridgeLaunchPhase, "connected")
         self.assertIn("小米遥控器2 Pro 已连接", controller.launchStatusText)
 
+    def test_current_bridge_status_exposes_version_channels_and_recent_button(self):
+        self._bridge_status_patch.stop()
+        self._bridge_status_patch = mock.patch.object(
+            qt_settings_app.single_instance,
+            "bridge_instance_running",
+            return_value=True,
+        )
+        self._bridge_status_patch.start()
+        identity = bridge_runtime_status.current_runtime_identity(
+            qt_settings_app.__version__
+        )
+        bridge_runtime_status.publish_status(
+            config.config_root(),
+            bridge_runtime_status.BridgeConnectionState.CONNECTED,
+            pid=4321,
+            identity=identity,
+            raw_input_state="ready",
+            hid_tap_state=frida_compat.HidTapState.READY.value,
+            last_button_at=time.time(),
+            last_button_source="hid",
+        )
+
+        controller, _ = self._make_controller()
+
+        self.assertIn("当前版本", controller.launchStatusText)
+        self.assertIn("两个按键通道正常", controller.launchStatusText)
+        self.assertIn("刚收到按键", controller.launchStatusText)
+        self.assertFalse(controller.bridgeRestartRecommended)
+
+    def test_legacy_bridge_recommends_manual_restart_without_auto_stopping(self):
+        self._bridge_status_patch.stop()
+        self._bridge_status_patch = mock.patch.object(
+            qt_settings_app.single_instance,
+            "bridge_instance_running",
+            return_value=True,
+        )
+        self._bridge_status_patch.start()
+        path = bridge_runtime_status.status_path(config.config_root())
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            '{"schema":1,"state":"connected","pid":4321,"updated_at":1}',
+            encoding="utf-8",
+        )
+
+        controller, _ = self._make_controller()
+        callbacks = []
+        with mock.patch(
+            "PySide6.QtCore.QTimer.singleShot",
+            side_effect=lambda _delay, callback: callbacks.append(callback),
+        ):
+            controller.refreshBridgeState()
+
+        self.assertTrue(controller.bridgeRestartRecommended)
+        self.assertEqual(callbacks, [])
+
+    def test_mismatched_idle_bridge_schedules_only_one_controlled_recovery(self):
+        self._bridge_status_patch.stop()
+        self._bridge_status_patch = mock.patch.object(
+            qt_settings_app.single_instance,
+            "bridge_instance_running",
+            return_value=True,
+        )
+        self._bridge_status_patch.start()
+        identity = bridge_runtime_status.current_runtime_identity(
+            qt_settings_app.__version__,
+            frozen=False,
+            source_root=Path(self._tmpdir.name) / "other-build",
+        )
+        bridge_runtime_status.publish_status(
+            config.config_root(),
+            bridge_runtime_status.BridgeConnectionState.CONNECTED,
+            pid=4321,
+            identity=identity,
+            raw_input_state="ready",
+            hid_tap_state=frida_compat.HidTapState.READY.value,
+        )
+        controller, _ = self._make_controller()
+        callbacks = []
+        recoveries = []
+
+        with mock.patch(
+            "PySide6.QtCore.QTimer.singleShot",
+            side_effect=lambda _delay, callback: callbacks.append(callback),
+        ):
+            controller.refreshBridgeState()
+            controller.refreshBridgeState()
+            self.assertEqual(len(callbacks), 1)
+            with mock.patch.object(
+                controller,
+                "_begin_bridge_restart",
+                side_effect=lambda **kwargs: recoveries.append(kwargs),
+            ):
+                callbacks.pop()()
+
+        self.assertEqual(recoveries, [{"automatic": True}])
+
+    def test_manual_restart_refuses_to_interrupt_active_voice(self):
+        self._bridge_status_patch.stop()
+        self._bridge_status_patch = mock.patch.object(
+            qt_settings_app.single_instance,
+            "bridge_instance_running",
+            return_value=True,
+        )
+        self._bridge_status_patch.start()
+        identity = bridge_runtime_status.current_runtime_identity(
+            qt_settings_app.__version__
+        )
+        bridge_runtime_status.publish_status(
+            config.config_root(),
+            bridge_runtime_status.BridgeConnectionState.CONNECTED,
+            pid=4321,
+            identity=identity,
+            voice_active=True,
+        )
+        controller, _ = self._make_controller()
+
+        with mock.patch.object(
+            qt_settings_app.bridge_control_windows,
+            "request_bridge_exit",
+        ) as request_exit:
+            controller.restartBridge()
+
+        request_exit.assert_not_called()
+        self.assertIn("正在语音输入", controller.errorMessage)
+
     def test_live_bridge_refresh_tracks_external_start_and_exit(self):
         controller, _ = self._make_controller()
 
@@ -6009,6 +6134,12 @@ class SettingsShellSourceContractTests(unittest.TestCase):
 
     def test_service_state_has_one_formal_device_page_location(self):
         self.assertIn('objectName: "remoteServiceRow"', self.device_qml)
+        self.assertIn('objectName: "restartBridgeButton"', self.device_qml)
+        self.assertIn(
+            "SettingsController.bridgeRestartRecommended",
+            self.device_qml,
+        )
+        self.assertIn("SettingsController.restartBridge()", self.device_qml)
         self.assertNotIn('objectName: "mappingBridgeWarning"', self.buttons_qml)
         self.assertNotIn('objectName: "mappingListFrame"', self.buttons_qml)
         self.assertIn("SettingsController.bridgeRunning", self.device_qml)

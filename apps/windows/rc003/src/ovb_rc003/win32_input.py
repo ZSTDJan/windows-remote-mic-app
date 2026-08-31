@@ -670,7 +670,10 @@ def send_delete_backward(*, _sender: Optional[RawSender] = None) -> None:
 
 
 def send_show_desktop(*, _sender: Optional[RawSender] = None) -> None:
-    _send_semantic_tap(("win", "d"), _sender=_sender)
+    # Win+D is a toggle, so duplicate remote-button reports can immediately
+    # restore every window. Win+M is idempotent for this action: repeating it
+    # keeps windows minimized instead of making the desktop flash back.
+    _send_semantic_tap(("win", "m"), _sender=_sender)
 
 
 def send_context_menu(*, _sender: Optional[RawSender] = None) -> None:
