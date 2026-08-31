@@ -337,7 +337,12 @@ class LegacyKeySuppressor:
                 ):
                     matched = True
                     match_kind = "tracked"
-                if matched or now >= deadline:
+                # A selected-device release is already identifiable through
+                # its armed edge or the tracked down-state. If neither exists,
+                # waiting for a future release arm only stalls an unrelated
+                # keyboard key-up; a late device release is already prevented
+                # from leaving a stale arm by ``_arm_key_event``.
+                if matched or not is_pressed or now >= deadline:
                     elapsed = now - deadline + effective_wait
                     _logger.info(
                         "consume key edge: vk=0x%X scan=0x%X ext=%s pressed=%s "

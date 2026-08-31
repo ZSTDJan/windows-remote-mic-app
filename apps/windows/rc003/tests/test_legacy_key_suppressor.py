@@ -201,6 +201,17 @@ class LegacyKeySuppressorRaceTests(unittest.TestCase):
         self.assertFalse(gate.consume_armed_key_event(0x4E, 0x31, False, True))
         self.assertLess(time.monotonic() - start, 0.25)
 
+    def test_untracked_rc003_release_passes_through_without_waiting(self):
+        gate = suppressor.LegacyKeySuppressor(
+            {0x74},
+            rc003_vk_codes=frozenset({0x74, 0x26, 0x27, 0x25, 0x28}),
+            consume_wait_seconds=10.0,
+        )
+
+        start = time.monotonic()
+        self.assertFalse(gate.consume_armed_key_event(0x26, 0x48, True, False))
+        self.assertLess(time.monotonic() - start, 0.25)
+
     def test_rc003_key_waits_for_a_late_arming_edge_by_default(self):
         gate = suppressor.LegacyKeySuppressor(
             {0x74},
