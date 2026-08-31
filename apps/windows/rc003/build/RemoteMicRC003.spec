@@ -233,10 +233,26 @@ def _is_ambient_icuuc(binary_entry):
     }
 
 
+def _is_unneeded_sounddevice_asio(binary_entry):
+    """Exclude the optional ASIO build that the application never selects.
+
+    python-sounddevice's Windows wheel carries both a normal PortAudio DLL and
+    a second ASIO-enabled DLL. The latter expands the redistribution terms but
+    provides no supported host API in this application.
+    """
+
+    destination_name, source_path, _type_code = binary_entry
+    return (
+        Path(destination_name).name.casefold() == "libportaudio64bit-asio.dll"
+        or Path(source_path).name.casefold() == "libportaudio64bit-asio.dll"
+    )
+
+
 a.binaries = [
     binary_entry
     for binary_entry in a.binaries
     if not _is_ambient_icuuc(binary_entry)
+    and not _is_unneeded_sounddevice_asio(binary_entry)
 ]
 
 pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)

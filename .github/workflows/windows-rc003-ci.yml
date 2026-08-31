@@ -8,9 +8,10 @@ name: windows-rc003-ci
 # touching no GUI/BLE/HID/audio), compiles
 # the Inno Setup installer SOURCE into an unsigned installer .exe, and
 # packages a deterministic unsigned portable ZIP (a versioned staging
-# folder containing the built app plus LICENSE.txt/COPYRIGHT.txt/
-# THIRD_PARTY_NOTICES.md/ATTRIBUTION.md/README.txt - the same provenance
-# and instructional content the installer itself carries) + installer +
+# folder containing the built app plus the project license, copyright,
+# third-party notices and licenses, corresponding-source record, asset
+# license record, attribution and README - the same legal/provenance and
+# instructional content the installer itself carries) + installer +
 # SHA256SUMS.txt artifact set.
 #
 # Honest disclosure of what this CI run DOES touch: the Windows-only tests
@@ -36,19 +37,27 @@ name: windows-rc003-ci
 
 # XRBM-022 controller pre-review correction: the installer (.iss) and the
 # PyInstaller spec both consume these repository-root files directly
-# (COPYRIGHT/LICENSE/THIRD_PARTY_NOTICES.md are packaged into the installed
-# app; device-profiles/xiaomi-rc003.json documents the identity/HID facts
-# the Windows adapter's own device_profile.py mirrors), so a change to any
-# of them must re-run this workflow even though none of them live under
-# apps/windows/rc003/.
+# (the repository-root legal/source records are packaged into the installed
+# app; device-profiles/xiaomi-rc003.json documents the identity/HID facts the
+# Windows adapter's own device_profile.py mirrors), so a change to any of them
+# must re-run this workflow even though none live under apps/windows/rc003/.
 on:
+  workflow_dispatch:
   push:
+    branches:
+      - main
+    tags:
+      - "v*-windows"
+      - "v*-windows-rc003-candidate.*"
     paths:
       - "apps/windows/rc003/**"
       - ".github/workflows/windows-rc003-ci.yml"
       - "COPYRIGHT.md"
       - "LICENSE.md"
       - "THIRD_PARTY_NOTICES.md"
+      - "THIRD_PARTY_SOURCE.md"
+      - "ASSET_LICENSES.md"
+      - "THIRD_PARTY_LICENSES/**"
       - "Resources/RC003-remote-photo.png"
       - "device-profiles/xiaomi-rc003.json"
       - "device-profiles/dji-mic-2.json"
@@ -59,6 +68,9 @@ on:
       - "COPYRIGHT.md"
       - "LICENSE.md"
       - "THIRD_PARTY_NOTICES.md"
+      - "THIRD_PARTY_SOURCE.md"
+      - "ASSET_LICENSES.md"
+      - "THIRD_PARTY_LICENSES/**"
       - "Resources/RC003-remote-photo.png"
       - "device-profiles/xiaomi-rc003.json"
       - "device-profiles/dji-mic-2.json"
@@ -66,20 +78,40 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: windows-rc003-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test-and-build:
-    runs-on: windows-latest
+    runs-on: windows-2025
+    timeout-minutes: 60
     defaults:
       run:
         working-directory: apps/windows/rc003
     steps:
-      - uses: actions/checkout@v7
+      # actions/checkout v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
 
-      - uses: actions/setup-python@v6
+      # actions/setup-python v7
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
         with:
-          python-version: "3.12"
+          python-version: "3.12.10"
           cache: pip
           cache-dependency-path: apps/windows/rc003/requirements-dev.txt
+
+      - name: Formal release readiness (tag builds only)
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: pwsh
+        run: |
+          python build/check-release-readiness.py --enforce
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Third-party notice and license inventory
+        shell: pwsh
+        run: |
+          python build/check-third-party-notices.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Public boundary scan
         shell: pwsh
@@ -221,7 +253,7 @@ jobs:
       - name: Compile Inno Setup installer (required gate, never run/installed)
         shell: pwsh
         run: |
-          choco install innosetup -y --no-progress
+          choco install innosetup --version=6.7.1 -y --no-progress
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
           if (-not (Test-Path $iscc)) {
@@ -273,6 +305,9 @@ jobs:
           Copy-Item -Path "../../../LICENSE.md" -Destination (Join-Path $stagingDir "LICENSE.txt") -Force
           Copy-Item -Path "../../../COPYRIGHT.md" -Destination (Join-Path $stagingDir "COPYRIGHT.txt") -Force
           Copy-Item -Path "../../../THIRD_PARTY_NOTICES.md" -Destination (Join-Path $stagingDir "THIRD_PARTY_NOTICES.md") -Force
+          Copy-Item -Path "../../../THIRD_PARTY_SOURCE.md" -Destination (Join-Path $stagingDir "THIRD_PARTY_SOURCE.md") -Force
+          Copy-Item -Path "../../../ASSET_LICENSES.md" -Destination (Join-Path $stagingDir "ASSET_LICENSES.md") -Force
+          Copy-Item -Path "../../../THIRD_PARTY_LICENSES" -Destination (Join-Path $stagingDir "THIRD_PARTY_LICENSES") -Recurse -Force
           Copy-Item -Path "ATTRIBUTION.md" -Destination (Join-Path $stagingDir "ATTRIBUTION.md") -Force
           Copy-Item -Path "installer/readme-rc003.txt" -Destination (Join-Path $stagingDir "README.txt") -Force
 
@@ -420,7 +455,9 @@ jobs:
       # absolute-path/wildcard inputs - still exactly one pattern, never a
       # multi-pattern list.
       - name: Upload deterministic distribution artifacts (unsigned, never installed/signed/published)
-        uses: actions/upload-artifact@v7
+        if: startsWith(github.ref, 'refs/tags/')
+        # actions/upload-artifact v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: RemoteMicRC003-distribution-unsigned
           path: ${{ github.workspace }}/apps/windows/rc003/dist/release/*

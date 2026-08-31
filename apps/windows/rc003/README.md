@@ -587,7 +587,9 @@ Windows GitHub Actions 工作流位于 `.github/workflows/windows-rc003-ci.yml`�
 代码按 GPL-3.0-only 发布。Windows 实现基于上游
 <https://github.com/nijez/open-voice-bridge> 的 GPL Windows RC003 实现，具体变更
 和归属记录见 `ATTRIBUTION.md`、仓库根目录 `COPYRIGHT.md` 与
-`THIRD_PARTY_NOTICES.md`。VB-CABLE 是 VB-Audio 的独立 Donationware；本项目不把它
+`THIRD_PARTY_NOTICES.md`。安装版和便携版还必须携带根目录
+`THIRD_PARTY_LICENSES/` 的完整许可文本；Qt/PySide6 对应源码和素材授权分别按
+`THIRD_PARTY_SOURCE.md`、`ASSET_LICENSES.md` 执行。VB-CABLE 是 VB-Audio 的独立 Donationware；本项目不把它
 当作 GPL 代码，也不会把付费的 A+B/C+D 版本伪装成随包内容。
 RC003 缺失 HID 报告的恢复路径参考 `xxb26553663-star/remote-bridge-hub` 的
 Frida Gadget 实现；Frida 的版本、哈希和许可证见仓库根目录
@@ -608,5 +610,9 @@ Windows 候选版以预发行版发布。首个发布：
 语音与稳定性验收，不能用自动测试替代。下载哪一个、如何安装，见上文
 "中文安装与使用说明"的
 "下载与安装"一节。
+
+正式 tag 还会执行 `build/check-release-readiness.py --enforce`。素材授权或
+Qt/PySide6 对应源码仍未就绪时，该门禁会主动失败；普通源码检查和本地测试包不因此
+被冒充为公开候选。
 
 完整的版本历史见本目录的 [`CHANGELOG.md`](CHANGELOG.md)。

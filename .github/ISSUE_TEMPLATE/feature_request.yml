@@ -1,0 +1,31 @@
+name: 功能建议
+description: 提议与 Windows RC003 主线相关的新能力或改进
+title: "[Feature] "
+labels:
+  - enhancement
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: 现在遇到什么问题
+      description: 先说明真实使用场景，不要只写准备采用的技术方案。
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: 建议怎样改变
+      description: 说明用户以后如何操作，以及会增加或取消哪些步骤。
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: 已尝试的替代方式
+  - type: checkboxes
+    id: scope
+    attributes:
+      label: 范围确认
+      options:
+        - label: 这项建议面向 Windows RC003 客户端，而不是 macOS 或其它独立项目。
+          required: true

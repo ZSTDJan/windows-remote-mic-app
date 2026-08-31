@@ -94,9 +94,24 @@ Windows 实现的改动说明与第三方边界见
 [`apps/windows/rc003/ATTRIBUTION.md`](apps/windows/rc003/ATTRIBUTION.md)、
 [`COPYRIGHT.md`](COPYRIGHT.md) 和 [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md)。
 
+## 参与、安全与发布状态
+
+- 报告普通问题或提交修改前，请阅读 [`CONTRIBUTING.md`](CONTRIBUTING.md)；
+- 安全漏洞不要公开复现细节，按 [`SECURITY.md`](SECURITY.md) 使用私密入口；
+- 社区讨论遵守 [`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md)；
+- Windows 二进制的完整第三方许可位于
+  [`THIRD_PARTY_LICENSES`](THIRD_PARTY_LICENSES/README.md)，Qt/PySide6 对应源码
+  与素材授权分别由 [`THIRD_PARTY_SOURCE.md`](THIRD_PARTY_SOURCE.md) 和
+  [`ASSET_LICENSES.md`](ASSET_LICENSES.md) 管理。
+
+普通分支和 Pull Request 可以运行源码、测试与构建检查，但只有正式 tag 才允许上传
+可分发 CI artifact。tag 构建还必须先通过素材授权和第三方对应源码门禁；检查未通过时
+不会为了赶发布绕过。
+
 ## 许可证
 
-代码按 `GPL-3.0-only` 发布。完整许可证见 [`LICENSE.md`](LICENSE.md)。
+代码按 `GPL-3.0-only` 发布。完整许可证见 [`LICENSE.md`](LICENSE.md)。第三方组件和
+素材不因进入同一个安装包就自动改为 GPL，仍按各自许可和授权记录分发。
 
 ## 维护边界
 

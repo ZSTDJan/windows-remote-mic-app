@@ -48,6 +48,20 @@
    `bugs/BUG-025-bridge-startup-readiness-warning.md`、
 `bugs/BUG-026-bridge-liveness-and-first-key-readiness.md` 和 `TESTING.md`。
 
+### 2026-08-31 开源发布基础与许可门禁
+
+- 新增安全报告、贡献说明、行为准则、Issue/PR 模板和 Dependabot 配置，明确 Windows
+  RC003 的问题范围、隐私边界、真机证据和贡献许可。
+- 补齐当前冻结依赖的第三方许可目录与精确清单；候选构建新增依赖声明检查，安装版和
+  便携版都会携带许可、对应源码和素材授权记录。
+- PyInstaller 明确排除未使用的 ASIO PortAudio DLL，收窄没有产品收益的第三方许可面。
+- Windows CI 固定 Windows/Python/Actions/Inno Setup 入口，增加手动运行、main/tag
+  范围、并发和总超时；只有正式 tag 通过发布门禁后才上传分发 artifact，不自动创建
+  GitHub Release。
+- 当前照片公开再分发授权和 Qt/PySide6 项目控制的对应源码地址仍未确认，正式 tag 会
+  被 `check-release-readiness.py --enforce` 阻断。本轮不改内部版本号、不构建、不
+  打包、不发布；现有功能改动冻结后再统一切换到 `0.2.0-candidate.1`。
+
 ### 2026-08-31 服务自检、语音结果诊断与首次唤起修复
 
 - 桥接运行状态升级为兼容旧文件的 schema 2，增加版本/构建来源、BLE、Raw Input、

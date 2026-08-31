@@ -123,6 +123,28 @@ GitHub Release、签名、安装器、正式发布说明或自动提交。用户
 来自同一次 Windows CI 构建。发布说明必须如实区分自动通过、真机通过和仍未完成的
 项目。
 
+### 5. 开源二进制发布门禁
+
+源码按 GPL 公开，不等于任意工作树都可以直接分发 Windows 二进制。正式候选和发布
+除前述代码、测试、真机与产物要求外，还必须同时满足：
+
+- `build/check-third-party-notices.py` 通过，所有锁定运行和构建依赖都能在根目录
+  `THIRD_PARTY_NOTICES.md` 找到精确版本、来源、许可和随包形态；
+- 安装版与便携版都携带 `THIRD_PARTY_LICENSES/`、`THIRD_PARTY_SOURCE.md` 和
+  `ASSET_LICENSES.md`，不能只在源码仓库放一份链接；
+- `build/check-release-readiness.py --enforce` 通过，素材授权已经明确，Qt/PySide6
+  对应源码已经放到项目控制的长期可下载位置并核对哈希；
+- 发布 tag 不可复用、改写或删除；tag 对应提交必须干净，版本、Changelog、发布说明
+  和 CI artifact 来源一致；
+- CI 只在正式 tag 通过发布门禁后上传分发 artifact，普通分支和 Pull Request 的构建
+  不作为公开下载包；
+- 未签名、SmartScreen、休眠恢复、长期运行、杀软兼容和其它人工未完成项按真实结果
+  逐项写入发布说明。
+
+GitHub 仓库简介、topics、Issues、私密漏洞报告、Dependabot 安全更新和 main/tag
+保护属于远端发布准备。修改仓库文件不能代替这些设置；正式公开候选前逐项核实，
+但未经明确发布授权不自动推送、建 tag 或创建 Release。
+
 ## 五、检查点不是交付阶段
 
 “检查点 / 待实测”表示源码已经达到可独立回退的稳定状态，但仍有真实设备、宿主

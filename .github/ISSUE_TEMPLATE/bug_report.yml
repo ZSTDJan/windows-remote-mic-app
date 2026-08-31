@@ -1,0 +1,67 @@
+name: 问题报告
+description: 报告可以复现的 Windows RC003 功能问题
+title: "[Bug] "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        安全漏洞不要在这里公开，请按 SECURITY.md 使用私密报告入口。日志必须先删除蓝牙地址、HID 路径、用户名和个人绝对路径。
+  - type: input
+    id: version
+    attributes:
+      label: 版本来源
+      description: 填写 release tag、commit，或安装包完整文件名。
+      placeholder: 例如 v0.x.0-windows-rc003-candidate.1
+    validations:
+      required: true
+  - type: dropdown
+    id: distribution
+    attributes:
+      label: 运行方式
+      options:
+        - 安装版
+        - 便携版
+        - 源码运行
+    validations:
+      required: true
+  - type: input
+    id: windows
+    attributes:
+      label: Windows 环境
+      description: 填写 Windows 版本和系统架构。
+    validations:
+      required: true
+  - type: textarea
+    id: scenario
+    attributes:
+      label: 使用场景
+      description: 说明 RC003、音频端点、语音程序或按键映射等相关前提。
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: 复现步骤
+      description: 使用最短、稳定的编号步骤。
+    validations:
+      required: true
+  - type: textarea
+    id: result
+    attributes:
+      label: 实际结果与预期结果
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: 已脱敏证据
+      description: 只粘贴最小日志或截图说明；不要上传完整配置和完整日志。
+  - type: checkboxes
+    id: privacy
+    attributes:
+      label: 隐私确认
+      options:
+        - label: 我已删除设备标识、个人路径、用户数据、密钥和其它敏感内容。
+          required: true

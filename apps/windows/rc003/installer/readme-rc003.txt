@@ -71,6 +71,10 @@ SHA-256 校验过的官方 VBCABLE_Driver_Pack45.zip，并通过 Windows 用户�
 手动下载安装换成随包、离线、明确确认的流程；仍可直接从
 https://vb-audio.com/Cable/ 手动下载安装。
 
+安装目录还包含 THIRD_PARTY_NOTICES.md、THIRD_PARTY_SOURCE.md、
+ASSET_LICENSES.md 和 THIRD_PARTY_LICENSES 文件夹，用于说明随包组件、对应
+源码、素材授权和完整许可证。它们与程序本体属于同一次发布，不能单独删除后再分发。
+
 首次使用
 --------
 1. 从 Start Menu 打开"无线麦"或"无线麦 设置"。统一设置窗口只有

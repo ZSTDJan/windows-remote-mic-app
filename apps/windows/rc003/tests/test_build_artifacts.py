@@ -488,6 +488,9 @@ class InnoSetupScriptTests(unittest.TestCase):
     def test_copyright_is_packaged_alongside_license_and_notices(self):
         self.assertIn('DestName: "COPYRIGHT.txt"', self.text)
         self.assertIn('DestName: "THIRD_PARTY_NOTICES.md"', self.text)
+        self.assertIn('DestName: "THIRD_PARTY_SOURCE.md"', self.text)
+        self.assertIn('DestName: "ASSET_LICENSES.md"', self.text)
+        self.assertIn('DestDir: "{app}\\THIRD_PARTY_LICENSES"', self.text)
         self.assertIn('DestName: "LICENSE.txt"', self.text)
 
 
@@ -496,7 +499,11 @@ class WindowsCiWorkflowTests(unittest.TestCase):
         self.text = _CI_PATH.read_text(encoding="utf-8")
 
     def test_targets_windows_runner(self):
-        self.assertIn("windows-latest", self.text)
+        self.assertIn("runs-on: windows-2025", self.text)
+        self.assertIn("timeout-minutes: 60", self.text)
+
+    def test_pins_python_patch_version_for_release_inventory(self):
+        self.assertIn('python-version: "3.12.10"', self.text)
 
     def test_scoped_to_rc003_paths(self):
         self.assertIn("apps/windows/rc003/**", self.text)
@@ -534,14 +541,24 @@ class WindowsCiWorkflowTests(unittest.TestCase):
         self.assertNotIn("/verysilent", lower)
         self.assertNotIn("/silent", lower)
 
-    def test_uses_current_supported_action_majors(self):
-        # XRBM-022: upgrade from checkout@v4/setup-python@v5/upload-artifact@v4.
-        self.assertIn("actions/checkout@v7", self.text)
-        self.assertIn("actions/setup-python@v6", self.text)
-        self.assertEqual(self.text.count("actions/upload-artifact@v7"), 1)
-        self.assertNotIn("actions/checkout@v4", self.text)
-        self.assertNotIn("actions/setup-python@v5", self.text)
-        self.assertNotIn("actions/upload-artifact@v4", self.text)
+    def test_uses_pinned_supported_actions(self):
+        self.assertIn(
+            "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+            self.text,
+        )
+        self.assertIn(
+            "actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97",
+            self.text,
+        )
+        self.assertEqual(
+            self.text.count(
+                "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a"
+            ),
+            1,
+        )
+        self.assertNotIn("uses: actions/checkout@v", self.text)
+        self.assertNotIn("uses: actions/setup-python@v", self.text)
+        self.assertNotIn("uses: actions/upload-artifact@v", self.text)
 
     def test_exactly_one_upload_step_runs_after_every_required_gate(self):
         # XRBM-022 controller pre-review correction: an earlier round
@@ -552,10 +569,14 @@ class WindowsCiWorkflowTests(unittest.TestCase):
         # (textually, which matches step execution order in a linear GitHub
         # Actions job) after the Inno compile and the deterministic
         # packaging step.
-        self.assertEqual(self.text.count("uses: actions/upload-artifact@v7"), 1)
+        upload_marker = (
+            "uses: actions/upload-artifact@"
+            "043fb46d1a93c77aae656e7c1c64a875d1fc6a0a"
+        )
+        self.assertEqual(self.text.count(upload_marker), 1)
         iscc_index = self.text.index("ISCC.exe")
         package_index = self.text.index("Compress-Archive")
-        upload_index = self.text.index("uses: actions/upload-artifact@v7")
+        upload_index = self.text.index(upload_marker)
         self.assertLess(iscc_index, upload_index)
         self.assertLess(package_index, upload_index)
 
@@ -577,6 +598,9 @@ class WindowsCiWorkflowTests(unittest.TestCase):
             "COPYRIGHT.md",
             "LICENSE.md",
             "THIRD_PARTY_NOTICES.md",
+            "THIRD_PARTY_SOURCE.md",
+            "ASSET_LICENSES.md",
+            "THIRD_PARTY_LICENSES/**",
             "Resources/RC003-remote-photo.png",
             "device-profiles/xiaomi-rc003.json",
         ):
@@ -592,6 +616,28 @@ class WindowsCiWorkflowTests(unittest.TestCase):
             "cache-dependency-path: apps/windows/rc003/requirements-dev.txt",
             self.text,
         )
+
+    def test_supports_manual_and_release_tag_builds_without_auto_publishing(self):
+        self.assertIn("workflow_dispatch:", self.text)
+        self.assertIn('      - "v*-windows"', self.text)
+        self.assertIn('      - "v*-windows-rc003-candidate.*"', self.text)
+        self.assertIn("check-release-readiness.py --enforce", self.text)
+        self.assertIn("if: startsWith(github.ref, 'refs/tags/')", self.text)
+        self.assertNotIn("gh release create", self.text)
+
+    def test_distribution_artifact_is_uploaded_only_after_a_tag_release_gate(self):
+        upload_index = self.text.index(
+            "uses: actions/upload-artifact@"
+            "043fb46d1a93c77aae656e7c1c64a875d1fc6a0a"
+        )
+        upload_step_start = self.text.rfind("- name:", 0, upload_index)
+        upload_step = self.text[upload_step_start:]
+        self.assertIn("if: startsWith(github.ref, 'refs/tags/')", upload_step)
+
+    def test_ci_checks_third_party_inventory_and_pins_inno_setup(self):
+        self.assertIn("check-third-party-notices.py", self.text)
+        self.assertIn("choco install innosetup --version=6.7.1", self.text)
+        self.assertIn("group: windows-rc003-ci-${{ github.workflow }}-${{ github.ref }}", self.text)
 
     def test_test_suite_is_gated_by_resource_warning(self):
         self.assertIn("-W error::ResourceWarning -m unittest discover", self.text)
@@ -661,7 +707,7 @@ class WindowsCiWorkflowTests(unittest.TestCase):
         self.assertIn("SHA256SUMS.txt", self.text)
         self.assertIn("-portable-unsigned.zip", self.text)
 
-    def test_portable_zip_stages_license_copyright_notices_attribution_and_readme(self):
+    def test_portable_zip_stages_license_source_assets_attribution_and_readme(self):
         # XRBM-022 controller pre-review correction: the portable ZIP
         # previously compressed only the bare PyInstaller output
         # (dist/RemoteMicRC003/*), so a user who only downloaded the
@@ -686,6 +732,18 @@ class WindowsCiWorkflowTests(unittest.TestCase):
             self.text,
         )
         self.assertIn(
+            'Copy-Item -Path "../../../THIRD_PARTY_SOURCE.md" -Destination (Join-Path $stagingDir "THIRD_PARTY_SOURCE.md")',
+            self.text,
+        )
+        self.assertIn(
+            'Copy-Item -Path "../../../ASSET_LICENSES.md" -Destination (Join-Path $stagingDir "ASSET_LICENSES.md")',
+            self.text,
+        )
+        self.assertIn(
+            'Copy-Item -Path "../../../THIRD_PARTY_LICENSES" -Destination (Join-Path $stagingDir "THIRD_PARTY_LICENSES") -Recurse -Force',
+            self.text,
+        )
+        self.assertIn(
             'Copy-Item -Path "ATTRIBUTION.md" -Destination (Join-Path $stagingDir "ATTRIBUTION.md")',
             self.text,
         )
@@ -705,6 +763,9 @@ class WindowsCiWorkflowTests(unittest.TestCase):
             'Destination (Join-Path $stagingDir "LICENSE.txt")',
             'Destination (Join-Path $stagingDir "COPYRIGHT.txt")',
             'Destination (Join-Path $stagingDir "THIRD_PARTY_NOTICES.md")',
+            'Destination (Join-Path $stagingDir "THIRD_PARTY_SOURCE.md")',
+            'Destination (Join-Path $stagingDir "ASSET_LICENSES.md")',
+            'Destination (Join-Path $stagingDir "THIRD_PARTY_LICENSES")',
             'Destination (Join-Path $stagingDir "ATTRIBUTION.md")',
             'Destination (Join-Path $stagingDir "README.txt")',
         ):
@@ -716,8 +777,8 @@ class WindowsCiWorkflowTests(unittest.TestCase):
 
     def test_compress_archive_targets_the_staging_directory_not_the_bare_built_glob(self):
         # The archive source must be the STAGING folder (which contains a
-        # copy of the built app plus the five metadata/instruction files
-        # above), never the bare "dist/RemoteMicRC003/*" glob
+        # copy of the built app plus the metadata/instruction payload above),
+        # never the bare "dist/RemoteMicRC003/*" glob
         # directly - compressing that glob again would silently regress to
         # the pre-fix "no license/instructions in the ZIP" bug even if the
         # staging/copy lines above still existed elsewhere in the step.
@@ -899,7 +960,10 @@ class WindowsCiWorkflowTests(unittest.TestCase):
         preflight_index = self.text.index(
             "$releaseFiles = @(Get-ChildItem -Path $releaseDir -File)"
         )
-        upload_index = self.text.index("uses: actions/upload-artifact@v7")
+        upload_index = self.text.index(
+            "uses: actions/upload-artifact@"
+            "043fb46d1a93c77aae656e7c1c64a875d1fc6a0a"
+        )
         self.assertLess(preflight_index, upload_index)
 
     def test_upload_path_is_the_single_release_directory_not_a_multi_pattern_list(self):
@@ -1312,16 +1376,17 @@ class RootDocumentConsistencyTests(unittest.TestCase):
         # installation only happens via an explicit user click plus a real
         # UAC prompt, and that this project's own process never runs
         # elevated and never reports install success from launch alone.
-        self.assertIn("fetch-vb-cable.ps1", self.notices_text)
-        self.assertIn("VBCABLE_Driver_Pack45.zip", self.notices_text)
-        self.assertIn("A+B/C+D", self.notices_text)
-        self.assertIn("UAC", self.notices_text)
-        self.assertIn("never runs with administrator privileges", self.notices_text)
+        notices_text = _normalize_whitespace(self.notices_text)
+        self.assertIn("fetch-vb-cable.ps1", notices_text)
+        self.assertIn("VBCABLE_Driver_Pack45.zip", notices_text)
+        self.assertIn("A+B/C+D", notices_text)
+        self.assertIn("UAC", notices_text)
+        self.assertIn("never runs with administrator privileges", notices_text)
         self.assertIn(
             "never reports a driver install as successful merely because a process was launched",
-            self.notices_text,
+            notices_text,
         )
-        self.assertIn("never changes the Windows system default input/output device", self.notices_text)
+        self.assertIn("never changes the Windows system default input/output device", notices_text)
 
     def test_root_readme_and_windows_readme_agree_rc003_windows_is_a_candidate(self):
         # Cross-file consistency: both docs must describe the RC003 Windows

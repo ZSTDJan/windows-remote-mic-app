@@ -69,6 +69,10 @@ try {
     & $venvPython -m pip install -r requirements-dev.txt
     Assert-LastExitCode "pip install -r requirements-dev.txt"
 
+    Write-Host "-- third-party notice and license inventory --"
+    & $venvPython (Join-Path "build" "check-third-party-notices.py")
+    Assert-LastExitCode "check-third-party-notices.py"
+
     Write-Host "-- generate shared Windows application icon --"
     & $venvPython (Join-Path "build" "generate-app-icon.py")
     Assert-LastExitCode "generate-app-icon.py"
