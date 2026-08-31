@@ -5706,6 +5706,7 @@ result = {
     "warnings": [],
     "client_shell": bounds(window, "clientShell"),
     "client_shell_outline": bounds(window, "clientShellOutline"),
+    "global_status_bar": bounds(window, "globalStatusBar"),
     "pages": {},
 }
 
@@ -6261,7 +6262,13 @@ class SettingsShellSourceContractTests(unittest.TestCase):
         self.assertIn("ToolTip {", self.compact_tooltip_qml)
         self.assertIn("delay: 450", self.compact_tooltip_qml)
         self.assertIn("font.pixelSize: root.tokens.fontSizeTiny", self.compact_tooltip_qml)
-        self.assertIn("y: -implicitHeight - root.tokens.spacingSmall", self.compact_tooltip_qml)
+        self.assertIn(
+            "y: -implicitHeight - root.tokens.spacingSmall "
+            "- tooltipBackground.border.width",
+            self.compact_tooltip_qml,
+        )
+        for inset in ("leftInset", "rightInset", "topInset", "bottomInset"):
+            self.assertIn(f"{inset}: 0", self.compact_tooltip_qml)
         self.assertIn("maximumTextWidth: 260", self.compact_tooltip_qml)
         self.assertEqual(self.buttons_qml.count("CompactToolTip {"), 4)
         for title_id in (
@@ -6271,6 +6278,17 @@ class SettingsShellSourceContractTests(unittest.TestCase):
             "comboGestureTitle",
         ):
             self.assertIn(f"id: {title_id}", self.buttons_qml)
+        for title_id in (
+            "primaryGestureTitle",
+            "doubleGestureTitle",
+            "longGestureTitle",
+            "comboGestureTitle",
+        ):
+            title_start = self.buttons_qml.index(f"id: {title_id}")
+            tooltip_start = self.buttons_qml.index("CompactToolTip {", title_start)
+            title_source = self.buttons_qml[title_start:tooltip_start]
+            self.assertIn("Layout.fillHeight: true", title_source)
+            self.assertIn("verticalAlignment: Text.AlignVCenter", title_source)
         self.assertNotIn("ToolTip.visible", self.buttons_qml)
         self.assertIn("gestureHover.hovered && !cell.empty", self.mapping_card_qml)
         self.assertIn("cell.usingNote || valueLabel.truncated", self.mapping_card_qml)
@@ -6436,11 +6454,13 @@ class SettingsShellSourceContractTests(unittest.TestCase):
         single_index = self.buttons_qml.index('objectName: "mappingList"')
         combo_index = self.buttons_qml.index('objectName: "comboMappingList"')
         actions_index = self.buttons_qml.index('objectName: "mappingActionsPanel"')
+        switcher_source = self.buttons_qml[switch_index:single_index]
 
         self.assertLess(switch_index, single_index)
         self.assertLess(switch_index, combo_index)
         self.assertLess(single_index, actions_index)
         self.assertLess(combo_index, actions_index)
+        self.assertEqual(switcher_source.count("Layout.preferredWidth: 1"), 2)
         self.assertIn('text: qsTr("单键映射")', self.buttons_qml)
         self.assertIn('text: qsTr("组合按键映射")', self.buttons_qml)
         self.assertIn("model: SettingsController.comboRows", self.buttons_qml)
@@ -6605,6 +6625,7 @@ class ThreePageSettingsSourceContractTests(unittest.TestCase):
             self.tokens_qml,
         )
         self.assertIn("property real hairlineWidth: 0.5", self.tokens_qml)
+        self.assertIn("property int structuralDividerWidth: 1", self.tokens_qml)
         self.assertNotIn("import QtQuick.Effects", self.main_qml)
         self.assertNotIn("clientShellShadow", self.main_qml)
         self.assertNotIn("windowShadow", self.tokens_qml)
@@ -6667,12 +6688,12 @@ class ThreePageSettingsSourceContractTests(unittest.TestCase):
         self.assertIn("? root.tokens.accent", self.compact_switch_qml)
         self.assertIn("? root.tokens.accentText", self.compact_switch_qml)
 
-    def test_sidebar_separator_keeps_a_visible_hairline(self):
+    def test_sidebar_separator_uses_a_visible_structural_divider(self):
         navigation_source = self.main_qml[
             self.main_qml.index('id: navigationBar'):
             self.main_qml.index('id: pageStack')
         ]
-        self.assertIn("width: tokens.hairlineWidth", navigation_source)
+        self.assertIn("width: tokens.structuralDividerWidth", navigation_source)
         self.assertIn("color: tokens.borderStrong", navigation_source)
 
     def test_diagnostics_are_reused_inside_their_own_rows(self):
@@ -6868,7 +6889,7 @@ class OffscreenQmlLoadTests(unittest.TestCase):
             data["warnings"], [], "main.qml produced QML warnings/errors during load"
         )
         self.assertEqual(data["width"], 720)
-        self.assertEqual(data["height"], 500)
+        self.assertEqual(data["height"], 560)
         self.assertFalse(data["initial_settings_dirty"])
         self.assertFalse(data["retired_finish_tap_control_exists"])
         self.assertFalse(data["voice_hotkey_recording"])
@@ -6913,6 +6934,7 @@ class OffscreenQmlLoadTests(unittest.TestCase):
         scenarios = (
             ("Basic", 720, 500),
             ("Basic", 640, 480),
+            ("FluentWinUI3", 720, 560),
             ("FluentWinUI3", 720, 500),
             ("FluentWinUI3", 640, 480),
         )
@@ -7046,6 +7068,11 @@ class OffscreenQmlLoadTests(unittest.TestCase):
                 )
 
                 voice_items = data["pages"]["voice"]["items"]
+                if style == "FluentWinUI3" and (width, height) == (720, 560):
+                    self.assertLessEqual(
+                        voice_items["voiceTestSection"]["bottom"] + 6,
+                        data["global_status_bar"]["y"],
+                    )
                 self.assertLessEqual(
                     voice_items["audioPrerequisiteSection"]["bottom"],
                     voice_items["voiceProgramSection"]["y"] + 1,
@@ -8456,12 +8483,14 @@ class ButtonsPageMappingCardTests(unittest.TestCase):
         self.assertTrue(data["editor_visible"])
 
     def test_editor_help_tooltip_is_compact_and_does_not_cover_the_input(self):
-        data = self._run_probe(720, 500)
-        tooltip = data["primary_help"]["tooltip"]
-        action_input = data["primary_help"]["input"]
-        self.assertTrue(tooltip["visible"])
-        self.assertLessEqual(tooltip["width"], 274)
-        self.assertLessEqual(tooltip["bottom"], action_input["y"])
+        for style in ("Basic", "FluentWinUI3"):
+            with self.subTest(style=style):
+                data = self._run_probe(720, 500, style)
+                tooltip = data["primary_help"]["tooltip"]
+                action_input = data["primary_help"]["input"]
+                self.assertTrue(tooltip["visible"])
+                self.assertLessEqual(tooltip["width"], 274)
+                self.assertLessEqual(tooltip["bottom"], action_input["y"])
 
     def test_selected_power_is_marked_at_its_calibrated_photo_position(self):
         data = self._run_probe(720, 500)

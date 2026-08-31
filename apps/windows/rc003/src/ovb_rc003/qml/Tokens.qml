@@ -55,6 +55,7 @@ QtObject {
     property int windowClientRadius: 9
     property int windowFrameGap: 3
     property real hairlineWidth: 0.5
+    property int structuralDividerWidth: 1
     property int spacingTiny: 3
     property int spacingSmall: 6
     property int spacingMedium: 8

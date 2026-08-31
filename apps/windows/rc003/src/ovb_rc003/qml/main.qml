@@ -8,7 +8,7 @@ ApplicationWindow {
     id: window
     title: SettingsController.applicationDisplayName
     width: 720
-    height: 500
+    height: 560
     minimumWidth: 640
     minimumHeight: 480
     visible: true
@@ -465,7 +465,7 @@ ApplicationWindow {
                 anchors.right: parent.right
                 anchors.top: parent.top
                 anchors.bottom: parent.bottom
-                width: tokens.hairlineWidth
+                width: tokens.structuralDividerWidth
                 color: tokens.borderStrong
             }
 

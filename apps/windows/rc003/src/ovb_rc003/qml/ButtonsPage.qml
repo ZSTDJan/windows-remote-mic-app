@@ -670,6 +670,8 @@ Item {
                     text: qsTr("单击")
                     font.pixelSize: tokens.fontSizeControl
                     font.weight: Font.Medium
+                    Layout.fillHeight: true
+                    verticalAlignment: Text.AlignVCenter
                     HoverHandler { id: primaryGestureTitleHover }
                     CompactToolTip {
                         objectName: "actionEditorPrimaryHelp"
@@ -740,6 +742,8 @@ Item {
                     text: qsTr("双击")
                     font.pixelSize: tokens.fontSizeControl
                     font.weight: Font.Medium
+                    Layout.fillHeight: true
+                    verticalAlignment: Text.AlignVCenter
                     HoverHandler { id: doubleGestureTitleHover }
                     CompactToolTip {
                         tokens: root.tokens
@@ -808,6 +812,8 @@ Item {
                     text: qsTr("长按")
                     font.pixelSize: tokens.fontSizeControl
                     font.weight: Font.Medium
+                    Layout.fillHeight: true
+                    verticalAlignment: Text.AlignVCenter
                     HoverHandler { id: longGestureTitleHover }
                     CompactToolTip {
                         tokens: root.tokens
@@ -922,6 +928,7 @@ Item {
                         objectName: "singleMappingViewButton"
                         tokens: root.tokens
                         Layout.fillWidth: true
+                        Layout.preferredWidth: 1
                         text: qsTr("单键映射")
                         highlighted: root.mappingViewIndex === 0
                         onClicked: root.mappingViewIndex = 0
@@ -932,6 +939,7 @@ Item {
                         objectName: "comboMappingViewButton"
                         tokens: root.tokens
                         Layout.fillWidth: true
+                        Layout.preferredWidth: 1
                         text: qsTr("组合按键映射")
                         highlighted: root.mappingViewIndex === 1
                         onClicked: root.mappingViewIndex = 1
@@ -1396,8 +1404,10 @@ Item {
                                         objectName: "comboMappingTitle_" + buttonId
                                         tokens: root.tokens
                                         Layout.preferredWidth: tokens.comboMappingKeyColumnWidth
+                                        Layout.fillHeight: true
                                         text: SettingsController.comboModifierText
                                             + " + " + root.shortButtonName(buttonId)
+                                        verticalAlignment: Text.AlignVCenter
                                         HoverHandler { id: comboGestureTitleHover }
                                         CompactToolTip {
                                             tokens: root.tokens

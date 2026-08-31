@@ -13,6 +13,10 @@ ToolTip {
     timeout: 5000
     x: 0
     y: -implicitHeight - root.tokens.spacingSmall - tooltipBackground.border.width
+    leftInset: 0
+    rightInset: 0
+    topInset: 0
+    bottomInset: 0
     leftMargin: tokens.spacingSmall
     rightMargin: tokens.spacingSmall
     topMargin: tokens.spacingSmall
