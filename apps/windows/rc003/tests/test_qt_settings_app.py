@@ -6536,6 +6536,9 @@ class ThreePageSettingsSourceContractTests(unittest.TestCase):
         self.compact_text_field_qml = (qml_dir / "CompactTextField.qml").read_text(
             encoding="utf-8"
         )
+        self.compact_switch_qml = (qml_dir / "CompactSwitch.qml").read_text(
+            encoding="utf-8"
+        )
         self.selection_combo_qml = (qml_dir / "SelectionComboBox.qml").read_text(
             encoding="utf-8"
         )
@@ -6643,6 +6646,14 @@ class ThreePageSettingsSourceContractTests(unittest.TestCase):
         self.assertNotIn('text: qsTr("设备")', self.device_qml)
         self.assertIn("SettingsController.remoteDisplayName", self.device_qml)
         self.assertIn('qsTr("启动桥接")', self.device_qml)
+
+    def test_device_toggles_share_the_compact_accent_switch(self):
+        self.assertEqual(self.device_qml.count("CompactSwitch {"), 2)
+        self.assertNotIn("                    Switch {", self.device_qml)
+        self.assertIn("implicitWidth: 36", self.compact_switch_qml)
+        self.assertIn("implicitHeight: 14", self.compact_switch_qml)
+        self.assertIn("? root.tokens.accent", self.compact_switch_qml)
+        self.assertIn("? root.tokens.accentText", self.compact_switch_qml)
 
     def test_diagnostics_are_reused_inside_their_own_rows(self):
         for check_id in ("os_version", "raw_input", "ble_candidate"):

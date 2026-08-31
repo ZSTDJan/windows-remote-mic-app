@@ -245,9 +245,10 @@ Item {
                     descriptionText: qsTr("登录后在通知区域后台运行%1")
                         .arg(SettingsController.applicationDisplayName)
 
-                    Switch {
+                    CompactSwitch {
                         id: launchAtLoginSwitch
                         objectName: "launchAtLoginSwitch"
+                        tokens: root.tokens
                         checked: SettingsController.launchAtLogin
                         Accessible.name: qsTr("随 Windows 启动")
                         onToggled: {
@@ -263,9 +264,10 @@ Item {
                     titleText: qsTr("启动程序时自动启动桥接")
                     descriptionText: qsTr("相当于自动点击一次“启动桥接”，与随 Windows 启动互不绑定")
 
-                    Switch {
+                    CompactSwitch {
                         id: launchBridgeOnAppStartSwitch
                         objectName: "launchBridgeOnAppStartSwitch"
+                        tokens: root.tokens
                         checked: SettingsController.launchBridgeOnAppStart
                         Accessible.name: qsTr("启动程序时自动启动桥接")
                         onToggled: {
