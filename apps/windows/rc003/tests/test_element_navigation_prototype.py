@@ -3731,7 +3731,7 @@ assert not any(name == "PySide6" or name.startswith("PySide6.") for name in sys.
         )
         self.assertIsNone(prototype.keyboard_navigation_action(0x70))
 
-    def test_injected_direction_repeat_waits_for_hold_confirmation(self):
+    def test_raw_remote_direction_owned_by_downstream_is_not_navigation_input(self):
         for vk in (
             prototype.VK_UP,
             prototype.VK_DOWN,
@@ -3739,22 +3739,21 @@ assert not any(name == "PySide6" or name.startswith("PySide6.") for name in sys.
             prototype.VK_RIGHT,
         ):
             with self.subTest(vk=vk):
-                gate = prototype.DirectionRepeatGate()
-                self.assertTrue(gate.allow(vk, 10.000, injected=True))
-                self.assertFalse(gate.allow(vk, 10.350, injected=True))
-                self.assertTrue(gate.allow(vk, 10.450, injected=True))
-                self.assertTrue(gate.allow(vk, 10.550, injected=True))
+                ownership = prototype.DirectionInputOwnership()
+                call_next = mock.Mock(return_value=1)
+                self.assertEqual(
+                    ownership.route(
+                        vk,
+                        is_down=True,
+                        is_up=False,
+                        injected=False,
+                        call_next=call_next,
+                    ),
+                    (True, 1),
+                )
+                call_next.assert_called_once_with()
 
-    def test_real_remote_repeat_cadence_is_confirmed_without_double_step(self):
-        gate = prototype.DirectionRepeatGate()
-
-        self.assertTrue(gate.allow(prototype.VK_UP, 20.000, injected=True))
-        self.assertFalse(gate.allow(prototype.VK_UP, 20.340, injected=True))
-        self.assertFalse(gate.allow(prototype.VK_UP, 20.350, injected=True))
-        self.assertTrue(gate.allow(prototype.VK_UP, 20.530, injected=True))
-        self.assertTrue(gate.allow(prototype.VK_UP, 20.720, injected=True))
-
-    def test_rc003_early_repeat_does_not_skip_the_next_target(self):
+    def test_raw_keyboard_direction_remains_navigation_input(self):
         for vk in (
             prototype.VK_UP,
             prototype.VK_DOWN,
@@ -3762,36 +3761,91 @@ assert not any(name == "PySide6" or name.startswith("PySide6.") for name in sys.
             prototype.VK_RIGHT,
         ):
             with self.subTest(vk=vk):
-                gate = prototype.DirectionRepeatGate()
-                self.assertTrue(gate.allow(vk, 60.000, injected=True))
-                self.assertFalse(gate.allow(vk, 60.274, injected=True))
-                self.assertTrue(gate.allow(vk, 60.511, injected=True))
-                self.assertTrue(gate.allow(vk, 60.748, injected=True))
+                ownership = prototype.DirectionInputOwnership()
+                call_next = mock.Mock(return_value=0)
+                self.assertEqual(
+                    ownership.route(
+                        vk,
+                        is_down=True,
+                        is_up=False,
+                        injected=False,
+                        call_next=call_next,
+                    ),
+                    (False, 0),
+                )
+                call_next.assert_called_once_with()
 
-    def test_fast_deliberate_injected_taps_remain_independent(self):
-        gate = prototype.DirectionRepeatGate()
+    def test_injected_direction_stays_available_to_navigation(self):
+        for vk in (
+            prototype.VK_UP,
+            prototype.VK_DOWN,
+            prototype.VK_LEFT,
+            prototype.VK_RIGHT,
+        ):
+            with self.subTest(vk=vk):
+                ownership = prototype.DirectionInputOwnership()
+                call_next = mock.Mock(return_value=1)
+                self.assertEqual(
+                    ownership.route(
+                        vk,
+                        is_down=True,
+                        is_up=False,
+                        injected=True,
+                        call_next=call_next,
+                    ),
+                    (False, 0),
+                )
+                call_next.assert_not_called()
 
-        self.assertTrue(gate.allow(prototype.VK_RIGHT, 30.000, injected=True))
-        self.assertTrue(gate.allow(prototype.VK_RIGHT, 30.180, injected=True))
-        self.assertTrue(gate.allow(prototype.VK_RIGHT, 30.360, injected=True))
-
-    def test_direction_repeat_gate_resets_for_new_input(self):
-        gate = prototype.DirectionRepeatGate()
-
-        self.assertTrue(gate.allow(prototype.VK_LEFT, 40.000, injected=True))
-        self.assertFalse(gate.allow(prototype.VK_LEFT, 40.350, injected=True))
-        self.assertTrue(gate.allow(prototype.VK_UP, 40.360, injected=True))
-        self.assertTrue(gate.allow(prototype.VK_UP, 40.370, injected=False))
-        self.assertTrue(gate.allow(prototype.VK_LEFT, 41.000, injected=True))
-
-    def test_confirmed_repeat_coalesces_near_simultaneous_duplicates(self):
-        gate = prototype.DirectionRepeatGate()
-
-        self.assertTrue(gate.allow(prototype.VK_DOWN, 50.000, injected=True))
-        self.assertFalse(gate.allow(prototype.VK_DOWN, 50.350, injected=True))
-        self.assertTrue(gate.allow(prototype.VK_DOWN, 50.450, injected=True))
-        self.assertFalse(gate.allow(prototype.VK_DOWN, 50.490, injected=True))
-        self.assertTrue(gate.allow(prototype.VK_DOWN, 50.550, injected=True))
+    def test_forwarded_direction_release_reaches_downstream_and_clears_state(self):
+        for vk in (
+            prototype.VK_UP,
+            prototype.VK_DOWN,
+            prototype.VK_LEFT,
+            prototype.VK_RIGHT,
+        ):
+            with self.subTest(vk=vk):
+                ownership = prototype.DirectionInputOwnership()
+                call_next = mock.Mock(side_effect=(1, 0, 0))
+                ownership.route(
+                    vk,
+                    is_down=True,
+                    is_up=False,
+                    injected=False,
+                    call_next=call_next,
+                )
+                self.assertEqual(
+                    ownership.route(
+                        vk,
+                        is_down=True,
+                        is_up=False,
+                        injected=False,
+                        call_next=call_next,
+                    ),
+                    (True, 0),
+                )
+                self.assertEqual(
+                    ownership.route(
+                        vk,
+                        is_down=False,
+                        is_up=True,
+                        injected=False,
+                        call_next=call_next,
+                    ),
+                    (True, 0),
+                )
+                self.assertEqual(call_next.call_count, 3)
+                self.assertFalse(ownership.has_forwarded_down(vk))
+                self.assertEqual(
+                    ownership.route(
+                        vk,
+                        is_down=False,
+                        is_up=True,
+                        injected=False,
+                        call_next=call_next,
+                    ),
+                    (False, 0),
+                )
 
     def test_tracks_only_relevant_structure_changes(self):
         self.assertTrue(prototype.is_navigation_structure_event(0x8000))

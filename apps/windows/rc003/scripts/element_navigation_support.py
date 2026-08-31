@@ -77,88 +77,52 @@ NATIVE_MENU_NAVIGATION_KEYS = frozenset(
 DIRECTION_NAVIGATION_KEYS = frozenset({VK_UP, VK_DOWN, VK_LEFT, VK_RIGHT})
 
 
-class DirectionRepeatGate:
-    """Separate deliberate taps from synthetic remote hold repeats."""
+class DirectionInputOwnership:
+    """Let a downstream device hook claim raw direction-key edges."""
 
-    def __init__(
+    def __init__(self) -> None:
+        self._forwarded_down: set[int] = set()
+        self._downstream_owned: set[int] = set()
+
+    def has_forwarded_down(self, vk: int) -> bool:
+        return vk in self._forwarded_down
+
+    def route(
         self,
+        vk: int,
         *,
-        repeat_suspect_after: float = 0.220,
-        repeat_suspect_until: float = 0.750,
-        repeat_confirm_min_gap: float = 0.070,
-        repeat_confirm_max_gap: float = 0.400,
-        repeat_output_min_gap: float = 0.080,
-    ) -> None:
-        self.repeat_suspect_after = repeat_suspect_after
-        self.repeat_suspect_until = repeat_suspect_until
-        self.repeat_confirm_min_gap = repeat_confirm_min_gap
-        self.repeat_confirm_max_gap = repeat_confirm_max_gap
-        self.repeat_output_min_gap = repeat_output_min_gap
-        self.reset()
+        is_down: bool,
+        is_up: bool,
+        injected: bool,
+        call_next: Callable[[], int],
+    ) -> tuple[bool, int]:
+        """Return ``(downstream_owned, downstream_result)``.
 
-    def reset(self) -> None:
-        self._vk: Optional[int] = None
-        self._sequence_started_at = 0.0
-        self._last_seen_at = 0.0
-        self._last_allowed_at = 0.0
-        self._pending_repeat_at: Optional[float] = None
-        self._repeating = False
+        Raw direction downs are offered to the rest of the hook chain first.
+        A non-zero result means the selected RC003 suppressor claimed the
+        physical edge. Its repeats and matching release remain downstream-owned.
+        Injected mapping events bypass this path and stay available to navigation.
+        """
 
-    def allow(self, vk: int, now: float, *, injected: bool) -> bool:
-        if not injected or vk not in DIRECTION_NAVIGATION_KEYS:
-            self.reset()
-            return True
+        if injected or vk not in DIRECTION_NAVIGATION_KEYS:
+            return False, 0
 
-        idle_reset = self.repeat_suspect_until
-        if (
-            self._vk != vk
-            or self._last_seen_at <= 0.0
-            or now < self._last_seen_at
-            or now - self._last_seen_at > idle_reset
-        ):
-            self._start(vk, now)
-            return True
+        was_forwarded = self.has_forwarded_down(vk)
+        was_owned = vk in self._downstream_owned
+        if not is_down and not (is_up and was_forwarded):
+            return False, 0
 
-        elapsed = now - self._sequence_started_at
-        self._last_seen_at = now
+        downstream_result = int(call_next())
+        downstream_owned = was_owned or downstream_result != 0
+        if is_down:
+            self._forwarded_down.add(vk)
+            if downstream_result != 0:
+                self._downstream_owned.add(vk)
+        if is_up:
+            self._forwarded_down.discard(vk)
+            self._downstream_owned.discard(vk)
 
-        if self._repeating:
-            if now - self._last_allowed_at < self.repeat_output_min_gap:
-                return False
-            self._last_allowed_at = now
-            return True
-
-        if elapsed < self.repeat_suspect_after:
-            # A second completed tap before Windows' normal double-click
-            # window is much more likely deliberate than a hold repeat.
-            self._start(vk, now)
-            return True
-
-        if elapsed > self.repeat_suspect_until:
-            self._start(vk, now)
-            return True
-
-        if self._pending_repeat_at is None:
-            self._pending_repeat_at = now
-            return False
-
-        confirmation_gap = now - self._pending_repeat_at
-        if self.repeat_confirm_min_gap <= confirmation_gap <= self.repeat_confirm_max_gap:
-            self._repeating = True
-            self._pending_repeat_at = None
-            self._last_allowed_at = now
-            return True
-        if confirmation_gap > self.repeat_confirm_max_gap:
-            self._pending_repeat_at = now
-        return False
-
-    def _start(self, vk: int, now: float) -> None:
-        self._vk = vk
-        self._sequence_started_at = now
-        self._last_seen_at = now
-        self._last_allowed_at = now
-        self._pending_repeat_at = None
-        self._repeating = False
+        return downstream_owned, downstream_result
 
 GLOBAL_HOTKEY_ACTIONS = {
     VK_D: "toggle_diagnostics",
@@ -810,7 +774,7 @@ __all__ = (
     'NAVIGATION_KEY_ACTIONS',
     'NATIVE_MENU_NAVIGATION_KEYS',
     'DIRECTION_NAVIGATION_KEYS',
-    'DirectionRepeatGate',
+    'DirectionInputOwnership',
     'GLOBAL_HOTKEY_ACTIONS',
     'OVERLAY_MAX_ROOT_AREA_RATIO',
     'OVERLAY_MIN_INTERSECTION_RATIO',
