@@ -23,8 +23,8 @@ platform-availability signal re-raised as-is with no rollback attempted,
 since nothing could have landed.
 
 WeType compatibility is deliberately narrower than the ordinary mapping
-path. It mirrors Vibe Flow's proven shortcut sender: separate virtual-key
-``SendInput`` batches for key-down and key-up, an 80 ms hold between them,
+path: separate virtual-key ``SendInput`` batches for key-down and key-up,
+an 80 ms hold between them,
 ``wScan=0``, no ``KEYEVENTF_SCANCODE``, and ``dwExtraInfo=0``. Other providers
 retain the marked ``keybd_event`` voice path required by the existing Doubao
 compatibility layer.
@@ -595,7 +595,7 @@ def send_wetype_voice_key_combo_tap(
     _sender: Optional[RawSender] = None,
     _sleep: Callable[[float], None] = time.sleep,
 ) -> None:
-    """Send one Vibe Flow-compatible 80 ms WeType shortcut tap."""
+    """Send one 80 ms WeType shortcut tap."""
 
     sender = _sender or _real_send_virtual_key_input_batch
     vk_codes = win32_keys.resolve_vk_codes(tokens)

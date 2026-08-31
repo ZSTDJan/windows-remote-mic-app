@@ -898,7 +898,7 @@ HID 注入权限顺序与稳定失败提交：
 - `compileall`、`pip check`、PowerShell parser、公开边界扫描 278 个文件和
   `git diff --check` 通过；QML 离屏加载及矩阵布局检查包含在完整测试中。
 - 本机候选已从提交 `b74288c` 构建到
-  `D:\Wuxianmai\RemoteMicRC003-0.1.0-candidate-20260822-hold1`。目录含 2062 个
+  `RemoteMicRC003-0.1.0-candidate-20260822-hold1`。目录含 2062 个
   文件，复制后逐文件 SHA-256 与 `dist/RemoteMicRC003` 一致；EXE SHA-256 为
   `752AB73FD3A6BF841682C2D41ADDACDE9520F22CBAC438AB19A8EFA8612970C8`。
 - 冻结 `--help=0`、`--dry-run=0`；六个 QML 文件与源码逐文件一致；Frida Gadget
@@ -911,7 +911,7 @@ HID 注入权限顺序与稳定失败提交：
 ### 2026-08-23 HOLD-only 便携 ZIP
 
 - 用户确认本机程序后，按指令将既有 `hold1` 候选目录原样压缩为
-  `D:\Wuxianmai\RemoteMicRC003-0.1.0-candidate-20260822-hold1-portable.zip`。
+  `RemoteMicRC003-0.1.0-candidate-20260822-hold1-portable.zip`。
 - ZIP 大小为 127,256,811 字节，SHA-256 为
   `9A3A9B09D60B360C3C55F14BBB800AFEB0FE3E5B4C446A985CAD812E024D861D`。
 - 完整解压复核通过：只有一个
@@ -982,7 +982,7 @@ HID 注入权限顺序与稳定失败提交：
 - 源码提交为 `90b552e`。从该干净提交重新运行 `build/build-candidate.ps1`，公开
   边界、固定资源校验、1152/7 完整测试、PyInstaller 和冻结自检全部通过。
 - 最终本机目录为
-  `D:\Wuxianmai\RemoteMicRC003-0.1.0-candidate-20260823-hold2`，共 2062 个文件、
+  `RemoteMicRC003-0.1.0-candidate-20260823-hold2`，共 2062 个文件、
   320,898,562 字节；与 `dist\RemoteMicRC003` 逐文件 SHA-256 一致。
 - 冻结 `--help=0`、`--dry-run=0`；EXE SHA-256 为
   `AE072B578FFA112F301201D8452C8A8959C656D75977BF00620A5E066819C5FF`。
@@ -992,7 +992,7 @@ HID 注入权限顺序与稳定失败提交：
   VB-CABLE 原始包 SHA-256 为
   `B950E39F01AF1D04EA623C8F6D8EB9B6EA5C477C637295FABF20631C85116BFB`。
 - 用户随后要求制作便携 ZIP。文件为
-  `D:\Wuxianmai\RemoteMicRC003-0.1.0-candidate-20260823-hold2-portable.zip`，大小
+  `RemoteMicRC003-0.1.0-candidate-20260823-hold2-portable.zip`，大小
   127,255,338 字节，SHA-256 为
   `3D9E900195FE99D193D4C324D09D993B1F94146C4821456B62F1EF05527D44FB`。
 - ZIP 完整解压验证通过：只有一个
@@ -1032,7 +1032,7 @@ HID 注入权限顺序与稳定失败提交：
 - 修复提交为 `83adfba`。从该干净提交运行 `build/build-candidate.ps1`，公开边界、
   固定资源、1157/7 完整测试、PyInstaller 和冻结 `--dry-run` 均通过。
 - 本机候选为
-  `D:\Wuxianmai\RemoteMicRC003-0.1.0-candidate-20260823-hold3`，共 2062 个文件、
+  `RemoteMicRC003-0.1.0-candidate-20260823-hold3`，共 2062 个文件、
   320,901,336 字节；与 `dist\RemoteMicRC003` 逐文件 SHA-256 一致。EXE SHA-256
   为 `8FF6A4840653035AA001746E0957159C33297BBBEA233AD9F6ED043112B38B0E`。
 - 冻结 `--help=0`、`--dry-run=0`、无效 HID 注入 PID `=4`。6 个 QML 与源码一致；
@@ -1040,7 +1040,7 @@ HID 注入权限顺序与稳定失败提交：
   `B566D70189B6D551AD8F4E0BEA24DE08A3D4C0F559BB35B2BDB67D45182240C2`、
   `B950E39F01AF1D04EA623C8F6D8EB9B6EA5C477C637295FABF20631C85116BFB`。
 - 便携 ZIP 为
-  `D:\Wuxianmai\RemoteMicRC003-0.1.0-candidate-20260823-hold3-portable.zip`，大小
+  `RemoteMicRC003-0.1.0-candidate-20260823-hold3-portable.zip`，大小
   127,256,558 字节，SHA-256 为
   `33C53BB6AC59AFE8EC661D051AE60EA16290F882971E49F3D46BE6BAB697B1B2`。
   完整解压验证只有一个版本顶层目录，2062 个文件与候选逐文件 SHA-256 一致，
@@ -1075,7 +1075,7 @@ HID 注入权限顺序与稳定失败提交：
   正式构建，脚本内公开边界扫描 278 个文件，完整 unittest 1165 项通过、7 项
   跳过，PyInstaller 和冻结 `--dry-run` 通过。
 - 本机候选为
-  `D:\Wuxianmai\RemoteMicRC003-0.1.0-candidate-20260823-hold4`，共 2062 个文件、
+  `RemoteMicRC003-0.1.0-candidate-20260823-hold4`，共 2062 个文件、
   320,902,537 字节；与 `dist\RemoteMicRC003` 零缺失、零新增、零内容差异。
   EXE SHA-256 为
   `64A329A51BE6C181FF4928463CD9DC6078A8B6C8B6A853EFD0379E75226CFCC4`。
@@ -1166,11 +1166,11 @@ HID 注入权限顺序与稳定失败提交：
   全脚本解析、公开边界扫描 302 个文件和 `git diff --check` 通过。
 - PyInstaller 构建、冻结 `--help=0` / `--dry-run=0` 和 11 个源码/冻结 QML
   逐文件一致性通过。便携目录为
-  `D:\Wuxianmai\RemoteMicRC003-0.1.0-candidate-20260824-selfcheck1`，共 2072 个
+  `RemoteMicRC003-0.1.0-candidate-20260824-selfcheck1`，共 2072 个
   文件、320,960,337 字节；EXE SHA-256 为
   `5AA9894E20FA05183BC2E5CEDDD342B148F36867262D899A9DD90CEEBCD174BF`。
 - ZIP 为
-  `D:\Wuxianmai\RemoteMicRC003-0.1.0-candidate-20260824-selfcheck1-portable.zip`，
+  `RemoteMicRC003-0.1.0-candidate-20260824-selfcheck1-portable.zip`，
   大小 127,308,081 字节，SHA-256 为
   `B110C4D44AAD62060B597AF02D875D5D06576EA039F4187895AF4B2BC7AE94C4`。完整解压
   后只有一个预期顶层目录，2072 个文件与便携目录零缺失、零新增、零内容差异。
@@ -1204,11 +1204,11 @@ HID 注入权限顺序与稳定失败提交：
   364 个文件；完整 unittest 1240 项通过、7 项按平台或安全条件跳过。
 - Frida Gadget 与 VB-CABLE 固定资产校验、PyInstaller 构建和冻结 `--dry-run`
   通过。本地测试目录为
-  `D:\Wuxianmai\RemoteMicRC003-0.1.0-localtest-20260825-audio-hid-fix1`，共 2073 个
+  `RemoteMicRC003-0.1.0-localtest-20260825-audio-hid-fix1`，共 2073 个
   文件、320,577,781 字节；EXE SHA-256 为
   `0ED8002B7AD72A874D41E86C9E4628BD76AF76D8B1B806794B8FE79EA9690B88`。
 - ZIP 为
-  `D:\Wuxianmai\RemoteMicRC003-0.1.0-localtest-20260825-audio-hid-fix1-portable.zip`，
+  `RemoteMicRC003-0.1.0-localtest-20260825-audio-hid-fix1-portable.zip`，
   大小 126,969,267 字节，SHA-256 为
   `C8CEFBDF258328B917E61DA905E6C1D0F5D8CDA5C0CBD6B1D7954C8FDA17C02E`。ZIP 只有
   一个预期顶层目录，2073 个文件与本地测试目录零缺失、零新增、零内容差异；包内
@@ -1283,11 +1283,11 @@ HID 注入权限顺序与稳定失败提交：
   扫描 277 个文件，完整 unittest 1330 项通过、7 项按平台条件跳过；固定资源、
   PyInstaller 和冻结程序 `--dry-run` 均通过。
 - 本地测试目录为
-  `D:\Wuxianmai\RemoteMicRC003-0.1.0-localtest-20260826-ui-voice-audio1`，包含 2086 个
+  `RemoteMicRC003-0.1.0-localtest-20260826-ui-voice-audio1`，包含 2086 个
   文件、397,334,914 字节；EXE SHA-256 为
   `ED6ADD695C58014702F8E0C497792FA19343164511EC42EB060D8CA00C6B7C1F`。
 - ZIP 为
-  `D:\Wuxianmai\RemoteMicRC003-0.1.0-localtest-20260826-ui-voice-audio1-portable.zip`，
+  `RemoteMicRC003-0.1.0-localtest-20260826-ui-voice-audio1-portable.zip`，
   大小 163,368,698 字节，SHA-256 为
   `6916325D31D68FF4FB269BD8BF380F5BE9C80849D6D12A7C89092CAC6579B3B9`。ZIP 可正常
   打开，只有一个预期顶层目录，2086 个文件齐全，包内 EXE 与复制目录哈希一致。
@@ -1365,7 +1365,7 @@ HID 注入权限顺序与稳定失败提交：
   未提交修改。公开边界扫描与两项固定第三方资源通过；1360 项 unittest 中 1353 项
   通过、7 项按平台或安全条件跳过；PyInstaller、冻结 `--dry-run` 和 Qt 运行时检查通过。
 - 本机测试目录为
-  `D:\Wuxianmai\RemoteMicRC003-0.1.0-localtest-20260827-ui-fix2`，共 2086 个文件、
+  `RemoteMicRC003-0.1.0-localtest-20260827-ui-fix2`，共 2086 个文件、
   394,586,719 字节，复制前后逐文件哈希一致。主 EXE SHA-256 为
   `A203B14534F8F2140706D18FA6AD788B46FBD4DB6CC54F08F7C200FD2A84E430`。
 - 使用隔离配置目录实际打开“Remote Mic 设置”窗口并正常关闭，未残留进程。该目录
@@ -1397,7 +1397,7 @@ HID 注入权限顺序与稳定失败提交：
   资源、PyInstaller、冻结 `--dry-run` 和 Qt 运行时检查全部通过；1406 项 unittest
   中 1399 项通过、7 项按平台或安全条件跳过。
 - 本机测试目录为
-  `D:\Wuxianmai\RemoteMicRC003-0.1.0-localtest-20260827-quicker-combo-nav1`，共
+  `RemoteMicRC003-0.1.0-localtest-20260827-quicker-combo-nav1`，共
   2086 个文件、394,608,856 字节。主 EXE 为 5,127,586 字节，SHA-256 为
   `841741F70BC413EE46178ADE4356A1FCC45376EB3249ABCE485D107F897A2E8C`；复制后的
   EXE 再次通过 `--dry-run` 和 Qt 运行时检查。
@@ -1670,10 +1670,10 @@ HID 注入权限顺序与稳定失败提交：
   `06934E951A4B7952C81C15314AD659CFEA07254637CD92137E5F3CE5DDB862A7`；构建脚本内
   公开边界扫描 360 个文件，完整 unittest 共 1602 项，其中 1595 项通过、7 项跳过，
   固定 VB-CABLE / Frida 资源、PyInstaller、冻结 `--dry-run` 和 Qt 运行时检查通过。
-- 本地测试目录 `D:\Wuxianmai\RemoteMicRC003-0.1.0-localtest-20260829-sogou-admin1`
+- 本地测试目录 `RemoteMicRC003-0.1.0-localtest-20260829-sogou-admin1`
   共 2083 个文件、363377035 字节；包内 EXE SHA-256 为
   `009D07989622222D40179A5565B560E388849513DAB8CD8795228548C2E6A5F6`。便携 ZIP 为
-  `D:\Wuxianmai\RemoteMicRC003-0.1.0-localtest-20260829-sogou-admin1-portable.zip`，
+  `RemoteMicRC003-0.1.0-localtest-20260829-sogou-admin1-portable.zip`，
   143814968 字节，SHA-256 为
   `C9998246183F311F244D09D7ACDE3AA1A195D498787277B53BB22F69CAF0940E`；可正常打开，
   只有一个预期顶层目录，文件数与复制目录一致。本包未签名，不是候选或发布包；真实

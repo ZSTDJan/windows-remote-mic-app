@@ -85,6 +85,19 @@ $macAddressPlaceholder = "AA:BB:CC:DD:EE:FF"
 $personalPathPattern = "[A-Za-z]:\\Users\\[^\\""'\s]+"
 $credentialPattern = "(api[_-]?key|client[_-]?secret|password)\s*[:=]\s*[""'][^""']{8,}[""']"
 $forbiddenBrandingPatterns = @("2655\s*AI", "2655ai\.com", "T1RemoteBridge", "V60PenBridge", "PV60", "汉王")
+$privateWorkspaceMarkers = @(
+    ("D:" + "\Wuxianmai"),
+    ("D:" + "\Clear")
+)
+$nonAttributionReferenceMarkers = @(
+    (([string][char]0x8A00) + ([string][char]0x7075)),
+    ("vibe" + "-flow"),
+    ("Vibe " + "Flow"),
+    ("richlearntodo" + "-debug"),
+    ("Vibe" + "Pad"),
+    ("Key" + "Hop"),
+    ("Say" + "All")
+)
 $elevationMarkers = @("runas", "ShellExecute", "IsUserAnAdmin", "RequireAdministrator", "PrivilegesRequired=admin")
 $autostartMarkers = @("CurrentVersion\Run", "userstartup")
 
@@ -246,6 +259,22 @@ try {
         }
         if ($text -match $credentialPattern) {
             $violations.Add("credential-shaped literal in: $($file.FullName)")
+        }
+
+        foreach ($marker in $privateWorkspaceMarkers) {
+            if ($text.IndexOf($marker, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
+                $violations.Add("private workspace path in: $($file.FullName)")
+                break
+            }
+        }
+        foreach ($marker in $nonAttributionReferenceMarkers) {
+            if (
+                ($text.IndexOf($marker, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) -or
+                ($relativePath.IndexOf($marker, [System.StringComparison]::OrdinalIgnoreCase) -ge 0)
+            ) {
+                $violations.Add("non-attribution reference in: $($file.FullName)")
+                break
+            }
         }
 
         $effectiveText = Remove-CommentLines -Text $text -Extension $ext

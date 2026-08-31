@@ -554,12 +554,12 @@ HID 注入权限顺序与稳定失败提交：
 - 结果：四组定向测试 303 项通过、1 项跳过；完整 unittest 1152 项通过、
   7 项跳过，退出码 0。
 - 本机候选：从源码提交 `90b552e` 构建并复制到
-  `D:\Wuxianmai\RemoteMicRC003-0.1.0-candidate-20260823-hold2`。共 2062 个文件，
+  `RemoteMicRC003-0.1.0-candidate-20260823-hold2`。共 2062 个文件，
   复制前后逐文件 SHA-256 一致；`--help=0`、`--dry-run=0`。EXE SHA-256 为
   `AE072B578FFA112F301201D8452C8A8959C656D75977BF00620A5E066819C5FF`。
 - 六个产品 QML 与源码逐文件一致，旧松手补发控件文字为零。
 - 便携 ZIP：
-  `D:\Wuxianmai\RemoteMicRC003-0.1.0-candidate-20260823-hold2-portable.zip`，大小
+  `RemoteMicRC003-0.1.0-candidate-20260823-hold2-portable.zip`，大小
   127,255,338 字节，SHA-256 为
   `3D9E900195FE99D193D4C324D09D993B1F94146C4821456B62F1EF05527D44FB`。完整解压
   后只有一个版本顶层目录，2062 个文件与本机候选逐文件 SHA-256 一致。
@@ -585,14 +585,14 @@ HID 注入权限顺序与稳定失败提交：
 - 自动结果：桥接状态、60 秒等待、连接中/就绪文字和真实离屏 QML 相关定向测试
   172 项通过；完整 unittest 1157 项通过、7 项跳过，公开边界扫描 290 个文件。
 - 本机候选：从源码提交 `83adfba` 构建并复制到
-  `D:\Wuxianmai\RemoteMicRC003-0.1.0-candidate-20260823-hold3`。共 2062 个文件、
+  `RemoteMicRC003-0.1.0-candidate-20260823-hold3`。共 2062 个文件、
   320,901,336 字节，与构建目录逐文件 SHA-256 一致；`--help=0`、`--dry-run=0`、
   无效 HID 注入 PID `=4`。EXE SHA-256 为
   `8FF6A4840653035AA001746E0957159C33297BBBEA233AD9F6ED043112B38B0E`。
 - 资源结果：6 个 QML 与源码一致，新桥接警告已进入冻结资源；Frida Gadget、
   VB-CABLE 固定哈希通过，旧松手补发文字和 On-request 专项文件均为零。
 - 便携 ZIP：
-  `D:\Wuxianmai\RemoteMicRC003-0.1.0-candidate-20260823-hold3-portable.zip`，大小
+  `RemoteMicRC003-0.1.0-candidate-20260823-hold3-portable.zip`，大小
   127,256,558 字节，SHA-256 为
   `33C53BB6AC59AFE8EC661D051AE60EA16290F882971E49F3D46BE6BAB697B1B2`。完整解压
   后只有一个版本顶层目录，2062 个文件与本机候选逐文件 SHA-256 一致。
@@ -612,7 +612,7 @@ HID 注入权限顺序与稳定失败提交：
   unittest 1165 项通过、7 项跳过；`compileall`、`pip check`、公开边界扫描
   245 个文件和 `git diff --check` 通过。真机见 `TEST-STARTUP-002`。
 - 本机候选：从修复提交 `0b6d5aaa4d85fbab0add1252034cf0f3fd2967f0` 构建并
-  复制到 `D:\Wuxianmai\RemoteMicRC003-0.1.0-candidate-20260823-hold4`。正式构建
+  复制到 `RemoteMicRC003-0.1.0-candidate-20260823-hold4`。正式构建
   脚本内公开边界扫描 278 个文件，完整 unittest 1165 项通过、7 项跳过；候选共
   2062 个文件、320,902,537 字节，与构建目录零差异。EXE SHA-256 为
   `64A329A51BE6C181FF4928463CD9DC6078A8B6C8B6A853EFD0379E75226CFCC4`。
@@ -928,8 +928,8 @@ HID 注入权限顺序与稳定失败提交：
   切换到搜狗后仍保持快捷键按下、抬起，不受微信协议影响。
 - 实际：2026-08-28 用户真机确认微信与搜狗可以分别测试，搜狗正常；微信能够完成
   语音识别，标准可编辑输入框可直接上屏，远程窗口由微信提示结果已复制、需要粘贴。
-  日志确认微信主要走状态栏按钮，提示粘贴并非只在快捷键兜底时出现。当前源码另按
-  言灵路径补充提交后最多 5 秒异步等待，超时仅关闭残留面板；不读取剪贴板、不自动
+  日志确认微信主要走状态栏按钮，提示粘贴并非只在快捷键兜底时出现。当前源码另在
+  提交后最多异步等待 5 秒，超时仅关闭残留面板；不读取剪贴板、不自动
   粘贴、不改变搜狗协议。
 - 状态：微信与搜狗分流及主语音链已通过；微信残留面板收尾检查点待实测。
 
@@ -1139,7 +1139,7 @@ HID 注入权限顺序与稳定失败提交：
   平台或安全条件跳过；VB-CABLE 与 Frida Gadget 固定资源、PyInstaller、冻结
   `--dry-run` 和 Qt 运行时检查全部通过。
 - 本机测试目录为
-  `D:\Wuxianmai\RemoteMicRC003-0.1.0-localtest-20260827-ui-fix2`，共 2086 个文件、
+  `RemoteMicRC003-0.1.0-localtest-20260827-ui-fix2`，共 2086 个文件、
   394,586,719 字节；复制前后逐文件 SHA-256 一致。主 EXE 为 5,116,691 字节，
   SHA-256 为 `A203B14534F8F2140706D18FA6AD788B46FBD4DB6CC54F08F7C200FD2A84E430`。
 - 冻结内容包含当前三页和统一弹窗关闭按钮，不包含已删除的旧连接、权限和诊断页。
@@ -1181,7 +1181,7 @@ HID 注入权限顺序与稳定失败提交：
   扫描 338 个文件通过；1406 项 unittest 中 1399 项通过、7 项按平台或安全条件跳过；
   两项固定第三方资源、PyInstaller、冻结 `--dry-run` 和 Qt 运行时检查全部通过。
 - 本机测试目录：
-  `D:\Wuxianmai\RemoteMicRC003-0.1.0-localtest-20260827-quicker-combo-nav1`，共
+  `RemoteMicRC003-0.1.0-localtest-20260827-quicker-combo-nav1`，共
   2086 个文件、394,608,856 字节。主 EXE 为 5,127,586 字节，SHA-256：
   `841741F70BC413EE46178ADE4356A1FCC45376EB3249ABCE485D107F897A2E8C`。复制后的
   EXE 再次通过 `--dry-run` 和 Qt 运行时检查。

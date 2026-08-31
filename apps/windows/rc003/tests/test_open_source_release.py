@@ -69,6 +69,16 @@ class ThirdPartyReleaseGateTests(unittest.TestCase):
             or "check-release-readiness: passed" in result.stdout
         )
 
+    def test_formal_release_gate_checks_complete_git_history(self):
+        source = (BUILD_ROOT / "check-release-readiness.py").read_text(
+            encoding="utf-8"
+        )
+        workflow = (REPO_ROOT / ".github/workflows/windows-rc003-ci.yml").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("_git_history_blockers", source)
+        self.assertIn("fetch-depth: 0", workflow)
+
     def test_license_bundle_contains_every_file_enforced_by_the_release_gate(self):
         source = (BUILD_ROOT / "check-release-readiness.py").read_text(
             encoding="utf-8"

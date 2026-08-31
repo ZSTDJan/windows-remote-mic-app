@@ -54,10 +54,10 @@
   跳过。`compileall`、`pip check`、PowerShell parser、公开边界扫描 290 个文件
   和 `git diff --check` 通过。
 - 从源码提交 `83adfba` 构建本机候选
-  `D:\Wuxianmai\RemoteMicRC003-0.1.0-candidate-20260823-hold3`。共 2062 个文件，
+  `RemoteMicRC003-0.1.0-candidate-20260823-hold3`。共 2062 个文件，
   与构建目录逐文件 SHA-256 一致；冻结入口、6 个 QML 和固定资源检查通过。
 - 便携 ZIP 为
-  `D:\Wuxianmai\RemoteMicRC003-0.1.0-candidate-20260823-hold3-portable.zip`，大小
+  `RemoteMicRC003-0.1.0-candidate-20260823-hold3-portable.zip`，大小
   127,256,558 字节，SHA-256 为
   `33C53BB6AC59AFE8EC661D051AE60EA16290F882971E49F3D46BE6BAB697B1B2`。完整解压后
   只有一个版本顶层目录，2062 个文件与候选逐文件一致。

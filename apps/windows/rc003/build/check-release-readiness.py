@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import subprocess
 from pathlib import Path
 
 
@@ -30,6 +31,97 @@ _REQUIRED_LICENSE_FILES = (
     "OpenSSL-3/LICENSE.txt",
 )
 
+_RELEASE_HISTORY_BASE = "271ed7947eec19c4c691ed3ba97f338461be8051"
+_PRIVATE_HISTORY_MARKERS = (
+    chr(0x8A00) + chr(0x7075),
+    "vibe" + "-flow",
+    "Vibe " + "Flow",
+    "richlearntodo" + "-debug",
+    "Vibe" + "Pad",
+    "Key" + "Hop",
+    "Say" + "All",
+    "D:" + "\\Wuxianmai",
+    "D:" + "\\Clear",
+    "C:" + "\\Users\\" + "DELL",
+)
+
+
+def _run_git(*args: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["git", *args],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+    )
+
+
+def _is_public_git_email(value: str) -> bool:
+    email = value.strip().casefold()
+    return email == "noreply@github.com" or email.endswith("@users.noreply.github.com")
+
+
+def _git_history_blockers() -> list[str]:
+    blockers: list[str] = []
+    repository = _run_git("rev-parse", "--show-toplevel")
+    if repository.returncode != 0:
+        return ["Git history is unavailable for the formal release privacy check"]
+
+    baseline = _run_git("cat-file", "-e", f"{_RELEASE_HISTORY_BASE}^{{commit}}")
+    if baseline.returncode != 0:
+        return ["complete post-baseline Git history is unavailable"]
+
+    revision_range = f"{_RELEASE_HISTORY_BASE}..HEAD"
+    metadata = _run_git(
+        "log",
+        "--format=%H%x00%ae%x00%ce%x00%s",
+        revision_range,
+    )
+    if metadata.returncode != 0:
+        return ["Git history metadata could not be checked"]
+
+    private_email_commits: set[str] = set()
+    private_subject_commits: set[str] = set()
+    folded_markers = tuple(marker.casefold() for marker in _PRIVATE_HISTORY_MARKERS)
+    for line in metadata.stdout.splitlines():
+        fields = line.split("\x00", 3)
+        if len(fields) != 4:
+            blockers.append("Git history metadata contains an unreadable commit record")
+            break
+        commit, author_email, committer_email, subject = fields
+        if not _is_public_git_email(author_email) or not _is_public_git_email(
+            committer_email
+        ):
+            private_email_commits.add(commit)
+        folded_subject = subject.casefold()
+        if any(marker in folded_subject for marker in folded_markers):
+            private_subject_commits.add(commit)
+
+    if private_email_commits:
+        blockers.append(
+            f"{len(private_email_commits)} post-baseline commits expose a non-noreply email"
+        )
+    if private_subject_commits:
+        blockers.append(
+            f"{len(private_subject_commits)} post-baseline commit subjects expose internal references"
+        )
+
+    private_content_markers = 0
+    for marker in _PRIVATE_HISTORY_MARKERS:
+        matches = _run_git("log", "--format=%H", "-S", marker, revision_range, "--", ".")
+        if matches.returncode != 0:
+            blockers.append("Git history content could not be checked")
+            break
+        if matches.stdout.strip():
+            private_content_markers += 1
+    if private_content_markers:
+        blockers.append(
+            f"Git history contains {private_content_markers} private-path or internal-reference markers"
+        )
+    return blockers
+
 
 def release_blockers() -> list[str]:
     blockers: list[str] = []
@@ -45,6 +137,7 @@ def release_blockers() -> list[str]:
     for relative_path in _REQUIRED_LICENSE_FILES:
         if not (license_root / relative_path).is_file():
             blockers.append(f"missing third-party license: {relative_path}")
+    blockers.extend(_git_history_blockers())
     return blockers
 
 

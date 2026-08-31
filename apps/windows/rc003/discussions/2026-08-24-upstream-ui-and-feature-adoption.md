@@ -8,7 +8,7 @@
 
 ## 1. 文档目的
 
-本文记录原作者 SayAll macOS 客户端中可供 Windows RC003 参考的界面源码、
+本文记录既有 macOS 客户端中可供 Windows RC003 评估的界面源码、
 现有功能差异，以及哪些能力适合引入 Windows、哪些需要分阶段验证、哪些暂时
 不应进入当前产品范围。
 
@@ -28,10 +28,10 @@
 
 - 原作者公开仓库：`HD838A/remote-mic-app`；远端 `main` 为
   `f3e0f26c5c6c406be7f0e989c816390ee7cc0b9e`；
-- 本地 `D:\Wuxianmai\remote-mic-app` 位于
+- 本地 `remote-mic-app` 位于
   `4d526175817ad2c4c5fbe1650d528c946a3cdbf3`，落后远端 `main` 51 个提交，
   因此本地文件便于查看结构，但当前事实以远端 `main` 为准；
-- 官网 `https://sayall.app/#how-it-works` 的“真实产品界面”展示连接与语音、
+- 既有产品截图展示连接与语音、
   按键映射、统计、权限与隐私等页面；
 - App 源码按 GPL-3.0-only 发布，但 Logo、App Icon、官网设计、文案和截图不因
   源码开源而自动获得复用授权。本项目只参考信息架构、交互方法和开源代码，

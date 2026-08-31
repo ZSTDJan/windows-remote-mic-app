@@ -1,8 +1,8 @@
 """Windows control path for WeType voice input.
 
-This mirrors Vibe Flow's proven WeType strategy: click the WeType status-bar
-microphone first, fall back to an 80 ms global-shortcut tap, and close the
-session through the same path that opened it.
+The controller clicks the WeType status-bar microphone first, falls back to
+an 80 ms global-shortcut tap, and closes the session through the same path
+that opened it.
 """
 
 from __future__ import annotations
@@ -142,7 +142,7 @@ def _start_daemon(callback: Callable[[], None]) -> None:
 
 
 class WeTypeVoiceControl:
-    """Open and submit one WeType session using Vibe Flow's path order."""
+    """Open and submit one WeType session using the configured path order."""
 
     def __init__(
         self,

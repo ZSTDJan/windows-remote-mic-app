@@ -185,11 +185,11 @@
   构建门禁 1523 项通过、7 项按平台条件跳过，公开边界、PyInstaller 与冻结 Qt 自检
   通过。真实 RC003、微信输入法唤起、声音接收和文字上屏仍为检查点待实测。
 
-### 2026-08-28 微信输入法控制对齐言灵
+### 2026-08-28 微信输入法控制时序修正
 
 - 上一测试包把微信快捷键的按下和抬起放在同一次零间隔 `SendInput` 中，真机反馈
-  仍无法唤起微信。当前实现不再自定义这条时序，直接对齐言灵提交
-  `047f9d3ead54bf30de9b884adf8f7b5adefe9993` 的已验证顺序。
+  仍无法唤起微信。当前实现改为先尝试状态栏按钮，再使用分开的快捷键按下和抬起
+  批次作为兜底。
 - 微信现在先点击 `wetype.statusbar.window` 状态栏语音按钮并确认“语音输入”面板；
   失败时才用分开的虚拟键 `SendInput` 按下/抬起批次，保持 80 ms，并在音频停止后
   按本轮实际成功的状态栏或快捷键路径结束。搜狗等程序继续使用原按下/抬起协议。
@@ -365,23 +365,23 @@
   扫描 302 个文件、完整 unittest 1205 项通过和 7 项跳过，PyInstaller 与冻结
   `--dry-run` 通过。另行复核 `--help=0`，11 个源码/冻结 QML 零差异。
 - 本机目录为
-  `D:\Wuxianmai\RemoteMicRC003-0.1.0-candidate-20260824-selfcheck1`，2072 个文件、
+  `RemoteMicRC003-0.1.0-candidate-20260824-selfcheck1`，2072 个文件、
   320,960,337 字节；其中 2067 个运行文件与 `dist\RemoteMicRC003` 逐文件一致，
   另有 5 个便携版许可与说明文件。EXE 大小 5,053,936 字节，SHA-256 为
   `5AA9894E20FA05183BC2E5CEDDD342B148F36867262D899A9DD90CEEBCD174BF`。
 - 便携 ZIP 为
-  `D:\Wuxianmai\RemoteMicRC003-0.1.0-candidate-20260824-selfcheck1-portable.zip`，
+  `RemoteMicRC003-0.1.0-candidate-20260824-selfcheck1-portable.zip`，
   大小 127,308,081 字节，SHA-256 为
   `B110C4D44AAD62060B597AF02D875D5D06576EA039F4187895AF4B2BC7AE94C4`。完整解压
   后只有一个版本顶层目录，2072 个文件与本机目录逐文件 SHA-256 一致。
 - 哈希清单为
-  `D:\Wuxianmai\RemoteMicRC003-0.1.0-candidate-20260824-selfcheck1-SHA256SUMS.txt`。
+  `RemoteMicRC003-0.1.0-candidate-20260824-selfcheck1-SHA256SUMS.txt`。
   本包的真实 RC003、UU、搜狗文字上屏和普通权限 Codex 仍是检查点待实测。
 - 从修复提交 `0b6d5aaa4d85fbab0add1252034cf0f3fd2967f0` 的干净源码运行正式
   构建门禁，公开边界扫描 278 个文件、完整 unittest 1165 项通过和 7 项跳过，
   PyInstaller 与冻结 `--dry-run` 通过。
 - 当前本机候选目录为
-  `D:\Wuxianmai\RemoteMicRC003-0.1.0-candidate-20260823-hold4`，共 2062 个文件、
+  `RemoteMicRC003-0.1.0-candidate-20260823-hold4`，共 2062 个文件、
   320,902,537 字节；与 `dist\RemoteMicRC003` 零缺失、零新增、零内容差异。
   EXE SHA-256 为
   `64A329A51BE6C181FF4928463CD9DC6078A8B6C8B6A853EFD0379E75226CFCC4`。
@@ -396,13 +396,13 @@
   290 个文件、完整 unittest 1157 项通过和 7 项跳过，PyInstaller 与冻结自检
   通过。
 - 此前本机候选目录为
-  `D:\Wuxianmai\RemoteMicRC003-0.1.0-candidate-20260823-hold3`，共 2062 个文件、
+  `RemoteMicRC003-0.1.0-candidate-20260823-hold3`，共 2062 个文件、
   320,901,336 字节；与 `dist\RemoteMicRC003` 逐文件 SHA-256 一致。EXE SHA-256
   为 `8FF6A4840653035AA001746E0957159C33297BBBEA233AD9F6ED043112B38B0E`。
 - `--help=0`、`--dry-run=0`、无效 HID 注入 PID `=4`；6 个 QML 与源码一致，
   新桥接警告已进入冻结资源，旧松手补发文字和 On-request 专项文件均为零。
 - 便携 ZIP 为
-  `D:\Wuxianmai\RemoteMicRC003-0.1.0-candidate-20260823-hold3-portable.zip`，大小
+  `RemoteMicRC003-0.1.0-candidate-20260823-hold3-portable.zip`，大小
   127,256,558 字节，SHA-256 为
   `33C53BB6AC59AFE8EC661D051AE60EA16290F882971E49F3D46BE6BAB697B1B2`。完整解压
   后只有一个 `hold3` 顶层目录，2062 个文件与本机候选逐文件一致。
@@ -618,7 +618,7 @@
 - `compileall`、`pip check`、PowerShell parser、`git diff --check` 通过；公开
   边界扫描 289 个文件通过。
 - 从源码提交 `90b552e` 构建本机候选
-  `D:\Wuxianmai\RemoteMicRC003-0.1.0-candidate-20260823-hold2`。目录含 2062 个
+  `RemoteMicRC003-0.1.0-candidate-20260823-hold2`。目录含 2062 个
   文件、320,898,562 字节，与构建输出逐文件 SHA-256 一致；`--help=0`、
   `--dry-run=0`，六个产品 QML 与源码一致且不含已撤下控件。EXE SHA-256 为
   `AE072B578FFA112F301201D8452C8A8959C656D75977BF00620A5E066819C5FF`。
@@ -633,7 +633,7 @@
 - `compileall`、`pip check`、PowerShell parser、`git diff --check` 通过；公开
   边界扫描 278 个文件通过。QML 离屏加载和矩阵布局检查包含在完整测试中。
 - 从源码提交 `b74288c` 构建本机候选
-  `D:\Wuxianmai\RemoteMicRC003-0.1.0-candidate-20260822-hold1`。目录含 2062 个
+  `RemoteMicRC003-0.1.0-candidate-20260822-hold1`。目录含 2062 个
   文件，复制后逐文件 SHA-256 一致；EXE SHA-256 为
   `752AB73FD3A6BF841682C2D41ADDACDE9520F22CBAC438AB19A8EFA8612970C8`。
   冻结入口 `--help=0`、`--dry-run=0`，六个 QML 文件与源码一致，Frida Gadget

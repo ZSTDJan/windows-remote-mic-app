@@ -54,6 +54,19 @@ _PERSONAL_PATH_RE = re.compile(r"[A-Za-z]:\\Users\\[^\\\"'\s]+")
 _CREDENTIAL_RE = re.compile(
     r"(api[_-]?key|client[_-]?secret|password)\s*[:=]\s*[\"'][^\"']{8,}[\"']"
 )
+_PRIVATE_WORKSPACE_MARKERS = (
+    "D:" + "\\Wuxianmai",
+    "D:" + "\\Clear",
+)
+_NON_ATTRIBUTION_REFERENCE_MARKERS = (
+    chr(0x8A00) + chr(0x7075),
+    "vibe" + "-flow",
+    "Vibe " + "Flow",
+    "richlearntodo" + "-debug",
+    "Vibe" + "Pad",
+    "Key" + "Hop",
+    "Say" + "All",
+)
 _FORBIDDEN_BRANDING_PATTERNS = [
     re.compile(pattern)
     for pattern in (r"2655\s*AI", r"2655ai\.com", "T1RemoteBridge", "V60PenBridge", "PV60", "汉王")
@@ -164,6 +177,16 @@ def _scan(root: Path):
             violations.append(f"personal absolute path in: {path}")
         if _CREDENTIAL_RE.search(text):
             violations.append(f"credential-shaped literal in: {path}")
+        folded_text = text.casefold()
+        folded_relative_path = relative_path.as_posix().casefold()
+        if any(marker.casefold() in folded_text for marker in _PRIVATE_WORKSPACE_MARKERS):
+            violations.append(f"private workspace path in: {path}")
+        if any(
+            marker.casefold() in folded_text
+            or marker.casefold() in folded_relative_path
+            for marker in _NON_ATTRIBUTION_REFERENCE_MARKERS
+        ):
+            violations.append(f"non-attribution reference in: {path}")
 
         effective_text = _remove_comment_lines(text, ext)
         if not is_branding_exempt:
@@ -312,6 +335,21 @@ class BoundaryScanReplayTests(unittest.TestCase):
             # scanned - they were never inspected at all, not merely
             # exempted from one category of check.
             self.assertEqual(scanned_count, 1)
+
+    def test_non_attribution_references_are_rejected_in_text_and_filenames(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            text_marker = _NON_ATTRIBUTION_REFERENCE_MARKERS[0]
+            path_marker = _NON_ATTRIBUTION_REFERENCE_MARKERS[4]
+            (root / "notes.md").write_text(text_marker, encoding="utf-8")
+            (root / f"{path_marker}-notes.md").write_text("internal notes", encoding="utf-8")
+
+            violations, _ = _scan(root)
+
+            self.assertEqual(
+                sum("non-attribution reference" in violation for violation in violations),
+                2,
+            )
 
 
 if __name__ == "__main__":

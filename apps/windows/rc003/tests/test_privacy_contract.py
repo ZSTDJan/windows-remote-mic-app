@@ -33,6 +33,16 @@ _FORBIDDEN_BRANDING_TERMS = (
     "汉王", "customer_license", "customer_entry",
 )
 
+_NON_ATTRIBUTION_REFERENCE_TERMS = (
+    chr(0x8A00) + chr(0x7075),
+    "vibe" + "-flow",
+    "Vibe " + "Flow",
+    "richlearntodo" + "-debug",
+    "Vibe" + "Pad",
+    "Key" + "Hop",
+    "Say" + "All",
+)
+
 # Matched separately (case-insensitive, word-boundary-ish) so it doesn't
 # false-positive on the unrelated upstream GitHub org name
 # "xxb26553663-star", which legitimately appears in provenance citations.
@@ -94,6 +104,9 @@ class NoForbiddenBrandingTests(unittest.TestCase):
             for term in _FORBIDDEN_BRANDING_TERMS:
                 if term in text:
                     offenders.append((str(path), term))
+            for term in _NON_ATTRIBUTION_REFERENCE_TERMS:
+                if term.casefold() in text.casefold():
+                    offenders.append((str(path), "non-attribution reference"))
             for pattern in _FORBIDDEN_BRANDING_PATTERNS:
                 if pattern.search(text):
                     offenders.append((str(path), pattern.pattern))

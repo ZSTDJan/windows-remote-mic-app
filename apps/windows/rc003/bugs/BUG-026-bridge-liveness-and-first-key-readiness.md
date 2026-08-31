@@ -68,7 +68,7 @@
   正式构建，构建脚本内公开边界扫描 278 个文件，完整 unittest 1165 项通过、
   7 项跳过，PyInstaller 和冻结 `--dry-run` 通过。
 - 本机候选为
-  `D:\Wuxianmai\RemoteMicRC003-0.1.0-candidate-20260823-hold4`，共 2062 个文件、
+  `RemoteMicRC003-0.1.0-candidate-20260823-hold4`，共 2062 个文件、
   320,902,537 字节；与 `dist\RemoteMicRC003` 零缺失、零新增、零内容差异。
   EXE SHA-256 为
   `64A329A51BE6C181FF4928463CD9DC6078A8B6C8B6A853EFD0379E75226CFCC4`。
