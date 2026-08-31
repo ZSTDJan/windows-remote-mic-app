@@ -21,6 +21,9 @@ ApplicationWindow {
         fontFamily: window.preferredWindowsUiFontAvailable
             ? window.preferredWindowsUiFont : Qt.application.font.family
     }
+    readonly property color nativeCaptionColor: tokens.windowFrame
+    readonly property color nativeCaptionTextColor: tokens.textPrimary
+    readonly property color nativeBorderColor: tokens.windowFrameBorder
 
     component ClientShellCorner: Item {
         property bool rightSide: false

@@ -130,6 +130,7 @@ from . import (
     voice_hotkey_sync_windows,
     voice_program_manager,
     win32_keys,
+    window_chrome_windows,
     windows_diagnostics,
 )
 
@@ -6041,6 +6042,7 @@ def run_settings_window(*, start_hidden: bool = False) -> int:
             raise QtUnavailableError(f"无法加载 QML 设置界面：{main_qml} 未能成功加载。")
         root_window = root_objects[0]
         update_application_icon()
+        window_chrome_windows.apply_settings_window_chrome(root_window)
         _mark_settings_window_for_activation(root_window)
 
         return app.exec()
