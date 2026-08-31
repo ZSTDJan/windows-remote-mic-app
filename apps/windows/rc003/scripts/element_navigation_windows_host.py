@@ -2996,6 +2996,7 @@ def _run_windows(args: argparse.Namespace) -> int:
         WM_SYSKEYDOWN = 0x0104
         WM_SYSKEYUP = 0x0105
         WM_QUIT = 0x0012
+        LLKHF_INJECTED = 0x10
         VK_CONTROL = 0x11
         VK_MENU = 0x12
 
@@ -3049,6 +3050,7 @@ def _run_windows(args: argparse.Namespace) -> int:
             self._down: set[int] = set()
             self._swallowed: set[int] = set()
             self._passthrough: set[int] = set()
+            self._direction_repeat_gate = DirectionRepeatGate()
             self._thread = threading.Thread(
                 target=self._run,
                 name="element-navigation-keyboard-hook",
@@ -3102,6 +3104,7 @@ def _run_windows(args: argparse.Namespace) -> int:
                 include_developer_actions=self._include_developer_hotkeys,
             )
             if is_down and ctrl_alt and hotkey_action is not None:
+                self._direction_repeat_gate.reset()
                 self._swallowed.add(vk)
                 if not was_down:
                     self._on_action(hotkey_action)
@@ -3112,6 +3115,7 @@ def _run_windows(args: argparse.Namespace) -> int:
                 if self._active.is_set() and should_pass_through_native_menu(
                     vk, native_menu_mode_active()
                 ):
+                    self._direction_repeat_gate.reset()
                     if is_down:
                         self._passthrough.add(vk)
                     return user32.CallNextHookEx(
@@ -3121,10 +3125,20 @@ def _run_windows(args: argparse.Namespace) -> int:
                 if is_down and (vk in self._down):
                     if vk in (VK_RETURN, VK_APPS, VK_ESCAPE) and was_down:
                         return 1
+                    if vk in DIRECTION_NAVIGATION_KEYS:
+                        if not self._direction_repeat_gate.allow(
+                            vk,
+                            time.perf_counter(),
+                            injected=bool(data.flags & self.LLKHF_INJECTED),
+                        ):
+                            return 1
+                    else:
+                        self._direction_repeat_gate.reset()
                     self._on_action(action)
                 return 1
 
             if is_down and action is not None:
+                self._direction_repeat_gate.reset()
                 self._passthrough.add(vk)
             return user32.CallNextHookEx(self._hook, code, wparam, lparam)
 

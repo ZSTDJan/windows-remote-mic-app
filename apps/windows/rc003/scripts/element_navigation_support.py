@@ -74,6 +74,92 @@ NATIVE_MENU_NAVIGATION_KEYS = frozenset(
     {VK_UP, VK_DOWN, VK_LEFT, VK_RIGHT, VK_RETURN, VK_ESCAPE}
 )
 
+DIRECTION_NAVIGATION_KEYS = frozenset({VK_UP, VK_DOWN, VK_LEFT, VK_RIGHT})
+
+
+class DirectionRepeatGate:
+    """Separate deliberate taps from synthetic remote hold repeats."""
+
+    def __init__(
+        self,
+        *,
+        repeat_suspect_after: float = 0.300,
+        repeat_suspect_until: float = 0.600,
+        repeat_confirm_min_gap: float = 0.070,
+        repeat_confirm_max_gap: float = 0.240,
+        repeat_output_min_gap: float = 0.080,
+    ) -> None:
+        self.repeat_suspect_after = repeat_suspect_after
+        self.repeat_suspect_until = repeat_suspect_until
+        self.repeat_confirm_min_gap = repeat_confirm_min_gap
+        self.repeat_confirm_max_gap = repeat_confirm_max_gap
+        self.repeat_output_min_gap = repeat_output_min_gap
+        self.reset()
+
+    def reset(self) -> None:
+        self._vk: Optional[int] = None
+        self._sequence_started_at = 0.0
+        self._last_seen_at = 0.0
+        self._last_allowed_at = 0.0
+        self._pending_repeat_at: Optional[float] = None
+        self._repeating = False
+
+    def allow(self, vk: int, now: float, *, injected: bool) -> bool:
+        if not injected or vk not in DIRECTION_NAVIGATION_KEYS:
+            self.reset()
+            return True
+
+        idle_reset = self.repeat_suspect_until
+        if (
+            self._vk != vk
+            or self._last_seen_at <= 0.0
+            or now < self._last_seen_at
+            or now - self._last_seen_at > idle_reset
+        ):
+            self._start(vk, now)
+            return True
+
+        elapsed = now - self._sequence_started_at
+        self._last_seen_at = now
+
+        if self._repeating:
+            if now - self._last_allowed_at < self.repeat_output_min_gap:
+                return False
+            self._last_allowed_at = now
+            return True
+
+        if elapsed < self.repeat_suspect_after:
+            # A second completed tap before Windows' normal double-click
+            # window is much more likely deliberate than a hold repeat.
+            self._start(vk, now)
+            return True
+
+        if elapsed > self.repeat_suspect_until:
+            self._start(vk, now)
+            return True
+
+        if self._pending_repeat_at is None:
+            self._pending_repeat_at = now
+            return False
+
+        confirmation_gap = now - self._pending_repeat_at
+        if self.repeat_confirm_min_gap <= confirmation_gap <= self.repeat_confirm_max_gap:
+            self._repeating = True
+            self._pending_repeat_at = None
+            self._last_allowed_at = now
+            return True
+        if confirmation_gap > self.repeat_confirm_max_gap:
+            self._pending_repeat_at = now
+        return False
+
+    def _start(self, vk: int, now: float) -> None:
+        self._vk = vk
+        self._sequence_started_at = now
+        self._last_seen_at = now
+        self._last_allowed_at = now
+        self._pending_repeat_at = None
+        self._repeating = False
+
 GLOBAL_HOTKEY_ACTIONS = {
     VK_D: "toggle_diagnostics",
     VK_N: "toggle",
@@ -723,6 +809,8 @@ __all__ = (
     'VK_VOLUME_UP',
     'NAVIGATION_KEY_ACTIONS',
     'NATIVE_MENU_NAVIGATION_KEYS',
+    'DIRECTION_NAVIGATION_KEYS',
+    'DirectionRepeatGate',
     'GLOBAL_HOTKEY_ACTIONS',
     'OVERLAY_MAX_ROOT_AREA_RATIO',
     'OVERLAY_MIN_INTERSECTION_RATIO',

@@ -3731,6 +3731,54 @@ assert not any(name == "PySide6" or name.startswith("PySide6.") for name in sys.
         )
         self.assertIsNone(prototype.keyboard_navigation_action(0x70))
 
+    def test_injected_direction_repeat_waits_for_hold_confirmation(self):
+        for vk in (
+            prototype.VK_UP,
+            prototype.VK_DOWN,
+            prototype.VK_LEFT,
+            prototype.VK_RIGHT,
+        ):
+            with self.subTest(vk=vk):
+                gate = prototype.DirectionRepeatGate()
+                self.assertTrue(gate.allow(vk, 10.000, injected=True))
+                self.assertFalse(gate.allow(vk, 10.350, injected=True))
+                self.assertTrue(gate.allow(vk, 10.450, injected=True))
+                self.assertTrue(gate.allow(vk, 10.550, injected=True))
+
+    def test_real_remote_repeat_cadence_is_confirmed_without_double_step(self):
+        gate = prototype.DirectionRepeatGate()
+
+        self.assertTrue(gate.allow(prototype.VK_UP, 20.000, injected=True))
+        self.assertFalse(gate.allow(prototype.VK_UP, 20.340, injected=True))
+        self.assertFalse(gate.allow(prototype.VK_UP, 20.350, injected=True))
+        self.assertTrue(gate.allow(prototype.VK_UP, 20.530, injected=True))
+        self.assertTrue(gate.allow(prototype.VK_UP, 20.720, injected=True))
+
+    def test_fast_deliberate_injected_taps_remain_independent(self):
+        gate = prototype.DirectionRepeatGate()
+
+        self.assertTrue(gate.allow(prototype.VK_RIGHT, 30.000, injected=True))
+        self.assertTrue(gate.allow(prototype.VK_RIGHT, 30.180, injected=True))
+        self.assertTrue(gate.allow(prototype.VK_RIGHT, 30.360, injected=True))
+
+    def test_direction_repeat_gate_resets_for_new_input(self):
+        gate = prototype.DirectionRepeatGate()
+
+        self.assertTrue(gate.allow(prototype.VK_LEFT, 40.000, injected=True))
+        self.assertFalse(gate.allow(prototype.VK_LEFT, 40.350, injected=True))
+        self.assertTrue(gate.allow(prototype.VK_UP, 40.360, injected=True))
+        self.assertTrue(gate.allow(prototype.VK_UP, 40.370, injected=False))
+        self.assertTrue(gate.allow(prototype.VK_LEFT, 41.000, injected=True))
+
+    def test_confirmed_repeat_coalesces_near_simultaneous_duplicates(self):
+        gate = prototype.DirectionRepeatGate()
+
+        self.assertTrue(gate.allow(prototype.VK_DOWN, 50.000, injected=True))
+        self.assertFalse(gate.allow(prototype.VK_DOWN, 50.350, injected=True))
+        self.assertTrue(gate.allow(prototype.VK_DOWN, 50.450, injected=True))
+        self.assertFalse(gate.allow(prototype.VK_DOWN, 50.490, injected=True))
+        self.assertTrue(gate.allow(prototype.VK_DOWN, 50.550, injected=True))
+
     def test_tracks_only_relevant_structure_changes(self):
         self.assertTrue(prototype.is_navigation_structure_event(0x8000))
         self.assertTrue(prototype.is_navigation_structure_event(0x800A))
