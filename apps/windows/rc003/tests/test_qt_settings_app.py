@@ -6368,7 +6368,7 @@ class SettingsShellSourceContractTests(unittest.TestCase):
         self.assertIn("photoHotspotRepeater.itemAt(i)", self.buttons_qml)
         self.assertNotIn("function targetY(buttonId)", self.buttons_qml)
         self.assertIn("root.selected ? root.tokens.accentSoft", self.mapping_card_qml)
-        self.assertIn("border.width: 0.75", self.mapping_card_qml)
+        self.assertIn("border.width: root.tokens.hairlineWidth", self.mapping_card_qml)
         self.assertIn("root.tokens.cardBorder", self.mapping_card_qml)
         self.assertIn("leftPadding: 4", self.mapping_card_qml)
         self.assertIn("columnSpacing: 0", self.mapping_card_qml)
@@ -6530,6 +6530,18 @@ class ThreePageSettingsSourceContractTests(unittest.TestCase):
         self.mapping_card_qml = (qml_dir / "MappingCard.qml").read_text(
             encoding="utf-8"
         )
+        self.compact_button_qml = (qml_dir / "CompactButton.qml").read_text(
+            encoding="utf-8"
+        )
+        self.compact_text_field_qml = (qml_dir / "CompactTextField.qml").read_text(
+            encoding="utf-8"
+        )
+        self.selection_combo_qml = (qml_dir / "SelectionComboBox.qml").read_text(
+            encoding="utf-8"
+        )
+        self.section_frame_qml = (qml_dir / "SectionFrame.qml").read_text(
+            encoding="utf-8"
+        )
 
     def test_navigation_has_only_device_buttons_and_voice(self):
         for object_name, label in (
@@ -6572,6 +6584,31 @@ class ThreePageSettingsSourceContractTests(unittest.TestCase):
         self.assertIn("anchors.bottomMargin: tokens.windowFrameGap", self.main_qml)
         self.assertIn("radius: tokens.windowClientRadius", self.main_qml)
         self.assertIn("border.color: tokens.windowFrameBorder", self.main_qml)
+        self.assertIn(
+            'property color windowFrame: darkMode ? "#101318" : "#f5f6f8"',
+            self.tokens_qml,
+        )
+        self.assertIn(
+            'property color sidebar: darkMode ? "#1b1e24" : "#f5f6f8"',
+            self.tokens_qml,
+        )
+        self.assertIn("property real hairlineWidth: 1", self.tokens_qml)
+
+    def test_regular_frames_share_one_hairline_width(self):
+        for source in (
+            self.main_qml,
+            self.voice_qml,
+            self.buttons_qml,
+            self.inline_row_qml,
+            self.mapping_card_qml,
+            self.compact_button_qml,
+            self.compact_text_field_qml,
+            self.selection_combo_qml,
+            self.section_frame_qml,
+        ):
+            self.assertIn("hairlineWidth", source)
+            self.assertNotIn("activeFocus ? 2 : 1", source)
+        self.assertNotIn("border.width: 0.75", self.mapping_card_qml)
 
     def test_device_page_contains_device_and_desktop_behavior_rows(self):
         for object_name in (

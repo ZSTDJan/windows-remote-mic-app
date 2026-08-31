@@ -14,7 +14,7 @@ Rectangle {
     radius: tokens.cornerRadiusLarge
     color: fillColor
     border.color: tokens.border
-    border.width: 1
+    border.width: tokens.hairlineWidth
     implicitHeight: sectionContent.implicitHeight + verticalPadding * 2
 
     ColumnLayout {

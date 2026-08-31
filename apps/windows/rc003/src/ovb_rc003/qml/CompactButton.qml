@@ -40,7 +40,7 @@ Button {
                     : root.hovered
                         ? root.tokens.buttonHover
                         : root.tokens.buttonBackground
-        border.width: root.highlighted ? 0 : 1
+        border.width: root.highlighted ? 0 : root.tokens.hairlineWidth
         border.color: root.hovered ? root.tokens.borderStrong : root.tokens.border
         opacity: root.enabled ? 1 : 0.62
     }

@@ -22,7 +22,7 @@ TextField {
     background: Rectangle {
         radius: root.tokens.cornerRadiusControl
         color: root.tokens.fieldBackground
-        border.width: root.activeFocus ? 2 : 1
+        border.width: root.tokens.hairlineWidth
         border.color: root.activeFocus ? root.tokens.accent : root.tokens.border
     }
 }

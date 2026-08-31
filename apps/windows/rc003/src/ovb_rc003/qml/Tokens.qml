@@ -12,11 +12,11 @@ QtObject {
         + palette.window.b * 0.114 < 0.5
 
     property color background: darkMode ? "#171a1f" : "#f5f6f8"
-    property color windowFrame: darkMode ? "#101318" : "#e5e5e5"
+    property color windowFrame: darkMode ? "#101318" : "#f5f6f8"
     property color windowFrameBorder: darkMode ? "#3b414a" : "#d8d8d8"
     property color surface: darkMode ? "#20242b" : "#ffffff"
     property color surfaceMuted: darkMode ? "#282d35" : "#f1f3f5"
-    property color sidebar: darkMode ? "#1b1e24" : "#fafafa"
+    property color sidebar: darkMode ? "#1b1e24" : "#f5f6f8"
     property color textPrimary: darkMode ? "#f3f4f6" : "#17191d"
     property color textSecondary: darkMode ? "#aeb4be" : "#5f6670"
     property color disabledText: darkMode ? "#888f99" : "#858c95"
@@ -53,6 +53,7 @@ QtObject {
     property int cornerRadiusLarge: 8
     property int windowClientRadius: 9
     property int windowFrameGap: 3
+    property real hairlineWidth: 1
     property int spacingTiny: 3
     property int spacingSmall: 6
     property int spacingMedium: 8

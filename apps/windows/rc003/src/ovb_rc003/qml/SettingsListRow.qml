@@ -86,7 +86,7 @@ Rectangle {
         anchors.left: parent.left
         anchors.right: parent.right
         anchors.bottom: parent.bottom
-        height: 1
+        height: root.tokens.hairlineWidth
         color: root.tokens.border
     }
 }

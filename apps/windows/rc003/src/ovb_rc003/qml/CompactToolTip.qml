@@ -46,7 +46,7 @@ ToolTip {
         objectName: root.objectName.length > 0 ? root.objectName + "_background" : ""
         radius: root.tokens.cornerRadiusControl
         color: root.tokens.surface
-        border.width: 1
+        border.width: root.tokens.hairlineWidth
         border.color: root.tokens.borderStrong
     }
 }

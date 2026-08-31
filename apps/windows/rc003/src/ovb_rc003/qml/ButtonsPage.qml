@@ -288,7 +288,7 @@ Item {
         background: Rectangle {
             radius: tokens.cornerRadiusLarge
             color: tokens.surface
-            border.width: 1
+            border.width: tokens.hairlineWidth
             border.color: tokens.borderStrong
         }
 
@@ -399,7 +399,7 @@ Item {
         background: Rectangle {
             radius: tokens.cornerRadiusControl
             color: tokens.fieldBackground
-            border.width: editorCombo.activeFocus ? 2 : 1
+            border.width: tokens.hairlineWidth
             border.color: editorCombo.activeFocus ? tokens.accent : tokens.border
         }
 
@@ -435,7 +435,7 @@ Item {
                     anchors.left: parent.left
                     anchors.right: parent.right
                     anchors.top: parent.top
-                    height: 1
+                    height: tokens.hairlineWidth
                     color: tokens.border
                 }
                 Label {
@@ -501,7 +501,7 @@ Item {
         background: Rectangle {
             radius: tokens.cornerRadiusLarge
             color: tokens.surface
-            border.width: 1
+            border.width: tokens.hairlineWidth
             border.color: tokens.borderStrong
         }
 
@@ -1330,7 +1330,7 @@ Item {
                         radius: tokens.cornerRadiusControl
                         color: tokens.surfaceMuted
                         border.color: tokens.border
-                        border.width: 1
+                        border.width: tokens.hairlineWidth
 
                         RowLayout {
                             anchors.fill: parent
@@ -1382,7 +1382,7 @@ Item {
                                 radius: tokens.cornerRadiusControl
                                 color: index % 2 === 0 ? tokens.surface : tokens.fieldBackground
                                 border.color: tokens.border
-                                border.width: 1
+                                border.width: tokens.hairlineWidth
                                 objectName: "comboMappingRow_" + buttonId
 
                                 RowLayout {

@@ -270,7 +270,7 @@ Item {
         background: Rectangle {
             radius: tokens.cornerRadiusLarge
             color: tokens.surface
-            border.width: 1
+            border.width: tokens.hairlineWidth
             border.color: tokens.borderStrong
         }
 
@@ -334,6 +334,7 @@ Item {
                     placeholderTextColor: tokens.disabledText
                     background: Rectangle {
                         color: tokens.fieldBackground
+                        border.width: tokens.hairlineWidth
                         border.color: speakTestInput.activeFocus
                             ? tokens.accent : tokens.borderStrong
                         radius: tokens.cornerRadiusControl

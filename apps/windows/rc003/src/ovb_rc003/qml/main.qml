@@ -465,7 +465,7 @@ ApplicationWindow {
                 anchors.right: parent.right
                 anchors.top: parent.top
                 anchors.bottom: parent.bottom
-                width: 1
+                width: tokens.hairlineWidth
                 color: tokens.border
             }
 
@@ -591,7 +591,7 @@ ApplicationWindow {
                     anchors.left: parent.left
                     anchors.right: parent.right
                     anchors.top: parent.top
-                    height: 1
+                    height: tokens.hairlineWidth
                     visible: globalStatusBar.hasStatus
                     color: globalStatusBar.hasError
                         || globalStatusBar.hasDirtySettings
@@ -667,7 +667,7 @@ ApplicationWindow {
             anchors.fill: parent
             color: "transparent"
             radius: tokens.windowClientRadius
-            border.width: 1
+            border.width: tokens.hairlineWidth
             border.color: tokens.windowFrameBorder
             antialiasing: true
             z: 20

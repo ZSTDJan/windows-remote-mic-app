@@ -72,7 +72,7 @@ AbstractButton {
             anchors.left: parent.left
             anchors.top: parent.top
             anchors.bottom: parent.bottom
-            width: 0.75
+            width: root.tokens.hairlineWidth
             color: root.tokens.border
         }
 
@@ -149,7 +149,7 @@ AbstractButton {
             anchors.left: parent.left
             anchors.top: parent.top
             anchors.bottom: parent.bottom
-            width: 0.75
+            width: root.tokens.hairlineWidth
             color: root.tokens.border
         }
 
@@ -192,7 +192,7 @@ AbstractButton {
     background: Rectangle {
         radius: root.tokens.cornerRadiusSmall
         color: root.selected ? root.tokens.accentSoft : root.tokens.surface
-        border.width: 0.75
+        border.width: root.tokens.hairlineWidth
         border.color: root.selected
             ? root.tokens.accent
             : root.hovered
