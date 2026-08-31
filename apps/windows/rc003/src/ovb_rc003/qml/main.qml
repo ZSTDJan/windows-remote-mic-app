@@ -613,17 +613,6 @@ ApplicationWindow {
                         ? tokens.errorBackground : tokens.statusBackground
                     : tokens.background
 
-                Rectangle {
-                    anchors.left: parent.left
-                    anchors.right: parent.right
-                    anchors.top: parent.top
-                    height: tokens.hairlineWidth
-                    visible: globalStatusBar.hasStatus
-                    color: globalStatusBar.hasError
-                        || globalStatusBar.hasDirtySettings
-                        ? tokens.errorColor : tokens.accent
-                }
-
                 Label {
                     id: globalStatusText
                     objectName: "globalStatusText"

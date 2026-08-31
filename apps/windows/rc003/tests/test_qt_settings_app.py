@@ -6605,6 +6605,14 @@ class ThreePageSettingsSourceContractTests(unittest.TestCase):
         self.assertNotIn("clientShellShadowNear", self.main_qml)
         self.assertNotIn("clientShellShadowFar", self.main_qml)
 
+    def test_global_status_bar_uses_background_without_a_top_rule(self):
+        status_bar_source = self.main_qml[
+            self.main_qml.index('id: globalStatusBar'):
+            self.main_qml.index('id: globalStatusText')
+        ]
+        self.assertIn("tokens.statusBackground", status_bar_source)
+        self.assertNotIn("height: tokens.hairlineWidth", status_bar_source)
+
     def test_regular_frames_share_one_hairline_width(self):
         for source in (
             self.main_qml,
