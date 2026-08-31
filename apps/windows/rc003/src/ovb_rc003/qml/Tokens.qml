@@ -54,10 +54,6 @@ QtObject {
     property int windowClientRadius: 9
     property int windowFrameGap: 3
     property real hairlineWidth: 0.5
-    property int windowShadowBlurMax: 8
-    property real windowShadowOpacity: darkMode ? 0.30 : 0.22
-    property real windowShadowScale: 1.006
-    property int windowShadowVerticalOffset: 1
     property int spacingTiny: 3
     property int spacingSmall: 6
     property int spacingMedium: 8

@@ -6596,14 +6596,9 @@ class ThreePageSettingsSourceContractTests(unittest.TestCase):
             self.tokens_qml,
         )
         self.assertIn("property real hairlineWidth: 0.5", self.tokens_qml)
-        self.assertIn("import QtQuick.Effects", self.main_qml)
-        self.assertIn('objectName: "clientShellShadowSource"', self.main_qml)
-        self.assertIn('objectName: "clientShellShadow"', self.main_qml)
-        self.assertIn("shadowOpacity: tokens.windowShadowOpacity", self.main_qml)
-        self.assertIn("shadowScale: tokens.windowShadowScale", self.main_qml)
-        self.assertIn("blurMax: tokens.windowShadowBlurMax", self.main_qml)
-        self.assertNotIn("clientShellShadowNear", self.main_qml)
-        self.assertNotIn("clientShellShadowFar", self.main_qml)
+        self.assertNotIn("import QtQuick.Effects", self.main_qml)
+        self.assertNotIn("clientShellShadow", self.main_qml)
+        self.assertNotIn("windowShadow", self.tokens_qml)
 
     def test_global_status_bar_uses_background_without_a_top_rule(self):
         status_bar_source = self.main_qml[
@@ -6658,10 +6653,18 @@ class ThreePageSettingsSourceContractTests(unittest.TestCase):
     def test_device_toggles_share_the_compact_accent_switch(self):
         self.assertEqual(self.device_qml.count("CompactSwitch {"), 2)
         self.assertNotIn("                    Switch {", self.device_qml)
-        self.assertIn("implicitWidth: 36", self.compact_switch_qml)
+        self.assertIn("implicitWidth: 28", self.compact_switch_qml)
         self.assertIn("implicitHeight: 14", self.compact_switch_qml)
         self.assertIn("? root.tokens.accent", self.compact_switch_qml)
         self.assertIn("? root.tokens.accentText", self.compact_switch_qml)
+
+    def test_sidebar_separator_keeps_a_visible_hairline(self):
+        navigation_source = self.main_qml[
+            self.main_qml.index('id: navigationBar'):
+            self.main_qml.index('id: pageStack')
+        ]
+        self.assertIn("width: tokens.hairlineWidth", navigation_source)
+        self.assertIn("color: tokens.borderStrong", navigation_source)
 
     def test_diagnostics_are_reused_inside_their_own_rows(self):
         for check_id in ("os_version", "raw_input", "ble_candidate"):

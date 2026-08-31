@@ -7,14 +7,14 @@ Switch {
     property var tokens
 
     hoverEnabled: true
-    implicitWidth: 36
+    implicitWidth: 28
     implicitHeight: tokens ? tokens.controlHeight : 28
     padding: 0
     spacing: 0
 
     indicator: Rectangle {
         objectName: root.objectName + "_track"
-        implicitWidth: 36
+        implicitWidth: 28
         implicitHeight: 14
         width: implicitWidth
         height: implicitHeight

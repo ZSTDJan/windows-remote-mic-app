@@ -1,6 +1,5 @@
 import QtQuick
 import QtQuick.Controls
-import QtQuick.Effects
 import QtQuick.Layouts
 import Qt.labs.platform as Platform
 import OvbRc003Settings 1.0
@@ -432,31 +431,6 @@ ApplicationWindow {
     }
 
     Rectangle {
-        id: clientShellShadowSource
-        objectName: "clientShellShadowSource"
-        anchors.fill: clientShell
-        radius: tokens.windowClientRadius
-        color: tokens.background
-        layer.enabled: true
-    }
-
-    MultiEffect {
-        id: clientShellShadow
-        objectName: "clientShellShadow"
-        anchors.fill: clientShellShadowSource
-        source: clientShellShadowSource
-        autoPaddingEnabled: true
-        shadowEnabled: true
-        shadowColor: "#000000"
-        shadowOpacity: tokens.windowShadowOpacity
-        shadowBlur: 1
-        shadowScale: tokens.windowShadowScale
-        shadowHorizontalOffset: 0
-        shadowVerticalOffset: tokens.windowShadowVerticalOffset
-        blurMax: tokens.windowShadowBlurMax
-    }
-
-    Rectangle {
         id: clientShell
         objectName: "clientShell"
         anchors.top: parent.top
@@ -492,7 +466,7 @@ ApplicationWindow {
                 anchors.top: parent.top
                 anchors.bottom: parent.bottom
                 width: tokens.hairlineWidth
-                color: tokens.border
+                color: tokens.borderStrong
             }
 
             Column {
