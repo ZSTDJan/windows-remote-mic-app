@@ -21,6 +21,29 @@ ApplicationWindow {
         fontFamily: window.preferredWindowsUiFontAvailable
             ? window.preferredWindowsUiFont : Qt.application.font.family
     }
+
+    component ClientShellCorner: Item {
+        property bool rightSide: false
+        property bool bottomSide: false
+        property color contentColor: window.tokens.background
+        width: window.tokens.windowClientRadius
+        height: window.tokens.windowClientRadius
+        clip: true
+
+        Rectangle {
+            anchors.fill: parent
+            color: window.tokens.windowFrame
+        }
+        Rectangle {
+            width: parent.width * 2
+            height: parent.height * 2
+            x: parent.rightSide ? -parent.width : 0
+            y: parent.bottomSide ? -parent.height : 0
+            radius: width / 2
+            color: parent.contentColor
+            antialiasing: true
+        }
+    }
     property bool initialDiagnosticsStarted: false
     property string applicationExitError: ""
     property string lifecycleErrorTitle: qsTr("操作未完成")
@@ -358,7 +381,7 @@ ApplicationWindow {
         initialDiagnosticsStarted = true
         DiagnosticsController.startInitialDiagnostics()
     }
-    color: tokens.background
+    color: tokens.windowFrame
     font.family: tokens.fontFamily
 
     palette.window: tokens.background
@@ -404,9 +427,24 @@ ApplicationWindow {
             SettingsController.activePageIndex = currentIndex
     }
 
-    RowLayout {
-        anchors.fill: parent
-        spacing: 0
+    Rectangle {
+        id: clientShell
+        objectName: "clientShell"
+        anchors.top: parent.top
+        anchors.left: parent.left
+        anchors.right: parent.right
+        anchors.bottom: parent.bottom
+        anchors.leftMargin: tokens.windowFrameGap
+        anchors.rightMargin: tokens.windowFrameGap
+        anchors.bottomMargin: tokens.windowFrameGap
+        color: tokens.background
+        radius: tokens.windowClientRadius
+
+        RowLayout {
+            id: clientContent
+            objectName: "clientContent"
+            anchors.fill: parent
+            spacing: 0
 
         Rectangle {
             id: navigationBar
@@ -588,6 +626,48 @@ ApplicationWindow {
                     }
                 }
             }
+        }
+        }
+
+        ClientShellCorner {
+            anchors.top: parent.top
+            anchors.left: parent.left
+            contentColor: tokens.sidebar
+            z: 10
+        }
+        ClientShellCorner {
+            anchors.top: parent.top
+            anchors.right: parent.right
+            rightSide: true
+            contentColor: tokens.background
+            z: 10
+        }
+        ClientShellCorner {
+            anchors.bottom: parent.bottom
+            anchors.left: parent.left
+            bottomSide: true
+            contentColor: tokens.sidebar
+            z: 10
+        }
+        ClientShellCorner {
+            anchors.bottom: parent.bottom
+            anchors.right: parent.right
+            rightSide: true
+            bottomSide: true
+            contentColor: globalStatusBar.color
+            z: 10
+        }
+
+        Rectangle {
+            id: clientShellOutline
+            objectName: "clientShellOutline"
+            anchors.fill: parent
+            color: "transparent"
+            radius: tokens.windowClientRadius
+            border.width: 1
+            border.color: tokens.windowFrameBorder
+            antialiasing: true
+            z: 20
         }
     }
 }

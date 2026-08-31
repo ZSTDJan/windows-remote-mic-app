@@ -5579,6 +5579,8 @@ result = {
     "width": float(window.property("width")),
     "height": float(window.property("height")),
     "warnings": [],
+    "client_shell": bounds(window, "clientShell"),
+    "client_shell_outline": bounds(window, "clientShellOutline"),
     "pages": {},
 }
 
@@ -6387,6 +6389,7 @@ class ThreePageSettingsSourceContractTests(unittest.TestCase):
     def setUp(self):
         qml_dir = Path(qt_settings_app.__file__).resolve().parent / "qml"
         self.main_qml = (qml_dir / "main.qml").read_text(encoding="utf-8")
+        self.tokens_qml = (qml_dir / "Tokens.qml").read_text(encoding="utf-8")
         self.device_qml = (qml_dir / "DevicePage.qml").read_text(encoding="utf-8")
         self.voice_qml = (qml_dir / "VoicePage.qml").read_text(encoding="utf-8")
         self.buttons_qml = (qml_dir / "ButtonsPage.qml").read_text(encoding="utf-8")
@@ -6418,6 +6421,26 @@ class ThreePageSettingsSourceContractTests(unittest.TestCase):
         self.assertIn("DevicePage {", self.main_qml)
         self.assertIn("ButtonsPage {", self.main_qml)
         self.assertIn("VoicePage {", self.main_qml)
+
+    def test_window_uses_the_inset_rounded_client_shell(self):
+        for token_name in (
+            "windowFrame",
+            "windowFrameBorder",
+            "windowClientRadius",
+            "windowFrameGap",
+        ):
+            self.assertRegex(
+                self.tokens_qml,
+                rf"property\s+(?:color|int)\s+{token_name}:",
+            )
+        self.assertIn('objectName: "clientShell"', self.main_qml)
+        self.assertIn('objectName: "clientContent"', self.main_qml)
+        self.assertIn('objectName: "clientShellOutline"', self.main_qml)
+        self.assertIn("anchors.leftMargin: tokens.windowFrameGap", self.main_qml)
+        self.assertIn("anchors.rightMargin: tokens.windowFrameGap", self.main_qml)
+        self.assertIn("anchors.bottomMargin: tokens.windowFrameGap", self.main_qml)
+        self.assertIn("radius: tokens.windowClientRadius", self.main_qml)
+        self.assertIn("border.color: tokens.windowFrameBorder", self.main_qml)
 
     def test_device_page_contains_device_and_desktop_behavior_rows(self):
         for object_name in (
@@ -6711,6 +6734,15 @@ class OffscreenQmlLoadTests(unittest.TestCase):
                 self.assertEqual(data["warnings"], [])
                 self.assertEqual((data["width"], data["height"]), (width, height))
                 self.assertEqual(data["mapping_index_on_press"], 1)
+
+                shell = data["client_shell"]
+                self.assertAlmostEqual(shell["x"], 3, delta=0.5)
+                self.assertAlmostEqual(shell["y"], 0, delta=0.5)
+                self.assertAlmostEqual(shell["right"], width - 3, delta=0.5)
+                self.assertAlmostEqual(shell["bottom"], height - 3, delta=0.5)
+                outline = data["client_shell_outline"]
+                for edge in ("x", "y", "right", "bottom"):
+                    self.assertAlmostEqual(outline[edge], shell[edge], delta=0.5)
 
                 descriptions = data["voice_columns"]["descriptions"]
                 launch_x = descriptions["voiceProgramLaunchText"]["x"]
