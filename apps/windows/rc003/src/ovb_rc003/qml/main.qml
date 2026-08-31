@@ -431,6 +431,32 @@ ApplicationWindow {
     }
 
     Rectangle {
+        id: clientShellShadowFar
+        objectName: "clientShellShadowFar"
+        anchors.fill: clientShell
+        anchors.margins: -tokens.windowShadowFarSpread
+        color: "transparent"
+        radius: tokens.windowClientRadius + tokens.windowShadowFarSpread
+        border.width: 1
+        border.color: "#000000"
+        opacity: tokens.windowShadowFarOpacity
+        antialiasing: true
+    }
+
+    Rectangle {
+        id: clientShellShadowNear
+        objectName: "clientShellShadowNear"
+        anchors.fill: clientShell
+        anchors.margins: -tokens.windowShadowNearSpread
+        color: "transparent"
+        radius: tokens.windowClientRadius + tokens.windowShadowNearSpread
+        border.width: 1
+        border.color: "#000000"
+        opacity: tokens.windowShadowNearOpacity
+        antialiasing: true
+    }
+
+    Rectangle {
         id: clientShell
         objectName: "clientShell"
         anchors.top: parent.top

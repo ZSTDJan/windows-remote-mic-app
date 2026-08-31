@@ -6592,7 +6592,11 @@ class ThreePageSettingsSourceContractTests(unittest.TestCase):
             'property color sidebar: darkMode ? "#1b1e24" : "#f5f6f8"',
             self.tokens_qml,
         )
-        self.assertIn("property real hairlineWidth: 1", self.tokens_qml)
+        self.assertIn("property real hairlineWidth: 0.5", self.tokens_qml)
+        self.assertIn('objectName: "clientShellShadowNear"', self.main_qml)
+        self.assertIn('objectName: "clientShellShadowFar"', self.main_qml)
+        self.assertIn("opacity: tokens.windowShadowNearOpacity", self.main_qml)
+        self.assertIn("opacity: tokens.windowShadowFarOpacity", self.main_qml)
 
     def test_regular_frames_share_one_hairline_width(self):
         for source in (

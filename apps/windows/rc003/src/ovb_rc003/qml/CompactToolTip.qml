@@ -47,6 +47,6 @@ ToolTip {
         radius: root.tokens.cornerRadiusControl
         color: root.tokens.surface
         border.width: root.tokens.hairlineWidth
-        border.color: root.tokens.borderStrong
+        border.color: root.tokens.border
     }
 }

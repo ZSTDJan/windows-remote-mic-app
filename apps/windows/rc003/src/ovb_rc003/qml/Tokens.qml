@@ -13,16 +13,16 @@ QtObject {
 
     property color background: darkMode ? "#171a1f" : "#f5f6f8"
     property color windowFrame: darkMode ? "#101318" : "#f5f6f8"
-    property color windowFrameBorder: darkMode ? "#3b414a" : "#d8d8d8"
+    property color windowFrameBorder: darkMode ? "#343941" : "#dfe1e4"
     property color surface: darkMode ? "#20242b" : "#ffffff"
     property color surfaceMuted: darkMode ? "#282d35" : "#f1f3f5"
     property color sidebar: darkMode ? "#1b1e24" : "#f5f6f8"
     property color textPrimary: darkMode ? "#f3f4f6" : "#17191d"
     property color textSecondary: darkMode ? "#aeb4be" : "#5f6670"
     property color disabledText: darkMode ? "#888f99" : "#858c95"
-    property color border: darkMode ? "#343941" : "#e0e3e7"
+    property color border: darkMode ? "#343941" : "#e2e4e7"
     property color borderStrong: darkMode ? "#474d57" : "#cfd4da"
-    property color cardBorder: darkMode ? "#59616c" : "#c4cad2"
+    property color cardBorder: border
     property color accent: "#087cf0"
     property color accentText: "#ffffff"
     property color accentSoft: darkMode ? "#183653" : "#e7f2ff"
@@ -53,7 +53,11 @@ QtObject {
     property int cornerRadiusLarge: 8
     property int windowClientRadius: 9
     property int windowFrameGap: 3
-    property real hairlineWidth: 1
+    property real hairlineWidth: 0.5
+    property real windowShadowNearSpread: 1
+    property real windowShadowFarSpread: 2
+    property real windowShadowNearOpacity: darkMode ? 0.24 : 0.10
+    property real windowShadowFarOpacity: darkMode ? 0.12 : 0.05
     property int spacingTiny: 3
     property int spacingSmall: 6
     property int spacingMedium: 8

@@ -271,7 +271,7 @@ Item {
             radius: tokens.cornerRadiusLarge
             color: tokens.surface
             border.width: tokens.hairlineWidth
-            border.color: tokens.borderStrong
+            border.color: tokens.border
         }
 
         header: Item {
@@ -336,7 +336,7 @@ Item {
                         color: tokens.fieldBackground
                         border.width: tokens.hairlineWidth
                         border.color: speakTestInput.activeFocus
-                            ? tokens.accent : tokens.borderStrong
+                            ? tokens.accent : tokens.border
                         radius: tokens.cornerRadiusControl
                     }
                 }
