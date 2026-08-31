@@ -13,6 +13,7 @@ QtObject {
 
     property color background: darkMode ? "#171a1f" : "#f5f6f8"
     property color windowFrame: darkMode ? "#101318" : "#eef0f2"
+    property color nativeWindowBorder: darkMode ? "#4a5059" : "#a8adb4"
     property color windowFrameBorder: darkMode ? "#343941" : "#dfe1e4"
     property color surface: darkMode ? "#20242b" : "#ffffff"
     property color surfaceMuted: darkMode ? "#282d35" : "#f1f3f5"

@@ -6571,6 +6571,7 @@ class ThreePageSettingsSourceContractTests(unittest.TestCase):
     def test_window_uses_the_inset_rounded_client_shell(self):
         for token_name in (
             "windowFrame",
+            "nativeWindowBorder",
             "windowFrameBorder",
             "windowClientRadius",
             "windowFrameGap",
@@ -6587,6 +6588,14 @@ class ThreePageSettingsSourceContractTests(unittest.TestCase):
         self.assertIn("anchors.bottomMargin: tokens.windowFrameGap", self.main_qml)
         self.assertIn("radius: tokens.windowClientRadius", self.main_qml)
         self.assertIn("border.color: tokens.windowFrameBorder", self.main_qml)
+        self.assertIn(
+            "readonly property color nativeBorderColor: tokens.nativeWindowBorder",
+            self.main_qml,
+        )
+        self.assertIn(
+            'property color nativeWindowBorder: darkMode ? "#4a5059" : "#a8adb4"',
+            self.tokens_qml,
+        )
         self.assertIn(
             'property color windowFrame: darkMode ? "#101318" : "#eef0f2"',
             self.tokens_qml,

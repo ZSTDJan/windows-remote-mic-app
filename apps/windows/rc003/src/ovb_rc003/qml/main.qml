@@ -23,7 +23,7 @@ ApplicationWindow {
     }
     readonly property color nativeCaptionColor: tokens.windowFrame
     readonly property color nativeCaptionTextColor: tokens.textPrimary
-    readonly property color nativeBorderColor: tokens.windowFrameBorder
+    readonly property color nativeBorderColor: tokens.nativeWindowBorder
 
     component ClientShellCorner: Item {
         property bool rightSide: false
