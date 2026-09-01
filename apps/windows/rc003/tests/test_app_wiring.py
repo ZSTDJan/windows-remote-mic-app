@@ -3129,24 +3129,24 @@ class EventLoopOwnershipRegressionTests(unittest.TestCase):
         self.assertTrue(loop.is_closed())
 
     def test_unowned_default_loop_pattern_reproduces_the_exact_red_evidence(self):
-        # The OLD (pre-fix) construction pattern - asyncio.get_event_loop()
-        # with no owned/running loop - run in an isolated subprocess, then
-        # forced through the exact condition real interpreter shutdown
-        # eventually creates. This deterministically reproduces the red
-        # evidence's exact shape: one "unclosed event loop" plus two
-        # "unclosed <socket.socket" warnings, both printed as unraisable
-        # exceptions from inside __del__, while the script's own exit code
-        # still reports 0 - proving why -W error::ResourceWarning alone
-        # could never have caught it.
+        # Recreate the OLD ambient-default-loop ownership pattern explicitly.
+        # Python 3.14 no longer creates a loop for a bare get_event_loop(), so
+        # the subprocess installs the same unowned default first. Dropping
+        # every reference then deterministically reproduces one unclosed-loop
+        # warning plus the two Proactor self-pipe socket warnings while the
+        # script still exits 0.
         script = (
             "import asyncio, gc\n"
+            "loop = asyncio.new_event_loop()\n"
+            "asyncio.set_event_loop(loop)\n"
             "class _Sup:\n"
             "    def __init__(self):\n"
             "        self._loop = asyncio.get_event_loop()\n"
             "objs = [_Sup() for _ in range(3)]\n"
             "assert all(o._loop is objs[0]._loop for o in objs)\n"
             "del objs\n"
-            "asyncio.get_event_loop_policy()._local._loop = None\n"
+            "asyncio.set_event_loop(None)\n"
+            "del loop\n"
             "gc.collect()\n"
             "print('done')\n"
         )

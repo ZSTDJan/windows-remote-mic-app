@@ -1,7 +1,7 @@
 无线麦（Windows 源码/构建候选）
 ====================================================
 
-状态：本安装包是 `0.2.0-candidate.1` 未签名候选。用户已确认现有功能完成
+状态：本安装包是 `0.2.0-candidate.2` 未签名候选。用户已确认现有功能完成
 真实小米遥控器2 Pro 使用验证；当前产品只支持实体话筒键按住说话。
 
 系统要求
@@ -13,7 +13,7 @@
   在点击"仍要运行"之前，建议先核对安装包（或便携版 ZIP）的 SHA-256 校验
   值是否与同一次构建产出的 SHA256SUMS.txt 一致。以 PowerShell 为例（把
   <文件名> 换成你实际下载的文件名，例如
-  RemoteMicRC003Setup-0.2.0-candidate.1-unsigned.exe）：
+  RemoteMicRC003Setup-0.2.0-candidate.2-unsigned.exe）：
 
       Get-FileHash -Algorithm SHA256 .\<文件名>
 

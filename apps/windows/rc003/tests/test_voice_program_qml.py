@@ -38,13 +38,24 @@ def render(window, app, count=10):
     return image
 
 
-def wait_for_voice_program_refresh(controller, app, timeout=10.0):
+def wait_for_voice_program_refresh(
+    controller, app, timeout=10.0, settle_seconds=0.25
+):
     deadline = time.monotonic() + timeout
-    while (
-        controller._voice_program_status_refresh_running
-        or controller._voice_program_status_refresh_pending
-    ) and time.monotonic() < deadline:
+    idle_since = None
+    while time.monotonic() < deadline:
         app.processEvents()
+        busy = (
+            controller._voice_program_status_refresh_running
+            or controller._voice_program_status_refresh_pending
+        )
+        now = time.monotonic()
+        if busy:
+            idle_since = None
+        elif idle_since is None:
+            idle_since = now
+        elif now - idle_since >= settle_seconds:
+            break
         time.sleep(0.01)
     app.processEvents()
     assert not controller._voice_program_status_refresh_running

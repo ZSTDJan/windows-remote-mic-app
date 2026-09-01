@@ -1,6 +1,6 @@
 # 无线麦 — Windows client（小米遥控器2 Pro）
 
-> **状态：`0.2.0-candidate.1` 源码/构建候选，已通过真实硬件验收。** 本目录包含
+> **状态：`0.2.0-candidate.2` 源码/构建候选，已通过真实硬件验收。** 本目录包含
 > 跨平台协议测试，以及针对 WinRT BLE、Raw Input、SendInput 和 PortAudio 的
 > Windows CI/构建流程。CI 没有真实 RC003 硬件，可以证明代码能够编译并通过
 > Windows API 调用契约测试，但不能替代真机配对、按键和语音链路验收。后续只
@@ -68,7 +68,7 @@ prerelease，发布说明会写清楚它基于哪一次真实 Windows CI 运行�
 
 预发行版的仓库级 tag（例如 `v0.3.0-windows-rc003-candidate.1`）只是发布
 编号，和资产文件名里的内部构建版本号是两回事：当前内部构建版本号固定为
-`0.2.0-candidate.1`（来自安装器脚本
+`0.2.0-candidate.2`（来自安装器脚本
 `installer/RemoteMicRC003Setup.iss` 的 `AppVersion`）。不要因为
 文件名里的版本号和 tag 不一致就怀疑下载错了文件，具体对应关系以该
 预发行版自己的发布说明为准。

@@ -14,7 +14,7 @@ Windows 客户端位于 [`apps/windows/rc003`](apps/windows/rc003/README.md)，�
 当前使用的同一份导航源码导出可独立安装和测试的项目，不复制维护第二套算法；独立源码
 按 `GPL-3.0-only` 发布于 [`ZSTDJan/orthofocus`](https://github.com/ZSTDJan/orthofocus)。
 
-当前版本为 `0.2.0-candidate.1` 源码/构建候选，已通过真实硬件验收。后续只
+当前版本为 `0.2.0-candidate.2` 源码/构建候选，已通过真实硬件验收。后续只
 调整公开历史、文档、授权记录和版本信息时沿用该结果。候选产物仍未签名；CI
 没有真实 RC003 硬件，不能替代真机配对、按键和语音链路验收。安装前应核对
 同一次 CI 生成的 SHA-256 清单。
@@ -29,8 +29,8 @@ Windows 客户端位于 [`apps/windows/rc003`](apps/windows/rc003/README.md)，�
 
 | 资产 | 适用场景 |
 | --- | --- |
-| `RemoteMicRC003Setup-0.2.0-candidate.1-unsigned.exe` | 推荐，安装到开始菜单/桌面并创建快捷方式 |
-| `RemoteMicRC003-0.2.0-candidate.1-portable-unsigned.zip` | 免安装，解压到任意目录直接运行 |
+| `RemoteMicRC003Setup-0.2.0-candidate.2-unsigned.exe` | 推荐，安装到开始菜单/桌面并创建快捷方式 |
+| `RemoteMicRC003-0.2.0-candidate.2-portable-unsigned.zip` | 免安装，解压到任意目录直接运行 |
 
 两个都未签名，Windows SmartScreen 会提示，点“更多信息 → 仍要运行”即可。
 建议同时下载 `SHA256SUMS.txt` 校验文件哈希。

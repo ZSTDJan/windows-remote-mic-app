@@ -26,7 +26,7 @@
 
 #define AppName "无线麦"
 #define AppPublisher "无线麦项目"
-#define AppVersion "0.2.0-candidate.1"
+#define AppVersion "0.2.0-candidate.2"
 #define AppExeName "RemoteMicRC003.exe"
 #define AppFolder "RC003"
 #define DistDir "..\dist\RemoteMicRC003"
