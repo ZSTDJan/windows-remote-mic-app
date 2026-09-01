@@ -140,8 +140,6 @@ $env:PYTHONPATH = Join-Path (Get-Location) 'src'
 
 ### 来源与维护边界
 
-- 本仓库从 [`HD838A/remote-mic-app`](https://github.com/HD838A/remote-mic-app)
-  的 Windows RC003 工作继续整理，macOS/Swift 内容不在本仓库维护；
 - Windows 实现参考了
   [`nijez/open-voice-bridge`](https://github.com/nijez/open-voice-bridge)；
 - RC003 HID 旁路参考了
@@ -159,6 +157,8 @@ $env:PYTHONPATH = Join-Path (Get-Location) 'src'
 代码按 `GPL-3.0-only` 发布，完整许可证见 [`LICENSE.md`](LICENSE.md)。第三方组件
 和素材仍按各自许可与授权记录分发：
 
+- **项目来源**：本仓库从 [`HD838A/remote-mic-app`](https://github.com/HD838A/remote-mic-app)
+  的 Windows RC003 工作继续整理；macOS/Swift 内容不在本仓库维护；
 - 普通问题和修改建议见 [`CONTRIBUTING.md`](CONTRIBUTING.md)；
 - 安全漏洞请按 [`SECURITY.md`](SECURITY.md) 使用私密入口，不要公开复现细节；
 - 第三方许可与素材授权见 [`THIRD_PARTY_LICENSES`](THIRD_PARTY_LICENSES/README.md)、
