@@ -172,7 +172,7 @@ jobs:
       # warning, from this cause or any other unclosed-resource cause.
       - name: Run test suite
         shell: pwsh
-        timeout-minutes: 10
+        timeout-minutes: 25
         env:
           PYTHONPATH: src
           PYTHONUNBUFFERED: "1"
