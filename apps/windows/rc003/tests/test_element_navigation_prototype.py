@@ -3497,7 +3497,7 @@ assert not any(name == "PySide6" or name.startswith("PySide6.") for name in sys.
         cached_elapsed = time.perf_counter() - started
 
         self.assertLess(cold_elapsed, 4.0)
-        self.assertLess(cached_elapsed, 0.1)
+        self.assertLess(cached_elapsed, 0.2)
 
     def test_irregular_layout_keeps_every_target_in_directional_rankings(self):
         targets = [

@@ -4829,6 +4829,7 @@ _QML_LOAD_PROBE_SCRIPT = r"""
 import faulthandler
 import json
 import sys
+import time
 
 # XRBM-034's "engine.warnings connected to a Python callback" theory for
 # this probe's 0xC0000005 was disproven by real Windows CI evidence
@@ -4891,6 +4892,11 @@ if voice_page is not None:
     voice_page.setProperty("voiceHotkeyRecording", True)
     controller.hotkeyCaptured.emit("ctrl+shift+f8")
     app.processEvents()
+    deadline = time.monotonic() + 5.0
+    while controller.voiceHotkeyBusy and time.monotonic() < deadline:
+        app.processEvents()
+        time.sleep(0.01)
+    app.processEvents()
 saved_config = m.config.load_config(m.config.config_path(m.config.config_root()))
 voice_save_status = controller.statusMessage
 status_bar = (
@@ -4923,6 +4929,7 @@ result = {
         voice_page.property("voiceHotkeyRecording")
         if voice_page is not None else None
     ),
+    "voice_hotkey_busy": bool(controller.voiceHotkeyBusy),
     "saved_voice_hotkey": saved_config.get("voice_hotkeys", {}).get("hold"),
     "voice_save_status": voice_save_status,
     "voice_feedback_on_device": voice_feedback_on_device,
@@ -6893,6 +6900,7 @@ class OffscreenQmlLoadTests(unittest.TestCase):
         self.assertFalse(data["initial_settings_dirty"])
         self.assertFalse(data["retired_finish_tap_control_exists"])
         self.assertFalse(data["voice_hotkey_recording"])
+        self.assertFalse(data["voice_hotkey_busy"])
         self.assertEqual(data["saved_voice_hotkey"], "ctrl+shift+f8")
         self.assertIn("快捷键已保存到无线麦", data["voice_save_status"])
         self.assertFalse(data["voice_feedback_on_device"])

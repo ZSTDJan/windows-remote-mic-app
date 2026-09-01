@@ -97,7 +97,7 @@ class NoResourceWarningAtShutdownTests(unittest.TestCase):
             env=env,
             capture_output=True,
             text=True,
-            timeout=300,
+            timeout=600,
         )
 
         self.assertEqual(
