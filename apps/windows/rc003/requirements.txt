@@ -6,7 +6,7 @@
 # pure-logic modules and their tests can run on non-Windows hosts without any of
 # these installed. They are required to actually run the app on Windows.
 
-sounddevice==0.5.5
+sounddevice==0.5.6
 numpy==2.4.3
 
 # Qt Quick/QML settings window (XRBM-030), replacing the earlier Tk view.
