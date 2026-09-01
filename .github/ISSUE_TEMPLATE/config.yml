@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 安全漏洞
+    url: https://github.com/ZSTDJan/windows-remote-mic-app/blob/main/SECURITY.md
+    about: 请先阅读私密报告方式，不要公开漏洞细节。
+  - name: 安装与使用说明
+    url: https://github.com/ZSTDJan/windows-remote-mic-app/blob/main/apps/windows/rc003/README.md
+    about: 配对、音频端点、安装和排障请先查看这里。

@@ -1,0 +1,4 @@
+* text=auto eol=lf
+
+# Preserve third-party license texts without treating upstream spacing as a project error.
+THIRD_PARTY_LICENSES/** -whitespace
