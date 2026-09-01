@@ -86,6 +86,8 @@ jobs:
   test-and-build:
     runs-on: windows-2025
     timeout-minutes: 60
+    env:
+      PYTHONUTF8: "1"
     defaults:
       run:
         working-directory: apps/windows/rc003

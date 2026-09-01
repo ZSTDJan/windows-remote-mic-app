@@ -49,6 +49,9 @@ Write-Host "== Remote Mic · RC003 candidate build =="
 
 Push-Location $RC003Root
 try {
+    # Keep Python and child-process output deterministic on English Windows.
+    $env:PYTHONUTF8 = "1"
+
     # Candidate builds run on a developer's interactive desktop. Tests must
     # never install a real keyboard hook or inject an actual key edge there.
     $env:RC003_DISABLE_LIVE_INPUT = "1"

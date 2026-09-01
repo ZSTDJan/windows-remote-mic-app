@@ -505,6 +505,9 @@ class WindowsCiWorkflowTests(unittest.TestCase):
     def test_pins_python_patch_version_for_release_inventory(self):
         self.assertIn('python-version: "3.12.10"', self.text)
 
+    def test_uses_utf8_mode_on_english_windows_runner(self):
+        self.assertIn('PYTHONUTF8: "1"', self.text)
+
     def test_scoped_to_rc003_paths(self):
         self.assertIn("apps/windows/rc003/**", self.text)
 
@@ -1081,6 +1084,9 @@ class BuildCandidateScriptTests(unittest.TestCase):
         # must enforce the same -W error::ResourceWarning policy as the CI
         # workflow's test-suite step, not just document it in prose.
         self.assertIn("-W error::ResourceWarning -m unittest discover", self.text)
+
+    def test_uses_utf8_mode_for_python_and_child_processes(self):
+        self.assertIn('$env:PYTHONUTF8 = "1"', self.text)
 
     def test_test_suite_full_log_is_scanned_for_late_resource_leaks(self):
         self.assertIn("Tee-Object -FilePath", self.text)
