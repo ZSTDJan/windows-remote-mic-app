@@ -63,7 +63,7 @@ winrt-Windows.Foundation.Collections==3.2.1
 # Doubao voice acceptance (XRBM-037): attaches to the verified ImeService
 # low-level callback and removes only this bridge's injected marker. The app
 # remains import-safe without it, but a Windows voice build must install it.
-frida==17.15.3
+frida==17.17.0
 
 # Provider-owned shortcut synchronization. WeType's Flutter settings expose
 # the current hold-to-talk shortcut through Windows UI Automation; using that
