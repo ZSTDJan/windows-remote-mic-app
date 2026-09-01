@@ -1349,10 +1349,11 @@ class RootDocumentConsistencyTests(unittest.TestCase):
         self.notices_text = _THIRD_PARTY_NOTICES_PATH.read_text(encoding="utf-8")
 
     def test_root_readme_does_not_lump_windows_in_with_planned_research(self):
-        self.assertIn("Windows 版本（小米遥控器2 Pro）", self.root_readme_text)
+        self.assertIn("无线麦【Win版】", self.root_readme_text)
+        self.assertIn("当前公开版本首先适配", self.root_readme_text)
+        self.assertIn("小米蓝牙语音遥控器 2 Pro", self.root_readme_text)
         self.assertIn("Windows 客户端位于", self.root_readme_text)
-        self.assertIn("源码/构建候选", self.root_readme_text)
-        self.assertIn("不能替代", self.root_readme_text)
+        self.assertIn("当前预发行版", self.root_readme_text)
 
     def test_third_party_notices_does_not_falsely_deny_all_vbcable_reference(self):
         # THIRD_PARTY_NOTICES.md previously claimed the Windows candidate
@@ -1380,14 +1381,18 @@ class RootDocumentConsistencyTests(unittest.TestCase):
         # is now bundled/fetched (not merely mentioned as a link), that only
         # the free Basic package (never paid A+B/C+D) is involved, that
         # installation only happens via an explicit user click plus a real
-        # UAC prompt, and that this project's own process never runs
-        # elevated and never reports install success from launch alone.
+        # UAC prompt, and that this action does not silently change the
+        # Remote Mic process privileges or report install success from launch
+        # alone.
         notices_text = _normalize_whitespace(self.notices_text)
         self.assertIn("fetch-vb-cable.ps1", notices_text)
         self.assertIn("VBCABLE_Driver_Pack45.zip", notices_text)
         self.assertIn("A+B/C+D", notices_text)
         self.assertIn("UAC", notices_text)
-        self.assertIn("never runs with administrator privileges", notices_text)
+        self.assertIn(
+            "Remote Mic does not automatically elevate or change its own current privileges",
+            notices_text,
+        )
         self.assertIn(
             "never reports a driver install as successful merely because a process was launched",
             notices_text,
@@ -1400,8 +1405,9 @@ class RootDocumentConsistencyTests(unittest.TestCase):
         # real-device verified) rather than one calling it a candidate and
         # the other calling it merely planned/research.
         windows_readme_text = _README_PATH.read_text(encoding="utf-8")
-        for text in (self.root_readme_text, windows_readme_text):
-            self.assertIn("源码/构建候选", text)
+        self.assertIn("当前预发行版", self.root_readme_text)
+        self.assertIn("候选版", self.root_readme_text)
+        self.assertIn("源码/构建候选", windows_readme_text)
 
 
 _CJK_CHAR_RE = r"[　-〿぀-ヿ㐀-鿿＀-￯]"

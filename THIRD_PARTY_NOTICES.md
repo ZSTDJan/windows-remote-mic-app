@@ -180,9 +180,10 @@ package and verifies its pinned SHA-256. The bundle never includes the paid
 A+B/C+D products. The client does not re-license or silently install VB-CABLE,
 and it never changes the Windows system default input/output device; audio is
 written only to an explicitly selected endpoint. Installation starts only after
-an explicit user action and Windows UAC confirmation. The Remote Mic process
-never runs with administrator privileges and never reports a driver install as
-successful merely because a process was launched. Users may obtain the same
+an explicit user action and Windows UAC confirmation. That action elevates only
+the vendor installer; Remote Mic does not automatically elevate or change its
+own current privileges, and it never reports a driver install as successful
+merely because a process was launched. Users may obtain the same
 package directly from VB-Audio and are encouraged to support the vendor through
 its Donationware model.
 
