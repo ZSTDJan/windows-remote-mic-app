@@ -24,7 +24,7 @@ numpy==2.4.3
 # PyInstaller build always bundles its own Qt runtime (see
 # build/RemoteMicRC003.spec), so end users of a packaged release never
 # need to separately install this themselves.
-PySide6-Essentials==6.11.1
+PySide6-Essentials==6.11.2
 
 # WinRT projections for BLE GATT (Bluetooth Low Energy Generic Attribute
 # Profile) access to the RC003's ATVV voice service.
