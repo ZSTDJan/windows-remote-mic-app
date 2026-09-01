@@ -9,6 +9,7 @@ import unittest
 _PROBE = r"""
 import json
 import os
+import time
 
 from PySide6.QtCore import QPointF, Qt
 from PySide6.QtTest import QTest
@@ -35,6 +36,19 @@ def render(window, app, count=10):
         image = window.grabWindow()
         app.processEvents()
     return image
+
+
+def wait_for_voice_program_refresh(controller, app, timeout=10.0):
+    deadline = time.monotonic() + timeout
+    while (
+        controller._voice_program_status_refresh_running
+        or controller._voice_program_status_refresh_pending
+    ) and time.monotonic() < deadline:
+        app.processEvents()
+        time.sleep(0.01)
+    app.processEvents()
+    assert not controller._voice_program_status_refresh_running
+    assert not controller._voice_program_status_refresh_pending
 
 
 def geometry(item):
@@ -117,9 +131,11 @@ render(window, app)
 tab_bar = find(window, "tabBar")
 tab_bar.setProperty("currentIndex", 2)
 render(window, app)
+find(window, "voiceProgramStatusRefreshTimer").setProperty("running", False)
+wait_for_voice_program_refresh(controller, app)
 
 controller.selectedVoiceProgramIndex = 1
-render(window, app)
+wait_for_voice_program_refresh(controller, app)
 controller._voice_program_status_code = "not_found"
 controller.voiceProgramStatusCodeChanged.emit()
 render(window, app)
@@ -142,7 +158,6 @@ controls = {
     )
 }
 assert all(control is not None for control in controls.values())
-find(window, "voiceProgramStatusRefreshTimer").setProperty("running", False)
 
 voice_page = find(window, "voiceScroll").parent()
 hotkey_field = controls["holdVoiceHotkeyField"]
