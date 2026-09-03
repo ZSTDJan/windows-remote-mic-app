@@ -10,9 +10,12 @@ without fighting the platform gate (see single_instance.py's docstring).
 
 import ctypes
 import inspect
+import json
 import sys
+import tempfile
 import unittest
 from ctypes import wintypes
+from pathlib import Path
 
 from ovb_rc003 import single_instance
 
@@ -548,6 +551,48 @@ class ShowBridgeStartupBlockedNoticeTests(unittest.TestCase):
         single_instance.show_bridge_startup_blocked_notice(
             "unavailable case", _message_box=failing_message_box
         )
+
+
+class BridgeStartRequestTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_fresh_request_is_consumed_exactly_once(self):
+        single_instance.write_bridge_start_request(self.root, now=lambda: 100.0)
+
+        self.assertTrue(
+            single_instance.consume_bridge_start_request(
+                self.root,
+                now=lambda: 110.0,
+            )
+        )
+        self.assertFalse(
+            single_instance.consume_bridge_start_request(
+                self.root,
+                now=lambda: 110.0,
+            )
+        )
+
+    def test_stale_or_invalid_request_is_discarded(self):
+        single_instance.write_bridge_start_request(self.root, now=lambda: 100.0)
+        self.assertFalse(
+            single_instance.consume_bridge_start_request(
+                self.root,
+                now=lambda: 131.0,
+            )
+        )
+
+        path = single_instance.bridge_start_request_path(self.root)
+        path.write_text(
+            json.dumps({"schema": 1, "action": "other"}),
+            encoding="utf-8",
+        )
+        self.assertFalse(single_instance.consume_bridge_start_request(self.root))
+        self.assertFalse(path.exists())
 
 
 class MutexCtypesPrototypeTests(unittest.TestCase):

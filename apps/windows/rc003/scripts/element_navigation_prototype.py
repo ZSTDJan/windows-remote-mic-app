@@ -252,7 +252,7 @@ def _parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--activate",
         action="store_true",
-        help="enter navigation after the companion process is ready",
+        help="enter navigation after the compatibility runtime is ready",
     )
     parser.add_argument(
         "--managed-companion",
@@ -322,6 +322,20 @@ def _load_element_navigation_windows_host() -> Any:
 def _run_windows(args: argparse.Namespace) -> int:
     host = _load_element_navigation_windows_host()
     return host._run_windows(args)
+
+
+def start_embedded(application: Any):
+    """Attach navigation to the desktop application's existing Qt loop."""
+
+    if sys.platform != "win32":
+        raise RuntimeError("元素导航只支持 Windows")
+    args = _parse_args(["--managed-companion"])
+    host = _load_element_navigation_windows_host()
+    return host._run_windows(
+        args,
+        application=application,
+        run_event_loop=False,
+    )
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:

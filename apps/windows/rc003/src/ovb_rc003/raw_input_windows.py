@@ -216,6 +216,7 @@ def _get_device_name(user32, device_handle, ridi_devicename: int) -> Optional[st
 
 
 ButtonEventCallback = Callable[[str, bool], None]  # (button_id, is_pressed)
+SourcedButtonEventCallback = Callable[[str, bool, str], None]
 
 
 @dataclass(frozen=True)
@@ -330,16 +331,22 @@ class RawInputButtonListener:
         on_button_event: ButtonEventCallback,
         on_raw_event: Optional[RawInputEventCallback] = None,
         physical_bindings: Optional[Mapping[str, str]] = None,
+        on_sourced_button_event: Optional[SourcedButtonEventCallback] = None,
     ):
         self._on_button_event = on_button_event
+        self._on_sourced_button_event = on_sourced_button_event
         self._on_raw_event = on_raw_event
         self._physical_bindings = dict(physical_bindings or {})
+        self._physical_bindings_lock = threading.Lock()
         self._thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
         self._hwnd = None
         self._active_hid_usages: FrozenSet[int] = frozenset()
         self._active_hid_buttons: FrozenSet[str] = frozenset()
         self._active_keyboard_buttons: FrozenSet[str] = frozenset()
+        self._active_hid_usage_buttons: dict[int, Optional[str]] = {}
+        self._active_keyboard_signature_buttons: dict[str, Optional[str]] = {}
+        self._logical_button_sources: dict[str, str] = {}
         self._ready_event = threading.Event()
         self._start_error: Optional[BaseException] = None
         self._device_path: Optional[str] = None
@@ -356,18 +363,25 @@ class RawInputButtonListener:
         ``back`` while keeping the configured ``back`` action unchanged.
         """
 
-        self._physical_bindings = dict(physical_bindings or {})
+        with self._physical_bindings_lock:
+            self._physical_bindings = dict(physical_bindings or {})
 
     def set_raw_event_callback(self, callback: Optional[RawInputEventCallback]) -> None:
         """Replace the optional observability callback after construction.
 
-        Keeping this tiny setter lets application wiring remain compatible
-        with older test/device adapters that only accepted the required
-        button callback, while the production listener still exposes the
-        exact Raw Input edge needed by the low-level duplicate suppressor.
+        Keeping this setter separate preserves the physical-learning and
+        diagnostic path without mixing it into logical button dispatch.
         """
 
         self._on_raw_event = callback
+
+    def set_sourced_button_event_callback(
+        self,
+        callback: Optional[SourcedButtonEventCallback],
+    ) -> None:
+        """Expose the Raw Input transport that produced a logical edge."""
+
+        self._on_sourced_button_event = callback
 
     @property
     def is_running(self) -> bool:
@@ -548,14 +562,34 @@ class RawInputButtonListener:
         self._release_all()
 
     def _release_all(self) -> None:
-        active_buttons = (
-            self._active_hid_buttons | self._active_keyboard_buttons
-        )
+        active_hid_buttons = self._active_hid_buttons
+        active_keyboard_buttons = self._active_keyboard_buttons
+        active_buttons = active_hid_buttons | active_keyboard_buttons
+        logical_button_sources = dict(self._logical_button_sources)
         self._active_hid_usages = frozenset()
         self._active_hid_buttons = frozenset()
         self._active_keyboard_buttons = frozenset()
+        self._active_hid_usage_buttons.clear()
+        self._active_keyboard_signature_buttons.clear()
+        self._logical_button_sources.clear()
         for button in sorted(active_buttons):
-            self._on_button_event(button, False)
+            source = logical_button_sources.get(
+                button,
+                "hid" if button in active_hid_buttons else "keyboard",
+            )
+            self._emit_button_event(button, False, source)
+
+    def _emit_button_event(
+        self,
+        button: str,
+        is_pressed: bool,
+        source: str,
+    ) -> None:
+        callback = self._on_sourced_button_event
+        if callback is not None:
+            callback(button, is_pressed, source)
+            return
+        self._on_button_event(button, is_pressed)
 
     def _update_source_button(self, source: str, button: str, is_pressed: bool) -> None:
         """Update one input source and emit only a logical button edge.
@@ -571,14 +605,15 @@ class RawInputButtonListener:
 
         before = self._active_keyboard_buttons | self._active_hid_buttons
         if source == "keyboard":
-            if is_pressed:
-                self._active_keyboard_buttons = (
-                    self._active_keyboard_buttons | {button}
-                )
-            else:
-                self._active_keyboard_buttons = (
-                    self._active_keyboard_buttons - {button}
-                )
+            # The signature table is the authoritative keyboard state. Two
+            # observed signatures may intentionally map to the same logical
+            # button; releasing either one must not release that button while
+            # the other signature is still physically down.
+            self._active_keyboard_buttons = frozenset(
+                candidate
+                for candidate in self._active_keyboard_signature_buttons.values()
+                if candidate
+            )
         elif source == "hid":
             if is_pressed:
                 self._active_hid_buttons = self._active_hid_buttons | {button}
@@ -588,8 +623,14 @@ class RawInputButtonListener:
             raise ValueError(f"unknown Raw Input source: {source!r}")
 
         after = self._active_keyboard_buttons | self._active_hid_buttons
-        if before != after and (button in before or button in after):
-            self._on_button_event(button, is_pressed)
+        was_active = button in before
+        is_active = button in after
+        if not was_active and is_active:
+            self._logical_button_sources[button] = source
+            self._emit_button_event(button, True, source)
+        elif was_active and not is_active:
+            owner = self._logical_button_sources.pop(button, source)
+            self._emit_button_event(button, False, owner)
 
     # -- background thread: window creation + message loop ----------------
 
@@ -911,23 +952,34 @@ class RawInputButtonListener:
         _make_code, flags, _reserved, vkey, message, _extra = struct.unpack_from(
             "<HHHHII", body, 0
         )
-        button = KEYBOARD_VK_TO_BUTTON.get(vkey)
-        if button is None and vkey == 0xFF:
-            button = KEYBOARD_MAKECODE_TO_BUTTON.get(_make_code)
+        default_button = KEYBOARD_VK_TO_BUTTON.get(vkey)
+        if default_button is None and vkey == 0xFF:
+            default_button = KEYBOARD_MAKECODE_TO_BUTTON.get(_make_code)
         WM_KEYUP = 0x0101
         WM_SYSKEYUP = 0x0105
         is_pressed = message not in (WM_KEYUP, WM_SYSKEYUP)
         event = RawInputEvent(
             source="keyboard",
             is_pressed=is_pressed,
-            button_id=button,
+            button_id=default_button,
             vkey=vkey,
             make_code=_make_code,
             flags=flags,
             message=message,
             device_path=device_path,
         )
-        button = self._resolve_button(event, button)
+        signature = physical_signature(event)
+        if is_pressed:
+            if signature in self._active_keyboard_signature_buttons:
+                button = self._active_keyboard_signature_buttons[signature]
+            else:
+                button = self._resolve_button(event, default_button)
+                self._active_keyboard_signature_buttons[signature] = button
+        else:
+            if signature in self._active_keyboard_signature_buttons:
+                button = self._active_keyboard_signature_buttons.pop(signature)
+            else:
+                button = self._resolve_button(event, default_button)
         if button != event.button_id:
             event = replace(event, button_id=button)
         self._emit_raw_event(event)
@@ -972,10 +1024,18 @@ class RawInputButtonListener:
                 self._active_hid_usages, current
             )
             previous_hid_buttons = self._active_hid_buttons
+            previous_usage_buttons = dict(self._active_hid_usage_buttons)
+            current_usage_buttons = {
+                usage: (
+                    previous_usage_buttons[usage]
+                    if usage in previous_usage_buttons
+                    else self._button_for_hid_usage(usage, report, device_path)
+                )
+                for usage in current
+            }
             current_hid_buttons = frozenset(
                 button
-                for usage in current
-                for button in (self._button_for_hid_usage(usage, report, device_path),)
+                for button in current_usage_buttons.values()
                 if button
             )
             previous_logical_buttons = (
@@ -986,8 +1046,9 @@ class RawInputButtonListener:
             )
             self._active_hid_usages = current
             self._active_hid_buttons = current_hid_buttons
+            self._active_hid_usage_buttons = current_usage_buttons
             for usage in pressed:
-                button = self._button_for_hid_usage(usage, report, device_path)
+                button = current_usage_buttons.get(usage)
                 self._emit_raw_event(self._hid_edge_event(
                     usage, True, button, report, device_path
                 ))
@@ -996,9 +1057,10 @@ class RawInputButtonListener:
                     and button in current_logical_buttons
                     and button not in previous_logical_buttons
                 ):
-                    self._on_button_event(button, True)
+                    self._logical_button_sources[button] = "hid"
+                    self._emit_button_event(button, True, "hid")
             for usage in released:
-                button = self._button_for_hid_usage(usage, report, device_path)
+                button = previous_usage_buttons.get(usage)
                 self._emit_raw_event(self._hid_edge_event(
                     usage, False, button, report, device_path
                 ))
@@ -1007,12 +1069,17 @@ class RawInputButtonListener:
                     and button in previous_logical_buttons
                     and button not in current_logical_buttons
                 ):
-                    self._on_button_event(button, False)
+                    owner = self._logical_button_sources.pop(button, "hid")
+                    self._emit_button_event(button, False, owner)
 
     def _resolve_button(
         self, event: RawInputEvent, default_button: Optional[str]
     ) -> Optional[str]:
-        return self._physical_bindings.get(physical_signature(event), default_button)
+        with self._physical_bindings_lock:
+            return self._physical_bindings.get(
+                physical_signature(event),
+                default_button,
+            )
 
     def _button_for_hid_usage(
         self, usage: int, report: bytes, device_path: Optional[str]

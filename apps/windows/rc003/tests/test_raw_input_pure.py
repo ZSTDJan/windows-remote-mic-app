@@ -86,6 +86,33 @@ class KeyboardBodyTests(unittest.TestCase):
             [("up", True), ("up", False), ("up", True), ("up", False)],
         )
 
+    def test_mapping_change_while_held_releases_the_original_keyboard_button(self):
+        rec = RecordingListener()
+        signature = "keyboard:vkey=0x0026;make=0x0000;flags=0x0000"
+
+        rec.listener._handle_keyboard_body(_rawkeyboard_body(0x26, WM_KEYDOWN))
+        rec.listener.set_physical_bindings({signature: "right"})
+        rec.listener._handle_keyboard_body(_rawkeyboard_body(0x26, WM_KEYUP))
+        rec.listener._handle_keyboard_body(_rawkeyboard_body(0x26, WM_KEYDOWN))
+        rec.listener._handle_keyboard_body(_rawkeyboard_body(0x26, WM_KEYUP))
+
+        self.assertEqual(
+            rec.events,
+            [("up", True), ("up", False), ("right", True), ("right", False)],
+        )
+
+    def test_two_keyboard_signatures_mapped_to_one_button_release_once(self):
+        rec = RecordingListener()
+        right_signature = "keyboard:vkey=0x0027;make=0x0000;flags=0x0000"
+        rec.listener.set_physical_bindings({right_signature: "up"})
+
+        rec.listener._handle_keyboard_body(_rawkeyboard_body(0x26, WM_KEYDOWN))
+        rec.listener._handle_keyboard_body(_rawkeyboard_body(0x27, WM_KEYDOWN))
+        rec.listener._handle_keyboard_body(_rawkeyboard_body(0x26, WM_KEYUP))
+        rec.listener._handle_keyboard_body(_rawkeyboard_body(0x27, WM_KEYUP))
+
+        self.assertEqual(rec.events, [("up", True), ("up", False)])
+
     def test_unrecognized_vk_emits_nothing(self):
         rec = RecordingListener()
         rec.listener._handle_keyboard_body(_rawkeyboard_body(0x99, WM_KEYDOWN))
@@ -191,6 +218,59 @@ class HidBodyTests(unittest.TestCase):
         rec.listener._handle_hid_body(_rawhid_body([_hid_report([])]))
         self.assertEqual(rec.events, [("up", True), ("up", False)])
 
+    def test_logical_release_keeps_the_source_that_owned_the_press(self):
+        events = []
+        listener = raw_input_windows.RawInputButtonListener(
+            lambda *_args: self.fail("legacy callback should not be used"),
+            on_sourced_button_event=lambda button, pressed, source: events.append(
+                (button, pressed, source)
+            ),
+        )
+
+        listener._handle_keyboard_body(_rawkeyboard_body(0x26, WM_KEYDOWN))
+        listener._handle_hid_body(_rawhid_body([_hid_report([0x0052])]))
+        listener._handle_keyboard_body(_rawkeyboard_body(0x26, WM_KEYUP))
+        listener._handle_hid_body(_rawhid_body([_hid_report([])]))
+
+        self.assertEqual(
+            events,
+            [("up", True, "keyboard"), ("up", False, "keyboard")],
+        )
+
+    def test_hid_owned_press_keeps_hid_source_when_keyboard_releases_last(self):
+        events = []
+        listener = raw_input_windows.RawInputButtonListener(
+            lambda *_args: self.fail("legacy callback should not be used"),
+            on_sourced_button_event=lambda button, pressed, source: events.append(
+                (button, pressed, source)
+            ),
+        )
+
+        listener._handle_hid_body(_rawhid_body([_hid_report([0x0028])]))
+        listener._handle_keyboard_body(_rawkeyboard_body(0x0D, WM_KEYDOWN))
+        listener._handle_hid_body(_rawhid_body([_hid_report([])]))
+        listener._handle_keyboard_body(_rawkeyboard_body(0x0D, WM_KEYUP))
+
+        self.assertEqual(
+            events,
+            [("ok", True, "hid"), ("ok", False, "hid")],
+        )
+
+    def test_mapping_change_while_held_releases_the_original_hid_button(self):
+        rec = RecordingListener()
+        signature = "hid:usages=0x0052"
+
+        rec.listener._handle_hid_body(_rawhid_body([_hid_report([0x0052])]))
+        rec.listener.set_physical_bindings({signature: "right"})
+        rec.listener._handle_hid_body(_rawhid_body([_hid_report([])]))
+        rec.listener._handle_hid_body(_rawhid_body([_hid_report([0x0052])]))
+        rec.listener._handle_hid_body(_rawhid_body([_hid_report([])]))
+
+        self.assertEqual(
+            rec.events,
+            [("up", True), ("up", False), ("right", True), ("right", False)],
+        )
+
 
 class StopWithoutStartTests(unittest.TestCase):
     """stop() must be safe to call, and must release stuck buttons, even
@@ -212,6 +292,21 @@ class StopWithoutStartTests(unittest.TestCase):
         rec.events.clear()
         rec.listener.stop()
         self.assertEqual(rec.events, [("right", False)])
+
+    def test_stop_preserves_the_real_source_on_forced_release(self):
+        events = []
+        listener = raw_input_windows.RawInputButtonListener(
+            lambda *_args: self.fail("legacy callback should not be used"),
+            on_sourced_button_event=lambda button, pressed, source: events.append(
+                (button, pressed, source)
+            ),
+        )
+        listener._handle_keyboard_body(_rawkeyboard_body(0x27, WM_KEYDOWN))
+        events.clear()
+
+        listener.stop()
+
+        self.assertEqual(events, [("right", False, "keyboard")])
 
     def test_stop_is_a_no_op_when_nothing_is_active(self):
         rec = RecordingListener()

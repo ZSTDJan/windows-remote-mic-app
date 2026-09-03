@@ -13,10 +13,11 @@ and waits forever. ``connection_supervisor.ConnectionSupervisor`` drives a
 connect/wait/cleanup/retry loop; a BLE disconnect notification or a protocol
 error both call ``request_reconnect()``, which ends the current wait and
 guarantees ``_cleanup_once()`` runs before the next connect attempt.
-``_cleanup_once()`` releases the voice hotkey, stops the Raw Input listener
-(which itself force-releases any stuck button), and closes the BLE session
-(which sends MIC_CLOSE, unsubscribes, and closes the device/service) - every
-step is individually wrapped so one step's failure never skips the rest.
+``_cleanup_once()`` releases the voice hotkey and closes the BLE/audio attempt.
+Raw Input, the verified HID tap, and the marked voice-key
+physicalizer instead belong to the bridge-worker lifetime: BLE discovery or
+reconnect failure cannot turn ordinary button handling off. Final worker exit
+stops those three input owners once, after BLE/voice cleanup has run.
 
 Voice fail-closed ordering (P1 #3): the output endpoint is resolved and
 opened BEFORE any hotkey/MIC_OPEN is sent, not lazily after the device has
@@ -36,22 +37,10 @@ writes run on a bounded FIFO worker, so ordinary BLE control handling does not
 wait for every PortAudio write.
 
 Cleanup ownership (XRBM-019 P1 #2, fixing XRBM-018 round 2 finding #2):
-stopping the Raw Input listener or closing the BLE session can now each
-raise when the resource they own reports it is still alive (a thread that
-did not stop within its join timeout - see raw_input_windows.py's
-``stop()``/ble_transport_winrt.py's ``close()``). ``_cleanup_once()`` still
-attempts every one of the four steps (voice hotkey, HID, BLE, playback)
-regardless of any single step's outcome, but a step whose owner reports it
-is still alive is intentionally left set on ``self._hid_listener``/
-``self._ble_session`` - not cleared to ``None`` - so no later code can
-mistake a still-running listener/session for a clean slate. Once every step
-has been attempted, any such retained-owner failure is aggregated and
-raised from ``_cleanup_once()`` itself, which is
-``ConnectionSupervisor.run_forever()``'s injected ``cleanup`` callable: that
-exception propagates out of ``run_forever()``'s ``finally`` block and ends
-the connect/retry loop entirely - the supervisor fails closed rather than
-starting a fresh ``connect()`` generation over resources that might still
-be live.
+an owner reference is cleared only after that resource confirms it stopped.
+BLE/audio cleanup failures end the reconnect supervisor rather than starting
+a new session over a live owner. Final input shutdown follows the same rule
+for Raw Input, HID tap, and the voice-key physicalizer.
 """
 
 from __future__ import annotations
@@ -85,9 +74,9 @@ from . import (
     hotkey,
     key_detection_bridge,
     key_mapping,
-    legacy_key_suppressor_windows,
     logging_setup,
     raw_input_windows,
+    voice_key_physicalizer_windows,
     voice_controller,
     voice_interaction_diagnostics_windows,
     voice_program_manager,
@@ -99,11 +88,7 @@ from .atvv_session import AudioStarted, AudioStopped, CapsReceived, MicButtonPre
 
 
 class CleanupIncompleteError(RuntimeError):
-    """Raised by ``RC003App._cleanup_once()`` when the Raw Input listener
-    and/or the BLE session report they are still alive after cleanup was
-    attempted - see the module docstring's "Cleanup ownership" note. Every
-    other cleanup step still ran before this is raised.
-    """
+    """Raised when an owned BLE/audio or process-input resource stays live."""
 
 
 _BUTTON_ACTION_KEY_TOKENS = {
@@ -244,18 +229,15 @@ class RC003App:
             self._voice.trigger_mode.value,
             self._voice_hotkey.serialize(),
         )
-        # One RC003 microphone press is reported independently by the legacy
-        # F5 hook, HID/Raw Input, the ATVV mic opcode, and sometimes
-        # AUDIO_STARTED first. Keep all reports in one gesture so one real
-        # press produces one host key-down and one release.
+        # One RC003 microphone press is reported independently by HID, the
+        # ATVV mic opcode, and sometimes AUDIO_STARTED first. Keep all reports
+        # in one gesture so one real press produces one host down and release.
         self._voice_mic_gesture_active = False
         self._voice_mic_gesture_audio_started = False
         self._voice_mic_gesture_audio_stopped = False
         self._voice_mic_gesture_physical_seen = False
         self._voice_mic_gesture_hid_released = False
-        self._voice_mic_gesture_started_without_direct_hid = False
         self._voice_mic_gesture_direct_hid_seen = False
-        self._voice_mic_gesture_legacy_f5_released = False
         self._voice_mic_gesture_sources_down: set[str] = set()
         self._ordinary_mic_lock = threading.Lock()
         self._ordinary_mic_sources_down: set[str] = set()
@@ -268,29 +250,25 @@ class RC003App:
         self._voice_audio_stop_processed = False
         self._voice_pcm_forwarding_enabled = False
         self._voice_raw_input_trigger_pending = False
-        # WH_KEYBOARD_LL must never wait for the voice/audio state machine.
-        # This private lock collapses repeated legacy F5 records before they
-        # are queued and exposes a brief down-state snapshot to the voice
-        # state machine. No hook callback holds it while acquiring voice state.
-        self._legacy_f5_hook_lock = threading.Lock()
-        self._legacy_f5_is_down = False
-        # A matched HID release can retire a still-down F5 duplicate before its
-        # delayed up arrives. Keep that old pair quarantined so it cannot attach
-        # to the next voice gesture.
-        self._legacy_f5_voice_blocked_until_up = False
         self._ble_session: Optional[ble_transport_winrt.RC003BleSession] = None
         self._hid_listener: Optional[raw_input_windows.RawInputButtonListener] = None
-        self._legacy_key_suppressor: Optional[
-            legacy_key_suppressor_windows.LegacyKeySuppressor
+        self._voice_key_physicalizer: Optional[
+            voice_key_physicalizer_windows.VoiceKeyPhysicalizer
         ] = None
         self._hid_report_tap: Optional[frida_compat.RC003HidReportTap] = None
         self._direct_hid_usages: set[int] = set()
         self._direct_hid_lock = threading.Lock()
-        # True once the tap has reported at least one full keyboard snapshot.
-        # While the tap side channel is live, the keyboard Raw Input path
-        # stands down so the same physical edge is not armed/dispatched twice.
-        self._direct_hid_tap_active = False
-        self._direction_fallback_buttons_down: set[str] = set()
+        self._input_arbitration_lock = threading.RLock()
+        # True only after the injected endpoint confirms it copied and cleared
+        # a real RC003 report before Windows could translate that report.
+        self._direct_hid_interception_ready = False
+        # The helper reports ATTACHED_WAITING_IO after the hook and lease are
+        # armed but before the first intercepted report proves end-to-end I/O.
+        # Suspend Raw Input mapping during that short handover so one physical
+        # hold cannot be split between two owners.
+        self._direct_hid_interception_armed = False
+        self._raw_fallback_buttons_down: set[str] = set()
+        self._raw_mapped_buttons_down: set[str] = set()
         self._key_detection_suppressed_buttons: set[str] = set()
         self._key_detection_mic_lock = threading.Lock()
         self._key_detection_mic_gesture_active = False
@@ -304,10 +282,11 @@ class RC003App:
         ] = None
         self._voice_pcm_stats = PcmStats()
         self._event_loop = asyncio.get_event_loop()
-        self._legacy_voice_event_generation = 0
-        # Cleanup disables every input callback before releasing host keys.
-        # A reconnect explicitly re-enables the next generation.
+        # Physical input belongs to the bridge-worker lifetime, not to one BLE
+        # connection attempt. BLE callbacks have their own generation gate.
         self._accept_input_events = True
+        self._accept_ble_events = False
+        self._ble_callback_generation = 0
 
         self._supervisor = connection_supervisor.ConnectionSupervisor(
             connect=self._connect_once,
@@ -325,10 +304,14 @@ class RC003App:
             self._runtime_status_heartbeat()
         )
         try:
+            self._start_input_channels()
             await self._supervisor.run_forever()
         finally:
-            heartbeat.cancel()
-            await asyncio.gather(heartbeat, return_exceptions=True)
+            try:
+                self._stop_input_channels()
+            finally:
+                heartbeat.cancel()
+                await asyncio.gather(heartbeat, return_exceptions=True)
 
     async def stop(self) -> None:
         await self._supervisor.stop()
@@ -405,34 +388,91 @@ class RC003App:
 
     async def _connect_once(self) -> None:
         with self._voice_trigger_lock:
-            self._accept_input_events = True
+            self._ble_callback_generation += 1
+            callback_generation = self._ble_callback_generation
+            self._accept_ble_events = True
         self._publish_runtime_status(
             bridge_runtime_status.BridgeConnectionState.WAITING_FOR_DEVICE
         )
         self._set_runtime_voice_active(False)
-        self._logger.info("startup: resolving RC003 identity")
-        candidates = await ble_transport_winrt.discover_candidates()
-        # A sole exact identity match remains the fast path. If Windows keeps
-        # multiple paired records, accept only the unique candidate that is
-        # currently reachable and exposes the ATVV voice service; zero or
-        # multiple reachable devices still fail closed instead of guessing.
-        candidate = await ble_transport_winrt.select_connectable_candidate(candidates)
-        self._logger.info("startup: exactly one RC003 candidate resolved")
+        stage = "discover_candidates"
+        try:
+            self._logger.info("startup: resolving RC003 identity")
+            candidates = await ble_transport_winrt.discover_candidates()
+            # A sole exact identity match remains the fast path. If Windows keeps
+            # multiple paired records, accept only the unique candidate that is
+            # currently reachable and exposes the ATVV voice service; zero or
+            # multiple reachable devices still fail closed instead of guessing.
+            stage = "select_connectable_candidate"
+            candidate = await ble_transport_winrt.select_connectable_candidate(
+                candidates
+            )
+            self._logger.info("startup: exactly one RC003 candidate resolved")
 
-        self._ble_session = ble_transport_winrt.RC003BleSession(
-            on_pcm_frame=self._on_pcm_frame,
-            on_control_event=self._on_control_event,
-            on_error=self._on_session_error,
-            on_disconnected=self._on_disconnected,
-            gain_db=float(self._config["gain_db"]),
-        )
-        await self._ble_session.connect(candidate)
+            stage = "create_ble_session"
+            self._ble_session = ble_transport_winrt.RC003BleSession(
+                on_pcm_frame=lambda samples: self._on_pcm_frame(
+                    samples,
+                    _ble_generation=callback_generation,
+                ),
+                on_control_event=lambda event: self._on_control_event(
+                    event,
+                    _ble_generation=callback_generation,
+                ),
+                on_error=lambda exc: self._on_session_error(
+                    exc,
+                    _ble_generation=callback_generation,
+                ),
+                on_disconnected=lambda: self._on_disconnected(
+                    _ble_generation=callback_generation,
+                ),
+                gain_db=float(self._config["gain_db"]),
+            )
+            stage = "connect_gatt"
+            await self._ble_session.connect(candidate)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self._logger.error(
+                "startup: RC003 connection failed: stage=%s error_type=%s",
+                stage,
+                type(exc).__name__,
+            )
+            raise
 
-        self._start_hid_listener()
-        self._start_hid_report_tap()
         self._publish_runtime_status(
             bridge_runtime_status.BridgeConnectionState.CONNECTED
         )
+
+    def _start_input_channels(self) -> None:
+        """Start process-lifetime input resources before any BLE attempt."""
+
+        with self._voice_trigger_lock:
+            self._accept_input_events = True
+        self._start_voice_key_physicalizer()
+        self._start_hid_listener()
+        self._start_hid_report_tap()
+
+    def _start_voice_key_physicalizer(self) -> None:
+        physicalizer = voice_key_physicalizer_windows.VoiceKeyPhysicalizer()
+        self._voice_key_physicalizer = physicalizer
+        try:
+            physicalizer.start()
+        except voice_key_physicalizer_windows.VoiceKeyPhysicalizerUnavailableError as exc:
+            if physicalizer.is_running:
+                self._logger.exception(
+                    "startup: voice key physicalizer failed but is still running; "
+                    "owner retained for cleanup"
+                )
+                raise
+            self._voice_key_physicalizer = None
+            self._logger.warning(
+                "startup: voice key physicalizer unavailable; marked voice "
+                "shortcuts may be ignored by some applications: %s",
+                exc,
+            )
+        else:
+            self._logger.info("startup: marked voice key physicalizer enabled")
 
 
     def _start_hid_listener(self) -> None:
@@ -476,15 +516,17 @@ class RC003App:
             )
             return
 
-        self._hid_listener = raw_input_windows.RawInputButtonListener(self._on_button_event)
-        set_physical_bindings = getattr(
-            self._hid_listener, "set_physical_bindings", None
+        self._hid_listener = raw_input_windows.RawInputButtonListener(
+            self._on_raw_button_event
         )
-        if callable(set_physical_bindings):
-            set_physical_bindings(self._bindings.get("physical_bindings", {}))
-        set_raw_event_callback = getattr(self._hid_listener, "set_raw_event_callback", None)
-        if set_raw_event_callback is not None:
-            set_raw_event_callback(self._on_raw_input_event)
+        self._sync_physical_bindings_to_listener(self._bindings)
+        set_sourced_button_event_callback = getattr(
+            self._hid_listener,
+            "set_sourced_button_event_callback",
+            None,
+        )
+        if callable(set_sourced_button_event_callback):
+            set_sourced_button_event_callback(self._on_raw_button_event)
         try:
             self._hid_listener.start(device_path)
         except raw_input_windows.RawInputUnavailableError as exc:
@@ -501,28 +543,20 @@ class RC003App:
             return
         self._set_runtime_input_state(raw_input_state="ready")
 
-        # RC003's voice key is also reported as a legacy F5. Keep that record
-        # out of the foreground application, but never turn it into the host
-        # voice shortcut inside the low-level hook. HID/ATVV/audio own the
-        # voice session lifecycle.
-        self._legacy_key_suppressor = legacy_key_suppressor_windows.LegacyKeySuppressor(
-            {0x74},
-            on_key_event=self._on_legacy_key_event,
-            rc003_vk_codes=frozenset(raw_input_windows.KEYBOARD_VK_TO_BUTTON),
-        )
-        self._legacy_voice_event_generation += 1
+    def _sync_physical_bindings_to_listener(self, bindings: dict) -> None:
+        listener = self._hid_listener
+        if listener is None:
+            return
+        set_physical_bindings = getattr(listener, "set_physical_bindings", None)
+        if not callable(set_physical_bindings):
+            return
         try:
-            self._legacy_key_suppressor.start()
-            self._logger.info("startup: RC003 voice legacy-key guard enabled")
-        except legacy_key_suppressor_windows.LegacyKeySuppressorUnavailableError as exc:
-            if self._legacy_key_suppressor.is_running:
-                self._logger.exception(
-                    "startup: RC003 voice legacy-key guard failed to start but is "
-                    "still running; owner retained for cleanup to retry"
-                )
-                raise
-            self._logger.warning("startup: RC003 voice legacy-key guard unavailable: %s", exc)
-            self._legacy_key_suppressor = None
+            set_physical_bindings(bindings.get("physical_bindings", {}))
+        except Exception as exc:  # noqa: BLE001 - keep the last live decoder
+            self._logger.warning(
+                "physical button bindings update failed: error_type=%s",
+                type(exc).__name__,
+            )
 
     def _start_hid_report_tap(self) -> None:
         """Start the upstream-derived tap for usages Windows drops.
@@ -563,119 +597,104 @@ class RC003App:
 
     def _on_hid_tap_status(self, status: str, detail: str) -> None:
         self._set_runtime_input_state(hid_tap_state=status)
+        interception_ready = status == frida_compat.HidTapState.READY.value
+        interception_armed = status in {
+            frida_compat.HidTapState.ATTACHED_WAITING_IO.value,
+            frida_compat.HidTapState.READY.value,
+        }
         message = "RC003 HID report tap state: %s"
         args = [status]
         if detail:
             message += " detail=%s"
             args.append(detail)
-        if status in {
-            frida_compat.HidTapState.FAILED.value,
-            frida_compat.HidTapState.UNHEALTHY.value,
-        }:
-            self._logger.warning(message, *args)
-            with self._direct_hid_lock:
-                stale_usages = set(self._direct_hid_usages)
-                self._direct_hid_usages.clear()
-            self._direct_hid_tap_active = False
-            for usage in sorted(stale_usages):
-                button = frida_compat.TAP_USAGE_TO_BUTTON.get(usage)
-                if button is not None:
-                    self._on_button_event(button, False, event_source="hid_tap")
-        else:
-            self._logger.info(message, *args)
+        with self._input_arbitration_lock:
+            if not interception_ready and self._direct_hid_interception_ready:
+                self._logger.warning(message, *args)
+                with self._direct_hid_lock:
+                    stale_usages = set(self._direct_hid_usages)
+                    self._direct_hid_usages.clear()
+                # Keep the ready flag set until every owned key is released.
+                # Holding the arbitration lock across both steps prevents a
+                # final report from inserting a new down edge between the
+                # stale snapshot and the transition to the unavailable state.
+                for usage in sorted(stale_usages):
+                    button = frida_compat.TAP_USAGE_TO_BUTTON.get(usage)
+                    if button is not None:
+                        self._on_button_event(
+                            button,
+                            False,
+                            event_source="hid_tap",
+                        )
+            else:
+                self._logger.info(message, *args)
+            if interception_armed and not self._direct_hid_interception_armed:
+                # ATTACHED_WAITING_IO is emitted only after the helper has
+                # acknowledged the interception lease. Finish any Raw HID
+                # gesture that began before that handover, then suspend Raw
+                # mapping until verified tap reports take ownership.
+                for button in sorted(self._raw_mapped_buttons_down):
+                    self._on_button_event(
+                        button,
+                        False,
+                        event_source="raw_hid",
+                    )
+                self._raw_fallback_buttons_down.clear()
+            self._direct_hid_interception_armed = interception_armed
+            self._direct_hid_interception_ready = interception_ready
 
     def _on_direct_hid_report(self, report_id: int, payload: bytes) -> None:
         """Translate every RC003 keyboard HID usage into button edges.
 
-        The tap observes the full keyboard report on its own socket thread,
-        which the low-level keyboard hook does not block.  Arming the
-        duplicate suppressor from this side channel makes the arming edge
-        arrive inside the hook's wait window (the WM_INPUT arm arrives too
-        late, ~63-72ms after the hook on this device). The microphone usage
-        also enters the shared edge path now that mic may own an ordinary
-        mapping; app-level source tracking collapses its F5/Raw/HID reports.
+        The injected Gadget copies the report and clears its keyboard usages
+        before Windows translates them. This callback therefore owns custom
+        mapping only after the tap reports verified interception. Raw Keyboard
+        remains observation/fallback and never adds a second mapped action.
         """
 
-        if not self._accept_input_events or report_id != 1 or len(payload) != 6:
-            return
-        active = {
-            int.from_bytes(payload[index : index + 2], "little")
-            for index in range(0, len(payload), 2)
-        } & set(frida_compat.TAP_USAGE_TO_BUTTON)
-        with self._direct_hid_lock:
-            previous = self._direct_hid_usages
-            if active == previous:
+        with self._input_arbitration_lock:
+            if (
+                not self._accept_input_events
+                or not self._direct_hid_interception_ready
+                or report_id != 1
+                or len(payload) != 6
+            ):
                 return
-            pressed = active - previous
-            released = previous - active
-            self._direct_hid_usages = set(active)
-        if active:
-            self._direct_hid_tap_active = True
-        for usage in sorted(pressed):
-            button = frida_compat.TAP_USAGE_TO_BUTTON[usage]
-            self._logger.info(
-                "RC003 direct HID usage down: 0x%04x -> %s",
-                usage,
-                button,
-            )
-            self._arm_from_direct_usage(usage, True)
-            self._on_button_event(button, True, event_source="hid_tap")
-        for usage in sorted(released):
-            button = frida_compat.TAP_USAGE_TO_BUTTON[usage]
-            self._logger.info(
-                "RC003 direct HID usage up: 0x%04x -> %s",
-                usage,
-                button,
-            )
-            self._arm_from_direct_usage(usage, False)
-            self._on_button_event(button, False, event_source="hid_tap")
+            active = {
+                int.from_bytes(payload[index : index + 2], "little")
+                for index in range(0, len(payload), 2)
+            } & set(frida_compat.TAP_USAGE_TO_BUTTON)
+            with self._direct_hid_lock:
+                previous = self._direct_hid_usages
+                if active == previous:
+                    return
+                pressed = active - previous
+                released = previous - active
+                self._direct_hid_usages = set(active)
+            for usage in sorted(pressed):
+                button = frida_compat.TAP_USAGE_TO_BUTTON[usage]
+                self._logger.info(
+                    "RC003 direct HID usage down: 0x%04x -> %s",
+                    usage,
+                    button,
+                )
+                self._on_button_event(button, True, event_source="hid_tap")
+            for usage in sorted(released):
+                button = frida_compat.TAP_USAGE_TO_BUTTON[usage]
+                self._logger.info(
+                    "RC003 direct HID usage up: 0x%04x -> %s",
+                    usage,
+                    button,
+                )
+                self._on_button_event(button, False, event_source="hid_tap")
 
-    def _arm_from_direct_usage(self, usage: int, is_pressed: bool) -> None:
-        """Arm the exact physical edge seen by the tap's socket thread.
+    def _stop_input_channels(self) -> None:
+        """Stop process-lifetime input resources exactly once at worker exit."""
 
-        Uses the same vk/scan/extended values the low-level hook observes for
-        that physical key, so ``consume_armed_key_event`` matches regardless
-        of whether the arm arrived from Raw Input or from the tap.
-        """
-
-        suppressor = self._legacy_key_suppressor
-        if suppressor is None:
-            return
-        key = frida_compat.TAP_USAGE_TO_KEY.get(usage)
-        if key is None:
-            return
-        vk_code, make_code, extended = key
-        if not self._accept_input_events:
-            return
-        if vk_code == 0x74:
-            return
-        suppressor.arm_tracked_key_event(vk_code, make_code, extended, is_pressed)
-
-
-    async def _cleanup_once(self) -> None:
-        """Every step is independently attempted: one failing must never
-        skip the rest (XRBM-014 review RETRY P1 #4). XRBM-019 P1 #2/#5: the
-        HID listener and BLE session owners are only cleared to ``None``
-        when their own stop()/close() call reports success - if either
-        reports its resource is still alive (raises), the owner reference
-        is deliberately retained so no later code can mistake a still-
-        running listener/session for a clean slate, and this method raises
-        ``CleanupIncompleteError`` once every step has still been
-        attempted (see the module docstring's "Cleanup ownership" note for
-        how that ends the connect/retry loop).
-        """
-
-        self._publish_runtime_status(
-            bridge_runtime_status.BridgeConnectionState.WAITING_FOR_DEVICE
-        )
         failures: List[str] = []
-        with self._voice_trigger_lock:
-            self._accept_input_events = False
-            self._legacy_voice_event_generation += 1
-            self._legacy_f5_voice_blocked_until_up = False
-        with self._legacy_f5_hook_lock:
-            self._legacy_f5_is_down = False
 
+        # Keep dispatch enabled until both listeners have emitted their forced
+        # release edges. The HID tap is stopped first so its explicit disable
+        # handshake restores the Windows path before Raw Input is closed.
         if self._hid_report_tap is not None:
             try:
                 self._hid_report_tap.stop()
@@ -683,14 +702,35 @@ class RC003App:
                 self._set_runtime_input_state(hid_tap_state="stopped")
             except Exception:
                 self._set_runtime_input_state(hid_tap_state="failed_stopping")
-                self._logger.exception("cleanup: stopping the RC003 HID report tap failed")
+                self._logger.exception(
+                    "cleanup: stopping the RC003 HID report tap failed"
+                )
                 failures.append("RC003 HID report tap did not stop; owner retained")
         else:
             self._set_runtime_input_state(hid_tap_state="stopped")
+
+        if self._hid_listener is not None:
+            try:
+                self._hid_listener.stop()
+                self._hid_listener = None
+                self._set_runtime_input_state(raw_input_state="stopped")
+            except Exception:
+                self._set_runtime_input_state(raw_input_state="failed_stopping")
+                self._logger.exception("cleanup: stopping the Raw Input listener failed")
+                failures.append("Raw Input listener did not stop; owner retained")
+        else:
+            self._set_runtime_input_state(raw_input_state="stopped")
+
+        with self._voice_trigger_lock:
+            self._accept_input_events = False
+
         with self._direct_hid_lock:
             self._direct_hid_usages.clear()
-        self._direct_hid_tap_active = False
-        self._direction_fallback_buttons_down.clear()
+        with self._input_arbitration_lock:
+            self._direct_hid_interception_ready = False
+            self._direct_hid_interception_armed = False
+            self._raw_fallback_buttons_down.clear()
+            self._raw_mapped_buttons_down.clear()
         self._key_detection_suppressed_buttons.clear()
         with self._ordinary_mic_lock:
             self._ordinary_mic_sources_down.clear()
@@ -700,12 +740,41 @@ class RC003App:
             self._ordinary_mic_gesture_active = False
         with self._key_detection_mic_lock:
             self._reset_key_detection_mic_gesture_locked()
-
-        # Cancel gesture timers before stopping Raw Input. The listener's
-        # forced releases then clear the dispatcher state without a late
-        # double/long callback racing the next connection generation.
         self._button_combos.reset()
         self._button_gestures.reset()
+
+        if self._button_key_release_pending is not None:
+            if self._release_pending_button_keys():
+                self._button_key_release_pending = None
+            else:
+                failures.append(
+                    "ordinary button key safety release did not fully deliver; "
+                    "state retained"
+                )
+
+        if self._voice_key_physicalizer is not None:
+            try:
+                self._voice_key_physicalizer.stop()
+                self._voice_key_physicalizer = None
+            except Exception:
+                self._logger.exception("cleanup: stopping voice key physicalizer failed")
+                failures.append("voice key physicalizer did not stop; owner retained")
+
+        if failures:
+            raise CleanupIncompleteError(
+                "cleanup could not release all owned input resources: "
+                + "; ".join(failures)
+            )
+
+    async def _cleanup_once(self) -> None:
+        """Release one BLE/voice/audio attempt without stopping input."""
+
+        self._publish_runtime_status(
+            bridge_runtime_status.BridgeConnectionState.WAITING_FOR_DEVICE
+        )
+        failures: List[str] = []
+        with self._voice_trigger_lock:
+            self._accept_ble_events = False
 
         try:
             with self._voice_trigger_lock:
@@ -759,28 +828,6 @@ class RC003App:
                     "state retained"
                 )
 
-        if self._hid_listener is not None:
-            try:
-                self._hid_listener.stop()
-                self._hid_listener = None
-                self._set_runtime_input_state(raw_input_state="stopped")
-            except Exception:
-                self._set_runtime_input_state(raw_input_state="failed_stopping")
-                self._logger.exception("cleanup: stopping the Raw Input listener failed")
-                failures.append("Raw Input listener did not stop; owner retained")
-                # self._hid_listener is intentionally NOT cleared here: it
-                # may still be a live thread/window.
-        else:
-            self._set_runtime_input_state(raw_input_state="stopped")
-
-        if self._legacy_key_suppressor is not None:
-            try:
-                self._legacy_key_suppressor.stop()
-                self._legacy_key_suppressor = None
-            except Exception:
-                self._logger.exception("cleanup: stopping RC003 voice legacy-key guard failed")
-                failures.append("RC003 voice legacy-key guard did not stop; owner retained")
-
         if self._ble_session is not None:
             try:
                 await self._ble_session.close()
@@ -826,19 +873,35 @@ class RC003App:
 
     # -- disconnect / error callbacks: hand off to the supervisor ----------
 
-    def _on_disconnected(self) -> None:
+    def _on_disconnected(self, *, _ble_generation: Optional[int] = None) -> None:
+        if not self._accepts_ble_callback(_ble_generation):
+            return
         self._publish_runtime_status(
             bridge_runtime_status.BridgeConnectionState.WAITING_FOR_DEVICE
         )
         self._logger.info("BLE reported disconnected; requesting reconnect")
         self._supervisor.request_reconnect()
 
-    def _on_session_error(self, exc: BaseException) -> None:
+    def _on_session_error(
+        self,
+        exc: BaseException,
+        *,
+        _ble_generation: Optional[int] = None,
+    ) -> None:
+        if not self._accepts_ble_callback(_ble_generation):
+            return
         self._publish_runtime_status(
             bridge_runtime_status.BridgeConnectionState.WAITING_FOR_DEVICE
         )
         self._logger.info("ATVV protocol error, requesting reconnect: %s", exc)
         self._supervisor.request_reconnect()
+
+    def _accepts_ble_callback(self, generation: Optional[int]) -> bool:
+        """Reject callbacks left behind by an older BLE session."""
+
+        return self._accept_ble_events and (
+            generation is None or generation == self._ble_callback_generation
+        )
 
     def _primary_button_action(self, button_id: str) -> key_mapping.ButtonAction:
         return key_mapping.button_action_for(
@@ -901,6 +964,11 @@ class RC003App:
         button_id: str,
         action: key_mapping.ButtonAction,
     ) -> bool:
+        if not self._direct_hid_interception_ready:
+            self._logger.warning(
+                "voice mapping ignored: RC003 HID interception is not ready"
+            )
+            return False
         if self._voice_mode_for_primary_button(button_id, action) is None:
             self._logger.warning(
                 "voice mapping ignored: only the physical microphone button "
@@ -952,22 +1020,16 @@ class RC003App:
                 self._voice_mic_gesture_sources_down.add(source)
                 if source == "hid_tap":
                     self._voice_mic_gesture_direct_hid_seen = True
-            self._track_legacy_f5_down_snapshot_locked()
             return False
         self._voice_mic_gesture_active = True
         self._voice_mic_gesture_audio_started = source == "audio_started"
         self._voice_mic_gesture_audio_stopped = False
         self._voice_mic_gesture_physical_seen = physical_down
         self._voice_mic_gesture_hid_released = False
-        self._voice_mic_gesture_started_without_direct_hid = (
-            not self._direct_hid_tap_active
-        )
         self._voice_mic_gesture_direct_hid_seen = (
             physical_down and source == "hid_tap"
         )
-        self._voice_mic_gesture_legacy_f5_released = False
         self._voice_mic_gesture_sources_down = {source} if physical_down else set()
-        self._track_legacy_f5_down_snapshot_locked()
         return True
 
     def _finish_voice_mic_gesture(self) -> None:
@@ -978,32 +1040,20 @@ class RC003App:
         self._voice_mic_gesture_audio_stopped = False
         self._voice_mic_gesture_physical_seen = False
         self._voice_mic_gesture_hid_released = False
-        self._voice_mic_gesture_started_without_direct_hid = False
         self._voice_mic_gesture_direct_hid_seen = False
-        self._voice_mic_gesture_legacy_f5_released = False
         self._voice_mic_gesture_sources_down.clear()
 
     def _rollover_completed_voice_mic_gesture_locked(self, next_source: str) -> bool:
         """Detach stale sources once a matched HID release proves a new press."""
 
-        startup_hid_handoff = (
-            next_source == "hid_tap"
-            and self._voice_mic_gesture_started_without_direct_hid
-            and not self._voice_mic_gesture_direct_hid_seen
-        )
         if not (
             self._voice_mic_gesture_active
             and self._voice_mic_gesture_audio_stopped
             and not self._voice.active
-            and (
-                self._voice_mic_gesture_hid_released
-                or startup_hid_handoff
-            )
+            and self._voice_mic_gesture_hid_released
         ):
             return False
         stale_sources = sorted(self._voice_mic_gesture_sources_down)
-        if "legacy_f5" in self._voice_mic_gesture_sources_down:
-            self._legacy_f5_voice_blocked_until_up = True
         self._finish_voice_mic_gesture()
         self._logger.info(
             "voice completed gesture rolled over for new source=%s; "
@@ -1012,44 +1062,6 @@ class RC003App:
             stale_sources,
         )
         return True
-
-    def _track_legacy_f5_down_snapshot_locked(self) -> bool:
-        """Attach the current F5 pair to an existing voice gesture only.
-
-        The caller holds ``_voice_trigger_lock``. The hook lock is held only
-        long enough to copy its down latch; the low-level hook never acquires
-        the voice lock, so this lock order has no reverse path.
-        """
-
-        if (
-            not self._voice_mic_gesture_active
-            or self._voice_mic_gesture_direct_hid_seen
-            or self._legacy_f5_voice_blocked_until_up
-            or self._voice_mic_gesture_legacy_f5_released
-            or "legacy_f5" in self._voice_mic_gesture_sources_down
-        ):
-            return False
-        with self._legacy_f5_hook_lock:
-            legacy_f5_is_down = self._legacy_f5_is_down
-        if not legacy_f5_is_down:
-            return False
-        self._voice_mic_gesture_sources_down.add("legacy_f5")
-        self._logger.info(
-            "voice legacy F5 down attached for release bookkeeping only"
-        )
-        return True
-
-    def _retire_legacy_f5_on_matched_hid_release_locked(self) -> None:
-        """Detach a duplicate F5 pair once matching HID already proved release."""
-
-        if "legacy_f5" not in self._voice_mic_gesture_sources_down:
-            return
-        self._voice_mic_gesture_sources_down.discard("legacy_f5")
-        self._voice_mic_gesture_legacy_f5_released = False
-        self._legacy_f5_voice_blocked_until_up = True
-        self._logger.info(
-            "voice legacy F5 pair retired by matched HID release; late up quarantined"
-        )
 
     def _release_hold_voice_on_physical_release_locked(
         self,
@@ -1184,197 +1196,20 @@ class RC003App:
                     )
                 return True, newly_captured
 
-    def _on_legacy_key_event(self, vk_code: int, is_pressed: bool) -> None:
-        """Deduplicate and queue an already-suppressed legacy F5 edge.
-
-        The callback runs inside WH_KEYBOARD_LL. It only updates the private F5
-        latch and releases that lock before queueing application work, so it
-        never waits for PortAudio or the voice state machine. Voice code may
-        briefly snapshot the latch later. The queued edge may support key
-        detection or an ordinary mic mapping, but never owns the voice shortcut
-        lifecycle.
-        """
-
-        if vk_code != 0x74:
-            return
-        with self._legacy_f5_hook_lock:
-            # Cleanup can close input after the hook callback passed its first
-            # instruction but before it acquired this lock. Recheck here so a
-            # stale callback cannot re-arm the down latch after cleanup reset it.
-            if not self._accept_input_events:
-                return
-            if is_pressed:
-                if self._legacy_f5_is_down:
-                    return
-                self._legacy_f5_is_down = True
-            elif not self._legacy_f5_is_down:
-                return
-            else:
-                self._legacy_f5_is_down = False
-            generation = self._legacy_voice_event_generation
-        try:
-            self._event_loop.call_soon_threadsafe(
-                self._dispatch_legacy_key_event,
-                generation,
-                is_pressed,
-            )
-        except RuntimeError:
-            # The original F5 remains swallowed while the loop is closing.
-            pass
-
-    def _dispatch_legacy_key_event(
+    def _on_raw_button_event(
         self,
-        generation: int,
+        button_id: str,
         is_pressed: bool,
+        source: str = "unknown",
     ) -> None:
-        if (
-            generation != self._legacy_voice_event_generation
-            or not self._accept_input_events
-        ):
-            return
-        if not is_pressed:
-            with self._voice_trigger_lock:
-                if self._legacy_f5_voice_blocked_until_up:
-                    self._legacy_f5_voice_blocked_until_up = False
-                    self._logger.info(
-                        "voice retired legacy F5 up consumed before dispatch"
-                    )
-                    return
-        self._reload_settings_if_changed()
-        mic_action = self._primary_button_action("mic")
-        if self._voice_mode_for_primary_button("mic", mic_action) is None:
-            self._on_button_event("mic", is_pressed, event_source="legacy_f5")
-            return
-        detection_handled, detection_captured = self._handle_key_detection_mic_event(
-            "physical_down" if is_pressed else "physical_up",
-            "legacy_f5",
-        )
-        if detection_handled:
-            if detection_captured:
-                self._logger.info(
-                    "key detection captured button=mic source=legacy_f5; "
-                    "voice action suppressed"
-                )
-            return
-        tracked = self._handle_voice_legacy_f5_edge(is_pressed)
-        if is_pressed and not tracked:
-            self._logger.info(
-                "voice legacy F5 swallowed; HID/ATVV owns the voice session"
-            )
-
-    def _handle_voice_legacy_f5_edge(self, is_pressed: bool) -> bool:
-        """Track an F5 pair only as release bookkeeping for an owned gesture.
-
-        Some Windows stacks report the RC003 microphone down through Raw Input
-        but omit its matching up while still producing the global legacy F5 up.
-        F5 may keep that already-owned gesture open long enough to absorb a late
-        Raw Input down, but it never opens or releases the host shortcut.
-        """
-
-        with self._voice_trigger_lock:
-            if is_pressed:
-                if (
-                    self._voice_mic_gesture_direct_hid_seen
-                    or self._legacy_f5_voice_blocked_until_up
-                    or not self._voice_mic_gesture_active
-                    or self._voice_mic_gesture_legacy_f5_released
-                    or "legacy_f5" in self._voice_mic_gesture_sources_down
-                ):
-                    return False
-                self._voice_mic_gesture_sources_down.add("legacy_f5")
-                self._logger.info(
-                    "voice legacy F5 down attached for release bookkeeping only"
-                )
-                return True
-
-            if (
-                not self._voice_mic_gesture_active
-                or "legacy_f5" not in self._voice_mic_gesture_sources_down
-            ):
-                return False
-
-            self._voice_mic_gesture_sources_down.discard("legacy_f5")
-            self._voice_mic_gesture_legacy_f5_released = True
-            self._logger.info(
-                "voice legacy F5 up recorded for release bookkeeping only"
-            )
-
-            if (
-                self._voice_mic_gesture_audio_stopped
-                and not self._voice.active
-                and not self._voice_mic_gesture_direct_hid_seen
-                and self._voice_mic_gesture_sources_down == {"hid"}
-            ):
-                self._voice_mic_gesture_sources_down.clear()
-                self._logger.info(
-                    "voice missing Raw Input mic up cleared after legacy F5 release"
-                )
-            if (
-                self._voice_mic_gesture_active
-                and not self._voice_mic_gesture_sources_down
-                and not self._voice.active
-                and (
-                    self._voice_mic_gesture_audio_stopped
-                    or not self._voice_mic_gesture_audio_started
-                )
-            ):
-                self._finish_voice_mic_gesture()
-            self._apply_pending_voice_settings_if_idle_locked()
-            return True
-
-    def _on_raw_input_event(self, event: raw_input_windows.RawInputEvent) -> None:
-        """Arm eligible non-direction keyboard edges for duplicate suppression.
-
-        The selected RC003 Raw Input listener is device-scoped; the global
-        low-level keyboard hook is not.  Passing the observed VKey/MakeCode
-        pair across this seam lets the hook swallow only the matching remote
-        edge before the injected mapping action is delivered. Direction keys
-        are intentionally excluded because Raw Input reports them after the
-        foreground application has already received the original key.
-        """
-
-        if not self._accept_input_events:
-            return
-        suppressor = self._legacy_key_suppressor
-        if (
-            suppressor is None
-            or event.source != "keyboard"
-            or event.button_id == "mic"
-            or event.button_id is None
-            or event.vkey is None
-            or event.make_code is None
-        ):
-            return
-        # Raw Input reaches the app after Windows has already delivered the
-        # same arrow to the foreground process. Arming from here is too late:
-        # it can only suppress later repeat/up records while the mapped action
-        # creates a second press. Direction ownership therefore belongs to the
-        # earlier HID tap side channel; without it, Windows keeps its original
-        # arrow behavior unchanged.
-        if event.button_id in _DIRECTION_BUTTON_IDS:
-            return
-        # While the Frida tap side channel is reporting full keyboard
-        # snapshots, it already arms and dispatches every ordinary button on
-        # its own socket thread.  Stand the Raw Input path down so one
-        # physical edge is not armed and dispatched twice.
-        if self._direct_hid_tap_active:
-            return
-        # Only arm a physical edge when this RC003 button has at least one
-        # configured ordinary gesture.  Unknown usages and deliberately
-        # unbound controls must remain ordinary Windows input instead of
-        # being swallowed with no replacement action.
-        if not any(
-            self._is_button_action_configured(event.button_id, trigger)
-            for trigger in button_gesture.ButtonTrigger
-        ) and not self._is_button_combo_participant(event.button_id):
-            return
-        # RAWKEYBOARD uses RI_KEY_E0 (0x02) for the extended prefix; the
-        # low-level hook uses LLKHF_EXTENDED (0x01).
-        suppressor.arm_tracked_key_event(
-            event.vkey,
-            event.make_code,
-            bool((event.flags or 0) & 0x02),
-            event.is_pressed,
+        event_source = {
+            "keyboard": "raw_keyboard",
+            "hid": "raw_hid",
+        }.get(source, "raw_unknown")
+        self._on_button_event(
+            button_id,
+            is_pressed,
+            event_source=event_source,
         )
 
     # -- HID button events --------------------------------------------------
@@ -1426,6 +1261,7 @@ class RC003App:
             self._button_combos.reset()
             self._bindings = self._pending_bindings
             self._pending_bindings = None
+            self._sync_physical_bindings_to_listener(self._bindings)
             self._removed_voice_bindings = dict(
                 self._bindings.get(config.RUNTIME_REMOVED_VOICE_BINDINGS_KEY, {})
             )
@@ -1476,6 +1312,7 @@ class RC003App:
                 self._config = refreshed_config
                 self._button_combos.reset()
                 self._bindings = refreshed_bindings
+                self._sync_physical_bindings_to_listener(self._bindings)
                 self._removed_voice_bindings = removed_voice_bindings
                 self._pending_config = None
                 self._pending_bindings = None
@@ -1565,19 +1402,47 @@ class RC003App:
     ) -> None:
         if not self._accept_input_events:
             return
-        if button_id in _DIRECTION_BUTTON_IDS and event_source != "hid_tap":
-            if is_pressed:
-                if button_id not in self._direction_fallback_buttons_down:
-                    self._direction_fallback_buttons_down.add(button_id)
-                    self._logger.warning(
-                        "RC003 direction mapping bypassed for non-tap input; "
-                        "Windows original retained: button=%s source=%s",
-                        button_id,
-                        event_source,
+        if event_source == "hid_tap":
+            with self._input_arbitration_lock:
+                if not self._direct_hid_interception_ready:
+                    return
+        raw_mapping_bypassed = False
+        if event_source.startswith("raw_"):
+            with self._input_arbitration_lock:
+                if (
+                    self._direct_hid_interception_armed
+                    or self._direct_hid_interception_ready
+                ):
+                    return
+
+                if button_id in self._raw_fallback_buttons_down:
+                    if not is_pressed:
+                        self._raw_fallback_buttons_down.discard(button_id)
+                    raw_mapping_bypassed = True
+
+                elif button_id in self._raw_mapped_buttons_down:
+                    if not is_pressed:
+                        self._raw_mapped_buttons_down.discard(button_id)
+                else:
+                    preserve_windows_original = event_source in {
+                        "raw_keyboard",
+                        "raw_unknown",
+                    } or (
+                        event_source == "raw_hid"
+                        and button_id in _DIRECTION_BUTTON_IDS
                     )
-            else:
-                self._direction_fallback_buttons_down.discard(button_id)
-            return
+                    if preserve_windows_original:
+                        if is_pressed:
+                            self._raw_fallback_buttons_down.add(button_id)
+                            self._logger.warning(
+                                "RC003 mapping bypassed for non-intercepted input; "
+                                "Windows original retained: button=%s source=%s",
+                                button_id,
+                                event_source,
+                            )
+                        raw_mapping_bypassed = True
+                    elif is_pressed:
+                        self._raw_mapped_buttons_down.add(button_id)
         if is_pressed:
             self._record_runtime_button(event_source)
         if button_id == "mic":
@@ -1615,6 +1480,8 @@ class RC003App:
                 button_id,
             )
             return
+        if raw_mapping_bypassed:
+            return
         if button_id == "mic" and self._ordinary_mic_gesture_active:
             self._handle_ordinary_mic_edge(event_source, is_pressed)
             return
@@ -1640,13 +1507,6 @@ class RC003App:
             if voice_mode is None:
                 self._handle_ordinary_mic_edge(event_source, is_pressed)
                 return
-            if event_source == "legacy_f5":
-                self._logger.info(
-                    "voice legacy F5 edge ignored after suppression: pressed=%s",
-                    is_pressed,
-                )
-                return
-
             if not is_pressed:
                 with self._voice_trigger_lock:
                     source_was_down = (
@@ -1662,11 +1522,9 @@ class RC003App:
                         self._apply_pending_voice_settings_if_idle_locked()
                         return
 
-                    self._track_legacy_f5_down_snapshot_locked()
                     matched_hid_released = event_source in {"hid", "hid_tap"}
                     if matched_hid_released:
                         self._voice_mic_gesture_hid_released = True
-                        self._retire_legacy_f5_on_matched_hid_release_locked()
                     self._voice_mic_gesture_sources_down.discard(event_source)
                     if (
                         self._voice.trigger_mode
@@ -1982,8 +1840,13 @@ class RC003App:
 
     # -- ATVV control-channel events (mic button + audio start/stop) ------
 
-    def _on_control_event(self, event: object) -> None:
-        if not self._accept_input_events:
+    def _on_control_event(
+        self,
+        event: object,
+        *,
+        _ble_generation: Optional[int] = None,
+    ) -> None:
+        if not self._accepts_ble_callback(_ble_generation):
             return
         # Some machines expose no usable Raw Input/F5 edge for the mic key,
         # leaving AudioStarted as the first event of the next physical press.
@@ -2176,7 +2039,6 @@ class RC003App:
                 self._voice_raw_input_trigger_pending = False
                 self._unsolicited_mic_close_pending = False
                 if self._voice_mic_gesture_active:
-                    self._track_legacy_f5_down_snapshot_locked()
                     self._voice_mic_gesture_audio_started = False
                     self._voice_mic_gesture_audio_stopped = True
                 action = self._voice.on_audio_stopped()
@@ -2199,17 +2061,6 @@ class RC003App:
                     )
                     self._supervisor.request_reconnect()
                 else:
-                    if (
-                        self._voice_mic_gesture_active
-                        and self._voice_mic_gesture_legacy_f5_released
-                        and not self._voice_mic_gesture_direct_hid_seen
-                        and self._voice_mic_gesture_sources_down == {"hid"}
-                    ):
-                        self._voice_mic_gesture_sources_down.clear()
-                        self._logger.info(
-                            "voice missing Raw Input mic up cleared at audio stop "
-                            "after legacy F5 release"
-                        )
                     if (
                         self._voice_mic_gesture_active
                         and self._voice_mic_gesture_audio_stopped
@@ -2235,7 +2086,7 @@ class RC003App:
         endpoint.
         """
 
-        if not self._accept_input_events:
+        if not self._accept_input_events or not self._accept_ble_events:
             self._voice_pcm_forwarding_enabled = False
             return
 
@@ -2659,14 +2510,19 @@ class RC003App:
                     timing.underflow_count,
                 )
 
-    def _on_pcm_frame(self, samples) -> None:
+    def _on_pcm_frame(
+        self,
+        samples,
+        *,
+        _ble_generation: Optional[int] = None,
+    ) -> None:
         """Queue one immutable PCM frame without blocking the BLE worker."""
 
         with self._voice_trigger_lock:
             sink = self._playback
             if (
                 sink is None
-                or not self._accept_input_events
+                or not self._accepts_ble_callback(_ble_generation)
                 or not self._voice_pcm_forwarding_enabled
             ):
                 return
@@ -2684,6 +2540,7 @@ async def _run(
     tray_factory=None,
     settings_launcher=None,
     show_notification_icon: bool = True,
+    on_runtime_ready=None,
 ) -> None:
     app_factory = app_factory or RC003App
     tray_factory = tray_factory or bridge_tray_windows.BridgeTray
@@ -2707,33 +2564,29 @@ async def _run(
         tray_exit_requested.set()
         loop.call_soon_threadsafe(run_task.cancel)
 
+    if on_runtime_ready is not None:
+        on_runtime_ready(request_exit)
+
     tray = None
     try:
-        try:
-            tray_kwargs = dict(
-                on_open_settings=open_settings,
-                on_exit_requested=request_exit,
-                status_handler=lambda message: app._logger.info(
-                    "notification area: %s", message
-                ),
-            )
-            if not show_notification_icon:
-                tray_kwargs["show_icon"] = False
-            tray = tray_factory(**tray_kwargs)
-            if tray.start():
-                app._logger.info(
-                    "notification area: %s started",
-                    "bridge control icon"
-                    if show_notification_icon
-                    else "hidden bridge control",
+        if show_notification_icon:
+            try:
+                tray = tray_factory(
+                    on_open_settings=open_settings,
+                    on_exit_requested=request_exit,
+                    status_handler=lambda message: app._logger.info(
+                        "notification area: %s", message
+                    ),
                 )
-            else:
-                app._logger.warning(
-                    "notification area unavailable: %s",
-                    tray.startup_error or "unknown_error",
-                )
-        except Exception:
-            app._logger.exception("notification area failed to initialize")
+                if tray.start():
+                    app._logger.info("notification area: bridge control icon started")
+                else:
+                    app._logger.warning(
+                        "notification area unavailable: %s",
+                        tray.startup_error or "unknown_error",
+                    )
+            except Exception:
+                app._logger.exception("notification area failed to initialize")
 
         try:
             await run_task
@@ -2752,32 +2605,20 @@ async def _run(
             )
         finally:
             try:
-                try:
-                    await app.stop()
-                finally:
-                    clear_runtime_status = getattr(app, "clear_runtime_status", None)
-                    if callable(clear_runtime_status):
-                        clear_runtime_status()
+                await app.stop()
             finally:
-                try:
-                    result = (
-                        element_navigation_control_windows.shutdown_element_navigation()
-                    )
-                    if (
-                        result
-                        == element_navigation_control_windows.CommandSendResult.FAILED
-                    ):
-                        app._logger.warning(
-                            "element navigation companion did not stop cleanly"
-                        )
-                except Exception:
-                    app._logger.exception(
-                        "element navigation companion shutdown failed unexpectedly"
-                    )
+                clear_runtime_status = getattr(app, "clear_runtime_status", None)
+                if callable(clear_runtime_status):
+                    clear_runtime_status()
 
 
-def main(*, show_notification_icon: bool = True) -> None:
-    asyncio.run(_run(show_notification_icon=show_notification_icon))
+def main(*, show_notification_icon: bool = True, on_runtime_ready=None) -> None:
+    asyncio.run(
+        _run(
+            show_notification_icon=show_notification_icon,
+            on_runtime_ready=on_runtime_ready,
+        )
+    )
 
 
 if __name__ == "__main__":

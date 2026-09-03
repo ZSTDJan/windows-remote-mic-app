@@ -2,25 +2,19 @@
 built from the standalone ``src/launcher.py`` entry point - see XRBM-021):
 
 - (no args)     open the settings window - the DEFAULT double-click
-                behavior. Settings has its own per-session single-instance
-                guard: a repeat launch restores the existing window without
-                touching BLE/HID/audio or the bridge guard.
+                behavior. One per-session application guard owns the window,
+                notification icon, bridge worker and embedded navigator; a
+                repeat launch restores that existing process.
 - ``--settings``  open the settings window (explicit form of the default)
 - ``--background``  start the desktop shell hidden in the notification area
-- ``--bridge``  run the bridge - guarded by a per-session Windows named-
-                mutex (single_instance.py) so a second concurrent launch
-                never starts BLE/HID/audio: it shows a visible notice and
-                exits with a deterministic nonzero code instead of ever
-                calling ``app.main()``. This guard FAILS CLOSED (XRBM-021
-                review round 1 P1 #1): if the mutex API itself could not be
-                used to prove single ownership - not just a confirmed
-                duplicate - the bridge does not start either. A caller
-                that cannot prove it is the only owner of BLE/HID/audio
-                resources must never gamble on being one anyway.
-- ``--bridge-from-settings``  HIDDEN marker used only together with
-                ``--bridge`` by the settings window. A confirmed duplicate
-                still exits with the same nonzero code, but skips the modal
-                notice so the parent can classify the result immediately.
+- ``--bridge``  compatibility form for old shortcuts. It starts the same
+                desktop application hidden and asks that single process to
+                run its bridge worker; it never creates a second long-lived
+                bridge process.
+- ``--bridge-from-settings``  HIDDEN compatibility marker retained in old
+                launch commands. Current product startup already routes
+                ``--bridge`` to the one desktop process, so the marker has no
+                separate runtime role.
 - ``--dry-run``   import every first-party module and exit 0, touching no
                    GUI, BLE, Raw Input, or audio device - the safe smoke
                   check build-candidate.ps1 and
@@ -72,18 +66,17 @@ built from the standalone ``src/launcher.py`` entry point - see XRBM-021):
                 the verified HID tap injector. It validates the current
                 RC003 WUDFHost target and returns a stable exit code; it never
                  falls through to settings or bridge startup.
-- ``--element-navigation``  HIDDEN companion-process entry point for the
-                  isolated UI Automation navigator. The bridge communicates
-                  with it through a local Win32 command window; it never
-                  falls through to settings or bridge startup.
+- ``--element-navigation``  HIDDEN compatibility entry point for older
+                  standalone navigator launches. Normal product navigation
+                  is hosted by the desktop Qt process; this branch never
+                  falls through to desktop or bridge startup.
 - ``--help``/``-h``  print this usage and exit 0
 
 ``--settings``, ``--bridge``, ``--dry-run``, ``--qt-runtime-check``,
 ``--diagnose-ble-candidates``, ``--diagnose-vb-cable-loopback``,
 ``--preflight-output-endpoint`` and
-``--help``/``-h`` are all checked and dispatched BEFORE the bridge branch
-below is ever reached. Settings uses its own mutex; dry-run, diagnostics and
-help touch neither settings nor bridge ownership.
+``--help``/``-h`` are all checked and dispatched before desktop startup.
+Dry-run, diagnostics and help touch neither application nor bridge ownership.
 """
 
 from __future__ import annotations
@@ -95,8 +88,6 @@ from . import dev_session
 from . import product_identity
 
 SETTINGS_STARTUP_FAILED_EXIT_CODE = 15
-BRIDGE_CONFIG_FAILED_EXIT_CODE = 16
-BRIDGE_RUNTIME_FAILED_EXIT_CODE = 17
 ELEMENT_NAVIGATION_RUNTIME_FAILED_EXIT_CODE = 18
 
 
@@ -111,7 +102,7 @@ def _print_help() -> None:
     print("  python -m ovb_rc003               open the settings window (default)")
     print("  python -m ovb_rc003 --settings    open the settings window")
     print("  python -m ovb_rc003 --background  start hidden in the notification area")
-    print("  python -m ovb_rc003 --bridge      run the bridge")
+    print("  python -m ovb_rc003 --bridge      start hidden and run the bridge")
     print("  python -m ovb_rc003 --dry-run     import every module and exit 0 (CI smoke check)")
     print("  python -m ovb_rc003 --help        show this message and exit 0")
 
@@ -161,6 +152,7 @@ def _dry_run() -> int:
         single_instance,
         startup_windows,
         voice_controller,
+        voice_key_physicalizer_windows,
         win32_input,
         win32_keys,
     )
@@ -196,92 +188,6 @@ def _qt_runtime_check() -> int:
     return 0
 
 
-def _run_bridge(*, quiet_duplicate: bool = False) -> None:
-    """No-argument bridge mode: guarded by the per-session single-instance
-    mutex (XRBM-021 In-scope items 2-3). ``app.main()`` is only ever called
-    from INSIDE the guard's ``with`` block (first owner) - NEVER from any
-    failure branch below. This fails CLOSED (XRBM-021 review round 1 P1
-    #1): a confirmed duplicate and an acquisition failure the guard could
-    not resolve are both treated as "cannot prove sole ownership", so both
-    show a visible notice, exit nonzero, and never start BLE/HID/audio - a
-    caller that cannot verify it is safe must not start anyway.
-
-    ``MutexCleanupError`` (raised from the guard's ``__exit__``, i.e. AFTER
-    ``app.main()`` has already run to completion or raised) is also caught
-    here: the packaged executable is windowed (``console=False``), so an
-    unhandled exception's traceback would never be seen by the user at all
-    - this still needs a visible, SANITIZED notice (not the raw exception
-    text, which is for diagnostics/stderr only) and a deterministic nonzero
-    exit rather than silently disappearing.
-    """
-
-    from . import app, config, device_catalog, single_instance
-
-    try:
-        selected_device_id = device_catalog.normalize_device_id(
-            config.load_config(config.config_path()).get("selected_device_profile")
-        )
-    except Exception as exc:
-        print(
-            f"bridge configuration load failed: error_type={type(exc).__name__}",
-            file=sys.stderr,
-        )
-        single_instance.show_bridge_startup_blocked_notice(
-            f"{product_identity.DISPLAY_NAME}无法读取现有配置，因此不会启动桥接，"
-            "也不会覆盖原配置。"
-            "请先打开设置目录检查 config.json 和 key_bindings.json。"
-        )
-        raise SystemExit(BRIDGE_CONFIG_FAILED_EXIT_CODE)
-    if selected_device_id == device_catalog.DJI_MIC_2_ID:
-        single_instance.show_bridge_startup_blocked_notice(
-            "当前设备是 DJI Mic 2。它由 Windows 作为系统录音输入使用，不需要也不会启动 "
-            f"小米遥控器2 Pro 的蓝牙按键与语音桥接。请在{product_identity.DISPLAY_NAME}"
-            "设置中检查录音端点。",
-            title=product_identity.DISPLAY_NAME,
-        )
-        return
-
-    try:
-        with single_instance.BridgeInstanceGuard():
-            if quiet_duplicate:
-                app.main(show_notification_icon=False)
-            else:
-                app.main()
-    except single_instance.DuplicateInstanceError as exc:
-        if not quiet_duplicate:
-            single_instance.show_bridge_startup_blocked_notice(str(exc))
-        raise SystemExit(single_instance.DUPLICATE_INSTANCE_EXIT_CODE)
-    except single_instance.SingleInstanceUnavailableError as exc:
-        single_instance.show_bridge_startup_blocked_notice(
-            f"{product_identity.DISPLAY_NAME} could not verify no other instance "
-            f"is already running, so it will not start. ({exc})"
-        )
-        raise SystemExit(single_instance.GUARD_UNAVAILABLE_EXIT_CODE)
-    except single_instance.MutexCleanupError as exc:
-        # Diagnostic detail (fixed operation names/error codes only, per
-        # single_instance.py's "no raw handle" contract - see that
-        # exception's own message construction) goes to stderr for anyone
-        # who can see it; the user-visible notice stays a fixed, sanitized
-        # sentence regardless of the exact underlying failure.
-        print(f"single-instance mutex cleanup failed: {exc}", file=sys.stderr)
-        single_instance.show_bridge_startup_blocked_notice(
-            f"{product_identity.DISPLAY_NAME} closed, but could not fully release "
-            "its single-instance lock. If it will not start again, check "
-            "Task Manager for a lingering process before retrying."
-        )
-        raise SystemExit(single_instance.CLEANUP_FAILED_EXIT_CODE)
-    except Exception as exc:
-        print(
-            f"bridge runtime failed: error_type={type(exc).__name__}",
-            file=sys.stderr,
-        )
-        single_instance.show_bridge_startup_blocked_notice(
-            f"{product_identity.DISPLAY_NAME}桥接启动或运行失败，已停止本次进程。"
-            "请打开日志目录查看固定诊断标记后重试。"
-        )
-        raise SystemExit(BRIDGE_RUNTIME_FAILED_EXIT_CODE)
-
-
 def main() -> None:
     args = dev_session.consume_marker(sys.argv[1:])
     if "--help" in args or "-h" in args:
@@ -297,7 +203,7 @@ def main() -> None:
         # this branch (never `return`s, never falls through below), which
         # is itself part of the fail-closed contract: whatever
         # run_ble_diagnostics_subprocess_entrypoint() decides, this process
-        # can never end up calling _run_bridge() by accident. A missing
+        # can never end up starting the desktop application by accident. A missing
         # result-path argument (index out of range) is passed through as
         # None - that function's own contract is to fail closed on that,
         # not this dispatch site's job to second-guess.
@@ -360,10 +266,12 @@ def main() -> None:
         _run_settings(start_hidden=True, activate_duplicate=False)
         return
     if "--bridge" in args:
-        from . import bridge_launcher
-
-        _run_bridge(
-            quiet_duplicate=bridge_launcher.SETTINGS_LAUNCH_FLAG in args
+        # Compatibility for old shortcuts: bridge mode is now the same
+        # desktop application, started hidden with its in-process bridge on.
+        _run_settings(
+            start_hidden=True,
+            start_bridge=True,
+            activate_duplicate=False,
         )
         return
 
@@ -374,19 +282,40 @@ def main() -> None:
 
 
 def _run_settings(
-    *, start_hidden: bool = False, activate_duplicate: bool = True
+    *,
+    start_hidden: bool = False,
+    start_bridge: bool = False,
+    activate_duplicate: bool = True,
 ) -> None:
     from . import settings_ui, single_instance
 
     try:
-        with single_instance.SettingsInstanceGuard():
+        with single_instance.ApplicationInstanceGuard():
             if start_hidden:
-                settings_ui.main(start_hidden=True)
+                settings_ui.main(
+                    start_hidden=True,
+                    start_bridge=start_bridge,
+                )
             else:
-                settings_ui.main()
+                settings_ui.main(start_bridge=start_bridge)
     except single_instance.DuplicateInstanceError:
+        if start_bridge:
+            from . import config
+
+            try:
+                single_instance.write_bridge_start_request(config.config_root())
+            except OSError:
+                single_instance.show_bridge_startup_blocked_notice(
+                    "现有程序正在运行，但无法向它发送启动遥控器服务的请求。"
+                    "请打开现有窗口后手动启动服务。"
+                )
+            return
         if activate_duplicate:
-            single_instance.activate_existing_settings_window()
+            if not single_instance.activate_existing_settings_window():
+                single_instance.show_bridge_startup_blocked_notice(
+                    f"{product_identity.DISPLAY_NAME}已经在运行，但暂时无法唤出窗口。"
+                    "请从通知区域打开现有程序；不要重复启动。"
+                )
         return
     except Exception as exc:
         print(

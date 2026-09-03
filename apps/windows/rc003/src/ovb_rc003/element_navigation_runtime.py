@@ -1,4 +1,4 @@
-"""Loads the single element-navigation source into its companion process."""
+"""Load the shared navigator for embedded product and compatibility runs."""
 
 from __future__ import annotations
 
@@ -78,4 +78,14 @@ def run_element_navigation(arguments: Sequence[str]) -> int:
         return single_instance.DUPLICATE_INSTANCE_EXIT_CODE
 
 
-__all__ = ("navigation_source_directory", "run_element_navigation")
+def start_embedded_element_navigation(application: object):
+    """Start the navigator inside the existing desktop Qt process."""
+
+    return _load_prototype().start_embedded(application)
+
+
+__all__ = (
+    "navigation_source_directory",
+    "run_element_navigation",
+    "start_embedded_element_navigation",
+)

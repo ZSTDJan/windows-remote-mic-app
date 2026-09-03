@@ -1,8 +1,8 @@
-"""Lifecycle and Win32 command channel for the element navigator.
+"""Element-navigation control for embedded and compatibility runtimes.
 
-The bridge never performs UI Automation work in-process. It sends a small
-command to one companion process, or starts that companion and delivers the
-queued command as soon as its hidden command window is ready.
+Normal product startup binds the navigator hosted by the desktop Qt loop.
+The process-launch and Win32 command client remains only for older standalone
+entry points and deterministic compatibility tests.
 """
 
 from __future__ import annotations
@@ -159,7 +159,7 @@ def build_element_navigation_command(
     executable: Optional[str] = None,
     owner_pid: Optional[int] = None,
 ) -> list[str]:
-    """Build the hidden companion command for source and frozen runs."""
+    """Build the hidden compatibility command for source and frozen runs."""
 
     if frozen is None:
         frozen = bool(getattr(sys, "frozen", False))
@@ -286,7 +286,7 @@ def send_element_navigation_command(
 
 
 class ElementNavigationClient:
-    """Non-blocking bridge-side controller with ordered startup delivery."""
+    """Compatibility controller for the older standalone navigator."""
 
     def __init__(
         self,
@@ -557,7 +557,62 @@ class ElementNavigationClient:
                 )
 
 
-_DEFAULT_CLIENT = ElementNavigationClient()
+class EmbeddedElementNavigationClient:
+    """Thread-safe handle for the navigator hosted by the desktop Qt loop."""
+
+    def __init__(
+        self,
+        *,
+        foreground_window: Callable[[], int] = _real_foreground_window,
+    ) -> None:
+        self._foreground_window = foreground_window
+        self._lock = threading.Lock()
+        self._runtime: Optional[object] = None
+
+    def bind(self, runtime: Optional[object]) -> None:
+        with self._lock:
+            self._runtime = runtime
+
+    def toggle(self) -> ToggleResult:
+        with self._lock:
+            runtime = self._runtime
+        if runtime is None:
+            return ToggleResult(
+                ToggleResultKind.FAILED,
+                0,
+                error="embedded_navigation_unavailable",
+            )
+        try:
+            target_hwnd = max(0, int(self._foreground_window()))
+            runtime.toggle(target_hwnd)
+        except Exception as exc:
+            return ToggleResult(
+                ToggleResultKind.FAILED,
+                0,
+                error=type(exc).__name__,
+            )
+        return ToggleResult(ToggleResultKind.DELIVERED, target_hwnd)
+
+    def shutdown(self) -> CommandSendResult:
+        with self._lock:
+            runtime = self._runtime
+        if runtime is None:
+            return CommandSendResult.NOT_RUNNING
+        try:
+            runtime.shutdown()
+        except Exception:
+            return CommandSendResult.FAILED
+        with self._lock:
+            if self._runtime is runtime:
+                self._runtime = None
+        return CommandSendResult.DELIVERED
+
+
+_DEFAULT_CLIENT = EmbeddedElementNavigationClient()
+
+
+def bind_embedded_element_navigation(runtime: Optional[object]) -> None:
+    _DEFAULT_CLIENT.bind(runtime)
 
 
 def toggle_element_navigation() -> ToggleResult:

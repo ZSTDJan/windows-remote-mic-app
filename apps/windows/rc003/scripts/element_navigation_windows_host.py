@@ -27,7 +27,47 @@ from element_navigation_command_windows import (
 )
 
 
-def _run_windows(args: argparse.Namespace) -> int:
+def _stop_resources_best_effort(
+    resources: Sequence[tuple[str, Callable[[], None]]],
+) -> list[str]:
+    """Attempt every cleanup step and return sanitized failure markers."""
+
+    failures: list[str] = []
+    for name, stop in resources:
+        try:
+            stop()
+        except Exception as exc:
+            failures.append(f"{name}:{type(exc).__name__}")
+    return failures
+
+
+class EmbeddedElementNavigationRuntime:
+    """In-process control surface owned by the main desktop application."""
+
+    def __init__(
+        self,
+        enqueue_command: Callable[[int, int], None],
+        cleanup: Callable[[], None],
+    ) -> None:
+        self._enqueue_command = enqueue_command
+        self._cleanup = cleanup
+
+    def toggle(self, target_hwnd: int = 0) -> None:
+        self._enqueue_command(
+            ELEMENT_NAVIGATION_COMMAND_TOGGLE,
+            max(0, int(target_hwnd)),
+        )
+
+    def shutdown(self) -> None:
+        self._cleanup()
+
+
+def _run_windows(
+    args: argparse.Namespace,
+    *,
+    application: Any = None,
+    run_event_loop: bool = True,
+) -> int | EmbeddedElementNavigationRuntime:
     # uiautomation opts into legacy system-DPI awareness during import. Set
     # per-monitor v2 first so Qt and UIA agree on mixed-DPI screen coordinates.
     dpi_user32 = ctypes.windll.user32
@@ -1575,8 +1615,12 @@ def _run_windows(args: argparse.Namespace) -> int:
                     self._refresh_cancel_requested.clear()
 
         def stop(self) -> None:
+            if not self._thread.is_alive():
+                return
             self.post("stop")
             self._thread.join(timeout=2)
+            if self._thread.is_alive():
+                raise RuntimeError("元素导航自动化线程未能及时退出")
 
         @staticmethod
         def _same_identity(first: TargetSnapshot, second: TargetSnapshot) -> bool:
@@ -2928,6 +2972,8 @@ def _run_windows(args: argparse.Namespace) -> int:
             )
 
         def stop(self) -> None:
+            if not self._thread.is_alive():
+                return
             if self._thread_id and self._thread.is_alive():
                 if not user32.PostThreadMessageW(
                     self._thread_id, self.WM_QUIT, 0, 0
@@ -2935,7 +2981,7 @@ def _run_windows(args: argparse.Namespace) -> int:
                     print("界面变化监听退出消息发送失败。", file=sys.stderr)
             self._thread.join(timeout=3)
             if self._thread.is_alive():
-                print("界面变化监听未能及时退出。", file=sys.stderr)
+                raise RuntimeError("界面变化监听未能及时退出")
 
         def _handle(
             self,
@@ -3063,9 +3109,13 @@ def _run_windows(args: argparse.Namespace) -> int:
                 raise RuntimeError("无法安装全局键盘钩子")
 
         def stop(self) -> None:
+            if not self._thread.is_alive():
+                return
             if self._thread_id:
                 user32.PostThreadMessageW(self._thread_id, self.WM_QUIT, 0, 0)
             self._thread.join(timeout=2)
+            if self._thread.is_alive():
+                raise RuntimeError("全局键盘钩子未能及时退出")
 
         def _pressed(self, vk: int) -> bool:
             return bool(user32.GetAsyncKeyState(vk) & 0x8000)
@@ -3218,12 +3268,14 @@ def _run_windows(args: argparse.Namespace) -> int:
         finally:
             auto.UninitializeUIAutomationInCurrentThread()
 
-    app = QApplication(sys.argv[:1])
-    app.setApplicationName("元素导航")
+    app = application or QApplication.instance() or QApplication(sys.argv[:1])
+    if not isinstance(app, QApplication):
+        raise RuntimeError("元素导航必须由 QApplication 主进程承载")
+    if application is None:
+        app.setApplicationName("元素导航")
     prototype_process_id = int(kernel32.GetCurrentProcessId())
     overlay = NavigationOverlay()
     worker = AutomationWorker(diagnostics_enabled=bool(args.diagnostics))
-    worker.start()
     keyboard_events: queue.Queue[tuple[str, int]] = queue.Queue()
     active = threading.Event()
     intercepting = threading.Event()
@@ -3259,21 +3311,10 @@ def _run_windows(args: argparse.Namespace) -> int:
         intercepting,
         include_developer_hotkeys=include_developer_hotkeys,
     )
-    hook.start()
     structure_watcher = StructureChangeWatcher()
-    if not structure_watcher.start():
-        print(
-            "界面变化监听未完整启用，将按缓存时限兜底刷新。",
-            file=sys.stderr,
-        )
-    command_server = ElementNavigationCommandServer(enqueue_external_command)
-    try:
-        command_server.start()
-    except Exception:
-        hook.stop()
-        structure_watcher.stop()
-        worker.stop()
-        raise
+    command_server = None
+
+    cleanup_callback: list[Callable[[], None]] = [lambda: None]
 
     def leave_navigation() -> None:
         nonlocal navigation_root_hwnd, navigation_process_id
@@ -3296,7 +3337,10 @@ def _run_windows(args: argparse.Namespace) -> int:
             return
         shutting_down = True
         leave_navigation()
-        app.quit()
+        if run_event_loop:
+            app.quit()
+        else:
+            cleanup_callback[0]()
 
     def refresh_navigation_overlay_signature(*, force: bool = False) -> bool:
         nonlocal navigation_overlay_signature, navigation_overlay_checked_at
@@ -3564,7 +3608,6 @@ def _run_windows(args: argparse.Namespace) -> int:
 
     timer = QTimer()
     timer.timeout.connect(drain_events)
-    timer.start(20)
 
     def monitor_navigation_context() -> None:
         nonlocal prewarm_observed_hwnd, prewarm_observed_at, prewarm_requested_hwnd
@@ -3610,7 +3653,6 @@ def _run_windows(args: argparse.Namespace) -> int:
 
     geometry_timer = QTimer()
     geometry_timer.timeout.connect(monitor_navigation_context)
-    geometry_timer.start(250)
 
     owner_timer = QTimer()
 
@@ -3620,7 +3662,6 @@ def _run_windows(args: argparse.Namespace) -> int:
 
     if managed_companion and owner_pid > 0:
         owner_timer.timeout.connect(monitor_owner_process)
-        owner_timer.start(500)
 
     cleanup_complete = False
 
@@ -3628,20 +3669,64 @@ def _run_windows(args: argparse.Namespace) -> int:
         nonlocal cleanup_complete
         if cleanup_complete:
             return
-        cleanup_complete = True
-        command_server.stop()
-        hook.stop()
-        structure_watcher.stop()
-        worker.stop()
-
-    app.aboutToQuit.connect(cleanup)
-    if managed_companion and owner_pid > 0:
-        QTimer.singleShot(0, monitor_owner_process)
-    if bool(getattr(args, "activate", False)):
-        enqueue_external_command(
-            ELEMENT_NAVIGATION_COMMAND_TOGGLE,
-            int(getattr(args, "window_handle", 0) or 0),
+        resources = [
+            # Stop intercepting first. Even if the hook thread itself cannot
+            # exit, it must immediately pass physical keys through to Windows.
+            ("deactivate", leave_navigation),
+            ("event_timer", timer.stop),
+            ("geometry_timer", geometry_timer.stop),
+            ("owner_timer", owner_timer.stop),
+        ]
+        if command_server is not None:
+            resources.append(("command_server", command_server.stop))
+        resources.extend(
+            (
+                ("keyboard_hook", hook.stop),
+                ("structure_watcher", structure_watcher.stop),
+                ("automation_worker", worker.stop),
+                ("overlay", overlay.clear_target),
+            )
         )
+        failures = _stop_resources_best_effort(resources)
+        if failures:
+            raise RuntimeError(
+                "元素导航未能完整退出：" + ",".join(failures)
+            )
+        cleanup_complete = True
+
+    cleanup_callback[0] = cleanup
+
+    try:
+        app.aboutToQuit.connect(cleanup)
+        worker.start()
+        hook.start()
+        if not structure_watcher.start():
+            print(
+                "界面变化监听未完整启用，将按缓存时限兜底刷新。",
+                file=sys.stderr,
+            )
+        if run_event_loop:
+            command_server = ElementNavigationCommandServer(enqueue_external_command)
+            command_server.start()
+        timer.start(20)
+        geometry_timer.start(250)
+        if managed_companion and owner_pid > 0:
+            owner_timer.start(500)
+            QTimer.singleShot(0, monitor_owner_process)
+        if bool(getattr(args, "activate", False)):
+            enqueue_external_command(
+                ELEMENT_NAVIGATION_COMMAND_TOGGLE,
+                int(getattr(args, "window_handle", 0) or 0),
+            )
+    except Exception as startup_error:
+        try:
+            cleanup()
+        except Exception as cleanup_error:
+            raise RuntimeError(
+                "元素导航启动失败且未能完整清理："
+                f"{type(cleanup_error).__name__}"
+            ) from startup_error
+        raise
     print("元素导航已启动。")
     controls = (
         "Ctrl+Alt+N 开始/退出，方向键移动，PageUp/PageDown 切换父子元素，"
@@ -3652,10 +3737,15 @@ def _run_windows(args: argparse.Namespace) -> int:
     print(controls)
     if diagnostics_enabled:
         print("导航诊断已开启。每次方向移动都会解释候选排序。")
+    if not run_event_loop:
+        return EmbeddedElementNavigationRuntime(
+            enqueue_external_command,
+            cleanup,
+        )
     try:
         return int(app.exec())
     finally:
         cleanup()
 
 
-__all__ = ("_run_windows",)
+__all__ = ("EmbeddedElementNavigationRuntime", "_run_windows")

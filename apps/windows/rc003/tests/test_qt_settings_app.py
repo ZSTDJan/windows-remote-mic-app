@@ -21,6 +21,7 @@ cannot prove any other way.
 """
 
 import json
+import logging
 import os
 import sys
 import tempfile
@@ -426,7 +427,13 @@ class SettingsControllerTests(unittest.TestCase):
         self.Model = classes["ButtonMappingModel"]
         self.Controller = classes["SettingsController"]
         self._tmpdir = tempfile.TemporaryDirectory()
-        self._env_patch = mock.patch.dict(os.environ, {"LOCALAPPDATA": self._tmpdir.name})
+        self._env_patch = mock.patch.dict(
+            os.environ,
+            {
+                "LOCALAPPDATA": self._tmpdir.name,
+                "RC003_DISABLE_LIVE_INPUT": "1",
+            },
+        )
         self._env_patch.start()
         self._bridge_status_patch = mock.patch.object(
             qt_settings_app.single_instance,
@@ -608,6 +615,24 @@ class SettingsControllerTests(unittest.TestCase):
 
         self.assertEqual(calls, [True])
         self.assertFalse(controller.launchAtLogin)
+
+    def test_application_start_migrates_a_legacy_bridge_into_this_process(self):
+        controller, _model = self._make_controller()
+        controller._set_bridge_running(True)
+        recoveries = []
+
+        with mock.patch.object(
+            qt_settings_app.bridge_launcher,
+            "in_process_bridge_running",
+            return_value=False,
+        ), mock.patch.object(
+            controller,
+            "_begin_bridge_restart",
+            side_effect=lambda **kwargs: recoveries.append(kwargs),
+        ):
+            controller.startBridgeOnApplicationStart()
+
+        self.assertEqual(recoveries, [{"automatic": True}])
 
     def test_full_exit_without_a_bridge_is_immediate(self):
         controller, _model = self._make_controller()
@@ -2767,6 +2792,20 @@ class SettingsControllerTests(unittest.TestCase):
 
         start_launch.assert_called_once_with()
 
+    def test_external_bridge_request_starts_the_existing_desktop_process_once(self):
+        controller, _ = self._make_controller()
+        single_instance.write_bridge_start_request(controller._config_root)
+
+        with mock.patch.object(
+            controller,
+            "_refresh_bridge_status",
+            return_value=False,
+        ), mock.patch.object(controller, "startBridge") as start_bridge:
+            controller.refreshBridgeState()
+            controller.refreshBridgeState()
+
+        start_bridge.assert_called_once_with()
+
     def test_start_bridge_rejects_output_configuration_work(self):
         blockers = (
             (
@@ -3490,6 +3529,13 @@ class SettingsControllerTests(unittest.TestCase):
             return_value=True,
         )
         self._bridge_status_patch.start()
+        bridge_runtime_status.publish_status(
+            controller._config_root,
+            bridge_runtime_status.BridgeConnectionState.CONNECTED,
+            pid=4321,
+            raw_input_state="ready",
+            hid_tap_state=frida_compat.HidTapState.UNAVAILABLE.value,
+        )
 
         with mock.patch.object(
             qt_settings_app.raw_input_windows,
@@ -3527,6 +3573,13 @@ class SettingsControllerTests(unittest.TestCase):
             return_value=True,
         )
         self._bridge_status_patch.start()
+        bridge_runtime_status.publish_status(
+            controller._config_root,
+            bridge_runtime_status.BridgeConnectionState.CONNECTED,
+            pid=4321,
+            raw_input_state="ready",
+            hid_tap_state=frida_compat.HidTapState.UNAVAILABLE.value,
+        )
         controller.startKeyDetection()
         request = controller._key_detection_bridge_request
         controller._key_detection_started_at -= (
@@ -3538,6 +3591,33 @@ class SettingsControllerTests(unittest.TestCase):
         self.assertFalse(controller.keyDetectionActive)
         self.assertFalse(request.request_path.exists())
         self.assertIn("超时", controller.keyDetectionText)
+
+    def test_running_bridge_without_a_ready_input_channel_fails_immediately(self):
+        controller, _ = self._make_controller()
+        self._bridge_status_patch.stop()
+        self._bridge_status_patch = mock.patch.object(
+            qt_settings_app.single_instance,
+            "bridge_instance_running",
+            return_value=True,
+        )
+        self._bridge_status_patch.start()
+        bridge_runtime_status.publish_status(
+            controller._config_root,
+            bridge_runtime_status.BridgeConnectionState.WAITING_FOR_DEVICE,
+            pid=4321,
+            raw_input_state="failed",
+            hid_tap_state=frida_compat.HidTapState.UNAVAILABLE.value,
+        )
+
+        with mock.patch.object(
+            qt_settings_app.key_detection_bridge,
+            "request_detection",
+        ) as request_detection:
+            controller.startKeyDetection()
+
+        request_detection.assert_not_called()
+        self.assertFalse(controller.keyDetectionActive)
+        self.assertIn("没有可用的按键通道", controller.keyDetectionText)
 
     def test_open_log_location_reports_honestly_when_never_run(self):
         controller, _ = self._make_controller()
@@ -4747,12 +4827,23 @@ class RunSettingsWindowShutdownCoverageTests(unittest.TestCase):
 
     def setUp(self):
         self._tmpdir = tempfile.TemporaryDirectory()
-        self._env_patch = mock.patch.dict(os.environ, {"LOCALAPPDATA": self._tmpdir.name})
+        self._env_patch = mock.patch.dict(
+            os.environ,
+            {
+                "LOCALAPPDATA": self._tmpdir.name,
+                "RC003_DISABLE_LIVE_INPUT": "1",
+            },
+        )
         self._env_patch.start()
         qt_settings_app._diagnostics_shutdown_event.clear()
 
     def tearDown(self):
         qt_settings_app._diagnostics_shutdown_event.clear()
+        logger = logging.getLogger(qt_settings_app.logging_setup.LOGGER_NAME)
+        for handler in list(logger.handlers):
+            handler.close()
+            logger.removeHandler(handler)
+        qt_settings_app.logging_setup._configured = False
         self._env_patch.stop()
         self._tmpdir.cleanup()
 
@@ -4863,6 +4954,35 @@ class RunSettingsWindowShutdownCoverageTests(unittest.TestCase):
             self.assertEqual(qt_settings_app.run_settings_window(), 0)
 
         marker.assert_called_once_with(4321)
+
+    def test_live_navigation_is_bound_and_shutdown_with_the_desktop_app(self):
+        runtime = object()
+        fake_classes = self._fake_classes(root_objects=[object()], exec_return=0)
+        with mock.patch.dict(
+            os.environ,
+            {"RC003_DISABLE_LIVE_INPUT": "0"},
+        ), mock.patch.object(
+            qt_settings_app, "_load_qt_classes", return_value=fake_classes
+        ), mock.patch.object(
+            qt_settings_app.sys, "platform", "win32"
+        ), mock.patch.object(
+            qt_settings_app.element_navigation_runtime,
+            "start_embedded_element_navigation",
+            return_value=runtime,
+        ) as start_navigation, mock.patch.object(
+            qt_settings_app.element_navigation_control_windows,
+            "bind_embedded_element_navigation",
+        ) as bind_navigation, mock.patch.object(
+            qt_settings_app.element_navigation_control_windows,
+            "shutdown_element_navigation",
+            return_value=qt_settings_app.element_navigation_control_windows.CommandSendResult.DELIVERED,
+        ) as shutdown_navigation:
+            self.assertEqual(qt_settings_app.run_settings_window(), 0)
+
+        start_navigation.assert_called_once()
+        self.assertIs(start_navigation.call_args.args[0].__class__, fake_classes["QGuiApplication"])
+        bind_navigation.assert_called_once_with(runtime)
+        shutdown_navigation.assert_called_once_with()
 
     def test_settings_cleanup_failure_cannot_skip_diagnostics_shutdown(self):
         fake_classes = self._fake_classes(root_objects=[object()], exec_return=0)
@@ -6946,6 +7066,7 @@ class ApplicationExitIntegrationTests(unittest.TestCase):
             env = dict(os.environ)
             env.setdefault("QT_QPA_PLATFORM", "offscreen")
             env["LOCALAPPDATA"] = tmpdir
+            env["RC003_DISABLE_LIVE_INPUT"] = "1"
             result = subprocess.run(
                 [sys.executable, "-c", _APPLICATION_EXIT_PROBE_SCRIPT],
                 env=env,

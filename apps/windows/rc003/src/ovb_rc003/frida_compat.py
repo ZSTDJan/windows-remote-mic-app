@@ -64,39 +64,22 @@ MISSING_USAGE_TO_BUTTON = {
 }
 
 # The tap observes the full 6-byte keyboard report (three little-endian 16-bit
-# usages), not just the three usages Windows' keyboard class drops.  Reporting
-# every known RC003 keyboard usage lets the application arm its duplicate
-# suppressor from the tap's socket thread - a side channel the low-level hook
-# does not block, unlike the WM_INPUT arm that arrives too late (measured
-# ~63-72ms after the hook on the RC003).
+# usages), not just the three usages Windows' keyboard class drops. Reporting
+# every known RC003 keyboard usage gives one authoritative mapping source after
+# the Gadget has copied and cleared that report before Windows translates it.
 TAP_USAGE_TO_BUTTON = dict(MISSING_USAGE_TO_BUTTON)
 for _usage, _button in BUTTON_USAGE_IDS.items():
     TAP_USAGE_TO_BUTTON.setdefault(_usage, _button)
-
-# usage -> (VK, make code, extended) matching what Windows' keyboard class
-# reports for the same physical key, so the hook's consume() sees identical
-# vk/scan/extended values whether the arm came from Raw Input or from the tap.
-TAP_USAGE_TO_KEY = {
-    0x0028: (0x0D, 0x1C, False),  # ok / Enter
-    0x0035: (0xC0, 0x29, False),  # tv / grave accent
-    0x003E: (0x74, 0x3F, False),  # mic / F5 (voice path, never armed)
-    0x004A: (0x24, 0x47, True),  # home
-    0x004F: (0x27, 0x4D, True),  # right
-    0x0050: (0x25, 0x4B, True),  # left
-    0x0051: (0x28, 0x50, True),  # down
-    0x0052: (0x26, 0x48, True),  # up
-    0x0065: (0x5D, 0x5D, True),  # menu / App key
-    0x0066: (0xFF, 0x5E, True),  # power (untranslated VK)
-    0x007F: (0xAD, 0x20, True),  # volume_mute
-    0x0080: (0xAF, 0x30, True),  # volume_up
-    0x0081: (0xAE, 0x2E, True),  # volume_down
-    0x00F1: (0xFF, 0x6A, True),  # back (untranslated VK)
-}
 
 HID_TAP_INJECTOR_FLAG = "--rc003-hid-injector"
 HID_TAP_INJECTOR_TIMEOUT_SECONDS = 30.0
 HID_TAP_CONNECTION_TIMEOUT_SECONDS = 10.0
 HID_TAP_MAX_BUFFER_BYTES = 64 * 1024
+HID_INTERCEPT_PROTOCOL = 3
+HID_INTERCEPT_LEASE_SECONDS = 2.0
+HID_INTERCEPT_RENEW_INTERVAL_SECONDS = 0.5
+HID_INTERCEPT_DISABLE_ACK_TIMEOUT_SECONDS = 0.5
+HID_INTERCEPT_LEASE_SAFETY_SECONDS = 0.15
 _ERROR_INSUFFICIENT_BUFFER = 122
 _TCP_TABLE_OWNER_PID_ALL = 5
 HID_TAP_INJECTOR_EXIT_DETAILS = {
@@ -413,9 +396,16 @@ class RC003HidReportTap:
         self.injector = injector
         self.client_pid_resolver = client_pid_resolver
         self.stop_event = threading.Event()
+        self._stop_requested_event = threading.Event()
         self.thread: threading.Thread | None = None
         self.active_usages: set[int] = set()
         self._state_lock = threading.Lock()
+        self._client_lock = threading.Lock()
+        self._control_send_lock = threading.Lock()
+        self._client: socket.socket | None = None
+        self._interception_enabled = False
+        self._lease_deadline = 0.0
+        self._disable_ack_event = threading.Event()
         self._status = self._initial_status()
         self._status_detail = ""
 
@@ -476,6 +466,88 @@ class RC003HidReportTap:
             value.to_bytes(2, "little") for value in sorted(active)
         )
         self.report_handler(1, (filtered + b"\x00" * 6)[:6])
+
+    def _set_client(self, client: socket.socket | None) -> None:
+        with self._client_lock:
+            self._client = client
+            if client is None:
+                self._interception_enabled = False
+                self._lease_deadline = 0.0
+
+    def _send_control(self, client: socket.socket, action: str) -> str:
+        with self._control_send_lock:
+            if (
+                action in {"enable", "renew"}
+                and self._stop_requested_event.is_set()
+            ):
+                action = "disable"
+            payload = {
+                "kind": "intercept_control",
+                "action": action,
+                "protocol": HID_INTERCEPT_PROTOCOL,
+            }
+            if action in {"enable", "renew"}:
+                payload["lease_ms"] = int(HID_INTERCEPT_LEASE_SECONDS * 1000)
+            encoded = (json.dumps(payload, separators=(",", ":")) + "\n").encode(
+                "ascii"
+            )
+            client.sendall(encoded)
+        return action
+
+    def _record_control_ack(self, message: dict) -> bool:
+        if (
+            message.get("protocol") != HID_INTERCEPT_PROTOCOL
+            or message.get("accepted") is not True
+        ):
+            self._set_status(HidTapState.FAILED, "gadget_control_rejected")
+            return False
+        action = message.get("action")
+        state = message.get("state")
+        with self._client_lock:
+            if action in {"enable", "renew"} and state == "enabled":
+                self._interception_enabled = True
+                self._lease_deadline = (
+                    time.monotonic() + HID_INTERCEPT_LEASE_SECONDS
+                )
+                return True
+            if action == "disable" and state == "disabled":
+                self._interception_enabled = False
+                self._lease_deadline = 0.0
+                self._disable_ack_event.set()
+                return True
+        self._set_status(HidTapState.FAILED, "gadget_control_ack_invalid")
+        return False
+
+    def _disable_interception_before_stop(self) -> None:
+        with self._client_lock:
+            client = self._client
+            lease_deadline = self._lease_deadline
+        if client is None:
+            return
+
+        self._disable_ack_event.clear()
+        sent = False
+        try:
+            self._send_control(client, "disable")
+            sent = True
+        except OSError:
+            pass
+        if sent and self._disable_ack_event.wait(
+            HID_INTERCEPT_DISABLE_ACK_TIMEOUT_SECONDS
+        ):
+            return
+
+        # A delivered enable may be awaiting its acknowledgement when stop()
+        # begins. Waiting one full bounded lease is therefore the only safe
+        # fallback if the explicit disable acknowledgement does not arrive.
+        remaining = max(
+            lease_deadline - time.monotonic(),
+            HID_INTERCEPT_LEASE_SECONDS,
+        )
+        time.sleep(remaining + HID_INTERCEPT_LEASE_SAFETY_SECONDS)
+        with self._client_lock:
+            self._interception_enabled = False
+            self._lease_deadline = 0.0
 
     def _run_guarded(self) -> None:
         try:
@@ -563,12 +635,18 @@ class RC003HidReportTap:
                     except OSError:
                         pass
                     continue
-                client.settimeout(1.0)
+                client.settimeout(0.25)
+                self._set_client(client)
                 try:
-                    self._set_status(HidTapState.ATTACHED_WAITING_IO)
+                    self._set_status(
+                        HidTapState.WAITING_CONNECTION,
+                        "gadget_handshake_pending",
+                    )
                     buffer = b""
                     last_heartbeat = time.monotonic()
                     io_verified = False
+                    control_enabled = False
+                    next_lease_renewal = 0.0
                     while not self.stop_event.is_set():
                         if frida_hid_tap_runtime.find_rc003_hidogatt_host_pid() != pid:
                             self._set_status(HidTapState.WAITING_HOST, "host_changed")
@@ -613,9 +691,77 @@ class RC003HidReportTap:
                                         )
                                         fatal_message = True
                                         break
+                                    if message.get("protocol") != HID_INTERCEPT_PROTOCOL:
+                                        self._set_status(
+                                            HidTapState.FAILED,
+                                            "gadget_intercept_protocol_mismatch",
+                                        )
+                                        fatal_message = True
+                                        break
+                                    action = (
+                                        "disable"
+                                        if self._stop_requested_event.is_set()
+                                        else "enable"
+                                    )
+                                    try:
+                                        self._send_control(client, action)
+                                    except OSError:
+                                        self._set_status(
+                                            HidTapState.UNHEALTHY,
+                                            "gadget_control_send_failed",
+                                        )
+                                        fatal_message = True
+                                        break
                                 elif kind == "heartbeat":
                                     last_heartbeat = time.monotonic()
+                                elif kind == "control_ack":
+                                    if not self._record_control_ack(message):
+                                        fatal_message = True
+                                        break
+                                    action = message.get("action")
+                                    if action in {"enable", "renew"}:
+                                        control_enabled = True
+                                        next_lease_renewal = (
+                                            time.monotonic()
+                                            + HID_INTERCEPT_RENEW_INTERVAL_SECONDS
+                                        )
+                                        if not io_verified:
+                                            self._set_status(
+                                                HidTapState.ATTACHED_WAITING_IO,
+                                                "hid_interception_armed",
+                                            )
+                                    elif action == "disable":
+                                        control_enabled = False
+                                        self._release_active()
+                                elif kind == "intercept_expired":
+                                    if message.get("protocol") != HID_INTERCEPT_PROTOCOL:
+                                        self._set_status(
+                                            HidTapState.FAILED,
+                                            "gadget_intercept_protocol_mismatch",
+                                        )
+                                    else:
+                                        self._set_status(
+                                            HidTapState.UNHEALTHY,
+                                            "gadget_intercept_lease_expired",
+                                        )
+                                    control_enabled = False
+                                    self._release_active()
+                                    fatal_message = True
+                                    break
                                 elif kind == "gatt_read":
+                                    if (
+                                        not control_enabled
+                                        or
+                                        message.get("protocol")
+                                        != HID_INTERCEPT_PROTOCOL
+                                        or message.get("intercepted") is not True
+                                    ):
+                                        self._set_status(
+                                            HidTapState.FAILED,
+                                            "gadget_report_not_intercepted",
+                                        )
+                                        fatal_message = True
+                                        break
                                     raw = message.get("raw", "")
                                     try:
                                         data = bytes.fromhex(raw)
@@ -623,7 +769,10 @@ class RC003HidReportTap:
                                         data = b""
                                     if decode_rc003_ioctl_output(data) is not None:
                                         io_verified = True
-                                        self._set_status(HidTapState.READY, "hid_io_verified")
+                                        self._set_status(
+                                            HidTapState.READY,
+                                            "hid_interception_verified",
+                                        )
                                         self._handle_ioctl_output(data)
                                 elif kind == "error":
                                     self._set_status(HidTapState.FAILED, "gadget_hook_error")
@@ -632,6 +781,25 @@ class RC003HidReportTap:
                             if fatal_message:
                                 break
                         now = time.monotonic()
+                        if (
+                            control_enabled
+                            and not self._stop_requested_event.is_set()
+                            and now >= next_lease_renewal
+                        ):
+                            try:
+                                sent_action = self._send_control(client, "renew")
+                            except OSError:
+                                self._set_status(
+                                    HidTapState.UNHEALTHY,
+                                    "gadget_control_send_failed",
+                                )
+                                break
+                            if sent_action == "renew":
+                                next_lease_renewal = (
+                                    now + HID_INTERCEPT_RENEW_INTERVAL_SECONDS
+                                )
+                            else:
+                                control_enabled = False
                         if now - last_heartbeat >= self.heartbeat_timeout:
                             self._set_status(
                                 HidTapState.UNHEALTHY,
@@ -639,8 +807,12 @@ class RC003HidReportTap:
                             )
                             break
                         if io_verified:
-                            self._set_status(HidTapState.READY, "hid_io_verified")
+                            self._set_status(
+                                HidTapState.READY,
+                                "hid_interception_verified",
+                            )
                 finally:
+                    self._set_client(None)
                     try:
                         client.close()
                     except OSError:
@@ -660,6 +832,7 @@ class RC003HidReportTap:
             return False
         if self.thread is not None and self.thread.is_alive():
             return True
+        self._stop_requested_event.clear()
         self.stop_event.clear()
         self._set_status(HidTapState.STARTING)
         self.thread = threading.Thread(
@@ -671,6 +844,8 @@ class RC003HidReportTap:
         return True
 
     def stop(self) -> None:
+        self._stop_requested_event.set()
+        self._disable_interception_before_stop()
         self.stop_event.set()
         if self.thread is not None and self.thread is not threading.current_thread():
             self.thread.join(timeout=3.0)

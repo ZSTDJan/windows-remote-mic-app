@@ -18,11 +18,8 @@ from pathlib import Path
 from ovb_rc003 import __main__ as main_module
 from ovb_rc003 import (
     app,
-    config,
-    device_catalog,
     element_navigation_runtime,
     frida_compat,
-    product_identity,
     single_instance,
     windows_diagnostics,
 )
@@ -91,310 +88,301 @@ def _make_guard_class(*, raise_on_enter=None, enter_calls=None):
 class _ArgvRestoringTestCase(unittest.TestCase):
     def setUp(self):
         self._original_argv = sys.argv
-        self._original_guard_cls = single_instance.BridgeInstanceGuard
-        self._original_settings_guard_cls = single_instance.SettingsInstanceGuard
-        self._original_activate_settings = single_instance.activate_existing_settings_window
+        self._original_application_guard_cls = (
+            single_instance.ApplicationInstanceGuard
+        )
+        self._original_activate_settings = (
+            single_instance.activate_existing_settings_window
+        )
         self._original_app_main = app.main
         self._original_notice = single_instance.show_bridge_startup_blocked_notice
-        self._original_load_config = config.load_config
+        self._original_bridge_start_request = (
+            single_instance.write_bridge_start_request
+        )
         self._original_qt_runtime_check = main_module._qt_runtime_check
         self._original_element_navigation_runtime = (
             element_navigation_runtime.run_element_navigation
         )
-        # XRBM-023: default every test in this suite to a safe no-op stub for
-        # the visible-notice callable. show_bridge_startup_blocked_notice's
-        # real implementation opens a real, SYSTEMMODAL Win32 MessageBoxW -
-        # a test that deliberately triggers a blocked startup but forgets to
-        # override this explicitly would otherwise open that real dialog and
-        # hang the whole headless CI runner waiting for user input (the
-        # test_duplicate_launch_never_calls_app_main defect this task fixes).
-        # Tests that need to assert on the exact notice text/call count still
-        # override this in their own body, same as before.
+        # Never let a failure-path test open a real system-modal Win32
+        # message box on a developer machine or headless CI runner.
         single_instance.show_bridge_startup_blocked_notice = lambda message: None
-        single_instance.SettingsInstanceGuard = _make_guard_class()
+        single_instance.ApplicationInstanceGuard = _make_guard_class()
         single_instance.activate_existing_settings_window = lambda: True
-        config.load_config = lambda path: {
-            "selected_device_profile": device_catalog.RC003_ID
-        }
+        single_instance.write_bridge_start_request = lambda _root: None
 
     def tearDown(self):
         sys.argv = self._original_argv
-        single_instance.BridgeInstanceGuard = self._original_guard_cls
-        single_instance.SettingsInstanceGuard = self._original_settings_guard_cls
-        single_instance.activate_existing_settings_window = self._original_activate_settings
+        single_instance.ApplicationInstanceGuard = (
+            self._original_application_guard_cls
+        )
+        single_instance.activate_existing_settings_window = (
+            self._original_activate_settings
+        )
         app.main = self._original_app_main
         single_instance.show_bridge_startup_blocked_notice = self._original_notice
-        config.load_config = self._original_load_config
+        single_instance.write_bridge_start_request = (
+            self._original_bridge_start_request
+        )
         main_module._qt_runtime_check = self._original_qt_runtime_check
         element_navigation_runtime.run_element_navigation = (
             self._original_element_navigation_runtime
         )
 
 
-class BridgeModeRoutingTests(_ArgvRestoringTestCase):
-    def test_dji_profile_never_starts_the_rc003_bridge(self):
-        app.main = lambda: self.fail("DJI Mic 2 must not start the RC003 bridge")
-        config.load_config = lambda path: {
-            "selected_device_profile": device_catalog.DJI_MIC_2_ID
-        }
-        notice_calls = []
-        single_instance.show_bridge_startup_blocked_notice = (
-            lambda message, **kwargs: notice_calls.append((message, kwargs))
-        )
-        sys.argv = ["ovb_rc003", "--bridge"]
+class DesktopModeRoutingTests(_ArgvRestoringTestCase):
+    def _run_with_settings_spy(self, argv):
+        from ovb_rc003 import settings_ui
 
-        main_module.main()
-
-        self.assertEqual(len(notice_calls), 1)
-        self.assertIn("DJI Mic 2", notice_calls[0][0])
-        self.assertEqual(
-            notice_calls[0][1]["title"], product_identity.DISPLAY_NAME
-        )
-
-    def test_unexpected_bridge_runtime_failure_is_visible_and_sanitized(self):
-        notice_calls = []
-        single_instance.show_bridge_startup_blocked_notice = notice_calls.append
-        # Keep this runtime-failure test independent of any real bridge that
-        # may already be running on the developer machine.
-        single_instance.BridgeInstanceGuard = _make_guard_class()
-        app.main = lambda: (_ for _ in ()).throw(RuntimeError("private detail"))
-        sys.argv = ["ovb_rc003", "--bridge"]
-
-        with self.assertRaises(SystemExit) as ctx:
+        calls = []
+        original = settings_ui.main
+        settings_ui.main = lambda **kwargs: calls.append(kwargs)
+        sys.argv = argv
+        try:
             main_module.main()
+        finally:
+            settings_ui.main = original
+        return calls
 
-        self.assertEqual(ctx.exception.code, main_module.BRIDGE_RUNTIME_FAILED_EXIT_CODE)
+    def test_no_arguments_open_the_single_desktop_application(self):
+        enter_calls = []
+        single_instance.ApplicationInstanceGuard = _make_guard_class(
+            enter_calls=enter_calls
+        )
+
+        calls = self._run_with_settings_spy(["ovb_rc003"])
+
+        self.assertEqual(enter_calls, [1])
+        self.assertEqual(calls, [{"start_bridge": False}])
+
+    def test_explicit_settings_open_the_same_desktop_application(self):
+        calls = self._run_with_settings_spy(["ovb_rc003", "--settings"])
+
+        self.assertEqual(calls, [{"start_bridge": False}])
+
+    def test_background_start_keeps_the_single_application_hidden(self):
+        calls = self._run_with_settings_spy(["ovb_rc003", "--background"])
+
+        self.assertEqual(
+            calls,
+            [{"start_hidden": True, "start_bridge": False}],
+        )
+
+    def test_bridge_compatibility_mode_starts_the_same_application_hidden(self):
+        calls = self._run_with_settings_spy(["ovb_rc003", "--bridge"])
+
+        self.assertEqual(
+            calls,
+            [{"start_hidden": True, "start_bridge": True}],
+        )
+
+    def test_explicit_settings_wins_when_bridge_flag_is_also_present(self):
+        calls = self._run_with_settings_spy(
+            ["ovb_rc003", "--bridge", "--settings"]
+        )
+
+        self.assertEqual(calls, [{"start_bridge": False}])
+
+    def test_duplicate_visible_launch_activates_the_existing_window(self):
+        from ovb_rc003 import settings_ui
+
+        activation_calls = []
+        single_instance.ApplicationInstanceGuard = _make_guard_class(
+            raise_on_enter=single_instance.DuplicateInstanceError("already open")
+        )
+        single_instance.activate_existing_settings_window = (
+            lambda: activation_calls.append(1) or True
+        )
+        original = settings_ui.main
+        settings_ui.main = lambda **kwargs: self.fail(
+            "duplicate launch must not build another desktop application"
+        )
+        sys.argv = ["ovb_rc003", "--settings"]
+        try:
+            main_module.main()
+        finally:
+            settings_ui.main = original
+
+        self.assertEqual(activation_calls, [1])
+
+    def test_duplicate_visible_launch_reports_when_the_window_cannot_be_activated(self):
+        from ovb_rc003 import settings_ui
+
+        activation_calls = []
+        notice_calls = []
+        single_instance.ApplicationInstanceGuard = _make_guard_class(
+            raise_on_enter=single_instance.DuplicateInstanceError("already open")
+        )
+        single_instance.activate_existing_settings_window = (
+            lambda: activation_calls.append(1) or False
+        )
+        single_instance.show_bridge_startup_blocked_notice = notice_calls.append
+        original = settings_ui.main
+        settings_ui.main = lambda **kwargs: self.fail(
+            "duplicate launch must not build another desktop application"
+        )
+        sys.argv = ["ovb_rc003", "--settings"]
+        try:
+            main_module.main()
+        finally:
+            settings_ui.main = original
+
+        self.assertEqual(activation_calls, [1])
+        self.assertEqual(len(notice_calls), 1)
+        self.assertIn("已经在运行", notice_calls[0])
+        self.assertIn("不要重复启动", notice_calls[0])
+
+    def test_duplicate_bridge_launch_requests_existing_app_without_popping_window(self):
+        from ovb_rc003 import settings_ui
+
+        activation_calls = []
+        request_calls = []
+        single_instance.ApplicationInstanceGuard = _make_guard_class(
+            raise_on_enter=single_instance.DuplicateInstanceError("already open")
+        )
+        single_instance.activate_existing_settings_window = (
+            lambda: activation_calls.append(1) or True
+        )
+        single_instance.write_bridge_start_request = (
+            lambda root: request_calls.append(root)
+        )
+        original = settings_ui.main
+        settings_ui.main = lambda **kwargs: self.fail(
+            "duplicate bridge launch must not create another process"
+        )
+        sys.argv = ["ovb_rc003", "--bridge"]
+        try:
+            main_module.main()
+        finally:
+            settings_ui.main = original
+
+        self.assertEqual(len(request_calls), 1)
+        self.assertEqual(activation_calls, [])
+
+    def test_duplicate_bridge_request_failure_is_visible_without_a_second_app(self):
+        from ovb_rc003 import settings_ui
+
+        activation_calls = []
+        notice_calls = []
+        single_instance.ApplicationInstanceGuard = _make_guard_class(
+            raise_on_enter=single_instance.DuplicateInstanceError("already open")
+        )
+        single_instance.activate_existing_settings_window = (
+            lambda: activation_calls.append(1) or True
+        )
+        single_instance.write_bridge_start_request = (
+            lambda _root: (_ for _ in ()).throw(PermissionError("private detail"))
+        )
+        single_instance.show_bridge_startup_blocked_notice = notice_calls.append
+        original = settings_ui.main
+        settings_ui.main = lambda **kwargs: self.fail(
+            "failed duplicate request must not create another application"
+        )
+        sys.argv = ["ovb_rc003", "--bridge"]
+        try:
+            main_module.main()
+        finally:
+            settings_ui.main = original
+
+        self.assertEqual(activation_calls, [])
         self.assertEqual(len(notice_calls), 1)
         self.assertNotIn("private detail", notice_calls[0])
 
-    def test_bridge_flag_calls_app_main_exactly_once_on_first_owner(self):
-        app_main_calls = []
-        app.main = lambda: app_main_calls.append(1)
-        single_instance.BridgeInstanceGuard = _make_guard_class()
-        sys.argv = ["ovb_rc003", "--bridge"]
+    def test_duplicate_background_start_does_not_pop_the_window_open(self):
+        from ovb_rc003 import settings_ui
 
-        main_module.main()  # must not raise
-
-        self.assertEqual(app_main_calls, [1])
-
-    def test_duplicate_launch_never_calls_app_main(self):
-        app_main_calls = []
-        app.main = lambda: app_main_calls.append(1)
-        single_instance.BridgeInstanceGuard = _make_guard_class(
-            raise_on_enter=single_instance.DuplicateInstanceError("already running")
+        activation_calls = []
+        single_instance.ApplicationInstanceGuard = _make_guard_class(
+            raise_on_enter=single_instance.DuplicateInstanceError("already open")
         )
-        sys.argv = ["ovb_rc003", "--bridge"]
-
-        with self.assertRaises(SystemExit) as ctx:
+        single_instance.activate_existing_settings_window = (
+            lambda: activation_calls.append(1) or True
+        )
+        original = settings_ui.main
+        settings_ui.main = lambda **kwargs: self.fail(
+            "duplicate background start must not build another application"
+        )
+        sys.argv = ["ovb_rc003", "--background"]
+        try:
             main_module.main()
+        finally:
+            settings_ui.main = original
 
-        self.assertEqual(app_main_calls, [])
-        self.assertEqual(ctx.exception.code, single_instance.DUPLICATE_INSTANCE_EXIT_CODE)
-        self.assertNotEqual(single_instance.DUPLICATE_INSTANCE_EXIT_CODE, 0)
+        self.assertEqual(activation_calls, [])
 
-    def test_duplicate_launch_without_an_explicit_notice_override_reaches_the_real_notice_function(self):
-        """Regression for XRBM-023 test 245: reproduces exactly why the
-        original test_duplicate_launch_never_calls_app_main hung the real
-        Windows CI runner - it left the REAL show_bridge_startup_blocked_
-        notice wired up, which by default calls single_instance's real
-        SYSTEMMODAL Win32 MessageBoxW, and a headless runner then blocks
-        waiting for user input on that dialog forever.
+    def test_guard_failure_is_visible_and_never_starts_the_application(self):
+        from ovb_rc003 import settings_ui
 
-        This drives that same REAL notice function (self._original_notice,
-        undoing setUp's safety-net no-op stub) through main()'s exact
-        duplicate-launch path, proving it does get called - but with its
-        own ``_message_box`` collaborator swapped for a safe recorder, so
-        this regression test itself never risks opening a real dialog on
-        any OS/CI runner, including a real Windows one.
-        """
-        message_box_calls = []
-
-        def _spy_notice(message):
-            self._original_notice(
-                message,
-                _message_box=lambda title, msg: message_box_calls.append((title, msg)) or 1,
+        notice_calls = []
+        single_instance.ApplicationInstanceGuard = _make_guard_class(
+            raise_on_enter=single_instance.SingleInstanceUnavailableError(
+                "private detail"
             )
-
-        single_instance.show_bridge_startup_blocked_notice = _spy_notice
-        app.main = lambda: self.fail("app.main() must never run on a duplicate launch")
-        single_instance.BridgeInstanceGuard = _make_guard_class(
-            raise_on_enter=single_instance.DuplicateInstanceError("already running")
         )
-        sys.argv = ["ovb_rc003", "--bridge"]
-
-        with self.assertRaises(SystemExit):
-            main_module.main()
-
-        self.assertEqual(len(message_box_calls), 1)
-
-    def test_duplicate_launch_shows_the_visible_notice_exactly_once(self):
-        app.main = lambda: self.fail("app.main() must never run on a duplicate launch")
-        single_instance.BridgeInstanceGuard = _make_guard_class(
-            raise_on_enter=single_instance.DuplicateInstanceError("already running")
+        single_instance.show_bridge_startup_blocked_notice = notice_calls.append
+        original = settings_ui.main
+        settings_ui.main = lambda **kwargs: self.fail(
+            "application must not start without its instance guard"
         )
-        notice_calls = []
-        single_instance.show_bridge_startup_blocked_notice = lambda msg: notice_calls.append(msg)
-        sys.argv = ["ovb_rc003", "--bridge"]
+        sys.argv = ["ovb_rc003"]
+        try:
+            with self.assertRaises(SystemExit) as ctx:
+                main_module.main()
+        finally:
+            settings_ui.main = original
 
-        with self.assertRaises(SystemExit):
-            main_module.main()
-
-        self.assertEqual(len(notice_calls), 1)
-        self.assertIn("already running", notice_calls[0])
-
-    def test_settings_duplicate_returns_immediately_without_modal_notice(self):
-        app.main = lambda: self.fail("app.main() must never run on a duplicate launch")
-        single_instance.BridgeInstanceGuard = _make_guard_class(
-            raise_on_enter=single_instance.DuplicateInstanceError("already running")
-        )
-        notice_calls = []
-        single_instance.show_bridge_startup_blocked_notice = lambda msg: notice_calls.append(msg)
-        sys.argv = [
-            "ovb_rc003",
-            "--bridge",
-            "--bridge-from-settings",
-        ]
-
-        with self.assertRaises(SystemExit) as ctx:
-            main_module.main()
-
-        self.assertEqual(ctx.exception.code, single_instance.DUPLICATE_INSTANCE_EXIT_CODE)
-        self.assertEqual(notice_calls, [])
-
-    def test_settings_managed_bridge_suppresses_the_second_tray_icon(self):
-        calls = []
-        app.main = lambda **kwargs: calls.append(kwargs)
-        single_instance.BridgeInstanceGuard = _make_guard_class()
-        sys.argv = ["ovb_rc003", "--bridge", "--bridge-from-settings"]
-
-        main_module.main()
-
-        self.assertEqual(calls, [{"show_notification_icon": False}])
-
-    def test_guard_unavailable_fails_closed_and_never_calls_app_main(self):
-        # XRBM-021 review round 1 P1 #1: the guard FAILS CLOSED - an
-        # acquisition failure it cannot resolve is treated the same as a
-        # proven duplicate, not as license to start anyway.
-        app.main = lambda: self.fail(
-            "app.main() must never run when the guard is unavailable"
-        )
-        single_instance.BridgeInstanceGuard = _make_guard_class(
-            raise_on_enter=single_instance.SingleInstanceUnavailableError("not on windows")
-        )
-        notice_calls = []
-        single_instance.show_bridge_startup_blocked_notice = lambda msg: notice_calls.append(msg)
-        sys.argv = ["ovb_rc003", "--bridge"]
-
-        with self.assertRaises(SystemExit) as ctx:
-            main_module.main()
-
-        self.assertEqual(ctx.exception.code, single_instance.GUARD_UNAVAILABLE_EXIT_CODE)
-        self.assertNotEqual(single_instance.GUARD_UNAVAILABLE_EXIT_CODE, 0)
-        self.assertNotEqual(
-            single_instance.GUARD_UNAVAILABLE_EXIT_CODE,
-            single_instance.DUPLICATE_INSTANCE_EXIT_CODE,
+        self.assertEqual(
+            ctx.exception.code,
+            main_module.SETTINGS_STARTUP_FAILED_EXIT_CODE,
         )
         self.assertEqual(len(notice_calls), 1)
+        self.assertNotIn("private detail", notice_calls[0])
 
-    def test_mutex_cleanup_failure_after_a_clean_run_shows_a_sanitized_notice(self):
-        # MutexCleanupError surfaces from the guard's __exit__, i.e. AFTER
-        # app.main() already ran (here: to a clean, immediate return) - it
-        # must still produce a visible notice and a deterministic nonzero
-        # exit, since the packaged executable is windowed (console=False)
-        # and an unhandled exception's traceback is otherwise never seen.
-        app_main_calls = []
-        app.main = lambda: app_main_calls.append(1)
+    def test_settings_startup_failure_is_visible_and_sanitized(self):
+        from ovb_rc003 import settings_ui
 
-        class _CleanupFailingGuard:
-            def __enter__(self):
-                return self
-
-            def __exit__(self, exc_type, exc, tb):
-                raise single_instance.MutexCleanupError(
-                    "mutex cleanup did not fully succeed: "
-                    "ReleaseMutex returned FALSE; CloseHandle returned FALSE"
-                )
-
-        single_instance.BridgeInstanceGuard = lambda: _CleanupFailingGuard()
         notice_calls = []
-        single_instance.show_bridge_startup_blocked_notice = lambda msg: notice_calls.append(msg)
-        sys.argv = ["ovb_rc003", "--bridge"]
+        single_instance.show_bridge_startup_blocked_notice = notice_calls.append
+        original = settings_ui.main
+        settings_ui.main = lambda **kwargs: (_ for _ in ()).throw(
+            ValueError("private detail")
+        )
+        sys.argv = ["ovb_rc003", "--settings"]
+        try:
+            with self.assertRaises(SystemExit) as ctx:
+                main_module.main()
+        finally:
+            settings_ui.main = original
 
-        with self.assertRaises(SystemExit) as ctx:
-            main_module.main()
-
-        self.assertEqual(app_main_calls, [1])  # app.main() DID run to completion
-        self.assertEqual(ctx.exception.code, single_instance.CLEANUP_FAILED_EXIT_CODE)
-        self.assertNotEqual(single_instance.CLEANUP_FAILED_EXIT_CODE, 0)
+        self.assertEqual(
+            ctx.exception.code,
+            main_module.SETTINGS_STARTUP_FAILED_EXIT_CODE,
+        )
         self.assertEqual(len(notice_calls), 1)
-        # The user-visible notice must be sanitized - never the raw
-        # MutexCleanupError text (which itself is already sanitized, but
-        # the notice text is deliberately a separate, fixed sentence, not
-        # str(exc), so it can never regress even if the exception message
-        # shape changes).
-        self.assertNotIn("ReleaseMutex", notice_calls[0])
-        self.assertNotIn("CloseHandle", notice_calls[0])
+        self.assertNotIn("private detail", notice_calls[0])
 
 
 class ArgumentModeBypassTests(_ArgvRestoringTestCase):
-    """Bridge and settings modes use separate guards; utility modes use none.
-    """
-
-    def test_no_arguments_opens_settings_under_only_the_settings_guard(self):
-        from ovb_rc003 import settings_ui
-
-        bridge_enter_calls = []
-        settings_enter_calls = []
-        single_instance.BridgeInstanceGuard = _make_guard_class(
-            enter_calls=bridge_enter_calls
+    def _assert_application_guard_unused(self):
+        enter_calls = []
+        single_instance.ApplicationInstanceGuard = _make_guard_class(
+            enter_calls=enter_calls
         )
-        single_instance.SettingsInstanceGuard = _make_guard_class(
-            enter_calls=settings_enter_calls
-        )
-        app.main = lambda: self.fail("no-argument launch must never start the bridge")
-        original_settings_main = settings_ui.main
-        settings_ui.main = lambda: None
-        sys.argv = ["ovb_rc003"]
-
-        try:
-            main_module.main()  # returns normally, no SystemExit
-        finally:
-            settings_ui.main = original_settings_main
-
-        self.assertEqual(bridge_enter_calls, [])
-        self.assertEqual(settings_enter_calls, [1])
+        return enter_calls
 
     def test_dry_run_never_touches_the_guard(self):
-        bridge_enter_calls = []
-        settings_enter_calls = []
-        single_instance.BridgeInstanceGuard = _make_guard_class(
-            enter_calls=bridge_enter_calls
-        )
-        single_instance.SettingsInstanceGuard = _make_guard_class(
-            enter_calls=settings_enter_calls
-        )
-        app.main = lambda: self.fail("--dry-run must never call app.main()")
+        enter_calls = self._assert_application_guard_unused()
         sys.argv = ["ovb_rc003", "--dry-run"]
 
         with self.assertRaises(SystemExit) as ctx:
             main_module.main()
 
         self.assertEqual(ctx.exception.code, 0)
-        self.assertEqual(bridge_enter_calls, [])
-        self.assertEqual(settings_enter_calls, [])
+        self.assertEqual(enter_calls, [])
 
     def test_qt_runtime_check_never_touches_the_guard(self):
-        bridge_enter_calls = []
-        settings_enter_calls = []
+        enter_calls = self._assert_application_guard_unused()
         check_calls = []
-        single_instance.BridgeInstanceGuard = _make_guard_class(
-            enter_calls=bridge_enter_calls
-        )
-        single_instance.SettingsInstanceGuard = _make_guard_class(
-            enter_calls=settings_enter_calls
-        )
         main_module._qt_runtime_check = lambda: check_calls.append(1) or 0
-        app.main = lambda: self.fail("Qt runtime check must never call app.main()")
         sys.argv = ["ovb_rc003", "--qt-runtime-check"]
 
         with self.assertRaises(SystemExit) as ctx:
@@ -402,189 +390,34 @@ class ArgumentModeBypassTests(_ArgvRestoringTestCase):
 
         self.assertEqual(ctx.exception.code, 0)
         self.assertEqual(check_calls, [1])
-        self.assertEqual(bridge_enter_calls, [])
-        self.assertEqual(settings_enter_calls, [])
+        self.assertEqual(enter_calls, [])
 
     def test_help_never_touches_the_guard(self):
-        bridge_enter_calls = []
-        settings_enter_calls = []
-        single_instance.BridgeInstanceGuard = _make_guard_class(
-            enter_calls=bridge_enter_calls
-        )
-        single_instance.SettingsInstanceGuard = _make_guard_class(
-            enter_calls=settings_enter_calls
-        )
-        app.main = lambda: self.fail("--help must never call app.main()")
+        enter_calls = self._assert_application_guard_unused()
         sys.argv = ["ovb_rc003", "--help"]
 
-        main_module.main()  # returns normally, no SystemExit
+        main_module.main()
 
-        self.assertEqual(bridge_enter_calls, [])
-        self.assertEqual(settings_enter_calls, [])
-
-    def test_settings_uses_only_the_settings_guard(self):
-        from ovb_rc003 import settings_ui
-
-        bridge_enter_calls = []
-        settings_enter_calls = []
-        single_instance.BridgeInstanceGuard = _make_guard_class(
-            enter_calls=bridge_enter_calls
-        )
-        single_instance.SettingsInstanceGuard = _make_guard_class(
-            enter_calls=settings_enter_calls
-        )
-        app.main = lambda: self.fail("--settings must never call app.main()")
-        original_settings_main = settings_ui.main
-        settings_ui.main = lambda: None
-        sys.argv = ["ovb_rc003", "--settings"]
-
-        try:
-            main_module.main()  # returns normally, no SystemExit
-        finally:
-            settings_ui.main = original_settings_main
-
-        self.assertEqual(bridge_enter_calls, [])
-        self.assertEqual(settings_enter_calls, [1])
-
-    def test_background_start_keeps_the_existing_window_hidden(self):
-        from ovb_rc003 import settings_ui
-
-        settings_calls = []
-        original_settings_main = settings_ui.main
-        settings_ui.main = lambda **kwargs: settings_calls.append(kwargs)
-        sys.argv = ["ovb_rc003", "--background"]
-        try:
-            main_module.main()
-        finally:
-            settings_ui.main = original_settings_main
-
-        self.assertEqual(settings_calls, [{"start_hidden": True}])
-
-    def test_duplicate_background_start_does_not_pop_the_window_open(self):
-        from ovb_rc003 import settings_ui
-
-        activation_calls = []
-        single_instance.SettingsInstanceGuard = _make_guard_class(
-            raise_on_enter=single_instance.DuplicateInstanceError("already open")
-        )
-        single_instance.activate_existing_settings_window = (
-            lambda: activation_calls.append(1) or True
-        )
-        original_settings_main = settings_ui.main
-        settings_ui.main = lambda **kwargs: self.fail(
-            "duplicate background start must not build another window"
-        )
-        sys.argv = ["ovb_rc003", "--background"]
-        try:
-            main_module.main()
-        finally:
-            settings_ui.main = original_settings_main
-
-        self.assertEqual(activation_calls, [])
-
-    def test_explicit_settings_wins_when_bridge_flag_is_also_present(self):
-        from ovb_rc003 import settings_ui
-
-        bridge_enter_calls = []
-        settings_enter_calls = []
-        settings_calls = []
-        single_instance.BridgeInstanceGuard = _make_guard_class(
-            enter_calls=bridge_enter_calls
-        )
-        single_instance.SettingsInstanceGuard = _make_guard_class(
-            enter_calls=settings_enter_calls
-        )
-        app.main = lambda: self.fail("--settings must take precedence over --bridge")
-        original_settings_main = settings_ui.main
-        settings_ui.main = lambda: settings_calls.append(1)
-        sys.argv = ["ovb_rc003", "--bridge", "--settings"]
-
-        try:
-            main_module.main()
-        finally:
-            settings_ui.main = original_settings_main
-
-        self.assertEqual(settings_calls, [1])
-        self.assertEqual(bridge_enter_calls, [])
-        self.assertEqual(settings_enter_calls, [1])
-
-    def test_duplicate_settings_launch_activates_existing_window_without_opening_another(self):
-        from ovb_rc003 import settings_ui
-
-        activation_calls = []
-        single_instance.SettingsInstanceGuard = _make_guard_class(
-            raise_on_enter=single_instance.DuplicateInstanceError("already open")
-        )
-        single_instance.activate_existing_settings_window = (
-            lambda: activation_calls.append(1) or True
-        )
-        original_settings_main = settings_ui.main
-        settings_ui.main = lambda: self.fail("duplicate launch must not build another window")
-        sys.argv = ["ovb_rc003", "--settings"]
-
-        try:
-            main_module.main()
-        finally:
-            settings_ui.main = original_settings_main
-
-        self.assertEqual(activation_calls, [1])
-
-    def test_settings_startup_failure_is_visible_and_has_a_stable_exit_code(self):
-        from ovb_rc003 import settings_ui
-
-        notice_calls = []
-        single_instance.show_bridge_startup_blocked_notice = notice_calls.append
-        original_settings_main = settings_ui.main
-        settings_ui.main = lambda: (_ for _ in ()).throw(ValueError("private detail"))
-        sys.argv = ["ovb_rc003", "--settings"]
-
-        try:
-            with self.assertRaises(SystemExit) as ctx:
-                main_module.main()
-        finally:
-            settings_ui.main = original_settings_main
-
-        self.assertEqual(ctx.exception.code, main_module.SETTINGS_STARTUP_FAILED_EXIT_CODE)
-        self.assertEqual(len(notice_calls), 1)
-        self.assertNotIn("private detail", notice_calls[0])
-
-    def test_bridge_config_failure_is_visible_and_never_touches_the_guard(self):
-        enter_calls = []
-        notice_calls = []
-        single_instance.BridgeInstanceGuard = _make_guard_class(enter_calls=enter_calls)
-        single_instance.show_bridge_startup_blocked_notice = notice_calls.append
-        config.load_config = lambda path: (_ for _ in ()).throw(ValueError("private detail"))
-        app.main = lambda: self.fail("invalid config must never start the bridge")
-        sys.argv = ["ovb_rc003", "--bridge"]
-
-        with self.assertRaises(SystemExit) as ctx:
-            main_module.main()
-
-        self.assertEqual(ctx.exception.code, main_module.BRIDGE_CONFIG_FAILED_EXIT_CODE)
         self.assertEqual(enter_calls, [])
-        self.assertEqual(len(notice_calls), 1)
-        self.assertNotIn("private detail", notice_calls[0])
 
     def test_diagnose_ble_candidates_never_touches_the_guard(self):
-        enter_calls = []
-        single_instance.BridgeInstanceGuard = _make_guard_class(enter_calls=enter_calls)
-        app.main = lambda: self.fail("--diagnose-ble-candidates must never call app.main()")
+        enter_calls = self._assert_application_guard_unused()
         sys.argv = ["ovb_rc003", "--diagnose-ble-candidates", "/tmp/result.json"]
 
-        original_entrypoint = windows_diagnostics.run_ble_diagnostics_subprocess_entrypoint
-        windows_diagnostics.run_ble_diagnostics_subprocess_entrypoint = lambda result_path: 0
+        original = windows_diagnostics.run_ble_diagnostics_subprocess_entrypoint
+        windows_diagnostics.run_ble_diagnostics_subprocess_entrypoint = (
+            lambda result_path: 0
+        )
         try:
             with self.assertRaises(SystemExit):
                 main_module.main()
         finally:
-            windows_diagnostics.run_ble_diagnostics_subprocess_entrypoint = original_entrypoint
+            windows_diagnostics.run_ble_diagnostics_subprocess_entrypoint = original
 
         self.assertEqual(enter_calls, [])
 
     def test_vb_cable_loopback_child_never_touches_the_guard(self):
-        enter_calls = []
-        single_instance.BridgeInstanceGuard = _make_guard_class(enter_calls=enter_calls)
-        app.main = lambda: self.fail("loopback child must never call app.main()")
+        enter_calls = self._assert_application_guard_unused()
         sys.argv = [
             "ovb_rc003",
             "--diagnose-vb-cable-loopback",
@@ -592,7 +425,7 @@ class ArgumentModeBypassTests(_ArgvRestoringTestCase):
             "/tmp/result.json",
         ]
 
-        original_entrypoint = (
+        original = (
             windows_diagnostics.run_vb_cable_loopback_subprocess_entrypoint
         )
         windows_diagnostics.run_vb_cable_loopback_subprocess_entrypoint = (
@@ -602,34 +435,32 @@ class ArgumentModeBypassTests(_ArgvRestoringTestCase):
             with self.assertRaises(SystemExit):
                 main_module.main()
         finally:
-            windows_diagnostics.run_vb_cable_loopback_subprocess_entrypoint = (
-                original_entrypoint
-            )
+            windows_diagnostics.run_vb_cable_loopback_subprocess_entrypoint = original
 
         self.assertEqual(enter_calls, [])
 
     def test_hid_injector_child_never_touches_the_guard(self):
-        enter_calls = []
+        enter_calls = self._assert_application_guard_unused()
         received_args = []
-        single_instance.BridgeInstanceGuard = _make_guard_class(enter_calls=enter_calls)
-        app.main = lambda: self.fail("HID injector child must never call app.main()")
-        original_injector_main = frida_compat.injector_main
+        original = frida_compat.injector_main
         frida_compat.injector_main = lambda args: received_args.append(args) or 4
         sys.argv = [
             "ovb_rc003",
             frida_compat.HID_TAP_INJECTOR_FLAG,
             "--pid",
-            "1234",
+            "321",
         ]
         try:
             with self.assertRaises(SystemExit) as ctx:
                 main_module.main()
         finally:
-            frida_compat.injector_main = original_injector_main
+            frida_compat.injector_main = original
 
         self.assertEqual(ctx.exception.code, 4)
-        self.assertEqual(received_args, [["--pid", "1234"]])
+        self.assertEqual(received_args, [["--pid", "321"]])
         self.assertEqual(enter_calls, [])
+
+
 
 
 class ElementNavigationDispatchTests(_ArgvRestoringTestCase):

@@ -1,6 +1,7 @@
 """Atomic runtime status shared by the bridge and settings window.
 
-The bridge is the sole writer and the settings process is read-only. The
+The in-process bridge worker is the sole writer and the settings controller
+is read-only. The
 file contains no device identity, address, HID path, or voice content; it
 only distinguishes a live process waiting for RC003 from one whose BLE/ATVV
 connection setup completed. A PID guard prevents an exiting old process from
@@ -25,11 +26,28 @@ SCHEMA_VERSION = 2
 LEGACY_SCHEMA_VERSION = 1
 STATUS_FILENAME = "bridge-runtime-status.json"
 FAILED_RAW_INPUT_STATES = frozenset(
-    {"failed", "failed_running", "failed_stopping"}
+    {
+        "unavailable",
+        "no_device",
+        "ambiguous",
+        "failed",
+        "failed_running",
+        "failed_stopping",
+        "stopped",
+    }
 )
 FAILED_HID_TAP_STATES = frozenset(
-    {"failed", "unhealthy", "failed_stopping"}
+    {
+        "disabled_non_windows",
+        "unavailable_gadget_not_verified",
+        "unhealthy",
+        "failed",
+        "failed_stopping",
+        "stopped",
+    }
 )
+READY_RAW_INPUT_STATES = frozenset({"ready"})
+READY_HID_TAP_STATES = frozenset({"attached_waiting_for_hid_io", "ready"})
 
 
 class BridgeConnectionState(Enum):
@@ -116,6 +134,15 @@ def input_channels_failed(status: BridgeRuntimeStatus) -> bool:
     return (
         status.raw_input_state in FAILED_RAW_INPUT_STATES
         and status.hid_tap_state in FAILED_HID_TAP_STATES
+    )
+
+
+def input_channels_ready(status: BridgeRuntimeStatus) -> bool:
+    if status.schema < SCHEMA_VERSION:
+        return False
+    return (
+        status.raw_input_state in READY_RAW_INPUT_STATES
+        or status.hid_tap_state in READY_HID_TAP_STATES
     )
 
 

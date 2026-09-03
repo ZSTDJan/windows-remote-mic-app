@@ -11,7 +11,10 @@ tests/test_bridge_launcher.py uses for subprocess.Popen.
 import tempfile
 import unittest
 import logging
+import threading
+import time
 from pathlib import Path
+from unittest import mock
 
 from ovb_rc003 import logging_setup
 
@@ -63,6 +66,69 @@ class PersistentLogPrivacyTests(unittest.TestCase):
     def test_logger_uses_bounded_rotation(self):
         self.assertEqual(logging_setup.LOG_MAX_BYTES, 5 * 1024 * 1024)
         self.assertEqual(logging_setup.LOG_BACKUP_COUNT, 3)
+
+    def test_concurrent_first_use_installs_only_one_handler(self):
+        class FakeHandler:
+            def addFilter(self, _filter):
+                return None
+
+            def setFormatter(self, _formatter):
+                return None
+
+        class FakeLogger:
+            def __init__(self):
+                self.handlers = []
+
+            def setLevel(self, _level):
+                return None
+
+            def addHandler(self, handler):
+                self.handlers.append(handler)
+
+        fake_logger = FakeLogger()
+        handler_calls = []
+        errors = []
+        start = threading.Barrier(12)
+
+        def handler_factory(*_args, **_kwargs):
+            handler_calls.append(1)
+            time.sleep(0.02)
+            return FakeHandler()
+
+        original_configured = logging_setup._configured
+        logging_setup._configured = False
+        try:
+            with tempfile.TemporaryDirectory() as tmp, mock.patch.object(
+                logging_setup.logging,
+                "getLogger",
+                return_value=fake_logger,
+            ), mock.patch.object(
+                logging_setup,
+                "RotatingFileHandler",
+                side_effect=handler_factory,
+            ):
+                def configure_logger():
+                    try:
+                        start.wait()
+                        logging_setup.get_logger(Path(tmp))
+                    except Exception as exc:
+                        errors.append(exc)
+
+                threads = [
+                    threading.Thread(target=configure_logger)
+                    for _ in range(start.parties)
+                ]
+                for thread in threads:
+                    thread.start()
+                for thread in threads:
+                    thread.join(timeout=2.0)
+
+            self.assertTrue(all(not thread.is_alive() for thread in threads))
+            self.assertEqual(errors, [])
+            self.assertEqual(len(handler_calls), 1)
+            self.assertEqual(len(fake_logger.handlers), 1)
+        finally:
+            logging_setup._configured = original_configured
 
 
 class DescribeLogLocationTests(unittest.TestCase):

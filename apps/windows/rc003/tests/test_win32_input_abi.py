@@ -96,6 +96,27 @@ class InputStructShapeTests(unittest.TestCase):
             win32_input._KEYEVENTF_SCANCODE | win32_input._KEYEVENTF_EXTENDEDKEY,
         )
 
+    def test_all_arrow_keys_use_their_extended_physical_scan_codes(self):
+        expected = {
+            "up": 0x48,
+            "down": 0x50,
+            "left": 0x4B,
+            "right": 0x4D,
+        }
+        for name, scan_code in expected.items():
+            with self.subTest(name=name):
+                array, _ = win32_input._build_input_array(
+                    [(win32_input.win32_keys.VK_CODES[name], False)]
+                )
+                keybd = array[0].union.ki
+                self.assertEqual(keybd.wVk, 0)
+                self.assertEqual(keybd.wScan, scan_code)
+                self.assertEqual(
+                    keybd.dwFlags,
+                    win32_input._KEYEVENTF_SCANCODE
+                    | win32_input._KEYEVENTF_EXTENDEDKEY,
+                )
+
     def test_wetype_builder_uses_unmarked_virtual_keys_without_scan_codes(self):
         vk_codes = [
             win32_input.win32_keys.VK_CODES[name]

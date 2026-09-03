@@ -260,6 +260,145 @@ assert not any(name == "PySide6" or name.startswith("PySide6.") for name in sys.
 
         self.assertEqual(completed.returncode, 0, completed.stderr)
 
+    def test_navigation_cleanup_attempts_every_resource_after_one_failure(self):
+        host = prototype._load_element_navigation_windows_host()
+        calls = []
+
+        def fail_hook():
+            calls.append("hook")
+            raise RuntimeError("still running")
+
+        failures = host._stop_resources_best_effort(
+            (
+                ("timer", lambda: calls.append("timer")),
+                ("keyboard_hook", fail_hook),
+                ("worker", lambda: calls.append("worker")),
+            )
+        )
+
+        self.assertEqual(calls, ["timer", "hook", "worker"])
+        self.assertEqual(failures, ["keyboard_hook:RuntimeError"])
+
+    def test_keyboard_hook_cleanup_reports_a_thread_that_stays_alive(self):
+        tree = ast.parse(WINDOWS_HOST_PATH.read_text(encoding="utf-8"))
+        keyboard_hook = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.ClassDef) and node.name == "KeyboardHook"
+        )
+        stop = next(
+            node
+            for node in keyboard_hook.body
+            if isinstance(node, ast.FunctionDef) and node.name == "stop"
+        )
+
+        self.assertTrue(any(isinstance(node, ast.Raise) for node in ast.walk(stop)))
+
+    def test_runtime_cleanup_marks_complete_only_after_all_stops_succeed(self):
+        tree = ast.parse(WINDOWS_HOST_PATH.read_text(encoding="utf-8"))
+        run_windows = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name == "_run_windows"
+        )
+        cleanup = next(
+            node
+            for node in ast.walk(run_windows)
+            if isinstance(node, ast.FunctionDef) and node.name == "cleanup"
+        )
+        completion_assignments = [
+            node
+            for node in cleanup.body
+            if isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Name)
+                and target.id == "cleanup_complete"
+                for target in node.targets
+            )
+        ]
+
+        self.assertEqual(len(completion_assignments), 1)
+        self.assertIsInstance(completion_assignments[0].value, ast.Constant)
+        self.assertIs(completion_assignments[0].value.value, True)
+        failure_guard = next(
+            node
+            for node in cleanup.body
+            if isinstance(node, ast.If)
+            and isinstance(node.test, ast.Name)
+            and node.test.id == "failures"
+        )
+        self.assertGreater(
+            completion_assignments[0].lineno,
+            failure_guard.lineno,
+        )
+
+    def test_runtime_builds_cleanup_chain_before_starting_owned_resources(self):
+        tree = ast.parse(WINDOWS_HOST_PATH.read_text(encoding="utf-8"))
+        run_windows = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name == "_run_windows"
+        )
+        cleanup_binding = next(
+            node
+            for node in ast.walk(run_windows)
+            if isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Subscript)
+                and isinstance(target.value, ast.Name)
+                and target.value.id == "cleanup_callback"
+                for target in node.targets
+            )
+            and isinstance(node.value, ast.Name)
+            and node.value.id == "cleanup"
+        )
+        owned_starts = [
+            node
+            for node in ast.walk(run_windows)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "start"
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id
+            in {
+                "worker",
+                "hook",
+                "structure_watcher",
+                "command_server",
+                "timer",
+                "geometry_timer",
+                "owner_timer",
+            }
+        ]
+
+        self.assertTrue(owned_starts)
+        self.assertTrue(
+            all(cleanup_binding.lineno < call.lineno for call in owned_starts)
+        )
+
+    def test_all_thread_owners_report_a_shutdown_timeout(self):
+        tree = ast.parse(WINDOWS_HOST_PATH.read_text(encoding="utf-8"))
+        run_windows = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name == "_run_windows"
+        )
+        for class_name in ("AutomationWorker", "StructureChangeWatcher", "KeyboardHook"):
+            owner = next(
+                node
+                for node in ast.walk(run_windows)
+                if isinstance(node, ast.ClassDef) and node.name == class_name
+            )
+            stop = next(
+                node
+                for node in owner.body
+                if isinstance(node, ast.FunctionDef) and node.name == "stop"
+            )
+            self.assertTrue(
+                any(isinstance(node, ast.Raise) for node in ast.walk(stop)),
+                class_name,
+            )
+
     def test_legacy_entry_help_works_from_an_arbitrary_directory(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             completed = subprocess.run(

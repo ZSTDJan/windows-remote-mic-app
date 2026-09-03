@@ -101,7 +101,7 @@ class BridgeRuntimeStatusTests(unittest.TestCase):
         self.assertNotEqual(first.runtime_id, second.runtime_id)
         self.assertNotIn(str(self.root), first.runtime_id)
 
-    def test_health_helpers_do_not_treat_expected_unavailability_as_crash(self):
+    def test_health_helpers_treat_two_terminally_unavailable_channels_as_failed(self):
         identity = bridge_runtime_status.current_runtime_identity(
             "1.2.3", frozen=False, source_root=self.root
         )
@@ -111,13 +111,14 @@ class BridgeRuntimeStatusTests(unittest.TestCase):
             pid=1234,
             identity=identity,
             raw_input_state="unavailable",
-            hid_tap_state="disabled",
+            hid_tap_state="unavailable_gadget_not_verified",
         )
 
         self.assertTrue(
             bridge_runtime_status.runtime_identity_matches(status, identity)
         )
-        self.assertFalse(bridge_runtime_status.input_channels_failed(status))
+        self.assertTrue(bridge_runtime_status.input_channels_failed(status))
+        self.assertFalse(bridge_runtime_status.input_channels_ready(status))
 
     def test_health_helpers_detect_two_explicitly_failed_button_channels(self):
         identity = bridge_runtime_status.current_runtime_identity(
@@ -133,6 +134,36 @@ class BridgeRuntimeStatusTests(unittest.TestCase):
         )
 
         self.assertTrue(bridge_runtime_status.input_channels_failed(status))
+
+    def test_any_ready_input_channel_allows_detection(self):
+        raw_ready = bridge_runtime_status.publish_status(
+            self.root,
+            bridge_runtime_status.BridgeConnectionState.CONNECTED,
+            pid=1234,
+            raw_input_state="ready",
+            hid_tap_state="unavailable_gadget_not_verified",
+        )
+        self.assertTrue(bridge_runtime_status.input_channels_ready(raw_ready))
+
+        tap_ready = bridge_runtime_status.publish_status(
+            self.root,
+            bridge_runtime_status.BridgeConnectionState.CONNECTED,
+            pid=1234,
+            raw_input_state="failed",
+            hid_tap_state="attached_waiting_for_hid_io",
+        )
+        self.assertTrue(bridge_runtime_status.input_channels_ready(tap_ready))
+
+    def test_legacy_status_cannot_claim_a_ready_input_channel(self):
+        status = bridge_runtime_status.BridgeRuntimeStatus(
+            schema=bridge_runtime_status.LEGACY_SCHEMA_VERSION,
+            state=bridge_runtime_status.BridgeConnectionState.CONNECTED,
+            pid=1234,
+            updated_at=1.0,
+            raw_input_state="ready",
+        )
+
+        self.assertFalse(bridge_runtime_status.input_channels_ready(status))
 
     def test_invalid_or_partial_file_is_treated_as_unknown(self):
         path = bridge_runtime_status.status_path(self.root)

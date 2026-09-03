@@ -62,6 +62,7 @@ def request_bridge_exit(
     find_window: Callable[[], int] = _find_bridge_window,
     post_exit_command: Callable[[int], bool] = _post_exit_command,
     bridge_running: Callable[[], bool] = single_instance.bridge_instance_running,
+    stop_internal: Optional[Callable[..., Optional[bool]]] = None,
     sleep: Callable[[float], None] = time.sleep,
     monotonic: Callable[[], float] = time.monotonic,
 ) -> BridgeExitResult:
@@ -70,6 +71,24 @@ def request_bridge_exit(
     current_platform = sys.platform if platform is None else platform
     if current_platform != "win32":
         return BridgeExitResult(False, False, "仅 Windows 支持自动停止遥控器服务。")
+
+    # The current product hosts the bridge inside the desktop process. Stop
+    # that worker directly; the Win32 control window below is only for a
+    # legacy standalone bridge left running by an older build.
+    if stop_internal is None:
+        from . import bridge_launcher
+
+        stop_internal = bridge_launcher.stop_in_process_bridge
+
+    internal_stopped = stop_internal(timeout=timeout)
+    if internal_stopped is not None:
+        if internal_stopped:
+            return BridgeExitResult(True, True)
+        return BridgeExitResult(
+            True,
+            False,
+            "遥控器服务没有在限定时间内停止。",
+        )
     try:
         if not bridge_running():
             return BridgeExitResult(False, True)

@@ -47,7 +47,7 @@ from ctypes import wintypes
 from typing import Callable, List, Optional, Sequence, Tuple
 
 from . import win32_keys
-from .legacy_key_suppressor_windows import VOICE_EVENT_EXTRA_INFO
+from .voice_key_physicalizer_windows import VOICE_EVENT_EXTRA_INFO
 
 _INPUT_KEYBOARD = 1
 _KEYEVENTF_KEYUP = 0x0002
@@ -131,6 +131,10 @@ _EXTENDED_KEYS = frozenset(
 # left/right identity for directional modifiers. The boolean records whether
 # the scan code carries the E0 extended prefix.
 _PHYSICAL_SCAN_CODES = {
+    win32_keys.VK_CODES["up"]: (0x48, True),
+    win32_keys.VK_CODES["down"]: (0x50, True),
+    win32_keys.VK_CODES["left"]: (0x4B, True),
+    win32_keys.VK_CODES["right"]: (0x4D, True),
     win32_keys.VK_CODES["ctrl"]: (0x1D, False),
     win32_keys.VK_CODES["lctrl"]: (0x1D, False),
     win32_keys.VK_CODES["rctrl"]: (0x1D, True),

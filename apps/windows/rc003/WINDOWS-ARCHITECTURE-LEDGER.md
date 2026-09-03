@@ -106,8 +106,8 @@ RC003 原本是面向电视/机顶盒的蓝牙语音遥控器。Windows 可以�
 | 术语 | 本文含义 |
 | --- | --- |
 | RC003 | 小米蓝牙遥控器 2 Pro；本项目当前唯一桥接主设备 |
-| 设置进程 | 打开 Qt Quick 设置窗口的 `RemoteMicRC003.exe` 角色 |
-| 桥接进程 | 后台持有 BLE、按键、音频和托盘资源的 `--bridge` 角色 |
+| 桌面主进程 | 当前登录会话唯一的 `RemoteMicRC003.exe`；持有 Qt 窗口、通知区域、桥接 worker 和元素导航 |
+| 桥接 worker | 桌面主进程内持有 BLE、按键和音频资源的工作线程；不是第二个长期进程 |
 | HID/按键链 | 从 Windows HID、Raw Input 或 HID tap 到逻辑按钮和映射动作的链路 |
 | ATVV/语音链 | 从 BLE GATT 控制与音频特征到 PCM 输出端点的链路 |
 | 宿主 | 最终接收快捷键和虚拟麦克风输入的输入法或语音应用 |
@@ -125,17 +125,19 @@ RC003 原本是面向电视/机顶盒的蓝牙语音遥控器。Windows 可以�
 
 | 入口 | 角色 | 是否持有硬件资源 |
 | --- | --- | --- |
-| 无参数、`--settings` | Qt Quick 设置窗口 | 不长期持有；本地按键检测和音频预检时短暂持有，BLE 诊断委托子进程 |
-| `--bridge` | 后台桥接进程 | 持有 BLE、Raw Input、HID tap、音频和托盘 |
+| 无参数、`--settings` | Qt Quick 桌面主程序 | 可长期持有窗口、通知区域、桥接 worker 和元素导航 |
+| `--background` | 隐藏启动同一个桌面主程序 | 与无参数入口相同，只是不立即显示窗口 |
+| `--bridge` | 兼容启动形式 | 隐藏进入同一个桌面主程序，并请求启动进程内桥接 worker |
 | `--dry-run` | 模块导入检查 | 否 |
 | `--help` | 帮助文本 | 否 |
 | `--diagnose-ble-candidates <result>` | 隐藏的有界 BLE 诊断子进程 | 短暂持有 WinRT BLE 枚举资源 |
 | `--rc003-hid-injector --pid ...` | 隐藏的受限注入子进程 | 短暂持有目标进程句柄 |
+| `--element-navigation` | 旧独立导航兼容入口 | 仅为旧启动形式保留；正常产品导航已嵌入桌面主进程 |
 | HID 助手 `--install-task` / `--uninstall-task` | 经 UAC 明确启动的安装或卸载动作 | 写入/删除 Program Files 助手和固定计划任务 |
 | HID 助手 `--inject` | 计划任务按需启动的管理员注入动作 | 短暂持有已独立定位并核验的 RC003 WUDFHost 句柄 |
 
 HID 助手不接受 PID、程序路径或用户配置。计划任务没有登录触发器，只能运行
-Program Files 中的固定助手和固定 `--inject` 参数；主程序、桥接和登录自启仍为
+Program Files 中的固定助手和固定 `--inject` 参数；主程序、桥接 worker 和登录自启仍为
 普通权限。当前任务归属正在登录的管理员账号，不支持标准账号借用另一管理员账号
 凭据后继续无提示调用。
 
@@ -143,19 +145,21 @@ Program Files 中的固定助手和固定 `--inject` 参数；主程序、桥接
 `__main__.py`，而从顶层 `src/launcher.py` 做绝对导入，避免冻结入口失去
 包上下文。
 
-后台桥接由 per-session Windows named mutex 保证单实例。设置窗口可以多次
-打开，但第二个桥接不能越过单实例保护。桥接存活时通知区域图标提供“打开
-设置”和“退出桥接”；关闭设置窗口本身不会结束后台桥接。
+桌面主程序由 per-session Windows named mutex 保证单实例；重复双击、开始菜单、
+任务栏或通知区域入口只恢复已有窗口，不会再创建一套窗口、托盘或桥接。桥接 worker
+另持有旧桥接 mutex，防止升级期间尚未退出的历史独立桥接同时抢占 BLE、Raw Input、
+HID、合成按键或音频资源。关闭窗口默认只隐藏主窗口，通知区域和 worker 继续由同一
+进程持有；“完全退出”才按正常清理顺序结束全部长期资源。
 
-桥接同时是 `bridge-runtime-status.json` 的唯一写入者。schema 2 每 5 秒原子更新
+桥接 worker 是 `bridge-runtime-status.json` 的唯一写入者。schema 2 每 5 秒原子更新
 版本与构建摘要、BLE 连接、Raw Input、HID tap、最近按键和语音活动；不写设备地址、
-窗口标题、输入文字或语音内容。设置进程只读：能确认其它构建或两个按键通道都明确
+窗口标题、输入文字或语音内容。设置控制器只读：能确认其它构建或两个按键通道都明确
 失败且语音空闲时，最多正常恢复一次；旧 schema、心跳滞后或语音进行中不自动停止。
 
-`--bridge-from-settings` 只是设置窗口启动 `--bridge` 时附带的隐藏来源标记，
-用于让重复实例静默返回确定退出码，不是独立运行角色。BLE 诊断另起子进程，
+`--bridge-from-settings` 只是旧启动命令保留的隐藏兼容标记，不是独立运行角色。
+`--bridge` 命中已有主程序时只写入一次短时启动请求，由现有进程消费。BLE 诊断另起子进程，
 是为了在 WinRT 调用卡住时仍能由父进程确认终止，不把不可取消的原生调用留在
-设置进程中。
+桌面主进程中。
 
 ## 7. 运行拓扑
 
@@ -173,11 +177,12 @@ RC003 遥控器
                                                                                   |
                                                                                   +--> 宿主语音输入
 
-设置进程 -- config.json / key_bindings.json -- 后台桥接热加载
-设置进程 -- 一次性 key-detection 文件 IPC ---- 后台桥接捕获下一键
-后台桥接 -- 原子运行状态 + 5 秒心跳 ----------- 设置页版本/通道校验
-后台桥接 -- app.log --------------------------- 设置页/用户诊断
-后台桥接 -- schtasks /Run 固定任务 ------------ 管理员 HID 助手 --> 核验并注入 WUDFHost
+桌面主进程 -- config.json / key_bindings.json -- 进程内桥接 worker 热加载
+设置控制器 -- 一次性 key-detection 文件 IPC --- 进程内桥接 worker 捕获下一键
+桥接 worker -- 原子运行状态 + 5 秒心跳 -------- 设置页版本/通道校验
+桥接 worker -- app.log ------------------------- 设置页/用户诊断
+桥接 worker -- schtasks /Run 固定任务 ---------- 管理员 HID 助手 --> 核验并注入 WUDFHost
+桌面主进程 -- Qt 事件队列 ---------------------- 内嵌元素导航运行对象
 ```
 
 这里有两条相互独立、在主映射解析为语音动作时汇合的数据链：
@@ -209,28 +214,26 @@ Frida Gadget。服务端通过 `GetExtendedTcpTable` 核对 TCP 客户端进程 
 无法确认或 PID 不等于刚核验过的 WUDFHost 时，连接会在读取任何消息前关闭。
 日志只写固定状态，不持久化端点、PID、设备路径或地址。
 
-冻结安装版由普通权限桥接调用预先登记的固定计划任务；管理员助手自行重新定位
+冻结安装版由普通权限桥接 worker 调用预先登记的固定计划任务；管理员助手自行重新定位
 RC003 的 WUDFHost、启用调试权限、复核进程名和固定 Gadget 哈希后注入。源码调试
 或手动以管理员权限运行的便携版仍可走原有直接注入子进程。助手、任务、哈希或
 Gadget 连接任一项不符合预期时，tap 明确失败，不回退为未经核验的注入。
 
-### 8.2 去重与原生按键抑制
+### 8.2 去重与原生按键归属
 
 同一个按键可能同时被 HID tap 和 Windows 原生键盘路径报告。如果两条路径都
-继续传播，用户会同时得到原生字符/功能和映射动作。
+继续传播，用户会同时得到原生字符/功能和映射动作。当前正式归属点不再是看不到
+设备身份的通用低层键盘钩子：Frida Gadget 在已经核验的 RC003 `WUDFHost.exe` 内
+复制被接管的 HID 报告，并在返回 Windows HID 栈前清空原报告；Python socket 线程
+只接收复制报告并执行一次映射动作。
 
-- `legacy_key_suppressor_windows.py` 安装低层键盘钩子；
-- HID tap 根据已知 usage 提前 arm 一个待吞掉边沿；非方向键在 tap 尚未接管时仍可
-  由 Raw Input arm；
-- 低层钩子本身看不到设备身份，只在短时间窗内吞掉与 arm 条目键值、扫描码、
-  扩展位和按下/释放状态都匹配的非注入边沿；
-- 应用随后只执行一次映射动作。
-
-方向键是单独的归属规则：Raw Input 到达时 Windows 已经把原始方向送给前台，不能再
-靠它及时吞掉本轮原始键。因此上下左右只接受 HID tap 执行映射并提前 arm 抑制器；
-Raw Input 方向事件不执行映射，也不迟到地 arm。tap 正常时保留自定义单击、双击、
-长按和遥控器组合；tap 异常时只让 Windows 原始方向通过一次，避免原始方向与映射
-方向同时执行。其它非方向按键继续沿用原有 Raw Input/HID tap 旁路和降级规则。
+方向键采用明确降级规则：Raw Input 到达时 Windows 已经把原始方向送给前台，不能再
+及时挽回本轮原始键。因此上下左右只接受 HID tap 执行自定义单击、双击、长按和遥控器
+组合；Raw Input 方向事件不执行映射。tap 未能接管时只保留 Windows 原始方向一次，
+避免原始方向与映射方向同时执行。tap 从 `READY` 变为失联或异常时，应用在同一个输入
+仲裁锁内先快照并补齐所有已认领按键的松键，再撤销 tap 所有权并启用 Raw Input 降级，
+防止最后一次按下没有对应抬起而造成方向连发或映射状态卡住。其它非方向按键继续使用
+现有 Raw Input/HID tap 旁路和各自的降级规则。
 
 麦克风的原生 F5 是特殊路径：部分 RC003/Windows 组合只把麦克风键暴露成
 无法关联设备来源的 legacy F5。桥接运行时，专用钩子会吞掉非注入 F5，避免
@@ -560,21 +563,19 @@ Frida Gadget 与 VB-CABLE 包都使用固定 URL/version/SHA-256。运行时仍�
 | 冻结 EXE smoke | PyInstaller 依赖完整、入口可运行 | BLE/音频/权限真机成功 |
 | 真实硬件验收 | 当前候选在指定机器上的按键和语音事实 | 其他机器、休眠、长期、杀软兼容 |
 
-源码检查点 `eafd203` 的完整审查基线已通过；当前 HOLD-only 修改在
-2026-08-22 完成 1151 项 unittest，7 项安全或平台条件跳过。核心定向测试
-481 项通过、1 项跳过；`compileall`、`pip check`、PowerShell parser、公开边界
-扫描 278 个文件及 `git diff --check` 均通过，QML 离屏加载和 Windows 输入调用
-契约包含在完整测试中。详细历史审查命令与证据见
-`reviews/2026-08-21-full-code-audit.md`。这些结果证明当前源码的自动化基线，
-冻结候选的 `--help`、`--dry-run`、资源与 QML 完整性也已通过；这些结果仍不
-证明冻结包已经通过 RC003、VB-CABLE 或目标输入法的端到端实机验收。
+2026-09-03 当前源码完成 1889 项完整 unittest，7 项按平台或安全条件跳过，测试日志
+未出现 `ResourceWarning`、未关闭事件循环或 socket；`compileall`、源码 `--dry-run`、
+公开边界扫描 507 个文件、`pip check` 和 `git diff --check` 均通过。本批没有构建、
+打包或发布，因此这些结果证明当前源码的自动化基线，不证明冻结 EXE、安装器、计划任务
+或真机链路已经通过。详细历史审查命令与证据见
+`reviews/2026-08-21-full-code-audit.md`，后续批次见 `MAINTENANCE.md`。
 
-截至 2026-08-22，历史异机结果已证明：多候选中可选出唯一可用 RC003、全部
+截至 2026-08-30，历史异机结果已证明：多候选中可选出唯一可用 RC003、全部
 普通按键可在映射页识别、记事本映射有效、按住语音得到非零 PCM 和识别文字、
 F5 不再向输入框泄漏日期时间。On-request 真机探针最终未收到 `START_SEARCH`，
-开关型已正式撤下。最新代码检查点还需要复测 HOLD 短流尾音、标准松手结束、
-旧配置停用提示、自定义组合键不连发、断连重连、休眠恢复、长期运行、权限/
-杀软兼容和安装器升级/卸载。
+开关型已正式撤下。最新代码检查点还需要复测方向键单次触发与长按、HID 失联补松、
+重复启动只唤出旧窗口、旧桥接升级迁移、重新登录无 UAC 自启、预授权助手修复/卸载，
+以及 HOLD 短流尾音、断连重连、休眠恢复、长期运行、权限和杀软兼容。
 
 ## 16. 模块索引
 
@@ -586,7 +587,7 @@ F5 不再向输入框泄漏日期时间。On-request 真机探针最终未收到
 | 音频 | `audio_output.py`、`audio_playback.py`、`audio_playback_worker.py` |
 | 普通按键 | `raw_input_windows.py`、`hid_identity.py`、`button_gesture.py` |
 | 动作输出 | `key_mapping.py`、`win32_input.py`、`action_executor.py` |
-| F5/跨来源语音仲裁 | `app.py`、`legacy_key_suppressor_windows.py`、`hotkey_capture_windows.py` |
+| F5/跨来源语音仲裁 | `app.py`、`hotkey_capture_windows.py`、`voice_key_physicalizer_windows.py` |
 | HID tap 与预授权助手 | `frida_compat.py`、`frida_hid_tap_runtime.py`、`frida_hid_tap_injector.py`、`hid_elevation_windows.py`、`hid_helper_launcher.py` |
 | 豆包兼容 | `doubao_rpc.py` |
 | 配置/IPC | `config.py`、`key_detection_bridge.py`、`key_testing.py` |

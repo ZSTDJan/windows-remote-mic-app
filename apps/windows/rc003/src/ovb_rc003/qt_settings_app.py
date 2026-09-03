@@ -97,6 +97,7 @@ from __future__ import annotations
 import atexit
 from dataclasses import dataclass
 import gc
+import os
 import sys
 import threading
 import time
@@ -112,6 +113,8 @@ from . import (
     bridge_runtime_status,
     config,
     device_catalog,
+    element_navigation_control_windows,
+    element_navigation_runtime,
     frida_compat,
     hid_elevation_windows,
     hotkey,
@@ -554,9 +557,10 @@ def _load_qt_classes() -> dict:
             Signal,
             Slot,
         )
-        from PySide6.QtGui import QGuiApplication, QIcon
+        from PySide6.QtGui import QIcon
         from PySide6.QtQml import QQmlApplicationEngine, qmlRegisterSingletonInstance
         from PySide6.QtQuickControls2 import QQuickStyle
+        from PySide6.QtWidgets import QApplication
     except ImportError as exc:
         raise QtUnavailableError(
             "PySide6-Essentials 未安装，无法打开 Qt 设置界面。源码运行请先在本项目"
@@ -973,6 +977,7 @@ def _load_qt_classes() -> dict:
             parent=None,
             *,
             start_hidden: bool = False,
+            start_bridge: bool = False,
             background_task_runner: Optional[
                 Callable[[Callable[[], None], str], None]
             ] = None,
@@ -1007,6 +1012,7 @@ def _load_qt_classes() -> dict:
             self._config_root = config.config_root()
             self._config = config.load_config(config.config_path(self._config_root))
             self._start_hidden = bool(start_hidden)
+            self._start_bridge_requested = bool(start_bridge)
             self._launch_bridge_on_app_start = bool(
                 self._config.get("launch_bridge_on_app_start", False)
             )
@@ -4247,7 +4253,19 @@ def _load_qt_classes() -> dict:
 
         @Slot()
         def startBridgeOnApplicationStart(self) -> None:
-            if self._launch_bridge_on_app_start and not self._bridge_running:
+            if (
+                self._bridge_running
+                and not bridge_launcher.in_process_bridge_running()
+            ):
+                # Upgrade path: preserve a running legacy service, but move it
+                # into this process so the product does not keep two resident
+                # executables after the settings shell has opened.
+                self._begin_bridge_restart(automatic=True)
+                return
+            if (
+                self._start_bridge_requested or self._launch_bridge_on_app_start
+            ) and not self._bridge_running:
+                self._start_bridge_requested = False
                 self.startBridge()
 
         @Slot()
@@ -4582,7 +4600,21 @@ def _load_qt_classes() -> dict:
 
         @Slot()
         def refreshBridgeState(self) -> None:
-            self._refresh_bridge_status()
+            running = self._refresh_bridge_status()
+            try:
+                requested = single_instance.consume_bridge_start_request(
+                    self._config_root
+                )
+            except OSError:
+                requested = False
+            if requested:
+                self._start_bridge_requested = True
+            if self._start_bridge_requested:
+                if running:
+                    self._start_bridge_requested = False
+                elif running is False and not self._get_bridge_launch_busy():
+                    self._start_bridge_requested = False
+                    self.startBridge()
 
         @Slot()
         def startKeyDetection(self) -> None:
@@ -4611,6 +4643,18 @@ def _load_qt_classes() -> dict:
                     "无法确认后台服务状态；请关闭设置窗口和服务后重试"
                 )
                 return
+            if bridge_running:
+                runtime_status = bridge_runtime_status.read_status(self._config_root)
+                if runtime_status is None:
+                    self._set_key_detection_text(
+                        "后台服务正在运行，但按键通道状态不可用；请重启服务后再检测"
+                    )
+                    return
+                if not bridge_runtime_status.input_channels_ready(runtime_status):
+                    self._set_key_detection_text(
+                        "后台服务当前没有可用的按键通道；请先修复按键通道或重启服务"
+                    )
+                    return
             self._set_key_detection_text(
                 "正在启动真实按键检测…"
             )
@@ -6050,7 +6094,9 @@ def _load_qt_classes() -> dict:
                 )
 
     _qt_classes_cache = {
-        "QGuiApplication": QGuiApplication,
+        # Keep the established cache key for tests/callers, but construct the
+        # QWidget-capable application required by embedded element navigation.
+        "QGuiApplication": QApplication,
         "QIcon": QIcon,
         "QQmlApplicationEngine": QQmlApplicationEngine,
         "QQuickStyle": QQuickStyle,
@@ -6073,7 +6119,9 @@ _QML_MAPPING_MODEL_TYPE_NAME = "ButtonMappingModel"
 _QML_DIAGNOSTICS_TYPE_NAME = "DiagnosticsController"  # XRBM-031
 
 
-def run_settings_window(*, start_hidden: bool = False) -> int:
+def run_settings_window(
+    *, start_hidden: bool = False, start_bridge: bool = False
+) -> int:
     """Builds and runs the Qt Quick/QML settings window. Blocks until the
     window is closed (``QGuiApplication.exec()``), then returns its exit
     code. Raises ``QtUnavailableError`` (via ``_load_qt_classes()``) if
@@ -6110,7 +6158,11 @@ def run_settings_window(*, start_hidden: bool = False) -> int:
         set_quit_on_last_window_closed(False)
 
     model = ButtonMappingModel()
-    controller = SettingsController(model, start_hidden=start_hidden)
+    controller = SettingsController(
+        model,
+        start_hidden=start_hidden,
+        start_bridge=start_bridge,
+    )
     _connect_application_exit(app, controller)
 
     root_window = None
@@ -6188,19 +6240,48 @@ def run_settings_window(*, start_hidden: bool = False) -> int:
         window_chrome_windows.apply_settings_window_chrome(root_window)
         _mark_settings_window_for_activation(root_window)
 
+        if (
+            sys.platform == "win32"
+            and os.environ.get("RC003_DISABLE_LIVE_INPUT") != "1"
+        ):
+            try:
+                navigation_runtime = (
+                    element_navigation_runtime.start_embedded_element_navigation(
+                        app
+                    )
+                )
+            except Exception as exc:
+                logging_setup.get_logger(config.config_root()).warning(
+                    "element navigation unavailable in main process: %s",
+                    type(exc).__name__,
+                )
+            else:
+                element_navigation_control_windows.bind_embedded_element_navigation(
+                    navigation_runtime
+                )
+
         return app.exec()
     finally:
         try:
             controller.shutdownForProcessExit()
         finally:
             try:
-                # XRBM-035: called HERE, synchronously - whether app.exec()
-                # returned normally, engine.load() raised, rootObjects()
-                # was empty, input cleanup raised, or anything else in this
-                # block raised. Independent cleanup steps cannot skip the
-                # diagnostics-worker shutdown contract.
-                _shutdown_diagnostics_workers()
+                bridge_stopped = bridge_launcher.stop_in_process_bridge()
+                if bridge_stopped is False:
+                    logging_setup.get_logger(config.config_root()).error(
+                        "in-process bridge did not stop before desktop shutdown"
+                    )
             finally:
-                audio_playback.cleanup_retained_portaudio_test_resources(
-                    blocking=False
-                )
+                try:
+                    element_navigation_control_windows.shutdown_element_navigation()
+                finally:
+                    try:
+                        # XRBM-035: called HERE, synchronously - whether
+                        # app.exec() returned normally, engine.load() raised,
+                        # rootObjects() was empty, input cleanup raised, or
+                        # anything else in this block raised.
+                        _shutdown_diagnostics_workers()
+                    finally:
+                        audio_playback.cleanup_retained_portaudio_test_resources(
+                            blocking=False
+                        )

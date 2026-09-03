@@ -44,20 +44,24 @@ WUDF_DIAGNOSTIC_SUFFIX = r"Device Parameters\WUDFDiagnosticInfo"
 
 
 # Frida Gadget is loaded into the WUDF host, not into this Python process.
-# The script observes the completed HidOverGatt read and sends only metadata
-# and the nine-byte output buffer to the local, loopback-only tap server.
+# It copies the selected RC003 report to the loopback client and clears the
+# usage payload before Windows translates it into a second keyboard event.
 GADGET_SCRIPT = r"""
 const READ_CHARACTERISTIC_IOCTL = 0x80018483;
 const EXPECTED_OUTPUT_LENGTH = 9;
+const INTERCEPT_PROTOCOL = 3;
 const HEARTBEAT_INTERVAL_MS = 5000;
 const RECONNECT_DELAY_MS = 1000;
+const MAX_INTERCEPT_LEASE_MS = 5000;
 
 let host = "127.0.0.1";
 let port = 30684;
 let output = null;
+let input = null;
 let writeChain = Promise.resolve();
 let reconnectTimer = null;
 let hookInstalled = false;
+let interceptLeaseDeadline = 0;
 
 function asciiBytes(text) {
   const result = [];
@@ -77,6 +81,33 @@ function hex(pointer, length) {
   return result;
 }
 
+function textFromBytes(data) {
+  const bytes = new Uint8Array(data);
+  let result = "";
+  for (let index = 0; index < bytes.length; index++) {
+    result += String.fromCharCode(bytes[index]);
+  }
+  return result;
+}
+
+function interceptionActive() {
+  if (output === null || interceptLeaseDeadline === 0) return false;
+  if (Date.now() < interceptLeaseDeadline) return true;
+  interceptLeaseDeadline = 0;
+  emit({ kind: "intercept_expired", protocol: INTERCEPT_PROTOCOL });
+  return false;
+}
+
+function interceptKeyboardReport(pointer, length) {
+  if (!interceptionActive() || pointer.isNull() || length !== EXPECTED_OUTPUT_LENGTH) {
+    return null;
+  }
+  const raw = hex(pointer, length);
+  if (!raw.startsWith("010000")) return null;
+  pointer.add(3).writeByteArray([0, 0, 0, 0, 0, 0]);
+  return raw;
+}
+
 function scheduleReconnect() {
   if (reconnectTimer !== null) return;
   reconnectTimer = setTimeout(() => {
@@ -88,6 +119,8 @@ function scheduleReconnect() {
 function markDisconnected(currentOutput) {
   if (output !== currentOutput) return;
   output = null;
+  input = null;
+  interceptLeaseDeadline = 0;
   scheduleReconnect();
 }
 
@@ -103,6 +136,71 @@ function emit(payload) {
     .catch(() => markDisconnected(currentOutput));
 }
 
+function acknowledgeControl(action, accepted, state, detail) {
+  emit({
+    kind: "control_ack",
+    action: action,
+    accepted: accepted,
+    state: state,
+    detail: detail || "",
+    protocol: INTERCEPT_PROTOCOL
+  });
+}
+
+function handleControl(message) {
+  if (message === null || typeof message !== "object") return;
+  if (message.kind !== "intercept_control") return;
+  const action = message.action;
+  if (message.protocol !== INTERCEPT_PROTOCOL) {
+    interceptLeaseDeadline = 0;
+    acknowledgeControl(action, false, "disabled", "protocol_mismatch");
+    return;
+  }
+  if (action === "disable") {
+    interceptLeaseDeadline = 0;
+    acknowledgeControl(action, true, "disabled", "");
+    return;
+  }
+  const leaseMs = Number(message.lease_ms);
+  if ((action !== "enable" && action !== "renew") ||
+      !Number.isInteger(leaseMs) || leaseMs <= 0 || leaseMs > MAX_INTERCEPT_LEASE_MS) {
+    interceptLeaseDeadline = 0;
+    acknowledgeControl(action, false, "disabled", "invalid_control");
+    return;
+  }
+  interceptLeaseDeadline = Date.now() + leaseMs;
+  acknowledgeControl(action, true, "enabled", "");
+}
+
+async function readControls(connection) {
+  const currentOutput = connection.output;
+  const currentInput = connection.input;
+  let buffer = "";
+  try {
+    while (output === currentOutput && input === currentInput) {
+      const chunk = await currentInput.read(4096);
+      if (chunk === null) break;
+      buffer += textFromBytes(chunk);
+      if (buffer.length > 65536) break;
+      let newline = buffer.indexOf("\n");
+      while (newline !== -1) {
+        const line = buffer.slice(0, newline);
+        buffer = buffer.slice(newline + 1);
+        try {
+          handleControl(JSON.parse(line));
+        } catch (_error) {
+          // Invalid control input never enables interception.
+          interceptLeaseDeadline = 0;
+        }
+        newline = buffer.indexOf("\n");
+      }
+    }
+  } catch (_error) {
+    // The lease is cleared below before reconnecting.
+  }
+  markDisconnected(currentOutput);
+}
+
 async function connectToHub() {
   if (output !== null) return;
   try {
@@ -112,9 +210,19 @@ async function connectToHub() {
       port: port
     });
     output = connection.output;
-    emit({ kind: "ready", pid: Process.id, hook_installed: hookInstalled });
+    input = connection.input;
+    interceptLeaseDeadline = 0;
+    emit({
+      kind: "ready",
+      pid: Process.id,
+      hook_installed: hookInstalled,
+      protocol: INTERCEPT_PROTOCOL
+    });
+    readControls(connection);
   } catch (_error) {
     output = null;
+    input = null;
+    interceptLeaseDeadline = 0;
     scheduleReconnect();
   }
 }
@@ -138,10 +246,13 @@ function installHook() {
     onLeave(retval) {
       if (!this.capture || retval.toUInt32() !== 0 || this.output.isNull()) return;
       try {
-        if (this.outputLength === EXPECTED_OUTPUT_LENGTH) {
+        const raw = interceptKeyboardReport(this.output, this.outputLength);
+        if (raw !== null) {
           emit({
             kind: "gatt_read",
-            raw: hex(this.output, this.outputLength)
+            raw: raw,
+            intercepted: true,
+            protocol: INTERCEPT_PROTOCOL
           });
         }
       } catch (error) {
@@ -156,7 +267,12 @@ setInterval(() => {
   if (output === null) {
     scheduleReconnect();
   } else {
-    emit({ kind: "heartbeat", pid: Process.id });
+    emit({
+      kind: "heartbeat",
+      pid: Process.id,
+      protocol: INTERCEPT_PROTOCOL,
+      intercept_enabled: interceptionActive()
+    });
   }
 }, HEARTBEAT_INTERVAL_MS);
 

@@ -1,23 +1,20 @@
-"""Windows named-mutex single-instance guards for bridge and settings modes.
+"""Windows named-mutex guards for the desktop app and bridge ownership.
 
-The explicit ``--bridge`` mode (``python -m ovb_rc003 --bridge`` / the
-packaged ``RemoteMicRC003.exe --bridge``) is a long-lived, mostly invisible
-owner of BLE, Raw Input, synthetic key and audio resources. Starting a second
-instance in the same Windows logon session would race both instances over
-those resources - so at most one bridge instance may hold them at a time.
-Settings mode uses a separate per-session mutex. A duplicate settings launch
-never constructs another Qt/QML window; it restores the existing marked
-window instead. The settings and bridge mutexes are deliberately distinct, so
-opening or closing settings never changes bridge ownership or lifetime.
+The settings mutex is now the product-wide application mutex: one desktop
+process owns the Qt window, notification area, bridge worker and element
+navigation runtime. A duplicate launch restores that process instead of
+creating another one. The older bridge mutex remains around the in-process
+worker so a legacy standalone bridge from an earlier build cannot race it for
+BLE, Raw Input, synthetic-key or audio resources during upgrade.
 
 Fail-closed contract (XRBM-021 review round 1 P1 #1): a caller that cannot
 PROVE it is the sole owner - whether because another instance already owns
 the mutex (``DuplicateInstanceError``) or because the Win32 API itself
 could not be used to check at all (``SingleInstanceUnavailableError``) -
-must never fall through to starting the bridge anyway. Both exceptions are
-therefore handled identically by ``__main__.py``'s ``_run_bridge()``: show
-a visible notice, exit with a deterministic nonzero code, and never call
-``app.main()``.
+must never fall through to starting protected resources. ``__main__.py``
+applies this to the one desktop application process, while
+``bridge_launcher.py`` applies it to the in-process bridge worker and the
+legacy bridge-compatibility mutex.
 
 Ctypes ABI: every Win32 call here (``CreateMutexW``, ``ReleaseMutex``,
 ``CloseHandle``, ``MessageBoxW``) declares an explicit ``argtypes``/
@@ -57,20 +54,29 @@ with the logic under test.
 from __future__ import annotations
 
 import ctypes
+import json
+import os
 import sys
+import time
+import uuid
 from ctypes import wintypes
+from pathlib import Path
 from typing import Callable, List, NamedTuple, Optional
 
 from . import product_identity
 
 # Local\ (not Global\) scopes the mutex to the current Terminal Services /
-# Windows logon session, matching the task's "per-session/local name"
-# requirement - a second bridge started by a different logged-in user (or
-# in a different session) is not this guard's concern.
+# Windows logon session. The settings-named mutex is retained as the
+# product-wide application identity for upgrade compatibility; the
+# bridge-named mutex protects hardware ownership against an older standalone
+# bridge from the same session.
 _MUTEX_NAME = r"Local\RemoteMicRC003_BridgeInstance"
 _SETTINGS_MUTEX_NAME = r"Local\RemoteMicRC003_SettingsInstance"
 _ELEMENT_NAVIGATION_MUTEX_NAME = r"Local\RemoteMicRC003_ElementNavigationInstance"
 _SETTINGS_WINDOW_PROPERTY = "RemoteMicRC003.SettingsWindow"
+_BRIDGE_START_REQUEST_FILENAME = "bridge-start-request.json"
+_BRIDGE_START_REQUEST_SCHEMA = 1
+_BRIDGE_START_REQUEST_MAX_AGE_SECONDS = 30.0
 
 # https://learn.microsoft.com/windows/win32/debug/system-error-codes--0-499-
 _ERROR_ALREADY_EXISTS = 183
@@ -93,8 +99,8 @@ class SingleInstanceUnavailableError(Exception):
     single ownership: either this is not Windows, or ``CreateMutexW``
     failed for a reason OTHER than "already exists" (e.g. access denied).
     Distinguishable from ``DuplicateInstanceError`` for logging/diagnostic
-    purposes only - both are handled identically (fail closed) by
-    ``__main__.py``'s ``_run_bridge()``.
+    purposes only; callers fail closed instead of starting protected
+    application or bridge resources without proven ownership.
     """
 
 
@@ -303,6 +309,80 @@ def activate_existing_settings_window(
         return False
 
 
+def bridge_start_request_path(config_root: Path) -> Path:
+    return Path(config_root) / _BRIDGE_START_REQUEST_FILENAME
+
+
+def write_bridge_start_request(
+    config_root: Path,
+    *,
+    now: Callable[[], float] = time.time,
+) -> Path:
+    """Atomically ask the existing desktop process to start its bridge."""
+
+    path = bridge_start_request_path(config_root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        temporary.write_text(
+            json.dumps(
+                {
+                    "schema": _BRIDGE_START_REQUEST_SCHEMA,
+                    "action": "start_bridge",
+                    "created_at": float(now()),
+                },
+                ensure_ascii=True,
+                sort_keys=True,
+            ),
+            encoding="utf-8",
+        )
+        os.replace(temporary, path)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+    return path
+
+
+def consume_bridge_start_request(
+    config_root: Path,
+    *,
+    now: Callable[[], float] = time.time,
+    max_age_seconds: float = _BRIDGE_START_REQUEST_MAX_AGE_SECONDS,
+) -> bool:
+    """Claim and validate one request without deleting a newer replacement."""
+
+    path = bridge_start_request_path(config_root)
+    claimed = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.claimed")
+    try:
+        os.replace(path, claimed)
+    except FileNotFoundError:
+        return False
+    try:
+        try:
+            payload = json.loads(claimed.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            return False
+        if not isinstance(payload, dict):
+            return False
+        created_at = payload.get("created_at")
+        if (
+            payload.get("schema") != _BRIDGE_START_REQUEST_SCHEMA
+            or payload.get("action") != "start_bridge"
+            or not isinstance(created_at, (int, float))
+            or isinstance(created_at, bool)
+        ):
+            return False
+        age = float(now()) - float(created_at)
+        return 0.0 <= age <= max(0.0, float(max_age_seconds))
+    finally:
+        try:
+            claimed.unlink()
+        except FileNotFoundError:
+            pass
+
+
 def _named_mutex_running(
     *,
     name: str,
@@ -503,8 +583,8 @@ class BridgeInstanceGuard:
         return None if closed else "CloseHandle returned FALSE"
 
 
-class SettingsInstanceGuard(BridgeInstanceGuard):
-    """Separate per-session guard for the user-visible settings window."""
+class ApplicationInstanceGuard(BridgeInstanceGuard):
+    """Product-wide guard for the one resident desktop application process."""
 
     def __init__(
         self,
@@ -520,14 +600,18 @@ class SettingsInstanceGuard(BridgeInstanceGuard):
             _release_mutex=_release_mutex,
             _close_handle=_close_handle,
             _duplicate_message=(
-                f"{product_identity.DISPLAY_NAME}设置窗口已在当前 Windows 会话中运行"
+                f"{product_identity.DISPLAY_NAME}已在当前 Windows 会话中运行"
             ),
             _access_denied_means_duplicate=True,
         )
 
 
+class SettingsInstanceGuard(ApplicationInstanceGuard):
+    """Compatibility name for callers from the former settings-only model."""
+
+
 class ElementNavigationInstanceGuard(BridgeInstanceGuard):
-    """Separate per-session guard for the element-navigation companion."""
+    """Compatibility guard for the older standalone navigator entry point."""
 
     def __init__(
         self,

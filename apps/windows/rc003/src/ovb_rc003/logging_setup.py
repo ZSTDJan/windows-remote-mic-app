@@ -28,6 +28,7 @@ from __future__ import annotations
 import logging
 from logging.handlers import RotatingFileHandler
 import os
+import threading
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -41,6 +42,7 @@ LOG_MAX_BYTES = 5 * 1024 * 1024
 LOG_BACKUP_COUNT = 3
 
 _configured = False
+_configuration_lock = threading.Lock()
 
 
 class PrivacySafeExceptionFilter(logging.Filter):
@@ -74,25 +76,26 @@ class PrivacySafeExceptionFilter(logging.Filter):
 def get_logger(root: Optional[Path] = None) -> logging.Logger:
     global _configured
     logger = logging.getLogger(LOGGER_NAME)
-    if _configured:
-        return logger
+    with _configuration_lock:
+        if _configured:
+            return logger
 
-    logger.setLevel(logging.INFO)
-    directory = log_dir(root)
-    directory.mkdir(parents=True, exist_ok=True)
+        logger.setLevel(logging.INFO)
+        directory = log_dir(root)
+        directory.mkdir(parents=True, exist_ok=True)
 
-    handler = RotatingFileHandler(
-        directory / LOG_FILENAME,
-        maxBytes=LOG_MAX_BYTES,
-        backupCount=LOG_BACKUP_COUNT,
-        encoding="utf-8",
-    )
-    handler.addFilter(PrivacySafeExceptionFilter())
-    handler.setFormatter(
-        logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
-    )
-    logger.addHandler(handler)
-    _configured = True
+        handler = RotatingFileHandler(
+            directory / LOG_FILENAME,
+            maxBytes=LOG_MAX_BYTES,
+            backupCount=LOG_BACKUP_COUNT,
+            encoding="utf-8",
+        )
+        handler.addFilter(PrivacySafeExceptionFilter())
+        handler.setFormatter(
+            logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
+        )
+        logger.addHandler(handler)
+        _configured = True
     return logger
 
 

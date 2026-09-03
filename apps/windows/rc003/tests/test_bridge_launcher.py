@@ -6,6 +6,7 @@ tests/test_single_instance.py's injected ``_create_mutex``/etc.).
 """
 
 import unittest
+from unittest import mock
 
 from ovb_rc003 import bridge_launcher, single_instance
 
@@ -289,6 +290,88 @@ class LaunchBridgeTests(unittest.TestCase):
 
         self.assertEqual(len(popen_calls), 1)
         self.assertTrue(popen_calls[0])  # non-empty, host-dependent contents
+
+
+class InProcessBridgeHandleTests(unittest.TestCase):
+    def test_default_product_launch_uses_the_in_process_worker(self):
+        expected = bridge_launcher.LaunchResult(
+            outcome=bridge_launcher.LaunchOutcome.STARTED,
+            command=("<in-process-bridge>",),
+            pid=1234,
+        )
+        with mock.patch.object(
+            bridge_launcher,
+            "start_in_process_bridge",
+            return_value=expected,
+        ) as start:
+            result = bridge_launcher.start_bridge_launch()
+
+        self.assertIs(result, expected)
+        start.assert_called_once_with(
+            grace_checks=bridge_launcher.DEFAULT_GRACE_CHECKS
+        )
+
+    def test_stop_requested_before_runtime_ready_is_delivered_once(self):
+        handle = bridge_launcher._InProcessBridgeHandle()
+        calls = []
+
+        handle.request_stop()
+        handle.request_stop()
+        handle.bind_stop(lambda: calls.append(1))
+
+        self.assertEqual(calls, [1])
+
+    def test_repeated_stop_requests_call_a_bound_callback_once(self):
+        handle = bridge_launcher._InProcessBridgeHandle()
+        calls = []
+        handle.bind_stop(lambda: calls.append(1))
+
+        handle.request_stop()
+        handle.request_stop()
+
+        self.assertEqual(calls, [1])
+
+    def test_public_stop_waits_for_the_owned_worker_and_clears_it(self):
+        class FakeHandle:
+            is_alive = True
+
+            def __init__(self):
+                self.stop_calls = 0
+                self.wait_calls = []
+
+            def request_stop(self):
+                self.stop_calls += 1
+
+            def wait(self, timeout):
+                self.wait_calls.append(timeout)
+                return True
+
+        handle = FakeHandle()
+        original = bridge_launcher._in_process_handle
+        bridge_launcher._in_process_handle = handle
+        try:
+            stopped = bridge_launcher.stop_in_process_bridge(timeout=2.5)
+        finally:
+            bridge_launcher._in_process_handle = original
+
+        self.assertTrue(stopped)
+        self.assertEqual(handle.stop_calls, 1)
+        self.assertEqual(handle.wait_calls, [2.5])
+
+    def test_finished_worker_does_not_mask_a_legacy_bridge(self):
+        class FinishedHandle:
+            is_alive = False
+
+        original = bridge_launcher._in_process_handle
+        bridge_launcher._in_process_handle = FinishedHandle()
+        try:
+            stopped = bridge_launcher.stop_in_process_bridge()
+            current = bridge_launcher._in_process_handle
+        finally:
+            bridge_launcher._in_process_handle = original
+
+        self.assertIsNone(stopped)
+        self.assertIsNone(current)
 
 
 class NonBlockingLaunchTests(unittest.TestCase):
