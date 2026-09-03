@@ -220,6 +220,37 @@ class InjectorSubprocessTests(unittest.TestCase):
             frida_compat.run_injector_subprocess(1234, _run=fake_run)
         self.assertEqual(str(ctx.exception), "injector_timeout")
 
+    def test_normal_frozen_app_uses_the_pre_authorized_task(self):
+        registered = mock.Mock()
+
+        frida_compat.run_injector_subprocess(
+            2468,
+            frozen=True,
+            _is_elevated=lambda: False,
+            _registered_injector=registered,
+        )
+
+        registered.assert_called_once_with(2468)
+
+    def test_elevated_frozen_app_keeps_the_direct_injector_path(self):
+        with mock.patch.object(
+            frida_compat,
+            "_run_direct_injector_subprocess",
+        ) as direct:
+            frida_compat.run_injector_subprocess(
+                2468,
+                frozen=True,
+                _is_elevated=lambda: True,
+                _registered_injector=mock.Mock(),
+            )
+
+        direct.assert_called_once_with(
+            2468,
+            timeout=frida_compat.HID_TAP_INJECTOR_TIMEOUT_SECONDS,
+            frozen=True,
+            executable=None,
+        )
+
     def test_child_entrypoint_returns_stable_permission_failure_code(self):
         with mock.patch.object(
             frida_hid_tap_injector,
@@ -546,6 +577,67 @@ class TapStateTests(unittest.TestCase):
                     "injector_requires_administrator",
                 ),
             ],
+        )
+
+    def test_missing_gadget_connection_becomes_a_stable_failure(self):
+        statuses = []
+        tap = frida_compat.RC003HidReportTap(
+            lambda _report_id, _payload: None,
+            enabled=False,
+            injector=lambda _pid: None,
+            connection_timeout=1.0,
+            status_handler=lambda status, detail: statuses.append((status, detail)),
+        )
+        wait_count = 0
+
+        def bounded_wait(_delay):
+            nonlocal wait_count
+            wait_count += 1
+            if wait_count == 1:
+                tap.stop_event.set()
+
+        tap.stop_event.wait = mock.Mock(side_effect=bounded_wait)
+
+        class FakeServer:
+            def setsockopt(self, *_args):
+                pass
+
+            def bind(self, _address):
+                pass
+
+            def listen(self, _backlog):
+                pass
+
+            def settimeout(self, _timeout):
+                pass
+
+            def accept(self):
+                raise frida_compat.socket.timeout()
+
+            def close(self):
+                pass
+
+        with mock.patch.object(
+            frida_compat.frida_hid_tap_runtime,
+            "find_rc003_hidogatt_host_pid",
+            return_value=2468,
+        ), mock.patch.object(
+            frida_compat.socket,
+            "socket",
+            return_value=FakeServer(),
+        ), mock.patch.object(
+            frida_compat.time,
+            "monotonic",
+            side_effect=[10.0, 11.1],
+        ):
+            tap._run()
+
+        self.assertIn(
+            (
+                frida_compat.HidTapState.FAILED.value,
+                "gadget_connection_timeout",
+            ),
+            statuses,
         )
 
 

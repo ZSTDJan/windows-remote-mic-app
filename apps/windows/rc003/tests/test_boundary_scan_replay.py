@@ -92,6 +92,8 @@ _BRANDING_CHECK_EXEMPT_RELATIVE_PATHS = {
     Path("tests/test_boundary_scan_replay.py"),
     Path("build/check-public-boundary.ps1"),
     Path("installer/readme-rc003.txt"),
+    Path("src/ovb_rc003/hid_elevation_windows.py"),
+    Path("installer/RemoteMicRC003Setup.iss"),
     Path("src/ovb_rc003/vb_cable_bundle.py"),
     Path("src/ovb_rc003/voice_program_manager.py"),
     # XRBM-031: README.md/ATTRIBUTION.md document the same disclosed
@@ -263,6 +265,26 @@ class BoundaryScanReplayTests(unittest.TestCase):
         self.assertNotIn("sys.executable", text)
         self.assertIn("winreg.QueryValueEx", text)
         self.assertNotIn("winreg.SetValueEx", text)
+
+    def test_hid_elevation_module_has_only_the_fixed_on_demand_task_boundary(self):
+        path = _RC003_ROOT / "src" / "ovb_rc003" / "hid_elevation_windows.py"
+        text = path.read_text(encoding="utf-8")
+        self.assertTrue(any(marker in text for marker in _ELEVATION_MARKERS))
+        self.assertFalse(any(pattern.search(text) for pattern in _FORBIDDEN_BRANDING_PATTERNS))
+        self.assertFalse(any(marker in text for marker in _AUTOSTART_MARKERS))
+        self.assertIn(r'TASK_NAME = r"\RemoteMic\RC003\HidTapInjector"', text)
+        self.assertIn('INJECT_FLAG = "--inject"', text)
+        self.assertIn('lpVerb = "runas"', text)
+        self.assertNotIn('add_argument("--pid"', text)
+
+    def test_installer_elevation_is_not_a_login_trigger_or_admin_manifest(self):
+        path = _RC003_ROOT / "installer" / "RemoteMicRC003Setup.iss"
+        effective = _remove_comment_lines(path.read_text(encoding="utf-8"), ".iss")
+        self.assertIn("ShellExec", effective)
+        self.assertIn("'runas'", effective)
+        self.assertIn("PrivilegesRequired=lowest", effective)
+        self.assertNotIn("PrivilegesRequired=admin", effective)
+        self.assertNotIn("userstartup", effective.casefold())
 
     def test_readme_is_exempt_only_for_its_documented_elevation_reason(self):
         path = _RC003_ROOT / "README.md"

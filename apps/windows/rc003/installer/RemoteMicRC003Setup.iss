@@ -4,7 +4,11 @@
 ; remaining checks before treating this as a supported release artifact.
 ;
 ; Hard boundaries enforced by this script:
-;   - PrivilegesRequired=lowest (no admin elevation requested, ever).
+;   - PrivilegesRequired=lowest: the installer and desktop application stay
+;     per-user/non-elevated. After files are installed, one narrow helper is
+;     launched with the Windows runas verb so the user can approve creation
+;     of the fixed on-demand HID task. Normal launch and login startup never
+;     request elevation.
 ;   - No [Tasks]/[Icons] entry adds login startup. The installed app exposes
 ;     an explicit per-user option and uninstall removes only its owned value.
 ;   - This INSTALLER SCRIPT never installs, configures, silently modifies,
@@ -29,6 +33,7 @@
 #define AppPublisher "无线麦项目"
 #define AppVersion "0.1.0-candidate"
 #define AppExeName "RemoteMicRC003.exe"
+#define HidHelperExeName "RemoteMicRC003HidHelper.exe"
 #define AppFolder "RC003"
 #define DistDir "..\dist\RemoteMicRC003"
 
@@ -112,6 +117,32 @@ Name: "{userdesktop}\{#AppName}"; Filename: "{app}\{#AppExeName}"; Tasks: deskto
 Filename: "{app}\{#AppExeName}"; Parameters: "--settings"; Description: "打开 {#AppName} 设置"; Flags: postinstall nowait skipifsilent unchecked
 
 [Code]
+var
+  HidHelperInstallSucceeded: Boolean;
+
+function RunHidHelper(const Parameters: String; var ResultCode: Integer): Boolean;
+var
+  HelperPath: String;
+begin
+  HelperPath := ExpandConstant('{app}\{#HidHelperExeName}');
+  if not FileExists(HelperPath) then
+  begin
+    ResultCode := -1;
+    Result := False;
+    exit;
+  end;
+  Result := ShellExec(
+    'runas',
+    HelperPath,
+    Parameters,
+    ExpandConstant('{sys}'),
+    SW_HIDE,
+    ewWaitUntilTerminated,
+    ResultCode
+  );
+  Result := Result and (ResultCode = 0);
+end;
+
 function PrepareToInstall(var NeedsRestart: Boolean): String;
 var
   ResultCode: Integer;
@@ -132,6 +163,29 @@ begin
     Result := '无线麦仍在运行或未能确认退出；请先退出程序后再重试安装。';
     exit;
   end;
+end;
+
+procedure CurStepChanged(CurStep: TSetupStep);
+var
+  ResultCode: Integer;
+begin
+  if CurStep <> ssPostInstall then
+    exit;
+
+  HidHelperInstallSucceeded := RunHidHelper('--install-task', ResultCode);
+  if not HidHelperInstallSucceeded then
+    MsgBox(
+      '主程序已经安装，但管理员按键组件没有安装成功。方向键仍按 Windows 原始方向执行一次，自定义方向映射已停用。可打开无线麦，在“按键接收”旁点击“修复权限”重试。',
+      mbError,
+      MB_OK
+    );
+end;
+
+procedure CurPageChanged(CurPageID: Integer);
+begin
+  if (CurPageID = wpFinished) and (not HidHelperInstallSucceeded) then
+    WizardForm.FinishedLabel.Caption :=
+      '无线麦主程序已安装，但管理员按键组件未完成。方向键不会连击；修复权限后才能使用自定义方向映射。';
 end;
 
 function InitializeUninstall(): Boolean;
@@ -160,6 +214,17 @@ begin
   begin
     MsgBox(
       '无线麦仍在运行或未能确认退出。卸载尚未开始，请先退出程序后重试。',
+      mbError,
+      MB_OK
+    );
+    Result := False;
+    exit;
+  end;
+
+  if not RunHidHelper('--uninstall-task', ResultCode) then
+  begin
+    MsgBox(
+      '管理员按键组件未能卸载。卸载尚未开始，请确认 UAC 后重试，以免系统中留下失效的计划任务。',
       mbError,
       MB_OK
     );

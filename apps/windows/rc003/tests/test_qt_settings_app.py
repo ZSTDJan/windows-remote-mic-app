@@ -500,6 +500,82 @@ class SettingsControllerTests(unittest.TestCase):
             controller.trayIconSource.endswith("remote-mic-unavailable.svg")
         )
 
+    def test_installed_helper_issue_exposes_an_explicit_repair_action(self):
+        with mock.patch.object(
+            qt_settings_app.hid_elevation_windows,
+            "inspect_installed_helper",
+            return_value=qt_settings_app.hid_elevation_windows.HidHelperState(
+                False, "hid_helper_task_missing"
+            ),
+        ), mock.patch.object(
+            qt_settings_app.hid_elevation_windows,
+            "is_installed_distribution",
+            return_value=True,
+        ):
+            controller, _model = self._make_controller()
+
+        self.assertTrue(controller.hidHelperIssueVisible)
+        self.assertTrue(controller.hidHelperRepairVisible)
+        self.assertIn("自定义方向映射已停用", controller.hidHelperIssueText)
+
+    def test_successful_helper_repair_clears_the_issue(self):
+        missing = qt_settings_app.hid_elevation_windows.HidHelperState(
+            False, "hid_helper_task_missing"
+        )
+        ready = qt_settings_app.hid_elevation_windows.HidHelperState(True)
+        with mock.patch.object(
+            qt_settings_app.hid_elevation_windows,
+            "inspect_installed_helper",
+            return_value=missing,
+        ), mock.patch.object(
+            qt_settings_app.hid_elevation_windows,
+            "is_installed_distribution",
+            return_value=True,
+        ):
+            controller, _model = self._make_controller()
+
+        with mock.patch.object(
+            qt_settings_app.hid_elevation_windows,
+            "request_install_elevation",
+            return_value=ready,
+        ) as repair:
+            controller.repairHidHelper()
+
+        repair.assert_called_once_with()
+        self.assertFalse(controller.hidHelperRepairBusy)
+        self.assertFalse(controller.hidHelperIssueVisible)
+        self.assertFalse(controller.hidHelperRepairVisible)
+        self.assertIn("已修复", controller.statusMessage)
+
+    def test_cancelled_helper_repair_keeps_direction_mapping_disabled(self):
+        missing = qt_settings_app.hid_elevation_windows.HidHelperState(
+            False, "hid_helper_task_missing"
+        )
+        cancelled = qt_settings_app.hid_elevation_windows.HidHelperState(
+            False, "uac_cancelled"
+        )
+        with mock.patch.object(
+            qt_settings_app.hid_elevation_windows,
+            "inspect_installed_helper",
+            return_value=missing,
+        ), mock.patch.object(
+            qt_settings_app.hid_elevation_windows,
+            "is_installed_distribution",
+            return_value=True,
+        ):
+            controller, _model = self._make_controller()
+
+        with mock.patch.object(
+            qt_settings_app.hid_elevation_windows,
+            "request_install_elevation",
+            return_value=cancelled,
+        ):
+            controller.repairHidHelper()
+
+        self.assertTrue(controller.hidHelperRepairVisible)
+        self.assertIn("修复未执行", controller.errorMessage)
+        self.assertIn("自定义方向映射保持停用", controller.errorMessage)
+
     def test_desktop_behavior_changes_are_persisted_immediately(self):
         controller, _model = self._make_controller()
         controller.setLaunchBridgeOnAppStart(True)
@@ -1833,6 +1909,33 @@ class SettingsControllerTests(unittest.TestCase):
         self.assertIn("两个按键通道正常", controller.launchStatusText)
         self.assertIn("刚收到按键", controller.launchStatusText)
         self.assertFalse(controller.bridgeRestartRecommended)
+
+    def test_raw_input_ready_with_failed_tap_reports_direction_mapping_disabled(self):
+        self._bridge_status_patch.stop()
+        self._bridge_status_patch = mock.patch.object(
+            qt_settings_app.single_instance,
+            "bridge_instance_running",
+            return_value=True,
+        )
+        self._bridge_status_patch.start()
+        identity = bridge_runtime_status.current_runtime_identity(
+            qt_settings_app.__version__
+        )
+        bridge_runtime_status.publish_status(
+            config.config_root(),
+            bridge_runtime_status.BridgeConnectionState.CONNECTED,
+            pid=4321,
+            identity=identity,
+            raw_input_state="ready",
+            hid_tap_state=frida_compat.HidTapState.FAILED.value,
+        )
+
+        controller, _ = self._make_controller()
+
+        self.assertIn(
+            "普通按键可用；方向映射已停用",
+            controller.launchStatusText,
+        )
 
     def test_legacy_bridge_recommends_manual_restart_without_auto_stopping(self):
         self._bridge_status_patch.stop()
@@ -5965,6 +6068,13 @@ class SettingsShellSourceContractTests(unittest.TestCase):
             "SettingsController.activePageIndex = currentIndex",
             self.main_qml,
         )
+
+    def test_hid_helper_repair_is_scoped_to_the_button_receiver_row(self):
+        self.assertIn('objectName: "buttonReceiverRow"', self.device_qml)
+        self.assertIn('objectName: "repairHidHelperButton"', self.device_qml)
+        self.assertIn("SettingsController.repairHidHelper()", self.device_qml)
+        self.assertIn("SettingsController.hidHelperRepairVisible", self.device_qml)
+        self.assertIn("管理员按键组件异常", self.device_qml)
         self.assertIn(
             "SettingsController.feedbackPageIndex === tabBar.currentIndex",
             self.main_qml,

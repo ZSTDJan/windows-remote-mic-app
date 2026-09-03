@@ -1,8 +1,9 @@
 """Narrowly-scoped x64 DLL injector for the RC003 WUDF host.
 
-This is adapted from remote-bridge-hub's Xiaomi injector.  Injection is only
-attempted from a process the user has explicitly started with administrator
-rights.  The normal Remote Mic process never elevates itself.
+This is adapted from remote-bridge-hub's Xiaomi injector. Injection is only
+attempted inside an already-elevated process: either the fixed pre-authorized
+HID helper or an explicitly elevated source/debug process. The normal Remote
+Mic process never elevates itself.
 """
 
 from __future__ import annotations
@@ -264,9 +265,9 @@ def _target_process_name(pid: int) -> str:
 def inject_current_process(pid: int) -> None:
     """Inject only when this process already has the required rights.
 
-    The application deliberately does not request elevation.  Callers that
-    want the optional tap must launch the bridge explicitly from an elevated
-    terminal or executable.
+    The desktop application deliberately does not request elevation. Installed
+    builds call this function inside the fixed scheduled helper; source/debug
+    callers may instead start the process explicitly from an elevated terminal.
     """
 
     if os.name != "nt":

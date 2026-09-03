@@ -1,6 +1,7 @@
 # PyInstaller spec for Remote Mic · RC003 (Windows source/build candidate).
 #
-# One-dir build (COLLECT), matching the layout pattern this project's
+# One-dir desktop build (COLLECT) plus one self-contained, narrow HID helper,
+# matching the layout pattern this project's
 # upstream reference uses for its own standalone products, minus everything
 # out of scope for this candidate: no other-device (T1/V60) code, and no
 # licensing/DRM modules (none exist in this tree to begin with). The pinned,
@@ -46,6 +47,7 @@ DEVICE_PROFILES_DIR = REPO_ROOT / "device-profiles"
 # offline on the end-user machine.
 VB_CABLE_BUNDLE_ZIP = RC003_ROOT / "build" / "third_party" / "VBCABLE_Driver_Pack45.zip"
 FRIDA_ASSET_DIR = SRC_ROOT / "ovb_rc003" / "frida_assets"
+HID_HELPER_NAME = "RemoteMicRC003HidHelper"
 
 # Import only the stdlib-only pin/runtime helper so the build contract has one
 # authoritative filename and SHA-256. Source execution may omit the asset, but
@@ -140,6 +142,7 @@ hiddenimports = [
     "ovb_rc003.frida_compat",
     "ovb_rc003.frida_hid_tap_runtime",
     "ovb_rc003.frida_hid_tap_injector",
+    "ovb_rc003.hid_elevation_windows",
     "ovb_rc003.single_instance",  # XRBM-021: imported lazily inside
     # __main__.py's _run_bridge(), same as the other lazily-imported
     # modules above.
@@ -269,10 +272,65 @@ exe = EXE(
     upx=False,
     console=False,
     icon=str(APP_ICON),
+    uac_admin=False,
+)
+
+# The helper is deliberately a one-file executable because setup copies this
+# executable alone into Program Files. It contains only the fixed task
+# lifecycle, WUDFHost validation/injection code, and the pinned Gadget asset;
+# Qt, BLE, audio, settings, and user configuration code are excluded.
+helper_a = Analysis(
+    [str(SRC_ROOT / "hid_helper_launcher.py")],
+    pathex=[str(SRC_ROOT)],
+    binaries=[],
+    datas=[(str(FRIDA_GADGET_ARCHIVE), "ovb_rc003/frida_assets")],
+    hiddenimports=[
+        "ovb_rc003.hid_elevation_windows",
+        "ovb_rc003.frida_hid_tap_injector",
+        "ovb_rc003.frida_hid_tap_runtime",
+    ],
+    hookspath=[],
+    hooksconfig={},
+    runtime_hooks=[],
+    excludes=[
+        "PySide6",
+        "numpy",
+        "sounddevice",
+        "winrt",
+        "uiautomation",
+        "comtypes",
+        "ovb_rc003.app",
+        "ovb_rc003.qt_settings_app",
+        "ovb_rc003.ble_transport_winrt",
+        "ovb_rc003.audio_playback",
+    ],
+    win_no_prefer_redirects=False,
+    win_private_assemblies=False,
+    cipher=block_cipher,
+    noarchive=False,
+)
+
+helper_pyz = PYZ(helper_a.pure, helper_a.zipped_data, cipher=block_cipher)
+
+helper_exe = EXE(
+    helper_pyz,
+    helper_a.scripts,
+    helper_a.binaries,
+    helper_a.datas,
+    [],
+    name=HID_HELPER_NAME,
+    debug=False,
+    bootloader_ignore_signals=False,
+    strip=False,
+    upx=False,
+    console=False,
+    icon=str(APP_ICON),
+    uac_admin=False,
 )
 
 coll = COLLECT(
     exe,
+    helper_exe,
     a.binaries,
     a.zipfiles,
     a.datas,

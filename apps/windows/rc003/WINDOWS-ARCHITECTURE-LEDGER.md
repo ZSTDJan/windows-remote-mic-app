@@ -120,7 +120,8 @@ RC003 原本是面向电视/机顶盒的蓝牙语音遥控器。Windows 可以�
 
 ## 6. 可执行程序角色
 
-冻结包只有一个 `RemoteMicRC003.exe`，参数决定角色：
+冻结目录包含一个用户入口 `RemoteMicRC003.exe`，参数决定桌面角色；另有一个
+只供安装器、权限修复和固定计划任务调用的 `RemoteMicRC003HidHelper.exe`：
 
 | 入口 | 角色 | 是否持有硬件资源 |
 | --- | --- | --- |
@@ -130,6 +131,13 @@ RC003 原本是面向电视/机顶盒的蓝牙语音遥控器。Windows 可以�
 | `--help` | 帮助文本 | 否 |
 | `--diagnose-ble-candidates <result>` | 隐藏的有界 BLE 诊断子进程 | 短暂持有 WinRT BLE 枚举资源 |
 | `--rc003-hid-injector --pid ...` | 隐藏的受限注入子进程 | 短暂持有目标进程句柄 |
+| HID 助手 `--install-task` / `--uninstall-task` | 经 UAC 明确启动的安装或卸载动作 | 写入/删除 Program Files 助手和固定计划任务 |
+| HID 助手 `--inject` | 计划任务按需启动的管理员注入动作 | 短暂持有已独立定位并核验的 RC003 WUDFHost 句柄 |
+
+HID 助手不接受 PID、程序路径或用户配置。计划任务没有登录触发器，只能运行
+Program Files 中的固定助手和固定 `--inject` 参数；主程序、桥接和登录自启仍为
+普通权限。当前任务归属正在登录的管理员账号，不支持标准账号借用另一管理员账号
+凭据后继续无提示调用。
 
 源码运行使用 `python -m ovb_rc003`。PyInstaller 不直接分析包内
 `__main__.py`，而从顶层 `src/launcher.py` 做绝对导入，避免冻结入口失去
@@ -169,6 +177,7 @@ RC003 遥控器
 设置进程 -- 一次性 key-detection 文件 IPC ---- 后台桥接捕获下一键
 后台桥接 -- 原子运行状态 + 5 秒心跳 ----------- 设置页版本/通道校验
 后台桥接 -- app.log --------------------------- 设置页/用户诊断
+后台桥接 -- schtasks /Run 固定任务 ------------ 管理员 HID 助手 --> 核验并注入 WUDFHost
 ```
 
 这里有两条相互独立、在主映射解析为语音动作时汇合的数据链：
@@ -200,16 +209,28 @@ Frida Gadget。服务端通过 `GetExtendedTcpTable` 核对 TCP 客户端进程 
 无法确认或 PID 不等于刚核验过的 WUDFHost 时，连接会在读取任何消息前关闭。
 日志只写固定状态，不持久化端点、PID、设备路径或地址。
 
+冻结安装版由普通权限桥接调用预先登记的固定计划任务；管理员助手自行重新定位
+RC003 的 WUDFHost、启用调试权限、复核进程名和固定 Gadget 哈希后注入。源码调试
+或手动以管理员权限运行的便携版仍可走原有直接注入子进程。助手、任务、哈希或
+Gadget 连接任一项不符合预期时，tap 明确失败，不回退为未经核验的注入。
+
 ### 8.2 去重与原生按键抑制
 
 同一个按键可能同时被 HID tap 和 Windows 原生键盘路径报告。如果两条路径都
 继续传播，用户会同时得到原生字符/功能和映射动作。
 
 - `legacy_key_suppressor_windows.py` 安装低层键盘钩子；
-- HID tap 或 Raw Input 根据已知 usage 提前 arm 一个待吞掉边沿；
+- HID tap 根据已知 usage 提前 arm 一个待吞掉边沿；非方向键在 tap 尚未接管时仍可
+  由 Raw Input arm；
 - 低层钩子本身看不到设备身份，只在短时间窗内吞掉与 arm 条目键值、扫描码、
   扩展位和按下/释放状态都匹配的非注入边沿；
 - 应用随后只执行一次映射动作。
+
+方向键是单独的归属规则：Raw Input 到达时 Windows 已经把原始方向送给前台，不能再
+靠它及时吞掉本轮原始键。因此上下左右只接受 HID tap 执行映射并提前 arm 抑制器；
+Raw Input 方向事件不执行映射，也不迟到地 arm。tap 正常时保留自定义单击、双击、
+长按和遥控器组合；tap 异常时只让 Windows 原始方向通过一次，避免原始方向与映射
+方向同时执行。其它非方向按键继续沿用原有 Raw Input/HID tap 旁路和降级规则。
 
 麦克风的原生 F5 是特殊路径：部分 RC003/Windows 组合只把麦克风键暴露成
 无法关联设备来源的 legacy F5。桥接运行时，专用钩子会吞掉非注入 F5，避免
@@ -464,7 +485,7 @@ VB-CABLE 的检测、确认和 UAC 安装继续只有 `DiagnosticsPage.qml` 一�
 | 音频播放 worker | 64 帧 PCM FIFO、停止屏障和阻塞式 PortAudio 写入 | 队列满/写失败/屏障超时停止转发并请求重连；未停止时保留 sink |
 | Raw Input 线程 | 隐藏窗口、设备通知、按键状态 | join 超时保留 listener 引用 |
 | 低层钩子线程 | F5/原生键抑制 | 消息队列 ready 后才报告启动成功 |
-| HID tap 线程/注入子进程 | loopback server、目标进程句柄、Gadget 消息 | 验证客户端 PID，心跳/大小有界 |
+| HID tap 线程/管理员助手 | loopback server、固定计划任务、目标进程句柄、Gadget 消息 | 助手无动态目标参数；验证任务 XML、助手哈希和客户端 PID，心跳/大小有界 |
 | 托盘线程 | Win32 window、图标、菜单 | 退出回投 asyncio，不直接碰 BLE |
 | Qt 诊断线程 | 一次诊断任务 | 窗口退出发 stop 并有界等待 |
 | PortAudio sink | native output stream | close 未确认时保留 owner 重试 |
@@ -498,27 +519,33 @@ VB-CABLE 的检测、确认和 UAC 安装继续只有 `DiagnosticsPage.qml` 一�
 ## 14. 构建、安装与第三方资产
 
 `build/RemoteMicRC003.spec` 生成 one-dir、windowed、unsigned PyInstaller
-候选。构建明确包含 QML、设备 profiles、遥控器图片和已验证的可选资产。
+候选。目录内包含普通权限桌面 EXE 和自包含、普通 manifest 的窄职责 HID 助手；
+助手只打入固定任务生命周期、WUDFHost 核验/注入代码和固定 Gadget 资产，不打入
+Qt、BLE、音频、设置或用户配置模块。构建同时包含 QML、设备 profiles、遥控器图片
+和已验证的可选资产。
 
 `build/build-candidate.ps1` 的门禁顺序是：
 
 1. 准备虚拟环境和固定依赖；
 2. 公开边界扫描；
 3. 下载并校验固定 VB-CABLE 包；
-4. 运行带 `ResourceWarning` 门禁的完整测试；
-5. PyInstaller 构建；
-6. 冻结 EXE `--dry-run`。
+4. 下载并校验固定 Frida Gadget；
+5. 运行带 `ResourceWarning` 门禁的完整测试；
+6. PyInstaller 构建并确认两个 EXE 都存在；
+7. 冻结 EXE `--dry-run` 和 Qt 运行时检查。
 
-Frida Gadget 与 VB-CABLE 的构建策略不同：VB-CABLE 是候选构建的必经下载门禁，
-而 Frida 仍由 `fetch-frida-gadget.ps1` 显式获取，`build-candidate.ps1` 不会自动
-下载它。需要保留返回键/音量键 HID tap 补齐能力的完整 RC003 候选，必须在构建
-前完成 Frida 固定哈希校验，并在成品目录和 ZIP 中再次确认资产存在；缺失该文件的
-包只能作为不含 HID tap 的降级构建，不能沿用完整候选的验收结论。
+Frida Gadget 与 VB-CABLE 都是候选构建的固定下载和哈希门禁；PyInstaller spec
+还会再次校验 Frida，并把它分别放入桌面目录和自包含 HID 助手。缺失、哈希不符或
+助手未生成都会直接停止构建，不能产出没有完整 HID 能力却沿用候选结论的包。
 
-`installer/RemoteMicRC003Setup.iss` 是 per-user 安装器，不自动启动、不自动
-安装驱动。升级和卸载前调用 `stop-app.ps1`，只停止安装目录下、文件名精确为
-`RemoteMicRC003.exe` 且 PID/CreationDate 仍匹配的进程。无法确认退出时，
-安装或卸载会停止，不覆盖仍在使用的文件。
+`installer/RemoteMicRC003Setup.iss` 是 per-user、普通权限安装器，不自动启动、
+不自动安装驱动。文件写入后只通过 Windows 管理员确认启动 HID 助手的固定
+`--install-task`；
+用户拒绝 UAC 时主程序仍可安装，但方向映射明确停用并提供“修复权限”。升级和
+卸载前调用 `stop-app.ps1`，只停止安装目录下、文件名精确为
+`RemoteMicRC003.exe` 且 PID/CreationDate 仍匹配的进程。卸载在删除程序文件前
+用固定 `--uninstall-task` 删除计划任务和 Program Files 助手；UAC 取消或清理失败
+会中止卸载，避免留下指向失效文件的任务。
 
 Frida Gadget 与 VB-CABLE 包都使用固定 URL/version/SHA-256。运行时仍再次
 校验，不把“构建时下载成功”当成永久可信。
@@ -560,7 +587,7 @@ F5 不再向输入框泄漏日期时间。On-request 真机探针最终未收到
 | 普通按键 | `raw_input_windows.py`、`hid_identity.py`、`button_gesture.py` |
 | 动作输出 | `key_mapping.py`、`win32_input.py`、`action_executor.py` |
 | F5/跨来源语音仲裁 | `app.py`、`legacy_key_suppressor_windows.py`、`hotkey_capture_windows.py` |
-| HID tap | `frida_compat.py`、`frida_hid_tap_runtime.py`、`frida_hid_tap_injector.py` |
+| HID tap 与预授权助手 | `frida_compat.py`、`frida_hid_tap_runtime.py`、`frida_hid_tap_injector.py`、`hid_elevation_windows.py`、`hid_helper_launcher.py` |
 | 豆包兼容 | `doubao_rpc.py` |
 | 配置/IPC | `config.py`、`key_detection_bridge.py`、`key_testing.py` |
 | 设置界面 | `qt_settings_app.py`、`settings_ui.py`、`qml/*.qml` |

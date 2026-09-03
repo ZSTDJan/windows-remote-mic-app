@@ -58,12 +58,15 @@ _ELEVATION_MARKERS = (
 
 _FORBIDDEN_BINARY_SUFFIXES = (".exe", ".dll", ".pyd", ".zip", ".xz")
 
-# Disclosed third-party launch exceptions. Neither module elevates Remote Mic
-# itself: one starts VB-CABLE's installer after confirmation, while the other
-# can start the user-selected voice-input program elevated only when that
-# option is enabled. Every other package module remains elevation-free.
+# Reviewed elevation boundaries. Two modules launch third-party programs only;
+# hid_elevation_windows.py owns the one narrow project helper that installs and
+# runs a fixed, on-demand HID task while the desktop process stays asInvoker.
 _ELEVATION_MARKER_EXEMPT_FILENAMES = frozenset(
-    {"vb_cable_bundle.py", "voice_program_manager.py"}
+    {
+        "hid_elevation_windows.py",
+        "vb_cable_bundle.py",
+        "voice_program_manager.py",
+    }
 )
 
 # vb_cable_bundle.py/windows_diagnostics.py/qt_settings_app.py are the three
@@ -147,6 +150,17 @@ class NoElevationOrAutoDriverTests(unittest.TestCase):
         self.assertNotIn("sys.executable", text)
         self.assertIn("winreg.QueryValueEx", text)
         self.assertNotIn("winreg.SetValueEx", text)
+
+    def test_hid_elevation_is_scoped_to_a_fixed_helper_and_task(self):
+        path = _PACKAGE_ROOT / "hid_elevation_windows.py"
+        text = path.read_text(encoding="utf-8")
+        self.assertIn(r'TASK_NAME = r"\RemoteMic\RC003\HidTapInjector"', text)
+        self.assertIn('HELPER_EXE_NAME = "RemoteMicRC003HidHelper.exe"', text)
+        self.assertIn('INJECT_FLAG = "--inject"', text)
+        self.assertIn('lpVerb = "runas"', text)
+        self.assertIn('"Program Files"', text.replace("PROGRAMFILES", "Program Files"))
+        self.assertNotIn('add_argument("--pid"', text)
+        self.assertNotIn("CurrentVersion\\Run", text)
 
     def test_no_vbcable_install_function_exists_outside_the_sanctioned_module(self):
         offenders = []

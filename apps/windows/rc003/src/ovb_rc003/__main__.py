@@ -144,6 +144,7 @@ def _dry_run() -> int:
         element_navigation_runtime,
         frida_compat,
         frida_hid_tap_injector,
+        hid_elevation_windows,
         hid_identity,
         hotkey,
         identity,

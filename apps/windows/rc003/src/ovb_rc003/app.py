@@ -127,6 +127,7 @@ _KEY_DETECTION_MIC_RELEASE_GRACE_SECONDS = 1.0
 _KEY_DETECTION_MIC_MAX_SECONDS = 10.0
 _ORDINARY_MIC_RELEASE_GUARD_SECONDS = 0.12
 _RUNTIME_STATUS_HEARTBEAT_SECONDS = 5.0
+_DIRECTION_BUTTON_IDS = frozenset({"up", "down", "left", "right"})
 _VOICE_HOTKEY_BACKEND_MARKED = "marked_keybd_event"
 _VOICE_HOTKEY_BACKEND_WETYPE = "wetype_virtual_key_sendinput"
 
@@ -289,6 +290,7 @@ class RC003App:
         # While the tap side channel is live, the keyboard Raw Input path
         # stands down so the same physical edge is not armed/dispatched twice.
         self._direct_hid_tap_active = False
+        self._direction_fallback_buttons_down: set[str] = set()
         self._key_detection_suppressed_buttons: set[str] = set()
         self._key_detection_mic_lock = threading.Lock()
         self._key_detection_mic_gesture_active = False
@@ -688,6 +690,7 @@ class RC003App:
         with self._direct_hid_lock:
             self._direct_hid_usages.clear()
         self._direct_hid_tap_active = False
+        self._direction_fallback_buttons_down.clear()
         self._key_detection_suppressed_buttons.clear()
         with self._ordinary_mic_lock:
             self._ordinary_mic_sources_down.clear()
@@ -1320,13 +1323,14 @@ class RC003App:
             return True
 
     def _on_raw_input_event(self, event: raw_input_windows.RawInputEvent) -> None:
-        """Arm the exact original keyboard edge for duplicate suppression.
+        """Arm eligible non-direction keyboard edges for duplicate suppression.
 
         The selected RC003 Raw Input listener is device-scoped; the global
         low-level keyboard hook is not.  Passing the observed VKey/MakeCode
-        pair across this seam lets the hook swallow only the remote's
-        original arrow/Enter/Home/consumer event before the injected mapping
-        action is delivered.
+        pair across this seam lets the hook swallow only the matching remote
+        edge before the injected mapping action is delivered. Direction keys
+        are intentionally excluded because Raw Input reports them after the
+        foreground application has already received the original key.
         """
 
         if not self._accept_input_events:
@@ -1340,6 +1344,14 @@ class RC003App:
             or event.vkey is None
             or event.make_code is None
         ):
+            return
+        # Raw Input reaches the app after Windows has already delivered the
+        # same arrow to the foreground process. Arming from here is too late:
+        # it can only suppress later repeat/up records while the mapped action
+        # creates a second press. Direction ownership therefore belongs to the
+        # earlier HID tap side channel; without it, Windows keeps its original
+        # arrow behavior unchanged.
+        if event.button_id in _DIRECTION_BUTTON_IDS:
             return
         # While the Frida tap side channel is reporting full keyboard
         # snapshots, it already arms and dispatches every ordinary button on
@@ -1552,6 +1564,19 @@ class RC003App:
         event_source: str = "hid",
     ) -> None:
         if not self._accept_input_events:
+            return
+        if button_id in _DIRECTION_BUTTON_IDS and event_source != "hid_tap":
+            if is_pressed:
+                if button_id not in self._direction_fallback_buttons_down:
+                    self._direction_fallback_buttons_down.add(button_id)
+                    self._logger.warning(
+                        "RC003 direction mapping bypassed for non-tap input; "
+                        "Windows original retained: button=%s source=%s",
+                        button_id,
+                        event_source,
+                    )
+            else:
+                self._direction_fallback_buttons_down.discard(button_id)
             return
         if is_pressed:
             self._record_runtime_button(event_source)

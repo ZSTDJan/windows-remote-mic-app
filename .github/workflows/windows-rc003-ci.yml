@@ -240,6 +240,11 @@ jobs:
             Write-Error "expected built executable not found: $builtExe"
             exit 1
           }
+          $builtHidHelper = "dist/RemoteMicRC003/RemoteMicRC003HidHelper.exe"
+          if (-not (Test-Path $builtHidHelper)) {
+            Write-Error "expected narrow HID helper not found: $builtHidHelper"
+            exit 1
+          }
           & $builtExe --dry-run
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 

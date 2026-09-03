@@ -17,6 +17,7 @@ _ISS_PATH = _RC003_ROOT / "installer" / "RemoteMicRC003Setup.iss"
 _CI_PATH = _REPO_ROOT / ".github" / "workflows" / "windows-rc003-ci.yml"
 _PACKAGE_MAIN_PATH = _RC003_ROOT / "src" / "ovb_rc003" / "__main__.py"
 _LAUNCHER_PATH = _RC003_ROOT / "src" / "launcher.py"
+_HID_HELPER_LAUNCHER_PATH = _RC003_ROOT / "src" / "hid_helper_launcher.py"
 _BUILD_CANDIDATE_PATH = _RC003_ROOT / "build" / "build-candidate.ps1"
 _RUN_DEV_PATH = _RC003_ROOT / "build" / "run-dev.ps1"
 _STOP_DEV_PATH = _RC003_ROOT / "build" / "stop-dev.ps1"
@@ -211,6 +212,28 @@ class PyInstallerSpecTests(unittest.TestCase):
         self.assertNotIn('glob("*.xz")', text)
         self.assertNotIn("frida-gadget-17.15.3-windows-x86_64.dll.xz", text)
 
+    def test_spec_builds_a_self_contained_narrow_hid_helper(self):
+        text = _strip_hash_comments(_SPEC_PATH.read_text(encoding="utf-8"))
+        self.assertTrue(_HID_HELPER_LAUNCHER_PATH.is_file())
+        self.assertIn('SRC_ROOT / "hid_helper_launcher.py"', text)
+        self.assertIn('HID_HELPER_NAME = "RemoteMicRC003HidHelper"', text)
+        self.assertIn("helper_a = Analysis(", text)
+        self.assertIn("helper_pyz = PYZ(", text)
+        self.assertIn("helper_exe = EXE(", text)
+        self.assertIn("helper_a.binaries", text)
+        self.assertIn("helper_a.datas", text)
+        self.assertIn('"ovb_rc003/frida_assets"', text)
+        self.assertIn('"ovb_rc003.hid_elevation_windows"', text)
+        self.assertIn('"ovb_rc003.frida_hid_tap_injector"', text)
+        self.assertIn('"PySide6"', text)
+        self.assertIn('"ovb_rc003.qt_settings_app"', text)
+        self.assertIn("helper_exe,", text)
+
+    def test_main_and_helper_manifests_do_not_require_administrator(self):
+        text = _strip_hash_comments(_SPEC_PATH.read_text(encoding="utf-8"))
+        self.assertGreaterEqual(text.count("uac_admin=False"), 2)
+        self.assertNotIn("uac_admin=True", text)
+
     def test_spec_requires_and_bundles_the_remote_photo(self):
         text = _strip_hash_comments(_SPEC_PATH.read_text(encoding="utf-8"))
         self.assertIn('REMOTE_PHOTO = REPO_ROOT / "Resources"', text)
@@ -337,6 +360,33 @@ class InnoSetupScriptTests(unittest.TestCase):
 
     def test_privileges_required_is_lowest(self):
         self.assertIn("PrivilegesRequired=lowest", self.text)
+
+    def test_installer_elevates_only_the_fixed_hid_helper_action(self):
+        code_section = _iss_section(self.text, "Code")
+        self.assertIn("ShellExec(", code_section)
+        self.assertIn("'runas'", code_section)
+        self.assertIn("{#HidHelperExeName}", code_section)
+        self.assertIn("RunHidHelper('--install-task'", code_section)
+        self.assertIn("RunHidHelper('--uninstall-task'", code_section)
+        self.assertNotIn("--pid", code_section)
+        self.assertNotIn("PrivilegesRequired=admin", self.effective_text)
+
+    def test_install_failure_explicitly_disables_custom_direction_mapping(self):
+        code_section = _iss_section(self.text, "Code")
+        self.assertIn("CurStepChanged", code_section)
+        self.assertIn("ssPostInstall", code_section)
+        self.assertIn("管理员按键组件没有安装成功", code_section)
+        self.assertIn("自定义方向映射已停用", code_section)
+        self.assertIn("WizardForm.FinishedLabel.Caption", code_section)
+
+    def test_uninstall_blocks_before_file_removal_if_helper_cleanup_fails(self):
+        code_section = _iss_section(self.text, "Code")
+        initialize = code_section.split(
+            "function InitializeUninstall(): Boolean", 1
+        )[1].split("procedure CurUninstallStepChanged", 1)[0]
+        self.assertIn("RunHidHelper('--uninstall-task'", initialize)
+        self.assertIn("Result := False", initialize)
+        self.assertIn("留下失效的计划任务", initialize)
 
     def test_no_autostart_shortcut_or_task(self):
         self.assertNotIn("userstartup", self.effective_text.lower())
@@ -1057,6 +1107,13 @@ class WindowsCiWorkflowTests(unittest.TestCase):
         pyinstaller_index = self.text.index("PyInstaller build (unsigned candidate)")
         self.assertLess(fetch_index, pyinstaller_index)
 
+    def test_requires_the_narrow_hid_helper_in_the_built_directory(self):
+        self.assertIn(
+            'dist/RemoteMicRC003/RemoteMicRC003HidHelper.exe',
+            self.text,
+        )
+        self.assertIn("expected narrow HID helper not found", self.text)
+
     def test_frida_fetch_step_is_a_required_gate_not_best_effort(self):
         step_start = self.text.index("- name: Fetch and verify Frida Gadget")
         next_step_start = self.text.index("- name:", step_start + 1)
@@ -1143,6 +1200,12 @@ class BuildCandidateScriptTests(unittest.TestCase):
         self.assertIn(
             'Assert-LastExitCode "$builtExe --qt-runtime-check"', self.text
         )
+
+    def test_requires_the_narrow_hid_helper_before_smoke_checks(self):
+        helper_index = self.text.index("RemoteMicRC003HidHelper.exe")
+        dry_run_index = self.text.index("& $builtExe --dry-run")
+        self.assertLess(helper_index, dry_run_index)
+        self.assertIn("expected narrow HID helper not found", self.text)
 
 
 class DeveloperEntryScriptTests(unittest.TestCase):
@@ -1301,6 +1364,16 @@ class UserFacingDocumentationContractTests(unittest.TestCase):
             self.assertIn("13", text)
             self.assertIn("没有独立的物理静音键", text)
             self.assertIn("返回", text)
+
+    def test_hid_elevation_and_login_startup_are_explained_consistently(self):
+        for text in self.both:
+            self.assertIn("管理员按键组件", text)
+            self.assertIn("自定义方向映射", text)
+            self.assertIn("Windows 原始方向", text)
+            self.assertIn("随 Windows 启动", text)
+            self.assertIn("不再弹 UAC", text)
+            self.assertIn("当前登录", text)
+            self.assertIn("管理员组", text)
 
     def test_installed_readme_matches_the_current_three_page_workflow(self):
         text = self.installed_readme_text

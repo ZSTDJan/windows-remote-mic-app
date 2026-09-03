@@ -121,6 +121,15 @@ $brandingCheckExemptRelativePaths = @(
     "tests/test_boundary_scan_replay.py",
     "build/check-public-boundary.ps1",
     "installer/readme-rc003.txt",
+    # The desktop app remains asInvoker. This reviewed module is the only
+    # project-owned elevation boundary: it installs/runs a fixed, on-demand
+    # HID task whose executable lives under Program Files and whose action
+    # accepts no PID or executable path from the caller.
+    "src/ovb_rc003/hid_elevation_windows.py",
+    # The per-user installer invokes only that fixed helper for install and
+    # uninstall. PrivilegesRequired remains lowest, so the installer and
+    # desktop application do not become permanently elevated.
+    "installer/RemoteMicRC003Setup.iss",
     # XRBM-031: scoped third-party elevation for the VB-CABLE installer.
     # This module legitimately requests Windows' own "runas"/UAC verb to launch the
     # THIRD-PARTY VB-CABLE vendor's own setup UI (never to elevate this

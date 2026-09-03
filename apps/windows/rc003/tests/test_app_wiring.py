@@ -1138,16 +1138,18 @@ class OrdinaryButtonGestureWiringTests(_AppWiringTestCase):
 
         self.assertEqual(calls, [key_mapping.ActionKind.OPEN_CODEX])
 
-    def test_one_physical_press_emits_one_mapping_action(self):
+    def test_one_physical_direction_press_emits_one_tap_mapping_action(self):
         calls = []
         with mock.patch.object(
             win32_input,
             "send_arrow_up",
             side_effect=lambda: calls.append("up"),
         ):
-            self.app._on_button_event("up", True)
-            self.app._on_button_event("up", True)  # Raw Input repeat/duplicate
-            self.app._on_button_event("up", False)
+            self.app._on_button_event("up", True, event_source="hid")
+            self.app._on_button_event("up", True, event_source="hid_tap")
+            self.app._on_button_event("up", True, event_source="hid")
+            self.app._on_button_event("up", False, event_source="hid_tap")
+            self.app._on_button_event("up", False, event_source="hid")
 
         self.assertEqual(calls, ["up"])
 
@@ -1158,12 +1160,12 @@ class OrdinaryButtonGestureWiringTests(_AppWiringTestCase):
         ).to_dict()
 
         with mock.patch.object(win32_input, "send_key_combo_tap") as action:
-            self.app._on_button_event("up", True)
+            self.app._on_button_event("up", True, event_source="hid_tap")
 
         action.assert_called_once_with(("shift", "3"))
         self.assertNotIn("up", self.app._button_gestures._repeat_timers)
 
-        self.app._on_button_event("up", False)
+        self.app._on_button_event("up", False, event_source="hid_tap")
 
     def test_remote_button_combo_consumes_both_single_actions(self):
         self.app._bindings["bindings"]["tv"] = {
@@ -1183,10 +1185,10 @@ class OrdinaryButtonGestureWiringTests(_AppWiringTestCase):
         with mock.patch.object(win32_input, "send_escape") as tv_action, mock.patch.object(
             win32_input, "send_arrow_up"
         ) as up_action, mock.patch.object(win32_input, "send_return") as combo_action:
-            self.app._on_button_event("tv", True)
-            self.app._on_button_event("up", True)
-            self.app._on_button_event("up", False)
-            self.app._on_button_event("tv", False)
+            self.app._on_button_event("tv", True, event_source="hid_tap")
+            self.app._on_button_event("up", True, event_source="hid_tap")
+            self.app._on_button_event("up", False, event_source="hid_tap")
+            self.app._on_button_event("tv", False, event_source="hid_tap")
 
         combo_action.assert_called_once_with()
         tv_action.assert_not_called()
@@ -1222,7 +1224,7 @@ class OrdinaryButtonGestureWiringTests(_AppWiringTestCase):
 
         launcher.assert_called_once_with(action)
 
-    def test_raw_keyboard_edge_is_armed_for_low_level_duplicate_suppression(self):
+    def test_non_direction_raw_keyboard_edge_is_still_armed(self):
         armed = []
 
         class _Suppressor:
@@ -1234,14 +1236,37 @@ class OrdinaryButtonGestureWiringTests(_AppWiringTestCase):
             raw_input_windows.RawInputEvent(
                 source="keyboard",
                 is_pressed=True,
-                button_id="up",
-                vkey=0x26,
-                make_code=0x48,
-                flags=0x02,
+                button_id="ok",
+                vkey=0x0D,
+                make_code=0x1C,
+                flags=0,
             )
         )
 
-        self.assertEqual(armed, [(0x26, 0x48, True, True)])
+        self.assertEqual(armed, [(0x0D, 0x1C, False, True)])
+
+    def test_raw_direction_edge_is_not_armed_or_mapped(self):
+        class _Suppressor:
+            arm_tracked_key_event = mock.Mock()
+
+        self.app._legacy_key_suppressor = _Suppressor()
+        event = raw_input_windows.RawInputEvent(
+            source="keyboard",
+            is_pressed=True,
+            button_id="up",
+            vkey=0x26,
+            make_code=0x48,
+            flags=0x02,
+        )
+        self.app._on_raw_input_event(event)
+        with mock.patch.object(self.app._button_gestures, "press") as press:
+            self.app._on_button_event("up", True, event_source="hid")
+            self.app._on_button_event("up", True, event_source="hid")
+            self.app._on_button_event("up", False, event_source="hid")
+
+        self.app._legacy_key_suppressor.arm_tracked_key_event.assert_not_called()
+        press.assert_not_called()
+        self.assertEqual(self.app._direction_fallback_buttons_down, set())
 
     def test_direct_hid_edges_track_the_full_physical_hold(self):
         armed = []
@@ -1319,8 +1344,8 @@ class VoiceMappingProductBoundaryTests(_AppWiringTestCase):
         with mock.patch.object(win32_input, "send_voice_key_combo_down") as voice, mock.patch.object(
             win32_input, "send_arrow_down"
         ) as secondary:
-            self.app._on_button_event("up", True)
-            self.app._on_button_event("up", False)
+            self.app._on_button_event("up", True, event_source="hid_tap")
+            self.app._on_button_event("up", False, event_source="hid_tap")
             self.app._on_button_trigger(
                 "up", app_module.button_gesture.ButtonTrigger.DOUBLE_CLICK
             )
@@ -1366,8 +1391,8 @@ class VoiceMappingProductBoundaryTests(_AppWiringTestCase):
         self._save_bindings(bindings)
 
         with mock.patch.object(win32_input, "send_arrow_left") as primary:
-            self.app._on_button_event("left", True)
-            self.app._on_button_event("left", False)
+            self.app._on_button_event("left", True, event_source="hid_tap")
+            self.app._on_button_event("left", False, event_source="hid_tap")
 
         self.assertEqual(self.app._removed_voice_bindings, {"left": "voice_hold"})
         primary.assert_not_called()
@@ -1392,8 +1417,8 @@ class VoiceMappingProductBoundaryTests(_AppWiringTestCase):
         self._save_bindings(refreshed)
 
         with mock.patch.object(win32_input, "send_arrow_up") as action:
-            self.app._on_button_event("up", True)
-            self.app._on_button_event("up", False)
+            self.app._on_button_event("up", True, event_source="hid_tap")
+            self.app._on_button_event("up", False, event_source="hid_tap")
 
         self.assertNotIn("up", self.app._removed_voice_bindings)
         action.assert_called_once_with()
@@ -2005,8 +2030,8 @@ class VoiceMappingProductBoundaryTests(_AppWiringTestCase):
         request = key_detection_bridge.request_detection(self.app._config_root)
 
         with mock.patch.object(win32_input, "send_voice_key_combo_down") as voice:
-            self.app._on_button_event("up", True)
-            self.app._on_button_event("up", False)
+            self.app._on_button_event("up", True, event_source="hid_tap")
+            self.app._on_button_event("up", False, event_source="hid_tap")
 
         self.assertEqual(key_detection_bridge.poll_detection(request), "up")
         voice.assert_not_called()

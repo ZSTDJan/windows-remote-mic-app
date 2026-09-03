@@ -154,12 +154,33 @@ Item {
                     objectName: "buttonReceiverRow"
                     tokens: root.tokens
                     titleText: qsTr("按键接收")
-                    descriptionText: root.combinedDetail(
-                        ["os_version", "raw_input"],
-                        qsTr("检查系统与按键接收")
-                    )
-                    stateText: root.combinedStatus(["os_version", "raw_input"])
-                    stateColor: root.combinedColor(["os_version", "raw_input"])
+                    descriptionText: SettingsController.hidHelperIssueVisible
+                        ? SettingsController.hidHelperIssueText
+                        : root.combinedDetail(
+                            ["os_version", "raw_input"],
+                            qsTr("检查系统与按键接收")
+                        )
+                    stateText: SettingsController.hidHelperIssueVisible
+                        ? (SettingsController.hidHelperRepairVisible
+                            ? qsTr("管理员按键组件异常")
+                            : qsTr("方向映射已停用"))
+                        : root.combinedStatus(["os_version", "raw_input"])
+                    stateColor: SettingsController.hidHelperIssueVisible
+                        ? tokens.errorColor
+                        : root.combinedColor(["os_version", "raw_input"])
+
+                    CompactButton {
+                        objectName: "repairHidHelperButton"
+                        visible: SettingsController.hidHelperRepairVisible
+                        tokens: root.tokens
+                        compactMinimumWidth: tokens.buttonWidth4Chars
+                        text: SettingsController.hidHelperRepairBusy
+                            ? qsTr("修复中…") : qsTr("修复权限")
+                        highlighted: true
+                        enabled: !SettingsController.hidHelperRepairBusy
+                            && !SettingsController.bridgeLaunchBusy
+                        onClicked: SettingsController.repairHidHelper()
+                    }
 
                     CompactButton {
                         objectName: "openButtonSettingsButton"
@@ -199,6 +220,7 @@ Item {
                             ? qsTr("启动中…") : qsTr("启动桥接")
                         highlighted: true
                         enabled: !SettingsController.bridgeLaunchBusy
+                            && !SettingsController.hidHelperRepairBusy
                             && !DiagnosticsController.vbCableTestRunning
                             && !DiagnosticsController.driverActionRunning
                             && !SettingsController.voiceHotkeyBusy

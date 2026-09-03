@@ -146,6 +146,10 @@ try {
     if (-not (Test-Path $builtExe)) {
         throw "expected built executable not found: $builtExe"
     }
+    $builtHidHelper = Join-Path "dist" (Join-Path "RemoteMicRC003" "RemoteMicRC003HidHelper.exe")
+    if (-not (Test-Path $builtHidHelper)) {
+        throw "expected narrow HID helper not found: $builtHidHelper"
+    }
     & $builtExe --dry-run
     Assert-LastExitCode "$builtExe --dry-run"
 

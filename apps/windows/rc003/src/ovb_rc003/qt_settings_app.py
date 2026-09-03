@@ -113,6 +113,7 @@ from . import (
     config,
     device_catalog,
     frida_compat,
+    hid_elevation_windows,
     hotkey,
     hotkey_capture_windows,
     key_detection_bridge,
@@ -929,6 +930,8 @@ def _load_qt_classes() -> dict:
         voiceProgramElevationStatusChanged = Signal()
         voiceHotkeyBusyChanged = Signal()
         endpointPreflightBusyChanged = Signal()
+        hidHelperStateChanged = Signal()
+        hidHelperRepairBusyChanged = Signal()
         keyDetectionActiveChanged = Signal()
         keyDetectionTextChanged = Signal()
         hotkeyCaptureActiveChanged = Signal()
@@ -946,6 +949,7 @@ def _load_qt_classes() -> dict:
         _voiceProgramOptionsRefreshReady = Signal(object)
         _voiceHotkeyTaskReady = Signal(object)
         _endpointPreflightReady = Signal(object)
+        _hidHelperRepairReady = Signal(object)
         _inputOperationReady = Signal(object)
         _applicationExitStopReady = Signal(object)
         _bridgeRestartStopReady = Signal(object)
@@ -984,6 +988,22 @@ def _load_qt_classes() -> dict:
             self._background_threads_lock = threading.RLock()
             self._input_worker_result_lock = threading.Lock()
             self._input_worker_result = None
+            self._hid_helper_repair_busy = False
+            self._hid_helper_state = (
+                hid_elevation_windows.inspect_installed_helper()
+            )
+            self._hid_helper_installed_distribution = (
+                hid_elevation_windows.is_installed_distribution()
+            )
+            self._hid_helper_portable_requires_admin = (
+                bool(getattr(sys, "frozen", False))
+                and not self._hid_helper_installed_distribution
+                and not self._hid_helper_state.available
+                and not hid_elevation_windows.is_process_elevated()
+            )
+            self._hidHelperRepairReady.connect(
+                self._on_hid_helper_repair_ready
+            )
             self._config_root = config.config_root()
             self._config = config.load_config(config.config_path(self._config_root))
             self._start_hidden = bool(start_hidden)
@@ -1652,14 +1672,24 @@ def _load_qt_classes() -> dict:
             ready_hid_states = {
                 frida_compat.HidTapState.READY.value,
                 frida_compat.HidTapState.ATTACHED_WAITING_IO.value,
-                frida_compat.HidTapState.INJECTING.value,
             }
             raw_ready = status.raw_input_state == "ready"
             tap_ready = status.hid_tap_state in ready_hid_states
+            tap_failed = status.hid_tap_state in (
+                bridge_runtime_status.FAILED_HID_TAP_STATES
+                | {
+                    frida_compat.HidTapState.UNAVAILABLE.value,
+                    frida_compat.HidTapState.DISABLED.value,
+                }
+            )
             if raw_ready and tap_ready:
                 input_text = "两个按键通道正常"
-            elif raw_ready or tap_ready:
-                input_text = "按键通道可用"
+            elif raw_ready and tap_failed:
+                input_text = "普通按键可用；方向映射已停用"
+            elif raw_ready:
+                input_text = "普通按键可用；方向映射正在检查"
+            elif tap_ready:
+                input_text = "方向映射通道可用；普通按键异常"
             elif bridge_runtime_status.input_channels_failed(status):
                 input_text = "两个按键通道异常"
             else:
@@ -1909,6 +1939,27 @@ def _load_qt_classes() -> dict:
                 return
             self._settings_save_busy = value
             self.settingsSaveBusyChanged.emit()
+
+        def _hid_helper_needs_repair(self) -> bool:
+            return (
+                self._hid_helper_installed_distribution
+                and not self._hid_helper_state.available
+            )
+
+        def _set_hid_helper_repair_busy(self, value: bool) -> None:
+            value = bool(value)
+            if value == self._hid_helper_repair_busy:
+                return
+            self._hid_helper_repair_busy = value
+            self.hidHelperRepairBusyChanged.emit()
+
+        def _set_hid_helper_state(
+            self, state: hid_elevation_windows.HidHelperState
+        ) -> None:
+            if state == self._hid_helper_state:
+                return
+            self._hid_helper_state = state
+            self.hidHelperStateChanged.emit()
 
         def _bump_settings_revision(self) -> None:
             self._settings_revision += 1
@@ -3736,6 +3787,34 @@ def _load_qt_classes() -> dict:
             notify=bridgeRestartRecommendedChanged,
         )
 
+        hidHelperIssueVisible = Property(
+            bool,
+            lambda self: self._hid_helper_needs_repair()
+            or self._hid_helper_portable_requires_admin,
+            notify=hidHelperStateChanged,
+        )
+        hidHelperRepairVisible = Property(
+            bool,
+            _hid_helper_needs_repair,
+            notify=hidHelperStateChanged,
+        )
+        hidHelperRepairBusy = Property(
+            bool,
+            lambda self: self._hid_helper_repair_busy,
+            notify=hidHelperRepairBusyChanged,
+        )
+        hidHelperIssueText = Property(
+            str,
+            lambda self: (
+                "方向键保留 Windows 原始操作；自定义方向映射已停用"
+                if self._hid_helper_needs_repair()
+                else "便携版需以管理员权限启动，才能使用自定义方向映射"
+                if self._hid_helper_portable_requires_admin
+                else ""
+            ),
+            notify=hidHelperStateChanged,
+        )
+
         startHidden = Property(bool, lambda self: self._start_hidden, constant=True)
         launchAtLogin = Property(
             bool,
@@ -4335,6 +4414,70 @@ def _load_qt_classes() -> dict:
             self._application_exit_deadline = 0.0
             self._application_exit_intent.clear()
             self.applicationExitFailed.emit(message)
+
+        @Slot()
+        def repairHidHelper(self) -> None:
+            if self._hid_helper_repair_busy or not self._hid_helper_needs_repair():
+                return
+            self._set_hid_helper_repair_busy(True)
+            self._set_error_message("")
+            self._set_status_message(
+                "请在 Windows 提示中确认管理员权限…",
+                self._DEVICE_PAGE_INDEX,
+            )
+
+            def run() -> None:
+                try:
+                    state = hid_elevation_windows.request_install_elevation()
+                except Exception as exc:  # noqa: BLE001 - keep the UI retryable
+                    state = hid_elevation_windows.HidHelperState(
+                        False,
+                        f"unexpected_{type(exc).__name__}",
+                    )
+                self._emit_background_result(
+                    self._hidHelperRepairReady,
+                    state,
+                )
+
+            try:
+                self._start_background_task(run, "remote-mic-hid-helper-repair")
+            except RuntimeError as exc:
+                self._set_hid_helper_repair_busy(False)
+                self._set_status_message("")
+                self._set_error_message(str(exc), self._DEVICE_PAGE_INDEX)
+
+        def _on_hid_helper_repair_ready(self, payload: object) -> None:
+            self._set_hid_helper_repair_busy(False)
+            state = (
+                payload
+                if isinstance(payload, hid_elevation_windows.HidHelperState)
+                else hid_elevation_windows.HidHelperState(
+                    False, "hid_helper_setup_result_unavailable"
+                )
+            )
+            self._set_hid_helper_state(state)
+            if state.available:
+                self._set_error_message("")
+                self._set_status_message(
+                    "管理员按键组件已修复。",
+                    self._DEVICE_PAGE_INDEX,
+                )
+                if self._bridge_running:
+                    self.restartBridge()
+                return
+
+            self._set_status_message("")
+            if state.detail == "uac_cancelled":
+                message = (
+                    "没有确认管理员权限，修复未执行。方向键仍按 Windows "
+                    "原始方向执行一次，自定义方向映射保持停用。"
+                )
+            else:
+                message = (
+                    "管理员按键组件修复失败。方向键仍按 Windows 原始方向"
+                    "执行一次，自定义方向映射保持停用。"
+                )
+            self._set_error_message(message, self._DEVICE_PAGE_INDEX)
 
         @Slot()
         def refreshVoiceProgramStatus(self) -> None:

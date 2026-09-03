@@ -95,6 +95,7 @@ TAP_USAGE_TO_KEY = {
 
 HID_TAP_INJECTOR_FLAG = "--rc003-hid-injector"
 HID_TAP_INJECTOR_TIMEOUT_SECONDS = 30.0
+HID_TAP_CONNECTION_TIMEOUT_SECONDS = 10.0
 HID_TAP_MAX_BUFFER_BYTES = 64 * 1024
 _ERROR_INSUFFICIENT_BUFFER = 122
 _TCP_TABLE_OWNER_PID_ALL = 5
@@ -261,14 +262,14 @@ def build_injector_command(
     return [executable, "-m", "ovb_rc003", *suffix]
 
 
-def run_injector_subprocess(
+def _run_direct_injector_subprocess(
     pid: int,
     *,
     timeout: float = HID_TAP_INJECTOR_TIMEOUT_SECONDS,
     _run: Callable[..., subprocess.CompletedProcess] = subprocess.run,
+    frozen: bool | None = None,
+    executable: str | None = None,
 ) -> None:
-    """Run the narrow injector out of process and accept only exit code 0."""
-
     kwargs: dict = {
         "stdin": subprocess.DEVNULL,
         "stdout": subprocess.DEVNULL,
@@ -279,7 +280,14 @@ def run_injector_subprocess(
     if sys.platform == "win32":
         kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
     try:
-        completed = _run(build_injector_command(pid), **kwargs)
+        completed = _run(
+            build_injector_command(
+                pid,
+                frozen=frozen,
+                executable=executable,
+            ),
+            **kwargs,
+        )
     except subprocess.TimeoutExpired as exc:
         raise HidTapInjectionError("injector_timeout") from exc
     except OSError as exc:
@@ -290,6 +298,63 @@ def run_injector_subprocess(
             return_code, f"injector_exit_code_{return_code}"
         )
         raise HidTapInjectionError(detail)
+
+
+_DEFAULT_SUBPROCESS_RUN = subprocess.run
+
+
+def run_injector_subprocess(
+    pid: int,
+    *,
+    timeout: float = HID_TAP_INJECTOR_TIMEOUT_SECONDS,
+    _run: Callable[..., subprocess.CompletedProcess] = _DEFAULT_SUBPROCESS_RUN,
+    frozen: bool | None = None,
+    executable: str | None = None,
+    _is_elevated: Callable[[], bool] | None = None,
+    _registered_injector: Callable[[int], None] | None = None,
+) -> None:
+    """Start the narrow injector without elevating the desktop application."""
+
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        raise ValueError("injector PID must be a positive integer")
+    resolved_frozen = (
+        bool(getattr(sys, "frozen", False)) if frozen is None else bool(frozen)
+    )
+    # Existing unit tests inject a fake subprocess runner to verify the
+    # direct child contract. Keep that seam deterministic instead of probing
+    # the real Task Scheduler from a test process.
+    if _run is not _DEFAULT_SUBPROCESS_RUN:
+        _run_direct_injector_subprocess(
+            pid,
+            timeout=timeout,
+            _run=_run,
+            frozen=frozen,
+            executable=executable,
+        )
+        return
+
+    if _is_elevated is None or _registered_injector is None:
+        from . import hid_elevation_windows
+
+        if _is_elevated is None:
+            _is_elevated = hid_elevation_windows.is_process_elevated
+        if _registered_injector is None:
+            _registered_injector = hid_elevation_windows.run_registered_injector
+
+    if resolved_frozen and not _is_elevated():
+        try:
+            _registered_injector(pid)
+        except Exception as exc:  # noqa: BLE001 - expose only the stable detail
+            detail = str(exc).strip() or "hid_helper_task_start_failed"
+            raise HidTapInjectionError(detail) from exc
+        return
+
+    _run_direct_injector_subprocess(
+        pid,
+        timeout=timeout,
+        frozen=frozen,
+        executable=executable,
+    )
 
 
 def verify_asset(path: Path, asset: ThirdPartyAsset = FRIDA_GADGET) -> bool:
@@ -333,6 +398,7 @@ class RC003HidReportTap:
         enabled: bool = True,
         retry_delay: float = 2.0,
         heartbeat_timeout: float = 15.0,
+        connection_timeout: float = HID_TAP_CONNECTION_TIMEOUT_SECONDS,
         status_handler: Callable[[str, str], None] | None = None,
         injector: Callable[[int], None] = run_injector_subprocess,
         client_pid_resolver: Callable[[socket.socket], int | None] = tcp_client_process_id,
@@ -342,6 +408,7 @@ class RC003HidReportTap:
         self.enabled = bool(enabled) and os.name == "nt"
         self.retry_delay = max(0.5, float(retry_delay))
         self.heartbeat_timeout = max(10.0, float(heartbeat_timeout))
+        self.connection_timeout = max(1.0, float(connection_timeout))
         self.status_handler = status_handler or (lambda _status, _detail: None)
         self.injector = injector
         self.client_pid_resolver = client_pid_resolver
@@ -425,17 +492,20 @@ class RC003HidReportTap:
     def _run(self) -> None:
         injection_attempted_pid: int | None = None
         injection_failed_pid: int | None = None
+        connection_deadline: float | None = None
         while not self.stop_event.is_set():
             pid = frida_hid_tap_runtime.find_rc003_hidogatt_host_pid()
             if pid is None:
                 injection_attempted_pid = None
                 injection_failed_pid = None
+                connection_deadline = None
                 self._set_status(HidTapState.WAITING_HOST)
                 self.stop_event.wait(self.retry_delay)
                 continue
             if pid != injection_attempted_pid and pid != injection_failed_pid:
                 injection_attempted_pid = None
                 injection_failed_pid = None
+                connection_deadline = None
             if pid == injection_failed_pid:
                 # Retrying an identical injection into the same system process
                 # adds risk and alternates FAILED/INJECTING in the log forever.
@@ -454,6 +524,7 @@ class RC003HidReportTap:
                     try:
                         self.injector(pid)
                         injection_attempted_pid = pid
+                        connection_deadline = time.monotonic() + self.connection_timeout
                     except Exception as exc:  # noqa: BLE001 - retry with sanitized state
                         injection_failed_pid = pid
                         self._set_status(
@@ -464,11 +535,20 @@ class RC003HidReportTap:
                         )
                         self.stop_event.wait(self.retry_delay)
                         continue
+                if connection_deadline is None:
+                    connection_deadline = time.monotonic() + self.connection_timeout
                 self._set_status(HidTapState.WAITING_CONNECTION)
                 try:
                     client, _address = server.accept()
                 except socket.timeout:
+                    if time.monotonic() >= connection_deadline:
+                        injection_failed_pid = pid
+                        self._set_status(
+                            HidTapState.FAILED,
+                            "gadget_connection_timeout",
+                        )
                     continue
+                connection_deadline = None
                 try:
                     client_pid = self.client_pid_resolver(client)
                 except Exception:  # noqa: BLE001 - fail closed on identity lookup
@@ -493,6 +573,7 @@ class RC003HidReportTap:
                         if frida_hid_tap_runtime.find_rc003_hidogatt_host_pid() != pid:
                             self._set_status(HidTapState.WAITING_HOST, "host_changed")
                             injection_attempted_pid = None
+                            connection_deadline = None
                             break
                         try:
                             chunk = client.recv(65536)
