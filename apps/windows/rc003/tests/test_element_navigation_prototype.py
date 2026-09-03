@@ -294,6 +294,46 @@ assert not any(name == "PySide6" or name.startswith("PySide6.") for name in sys.
 
         self.assertTrue(any(isinstance(node, ast.Raise) for node in ast.walk(stop)))
 
+    def test_keyboard_hook_creates_its_message_queue_before_reporting_ready(self):
+        tree = ast.parse(WINDOWS_HOST_PATH.read_text(encoding="utf-8"))
+        keyboard_hook = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.ClassDef) and node.name == "KeyboardHook"
+        )
+        run = next(
+            node
+            for node in keyboard_hook.body
+            if isinstance(node, ast.FunctionDef) and node.name == "_run"
+        )
+        source = ast.unparse(run)
+
+        self.assertLess(
+            source.index("user32.PeekMessageW"),
+            source.index("self._ready.set()"),
+        )
+
+    def test_keyboard_hook_passes_an_unowned_key_up_to_windows(self):
+        tree = ast.parse(WINDOWS_HOST_PATH.read_text(encoding="utf-8"))
+        keyboard_hook = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.ClassDef) and node.name == "KeyboardHook"
+        )
+        handle = next(
+            node
+            for node in keyboard_hook.body
+            if isinstance(node, ast.FunctionDef) and node.name == "_handle"
+        )
+        source = ast.unparse(handle)
+
+        unmatched_release_guard = source.index("if is_up:\n")
+        navigation_interception = source.index(
+            "if self._intercepting.is_set() and action is not None:"
+        )
+        self.assertLess(unmatched_release_guard, navigation_interception)
+        self.assertIn("return user32.CallNextHookEx", source[unmatched_release_guard:])
+
     def test_runtime_cleanup_marks_complete_only_after_all_stops_succeed(self):
         tree = ast.parse(WINDOWS_HOST_PATH.read_text(encoding="utf-8"))
         run_windows = next(
@@ -4229,9 +4269,15 @@ assert not any(name == "PySide6" or name.startswith("PySide6.") for name in sys.
         self.assertIn("def owner_process_is_alive(process_id: int)", source)
         self.assertIn("owner_timer.start(500)", source)
         self.assertIn("QTimer.singleShot(0, monitor_owner_process)", source)
-        self.assertIn("if vk in self._passthrough:", source)
-        self.assertIn("if is_down and action is not None:", source)
+        self.assertIn("if not injected and vk in self._passthrough:", source)
+        self.assertIn(
+            "if is_down and not injected and action is not None:",
+            source,
+        )
+        self.assertIn("if is_down and not injected:", source)
         self.assertIn("self._passthrough.add(vk)", source)
+        self.assertIn("ownership_key = (vk, injected)", source)
+        self.assertIn("self._seed_passthrough()", source)
 
     def test_overlay_signature_checks_are_rate_limited(self):
         self.assertTrue(prototype.periodic_check_due(10.0, 0.0, 1.0))

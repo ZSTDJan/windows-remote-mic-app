@@ -562,6 +562,21 @@ class TapStateTests(unittest.TestCase):
             intercept.index("pointer.add(3).writeByteArray"),
         )
         self.assertIn("interceptLeaseDeadline = 0", source)
+
+    def test_gadget_waits_for_a_neutral_report_before_taking_ownership(self):
+        source = frida_compat.frida_hid_tap_runtime.GADGET_SCRIPT
+        intercept = source[
+            source.index("function interceptKeyboardReport") :
+            source.index("function scheduleReconnect")
+        ]
+
+        self.assertIn('raw.slice(6) !== "000000000000"', intercept)
+        self.assertLess(
+            intercept.index('raw.slice(6) !== "000000000000"'),
+            intercept.index("pointer.add(3).writeByteArray"),
+        )
+        self.assertIn('if (action === "enable") interceptionReady = false;', source)
+        self.assertNotIn('if (action === "renew") interceptionReady = false;', source)
         self.assertIn('kind: "intercept_expired"', source)
         self.assertIn('action === "disable"', source)
         self.assertIn('action !== "enable" && action !== "renew"', source)

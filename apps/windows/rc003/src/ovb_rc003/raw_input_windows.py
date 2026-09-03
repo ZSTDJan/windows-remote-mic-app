@@ -115,9 +115,12 @@ RAW_INPUT_USAGE_PAGES = (
 
 _WM_DESTROY = 0x0002
 _WM_CLOSE = 0x0010
+_WM_INPUT_DEVICE_CHANGE = 0x00FE
 _WM_INPUT = 0x00FF
 _HWND_MESSAGE = -3
 _RIDEV_INPUTSINK = 0x00000100
+_RIDEV_DEVNOTIFY = 0x00002000
+_GIDC_REMOVAL = 2
 _DEFAULT_START_TIMEOUT_SECONDS = 5.0
 _STOP_JOIN_TIMEOUT_SECONDS = 2.0
 
@@ -217,6 +220,7 @@ def _get_device_name(user32, device_handle, ridi_devicename: int) -> Optional[st
 
 ButtonEventCallback = Callable[[str, bool], None]  # (button_id, is_pressed)
 SourcedButtonEventCallback = Callable[[str, bool, str], None]
+DeviceRemovedCallback = Callable[[], None]
 
 
 @dataclass(frozen=True)
@@ -347,6 +351,8 @@ class RawInputButtonListener:
         self._active_hid_usage_buttons: dict[int, Optional[str]] = {}
         self._active_keyboard_signature_buttons: dict[str, Optional[str]] = {}
         self._logical_button_sources: dict[str, str] = {}
+        self._selected_device_handles: set[int] = set()
+        self._on_device_removed: Optional[DeviceRemovedCallback] = None
         self._ready_event = threading.Event()
         self._start_error: Optional[BaseException] = None
         self._device_path: Optional[str] = None
@@ -382,6 +388,14 @@ class RawInputButtonListener:
         """Expose the Raw Input transport that produced a logical edge."""
 
         self._on_sourced_button_event = callback
+
+    def set_device_removed_callback(
+        self,
+        callback: Optional[DeviceRemovedCallback],
+    ) -> None:
+        """Receive loss of the selected Raw Input device on its owner thread."""
+
+        self._on_device_removed = callback
 
     @property
     def is_running(self) -> bool:
@@ -427,6 +441,7 @@ class RawInputButtonListener:
             _require_windows()
         self._device_path = device_path
         self._normalized_device_path = hid_identity.normalize_device_path(device_path)
+        self._selected_device_handles.clear()
         self._class_name = f"RemoteMicRC003RawInputWindow-{uuid.uuid4().hex}"
         self._stop_event.clear()
         self._ready_event.clear()
@@ -562,6 +577,11 @@ class RawInputButtonListener:
         self._release_all()
 
     def _release_all(self) -> None:
+        active_buttons = self._clear_active_state()
+        for button, source in active_buttons:
+            self._emit_button_event(button, False, source)
+
+    def _clear_active_state(self) -> List[Tuple[str, str]]:
         active_hid_buttons = self._active_hid_buttons
         active_keyboard_buttons = self._active_keyboard_buttons
         active_buttons = active_hid_buttons | active_keyboard_buttons
@@ -572,12 +592,33 @@ class RawInputButtonListener:
         self._active_hid_usage_buttons.clear()
         self._active_keyboard_signature_buttons.clear()
         self._logical_button_sources.clear()
-        for button in sorted(active_buttons):
-            source = logical_button_sources.get(
+        self._selected_device_handles.clear()
+        return [
+            (
                 button,
-                "hid" if button in active_hid_buttons else "keyboard",
+                logical_button_sources.get(
+                    button,
+                    "hid" if button in active_hid_buttons else "keyboard",
+                ),
             )
-            self._emit_button_event(button, False, source)
+            for button in sorted(active_buttons)
+        ]
+
+    def _handle_device_change(self, wparam, lparam) -> None:
+        if int(wparam) != _GIDC_REMOVAL:
+            return
+        raw_handle = getattr(lparam, "value", lparam)
+        device_handle = int(raw_handle or 0)
+        if not device_handle or device_handle not in self._selected_device_handles:
+            return
+
+        callback = self._on_device_removed
+        if callback is None:
+            self._release_all()
+            return
+
+        self._clear_active_state()
+        callback()
 
     def _emit_button_event(
         self,
@@ -789,7 +830,7 @@ class RawInputButtonListener:
                 devices[index] = RAWINPUTDEVICE(
                     usUsagePage=usage_page,
                     usUsage=usage,
-                    dwFlags=_RIDEV_INPUTSINK,
+                    dwFlags=_RIDEV_INPUTSINK | _RIDEV_DEVNOTIFY,
                     hwndTarget=self._hwnd,
                 )
             registered = user32.RegisterRawInputDevices(
@@ -865,6 +906,12 @@ class RawInputButtonListener:
             except Exception:
                 pass  # never let a decode error kill the message loop
             return 0
+        if msg == _WM_INPUT_DEVICE_CHANGE:
+            try:
+                self._handle_device_change(wparam, lparam)
+            except Exception:
+                pass  # device loss must not terminate the message loop
+            return 0
         if msg == _WM_CLOSE:
             # DestroyWindow synchronously delivers WM_DESTROY to this same
             # wndproc (on this same thread) before returning - see the
@@ -930,6 +977,10 @@ class RawInputButtonListener:
             # per-event scoping (XRBM-014 review round 2 P1 #4), not merely
             # "some RC003-VID/PID device".
             return
+        raw_handle = getattr(header.hDevice, "value", header.hDevice)
+        device_handle = int(raw_handle or 0)
+        if device_handle:
+            self._selected_device_handles.add(device_handle)
 
         body = bytes(buffer.raw[ctypes.sizeof(RAWINPUTHEADER) :])
 

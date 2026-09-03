@@ -97,7 +97,11 @@ class NoResourceWarningAtShutdownTests(unittest.TestCase):
             env=env,
             capture_output=True,
             text=True,
-            timeout=300,
+            # The guarded full suite currently takes about 4.5 minutes on
+            # the Windows validation host. Keep enough cold-start margin for
+            # antivirus and Qt initialization without turning a hang into an
+            # unbounded CI job.
+            timeout=600,
         )
 
         self.assertEqual(

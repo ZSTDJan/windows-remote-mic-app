@@ -318,6 +318,46 @@ class StopWithoutStartTests(unittest.TestCase):
         self.assertFalse(rec.listener.is_running)
 
 
+class DeviceChangeTests(unittest.TestCase):
+    def test_selected_device_removal_hands_state_loss_to_the_owner(self):
+        rec = RecordingListener()
+        removed = []
+        rec.listener.set_device_removed_callback(lambda: removed.append(True))
+        rec.listener._handle_keyboard_body(_rawkeyboard_body(0x26, WM_KEYDOWN))
+        rec.listener._selected_device_handles.add(123)
+        rec.events.clear()
+
+        rec.listener._handle_device_change(raw_input_windows._GIDC_REMOVAL, 123)
+
+        self.assertEqual(removed, [True])
+        self.assertEqual(rec.events, [])
+        self.assertEqual(rec.listener._active_keyboard_buttons, frozenset())
+        self.assertEqual(rec.listener._selected_device_handles, set())
+
+    def test_selected_device_removal_force_releases_without_an_owner_callback(self):
+        rec = RecordingListener()
+        rec.listener._handle_keyboard_body(_rawkeyboard_body(0x27, WM_KEYDOWN))
+        rec.listener._selected_device_handles.add(456)
+        rec.events.clear()
+
+        rec.listener._handle_device_change(raw_input_windows._GIDC_REMOVAL, 456)
+
+        self.assertEqual(rec.events, [("right", False)])
+
+    def test_arrival_and_unrelated_removal_do_not_clear_active_state(self):
+        rec = RecordingListener()
+        rec.listener._handle_keyboard_body(_rawkeyboard_body(0x28, WM_KEYDOWN))
+        rec.listener._selected_device_handles.add(789)
+        rec.events.clear()
+
+        rec.listener._handle_device_change(1, 789)
+        rec.listener._handle_device_change(raw_input_windows._GIDC_REMOVAL, 999)
+
+        self.assertEqual(rec.events, [])
+        self.assertEqual(rec.listener._active_keyboard_buttons, frozenset({"down"}))
+        self.assertEqual(rec.listener._selected_device_handles, {789})
+
+
 class StartTimeoutInjectionTests(unittest.TestCase):
     """XRBM-018 RETRY 1 P2 #5: exercises start()'s timeout/fail-closed path
     via the ``_run_target`` injection seam (the same dependency-injection

@@ -62,6 +62,7 @@ let writeChain = Promise.resolve();
 let reconnectTimer = null;
 let hookInstalled = false;
 let interceptLeaseDeadline = 0;
+let interceptionReady = false;
 
 function asciiBytes(text) {
   const result = [];
@@ -94,6 +95,7 @@ function interceptionActive() {
   if (output === null || interceptLeaseDeadline === 0) return false;
   if (Date.now() < interceptLeaseDeadline) return true;
   interceptLeaseDeadline = 0;
+  interceptionReady = false;
   emit({ kind: "intercept_expired", protocol: INTERCEPT_PROTOCOL });
   return false;
 }
@@ -104,6 +106,13 @@ function interceptKeyboardReport(pointer, length) {
   }
   const raw = hex(pointer, length);
   if (!raw.startsWith("010000")) return null;
+  if (!interceptionReady) {
+    if (raw.slice(6) !== "000000000000") return null;
+    // The enable request can race a key that Windows already received. Let
+    // that hold reach its neutral report before taking ownership so its key-up
+    // can never be intercepted without the matching key-down.
+    interceptionReady = true;
+  }
   pointer.add(3).writeByteArray([0, 0, 0, 0, 0, 0]);
   return raw;
 }
@@ -121,6 +130,7 @@ function markDisconnected(currentOutput) {
   output = null;
   input = null;
   interceptLeaseDeadline = 0;
+  interceptionReady = false;
   scheduleReconnect();
 }
 
@@ -153,11 +163,13 @@ function handleControl(message) {
   const action = message.action;
   if (message.protocol !== INTERCEPT_PROTOCOL) {
     interceptLeaseDeadline = 0;
+    interceptionReady = false;
     acknowledgeControl(action, false, "disabled", "protocol_mismatch");
     return;
   }
   if (action === "disable") {
     interceptLeaseDeadline = 0;
+    interceptionReady = false;
     acknowledgeControl(action, true, "disabled", "");
     return;
   }
@@ -165,9 +177,11 @@ function handleControl(message) {
   if ((action !== "enable" && action !== "renew") ||
       !Number.isInteger(leaseMs) || leaseMs <= 0 || leaseMs > MAX_INTERCEPT_LEASE_MS) {
     interceptLeaseDeadline = 0;
+    interceptionReady = false;
     acknowledgeControl(action, false, "disabled", "invalid_control");
     return;
   }
+  if (action === "enable") interceptionReady = false;
   interceptLeaseDeadline = Date.now() + leaseMs;
   acknowledgeControl(action, true, "enabled", "");
 }
@@ -191,6 +205,7 @@ async function readControls(connection) {
         } catch (_error) {
           // Invalid control input never enables interception.
           interceptLeaseDeadline = 0;
+          interceptionReady = false;
         }
         newline = buffer.indexOf("\n");
       }
@@ -212,6 +227,7 @@ async function connectToHub() {
     output = connection.output;
     input = connection.input;
     interceptLeaseDeadline = 0;
+    interceptionReady = false;
     emit({
       kind: "ready",
       pid: Process.id,
@@ -223,6 +239,7 @@ async function connectToHub() {
     output = null;
     input = null;
     interceptLeaseDeadline = 0;
+    interceptionReady = false;
     scheduleReconnect();
   }
 }
@@ -271,7 +288,8 @@ setInterval(() => {
       kind: "heartbeat",
       pid: Process.id,
       protocol: INTERCEPT_PROTOCOL,
-      intercept_enabled: interceptionActive()
+      intercept_enabled: interceptionActive(),
+      intercept_ready: interceptionReady
     });
   }
 }, HEARTBEAT_INTERVAL_MS);

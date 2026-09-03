@@ -110,6 +110,45 @@ class HotkeyCaptureStateTests(unittest.TestCase):
         )
         self.assertEqual(captured, [])
 
+    def test_key_up_without_a_captured_down_is_not_suppressed(self):
+        captured = []
+        recorder = hotkey_capture_windows.HotkeyCapture(captured.append)
+
+        self.assertFalse(
+            recorder._handle_event(
+                hotkey_capture_windows.WM_KEYUP,
+                self._event(0x26, 0x48, hotkey_capture_windows.LLKHF_UP),
+            )
+        )
+        self.assertEqual(captured, [])
+
+    def test_key_held_before_capture_passes_repeats_and_release_through(self):
+        captured = []
+        recorder = hotkey_capture_windows.HotkeyCapture(captured.append)
+        recorder._passthrough_vks.add(0x26)
+
+        self.assertFalse(
+            recorder._handle_event(
+                hotkey_capture_windows.WM_KEYDOWN,
+                self._event(0x26, 0x48),
+            )
+        )
+        self.assertFalse(
+            recorder._handle_event(
+                hotkey_capture_windows.WM_KEYUP,
+                self._event(0x26, 0x48, hotkey_capture_windows.LLKHF_UP),
+            )
+        )
+        self.assertEqual(recorder._passthrough_vks, set())
+        self.assertEqual(captured, [])
+
+        self.assertTrue(
+            recorder._handle_event(
+                hotkey_capture_windows.WM_KEYDOWN,
+                self._event(0x26, 0x48),
+            )
+        )
+
 
 class HotkeyCaptureLifecycleTests(unittest.TestCase):
     def test_start_timeout_retains_a_thread_that_did_not_stop(self):

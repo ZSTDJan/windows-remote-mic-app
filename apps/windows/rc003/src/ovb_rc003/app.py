@@ -108,6 +108,23 @@ _BUTTON_ACTION_KEY_TOKENS = {
     key_mapping.ActionKind.PLAY_PAUSE: ("media_play_pause",),
 }
 
+_RAW_FALLBACK_KEY_TOKENS = {
+    "mic": "f5",
+    "right": "right",
+    "left": "left",
+    "down": "down",
+    "up": "up",
+    "ok": "enter",
+    "home": "home",
+    "menu": "apps",
+    "tv": "backtick",
+    "power": "vk_5f",
+    "volume_mute": "volume_mute",
+    "volume_up": "volume_up",
+    "volume_down": "volume_down",
+    "back": "browser_back",
+}
+
 _KEY_DETECTION_MIC_RELEASE_GRACE_SECONDS = 1.0
 _KEY_DETECTION_MIC_MAX_SECONDS = 10.0
 _ORDINARY_MIC_RELEASE_GUARD_SECONDS = 0.12
@@ -219,6 +236,7 @@ class RC003App:
         self._wetype_voice_control = wetype_control_windows.WeTypeVoiceControl(
             logger=self._logger
         )
+        self._button_action_lock = threading.RLock()
         self._button_key_release_pending: Optional[Tuple[str, ...]] = None
         # Raw Input and the ATVV control channel arrive on different worker
         # threads. Serialize the voice state machine so one physical press
@@ -269,6 +287,7 @@ class RC003App:
         self._direct_hid_interception_armed = False
         self._raw_fallback_buttons_down: set[str] = set()
         self._raw_mapped_buttons_down: set[str] = set()
+        self._input_rearm_blocked_buttons: set[str] = set()
         self._key_detection_suppressed_buttons: set[str] = set()
         self._key_detection_mic_lock = threading.Lock()
         self._key_detection_mic_gesture_active = False
@@ -527,6 +546,13 @@ class RC003App:
         )
         if callable(set_sourced_button_event_callback):
             set_sourced_button_event_callback(self._on_raw_button_event)
+        set_device_removed_callback = getattr(
+            self._hid_listener,
+            "set_device_removed_callback",
+            None,
+        )
+        if callable(set_device_removed_callback):
+            set_device_removed_callback(self._on_raw_input_device_removed)
         try:
             self._hid_listener.start(device_path)
         except raw_input_windows.RawInputUnavailableError as exc:
@@ -595,6 +621,118 @@ class RC003App:
                 self._hid_report_tap = tap
                 raise
 
+    @staticmethod
+    def _direct_buttons_for_usages(usages: set[int]) -> set[str]:
+        return {
+            button
+            for usage in usages
+            if (button := frida_compat.TAP_USAGE_TO_BUTTON.get(usage)) is not None
+        }
+
+    def _cancel_input_gestures(
+        self,
+        buttons: set[str],
+        *,
+        reason: str,
+        block_until_release: bool,
+    ) -> None:
+        if block_until_release:
+            self._input_rearm_blocked_buttons.update(buttons)
+        self._button_combos.reset()
+        self._button_gestures.reset()
+        self._key_detection_suppressed_buttons.clear()
+
+        if "mic" in buttons:
+            with self._ordinary_mic_lock:
+                self._ordinary_mic_sources_down.clear()
+                self._ordinary_mic_late_sources_down.clear()
+                self._ordinary_mic_sources_seen.clear()
+                self._ordinary_mic_release_guard_until = 0.0
+                self._ordinary_mic_gesture_active = False
+            with self._key_detection_mic_lock:
+                self._reset_key_detection_mic_gesture_locked()
+            with self._voice_trigger_lock:
+                self._voice_mic_gesture_sources_down.clear()
+                self._voice_mic_gesture_hid_released = True
+                if self._voice.active:
+                    self._release_hold_voice_on_physical_release_locked(reason)
+                if (
+                    self._voice_mic_gesture_active
+                    and not self._voice_audio_stream_active
+                ):
+                    self._finish_voice_mic_gesture()
+                self._apply_pending_voice_settings_if_idle_locked()
+
+        if buttons:
+            self._logger.warning(
+                "button input ownership cancelled: reason=%s buttons=%s",
+                reason,
+                sorted(buttons),
+            )
+
+    def _release_raw_fallback_keyups(
+        self,
+        buttons: set[str],
+        *,
+        reason: str,
+    ) -> None:
+        tokens = tuple(
+            dict.fromkeys(
+                token
+                for button in sorted(buttons)
+                if (token := _RAW_FALLBACK_KEY_TOKENS.get(button)) is not None
+            )
+        )
+        if not tokens:
+            return
+        with self._button_action_lock:
+            pending = self._button_key_release_pending or ()
+            owed_tokens = tuple(dict.fromkeys((*pending, *tokens)))
+            self._button_key_release_pending = owed_tokens
+            if self._release_pending_button_keys():
+                self._logger.info(
+                    "raw Windows key-up safety release completed: reason=%s buttons=%s",
+                    reason,
+                    sorted(buttons),
+                )
+
+    def _on_raw_input_device_removed(self) -> None:
+        self._set_runtime_input_state(raw_input_state="device_removed")
+        with self._input_arbitration_lock:
+            with self._direct_hid_lock:
+                direct_buttons = self._direct_buttons_for_usages(
+                    self._direct_hid_usages
+                )
+                self._direct_hid_usages.clear()
+            raw_fallback_buttons = set(self._raw_fallback_buttons_down)
+            lost_buttons = (
+                raw_fallback_buttons
+                | set(self._raw_mapped_buttons_down)
+                | direct_buttons
+                | set(self._input_rearm_blocked_buttons)
+            )
+            self._direct_hid_interception_ready = False
+            self._direct_hid_interception_armed = False
+            self._raw_fallback_buttons_down.clear()
+            self._raw_mapped_buttons_down.clear()
+            self._input_rearm_blocked_buttons.clear()
+            # The Raw Input collection can be re-enumerated while the
+            # separately owned HID tap is still alive. Preserve a guard for
+            # direct buttons that were down until a later neutral report or
+            # matching release proves the old hold is over.
+            self._input_rearm_blocked_buttons.update(direct_buttons)
+            self._cancel_input_gestures(
+                lost_buttons,
+                reason="raw_input_device_removed",
+                block_until_release=False,
+            )
+            self._release_raw_fallback_keyups(
+                raw_fallback_buttons,
+                reason="raw_input_device_removed",
+            )
+        self._logger.warning("RC003 Raw Input device removed; requesting reconnect")
+        self._supervisor.request_reconnect()
+
     def _on_hid_tap_status(self, status: str, detail: str) -> None:
         self._set_runtime_input_state(hid_tap_state=status)
         interception_ready = status == frida_compat.HidTapState.READY.value
@@ -613,32 +751,33 @@ class RC003App:
                 with self._direct_hid_lock:
                     stale_usages = set(self._direct_hid_usages)
                     self._direct_hid_usages.clear()
-                # Keep the ready flag set until every owned key is released.
-                # Holding the arbitration lock across both steps prevents a
-                # final report from inserting a new down edge between the
-                # stale snapshot and the transition to the unavailable state.
-                for usage in sorted(stale_usages):
-                    button = frida_compat.TAP_USAGE_TO_BUTTON.get(usage)
-                    if button is not None:
-                        self._on_button_event(
-                            button,
-                            False,
-                            event_source="hid_tap",
-                        )
+                stale_buttons = self._direct_buttons_for_usages(stale_usages)
+                self._cancel_input_gestures(
+                    stale_buttons,
+                    reason="hid_tap_ownership_lost",
+                    block_until_release=True,
+                )
             else:
                 self._logger.info(message, *args)
             if interception_armed and not self._direct_hid_interception_armed:
                 # ATTACHED_WAITING_IO is emitted only after the helper has
-                # acknowledged the interception lease. Finish any Raw HID
-                # gesture that began before that handover, then suspend Raw
-                # mapping until verified tap reports take ownership.
-                for button in sorted(self._raw_mapped_buttons_down):
-                    self._on_button_event(
-                        button,
-                        False,
-                        event_source="raw_hid",
-                    )
+                # acknowledged the interception lease. Cancel any in-flight
+                # Raw Input gesture instead of completing it as a click, then
+                # ignore the same physical hold until its real release arrives.
+                raw_mapped_buttons = set(self._raw_mapped_buttons_down)
+                raw_fallback_buttons = set(self._raw_fallback_buttons_down)
+                handover_buttons = raw_mapped_buttons | raw_fallback_buttons
+                self._cancel_input_gestures(
+                    handover_buttons,
+                    reason="hid_tap_handover",
+                    block_until_release=True,
+                )
+                self._release_raw_fallback_keyups(
+                    raw_fallback_buttons,
+                    reason="hid_tap_handover",
+                )
                 self._raw_fallback_buttons_down.clear()
+                self._raw_mapped_buttons_down.clear()
             self._direct_hid_interception_armed = interception_armed
             self._direct_hid_interception_ready = interception_ready
 
@@ -652,17 +791,35 @@ class RC003App:
         """
 
         with self._input_arbitration_lock:
+            tap = self._hid_report_tap
+            tap_reports_ready = (
+                tap is not None
+                and tap.status == frida_compat.HidTapState.READY.value
+            )
             if (
                 not self._accept_input_events
-                or not self._direct_hid_interception_ready
                 or report_id != 1
                 or len(payload) != 6
             ):
+                return
+            if not self._direct_hid_interception_ready:
+                if not tap_reports_ready:
+                    return
+                # A newly received, validated tap report is stronger evidence
+                # than the Raw Input collection-removal notification. Restore
+                # local ownership without waiting for a duplicate status event.
+                self._direct_hid_interception_armed = True
+                self._direct_hid_interception_ready = True
+            elif tap is not None and not tap_reports_ready:
+                # The tap updates its own state before invoking the app status
+                # callback. Reject a report that raced that callback.
                 return
             active = {
                 int.from_bytes(payload[index : index + 2], "little")
                 for index in range(0, len(payload), 2)
             } & set(frida_compat.TAP_USAGE_TO_BUTTON)
+            if not active:
+                self._input_rearm_blocked_buttons.clear()
             with self._direct_hid_lock:
                 previous = self._direct_hid_usages
                 if active == previous:
@@ -691,6 +848,17 @@ class RC003App:
         """Stop process-lifetime input resources exactly once at worker exit."""
 
         failures: List[str] = []
+
+        # Input loss is cancellation, not a click. Clear gesture timers before
+        # listener shutdown emits forced releases, and release any Windows key
+        # whose original down was deliberately allowed through during fallback.
+        self._button_combos.reset()
+        self._button_gestures.reset()
+        with self._input_arbitration_lock:
+            self._release_raw_fallback_keyups(
+                set(self._raw_fallback_buttons_down),
+                reason="input_channels_stopping",
+            )
 
         # Keep dispatch enabled until both listeners have emitted their forced
         # release edges. The HID tap is stopped first so its explicit disable
@@ -731,6 +899,7 @@ class RC003App:
             self._direct_hid_interception_armed = False
             self._raw_fallback_buttons_down.clear()
             self._raw_mapped_buttons_down.clear()
+            self._input_rearm_blocked_buttons.clear()
         self._key_detection_suppressed_buttons.clear()
         with self._ordinary_mic_lock:
             self._ordinary_mic_sources_down.clear()
@@ -743,14 +912,11 @@ class RC003App:
         self._button_combos.reset()
         self._button_gestures.reset()
 
-        if self._button_key_release_pending is not None:
-            if self._release_pending_button_keys():
-                self._button_key_release_pending = None
-            else:
-                failures.append(
-                    "ordinary button key safety release did not fully deliver; "
-                    "state retained"
-                )
+        if not self._release_pending_button_keys():
+            failures.append(
+                "ordinary button key safety release did not fully deliver; "
+                "state retained"
+            )
 
         if self._voice_key_physicalizer is not None:
             try:
@@ -819,14 +985,11 @@ class RC003App:
             self._logger.exception("cleanup: releasing the voice hotkey failed")
             failures.append("voice hotkey cleanup failed; state retained")
 
-        if self._button_key_release_pending is not None:
-            if self._release_pending_button_keys():
-                self._button_key_release_pending = None
-            else:
-                failures.append(
-                    "ordinary button key safety release did not fully deliver; "
-                    "state retained"
-                )
+        if not self._release_pending_button_keys():
+            failures.append(
+                "ordinary button key safety release did not fully deliver; "
+                "state retained"
+            )
 
         if self._ble_session is not None:
             try:
@@ -1402,6 +1565,11 @@ class RC003App:
     ) -> None:
         if not self._accept_input_events:
             return
+        with self._input_arbitration_lock:
+            if button_id in self._input_rearm_blocked_buttons:
+                if not is_pressed:
+                    self._input_rearm_blocked_buttons.discard(button_id)
+                return
         if event_source == "hid_tap":
             with self._input_arbitration_lock:
                 if not self._direct_hid_interception_ready:
@@ -1730,13 +1898,16 @@ class RC003App:
         self._apply_button_action(action)
 
     def _apply_button_action(self, action: key_mapping.ButtonAction) -> None:
+        with self._button_action_lock:
+            self._apply_button_action_locked(action)
+
+    def _apply_button_action_locked(self, action: key_mapping.ButtonAction) -> None:
         if self._button_key_release_pending is not None:
             if not self._release_pending_button_keys():
                 self._logger.info(
                     "button action suppressed: an earlier key release is still pending"
                 )
                 return
-            self._button_key_release_pending = None
 
         try:
             if action.kind == key_mapping.ActionKind.DISABLED:
@@ -1817,26 +1988,28 @@ class RC003App:
         return _BUTTON_ACTION_KEY_TOKENS.get(action.kind)
 
     def _release_pending_button_keys(self) -> bool:
-        tokens = self._button_key_release_pending
-        if tokens is None:
+        with self._button_action_lock:
+            tokens = self._button_key_release_pending
+            if tokens is None:
+                return True
+            try:
+                win32_input.send_key_combo_up(tokens)
+            except win32_input.InputCleanupIncompleteError:
+                self._logger.exception("button key safety release remains incomplete")
+                return False
+            except win32_input.Win32InputUnavailableError:
+                self._logger.info("button key safety release unavailable")
+                return False
+            except OSError:
+                # send_key_combo_up raises ordinary OSError only after its own
+                # per-key fallback confirmed every requested key-up.
+                self._logger.exception(
+                    "button key safety release needed fallback but completed"
+                )
+            else:
+                self._logger.info("button key safety release completed")
+            self._button_key_release_pending = None
             return True
-        try:
-            win32_input.send_key_combo_up(tokens)
-        except win32_input.InputCleanupIncompleteError:
-            self._logger.exception("button key safety release remains incomplete")
-            return False
-        except win32_input.Win32InputUnavailableError:
-            self._logger.info("button key safety release unavailable")
-            return False
-        except OSError:
-            # send_key_combo_up raises ordinary OSError only after its own
-            # per-key fallback confirmed every requested key-up.
-            self._logger.exception(
-                "button key safety release needed fallback but completed"
-            )
-        else:
-            self._logger.info("button key safety release completed")
-        return True
 
     # -- ATVV control-channel events (mic button + audio start/stop) ------
 

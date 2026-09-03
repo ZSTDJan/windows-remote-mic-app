@@ -132,6 +132,7 @@ class HotkeyCapture:
         self._state_lock = threading.Lock()
         self._tokens: List[str] = []
         self._pressed_tokens: Set[str] = set()
+        self._passthrough_vks: Set[int] = set()
 
     @property
     def is_running(self) -> bool:
@@ -154,6 +155,7 @@ class HotkeyCapture:
         with self._state_lock:
             self._tokens.clear()
             self._pressed_tokens.clear()
+            self._passthrough_vks.clear()
         self._ready_event.clear()
         self._stop_event.clear()
         self._start_error = None
@@ -240,16 +242,24 @@ class HotkeyCapture:
             return False
 
         token = token_for_keyboard_event(data.vkCode, data.scanCode, data.flags)
+        owns_event = False
         with self._state_lock:
+            vk_code = int(data.vkCode)
+            if vk_code in self._passthrough_vks:
+                if is_up:
+                    self._passthrough_vks.discard(vk_code)
+                return False
             if is_down:
+                owns_event = True
                 if token not in self._pressed_tokens:
                     self._pressed_tokens.add(token)
                     self._tokens.append(token)
             elif token in self._pressed_tokens:
+                owns_event = True
                 self._pressed_tokens.remove(token)
-        if is_up:
+        if is_up and owns_event:
             self._complete_capture()
-        return True
+        return owns_event
 
     def _run(self) -> None:
         user32 = None
@@ -303,6 +313,8 @@ class HotkeyCapture:
             user32.CallNextHookEx.restype = lresult
             user32.UnhookWindowsHookEx.argtypes = (wintypes.HHOOK,)
             user32.UnhookWindowsHookEx.restype = wintypes.BOOL
+            user32.GetAsyncKeyState.argtypes = (ctypes.c_int,)
+            user32.GetAsyncKeyState.restype = ctypes.c_short
             kernel32.GetModuleHandleW.argtypes = (wintypes.LPCWSTR,)
             kernel32.GetModuleHandleW.restype = wintypes.HMODULE
 
@@ -327,6 +339,15 @@ class HotkeyCapture:
             if not hook:
                 raise ctypes.WinError()
             self._hook = hook
+            # The foreground application already owns keys that were held
+            # before this hook existed. Pass their repeats and matching key-up
+            # through until release instead of adopting half of the hold.
+            with self._state_lock:
+                self._passthrough_vks.update(
+                    vk_code
+                    for vk_code in range(1, 256)
+                    if user32.GetAsyncKeyState(vk_code) & 0x8000
+                )
             # Force creation of this thread's message queue before exposing
             # the capture as ready; otherwise PostThreadMessageW can fail on
             # a stop race before the first GetMessageW call.

@@ -1161,6 +1161,60 @@ class OrdinaryButtonGestureWiringTests(_AppWiringTestCase):
         self.assertEqual(actions, [])
         self.assertEqual(self.app._button_key_release_pending, ("ctrl", "l"))
 
+    def test_fallback_safety_release_cannot_erase_a_new_pending_action_release(self):
+        first_release_started = threading.Event()
+        allow_first_release = threading.Event()
+        action_attempted = threading.Event()
+        release_calls = []
+        release_calls_lock = threading.Lock()
+
+        def release_keys(keys):
+            with release_calls_lock:
+                release_calls.append(tuple(keys))
+                call_number = len(release_calls)
+            if call_number == 1:
+                first_release_started.set()
+                allow_first_release.wait(1.0)
+
+        def fail_action():
+            action_attempted.set()
+            raise win32_input.InputCleanupIncompleteError("simulated stuck down key")
+
+        with mock.patch.object(
+            win32_input,
+            "send_key_combo_up",
+            side_effect=release_keys,
+        ), mock.patch.object(
+            win32_input,
+            "send_arrow_down",
+            side_effect=fail_action,
+        ):
+            fallback_thread = threading.Thread(
+                target=lambda: self.app._release_raw_fallback_keyups(
+                    {"up"},
+                    reason="test_handover",
+                )
+            )
+            fallback_thread.start()
+            self.assertTrue(first_release_started.wait(1.0))
+
+            action_thread = threading.Thread(
+                target=lambda: self.app._apply_button_action(
+                    key_mapping.ButtonAction(key_mapping.ActionKind.ARROW_DOWN)
+                )
+            )
+            action_thread.start()
+            self.assertFalse(action_attempted.wait(0.1))
+
+            allow_first_release.set()
+            fallback_thread.join(1.0)
+            action_thread.join(1.0)
+
+        self.assertFalse(fallback_thread.is_alive())
+        self.assertFalse(action_thread.is_alive())
+        self.assertEqual(release_calls, [("up",)])
+        self.assertEqual(self.app._button_key_release_pending, ("down",))
+
     def test_open_app_action_uses_application_executor(self):
         calls = []
         original = getattr(app_module, "open_configured_application", None)
@@ -1334,12 +1388,12 @@ class OrdinaryButtonGestureWiringTests(_AppWiringTestCase):
         release.assert_called_once_with("ok")
         self.assertEqual(self.app._raw_mapped_buttons_down, set())
 
-    def test_tap_arming_finishes_raw_owned_gesture_before_handover(self):
+    def test_tap_arming_cancels_raw_owned_gesture_before_handover(self):
         self.app._direct_hid_interception_ready = False
 
         with mock.patch.object(self.app._button_gestures, "press") as press, mock.patch.object(
             self.app._button_gestures, "release"
-        ) as release:
+        ) as release, mock.patch.object(self.app._button_gestures, "reset") as reset:
             self.app._on_raw_button_event("ok", True, "hid")
             self.app._on_hid_tap_status(
                 app_module.frida_compat.HidTapState.ATTACHED_WAITING_IO.value,
@@ -1348,10 +1402,29 @@ class OrdinaryButtonGestureWiringTests(_AppWiringTestCase):
             self.app._on_raw_button_event("ok", False, "keyboard")
 
         press.assert_called_once_with("ok")
-        release.assert_called_once_with("ok")
+        release.assert_not_called()
+        reset.assert_called_once_with()
         self.assertTrue(self.app._direct_hid_interception_armed)
         self.assertFalse(self.app._direct_hid_interception_ready)
         self.assertEqual(self.app._raw_mapped_buttons_down, set())
+        self.assertEqual(self.app._input_rearm_blocked_buttons, set())
+
+    def test_tap_arming_releases_a_windows_fallback_key_and_blocks_the_hold(self):
+        self.app._direct_hid_interception_ready = False
+        self.app._on_raw_button_event("up", True, "keyboard")
+
+        with mock.patch.object(win32_input, "send_key_combo_up") as release_keys:
+            self.app._on_hid_tap_status(
+                app_module.frida_compat.HidTapState.ATTACHED_WAITING_IO.value,
+                "hid_interception_armed",
+            )
+
+        release_keys.assert_called_once_with(("up",))
+        self.assertEqual(self.app._raw_fallback_buttons_down, set())
+        self.assertEqual(self.app._input_rearm_blocked_buttons, {"up"})
+
+        self.app._on_raw_button_event("up", False, "keyboard")
+        self.assertEqual(self.app._input_rearm_blocked_buttons, set())
 
     def test_raw_mapping_resumes_if_armed_tap_fails_before_ready(self):
         self.app._direct_hid_interception_ready = False
@@ -1395,6 +1468,69 @@ class OrdinaryButtonGestureWiringTests(_AppWiringTestCase):
         release.assert_called_once_with("up")
         self.assertEqual(self.app._direct_hid_usages, set())
 
+    def test_direct_neutral_report_clears_handover_block(self):
+        self.app._input_rearm_blocked_buttons = {"up", "ok"}
+
+        self.app._on_direct_hid_report(1, b"\x00" * 6)
+
+        self.assertEqual(self.app._input_rearm_blocked_buttons, set())
+
+    def test_raw_device_removal_cancels_all_button_state_and_reconnects(self):
+        usage = next(
+            usage
+            for usage, button_id in app_module.frida_compat.TAP_USAGE_TO_BUTTON.items()
+            if button_id == "down"
+        )
+        self.app._direct_hid_usages = {usage}
+        self.app._raw_fallback_buttons_down = {"up"}
+        self.app._raw_mapped_buttons_down = {"ok"}
+        self.app._input_rearm_blocked_buttons = {"left"}
+        self.app._direct_hid_interception_armed = True
+        reconnects = []
+        self.app._supervisor.request_reconnect = lambda: reconnects.append(True)
+
+        with mock.patch.object(win32_input, "send_key_combo_up") as release_keys, mock.patch.object(
+            self.app._button_gestures, "reset"
+        ) as gesture_reset, mock.patch.object(
+            self.app._button_combos, "reset"
+        ) as combo_reset:
+            self.app._on_raw_input_device_removed()
+
+        release_keys.assert_called_once_with(("up",))
+        gesture_reset.assert_called_once_with()
+        combo_reset.assert_called_once_with()
+        self.assertEqual(reconnects, [True])
+        self.assertEqual(self.app._direct_hid_usages, set())
+        self.assertEqual(self.app._raw_fallback_buttons_down, set())
+        self.assertEqual(self.app._raw_mapped_buttons_down, set())
+        self.assertEqual(self.app._input_rearm_blocked_buttons, {"down"})
+        self.assertFalse(self.app._direct_hid_interception_ready)
+        self.assertFalse(self.app._direct_hid_interception_armed)
+
+    def test_direct_report_revalidates_after_raw_collection_is_removed(self):
+        usage = next(
+            usage
+            for usage, button_id in app_module.frida_compat.TAP_USAGE_TO_BUTTON.items()
+            if button_id == "up"
+        )
+
+        class ReadyTap:
+            status = app_module.frida_compat.HidTapState.READY.value
+
+        self.app._hid_report_tap = ReadyTap()
+        self.app._direct_hid_usages = {usage}
+        self.app._supervisor.request_reconnect = lambda: None
+
+        self.app._on_raw_input_device_removed()
+        self.assertEqual(self.app._input_rearm_blocked_buttons, {"up"})
+        self.assertFalse(self.app._direct_hid_interception_ready)
+
+        self.app._on_direct_hid_report(1, b"\x00" * 6)
+
+        self.assertTrue(self.app._direct_hid_interception_ready)
+        self.assertTrue(self.app._direct_hid_interception_armed)
+        self.assertEqual(self.app._input_rearm_blocked_buttons, set())
+
     def test_tap_failure_serializes_stale_release_against_final_report(self):
         usage = next(
             usage
@@ -1410,7 +1546,7 @@ class OrdinaryButtonGestureWiringTests(_AppWiringTestCase):
             original_set_runtime_input_state(**kwargs)
 
         self.app._set_runtime_input_state = record_status_start
-        with mock.patch.object(self.app, "_on_button_event") as button_event:
+        with mock.patch.object(self.app._button_gestures, "reset") as reset:
             with self.app._input_arbitration_lock:
                 worker = threading.Thread(
                     target=self.app._on_hid_tap_status,
@@ -1429,11 +1565,8 @@ class OrdinaryButtonGestureWiringTests(_AppWiringTestCase):
 
         self.assertFalse(worker.is_alive())
         self.assertEqual(self.app._direct_hid_usages, set())
-        button_event.assert_called_once_with(
-            "up",
-            False,
-            event_source="hid_tap",
-        )
+        reset.assert_called_once_with()
+        self.assertEqual(self.app._input_rearm_blocked_buttons, {"up"})
 
 
 class VoiceMappingProductBoundaryTests(_AppWiringTestCase):
@@ -2109,7 +2242,7 @@ class InputLifecycleTests(_AppWiringTestCase):
             self.app._stop_input_channels()
 
         self.assertEqual(events, [("tap", True), ("raw", True)])
-        button_event.assert_called_once_with("up", False, event_source="hid_tap")
+        button_event.assert_not_called()
         self.assertFalse(self.app._accept_input_events)
 
     def test_ble_cleanup_does_not_disable_ordinary_button_mapping(self):

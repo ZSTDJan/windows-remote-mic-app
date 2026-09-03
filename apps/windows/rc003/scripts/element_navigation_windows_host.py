@@ -3093,8 +3093,8 @@ def _run_windows(
             self._callback = None
             self._thread_id = 0
             self._ready = threading.Event()
-            self._down: set[int] = set()
-            self._swallowed: set[int] = set()
+            self._down: set[tuple[int, bool]] = set()
+            self._swallowed: set[tuple[int, bool]] = set()
             self._passthrough: set[int] = set()
             self._direction_input_ownership = DirectionInputOwnership()
             self._thread = threading.Thread(
@@ -3120,6 +3120,11 @@ def _run_windows(
         def _pressed(self, vk: int) -> bool:
             return bool(user32.GetAsyncKeyState(vk) & 0x8000)
 
+        def _seed_passthrough(self) -> None:
+            self._passthrough.update(
+                vk for vk in range(1, 256) if self._pressed(vk)
+            )
+
         def _handle(self, code: int, wparam: int, lparam: int) -> int:
             if code < 0:
                 return user32.CallNextHookEx(self._hook, code, wparam, lparam)
@@ -3132,11 +3137,12 @@ def _run_windows(
             data = ctypes.cast(lparam, ctypes.POINTER(self._struct)).contents
             vk = int(data.vkCode)
             injected = bool(data.flags & self.LLKHF_INJECTED)
-            was_down = vk in self._down
+            ownership_key = (vk, injected)
+            was_down = ownership_key in self._down
             if is_down:
-                self._down.add(vk)
+                self._down.add(ownership_key)
             else:
-                self._down.discard(vk)
+                self._down.discard(ownership_key)
 
             if (
                 is_up
@@ -3155,19 +3161,28 @@ def _run_windows(
                     )
                 )
                 self._passthrough.discard(vk)
-                self._swallowed.discard(vk)
+                self._swallowed.discard((vk, False))
                 return downstream_result or 1
 
-            if vk in self._passthrough:
+            if not injected and vk in self._passthrough:
                 if is_up:
                     self._passthrough.discard(vk)
                 return user32.CallNextHookEx(
                     self._hook, code, wparam, lparam
                 )
 
-            if is_up and vk in self._swallowed:
-                self._swallowed.discard(vk)
+            if is_up and ownership_key in self._swallowed:
+                self._swallowed.discard(ownership_key)
                 return 1
+
+            # A key-up is ours only when this hook previously swallowed or
+            # forwarded the matching key-down. The hook can start while a key
+            # is already held, so claiming an otherwise unowned key-up would
+            # leave the foreground application believing the key is stuck.
+            if is_up:
+                return user32.CallNextHookEx(
+                    self._hook, code, wparam, lparam
+                )
 
             ctrl_alt = self._pressed(self.VK_CONTROL) and self._pressed(self.VK_MENU)
             hotkey_action = global_hotkey_action(
@@ -3175,7 +3190,7 @@ def _run_windows(
                 include_developer_actions=self._include_developer_hotkeys,
             )
             if is_down and ctrl_alt and hotkey_action is not None:
-                self._swallowed.add(vk)
+                self._swallowed.add(ownership_key)
                 if not was_down:
                     self._on_action(hotkey_action)
                 return 1
@@ -3185,7 +3200,7 @@ def _run_windows(
                 if self._active.is_set() and should_pass_through_native_menu(
                     vk, native_menu_mode_active()
                 ):
-                    if is_down:
+                    if is_down and not injected:
                         self._passthrough.add(vk)
                     return user32.CallNextHookEx(
                         self._hook, code, wparam, lparam
@@ -3203,27 +3218,34 @@ def _run_windows(
                 )
                 if downstream_owned:
                     return downstream_result or 1
-                self._swallowed.add(vk)
-                if is_down and (vk in self._down):
+                self._swallowed.add(ownership_key)
+                if is_down:
                     if vk in (VK_RETURN, VK_APPS, VK_ESCAPE) and was_down:
                         return 1
                     self._on_action(action)
                 return 1
 
-            if is_down and action is not None:
+            if is_down and not injected and action is not None:
                 self._passthrough.add(vk)
             return user32.CallNextHookEx(self._hook, code, wparam, lparam)
 
         def _run(self) -> None:
             self._thread_id = int(kernel32.GetCurrentThreadId())
+            message = wintypes.MSG()
+            user32.PeekMessageW(
+                ctypes.byref(message), None, 0, 0, pm_noremove
+            )
             self._callback = self._proc_type(self._handle)
             self._hook = user32.SetWindowsHookExW(
                 self.WH_KEYBOARD_LL, self._callback, kernel32.GetModuleHandleW(None), 0
             )
+            if self._hook:
+                # A foreground application already owns keys held before the
+                # hook starts. Keep their repeats and release downstream.
+                self._seed_passthrough()
             self._ready.set()
             if not self._hook:
                 return
-            message = wintypes.MSG()
             while user32.GetMessageW(ctypes.byref(message), None, 0, 0) > 0:
                 user32.TranslateMessage(ctypes.byref(message))
                 user32.DispatchMessageW(ctypes.byref(message))
