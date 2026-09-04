@@ -47,6 +47,7 @@ DEVICE_PROFILES_DIR = REPO_ROOT / "device-profiles"
 # offline on the end-user machine.
 VB_CABLE_BUNDLE_ZIP = RC003_ROOT / "build" / "third_party" / "VBCABLE_Driver_Pack45.zip"
 FRIDA_ASSET_DIR = SRC_ROOT / "ovb_rc003" / "frida_assets"
+VERSION_FILE = SRC_ROOT / "ovb_rc003" / "VERSION"
 HID_HELPER_NAME = "RemoteMicRC003HidHelper"
 HID_HELPER_RELATIVE_PATH = Path("_internal") / f"{HID_HELPER_NAME}.exe"
 
@@ -79,6 +80,9 @@ if not REMOTE_PHOTO.is_file():
     )
 
 datas = []
+if not VERSION_FILE.is_file():
+    raise SystemExit(f"required application version file is missing: {VERSION_FILE}")
+datas.append((str(VERSION_FILE), "ovb_rc003"))
 # This places the photo under Resources/ inside the one-dir COLLECT output,
 # which PyInstaller exposes at runtime as sys._MEIPASS/Resources/. A source
 # checkout may still degrade if a user deletes the file after startup, but a

@@ -31,7 +31,12 @@
 
 #define AppName "无线麦"
 #define AppPublisher "无线麦项目"
-#define AppVersion "0.1.0-candidate"
+#define VersionFileHandle FileOpen(AddBackslash(SourcePath) + "..\src\ovb_rc003\VERSION")
+#if !VersionFileHandle
+  #error "Cannot read src\ovb_rc003\VERSION"
+#endif
+#define AppVersion Trim(FileRead(VersionFileHandle))
+#expr FileClose(VersionFileHandle)
 #define AppExeName "RemoteMicRC003.exe"
 #define HidHelperExeName "RemoteMicRC003HidHelper.exe"
 #define AppFolder "RC003"
@@ -124,20 +129,23 @@ Name: "{userdesktop}\{#AppName}"; Filename: "{app}\{#AppExeName}"; Tasks: deskto
 [Run]
 ; Post-install may open Settings, but must never silently start the
 ; bridge (that would touch BLE/HID/audio before the user has configured
-; anything) - unchecked by default either way.
-Filename: "{app}\{#AppExeName}"; Parameters: "--settings"; Description: "打开 {#AppName} 设置"; Flags: postinstall nowait skipifsilent unchecked
+; anything). The finish-page action is checked by default so a successful
+; upgrade visibly opens the newly installed version.
+Filename: "{app}\{#AppExeName}"; Parameters: "--settings"; Description: "打开 {#AppName} {#AppVersion}"; Flags: postinstall nowait skipifsilent
 
 [Code]
 const
   StopNeedsElevationExitCode = 10;
   StopUnsafeToContinueExitCode = 20;
   StopProbeFailedExitCode = 21;
+  StopUserActionRequiredExitCode = 22;
+  StopOtherLocationRunningExitCode = 23;
 
 var
   HidHelperInstallSucceeded: Boolean;
 
 function RunStopApplication(const StopScript: String; Elevated: Boolean;
-  var ResultCode: Integer): Boolean;
+  BlockOtherLocations: Boolean; var ResultCode: Integer): Boolean;
 var
   Parameters: String;
   PowerShellPath: String;
@@ -147,7 +155,9 @@ begin
     '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' +
     StopScript + '" -AppPath "' + ExpandConstant('{app}') +
     '" -ConfigRoot "' +
-    ExpandConstant('{localappdata}\RemoteMic\{#AppFolder}') + '"';
+     ExpandConstant('{localappdata}\RemoteMic\{#AppFolder}') + '"';
+  if BlockOtherLocations then
+    Parameters := Parameters + ' -BlockOtherLocations';
   if Elevated then
   begin
     Parameters := Parameters + ' -ElevatedRetry';
@@ -204,7 +214,7 @@ begin
   Result := '';
   ExtractTemporaryFile('stop-app.ps1');
   StopScript := ExpandConstant('{tmp}\stop-app.ps1');
-  Started := RunStopApplication(StopScript, False, ResultCode);
+  Started := RunStopApplication(StopScript, False, True, ResultCode);
   if not Started then
   begin
     Result := '无法运行旧进程清理程序；安装已停止，以免覆盖仍在使用的文件。';
@@ -212,7 +222,7 @@ begin
   end;
   if ResultCode = StopNeedsElevationExitCode then
   begin
-    Started := RunStopApplication(StopScript, True, ResultCode);
+    Started := RunStopApplication(StopScript, True, True, ResultCode);
     if not Started then
     begin
       Result := '需要管理员权限关闭正在以管理员身份运行的旧版。未完成 UAC 确认，安装没有覆盖任何程序文件。';
@@ -221,7 +231,11 @@ begin
   end;
   if ResultCode <> 0 then
   begin
-    if ResultCode = StopUnsafeToContinueExitCode then
+    if ResultCode = StopOtherLocationRunningExitCode then
+      Result := '检测到另一个文件夹中的无线麦仍在运行，常见于旧便携版。已尝试把旧窗口唤到前台；请保存或放弃未保存的修改，再从通知区域选择“完全退出”，然后回到安装器重试。安装没有覆盖任何程序文件。'
+    else if ResultCode = StopUserActionRequiredExitCode then
+      Result := '旧版遥控器服务已经停止，但旧版设置窗口仍在运行。请在旧版窗口保存或放弃未保存的修改，再从通知区域选择“完全退出”；完成后回到安装器重试。安装没有覆盖任何程序文件。'
+    else if ResultCode = StopUnsafeToContinueExitCode then
       Result := '无线麦没有完成安全退出。安装没有覆盖任何程序文件；请先处理窗口中的保存提示并完全退出。旧版若没有可用的退出入口，请关闭软件或重启 Windows 后再安装。'
     else if ResultCode = StopProbeFailedExitCode then
       Result := '无法安全核对正在运行的旧程序。安装没有覆盖任何程序文件；请关闭所有无线麦进程或重启 Windows 后再安装。'
@@ -273,19 +287,26 @@ begin
     exit;
   end;
 
-  Started := RunStopApplication(StopScript, False, ResultCode);
+  Started := RunStopApplication(StopScript, False, False, ResultCode);
   if Started then
   begin
     if ResultCode = StopNeedsElevationExitCode then
-      Started := RunStopApplication(StopScript, True, ResultCode);
+      Started := RunStopApplication(StopScript, True, False, ResultCode);
   end;
   if (not Started) or (ResultCode <> 0) then
   begin
-    MsgBox(
-      '无线麦没有完成安全退出，或管理员确认被取消。卸载尚未开始；请处理窗口中的保存提示并完全退出。旧版若没有可用的退出入口，请关闭软件或重启 Windows 后再卸载。',
-      mbError,
-      MB_OK
-    );
+    if ResultCode = StopUserActionRequiredExitCode then
+      MsgBox(
+        '旧版遥控器服务已经停止，但设置窗口仍在运行。请保存或放弃未保存的修改，再从通知区域选择“完全退出”，然后重新卸载。',
+        mbError,
+        MB_OK
+      )
+    else
+      MsgBox(
+        '无线麦没有完成安全退出，或管理员确认被取消。卸载尚未开始；请处理窗口中的保存提示并完全退出。旧版若没有可用的退出入口，请关闭软件或重启 Windows 后再卸载。',
+        mbError,
+        MB_OK
+      );
     Result := False;
     exit;
   end;

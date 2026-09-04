@@ -498,11 +498,12 @@ class SettingsControllerTests(unittest.TestCase):
     def _continue_save_and_launch(self, controller):
         controller._continue_save_and_launch()
 
-    def test_desktop_behavior_defaults_hide_close_and_do_not_auto_start_bridge(self):
+    def test_desktop_behavior_defaults_quit_close_and_do_not_auto_start_bridge(self):
         controller, _model = self._make_controller()
         self.assertFalse(controller.launchAtLogin)
         self.assertFalse(controller.launchBridgeOnAppStart)
-        self.assertEqual(controller.closeBehavior, "hide_to_tray")
+        self.assertEqual(controller.closeBehavior, "quit")
+        self.assertEqual(controller.applicationVersion, qt_settings_app.__version__)
         self.assertTrue(
             controller.trayIconSource.endswith("remote-mic-unavailable.svg")
         )
@@ -5114,6 +5115,7 @@ class RunSettingsWindowShutdownCoverageTests(unittest.TestCase):
 # documented on RenderedContrastTests above).
 _APPLICATION_EXIT_PROBE_SCRIPT = r"""
 import json
+import os
 import time
 
 from PySide6.QtCore import QTimer
@@ -5121,17 +5123,30 @@ from ovb_rc003 import qt_settings_app as m
 
 m.single_instance.bridge_instance_running = lambda: False
 original_connect_application_exit = m._connect_application_exit
+action = os.environ.get("RC003_EXIT_PROBE_ACTION", "controller")
 
 
 def connect_application_exit_and_schedule(app, controller):
     original_connect_application_exit(app, controller)
-    QTimer.singleShot(50, controller.requestApplicationExit)
+
+    def trigger_exit():
+        if action == "window_close":
+            windows = app.topLevelWindows()
+            if not windows:
+                app.exit(23)
+                return
+            windows[0].close()
+            return
+        controller.requestApplicationExit()
+
+    QTimer.singleShot(50, trigger_exit)
 
 
 m._connect_application_exit = connect_application_exit_and_schedule
 started = time.monotonic()
-result = m.run_settings_window(start_hidden=True)
+result = m.run_settings_window(start_hidden=(action != "window_close"))
 print(json.dumps({
+    "action": action,
     "result": result,
     "elapsed": time.monotonic() - started,
 }))
@@ -5225,6 +5240,7 @@ mapping_dirty_on_voice = bool(status_bar.property("hasStatus"))
 result = {
     "root_count": len(root_objects),
     "warnings": [w.toString() for w in warnings],
+    "title": root_objects[0].property("title") if root_objects else None,
     "width": root_objects[0].property("width") if root_objects else None,
     "height": root_objects[0].property("height") if root_objects else None,
     "initial_settings_dirty": initial_settings_dirty,
@@ -7186,6 +7202,33 @@ class ApplicationExitIntegrationTests(unittest.TestCase):
         self.assertEqual(data["result"], 0)
         self.assertLess(data["elapsed"], 5.0)
 
+    def test_default_window_close_runs_the_full_exit_path(self):
+        import subprocess
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            env = dict(os.environ)
+            env.setdefault("QT_QPA_PLATFORM", "offscreen")
+            env["LOCALAPPDATA"] = tmpdir
+            env["RC003_DISABLE_LIVE_INPUT"] = "1"
+            env["RC003_EXIT_PROBE_ACTION"] = "window_close"
+            result = subprocess.run(
+                [sys.executable, "-c", _APPLICATION_EXIT_PROBE_SCRIPT],
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+
+        self.assertEqual(
+            result.returncode,
+            0,
+            f"window close probe failed: {result.stderr}",
+        )
+        data = json.loads(result.stdout.strip().splitlines()[-1])
+        self.assertEqual(data["action"], "window_close")
+        self.assertEqual(data["result"], 0)
+        self.assertLess(data["elapsed"], 5.0)
+
 
 @unittest.skipUnless(_HAS_PYSIDE6, _SKIP_REASON)
 class OffscreenQmlLoadTests(unittest.TestCase):
@@ -7223,6 +7266,11 @@ class OffscreenQmlLoadTests(unittest.TestCase):
         )
         self.assertEqual(data["width"], 720)
         self.assertEqual(data["height"], 560)
+        self.assertEqual(
+            data["title"],
+            f"{qt_settings_app.product_identity.DISPLAY_NAME} · "
+            f"{qt_settings_app.__version__}",
+        )
         self.assertFalse(data["initial_settings_dirty"])
         self.assertFalse(data["retired_finish_tap_control_exists"])
         self.assertFalse(data["voice_hotkey_recording"])

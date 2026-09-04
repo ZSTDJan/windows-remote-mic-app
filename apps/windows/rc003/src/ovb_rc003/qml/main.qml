@@ -6,7 +6,8 @@ import OvbRc003Settings 1.0
 
 ApplicationWindow {
     id: window
-    title: SettingsController.applicationDisplayName
+    title: "%1 · %2".arg(SettingsController.applicationDisplayName)
+        .arg(SettingsController.applicationVersion)
     width: 720
     height: 560
     minimumWidth: 640

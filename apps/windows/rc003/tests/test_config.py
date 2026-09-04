@@ -50,9 +50,7 @@ class DefaultConfigPrivacyTests(unittest.TestCase):
         )
         self.assertEqual(defaults["gain_db"], 10.0)
         self.assertFalse(defaults["launch_bridge_on_app_start"])
-        self.assertEqual(
-            defaults["close_behavior"], config.CLOSE_BEHAVIOR_HIDE_TO_TRAY
-        )
+        self.assertEqual(defaults["close_behavior"], config.CLOSE_BEHAVIOR_QUIT)
 
     def test_default_config_contains_no_forbidden_identity_fields(self):
         defaults = config.default_config()
@@ -90,6 +88,38 @@ class DefaultConfigPrivacyTests(unittest.TestCase):
             )
             loaded = config.load_config(path)
         self.assertTrue(loaded["launch_bridge_on_app_start"])
+        self.assertEqual(loaded["close_behavior"], config.CLOSE_BEHAVIOR_QUIT)
+
+    def test_legacy_hide_to_tray_is_migrated_to_quit_once(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": config.SCHEMA_VERSION - 1,
+                        "close_behavior": config.CLOSE_BEHAVIOR_HIDE_TO_TRAY,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            loaded = config.load_config(path)
+
+        self.assertEqual(loaded["close_behavior"], config.CLOSE_BEHAVIOR_QUIT)
+
+    def test_current_explicit_hide_to_tray_choice_is_preserved(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": config.SCHEMA_VERSION,
+                        "close_behavior": config.CLOSE_BEHAVIOR_HIDE_TO_TRAY,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            loaded = config.load_config(path)
+
         self.assertEqual(
             loaded["close_behavior"], config.CLOSE_BEHAVIOR_HIDE_TO_TRAY
         )

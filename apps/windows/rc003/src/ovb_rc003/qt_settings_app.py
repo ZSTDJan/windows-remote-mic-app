@@ -1019,7 +1019,7 @@ def _load_qt_classes() -> dict:
             )
             self._close_behavior = str(
                 self._config.get(
-                    "close_behavior", config.CLOSE_BEHAVIOR_HIDE_TO_TRAY
+                    "close_behavior", config.CLOSE_BEHAVIOR_QUIT
                 )
             )
             startup_state = startup_windows.read_startup_state()
@@ -3973,6 +3973,11 @@ def _load_qt_classes() -> dict:
         applicationDisplayName = Property(
             str,
             lambda self: product_identity.DISPLAY_NAME,
+            constant=True,
+        )
+        applicationVersion = Property(
+            str,
+            lambda self: __version__,
             constant=True,
         )
 

@@ -67,7 +67,9 @@ class ProductIdentityTests(unittest.TestCase):
             self.assertNotIn("Remote Mic", text)
 
         main_qml = (qml_dir / "main.qml").read_text(encoding="utf-8")
-        self.assertIn("title: SettingsController.applicationDisplayName", main_qml)
+        self.assertIn("arg(SettingsController.applicationDisplayName)", main_qml)
+        self.assertIn("arg(SettingsController.applicationVersion)", main_qml)
+        self.assertNotIn(qt_settings_app.__version__, main_qml)
         self.assertNotIn('title: qsTr("%1 设置")', main_qml)
 
     def test_qt_process_identity_uses_the_shared_display_name(self):

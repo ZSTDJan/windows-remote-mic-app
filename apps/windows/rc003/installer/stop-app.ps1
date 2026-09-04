@@ -7,9 +7,12 @@
 .DESCRIPTION
     Current builds receive an atomic full-exit request and own all cleanup.
     Released legacy builds have no application-exit contract, so their bridge
-    is asked to exit through its existing tray control window before the
-    remaining settings shell is boundedly removed. The script never touches a
-    same-named executable outside the exact installation path.
+    is asked to exit through its existing tray control window. Any remaining
+    settings shell is brought forward for the user to save or discard changes
+    and exit. During installation, a same-named program running from another
+    folder is also brought forward and blocks the install, preventing a legacy
+    portable copy from intercepting the newly installed launch. Such external
+    programs are never force-stopped.
 #>
 
 param(
@@ -17,6 +20,8 @@ param(
     [string]$AppPath,
 
     [string]$ConfigRoot = "",
+
+    [switch]$BlockOtherLocations,
 
     [switch]$ElevatedRetry
 )
@@ -27,10 +32,11 @@ $exitOk = 0
 $exitNeedsElevation = 10
 $exitUnsafeToContinue = 20
 $exitProbeFailed = 21
+$exitUserActionRequired = 22
+$exitOtherLocationRunning = 23
 $currentExitTimeoutSeconds = 45
 $legacyRequestGraceSeconds = 2
 $legacyBridgeExitTimeoutSeconds = 10
-$legacyShellExitTimeoutSeconds = 5
 $targetExecutableName = "RemoteMicRC003.exe"
 $exitRequestFileName = "application-exit-request.json"
 $bridgeStartRequestFileName = "bridge-start-request.json"
@@ -50,6 +56,83 @@ function Write-StopError {
     [Console]::Error.WriteLine($Message)
 }
 
+function Show-LegacyShellWindow {
+    param([Parameter(Mandatory = $true)][object[]]$Targets)
+
+    $nativeType = [System.Management.Automation.PSTypeName]'RemoteMicInstaller.LegacyShellMethods'
+    if (-not $nativeType.Type) {
+        Add-Type -TypeDefinition @"
+using System;
+using System.Collections.Generic;
+using System.Runtime.InteropServices;
+
+namespace RemoteMicInstaller {
+    public static class LegacyShellMethods {
+        private delegate bool EnumWindowsProc(IntPtr window, IntPtr parameter);
+
+        [DllImport("user32.dll")]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool EnumWindows(EnumWindowsProc callback, IntPtr parameter);
+
+        [DllImport("user32.dll")]
+        private static extern uint GetWindowThreadProcessId(IntPtr window, out uint processId);
+
+        [DllImport("user32.dll")]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool ShowWindow(IntPtr window, int command);
+
+        [DllImport("user32.dll")]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool BringWindowToTop(IntPtr window);
+
+        [DllImport("user32.dll")]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool SetForegroundWindow(IntPtr window);
+
+        [DllImport("user32.dll")]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool FlashWindow(IntPtr window, bool invert);
+
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+        private static extern int GetWindowTextLength(IntPtr window);
+
+        public static IntPtr FindWindowForProcess(uint processId) {
+            IntPtr found = IntPtr.Zero;
+            EnumWindows(delegate(IntPtr window, IntPtr parameter) {
+                uint ownerProcessId;
+                GetWindowThreadProcessId(window, out ownerProcessId);
+                if (ownerProcessId != processId || GetWindowTextLength(window) <= 0) {
+                    return true;
+                }
+                found = window;
+                return false;
+            }, IntPtr.Zero);
+            return found;
+        }
+    }
+}
+"@
+    }
+
+    foreach ($target in $Targets) {
+        try {
+            $window = [RemoteMicInstaller.LegacyShellMethods]::FindWindowForProcess(
+                [uint32]$target.ProcessId
+            )
+            if ($window -eq [IntPtr]::Zero) {
+                continue
+            }
+            [void][RemoteMicInstaller.LegacyShellMethods]::ShowWindow($window, 9)
+            [void][RemoteMicInstaller.LegacyShellMethods]::BringWindowToTop($window)
+            if (-not [RemoteMicInstaller.LegacyShellMethods]::SetForegroundWindow($window)) {
+                [void][RemoteMicInstaller.LegacyShellMethods]::FlashWindow($window, $true)
+            }
+        } catch {
+            # Best effort only. The installer message also names the tray exit path.
+        }
+    }
+}
+
 function Test-IsAdministrator {
     $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
     $principal = [Security.Principal.WindowsPrincipal]::new($identity)
@@ -64,15 +147,15 @@ if ($ElevatedRetry -and -not $isElevated) {
     exit $exitProbeFailed
 }
 
-$normalizedAppPath = Resolve-Path -LiteralPath $AppPath -ErrorAction SilentlyContinue
-if (-not $normalizedAppPath) {
-    exit $exitOk
+try {
+    $root = [System.IO.Path]::GetFullPath($AppPath).TrimEnd(
+        [System.IO.Path]::DirectorySeparatorChar,
+        [System.IO.Path]::AltDirectorySeparatorChar
+    )
+} catch {
+    Write-StopError "$productName application path could not be normalized."
+    exit $exitProbeFailed
 }
-
-$root = [System.IO.Path]::GetFullPath($normalizedAppPath.Path).TrimEnd(
-    [System.IO.Path]::DirectorySeparatorChar,
-    [System.IO.Path]::AltDirectorySeparatorChar
-)
 $targetExecutablePath = [System.IO.Path]::GetFullPath(
     [System.IO.Path]::Combine($root, $targetExecutableName)
 )
@@ -104,6 +187,7 @@ function Exit-ForRestrictedProcess {
 
 function Get-TargetSnapshot {
     $targets = [System.Collections.Generic.List[object]]::new()
+    $externalTargets = [System.Collections.Generic.List[object]]::new()
     $unknownCount = 0
     try {
         $processes = @(
@@ -127,17 +211,34 @@ function Get-TargetSnapshot {
             $unknownCount += 1
             continue
         }
+        $target = [PSCustomObject]@{
+            ProcessId = [uint32]$process.ProcessId
+            CreationDate = $process.CreationDate
+            CommandLine = [string]$process.CommandLine
+        }
         if (-not $executable.Equals(
             $script:targetExecutablePath,
             [System.StringComparison]::OrdinalIgnoreCase
         )) {
+            if ($script:BlockOtherLocations) {
+                $externalTargets.Add($target)
+            }
             continue
         }
-        $targets.Add([PSCustomObject]@{
-            ProcessId = [uint32]$process.ProcessId
-            CreationDate = $process.CreationDate
-            CommandLine = [string]$process.CommandLine
-        })
+        $targets.Add($target)
+    }
+
+    if ($script:BlockOtherLocations -and $externalTargets.Count -gt 0) {
+        $externalShellTargets = @(
+            $externalTargets | Where-Object {
+                $_.CommandLine -notmatch '(?i)(^|\s|\")--bridge(\s|$|\")'
+            }
+        )
+        if ($externalShellTargets.Count -gt 0) {
+            Show-LegacyShellWindow -Targets $externalShellTargets
+        }
+        Write-StopError "$productName is running from another folder."
+        exit $script:exitOtherLocationRunning
     }
 
     return [PSCustomObject]@{
@@ -421,8 +522,9 @@ namespace RemoteMicInstaller {
 
 # Candidate releases before the full-exit contract kept the settings shell
 # separate from the bridge. Once every legacy bridge process has completed
-# normal cleanup, the shell owns no BLE/HID/key/audio resources and can be
-# boundedly removed so its executable can be replaced.
+# normal cleanup, leave the shell alive so the user can save or discard any
+# pending mapping edits and choose its existing "完全退出" command. The
+# installer must never trade a convenient upgrade for silent setting loss.
 $shellSnapshot = Get-TargetSnapshot
 if ($shellSnapshot.UnknownCount -gt 0) {
     Exit-ForRestrictedProcess
@@ -436,48 +538,10 @@ if ($restartedLegacyBridgeTargets.Count -gt 0) {
     Write-StopError "$productName legacy bridge restarted during shutdown confirmation."
     exit $exitUnsafeToContinue
 }
-foreach ($target in $shellSnapshot.Targets) {
-    try {
-        $current = Get-CurrentTargetProcess `
-            -ProcessId $target.ProcessId `
-            -CreationDate $target.CreationDate
-        if (-not $current) {
-            continue
-        }
-        Stop-Process -Id $target.ProcessId -Force -ErrorAction Stop
-    } catch {
-        try {
-            $stillCurrent = Get-CurrentTargetProcess `
-                -ProcessId $target.ProcessId `
-                -CreationDate $target.CreationDate
-        } catch {
-            Exit-ForRestrictedProcess
-        }
-        if ($stillCurrent) {
-            if (-not $isElevated) {
-                exit $exitNeedsElevation
-            }
-            Write-StopError "$productName legacy shell could not be stopped."
-            exit $exitUnsafeToContinue
-        }
-    }
-}
-
-if (-not (Wait-ForTargetsToExit `
-    -Targets $shellSnapshot.Targets `
-    -TimeoutSeconds $legacyShellExitTimeoutSeconds
-)) {
-    Write-StopError "$productName legacy shell did not exit within the bounded timeout."
-    exit $exitUnsafeToContinue
-}
-
-$finalSnapshot = Get-TargetSnapshot
-if ($finalSnapshot.UnknownCount -gt 0) {
-    Exit-ForRestrictedProcess
-}
-if ($finalSnapshot.Targets.Count -ne 0) {
-    Write-StopError "$productName is still running; files were not touched."
-    exit $exitUnsafeToContinue
+if ($shellSnapshot.Targets.Count -gt 0) {
+    Show-LegacyShellWindow -Targets $shellSnapshot.Targets
+    Write-StopError "$productName legacy settings require user confirmation before upgrade."
+    exit $exitUserActionRequired
 }
 
 Remove-TransientRequests

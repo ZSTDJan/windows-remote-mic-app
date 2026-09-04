@@ -279,18 +279,16 @@ jobs:
         shell: pwsh
         run: |
           # "Deterministic" here means deterministic, non-random/non-timestamped
-          # OUTPUT FILENAMES (derived from the .iss AppVersion, not a build
+          # OUTPUT FILENAMES (derived from the runtime VERSION source, not a build
           # number or GUID) plus a checksum manifest generated in sorted
           # order - not bit-for-bit reproducible-build byte equality, which
           # PyInstaller does not guarantee upstream. Never signed, never
           # published, never installed here.
-          $issText = Get-Content -Raw installer\RemoteMicRC003Setup.iss
-          $versionMatch = [regex]::Match($issText, '#define AppVersion "([^"]+)"')
-          if (-not $versionMatch.Success) {
-            Write-Error "could not determine AppVersion from installer\RemoteMicRC003Setup.iss"
+          $version = (Get-Content -Raw src\ovb_rc003\VERSION).Trim()
+          if ($version -notmatch '^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$') {
+            Write-Error "invalid application version in src\ovb_rc003\VERSION: $version"
             exit 1
           }
-          $version = $versionMatch.Groups[1].Value
 
           # XRBM-022 controller pre-review correction: the installer
           # packages LICENSE/COPYRIGHT/THIRD_PARTY_NOTICES.md and ships an

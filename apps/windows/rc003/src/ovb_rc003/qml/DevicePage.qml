@@ -303,7 +303,7 @@ Item {
                     objectName: "closeBehaviorRow"
                     tokens: root.tokens
                     titleText: qsTr("关闭窗口时")
-                    descriptionText: qsTr("最小化按钮仍正常保留在任务栏")
+                    descriptionText: qsTr("默认完全退出；需要后台运行时可改为隐藏到通知区域")
                     showDivider: false
 
                     SelectionComboBox {

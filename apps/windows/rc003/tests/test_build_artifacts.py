@@ -12,6 +12,7 @@ from ovb_rc003 import config, logging_setup
 _RC003_ROOT = Path(__file__).resolve().parents[1]
 _REPO_ROOT = _RC003_ROOT.parents[2]
 _SPEC_PATH = _RC003_ROOT / "build" / "RemoteMicRC003.spec"
+_VERSION_PATH = _RC003_ROOT / "src" / "ovb_rc003" / "VERSION"
 _REQUIREMENTS_PATH = _RC003_ROOT / "requirements.txt"
 _ISS_PATH = _RC003_ROOT / "installer" / "RemoteMicRC003Setup.iss"
 _CI_PATH = _REPO_ROOT / ".github" / "workflows" / "windows-rc003-ci.yml"
@@ -193,6 +194,16 @@ class PyInstallerSpecTests(unittest.TestCase):
     def test_spec_is_valid_python(self):
         text = _SPEC_PATH.read_text(encoding="utf-8")
         ast.parse(text, filename=str(_SPEC_PATH))  # raises SyntaxError on failure
+
+    def test_spec_requires_and_bundles_the_shared_version_file(self):
+        text = _strip_hash_comments(_SPEC_PATH.read_text(encoding="utf-8"))
+        self.assertTrue(_VERSION_PATH.is_file())
+        self.assertRegex(
+            _VERSION_PATH.read_text(encoding="ascii").strip(),
+            r"^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$",
+        )
+        self.assertIn('VERSION_FILE = SRC_ROOT / "ovb_rc003" / "VERSION"', text)
+        self.assertIn('datas.append((str(VERSION_FILE), "ovb_rc003"))', text)
 
     def test_spec_excludes_other_device_bridges(self):
         text = _SPEC_PATH.read_text(encoding="utf-8")
@@ -380,6 +391,7 @@ class InnoSetupScriptTests(unittest.TestCase):
         self.assertIn("StopNeedsElevationExitCode = 10", code_section)
         self.assertIn("StopUnsafeToContinueExitCode = 20", code_section)
         self.assertIn("StopProbeFailedExitCode = 21", code_section)
+        self.assertIn("StopUserActionRequiredExitCode = 22", code_section)
         self.assertIn("RunStopApplication(StopScript, True", code_section)
         self.assertIn("-ElevatedRetry", code_section)
         self.assertNotIn("--pid", code_section)
@@ -477,6 +489,8 @@ class InnoSetupScriptTests(unittest.TestCase):
         self.assertIn("if not Started then", code_section)
         self.assertIn("if ResultCode <> 0 then", code_section)
         self.assertIn("安装没有覆盖任何程序文件", code_section)
+        self.assertIn("旧版设置窗口仍在运行", code_section)
+        self.assertIn("从通知区域选择“完全退出”", code_section)
 
     def test_upgrade_requests_uac_only_for_the_dedicated_elevation_exit_code(self):
         code_section = _iss_section(self.text, "Code")
@@ -484,13 +498,13 @@ class InnoSetupScriptTests(unittest.TestCase):
             "function PrepareToInstall(var NeedsRestart: Boolean): String;", 1
         )[1].split("procedure CurStepChanged", 1)[0]
         normal_call = prepare.index(
-            "Started := RunStopApplication(StopScript, False, ResultCode);"
+            "Started := RunStopApplication(StopScript, False, True, ResultCode);"
         )
         elevation_gate = prepare.index(
             "if ResultCode = StopNeedsElevationExitCode then"
         )
         elevated_call = prepare.index(
-            "Started := RunStopApplication(StopScript, True, ResultCode);"
+            "Started := RunStopApplication(StopScript, True, True, ResultCode);"
         )
         self.assertLess(normal_call, elevation_gate)
         self.assertLess(elevation_gate, elevated_call)
@@ -505,11 +519,13 @@ class InnoSetupScriptTests(unittest.TestCase):
         self.assertIn("$currentExitTimeoutSeconds = 45", script)
         self.assertIn("$legacyRequestGraceSeconds = 2", script)
         self.assertIn("$legacyBridgeExitTimeoutSeconds = 10", script)
-        self.assertIn("$legacyShellExitTimeoutSeconds = 5", script)
         self.assertIn("CreationDate", script)
         self.assertIn("Get-CurrentTargetProcess", script)
         self.assertIn('$targetExecutableName = "RemoteMicRC003.exe"', script)
         self.assertIn("$targetExecutablePath", script)
+        self.assertIn("[switch]$BlockOtherLocations", script)
+        self.assertIn("$exitOtherLocationRunning = 23", script)
+        self.assertNotIn("Resolve-Path -LiteralPath $AppPath", script)
         self.assertIn("$exitUnsafeToContinue = 20", script)
         self.assertIn("[Console]::Error.WriteLine", script)
         self.assertIn("GetWindowThreadProcessId", script)
@@ -521,7 +537,7 @@ class InnoSetupScriptTests(unittest.TestCase):
         self.assertNotIn("exit $script:exitNeedsElevation", process_list_failure)
         self.assertNotIn("Write-Error", script)
 
-    def test_stop_script_uses_full_exit_before_any_legacy_force_stop(self):
+    def test_stop_script_uses_full_exit_and_never_force_stops_a_legacy_shell(self):
         script = (_ISS_PATH.parent / "stop-app.ps1").read_text(
             encoding="utf-8-sig"
         )
@@ -531,13 +547,37 @@ class InnoSetupScriptTests(unittest.TestCase):
         self.assertIn("Remove-TransientRequests", script)
         marker_gate = script.index("if ($supportsFullExit)")
         legacy_bridge = script.index("[RemoteMicInstaller.NativeMethods]::PostMessage")
-        force_stop = script.index("Stop-Process -Id $target.ProcessId -Force")
         self.assertLess(marker_gate, legacy_bridge)
-        self.assertLess(legacy_bridge, force_stop)
         self.assertIn("legacy bridge did not finish normal cleanup", script)
         self.assertIn("legacy bridge control window was not found", script)
         self.assertIn("legacy bridge restarted during shutdown confirmation", script)
         self.assertIn("-not (Test-Path -LiteralPath $exitRequestPath)", script)
+        self.assertIn("Show-LegacyShellWindow", script)
+        self.assertIn("FindWindowForProcess", script)
+        self.assertIn("exit $exitUserActionRequired", script)
+        self.assertNotIn("Stop-Process", script)
+
+    def test_install_blocks_a_running_portable_copy_but_uninstall_does_not_touch_it(self):
+        code_section = _iss_section(self.text, "Code")
+        prepare = code_section.split(
+            "function PrepareToInstall(var NeedsRestart: Boolean): String;", 1
+        )[1].split("procedure CurStepChanged", 1)[0]
+        uninstall = code_section.split("function InitializeUninstall(): Boolean;", 1)[1]
+
+        self.assertIn(
+            "RunStopApplication(StopScript, False, True, ResultCode)", prepare
+        )
+        self.assertIn(
+            "RunStopApplication(StopScript, True, True, ResultCode)", prepare
+        )
+        self.assertIn("StopOtherLocationRunningExitCode", prepare)
+        self.assertIn("旧便携版", prepare)
+        self.assertIn(
+            "RunStopApplication(StopScript, False, False, ResultCode)", uninstall
+        )
+        self.assertIn(
+            "RunStopApplication(StopScript, True, False, ResultCode)", uninstall
+        )
 
     def test_upgrade_marker_and_runtime_cleanup_do_not_delete_user_data(self):
         files_section = _iss_section(self.text, "Files")
@@ -623,6 +663,8 @@ class InnoSetupScriptTests(unittest.TestCase):
         run_section = _iss_section(self.text, "Run")
         self.assertIn("postinstall", run_section)
         self.assertIn("--settings", run_section)
+        self.assertIn("打开 {#AppName} {#AppVersion}", run_section)
+        self.assertNotIn("unchecked", run_section)
         # The bare (no-argument) form would start bridge mode - BLE/HID/audio
         # - before the user has configured anything. Only one [Run] entry
         # exists in this file, and it must carry --settings.
@@ -668,6 +710,13 @@ class WindowsCiWorkflowTests(unittest.TestCase):
 
     def test_compiles_inno_setup_installer(self):
         self.assertIn("ISCC.exe", self.text)
+
+    def test_packages_from_the_shared_runtime_version_file(self):
+        self.assertIn(
+            "$version = (Get-Content -Raw src\\ovb_rc003\\VERSION).Trim()",
+            self.text,
+        )
+        self.assertNotIn("Select-String.*AppVersion", self.text)
 
     def test_inno_setup_compile_is_a_required_gate_not_best_effort(self):
         # XRBM-018: promoted from best-effort/continue-on-error to a
@@ -1646,13 +1695,9 @@ class PrereleaseDownloadInstructionsContractTests(unittest.TestCase):
 
     def test_documents_the_release_tag_vs_internal_build_version_distinction(self):
         self.assertIn("v0.3.0-windows-rc003-candidate.1", self.text)
-        # The doc's claimed internal build version must match the .iss
-        # file's real AppVersion - not just a hardcoded literal that could
-        # silently drift the moment a future task bumps AppVersion without
-        # updating this sentence.
-        version_match = re.search(r'#define AppVersion "([^"]+)"', self.iss_text)
-        self.assertIsNotNone(version_match)
-        self.assertIn(version_match.group(1), self.text)
+        version = _VERSION_PATH.read_text(encoding="ascii").strip()
+        self.assertIn(version, self.text)
+        self.assertIn("src/ovb_rc003/VERSION", self.text)
 
     def test_installer_and_portable_are_documented_as_either_or_not_both(self):
         self.assertIn("不需要两个都下载", self.text)
