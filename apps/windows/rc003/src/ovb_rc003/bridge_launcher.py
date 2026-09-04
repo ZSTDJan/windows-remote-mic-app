@@ -180,6 +180,7 @@ class _InProcessBridgeHandle:
         self._exit_code: Optional[int] = None
         self._thread: Optional[threading.Thread] = None
         self._stop_callback: Optional[Callable[[], None]] = None
+        self._reconnect_callback: Optional[Callable[[], None]] = None
         self._stop_requested = False
         self._finished = threading.Event()
 
@@ -190,6 +191,7 @@ class _InProcessBridgeHandle:
         with self._lock:
             self._exit_code = int(exit_code)
             self._stop_callback = None
+            self._reconnect_callback = None
         self._finished.set()
 
     def bind_stop(self, callback: Callable[[], None]) -> None:
@@ -211,6 +213,21 @@ class _InProcessBridgeHandle:
             self._stop_callback = None
         if callback is not None:
             callback()
+
+    def bind_reconnect(self, callback: Callable[[], None]) -> None:
+        with self._lock:
+            if self._exit_code is None and not self._stop_requested:
+                self._reconnect_callback = callback
+
+    def request_reconnect_now(self) -> bool:
+        with self._lock:
+            if self._exit_code is not None or self._stop_requested:
+                return False
+            callback = self._reconnect_callback
+        if callback is None:
+            return False
+        callback()
+        return True
 
     def wait(self, timeout: float) -> bool:
         return self._finished.wait(max(0.0, float(timeout)))
@@ -241,6 +258,7 @@ def _run_in_process_bridge(handle: _InProcessBridgeHandle) -> None:
             app.main(
                 show_notification_icon=False,
                 on_runtime_ready=handle.bind_stop,
+                on_reconnect_ready=handle.bind_reconnect,
             )
     except single_instance.DuplicateInstanceError:
         exit_code = single_instance.DUPLICATE_INSTANCE_EXIT_CODE
@@ -258,6 +276,20 @@ def in_process_bridge_running() -> bool:
     with _in_process_lock:
         handle = _in_process_handle
         return bool(handle is not None and handle.is_alive)
+
+
+def reconnect_in_process_bridge_now() -> Optional[bool]:
+    """Wake this process's retry backoff; return None for a legacy owner."""
+
+    global _in_process_handle
+    with _in_process_lock:
+        handle = _in_process_handle
+        if handle is None:
+            return None
+        if not handle.is_alive:
+            _in_process_handle = None
+            return None
+        return handle.request_reconnect_now()
 
 
 def stop_in_process_bridge(*, timeout: float = 7.0) -> Optional[bool]:

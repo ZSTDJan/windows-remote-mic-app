@@ -67,21 +67,25 @@ Item {
     }
 
     function bridgeStateText() {
+        if (SettingsController.bridgeReconnectBusy)
+            return qsTr("重连中")
         if (SettingsController.bridgeLaunchBusy)
             return qsTr("启动中")
         if (SettingsController.bridgeConnected)
             return qsTr("已连接")
         if (SettingsController.bridgeRunning)
-            return qsTr("运行中")
+            return qsTr("等待连接")
         if (SettingsController.bridgeLaunchPhase === "unknown")
             return qsTr("需检查")
         return qsTr("未运行")
     }
 
     function bridgeStateColor() {
-        if (SettingsController.bridgeConnected || SettingsController.bridgeRunning)
+        if (SettingsController.bridgeConnected)
             return tokens.successColor
-        if (SettingsController.bridgeLaunchBusy
+        if (SettingsController.bridgeReconnectBusy
+                || SettingsController.bridgeRunning
+                || SettingsController.bridgeLaunchBusy
                 || SettingsController.bridgeLaunchPhase === "unknown")
             return tokens.voiceAccent
         return tokens.errorColor
@@ -202,13 +206,21 @@ Item {
                     CompactButton {
                         objectName: "restartBridgeButton"
                         visible: SettingsController.bridgeRunning
-                            && SettingsController.bridgeRestartRecommended
+                            && (SettingsController.bridgeReconnectAvailable
+                                || SettingsController.bridgeReconnectBusy
+                                || SettingsController.bridgeRestartRecommended)
                         tokens: root.tokens
                         compactMinimumWidth: tokens.buttonWidth4Chars
-                        text: qsTr("重新启动")
+                        text: SettingsController.bridgeReconnectBusy
+                            ? qsTr("连接中…")
+                            : SettingsController.bridgeReconnectAvailable
+                                ? qsTr("立即重连") : qsTr("重新启动")
                         highlighted: true
                         enabled: !SettingsController.bridgeLaunchBusy
-                        onClicked: SettingsController.restartBridge()
+                            && !SettingsController.bridgeReconnectBusy
+                        onClicked: SettingsController.bridgeReconnectAvailable
+                            ? SettingsController.reconnectBridgeNow()
+                            : SettingsController.restartBridge()
                     }
 
                     CompactButton {

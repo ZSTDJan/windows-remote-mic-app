@@ -324,6 +324,7 @@ _APPLICATION_EXIT_SAVE_WAIT_TIMEOUT_SECONDS = (
 )
 _APPLICATION_EXIT_POLL_INTERVAL_MS = 100
 _BRIDGE_STATUS_STALE_AFTER_SECONDS = 20.0
+_BRIDGE_RECONNECT_BUSY_TIMEOUT_MS = 10_000
 
 
 @dataclass(frozen=True)
@@ -905,6 +906,8 @@ def _load_qt_classes() -> dict:
         bridgeLaunchPhaseChanged = Signal()
         bridgeLaunchElapsedSecondsChanged = Signal()
         bridgeRestartRecommendedChanged = Signal()
+        bridgeReconnectAvailableChanged = Signal()
+        bridgeReconnectBusyChanged = Signal()
         desktopBehaviorChanged = Signal()
         trayStateChanged = Signal()
         maintenanceExitRequested = Signal()
@@ -1112,6 +1115,8 @@ def _load_qt_classes() -> dict:
             self._bridge_restart_recommended = False
             self._bridge_recovery_attempted = False
             self._bridge_recovery_running = False
+            self._bridge_reconnect_available = False
+            self._bridge_reconnect_busy = False
             runtime_status = (
                 bridge_runtime_status.read_status(self._config_root)
                 if self._bridge_running
@@ -1161,6 +1166,9 @@ def _load_qt_classes() -> dict:
                     identity_match is not True
                     or bridge_runtime_status.input_channels_failed(runtime_status)
                 )
+            self._bridge_reconnect_available = (
+                self._can_reconnect_bridge_now(runtime_status)
+            )
             self._has_explicit_launch_result = False
             self._status_message = ""
             self._error_message = ""
@@ -1653,6 +1661,46 @@ def _load_qt_classes() -> dict:
             self._bridge_restart_recommended = value
             self.bridgeRestartRecommendedChanged.emit()
 
+        def _set_bridge_reconnect_available(self, value: bool) -> None:
+            value = bool(value)
+            if value == self._bridge_reconnect_available:
+                return
+            self._bridge_reconnect_available = value
+            self.bridgeReconnectAvailableChanged.emit()
+
+        def _set_bridge_reconnect_busy(self, value: bool) -> None:
+            value = bool(value)
+            if value == self._bridge_reconnect_busy:
+                return
+            self._bridge_reconnect_busy = value
+            self.bridgeReconnectBusyChanged.emit()
+
+        def _can_reconnect_bridge_now(
+            self,
+            status: Optional[bridge_runtime_status.BridgeRuntimeStatus],
+        ) -> bool:
+            if (
+                not self._bridge_running
+                or self._bridge_connected
+                or self._bridge_restart_recommended
+                or status is None
+            ):
+                return False
+            if (
+                bridge_runtime_status.runtime_identity_matches(
+                    status,
+                    self._current_runtime_identity,
+                )
+                is not True
+            ):
+                return False
+            if (
+                time.time() - status.updated_at
+                > _BRIDGE_STATUS_STALE_AFTER_SECONDS
+            ):
+                return False
+            return bridge_launcher.in_process_bridge_running()
+
         def _describe_runtime_status(
             self,
             status: bridge_runtime_status.BridgeRuntimeStatus,
@@ -1826,7 +1874,17 @@ def _load_qt_classes() -> dict:
                     runtime_status,
                     schedule_recovery=True,
                 )
+                reconnect_available = self._can_reconnect_bridge_now(runtime_status)
+                self._set_bridge_reconnect_available(reconnect_available)
+                if connected or not reconnect_available:
+                    self._set_bridge_reconnect_busy(False)
                 if runtime_status is not None:
+                    if self._bridge_reconnect_busy and not connected:
+                        self._set_bridge_launch_phase("reconnecting")
+                        self._set_launch_status(
+                            f"服务运行中；正在立即连接{device_catalog.RC003_DISPLAY_NAME}…"
+                        )
+                        return
                     self._set_bridge_launch_phase(
                         "connected" if connected else "waiting"
                     )
@@ -1858,6 +1916,8 @@ def _load_qt_classes() -> dict:
                 return
 
             self._set_bridge_restart_recommended(False)
+            self._set_bridge_reconnect_available(False)
+            self._set_bridge_reconnect_busy(False)
 
             previous_phase = self._bridge_launch_phase
             if (
@@ -3795,6 +3855,16 @@ def _load_qt_classes() -> dict:
             lambda self: self._bridge_restart_recommended,
             notify=bridgeRestartRecommendedChanged,
         )
+        bridgeReconnectAvailable = Property(
+            bool,
+            lambda self: self._bridge_reconnect_available,
+            notify=bridgeReconnectAvailableChanged,
+        )
+        bridgeReconnectBusy = Property(
+            bool,
+            lambda self: self._bridge_reconnect_busy,
+            notify=bridgeReconnectBusyChanged,
+        )
 
         hidHelperIssueVisible = Property(
             bool,
@@ -4818,6 +4888,47 @@ def _load_qt_classes() -> dict:
         @Slot()
         def restartBridge(self) -> None:
             self._begin_bridge_restart(automatic=False)
+
+        @Slot()
+        def reconnectBridgeNow(self) -> None:
+            if (
+                self._bridge_reconnect_busy
+                or self._maintenance_exit_pending
+                or self._application_exit_requested
+                or self._application_exit_confirmed
+                or self._application_exit_intent.is_set()
+            ):
+                return
+            self._refresh_bridge_status()
+            if not self._bridge_reconnect_available:
+                self._set_error_message(
+                    "当前无法直接重连；请使用“重新启动”恢复服务。",
+                    self._DEVICE_PAGE_INDEX,
+                )
+                return
+            if bridge_launcher.reconnect_in_process_bridge_now() is not True:
+                self._set_bridge_reconnect_available(False)
+                self._set_error_message(
+                    "立即重连请求未送达；请使用“重新启动”恢复服务。",
+                    self._DEVICE_PAGE_INDEX,
+                )
+                return
+            self._set_bridge_reconnect_busy(True)
+            self._set_bridge_launch_phase("reconnecting")
+            self._set_error_message("")
+            self._set_launch_status(
+                f"服务运行中；正在立即连接{device_catalog.RC003_DISPLAY_NAME}…"
+            )
+            QTimer.singleShot(
+                _BRIDGE_RECONNECT_BUSY_TIMEOUT_MS,
+                self._finish_immediate_reconnect_feedback,
+            )
+
+        def _finish_immediate_reconnect_feedback(self) -> None:
+            if not self._bridge_reconnect_busy:
+                return
+            self._set_bridge_reconnect_busy(False)
+            self._refresh_bridge_status()
 
         def _begin_bridge_restart(self, *, automatic: bool) -> None:
             if (

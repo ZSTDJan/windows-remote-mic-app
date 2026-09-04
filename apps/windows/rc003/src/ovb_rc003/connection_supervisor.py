@@ -58,6 +58,7 @@ class ConnectionSupervisor:
         # back onto it from any other thread - see module docstring.
         self._loop = loop or asyncio.get_event_loop()
         self._disconnect_event = asyncio.Event()
+        self._retry_now_event = asyncio.Event()
         self._stopping = False
 
         # Exposed for tests to assert on, without needing to intercept the
@@ -87,6 +88,39 @@ class ConnectionSupervisor:
             # reconnect in that state, so this notification is safely stale.
             return
 
+    def request_retry_now(self) -> None:
+        """Wake the current retry backoff without starting a parallel attempt."""
+
+        if self._stopping or self._loop.is_closed():
+            return
+        try:
+            self._loop.call_soon_threadsafe(self._retry_now_event.set)
+        except RuntimeError:
+            return
+
+    async def _wait_before_retry(self, delay: float) -> None:
+        """Wait for the backoff or a user-requested immediate retry."""
+
+        if delay <= 0.0:
+            return
+        sleep_task = asyncio.ensure_future(self._sleep(delay))
+        retry_task = asyncio.ensure_future(self._retry_now_event.wait())
+        tasks = (sleep_task, retry_task)
+        try:
+            done, _pending = await asyncio.wait(
+                tasks,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if retry_task in done:
+                self._retry_now_event.clear()
+            if sleep_task in done:
+                await sleep_task
+        finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+
     async def run_forever(self) -> None:
         while not self._stopping:
             self.attempt_count += 1
@@ -96,6 +130,7 @@ class ConnectionSupervisor:
                 self.last_error = None
                 await self._connect()
                 connected = True
+                self._retry_now_event.clear()
                 await self._disconnect_event.wait()
             except asyncio.CancelledError:
                 raise
@@ -123,7 +158,7 @@ class ConnectionSupervisor:
                     self._max_retry_delay,
                     max(self._retry_delay, self._next_retry_delay * 2),
                 )
-            await self._sleep(delay)
+            await self._wait_before_retry(delay)
 
     async def stop(self) -> None:
         """Ends the loop after its current cleanup finishes. Safe to call
@@ -132,3 +167,4 @@ class ConnectionSupervisor:
 
         self._stopping = True
         self._disconnect_event.set()
+        self._retry_now_event.set()

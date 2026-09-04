@@ -331,6 +331,38 @@ class InProcessBridgeHandleTests(unittest.TestCase):
 
         self.assertEqual(calls, [1])
 
+    def test_reconnect_request_is_delivered_without_stopping_the_worker(self):
+        handle = bridge_launcher._InProcessBridgeHandle()
+        calls = []
+
+        self.assertFalse(handle.request_reconnect_now())
+        handle.bind_reconnect(lambda: calls.append("reconnect"))
+
+        self.assertTrue(handle.request_reconnect_now())
+        self.assertEqual(calls, ["reconnect"])
+
+    def test_public_reconnect_targets_only_the_live_in_process_worker(self):
+        class FakeHandle:
+            is_alive = True
+
+            def __init__(self):
+                self.calls = 0
+
+            def request_reconnect_now(self):
+                self.calls += 1
+                return True
+
+        handle = FakeHandle()
+        original = bridge_launcher._in_process_handle
+        bridge_launcher._in_process_handle = handle
+        try:
+            delivered = bridge_launcher.reconnect_in_process_bridge_now()
+        finally:
+            bridge_launcher._in_process_handle = original
+
+        self.assertTrue(delivered)
+        self.assertEqual(handle.calls, 1)
+
     def test_public_stop_waits_for_the_owned_worker_and_clears_it(self):
         class FakeHandle:
             is_alive = True

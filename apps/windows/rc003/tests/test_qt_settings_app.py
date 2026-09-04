@@ -1928,6 +1928,116 @@ class SettingsControllerTests(unittest.TestCase):
         self.assertEqual(controller.bridgeLaunchPhase, "connected")
         self.assertIn("小米遥控器2 Pro 已连接", controller.launchStatusText)
 
+    def test_waiting_current_bridge_exposes_immediate_reconnect(self):
+        self._bridge_status_patch.stop()
+        self._bridge_status_patch = mock.patch.object(
+            qt_settings_app.single_instance,
+            "bridge_instance_running",
+            return_value=True,
+        )
+        self._bridge_status_patch.start()
+        identity = bridge_runtime_status.current_runtime_identity(
+            qt_settings_app.__version__
+        )
+        bridge_runtime_status.publish_status(
+            config.config_root(),
+            bridge_runtime_status.BridgeConnectionState.WAITING_FOR_DEVICE,
+            pid=4321,
+            identity=identity,
+            raw_input_state="ready",
+            hid_tap_state=frida_compat.HidTapState.READY.value,
+        )
+
+        with mock.patch.object(
+            qt_settings_app.bridge_launcher,
+            "in_process_bridge_running",
+            return_value=True,
+        ):
+            controller, _ = self._make_controller()
+
+        self.assertTrue(controller.bridgeRunning)
+        self.assertFalse(controller.bridgeConnected)
+        self.assertTrue(controller.bridgeReconnectAvailable)
+        self.assertFalse(controller.bridgeReconnectBusy)
+
+    def test_immediate_reconnect_wakes_worker_and_throttles_repeated_clicks(self):
+        self._bridge_status_patch.stop()
+        self._bridge_status_patch = mock.patch.object(
+            qt_settings_app.single_instance,
+            "bridge_instance_running",
+            return_value=True,
+        )
+        self._bridge_status_patch.start()
+        identity = bridge_runtime_status.current_runtime_identity(
+            qt_settings_app.__version__
+        )
+        bridge_runtime_status.publish_status(
+            config.config_root(),
+            bridge_runtime_status.BridgeConnectionState.WAITING_FOR_DEVICE,
+            pid=4321,
+            identity=identity,
+            raw_input_state="ready",
+            hid_tap_state=frida_compat.HidTapState.READY.value,
+        )
+
+        callbacks = []
+        with mock.patch.object(
+            qt_settings_app.bridge_launcher,
+            "in_process_bridge_running",
+            return_value=True,
+        ), mock.patch.object(
+            qt_settings_app.bridge_launcher,
+            "reconnect_in_process_bridge_now",
+            return_value=True,
+        ) as reconnect, mock.patch(
+            "PySide6.QtCore.QTimer.singleShot",
+            side_effect=lambda delay, callback: callbacks.append((delay, callback)),
+        ):
+            controller, _ = self._make_controller()
+            controller.reconnectBridgeNow()
+            controller.reconnectBridgeNow()
+
+        reconnect.assert_called_once_with()
+        self.assertTrue(controller.bridgeReconnectBusy)
+        self.assertEqual(controller.bridgeLaunchPhase, "reconnecting")
+        self.assertIn("正在立即连接", controller.launchStatusText)
+        self.assertEqual(len(callbacks), 1)
+        self.assertEqual(
+            callbacks[0][0],
+            qt_settings_app._BRIDGE_RECONNECT_BUSY_TIMEOUT_MS,
+        )
+
+        with mock.patch.object(controller, "_refresh_bridge_status") as refresh:
+            callbacks[0][1]()
+
+        self.assertFalse(controller.bridgeReconnectBusy)
+        refresh.assert_called_once_with()
+
+    def test_reconnect_feedback_yields_to_a_restart_recommendation(self):
+        self._bridge_status_patch.stop()
+        self._bridge_status_patch = mock.patch.object(
+            qt_settings_app.single_instance,
+            "bridge_instance_running",
+            return_value=True,
+        )
+        self._bridge_status_patch.start()
+        path = bridge_runtime_status.status_path(config.config_root())
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            '{"schema":1,"state":"waiting_for_device","pid":4321,'
+            '"updated_at":1}',
+            encoding="utf-8",
+        )
+
+        controller, _ = self._make_controller()
+        controller._set_bridge_reconnect_busy(True)
+        controller.refreshBridgeState()
+
+        self.assertTrue(controller.bridgeRestartRecommended)
+        self.assertFalse(controller.bridgeReconnectAvailable)
+        self.assertFalse(controller.bridgeReconnectBusy)
+        self.assertNotEqual(controller.bridgeLaunchPhase, "reconnecting")
+
     def test_current_bridge_status_exposes_version_channels_and_recent_button(self):
         self._bridge_status_patch.stop()
         self._bridge_status_patch = mock.patch.object(
@@ -6503,6 +6613,10 @@ class SettingsShellSourceContractTests(unittest.TestCase):
             self.device_qml,
         )
         self.assertIn("SettingsController.restartBridge()", self.device_qml)
+        self.assertIn("SettingsController.reconnectBridgeNow()", self.device_qml)
+        self.assertIn("SettingsController.bridgeReconnectAvailable", self.device_qml)
+        self.assertIn('qsTr("立即重连")', self.device_qml)
+        self.assertIn('return qsTr("等待连接")', self.device_qml)
         self.assertNotIn('objectName: "mappingBridgeWarning"', self.buttons_qml)
         self.assertNotIn('objectName: "mappingListFrame"', self.buttons_qml)
         self.assertIn("SettingsController.bridgeRunning", self.device_qml)

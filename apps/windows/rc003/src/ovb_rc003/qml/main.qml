@@ -411,6 +411,7 @@ ApplicationWindow {
         interval: SettingsController.bridgeLaunchPhase === "saving"
             || SettingsController.bridgeLaunchPhase === "starting"
             || SettingsController.bridgeLaunchPhase === "waiting"
+            || SettingsController.bridgeLaunchPhase === "reconnecting"
             ? 1000 : 2000
         repeat: true
         running: true

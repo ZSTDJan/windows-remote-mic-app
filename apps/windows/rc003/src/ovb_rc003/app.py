@@ -346,6 +346,10 @@ class RC003App:
     async def stop(self) -> None:
         await self._supervisor.stop()
 
+    def request_connection_retry_now(self) -> None:
+        self._logger.info("manual reconnect requested; waking retry backoff")
+        self._supervisor.request_retry_now()
+
     async def _runtime_status_heartbeat(self) -> None:
         while True:
             self._publish_runtime_status()
@@ -2810,6 +2814,7 @@ async def _run(
     settings_launcher=None,
     show_notification_icon: bool = True,
     on_runtime_ready=None,
+    on_reconnect_ready=None,
 ) -> None:
     app_factory = app_factory or RC003App
     tray_factory = tray_factory or bridge_tray_windows.BridgeTray
@@ -2835,6 +2840,8 @@ async def _run(
 
     if on_runtime_ready is not None:
         on_runtime_ready(request_exit)
+    if on_reconnect_ready is not None:
+        on_reconnect_ready(app.request_connection_retry_now)
 
     tray = None
     try:
@@ -2881,11 +2888,17 @@ async def _run(
                     clear_runtime_status()
 
 
-def main(*, show_notification_icon: bool = True, on_runtime_ready=None) -> None:
+def main(
+    *,
+    show_notification_icon: bool = True,
+    on_runtime_ready=None,
+    on_reconnect_ready=None,
+) -> None:
     asyncio.run(
         _run(
             show_notification_icon=show_notification_icon,
             on_runtime_ready=on_runtime_ready,
+            on_reconnect_ready=on_reconnect_ready,
         )
     )
 
