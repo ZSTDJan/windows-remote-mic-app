@@ -12,12 +12,14 @@ replaces ``sys.argv`` and restores it in ``finally``.
 import os
 import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
 from ovb_rc003 import __main__ as main_module
 from ovb_rc003 import (
     app,
+    config,
     element_navigation_runtime,
     frida_compat,
     single_instance,
@@ -392,6 +394,24 @@ class ArgumentModeBypassTests(_ArgvRestoringTestCase):
         self.assertEqual(check_calls, [1])
         self.assertEqual(enter_calls, [])
 
+    def test_application_exit_request_never_enters_the_application_guard(self):
+        enter_calls = self._assert_application_guard_unused()
+        request_calls = []
+        original = main_module._request_application_exit
+        main_module._request_application_exit = (
+            lambda: request_calls.append(1) or 7
+        )
+        sys.argv = ["ovb_rc003", "--request-exit"]
+        try:
+            with self.assertRaises(SystemExit) as ctx:
+                main_module.main()
+        finally:
+            main_module._request_application_exit = original
+
+        self.assertEqual(ctx.exception.code, 7)
+        self.assertEqual(request_calls, [1])
+        self.assertEqual(enter_calls, [])
+
     def test_help_never_touches_the_guard(self):
         enter_calls = self._assert_application_guard_unused()
         sys.argv = ["ovb_rc003", "--help"]
@@ -581,7 +601,72 @@ class DiagnoseBleCandidatesDispatchTests(_ArgvRestoringTestCase):
         self.assertNotIn("--diagnose-ble-candidates", buffer.getvalue())
         self.assertNotIn("--diagnose-vb-cable-loopback", buffer.getvalue())
         self.assertNotIn("--preflight-output-endpoint", buffer.getvalue())
+        self.assertNotIn("--request-exit", buffer.getvalue())
         self.assertNotIn("--on-request-probe", buffer.getvalue())
+
+
+class ApplicationExitRequestEntrypointTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        self._original_config_root = config.config_root
+        self._original_running = single_instance.application_instance_running
+        self._original_write = single_instance.write_application_exit_request
+        config.config_root = lambda: self.root
+
+    def tearDown(self):
+        config.config_root = self._original_config_root
+        single_instance.application_instance_running = self._original_running
+        single_instance.write_application_exit_request = self._original_write
+        self._tmp.cleanup()
+
+    def test_already_stopped_returns_success_and_removes_a_stale_request(self):
+        request_path = single_instance.application_exit_request_path(self.root)
+        request_path.write_text("stale", encoding="utf-8")
+        write_calls = []
+        single_instance.application_instance_running = lambda: False
+        single_instance.write_application_exit_request = (
+            lambda _root: write_calls.append(1)
+        )
+
+        result = main_module._request_application_exit()
+
+        self.assertEqual(result, 0)
+        self.assertEqual(write_calls, [])
+        self.assertFalse(request_path.exists())
+
+    def test_running_application_gets_one_request_and_is_waited_out(self):
+        states = iter((True, True, False))
+        writes = []
+        sleeps = []
+        single_instance.application_instance_running = lambda: next(states)
+        single_instance.write_application_exit_request = (
+            lambda root: writes.append(root)
+        )
+
+        result = main_module._request_application_exit(
+            monotonic=iter((0.0, 0.01)).__next__,
+            sleep=sleeps.append,
+        )
+
+        self.assertEqual(result, 0)
+        self.assertEqual(writes, [self.root])
+        self.assertEqual(sleeps, [main_module.APPLICATION_EXIT_REQUEST_POLL_SECONDS])
+
+    def test_timeout_is_nonzero_and_never_starts_application_resources(self):
+        single_instance.application_instance_running = lambda: True
+        single_instance.write_application_exit_request = lambda _root: None
+
+        result = main_module._request_application_exit(
+            timeout=0.1,
+            monotonic=iter((0.0, 1.0)).__next__,
+            sleep=lambda _seconds: self.fail("timeout must be checked before sleep"),
+        )
+
+        self.assertEqual(
+            result,
+            main_module.APPLICATION_EXIT_REQUEST_TIMEOUT_EXIT_CODE,
+        )
 
 
 class DiagnoseVbCableLoopbackDispatchTests(_ArgvRestoringTestCase):

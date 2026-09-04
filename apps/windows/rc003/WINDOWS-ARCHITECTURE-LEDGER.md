@@ -128,6 +128,7 @@ RC003 原本是面向电视/机顶盒的蓝牙语音遥控器。Windows 可以�
 | 无参数、`--settings` | Qt Quick 桌面主程序 | 可长期持有窗口、通知区域、桥接 worker 和元素导航 |
 | `--background` | 隐藏启动同一个桌面主程序 | 与无参数入口相同，只是不立即显示窗口 |
 | `--bridge` | 兼容启动形式 | 隐藏进入同一个桌面主程序，并请求启动进程内桥接 worker |
+| `--request-exit` | 隐藏的安装维护入口 | 只写入一次性完整退出请求并等待桌面主进程结束 |
 | `--dry-run` | 模块导入检查 | 否 |
 | `--help` | 帮助文本 | 否 |
 | `--diagnose-ble-candidates <result>` | 隐藏的有界 BLE 诊断子进程 | 短暂持有 WinRT BLE 枚举资源 |
@@ -150,6 +151,11 @@ Program Files 中的固定助手和固定 `--inject` 参数；主程序、桥接
 另持有旧桥接 mutex，防止升级期间尚未退出的历史独立桥接同时抢占 BLE、Raw Input、
 HID、合成按键或音频资源。关闭窗口默认只隐藏主窗口，通知区域和 worker 继续由同一
 进程持有；“完全退出”才按正常清理顺序结束全部长期资源。
+
+安装器、卸载器和 Start Menu“停止”入口使用 `application-exit-request.json` 请求桌面主
+进程走同一套完整退出路径。当前版本会先处理未保存提示，再停止输入监听、诊断任务、
+桥接 worker、BLE、HID、语音热键和音频资源；请求处理期间禁止新的桥接启动或自动恢复。
+请求被取消、拒绝或超时后，安装器不会覆盖正在使用的程序文件。
 
 桥接 worker 是 `bridge-runtime-status.json` 的唯一写入者。schema 2 每 5 秒原子更新
 版本与构建摘要、BLE 连接、Raw Input、HID tap、最近按键和语音活动；不写设备地址、
@@ -409,6 +415,7 @@ session detach 成功即证明其脚本不再被会话持有；单独 script unl
 | `key_bindings.json` | 主/次手势动作、可移植物理签名映射 |
 | `logs\app.log` | 轮转运行日志 |
 | `key-detection\` | 最多 30 秒有效的一次性按键检测 IPC |
+| `application-exit-request.json` | 安装、卸载或明确停止操作使用的一次性完整退出请求 |
 | `captures\` | 用户显式运行诊断工具时生成的隐私安全 JSONL |
 
 两份 JSON 都逐文件使用临时文件、flush、`fsync`、`os.replace` 原子替换。
@@ -544,11 +551,15 @@ Frida Gadget 与 VB-CABLE 都是候选构建的固定下载和哈希门禁；PyI
 `installer/RemoteMicRC003Setup.iss` 是 per-user、普通权限安装器，不自动启动、
 不自动安装驱动。文件写入后只通过 Windows 管理员确认启动 HID 助手的固定
 `--install-task`；
-用户拒绝 UAC 时主程序仍可安装，但方向映射明确停用并提供“修复权限”。升级和
-卸载前调用 `stop-app.ps1`，只停止安装目录下、文件名精确为
-`RemoteMicRC003.exe` 且 PID/CreationDate 仍匹配的进程。卸载在删除程序文件前
-用固定 `--uninstall-task` 删除计划任务和 Program Files 助手；UAC 取消或清理失败
-会中止卸载，避免留下指向失效文件的任务。
+用户拒绝 UAC 时主程序仍可安装，但方向映射明确停用并提供“修复权限”。升级和卸载前
+调用 `stop-app.ps1`，只处理安装目录下、完整路径、PID 与 CreationDate 都匹配的
+`RemoteMicRC003.exe`。支持完整退出合同的版本只接受原子请求并等待正常清理；拒绝或
+超时就停止安装，绝不强杀。已发布的旧双进程版本先通过旧托盘控制窗口正常停止桥接，
+并校验窗口所属 PID，随后才有界清理不再持有硬件资源的设置壳。只有明确权限不足时才
+在管理员确认后重试一次；控制入口缺失或身份无法确认时直接停止，不弹无意义 UAC。确认进程
+全部结束后，升级才删除并重写纯程序目录 `{app}\_internal`，不会删除 LocalAppData 中的
+配置、日志或采集数据。卸载在删除程序文件前用固定 `--uninstall-task` 删除计划任务和
+Program Files 助手；UAC 取消或清理失败会中止卸载，避免留下指向失效文件的任务。
 
 Frida Gadget 与 VB-CABLE 包都使用固定 URL/version/SHA-256。运行时仍再次
 校验，不把“构建时下载成功”当成永久可信。
@@ -563,9 +574,9 @@ Frida Gadget 与 VB-CABLE 包都使用固定 URL/version/SHA-256。运行时仍�
 | 冻结 EXE smoke | PyInstaller 依赖完整、入口可运行 | BLE/音频/权限真机成功 |
 | 真实硬件验收 | 当前候选在指定机器上的按键和语音事实 | 其他机器、休眠、长期、杀软兼容 |
 
-2026-09-03 当前源码完成 1889 项完整 unittest，7 项按平台或安全条件跳过，测试日志
+2026-09-04 当前源码完成 1920 项完整 unittest，7 项按平台或安全条件跳过，测试日志
 未出现 `ResourceWarning`、未关闭事件循环或 socket；`compileall`、源码 `--dry-run`、
-公开边界扫描 507 个文件、`pip check` 和 `git diff --check` 均通过。本批没有构建、
+公开边界扫描 508 个文件、`pip check` 和 `git diff --check` 均通过。本批没有构建、
 打包或发布，因此这些结果证明当前源码的自动化基线，不证明冻结 EXE、安装器、计划任务
 或真机链路已经通过。详细历史审查命令与证据见
 `reviews/2026-08-21-full-code-audit.md`，后续批次见 `MAINTENANCE.md`。

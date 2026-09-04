@@ -361,13 +361,18 @@ class InnoSetupScriptTests(unittest.TestCase):
     def test_privileges_required_is_lowest(self):
         self.assertIn("PrivilegesRequired=lowest", self.text)
 
-    def test_installer_elevates_only_the_fixed_hid_helper_action(self):
+    def test_installer_elevates_only_fixed_hid_actions_and_the_stop_retry(self):
         code_section = _iss_section(self.text, "Code")
         self.assertIn("ShellExec(", code_section)
         self.assertIn("'runas'", code_section)
         self.assertIn("{#HidHelperExeName}", code_section)
         self.assertIn("RunHidHelper('--install-task'", code_section)
         self.assertIn("RunHidHelper('--uninstall-task'", code_section)
+        self.assertIn("StopNeedsElevationExitCode = 10", code_section)
+        self.assertIn("StopUnsafeToContinueExitCode = 20", code_section)
+        self.assertIn("StopProbeFailedExitCode = 21", code_section)
+        self.assertIn("RunStopApplication(StopScript, True", code_section)
+        self.assertIn("-ElevatedRetry", code_section)
         self.assertNotIn("--pid", code_section)
         self.assertNotIn("PrivilegesRequired=admin", self.effective_text)
 
@@ -445,29 +450,94 @@ class InnoSetupScriptTests(unittest.TestCase):
 
     def test_upgrade_aborts_when_the_old_process_cannot_be_confirmed_stopped(self):
         code_section = _iss_section(self.text, "Code")
-        self.assertIn("Started := Exec", code_section)
+        self.assertIn("Started := RunStopApplication(StopScript, False", code_section)
         self.assertIn("if not Started then", code_section)
         self.assertIn("if ResultCode <> 0 then", code_section)
+        self.assertIn("安装没有覆盖任何程序文件", code_section)
+
+    def test_upgrade_requests_uac_only_for_the_dedicated_elevation_exit_code(self):
+        code_section = _iss_section(self.text, "Code")
+        prepare = code_section.split(
+            "function PrepareToInstall(var NeedsRestart: Boolean): String;", 1
+        )[1].split("procedure CurStepChanged", 1)[0]
+        normal_call = prepare.index(
+            "Started := RunStopApplication(StopScript, False, ResultCode);"
+        )
+        elevation_gate = prepare.index(
+            "if ResultCode = StopNeedsElevationExitCode then"
+        )
+        elevated_call = prepare.index(
+            "Started := RunStopApplication(StopScript, True, ResultCode);"
+        )
+        self.assertLess(normal_call, elevation_gate)
+        self.assertLess(elevation_gate, elevated_call)
+        self.assertIn("未完成 UAC 确认", prepare)
+        self.assertIn("旧版若没有可用的退出入口", prepare)
 
     def test_stop_script_uses_directory_boundary_and_bounded_exit_confirmation(self):
         script = (_ISS_PATH.parent / "stop-app.ps1").read_text(
             encoding="utf-8-sig"
         )
-        self.assertIn("$rootPrefix", script)
         self.assertIn("[System.IO.Path]::GetFullPath", script)
-        self.assertIn("AddSeconds(5)", script)
+        self.assertIn("$currentExitTimeoutSeconds = 45", script)
+        self.assertIn("$legacyRequestGraceSeconds = 2", script)
+        self.assertIn("$legacyBridgeExitTimeoutSeconds = 10", script)
+        self.assertIn("$legacyShellExitTimeoutSeconds = 5", script)
         self.assertIn("CreationDate", script)
         self.assertIn("Get-CurrentTargetProcess", script)
         self.assertIn('$targetExecutableName = "RemoteMicRC003.exe"', script)
-        self.assertIn("GetFileName", script)
-        self.assertIn("exit 2", script)
+        self.assertIn("$targetExecutablePath", script)
+        self.assertIn("$exitUnsafeToContinue = 20", script)
+        self.assertIn("[Console]::Error.WriteLine", script)
+        self.assertIn("GetWindowThreadProcessId", script)
+        self.assertIn("$postError -eq $errorAccessDenied", script)
+        process_list_failure = script.split(
+            'Write-StopError "$productName process list could not be read."', 1
+        )[1].split("}", 1)[0]
+        self.assertIn("exit $script:exitProbeFailed", process_list_failure)
+        self.assertNotIn("exit $script:exitNeedsElevation", process_list_failure)
+        self.assertNotIn("Write-Error", script)
+
+    def test_stop_script_uses_full_exit_before_any_legacy_force_stop(self):
+        script = (_ISS_PATH.parent / "stop-app.ps1").read_text(
+            encoding="utf-8-sig"
+        )
+        self.assertIn('action = "exit_application"', script)
+        self.assertIn('$exitRequestFileName = "application-exit-request.json"', script)
+        self.assertIn('$bridgeStartRequestFileName = "bridge-start-request.json"', script)
+        self.assertIn("Remove-TransientRequests", script)
+        marker_gate = script.index("if ($supportsFullExit)")
+        legacy_bridge = script.index("[RemoteMicInstaller.NativeMethods]::PostMessage")
+        force_stop = script.index("Stop-Process -Id $target.ProcessId -Force")
+        self.assertLess(marker_gate, legacy_bridge)
+        self.assertLess(legacy_bridge, force_stop)
+        self.assertIn("legacy bridge did not finish normal cleanup", script)
+        self.assertIn("legacy bridge control window was not found", script)
+        self.assertIn("legacy bridge restarted during shutdown confirmation", script)
+        self.assertIn("-not (Test-Path -LiteralPath $exitRequestPath)", script)
+
+    def test_upgrade_marker_and_runtime_cleanup_do_not_delete_user_data(self):
+        files_section = _iss_section(self.text, "Files")
+        install_delete = _strip_semicolon_comments(
+            _iss_section(self.text, "InstallDelete")
+        )
+        self.assertIn(
+            'Source: "application-exit-contract-v1.json"; DestDir: "{app}"',
+            files_section,
+        )
+        self.assertIn(
+            'Type: filesandordirs; Name: "{app}\\_internal"',
+            install_delete,
+        )
+        for user_data in ("config.json", "key_bindings.json", "logs", "captures"):
+            self.assertNotIn(user_data, install_delete)
 
     def test_uninstall_aborts_when_the_installed_stop_script_is_missing(self):
         code_section = _iss_section(self.text, "Code")
         self.assertIn("if not FileExists(StopScript) then", code_section)
         missing_branch = code_section.split(
             "if not FileExists(StopScript) then", 1
-        )[1].split("Started := Exec", 1)[0]
+        )[1].split("Started := RunStopApplication", 1)[0]
         self.assertIn("Result := False", missing_branch)
 
     def test_stop_app_script_is_both_temp_extractable_and_permanently_installed(self):

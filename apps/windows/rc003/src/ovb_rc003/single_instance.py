@@ -77,6 +77,9 @@ _SETTINGS_WINDOW_PROPERTY = "RemoteMicRC003.SettingsWindow"
 _BRIDGE_START_REQUEST_FILENAME = "bridge-start-request.json"
 _BRIDGE_START_REQUEST_SCHEMA = 1
 _BRIDGE_START_REQUEST_MAX_AGE_SECONDS = 30.0
+_APPLICATION_EXIT_REQUEST_FILENAME = "application-exit-request.json"
+_APPLICATION_EXIT_REQUEST_SCHEMA = 1
+_APPLICATION_EXIT_REQUEST_MAX_AGE_SECONDS = 30.0
 
 # https://learn.microsoft.com/windows/win32/debug/system-error-codes--0-499-
 _ERROR_ALREADY_EXISTS = 183
@@ -313,22 +316,25 @@ def bridge_start_request_path(config_root: Path) -> Path:
     return Path(config_root) / _BRIDGE_START_REQUEST_FILENAME
 
 
-def write_bridge_start_request(
-    config_root: Path,
-    *,
-    now: Callable[[], float] = time.time,
-) -> Path:
-    """Atomically ask the existing desktop process to start its bridge."""
+def application_exit_request_path(config_root: Path) -> Path:
+    return Path(config_root) / _APPLICATION_EXIT_REQUEST_FILENAME
 
-    path = bridge_start_request_path(config_root)
+
+def _write_request(
+    path: Path,
+    *,
+    schema: int,
+    action: str,
+    now: Callable[[], float],
+) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
     try:
         temporary.write_text(
             json.dumps(
                 {
-                    "schema": _BRIDGE_START_REQUEST_SCHEMA,
-                    "action": "start_bridge",
+                    "schema": schema,
+                    "action": action,
                     "created_at": float(now()),
                 },
                 ensure_ascii=True,
@@ -345,15 +351,44 @@ def write_bridge_start_request(
     return path
 
 
-def consume_bridge_start_request(
+def write_bridge_start_request(
     config_root: Path,
     *,
     now: Callable[[], float] = time.time,
-    max_age_seconds: float = _BRIDGE_START_REQUEST_MAX_AGE_SECONDS,
-) -> bool:
-    """Claim and validate one request without deleting a newer replacement."""
+) -> Path:
+    """Atomically ask the existing desktop process to start its bridge."""
 
-    path = bridge_start_request_path(config_root)
+    return _write_request(
+        bridge_start_request_path(config_root),
+        schema=_BRIDGE_START_REQUEST_SCHEMA,
+        action="start_bridge",
+        now=now,
+    )
+
+
+def write_application_exit_request(
+    config_root: Path,
+    *,
+    now: Callable[[], float] = time.time,
+) -> Path:
+    """Atomically ask the resident desktop process to exit completely."""
+
+    return _write_request(
+        application_exit_request_path(config_root),
+        schema=_APPLICATION_EXIT_REQUEST_SCHEMA,
+        action="exit_application",
+        now=now,
+    )
+
+
+def _consume_request(
+    path: Path,
+    *,
+    schema: int,
+    action: str,
+    now: Callable[[], float],
+    max_age_seconds: float,
+) -> bool:
     claimed = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.claimed")
     try:
         os.replace(path, claimed)
@@ -368,8 +403,8 @@ def consume_bridge_start_request(
             return False
         created_at = payload.get("created_at")
         if (
-            payload.get("schema") != _BRIDGE_START_REQUEST_SCHEMA
-            or payload.get("action") != "start_bridge"
+            payload.get("schema") != schema
+            or payload.get("action") != action
             or not isinstance(created_at, (int, float))
             or isinstance(created_at, bool)
         ):
@@ -381,6 +416,40 @@ def consume_bridge_start_request(
             claimed.unlink()
         except FileNotFoundError:
             pass
+
+
+def consume_bridge_start_request(
+    config_root: Path,
+    *,
+    now: Callable[[], float] = time.time,
+    max_age_seconds: float = _BRIDGE_START_REQUEST_MAX_AGE_SECONDS,
+) -> bool:
+    """Claim and validate one request without deleting a newer replacement."""
+
+    return _consume_request(
+        bridge_start_request_path(config_root),
+        schema=_BRIDGE_START_REQUEST_SCHEMA,
+        action="start_bridge",
+        now=now,
+        max_age_seconds=max_age_seconds,
+    )
+
+
+def consume_application_exit_request(
+    config_root: Path,
+    *,
+    now: Callable[[], float] = time.time,
+    max_age_seconds: float = _APPLICATION_EXIT_REQUEST_MAX_AGE_SECONDS,
+) -> bool:
+    """Claim one fresh full-application exit request exactly once."""
+
+    return _consume_request(
+        application_exit_request_path(config_root),
+        schema=_APPLICATION_EXIT_REQUEST_SCHEMA,
+        action="exit_application",
+        now=now,
+        max_age_seconds=max_age_seconds,
+    )
 
 
 def _named_mutex_running(
@@ -430,6 +499,21 @@ def bridge_instance_running(
     _close_handle: CloseHandleFn = _real_close_handle,
 ) -> bool:
     """Return whether bridge mode already owns the per-session mutex."""
+
+    return _named_mutex_running(
+        name=name,
+        _open_mutex=_open_mutex,
+        _close_handle=_close_handle,
+    )
+
+
+def application_instance_running(
+    *,
+    name: str = _SETTINGS_MUTEX_NAME,
+    _open_mutex: OpenMutexFn = _real_open_mutex,
+    _close_handle: CloseHandleFn = _real_close_handle,
+) -> bool:
+    """Return whether the resident desktop application currently exists."""
 
     return _named_mutex_running(
         name=name,

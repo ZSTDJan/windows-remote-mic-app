@@ -595,6 +595,89 @@ class BridgeStartRequestTests(unittest.TestCase):
         self.assertFalse(path.exists())
 
 
+class ApplicationExitRequestTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_fresh_request_is_consumed_exactly_once(self):
+        path = single_instance.write_application_exit_request(
+            self.root, now=lambda: 100.0
+        )
+
+        self.assertEqual(
+            path,
+            single_instance.application_exit_request_path(self.root),
+        )
+        self.assertTrue(
+            single_instance.consume_application_exit_request(
+                self.root,
+                now=lambda: 110.0,
+            )
+        )
+        self.assertFalse(
+            single_instance.consume_application_exit_request(
+                self.root,
+                now=lambda: 110.0,
+            )
+        )
+
+    def test_stale_or_wrong_action_is_discarded_without_touching_bridge_request(self):
+        single_instance.write_application_exit_request(
+            self.root, now=lambda: 100.0
+        )
+        single_instance.write_bridge_start_request(self.root, now=lambda: 100.0)
+
+        self.assertFalse(
+            single_instance.consume_application_exit_request(
+                self.root,
+                now=lambda: 131.0,
+            )
+        )
+        self.assertTrue(
+            single_instance.consume_bridge_start_request(
+                self.root,
+                now=lambda: 110.0,
+            )
+        )
+
+        path = single_instance.application_exit_request_path(self.root)
+        path.write_text(
+            json.dumps(
+                {
+                    "schema": 1,
+                    "action": "start_bridge",
+                    "created_at": 100.0,
+                }
+            ),
+            encoding="utf-8",
+        )
+        self.assertFalse(
+            single_instance.consume_application_exit_request(
+                self.root,
+                now=lambda: 110.0,
+            )
+        )
+        self.assertFalse(path.exists())
+
+    def test_application_probe_uses_the_product_wide_settings_mutex(self):
+        opened = []
+
+        self.assertFalse(
+            single_instance.application_instance_running(
+                _open_mutex=lambda name: opened.append(name)
+                or single_instance.MutexOpenResult(
+                    handle=0,
+                    last_error=single_instance._ERROR_FILE_NOT_FOUND,
+                )
+            )
+        )
+        self.assertEqual(opened, [single_instance._SETTINGS_MUTEX_NAME])
+
+
 class MutexCtypesPrototypeTests(unittest.TestCase):
     """Structural exact-prototype coverage, matching the convention
     established by tests/test_win32_ctypes_argtypes.py: every Win32 call

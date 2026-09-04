@@ -80,8 +80,15 @@ Source: "..\..\..\..\COPYRIGHT.md"; DestDir: "{app}"; DestName: "COPYRIGHT.txt";
 ;     below both depend on existing on disk AFTER install completes.
 Source: "stop-app.ps1"; DestDir: "{app}"; Flags: ignoreversion
 Source: "stop-app.ps1"; DestDir: "{tmp}"; Flags: dontcopy
+; This marker is the upgrade-time proof that the installed desktop build
+; consumes application-exit-request.json and must never be force-stopped.
+Source: "application-exit-contract-v1.json"; DestDir: "{app}"; Flags: ignoreversion
 
 [InstallDelete]
+; PyInstaller's runtime directory contains no user settings or logs. Remove
+; it only after PrepareToInstall has proved the old application is stopped,
+; so files removed from a newer build cannot survive an in-place upgrade.
+Type: filesandordirs; Name: "{app}\_internal"
 ; Remove only shortcut names created by earlier releases with the same AppId.
 Type: files; Name: "{userdesktop}\Remote Mic · 小米遥控器2 Pro.lnk"
 Type: files; Name: "{userdesktop}\Remote Mic · RC003.lnk"
@@ -105,7 +112,7 @@ Name: "desktopicon"; Description: "创建桌面快捷方式"; GroupDescription: 
 ; the saved in-app option.
 Name: "{group}\{#AppName}"; Filename: "{app}\{#AppExeName}"
 Name: "{group}\{#AppName} 设置"; Filename: "{app}\{#AppExeName}"; Parameters: "--settings"
-Name: "{group}\停止 {#AppName}"; Filename: "powershell.exe"; Parameters: "-ExecutionPolicy Bypass -File ""{app}\stop-app.ps1"" -AppPath ""{app}"""; WorkingDir: "{app}"; Flags: runminimized
+Name: "{group}\停止 {#AppName}"; Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\stop-app.ps1"" -AppPath ""{app}"" -ConfigRoot ""{localappdata}\RemoteMic\{#AppFolder}"""; WorkingDir: "{app}"; Flags: runminimized
 Name: "{group}\卸载 {#AppName}"; Filename: "{uninstallexe}"
 Name: "{userdesktop}\{#AppName}"; Filename: "{app}\{#AppExeName}"; Tasks: desktopicon
 ; Deliberately no {userstartup} icon anywhere in this file.
@@ -117,8 +124,49 @@ Name: "{userdesktop}\{#AppName}"; Filename: "{app}\{#AppExeName}"; Tasks: deskto
 Filename: "{app}\{#AppExeName}"; Parameters: "--settings"; Description: "打开 {#AppName} 设置"; Flags: postinstall nowait skipifsilent unchecked
 
 [Code]
+const
+  StopNeedsElevationExitCode = 10;
+  StopUnsafeToContinueExitCode = 20;
+  StopProbeFailedExitCode = 21;
+
 var
   HidHelperInstallSucceeded: Boolean;
+
+function RunStopApplication(const StopScript: String; Elevated: Boolean;
+  var ResultCode: Integer): Boolean;
+var
+  Parameters: String;
+  PowerShellPath: String;
+begin
+  PowerShellPath := ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe');
+  Parameters :=
+    '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' +
+    StopScript + '" -AppPath "' + ExpandConstant('{app}') +
+    '" -ConfigRoot "' +
+    ExpandConstant('{localappdata}\RemoteMic\{#AppFolder}') + '"';
+  if Elevated then
+  begin
+    Parameters := Parameters + ' -ElevatedRetry';
+    Result := ShellExec(
+      'runas',
+      PowerShellPath,
+      Parameters,
+      ExtractFileDir(StopScript),
+      SW_HIDE,
+      ewWaitUntilTerminated,
+      ResultCode
+    );
+  end
+  else
+    Result := Exec(
+      PowerShellPath,
+      Parameters,
+      ExtractFileDir(StopScript),
+      SW_HIDE,
+      ewWaitUntilTerminated,
+      ResultCode
+    );
+end;
 
 function RunHidHelper(const Parameters: String; var ResultCode: Integer): Boolean;
 var
@@ -147,20 +195,34 @@ function PrepareToInstall(var NeedsRestart: Boolean): String;
 var
   ResultCode: Integer;
   Started: Boolean;
+  StopScript: String;
 begin
   Result := '';
   ExtractTemporaryFile('stop-app.ps1');
-  Started := Exec('powershell.exe',
-    '-ExecutionPolicy Bypass -File "' + ExpandConstant('{tmp}\stop-app.ps1') + '" -AppPath "' + ExpandConstant('{app}') + '"',
-    '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  StopScript := ExpandConstant('{tmp}\stop-app.ps1');
+  Started := RunStopApplication(StopScript, False, ResultCode);
   if not Started then
   begin
     Result := '无法运行旧进程清理程序；安装已停止，以免覆盖仍在使用的文件。';
     exit;
   end;
+  if ResultCode = StopNeedsElevationExitCode then
+  begin
+    Started := RunStopApplication(StopScript, True, ResultCode);
+    if not Started then
+    begin
+      Result := '需要管理员权限关闭正在以管理员身份运行的旧版。未完成 UAC 确认，安装没有覆盖任何程序文件。';
+      exit;
+    end;
+  end;
   if ResultCode <> 0 then
   begin
-    Result := '无线麦仍在运行或未能确认退出；请先退出程序后再重试安装。';
+    if ResultCode = StopUnsafeToContinueExitCode then
+      Result := '无线麦没有完成安全退出。安装没有覆盖任何程序文件；请先处理窗口中的保存提示并完全退出。旧版若没有可用的退出入口，请关闭软件或重启 Windows 后再安装。'
+    else if ResultCode = StopProbeFailedExitCode then
+      Result := '无法安全核对正在运行的旧程序。安装没有覆盖任何程序文件；请关闭所有无线麦进程或重启 Windows 后再安装。'
+    else
+      Result := '无线麦没有完成安全退出。安装没有覆盖任何程序文件；请完全退出后重试。';
     exit;
   end;
 end;
@@ -207,13 +269,16 @@ begin
     exit;
   end;
 
-  Started := Exec('powershell.exe',
-    '-ExecutionPolicy Bypass -File "' + StopScript + '" -AppPath "' + ExpandConstant('{app}') + '"',
-    '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  Started := RunStopApplication(StopScript, False, ResultCode);
+  if Started then
+  begin
+    if ResultCode = StopNeedsElevationExitCode then
+      Started := RunStopApplication(StopScript, True, ResultCode);
+  end;
   if (not Started) or (ResultCode <> 0) then
   begin
     MsgBox(
-      '无线麦仍在运行或未能确认退出。卸载尚未开始，请先退出程序后重试。',
+      '无线麦没有完成安全退出，或管理员确认被取消。卸载尚未开始；请处理窗口中的保存提示并完全退出。旧版若没有可用的退出入口，请关闭软件或重启 Windows 后再卸载。',
       mbError,
       MB_OK
     );

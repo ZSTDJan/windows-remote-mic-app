@@ -15,6 +15,10 @@ built from the standalone ``src/launcher.py`` entry point - see XRBM-021):
                 launch commands. Current product startup already routes
                 ``--bridge`` to the one desktop process, so the marker has no
                 separate runtime role.
+- ``--request-exit``  HIDDEN maintenance entry point. It writes one bounded,
+                atomic full-exit request for the resident desktop process and
+                waits for the application mutex to disappear. It never opens
+                a window or starts BLE, HID, navigation, or audio resources.
 - ``--dry-run``   import every first-party module and exit 0, touching no
                    GUI, BLE, Raw Input, or audio device - the safe smoke
                   check build-candidate.ps1 and
@@ -72,7 +76,7 @@ built from the standalone ``src/launcher.py`` entry point - see XRBM-021):
                   falls through to desktop or bridge startup.
 - ``--help``/``-h``  print this usage and exit 0
 
-``--settings``, ``--bridge``, ``--dry-run``, ``--qt-runtime-check``,
+``--settings``, ``--bridge``, ``--request-exit``, ``--dry-run``, ``--qt-runtime-check``,
 ``--diagnose-ble-candidates``, ``--diagnose-vb-cable-loopback``,
 ``--preflight-output-endpoint`` and
 ``--help``/``-h`` are all checked and dispatched before desktop startup.
@@ -82,6 +86,7 @@ Dry-run, diagnostics and help touch neither application nor bridge ownership.
 from __future__ import annotations
 
 import sys
+import time
 
 from . import __version__
 from . import dev_session
@@ -89,6 +94,10 @@ from . import product_identity
 
 SETTINGS_STARTUP_FAILED_EXIT_CODE = 15
 ELEMENT_NAVIGATION_RUNTIME_FAILED_EXIT_CODE = 18
+APPLICATION_EXIT_REQUEST_FAILED_EXIT_CODE = 19
+APPLICATION_EXIT_REQUEST_TIMEOUT_EXIT_CODE = 20
+APPLICATION_EXIT_REQUEST_TIMEOUT_SECONDS = 45.0
+APPLICATION_EXIT_REQUEST_POLL_SECONDS = 0.1
 
 
 def _print_help() -> None:
@@ -188,6 +197,67 @@ def _qt_runtime_check() -> int:
     return 0
 
 
+def _request_application_exit(
+    *,
+    timeout: float = APPLICATION_EXIT_REQUEST_TIMEOUT_SECONDS,
+    poll_interval: float = APPLICATION_EXIT_REQUEST_POLL_SECONDS,
+    monotonic=time.monotonic,
+    sleep=time.sleep,
+) -> int:
+    """Request full cleanup from the resident process and wait for exit."""
+
+    from . import config, single_instance
+
+    root = config.config_root()
+    request_path = single_instance.application_exit_request_path(root)
+    try:
+        running = single_instance.application_instance_running()
+    except Exception as exc:
+        print(
+            "application exit status unavailable: "
+            f"error_type={type(exc).__name__}",
+            file=sys.stderr,
+        )
+        return APPLICATION_EXIT_REQUEST_FAILED_EXIT_CODE
+    if not running:
+        try:
+            request_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return 0
+
+    try:
+        single_instance.write_application_exit_request(root)
+    except OSError as exc:
+        print(
+            "application exit request failed: "
+            f"error_type={type(exc).__name__}",
+            file=sys.stderr,
+        )
+        return APPLICATION_EXIT_REQUEST_FAILED_EXIT_CODE
+
+    deadline = monotonic() + max(0.1, float(timeout))
+    while True:
+        try:
+            running = single_instance.application_instance_running()
+        except Exception as exc:
+            print(
+                "application exit confirmation failed: "
+                f"error_type={type(exc).__name__}",
+                file=sys.stderr,
+            )
+            return APPLICATION_EXIT_REQUEST_FAILED_EXIT_CODE
+        if not running:
+            try:
+                request_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            return 0
+        if monotonic() >= deadline:
+            return APPLICATION_EXIT_REQUEST_TIMEOUT_EXIT_CODE
+        sleep(max(0.01, float(poll_interval)))
+
+
 def main() -> None:
     args = dev_session.consume_marker(sys.argv[1:])
     if "--help" in args or "-h" in args:
@@ -197,6 +267,8 @@ def main() -> None:
         raise SystemExit(_dry_run())
     if "--qt-runtime-check" in args:
         raise SystemExit(_qt_runtime_check())
+    if "--request-exit" in args:
+        raise SystemExit(_request_application_exit())
     if "--diagnose-ble-candidates" in args:
         # XRBM-035 RETRY 1: hidden, undocumented child-process entry point -
         # see this module's own docstring. Always raises SystemExit from

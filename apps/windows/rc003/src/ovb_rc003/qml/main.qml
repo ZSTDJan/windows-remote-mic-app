@@ -159,6 +159,7 @@ ApplicationWindow {
                 pendingExitPrompt = true
                 if (!SettingsController.stopInputCapture()) {
                     pendingExitPrompt = false
+                    SettingsController.cancelPendingMaintenanceExit()
                     showLifecycleError(
                         qsTr("无法准备退出"),
                         qsTr("无法停止正在进行的按键录入或检测。"))
@@ -213,6 +214,7 @@ ApplicationWindow {
 
     Connections {
         target: SettingsController
+        function onMaintenanceExitRequested() { window.requestFullExit() }
         function onApplicationExitReady() { Qt.quit() }
         function onApplicationExitFailed(message) {
             window.applicationExitInProgress = false
@@ -249,6 +251,8 @@ ApplicationWindow {
             const exiting = window.pendingExitPrompt
             window.pendingExitPrompt = false
             window.pendingPageIndex = -1
+            if (exiting)
+                SettingsController.cancelPendingMaintenanceExit()
             window.showLifecycleError(
                 exiting ? qsTr("无法准备退出") : qsTr("无法切换页面"),
                 message)
@@ -275,6 +279,10 @@ ApplicationWindow {
         standardButtons: Dialog.NoButton
         property bool saveAttempted: false
         property bool exitCommitInProgress: false
+        onClosed: {
+            if (!exitCommitInProgress && !window.applicationExitInProgress)
+                SettingsController.cancelPendingMaintenanceExit()
+        }
         closePolicy: SettingsController.settingsSaveBusy
             || exitCommitInProgress ? Popup.NoAutoClose : Popup.CloseOnEscape
         width: Math.min(430, window.width - 32)

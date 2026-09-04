@@ -2806,6 +2806,96 @@ class SettingsControllerTests(unittest.TestCase):
 
         start_bridge.assert_called_once_with()
 
+    def test_external_application_exit_request_preempts_bridge_refresh_once(self):
+        controller, _ = self._make_controller()
+        single_instance.write_application_exit_request(controller._config_root)
+        single_instance.write_bridge_start_request(controller._config_root)
+        exit_requests = []
+        controller.maintenanceExitRequested.connect(
+            lambda: exit_requests.append(True)
+        )
+
+        with mock.patch.object(
+            controller,
+            "_refresh_bridge_status",
+        ) as refresh_status:
+            controller.refreshBridgeState()
+
+        self.assertEqual(exit_requests, [True])
+        refresh_status.assert_not_called()
+        self.assertFalse(
+            single_instance.consume_application_exit_request(
+                controller._config_root
+            )
+        )
+        self.assertFalse(
+            single_instance.consume_bridge_start_request(controller._config_root)
+        )
+
+    def test_external_exit_blocks_an_already_queued_bridge_start_until_cancelled(self):
+        controller, _ = self._make_controller()
+        controller._start_bridge_requested = True
+        single_instance.write_application_exit_request(controller._config_root)
+
+        with mock.patch.object(
+            controller,
+            "_refresh_bridge_status",
+            return_value=False,
+        ) as refresh_status, mock.patch.object(
+            controller, "startBridge"
+        ) as start_bridge:
+            controller.refreshBridgeState()
+            single_instance.write_bridge_start_request(controller._config_root)
+            controller.refreshBridgeState()
+
+        start_bridge.assert_not_called()
+        refresh_status.assert_not_called()
+        self.assertTrue(controller._maintenance_exit_pending)
+        self.assertFalse(controller._start_bridge_requested)
+        self.assertFalse(
+            single_instance.consume_bridge_start_request(controller._config_root)
+        )
+
+        with mock.patch("PySide6.QtCore.QTimer.singleShot") as single_shot:
+            controller.startBridge()
+
+        single_shot.assert_not_called()
+
+        controller.cancelPendingMaintenanceExit()
+
+        self.assertFalse(controller._maintenance_exit_pending)
+
+    def test_maintenance_exit_pending_blocks_every_bridge_start_path(self):
+        controller, _ = self._make_controller()
+        controller._maintenance_exit_pending = True
+        controller._start_bridge_requested = True
+        controller._launch_bridge_on_app_start = True
+        controller._set_bridge_running(True)
+
+        with mock.patch.object(controller, "_begin_bridge_restart") as restart:
+            controller.startBridgeOnApplicationStart()
+        restart.assert_not_called()
+
+        with mock.patch.object(
+            qt_settings_app.bridge_control_windows,
+            "request_bridge_exit",
+        ) as request_exit:
+            controller.restartBridge()
+        request_exit.assert_not_called()
+
+        controller._set_bridge_launch_phase("starting")
+        with mock.patch.object(
+            bridge_launcher,
+            "start_bridge_launch",
+        ) as start_launch:
+            controller._start_bridge_process()
+        start_launch.assert_not_called()
+        self.assertEqual(controller.bridgeLaunchPhase, "idle")
+
+        with mock.patch("PySide6.QtCore.QTimer.singleShot") as single_shot:
+            controller.startBridge()
+        single_shot.assert_not_called()
+
     def test_start_bridge_rejects_output_configuration_work(self):
         blockers = (
             (
@@ -6435,6 +6525,18 @@ class SettingsShellSourceContractTests(unittest.TestCase):
         self.assertGreaterEqual(
             self.main_qml.count("window.applicationExitInProgress = false"),
             2,
+        )
+        self.assertIn(
+            "function onMaintenanceExitRequested() { window.requestFullExit() }",
+            self.main_qml,
+        )
+        self.assertIn(
+            "SettingsController.cancelPendingMaintenanceExit()",
+            self.main_qml,
+        )
+        self.assertGreaterEqual(
+            self.main_qml.count("SettingsController.cancelPendingMaintenanceExit()"),
+            3,
         )
 
     def test_device_page_owns_the_three_desktop_behavior_options(self):

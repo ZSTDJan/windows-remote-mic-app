@@ -907,6 +907,7 @@ def _load_qt_classes() -> dict:
         bridgeRestartRecommendedChanged = Signal()
         desktopBehaviorChanged = Signal()
         trayStateChanged = Signal()
+        maintenanceExitRequested = Signal()
         applicationExitReady = Signal()
         applicationExitFailed = Signal(str)
         windowHideReady = Signal()
@@ -1025,6 +1026,7 @@ def _load_qt_classes() -> dict:
             self._launch_at_login = startup_state.enabled
             self._application_exit_requested = False
             self._application_exit_confirmed = False
+            self._maintenance_exit_pending = False
             self._application_exit_intent = threading.Event()
             self._application_exit_deadline = 0.0
             self._application_exit_poll_scheduled = False
@@ -1747,6 +1749,7 @@ def _load_qt_classes() -> dict:
                 and not self._bridge_recovery_attempted
                 and not self._bridge_recovery_running
                 and not self._get_bridge_launch_busy()
+                and not self._maintenance_exit_pending
                 and not self._application_exit_requested
                 and not self._application_exit_confirmed
             ):
@@ -4253,6 +4256,8 @@ def _load_qt_classes() -> dict:
 
         @Slot()
         def startBridgeOnApplicationStart(self) -> None:
+            if self._maintenance_exit_pending:
+                return
             if (
                 self._bridge_running
                 and not bridge_launcher.in_process_bridge_running()
@@ -4293,6 +4298,7 @@ def _load_qt_classes() -> dict:
                 or self._application_exit_confirmed
             ):
                 return
+            self._maintenance_exit_pending = False
             self._application_exit_requested = True
             self._application_exit_deadline = 0.0
             self._window_hide_requested = False
@@ -4425,6 +4431,7 @@ def _load_qt_classes() -> dict:
             self._fail_application_exit(str(message))
 
         def _fail_application_exit(self, message: str) -> None:
+            self._maintenance_exit_pending = False
             self._application_exit_requested = False
             self._application_exit_stop_running = False
             self._application_exit_poll_scheduled = False
@@ -4432,6 +4439,12 @@ def _load_qt_classes() -> dict:
             self._application_exit_deadline = 0.0
             self._application_exit_intent.clear()
             self.applicationExitFailed.emit(message)
+
+        @Slot()
+        def cancelPendingMaintenanceExit(self) -> None:
+            if self._application_exit_requested or self._application_exit_confirmed:
+                return
+            self._maintenance_exit_pending = False
 
         @Slot()
         def repairHidHelper(self) -> None:
@@ -4600,6 +4613,34 @@ def _load_qt_classes() -> dict:
 
         @Slot()
         def refreshBridgeState(self) -> None:
+            try:
+                exit_requested = single_instance.consume_application_exit_request(
+                    self._config_root
+                )
+            except OSError:
+                exit_requested = False
+            if exit_requested:
+                self._maintenance_exit_pending = True
+                self._start_bridge_requested = False
+                try:
+                    single_instance.consume_bridge_start_request(
+                        self._config_root
+                    )
+                except OSError:
+                    pass
+                self.maintenanceExitRequested.emit()
+                return
+
+            if self._maintenance_exit_pending:
+                try:
+                    single_instance.consume_bridge_start_request(
+                        self._config_root
+                    )
+                except OSError:
+                    pass
+                self._start_bridge_requested = False
+                return
+
             running = self._refresh_bridge_status()
             try:
                 requested = single_instance.consume_bridge_start_request(
@@ -4776,6 +4817,7 @@ def _load_qt_classes() -> dict:
         def _begin_bridge_restart(self, *, automatic: bool) -> None:
             if (
                 self._bridge_recovery_running
+                or self._maintenance_exit_pending
                 or self._application_exit_requested
                 or self._application_exit_confirmed
                 or self._application_exit_intent.is_set()
@@ -4844,7 +4886,8 @@ def _load_qt_classes() -> dict:
             if self._bridge_launch_phase not in {"saving", "starting"}:
                 return
             if (
-                self._application_exit_requested
+                self._maintenance_exit_pending
+                or self._application_exit_requested
                 or self._application_exit_confirmed
                 or self._application_exit_intent.is_set()
             ):
@@ -4879,7 +4922,8 @@ def _load_qt_classes() -> dict:
             """Start the bridge without saving unrelated unsaved page edits."""
 
             if (
-                self._application_exit_requested
+                self._maintenance_exit_pending
+                or self._application_exit_requested
                 or self._application_exit_confirmed
                 or self._application_exit_intent.is_set()
             ):
@@ -4943,6 +4987,7 @@ def _load_qt_classes() -> dict:
                 self._set_bridge_launch_phase("waiting")
                 if (
                     result.outcome is bridge_launcher.LaunchOutcome.ALREADY_RUNNING
+                    and not self._maintenance_exit_pending
                     and not self._application_exit_requested
                     and self._voice_program_settings.get("launch_on_bridge_start")
                     is True
