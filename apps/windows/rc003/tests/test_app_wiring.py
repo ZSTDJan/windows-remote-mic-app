@@ -1161,6 +1161,80 @@ class OrdinaryButtonGestureWiringTests(_AppWiringTestCase):
         self.assertEqual(actions, [])
         self.assertEqual(self.app._button_key_release_pending, ("ctrl", "l"))
 
+    def test_mouse_actions_dispatch_physical_buttons_and_wheel_steps(self):
+        button_calls = []
+        wheel_calls = []
+        with mock.patch.object(
+            win32_input,
+            "send_mouse_button_click",
+            side_effect=lambda button: button_calls.append(button),
+        ), mock.patch.object(
+            win32_input,
+            "send_mouse_wheel",
+            side_effect=lambda clicks: wheel_calls.append(clicks),
+        ):
+            for action_kind in (
+                key_mapping.ActionKind.MOUSE_LEFT_CLICK,
+                key_mapping.ActionKind.MOUSE_RIGHT_CLICK,
+                key_mapping.ActionKind.MOUSE_MIDDLE_CLICK,
+                key_mapping.ActionKind.MOUSE_X1_CLICK,
+                key_mapping.ActionKind.MOUSE_X2_CLICK,
+                key_mapping.ActionKind.MOUSE_WHEEL_UP,
+                key_mapping.ActionKind.MOUSE_WHEEL_DOWN,
+            ):
+                self.app._apply_button_action(key_mapping.ButtonAction(action_kind))
+
+        self.assertEqual(button_calls, ["left", "right", "middle", "x1", "x2"])
+        self.assertEqual(wheel_calls, [1, -1])
+
+    def test_incomplete_mouse_click_is_retained_and_released_before_next_action(self):
+        actions = []
+        releases = []
+        with mock.patch.object(
+            win32_input,
+            "send_mouse_button_click",
+            side_effect=win32_input.InputCleanupIncompleteError("still down"),
+        ), mock.patch.object(
+            win32_input,
+            "send_mouse_button_up",
+            side_effect=lambda button: releases.append(button),
+        ), mock.patch.object(
+            win32_input,
+            "send_arrow_down",
+            side_effect=lambda: actions.append("arrow_down"),
+        ):
+            self.app._apply_button_action(
+                key_mapping.ButtonAction(key_mapping.ActionKind.MOUSE_X2_CLICK)
+            )
+            self.assertEqual(self.app._button_mouse_release_pending, "x2")
+
+            self.app._apply_button_action(
+                key_mapping.ButtonAction(key_mapping.ActionKind.ARROW_DOWN)
+            )
+
+        self.assertEqual(releases, ["x2"])
+        self.assertEqual(actions, ["arrow_down"])
+        self.assertIsNone(self.app._button_mouse_release_pending)
+
+    def test_pending_mouse_release_blocks_new_actions_when_retry_is_incomplete(self):
+        actions = []
+        self.app._button_mouse_release_pending = "left"
+        with mock.patch.object(
+            win32_input,
+            "send_mouse_button_up",
+            side_effect=win32_input.InputCleanupIncompleteError("still down"),
+        ), mock.patch.object(
+            win32_input,
+            "send_arrow_down",
+            side_effect=lambda: actions.append("arrow_down"),
+        ):
+            self.app._apply_button_action(
+                key_mapping.ButtonAction(key_mapping.ActionKind.ARROW_DOWN)
+            )
+
+        self.assertEqual(actions, [])
+        self.assertEqual(self.app._button_mouse_release_pending, "left")
+
     def test_fallback_safety_release_cannot_erase_a_new_pending_action_release(self):
         first_release_started = threading.Event()
         allow_first_release = threading.Event()
@@ -2356,8 +2430,33 @@ class CleanupOwnershipTests(_AppWiringTestCase):
         finally:
             win32_input.send_key_combo_up = original
 
-        self.assertIn("ordinary button key", str(ctx.exception))
+        self.assertIn("ordinary button input", str(ctx.exception))
         self.assertEqual(self.app._button_key_release_pending, ("ctrl", "l"))
+
+    def test_cleanup_releases_and_clears_pending_mouse_button(self):
+        released = []
+        self.app._button_mouse_release_pending = "x1"
+        with mock.patch.object(
+            win32_input,
+            "send_mouse_button_up",
+            side_effect=lambda button: released.append(button),
+        ):
+            _run(self.app._cleanup_once())
+
+        self.assertEqual(released, ["x1"])
+        self.assertIsNone(self.app._button_mouse_release_pending)
+
+    def test_cleanup_retains_incomplete_mouse_button_release(self):
+        self.app._button_mouse_release_pending = "right"
+        with mock.patch.object(
+            win32_input,
+            "send_mouse_button_up",
+            side_effect=win32_input.InputCleanupIncompleteError("still down"),
+        ), self.assertRaises(app_module.CleanupIncompleteError) as ctx:
+            _run(self.app._cleanup_once())
+
+        self.assertIn("ordinary button input", str(ctx.exception))
+        self.assertEqual(self.app._button_mouse_release_pending, "right")
 
     def test_input_shutdown_failure_retains_hid_owner(self):
         hid = _FakeHidListener(stop_raises=True)

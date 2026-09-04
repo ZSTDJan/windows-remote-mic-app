@@ -50,9 +50,22 @@ from . import win32_keys
 from .voice_key_physicalizer_windows import VOICE_EVENT_EXTRA_INFO
 
 _INPUT_KEYBOARD = 1
+_INPUT_MOUSE = 0
 _KEYEVENTF_KEYUP = 0x0002
 _KEYEVENTF_EXTENDEDKEY = 0x0001
 _KEYEVENTF_SCANCODE = 0x0008
+_MOUSEEVENTF_LEFTDOWN = 0x0002
+_MOUSEEVENTF_LEFTUP = 0x0004
+_MOUSEEVENTF_RIGHTDOWN = 0x0008
+_MOUSEEVENTF_RIGHTUP = 0x0010
+_MOUSEEVENTF_MIDDLEDOWN = 0x0020
+_MOUSEEVENTF_MIDDLEUP = 0x0040
+_MOUSEEVENTF_XDOWN = 0x0080
+_MOUSEEVENTF_XUP = 0x0100
+_MOUSEEVENTF_WHEEL = 0x0800
+_XBUTTON1 = 0x0001
+_XBUTTON2 = 0x0002
+_WHEEL_DELTA = 120
 
 # Real x64 Win32 ``INPUT`` struct shape (fixed after XRBM-014 review round 2
 # P1 #1: the union previously declared only ``KEYBDINPUT``, so
@@ -149,7 +162,17 @@ _PHYSICAL_SCAN_CODES = {
 }
 
 RawSender = Callable[[Sequence[Tuple[int, bool]]], int]
+MouseEvent = Tuple[int, int]
+MouseSender = Callable[[Sequence[MouseEvent]], int]
 VoiceSender = Callable[[int, bool], None]
+
+_MOUSE_BUTTON_EVENTS = {
+    "left": (_MOUSEEVENTF_LEFTDOWN, _MOUSEEVENTF_LEFTUP, 0),
+    "right": (_MOUSEEVENTF_RIGHTDOWN, _MOUSEEVENTF_RIGHTUP, 0),
+    "middle": (_MOUSEEVENTF_MIDDLEDOWN, _MOUSEEVENTF_MIDDLEUP, 0),
+    "x1": (_MOUSEEVENTF_XDOWN, _MOUSEEVENTF_XUP, _XBUTTON1),
+    "x2": (_MOUSEEVENTF_XDOWN, _MOUSEEVENTF_XUP, _XBUTTON2),
+}
 
 _voice_backend: Optional[str] = None
 
@@ -166,7 +189,7 @@ def _require_live_input_allowed() -> None:
 
 
 class InputCleanupIncompleteError(OSError):
-    """Raised when delivery failed and a compensating key-up could not be
+    """Raised when delivery failed and a compensating input-up could not be
     confirmed.
 
     Callers must retain enough state to retry a release later. Treating this
@@ -232,8 +255,23 @@ def _build_virtual_key_input_array(events: Sequence[Tuple[int, bool]]):
     return array, INPUT
 
 
+def _build_mouse_input_array(events: Sequence[MouseEvent]):
+    array = (INPUT * len(events))()
+    for index, (flags, mouse_data) in enumerate(events):
+        mouse_input = MOUSEINPUT(
+            dx=0,
+            dy=0,
+            mouseData=ctypes.c_uint32(mouse_data).value,
+            dwFlags=flags,
+            time=0,
+            dwExtraInfo=0,
+        )
+        array[index] = INPUT(type=_INPUT_MOUSE, union=_INPUT_UNION(mi=mouse_input))
+    return array, INPUT
+
+
 def _real_send_input_batch_with_builder(events, builder) -> int:
-    """Submit one keyboard batch using the requested INPUT-array builder."""
+    """Submit one input batch using the requested INPUT-array builder."""
 
     _require_live_input_allowed()
     _require_windows()
@@ -271,6 +309,103 @@ def _real_send_virtual_key_input_batch(events: Sequence[Tuple[int, bool]]) -> in
     """Submit unmarked, virtual-key-only events in one real SendInput call."""
 
     return _real_send_input_batch_with_builder(events, _build_virtual_key_input_array)
+
+
+def _real_send_mouse_input_batch(events: Sequence[MouseEvent]) -> int:
+    """Submit ordinary mouse events in one real SendInput call."""
+
+    return _real_send_input_batch_with_builder(events, _build_mouse_input_array)
+
+
+def _mouse_button_event(button: str, *, key_up: bool) -> MouseEvent:
+    try:
+        down_flag, up_flag, mouse_data = _MOUSE_BUTTON_EVENTS[button]
+    except KeyError as exc:
+        raise ValueError(f"unsupported mouse button: {button}") from exc
+    return (up_flag if key_up else down_flag, mouse_data)
+
+
+def _best_effort_mouse_release(button: str, sender: MouseSender) -> bool:
+    try:
+        sent = sender([_mouse_button_event(button, key_up=True)])
+    except Exception:
+        return False
+    return sent == 1
+
+
+def send_mouse_button_click(
+    button: str, *, _sender: Optional[MouseSender] = None
+) -> None:
+    """Click one physical mouse button at the current pointer position.
+
+    Down and up are submitted together. If submission is partial or raises
+    after it may have reached Windows, a separate up is attempted immediately.
+    An incomplete compensating release is surfaced distinctly so the caller
+    can retain ownership and retry before another action.
+    """
+
+    sender = _sender or _real_send_mouse_input_batch
+    events = [
+        _mouse_button_event(button, key_up=False),
+        _mouse_button_event(button, key_up=True),
+    ]
+    try:
+        sent = sender(events)
+    except Win32InputUnavailableError:
+        raise
+    except Exception as exc:
+        cleanup_complete = _best_effort_mouse_release(button, sender)
+        error_type = _delivery_error_type(cleanup_complete)
+        raise error_type(f"mouse {button} click delivery failed: {exc}") from exc
+    if sent < len(events):
+        cleanup_complete = sent == 0 or _best_effort_mouse_release(button, sender)
+        error_type = _delivery_error_type(cleanup_complete)
+        raise error_type(
+            f"SendInput delivered only {sent}/{len(events)} events for mouse "
+            f"{button} click; safety release attempted"
+        )
+
+
+def send_mouse_button_up(
+    button: str, *, _sender: Optional[MouseSender] = None
+) -> None:
+    """Release one mouse button, retrying once if delivery is uncertain."""
+
+    sender = _sender or _real_send_mouse_input_batch
+    event = _mouse_button_event(button, key_up=True)
+    try:
+        sent = sender([event])
+    except Win32InputUnavailableError:
+        raise
+    except Exception as exc:
+        cleanup_complete = _best_effort_mouse_release(button, sender)
+        error_type = _delivery_error_type(cleanup_complete)
+        raise error_type(f"mouse {button} up delivery failed: {exc}") from exc
+    if sent < 1:
+        cleanup_complete = _best_effort_mouse_release(button, sender)
+        error_type = _delivery_error_type(cleanup_complete)
+        raise error_type(
+            f"SendInput did not deliver mouse {button} up; retry attempted"
+        )
+
+
+def send_mouse_wheel(
+    clicks: int, *, _sender: Optional[MouseSender] = None
+) -> None:
+    """Scroll vertically by an integral number of Windows wheel clicks."""
+
+    if not isinstance(clicks, int) or isinstance(clicks, bool) or clicks == 0:
+        raise ValueError("mouse wheel clicks must be a non-zero integer")
+    sender = _sender or _real_send_mouse_input_batch
+    events = [(_MOUSEEVENTF_WHEEL, clicks * _WHEEL_DELTA)]
+    try:
+        sent = sender(events)
+    except Win32InputUnavailableError:
+        raise
+    except Exception as exc:
+        raise OSError(f"mouse wheel delivery failed: {exc}") from exc
+    if sent < 1:
+        raise OSError("SendInput did not deliver the mouse wheel event")
 
 
 def _best_effort_release(vk_codes: Sequence[int], sender: RawSender) -> bool:

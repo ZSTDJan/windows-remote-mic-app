@@ -1773,6 +1773,22 @@ class SettingsControllerTests(unittest.TestCase):
         )
         self.assertIn("元素导航开关", controller.secondaryActionOptions)
 
+    def test_mouse_actions_are_available_to_every_mapping_entry(self):
+        controller, _ = self._make_controller()
+        mouse_actions = (
+            "鼠标左键单击",
+            "鼠标右键单击",
+            "鼠标中键单击",
+            "滚轮向上",
+            "滚轮向下",
+            "鼠标 X1 单击",
+            "鼠标 X2 单击",
+        )
+        for label in mouse_actions:
+            self.assertIn(label, controller.primaryActionOptions)
+            self.assertIn(label, controller.primaryActionOptionsFor("mic"))
+            self.assertIn(label, controller.secondaryActionOptions)
+
     def test_application_display_name_comes_from_product_identity(self):
         controller, _ = self._make_controller()
         self.assertEqual(
@@ -1785,10 +1801,15 @@ class SettingsControllerTests(unittest.TestCase):
         self.assertEqual(controller.actionOptionGroupTitle("Escape"), "按键操作")
         self.assertTrue(controller.actionOptionStartsGroup("Escape"))
         self.assertEqual(
+            controller.actionOptionGroupTitle("鼠标左键单击"),
+            "鼠标与导航",
+        )
+        self.assertTrue(controller.actionOptionStartsGroup("鼠标左键单击"))
+        self.assertEqual(
             controller.actionOptionGroupTitle("元素导航开关"),
             "鼠标与导航",
         )
-        self.assertTrue(controller.actionOptionStartsGroup("元素导航开关"))
+        self.assertFalse(controller.actionOptionStartsGroup("元素导航开关"))
         self.assertEqual(controller.actionOptionGroupTitle("方向上"), "按键操作")
         self.assertFalse(controller.actionOptionStartsGroup("方向上"))
         self.assertEqual(controller.actionOptionGroupTitle("未设置"), "")
@@ -8129,7 +8150,12 @@ assert editor.property("primaryText") == "Escape"
 assert model.to_display_map()["mic"] == "按住说话"
 assert double_combo.property("visible") and long_combo.property("visible")
 
-_select_combo_option(window, app, double_combo, 10)
+_select_combo_option(
+    window,
+    app,
+    double_combo,
+    list(controller.secondaryActionOptions).index("f5"),
+)
 assert double_combo.property("editText") == "f5"
 double_indicator = double_combo.mapToScene(
     QPointF(double_combo.property("width") - 8, double_combo.property("height") / 2)
@@ -8137,19 +8163,33 @@ double_indicator = double_combo.mapToScene(
 QTest.mouseClick(window, Qt.LeftButton, Qt.NoModifier, double_indicator)
 app.processEvents()
 assert double_combo.property("down")
-QTest.keyClick(window, Qt.Key_Down)
+QTest.keyClick(window, Qt.Key_Home)
+for _ in range(
+    list(controller.secondaryActionOptions).index("元素导航开关")
+):
+    QTest.keyClick(window, Qt.Key_Down)
 QTest.keyClick(window, Qt.Key_Return)
 for _ in range(3):
     window.grabWindow()
     app.processEvents()
 assert double_combo.property("editText") == "元素导航开关"
 
-_select_combo_option(window, app, double_combo, 1)
+_select_combo_option(
+    window,
+    app,
+    double_combo,
+    list(controller.secondaryActionOptions).index("Escape"),
+)
 assert double_combo.property("editText") == "Escape"
 assert editor.property("doubleText") == "Escape"
 assert model.to_secondary_display_map()["mic"]["double_click"] == ""
 
-_select_combo_option(window, app, long_combo, 2)
+_select_combo_option(
+    window,
+    app,
+    long_combo,
+    list(controller.secondaryActionOptions).index("回车"),
+)
 assert long_combo.property("editText") == "回车"
 assert editor.property("longText") == "回车"
 assert model.to_secondary_display_map()["mic"]["long_press"] == ""

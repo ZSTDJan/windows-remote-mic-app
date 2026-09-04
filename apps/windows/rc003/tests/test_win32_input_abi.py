@@ -63,6 +63,24 @@ class InputStructShapeTests(unittest.TestCase):
         self.assertIs(input_type, win32_input.INPUT)
         self.assertEqual(ctypes.sizeof(array), ctypes.sizeof(win32_input.INPUT))
 
+    def test_mouse_builder_uses_the_same_real_input_union(self):
+        array, input_type = win32_input._build_mouse_input_array(
+            [(win32_input._MOUSEEVENTF_XDOWN, win32_input._XBUTTON2)]
+        )
+        self.assertIs(input_type, win32_input.INPUT)
+        self.assertEqual(array[0].type, win32_input._INPUT_MOUSE)
+        self.assertEqual(array[0].union.mi.dwFlags, win32_input._MOUSEEVENTF_XDOWN)
+        self.assertEqual(array[0].union.mi.mouseData, win32_input._XBUTTON2)
+
+    def test_negative_wheel_delta_is_encoded_as_unsigned_mouse_data(self):
+        array, _ = win32_input._build_mouse_input_array(
+            [(win32_input._MOUSEEVENTF_WHEEL, -win32_input._WHEEL_DELTA)]
+        )
+        self.assertEqual(
+            array[0].union.mi.mouseData,
+            ctypes.c_uint32(-win32_input._WHEEL_DELTA).value,
+        )
+
     def test_right_alt_uses_the_extended_physical_scan_code(self):
         array, _ = win32_input._build_input_array(
             [(win32_input.win32_keys.VK_CODES["ralt"], False)]

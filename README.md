@@ -5,7 +5,7 @@
 Windows 客户端位于 [`apps/windows/rc003`](apps/windows/rc003/README.md)，提供：
 
 - WinRT BLE 连接与 ATVV 语音解码；
-- Windows Raw Input + Frida HID 旁路按键监听，SendInput 按键映射；
+- Windows Raw Input + Frida HID 旁路按键监听，SendInput 键盘与鼠标动作映射；
 - 语音输出到用户明确选择的音频端点（配合虚拟声卡供输入法识别）；
 - PySide6/Qt Quick 三页桌面程序、通知区域控制、分项检查和 PyInstaller/Inno Setup 构建；
 - 每个 Windows 登录会话只保留一个长期主进程，桥接和元素导航在主进程内运行。

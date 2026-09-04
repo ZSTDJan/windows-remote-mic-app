@@ -108,6 +108,14 @@ _BUTTON_ACTION_KEY_TOKENS = {
     key_mapping.ActionKind.PLAY_PAUSE: ("media_play_pause",),
 }
 
+_BUTTON_ACTION_MOUSE_BUTTONS = {
+    key_mapping.ActionKind.MOUSE_LEFT_CLICK: "left",
+    key_mapping.ActionKind.MOUSE_RIGHT_CLICK: "right",
+    key_mapping.ActionKind.MOUSE_MIDDLE_CLICK: "middle",
+    key_mapping.ActionKind.MOUSE_X1_CLICK: "x1",
+    key_mapping.ActionKind.MOUSE_X2_CLICK: "x2",
+}
+
 _RAW_FALLBACK_KEY_TOKENS = {
     "mic": "f5",
     "right": "right",
@@ -238,6 +246,7 @@ class RC003App:
         )
         self._button_action_lock = threading.RLock()
         self._button_key_release_pending: Optional[Tuple[str, ...]] = None
+        self._button_mouse_release_pending: Optional[str] = None
         # Raw Input and the ATVV control channel arrive on different worker
         # threads. Serialize the voice state machine so one physical press
         # cannot race into two host shortcut deliveries.
@@ -912,9 +921,9 @@ class RC003App:
         self._button_combos.reset()
         self._button_gestures.reset()
 
-        if not self._release_pending_button_keys():
+        if not self._release_pending_button_inputs():
             failures.append(
-                "ordinary button key safety release did not fully deliver; "
+                "ordinary button input safety release did not fully deliver; "
                 "state retained"
             )
 
@@ -985,9 +994,9 @@ class RC003App:
             self._logger.exception("cleanup: releasing the voice hotkey failed")
             failures.append("voice hotkey cleanup failed; state retained")
 
-        if not self._release_pending_button_keys():
+        if not self._release_pending_button_inputs():
             failures.append(
-                "ordinary button key safety release did not fully deliver; "
+                "ordinary button input safety release did not fully deliver; "
                 "state retained"
             )
 
@@ -1902,12 +1911,14 @@ class RC003App:
             self._apply_button_action_locked(action)
 
     def _apply_button_action_locked(self, action: key_mapping.ButtonAction) -> None:
-        if self._button_key_release_pending is not None:
-            if not self._release_pending_button_keys():
-                self._logger.info(
-                    "button action suppressed: an earlier key release is still pending"
-                )
-                return
+        if (
+            self._button_key_release_pending is not None
+            or self._button_mouse_release_pending is not None
+        ) and not self._release_pending_button_inputs():
+            self._logger.info(
+                "button action suppressed: an earlier input release is still pending"
+            )
+            return
 
         try:
             if action.kind == key_mapping.ActionKind.DISABLED:
@@ -1942,6 +1953,14 @@ class RC003App:
                 win32_input.send_volume_mute()
             elif action.kind == key_mapping.ActionKind.PLAY_PAUSE:
                 win32_input.send_play_pause()
+            elif action.kind in _BUTTON_ACTION_MOUSE_BUTTONS:
+                win32_input.send_mouse_button_click(
+                    _BUTTON_ACTION_MOUSE_BUTTONS[action.kind]
+                )
+            elif action.kind == key_mapping.ActionKind.MOUSE_WHEEL_UP:
+                win32_input.send_mouse_wheel(1)
+            elif action.kind == key_mapping.ActionKind.MOUSE_WHEEL_DOWN:
+                win32_input.send_mouse_wheel(-1)
             elif action.kind == key_mapping.ActionKind.ELEMENT_NAVIGATION_TOGGLE:
                 try:
                     result = (
@@ -1973,8 +1992,11 @@ class RC003App:
             tokens = self._button_action_key_tokens(action)
             if tokens is not None:
                 self._button_key_release_pending = tokens
+            mouse_button = _BUTTON_ACTION_MOUSE_BUTTONS.get(action.kind)
+            if mouse_button is not None:
+                self._button_mouse_release_pending = mouse_button
             self._logger.exception(
-                "button action failed and safety key-up remains pending"
+                "button action failed and safety input-up remains pending"
             )
         except OSError:
             self._logger.exception("button action failed to fully deliver")
@@ -2010,6 +2032,34 @@ class RC003App:
                 self._logger.info("button key safety release completed")
             self._button_key_release_pending = None
             return True
+
+    def _release_pending_button_mouse(self) -> bool:
+        with self._button_action_lock:
+            button = self._button_mouse_release_pending
+            if button is None:
+                return True
+            try:
+                win32_input.send_mouse_button_up(button)
+            except win32_input.InputCleanupIncompleteError:
+                self._logger.exception("button mouse safety release remains incomplete")
+                return False
+            except win32_input.Win32InputUnavailableError:
+                self._logger.info("button mouse safety release unavailable")
+                return False
+            except OSError:
+                self._logger.exception(
+                    "button mouse safety release needed fallback but completed"
+                )
+            else:
+                self._logger.info("button mouse safety release completed")
+            self._button_mouse_release_pending = None
+            return True
+
+    def _release_pending_button_inputs(self) -> bool:
+        with self._button_action_lock:
+            key_complete = self._release_pending_button_keys()
+            mouse_complete = self._release_pending_button_mouse()
+            return key_complete and mouse_complete
 
     # -- ATVV control-channel events (mic button + audio start/stop) ------
 

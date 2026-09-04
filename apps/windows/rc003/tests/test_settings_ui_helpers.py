@@ -57,6 +57,13 @@ class DisplayRoundTripTests(unittest.TestCase):
             "显示桌面": key_mapping.ActionKind.SHOW_DESKTOP,
             "右键菜单": key_mapping.ActionKind.CONTEXT_MENU,
             "应用切换": key_mapping.ActionKind.APP_SWITCHER,
+            "鼠标左键单击": key_mapping.ActionKind.MOUSE_LEFT_CLICK,
+            "鼠标右键单击": key_mapping.ActionKind.MOUSE_RIGHT_CLICK,
+            "鼠标中键单击": key_mapping.ActionKind.MOUSE_MIDDLE_CLICK,
+            "滚轮向上": key_mapping.ActionKind.MOUSE_WHEEL_UP,
+            "滚轮向下": key_mapping.ActionKind.MOUSE_WHEEL_DOWN,
+            "鼠标 X1 单击": key_mapping.ActionKind.MOUSE_X1_CLICK,
+            "鼠标 X2 单击": key_mapping.ActionKind.MOUSE_X2_CLICK,
             "元素导航开关": key_mapping.ActionKind.ELEMENT_NAVIGATION_TOGGLE,
         }
         for label, action_kind in expected.items():
@@ -90,6 +97,19 @@ class DisplayRoundTripTests(unittest.TestCase):
         self.assertNotIn("lctrl+win", flattened)
         self.assertNotIn("ralt", flattened)
         self.assertNotIn("ralt+space", flattened)
+        mouse_group = dict(settings_ui.ACTION_OPTION_GROUPS)["鼠标与导航"]
+        self.assertEqual(
+            mouse_group[:7],
+            (
+                "鼠标左键单击",
+                "鼠标右键单击",
+                "鼠标中键单击",
+                "滚轮向上",
+                "滚轮向下",
+                "鼠标 X1 单击",
+                "鼠标 X2 单击",
+            ),
+        )
 
     def test_legacy_alt_escape_app_switch_is_displayed_as_reference_action(self):
         action = key_mapping.ButtonAction(

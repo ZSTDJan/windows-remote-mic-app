@@ -58,6 +58,10 @@ class LiveInputSafetyGateTests(unittest.TestCase):
             with self.assertRaises(win32_input.Win32InputUnavailableError):
                 win32_input._real_send_virtual_key_input_batch([(0x41, False)])
             with self.assertRaises(win32_input.Win32InputUnavailableError):
+                win32_input._real_send_mouse_input_batch(
+                    [(win32_input._MOUSEEVENTF_LEFTDOWN, 0)]
+                )
+            with self.assertRaises(win32_input.Win32InputUnavailableError):
                 win32_input._real_keybd_event(0xA5, False)
 
 
@@ -323,6 +327,107 @@ class SendKeyComboTapTests(unittest.TestCase):
 
         with self.assertRaises(win32_input.Win32InputUnavailableError):
             win32_input.send_key_combo_tap(("a",), _sender=unavailable_sender)
+
+
+class MouseInputTests(unittest.TestCase):
+    def test_each_button_click_is_one_down_up_batch(self):
+        expected = {
+            "left": (
+                win32_input._MOUSEEVENTF_LEFTDOWN,
+                win32_input._MOUSEEVENTF_LEFTUP,
+                0,
+            ),
+            "right": (
+                win32_input._MOUSEEVENTF_RIGHTDOWN,
+                win32_input._MOUSEEVENTF_RIGHTUP,
+                0,
+            ),
+            "middle": (
+                win32_input._MOUSEEVENTF_MIDDLEDOWN,
+                win32_input._MOUSEEVENTF_MIDDLEUP,
+                0,
+            ),
+            "x1": (
+                win32_input._MOUSEEVENTF_XDOWN,
+                win32_input._MOUSEEVENTF_XUP,
+                win32_input._XBUTTON1,
+            ),
+            "x2": (
+                win32_input._MOUSEEVENTF_XDOWN,
+                win32_input._MOUSEEVENTF_XUP,
+                win32_input._XBUTTON2,
+            ),
+        }
+        for button, (down_flag, up_flag, mouse_data) in expected.items():
+            sender = RecordingSender()
+            win32_input.send_mouse_button_click(button, _sender=sender)
+            self.assertEqual(
+                sender.calls,
+                [[(down_flag, mouse_data), (up_flag, mouse_data)]],
+                button,
+            )
+
+    def test_partial_click_after_down_immediately_releases_the_button(self):
+        sender = RecordingSender(sent_counts=[1])
+        with self.assertRaises(OSError) as ctx:
+            win32_input.send_mouse_button_click("left", _sender=sender)
+        self.assertNotIsInstance(
+            ctx.exception, win32_input.InputCleanupIncompleteError
+        )
+        self.assertEqual(
+            sender.calls[1], [(win32_input._MOUSEEVENTF_LEFTUP, 0)]
+        )
+
+    def test_partial_click_retains_cleanup_error_when_release_still_fails(self):
+        sender = RecordingSender(sent_counts=[1, 0])
+        with self.assertRaises(win32_input.InputCleanupIncompleteError):
+            win32_input.send_mouse_button_click("x1", _sender=sender)
+        self.assertEqual(
+            sender.calls[1],
+            [(win32_input._MOUSEEVENTF_XUP, win32_input._XBUTTON1)],
+        )
+
+    def test_generic_click_failure_treats_delivery_as_unknown_and_releases(self):
+        sender = RaiseOnceThenRecordSender()
+        with self.assertRaises(OSError) as ctx:
+            win32_input.send_mouse_button_click("right", _sender=sender)
+        self.assertNotIsInstance(
+            ctx.exception, win32_input.InputCleanupIncompleteError
+        )
+        self.assertEqual(
+            sender.calls[1], [(win32_input._MOUSEEVENTF_RIGHTUP, 0)]
+        )
+
+    def test_mouse_up_retries_and_reports_completed_fallback(self):
+        sender = RecordingSender(sent_counts=[0, 1])
+        with self.assertRaises(OSError) as ctx:
+            win32_input.send_mouse_button_up("middle", _sender=sender)
+        self.assertNotIsInstance(
+            ctx.exception, win32_input.InputCleanupIncompleteError
+        )
+        self.assertEqual(len(sender.calls), 2)
+
+    def test_vertical_wheel_uses_one_windows_wheel_delta_per_click(self):
+        up_sender = RecordingSender()
+        down_sender = RecordingSender()
+        win32_input.send_mouse_wheel(1, _sender=up_sender)
+        win32_input.send_mouse_wheel(-1, _sender=down_sender)
+        self.assertEqual(
+            up_sender.calls,
+            [[(win32_input._MOUSEEVENTF_WHEEL, win32_input._WHEEL_DELTA)]],
+        )
+        self.assertEqual(
+            down_sender.calls,
+            [[(win32_input._MOUSEEVENTF_WHEEL, -win32_input._WHEEL_DELTA)]],
+        )
+
+    def test_unknown_button_and_zero_wheel_are_rejected_before_submission(self):
+        sender = RecordingSender()
+        with self.assertRaises(ValueError):
+            win32_input.send_mouse_button_click("unknown", _sender=sender)
+        with self.assertRaises(ValueError):
+            win32_input.send_mouse_wheel(0, _sender=sender)
+        self.assertEqual(sender.calls, [])
 
 
 class VoiceKeyComboTests(unittest.TestCase):

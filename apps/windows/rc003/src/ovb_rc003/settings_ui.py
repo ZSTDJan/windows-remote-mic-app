@@ -63,6 +63,13 @@ _REFERENCE_ACTION_LABELS: Dict[key_mapping.ActionKind, str] = {
     key_mapping.ActionKind.SYSTEM_VOLUME_DOWN: "系统音量 −",
     key_mapping.ActionKind.SYSTEM_VOLUME_MUTE: "系统静音",
     key_mapping.ActionKind.PLAY_PAUSE: "播放 / 暂停",
+    key_mapping.ActionKind.MOUSE_LEFT_CLICK: "鼠标左键单击",
+    key_mapping.ActionKind.MOUSE_RIGHT_CLICK: "鼠标右键单击",
+    key_mapping.ActionKind.MOUSE_MIDDLE_CLICK: "鼠标中键单击",
+    key_mapping.ActionKind.MOUSE_WHEEL_UP: "滚轮向上",
+    key_mapping.ActionKind.MOUSE_WHEEL_DOWN: "滚轮向下",
+    key_mapping.ActionKind.MOUSE_X1_CLICK: "鼠标 X1 单击",
+    key_mapping.ActionKind.MOUSE_X2_CLICK: "鼠标 X2 单击",
     key_mapping.ActionKind.ELEMENT_NAVIGATION_TOGGLE: "元素导航开关",
     key_mapping.ActionKind.OPEN_REMOTE_MIC: _OPEN_APPLICATION_DISPLAY,
     key_mapping.ActionKind.OPEN_CODEX: "打开 Codex",
@@ -101,7 +108,14 @@ ACTION_OPTION_GROUPS: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
             "tab", "space", "f5",
         ),
     ),
-    ("鼠标与导航", ("元素导航开关", "右键菜单")),
+    (
+        "鼠标与导航",
+        (
+            "鼠标左键单击", "鼠标右键单击", "鼠标中键单击",
+            "滚轮向上", "滚轮向下", "鼠标 X1 单击", "鼠标 X2 单击",
+            "元素导航开关", "右键菜单",
+        ),
+    ),
     (
         "系统与媒体",
         (

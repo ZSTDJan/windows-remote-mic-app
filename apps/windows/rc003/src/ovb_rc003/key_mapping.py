@@ -53,6 +53,13 @@ class ActionKind(str, Enum):
     SYSTEM_VOLUME_DOWN = "system_volume_down"
     SYSTEM_VOLUME_MUTE = "system_volume_mute"
     PLAY_PAUSE = "play_pause"
+    MOUSE_LEFT_CLICK = "mouse_left_click"
+    MOUSE_RIGHT_CLICK = "mouse_right_click"
+    MOUSE_MIDDLE_CLICK = "mouse_middle_click"
+    MOUSE_WHEEL_UP = "mouse_wheel_up"
+    MOUSE_WHEEL_DOWN = "mouse_wheel_down"
+    MOUSE_X1_CLICK = "mouse_x1_click"
+    MOUSE_X2_CLICK = "mouse_x2_click"
     ELEMENT_NAVIGATION_TOGGLE = "element_navigation_toggle"
     # ``VOICE`` and ``VOICE_TOGGLE`` remain parseable only so schema-1 files
     # can be failed closed with an explicit migration notice. They are not
@@ -209,6 +216,8 @@ REPEATABLE_ACTIONS = frozenset(
         ActionKind.DELETE_BACKWARD,
         ActionKind.SYSTEM_VOLUME_UP,
         ActionKind.SYSTEM_VOLUME_DOWN,
+        ActionKind.MOUSE_WHEEL_UP,
+        ActionKind.MOUSE_WHEEL_DOWN,
     }
 )
 
