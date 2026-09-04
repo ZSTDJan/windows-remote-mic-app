@@ -163,10 +163,12 @@ class RC003App:
             self._bindings,
         )
         self._bindings_mtime_ns = self._settings_file_mtime_ns(self._bindings_path)
+        self._button_mapping_lock = threading.RLock()
         self._button_gestures = button_gesture.ButtonGestureDispatcher(
             is_action_configured=self._is_button_action_configured,
             is_repeatable=self._is_button_repeatable,
             on_trigger=self._on_button_trigger,
+            on_idle=self._apply_pending_settings_if_idle,
         )
         self._button_combos = button_combo.ButtonComboRecognizer()
         self._logger: logging.Logger = logging_setup.get_logger(self._config_root)
@@ -1402,6 +1404,12 @@ class RC003App:
             or self._voice_hotkey_release_pending is not None
         )
 
+    def _ordinary_button_mappings_idle(self) -> bool:
+        return not (
+            self._button_gestures.has_active_gestures()
+            or self._button_combos.has_active_combo()
+        )
+
     def _apply_voice_settings_locked(
         self,
         trigger_mode: key_mapping.VoiceTriggerMode,
@@ -1429,17 +1437,27 @@ class RC003App:
             trigger_mode, voice_hotkey = self._pending_voice_settings
             self._pending_voice_settings = None
             self._apply_voice_settings_locked(trigger_mode, voice_hotkey)
-        if self._pending_bindings is not None:
-            self._button_combos.reset()
-            self._bindings = self._pending_bindings
-            self._pending_bindings = None
-            self._sync_physical_bindings_to_listener(self._bindings)
-            self._removed_voice_bindings = dict(
-                self._bindings.get(config.RUNTIME_REMOVED_VOICE_BINDINGS_KEY, {})
-            )
-            self._logger.info(
-                "deferred settings mappings applied after voice became idle"
-            )
+        if (
+            self._pending_bindings is not None
+        ):
+            with self._button_mapping_lock:
+                if self._ordinary_button_mappings_idle():
+                    self._button_combos.reset()
+                    self._bindings = self._pending_bindings
+                    self._pending_bindings = None
+                    self._sync_physical_bindings_to_listener(self._bindings)
+                    self._removed_voice_bindings = dict(
+                        self._bindings.get(
+                            config.RUNTIME_REMOVED_VOICE_BINDINGS_KEY, {}
+                        )
+                    )
+                    self._logger.info(
+                        "deferred settings mappings applied after active input became idle"
+                    )
+
+    def _apply_pending_settings_if_idle(self) -> None:
+        with self._voice_trigger_lock:
+            self._apply_pending_voice_settings_if_idle_locked()
 
     def _reload_settings_if_changed(self) -> None:
         """Apply mapping and voice-setting edits without a bridge restart."""
@@ -1475,31 +1493,38 @@ class RC003App:
             return
 
         with self._voice_trigger_lock:
-            refreshed_settings = (trigger_mode, voice_hotkey.serialize())
-            current_settings = (
-                self._voice.trigger_mode,
-                self._voice_hotkey.serialize(),
-            )
-            if self._voice_settings_idle_locked():
-                self._config = refreshed_config
-                self._button_combos.reset()
-                self._bindings = refreshed_bindings
-                self._sync_physical_bindings_to_listener(self._bindings)
-                self._removed_voice_bindings = removed_voice_bindings
-                self._pending_config = None
-                self._pending_bindings = None
-                self._pending_voice_settings = None
-                if refreshed_settings != current_settings:
-                    self._apply_voice_settings_locked(trigger_mode, voice_hotkey)
-            else:
-                self._pending_config = refreshed_config
-                self._pending_bindings = refreshed_bindings
-                self._pending_voice_settings = (trigger_mode, voice_hotkey)
-                self._logger.info(
-                    "settings reload deferred until active voice session is idle"
+            with self._button_mapping_lock:
+                refreshed_settings = (trigger_mode, voice_hotkey.serialize())
+                current_settings = (
+                    self._voice.trigger_mode,
+                    self._voice_hotkey.serialize(),
                 )
-            self._config_mtime_ns = current_config_mtime_ns
-            self._bindings_mtime_ns = current_bindings_mtime_ns
+                if self._voice_settings_idle_locked():
+                    self._config = refreshed_config
+                    self._pending_config = None
+                    self._pending_voice_settings = None
+                    if refreshed_settings != current_settings:
+                        self._apply_voice_settings_locked(trigger_mode, voice_hotkey)
+                    if self._ordinary_button_mappings_idle():
+                        self._button_combos.reset()
+                        self._bindings = refreshed_bindings
+                        self._sync_physical_bindings_to_listener(self._bindings)
+                        self._removed_voice_bindings = removed_voice_bindings
+                        self._pending_bindings = None
+                    else:
+                        self._pending_bindings = refreshed_bindings
+                        self._logger.info(
+                            "settings mapping reload deferred until active input is idle"
+                        )
+                else:
+                    self._pending_config = refreshed_config
+                    self._pending_bindings = refreshed_bindings
+                    self._pending_voice_settings = (trigger_mode, voice_hotkey)
+                    self._logger.info(
+                        "settings reload deferred until active voice session is idle"
+                    )
+                self._config_mtime_ns = current_config_mtime_ns
+                self._bindings_mtime_ns = current_bindings_mtime_ns
         if removed_voice_bindings:
             self._logger.warning(
                 "legacy voice mappings disabled until user reselects actions: %s",
@@ -1558,12 +1583,11 @@ class RC003App:
             )
         if not dispatch:
             return
-        if is_pressed:
-            self._button_gestures.press("mic")
-        else:
-            self._button_gestures.release("mic")
-            with self._voice_trigger_lock:
-                self._apply_pending_voice_settings_if_idle_locked()
+        with self._button_mapping_lock:
+            if is_pressed:
+                self._button_gestures.press("mic")
+            else:
+                self._button_gestures.release("mic")
 
     def _on_button_event(
         self,
@@ -1661,29 +1685,40 @@ class RC003App:
             return
         if button_id == "mic" and self._ordinary_mic_gesture_active:
             self._handle_ordinary_mic_edge(event_source, is_pressed)
+            self._apply_pending_settings_if_idle()
             return
         self._reload_settings_if_changed()
 
-        if button_id in self._removed_voice_bindings:
-            if not is_pressed:
-                self._button_gestures.release(button_id)
+        with self._button_mapping_lock:
+            removed_voice_binding = button_id in self._removed_voice_bindings
+            ordinary_mic_handled = False
+            if removed_voice_binding:
+                if not is_pressed:
+                    self._button_gestures.release(button_id)
+                else:
+                    self._logger.warning(
+                        "button action suppressed until removed voice mapping is reselected: %s",
+                        button_id,
+                    )
+                primary_action = None
+                voice_mode = None
             else:
-                self._logger.warning(
-                    "button action suppressed until removed voice mapping is reselected: %s",
+                primary_action = self._primary_button_action(button_id)
+                voice_mode = self._voice_mode_for_primary_button(
                     button_id,
+                    primary_action,
                 )
+                if button_id == "mic" and voice_mode is None:
+                    self._handle_ordinary_mic_edge(event_source, is_pressed)
+                    ordinary_mic_handled = True
+        if removed_voice_binding:
+            self._apply_pending_settings_if_idle()
+            return
+        if ordinary_mic_handled:
+            self._apply_pending_settings_if_idle()
             return
 
-        primary_action = self._primary_button_action(button_id)
-        voice_mode = self._voice_mode_for_primary_button(
-            button_id,
-            primary_action,
-        )
-
         if button_id == "mic":
-            if voice_mode is None:
-                self._handle_ordinary_mic_edge(event_source, is_pressed)
-                return
             if not is_pressed:
                 with self._voice_trigger_lock:
                     source_was_down = (
@@ -1772,25 +1807,27 @@ class RC003App:
                     self._voice_raw_input_trigger_pending = False
             return
 
-        modifier = key_mapping.button_combo_modifier(self._bindings)
-        configured_combo_buttons = frozenset(
-            candidate
-            for candidate in key_mapping.COMBO_ACTION_BUTTON_IDS
-            if key_mapping.button_combo_action_for(
-                self._bindings, candidate
-            ).kind
-            != key_mapping.ActionKind.DISABLED
-        )
-        commands = (
-            self._button_combos.press(
-                button_id,
-                modifier=modifier,
-                configured_buttons=configured_combo_buttons,
+        with self._button_mapping_lock:
+            modifier = key_mapping.button_combo_modifier(self._bindings)
+            configured_combo_buttons = frozenset(
+                candidate
+                for candidate in key_mapping.COMBO_ACTION_BUTTON_IDS
+                if key_mapping.button_combo_action_for(
+                    self._bindings, candidate
+                ).kind
+                != key_mapping.ActionKind.DISABLED
             )
-            if is_pressed
-            else self._button_combos.release(button_id)
-        )
-        self._dispatch_button_combo_commands(commands)
+            commands = (
+                self._button_combos.press(
+                    button_id,
+                    modifier=modifier,
+                    configured_buttons=configured_combo_buttons,
+                )
+                if is_pressed
+                else self._button_combos.release(button_id)
+            )
+            self._dispatch_button_combo_commands(commands)
+        self._apply_pending_settings_if_idle()
 
     def _dispatch_button_combo_commands(
         self, commands: List[button_combo.ComboCommand]
@@ -1871,40 +1908,45 @@ class RC003App:
     def _on_button_trigger(
         self, button_id: str, trigger: button_gesture.ButtonTrigger
     ) -> None:
-        self._reload_settings_if_changed()
-        if button_id in self._removed_voice_bindings:
-            self._logger.warning(
-                "delayed button gesture suppressed until removed voice mapping "
-                "is reselected: %s",
+        with self._button_mapping_lock:
+            if button_id in self._removed_voice_bindings:
+                self._logger.warning(
+                    "delayed button gesture suppressed until removed voice mapping "
+                    "is reselected: %s",
+                    button_id,
+                )
+                return
+            action = key_mapping.button_action_for(
+                self._bindings,
                 button_id,
+                key_mapping.ButtonTrigger(trigger.value),
             )
-            return
-        action = key_mapping.button_action_for(
-            self._bindings,
-            button_id,
-            key_mapping.ButtonTrigger(trigger.value),
-        )
-        try:
-            if action.kind == key_mapping.ActionKind.KEY_COMBO:
-                win32_keys.resolve_vk_codes(action.keys)
-        except (KeyError, TypeError, ValueError, win32_keys.UnknownKeyTokenError):
-            # A hand-edited or partially corrupted bindings file must disable
-            # only the affected button, never escape the Raw Input callback
-            # and tear down ordinary-button processing for the whole device.
-            self._logger.warning(
-                "invalid button binding ignored: button=%s trigger=%s",
-                button_id,
-                trigger.value,
-            )
-            return
-        if key_mapping.is_voice_action(action):
-            self._logger.warning(
-                "secondary voice action ignored: button=%s trigger=%s",
-                button_id,
-                trigger.value,
-            )
-            return
-        self._apply_button_action(action)
+            try:
+                if action.kind == key_mapping.ActionKind.KEY_COMBO:
+                    win32_keys.resolve_vk_codes(action.keys)
+            except (
+                KeyError,
+                TypeError,
+                ValueError,
+                win32_keys.UnknownKeyTokenError,
+            ):
+                # A hand-edited or partially corrupted bindings file must disable
+                # only the affected button, never escape the Raw Input callback
+                # and tear down ordinary-button processing for the whole device.
+                self._logger.warning(
+                    "invalid button binding ignored: button=%s trigger=%s",
+                    button_id,
+                    trigger.value,
+                )
+                return
+            if key_mapping.is_voice_action(action):
+                self._logger.warning(
+                    "secondary voice action ignored: button=%s trigger=%s",
+                    button_id,
+                    trigger.value,
+                )
+                return
+            self._apply_button_action(action)
 
     def _apply_button_action(self, action: key_mapping.ButtonAction) -> None:
         with self._button_action_lock:
@@ -1986,6 +2028,10 @@ class RC003App:
                     )
             # Voice actions are edge-driven in _on_button_event and never
             # enter this tap-only ordinary action executor.
+        except win32_input.MouseButtonInUseError:
+            self._logger.info(
+                "mouse button action skipped: the physical button is already held"
+            )
         except win32_input.Win32InputUnavailableError:
             self._logger.info("button action skipped: SendInput unavailable here")
         except win32_input.InputCleanupIncompleteError:

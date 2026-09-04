@@ -98,6 +98,22 @@ class _FakeInputOwner:
             raise RuntimeError("simulated input owner that did not stop")
 
 
+class _ManualTimer:
+    def __init__(self, callback):
+        self.callback = callback
+        self.cancelled = False
+
+    def start(self):
+        pass
+
+    def cancel(self):
+        self.cancelled = True
+
+    def fire(self):
+        if not self.cancelled:
+            self.callback()
+
+
 class _FakePlaybackSink:
     def __init__(self, fail_write=False, close_raises=False):
         self.fail_write = fail_write
@@ -293,6 +309,21 @@ class StartupIdentityLoggingTests(unittest.TestCase):
 
 
 class LiveSettingsReloadTests(_AppWiringTestCase):
+    def _use_manual_gesture_timers(self):
+        timers = []
+
+        def timer_factory(_delay, callback):
+            timer = _ManualTimer(callback)
+            timers.append(timer)
+            return timer
+
+        self.app._button_gestures._timer_factory = timer_factory
+        return timers
+
+    def _save_button_bindings(self, bindings):
+        config.save_key_bindings(self.app._bindings_path, bindings)
+        self.app._reload_settings_if_changed()
+
     def test_zero_voice_blank_shortcuts_construct_without_crashing(self):
         stored_config = config.default_config()
         stored_config["voice_hotkey"] = ""
@@ -392,6 +423,249 @@ class LiveSettingsReloadTests(_AppWiringTestCase):
         self.assertEqual(self.app._voice.trigger_mode, key_mapping.VoiceTriggerMode.HOLD)
         self.assertEqual(self.app._voice_hotkey.serialize(), "ralt")
         self.assertIsNone(self.app._pending_voice_settings)
+
+    def test_delayed_single_click_keeps_the_mapping_owned_at_first_press(self):
+        timers = self._use_manual_gesture_timers()
+        original = config.default_key_bindings()
+        original["bindings"]["up"] = key_mapping.ButtonAction(
+            key_mapping.ActionKind.ESCAPE
+        ).to_dict()
+        original["secondary_bindings"]["up"] = {
+            "double_click": key_mapping.ButtonAction(
+                key_mapping.ActionKind.RETURN
+            ).to_dict()
+        }
+        self._save_button_bindings(original)
+
+        self.app._on_button_event("up", True, event_source="hid")
+        self.app._on_button_event("up", False, event_source="hid")
+        changed = config.load_key_bindings(self.app._bindings_path)
+        changed["bindings"]["up"] = key_mapping.ButtonAction(
+            key_mapping.ActionKind.MOUSE_LEFT_CLICK
+        ).to_dict()
+        self._save_button_bindings(changed)
+        self.assertIsNotNone(self.app._pending_bindings)
+
+        with mock.patch.object(win32_input, "send_escape") as old_action, mock.patch.object(
+            win32_input, "send_mouse_button_click"
+        ) as new_action:
+            timers[0].fire()
+
+        old_action.assert_called_once_with()
+        new_action.assert_not_called()
+        self.assertIsNone(self.app._pending_bindings)
+        self.assertEqual(
+            self.app._bindings["bindings"]["up"]["kind"],
+            key_mapping.ActionKind.MOUSE_LEFT_CLICK.value,
+        )
+
+    def test_delayed_callback_reservation_blocks_a_concurrent_mapping_swap(self):
+        timers = self._use_manual_gesture_timers()
+        original = config.default_key_bindings()
+        original["bindings"]["up"] = key_mapping.ButtonAction(
+            key_mapping.ActionKind.ESCAPE
+        ).to_dict()
+        original["secondary_bindings"]["up"] = {
+            "double_click": key_mapping.ButtonAction(
+                key_mapping.ActionKind.RETURN
+            ).to_dict()
+        }
+        self._save_button_bindings(original)
+        self.app._on_button_event("up", True, event_source="hid")
+        self.app._on_button_event("up", False, event_source="hid")
+
+        changed = config.load_key_bindings(self.app._bindings_path)
+        changed["bindings"]["up"] = key_mapping.ButtonAction(
+            key_mapping.ActionKind.MOUSE_LEFT_CLICK
+        ).to_dict()
+        config.save_key_bindings(self.app._bindings_path, changed)
+
+        entered = threading.Event()
+        release = threading.Event()
+        original_trigger = self.app._button_gestures._on_trigger
+
+        def blocking_trigger(button_id, trigger):
+            entered.set()
+            release.wait(1.0)
+            original_trigger(button_id, trigger)
+
+        self.app._button_gestures._on_trigger = blocking_trigger
+        with mock.patch.object(win32_input, "send_escape") as old_action, mock.patch.object(
+            win32_input, "send_mouse_button_click"
+        ) as new_action:
+            worker = threading.Thread(target=timers[0].fire)
+            worker.start()
+            self.assertTrue(entered.wait(1.0))
+
+            self.app._reload_settings_if_changed()
+            self.assertIsNotNone(self.app._pending_bindings)
+            release.set()
+            worker.join(1.0)
+
+        self.assertFalse(worker.is_alive())
+        old_action.assert_called_once_with()
+        new_action.assert_not_called()
+        self.assertIsNone(self.app._pending_bindings)
+
+    def test_mapping_swap_serializes_with_a_new_physical_gesture(self):
+        timers = self._use_manual_gesture_timers()
+        original = config.default_key_bindings()
+        original["bindings"]["up"] = key_mapping.ButtonAction(
+            key_mapping.ActionKind.ESCAPE
+        ).to_dict()
+        original["secondary_bindings"]["up"] = {
+            "double_click": key_mapping.ButtonAction(
+                key_mapping.ActionKind.RETURN
+            ).to_dict()
+        }
+        self._save_button_bindings(original)
+
+        changed = config.load_key_bindings(self.app._bindings_path)
+        changed["bindings"]["up"] = key_mapping.ButtonAction(
+            key_mapping.ActionKind.MOUSE_LEFT_CLICK
+        ).to_dict()
+        config.save_key_bindings(self.app._bindings_path, changed)
+
+        original_reload = self.app._reload_settings_if_changed
+        input_passed_reload = threading.Event()
+        allow_input_dispatch = threading.Event()
+        input_dispatching = threading.Event()
+        reload_checked_idle = threading.Event()
+        allow_mapping_swap = threading.Event()
+
+        def routed_reload():
+            if threading.current_thread().name == "mapping-input":
+                input_passed_reload.set()
+                allow_input_dispatch.wait(1.0)
+                input_dispatching.set()
+                return
+            original_reload()
+
+        original_idle = self.app._ordinary_button_mappings_idle
+
+        def pause_after_idle_check():
+            result = original_idle()
+            reload_checked_idle.set()
+            allow_mapping_swap.wait(1.0)
+            return result
+
+        with mock.patch.object(
+            self.app, "_reload_settings_if_changed", side_effect=routed_reload
+        ), mock.patch.object(
+            self.app,
+            "_ordinary_button_mappings_idle",
+            side_effect=pause_after_idle_check,
+        ):
+            input_worker = threading.Thread(
+                target=self.app._on_button_event,
+                args=("up", True),
+                kwargs={"event_source": "hid"},
+                name="mapping-input",
+            )
+            input_worker.start()
+            self.assertTrue(input_passed_reload.wait(1.0))
+
+            reload_worker = threading.Thread(target=original_reload)
+            reload_worker.start()
+            self.assertTrue(reload_checked_idle.wait(1.0))
+            allow_input_dispatch.set()
+            self.assertTrue(input_dispatching.wait(1.0))
+            self.assertTrue(input_worker.is_alive())
+
+            allow_mapping_swap.set()
+            reload_worker.join(1.0)
+            input_worker.join(1.0)
+
+        self.assertFalse(reload_worker.is_alive())
+        self.assertFalse(input_worker.is_alive())
+        self.app._on_button_event("up", False, event_source="hid")
+        with mock.patch.object(win32_input, "send_mouse_button_click") as new_action:
+            timers[0].fire()
+        new_action.assert_called_once_with("left")
+
+    def test_long_press_keeps_old_mapping_until_physical_release(self):
+        timers = self._use_manual_gesture_timers()
+        original = config.default_key_bindings()
+        original["secondary_bindings"]["ok"] = {
+            "long_press": key_mapping.ButtonAction(
+                key_mapping.ActionKind.ESCAPE
+            ).to_dict()
+        }
+        self._save_button_bindings(original)
+
+        self.app._on_button_event("ok", True, event_source="hid")
+        changed = config.load_key_bindings(self.app._bindings_path)
+        changed["secondary_bindings"]["ok"]["long_press"] = (
+            key_mapping.ButtonAction(
+                key_mapping.ActionKind.MOUSE_LEFT_CLICK
+            ).to_dict()
+        )
+        self._save_button_bindings(changed)
+
+        with mock.patch.object(win32_input, "send_escape") as old_action, mock.patch.object(
+            win32_input, "send_mouse_button_click"
+        ) as new_action:
+            timers[0].fire()
+            self.assertIsNotNone(self.app._pending_bindings)
+            self.app._on_button_event("ok", False, event_source="hid")
+
+        old_action.assert_called_once_with()
+        new_action.assert_not_called()
+        self.assertIsNone(self.app._pending_bindings)
+
+    def test_repeat_keeps_old_mapping_for_the_whole_hold(self):
+        timers = self._use_manual_gesture_timers()
+        original = config.default_key_bindings()
+        self._save_button_bindings(original)
+
+        with mock.patch.object(win32_input, "send_arrow_up") as old_action, mock.patch.object(
+            win32_input, "send_mouse_wheel"
+        ) as new_action:
+            self.app._on_button_event("up", True, event_source="hid")
+            changed = config.load_key_bindings(self.app._bindings_path)
+            changed["bindings"]["up"] = key_mapping.ButtonAction(
+                key_mapping.ActionKind.MOUSE_WHEEL_UP
+            ).to_dict()
+            self._save_button_bindings(changed)
+            timers[0].fire()
+            self.app._on_button_event("up", False, event_source="hid")
+
+        self.assertEqual(old_action.call_count, 2)
+        new_action.assert_not_called()
+        self.assertIsNone(self.app._pending_bindings)
+
+    def test_button_combo_keeps_old_action_until_both_buttons_release(self):
+        original = config.default_key_bindings()
+        original["combo_bindings"] = {
+            "modifier": "tv",
+            "bindings": {
+                "up": key_mapping.ButtonAction(
+                    key_mapping.ActionKind.ESCAPE
+                ).to_dict()
+            },
+            "display_notes": {},
+        }
+        self._save_button_bindings(original)
+
+        self.app._on_button_event("tv", True, event_source="hid")
+        changed = config.load_key_bindings(self.app._bindings_path)
+        changed["combo_bindings"]["bindings"]["up"] = (
+            key_mapping.ButtonAction(
+                key_mapping.ActionKind.MOUSE_LEFT_CLICK
+            ).to_dict()
+        )
+        self._save_button_bindings(changed)
+
+        with mock.patch.object(win32_input, "send_escape") as old_action, mock.patch.object(
+            win32_input, "send_mouse_button_click"
+        ) as new_action:
+            self.app._on_button_event("up", True, event_source="hid")
+            self.app._on_button_event("up", False, event_source="hid")
+            self.app._on_button_event("tv", False, event_source="hid")
+
+        old_action.assert_called_once_with()
+        new_action.assert_not_called()
+        self.assertIsNone(self.app._pending_bindings)
 
 
 class CandidateResolutionWiringTests(_AppWiringTestCase):
@@ -1186,6 +1460,18 @@ class OrdinaryButtonGestureWiringTests(_AppWiringTestCase):
 
         self.assertEqual(button_calls, ["left", "right", "middle", "x1", "x2"])
         self.assertEqual(wheel_calls, [1, -1])
+
+    def test_physical_mouse_hold_skips_click_without_recording_cleanup_debt(self):
+        with mock.patch.object(
+            win32_input,
+            "send_mouse_button_click",
+            side_effect=win32_input.MouseButtonInUseError("physical hold"),
+        ):
+            self.app._apply_button_action(
+                key_mapping.ButtonAction(key_mapping.ActionKind.MOUSE_LEFT_CLICK)
+            )
+
+        self.assertIsNone(self.app._button_mouse_release_pending)
 
     def test_incomplete_mouse_click_is_retained_and_released_before_next_action(self):
         actions = []

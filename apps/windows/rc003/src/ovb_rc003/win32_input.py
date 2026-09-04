@@ -66,6 +66,11 @@ _MOUSEEVENTF_WHEEL = 0x0800
 _XBUTTON1 = 0x0001
 _XBUTTON2 = 0x0002
 _WHEEL_DELTA = 120
+_VK_LBUTTON = 0x01
+_VK_RBUTTON = 0x02
+_VK_MBUTTON = 0x04
+_VK_XBUTTON1 = 0x05
+_VK_XBUTTON2 = 0x06
 
 # Real x64 Win32 ``INPUT`` struct shape (fixed after XRBM-014 review round 2
 # P1 #1: the union previously declared only ``KEYBDINPUT``, so
@@ -164,6 +169,7 @@ _PHYSICAL_SCAN_CODES = {
 RawSender = Callable[[Sequence[Tuple[int, bool]]], int]
 MouseEvent = Tuple[int, int]
 MouseSender = Callable[[Sequence[MouseEvent]], int]
+MouseButtonDownQuery = Callable[[str], bool]
 VoiceSender = Callable[[int, bool], None]
 
 _MOUSE_BUTTON_EVENTS = {
@@ -172,6 +178,14 @@ _MOUSE_BUTTON_EVENTS = {
     "middle": (_MOUSEEVENTF_MIDDLEDOWN, _MOUSEEVENTF_MIDDLEUP, 0),
     "x1": (_MOUSEEVENTF_XDOWN, _MOUSEEVENTF_XUP, _XBUTTON1),
     "x2": (_MOUSEEVENTF_XDOWN, _MOUSEEVENTF_XUP, _XBUTTON2),
+}
+
+_MOUSE_BUTTON_VK_CODES = {
+    "left": _VK_LBUTTON,
+    "right": _VK_RBUTTON,
+    "middle": _VK_MBUTTON,
+    "x1": _VK_XBUTTON1,
+    "x2": _VK_XBUTTON2,
 }
 
 _voice_backend: Optional[str] = None
@@ -196,6 +210,10 @@ class InputCleanupIncompleteError(OSError):
     as an ordinary delivery failure can strand Alt/Ctrl/Win logically down
     while the application forgets that it still owes cleanup.
     """
+
+
+class MouseButtonInUseError(OSError):
+    """Raised when a real mouse already owns the requested button."""
 
 
 def _require_windows() -> None:
@@ -325,6 +343,19 @@ def _mouse_button_event(button: str, *, key_up: bool) -> MouseEvent:
     return (up_flag if key_up else down_flag, mouse_data)
 
 
+def _real_mouse_button_is_down(button: str) -> bool:
+    try:
+        vk_code = _MOUSE_BUTTON_VK_CODES[button]
+    except KeyError as exc:
+        raise ValueError(f"unsupported mouse button: {button}") from exc
+    _require_windows()
+    _require_live_input_allowed()
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    user32.GetAsyncKeyState.argtypes = (ctypes.c_int,)
+    user32.GetAsyncKeyState.restype = ctypes.c_short
+    return bool(user32.GetAsyncKeyState(vk_code) & 0x8000)
+
+
 def _best_effort_mouse_release(button: str, sender: MouseSender) -> bool:
     try:
         sent = sender([_mouse_button_event(button, key_up=True)])
@@ -334,7 +365,10 @@ def _best_effort_mouse_release(button: str, sender: MouseSender) -> bool:
 
 
 def send_mouse_button_click(
-    button: str, *, _sender: Optional[MouseSender] = None
+    button: str,
+    *,
+    _sender: Optional[MouseSender] = None,
+    _button_down_query: Optional[MouseButtonDownQuery] = None,
 ) -> None:
     """Click one physical mouse button at the current pointer position.
 
@@ -349,6 +383,13 @@ def send_mouse_button_click(
         _mouse_button_event(button, key_up=False),
         _mouse_button_event(button, key_up=True),
     ]
+    button_down_query = _button_down_query
+    if button_down_query is None and _sender is None:
+        button_down_query = _real_mouse_button_is_down
+    if button_down_query is not None and button_down_query(button):
+        raise MouseButtonInUseError(
+            f"mouse {button} is already held by physical input"
+        )
     try:
         sent = sender(events)
     except Win32InputUnavailableError:

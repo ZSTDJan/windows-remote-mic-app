@@ -233,6 +233,128 @@ class SpatialNavigationTests(unittest.TestCase):
         )
         self.assertLess(dpi_call_line, platform_import_line)
 
+    def test_windows_host_mouse_click_uses_one_confirmed_batch(self):
+        host = prototype._load_element_navigation_windows_host()
+        calls = []
+
+        host._send_mouse_click_safely(
+            "left",
+            is_button_down=lambda _button: False,
+            send_events=lambda events: calls.append(list(events)) or len(events),
+        )
+
+        self.assertEqual(
+            calls,
+            [[(host._MOUSEEVENTF_LEFTDOWN, 0), (host._MOUSEEVENTF_LEFTUP, 0)]],
+        )
+
+    def test_windows_host_mouse_click_refuses_to_interrupt_a_physical_hold(self):
+        host = prototype._load_element_navigation_windows_host()
+        calls = []
+
+        with self.assertRaises(host.MouseInputBusyError):
+            host._send_mouse_click_safely(
+                "right",
+                is_button_down=lambda _button: True,
+                send_events=lambda events: calls.append(list(events)) or len(events),
+            )
+
+        self.assertEqual(calls, [])
+
+    def test_windows_host_busy_click_does_not_move_the_pointer(self):
+        host = prototype._load_element_navigation_windows_host()
+        moves = []
+        calls = []
+
+        with self.assertRaises(host.MouseInputBusyError):
+            host._move_and_click_safely(
+                (120, 80),
+                "left",
+                is_button_down=lambda _button: True,
+                move_pointer=lambda point: moves.append(point) or True,
+                send_events=lambda events: calls.append(list(events)) or len(events),
+            )
+
+        self.assertEqual(moves, [])
+        self.assertEqual(calls, [])
+
+    def test_windows_host_busy_wheel_does_not_move_the_pointer(self):
+        host = prototype._load_element_navigation_windows_host()
+        moves = []
+        calls = []
+
+        with self.assertRaises(host.MouseInputBusyError):
+            host._move_and_wheel_safely(
+                (120, 80),
+                1,
+                pointer_move_is_blocked=lambda: True,
+                move_pointer=lambda point: moves.append(point) or True,
+                send_events=lambda events: calls.append(list(events)) or len(events),
+            )
+
+        self.assertEqual(moves, [])
+        self.assertEqual(calls, [])
+
+    def test_windows_host_partial_mouse_click_attempts_a_release(self):
+        host = prototype._load_element_navigation_windows_host()
+        calls = []
+        sent_counts = iter((1, 1))
+
+        with self.assertRaises(host.MouseInputDeliveryError):
+            host._send_mouse_click_safely(
+                "left",
+                is_button_down=lambda _button: False,
+                send_events=lambda events: (
+                    calls.append(list(events)) or next(sent_counts)
+                ),
+            )
+
+        self.assertEqual(calls[1], [(host._MOUSEEVENTF_LEFTUP, 0)])
+
+    def test_windows_host_retains_an_unconfirmed_release_until_it_succeeds(self):
+        host = prototype._load_element_navigation_windows_host()
+        state = host._MouseInputSafetyState()
+        wheel_calls = []
+        failed_release = lambda _events: 0
+        sent_counts = iter((1, 0))
+
+        with self.assertRaises(host.MouseInputCleanupIncompleteError) as ctx:
+            host._send_mouse_click_safely(
+                "left",
+                is_button_down=lambda _button: False,
+                send_events=lambda _events: next(sent_counts),
+            )
+        state.pending_button = ctx.exception.button
+
+        with self.assertRaises(host.MouseInputCleanupIncompleteError):
+            state.run(
+                lambda: wheel_calls.append("wheel"),
+                send_events=failed_release,
+            )
+        self.assertEqual(wheel_calls, [])
+        self.assertEqual(state.pending_button, "left")
+
+        state.run(
+            lambda: wheel_calls.append("wheel"),
+            send_events=lambda _events: 1,
+        )
+        self.assertEqual(wheel_calls, ["wheel"])
+        self.assertIsNone(state.pending_button)
+
+    def test_windows_host_wheel_requires_confirmed_delivery(self):
+        host = prototype._load_element_navigation_windows_host()
+        calls = []
+
+        host._send_mouse_wheel_safely(
+            -2,
+            send_events=lambda events: calls.append(list(events)) or 1,
+        )
+
+        self.assertEqual(
+            calls,
+            [[(host._MOUSEEVENTF_WHEEL, -2 * host._MOUSE_WHEEL_DELTA)]],
+        )
+
     def test_windows_host_loads_without_importing_uia_or_qt(self):
         code = f"""
 import importlib.util

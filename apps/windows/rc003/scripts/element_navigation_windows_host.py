@@ -27,6 +27,182 @@ from element_navigation_command_windows import (
 )
 
 
+_MOUSEEVENTF_LEFTDOWN = 0x0002
+_MOUSEEVENTF_LEFTUP = 0x0004
+_MOUSEEVENTF_RIGHTDOWN = 0x0008
+_MOUSEEVENTF_RIGHTUP = 0x0010
+_MOUSEEVENTF_WHEEL = 0x0800
+_MOUSE_WHEEL_DELTA = 120
+_MOUSE_BUTTON_EVENTS = {
+    "left": (_MOUSEEVENTF_LEFTDOWN, _MOUSEEVENTF_LEFTUP),
+    "right": (_MOUSEEVENTF_RIGHTDOWN, _MOUSEEVENTF_RIGHTUP),
+}
+
+
+class MouseInputBusyError(RuntimeError):
+    """Raised when a real mouse already owns the requested button."""
+
+
+class MouseInputDeliveryError(RuntimeError):
+    """Raised when a synthetic mouse action cannot be confirmed."""
+
+
+class MouseInputCleanupIncompleteError(MouseInputDeliveryError):
+    """Raised when a mouse button may still be held after compensation."""
+
+    def __init__(self, button: str, message: str) -> None:
+        super().__init__(message)
+        self.button = button
+
+
+def _send_mouse_button_up_safely(
+    button: str,
+    *,
+    send_events: Callable[[Sequence[tuple[int, int]]], int],
+) -> None:
+    try:
+        _down_flag, up_flag = _MOUSE_BUTTON_EVENTS[button]
+    except KeyError as exc:
+        raise ValueError(f"unsupported mouse button: {button}") from exc
+    try:
+        sent = int(send_events([(up_flag, 0)]))
+    except Exception as exc:
+        raise MouseInputCleanupIncompleteError(
+            button,
+            f"mouse {button} release delivery failed",
+        ) from exc
+    if sent != 1:
+        raise MouseInputCleanupIncompleteError(
+            button,
+            f"mouse {button} release delivery was not confirmed",
+        )
+
+
+def _send_mouse_click_safely(
+    button: str,
+    *,
+    is_button_down: Callable[[str], bool],
+    send_events: Callable[[Sequence[tuple[int, int]]], int],
+) -> None:
+    try:
+        down_flag, up_flag = _MOUSE_BUTTON_EVENTS[button]
+    except KeyError as exc:
+        raise ValueError(f"unsupported mouse button: {button}") from exc
+    if is_button_down(button):
+        raise MouseInputBusyError(f"physical mouse {button} button is held")
+    events = [(down_flag, 0), (up_flag, 0)]
+    try:
+        sent = int(send_events(events))
+    except Exception as exc:
+        try:
+            _send_mouse_button_up_safely(button, send_events=send_events)
+        except MouseInputCleanupIncompleteError as cleanup_exc:
+            raise MouseInputCleanupIncompleteError(
+                button,
+                f"mouse {button} click failed and release remains unconfirmed",
+            ) from exc
+        raise MouseInputDeliveryError(f"mouse {button} click delivery failed") from exc
+    if sent == len(events):
+        return
+    if sent != 0:
+        try:
+            _send_mouse_button_up_safely(button, send_events=send_events)
+        except MouseInputCleanupIncompleteError as exc:
+            raise MouseInputCleanupIncompleteError(
+                button,
+                f"mouse {button} click delivered {sent}/{len(events)} events; "
+                "release remains unconfirmed",
+            ) from exc
+    raise MouseInputDeliveryError(
+        f"mouse {button} click delivered {sent}/{len(events)} events"
+    )
+
+
+def _move_and_click_safely(
+    point: tuple[int, int],
+    button: str,
+    *,
+    is_button_down: Callable[[str], bool],
+    pointer_move_is_blocked: Optional[Callable[[], bool]] = None,
+    move_pointer: Callable[[tuple[int, int]], bool],
+    send_events: Callable[[Sequence[tuple[int, int]]], int],
+) -> None:
+    if (pointer_move_is_blocked is not None and pointer_move_is_blocked()) or (
+        is_button_down(button)
+    ):
+        raise MouseInputBusyError(f"physical mouse {button} button is held")
+    if not move_pointer(point):
+        raise MouseInputDeliveryError("mouse pointer move failed")
+    _send_mouse_click_safely(
+        button,
+        is_button_down=is_button_down,
+        send_events=send_events,
+    )
+
+
+class _MouseInputSafetyState:
+    def __init__(self) -> None:
+        self.pending_button: Optional[str] = None
+
+    def run(
+        self,
+        action: Callable[[], None],
+        *,
+        send_events: Callable[[Sequence[tuple[int, int]]], int],
+    ) -> None:
+        self.release_pending(send_events=send_events)
+        try:
+            action()
+        except MouseInputCleanupIncompleteError as exc:
+            self.pending_button = exc.button
+            raise
+
+    def release_pending(
+        self,
+        *,
+        send_events: Callable[[Sequence[tuple[int, int]]], int],
+    ) -> None:
+        button = self.pending_button
+        if button is None:
+            return
+        _send_mouse_button_up_safely(button, send_events=send_events)
+        self.pending_button = None
+
+
+def _move_and_wheel_safely(
+    point: tuple[int, int],
+    steps: int,
+    *,
+    pointer_move_is_blocked: Callable[[], bool],
+    move_pointer: Callable[[tuple[int, int]], bool],
+    send_events: Callable[[Sequence[tuple[int, int]]], int],
+) -> None:
+    if pointer_move_is_blocked():
+        raise MouseInputBusyError("a physical mouse button is held")
+    if not move_pointer(point):
+        raise MouseInputDeliveryError("mouse pointer move failed")
+    _send_mouse_wheel_safely(steps, send_events=send_events)
+
+
+def _send_mouse_wheel_safely(
+    steps: int,
+    *,
+    send_events: Callable[[Sequence[tuple[int, int]]], int],
+) -> None:
+    if not isinstance(steps, int) or isinstance(steps, bool) or steps == 0:
+        raise ValueError("mouse wheel steps must be a non-zero integer")
+    try:
+        sent = int(
+            send_events(
+                [(_MOUSEEVENTF_WHEEL, steps * _MOUSE_WHEEL_DELTA)]
+            )
+        )
+    except Exception as exc:
+        raise MouseInputDeliveryError("mouse wheel delivery failed") from exc
+    if sent != 1:
+        raise MouseInputDeliveryError("mouse wheel delivery was not confirmed")
+
+
 def _stop_resources_best_effort(
     resources: Sequence[tuple[str, Callable[[], None]]],
 ) -> list[str]:
@@ -141,6 +317,22 @@ def _run_windows(
             ("colors", wintypes.DWORD * 3),
         ]
 
+    class MouseInput(ctypes.Structure):
+        _fields_ = [
+            ("dx", ctypes.c_int32),
+            ("dy", ctypes.c_int32),
+            ("mouseData", ctypes.c_uint32),
+            ("dwFlags", ctypes.c_uint32),
+            ("time", ctypes.c_uint32),
+            ("dwExtraInfo", ctypes.c_size_t),
+        ]
+
+    class InputUnion(ctypes.Union):
+        _fields_ = [("mi", MouseInput)]
+
+    class Input(ctypes.Structure):
+        _fields_ = [("type", ctypes.c_uint32), ("union", InputUnion)]
+
     kernel32.GetCurrentThreadId.restype = wintypes.DWORD
     kernel32.GetModuleHandleW.argtypes = [wintypes.LPCWSTR]
     kernel32.GetModuleHandleW.restype = wintypes.HMODULE
@@ -222,13 +414,12 @@ def _run_windows(
     user32.GetGUIThreadInfo.restype = wintypes.BOOL
     user32.SetCursorPos.argtypes = [ctypes.c_int, ctypes.c_int]
     user32.SetCursorPos.restype = wintypes.BOOL
-    user32.mouse_event.argtypes = [
-        wintypes.DWORD,
-        wintypes.DWORD,
-        wintypes.DWORD,
-        wintypes.DWORD,
-        ctypes.c_size_t,
+    user32.SendInput.argtypes = [
+        wintypes.UINT,
+        ctypes.POINTER(Input),
+        ctypes.c_int,
     ]
+    user32.SendInput.restype = wintypes.UINT
     user32.GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
     user32.GetClassNameW.restype = ctypes.c_int
     user32.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
@@ -334,12 +525,13 @@ def _run_windows(
     child_id_self = 0
     coinit_apartment_threaded = 0x2
     rpc_e_changed_mode = ctypes.c_long(0x80010106).value
-    mouseeventf_leftdown = 0x0002
-    mouseeventf_leftup = 0x0004
-    mouseeventf_rightdown = 0x0008
-    mouseeventf_rightup = 0x0010
-    mouseeventf_wheel = 0x0800
-    wheel_delta = 120
+    mouse_button_vk_codes = {
+        "left": 0x01,
+        "right": 0x02,
+        "middle": 0x04,
+        "x1": 0x05,
+        "x2": 0x06,
+    }
     gw_owner = 4
     ga_root = 2
     gwl_exstyle = -20
@@ -601,23 +793,51 @@ def _run_windows(
         except queue.Empty:
             return None
 
+    def send_mouse_events(events: Sequence[tuple[int, int]]) -> int:
+        array = (Input * len(events))()
+        for index, (flags, mouse_data) in enumerate(events):
+            mouse_input = MouseInput(
+                dx=0,
+                dy=0,
+                mouseData=ctypes.c_uint32(mouse_data).value,
+                dwFlags=flags,
+                time=0,
+                dwExtraInfo=0,
+            )
+            array[index] = Input(type=0, union=InputUnion(mi=mouse_input))
+        return int(user32.SendInput(len(events), array, ctypes.sizeof(Input)))
+
+    def mouse_button_is_down(button: str) -> bool:
+        try:
+            vk_code = mouse_button_vk_codes[button]
+        except KeyError as exc:
+            raise ValueError(f"unsupported mouse button: {button}") from exc
+        return bool(user32.GetAsyncKeyState(vk_code) & 0x8000)
+
+    def pointer_move_is_blocked() -> bool:
+        return any(mouse_button_is_down(button) for button in mouse_button_vk_codes)
+
     def click_point(point: tuple[int, int], button: str = "left") -> None:
-        user32.SetCursorPos(point[0], point[1])
-        if button == "right":
-            down, up = mouseeventf_rightdown, mouseeventf_rightup
-        else:
-            down, up = mouseeventf_leftdown, mouseeventf_leftup
-        user32.mouse_event(down, 0, 0, 0, 0)
-        user32.mouse_event(up, 0, 0, 0, 0)
+        _move_and_click_safely(
+            point,
+            button,
+            is_button_down=mouse_button_is_down,
+            pointer_move_is_blocked=pointer_move_is_blocked,
+            move_pointer=lambda target: bool(
+                user32.SetCursorPos(target[0], target[1])
+            ),
+            send_events=send_mouse_events,
+        )
 
     def scroll_point(point: tuple[int, int], steps: int) -> None:
-        user32.SetCursorPos(point[0], point[1])
-        user32.mouse_event(
-            mouseeventf_wheel,
-            0,
-            0,
-            mouse_wheel_data(steps * wheel_delta),
-            0,
+        _move_and_wheel_safely(
+            point,
+            steps,
+            pointer_move_is_blocked=pointer_move_is_blocked,
+            move_pointer=lambda target: bool(
+                user32.SetCursorPos(target[0], target[1])
+            ),
+            send_events=send_mouse_events,
         )
 
     def window_class_name(hwnd: int) -> str:
@@ -1478,6 +1698,7 @@ def _run_windows(
             "context": 1,
             "scroll_up": 2,
             "scroll_down": 2,
+            "release_mouse": 1,
             "back": 1,
             "sync_window": 1,
             "refresh_content": 1,
@@ -1558,6 +1779,7 @@ def _run_windows(
             self._scroll_cache_point: Optional[tuple[int, int]] = None
             self._scroll_cache_at = 0.0
             self._content_settle_until = 0.0
+            self._mouse_input_safety = _MouseInputSafetyState()
             self.diagnostics_enabled = diagnostics_enabled
             self._double_click_seconds = max(
                 0.2, int(user32.GetDoubleClickTime()) / 1000
@@ -1602,6 +1824,7 @@ def _run_windows(
                 self._empty_follow_refresh_attempts = 0
                 self._deferred_moves.clear()
                 self._refresh_cancel_requested.set()
+            self.post("release_mouse")
 
         def _finish_refresh_interrupt(self, command: str) -> None:
             if command not in self._REFRESH_INTERRUPT_COMMANDS:
@@ -2550,6 +2773,58 @@ def _run_windows(
             self._request_background_refresh()
             self._emit_selection()
 
+        def _try_mouse_action(
+            self,
+            target: RuntimeTarget,
+            operation: str,
+            action: Callable[[], None],
+        ) -> bool:
+            try:
+                self._mouse_input_safety.run(
+                    action,
+                    send_events=send_mouse_events,
+                )
+            except MouseInputBusyError:
+                self.events.put(
+                    (
+                        "mouse_input_unavailable",
+                        {
+                            "target": target.snapshot,
+                            "operation": operation,
+                            "busy": True,
+                            "cleanup_pending": False,
+                        },
+                    )
+                )
+                return False
+            except MouseInputCleanupIncompleteError:
+                self.events.put(
+                    (
+                        "mouse_input_unavailable",
+                        {
+                            "target": target.snapshot,
+                            "operation": operation,
+                            "busy": False,
+                            "cleanup_pending": True,
+                        },
+                    )
+                )
+                return False
+            except MouseInputDeliveryError:
+                self.events.put(
+                    (
+                        "mouse_input_unavailable",
+                        {
+                            "target": target.snapshot,
+                            "operation": operation,
+                            "busy": False,
+                            "cleanup_pending": False,
+                        },
+                    )
+                )
+                return False
+            return True
+
         def _activate(self) -> None:
             if not self.targets or self.selected < 0:
                 return
@@ -2557,7 +2832,12 @@ def _run_windows(
             target = self.targets[self.selected]
             cached_point = self._cached_pointer_point(target)
             if cached_point is not None:
-                click_point(cached_point)
+                if not self._try_mouse_action(
+                    target,
+                    "左击",
+                    lambda: click_point(cached_point),
+                ):
+                    return
                 self._remember_pointer_point(target, cached_point)
                 self.events.put(
                     (
@@ -2586,7 +2866,12 @@ def _run_windows(
                 allow_rect_center=target.control is None,
             )
             if exposed and point is not None:
-                click_point(point)
+                if not self._try_mouse_action(
+                    target,
+                    "左击",
+                    lambda: click_point(point),
+                ):
+                    return
                 self._remember_pointer_point(target, point)
                 method = (
                     "MSAA coordinate click"
@@ -2634,7 +2919,12 @@ def _run_windows(
             if point is None:
                 self._refresh_invalid_target(target)
                 return
-            click_point(point, button="right")
+            if not self._try_mouse_action(
+                target,
+                "右击",
+                lambda: click_point(point, button="right"),
+            ):
+                return
             self.events.put(
                 (
                     "contexted",
@@ -2668,7 +2958,12 @@ def _run_windows(
                 if point is None:
                     self._refresh_invalid_target(target)
                     return
-            scroll_point(point, steps)
+            if not self._try_mouse_action(
+                target,
+                "滚动",
+                lambda: scroll_point(point, steps),
+            ):
+                return
             self._remember_scroll_point(target, point)
             self.events.put(
                 (
@@ -2763,7 +3058,17 @@ def _run_windows(
                         ):
                             continue
                         if command == "stop":
+                            self._mouse_input_safety.release_pending(
+                                send_events=send_mouse_events
+                            )
                             return
+                        if command == "release_mouse":
+                            try:
+                                self._mouse_input_safety.release_pending(
+                                    send_events=send_mouse_events
+                                )
+                            except MouseInputCleanupIncompleteError:
+                                pass
                         if command == "scan":
                             self._scan_requested.clear()
                             scan_hwnd, scan_token = value
@@ -3556,6 +3861,24 @@ def _run_windows(
                 if refresh_delay and active.is_set():
                     QTimer.singleShot(
                         refresh_delay, lambda: worker.post("refresh_content")
+                    )
+            elif event == "mouse_input_unavailable":
+                target = payload["target"]
+                if payload["busy"]:
+                    print(
+                        f"未执行{payload['operation']}: 实体鼠标按键正在使用 "
+                        f"({target.name or target.control_type})"
+                    )
+                elif payload.get("cleanup_pending"):
+                    print(
+                        f"未执行{payload['operation']}: 鼠标按键松开未确认，"
+                        "已暂停后续鼠标操作 "
+                        f"({target.name or target.control_type})"
+                    )
+                else:
+                    print(
+                        f"未执行{payload['operation']}: 鼠标操作未能确认送达 "
+                        f"({target.name or target.control_type})"
                     )
             elif event == "exit_requested":
                 leave_navigation()

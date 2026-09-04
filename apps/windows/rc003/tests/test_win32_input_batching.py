@@ -367,6 +367,30 @@ class MouseInputTests(unittest.TestCase):
                 button,
             )
 
+    def test_each_physical_button_hold_blocks_the_matching_synthetic_click(self):
+        for button in ("left", "right", "middle", "x1", "x2"):
+            sender = RecordingSender()
+            with self.assertRaises(win32_input.MouseButtonInUseError):
+                win32_input.send_mouse_button_click(
+                    button,
+                    _sender=sender,
+                    _button_down_query=lambda candidate, expected=button: (
+                        candidate == expected
+                    ),
+                )
+            self.assertEqual(sender.calls, [], button)
+
+    def test_unrelated_physical_button_does_not_block_the_requested_click(self):
+        sender = RecordingSender()
+
+        win32_input.send_mouse_button_click(
+            "right",
+            _sender=sender,
+            _button_down_query=lambda button: button == "left",
+        )
+
+        self.assertEqual(len(sender.calls), 1)
+
     def test_partial_click_after_down_immediately_releases_the_button(self):
         sender = RecordingSender(sent_counts=[1])
         with self.assertRaises(OSError) as ctx:

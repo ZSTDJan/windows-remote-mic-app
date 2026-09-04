@@ -88,6 +88,9 @@ class ButtonGestureRecognizer:
     def is_tracking(self, button_id: str) -> bool:
         return button_id in self._states
 
+    def has_active_gestures(self) -> bool:
+        return bool(self._states)
+
     def press(
         self,
         button_id: str,
@@ -167,6 +170,7 @@ TimerFactory = Callable[[float, Callable[[], None]], object]
 ActionConfigured = Callable[[str, ButtonTrigger], bool]
 TriggerCallback = Callable[[str, ButtonTrigger], None]
 RepeatableCallback = Callable[[str], bool]
+IdleCallback = Callable[[], None]
 
 
 class ButtonGestureDispatcher:
@@ -190,11 +194,13 @@ class ButtonGestureDispatcher:
         is_action_configured: ActionConfigured,
         is_repeatable: RepeatableCallback,
         on_trigger: TriggerCallback,
+        on_idle: Optional[IdleCallback] = None,
         timer_factory: Optional[TimerFactory] = None,
     ) -> None:
         self._is_action_configured = is_action_configured
         self._is_repeatable = is_repeatable
         self._on_trigger = on_trigger
+        self._on_idle = on_idle
         self._timer_factory = timer_factory or (
             lambda delay, callback: threading.Timer(delay, callback)
         )
@@ -209,6 +215,7 @@ class ButtonGestureDispatcher:
         self._repeat_timer_tokens: Dict[str, object] = {}
         self._repeat_hold_tokens: Dict[str, object] = {}
         self._held_immediate_buttons: Set[str] = set()
+        self._callback_reservations: Set[object] = set()
         self._generation = 0
 
     def press(self, button_id: str) -> None:
@@ -243,7 +250,8 @@ class ButtonGestureDispatcher:
                     recognizes_long_press=recognizes_long,
                 )
                 callbacks.extend(self._execute_commands_locked(commands))
-        self._emit(button_id, callbacks, generation)
+            reservation = self._reserve_callbacks_locked(callbacks)
+        self._emit(button_id, callbacks, generation, reservation=reservation)
 
     def release(self, button_id: str) -> None:
         with self._lock:
@@ -257,7 +265,8 @@ class ButtonGestureDispatcher:
             )
             commands = self._recognizer.release(button_id)
             callbacks = self._execute_commands_locked(commands)
-        self._emit(button_id, callbacks, generation)
+            reservation = self._reserve_callbacks_locked(callbacks)
+        self._emit(button_id, callbacks, generation, reservation=reservation)
 
     def reset(self) -> None:
         with self._lock:
@@ -279,6 +288,31 @@ class ButtonGestureDispatcher:
         # after reset() returns without making release wait on SendInput.
         with self._callback_lock:
             pass
+
+    def has_active_gestures(self) -> bool:
+        """Return whether a physical gesture still owns the current mapping."""
+
+        with self._lock:
+            return bool(
+                self._held_immediate_buttons
+                or self._repeat_hold_tokens
+                or self._callback_reservations
+                or self._recognizer.has_active_gestures()
+            )
+
+    def _reserve_callbacks_locked(
+        self, callbacks: List[ButtonTrigger]
+    ) -> Optional[object]:
+        if not callbacks:
+            return None
+        reservation = object()
+        self._callback_reservations.add(reservation)
+        return reservation
+
+    def _notify_idle(self) -> None:
+        callback = self._on_idle
+        if callback is not None and not self.has_active_gestures():
+            callback()
 
     def _execute_commands_locked(
         self, commands: List[GestureCommand]
@@ -377,7 +411,11 @@ class ButtonGestureDispatcher:
             self._double_timer_tokens.pop(button_id, None)
             commands = self._recognizer.double_click_timed_out(button_id)
             callbacks = self._execute_commands_locked(commands)
-        self._emit(button_id, callbacks, generation)
+            reservation = self._reserve_callbacks_locked(callbacks)
+        try:
+            self._emit(button_id, callbacks, generation, reservation=reservation)
+        finally:
+            self._notify_idle()
 
     def _long_press_timeout(
         self,
@@ -395,7 +433,11 @@ class ButtonGestureDispatcher:
             self._long_timer_tokens.pop(button_id, None)
             commands = self._recognizer.long_press_timed_out(button_id)
             callbacks = self._execute_commands_locked(commands)
-        self._emit(button_id, callbacks, generation)
+            reservation = self._reserve_callbacks_locked(callbacks)
+        try:
+            self._emit(button_id, callbacks, generation, reservation=reservation)
+        finally:
+            self._notify_idle()
 
     def _repeat_timeout(
         self,
@@ -422,14 +464,19 @@ class ButtonGestureDispatcher:
                 return
             self._repeat_timers.pop(button_id, None)
             self._repeat_timer_tokens.pop(button_id, None)
+            reservation = self._reserve_callbacks_locked(
+                [ButtonTrigger.SINGLE_CLICK]
+            )
 
         emitted = self._emit(
             button_id,
             [ButtonTrigger.SINGLE_CLICK],
             generation,
             require_hold_token=hold_token,
+            reservation=reservation,
         )
         if not emitted:
+            self._notify_idle()
             return
 
         with self._lock:
@@ -441,13 +488,14 @@ class ButtonGestureDispatcher:
             ):
                 if self._repeat_hold_tokens.get(button_id) is hold_token:
                     self._repeat_hold_tokens.pop(button_id, None)
-                return
-            interval = (
-                self.BACK_REPEAT_INTERVAL_SECONDS
-                if button_id == "back"
-                else self.REPEAT_INTERVAL_SECONDS
-            )
-            self._schedule_repeat_locked(button_id, interval, hold_token)
+            else:
+                interval = (
+                    self.BACK_REPEAT_INTERVAL_SECONDS
+                    if button_id == "back"
+                    else self.REPEAT_INTERVAL_SECONDS
+                )
+                self._schedule_repeat_locked(button_id, interval, hold_token)
+        self._notify_idle()
 
     def _emit(
         self,
@@ -456,22 +504,28 @@ class ButtonGestureDispatcher:
         generation: int,
         *,
         require_hold_token: Optional[object] = None,
+        reservation: Optional[object] = None,
     ) -> bool:
         emitted = False
-        for trigger in callbacks:
-            with self._callback_lock:
+        try:
+            for trigger in callbacks:
+                with self._callback_lock:
+                    with self._lock:
+                        if generation != self._generation:
+                            return emitted
+                        if (
+                            require_hold_token is not None
+                            and self._repeat_hold_tokens.get(button_id)
+                            is not require_hold_token
+                        ):
+                            return emitted
+                    self._on_trigger(button_id, trigger)
+                    emitted = True
+            return emitted
+        finally:
+            if reservation is not None:
                 with self._lock:
-                    if generation != self._generation:
-                        return emitted
-                    if (
-                        require_hold_token is not None
-                        and self._repeat_hold_tokens.get(button_id)
-                        is not require_hold_token
-                    ):
-                        return emitted
-                self._on_trigger(button_id, trigger)
-                emitted = True
-        return emitted
+                    self._callback_reservations.discard(reservation)
 
     def _cancel_timer_locked(
         self,

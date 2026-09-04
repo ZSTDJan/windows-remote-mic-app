@@ -27,10 +27,12 @@ class ButtonComboRecognizerTests(unittest.TestCase):
 
     def test_matching_second_key_triggers_once_and_consumes_both_single_keys(self):
         self.press("tv")
+        self.assertTrue(self.recognizer.has_active_combo())
         self.assertEqual(self.press("up"), [ComboCommand.trigger("up")])
         self.assertEqual(self.press("up"), [])
         self.assertEqual(self.recognizer.release("up"), [])
         self.assertEqual(self.recognizer.release("tv"), [])
+        self.assertFalse(self.recognizer.has_active_combo())
 
     def test_one_modifier_hold_can_trigger_multiple_configured_buttons(self):
         self.press("tv")
@@ -66,6 +68,7 @@ class ButtonComboRecognizerTests(unittest.TestCase):
             self.recognizer.release("tv"),
             [ComboCommand.forward_release("tv")],
         )
+        self.assertFalse(self.recognizer.has_active_combo())
 
     def test_reset_drops_a_pending_modifier_without_emitting_an_action(self):
         self.press("tv")

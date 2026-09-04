@@ -119,11 +119,70 @@ class ButtonGestureDispatcherTests(unittest.TestCase):
     def test_double_click_timer_resolves_single_click(self):
         self.dispatcher.press("ok")
         self.dispatcher.release("ok")
+        self.assertTrue(self.dispatcher.has_active_gestures())
         self.assertEqual(self.triggers, [])
         self.assertEqual(len(self.timers), 1)
 
         self.timers[0].fire()
         self.assertEqual(self.triggers, [("ok", ButtonTrigger.SINGLE_CLICK)])
+        self.assertFalse(self.dispatcher.has_active_gestures())
+
+    def test_delayed_callback_keeps_mapping_activity_reserved_until_it_returns(self):
+        entered = threading.Event()
+        release = threading.Event()
+
+        def blocking_trigger(button_id, trigger):
+            entered.set()
+            release.wait(1.0)
+            self.triggers.append((button_id, trigger))
+
+        self.dispatcher._on_trigger = blocking_trigger
+        self.dispatcher.press("ok")
+        self.dispatcher.release("ok")
+
+        worker = threading.Thread(target=self.timers[0].fire)
+        worker.start()
+        self.assertTrue(entered.wait(1.0))
+        self.assertTrue(self.dispatcher.has_active_gestures())
+
+        release.set()
+        worker.join(1.0)
+        self.assertFalse(worker.is_alive())
+        self.assertFalse(self.dispatcher.has_active_gestures())
+
+    def test_reset_does_not_release_a_callback_reservation_before_callback_exit(self):
+        entered = threading.Event()
+        release = threading.Event()
+
+        def blocking_trigger(_button_id, _trigger):
+            entered.set()
+            release.wait(1.0)
+
+        self.dispatcher._on_trigger = blocking_trigger
+        self.dispatcher.press("ok")
+        self.dispatcher.release("ok")
+        callback_worker = threading.Thread(target=self.timers[0].fire)
+        callback_worker.start()
+        self.assertTrue(entered.wait(1.0))
+
+        reset_worker = threading.Thread(target=self.dispatcher.reset)
+        reset_worker.start()
+        self.assertTrue(self.dispatcher.has_active_gestures())
+
+        release.set()
+        callback_worker.join(1.0)
+        reset_worker.join(1.0)
+        self.assertFalse(callback_worker.is_alive())
+        self.assertFalse(reset_worker.is_alive())
+        self.assertFalse(self.dispatcher.has_active_gestures())
+
+    def test_immediate_hold_remains_active_until_release(self):
+        self.dispatcher.press("up")
+        self.assertTrue(self.dispatcher.has_active_gestures())
+
+        self.dispatcher.release("up")
+
+        self.assertFalse(self.dispatcher.has_active_gestures())
 
     def test_double_click_emits_only_double_action(self):
         self.dispatcher.press("ok")
@@ -208,6 +267,7 @@ class ButtonGestureDispatcherTests(unittest.TestCase):
     def test_release_cancels_repeat_while_action_callback_is_blocked(self):
         callback_started = threading.Event()
         allow_callback_to_finish = threading.Event()
+        idle_calls = []
 
         def on_trigger(button, trigger):
             self.triggers.append((button, trigger))
@@ -221,6 +281,7 @@ class ButtonGestureDispatcherTests(unittest.TestCase):
             ),
             is_repeatable=lambda button: button == "up",
             on_trigger=on_trigger,
+            on_idle=lambda: idle_calls.append("idle"),
             timer_factory=lambda delay, callback: self._new_timer(callback),
         )
         self.dispatcher.press("up")
@@ -241,6 +302,7 @@ class ButtonGestureDispatcherTests(unittest.TestCase):
         self.assertFalse(repeat_thread.is_alive())
         self.assertFalse(release_thread.is_alive())
         self.assertEqual(len(self.timers), 1)
+        self.assertEqual(idle_calls, ["idle"])
 
     def test_repeat_stops_if_the_current_mapping_is_no_longer_repeatable(self):
         repeatable = {"up": True}
