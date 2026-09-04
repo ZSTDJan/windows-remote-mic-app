@@ -104,6 +104,10 @@ APPLICATION_EXIT_REQUEST_POLL_SECONDS = 0.1
 APPLICATION_HANDOFF_TIMEOUT_SECONDS = 180.0
 APPLICATION_HANDOFF_POLL_SECONDS = 0.1
 APPLICATION_HANDOFF_REQUEST_GRACE_SECONDS = 5.0
+APPLICATION_HANDOFF_MANUAL_EXIT_NOTICE = (
+    f"请在通知区域右键“{product_identity.DISPLAY_NAME}”，选择“完全退出”。\n"
+    "退出后，当前版本会自动打开。"
+)
 
 
 def _print_help() -> None:
@@ -332,8 +336,8 @@ def _handoff_previous_application(
                 # path when the request cannot be written.
                 pass
 
-            activated = single_instance.activate_existing_settings_window()
-            manual_exit_notice_pending = not activated
+            single_instance.activate_existing_settings_window()
+            manual_exit_notice_pending = True
             started_at = monotonic()
             bounded_timeout = max(0.1, float(timeout))
             deadline = started_at + bounded_timeout
@@ -354,6 +358,11 @@ def _handoff_previous_application(
                     success = True
                     break
                 now = monotonic()
+                if now >= deadline:
+                    failure_message = (
+                        "旧版仍在运行，当前版本未启动。请完全退出旧版后，再打开当前版本。"
+                    )
+                    break
                 if manual_exit_notice_pending and request_id is not None:
                     if not single_instance.owned_application_exit_request_pending(
                         root,
@@ -364,22 +373,14 @@ def _handoff_previous_application(
                         pass
                     else:
                         single_instance.show_bridge_startup_blocked_notice(
-                            "旧版窗口未能自动唤出，退出请求也尚未被接收。"
-                            "请从通知区域打开旧版，保存需要保留的修改后选择“完全退出”。"
+                            APPLICATION_HANDOFF_MANUAL_EXIT_NOTICE
                         )
                         manual_exit_notice_pending = False
                 elif manual_exit_notice_pending:
                     single_instance.show_bridge_startup_blocked_notice(
-                        "旧版窗口未能自动唤出。当前版本正在等待；请从通知区域打开旧版，"
-                        "保存需要保留的修改后选择“完全退出”。"
+                        APPLICATION_HANDOFF_MANUAL_EXIT_NOTICE
                     )
                     manual_exit_notice_pending = False
-                if now >= deadline:
-                    failure_message = (
-                        "旧版仍在运行，当前版本没有启动。请从旧版通知区域选择"
-                        "“完全退出”后，再双击当前版本。"
-                    )
-                    break
                 sleep(max(0.01, float(poll_interval)))
         finally:
             if request_id is not None and not single_instance.clear_owned_application_exit_request(
@@ -537,15 +538,12 @@ def _run_settings(
             activated = single_instance.activate_existing_settings_window()
             if activated:
                 single_instance.show_bridge_startup_blocked_notice(
-                    "当前副本已有一个启动或运行流程。刚刚唤出的窗口可能是旧版，"
-                    "请以窗口标题版本号为准；若是旧版，请完成已有的版本切换。"
-                    "旧版退出后，等待中的当前版本会自动打开，不要再次双击。"
+                    APPLICATION_HANDOFF_MANUAL_EXIT_NOTICE
                 )
             else:
                 single_instance.show_bridge_startup_blocked_notice(
-                    f"{product_identity.DISPLAY_NAME}当前副本已经在启动、等待旧版退出，"
-                    "或已经在运行，但暂时无法唤出窗口。请从通知区域打开现有程序，"
-                    "完成已有切换；不要重复启动。"
+                    f"{product_identity.DISPLAY_NAME}已经在启动或运行。\n\n"
+                    "请从通知区域打开现有程序。"
                 )
     try:
         with single_instance.ApplicationRuntimeInstanceGuard():

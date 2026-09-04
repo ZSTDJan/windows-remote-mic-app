@@ -506,22 +506,23 @@ class ApplicationRuntimeInstanceGuardTests(unittest.TestCase):
                 with guard():
                     self.fail("the same runtime must have only one owner or waiter")
 
-    def test_handoff_confirmation_names_the_clicked_version_and_safety_rule(self):
+    def test_handoff_confirmation_is_concise_and_names_the_clicked_version(self):
         calls = []
 
         result = single_instance.confirm_application_handoff(
-            "0.2.0-candidate.4",
+            "0.2.0-candidate.6",
             _confirm=lambda title, message: calls.append((title, message)) or True,
         )
 
         self.assertTrue(result)
         self.assertEqual(len(calls), 1)
         title, message = calls[0]
-        self.assertIn("0.2.0-candidate.4", title)
-        self.assertIn("被唤出的窗口仍是旧版", message)
-        self.assertIn("窗口标题显示当前版本号才表示切换完成", message)
-        self.assertIn("旧版退出后，当前版本会自动继续打开", message)
-        self.assertIn("不会强制结束进程", message)
+        self.assertEqual(title, "无线麦 0.2.0-candidate.6")
+        self.assertEqual(
+            message,
+            "旧版正在运行。\n\n"
+            "是否退出旧版并打开当前版本？",
+        )
 
     def test_only_one_cross_version_handoff_guard_can_enter(self):
         registry = _FakeMutexRegistry()

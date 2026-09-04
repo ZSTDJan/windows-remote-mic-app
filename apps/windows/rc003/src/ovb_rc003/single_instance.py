@@ -954,12 +954,8 @@ def confirm_application_handoff(
 
     title = f"{product_identity.DISPLAY_NAME} {current_version}"
     message = (
-        "检测到另一个目录或旧版本的无线麦正在运行。\n\n"
-        f"是否退出旧版并打开当前版本 {current_version}？\n\n"
-        "选择“是”后，支持自动退出的版本会正常退出；程序会尝试把更早版本唤到前台，"
-        "被唤出的窗口仍是旧版，请从通知区域选择“完全退出”。旧版退出后，"
-        "当前版本会自动继续打开；窗口标题显示当前版本号才表示切换完成。\n\n"
-        "不会强制结束进程，也不会丢弃未保存的按键修改。"
+        "旧版正在运行。\n\n"
+        "是否退出旧版并打开当前版本？"
     )
     try:
         return bool(_confirm(title, message))
