@@ -17,7 +17,7 @@ F5 防漏已经得到真实小米遥控器2 Pro 证据。当前产品只支持�
   在点击"仍要运行"之前，建议先核对安装包（或便携版 ZIP）的 SHA-256 校验
   值是否与同一次构建产出的 SHA256SUMS.txt 一致。以 PowerShell 为例（把
   <文件名> 换成你实际下载的文件名，例如
-  RemoteMicRC003Setup-0.2.0-candidate.3-unsigned.exe）：
+  RemoteMicRC003Setup-0.2.0-candidate.4-unsigned.exe）：
 
       Get-FileHash -Algorithm SHA256 .\<文件名>
 

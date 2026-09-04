@@ -7,6 +7,13 @@ creating another one. The older bridge mutex remains around the in-process
 worker so a legacy standalone bridge from an earlier build cannot race it for
 BLE, Raw Input, synthetic-key or audio resources during upgrade.
 
+The product mutex intentionally stays stable across versions and locations.
+A second mutex hashes the current version plus executable location so a visible
+launch can distinguish the same copy (restore it) from a different/older copy
+(offer a safe handoff). A fixed handoff mutex allows only one such waiter in a
+Windows logon session. Handoff exit requests carry an owner token and the new
+copy starts only after its own pending request is consumed or safely removed.
+
 Fail-closed contract (XRBM-021 review round 1 P1 #1): a caller that cannot
 PROVE it is the sole owner - whether because another instance already owns
 the mutex (``DuplicateInstanceError``) or because the Win32 API itself
@@ -54,6 +61,7 @@ with the logic under test.
 from __future__ import annotations
 
 import ctypes
+import hashlib
 import json
 import os
 import sys
@@ -63,7 +71,7 @@ from ctypes import wintypes
 from pathlib import Path
 from typing import Callable, List, NamedTuple, Optional
 
-from . import product_identity
+from . import __version__, product_identity
 
 # Local\ (not Global\) scopes the mutex to the current Terminal Services /
 # Windows logon session. The settings-named mutex is retained as the
@@ -73,6 +81,8 @@ from . import product_identity
 _MUTEX_NAME = r"Local\RemoteMicRC003_BridgeInstance"
 _SETTINGS_MUTEX_NAME = r"Local\RemoteMicRC003_SettingsInstance"
 _ELEMENT_NAVIGATION_MUTEX_NAME = r"Local\RemoteMicRC003_ElementNavigationInstance"
+_APPLICATION_RUNTIME_MUTEX_PREFIX = r"Local\RemoteMicRC003_Runtime_"
+_APPLICATION_HANDOFF_MUTEX_NAME = r"Local\RemoteMicRC003_ApplicationHandoff"
 _SETTINGS_WINDOW_PROPERTY = "RemoteMicRC003.SettingsWindow"
 _BRIDGE_START_REQUEST_FILENAME = "bridge-start-request.json"
 _BRIDGE_START_REQUEST_SCHEMA = 1
@@ -153,6 +163,46 @@ CloseHandleFn = Callable[[int], bool]
 OpenMutexFn = Callable[[str], MutexOpenResult]
 SetWindowPropertyFn = Callable[[int, str], bool]
 ActivateMarkedWindowFn = Callable[[str], bool]
+ConfirmApplicationHandoffFn = Callable[[str, str], bool]
+
+
+def application_runtime_mutex_name(
+    *,
+    executable_path: str | os.PathLike[str] | None = None,
+    version: str | None = None,
+) -> str:
+    """Return the per-build-and-location identity for this desktop copy."""
+
+    if executable_path is None:
+        if getattr(sys, "frozen", False):
+            runtime_path = Path(sys.executable)
+        else:
+            runtime_path = Path(__file__).resolve()
+    else:
+        runtime_path = Path(executable_path)
+    try:
+        runtime_path = runtime_path.resolve(strict=False)
+    except OSError:
+        runtime_path = runtime_path.absolute()
+    normalized_path = str(runtime_path).replace("/", "\\").casefold()
+    identity = f"{normalized_path}\0{str(version or __version__).strip()}"
+    digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()
+    return f"{_APPLICATION_RUNTIME_MUTEX_PREFIX}{digest}"
+
+
+def application_runtime_window_property(
+    *,
+    executable_path: str | os.PathLike[str] | None = None,
+    version: str | None = None,
+) -> str:
+    """Return the private HWND marker for this exact executable copy."""
+
+    mutex_name = application_runtime_mutex_name(
+        executable_path=executable_path,
+        version=version,
+    )
+    digest = mutex_name.removeprefix(_APPLICATION_RUNTIME_MUTEX_PREFIX)
+    return f"{_SETTINGS_WINDOW_PROPERTY}.{digest}"
 
 
 def _require_windows() -> None:
@@ -246,10 +296,16 @@ def mark_settings_window(
 
     if not hwnd:
         return False
-    try:
-        return bool(_set_property(hwnd, _SETTINGS_WINDOW_PROPERTY))
-    except Exception:
-        return False
+    marked = False
+    for property_name in (
+        _SETTINGS_WINDOW_PROPERTY,
+        application_runtime_window_property(),
+    ):
+        try:
+            marked = bool(_set_property(hwnd, property_name)) or marked
+        except Exception:
+            continue
+    return marked
 
 
 def _real_activate_marked_window(property_name: str) -> bool:
@@ -312,6 +368,18 @@ def activate_existing_settings_window(
         return False
 
 
+def activate_current_runtime_settings_window(
+    *,
+    _activate: ActivateMarkedWindowFn = _real_activate_marked_window,
+) -> bool:
+    """Restore only the window belonging to this version and location."""
+
+    try:
+        return bool(_activate(application_runtime_window_property()))
+    except Exception:
+        return False
+
+
 def bridge_start_request_path(config_root: Path) -> Path:
     return Path(config_root) / _BRIDGE_START_REQUEST_FILENAME
 
@@ -326,17 +394,24 @@ def _write_request(
     schema: int,
     action: str,
     now: Callable[[], float],
+    request_id: str | None = None,
 ) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
     try:
+        payload = {
+            "schema": schema,
+            "action": action,
+            "created_at": float(now()),
+        }
+        if request_id is not None:
+            normalized_request_id = str(request_id).strip()
+            if not normalized_request_id:
+                raise ValueError("request_id must not be empty")
+            payload["request_id"] = normalized_request_id
         temporary.write_text(
             json.dumps(
-                {
-                    "schema": schema,
-                    "action": action,
-                    "created_at": float(now()),
-                },
+                payload,
                 ensure_ascii=True,
                 sort_keys=True,
             ),
@@ -370,6 +445,7 @@ def write_application_exit_request(
     config_root: Path,
     *,
     now: Callable[[], float] = time.time,
+    request_id: str | None = None,
 ) -> Path:
     """Atomically ask the resident desktop process to exit completely."""
 
@@ -378,7 +454,76 @@ def write_application_exit_request(
         schema=_APPLICATION_EXIT_REQUEST_SCHEMA,
         action="exit_application",
         now=now,
+        request_id=request_id,
     )
+
+
+def owned_application_exit_request_pending(
+    config_root: Path,
+    request_id: str,
+) -> bool:
+    """Return whether the public request is still the handoff request we wrote."""
+
+    path = application_exit_request_path(config_root)
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return False
+    return bool(
+        isinstance(payload, dict)
+        and payload.get("schema") == _APPLICATION_EXIT_REQUEST_SCHEMA
+        and payload.get("action") == "exit_application"
+        and payload.get("request_id") == str(request_id)
+    )
+
+
+def clear_owned_application_exit_request(
+    config_root: Path,
+    request_id: str,
+) -> bool:
+    """Atomically remove only the still-pending exit request we created."""
+
+    path = application_exit_request_path(config_root)
+    claimed = path.with_name(
+        f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.handoff-cleanup"
+    )
+    try:
+        os.replace(path, claimed)
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+
+    try:
+        payload = json.loads(claimed.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        payload = None
+    owned = bool(
+        isinstance(payload, dict)
+        and payload.get("schema") == _APPLICATION_EXIT_REQUEST_SCHEMA
+        and payload.get("action") == "exit_application"
+        and payload.get("request_id") == str(request_id)
+    )
+    if owned:
+        try:
+            claimed.unlink()
+        except OSError:
+            return False
+        return True
+
+    # Another writer replaced our request before cleanup. Restore that
+    # request atomically only if the public path is still empty; otherwise
+    # leave this claimed copy intact and fail closed rather than deleting
+    # or overwriting either writer's request.
+    try:
+        os.link(claimed, path)
+    except OSError:
+        return False
+    try:
+        claimed.unlink()
+    except OSError:
+        return False
+    return False
 
 
 def _consume_request(
@@ -690,6 +835,52 @@ class ApplicationInstanceGuard(BridgeInstanceGuard):
         )
 
 
+class ApplicationRuntimeInstanceGuard(BridgeInstanceGuard):
+    """Guard one executable version in one location, including handoff waiters."""
+
+    def __init__(
+        self,
+        *,
+        name: str | None = None,
+        _create_mutex: CreateMutexFn = _real_create_mutex,
+        _release_mutex: ReleaseMutexFn = _real_release_mutex,
+        _close_handle: CloseHandleFn = _real_close_handle,
+    ) -> None:
+        super().__init__(
+            name=name or application_runtime_mutex_name(),
+            _create_mutex=_create_mutex,
+            _release_mutex=_release_mutex,
+            _close_handle=_close_handle,
+            _duplicate_message=(
+                f"{product_identity.DISPLAY_NAME}当前版本已在启动或运行"
+            ),
+            _access_denied_means_duplicate=True,
+        )
+
+
+class ApplicationHandoffInstanceGuard(BridgeInstanceGuard):
+    """Allow only one cross-version/location handoff in this logon session."""
+
+    def __init__(
+        self,
+        *,
+        name: str = _APPLICATION_HANDOFF_MUTEX_NAME,
+        _create_mutex: CreateMutexFn = _real_create_mutex,
+        _release_mutex: ReleaseMutexFn = _real_release_mutex,
+        _close_handle: CloseHandleFn = _real_close_handle,
+    ) -> None:
+        super().__init__(
+            name=name,
+            _create_mutex=_create_mutex,
+            _release_mutex=_release_mutex,
+            _close_handle=_close_handle,
+            _duplicate_message=(
+                f"{product_identity.DISPLAY_NAME}正在切换运行版本"
+            ),
+            _access_denied_means_duplicate=True,
+        )
+
+
 class SettingsInstanceGuard(ApplicationInstanceGuard):
     """Compatibility name for callers from the former settings-only model."""
 
@@ -727,6 +918,57 @@ def _real_message_box(title: str, message: str) -> int:
     _MB_ICONWARNING = 0x00000030
     _MB_SYSTEMMODAL = 0x00001000  # visible/on-top even with no owner window
     return user32.MessageBoxW(None, message, title, _MB_OK | _MB_ICONWARNING | _MB_SYSTEMMODAL)
+
+
+def _real_confirm_application_handoff(title: str, message: str) -> bool:
+    _require_windows()
+    user32 = ctypes.windll.user32  # type: ignore[attr-defined]
+    user32.MessageBoxW.argtypes = (
+        wintypes.HWND,
+        wintypes.LPCWSTR,
+        wintypes.LPCWSTR,
+        wintypes.UINT,
+    )
+    user32.MessageBoxW.restype = ctypes.c_int
+    _MB_YESNO = 0x00000004
+    _MB_ICONQUESTION = 0x00000020
+    _MB_SYSTEMMODAL = 0x00001000
+    _IDYES = 6
+    return (
+        user32.MessageBoxW(
+            None,
+            message,
+            title,
+            _MB_YESNO | _MB_ICONQUESTION | _MB_SYSTEMMODAL,
+        )
+        == _IDYES
+    )
+
+
+def confirm_application_handoff(
+    current_version: str,
+    *,
+    _confirm: ConfirmApplicationHandoffFn = _real_confirm_application_handoff,
+) -> bool:
+    """Ask before replacing a different executable copy that owns the app."""
+
+    title = f"{product_identity.DISPLAY_NAME} {current_version}"
+    message = (
+        "检测到另一个目录或旧版本的无线麦正在运行。\n\n"
+        f"是否退出旧版并打开当前版本 {current_version}？\n\n"
+        "选择“是”后，支持自动退出的版本会正常退出；程序会尝试把更早版本唤到前台，"
+        "被唤出的窗口仍是旧版，请从通知区域选择“完全退出”。旧版退出后，"
+        "当前版本会自动继续打开；窗口标题显示当前版本号才表示切换完成。\n\n"
+        "不会强制结束进程，也不会丢弃未保存的按键修改。"
+    )
+    try:
+        return bool(_confirm(title, message))
+    except Exception:
+        print(
+            f"{product_identity.DISPLAY_NAME}: 无法显示版本切换确认。",
+            file=sys.stderr,
+        )
+        return False
 
 
 def show_bridge_startup_blocked_notice(

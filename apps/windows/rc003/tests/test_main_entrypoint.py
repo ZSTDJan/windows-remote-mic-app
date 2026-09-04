@@ -93,8 +93,14 @@ class _ArgvRestoringTestCase(unittest.TestCase):
         self._original_application_guard_cls = (
             single_instance.ApplicationInstanceGuard
         )
+        self._original_runtime_guard_cls = (
+            single_instance.ApplicationRuntimeInstanceGuard
+        )
         self._original_activate_settings = (
             single_instance.activate_existing_settings_window
+        )
+        self._original_activate_current_runtime_settings = (
+            single_instance.activate_current_runtime_settings_window
         )
         self._original_app_main = app.main
         self._original_notice = single_instance.show_bridge_startup_blocked_notice
@@ -105,11 +111,16 @@ class _ArgvRestoringTestCase(unittest.TestCase):
         self._original_element_navigation_runtime = (
             element_navigation_runtime.run_element_navigation
         )
+        self._original_handoff_previous_application = (
+            main_module._handoff_previous_application
+        )
         # Never let a failure-path test open a real system-modal Win32
         # message box on a developer machine or headless CI runner.
         single_instance.show_bridge_startup_blocked_notice = lambda message: None
         single_instance.ApplicationInstanceGuard = _make_guard_class()
+        single_instance.ApplicationRuntimeInstanceGuard = _make_guard_class()
         single_instance.activate_existing_settings_window = lambda: True
+        single_instance.activate_current_runtime_settings_window = lambda: True
         single_instance.write_bridge_start_request = lambda _root: None
 
     def tearDown(self):
@@ -117,8 +128,14 @@ class _ArgvRestoringTestCase(unittest.TestCase):
         single_instance.ApplicationInstanceGuard = (
             self._original_application_guard_cls
         )
+        single_instance.ApplicationRuntimeInstanceGuard = (
+            self._original_runtime_guard_cls
+        )
         single_instance.activate_existing_settings_window = (
             self._original_activate_settings
+        )
+        single_instance.activate_current_runtime_settings_window = (
+            self._original_activate_current_runtime_settings
         )
         app.main = self._original_app_main
         single_instance.show_bridge_startup_blocked_notice = self._original_notice
@@ -126,6 +143,9 @@ class _ArgvRestoringTestCase(unittest.TestCase):
             self._original_bridge_start_request
         )
         main_module._qt_runtime_check = self._original_qt_runtime_check
+        main_module._handoff_previous_application = (
+            self._original_handoff_previous_application
+        )
         element_navigation_runtime.run_element_navigation = (
             self._original_element_navigation_runtime
         )
@@ -187,12 +207,19 @@ class DesktopModeRoutingTests(_ArgvRestoringTestCase):
     def test_duplicate_visible_launch_activates_the_existing_window(self):
         from ovb_rc003 import settings_ui
 
-        activation_calls = []
-        single_instance.ApplicationInstanceGuard = _make_guard_class(
+        current_activation_calls = []
+        fallback_activation_calls = []
+        single_instance.ApplicationRuntimeInstanceGuard = _make_guard_class(
             raise_on_enter=single_instance.DuplicateInstanceError("already open")
         )
+        main_module._handoff_previous_application = lambda: self.fail(
+            "the same runtime must activate, not start a version handoff"
+        )
+        single_instance.activate_current_runtime_settings_window = (
+            lambda: current_activation_calls.append(1) or True
+        )
         single_instance.activate_existing_settings_window = (
-            lambda: activation_calls.append(1) or True
+            lambda: fallback_activation_calls.append(1) or True
         )
         original = settings_ui.main
         settings_ui.main = lambda **kwargs: self.fail(
@@ -204,18 +231,23 @@ class DesktopModeRoutingTests(_ArgvRestoringTestCase):
         finally:
             settings_ui.main = original
 
-        self.assertEqual(activation_calls, [1])
+        self.assertEqual(current_activation_calls, [1])
+        self.assertEqual(fallback_activation_calls, [])
 
     def test_duplicate_visible_launch_reports_when_the_window_cannot_be_activated(self):
         from ovb_rc003 import settings_ui
 
-        activation_calls = []
+        current_activation_calls = []
+        fallback_activation_calls = []
         notice_calls = []
-        single_instance.ApplicationInstanceGuard = _make_guard_class(
+        single_instance.ApplicationRuntimeInstanceGuard = _make_guard_class(
             raise_on_enter=single_instance.DuplicateInstanceError("already open")
         )
+        single_instance.activate_current_runtime_settings_window = (
+            lambda: current_activation_calls.append(1) or False
+        )
         single_instance.activate_existing_settings_window = (
-            lambda: activation_calls.append(1) or False
+            lambda: fallback_activation_calls.append(1) or False
         )
         single_instance.show_bridge_startup_blocked_notice = notice_calls.append
         original = settings_ui.main
@@ -228,17 +260,50 @@ class DesktopModeRoutingTests(_ArgvRestoringTestCase):
         finally:
             settings_ui.main = original
 
-        self.assertEqual(activation_calls, [1])
+        self.assertEqual(current_activation_calls, [1])
+        self.assertEqual(fallback_activation_calls, [1])
         self.assertEqual(len(notice_calls), 1)
-        self.assertIn("已经在运行", notice_calls[0])
+        self.assertIn("已经在启动", notice_calls[0])
         self.assertIn("不要重复启动", notice_calls[0])
+
+    def test_duplicate_visible_launch_during_handoff_explains_the_old_window(self):
+        from ovb_rc003 import settings_ui
+
+        current_activation_calls = []
+        fallback_activation_calls = []
+        notice_calls = []
+        single_instance.ApplicationRuntimeInstanceGuard = _make_guard_class(
+            raise_on_enter=single_instance.DuplicateInstanceError("handoff waiter")
+        )
+        single_instance.activate_current_runtime_settings_window = (
+            lambda: current_activation_calls.append(1) or False
+        )
+        single_instance.activate_existing_settings_window = (
+            lambda: fallback_activation_calls.append(1) or True
+        )
+        single_instance.show_bridge_startup_blocked_notice = notice_calls.append
+        original = settings_ui.main
+        settings_ui.main = lambda **kwargs: self.fail(
+            "a second launch must not create another application"
+        )
+        sys.argv = ["ovb_rc003", "--settings"]
+        try:
+            main_module.main()
+        finally:
+            settings_ui.main = original
+
+        self.assertEqual(current_activation_calls, [1])
+        self.assertEqual(fallback_activation_calls, [1])
+        self.assertEqual(len(notice_calls), 1)
+        self.assertIn("可能是旧版", notice_calls[0])
+        self.assertIn("不要再次双击", notice_calls[0])
 
     def test_duplicate_bridge_launch_requests_existing_app_without_popping_window(self):
         from ovb_rc003 import settings_ui
 
         activation_calls = []
         request_calls = []
-        single_instance.ApplicationInstanceGuard = _make_guard_class(
+        single_instance.ApplicationRuntimeInstanceGuard = _make_guard_class(
             raise_on_enter=single_instance.DuplicateInstanceError("already open")
         )
         single_instance.activate_existing_settings_window = (
@@ -265,7 +330,7 @@ class DesktopModeRoutingTests(_ArgvRestoringTestCase):
 
         activation_calls = []
         notice_calls = []
-        single_instance.ApplicationInstanceGuard = _make_guard_class(
+        single_instance.ApplicationRuntimeInstanceGuard = _make_guard_class(
             raise_on_enter=single_instance.DuplicateInstanceError("already open")
         )
         single_instance.activate_existing_settings_window = (
@@ -293,7 +358,7 @@ class DesktopModeRoutingTests(_ArgvRestoringTestCase):
         from ovb_rc003 import settings_ui
 
         activation_calls = []
-        single_instance.ApplicationInstanceGuard = _make_guard_class(
+        single_instance.ApplicationRuntimeInstanceGuard = _make_guard_class(
             raise_on_enter=single_instance.DuplicateInstanceError("already open")
         )
         single_instance.activate_existing_settings_window = (
@@ -310,6 +375,61 @@ class DesktopModeRoutingTests(_ArgvRestoringTestCase):
             settings_ui.main = original
 
         self.assertEqual(activation_calls, [])
+
+    def test_different_runtime_visible_launch_waits_then_starts_current_copy(self):
+        from ovb_rc003 import settings_ui
+
+        enter_calls = []
+
+        class _FirstDuplicateThenOwner:
+            def __enter__(self):
+                enter_calls.append(1)
+                if len(enter_calls) == 1:
+                    raise single_instance.DuplicateInstanceError("old copy")
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        handoff_calls = []
+        settings_calls = []
+        single_instance.ApplicationInstanceGuard = _FirstDuplicateThenOwner
+        main_module._handoff_previous_application = (
+            lambda: handoff_calls.append(1) or True
+        )
+        original = settings_ui.main
+        settings_ui.main = lambda **kwargs: settings_calls.append(kwargs)
+        sys.argv = ["ovb_rc003"]
+        try:
+            main_module.main()
+        finally:
+            settings_ui.main = original
+
+        self.assertEqual(enter_calls, [1, 1])
+        self.assertEqual(handoff_calls, [1])
+        self.assertEqual(settings_calls, [{"start_bridge": False}])
+
+    def test_different_runtime_visible_launch_does_not_start_when_handoff_is_cancelled(self):
+        from ovb_rc003 import settings_ui
+
+        single_instance.ApplicationInstanceGuard = _make_guard_class(
+            raise_on_enter=single_instance.DuplicateInstanceError("old copy")
+        )
+        handoff_calls = []
+        main_module._handoff_previous_application = (
+            lambda: handoff_calls.append(1) or False
+        )
+        original = settings_ui.main
+        settings_ui.main = lambda **kwargs: self.fail(
+            "cancelled handoff must not start the current application"
+        )
+        sys.argv = ["ovb_rc003"]
+        try:
+            main_module.main()
+        finally:
+            settings_ui.main = original
+
+        self.assertEqual(handoff_calls, [1])
 
     def test_guard_failure_is_visible_and_never_starts_the_application(self):
         from ovb_rc003 import settings_ui
@@ -667,6 +787,296 @@ class ApplicationExitRequestEntrypointTests(unittest.TestCase):
             result,
             main_module.APPLICATION_EXIT_REQUEST_TIMEOUT_EXIT_CODE,
         )
+
+
+class ApplicationHandoffTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        self._original_config_root = config.config_root
+        self._original_confirm = single_instance.confirm_application_handoff
+        self._original_handoff_guard = (
+            single_instance.ApplicationHandoffInstanceGuard
+        )
+        self._original_activate = single_instance.activate_existing_settings_window
+        self._original_running = single_instance.application_instance_running
+        self._original_write = single_instance.write_application_exit_request
+        self._original_clear = (
+            single_instance.clear_owned_application_exit_request
+        )
+        self._original_notice = single_instance.show_bridge_startup_blocked_notice
+        config.config_root = lambda: self.root
+        single_instance.ApplicationHandoffInstanceGuard = _make_guard_class()
+
+    def tearDown(self):
+        config.config_root = self._original_config_root
+        single_instance.confirm_application_handoff = self._original_confirm
+        single_instance.ApplicationHandoffInstanceGuard = (
+            self._original_handoff_guard
+        )
+        single_instance.activate_existing_settings_window = self._original_activate
+        single_instance.application_instance_running = self._original_running
+        single_instance.write_application_exit_request = self._original_write
+        single_instance.clear_owned_application_exit_request = self._original_clear
+        single_instance.show_bridge_startup_blocked_notice = self._original_notice
+        self._tmp.cleanup()
+
+    def test_cancel_keeps_the_old_copy_and_only_restores_its_window(self):
+        activations = []
+        single_instance.confirm_application_handoff = lambda _version: False
+        single_instance.activate_existing_settings_window = (
+            lambda: activations.append(1) or True
+        )
+        single_instance.write_application_exit_request = (
+            lambda _root: self.fail("cancel must not write an exit request")
+        )
+        single_instance.application_instance_running = lambda: True
+
+        self.assertFalse(main_module._handoff_previous_application())
+        self.assertEqual(activations, [1])
+
+    def test_confirm_requests_normal_exit_waits_and_clears_the_request(self):
+        request_path = single_instance.application_exit_request_path(self.root)
+        activations = []
+        sleeps = []
+        states = iter((True, True, False))
+        single_instance.confirm_application_handoff = lambda _version: True
+        single_instance.activate_existing_settings_window = (
+            lambda: activations.append(1) or True
+        )
+        single_instance.write_application_exit_request = (
+            lambda root, *, request_id: self._original_write(
+                root,
+                request_id=request_id,
+            )
+        )
+        single_instance.application_instance_running = lambda: next(states)
+
+        result = main_module._handoff_previous_application(
+            monotonic=iter((0.0, 0.01)).__next__,
+            sleep=sleeps.append,
+        )
+
+        self.assertTrue(result)
+        self.assertEqual(activations, [1])
+        self.assertEqual(sleeps, [main_module.APPLICATION_HANDOFF_POLL_SECONDS])
+        self.assertFalse(request_path.exists())
+
+    def test_legacy_copy_can_be_closed_manually_when_request_write_fails(self):
+        activations = []
+        single_instance.confirm_application_handoff = lambda _version: True
+        single_instance.activate_existing_settings_window = (
+            lambda: activations.append(1) or True
+        )
+        states = iter((True, False))
+        single_instance.write_application_exit_request = (
+            lambda _root, *, request_id: (_ for _ in ()).throw(
+                PermissionError("blocked")
+            )
+        )
+        single_instance.application_instance_running = lambda: next(states)
+
+        self.assertTrue(main_module._handoff_previous_application())
+        self.assertEqual(activations, [1])
+
+    def test_legacy_copy_can_exit_manually_without_consuming_the_request(self):
+        request_path = single_instance.application_exit_request_path(self.root)
+        states = iter((True, False))
+        single_instance.confirm_application_handoff = lambda _version: True
+        single_instance.activate_existing_settings_window = lambda: True
+        single_instance.write_application_exit_request = (
+            lambda root, *, request_id: self._original_write(
+                root,
+                request_id=request_id,
+            )
+        )
+        single_instance.application_instance_running = lambda: next(states)
+
+        result = main_module._handoff_previous_application(
+            monotonic=iter((0.0, 0.01)).__next__,
+            sleep=lambda _seconds: None,
+        )
+
+        self.assertTrue(result)
+        self.assertFalse(request_path.exists())
+
+    def test_old_copy_that_exits_before_window_activation_needs_no_extra_notice(self):
+        request_path = single_instance.application_exit_request_path(self.root)
+        notices = []
+        states = iter((True, False))
+        single_instance.confirm_application_handoff = lambda _version: True
+        single_instance.activate_existing_settings_window = lambda: False
+        single_instance.write_application_exit_request = (
+            lambda root, *, request_id: self._original_write(
+                root,
+                request_id=request_id,
+            )
+        )
+        single_instance.application_instance_running = lambda: next(states)
+        single_instance.show_bridge_startup_blocked_notice = notices.append
+
+        result = main_module._handoff_previous_application()
+
+        self.assertTrue(result)
+        self.assertEqual(notices, [])
+        self.assertFalse(request_path.exists())
+
+    def test_consumed_exit_request_stays_silent_while_old_cleanup_finishes(self):
+        request_path = single_instance.application_exit_request_path(self.root)
+        notices = []
+        sleeps = []
+        running_calls = 0
+
+        def running():
+            nonlocal running_calls
+            running_calls += 1
+            if running_calls == 1:
+                return True
+            if running_calls == 2:
+                request_path.unlink()
+                return True
+            return False
+
+        single_instance.confirm_application_handoff = lambda _version: True
+        single_instance.activate_existing_settings_window = lambda: False
+        single_instance.write_application_exit_request = (
+            lambda root, *, request_id: self._original_write(
+                root,
+                request_id=request_id,
+            )
+        )
+        single_instance.application_instance_running = running
+        single_instance.show_bridge_startup_blocked_notice = notices.append
+
+        result = main_module._handoff_previous_application(
+            monotonic=iter((0.0, 6.0)).__next__,
+            sleep=sleeps.append,
+        )
+
+        self.assertTrue(result)
+        self.assertEqual(notices, [])
+        self.assertEqual(sleeps, [main_module.APPLICATION_HANDOFF_POLL_SECONDS])
+
+    def test_unactivated_old_copy_gets_manual_exit_notice_only_while_still_running(self):
+        notices = []
+        sleeps = []
+        states = iter((True, True, False))
+        single_instance.confirm_application_handoff = lambda _version: True
+        single_instance.activate_existing_settings_window = lambda: False
+        single_instance.write_application_exit_request = (
+            lambda root, *, request_id: self._original_write(
+                root,
+                request_id=request_id,
+            )
+        )
+        single_instance.application_instance_running = lambda: next(states)
+        single_instance.show_bridge_startup_blocked_notice = notices.append
+
+        result = main_module._handoff_previous_application(
+            monotonic=iter((0.0, 6.0)).__next__,
+            sleep=sleeps.append,
+        )
+
+        self.assertTrue(result)
+        self.assertEqual(len(notices), 1)
+        self.assertIn("退出请求也尚未被接收", notices[0])
+        self.assertEqual(sleeps, [main_module.APPLICATION_HANDOFF_POLL_SECONDS])
+
+    def test_timeout_leaves_old_copy_running_and_removes_our_stale_request(self):
+        request_path = single_instance.application_exit_request_path(self.root)
+        notices = []
+        single_instance.confirm_application_handoff = lambda _version: True
+        single_instance.activate_existing_settings_window = lambda: True
+        single_instance.write_application_exit_request = (
+            lambda root, *, request_id: self._original_write(
+                root,
+                request_id=request_id,
+            )
+        )
+        single_instance.application_instance_running = lambda: True
+        single_instance.show_bridge_startup_blocked_notice = notices.append
+
+        result = main_module._handoff_previous_application(
+            timeout=0.1,
+            monotonic=iter((0.0, 1.0)).__next__,
+            sleep=lambda _seconds: self.fail("timeout must be checked before sleep"),
+        )
+
+        self.assertFalse(result)
+        self.assertEqual(len(notices), 1)
+        self.assertIn("旧版仍在运行", notices[0])
+        self.assertFalse(request_path.exists())
+
+    def test_cleanup_failure_blocks_the_new_copy_from_starting(self):
+        request_path = single_instance.application_exit_request_path(self.root)
+        notices = []
+        states = iter((True, False))
+        single_instance.confirm_application_handoff = lambda _version: True
+        single_instance.activate_existing_settings_window = lambda: True
+        single_instance.write_application_exit_request = (
+            lambda root, *, request_id: self._original_write(
+                root,
+                request_id=request_id,
+            )
+        )
+        single_instance.clear_owned_application_exit_request = (
+            lambda _root, _request_id: False
+        )
+        single_instance.application_instance_running = lambda: next(states)
+        single_instance.show_bridge_startup_blocked_notice = notices.append
+
+        result = main_module._handoff_previous_application()
+
+        self.assertFalse(result)
+        self.assertTrue(request_path.exists())
+        self.assertEqual(len(notices), 1)
+        self.assertIn("切换请求未能安全清理", notices[0])
+
+    def test_only_one_cross_version_handoff_waiter_is_allowed(self):
+        notices = []
+        activations = []
+        single_instance.ApplicationHandoffInstanceGuard = _make_guard_class(
+            raise_on_enter=single_instance.DuplicateInstanceError("handoff busy")
+        )
+        single_instance.confirm_application_handoff = (
+            lambda _version: self.fail("a second waiter must not prompt again")
+        )
+        single_instance.activate_existing_settings_window = (
+            lambda: activations.append(1) or True
+        )
+        single_instance.show_bridge_startup_blocked_notice = notices.append
+
+        self.assertFalse(main_module._handoff_previous_application())
+        self.assertEqual(activations, [1])
+        self.assertEqual(len(notices), 1)
+        self.assertIn("正在切换运行版本", notices[0])
+
+    def test_timeout_message_does_not_claim_the_old_copy_exited_when_cleanup_fails(self):
+        notices = []
+        single_instance.confirm_application_handoff = lambda _version: True
+        single_instance.activate_existing_settings_window = lambda: True
+        single_instance.write_application_exit_request = (
+            lambda root, *, request_id: self._original_write(
+                root,
+                request_id=request_id,
+            )
+        )
+        single_instance.clear_owned_application_exit_request = (
+            lambda _root, _request_id: False
+        )
+        single_instance.application_instance_running = lambda: True
+        single_instance.show_bridge_startup_blocked_notice = notices.append
+
+        result = main_module._handoff_previous_application(
+            timeout=0.1,
+            monotonic=iter((0.0, 1.0)).__next__,
+            sleep=lambda _seconds: self.fail("timeout must be checked before sleep"),
+        )
+
+        self.assertFalse(result)
+        self.assertEqual(len(notices), 1)
+        self.assertIn("旧版仍在运行", notices[0])
+        self.assertNotIn("旧版已经退出", notices[0])
 
 
 class DiagnoseVbCableLoopbackDispatchTests(_ArgvRestoringTestCase):

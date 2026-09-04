@@ -4,7 +4,9 @@ built from the standalone ``src/launcher.py`` entry point - see XRBM-021):
 - (no args)     open the settings window - the DEFAULT double-click
                 behavior. One per-session application guard owns the window,
                 notification icon, bridge worker and embedded navigator; a
-                repeat launch restores that existing process.
+                repeat launch of the same copy restores that process. A
+                different version/location asks to switch, waits for the old
+                copy to exit normally, then continues the original launch.
 - ``--settings``  open the settings window (explicit form of the default)
 - ``--background``  start the desktop shell hidden in the notification area
 - ``--bridge``  compatibility form for old shortcuts. It starts the same
@@ -87,6 +89,7 @@ from __future__ import annotations
 
 import sys
 import time
+import uuid
 
 from . import __version__
 from . import dev_session
@@ -98,6 +101,9 @@ APPLICATION_EXIT_REQUEST_FAILED_EXIT_CODE = 19
 APPLICATION_EXIT_REQUEST_TIMEOUT_EXIT_CODE = 20
 APPLICATION_EXIT_REQUEST_TIMEOUT_SECONDS = 45.0
 APPLICATION_EXIT_REQUEST_POLL_SECONDS = 0.1
+APPLICATION_HANDOFF_TIMEOUT_SECONDS = 180.0
+APPLICATION_HANDOFF_POLL_SECONDS = 0.1
+APPLICATION_HANDOFF_REQUEST_GRACE_SECONDS = 5.0
 
 
 def _print_help() -> None:
@@ -258,6 +264,148 @@ def _request_application_exit(
         sleep(max(0.01, float(poll_interval)))
 
 
+def _handoff_previous_application(
+    *,
+    timeout: float = APPLICATION_HANDOFF_TIMEOUT_SECONDS,
+    poll_interval: float = APPLICATION_HANDOFF_POLL_SECONDS,
+    monotonic=time.monotonic,
+    sleep=time.sleep,
+) -> bool:
+    """Wait for a different executable copy to exit, without force-stopping it."""
+
+    from . import config, single_instance
+
+    try:
+        handoff_guard = single_instance.ApplicationHandoffInstanceGuard()
+        handoff_guard.__enter__()
+    except single_instance.DuplicateInstanceError:
+        if not single_instance.activate_existing_settings_window():
+            single_instance.show_bridge_startup_blocked_notice(
+                "另一个无线麦副本正在切换运行版本，但旧窗口未能自动唤出。"
+                "请从通知区域打开旧版并选择“完全退出”；不要重复启动。"
+            )
+            return False
+        single_instance.show_bridge_startup_blocked_notice(
+            "另一个无线麦副本正在切换运行版本。请先处理已经唤出的旧版窗口，"
+            "不要重复启动。"
+        )
+        return False
+    except Exception:
+        single_instance.show_bridge_startup_blocked_notice(
+            "无法安全建立版本切换。当前版本没有启动；请完全退出旧版后重试。"
+        )
+        return False
+
+    try:
+        try:
+            running = single_instance.application_instance_running()
+        except Exception:
+            single_instance.show_bridge_startup_blocked_notice(
+                "无法确认旧版是否仍在运行。当前版本没有启动；"
+                "请完全退出旧版后重试。"
+            )
+            return False
+        if not running:
+            return True
+        if not single_instance.confirm_application_handoff(__version__):
+            if not single_instance.activate_existing_settings_window():
+                single_instance.show_bridge_startup_blocked_notice(
+                    "旧版窗口未能自动唤出。请从通知区域打开现有无线麦。"
+                )
+            return False
+
+        root = config.config_root()
+        request_id: str | None = None
+        success = False
+        failure_message = ""
+        try:
+            candidate_request_id = uuid.uuid4().hex
+            try:
+                single_instance.write_application_exit_request(
+                    root,
+                    request_id=candidate_request_id,
+                )
+                request_id = candidate_request_id
+            except OSError:
+                # Older portable builds do not consume this request anyway.
+                # Their visible "完全退出" action remains the compatibility
+                # path when the request cannot be written.
+                pass
+
+            activated = single_instance.activate_existing_settings_window()
+            manual_exit_notice_pending = not activated
+            started_at = monotonic()
+            bounded_timeout = max(0.1, float(timeout))
+            deadline = started_at + bounded_timeout
+            manual_notice_deadline = started_at + min(
+                APPLICATION_HANDOFF_REQUEST_GRACE_SECONDS,
+                bounded_timeout,
+            )
+            while True:
+                try:
+                    running = single_instance.application_instance_running()
+                except Exception:
+                    failure_message = (
+                        "无法确认旧版是否已经完全退出。当前版本没有启动；"
+                        "请从旧版通知区域选择“完全退出”后，再双击当前版本。"
+                    )
+                    break
+                if not running:
+                    success = True
+                    break
+                now = monotonic()
+                if manual_exit_notice_pending and request_id is not None:
+                    if not single_instance.owned_application_exit_request_pending(
+                        root,
+                        request_id,
+                    ):
+                        manual_exit_notice_pending = False
+                    elif now < manual_notice_deadline:
+                        pass
+                    else:
+                        single_instance.show_bridge_startup_blocked_notice(
+                            "旧版窗口未能自动唤出，退出请求也尚未被接收。"
+                            "请从通知区域打开旧版，保存需要保留的修改后选择“完全退出”。"
+                        )
+                        manual_exit_notice_pending = False
+                elif manual_exit_notice_pending:
+                    single_instance.show_bridge_startup_blocked_notice(
+                        "旧版窗口未能自动唤出。当前版本正在等待；请从通知区域打开旧版，"
+                        "保存需要保留的修改后选择“完全退出”。"
+                    )
+                    manual_exit_notice_pending = False
+                if now >= deadline:
+                    failure_message = (
+                        "旧版仍在运行，当前版本没有启动。请从旧版通知区域选择"
+                        "“完全退出”后，再双击当前版本。"
+                    )
+                    break
+                sleep(max(0.01, float(poll_interval)))
+        finally:
+            if request_id is not None and not single_instance.clear_owned_application_exit_request(
+                root,
+                request_id,
+            ):
+                if success:
+                    failure_message = (
+                        "旧版已经退出，但版本切换请求未能安全清理。当前版本没有启动；"
+                        "请稍后重新双击当前版本。"
+                    )
+                elif failure_message:
+                    failure_message += " 同时，版本切换请求也未能安全清理。"
+                else:
+                    failure_message = (
+                        "版本切换请求未能安全清理。当前版本没有启动；"
+                        "请稍后重新双击当前版本。"
+                    )
+                success = False
+        if failure_message:
+            single_instance.show_bridge_startup_blocked_notice(failure_message)
+        return success
+    finally:
+        handoff_guard.__exit__(None, None, None)
+
+
 def main() -> None:
     args = dev_session.consume_marker(sys.argv[1:])
     if "--help" in args or "-h" in args:
@@ -361,7 +509,7 @@ def _run_settings(
 ) -> None:
     from . import settings_ui, single_instance
 
-    try:
+    def run_owned_application() -> None:
         with single_instance.ApplicationInstanceGuard():
             if start_hidden:
                 settings_ui.main(
@@ -370,7 +518,8 @@ def _run_settings(
                 )
             else:
                 settings_ui.main(start_bridge=start_bridge)
-    except single_instance.DuplicateInstanceError:
+
+    def handle_current_runtime_duplicate() -> None:
         if start_bridge:
             from . import config
 
@@ -383,11 +532,41 @@ def _run_settings(
                 )
             return
         if activate_duplicate:
-            if not single_instance.activate_existing_settings_window():
+            if single_instance.activate_current_runtime_settings_window():
+                return
+            activated = single_instance.activate_existing_settings_window()
+            if activated:
                 single_instance.show_bridge_startup_blocked_notice(
-                    f"{product_identity.DISPLAY_NAME}已经在运行，但暂时无法唤出窗口。"
-                    "请从通知区域打开现有程序；不要重复启动。"
+                    "当前副本已有一个启动或运行流程。刚刚唤出的窗口可能是旧版，"
+                    "请以窗口标题版本号为准；若是旧版，请完成已有的版本切换。"
+                    "旧版退出后，等待中的当前版本会自动打开，不要再次双击。"
                 )
+            else:
+                single_instance.show_bridge_startup_blocked_notice(
+                    f"{product_identity.DISPLAY_NAME}当前副本已经在启动、等待旧版退出，"
+                    "或已经在运行，但暂时无法唤出窗口。请从通知区域打开现有程序，"
+                    "完成已有切换；不要重复启动。"
+                )
+    try:
+        with single_instance.ApplicationRuntimeInstanceGuard():
+            try:
+                run_owned_application()
+            except single_instance.DuplicateInstanceError:
+                if start_bridge or not activate_duplicate:
+                    handle_current_runtime_duplicate()
+                    return
+                if not _handoff_previous_application():
+                    return
+                try:
+                    run_owned_application()
+                except single_instance.DuplicateInstanceError:
+                    single_instance.activate_existing_settings_window()
+                    single_instance.show_bridge_startup_blocked_notice(
+                        "旧版退出后，另一个无线麦副本先取得了运行权。"
+                        "当前副本没有继续启动，请使用已经打开的窗口。"
+                    )
+    except single_instance.DuplicateInstanceError:
+        handle_current_runtime_duplicate()
         return
     except Exception as exc:
         print(

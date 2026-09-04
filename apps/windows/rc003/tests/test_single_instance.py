@@ -446,6 +446,98 @@ class SettingsInstanceGuardTests(unittest.TestCase):
                 self.fail("an inaccessible existing settings mutex must block a duplicate")
 
 
+class ApplicationRuntimeInstanceGuardTests(unittest.TestCase):
+    def test_runtime_identity_changes_with_version_or_location(self):
+        first = single_instance.application_runtime_mutex_name(
+            executable_path=r"C:\Apps\RemoteMicRC003.exe",
+            version="1.0.0",
+        )
+        same = single_instance.application_runtime_mutex_name(
+            executable_path=r"c:\apps\remotemicrc003.exe",
+            version="1.0.0",
+        )
+        other_version = single_instance.application_runtime_mutex_name(
+            executable_path=r"C:\Apps\RemoteMicRC003.exe",
+            version="1.0.1",
+        )
+        other_location = single_instance.application_runtime_mutex_name(
+            executable_path=r"C:\Portable\RemoteMicRC003.exe",
+            version="1.0.0",
+        )
+
+        self.assertEqual(first, same)
+        self.assertNotEqual(first, other_version)
+        self.assertNotEqual(first, other_location)
+        self.assertTrue(first.startswith("Local\\"))
+        self.assertNotIn("Apps", first)
+
+    def test_runtime_window_property_uses_the_same_private_identity(self):
+        first = single_instance.application_runtime_window_property(
+            executable_path=r"C:\Apps\RemoteMicRC003.exe",
+            version="1.0.0",
+        )
+        same = single_instance.application_runtime_window_property(
+            executable_path=r"c:\apps\remotemicrc003.exe",
+            version="1.0.0",
+        )
+        other_location = single_instance.application_runtime_window_property(
+            executable_path=r"C:\Portable\RemoteMicRC003.exe",
+            version="1.0.0",
+        )
+
+        self.assertEqual(first, same)
+        self.assertNotEqual(first, other_location)
+        self.assertTrue(first.startswith(single_instance._SETTINGS_WINDOW_PROPERTY + "."))
+        self.assertNotIn("Apps", first)
+
+    def test_runtime_guard_blocks_a_second_waiter_or_owner_of_the_same_copy(self):
+        registry = _FakeMutexRegistry()
+
+        def guard():
+            return single_instance.ApplicationRuntimeInstanceGuard(
+                name=r"Local\RemoteMicRC003_Runtime_test",
+                _create_mutex=registry.create_mutex,
+                _release_mutex=registry.release_mutex,
+                _close_handle=registry.close_handle,
+            )
+
+        with guard():
+            with self.assertRaises(single_instance.DuplicateInstanceError):
+                with guard():
+                    self.fail("the same runtime must have only one owner or waiter")
+
+    def test_handoff_confirmation_names_the_clicked_version_and_safety_rule(self):
+        calls = []
+
+        result = single_instance.confirm_application_handoff(
+            "0.2.0-candidate.4",
+            _confirm=lambda title, message: calls.append((title, message)) or True,
+        )
+
+        self.assertTrue(result)
+        self.assertEqual(len(calls), 1)
+        title, message = calls[0]
+        self.assertIn("0.2.0-candidate.4", title)
+        self.assertIn("被唤出的窗口仍是旧版", message)
+        self.assertIn("窗口标题显示当前版本号才表示切换完成", message)
+        self.assertIn("旧版退出后，当前版本会自动继续打开", message)
+        self.assertIn("不会强制结束进程", message)
+
+    def test_only_one_cross_version_handoff_guard_can_enter(self):
+        registry = _FakeMutexRegistry()
+
+        def guard():
+            return single_instance.ApplicationHandoffInstanceGuard(
+                _create_mutex=registry.create_mutex,
+                _release_mutex=registry.release_mutex,
+                _close_handle=registry.close_handle,
+            )
+
+        with guard():
+            with self.assertRaises(single_instance.DuplicateInstanceError):
+                with guard():
+                    self.fail("only one version handoff may wait at a time")
+
 class ElementNavigationInstanceGuardTests(unittest.TestCase):
     def test_element_navigation_uses_a_distinct_local_mutex(self):
         registry = _FakeMutexRegistry()
@@ -499,7 +591,13 @@ class SettingsWindowActivationTests(unittest.TestCase):
         )
 
         self.assertTrue(marked)
-        self.assertEqual(calls, [(321, single_instance._SETTINGS_WINDOW_PROPERTY)])
+        self.assertEqual(
+            calls,
+            [
+                (321, single_instance._SETTINGS_WINDOW_PROPERTY),
+                (321, single_instance.application_runtime_window_property()),
+            ],
+        )
 
     def test_marker_failure_does_not_block_the_first_window(self):
         self.assertFalse(
@@ -517,6 +615,18 @@ class SettingsWindowActivationTests(unittest.TestCase):
 
         self.assertTrue(activated)
         self.assertEqual(calls, [single_instance._SETTINGS_WINDOW_PROPERTY])
+
+    def test_current_runtime_activation_uses_the_runtime_private_property(self):
+        calls = []
+        activated = single_instance.activate_current_runtime_settings_window(
+            _activate=lambda name: calls.append(name) or True
+        )
+
+        self.assertTrue(activated)
+        self.assertEqual(
+            calls,
+            [single_instance.application_runtime_window_property()],
+        )
 
     def test_activation_failure_is_best_effort_and_nonfatal(self):
         self.assertFalse(
@@ -676,6 +786,72 @@ class ApplicationExitRequestTests(unittest.TestCase):
             )
         )
         self.assertEqual(opened, [single_instance._SETTINGS_MUTEX_NAME])
+
+    def test_handoff_can_observe_its_own_request_until_the_old_copy_consumes_it(self):
+        single_instance.write_application_exit_request(
+            self.root,
+            request_id="ours",
+        )
+
+        self.assertTrue(
+            single_instance.owned_application_exit_request_pending(
+                self.root,
+                "ours",
+            )
+        )
+        self.assertTrue(single_instance.consume_application_exit_request(self.root))
+        self.assertFalse(
+            single_instance.owned_application_exit_request_pending(
+                self.root,
+                "ours",
+            )
+        )
+
+    def test_handoff_never_treats_a_replacement_request_as_its_own(self):
+        single_instance.write_application_exit_request(
+            self.root,
+            request_id="newer",
+        )
+
+        self.assertFalse(
+            single_instance.owned_application_exit_request_pending(
+                self.root,
+                "ours",
+            )
+        )
+
+    def test_handoff_can_clear_only_its_own_pending_request(self):
+        path = single_instance.write_application_exit_request(
+            self.root,
+            request_id="ours",
+        )
+
+        self.assertTrue(
+            single_instance.clear_owned_application_exit_request(
+                self.root,
+                "ours",
+            )
+        )
+        self.assertFalse(path.exists())
+
+    def test_handoff_cleanup_preserves_a_replacement_request(self):
+        path = single_instance.write_application_exit_request(
+            self.root,
+            request_id="ours",
+        )
+        single_instance.write_application_exit_request(
+            self.root,
+            request_id="newer",
+        )
+
+        self.assertFalse(
+            single_instance.clear_owned_application_exit_request(
+                self.root,
+                "ours",
+            )
+        )
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(payload["request_id"], "newer")
 
 
 class MutexCtypesPrototypeTests(unittest.TestCase):

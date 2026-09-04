@@ -5157,6 +5157,7 @@ _QML_LOAD_PROBE_SCRIPT = r"""
 import faulthandler
 import json
 import sys
+import time
 
 # XRBM-034's "engine.warnings connected to a Python callback" theory for
 # this probe's 0xC0000005 was disproven by real Windows CI evidence
@@ -5218,6 +5219,10 @@ voice_page = voice_scroll.parent() if voice_scroll is not None else None
 if voice_page is not None:
     voice_page.setProperty("voiceHotkeyRecording", True)
     controller.hotkeyCaptured.emit("ctrl+shift+f8")
+    deadline = time.monotonic() + 5.0
+    while controller.voiceHotkeyBusy and time.monotonic() < deadline:
+        app.processEvents()
+        time.sleep(0.01)
     app.processEvents()
 saved_config = m.config.load_config(m.config.config_path(m.config.config_root()))
 voice_save_status = controller.statusMessage

@@ -319,7 +319,7 @@ jobs:
           Copy-Item -Path "../../../ASSET_LICENSES.md" -Destination (Join-Path $stagingDir "ASSET_LICENSES.md") -Force
           Copy-Item -Path "../../../THIRD_PARTY_LICENSES" -Destination (Join-Path $stagingDir "THIRD_PARTY_LICENSES") -Recurse -Force
           Copy-Item -Path "ATTRIBUTION.md" -Destination (Join-Path $stagingDir "ATTRIBUTION.md") -Force
-          Copy-Item -Path "installer/readme-rc003.txt" -Destination (Join-Path $stagingDir "README.txt") -Force
+          Copy-Item -Path "installer/readme-portable-rc003.txt" -Destination (Join-Path $stagingDir "README.txt") -Force
 
           $zipPath = "dist/portable/RemoteMicRC003-$version-portable-unsigned.zip"
           if (Test-Path $zipPath) { Remove-Item $zipPath -Force }

@@ -26,6 +26,9 @@ _INSTALL_DEV_SHORTCUT_PATH = _RC003_ROOT / "build" / "install-dev-shortcut.ps1"
 _PUBLIC_BOUNDARY_PATH = _RC003_ROOT / "build" / "check-public-boundary.ps1"
 _README_PATH = _RC003_ROOT / "README.md"
 _INSTALLED_README_PATH = _RC003_ROOT / "installer" / "readme-rc003.txt"
+_PORTABLE_README_PATH = (
+    _RC003_ROOT / "installer" / "readme-portable-rc003.txt"
+)
 _ROOT_README_PATH = _REPO_ROOT / "README.md"
 _THIRD_PARTY_NOTICES_PATH = _REPO_ROOT / "THIRD_PARTY_NOTICES.md"
 
@@ -909,8 +912,8 @@ class WindowsCiWorkflowTests(unittest.TestCase):
         # portable folder, matching what the installer itself packages
         # (LICENSE.txt/COPYRIGHT.txt/THIRD_PARTY_NOTICES.md) plus the two
         # extras the installer doesn't need but a bare portable ZIP does
-        # (ATTRIBUTION.md's file-by-file provenance record, and the
-        # installed readme repurposed as README.txt for usage instructions).
+        # (ATTRIBUTION.md's file-by-file provenance record and a dedicated
+        # portable README that never tells users to run Setup/Start Menu).
         self.assertIn(
             'Copy-Item -Path "../../../LICENSE.md" -Destination (Join-Path $stagingDir "LICENSE.txt")',
             self.text,
@@ -940,9 +943,18 @@ class WindowsCiWorkflowTests(unittest.TestCase):
             self.text,
         )
         self.assertIn(
-            'Copy-Item -Path "installer/readme-rc003.txt" -Destination (Join-Path $stagingDir "README.txt")',
+            'Copy-Item -Path "installer/readme-portable-rc003.txt" -Destination (Join-Path $stagingDir "README.txt")',
             self.text,
         )
+
+    def test_portable_readme_describes_handoff_without_installer_steps(self):
+        text = _PORTABLE_README_PATH.read_text(encoding="utf-8")
+        self.assertIn("这是解压即用的便携版，不是安装程序", text)
+        self.assertIn("旧版完全退出后，这次双击的当前版本会自动继续打开", text)
+        self.assertIn("不会强制结束旧版", text)
+        self.assertIn("窗口标题会显示", text)
+        self.assertNotIn("运行安装器", text)
+        self.assertNotIn("Start Menu 分组", text)
 
     def test_portable_metadata_files_are_staged_before_compress_archive_runs(self):
         # Staging each file is necessary but not sufficient - it must also
