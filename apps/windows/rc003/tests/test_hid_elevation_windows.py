@@ -102,7 +102,8 @@ class InstalledHelperTests(unittest.TestCase):
             protected = root / "protected" / hid_elevation_windows.HELPER_EXE_NAME
             app.mkdir()
             protected.parent.mkdir()
-            bundled = app / hid_elevation_windows.HELPER_EXE_NAME
+            bundled = app / hid_elevation_windows.HELPER_BUNDLE_RELATIVE_PATH
+            bundled.parent.mkdir()
             bundled.write_bytes(b"same-helper")
             protected.write_bytes(b"same-helper")
             xml = hid_elevation_windows.task_definition_xml(protected, SID)
@@ -128,7 +129,9 @@ class InstalledHelperTests(unittest.TestCase):
             protected = root / "protected" / hid_elevation_windows.HELPER_EXE_NAME
             app.mkdir()
             protected.parent.mkdir()
-            (app / hid_elevation_windows.HELPER_EXE_NAME).write_bytes(b"new")
+            bundled = app / hid_elevation_windows.HELPER_BUNDLE_RELATIVE_PATH
+            bundled.parent.mkdir()
+            bundled.write_bytes(b"new")
             protected.write_bytes(b"old")
             runner = mock.Mock()
 
@@ -146,6 +149,17 @@ class InstalledHelperTests(unittest.TestCase):
     def test_source_runtime_never_offers_task_installation(self):
         state = hid_elevation_windows.inspect_installed_helper(frozen=False)
         self.assertEqual(state, hid_elevation_windows.HidHelperState(False, "source_runtime"))
+
+    def test_frozen_distribution_keeps_bundled_helper_under_internal(self):
+        with tempfile.TemporaryDirectory() as raw:
+            executable = Path(raw) / "RemoteMicRC003.exe"
+            self.assertEqual(
+                hid_elevation_windows.bundled_helper_path(
+                    frozen=True,
+                    executable=str(executable),
+                ),
+                Path(raw) / "_internal" / hid_elevation_windows.HELPER_EXE_NAME,
+            )
 
 
 class TaskLifecycleTests(unittest.TestCase):

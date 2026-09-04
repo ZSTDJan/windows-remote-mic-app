@@ -89,6 +89,10 @@ Source: "application-exit-contract-v1.json"; DestDir: "{app}"; Flags: ignorevers
 ; it only after PrepareToInstall has proved the old application is stopped,
 ; so files removed from a newer build cannot survive an in-place upgrade.
 Type: filesandordirs; Name: "{app}\_internal"
+; Builds before 2026-09-04 exposed the internal helper beside the main EXE.
+; Remove that exact obsolete file during upgrade so users continue to see
+; only the supported application entry point at the install root.
+Type: files; Name: "{app}\{#HidHelperExeName}"
 ; Remove only shortcut names created by earlier releases with the same AppId.
 Type: files; Name: "{userdesktop}\Remote Mic · 小米遥控器2 Pro.lnk"
 Type: files; Name: "{userdesktop}\Remote Mic · RC003.lnk"
@@ -172,7 +176,7 @@ function RunHidHelper(const Parameters: String; var ResultCode: Integer): Boolea
 var
   HelperPath: String;
 begin
-  HelperPath := ExpandConstant('{app}\{#HidHelperExeName}');
+  HelperPath := ExpandConstant('{app}\_internal\{#HidHelperExeName}');
   if not FileExists(HelperPath) then
   begin
     ResultCode := -1;

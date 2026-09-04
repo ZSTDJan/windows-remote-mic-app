@@ -240,9 +240,14 @@ jobs:
             Write-Error "expected built executable not found: $builtExe"
             exit 1
           }
-          $builtHidHelper = "dist/RemoteMicRC003/RemoteMicRC003HidHelper.exe"
+          $builtHidHelper = "dist/RemoteMicRC003/_internal/RemoteMicRC003HidHelper.exe"
           if (-not (Test-Path $builtHidHelper)) {
             Write-Error "expected narrow HID helper not found: $builtHidHelper"
+            exit 1
+          }
+          $rootExecutables = @(Get-ChildItem -LiteralPath "dist/RemoteMicRC003" -Filter "*.exe" -File)
+          if ($rootExecutables.Count -ne 1 -or $rootExecutables[0].Name -ne "RemoteMicRC003.exe") {
+            Write-Error "build root must expose only RemoteMicRC003.exe"
             exit 1
           }
           & $builtExe --dry-run

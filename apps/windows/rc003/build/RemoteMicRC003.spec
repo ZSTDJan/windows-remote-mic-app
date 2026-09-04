@@ -48,6 +48,7 @@ DEVICE_PROFILES_DIR = REPO_ROOT / "device-profiles"
 VB_CABLE_BUNDLE_ZIP = RC003_ROOT / "build" / "third_party" / "VBCABLE_Driver_Pack45.zip"
 FRIDA_ASSET_DIR = SRC_ROOT / "ovb_rc003" / "frida_assets"
 HID_HELPER_NAME = "RemoteMicRC003HidHelper"
+HID_HELPER_RELATIVE_PATH = Path("_internal") / f"{HID_HELPER_NAME}.exe"
 
 # Import only the stdlib-only pin/runtime helper so the build contract has one
 # authoritative filename and SHA-256. Source execution may omit the asset, but
@@ -328,9 +329,17 @@ helper_exe = EXE(
     uac_admin=False,
 )
 
+# Keep the privileged implementation available to setup and repair flows
+# without presenting it beside the only user-facing executable. The helper
+# remains a self-contained one-file EXE; only its distribution location moves.
+helper_collect_toc = [
+    (str(HID_HELPER_RELATIVE_PATH), helper_exe.name, "EXECUTABLE"),
+    *helper_exe.dependencies,
+]
+
 coll = COLLECT(
     exe,
-    helper_exe,
+    helper_collect_toc,
     a.binaries,
     a.zipfiles,
     a.datas,

@@ -146,9 +146,13 @@ try {
     if (-not (Test-Path $builtExe)) {
         throw "expected built executable not found: $builtExe"
     }
-    $builtHidHelper = Join-Path "dist" (Join-Path "RemoteMicRC003" "RemoteMicRC003HidHelper.exe")
+    $builtHidHelper = Join-Path "dist" (Join-Path "RemoteMicRC003" (Join-Path "_internal" "RemoteMicRC003HidHelper.exe"))
     if (-not (Test-Path $builtHidHelper)) {
         throw "expected narrow HID helper not found: $builtHidHelper"
+    }
+    $rootExecutables = @(Get-ChildItem -LiteralPath (Split-Path $builtExe -Parent) -Filter "*.exe" -File)
+    if ($rootExecutables.Count -ne 1 -or $rootExecutables[0].Name -ne "RemoteMicRC003.exe") {
+        throw "build root must expose only RemoteMicRC003.exe"
     }
     & $builtExe --dry-run
     Assert-LastExitCode "$builtExe --dry-run"

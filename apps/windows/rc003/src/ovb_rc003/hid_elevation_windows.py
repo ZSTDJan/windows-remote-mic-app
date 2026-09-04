@@ -30,6 +30,7 @@ from typing import Callable, Optional, Sequence
 
 TASK_NAME = r"\RemoteMic\RC003\HidTapInjector"
 HELPER_EXE_NAME = "RemoteMicRC003HidHelper.exe"
+HELPER_BUNDLE_RELATIVE_PATH = Path("_internal") / HELPER_EXE_NAME
 INSTALL_FLAG = "--install-task"
 UNINSTALL_FLAG = "--uninstall-task"
 INJECT_FLAG = "--inject"
@@ -95,7 +96,7 @@ def bundled_helper_path(
     if not frozen:
         return None
     base = Path(executable or sys.executable).resolve().parent
-    return base / HELPER_EXE_NAME
+    return base / HELPER_BUNDLE_RELATIVE_PATH
 
 
 def is_installed_distribution(

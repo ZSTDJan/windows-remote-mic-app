@@ -217,6 +217,10 @@ class PyInstallerSpecTests(unittest.TestCase):
         self.assertTrue(_HID_HELPER_LAUNCHER_PATH.is_file())
         self.assertIn('SRC_ROOT / "hid_helper_launcher.py"', text)
         self.assertIn('HID_HELPER_NAME = "RemoteMicRC003HidHelper"', text)
+        self.assertIn(
+            'HID_HELPER_RELATIVE_PATH = Path("_internal")',
+            text,
+        )
         self.assertIn("helper_a = Analysis(", text)
         self.assertIn("helper_pyz = PYZ(", text)
         self.assertIn("helper_exe = EXE(", text)
@@ -227,7 +231,12 @@ class PyInstallerSpecTests(unittest.TestCase):
         self.assertIn('"ovb_rc003.frida_hid_tap_injector"', text)
         self.assertIn('"PySide6"', text)
         self.assertIn('"ovb_rc003.qt_settings_app"', text)
-        self.assertIn("helper_exe,", text)
+        self.assertIn(
+            '(str(HID_HELPER_RELATIVE_PATH), helper_exe.name, "EXECUTABLE")',
+            text,
+        )
+        self.assertIn("*helper_exe.dependencies", text)
+        self.assertNotIn("\n    helper_exe,\n", text)
 
     def test_main_and_helper_manifests_do_not_require_administrator(self):
         text = _strip_hash_comments(_SPEC_PATH.read_text(encoding="utf-8"))
@@ -375,6 +384,20 @@ class InnoSetupScriptTests(unittest.TestCase):
         self.assertIn("-ElevatedRetry", code_section)
         self.assertNotIn("--pid", code_section)
         self.assertNotIn("PrivilegesRequired=admin", self.effective_text)
+
+    def test_installer_uses_internal_helper_and_removes_the_old_root_copy(self):
+        code_section = _iss_section(self.text, "Code")
+        install_delete = _strip_semicolon_comments(
+            _iss_section(self.text, "InstallDelete")
+        )
+        self.assertIn(
+            "ExpandConstant('{app}\\_internal\\{#HidHelperExeName}')",
+            code_section,
+        )
+        self.assertIn(
+            'Type: files; Name: "{app}\\{#HidHelperExeName}"',
+            install_delete,
+        )
 
     def test_install_failure_explicitly_disables_custom_direction_mapping(self):
         code_section = _iss_section(self.text, "Code")
@@ -1179,10 +1202,11 @@ class WindowsCiWorkflowTests(unittest.TestCase):
 
     def test_requires_the_narrow_hid_helper_in_the_built_directory(self):
         self.assertIn(
-            'dist/RemoteMicRC003/RemoteMicRC003HidHelper.exe',
+            'dist/RemoteMicRC003/_internal/RemoteMicRC003HidHelper.exe',
             self.text,
         )
         self.assertIn("expected narrow HID helper not found", self.text)
+        self.assertIn("build root must expose only RemoteMicRC003.exe", self.text)
 
     def test_frida_fetch_step_is_a_required_gate_not_best_effort(self):
         step_start = self.text.index("- name: Fetch and verify Frida Gadget")
@@ -1276,6 +1300,7 @@ class BuildCandidateScriptTests(unittest.TestCase):
         dry_run_index = self.text.index("& $builtExe --dry-run")
         self.assertLess(helper_index, dry_run_index)
         self.assertIn("expected narrow HID helper not found", self.text)
+        self.assertIn("build root must expose only RemoteMicRC003.exe", self.text)
 
 
 class DeveloperEntryScriptTests(unittest.TestCase):
@@ -1686,6 +1711,12 @@ class PortableAndInstallerFlowContractTests(unittest.TestCase):
         self.assertIn(
             r".\RemoteMicRC003.exe --settings", self.text
         )
+
+    def test_portable_root_exposes_only_the_main_executable(self):
+        self.assertIn("解压目录根层只保留一个供用户启动的程序", self.normalized)
+        self.assertIn("`RemoteMicRC003.exe`", self.text)
+        self.assertIn("`_internal`", self.text)
+        self.assertIn("不需要也不应手动打开", self.normalized)
 
     def test_portable_start_command_uses_the_explicit_bridge_flag(self):
         # The no-argument invocation now opens the settings window, so the

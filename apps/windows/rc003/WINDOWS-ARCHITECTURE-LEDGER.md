@@ -529,7 +529,8 @@ VB-CABLE 的检测、确认和 UAC 安装继续只有 `DiagnosticsPage.qml` 一�
 ## 14. 构建、安装与第三方资产
 
 `build/RemoteMicRC003.spec` 生成 one-dir、windowed、unsigned PyInstaller
-候选。目录内包含普通权限桌面 EXE 和自包含、普通 manifest 的窄职责 HID 助手；
+候选。成品根目录只暴露普通权限桌面 EXE；自包含、普通 manifest 的窄职责 HID 助手
+收在 `_internal` 内，不作为用户入口展示；
 助手只打入固定任务生命周期、WUDFHost 核验/注入代码和固定 Gadget 资产，不打入
 Qt、BLE、音频、设置或用户配置模块。构建同时包含 QML、设备 profiles、遥控器图片
 和已验证的可选资产。
@@ -541,7 +542,7 @@ Qt、BLE、音频、设置或用户配置模块。构建同时包含 QML、设�
 3. 下载并校验固定 VB-CABLE 包；
 4. 下载并校验固定 Frida Gadget；
 5. 运行带 `ResourceWarning` 门禁的完整测试；
-6. PyInstaller 构建并确认两个 EXE 都存在；
+6. PyInstaller 构建并确认根目录只有主 EXE、内部目录存在 HID 助手；
 7. 冻结 EXE `--dry-run` 和 Qt 运行时检查。
 
 Frida Gadget 与 VB-CABLE 都是候选构建的固定下载和哈希门禁；PyInstaller spec
@@ -549,7 +550,7 @@ Frida Gadget 与 VB-CABLE 都是候选构建的固定下载和哈希门禁；PyI
 助手未生成都会直接停止构建，不能产出没有完整 HID 能力却沿用候选结论的包。
 
 `installer/RemoteMicRC003Setup.iss` 是 per-user、普通权限安装器，不自动启动、
-不自动安装驱动。文件写入后只通过 Windows 管理员确认启动 HID 助手的固定
+不自动安装驱动。文件写入后只通过 Windows 管理员确认启动 `_internal` 中 HID 助手的固定
 `--install-task`；
 用户拒绝 UAC 时主程序仍可安装，但方向映射明确停用并提供“修复权限”。升级和卸载前
 调用 `stop-app.ps1`，只处理安装目录下、完整路径、PID 与 CreationDate 都匹配的
@@ -557,7 +558,8 @@ Frida Gadget 与 VB-CABLE 都是候选构建的固定下载和哈希门禁；PyI
 超时就停止安装，绝不强杀。已发布的旧双进程版本先通过旧托盘控制窗口正常停止桥接，
 并校验窗口所属 PID，随后才有界清理不再持有硬件资源的设置壳。只有明确权限不足时才
 在管理员确认后重试一次；控制入口缺失或身份无法确认时直接停止，不弹无意义 UAC。确认进程
-全部结束后，升级才删除并重写纯程序目录 `{app}\_internal`，不会删除 LocalAppData 中的
+全部结束后，升级才删除并重写纯程序目录 `{app}\_internal`，并删除旧版曾留在根目录的
+同名 HID 助手，不会删除 LocalAppData 中的
 配置、日志或采集数据。卸载在删除程序文件前用固定 `--uninstall-task` 删除计划任务和
 Program Files 助手；UAC 取消或清理失败会中止卸载，避免留下指向失效文件的任务。
 
