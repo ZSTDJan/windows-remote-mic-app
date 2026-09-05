@@ -50,7 +50,9 @@ class DefaultConfigPrivacyTests(unittest.TestCase):
         )
         self.assertEqual(defaults["gain_db"], 10.0)
         self.assertFalse(defaults["launch_bridge_on_app_start"])
-        self.assertEqual(defaults["close_behavior"], config.CLOSE_BEHAVIOR_QUIT)
+        self.assertEqual(
+            defaults["close_behavior"], config.CLOSE_BEHAVIOR_HIDE_TO_TRAY
+        )
         self.assertEqual(defaults["hid_helper_setup_prompted_offer_id"], "")
 
     def test_default_config_contains_no_forbidden_identity_fields(self):
@@ -89,15 +91,17 @@ class DefaultConfigPrivacyTests(unittest.TestCase):
             )
             loaded = config.load_config(path)
         self.assertTrue(loaded["launch_bridge_on_app_start"])
-        self.assertEqual(loaded["close_behavior"], config.CLOSE_BEHAVIOR_QUIT)
+        self.assertEqual(
+            loaded["close_behavior"], config.CLOSE_BEHAVIOR_HIDE_TO_TRAY
+        )
 
-    def test_legacy_hide_to_tray_is_migrated_to_quit_once(self):
+    def test_legacy_hide_to_tray_choice_is_preserved(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "config.json"
             path.write_text(
                 json.dumps(
                     {
-                        "schema_version": config._QUIT_BY_DEFAULT_SCHEMA_VERSION - 1,
+                        "schema_version": 1,
                         "close_behavior": config.CLOSE_BEHAVIOR_HIDE_TO_TRAY,
                     }
                 ),
@@ -105,7 +109,28 @@ class DefaultConfigPrivacyTests(unittest.TestCase):
             )
             loaded = config.load_config(path)
 
-        self.assertEqual(loaded["close_behavior"], config.CLOSE_BEHAVIOR_QUIT)
+        self.assertEqual(
+            loaded["close_behavior"], config.CLOSE_BEHAVIOR_HIDE_TO_TRAY
+        )
+
+    def test_existing_quit_choice_is_preserved(self):
+        for schema_version in (1, config.SCHEMA_VERSION):
+            with self.subTest(schema_version=schema_version), tempfile.TemporaryDirectory() as tmp:
+                path = Path(tmp) / "config.json"
+                path.write_text(
+                    json.dumps(
+                        {
+                            "schema_version": schema_version,
+                            "close_behavior": config.CLOSE_BEHAVIOR_QUIT,
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                loaded = config.load_config(path)
+
+            self.assertEqual(
+                loaded["close_behavior"], config.CLOSE_BEHAVIOR_QUIT
+            )
 
     def test_current_explicit_hide_to_tray_choice_is_preserved(self):
         with tempfile.TemporaryDirectory() as tmp:

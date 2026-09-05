@@ -33,8 +33,6 @@ KEY_BINDINGS_FILENAME = "key_bindings.json"
 
 SCHEMA_VERSION = 12
 
-_QUIT_BY_DEFAULT_SCHEMA_VERSION = 10
-
 CLOSE_BEHAVIOR_HIDE_TO_TRAY = "hide_to_tray"
 CLOSE_BEHAVIOR_QUIT = "quit"
 VALID_CLOSE_BEHAVIORS = frozenset(
@@ -133,7 +131,7 @@ def default_config() -> Dict[str, Any]:
         # Desktop-shell behavior. Windows login startup itself is owned by
         # the user's HKCU Run value and is deliberately not mirrored here.
         "launch_bridge_on_app_start": False,
-        "close_behavior": CLOSE_BEHAVIOR_QUIT,
+        "close_behavior": CLOSE_BEHAVIOR_HIDE_TO_TRAY,
         # A portable build offers each exact helper binary once. The explicit
         # device-page action remains available after the automatic prompt.
         "hid_helper_setup_prompted_offer_id": "",
@@ -177,22 +175,13 @@ def load_config(path: Path) -> Dict[str, Any]:
         if not isinstance(stored, dict):
             raise ConfigFormatError("config.json root must be a JSON object")
         _assert_no_forbidden_keys(stored)
-        try:
-            stored_schema_version = int(stored.get("schema_version", 0))
-        except (TypeError, ValueError):
-            stored_schema_version = 0
         # Normalize the persisted voice fields before merging defaults. A
         # shallow merge would otherwise make a newly introduced default look
         # like an explicitly saved top-level/nested shortcut and could hide
         # the old value that is actually present in the file.
         _normalize_voice_program(stored)
         _normalize_voice_hotkey(stored)
-        _normalize_desktop_behavior(
-            stored,
-            migrate_legacy_close_behavior=(
-                stored_schema_version < _QUIT_BY_DEFAULT_SCHEMA_VERSION
-            ),
-        )
+        _normalize_desktop_behavior(stored)
         config.update(stored)
     _normalize_voice_program(config)
     _normalize_voice_hotkey(config)
@@ -353,9 +342,7 @@ def _normalize_voice_program(config: Dict[str, Any]) -> None:
     )
 
 
-def _normalize_desktop_behavior(
-    config: Dict[str, Any], *, migrate_legacy_close_behavior: bool = False
-) -> None:
+def _normalize_desktop_behavior(config: Dict[str, Any]) -> None:
     config["launch_bridge_on_app_start"] = bool(
         config.get("launch_bridge_on_app_start", False)
     )
@@ -376,12 +363,10 @@ def _normalize_desktop_behavior(
             prompted_offer_id = "legacy-generation:1"
     config["hid_helper_setup_prompted_offer_id"] = prompted_offer_id
     close_behavior = str(
-        config.get("close_behavior", CLOSE_BEHAVIOR_QUIT)
+        config.get("close_behavior", CLOSE_BEHAVIOR_HIDE_TO_TRAY)
     ).strip()
-    if migrate_legacy_close_behavior and close_behavior == CLOSE_BEHAVIOR_HIDE_TO_TRAY:
-        close_behavior = CLOSE_BEHAVIOR_QUIT
     if close_behavior not in VALID_CLOSE_BEHAVIORS:
-        close_behavior = CLOSE_BEHAVIOR_QUIT
+        close_behavior = CLOSE_BEHAVIOR_HIDE_TO_TRAY
     config["close_behavior"] = close_behavior
     config["schema_version"] = SCHEMA_VERSION
 

@@ -519,11 +519,11 @@ class SettingsControllerTests(unittest.TestCase):
     def _continue_save_and_launch(self, controller):
         controller._continue_save_and_launch()
 
-    def test_desktop_behavior_defaults_quit_close_and_do_not_auto_start_bridge(self):
+    def test_desktop_behavior_defaults_to_tray_and_does_not_auto_start_bridge(self):
         controller, _model = self._make_controller()
         self.assertFalse(controller.launchAtLogin)
         self.assertFalse(controller.launchBridgeOnAppStart)
-        self.assertEqual(controller.closeBehavior, "quit")
+        self.assertEqual(controller.closeBehavior, "hide_to_tray")
         self.assertEqual(controller.applicationVersion, qt_settings_app.__version__)
         self.assertTrue(
             controller.trayIconSource.endswith("remote-mic-unavailable.svg")
@@ -583,6 +583,42 @@ class SettingsControllerTests(unittest.TestCase):
         self.assertTrue(controller.hidHelperSetupRequired)
         self.assertIn("确认一次管理员权限", controller.hidHelperIssueText)
 
+    def test_newer_helper_state_hides_actions_that_cannot_succeed(self):
+        newer = qt_settings_app.hid_elevation_windows.HidHelperState(
+            False, "helper_task_contract_newer"
+        )
+        with mock.patch.object(
+            qt_settings_app.sys, "frozen", True, create=True
+        ), mock.patch.object(
+            qt_settings_app.hid_elevation_windows,
+            "inspect_installed_helper",
+            return_value=newer,
+        ), mock.patch.object(
+            qt_settings_app.hid_elevation_windows,
+            "is_installed_distribution",
+            return_value=False,
+        ):
+            controller, _model = self._make_controller()
+
+        with mock.patch.object(
+            qt_settings_app.hid_helper_consumers,
+            "install_for_current_consumer",
+        ) as repair, mock.patch.object(
+            qt_settings_app.hid_helper_consumers,
+            "remove_for_portable_consumer",
+        ) as remove:
+            self.assertFalse(controller.claimPortableHidSetupPrompt())
+            controller.repairHidHelper()
+            controller.removeHidHelper()
+
+        self.assertTrue(controller.hidHelperIssueVisible)
+        self.assertFalse(controller.hidHelperSetupRequired)
+        self.assertFalse(controller.hidHelperRepairVisible)
+        self.assertFalse(controller.hidHelperRemovalVisible)
+        self.assertIn("较新版本", controller.hidHelperIssueText)
+        repair.assert_not_called()
+        remove.assert_not_called()
+
     def test_elevated_portable_session_is_not_reported_as_broken(self):
         with mock.patch.object(
             qt_settings_app.sys, "frozen", True, create=True
@@ -629,12 +665,21 @@ class SettingsControllerTests(unittest.TestCase):
             qt_settings_app.hid_helper_consumers,
             "install_for_current_consumer",
             return_value=ready,
-        ) as repair:
+        ) as repair, mock.patch.object(
+            qt_settings_app.logging_setup,
+            "write_parent_hid_helper_event",
+        ) as helper_log:
             controller.repairHidHelper()
 
         repair.assert_called_once_with(
             controller._config_root,
             qt_settings_app.hid_elevation_windows.request_install_elevation,
+        )
+        helper_log.assert_called_once_with(
+            "setup_result",
+            available=True,
+            detail="",
+            root=controller._config_root,
         )
         self.assertFalse(controller.hidHelperRepairBusy)
         self.assertFalse(controller.hidHelperIssueVisible)
@@ -903,7 +948,227 @@ class SettingsControllerTests(unittest.TestCase):
 
         save.assert_called_once()
         request.assert_not_called()
-        self.assertIn("无法记录首次授权状态", controller.errorMessage)
+        self.assertIn("无法记录首次提示状态", controller.errorMessage)
+
+    def test_incomplete_portable_bundle_gives_a_direct_recovery_action(self):
+        missing = qt_settings_app.hid_elevation_windows.HidHelperState(
+            False, "protected_helper_missing"
+        )
+        incomplete = qt_settings_app.hid_elevation_windows.HidHelperState(
+            False, "bundled_helper_missing"
+        )
+        with mock.patch.object(
+            qt_settings_app.sys, "frozen", True, create=True
+        ), mock.patch.object(
+            qt_settings_app.hid_elevation_windows,
+            "inspect_installed_helper",
+            return_value=missing,
+        ), mock.patch.object(
+            qt_settings_app.hid_elevation_windows,
+            "is_installed_distribution",
+            return_value=False,
+        ):
+            controller, _model = self._make_controller()
+
+        with mock.patch.object(
+            qt_settings_app.hid_helper_consumers,
+            "install_for_current_consumer",
+            return_value=incomplete,
+        ):
+            controller.repairHidHelper()
+
+        self.assertIn("完整解压 ZIP", controller.errorMessage)
+        self.assertIn("RemoteMicRC003.exe", controller.errorMessage)
+
+    def test_missing_portable_helper_at_start_never_requests_uac(self):
+        missing = qt_settings_app.hid_elevation_windows.HidHelperState(
+            False, "protected_helper_missing"
+        )
+        with mock.patch.object(
+            qt_settings_app.sys, "frozen", True, create=True
+        ), mock.patch.object(
+            qt_settings_app.hid_elevation_windows,
+            "bundled_helper_offer_id",
+            return_value="",
+        ), mock.patch.object(
+            qt_settings_app.hid_elevation_windows,
+            "inspect_installed_helper",
+            return_value=missing,
+        ), mock.patch.object(
+            qt_settings_app.hid_elevation_windows,
+            "is_installed_distribution",
+            return_value=False,
+        ):
+            controller, _model = self._make_controller()
+
+        with mock.patch.object(
+            qt_settings_app.hid_helper_consumers,
+            "install_for_current_consumer",
+        ) as repair:
+            self.assertFalse(controller.claimPortableHidSetupPrompt())
+            controller.repairHidHelper()
+
+        repair.assert_not_called()
+        self.assertIn("完整解压 ZIP", controller.errorMessage)
+        self.assertIn("RemoteMicRC003.exe", controller.errorMessage)
+
+    def test_incomplete_installed_bundle_recommends_reinstall(self):
+        missing = qt_settings_app.hid_elevation_windows.HidHelperState(
+            False, "protected_helper_missing"
+        )
+        incomplete = qt_settings_app.hid_elevation_windows.HidHelperState(
+            False, "bundled_helper_missing"
+        )
+        with mock.patch.object(
+            qt_settings_app.sys, "frozen", True, create=True
+        ), mock.patch.object(
+            qt_settings_app.hid_elevation_windows,
+            "inspect_installed_helper",
+            return_value=missing,
+        ), mock.patch.object(
+            qt_settings_app.hid_elevation_windows,
+            "is_installed_distribution",
+            return_value=True,
+        ):
+            controller, _model = self._make_controller()
+
+        with mock.patch.object(
+            qt_settings_app.hid_helper_consumers,
+            "install_for_current_consumer",
+            return_value=incomplete,
+        ):
+            controller.repairHidHelper()
+
+        self.assertIn("重新安装当前版本", controller.errorMessage)
+        self.assertNotIn("解压 ZIP", controller.errorMessage)
+
+    def test_missing_installed_helper_at_start_never_requests_uac(self):
+        missing = qt_settings_app.hid_elevation_windows.HidHelperState(
+            False, "protected_helper_missing"
+        )
+        with mock.patch.object(
+            qt_settings_app.sys, "frozen", True, create=True
+        ), mock.patch.object(
+            qt_settings_app.hid_elevation_windows,
+            "bundled_helper_offer_id",
+            return_value="",
+        ), mock.patch.object(
+            qt_settings_app.hid_elevation_windows,
+            "inspect_installed_helper",
+            return_value=missing,
+        ), mock.patch.object(
+            qt_settings_app.hid_elevation_windows,
+            "is_installed_distribution",
+            return_value=True,
+        ):
+            controller, _model = self._make_controller()
+
+        with mock.patch.object(
+            qt_settings_app.hid_helper_consumers,
+            "install_for_current_consumer",
+        ) as repair:
+            controller.repairHidHelper()
+
+        repair.assert_not_called()
+        self.assertIn("重新安装当前版本", controller.errorMessage)
+        self.assertNotIn("解压 ZIP", controller.errorMessage)
+
+    def test_repair_that_finds_a_newer_helper_stops_offering_old_actions(self):
+        missing = qt_settings_app.hid_elevation_windows.HidHelperState(
+            False, "protected_helper_missing"
+        )
+        newer = qt_settings_app.hid_elevation_windows.HidHelperState(
+            False, "newer_helper_preserved"
+        )
+        with mock.patch.object(
+            qt_settings_app.sys, "frozen", True, create=True
+        ), mock.patch.object(
+            qt_settings_app.hid_elevation_windows,
+            "inspect_installed_helper",
+            return_value=missing,
+        ), mock.patch.object(
+            qt_settings_app.hid_elevation_windows,
+            "is_installed_distribution",
+            return_value=False,
+        ):
+            controller, _model = self._make_controller()
+
+        with mock.patch.object(
+            qt_settings_app.hid_helper_consumers,
+            "install_for_current_consumer",
+            return_value=newer,
+        ) as repair:
+            controller.repairHidHelper()
+
+        repair.assert_called_once()
+        self.assertIn("较新版本", controller.errorMessage)
+        self.assertFalse(controller.hidHelperSetupRequired)
+        self.assertFalse(controller.hidHelperRepairVisible)
+        self.assertFalse(controller.hidHelperRemovalVisible)
+
+    def test_installed_helper_timeout_points_to_repair_permission(self):
+        missing = qt_settings_app.hid_elevation_windows.HidHelperState(
+            False, "protected_helper_missing"
+        )
+        timed_out = qt_settings_app.hid_elevation_windows.HidHelperState(
+            False, "hid_helper_setup_timeout"
+        )
+        with mock.patch.object(
+            qt_settings_app.sys, "frozen", True, create=True
+        ), mock.patch.object(
+            qt_settings_app.hid_elevation_windows,
+            "inspect_installed_helper",
+            return_value=missing,
+        ), mock.patch.object(
+            qt_settings_app.hid_elevation_windows,
+            "is_installed_distribution",
+            return_value=True,
+        ):
+            controller, _model = self._make_controller()
+
+        with mock.patch.object(
+            qt_settings_app.hid_helper_consumers,
+            "install_for_current_consumer",
+            return_value=timed_out,
+        ):
+            controller.repairHidHelper()
+
+        self.assertIn("修复权限", controller.errorMessage)
+        self.assertNotIn("启用改键", controller.errorMessage)
+
+    def test_helper_validation_failure_points_to_retry_and_the_log(self):
+        missing = qt_settings_app.hid_elevation_windows.HidHelperState(
+            False, "protected_helper_missing"
+        )
+        failed = qt_settings_app.hid_elevation_windows.HidHelperState(
+            False,
+            "hid_helper_setup_exit_"
+            + str(
+                qt_settings_app.hid_elevation_windows.HELPER_EXIT_VALIDATION_FAILED
+            ),
+        )
+        with mock.patch.object(
+            qt_settings_app.sys, "frozen", True, create=True
+        ), mock.patch.object(
+            qt_settings_app.hid_elevation_windows,
+            "inspect_installed_helper",
+            return_value=missing,
+        ), mock.patch.object(
+            qt_settings_app.hid_elevation_windows,
+            "is_installed_distribution",
+            return_value=False,
+        ):
+            controller, _model = self._make_controller()
+
+        with mock.patch.object(
+            qt_settings_app.hid_helper_consumers,
+            "install_for_current_consumer",
+            return_value=failed,
+        ):
+            controller.repairHidHelper()
+
+        self.assertIn("没有完成安装", controller.errorMessage)
+        self.assertIn("运行日志", controller.errorMessage)
 
     def test_portable_can_remove_the_shared_helper_after_confirmation(self):
         ready = qt_settings_app.hid_elevation_windows.HidHelperState(True)
@@ -924,12 +1189,21 @@ class SettingsControllerTests(unittest.TestCase):
             qt_settings_app.hid_helper_consumers,
             "remove_for_portable_consumer",
             return_value=ready,
-        ) as remove:
+        ) as remove, mock.patch.object(
+            qt_settings_app.logging_setup,
+            "write_parent_hid_helper_event",
+        ) as helper_log:
             controller.removeHidHelper()
 
         remove.assert_called_once_with(
             controller._config_root,
             qt_settings_app.hid_elevation_windows.request_uninstall_elevation,
+        )
+        helper_log.assert_called_once_with(
+            "removal_result",
+            available=True,
+            detail="",
+            root=controller._config_root,
         )
         self.assertFalse(controller.hidHelperRemovalVisible)
         self.assertTrue(controller.hidHelperSetupRequired)
@@ -4176,14 +4450,19 @@ class SettingsControllerTests(unittest.TestCase):
         self.assertEqual(model.selected_button_id(), "power")
 
     def test_real_key_detection_selects_captured_button_without_executing_mapping(self):
+        from PySide6.QtCore import QCoreApplication
+
+        app = QCoreApplication.instance() or QCoreApplication([])
         controller, model = self._make_controller()
         callbacks = []
+        listeners = []
 
         class FakeListener:
             def __init__(self, _button_callback, raw_callback):
                 callbacks.append(raw_callback)
                 self.started_with = None
                 self.stop_calls = 0
+                listeners.append(self)
 
             def start(self, device_path):
                 self.started_with = device_path
@@ -4207,18 +4486,27 @@ class SettingsControllerTests(unittest.TestCase):
             controller.startKeyDetection()
 
         self.assertTrue(controller.keyDetectionActive)
-        callbacks[0](
-            qt_settings_app.raw_input_windows.RawInputEvent(
-                source="keyboard",
-                is_pressed=True,
-                button_id="power",
-                vkey=0xFF,
-                make_code=0x5E,
-                flags=0x0002,
-                message=0x0100,
+        controller._background_task_runner = None
+        try:
+            callbacks[0](
+                qt_settings_app.raw_input_windows.RawInputEvent(
+                    source="keyboard",
+                    is_pressed=True,
+                    button_id="power",
+                    vkey=0xFF,
+                    make_code=0x5E,
+                    flags=0x0002,
+                    message=0x0100,
+                )
             )
-        )
+            deadline = time.monotonic() + 1.0
+            while controller.keyDetectionActive and time.monotonic() < deadline:
+                app.processEvents()
+                time.sleep(0.001)
+        finally:
+            controller.shutdownBackgroundTasks()
         self.assertFalse(controller.keyDetectionActive)
+        self.assertEqual(listeners[0].stop_calls, 1)
         self.assertEqual(controller.selectedButtonId, "power")
         self.assertEqual(model.selected_button_id(), "power")
         self.assertIn("电源键", controller.keyDetectionText)
@@ -4569,6 +4857,44 @@ class SettingsControllerTests(unittest.TestCase):
         controller.stopHotkeyCapture()
 
         self.assertIs(controller._hotkey_capture, capture)
+
+    def test_window_hide_waits_for_active_input_capture_to_stop(self):
+        controller, _ = self._make_controller()
+        capture = mock.Mock()
+        controller._hotkey_capture = capture
+        controller._set_input_operation_state("hotkey", "active")
+        ready = []
+        failed = []
+        controller.windowHideReady.connect(lambda: ready.append(True))
+        controller.windowHideFailed.connect(failed.append)
+
+        controller.prepareForWindowHide()
+
+        capture.stop.assert_called_once_with()
+        self.assertIsNone(controller._hotkey_capture)
+        self.assertEqual(controller._input_operation_phase, "idle")
+        self.assertEqual(ready, [True])
+        self.assertEqual(failed, [])
+
+    def test_window_hide_failure_keeps_input_capture_for_retry(self):
+        controller, _ = self._make_controller()
+        capture = mock.Mock()
+        capture.stop.side_effect = RuntimeError("stop failed")
+        controller._hotkey_capture = capture
+        controller._set_input_operation_state("hotkey", "active")
+        ready = []
+        failed = []
+        controller.windowHideReady.connect(lambda: ready.append(True))
+        controller.windowHideFailed.connect(failed.append)
+
+        controller.prepareForWindowHide()
+
+        capture.stop.assert_called_once_with()
+        self.assertIs(controller._hotkey_capture, capture)
+        self.assertEqual(controller._input_operation_phase, "active")
+        self.assertEqual(ready, [])
+        self.assertEqual(len(failed), 1)
+        self.assertIn("停止", failed[0])
 
     def test_input_stop_worker_owns_the_resource_during_process_shutdown(self):
         controller, _ = self._make_controller()
@@ -6249,9 +6575,14 @@ from ovb_rc003 import qt_settings_app as m
 
 original_connect_application_exit = m._connect_application_exit
 action = os.environ.get("RC003_EXIT_PROBE_ACTION", "controller")
-slow_bridge_exit = action == "window_close_running_bridge"
+window_close_actions = {
+    "window_close_hide",
+    "window_close_quit",
+    "window_close_quit_running_bridge",
+}
+slow_bridge_exit = action == "window_close_quit_running_bridge"
 m.single_instance.bridge_instance_running = lambda: slow_bridge_exit
-visibility = {"during_cleanup": None}
+visibility = {"after_close": None, "during_cleanup": None}
 
 if slow_bridge_exit:
     def delayed_bridge_exit():
@@ -6265,7 +6596,7 @@ def connect_application_exit_and_schedule(app, controller):
     original_connect_application_exit(app, controller)
 
     def trigger_exit():
-        if action in {"window_close", "window_close_running_bridge"}:
+        if action in window_close_actions:
             windows = app.topLevelWindows()
             if not windows:
                 app.exit(23)
@@ -6275,6 +6606,15 @@ def connect_application_exit_and_schedule(app, controller):
         controller.requestApplicationExit()
 
     QTimer.singleShot(50, trigger_exit)
+    if action == "window_close_hide":
+        def finish_hide_probe():
+            windows = app.topLevelWindows()
+            visibility["after_close"] = (
+                windows[0].isVisible() if windows else None
+            )
+            controller.requestApplicationExit()
+
+        QTimer.singleShot(300, finish_hide_probe)
     if slow_bridge_exit:
         def record_visibility():
             windows = app.topLevelWindows()
@@ -6286,14 +6626,19 @@ def connect_application_exit_and_schedule(app, controller):
 
 
 m._connect_application_exit = connect_application_exit_and_schedule
+if action in {"window_close_quit", "window_close_quit_running_bridge"}:
+    settings = m.config.default_config()
+    settings["close_behavior"] = m.config.CLOSE_BEHAVIOR_QUIT
+    m.config.save_config(m.config.config_path(), settings)
 started = time.monotonic()
 result = m.run_settings_window(
-    start_hidden=action not in {"window_close", "window_close_running_bridge"}
+    start_hidden=action not in window_close_actions
 )
 print(json.dumps({
     "action": action,
     "result": result,
     "elapsed": time.monotonic() - started,
+    "visible_after_close": visibility["after_close"],
     "visible_during_cleanup": visibility["during_cleanup"],
 }))
 """
@@ -6425,6 +6770,184 @@ controller.shutdownBackgroundTasks()
 m._shutdown_diagnostics_workers()
 print("STAGE:shutdown", file=sys.stderr, flush=True)
 
+print(json.dumps(result))
+"""
+
+
+_HID_HELPER_DIALOG_PROBE_SCRIPT = r"""
+import json
+import sys
+import time
+
+from PySide6.QtCore import QObject, QPointF, Qt
+from PySide6.QtTest import QTest
+from ovb_rc003 import qt_settings_app as m
+
+
+def find_child(root, name):
+    children = list(root.children())
+    child_items = getattr(root, "childItems", None)
+    if callable(child_items):
+        children.extend(child for child in child_items() if child not in children)
+    for child in children:
+        if child.objectName() == name:
+            return child
+        found = find_child(child, name)
+        if found is not None:
+            return found
+    return None
+
+
+def render_until(window, app, predicate, timeout=5.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        window.grabWindow()
+        app.processEvents()
+        if predicate():
+            return True
+        QTest.qWait(20)
+    return False
+
+
+def item_geometry(item):
+    assert item is not None
+    position = item.mapToScene(QPointF(0.0, 0.0))
+    width = float(item.property("width"))
+    height = float(item.property("height"))
+    return {
+        "x": position.x(),
+        "y": position.y(),
+        "width": width,
+        "height": height,
+        "right": position.x() + width,
+        "bottom": position.y() + height,
+    }
+
+
+def popup_geometry(popup):
+    x = float(popup.property("x"))
+    y = float(popup.property("y"))
+    width = float(popup.property("width"))
+    height = float(popup.property("height"))
+    return {
+        "x": x,
+        "y": y,
+        "width": width,
+        "height": height,
+        "right": x + width,
+        "bottom": y + height,
+    }
+
+
+setattr(sys, "frozen", True)
+m.single_instance.bridge_instance_running = lambda: False
+m.startup_windows.rebind_owned_frozen_startup = (
+    lambda: m.startup_windows.StartupState(False)
+)
+m.startup_windows.read_startup_state = lambda: m.startup_windows.StartupState(False)
+m.hid_elevation_windows.bundled_helper_offer_id = lambda: "4:" + ("a" * 64)
+m.hid_elevation_windows.inspect_installed_helper = lambda: (
+    m.hid_elevation_windows.HidHelperState(False, "protected_helper_missing")
+)
+m.hid_elevation_windows.is_process_elevated = lambda: False
+m.hid_elevation_windows.is_installed_distribution = lambda: False
+m.hid_helper_consumers.current_consumer_is_registered = lambda _root: True
+install_calls = []
+
+
+def unexpected_install(*args, **kwargs):
+    install_calls.append((args, kwargs))
+    raise AssertionError("opening or declining the prompt must not request UAC")
+
+
+m.hid_helper_consumers.install_for_current_consumer = unexpected_install
+
+classes = m._load_qt_classes()
+QGuiApplication = classes["QGuiApplication"]
+QQmlApplicationEngine = classes["QQmlApplicationEngine"]
+QQuickStyle = classes["QQuickStyle"]
+QUrl = classes["QUrl"]
+qmlRegisterSingletonInstance = classes["qmlRegisterSingletonInstance"]
+ButtonMappingModel = classes["ButtonMappingModel"]
+SettingsController = classes["SettingsController"]
+DiagnosticsController = classes["DiagnosticsController"]
+
+QQuickStyle.setStyle("FluentWinUI3")
+app = QGuiApplication.instance() or QGuiApplication([])
+model = ButtonMappingModel()
+controller = SettingsController(model)
+diagnostics_controller = DiagnosticsController(controller, m.config.config_root())
+qmlRegisterSingletonInstance(SettingsController, "OvbRc003Settings", 1, 0, "SettingsController", controller)
+qmlRegisterSingletonInstance(ButtonMappingModel, "OvbRc003Settings", 1, 0, "ButtonMappingModel", model)
+qmlRegisterSingletonInstance(DiagnosticsController, "OvbRc003Settings", 1, 0, "DiagnosticsController", diagnostics_controller)
+
+engine = QQmlApplicationEngine()
+qml_dir = m._qml_directory()
+engine.addImportPath(str(qml_dir))
+warnings = []
+engine.warnings.connect(lambda values: warnings.extend(values))
+engine.load(QUrl.fromLocalFile(str(qml_dir / "main.qml")))
+assert len(engine.rootObjects()) == 1, "main.qml failed to load"
+window = engine.rootObjects()[0]
+window.setProperty("width", 640)
+window.setProperty("height", 480)
+window.show()
+
+dialog = find_child(window, "hidHelperSetupDialog")
+body = find_child(window, "hidHelperSetupBody")
+decline = find_child(window, "cancelHidHelperSetupButton")
+confirm = find_child(window, "confirmHidHelperSetupButton")
+repair = find_child(window, "repairHidHelperButton")
+assert all(item is not None for item in (dialog, body, decline, confirm, repair))
+assert render_until(window, app, lambda: bool(dialog.property("visible")))
+
+dialog_geometry = popup_geometry(dialog)
+body_geometry = item_geometry(body)
+decline_geometry = item_geometry(decline)
+confirm_geometry = item_geometry(confirm)
+initial = {
+    "dialog_visible": bool(dialog.property("visible")),
+    "dialog_title": str(dialog.property("title")),
+    "body_text": str(body.property("text")),
+    "body_height": float(body.property("height")),
+    "body_implicit_height": float(body.property("implicitHeight")),
+    "dialog": dialog_geometry,
+    "body": body_geometry,
+    "decline": decline_geometry,
+    "confirm": confirm_geometry,
+    "decline_text": str(decline.property("text")),
+    "decline_flat": bool(decline.property("flat")),
+    "decline_highlighted": bool(decline.property("highlighted")),
+    "confirm_text": str(confirm.property("text")),
+    "confirm_flat": bool(confirm.property("flat")),
+    "confirm_highlighted": bool(confirm.property("highlighted")),
+}
+
+decline_point = decline.mapToScene(
+    QPointF(float(decline.property("width")) / 2.0, float(decline.property("height")) / 2.0)
+).toPoint()
+QTest.mouseClick(window, Qt.LeftButton, Qt.NoModifier, decline_point)
+assert render_until(window, app, lambda: not bool(dialog.property("visible")))
+
+repair_point = repair.mapToScene(
+    QPointF(float(repair.property("width")) / 2.0, float(repair.property("height")) / 2.0)
+).toPoint()
+QTest.mouseClick(window, Qt.LeftButton, Qt.NoModifier, repair_point)
+assert render_until(window, app, lambda: bool(dialog.property("visible")))
+
+saved = m.config.load_config(m.config.config_path(m.config.config_root()))
+result = {
+    "warnings": [warning.toString() for warning in warnings],
+    "window_width": float(window.property("width")),
+    "window_height": float(window.property("height")),
+    "initial": initial,
+    "dialog_reopened": bool(dialog.property("visible")),
+    "repair_visible": bool(repair.property("visible")),
+    "install_call_count": len(install_calls),
+    "saved_offer_id": saved.get("hid_helper_setup_prompted_offer_id"),
+}
+controller.shutdownBackgroundTasks()
+m._shutdown_diagnostics_workers()
 print(json.dumps(result))
 """
 
@@ -7426,6 +7949,9 @@ class SettingsShellSourceContractTests(unittest.TestCase):
             encoding="utf-8"
         )
         self.tokens_qml = (qml_dir / "Tokens.qml").read_text(encoding="utf-8")
+        self.compact_button_qml = (qml_dir / "CompactButton.qml").read_text(
+            encoding="utf-8"
+        )
         self.compact_tooltip_qml = (qml_dir / "CompactToolTip.qml").read_text(
             encoding="utf-8"
         )
@@ -7459,9 +7985,19 @@ class SettingsShellSourceContractTests(unittest.TestCase):
         self.assertIn("管理员按键组件异常", self.device_qml)
         self.assertIn('objectName: "hidHelperSetupDialog"', self.main_qml)
         self.assertIn(
-            "确认一次管理员权限，之后普通启动和自启动都可使用自定义按键映射。",
+            "建议打开管理员按键权限",
             self.main_qml,
         )
+        self.assertIn("用于自定义改键和遥控器语音键", self.main_qml)
+        self.assertIn("成功后普通启动和自启动不再询问", self.main_qml)
+        self.assertIn("现在不打开时，只保留 Windows 原始按键", self.main_qml)
+        self.assertIn("修复管理员按键权限？", self.main_qml)
+        self.assertIn("修复后恢复自定义改键和遥控器语音键", self.main_qml)
+        self.assertIn('? qsTr("不打开") : qsTr("取消")', self.main_qml)
+        self.assertIn("flat: SettingsController.hidHelperSetupRequired", self.main_qml)
+        self.assertIn('? qsTr("打开") : qsTr("修复")', self.main_qml)
+        self.assertIn("root.flat", self.compact_button_qml)
+        self.assertIn("root.flat && root.activeFocus", self.compact_button_qml)
         self.assertIn("自定义按键映射已可用。确认管理员权限，清理旧组件。", self.main_qml)
         self.assertIn('objectName: "removeHidHelperButton"', self.device_qml)
         self.assertIn("本机所有无线麦版本都不能使用自定义按键映射", self.main_qml)
@@ -7480,6 +8016,11 @@ class SettingsShellSourceContractTests(unittest.TestCase):
         ):
             self.assertNotIn("SettingsController.errorMessage", page_text)
             self.assertNotIn("SettingsController.statusMessage", page_text)
+
+        self.assertIn(
+            "默认隐藏到通知区域；需要彻底结束时可改为完全退出",
+            self.device_qml,
+        )
 
     def test_touched_pages_reuse_shared_compact_sources(self):
         self.assertIn("default property alias contentData", self.section_frame_qml)
@@ -8395,7 +8936,7 @@ class ApplicationExitIntegrationTests(unittest.TestCase):
         self.assertEqual(data["result"], 0)
         self.assertLess(data["elapsed"], 5.0)
 
-    def test_default_window_close_runs_the_full_exit_path(self):
+    def test_default_window_close_hides_to_the_notification_area(self):
         import subprocess
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -8403,7 +8944,7 @@ class ApplicationExitIntegrationTests(unittest.TestCase):
             env.setdefault("QT_QPA_PLATFORM", "offscreen")
             env["LOCALAPPDATA"] = tmpdir
             env["RC003_DISABLE_LIVE_INPUT"] = "1"
-            env["RC003_EXIT_PROBE_ACTION"] = "window_close"
+            env["RC003_EXIT_PROBE_ACTION"] = "window_close_hide"
             result = subprocess.run(
                 [sys.executable, "-c", _APPLICATION_EXIT_PROBE_SCRIPT],
                 env=env,
@@ -8418,7 +8959,36 @@ class ApplicationExitIntegrationTests(unittest.TestCase):
             f"window close probe failed: {result.stderr}",
         )
         data = json.loads(result.stdout.strip().splitlines()[-1])
-        self.assertEqual(data["action"], "window_close")
+        self.assertEqual(data["action"], "window_close_hide")
+        self.assertEqual(data["result"], 0)
+        self.assertFalse(data["visible_after_close"])
+        self.assertGreater(data["elapsed"], 0.25)
+        self.assertLess(data["elapsed"], 5.0)
+
+    def test_explicit_quit_window_close_runs_the_full_exit_path(self):
+        import subprocess
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            env = dict(os.environ)
+            env.setdefault("QT_QPA_PLATFORM", "offscreen")
+            env["LOCALAPPDATA"] = tmpdir
+            env["RC003_DISABLE_LIVE_INPUT"] = "1"
+            env["RC003_EXIT_PROBE_ACTION"] = "window_close_quit"
+            result = subprocess.run(
+                [sys.executable, "-c", _APPLICATION_EXIT_PROBE_SCRIPT],
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+
+        self.assertEqual(
+            result.returncode,
+            0,
+            f"window close probe failed: {result.stderr}",
+        )
+        data = json.loads(result.stdout.strip().splitlines()[-1])
+        self.assertEqual(data["action"], "window_close_quit")
         self.assertEqual(data["result"], 0)
         self.assertLess(data["elapsed"], 5.0)
 
@@ -8430,7 +9000,7 @@ class ApplicationExitIntegrationTests(unittest.TestCase):
             env.setdefault("QT_QPA_PLATFORM", "offscreen")
             env["LOCALAPPDATA"] = tmpdir
             env["RC003_DISABLE_LIVE_INPUT"] = "1"
-            env["RC003_EXIT_PROBE_ACTION"] = "window_close_running_bridge"
+            env["RC003_EXIT_PROBE_ACTION"] = "window_close_quit_running_bridge"
             result = subprocess.run(
                 [sys.executable, "-c", _APPLICATION_EXIT_PROBE_SCRIPT],
                 env=env,
@@ -8445,7 +9015,7 @@ class ApplicationExitIntegrationTests(unittest.TestCase):
             f"running-bridge close probe failed: {result.stderr}",
         )
         data = json.loads(result.stdout.strip().splitlines()[-1])
-        self.assertEqual(data["action"], "window_close_running_bridge")
+        self.assertEqual(data["action"], "window_close_quit_running_bridge")
         self.assertFalse(data["visible_during_cleanup"])
         self.assertGreater(data["elapsed"], 0.5)
         self.assertLess(data["elapsed"], 5.0)
@@ -8501,6 +9071,68 @@ class OffscreenQmlLoadTests(unittest.TestCase):
         self.assertTrue(data["voice_feedback_on_voice"])
         self.assertTrue(data["mapping_dirty_on_buttons"])
         self.assertFalse(data["mapping_dirty_on_voice"])
+
+    def test_first_hid_permission_prompt_is_compact_clear_and_non_elevating(self):
+        import json
+        import subprocess
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            env = dict(os.environ)
+            env.setdefault("QT_QPA_PLATFORM", "offscreen")
+            env["LOCALAPPDATA"] = tmpdir
+            env["RC003_DISABLE_LIVE_INPUT"] = "1"
+            result = subprocess.run(
+                [sys.executable, "-c", _HID_HELPER_DIALOG_PROBE_SCRIPT],
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+
+        self.assertEqual(
+            result.returncode,
+            0,
+            f"HID helper dialog probe failed: {result.stdout}\n{result.stderr}",
+        )
+        data = json.loads(result.stdout.strip().splitlines()[-1])
+        self.assertEqual(data["warnings"], [])
+        self.assertEqual((data["window_width"], data["window_height"]), (640, 480))
+
+        initial = data["initial"]
+        self.assertTrue(initial["dialog_visible"])
+        self.assertEqual(initial["dialog_title"], "建议打开管理员按键权限")
+        self.assertIn("用于自定义改键和遥控器语音键", initial["body_text"])
+        self.assertIn("成功后普通启动和自启动不再询问", initial["body_text"])
+        self.assertIn("现在不打开时，只保留 Windows 原始按键", initial["body_text"])
+        self.assertGreaterEqual(
+            initial["body_height"] + 0.5,
+            initial["body_implicit_height"],
+        )
+        self.assertEqual(initial["decline_text"], "不打开")
+        self.assertTrue(initial["decline_flat"])
+        self.assertFalse(initial["decline_highlighted"])
+        self.assertEqual(initial["confirm_text"], "打开")
+        self.assertFalse(initial["confirm_flat"])
+        self.assertTrue(initial["confirm_highlighted"])
+
+        def assert_inside(item, container):
+            self.assertGreaterEqual(item["x"], container["x"] - 0.5)
+            self.assertGreaterEqual(item["y"], container["y"] - 0.5)
+            self.assertLessEqual(item["right"], container["right"] + 0.5)
+            self.assertLessEqual(item["bottom"], container["bottom"] + 0.5)
+
+        viewport = {"x": 0, "y": 0, "right": 640, "bottom": 480}
+        assert_inside(initial["dialog"], viewport)
+        assert_inside(initial["body"], initial["dialog"])
+        assert_inside(initial["decline"], initial["dialog"])
+        assert_inside(initial["confirm"], initial["dialog"])
+        self.assertLessEqual(initial["body"]["bottom"], initial["decline"]["y"] + 0.5)
+        self.assertLessEqual(initial["decline"]["right"], initial["confirm"]["x"] + 0.5)
+
+        self.assertTrue(data["dialog_reopened"])
+        self.assertTrue(data["repair_visible"])
+        self.assertEqual(data["install_call_count"], 0)
+        self.assertEqual(data["saved_offer_id"], "4:" + ("a" * 64))
 
     def test_rc003_only_three_page_shell_is_rendered(self):
         import json

@@ -54,9 +54,10 @@ _ELEVATED_PROCESS_TERMINATION_WAIT_MS = 10_000
 MANIFEST_SCHEMA_VERSION = 1
 HELPER_PROTOCOL_VERSION = 1
 # Generation 5 adds thread-safe Task Scheduler COM use and bounded injection
-# lock behavior. Older portable copies must never replace this helper.
+# lock behavior. Task contract 4 accepts only the empty Triggers container
+# that Windows adds while normalizing an otherwise on-demand-only task.
 HELPER_GENERATION = 5
-TASK_CONTRACT_VERSION = 3
+TASK_CONTRACT_VERSION = 4
 MANIFEST_FILENAME = "helper-manifest.json"
 
 TASK_CREATE_OR_UPDATE = 0x6
@@ -99,6 +100,10 @@ class HidElevationError(RuntimeError):
 class HidHelperState:
     available: bool
     detail: str = ""
+
+
+def is_newer_helper_state(state: HidHelperState) -> bool:
+    return state.detail in _NEWER_HELPER_DETAILS
 
 
 @dataclass(frozen=True)
@@ -1047,9 +1052,21 @@ def validate_registered_task_xml(
         or {child.tag for child in exec_nodes[0]} != expected_exec_children
     ):
         return False
-    if root.find(".//t:Triggers", namespace) is not None:
+    trigger_nodes = root.findall(".//t:Triggers", namespace)
+    if len(trigger_nodes) > 1:
         return False
+    if trigger_nodes:
+        trigger = trigger_nodes[0]
+        if (
+            trigger not in list(root)
+            or trigger.attrib
+            or list(trigger)
+            or (trigger.text or "").strip()
+        ):
+            return False
     if root.find(".//t:RestartOnFailure", namespace) is not None:
+        return False
+    if root.find(".//t:MaintenanceSettings", namespace) is not None:
         return False
     command = _task_xml_value(root, ".//t:Actions/t:Exec/t:Command")
     arguments = _task_xml_value(root, ".//t:Actions/t:Exec/t:Arguments")
@@ -2416,7 +2433,7 @@ def request_install_elevation(
         current_state = HidHelperState(False, "hid_helper_inspection_failed")
     if current_state.available and current_state.detail != "helper_cleanup_pending":
         return current_state
-    if current_state.detail in _NEWER_HELPER_DETAILS:
+    if is_newer_helper_state(current_state):
         return current_state
     if not _can_self_elevate():
         if current_state.available:

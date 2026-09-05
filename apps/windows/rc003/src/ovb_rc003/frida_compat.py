@@ -91,6 +91,13 @@ HID_TAP_INJECTOR_EXIT_DETAILS = {
 HID_TAP_RETRYABLE_INJECTION_DETAILS = frozenset(
     {"hid_helper_operation_busy"}
 )
+HID_TAP_BOUNDED_RETRYABLE_INJECTION_DETAILS = frozenset(
+    {
+        "hid_helper_task_service_unavailable",
+        "hid_helper_task_start_failed",
+    }
+)
+HID_TAP_TRANSIENT_INJECTION_MAX_ATTEMPTS = 3
 
 
 class HidTapInjectionError(RuntimeError):
@@ -599,12 +606,16 @@ class RC003HidReportTap:
     def _run(self) -> None:
         injection_attempted_pid: int | None = None
         injection_failed_pid: int | None = None
+        transient_retry_pid: int | None = None
+        transient_injection_failures = 0
         connection_deadline: float | None = None
         while not self.stop_event.is_set():
             pid = frida_hid_tap_runtime.find_rc003_hidogatt_host_pid()
             if pid is None:
                 injection_attempted_pid = None
                 injection_failed_pid = None
+                transient_retry_pid = None
+                transient_injection_failures = 0
                 connection_deadline = None
                 self._set_status(HidTapState.WAITING_HOST)
                 self.stop_event.wait(self.retry_delay)
@@ -613,6 +624,9 @@ class RC003HidReportTap:
                 injection_attempted_pid = None
                 injection_failed_pid = None
                 connection_deadline = None
+            if pid != transient_retry_pid:
+                transient_retry_pid = pid
+                transient_injection_failures = 0
             if pid == injection_failed_pid:
                 # Retrying an identical injection into the same system process
                 # adds risk and alternates FAILED/INJECTING in the log forever.
@@ -631,6 +645,7 @@ class RC003HidReportTap:
                     try:
                         self.injector(pid)
                         injection_attempted_pid = pid
+                        transient_injection_failures = 0
                         connection_deadline = time.monotonic() + self.connection_timeout
                     except Exception as exc:  # noqa: BLE001 - retry with sanitized state
                         detail = (
@@ -638,7 +653,14 @@ class RC003HidReportTap:
                             if isinstance(exc, HidTapInjectionError)
                             else f"injector_exception_{type(exc).__name__}"
                         )
-                        if detail not in HID_TAP_RETRYABLE_INJECTION_DETAILS:
+                        retry_same_pid = detail in HID_TAP_RETRYABLE_INJECTION_DETAILS
+                        if detail in HID_TAP_BOUNDED_RETRYABLE_INJECTION_DETAILS:
+                            transient_injection_failures += 1
+                            retry_same_pid = (
+                                transient_injection_failures
+                                < HID_TAP_TRANSIENT_INJECTION_MAX_ATTEMPTS
+                            )
+                        if not retry_same_pid:
                             injection_failed_pid = pid
                         self._set_status(
                             HidTapState.FAILED,

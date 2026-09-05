@@ -9,12 +9,11 @@ literals. As defense in depth, the persistent handler also removes traceback
 text and replaces exception arguments with their exception type; this is not
 a substitute for keeping sensitive values out of ordinary log messages.
 
-``log_dir``/``log_file_path`` (XRBM-029) expose this module's canonical
-``%LOCALAPPDATA%\\RemoteMic\\RC003\\logs\\app.log`` location WITHOUT the
-side effect ``get_logger()`` has of creating that directory - the settings
-window's "open log directory" entry needs to tell a user "this doesn't exist
-yet, the app hasn't run" as an honest fact, which would be impossible if
-merely asking the question always created the directory first.
+``log_dir``/``log_file_path``/``hid_helper_log_file_path`` (XRBM-029) expose
+the canonical log locations without creating them. ``app.log`` is owned by
+the long-running bridge logger; the ordinary desktop parent writes completed
+administrator-helper results to ``hid-helper.log`` and immediately closes it.
+The elevated helper never writes a user-controlled path.
 ``describe_log_location``/``open_log_location`` build on those two path
 functions to answer "does it exist" and "open it" respectively, the latter
 via an injectable ``_open_directory`` callable (mirrors this package's other
@@ -28,6 +27,7 @@ from __future__ import annotations
 import logging
 from logging.handlers import RotatingFileHandler
 import os
+import re
 import threading
 from dataclasses import dataclass
 from enum import Enum
@@ -38,11 +38,16 @@ from . import config
 
 LOGGER_NAME = "ovb_rc003"
 LOG_FILENAME = "app.log"
+HID_HELPER_LOG_FILENAME = "hid-helper.log"
 LOG_MAX_BYTES = 5 * 1024 * 1024
 LOG_BACKUP_COUNT = 3
+LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
+
+_HID_EVENT_MARKER_PATTERN = re.compile(r"[A-Za-z0-9_.:=+-]{1,160}")
 
 _configured = False
 _configuration_lock = threading.Lock()
+_one_shot_write_lock = threading.Lock()
 
 
 class PrivacySafeExceptionFilter(logging.Filter):
@@ -91,18 +96,58 @@ def get_logger(root: Optional[Path] = None) -> logging.Logger:
             encoding="utf-8",
         )
         handler.addFilter(PrivacySafeExceptionFilter())
-        handler.setFormatter(
-            logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
-        )
+        handler.setFormatter(logging.Formatter(LOG_FORMAT))
         logger.addHandler(handler)
         _configured = True
     return logger
 
 
+def write_parent_hid_helper_event(
+    event: str,
+    *,
+    available: Optional[bool] = None,
+    detail: str = "",
+    root: Optional[Path] = None,
+) -> bool:
+    """Log a finished helper result from the ordinary, non-elevated parent.
+
+    Elevated helper entry points must not call this function: LocalAppData is
+    user controlled and therefore not a valid privileged write destination.
+    """
+
+    safe_event = str(event)
+    if _HID_EVENT_MARKER_PATTERN.fullmatch(safe_event) is None:
+        safe_event = "invalid_event"
+    safe_detail = str(detail or "none")
+    if _HID_EVENT_MARKER_PATTERN.fullmatch(safe_detail) is None:
+        safe_detail = "invalid_detail"
+    available_text = "unknown" if available is None else str(bool(available)).lower()
+    record = logging.LogRecord(
+        LOGGER_NAME,
+        logging.INFO,
+        __file__,
+        0,
+        "HID helper event: event=%s available=%s detail=%s",
+        (safe_event, available_text, safe_detail),
+        None,
+    )
+    line = logging.Formatter(LOG_FORMAT).format(record) + "\n"
+    try:
+        with _one_shot_write_lock:
+            directory = log_dir(root)
+            directory.mkdir(parents=True, exist_ok=True)
+            with hid_helper_log_file_path(root).open(
+                "a", encoding="utf-8"
+            ) as stream:
+                stream.write(line)
+        return True
+    except (OSError, ValueError):
+        return False
+
+
 def log_dir(root: Optional[Path] = None) -> Path:
     """The canonical log directory - does NOT create it (see module
-    docstring); only ``get_logger()`` does that, as a side effect of
-    actually needing to write to it.
+    docstring); only an actual log write creates it.
     """
 
     return (root or config.config_root()) / "logs"
@@ -110,6 +155,10 @@ def log_dir(root: Optional[Path] = None) -> Path:
 
 def log_file_path(root: Optional[Path] = None) -> Path:
     return log_dir(root) / LOG_FILENAME
+
+
+def hid_helper_log_file_path(root: Optional[Path] = None) -> Path:
+    return log_dir(root) / HID_HELPER_LOG_FILENAME
 
 
 class LogLocationStatus(Enum):
@@ -126,11 +175,10 @@ class LogLocation:
 
 
 def describe_log_location(root: Optional[Path] = None) -> LogLocation:
-    """A pure filesystem check - never creates anything (DoD: "不存在时给出
-    诚实提示；不得创建伪日志"). ``FILE_MISSING`` (directory exists, no
-    ``app.log`` yet) is distinct from ``DIRECTORY_MISSING`` (the app has
-    never even been run on this machine) so a caller can phrase each
-    honestly instead of collapsing them into one generic "not found".
+    """Inspect the log directory without creating it.
+
+    ``FILE_MISSING`` means the directory exists but neither supported log
+    exists. A helper-only directory is ready to open.
     """
 
     directory = log_dir(root)
@@ -138,6 +186,9 @@ def describe_log_location(root: Optional[Path] = None) -> LogLocation:
     if not directory.is_dir():
         return LogLocation(LogLocationStatus.DIRECTORY_MISSING, directory, file_path)
     if not file_path.is_file():
+        helper_file_path = hid_helper_log_file_path(root)
+        if helper_file_path.is_file():
+            return LogLocation(LogLocationStatus.READY, directory, helper_file_path)
         return LogLocation(LogLocationStatus.FILE_MISSING, directory, file_path)
     return LogLocation(LogLocationStatus.READY, directory, file_path)
 

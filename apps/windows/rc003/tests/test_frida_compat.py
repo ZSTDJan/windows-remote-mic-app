@@ -1104,6 +1104,166 @@ class TapStateTests(unittest.TestCase):
             statuses,
         )
 
+    def test_transient_task_start_failure_stops_after_three_attempts_for_same_pid(self):
+        for detail in (
+            "hid_helper_task_service_unavailable",
+            "hid_helper_task_start_failed",
+        ):
+            with self.subTest(detail=detail):
+                injector = mock.Mock(
+                    side_effect=frida_compat.HidTapInjectionError(detail)
+                )
+                tap = frida_compat.RC003HidReportTap(
+                    lambda _report_id, _payload: None,
+                    enabled=False,
+                    injector=injector,
+                )
+                wait_count = 0
+
+                def bounded_wait(_delay):
+                    nonlocal wait_count
+                    wait_count += 1
+                    if (
+                        wait_count
+                        == frida_compat.HID_TAP_TRANSIENT_INJECTION_MAX_ATTEMPTS
+                        + 1
+                    ):
+                        tap.stop_event.set()
+
+                tap.stop_event.wait = mock.Mock(side_effect=bounded_wait)
+                server = mock.MagicMock()
+
+                with mock.patch.object(
+                    frida_compat.frida_hid_tap_runtime,
+                    "find_rc003_hidogatt_host_pid",
+                    return_value=2468,
+                ), mock.patch.object(
+                    frida_compat.socket, "socket", return_value=server
+                ):
+                    tap._run()
+
+                self.assertEqual(
+                    injector.call_count,
+                    frida_compat.HID_TAP_TRANSIENT_INJECTION_MAX_ATTEMPTS,
+                )
+                self.assertEqual(
+                    wait_count,
+                    frida_compat.HID_TAP_TRANSIENT_INJECTION_MAX_ATTEMPTS + 1,
+                )
+
+    def test_transient_task_start_retry_budget_resets_for_new_host_pid(self):
+        injector = mock.Mock(
+            side_effect=frida_compat.HidTapInjectionError(
+                "hid_helper_task_start_failed"
+            )
+        )
+        tap = frida_compat.RC003HidReportTap(
+            lambda _report_id, _payload: None,
+            enabled=False,
+            injector=injector,
+        )
+        wait_count = 0
+
+        def bounded_wait(_delay):
+            nonlocal wait_count
+            wait_count += 1
+            if wait_count == (
+                frida_compat.HID_TAP_TRANSIENT_INJECTION_MAX_ATTEMPTS * 2 + 1
+            ):
+                tap.stop_event.set()
+
+        tap.stop_event.wait = mock.Mock(side_effect=bounded_wait)
+        server = mock.MagicMock()
+        first_pid = 2468
+        second_pid = 9753
+        max_attempts = frida_compat.HID_TAP_TRANSIENT_INJECTION_MAX_ATTEMPTS
+        pid_sequence = [first_pid] * max_attempts + [second_pid] * (
+            max_attempts + 1
+        )
+
+        with mock.patch.object(
+            frida_compat.frida_hid_tap_runtime,
+            "find_rc003_hidogatt_host_pid",
+            side_effect=pid_sequence,
+        ), mock.patch.object(frida_compat.socket, "socket", return_value=server):
+            tap._run()
+
+        self.assertEqual(
+            injector.call_args_list,
+            [mock.call(first_pid)] * max_attempts
+            + [mock.call(second_pid)] * max_attempts,
+        )
+
+    def test_transient_task_start_failure_then_success_waits_for_connection(self):
+        statuses = []
+        injector = mock.Mock(
+            side_effect=[
+                frida_compat.HidTapInjectionError(
+                    "hid_helper_task_service_unavailable"
+                ),
+                None,
+            ]
+        )
+        tap = frida_compat.RC003HidReportTap(
+            lambda _report_id, _payload: None,
+            enabled=False,
+            injector=injector,
+            status_handler=lambda status, detail: statuses.append((status, detail)),
+        )
+        tap.stop_event.wait = mock.Mock(return_value=False)
+        server = mock.MagicMock()
+
+        def stop_while_waiting_for_connection():
+            tap.stop_event.set()
+            raise frida_compat.socket.timeout()
+
+        server.accept.side_effect = stop_while_waiting_for_connection
+        with mock.patch.object(
+            frida_compat.frida_hid_tap_runtime,
+            "find_rc003_hidogatt_host_pid",
+            return_value=2468,
+        ), mock.patch.object(frida_compat.socket, "socket", return_value=server):
+            tap._run()
+
+        self.assertEqual(
+            injector.call_args_list,
+            [mock.call(2468), mock.call(2468)],
+        )
+        self.assertEqual(
+            statuses[-1],
+            (frida_compat.HidTapState.WAITING_CONNECTION.value, ""),
+        )
+
+    def test_registered_task_timeout_does_not_retry_the_same_host_pid(self):
+        injector = mock.Mock(
+            side_effect=frida_compat.HidTapInjectionError(
+                "hid_helper_task_timeout"
+            )
+        )
+        tap = frida_compat.RC003HidReportTap(
+            lambda _report_id, _payload: None,
+            enabled=False,
+            injector=injector,
+        )
+        wait_count = 0
+
+        def bounded_wait(_delay):
+            nonlocal wait_count
+            wait_count += 1
+            if wait_count == 2:
+                tap.stop_event.set()
+
+        tap.stop_event.wait = mock.Mock(side_effect=bounded_wait)
+        server = mock.MagicMock()
+        with mock.patch.object(
+            frida_compat.frida_hid_tap_runtime,
+            "find_rc003_hidogatt_host_pid",
+            return_value=2468,
+        ), mock.patch.object(frida_compat.socket, "socket", return_value=server):
+            tap._run()
+
+        injector.assert_called_once_with(2468)
+
     def test_missing_gadget_connection_becomes_a_stable_failure(self):
         statuses = []
         tap = frida_compat.RC003HidReportTap(

@@ -335,7 +335,7 @@ Item {
                     objectName: "closeBehaviorRow"
                     tokens: root.tokens
                     titleText: qsTr("关闭窗口时")
-                    descriptionText: qsTr("默认完全退出；需要后台运行时可改为隐藏到通知区域")
+                    descriptionText: qsTr("默认隐藏到通知区域；需要彻底结束时可改为完全退出")
                     showDivider: false
 
                     SelectionComboBox {

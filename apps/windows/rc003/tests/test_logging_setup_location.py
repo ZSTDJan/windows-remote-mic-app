@@ -67,6 +67,50 @@ class PersistentLogPrivacyTests(unittest.TestCase):
         self.assertEqual(logging_setup.LOG_MAX_BYTES, 5 * 1024 * 1024)
         self.assertEqual(logging_setup.LOG_BACKUP_COUNT, 3)
 
+    def test_one_shot_hid_event_is_sanitized_and_closes_the_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.assertTrue(
+                logging_setup.write_parent_hid_helper_event(
+                    "setup_result",
+                    available=False,
+                    detail=r"C:\private\device path",
+                    root=root,
+                )
+            )
+            log_path = logging_setup.hid_helper_log_file_path(root)
+            text = log_path.read_text(encoding="utf-8")
+            self.assertIn("event=setup_result", text)
+            self.assertIn("available=false", text)
+            self.assertIn("detail=invalid_detail", text)
+            self.assertNotIn("private", text)
+
+            moved = log_path.with_name("moved.log")
+            log_path.rename(moved)
+            moved.unlink()
+
+    def test_one_shot_hid_event_is_independent_from_an_open_app_log(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            app_log = logging_setup.log_file_path(root)
+            app_log.parent.mkdir(parents=True)
+            with app_log.open("w", encoding="utf-8") as app_stream:
+                app_stream.write("main app still running\n")
+                self.assertTrue(
+                    logging_setup.write_parent_hid_helper_event(
+                        "setup_result",
+                        available=False,
+                        detail="hid_helper_setup_timeout",
+                        root=root,
+                    )
+                )
+
+            helper_log = logging_setup.hid_helper_log_file_path(root)
+            self.assertIn(
+                "detail=hid_helper_setup_timeout",
+                helper_log.read_text(encoding="utf-8"),
+            )
+
     def test_concurrent_first_use_installs_only_one_handler(self):
         class FakeHandler:
             def addFilter(self, _filter):
@@ -158,6 +202,18 @@ class DescribeLogLocationTests(unittest.TestCase):
             (log_dir / "app.log").write_text("hello\n", encoding="utf-8")
             location = logging_setup.describe_log_location(root)
             self.assertEqual(location.status, logging_setup.LogLocationStatus.READY)
+
+    def test_ready_when_only_the_hid_helper_log_exists(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            helper_log = logging_setup.hid_helper_log_file_path(root)
+            helper_log.parent.mkdir()
+            helper_log.write_text("helper failure\n", encoding="utf-8")
+
+            location = logging_setup.describe_log_location(root)
+
+            self.assertEqual(location.status, logging_setup.LogLocationStatus.READY)
+            self.assertEqual(location.file_path, helper_log)
 
     def test_never_creates_the_directory_it_is_only_describing(self):
         with tempfile.TemporaryDirectory() as tmp:

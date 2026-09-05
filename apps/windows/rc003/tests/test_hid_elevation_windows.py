@@ -14,6 +14,14 @@ from ovb_rc003 import hid_elevation_windows
 SID = "S-1-5-21-111-222-333-1001"
 
 
+def _with_empty_triggers(xml_text: str) -> str:
+    return xml_text.replace(
+        "  <Principals>",
+        "  <Triggers />\n  <Principals>",
+        1,
+    )
+
+
 class _CallableWin32Function:
     def __init__(self, callback):
         self._callback = callback
@@ -144,6 +152,77 @@ class TaskDefinitionTests(unittest.TestCase):
             )
         )
 
+    def test_task_validation_accepts_only_one_empty_trigger_container(self):
+        variants = (
+            _with_empty_triggers(self.xml),
+            _with_empty_triggers(self.xml).replace(
+                "<Triggers />", "<Triggers>  </Triggers>"
+            ),
+        )
+        for xml_text in variants:
+            with self.subTest(xml_text=xml_text):
+                self.assertTrue(
+                    hid_elevation_windows.validate_registered_task_xml(
+                        xml_text,
+                        helper_path=self.helper,
+                        user_sid=SID,
+                        task_name=self.task_name,
+                    )
+                )
+
+    def test_task_validation_rejects_nonempty_or_misplaced_trigger_containers(self):
+        empty = _with_empty_triggers(self.xml)
+        invalid_variants = (
+            empty.replace("<Triggers />", '<Triggers Enabled="false" />'),
+            empty.replace("<Triggers />", "<Triggers>unexpected</Triggers>"),
+            empty.replace("<Triggers />", "<Triggers><BootTrigger /></Triggers>"),
+            empty.replace("<Triggers />", "<Triggers><EventTrigger /></Triggers>"),
+            empty.replace("<Triggers />", "<Triggers />\n  <Triggers />"),
+            self.xml.replace(
+                "    <Exec>",
+                "    <Triggers />\n    <Exec>",
+                1,
+            ),
+        )
+        for xml_text in invalid_variants:
+            with self.subTest(xml_text=xml_text):
+                self.assertFalse(
+                    hid_elevation_windows.validate_registered_task_xml(
+                        xml_text,
+                        helper_path=self.helper,
+                        user_sid=SID,
+                        task_name=self.task_name,
+                    )
+                )
+
+    @unittest.skipUnless(sys.platform == "win32", "Windows Task Scheduler only")
+    def test_task_validation_accepts_windows_in_memory_normalization(self):
+        import comtypes.client
+
+        sid = hid_elevation_windows.current_user_sid()
+        helper = Path(
+            r"C:\Program Files\RemoteMic\RC003\probe\RemoteMicRC003HidHelper.exe"
+        )
+        task_name = hid_elevation_windows.task_name_for_sid(sid)
+        service = comtypes.client.CreateObject("Schedule.Service", dynamic=True)
+        definition = service.NewTask(0)
+        definition.XmlText = hid_elevation_windows.task_definition_xml(
+            helper,
+            sid,
+            task_name=task_name,
+        )
+        normalized = str(definition.XmlText)
+
+        self.assertIn("<Triggers />", normalized)
+        self.assertTrue(
+            hid_elevation_windows.validate_registered_task_xml(
+                normalized,
+                helper_path=helper,
+                user_sid=sid,
+                task_name=task_name,
+            )
+        )
+
     def test_task_validation_rejects_extra_actions_and_restart_policy(self):
         extra_exec = self.xml.replace(
             "  </Actions>",
@@ -161,7 +240,23 @@ class TaskDefinitionTests(unittest.TestCase):
             "    <Priority>7</Priority>",
             "    <Priority>7</Priority><RestartOnFailure><Interval>PT1M</Interval><Count>3</Count></RestartOnFailure>",
         )
-        for invalid in (extra_exec, com_handler, second_actions, restart):
+        maintenance = self.xml.replace(
+            "  </Settings>",
+            "    <MaintenanceSettings>\n"
+            "      <Period>P1D</Period>\n"
+            "      <Deadline>P7D</Deadline>\n"
+            "      <Exclusive>false</Exclusive>\n"
+            "    </MaintenanceSettings>\n"
+            "  </Settings>",
+            1,
+        )
+        for invalid in (
+            extra_exec,
+            com_handler,
+            second_actions,
+            restart,
+            maintenance,
+        ):
             self.assertFalse(
                 hid_elevation_windows.validate_registered_task_xml(
                     invalid,
@@ -239,6 +334,14 @@ class TaskDefinitionTests(unittest.TestCase):
         self.assertFalse(
             hid_elevation_windows.validate_task_security_sddl(
                 sddl.replace(f"(A;;FRFX;;;{SID})", f"(A;;FR;;;{SID})"),
+                user_sid=SID,
+            )
+        )
+        self.assertTrue(
+            hid_elevation_windows.validate_task_security_sddl(
+                sddl.replace(
+                    f"(A;;FRFX;;;{SID})", f"(A;;0x1200a9;;;{SID})"
+                ),
                 user_sid=SID,
             )
         )
@@ -807,8 +910,10 @@ class TaskLifecycleTests(unittest.TestCase):
     def _task_snapshot(target: Path):
         task_name = hid_elevation_windows.task_name_for_sid(SID)
         return hid_elevation_windows._RegisteredTaskSnapshot(
-            hid_elevation_windows.task_definition_xml(
-                target, SID, task_name=task_name
+            _with_empty_triggers(
+                hid_elevation_windows.task_definition_xml(
+                    target, SID, task_name=task_name
+                )
             ),
             hid_elevation_windows.task_security_sddl(SID),
         )
@@ -824,7 +929,10 @@ class TaskLifecycleTests(unittest.TestCase):
 
             def register(name, xml, sddl):
                 nonlocal registered
-                registered = hid_elevation_windows._RegisteredTaskSnapshot(xml, sddl)
+                registered = hid_elevation_windows._RegisteredTaskSnapshot(
+                    _with_empty_triggers(xml),
+                    sddl,
+                )
 
             def read_task(name):
                 if name == hid_elevation_windows.LEGACY_TASK_NAME:
@@ -2735,6 +2843,7 @@ class ElevationRequestTests(unittest.TestCase):
 class HelperMainTests(unittest.TestCase):
     def test_fixed_frozen_helper_uses_a_new_generation(self):
         self.assertGreaterEqual(hid_elevation_windows.HELPER_GENERATION, 5)
+        self.assertGreaterEqual(hid_elevation_windows.TASK_CONTRACT_VERSION, 4)
 
     def test_self_check_explicitly_imports_the_operation_lock_dependency(self):
         source = __import__("inspect").getsource(hid_elevation_windows._self_check)
@@ -2790,7 +2899,6 @@ class HelperMainTests(unittest.TestCase):
             self.assertEqual(
                 result, hid_elevation_windows.HELPER_EXIT_NEWER_PRESERVED
             )
-
 
 class HelperEntryPointTests(unittest.TestCase):
     def test_inject_mode_resolves_target_internally(self):

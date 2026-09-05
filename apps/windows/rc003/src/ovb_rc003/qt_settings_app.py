@@ -1059,7 +1059,7 @@ def _load_qt_classes() -> dict:
             )
             self._close_behavior = str(
                 self._config.get(
-                    "close_behavior", config.CLOSE_BEHAVIOR_QUIT
+                    "close_behavior", config.CLOSE_BEHAVIOR_HIDE_TO_TRAY
                 )
             )
             startup_windows.rebind_owned_frozen_startup()
@@ -2101,6 +2101,9 @@ def _load_qt_classes() -> dict:
         def _hid_helper_repair_available(self) -> bool:
             return (
                 self._hid_helper_frozen_distribution
+                and not hid_elevation_windows.is_newer_helper_state(
+                    self._hid_helper_state
+                )
                 and (
                     not self._hid_helper_state.available
                     or self._hid_helper_cleanup_pending()
@@ -2111,6 +2114,9 @@ def _load_qt_classes() -> dict:
             return (
                 self._hid_helper_portable_distribution
                 and not self._hid_helper_state.available
+                and not hid_elevation_windows.is_newer_helper_state(
+                    self._hid_helper_state
+                )
             )
 
         def _set_hid_helper_repair_busy(self, value: bool) -> None:
@@ -3990,6 +3996,9 @@ def _load_qt_classes() -> dict:
                 self._hid_helper_portable_distribution
                 and self._hid_helper_state.available
                 and not self._hid_helper_cleanup_pending()
+                and not hid_elevation_windows.is_newer_helper_state(
+                    self._hid_helper_state
+                )
             ),
             notify=hidHelperStateChanged,
         )
@@ -4003,6 +4012,10 @@ def _load_qt_classes() -> dict:
             lambda self: (
                 "自定义按键映射可用，旧权限组件尚未清理"
                 if self._hid_helper_cleanup_pending()
+                else "检测到较新版本的管理员按键组件，请使用或重新安装较新版本"
+                if hid_elevation_windows.is_newer_helper_state(
+                    self._hid_helper_state
+                )
                 else "确认一次管理员权限后，普通启动和自启动都可使用自定义按键映射"
                 if self._hid_helper_setup_required()
                 else "遥控器保留 Windows 原始按键操作；自定义按键映射已停用"
@@ -4691,10 +4704,14 @@ def _load_qt_classes() -> dict:
         def _record_hid_helper_setup_prompted(self) -> bool:
             offer_id = self._hid_helper_offer_id
             if not offer_id:
-                self._set_error_message(
-                    "管理员按键组件不完整，请重新获取当前版本。",
-                    self._DEVICE_PAGE_INDEX,
-                )
+                if self._hid_helper_portable_distribution:
+                    message = (
+                        "当前程序文件不完整。请完整解压 ZIP，"
+                        "再运行根目录里的 RemoteMicRC003.exe。"
+                    )
+                else:
+                    message = "安装文件不完整，请重新安装当前版本。"
+                self._set_error_message(message, self._DEVICE_PAGE_INDEX)
                 return False
             if self._hid_helper_setup_prompted_offer_id == offer_id:
                 return True
@@ -4706,8 +4723,13 @@ def _load_qt_classes() -> dict:
                     updated,
                 )
             except (OSError, ValueError, config.ConfigTransactionError):
+                action_text = (
+                    "启用改键"
+                    if self._hid_helper_portable_distribution
+                    else "修复权限"
+                )
                 self._set_error_message(
-                    "无法记录首次授权状态，请点击“启用改键”重试。",
+                    f"无法记录首次提示状态，请在“按键接收”中点击“{action_text}”重试。",
                     self._DEVICE_PAGE_INDEX,
                 )
                 return False
@@ -4766,6 +4788,12 @@ def _load_qt_classes() -> dict:
                 )
             )
             self._set_hid_helper_state(state)
+            logging_setup.write_parent_hid_helper_event(
+                "setup_result",
+                available=state.available,
+                detail=state.detail,
+                root=self._config_root,
+            )
             if state.available:
                 self._set_error_message("")
                 if state.detail == "helper_cleanup_pending":
@@ -4797,8 +4825,50 @@ def _load_qt_classes() -> dict:
                 )
             elif state.detail == "current_account_cannot_self_elevate":
                 message = (
-                    "当前 Windows 账号不是管理员，不能启用管理员按键组件。"
-                    "请登录管理员账号；临时输入另一个管理员账号无效。"
+                    "当前账号无法直接完成管理员授权。"
+                    "请确认正在使用管理员账号后重试。"
+                )
+            elif hid_elevation_windows.is_newer_helper_state(state):
+                message = (
+                    "检测到较新版本的管理员按键组件。"
+                    "当前版本不能覆盖，请使用或重新安装较新版本。"
+                )
+            elif state.detail == "bundled_helper_missing":
+                if self._hid_helper_portable_distribution:
+                    message = (
+                        "当前程序文件不完整。请完整解压 ZIP，"
+                        "再运行根目录里的 RemoteMicRC003.exe。"
+                    )
+                else:
+                    message = "安装文件不完整，请重新安装当前版本。"
+            elif state.detail in {
+                "hid_helper_operation_busy",
+                f"hid_helper_setup_exit_{hid_elevation_windows.HELPER_EXIT_OPERATION_BUSY}",
+            }:
+                message = "另一个管理员按键操作正在进行，请稍后重试。"
+            elif state.detail in {
+                "hid_helper_setup_timeout",
+                "hid_helper_setup_terminate_failed",
+                "hid_helper_setup_terminate_wait_failed",
+                "hid_helper_setup_wait_failed",
+            }:
+                action_text = (
+                    "启用改键"
+                    if self._hid_helper_portable_distribution
+                    else "修复权限"
+                )
+                message = (
+                    "管理员按键组件处理超时，尚未启用。"
+                    f"请在“按键接收”中点击“{action_text}”重试。"
+                )
+            elif state.detail in {
+                f"hid_helper_setup_exit_{hid_elevation_windows.HELPER_EXIT_REQUIRES_ADMIN}",
+                f"hid_helper_setup_exit_{hid_elevation_windows.HELPER_EXIT_VALIDATION_FAILED}",
+                f"hid_helper_setup_exit_{hid_elevation_windows.HELPER_EXIT_UNEXPECTED_FAILURE}",
+            }:
+                message = (
+                    "管理员按键组件没有完成安装。"
+                    "请在“按键接收”中重试；仍失败时打开运行日志。"
                 )
             else:
                 message = (
@@ -4852,6 +4922,12 @@ def _load_qt_classes() -> dict:
                 else hid_elevation_windows.HidHelperState(
                     False, "hid_helper_removal_result_unavailable"
                 )
+            )
+            logging_setup.write_parent_hid_helper_event(
+                "removal_result",
+                available=state.available,
+                detail=state.detail,
+                root=self._config_root,
             )
             if state.available:
                 self._set_hid_helper_state(

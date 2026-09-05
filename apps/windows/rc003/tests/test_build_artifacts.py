@@ -420,6 +420,16 @@ class HidHelperLauncherTests(unittest.TestCase):
         ):
             self.assertEqual(launcher.main(), 5)
 
+    def test_elevated_launcher_never_writes_user_controlled_paths(self):
+        text = _HID_HELPER_LAUNCHER_PATH.read_text(encoding="utf-8")
+        self.assertNotIn("LOCALAPPDATA", text)
+        self.assertNotIn("write_parent_hid_helper_event", text)
+
+        helper_source = (
+            _RC003_ROOT / "src" / "ovb_rc003" / "hid_elevation_windows.py"
+        ).read_text(encoding="utf-8")
+        self.assertNotIn("write_parent_hid_helper_event", helper_source)
+
 
 class InnoSetupScriptTests(unittest.TestCase):
     def setUp(self):
@@ -2641,6 +2651,19 @@ class UserFacingDocumentationContractTests(unittest.TestCase):
             self.assertIn("只保留 Windows 原始按键操作", normalized)
             self.assertNotIn("只保留 Windows 原始方向键一次", normalized)
 
+    def test_default_window_close_hides_to_tray_in_all_user_guides(self):
+        root_readme = _ROOT_README_PATH.read_text(encoding="utf-8")
+        for text in (
+            root_readme,
+            self.readme_text,
+            self.installed_readme_text,
+            self.portable_readme_text,
+        ):
+            normalized = _normalize_whitespace(text)
+            self.assertIn("关闭窗口默认隐藏到通知区域", normalized)
+            self.assertNotIn("关闭窗口默认会完全退出", normalized)
+            self.assertNotIn("关闭窗口默认会先正常停止", normalized)
+
     def test_current_build_version_is_consistent_in_user_guides(self):
         version = _VERSION_PATH.read_text(encoding="ascii").strip()
         self.assertIn(f"`{version}`", self.readme_text)
@@ -2924,7 +2947,9 @@ class PortableAndInstallerFlowContractTests(unittest.TestCase):
             _PORTABLE_README_PATH.read_text(encoding="utf-8")
         )
         for text in (self.normalized, portable_readme):
-            self.assertIn("首次启用自定义按键映射", text)
+            self.assertIn("建议打开管理员按键权限", text)
+            self.assertIn("“打开”", text)
+            self.assertIn("“不打开”", text)
             self.assertIn("确认一次", text)
             self.assertIn("普通", text)
             self.assertIn("随 Windows 启动", text)

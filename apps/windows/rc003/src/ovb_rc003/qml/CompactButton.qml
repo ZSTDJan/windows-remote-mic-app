@@ -31,7 +31,13 @@ Button {
 
     background: Rectangle {
         radius: root.tokens.cornerRadiusControl
-        color: !root.enabled
+        color: root.flat
+            ? root.down
+                ? Qt.darker(root.tokens.buttonHover, 1.05)
+                : root.hovered
+                    ? root.tokens.buttonHover
+                    : "transparent"
+            : !root.enabled
             ? root.tokens.surfaceMuted
             : root.highlighted
                 ? (root.down ? Qt.darker(root.tokens.accent, 1.12) : root.tokens.accent)
@@ -40,8 +46,12 @@ Button {
                     : root.hovered
                         ? root.tokens.buttonHover
                         : root.tokens.buttonBackground
-        border.width: root.highlighted ? 0 : root.tokens.hairlineWidth
-        border.color: root.hovered ? root.tokens.borderStrong : root.tokens.border
+        border.width: root.flat
+            ? (root.activeFocus ? root.tokens.hairlineWidth : 0)
+            : root.highlighted ? 0 : root.tokens.hairlineWidth
+        border.color: root.flat && root.activeFocus
+            ? root.tokens.accent
+            : root.hovered ? root.tokens.borderStrong : root.tokens.border
         opacity: root.enabled ? 1 : 0.62
     }
 }

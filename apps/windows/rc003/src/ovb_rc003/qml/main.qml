@@ -295,7 +295,10 @@ ApplicationWindow {
         modal: true
         popupType: Popup.Item
         title: SettingsController.hidHelperCleanupPending
-            ? qsTr("完成权限清理？") : qsTr("启用按键映射？")
+            ? qsTr("完成权限清理？")
+            : SettingsController.hidHelperSetupRequired
+                ? qsTr("建议打开管理员按键权限")
+                : qsTr("修复管理员按键权限？")
         standardButtons: Dialog.NoButton
         closePolicy: SettingsController.hidHelperRepairBusy
             ? Popup.NoAutoClose : Popup.CloseOnEscape
@@ -305,13 +308,16 @@ ApplicationWindow {
             spacing: window.tokens.spacingLarge
 
             UiLabel {
+                objectName: "hidHelperSetupBody"
                 tokens: window.tokens
                 kind: bodyKind
                 Layout.fillWidth: true
                 wrapMode: Text.WordWrap
                 text: SettingsController.hidHelperCleanupPending
                     ? qsTr("自定义按键映射已可用。确认管理员权限，清理旧组件。")
-                    : qsTr("确认一次管理员权限，之后普通启动和自启动都可使用自定义按键映射。")
+                    : SettingsController.hidHelperSetupRequired
+                        ? qsTr("用于自定义改键和遥控器语音键。\n\n打开时 Windows 会确认一次；成功后普通启动和自启动不再询问。现在不打开时，只保留 Windows 原始按键。")
+                        : qsTr("修复后恢复自定义改键和遥控器语音键。Windows 会请求一次管理员确认。")
             }
 
             RowLayout {
@@ -321,7 +327,11 @@ ApplicationWindow {
                 CompactButton {
                     objectName: "cancelHidHelperSetupButton"
                     tokens: window.tokens
-                    text: qsTr("暂不")
+                    text: SettingsController.hidHelperCleanupPending
+                        ? qsTr("取消")
+                        : SettingsController.hidHelperSetupRequired
+                            ? qsTr("不打开") : qsTr("取消")
+                    flat: SettingsController.hidHelperSetupRequired
                     enabled: !SettingsController.hidHelperRepairBusy
                     onClicked: hidHelperSetupDialog.close()
                 }
@@ -329,7 +339,9 @@ ApplicationWindow {
                     objectName: "confirmHidHelperSetupButton"
                     tokens: window.tokens
                     text: SettingsController.hidHelperCleanupPending
-                        ? qsTr("清理") : qsTr("启用")
+                        ? qsTr("清理")
+                        : SettingsController.hidHelperSetupRequired
+                            ? qsTr("打开") : qsTr("修复")
                     highlighted: true
                     enabled: !SettingsController.hidHelperRepairBusy
                     onClicked: {
