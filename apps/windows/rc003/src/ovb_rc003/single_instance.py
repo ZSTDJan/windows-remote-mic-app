@@ -12,7 +12,10 @@ A second mutex hashes the current version plus executable location so a visible
 launch can distinguish the same copy (restore it) from a different/older copy
 (offer a safe handoff). A fixed handoff mutex allows only one such waiter in a
 Windows logon session. Handoff exit requests carry an owner token and the new
-copy starts only after its own pending request is consumed or safely removed.
+ copy starts only after the old process exits and its own pending request is
+ safely removed. A matching acknowledgement records that the old process
+ really consumed the request; disappearance of the request file alone is
+ never treated as proof.
 
 Fail-closed contract (XRBM-021 review round 1 P1 #1): a caller that cannot
 PROVE it is the sole owner - whether because another instance already owns
@@ -61,6 +64,7 @@ with the logic under test.
 from __future__ import annotations
 
 import ctypes
+import enum
 import hashlib
 import json
 import os
@@ -84,12 +88,19 @@ _ELEMENT_NAVIGATION_MUTEX_NAME = r"Local\RemoteMicRC003_ElementNavigationInstanc
 _APPLICATION_RUNTIME_MUTEX_PREFIX = r"Local\RemoteMicRC003_Runtime_"
 _APPLICATION_HANDOFF_MUTEX_NAME = r"Local\RemoteMicRC003_ApplicationHandoff"
 _SETTINGS_WINDOW_PROPERTY = "RemoteMicRC003.SettingsWindow"
+_APPLICATION_EXIT_CAPABILITY_PROPERTY = (
+    "RemoteMicRC003.ApplicationExitRequestV2"
+)
 _BRIDGE_START_REQUEST_FILENAME = "bridge-start-request.json"
 _BRIDGE_START_REQUEST_SCHEMA = 1
 _BRIDGE_START_REQUEST_MAX_AGE_SECONDS = 30.0
 _APPLICATION_EXIT_REQUEST_FILENAME = "application-exit-request.json"
 _APPLICATION_EXIT_REQUEST_SCHEMA = 1
 _APPLICATION_EXIT_REQUEST_MAX_AGE_SECONDS = 30.0
+_APPLICATION_EXIT_ACK_FILENAME = "application-exit-ack.json"
+_APPLICATION_EXIT_ACK_SCHEMA = 1
+_APPLICATION_EXIT_ACK_ACTION = "exit_application_acknowledged"
+_APPLICATION_EXIT_REJECTED_ACTION = "exit_application_rejected"
 
 # https://learn.microsoft.com/windows/win32/debug/system-error-codes--0-499-
 _ERROR_ALREADY_EXISTS = 183
@@ -164,6 +175,24 @@ OpenMutexFn = Callable[[str], MutexOpenResult]
 SetWindowPropertyFn = Callable[[int, str], bool]
 ActivateMarkedWindowFn = Callable[[str], bool]
 ConfirmApplicationHandoffFn = Callable[[str, str], bool]
+ProbeApplicationExitCapabilityFn = Callable[[], "ApplicationExitRequestCapability"]
+
+
+class ApplicationExitRequestCapability(str, enum.Enum):
+    SUPPORTED = "supported"
+    LEGACY_SUPPORTED = "legacy_supported"
+    UNSUPPORTED = "unsupported"
+    UNKNOWN = "unknown"
+
+
+class ApplicationExitRequest(NamedTuple):
+    request_id: Optional[str]
+
+
+class ApplicationExitWindowMarkers(NamedTuple):
+    settings_window_found: bool
+    supported_window_found: bool
+    legacy_supported_window_found: bool
 
 
 def application_runtime_mutex_name(
@@ -300,12 +329,142 @@ def mark_settings_window(
     for property_name in (
         _SETTINGS_WINDOW_PROPERTY,
         application_runtime_window_property(),
+        _APPLICATION_EXIT_CAPABILITY_PROPERTY,
     ):
         try:
             marked = bool(_set_property(hwnd, property_name)) or marked
         except Exception:
             continue
     return marked
+
+
+def _is_legacy_exit_capability_property(property_name: str) -> bool:
+    """Recognize the per-runtime marker shipped with the first exit contract."""
+
+    prefix = f"{_SETTINGS_WINDOW_PROPERTY}."
+    if not property_name.startswith(prefix):
+        return False
+    digest = property_name[len(prefix) :]
+    return len(digest) == 64 and all(
+        character in "0123456789abcdefABCDEF" for character in digest
+    )
+
+
+def _real_window_has_legacy_exit_capability(hwnd: int) -> bool:
+    """Find the runtime marker used by candidate 007 without guessing its hash."""
+
+    _require_windows()
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    enum_props_proc = ctypes.WINFUNCTYPE(
+        ctypes.c_int,
+        wintypes.HWND,
+        ctypes.c_void_p,
+        wintypes.HANDLE,
+        wintypes.LPARAM,
+    )
+    user32.EnumPropsExW.argtypes = (
+        wintypes.HWND,
+        enum_props_proc,
+        wintypes.LPARAM,
+    )
+    user32.EnumPropsExW.restype = ctypes.c_int
+    found = False
+
+    @enum_props_proc
+    def visit(_window, raw_name, _data, _lparam):
+        nonlocal found
+        address = int(raw_name or 0)
+        # Win32 may expose an integer atom instead of a string pointer.
+        if address <= 0xFFFF:
+            return 1
+        try:
+            property_name = ctypes.wstring_at(address)
+        except (OSError, ValueError):
+            return 1
+        if _is_legacy_exit_capability_property(property_name):
+            found = True
+            return 0
+        return 1
+
+    user32.EnumPropsExW(hwnd, visit, 0)
+    return found
+
+
+def _real_application_exit_window_markers() -> ApplicationExitWindowMarkers:
+    """Inspect live windows without relying on stale disk markers."""
+
+    _require_windows()
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    enum_windows_proc = ctypes.WINFUNCTYPE(
+        wintypes.BOOL,
+        wintypes.HWND,
+        wintypes.LPARAM,
+    )
+    user32.EnumWindows.argtypes = (enum_windows_proc, wintypes.LPARAM)
+    user32.EnumWindows.restype = wintypes.BOOL
+    user32.GetPropW.argtypes = (wintypes.HWND, wintypes.LPCWSTR)
+    user32.GetPropW.restype = wintypes.HANDLE
+
+    settings_window_found = False
+    supported_window_found = False
+    legacy_supported_window_found = False
+
+    @enum_windows_proc
+    def visit(hwnd, _lparam):
+        nonlocal settings_window_found
+        nonlocal supported_window_found
+        nonlocal legacy_supported_window_found
+        if not user32.GetPropW(hwnd, _SETTINGS_WINDOW_PROPERTY):
+            return True
+        settings_window_found = True
+        if user32.GetPropW(hwnd, _APPLICATION_EXIT_CAPABILITY_PROPERTY):
+            supported_window_found = True
+            return False
+        if _real_window_has_legacy_exit_capability(int(hwnd)):
+            legacy_supported_window_found = True
+        return True
+
+    user32.EnumWindows(visit, 0)
+    return ApplicationExitWindowMarkers(
+        settings_window_found=settings_window_found,
+        supported_window_found=supported_window_found,
+        legacy_supported_window_found=legacy_supported_window_found,
+    )
+
+
+def _real_application_exit_request_capability(
+    *,
+    _probe: Callable[[], ApplicationExitWindowMarkers] = (
+        _real_application_exit_window_markers
+    ),
+) -> ApplicationExitRequestCapability:
+    """Classify the exit contract only after a live window advertises it."""
+
+    markers = _probe()
+    if markers.supported_window_found:
+        return ApplicationExitRequestCapability.SUPPORTED
+    if markers.legacy_supported_window_found:
+        return ApplicationExitRequestCapability.LEGACY_SUPPORTED
+    if markers.settings_window_found:
+        return ApplicationExitRequestCapability.UNSUPPORTED
+    return ApplicationExitRequestCapability.UNKNOWN
+
+
+def application_exit_request_capability(
+    *,
+    _probe: ProbeApplicationExitCapabilityFn = (
+        _real_application_exit_request_capability
+    ),
+) -> ApplicationExitRequestCapability:
+    """Describe whether the live desktop process advertises exit requests."""
+
+    try:
+        result = _probe()
+    except Exception:
+        return ApplicationExitRequestCapability.UNKNOWN
+    if isinstance(result, ApplicationExitRequestCapability):
+        return result
+    return ApplicationExitRequestCapability.UNKNOWN
 
 
 def _real_activate_marked_window(property_name: str) -> bool:
@@ -388,6 +547,10 @@ def application_exit_request_path(config_root: Path) -> Path:
     return Path(config_root) / _APPLICATION_EXIT_REQUEST_FILENAME
 
 
+def application_exit_ack_path(config_root: Path) -> Path:
+    return Path(config_root) / _APPLICATION_EXIT_ACK_FILENAME
+
+
 def _write_request(
     path: Path,
     *,
@@ -458,32 +621,108 @@ def write_application_exit_request(
     )
 
 
-def owned_application_exit_request_pending(
+def write_application_exit_acknowledgement(
     config_root: Path,
     request_id: str,
-) -> bool:
-    """Return whether the public request is still the handoff request we wrote."""
+    *,
+    now: Callable[[], float] = time.time,
+) -> Path:
+    """Record that the resident process accepted one owned exit request."""
 
-    path = application_exit_request_path(config_root)
+    return _write_request(
+        application_exit_ack_path(config_root),
+        schema=_APPLICATION_EXIT_ACK_SCHEMA,
+        action=_APPLICATION_EXIT_ACK_ACTION,
+        now=now,
+        request_id=request_id,
+    )
+
+
+def write_application_exit_rejection(
+    config_root: Path,
+    request_id: str,
+    *,
+    now: Callable[[], float] = time.time,
+) -> Path:
+    """Tell the waiting copy that this owned exit request did not complete."""
+
+    return _write_request(
+        application_exit_ack_path(config_root),
+        schema=_APPLICATION_EXIT_ACK_SCHEMA,
+        action=_APPLICATION_EXIT_REJECTED_ACTION,
+        now=now,
+        request_id=request_id,
+    )
+
+
+def _owned_request_marker_pending(
+    path: Path,
+    *,
+    schema: int,
+    action: str,
+    request_id: str,
+) -> bool:
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError):
         return False
     return bool(
         isinstance(payload, dict)
-        and payload.get("schema") == _APPLICATION_EXIT_REQUEST_SCHEMA
-        and payload.get("action") == "exit_application"
+        and payload.get("schema") == schema
+        and payload.get("action") == action
         and payload.get("request_id") == str(request_id)
     )
 
 
-def clear_owned_application_exit_request(
+def owned_application_exit_request_pending(
     config_root: Path,
     request_id: str,
 ) -> bool:
-    """Atomically remove only the still-pending exit request we created."""
+    """Return whether the public request is still the handoff request we wrote."""
 
-    path = application_exit_request_path(config_root)
+    return _owned_request_marker_pending(
+        application_exit_request_path(config_root),
+        schema=_APPLICATION_EXIT_REQUEST_SCHEMA,
+        action="exit_application",
+        request_id=request_id,
+    )
+
+
+def application_exit_request_acknowledged(
+    config_root: Path,
+    request_id: str,
+) -> bool:
+    """Return whether the resident process explicitly accepted our request."""
+
+    return _owned_request_marker_pending(
+        application_exit_ack_path(config_root),
+        schema=_APPLICATION_EXIT_ACK_SCHEMA,
+        action=_APPLICATION_EXIT_ACK_ACTION,
+        request_id=request_id,
+    )
+
+
+def application_exit_request_rejected(
+    config_root: Path,
+    request_id: str,
+) -> bool:
+    """Return whether the resident process declined or failed this exit."""
+
+    return _owned_request_marker_pending(
+        application_exit_ack_path(config_root),
+        schema=_APPLICATION_EXIT_ACK_SCHEMA,
+        action=_APPLICATION_EXIT_REJECTED_ACTION,
+        request_id=request_id,
+    )
+
+
+def _clear_owned_request_marker(
+    path: Path,
+    *,
+    schema: int,
+    action: str | tuple[str, ...],
+    request_id: str,
+) -> bool:
     claimed = path.with_name(
         f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.handoff-cleanup"
     )
@@ -498,10 +737,11 @@ def clear_owned_application_exit_request(
         payload = json.loads(claimed.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError):
         payload = None
+    expected_actions = (action,) if isinstance(action, str) else action
     owned = bool(
         isinstance(payload, dict)
-        and payload.get("schema") == _APPLICATION_EXIT_REQUEST_SCHEMA
-        and payload.get("action") == "exit_application"
+        and payload.get("schema") == schema
+        and payload.get("action") in expected_actions
         and payload.get("request_id") == str(request_id)
     )
     if owned:
@@ -511,10 +751,8 @@ def clear_owned_application_exit_request(
             return False
         return True
 
-    # Another writer replaced our request before cleanup. Restore that
-    # request atomically only if the public path is still empty; otherwise
-    # leave this claimed copy intact and fail closed rather than deleting
-    # or overwriting either writer's request.
+    # Another writer replaced our marker before cleanup. Restore that marker
+    # only when the public path is still empty; never delete another request.
     try:
         os.link(claimed, path)
     except OSError:
@@ -526,6 +764,90 @@ def clear_owned_application_exit_request(
     return False
 
 
+def clear_owned_application_exit_request(
+    config_root: Path,
+    request_id: str,
+) -> bool:
+    """Atomically remove only the still-pending exit request we created."""
+
+    return _clear_owned_request_marker(
+        application_exit_request_path(config_root),
+        schema=_APPLICATION_EXIT_REQUEST_SCHEMA,
+        action="exit_application",
+        request_id=request_id,
+    )
+
+
+def clear_owned_application_exit_acknowledgement(
+    config_root: Path,
+    request_id: str,
+) -> bool:
+    """Remove only the acknowledgement for the caller's request."""
+
+    return _clear_owned_request_marker(
+        application_exit_ack_path(config_root),
+        schema=_APPLICATION_EXIT_ACK_SCHEMA,
+        action=_APPLICATION_EXIT_ACK_ACTION,
+        request_id=request_id,
+    )
+
+
+def clear_owned_application_exit_response(
+    config_root: Path,
+    request_id: str,
+) -> bool:
+    """Remove this caller's acknowledgement or rejection response."""
+
+    return _clear_owned_request_marker(
+        application_exit_ack_path(config_root),
+        schema=_APPLICATION_EXIT_ACK_SCHEMA,
+        action=(
+            _APPLICATION_EXIT_ACK_ACTION,
+            _APPLICATION_EXIT_REJECTED_ACTION,
+        ),
+        request_id=request_id,
+    )
+
+
+def _consume_request_payload(
+    path: Path,
+    *,
+    schema: int,
+    action: str,
+    now: Callable[[], float],
+    max_age_seconds: float,
+) -> Optional[dict]:
+    claimed = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.claimed")
+    try:
+        os.replace(path, claimed)
+    except FileNotFoundError:
+        return None
+    try:
+        try:
+            payload = json.loads(claimed.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            return None
+        if not isinstance(payload, dict):
+            return None
+        created_at = payload.get("created_at")
+        if (
+            payload.get("schema") != schema
+            or payload.get("action") != action
+            or not isinstance(created_at, (int, float))
+            or isinstance(created_at, bool)
+        ):
+            return None
+        age = float(now()) - float(created_at)
+        if not 0.0 <= age <= max(0.0, float(max_age_seconds)):
+            return None
+        return payload
+    finally:
+        try:
+            claimed.unlink()
+        except FileNotFoundError:
+            pass
+
+
 def _consume_request(
     path: Path,
     *,
@@ -534,33 +856,16 @@ def _consume_request(
     now: Callable[[], float],
     max_age_seconds: float,
 ) -> bool:
-    claimed = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.claimed")
-    try:
-        os.replace(path, claimed)
-    except FileNotFoundError:
-        return False
-    try:
-        try:
-            payload = json.loads(claimed.read_text(encoding="utf-8"))
-        except (OSError, UnicodeError, json.JSONDecodeError):
-            return False
-        if not isinstance(payload, dict):
-            return False
-        created_at = payload.get("created_at")
-        if (
-            payload.get("schema") != schema
-            or payload.get("action") != action
-            or not isinstance(created_at, (int, float))
-            or isinstance(created_at, bool)
-        ):
-            return False
-        age = float(now()) - float(created_at)
-        return 0.0 <= age <= max(0.0, float(max_age_seconds))
-    finally:
-        try:
-            claimed.unlink()
-        except FileNotFoundError:
-            pass
+    return (
+        _consume_request_payload(
+            path,
+            schema=schema,
+            action=action,
+            now=now,
+            max_age_seconds=max_age_seconds,
+        )
+        is not None
+    )
 
 
 def consume_bridge_start_request(
@@ -595,6 +900,35 @@ def consume_application_exit_request(
         now=now,
         max_age_seconds=max_age_seconds,
     )
+
+
+def consume_and_acknowledge_application_exit_request(
+    config_root: Path,
+    *,
+    now: Callable[[], float] = time.time,
+    max_age_seconds: float = _APPLICATION_EXIT_REQUEST_MAX_AGE_SECONDS,
+) -> Optional[ApplicationExitRequest]:
+    """Consume one request and acknowledge its owner token before shutdown."""
+
+    payload = _consume_request_payload(
+        application_exit_request_path(config_root),
+        schema=_APPLICATION_EXIT_REQUEST_SCHEMA,
+        action="exit_application",
+        now=now,
+        max_age_seconds=max_age_seconds,
+    )
+    if payload is None:
+        return None
+    request_id = payload.get("request_id")
+    normalized_request_id: Optional[str] = None
+    if isinstance(request_id, str) and request_id.strip():
+        normalized_request_id = request_id.strip()
+        write_application_exit_acknowledgement(
+            config_root,
+            normalized_request_id,
+            now=now,
+        )
+    return ApplicationExitRequest(request_id=normalized_request_id)
 
 
 def _named_mutex_running(

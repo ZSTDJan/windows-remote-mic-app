@@ -316,6 +316,7 @@ def run_injector_subprocess(
         )
         return
 
+    uses_registered_helper = _registered_injector is None
     if _is_elevated is None or _registered_injector is None:
         from . import hid_elevation_windows
 
@@ -325,6 +326,13 @@ def run_injector_subprocess(
             _registered_injector = hid_elevation_windows.run_registered_injector
 
     if resolved_frozen and not _is_elevated():
+        if uses_registered_helper:
+            from . import config, hid_helper_consumers
+
+            if not hid_helper_consumers.current_consumer_is_registered(
+                config.config_root()
+            ):
+                raise HidTapInjectionError("helper_consumer_unregistered")
         try:
             _registered_injector(pid)
         except Exception as exc:  # noqa: BLE001 - expose only the stable detail
@@ -452,14 +460,14 @@ class RC003HidReportTap:
         if was_active:
             self.report_handler(1, b"\x00" * 6)
 
-    def _handle_ioctl_output(self, data: bytes) -> None:
+    def _handle_ioctl_output(self, data: bytes, *, force: bool = False) -> None:
         payload = decode_rc003_ioctl_output(data)
         if payload is None:
             return
         active = payload_usages(payload) & set(TAP_USAGE_TO_BUTTON)
         with self._state_lock:
             previous = self.active_usages
-            if active == previous:
+            if active == previous and not force:
                 return
             self.active_usages = set(active)
         filtered = b"".join(
@@ -552,11 +560,14 @@ class RC003HidReportTap:
     def _run_guarded(self) -> None:
         try:
             self._run()
-        except Exception as exc:  # noqa: BLE001 - thread must report, never disappear
-            self._set_status(
-                HidTapState.FAILED,
-                f"tap_thread_exception_{type(exc).__name__}",
-            )
+            if not self.stop_event.is_set():
+                self._set_status(HidTapState.FAILED, "tap_thread_returned")
+        except BaseException as exc:  # noqa: BLE001 - thread must fail closed
+            if not self.stop_event.is_set():
+                self._set_status(
+                    HidTapState.FAILED,
+                    f"tap_thread_exception_{type(exc).__name__}",
+                )
         finally:
             if self.stop_event.is_set():
                 self._set_status(HidTapState.STOPPED)
@@ -657,6 +668,12 @@ class RC003HidReportTap:
                             chunk = client.recv(65536)
                         except socket.timeout:
                             chunk = None
+                        except OSError:
+                            self._set_status(
+                                HidTapState.UNHEALTHY,
+                                "gadget_connection_io_failed",
+                            )
+                            break
                         if chunk == b"":
                             if not self.stop_event.is_set():
                                 self._set_status(
@@ -678,9 +695,19 @@ class RC003HidReportTap:
                                 try:
                                     message = json.loads(line.decode("utf-8"))
                                 except (UnicodeDecodeError, json.JSONDecodeError):
-                                    continue
+                                    self._set_status(
+                                        HidTapState.UNHEALTHY,
+                                        "gadget_message_invalid_json",
+                                    )
+                                    fatal_message = True
+                                    break
                                 if not isinstance(message, dict):
-                                    continue
+                                    self._set_status(
+                                        HidTapState.UNHEALTHY,
+                                        "gadget_message_not_object",
+                                    )
+                                    fatal_message = True
+                                    break
                                 kind = message.get("kind")
                                 if kind == "ready":
                                     last_heartbeat = time.monotonic()
@@ -766,16 +793,38 @@ class RC003HidReportTap:
                                     try:
                                         data = bytes.fromhex(raw)
                                     except (TypeError, ValueError):
-                                        data = b""
-                                    if decode_rc003_ioctl_output(data) is not None:
-                                        io_verified = True
                                         self._set_status(
-                                            HidTapState.READY,
-                                            "hid_interception_verified",
+                                            HidTapState.UNHEALTHY,
+                                            "gadget_report_invalid_hex",
                                         )
-                                        self._handle_ioctl_output(data)
+                                        fatal_message = True
+                                        break
+                                    if decode_rc003_ioctl_output(data) is None:
+                                        self._set_status(
+                                            HidTapState.UNHEALTHY,
+                                            "gadget_report_invalid",
+                                        )
+                                        fatal_message = True
+                                        break
+                                    first_verified_report = not io_verified
+                                    io_verified = True
+                                    self._set_status(
+                                        HidTapState.READY,
+                                        "hid_interception_verified",
+                                    )
+                                    self._handle_ioctl_output(
+                                        data,
+                                        force=first_verified_report,
+                                    )
                                 elif kind == "error":
                                     self._set_status(HidTapState.FAILED, "gadget_hook_error")
+                                    fatal_message = True
+                                    break
+                                else:
+                                    self._set_status(
+                                        HidTapState.UNHEALTHY,
+                                        "gadget_message_kind_invalid",
+                                    )
                                     fatal_message = True
                                     break
                             if fatal_message:
@@ -811,6 +860,16 @@ class RC003HidReportTap:
                                 HidTapState.READY,
                                 "hid_interception_verified",
                             )
+                except BaseException as exc:
+                    # Report loss of interception before synthesizing the
+                    # neutral report below. The app treats a status failure as
+                    # cancellation; emitting the neutral report first could
+                    # otherwise complete a half-seen hold as a normal click.
+                    self._set_status(
+                        HidTapState.FAILED,
+                        f"tap_connection_exception_{type(exc).__name__}",
+                    )
+                    raise
                 finally:
                     self._set_client(None)
                     try:

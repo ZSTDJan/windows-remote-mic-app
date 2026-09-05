@@ -445,6 +445,27 @@ class SettingsInstanceGuardTests(unittest.TestCase):
             with guard:
                 self.fail("an inaccessible existing settings mutex must block a duplicate")
 
+    def test_settings_guard_does_not_publish_exit_capability_before_window_ready(self):
+        create_calls = []
+        release_calls = []
+        close_calls = []
+
+        def create(name):
+            create_calls.append(name)
+            return single_instance.MutexCreationResult(
+                handle=1000 + len(create_calls), last_error=0
+            )
+
+        with single_instance.SettingsInstanceGuard(
+            _create_mutex=create,
+            _release_mutex=lambda handle: release_calls.append(handle) or True,
+            _close_handle=lambda handle: close_calls.append(handle) or True,
+        ):
+            self.assertEqual(create_calls, [single_instance._SETTINGS_MUTEX_NAME])
+
+        self.assertEqual(release_calls, [1001])
+        self.assertEqual(close_calls, [1001])
+
 
 class ApplicationRuntimeInstanceGuardTests(unittest.TestCase):
     def test_runtime_identity_changes_with_version_or_location(self):
@@ -510,14 +531,14 @@ class ApplicationRuntimeInstanceGuardTests(unittest.TestCase):
         calls = []
 
         result = single_instance.confirm_application_handoff(
-            "0.2.0-candidate.6",
+            "0.2.0-candidate.7",
             _confirm=lambda title, message: calls.append((title, message)) or True,
         )
 
         self.assertTrue(result)
         self.assertEqual(len(calls), 1)
         title, message = calls[0]
-        self.assertEqual(title, "无线麦 0.2.0-candidate.6")
+        self.assertEqual(title, "无线麦 0.2.0-candidate.7")
         self.assertEqual(
             message,
             "旧版正在运行。\n\n"
@@ -597,6 +618,7 @@ class SettingsWindowActivationTests(unittest.TestCase):
             [
                 (321, single_instance._SETTINGS_WINDOW_PROPERTY),
                 (321, single_instance.application_runtime_window_property()),
+                (321, single_instance._APPLICATION_EXIT_CAPABILITY_PROPERTY),
             ],
         )
 
@@ -788,6 +810,40 @@ class ApplicationExitRequestTests(unittest.TestCase):
         )
         self.assertEqual(opened, [single_instance._SETTINGS_MUTEX_NAME])
 
+    def test_exit_capability_requires_a_ready_window_marker(self):
+        self.assertEqual(
+            single_instance._real_application_exit_request_capability(
+                _probe=lambda: single_instance.ApplicationExitWindowMarkers(
+                    settings_window_found=True,
+                    supported_window_found=True,
+                    legacy_supported_window_found=False,
+                )
+            ),
+            single_instance.ApplicationExitRequestCapability.SUPPORTED,
+        )
+
+    def test_candidate_007_runtime_marker_is_recognized_as_legacy_supported(self):
+        self.assertTrue(
+            single_instance._is_legacy_exit_capability_property(
+                "RemoteMicRC003.SettingsWindow." + ("a" * 64)
+            )
+        )
+        self.assertFalse(
+            single_instance._is_legacy_exit_capability_property(
+                "RemoteMicRC003.SettingsWindow." + ("g" * 64)
+            )
+        )
+        self.assertEqual(
+            single_instance._real_application_exit_request_capability(
+                _probe=lambda: single_instance.ApplicationExitWindowMarkers(
+                    settings_window_found=True,
+                    supported_window_found=False,
+                    legacy_supported_window_found=True,
+                )
+            ),
+            single_instance.ApplicationExitRequestCapability.LEGACY_SUPPORTED,
+        )
+
     def test_handoff_can_observe_its_own_request_until_the_old_copy_consumes_it(self):
         single_instance.write_application_exit_request(
             self.root,
@@ -807,6 +863,95 @@ class ApplicationExitRequestTests(unittest.TestCase):
                 "ours",
             )
         )
+
+    def test_consuming_an_owned_exit_request_writes_a_matching_acknowledgement(self):
+        single_instance.write_application_exit_request(
+            self.root,
+            request_id="ours",
+            now=lambda: 100.0,
+        )
+
+        self.assertEqual(
+            single_instance.consume_and_acknowledge_application_exit_request(
+                self.root,
+                now=lambda: 101.0,
+            ),
+            single_instance.ApplicationExitRequest(request_id="ours"),
+        )
+        self.assertTrue(
+            single_instance.application_exit_request_acknowledged(
+                self.root,
+                "ours",
+            )
+        )
+
+    def test_rejected_exit_request_replaces_ack_and_can_be_cleared_by_owner(self):
+        single_instance.write_application_exit_request(
+            self.root,
+            request_id="ours",
+        )
+        request = single_instance.consume_and_acknowledge_application_exit_request(
+            self.root
+        )
+        self.assertEqual(
+            request,
+            single_instance.ApplicationExitRequest(request_id="ours"),
+        )
+
+        single_instance.write_application_exit_rejection(self.root, "ours")
+
+        self.assertFalse(
+            single_instance.application_exit_request_acknowledged(
+                self.root,
+                "ours",
+            )
+        )
+        self.assertTrue(
+            single_instance.application_exit_request_rejected(
+                self.root,
+                "ours",
+            )
+        )
+        self.assertTrue(
+            single_instance.clear_owned_application_exit_response(
+                self.root,
+                "ours",
+            )
+        )
+        self.assertFalse(single_instance.application_exit_ack_path(self.root).exists())
+
+    def test_request_disappearance_without_acknowledgement_is_not_acceptance(self):
+        path = single_instance.write_application_exit_request(
+            self.root,
+            request_id="ours",
+        )
+        path.unlink()
+
+        self.assertFalse(
+            single_instance.application_exit_request_acknowledged(
+                self.root,
+                "ours",
+            )
+        )
+
+    def test_acknowledgement_cleanup_preserves_a_replacement(self):
+        path = single_instance.write_application_exit_acknowledgement(
+            self.root,
+            "ours",
+        )
+        single_instance.write_application_exit_acknowledgement(
+            self.root,
+            "newer",
+        )
+
+        self.assertFalse(
+            single_instance.clear_owned_application_exit_acknowledgement(
+                self.root,
+                "ours",
+            )
+        )
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(payload["request_id"], "newer")
 
     def test_handoff_never_treats_a_replacement_request_as_its_own(self):
         single_instance.write_application_exit_request(

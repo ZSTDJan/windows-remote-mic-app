@@ -164,8 +164,25 @@ class KeyboardBodyTests(unittest.TestCase):
 
     def test_too_short_body_is_ignored_without_raising(self):
         rec = RecordingListener()
+        corruptions = []
+        rec.listener.set_input_corruption_callback(corruptions.append)
         rec.listener._handle_keyboard_body(b"\x00\x00")
         self.assertEqual(rec.events, [])
+        self.assertEqual(corruptions, ["keyboard_body_too_short"])
+
+    def test_short_keyboard_body_preserves_state_for_the_real_release(self):
+        rec = RecordingListener()
+        corruptions = []
+        rec.listener.set_input_corruption_callback(corruptions.append)
+        rec.listener._handle_keyboard_body(_rawkeyboard_body(0x26, WM_KEYDOWN))
+        rec.events.clear()
+
+        rec.listener._handle_keyboard_body(b"\x00\x00")
+
+        self.assertEqual(corruptions, ["keyboard_body_too_short"])
+        self.assertEqual(rec.listener._active_keyboard_buttons, frozenset({"up"}))
+        rec.listener._handle_keyboard_body(_rawkeyboard_body(0x26, WM_KEYUP))
+        self.assertEqual(rec.events, [("up", False)])
 
     def test_every_table_entry_resolves_to_a_known_button(self):
         from ovb_rc003 import device_profile
@@ -188,8 +205,35 @@ class HidBodyTests(unittest.TestCase):
 
     def test_malformed_rawhid_body_is_ignored_without_raising(self):
         rec = RecordingListener()
+        corruptions = []
+        rec.listener.set_input_corruption_callback(corruptions.append)
         rec.listener._handle_hid_body(b"\x00\x00")
         self.assertEqual(rec.events, [])
+        self.assertEqual(corruptions, ["hid_payload_invalid"])
+
+    def test_malformed_hid_body_preserves_state_for_the_real_release(self):
+        rec = RecordingListener()
+        corruptions = []
+        rec.listener.set_input_corruption_callback(corruptions.append)
+        rec.listener._handle_hid_body(_rawhid_body([_hid_report([0x0052])]))
+        rec.events.clear()
+
+        rec.listener._handle_hid_body(b"\x00\x00")
+
+        self.assertEqual(corruptions, ["hid_payload_invalid"])
+        self.assertEqual(rec.listener._active_hid_buttons, frozenset({"up"}))
+        rec.listener._handle_hid_body(_rawhid_body([_hid_report([])]))
+        self.assertEqual(rec.events, [("up", False)])
+
+    def test_invalid_individual_hid_report_notifies_corruption(self):
+        rec = RecordingListener()
+        corruptions = []
+        rec.listener.set_input_corruption_callback(corruptions.append)
+
+        rec.listener._handle_hid_body(_rawhid_body([b"short"]))
+
+        self.assertEqual(rec.events, [])
+        self.assertEqual(corruptions, ["hid_report_invalid"])
 
     def test_multiple_reports_in_one_body_both_processed(self):
         rec = RecordingListener()

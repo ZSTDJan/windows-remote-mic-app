@@ -31,7 +31,7 @@ PRODUCT_ID = "RC003"
 CONFIG_FILENAME = "config.json"
 KEY_BINDINGS_FILENAME = "key_bindings.json"
 
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 12
 
 _QUIT_BY_DEFAULT_SCHEMA_VERSION = 10
 
@@ -134,6 +134,9 @@ def default_config() -> Dict[str, Any]:
         # the user's HKCU Run value and is deliberately not mirrored here.
         "launch_bridge_on_app_start": False,
         "close_behavior": CLOSE_BEHAVIOR_QUIT,
+        # A portable build offers each exact helper binary once. The explicit
+        # device-page action remains available after the automatic prompt.
+        "hid_helper_setup_prompted_offer_id": "",
     }
 
 
@@ -356,6 +359,22 @@ def _normalize_desktop_behavior(
     config["launch_bridge_on_app_start"] = bool(
         config.get("launch_bridge_on_app_start", False)
     )
+    prompted_offer_id = config.get("hid_helper_setup_prompted_offer_id", "")
+    if not isinstance(prompted_offer_id, str) or len(prompted_offer_id) > 128:
+        prompted_offer_id = ""
+    prompted_offer_id = prompted_offer_id.strip()
+    legacy_generation = config.pop("hid_helper_setup_prompted_generation", None)
+    legacy_prompted = config.pop("hid_helper_setup_prompted", False)
+    if not prompted_offer_id:
+        if (
+            isinstance(legacy_generation, int)
+            and not isinstance(legacy_generation, bool)
+            and legacy_generation > 0
+        ):
+            prompted_offer_id = f"legacy-generation:{legacy_generation}"
+        elif legacy_prompted is True:
+            prompted_offer_id = "legacy-generation:1"
+    config["hid_helper_setup_prompted_offer_id"] = prompted_offer_id
     close_behavior = str(
         config.get("close_behavior", CLOSE_BEHAVIOR_QUIT)
     ).strip()

@@ -1150,6 +1150,110 @@ class HostHotkeyFailureSuppressesMicOpenTests(_AppWiringTestCase):
         self.assertEqual(self.app._ble_session.mic_open_calls, 1)
         self.assertTrue(self.app._voice.active)
 
+    def test_voice_hold_watchdog_forces_key_up_and_reconnect(self):
+        timers = []
+        reconnects = []
+        calls = []
+        self.app._voice_hold_watchdog_timer_factory = (
+            lambda _delay, callback: timers.append(_ManualTimer(callback)) or timers[-1]
+        )
+        self.app._supervisor.request_reconnect = lambda: reconnects.append(True)
+
+        with mock.patch.object(
+            win32_input,
+            "send_voice_key_combo_down",
+            side_effect=lambda tokens: calls.append(("down", tokens)),
+        ), mock.patch.object(
+            win32_input,
+            "send_voice_key_combo_up",
+            side_effect=lambda tokens: calls.append(("up", tokens)),
+        ):
+            self.app._handle_mic_button_pressed()
+            timers[0].fire()
+
+        self.assertEqual(
+            calls,
+            [("down", DEFAULT_VOICE_TOKENS), ("up", DEFAULT_VOICE_TOKENS)],
+        )
+        self.assertFalse(self.app._voice.active)
+        self.assertEqual(self.app._ble_session.mic_open_calls, 1)
+        self.assertEqual(self.app._ble_session.mic_close_calls, 1)
+        self.assertEqual(reconnects, [True])
+
+    def test_stale_voice_hold_watchdog_cannot_release_a_new_session(self):
+        timers = []
+        calls = []
+        self.app._voice_hold_watchdog_timer_factory = (
+            lambda _delay, callback: timers.append(_ManualTimer(callback)) or timers[-1]
+        )
+
+        with mock.patch.object(
+            win32_input,
+            "send_voice_key_combo_down",
+            side_effect=lambda tokens: calls.append(("down", tokens)),
+        ), mock.patch.object(
+            win32_input,
+            "send_voice_key_combo_up",
+            side_effect=lambda tokens: calls.append(("up", tokens)),
+        ):
+            self.app._handle_mic_button_pressed()
+            first_callback = timers[0].callback
+            with self.app._voice_trigger_lock:
+                self.assertTrue(
+                    self.app._release_hold_voice_on_physical_release_locked(
+                        "test first release"
+                    )
+                )
+            self.app._handle_mic_button_pressed()
+            first_callback()
+
+        self.assertTrue(self.app._voice.active)
+        self.assertEqual(
+            calls,
+            [
+                ("down", DEFAULT_VOICE_TOKENS),
+                ("up", DEFAULT_VOICE_TOKENS),
+                ("down", DEFAULT_VOICE_TOKENS),
+            ],
+        )
+
+    def test_watchdog_start_failure_immediately_releases_the_host_key(self):
+        reconnects = []
+        calls = []
+        self.app._supervisor.request_reconnect = lambda: reconnects.append(True)
+
+        class FailingTimer:
+            def start(self):
+                raise RuntimeError("simulated timer start failure")
+
+            def cancel(self):
+                pass
+
+        self.app._voice_hold_watchdog_timer_factory = (
+            lambda _delay, _callback: FailingTimer()
+        )
+
+        with mock.patch.object(
+            win32_input,
+            "send_voice_key_combo_down",
+            side_effect=lambda tokens: calls.append(("down", tokens)),
+        ), mock.patch.object(
+            win32_input,
+            "send_voice_key_combo_up",
+            side_effect=lambda tokens: calls.append(("up", tokens)),
+        ), mock.patch.object(self.app, "_schedule_sogou_readiness_check") as readiness:
+            self.app._handle_mic_button_pressed()
+
+        self.assertEqual(
+            calls,
+            [("down", DEFAULT_VOICE_TOKENS), ("up", DEFAULT_VOICE_TOKENS)],
+        )
+        self.assertFalse(self.app._voice.active)
+        self.assertEqual(self.app._ble_session.mic_open_calls, 0)
+        self.assertEqual(self.app._ble_session.mic_close_calls, 1)
+        self.assertEqual(reconnects, [True])
+        readiness.assert_not_called()
+
     def test_raw_input_press_runs_before_matching_atvv_events(self):
         calls = []
         with mock.patch.object(
@@ -1320,6 +1424,40 @@ class CorruptButtonBindingFailsClosedTests(_AppWiringTestCase):
 
 
 class OrdinaryButtonGestureWiringTests(_AppWiringTestCase):
+    def test_dispatch_callback_does_not_reacquire_the_mapping_lock(self):
+        lock_held = threading.Event()
+        release_lock = threading.Event()
+        callback_finished = threading.Event()
+
+        def hold_mapping_lock():
+            with self.app._button_mapping_lock:
+                lock_held.set()
+                release_lock.wait(1.0)
+
+        holder = threading.Thread(target=hold_mapping_lock)
+        callback = threading.Thread(
+            target=lambda: (
+                self.app._on_button_trigger(
+                    "up",
+                    app_module.button_gesture.ButtonTrigger.SINGLE_CLICK,
+                ),
+                callback_finished.set(),
+            )
+        )
+        holder.start()
+        try:
+            self.assertTrue(lock_held.wait(1.0))
+            with mock.patch.object(win32_input, "send_arrow_up"):
+                callback.start()
+                self.assertTrue(callback_finished.wait(0.5))
+        finally:
+            release_lock.set()
+            holder.join(1.0)
+            callback.join(1.0)
+
+        self.assertFalse(holder.is_alive())
+        self.assertFalse(callback.is_alive())
+
     def test_saved_mapping_is_reloaded_before_the_next_button_event(self):
         updated = config.default_key_bindings()
         updated["bindings"]["back"] = {"kind": "key_combo", "keys": ["f8"]}
@@ -1747,6 +1885,46 @@ class OrdinaryButtonGestureWiringTests(_AppWiringTestCase):
         press.assert_called_once_with("ok")
         release.assert_called_once_with("ok")
         self.assertEqual(self.app._raw_mapped_buttons_down, set())
+
+    def test_raw_corruption_cancels_active_buttons_until_real_release(self):
+        self.app._direct_hid_interception_ready = False
+        self.app._raw_fallback_buttons_down = {"up"}
+        self.app._raw_mapped_buttons_down = {"ok"}
+
+        with mock.patch.object(win32_input, "send_key_combo_up") as release_keys, mock.patch.object(
+            self.app._button_gestures, "reset"
+        ) as gesture_reset, mock.patch.object(
+            self.app._button_combos, "reset"
+        ) as combo_reset:
+            self.app._on_raw_input_corruption("hid_payload_invalid")
+
+        release_keys.assert_called_once_with(("up",))
+        gesture_reset.assert_called_once_with()
+        combo_reset.assert_called_once_with()
+        self.assertEqual(self.app._raw_fallback_buttons_down, set())
+        self.assertEqual(self.app._raw_mapped_buttons_down, set())
+        self.assertEqual(self.app._input_rearm_blocked_buttons, {"up", "ok"})
+
+        with mock.patch.object(self.app._button_gestures, "press") as press:
+            self.app._on_raw_button_event("ok", True, "hid")
+            self.app._on_raw_button_event("ok", False, "hid")
+            self.app._on_raw_button_event("ok", True, "hid")
+
+        press.assert_called_once_with("ok")
+        self.assertEqual(self.app._input_rearm_blocked_buttons, {"up"})
+
+    def test_raw_corruption_without_raw_owned_buttons_leaves_direct_input_alone(self):
+        self.app._direct_hid_interception_ready = True
+
+        with mock.patch.object(
+            self.app._button_gestures, "reset"
+        ) as gesture_reset, mock.patch.object(
+            self.app._button_combos, "reset"
+        ) as combo_reset:
+            self.app._on_raw_input_corruption("keyboard_body_too_short")
+
+        gesture_reset.assert_not_called()
+        combo_reset.assert_not_called()
 
     def test_tap_arming_cancels_raw_owned_gesture_before_handover(self):
         self.app._direct_hid_interception_ready = False

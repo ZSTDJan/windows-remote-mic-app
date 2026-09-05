@@ -11,6 +11,8 @@ Item {
     readonly property var firstFocusItem: refreshDeviceChecksButton
     readonly property var lastFocusItem: closeBehaviorCombo
     signal openButtonsRequested()
+    signal enableHidHelperRequested()
+    signal removeHidHelperRequested()
 
     function checkResult(checkId) {
         const rows = DiagnosticsController.checkResults
@@ -165,12 +167,15 @@ Item {
                             qsTr("检查系统与按键接收")
                         )
                     stateText: SettingsController.hidHelperIssueVisible
-                        ? (SettingsController.hidHelperRepairVisible
-                            ? qsTr("管理员按键组件异常")
-                            : qsTr("方向映射已停用"))
+                        ? (SettingsController.hidHelperCleanupPending
+                            ? qsTr("方向改键可用，待清理")
+                            : SettingsController.hidHelperSetupRequired
+                            ? qsTr("方向改键未启用")
+                            : qsTr("管理员按键组件异常"))
                         : root.combinedStatus(["os_version", "raw_input"])
                     stateColor: SettingsController.hidHelperIssueVisible
-                        ? tokens.errorColor
+                        ? (SettingsController.hidHelperCleanupPending
+                            ? tokens.textSecondary : tokens.errorColor)
                         : root.combinedColor(["os_version", "raw_input"])
 
                     CompactButton {
@@ -179,11 +184,26 @@ Item {
                         tokens: root.tokens
                         compactMinimumWidth: tokens.buttonWidth4Chars
                         text: SettingsController.hidHelperRepairBusy
-                            ? qsTr("修复中…") : qsTr("修复权限")
+                            ? qsTr("处理中…")
+                            : (SettingsController.hidHelperSetupRequired
+                                ? qsTr("启用改键")
+                                : SettingsController.hidHelperCleanupPending
+                                ? qsTr("完成清理") : qsTr("修复权限"))
                         highlighted: true
                         enabled: !SettingsController.hidHelperRepairBusy
                             && !SettingsController.bridgeLaunchBusy
-                        onClicked: SettingsController.repairHidHelper()
+                        onClicked: root.enableHidHelperRequested()
+                    }
+
+                    CompactButton {
+                        objectName: "removeHidHelperButton"
+                        visible: SettingsController.hidHelperRemovalVisible
+                        tokens: root.tokens
+                        compactMinimumWidth: tokens.buttonWidth4Chars
+                        text: qsTr("移除权限")
+                        enabled: !SettingsController.hidHelperRepairBusy
+                            && !SettingsController.bridgeLaunchBusy
+                        onClicked: root.removeHidHelperRequested()
                     }
 
                     CompactButton {

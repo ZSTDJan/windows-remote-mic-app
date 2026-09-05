@@ -405,6 +405,53 @@ class InProcessBridgeHandleTests(unittest.TestCase):
         self.assertIsNone(stopped)
         self.assertIsNone(current)
 
+    def test_mutex_cleanup_failure_blocks_every_later_in_process_restart(self):
+        class CleanupFailingGuard:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, _exc_type, _exc, _traceback):
+                raise single_instance.MutexCleanupError("simulated cleanup failure")
+
+        original_handle = bridge_launcher._in_process_handle
+        original_blocked = bridge_launcher._in_process_restart_blocked
+        bridge_launcher._in_process_handle = None
+        bridge_launcher._in_process_restart_blocked = False
+        handle = bridge_launcher._InProcessBridgeHandle()
+        try:
+            with mock.patch.object(
+                single_instance,
+                "BridgeInstanceGuard",
+                return_value=CleanupFailingGuard(),
+            ), mock.patch("ovb_rc003.app.main"):
+                bridge_launcher._run_in_process_bridge(handle)
+
+            self.assertEqual(
+                handle.poll(),
+                single_instance.CLEANUP_FAILED_EXIT_CODE,
+            )
+            self.assertTrue(bridge_launcher._in_process_restart_blocked)
+
+            result = bridge_launcher.start_in_process_bridge(grace_checks=0)
+            self.assertIsInstance(result, bridge_launcher.LaunchResult)
+            self.assertEqual(result.outcome, bridge_launcher.LaunchOutcome.QUICK_EXIT)
+            self.assertEqual(
+                result.exit_code,
+                single_instance.CLEANUP_FAILED_EXIT_CODE,
+            )
+            self.assertIsNone(bridge_launcher._in_process_handle)
+        finally:
+            bridge_launcher._in_process_handle = original_handle
+            bridge_launcher._in_process_restart_blocked = original_blocked
+
+    def test_worker_base_exception_is_reported_as_failure(self):
+        handle = bridge_launcher._InProcessBridgeHandle()
+
+        with mock.patch("ovb_rc003.app.main", side_effect=SystemExit(7)):
+            bridge_launcher._run_in_process_bridge(handle)
+
+        self.assertEqual(handle.poll(), 1)
+
 
 class NonBlockingLaunchTests(unittest.TestCase):
     def test_start_returns_a_pending_launch_without_waiting(self):

@@ -3,8 +3,9 @@ name: windows-rc003-ci
 # Candidate CI for the Remote Mic · RC003 Windows client
 # (apps/windows/rc003). This runs the cross-platform pure-Python test suite
 # and a public-boundary scan on a real Windows runner, builds an unsigned
-# PyInstaller artifact, smoke-checks the built executable with --dry-run and
-# --qt-runtime-check (loads the real Qt DLL chain and verifies main.qml while
+# PyInstaller artifact, smoke-checks the narrow HID helper with --self-check,
+# then checks the built executable with --dry-run and --qt-runtime-check (loads
+# the real Qt DLL chain and verifies main.qml while
 # touching no GUI/BLE/HID/audio), compiles
 # the Inno Setup installer SOURCE into an unsigned installer .exe, and
 # packages a deterministic unsigned portable ZIP (a versioned staging
@@ -30,10 +31,12 @@ name: windows-rc003-ci
 # promoted from best-effort/continue-on-error to a required gate, matching
 # every other step) - a failure at any step fails the whole job.
 #
-# Exit-code gating (XRBM-014 review RETRY P2 #3): pwsh steps below check
-# $LASTEXITCODE explicitly after every native command, since a non-zero
-# native exit code does not automatically fail a GitHub Actions step unless
-# it is the last command in the script block.
+# Exit-code gating (XRBM-014 review RETRY P2 #3): console commands below check
+# $LASTEXITCODE explicitly, since a non-zero native exit code does not
+# automatically fail a GitHub Actions step unless it is the last command in
+# the script block. Frozen GUI-subsystem EXEs use Start-Process -Wait and the
+# returned process ExitCode because those launches can leave $LASTEXITCODE
+# unset or stale.
 
 # XRBM-022 controller pre-review correction: the installer (.iss) and the
 # PyInstaller spec both consume these repository-root files directly
@@ -135,6 +138,35 @@ jobs:
           python build/generate-app-icon.py
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
+      # Fetch every ignored-but-required frozen input before taking the
+      # fingerprint that the compile/test/build/package chain must preserve.
+      - name: Fetch and verify VB-CABLE driver pack
+        shell: pwsh
+        run: |
+          ./build/fetch-vb-cable.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Fetch and verify Frida Gadget
+        shell: pwsh
+        run: |
+          ./build/fetch-frida-gadget.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Capture checked build inputs
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          . ./build/build-provenance.ps1
+          $rc003Root = (Resolve-Path ".").Path
+          $repoRoot = (Resolve-Path "../../..").Path
+          $inputState = Get-RC003BuildInputState -RC003Root $rc003Root -RepoRoot $repoRoot
+          $inputStatePath = Join-Path $env:RUNNER_TEMP "rc003-build-input.json"
+          [System.IO.File]::WriteAllText(
+            $inputStatePath,
+            (($inputState | ConvertTo-Json -Depth 3) + "`n"),
+            [System.Text.UTF8Encoding]::new($false)
+          )
+
       - name: Compile check
         shell: pwsh
         run: |
@@ -204,37 +236,75 @@ jobs:
             }
           }
 
-      # XRBM-031: fetches and hash-verifies the official VB-CABLE base
-      # package BEFORE PyInstaller runs, so the frozen build deterministically
-      # bundles it (see build/RemoteMicRC003.spec) and an end user of
-      # the built candidate never needs their own network access to install
-      # the optional driver. A download failure or hash mismatch here is a
-      # required gate - it fails this whole job closed, exactly like every
-      # other step above.
-      - name: Fetch and verify VB-CABLE driver pack
-        shell: pwsh
-        run: |
-          ./build/fetch-vb-cable.ps1
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-
-      # Back and volume usages are absent from the normal Windows keyboard
-      # path. A distributable package without the pinned Gadget is therefore
-      # incomplete, not a valid degraded candidate.
-      - name: Fetch and verify Frida Gadget
-        shell: pwsh
-        run: |
-          ./build/fetch-frida-gadget.ps1
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-
       - name: PyInstaller build (unsigned candidate)
         shell: pwsh
         run: |
+          $ErrorActionPreference = "Stop"
+          . ./build/build-provenance.ps1
+          $rc003Root = (Resolve-Path ".").Path
+          $repoRoot = (Resolve-Path "../../..").Path
+          $buildRoot = Join-Path $rc003Root "dist/RemoteMicRC003"
+          $provenancePath = Get-RC003BuildProvenancePath -BuildRoot $buildRoot
+          Remove-Item -LiteralPath $provenancePath -Force -ErrorAction SilentlyContinue
+          git -C $repoRoot diff --exit-code -- apps/windows/rc003 .github/workflows/windows-rc003-ci.yml Resources/RC003-remote-photo.png device-profiles
+          if ($LASTEXITCODE -ne 0) {
+            throw "tracked build or test inputs changed after their CI checks ran"
+          }
+          $inputStatePath = Join-Path $env:RUNNER_TEMP "rc003-build-input.json"
+          if (-not (Test-Path -LiteralPath $inputStatePath -PathType Leaf)) {
+            throw "expected checked build input fingerprint not found"
+          }
+          $inputState = Get-Content -LiteralPath $inputStatePath -Raw | ConvertFrom-Json
+          $currentInputState = Get-RC003BuildInputState -RC003Root $rc003Root -RepoRoot $repoRoot
+          if (
+            $currentInputState.FileCount -ne [int]$inputState.FileCount -or
+            $currentInputState.FingerprintSha256 -ne [string]$inputState.FingerprintSha256
+          ) {
+            throw "build inputs changed after their CI checks ran"
+          }
           python -m PyInstaller build/RemoteMicRC003.spec --distpath dist --workpath build/pyinstaller-work --noconfirm
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $inputStateAfterBuild = Get-RC003BuildInputState -RC003Root $rc003Root -RepoRoot $repoRoot
+          if (
+            $inputStateAfterBuild.FileCount -ne $inputState.FileCount -or
+            $inputStateAfterBuild.FingerprintSha256 -ne $inputState.FingerprintSha256
+          ) {
+            throw "build inputs changed while PyInstaller was running"
+          }
 
       - name: Built-artifact dry-run smoke check (no GUI/BLE/HID/audio)
         shell: pwsh
         run: |
+          $ErrorActionPreference = "Stop"
+          . ./build/build-provenance.ps1
+          function Invoke-FrozenExecutableCheck {
+            param(
+              [string]$FilePath,
+              [string[]]$ArgumentList,
+              [string]$Step
+            )
+            $process = Start-Process -FilePath $FilePath -ArgumentList $ArgumentList -Wait -PassThru -WindowStyle Hidden -ErrorAction Stop
+            if ($process.ExitCode -ne 0) {
+              throw "$Step failed with exit code $($process.ExitCode)"
+            }
+          }
+
+          $rc003Root = (Resolve-Path ".").Path
+          $repoRoot = (Resolve-Path "../../..").Path
+          $buildRoot = Join-Path $rc003Root "dist/RemoteMicRC003"
+          $inputStatePath = Join-Path $env:RUNNER_TEMP "rc003-build-input.json"
+          if (-not (Test-Path -LiteralPath $inputStatePath -PathType Leaf)) {
+            throw "expected pre-build input fingerprint not found"
+          }
+          $inputState = Get-Content -LiteralPath $inputStatePath -Raw | ConvertFrom-Json
+          $inputStateBeforeChecks = Get-RC003BuildInputState -RC003Root $rc003Root -RepoRoot $repoRoot
+          if (
+            $inputStateBeforeChecks.FileCount -ne [int]$inputState.FileCount -or
+            $inputStateBeforeChecks.FingerprintSha256 -ne [string]$inputState.FingerprintSha256
+          ) {
+            throw "build inputs changed before frozen checks"
+          }
+
           $builtExe = "dist/RemoteMicRC003/RemoteMicRC003.exe"
           if (-not (Test-Path $builtExe)) {
             Write-Error "expected built executable not found: $builtExe"
@@ -245,16 +315,37 @@ jobs:
             Write-Error "expected narrow HID helper not found: $builtHidHelper"
             exit 1
           }
-          $rootExecutables = @(Get-ChildItem -LiteralPath "dist/RemoteMicRC003" -Filter "*.exe" -File)
+          $sourceVersion = (Get-Content -LiteralPath "src/ovb_rc003/VERSION" -Raw).Trim()
+          $builtVersionFile = "dist/RemoteMicRC003/_internal/ovb_rc003/VERSION"
+          if (-not (Test-Path $builtVersionFile)) {
+            Write-Error "expected built VERSION file not found: $builtVersionFile"
+            exit 1
+          }
+          $builtVersion = (Get-Content -LiteralPath $builtVersionFile -Raw).Trim()
+          if ($builtVersion -ne $sourceVersion) {
+            Write-Error "built VERSION mismatch: source=$sourceVersion built=$builtVersion"
+            exit 1
+          }
+          $rootExecutables = @(Get-ChildItem -LiteralPath "dist/RemoteMicRC003" -Force -Filter "*.exe" -File)
           if ($rootExecutables.Count -ne 1 -or $rootExecutables[0].Name -ne "RemoteMicRC003.exe") {
             Write-Error "build root must expose only RemoteMicRC003.exe"
             exit 1
           }
-          & $builtExe --dry-run
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Invoke-FrozenExecutableCheck -FilePath $builtHidHelper -ArgumentList @("--self-check") -Step "$builtHidHelper --self-check"
 
-          & $builtExe --qt-runtime-check
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Invoke-FrozenExecutableCheck -FilePath $builtExe -ArgumentList @("--dry-run") -Step "$builtExe --dry-run"
+
+          Invoke-FrozenExecutableCheck -FilePath $builtExe -ArgumentList @("--qt-runtime-check") -Step "$builtExe --qt-runtime-check"
+
+          $inputStateAfterChecks = Get-RC003BuildInputState -RC003Root $rc003Root -RepoRoot $repoRoot
+          if (
+            $inputStateAfterChecks.FileCount -ne [int]$inputState.FileCount -or
+            $inputStateAfterChecks.FingerprintSha256 -ne [string]$inputState.FingerprintSha256
+          ) {
+            throw "build inputs changed while frozen checks were running"
+          }
+          Write-RC003BuildProvenance -RC003Root $rc003Root -RepoRoot $repoRoot -BuildRoot $buildRoot -InputState $inputState | Out-Null
+          Assert-RC003BuildProvenance -RC003Root $rc003Root -RepoRoot $repoRoot -BuildRoot $buildRoot | Out-Null
 
       # XRBM-018: promoted from best-effort to a required gate - this
       # SOURCE-compiles the Inno Setup script into an installer .exe
@@ -278,6 +369,13 @@ jobs:
       - name: Package deterministic unsigned release directory (ZIP + installer + SHA256SUMS)
         shell: pwsh
         run: |
+          $ErrorActionPreference = "Stop"
+          . ./build/build-provenance.ps1
+          $rc003Root = (Resolve-Path ".").Path
+          $repoRoot = (Resolve-Path "../../..").Path
+          $buildRoot = Join-Path $rc003Root "dist/RemoteMicRC003"
+          $initialBuildProvenance = Assert-RC003BuildProvenance -RC003Root $rc003Root -RepoRoot $repoRoot -BuildRoot $buildRoot
+
           # "Deterministic" here means deterministic, non-random/non-timestamped
           # OUTPUT FILENAMES (derived from the runtime VERSION source, not a build
           # number or GUID) plus a checksum manifest generated in sorted
@@ -311,6 +409,8 @@ jobs:
           New-Item -ItemType Directory -Force -Path $stagingDir | Out-Null
 
           Copy-Item -Path "dist/RemoteMicRC003/*" -Destination $stagingDir -Recurse -Force
+          $stagedBuildProvenance = Assert-RC003BuildProvenance -RC003Root $rc003Root -RepoRoot $repoRoot -BuildRoot $stagingDir
+          Assert-RC003BuildProvenanceMatches -Expected $initialBuildProvenance -Actual $stagedBuildProvenance -Context "CI staged build verification"
 
           Copy-Item -Path "../../../LICENSE.md" -Destination (Join-Path $stagingDir "LICENSE.txt") -Force
           Copy-Item -Path "../../../COPYRIGHT.md" -Destination (Join-Path $stagingDir "COPYRIGHT.txt") -Force
@@ -343,11 +443,130 @@ jobs:
             exit 1
           }
 
-          $installerExe = Get-ChildItem -Path dist/installer -Filter "RemoteMicRC003Setup-*-unsigned.exe" | Select-Object -First 1
-          if (-not $installerExe) {
-            Write-Error "expected compiled installer .exe not found under dist/installer"
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $archive = [System.IO.Compression.ZipFile]::OpenRead((Resolve-Path $zipPath).Path)
+          try {
+            $archiveFiles = @{}
+            foreach ($entry in $archive.Entries) {
+              $entryName = $entry.FullName.Replace(
+                [System.IO.Path]::DirectorySeparatorChar,
+                [char]'/'
+              )
+              if (-not $entryName -or $entryName.EndsWith('/')) {
+                continue
+              }
+              if ($archiveFiles.ContainsKey($entryName)) {
+                Write-Error "portable ZIP contains a duplicate file entry: $entryName"
+                exit 1
+              }
+              $archiveFiles[$entryName] = $entry
+            }
+            $entryNames = @($archiveFiles.Keys)
+            $topLevels = @(
+              $entryNames |
+                ForEach-Object { $_.Split('/')[0] } |
+                Sort-Object -Unique
+            )
+            if ($topLevels.Count -ne 1 -or $topLevels[0] -ne $stagingName) {
+              Write-Error "portable ZIP must contain exactly one top-level directory named $stagingName"
+              exit 1
+            }
+            $rootExecutables = @(
+              $entryNames | Where-Object {
+                $_ -match ('^' + [regex]::Escape($stagingName) + '/[^/]+\.exe$')
+              }
+            )
+            $expectedMainEntry = "$stagingName/RemoteMicRC003.exe"
+            if ($rootExecutables.Count -ne 1 -or $rootExecutables[0] -ne $expectedMainEntry) {
+              Write-Error "portable ZIP root must expose only $expectedMainEntry"
+              exit 1
+            }
+            $helperEntryName = "$stagingName/_internal/RemoteMicRC003HidHelper.exe"
+            if (-not $archiveFiles.ContainsKey($helperEntryName)) {
+              Write-Error "portable ZIP is missing the internal HID helper"
+              exit 1
+            }
+            $versionEntryName = "$stagingName/_internal/ovb_rc003/VERSION"
+            if (-not $archiveFiles.ContainsKey($versionEntryName)) {
+              Write-Error "portable ZIP is missing the frozen VERSION file"
+              exit 1
+            }
+            $provenanceEntryName = "$stagingName/_internal/build-provenance.json"
+            if (-not $archiveFiles.ContainsKey($provenanceEntryName)) {
+              Write-Error "portable ZIP is missing the build provenance file"
+              exit 1
+            }
+            $versionEntry = $archiveFiles[$versionEntryName]
+            $reader = [System.IO.StreamReader]::new($versionEntry.Open())
+            try {
+              $zipVersion = $reader.ReadToEnd().Trim()
+            } finally {
+              $reader.Dispose()
+            }
+            if ($zipVersion -ne $version) {
+              Write-Error "portable ZIP VERSION mismatch: source=$version zip=$zipVersion"
+              exit 1
+            }
+
+            $pathSeparators = [char[]]@(
+              [System.IO.Path]::DirectorySeparatorChar,
+              [char]'/'
+            )
+            $stagingRoot = (Resolve-Path $stagingDir).Path.TrimEnd($pathSeparators)
+            $stagingFiles = @(
+              Get-ChildItem -LiteralPath $stagingRoot -Force -File -Recurse | ForEach-Object {
+                $relativePath = $_.FullName.Substring($stagingRoot.Length).TrimStart(
+                  $pathSeparators
+                ).Replace([System.IO.Path]::DirectorySeparatorChar, [char]'/')
+                [pscustomobject]@{
+                  EntryName = "$stagingName/$relativePath"
+                  FullName = $_.FullName
+                  Length = $_.Length
+                }
+              }
+            )
+            if ($archiveFiles.Count -ne $stagingFiles.Count) {
+              Write-Error "portable ZIP file count mismatch: staging=$($stagingFiles.Count) zip=$($archiveFiles.Count)"
+              exit 1
+            }
+            foreach ($stagingFile in $stagingFiles) {
+              if (-not $archiveFiles.ContainsKey($stagingFile.EntryName)) {
+                Write-Error "portable ZIP is missing staging file: $($stagingFile.EntryName)"
+                exit 1
+              }
+              $entry = $archiveFiles[$stagingFile.EntryName]
+              if ($entry.Length -ne $stagingFile.Length) {
+                Write-Error "portable ZIP file length mismatch: $($stagingFile.EntryName)"
+                exit 1
+              }
+              $stagingHash = (Get-FileHash -LiteralPath $stagingFile.FullName -Algorithm SHA256).Hash
+              $stream = $entry.Open()
+              $sha256 = [System.Security.Cryptography.SHA256]::Create()
+              try {
+                $zipHash = [System.BitConverter]::ToString($sha256.ComputeHash($stream)).Replace('-', '')
+              } finally {
+                $sha256.Dispose()
+                $stream.Dispose()
+              }
+              if ($zipHash -ne $stagingHash) {
+                Write-Error "portable ZIP file hash mismatch: $($stagingFile.EntryName)"
+                exit 1
+              }
+            }
+          } finally {
+            $archive.Dispose()
+          }
+
+          $finalBuildProvenance = Assert-RC003BuildProvenance -RC003Root $rc003Root -RepoRoot $repoRoot -BuildRoot $buildRoot
+          Assert-RC003BuildProvenanceMatches -Expected $initialBuildProvenance -Actual $finalBuildProvenance -Context "CI post-package verification"
+
+          $expectedInstallerName = "RemoteMicRC003Setup-$version-unsigned.exe"
+          $installerFiles = @(Get-ChildItem -Path dist/installer -Filter "RemoteMicRC003Setup-*-unsigned.exe" -File)
+          if ($installerFiles.Count -ne 1 -or $installerFiles[0].Name -ne $expectedInstallerName) {
+            Write-Error "installer output must contain exactly the current version: $expectedInstallerName"
             exit 1
           }
+          $installerExe = $installerFiles[0]
 
           # XRBM-024 RETRY: stage the final ZIP, installer, and a manifest
           # covering both into one CLEAN release directory, then upload

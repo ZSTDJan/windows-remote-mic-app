@@ -245,6 +245,7 @@ class _InProcessBridgeHandle:
 _IN_PROCESS_COMMAND = ("<in-process-bridge>",)
 _in_process_lock = threading.Lock()
 _in_process_handle: Optional[_InProcessBridgeHandle] = None
+_in_process_restart_blocked = False
 
 
 def _run_in_process_bridge(handle: _InProcessBridgeHandle) -> None:
@@ -252,7 +253,10 @@ def _run_in_process_bridge(handle: _InProcessBridgeHandle) -> None:
 
     from . import app
 
+    global _in_process_restart_blocked
+
     exit_code = 0
+    mutex_cleanup_failed = False
     try:
         with single_instance.BridgeInstanceGuard():
             app.main(
@@ -266,9 +270,13 @@ def _run_in_process_bridge(handle: _InProcessBridgeHandle) -> None:
         exit_code = single_instance.GUARD_UNAVAILABLE_EXIT_CODE
     except single_instance.MutexCleanupError:
         exit_code = single_instance.CLEANUP_FAILED_EXIT_CODE
-    except Exception:
+        mutex_cleanup_failed = True
+    except BaseException:  # noqa: BLE001 - worker failure must not report success
         exit_code = 1
     finally:
+        if mutex_cleanup_failed:
+            with _in_process_lock:
+                _in_process_restart_blocked = True
         handle.finish(exit_code)
 
 
@@ -323,6 +331,12 @@ def start_in_process_bridge(
 
     global _in_process_handle
     with _in_process_lock:
+        if _in_process_restart_blocked:
+            return _result_for_exit(
+                _IN_PROCESS_COMMAND,
+                os.getpid(),
+                single_instance.CLEANUP_FAILED_EXIT_CODE,
+            )
         current = _in_process_handle
         if current is not None and current.is_alive:
             return LaunchResult(

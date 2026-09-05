@@ -117,6 +117,7 @@ from . import (
     element_navigation_runtime,
     frida_compat,
     hid_elevation_windows,
+    hid_helper_consumers,
     hotkey,
     hotkey_capture_windows,
     key_detection_bridge,
@@ -958,6 +959,7 @@ def _load_qt_classes() -> dict:
         _voiceHotkeyTaskReady = Signal(object)
         _endpointPreflightReady = Signal(object)
         _hidHelperRepairReady = Signal(object)
+        _hidHelperRemovalReady = Signal(object)
         _inputOperationReady = Signal(object)
         _applicationExitStopReady = Signal(object)
         _bridgeRestartStopReady = Signal(object)
@@ -998,23 +1000,47 @@ def _load_qt_classes() -> dict:
             self._input_worker_result_lock = threading.Lock()
             self._input_worker_result = None
             self._hid_helper_repair_busy = False
+            self._config_root = config.config_root()
+            self._hid_helper_frozen_distribution = bool(
+                getattr(sys, "frozen", False)
+            )
+            self._hid_helper_offer_id = (
+                hid_elevation_windows.bundled_helper_offer_id()
+            )
             self._hid_helper_state = (
                 hid_elevation_windows.inspect_installed_helper()
+            )
+            if (
+                self._hid_helper_frozen_distribution
+                and self._hid_helper_state.available
+                and not hid_helper_consumers.current_consumer_is_registered(
+                    self._config_root
+                )
+            ):
+                self._hid_helper_state = hid_elevation_windows.HidHelperState(
+                    False, "helper_consumer_unregistered"
+                )
+            self._hid_helper_process_elevated = (
+                hid_elevation_windows.is_process_elevated()
             )
             self._hid_helper_installed_distribution = (
                 hid_elevation_windows.is_installed_distribution()
             )
-            self._hid_helper_portable_requires_admin = (
-                bool(getattr(sys, "frozen", False))
+            self._hid_helper_portable_distribution = (
+                self._hid_helper_frozen_distribution
                 and not self._hid_helper_installed_distribution
-                and not self._hid_helper_state.available
-                and not hid_elevation_windows.is_process_elevated()
             )
             self._hidHelperRepairReady.connect(
                 self._on_hid_helper_repair_ready
             )
-            self._config_root = config.config_root()
+            self._hidHelperRemovalReady.connect(
+                self._on_hid_helper_removal_ready
+            )
             self._config = config.load_config(config.config_path(self._config_root))
+            self._hid_helper_setup_prompted_offer_id = str(
+                self._config.get("hid_helper_setup_prompted_offer_id", "")
+            )
+            self._hid_helper_setup_attempted_this_session = False
             self._start_hidden = bool(start_hidden)
             self._start_bridge_requested = bool(start_bridge)
             self._launch_bridge_on_app_start = bool(
@@ -1030,6 +1056,7 @@ def _load_qt_classes() -> dict:
             self._application_exit_requested = False
             self._application_exit_confirmed = False
             self._maintenance_exit_pending = False
+            self._maintenance_exit_request_id: Optional[str] = None
             self._application_exit_intent = threading.Event()
             self._application_exit_deadline = 0.0
             self._application_exit_poll_scheduled = False
@@ -1947,6 +1974,8 @@ def _load_qt_classes() -> dict:
             ):
                 self._set_bridge_running(False)
                 self._set_bridge_connected(False)
+                self._set_bridge_reconnect_available(False)
+                self._set_bridge_reconnect_busy(False)
                 if (
                     self._has_explicit_launch_result
                     and self._bridge_launch_phase == "failed"
@@ -2011,7 +2040,34 @@ def _load_qt_classes() -> dict:
 
         def _hid_helper_needs_repair(self) -> bool:
             return (
-                self._hid_helper_installed_distribution
+                self._hid_helper_frozen_distribution
+                and (
+                    self._hid_helper_cleanup_pending()
+                    or (
+                        not self._hid_helper_state.available
+                        and not self._hid_helper_process_elevated
+                    )
+                )
+            )
+
+        def _hid_helper_cleanup_pending(self) -> bool:
+            return (
+                self._hid_helper_state.available
+                and self._hid_helper_state.detail == "helper_cleanup_pending"
+            )
+
+        def _hid_helper_repair_available(self) -> bool:
+            return (
+                self._hid_helper_frozen_distribution
+                and (
+                    not self._hid_helper_state.available
+                    or self._hid_helper_cleanup_pending()
+                )
+            )
+
+        def _hid_helper_setup_required(self) -> bool:
+            return (
+                self._hid_helper_portable_distribution
                 and not self._hid_helper_state.available
             )
 
@@ -3868,13 +3924,31 @@ def _load_qt_classes() -> dict:
 
         hidHelperIssueVisible = Property(
             bool,
-            lambda self: self._hid_helper_needs_repair()
-            or self._hid_helper_portable_requires_admin,
+            _hid_helper_needs_repair,
+            notify=hidHelperStateChanged,
+        )
+        hidHelperSetupRequired = Property(
+            bool,
+            _hid_helper_setup_required,
+            notify=hidHelperStateChanged,
+        )
+        hidHelperCleanupPending = Property(
+            bool,
+            _hid_helper_cleanup_pending,
             notify=hidHelperStateChanged,
         )
         hidHelperRepairVisible = Property(
             bool,
-            _hid_helper_needs_repair,
+            _hid_helper_repair_available,
+            notify=hidHelperStateChanged,
+        )
+        hidHelperRemovalVisible = Property(
+            bool,
+            lambda self: (
+                self._hid_helper_portable_distribution
+                and self._hid_helper_state.available
+                and not self._hid_helper_cleanup_pending()
+            ),
             notify=hidHelperStateChanged,
         )
         hidHelperRepairBusy = Property(
@@ -3885,10 +3959,12 @@ def _load_qt_classes() -> dict:
         hidHelperIssueText = Property(
             str,
             lambda self: (
-                "方向键保留 Windows 原始操作；自定义方向映射已停用"
+                "方向改键已可用，旧权限组件尚未清理"
+                if self._hid_helper_cleanup_pending()
+                else "确认一次管理员权限后，普通启动和自启动都可使用方向改键"
+                if self._hid_helper_setup_required()
+                else "方向键保留 Windows 原始操作；自定义方向映射已停用"
                 if self._hid_helper_needs_repair()
-                else "便携版需以管理员权限启动，才能使用自定义方向映射"
-                if self._hid_helper_portable_requires_admin
                 else ""
             ),
             notify=hidHelperStateChanged,
@@ -4360,6 +4436,8 @@ def _load_qt_classes() -> dict:
 
             def finish(saved: bool) -> None:
                 self._save_then_exit_requested = False
+                if not saved:
+                    self._reject_pending_maintenance_exit()
                 self.saveSettingsAndExitFinished.emit(bool(saved))
                 if saved:
                     self.requestApplicationExit()
@@ -4443,6 +4521,7 @@ def _load_qt_classes() -> dict:
                 self._voice_hotkey_busy
                 or self._settings_save_busy
                 or self._endpoint_preflight_busy
+                or self._hid_helper_repair_busy
                 or self._bridge_recovery_running
                 or _vb_cable_test_active_event.is_set()
                 or _driver_action_active_event.is_set()
@@ -4500,13 +4579,14 @@ def _load_qt_classes() -> dict:
                 self._application_exit_requested = False
                 self._application_exit_waiting_for_save = False
                 self._application_exit_confirmed = True
+                self._maintenance_exit_request_id = None
                 self._application_exit_intent.set()
                 self.applicationExitReady.emit()
                 return
             self._fail_application_exit(str(message))
 
         def _fail_application_exit(self, message: str) -> None:
-            self._maintenance_exit_pending = False
+            self._reject_pending_maintenance_exit()
             self._application_exit_requested = False
             self._application_exit_stop_running = False
             self._application_exit_poll_scheduled = False
@@ -4515,15 +4595,91 @@ def _load_qt_classes() -> dict:
             self._application_exit_intent.clear()
             self.applicationExitFailed.emit(message)
 
+        def _reject_pending_maintenance_exit(self) -> None:
+            request_id = self._maintenance_exit_request_id
+            self._maintenance_exit_request_id = None
+            self._maintenance_exit_pending = False
+            if request_id is None:
+                return
+            try:
+                single_instance.write_application_exit_rejection(
+                    self._config_root,
+                    request_id,
+                )
+            except OSError:
+                # The waiting copy retains a bounded fallback timeout when a
+                # response file cannot be written.
+                pass
+
         @Slot()
         def cancelPendingMaintenanceExit(self) -> None:
             if self._application_exit_requested or self._application_exit_confirmed:
                 return
-            self._maintenance_exit_pending = False
+            self._reject_pending_maintenance_exit()
+
+        @Slot(result=bool)
+        def claimPortableHidSetupPrompt(self) -> bool:
+            if self._hid_helper_setup_attempted_this_session:
+                return False
+            self._hid_helper_setup_attempted_this_session = True
+            if (
+                not self._hid_helper_setup_required()
+                or not self._hid_helper_offer_id
+                or self._hid_helper_setup_prompted_offer_id
+                == self._hid_helper_offer_id
+                or self._hid_helper_repair_busy
+                or self._maintenance_exit_pending
+                or self._application_exit_requested
+                or self._application_exit_confirmed
+                or self._application_exit_intent.is_set()
+                or self._background_shutdown_event.is_set()
+            ):
+                return False
+            return self._record_hid_helper_setup_prompted()
+
+        def _record_hid_helper_setup_prompted(self) -> bool:
+            offer_id = self._hid_helper_offer_id
+            if not offer_id:
+                self._set_error_message(
+                    "管理员按键组件不完整，请重新获取当前版本。",
+                    self._DEVICE_PAGE_INDEX,
+                )
+                return False
+            if self._hid_helper_setup_prompted_offer_id == offer_id:
+                return True
+            updated = dict(self._config)
+            updated["hid_helper_setup_prompted_offer_id"] = offer_id
+            try:
+                loaded = config.save_config_and_load(
+                    config.config_path(self._config_root),
+                    updated,
+                )
+            except (OSError, ValueError, config.ConfigTransactionError):
+                self._set_error_message(
+                    "无法记录首次授权状态，请点击“启用改键”重试。",
+                    self._DEVICE_PAGE_INDEX,
+                )
+                return False
+            self._config = loaded
+            self._hid_helper_setup_prompted_offer_id = offer_id
+            return True
 
         @Slot()
         def repairHidHelper(self) -> None:
-            if self._hid_helper_repair_busy or not self._hid_helper_needs_repair():
+            self._begin_hid_helper_repair()
+
+        def _begin_hid_helper_repair(self) -> None:
+            if (
+                self._hid_helper_repair_busy
+                or not self._hid_helper_repair_available()
+                or self._maintenance_exit_pending
+                or self._application_exit_requested
+                or self._application_exit_confirmed
+                or self._application_exit_intent.is_set()
+                or self._background_shutdown_event.is_set()
+            ):
+                return
+            if not self._record_hid_helper_setup_prompted():
                 return
             self._set_hid_helper_repair_busy(True)
             self._set_error_message("")
@@ -4533,13 +4689,10 @@ def _load_qt_classes() -> dict:
             )
 
             def run() -> None:
-                try:
-                    state = hid_elevation_windows.request_install_elevation()
-                except Exception as exc:  # noqa: BLE001 - keep the UI retryable
-                    state = hid_elevation_windows.HidHelperState(
-                        False,
-                        f"unexpected_{type(exc).__name__}",
-                    )
+                state = hid_helper_consumers.install_for_current_consumer(
+                    self._config_root,
+                    hid_elevation_windows.request_install_elevation,
+                )
                 self._emit_background_result(
                     self._hidHelperRepairReady,
                     state,
@@ -4564,25 +4717,134 @@ def _load_qt_classes() -> dict:
             self._set_hid_helper_state(state)
             if state.available:
                 self._set_error_message("")
-                self._set_status_message(
-                    "管理员按键组件已修复。",
-                    self._DEVICE_PAGE_INDEX,
-                )
-                if self._bridge_running:
+                if state.detail == "helper_cleanup_pending":
+                    self._set_status_message(
+                        "方向改键可用，旧权限组件尚未清理，请重试。",
+                        self._DEVICE_PAGE_INDEX,
+                    )
+                else:
+                    self._set_status_message(
+                        "方向改键权限已启用。",
+                        self._DEVICE_PAGE_INDEX,
+                    )
+                if (
+                    self._bridge_running
+                    and not self._maintenance_exit_pending
+                    and not self._application_exit_requested
+                    and not self._application_exit_confirmed
+                    and not self._application_exit_intent.is_set()
+                    and not self._background_shutdown_event.is_set()
+                ):
                     self.restartBridge()
                 return
 
             self._set_status_message("")
             if state.detail == "uac_cancelled":
                 message = (
-                    "没有确认管理员权限，修复未执行。方向键仍按 Windows "
-                    "原始方向执行一次，自定义方向映射保持停用。"
+                    "未确认管理员权限。方向键仍按 Windows 原始方向执行。"
+                )
+            elif state.detail == "current_account_cannot_self_elevate":
+                message = (
+                    "当前 Windows 账号不是管理员，不能启用方向改键。"
+                    "请登录管理员账号；临时输入另一个管理员账号无效。"
                 )
             else:
                 message = (
-                    "管理员按键组件修复失败。方向键仍按 Windows 原始方向"
-                    "执行一次，自定义方向映射保持停用。"
+                    "方向改键权限启用失败。方向键仍按 Windows 原始方向执行。"
                 )
+            self._set_error_message(message, self._DEVICE_PAGE_INDEX)
+
+        @Slot()
+        def removeHidHelper(self) -> None:
+            if (
+                self._hid_helper_repair_busy
+                or not self._hid_helper_portable_distribution
+                or not self._hid_helper_state.available
+                or self._maintenance_exit_pending
+                or self._application_exit_requested
+                or self._application_exit_confirmed
+                or self._application_exit_intent.is_set()
+                or self._background_shutdown_event.is_set()
+            ):
+                return
+            self._set_hid_helper_repair_busy(True)
+            self._set_error_message("")
+            self._set_status_message(
+                "正在处理方向改键权限…",
+                self._DEVICE_PAGE_INDEX,
+            )
+
+            def run() -> None:
+                state = hid_helper_consumers.remove_for_portable_consumer(
+                    self._config_root,
+                    hid_elevation_windows.request_uninstall_elevation,
+                )
+                self._emit_background_result(
+                    self._hidHelperRemovalReady,
+                    state,
+                )
+
+            try:
+                self._start_background_task(run, "remote-mic-hid-helper-removal")
+            except RuntimeError as exc:
+                self._set_hid_helper_repair_busy(False)
+                self._set_status_message("")
+                self._set_error_message(str(exc), self._DEVICE_PAGE_INDEX)
+
+        def _on_hid_helper_removal_ready(self, payload: object) -> None:
+            self._set_hid_helper_repair_busy(False)
+            state = (
+                payload
+                if isinstance(payload, hid_elevation_windows.HidHelperState)
+                else hid_elevation_windows.HidHelperState(
+                    False, "hid_helper_removal_result_unavailable"
+                )
+            )
+            if state.available:
+                self._set_hid_helper_state(
+                    hid_elevation_windows.HidHelperState(
+                        False, "helper_manifest_missing"
+                    )
+                )
+                self._set_error_message("")
+                self._set_status_message(
+                    "方向改键权限已移除。",
+                    self._DEVICE_PAGE_INDEX,
+                )
+                if (
+                    self._bridge_running
+                    and not self._maintenance_exit_pending
+                    and not self._application_exit_requested
+                    and not self._application_exit_confirmed
+                    and not self._application_exit_intent.is_set()
+                    and not self._background_shutdown_event.is_set()
+                ):
+                    self.restartBridge()
+                return
+
+            self._set_status_message("")
+            if state.detail == "uac_cancelled":
+                message = "未确认管理员权限，方向改键权限没有移除。"
+            elif state.detail == "current_account_cannot_self_elevate":
+                message = (
+                    "当前 Windows 账号不能移除方向改键权限。"
+                    "请登录原管理员账号后重试。"
+                )
+            elif state.detail == "helper_in_use_by_other_consumer":
+                message = (
+                    "本机还有其它无线麦版本在使用方向改键权限，当前版本不能移除。"
+                )
+            elif state.detail == "helper_consumer_inspection_failed":
+                message = "无法确认是否还有其它无线麦版本在使用，未做任何更改。"
+            elif state.detail == "helper_preserved_newer_contract":
+                message = "检测到较新版本正在使用，方向改键权限未移除。"
+            elif state.detail == "helper_consumer_marker_restore_failed":
+                message = (
+                    "权限没有移除，但当前版本的使用记录未能恢复。"
+                    "请保留程序文件并重新打开后再试。"
+                )
+            else:
+                message = "方向改键权限移除失败，请稍后重试。"
             self._set_error_message(message, self._DEVICE_PAGE_INDEX)
 
         @Slot()
@@ -4689,13 +4951,16 @@ def _load_qt_classes() -> dict:
         @Slot()
         def refreshBridgeState(self) -> None:
             try:
-                exit_requested = single_instance.consume_application_exit_request(
-                    self._config_root
+                exit_request = (
+                    single_instance.consume_and_acknowledge_application_exit_request(
+                        self._config_root
+                    )
                 )
             except OSError:
-                exit_requested = False
-            if exit_requested:
+                exit_request = None
+            if exit_request is not None:
                 self._maintenance_exit_pending = True
+                self._maintenance_exit_request_id = exit_request.request_id
                 self._start_bridge_requested = False
                 try:
                     single_instance.consume_bridge_start_request(
@@ -4899,17 +5164,32 @@ def _load_qt_classes() -> dict:
                 or self._application_exit_intent.is_set()
             ):
                 return
-            self._refresh_bridge_status()
+            running = self._refresh_bridge_status()
+            if self._bridge_connected:
+                self._set_error_message("")
+                return
+            if running is False:
+                self._set_error_message(
+                    "遥控器服务已停止；请点击“启动桥接”。",
+                    self._DEVICE_PAGE_INDEX,
+                )
+                return
+            if running is None:
+                self._set_error_message(
+                    "当前无法确认服务状态；请稍后重新检查。",
+                    self._DEVICE_PAGE_INDEX,
+                )
+                return
             if not self._bridge_reconnect_available:
                 self._set_error_message(
-                    "当前无法直接重连；请使用“重新启动”恢复服务。",
+                    "当前正在连接或暂时无法直接重连；请稍后再试。",
                     self._DEVICE_PAGE_INDEX,
                 )
                 return
             if bridge_launcher.reconnect_in_process_bridge_now() is not True:
                 self._set_bridge_reconnect_available(False)
                 self._set_error_message(
-                    "立即重连请求未送达；请使用“重新启动”恢复服务。",
+                    "立即重连请求暂未送达；请稍后再试。",
                     self._DEVICE_PAGE_INDEX,
                 )
                 return
@@ -6399,6 +6679,10 @@ def run_settings_window(
         root_window = root_objects[0]
         update_application_icon()
         window_chrome_windows.apply_settings_window_chrome(root_window)
+
+        # The real QML window and full-exit signal are ready here. Publish the
+        # capability before optional element navigation startup, whose bounded
+        # native hook waits must not make another version misclassify this copy.
         _mark_settings_window_for_activation(root_window)
 
         if (

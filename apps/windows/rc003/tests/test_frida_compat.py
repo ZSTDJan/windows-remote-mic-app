@@ -269,6 +269,41 @@ class InjectorSubprocessTests(unittest.TestCase):
 
 
 class TapStateTests(unittest.TestCase):
+    def test_guarded_thread_marks_an_unexpected_return_failed(self):
+        statuses = []
+        tap = frida_compat.RC003HidReportTap(
+            lambda _report_id, _payload: None,
+            enabled=False,
+            status_handler=lambda status, detail: statuses.append((status, detail)),
+        )
+        tap._run = lambda: None
+
+        tap._run_guarded()
+
+        self.assertEqual(
+            statuses[-1],
+            (frida_compat.HidTapState.FAILED.value, "tap_thread_returned"),
+        )
+
+    def test_guarded_thread_catches_base_exception_and_fails_closed(self):
+        statuses = []
+        tap = frida_compat.RC003HidReportTap(
+            lambda _report_id, _payload: None,
+            enabled=False,
+            status_handler=lambda status, detail: statuses.append((status, detail)),
+        )
+        tap._run = mock.Mock(side_effect=SystemExit(7))
+
+        tap._run_guarded()
+
+        self.assertEqual(
+            statuses[-1],
+            (
+                frida_compat.HidTapState.FAILED.value,
+                "tap_thread_exception_SystemExit",
+            ),
+        )
+
     def test_thread_start_is_starting_not_ready(self):
         statuses = []
         tap = frida_compat.RC003HidReportTap(
@@ -372,6 +407,94 @@ class TapStateTests(unittest.TestCase):
                 (1, bytes.fromhex("f10000000000")),
                 (1, b"\x00" * 6),
             ],
+        )
+
+    def test_connection_base_exception_marks_failure_before_neutral_release(self):
+        events = []
+
+        tap = frida_compat.RC003HidReportTap(
+            lambda _report_id, payload: events.append(
+                ("report", payload, tap.status)
+            ),
+            enabled=False,
+            injector=lambda _pid: None,
+            client_pid_resolver=lambda _client: 2468,
+            status_handler=lambda status, detail: events.append(
+                ("status", status, detail)
+            ),
+        )
+
+        class FakeClient:
+            def __init__(self):
+                self.calls = 0
+
+            def settimeout(self, _timeout):
+                pass
+
+            def sendall(self, _payload):
+                pass
+
+            def recv(self, _size):
+                self.calls += 1
+                if self.calls == 1:
+                    return (
+                        b'{"kind":"ready","hook_installed":true,"protocol":3}\n'
+                        b'{"kind":"control_ack","action":"enable",'
+                        b'"accepted":true,"state":"enabled","protocol":3}\n'
+                        b'{"kind":"gatt_read","raw":"010000520000000000",'
+                        b'"intercepted":true,"protocol":3}\n'
+                    )
+                raise SystemExit(9)
+
+            def close(self):
+                pass
+
+        class FakeServer:
+            def setsockopt(self, *_args):
+                pass
+
+            def bind(self, _address):
+                pass
+
+            def listen(self, _backlog):
+                pass
+
+            def settimeout(self, _timeout):
+                pass
+
+            def accept(self):
+                return FakeClient(), ("127.0.0.1", 1)
+
+            def close(self):
+                pass
+
+        with mock.patch.object(
+            frida_compat.frida_hid_tap_runtime,
+            "find_rc003_hidogatt_host_pid",
+            return_value=2468,
+        ), mock.patch.object(
+            frida_compat.socket,
+            "socket",
+            return_value=FakeServer(),
+        ):
+            with self.assertRaises(SystemExit):
+                tap._run()
+
+        failure_index = next(
+            index
+            for index, event in enumerate(events)
+            if event[:2]
+            == ("status", frida_compat.HidTapState.FAILED.value)
+        )
+        neutral_index = next(
+            index
+            for index, event in enumerate(events)
+            if event[0] == "report" and event[1] == b"\x00" * 6
+        )
+        self.assertLess(failure_index, neutral_index)
+        self.assertEqual(
+            events[neutral_index][2],
+            frida_compat.HidTapState.FAILED.value,
         )
 
     def test_gadget_handshake_and_heartbeat_do_not_announce_hid_ready(self):

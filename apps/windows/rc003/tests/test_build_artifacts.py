@@ -3,9 +3,15 @@ Windows build, just structural/contract validation that runs anywhere.
 """
 
 import ast
+import importlib.util
+import os
 import re
+import shutil
+import subprocess
+import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from ovb_rc003 import config, logging_setup
 
@@ -20,6 +26,8 @@ _PACKAGE_MAIN_PATH = _RC003_ROOT / "src" / "ovb_rc003" / "__main__.py"
 _LAUNCHER_PATH = _RC003_ROOT / "src" / "launcher.py"
 _HID_HELPER_LAUNCHER_PATH = _RC003_ROOT / "src" / "hid_helper_launcher.py"
 _BUILD_CANDIDATE_PATH = _RC003_ROOT / "build" / "build-candidate.ps1"
+_BUILD_PROVENANCE_PATH = _RC003_ROOT / "build" / "build-provenance.ps1"
+_PACKAGE_LOCAL_TEST_PATH = _RC003_ROOT / "build" / "package-local-test.ps1"
 _RUN_DEV_PATH = _RC003_ROOT / "build" / "run-dev.ps1"
 _STOP_DEV_PATH = _RC003_ROOT / "build" / "stop-dev.ps1"
 _INSTALL_DEV_SHORTCUT_PATH = _RC003_ROOT / "build" / "install-dev-shortcut.ps1"
@@ -228,6 +236,9 @@ class PyInstallerSpecTests(unittest.TestCase):
 
     def test_spec_builds_a_self_contained_narrow_hid_helper(self):
         text = _strip_hash_comments(_SPEC_PATH.read_text(encoding="utf-8"))
+        helper_analysis = text[
+            text.index("helper_a = Analysis(") : text.index("helper_pyz = PYZ(")
+        ]
         self.assertTrue(_HID_HELPER_LAUNCHER_PATH.is_file())
         self.assertIn('SRC_ROOT / "hid_helper_launcher.py"', text)
         self.assertIn('HID_HELPER_NAME = "RemoteMicRC003HidHelper"', text)
@@ -240,11 +251,14 @@ class PyInstallerSpecTests(unittest.TestCase):
         self.assertIn("helper_exe = EXE(", text)
         self.assertIn("helper_a.binaries", text)
         self.assertIn("helper_a.datas", text)
-        self.assertIn('"ovb_rc003/frida_assets"', text)
-        self.assertIn('"ovb_rc003.hid_elevation_windows"', text)
-        self.assertIn('"ovb_rc003.frida_hid_tap_injector"', text)
-        self.assertIn('"PySide6"', text)
-        self.assertIn('"ovb_rc003.qt_settings_app"', text)
+        self.assertIn('(str(VERSION_FILE), "ovb_rc003")', helper_analysis)
+        self.assertIn('"ovb_rc003/frida_assets"', helper_analysis)
+        self.assertIn('"ovb_rc003.hid_elevation_windows"', helper_analysis)
+        self.assertIn('"ovb_rc003.frida_hid_tap_injector"', helper_analysis)
+        self.assertIn('"comtypes"', helper_analysis)
+        self.assertIn('"comtypes.client"', helper_analysis)
+        self.assertIn('"PySide6"', helper_analysis)
+        self.assertIn('"ovb_rc003.qt_settings_app"', helper_analysis)
         self.assertIn(
             '(str(HID_HELPER_RELATIVE_PATH), helper_exe.name, "EXECUTABLE")',
             text,
@@ -376,6 +390,37 @@ class LauncherEntryPointTests(unittest.TestCase):
         self.assertIn('if __name__ == "__main__":', text)
 
 
+class HidHelperLauncherTests(unittest.TestCase):
+    def _load_launcher(self):
+        spec = importlib.util.spec_from_file_location(
+            "test_hid_helper_launcher",
+            _HID_HELPER_LAUNCHER_PATH,
+        )
+        self.assertIsNotNone(spec)
+        self.assertIsNotNone(spec.loader)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    def test_import_failure_returns_stable_exit_code(self):
+        launcher = self._load_launcher()
+        with mock.patch.object(
+            launcher,
+            "_load_helper_main",
+            side_effect=ModuleNotFoundError("missing frozen dependency"),
+        ):
+            self.assertEqual(launcher.main(), 5)
+
+    def test_unexpected_helper_failure_returns_stable_exit_code(self):
+        launcher = self._load_launcher()
+        with mock.patch.object(
+            launcher,
+            "_load_helper_main",
+            return_value=mock.Mock(side_effect=RuntimeError("boom")),
+        ):
+            self.assertEqual(launcher.main(), 5)
+
+
 class InnoSetupScriptTests(unittest.TestCase):
     def setUp(self):
         self.text = _ISS_PATH.read_text(encoding="utf-8")
@@ -384,13 +429,16 @@ class InnoSetupScriptTests(unittest.TestCase):
     def test_privileges_required_is_lowest(self):
         self.assertIn("PrivilegesRequired=lowest", self.text)
 
-    def test_installer_elevates_only_fixed_hid_actions_and_the_stop_retry(self):
+    def test_installer_delegates_hid_maintenance_to_the_normal_application(self):
         code_section = _iss_section(self.text, "Code")
         self.assertIn("ShellExec(", code_section)
         self.assertIn("'runas'", code_section)
-        self.assertIn("{#HidHelperExeName}", code_section)
-        self.assertIn("RunHidHelper('--install-task'", code_section)
-        self.assertIn("RunHidHelper('--uninstall-task'", code_section)
+        self.assertIn("RunApplicationMaintenance", code_section)
+        self.assertIn("'--install-hid-helper'", code_section)
+        self.assertIn("'--uninstall-hid-helper'", code_section)
+        self.assertNotIn("RunHidHelper", code_section)
+        self.assertNotIn("'--install-task'", code_section)
+        self.assertNotIn("'--uninstall-task'", code_section)
         self.assertIn("StopNeedsElevationExitCode = 10", code_section)
         self.assertIn("StopUnsafeToContinueExitCode = 20", code_section)
         self.assertIn("StopProbeFailedExitCode = 21", code_section)
@@ -400,36 +448,43 @@ class InnoSetupScriptTests(unittest.TestCase):
         self.assertNotIn("--pid", code_section)
         self.assertNotIn("PrivilegesRequired=admin", self.effective_text)
 
-    def test_installer_uses_internal_helper_and_removes_the_old_root_copy(self):
+    def test_installer_hides_the_internal_helper_and_removes_the_old_root_copy(self):
         code_section = _iss_section(self.text, "Code")
         install_delete = _strip_semicolon_comments(
             _iss_section(self.text, "InstallDelete")
         )
-        self.assertIn(
-            "ExpandConstant('{app}\\_internal\\{#HidHelperExeName}')",
-            code_section,
-        )
+        self.assertIn("ExpandConstant('{app}\\{#AppExeName}')", code_section)
         self.assertIn(
             'Type: files; Name: "{app}\\{#HidHelperExeName}"',
             install_delete,
         )
 
-    def test_install_failure_explicitly_disables_custom_direction_mapping(self):
+    def test_install_failure_keeps_a_concise_in_app_retry_path(self):
         code_section = _iss_section(self.text, "Code")
         self.assertIn("CurStepChanged", code_section)
         self.assertIn("ssPostInstall", code_section)
-        self.assertIn("管理员按键组件没有安装成功", code_section)
-        self.assertIn("自定义方向映射已停用", code_section)
+        self.assertIn("方向改键未启用", code_section)
+        self.assertIn("启用改键", code_section)
         self.assertIn("WizardForm.FinishedLabel.Caption", code_section)
+
+    def test_standard_account_gets_one_direct_message_without_a_useless_uac_prompt(self):
+        code_section = _iss_section(self.text, "Code")
+        self.assertIn("HidHelperAccountUnsupportedExitCode = 25", code_section)
+        branch = code_section.split(
+            "if ResultCode = HidHelperAccountUnsupportedExitCode then", 1
+        )[1].split("else", 1)[0]
+        self.assertIn("当前 Windows 账号不是管理员", branch)
+        self.assertIn("临时输入另一个管理员账号无效", branch)
+        self.assertNotIn("ShellExec", branch)
 
     def test_uninstall_blocks_before_file_removal_if_helper_cleanup_fails(self):
         code_section = _iss_section(self.text, "Code")
         initialize = code_section.split(
             "function InitializeUninstall(): Boolean", 1
         )[1].split("procedure CurUninstallStepChanged", 1)[0]
-        self.assertIn("RunHidHelper('--uninstall-task'", initialize)
+        self.assertIn("RunApplicationMaintenance('--uninstall-hid-helper'", initialize)
         self.assertIn("Result := False", initialize)
-        self.assertIn("留下失效的计划任务", initialize)
+        self.assertIn("方向改键权限未能移除", initialize)
 
     def test_no_autostart_shortcut_or_task(self):
         self.assertNotIn("userstartup", self.effective_text.lower())
@@ -658,9 +713,32 @@ class InnoSetupScriptTests(unittest.TestCase):
     def test_uninstall_removes_only_the_owned_login_startup_value(self):
         code_section = _iss_section(self.text, "Code")
         self.assertIn("CurUninstallStepChanged", code_section)
-        self.assertIn("RegDeleteValue", code_section)
-        self.assertIn("RemoteMicRC003", code_section)
-        self.assertIn(r"Software\Microsoft\Windows\CurrentVersion\Run", code_section)
+        self.assertIn("procedure RemoveOwnedLoginStartupValue", code_section)
+        ownership_check = code_section.split(
+            "procedure RemoveOwnedLoginStartupValue", 1
+        )[1].split("procedure CurUninstallStepChanged", 1)[0]
+        self.assertIn("RegQueryStringValue", ownership_check)
+        self.assertIn(
+            "ExpectedCommand := AppExecutable + ' --background'", ownership_check
+        )
+        self.assertIn(
+            "ExpectedQuotedCommand := '\"' + AppExecutable + '\" --background'",
+            ownership_check,
+        )
+        self.assertIn("CompareText(CurrentCommand, ExpectedCommand)", ownership_check)
+        self.assertIn(
+            "CompareText(CurrentCommand, ExpectedQuotedCommand)", ownership_check
+        )
+        self.assertIn("RegDeleteValue", ownership_check)
+        self.assertIn("RemoteMicRC003", ownership_check)
+        self.assertIn(
+            r"Software\Microsoft\Windows\CurrentVersion\Run", ownership_check
+        )
+        uninstall_hook = code_section.split(
+            "procedure CurUninstallStepChanged", 1
+        )[1]
+        self.assertIn("RemoveOwnedLoginStartupValue", uninstall_hook)
+        self.assertNotIn("RegDeleteValue", uninstall_hook)
 
     def test_postinstall_run_opens_settings_and_never_the_bare_no_arg_bridge(self):
         run_section = _iss_section(self.text, "Run")
@@ -711,6 +789,57 @@ class WindowsCiWorkflowTests(unittest.TestCase):
     def test_runs_frozen_qt_runtime_smoke_check(self):
         self.assertIn("--qt-runtime-check", self.text)
 
+    def test_runs_the_frozen_hid_helper_self_check_before_the_main_app(self):
+        helper_index = self.text.index("RemoteMicRC003HidHelper.exe")
+        self_check_index = self.text.index(
+            "Invoke-FrozenExecutableCheck -FilePath $builtHidHelper"
+        )
+        dry_run_index = self.text.index(
+            "Invoke-FrozenExecutableCheck -FilePath $builtExe"
+        )
+        self.assertLess(helper_index, self_check_index)
+        self.assertLess(self_check_index, dry_run_index)
+        self.assertIn("Start-Process", self.text)
+        self.assertIn("-Wait -PassThru -WindowStyle Hidden", self.text)
+        self.assertIn("$process.ExitCode", self.text)
+        self.assertNotIn("& $builtHidHelper --self-check", self.text)
+
+    def test_rejects_a_frozen_version_that_differs_from_source(self):
+        self.assertIn(
+            '$builtVersionFile = "dist/RemoteMicRC003/_internal/ovb_rc003/VERSION"',
+            self.text,
+        )
+        self.assertIn("if ($builtVersion -ne $sourceVersion)", self.text)
+        self.assertIn("built VERSION mismatch", self.text)
+
+    def test_binds_the_ci_artifact_to_the_checked_source_and_test_state(self):
+        test_index = self.text.index("- name: Run test suite")
+        capture_index = self.text.index(
+            "$inputState = Get-RC003BuildInputState"
+        )
+        diff_guard_index = self.text.index(
+            "tracked build or test inputs changed after their CI checks ran"
+        )
+        compare_index = self.text.index(
+            "build inputs changed after their CI checks ran"
+        )
+        pyinstaller_index = self.text.index(
+            "python -m PyInstaller build/RemoteMicRC003.spec"
+        )
+        qt_index = self.text.index(
+            'Invoke-FrozenExecutableCheck -FilePath $builtExe -ArgumentList @("--qt-runtime-check")'
+        )
+        write_index = self.text.index("Write-RC003BuildProvenance")
+        assert_index = self.text.index("Assert-RC003BuildProvenance", write_index)
+        self.assertLess(capture_index, test_index)
+        self.assertLess(test_index, diff_guard_index)
+        self.assertLess(diff_guard_index, compare_index)
+        self.assertLess(compare_index, pyinstaller_index)
+        self.assertLess(pyinstaller_index, qt_index)
+        self.assertLess(qt_index, write_index)
+        self.assertLess(write_index, assert_index)
+        self.assertIn("rc003-build-input.json", self.text)
+
     def test_compiles_inno_setup_installer(self):
         self.assertIn("ISCC.exe", self.text)
 
@@ -731,10 +860,14 @@ class WindowsCiWorkflowTests(unittest.TestCase):
         self.assertNotIn("continue-on-error", _strip_hash_comments(self.text))
 
     def test_never_runs_the_compiled_installer(self):
-        lower = self.text.lower()
-        self.assertNotIn("start-process", lower)
-        self.assertNotIn("/verysilent", lower)
-        self.assertNotIn("/silent", lower)
+        step_start = self.text.index(
+            "- name: Compile Inno Setup installer (required gate, never run/installed)"
+        )
+        step_end = self.text.index("- name:", step_start + 1)
+        installer_step = self.text[step_start:step_end].lower()
+        self.assertNotIn("start-process", installer_step)
+        self.assertNotIn("/verysilent", installer_step)
+        self.assertNotIn("/silent", installer_step)
 
     def test_uses_pinned_supported_actions(self):
         self.assertIn(
@@ -1048,13 +1181,72 @@ class WindowsCiWorkflowTests(unittest.TestCase):
         step = self._package_step_text()
         try_block_end = step.index("} catch {")
         installer_lookup_index = step.index(
-            'Get-ChildItem -Path dist/installer -Filter "RemoteMicRC003Setup-*-unsigned.exe"'
+            '$expectedInstallerName = "RemoteMicRC003Setup-$version-unsigned.exe"'
         )
         release_dir_index = step.index('$releaseDir = "$env:GITHUB_WORKSPACE')
         preflight_index = step.index("$releaseFiles = @(Get-ChildItem -Path $releaseDir -File)")
         self.assertLess(try_block_end, installer_lookup_index)
         self.assertLess(installer_lookup_index, release_dir_index)
         self.assertLess(release_dir_index, preflight_index)
+
+    def test_portable_zip_contract_is_read_back_before_release_staging(self):
+        step = self._package_step_text()
+        archive_index = step.index(
+            "[System.IO.Compression.ZipFile]::OpenRead((Resolve-Path $zipPath).Path)"
+        )
+        installer_index = step.index(
+            '$expectedInstallerName = "RemoteMicRC003Setup-$version-unsigned.exe"'
+        )
+        self.assertLess(archive_index, installer_index)
+        self.assertIn("portable ZIP must contain exactly one top-level directory", step)
+        self.assertIn("portable ZIP root must expose only", step)
+        self.assertIn("_internal/RemoteMicRC003HidHelper.exe", step)
+        self.assertIn("_internal/ovb_rc003/VERSION", step)
+        self.assertIn("_internal/build-provenance.json", step)
+        self.assertIn("$archiveFiles.ContainsKey($helperEntryName)", step)
+        self.assertIn("$versionEntry = $archiveFiles[$versionEntryName]", step)
+        self.assertNotIn("$archive.GetEntry", step)
+        self.assertIn("portable ZIP VERSION mismatch", step)
+        self.assertIn("portable ZIP file count mismatch", step)
+        self.assertIn("portable ZIP is missing staging file", step)
+        self.assertIn("portable ZIP file length mismatch", step)
+        self.assertIn("portable ZIP file hash mismatch", step)
+        self.assertIn("[System.IO.Path]::DirectorySeparatorChar", step)
+        staging_enumeration = re.search(
+            r"Get-ChildItem -LiteralPath \$stagingRoot[^\r\n]+",
+            step,
+        )
+        self.assertIsNotNone(staging_enumeration)
+        self.assertIn("-Force", staging_enumeration.group(0))
+        self.assertNotIn(".Replace('\\\\', '/')", step)
+        self.assertNotIn("[char[]]@('\\\\', '/')", step)
+
+    def test_release_packaging_rechecks_the_build_before_and_after_copying(self):
+        step = self._package_step_text()
+        initial_index = step.index("$initialBuildProvenance =")
+        copy_index = step.index('Copy-Item -Path "dist/RemoteMicRC003/*"')
+        staged_index = step.index("$stagedBuildProvenance =")
+        archive_index = step.index("[System.IO.Compression.ZipFile]::OpenRead")
+        final_index = step.index("$finalBuildProvenance =")
+        installer_index = step.index(
+            '$expectedInstallerName = "RemoteMicRC003Setup-$version-unsigned.exe"'
+        )
+        self.assertLess(initial_index, copy_index)
+        self.assertLess(copy_index, staged_index)
+        self.assertLess(staged_index, archive_index)
+        self.assertLess(archive_index, final_index)
+        self.assertLess(final_index, installer_index)
+        self.assertGreaterEqual(step.count("Assert-RC003BuildProvenanceMatches"), 2)
+
+    def test_selects_only_the_exact_current_version_installer(self):
+        step = self._package_step_text()
+        self.assertIn(
+            '$expectedInstallerName = "RemoteMicRC003Setup-$version-unsigned.exe"',
+            step,
+        )
+        self.assertIn("$installerFiles.Count -ne 1", step)
+        self.assertIn("$installerFiles[0].Name -ne $expectedInstallerName", step)
+        self.assertNotIn("Select-Object -First 1", step)
 
     def test_portable_staging_directory_is_a_single_versioned_top_level_folder(self):
         # Compress-Archive given a bare directory path (not a "/*" content
@@ -1284,6 +1476,238 @@ class WindowsCiWorkflowTests(unittest.TestCase):
         self.assertIn("$LASTEXITCODE", step_text)
 
 
+class BuildProvenanceScriptTests(unittest.TestCase):
+    def setUp(self):
+        self.text = _BUILD_PROVENANCE_PATH.read_text(encoding="utf-8")
+
+    def test_fingerprint_covers_runtime_tests_and_build_contract(self):
+        self.assertIn('$sourceRoot = Join-Path $RC003Root "src"', self.text)
+        self.assertIn('$testsRoot = Join-Path $RC003Root "tests"', self.text)
+        for required in (
+            r"build\build-candidate.ps1",
+            r"build\package-local-test.ps1",
+            r"build\build-provenance.ps1",
+            r"build\check-public-boundary.ps1",
+            r"build\check-release-readiness.py",
+            r"build\check-third-party-notices.py",
+            r"build\fetch-frida-gadget.ps1",
+            r"build\fetch-vb-cable.ps1",
+            r"build\RemoteMicRC003.spec",
+            r"ATTRIBUTION.md",
+            r"ASSET_LICENSES.md",
+            r"COPYRIGHT.md",
+            r"LICENSE.md",
+            r"THIRD_PARTY_NOTICES.md",
+            r"THIRD_PARTY_SOURCE.md",
+            r".github\workflows\windows-rc003-ci.yml",
+        ):
+            self.assertIn(required, self.text)
+        self.assertIn('$installerRoot = Join-Path $RC003Root "installer"', self.text)
+        self.assertIn(
+            '$thirdPartyLicensesRoot = Join-Path $RepoRoot "THIRD_PARTY_LICENSES"',
+            self.text,
+        )
+
+    def test_hidden_files_are_part_of_source_and_artifact_state(self):
+        recursive_enumerations = re.findall(
+            r"Get-ChildItem[^\r\n]+-File[^\r\n]+-Recurse[^\r\n]*",
+            self.text,
+        )
+        self.assertGreaterEqual(len(recursive_enumerations), 3)
+        for enumeration in recursive_enumerations:
+            self.assertIn("-Force", enumeration)
+
+    def test_each_file_hash_and_length_come_from_one_locked_stream(self):
+        self.assertIn("[System.IO.File]::Open(", self.text)
+        self.assertIn("[System.IO.FileShare]::Read", self.text)
+        self.assertIn("$length = $stream.Length", self.text)
+        self.assertIn("$sha256.ComputeHash($stream)", self.text)
+        self.assertNotIn("$($file.Length)", self.text)
+
+    def test_build_gate_is_path_scoped_nonblocking_and_abandonment_safe(self):
+        self.assertIn("function Enter-RC003BuildGate", self.text)
+        self.assertIn("Get-RC003BuildGateName -RC003Root $RC003Root", self.text)
+        self.assertIn('return "Global\\RemoteMicRC003_BuildGate_', self.text)
+        self.assertIn("$mutex.WaitOne(0)", self.text)
+        self.assertIn("System.Threading.AbandonedMutexException", self.text)
+        self.assertIn("another RC003 build or package operation is already running", self.text)
+        self.assertIn("function Exit-RC003BuildGate", self.text)
+
+    def test_manifest_recomputes_source_and_artifact_before_accepting(self):
+        self.assertIn("Get-RC003BuildInputState", self.text)
+        self.assertIn("Get-RC003ArtifactState", self.text)
+        self.assertIn("build inputs changed before the source fingerprint was written", self.text)
+        self.assertIn("packaged files changed after the last complete build", self.text)
+        self.assertIn("main executable hash changed", self.text)
+        self.assertIn("HID helper hash changed", self.text)
+
+    @unittest.skipUnless(
+        os.name == "nt" and shutil.which("powershell"),
+        "requires Windows PowerShell",
+    )
+    def test_runtime_rejects_same_version_source_change_and_counts_hidden_file(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            repo_root = Path(temporary_directory) / "repo"
+            rc003_root = repo_root / "apps" / "windows" / "rc003"
+            source_file = rc003_root / "src" / "ovb_rc003" / "app.py"
+            fixture_files = {
+                source_file: "alpha",
+                rc003_root / "src" / "ovb_rc003" / "VERSION": "0.0.1-test\n",
+                rc003_root / "tests" / "test_sample.py": "VALUE = 1\n",
+                rc003_root / "build" / "build-candidate.ps1": "fixture\n",
+                rc003_root / "build" / "package-local-test.ps1": "fixture\n",
+                rc003_root / "build" / "build-provenance.ps1": "fixture\n",
+                rc003_root / "build" / "check-public-boundary.ps1": "fixture\n",
+                rc003_root / "build" / "check-release-readiness.py": "fixture\n",
+                rc003_root / "build" / "check-third-party-notices.py": "fixture\n",
+                rc003_root / "build" / "fetch-frida-gadget.ps1": "fixture\n",
+                rc003_root / "build" / "fetch-vb-cable.ps1": "fixture\n",
+                rc003_root / "build" / "RemoteMicRC003.spec": "fixture\n",
+                rc003_root / "build" / "generate-app-icon.py": "fixture\n",
+                rc003_root / "build" / "third_party" / "VBCABLE_Driver_Pack45.zip": b"zip",
+                rc003_root / "requirements.txt": "fixture\n",
+                rc003_root / "requirements-dev.txt": "fixture\n",
+                rc003_root / "pyproject.toml": "fixture\n",
+                rc003_root / "ATTRIBUTION.md": "fixture\n",
+                rc003_root / "installer" / "application-exit-contract-v1.json": "{}\n",
+                rc003_root / "installer" / "readme-portable-rc003.txt": "fixture\n",
+                rc003_root / "installer" / "readme-rc003.txt": "fixture\n",
+                rc003_root / "installer" / "RemoteMicRC003Setup.iss": "fixture\n",
+                rc003_root / "installer" / "stop-app.ps1": "fixture\n",
+                repo_root / ".github" / "workflows" / "windows-rc003-ci.yml": "fixture\n",
+                repo_root / "Resources" / "RC003-remote-photo.png": b"png",
+                repo_root / "ASSET_LICENSES.md": "fixture\n",
+                repo_root / "COPYRIGHT.md": "fixture\n",
+                repo_root / "LICENSE.md": "fixture\n",
+                repo_root / "THIRD_PARTY_NOTICES.md": "fixture\n",
+                repo_root / "THIRD_PARTY_SOURCE.md": "fixture\n",
+                repo_root / "THIRD_PARTY_LICENSES" / "sample.txt": "fixture\n",
+                repo_root / "device-profiles" / "rc003.json": "{}\n",
+            }
+            for script_name in (
+                "element_navigation_prototype.py",
+                "element_navigation_command_windows.py",
+                "element_navigation_support.py",
+                "element_navigation_windows_host.py",
+                "element_targeting_core.py",
+                "spatial_navigation_core.py",
+            ):
+                fixture_files[rc003_root / "scripts" / script_name] = "fixture\n"
+            for path, content in fixture_files.items():
+                path.parent.mkdir(parents=True, exist_ok=True)
+                if isinstance(content, bytes):
+                    path.write_bytes(content)
+                else:
+                    path.write_text(content, encoding="utf-8")
+
+            build_root = rc003_root / "dist" / "RemoteMicRC003"
+            built_files = {
+                build_root / "RemoteMicRC003.exe": b"main",
+                build_root / "_internal" / "RemoteMicRC003HidHelper.exe": b"helper",
+                build_root / "_internal" / "ovb_rc003" / "VERSION": b"0.0.1-test\n",
+                build_root / "_internal" / "hidden.dat": b"hidden",
+            }
+            for path, content in built_files.items():
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(content)
+
+            environment = os.environ.copy()
+            environment.update(
+                {
+                    "RC003_PROVENANCE_SCRIPT": str(_BUILD_PROVENANCE_PATH),
+                    "RC003_FIXTURE_ROOT": str(rc003_root),
+                    "RC003_FIXTURE_REPO": str(repo_root),
+                    "RC003_FIXTURE_BUILD": str(build_root),
+                    "RC003_FIXTURE_SOURCE": str(source_file),
+                    "RC003_FIXTURE_HIDDEN": str(build_root / "_internal" / "hidden.dat"),
+                    "RC003_FIXTURE_RESULT": str(
+                        Path(temporary_directory) / "powershell-result.txt"
+                    ),
+                }
+            )
+            command = r"""
+trap {
+    [System.IO.File]::WriteAllText(
+        $env:RC003_FIXTURE_RESULT,
+        $_.Exception.ToString()
+    )
+    exit 1
+}
+$ErrorActionPreference = 'Stop'
+. $env:RC003_PROVENANCE_SCRIPT
+[System.IO.File]::SetAttributes(
+    $env:RC003_FIXTURE_HIDDEN,
+    [System.IO.FileAttributes]::Hidden
+)
+$inputState = Get-RC003BuildInputState `
+    -RC003Root $env:RC003_FIXTURE_ROOT `
+    -RepoRoot $env:RC003_FIXTURE_REPO
+$artifactState = Get-RC003ArtifactState -BuildRoot $env:RC003_FIXTURE_BUILD
+if ($artifactState.FileCount -ne 4) {
+    throw "hidden artifact was omitted: $($artifactState.FileCount)"
+}
+Write-RC003BuildProvenance `
+    -RC003Root $env:RC003_FIXTURE_ROOT `
+    -RepoRoot $env:RC003_FIXTURE_REPO `
+    -BuildRoot $env:RC003_FIXTURE_BUILD `
+    -InputState $inputState | Out-Null
+Assert-RC003BuildProvenance `
+    -RC003Root $env:RC003_FIXTURE_ROOT `
+    -RepoRoot $env:RC003_FIXTURE_REPO `
+    -BuildRoot $env:RC003_FIXTURE_BUILD | Out-Null
+[System.IO.File]::WriteAllText($env:RC003_FIXTURE_SOURCE, 'bravo')
+try {
+    Assert-RC003BuildProvenance `
+        -RC003Root $env:RC003_FIXTURE_ROOT `
+        -RepoRoot $env:RC003_FIXTURE_REPO `
+        -BuildRoot $env:RC003_FIXTURE_BUILD | Out-Null
+    throw 'stale source was accepted'
+} catch {
+    if ($_.Exception.Message -eq 'stale source was accepted') {
+        throw
+    }
+    if ($_.Exception.Message -notmatch 'build inputs changed') {
+        throw
+    }
+}
+[System.IO.File]::WriteAllText($env:RC003_FIXTURE_RESULT, 'ok')
+"""
+            result = subprocess.run(
+                [
+                    shutil.which("powershell"),
+                    "-NoProfile",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-Command",
+                    command,
+                ],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                env=environment,
+                timeout=30,
+                check=False,
+            )
+            self.assertEqual(
+                result.returncode,
+                0,
+                "PowerShell provenance fixture failed:\n"
+                + result.stdout
+                + "\n"
+                + result.stderr
+                + "\n"
+                + (
+                    Path(environment["RC003_FIXTURE_RESULT"]).read_text(
+                        encoding="utf-8",
+                        errors="replace",
+                    )
+                    if Path(environment["RC003_FIXTURE_RESULT"]).exists()
+                    else "no PowerShell result file"
+                ),
+            )
+
+
 class BuildCandidateScriptTests(unittest.TestCase):
     def setUp(self):
         self.text = _BUILD_CANDIDATE_PATH.read_text(encoding="utf-8")
@@ -1322,6 +1746,17 @@ class BuildCandidateScriptTests(unittest.TestCase):
         self.assertIn('$env:RC003_DISABLE_LIVE_INPUT = "1"', self.text)
         self.assertIn('$env:RC003_ALLOW_LIVE_INPUT_TESTS = "0"', self.text)
 
+    def test_local_build_requires_python_312_for_creation_and_existing_venv(self):
+        self.assertIn('Get-Command "py.exe"', self.text)
+        self.assertIn('PrefixArguments = @("-3.12")', self.text)
+        self.assertIn("candidate builds require Python 3.12", self.text)
+        self.assertIn("Get-PythonMinorVersion -Command $venvPython", self.text)
+        self.assertIn(
+            "candidate build virtual environment must use Python 3.12",
+            self.text,
+        )
+        self.assertNotIn('[string]$PythonExecutable = "python"', self.text)
+
     def test_stops_the_marked_development_session_before_touching_the_venv(self):
         stop_index = self.text.index("stop-dev.ps1")
         pip_index = self.text.index("pip install --upgrade pip")
@@ -1350,18 +1785,181 @@ class BuildCandidateScriptTests(unittest.TestCase):
 
     def test_checks_the_real_frozen_qt_runtime_after_building(self):
         pyinstaller_index = self.text.index("PyInstaller build (unsigned candidate)")
-        qt_check_index = self.text.index("& $builtExe --qt-runtime-check")
+        qt_check_index = self.text.index('@("--qt-runtime-check")')
         self.assertGreater(qt_check_index, pyinstaller_index)
-        self.assertIn(
-            'Assert-LastExitCode "$builtExe --qt-runtime-check"', self.text
-        )
+        self.assertIn("Invoke-FrozenExecutableCheck", self.text)
+        self.assertIn("$process.ExitCode", self.text)
 
     def test_requires_the_narrow_hid_helper_before_smoke_checks(self):
         helper_index = self.text.index("RemoteMicRC003HidHelper.exe")
-        dry_run_index = self.text.index("& $builtExe --dry-run")
+        dry_run_index = self.text.index('@("--dry-run")')
         self.assertLess(helper_index, dry_run_index)
         self.assertIn("expected narrow HID helper not found", self.text)
         self.assertIn("build root must expose only RemoteMicRC003.exe", self.text)
+        self.assertIn('@("--self-check")', self.text)
+        self.assertIn("Invoke-FrozenExecutableCheck", self.text)
+        self.assertIn("-Wait", self.text)
+        self.assertIn("-PassThru", self.text)
+
+    def test_rejects_a_stale_or_missing_frozen_version(self):
+        self.assertIn("$sourceVersionFile", self.text)
+        self.assertIn("$builtVersionFile", self.text)
+        self.assertIn("expected built VERSION file not found", self.text)
+        self.assertIn("if ($builtVersion -ne $sourceVersion)", self.text)
+        self.assertIn("built VERSION mismatch", self.text)
+
+    def test_invalidates_old_provenance_before_any_new_build_attempt(self):
+        remove_index = self.text.index(
+            "Remove-Item -LiteralPath $BuildProvenancePath"
+        )
+        test_index = self.text.index('Write-Host "-- test suite --"')
+        self.assertLess(remove_index, test_index)
+        self.assertIn('. (Join-Path $PSScriptRoot "build-provenance.ps1")', self.text)
+
+    def test_holds_the_shared_build_gate_before_touching_dist(self):
+        gate_index = self.text.index("Enter-RC003BuildGate")
+        provenance_remove_index = self.text.index(
+            "Remove-Item -LiteralPath $BuildProvenancePath"
+        )
+        release_index = self.text.rindex("Exit-RC003BuildGate")
+        self.assertLess(gate_index, provenance_remove_index)
+        self.assertGreater(release_index, provenance_remove_index)
+
+    def test_captures_one_input_state_before_all_validation_and_build_steps(self):
+        capture_index = self.text.index("$inputStateBeforeBuild =")
+        notice_index = self.text.index(
+            'Write-Host "-- third-party notice and license inventory --"'
+        )
+        boundary_index = self.text.index('Write-Host "-- public boundary scan --"')
+        test_index = self.text.index('Write-Host "-- test suite --"')
+        pyinstaller_index = self.text.index(
+            'Write-Host "-- PyInstaller build (unsigned candidate) --"'
+        )
+        self.assertLess(capture_index, notice_index)
+        self.assertLess(capture_index, boundary_index)
+        self.assertLess(capture_index, test_index)
+        self.assertLess(capture_index, pyinstaller_index)
+
+    def test_writes_provenance_only_after_all_frozen_checks_pass(self):
+        qt_index = self.text.index('@("--qt-runtime-check")')
+        write_index = self.text.index("Write-RC003BuildProvenance")
+        assert_index = self.text.index("Assert-RC003BuildProvenance")
+        self.assertLess(qt_index, write_index)
+        self.assertLess(write_index, assert_index)
+        self.assertIn(
+            "build inputs changed while PyInstaller or frozen checks were running",
+            self.text,
+        )
+        catch_index = self.text.index("} catch {")
+        cleanup_index = self.text.index(
+            "Remove-Item -LiteralPath $BuildProvenancePath",
+            catch_index,
+        )
+        self.assertGreater(cleanup_index, catch_index)
+
+
+class LocalTestPackageScriptTests(unittest.TestCase):
+    def setUp(self):
+        self.text = _PACKAGE_LOCAL_TEST_PATH.read_text(encoding="utf-8")
+
+    def test_refuses_stale_builds_and_existing_output(self):
+        self.assertIn("built output is stale", self.text)
+        self.assertIn("refusing to overwrite existing test package", self.text)
+
+    def test_holds_the_shared_build_gate_for_the_whole_package_operation(self):
+        gate_index = self.text.index("Enter-RC003BuildGate")
+        version_index = self.text.index("$sourceVersion = Get-RC003SourceVersion")
+        publish_index = self.text.index("Move-Item", version_index)
+        release_index = self.text.rindex("Exit-RC003BuildGate")
+        self.assertLess(gate_index, version_index)
+        self.assertGreater(release_index, publish_index)
+
+    def test_runs_all_frozen_smoke_checks_before_compressing(self):
+        helper_index = self.text.index('-ArgumentList @("--self-check")')
+        dry_run_index = self.text.index('-ArgumentList @("--dry-run")')
+        qt_index = self.text.index('-ArgumentList @("--qt-runtime-check")')
+        compress_index = self.text.index("Compress-Archive")
+        self.assertLess(helper_index, dry_run_index)
+        self.assertLess(dry_run_index, qt_index)
+        self.assertLess(qt_index, compress_index)
+
+    def test_frozen_smoke_checks_read_the_process_exit_code(self):
+        self.assertIn("Start-Process", self.text)
+        self.assertIn("-Wait", self.text)
+        self.assertIn("-PassThru", self.text)
+        self.assertIn("-WindowStyle Hidden", self.text)
+        self.assertIn("$process.ExitCode", self.text)
+        self.assertNotIn("$LASTEXITCODE", self.text)
+
+    def test_zip_has_one_user_entry_and_the_internal_helper_version(self):
+        self.assertIn("portable ZIP must contain exactly one top-level directory", self.text)
+        self.assertIn("portable ZIP root must expose only", self.text)
+        self.assertIn("_internal/RemoteMicRC003HidHelper.exe", self.text)
+        self.assertIn("_internal/ovb_rc003/VERSION", self.text)
+        self.assertIn("$archiveFiles.ContainsKey($helperEntryName)", self.text)
+        self.assertIn("$versionEntry = $archiveFiles[$versionEntryName]", self.text)
+        self.assertNotIn("$archive.GetEntry", self.text)
+
+    def test_zip_is_compared_file_by_file_with_the_staging_directory(self):
+        self.assertIn("portable ZIP file count mismatch", self.text)
+        self.assertIn("portable ZIP is missing staging file", self.text)
+        self.assertIn("portable ZIP file length mismatch", self.text)
+        self.assertIn("portable ZIP file hash mismatch", self.text)
+        self.assertIn("Get-StreamSha256", self.text)
+        self.assertIn("[System.IO.Path]::DirectorySeparatorChar", self.text)
+        self.assertNotIn(".Replace('\\\\', '/')", self.text)
+        self.assertNotIn("[char[]]@('\\\\', '/')", self.text)
+
+    def test_outputs_zip_and_main_executable_hashes(self):
+        self.assertIn("ZIP SHA-256", self.text)
+        self.assertIn("EXE SHA-256", self.text)
+
+    def test_refuses_to_write_the_zip_inside_the_build_output(self):
+        refusal_index = self.text.index(
+            "OutputPath must be outside the build output directory"
+        )
+        smoke_index = self.text.index('Write-Host "-- verify frozen HID helper --"')
+        self.assertLess(refusal_index, smoke_index)
+        self.assertIn("[System.StringComparison]::OrdinalIgnoreCase", self.text)
+
+    def test_checks_provenance_before_smoke_copy_and_after_zip_verification(self):
+        initial_index = self.text.index("$initialBuildProvenance =")
+        smoke_index = self.text.index('Write-Host "-- verify frozen HID helper --"')
+        checked_index = self.text.index("$checkedBuildProvenance =")
+        copy_index = self.text.index("Copy-Item -Path (Join-Path $BuildRoot")
+        staged_index = self.text.index("$stagedBuildProvenance =")
+        compress_index = self.text.index("Compress-Archive")
+        final_index = self.text.index("$finalBuildProvenance =")
+        move_index = self.text.index("Move-Item", final_index)
+        self.assertLess(initial_index, smoke_index)
+        self.assertLess(smoke_index, checked_index)
+        self.assertLess(checked_index, copy_index)
+        self.assertLess(copy_index, staged_index)
+        self.assertLess(staged_index, compress_index)
+        self.assertLess(compress_index, final_index)
+        self.assertLess(final_index, move_index)
+        self.assertGreaterEqual(self.text.count("Assert-RC003BuildProvenanceMatches"), 3)
+        self.assertIn("_internal/build-provenance.json", self.text)
+
+    def test_zip_is_published_atomically_without_deleting_a_competing_result(self):
+        self.assertIn("$temporaryOutputPath =", self.text)
+        self.assertIn(".tmp.zip", self.text)
+        compress_index = self.text.index("Compress-Archive")
+        move_index = self.text.index("Move-Item", compress_index)
+        self.assertLess(compress_index, move_index)
+        catch_index = self.text.index("} catch {", move_index)
+        catch_end = self.text.index("} finally {", catch_index)
+        catch_block = self.text[catch_index:catch_end]
+        self.assertIn("$temporaryOutputPath", catch_block)
+        self.assertNotIn("$outputFullPath", catch_block)
+
+    def test_hidden_staging_files_cannot_escape_zip_comparison(self):
+        staging_enumeration = re.search(
+            r"Get-ChildItem -LiteralPath \$stagingRoot[^\r\n]+",
+            self.text,
+        )
+        self.assertIsNotNone(staging_enumeration)
+        self.assertIn("-Force", staging_enumeration.group(0))
 
 
 class DeveloperEntryScriptTests(unittest.TestCase):
@@ -1794,9 +2392,24 @@ class PortableAndInstallerFlowContractTests(unittest.TestCase):
         # installer's "停止" Start Menu shortcut.
         self.assertIn("便携版没有停止脚本", self.normalized)
 
-    def test_portable_removal_is_deleting_the_extracted_folder(self):
-        self.assertIn("删除整个解压出来的文件夹", self.normalized)
-        self.assertIn("便携版没有安装程序", self.normalized)
+    def test_portable_removal_cleans_shared_permission_before_deleting_folder(self):
+        self.assertIn("点击“移除权限”并确认一次 UAC", self.normalized)
+        self.assertIn("再删除整个解压文件夹", self.normalized)
+        self.assertIn("不会自动删除已授权助手", self.normalized)
+
+    def test_portable_uses_one_uac_then_normal_startup_and_login_startup(self):
+        portable_readme = _normalize_whitespace(
+            _PORTABLE_README_PATH.read_text(encoding="utf-8")
+        )
+        for text in (self.normalized, portable_readme):
+            self.assertIn("首次启用方向改键", text)
+            self.assertIn("确认一次", text)
+            self.assertIn("普通", text)
+            self.assertIn("随 Windows 启动", text)
+            self.assertIn("不再反复弹 UAC", text)
+            self.assertIn("移除权限", text)
+        self.assertNotIn("便携版本身不会安装预授权 HID 助手", self.text)
+        self.assertNotIn("手动以管理员身份启动便携版", self.text)
 
     def test_installer_flow_still_retains_start_menu_settings_start_stop_uninstall(self):
         installer_section_start = self.text.index("方式一：安装器")
@@ -1902,7 +2515,7 @@ class ConfigLogResidueDisclosureContractTests(unittest.TestCase):
         # shared config_root() location too.
         portable_section_start = self.readme_text.index("**便携版 ZIP 用户**")
         portable_section = self.readme_text[portable_section_start:]
-        self.assertIn("但便携版运行时同样会把", portable_section)
+        self.assertIn("便携版运行时同样会把", portable_section)
         self.assertIn(config.CONFIG_FILENAME, portable_section)
 
 

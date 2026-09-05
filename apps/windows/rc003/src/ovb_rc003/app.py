@@ -137,6 +137,7 @@ _KEY_DETECTION_MIC_RELEASE_GRACE_SECONDS = 1.0
 _KEY_DETECTION_MIC_MAX_SECONDS = 10.0
 _ORDINARY_MIC_RELEASE_GUARD_SECONDS = 0.12
 _RUNTIME_STATUS_HEARTBEAT_SECONDS = 5.0
+_VOICE_HOLD_SAFETY_SECONDS = 120.0
 _DIRECTION_BUTTON_IDS = frozenset({"up", "down", "left", "right"})
 _VOICE_HOTKEY_BACKEND_MARKED = "marked_keybd_event"
 _VOICE_HOTKEY_BACKEND_WETYPE = "wetype_virtual_key_sendinput"
@@ -268,6 +269,9 @@ class RC003App:
         self._voice_mic_gesture_hid_released = False
         self._voice_mic_gesture_direct_hid_seen = False
         self._voice_mic_gesture_sources_down: set[str] = set()
+        self._voice_hold_watchdog_timer: Optional[object] = None
+        self._voice_hold_watchdog_token: Optional[object] = None
+        self._voice_hold_watchdog_timer_factory = threading.Timer
         self._ordinary_mic_lock = threading.Lock()
         self._ordinary_mic_sources_down: set[str] = set()
         self._ordinary_mic_late_sources_down: set[str] = set()
@@ -297,6 +301,8 @@ class RC003App:
         # hold cannot be split between two owners.
         self._direct_hid_interception_armed = False
         self._raw_fallback_buttons_down: set[str] = set()
+        self._raw_fallback_hold_guards: dict[str, tuple[object, object]] = {}
+        self._raw_fallback_timer_factory = threading.Timer
         self._raw_mapped_buttons_down: set[str] = set()
         self._input_rearm_blocked_buttons: set[str] = set()
         self._key_detection_suppressed_buttons: set[str] = set()
@@ -568,6 +574,13 @@ class RC003App:
         )
         if callable(set_device_removed_callback):
             set_device_removed_callback(self._on_raw_input_device_removed)
+        set_input_corruption_callback = getattr(
+            self._hid_listener,
+            "set_input_corruption_callback",
+            None,
+        )
+        if callable(set_input_corruption_callback):
+            set_input_corruption_callback(self._on_raw_input_corruption)
         try:
             self._hid_listener.start(device_path)
         except raw_input_windows.RawInputUnavailableError as exc:
@@ -711,6 +724,73 @@ class RC003App:
                     sorted(buttons),
                 )
 
+    def _cancel_raw_fallback_hold_guard_locked(self, button_id: str) -> None:
+        guard = self._raw_fallback_hold_guards.pop(button_id, None)
+        if guard is None:
+            return
+        _token, timer = guard
+        cancel = getattr(timer, "cancel", None)
+        if callable(cancel):
+            try:
+                cancel()
+            except BaseException as exc:  # noqa: BLE001 - token is already invalid
+                self._logger.warning(
+                    "raw fallback hold timer cancel failed: button=%s error_type=%s",
+                    button_id,
+                    type(exc).__name__,
+                )
+
+    def _cancel_all_raw_fallback_hold_guards_locked(self) -> None:
+        for button_id in tuple(self._raw_fallback_hold_guards):
+            self._cancel_raw_fallback_hold_guard_locked(button_id)
+
+    def _arm_raw_fallback_hold_guard_locked(self, button_id: str) -> bool:
+        self._cancel_raw_fallback_hold_guard_locked(button_id)
+        token = object()
+        try:
+            timer = self._raw_fallback_timer_factory(
+                button_gesture.ButtonGestureDispatcher.MAX_HOLD_SECONDS,
+                lambda button_id=button_id, token=token: (
+                    self._raw_fallback_hold_timeout(button_id, token)
+                ),
+            )
+            if isinstance(timer, threading.Thread):
+                timer.daemon = True
+            self._raw_fallback_hold_guards[button_id] = (token, timer)
+            timer.start()
+        except BaseException as exc:  # noqa: BLE001 - immediately release the key
+            current = self._raw_fallback_hold_guards.get(button_id)
+            if current is not None and current[0] is token:
+                self._raw_fallback_hold_guards.pop(button_id, None)
+            self._logger.error(
+                "raw fallback hold timer failed to start: button=%s error_type=%s",
+                button_id,
+                type(exc).__name__,
+            )
+            return False
+        return True
+
+    def _raw_fallback_hold_timeout(self, button_id: str, token: object) -> None:
+        with self._input_arbitration_lock:
+            guard = self._raw_fallback_hold_guards.get(button_id)
+            if guard is None or guard[0] is not token:
+                return
+            self._raw_fallback_hold_guards.pop(button_id, None)
+            if button_id not in self._raw_fallback_buttons_down:
+                return
+            self._raw_fallback_buttons_down.discard(button_id)
+            self._input_rearm_blocked_buttons.add(button_id)
+            self._release_raw_fallback_keyups(
+                {button_id},
+                reason="raw_fallback_hold_timeout",
+            )
+            self._logger.warning(
+                "raw Windows key held for %.0fs; forced release until physical up: "
+                "button=%s",
+                button_gesture.ButtonGestureDispatcher.MAX_HOLD_SECONDS,
+                button_id,
+            )
+
     def _on_raw_input_device_removed(self) -> None:
         self._set_runtime_input_state(raw_input_state="device_removed")
         with self._input_arbitration_lock:
@@ -720,6 +800,7 @@ class RC003App:
                 )
                 self._direct_hid_usages.clear()
             raw_fallback_buttons = set(self._raw_fallback_buttons_down)
+            self._cancel_all_raw_fallback_hold_guards_locked()
             lost_buttons = (
                 raw_fallback_buttons
                 | set(self._raw_mapped_buttons_down)
@@ -747,6 +828,32 @@ class RC003App:
             )
         self._logger.warning("RC003 Raw Input device removed; requesting reconnect")
         self._supervisor.request_reconnect()
+
+    def _on_raw_input_corruption(self, reason: str) -> None:
+        """Cancel Raw Input ownership while preserving the physical release."""
+
+        with self._input_arbitration_lock:
+            raw_fallback_buttons = set(self._raw_fallback_buttons_down)
+            raw_mapped_buttons = set(self._raw_mapped_buttons_down)
+            affected_buttons = raw_fallback_buttons | raw_mapped_buttons
+            self._cancel_all_raw_fallback_hold_guards_locked()
+            self._raw_fallback_buttons_down.clear()
+            self._raw_mapped_buttons_down.clear()
+            if affected_buttons:
+                self._cancel_input_gestures(
+                    affected_buttons,
+                    reason=f"raw_input_corruption_{reason}",
+                    block_until_release=True,
+                )
+                self._release_raw_fallback_keyups(
+                    raw_fallback_buttons,
+                    reason=f"raw_input_corruption_{reason}",
+                )
+        self._logger.warning(
+            "RC003 Raw Input data rejected: reason=%s cancelled_buttons=%s",
+            reason,
+            sorted(affected_buttons),
+        )
 
     def _on_hid_tap_status(self, status: str, detail: str) -> None:
         self._set_runtime_input_state(hid_tap_state=status)
@@ -782,6 +889,7 @@ class RC003App:
                 raw_mapped_buttons = set(self._raw_mapped_buttons_down)
                 raw_fallback_buttons = set(self._raw_fallback_buttons_down)
                 handover_buttons = raw_mapped_buttons | raw_fallback_buttons
+                self._cancel_all_raw_fallback_hold_guards_locked()
                 self._cancel_input_gestures(
                     handover_buttons,
                     reason="hid_tap_handover",
@@ -870,6 +978,7 @@ class RC003App:
         self._button_combos.reset()
         self._button_gestures.reset()
         with self._input_arbitration_lock:
+            self._cancel_all_raw_fallback_hold_guards_locked()
             self._release_raw_fallback_keyups(
                 set(self._raw_fallback_buttons_down),
                 reason="input_channels_stopping",
@@ -912,6 +1021,7 @@ class RC003App:
         with self._input_arbitration_lock:
             self._direct_hid_interception_ready = False
             self._direct_hid_interception_armed = False
+            self._cancel_all_raw_fallback_hold_guards_locked()
             self._raw_fallback_buttons_down.clear()
             self._raw_mapped_buttons_down.clear()
             self._input_rearm_blocked_buttons.clear()
@@ -1213,6 +1323,7 @@ class RC003App:
     def _finish_voice_mic_gesture(self) -> None:
         """Release the current cross-source mic gesture latch."""
 
+        self._cancel_voice_hold_watchdog_locked()
         self._voice_mic_gesture_active = False
         self._voice_mic_gesture_audio_started = False
         self._voice_mic_gesture_audio_stopped = False
@@ -1220,6 +1331,104 @@ class RC003App:
         self._voice_mic_gesture_hid_released = False
         self._voice_mic_gesture_direct_hid_seen = False
         self._voice_mic_gesture_sources_down.clear()
+
+    def _cancel_voice_hold_watchdog_locked(self) -> None:
+        timer = self._voice_hold_watchdog_timer
+        self._voice_hold_watchdog_timer = None
+        self._voice_hold_watchdog_token = None
+        if timer is not None:
+            cancel = getattr(timer, "cancel", None)
+            if callable(cancel):
+                try:
+                    cancel()
+                except BaseException as exc:  # noqa: BLE001 - token is already invalid
+                    self._logger.warning(
+                        "voice hold safety timer cancel failed: error_type=%s",
+                        type(exc).__name__,
+                    )
+
+    def _arm_voice_hold_watchdog_locked(self) -> bool:
+        self._cancel_voice_hold_watchdog_locked()
+        token = object()
+        try:
+            timer = self._voice_hold_watchdog_timer_factory(
+                _VOICE_HOLD_SAFETY_SECONDS,
+                lambda token=token: self._voice_hold_watchdog_expired(token),
+            )
+            if isinstance(timer, threading.Thread):
+                timer.daemon = True
+            self._voice_hold_watchdog_token = token
+            self._voice_hold_watchdog_timer = timer
+            timer.start()
+        except BaseException as exc:  # noqa: BLE001 - never leave the host key held
+            if self._voice_hold_watchdog_token is token:
+                self._cancel_voice_hold_watchdog_locked()
+            self._logger.error(
+                "voice hold safety timer failed to start: error_type=%s",
+                type(exc).__name__,
+            )
+            return False
+        return True
+
+    def _force_voice_hold_release_locked(self, reason: str) -> bool:
+        # This watchdog owns the end of the current BLE attempt. Invalidate
+        # every callback already queued by that session before releasing the
+        # host key; reconnect publishes a fresh generation.
+        self._accept_ble_events = False
+        self._ble_callback_generation += 1
+        self._voice_pcm_forwarding_enabled = False
+        self._voice_audio_stream_active = False
+        self._voice_audio_stop_processed = True
+        self._voice_raw_input_trigger_pending = False
+        self._voice_audio_start_fallback_pending = False
+        self._voice_mic_gesture_sources_down.clear()
+        self._voice_mic_gesture_hid_released = True
+
+        action = self._voice.reset()
+        released = True
+        if action is not None:
+            released = self._apply_voice_action(action)
+            if not released:
+                self._voice.restore_pending(action)
+        elif self._voice_hotkey_release_pending is not None:
+            released = self._release_pending_voice_hotkey()
+
+        self._finish_voice_mic_gesture()
+        if released:
+            self._set_runtime_voice_active(False)
+            self._log_voice_submission_observation()
+            self._apply_pending_voice_settings_if_idle_locked()
+        else:
+            self._logger.error(
+                "%s; reconnect cleanup will retry the host release",
+                reason,
+            )
+        try:
+            if self._ble_session is not None:
+                self._ble_session.send_mic_close_threadsafe()
+        except BaseException as exc:  # noqa: BLE001 - reconnect must still run
+            self._logger.warning(
+                "voice hold safety MIC_CLOSE failed: error_type=%s",
+                type(exc).__name__,
+            )
+        finally:
+            self._supervisor.request_reconnect()
+        return released
+
+    def _voice_hold_watchdog_expired(self, token: object) -> None:
+        with self._voice_trigger_lock:
+            if self._voice_hold_watchdog_token is not token:
+                return
+            self._voice_hold_watchdog_timer = None
+            self._voice_hold_watchdog_token = None
+            if not self._voice.active and self._voice_hotkey_release_pending is None:
+                return
+
+            self._force_voice_hold_release_locked("voice hold safety release failed")
+            self._logger.warning(
+                "voice hold exceeded %.0fs; forced host release and reconnect",
+                _VOICE_HOLD_SAFETY_SECONDS,
+            )
 
     def _rollover_completed_voice_mic_gesture_locked(self, next_source: str) -> bool:
         """Detach stale sources once a matched HID release proves a new press."""
@@ -1259,11 +1468,13 @@ class RC003App:
 
         action = self._voice.on_mic_button_released()
         if action is None:
+            self._cancel_voice_hold_watchdog_locked()
             return True
         self._voice_raw_input_trigger_pending = False
         self._voice_audio_start_fallback_pending = False
         self._voice_pcm_forwarding_enabled = False
         if self._apply_voice_action(action):
+            self._cancel_voice_hold_watchdog_locked()
             self._logger.info("voice hold hotkey released on %s", reason)
             if not self._voice_audio_stream_active:
                 self._set_runtime_voice_active(False)
@@ -1622,6 +1833,7 @@ class RC003App:
 
                 if button_id in self._raw_fallback_buttons_down:
                     if not is_pressed:
+                        self._cancel_raw_fallback_hold_guard_locked(button_id)
                         self._raw_fallback_buttons_down.discard(button_id)
                     raw_mapping_bypassed = True
 
@@ -1639,6 +1851,13 @@ class RC003App:
                     if preserve_windows_original:
                         if is_pressed:
                             self._raw_fallback_buttons_down.add(button_id)
+                            if not self._arm_raw_fallback_hold_guard_locked(button_id):
+                                self._raw_fallback_buttons_down.discard(button_id)
+                                self._input_rearm_blocked_buttons.add(button_id)
+                                self._release_raw_fallback_keyups(
+                                    {button_id},
+                                    reason="raw_fallback_timer_unavailable",
+                                )
                             self._logger.warning(
                                 "RC003 mapping bypassed for non-intercepted input; "
                                 "Windows original retained: button=%s source=%s",
@@ -1912,45 +2131,49 @@ class RC003App:
     def _on_button_trigger(
         self, button_id: str, trigger: button_gesture.ButtonTrigger
     ) -> None:
-        with self._button_mapping_lock:
-            if button_id in self._removed_voice_bindings:
-                self._logger.warning(
-                    "delayed button gesture suppressed until removed voice mapping "
-                    "is reselected: %s",
-                    button_id,
-                )
-                return
-            action = key_mapping.button_action_for(
-                self._bindings,
+        # ButtonGestureDispatcher keeps a callback reservation until this
+        # function returns, so settings reload cannot replace the mapping we
+        # are reading. Avoid taking _button_mapping_lock here: immediate input
+        # enters the dispatcher while already holding it, whereas timer
+        # callbacks are serialized by the dispatcher's callback gate.
+        if button_id in self._removed_voice_bindings:
+            self._logger.warning(
+                "delayed button gesture suppressed until removed voice mapping "
+                "is reselected: %s",
                 button_id,
-                key_mapping.ButtonTrigger(trigger.value),
             )
-            try:
-                if action.kind == key_mapping.ActionKind.KEY_COMBO:
-                    win32_keys.resolve_vk_codes(action.keys)
-            except (
-                KeyError,
-                TypeError,
-                ValueError,
-                win32_keys.UnknownKeyTokenError,
-            ):
-                # A hand-edited or partially corrupted bindings file must disable
-                # only the affected button, never escape the Raw Input callback
-                # and tear down ordinary-button processing for the whole device.
-                self._logger.warning(
-                    "invalid button binding ignored: button=%s trigger=%s",
-                    button_id,
-                    trigger.value,
-                )
-                return
-            if key_mapping.is_voice_action(action):
-                self._logger.warning(
-                    "secondary voice action ignored: button=%s trigger=%s",
-                    button_id,
-                    trigger.value,
-                )
-                return
-            self._apply_button_action(action)
+            return
+        action = key_mapping.button_action_for(
+            self._bindings,
+            button_id,
+            key_mapping.ButtonTrigger(trigger.value),
+        )
+        try:
+            if action.kind == key_mapping.ActionKind.KEY_COMBO:
+                win32_keys.resolve_vk_codes(action.keys)
+        except (
+            KeyError,
+            TypeError,
+            ValueError,
+            win32_keys.UnknownKeyTokenError,
+        ):
+            # A hand-edited or partially corrupted bindings file must disable
+            # only the affected button, never escape the Raw Input callback
+            # and tear down ordinary-button processing for the whole device.
+            self._logger.warning(
+                "invalid button binding ignored: button=%s trigger=%s",
+                button_id,
+                trigger.value,
+            )
+            return
+        if key_mapping.is_voice_action(action):
+            self._logger.warning(
+                "secondary voice action ignored: button=%s trigger=%s",
+                button_id,
+                trigger.value,
+            )
+            return
+        self._apply_button_action(action)
 
     def _apply_button_action(self, action: key_mapping.ButtonAction) -> None:
         with self._button_action_lock:
@@ -2144,6 +2367,8 @@ class RC003App:
                         "voice action suppressed"
                     )
                 return
+            if not self._accepts_ble_callback(_ble_generation):
+                return
             mic_action = self._primary_button_action("mic")
             mic_voice_mode = self._voice_mode_for_primary_button(
                 "mic",
@@ -2151,6 +2376,8 @@ class RC003App:
             )
             if mic_voice_mode is None:
                 with self._voice_trigger_lock:
+                    if not self._accepts_ble_callback(_ble_generation):
+                        return
                     if not self._voice.active:
                         self._logger.info(
                             "ATVV mic trigger ignored: physical mic has an ordinary mapping"
@@ -2163,6 +2390,8 @@ class RC003App:
                             self._ble_session.send_mic_close_threadsafe()
                 return
             with self._voice_trigger_lock:
+                if not self._accepts_ble_callback(_ble_generation):
+                    return
                 if not self._prepare_voice_mapping_locked("mic", mic_action):
                     if self._ble_session is not None:
                         self._ble_session.send_mic_close_threadsafe()
@@ -2192,6 +2421,8 @@ class RC003App:
                     )
                 return
             with self._voice_trigger_lock:
+                if not self._accepts_ble_callback(_ble_generation):
+                    return
                 self._logger.info("voice audio started")
                 if self._voice_audio_stream_active:
                     self._logger.info(
@@ -2260,6 +2491,8 @@ class RC003App:
                 )
                 return
             with self._voice_trigger_lock:
+                if not self._accepts_ble_callback(_ble_generation):
+                    return
                 if (
                     not self._voice_audio_stream_active
                     and self._voice_audio_stop_processed
@@ -2318,6 +2551,8 @@ class RC003App:
                 action_applied = (
                     True if action is None else self._apply_voice_action(action)
                 )
+                if action is None or action_applied:
+                    self._cancel_voice_hold_watchdog_locked()
                 if action is not None and not action_applied:
                     # Same rule as _cleanup_once(): on_audio_stopped() already
                     # cleared the controller's pending state before we knew
@@ -2403,6 +2638,11 @@ class RC003App:
 
         self._voice_pcm_forwarding_enabled = True
         self._set_runtime_voice_active(True)
+        if not self._arm_voice_hold_watchdog_locked():
+            self._force_voice_hold_release_locked(
+                "voice hold safety timer unavailable"
+            )
+            return
         self._schedule_sogou_readiness_check()
         if send_device_open and self._ble_session is not None:
             self._ble_session.send_mic_open_threadsafe()

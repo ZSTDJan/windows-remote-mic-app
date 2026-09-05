@@ -14,8 +14,6 @@ import lzma
 import os
 from pathlib import Path
 import shutil
-import subprocess
-import sys
 import threading
 
 try:
@@ -317,12 +315,21 @@ def gadget_archive_path() -> Path:
     return Path(__file__).resolve().with_name("frida_assets") / GADGET_ARCHIVE_NAME
 
 
-def secure_runtime_directory() -> Path:
-    program_data = Path(os.environ.get("PROGRAMDATA", r"C:\ProgramData"))
+def secure_runtime_directory(
+    *,
+    user_sid: str | None = None,
+    program_files_root: Path | None = None,
+) -> Path:
+    from . import hid_elevation_windows
+
+    sid = user_sid or hid_elevation_windows.current_user_sid()
+    owner_root = hid_elevation_windows.protected_owner_root(
+        sid,
+        program_files_root=program_files_root,
+    )
     return (
-        program_data
-        / "RemoteMicRC003"
-        / "hid-tap"
+        owner_root
+        / "runtime"
         / f"{GADGET_VERSION}-x64-{GADGET_DLL_SHA256[:12]}"
     )
 
@@ -346,7 +353,9 @@ def gadget_config_text() -> str:
     )
 
 
-def _write_verified_text(path: Path, content: str) -> None:
+def _write_verified_text(path: Path, content: str, *, user_sid: str) -> None:
+    from . import hid_elevation_windows
+
     encoded = content.encode("utf-8")
     if path.is_file():
         try:
@@ -357,6 +366,9 @@ def _write_verified_text(path: Path, content: str) -> None:
     temporary = path.with_suffix(path.suffix + f".{os.getpid()}.{threading.get_ident()}.tmp")
     try:
         temporary.write_bytes(encoded)
+        hid_elevation_windows._apply_path_security(
+            temporary, user_sid=user_sid, directory=False
+        )
         os.replace(temporary, path)
     finally:
         try:
@@ -365,44 +377,9 @@ def _write_verified_text(path: Path, content: str) -> None:
             pass
 
 
-def _lock_runtime_acl(path: Path) -> None:
-    def apply(target: Path, *, directory: bool) -> None:
-        suffix = "(OI)(CI)" if directory else ""
-        command = [
-            "icacls.exe",
-            str(target),
-            "/inheritance:r",
-            "/grant:r",
-            f"*S-1-5-18:{suffix}F",
-            f"*S-1-5-32-544:{suffix}F",
-            f"*S-1-5-32-545:{suffix}RX",
-            "/C",
-            "/Q",
-        ]
-        creationflags = 0
-        if sys.platform == "win32":
-            creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-        completed = subprocess.run(
-            command,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            check=False,
-            creationflags=creationflags,
-        )
-        if completed.returncode != 0:
-            raise OSError(
-                f"failed to secure Gadget runtime ACL: {completed.stdout.strip()}"
-            )
-
-    apply(path, directory=True)
-    for child in path.rglob("*"):
-        apply(child, directory=child.is_dir())
-
-
 def prepare_secure_runtime() -> Path:
+    from . import hid_elevation_windows
+
     archive = gadget_archive_path()
     if not archive.is_file():
         raise FileNotFoundError(archive)
@@ -410,9 +387,24 @@ def prepare_secure_runtime() -> Path:
     if archive_hash != GADGET_ARCHIVE_SHA256:
         raise RuntimeError(f"Gadget archive hash mismatch: {archive_hash}")
 
-    destination = secure_runtime_directory()
-    destination.mkdir(parents=True, exist_ok=True)
-    _lock_runtime_acl(destination)
+    sid = hid_elevation_windows.current_user_sid()
+    program_files_root = hid_elevation_windows._program_files_root()
+    owner_root = hid_elevation_windows.protected_owner_root(
+        sid, program_files_root=program_files_root
+    )
+    destination = secure_runtime_directory(
+        user_sid=sid,
+        program_files_root=program_files_root,
+    )
+    hid_elevation_windows.ensure_protected_directory(
+        destination,
+        user_sid=sid,
+        trusted_root=program_files_root,
+        security_root=owner_root,
+    )
+    hid_elevation_windows.assert_no_reparse_points(
+        destination, trusted_root=program_files_root
+    )
     dll_path = destination / GADGET_DLL_NAME
     if not dll_path.is_file() or sha256_file(dll_path) != GADGET_DLL_SHA256:
         temporary = dll_path.with_suffix(f".dll.{os.getpid()}.tmp")
@@ -422,15 +414,39 @@ def prepare_secure_runtime() -> Path:
             dll_hash = sha256_file(temporary)
             if dll_hash != GADGET_DLL_SHA256:
                 raise RuntimeError(f"Gadget DLL hash mismatch: {dll_hash}")
+            hid_elevation_windows._apply_path_security(
+                temporary, user_sid=sid, directory=False
+            )
             os.replace(temporary, dll_path)
         finally:
             try:
                 temporary.unlink(missing_ok=True)
             except OSError:
                 pass
-    _write_verified_text(destination / GADGET_CONFIG_NAME, gadget_config_text())
-    _write_verified_text(destination / GADGET_SCRIPT_NAME, GADGET_SCRIPT)
-    _lock_runtime_acl(destination)
+    _write_verified_text(
+        destination / GADGET_CONFIG_NAME,
+        gadget_config_text(),
+        user_sid=sid,
+    )
+    _write_verified_text(
+        destination / GADGET_SCRIPT_NAME,
+        GADGET_SCRIPT,
+        user_sid=sid,
+    )
+    for runtime_file in (
+        dll_path,
+        destination / GADGET_CONFIG_NAME,
+        destination / GADGET_SCRIPT_NAME,
+    ):
+        hid_elevation_windows.assert_no_reparse_points(
+            runtime_file, trusted_root=program_files_root
+        )
+        if not hid_elevation_windows.validate_path_security_sddl(
+            hid_elevation_windows._read_path_security_sddl(runtime_file),
+            user_sid=sid,
+            directory=False,
+        ):
+            raise RuntimeError("Gadget runtime ACL validation failed")
     return dll_path
 
 

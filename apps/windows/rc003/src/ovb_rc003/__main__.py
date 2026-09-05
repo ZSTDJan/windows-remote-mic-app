@@ -18,9 +18,14 @@ built from the standalone ``src/launcher.py`` entry point - see XRBM-021):
                 ``--bridge`` to the one desktop process, so the marker has no
                 separate runtime role.
 - ``--request-exit``  HIDDEN maintenance entry point. It writes one bounded,
-                atomic full-exit request for the resident desktop process and
-                waits for the application mutex to disappear. It never opens
-                a window or starts BLE, HID, navigation, or audio resources.
+                 atomic full-exit request for the resident desktop process and
+                 waits for the application mutex to disappear. It never opens
+                 a window or starts BLE, HID, navigation, or audio resources.
+- ``--install-hid-helper`` / ``--uninstall-hid-helper``  HIDDEN maintenance
+                 entry points used by the per-user installer. The ordinary
+                 desktop executable records the calling distribution and only
+                 then asks the narrow bundled helper to elevate. These modes
+                 never construct the desktop window or start device resources.
 - ``--dry-run``   import every first-party module and exit 0, touching no
                    GUI, BLE, Raw Input, or audio device - the safe smoke
                   check build-candidate.ps1 and
@@ -73,15 +78,17 @@ built from the standalone ``src/launcher.py`` entry point - see XRBM-021):
                 RC003 WUDFHost target and returns a stable exit code; it never
                  falls through to settings or bridge startup.
 - ``--element-navigation``  HIDDEN compatibility entry point for older
-                  standalone navigator launches. Normal product navigation
-                  is hosted by the desktop Qt process; this branch never
-                  falls through to desktop or bridge startup.
+                   standalone navigator launches. Normal product navigation
+                   is hosted by the desktop Qt process; this branch never
+                   falls through to desktop or bridge startup.
+- ``--version``  print the exact application version and exit without opening
+                 the desktop application.
 - ``--help``/``-h``  print this usage and exit 0
 
 ``--settings``, ``--bridge``, ``--request-exit``, ``--dry-run``, ``--qt-runtime-check``,
 ``--diagnose-ble-candidates``, ``--diagnose-vb-cable-loopback``,
 ``--preflight-output-endpoint`` and
-``--help``/``-h`` are all checked and dispatched before desktop startup.
+``--version``/``--help``/``-h`` are all checked and dispatched before desktop startup.
 Dry-run, diagnostics and help touch neither application nor bridge ownership.
 """
 
@@ -99,14 +106,31 @@ SETTINGS_STARTUP_FAILED_EXIT_CODE = 15
 ELEMENT_NAVIGATION_RUNTIME_FAILED_EXIT_CODE = 18
 APPLICATION_EXIT_REQUEST_FAILED_EXIT_CODE = 19
 APPLICATION_EXIT_REQUEST_TIMEOUT_EXIT_CODE = 20
+HID_HELPER_MAINTENANCE_FAILED_EXIT_CODE = 24
+HID_HELPER_ACCOUNT_UNSUPPORTED_EXIT_CODE = 25
+INVALID_ARGUMENTS_EXIT_CODE = 2
 APPLICATION_EXIT_REQUEST_TIMEOUT_SECONDS = 45.0
 APPLICATION_EXIT_REQUEST_POLL_SECONDS = 0.1
 APPLICATION_HANDOFF_TIMEOUT_SECONDS = 180.0
 APPLICATION_HANDOFF_POLL_SECONDS = 0.1
+APPLICATION_HANDOFF_CAPABILITY_WAIT_SECONDS = 10.0
 APPLICATION_HANDOFF_REQUEST_GRACE_SECONDS = 5.0
+APPLICATION_HANDOFF_ACCEPTED_EXIT_TIMEOUT_SECONDS = 45.0
+APPLICATION_HANDOFF_LEGACY_EXIT_NOTICE = (
+    "这个旧版不能由新版本自动退出。\n\n"
+    "请在旧版通知区域选择“完全退出”，退出后当前版本会自动打开。"
+)
+APPLICATION_HANDOFF_UNKNOWN_EXIT_NOTICE = (
+    "无法确认旧版能否自动退出。\n\n"
+    "请在旧版通知区域选择“完全退出”，退出后当前版本会自动打开。"
+)
 APPLICATION_HANDOFF_MANUAL_EXIT_NOTICE = (
-    f"请在通知区域右键“{product_identity.DISPLAY_NAME}”，选择“完全退出”。\n"
-    "退出后，当前版本会自动打开。"
+    "请在旧版通知区域选择“完全退出”。\n\n"
+    "退出后当前版本会自动打开。"
+)
+APPLICATION_HANDOFF_REJECTED_EXIT_NOTICE = (
+    "旧版没有退出，当前版本未打开。\n\n"
+    "请完全退出旧版后重试。"
 )
 
 
@@ -123,7 +147,36 @@ def _print_help() -> None:
     print("  python -m ovb_rc003 --background  start hidden in the notification area")
     print("  python -m ovb_rc003 --bridge      start hidden and run the bridge")
     print("  python -m ovb_rc003 --dry-run     import every module and exit 0 (CI smoke check)")
+    print("  python -m ovb_rc003 --version     print the application version and exit")
     print("  python -m ovb_rc003 --help        show this message and exit 0")
+
+
+def _print_version() -> None:
+    """Write the version when a console exists; windowed builds still exit cleanly."""
+
+    stream = getattr(sys, "stdout", None)
+    if stream is not None:
+        print(__version__, file=stream)
+
+
+def _validate_desktop_arguments(args: list[str]) -> None:
+    """Reject unhandled arguments instead of silently opening the application."""
+
+    from . import bridge_launcher
+
+    allowed = {
+        "--settings",
+        "--background",
+        "--bridge",
+        bridge_launcher.SETTINGS_LAUNCH_FLAG,
+    }
+    unknown = [argument for argument in args if argument not in allowed]
+    if not unknown:
+        return
+    stream = getattr(sys, "stderr", None)
+    if stream is not None:
+        print(f"unsupported argument: {unknown[0]}", file=stream)
+    raise SystemExit(INVALID_ARGUMENTS_EXIT_CODE)
 
 
 def _dry_run() -> int:
@@ -155,6 +208,7 @@ def _dry_run() -> int:
         frida_compat,
         frida_hid_tap_injector,
         hid_elevation_windows,
+        hid_helper_consumers,
         hid_identity,
         hotkey,
         identity,
@@ -205,6 +259,63 @@ def _qt_runtime_check() -> int:
 
     print("qt-runtime-check: Qt modules and main.qml are available")
     return 0
+
+
+def _register_current_hid_helper_consumer() -> None:
+    """Best-effort registration for a frozen installed or portable copy."""
+
+    from . import config, hid_helper_consumers
+
+    try:
+        hid_helper_consumers.register_current_consumer(config.config_root())
+    except Exception as exc:  # noqa: BLE001 - startup must remain available
+        print(
+            "HID helper consumer registration failed: "
+            f"error_type={type(exc).__name__}",
+            file=sys.stderr,
+        )
+
+
+def _install_hid_helper() -> int:
+    """Install or reuse the current user's pre-authorized HID helper."""
+
+    from . import config, hid_elevation_windows, hid_helper_consumers
+
+    state = hid_helper_consumers.install_for_current_consumer(
+        config.config_root(),
+        hid_elevation_windows.request_install_elevation,
+    )
+    if state.available:
+        return 0
+    if state.detail == "current_account_cannot_self_elevate":
+        return HID_HELPER_ACCOUNT_UNSUPPORTED_EXIT_CODE
+    print(
+        "HID helper installation failed: "
+        f"detail={state.detail or 'unknown'}",
+        file=sys.stderr,
+    )
+    return HID_HELPER_MAINTENANCE_FAILED_EXIT_CODE
+
+
+def _uninstall_hid_helper() -> int:
+    """Remove the installed copy's ownership and preserve live portable users."""
+
+    from . import config, hid_elevation_windows, hid_helper_consumers
+
+    state = hid_helper_consumers.uninstall_current_distribution(
+        config.config_root(),
+        hid_elevation_windows.request_uninstall_elevation,
+    )
+    if state.available:
+        return 0
+    if state.detail == "current_account_cannot_self_elevate":
+        return HID_HELPER_ACCOUNT_UNSUPPORTED_EXIT_CODE
+    print(
+        "HID helper removal failed: "
+        f"detail={state.detail or 'unknown'}",
+        file=sys.stderr,
+    )
+    return HID_HELPER_MAINTENANCE_FAILED_EXIT_CODE
 
 
 def _request_application_exit(
@@ -283,15 +394,9 @@ def _handoff_previous_application(
         handoff_guard = single_instance.ApplicationHandoffInstanceGuard()
         handoff_guard.__enter__()
     except single_instance.DuplicateInstanceError:
-        if not single_instance.activate_existing_settings_window():
-            single_instance.show_bridge_startup_blocked_notice(
-                "另一个无线麦副本正在切换运行版本，但旧窗口未能自动唤出。"
-                "请从通知区域打开旧版并选择“完全退出”；不要重复启动。"
-            )
-            return False
         single_instance.show_bridge_startup_blocked_notice(
-            "另一个无线麦副本正在切换运行版本。请先处理已经唤出的旧版窗口，"
-            "不要重复启动。"
+            "正在切换无线麦版本，请稍候。\n\n"
+            "如果一直没有完成，请从旧版通知区域选择“完全退出”。"
         )
         return False
     except Exception:
@@ -311,11 +416,41 @@ def _handoff_previous_application(
             return False
         if not running:
             return True
-        if not single_instance.confirm_application_handoff(__version__):
-            if not single_instance.activate_existing_settings_window():
-                single_instance.show_bridge_startup_blocked_notice(
-                    "旧版窗口未能自动唤出。请从通知区域打开现有无线麦。"
-                )
+
+        capability = single_instance.application_exit_request_capability()
+        if capability is single_instance.ApplicationExitRequestCapability.UNKNOWN:
+            capability_started_at = monotonic()
+            capability_deadline = capability_started_at + min(
+                APPLICATION_HANDOFF_CAPABILITY_WAIT_SECONDS,
+                max(0.1, float(timeout)),
+            )
+            while capability is single_instance.ApplicationExitRequestCapability.UNKNOWN:
+                try:
+                    running = single_instance.application_instance_running()
+                except Exception:
+                    single_instance.show_bridge_startup_blocked_notice(
+                        "无法确认旧版是否仍在运行。当前版本没有启动；"
+                        "请完全退出旧版后重试。"
+                    )
+                    return False
+                if not running:
+                    return True
+                if monotonic() >= capability_deadline:
+                    break
+                sleep(max(0.01, float(poll_interval)))
+                capability = single_instance.application_exit_request_capability()
+
+        request_capable = capability in {
+            single_instance.ApplicationExitRequestCapability.SUPPORTED,
+            single_instance.ApplicationExitRequestCapability.LEGACY_SUPPORTED,
+        }
+        legacy_request_capable = (
+            capability
+            is single_instance.ApplicationExitRequestCapability.LEGACY_SUPPORTED
+        )
+        if request_capable and not single_instance.confirm_application_handoff(
+            __version__
+        ):
             return False
 
         root = config.config_root()
@@ -323,24 +458,33 @@ def _handoff_previous_application(
         success = False
         failure_message = ""
         try:
-            candidate_request_id = uuid.uuid4().hex
-            try:
-                single_instance.write_application_exit_request(
-                    root,
-                    request_id=candidate_request_id,
+            manual_exit_notice_pending = False
+            if request_capable:
+                candidate_request_id = uuid.uuid4().hex
+                try:
+                    single_instance.write_application_exit_request(
+                        root,
+                        request_id=candidate_request_id,
+                    )
+                    request_id = candidate_request_id
+                    manual_exit_notice_pending = True
+                except OSError:
+                    single_instance.show_bridge_startup_blocked_notice(
+                        APPLICATION_HANDOFF_MANUAL_EXIT_NOTICE
+                    )
+            elif capability is single_instance.ApplicationExitRequestCapability.UNSUPPORTED:
+                single_instance.show_bridge_startup_blocked_notice(
+                    APPLICATION_HANDOFF_LEGACY_EXIT_NOTICE
                 )
-                request_id = candidate_request_id
-            except OSError:
-                # Older portable builds do not consume this request anyway.
-                # Their visible "完全退出" action remains the compatibility
-                # path when the request cannot be written.
-                pass
+            else:
+                single_instance.show_bridge_startup_blocked_notice(
+                    APPLICATION_HANDOFF_UNKNOWN_EXIT_NOTICE
+                )
 
-            single_instance.activate_existing_settings_window()
-            manual_exit_notice_pending = True
             started_at = monotonic()
             bounded_timeout = max(0.1, float(timeout))
             deadline = started_at + bounded_timeout
+            accepted_at: float | None = None
             manual_notice_deadline = started_at + min(
                 APPLICATION_HANDOFF_REQUEST_GRACE_SECONDS,
                 bounded_timeout,
@@ -358,17 +502,36 @@ def _handoff_previous_application(
                     success = True
                     break
                 now = monotonic()
+                if (
+                    request_id is not None
+                    and single_instance.application_exit_request_rejected(
+                        root,
+                        request_id,
+                    )
+                ):
+                    failure_message = APPLICATION_HANDOFF_REJECTED_EXIT_NOTICE
+                    break
                 if now >= deadline:
                     failure_message = (
                         "旧版仍在运行，当前版本未启动。请完全退出旧版后，再打开当前版本。"
                     )
                     break
                 if manual_exit_notice_pending and request_id is not None:
-                    if not single_instance.owned_application_exit_request_pending(
+                    if single_instance.application_exit_request_acknowledged(
                         root,
                         request_id,
                     ):
                         manual_exit_notice_pending = False
+                        accepted_at = accepted_at or now
+                    elif (
+                        legacy_request_capable
+                        and not single_instance.owned_application_exit_request_pending(
+                            root,
+                            request_id,
+                        )
+                    ):
+                        manual_exit_notice_pending = False
+                        accepted_at = accepted_at or now
                     elif now < manual_notice_deadline:
                         pass
                     else:
@@ -381,25 +544,40 @@ def _handoff_previous_application(
                         APPLICATION_HANDOFF_MANUAL_EXIT_NOTICE
                     )
                     manual_exit_notice_pending = False
+                if (
+                    accepted_at is not None
+                    and now - accepted_at
+                    >= min(
+                        APPLICATION_HANDOFF_ACCEPTED_EXIT_TIMEOUT_SECONDS,
+                        bounded_timeout,
+                    )
+                ):
+                    failure_message = APPLICATION_HANDOFF_REJECTED_EXIT_NOTICE
+                    break
                 sleep(max(0.01, float(poll_interval)))
         finally:
-            if request_id is not None and not single_instance.clear_owned_application_exit_request(
-                root,
-                request_id,
-            ):
-                if success:
-                    failure_message = (
-                        "旧版已经退出，但版本切换请求未能安全清理。当前版本没有启动；"
-                        "请稍后重新双击当前版本。"
-                    )
-                elif failure_message:
-                    failure_message += " 同时，版本切换请求也未能安全清理。"
-                else:
-                    failure_message = (
-                        "版本切换请求未能安全清理。当前版本没有启动；"
-                        "请稍后重新双击当前版本。"
-                    )
-                success = False
+            if request_id is not None:
+                if not single_instance.clear_owned_application_exit_request(
+                    root,
+                    request_id,
+                ):
+                    if success:
+                        failure_message = (
+                            "旧版已经退出，但版本切换请求未能安全清理。当前版本没有启动；"
+                            "请稍后重新双击当前版本。"
+                        )
+                    elif failure_message:
+                        failure_message += " 同时，版本切换请求也未能安全清理。"
+                    else:
+                        failure_message = (
+                            "版本切换请求未能安全清理。当前版本没有启动；"
+                            "请稍后重新双击当前版本。"
+                        )
+                    success = False
+                single_instance.clear_owned_application_exit_response(
+                    root,
+                    request_id,
+                )
         if failure_message:
             single_instance.show_bridge_startup_blocked_notice(failure_message)
         return success
@@ -412,12 +590,19 @@ def main() -> None:
     if "--help" in args or "-h" in args:
         _print_help()
         return
+    if "--version" in args:
+        _print_version()
+        return
     if "--dry-run" in args:
         raise SystemExit(_dry_run())
     if "--qt-runtime-check" in args:
         raise SystemExit(_qt_runtime_check())
     if "--request-exit" in args:
         raise SystemExit(_request_application_exit())
+    if "--install-hid-helper" in args:
+        raise SystemExit(_install_hid_helper())
+    if "--uninstall-hid-helper" in args:
+        raise SystemExit(_uninstall_hid_helper())
     if "--diagnose-ble-candidates" in args:
         # XRBM-035 RETRY 1: hidden, undocumented child-process entry point -
         # see this module's own docstring. Always raises SystemExit from
@@ -480,6 +665,8 @@ def main() -> None:
             )
             exit_code = ELEMENT_NAVIGATION_RUNTIME_FAILED_EXIT_CODE
         raise SystemExit(exit_code)
+
+    _validate_desktop_arguments(args)
     if "--settings" in args:
         _run_settings()
         return
@@ -512,6 +699,7 @@ def _run_settings(
 
     def run_owned_application() -> None:
         with single_instance.ApplicationInstanceGuard():
+            _register_current_hid_helper_consumer()
             if start_hidden:
                 settings_ui.main(
                     start_hidden=True,
@@ -536,11 +724,7 @@ def _run_settings(
             if single_instance.activate_current_runtime_settings_window():
                 return
             activated = single_instance.activate_existing_settings_window()
-            if activated:
-                single_instance.show_bridge_startup_blocked_notice(
-                    APPLICATION_HANDOFF_MANUAL_EXIT_NOTICE
-                )
-            else:
+            if not activated:
                 single_instance.show_bridge_startup_blocked_notice(
                     f"{product_identity.DISPLAY_NAME}已经在启动或运行。\n\n"
                     "请从通知区域打开现有程序。"

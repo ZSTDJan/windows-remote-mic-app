@@ -447,6 +447,18 @@ class SettingsControllerTests(unittest.TestCase):
             return_value=qt_settings_app.startup_windows.StartupState(False),
         )
         self._startup_state_patch.start()
+        self._hid_helper_offer_patch = mock.patch.object(
+            qt_settings_app.hid_elevation_windows,
+            "bundled_helper_offer_id",
+            return_value="3:" + ("a" * 64),
+        )
+        self._hid_helper_offer_patch.start()
+        self._hid_helper_consumer_patch = mock.patch.object(
+            qt_settings_app.hid_helper_consumers,
+            "current_consumer_is_registered",
+            return_value=True,
+        )
+        self._hid_helper_consumer_patch.start()
         self._voice_hotkey_read_patch = mock.patch.object(
             qt_settings_app.voice_hotkey_sync_windows,
             "read_provider_hotkey",
@@ -480,6 +492,8 @@ class SettingsControllerTests(unittest.TestCase):
     def tearDown(self):
         qt_settings_app._vb_cable_test_active_event.clear()
         qt_settings_app._driver_action_active_event.clear()
+        self._hid_helper_consumer_patch.stop()
+        self._hid_helper_offer_patch.stop()
         self._startup_state_patch.stop()
         self._voice_hotkey_sync_patch.stop()
         self._voice_hotkey_read_patch.stop()
@@ -510,6 +524,8 @@ class SettingsControllerTests(unittest.TestCase):
 
     def test_installed_helper_issue_exposes_an_explicit_repair_action(self):
         with mock.patch.object(
+            qt_settings_app.sys, "frozen", True, create=True
+        ), mock.patch.object(
             qt_settings_app.hid_elevation_windows,
             "inspect_installed_helper",
             return_value=qt_settings_app.hid_elevation_windows.HidHelperState(
@@ -526,12 +542,59 @@ class SettingsControllerTests(unittest.TestCase):
         self.assertTrue(controller.hidHelperRepairVisible)
         self.assertIn("自定义方向映射已停用", controller.hidHelperIssueText)
 
+    def test_portable_helper_issue_offers_one_time_enable_action(self):
+        with mock.patch.object(
+            qt_settings_app.sys, "frozen", True, create=True
+        ), mock.patch.object(
+            qt_settings_app.hid_elevation_windows,
+            "inspect_installed_helper",
+            return_value=qt_settings_app.hid_elevation_windows.HidHelperState(
+                False, "protected_helper_missing"
+            ),
+        ), mock.patch.object(
+            qt_settings_app.hid_elevation_windows,
+            "is_installed_distribution",
+            return_value=False,
+        ):
+            controller, _model = self._make_controller()
+
+        self.assertTrue(controller.hidHelperIssueVisible)
+        self.assertTrue(controller.hidHelperRepairVisible)
+        self.assertTrue(controller.hidHelperSetupRequired)
+        self.assertIn("确认一次管理员权限", controller.hidHelperIssueText)
+
+    def test_elevated_portable_session_is_not_reported_as_broken(self):
+        with mock.patch.object(
+            qt_settings_app.sys, "frozen", True, create=True
+        ), mock.patch.object(
+            qt_settings_app.hid_elevation_windows,
+            "inspect_installed_helper",
+            return_value=qt_settings_app.hid_elevation_windows.HidHelperState(
+                False, "protected_helper_missing"
+            ),
+        ), mock.patch.object(
+            qt_settings_app.hid_elevation_windows,
+            "is_installed_distribution",
+            return_value=False,
+        ), mock.patch.object(
+            qt_settings_app.hid_elevation_windows,
+            "is_process_elevated",
+            return_value=True,
+        ):
+            controller, _model = self._make_controller()
+
+        self.assertFalse(controller.hidHelperIssueVisible)
+        self.assertTrue(controller.hidHelperSetupRequired)
+        self.assertTrue(controller.hidHelperRepairVisible)
+
     def test_successful_helper_repair_clears_the_issue(self):
         missing = qt_settings_app.hid_elevation_windows.HidHelperState(
             False, "hid_helper_task_missing"
         )
         ready = qt_settings_app.hid_elevation_windows.HidHelperState(True)
         with mock.patch.object(
+            qt_settings_app.sys, "frozen", True, create=True
+        ), mock.patch.object(
             qt_settings_app.hid_elevation_windows,
             "inspect_installed_helper",
             return_value=missing,
@@ -543,17 +606,79 @@ class SettingsControllerTests(unittest.TestCase):
             controller, _model = self._make_controller()
 
         with mock.patch.object(
-            qt_settings_app.hid_elevation_windows,
-            "request_install_elevation",
+            qt_settings_app.hid_helper_consumers,
+            "install_for_current_consumer",
             return_value=ready,
         ) as repair:
             controller.repairHidHelper()
 
-        repair.assert_called_once_with()
+        repair.assert_called_once_with(
+            controller._config_root,
+            qt_settings_app.hid_elevation_windows.request_install_elevation,
+        )
         self.assertFalse(controller.hidHelperRepairBusy)
         self.assertFalse(controller.hidHelperIssueVisible)
         self.assertFalse(controller.hidHelperRepairVisible)
-        self.assertIn("已修复", controller.statusMessage)
+        self.assertIn("权限已启用", controller.statusMessage)
+        saved = config.load_config(config.config_path(controller._config_root))
+        self.assertEqual(
+            saved["hid_helper_setup_prompted_offer_id"],
+            "3:" + ("a" * 64),
+        )
+
+    def test_cleanup_pending_stays_usable_and_exposes_a_retry(self):
+        pending = qt_settings_app.hid_elevation_windows.HidHelperState(
+            True, "helper_cleanup_pending"
+        )
+        with mock.patch.object(
+            qt_settings_app.sys, "frozen", True, create=True
+        ), mock.patch.object(
+            qt_settings_app.hid_elevation_windows,
+            "inspect_installed_helper",
+            return_value=pending,
+        ), mock.patch.object(
+            qt_settings_app.hid_elevation_windows,
+            "is_installed_distribution",
+            return_value=False,
+        ):
+            controller, _model = self._make_controller()
+
+        self.assertTrue(controller.hidHelperIssueVisible)
+        self.assertTrue(controller.hidHelperCleanupPending)
+        self.assertTrue(controller.hidHelperRepairVisible)
+        self.assertFalse(controller.hidHelperSetupRequired)
+        self.assertFalse(controller.hidHelperRemovalVisible)
+        self.assertIn("已可用", controller.hidHelperIssueText)
+
+    def test_cleanup_retry_that_still_has_residue_does_not_claim_full_success(self):
+        pending = qt_settings_app.hid_elevation_windows.HidHelperState(
+            True, "helper_cleanup_pending"
+        )
+        with mock.patch.object(
+            qt_settings_app.sys, "frozen", True, create=True
+        ), mock.patch.object(
+            qt_settings_app.hid_elevation_windows,
+            "inspect_installed_helper",
+            return_value=pending,
+        ), mock.patch.object(
+            qt_settings_app.hid_elevation_windows,
+            "is_installed_distribution",
+            return_value=False,
+        ):
+            controller, _model = self._make_controller()
+
+        with mock.patch.object(
+            qt_settings_app.hid_helper_consumers,
+            "install_for_current_consumer",
+            return_value=pending,
+        ) as repair:
+            controller.repairHidHelper()
+
+        repair.assert_called_once()
+        self.assertTrue(controller.hidHelperCleanupPending)
+        self.assertTrue(controller.hidHelperRepairVisible)
+        self.assertIn("尚未清理", controller.statusMessage)
+        self.assertNotIn("权限已启用", controller.statusMessage)
 
     def test_cancelled_helper_repair_keeps_direction_mapping_disabled(self):
         missing = qt_settings_app.hid_elevation_windows.HidHelperState(
@@ -563,6 +688,8 @@ class SettingsControllerTests(unittest.TestCase):
             False, "uac_cancelled"
         )
         with mock.patch.object(
+            qt_settings_app.sys, "frozen", True, create=True
+        ), mock.patch.object(
             qt_settings_app.hid_elevation_windows,
             "inspect_installed_helper",
             return_value=missing,
@@ -574,15 +701,279 @@ class SettingsControllerTests(unittest.TestCase):
             controller, _model = self._make_controller()
 
         with mock.patch.object(
-            qt_settings_app.hid_elevation_windows,
-            "request_install_elevation",
+            qt_settings_app.hid_helper_consumers,
+            "install_for_current_consumer",
             return_value=cancelled,
         ):
             controller.repairHidHelper()
 
         self.assertTrue(controller.hidHelperRepairVisible)
-        self.assertIn("修复未执行", controller.errorMessage)
-        self.assertIn("自定义方向映射保持停用", controller.errorMessage)
+        self.assertIn("未确认管理员权限", controller.errorMessage)
+        self.assertIn("Windows 原始方向", controller.errorMessage)
+
+    def test_visible_portable_launch_claims_one_short_prompt_before_uac(self):
+        missing = qt_settings_app.hid_elevation_windows.HidHelperState(
+            False, "protected_helper_missing"
+        )
+        ready = qt_settings_app.hid_elevation_windows.HidHelperState(True)
+        with mock.patch.object(
+            qt_settings_app.sys, "frozen", True, create=True
+        ), mock.patch.object(
+            qt_settings_app.hid_elevation_windows,
+            "inspect_installed_helper",
+            return_value=missing,
+        ), mock.patch.object(
+            qt_settings_app.hid_elevation_windows,
+            "is_installed_distribution",
+            return_value=False,
+        ):
+            controller, _model = self._make_controller()
+
+        with mock.patch.object(
+            qt_settings_app.hid_helper_consumers,
+            "install_for_current_consumer",
+            return_value=ready,
+        ) as request:
+            self.assertTrue(controller.claimPortableHidSetupPrompt())
+            self.assertFalse(controller.claimPortableHidSetupPrompt())
+            request.assert_not_called()
+            controller.repairHidHelper()
+
+        request.assert_called_once_with(
+            controller._config_root,
+            qt_settings_app.hid_elevation_windows.request_install_elevation,
+        )
+        saved = config.load_config(config.config_path(controller._config_root))
+        self.assertEqual(
+            saved["hid_helper_setup_prompted_offer_id"],
+            "3:" + ("a" * 64),
+        )
+        self.assertFalse(controller.hidHelperIssueVisible)
+
+    def test_hidden_portable_start_can_prompt_after_the_window_is_shown(self):
+        missing = qt_settings_app.hid_elevation_windows.HidHelperState(
+            False, "protected_helper_missing"
+        )
+        ready = qt_settings_app.hid_elevation_windows.HidHelperState(True)
+        with mock.patch.object(
+            qt_settings_app.sys, "frozen", True, create=True
+        ), mock.patch.object(
+            qt_settings_app.hid_elevation_windows,
+            "inspect_installed_helper",
+            return_value=missing,
+        ), mock.patch.object(
+            qt_settings_app.hid_elevation_windows,
+            "is_installed_distribution",
+            return_value=False,
+        ):
+            controller = self.Controller(
+                self.Model(),
+                start_hidden=True,
+                background_task_runner=lambda target, _name: target(),
+            )
+
+        with mock.patch.object(
+            qt_settings_app.hid_helper_consumers,
+            "install_for_current_consumer",
+            return_value=ready,
+        ) as request:
+            self.assertTrue(controller.claimPortableHidSetupPrompt())
+            self.assertFalse(controller.claimPortableHidSetupPrompt())
+            request.assert_not_called()
+            controller.repairHidHelper()
+
+        request.assert_called_once_with(
+            controller._config_root,
+            qt_settings_app.hid_elevation_windows.request_install_elevation,
+        )
+
+    def test_portable_setup_never_starts_after_full_exit_has_begun(self):
+        missing = qt_settings_app.hid_elevation_windows.HidHelperState(
+            False, "protected_helper_missing"
+        )
+        with mock.patch.object(
+            qt_settings_app.sys, "frozen", True, create=True
+        ), mock.patch.object(
+            qt_settings_app.hid_elevation_windows,
+            "inspect_installed_helper",
+            return_value=missing,
+        ), mock.patch.object(
+            qt_settings_app.hid_elevation_windows,
+            "is_installed_distribution",
+            return_value=False,
+        ):
+            controller, _model = self._make_controller()
+        controller._application_exit_requested = True
+
+        with mock.patch.object(
+            qt_settings_app.hid_helper_consumers,
+            "install_for_current_consumer",
+        ) as request:
+            self.assertFalse(controller.claimPortableHidSetupPrompt())
+            controller.repairHidHelper()
+
+        request.assert_not_called()
+        self.assertFalse(
+            config.config_path(controller._config_root).exists()
+        )
+
+    def test_manual_helper_repair_records_prompt_and_remains_retryable(self):
+        missing = qt_settings_app.hid_elevation_windows.HidHelperState(
+            False, "protected_helper_missing"
+        )
+        cancelled = qt_settings_app.hid_elevation_windows.HidHelperState(
+            False, "uac_cancelled"
+        )
+        with mock.patch.object(
+            qt_settings_app.sys, "frozen", True, create=True
+        ), mock.patch.object(
+            qt_settings_app.hid_elevation_windows,
+            "inspect_installed_helper",
+            return_value=missing,
+        ), mock.patch.object(
+            qt_settings_app.hid_elevation_windows,
+            "is_installed_distribution",
+            return_value=False,
+        ):
+            controller, _model = self._make_controller()
+
+        with mock.patch.object(
+            qt_settings_app.hid_helper_consumers,
+            "install_for_current_consumer",
+            return_value=cancelled,
+        ) as request:
+            controller.repairHidHelper()
+            controller.repairHidHelper()
+
+        self.assertEqual(request.call_count, 2)
+        saved = config.load_config(config.config_path(controller._config_root))
+        self.assertEqual(
+            saved["hid_helper_setup_prompted_offer_id"],
+            "3:" + ("a" * 64),
+        )
+
+    def test_setup_marker_save_failure_never_starts_uac(self):
+        missing = qt_settings_app.hid_elevation_windows.HidHelperState(
+            False, "protected_helper_missing"
+        )
+        with mock.patch.object(
+            qt_settings_app.sys, "frozen", True, create=True
+        ), mock.patch.object(
+            qt_settings_app.hid_elevation_windows,
+            "inspect_installed_helper",
+            return_value=missing,
+        ), mock.patch.object(
+            qt_settings_app.hid_elevation_windows,
+            "is_installed_distribution",
+            return_value=False,
+        ):
+            controller, _model = self._make_controller()
+
+        with mock.patch.object(
+            qt_settings_app.config,
+            "save_config_and_load",
+            side_effect=OSError("read only"),
+        ) as save, mock.patch.object(
+            qt_settings_app.hid_helper_consumers,
+            "install_for_current_consumer",
+        ) as request:
+            self.assertFalse(controller.claimPortableHidSetupPrompt())
+            self.assertFalse(controller.claimPortableHidSetupPrompt())
+
+        save.assert_called_once()
+        request.assert_not_called()
+        self.assertIn("无法记录首次授权状态", controller.errorMessage)
+
+    def test_portable_can_remove_the_shared_helper_after_confirmation(self):
+        ready = qt_settings_app.hid_elevation_windows.HidHelperState(True)
+        with mock.patch.object(
+            qt_settings_app.sys, "frozen", True, create=True
+        ), mock.patch.object(
+            qt_settings_app.hid_elevation_windows,
+            "inspect_installed_helper",
+            return_value=ready,
+        ), mock.patch.object(
+            qt_settings_app.hid_elevation_windows,
+            "is_installed_distribution",
+            return_value=False,
+        ):
+            controller, _model = self._make_controller()
+
+        with mock.patch.object(
+            qt_settings_app.hid_helper_consumers,
+            "remove_for_portable_consumer",
+            return_value=ready,
+        ) as remove:
+            controller.removeHidHelper()
+
+        remove.assert_called_once_with(
+            controller._config_root,
+            qt_settings_app.hid_elevation_windows.request_uninstall_elevation,
+        )
+        self.assertFalse(controller.hidHelperRemovalVisible)
+        self.assertTrue(controller.hidHelperSetupRequired)
+        self.assertIn("权限已移除", controller.statusMessage)
+
+    def test_failed_portable_helper_removal_restores_its_consumer_marker(self):
+        ready = qt_settings_app.hid_elevation_windows.HidHelperState(True)
+        cancelled = qt_settings_app.hid_elevation_windows.HidHelperState(
+            False, "uac_cancelled"
+        )
+        with mock.patch.object(
+            qt_settings_app.sys, "frozen", True, create=True
+        ), mock.patch.object(
+            qt_settings_app.hid_elevation_windows,
+            "inspect_installed_helper",
+            return_value=ready,
+        ), mock.patch.object(
+            qt_settings_app.hid_elevation_windows,
+            "is_installed_distribution",
+            return_value=False,
+        ):
+            controller, _model = self._make_controller()
+
+        with mock.patch.object(
+            qt_settings_app.hid_helper_consumers,
+            "remove_for_portable_consumer",
+            return_value=cancelled,
+        ) as remove:
+            controller.removeHidHelper()
+
+        remove.assert_called_once_with(
+            controller._config_root,
+            qt_settings_app.hid_elevation_windows.request_uninstall_elevation,
+        )
+        self.assertTrue(controller.hidHelperRemovalVisible)
+        self.assertIn("没有移除", controller.errorMessage)
+
+    def test_portable_does_not_claim_a_preserved_newer_helper_was_removed(self):
+        ready = qt_settings_app.hid_elevation_windows.HidHelperState(True)
+        preserved = qt_settings_app.hid_elevation_windows.HidHelperState(
+            False, "helper_preserved_newer_contract"
+        )
+        with mock.patch.object(
+            qt_settings_app.sys, "frozen", True, create=True
+        ), mock.patch.object(
+            qt_settings_app.hid_elevation_windows,
+            "inspect_installed_helper",
+            return_value=ready,
+        ), mock.patch.object(
+            qt_settings_app.hid_elevation_windows,
+            "is_installed_distribution",
+            return_value=False,
+        ):
+            controller, _model = self._make_controller()
+
+        with mock.patch.object(
+            qt_settings_app.hid_helper_consumers,
+            "remove_for_portable_consumer",
+            return_value=preserved,
+        ):
+            controller.removeHidHelper()
+
+        self.assertTrue(controller.hidHelperRemovalVisible)
+        self.assertIn("较新版本", controller.errorMessage)
+        self.assertNotIn("权限已移除", controller.statusMessage)
 
     def test_desktop_behavior_changes_are_persisted_immediately(self):
         controller, _model = self._make_controller()
@@ -924,6 +1315,29 @@ class SettingsControllerTests(unittest.TestCase):
         controller._continue_application_exit()
 
         self.assertEqual(ready, [True])
+
+    def test_full_exit_waits_for_hid_helper_maintenance(self):
+        controller, _model = self._make_controller()
+        callbacks = []
+        ready = []
+        controller.applicationExitReady.connect(lambda: ready.append(True))
+        controller._set_hid_helper_repair_busy(True)
+
+        with mock.patch(
+            "PySide6.QtCore.QTimer.singleShot",
+            side_effect=lambda _delay, callback: callbacks.append(callback),
+        ):
+            controller.requestApplicationExit()
+
+            self.assertEqual(ready, [])
+            self.assertTrue(controller._application_exit_requested)
+            self.assertEqual(len(callbacks), 1)
+
+            controller._set_hid_helper_repair_busy(False)
+            callbacks.pop()()
+
+        self.assertEqual(ready, [True])
+        self.assertFalse(controller._application_exit_requested)
 
     def test_save_settings_and_exit_waits_for_the_save_result(self):
         controller, _model = self._make_controller()
@@ -2038,6 +2452,167 @@ class SettingsControllerTests(unittest.TestCase):
         self.assertFalse(controller.bridgeReconnectBusy)
         self.assertNotEqual(controller.bridgeLaunchPhase, "reconnecting")
 
+    def test_bridge_status_error_clears_immediate_reconnect_state(self):
+        self._bridge_status_patch.stop()
+        self._bridge_status_patch = mock.patch.object(
+            qt_settings_app.single_instance,
+            "bridge_instance_running",
+            return_value=True,
+        )
+        self._bridge_status_patch.start()
+        identity = bridge_runtime_status.current_runtime_identity(
+            qt_settings_app.__version__
+        )
+        bridge_runtime_status.publish_status(
+            config.config_root(),
+            bridge_runtime_status.BridgeConnectionState.WAITING_FOR_DEVICE,
+            pid=4321,
+            identity=identity,
+            raw_input_state="ready",
+            hid_tap_state=frida_compat.HidTapState.READY.value,
+        )
+
+        with mock.patch.object(
+            qt_settings_app.bridge_launcher,
+            "in_process_bridge_running",
+            return_value=True,
+        ):
+            controller, _ = self._make_controller()
+        controller._set_bridge_reconnect_busy(True)
+
+        with mock.patch.object(
+            qt_settings_app.single_instance,
+            "bridge_instance_running",
+            side_effect=single_instance.SingleInstanceUnavailableError(
+                "status unavailable"
+            ),
+        ):
+            controller.refreshBridgeState()
+
+        self.assertFalse(controller.bridgeRunning)
+        self.assertFalse(controller.bridgeReconnectAvailable)
+        self.assertFalse(controller.bridgeReconnectBusy)
+        self.assertEqual(controller.bridgeLaunchPhase, "unknown")
+
+    def test_immediate_reconnect_accepts_an_already_recovered_connection(self):
+        self._bridge_status_patch.stop()
+        self._bridge_status_patch = mock.patch.object(
+            qt_settings_app.single_instance,
+            "bridge_instance_running",
+            return_value=True,
+        )
+        self._bridge_status_patch.start()
+        identity = bridge_runtime_status.current_runtime_identity(
+            qt_settings_app.__version__
+        )
+        bridge_runtime_status.publish_status(
+            config.config_root(),
+            bridge_runtime_status.BridgeConnectionState.WAITING_FOR_DEVICE,
+            pid=4321,
+            identity=identity,
+            raw_input_state="ready",
+            hid_tap_state=frida_compat.HidTapState.READY.value,
+        )
+
+        with mock.patch.object(
+            qt_settings_app.bridge_launcher,
+            "in_process_bridge_running",
+            return_value=True,
+        ):
+            controller, _ = self._make_controller()
+            bridge_runtime_status.publish_status(
+                config.config_root(),
+                bridge_runtime_status.BridgeConnectionState.CONNECTED,
+                pid=4321,
+                identity=identity,
+                raw_input_state="ready",
+                hid_tap_state=frida_compat.HidTapState.READY.value,
+            )
+            with mock.patch.object(
+                qt_settings_app.bridge_launcher,
+                "reconnect_in_process_bridge_now",
+            ) as reconnect:
+                controller.reconnectBridgeNow()
+
+        reconnect.assert_not_called()
+        self.assertTrue(controller.bridgeConnected)
+        self.assertFalse(controller.bridgeReconnectAvailable)
+        self.assertEqual(controller.errorMessage, "")
+
+    def test_immediate_reconnect_reports_when_the_service_already_stopped(self):
+        self._bridge_status_patch.stop()
+        self._bridge_status_patch = mock.patch.object(
+            qt_settings_app.single_instance,
+            "bridge_instance_running",
+            return_value=True,
+        )
+        self._bridge_status_patch.start()
+        identity = bridge_runtime_status.current_runtime_identity(
+            qt_settings_app.__version__
+        )
+        bridge_runtime_status.publish_status(
+            config.config_root(),
+            bridge_runtime_status.BridgeConnectionState.WAITING_FOR_DEVICE,
+            pid=4321,
+            identity=identity,
+            raw_input_state="ready",
+            hid_tap_state=frida_compat.HidTapState.READY.value,
+        )
+
+        with mock.patch.object(
+            qt_settings_app.bridge_launcher,
+            "in_process_bridge_running",
+            return_value=True,
+        ):
+            controller, _ = self._make_controller()
+        with mock.patch.object(
+            qt_settings_app.single_instance,
+            "bridge_instance_running",
+            return_value=False,
+        ):
+            controller.reconnectBridgeNow()
+
+        self.assertFalse(controller.bridgeRunning)
+        self.assertFalse(controller.bridgeReconnectAvailable)
+        self.assertIn("启动桥接", controller.errorMessage)
+        self.assertNotIn("重新启动", controller.errorMessage)
+
+    def test_immediate_reconnect_delivery_failure_asks_to_retry_later(self):
+        self._bridge_status_patch.stop()
+        self._bridge_status_patch = mock.patch.object(
+            qt_settings_app.single_instance,
+            "bridge_instance_running",
+            return_value=True,
+        )
+        self._bridge_status_patch.start()
+        identity = bridge_runtime_status.current_runtime_identity(
+            qt_settings_app.__version__
+        )
+        bridge_runtime_status.publish_status(
+            config.config_root(),
+            bridge_runtime_status.BridgeConnectionState.WAITING_FOR_DEVICE,
+            pid=4321,
+            identity=identity,
+            raw_input_state="ready",
+            hid_tap_state=frida_compat.HidTapState.READY.value,
+        )
+
+        with mock.patch.object(
+            qt_settings_app.bridge_launcher,
+            "in_process_bridge_running",
+            return_value=True,
+        ), mock.patch.object(
+            qt_settings_app.bridge_launcher,
+            "reconnect_in_process_bridge_now",
+            return_value=False,
+        ):
+            controller, _ = self._make_controller()
+            controller.reconnectBridgeNow()
+
+        self.assertFalse(controller.bridgeReconnectAvailable)
+        self.assertIn("稍后再试", controller.errorMessage)
+        self.assertNotIn("重新启动", controller.errorMessage)
+
     def test_current_bridge_status_exposes_version_channels_and_recent_button(self):
         self._bridge_status_patch.stop()
         self._bridge_status_patch = mock.patch.object(
@@ -2962,6 +3537,53 @@ class SettingsControllerTests(unittest.TestCase):
         )
         self.assertFalse(
             single_instance.consume_bridge_start_request(controller._config_root)
+        )
+
+    def test_cancelled_external_exit_notifies_the_waiting_copy(self):
+        controller, _ = self._make_controller()
+        single_instance.write_application_exit_request(
+            controller._config_root,
+            request_id="handoff-request",
+        )
+
+        controller.refreshBridgeState()
+        self.assertTrue(controller._maintenance_exit_pending)
+        self.assertEqual(
+            controller._maintenance_exit_request_id,
+            "handoff-request",
+        )
+
+        controller.cancelPendingMaintenanceExit()
+
+        self.assertFalse(controller._maintenance_exit_pending)
+        self.assertIsNone(controller._maintenance_exit_request_id)
+        self.assertTrue(
+            single_instance.application_exit_request_rejected(
+                controller._config_root,
+                "handoff-request",
+            )
+        )
+
+    def test_failed_save_rejects_an_external_exit_request(self):
+        controller, _ = self._make_controller()
+        single_instance.write_application_exit_request(
+            controller._config_root,
+            request_id="handoff-request",
+        )
+        controller.refreshBridgeState()
+        completions = []
+        controller._save = lambda completion=None: (
+            completions.append(completion) or True
+        )
+
+        controller.saveSettingsAndExit()
+        completions[0](False)
+
+        self.assertTrue(
+            single_instance.application_exit_request_rejected(
+                controller._config_root,
+                "handoff-request",
+            )
         )
 
     def test_external_exit_blocks_an_already_queued_bridge_start_until_cancelled(self):
@@ -5177,6 +5799,59 @@ class RunSettingsWindowShutdownCoverageTests(unittest.TestCase):
 
         marker.assert_called_once_with(4321)
 
+    def test_exit_capability_is_marked_before_embedded_runtime_startup(self):
+        class _FakeWindow:
+            def winId(self):
+                return 4321
+
+        events = mock.Mock()
+        runtime = object()
+        fake_classes = self._fake_classes(root_objects=[_FakeWindow()], exec_return=0)
+        with mock.patch.dict(
+            os.environ,
+            {"RC003_DISABLE_LIVE_INPUT": "0"},
+        ), mock.patch.object(
+            qt_settings_app, "_load_qt_classes", return_value=fake_classes
+        ), mock.patch.object(
+            qt_settings_app.sys, "platform", "win32"
+        ), mock.patch.object(
+            qt_settings_app.element_navigation_runtime,
+            "start_embedded_element_navigation",
+            side_effect=lambda _app: events.runtime_started() or runtime,
+        ), mock.patch.object(
+            qt_settings_app.element_navigation_control_windows,
+            "bind_embedded_element_navigation",
+            side_effect=lambda _runtime: events.runtime_bound(),
+        ), mock.patch.object(
+            qt_settings_app.single_instance,
+            "mark_settings_window",
+            side_effect=lambda _hwnd: events.window_marked() or True,
+        ):
+            self.assertEqual(qt_settings_app.run_settings_window(), 0)
+
+        self.assertEqual(
+            events.mock_calls[:3],
+            [
+                mock.call.window_marked(),
+                mock.call.runtime_started(),
+                mock.call.runtime_bound(),
+            ],
+        )
+
+    def test_hid_setup_is_not_started_before_the_qt_event_loop(self):
+        fake_classes = self._fake_classes(root_objects=[object()], exec_return=0)
+        controller_class = fake_classes["SettingsController"]
+        with mock.patch.object(
+            qt_settings_app, "_load_qt_classes", return_value=fake_classes
+        ), mock.patch.object(
+            controller_class,
+            "claimPortableHidSetupPrompt",
+            autospec=True,
+        ) as prompt:
+            self.assertEqual(qt_settings_app.run_settings_window(), 0)
+
+        prompt.assert_not_called()
+
     def test_live_navigation_is_bound_and_shutdown_with_the_desktop_app(self):
         runtime = object()
         fake_classes = self._fake_classes(root_objects=[object()], exec_return=0)
@@ -5248,20 +5923,30 @@ _APPLICATION_EXIT_PROBE_SCRIPT = r"""
 import json
 import os
 import time
+from types import SimpleNamespace
 
 from PySide6.QtCore import QTimer
 from ovb_rc003 import qt_settings_app as m
 
-m.single_instance.bridge_instance_running = lambda: False
 original_connect_application_exit = m._connect_application_exit
 action = os.environ.get("RC003_EXIT_PROBE_ACTION", "controller")
+slow_bridge_exit = action == "window_close_running_bridge"
+m.single_instance.bridge_instance_running = lambda: slow_bridge_exit
+visibility = {"during_cleanup": None}
+
+if slow_bridge_exit:
+    def delayed_bridge_exit():
+        time.sleep(0.6)
+        return SimpleNamespace(stopped=True, error="")
+
+    m.bridge_control_windows.request_bridge_exit = delayed_bridge_exit
 
 
 def connect_application_exit_and_schedule(app, controller):
     original_connect_application_exit(app, controller)
 
     def trigger_exit():
-        if action == "window_close":
+        if action in {"window_close", "window_close_running_bridge"}:
             windows = app.topLevelWindows()
             if not windows:
                 app.exit(23)
@@ -5271,15 +5956,26 @@ def connect_application_exit_and_schedule(app, controller):
         controller.requestApplicationExit()
 
     QTimer.singleShot(50, trigger_exit)
+    if slow_bridge_exit:
+        def record_visibility():
+            windows = app.topLevelWindows()
+            visibility["during_cleanup"] = (
+                windows[0].isVisible() if windows else None
+            )
+
+        QTimer.singleShot(150, record_visibility)
 
 
 m._connect_application_exit = connect_application_exit_and_schedule
 started = time.monotonic()
-result = m.run_settings_window(start_hidden=(action != "window_close"))
+result = m.run_settings_window(
+    start_hidden=action not in {"window_close", "window_close_running_bridge"}
+)
 print(json.dumps({
     "action": action,
     "result": result,
     "elapsed": time.monotonic() - started,
+    "visible_during_cleanup": visibility["during_cleanup"],
 }))
 """
 
@@ -6434,9 +7130,19 @@ class SettingsShellSourceContractTests(unittest.TestCase):
     def test_hid_helper_repair_is_scoped_to_the_button_receiver_row(self):
         self.assertIn('objectName: "buttonReceiverRow"', self.device_qml)
         self.assertIn('objectName: "repairHidHelperButton"', self.device_qml)
-        self.assertIn("SettingsController.repairHidHelper()", self.device_qml)
+        self.assertIn("root.enableHidHelperRequested()", self.device_qml)
+        self.assertIn("SettingsController.repairHidHelper()", self.main_qml)
         self.assertIn("SettingsController.hidHelperRepairVisible", self.device_qml)
+        self.assertIn("SettingsController.hidHelperSetupRequired", self.device_qml)
+        self.assertIn("SettingsController.hidHelperCleanupPending", self.device_qml)
+        self.assertIn("启用改键", self.device_qml)
+        self.assertIn("完成清理", self.device_qml)
         self.assertIn("管理员按键组件异常", self.device_qml)
+        self.assertIn('objectName: "hidHelperSetupDialog"', self.main_qml)
+        self.assertIn("确认一次管理员权限，之后普通启动和自启动都可用。", self.main_qml)
+        self.assertIn("方向改键已可用。确认管理员权限，清理旧组件。", self.main_qml)
+        self.assertIn('objectName: "removeHidHelperButton"', self.device_qml)
+        self.assertIn("本机所有无线麦版本都不能使用方向改键", self.main_qml)
         self.assertIn(
             "SettingsController.feedbackPageIndex === tabBar.currentIndex",
             self.main_qml,
@@ -6671,9 +7377,19 @@ class SettingsShellSourceContractTests(unittest.TestCase):
         busy_index = exit_function.index("SettingsController.settingsSaveBusy")
         dirty_index = exit_function.index("SettingsController.settingsDirty")
         self.assertLess(busy_index, dirty_index)
-        self.assertIn("SettingsController.requestApplicationExit()", exit_function)
+        self.assertIn("window.beginApplicationExit()", exit_function)
+        begin_exit_function = self.main_qml[
+            self.main_qml.index("function beginApplicationExit()"):
+            self.main_qml.index("function requestFullExit()")
+        ]
+        self.assertIn("window.hide()", begin_exit_function)
+        self.assertIn(
+            "SettingsController.requestApplicationExit()", begin_exit_function
+        )
         self.assertIn("property bool applicationExitInProgress: false", self.main_qml)
-        self.assertIn("window.applicationExitInProgress = true", exit_function)
+        self.assertIn(
+            "window.applicationExitInProgress = true", begin_exit_function
+        )
         self.assertGreaterEqual(
             self.main_qml.count("&& !window.applicationExitInProgress"),
             2,
@@ -6694,6 +7410,21 @@ class SettingsShellSourceContractTests(unittest.TestCase):
             self.main_qml.count("SettingsController.cancelPendingMaintenanceExit()"),
             3,
         )
+
+    def test_first_hid_setup_waits_for_a_visible_rendered_window(self):
+        frame_handler = self.main_qml[
+            self.main_qml.index("onFrameSwapped:"):
+            self.main_qml.index("color: tokens.windowFrame")
+        ]
+        self.assertIn(
+            "property bool portableHidSetupPromptAttempted: false",
+            self.main_qml,
+        )
+        self.assertIn("window.visible", frame_handler)
+        self.assertIn(
+            "SettingsController.claimPortableHidSetupPrompt()", frame_handler
+        )
+        self.assertIn("window.openHidHelperSetupPrompt()", frame_handler)
 
     def test_device_page_owns_the_three_desktop_behavior_options(self):
         self.assertIn('objectName: "desktopBehaviorSection"', self.device_qml)
@@ -7367,6 +8098,34 @@ class ApplicationExitIntegrationTests(unittest.TestCase):
         data = json.loads(result.stdout.strip().splitlines()[-1])
         self.assertEqual(data["action"], "window_close")
         self.assertEqual(data["result"], 0)
+        self.assertLess(data["elapsed"], 5.0)
+
+    def test_window_hides_while_a_running_bridge_stops(self):
+        import subprocess
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            env = dict(os.environ)
+            env.setdefault("QT_QPA_PLATFORM", "offscreen")
+            env["LOCALAPPDATA"] = tmpdir
+            env["RC003_DISABLE_LIVE_INPUT"] = "1"
+            env["RC003_EXIT_PROBE_ACTION"] = "window_close_running_bridge"
+            result = subprocess.run(
+                [sys.executable, "-c", _APPLICATION_EXIT_PROBE_SCRIPT],
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+
+        self.assertEqual(
+            result.returncode,
+            0,
+            f"running-bridge close probe failed: {result.stderr}",
+        )
+        data = json.loads(result.stdout.strip().splitlines()[-1])
+        self.assertEqual(data["action"], "window_close_running_bridge")
+        self.assertFalse(data["visible_during_cleanup"])
+        self.assertGreater(data["elapsed"], 0.5)
         self.assertLess(data["elapsed"], 5.0)
 
 

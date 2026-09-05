@@ -154,11 +154,13 @@ class NoElevationOrAutoDriverTests(unittest.TestCase):
     def test_hid_elevation_is_scoped_to_a_fixed_helper_and_task(self):
         path = _PACKAGE_ROOT / "hid_elevation_windows.py"
         text = path.read_text(encoding="utf-8")
-        self.assertIn(r'TASK_NAME = r"\RemoteMic\RC003\HidTapInjector"', text)
+        self.assertIn('TASK_NAME_PREFIX = r"\\RemoteMicRC003-HidTap-"', text)
+        self.assertIn("def task_name_for_sid", text)
+        self.assertIn("TASK_DONT_ADD_PRINCIPAL_ACE", text)
         self.assertIn('HELPER_EXE_NAME = "RemoteMicRC003HidHelper.exe"', text)
         self.assertIn('INJECT_FLAG = "--inject"', text)
         self.assertIn('lpVerb = "runas"', text)
-        self.assertIn('"Program Files"', text.replace("PROGRAMFILES", "Program Files"))
+        self.assertIn("SHGetKnownFolderPath", text)
         self.assertNotIn('add_argument("--pid"', text)
         self.assertNotIn("CurrentVersion\\Run", text)
 

@@ -51,6 +51,7 @@ class DefaultConfigPrivacyTests(unittest.TestCase):
         self.assertEqual(defaults["gain_db"], 10.0)
         self.assertFalse(defaults["launch_bridge_on_app_start"])
         self.assertEqual(defaults["close_behavior"], config.CLOSE_BEHAVIOR_QUIT)
+        self.assertEqual(defaults["hid_helper_setup_prompted_offer_id"], "")
 
     def test_default_config_contains_no_forbidden_identity_fields(self):
         defaults = config.default_config()
@@ -96,7 +97,7 @@ class DefaultConfigPrivacyTests(unittest.TestCase):
             path.write_text(
                 json.dumps(
                     {
-                        "schema_version": config.SCHEMA_VERSION - 1,
+                        "schema_version": config._QUIT_BY_DEFAULT_SCHEMA_VERSION - 1,
                         "close_behavior": config.CLOSE_BEHAVIOR_HIDE_TO_TRAY,
                     }
                 ),
@@ -123,6 +124,84 @@ class DefaultConfigPrivacyTests(unittest.TestCase):
         self.assertEqual(
             loaded["close_behavior"], config.CLOSE_BEHAVIOR_HIDE_TO_TRAY
         )
+
+    def test_legacy_hid_helper_prompt_state_migrates_to_offer_id(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": config.SCHEMA_VERSION,
+                        "hid_helper_setup_prompted": True,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            loaded = config.load_config(path)
+            config.save_config(path, loaded)
+            persisted = json.loads(path.read_text(encoding="utf-8"))
+
+        self.assertEqual(
+            loaded["hid_helper_setup_prompted_offer_id"],
+            "legacy-generation:1",
+        )
+        self.assertEqual(
+            persisted["hid_helper_setup_prompted_offer_id"],
+            "legacy-generation:1",
+        )
+        self.assertNotIn("hid_helper_setup_prompted", persisted)
+        self.assertNotIn("hid_helper_setup_prompted_generation", persisted)
+
+    def test_legacy_hid_helper_prompt_generation_migrates_to_offer_id(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": config.SCHEMA_VERSION,
+                        "hid_helper_setup_prompted_generation": 2,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            loaded = config.load_config(path)
+
+        self.assertEqual(
+            loaded["hid_helper_setup_prompted_offer_id"],
+            "legacy-generation:2",
+        )
+
+    def test_invalid_hid_helper_prompt_generation_falls_back_to_empty_offer(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": config.SCHEMA_VERSION,
+                        "hid_helper_setup_prompted_generation": True,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            loaded = config.load_config(path)
+
+        self.assertEqual(loaded["hid_helper_setup_prompted_offer_id"], "")
+
+    def test_invalid_hid_helper_offer_id_falls_back_to_empty(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": config.SCHEMA_VERSION,
+                        "hid_helper_setup_prompted_offer_id": "x" * 129,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            loaded = config.load_config(path)
+
+        self.assertEqual(loaded["hid_helper_setup_prompted_offer_id"], "")
 
     def test_load_preserves_an_existing_right_alt_hold_shortcut(self):
         with tempfile.TemporaryDirectory() as tmp:

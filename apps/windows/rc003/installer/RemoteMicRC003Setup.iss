@@ -6,9 +6,10 @@
 ; Hard boundaries enforced by this script:
 ;   - PrivilegesRequired=lowest: the installer and desktop application stay
 ;     per-user/non-elevated. After files are installed, one narrow helper is
-;     launched with the Windows runas verb so the user can approve creation
-;     of the fixed on-demand HID task. Normal launch and login startup never
-;     request elevation.
+;     requested through the ordinary desktop executable. That executable
+;     verifies the current account before its narrow bundled helper uses the
+;     Windows runas verb. Normal launch and login startup never request
+;     elevation after setup succeeds.
 ;   - No [Tasks]/[Icons] entry adds login startup. The installed app exposes
 ;     an explicit per-user option and uninstall removes only its owned value.
 ;   - This INSTALLER SCRIPT never installs, configures, silently modifies,
@@ -140,6 +141,7 @@ const
   StopProbeFailedExitCode = 21;
   StopUserActionRequiredExitCode = 22;
   StopOtherLocationRunningExitCode = 23;
+  HidHelperAccountUnsupportedExitCode = 25;
 
 var
   HidHelperInstallSucceeded: Boolean;
@@ -182,22 +184,22 @@ begin
     );
 end;
 
-function RunHidHelper(const Parameters: String; var ResultCode: Integer): Boolean;
+function RunApplicationMaintenance(const Parameters: String;
+  var ResultCode: Integer): Boolean;
 var
-  HelperPath: String;
+  AppPath: String;
 begin
-  HelperPath := ExpandConstant('{app}\_internal\{#HidHelperExeName}');
-  if not FileExists(HelperPath) then
+  AppPath := ExpandConstant('{app}\{#AppExeName}');
+  if not FileExists(AppPath) then
   begin
     ResultCode := -1;
     Result := False;
     exit;
   end;
-  Result := ShellExec(
-    'runas',
-    HelperPath,
+  Result := Exec(
+    AppPath,
     Parameters,
-    ExpandConstant('{sys}'),
+    ExpandConstant('{app}'),
     SW_HIDE,
     ewWaitUntilTerminated,
     ResultCode
@@ -252,20 +254,32 @@ begin
   if CurStep <> ssPostInstall then
     exit;
 
-  HidHelperInstallSucceeded := RunHidHelper('--install-task', ResultCode);
+  HidHelperInstallSucceeded := RunApplicationMaintenance(
+    '--install-hid-helper',
+    ResultCode
+  );
   if not HidHelperInstallSucceeded then
-    MsgBox(
-      '主程序已经安装，但管理员按键组件没有安装成功。方向键仍按 Windows 原始方向执行一次，自定义方向映射已停用。可打开无线麦，在“按键接收”旁点击“修复权限”重试。',
-      mbError,
-      MB_OK
-    );
+  begin
+    if ResultCode = HidHelperAccountUnsupportedExitCode then
+      MsgBox(
+        '当前 Windows 账号不是管理员，不能启用方向改键。请登录管理员账号后重试；在 UAC 中临时输入另一个管理员账号无效。',
+        mbError,
+        MB_OK
+      )
+    else
+      MsgBox(
+        '方向改键未启用。打开无线麦，在“按键接收”中点击“启用改键”即可重试。',
+        mbError,
+        MB_OK
+      );
+  end;
 end;
 
 procedure CurPageChanged(CurPageID: Integer);
 begin
   if (CurPageID = wpFinished) and (not HidHelperInstallSucceeded) then
     WizardForm.FinishedLabel.Caption :=
-      '无线麦主程序已安装，但管理员按键组件未完成。方向键不会连击；修复权限后才能使用自定义方向映射。';
+      '无线麦已安装；方向改键可稍后在程序内启用。';
 end;
 
 function InitializeUninstall(): Boolean;
@@ -311,10 +325,10 @@ begin
     exit;
   end;
 
-  if not RunHidHelper('--uninstall-task', ResultCode) then
+  if not RunApplicationMaintenance('--uninstall-hid-helper', ResultCode) then
   begin
     MsgBox(
-      '管理员按键组件未能卸载。卸载尚未开始，请确认 UAC 后重试，以免系统中留下失效的计划任务。',
+      '方向改键权限未能移除，卸载尚未开始。请确认管理员权限后重试。',
       mbError,
       MB_OK
     );
@@ -322,12 +336,36 @@ begin
   end;
 end;
 
-procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
+procedure RemoveOwnedLoginStartupValue;
+var
+  AppExecutable: String;
+  CurrentCommand: String;
+  ExpectedCommand: String;
+  ExpectedQuotedCommand: String;
 begin
-  if CurUninstallStep = usUninstall then
+  if not RegQueryStringValue(
+    HKCU,
+    'Software\Microsoft\Windows\CurrentVersion\Run',
+    'RemoteMicRC003',
+    CurrentCommand
+  ) then
+    exit;
+
+  AppExecutable := ExpandConstant('{app}\{#AppExeName}');
+  ExpectedCommand := AppExecutable + ' --background';
+  ExpectedQuotedCommand := '"' + AppExecutable + '" --background';
+  CurrentCommand := Trim(CurrentCommand);
+  if (CompareText(CurrentCommand, ExpectedCommand) = 0) or
+     (CompareText(CurrentCommand, ExpectedQuotedCommand) = 0) then
     RegDeleteValue(
       HKCU,
       'Software\Microsoft\Windows\CurrentVersion\Run',
       'RemoteMicRC003'
     );
+end;
+
+procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
+begin
+  if CurUninstallStep = usUninstall then
+    RemoveOwnedLoginStartupValue;
 end;

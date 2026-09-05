@@ -221,6 +221,7 @@ def _get_device_name(user32, device_handle, ridi_devicename: int) -> Optional[st
 ButtonEventCallback = Callable[[str, bool], None]  # (button_id, is_pressed)
 SourcedButtonEventCallback = Callable[[str, bool, str], None]
 DeviceRemovedCallback = Callable[[], None]
+InputCorruptionCallback = Callable[[str], None]
 
 
 @dataclass(frozen=True)
@@ -353,6 +354,7 @@ class RawInputButtonListener:
         self._logical_button_sources: dict[str, str] = {}
         self._selected_device_handles: set[int] = set()
         self._on_device_removed: Optional[DeviceRemovedCallback] = None
+        self._on_input_corruption: Optional[InputCorruptionCallback] = None
         self._ready_event = threading.Event()
         self._start_error: Optional[BaseException] = None
         self._device_path: Optional[str] = None
@@ -396,6 +398,19 @@ class RawInputButtonListener:
         """Receive loss of the selected Raw Input device on its owner thread."""
 
         self._on_device_removed = callback
+
+    def set_input_corruption_callback(
+        self,
+        callback: Optional[InputCorruptionCallback],
+    ) -> None:
+        """Report malformed selected-device input without discarding state.
+
+        The last known physical state is retained so a later real release can
+        still be emitted. The owner cancels the current logical gesture and
+        blocks it from rearming until that release arrives.
+        """
+
+        self._on_input_corruption = callback
 
     @property
     def is_running(self) -> bool:
@@ -612,13 +627,29 @@ class RawInputButtonListener:
         if not device_handle or device_handle not in self._selected_device_handles:
             return
 
+        self._notify_input_ownership_lost()
+
+    def _notify_input_ownership_lost(self) -> None:
+        """Cancel active state when the selected input stream disappears."""
+
         callback = self._on_device_removed
         if callback is None:
             self._release_all()
             return
-
         self._clear_active_state()
-        callback()
+        try:
+            callback()
+        except Exception:
+            pass
+
+    def _notify_input_corruption(self, reason: str) -> None:
+        callback = self._on_input_corruption
+        if callback is None:
+            return
+        try:
+            callback(reason)
+        except BaseException:
+            pass
 
     def _emit_button_event(
         self,
@@ -868,34 +899,41 @@ class RawInputButtonListener:
         import ctypes
 
         msg = wintypes.MSG()
-        while not self._stop_event.is_set():
-            result = user32.GetMessageW(ctypes.byref(msg), None, 0, 0)
-            if result <= 0:
-                break
-            user32.TranslateMessage(ctypes.byref(msg))
-            user32.DispatchMessageW(ctypes.byref(msg))
+        unexpected_exit = False
+        try:
+            while not self._stop_event.is_set():
+                try:
+                    result = user32.GetMessageW(ctypes.byref(msg), None, 0, 0)
+                    if result < 0:
+                        unexpected_exit = True
+                        break
+                    if result == 0:
+                        unexpected_exit = not self._stop_event.is_set()
+                        break
+                    user32.TranslateMessage(ctypes.byref(msg))
+                    user32.DispatchMessageW(ctypes.byref(msg))
+                except BaseException:  # noqa: BLE001 - thread must fail closed
+                    unexpected_exit = not self._stop_event.is_set()
+                    break
+        finally:
+            # Fallback only: the normal stop() path already clears self._hwnd
+            # from the WM_DESTROY handler below. This covers a failed message
+            # loop that never went through WM_CLOSE/WM_DESTROY.
+            if self._hwnd is not None:
+                try:
+                    user32.DestroyWindow(self._hwnd)
+                except Exception:
+                    pass
+                self._hwnd = None
 
-        # Fallback only: the normal stop() path already clears self._hwnd
-        # from the WM_DESTROY handler below (DestroyWindow's synchronous
-        # WM_DESTROY notification runs on this same thread before it
-        # returns). This only fires on an abnormal GetMessageW failure that
-        # never went through WM_CLOSE/WM_DESTROY.
-        if self._hwnd is not None:
-            user32.DestroyWindow(self._hwnd)
-            self._hwnd = None
+            if class_registered:
+                try:
+                    user32.UnregisterClassW(class_name, hinstance)
+                except Exception:
+                    pass
 
-        # The window is gone either way by this point; unregistering the
-        # class now (rather than never) is what makes start()/stop() safely
-        # repeatable without accumulating registered classes across many
-        # reconnect cycles (XRBM-018 RETRY 1 P1 #2). Win32 refuses to
-        # unregister a class while any window of that class still exists,
-        # which is exactly why this runs only after the DestroyWindow calls
-        # above.
-        if class_registered:
-            try:
-                user32.UnregisterClassW(class_name, hinstance)
-            except Exception:
-                pass
+            if unexpected_exit:
+                self._notify_input_ownership_lost()
 
     def _wndproc(self, hwnd, msg, wparam, lparam):
         import ctypes
@@ -903,7 +941,7 @@ class RawInputButtonListener:
         if msg == _WM_INPUT:
             try:
                 self._handle_raw_input(lparam)
-            except Exception:
+            except BaseException:
                 pass  # never let a decode error kill the message loop
             return 0
         if msg == _WM_INPUT_DEVICE_CHANGE:
@@ -984,12 +1022,16 @@ class RawInputButtonListener:
 
         body = bytes(buffer.raw[ctypes.sizeof(RAWINPUTHEADER) :])
 
-        if header.dwType == RIM_TYPEKEYBOARD:
-            self._handle_keyboard_body(body, device_path=device_path)
-        elif header.dwType == RIM_TYPEHID:
-            self._handle_hid_body(body, device_path=device_path)
-        elif header.dwType == RIM_TYPEMOUSE:
-            return  # RC003 has no mouse-usage buttons in this candidate
+        try:
+            if header.dwType == RIM_TYPEKEYBOARD:
+                self._handle_keyboard_body(body, device_path=device_path)
+            elif header.dwType == RIM_TYPEHID:
+                self._handle_hid_body(body, device_path=device_path)
+            elif header.dwType == RIM_TYPEMOUSE:
+                return  # RC003 has no mouse-usage buttons in this candidate
+        except BaseException:
+            self._notify_input_corruption("raw_input_handler_exception")
+            raise
 
     def _handle_keyboard_body(
         self, body: bytes, *, device_path: Optional[str] = None
@@ -999,6 +1041,7 @@ class RawInputButtonListener:
         # RAWKEYBOARD: MakeCode(u16), Flags(u16), Reserved(u16), VKey(u16),
         # Message(u32), ExtraInformation(u32) - little-endian.
         if len(body) < 16:
+            self._notify_input_corruption("keyboard_body_too_short")
             return
         _make_code, flags, _reserved, vkey, message, _extra = struct.unpack_from(
             "<HHHHII", body, 0
@@ -1056,6 +1099,7 @@ class RawInputButtonListener:
                     decode_error=str(exc),
                 )
             )
+            self._notify_input_corruption("hid_payload_invalid")
             return
         for report in reports:
             try:
@@ -1070,6 +1114,7 @@ class RawInputButtonListener:
                         decode_error=str(exc),
                     )
                 )
+                self._notify_input_corruption("hid_report_invalid")
                 continue
             pressed, released = hid_identity.diff_usages(
                 self._active_hid_usages, current

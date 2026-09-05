@@ -176,6 +176,50 @@ class ButtonGestureDispatcherTests(unittest.TestCase):
         self.assertFalse(reset_worker.is_alive())
         self.assertFalse(self.dispatcher.has_active_gestures())
 
+    def test_button_callbacks_never_run_concurrently(self):
+        first_entered = threading.Event()
+        allow_first_to_finish = threading.Event()
+        second_entered = threading.Event()
+        callback_order = []
+
+        def on_trigger(button_id, _trigger):
+            callback_order.append(f"{button_id}:start")
+            if button_id == "up":
+                first_entered.set()
+                allow_first_to_finish.wait(1.0)
+            else:
+                second_entered.set()
+            callback_order.append(f"{button_id}:end")
+
+        dispatcher = ButtonGestureDispatcher(
+            is_action_configured=lambda _button, trigger: (
+                trigger == ButtonTrigger.SINGLE_CLICK
+            ),
+            is_repeatable=lambda _button: False,
+            on_trigger=on_trigger,
+            hold_timer_factory=lambda _delay, callback: _FakeTimer(callback),
+        )
+        first = threading.Thread(target=lambda: dispatcher.press("up"))
+        second = threading.Thread(target=lambda: dispatcher.press("down"))
+        try:
+            first.start()
+            self.assertTrue(first_entered.wait(1.0))
+            second.start()
+            self.assertFalse(second_entered.wait(0.1))
+        finally:
+            allow_first_to_finish.set()
+            first.join(1.0)
+            second.join(1.0)
+            dispatcher.release("up")
+            dispatcher.release("down")
+
+        self.assertFalse(first.is_alive())
+        self.assertFalse(second.is_alive())
+        self.assertEqual(
+            callback_order,
+            ["up:start", "up:end", "down:start", "down:end"],
+        )
+
     def test_immediate_hold_remains_active_until_release(self):
         self.dispatcher.press("up")
         self.assertTrue(self.dispatcher.has_active_gestures())

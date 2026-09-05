@@ -54,6 +54,7 @@ ApplicationWindow {
     property int pendingPageIndex: -1
     property bool pendingExitPrompt: false
     property bool applicationExitInProgress: false
+    property bool portableHidSetupPromptAttempted: false
 
     function restoreWindow() {
         window.show()
@@ -144,13 +145,18 @@ ApplicationWindow {
         SettingsController.prepareForWindowHide()
     }
 
+    function beginApplicationExit() {
+        window.applicationExitInProgress = true
+        window.hide()
+        SettingsController.requestApplicationExit()
+    }
+
     function requestFullExit() {
         if (unsavedExitDialog.exitCommitInProgress
                 || window.applicationExitInProgress)
             return
         if (SettingsController.settingsSaveBusy) {
-            window.applicationExitInProgress = true
-            SettingsController.requestApplicationExit()
+            window.beginApplicationExit()
             return
         }
         if (SettingsController.settingsDirty || hasPendingMappingDraft()) {
@@ -170,8 +176,7 @@ ApplicationWindow {
             }
             return
         }
-        window.applicationExitInProgress = true
-        SettingsController.requestApplicationExit()
+        window.beginApplicationExit()
     }
 
     function saveAndExit() {
@@ -181,6 +186,7 @@ ApplicationWindow {
         unsavedExitDialog.saveAttempted = true
         unsavedExitDialog.exitCommitInProgress = true
         window.applicationExitInProgress = true
+        window.hide()
         SettingsController.saveSettingsAndExit()
     }
 
@@ -189,9 +195,20 @@ ApplicationWindow {
         if (page)
             page.discardPendingEditorDraft()
         unsavedExitDialog.exitCommitInProgress = true
-        window.applicationExitInProgress = true
         unsavedExitDialog.close()
-        SettingsController.requestApplicationExit()
+        window.beginApplicationExit()
+    }
+
+    function openHidHelperSetupPrompt() {
+        if (!hidHelperSetupDialog.visible
+                && !window.applicationExitInProgress)
+            hidHelperSetupDialog.open()
+    }
+
+    function openHidHelperRemovalPrompt() {
+        if (!hidHelperRemovalDialog.visible
+                && !window.applicationExitInProgress)
+            hidHelperRemovalDialog.open()
     }
 
     Component.onCompleted: {
@@ -232,6 +249,7 @@ ApplicationWindow {
                 window.applicationExitInProgress = false
                 unsavedExitDialog.exitCommitInProgress = false
                 unsavedExitDialog.saveAttempted = true
+                window.restoreWindow()
                 if (!unsavedExitDialog.visible)
                     unsavedExitDialog.open()
             }
@@ -267,6 +285,108 @@ ApplicationWindow {
             window.lifecycleErrorTitle = qsTr("无法隐藏窗口")
             window.applicationExitError = message
             exitFailedDialog.open()
+        }
+    }
+
+    Dialog {
+        id: hidHelperSetupDialog
+        objectName: "hidHelperSetupDialog"
+        anchors.centerIn: parent
+        modal: true
+        popupType: Popup.Item
+        title: SettingsController.hidHelperCleanupPending
+            ? qsTr("完成权限清理？") : qsTr("启用方向改键？")
+        standardButtons: Dialog.NoButton
+        closePolicy: SettingsController.hidHelperRepairBusy
+            ? Popup.NoAutoClose : Popup.CloseOnEscape
+        width: Math.min(390, window.width - 32)
+
+        contentItem: ColumnLayout {
+            spacing: window.tokens.spacingLarge
+
+            UiLabel {
+                tokens: window.tokens
+                kind: bodyKind
+                Layout.fillWidth: true
+                wrapMode: Text.WordWrap
+                text: SettingsController.hidHelperCleanupPending
+                    ? qsTr("方向改键已可用。确认管理员权限，清理旧组件。")
+                    : qsTr("确认一次管理员权限，之后普通启动和自启动都可用。")
+            }
+
+            RowLayout {
+                Layout.fillWidth: true
+                spacing: window.tokens.spacingSmall
+                Item { Layout.fillWidth: true }
+                CompactButton {
+                    objectName: "cancelHidHelperSetupButton"
+                    tokens: window.tokens
+                    text: qsTr("暂不")
+                    enabled: !SettingsController.hidHelperRepairBusy
+                    onClicked: hidHelperSetupDialog.close()
+                }
+                CompactButton {
+                    objectName: "confirmHidHelperSetupButton"
+                    tokens: window.tokens
+                    text: SettingsController.hidHelperCleanupPending
+                        ? qsTr("清理") : qsTr("启用")
+                    highlighted: true
+                    enabled: !SettingsController.hidHelperRepairBusy
+                    onClicked: {
+                        hidHelperSetupDialog.close()
+                        SettingsController.repairHidHelper()
+                    }
+                }
+            }
+        }
+    }
+
+    Dialog {
+        id: hidHelperRemovalDialog
+        objectName: "hidHelperRemovalDialog"
+        anchors.centerIn: parent
+        modal: true
+        popupType: Popup.Item
+        title: qsTr("移除方向改键权限？")
+        standardButtons: Dialog.NoButton
+        closePolicy: SettingsController.hidHelperRepairBusy
+            ? Popup.NoAutoClose : Popup.CloseOnEscape
+        width: Math.min(390, window.width - 32)
+
+        contentItem: ColumnLayout {
+            spacing: window.tokens.spacingLarge
+
+            UiLabel {
+                tokens: window.tokens
+                kind: bodyKind
+                Layout.fillWidth: true
+                wrapMode: Text.WordWrap
+                text: qsTr("移除后，本机所有无线麦版本都不能使用方向改键。")
+            }
+
+            RowLayout {
+                Layout.fillWidth: true
+                spacing: window.tokens.spacingSmall
+                Item { Layout.fillWidth: true }
+                CompactButton {
+                    objectName: "cancelHidHelperRemovalButton"
+                    tokens: window.tokens
+                    text: qsTr("取消")
+                    enabled: !SettingsController.hidHelperRepairBusy
+                    onClicked: hidHelperRemovalDialog.close()
+                }
+                CompactButton {
+                    objectName: "confirmHidHelperRemovalButton"
+                    tokens: window.tokens
+                    text: qsTr("移除")
+                    highlighted: true
+                    enabled: !SettingsController.hidHelperRepairBusy
+                    onClicked: {
+                        hidHelperRemovalDialog.close()
+                        SettingsController.removeHidHelper()
+                    }
+                }
+            }
         }
     }
 
@@ -388,10 +508,15 @@ ApplicationWindow {
     }
 
     onFrameSwapped: {
-        if (initialDiagnosticsStarted)
-            return
-        initialDiagnosticsStarted = true
-        DiagnosticsController.startInitialDiagnostics()
+        if (!initialDiagnosticsStarted) {
+            initialDiagnosticsStarted = true
+            DiagnosticsController.startInitialDiagnostics()
+        }
+        if (!portableHidSetupPromptAttempted && window.visible) {
+            portableHidSetupPromptAttempted = true
+            if (SettingsController.claimPortableHidSetupPrompt())
+                window.openHidHelperSetupPrompt()
+        }
     }
     color: tokens.windowFrame
     font.family: tokens.fontFamily
@@ -547,6 +672,8 @@ ApplicationWindow {
                     backTabTarget: voiceTabButton
                     tabTarget: deviceTabButton
                     onOpenButtonsRequested: window.requestPage(1)
+                    onEnableHidHelperRequested: window.openHidHelperSetupPrompt()
+                    onRemoveHidHelperRequested: window.openHidHelperRemovalPrompt()
                 }
                 Loader {
                     id: buttonsPageLoader
