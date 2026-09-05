@@ -560,6 +560,27 @@ class ApplicationRuntimeInstanceGuardTests(unittest.TestCase):
                 with guard():
                     self.fail("only one version handoff may wait at a time")
 
+    def test_only_one_full_exit_sender_can_enter_per_session(self):
+        registry = _FakeMutexRegistry()
+
+        def guard():
+            return single_instance.ApplicationExitRequestGuard(
+                _create_mutex=registry.create_mutex,
+                _release_mutex=registry.release_mutex,
+                _close_handle=registry.close_handle,
+            )
+
+        with guard():
+            with self.assertRaises(single_instance.DuplicateInstanceError):
+                with guard():
+                    self.fail("exit senders must not overwrite each other")
+
+    def test_installer_maintenance_mutex_is_global(self):
+        self.assertEqual(
+            single_instance._INSTALLER_MAINTENANCE_MUTEX_NAME,
+            r"Global\RemoteMicRC003_InstallerMaintenance",
+        )
+
 class ElementNavigationInstanceGuardTests(unittest.TestCase):
     def test_element_navigation_uses_a_distinct_local_mutex(self):
         registry = _FakeMutexRegistry()
@@ -618,7 +639,12 @@ class SettingsWindowActivationTests(unittest.TestCase):
             [
                 (321, single_instance._SETTINGS_WINDOW_PROPERTY),
                 (321, single_instance.application_runtime_window_property()),
+                (321, single_instance._APPLICATION_EXIT_CAPABILITY_PROPERTY_V2),
                 (321, single_instance._APPLICATION_EXIT_CAPABILITY_PROPERTY),
+                (
+                    321,
+                    single_instance._APPLICATION_EXIT_WINDOW_SIGNAL_CAPABILITY_PROPERTY,
+                ),
             ],
         )
 
@@ -727,6 +753,35 @@ class BridgeStartRequestTests(unittest.TestCase):
         self.assertFalse(single_instance.consume_bridge_start_request(self.root))
         self.assertFalse(path.exists())
 
+    def test_session_bridge_requests_do_not_cross_sessions(self):
+        first = single_instance.write_bridge_start_request(
+            self.root,
+            session_id=11,
+            session_scoped=True,
+        )
+        second = single_instance.write_bridge_start_request(
+            self.root,
+            session_id=22,
+            session_scoped=True,
+        )
+
+        self.assertNotEqual(first, second)
+        self.assertTrue(
+            single_instance.consume_bridge_start_request(
+                self.root,
+                session_id=11,
+                session_scoped=True,
+            )
+        )
+        self.assertTrue(second.exists())
+        self.assertTrue(
+            single_instance.consume_bridge_start_request(
+                self.root,
+                session_id=22,
+                session_scoped=True,
+            )
+        )
+
 
 class ApplicationExitRequestTests(unittest.TestCase):
     def setUp(self):
@@ -735,6 +790,71 @@ class ApplicationExitRequestTests(unittest.TestCase):
 
     def tearDown(self):
         self._tmp.cleanup()
+
+    def test_window_exit_request_is_consumed_once_from_the_settings_hwnd(self):
+        removed = []
+        request_values = iter((731, 0))
+
+        def remove_property(hwnd, property_name):
+            removed.append((hwnd, property_name))
+            if property_name == single_instance._APPLICATION_EXIT_WINDOW_REQUEST_PROPERTY:
+                return next(request_values)
+            return 0
+
+        self.assertEqual(
+            single_instance.consume_settings_window_exit_request(
+                321,
+                _remove_property=remove_property,
+            ),
+            731,
+        )
+        self.assertIsNone(
+            single_instance.consume_settings_window_exit_request(
+                321,
+                _remove_property=remove_property,
+            )
+        )
+        self.assertEqual(
+            removed,
+            [
+                (321, single_instance._APPLICATION_EXIT_WINDOW_REQUEST_PROPERTY),
+                (321, single_instance._APPLICATION_EXIT_WINDOW_REJECTED_PROPERTY),
+                (321, single_instance._APPLICATION_EXIT_WINDOW_REQUEST_PROPERTY),
+            ],
+        )
+
+    def test_window_exit_request_probe_failure_is_safe(self):
+        self.assertFalse(
+            single_instance.consume_settings_window_exit_request(
+                321,
+                _remove_property=lambda *_args: (_ for _ in ()).throw(
+                    OSError("blocked")
+                ),
+            )
+        )
+
+    def test_window_exit_rejection_echoes_the_request_token(self):
+        calls = []
+        self.assertTrue(
+            single_instance.publish_settings_window_exit_rejection(
+                321,
+                731,
+                _set_property=lambda hwnd, name, value: calls.append(
+                    (hwnd, name, value)
+                )
+                or True,
+            )
+        )
+        self.assertEqual(
+            calls,
+            [
+                (
+                    321,
+                    single_instance._APPLICATION_EXIT_WINDOW_REJECTED_PROPERTY,
+                    731,
+                )
+            ],
+        )
 
     def test_fresh_request_is_consumed_exactly_once(self):
         path = single_instance.write_application_exit_request(
@@ -999,6 +1119,149 @@ class ApplicationExitRequestTests(unittest.TestCase):
         payload = json.loads(path.read_text(encoding="utf-8"))
         self.assertEqual(payload["request_id"], "newer")
 
+    def test_session_exit_request_round_trip_is_isolated_by_session(self):
+        first = single_instance.write_application_exit_request(
+            self.root,
+            request_id="first",
+            session_id=11,
+            session_scoped=True,
+            now=lambda: 100.0,
+        )
+        second = single_instance.write_application_exit_request(
+            self.root,
+            request_id="second",
+            session_id=22,
+            session_scoped=True,
+            now=lambda: 100.0,
+        )
+
+        request = single_instance.consume_and_acknowledge_application_exit_request(
+            self.root,
+            session_id=11,
+            now=lambda: 101.0,
+        )
+
+        self.assertEqual(
+            request,
+            single_instance.ApplicationExitRequest(
+                request_id="first",
+                session_id=11,
+                session_scoped=True,
+            ),
+        )
+        self.assertFalse(first.exists())
+        self.assertTrue(second.exists())
+        self.assertTrue(
+            single_instance.application_exit_request_acknowledged(
+                self.root,
+                "first",
+                session_id=11,
+                session_scoped=True,
+            )
+        )
+        self.assertFalse(
+            single_instance.application_exit_request_acknowledged(
+                self.root,
+                "first",
+                session_id=22,
+                session_scoped=True,
+            )
+        )
+
+    def test_session_rejection_and_cleanup_touch_only_the_owned_response(self):
+        single_instance.write_application_exit_rejection(
+            self.root,
+            "same-id",
+            session_id=11,
+            session_scoped=True,
+        )
+        other = single_instance.write_application_exit_rejection(
+            self.root,
+            "same-id",
+            session_id=22,
+            session_scoped=True,
+        )
+
+        self.assertTrue(
+            single_instance.application_exit_request_rejected(
+                self.root,
+                "same-id",
+                session_id=11,
+                session_scoped=True,
+            )
+        )
+        self.assertTrue(
+            single_instance.clear_owned_application_exit_response(
+                self.root,
+                "same-id",
+                session_id=11,
+                session_scoped=True,
+            )
+        )
+        self.assertTrue(other.exists())
+
+    def test_acknowledgement_write_failure_does_not_cancel_consumed_exit(self):
+        single_instance.write_application_exit_request(
+            self.root,
+            request_id="ours",
+            session_id=11,
+            session_scoped=True,
+            now=lambda: 100.0,
+        )
+        original = single_instance.write_application_exit_acknowledgement
+        single_instance.write_application_exit_acknowledgement = (
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("full"))
+        )
+        try:
+            request = single_instance.consume_and_acknowledge_application_exit_request(
+                self.root,
+                session_id=11,
+                now=lambda: 101.0,
+            )
+        finally:
+            single_instance.write_application_exit_acknowledgement = original
+
+        self.assertEqual(
+            request,
+            single_instance.ApplicationExitRequest(
+                request_id="ours",
+                session_id=11,
+                session_scoped=True,
+            ),
+        )
+
+    def test_v3_request_is_consumed_before_legacy_compatibility_request(self):
+        legacy = single_instance.write_application_exit_request(
+            self.root,
+            request_id="legacy",
+            now=lambda: 100.0,
+        )
+        single_instance.write_application_exit_request(
+            self.root,
+            request_id="current",
+            session_id=11,
+            session_scoped=True,
+            now=lambda: 100.0,
+        )
+
+        request = single_instance.consume_and_acknowledge_application_exit_request(
+            self.root,
+            session_id=11,
+            now=lambda: 101.0,
+        )
+
+        self.assertEqual(request.request_id, "current")
+        self.assertTrue(request.session_scoped)
+        self.assertTrue(legacy.exists())
+
+    def test_current_session_query_is_validated_through_an_injected_probe(self):
+        self.assertEqual(
+            single_instance.current_process_session_id(_query=lambda: 7),
+            7,
+        )
+        with self.assertRaises(single_instance.SingleInstanceUnavailableError):
+            single_instance.current_process_session_id(_query=lambda: -1)
+
 
 class MutexCtypesPrototypeTests(unittest.TestCase):
     """Structural exact-prototype coverage, matching the convention
@@ -1057,7 +1320,9 @@ class MutexCtypesPrototypeTests(unittest.TestCase):
             self.assertIn(token, source)
 
     def test_settings_window_marker_declares_the_full_real_prototype(self):
-        source = inspect.getsource(single_instance._real_set_window_property)
+        source = inspect.getsource(
+            single_instance._real_set_window_property_value
+        )
         self.assertIn("SetPropW.argtypes", source)
         self.assertIn("SetPropW.restype", source)
         for token in ("wintypes.HWND", "wintypes.LPCWSTR", "wintypes.HANDLE"):

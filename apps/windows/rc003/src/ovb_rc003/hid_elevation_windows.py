@@ -23,6 +23,7 @@ import sys
 import tempfile
 import time
 import xml.etree.ElementTree as ET
+from contextlib import contextmanager
 from ctypes import wintypes
 from dataclasses import dataclass
 from pathlib import Path
@@ -44,15 +45,18 @@ SELF_CHECK_FLAG = "--self-check"
 REQUEST_SID_FLAG = "--request-sid"
 TASK_EXECUTION_LIMIT = "PT30S"
 _HELPER_OPERATION_MUTEX_NAME = r"Global\RemoteMicRC003_HidHelperOperation"
-_HELPER_OPERATION_LOCK_TIMEOUT_SECONDS = 110.0
+_HELPER_MAINTENANCE_LOCK_TIMEOUT_SECONDS = 110.0
+_HELPER_INJECT_LOCK_TIMEOUT_SECONDS = 2.0
+_REGISTERED_TASK_COMPLETION_TIMEOUT_SECONDS = 30.0
+_REGISTERED_TASK_POLL_SECONDS = 0.05
+_ELEVATED_PROCESS_TERMINATION_WAIT_MS = 10_000
 
 MANIFEST_SCHEMA_VERSION = 1
 HELPER_PROTOCOL_VERSION = 1
-# Generation 4 is the first build whose frozen helper carries VERSION and
-# validates all lazy operation-lock imports. Older portable copies must never
-# be able to replace it with their generation-3 binary.
-HELPER_GENERATION = 4
-TASK_CONTRACT_VERSION = 2
+# Generation 5 adds thread-safe Task Scheduler COM use and bounded injection
+# lock behavior. Older portable copies must never replace this helper.
+HELPER_GENERATION = 5
+TASK_CONTRACT_VERSION = 3
 MANIFEST_FILENAME = "helper-manifest.json"
 
 TASK_CREATE_OR_UPDATE = 0x6
@@ -66,6 +70,7 @@ HELPER_EXIT_REQUIRES_ADMIN = 3
 HELPER_EXIT_VALIDATION_FAILED = 4
 HELPER_EXIT_UNEXPECTED_FAILURE = 5
 HELPER_EXIT_NEWER_PRESERVED = 6
+HELPER_EXIT_OPERATION_BUSY = 7
 
 _NEWER_HELPER_DETAILS = frozenset(
     {
@@ -230,14 +235,27 @@ def _token_information(information_class: int) -> bytes:
         kernel32.CloseHandle(token)
 
 
-def is_process_elevated() -> bool:
+def query_process_elevated() -> bool:
+    """Return the current token state or fail when it cannot be proven."""
+
     if not _is_windows():
         return False
     try:
         raw = _token_information(_TOKEN_ELEVATION_INFORMATION)
         elevation = _TOKEN_ELEVATION.from_buffer_copy(raw)
         return bool(elevation.TokenIsElevated)
-    except (HidElevationError, OSError, ValueError):
+    except HidElevationError:
+        raise
+    except (OSError, ValueError) as exc:
+        raise HidElevationError(
+            "current_user_elevation_status_unavailable"
+        ) from exc
+
+
+def is_process_elevated() -> bool:
+    try:
+        return query_process_elevated()
+    except HidElevationError:
         return False
 
 
@@ -1002,11 +1020,15 @@ def validate_registered_task_xml(
         return False
     actions_nodes = root.findall("./t:Actions", namespace)
     exec_nodes = root.findall("./t:Actions/t:Exec", namespace)
+    registration_nodes = root.findall("./t:RegistrationInfo", namespace)
+    settings_nodes = root.findall("./t:Settings", namespace)
     principal_containers = root.findall("./t:Principals", namespace)
     principal_nodes = root.findall("./t:Principals/t:Principal", namespace)
     if (
         len(actions_nodes) != 1
         or len(exec_nodes) != 1
+        or len(registration_nodes) != 1
+        or len(settings_nodes) != 1
         or len(list(actions_nodes[0])) != 1
         or len(principal_containers) != 1
         or len(principal_nodes) != 1
@@ -1037,14 +1059,6 @@ def validate_registered_task_xml(
     principal = _task_xml_value(root, ".//t:Principals/t:Principal/t:UserId")
     run_level = _task_xml_value(root, ".//t:Principals/t:Principal/t:RunLevel")
     logon_type = _task_xml_value(root, ".//t:Principals/t:Principal/t:LogonType")
-    allow_demand = _task_xml_value(root, ".//t:Settings/t:AllowStartOnDemand")
-    enabled = _task_xml_value(root, ".//t:Settings/t:Enabled")
-    multiple_instances = _task_xml_value(
-        root, ".//t:Settings/t:MultipleInstancesPolicy"
-    )
-    execution_limit = _task_xml_value(
-        root, ".//t:Settings/t:ExecutionTimeLimit"
-    )
     task_uri = _task_xml_value(root, ".//t:RegistrationInfo/t:URI")
     try:
         sid = canonical_user_sid(user_sid)
@@ -1052,6 +1066,27 @@ def validate_registered_task_xml(
         return False
     expected_task_name = task_name or task_name_for_sid(sid)
     expected = _lexical_absolute(Path(helper_path))
+    expected_settings = {
+        "MultipleInstancesPolicy": "IgnoreNew",
+        "DisallowStartIfOnBatteries": "false",
+        "StopIfGoingOnBatteries": "false",
+        "AllowHardTerminate": "true",
+        "StartWhenAvailable": "false",
+        "RunOnlyIfNetworkAvailable": "false",
+        "AllowStartOnDemand": "true",
+        "Enabled": "true",
+        "Hidden": "true",
+        "RunOnlyIfIdle": "false",
+        "WakeToRun": "false",
+        "ExecutionTimeLimit": TASK_EXECUTION_LIMIT,
+        "Priority": "7",
+    }
+    settings_valid = all(
+        len(root.findall(f"./t:Settings/t:{name}", namespace)) == 1
+        and _task_xml_value(root, f"./t:Settings/t:{name}").casefold()
+        == expected.casefold()
+        for name, expected in expected_settings.items()
+    )
     return (
         os.path.normcase(command) == os.path.normcase(str(expected))
         and arguments == INJECT_FLAG
@@ -1060,10 +1095,7 @@ def validate_registered_task_xml(
         and principal.casefold() == sid.casefold()
         and run_level == "HighestAvailable"
         and logon_type == "InteractiveToken"
-        and allow_demand.casefold() == "true"
-        and enabled.casefold() == "true"
-        and multiple_instances == "IgnoreNew"
-        and execution_limit == TASK_EXECUTION_LIMIT
+        and settings_valid
         and task_uri == expected_task_name
     )
 
@@ -1146,6 +1178,52 @@ def _task_service_root() -> object:
         raise HidElevationError("hid_helper_task_service_unavailable") from exc
 
 
+def _hresult_code(exc: BaseException) -> Optional[int]:
+    raw = getattr(exc, "hresult", None)
+    if raw is None and getattr(exc, "args", None):
+        candidate = exc.args[0]
+        raw = candidate if isinstance(candidate, int) else None
+    if raw is None:
+        return None
+    return int(raw) & 0xFFFFFFFF
+
+
+@contextmanager
+def _task_service_session(_root: Optional[object] = None):
+    """Use Task Scheduler from any thread with balanced COM initialization."""
+
+    if _root is not None:
+        yield _root
+        return
+    if not _is_windows():
+        raise HidElevationError("windows_only")
+
+    try:
+        import comtypes
+    except Exception as exc:
+        raise HidElevationError("hid_helper_task_service_unavailable") from exc
+
+    initialized = False
+    try:
+        try:
+            comtypes.CoInitialize()
+            initialized = True
+        except OSError as exc:
+            # The thread may already use the other COM apartment. It is still
+            # initialized and usable; only the matching owner may uninitialize it.
+            if _hresult_code(exc) != 0x80010106:  # RPC_E_CHANGED_MODE
+                raise HidElevationError(
+                    "hid_helper_task_service_unavailable"
+                ) from exc
+        yield _task_service_root()
+    finally:
+        if initialized:
+            try:
+                comtypes.CoUninitialize()
+            except Exception:
+                pass
+
+
 def _task_missing_error(exc: BaseException) -> bool:
     raw = getattr(exc, "hresult", None)
     if raw is None and getattr(exc, "args", None):
@@ -1208,18 +1286,20 @@ def _read_registered_task(
     *,
     _root: Optional[object] = None,
 ) -> Optional[_RegisteredTaskSnapshot]:
-    root = _root or _task_service_root()
     try:
-        task = _find_registered_task(root, task_name)
-        if task is None:
-            return None
-        return _RegisteredTaskSnapshot(
-            xml_text=str(task.Xml),
-            security_sddl=str(
-                task.GetSecurityDescriptor(TASK_SECURITY_INFORMATION)
-            ),
-        )
+        with _task_service_session(_root) as root:
+            task = _find_registered_task(root, task_name)
+            if task is None:
+                return None
+            return _RegisteredTaskSnapshot(
+                xml_text=str(task.Xml),
+                security_sddl=str(
+                    task.GetSecurityDescriptor(TASK_SECURITY_INFORMATION)
+                ),
+            )
     except Exception as exc:
+        if isinstance(exc, HidElevationError):
+            raise
         if _task_missing_error(exc):
             return None
         raise HidElevationError("hid_helper_task_query_failed") from exc
@@ -1232,18 +1312,20 @@ def _register_task(
     *,
     _root: Optional[object] = None,
 ) -> None:
-    root = _root or _task_service_root()
     try:
-        root.RegisterTask(
-            str(task_name),
-            str(xml_text),
-            TASK_CREATE_OR_UPDATE | TASK_DONT_ADD_PRINCIPAL_ACE,
-            None,
-            None,
-            TASK_LOGON_INTERACTIVE_TOKEN,
-            str(security_sddl),
-        )
+        with _task_service_session(_root) as root:
+            root.RegisterTask(
+                str(task_name),
+                str(xml_text),
+                TASK_CREATE_OR_UPDATE | TASK_DONT_ADD_PRINCIPAL_ACE,
+                None,
+                None,
+                TASK_LOGON_INTERACTIVE_TOKEN,
+                str(security_sddl),
+            )
     except Exception as exc:
+        if isinstance(exc, HidElevationError):
+            raise
         raise HidElevationError("hid_helper_task_registration_failed") from exc
 
 
@@ -1253,16 +1335,16 @@ def _delete_task(
     missing_ok: bool,
     _root: Optional[object] = None,
 ) -> None:
-    root = _root or _task_service_root()
     try:
-        folder, leaf_name = _find_task_folder(root, task_name)
-        if folder is None:
-            if missing_ok:
+        with _task_service_session(_root) as root:
+            folder, leaf_name = _find_task_folder(root, task_name)
+            if folder is None:
+                if missing_ok:
+                    return
+                raise HidElevationError("hid_helper_task_removal_failed")
+            if missing_ok and _find_registered_task(root, task_name) is None:
                 return
-            raise HidElevationError("hid_helper_task_removal_failed")
-        if missing_ok and _find_registered_task(root, task_name) is None:
-            return
-        folder.DeleteTask(leaf_name, 0)
+            folder.DeleteTask(leaf_name, 0)
     except Exception as exc:
         if isinstance(exc, HidElevationError):
             raise
@@ -1297,23 +1379,31 @@ def _cleanup_legacy_contract_for_user(
     """Remove only the fixed legacy task owned by this Windows account."""
 
     sid = canonical_user_sid(user_sid)
+    snapshot = _read_registered_task(LEGACY_TASK_NAME)
+    if snapshot is not None:
+        try:
+            owner_sid = _registered_task_principal_sid(snapshot.xml_text)
+        except HidElevationError as exc:
+            raise HidElevationError(
+                "legacy_hid_helper_task_owner_unknown"
+            ) from exc
+        if owner_sid != sid:
+            return False
+
     target = legacy_protected_helper_path(program_files_root=trusted_root)
     assert_no_reparse_points(target, trusted_root=trusted_root)
     if target.exists():
         if not target.is_file():
             raise HidElevationError("legacy_protected_helper_invalid")
 
-    snapshot = _read_registered_task(LEGACY_TASK_NAME)
+    snapshot_contract_valid = False
     if snapshot is not None:
-        if _registered_task_principal_sid(snapshot.xml_text) != sid:
-            return False
-        if not validate_registered_task_xml(
+        snapshot_contract_valid = validate_registered_task_xml(
             snapshot.xml_text,
             helper_path=target,
             user_sid=sid,
             task_name=LEGACY_TASK_NAME,
-        ):
-            raise HidElevationError("legacy_hid_helper_task_invalid")
+        )
         _delete_task(LEGACY_TASK_NAME, missing_ok=False)
         if _read_registered_task(LEGACY_TASK_NAME) is not None:
             raise HidElevationError("legacy_hid_helper_task_removal_failed")
@@ -1322,7 +1412,7 @@ def _cleanup_legacy_contract_for_user(
         if target.exists():
             target.unlink()
     except OSError as exc:
-        if snapshot is not None:
+        if snapshot is not None and snapshot_contract_valid:
             try:
                 _restore_registered_task(LEGACY_TASK_NAME, snapshot)
             except Exception as rollback_exc:
@@ -1340,12 +1430,24 @@ def _cleanup_legacy_contract_for_user(
 
 
 def _run_task(task_name: str, *, _root: Optional[object] = None) -> None:
-    root = _root or _task_service_root()
     try:
-        task = _find_registered_task(root, task_name)
-        if task is None:
-            raise HidElevationError("hid_helper_task_start_failed")
-        task.Run("")
+        with _task_service_session(_root) as root:
+            task = _find_registered_task(root, task_name)
+            if task is None:
+                raise HidElevationError("hid_helper_task_start_failed")
+            running = task.Run("")
+            if not hasattr(running, "State"):
+                raise HidElevationError("hid_helper_task_result_unavailable")
+            deadline = time.monotonic() + _REGISTERED_TASK_COMPLETION_TIMEOUT_SECONDS
+            while int(running.State) in {2, 4}:  # queued or running
+                if time.monotonic() >= deadline:
+                    raise HidElevationError("hid_helper_task_timeout")
+                time.sleep(_REGISTERED_TASK_POLL_SECONDS)
+            exit_code = int(task.LastTaskResult)
+            if exit_code == HELPER_EXIT_OPERATION_BUSY:
+                raise HidElevationError("hid_helper_operation_busy")
+            if exit_code != HELPER_EXIT_OK:
+                raise HidElevationError(f"hid_helper_task_exit_{exit_code}")
     except Exception as exc:
         if isinstance(exc, HidElevationError):
             raise
@@ -1425,19 +1527,22 @@ def _installation_requires_elevated_removal(
     if _read_task(task_name_for_sid(sid)) is not None:
         return True
     legacy = _read_task(LEGACY_TASK_NAME)
-    if (
-        legacy is not None
-        and _registered_task_principal_sid(legacy.xml_text) == sid
-    ):
-        return True
-    legacy_target = legacy_protected_helper_path(
-        program_files_root=program_files_root
-    )
-    try:
-        if os.path.lexists(legacy_target):
+    if legacy is not None:
+        try:
+            legacy_sid = _registered_task_principal_sid(legacy.xml_text)
+        except HidElevationError:
             return True
-    except OSError:
-        return True
+        if legacy_sid == sid:
+            return True
+    else:
+        legacy_target = legacy_protected_helper_path(
+            program_files_root=program_files_root
+        )
+        try:
+            if os.path.lexists(legacy_target):
+                return True
+        except OSError:
+            return True
     root = protected_owner_root(sid, program_files_root=program_files_root)
     try:
         generations = root / "generations"
@@ -1620,19 +1725,17 @@ def inspect_installed_helper(
                 legacy_target = legacy_protected_helper_path(
                     program_files_root=trusted_root
                 )
-                legacy_owned = (
-                    legacy is not None
-                    and _registered_task_principal_sid(legacy.xml_text) == sid
-                    and validate_registered_task_xml(
-                        legacy.xml_text,
-                        helper_path=legacy_target,
-                        user_sid=sid,
-                        task_name=LEGACY_TASK_NAME,
-                    )
-                )
-                if legacy_owned or (
-                    legacy is None and os.path.lexists(legacy_target)
-                ):
+                legacy_cleanup_pending = False
+                if legacy is not None:
+                    try:
+                        legacy_cleanup_pending = (
+                            _registered_task_principal_sid(legacy.xml_text) == sid
+                        )
+                    except HidElevationError:
+                        legacy_cleanup_pending = True
+                elif os.path.lexists(legacy_target):
+                    legacy_cleanup_pending = True
+                if legacy_cleanup_pending:
                     return HidHelperState(True, "helper_cleanup_pending")
             except (HidElevationError, OSError):
                 # The active contract is already fully verified. Stale cleanup
@@ -2238,6 +2341,8 @@ def _run_elevated_and_wait(
         ctypes.POINTER(wintypes.DWORD),
     )
     kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+    kernel32.TerminateProcess.argtypes = (wintypes.HANDLE, wintypes.UINT)
+    kernel32.TerminateProcess.restype = wintypes.BOOL
     kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
     kernel32.CloseHandle.restype = wintypes.BOOL
 
@@ -2261,6 +2366,25 @@ def _run_elevated_and_wait(
         timeout_ms = max(1, min(0xFFFFFFFE, int(float(timeout_seconds) * 1000)))
         wait_result = int(kernel32.WaitForSingleObject(info.hProcess, timeout_ms))
         if wait_result == 0x00000102:
+            # Never return while the elevated helper can still alter the task
+            # later. Terminate it, then wait until Windows confirms final exit.
+            terminated = bool(kernel32.TerminateProcess(
+                info.hProcess,
+                HELPER_EXIT_UNEXPECTED_FAILURE,
+            ))
+            termination_wait = int(
+                kernel32.WaitForSingleObject(
+                    info.hProcess,
+                    _ELEVATED_PROCESS_TERMINATION_WAIT_MS,
+                )
+            )
+            if termination_wait != 0:
+                detail = (
+                    "hid_helper_setup_terminate_wait_failed"
+                    if terminated
+                    else "hid_helper_setup_terminate_failed"
+                )
+                raise HidElevationError(detail)
             raise HidElevationError("hid_helper_setup_timeout")
         if wait_result != 0:
             raise HidElevationError("hid_helper_setup_wait_failed")
@@ -2305,6 +2429,12 @@ def request_install_elevation(
         )
         exit_code = _launch(source, arguments, timeout_seconds)
     except HidElevationError as exc:
+        try:
+            final_state = _inspect()
+        except Exception:
+            final_state = HidHelperState(False, "hid_helper_inspection_failed")
+        if final_state.available:
+            return final_state
         if str(exc) == "uac_cancelled" and current_state.available:
             return current_state
         return HidHelperState(False, str(exc))
@@ -2341,11 +2471,18 @@ def request_uninstall_elevation(
 ) -> HidHelperState:
     if not _is_windows():
         return HidHelperState(False, "windows_only")
+    sid: Optional[str] = None
     try:
         sid = canonical_user_sid(_current_sid())
         if not _requires_removal(sid):
             return HidHelperState(True)
     except HidElevationError as exc:
+        if sid is not None:
+            try:
+                if not _requires_removal(sid):
+                    return HidHelperState(True)
+            except (HidElevationError, OSError, ValueError):
+                pass
         return HidHelperState(False, str(exc))
     except (OSError, ValueError):
         return HidHelperState(False, "hid_helper_inspection_failed")
@@ -2431,12 +2568,16 @@ def _self_check() -> None:
         raise HidElevationError("frida_gadget_archive_hash_mismatch")
 
 
-def _run_serialized_helper_operation(operation: Callable[[], None]) -> None:
+def _run_serialized_helper_operation(
+    operation: Callable[[], None],
+    *,
+    lock_timeout_seconds: float,
+) -> None:
     """Keep elevated helper work serialized even if its parent exits."""
 
     from . import single_instance
 
-    deadline = time.monotonic() + _HELPER_OPERATION_LOCK_TIMEOUT_SECONDS
+    deadline = time.monotonic() + max(0.0, float(lock_timeout_seconds))
     guard: single_instance.BridgeInstanceGuard | None = None
     while guard is None:
         candidate = single_instance.BridgeInstanceGuard(
@@ -2472,16 +2613,21 @@ def helper_main(argv: Optional[Sequence[str]] = None) -> int:
         args = parser.parse_args(list(argv) if argv is not None else None)
         if getattr(args, INSTALL_FLAG[2:].replace("-", "_")):
             _run_serialized_helper_operation(
-                lambda: install_task(request_sid=args.request_sid)
+                lambda: install_task(request_sid=args.request_sid),
+                lock_timeout_seconds=_HELPER_MAINTENANCE_LOCK_TIMEOUT_SECONDS,
             )
         elif getattr(args, UNINSTALL_FLAG[2:].replace("-", "_")):
             _run_serialized_helper_operation(
-                lambda: uninstall_task(request_sid=args.request_sid)
+                lambda: uninstall_task(request_sid=args.request_sid),
+                lock_timeout_seconds=_HELPER_MAINTENANCE_LOCK_TIMEOUT_SECONDS,
             )
         elif getattr(args, INJECT_FLAG[2:].replace("-", "_")):
             if args.request_sid is not None:
                 raise HidElevationError("unexpected_request_sid")
-            _run_serialized_helper_operation(_inject_once)
+            _run_serialized_helper_operation(
+                _inject_once,
+                lock_timeout_seconds=_HELPER_INJECT_LOCK_TIMEOUT_SECONDS,
+            )
         else:
             if args.request_sid is not None:
                 raise HidElevationError("unexpected_request_sid")
@@ -2492,6 +2638,8 @@ def helper_main(argv: Optional[Sequence[str]] = None) -> int:
     except HidElevationError as exc:
         if str(exc) == "newer_helper_preserved":
             return HELPER_EXIT_NEWER_PRESERVED
+        if str(exc) == "hid_helper_operation_busy":
+            return HELPER_EXIT_OPERATION_BUSY
         return HELPER_EXIT_VALIDATION_FAILED
     except (OSError, RuntimeError, ValueError):
         return HELPER_EXIT_VALIDATION_FAILED

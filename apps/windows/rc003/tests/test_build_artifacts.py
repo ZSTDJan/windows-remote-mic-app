@@ -429,6 +429,32 @@ class InnoSetupScriptTests(unittest.TestCase):
     def test_privileges_required_is_lowest(self):
         self.assertIn("PrivilegesRequired=lowest", self.text)
 
+    def test_install_and_uninstall_reject_an_elevated_outer_process(self):
+        code_section = _iss_section(self.text, "Code")
+        setup = code_section.split(
+            "function InitializeSetup(): Boolean;", 1
+        )[1].split("procedure DeinitializeSetup", 1)[0]
+        uninstall = code_section.split(
+            "function InitializeUninstall(): Boolean;", 1
+        )[1].split("procedure DeinitializeUninstall", 1)[0]
+
+        for branch in (setup, uninstall):
+            self.assertIn("if ShellIsUserAnAdmin() then", branch)
+            self.assertIn("Result := False", branch)
+        self.assertIn("不能以管理员身份运行卸载程序", uninstall)
+
+    def test_installer_maintenance_mutex_is_visible_across_sessions(self):
+        code_section = _iss_section(self.text, "Code")
+        self.assertIn(
+            "InstallerMaintenanceMutexName = "
+            "'Global\\RemoteMicRC003_InstallerMaintenance'",
+            code_section,
+        )
+        self.assertIn(
+            "CreateMutex(\n    0,\n    False,\n    InstallerMaintenanceMutexName",
+            code_section,
+        )
+
     def test_installer_delegates_hid_maintenance_to_the_normal_application(self):
         code_section = _iss_section(self.text, "Code")
         self.assertIn("ShellExec(", code_section)
@@ -450,20 +476,19 @@ class InnoSetupScriptTests(unittest.TestCase):
 
     def test_installer_hides_the_internal_helper_and_removes_the_old_root_copy(self):
         code_section = _iss_section(self.text, "Code")
-        install_delete = _strip_semicolon_comments(
-            _iss_section(self.text, "InstallDelete")
-        )
         self.assertIn("ExpandConstant('{app}\\{#AppExeName}')", code_section)
         self.assertIn(
-            'Type: files; Name: "{app}\\{#HidHelperExeName}"',
-            install_delete,
+            "UpgradeLegacyHelperPath := ExpandConstant('{app}\\{#HidHelperExeName}')",
+            code_section,
         )
+        self.assertIn("UpgradeHeldLegacyHelperPath", code_section)
+        self.assertNotIn("[InstallDelete]", self.text)
 
     def test_install_failure_keeps_a_concise_in_app_retry_path(self):
         code_section = _iss_section(self.text, "Code")
         self.assertIn("CurStepChanged", code_section)
         self.assertIn("ssPostInstall", code_section)
-        self.assertIn("方向改键未启用", code_section)
+        self.assertIn("管理员按键组件未启用", code_section)
         self.assertIn("启用改键", code_section)
         self.assertIn("WizardForm.FinishedLabel.Caption", code_section)
 
@@ -484,7 +509,7 @@ class InnoSetupScriptTests(unittest.TestCase):
         )[1].split("procedure CurUninstallStepChanged", 1)[0]
         self.assertIn("RunApplicationMaintenance('--uninstall-hid-helper'", initialize)
         self.assertIn("Result := False", initialize)
-        self.assertIn("方向改键权限未能移除", initialize)
+        self.assertIn("管理员按键组件未能移除", initialize)
 
     def test_no_autostart_shortcut_or_task(self):
         self.assertNotIn("userstartup", self.effective_text.lower())
@@ -543,40 +568,436 @@ class InnoSetupScriptTests(unittest.TestCase):
 
     def test_upgrade_aborts_when_the_old_process_cannot_be_confirmed_stopped(self):
         code_section = _iss_section(self.text, "Code")
-        self.assertIn("Started := RunStopApplication(StopScript, False", code_section)
-        self.assertIn("if not Started then", code_section)
-        self.assertIn("if ResultCode <> 0 then", code_section)
-        self.assertIn("安装没有覆盖任何程序文件", code_section)
-        self.assertIn("旧版设置窗口仍在运行", code_section)
-        self.assertIn("从通知区域选择“完全退出”", code_section)
+        stop_helper = code_section.split(
+            "function StopApplicationForInstall(const StopScript: String;", 1
+        )[1].split("function RunApplicationMaintenance", 1)[0]
+        prepare = code_section.split(
+            "function PrepareToInstall(var NeedsRestart: Boolean): String;", 1
+        )[1].split("procedure CurStepChanged", 1)[0]
 
-    def test_upgrade_requests_uac_only_for_the_dedicated_elevation_exit_code(self):
+        self.assertIn("Started := RunStopApplication(StopScript, False", stop_helper)
+        self.assertIn("if not Started then", stop_helper)
+        self.assertIn("if ResultCode = 0 then", stop_helper)
+        self.assertIn("Result := False", stop_helper)
+        self.assertEqual(prepare.count("if not StopApplicationForInstall"), 2)
+        self.assertIn("安装没有覆盖任何程序文件", code_section)
+        self.assertIn("旧版仍需您确认退出", code_section)
+        self.assertIn("请处理旧版窗口并完全退出后重试", code_section)
+
+    def test_upgrade_quarantines_and_recovers_the_complete_old_runtime(self):
         code_section = _iss_section(self.text, "Code")
         prepare = code_section.split(
             "function PrepareToInstall(var NeedsRestart: Boolean): String;", 1
         )[1].split("procedure CurStepChanged", 1)[0]
-        normal_call = prepare.index(
+        post_install = code_section.split(
+            "procedure CurStepChanged(CurStep: TSetupStep);", 1
+        )[1].split("procedure CurPageChanged", 1)[0]
+
+        self.assertIn("QuarantineExistingApplication", prepare)
+        self.assertIn(
+            "RenameFile(UpgradeApplicationPath, UpgradeHeldApplicationPath)",
+            code_section,
+        )
+        self.assertIn(
+            "RenameFile(UpgradeInternalPath, UpgradeHeldInternalPath)",
+            code_section,
+        )
+        self.assertIn("RestoreHeldRuntime", code_section)
+        self.assertIn("RecoverUpgradeRuntimeQuarantine", code_section)
+        first_stop = prepare.index("if not StopApplicationForInstall")
+        quarantine = prepare.index("if not QuarantineExistingApplication")
+        second_stop = prepare.index("if not StopApplicationForInstall", first_stop + 1)
+        self.assertLess(
+            first_stop,
+            second_stop,
+        )
+        self.assertLess(second_stop, quarantine)
+        self.assertNotIn("RecoverUpgradeRuntimeQuarantine", prepare[:quarantine])
+        self.assertIn("ValidateInstalledApplication", post_install)
+        self.assertIn("CommitUpgradeRuntimeQuarantine", post_install)
+        self.assertIn("InstallFilesCompleted := True", post_install)
+
+    def test_committed_upgrade_is_only_cleaned_and_never_rolled_back(self):
+        code_section = _iss_section(self.text, "Code")
+        normalize = code_section.split(
+            "function NormalizePreviousUpgradeRuntime", 1
+        )[1].split("function QuarantineExistingApplication", 1)[0]
+        committed = normalize.split(
+            "if RuntimeState = UpgradeStateCommitted then", 1
+        )[1].split(
+            "if RuntimeState = UpgradeStateRestoring then",
+            1,
+        )[0]
+        recover = code_section.split(
+            "function RecoverUpgradeRuntimeQuarantine", 1
+        )[1].split("procedure DeleteObsoleteShortcuts", 1)[0]
+        recover_committed = recover.split(
+            "if RuntimeState = UpgradeStateCommitted then", 1
+        )[1].split("if not DirExists(UpgradeRuntimeHoldPath) then", 1)[0]
+
+        self.assertIn("DeleteDirectoryWithRetries(UpgradeRuntimeHoldPath)", committed)
+        self.assertIn("DeleteUpgradeRuntimeStateAfterCleanup", committed)
+        self.assertNotIn("RestoreHeldRuntime", committed)
+        self.assertIn("FinishUpgradeRuntimeQuarantine", recover_committed)
+        self.assertNotIn("RestoreHeldRuntime", recover_committed)
+
+    def test_unknown_upgrade_state_repairs_only_from_verified_runtime_evidence(self):
+        code_section = _iss_section(self.text, "Code")
+        normalize = code_section.split(
+            "function NormalizePreviousUpgradeRuntime", 1
+        )[1].split("function QuarantineExistingApplication", 1)[0]
+        unknown_normalize = normalize.split(
+            "if UpgradeRuntimeQuarantined then", 1
+        )[1].split(
+            "Result := DeleteDirectoryWithRetries(UpgradeRuntimeHoldPath)", 1
+        )[0]
+        recover = code_section.split(
+            "function RecoverUpgradeRuntimeQuarantine", 1
+        )[1].split("procedure DeleteObsoleteShortcuts", 1)[0]
+        exact_recovery = recover.split(
+            "if RuntimeState = UpgradeStatePreparing then", 1
+        )[1]
+
+        current_validation = unknown_normalize.index(
+            "ValidateInstalledApplication(ValidationError)"
+        )
+        committed_state = unknown_normalize.index(
+            "WriteUpgradeRuntimeState(UpgradeStateCommitted)"
+        )
+        held_complete = unknown_normalize.index("if HeldRuntimeIsComplete() then")
+        restore = unknown_normalize.index("RestoreHeldRuntime(True)")
+        preserve = unknown_normalize.index("Result := False", restore)
+        self.assertLess(current_validation, committed_state)
+        self.assertLess(committed_state, held_complete)
+        self.assertLess(held_complete, restore)
+        self.assertLess(restore, preserve)
+        self.assertIn("本次未改动文件", unknown_normalize)
+        self.assertIn("RuntimeState = UpgradeStateQuarantined", exact_recovery)
+        self.assertIn("else\n    Result := False", exact_recovery)
+
+    def test_full_restore_checks_the_backup_before_deleting_the_current_runtime(self):
+        code_section = _iss_section(self.text, "Code")
+        restore = code_section.split(
+            "function RestoreHeldRuntime(RemoveAllCurrent: Boolean): Boolean;", 1
+        )[1].split("function ValidateInstalledApplication", 1)[0]
+
+        complete_check = restore.index(
+            "if not HeldRuntimeIsComplete() then"
+        )
+        delete_current = restore.index(
+            "if not RemoveCurrentRuntimePayload() then"
+        )
+        self.assertLess(complete_check, delete_current)
+        self.assertIn("current runtime was preserved", restore)
+
+    def test_full_restore_is_resumable_after_only_one_old_component_moves_back(self):
+        code_section = _iss_section(self.text, "Code")
+        restore = code_section.split(
+            "function RestoreHeldRuntime(RemoveAllCurrent: Boolean): Boolean;", 1
+        )[1].split("function ValidateInstalledApplication", 1)[0]
+        normalize = code_section.split(
+            "function NormalizePreviousUpgradeRuntime", 1
+        )[1].split("function QuarantineExistingApplication", 1)[0]
+        recover = code_section.split(
+            "function RecoverUpgradeRuntimeQuarantine", 1
+        )[1].split("procedure DeleteObsoleteShortcuts", 1)[0]
+
+        self.assertIn("UpgradeStateRestorePending = 'restore-pending'", code_section)
+        self.assertIn("UpgradeStateRestoring = 'restoring'", code_section)
+        self.assertIn("RuntimeState <> UpgradeStateRestorePending", restore)
+        self.assertIn("RestoringRuntimeIsComplete()", restore)
+        self.assertLess(
+            restore.index("WriteUpgradeRuntimeState(UpgradeStateRestorePending)"),
+            restore.index("RemoveCurrentRuntimePayload()"),
+        )
+        self.assertLess(
+            restore.index("RemoveCurrentRuntimePayload()"),
+            restore.index("WriteUpgradeRuntimeState(UpgradeStateRestoring)"),
+        )
+        self.assertIn("if DirExists(UpgradeHeldInternalPath) then", restore)
+        self.assertIn("if FileExists(UpgradeHeldApplicationPath) then", restore)
+        self.assertIn("RuntimeState = UpgradeStateRestorePending", normalize)
+        self.assertIn("RuntimeState = UpgradeStateRestoring", normalize)
+        self.assertIn("RuntimeState = UpgradeStateRestorePending", recover)
+        self.assertIn("RuntimeState = UpgradeStateRestoring", recover)
+
+    def test_missing_old_backup_cannot_be_reported_as_a_successful_full_restore(self):
+        code_section = _iss_section(self.text, "Code")
+        restore = code_section.split(
+            "function RestoreHeldRuntime(RemoveAllCurrent: Boolean): Boolean;", 1
+        )[1].split("function ValidateInstalledApplication", 1)[0]
+        missing_backup = restore.split(
+            "if not DirExists(UpgradeRuntimeHoldPath) then", 1
+        )[1].split("if RemoveAllCurrent and", 1)[0]
+
+        self.assertIn("if RemoveAllCurrent then", missing_backup)
+        self.assertIn("RuntimeState = UpgradeStateRestoring", missing_backup)
+        self.assertIn("RuntimeState = UpgradeStatePreparing", missing_backup)
+        self.assertIn("CurrentRuntimeIsComplete()", missing_backup)
+        self.assertNotIn("Result := True", missing_backup)
+
+    def test_missing_backup_state_is_not_unconditionally_normalized(self):
+        code_section = _iss_section(self.text, "Code")
+        normalize = code_section.split(
+            "function NormalizePreviousUpgradeRuntime", 1
+        )[1].split("function QuarantineExistingApplication", 1)[0]
+        missing_backup = normalize.split(
+            "if not DirExists(UpgradeRuntimeHoldPath) then", 1
+        )[1].split("UpgradeRuntimeQuarantined := HeldRuntimeExists()", 1)[0]
+
+        self.assertIn("RuntimeState := ReadUpgradeRuntimeState()", normalize)
+        self.assertIn("RuntimeState = UpgradeStateCommitted", missing_backup)
+        self.assertIn("RuntimeState = UpgradeStatePreparing", missing_backup)
+        self.assertIn("RuntimeState = UpgradeStateRestoring", missing_backup)
+        self.assertIn("CurrentRuntimeIsComplete()", missing_backup)
+        self.assertIn("Result := False", missing_backup)
+        self.assertNotIn("RuntimeState = UpgradeStateQuarantined", missing_backup)
+
+    def test_empty_backup_directory_cannot_hide_an_incomplete_recovery(self):
+        code_section = _iss_section(self.text, "Code")
+        recover = code_section.split(
+            "function RecoverUpgradeRuntimeQuarantine", 1
+        )[1].split("procedure DeleteObsoleteShortcuts", 1)[0]
+        empty_backup = recover.split(
+            "if not UpgradeRuntimeQuarantined then", 1
+        )[1].split("if (RuntimeState = UpgradeStateRestorePending)", 1)[0]
+
+        self.assertIn("RuntimeState = UpgradeStatePreparing", empty_backup)
+        self.assertIn("RuntimeState = UpgradeStateRestoring", empty_backup)
+        self.assertIn("CurrentRuntimeIsComplete()", empty_backup)
+        self.assertIn("DeleteDirectoryWithRetries(UpgradeRuntimeHoldPath)", empty_backup)
+        self.assertNotIn("RuntimeState = UpgradeStateRestorePending", empty_backup)
+        self.assertNotIn("RuntimeState = UpgradeStateQuarantined", empty_backup)
+
+    def test_validation_failure_restores_known_backup_before_any_recovery_reread(self):
+        code_section = _iss_section(self.text, "Code")
+        failure = code_section.split(
+            "procedure RecordInstallValidationFailure", 1
+        )[1].split("procedure CurStepChanged", 1)[0]
+
+        previous_branch = failure.split("if InstallHadPreviousRuntime then", 1)[1].split(
+            "else", 1
+        )[0]
+        fresh_install_branch = failure.split("else", 1)[1]
+        self.assertIn("RestoreHeldRuntime(True)", previous_branch)
+        self.assertNotIn("RemoveCurrentRuntimePayload", previous_branch)
+        self.assertNotIn("RecoverUpgradeRuntimeQuarantine", previous_branch)
+        self.assertIn("RemoveCurrentRuntimePayload", fresh_install_branch)
+
+    def test_failed_recovery_keeps_runtime_barriers_until_setup_deinitializes(self):
+        code_section = _iss_section(self.text, "Code")
+        post_install = code_section.split(
+            "procedure CurStepChanged(CurStep: TSetupStep);", 1
+        )[1].split("procedure CurPageChanged", 1)[0]
+        deinitialize = code_section.split(
+            "procedure DeinitializeSetup();", 1
+        )[1].split("function RunStopApplication", 1)[0]
+
+        self.assertIn(
+            "if (not InstallValidationFailed) or InstallRecoverySucceeded then",
+            post_install,
+        )
+        self.assertIn("ReleaseLegacyRuntimeBarriers", deinitialize)
+        self.assertIn("ReleaseInstallerMaintenanceMutex", deinitialize)
+
+    def test_setup_deinitialization_only_repairs_files_after_mutation_started(self):
+        code_section = _iss_section(self.text, "Code")
+        prepare = code_section.split(
+            "function PrepareToInstall(var NeedsRestart: Boolean): String;", 1
+        )[1].split("procedure RecordInstallValidationFailure", 1)[0]
+        deinitialize = code_section.split(
+            "procedure DeinitializeSetup();", 1
+        )[1].split("function RunStopApplication", 1)[0]
+
+        mutation = prepare.index("UpgradeRuntimeMutationStarted := True")
+        quarantine = prepare.index("if not QuarantineExistingApplication")
+        second_stop = prepare.index(
+            "if not StopApplicationForInstall",
+            prepare.index("if not StopApplicationForInstall") + 1,
+        )
+        self.assertLess(second_stop, mutation)
+        self.assertLess(mutation, quarantine)
+        self.assertIn("if UpgradeRuntimeMutationStarted then", deinitialize)
+        self.assertNotIn("RecoverUpgradeRuntimeQuarantine", deinitialize.split(
+            "if UpgradeRuntimeMutationStarted then", 1
+        )[0])
+
+    def test_upgrade_state_is_outside_the_backup_and_removed_only_after_cleanup(self):
+        code_section = _iss_section(self.text, "Code")
+        paths = code_section.split("procedure InitializeUpgradeRuntimePaths", 1)[1].split(
+            "function CurrentRuntimeExists", 1
+        )[0]
+        cleanup = code_section.split(
+            "function DeleteUpgradeRuntimeStateAfterCleanup", 1
+        )[1].split("function RemoveCurrentRuntimePayload", 1)[0]
+        commit = code_section.split(
+            "function CommitUpgradeRuntimeQuarantine", 1
+        )[1].split("procedure FinishUpgradeRuntimeQuarantine", 1)[0]
+
+        self.assertIn(
+            "UpgradeRuntimeHoldPath := ExpandConstant('{app}\\.installing-previous')",
+            paths,
+        )
+        self.assertIn(
+            "UpgradeStatePath := ExpandConstant('{app}\\.installing-previous.state')",
+            paths,
+        )
+        self.assertIn("if DirExists(UpgradeRuntimeHoldPath) then", cleanup)
+        self.assertLess(
+            cleanup.index("if DirExists(UpgradeRuntimeHoldPath) then"),
+            cleanup.index("DeleteFileWithRetries(UpgradeStatePath)"),
+        )
+        self.assertLess(
+            commit.index("WriteUpgradeRuntimeState(UpgradeStateCommitted)"),
+            commit.index("DeleteDirectoryWithRetries(UpgradeRuntimeHoldPath)"),
+        )
+        self.assertLess(
+            commit.index("DeleteDirectoryWithRetries(UpgradeRuntimeHoldPath)"),
+            commit.index("DeleteUpgradeRuntimeStateAfterCleanup"),
+        )
+
+    def test_main_executable_is_installed_last_and_verified_before_success(self):
+        files_section = _iss_section(self.text, "Files")
+        code_section = _iss_section(self.text, "Code")
+        post_install = code_section.split(
+            "procedure CurStepChanged(CurStep: TSetupStep);", 1
+        )[1].split("procedure CurPageChanged", 1)[0]
+
+        wildcard = next(
+            line
+            for line in files_section.splitlines()
+            if 'Source: "{#DistDir}\\*"' in line
+        )
+        main_executable = next(
+            line
+            for line in files_section.splitlines()
+            if 'Source: "{#DistDir}\\{#AppExeName}"' in line
+        )
+        self.assertIn('Excludes: "{#AppExeName}"', wildcard)
+        self.assertEqual(files_section.strip().splitlines()[-1], main_executable)
+        verification = code_section.split(
+            "function ValidateInstalledApplication", 1
+        )[1].split("function NormalizeLegacyExecutableHold", 1)[0]
+        self.assertIn("if not FileExists(UpgradeApplicationPath) then", verification)
+        self.assertIn("if not DirExists(UpgradeInternalPath) then", verification)
+        self.assertIn("'{#HidHelperExeName}'", verification)
+        self.assertIn("'--dry-run'", verification)
+        self.assertIn("ResultCode <> 0", verification)
+        self.assertLess(
+            post_install.index("if not ValidateInstalledApplication"),
+            post_install.index("InstallFilesCompleted := True"),
+        )
+        self.assertIn("Check: ShouldLaunchInstalledApplication", self.text)
+        self.assertIn("function GetCustomSetupExitCode", code_section)
+        self.assertIn("InstallValidationFailureExitCode", code_section)
+
+    def test_upgrade_blocks_legacy_restarts_until_file_replacement_finishes(self):
+        code_section = _iss_section(self.text, "Code")
+        prepare = code_section.split(
+            "function PrepareToInstall(var NeedsRestart: Boolean): String;", 1
+        )[1].split("procedure CurStepChanged", 1)[0]
+        post_install = code_section.split(
+            "procedure CurStepChanged(CurStep: TSetupStep);", 1
+        )[1].split("procedure CurPageChanged", 1)[0]
+        deinitialize = code_section.split("procedure DeinitializeSetup();", 1)[1].split(
+            "function RunStopApplication", 1
+        )[0]
+
+        for name in (
+            "Local\\RemoteMicRC003_SettingsInstance",
+            "Local\\RemoteMicRC003_BridgeInstance",
+            "Local\\RemoteMicRC003_ApplicationHandoff",
+        ):
+            self.assertIn(name, code_section)
+        barriers = code_section.split(
+            "function AcquireLegacyRuntimeBarriers", 1
+        )[1].split("procedure InitializeUpgradeRuntimePaths", 1)[0]
+        self.assertEqual(barriers.count("CreateMutex(0, False"), 3)
+        first_stop = prepare.index("if not StopApplicationForInstall")
+        barrier = prepare.index("if not AcquireLegacyRuntimeBarriers")
+        second_stop = prepare.index("if not StopApplicationForInstall", first_stop + 1)
+        quarantine = prepare.index("if not QuarantineExistingApplication")
+        self.assertLess(first_stop, barrier)
+        self.assertLess(barrier, second_stop)
+        self.assertLess(second_stop, quarantine)
+        self.assertIn("ReleaseLegacyRuntimeBarriers", post_install)
+        self.assertIn("ReleaseLegacyRuntimeBarriers", deinitialize)
+
+    def test_uninstall_stops_then_blocks_legacy_restarts_and_checks_again(self):
+        code_section = _iss_section(self.text, "Code")
+        uninstall = code_section.split(
+            "function InitializeUninstall(): Boolean;", 1
+        )[1].split("procedure DeinitializeUninstall", 1)[0]
+        deinitialize = code_section.split(
+            "procedure DeinitializeUninstall();", 1
+        )[1].split("procedure RemoveOwnedLoginStartupValue", 1)[0]
+
+        first_stop = uninstall.index("if not StopApplicationForUninstall")
+        barrier = uninstall.index("if not AcquireLegacyRuntimeBarriers")
+        second_stop = uninstall.index(
+            "if not StopApplicationForUninstall", first_stop + 1
+        )
+        helper_cleanup = uninstall.index(
+            "RunApplicationMaintenance('--uninstall-hid-helper'"
+        )
+        self.assertLess(first_stop, barrier)
+        self.assertLess(barrier, second_stop)
+        self.assertLess(second_stop, helper_cleanup)
+        self.assertIn("ReleaseLegacyRuntimeBarriers", deinitialize)
+        self.assertIn("ReleaseInstallerMaintenanceMutex", deinitialize)
+
+    def test_quarantined_runtime_cleanup_retries_and_uninstall_is_exact(self):
+        code_section = _iss_section(self.text, "Code")
+        deinitialize = code_section.split("procedure DeinitializeSetup();", 1)[1].split(
+            "function RunStopApplication", 1
+        )[0]
+        uninstall_delete = _strip_semicolon_comments(
+            _iss_section(self.text, "UninstallDelete")
+        )
+
+        self.assertIn("function DeleteFileWithRetries", code_section)
+        self.assertIn("function DeleteDirectoryWithRetries", code_section)
+        self.assertIn("FileCleanupAttempts = 5", code_section)
+        self.assertIn("FinishUpgradeRuntimeQuarantine", deinitialize)
+        self.assertIn(
+            'Type: filesandordirs; Name: "{app}\\.installing-previous"',
+            uninstall_delete,
+        )
+        self.assertIn(
+            'Type: files; Name: "{app}\\{#AppExeName}.installing-previous"',
+            uninstall_delete,
+        )
+        for user_data in ("config.json", "key_bindings.json", "logs", "captures"):
+            self.assertNotIn(user_data, uninstall_delete)
+
+    def test_upgrade_requests_uac_only_for_the_dedicated_elevation_exit_code(self):
+        code_section = _iss_section(self.text, "Code")
+        stop_helper = code_section.split(
+            "function StopApplicationForInstall(const StopScript: String;", 1
+        )[1].split("function RunApplicationMaintenance", 1)[0]
+        normal_call = stop_helper.index(
             "Started := RunStopApplication(StopScript, False, True, ResultCode);"
         )
-        elevation_gate = prepare.index(
+        elevation_gate = stop_helper.index(
             "if ResultCode = StopNeedsElevationExitCode then"
         )
-        elevated_call = prepare.index(
+        elevated_call = stop_helper.index(
             "Started := RunStopApplication(StopScript, True, True, ResultCode);"
         )
         self.assertLess(normal_call, elevation_gate)
         self.assertLess(elevation_gate, elevated_call)
-        self.assertIn("未完成 UAC 确认", prepare)
-        self.assertIn("旧版若没有可用的退出入口", prepare)
+        self.assertIn("未完成 UAC 确认", stop_helper)
+        self.assertIn("需要管理员权限关闭正在以管理员身份运行的旧版", stop_helper)
 
     def test_stop_script_uses_directory_boundary_and_bounded_exit_confirmation(self):
         script = (_ISS_PATH.parent / "stop-app.ps1").read_text(
             encoding="utf-8-sig"
         )
         self.assertIn("[System.IO.Path]::GetFullPath", script)
-        self.assertIn("$currentExitTimeoutSeconds = 45", script)
-        self.assertIn("$legacyRequestGraceSeconds = 2", script)
+        self.assertIn("$maintenanceExitTimeoutSeconds = 50", script)
         self.assertIn("$legacyBridgeExitTimeoutSeconds = 10", script)
+        self.assertIn("$currentSessionId", script)
+        self.assertIn("$exitOtherSessionRunning = 24", script)
         self.assertIn("CreationDate", script)
         self.assertIn("Get-CurrentTargetProcess", script)
         self.assertIn('$targetExecutableName = "RemoteMicRC003.exe"', script)
@@ -599,67 +1020,137 @@ class InnoSetupScriptTests(unittest.TestCase):
         script = (_ISS_PATH.parent / "stop-app.ps1").read_text(
             encoding="utf-8-sig"
         )
-        self.assertIn('action = "exit_application"', script)
-        self.assertIn('$exitRequestFileName = "application-exit-request.json"', script)
-        self.assertIn('$bridgeStartRequestFileName = "bridge-start-request.json"', script)
-        self.assertIn("Remove-TransientRequests", script)
-        marker_gate = script.index("if ($supportsFullExit)")
-        legacy_bridge = script.index("[RemoteMicInstaller.NativeMethods]::PostMessage")
+        self.assertIn(
+            '$v3ExitCapabilityProperty = "RemoteMicRC003.ApplicationExitRequestV3"',
+            script,
+        )
+        self.assertIn(
+            '$windowExitCapabilityProperty = '
+            '"RemoteMicRC003.ApplicationExitWindowSignalV1"',
+            script,
+        )
+        self.assertIn(
+            '$windowExitRequestProperty = '
+            '"RemoteMicRC003.ApplicationExitWindowRequestV1"',
+            script,
+        )
+        self.assertIn("function Invoke-WindowFullExit", script)
+        self.assertIn("TrySetProcessWindowProperty", script)
+        self.assertIn("TryRemoveProcessWindowPropertyValue", script)
+        window_exit = script.split("function Invoke-WindowFullExit", 1)[1].split(
+            "function Invoke-LegacyV3FullExit", 1
+        )[0]
+        self.assertIn("finally", window_exit)
+        self.assertIn("$script:windowExitRequestProperty", window_exit)
+        self.assertIn("[IntPtr]$requestToken", window_exit)
+        self.assertIn("function Invoke-LegacyV3FullExit", script)
+        self.assertIn('-ArgumentList "--request-exit"', script)
+        self.assertIn("-FilePath $Target.ExecutablePath", script)
+        legacy_function = script.split("function Invoke-LegacyV3FullExit", 1)[1]
+        elevation_guard = legacy_function.index("if ($script:isElevated)")
+        external_launch = legacy_function.index("-FilePath $Target.ExecutablePath")
+        self.assertLess(elevation_guard, external_launch)
+        marker_gate = script.index("if ($windowSignalTargets.Count -eq 1)")
+        legacy_bridge = script.index(
+            "[RemoteMicInstaller.LegacyShellMethods]::PostMessage"
+        )
         self.assertLess(marker_gate, legacy_bridge)
         self.assertIn("legacy bridge did not finish normal cleanup", script)
         self.assertIn("legacy bridge control window was not found", script)
         self.assertIn("legacy bridge restarted during shutdown confirmation", script)
-        self.assertIn("-not (Test-Path -LiteralPath $exitRequestPath)", script)
         self.assertIn("Show-LegacyShellWindow", script)
-        self.assertIn("FindWindowForProcess", script)
+        self.assertIn("FindWindowForProcessAndTitle", script)
         self.assertIn("exit $exitUserActionRequired", script)
-        self.assertNotIn("Stop-Process", script)
+        self.assertEqual(script.count("Stop-Process"), 1)
+        self.assertIn("Stop-Process -Id $requestProcess.Id", script)
+        self.assertNotIn("Stop-Process -Id $target.ProcessId", script)
+
+    def test_stop_script_only_blocks_the_same_installed_path_in_other_sessions(self):
+        script = (_ISS_PATH.parent / "stop-app.ps1").read_text(
+            encoding="utf-8-sig"
+        )
+        other_session = script.split(
+            "if ([uint32]$process.SessionId -ne $script:currentSessionId)", 1
+        )[1].split("continue", 1)[0]
+
+        self.assertIn("if ($matchesTargetPath)", other_session)
+        self.assertNotIn("BlockOtherLocations", other_session)
 
     def test_install_blocks_a_running_portable_copy_but_uninstall_does_not_touch_it(self):
         code_section = _iss_section(self.text, "Code")
         prepare = code_section.split(
             "function PrepareToInstall(var NeedsRestart: Boolean): String;", 1
         )[1].split("procedure CurStepChanged", 1)[0]
+        stop_helper = code_section.split(
+            "function StopApplicationForInstall(const StopScript: String;", 1
+        )[1].split("function StopApplicationForUninstall", 1)[0]
+        uninstall_stop_helper = code_section.split(
+            "function StopApplicationForUninstall(const StopScript: String): Boolean;",
+            1,
+        )[1].split("function RunApplicationMaintenance", 1)[0]
         uninstall = code_section.split("function InitializeUninstall(): Boolean;", 1)[1]
 
         self.assertIn(
-            "RunStopApplication(StopScript, False, True, ResultCode)", prepare
+            "RunStopApplication(StopScript, False, True, ResultCode)", stop_helper
         )
         self.assertIn(
-            "RunStopApplication(StopScript, True, True, ResultCode)", prepare
+            "RunStopApplication(StopScript, True, True, ResultCode)", stop_helper
         )
-        self.assertIn("StopOtherLocationRunningExitCode", prepare)
-        self.assertIn("旧便携版", prepare)
+        self.assertEqual(prepare.count("StopApplicationForInstall"), 2)
+        self.assertIn("StopOtherLocationRunningExitCode", stop_helper)
+        self.assertIn("旧便携版", stop_helper)
         self.assertIn(
-            "RunStopApplication(StopScript, False, False, ResultCode)", uninstall
+            "RunStopApplication(StopScript, False, False, ResultCode)",
+            uninstall_stop_helper,
         )
+        self.assertNotIn(
+            "RunStopApplication(StopScript, True, False, ResultCode)",
+            uninstall_stop_helper,
+        )
+        self.assertIn("正以管理员身份运行", uninstall_stop_helper)
+        self.assertEqual(uninstall.count("StopApplicationForUninstall"), 2)
+
+    def test_uninstall_never_elevates_the_user_writable_stop_script(self):
+        code_section = _iss_section(self.text, "Code")
+        uninstall_stop_helper = code_section.split(
+            "function StopApplicationForUninstall(const StopScript: String): Boolean;",
+            1,
+        )[1].split("function RunApplicationMaintenance", 1)[0]
+
         self.assertIn(
-            "RunStopApplication(StopScript, True, False, ResultCode)", uninstall
+            "RunStopApplication(StopScript, False, False, ResultCode)",
+            uninstall_stop_helper,
         )
+        self.assertNotIn("RunStopApplication(StopScript, True", uninstall_stop_helper)
+        self.assertNotIn("ShellExec(", uninstall_stop_helper)
 
     def test_upgrade_marker_and_runtime_cleanup_do_not_delete_user_data(self):
         files_section = _iss_section(self.text, "Files")
-        install_delete = _strip_semicolon_comments(
-            _iss_section(self.text, "InstallDelete")
+        code_section = _iss_section(self.text, "Code")
+        uninstall_delete = _strip_semicolon_comments(
+            _iss_section(self.text, "UninstallDelete")
         )
         self.assertIn(
             'Source: "application-exit-contract-v1.json"; DestDir: "{app}"',
             files_section,
         )
-        self.assertIn(
-            'Type: filesandordirs; Name: "{app}\\_internal"',
-            install_delete,
-        )
+        self.assertNotIn("[InstallDelete]", self.text)
+        self.assertIn("UpgradeInternalPath", code_section)
+        self.assertIn("UpgradeHeldInternalPath", code_section)
         for user_data in ("config.json", "key_bindings.json", "logs", "captures"):
-            self.assertNotIn(user_data, install_delete)
+            self.assertNotIn(user_data, uninstall_delete)
 
     def test_uninstall_aborts_when_the_installed_stop_script_is_missing(self):
         code_section = _iss_section(self.text, "Code")
-        self.assertIn("if not FileExists(StopScript) then", code_section)
-        missing_branch = code_section.split(
+        uninstall = code_section.split(
+            "function InitializeUninstall(): Boolean;", 1
+        )[1].split("procedure DeinitializeUninstall", 1)[0]
+        self.assertIn("if not FileExists(StopScript) then", uninstall)
+        missing_branch = uninstall.split(
             "if not FileExists(StopScript) then", 1
-        )[1].split("Started := RunStopApplication", 1)[0]
+        )[1].split("if not StopApplicationForUninstall", 1)[0]
         self.assertIn("Result := False", missing_branch)
+        self.assertIn("ReleaseInstallerMaintenanceMutex", missing_branch)
 
     def test_stop_app_script_is_both_temp_extractable_and_permanently_installed(self):
         # XRBM-022: the round-1 defect was that stop-app.ps1 only had a
@@ -1492,11 +1983,14 @@ class BuildProvenanceScriptTests(unittest.TestCase):
             r"build\check-third-party-notices.py",
             r"build\fetch-frida-gadget.ps1",
             r"build\fetch-vb-cable.ps1",
+            r"build\stop-dev.ps1",
             r"build\RemoteMicRC003.spec",
             r"ATTRIBUTION.md",
+            r'Join-Path $RC003Root "README.md"',
             r"ASSET_LICENSES.md",
             r"COPYRIGHT.md",
             r"LICENSE.md",
+            r'Join-Path $RepoRoot "README.md"',
             r"THIRD_PARTY_NOTICES.md",
             r"THIRD_PARTY_SOURCE.md",
             r".github\workflows\windows-rc003-ci.yml",
@@ -1562,6 +2056,7 @@ class BuildProvenanceScriptTests(unittest.TestCase):
                 rc003_root / "build" / "check-third-party-notices.py": "fixture\n",
                 rc003_root / "build" / "fetch-frida-gadget.ps1": "fixture\n",
                 rc003_root / "build" / "fetch-vb-cable.ps1": "fixture\n",
+                rc003_root / "build" / "stop-dev.ps1": "fixture\n",
                 rc003_root / "build" / "RemoteMicRC003.spec": "fixture\n",
                 rc003_root / "build" / "generate-app-icon.py": "fixture\n",
                 rc003_root / "build" / "third_party" / "VBCABLE_Driver_Pack45.zip": b"zip",
@@ -1569,12 +2064,14 @@ class BuildProvenanceScriptTests(unittest.TestCase):
                 rc003_root / "requirements-dev.txt": "fixture\n",
                 rc003_root / "pyproject.toml": "fixture\n",
                 rc003_root / "ATTRIBUTION.md": "fixture\n",
+                rc003_root / "README.md": "fixture\n",
                 rc003_root / "installer" / "application-exit-contract-v1.json": "{}\n",
                 rc003_root / "installer" / "readme-portable-rc003.txt": "fixture\n",
                 rc003_root / "installer" / "readme-rc003.txt": "fixture\n",
                 rc003_root / "installer" / "RemoteMicRC003Setup.iss": "fixture\n",
                 rc003_root / "installer" / "stop-app.ps1": "fixture\n",
                 repo_root / ".github" / "workflows" / "windows-rc003-ci.yml": "fixture\n",
+                repo_root / "README.md": "fixture\n",
                 repo_root / "Resources" / "RC003-remote-photo.png": b"png",
                 repo_root / "ASSET_LICENSES.md": "fixture\n",
                 repo_root / "COPYRIGHT.md": "fixture\n",
@@ -1982,7 +2479,10 @@ class DeveloperEntryScriptTests(unittest.TestCase):
         self.assertIn(r".venv\Scripts\pythonw.exe", self.stop_text)
         self.assertIn("OrdinalIgnoreCase", self.stop_text)
         self.assertIn("--remote-mic-dev-session", self.stop_text)
-        self.assertIn("Stop-Process", self.stop_text)
+        self.assertIn("--request-exit", self.stop_text)
+        self.assertIn("RemoteMicRC003.ApplicationExitRequestV3", self.stop_text)
+        self.assertIn("GetCurrentProcess().SessionId", self.stop_text)
+        self.assertNotIn("Stop-Process", self.stop_text)
 
     def test_shortcut_targets_the_source_launcher(self):
         self.assertIn('GetFolderPath("Desktop")', self.install_text)
@@ -2061,6 +2561,7 @@ class UserFacingDocumentationContractTests(unittest.TestCase):
     def setUp(self):
         self.readme_text = _README_PATH.read_text(encoding="utf-8")
         self.installed_readme_text = _INSTALLED_README_PATH.read_text(encoding="utf-8")
+        self.portable_readme_text = _PORTABLE_README_PATH.read_text(encoding="utf-8")
         self.both = (self.readme_text, self.installed_readme_text)
 
     def test_official_vbcable_url_is_present_in_both_docs(self):
@@ -2122,12 +2623,33 @@ class UserFacingDocumentationContractTests(unittest.TestCase):
     def test_hid_elevation_and_login_startup_are_explained_consistently(self):
         for text in self.both:
             self.assertIn("管理员按键组件", text)
-            self.assertIn("自定义方向映射", text)
-            self.assertIn("Windows 原始方向", text)
+            self.assertIn("自定义按键映射", text)
+            self.assertIn("Windows 原始按键", text)
             self.assertIn("随 Windows 启动", text)
             self.assertIn("不再弹 UAC", text)
             self.assertIn("当前登录", text)
             self.assertIn("管理员组", text)
+
+    def test_hid_failure_disables_every_custom_mapping_in_all_user_guides(self):
+        for text in (
+            self.readme_text,
+            self.installed_readme_text,
+            self.portable_readme_text,
+        ):
+            normalized = _normalize_whitespace(text)
+            self.assertIn("全部自定义按键映射停用", normalized)
+            self.assertIn("只保留 Windows 原始按键操作", normalized)
+            self.assertNotIn("只保留 Windows 原始方向键一次", normalized)
+
+    def test_current_build_version_is_consistent_in_user_guides(self):
+        version = _VERSION_PATH.read_text(encoding="ascii").strip()
+        self.assertIn(f"`{version}`", self.readme_text)
+        self.assertIn(
+            f"RemoteMicRC003Setup-{version}-unsigned.exe",
+            self.installed_readme_text,
+        )
+        root_readme = _ROOT_README_PATH.read_text(encoding="utf-8")
+        self.assertIn(f"`{version}`", root_readme)
 
     def test_installed_readme_matches_the_current_three_page_workflow(self):
         text = self.installed_readme_text
@@ -2402,7 +2924,7 @@ class PortableAndInstallerFlowContractTests(unittest.TestCase):
             _PORTABLE_README_PATH.read_text(encoding="utf-8")
         )
         for text in (self.normalized, portable_readme):
-            self.assertIn("首次启用方向改键", text)
+            self.assertIn("首次启用自定义按键映射", text)
             self.assertIn("确认一次", text)
             self.assertIn("普通", text)
             self.assertIn("随 Windows 启动", text)
@@ -2473,14 +2995,17 @@ class ConfigLogResidueDisclosureContractTests(unittest.TestCase):
             # not directly inside it (see logging_setup.get_logger()).
             self.assertIn("logs" + "\\" + logging_setup.LOG_FILENAME, text)
 
-    def test_iss_has_no_uninstall_delete_rule_for_runtime_files(self):
-        # Regression guard for the premise both docs now rely on: if a
-        # future change adds an [UninstallDelete] entry, that's a genuine
-        # behavior change requiring its own runtime/installer-scoped task,
-        # and this doc's "uninstall does not remove settings/logs" claim
-        # would need to be revisited together with it - this test fails
-        # first, loudly, instead of the docs silently going stale.
-        self.assertNotIn("UninstallDelete", self.iss_text)
+    def test_uninstall_delete_is_limited_to_fixed_upgrade_backups(self):
+        uninstall_delete = _strip_semicolon_comments(
+            _iss_section(self.iss_text, "UninstallDelete")
+        )
+        self.assertIn(r'{app}\.installing-previous', uninstall_delete)
+        self.assertIn(
+            r'{app}\{#AppExeName}.installing-previous',
+            uninstall_delete,
+        )
+        for user_data in ("config.json", "key_bindings.json", "logs", "captures"):
+            self.assertNotIn(user_data, uninstall_delete)
 
     def test_uninstall_does_not_claim_full_directory_removal(self):
         for text in self.both:

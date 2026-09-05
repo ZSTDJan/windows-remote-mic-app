@@ -6,7 +6,13 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from ovb_rc003 import frida_compat, frida_hid_tap_injector
+from ovb_rc003 import (
+    config,
+    frida_compat,
+    frida_hid_tap_injector,
+    hid_elevation_windows,
+    hid_helper_consumers,
+)
 
 
 class AssetDescriptorTests(unittest.TestCase):
@@ -231,6 +237,66 @@ class InjectorSubprocessTests(unittest.TestCase):
         )
 
         registered.assert_called_once_with(2468)
+
+    def test_normal_frozen_app_repairs_a_missing_consumer_before_injection(self):
+        tenant = mock.Mock()
+        marker = Path("registered-consumer.json")
+
+        with mock.patch.object(
+            hid_helper_consumers,
+            "current_consumer_is_registered",
+            side_effect=(False, True),
+        ) as registered_probe, mock.patch.object(
+            hid_helper_consumers,
+            "register_current_consumer",
+            return_value=marker,
+        ) as register_consumer, mock.patch.object(
+            hid_elevation_windows,
+            "run_registered_injector",
+            tenant,
+        ):
+            frida_compat.run_injector_subprocess(
+                2468,
+                frozen=True,
+                _is_elevated=lambda: False,
+            )
+
+        self.assertEqual(registered_probe.call_count, 2)
+        register_consumer.assert_called_once_with(
+            config.config_root(),
+            timeout_seconds=(
+                frida_compat.HID_CONSUMER_REGISTRATION_TIMEOUT_SECONDS
+            ),
+        )
+        tenant.assert_called_once_with(2468)
+
+    def test_busy_consumer_registration_is_retryable_before_injection(self):
+        tenant = mock.Mock()
+
+        with mock.patch.object(
+            hid_helper_consumers,
+            "current_consumer_is_registered",
+            return_value=False,
+        ), mock.patch.object(
+            hid_helper_consumers,
+            "register_current_consumer",
+            side_effect=hid_helper_consumers.ConsumerMaintenanceError(
+                "helper_consumer_maintenance_busy"
+            ),
+        ), mock.patch.object(
+            hid_elevation_windows,
+            "run_registered_injector",
+            tenant,
+        ):
+            with self.assertRaises(frida_compat.HidTapInjectionError) as ctx:
+                frida_compat.run_injector_subprocess(
+                    2468,
+                    frozen=True,
+                    _is_elevated=lambda: False,
+                )
+
+        self.assertEqual(str(ctx.exception), "hid_helper_operation_busy")
+        tenant.assert_not_called()
 
     def test_elevated_frozen_app_keeps_the_direct_injector_path(self):
         with mock.patch.object(
@@ -988,6 +1054,54 @@ class TapStateTests(unittest.TestCase):
                     "injector_requires_administrator",
                 ),
             ],
+        )
+
+    def test_busy_registered_helper_retries_the_same_host_pid(self):
+        statuses = []
+        injector = mock.Mock(
+            side_effect=[
+                frida_compat.HidTapInjectionError("hid_helper_operation_busy"),
+                frida_compat.HidTapInjectionError(
+                    "injector_requires_administrator"
+                ),
+            ]
+        )
+
+        def record_status(status, detail):
+            statuses.append((status, detail))
+            if detail == "injector_requires_administrator":
+                tap.stop_event.set()
+
+        tap = frida_compat.RC003HidReportTap(
+            lambda _report_id, _payload: None,
+            enabled=False,
+            injector=injector,
+            status_handler=record_status,
+        )
+        tap.stop_event.wait = mock.Mock(return_value=False)
+        server = mock.MagicMock()
+
+        with mock.patch.object(
+            frida_compat.frida_hid_tap_runtime,
+            "find_rc003_hidogatt_host_pid",
+            return_value=2468,
+        ), mock.patch.object(frida_compat.socket, "socket", return_value=server):
+            tap._run()
+
+        self.assertEqual(injector.call_args_list, [mock.call(2468), mock.call(2468)])
+        self.assertIn(
+            (
+                frida_compat.HidTapState.FAILED.value,
+                "hid_helper_operation_busy",
+            ),
+            statuses,
+        )
+        self.assertIn(
+            (
+                frida_compat.HidTapState.FAILED.value,
+                "injector_requires_administrator",
+            ),
+            statuses,
         )
 
     def test_missing_gadget_connection_becomes_a_stable_failure(self):

@@ -17,6 +17,7 @@ param(
 $ErrorActionPreference = "Stop"
 $RC003Root = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $DevMarker = "--remote-mic-dev-session"
+$CurrentSessionId = [uint32][System.Diagnostics.Process]::GetCurrentProcess().SessionId
 $InterpreterPaths = @(
     (Join-Path $RC003Root ".venv\Scripts\python.exe"),
     (Join-Path $RC003Root ".venv\Scripts\pythonw.exe")
@@ -31,7 +32,7 @@ if ($InterpreterPaths.Count -eq 0) {
     exit 0
 }
 
-$DevProcesses = Get-CimInstance Win32_Process | Where-Object {
+$AllDevProcesses = Get-CimInstance Win32_Process | Where-Object {
     $executablePath = $_.ExecutablePath
     $commandLine = $_.CommandLine
     if (-not $executablePath -or -not $commandLine) {
@@ -46,30 +47,127 @@ $DevProcesses = Get-CimInstance Win32_Process | Where-Object {
     }
     return $exactInterpreter -and $commandLine.Contains($DevMarker)
 }
+$OtherSessionDevProcesses = @(
+    $AllDevProcesses | Where-Object {
+        [uint32]$_.SessionId -ne $CurrentSessionId
+    }
+)
+if ($OtherSessionDevProcesses.Count -gt 0) {
+    throw "A marked source process is running in another Windows session."
+}
+$DevProcesses = @(
+    $AllDevProcesses | Where-Object {
+        [uint32]$_.SessionId -eq $CurrentSessionId
+    }
+)
 
 if (-not $DevProcesses) {
     Write-Host "[stop-dev] no marked source development session is running"
     exit 0
 }
 
-foreach ($devProcess in $DevProcesses) {
-    $process = Get-Process -Id $devProcess.ProcessId -ErrorAction SilentlyContinue
-    if (-not $process) {
-        continue
-    }
+$PackagedProcesses = @(
+    Get-CimInstance Win32_Process -Filter "Name = 'RemoteMicRC003.exe'" |
+        Where-Object { [uint32]$_.SessionId -eq $CurrentSessionId }
+)
+if ($PackagedProcesses.Count -gt 0) {
+    throw "A packaged RemoteMicRC003 process is running; stop-dev will not request its exit."
+}
 
-    Write-Host "[stop-dev] stopping marked source process PID $($process.Id)"
-    $closeRequested = $process.CloseMainWindow()
-    if ($closeRequested) {
-        [void]$process.WaitForExit($GracefulTimeoutSeconds * 1000)
-    }
+$windowProbeType = [System.Management.Automation.PSTypeName]'RemoteMicBuild.WindowProbe'
+if (-not $windowProbeType.Type) {
+    Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
 
-    if (-not $process.HasExited) {
-        Stop-Process -Id $process.Id -Force -ErrorAction Stop
-        if (-not $process.WaitForExit($GracefulTimeoutSeconds * 1000)) {
-            throw "Marked source process PID $($process.Id) did not exit."
+namespace RemoteMicBuild {
+    public static class WindowProbe {
+        private delegate bool EnumWindowsProc(IntPtr window, IntPtr parameter);
+
+        [DllImport("user32.dll")]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool EnumWindows(EnumWindowsProc callback, IntPtr parameter);
+
+        [DllImport("user32.dll")]
+        private static extern uint GetWindowThreadProcessId(IntPtr window, out uint processId);
+
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+        private static extern IntPtr GetProp(IntPtr window, string propertyName);
+
+        public static uint FindOwner(string propertyName) {
+            uint found = 0;
+            EnumWindows(delegate(IntPtr window, IntPtr parameter) {
+                if (GetProp(window, propertyName) == IntPtr.Zero) {
+                    return true;
+                }
+                GetWindowThreadProcessId(window, out found);
+                return false;
+            }, IntPtr.Zero);
+            return found;
         }
     }
+}
+"@
+}
+$DesktopOwnerProcessId = [RemoteMicBuild.WindowProbe]::FindOwner(
+    "RemoteMicRC003.ApplicationExitRequestV3"
+)
+$DevProcessIds = @($DevProcesses | ForEach-Object { [uint32]$_.ProcessId })
+if (
+    $DesktopOwnerProcessId -eq 0 -or
+    $DevProcessIds -notcontains [uint32]$DesktopOwnerProcessId
+) {
+    throw "The marked processes do not own this checkout's V3 desktop window."
+}
+
+$Python = Join-Path $RC003Root ".venv\Scripts\python.exe"
+if (-not (Test-Path -LiteralPath $Python -PathType Leaf)) {
+    throw "The source exit entry point requires .venv\Scripts\python.exe."
+}
+
+Write-Host "[stop-dev] requesting normal application exit"
+$PreviousPythonPath = $env:PYTHONPATH
+try {
+    $env:PYTHONPATH = Join-Path $RC003Root "src"
+    & $Python -m ovb_rc003 --request-exit
+    if ($LASTEXITCODE -ne 0) {
+        throw "The source application did not complete normal exit (code $LASTEXITCODE)."
+    }
+} finally {
+    $env:PYTHONPATH = $PreviousPythonPath
+}
+
+$deadline = [DateTime]::UtcNow.AddSeconds($GracefulTimeoutSeconds)
+do {
+    $remaining = @(
+        Get-CimInstance Win32_Process | Where-Object {
+            $executablePath = $_.ExecutablePath
+            $commandLine = $_.CommandLine
+            if (
+                -not $executablePath -or
+                -not $commandLine -or
+                [uint32]$_.SessionId -ne $CurrentSessionId
+            ) {
+                return $false
+            }
+            $exactInterpreter = $InterpreterPaths | Where-Object {
+                [string]::Equals(
+                    $_,
+                    $executablePath,
+                    [System.StringComparison]::OrdinalIgnoreCase
+                )
+            }
+            return $exactInterpreter -and $commandLine.Contains($DevMarker)
+        }
+    )
+    if ($remaining.Count -eq 0) {
+        break
+    }
+    Start-Sleep -Milliseconds 100
+} while ([DateTime]::UtcNow -lt $deadline)
+
+if ($remaining.Count -gt 0) {
+    throw "A marked source process is still running; build files were not touched."
 }
 
 Write-Host "[stop-dev] marked source development session stopped"

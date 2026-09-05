@@ -75,6 +75,7 @@ class BridgeRuntimeStatus:
     runtime_id: str = ""
     raw_input_state: str = "unknown"
     hid_tap_state: str = "unknown"
+    voice_key_physicalizer_state: str = "unknown"
     last_button_at: Optional[float] = None
     last_button_source: str = ""
     voice_active: bool = False
@@ -154,6 +155,7 @@ def publish_status(
     identity: Optional[BridgeRuntimeIdentity] = None,
     raw_input_state: str = "unknown",
     hid_tap_state: str = "unknown",
+    voice_key_physicalizer_state: str = "unknown",
     last_button_at: Optional[float] = None,
     last_button_source: str = "",
     voice_active: bool = False,
@@ -176,6 +178,7 @@ def publish_status(
         runtime_id=resolved_identity.runtime_id,
         raw_input_state=str(raw_input_state),
         hid_tap_state=str(hid_tap_state),
+        voice_key_physicalizer_state=str(voice_key_physicalizer_state),
         last_button_at=last_button_at,
         last_button_source=str(last_button_source),
         voice_active=bool(voice_active),
@@ -197,6 +200,9 @@ def publish_status(
                     "runtime_id": status.runtime_id,
                     "raw_input_state": status.raw_input_state,
                     "hid_tap_state": status.hid_tap_state,
+                    "voice_key_physicalizer_state": (
+                        status.voice_key_physicalizer_state
+                    ),
                     "last_button_at": status.last_button_at,
                     "last_button_source": status.last_button_source,
                     "voice_active": status.voice_active,
@@ -244,7 +250,10 @@ def read_status(config_root: Path) -> Optional[BridgeRuntimeStatus]:
         )
 
     string_fields = {
-        name: payload.get(name, "")
+        name: payload.get(
+            name,
+            "unknown" if name == "voice_key_physicalizer_state" else "",
+        )
         for name in (
             "app_version",
             "runtime_kind",
@@ -252,6 +261,7 @@ def read_status(config_root: Path) -> Optional[BridgeRuntimeStatus]:
             "runtime_id",
             "raw_input_state",
             "hid_tap_state",
+            "voice_key_physicalizer_state",
             "last_button_source",
         )
     }
@@ -277,6 +287,9 @@ def read_status(config_root: Path) -> Optional[BridgeRuntimeStatus]:
         runtime_id=string_fields["runtime_id"],
         raw_input_state=string_fields["raw_input_state"],
         hid_tap_state=string_fields["hid_tap_state"],
+        voice_key_physicalizer_state=(
+            string_fields["voice_key_physicalizer_state"]
+        ),
         last_button_at=(
             None if last_button_at is None else float(last_button_at)
         ),

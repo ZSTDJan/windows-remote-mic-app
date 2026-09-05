@@ -136,8 +136,16 @@ _RAW_FALLBACK_KEY_TOKENS = {
 _KEY_DETECTION_MIC_RELEASE_GRACE_SECONDS = 1.0
 _KEY_DETECTION_MIC_MAX_SECONDS = 10.0
 _ORDINARY_MIC_RELEASE_GUARD_SECONDS = 0.12
+_ORDINARY_MIC_SOURCE_STALE_SECONDS = 2.0
+_ORDINARY_MIC_MAX_SECONDS = 10.0
+_KEY_DETECTION_SUPPRESSION_MAX_SECONDS = 2.0
 _RUNTIME_STATUS_HEARTBEAT_SECONDS = 5.0
 _VOICE_HOLD_SAFETY_SECONDS = 120.0
+_VOICE_KEY_PHYSICALIZER_RETRY_SECONDS = 1.0
+_RAW_INPUT_RETRY_INITIAL_SECONDS = 1.0
+_RAW_INPUT_RETRY_MAX_SECONDS = 30.0
+_BUTTON_INPUT_RELEASE_RETRY_INITIAL_SECONDS = 0.1
+_BUTTON_INPUT_RELEASE_RETRY_MAX_SECONDS = 2.0
 _DIRECTION_BUTTON_IDS = frozenset({"up", "down", "left", "right"})
 _VOICE_HOTKEY_BACKEND_MARKED = "marked_keybd_event"
 _VOICE_HOTKEY_BACKEND_WETYPE = "wetype_virtual_key_sendinput"
@@ -182,6 +190,7 @@ class RC003App:
         )
         self._runtime_raw_input_state = "starting"
         self._runtime_hid_tap_state = "starting"
+        self._runtime_voice_key_physicalizer_state = "starting"
         self._runtime_last_button_at: Optional[float] = None
         self._runtime_last_button_source = ""
         self._runtime_voice_active = False
@@ -250,6 +259,13 @@ class RC003App:
         self._button_action_lock = threading.RLock()
         self._button_key_release_pending: Optional[Tuple[str, ...]] = None
         self._button_mouse_release_pending: Optional[str] = None
+        self._button_input_release_retry_timer: Optional[object] = None
+        self._button_input_release_retry_token: Optional[object] = None
+        self._button_input_release_retry_delay = (
+            _BUTTON_INPUT_RELEASE_RETRY_INITIAL_SECONDS
+        )
+        self._button_input_release_retry_stopping = False
+        self._button_input_release_timer_factory = threading.Timer
         # Raw Input and the ATVV control channel arrive on different worker
         # threads. Serialize the voice state machine so one physical press
         # cannot race into two host shortcut deliveries.
@@ -275,7 +291,9 @@ class RC003App:
         self._ordinary_mic_lock = threading.Lock()
         self._ordinary_mic_sources_down: set[str] = set()
         self._ordinary_mic_late_sources_down: set[str] = set()
+        self._ordinary_mic_late_source_deadlines: dict[str, float] = {}
         self._ordinary_mic_sources_seen: set[str] = set()
+        self._ordinary_mic_gesture_started_at = 0.0
         self._ordinary_mic_release_guard_until = 0.0
         self._ordinary_mic_gesture_active = False
         self._unsolicited_mic_close_pending = False
@@ -285,9 +303,30 @@ class RC003App:
         self._voice_raw_input_trigger_pending = False
         self._ble_session: Optional[ble_transport_winrt.RC003BleSession] = None
         self._hid_listener: Optional[raw_input_windows.RawInputButtonListener] = None
+        self._raw_input_lifecycle_lock = threading.RLock()
+        self._raw_input_operation_lock = threading.RLock()
+        self._raw_input_generation = 0
+        self._raw_input_lost_generation = -1
+        self._raw_input_stopping = False
+        self._raw_input_retry_timer: Optional[object] = None
+        self._raw_input_retry_token: Optional[object] = None
+        self._raw_input_retry_delay = _RAW_INPUT_RETRY_INITIAL_SECONDS
+        self._raw_input_timer_factory = threading.Timer
+        self._raw_windows_key_down_query = (
+            raw_input_windows.physical_key_is_down_before_injection
+        )
         self._voice_key_physicalizer: Optional[
             voice_key_physicalizer_windows.VoiceKeyPhysicalizer
         ] = None
+        self._voice_key_physicalizer_ready = False
+        self._voice_key_physicalizer_lifecycle_lock = threading.RLock()
+        self._voice_key_physicalizer_operation_lock = threading.Lock()
+        self._voice_key_physicalizer_generation = 0
+        self._voice_key_physicalizer_lost_generation = -1
+        self._voice_key_physicalizer_stopping = False
+        self._voice_key_physicalizer_retry_timer: Optional[object] = None
+        self._voice_key_physicalizer_retry_token: Optional[object] = None
+        self._voice_key_physicalizer_timer_factory = threading.Timer
         self._hid_report_tap: Optional[frida_compat.RC003HidReportTap] = None
         self._direct_hid_usages: set[int] = set()
         self._direct_hid_lock = threading.Lock()
@@ -300,12 +339,21 @@ class RC003App:
         # Suspend Raw Input mapping during that short handover so one physical
         # hold cannot be split between two owners.
         self._direct_hid_interception_armed = False
+        self._direct_hid_handover_waiting_for_neutral = False
         self._raw_fallback_buttons_down: set[str] = set()
+        self._raw_fallback_physical_buttons_down: dict[
+            str, tuple[str, Optional[str]]
+        ] = {}
+        self._raw_fallback_release_debts: dict[
+            str, tuple[set[str], set[str]]
+        ] = {}
+        self._raw_fallback_tracking_active = False
         self._raw_fallback_hold_guards: dict[str, tuple[object, object]] = {}
         self._raw_fallback_timer_factory = threading.Timer
         self._raw_mapped_buttons_down: set[str] = set()
         self._input_rearm_blocked_buttons: set[str] = set()
         self._key_detection_suppressed_buttons: set[str] = set()
+        self._key_detection_suppression_deadlines: dict[str, float] = {}
         self._key_detection_mic_lock = threading.Lock()
         self._key_detection_mic_gesture_active = False
         self._key_detection_mic_gesture_started_at = 0.0
@@ -375,6 +423,9 @@ class RC003App:
                     identity=self._runtime_identity,
                     raw_input_state=self._runtime_raw_input_state,
                     hid_tap_state=self._runtime_hid_tap_state,
+                    voice_key_physicalizer_state=(
+                        self._runtime_voice_key_physicalizer_state
+                    ),
                     last_button_at=self._runtime_last_button_at,
                     last_button_source=self._runtime_last_button_source,
                     voice_active=self._runtime_voice_active,
@@ -390,12 +441,17 @@ class RC003App:
         *,
         raw_input_state: Optional[str] = None,
         hid_tap_state: Optional[str] = None,
+        voice_key_physicalizer_state: Optional[str] = None,
     ) -> None:
         with self._runtime_status_lock:
             if raw_input_state is not None:
                 self._runtime_raw_input_state = str(raw_input_state)
             if hid_tap_state is not None:
                 self._runtime_hid_tap_state = str(hid_tap_state)
+            if voice_key_physicalizer_state is not None:
+                self._runtime_voice_key_physicalizer_state = str(
+                    voice_key_physicalizer_state
+                )
         self._publish_runtime_status()
 
     def _set_runtime_voice_active(self, active: bool) -> None:
@@ -489,33 +545,327 @@ class RC003App:
 
         with self._voice_trigger_lock:
             self._accept_input_events = True
+        with self._voice_key_physicalizer_lifecycle_lock:
+            self._voice_key_physicalizer_stopping = False
+        with self._raw_input_lifecycle_lock:
+            self._raw_input_stopping = False
         self._start_voice_key_physicalizer()
         self._start_hid_listener()
         self._start_hid_report_tap()
 
-    def _start_voice_key_physicalizer(self) -> None:
-        physicalizer = voice_key_physicalizer_windows.VoiceKeyPhysicalizer()
-        self._voice_key_physicalizer = physicalizer
-        try:
-            physicalizer.start()
-        except voice_key_physicalizer_windows.VoiceKeyPhysicalizerUnavailableError as exc:
-            if physicalizer.is_running:
-                self._logger.exception(
-                    "startup: voice key physicalizer failed but is still running; "
-                    "owner retained for cleanup"
+    def _start_voice_key_physicalizer(self, *, recovering: bool = False) -> None:
+        with self._voice_key_physicalizer_operation_lock:
+            with self._voice_key_physicalizer_lifecycle_lock:
+                if (
+                    self._voice_key_physicalizer_stopping
+                    or not self._accept_input_events
+                ):
+                    return
+                current = self._voice_key_physicalizer
+                if current is not None and current.is_running:
+                    return
+                self._voice_key_physicalizer = None
+                self._voice_key_physicalizer_generation += 1
+                generation = self._voice_key_physicalizer_generation
+                self._voice_key_physicalizer_lost_generation = -1
+                physicalizer = (
+                    voice_key_physicalizer_windows.VoiceKeyPhysicalizer()
                 )
-                raise
-            self._voice_key_physicalizer = None
-            self._logger.warning(
-                "startup: voice key physicalizer unavailable; marked voice "
-                "shortcuts may be ignored by some applications: %s",
-                exc,
+                self._voice_key_physicalizer = physicalizer
+                self._voice_key_physicalizer_ready = False
+                state = "recovering" if recovering else "starting"
+            self._set_runtime_input_state(
+                voice_key_physicalizer_state=state
             )
-        else:
+            set_tracking_lost_callback = getattr(
+                physicalizer,
+                "set_tracking_lost_callback",
+                None,
+            )
+            if callable(set_tracking_lost_callback):
+                set_tracking_lost_callback(
+                    lambda physicalizer=physicalizer, generation=generation: (
+                        self._on_voice_key_physicalizer_tracking_lost(
+                            physicalizer,
+                            generation,
+                        )
+                    )
+                )
+            try:
+                physicalizer.start()
+            except (
+                voice_key_physicalizer_windows.
+                VoiceKeyPhysicalizerUnavailableError
+            ) as exc:
+                with self._voice_key_physicalizer_lifecycle_lock:
+                    if (
+                        self._voice_key_physicalizer is physicalizer
+                        and self._voice_key_physicalizer_generation == generation
+                    ):
+                        self._voice_key_physicalizer_ready = False
+                        if not physicalizer.is_running:
+                            self._voice_key_physicalizer = None
+                        self._schedule_voice_key_physicalizer_recovery_locked()
+                self._set_runtime_input_state(
+                    voice_key_physicalizer_state="failed"
+                )
+                if physicalizer.is_running:
+                    self._logger.exception(
+                        "startup: voice key physicalizer failed but is still running; "
+                        "owner retained for cleanup"
+                    )
+                    raise
+                self._logger.warning(
+                    "startup: voice key physicalizer unavailable; recovery scheduled: %s",
+                    exc,
+                )
+                return
+
+            stop_stale_instance = False
+            with self._voice_key_physicalizer_lifecycle_lock:
+                current_generation = self._voice_key_physicalizer_generation
+                stale = (
+                    self._voice_key_physicalizer is not physicalizer
+                    or current_generation != generation
+                    or self._voice_key_physicalizer_stopping
+                )
+                lost = self._voice_key_physicalizer_lost_generation == generation
+                if stale:
+                    stop_stale_instance = physicalizer.is_running
+                elif lost or not physicalizer.is_running:
+                    self._voice_key_physicalizer_ready = False
+                    self._schedule_voice_key_physicalizer_recovery_locked()
+                else:
+                    self._voice_key_physicalizer_ready = True
+            if stop_stale_instance:
+                try:
+                    physicalizer.stop()
+                except Exception:
+                    self._logger.exception(
+                        "cleanup: stale voice key physicalizer did not stop"
+                    )
+                return
+            if lost or not physicalizer.is_running:
+                self._set_runtime_input_state(
+                    voice_key_physicalizer_state="recovering"
+                )
+                return
+            self._set_runtime_input_state(
+                voice_key_physicalizer_state="ready"
+            )
             self._logger.info("startup: marked voice key physicalizer enabled")
 
+    def _cancel_voice_key_physicalizer_retry_locked(self) -> None:
+        timer = self._voice_key_physicalizer_retry_timer
+        self._voice_key_physicalizer_retry_timer = None
+        self._voice_key_physicalizer_retry_token = None
+        if timer is None:
+            return
+        cancel = getattr(timer, "cancel", None)
+        if callable(cancel):
+            try:
+                cancel()
+            except BaseException:
+                pass
 
-    def _start_hid_listener(self) -> None:
+    def _schedule_voice_key_physicalizer_recovery_locked(self) -> None:
+        if (
+            self._voice_key_physicalizer_stopping
+            or not self._accept_input_events
+            or self._voice_key_physicalizer_retry_timer is not None
+        ):
+            return
+        token = object()
+        try:
+            timer = self._voice_key_physicalizer_timer_factory(
+                _VOICE_KEY_PHYSICALIZER_RETRY_SECONDS,
+                lambda token=token: self._recover_voice_key_physicalizer(token),
+            )
+            if isinstance(timer, threading.Thread):
+                timer.daemon = True
+            self._voice_key_physicalizer_retry_token = token
+            self._voice_key_physicalizer_retry_timer = timer
+            timer.start()
+        except BaseException as exc:
+            if self._voice_key_physicalizer_retry_token is token:
+                self._voice_key_physicalizer_retry_token = None
+                self._voice_key_physicalizer_retry_timer = None
+            self._logger.error(
+                "voice key physicalizer recovery timer failed: error_type=%s",
+                type(exc).__name__,
+            )
+
+    def _recover_voice_key_physicalizer(self, token: object) -> None:
+        with self._voice_key_physicalizer_lifecycle_lock:
+            if self._voice_key_physicalizer_retry_token is not token:
+                return
+            self._voice_key_physicalizer_retry_token = None
+            self._voice_key_physicalizer_retry_timer = None
+            if (
+                self._voice_key_physicalizer_stopping
+                or not self._accept_input_events
+            ):
+                return
+            physicalizer = self._voice_key_physicalizer
+            if physicalizer is not None and physicalizer.is_running:
+                self._schedule_voice_key_physicalizer_recovery_locked()
+                return
+            self._voice_key_physicalizer = None
+        self._set_runtime_input_state(
+            voice_key_physicalizer_state="recovering"
+        )
+        self._start_voice_key_physicalizer(recovering=True)
+
+
+    def _cancel_raw_input_retry_locked(self) -> None:
+        timer = self._raw_input_retry_timer
+        self._raw_input_retry_timer = None
+        self._raw_input_retry_token = None
+        if timer is None:
+            return
+        cancel = getattr(timer, "cancel", None)
+        if callable(cancel):
+            try:
+                cancel()
+            except BaseException:
+                pass
+
+    def _schedule_raw_input_recovery_locked(self) -> None:
+        if (
+            self._raw_input_stopping
+            or not self._accept_input_events
+            or self._raw_input_retry_timer is not None
+        ):
+            return
+        token = object()
+        delay = self._raw_input_retry_delay
+        self._raw_input_retry_delay = min(
+            _RAW_INPUT_RETRY_MAX_SECONDS,
+            max(_RAW_INPUT_RETRY_INITIAL_SECONDS, delay * 2.0),
+        )
+        try:
+            timer = self._raw_input_timer_factory(
+                delay,
+                lambda token=token: self._recover_raw_input_listener(token),
+            )
+            if isinstance(timer, threading.Thread):
+                timer.daemon = True
+            self._raw_input_retry_token = token
+            self._raw_input_retry_timer = timer
+            timer.start()
+        except BaseException as exc:  # noqa: BLE001 - input remains failed closed
+            if self._raw_input_retry_token is token:
+                self._raw_input_retry_token = None
+                self._raw_input_retry_timer = None
+            self._logger.error(
+                "Raw Input recovery timer failed: error_type=%s",
+                type(exc).__name__,
+            )
+
+    def _raw_input_callback_is_current(
+        self,
+        listener: Optional[raw_input_windows.RawInputButtonListener],
+        generation: Optional[int],
+    ) -> bool:
+        if listener is None and generation is None:
+            return True
+        if listener is None or generation is None:
+            return False
+        with self._raw_input_lifecycle_lock:
+            return (
+                not self._raw_input_stopping
+                and self._hid_listener is listener
+                and self._raw_input_generation == int(generation)
+            )
+
+    def _cancel_raw_input_ownership_locked(self, *, reason: str) -> set[str]:
+        """Cancel every Raw-owned edge while the input lock is held."""
+
+        tracked_logical_buttons, tracked_physical_buttons = (
+            self._raw_fallback_tracked_button_ids_locked()
+        )
+        raw_fallback_buttons = (
+            set(self._raw_fallback_buttons_down) | tracked_logical_buttons
+        )
+        raw_fallback_physical_buttons = (
+            self._take_raw_fallback_physical_buttons_locked(
+                raw_fallback_buttons
+            )
+        )
+        affected_buttons = (
+            raw_fallback_buttons
+            | set(self._raw_mapped_buttons_down)
+            | tracked_physical_buttons
+        )
+        self._cancel_all_raw_fallback_hold_guards_locked()
+        self._raw_fallback_buttons_down.clear()
+        self._raw_mapped_buttons_down.clear()
+        if affected_buttons:
+            self._cancel_input_gestures(
+                affected_buttons,
+                reason=reason,
+                block_until_release=True,
+            )
+            self._release_raw_fallback_keyups(
+                raw_fallback_physical_buttons,
+                reason=reason,
+            )
+        return affected_buttons
+
+    def _recover_raw_input_listener(self, token: object) -> None:
+        with self._raw_input_operation_lock:
+            with self._input_arbitration_lock:
+                with self._raw_input_lifecycle_lock:
+                    if self._raw_input_retry_token is not token:
+                        return
+                    self._raw_input_retry_token = None
+                    self._raw_input_retry_timer = None
+                    if self._raw_input_stopping or not self._accept_input_events:
+                        return
+                    listener = self._hid_listener
+                    if listener is not None:
+                        # Invalidate every callback before stop() can emit
+                        # forced releases. The arbitration lock also lets an
+                        # already-running callback finish before its resulting
+                        # state is cancelled below.
+                        self._raw_input_generation += 1
+                if listener is not None:
+                    self._cancel_raw_input_ownership_locked(
+                        reason="raw_input_recovery"
+                    )
+
+            if listener is not None:
+                try:
+                    listener.stop()
+                except Exception:
+                    self._set_runtime_input_state(
+                        raw_input_state="failed_stopping"
+                    )
+                    self._logger.exception(
+                        "Raw Input recovery could not stop the old listener"
+                    )
+                    with self._raw_input_lifecycle_lock:
+                        self._schedule_raw_input_recovery_locked()
+                    return
+                with self._raw_input_lifecycle_lock:
+                    if self._hid_listener is listener:
+                        self._hid_listener = None
+                        self._raw_fallback_tracking_active = False
+
+            try:
+                self._start_hid_listener_owned(recovering=True)
+            except raw_input_windows.RawInputUnavailableError:
+                self._logger.exception(
+                    "Raw Input recovery retained a listener that did not start cleanly"
+                )
+                with self._raw_input_lifecycle_lock:
+                    self._schedule_raw_input_recovery_locked()
+
+    def _start_hid_listener(self, *, recovering: bool = False) -> None:
+        with self._raw_input_operation_lock:
+            self._start_hid_listener_owned(recovering=recovering)
+
+    def _start_hid_listener_owned(self, *, recovering: bool = False) -> None:
         """Best-effort: buttons fail closed independently of BLE/voice.
 
         Multiple matching HID device paths -> fail closed for buttons only
@@ -537,54 +887,142 @@ class RC003App:
         retry stopping it, exactly like any other retained-owner failure.
         """
 
-        self._set_runtime_input_state(raw_input_state="starting")
+        with self._input_arbitration_lock:
+            with self._raw_input_lifecycle_lock:
+                if self._raw_input_stopping or not self._accept_input_events:
+                    return
+                current = self._hid_listener
+                if current is not None and bool(
+                    getattr(current, "is_running", False)
+                ):
+                    return
+                self._hid_listener = None
+                self._raw_fallback_tracking_active = False
+                self._raw_input_generation += 1
+                generation = self._raw_input_generation
+                self._raw_input_lost_generation = -1
+
+        self._set_runtime_input_state(
+            raw_input_state="recovering" if recovering else "starting"
+        )
         try:
             paths = raw_input_windows.enumerate_matching_device_paths()
             device_path = hid_identity.select_single_device_path(paths)
         except raw_input_windows.RawInputUnavailableError as exc:
             self._set_runtime_input_state(raw_input_state="unavailable")
             self._logger.info("startup: Raw Input unavailable; buttons disabled: %s", exc)
+            with self._raw_input_lifecycle_lock:
+                if self._raw_input_generation == generation:
+                    self._schedule_raw_input_recovery_locked()
             return
         except hid_identity.NoDevicePathFoundError:
             self._set_runtime_input_state(raw_input_state="no_device")
             self._logger.info("startup: no RC003 HID device path found; buttons unavailable")
+            with self._raw_input_lifecycle_lock:
+                if self._raw_input_generation == generation:
+                    self._schedule_raw_input_recovery_locked()
             return
         except hid_identity.AmbiguousDevicePathError as exc:
             self._set_runtime_input_state(raw_input_state="ambiguous")
             self._logger.info(
                 "startup: buttons failing closed, ambiguous HID device paths: %s", exc
             )
+            with self._raw_input_lifecycle_lock:
+                if self._raw_input_generation == generation:
+                    self._schedule_raw_input_recovery_locked()
             return
 
-        self._hid_listener = raw_input_windows.RawInputButtonListener(
+        listener = raw_input_windows.RawInputButtonListener(
             self._on_raw_button_event
         )
-        self._sync_physical_bindings_to_listener(self._bindings)
+        with self._raw_input_lifecycle_lock:
+            if (
+                self._raw_input_stopping
+                or not self._accept_input_events
+                or self._raw_input_generation != generation
+            ):
+                return
+            self._hid_listener = listener
+        self._sync_physical_bindings_to_listener()
         set_sourced_button_event_callback = getattr(
-            self._hid_listener,
+            listener,
             "set_sourced_button_event_callback",
             None,
         )
         if callable(set_sourced_button_event_callback):
-            set_sourced_button_event_callback(self._on_raw_button_event)
+            set_sourced_button_event_callback(
+                lambda button_id, is_pressed, source, windows_button_id: (
+                    self._on_raw_button_event(
+                    button_id,
+                    is_pressed,
+                    source,
+                    windows_button_id,
+                    _listener=listener,
+                    _generation=generation,
+                )
+                )
+            )
+        set_raw_event_callback = getattr(
+            listener,
+            "set_raw_event_callback",
+            None,
+        )
+        if callable(set_raw_event_callback):
+            set_raw_event_callback(
+                lambda event: self._on_raw_physical_event(
+                    event,
+                    _listener=listener,
+                    _generation=generation,
+                )
+            )
+            with self._raw_input_lifecycle_lock:
+                if (
+                    self._hid_listener is listener
+                    and self._raw_input_generation == generation
+                ):
+                    self._raw_fallback_tracking_active = True
         set_device_removed_callback = getattr(
-            self._hid_listener,
+            listener,
             "set_device_removed_callback",
             None,
         )
         if callable(set_device_removed_callback):
-            set_device_removed_callback(self._on_raw_input_device_removed)
+            set_device_removed_callback(
+                lambda: self._on_raw_input_device_removed(
+                    _listener=listener,
+                    _generation=generation,
+                )
+            )
         set_input_corruption_callback = getattr(
-            self._hid_listener,
+            listener,
             "set_input_corruption_callback",
             None,
         )
         if callable(set_input_corruption_callback):
-            set_input_corruption_callback(self._on_raw_input_corruption)
+            set_input_corruption_callback(
+                lambda reason: self._on_raw_input_corruption(
+                    reason,
+                    _listener=listener,
+                    _generation=generation,
+                )
+            )
+        set_physical_keyboard_tracking_lost_callback = getattr(
+            listener,
+            "set_physical_keyboard_tracking_lost_callback",
+            None,
+        )
+        if callable(set_physical_keyboard_tracking_lost_callback):
+            set_physical_keyboard_tracking_lost_callback(
+                lambda reason: self._on_physical_keyboard_tracking_lost(
+                    reason,
+                    _listener=listener,
+                    _generation=generation,
+                )
+            )
         try:
-            self._hid_listener.start(device_path)
+            listener.start(device_path)
         except raw_input_windows.RawInputUnavailableError as exc:
-            if self._hid_listener.is_running:
+            if listener.is_running:
                 self._set_runtime_input_state(raw_input_state="failed_running")
                 self._logger.exception(
                     "startup: Raw Input listener failed to start but is still running; "
@@ -592,25 +1030,67 @@ class RC003App:
                 )
                 raise
             self._logger.info("startup: Raw Input listener failed to start: %s", exc)
-            self._hid_listener = None
+            with self._raw_input_lifecycle_lock:
+                if (
+                    self._hid_listener is listener
+                    and self._raw_input_generation == generation
+                ):
+                    self._hid_listener = None
+                    self._raw_fallback_tracking_active = False
+                    self._schedule_raw_input_recovery_locked()
             self._set_runtime_input_state(raw_input_state="failed")
             return
-        self._set_runtime_input_state(raw_input_state="ready")
+        with self._input_arbitration_lock:
+            with self._raw_input_lifecycle_lock:
+                stale = (
+                    self._raw_input_stopping
+                    or not self._accept_input_events
+                    or self._hid_listener is not listener
+                    or self._raw_input_generation != generation
+                )
+                lost = self._raw_input_lost_generation == generation
+                running = listener.is_running
+                if not stale and (lost or not running):
+                    self._schedule_raw_input_recovery_locked()
+                elif not stale:
+                    self._raw_input_retry_delay = (
+                        _RAW_INPUT_RETRY_INITIAL_SECONDS
+                    )
+            if not stale:
+                self._set_runtime_input_state(
+                    raw_input_state=(
+                        "recovering" if lost or not running else "ready"
+                    )
+                )
+        if stale:
+            if listener.is_running:
+                try:
+                    listener.stop()
+                except Exception:
+                    self._logger.exception(
+                        "cleanup: stale Raw Input listener did not stop"
+                    )
+            return
+        if lost or not running:
+            return
 
-    def _sync_physical_bindings_to_listener(self, bindings: dict) -> None:
-        listener = self._hid_listener
-        if listener is None:
-            return
-        set_physical_bindings = getattr(listener, "set_physical_bindings", None)
-        if not callable(set_physical_bindings):
-            return
-        try:
-            set_physical_bindings(bindings.get("physical_bindings", {}))
-        except Exception as exc:  # noqa: BLE001 - keep the last live decoder
-            self._logger.warning(
-                "physical button bindings update failed: error_type=%s",
-                type(exc).__name__,
-            )
+    def _sync_physical_bindings_to_listener(self) -> None:
+        with self._button_mapping_lock:
+            listener = self._hid_listener
+            if listener is None:
+                return
+            set_physical_bindings = getattr(listener, "set_physical_bindings", None)
+            if not callable(set_physical_bindings):
+                return
+            try:
+                set_physical_bindings(
+                    self._bindings.get("physical_bindings", {})
+                )
+            except Exception as exc:  # noqa: BLE001 - keep the last live decoder
+                self._logger.warning(
+                    "physical button bindings update failed: error_type=%s",
+                    type(exc).__name__,
+                )
 
     def _start_hid_report_tap(self) -> None:
         """Start the upstream-derived tap for usages Windows drops.
@@ -665,16 +1145,19 @@ class RC003App:
         block_until_release: bool,
     ) -> None:
         if block_until_release:
-            self._input_rearm_blocked_buttons.update(buttons)
+            self._block_input_until_release(buttons)
         self._button_combos.reset()
         self._button_gestures.reset()
         self._key_detection_suppressed_buttons.clear()
+        self._key_detection_suppression_deadlines.clear()
 
         if "mic" in buttons:
             with self._ordinary_mic_lock:
                 self._ordinary_mic_sources_down.clear()
                 self._ordinary_mic_late_sources_down.clear()
+                self._ordinary_mic_late_source_deadlines.clear()
                 self._ordinary_mic_sources_seen.clear()
+                self._ordinary_mic_gesture_started_at = 0.0
                 self._ordinary_mic_release_guard_until = 0.0
                 self._ordinary_mic_gesture_active = False
             with self._key_detection_mic_lock:
@@ -698,16 +1181,288 @@ class RC003App:
                 sorted(buttons),
             )
 
-    def _release_raw_fallback_keyups(
+    def _cancel_input_gestures_for_buttons(
         self,
         buttons: set[str],
+        *,
+        reason: str,
+        block_until_release: bool,
+    ) -> None:
+        """Cancel only input state coupled to the named physical buttons."""
+
+        affected_buttons = set(buttons)
+        affected_buttons.update(
+            self._button_combos.cancel_buttons(affected_buttons)
+        )
+        if block_until_release:
+            self._block_input_until_release(affected_buttons)
+        self._button_gestures.cancel_buttons(affected_buttons)
+        self._key_detection_suppressed_buttons.difference_update(
+            affected_buttons
+        )
+        for button_id in affected_buttons:
+            self._key_detection_suppression_deadlines.pop(button_id, None)
+
+        if "mic" in affected_buttons:
+            with self._ordinary_mic_lock:
+                self._ordinary_mic_sources_down.clear()
+                self._ordinary_mic_late_sources_down.clear()
+                self._ordinary_mic_late_source_deadlines.clear()
+                self._ordinary_mic_sources_seen.clear()
+                self._ordinary_mic_gesture_started_at = 0.0
+                self._ordinary_mic_release_guard_until = 0.0
+                self._ordinary_mic_gesture_active = False
+            with self._key_detection_mic_lock:
+                self._reset_key_detection_mic_gesture_locked()
+            with self._voice_trigger_lock:
+                self._voice_mic_gesture_sources_down.clear()
+                self._voice_mic_gesture_hid_released = True
+                if self._voice.active:
+                    self._release_hold_voice_on_physical_release_locked(reason)
+                if (
+                    self._voice_mic_gesture_active
+                    and not self._voice_audio_stream_active
+                ):
+                    self._finish_voice_mic_gesture()
+                self._apply_pending_voice_settings_if_idle_locked()
+
+        if affected_buttons:
+            self._logger.warning(
+                "button input ownership cancelled: reason=%s buttons=%s",
+                reason,
+                sorted(affected_buttons),
+            )
+
+    def _on_raw_physical_event(
+        self,
+        event: raw_input_windows.RawInputEvent,
+        *,
+        _listener: Optional[raw_input_windows.RawInputButtonListener] = None,
+        _generation: Optional[int] = None,
+    ) -> None:
+        """Track the real Windows key independently of a taught button ID."""
+
+        if not self._raw_input_callback_is_current(_listener, _generation):
+            return
+        logical_button = event.button_id
+        physical_button = event.windows_button_id
+        signature = raw_input_windows.physical_signature(event)
+        with self._input_arbitration_lock:
+            if not self._raw_input_callback_is_current(
+                _listener,
+                _generation,
+            ):
+                return
+            self._raw_fallback_tracking_active = True
+
+            if not event.is_pressed:
+                tracked = self._raw_fallback_physical_buttons_down.pop(
+                    signature,
+                    None,
+                )
+                debt_logical_buttons, debt_physical_buttons = (
+                    self._raw_fallback_release_debts.pop(
+                        signature,
+                        (set(), set()),
+                    )
+                )
+                released_buttons = (
+                    set(debt_logical_buttons) | set(debt_physical_buttons)
+                )
+                if tracked is not None:
+                    released_buttons.add(tracked[0])
+                    if tracked[1] is not None:
+                        released_buttons.add(tracked[1])
+                else:
+                    if logical_button is not None:
+                        released_buttons.add(logical_button)
+                    if physical_button is not None:
+                        released_buttons.add(physical_button)
+                remaining = [
+                    {
+                        candidate
+                        for candidate in tracked_pair
+                        if candidate is not None
+                    }
+                    for tracked_pair in (
+                        self._raw_fallback_physical_buttons_down.values()
+                    )
+                ] + [
+                    set(logical_buttons) | set(physical_buttons)
+                    for logical_buttons, physical_buttons in (
+                        self._raw_fallback_release_debts.values()
+                    )
+                ]
+                with self._direct_hid_lock:
+                    direct_buttons = self._direct_buttons_for_usages(
+                        self._direct_hid_usages
+                    )
+                for blocked_button in released_buttons:
+                    if (
+                        blocked_button not in direct_buttons
+                        and all(
+                            blocked_button not in candidate
+                            for candidate in remaining
+                        )
+                    ):
+                        self._input_rearm_blocked_buttons.discard(
+                            blocked_button
+                        )
+                return
+
+            if not self._accept_input_events:
+                return
+            release_debt = self._raw_fallback_release_debts.get(signature)
+            if release_debt is not None:
+                debt_logical_buttons, debt_physical_buttons = release_debt
+                if logical_button is not None:
+                    debt_logical_buttons.add(logical_button)
+                if physical_button is not None:
+                    debt_physical_buttons.add(physical_button)
+                self._block_input_until_release(
+                    set(debt_logical_buttons) | set(debt_physical_buttons)
+                )
+                if physical_button in _RAW_FALLBACK_KEY_TOKENS:
+                    self._release_raw_fallback_keyups(
+                        {physical_button},
+                        reason="raw_release_debt_repeat",
+                    )
+                return
+            if logical_button is None:
+                return
+            was_new = signature not in self._raw_fallback_physical_buttons_down
+            tracked = self._raw_fallback_physical_buttons_down.setdefault(
+                signature,
+                (logical_button, physical_button),
+            )
+            tracked_logical, tracked_physical = tracked
+            if not (
+                self._direct_hid_interception_armed
+                or self._direct_hid_interception_ready
+            ):
+                return
+
+            physical_was_blocked = (
+                tracked_physical in self._input_rearm_blocked_buttons
+            )
+            blocked_buttons = {tracked_logical}
+            if tracked_physical is not None:
+                blocked_buttons.add(tracked_physical)
+            newly_quarantined = was_new and not physical_was_blocked
+            if newly_quarantined:
+                with self._direct_hid_lock:
+                    direct_buttons = self._direct_buttons_for_usages(
+                        self._direct_hid_usages
+                    )
+                cancellation_buttons = set(blocked_buttons)
+                if cancellation_buttons.intersection(direct_buttons):
+                    cancellation_buttons.update(direct_buttons)
+                    self._direct_hid_handover_waiting_for_neutral = True
+                self._cancel_input_gestures_for_buttons(
+                    cancellation_buttons,
+                    reason="late_raw_after_hid_handover",
+                    block_until_release=True,
+                )
+            else:
+                self._block_input_until_release(blocked_buttons)
+            if newly_quarantined and tracked_physical in _RAW_FALLBACK_KEY_TOKENS:
+                self._release_raw_fallback_keyups(
+                    {tracked_physical},
+                    reason="late_raw_after_hid_handover",
+                )
+
+    def _take_raw_fallback_physical_buttons_locked(
+        self,
+        logical_buttons: set[str],
+    ) -> set[str]:
+        matched_signatures = {
+            signature
+            for signature, (logical_button, _physical_button) in (
+                self._raw_fallback_physical_buttons_down.items()
+            )
+            if logical_button in logical_buttons
+        }
+        physical_buttons = {
+            self._raw_fallback_physical_buttons_down[signature][1]
+            for signature in matched_signatures
+            if self._raw_fallback_physical_buttons_down[signature][1]
+            in _RAW_FALLBACK_KEY_TOKENS
+        }
+        for signature in matched_signatures:
+            tracked = self._raw_fallback_physical_buttons_down.pop(
+                signature,
+                None,
+            )
+            if tracked is not None:
+                release_debt = self._raw_fallback_release_debts.setdefault(
+                    signature,
+                    (set(), set()),
+                )
+                debt_logical_buttons, debt_physical_buttons = release_debt
+                debt_logical_buttons.add(tracked[0])
+                if tracked[1] is not None:
+                    debt_physical_buttons.add(tracked[1])
+
+        # Compatibility for injected test owners and old listener fakes that
+        # do not expose raw physical events. The real listener always enables
+        # tracking before it can emit a logical edge, so production remaps
+        # never guess the logical key here.
+        if not self._raw_fallback_tracking_active:
+            physical_buttons.update(
+                logical_button
+                for logical_button in logical_buttons
+                if logical_button in _RAW_FALLBACK_KEY_TOKENS
+            )
+        return physical_buttons
+
+    def _raw_fallback_tracked_button_ids_locked(
+        self,
+    ) -> tuple[set[str], set[str]]:
+        logical_buttons = {
+            logical_button
+            for logical_button, _physical_button in (
+                self._raw_fallback_physical_buttons_down.values()
+            )
+        }
+        physical_buttons = {
+            physical_button
+            for _logical_button, physical_button in (
+                self._raw_fallback_physical_buttons_down.values()
+            )
+            if physical_button in _RAW_FALLBACK_KEY_TOKENS
+        }
+        return logical_buttons, physical_buttons
+
+    def _windows_buttons_down_before_hid_handover(
+        self,
+    ) -> Optional[set[str]]:
+        buttons_down: set[str] = set()
+        try:
+            for button, token in _RAW_FALLBACK_KEY_TOKENS.items():
+                vk_codes = win32_keys.resolve_vk_codes((token,))
+                if any(
+                    self._raw_windows_key_down_query(vk_code)
+                    for vk_code in vk_codes
+                ):
+                    buttons_down.add(button)
+        except Exception as exc:  # noqa: BLE001 - unknown state fails closed
+            self._logger.warning(
+                "Windows key state unavailable during HID handover: error_type=%s",
+                type(exc).__name__,
+            )
+            return None
+        return buttons_down
+
+    def _release_raw_fallback_keyups(
+        self,
+        physical_buttons: set[str],
         *,
         reason: str,
     ) -> None:
         tokens = tuple(
             dict.fromkeys(
                 token
-                for button in sorted(buttons)
+                for button in sorted(physical_buttons)
                 if (token := _RAW_FALLBACK_KEY_TOKENS.get(button)) is not None
             )
         )
@@ -721,7 +1476,7 @@ class RC003App:
                 self._logger.info(
                     "raw Windows key-up safety release completed: reason=%s buttons=%s",
                     reason,
-                    sorted(buttons),
+                    sorted(physical_buttons),
                 )
 
     def _cancel_raw_fallback_hold_guard_locked(self, button_id: str) -> None:
@@ -779,9 +1534,14 @@ class RC003App:
             if button_id not in self._raw_fallback_buttons_down:
                 return
             self._raw_fallback_buttons_down.discard(button_id)
-            self._input_rearm_blocked_buttons.add(button_id)
+            physical_buttons = self._take_raw_fallback_physical_buttons_locked(
+                {button_id}
+            )
+            self._block_input_until_release(
+                {button_id} | physical_buttons
+            )
             self._release_raw_fallback_keyups(
-                {button_id},
+                physical_buttons,
                 reason="raw_fallback_hold_timeout",
             )
             self._logger.warning(
@@ -791,24 +1551,56 @@ class RC003App:
                 button_id,
             )
 
-    def _on_raw_input_device_removed(self) -> None:
-        self._set_runtime_input_state(raw_input_state="device_removed")
+    def _on_raw_input_device_removed(
+        self,
+        *,
+        _listener: Optional[raw_input_windows.RawInputButtonListener] = None,
+        _generation: Optional[int] = None,
+    ) -> None:
+        if not self._raw_input_callback_is_current(_listener, _generation):
+            return
         with self._input_arbitration_lock:
+            if not self._raw_input_callback_is_current(
+                _listener,
+                _generation,
+            ):
+                return
+            with self._raw_input_lifecycle_lock:
+                resolved_generation = (
+                    self._raw_input_generation
+                    if _generation is None
+                    else int(_generation)
+                )
+                self._raw_input_lost_generation = resolved_generation
+            self._set_runtime_input_state(raw_input_state="device_removed")
             with self._direct_hid_lock:
                 direct_buttons = self._direct_buttons_for_usages(
                     self._direct_hid_usages
                 )
                 self._direct_hid_usages.clear()
-            raw_fallback_buttons = set(self._raw_fallback_buttons_down)
+            tracked_logical_buttons, tracked_physical_buttons = (
+                self._raw_fallback_tracked_button_ids_locked()
+            )
+            raw_fallback_buttons = (
+                set(self._raw_fallback_buttons_down)
+                | tracked_logical_buttons
+            )
+            raw_fallback_physical_buttons = (
+                self._take_raw_fallback_physical_buttons_locked(
+                    raw_fallback_buttons
+                )
+            )
             self._cancel_all_raw_fallback_hold_guards_locked()
             lost_buttons = (
                 raw_fallback_buttons
                 | set(self._raw_mapped_buttons_down)
+                | tracked_physical_buttons
                 | direct_buttons
                 | set(self._input_rearm_blocked_buttons)
             )
             self._direct_hid_interception_ready = False
             self._direct_hid_interception_armed = False
+            self._direct_hid_handover_waiting_for_neutral = False
             self._raw_fallback_buttons_down.clear()
             self._raw_mapped_buttons_down.clear()
             self._input_rearm_blocked_buttons.clear()
@@ -816,43 +1608,175 @@ class RC003App:
             # separately owned HID tap is still alive. Preserve a guard for
             # direct buttons that were down until a later neutral report or
             # matching release proves the old hold is over.
-            self._input_rearm_blocked_buttons.update(direct_buttons)
+            self._block_input_until_release(lost_buttons)
             self._cancel_input_gestures(
                 lost_buttons,
                 reason="raw_input_device_removed",
                 block_until_release=False,
             )
             self._release_raw_fallback_keyups(
-                raw_fallback_buttons,
+                raw_fallback_physical_buttons,
                 reason="raw_input_device_removed",
             )
         self._logger.warning("RC003 Raw Input device removed; requesting reconnect")
+        with self._raw_input_lifecycle_lock:
+            if self._raw_input_callback_is_current(_listener, _generation):
+                self._schedule_raw_input_recovery_locked()
         self._supervisor.request_reconnect()
 
-    def _on_raw_input_corruption(self, reason: str) -> None:
+    def _on_raw_input_corruption(
+        self,
+        reason: str,
+        *,
+        _listener: Optional[raw_input_windows.RawInputButtonListener] = None,
+        _generation: Optional[int] = None,
+    ) -> None:
         """Cancel Raw Input ownership while preserving the physical release."""
 
+        if not self._raw_input_callback_is_current(_listener, _generation):
+            return
         with self._input_arbitration_lock:
-            raw_fallback_buttons = set(self._raw_fallback_buttons_down)
-            raw_mapped_buttons = set(self._raw_mapped_buttons_down)
-            affected_buttons = raw_fallback_buttons | raw_mapped_buttons
-            self._cancel_all_raw_fallback_hold_guards_locked()
-            self._raw_fallback_buttons_down.clear()
-            self._raw_mapped_buttons_down.clear()
-            if affected_buttons:
-                self._cancel_input_gestures(
-                    affected_buttons,
-                    reason=f"raw_input_corruption_{reason}",
-                    block_until_release=True,
-                )
-                self._release_raw_fallback_keyups(
-                    raw_fallback_buttons,
-                    reason=f"raw_input_corruption_{reason}",
-                )
+            if not self._raw_input_callback_is_current(
+                _listener,
+                _generation,
+            ):
+                return
+            affected_buttons = self._cancel_raw_input_ownership_locked(
+                reason=f"raw_input_corruption_{reason}"
+            )
+            if reason in {
+                "raw_input_header_unavailable",
+                "raw_input_listener_exited",
+            }:
+                with self._raw_input_lifecycle_lock:
+                    resolved_generation = (
+                        self._raw_input_generation
+                        if _generation is None
+                        else int(_generation)
+                    )
+                    self._raw_input_lost_generation = resolved_generation
+                    self._schedule_raw_input_recovery_locked()
+                self._set_runtime_input_state(raw_input_state="recovering")
         self._logger.warning(
             "RC003 Raw Input data rejected: reason=%s cancelled_buttons=%s",
             reason,
             sorted(affected_buttons),
+        )
+
+    def _on_physical_keyboard_tracking_lost(
+        self,
+        reason: str,
+        *,
+        _listener: Optional[raw_input_windows.RawInputButtonListener] = None,
+        _generation: Optional[int] = None,
+    ) -> None:
+        """End an unsafe ordinary-key HOLD; future downs fail closed."""
+
+        with self._input_arbitration_lock:
+            if not self._raw_input_callback_is_current(
+                _listener,
+                _generation,
+            ):
+                return
+            with self._raw_input_lifecycle_lock:
+                resolved_generation = (
+                    self._raw_input_generation
+                    if _generation is None
+                    else int(_generation)
+                )
+                self._raw_input_lost_generation = resolved_generation
+                self._schedule_raw_input_recovery_locked()
+            self._set_runtime_input_state(raw_input_state="unhealthy")
+            with self._voice_trigger_lock:
+                tokens = tuple(self._voice_hotkey.modifiers) + (
+                    self._voice_hotkey.key,
+                )
+                active_hold = (
+                    self._voice.active
+                    or self._voice_hotkey_release_pending is not None
+                )
+                if active_hold and not win32_input.can_begin_tracked_hold(tokens):
+                    self._force_voice_hold_release_locked(
+                        "physical keyboard tracking lost"
+                    )
+            self._release_pending_button_keys()
+        self._logger.warning(
+            "physical keyboard tracking lost: reason=%s; unsafe held shortcuts disabled",
+            reason,
+        )
+
+    def _on_voice_key_physicalizer_tracking_lost(
+        self,
+        physicalizer: Optional[
+            voice_key_physicalizer_windows.VoiceKeyPhysicalizer
+        ] = None,
+        generation: Optional[int] = None,
+    ) -> None:
+        """Release an active marked right-Alt hold before the hook disappears."""
+
+        with self._voice_key_physicalizer_lifecycle_lock:
+            current = self._voice_key_physicalizer
+            current_generation = self._voice_key_physicalizer_generation
+            resolved_physicalizer = physicalizer or current
+            resolved_generation = (
+                current_generation if generation is None else int(generation)
+            )
+            if (
+                resolved_physicalizer is None
+                or current is not resolved_physicalizer
+                or current_generation != resolved_generation
+                or self._voice_key_physicalizer_stopping
+            ):
+                return
+            self._voice_key_physicalizer_lost_generation = resolved_generation
+            self._voice_key_physicalizer_ready = False
+        self._set_runtime_input_state(
+            voice_key_physicalizer_state="recovering"
+        )
+        raw_tracking_available = (
+            raw_input_windows.physical_keyboard_tracking_available()
+        )
+        with self._voice_trigger_lock:
+            tokens = tuple(self._voice_hotkey.modifiers) + (
+                self._voice_hotkey.key,
+            )
+            try:
+                uses_right_alt = (
+                    win32_keys.VK_CODES["ralt"]
+                    in win32_keys.resolve_vk_codes(tokens)
+                )
+            except win32_keys.UnknownKeyTokenError:
+                uses_right_alt = False
+            active_hold = (
+                self._voice.active
+                or self._voice_hotkey_release_pending is not None
+            )
+            if (
+                active_hold
+                and (
+                    not raw_tracking_available
+                    or (
+                        uses_right_alt
+                        and self._configured_voice_hotkey_backend()
+                        == _VOICE_HOTKEY_BACKEND_MARKED
+                    )
+                )
+            ):
+                self._force_voice_hold_release_locked(
+                    "voice key physicalizer stopped unexpectedly"
+                )
+        if not raw_tracking_available:
+            self._release_pending_button_keys()
+        with self._voice_key_physicalizer_lifecycle_lock:
+            if (
+                self._voice_key_physicalizer is resolved_physicalizer
+                and self._voice_key_physicalizer_generation
+                == resolved_generation
+                and not self._voice_key_physicalizer_stopping
+            ):
+                self._schedule_voice_key_physicalizer_recovery_locked()
+        self._logger.warning(
+            "voice key physicalizer stopped unexpectedly; recovery scheduled"
         )
 
     def _on_hid_tap_status(self, status: str, detail: str) -> None:
@@ -868,6 +1792,10 @@ class RC003App:
             message += " detail=%s"
             args.append(detail)
         with self._input_arbitration_lock:
+            newly_armed = (
+                interception_armed
+                and not self._direct_hid_interception_armed
+            )
             if not interception_ready and self._direct_hid_interception_ready:
                 self._logger.warning(message, *args)
                 with self._direct_hid_lock:
@@ -881,14 +1809,37 @@ class RC003App:
                 )
             else:
                 self._logger.info(message, *args)
-            if interception_armed and not self._direct_hid_interception_armed:
+            if newly_armed:
                 # ATTACHED_WAITING_IO is emitted only after the helper has
                 # acknowledged the interception lease. Cancel any in-flight
                 # Raw Input gesture instead of completing it as a click, then
                 # ignore the same physical hold until its real release arrives.
+                windows_buttons_down = (
+                    self._windows_buttons_down_before_hid_handover()
+                )
+                self._direct_hid_handover_waiting_for_neutral = (
+                    windows_buttons_down is None
+                )
+                windows_buttons_down = windows_buttons_down or set()
                 raw_mapped_buttons = set(self._raw_mapped_buttons_down)
-                raw_fallback_buttons = set(self._raw_fallback_buttons_down)
-                handover_buttons = raw_mapped_buttons | raw_fallback_buttons
+                tracked_logical_buttons, tracked_physical_buttons = (
+                    self._raw_fallback_tracked_button_ids_locked()
+                )
+                raw_fallback_buttons = (
+                    set(self._raw_fallback_buttons_down)
+                    | tracked_logical_buttons
+                )
+                raw_fallback_physical_buttons = (
+                    self._take_raw_fallback_physical_buttons_locked(
+                        raw_fallback_buttons
+                    )
+                )
+                handover_buttons = (
+                    raw_mapped_buttons
+                    | raw_fallback_buttons
+                    | tracked_physical_buttons
+                    | windows_buttons_down
+                )
                 self._cancel_all_raw_fallback_hold_guards_locked()
                 self._cancel_input_gestures(
                     handover_buttons,
@@ -896,11 +1847,13 @@ class RC003App:
                     block_until_release=True,
                 )
                 self._release_raw_fallback_keyups(
-                    raw_fallback_buttons,
+                    raw_fallback_physical_buttons | windows_buttons_down,
                     reason="hid_tap_handover",
                 )
                 self._raw_fallback_buttons_down.clear()
                 self._raw_mapped_buttons_down.clear()
+            elif not interception_armed:
+                self._direct_hid_handover_waiting_for_neutral = False
             self._direct_hid_interception_armed = interception_armed
             self._direct_hid_interception_ready = interception_ready
 
@@ -931,6 +1884,19 @@ class RC003App:
                 # A newly received, validated tap report is stronger evidence
                 # than the Raw Input collection-removal notification. Restore
                 # local ownership without waiting for a duplicate status event.
+                if not self._direct_hid_interception_armed:
+                    windows_buttons_down = (
+                        self._windows_buttons_down_before_hid_handover()
+                    )
+                    self._direct_hid_handover_waiting_for_neutral = (
+                        windows_buttons_down is None
+                    )
+                    if windows_buttons_down:
+                        self._block_input_until_release(windows_buttons_down)
+                        self._release_raw_fallback_keyups(
+                            windows_buttons_down,
+                            reason="hid_tap_report_revalidated",
+                        )
                 self._direct_hid_interception_armed = True
                 self._direct_hid_interception_ready = True
             elif tap is not None and not tap_reports_ready:
@@ -941,23 +1907,34 @@ class RC003App:
                 int.from_bytes(payload[index : index + 2], "little")
                 for index in range(0, len(payload), 2)
             } & set(frida_compat.TAP_USAGE_TO_BUTTON)
-            if not active:
-                self._input_rearm_blocked_buttons.clear()
+            active_buttons = self._direct_buttons_for_usages(active)
             with self._direct_hid_lock:
                 previous = self._direct_hid_usages
+                previous_buttons = self._direct_buttons_for_usages(previous)
+                if self._direct_hid_handover_waiting_for_neutral:
+                    if active:
+                        self._block_input_until_release(
+                            active_buttons | previous_buttons
+                        )
+                        self._direct_hid_usages = set(active)
+                        return
+                    self._direct_hid_handover_waiting_for_neutral = False
+                if not active:
+                    # A verified neutral tap snapshot proves that every
+                    # pre-handover Raw physical edge has ended. Drop those
+                    # records so a later press cannot inherit stale ownership.
+                    self._raw_fallback_physical_buttons_down.clear()
+                    self._raw_fallback_release_debts.clear()
+                self._input_rearm_blocked_buttons.difference_update(
+                    self._input_rearm_blocked_buttons
+                    - active_buttons
+                    - previous_buttons
+                )
                 if active == previous:
                     return
                 pressed = active - previous
                 released = previous - active
                 self._direct_hid_usages = set(active)
-            for usage in sorted(pressed):
-                button = frida_compat.TAP_USAGE_TO_BUTTON[usage]
-                self._logger.info(
-                    "RC003 direct HID usage down: 0x%04x -> %s",
-                    usage,
-                    button,
-                )
-                self._on_button_event(button, True, event_source="hid_tap")
             for usage in sorted(released):
                 button = frida_compat.TAP_USAGE_TO_BUTTON[usage]
                 self._logger.info(
@@ -966,11 +1943,39 @@ class RC003App:
                     button,
                 )
                 self._on_button_event(button, False, event_source="hid_tap")
+            with self._button_mapping_lock:
+                combo_modifier = key_mapping.button_combo_modifier(self._bindings)
+            for usage in sorted(
+                pressed,
+                key=lambda candidate: (
+                    frida_compat.TAP_USAGE_TO_BUTTON[candidate] != combo_modifier,
+                    candidate,
+                ),
+            ):
+                button = frida_compat.TAP_USAGE_TO_BUTTON[usage]
+                self._logger.info(
+                    "RC003 direct HID usage down: 0x%04x -> %s",
+                    usage,
+                    button,
+                )
+                self._on_button_event(button, True, event_source="hid_tap")
 
     def _stop_input_channels(self) -> None:
         """Stop process-lifetime input resources exactly once at worker exit."""
 
         failures: List[str] = []
+        with self._voice_key_physicalizer_lifecycle_lock:
+            self._voice_key_physicalizer_stopping = True
+            self._voice_key_physicalizer_generation += 1
+            self._cancel_voice_key_physicalizer_retry_locked()
+        with self._input_arbitration_lock:
+            with self._raw_input_lifecycle_lock:
+                self._raw_input_stopping = True
+                self._raw_input_generation += 1
+                self._cancel_raw_input_retry_locked()
+        with self._button_action_lock:
+            self._button_input_release_retry_stopping = True
+            self._cancel_button_input_release_retry_locked(reset_delay=False)
 
         # Input loss is cancellation, not a click. Clear gesture timers before
         # listener shutdown emits forced releases, and release any Windows key
@@ -979,8 +1984,17 @@ class RC003App:
         self._button_gestures.reset()
         with self._input_arbitration_lock:
             self._cancel_all_raw_fallback_hold_guards_locked()
+            tracked_logical_buttons, _tracked_physical_buttons = (
+                self._raw_fallback_tracked_button_ids_locked()
+            )
+            raw_fallback_physical_buttons = (
+                self._take_raw_fallback_physical_buttons_locked(
+                    set(self._raw_fallback_buttons_down)
+                    | tracked_logical_buttons
+                )
+            )
             self._release_raw_fallback_keyups(
-                set(self._raw_fallback_buttons_down),
+                raw_fallback_physical_buttons,
                 reason="input_channels_stopping",
             )
 
@@ -1001,17 +2015,55 @@ class RC003App:
         else:
             self._set_runtime_input_state(hid_tap_state="stopped")
 
-        if self._hid_listener is not None:
-            try:
-                self._hid_listener.stop()
-                self._hid_listener = None
-                self._set_runtime_input_state(raw_input_state="stopped")
-            except Exception:
-                self._set_runtime_input_state(raw_input_state="failed_stopping")
-                self._logger.exception("cleanup: stopping the Raw Input listener failed")
-                failures.append("Raw Input listener did not stop; owner retained")
+        keyboard_release_complete = True
+        if not self._release_pending_button_keys():
+            keyboard_release_complete = False
+            failures.append(
+                "ordinary button key safety release did not fully deliver; "
+                "keyboard trackers retained"
+            )
+        if not self._release_pending_button_mouse():
+            failures.append(
+                "ordinary button mouse safety release did not fully deliver; "
+                "state retained"
+            )
+
+        with self._voice_trigger_lock:
+            if self._voice_hotkey_release_pending is not None:
+                if self._release_pending_voice_hotkey():
+                    self._voice.cancel_pending()
+                else:
+                    keyboard_release_complete = False
+                    failures.append(
+                        "voice hotkey final safety release did not fully deliver; "
+                        "keyboard trackers retained"
+                    )
+
+        if keyboard_release_complete:
+            with self._raw_input_operation_lock:
+                listener = self._hid_listener
+                if listener is not None:
+                    try:
+                        listener.stop()
+                        with self._raw_input_lifecycle_lock:
+                            if self._hid_listener is listener:
+                                self._hid_listener = None
+                                self._raw_fallback_tracking_active = False
+                        self._set_runtime_input_state(raw_input_state="stopped")
+                    except Exception:
+                        self._set_runtime_input_state(
+                            raw_input_state="failed_stopping"
+                        )
+                        self._logger.exception(
+                            "cleanup: stopping the Raw Input listener failed"
+                        )
+                        failures.append(
+                            "Raw Input listener did not stop; owner retained"
+                        )
+                else:
+                    self._set_runtime_input_state(raw_input_state="stopped")
         else:
-            self._set_runtime_input_state(raw_input_state="stopped")
+            self._set_runtime_input_state(raw_input_state="retained_for_cleanup")
 
         with self._voice_trigger_lock:
             self._accept_input_events = False
@@ -1021,15 +2073,21 @@ class RC003App:
         with self._input_arbitration_lock:
             self._direct_hid_interception_ready = False
             self._direct_hid_interception_armed = False
+            self._direct_hid_handover_waiting_for_neutral = False
             self._cancel_all_raw_fallback_hold_guards_locked()
             self._raw_fallback_buttons_down.clear()
+            self._raw_fallback_physical_buttons_down.clear()
+            self._raw_fallback_release_debts.clear()
             self._raw_mapped_buttons_down.clear()
             self._input_rearm_blocked_buttons.clear()
         self._key_detection_suppressed_buttons.clear()
+        self._key_detection_suppression_deadlines.clear()
         with self._ordinary_mic_lock:
             self._ordinary_mic_sources_down.clear()
             self._ordinary_mic_late_sources_down.clear()
+            self._ordinary_mic_late_source_deadlines.clear()
             self._ordinary_mic_sources_seen.clear()
+            self._ordinary_mic_gesture_started_at = 0.0
             self._ordinary_mic_release_guard_until = 0.0
             self._ordinary_mic_gesture_active = False
         with self._key_detection_mic_lock:
@@ -1037,19 +2095,33 @@ class RC003App:
         self._button_combos.reset()
         self._button_gestures.reset()
 
-        if not self._release_pending_button_inputs():
-            failures.append(
-                "ordinary button input safety release did not fully deliver; "
-                "state retained"
-            )
-
-        if self._voice_key_physicalizer is not None:
-            try:
-                self._voice_key_physicalizer.stop()
-                self._voice_key_physicalizer = None
-            except Exception:
-                self._logger.exception("cleanup: stopping voice key physicalizer failed")
-                failures.append("voice key physicalizer did not stop; owner retained")
+        physicalizer_state = "stopped"
+        if keyboard_release_complete:
+            with self._voice_key_physicalizer_operation_lock:
+                with self._voice_key_physicalizer_lifecycle_lock:
+                    physicalizer = self._voice_key_physicalizer
+                if physicalizer is not None:
+                    try:
+                        physicalizer.stop()
+                    except Exception:
+                        physicalizer_state = "failed"
+                        self._logger.exception(
+                            "cleanup: stopping voice key physicalizer failed"
+                        )
+                        failures.append(
+                            "voice key physicalizer did not stop; owner retained"
+                        )
+                    else:
+                        with self._voice_key_physicalizer_lifecycle_lock:
+                            if self._voice_key_physicalizer is physicalizer:
+                                self._voice_key_physicalizer = None
+        else:
+            physicalizer_state = "failed"
+        with self._voice_key_physicalizer_lifecycle_lock:
+            self._voice_key_physicalizer_ready = False
+        self._set_runtime_input_state(
+            voice_key_physicalizer_state=physicalizer_state
+        )
 
         if failures:
             raise CleanupIncompleteError(
@@ -1270,14 +2342,30 @@ class RC003App:
             voice_hotkey = hotkey.HotkeySpec.parse(
                 self._voice_hotkey_text_for_mode(mode)
             )
-            win32_keys.resolve_vk_codes(
-                tuple(voice_hotkey.modifiers) + (voice_hotkey.key,)
-            )
+            tokens = tuple(voice_hotkey.modifiers) + (voice_hotkey.key,)
+            resolved_vk_codes = win32_keys.resolve_vk_codes(tokens)
         except (hotkey.HotkeyParseError, win32_keys.UnknownKeyTokenError) as exc:
             self._logger.warning(
                 "voice mapping ignored: invalid %s shortcut: %s",
                 mode.value,
                 exc,
+            )
+            return False
+        if not win32_input.can_begin_tracked_hold(tokens):
+            self._logger.warning(
+                "voice mapping ignored: physical keyboard tracking is unavailable "
+                "for shortcut=%s",
+                voice_hotkey.serialize(),
+            )
+            return False
+        if (
+            self._configured_voice_hotkey_backend()
+            == _VOICE_HOTKEY_BACKEND_MARKED
+            and win32_keys.VK_CODES["ralt"] in resolved_vk_codes
+            and not self._voice_key_physicalizer_ready
+        ):
+            self._logger.warning(
+                "voice mapping ignored: marked right-Alt physicalizer is unavailable"
             )
             return False
         requested = (mode, voice_hotkey.serialize())
@@ -1590,16 +2678,24 @@ class RC003App:
         button_id: str,
         is_pressed: bool,
         source: str = "unknown",
+        windows_button_id: Optional[str] = None,
+        *,
+        _listener: Optional[raw_input_windows.RawInputButtonListener] = None,
+        _generation: Optional[int] = None,
     ) -> None:
         event_source = {
             "keyboard": "raw_keyboard",
             "hid": "raw_hid",
         }.get(source, "raw_unknown")
-        self._on_button_event(
-            button_id,
-            is_pressed,
-            event_source=event_source,
-        )
+        with self._input_arbitration_lock:
+            if not self._raw_input_callback_is_current(_listener, _generation):
+                return
+            self._on_button_event_serialized(
+                button_id,
+                is_pressed,
+                event_source=event_source,
+                raw_windows_button_id=windows_button_id,
+            )
 
     # -- HID button events --------------------------------------------------
 
@@ -1660,7 +2756,7 @@ class RC003App:
                     self._button_combos.reset()
                     self._bindings = self._pending_bindings
                     self._pending_bindings = None
-                    self._sync_physical_bindings_to_listener(self._bindings)
+                    self._sync_physical_bindings_to_listener()
                     self._removed_voice_bindings = dict(
                         self._bindings.get(
                             config.RUNTIME_REMOVED_VOICE_BINDINGS_KEY, {}
@@ -1723,7 +2819,7 @@ class RC003App:
                     if self._ordinary_button_mappings_idle():
                         self._button_combos.reset()
                         self._bindings = refreshed_bindings
-                        self._sync_physical_bindings_to_listener(self._bindings)
+                        self._sync_physical_bindings_to_listener()
                         self._removed_voice_bindings = removed_voice_bindings
                         self._pending_bindings = None
                     else:
@@ -1754,7 +2850,40 @@ class RC003App:
         """Collapse F5/HID duplicates before ordinary mic gesture dispatch."""
 
         dispatch = False
+        cancel_stale_gesture = False
+        now = time.monotonic()
         with self._ordinary_mic_lock:
+            expired_late_sources = {
+                source
+                for source, deadline in self._ordinary_mic_late_source_deadlines.items()
+                if now >= deadline
+            }
+            if expired_late_sources:
+                self._ordinary_mic_late_sources_down.difference_update(
+                    expired_late_sources
+                )
+                for source in expired_late_sources:
+                    self._ordinary_mic_late_source_deadlines.pop(source, None)
+
+            stale_active_gesture = self._ordinary_mic_gesture_active and (
+                now - self._ordinary_mic_gesture_started_at
+                >= _ORDINARY_MIC_MAX_SECONDS
+                or (
+                    is_pressed
+                    and now - self._ordinary_mic_gesture_started_at
+                    >= _ORDINARY_MIC_SOURCE_STALE_SECONDS
+                )
+            )
+            if stale_active_gesture:
+                self._ordinary_mic_sources_down.clear()
+                self._ordinary_mic_late_sources_down.clear()
+                self._ordinary_mic_late_source_deadlines.clear()
+                self._ordinary_mic_sources_seen.clear()
+                self._ordinary_mic_gesture_started_at = 0.0
+                self._ordinary_mic_release_guard_until = 0.0
+                self._ordinary_mic_gesture_active = False
+                cancel_stale_gesture = True
+
             if is_pressed:
                 if (
                     event_source in self._ordinary_mic_sources_down
@@ -1771,6 +2900,9 @@ class RC003App:
                     and event_source not in self._ordinary_mic_sources_seen
                 ):
                     self._ordinary_mic_late_sources_down.add(event_source)
+                    self._ordinary_mic_late_source_deadlines[event_source] = (
+                        now + _ORDINARY_MIC_SOURCE_STALE_SECONDS
+                    )
                     self._ordinary_mic_sources_seen.add(event_source)
                     self._logger.info(
                         "ordinary mic late duplicate ignored: source=%s",
@@ -1779,11 +2911,13 @@ class RC003App:
                     return
                 self._ordinary_mic_sources_down.add(event_source)
                 self._ordinary_mic_sources_seen = {event_source}
+                self._ordinary_mic_gesture_started_at = now
                 self._ordinary_mic_release_guard_until = 0.0
                 dispatch = True
             else:
                 if event_source in self._ordinary_mic_late_sources_down:
                     self._ordinary_mic_late_sources_down.discard(event_source)
+                    self._ordinary_mic_late_source_deadlines.pop(event_source, None)
                     return
                 if event_source not in self._ordinary_mic_sources_down:
                     return
@@ -1791,11 +2925,14 @@ class RC003App:
                 dispatch = not self._ordinary_mic_sources_down
                 if dispatch:
                     self._ordinary_mic_release_guard_until = (
-                        time.monotonic() + _ORDINARY_MIC_RELEASE_GUARD_SECONDS
+                        now + _ORDINARY_MIC_RELEASE_GUARD_SECONDS
                     )
+                    self._ordinary_mic_gesture_started_at = 0.0
             self._ordinary_mic_gesture_active = bool(
                 self._ordinary_mic_sources_down
             )
+        if cancel_stale_gesture:
+            self._button_gestures.reset()
         if not dispatch:
             return
         with self._button_mapping_lock:
@@ -1810,9 +2947,27 @@ class RC003App:
         is_pressed: bool,
         *,
         event_source: str = "hid",
+        raw_windows_button_id: Optional[str] = None,
+    ) -> None:
+        with self._input_arbitration_lock:
+            self._on_button_event_serialized(
+                button_id,
+                is_pressed,
+                event_source=event_source,
+                raw_windows_button_id=raw_windows_button_id,
+            )
+
+    def _on_button_event_serialized(
+        self,
+        button_id: str,
+        is_pressed: bool,
+        *,
+        event_source: str,
+        raw_windows_button_id: Optional[str] = None,
     ) -> None:
         if not self._accept_input_events:
             return
+        now = time.monotonic()
         with self._input_arbitration_lock:
             if button_id in self._input_rearm_blocked_buttons:
                 if not is_pressed:
@@ -1841,21 +2996,30 @@ class RC003App:
                     if not is_pressed:
                         self._raw_mapped_buttons_down.discard(button_id)
                 else:
-                    preserve_windows_original = event_source in {
-                        "raw_keyboard",
-                        "raw_unknown",
-                    } or (
-                        event_source == "raw_hid"
-                        and button_id in _DIRECTION_BUTTON_IDS
+                    effective_windows_button = raw_windows_button_id
+                    if (
+                        effective_windows_button is None
+                        and not self._raw_fallback_tracking_active
+                    ):
+                        effective_windows_button = button_id
+                    preserve_windows_original = (
+                        effective_windows_button in _RAW_FALLBACK_KEY_TOKENS
                     )
                     if preserve_windows_original:
                         if is_pressed:
                             self._raw_fallback_buttons_down.add(button_id)
                             if not self._arm_raw_fallback_hold_guard_locked(button_id):
                                 self._raw_fallback_buttons_down.discard(button_id)
-                                self._input_rearm_blocked_buttons.add(button_id)
+                                physical_buttons = (
+                                    self._take_raw_fallback_physical_buttons_locked(
+                                        {button_id}
+                                    )
+                                )
+                                self._block_input_until_release(
+                                    {button_id} | physical_buttons
+                                )
                                 self._release_raw_fallback_keyups(
-                                    {button_id},
+                                    physical_buttons,
                                     reason="raw_fallback_timer_unavailable",
                                 )
                             self._logger.warning(
@@ -1887,7 +3051,13 @@ class RC003App:
         if button_id in self._key_detection_suppressed_buttons:
             if not is_pressed:
                 self._key_detection_suppressed_buttons.discard(button_id)
-            return
+                self._key_detection_suppression_deadlines.pop(button_id, None)
+                return
+            deadline = self._key_detection_suppression_deadlines.get(button_id)
+            if deadline is None or now < deadline:
+                return
+            self._key_detection_suppressed_buttons.discard(button_id)
+            self._key_detection_suppression_deadlines.pop(button_id, None)
         detection_captured = False
         if is_pressed and button_id != "mic":
             try:
@@ -1899,6 +3069,9 @@ class RC003App:
                 self._logger.warning("key detection IPC unavailable: %s", exc)
         if detection_captured:
             self._key_detection_suppressed_buttons.add(button_id)
+            self._key_detection_suppression_deadlines[button_id] = (
+                now + _KEY_DETECTION_SUPPRESSION_MAX_SECONDS
+            )
             self._logger.info(
                 "key detection captured button=%s; mapped action suppressed",
                 button_id,
@@ -2051,6 +3224,11 @@ class RC003App:
             )
             self._dispatch_button_combo_commands(commands)
         self._apply_pending_settings_if_idle()
+
+    def _block_input_until_release(self, buttons: set[str]) -> None:
+        if not buttons:
+            return
+        self._input_rearm_blocked_buttons.update(buttons)
 
     def _dispatch_button_combo_commands(
         self, commands: List[button_combo.ComboCommand]
@@ -2268,6 +3446,7 @@ class RC003App:
             mouse_button = _BUTTON_ACTION_MOUSE_BUTTONS.get(action.kind)
             if mouse_button is not None:
                 self._button_mouse_release_pending = mouse_button
+            self._schedule_button_input_release_retry_locked()
             self._logger.exception(
                 "button action failed and safety input-up remains pending"
             )
@@ -2282,18 +3461,100 @@ class RC003App:
             return tuple(action.keys)
         return _BUTTON_ACTION_KEY_TOKENS.get(action.kind)
 
+    def _cancel_button_input_release_retry_locked(
+        self,
+        *,
+        reset_delay: bool = True,
+    ) -> None:
+        timer = self._button_input_release_retry_timer
+        self._button_input_release_retry_timer = None
+        self._button_input_release_retry_token = None
+        if reset_delay:
+            self._button_input_release_retry_delay = (
+                _BUTTON_INPUT_RELEASE_RETRY_INITIAL_SECONDS
+            )
+        if timer is None:
+            return
+        cancel = getattr(timer, "cancel", None)
+        if callable(cancel):
+            try:
+                cancel()
+            except BaseException:
+                pass
+
+    def _schedule_button_input_release_retry_locked(self) -> None:
+        if (
+            self._button_input_release_retry_stopping
+            or not self._accept_input_events
+            or self._button_input_release_retry_timer is not None
+            or (
+                self._button_key_release_pending is None
+                and self._button_mouse_release_pending is None
+            )
+        ):
+            return
+        token = object()
+        try:
+            timer = self._button_input_release_timer_factory(
+                self._button_input_release_retry_delay,
+                lambda token=token: self._retry_pending_button_inputs(token),
+            )
+            if isinstance(timer, threading.Thread):
+                timer.daemon = True
+            self._button_input_release_retry_token = token
+            self._button_input_release_retry_timer = timer
+            timer.start()
+        except BaseException as exc:
+            if self._button_input_release_retry_token is token:
+                self._button_input_release_retry_token = None
+                self._button_input_release_retry_timer = None
+            self._logger.error(
+                "button input safety-release timer failed: error_type=%s",
+                type(exc).__name__,
+            )
+
+    def _retry_pending_button_inputs(self, token: object) -> None:
+        with self._button_action_lock:
+            if self._button_input_release_retry_token is not token:
+                return
+            self._button_input_release_retry_token = None
+            self._button_input_release_retry_timer = None
+            if (
+                self._button_input_release_retry_stopping
+                or not self._accept_input_events
+            ):
+                return
+            self._button_input_release_retry_delay = min(
+                _BUTTON_INPUT_RELEASE_RETRY_MAX_SECONDS,
+                max(
+                    _BUTTON_INPUT_RELEASE_RETRY_INITIAL_SECONDS,
+                    self._button_input_release_retry_delay * 2.0,
+                ),
+            )
+            self._release_pending_button_inputs()
+
+    def _finish_button_input_release_if_complete_locked(self) -> None:
+        if (
+            self._button_key_release_pending is None
+            and self._button_mouse_release_pending is None
+        ):
+            self._cancel_button_input_release_retry_locked()
+
     def _release_pending_button_keys(self) -> bool:
         with self._button_action_lock:
             tokens = self._button_key_release_pending
             if tokens is None:
+                self._finish_button_input_release_if_complete_locked()
                 return True
             try:
                 win32_input.send_key_combo_up(tokens)
             except win32_input.InputCleanupIncompleteError:
                 self._logger.exception("button key safety release remains incomplete")
+                self._schedule_button_input_release_retry_locked()
                 return False
             except win32_input.Win32InputUnavailableError:
                 self._logger.info("button key safety release unavailable")
+                self._schedule_button_input_release_retry_locked()
                 return False
             except OSError:
                 # send_key_combo_up raises ordinary OSError only after its own
@@ -2304,20 +3565,24 @@ class RC003App:
             else:
                 self._logger.info("button key safety release completed")
             self._button_key_release_pending = None
+            self._finish_button_input_release_if_complete_locked()
             return True
 
     def _release_pending_button_mouse(self) -> bool:
         with self._button_action_lock:
             button = self._button_mouse_release_pending
             if button is None:
+                self._finish_button_input_release_if_complete_locked()
                 return True
             try:
                 win32_input.send_mouse_button_up(button)
             except win32_input.InputCleanupIncompleteError:
                 self._logger.exception("button mouse safety release remains incomplete")
+                self._schedule_button_input_release_retry_locked()
                 return False
             except win32_input.Win32InputUnavailableError:
                 self._logger.info("button mouse safety release unavailable")
+                self._schedule_button_input_release_retry_locked()
                 return False
             except OSError:
                 self._logger.exception(
@@ -2326,6 +3591,7 @@ class RC003App:
             else:
                 self._logger.info("button mouse safety release completed")
             self._button_mouse_release_pending = None
+            self._finish_button_input_release_if_complete_locked()
             return True
 
     def _release_pending_button_inputs(self) -> bool:

@@ -74,16 +74,22 @@ class ButtonGestureRecognizerTests(unittest.TestCase):
 
 
 class _FakeTimer:
-    def __init__(self, callback):
+    def __init__(self, callback, *, start_error=None, cancel_error=None):
         self.callback = callback
+        self.start_error = start_error
+        self.cancel_error = cancel_error
         self.cancelled = False
         self.started = False
 
     def start(self):
+        if self.start_error is not None:
+            raise self.start_error
         self.started = True
 
     def cancel(self):
         self.cancelled = True
+        if self.cancel_error is not None:
+            raise self.cancel_error
 
     def fire(self):
         if not self.cancelled:
@@ -272,6 +278,88 @@ class ButtonGestureDispatcherTests(unittest.TestCase):
 
         self.assertEqual(self.triggers, [("up", ButtonTrigger.SINGLE_CLICK)])
 
+    def test_cancel_one_button_preserves_another_active_repeat(self):
+        repeat_timers = []
+        hold_timers = []
+        dispatcher = ButtonGestureDispatcher(
+            is_action_configured=lambda button, trigger: (
+                button in {"up", "right"}
+                and trigger == ButtonTrigger.SINGLE_CLICK
+            ),
+            is_repeatable=lambda button: button in {"up", "right"},
+            on_trigger=lambda button, trigger: self.triggers.append(
+                (button, trigger)
+            ),
+            timer_factory=lambda _delay, callback: repeat_timers.append(
+                _FakeTimer(callback)
+            )
+            or repeat_timers[-1],
+            hold_timer_factory=lambda _delay, callback: hold_timers.append(
+                _FakeTimer(callback)
+            )
+            or hold_timers[-1],
+        )
+        dispatcher.press("up")
+        dispatcher.press("right")
+
+        dispatcher.cancel_buttons({"right"})
+        repeat_timers[0].fire()
+
+        self.assertEqual(
+            self.triggers,
+            [
+                ("up", ButtonTrigger.SINGLE_CLICK),
+                ("right", ButtonTrigger.SINGLE_CLICK),
+                ("up", ButtonTrigger.SINGLE_CLICK),
+            ],
+        )
+        self.assertFalse(repeat_timers[0].cancelled)
+        self.assertTrue(repeat_timers[1].cancelled)
+        self.assertTrue(dispatcher.has_active_gestures())
+        dispatcher.release("up")
+        self.assertFalse(dispatcher.has_active_gestures())
+
+    def test_cancel_rejects_a_timeout_callback_already_waiting_at_the_gate(self):
+        reserved = threading.Event()
+        original_reserve = self.dispatcher._reserve_callbacks_locked
+
+        def reserve(callbacks):
+            reservation = original_reserve(callbacks)
+            if reservation is not None:
+                reserved.set()
+            return reservation
+
+        self.dispatcher._reserve_callbacks_locked = reserve
+        self.dispatcher.press("ok")
+        self.dispatcher.release("ok")
+        callback_worker = threading.Thread(target=self.timers[0].callback)
+        cancel_worker = threading.Thread(
+            target=lambda: self.dispatcher.cancel_buttons({"ok"})
+        )
+
+        self.dispatcher._callback_lock.acquire()
+        try:
+            callback_worker.start()
+            self.assertTrue(reserved.wait(1.0))
+            cancel_worker.start()
+            deadline = threading.Event()
+            for _index in range(100):
+                with self.dispatcher._lock:
+                    if self.dispatcher._button_generations.get("ok") == 1:
+                        deadline.set()
+                        break
+                threading.Event().wait(0.005)
+            self.assertTrue(deadline.is_set())
+        finally:
+            self.dispatcher._callback_lock.release()
+
+        callback_worker.join(1.0)
+        cancel_worker.join(1.0)
+        self.assertFalse(callback_worker.is_alive())
+        self.assertFalse(cancel_worker.is_alive())
+        self.assertEqual(self.triggers, [])
+        self.assertFalse(self.dispatcher.has_active_gestures())
+
     def test_stale_repeat_timer_cannot_attach_to_a_new_hold(self):
         self.dispatcher.press("up")
         stale_callback = self.timers[0].callback
@@ -394,6 +482,155 @@ class ButtonGestureDispatcherTests(unittest.TestCase):
             ],
         )
         self.assertEqual(len(self.timers), 1)
+
+    def test_double_click_timer_creation_failure_resolves_one_single_click(self):
+        dispatcher = ButtonGestureDispatcher(
+            is_action_configured=lambda button, trigger: (
+                button == "ok"
+                and trigger
+                in {ButtonTrigger.SINGLE_CLICK, ButtonTrigger.DOUBLE_CLICK}
+            ),
+            is_repeatable=lambda _button: False,
+            on_trigger=lambda button, trigger: self.triggers.append((button, trigger)),
+            timer_factory=lambda _delay, _callback: (_ for _ in ()).throw(
+                RuntimeError("timer unavailable")
+            ),
+            hold_timer_factory=lambda _delay, callback: _FakeTimer(callback),
+        )
+
+        dispatcher.press("ok")
+        dispatcher.release("ok")
+
+        self.assertEqual(self.triggers, [("ok", ButtonTrigger.SINGLE_CLICK)])
+        self.assertFalse(dispatcher.has_active_gestures())
+
+    def test_long_press_timer_start_failure_blocks_until_release_without_click(self):
+        dispatcher = ButtonGestureDispatcher(
+            is_action_configured=lambda button, trigger: (
+                button == "ok"
+                and trigger
+                in {ButtonTrigger.SINGLE_CLICK, ButtonTrigger.LONG_PRESS}
+            ),
+            is_repeatable=lambda _button: False,
+            on_trigger=lambda button, trigger: self.triggers.append((button, trigger)),
+            timer_factory=lambda _delay, callback: _FakeTimer(
+                callback,
+                start_error=RuntimeError("timer start failed"),
+            ),
+            hold_timer_factory=lambda _delay, callback: _FakeTimer(callback),
+        )
+
+        dispatcher.press("ok")
+        dispatcher.press("ok")
+        self.assertEqual(self.triggers, [])
+        self.assertFalse(dispatcher.has_active_gestures())
+
+        dispatcher.release("ok")
+        self.assertFalse(dispatcher.has_active_gestures())
+
+    def test_initial_repeat_timer_creation_failure_keeps_only_initial_click(self):
+        dispatcher = ButtonGestureDispatcher(
+            is_action_configured=lambda button, trigger: (
+                button == "up" and trigger == ButtonTrigger.SINGLE_CLICK
+            ),
+            is_repeatable=lambda button: button == "up",
+            on_trigger=lambda button, trigger: self.triggers.append((button, trigger)),
+            timer_factory=lambda _delay, _callback: (_ for _ in ()).throw(
+                RuntimeError("timer unavailable")
+            ),
+            hold_timer_factory=lambda _delay, callback: _FakeTimer(callback),
+        )
+
+        dispatcher.press("up")
+        dispatcher.press("up")
+        dispatcher.release("up")
+
+        self.assertEqual(self.triggers, [("up", ButtonTrigger.SINGLE_CLICK)])
+        self.assertFalse(dispatcher.has_active_gestures())
+
+    def test_repeat_reschedule_failure_stops_repeating_but_releases_cleanly(self):
+        timers = []
+
+        def timer_factory(_delay, callback):
+            if timers:
+                raise RuntimeError("repeat reschedule failed")
+            timer = _FakeTimer(callback)
+            timers.append(timer)
+            return timer
+
+        dispatcher = ButtonGestureDispatcher(
+            is_action_configured=lambda button, trigger: (
+                button == "up" and trigger == ButtonTrigger.SINGLE_CLICK
+            ),
+            is_repeatable=lambda button: button == "up",
+            on_trigger=lambda button, trigger: self.triggers.append((button, trigger)),
+            timer_factory=timer_factory,
+            hold_timer_factory=lambda _delay, callback: _FakeTimer(callback),
+        )
+
+        dispatcher.press("up")
+        timers[0].fire()
+        dispatcher.release("up")
+
+        self.assertEqual(
+            self.triggers,
+            [
+                ("up", ButtonTrigger.SINGLE_CLICK),
+                ("up", ButtonTrigger.SINGLE_CLICK),
+            ],
+        )
+        self.assertFalse(dispatcher.has_active_gestures())
+
+    def test_hold_guard_start_failure_never_leaves_a_repeat_or_hold_latched(self):
+        dispatcher = ButtonGestureDispatcher(
+            is_action_configured=lambda button, trigger: (
+                button == "up" and trigger == ButtonTrigger.SINGLE_CLICK
+            ),
+            is_repeatable=lambda button: button == "up",
+            on_trigger=lambda button, trigger: self.triggers.append((button, trigger)),
+            timer_factory=lambda _delay, callback: _FakeTimer(callback),
+            hold_timer_factory=lambda _delay, callback: _FakeTimer(
+                callback,
+                start_error=RuntimeError("hold guard unavailable"),
+            ),
+        )
+
+        dispatcher.press("up")
+        dispatcher.press("up")
+        dispatcher.release("up")
+
+        self.assertEqual(self.triggers, [("up", ButtonTrigger.SINGLE_CLICK)])
+        self.assertFalse(dispatcher.has_active_gestures())
+
+    def test_timer_cancel_failure_still_clears_all_dispatcher_state(self):
+        timers = []
+
+        def timer_factory(_delay, callback):
+            timer = _FakeTimer(
+                callback,
+                cancel_error=RuntimeError("cancel failed"),
+            )
+            timers.append(timer)
+            return timer
+
+        dispatcher = ButtonGestureDispatcher(
+            is_action_configured=lambda button, trigger: (
+                button == "ok" and trigger == ButtonTrigger.DOUBLE_CLICK
+            ),
+            is_repeatable=lambda _button: False,
+            on_trigger=lambda button, trigger: self.triggers.append((button, trigger)),
+            timer_factory=timer_factory,
+            hold_timer_factory=timer_factory,
+        )
+
+        dispatcher.press("ok")
+        dispatcher.release("ok")
+        dispatcher.reset()
+        for timer in timers:
+            timer.callback()
+
+        self.assertEqual(self.triggers, [])
+        self.assertFalse(dispatcher.has_active_gestures())
 
     def _new_timer(self, callback):
         timer = _FakeTimer(callback)

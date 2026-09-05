@@ -232,6 +232,8 @@ class HotkeyCapture:
             pass
 
     def _handle_event(self, message: int, data: KBDLLHOOKSTRUCT) -> bool:
+        if self._stop_event.is_set():
+            return False
         if int(data.flags) & LLKHF_INJECTED:
             return False
         is_down = message in (WM_KEYDOWN, WM_SYSKEYDOWN)

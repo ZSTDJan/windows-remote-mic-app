@@ -90,6 +90,7 @@ _BRANDING_CHECK_EXEMPT_RELATIVE_PATHS = {
     Path("tests/test_privacy_contract.py"),
     Path("tests/test_build_artifacts.py"),
     Path("tests/test_boundary_scan_replay.py"),
+    Path("tests/test_hid_elevation_windows.py"),
     Path("build/check-public-boundary.ps1"),
     Path("installer/readme-rc003.txt"),
     Path("src/ovb_rc003/hid_elevation_windows.py"),
@@ -278,6 +279,20 @@ class BoundaryScanReplayTests(unittest.TestCase):
         self.assertIn('INJECT_FLAG = "--inject"', text)
         self.assertIn('lpVerb = "runas"', text)
         self.assertNotIn('add_argument("--pid"', text)
+
+    def test_hid_elevation_test_is_exempt_only_for_the_reviewed_win32_stub(self):
+        path = _RC003_ROOT / "tests" / "test_hid_elevation_windows.py"
+        text = path.read_text(encoding="utf-8")
+        self.assertIn("ShellExecuteExW", text)
+        self.assertFalse(any(pattern.search(text) for pattern in _FORBIDDEN_BRANDING_PATTERNS))
+        self.assertFalse(any(marker in text for marker in _AUTOSTART_MARKERS))
+        for marker in (
+            "runas",
+            "IsUserAnAdmin",
+            "RequireAdministrator",
+            "PrivilegesRequired=admin",
+        ):
+            self.assertNotIn(marker, text)
 
     def test_installer_elevation_is_not_a_login_trigger_or_admin_manifest(self):
         path = _RC003_ROOT / "installer" / "RemoteMicRC003Setup.iss"

@@ -119,6 +119,9 @@ $brandingCheckExemptRelativePaths = @(
     "tests/test_privacy_contract.py",
     "tests/test_build_artifacts.py",
     "tests/test_boundary_scan_replay.py",
+    # This test stubs the reviewed HID module's exact Win32 elevation call;
+    # it does not add a second runtime elevation boundary.
+    "tests/test_hid_elevation_windows.py",
     "build/check-public-boundary.ps1",
     "installer/readme-rc003.txt",
     # The desktop app remains asInvoker. This reviewed module is the only

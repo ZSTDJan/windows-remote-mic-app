@@ -170,8 +170,9 @@ def register_current_consumer(
     *,
     frozen: Optional[bool] = None,
     executable: Optional[str] = None,
+    timeout_seconds: float = _MAINTENANCE_LOCK_TIMEOUT_SECONDS,
 ) -> Optional[Path]:
-    with consumer_maintenance_lock():
+    with consumer_maintenance_lock(timeout_seconds=timeout_seconds):
         return _register_current_consumer_unlocked(
             config_root,
             frozen=frozen,
@@ -490,36 +491,37 @@ def uninstall_current_distribution(
     """Drop this distribution and keep the helper for any remaining owner."""
 
     app = _lexical_executable_path(executable)
-    installed_distribution = _distribution_kind(app) == INSTALLED_KIND
     try:
         with consumer_maintenance_lock():
+            presence = _inspect_other_consumers_unlocked(
+                config_root,
+                exclude_executable=app,
+            )
+            if presence is OtherConsumerPresence.UNKNOWN:
+                _unregister_current_consumer_unlocked(
+                    config_root,
+                    executable=executable,
+                )
+                return hid_elevation_windows.HidHelperState(
+                    True, "helper_kept_for_unknown_consumer"
+                )
             _unregister_current_consumer_unlocked(
                 config_root,
                 executable=executable,
             )
-            presence = _inspect_other_consumers_unlocked(config_root)
             if presence is OtherConsumerPresence.PRESENT:
                 return hid_elevation_windows.HidHelperState(
                     True, "helper_kept_for_other_consumer"
                 )
-            if presence is OtherConsumerPresence.UNKNOWN:
-                if installed_distribution:
-                    return hid_elevation_windows.HidHelperState(
-                        True, "helper_kept_for_unknown_consumer"
-                    )
-                result = hid_elevation_windows.HidHelperState(
-                    False, "helper_consumer_inspection_failed"
+            try:
+                result = _coerce_helper_state(
+                    remove_helper(),
+                    unavailable_detail="hid_helper_removal_result_unavailable",
                 )
-            else:
-                try:
-                    result = _coerce_helper_state(
-                        remove_helper(),
-                        unavailable_detail="hid_helper_removal_result_unavailable",
-                    )
-                except Exception:
-                    result = hid_elevation_windows.HidHelperState(
-                        False, "hid_helper_removal_request_failed"
-                    )
+            except Exception:
+                result = hid_elevation_windows.HidHelperState(
+                    False, "hid_helper_removal_request_failed"
+                )
             if result.available:
                 return result
             if not _restore_current_consumer_unlocked(

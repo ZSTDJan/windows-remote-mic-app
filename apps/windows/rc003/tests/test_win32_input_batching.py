@@ -146,6 +146,19 @@ class SendKeyComboDownTests(unittest.TestCase):
 
         self.assertEqual(len(sender.calls), 2)
 
+    def test_physical_modifier_blocks_synthetic_combo_before_submission(self):
+        sender = RecordingSender()
+        lctrl = win32_input.win32_keys.VK_CODES["lctrl"]
+
+        with self.assertRaises(win32_input.PhysicalKeyInUseError):
+            win32_input.send_key_combo_down(
+                ("lctrl", "f9"),
+                _sender=sender,
+                _key_down_query=lambda vk: vk == lctrl,
+            )
+
+        self.assertEqual(sender.calls, [])
+
 
 class SendKeyComboUpTests(unittest.TestCase):
     def test_full_delivery_releases_in_reverse_order(self):
@@ -231,6 +244,38 @@ class SendKeyComboUpTests(unittest.TestCase):
 
         with self.assertRaises(win32_input.Win32InputUnavailableError):
             win32_input.send_key_combo_up(("a",), _sender=unavailable_sender)
+
+    def test_physical_modifier_is_not_released_by_synthetic_cleanup(self):
+        sender = RecordingSender()
+        lctrl = win32_input.win32_keys.VK_CODES["lctrl"]
+        f9 = win32_input.win32_keys.VK_CODES["f9"]
+
+        win32_input.send_key_combo_up(
+            ("lctrl", "f9"),
+            _sender=sender,
+            _key_down_query=lambda vk: vk == lctrl,
+        )
+
+        self.assertEqual(sender.calls, [[(f9, True)]])
+
+    def test_physical_state_query_failure_does_not_skip_other_key_ups(self):
+        sender = RecordingSender()
+        lctrl = win32_input.win32_keys.VK_CODES["lctrl"]
+        f9 = win32_input.win32_keys.VK_CODES["f9"]
+
+        def query(vk):
+            if vk == lctrl:
+                raise RuntimeError("physical state unavailable")
+            return False
+
+        with self.assertRaises(win32_input.InputCleanupIncompleteError):
+            win32_input.send_key_combo_up(
+                ("lctrl", "f9"),
+                _sender=sender,
+                _key_down_query=query,
+            )
+
+        self.assertEqual(sender.calls, [[(f9, True)]])
 
 
 class SendKeyComboTapTests(unittest.TestCase):
@@ -671,6 +716,158 @@ class VoiceKeyComboTests(unittest.TestCase):
 
         self.assertGreaterEqual(len(calls), 4)
 
+    def test_physical_modifier_blocks_voice_combo_before_submission(self):
+        calls = []
+        lalt = win32_input.win32_keys.VK_CODES["lalt"]
+
+        with self.assertRaises(win32_input.PhysicalKeyInUseError):
+            win32_input.send_voice_key_combo_down(
+                ("lalt", "f8"),
+                _sender=lambda vk, key_up: calls.append((vk, key_up)),
+                _key_down_query=lambda vk: vk == lalt,
+            )
+
+        self.assertEqual(calls, [])
+
+    def test_voice_release_preserves_physical_modifier_and_releases_other_key(self):
+        calls = []
+        lalt = win32_input.win32_keys.VK_CODES["lalt"]
+        f8 = win32_input.win32_keys.VK_CODES["f8"]
+
+        win32_input.send_voice_key_combo_up(
+            ("lalt", "f8"),
+            _sender=lambda vk, key_up: calls.append((vk, key_up)),
+            _key_down_query=lambda vk: vk == lalt,
+        )
+
+        self.assertEqual(calls, [(f8, True)])
+
+    def test_inactive_tracker_cannot_suppress_the_matching_voice_key_up(self):
+        calls = []
+        ralt = win32_input.win32_keys.VK_CODES["ralt"]
+        tracking = {"available": True}
+
+        with mock.patch.object(
+            win32_input.raw_input_windows,
+            "physical_keyboard_tracking_available",
+            return_value=False,
+        ), mock.patch.object(
+            win32_input.voice_key_physicalizer_windows,
+            "physical_key_tracking_available",
+            side_effect=lambda _vk: tracking["available"],
+        ), mock.patch.object(
+            win32_input.raw_input_windows,
+            "physical_key_is_down",
+            return_value=False,
+        ), mock.patch.object(
+            win32_input.raw_input_windows,
+            "physical_key_is_down_before_injection",
+            return_value=False,
+        ), mock.patch.object(
+            win32_input.voice_key_physicalizer_windows,
+            "physical_key_is_down",
+            return_value=False,
+        ), mock.patch.object(
+            win32_input,
+            "_real_voice_event",
+            side_effect=lambda vk, key_up: calls.append((vk, key_up)),
+        ):
+            win32_input.send_voice_key_combo_down(("ralt",))
+            tracking["available"] = False
+            win32_input.send_voice_key_combo_up(("ralt",))
+
+        self.assertEqual(calls, [(ralt, False), (ralt, True)])
+
+    def test_voice_physical_query_failure_still_releases_other_keys(self):
+        calls = []
+        lalt = win32_input.win32_keys.VK_CODES["lalt"]
+        f8 = win32_input.win32_keys.VK_CODES["f8"]
+
+        def query(vk):
+            if vk == lalt:
+                raise RuntimeError("physical state unavailable")
+            return False
+
+        with self.assertRaises(win32_input.InputCleanupIncompleteError):
+            win32_input.send_voice_key_combo_up(
+                ("lalt", "f8"),
+                _sender=lambda vk, key_up: calls.append((vk, key_up)),
+                _key_down_query=query,
+            )
+
+        self.assertEqual(calls, [(f8, True)])
+
+
+class MarkedVoiceEventConfirmationTests(unittest.TestCase):
+    def test_real_right_alt_edge_uses_its_hook_ticket(self):
+        sent = []
+        ticket = mock.Mock(marker=12345)
+        with mock.patch.object(
+            win32_input.voice_key_physicalizer_windows,
+            "begin_marked_voice_event",
+            return_value=ticket,
+        ) as begin, mock.patch.object(
+            win32_input,
+            "_real_keybd_event",
+            side_effect=lambda vk, key_up, **kwargs: sent.append(
+                (vk, key_up, kwargs["_extra_info"])
+            ),
+        ), mock.patch.object(
+            win32_input.voice_key_physicalizer_windows,
+            "wait_for_marked_voice_event",
+            return_value=True,
+        ) as wait:
+            win32_input._real_voice_event(
+                win32_input.win32_keys.VK_CODES["ralt"],
+                False,
+            )
+
+        begin.assert_called_once_with(False)
+        wait.assert_called_once_with(
+            ticket,
+            win32_input._VOICE_EVENT_CONFIRM_TIMEOUT_SECONDS,
+        )
+        self.assertEqual(
+            sent,
+            [(win32_input.win32_keys.VK_CODES["ralt"], False, 12345)],
+        )
+
+    def test_right_alt_hook_timeout_is_always_incomplete_cleanup(self):
+        ticket = mock.Mock(marker=12345)
+        with mock.patch.object(
+            win32_input.voice_key_physicalizer_windows,
+            "begin_marked_voice_event",
+            return_value=ticket,
+        ), mock.patch.object(
+            win32_input,
+            "_real_keybd_event",
+        ), mock.patch.object(
+            win32_input.voice_key_physicalizer_windows,
+            "wait_for_marked_voice_event",
+            return_value=False,
+        ):
+            with self.assertRaises(win32_input.InputCleanupIncompleteError):
+                win32_input._real_voice_event(
+                    win32_input.win32_keys.VK_CODES["ralt"],
+                    True,
+                )
+
+    def test_combo_keeps_confirmation_failure_even_if_retry_returns(self):
+        calls = []
+
+        def sender(_vk, key_up):
+            calls.append(key_up)
+            if not key_up:
+                raise win32_input.InputCleanupIncompleteError("no ack")
+
+        with self.assertRaises(win32_input.InputCleanupIncompleteError):
+            win32_input.send_voice_key_combo_down(
+                ("ralt",),
+                _sender=sender,
+            )
+
+        self.assertEqual(calls, [False, True])
+
 
 class WeTypeVoiceKeyComboTests(unittest.TestCase):
     def test_hold_down_and_up_are_each_submitted_as_one_ordered_batch(self):
@@ -705,6 +902,50 @@ class WeTypeVoiceKeyComboTests(unittest.TestCase):
         shift = win32_input.win32_keys.VK_CODES["lshift"]
         self.assertEqual(sender.calls[1], [(shift, True)])
         self.assertEqual(sender.calls[2], [(ctrl, True)])
+
+    def test_partial_wetype_key_down_uses_release_phase_physical_state(self):
+        ctrl = win32_input.win32_keys.VK_CODES["lctrl"]
+        f9 = win32_input.win32_keys.VK_CODES["f9"]
+        keys_down = set()
+        calls = []
+
+        def sender(events):
+            calls.append(list(events))
+            if len(calls) == 1:
+                keys_down.add(ctrl)
+                return 1
+            for vk, key_up in events:
+                if key_up:
+                    keys_down.discard(vk)
+            return len(events)
+
+        with mock.patch.object(
+            win32_input,
+            "_real_send_virtual_key_input_batch",
+            side_effect=sender,
+        ), mock.patch.object(
+            win32_input.raw_input_windows,
+            "physical_keyboard_tracking_available",
+            return_value=True,
+        ), mock.patch.object(
+            win32_input.raw_input_windows,
+            "physical_key_is_down_before_injection",
+            return_value=False,
+        ), mock.patch.object(
+            win32_input.raw_input_windows,
+            "physical_key_is_down",
+            return_value=False,
+        ), mock.patch.object(
+            win32_input.voice_key_physicalizer_windows,
+            "physical_key_is_down",
+            return_value=False,
+        ):
+            with self.assertRaises(OSError):
+                win32_input.send_wetype_voice_key_combo_down(("lctrl", "f9"))
+
+        self.assertEqual(keys_down, set())
+        self.assertEqual(calls[1], [(ctrl, True)])
+        self.assertNotIn((f9, True), calls[1])
 
     def test_wetype_tap_uses_separate_batches_with_vibe_flow_hold(self):
         sender = RecordingSender()

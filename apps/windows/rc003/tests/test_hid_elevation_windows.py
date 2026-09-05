@@ -1,6 +1,9 @@
+import ctypes
 import json
 import subprocess
+import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -9,6 +12,83 @@ from ovb_rc003 import hid_elevation_windows
 
 
 SID = "S-1-5-21-111-222-333-1001"
+
+
+class _CallableWin32Function:
+    def __init__(self, callback):
+        self._callback = callback
+        self.argtypes = None
+        self.restype = None
+
+    def __call__(self, *args):
+        return self._callback(*args)
+
+
+class _Collection:
+    def __init__(self, items):
+        self._items = list(items)
+        self.Count = len(self._items)
+
+    def Item(self, index):
+        return self._items[index - 1]
+
+
+class ProcessElevationStateTests(unittest.TestCase):
+    def test_strict_query_returns_the_verified_token_state(self):
+        for raw_state, expected in ((0, False), (1, True)):
+            elevation = hid_elevation_windows._TOKEN_ELEVATION(raw_state)
+            with self.subTest(raw_state=raw_state), mock.patch.object(
+                hid_elevation_windows, "_is_windows", return_value=True
+            ), mock.patch.object(
+                hid_elevation_windows,
+                "_token_information",
+                return_value=bytes(elevation),
+            ):
+                self.assertIs(
+                    hid_elevation_windows.query_process_elevated(),
+                    expected,
+                )
+
+    def test_strict_query_preserves_a_known_token_error(self):
+        with mock.patch.object(
+            hid_elevation_windows, "_is_windows", return_value=True
+        ), mock.patch.object(
+            hid_elevation_windows,
+            "_token_information",
+            side_effect=hid_elevation_windows.HidElevationError("token_failed"),
+        ):
+            with self.assertRaises(hid_elevation_windows.HidElevationError) as ctx:
+                hid_elevation_windows.query_process_elevated()
+
+        self.assertEqual(str(ctx.exception), "token_failed")
+
+    def test_strict_query_normalizes_unexpected_token_read_failures(self):
+        for failure in (OSError("read failed"), b""):
+            with self.subTest(failure=failure), mock.patch.object(
+                hid_elevation_windows, "_is_windows", return_value=True
+            ), mock.patch.object(
+                hid_elevation_windows,
+                "_token_information",
+                side_effect=failure if isinstance(failure, BaseException) else None,
+                return_value=failure if isinstance(failure, bytes) else None,
+            ):
+                with self.assertRaises(
+                    hid_elevation_windows.HidElevationError
+                ) as ctx:
+                    hid_elevation_windows.query_process_elevated()
+
+            self.assertEqual(
+                str(ctx.exception),
+                "current_user_elevation_status_unavailable",
+            )
+
+    def test_legacy_boolean_query_still_falls_back_to_not_elevated(self):
+        with mock.patch.object(
+            hid_elevation_windows,
+            "query_process_elevated",
+            side_effect=hid_elevation_windows.HidElevationError("token_failed"),
+        ):
+            self.assertFalse(hid_elevation_windows.is_process_elevated())
 
 
 class TaskDefinitionTests(unittest.TestCase):
@@ -91,6 +171,37 @@ class TaskDefinitionTests(unittest.TestCase):
                 )
             )
 
+    def test_task_validation_rejects_each_fixed_setting_when_changed(self):
+        replacements = {
+            "MultipleInstancesPolicy": "Parallel",
+            "DisallowStartIfOnBatteries": "true",
+            "StopIfGoingOnBatteries": "true",
+            "AllowHardTerminate": "false",
+            "StartWhenAvailable": "true",
+            "RunOnlyIfNetworkAvailable": "true",
+            "AllowStartOnDemand": "false",
+            "Enabled": "false",
+            "Hidden": "false",
+            "RunOnlyIfIdle": "true",
+            "WakeToRun": "true",
+            "ExecutionTimeLimit": "PT1H",
+            "Priority": "1",
+        }
+        for name, changed in replacements.items():
+            with self.subTest(setting=name):
+                marker = f"<{name}>"
+                start = self.xml.index(marker) + len(marker)
+                end = self.xml.index(f"</{name}>", start)
+                invalid = self.xml[:start] + changed + self.xml[end:]
+                self.assertFalse(
+                    hid_elevation_windows.validate_registered_task_xml(
+                        invalid,
+                        helper_path=self.helper,
+                        user_sid=SID,
+                        task_name=self.task_name,
+                    )
+                )
+
     def test_task_and_helper_names_are_isolated_by_sid(self):
         other_sid = "S-1-5-21-111-222-333-1002"
         self.assertNotEqual(
@@ -160,6 +271,187 @@ class TaskSchedulerApiTests(unittest.TestCase):
             hid_elevation_windows.TASK_CREATE_OR_UPDATE
             | hid_elevation_windows.TASK_DONT_ADD_PRINCIPAL_ACE,
         )
+
+    def test_com_initialization_is_balanced_on_the_background_thread(self):
+        import comtypes
+
+        calls = []
+        root = object()
+
+        def record(name):
+            calls.append((name, threading.get_ident()))
+
+        def worker():
+            with hid_elevation_windows._task_service_session() as yielded:
+                self.assertIs(yielded, root)
+
+        with mock.patch.object(hid_elevation_windows, "_is_windows", return_value=True), mock.patch.object(
+            hid_elevation_windows,
+            "_task_service_root",
+            return_value=root,
+        ), mock.patch.object(
+            comtypes,
+            "CoInitialize",
+            side_effect=lambda: record("init"),
+        ), mock.patch.object(
+            comtypes,
+            "CoUninitialize",
+            side_effect=lambda: record("uninit"),
+        ):
+            thread = threading.Thread(target=worker)
+            thread.start()
+            thread.join(1.0)
+
+        self.assertFalse(thread.is_alive())
+        self.assertEqual([name for name, _thread_id in calls], ["init", "uninit"])
+        self.assertEqual(calls[0][1], calls[1][1])
+        self.assertNotEqual(calls[0][1], threading.get_ident())
+
+    @staticmethod
+    def _task_root(*, states, result):
+        class Running:
+            def __init__(self, values):
+                self._values = list(values)
+
+            @property
+            def State(self):
+                if len(self._values) > 1:
+                    return self._values.pop(0)
+                return self._values[0]
+
+        task = mock.Mock()
+        task.Name = "task"
+        task.Run.return_value = Running(states)
+        task.LastTaskResult = result
+        root = mock.Mock()
+        root.GetTasks.return_value = _Collection([task])
+        return root, task
+
+    def test_registered_task_waits_for_completion_and_accepts_zero_result(self):
+        root, task = self._task_root(states=[4, 3], result=0)
+
+        with mock.patch.object(hid_elevation_windows.time, "sleep"):
+            hid_elevation_windows._run_task(r"\task", _root=root)
+
+        task.Run.assert_called_once_with("")
+
+    def test_registered_task_busy_exit_is_reported_for_retry(self):
+        root, _task = self._task_root(
+            states=[3],
+            result=hid_elevation_windows.HELPER_EXIT_OPERATION_BUSY,
+        )
+
+        with self.assertRaises(hid_elevation_windows.HidElevationError) as ctx:
+            hid_elevation_windows._run_task(r"\task", _root=root)
+
+        self.assertEqual(str(ctx.exception), "hid_helper_operation_busy")
+
+    def test_registered_task_timeout_is_not_reported_as_success(self):
+        root, _task = self._task_root(states=[4], result=0)
+
+        with mock.patch.object(
+            hid_elevation_windows.time,
+            "monotonic",
+            side_effect=[0.0, 31.0],
+        ), mock.patch.object(hid_elevation_windows.time, "sleep"):
+            with self.assertRaises(hid_elevation_windows.HidElevationError) as ctx:
+                hid_elevation_windows._run_task(r"\task", _root=root)
+
+        self.assertEqual(str(ctx.exception), "hid_helper_task_timeout")
+
+    def test_registered_task_without_running_state_is_rejected(self):
+        task = mock.Mock()
+        task.Name = "task"
+        task.Run.return_value = object()
+        root = mock.Mock()
+        root.GetTasks.return_value = _Collection([task])
+
+        with self.assertRaises(hid_elevation_windows.HidElevationError) as ctx:
+            hid_elevation_windows._run_task(r"\task", _root=root)
+
+        self.assertEqual(
+            str(ctx.exception),
+            "hid_helper_task_result_unavailable",
+        )
+
+    def test_registered_task_start_exception_is_sanitized(self):
+        task = mock.Mock()
+        task.Name = "task"
+        task.Run.side_effect = RuntimeError("COM failure")
+        root = mock.Mock()
+        root.GetTasks.return_value = _Collection([task])
+
+        with self.assertRaises(hid_elevation_windows.HidElevationError) as ctx:
+            hid_elevation_windows._run_task(r"\task", _root=root)
+
+        self.assertEqual(str(ctx.exception), "hid_helper_task_start_failed")
+
+
+class ElevatedProcessTests(unittest.TestCase):
+    def test_uac_helper_timeout_terminates_and_waits_for_final_exit(self):
+        wait_calls = []
+        terminate_calls = []
+        close_calls = []
+
+        class Shell32:
+            pass
+
+        shell32 = Shell32()
+
+        def launch(info_ptr):
+            info_ptr._obj.hProcess = 123
+            return True
+
+        shell32.ShellExecuteExW = _CallableWin32Function(launch)
+
+        class Kernel32:
+            pass
+
+        kernel32 = Kernel32()
+
+        def wait(handle, timeout):
+            wait_calls.append((handle, timeout))
+            return 0x00000102 if len(wait_calls) == 1 else 0
+
+        kernel32.WaitForSingleObject = _CallableWin32Function(wait)
+        kernel32.GetExitCodeProcess = _CallableWin32Function(
+            lambda _handle, _exit_code: True
+        )
+        kernel32.TerminateProcess = _CallableWin32Function(
+            lambda handle, exit_code: terminate_calls.append(
+                (handle, exit_code)
+            )
+            or True
+        )
+        kernel32.CloseHandle = _CallableWin32Function(
+            lambda handle: close_calls.append(handle) or True
+        )
+
+        with mock.patch.object(
+            hid_elevation_windows.ctypes,
+            "WinDLL",
+            side_effect=[shell32, kernel32],
+        ):
+            with self.assertRaises(hid_elevation_windows.HidElevationError) as ctx:
+                hid_elevation_windows._run_elevated_and_wait(
+                    Path(r"C:\helper.exe"),
+                    "--install-task",
+                    1.0,
+                )
+
+        self.assertEqual(str(ctx.exception), "hid_helper_setup_timeout")
+        self.assertEqual(
+            wait_calls,
+            [
+                (123, 1000),
+                (123, hid_elevation_windows._ELEVATED_PROCESS_TERMINATION_WAIT_MS),
+            ],
+        )
+        self.assertEqual(
+            terminate_calls,
+            [(123, hid_elevation_windows.HELPER_EXIT_UNEXPECTED_FAILURE)],
+        )
+        self.assertEqual(close_calls, [123])
 
 
 class ProtectedPathTests(unittest.TestCase):
@@ -302,7 +594,7 @@ class InstalledHelperTests(unittest.TestCase):
 
     def test_matching_helper_and_task_are_available(self):
         with tempfile.TemporaryDirectory() as raw:
-            root, app, owner_root, _manifest_path, _target, _manifest, task = (
+            root, app, owner_root, _manifest_path, _target, manifest, task = (
                 self._fixture(raw)
             )
 
@@ -312,7 +604,9 @@ class InstalledHelperTests(unittest.TestCase):
                 user_sid=SID,
                 owner_root=owner_root,
                 program_files_root=root,
-                _read_task=lambda _name: task,
+                _read_task=lambda name: (
+                    task if name == manifest.task_name else None
+                ),
                 _read_acl=self._acl,
             )
 
@@ -341,7 +635,7 @@ class InstalledHelperTests(unittest.TestCase):
 
     def test_same_generation_from_an_older_build_is_reused(self):
         with tempfile.TemporaryDirectory() as raw:
-            root, app, owner_root, _manifest_path, _target, _manifest, task = (
+            root, app, owner_root, _manifest_path, _target, manifest, task = (
                 self._fixture(raw, helper_bytes=b"older-helper")
             )
             bundled = app / hid_elevation_windows.HELPER_BUNDLE_RELATIVE_PATH
@@ -353,7 +647,9 @@ class InstalledHelperTests(unittest.TestCase):
                 user_sid=SID,
                 owner_root=owner_root,
                 program_files_root=root,
-                _read_task=lambda _name: task,
+                _read_task=lambda name: (
+                    task if name == manifest.task_name else None
+                ),
                 _read_acl=self._acl,
             )
 
@@ -635,6 +931,53 @@ class TaskLifecycleTests(unittest.TestCase):
             self.assertNotIn(hid_elevation_windows.LEGACY_TASK_NAME, tasks)
             self.assertFalse(legacy_target.exists())
 
+    def test_install_removes_current_users_legacy_task_with_damaged_settings(self):
+        with tempfile.TemporaryDirectory() as raw:
+            program_files = Path(raw)
+            legacy_target = hid_elevation_windows.legacy_protected_helper_path(
+                program_files_root=program_files
+            )
+            legacy_target.parent.mkdir(parents=True)
+            legacy_target.write_bytes(b"old-helper")
+            damaged_xml = hid_elevation_windows.task_definition_xml(
+                legacy_target,
+                SID,
+                task_name=hid_elevation_windows.LEGACY_TASK_NAME,
+            ).replace(
+                "<MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>",
+                "<MultipleInstancesPolicy>Parallel</MultipleInstancesPolicy>",
+            )
+            tasks = {
+                hid_elevation_windows.LEGACY_TASK_NAME: (
+                    hid_elevation_windows._RegisteredTaskSnapshot(
+                        damaged_xml,
+                        "legacy-sddl",
+                    )
+                )
+            }
+
+            def delete_task(name, *, missing_ok):
+                self.assertFalse(missing_ok)
+                tasks.pop(name, None)
+
+            with mock.patch.object(
+                hid_elevation_windows,
+                "_read_registered_task",
+                side_effect=lambda name: tasks.get(name),
+            ), mock.patch.object(
+                hid_elevation_windows,
+                "_delete_task",
+                side_effect=delete_task,
+            ):
+                removed = hid_elevation_windows._cleanup_legacy_contract_for_user(
+                    SID,
+                    trusted_root=program_files,
+                )
+
+            self.assertTrue(removed)
+            self.assertEqual(tasks, {})
+            self.assertFalse(legacy_target.exists())
+
     def test_install_preserves_another_users_legacy_task(self):
         with tempfile.TemporaryDirectory() as raw:
             program_files = Path(raw)
@@ -668,6 +1011,101 @@ class TaskLifecycleTests(unittest.TestCase):
             self.assertFalse(removed)
             self.assertTrue(legacy_target.exists())
             delete.assert_not_called()
+
+    def test_other_users_legacy_task_is_ignored_before_its_damaged_path(self):
+        other_sid = "S-1-5-21-111-222-333-1002"
+        with tempfile.TemporaryDirectory() as raw:
+            program_files = Path(raw)
+            legacy_target = hid_elevation_windows.legacy_protected_helper_path(
+                program_files_root=program_files
+            )
+            legacy_target.mkdir(parents=True)
+            legacy_task = hid_elevation_windows._RegisteredTaskSnapshot(
+                hid_elevation_windows.task_definition_xml(
+                    legacy_target,
+                    other_sid,
+                    task_name=hid_elevation_windows.LEGACY_TASK_NAME,
+                ),
+                "legacy-sddl",
+            )
+            delete = mock.Mock()
+
+            with mock.patch.object(
+                hid_elevation_windows,
+                "_read_registered_task",
+                return_value=legacy_task,
+            ), mock.patch.object(
+                hid_elevation_windows,
+                "_delete_task",
+                delete,
+            ):
+                removed = hid_elevation_windows._cleanup_legacy_contract_for_user(
+                    SID,
+                    trusted_root=program_files,
+                )
+
+            self.assertFalse(removed)
+            self.assertTrue(legacy_target.is_dir())
+            delete.assert_not_called()
+
+    def test_unreadable_legacy_owner_remains_visible_as_cleanup_pending(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            app = root / "app"
+            app.mkdir()
+            bundled = app / hid_elevation_windows.HELPER_BUNDLE_RELATIVE_PATH
+            bundled.parent.mkdir()
+            bundled.write_bytes(b"helper")
+            owner_root = root / "protected"
+            owner_root.mkdir()
+            manifest = hid_elevation_windows._build_manifest(
+                SID,
+                hid_elevation_windows._sha256(bundled),
+            )
+            target = owner_root / Path(manifest.helper_relative_path)
+            target.parent.mkdir(parents=True)
+            target.write_bytes(b"helper")
+            (owner_root / hid_elevation_windows.MANIFEST_FILENAME).write_text(
+                json.dumps(manifest.as_dict()),
+                encoding="utf-8",
+            )
+            task = self._task_snapshot(target)
+            unreadable_legacy = hid_elevation_windows._RegisteredTaskSnapshot(
+                "<Task broken",
+                "legacy-sddl",
+            )
+
+            def read_task(name):
+                if name == manifest.task_name:
+                    return task
+                if name == hid_elevation_windows.LEGACY_TASK_NAME:
+                    return unreadable_legacy
+                return None
+
+            states = [
+                hid_elevation_windows.inspect_installed_helper(
+                    frozen=True,
+                    executable=str(app / "RemoteMicRC003.exe"),
+                    user_sid=SID,
+                    owner_root=owner_root,
+                    program_files_root=root,
+                    _read_task=read_task,
+                    _read_acl=self._acl,
+                )
+                for _ in range(2)
+            ]
+
+        self.assertEqual(
+            states,
+            [
+                hid_elevation_windows.HidHelperState(
+                    True, "helper_cleanup_pending"
+                ),
+                hid_elevation_windows.HidHelperState(
+                    True, "helper_cleanup_pending"
+                ),
+            ],
+        )
 
     def test_sid_mismatch_fails_before_any_write(self):
         with tempfile.TemporaryDirectory() as raw:
@@ -1884,6 +2322,39 @@ class RemovalInspectionTests(unittest.TestCase):
 
         self.assertTrue(requires_removal)
 
+    def test_another_users_legacy_task_is_not_this_users_residual(self):
+        other_sid = "S-1-5-21-111-222-333-1002"
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            target = hid_elevation_windows.legacy_protected_helper_path(
+                program_files_root=root
+            )
+            target.parent.mkdir(parents=True)
+            target.write_bytes(b"legacy-helper")
+            snapshot = hid_elevation_windows._RegisteredTaskSnapshot(
+                xml_text=hid_elevation_windows.task_definition_xml(
+                    target,
+                    other_sid,
+                    task_name=hid_elevation_windows.LEGACY_TASK_NAME,
+                ),
+                security_sddl="",
+            )
+
+            def read_task(name):
+                if name == hid_elevation_windows.LEGACY_TASK_NAME:
+                    return snapshot
+                return None
+
+            requires_removal = (
+                hid_elevation_windows._installation_requires_elevated_removal(
+                    SID,
+                    program_files_root=root,
+                    _read_task=read_task,
+                )
+            )
+
+        self.assertFalse(requires_removal)
+
     def test_inert_manifest_alone_does_not_request_uac(self):
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
@@ -1957,6 +2428,34 @@ class ElevationRequestTests(unittest.TestCase):
             f"{hid_elevation_windows.INSTALL_FLAG} {hid_elevation_windows.REQUEST_SID_FLAG} {SID}",
             12.0,
         )
+        self.assertEqual(inspect.call_count, 2)
+
+    def test_install_rechecks_final_state_even_when_the_launcher_reports_failure(self):
+        with tempfile.TemporaryDirectory() as raw:
+            helper = Path(raw) / hid_elevation_windows.HELPER_EXE_NAME
+            helper.write_bytes(b"helper")
+            inspect = mock.Mock(
+                side_effect=[
+                    hid_elevation_windows.HidHelperState(
+                        False, "helper_manifest_missing"
+                    ),
+                    hid_elevation_windows.HidHelperState(True),
+                ]
+            )
+
+            state = hid_elevation_windows.request_install_elevation(
+                helper_path=helper,
+                _launch=mock.Mock(
+                    side_effect=hid_elevation_windows.HidElevationError(
+                        "hid_helper_setup_wait_failed"
+                    )
+                ),
+                _inspect=inspect,
+                _can_self_elevate=lambda: True,
+                _current_sid=lambda: SID,
+            )
+
+        self.assertEqual(state, hid_elevation_windows.HidHelperState(True))
         self.assertEqual(inspect.call_count, 2)
 
     def test_cleanup_failure_keeps_the_verified_helper_available(self):
@@ -2182,6 +2681,39 @@ class ElevationRequestTests(unittest.TestCase):
         self.assertEqual(state, hid_elevation_windows.HidHelperState(True))
         launch.assert_not_called()
 
+    def test_uninstall_rechecks_after_an_initial_inspection_error(self):
+        with tempfile.TemporaryDirectory() as raw:
+            helper = Path(raw) / hid_elevation_windows.HELPER_EXE_NAME
+            helper.write_bytes(b"helper")
+            launch = mock.Mock()
+            requires_removal = mock.Mock(
+                side_effect=[
+                    hid_elevation_windows.HidElevationError(
+                        "hid_helper_task_query_failed"
+                    ),
+                    False,
+                ]
+            )
+
+            state = hid_elevation_windows.request_uninstall_elevation(
+                helper_path=helper,
+                _launch=launch,
+                _current_sid=lambda: SID,
+                _requires_removal=requires_removal,
+            )
+
+        self.assertEqual(state, hid_elevation_windows.HidHelperState(True))
+        self.assertEqual(requires_removal.call_count, 2)
+        launch.assert_not_called()
+
+    def test_uninstall_invalid_sid_returns_a_stable_error(self):
+        state = hid_elevation_windows.request_uninstall_elevation(
+            _current_sid=lambda: "not-a-sid",
+            _requires_removal=mock.Mock(),
+        )
+
+        self.assertEqual(state.detail, "current_user_sid_invalid")
+
     def test_standard_account_with_a_helper_is_rejected_before_uac(self):
         with tempfile.TemporaryDirectory() as raw:
             helper = Path(raw) / hid_elevation_windows.HELPER_EXE_NAME
@@ -2202,7 +2734,7 @@ class ElevationRequestTests(unittest.TestCase):
 
 class HelperMainTests(unittest.TestCase):
     def test_fixed_frozen_helper_uses_a_new_generation(self):
-        self.assertGreaterEqual(hid_elevation_windows.HELPER_GENERATION, 4)
+        self.assertGreaterEqual(hid_elevation_windows.HELPER_GENERATION, 5)
 
     def test_self_check_explicitly_imports_the_operation_lock_dependency(self):
         source = __import__("inspect").getsource(hid_elevation_windows._self_check)

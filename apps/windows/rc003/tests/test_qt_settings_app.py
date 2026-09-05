@@ -446,7 +446,13 @@ class SettingsControllerTests(unittest.TestCase):
             "read_startup_state",
             return_value=qt_settings_app.startup_windows.StartupState(False),
         )
-        self._startup_state_patch.start()
+        self._startup_state_mock = self._startup_state_patch.start()
+        self._startup_rebind_patch = mock.patch.object(
+            qt_settings_app.startup_windows,
+            "rebind_owned_frozen_startup",
+            return_value=qt_settings_app.startup_windows.StartupState(False),
+        )
+        self._startup_rebind_mock = self._startup_rebind_patch.start()
         self._hid_helper_offer_patch = mock.patch.object(
             qt_settings_app.hid_elevation_windows,
             "bundled_helper_offer_id",
@@ -494,6 +500,7 @@ class SettingsControllerTests(unittest.TestCase):
         qt_settings_app._driver_action_active_event.clear()
         self._hid_helper_consumer_patch.stop()
         self._hid_helper_offer_patch.stop()
+        self._startup_rebind_patch.stop()
         self._startup_state_patch.stop()
         self._voice_hotkey_sync_patch.stop()
         self._voice_hotkey_read_patch.stop()
@@ -522,6 +529,19 @@ class SettingsControllerTests(unittest.TestCase):
             controller.trayIconSource.endswith("remote-mic-unavailable.svg")
         )
 
+    def test_startup_rebind_runs_before_startup_state_read(self):
+        calls = []
+        self._startup_rebind_mock.side_effect = lambda: calls.append("rebind")
+        self._startup_state_mock.side_effect = lambda: (
+            calls.append("read")
+            or qt_settings_app.startup_windows.StartupState(True)
+        )
+
+        controller, _model = self._make_controller()
+
+        self.assertEqual(calls, ["rebind", "read"])
+        self.assertTrue(controller.launchAtLogin)
+
     def test_installed_helper_issue_exposes_an_explicit_repair_action(self):
         with mock.patch.object(
             qt_settings_app.sys, "frozen", True, create=True
@@ -540,7 +560,7 @@ class SettingsControllerTests(unittest.TestCase):
 
         self.assertTrue(controller.hidHelperIssueVisible)
         self.assertTrue(controller.hidHelperRepairVisible)
-        self.assertIn("自定义方向映射已停用", controller.hidHelperIssueText)
+        self.assertIn("自定义按键映射已停用", controller.hidHelperIssueText)
 
     def test_portable_helper_issue_offers_one_time_enable_action(self):
         with mock.patch.object(
@@ -619,7 +639,7 @@ class SettingsControllerTests(unittest.TestCase):
         self.assertFalse(controller.hidHelperRepairBusy)
         self.assertFalse(controller.hidHelperIssueVisible)
         self.assertFalse(controller.hidHelperRepairVisible)
-        self.assertIn("权限已启用", controller.statusMessage)
+        self.assertIn("管理员按键组件已启用", controller.statusMessage)
         saved = config.load_config(config.config_path(controller._config_root))
         self.assertEqual(
             saved["hid_helper_setup_prompted_offer_id"],
@@ -648,7 +668,7 @@ class SettingsControllerTests(unittest.TestCase):
         self.assertTrue(controller.hidHelperRepairVisible)
         self.assertFalse(controller.hidHelperSetupRequired)
         self.assertFalse(controller.hidHelperRemovalVisible)
-        self.assertIn("已可用", controller.hidHelperIssueText)
+        self.assertIn("自定义按键映射可用", controller.hidHelperIssueText)
 
     def test_cleanup_retry_that_still_has_residue_does_not_claim_full_success(self):
         pending = qt_settings_app.hid_elevation_windows.HidHelperState(
@@ -680,7 +700,7 @@ class SettingsControllerTests(unittest.TestCase):
         self.assertIn("尚未清理", controller.statusMessage)
         self.assertNotIn("权限已启用", controller.statusMessage)
 
-    def test_cancelled_helper_repair_keeps_direction_mapping_disabled(self):
+    def test_cancelled_helper_repair_keeps_all_custom_mapping_disabled(self):
         missing = qt_settings_app.hid_elevation_windows.HidHelperState(
             False, "hid_helper_task_missing"
         )
@@ -709,7 +729,8 @@ class SettingsControllerTests(unittest.TestCase):
 
         self.assertTrue(controller.hidHelperRepairVisible)
         self.assertIn("未确认管理员权限", controller.errorMessage)
-        self.assertIn("Windows 原始方向", controller.errorMessage)
+        self.assertIn("全部自定义按键映射已停用", controller.errorMessage)
+        self.assertIn("Windows 原始按键操作", controller.errorMessage)
 
     def test_visible_portable_launch_claims_one_short_prompt_before_uac(self):
         missing = qt_settings_app.hid_elevation_windows.HidHelperState(
@@ -912,7 +933,7 @@ class SettingsControllerTests(unittest.TestCase):
         )
         self.assertFalse(controller.hidHelperRemovalVisible)
         self.assertTrue(controller.hidHelperSetupRequired)
-        self.assertIn("权限已移除", controller.statusMessage)
+        self.assertIn("管理员按键组件已移除", controller.statusMessage)
 
     def test_failed_portable_helper_removal_restores_its_consumer_marker(self):
         ready = qt_settings_app.hid_elevation_windows.HidHelperState(True)
@@ -2631,6 +2652,7 @@ class SettingsControllerTests(unittest.TestCase):
             identity=identity,
             raw_input_state="ready",
             hid_tap_state=frida_compat.HidTapState.READY.value,
+            voice_key_physicalizer_state="ready",
             last_button_at=time.time(),
             last_button_source="hid",
         )
@@ -2642,7 +2664,91 @@ class SettingsControllerTests(unittest.TestCase):
         self.assertIn("刚收到按键", controller.launchStatusText)
         self.assertFalse(controller.bridgeRestartRecommended)
 
-    def test_raw_input_ready_with_failed_tap_reports_direction_mapping_disabled(self):
+    def test_unknown_voice_shortcut_channel_is_not_reported_as_all_normal(self):
+        self._bridge_status_patch.stop()
+        self._bridge_status_patch = mock.patch.object(
+            qt_settings_app.single_instance,
+            "bridge_instance_running",
+            return_value=True,
+        )
+        self._bridge_status_patch.start()
+        identity = bridge_runtime_status.current_runtime_identity(
+            qt_settings_app.__version__
+        )
+        bridge_runtime_status.publish_status(
+            config.config_root(),
+            bridge_runtime_status.BridgeConnectionState.CONNECTED,
+            pid=4321,
+            identity=identity,
+            raw_input_state="ready",
+            hid_tap_state=frida_compat.HidTapState.READY.value,
+            voice_key_physicalizer_state="unknown",
+        )
+
+        controller, _ = self._make_controller()
+
+        self.assertNotIn("两个按键通道正常", controller.launchStatusText)
+        self.assertIn("语音快捷键通道正在检查", controller.launchStatusText)
+
+    def test_recovering_voice_shortcut_channel_is_not_reported_as_all_normal(self):
+        self._bridge_status_patch.stop()
+        self._bridge_status_patch = mock.patch.object(
+            qt_settings_app.single_instance,
+            "bridge_instance_running",
+            return_value=True,
+        )
+        self._bridge_status_patch.start()
+        identity = bridge_runtime_status.current_runtime_identity(
+            qt_settings_app.__version__
+        )
+        bridge_runtime_status.publish_status(
+            config.config_root(),
+            bridge_runtime_status.BridgeConnectionState.CONNECTED,
+            pid=4321,
+            identity=identity,
+            raw_input_state="ready",
+            hid_tap_state=frida_compat.HidTapState.READY.value,
+            voice_key_physicalizer_state="recovering",
+        )
+
+        controller, _ = self._make_controller()
+
+        self.assertNotIn("两个按键通道正常", controller.launchStatusText)
+        self.assertIn(
+            "自定义按键映射可用；语音快捷键通道正在恢复",
+            controller.launchStatusText,
+        )
+
+    def test_failed_voice_shortcut_channel_is_reported_directly(self):
+        self._bridge_status_patch.stop()
+        self._bridge_status_patch = mock.patch.object(
+            qt_settings_app.single_instance,
+            "bridge_instance_running",
+            return_value=True,
+        )
+        self._bridge_status_patch.start()
+        identity = bridge_runtime_status.current_runtime_identity(
+            qt_settings_app.__version__
+        )
+        bridge_runtime_status.publish_status(
+            config.config_root(),
+            bridge_runtime_status.BridgeConnectionState.CONNECTED,
+            pid=4321,
+            identity=identity,
+            raw_input_state="ready",
+            hid_tap_state=frida_compat.HidTapState.READY.value,
+            voice_key_physicalizer_state="failed",
+        )
+
+        controller, _ = self._make_controller()
+
+        self.assertNotIn("两个按键通道正常", controller.launchStatusText)
+        self.assertIn(
+            "自定义按键映射可用；语音快捷键通道异常",
+            controller.launchStatusText,
+        )
+
+    def test_raw_input_ready_with_failed_tap_reports_all_custom_mapping_disabled(self):
         self._bridge_status_patch.stop()
         self._bridge_status_patch = mock.patch.object(
             qt_settings_app.single_instance,
@@ -2665,7 +2771,7 @@ class SettingsControllerTests(unittest.TestCase):
         controller, _ = self._make_controller()
 
         self.assertIn(
-            "普通按键可用；方向映射已停用",
+            "Windows 原始按键可用；自定义按键映射已停用",
             controller.launchStatusText,
         )
 
@@ -3501,7 +3607,10 @@ class SettingsControllerTests(unittest.TestCase):
 
     def test_external_bridge_request_starts_the_existing_desktop_process_once(self):
         controller, _ = self._make_controller()
-        single_instance.write_bridge_start_request(controller._config_root)
+        single_instance.write_bridge_start_request(
+            controller._config_root,
+            session_scoped=True,
+        )
 
         with mock.patch.object(
             controller,
@@ -3515,8 +3624,15 @@ class SettingsControllerTests(unittest.TestCase):
 
     def test_external_application_exit_request_preempts_bridge_refresh_once(self):
         controller, _ = self._make_controller()
-        single_instance.write_application_exit_request(controller._config_root)
-        single_instance.write_bridge_start_request(controller._config_root)
+        single_instance.write_application_exit_request(
+            controller._config_root,
+            request_id="handoff-request",
+            session_scoped=True,
+        )
+        single_instance.write_bridge_start_request(
+            controller._config_root,
+            session_scoped=True,
+        )
         exit_requests = []
         controller.maintenanceExitRequested.connect(
             lambda: exit_requests.append(True)
@@ -3536,31 +3652,222 @@ class SettingsControllerTests(unittest.TestCase):
             )
         )
         self.assertFalse(
-            single_instance.consume_bridge_start_request(controller._config_root)
+            single_instance.consume_bridge_start_request(
+                controller._config_root,
+                session_scoped=True,
+            )
         )
+
+    def test_window_exit_signal_uses_the_normal_full_exit_flow(self):
+        controller, _ = self._make_controller()
+        controller._settings_window_hwnd = 4321
+        exit_requests = []
+        controller.maintenanceExitRequested.connect(
+            lambda: exit_requests.append(True)
+        )
+
+        with mock.patch.object(
+            single_instance,
+            "consume_settings_window_exit_request",
+            return_value=731,
+        ) as window_request, mock.patch.object(
+            single_instance,
+            "consume_and_acknowledge_application_exit_request",
+        ) as file_request:
+            controller.refreshBridgeState()
+
+        window_request.assert_called_once_with(4321)
+        file_request.assert_not_called()
+        self.assertEqual(exit_requests, [True])
+        self.assertTrue(controller._maintenance_exit_pending)
+        self.assertIsNone(controller._maintenance_exit_request.request_id)
+        self.assertEqual(controller._maintenance_exit_request.window_token, 731)
+
+    def test_maintenance_exit_cancels_an_async_window_hide(self):
+        controller, _ = self._make_controller()
+        controller._settings_window_hwnd = 4321
+        controller._window_hide_requested = True
+        controller._input_cleanup_requested = True
+        input_ready = []
+        hide_ready = []
+        controller.inputCleanupReady.connect(lambda: input_ready.append(True))
+        controller.windowHideReady.connect(lambda: hide_ready.append(True))
+
+        with mock.patch.object(
+            single_instance,
+            "consume_settings_window_exit_request",
+            return_value=731,
+        ), mock.patch.object(
+            controller,
+            "_get_input_capture_in_use",
+            return_value=False,
+        ):
+            controller.refreshBridgeState()
+            controller._after_input_operation_change()
+
+        self.assertFalse(controller._window_hide_requested)
+        self.assertEqual(input_ready, [True])
+        self.assertEqual(hide_ready, [])
+
+    def test_cancelled_window_exit_signal_returns_its_token(self):
+        controller, _ = self._make_controller()
+        controller._settings_window_hwnd = 4321
+
+        with mock.patch.object(
+            single_instance,
+            "consume_settings_window_exit_request",
+            return_value=731,
+        ), mock.patch.object(
+            single_instance,
+            "publish_settings_window_exit_rejection",
+            return_value=True,
+        ) as reject:
+            controller.refreshBridgeState()
+            controller.cancelPendingMaintenanceExit()
+
+        reject.assert_called_once_with(4321, 731)
+        self.assertFalse(controller._maintenance_exit_pending)
+
+    def test_pending_exit_is_not_replaced_until_the_first_request_is_cancelled(self):
+        controller, _ = self._make_controller()
+        controller._settings_window_hwnd = 4321
+        second_request = single_instance.ApplicationExitRequest(
+            "second-request",
+            session_scoped=True,
+        )
+
+        with mock.patch.object(
+            single_instance,
+            "consume_settings_window_exit_request",
+            side_effect=(731, None),
+        ) as window_request, mock.patch.object(
+            single_instance,
+            "consume_and_acknowledge_application_exit_request",
+            return_value=second_request,
+        ) as file_request, mock.patch.object(
+            single_instance,
+            "publish_settings_window_exit_rejection",
+            return_value=True,
+        ):
+            controller.refreshBridgeState()
+            first_request = controller._maintenance_exit_request
+            controller.refreshBridgeState()
+
+            self.assertIs(controller._maintenance_exit_request, first_request)
+            self.assertEqual(window_request.call_count, 1)
+            file_request.assert_not_called()
+
+            controller.cancelPendingMaintenanceExit()
+            controller.refreshBridgeState()
+
+        self.assertEqual(window_request.call_count, 2)
+        file_request.assert_called_once_with(controller._config_root)
+        self.assertIs(controller._maintenance_exit_request, second_request)
+
+    def test_exit_in_progress_never_consumes_a_second_exit_request(self):
+        blockers = (
+            (
+                "request retained",
+                lambda controller: setattr(
+                    controller,
+                    "_maintenance_exit_request",
+                    single_instance.ApplicationExitRequest(
+                        "active-request",
+                        session_scoped=True,
+                    ),
+                ),
+            ),
+            (
+                "exit requested",
+                lambda controller: setattr(
+                    controller, "_application_exit_requested", True
+                ),
+            ),
+            (
+                "exit confirmed",
+                lambda controller: setattr(
+                    controller, "_application_exit_confirmed", True
+                ),
+            ),
+            (
+                "exit intent",
+                lambda controller: controller._application_exit_intent.set(),
+            ),
+        )
+
+        for label, block in blockers:
+            with self.subTest(label=label):
+                controller, _ = self._make_controller()
+                block(controller)
+                with mock.patch.object(
+                    single_instance,
+                    "consume_settings_window_exit_request",
+                ) as window_request, mock.patch.object(
+                    single_instance,
+                    "consume_and_acknowledge_application_exit_request",
+                ) as file_request, mock.patch.object(
+                    single_instance,
+                    "consume_bridge_start_request",
+                    return_value=False,
+                ) as bridge_request, mock.patch.object(
+                    controller,
+                    "_refresh_bridge_status",
+                ) as refresh_status:
+                    controller.refreshBridgeState()
+
+                window_request.assert_not_called()
+                file_request.assert_not_called()
+                bridge_request.assert_called_once_with(
+                    controller._config_root,
+                    session_scoped=True,
+                )
+                refresh_status.assert_not_called()
+
+    def test_session_request_probe_failure_does_not_break_periodic_refresh(self):
+        controller, _ = self._make_controller()
+
+        with mock.patch.object(
+            single_instance,
+            "consume_and_acknowledge_application_exit_request",
+            side_effect=single_instance.SingleInstanceUnavailableError(
+                "session unavailable"
+            ),
+        ), mock.patch.object(
+            single_instance,
+            "consume_bridge_start_request",
+            side_effect=single_instance.SingleInstanceUnavailableError(
+                "session unavailable"
+            ),
+        ):
+            controller.refreshBridgeState()
+
+        self.assertFalse(controller._maintenance_exit_pending)
 
     def test_cancelled_external_exit_notifies_the_waiting_copy(self):
         controller, _ = self._make_controller()
         single_instance.write_application_exit_request(
             controller._config_root,
             request_id="handoff-request",
+            session_scoped=True,
         )
 
         controller.refreshBridgeState()
         self.assertTrue(controller._maintenance_exit_pending)
         self.assertEqual(
-            controller._maintenance_exit_request_id,
+            controller._maintenance_exit_request.request_id,
             "handoff-request",
         )
+        self.assertTrue(controller._maintenance_exit_request.session_scoped)
 
         controller.cancelPendingMaintenanceExit()
 
         self.assertFalse(controller._maintenance_exit_pending)
-        self.assertIsNone(controller._maintenance_exit_request_id)
+        self.assertIsNone(controller._maintenance_exit_request)
         self.assertTrue(
             single_instance.application_exit_request_rejected(
                 controller._config_root,
                 "handoff-request",
+                session_scoped=True,
             )
         )
 
@@ -3569,6 +3876,7 @@ class SettingsControllerTests(unittest.TestCase):
         single_instance.write_application_exit_request(
             controller._config_root,
             request_id="handoff-request",
+            session_scoped=True,
         )
         controller.refreshBridgeState()
         completions = []
@@ -3583,13 +3891,18 @@ class SettingsControllerTests(unittest.TestCase):
             single_instance.application_exit_request_rejected(
                 controller._config_root,
                 "handoff-request",
+                session_scoped=True,
             )
         )
 
     def test_external_exit_blocks_an_already_queued_bridge_start_until_cancelled(self):
         controller, _ = self._make_controller()
         controller._start_bridge_requested = True
-        single_instance.write_application_exit_request(controller._config_root)
+        single_instance.write_application_exit_request(
+            controller._config_root,
+            request_id="handoff-request",
+            session_scoped=True,
+        )
 
         with mock.patch.object(
             controller,
@@ -3599,7 +3912,10 @@ class SettingsControllerTests(unittest.TestCase):
             controller, "startBridge"
         ) as start_bridge:
             controller.refreshBridgeState()
-            single_instance.write_bridge_start_request(controller._config_root)
+            single_instance.write_bridge_start_request(
+                controller._config_root,
+                session_scoped=True,
+            )
             controller.refreshBridgeState()
 
         start_bridge.assert_not_called()
@@ -3607,7 +3923,10 @@ class SettingsControllerTests(unittest.TestCase):
         self.assertTrue(controller._maintenance_exit_pending)
         self.assertFalse(controller._start_bridge_requested)
         self.assertFalse(
-            single_instance.consume_bridge_start_request(controller._config_root)
+            single_instance.consume_bridge_start_request(
+                controller._config_root,
+                session_scoped=True,
+            )
         )
 
         with mock.patch("PySide6.QtCore.QTimer.singleShot") as single_shot:
@@ -7139,10 +7458,13 @@ class SettingsShellSourceContractTests(unittest.TestCase):
         self.assertIn("完成清理", self.device_qml)
         self.assertIn("管理员按键组件异常", self.device_qml)
         self.assertIn('objectName: "hidHelperSetupDialog"', self.main_qml)
-        self.assertIn("确认一次管理员权限，之后普通启动和自启动都可用。", self.main_qml)
-        self.assertIn("方向改键已可用。确认管理员权限，清理旧组件。", self.main_qml)
+        self.assertIn(
+            "确认一次管理员权限，之后普通启动和自启动都可使用自定义按键映射。",
+            self.main_qml,
+        )
+        self.assertIn("自定义按键映射已可用。确认管理员权限，清理旧组件。", self.main_qml)
         self.assertIn('objectName: "removeHidHelperButton"', self.device_qml)
-        self.assertIn("本机所有无线麦版本都不能使用方向改键", self.main_qml)
+        self.assertIn("本机所有无线麦版本都不能使用自定义按键映射", self.main_qml)
         self.assertIn(
             "SettingsController.feedbackPageIndex === tabBar.currentIndex",
             self.main_qml,

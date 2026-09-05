@@ -168,9 +168,9 @@ Item {
                         )
                     stateText: SettingsController.hidHelperIssueVisible
                         ? (SettingsController.hidHelperCleanupPending
-                            ? qsTr("方向改键可用，待清理")
+                            ? qsTr("自定义映射可用，待清理")
                             : SettingsController.hidHelperSetupRequired
-                            ? qsTr("方向改键未启用")
+                            ? qsTr("自定义映射未启用")
                             : qsTr("管理员按键组件异常"))
                         : root.combinedStatus(["os_version", "raw_input"])
                     stateColor: SettingsController.hidHelperIssueVisible

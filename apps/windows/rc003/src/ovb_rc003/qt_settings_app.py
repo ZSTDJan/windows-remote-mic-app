@@ -219,16 +219,27 @@ def _qml_directory() -> Path:
     return Path(__file__).resolve().parent / "qml"
 
 
-def _mark_settings_window_for_activation(window: object) -> bool:
-    """Mark the real native QML window for duplicate-launch reactivation."""
-
+def _settings_window_handle(window: object) -> int:
     if sys.platform != "win32":
-        return False
+        return 0
     try:
         hwnd = int(window.winId())  # type: ignore[attr-defined]
     except (AttributeError, TypeError, ValueError):
+        return 0
+    return hwnd if hwnd > 0 else 0
+
+
+def _mark_settings_window_for_activation(
+    window: object,
+    *,
+    hwnd: Optional[int] = None,
+) -> bool:
+    """Mark the real native QML window for duplicate-launch reactivation."""
+
+    resolved_hwnd = _settings_window_handle(window) if hwnd is None else int(hwnd)
+    if not resolved_hwnd:
         return False
-    return single_instance.mark_settings_window(hwnd)
+    return single_instance.mark_settings_window(resolved_hwnd)
 
 
 _qt_classes_cache: Optional[dict] = None
@@ -1051,12 +1062,16 @@ def _load_qt_classes() -> dict:
                     "close_behavior", config.CLOSE_BEHAVIOR_QUIT
                 )
             )
+            startup_windows.rebind_owned_frozen_startup()
             startup_state = startup_windows.read_startup_state()
             self._launch_at_login = startup_state.enabled
             self._application_exit_requested = False
             self._application_exit_confirmed = False
             self._maintenance_exit_pending = False
-            self._maintenance_exit_request_id: Optional[str] = None
+            self._maintenance_exit_request: Optional[
+                single_instance.ApplicationExitRequest
+            ] = None
+            self._settings_window_hwnd = 0
             self._application_exit_intent = threading.Event()
             self._application_exit_deadline = 0.0
             self._application_exit_poll_scheduled = False
@@ -1765,18 +1780,45 @@ def _load_qt_classes() -> dict:
                     frida_compat.HidTapState.DISABLED.value,
                 }
             )
+            physicalizer_recovering = (
+                status.voice_key_physicalizer_state
+                in {"starting", "recovering"}
+            )
+            physicalizer_failed = (
+                status.voice_key_physicalizer_state
+                in {"failed", "stopped"}
+            )
+            physicalizer_ready = status.voice_key_physicalizer_state == "ready"
             if raw_ready and tap_ready:
-                input_text = "两个按键通道正常"
+                if physicalizer_recovering:
+                    input_text = (
+                        "自定义按键映射可用；语音快捷键通道正在恢复"
+                    )
+                elif physicalizer_failed:
+                    input_text = (
+                        "自定义按键映射可用；语音快捷键通道异常"
+                    )
+                elif physicalizer_ready:
+                    input_text = "两个按键通道正常"
+                else:
+                    input_text = (
+                        "自定义按键映射可用；语音快捷键通道正在检查"
+                    )
             elif raw_ready and tap_failed:
-                input_text = "普通按键可用；方向映射已停用"
+                input_text = "Windows 原始按键可用；自定义按键映射已停用"
             elif raw_ready:
-                input_text = "普通按键可用；方向映射正在检查"
+                input_text = "Windows 原始按键可用；自定义按键映射正在检查"
             elif tap_ready:
-                input_text = "方向映射通道可用；普通按键异常"
+                input_text = "自定义按键映射可用；普通按键监听异常"
             elif bridge_runtime_status.input_channels_failed(status):
                 input_text = "两个按键通道异常"
             else:
                 input_text = "按键通道正在检查"
+            if not (raw_ready and tap_ready):
+                if physicalizer_recovering:
+                    input_text += "；语音快捷键通道正在恢复"
+                elif physicalizer_failed:
+                    input_text += "；语音快捷键通道异常"
             if status.last_button_at is not None:
                 age = max(0.0, time.time() - status.last_button_at)
                 if age <= 10.0:
@@ -3959,11 +4001,11 @@ def _load_qt_classes() -> dict:
         hidHelperIssueText = Property(
             str,
             lambda self: (
-                "方向改键已可用，旧权限组件尚未清理"
+                "自定义按键映射可用，旧权限组件尚未清理"
                 if self._hid_helper_cleanup_pending()
-                else "确认一次管理员权限后，普通启动和自启动都可使用方向改键"
+                else "确认一次管理员权限后，普通启动和自启动都可使用自定义按键映射"
                 if self._hid_helper_setup_required()
-                else "方向键保留 Windows 原始操作；自定义方向映射已停用"
+                else "遥控器保留 Windows 原始按键操作；自定义按键映射已停用"
                 if self._hid_helper_needs_repair()
                 else ""
             ),
@@ -4579,7 +4621,7 @@ def _load_qt_classes() -> dict:
                 self._application_exit_requested = False
                 self._application_exit_waiting_for_save = False
                 self._application_exit_confirmed = True
-                self._maintenance_exit_request_id = None
+                self._maintenance_exit_request = None
                 self._application_exit_intent.set()
                 self.applicationExitReady.emit()
                 return
@@ -4596,15 +4638,24 @@ def _load_qt_classes() -> dict:
             self.applicationExitFailed.emit(message)
 
         def _reject_pending_maintenance_exit(self) -> None:
-            request_id = self._maintenance_exit_request_id
-            self._maintenance_exit_request_id = None
+            request = self._maintenance_exit_request
+            self._maintenance_exit_request = None
             self._maintenance_exit_pending = False
-            if request_id is None:
+            if request is None:
+                return
+            if request.window_token is not None:
+                single_instance.publish_settings_window_exit_rejection(
+                    self._settings_window_hwnd,
+                    request.window_token,
+                )
+            if request.request_id is None:
                 return
             try:
                 single_instance.write_application_exit_rejection(
                     self._config_root,
-                    request_id,
+                    request.request_id,
+                    session_id=request.session_id,
+                    session_scoped=request.session_scoped,
                 )
             except OSError:
                 # The waiting copy retains a bounded fallback timeout when a
@@ -4719,12 +4770,12 @@ def _load_qt_classes() -> dict:
                 self._set_error_message("")
                 if state.detail == "helper_cleanup_pending":
                     self._set_status_message(
-                        "方向改键可用，旧权限组件尚未清理，请重试。",
+                        "自定义按键映射可用，旧权限组件尚未清理，请重试。",
                         self._DEVICE_PAGE_INDEX,
                     )
                 else:
                     self._set_status_message(
-                        "方向改键权限已启用。",
+                        "管理员按键组件已启用。",
                         self._DEVICE_PAGE_INDEX,
                     )
                 if (
@@ -4741,16 +4792,18 @@ def _load_qt_classes() -> dict:
             self._set_status_message("")
             if state.detail == "uac_cancelled":
                 message = (
-                    "未确认管理员权限。方向键仍按 Windows 原始方向执行。"
+                    "未确认管理员权限。全部自定义按键映射已停用，"
+                    "只保留 Windows 原始按键操作。"
                 )
             elif state.detail == "current_account_cannot_self_elevate":
                 message = (
-                    "当前 Windows 账号不是管理员，不能启用方向改键。"
+                    "当前 Windows 账号不是管理员，不能启用管理员按键组件。"
                     "请登录管理员账号；临时输入另一个管理员账号无效。"
                 )
             else:
                 message = (
-                    "方向改键权限启用失败。方向键仍按 Windows 原始方向执行。"
+                    "管理员按键组件启用失败。全部自定义按键映射已停用，"
+                    "只保留 Windows 原始按键操作。"
                 )
             self._set_error_message(message, self._DEVICE_PAGE_INDEX)
 
@@ -4770,7 +4823,7 @@ def _load_qt_classes() -> dict:
             self._set_hid_helper_repair_busy(True)
             self._set_error_message("")
             self._set_status_message(
-                "正在处理方向改键权限…",
+                "正在处理管理员按键组件…",
                 self._DEVICE_PAGE_INDEX,
             )
 
@@ -4808,7 +4861,7 @@ def _load_qt_classes() -> dict:
                 )
                 self._set_error_message("")
                 self._set_status_message(
-                    "方向改键权限已移除。",
+                    "管理员按键组件已移除。",
                     self._DEVICE_PAGE_INDEX,
                 )
                 if (
@@ -4824,27 +4877,27 @@ def _load_qt_classes() -> dict:
 
             self._set_status_message("")
             if state.detail == "uac_cancelled":
-                message = "未确认管理员权限，方向改键权限没有移除。"
+                message = "未确认管理员权限，管理员按键组件没有移除。"
             elif state.detail == "current_account_cannot_self_elevate":
                 message = (
-                    "当前 Windows 账号不能移除方向改键权限。"
+                    "当前 Windows 账号不能移除管理员按键组件。"
                     "请登录原管理员账号后重试。"
                 )
             elif state.detail == "helper_in_use_by_other_consumer":
                 message = (
-                    "本机还有其它无线麦版本在使用方向改键权限，当前版本不能移除。"
+                    "本机还有其它无线麦版本在使用管理员按键组件，当前版本不能移除。"
                 )
             elif state.detail == "helper_consumer_inspection_failed":
                 message = "无法确认是否还有其它无线麦版本在使用，未做任何更改。"
             elif state.detail == "helper_preserved_newer_contract":
-                message = "检测到较新版本正在使用，方向改键权限未移除。"
+                message = "检测到较新版本正在使用，管理员按键组件未移除。"
             elif state.detail == "helper_consumer_marker_restore_failed":
                 message = (
                     "权限没有移除，但当前版本的使用记录未能恢复。"
                     "请保留程序文件并重新打开后再试。"
                 )
             else:
-                message = "方向改键权限移除失败，请稍后重试。"
+                message = "管理员按键组件移除失败，请稍后重试。"
             self._set_error_message(message, self._DEVICE_PAGE_INDEX)
 
         @Slot()
@@ -4950,43 +5003,76 @@ def _load_qt_classes() -> dict:
 
         @Slot()
         def refreshBridgeState(self) -> None:
-            try:
-                exit_request = (
-                    single_instance.consume_and_acknowledge_application_exit_request(
-                        self._config_root
-                    )
-                )
-            except OSError:
-                exit_request = None
-            if exit_request is not None:
-                self._maintenance_exit_pending = True
-                self._maintenance_exit_request_id = exit_request.request_id
-                self._start_bridge_requested = False
+            if (
+                self._maintenance_exit_pending
+                or self._maintenance_exit_request is not None
+                or self._application_exit_requested
+                or self._application_exit_confirmed
+                or self._application_exit_intent.is_set()
+            ):
                 try:
                     single_instance.consume_bridge_start_request(
-                        self._config_root
+                        self._config_root,
+                        session_scoped=True,
                     )
-                except OSError:
+                except (
+                    OSError,
+                    single_instance.SingleInstanceUnavailableError,
+                ):
                     pass
-                self.maintenanceExitRequested.emit()
+                self._start_bridge_requested = False
                 return
 
-            if self._maintenance_exit_pending:
+            window_request_token = (
+                single_instance.consume_settings_window_exit_request(
+                    self._settings_window_hwnd
+                )
+            )
+            if window_request_token is not None:
+                exit_request = single_instance.ApplicationExitRequest(
+                    None,
+                    window_token=window_request_token,
+                )
+            else:
+                try:
+                    exit_request = (
+                        single_instance.consume_and_acknowledge_application_exit_request(
+                            self._config_root
+                        )
+                    )
+                except (
+                    OSError,
+                    single_instance.SingleInstanceUnavailableError,
+                ):
+                    exit_request = None
+            if exit_request is not None:
+                self._maintenance_exit_pending = True
+                self._maintenance_exit_request = exit_request
+                self._start_bridge_requested = False
+                self._window_hide_requested = False
                 try:
                     single_instance.consume_bridge_start_request(
-                        self._config_root
+                        self._config_root,
+                        session_scoped=True,
                     )
-                except OSError:
+                except (
+                    OSError,
+                    single_instance.SingleInstanceUnavailableError,
+                ):
                     pass
-                self._start_bridge_requested = False
+                self.maintenanceExitRequested.emit()
                 return
 
             running = self._refresh_bridge_status()
             try:
                 requested = single_instance.consume_bridge_start_request(
-                    self._config_root
+                    self._config_root,
+                    session_scoped=True,
                 )
-            except OSError:
+            except (
+                OSError,
+                single_instance.SingleInstanceUnavailableError,
+            ):
                 requested = False
             if requested:
                 self._start_bridge_requested = True
@@ -6683,7 +6769,12 @@ def run_settings_window(
         # The real QML window and full-exit signal are ready here. Publish the
         # capability before optional element navigation startup, whose bounded
         # native hook waits must not make another version misclassify this copy.
-        _mark_settings_window_for_activation(root_window)
+        settings_window_hwnd = _settings_window_handle(root_window)
+        controller._settings_window_hwnd = settings_window_hwnd
+        _mark_settings_window_for_activation(
+            root_window,
+            hwnd=settings_window_hwnd,
+        )
 
         if (
             sys.platform == "win32"

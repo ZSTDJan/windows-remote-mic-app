@@ -106,8 +106,12 @@ SETTINGS_STARTUP_FAILED_EXIT_CODE = 15
 ELEMENT_NAVIGATION_RUNTIME_FAILED_EXIT_CODE = 18
 APPLICATION_EXIT_REQUEST_FAILED_EXIT_CODE = 19
 APPLICATION_EXIT_REQUEST_TIMEOUT_EXIT_CODE = 20
+APPLICATION_EXIT_REQUEST_REJECTED_EXIT_CODE = 21
 HID_HELPER_MAINTENANCE_FAILED_EXIT_CODE = 24
 HID_HELPER_ACCOUNT_UNSUPPORTED_EXIT_CODE = 25
+ELEVATED_DESKTOP_UNSUPPORTED_EXIT_CODE = 26
+INSTALLER_MAINTENANCE_ACTIVE_EXIT_CODE = 27
+HID_CONSUMER_REGISTRATION_TIMEOUT_SECONDS = 2.0
 INVALID_ARGUMENTS_EXIT_CODE = 2
 APPLICATION_EXIT_REQUEST_TIMEOUT_SECONDS = 45.0
 APPLICATION_EXIT_REQUEST_POLL_SECONDS = 0.1
@@ -115,7 +119,6 @@ APPLICATION_HANDOFF_TIMEOUT_SECONDS = 180.0
 APPLICATION_HANDOFF_POLL_SECONDS = 0.1
 APPLICATION_HANDOFF_CAPABILITY_WAIT_SECONDS = 10.0
 APPLICATION_HANDOFF_REQUEST_GRACE_SECONDS = 5.0
-APPLICATION_HANDOFF_ACCEPTED_EXIT_TIMEOUT_SECONDS = 45.0
 APPLICATION_HANDOFF_LEGACY_EXIT_NOTICE = (
     "这个旧版不能由新版本自动退出。\n\n"
     "请在旧版通知区域选择“完全退出”，退出后当前版本会自动打开。"
@@ -267,7 +270,10 @@ def _register_current_hid_helper_consumer() -> None:
     from . import config, hid_helper_consumers
 
     try:
-        hid_helper_consumers.register_current_consumer(config.config_root())
+        hid_helper_consumers.register_current_consumer(
+            config.config_root(),
+            timeout_seconds=HID_CONSUMER_REGISTRATION_TIMEOUT_SECONDS,
+        )
     except Exception as exc:  # noqa: BLE001 - startup must remain available
         print(
             "HID helper consumer registration failed: "
@@ -330,53 +336,161 @@ def _request_application_exit(
     from . import config, single_instance
 
     root = config.config_root()
-    request_path = single_instance.application_exit_request_path(root)
+    request_guard = single_instance.ApplicationExitRequestGuard()
+    request_guard_entered = False
+    request_id: str | None = None
+    session_scoped = False
+    result = APPLICATION_EXIT_REQUEST_FAILED_EXIT_CODE
+    coordination_ready = True
     try:
-        running = single_instance.application_instance_running()
-    except Exception as exc:
-        print(
-            "application exit status unavailable: "
-            f"error_type={type(exc).__name__}",
-            file=sys.stderr,
-        )
-        return APPLICATION_EXIT_REQUEST_FAILED_EXIT_CODE
-    if not running:
         try:
-            request_path.unlink(missing_ok=True)
-        except OSError:
+            request_guard.__enter__()
+            request_guard_entered = True
+        except single_instance.DuplicateInstanceError:
+            # Another current-session sender already owns the one exit slot.
+            # Do not overwrite its request; just observe the same shutdown.
             pass
-        return 0
-
-    try:
-        single_instance.write_application_exit_request(root)
-    except OSError as exc:
-        print(
-            "application exit request failed: "
-            f"error_type={type(exc).__name__}",
-            file=sys.stderr,
-        )
-        return APPLICATION_EXIT_REQUEST_FAILED_EXIT_CODE
-
-    deadline = monotonic() + max(0.1, float(timeout))
-    while True:
-        try:
-            running = single_instance.application_instance_running()
         except Exception as exc:
             print(
-                "application exit confirmation failed: "
+                "application exit coordination failed: "
                 f"error_type={type(exc).__name__}",
                 file=sys.stderr,
             )
-            return APPLICATION_EXIT_REQUEST_FAILED_EXIT_CODE
-        if not running:
+            coordination_ready = False
+
+        running = False
+        if coordination_ready:
             try:
-                request_path.unlink(missing_ok=True)
-            except OSError:
-                pass
-            return 0
-        if monotonic() >= deadline:
-            return APPLICATION_EXIT_REQUEST_TIMEOUT_EXIT_CODE
-        sleep(max(0.01, float(poll_interval)))
+                running = single_instance.application_instance_running()
+            except Exception as exc:
+                print(
+                    "application exit status unavailable: "
+                    f"error_type={type(exc).__name__}",
+                    file=sys.stderr,
+                )
+                coordination_ready = False
+
+        if coordination_ready and not running:
+            result = 0
+        elif coordination_ready:
+            request_ready = True
+            if request_guard_entered:
+                try:
+                    capability = (
+                        single_instance.application_exit_request_capability()
+                    )
+                except Exception as exc:  # noqa: BLE001 - stable CLI result
+                    print(
+                        "application exit capability unavailable: "
+                        f"error_type={type(exc).__name__}",
+                        file=sys.stderr,
+                    )
+                    capability = (
+                        single_instance.ApplicationExitRequestCapability.UNKNOWN
+                    )
+                session_scoped = (
+                    capability
+                    is single_instance.ApplicationExitRequestCapability.SESSION_SUPPORTED
+                )
+                if not session_scoped:
+                    print(
+                        "application exit request is unavailable for this running version",
+                        file=sys.stderr,
+                    )
+                    request_ready = False
+                else:
+                    candidate_request_id = uuid.uuid4().hex
+                    try:
+                        single_instance.write_application_exit_request(
+                            root,
+                            request_id=candidate_request_id,
+                            session_scoped=True,
+                        )
+                        request_id = candidate_request_id
+                    except Exception as exc:  # noqa: BLE001 - stable CLI result
+                        print(
+                            "application exit request failed: "
+                            f"error_type={type(exc).__name__}",
+                            file=sys.stderr,
+                        )
+                        request_ready = False
+
+            if request_ready:
+                deadline = monotonic() + max(0.1, float(timeout))
+                while True:
+                    try:
+                        running = single_instance.application_instance_running()
+                    except Exception as exc:
+                        print(
+                            "application exit confirmation failed: "
+                            f"error_type={type(exc).__name__}",
+                            file=sys.stderr,
+                        )
+                        result = APPLICATION_EXIT_REQUEST_FAILED_EXIT_CODE
+                        break
+                    if not running:
+                        result = 0
+                        break
+                    if request_id is not None:
+                        try:
+                            rejected = (
+                                single_instance.application_exit_request_rejected(
+                                    root,
+                                    request_id,
+                                    session_scoped=session_scoped,
+                                )
+                            )
+                        except Exception as exc:  # noqa: BLE001 - stable CLI result
+                            print(
+                                "application exit response unavailable: "
+                                f"error_type={type(exc).__name__}",
+                                file=sys.stderr,
+                            )
+                            result = APPLICATION_EXIT_REQUEST_FAILED_EXIT_CODE
+                            break
+                        if rejected:
+                            result = APPLICATION_EXIT_REQUEST_REJECTED_EXIT_CODE
+                            break
+                    if monotonic() >= deadline:
+                        result = APPLICATION_EXIT_REQUEST_TIMEOUT_EXIT_CODE
+                        break
+                    sleep(max(0.01, float(poll_interval)))
+    finally:
+        cleanup_failed = False
+        if request_id is not None:
+            try:
+                request_cleared = single_instance.clear_owned_application_exit_request(
+                    root,
+                    request_id,
+                    session_scoped=session_scoped,
+                )
+            except Exception:  # noqa: BLE001 - preserve the stable CLI result
+                request_cleared = False
+            if not request_cleared:
+                cleanup_failed = True
+            try:
+                response_cleared = single_instance.clear_owned_application_exit_response(
+                    root,
+                    request_id,
+                    session_scoped=session_scoped,
+                )
+            except Exception:  # noqa: BLE001 - preserve the stable CLI result
+                response_cleared = False
+            if not response_cleared:
+                cleanup_failed = True
+        if request_guard_entered:
+            try:
+                request_guard.__exit__(None, None, None)
+            except Exception as exc:
+                cleanup_failed = True
+                print(
+                    "application exit coordination cleanup failed: "
+                    f"error_type={type(exc).__name__}",
+                    file=sys.stderr,
+                )
+        if cleanup_failed and result == 0:
+            result = APPLICATION_EXIT_REQUEST_FAILED_EXIT_CODE
+    return result
 
 
 def _handoff_previous_application(
@@ -417,7 +531,10 @@ def _handoff_previous_application(
         if not running:
             return True
 
-        capability = single_instance.application_exit_request_capability()
+        try:
+            capability = single_instance.application_exit_request_capability()
+        except Exception:
+            capability = single_instance.ApplicationExitRequestCapability.UNKNOWN
         if capability is single_instance.ApplicationExitRequestCapability.UNKNOWN:
             capability_started_at = monotonic()
             capability_deadline = capability_started_at + min(
@@ -438,22 +555,43 @@ def _handoff_previous_application(
                 if monotonic() >= capability_deadline:
                     break
                 sleep(max(0.01, float(poll_interval)))
-                capability = single_instance.application_exit_request_capability()
+                try:
+                    capability = (
+                        single_instance.application_exit_request_capability()
+                    )
+                except Exception:
+                    capability = (
+                        single_instance.ApplicationExitRequestCapability.UNKNOWN
+                    )
 
-        request_capable = capability in {
-            single_instance.ApplicationExitRequestCapability.SUPPORTED,
-            single_instance.ApplicationExitRequestCapability.LEGACY_SUPPORTED,
-        }
-        legacy_request_capable = (
+        request_capable = (
             capability
-            is single_instance.ApplicationExitRequestCapability.LEGACY_SUPPORTED
+            is single_instance.ApplicationExitRequestCapability.SESSION_SUPPORTED
         )
+        session_request_capable = request_capable
         if request_capable and not single_instance.confirm_application_handoff(
             __version__
         ):
             return False
 
         root = config.config_root()
+        exit_request_guard = single_instance.ApplicationExitRequestGuard()
+        exit_request_guard_entered = False
+        if request_capable:
+            try:
+                exit_request_guard.__enter__()
+                exit_request_guard_entered = True
+            except single_instance.DuplicateInstanceError:
+                single_instance.show_bridge_startup_blocked_notice(
+                    "旧版正在退出，请稍后再打开当前版本。"
+                )
+                return False
+            except Exception:
+                single_instance.show_bridge_startup_blocked_notice(
+                    "无法安全发送退出请求。当前版本没有启动；"
+                    "请完全退出旧版后重试。"
+                )
+                return False
         request_id: str | None = None
         success = False
         failure_message = ""
@@ -465,14 +603,19 @@ def _handoff_previous_application(
                     single_instance.write_application_exit_request(
                         root,
                         request_id=candidate_request_id,
+                        session_scoped=session_request_capable,
                     )
                     request_id = candidate_request_id
                     manual_exit_notice_pending = True
-                except OSError:
+                except Exception:  # noqa: BLE001 - fall back to explicit manual exit
                     single_instance.show_bridge_startup_blocked_notice(
                         APPLICATION_HANDOFF_MANUAL_EXIT_NOTICE
                     )
-            elif capability is single_instance.ApplicationExitRequestCapability.UNSUPPORTED:
+            elif capability in {
+                single_instance.ApplicationExitRequestCapability.SUPPORTED,
+                single_instance.ApplicationExitRequestCapability.LEGACY_SUPPORTED,
+                single_instance.ApplicationExitRequestCapability.UNSUPPORTED,
+            }:
                 single_instance.show_bridge_startup_blocked_notice(
                     APPLICATION_HANDOFF_LEGACY_EXIT_NOTICE
                 )
@@ -484,7 +627,6 @@ def _handoff_previous_application(
             started_at = monotonic()
             bounded_timeout = max(0.1, float(timeout))
             deadline = started_at + bounded_timeout
-            accepted_at: float | None = None
             manual_notice_deadline = started_at + min(
                 APPLICATION_HANDOFF_REQUEST_GRACE_SECONDS,
                 bounded_timeout,
@@ -502,36 +644,60 @@ def _handoff_previous_application(
                     success = True
                     break
                 now = monotonic()
-                if (
-                    request_id is not None
-                    and single_instance.application_exit_request_rejected(
-                        root,
-                        request_id,
-                    )
-                ):
-                    failure_message = APPLICATION_HANDOFF_REJECTED_EXIT_NOTICE
-                    break
+                if request_id is not None:
+                    try:
+                        rejected = (
+                            single_instance.application_exit_request_rejected(
+                                root,
+                                request_id,
+                                session_scoped=session_request_capable,
+                            )
+                        )
+                    except Exception:
+                        failure_message = (
+                            "无法确认旧版退出请求状态。当前版本没有启动；"
+                            "请完全退出旧版后重试。"
+                        )
+                        break
+                    if rejected:
+                        failure_message = APPLICATION_HANDOFF_REJECTED_EXIT_NOTICE
+                        break
                 if now >= deadline:
                     failure_message = (
                         "旧版仍在运行，当前版本未启动。请完全退出旧版后，再打开当前版本。"
                     )
                     break
                 if manual_exit_notice_pending and request_id is not None:
-                    if single_instance.application_exit_request_acknowledged(
-                        root,
-                        request_id,
-                    ):
-                        manual_exit_notice_pending = False
-                        accepted_at = accepted_at or now
-                    elif (
-                        legacy_request_capable
-                        and not single_instance.owned_application_exit_request_pending(
-                            root,
-                            request_id,
+                    try:
+                        acknowledged = (
+                            single_instance.application_exit_request_acknowledged(
+                                root,
+                                request_id,
+                                session_scoped=session_request_capable,
+                            )
                         )
+                        request_pending = True
+                        if not acknowledged and session_request_capable:
+                            request_pending = (
+                                single_instance.owned_application_exit_request_pending(
+                                    root,
+                                    request_id,
+                                    session_scoped=session_request_capable,
+                                )
+                            )
+                    except Exception:
+                        failure_message = (
+                            "无法确认旧版是否收到退出请求。当前版本没有启动；"
+                            "请完全退出旧版后重试。"
+                        )
+                        break
+                    if acknowledged:
+                        manual_exit_notice_pending = False
+                    elif (
+                        session_request_capable
+                        and not request_pending
                     ):
                         manual_exit_notice_pending = False
-                        accepted_at = accepted_at or now
                     elif now < manual_notice_deadline:
                         pass
                     else:
@@ -544,23 +710,20 @@ def _handoff_previous_application(
                         APPLICATION_HANDOFF_MANUAL_EXIT_NOTICE
                     )
                     manual_exit_notice_pending = False
-                if (
-                    accepted_at is not None
-                    and now - accepted_at
-                    >= min(
-                        APPLICATION_HANDOFF_ACCEPTED_EXIT_TIMEOUT_SECONDS,
-                        bounded_timeout,
-                    )
-                ):
-                    failure_message = APPLICATION_HANDOFF_REJECTED_EXIT_NOTICE
-                    break
                 sleep(max(0.01, float(poll_interval)))
         finally:
             if request_id is not None:
-                if not single_instance.clear_owned_application_exit_request(
-                    root,
-                    request_id,
-                ):
+                try:
+                    request_cleared = (
+                        single_instance.clear_owned_application_exit_request(
+                            root,
+                            request_id,
+                            session_scoped=session_request_capable,
+                        )
+                    )
+                except Exception:  # noqa: BLE001 - keep the handoff bounded
+                    request_cleared = False
+                if not request_cleared:
                     if success:
                         failure_message = (
                             "旧版已经退出，但版本切换请求未能安全清理。当前版本没有启动；"
@@ -574,10 +737,41 @@ def _handoff_previous_application(
                             "请稍后重新双击当前版本。"
                         )
                     success = False
-                single_instance.clear_owned_application_exit_response(
-                    root,
-                    request_id,
-                )
+                try:
+                    response_cleared = (
+                        single_instance.clear_owned_application_exit_response(
+                            root,
+                            request_id,
+                            session_scoped=session_request_capable,
+                        )
+                    )
+                except Exception:  # noqa: BLE001 - keep the handoff bounded
+                    response_cleared = False
+                if not response_cleared:
+                    if success:
+                        failure_message = (
+                            "旧版已经退出，但版本切换回执未能安全清理。"
+                            "当前版本没有启动，请重新双击。"
+                        )
+                    elif not failure_message:
+                        failure_message = (
+                            "版本切换回执未能安全清理。当前版本没有启动，请重试。"
+                        )
+                    success = False
+            if exit_request_guard_entered:
+                try:
+                    exit_request_guard.__exit__(None, None, None)
+                except Exception:
+                    if success:
+                        failure_message = (
+                            "旧版已经退出，但退出协调没有完整清理。"
+                            "当前版本没有启动，请重新双击。"
+                        )
+                    elif not failure_message:
+                        failure_message = (
+                            "退出协调没有完整清理。当前版本没有启动，请重试。"
+                        )
+                    success = False
         if failure_message:
             single_instance.show_bridge_startup_blocked_notice(failure_message)
         return success
@@ -695,7 +889,39 @@ def _run_settings(
     start_bridge: bool = False,
     activate_duplicate: bool = True,
 ) -> None:
-    from . import settings_ui, single_instance
+    from . import hid_elevation_windows, settings_ui, single_instance
+
+    if getattr(sys, "frozen", False) and sys.platform == "win32":
+        try:
+            process_elevated = hid_elevation_windows.query_process_elevated()
+        except Exception:  # noqa: BLE001 - the desktop startup must fail closed
+            single_instance.show_bridge_startup_blocked_notice(
+                "无法确认无线麦当前的权限状态。\n\n"
+                "请关闭程序后重新普通双击打开。"
+            )
+            raise SystemExit(ELEVATED_DESKTOP_UNSUPPORTED_EXIT_CODE)
+        if process_elevated:
+            single_instance.show_bridge_startup_blocked_notice(
+                f"{product_identity.DISPLAY_NAME}不能以管理员身份长期运行。\n\n"
+                "请关闭后普通双击打开；自定义按键映射由管理员按键组件处理。"
+            )
+            raise SystemExit(ELEVATED_DESKTOP_UNSUPPORTED_EXIT_CODE)
+        try:
+            maintenance_active = single_instance.installer_maintenance_running()
+        except (
+            single_instance.SingleInstanceUnavailableError,
+            single_instance.MutexCleanupError,
+        ):
+            single_instance.show_bridge_startup_blocked_notice(
+                "无法确认安装状态。请等待安装或卸载结束后重试。"
+            )
+            raise SystemExit(INSTALLER_MAINTENANCE_ACTIVE_EXIT_CODE)
+        if maintenance_active:
+            if not start_hidden:
+                single_instance.show_bridge_startup_blocked_notice(
+                    "无线麦正在安装或卸载。完成后再打开。"
+                )
+            raise SystemExit(INSTALLER_MAINTENANCE_ACTIVE_EXIT_CODE)
 
     def run_owned_application() -> None:
         with single_instance.ApplicationInstanceGuard():
@@ -713,8 +939,14 @@ def _run_settings(
             from . import config
 
             try:
-                single_instance.write_bridge_start_request(config.config_root())
-            except OSError:
+                single_instance.write_bridge_start_request(
+                    config.config_root(),
+                    session_scoped=True,
+                )
+            except (
+                OSError,
+                single_instance.SingleInstanceUnavailableError,
+            ):
                 single_instance.show_bridge_startup_blocked_notice(
                     "现有程序正在运行，但无法向它发送启动遥控器服务的请求。"
                     "请打开现有窗口后手动启动服务。"

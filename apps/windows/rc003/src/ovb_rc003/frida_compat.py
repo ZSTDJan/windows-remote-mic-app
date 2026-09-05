@@ -73,6 +73,7 @@ for _usage, _button in BUTTON_USAGE_IDS.items():
 
 HID_TAP_INJECTOR_FLAG = "--rc003-hid-injector"
 HID_TAP_INJECTOR_TIMEOUT_SECONDS = 30.0
+HID_CONSUMER_REGISTRATION_TIMEOUT_SECONDS = 1.0
 HID_TAP_CONNECTION_TIMEOUT_SECONDS = 10.0
 HID_TAP_MAX_BUFFER_BYTES = 64 * 1024
 HID_INTERCEPT_PROTOCOL = 3
@@ -87,6 +88,9 @@ HID_TAP_INJECTOR_EXIT_DETAILS = {
     4: "injector_validation_failed",
     5: "injector_unexpected_failure",
 }
+HID_TAP_RETRYABLE_INJECTION_DETAILS = frozenset(
+    {"hid_helper_operation_busy"}
+)
 
 
 class HidTapInjectionError(RuntimeError):
@@ -332,7 +336,27 @@ def run_injector_subprocess(
             if not hid_helper_consumers.current_consumer_is_registered(
                 config.config_root()
             ):
-                raise HidTapInjectionError("helper_consumer_unregistered")
+                try:
+                    marker = hid_helper_consumers.register_current_consumer(
+                        config.config_root(),
+                        timeout_seconds=HID_CONSUMER_REGISTRATION_TIMEOUT_SECONDS,
+                    )
+                except hid_helper_consumers.ConsumerMaintenanceError as exc:
+                    raise HidTapInjectionError(
+                        "hid_helper_operation_busy"
+                    ) from exc
+                except Exception as exc:
+                    raise HidTapInjectionError(
+                        "helper_consumer_unregistered"
+                    ) from exc
+                if marker is None or not (
+                    hid_helper_consumers.current_consumer_is_registered(
+                        config.config_root()
+                    )
+                ):
+                    raise HidTapInjectionError(
+                        "helper_consumer_unregistered"
+                    )
         try:
             _registered_injector(pid)
         except Exception as exc:  # noqa: BLE001 - expose only the stable detail
@@ -609,12 +633,16 @@ class RC003HidReportTap:
                         injection_attempted_pid = pid
                         connection_deadline = time.monotonic() + self.connection_timeout
                     except Exception as exc:  # noqa: BLE001 - retry with sanitized state
-                        injection_failed_pid = pid
-                        self._set_status(
-                            HidTapState.FAILED,
+                        detail = (
                             str(exc)
                             if isinstance(exc, HidTapInjectionError)
-                            else f"injector_exception_{type(exc).__name__}",
+                            else f"injector_exception_{type(exc).__name__}"
+                        )
+                        if detail not in HID_TAP_RETRYABLE_INJECTION_DETAILS:
+                            injection_failed_pid = pid
+                        self._set_status(
+                            HidTapState.FAILED,
+                            detail,
                         )
                         self.stop_event.wait(self.retry_delay)
                         continue

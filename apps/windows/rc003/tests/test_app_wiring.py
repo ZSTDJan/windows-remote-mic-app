@@ -19,6 +19,7 @@ in for it.
 """
 
 import asyncio
+from dataclasses import replace
 import logging
 import subprocess
 import sys
@@ -40,6 +41,7 @@ from ovb_rc003 import (
     raw_input_windows,
     voice_program_manager,
     win32_input,
+    win32_keys,
 )
 from ovb_rc003.atvv_session import AudioStarted, AudioStopped, MicButtonPressed
 
@@ -96,6 +98,33 @@ class _FakeInputOwner:
         self.stop_calls += 1
         if self.stop_raises:
             raise RuntimeError("simulated input owner that did not stop")
+
+
+class _FakeVoicePhysicalizer:
+    def __init__(self, *, start_error=None, immediate_exit=False):
+        self.start_error = start_error
+        self.immediate_exit = immediate_exit
+        self.is_running = False
+        self.start_calls = 0
+        self.stop_calls = 0
+        self.callback = None
+
+    def set_tracking_lost_callback(self, callback):
+        self.callback = callback
+
+    def start(self):
+        self.start_calls += 1
+        if self.start_error is not None:
+            raise self.start_error
+        self.is_running = not self.immediate_exit
+
+    def stop(self):
+        self.stop_calls += 1
+        self.is_running = False
+
+    def emit_loss(self):
+        if self.callback is not None:
+            self.callback()
 
 
 class _ManualTimer:
@@ -158,6 +187,61 @@ class _FakeHidListenerForFailedStart:
         pass
 
 
+class _FakeRecoveringRawListener:
+    def __init__(
+        self,
+        *,
+        start_error=None,
+        running_after_start=True,
+        running_after_error=False,
+        stop_error=None,
+    ):
+        self.start_error = start_error
+        self.running_after_start = running_after_start
+        self.running_after_error = running_after_error
+        self.stop_error = stop_error
+        self.is_running = False
+        self.start_calls = 0
+        self.stop_calls = 0
+        self.sourced_callback = None
+        self.raw_callback = None
+        self.removed_callback = None
+        self.corruption_callback = None
+        self.tracking_lost_callback = None
+        self.physical_bindings = None
+
+    def set_sourced_button_event_callback(self, callback):
+        self.sourced_callback = callback
+
+    def set_raw_event_callback(self, callback):
+        self.raw_callback = callback
+
+    def set_device_removed_callback(self, callback):
+        self.removed_callback = callback
+
+    def set_input_corruption_callback(self, callback):
+        self.corruption_callback = callback
+
+    def set_physical_keyboard_tracking_lost_callback(self, callback):
+        self.tracking_lost_callback = callback
+
+    def set_physical_bindings(self, bindings):
+        self.physical_bindings = dict(bindings)
+
+    def start(self, _device_path):
+        self.start_calls += 1
+        if self.start_error is not None:
+            self.is_running = self.running_after_error
+            raise self.start_error
+        self.is_running = self.running_after_start
+
+    def stop(self):
+        self.stop_calls += 1
+        if self.stop_error is not None:
+            raise self.stop_error
+        self.is_running = False
+
+
 def _build_app(tmp_root: Path) -> "app_module.RC003App":
     # Redirect config_root (and therefore logging_setup's log directory) at
     # a throwaway temp directory instead of the real machine's config/log
@@ -216,8 +300,38 @@ class _AppWiringTestCase(unittest.TestCase):
         # path is available only after the privileged HID endpoint confirms
         # that it intercepted a real report before Windows saw it.
         self.app._direct_hid_interception_ready = True
+        # The real application starts both physical-input trackers before it
+        # accepts mapped button events. These unit tests construct RC003App
+        # directly, so establish the same ready state explicitly.
+        raw_input_windows._set_physical_keyboard_tracker_active(True)
+        self.app._voice_key_physicalizer_ready = True
+        self.app._raw_windows_key_down_query = lambda _vk_code: False
+        self._button_input_release_timers = []
+
+        def button_input_release_timer_factory(delay, callback):
+            timer = _ManualTimer(callback)
+            timer.delay = delay
+            self._button_input_release_timers.append(timer)
+            return timer
+
+        self.app._button_input_release_timer_factory = (
+            button_input_release_timer_factory
+        )
 
     def tearDown(self):
+        with self.app._button_action_lock:
+            self.app._button_input_release_retry_stopping = True
+            self.app._cancel_button_input_release_retry_locked(reset_delay=False)
+        with self.app._voice_key_physicalizer_lifecycle_lock:
+            self.app._voice_key_physicalizer_stopping = True
+            self.app._cancel_voice_key_physicalizer_retry_locked()
+        with self.app._raw_input_lifecycle_lock:
+            self.app._raw_input_stopping = True
+            self.app._cancel_raw_input_retry_locked()
+        app_module.voice_key_physicalizer_windows._set_physical_tracker_active(
+            False
+        )
+        raw_input_windows._set_physical_keyboard_tracker_active(False)
         playback_writer = self.app._playback_writer
         if playback_writer is not None:
             playback_writer.flush(1.0)
@@ -362,6 +476,79 @@ class LiveSettingsReloadTests(_AppWiringTestCase):
         listener.set_physical_bindings.assert_called_once_with(
             {"keyboard:00ff:0070:0002": "back"}
         )
+
+    def test_listener_start_cannot_overwrite_newer_physical_bindings(self):
+        first_sync_started = threading.Event()
+        allow_first_sync = threading.Event()
+        second_sync_started = threading.Event()
+        calls = []
+        calls_lock = threading.Lock()
+
+        class BlockingBindingsListener(_FakeRecoveringRawListener):
+            def set_physical_bindings(self, bindings):
+                payload = dict(bindings)
+                with calls_lock:
+                    call_index = len(calls)
+                    calls.append(payload)
+                if call_index == 0:
+                    first_sync_started.set()
+                    allow_first_sync.wait(1.0)
+                else:
+                    second_sync_started.set()
+                self.physical_bindings = payload
+
+        listener = BlockingBindingsListener()
+        self.app._bindings["physical_bindings"] = {"hid:race": "up"}
+        refreshed = config.load_key_bindings(self.app._bindings_path)
+        refreshed["physical_bindings"] = {"hid:race": "down"}
+        config.save_key_bindings(self.app._bindings_path, refreshed)
+        errors = []
+
+        def start_listener():
+            try:
+                self.app._start_hid_listener()
+            except BaseException as exc:  # noqa: BLE001 - surfaced by assertion
+                errors.append(exc)
+
+        def reload_settings():
+            try:
+                self.app._reload_settings_if_changed()
+            except BaseException as exc:  # noqa: BLE001 - surfaced by assertion
+                errors.append(exc)
+
+        with mock.patch.object(
+            app_module.raw_input_windows,
+            "enumerate_matching_device_paths",
+            return_value=["fake-path"],
+        ), mock.patch.object(
+            app_module.hid_identity,
+            "select_single_device_path",
+            return_value="fake-path",
+        ), mock.patch.object(
+            app_module.raw_input_windows,
+            "RawInputButtonListener",
+            return_value=listener,
+        ):
+            start_worker = threading.Thread(target=start_listener)
+            start_worker.start()
+            self.assertTrue(first_sync_started.wait(1.0))
+
+            reload_worker = threading.Thread(target=reload_settings)
+            reload_worker.start()
+            second_sync_started.wait(0.1)
+            allow_first_sync.set()
+            start_worker.join(1.0)
+            reload_worker.join(1.0)
+
+        self.assertFalse(start_worker.is_alive())
+        self.assertFalse(reload_worker.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(
+            self.app._bindings["physical_bindings"],
+            {"hid:race": "down"},
+        )
+        self.assertEqual(listener.physical_bindings, {"hid:race": "down"})
+        self.assertEqual(calls[-1], {"hid:race": "down"})
 
     def test_deferred_physical_bindings_update_when_voice_becomes_idle(self):
         listener = mock.Mock()
@@ -672,6 +859,7 @@ class CandidateResolutionWiringTests(_AppWiringTestCase):
     def test_runtime_status_identifies_build_channels_recent_button_and_voice(self):
         self.app._runtime_raw_input_state = "ready"
         self.app._runtime_hid_tap_state = frida_compat.HidTapState.READY.value
+        self.app._runtime_voice_key_physicalizer_state = "ready"
         with mock.patch.object(app_module.time, "time", return_value=123.0), mock.patch.object(
             app_module.time,
             "monotonic",
@@ -689,6 +877,7 @@ class CandidateResolutionWiringTests(_AppWiringTestCase):
         self.assertTrue(status.runtime_id)
         self.assertEqual(status.raw_input_state, "ready")
         self.assertEqual(status.hid_tap_state, frida_compat.HidTapState.READY.value)
+        self.assertEqual(status.voice_key_physicalizer_state, "ready")
         self.assertEqual(status.last_button_at, 123.0)
         self.assertEqual(status.last_button_source, "hid")
         self.assertTrue(status.voice_active)
@@ -1573,6 +1762,71 @@ class OrdinaryButtonGestureWiringTests(_AppWiringTestCase):
         self.assertEqual(actions, [])
         self.assertEqual(self.app._button_key_release_pending, ("ctrl", "l"))
 
+    def test_incomplete_button_release_retries_without_another_action(self):
+        with mock.patch.object(
+            win32_input,
+            "send_arrow_up",
+            side_effect=win32_input.InputCleanupIncompleteError("stuck"),
+        ), mock.patch.object(
+            win32_input,
+            "send_key_combo_up",
+        ) as send_up:
+            self.app._apply_button_action(
+                key_mapping.ButtonAction(key_mapping.ActionKind.ARROW_UP)
+            )
+            self.assertEqual(len(self._button_input_release_timers), 1)
+            self._button_input_release_timers[0].fire()
+
+        send_up.assert_called_once_with(("up",))
+        self.assertIsNone(self.app._button_key_release_pending)
+        self.assertIsNone(self.app._button_input_release_retry_timer)
+        self.assertEqual(
+            self.app._button_input_release_retry_delay,
+            app_module._BUTTON_INPUT_RELEASE_RETRY_INITIAL_SECONDS,
+        )
+
+    def test_repeated_release_failures_keep_only_one_live_retry(self):
+        self.app._button_key_release_pending = ("up",)
+        with mock.patch.object(
+            win32_input,
+            "send_key_combo_up",
+            side_effect=win32_input.InputCleanupIncompleteError("still stuck"),
+        ):
+            self.assertFalse(self.app._release_pending_button_keys())
+            first_timer = self.app._button_input_release_retry_timer
+            self.assertFalse(self.app._release_pending_button_keys())
+            self.assertIs(self.app._button_input_release_retry_timer, first_timer)
+            self.assertEqual(len(self._button_input_release_timers), 1)
+
+            self._button_input_release_timers[0].fire()
+            second_timer = self.app._button_input_release_retry_timer
+            self.assertIsNot(second_timer, first_timer)
+            self.assertEqual(len(self._button_input_release_timers), 2)
+
+            self._button_input_release_timers[0].fire()
+            self.assertIs(self.app._button_input_release_retry_timer, second_timer)
+            self.assertEqual(len(self._button_input_release_timers), 2)
+
+    def test_key_and_mouse_release_debt_share_one_retry_timer(self):
+        self.app._button_key_release_pending = ("up",)
+        self.app._button_mouse_release_pending = "left"
+        with mock.patch.object(
+            win32_input,
+            "send_key_combo_up",
+            side_effect=win32_input.InputCleanupIncompleteError("key stuck"),
+        ), mock.patch.object(
+            win32_input,
+            "send_mouse_button_up",
+            side_effect=win32_input.InputCleanupIncompleteError("mouse stuck"),
+        ):
+            self.assertFalse(self.app._release_pending_button_inputs())
+
+        self.assertEqual(len(self._button_input_release_timers), 1)
+        self.assertIs(
+            self.app._button_input_release_retry_timer,
+            self._button_input_release_timers[0],
+        )
+
     def test_mouse_actions_dispatch_physical_buttons_and_wheel_steps(self):
         button_calls = []
         wheel_calls = []
@@ -1785,6 +2039,86 @@ class OrdinaryButtonGestureWiringTests(_AppWiringTestCase):
         tv_action.assert_not_called()
         up_action.assert_not_called()
 
+    def test_direct_snapshot_releases_old_modifier_before_new_target(self):
+        self.app._bindings["bindings"]["tv"] = {
+            "kind": "escape",
+            "keys": [],
+        }
+        self.app._bindings["bindings"]["up"] = {
+            "kind": "arrow_up",
+            "keys": [],
+        }
+        self.app._bindings["combo_bindings"] = {
+            "modifier": "tv",
+            "bindings": {"up": {"kind": "return", "keys": []}},
+            "display_notes": {},
+        }
+        tv_usage = next(
+            usage
+            for usage, button in frida_compat.TAP_USAGE_TO_BUTTON.items()
+            if button == "tv"
+        )
+        up_usage = next(
+            usage
+            for usage, button in frida_compat.TAP_USAGE_TO_BUTTON.items()
+            if button == "up"
+        )
+
+        with mock.patch.object(win32_input, "send_escape") as tv_action, mock.patch.object(
+            win32_input, "send_arrow_up"
+        ) as up_action, mock.patch.object(win32_input, "send_return") as combo_action:
+            self.app._on_direct_hid_report(
+                1, tv_usage.to_bytes(2, "little") + b"\x00\x00\x00\x00"
+            )
+            self.app._on_direct_hid_report(
+                1, up_usage.to_bytes(2, "little") + b"\x00\x00\x00\x00"
+            )
+            self.app._on_direct_hid_report(1, b"\x00" * 6)
+
+        tv_action.assert_called_once_with()
+        up_action.assert_called_once_with()
+        combo_action.assert_not_called()
+
+    def test_direct_snapshot_presses_configured_modifier_before_target(self):
+        self.app._bindings["bindings"]["menu"] = {
+            "kind": "context_menu",
+            "keys": [],
+        }
+        self.app._bindings["bindings"]["up"] = {
+            "kind": "arrow_up",
+            "keys": [],
+        }
+        self.app._bindings["combo_bindings"] = {
+            "modifier": "menu",
+            "bindings": {"up": {"kind": "return", "keys": []}},
+            "display_notes": {},
+        }
+        menu_usage = next(
+            usage
+            for usage, button in frida_compat.TAP_USAGE_TO_BUTTON.items()
+            if button == "menu"
+        )
+        up_usage = next(
+            usage
+            for usage, button in frida_compat.TAP_USAGE_TO_BUTTON.items()
+            if button == "up"
+        )
+        payload = (
+            up_usage.to_bytes(2, "little")
+            + menu_usage.to_bytes(2, "little")
+            + b"\x00\x00"
+        )
+
+        with mock.patch.object(win32_input, "send_context_menu") as menu_action, mock.patch.object(
+            win32_input, "send_arrow_up"
+        ) as up_action, mock.patch.object(win32_input, "send_return") as combo_action:
+            self.app._on_direct_hid_report(1, payload)
+            self.app._on_direct_hid_report(1, b"\x00" * 6)
+
+        combo_action.assert_called_once_with()
+        menu_action.assert_not_called()
+        up_action.assert_not_called()
+
     def test_unused_remote_combo_modifier_keeps_its_single_click(self):
         self.app._bindings["bindings"]["tv"] = {
             "kind": "escape",
@@ -1837,6 +2171,44 @@ class OrdinaryButtonGestureWiringTests(_AppWiringTestCase):
 
         self.assertEqual(self.app._raw_fallback_buttons_down, set())
 
+    def test_unknown_physical_key_mapped_to_up_still_executes_raw_mapping(self):
+        self.app._direct_hid_interception_ready = False
+        self.app._direct_hid_interception_armed = False
+        raw_down = raw_input_windows.RawInputEvent(
+            source="keyboard",
+            is_pressed=True,
+            button_id="up",
+            windows_button_id=None,
+            vkey=0xFF,
+            make_code=0x7F,
+            flags=0,
+            message=0x0100,
+        )
+        raw_up = raw_input_windows.RawInputEvent(
+            source="keyboard",
+            is_pressed=False,
+            button_id="up",
+            windows_button_id=None,
+            vkey=0xFF,
+            make_code=0x7F,
+            flags=1,
+            message=0x0101,
+        )
+
+        with mock.patch.object(self.app._button_gestures, "press") as press, mock.patch.object(
+            self.app._button_gestures,
+            "release",
+        ) as release:
+            self.app._on_raw_physical_event(raw_down)
+            self.app._on_raw_button_event("up", True, "keyboard", None)
+            self.app._on_raw_physical_event(raw_up)
+            self.app._on_raw_button_event("up", False, "keyboard", None)
+
+        press.assert_called_once_with("up")
+        release.assert_called_once_with("up")
+        self.assertEqual(self.app._raw_mapped_buttons_down, set())
+        self.assertEqual(self.app._raw_fallback_physical_buttons_down, {})
+
     def test_direction_fallback_handles_cross_source_edges_without_mapping(self):
         self.app._direct_hid_interception_ready = False
 
@@ -1852,7 +2224,7 @@ class OrdinaryButtonGestureWiringTests(_AppWiringTestCase):
         release.assert_not_called()
         self.assertEqual(self.app._raw_fallback_buttons_down, set())
 
-    def test_raw_hid_source_maps_only_when_interception_is_unavailable(self):
+    def test_raw_hid_fallback_never_executes_a_mapping(self):
         self.app._direct_hid_interception_ready = False
         with mock.patch.object(self.app._button_gestures, "press") as press, mock.patch.object(
             self.app._button_gestures, "release"
@@ -1860,8 +2232,9 @@ class OrdinaryButtonGestureWiringTests(_AppWiringTestCase):
             self.app._on_raw_button_event("ok", True, "hid")
             self.app._on_raw_button_event("ok", False, "hid")
 
-        press.assert_called_once_with("ok")
-        release.assert_called_once_with("ok")
+        press.assert_not_called()
+        release.assert_not_called()
+        self.assertEqual(self.app._raw_fallback_buttons_down, set())
 
         self.app._direct_hid_interception_ready = True
         with mock.patch.object(self.app._button_gestures, "press") as press, mock.patch.object(
@@ -1873,7 +2246,7 @@ class OrdinaryButtonGestureWiringTests(_AppWiringTestCase):
         press.assert_not_called()
         release.assert_not_called()
 
-    def test_raw_hid_owned_button_releases_when_keyboard_edge_arrives_last(self):
+    def test_raw_hid_fallback_clears_when_keyboard_edge_arrives_last(self):
         self.app._direct_hid_interception_ready = False
 
         with mock.patch.object(self.app._button_gestures, "press") as press, mock.patch.object(
@@ -1882,9 +2255,27 @@ class OrdinaryButtonGestureWiringTests(_AppWiringTestCase):
             self.app._on_raw_button_event("ok", True, "hid")
             self.app._on_raw_button_event("ok", False, "keyboard")
 
-        press.assert_called_once_with("ok")
-        release.assert_called_once_with("ok")
-        self.assertEqual(self.app._raw_mapped_buttons_down, set())
+        press.assert_not_called()
+        release.assert_not_called()
+        self.assertEqual(self.app._raw_fallback_buttons_down, set())
+
+    def test_every_raw_button_preserves_only_the_windows_original(self):
+        self.app._direct_hid_interception_ready = False
+
+        with mock.patch.object(self.app._button_gestures, "press") as press, mock.patch.object(
+            self.app._button_gestures, "release"
+        ) as release, mock.patch.object(
+            win32_input, "send_voice_key_combo_down"
+        ) as voice_down:
+            for button_id in app_module._RAW_FALLBACK_KEY_TOKENS:
+                with self.subTest(button_id=button_id):
+                    self.app._on_raw_button_event(button_id, True, "hid")
+                    self.app._on_raw_button_event(button_id, False, "keyboard")
+
+        press.assert_not_called()
+        release.assert_not_called()
+        voice_down.assert_not_called()
+        self.assertEqual(self.app._raw_fallback_buttons_down, set())
 
     def test_raw_corruption_cancels_active_buttons_until_real_release(self):
         self.app._direct_hid_interception_ready = False
@@ -1910,8 +2301,10 @@ class OrdinaryButtonGestureWiringTests(_AppWiringTestCase):
             self.app._on_raw_button_event("ok", False, "hid")
             self.app._on_raw_button_event("ok", True, "hid")
 
-        press.assert_called_once_with("ok")
+        press.assert_not_called()
         self.assertEqual(self.app._input_rearm_blocked_buttons, {"up"})
+        self.assertEqual(self.app._raw_fallback_buttons_down, {"ok"})
+        self.app._on_raw_button_event("ok", False, "hid")
 
     def test_raw_corruption_without_raw_owned_buttons_leaves_direct_input_alone(self):
         self.app._direct_hid_interception_ready = True
@@ -1931,7 +2324,11 @@ class OrdinaryButtonGestureWiringTests(_AppWiringTestCase):
 
         with mock.patch.object(self.app._button_gestures, "press") as press, mock.patch.object(
             self.app._button_gestures, "release"
-        ) as release, mock.patch.object(self.app._button_gestures, "reset") as reset:
+        ) as release, mock.patch.object(
+            self.app._button_gestures, "reset"
+        ) as reset, mock.patch.object(
+            win32_input, "send_key_combo_up"
+        ) as release_keys:
             self.app._on_raw_button_event("ok", True, "hid")
             self.app._on_hid_tap_status(
                 app_module.frida_compat.HidTapState.ATTACHED_WAITING_IO.value,
@@ -1939,12 +2336,367 @@ class OrdinaryButtonGestureWiringTests(_AppWiringTestCase):
             )
             self.app._on_raw_button_event("ok", False, "keyboard")
 
-        press.assert_called_once_with("ok")
+        press.assert_not_called()
         release.assert_not_called()
         reset.assert_called_once_with()
+        release_keys.assert_called_once_with(("enter",))
         self.assertTrue(self.app._direct_hid_interception_armed)
         self.assertFalse(self.app._direct_hid_interception_ready)
         self.assertEqual(self.app._raw_mapped_buttons_down, set())
+        self.assertEqual(self.app._input_rearm_blocked_buttons, set())
+
+    def test_tap_handover_cannot_reset_then_receive_a_late_raw_press(self):
+        self.app._direct_hid_interception_ready = False
+        raw_paused = threading.Event()
+        allow_raw = threading.Event()
+        calls = []
+
+        def pause_raw(_source):
+            raw_paused.set()
+            allow_raw.wait(1.0)
+
+        with mock.patch.object(
+            self.app, "_record_runtime_button", side_effect=pause_raw
+        ), mock.patch.object(
+            self.app._button_gestures,
+            "press",
+            side_effect=lambda button: calls.append(("press", button)),
+        ), mock.patch.object(
+            self.app._button_gestures,
+            "reset",
+            side_effect=lambda: calls.append(("reset", None)),
+        ):
+            raw_worker = threading.Thread(
+                target=self.app._on_raw_button_event,
+                args=("ok", True, "hid"),
+            )
+            raw_worker.start()
+            self.assertTrue(raw_paused.wait(1.0))
+
+            handover_worker = threading.Thread(
+                target=self.app._on_hid_tap_status,
+                args=(
+                    app_module.frida_compat.HidTapState.ATTACHED_WAITING_IO.value,
+                    "hid_interception_armed",
+                ),
+            )
+            handover_worker.start()
+            handover_worker.join(0.1)
+            self.assertTrue(handover_worker.is_alive())
+
+            allow_raw.set()
+            raw_worker.join(1.0)
+            handover_worker.join(1.0)
+
+        self.assertFalse(raw_worker.is_alive())
+        self.assertFalse(handover_worker.is_alive())
+        self.assertEqual(calls, [("reset", None)])
+        self.assertEqual(self.app._input_rearm_blocked_buttons, {"ok"})
+
+    def test_late_raw_down_after_tap_arming_is_released_and_quarantined(self):
+        self.app._direct_hid_interception_ready = False
+        self.app._direct_hid_interception_armed = False
+        usage = next(
+            candidate
+            for candidate, button_id in frida_compat.TAP_USAGE_TO_BUTTON.items()
+            if button_id == "up"
+        )
+        raw_down = raw_input_windows.RawInputEvent(
+            source="keyboard",
+            is_pressed=True,
+            button_id="ok",
+            windows_button_id="up",
+            vkey=0x26,
+            make_code=0x48,
+            flags=0,
+            message=0x0100,
+        )
+        direct_down = usage.to_bytes(2, "little") + b"\x00\x00\x00\x00"
+
+        self.app._on_hid_tap_status(
+            frida_compat.HidTapState.ATTACHED_WAITING_IO.value,
+            "hid_interception_armed",
+        )
+        with mock.patch.object(win32_input, "send_key_combo_up") as release_keys, mock.patch.object(
+            self.app._button_gestures,
+            "press",
+        ) as press:
+            self.app._on_raw_physical_event(raw_down)
+            self.app._on_raw_physical_event(raw_down)
+            self.app._on_raw_button_event("ok", True, "keyboard", "up")
+            self.app._on_hid_tap_status(
+                frida_compat.HidTapState.READY.value,
+                "hid_interception_verified",
+            )
+            self.assertEqual(
+                self.app._input_rearm_blocked_buttons,
+                {"ok", "up"},
+            )
+            self.app._on_direct_hid_report(1, direct_down)
+
+            release_keys.assert_called_once_with(("up",))
+            press.assert_not_called()
+            self.assertEqual(
+                self.app._input_rearm_blocked_buttons,
+                {"up"},
+            )
+
+            self.app._on_direct_hid_report(1, b"\x00" * 6)
+            self.assertEqual(self.app._input_rearm_blocked_buttons, set())
+            self.assertEqual(
+                self.app._raw_fallback_physical_buttons_down,
+                {},
+            )
+            self.app._on_direct_hid_report(1, direct_down)
+
+        press.assert_called_once_with("up")
+
+    def test_first_direct_snapshot_before_late_raw_down_is_quarantined(self):
+        self.app._direct_hid_interception_ready = False
+        self.app._direct_hid_interception_armed = False
+        usage = next(
+            candidate
+            for candidate, button_id in frida_compat.TAP_USAGE_TO_BUTTON.items()
+            if button_id == "up"
+        )
+        raw_down = raw_input_windows.RawInputEvent(
+            source="keyboard",
+            is_pressed=True,
+            button_id="ok",
+            windows_button_id="up",
+            vkey=0x26,
+            make_code=0x48,
+            flags=0,
+            message=0x0100,
+        )
+        direct_down = usage.to_bytes(2, "little") + b"\x00\x00\x00\x00"
+        up_vk = win32_keys.VK_CODES["up"]
+        self.app._raw_windows_key_down_query = (
+            lambda vk_code: vk_code == up_vk
+        )
+
+        with mock.patch.object(win32_input, "send_key_combo_up") as release_keys, mock.patch.object(
+            self.app._button_gestures,
+            "press",
+        ) as press:
+            self.app._on_hid_tap_status(
+                frida_compat.HidTapState.ATTACHED_WAITING_IO.value,
+                "hid_interception_armed",
+            )
+            self.app._on_hid_tap_status(
+                frida_compat.HidTapState.READY.value,
+                "hid_interception_verified",
+            )
+            self.app._on_direct_hid_report(1, direct_down)
+            self.app._on_raw_physical_event(raw_down)
+            self.app._on_raw_button_event("ok", True, "keyboard", "up")
+
+            release_keys.assert_called_once_with(("up",))
+            press.assert_not_called()
+            self.assertEqual(
+                self.app._input_rearm_blocked_buttons,
+                {"ok", "up"},
+            )
+
+            self.app._on_direct_hid_report(1, b"\x00" * 6)
+            self.app._on_direct_hid_report(1, direct_down)
+
+        press.assert_called_once_with("up")
+
+    def test_late_raw_down_cancels_an_active_direct_gesture_before_quarantine(self):
+        self.app._direct_hid_interception_ready = False
+        self.app._direct_hid_interception_armed = False
+        usage = next(
+            candidate
+            for candidate, button_id in frida_compat.TAP_USAGE_TO_BUTTON.items()
+            if button_id == "up"
+        )
+        raw_down = raw_input_windows.RawInputEvent(
+            source="keyboard",
+            is_pressed=True,
+            button_id="ok",
+            windows_button_id="up",
+            vkey=0x26,
+            make_code=0x48,
+            flags=0,
+            message=0x0100,
+        )
+        direct_down = usage.to_bytes(2, "little") + b"\x00\x00\x00\x00"
+        direct_neutral = b"\x00" * 6
+
+        self.app._on_hid_tap_status(
+            frida_compat.HidTapState.ATTACHED_WAITING_IO.value,
+            "hid_interception_armed",
+        )
+        self.app._on_hid_tap_status(
+            frida_compat.HidTapState.READY.value,
+            "hid_interception_verified",
+        )
+        self.app._on_direct_hid_report(1, direct_neutral)
+
+        with mock.patch.object(
+            win32_input,
+            "send_key_combo_up",
+        ) as release_keys, mock.patch.object(
+            self.app._button_gestures,
+            "press",
+        ) as press, mock.patch.object(
+            self.app._button_gestures,
+            "release",
+        ) as release, mock.patch.object(
+            self.app._button_gestures,
+            "cancel_buttons",
+        ) as cancel_buttons, mock.patch.object(
+            self.app._button_combos,
+            "cancel_buttons",
+            return_value=set(),
+        ):
+            self.app._on_direct_hid_report(1, direct_down)
+            self.app._on_raw_physical_event(raw_down)
+            self.app._on_direct_hid_report(1, direct_neutral)
+            self.assertEqual(self.app._input_rearm_blocked_buttons, set())
+            self.app._on_direct_hid_report(1, direct_down)
+
+        self.assertEqual(press.call_args_list, [mock.call("up"), mock.call("up")])
+        release.assert_not_called()
+        cancel_buttons.assert_called_once_with({"ok", "up"})
+        release_keys.assert_called_once_with(("up",))
+        self.assertFalse(self.app._direct_hid_handover_waiting_for_neutral)
+
+    def test_late_raw_for_other_button_does_not_cancel_active_direct_hold(self):
+        up_usage = next(
+            usage
+            for usage, button_id in frida_compat.TAP_USAGE_TO_BUTTON.items()
+            if button_id == "up"
+        )
+        self.app._direct_hid_interception_ready = True
+        self.app._direct_hid_interception_armed = True
+        self.app._direct_hid_usages = {up_usage}
+        raw_right = raw_input_windows.RawInputEvent(
+            source="keyboard",
+            is_pressed=True,
+            button_id="right",
+            windows_button_id="right",
+            vkey=0x27,
+            make_code=0x4D,
+            flags=0,
+            message=0x0100,
+        )
+
+        with mock.patch.object(
+            self.app._button_gestures,
+            "cancel_buttons",
+        ) as cancel_buttons, mock.patch.object(
+            self.app._button_gestures,
+            "reset",
+        ) as gesture_reset, mock.patch.object(
+            self.app._button_combos,
+            "cancel_buttons",
+            return_value=set(),
+        ) as cancel_combo, mock.patch.object(
+            self.app._button_combos,
+            "reset",
+        ) as combo_reset, mock.patch.object(
+            win32_input,
+            "send_key_combo_up",
+        ) as release_keys:
+            self.app._on_raw_physical_event(raw_right)
+
+        cancel_combo.assert_called_once_with({"right"})
+        cancel_buttons.assert_called_once_with({"right"})
+        gesture_reset.assert_not_called()
+        combo_reset.assert_not_called()
+        release_keys.assert_called_once_with(("right",))
+        self.assertEqual(self.app._direct_hid_usages, {up_usage})
+        self.assertEqual(self.app._input_rearm_blocked_buttons, {"right"})
+        self.assertFalse(self.app._direct_hid_handover_waiting_for_neutral)
+
+    def test_late_raw_for_active_direct_key_waits_for_full_neutral(self):
+        usages = {
+            button_id: usage
+            for usage, button_id in frida_compat.TAP_USAGE_TO_BUTTON.items()
+            if button_id in {"tv", "up", "right"}
+        }
+        self.app._direct_hid_interception_ready = True
+        self.app._direct_hid_interception_armed = True
+        self.app._direct_hid_usages = {usages["tv"], usages["up"]}
+        raw_up = raw_input_windows.RawInputEvent(
+            source="keyboard",
+            is_pressed=True,
+            button_id="ok",
+            windows_button_id="up",
+            vkey=0x26,
+            make_code=0x48,
+            flags=0,
+            message=0x0100,
+        )
+
+        with mock.patch.object(win32_input, "send_key_combo_up"):
+            self.app._on_raw_physical_event(raw_up)
+
+        self.assertTrue(self.app._direct_hid_handover_waiting_for_neutral)
+        self.assertEqual(
+            self.app._input_rearm_blocked_buttons,
+            {"ok", "tv", "up"},
+        )
+        tv_right_report = (
+            usages["tv"].to_bytes(2, "little")
+            + usages["right"].to_bytes(2, "little")
+            + b"\x00\x00"
+        )
+        with mock.patch.object(self.app, "_on_button_event") as button_event:
+            self.app._on_direct_hid_report(1, tv_right_report)
+        button_event.assert_not_called()
+        self.assertTrue(self.app._direct_hid_handover_waiting_for_neutral)
+        self.assertEqual(
+            self.app._input_rearm_blocked_buttons,
+            {"ok", "tv", "up", "right"},
+        )
+
+        self.app._on_direct_hid_report(1, b"\x00" * 6)
+
+        self.assertFalse(self.app._direct_hid_handover_waiting_for_neutral)
+        self.assertEqual(self.app._input_rearm_blocked_buttons, set())
+
+    def test_raw_release_after_failed_handover_unblocks_physical_alias(self):
+        self.app._direct_hid_interception_ready = False
+        self.app._direct_hid_interception_armed = False
+        raw_down = raw_input_windows.RawInputEvent(
+            source="keyboard",
+            is_pressed=True,
+            button_id="ok",
+            windows_button_id="up",
+            vkey=0x26,
+            make_code=0x48,
+            flags=0,
+            message=0x0100,
+        )
+        raw_up = raw_input_windows.RawInputEvent(
+            source="keyboard",
+            is_pressed=False,
+            button_id="ok",
+            windows_button_id="up",
+            vkey=0x26,
+            make_code=0x48,
+            flags=1,
+            message=0x0101,
+        )
+
+        self.app._on_hid_tap_status(
+            frida_compat.HidTapState.ATTACHED_WAITING_IO.value,
+            "hid_interception_armed",
+        )
+        with mock.patch.object(win32_input, "send_key_combo_up") as release_keys:
+            self.app._on_raw_physical_event(raw_down)
+            self.app._on_raw_button_event("ok", True, "keyboard", "up")
+            self.app._on_hid_tap_status(
+                frida_compat.HidTapState.FAILED.value,
+                "gadget_connection_closed",
+            )
+            self.app._on_raw_physical_event(raw_up)
+            self.app._on_raw_button_event("ok", False, "keyboard", "up")
+
+        release_keys.assert_called_once_with(("up",))
         self.assertEqual(self.app._input_rearm_blocked_buttons, set())
 
     def test_tap_arming_releases_a_windows_fallback_key_and_blocks_the_hold(self):
@@ -1964,7 +2716,7 @@ class OrdinaryButtonGestureWiringTests(_AppWiringTestCase):
         self.app._on_raw_button_event("up", False, "keyboard")
         self.assertEqual(self.app._input_rearm_blocked_buttons, set())
 
-    def test_raw_mapping_resumes_if_armed_tap_fails_before_ready(self):
+    def test_raw_fallback_stays_unmapped_if_armed_tap_fails_before_ready(self):
         self.app._direct_hid_interception_ready = False
         self.app._on_hid_tap_status(
             app_module.frida_compat.HidTapState.ATTACHED_WAITING_IO.value,
@@ -1981,10 +2733,107 @@ class OrdinaryButtonGestureWiringTests(_AppWiringTestCase):
             self.app._on_raw_button_event("ok", True, "hid")
             self.app._on_raw_button_event("ok", False, "keyboard")
 
-        press.assert_called_once_with("ok")
-        release.assert_called_once_with("ok")
+        press.assert_not_called()
+        release.assert_not_called()
         self.assertFalse(self.app._direct_hid_interception_armed)
-        self.assertEqual(self.app._raw_mapped_buttons_down, set())
+        self.assertEqual(self.app._raw_fallback_buttons_down, set())
+
+    def test_raw_fallback_hold_timeout_releases_windows_key_and_waits_for_up(self):
+        self.app._direct_hid_interception_ready = False
+        timers = []
+
+        def timer_factory(_delay, callback):
+            timer = _ManualTimer(callback)
+            timers.append(timer)
+            return timer
+
+        self.app._raw_fallback_timer_factory = timer_factory
+        with mock.patch.object(win32_input, "send_key_combo_up") as release_keys, mock.patch.object(
+            self.app._button_gestures, "press"
+        ) as press:
+            self.app._on_raw_button_event("up", True, "keyboard")
+            timers[0].fire()
+            self.app._on_raw_button_event("up", True, "keyboard")
+            self.app._on_raw_button_event("up", False, "keyboard")
+
+        release_keys.assert_called_once_with(("up",))
+        press.assert_not_called()
+        self.assertEqual(self.app._raw_fallback_buttons_down, set())
+        self.assertEqual(self.app._input_rearm_blocked_buttons, set())
+
+    def test_rearm_guard_never_treats_elapsed_time_as_a_release(self):
+        self.app._input_rearm_blocked_buttons = {"ok"}
+
+        with mock.patch.object(app_module.time, "monotonic", return_value=101.0), mock.patch.object(
+            self.app._button_gestures, "press"
+        ) as press:
+            self.app._on_button_event("ok", True, event_source="hid_tap")
+
+        press.assert_not_called()
+        self.assertEqual(self.app._input_rearm_blocked_buttons, {"ok"})
+        self.app._on_button_event("ok", False, event_source="hid_tap")
+        self.assertEqual(self.app._input_rearm_blocked_buttons, set())
+
+        with mock.patch.object(self.app._button_gestures, "press") as press:
+            self.app._on_button_event("ok", True, event_source="hid_tap")
+        press.assert_called_once_with("ok")
+
+    def test_clean_handover_keeps_the_first_direct_press(self):
+        self.app._direct_hid_interception_ready = False
+        self.app._direct_hid_interception_armed = False
+        usage = next(
+            candidate
+            for candidate, button_id in frida_compat.TAP_USAGE_TO_BUTTON.items()
+            if button_id == "up"
+        )
+        down_report = usage.to_bytes(2, "little") + b"\x00\x00\x00\x00"
+
+        self.app._on_hid_tap_status(
+            frida_compat.HidTapState.ATTACHED_WAITING_IO.value,
+            "hid_interception_armed",
+        )
+        self.app._on_hid_tap_status(
+            frida_compat.HidTapState.READY.value,
+            "hid_interception_verified",
+        )
+        with mock.patch.object(self.app._button_gestures, "press") as press, mock.patch.object(
+            self.app._button_gestures,
+            "release",
+        ) as release:
+            self.app._on_direct_hid_report(1, down_report)
+            self.app._on_direct_hid_report(1, b"\x00" * 6)
+
+        press.assert_called_once_with("up")
+        release.assert_called_once_with("up")
+
+    def test_unknown_windows_state_quarantines_until_direct_neutral(self):
+        self.app._direct_hid_interception_ready = False
+        self.app._direct_hid_interception_armed = False
+        self.app._raw_windows_key_down_query = mock.Mock(
+            side_effect=OSError("state unavailable")
+        )
+        usage = next(
+            candidate
+            for candidate, button_id in frida_compat.TAP_USAGE_TO_BUTTON.items()
+            if button_id == "up"
+        )
+        down_report = usage.to_bytes(2, "little") + b"\x00\x00\x00\x00"
+
+        self.app._on_hid_tap_status(
+            frida_compat.HidTapState.ATTACHED_WAITING_IO.value,
+            "hid_interception_armed",
+        )
+        self.app._on_hid_tap_status(
+            frida_compat.HidTapState.READY.value,
+            "hid_interception_verified",
+        )
+        with mock.patch.object(self.app._button_gestures, "press") as press:
+            self.app._on_direct_hid_report(1, down_report)
+            press.assert_not_called()
+            self.app._on_direct_hid_report(1, b"\x00" * 6)
+            self.app._on_direct_hid_report(1, down_report)
+
+        press.assert_called_once_with("up")
 
     def test_direct_hid_report_emits_one_complete_hold(self):
         usage = next(
@@ -2012,6 +2861,47 @@ class OrdinaryButtonGestureWiringTests(_AppWiringTestCase):
         self.app._on_direct_hid_report(1, b"\x00" * 6)
 
         self.assertEqual(self.app._input_rearm_blocked_buttons, set())
+
+    def test_direct_snapshot_clears_only_blocked_buttons_that_are_absent(self):
+        up_usage = next(
+            usage
+            for usage, button_id in app_module.frida_compat.TAP_USAGE_TO_BUTTON.items()
+            if button_id == "up"
+        )
+        self.app._input_rearm_blocked_buttons = {"up", "ok"}
+
+        self.app._on_direct_hid_report(
+            1,
+            up_usage.to_bytes(2, "little") + b"\x00\x00\x00\x00",
+        )
+
+        self.assertEqual(self.app._input_rearm_blocked_buttons, {"up"})
+
+    def test_same_hold_across_hid_tap_recovery_never_starts_twice(self):
+        usage = next(
+            candidate
+            for candidate, button_id in app_module.frida_compat.TAP_USAGE_TO_BUTTON.items()
+            if button_id == "up"
+        )
+        down_report = usage.to_bytes(2, "little") + b"\x00\x00\x00\x00"
+        neutral_report = b"\x00" * 6
+
+        class ReadyTap:
+            status = app_module.frida_compat.HidTapState.READY.value
+
+        with mock.patch.object(self.app._button_gestures, "press") as press:
+            self.app._on_direct_hid_report(1, down_report)
+            self.app._on_hid_tap_status(
+                app_module.frida_compat.HidTapState.UNHEALTHY.value,
+                "simulated_loss",
+            )
+            self.app._hid_report_tap = ReadyTap()
+            with mock.patch.object(app_module.time, "monotonic", return_value=1000.0):
+                self.app._on_direct_hid_report(1, down_report)
+            self.app._on_direct_hid_report(1, neutral_report)
+            self.app._on_direct_hid_report(1, down_report)
+
+        self.assertEqual(press.call_args_list, [mock.call("up"), mock.call("up")])
 
     def test_raw_device_removal_cancels_all_button_state_and_reconnects(self):
         usage = next(
@@ -2041,9 +2931,227 @@ class OrdinaryButtonGestureWiringTests(_AppWiringTestCase):
         self.assertEqual(self.app._direct_hid_usages, set())
         self.assertEqual(self.app._raw_fallback_buttons_down, set())
         self.assertEqual(self.app._raw_mapped_buttons_down, set())
-        self.assertEqual(self.app._input_rearm_blocked_buttons, {"down"})
+        self.assertEqual(
+            self.app._input_rearm_blocked_buttons,
+            {"down", "left", "ok", "up"},
+        )
         self.assertFalse(self.app._direct_hid_interception_ready)
         self.assertFalse(self.app._direct_hid_interception_armed)
+
+    def test_raw_device_removal_blocks_physical_alias_until_release(self):
+        self.app._direct_hid_interception_ready = False
+        self.app._direct_hid_interception_armed = False
+        raw_down = raw_input_windows.RawInputEvent(
+            source="keyboard",
+            is_pressed=True,
+            button_id="ok",
+            windows_button_id="up",
+            vkey=0x26,
+            make_code=0x48,
+            flags=0,
+            message=0x0100,
+        )
+        raw_up = raw_input_windows.RawInputEvent(
+            source="keyboard",
+            is_pressed=False,
+            button_id="down",
+            windows_button_id="up",
+            vkey=0x26,
+            make_code=0x48,
+            flags=1,
+            message=0x0101,
+        )
+        self.app._supervisor.request_reconnect = lambda: None
+        self.app._on_raw_physical_event(raw_down)
+        self.app._raw_mapped_buttons_down = {"ok"}
+
+        with mock.patch.object(win32_input, "send_key_combo_up") as release_keys:
+            self.app._on_raw_input_device_removed()
+
+        release_keys.assert_called_once_with(("up",))
+        self.assertEqual(
+            self.app._input_rearm_blocked_buttons,
+            {"ok", "up"},
+        )
+        self.assertEqual(
+            self.app._raw_fallback_release_debts,
+            {
+                raw_input_windows.physical_signature(raw_down): (
+                    {"ok"},
+                    {"up"},
+                )
+            },
+        )
+
+        self.app._on_raw_physical_event(raw_up)
+        self.assertEqual(self.app._input_rearm_blocked_buttons, set())
+        self.assertEqual(self.app._raw_fallback_release_debts, {})
+
+    def test_release_debt_accumulates_remapped_alias_across_two_recoveries(self):
+        first_down = raw_input_windows.RawInputEvent(
+            source="keyboard",
+            is_pressed=True,
+            button_id="ok",
+            windows_button_id="up",
+            vkey=0x26,
+            make_code=0x48,
+            flags=0,
+            message=0x0100,
+        )
+        remapped_down = replace(first_down, button_id="down")
+        remapped_up = replace(
+            remapped_down,
+            is_pressed=False,
+            flags=1,
+            message=0x0101,
+        )
+        signature = raw_input_windows.physical_signature(first_down)
+        self.app._direct_hid_interception_ready = False
+        self.app._direct_hid_interception_armed = False
+        self.app._supervisor.request_reconnect = lambda: None
+        self.app._on_raw_physical_event(first_down)
+
+        with mock.patch.object(win32_input, "send_key_combo_up") as release_keys:
+            self.app._on_raw_input_device_removed()
+            self.app._on_raw_physical_event(remapped_down)
+            self.app._on_raw_input_device_removed()
+
+        self.assertEqual(release_keys.call_count, 2)
+        release_keys.assert_has_calls([mock.call(("up",)), mock.call(("up",))])
+        self.assertEqual(
+            self.app._raw_fallback_release_debts,
+            {signature: ({"ok", "down"}, {"up"})},
+        )
+        self.assertEqual(
+            self.app._input_rearm_blocked_buttons,
+            {"ok", "down", "up"},
+        )
+
+        self.app._on_raw_physical_event(remapped_up)
+
+        self.assertEqual(self.app._raw_fallback_release_debts, {})
+        self.assertEqual(self.app._input_rearm_blocked_buttons, set())
+        with mock.patch.object(self.app._button_gestures, "press") as press:
+            self.app._on_button_event("down", True)
+        press.assert_called_once_with("down")
+
+        with mock.patch.object(self.app._button_gestures, "press") as press:
+            self.app._on_button_event("ok", True)
+        press.assert_called_once_with("ok")
+
+    def test_raw_release_debt_waits_for_every_physical_signature(self):
+        self.app._direct_hid_interception_ready = False
+        self.app._direct_hid_interception_armed = False
+        first_down = raw_input_windows.RawInputEvent(
+            source="keyboard",
+            is_pressed=True,
+            button_id="ok",
+            windows_button_id="up",
+            vkey=0x26,
+            make_code=0x48,
+            flags=0,
+            message=0x0100,
+        )
+        second_down = raw_input_windows.RawInputEvent(
+            source="keyboard",
+            is_pressed=True,
+            button_id="ok",
+            windows_button_id="up",
+            vkey=0x26,
+            make_code=0x49,
+            flags=0,
+            message=0x0100,
+        )
+        first_up = replace(
+            first_down,
+            is_pressed=False,
+            flags=1,
+            message=0x0101,
+        )
+        second_up = replace(
+            second_down,
+            is_pressed=False,
+            flags=1,
+            message=0x0101,
+        )
+        self.app._supervisor.request_reconnect = lambda: None
+        self.app._on_raw_physical_event(first_down)
+        self.app._on_raw_physical_event(second_down)
+
+        with mock.patch.object(win32_input, "send_key_combo_up") as release_keys:
+            self.app._on_raw_input_device_removed()
+            self.app._on_raw_input_corruption("keyboard_body_too_short")
+
+        release_keys.assert_called_once_with(("up",))
+        self.assertEqual(self.app._input_rearm_blocked_buttons, {"ok", "up"})
+        self.app._on_raw_physical_event(first_up)
+        self.assertEqual(self.app._input_rearm_blocked_buttons, {"ok", "up"})
+        self.app._on_raw_physical_event(second_up)
+        self.assertEqual(self.app._input_rearm_blocked_buttons, set())
+        self.assertEqual(self.app._raw_fallback_release_debts, {})
+
+    def test_removed_custom_mapping_still_clears_release_debt(self):
+        self.app._direct_hid_interception_ready = False
+        self.app._direct_hid_interception_armed = False
+        raw_down = raw_input_windows.RawInputEvent(
+            source="keyboard",
+            is_pressed=True,
+            button_id="ok",
+            windows_button_id=None,
+            vkey=0x70,
+            make_code=0x3B,
+            flags=0,
+            message=0x0100,
+        )
+        raw_up_without_mapping = replace(
+            raw_down,
+            is_pressed=False,
+            button_id=None,
+            flags=1,
+            message=0x0101,
+        )
+        self.app._supervisor.request_reconnect = lambda: None
+        self.app._on_raw_physical_event(raw_down)
+        self.app._raw_mapped_buttons_down = {"ok"}
+
+        self.app._on_raw_input_device_removed()
+        self.assertEqual(self.app._input_rearm_blocked_buttons, {"ok"})
+        self.app._on_raw_physical_event(raw_up_without_mapping)
+
+        self.assertEqual(self.app._input_rearm_blocked_buttons, set())
+        self.assertEqual(self.app._raw_fallback_release_debts, {})
+
+    def test_release_debt_cannot_unblock_a_still_active_direct_button(self):
+        raw_down = raw_input_windows.RawInputEvent(
+            source="keyboard",
+            is_pressed=True,
+            button_id="ok",
+            windows_button_id="up",
+            vkey=0x26,
+            make_code=0x48,
+            flags=0,
+            message=0x0100,
+        )
+        raw_up = replace(
+            raw_down,
+            is_pressed=False,
+            flags=1,
+            message=0x0101,
+        )
+        up_usage = next(
+            usage
+            for usage, button_id in frida_compat.TAP_USAGE_TO_BUTTON.items()
+            if button_id == "up"
+        )
+        signature = raw_input_windows.physical_signature(raw_down)
+        self.app._raw_fallback_release_debts[signature] = ({"ok"}, {"up"})
+        self.app._input_rearm_blocked_buttons = {"ok", "up"}
+        self.app._direct_hid_usages = {up_usage}
+
+        self.app._on_raw_physical_event(raw_up)
+
+        self.assertEqual(self.app._input_rearm_blocked_buttons, {"up"})
+        self.assertEqual(self.app._raw_fallback_release_debts, {})
 
     def test_direct_report_revalidates_after_raw_collection_is_removed(self):
         usage = next(
@@ -2308,6 +3416,32 @@ class VoiceMappingProductBoundaryTests(_AppWiringTestCase):
 
         self.assertEqual(actions, ["up", "up"])
 
+    def test_stale_ordinary_mic_source_cannot_block_the_next_press(self):
+        self.app._bindings["bindings"]["mic"] = key_mapping.ButtonAction(
+            key_mapping.ActionKind.ARROW_UP
+        ).to_dict()
+        clock = [100.0]
+        actions = []
+
+        with mock.patch.object(
+            app_module.time,
+            "monotonic",
+            side_effect=lambda: clock[0],
+        ), mock.patch.object(
+            win32_input,
+            "send_arrow_up",
+            side_effect=lambda: actions.append("up"),
+        ):
+            self.app._on_button_event("mic", True, event_source="hid")
+            self.app._on_button_event("mic", True, event_source="hid_tap")
+            clock[0] += app_module._ORDINARY_MIC_SOURCE_STALE_SECONDS + 0.01
+            self.app._on_button_event("mic", True, event_source="hid")
+            self.app._on_button_event("mic", False, event_source="hid")
+
+        self.assertEqual(actions, ["up", "up"])
+        self.assertEqual(self.app._ordinary_mic_sources_down, set())
+        self.assertFalse(self.app._ordinary_mic_gesture_active)
+
     def test_non_mic_legacy_voice_data_is_removed_from_runtime_bindings(self):
         bindings = config.default_key_bindings()
         bindings["bindings"]["mic"] = key_mapping.ButtonAction(
@@ -2446,6 +3580,21 @@ class LiveBridgeKeyDetectionTests(_AppWiringTestCase):
         self.assertEqual(hotkey_calls, [DEFAULT_VOICE_TOKENS])
         self.assertTrue(self.app._voice.active)
         self.assertEqual(self.app._ble_session.mic_open_calls, 0)
+
+    def test_detection_suppression_timeout_allows_a_later_real_press(self):
+        self.app._key_detection_suppressed_buttons = {"back"}
+        self.app._key_detection_suppression_deadlines = {"back": 100.0}
+
+        with mock.patch.object(app_module.time, "monotonic", return_value=101.0), mock.patch.object(
+            key_detection_bridge,
+            "publish_next_button",
+            return_value=False,
+        ), mock.patch.object(self.app._button_gestures, "press") as press:
+            self.app._on_button_event("back", True, event_source="hid_tap")
+
+        press.assert_called_once_with("back")
+        self.assertEqual(self.app._key_detection_suppressed_buttons, set())
+        self.app._on_button_event("back", False, event_source="hid_tap")
 
 
 class PlaybackWriteFailureTests(_AppWiringTestCase):
@@ -2692,6 +3841,8 @@ class InputLifecycleTests(_AppWiringTestCase):
         self.assertEqual(calls, ["physicalizer", "raw_input", "hid_tap"])
 
     def test_unavailable_voice_physicalizer_degrades_without_losing_owner_state(self):
+        timers = []
+
         class UnavailablePhysicalizer:
             is_running = False
 
@@ -2706,9 +3857,16 @@ class InputLifecycleTests(_AppWiringTestCase):
             "VoiceKeyPhysicalizer",
             UnavailablePhysicalizer,
         ):
+            self.app._voice_key_physicalizer_timer_factory = (
+                lambda _delay, callback: timers.append(_ManualTimer(callback))
+                or timers[-1]
+            )
             self.app._start_voice_key_physicalizer()
 
         self.assertIsNone(self.app._voice_key_physicalizer)
+        self.assertFalse(self.app._voice_key_physicalizer_ready)
+        self.assertEqual(self.app._runtime_voice_key_physicalizer_state, "failed")
+        self.assertEqual(len(timers), 1)
 
     def test_still_running_voice_physicalizer_is_retained_for_shutdown(self):
         class StuckPhysicalizer:
@@ -2735,6 +3893,755 @@ class InputLifecycleTests(_AppWiringTestCase):
             StuckPhysicalizer,
         )
 
+    def test_ready_then_immediate_exit_never_publishes_ready(self):
+        timers = []
+        physicalizer = _FakeVoicePhysicalizer(immediate_exit=True)
+        self.app._voice_key_physicalizer_timer_factory = (
+            lambda _delay, callback: timers.append(_ManualTimer(callback))
+            or timers[-1]
+        )
+        with mock.patch.object(
+            app_module.voice_key_physicalizer_windows,
+            "VoiceKeyPhysicalizer",
+            return_value=physicalizer,
+        ):
+            self.app._start_voice_key_physicalizer()
+
+        self.assertFalse(self.app._voice_key_physicalizer_ready)
+        self.assertEqual(
+            self.app._runtime_voice_key_physicalizer_state,
+            "recovering",
+        )
+        self.assertEqual(len(timers), 1)
+
+    def test_repeated_start_failures_keep_one_recovery_timer(self):
+        timers = []
+        instances = []
+
+        def build_physicalizer():
+            instance = _FakeVoicePhysicalizer(
+                start_error=(
+                    app_module.voice_key_physicalizer_windows.
+                    VoiceKeyPhysicalizerUnavailableError("failed")
+                )
+            )
+            instances.append(instance)
+            return instance
+
+        self.app._voice_key_physicalizer_timer_factory = (
+            lambda _delay, callback: timers.append(_ManualTimer(callback))
+            or timers[-1]
+        )
+        with mock.patch.object(
+            app_module.voice_key_physicalizer_windows,
+            "VoiceKeyPhysicalizer",
+            side_effect=build_physicalizer,
+        ):
+            self.app._start_voice_key_physicalizer()
+            with self.app._voice_key_physicalizer_lifecycle_lock:
+                self.app._schedule_voice_key_physicalizer_recovery_locked()
+            self.assertEqual(len(timers), 1)
+            timers[0].fire()
+
+        self.assertEqual(len(instances), 2)
+        self.assertEqual(len(timers), 2)
+        self.assertIsNone(self.app._voice_key_physicalizer)
+
+    def test_normal_shutdown_cancels_recovery_and_never_restarts(self):
+        timers = []
+        instances = []
+
+        def build_physicalizer():
+            instance = _FakeVoicePhysicalizer(
+                start_error=(
+                    app_module.voice_key_physicalizer_windows.
+                    VoiceKeyPhysicalizerUnavailableError("failed")
+                )
+            )
+            instances.append(instance)
+            return instance
+
+        self.app._voice_key_physicalizer_timer_factory = (
+            lambda _delay, callback: timers.append(_ManualTimer(callback))
+            or timers[-1]
+        )
+        with mock.patch.object(
+            app_module.voice_key_physicalizer_windows,
+            "VoiceKeyPhysicalizer",
+            side_effect=build_physicalizer,
+        ):
+            self.app._start_voice_key_physicalizer()
+            self.app._stop_input_channels()
+            timers[0].fire()
+
+        self.assertEqual(len(instances), 1)
+        self.assertTrue(timers[0].cancelled)
+        self.assertEqual(
+            self.app._runtime_voice_key_physicalizer_state,
+            "stopped",
+        )
+
+    def test_repeated_raw_start_failures_keep_one_capped_backoff_timer(self):
+        timers = []
+
+        def timer_factory(delay, callback):
+            timer = _ManualTimer(callback)
+            timer.delay = delay
+            timers.append(timer)
+            return timer
+
+        self.app._raw_input_timer_factory = timer_factory
+        with mock.patch.object(
+            app_module.raw_input_windows,
+            "enumerate_matching_device_paths",
+            return_value=[],
+        ):
+            self.app._start_hid_listener()
+            with self.app._raw_input_lifecycle_lock:
+                self.app._schedule_raw_input_recovery_locked()
+            self.assertEqual(len(timers), 1)
+            for _index in range(6):
+                timers[-1].fire()
+
+        self.assertEqual(
+            [timer.delay for timer in timers],
+            [1.0, 2.0, 4.0, 8.0, 16.0, 30.0, 30.0],
+        )
+
+    def test_raw_recovery_stops_old_listener_and_replaces_it_once(self):
+        timers = []
+        old_listener = _FakeRecoveringRawListener()
+        old_listener.is_running = True
+        new_listener = _FakeRecoveringRawListener()
+        self.app._hid_listener = old_listener
+        self.app._raw_input_generation = 4
+        self.app._raw_input_retry_delay = 8.0
+
+        def timer_factory(delay, callback):
+            timer = _ManualTimer(callback)
+            timer.delay = delay
+            timers.append(timer)
+            return timer
+
+        self.app._raw_input_timer_factory = timer_factory
+        with self.app._raw_input_lifecycle_lock:
+            self.app._schedule_raw_input_recovery_locked()
+
+        with mock.patch.object(
+            app_module.raw_input_windows,
+            "enumerate_matching_device_paths",
+            return_value=["fake-path"],
+        ), mock.patch.object(
+            app_module.hid_identity,
+            "select_single_device_path",
+            return_value="fake-path",
+        ), mock.patch.object(
+            app_module.raw_input_windows,
+            "RawInputButtonListener",
+            return_value=new_listener,
+        ):
+            timers[0].fire()
+
+        self.assertEqual(old_listener.stop_calls, 1)
+        self.assertEqual(new_listener.start_calls, 1)
+        self.assertIs(self.app._hid_listener, new_listener)
+        self.assertEqual(self.app._raw_input_retry_delay, 1.0)
+        self.assertIsNone(self.app._raw_input_retry_timer)
+        self.assertIsNotNone(new_listener.raw_callback)
+        self.assertIsNotNone(new_listener.sourced_callback)
+
+    def test_raw_recovery_stop_failure_retains_old_listener_and_never_starts_second(self):
+        timers = []
+        old_listener = _FakeRecoveringRawListener(
+            stop_error=raw_input_windows.RawInputUnavailableError("stuck")
+        )
+        old_listener.is_running = True
+        self.app._hid_listener = old_listener
+        self.app._raw_input_generation = 4
+        self.app._raw_input_timer_factory = (
+            lambda _delay, callback: timers.append(_ManualTimer(callback))
+            or timers[-1]
+        )
+        with self.app._raw_input_lifecycle_lock:
+            self.app._schedule_raw_input_recovery_locked()
+
+        with mock.patch.object(
+            app_module.raw_input_windows,
+            "RawInputButtonListener",
+        ) as build_listener, mock.patch.object(
+            app_module.raw_input_windows,
+            "enumerate_matching_device_paths",
+        ) as enumerate_paths:
+            timers[0].fire()
+
+        self.assertEqual(old_listener.stop_calls, 1)
+        self.assertIs(self.app._hid_listener, old_listener)
+        build_listener.assert_not_called()
+        enumerate_paths.assert_not_called()
+        self.assertEqual(len(timers), 2)
+        self.assertEqual(self.app._runtime_raw_input_state, "failed_stopping")
+
+    def test_physical_tracking_loss_schedules_listener_replacement(self):
+        timers = []
+        old_listener = _FakeRecoveringRawListener()
+        old_listener.is_running = True
+        new_listener = _FakeRecoveringRawListener()
+        self.app._hid_listener = old_listener
+        self.app._raw_input_generation = 4
+        self.app._raw_input_timer_factory = (
+            lambda _delay, callback: timers.append(_ManualTimer(callback))
+            or timers[-1]
+        )
+
+        self.app._on_physical_keyboard_tracking_lost(
+            "physical_keyboard_edge_mismatch",
+            _listener=old_listener,
+            _generation=4,
+        )
+
+        self.assertEqual(self.app._raw_input_lost_generation, 4)
+        self.assertEqual(self.app._runtime_raw_input_state, "unhealthy")
+        self.assertEqual(len(timers), 1)
+
+        with mock.patch.object(
+            app_module.raw_input_windows,
+            "enumerate_matching_device_paths",
+            return_value=["fake-path"],
+        ), mock.patch.object(
+            app_module.hid_identity,
+            "select_single_device_path",
+            return_value="fake-path",
+        ), mock.patch.object(
+            app_module.raw_input_windows,
+            "RawInputButtonListener",
+            return_value=new_listener,
+        ):
+            timers[0].fire()
+
+        self.assertEqual(old_listener.stop_calls, 1)
+        self.assertEqual(new_listener.start_calls, 1)
+        self.assertIs(self.app._hid_listener, new_listener)
+        self.assertEqual(self.app._runtime_raw_input_state, "ready")
+
+    def test_device_removed_during_start_never_publishes_ready(self):
+        timers = []
+        reconnects = []
+
+        class RemovedDuringStartListener(_FakeRecoveringRawListener):
+            def start(self, _device_path):
+                self.start_calls += 1
+                self.is_running = True
+                self.removed_callback()
+
+        listener = RemovedDuringStartListener()
+        self.app._raw_input_timer_factory = (
+            lambda _delay, callback: timers.append(_ManualTimer(callback))
+            or timers[-1]
+        )
+        self.app._supervisor.request_reconnect = lambda: reconnects.append(True)
+
+        with mock.patch.object(
+            app_module.raw_input_windows,
+            "enumerate_matching_device_paths",
+            return_value=["fake-path"],
+        ), mock.patch.object(
+            app_module.hid_identity,
+            "select_single_device_path",
+            return_value="fake-path",
+        ), mock.patch.object(
+            app_module.raw_input_windows,
+            "RawInputButtonListener",
+            return_value=listener,
+        ):
+            self.app._start_hid_listener()
+
+        self.assertEqual(listener.start_calls, 1)
+        self.assertEqual(reconnects, [True])
+        self.assertEqual(
+            self.app._raw_input_lost_generation,
+            self.app._raw_input_generation,
+        )
+        self.assertEqual(self.app._runtime_raw_input_state, "recovering")
+        self.assertEqual(len(timers), 1)
+
+    def test_raw_listener_exit_between_liveness_check_and_ready_publish_never_leaves_ready(self):
+        timers = []
+        listener = _FakeRecoveringRawListener()
+        exit_attempted = threading.Event()
+        exit_finished = threading.Event()
+        exit_thread = []
+        original_set_runtime_state = self.app._set_runtime_input_state
+
+        def publish_state(**changes):
+            if changes.get("raw_input_state") == "ready" and not exit_thread:
+                def report_exit():
+                    exit_attempted.set()
+                    listener.corruption_callback("raw_input_listener_exited")
+                    exit_finished.set()
+
+                worker = threading.Thread(target=report_exit)
+                exit_thread.append(worker)
+                worker.start()
+                self.assertTrue(exit_attempted.wait(1.0))
+                self.assertFalse(exit_finished.wait(0.05))
+            original_set_runtime_state(**changes)
+
+        self.app._raw_input_timer_factory = (
+            lambda _delay, callback: timers.append(_ManualTimer(callback))
+            or timers[-1]
+        )
+        with mock.patch.object(
+            app_module.raw_input_windows,
+            "enumerate_matching_device_paths",
+            return_value=["fake-path"],
+        ), mock.patch.object(
+            app_module.hid_identity,
+            "select_single_device_path",
+            return_value="fake-path",
+        ), mock.patch.object(
+            app_module.raw_input_windows,
+            "RawInputButtonListener",
+            return_value=listener,
+        ), mock.patch.object(
+            self.app,
+            "_set_runtime_input_state",
+            side_effect=publish_state,
+        ):
+            self.app._start_hid_listener()
+
+        exit_thread[0].join(1.0)
+        self.assertFalse(exit_thread[0].is_alive())
+        self.assertEqual(self.app._runtime_raw_input_state, "recovering")
+        self.assertEqual(
+            self.app._raw_input_lost_generation,
+            self.app._raw_input_generation,
+        )
+        self.assertEqual(len(timers), 1)
+
+    def test_stale_raw_generation_callbacks_cannot_mutate_current_input_state(self):
+        old_listener = _FakeRecoveringRawListener()
+        current_listener = _FakeRecoveringRawListener()
+        self.app._hid_listener = current_listener
+        self.app._raw_input_generation = 8
+        event = raw_input_windows.RawInputEvent(
+            source="keyboard",
+            is_pressed=True,
+            button_id="up",
+            windows_button_id="up",
+            vkey=0x26,
+            make_code=0x48,
+            flags=0,
+            message=0x0100,
+        )
+        reconnects = []
+        self.app._supervisor.request_reconnect = lambda: reconnects.append(True)
+
+        self.app._on_raw_physical_event(
+            event,
+            _listener=old_listener,
+            _generation=7,
+        )
+        self.app._on_raw_button_event(
+            "up",
+            True,
+            "keyboard",
+            "up",
+            _listener=old_listener,
+            _generation=7,
+        )
+        self.app._on_raw_input_corruption(
+            "raw_input_listener_exited",
+            _listener=old_listener,
+            _generation=7,
+        )
+        self.app._on_physical_keyboard_tracking_lost(
+            "raw_input_listener_exited",
+            _listener=old_listener,
+            _generation=7,
+        )
+        self.app._on_raw_input_device_removed(
+            _listener=old_listener,
+            _generation=7,
+        )
+
+        self.assertEqual(self.app._raw_fallback_physical_buttons_down, {})
+        self.assertEqual(self.app._raw_fallback_buttons_down, set())
+        self.assertEqual(self.app._raw_mapped_buttons_down, set())
+        self.assertEqual(self.app._input_rearm_blocked_buttons, set())
+        self.assertEqual(reconnects, [])
+        self.assertIsNone(self.app._raw_input_retry_timer)
+
+    def test_raw_recovery_waits_for_inflight_callback_then_cancels_its_state(self):
+        entered_callback = threading.Event()
+        allow_callback = threading.Event()
+        timers = []
+        old_listener = _FakeRecoveringRawListener()
+        old_listener.is_running = True
+        self.app._hid_listener = old_listener
+        self.app._raw_input_generation = 4
+        self.app._direct_hid_interception_ready = False
+        self.app._direct_hid_interception_armed = False
+
+        class BlockingPhysicalState(dict):
+            def setdefault(self, key, default=None):
+                entered_callback.set()
+                allow_callback.wait(1.0)
+                return super().setdefault(key, default)
+
+        self.app._raw_fallback_physical_buttons_down = BlockingPhysicalState()
+        self.app._raw_input_timer_factory = (
+            lambda _delay, callback: timers.append(_ManualTimer(callback))
+            or timers[-1]
+        )
+        with self.app._raw_input_lifecycle_lock:
+            self.app._schedule_raw_input_recovery_locked()
+        event = raw_input_windows.RawInputEvent(
+            source="keyboard",
+            is_pressed=True,
+            button_id="up",
+            windows_button_id="up",
+            vkey=0x26,
+            make_code=0x48,
+            flags=0,
+            message=0x0100,
+        )
+        raw_worker = threading.Thread(
+            target=lambda: self.app._on_raw_physical_event(
+                event,
+                _listener=old_listener,
+                _generation=4,
+            )
+        )
+        recovery_worker = threading.Thread(target=timers[0].fire)
+
+        with mock.patch.object(
+            app_module.raw_input_windows,
+            "enumerate_matching_device_paths",
+            return_value=[],
+        ), mock.patch.object(
+            win32_input,
+            "send_key_combo_up",
+        ) as release_keys:
+            raw_worker.start()
+            self.assertTrue(entered_callback.wait(1.0))
+            recovery_worker.start()
+            recovery_worker.join(0.05)
+            self.assertTrue(recovery_worker.is_alive())
+            self.assertEqual(self.app._raw_input_generation, 4)
+            allow_callback.set()
+            raw_worker.join(1.0)
+            recovery_worker.join(1.0)
+
+        self.assertFalse(raw_worker.is_alive())
+        self.assertFalse(recovery_worker.is_alive())
+        self.assertEqual(old_listener.stop_calls, 1)
+        self.assertEqual(self.app._raw_fallback_physical_buttons_down, {})
+        self.assertEqual(self.app._input_rearm_blocked_buttons, {"up"})
+        release_keys.assert_called_once_with(("up",))
+
+    def test_inflight_raw_recovery_cannot_restart_after_final_shutdown(self):
+        stop_started = threading.Event()
+        allow_stop = threading.Event()
+        timers = []
+
+        class BlockingStopListener(_FakeRecoveringRawListener):
+            def stop(self):
+                self.stop_calls += 1
+                stop_started.set()
+                allow_stop.wait(1.0)
+                self.is_running = False
+
+        old_listener = BlockingStopListener()
+        old_listener.is_running = True
+        self.app._hid_listener = old_listener
+        self.app._raw_input_generation = 4
+        self.app._raw_input_timer_factory = (
+            lambda _delay, callback: timers.append(_ManualTimer(callback))
+            or timers[-1]
+        )
+        with self.app._raw_input_lifecycle_lock:
+            self.app._schedule_raw_input_recovery_locked()
+        recovery_worker = threading.Thread(target=timers[0].fire)
+        shutdown_worker = threading.Thread(target=self.app._stop_input_channels)
+
+        with mock.patch.object(
+            app_module.raw_input_windows,
+            "enumerate_matching_device_paths",
+        ) as enumerate_paths, mock.patch.object(
+            app_module.raw_input_windows,
+            "RawInputButtonListener",
+        ) as build_listener:
+            recovery_worker.start()
+            self.assertTrue(stop_started.wait(1.0))
+            shutdown_worker.start()
+            allow_stop.set()
+            recovery_worker.join(1.0)
+            shutdown_worker.join(1.0)
+
+        self.assertFalse(recovery_worker.is_alive())
+        self.assertFalse(shutdown_worker.is_alive())
+        self.assertEqual(old_listener.stop_calls, 1)
+        enumerate_paths.assert_not_called()
+        build_listener.assert_not_called()
+        self.assertTrue(self.app._raw_input_stopping)
+        self.assertFalse(self.app._accept_input_events)
+        self.assertIsNone(self.app._hid_listener)
+        self.assertIsNone(self.app._raw_input_retry_timer)
+
+    def test_raw_shutdown_cancels_recovery_and_never_restarts(self):
+        timers = []
+
+        def timer_factory(_delay, callback):
+            timer = _ManualTimer(callback)
+            timers.append(timer)
+            return timer
+
+        self.app._raw_input_timer_factory = timer_factory
+        with mock.patch.object(
+            app_module.raw_input_windows,
+            "enumerate_matching_device_paths",
+            return_value=[],
+        ) as enumerate_paths:
+            self.app._start_hid_listener()
+            self.app._stop_input_channels()
+            timers[0].fire()
+
+        self.assertTrue(timers[0].cancelled)
+        self.assertEqual(enumerate_paths.call_count, 1)
+        self.assertIsNone(self.app._raw_input_retry_timer)
+        self.assertFalse(self.app._accept_input_events)
+
+    def test_uncontrolled_recovery_listener_is_retained_and_retried(self):
+        timers = []
+        listener = _FakeRecoveringRawListener(
+            start_error=raw_input_windows.RawInputUnavailableError("stuck"),
+            running_after_error=True,
+        )
+
+        def timer_factory(delay, callback):
+            timer = _ManualTimer(callback)
+            timer.delay = delay
+            timers.append(timer)
+            return timer
+
+        self.app._raw_input_timer_factory = timer_factory
+        with self.app._raw_input_lifecycle_lock:
+            self.app._schedule_raw_input_recovery_locked()
+        with mock.patch.object(
+            app_module.raw_input_windows,
+            "enumerate_matching_device_paths",
+            return_value=["fake-path"],
+        ), mock.patch.object(
+            app_module.hid_identity,
+            "select_single_device_path",
+            return_value="fake-path",
+        ), mock.patch.object(
+            app_module.raw_input_windows,
+            "RawInputButtonListener",
+            return_value=listener,
+        ):
+            timers[0].fire()
+
+        self.assertIs(self.app._hid_listener, listener)
+        self.assertEqual(listener.start_calls, 1)
+        self.assertEqual(len(timers), 2)
+        self.assertEqual([timer.delay for timer in timers], [1.0, 2.0])
+
+    def test_raw_listener_exit_retries_without_ble_reconnect(self):
+        timers = []
+        listener = _FakeRecoveringRawListener()
+        listener.is_running = False
+        self.app._hid_listener = listener
+        self.app._raw_input_generation = 7
+        reconnects = []
+        self.app._supervisor.request_reconnect = lambda: reconnects.append(True)
+        self.app._raw_input_timer_factory = (
+            lambda _delay, callback: timers.append(_ManualTimer(callback))
+            or timers[-1]
+        )
+
+        self.app._on_raw_input_corruption(
+            "raw_input_listener_exited",
+            _listener=listener,
+            _generation=7,
+        )
+        self.app._on_raw_input_corruption(
+            "raw_input_listener_exited",
+            _listener=listener,
+            _generation=7,
+        )
+
+        self.assertEqual(len(timers), 1)
+        self.assertEqual(reconnects, [])
+
+    def test_stale_physicalizer_callback_cannot_replace_current_state(self):
+        timers = []
+        old = _FakeVoicePhysicalizer()
+        current = _FakeVoicePhysicalizer()
+        current.is_running = True
+        self.app._voice_key_physicalizer_timer_factory = (
+            lambda _delay, callback: timers.append(_ManualTimer(callback))
+            or timers[-1]
+        )
+        self.app._voice_key_physicalizer = current
+        self.app._voice_key_physicalizer_generation = 2
+        self.app._voice_key_physicalizer_ready = True
+
+        with mock.patch.object(
+            self.app,
+            "_force_voice_hold_release_locked",
+        ) as release_voice, mock.patch.object(
+            self.app,
+            "_release_pending_button_keys",
+        ) as release_buttons:
+            self.app._on_voice_key_physicalizer_tracking_lost(old, 1)
+
+        self.assertTrue(self.app._voice_key_physicalizer_ready)
+        self.assertEqual(timers, [])
+        release_voice.assert_not_called()
+        release_buttons.assert_not_called()
+
+    def test_physicalizer_loss_with_healthy_raw_releases_only_marked_right_alt(self):
+        timers = []
+        physicalizer = _FakeVoicePhysicalizer()
+        physicalizer.is_running = True
+        self.app._voice_key_physicalizer = physicalizer
+        self.app._voice_key_physicalizer_generation = 1
+        self.app._voice_key_physicalizer_ready = True
+        self.app._voice_hotkey = app_module.hotkey.HotkeySpec.parse("ralt")
+        self.app._voice_hotkey_release_pending = ("ralt",)
+        self.app._voice_hotkey_release_pending_backend = (
+            app_module._VOICE_HOTKEY_BACKEND_MARKED
+        )
+        self.app._voice_key_physicalizer_timer_factory = (
+            lambda _delay, callback: timers.append(_ManualTimer(callback))
+            or timers[-1]
+        )
+
+        with mock.patch.object(
+            self.app,
+            "_force_voice_hold_release_locked",
+            return_value=True,
+        ) as release_voice, mock.patch.object(
+            self.app,
+            "_release_pending_button_keys",
+        ) as release_buttons:
+            self.app._on_voice_key_physicalizer_tracking_lost(
+                physicalizer,
+                1,
+            )
+
+        release_voice.assert_called_once_with(
+            "voice key physicalizer stopped unexpectedly"
+        )
+        release_buttons.assert_not_called()
+        self.assertEqual(len(timers), 1)
+
+    def test_physicalizer_loss_with_healthy_raw_preserves_other_combos(self):
+        timers = []
+        physicalizer = _FakeVoicePhysicalizer()
+        physicalizer.is_running = True
+        self.app._voice_key_physicalizer = physicalizer
+        self.app._voice_key_physicalizer_generation = 1
+        self.app._voice_key_physicalizer_ready = True
+        self.app._voice_hotkey = app_module.hotkey.HotkeySpec.parse("lctrl+f9")
+        self.app._voice_hotkey_release_pending = ("lctrl", "f9")
+        self.app._voice_key_physicalizer_timer_factory = (
+            lambda _delay, callback: timers.append(_ManualTimer(callback))
+            or timers[-1]
+        )
+
+        with mock.patch.object(
+            self.app,
+            "_force_voice_hold_release_locked",
+        ) as release_voice, mock.patch.object(
+            self.app,
+            "_release_pending_button_keys",
+        ) as release_buttons:
+            self.app._on_voice_key_physicalizer_tracking_lost(
+                physicalizer,
+                1,
+            )
+
+        release_voice.assert_not_called()
+        release_buttons.assert_not_called()
+
+    def test_second_tracker_loss_releases_pending_modifier_combo_once(self):
+        timers = []
+        physicalizer = _FakeVoicePhysicalizer()
+        physicalizer.is_running = True
+        self.app._voice_key_physicalizer = physicalizer
+        self.app._voice_key_physicalizer_generation = 1
+        self.app._voice_key_physicalizer_ready = True
+        self.app._voice_hotkey_release_pending = ("lctrl", "lwin")
+        self.app._button_key_release_pending = ("lctrl", "lwin")
+        self.app._voice_key_physicalizer_timer_factory = (
+            lambda _delay, callback: timers.append(_ManualTimer(callback))
+            or timers[-1]
+        )
+        raw_input_windows._set_physical_keyboard_tracker_active(False)
+
+        with mock.patch.object(
+            self.app,
+            "_force_voice_hold_release_locked",
+            return_value=True,
+        ) as release_voice, mock.patch.object(
+            self.app,
+            "_release_pending_button_keys",
+            return_value=True,
+        ) as release_buttons:
+            self.app._on_voice_key_physicalizer_tracking_lost(
+                physicalizer,
+                1,
+            )
+
+        release_voice.assert_called_once()
+        release_buttons.assert_called_once_with()
+
+    def test_dual_tracker_loss_without_owned_hold_sends_no_key_up(self):
+        timers = []
+        physicalizer = _FakeVoicePhysicalizer()
+        physicalizer.is_running = True
+        self.app._voice_key_physicalizer = physicalizer
+        self.app._voice_key_physicalizer_generation = 1
+        self.app._voice_key_physicalizer_ready = True
+        self.app._voice_key_physicalizer_timer_factory = (
+            lambda _delay, callback: timers.append(_ManualTimer(callback))
+            or timers[-1]
+        )
+        raw_input_windows._set_physical_keyboard_tracker_active(False)
+
+        with mock.patch.object(
+            self.app,
+            "_force_voice_hold_release_locked",
+        ) as release_voice, mock.patch.object(
+            win32_input,
+            "send_key_combo_up",
+        ) as send_up:
+            self.app._on_voice_key_physicalizer_tracking_lost(
+                physicalizer,
+                1,
+            )
+
+        release_voice.assert_not_called()
+        send_up.assert_not_called()
+
+    def test_raw_tracker_loss_retries_pending_combo_even_with_physicalizer_ready(self):
+        self.app._voice_key_physicalizer_ready = True
+        self.app._button_key_release_pending = ("lctrl", "f9")
+
+        with mock.patch.object(win32_input, "send_key_combo_up") as send_up:
+            self.app._on_physical_keyboard_tracking_lost("raw_failed")
+
+        send_up.assert_called_once_with(("lctrl", "f9"))
+        self.assertIsNone(self.app._button_key_release_pending)
+
+    def test_raw_tracker_loss_without_button_debt_sends_no_button_key_up(self):
+        with mock.patch.object(win32_input, "send_key_combo_up") as send_up:
+            self.app._on_physical_keyboard_tracking_lost("raw_failed")
+
+        send_up.assert_not_called()
+
     def test_final_input_shutdown_stops_all_three_owners(self):
         tap = _FakeInputOwner()
         raw = _FakeHidListener()
@@ -2752,6 +4659,21 @@ class InputLifecycleTests(_AppWiringTestCase):
         self.assertIsNone(self.app._hid_listener)
         self.assertIsNone(self.app._voice_key_physicalizer)
         self.assertFalse(self.app._accept_input_events)
+
+    def test_final_input_shutdown_cancels_release_retry_before_final_key_up(self):
+        self.app._button_key_release_pending = ("up",)
+        with self.app._button_action_lock:
+            self.app._schedule_button_input_release_retry_locked()
+        retry_timer = self._button_input_release_timers[0]
+
+        with mock.patch.object(win32_input, "send_key_combo_up") as send_up:
+            self.app._stop_input_channels()
+            retry_timer.fire()
+
+        self.assertTrue(retry_timer.cancelled)
+        send_up.assert_called_once_with(("up",))
+        self.assertIsNone(self.app._button_key_release_pending)
+        self.assertIsNone(self.app._button_input_release_retry_timer)
 
     def test_final_shutdown_keeps_input_enabled_until_tap_and_raw_releases_finish(self):
         events = []
@@ -3168,6 +5090,21 @@ class HidTapStartupStateTests(_AppWiringTestCase):
 
 class VoiceCleanupFailurePreservesPendingStateTests(_AppWiringTestCase):
     """A failed key-up must remain owed after cleanup or audio stop."""
+
+    def test_cleanup_releases_and_clears_an_owned_voice_hotkey(self):
+        self.app._voice.on_mic_button_pressed()
+        released = []
+
+        with mock.patch.object(
+            win32_input,
+            "send_voice_key_combo_up",
+            side_effect=lambda tokens: released.append(tuple(tokens)),
+        ):
+            _run(self.app._cleanup_once())
+
+        self.assertEqual(released, [DEFAULT_VOICE_TOKENS])
+        self.assertFalse(self.app._voice.active)
+        self.assertFalse(self.app._voice.holding)
 
     def test_cleanup_once_preserves_hold_key_up_on_failure(self):
         self.app._voice.on_mic_button_pressed()

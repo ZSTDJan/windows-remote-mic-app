@@ -1,6 +1,7 @@
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from ovb_rc003 import hid_elevation_windows, hid_helper_consumers
 
@@ -141,6 +142,115 @@ class HidHelperConsumerTests(unittest.TestCase):
                 ),
             )
             self.assertFalse(marker.exists())
+
+    def test_distribution_uninstall_drops_its_marker_and_keeps_an_unknown_consumer(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            config_root = root / "config"
+            installed = self._distribution(root, "installed", installed=True)
+            marker = hid_helper_consumers.register_current_consumer(
+                config_root, frozen=True, executable=str(installed)
+            )
+            assert marker is not None
+            remove_helper = mock.Mock(
+                return_value=hid_elevation_windows.HidHelperState(True)
+            )
+
+            with mock.patch.object(
+                hid_helper_consumers,
+                "_inspect_other_consumers_unlocked",
+                return_value=hid_helper_consumers.OtherConsumerPresence.UNKNOWN,
+            ):
+                state = hid_helper_consumers.uninstall_current_distribution(
+                    config_root,
+                    remove_helper,
+                    frozen=True,
+                    executable=str(installed),
+                )
+
+            self.assertEqual(
+                state,
+                hid_elevation_windows.HidHelperState(
+                    True, "helper_kept_for_unknown_consumer"
+                ),
+            )
+            self.assertFalse(marker.is_file())
+            remove_helper.assert_not_called()
+
+    def test_distribution_uninstall_keeps_helper_for_real_damaged_consumers(self):
+        for damage in ("invalid_json", "missing_helper", "hash_mismatch"):
+            with self.subTest(damage=damage), tempfile.TemporaryDirectory() as raw:
+                root = Path(raw)
+                config_root = root / "config"
+                installed = self._distribution(root, "installed", installed=True)
+                portable = self._distribution(root, "portable", installed=False)
+                installed_marker = hid_helper_consumers.register_current_consumer(
+                    config_root,
+                    frozen=True,
+                    executable=str(installed),
+                )
+                portable_marker = hid_helper_consumers.register_current_consumer(
+                    config_root,
+                    frozen=True,
+                    executable=str(portable),
+                )
+                assert installed_marker is not None
+                assert portable_marker is not None
+                portable_helper = (
+                    portable.parent
+                    / hid_elevation_windows.HELPER_BUNDLE_RELATIVE_PATH
+                )
+                if damage == "invalid_json":
+                    portable_marker.write_text("{broken", encoding="utf-8")
+                elif damage == "missing_helper":
+                    portable_helper.unlink()
+                else:
+                    portable_helper.write_bytes(b"tampered")
+                remove_helper = mock.Mock(
+                    return_value=hid_elevation_windows.HidHelperState(True)
+                )
+
+                state = hid_helper_consumers.uninstall_current_distribution(
+                    config_root,
+                    remove_helper,
+                    frozen=True,
+                    executable=str(installed),
+                )
+
+                self.assertEqual(
+                    state,
+                    hid_elevation_windows.HidHelperState(
+                        True, "helper_kept_for_unknown_consumer"
+                    ),
+                )
+                self.assertFalse(installed_marker.exists())
+                self.assertTrue(portable_marker.exists())
+                remove_helper.assert_not_called()
+
+    def test_distribution_uninstall_restores_marker_when_helper_removal_fails(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            config_root = root / "config"
+            installed = self._distribution(root, "installed", installed=True)
+            marker = hid_helper_consumers.register_current_consumer(
+                config_root, frozen=True, executable=str(installed)
+            )
+            assert marker is not None
+
+            state = hid_helper_consumers.uninstall_current_distribution(
+                config_root,
+                lambda: hid_elevation_windows.HidHelperState(
+                    False, "uac_cancelled"
+                ),
+                frozen=True,
+                executable=str(installed),
+            )
+
+            self.assertEqual(
+                state,
+                hid_elevation_windows.HidHelperState(False, "uac_cancelled"),
+            )
+            self.assertTrue(marker.is_file())
 
 
 if __name__ == "__main__":

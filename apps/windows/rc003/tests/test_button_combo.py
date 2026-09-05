@@ -5,7 +5,8 @@ from ovb_rc003.button_combo import ButtonComboRecognizer, ComboCommand
 
 class ButtonComboRecognizerTests(unittest.TestCase):
     def setUp(self):
-        self.recognizer = ButtonComboRecognizer()
+        self.now = 100.0
+        self.recognizer = ButtonComboRecognizer(clock=lambda: self.now)
         self.configured = frozenset({"up", "ok"})
 
     def press(self, button_id):
@@ -77,6 +78,38 @@ class ButtonComboRecognizerTests(unittest.TestCase):
             self.recognizer.release("tv"),
             [ComboCommand.forward_release("tv")],
         )
+
+    def test_cancel_unrelated_button_preserves_active_combo(self):
+        self.press("tv")
+
+        self.assertEqual(self.recognizer.cancel_buttons({"right"}), set())
+        self.assertTrue(self.recognizer.has_active_combo())
+
+    def test_cancel_combo_participant_returns_and_clears_the_whole_combo(self):
+        self.press("tv")
+        self.assertEqual(self.press("up"), [ComboCommand.trigger("up")])
+
+        self.assertEqual(
+            self.recognizer.cancel_buttons({"up"}),
+            {"tv", "up"},
+        )
+        self.assertFalse(self.recognizer.has_active_combo())
+
+    def test_lost_modifier_release_expires_before_the_next_button_press(self):
+        self.press("tv")
+        self.now += ButtonComboRecognizer.MAX_HOLD_SECONDS + 0.1
+
+        self.assertEqual(self.press("up"), [ComboCommand.forward_press("up")])
+        self.assertFalse(self.recognizer.has_active_combo())
+
+    def test_lost_consumed_release_expires_before_the_next_button_press(self):
+        self.press("tv")
+        self.assertEqual(self.press("up"), [ComboCommand.trigger("up")])
+        self.recognizer.release("tv")
+        self.now += ButtonComboRecognizer.MAX_HOLD_SECONDS + 0.1
+
+        self.assertEqual(self.press("up"), [ComboCommand.forward_press("up")])
+        self.assertFalse(self.recognizer.has_active_combo())
 
 
 if __name__ == "__main__":

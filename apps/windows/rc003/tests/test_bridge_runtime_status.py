@@ -27,6 +27,7 @@ class BridgeRuntimeStatusTests(unittest.TestCase):
             identity=identity,
             raw_input_state="ready",
             hid_tap_state="unavailable",
+            voice_key_physicalizer_state="recovering",
             last_button_at=40.0,
             last_button_source="hid",
             voice_active=True,
@@ -40,6 +41,7 @@ class BridgeRuntimeStatusTests(unittest.TestCase):
         self.assertEqual(written.schema, bridge_runtime_status.SCHEMA_VERSION)
         self.assertEqual(written.runtime_id, identity.runtime_id)
         self.assertTrue(written.voice_active)
+        self.assertEqual(written.voice_key_physicalizer_state, "recovering")
         self.assertEqual(bridge_runtime_status.read_status(self.root), written)
 
     def test_publish_replaces_the_file_with_connected_state(self):
@@ -85,6 +87,34 @@ class BridgeRuntimeStatusTests(unittest.TestCase):
         self.assertEqual(status.schema, 1)
         self.assertEqual(status.runtime_id, "")
         self.assertFalse(status.voice_active)
+        self.assertEqual(status.voice_key_physicalizer_state, "unknown")
+
+    def test_existing_schema_two_status_defaults_new_channel_to_unknown(self):
+        path = bridge_runtime_status.status_path(self.root)
+        path.write_text(
+            json.dumps(
+                {
+                    "schema": bridge_runtime_status.SCHEMA_VERSION,
+                    "state": "connected",
+                    "pid": 1234,
+                    "updated_at": 42.5,
+                    "app_version": "old",
+                    "runtime_kind": "frozen",
+                    "package_name": "old-package",
+                    "runtime_id": "old-id",
+                    "raw_input_state": "ready",
+                    "hid_tap_state": "ready",
+                    "last_button_source": "",
+                    "voice_active": False,
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        status = bridge_runtime_status.read_status(self.root)
+
+        self.assertIsNotNone(status)
+        self.assertEqual(status.voice_key_physicalizer_state, "unknown")
 
     def test_runtime_identity_distinguishes_package_roots_without_exposing_them(self):
         first = bridge_runtime_status.current_runtime_identity(

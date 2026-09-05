@@ -295,7 +295,7 @@ ApplicationWindow {
         modal: true
         popupType: Popup.Item
         title: SettingsController.hidHelperCleanupPending
-            ? qsTr("完成权限清理？") : qsTr("启用方向改键？")
+            ? qsTr("完成权限清理？") : qsTr("启用按键映射？")
         standardButtons: Dialog.NoButton
         closePolicy: SettingsController.hidHelperRepairBusy
             ? Popup.NoAutoClose : Popup.CloseOnEscape
@@ -310,8 +310,8 @@ ApplicationWindow {
                 Layout.fillWidth: true
                 wrapMode: Text.WordWrap
                 text: SettingsController.hidHelperCleanupPending
-                    ? qsTr("方向改键已可用。确认管理员权限，清理旧组件。")
-                    : qsTr("确认一次管理员权限，之后普通启动和自启动都可用。")
+                    ? qsTr("自定义按键映射已可用。确认管理员权限，清理旧组件。")
+                    : qsTr("确认一次管理员权限，之后普通启动和自启动都可使用自定义按键映射。")
             }
 
             RowLayout {
@@ -347,7 +347,7 @@ ApplicationWindow {
         anchors.centerIn: parent
         modal: true
         popupType: Popup.Item
-        title: qsTr("移除方向改键权限？")
+        title: qsTr("移除按键映射权限？")
         standardButtons: Dialog.NoButton
         closePolicy: SettingsController.hidHelperRepairBusy
             ? Popup.NoAutoClose : Popup.CloseOnEscape
@@ -361,7 +361,7 @@ ApplicationWindow {
                 kind: bodyKind
                 Layout.fillWidth: true
                 wrapMode: Text.WordWrap
-                text: qsTr("移除后，本机所有无线麦版本都不能使用方向改键。")
+                text: qsTr("移除后，本机所有无线麦版本都不能使用自定义按键映射。")
             }
 
             RowLayout {

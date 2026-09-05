@@ -149,6 +149,18 @@ class HotkeyCaptureStateTests(unittest.TestCase):
             )
         )
 
+    def test_events_are_not_swallowed_after_stop_has_started(self):
+        recorder = hotkey_capture_windows.HotkeyCapture(lambda _chord: None)
+        recorder._stop_event.set()
+
+        self.assertFalse(
+            recorder._handle_event(
+                hotkey_capture_windows.WM_KEYDOWN,
+                self._event(0x26, 0x48),
+            )
+        )
+        self.assertEqual(recorder._pressed_tokens, set())
+
 
 class HotkeyCaptureLifecycleTests(unittest.TestCase):
     def test_start_timeout_retains_a_thread_that_did_not_stop(self):
