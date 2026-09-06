@@ -158,7 +158,7 @@ def open_configured_application(action: key_mapping.ButtonAction) -> bool:
 
 
 class RC003App:
-    def __init__(self) -> None:
+    def __init__(self, *, launch_voice_program_on_start: bool = True) -> None:
         self._config_root = config.config_root()
         self._config_path = config.config_path(self._config_root)
         self._config = config.load_config(self._config_path)
@@ -201,31 +201,39 @@ class RC003App:
             self._runtime_identity.runtime_kind,
             self._runtime_identity.package_name,
         )
-        try:
-            voice_program_result = (
-                voice_program_manager.launch_configured_at_bridge_start(self._config)
-            )
-        except Exception:
-            self._logger.exception(
-                "voice program: optional bridge-start launch failed unexpectedly"
-            )
-        else:
-            if voice_program_result.code not in {"not_requested", "disabled"}:
-                self._logger.info(
-                    "voice program: provider=%s launch_result=%s",
-                    voice_program_result.provider_id,
-                    voice_program_result.code,
+        if launch_voice_program_on_start:
+            try:
+                voice_program_result = (
+                    voice_program_manager.launch_configured_at_bridge_start(self._config)
                 )
-        configured_voice_program = (
-            voice_program_manager.normalize_voice_program_settings(
-                self._config.get("voice_program")
+            except Exception:
+                self._logger.exception(
+                    "voice program: optional bridge-start launch failed unexpectedly"
+                )
+            else:
+                if voice_program_result.code not in {"not_requested", "disabled"}:
+                    self._logger.info(
+                        "voice program: provider=%s launch_result=%s",
+                        voice_program_result.provider_id,
+                        voice_program_result.code,
+                    )
+            configured_voice_program = (
+                voice_program_manager.normalize_voice_program_settings(
+                    self._config.get("voice_program")
+                )
             )
-        )
-        if configured_voice_program["provider"] == voice_program_manager.VOICE_PROGRAM_SOGOU:
-            sogou_prewarm = voice_program_manager.prewarm_sogou_voice_component()
+            if (
+                configured_voice_program["provider"]
+                == voice_program_manager.VOICE_PROGRAM_SOGOU
+            ):
+                sogou_prewarm = voice_program_manager.prewarm_sogou_voice_component()
+                self._logger.info(
+                    "voice program: Sogou component prewarm=%s",
+                    sogou_prewarm.code,
+                )
+        else:
             self._logger.info(
-                "voice program: Sogou component prewarm=%s",
-                sogou_prewarm.code,
+                "voice program: startup launch and prewarm skipped during diagnostics recovery"
             )
         if self._removed_voice_bindings:
             self._logger.warning(
@@ -1233,6 +1241,20 @@ class RC003App:
                 sorted(affected_buttons),
             )
 
+    def _active_audio_owns_late_raw_mic(self) -> bool:
+        """Return whether ATVV audio already owns the current mic press."""
+
+        with self._voice_trigger_lock:
+            return (
+                self._voice_mic_gesture_active
+                and self._voice_mic_gesture_audio_started
+                and self._voice_audio_stream_active
+                and (
+                    self._voice.active
+                    or self._voice_hotkey_release_pending is not None
+                )
+            )
+
     def _on_raw_physical_event(
         self,
         event: raw_input_windows.RawInputEvent,
@@ -1348,23 +1370,33 @@ class RC003App:
             blocked_buttons = {tracked_logical}
             if tracked_physical is not None:
                 blocked_buttons.add(tracked_physical)
+            with self._direct_hid_lock:
+                direct_buttons = self._direct_buttons_for_usages(
+                    self._direct_hid_usages
+                )
+            raw_only_buttons = set(blocked_buttons) - direct_buttons
+            if (
+                "mic" in raw_only_buttons
+                and self._active_audio_owns_late_raw_mic()
+            ):
+                # AudioStarted can beat both the duplicated Windows F5 edge
+                # and the direct HID report. The active ATVV gesture remains
+                # authoritative until HID-up or AudioStopped closes it.
+                raw_only_buttons.discard("mic")
             newly_quarantined = was_new and not physical_was_blocked
             if newly_quarantined:
-                with self._direct_hid_lock:
-                    direct_buttons = self._direct_buttons_for_usages(
-                        self._direct_hid_usages
+                # A late Raw Input down is the Windows-side duplicate of a
+                # report already owned by direct HID. Quarantine only aliases
+                # that direct HID is not currently holding; the real HID up
+                # must remain the sole release edge for the active gesture.
+                if raw_only_buttons:
+                    self._cancel_input_gestures_for_buttons(
+                        raw_only_buttons,
+                        reason="late_raw_after_hid_handover",
+                        block_until_release=True,
                     )
-                cancellation_buttons = set(blocked_buttons)
-                if cancellation_buttons.intersection(direct_buttons):
-                    cancellation_buttons.update(direct_buttons)
-                    self._direct_hid_handover_waiting_for_neutral = True
-                self._cancel_input_gestures_for_buttons(
-                    cancellation_buttons,
-                    reason="late_raw_after_hid_handover",
-                    block_until_release=True,
-                )
             else:
-                self._block_input_until_release(blocked_buttons)
+                self._block_input_until_release(raw_only_buttons)
             if newly_quarantined and tracked_physical in _RAW_FALLBACK_KEY_TOKENS:
                 self._release_raw_fallback_keyups(
                     {tracked_physical},
@@ -4321,11 +4353,15 @@ async def _run(
     show_notification_icon: bool = True,
     on_runtime_ready=None,
     on_reconnect_ready=None,
+    launch_voice_program_on_start: bool = True,
 ) -> None:
-    app_factory = app_factory or RC003App
     tray_factory = tray_factory or bridge_tray_windows.BridgeTray
     settings_launcher = settings_launcher or bridge_launcher.launch_settings
-    app = app_factory()
+    app = (
+        RC003App(launch_voice_program_on_start=launch_voice_program_on_start)
+        if app_factory is None
+        else app_factory()
+    )
     loop = asyncio.get_running_loop()
     tray_exit_requested = threading.Event()
     run_task = asyncio.create_task(app.run_forever())
@@ -4399,12 +4435,14 @@ def main(
     show_notification_icon: bool = True,
     on_runtime_ready=None,
     on_reconnect_ready=None,
+    launch_voice_program_on_start: bool = True,
 ) -> None:
     asyncio.run(
         _run(
             show_notification_icon=show_notification_icon,
             on_runtime_ready=on_runtime_ready,
             on_reconnect_ready=on_reconnect_ready,
+            launch_voice_program_on_start=launch_voice_program_on_start,
         )
     )
 

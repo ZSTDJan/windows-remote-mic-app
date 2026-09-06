@@ -90,9 +90,7 @@ Item {
     }
 
     function hidTapReady() {
-        return valueIn(SettingsController.hidTapState, [
-            "attached_waiting_for_hid_io", "ready"
-        ])
+        return SettingsController.hidTapState === "ready"
     }
 
     function rawInputWaitsForRemote() {
@@ -168,7 +166,7 @@ Item {
                     return "checking"
                 return "ready"
             }
-            if (rawInputWaitsForRemote() && hidTapWaitsForFirstInput()) {
+            if (hidTapWaitsForFirstInput()) {
                 if (deviceCode === "unpaired")
                     return "unpaired"
                 if (deviceCode === "conflict")
@@ -226,18 +224,18 @@ Item {
         case "disabled": return qsTr("请启用改键")
         case "permission": return qsTr("请启用改键")
         case "version": return qsTr("请安装新版")
-        case "waiting_remote": return qsTr("待唤醒")
-        case "waiting_input": return qsTr("请按遥控器")
+        case "waiting_remote": return qsTr("请按方向键")
+        case "waiting_input": return qsTr("请按方向键")
         case "unpaired": return qsTr("未配对")
         case "conflict": return qsTr("多设备")
         case "ready": return qsTr("正常")
         case "detected": return qsTr("已找到")
-        case "custom_only": return qsTr("请重新连接")
-        case "original_only": return qsTr("请重新连接")
-        case "voice_error": return qsTr("请重新连接")
+        case "custom_only": return qsTr("请重启服务")
+        case "original_only": return qsTr("请重启服务")
+        case "voice_error": return qsTr("请重启服务")
         case "system_error": return qsTr("请升级系统")
         case "error": return SettingsController.bridgeRunning
-            ? qsTr("请重新连接") : qsTr("请重新检查")
+            ? qsTr("请重启服务") : qsTr("请重新检查")
         default: return qsTr("未检查")
         }
     }
@@ -261,7 +259,7 @@ Item {
         if (SettingsController.bridgeLaunchBusy)
             return qsTr("启动中")
         if (bridgeNeedsRestartAction())
-            return qsTr("请重新连接")
+            return qsTr("请重启服务")
         const receiverCode = buttonReceiverStateCode()
         if (SettingsController.bridgeConnected) {
             if (receiverCode === "checking")
@@ -270,9 +268,9 @@ Item {
         }
         if (SettingsController.bridgeRunning) {
             if (receiverCode === "waiting_remote")
-                return qsTr("待唤醒")
+                return qsTr("请按方向键")
             if (receiverCode === "waiting_input")
-                return qsTr("请按遥控器")
+                return qsTr("请按方向键")
             if (receiverCode === "unpaired" || receiverCode === "conflict")
                 return qsTr("未连接")
             if (bridgeReconnectActionAvailable())
@@ -326,6 +324,8 @@ Item {
             return qsTr("启动中…")
         if (!SettingsController.bridgeRunning)
             return qsTr("启动服务")
+        if (bridgeNeedsRestartAction())
+            return qsTr("重启服务")
         return qsTr("重新连接")
     }
 
@@ -567,7 +567,7 @@ Item {
                 SettingsListRow {
                     objectName: "launchBridgeOnAppStartRow"
                     tokens: root.tokens
-                    titleText: qsTr("启动程序时自动启动桥接")
+                    titleText: qsTr("启动程序时自动运行服务")
                     descriptionText: qsTr("自动连接遥控器")
 
                     CompactSwitch {
@@ -575,7 +575,7 @@ Item {
                         objectName: "launchBridgeOnAppStartSwitch"
                         tokens: root.tokens
                         checked: SettingsController.launchBridgeOnAppStart
-                        Accessible.name: qsTr("启动程序时自动启动桥接")
+                        Accessible.name: qsTr("启动程序时自动运行遥控器服务")
                         onToggled: {
                             if (checked !== SettingsController.launchBridgeOnAppStart)
                                 SettingsController.setLaunchBridgeOnAppStart(checked)

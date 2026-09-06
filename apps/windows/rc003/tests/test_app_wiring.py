@@ -2503,7 +2503,7 @@ class OrdinaryButtonGestureWiringTests(_AppWiringTestCase):
 
         press.assert_called_once_with("up")
 
-    def test_late_raw_down_cancels_an_active_direct_gesture_before_quarantine(self):
+    def test_late_raw_down_preserves_the_active_direct_gesture_until_hid_up(self):
         self.app._direct_hid_interception_ready = False
         self.app._direct_hid_interception_armed = False
         usage = next(
@@ -2553,15 +2553,98 @@ class OrdinaryButtonGestureWiringTests(_AppWiringTestCase):
         ):
             self.app._on_direct_hid_report(1, direct_down)
             self.app._on_raw_physical_event(raw_down)
+            self.app._on_raw_physical_event(raw_down)
             self.app._on_direct_hid_report(1, direct_neutral)
             self.assertEqual(self.app._input_rearm_blocked_buttons, set())
             self.app._on_direct_hid_report(1, direct_down)
 
         self.assertEqual(press.call_args_list, [mock.call("up"), mock.call("up")])
-        release.assert_not_called()
-        cancel_buttons.assert_called_once_with({"ok", "up"})
+        release.assert_called_once_with("up")
+        cancel_buttons.assert_called_once_with({"ok"})
         release_keys.assert_called_once_with(("up",))
         self.assertFalse(self.app._direct_hid_handover_waiting_for_neutral)
+
+    def test_late_raw_mic_duplicate_does_not_release_the_active_voice_hold(self):
+        mic_usage = next(
+            usage
+            for usage, button_id in frida_compat.TAP_USAGE_TO_BUTTON.items()
+            if button_id == "mic"
+        )
+        raw_down = raw_input_windows.RawInputEvent(
+            source="keyboard",
+            is_pressed=True,
+            button_id="mic",
+            windows_button_id="f5",
+            vkey=0x74,
+            make_code=0x3F,
+            flags=0,
+            message=0x0100,
+        )
+        direct_down = mic_usage.to_bytes(2, "little") + b"\x00\x00\x00\x00"
+
+        with mock.patch.object(
+            win32_input, "send_voice_key_combo_down"
+        ) as voice_down, mock.patch.object(
+            win32_input, "send_voice_key_combo_up"
+        ) as voice_up:
+            self.app._on_direct_hid_report(1, direct_down)
+            self.assertTrue(self.app._voice.active)
+
+            self.app._on_raw_physical_event(raw_down)
+            self.app._on_raw_physical_event(raw_down)
+
+            self.assertTrue(self.app._voice.active)
+            voice_up.assert_not_called()
+            self.app._on_direct_hid_report(1, b"\x00" * 6)
+
+        voice_down.assert_called_once()
+        voice_up.assert_called_once()
+
+    def test_audio_started_voice_hold_survives_raw_before_direct_hid(self):
+        mic_usage = next(
+            usage
+            for usage, button_id in frida_compat.TAP_USAGE_TO_BUTTON.items()
+            if button_id == "mic"
+        )
+        raw_down = raw_input_windows.RawInputEvent(
+            source="keyboard",
+            is_pressed=True,
+            button_id="mic",
+            windows_button_id="f5",
+            vkey=0x74,
+            make_code=0x3F,
+            flags=0,
+            message=0x0100,
+        )
+        direct_down = mic_usage.to_bytes(2, "little") + b"\x00\x00\x00\x00"
+
+        with mock.patch.object(
+            win32_input, "send_voice_key_combo_down"
+        ) as voice_down, mock.patch.object(
+            win32_input, "send_voice_key_combo_up"
+        ) as voice_up:
+            self.app._on_control_event(AudioStarted(session_id=1))
+            self.assertTrue(self.app._voice.active)
+            self.assertTrue(self.app._voice_pcm_forwarding_enabled)
+
+            self.app._on_raw_physical_event(raw_down)
+            self.assertTrue(self.app._voice.active)
+            self.assertTrue(self.app._voice_pcm_forwarding_enabled)
+            voice_up.assert_not_called()
+
+            self.app._on_direct_hid_report(1, direct_down)
+            self.assertIn("hid_tap", self.app._voice_mic_gesture_sources_down)
+            self.app._on_pcm_frame([1, 2, 3])
+            self.assertTrue(self.app._playback_writer.flush(1.0).completed)
+            self.assertEqual(self.app._playback.write_calls, [(1, 2, 3)])
+
+            self.app._on_direct_hid_report(1, b"\x00" * 6)
+            self.assertFalse(self.app._voice.active)
+            self.assertFalse(self.app._voice_pcm_forwarding_enabled)
+            self.app._on_control_event(AudioStopped())
+
+        voice_down.assert_called_once()
+        voice_up.assert_called_once()
 
     def test_late_raw_for_other_button_does_not_cancel_active_direct_hold(self):
         up_usage = next(
@@ -2611,7 +2694,7 @@ class OrdinaryButtonGestureWiringTests(_AppWiringTestCase):
         self.assertEqual(self.app._input_rearm_blocked_buttons, {"right"})
         self.assertFalse(self.app._direct_hid_handover_waiting_for_neutral)
 
-    def test_late_raw_for_active_direct_key_waits_for_full_neutral(self):
+    def test_late_raw_for_active_direct_key_keeps_following_hid_edges_live(self):
         usages = {
             button_id: usage
             for usage, button_id in frida_compat.TAP_USAGE_TO_BUTTON.items()
@@ -2634,10 +2717,10 @@ class OrdinaryButtonGestureWiringTests(_AppWiringTestCase):
         with mock.patch.object(win32_input, "send_key_combo_up"):
             self.app._on_raw_physical_event(raw_up)
 
-        self.assertTrue(self.app._direct_hid_handover_waiting_for_neutral)
+        self.assertFalse(self.app._direct_hid_handover_waiting_for_neutral)
         self.assertEqual(
             self.app._input_rearm_blocked_buttons,
-            {"ok", "tv", "up"},
+            {"ok"},
         )
         tv_right_report = (
             usages["tv"].to_bytes(2, "little")
@@ -2646,12 +2729,15 @@ class OrdinaryButtonGestureWiringTests(_AppWiringTestCase):
         )
         with mock.patch.object(self.app, "_on_button_event") as button_event:
             self.app._on_direct_hid_report(1, tv_right_report)
-        button_event.assert_not_called()
-        self.assertTrue(self.app._direct_hid_handover_waiting_for_neutral)
         self.assertEqual(
-            self.app._input_rearm_blocked_buttons,
-            {"ok", "tv", "up", "right"},
+            button_event.call_args_list,
+            [
+                mock.call("up", False, event_source="hid_tap"),
+                mock.call("right", True, event_source="hid_tap"),
+            ],
         )
+        self.assertFalse(self.app._direct_hid_handover_waiting_for_neutral)
+        self.assertEqual(self.app._input_rearm_blocked_buttons, set())
 
         self.app._on_direct_hid_report(1, b"\x00" * 6)
 

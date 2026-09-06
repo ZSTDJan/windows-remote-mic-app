@@ -590,7 +590,7 @@ def default_display_state() -> DefaultDisplayState:
 # "RC003 已连接"/"RC003 connected" - only as the process itself still being
 # alive. The settings controller continues polling the runtime status and
 # promotes the UI to the connected state only after the bridge reports it.
-LAUNCH_NOT_STARTED_TEXT = "服务未运行；点击“启动桥接”后，按键和语音才会生效"
+LAUNCH_NOT_STARTED_TEXT = "服务未运行；点击“启动服务”后，按键和语音才会生效"
 LAUNCH_ALREADY_RUNNING_TEXT = (
     f"服务已在运行；正在检查{device_catalog.RC003_DISPLAY_NAME}的连接"
 )

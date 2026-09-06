@@ -6,6 +6,8 @@ import OvbRc003Settings 1.0
 
 Item {
     id: root
+    signal openDeviceRequested()
+    signal openButtonsRequested()
     property var tokens
     property var backTabTarget: null
     property var tabTarget: null
@@ -13,6 +15,7 @@ Item {
     readonly property var lastFocusItem: trySpeakingButton
     property bool voiceHotkeyRecording: false
     property string voiceHotkeyCaptureError: ""
+    property string pendingVoiceHotkey: ""
     readonly property int settingsStateColumnWidth: 54
     readonly property int settingsActionColumnWidth: 84
     readonly property real voiceHotkeyEditorWidth:
@@ -81,14 +84,20 @@ Item {
             return qsTr("正常")
         if (row.status === "manual")
             return qsTr("待实测")
-        return qsTr("需处理")
+        if (checkId === "vb_cable_endpoints")
+            return String(row.detail || "").indexOf(qsTr("缺少")) >= 0
+                ? qsTr("请安装") : qsTr("请重试")
+        if (checkId === "output_endpoint")
+            return qsTr("请重选")
+        return qsTr("请重试")
     }
 
     function checkColor(checkId) {
         const state = checkState(checkId)
         if (state === qsTr("正常"))
             return tokens.successColor
-        if (state === qsTr("需处理"))
+        if (state === qsTr("请安装") || state === qsTr("请重选")
+                || state === qsTr("请重试"))
             return tokens.errorColor
         if (state === qsTr("检查中") || state === qsTr("待实测"))
             return tokens.voiceAccent
@@ -99,6 +108,206 @@ Item {
         const row = checkResult(checkId)
         return row && String(row.detail).length > 0
             ? String(row.detail).trim().replace(/[。；;]+$/, "") : fallback
+    }
+
+    function actualSpeechStateCode() {
+        if (root.configurationWriteBusy || root.voiceHotkeyBusy
+                || SettingsController.inputCaptureInUse
+                || SettingsController.hidHelperRepairBusy
+                || SettingsController.bridgeReconnectBusy
+                || DiagnosticsController.isRefreshing)
+            return "busy"
+        if (SettingsController.hidHelperIssueVisible)
+            return "enable_mapping"
+        if (!SettingsController.bridgeRunning)
+            return "start_service"
+        if (SettingsController.bridgeRestartRecommended)
+            return "restart_service"
+        if (!SettingsController.bridgeConnected)
+            return "connect_remote"
+        const hidState = String(SettingsController.hidTapState)
+        if (hidState === "attached_waiting_for_hid_io"
+                || hidState === "waiting_for_rc003_host"
+                || hidState === "waiting_for_gadget_connection")
+            return "connect_remote"
+        if (hidState === "unknown" || hidState === "verified_not_started"
+                || hidState === "starting" || hidState === "injecting")
+            return "busy"
+        if (hidState !== "ready")
+            return "restart_service"
+        const physicalizerState = String(
+            SettingsController.voiceKeyPhysicalizerState
+        )
+        if (physicalizerState === "unknown"
+                || physicalizerState === "starting"
+                || physicalizerState === "recovering")
+            return "busy"
+        if (physicalizerState !== "ready")
+            return "restart_service"
+        if (SettingsController.voiceHotkeySaveState === "retry"
+                || String(SettingsController.holdVoiceHotkeyText).trim().length === 0)
+            return "record_hotkey"
+        const cableCheck = root.checkResult("vb_cable_endpoints")
+        const outputCheck = root.checkResult("output_endpoint")
+        if (!cableCheck || !outputCheck)
+            return "run_checks"
+        if (String(cableCheck.status) !== "pass") {
+            return String(cableCheck.detail || "").indexOf(qsTr("缺少")) >= 0
+                ? "install_audio" : "check_audio"
+        }
+        if (SettingsController.selectedEndpointIndex < 0
+                || String(outputCheck.status) !== "pass")
+            return "apply_output"
+        if (!SettingsController.voiceMappingReady)
+            return "configure_mapping"
+        if (root.voiceProgramManaged) {
+            const programCode = SettingsController.voiceProgramStatusCode
+            if (programCode === "unknown")
+                return "busy"
+            if (programCode === "not_found")
+                return root.customProgramSelected
+                    ? "select_program" : "install_program"
+            if (!root.voiceProgramSystemManaged && programCode === "stopped")
+                return "start_program"
+            if (programCode === "running_not_ready")
+                return "restart_program"
+            if (root.voiceProgramPrivilegeUnknown
+                    || root.voiceProgramPrivilegeMismatch)
+                return "restart_program"
+        }
+        return "ready"
+    }
+
+    function actualSpeechDescription() {
+        const code = actualSpeechStateCode()
+        if (code === "busy")
+            return qsTr("当前操作完成后再试")
+        if (code === "enable_mapping")
+            return qsTr("先到设备页启用改键")
+        if (code === "start_service")
+            return qsTr("先到设备页启动服务")
+        if (code === "restart_service")
+            return qsTr("先到设备页重启服务")
+        if (code === "connect_remote")
+            return qsTr("先按一下遥控器方向键")
+        if (code === "record_hotkey")
+            return qsTr("先重新录入语音按键")
+        if (code === "run_checks")
+            return qsTr("先重新检查音频配置")
+        if (code === "install_audio")
+            return qsTr("先安装虚拟音频并重启电脑")
+        if (code === "check_audio")
+            return qsTr("先重新检查虚拟音频")
+        if (code === "apply_output")
+            return qsTr("先应用 CABLE Input 输出端点")
+        if (code === "configure_mapping")
+            return qsTr("先把话筒键设为“按住说话”并保存")
+        if (code === "select_program")
+            return qsTr("先在上方选择语音程序")
+        if (code === "install_program")
+            return qsTr("先在上方安装语音程序")
+        if (code === "start_program")
+            return qsTr("点击右侧启动语音程序")
+        if (code === "restart_program")
+            return qsTr("先完全退出语音程序，再点右侧重新检测")
+        return qsTr("在输入框中验证语音文字")
+    }
+
+    function actualSpeechStateText() {
+        const code = actualSpeechStateCode()
+        if (code === "busy")
+            return qsTr("请稍候")
+        if (code === "enable_mapping")
+            return qsTr("请启用改键")
+        if (code === "start_service")
+            return qsTr("请启动服务")
+        if (code === "restart_service")
+            return qsTr("请重启服务")
+        if (code === "connect_remote")
+            return qsTr("请按方向键")
+        if (code === "record_hotkey")
+            return qsTr("请录入")
+        if (code === "run_checks" || code === "check_audio")
+            return qsTr("请检查")
+        if (code === "install_audio")
+            return qsTr("请装音频")
+        if (code === "apply_output")
+            return qsTr("请应用")
+        if (code === "configure_mapping")
+            return qsTr("请改映射")
+        if (code === "select_program")
+            return qsTr("请选择程序")
+        if (code === "install_program")
+            return qsTr("请安装程序")
+        if (code === "start_program")
+            return qsTr("请启动程序")
+        if (code === "restart_program")
+            return qsTr("请退出程序")
+        return qsTr("待实测")
+    }
+
+    function actualSpeechActionText() {
+        const code = actualSpeechStateCode()
+        if (code === "enable_mapping" || code === "start_service"
+                || code === "restart_service")
+            return qsTr("打开设备")
+        if (code === "record_hotkey")
+            return qsTr("重新录入")
+        if (code === "run_checks" || code === "check_audio")
+            return qsTr("重新检查")
+        if (code === "install_audio")
+            return qsTr("安装音频")
+        if (code === "apply_output")
+            return qsTr("应用端点")
+        if (code === "configure_mapping")
+            return qsTr("设置按键")
+        if (code === "select_program")
+            return qsTr("选择程序")
+        if (code === "install_program")
+            return qsTr("打开设置")
+        if (code === "start_program")
+            return qsTr("启动程序")
+        if (code === "restart_program")
+            return qsTr("重新检测")
+        return qsTr("试说一句")
+    }
+
+    function actualSpeechActionEnabled() {
+        const code = actualSpeechStateCode()
+        return code === "ready" || code === "enable_mapping"
+            || code === "start_service" || code === "restart_service"
+            || code === "record_hotkey" || code === "run_checks"
+            || code === "check_audio" || code === "install_audio"
+            || code === "apply_output" || code === "configure_mapping"
+            || code === "select_program" || code === "install_program"
+            || code === "start_program" || code === "restart_program"
+    }
+
+    function runActualSpeechAction() {
+        const code = actualSpeechStateCode()
+        if (code === "ready")
+            speakTestDialog.open()
+        else if (code === "enable_mapping" || code === "start_service"
+                || code === "restart_service")
+            root.openDeviceRequested()
+        else if (code === "record_hotkey")
+            root.startVoiceHotkeyCapture()
+        else if (code === "run_checks" || code === "check_audio")
+            DiagnosticsController.refreshDiagnostics()
+        else if (code === "install_audio")
+            driverConfirmDialog.open()
+        else if (code === "apply_output")
+            DiagnosticsController.selectDetectedCableInputAsOutput()
+        else if (code === "configure_mapping")
+            root.openButtonsRequested()
+        else if (code === "select_program")
+            voiceProgramFileDialog.open()
+        else if (code === "install_program")
+            SettingsController.openVoiceProgramSettings()
+        else if (code === "start_program")
+            SettingsController.launchVoiceProgram()
+        else if (code === "restart_program")
+            SettingsController.refreshVoiceProgramStatus()
     }
 
     function voiceProgramStatusSummary() {
@@ -177,12 +386,17 @@ Item {
             return
         }
         voiceHotkeyCaptureError = ""
+        pendingVoiceHotkey = ""
+        if (!SettingsController.startHotkeyCapture()) {
+            voiceHotkeyCaptureError = qsTr("无法开始录入，请结束其它按键操作后重试")
+            return
+        }
         voiceHotkeyRecording = true
-        SettingsController.startHotkeyCapture()
         voiceHotkeyField.forceActiveFocus()
     }
 
     function stopVoiceHotkeyCapture() {
+        pendingVoiceHotkey = ""
         if (!voiceHotkeyRecording)
             return true
         if (!SettingsController.stopHotkeyCapture()) {
@@ -195,8 +409,30 @@ Item {
     }
 
     function settleInputUiAfterStop() {
-        if (!SettingsController.hotkeyCaptureActive)
+        if (!SettingsController.hotkeyCaptureActive) {
             voiceHotkeyRecording = false
+            pendingVoiceHotkey = ""
+        }
+    }
+
+    function finishCapturedVoiceHotkey(chord) {
+        pendingVoiceHotkey = chord
+        if (!SettingsController.stopHotkeyCapture()) {
+            pendingVoiceHotkey = ""
+            voiceHotkeyCaptureError = qsTr("无法停止快捷键录入，请重试")
+            return
+        }
+        if (!SettingsController.hotkeyCaptureActive)
+            commitCapturedVoiceHotkey()
+    }
+
+    function commitCapturedVoiceHotkey() {
+        if (pendingVoiceHotkey.length === 0)
+            return
+        const chord = pendingVoiceHotkey
+        pendingVoiceHotkey = ""
+        voiceHotkeyRecording = false
+        SettingsController.holdVoiceHotkeyText = chord
     }
 
     FileDialog {
@@ -316,6 +552,15 @@ Item {
                 elide: Text.ElideRight
             }
 
+            UiLabel {
+                objectName: "actualSpeechInstruction"
+                tokens: root.tokens
+                kind: noteKind
+                Layout.fillWidth: true
+                wrapMode: Text.WordWrap
+                text: qsTr("保持光标在输入框中，按住遥控器话筒键说话，松开后查看文字。")
+            }
+
             ScrollView {
                 id: speakTestInputFrame
                 objectName: "speakTestInputFrame"
@@ -364,18 +609,21 @@ Item {
         function onHotkeyCaptured(chord) {
             if (!root.voiceHotkeyRecording)
                 return
-            SettingsController.holdVoiceHotkeyText = chord
-            root.stopVoiceHotkeyCapture()
+            root.finishCapturedVoiceHotkey(chord)
         }
         function onHotkeyCaptureError(message) {
             if (!root.voiceHotkeyRecording)
                 return
+            root.pendingVoiceHotkey = ""
             root.voiceHotkeyCaptureError = message
         }
         function onHotkeyCaptureActiveChanged() {
             if (root.voiceHotkeyRecording
                     && !SettingsController.hotkeyCaptureActive) {
-                root.voiceHotkeyRecording = false
+                if (root.pendingVoiceHotkey.length > 0)
+                    root.commitCapturedVoiceHotkey()
+                else
+                    root.voiceHotkeyRecording = false
             }
         }
     }
@@ -446,11 +694,16 @@ Item {
                                     qsTr("检测并选择 CABLE Input")
                                 )
                     stateText: DiagnosticsController.driverErrorMessage.length > 0
-                        ? qsTr("需处理")
+                        ? qsTr("请重试")
                         : DiagnosticsController.driverStatusMessage.length > 0
                             ? qsTr("正常")
                             : DiagnosticsController.driverInfoMessage.length > 0
-                                ? qsTr("待完成")
+                                ? (DiagnosticsController.driverInfoMessage.indexOf(
+                                    qsTr("正在")) >= 0
+                                    ? qsTr("处理中")
+                                    : DiagnosticsController.driverInfoMessage.indexOf(
+                                        qsTr("重启电脑")) >= 0
+                                        ? qsTr("重启电脑") : qsTr("请重试"))
                                 : root.checkState("vb_cable_endpoints")
                     stateColor: DiagnosticsController.driverErrorMessage.length > 0
                         ? tokens.errorColor
@@ -639,9 +892,15 @@ Item {
                         : root.voiceHotkeyDescription()
                     stateText: root.voiceHotkeyRecording
                         ? qsTr("录入中")
-                        : root.voiceHotkeyBusy ? qsTr("处理中") : qsTr("已保存")
+                        : root.voiceHotkeyBusy ? qsTr("处理中")
+                            : root.voiceHotkeyCaptureError.length > 0
+                                || SettingsController.voiceHotkeySaveState === "retry"
+                                ? qsTr("请重试") : qsTr("已保存")
                     stateColor: root.voiceHotkeyRecording || root.voiceHotkeyBusy
-                        ? tokens.voiceAccent : tokens.successColor
+                        ? tokens.voiceAccent
+                        : root.voiceHotkeyCaptureError.length > 0
+                            || SettingsController.voiceHotkeySaveState === "retry"
+                            ? tokens.errorColor : tokens.successColor
 
                     editorData: [
                         CompactTextField {
@@ -782,10 +1041,13 @@ Item {
                     stateColumnWidth: root.settingsStateColumnWidth
                     actionColumnWidth: root.settingsActionColumnWidth
                     titleText: qsTr("实际说话")
-                    descriptionText: qsTr("在输入框中验证语音文字")
+                    descriptionText: root.actualSpeechDescription()
                     descriptionObjectName: "actualSpeechTestDescription"
-                    stateText: qsTr("待实测")
-                    stateColor: tokens.voiceAccent
+                    stateText: root.actualSpeechStateText()
+                    stateColor: root.actualSpeechStateCode() === "ready"
+                            || root.actualSpeechStateCode() === "busy"
+                            || root.actualSpeechStateCode() === "connect_remote"
+                        ? tokens.voiceAccent : tokens.errorColor
                     showDivider: false
 
                     CompactButton {
@@ -793,9 +1055,10 @@ Item {
                         objectName: "trySpeakingButton"
                         tokens: root.tokens
                         Layout.fillWidth: true
-                        text: qsTr("试说一句")
+                        text: root.actualSpeechActionText()
                         highlighted: true
-                        onClicked: speakTestDialog.open()
+                        enabled: root.actualSpeechActionEnabled()
+                        onClicked: root.runActualSpeechAction()
                         KeyNavigation.tab: root.tabTarget
                     }
                 }

@@ -2110,6 +2110,7 @@ class SettingsControllerTests(unittest.TestCase):
 
         self.assertEqual(controller.holdVoiceHotkeyText, previous)
         self.assertIn("Sogou rejected", controller.errorMessage)
+        self.assertEqual(controller.voiceHotkeySaveState, "retry")
 
     def test_reentering_the_current_provider_refreshes_its_shortcut(self):
         controller, _ = self._make_controller()
@@ -2131,6 +2132,7 @@ class SettingsControllerTests(unittest.TestCase):
 
         self._voice_hotkey_sync_mock.assert_called_once_with("sogou", current)
         self.assertFalse(controller.voiceHotkeyBusy)
+        self.assertEqual(controller.voiceHotkeySaveState, "saved")
 
     def test_provider_sync_exception_keeps_the_saved_shortcut_and_clears_busy(self):
         controller, _ = self._make_controller()
@@ -2143,6 +2145,7 @@ class SettingsControllerTests(unittest.TestCase):
         self.assertEqual(controller.holdVoiceHotkeyText, previous)
         self.assertFalse(controller.voiceHotkeyBusy)
         self.assertIn("provider unavailable", controller.errorMessage)
+        self.assertEqual(controller.voiceHotkeySaveState, "retry")
 
     def test_failed_provider_value_adoption_restores_the_saved_display(self):
         controller, _ = self._make_controller()
@@ -2267,6 +2270,7 @@ class SettingsControllerTests(unittest.TestCase):
             saved["voice_hotkeys_by_provider"]["sogou"]["hold"],
             "lctrl+lshift+f9",
         )
+        self.assertEqual(controller.voiceHotkeySaveState, "saved")
 
     def test_refreshing_local_only_provider_does_not_leave_processing_status(self):
         controller, _ = self._make_controller()
@@ -2553,6 +2557,23 @@ class SettingsControllerTests(unittest.TestCase):
 
         self.assertEqual(controller.holdVoiceHotkeyText, "ralt")
 
+    def test_voice_mapping_ready_reads_only_the_saved_mic_mapping(self):
+        controller, _ = self._make_controller()
+
+        self.assertTrue(controller.voiceMappingReady)
+
+        controller._bindings["bindings"]["mic"] = key_mapping.ButtonAction(
+            key_mapping.ActionKind.ESCAPE
+        ).to_dict()
+        controller.voiceMappingReadyChanged.emit()
+
+        self.assertFalse(controller.voiceMappingReady)
+
+        controller._bindings["bindings"]["mic"] = {"kind": "broken"}
+        controller.voiceMappingReadyChanged.emit()
+
+        self.assertFalse(controller.voiceMappingReady)
+
     def test_only_mic_primary_options_include_hold_to_talk(self):
         controller, _ = self._make_controller()
         self.assertNotIn(settings_ui._VOICE_HOLD_DISPLAY, controller.primaryActionOptions)
@@ -2668,7 +2689,9 @@ class SettingsControllerTests(unittest.TestCase):
         controller.hotkeyCaptured.connect(captured.append)
         controller._hotkey_capture = object()
         controller._set_input_operation_state("hotkey", "active")
-        controller._on_hotkey_capture_result("lctrl+lwin")
+        controller._on_hotkey_capture_result(
+            (controller._input_operation_token, "lctrl+lwin")
+        )
         self.assertEqual(captured, ["lctrl+lwin"])
         controller.hotkeyText = "lctrl+lwin"
         self.assertEqual(controller.hotkeyText, "lctrl+lwin")
@@ -2702,9 +2725,55 @@ class SettingsControllerTests(unittest.TestCase):
                 else:
                     controller._application_exit_intent.set()
 
-                controller._on_hotkey_capture_result("ctrl+alt+n")
+                controller._on_hotkey_capture_result(
+                    (controller._input_operation_token, "ctrl+alt+n")
+                )
 
                 self.assertEqual(captured, [])
+
+    def test_hotkey_captured_during_start_is_delivered_after_hook_start_finishes(self):
+        controller, _ = self._make_controller()
+        captured = []
+
+        class ImmediateCapture:
+            def __init__(self, callback):
+                self._callback = callback
+                self.is_running = False
+
+            def start(self):
+                self._callback("lctrl+lshift+f8")
+
+            def stop(self):
+                self.is_running = False
+
+        def on_captured(chord):
+            captured.append(chord)
+            controller.stopHotkeyCapture()
+
+        controller.hotkeyCaptured.connect(on_captured)
+        with mock.patch.object(
+            qt_settings_app.hotkey_capture_windows,
+            "HotkeyCapture",
+            ImmediateCapture,
+        ):
+            controller.startHotkeyCapture()
+
+        self.assertEqual(captured, ["lctrl+lshift+f8"])
+        self.assertFalse(controller.hotkeyCaptureActive)
+        self.assertIsNone(controller._hotkey_capture)
+        self.assertIsNone(controller._pending_hotkey_capture_result)
+
+    def test_hotkey_result_from_an_older_operation_is_ignored(self):
+        controller, _ = self._make_controller()
+        captured = []
+        controller.hotkeyCaptured.connect(captured.append)
+        controller._input_operation_token = 4
+        controller._hotkey_capture = object()
+        controller._set_input_operation_state("hotkey", "active")
+
+        controller._on_hotkey_capture_result((3, "ctrl+alt+n"))
+
+        self.assertEqual(captured, [])
 
     def test_launch_status_starts_as_the_not_started_constant(self):
         controller, _ = self._make_controller()
@@ -3026,7 +3095,7 @@ class SettingsControllerTests(unittest.TestCase):
 
         self.assertFalse(controller.bridgeRunning)
         self.assertFalse(controller.bridgeReconnectAvailable)
-        self.assertIn("启动桥接", controller.errorMessage)
+        self.assertIn("启动服务", controller.errorMessage)
         self.assertNotIn("重新启动", controller.errorMessage)
 
     def test_immediate_reconnect_delivery_failure_asks_to_retry_later(self):
@@ -4705,7 +4774,7 @@ class SettingsControllerTests(unittest.TestCase):
 
         self.assertTrue(controller.bridgeRunning)
         self.assertEqual(controller.bridgeLaunchPhase, "waiting")
-        self.assertIn("桥接不受影响", controller.errorMessage)
+        self.assertIn("遥控器服务不受影响", controller.errorMessage)
 
     def test_external_bridge_winning_launch_race_gets_one_automatic_handoff(self):
         controller, _ = self._make_controller()
@@ -4768,6 +4837,119 @@ class SettingsControllerTests(unittest.TestCase):
         self.assertEqual(poll_launch.call_count, 2)
         self.assertEqual(controller.bridgeLaunchPhase, "waiting")
         self.assertFalse(controller.bridgeLaunchBusy)
+
+    def test_new_bridge_ignores_a_stopped_bridge_status_file(self):
+        controller, _ = self._make_controller()
+        bridge_runtime_status.publish_status(
+            controller._config_root,
+            bridge_runtime_status.BridgeConnectionState.CONNECTED,
+            pid=9876,
+            identity=controller._current_runtime_identity,
+            raw_input_state="ready",
+            hid_tap_state=frida_compat.HidTapState.READY.value,
+            voice_key_physicalizer_state="ready",
+        )
+        started = bridge_launcher.LaunchResult(
+            outcome=bridge_launcher.LaunchOutcome.STARTED,
+            command=("in-process",),
+            pid=os.getpid(),
+        )
+        controller._set_bridge_launch_phase("starting")
+
+        with mock.patch.object(
+            bridge_launcher,
+            "in_process_bridge_running",
+            return_value=False,
+        ), mock.patch.object(
+            qt_settings_app.single_instance,
+            "bridge_instance_running",
+            return_value=False,
+        ), mock.patch.object(
+            bridge_launcher,
+            "start_bridge_launch",
+            return_value=started,
+        ):
+            controller._start_bridge_process()
+
+        self.assertIsNone(
+            bridge_runtime_status.read_status(controller._config_root)
+        )
+        self.assertTrue(controller.bridgeRunning)
+        self.assertFalse(controller.bridgeConnected)
+        self.assertEqual(controller.bridgeLaunchPhase, "waiting")
+        self.assertFalse(controller.bridgeRestartRecommended)
+        self.assertEqual(controller.rawInputState, "unknown")
+        self.assertEqual(controller.hidTapState, "unknown")
+        self.assertEqual(controller.voiceKeyPhysicalizerState, "unknown")
+
+    def test_bridge_does_not_start_when_its_stale_status_cannot_be_cleared(self):
+        controller, _ = self._make_controller()
+        bridge_runtime_status.publish_status(
+            controller._config_root,
+            bridge_runtime_status.BridgeConnectionState.WAITING_FOR_DEVICE,
+            pid=9876,
+            identity=controller._current_runtime_identity,
+        )
+        controller._set_bridge_launch_phase("starting")
+
+        with mock.patch.object(
+            bridge_launcher,
+            "in_process_bridge_running",
+            return_value=False,
+        ), mock.patch.object(
+            qt_settings_app.single_instance,
+            "bridge_instance_running",
+            return_value=False,
+        ), mock.patch.object(
+            bridge_runtime_status,
+            "clear_status",
+            side_effect=OSError("simulated cleanup failure"),
+        ), mock.patch.object(
+            bridge_launcher,
+            "start_bridge_launch",
+        ) as start_launch:
+            controller._start_bridge_process()
+
+        start_launch.assert_not_called()
+        self.assertFalse(controller.bridgeRunning)
+        self.assertEqual(controller.bridgeLaunchPhase, "failed")
+        self.assertTrue(controller.bridgeRestartRecommended)
+        self.assertIn("完全退出", controller.launchStatusText)
+
+    def test_bridge_does_not_start_when_mutex_status_cannot_be_queried(self):
+        for error in (
+            single_instance.SingleInstanceUnavailableError("status unavailable"),
+            single_instance.MutexCleanupError("close failed"),
+        ):
+            with self.subTest(error=type(error).__name__):
+                controller, _ = self._make_controller()
+                bridge_runtime_status.publish_status(
+                    controller._config_root,
+                    bridge_runtime_status.BridgeConnectionState.WAITING_FOR_DEVICE,
+                    pid=9876,
+                    identity=controller._current_runtime_identity,
+                )
+                controller._set_bridge_launch_phase("starting")
+
+                with mock.patch.object(
+                    bridge_launcher,
+                    "in_process_bridge_running",
+                    return_value=False,
+                ), mock.patch.object(
+                    qt_settings_app.single_instance,
+                    "bridge_instance_running",
+                    side_effect=error,
+                ), mock.patch.object(
+                    bridge_launcher,
+                    "start_bridge_launch",
+                ) as start_launch:
+                    controller._start_bridge_process()
+
+                start_launch.assert_not_called()
+                self.assertFalse(controller.bridgeRunning)
+                self.assertEqual(controller.bridgeLaunchPhase, "failed")
+                self.assertTrue(controller.bridgeRestartRecommended)
+                self.assertIn("完全退出", controller.launchStatusText)
 
     def test_failed_launch_keeps_the_bridge_warning_active(self):
         controller, _ = self._make_controller()
@@ -4902,7 +5084,7 @@ class SettingsControllerTests(unittest.TestCase):
         self.assertEqual(controller.selectedButtonId, "power")
         self.assertEqual(model.selected_button_id(), "power")
         self.assertIn("电源键", controller.keyDetectionText)
-        self.assertIn("0x0066", controller.keyDetectionText)
+        self.assertIn("可修改后保存映射", controller.keyDetectionText)
 
     def test_real_key_detection_failure_is_reported_in_the_ui(self):
         controller, _ = self._make_controller()
@@ -5058,7 +5240,7 @@ class SettingsControllerTests(unittest.TestCase):
         self.assertFalse(controller.keyDetectionActive)
         self.assertEqual(controller.selectedButtonId, "up")
         self.assertEqual(model.selected_button_id(), "up")
-        self.assertIn("0x0052", controller.keyDetectionText)
+        self.assertIn("可修改后保存映射", controller.keyDetectionText)
 
     def test_tap_detection_ignores_unknown_or_empty_reports(self):
         controller, _ = self._make_controller()
@@ -5110,7 +5292,7 @@ class SettingsControllerTests(unittest.TestCase):
         self.assertIsNone(controller._key_detection_tap)
         listener.stop.assert_called_once_with()
         tap.stop.assert_called_once_with()
-        self.assertIn("等待按键超时", controller.keyDetectionText)
+        self.assertIn("未检测到按键", controller.keyDetectionText)
 
     def test_local_detection_timeout_preserves_a_cleanup_error(self):
         controller, _ = self._make_controller()
@@ -5225,6 +5407,25 @@ class SettingsControllerTests(unittest.TestCase):
         self.assertIs(controller._key_detection_tap, tap)
         self.assertTrue(controller.keyDetectionActive)
 
+    def test_detected_key_does_not_claim_completion_when_stop_cannot_start(self):
+        controller, _ = self._make_controller()
+        listener = mock.Mock()
+        controller._key_detection_listener = listener
+        controller._set_key_detection_active_state(True)
+        controller._set_input_operation_state("key_detection", "active")
+
+        with mock.patch.object(
+            controller,
+            "_start_background_task",
+            side_effect=RuntimeError("simulated stop start failure"),
+        ):
+            controller._on_raw_key_detected("up", "")
+
+        self.assertTrue(controller.keyDetectionActive)
+        self.assertIs(controller._key_detection_listener, listener)
+        self.assertIn("检测未停止", controller.keyDetectionText)
+        self.assertIn("停止检测", controller.keyDetectionText)
+
     def test_hotkey_start_failure_retains_a_still_running_capture(self):
         controller, _ = self._make_controller()
         capture = mock.Mock()
@@ -5236,9 +5437,21 @@ class SettingsControllerTests(unittest.TestCase):
             "HotkeyCapture",
             return_value=capture,
         ):
-            controller.startHotkeyCapture()
+            self.assertTrue(controller.startHotkeyCapture())
 
         self.assertIs(controller._hotkey_capture, capture)
+
+    def test_hotkey_start_returns_false_while_another_input_operation_is_active(self):
+        controller, _ = self._make_controller()
+        errors = []
+        controller.hotkeyCaptureError.connect(errors.append)
+        controller._set_input_operation_state("key_detection", "active")
+
+        self.assertFalse(controller.startHotkeyCapture())
+
+        self.assertEqual(controller._input_operation_kind, "key_detection")
+        self.assertEqual(controller._input_operation_phase, "active")
+        self.assertEqual(errors, ["另一项按键输入操作正在进行，请先结束。"])
 
     def test_hotkey_stop_failure_retains_capture_for_retry(self):
         controller, _ = self._make_controller()
@@ -5397,7 +5610,7 @@ class SettingsControllerTests(unittest.TestCase):
         self.assertFalse(controller.keyDetectionActive)
         self.assertEqual(controller.selectedButtonId, "back")
         self.assertEqual(model.selected_button_id(), "back")
-        self.assertIn("0x00F1", controller.keyDetectionText)
+        self.assertIn("可修改后保存映射", controller.keyDetectionText)
         self.assertEqual(raw_instances[0].stop_calls, 1)
         self.assertEqual(tap_instances[0].stop_calls, 1)
 
@@ -5429,6 +5642,10 @@ class SettingsControllerTests(unittest.TestCase):
 
         self.assertTrue(controller.keyDetectionActive)
         self.assertIsNotNone(controller._key_detection_bridge_request)
+        self.assertEqual(
+            controller.keyDetectionText,
+            "请按一次遥控器；检测时不执行映射",
+        )
         raw_listener.assert_not_called()
         tap.assert_not_called()
 
@@ -5443,7 +5660,7 @@ class SettingsControllerTests(unittest.TestCase):
         self.assertFalse(controller.keyDetectionActive)
         self.assertEqual(controller.selectedButtonId, "volume_down")
         self.assertEqual(model.selected_button_id(), "volume_down")
-        self.assertIn("后台桥接", controller.keyDetectionText)
+        self.assertIn("可修改后保存映射", controller.keyDetectionText)
 
     def test_running_bridge_detection_times_out_cleanly(self):
         controller, _ = self._make_controller()
@@ -5471,7 +5688,7 @@ class SettingsControllerTests(unittest.TestCase):
 
         self.assertFalse(controller.keyDetectionActive)
         self.assertFalse(request.request_path.exists())
-        self.assertIn("超时", controller.keyDetectionText)
+        self.assertIn("未检测到按键", controller.keyDetectionText)
 
     def test_running_bridge_without_a_ready_input_channel_fails_immediately(self):
         controller, _ = self._make_controller()
@@ -6839,12 +7056,15 @@ class DiagnosticsControllerTests(unittest.TestCase):
             "check_vb_cable_loopback_isolated",
             return_value=loopback_result,
         ), mock.patch.object(
-            bridge_launcher, "launch_bridge", return_value=restart_result
-        ):
+            bridge_launcher,
+            "launch_in_process_bridge",
+            return_value=restart_result,
+        ) as restart:
             diag.testVbCableChannelWithBridgeRestart()
             self.assertTrue(diag.vbCableTestRunning)
             self.assertTrue(self._pump_until(lambda: not diag.vbCableTestRunning))
 
+        restart.assert_called_once_with(launch_voice_program_on_start=False)
         self.assertEqual(diag.vbCableTestStatus, "pass")
         self.assertIn("自动恢复", diag.vbCableTestMessage)
         self.assertFalse(diag.vbCableBridgeRecoveryNeeded)
@@ -6877,7 +7097,9 @@ class DiagnosticsControllerTests(unittest.TestCase):
             "check_vb_cable_loopback_isolated",
             return_value=loopback_result,
         ), mock.patch.object(
-            bridge_launcher, "launch_bridge", return_value=restart_result
+            bridge_launcher,
+            "launch_in_process_bridge",
+            return_value=restart_result,
         ):
             diag.testVbCableChannelWithBridgeRestart()
             self.assertTrue(self._pump_until(lambda: not diag.vbCableTestRunning))
@@ -6885,6 +7107,27 @@ class DiagnosticsControllerTests(unittest.TestCase):
         self.assertEqual(diag.vbCableTestStatus, "fail")
         self.assertTrue(diag.vbCableBridgeRecoveryNeeded)
         self.assertIn("未能自动恢复", diag.vbCableTestMessage)
+
+    def test_manual_vb_cable_recovery_clears_the_stale_recovery_action(self):
+        settings_controller = self._make_settings_controller()
+        diag = self.DiagnosticsController(settings_controller, self._config_root)
+        self._pump_until(lambda: not diag.isRefreshing)
+        settings_controller._set_bridge_running(False)
+        diag._set_vb_cable_bridge_recovery_needed(True)
+        diag._set_vb_cable_test_state(
+            "fail",
+            "声音通道正常，但遥控器服务未能自动恢复",
+            running=False,
+        )
+
+        settings_controller._set_bridge_running(True)
+
+        self.assertFalse(diag.vbCableBridgeRecoveryNeeded)
+        self.assertEqual(diag.vbCableTestStatus, "idle")
+        self.assertEqual(
+            diag.vbCableTestMessage,
+            "遥控器服务已重新启动；请重新测试声音通道",
+        )
 
     def test_vb_cable_channel_test_does_not_run_when_graceful_stop_fails(self):
         settings_controller = self._make_settings_controller()
@@ -6908,6 +7151,30 @@ class DiagnosticsControllerTests(unittest.TestCase):
         self.assertEqual(diag.vbCableTestStatus, "fail")
         self.assertIn("服务未停止", diag.vbCableTestMessage)
         self.assertFalse(diag.vbCableBridgeRecoveryNeeded)
+        loopback.assert_not_called()
+
+    def test_vb_cable_channel_test_recovers_when_graceful_stop_raises(self):
+        settings_controller = self._make_settings_controller()
+        diag = self.DiagnosticsController(settings_controller, self._config_root)
+        self._pump_until(lambda: not diag.isRefreshing)
+
+        with mock.patch.object(
+            settings_controller, "_refresh_bridge_status", return_value=True
+        ), mock.patch.object(
+            bridge_control_windows,
+            "request_bridge_exit",
+            side_effect=OSError("simulated stop failure"),
+        ), mock.patch.object(
+            windows_diagnostics, "check_vb_cable_loopback_isolated"
+        ) as loopback:
+            diag.testVbCableChannelWithBridgeRestart()
+            self.assertTrue(diag.vbCableTestRunning)
+            self.assertTrue(self._pump_until(lambda: not diag.vbCableTestRunning))
+
+        self.assertEqual(diag.vbCableTestStatus, "fail")
+        self.assertIn("无法临时停止", diag.vbCableTestMessage)
+        self.assertFalse(diag.vbCableBridgeRecoveryNeeded)
+        self.assertFalse(qt_settings_app._vb_cable_test_active_event.is_set())
         loopback.assert_not_called()
 
     def test_vb_cable_channel_test_rejects_a_bridge_launch_in_progress(self):
@@ -7420,6 +7687,7 @@ _QML_LOAD_PROBE_SCRIPT = r"""
 import faulthandler
 import json
 import sys
+import threading
 import time
 
 # XRBM-034's "engine.warnings connected to a Python callback" theory for
@@ -7479,11 +7747,42 @@ voice_scroll = (
     root_objects[0].findChild(QObject, "voiceScroll") if root_objects else None
 )
 voice_page = voice_scroll.parent() if voice_scroll is not None else None
+hotkey_before_capture = controller.holdVoiceHotkeyText
+hotkey_before_stop_completed = hotkey_before_capture
+recording_before_stop_completed = False
+pending_before_stop_completed = ""
 if voice_page is not None:
+    class BlockingHotkeyCapture:
+        def __init__(self):
+            self.stop_started = threading.Event()
+            self.allow_stop = threading.Event()
+
+        def stop(self):
+            self.stop_started.set()
+            if not self.allow_stop.wait(5.0):
+                raise RuntimeError("test capture stop timed out")
+
+    blocking_capture = BlockingHotkeyCapture()
+    controller._hotkey_capture = blocking_capture
+    controller._set_input_operation_state("hotkey", "active")
     voice_page.setProperty("voiceHotkeyRecording", True)
     controller.hotkeyCaptured.emit("ctrl+shift+f8")
+    stop_deadline = time.monotonic() + 5.0
+    while not blocking_capture.stop_started.is_set() and time.monotonic() < stop_deadline:
+        app.processEvents()
+        time.sleep(0.01)
+    app.processEvents()
+    hotkey_before_stop_completed = controller.holdVoiceHotkeyText
+    recording_before_stop_completed = bool(
+        voice_page.property("voiceHotkeyRecording")
+    )
+    pending_before_stop_completed = str(
+        voice_page.property("pendingVoiceHotkey")
+    )
+    blocking_capture.allow_stop.set()
     deadline = time.monotonic() + 5.0
-    while controller.voiceHotkeyBusy and time.monotonic() < deadline:
+    while (controller.hotkeyCaptureActive or controller.voiceHotkeyBusy) \
+            and time.monotonic() < deadline:
         app.processEvents()
         time.sleep(0.01)
     app.processEvents()
@@ -7520,6 +7819,10 @@ result = {
         voice_page.property("voiceHotkeyRecording")
         if voice_page is not None else None
     ),
+    "hotkey_before_capture": hotkey_before_capture,
+    "hotkey_before_stop_completed": hotkey_before_stop_completed,
+    "recording_before_stop_completed": recording_before_stop_completed,
+    "pending_before_stop_completed": pending_before_stop_completed,
     "saved_voice_hotkey": saved_config.get("voice_hotkeys", {}).get("hold"),
     "voice_save_status": voice_save_status,
     "voice_feedback_on_device": voice_feedback_on_device,
@@ -8084,12 +8387,15 @@ def column_snapshot(name):
     }
 
 
-def row_snapshot(row):
+def row_snapshot(row, description_name=""):
     color = row.property("stateColor")
     row_name = str(row.property("objectName"))
     state_label = find_child(window, row_name + "_stateLabel")
     state_column = find_child(window, row_name + "_stateColumn")
-    description_label = find_child(window, row_name + "_descriptionLabel")
+    description_label = find_child(
+        window,
+        description_name or row_name + "_descriptionLabel",
+    )
     assert state_label is not None
     assert state_column is not None
     assert description_label is not None
@@ -8360,6 +8666,166 @@ result["voice_sections"] = all(
         "voiceTestSection",
     )
 )
+
+actual_speech_row = find_child(window, "actualSpeechTestRow")
+try_speaking_button = find_child(window, "trySpeakingButton")
+assert actual_speech_row is not None
+assert try_speaking_button is not None
+
+
+def actual_speech_case(
+    *,
+    helper_ready=True,
+    bridge_running=True,
+    bridge_connected=True,
+    hid_state="ready",
+    physicalizer_state="ready",
+    restart=False,
+    hotkey_state="saved",
+    hotkey_busy=False,
+    reconnect_busy=False,
+    endpoint_ready=True,
+    diagnostics_ready=True,
+    cable_status="pass",
+    cable_detail="CABLE Input 和 CABLE Output 均可用",
+    output_status="pass",
+    mapping_ready=True,
+    provider="none",
+    program_status="disabled",
+    elevation_status="standard",
+):
+    diagnostics_controller._is_refreshing = False
+    diagnostics_controller._check_rows = (
+        [
+            {
+                "checkId": "vb_cable_endpoints",
+                "status": cable_status,
+                "detail": cable_detail,
+                "resultCode": "ready" if cable_status == "pass" else "failed",
+            },
+            {
+                "checkId": "output_endpoint",
+                "status": output_status,
+                "detail": "已选择 CABLE Input",
+                "resultCode": "ready" if output_status == "pass" else "failed",
+            },
+        ]
+        if diagnostics_ready else []
+    )
+    diagnostics_controller.isRefreshingChanged.emit()
+    diagnostics_controller.checkResultsChanged.emit()
+    controller._set_hid_helper_state(
+        m.hid_elevation_windows.HidHelperState(
+            helper_ready,
+            "ready" if helper_ready else "helper_missing",
+        )
+    )
+    controller._set_hid_helper_repair_busy(False)
+    controller._set_bridge_running(bridge_running)
+    controller._set_bridge_connected(bridge_connected)
+    controller._hid_tap_state = hid_state
+    controller._voice_key_physicalizer_state = physicalizer_state
+    controller.bridgeInputStateChanged.emit()
+    controller._set_bridge_restart_recommended(restart)
+    controller._set_bridge_reconnect_busy(reconnect_busy)
+    controller._set_voice_hotkey_save_state(hotkey_state)
+    controller._set_voice_hotkey_busy(hotkey_busy)
+    controller._bindings["bindings"]["mic"] = m.key_mapping.ButtonAction(
+        m.key_mapping.ActionKind.VOICE_HOLD
+        if mapping_ready else m.key_mapping.ActionKind.ESCAPE
+    ).to_dict()
+    controller.voiceMappingReadyChanged.emit()
+    controller._selected_endpoint_index = 0 if endpoint_ready else -1
+    controller.selectedEndpointIndexChanged.emit()
+    controller._voice_program_settings = (
+        m.voice_program_manager.normalize_voice_program_settings(
+            {
+                "provider": provider,
+                "custom_executable": (
+                    "C:/Voice/custom.exe" if provider == "custom" else ""
+                ),
+                "launch_on_bridge_start": provider not in {
+                    "none", "wetype", "windows_dictation"
+                },
+            }
+        )
+    )
+    controller.selectedVoiceProgramIndexChanged.emit()
+    controller._voice_program_status_code = program_status
+    controller.voiceProgramStatusCodeChanged.emit()
+    controller._voice_program_elevation_status = elevation_status
+    controller.voiceProgramElevationStatusChanged.emit()
+    settle()
+    return {
+        "row": row_snapshot(actual_speech_row, "actualSpeechTestDescription"),
+        "button": {
+            "enabled": bool(try_speaking_button.property("enabled")),
+            "text": str(try_speaking_button.property("text")),
+        },
+    }
+
+
+result["actual_speech_cases"] = {
+    "busy": actual_speech_case(hotkey_busy=True),
+    "helper_issue": actual_speech_case(helper_ready=False),
+    "service_stopped": actual_speech_case(
+        bridge_running=False,
+        bridge_connected=False,
+    ),
+    "restart": actual_speech_case(restart=True),
+    "remote_disconnected": actual_speech_case(bridge_connected=False),
+    "input_unconfirmed": actual_speech_case(
+        hid_state="attached_waiting_for_hid_io"
+    ),
+    "voice_physicalizer_starting": actual_speech_case(
+        physicalizer_state="starting"
+    ),
+    "voice_physicalizer_recovering": actual_speech_case(
+        physicalizer_state="recovering"
+    ),
+    "voice_physicalizer_failed": actual_speech_case(
+        physicalizer_state="failed"
+    ),
+    "hotkey_retry": actual_speech_case(hotkey_state="retry"),
+    "diagnostics_missing": actual_speech_case(diagnostics_ready=False),
+    "audio_missing": actual_speech_case(
+        cable_status="fail",
+        cable_detail="缺少 CABLE Output",
+    ),
+    "audio_check_failed": actual_speech_case(
+        cable_status="fail",
+        cable_detail="无法检测音频端点",
+    ),
+    "missing_endpoint": actual_speech_case(endpoint_ready=False),
+    "output_failed": actual_speech_case(output_status="fail"),
+    "mapping_missing": actual_speech_case(mapping_ready=False),
+    "missing_custom_program": actual_speech_case(
+        provider="custom",
+        program_status="not_found",
+    ),
+    "missing_managed_program": actual_speech_case(
+        provider="sogou",
+        program_status="not_found",
+    ),
+    "stopped_managed_program": actual_speech_case(
+        provider="sogou",
+        program_status="stopped",
+    ),
+    "managed_program_not_ready": actual_speech_case(
+        provider="sogou",
+        program_status="running_not_ready",
+    ),
+    "program_privilege_mismatch": actual_speech_case(
+        provider="sogou",
+        program_status="running",
+        elevation_status="standard",
+    ),
+    "reconnecting": actual_speech_case(
+        bridge_connected=False,
+        reconnect_busy=True,
+    ),
+    "ready": actual_speech_case(),
+}
 controller.shutdownBackgroundTasks()
 m._shutdown_diagnostics_workers()
 print(json.dumps(result))
@@ -9517,14 +9983,16 @@ class SettingsShellSourceContractTests(unittest.TestCase):
         self.assertIn("SettingsController.reconnectBridgeNow()", self.device_qml)
         self.assertIn("SettingsController.bridgeReconnectAvailable", self.device_qml)
         self.assertIn('return qsTr("重新连接")', self.device_qml)
+        self.assertIn('return qsTr("重启服务")', self.device_qml)
+        self.assertIn('return qsTr("请重启服务")', self.device_qml)
         self.assertIn('return qsTr("已连接")', self.device_qml)
-        self.assertIn('return qsTr("待唤醒")', self.device_qml)
+        self.assertIn('return qsTr("请按方向键")', self.device_qml)
         self.assertNotIn('return qsTr("等待连接")', self.device_qml)
         self.assertIn("function bridgeNeedsRestartAction()", self.device_qml)
         self.assertIn("rawInputReady() && hidTapReady()", self.device_qml)
         self.assertIn("if (buttonReceiverWaitsForRemote())", self.device_qml)
         self.assertIn(
-            "if (rawInputWaitsForRemote() && hidTapWaitsForFirstInput())",
+            "if (hidTapWaitsForFirstInput())",
             self.device_qml,
         )
         self.assertNotIn('objectName: "mappingBridgeWarning"', self.buttons_qml)
@@ -9574,10 +10042,11 @@ class SettingsShellSourceContractTests(unittest.TestCase):
             "登录后后台运行",
             "自动连接遥控器",
             "右上角 × 的行为",
-            "待唤醒",
+            "请按方向键",
             "让遥控器按键在电脑上生效",
             "保持遥控器连接，让按键和语音持续可用",
             "请重新连接",
+            "请重启服务",
             "请重新检查",
         ):
             self.assertIn(expected, self.device_qml)
@@ -9613,7 +10082,7 @@ class SettingsShellSourceContractTests(unittest.TestCase):
         self.assertIn("SettingsController.rawInputState", self.device_qml)
         self.assertIn("SettingsController.hidTapState", self.device_qml)
         self.assertIn("SettingsController.voiceKeyPhysicalizerState", self.device_qml)
-        self.assertEqual(self.device_qml.count("待唤醒"), 2)
+        self.assertNotIn("待唤醒", self.device_qml)
         self.assertNotIn("function bridgeDetailText()", self.device_qml)
         self.assertNotIn("function buttonReceiverDetailText()", self.device_qml)
 
@@ -9726,7 +10195,7 @@ class SettingsShellSourceContractTests(unittest.TestCase):
         self.assertIn("SettingsController.setLaunchAtLogin", self.device_qml)
         self.assertIn("SettingsController.setLaunchBridgeOnAppStart", self.device_qml)
         self.assertIn("SettingsController.setCloseBehaviorIndex", self.device_qml)
-        self.assertIn('titleText: qsTr("启动程序时自动启动桥接")', self.device_qml)
+        self.assertIn('titleText: qsTr("启动程序时自动运行服务")', self.device_qml)
         self.assertIn("自动连接遥控器", self.device_qml)
         self.assertNotIn("与随 Windows 启动互不绑定", self.device_qml)
         self.assertNotIn("GeneralPage", self.main_qml)
@@ -9865,9 +10334,14 @@ class SettingsShellSourceContractTests(unittest.TestCase):
         )
         self.assertIn('? qsTr("录入中")', self.voice_qml)
         self.assertIn(
-            'root.voiceHotkeyBusy ? qsTr("处理中") : qsTr("已保存")',
+            'SettingsController.voiceHotkeySaveState === "retry"',
             self.voice_qml,
         )
+        self.assertIn('qsTr("请安装")', self.voice_qml)
+        self.assertIn('qsTr("请重选")', self.voice_qml)
+        self.assertIn('qsTr("请重试")', self.voice_qml)
+        self.assertNotIn('qsTr("需处理")', self.voice_qml)
+        self.assertNotIn('qsTr("待完成")', self.voice_qml)
         for misleading_claim in (
             "已授权",
             "无线麦需要管理员权限",
@@ -9875,11 +10349,22 @@ class SettingsShellSourceContractTests(unittest.TestCase):
         ):
             self.assertNotIn(misleading_claim, self.voice_qml)
         self.assertIn("由 Windows 管理", self.voice_qml)
+        self.assertIn('objectName: "actualSpeechInstruction"', self.voice_qml)
+        self.assertIn(
+            "保持光标在输入框中，按住遥控器话筒键说话，松开后查看文字。",
+            self.voice_qml,
+        )
 
-    def test_only_device_page_owns_internal_navigation_to_buttons(self):
+    def test_device_and_voice_guidance_use_the_shared_page_navigation(self):
         self.assertIn("signal openButtonsRequested()", self.device_qml)
         self.assertIn("onOpenButtonsRequested: window.requestPage(1)", self.main_qml)
-        self.assertNotIn("openButtonsRequested", self.voice_qml)
+        self.assertIn("signal openDeviceRequested()", self.voice_qml)
+        self.assertIn("signal openButtonsRequested()", self.voice_qml)
+        self.assertIn("onOpenDeviceRequested: window.requestPage(0)", self.main_qml)
+        self.assertGreaterEqual(
+            self.main_qml.count("onOpenButtonsRequested: window.requestPage(1)"),
+            2,
+        )
 
     def test_buttons_page_keeps_the_mapping_cards_and_photo_sidebar(self):
         for object_name in ("photoSidebar", "photoFrame", "photoImage"):
@@ -10002,6 +10487,10 @@ class SettingsShellSourceContractTests(unittest.TestCase):
             self.voice_qml,
         )
         self.assertIn('objectName: "openVoiceProgramSettingsButton"', self.voice_qml)
+        self.assertIn(
+            "if (!SettingsController.startHotkeyCapture())",
+            self.voice_qml,
+        )
         self.assertNotIn('objectName: "holdVoiceHotkeyField"', self.buttons_qml)
 
     def test_voice_program_status_uses_structured_privilege_and_dirty_state(self):
@@ -10296,6 +10785,24 @@ class ThreePageSettingsSourceContractTests(unittest.TestCase):
         self.assertIn("speakTestInput.forceActiveFocus()", self.voice_qml)
         self.assertIn('objectName: "speakTestInputFrame"', self.voice_qml)
         self.assertIn('objectName: "speakTestCloseButton"', self.voice_qml)
+        self.assertIn("function actualSpeechStateCode()", self.voice_qml)
+        self.assertIn('return "start_service"', self.voice_qml)
+        self.assertIn('return "restart_service"', self.voice_qml)
+        self.assertIn(
+            "enabled: root.actualSpeechActionEnabled()",
+            self.voice_qml,
+        )
+        self.assertIn("SettingsController.voiceMappingReady", self.voice_qml)
+        self.assertIn(
+            "SettingsController.voiceKeyPhysicalizerState",
+            self.voice_qml,
+        )
+        self.assertIn(
+            "SettingsController.refreshVoiceProgramStatus()",
+            self.voice_qml,
+        )
+        self.assertIn("DiagnosticsController.refreshDiagnostics()", self.voice_qml)
+        self.assertIn("root.openButtonsRequested()", self.voice_qml)
         self.assertIn("Layout.minimumHeight: 150", self.voice_qml)
         self.assertIn("vbCableBridgeRecoveryNeeded", self.voice_qml)
 
@@ -10308,7 +10815,21 @@ class ThreePageSettingsSourceContractTests(unittest.TestCase):
         detect_index = self.buttons_qml.index('objectName: "detectRealKeyButton"')
         note_index = self.buttons_qml.index('objectName: "voiceGestureRestrictionText"')
         self.assertLess(detect_index, note_index)
-        self.assertIn("设为语音动作后，双击和长按不可用", self.buttons_qml)
+        self.assertIn("? SettingsController.keyDetectionText", self.buttons_qml)
+        self.assertIn(
+            "if (!SettingsController.startHotkeyCapture()",
+            self.buttons_qml,
+        )
+        self.assertRegex(
+            self.buttons_qml,
+            r'(?s)text: qsTr\("取消"\).*?'
+            r'onClicked: shortcutRecorder\.requestClose\(\)',
+        )
+        self.assertNotIn(
+            "SettingsController.keyDetectionActive\n"
+            "                                ? SettingsController.keyDetectionText",
+            self.buttons_qml,
+        )
         self.assertIn('qsTr("语音模式下暂停")', self.mapping_card_qml)
 
     def test_inline_rows_do_not_restore_the_old_blue_circle_icon(self):
@@ -10509,6 +11030,12 @@ class OffscreenQmlLoadTests(unittest.TestCase):
         self.assertFalse(data["initial_settings_dirty"])
         self.assertFalse(data["retired_finish_tap_control_exists"])
         self.assertFalse(data["voice_hotkey_recording"])
+        self.assertEqual(
+            data["hotkey_before_stop_completed"],
+            data["hotkey_before_capture"],
+        )
+        self.assertTrue(data["recording_before_stop_completed"])
+        self.assertEqual(data["pending_before_stop_completed"], "ctrl+shift+f8")
         self.assertEqual(data["saved_voice_hotkey"], "ctrl+shift+f8")
         self.assertIn("快捷键已保存到无线麦", data["voice_save_status"])
         self.assertFalse(data["voice_feedback_on_device"])
@@ -10708,15 +11235,15 @@ class OffscreenQmlLoadTests(unittest.TestCase):
 
         cases = data["status_cases"]
         self.assertEqual(
-            cases["partial_raw_ready"]["buttons"]["state"], "请重新连接"
+            cases["partial_raw_ready"]["buttons"]["state"], "请重启服务"
         )
         self.assertEqual(
             cases["partial_raw_ready"]["buttons"]["detail"],
             "让遥控器按键在电脑上生效",
         )
-        self.assertEqual(cases["partial_raw_ready"]["action"]["text"], "重新连接")
+        self.assertEqual(cases["partial_raw_ready"]["action"]["text"], "重启服务")
         self.assertEqual(
-            cases["partial_raw_ready"]["service"]["state"], "请重新连接"
+            cases["partial_raw_ready"]["service"]["state"], "请重启服务"
         )
         self.assertTrue(cases["partial_raw_ready"]["action"]["visible"])
         self.assertEqual(cases["conflict"]["buttons"]["state"], "多设备")
@@ -10726,7 +11253,7 @@ class OffscreenQmlLoadTests(unittest.TestCase):
         )
         self.assertEqual(cases["conflict"]["service"]["state"], "未连接")
         self.assertFalse(cases["conflict"]["action"]["visible"])
-        self.assertEqual(cases["asleep"]["buttons"]["state"], "待唤醒")
+        self.assertEqual(cases["asleep"]["buttons"]["state"], "请按方向键")
         self.assertEqual(
             cases["asleep"]["buttons"]["detail"],
             "让遥控器按键在电脑上生效",
@@ -10751,15 +11278,15 @@ class OffscreenQmlLoadTests(unittest.TestCase):
         )
         self.assertFalse(cases["connected_input_wait"]["action"]["visible"])
         self.assertEqual(
-            cases["first_hid_input_wait"]["buttons"]["state"], "请按遥控器"
+            cases["first_hid_input_wait"]["buttons"]["state"], "请按方向键"
         )
         self.assertEqual(
-            cases["first_hid_input_wait"]["service"]["state"], "请按遥控器"
+            cases["first_hid_input_wait"]["service"]["state"], "请按方向键"
         )
         self.assertFalse(cases["first_hid_input_wait"]["action"]["visible"])
         self.assertEqual(
             cases["first_hid_input_wait_connected"]["buttons"]["state"],
-            "请按遥控器",
+            "请按方向键",
         )
         self.assertEqual(
             cases["first_hid_input_wait_connected"]["service"]["state"],
@@ -10769,13 +11296,14 @@ class OffscreenQmlLoadTests(unittest.TestCase):
             cases["first_hid_input_wait_connected"]["action"]["visible"]
         )
         self.assertEqual(
-            cases["verified_hid_without_raw"]["buttons"]["state"], "请重新连接"
+            cases["verified_hid_without_raw"]["buttons"]["state"], "请重启服务"
         )
         self.assertEqual(
-            cases["verified_hid_without_raw"]["service"]["state"], "请重新连接"
+            cases["verified_hid_without_raw"]["service"]["state"], "请重启服务"
         )
         self.assertTrue(cases["verified_hid_without_raw"]["action"]["visible"])
-        self.assertEqual(cases["restart"]["service"]["state"], "请重新连接")
+        self.assertEqual(cases["restart"]["service"]["state"], "请重启服务")
+        self.assertEqual(cases["restart"]["action"]["text"], "重启服务")
         self.assertEqual(
             cases["restart"]["service"]["detail"],
             "保持遥控器连接，让按键和语音持续可用",
@@ -10802,7 +11330,7 @@ class OffscreenQmlLoadTests(unittest.TestCase):
         )
         self.assertFalse(cases["voice_recovering"]["action"]["visible"])
         self.assertEqual(
-            cases["voice_failed"]["buttons"]["state"], "请重新连接"
+            cases["voice_failed"]["buttons"]["state"], "请重启服务"
         )
         self.assertEqual(
             cases["voice_failed"]["buttons"]["detail"],
@@ -10821,13 +11349,13 @@ class OffscreenQmlLoadTests(unittest.TestCase):
         )
         self.assertFalse(cases["raw_ready_hid_wait"]["action"]["visible"])
         self.assertEqual(
-            cases["raw_failed_hid_wait"]["buttons"]["state"], "请重新连接"
+            cases["raw_failed_hid_wait"]["buttons"]["state"], "请重启服务"
         )
         self.assertEqual(
-            cases["raw_failed_hid_wait"]["service"]["state"], "请重新连接"
+            cases["raw_failed_hid_wait"]["service"]["state"], "请重启服务"
         )
         self.assertEqual(
-            cases["raw_failed_hid_wait"]["action"]["text"], "重新连接"
+            cases["raw_failed_hid_wait"]["action"]["text"], "重启服务"
         )
         self.assertEqual(
             cases["raw_failure"]["buttons"]["state"], "请重新检查"
@@ -10836,7 +11364,7 @@ class OffscreenQmlLoadTests(unittest.TestCase):
             cases["raw_failure"]["buttons"]["detail"],
             "让遥控器按键在电脑上生效",
         )
-        self.assertEqual(cases["raw_asleep"]["buttons"]["state"], "待唤醒")
+        self.assertEqual(cases["raw_asleep"]["buttons"]["state"], "请按方向键")
         self.assertEqual(
             cases["raw_asleep"]["buttons"]["detail"],
             "让遥控器按键在电脑上生效",
@@ -10876,6 +11404,40 @@ class OffscreenQmlLoadTests(unittest.TestCase):
             "让遥控器按键在电脑上生效",
         )
 
+        speech_cases = data["actual_speech_cases"]
+        expected_speech_states = {
+            "busy": ("请稍候", "当前操作完成后再试", "试说一句", False),
+            "helper_issue": ("请启用改键", "先到设备页启用改键", "打开设备", True),
+            "service_stopped": ("请启动服务", "先到设备页启动服务", "打开设备", True),
+            "restart": ("请重启服务", "先到设备页重启服务", "打开设备", True),
+            "remote_disconnected": ("请按方向键", "先按一下遥控器方向键", "试说一句", False),
+            "input_unconfirmed": ("请按方向键", "先按一下遥控器方向键", "试说一句", False),
+            "voice_physicalizer_starting": ("请稍候", "当前操作完成后再试", "试说一句", False),
+            "voice_physicalizer_recovering": ("请稍候", "当前操作完成后再试", "试说一句", False),
+            "voice_physicalizer_failed": ("请重启服务", "先到设备页重启服务", "打开设备", True),
+            "hotkey_retry": ("请录入", "先重新录入语音按键", "重新录入", True),
+            "diagnostics_missing": ("请检查", "先重新检查音频配置", "重新检查", True),
+            "audio_missing": ("请装音频", "先安装虚拟音频并重启电脑", "安装音频", True),
+            "audio_check_failed": ("请检查", "先重新检查虚拟音频", "重新检查", True),
+            "missing_endpoint": ("请应用", "先应用 CABLE Input 输出端点", "应用端点", True),
+            "output_failed": ("请应用", "先应用 CABLE Input 输出端点", "应用端点", True),
+            "mapping_missing": ("请改映射", "先把话筒键设为“按住说话”并保存", "设置按键", True),
+            "missing_custom_program": ("请选择程序", "先在上方选择语音程序", "选择程序", True),
+            "missing_managed_program": ("请安装程序", "先在上方安装语音程序", "打开设置", True),
+            "stopped_managed_program": ("请启动程序", "点击右侧启动语音程序", "启动程序", True),
+            "managed_program_not_ready": ("请退出程序", "先完全退出语音程序，再点右侧重新检测", "重新检测", True),
+            "program_privilege_mismatch": ("请退出程序", "先完全退出语音程序，再点右侧重新检测", "重新检测", True),
+            "reconnecting": ("请稍候", "当前操作完成后再试", "试说一句", False),
+            "ready": ("待实测", "在输入框中验证语音文字", "试说一句", True),
+        }
+        for name, (state, detail, action_text, enabled) in expected_speech_states.items():
+            with self.subTest(actual_speech=name):
+                case = speech_cases[name]
+                self.assertEqual(case["row"]["state"], state)
+                self.assertEqual(case["row"]["detail"], detail)
+                self.assertEqual(case["button"]["text"], action_text)
+                self.assertEqual(case["button"]["enabled"], enabled)
+
         for style, style_data in style_results.items():
             with self.subTest(style=style, check="status_geometry"):
                 style_state_columns = style_data["device_columns"]["states"]
@@ -10913,6 +11475,20 @@ class OffscreenQmlLoadTests(unittest.TestCase):
                         )
                         if row["baseline_delta"] is not None:
                             self.assertLessEqual(row["baseline_delta"], 0.5)
+                for case in style_data["actual_speech_cases"].values():
+                    row = case["row"]
+                    self.assertFalse(row["state_truncated"])
+                    self.assertGreaterEqual(
+                        row["state_width"] + 0.5,
+                        row["state_implicit_width"],
+                    )
+                    self.assertFalse(row["detail_truncated"])
+                    self.assertGreaterEqual(
+                        row["detail_width"] + 0.5,
+                        row["detail_implicit_width"],
+                    )
+                    if row["baseline_delta"] is not None:
+                        self.assertLessEqual(row["baseline_delta"], 0.5)
 
     def test_three_page_shell_fits_compact_viewports_without_horizontal_overflow(self):
         import json

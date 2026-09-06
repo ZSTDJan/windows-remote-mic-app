@@ -909,6 +909,8 @@ ApplicationWindow {
                             tokens: window.tokens
                             backTabTarget: voiceTabButton
                             tabTarget: deviceTabButton
+                            onOpenDeviceRequested: window.requestPage(0)
+                            onOpenButtonsRequested: window.requestPage(1)
                         }
                     }
                 }

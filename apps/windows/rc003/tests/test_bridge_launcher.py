@@ -321,6 +321,25 @@ class InProcessBridgeHandleTests(unittest.TestCase):
 
         self.assertEqual(calls, [1])
 
+    def test_in_process_worker_forwards_the_voice_program_startup_choice(self):
+        handle = bridge_launcher._InProcessBridgeHandle(
+            launch_voice_program_on_start=False
+        )
+
+        with mock.patch.object(
+            bridge_launcher.single_instance,
+            "BridgeInstanceGuard",
+        ), mock.patch("ovb_rc003.app.main") as app_main:
+            bridge_launcher._run_in_process_bridge(handle)
+
+        app_main.assert_called_once_with(
+            show_notification_icon=False,
+            on_runtime_ready=handle.bind_stop,
+            on_reconnect_ready=handle.bind_reconnect,
+            launch_voice_program_on_start=False,
+        )
+        self.assertEqual(handle.poll(), 0)
+
     def test_repeated_stop_requests_call_a_bound_callback_once(self):
         handle = bridge_launcher._InProcessBridgeHandle()
         calls = []

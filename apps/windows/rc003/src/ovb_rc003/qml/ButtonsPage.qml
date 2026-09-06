@@ -274,7 +274,11 @@ Item {
             pendingClose = false
             pendingChord = ""
             captureArea.forceActiveFocus()
-            SettingsController.startHotkeyCapture()
+            const promptBeforeStart = previewText
+            if (!SettingsController.startHotkeyCapture()
+                    && previewText === promptBeforeStart) {
+                previewText = qsTr("无法开始录入，请结束其它按键操作后重试")
+            }
         }
 
         onClosed: {
@@ -370,7 +374,7 @@ Item {
                         tokens: root.tokens
                         compactMinimumWidth: tokens.buttonWidth2Chars
                         text: qsTr("取消")
-                        onClicked: shortcutRecorder.close()
+                        onClicked: shortcutRecorder.requestClose()
                     }
                 }
             }
@@ -1505,9 +1509,7 @@ Item {
                         kind: noteKind
                         Layout.fillWidth: true
                         text: root.mappingViewIndex === 0
-                            ? (SettingsController.keyDetectionActive
-                                ? SettingsController.keyDetectionText
-                                : qsTr("设为语音动作后，双击和长按不可用"))
+                            ? SettingsController.keyDetectionText
                             : qsTr("组合触发后，不执行两个按键的单键动作")
                         elide: Text.ElideRight
                     }

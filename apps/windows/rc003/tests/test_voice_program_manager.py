@@ -766,6 +766,34 @@ class BridgeStartupWiringTests(unittest.TestCase):
                 asyncio.set_event_loop(None)
                 loop.close()
 
+    def test_diagnostics_recovery_can_skip_voice_program_startup(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            try:
+                with (
+                    mock.patch.object(config, "config_root", return_value=Path(tmp)),
+                    mock.patch.object(
+                        app.voice_program_manager,
+                        "launch_configured_at_bridge_start",
+                    ) as launch,
+                    mock.patch.object(
+                        app.voice_program_manager,
+                        "prewarm_sogou_voice_component",
+                    ) as prewarm,
+                ):
+                    app.RC003App(launch_voice_program_on_start=False)
+                launch.assert_not_called()
+                prewarm.assert_not_called()
+            finally:
+                logger = logging.getLogger(logging_setup.LOGGER_NAME)
+                for handler in list(logger.handlers):
+                    handler.close()
+                    logger.removeHandler(handler)
+                logging_setup._configured = False
+                asyncio.set_event_loop(None)
+                loop.close()
+
 
 if __name__ == "__main__":
     unittest.main()

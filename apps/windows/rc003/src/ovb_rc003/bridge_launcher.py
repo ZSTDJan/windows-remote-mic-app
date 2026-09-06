@@ -175,7 +175,7 @@ class _InProcessBridgeHandle:
 
     pid = os.getpid()
 
-    def __init__(self) -> None:
+    def __init__(self, *, launch_voice_program_on_start: bool = True) -> None:
         self._lock = threading.Lock()
         self._exit_code: Optional[int] = None
         self._thread: Optional[threading.Thread] = None
@@ -183,6 +183,7 @@ class _InProcessBridgeHandle:
         self._reconnect_callback: Optional[Callable[[], None]] = None
         self._stop_requested = False
         self._finished = threading.Event()
+        self.launch_voice_program_on_start = bool(launch_voice_program_on_start)
 
     def attach(self, thread: threading.Thread) -> None:
         self._thread = thread
@@ -263,6 +264,7 @@ def _run_in_process_bridge(handle: _InProcessBridgeHandle) -> None:
                 show_notification_icon=False,
                 on_runtime_ready=handle.bind_stop,
                 on_reconnect_ready=handle.bind_reconnect,
+                launch_voice_program_on_start=handle.launch_voice_program_on_start,
             )
     except single_instance.DuplicateInstanceError:
         exit_code = single_instance.DUPLICATE_INSTANCE_EXIT_CODE
@@ -325,7 +327,9 @@ def stop_in_process_bridge(*, timeout: float = 7.0) -> Optional[bool]:
 
 
 def start_in_process_bridge(
-    *, grace_checks: int = DEFAULT_GRACE_CHECKS
+    *,
+    grace_checks: int = DEFAULT_GRACE_CHECKS,
+    launch_voice_program_on_start: bool = True,
 ) -> Union[LaunchResult, PendingBridgeLaunch]:
     """Start the single bridge worker without creating another OS process."""
 
@@ -345,7 +349,9 @@ def start_in_process_bridge(
                 pid=os.getpid(),
                 exit_code=ALREADY_RUNNING_EXIT_CODE,
             )
-        handle = _InProcessBridgeHandle()
+        handle = _InProcessBridgeHandle(
+            launch_voice_program_on_start=launch_voice_program_on_start
+        )
         thread = threading.Thread(
             target=_run_in_process_bridge,
             args=(handle,),
@@ -385,10 +391,14 @@ def launch_in_process_bridge(
     grace_checks: int = DEFAULT_GRACE_CHECKS,
     poll_interval_seconds: float = DEFAULT_POLL_INTERVAL_SECONDS,
     _sleep: Callable[[float], None] = time.sleep,
+    launch_voice_program_on_start: bool = True,
 ) -> LaunchResult:
     """Synchronous wrapper used only by bounded background workflows."""
 
-    attempt = start_in_process_bridge(grace_checks=grace_checks)
+    attempt = start_in_process_bridge(
+        grace_checks=grace_checks,
+        launch_voice_program_on_start=launch_voice_program_on_start,
+    )
     if isinstance(attempt, LaunchResult):
         return attempt
     while True:
