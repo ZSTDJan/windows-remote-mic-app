@@ -1140,13 +1140,6 @@ class SettingsControllerTests(unittest.TestCase):
         missing = qt_settings_app.hid_elevation_windows.HidHelperState(
             False, "protected_helper_missing"
         )
-        failed = qt_settings_app.hid_elevation_windows.HidHelperState(
-            False,
-            "hid_helper_setup_exit_"
-            + str(
-                qt_settings_app.hid_elevation_windows.HELPER_EXIT_VALIDATION_FAILED
-            ),
-        )
         with mock.patch.object(
             qt_settings_app.sys, "frozen", True, create=True
         ), mock.patch.object(
@@ -1160,15 +1153,25 @@ class SettingsControllerTests(unittest.TestCase):
         ):
             controller, _model = self._make_controller()
 
-        with mock.patch.object(
-            qt_settings_app.hid_helper_consumers,
-            "install_for_current_consumer",
-            return_value=failed,
-        ):
-            controller.repairHidHelper()
+        details = (
+            "hid_helper_task_acl_invalid",
+            "hid_helper_setup_exit_"
+            + str(
+                qt_settings_app.hid_elevation_windows.HELPER_EXIT_VALIDATION_FAILED
+            ),
+        )
+        for detail in details:
+            with self.subTest(detail=detail), mock.patch.object(
+                qt_settings_app.hid_helper_consumers,
+                "install_for_current_consumer",
+                return_value=qt_settings_app.hid_elevation_windows.HidHelperState(
+                    False, detail
+                ),
+            ):
+                controller.repairHidHelper()
 
-        self.assertIn("没有完成安装", controller.errorMessage)
-        self.assertIn("运行日志", controller.errorMessage)
+            self.assertIn("没有完成安装", controller.errorMessage)
+            self.assertIn("运行日志", controller.errorMessage)
 
     def test_portable_can_remove_the_shared_helper_after_confirmation(self):
         ready = qt_settings_app.hid_elevation_windows.HidHelperState(True)

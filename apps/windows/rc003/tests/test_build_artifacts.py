@@ -420,6 +420,15 @@ class HidHelperLauncherTests(unittest.TestCase):
         ):
             self.assertEqual(launcher.main(), 5)
 
+    def test_helper_specific_nonzero_exit_code_is_preserved(self):
+        launcher = self._load_launcher()
+        with mock.patch.object(
+            launcher,
+            "_load_helper_main",
+            return_value=mock.Mock(return_value=12),
+        ):
+            self.assertEqual(launcher.main(), 12)
+
     def test_elevated_launcher_never_writes_user_controlled_paths(self):
         text = _HID_HELPER_LAUNCHER_PATH.read_text(encoding="utf-8")
         self.assertNotIn("LOCALAPPDATA", text)

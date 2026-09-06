@@ -285,14 +285,21 @@ def _register_current_hid_helper_consumer() -> None:
 def _install_hid_helper() -> int:
     """Install or reuse the current user's pre-authorized HID helper."""
 
-    from . import config, hid_elevation_windows, hid_helper_consumers
+    from . import config, hid_elevation_windows, hid_helper_consumers, logging_setup
 
+    root = config.config_root()
     state = hid_helper_consumers.install_for_current_consumer(
-        config.config_root(),
+        root,
         hid_elevation_windows.request_install_elevation,
     )
     if state.available:
         return 0
+    logging_setup.write_parent_hid_helper_event(
+        "install_failed",
+        available=False,
+        detail=state.detail or "unknown",
+        root=root,
+    )
     if state.detail == "current_account_cannot_self_elevate":
         return HID_HELPER_ACCOUNT_UNSUPPORTED_EXIT_CODE
     print(
@@ -306,14 +313,21 @@ def _install_hid_helper() -> int:
 def _uninstall_hid_helper() -> int:
     """Remove the installed copy's ownership and preserve live portable users."""
 
-    from . import config, hid_elevation_windows, hid_helper_consumers
+    from . import config, hid_elevation_windows, hid_helper_consumers, logging_setup
 
+    root = config.config_root()
     state = hid_helper_consumers.uninstall_current_distribution(
-        config.config_root(),
+        root,
         hid_elevation_windows.request_uninstall_elevation,
     )
     if state.available:
         return 0
+    logging_setup.write_parent_hid_helper_event(
+        "uninstall_failed",
+        available=False,
+        detail=state.detail or "unknown",
+        root=root,
+    )
     if state.detail == "current_account_cannot_self_elevate":
         return HID_HELPER_ACCOUNT_UNSUPPORTED_EXIT_CODE
     print(

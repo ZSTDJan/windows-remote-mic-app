@@ -4865,7 +4865,7 @@ def _load_qt_classes() -> dict:
                 f"hid_helper_setup_exit_{hid_elevation_windows.HELPER_EXIT_REQUIRES_ADMIN}",
                 f"hid_helper_setup_exit_{hid_elevation_windows.HELPER_EXIT_VALIDATION_FAILED}",
                 f"hid_helper_setup_exit_{hid_elevation_windows.HELPER_EXIT_UNEXPECTED_FAILURE}",
-            }:
+            } or hid_elevation_windows.is_helper_setup_failure_detail(state.detail):
                 message = (
                     "管理员按键组件没有完成安装。"
                     "请在“按键接收”中重试；仍失败时打开运行日志。"

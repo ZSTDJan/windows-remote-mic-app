@@ -49,15 +49,18 @@ _HELPER_MAINTENANCE_LOCK_TIMEOUT_SECONDS = 110.0
 _HELPER_INJECT_LOCK_TIMEOUT_SECONDS = 2.0
 _REGISTERED_TASK_COMPLETION_TIMEOUT_SECONDS = 30.0
 _REGISTERED_TASK_POLL_SECONDS = 0.05
+_TASK_REGISTRATION_SETTLE_TIMEOUT_SECONDS = 5.0
+_TASK_REGISTRATION_SETTLE_POLL_SECONDS = 0.10
 _ELEVATED_PROCESS_TERMINATION_WAIT_MS = 10_000
 
 MANIFEST_SCHEMA_VERSION = 1
 HELPER_PROTOCOL_VERSION = 1
-# Generation 5 adds thread-safe Task Scheduler COM use and bounded injection
-# lock behavior. Task contract 4 accepts only the empty Triggers container
-# that Windows adds while normalizing an otherwise on-demand-only task.
-HELPER_GENERATION = 5
-TASK_CONTRACT_VERSION = 4
+# Generation 6 validates the task returned by RegisterTask and reports
+# sanitized setup stages to the normal-integrity parent. Task contract 5
+# accepts Windows' equivalent inherited administrator/SYSTEM task ACLs while
+# still granting only read/execute access to the requesting user.
+HELPER_GENERATION = 6
+TASK_CONTRACT_VERSION = 5
 MANIFEST_FILENAME = "helper-manifest.json"
 
 TASK_CREATE_OR_UPDATE = 0x6
@@ -72,6 +75,87 @@ HELPER_EXIT_VALIDATION_FAILED = 4
 HELPER_EXIT_UNEXPECTED_FAILURE = 5
 HELPER_EXIT_NEWER_PRESERVED = 6
 HELPER_EXIT_OPERATION_BUSY = 7
+HELPER_EXIT_TASK_REGISTRATION_FAILED = 8
+HELPER_EXIT_TASK_QUERY_FAILED = 9
+HELPER_EXIT_TASK_NOT_VISIBLE = 10
+HELPER_EXIT_TASK_XML_INVALID = 11
+HELPER_EXIT_TASK_ACL_INVALID = 12
+HELPER_EXIT_MANIFEST_WRITE_FAILED = 13
+HELPER_EXIT_MANIFEST_VERIFICATION_FAILED = 14
+HELPER_EXIT_INSTALL_ROLLBACK_FAILED = 15
+HELPER_EXIT_PROTECTED_HELPER_FAILED = 16
+HELPER_EXIT_TASK_SERVICE_UNAVAILABLE = 17
+HELPER_EXIT_INSTALL_FAILED = 18
+HELPER_EXIT_PATH_ACL_FAILED = 19
+HELPER_EXIT_COPY_HASH_FAILED = 20
+HELPER_EXIT_PATH_ACL_QUERY_FAILED = 21
+HELPER_EXIT_COPY_FAILED = 22
+HELPER_EXIT_SOURCE_INVALID = 23
+# 24 and 25 belong to the ordinary parent process' installer contract.
+HELPER_EXIT_PROTECTED_PATH_INVALID = 26
+HELPER_EXIT_CLEANUP_FAILED = 27
+HELPER_EXIT_TASK_REMOVAL_FAILED = 28
+HELPER_EXIT_MANIFEST_REMOVAL_FAILED = 29
+HELPER_EXIT_UNINSTALL_ROLLBACK_FAILED = 30
+HELPER_EXIT_UNINSTALL_FAILED = 31
+HELPER_EXIT_REQUEST_INVALID = 32
+HELPER_EXIT_OPERATION_UNAVAILABLE = 33
+
+_HELPER_EXIT_ERROR_DETAILS = {
+    HELPER_EXIT_TASK_REGISTRATION_FAILED: "hid_helper_task_registration_failed",
+    HELPER_EXIT_TASK_QUERY_FAILED: "hid_helper_task_query_failed",
+    HELPER_EXIT_TASK_NOT_VISIBLE: "hid_helper_task_not_visible",
+    HELPER_EXIT_TASK_XML_INVALID: "hid_helper_task_verification_failed",
+    HELPER_EXIT_TASK_ACL_INVALID: "hid_helper_task_acl_invalid",
+    HELPER_EXIT_MANIFEST_WRITE_FAILED: "helper_manifest_write_failed",
+    HELPER_EXIT_MANIFEST_VERIFICATION_FAILED: "helper_manifest_verification_failed",
+    HELPER_EXIT_INSTALL_ROLLBACK_FAILED: "hid_helper_install_rollback_failed",
+    HELPER_EXIT_PROTECTED_HELPER_FAILED: "protected_helper_verification_failed",
+    HELPER_EXIT_TASK_SERVICE_UNAVAILABLE: "hid_helper_task_service_unavailable",
+    HELPER_EXIT_INSTALL_FAILED: "hid_helper_install_failed",
+    HELPER_EXIT_PATH_ACL_FAILED: "protected_path_acl_failed",
+    HELPER_EXIT_COPY_HASH_FAILED: "helper_copy_hash_mismatch",
+    HELPER_EXIT_PATH_ACL_QUERY_FAILED: "protected_path_acl_query_failed",
+    HELPER_EXIT_COPY_FAILED: "helper_copy_failed",
+    HELPER_EXIT_SOURCE_INVALID: "bundled_helper_invalid",
+    HELPER_EXIT_PROTECTED_PATH_INVALID: "protected_path_invalid",
+    HELPER_EXIT_CLEANUP_FAILED: "hid_helper_cleanup_failed",
+    HELPER_EXIT_TASK_REMOVAL_FAILED: "hid_helper_task_removal_failed",
+    HELPER_EXIT_MANIFEST_REMOVAL_FAILED: "helper_manifest_removal_failed",
+    HELPER_EXIT_UNINSTALL_ROLLBACK_FAILED: "hid_helper_uninstall_rollback_failed",
+    HELPER_EXIT_UNINSTALL_FAILED: "hid_helper_uninstall_failed",
+    HELPER_EXIT_REQUEST_INVALID: "hid_helper_request_invalid",
+    HELPER_EXIT_OPERATION_UNAVAILABLE: "hid_helper_operation_unavailable",
+}
+_HELPER_ERROR_EXIT_CODES = {
+    detail: exit_code for exit_code, detail in _HELPER_EXIT_ERROR_DETAILS.items()
+}
+_HELPER_ERROR_EXIT_CODES.update(
+    {
+        "bundled_helper_missing": HELPER_EXIT_SOURCE_INVALID,
+        "bundled_helper_inspection_failed": HELPER_EXIT_SOURCE_INVALID,
+        "program_files_unavailable": HELPER_EXIT_PROTECTED_PATH_INVALID,
+        "protected_path_outside_program_files": HELPER_EXIT_PROTECTED_PATH_INVALID,
+        "protected_path_reparse_point": HELPER_EXIT_PROTECTED_PATH_INVALID,
+        "protected_path_acl_root_invalid": HELPER_EXIT_PROTECTED_PATH_INVALID,
+        "helper_manifest_inspection_failed": HELPER_EXIT_PROTECTED_HELPER_FAILED,
+        "protected_helper_orphan_invalid": HELPER_EXIT_PROTECTED_HELPER_FAILED,
+        "protected_helper_acl_invalid": HELPER_EXIT_PROTECTED_HELPER_FAILED,
+        "protected_helper_inspection_failed": HELPER_EXIT_PROTECTED_HELPER_FAILED,
+        "protected_helper_hash_mismatch": HELPER_EXIT_PROTECTED_HELPER_FAILED,
+        "protected_helper_removal_failed": HELPER_EXIT_CLEANUP_FAILED,
+        "protected_helper_cleanup_pending": HELPER_EXIT_CLEANUP_FAILED,
+        "legacy_hid_helper_task_invalid": HELPER_EXIT_CLEANUP_FAILED,
+        "legacy_protected_helper_invalid": HELPER_EXIT_CLEANUP_FAILED,
+        "legacy_hid_helper_task_removal_failed": HELPER_EXIT_CLEANUP_FAILED,
+        "legacy_protected_helper_removal_failed": HELPER_EXIT_CLEANUP_FAILED,
+        "request_sid_missing": HELPER_EXIT_REQUEST_INVALID,
+        "request_sid_mismatch": HELPER_EXIT_REQUEST_INVALID,
+        "current_user_sid_invalid": HELPER_EXIT_REQUEST_INVALID,
+        "current_user_sid_unavailable": HELPER_EXIT_REQUEST_INVALID,
+        "hid_helper_task_name_invalid": HELPER_EXIT_REQUEST_INVALID,
+    }
+)
 
 _NEWER_HELPER_DETAILS = frozenset(
     {
@@ -104,6 +188,16 @@ class HidHelperState:
 
 def is_newer_helper_state(state: HidHelperState) -> bool:
     return state.detail in _NEWER_HELPER_DETAILS
+
+
+def helper_setup_detail_from_exit_code(exit_code: int) -> str:
+    return _HELPER_EXIT_ERROR_DETAILS.get(
+        int(exit_code), f"hid_helper_setup_exit_{int(exit_code)}"
+    )
+
+
+def is_helper_setup_failure_detail(detail: str) -> bool:
+    return str(detail) in _HELPER_ERROR_EXIT_CODES
 
 
 @dataclass(frozen=True)
@@ -836,6 +930,8 @@ def _write_manifest_atomic(
             directory=False,
         )
         _replace(temporary, path)
+    except (HidElevationError, OSError, ValueError) as exc:
+        raise HidElevationError("helper_manifest_write_failed") from exc
     finally:
         try:
             temporary.unlink(missing_ok=True)
@@ -1126,15 +1222,37 @@ def _canonical_acl_sid(raw_sid: str) -> str:
     return aliases.get(sid, sid)
 
 
-def _task_rights_kind(raw_rights: str) -> str:
+_TASK_FULL_CONTROL_MASK = 0x001F01FF
+_TASK_ADMIN_SERVICE_MASK = 0x001F019F
+_TASK_READ_MASK = 0x00120089
+_TASK_READ_EXECUTE_MASK = 0x001200A9
+
+
+def _task_rights_mask(raw_rights: str) -> Optional[int]:
     rights = str(raw_rights).strip().upper()
-    if rights == "FA" or rights == "0X1F01FF":
-        return "full"
-    if rights == "FR" or rights == "0X120089":
-        return "read"
-    if rights in {"FRFX", "GRGX", "0X1200A9", "0XA0000000"}:
-        return "read_execute"
-    return "other"
+    symbolic = {
+        "FA": _TASK_FULL_CONTROL_MASK,
+        "GA": _TASK_FULL_CONTROL_MASK,
+        "FR": _TASK_READ_MASK,
+        "GR": _TASK_READ_MASK,
+        "FRFX": _TASK_READ_EXECUTE_MASK,
+        "FXFR": _TASK_READ_EXECUTE_MASK,
+        "GRGX": _TASK_READ_EXECUTE_MASK,
+        "GXGR": _TASK_READ_EXECUTE_MASK,
+    }
+    if rights in symbolic:
+        return symbolic[rights]
+    if rights.startswith("0X"):
+        try:
+            numeric = int(rights, 16)
+        except ValueError:
+            return None
+        return {
+            0x10000000: _TASK_FULL_CONTROL_MASK,
+            0x80000000: _TASK_READ_MASK,
+            0xA0000000: _TASK_READ_EXECUTE_MASK,
+        }.get(numeric, numeric)
+    return None
 
 
 def validate_task_security_sddl(sddl: str, *, user_sid: str) -> bool:
@@ -1148,38 +1266,44 @@ def validate_task_security_sddl(sddl: str, *, user_sid: str) -> bool:
     )
     if match is None:
         return False
-    owner, group, dacl_flags, ace_blob = match.groups()
-    if (
-        _canonical_acl_sid(owner) != "S-1-5-32-544"
-        or _canonical_acl_sid(group) != "S-1-5-32-544"
-        or "P" not in dacl_flags
-    ):
+    owner, group, _dacl_flags, ace_blob = match.groups()
+    if _canonical_acl_sid(owner) not in {"S-1-5-18", "S-1-5-32-544"}:
+        return False
+    if not group:
         return False
     raw_aces = re.findall(r"\(([^()]*)\)", ace_blob)
-    if len(raw_aces) != 3 or "".join(f"({ace})" for ace in raw_aces) != ace_blob:
+    if not raw_aces or "".join(f"({ace})" for ace in raw_aces) != ace_blob:
         return False
-    seen: dict[str, str] = {}
+    allowed_trustees = {"S-1-5-18", "S-1-5-32-544", expected_sid}
+    effective_masks = {trustee: 0 for trustee in allowed_trustees}
     for raw_ace in raw_aces:
         fields = raw_ace.split(";")
         if len(fields) != 6:
             return False
         ace_type, ace_flags, rights, object_guid, inherit_guid, trustee = fields
-        if (
-            ace_type != "A"
-            or ace_flags
-            or object_guid
-            or inherit_guid
-        ):
+        if ace_type != "A" or object_guid or inherit_guid:
+            return False
+        flags = _split_ace_flags(ace_flags)
+        if not flags.issubset({"ID"}):
             return False
         normalized_trustee = _canonical_acl_sid(trustee)
-        if normalized_trustee in seen:
+        if normalized_trustee not in allowed_trustees:
             return False
-        seen[normalized_trustee] = _task_rights_kind(rights)
-    return seen == {
-        "S-1-5-18": "full",
-        "S-1-5-32-544": "full",
-        expected_sid: "read_execute",
-    }
+        mask = _task_rights_mask(rights)
+        if mask is None or mask <= 0:
+            return False
+        if normalized_trustee == expected_sid and mask & ~_TASK_READ_EXECUTE_MASK:
+            return False
+        if normalized_trustee != expected_sid and mask & ~_TASK_FULL_CONTROL_MASK:
+            return False
+        effective_masks[normalized_trustee] |= mask
+    return (
+        effective_masks[expected_sid] == _TASK_READ_EXECUTE_MASK
+        and effective_masks["S-1-5-18"] & _TASK_ADMIN_SERVICE_MASK
+        == _TASK_ADMIN_SERVICE_MASK
+        and effective_masks["S-1-5-32-544"] & _TASK_ADMIN_SERVICE_MASK
+        == _TASK_ADMIN_SERVICE_MASK
+    )
 
 
 def _task_service_root() -> object:
@@ -1308,17 +1432,60 @@ def _read_registered_task(
             task = _find_registered_task(root, task_name)
             if task is None:
                 return None
-            return _RegisteredTaskSnapshot(
-                xml_text=str(task.Xml),
-                security_sddl=str(
-                    task.GetSecurityDescriptor(TASK_SECURITY_INFORMATION)
-                ),
-            )
+            return _registered_task_snapshot(task)
     except Exception as exc:
         if isinstance(exc, HidElevationError):
             raise
         if _task_missing_error(exc):
             return None
+        raise HidElevationError("hid_helper_task_query_failed") from exc
+
+
+def _read_registered_task_after_registration(
+    task_name: str,
+    *,
+    timeout_seconds: float = _TASK_REGISTRATION_SETTLE_TIMEOUT_SECONDS,
+    poll_seconds: float = _TASK_REGISTRATION_SETTLE_POLL_SECONDS,
+    _read_task: Optional[
+        Callable[[str], Optional[_RegisteredTaskSnapshot]]
+    ] = None,
+    _sleep: Optional[Callable[[float], None]] = None,
+) -> Optional[_RegisteredTaskSnapshot]:
+    """Wait briefly for Task Scheduler enumeration to expose a new task."""
+
+    read_task = _read_task or _read_registered_task
+    sleep = _sleep or time.sleep
+    poll = max(0.01, float(poll_seconds))
+    attempts = max(1, int(max(0.0, float(timeout_seconds)) / poll) + 1)
+    last_query_error: Optional[HidElevationError] = None
+    for attempt in range(attempts):
+        try:
+            snapshot = read_task(task_name)
+        except HidElevationError as exc:
+            if str(exc) != "hid_helper_task_query_failed":
+                raise
+            snapshot = None
+            last_query_error = exc
+        else:
+            last_query_error = None
+        if snapshot is not None:
+            return snapshot
+        if attempt + 1 < attempts:
+            sleep(poll)
+    if last_query_error is not None:
+        raise last_query_error
+    return None
+
+
+def _registered_task_snapshot(task: object) -> _RegisteredTaskSnapshot:
+    try:
+        return _RegisteredTaskSnapshot(
+            xml_text=str(task.Xml),
+            security_sddl=str(
+                task.GetSecurityDescriptor(TASK_SECURITY_INFORMATION)
+            ),
+        )
+    except Exception as exc:
         raise HidElevationError("hid_helper_task_query_failed") from exc
 
 
@@ -1328,10 +1495,10 @@ def _register_task(
     security_sddl: str,
     *,
     _root: Optional[object] = None,
-) -> None:
+) -> Optional[_RegisteredTaskSnapshot]:
     try:
         with _task_service_session(_root) as root:
-            root.RegisterTask(
+            registered = root.RegisterTask(
                 str(task_name),
                 str(xml_text),
                 TASK_CREATE_OR_UPDATE | TASK_DONT_ADD_PRINCIPAL_ACE,
@@ -1340,6 +1507,10 @@ def _register_task(
                 TASK_LOGON_INTERACTIVE_TOKEN,
                 str(security_sddl),
             )
+            try:
+                return _registered_task_snapshot(registered)
+            except HidElevationError:
+                return None
     except Exception as exc:
         if isinstance(exc, HidElevationError):
             raise
@@ -1861,7 +2032,7 @@ def _copy_verified_helper(
 ) -> None:
     source = _lexical_absolute(source)
     if not source.is_file():
-        raise FileNotFoundError(source)
+        raise HidElevationError("helper_copy_failed")
     temporary = destination.with_name(
         f".{destination.name}.{os.getpid()}.{time.time_ns()}.tmp"
     )
@@ -1871,6 +2042,10 @@ def _copy_verified_helper(
             raise HidElevationError("helper_copy_hash_mismatch")
         _apply_path_security(temporary, user_sid=user_sid, directory=False)
         os.replace(temporary, destination)
+    except HidElevationError:
+        raise
+    except (OSError, ValueError) as exc:
+        raise HidElevationError("helper_copy_failed") from exc
     finally:
         try:
             temporary.unlink(missing_ok=True)
@@ -1907,6 +2082,24 @@ def _restore_registered_task(
     _register_task(task_name, snapshot.xml_text, snapshot.security_sddl)
 
 
+def _validate_registered_task_snapshot(
+    snapshot: _RegisteredTaskSnapshot,
+    *,
+    helper_path: Path,
+    user_sid: str,
+    task_name: str,
+) -> None:
+    if not validate_registered_task_xml(
+        snapshot.xml_text,
+        helper_path=helper_path,
+        user_sid=user_sid,
+        task_name=task_name,
+    ):
+        raise HidElevationError("hid_helper_task_verification_failed")
+    if not validate_task_security_sddl(snapshot.security_sddl, user_sid=user_sid):
+        raise HidElevationError("hid_helper_task_acl_invalid")
+
+
 def _validate_requesting_sid(request_sid: Optional[str]) -> str:
     if request_sid is None:
         raise HidElevationError("request_sid_missing")
@@ -1925,13 +2118,18 @@ def install_task(
     program_files_root: Optional[Path] = None,
     _read_acl: Callable[[Path], str] = _read_path_security_sddl,
 ) -> None:
-    if not _is_windows() or not is_process_elevated():
-        raise PermissionError("administrator elevation required")
+    if not _is_windows():
+        raise HidElevationError("windows_only")
+    if not is_process_elevated():
+        raise HidElevationError("administrator_elevation_required")
     sid = _validate_requesting_sid(request_sid)
     source = _lexical_absolute(Path(source_executable or sys.executable))
     if not source.is_file():
         raise HidElevationError("bundled_helper_missing")
-    source_hash = _sha256(source)
+    try:
+        source_hash = _sha256(source)
+    except OSError as exc:
+        raise HidElevationError("bundled_helper_inspection_failed") from exc
     trusted_root = Path(program_files_root or _program_files_root())
     root = Path(
         owner_root
@@ -2050,52 +2248,79 @@ def install_task(
     )
     assert_no_reparse_points(target, trusted_root=trusted_root)
     target_existed = os.path.lexists(target)
-    if target_existed and not target.is_file():
-        raise HidElevationError("protected_helper_orphan_invalid")
     expected_hash = manifest.helper_sha256
-    if reuse_existing_manifest:
-        if not target_existed or _sha256(target) != expected_hash:
-            raise HidElevationError("protected_helper_verification_failed")
-    elif not target_existed or _sha256(target) != expected_hash:
-        _copy_verified_helper(source, target, user_sid=sid)
-    if _sha256(target) != expected_hash or not validate_path_security_sddl(
-        _read_acl(target), user_sid=sid, directory=False
-    ):
-        if not target_existed:
-            try:
-                _remove_helper_generation(target, owner_root=root)
-            except HidElevationError as rollback_exc:
-                raise HidElevationError(
-                    "hid_helper_install_rollback_failed"
-                ) from rollback_exc
-        raise HidElevationError("protected_helper_verification_failed")
-
-    xml_text = task_definition_xml(
-        target,
-        sid,
-        task_name=manifest.task_name,
-    )
-    security_sddl = task_security_sddl(sid)
+    target_mutated = False
     task_mutated = False
     manifest_mutated = False
     try:
-        task_mutated = True
-        _register_task(manifest.task_name, xml_text, security_sddl)
-        registered = _read_registered_task(manifest.task_name)
-        if registered is None or not validate_registered_task_xml(
-            registered.xml_text,
-            helper_path=target,
-            user_sid=sid,
+        if target_existed and not target.is_file():
+            raise HidElevationError("protected_helper_orphan_invalid")
+        try:
+            target_hash = _sha256(target) if target_existed else ""
+        except OSError as exc:
+            raise HidElevationError("protected_helper_verification_failed") from exc
+        if reuse_existing_manifest:
+            if not target_existed or target_hash != expected_hash:
+                raise HidElevationError("protected_helper_verification_failed")
+        elif target_hash != expected_hash:
+            _copy_verified_helper(source, target, user_sid=sid)
+            target_mutated = True
+        try:
+            installed_hash = _sha256(target)
+        except OSError as exc:
+            raise HidElevationError("protected_helper_verification_failed") from exc
+        try:
+            target_acl = _read_acl(target)
+        except HidElevationError:
+            raise
+        except OSError as exc:
+            raise HidElevationError("protected_path_acl_query_failed") from exc
+        if installed_hash != expected_hash or not validate_path_security_sddl(
+            target_acl, user_sid=sid, directory=False
+        ):
+            raise HidElevationError("protected_helper_verification_failed")
+
+        xml_text = task_definition_xml(
+            target,
+            sid,
             task_name=manifest.task_name,
-        ):
-            raise HidElevationError("hid_helper_task_verification_failed")
-        if not validate_task_security_sddl(
-            registered.security_sddl, user_sid=sid
-        ):
-            raise HidElevationError("hid_helper_task_acl_invalid")
+        )
+        security_sddl = task_security_sddl(sid)
+        task_mutated = True
+        registered_from_call = _register_task(
+            manifest.task_name, xml_text, security_sddl
+        )
+        if registered_from_call is not None:
+            _validate_registered_task_snapshot(
+                registered_from_call,
+                helper_path=target,
+                user_sid=sid,
+                task_name=manifest.task_name,
+            )
+        else:
+            registered_from_query = _read_registered_task_after_registration(
+                manifest.task_name
+            )
+            if registered_from_query is None:
+                raise HidElevationError("hid_helper_task_not_visible")
+            _validate_registered_task_snapshot(
+                registered_from_query,
+                helper_path=target,
+                user_sid=sid,
+                task_name=manifest.task_name,
+            )
         assert_no_reparse_points(manifest_file, trusted_root=trusted_root)
         manifest_mutated = True
         _write_manifest_atomic(manifest_file, manifest)
+        try:
+            saved_manifest = _load_manifest(manifest_file)
+            manifest_acl_valid = validate_path_security_sddl(
+                _read_acl(manifest_file), user_sid=sid, directory=False
+            )
+        except (HidElevationError, OSError, ValueError) as exc:
+            raise HidElevationError("helper_manifest_verification_failed") from exc
+        if saved_manifest != manifest or not manifest_acl_valid:
+            raise HidElevationError("helper_manifest_verification_failed")
     except Exception as exc:
         rollback_failed = False
         if task_mutated:
@@ -2112,7 +2337,7 @@ def install_task(
                 )
             except Exception:
                 rollback_failed = True
-        if not target_existed:
+        if target_mutated:
             try:
                 _remove_helper_generation(target, owner_root=root)
             except Exception:
@@ -2150,8 +2375,10 @@ def uninstall_task(
     program_files_root: Optional[Path] = None,
     _read_acl: Callable[[Path], str] = _read_path_security_sddl,
 ) -> None:
-    if not _is_windows() or not is_process_elevated():
-        raise PermissionError("administrator elevation required")
+    if not _is_windows():
+        raise HidElevationError("windows_only")
+    if not is_process_elevated():
+        raise HidElevationError("administrator_elevation_required")
     sid = _validate_requesting_sid(request_sid)
     trusted_root = Path(program_files_root or _program_files_root())
     root = Path(
@@ -2413,6 +2640,42 @@ def _run_elevated_and_wait(
         kernel32.CloseHandle(info.hProcess)
 
 
+_TRANSIENT_POST_SETUP_INSPECTION_DETAILS = frozenset(
+    {
+        "hid_helper_task_missing",
+        "hid_helper_task_query_failed",
+    }
+)
+
+
+def _inspect_installed_helper_after_setup(
+    inspect: Callable[[], HidHelperState],
+    *,
+    timeout_seconds: float = _TASK_REGISTRATION_SETTLE_TIMEOUT_SECONDS,
+    poll_seconds: float = _TASK_REGISTRATION_SETTLE_POLL_SECONDS,
+    _sleep: Optional[Callable[[float], None]] = None,
+) -> HidHelperState:
+    """Retry only the Task Scheduler states known to settle after registration."""
+
+    sleep = _sleep or time.sleep
+    poll = max(0.01, float(poll_seconds))
+    attempts = max(1, int(max(0.0, float(timeout_seconds)) / poll) + 1)
+    state = HidHelperState(False, "hid_helper_inspection_failed")
+    for attempt in range(attempts):
+        try:
+            state = inspect()
+        except Exception:
+            return HidHelperState(False, "hid_helper_inspection_failed")
+        if (
+            state.available
+            or state.detail not in _TRANSIENT_POST_SETUP_INSPECTION_DETAILS
+        ):
+            return state
+        if attempt + 1 < attempts:
+            sleep(poll)
+    return state
+
+
 def request_install_elevation(
     *,
     helper_path: Optional[Path] = None,
@@ -2421,6 +2684,7 @@ def request_install_elevation(
     _inspect: Callable[[], HidHelperState] = inspect_installed_helper,
     _can_self_elevate: Callable[[], bool] = can_current_user_self_elevate,
     _current_sid: Callable[[], str] = current_user_sid,
+    _sleep: Optional[Callable[[float], None]] = None,
 ) -> HidHelperState:
     if not _is_windows():
         return HidHelperState(False, "windows_only")
@@ -2446,10 +2710,10 @@ def request_install_elevation(
         )
         exit_code = _launch(source, arguments, timeout_seconds)
     except HidElevationError as exc:
-        try:
-            final_state = _inspect()
-        except Exception:
-            final_state = HidHelperState(False, "hid_helper_inspection_failed")
+        final_state = _inspect_installed_helper_after_setup(
+            _inspect,
+            _sleep=_sleep,
+        )
         if final_state.available:
             return final_state
         if str(exc) == "uac_cancelled" and current_state.available:
@@ -2457,10 +2721,10 @@ def request_install_elevation(
         return HidHelperState(False, str(exc))
     except (OSError, ValueError):
         return HidHelperState(False, "hid_helper_setup_launch_failed")
-    try:
-        installed = _inspect()
-    except Exception:
-        installed = HidHelperState(False, "hid_helper_inspection_failed")
+    installed = _inspect_installed_helper_after_setup(
+        _inspect,
+        _sleep=_sleep,
+    )
     if exit_code == HELPER_EXIT_NEWER_PRESERVED:
         if installed.available:
             return installed
@@ -2470,7 +2734,7 @@ def request_install_elevation(
             return HidHelperState(True, "helper_cleanup_pending")
         return installed
     if exit_code != HELPER_EXIT_OK:
-        return HidHelperState(False, f"hid_helper_setup_exit_{exit_code}")
+        return HidHelperState(False, helper_setup_detail_from_exit_code(exit_code))
     return installed
 
 
@@ -2530,7 +2794,7 @@ def request_uninstall_elevation(
     except (HidElevationError, OSError, ValueError):
         return HidHelperState(False, "hid_helper_inspection_failed")
     if exit_code != HELPER_EXIT_OK:
-        return HidHelperState(False, f"hid_helper_setup_exit_{exit_code}")
+        return HidHelperState(False, helper_setup_detail_from_exit_code(exit_code))
     if not removal_still_required:
         return HidHelperState(True)
     return HidHelperState(False, "hid_helper_removal_incomplete")
@@ -2626,14 +2890,17 @@ def helper_main(argv: Optional[Sequence[str]] = None) -> int:
     group.add_argument(INJECT_FLAG, action="store_true")
     group.add_argument(SELF_CHECK_FLAG, action="store_true")
     parser.add_argument(REQUEST_SID_FLAG)
+    operation_failure_exit = HELPER_EXIT_VALIDATION_FAILED
     try:
         args = parser.parse_args(list(argv) if argv is not None else None)
         if getattr(args, INSTALL_FLAG[2:].replace("-", "_")):
+            operation_failure_exit = HELPER_EXIT_INSTALL_FAILED
             _run_serialized_helper_operation(
                 lambda: install_task(request_sid=args.request_sid),
                 lock_timeout_seconds=_HELPER_MAINTENANCE_LOCK_TIMEOUT_SECONDS,
             )
         elif getattr(args, UNINSTALL_FLAG[2:].replace("-", "_")):
+            operation_failure_exit = HELPER_EXIT_UNINSTALL_FAILED
             _run_serialized_helper_operation(
                 lambda: uninstall_task(request_sid=args.request_sid),
                 lock_timeout_seconds=_HELPER_MAINTENANCE_LOCK_TIMEOUT_SECONDS,
@@ -2650,15 +2917,16 @@ def helper_main(argv: Optional[Sequence[str]] = None) -> int:
                 raise HidElevationError("unexpected_request_sid")
             _self_check()
         return HELPER_EXIT_OK
-    except PermissionError:
-        return HELPER_EXIT_REQUIRES_ADMIN
     except HidElevationError as exc:
-        if str(exc) == "newer_helper_preserved":
+        detail = str(exc)
+        if detail == "administrator_elevation_required":
+            return HELPER_EXIT_REQUIRES_ADMIN
+        if detail == "newer_helper_preserved":
             return HELPER_EXIT_NEWER_PRESERVED
-        if str(exc) == "hid_helper_operation_busy":
+        if detail == "hid_helper_operation_busy":
             return HELPER_EXIT_OPERATION_BUSY
-        return HELPER_EXIT_VALIDATION_FAILED
+        return _HELPER_ERROR_EXIT_CODES.get(detail, operation_failure_exit)
     except (OSError, RuntimeError, ValueError):
-        return HELPER_EXIT_VALIDATION_FAILED
+        return operation_failure_exit
     except Exception:
         return HELPER_EXIT_UNEXPECTED_FAILURE

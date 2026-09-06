@@ -25,6 +25,7 @@ from ovb_rc003 import (
     frida_compat,
     hid_elevation_windows,
     hid_helper_consumers,
+    logging_setup,
     single_instance,
     windows_diagnostics,
 )
@@ -92,19 +93,29 @@ class HidHelperMaintenanceEntrypointTests(unittest.TestCase):
         )
 
     def test_install_failure_returns_nonzero_without_starting_the_desktop(self):
-        with tempfile.TemporaryDirectory() as raw, mock.patch.object(
-            config, "config_root", return_value=Path(raw)
-        ), mock.patch.object(
-            hid_helper_consumers,
-            "install_for_current_consumer",
-            return_value=hid_elevation_windows.HidHelperState(
-                False, "uac_cancelled"
-            ),
-        ):
-            result = main_module._install_hid_helper()
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            with mock.patch.object(
+                config, "config_root", return_value=root
+            ), mock.patch.object(
+                hid_helper_consumers,
+                "install_for_current_consumer",
+                return_value=hid_elevation_windows.HidHelperState(
+                    False, "hid_helper_task_acl_invalid"
+                ),
+            ), mock.patch.object(
+                logging_setup, "write_parent_hid_helper_event"
+            ) as helper_log:
+                result = main_module._install_hid_helper()
 
         self.assertEqual(
             result, main_module.HID_HELPER_MAINTENANCE_FAILED_EXIT_CODE
+        )
+        helper_log.assert_called_once_with(
+            "install_failed",
+            available=False,
+            detail="hid_helper_task_acl_invalid",
+            root=root,
         )
 
     def test_standard_account_install_returns_the_dedicated_installer_code(self):
@@ -154,7 +165,9 @@ class HidHelperMaintenanceEntrypointTests(unittest.TestCase):
                 return_value=hid_elevation_windows.HidHelperState(
                     False, "uac_cancelled"
                 ),
-            ) as uninstall:
+            ) as uninstall, mock.patch.object(
+                logging_setup, "write_parent_hid_helper_event"
+            ) as helper_log:
                 result = main_module._uninstall_hid_helper()
 
         self.assertEqual(
@@ -163,6 +176,12 @@ class HidHelperMaintenanceEntrypointTests(unittest.TestCase):
         uninstall.assert_called_once_with(
             root,
             hid_elevation_windows.request_uninstall_elevation,
+        )
+        helper_log.assert_called_once_with(
+            "uninstall_failed",
+            available=False,
+            detail="uac_cancelled",
+            root=root,
         )
 
     def test_standard_account_uninstall_restores_marker_and_returns_dedicated_code(self):

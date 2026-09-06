@@ -89,6 +89,28 @@ class HidHelperConsumerTests(unittest.TestCase):
             self.assertFalse(first_marker.is_file())
             self.assertTrue(second_marker.is_file())
 
+    def test_install_preserves_the_specific_helper_failure_detail(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            config_root = root / "config"
+            portable = self._distribution(root, "portable", installed=False)
+
+            state = hid_helper_consumers.install_for_current_consumer(
+                config_root,
+                lambda: hid_elevation_windows.HidHelperState(
+                    False, "hid_helper_task_acl_invalid"
+                ),
+                frozen=True,
+                executable=str(portable),
+            )
+
+            self.assertEqual(
+                state,
+                hid_elevation_windows.HidHelperState(
+                    False, "hid_helper_task_acl_invalid"
+                ),
+            )
+
     def test_portable_remove_keeps_its_marker_when_newer_helper_is_preserved(self):
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
