@@ -36,6 +36,8 @@ LEGACY_HELPER_RELATIVE_PATH = (
 )
 TASK_NAME_PREFIX = r"\RemoteMicRC003-HidTap-"
 PROTECTED_NAMESPACE = "HidHelperUsersV1"
+PROTECTED_RUNTIME_NAMESPACE = "HidRuntimeUsersV1"
+LOCAL_SERVICE_SID = "S-1-5-19"
 HELPER_EXE_NAME = "RemoteMicRC003HidHelper.exe"
 HELPER_BUNDLE_RELATIVE_PATH = Path("_internal") / HELPER_EXE_NAME
 INSTALL_FLAG = "--install-task"
@@ -55,11 +57,9 @@ _ELEVATED_PROCESS_TERMINATION_WAIT_MS = 10_000
 
 MANIFEST_SCHEMA_VERSION = 1
 HELPER_PROTOCOL_VERSION = 1
-# Generation 7 replaces generation 6 after the task-validation and runtime
-# injection fixes changed the frozen helper binary. A generation bump is the
-# upgrade boundary that prevents an older, otherwise valid helper from being
-# silently reused by a newer application build.
-HELPER_GENERATION = 7
+# Generation 8 gives WUDFHost's LocalService identity read/execute access only
+# to the verified Gadget runtime. The helper executable remains administrator-only.
+HELPER_GENERATION = 8
 TASK_CONTRACT_VERSION = 5
 MANIFEST_FILENAME = "helper-manifest.json"
 
@@ -478,6 +478,22 @@ def protected_owner_root(
     )
 
 
+def protected_runtime_owner_root(
+    user_sid: str,
+    *,
+    program_files_root: Optional[Path] = None,
+    environ: Optional[Mapping[str, str]] = None,
+) -> Path:
+    root = program_files_root or _program_files_root(environ)
+    return (
+        Path(root)
+        / "RemoteMic"
+        / "RC003"
+        / PROTECTED_RUNTIME_NAMESPACE
+        / sid_key(user_sid)
+    )
+
+
 def helper_relative_path(
     helper_sha256: str,
     *,
@@ -612,24 +628,46 @@ def assert_no_reparse_points(path: Path, *, trusted_root: Path) -> None:
             raise HidElevationError("protected_path_reparse_point")
 
 
-def _path_security_sddl_text(user_sid: str, *, directory: bool) -> str:
+def _additional_read_execute_sids(
+    user_sid: str,
+    read_execute_sids: Sequence[str],
+) -> tuple[str, ...]:
+    owner_sid = canonical_user_sid(user_sid)
+    reserved = {"S-1-5-18", "S-1-5-32-544", owner_sid}
+    result: list[str] = []
+    for raw_sid in read_execute_sids:
+        sid = canonical_user_sid(raw_sid)
+        if sid in reserved or sid in result:
+            raise HidElevationError("protected_path_acl_sid_invalid")
+        result.append(sid)
+    return tuple(result)
+
+
+def _path_security_sddl_text(
+    user_sid: str,
+    *,
+    directory: bool,
+    read_execute_sids: Sequence[str] = (),
+) -> str:
     sid = canonical_user_sid(user_sid)
-    if directory:
-        return (
-            "O:BAG:BAD:P"
-            "(A;OICI;FA;;;SY)"
-            "(A;OICI;FA;;;BA)"
-            f"(A;OICI;GRGX;;;{sid})"
-        )
-    return (
-        "O:BAG:BAD:P"
-        "(A;;FA;;;SY)"
-        "(A;;FA;;;BA)"
-        f"(A;;GR;;;{sid})"
-    )
+    readers = _additional_read_execute_sids(sid, read_execute_sids)
+    flags = "OICI" if directory else ""
+    entries = [
+        f"(A;{flags};FA;;;SY)",
+        f"(A;{flags};FA;;;BA)",
+        *(f"(A;{flags};GRGX;;;{reader})" for reader in readers),
+        f"(A;{flags};{'GRGX' if directory else 'GR'};;;{sid})",
+    ]
+    return "O:BAG:BAD:P" + "".join(entries)
 
 
-def _apply_path_security(path: Path, *, user_sid: str, directory: bool) -> None:
+def _apply_path_security(
+    path: Path,
+    *,
+    user_sid: str,
+    directory: bool,
+    read_execute_sids: Sequence[str] = (),
+) -> None:
     if not _is_windows():
         raise HidElevationError("windows_only")
     advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
@@ -653,7 +691,11 @@ def _apply_path_security(path: Path, *, user_sid: str, directory: bool) -> None:
     kernel32.LocalFree.restype = ctypes.c_void_p
     descriptor = ctypes.c_void_p()
     descriptor_size = wintypes.DWORD()
-    sddl = _path_security_sddl_text(user_sid, directory=directory)
+    sddl = _path_security_sddl_text(
+        user_sid,
+        directory=directory,
+        read_execute_sids=read_execute_sids,
+    )
     if not advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW(
         sddl,
         1,
@@ -757,9 +799,13 @@ def validate_path_security_sddl(
     *,
     user_sid: str,
     directory: bool,
+    read_execute_sids: Sequence[str] = (),
 ) -> bool:
     try:
         expected_sid = canonical_user_sid(user_sid)
+        expected_readers = _additional_read_execute_sids(
+            expected_sid, read_execute_sids
+        )
     except HidElevationError:
         return False
     normalized = re.sub(r"\s+", "", str(sddl)).upper()
@@ -776,7 +822,9 @@ def validate_path_security_sddl(
     ):
         return False
     raw_aces = re.findall(r"\(([^()]*)\)", ace_blob)
-    if len(raw_aces) != 3 or "".join(f"({ace})" for ace in raw_aces) != ace_blob:
+    if len(raw_aces) != 3 + len(expected_readers) or "".join(
+        f"({ace})" for ace in raw_aces
+    ) != ace_blob:
         return False
     seen: dict[str, tuple[set[str], str]] = {}
     expected_flags = {"OI", "CI"} if directory else set()
@@ -795,11 +843,18 @@ def validate_path_security_sddl(
             return False
         seen[normalized_trustee] = (flags, _path_rights_kind(rights))
     expected_user_rights = "read_execute" if directory else "read"
-    return seen == {
+    expected = {
         "S-1-5-18": (expected_flags, "full"),
         "S-1-5-32-544": (expected_flags, "full"),
         expected_sid: (expected_flags, expected_user_rights),
     }
+    expected.update(
+        {
+            reader: (expected_flags, "read_execute")
+            for reader in expected_readers
+        }
+    )
+    return seen == expected
 
 
 def ensure_protected_directory(
@@ -808,6 +863,7 @@ def ensure_protected_directory(
     user_sid: str,
     trusted_root: Optional[Path] = None,
     security_root: Optional[Path] = None,
+    read_execute_sids: Sequence[str] = (),
 ) -> Path:
     root = trusted_root or _program_files_root()
     candidate, root = _assert_within(path, root)
@@ -831,7 +887,12 @@ def ensure_protected_directory(
         else:
             current.mkdir()
         if protected:
-            _apply_path_security(current, user_sid=user_sid, directory=True)
+            _apply_path_security(
+                current,
+                user_sid=user_sid,
+                directory=True,
+                read_execute_sids=read_execute_sids,
+            )
     assert_no_reparse_points(candidate, trusted_root=root)
     return candidate
 
@@ -1275,6 +1336,7 @@ def _canonical_acl_sid(raw_sid: str) -> str:
     aliases = {
         "SY": "S-1-5-18",
         "BA": "S-1-5-32-544",
+        "LS": LOCAL_SERVICE_SID,
     }
     return aliases.get(sid, sid)
 

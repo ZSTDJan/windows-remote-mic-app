@@ -8276,6 +8276,15 @@ result["status_cases"] = {
     "connected_input_wait": runtime_case(
         "no_device", "waiting_for_rc003_host", connected=True
     ),
+    "first_hid_input_wait": runtime_case(
+        "no_device", "attached_waiting_for_hid_io", reconnect=True
+    ),
+    "first_hid_input_wait_connected": runtime_case(
+        "device_removed", "attached_waiting_for_hid_io", connected=True
+    ),
+    "verified_hid_without_raw": runtime_case(
+        "no_device", "ready", reconnect=True
+    ),
     "restart": runtime_case("ready", "ready", connected=True, restart=True),
     "reconnect": runtime_case(
         "ready", "ready", connected=False, reconnect=True
@@ -9514,6 +9523,10 @@ class SettingsShellSourceContractTests(unittest.TestCase):
         self.assertIn("function bridgeNeedsRestartAction()", self.device_qml)
         self.assertIn("rawInputReady() && hidTapReady()", self.device_qml)
         self.assertIn("if (buttonReceiverWaitsForRemote())", self.device_qml)
+        self.assertIn(
+            "if (rawInputWaitsForRemote() && hidTapWaitsForFirstInput())",
+            self.device_qml,
+        )
         self.assertNotIn('objectName: "mappingBridgeWarning"', self.buttons_qml)
         self.assertNotIn('objectName: "mappingListFrame"', self.buttons_qml)
         self.assertIn("SettingsController.bridgeRunning", self.device_qml)
@@ -10737,6 +10750,31 @@ class OffscreenQmlLoadTests(unittest.TestCase):
             "让遥控器按键在电脑上生效",
         )
         self.assertFalse(cases["connected_input_wait"]["action"]["visible"])
+        self.assertEqual(
+            cases["first_hid_input_wait"]["buttons"]["state"], "请按遥控器"
+        )
+        self.assertEqual(
+            cases["first_hid_input_wait"]["service"]["state"], "请按遥控器"
+        )
+        self.assertFalse(cases["first_hid_input_wait"]["action"]["visible"])
+        self.assertEqual(
+            cases["first_hid_input_wait_connected"]["buttons"]["state"],
+            "请按遥控器",
+        )
+        self.assertEqual(
+            cases["first_hid_input_wait_connected"]["service"]["state"],
+            "已连接",
+        )
+        self.assertFalse(
+            cases["first_hid_input_wait_connected"]["action"]["visible"]
+        )
+        self.assertEqual(
+            cases["verified_hid_without_raw"]["buttons"]["state"], "请重新连接"
+        )
+        self.assertEqual(
+            cases["verified_hid_without_raw"]["service"]["state"], "请重新连接"
+        )
+        self.assertTrue(cases["verified_hid_without_raw"]["action"]["visible"])
         self.assertEqual(cases["restart"]["service"]["state"], "请重新连接")
         self.assertEqual(
             cases["restart"]["service"]["detail"],

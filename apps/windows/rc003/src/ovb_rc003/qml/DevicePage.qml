@@ -107,6 +107,10 @@ Item {
         ])
     }
 
+    function hidTapWaitsForFirstInput() {
+        return SettingsController.hidTapState === "attached_waiting_for_hid_io"
+    }
+
     function buttonReceiverWaitsForRemote() {
         return rawInputWaitsForRemote() && hidTapWaitsForRemote()
     }
@@ -164,6 +168,13 @@ Item {
                     return "checking"
                 return "ready"
             }
+            if (rawInputWaitsForRemote() && hidTapWaitsForFirstInput()) {
+                if (deviceCode === "unpaired")
+                    return "unpaired"
+                if (deviceCode === "conflict")
+                    return "conflict"
+                return "waiting_input"
+            }
             if (buttonReceiverWaitsForRemote()) {
                 if (deviceCode === "unpaired")
                     return "unpaired"
@@ -216,6 +227,7 @@ Item {
         case "permission": return qsTr("请启用改键")
         case "version": return qsTr("请安装新版")
         case "waiting_remote": return qsTr("待唤醒")
+        case "waiting_input": return qsTr("请按遥控器")
         case "unpaired": return qsTr("未配对")
         case "conflict": return qsTr("多设备")
         case "ready": return qsTr("正常")
@@ -235,7 +247,8 @@ Item {
         if (code === "ready" || code === "detected")
             return tokens.successColor
         if (code === "checking" || code === "waiting_remote"
-                || code === "custom_only" || code === "original_only")
+                || code === "waiting_input" || code === "custom_only"
+                || code === "original_only")
             return tokens.voiceAccent
         if (code === "cleanup" || code === "unchecked")
             return tokens.disabledText
@@ -258,6 +271,8 @@ Item {
         if (SettingsController.bridgeRunning) {
             if (receiverCode === "waiting_remote")
                 return qsTr("待唤醒")
+            if (receiverCode === "waiting_input")
+                return qsTr("请按遥控器")
             if (receiverCode === "unpaired" || receiverCode === "conflict")
                 return qsTr("未连接")
             if (bridgeReconnectActionAvailable())

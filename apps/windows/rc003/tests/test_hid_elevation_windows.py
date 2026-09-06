@@ -816,6 +816,54 @@ class ProtectedPathTests(unittest.TestCase):
             )
         )
 
+    def test_runtime_acl_grants_local_service_read_execute_only(self):
+        valid = hid_elevation_windows._path_security_sddl_text(
+            SID,
+            directory=True,
+            read_execute_sids=(hid_elevation_windows.LOCAL_SERVICE_SID,),
+        )
+
+        self.assertTrue(
+            hid_elevation_windows.validate_path_security_sddl(
+                valid,
+                user_sid=SID,
+                directory=True,
+                read_execute_sids=(hid_elevation_windows.LOCAL_SERVICE_SID,),
+            )
+        )
+        self.assertFalse(
+            hid_elevation_windows.validate_path_security_sddl(
+                valid, user_sid=SID, directory=True
+            )
+        )
+        self.assertFalse(
+            hid_elevation_windows.validate_path_security_sddl(
+                valid.replace(
+                    f"(A;OICI;GRGX;;;{hid_elevation_windows.LOCAL_SERVICE_SID})",
+                    f"(A;OICI;FA;;;{hid_elevation_windows.LOCAL_SERVICE_SID})",
+                ),
+                user_sid=SID,
+                directory=True,
+                read_execute_sids=(hid_elevation_windows.LOCAL_SERVICE_SID,),
+            )
+        )
+
+    def test_runtime_acl_accepts_windows_local_service_alias(self):
+        valid = hid_elevation_windows._path_security_sddl_text(
+            SID,
+            directory=False,
+            read_execute_sids=(hid_elevation_windows.LOCAL_SERVICE_SID,),
+        ).replace(hid_elevation_windows.LOCAL_SERVICE_SID, "LS")
+
+        self.assertTrue(
+            hid_elevation_windows.validate_path_security_sddl(
+                valid,
+                user_sid=SID,
+                directory=False,
+                read_execute_sids=(hid_elevation_windows.LOCAL_SERVICE_SID,),
+            )
+        )
+
     def test_reparse_component_is_rejected_before_directory_creation(self):
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
@@ -3402,7 +3450,7 @@ class ElevationRequestTests(unittest.TestCase):
 
 class HelperMainTests(unittest.TestCase):
     def test_fixed_frozen_helper_uses_a_new_generation(self):
-        self.assertGreaterEqual(hid_elevation_windows.HELPER_GENERATION, 7)
+        self.assertGreaterEqual(hid_elevation_windows.HELPER_GENERATION, 8)
         self.assertGreaterEqual(hid_elevation_windows.TASK_CONTRACT_VERSION, 5)
 
     def test_inject_once_reports_a_stable_failure_stage(self):

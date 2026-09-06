@@ -323,15 +323,11 @@ def secure_runtime_directory(
     from . import hid_elevation_windows
 
     sid = user_sid or hid_elevation_windows.current_user_sid()
-    owner_root = hid_elevation_windows.protected_owner_root(
+    owner_root = hid_elevation_windows.protected_runtime_owner_root(
         sid,
         program_files_root=program_files_root,
     )
-    return (
-        owner_root
-        / "runtime"
-        / f"{GADGET_VERSION}-x64-{GADGET_DLL_SHA256[:12]}"
-    )
+    return owner_root / f"{GADGET_VERSION}-x64-{GADGET_DLL_SHA256[:12]}"
 
 
 def gadget_config_text() -> str:
@@ -360,6 +356,12 @@ def _write_verified_text(path: Path, content: str, *, user_sid: str) -> None:
     if path.is_file():
         try:
             if path.read_bytes() == encoded:
+                hid_elevation_windows._apply_path_security(
+                    path,
+                    user_sid=user_sid,
+                    directory=False,
+                    read_execute_sids=(hid_elevation_windows.LOCAL_SERVICE_SID,),
+                )
                 return
         except OSError:
             pass
@@ -367,7 +369,10 @@ def _write_verified_text(path: Path, content: str, *, user_sid: str) -> None:
     try:
         temporary.write_bytes(encoded)
         hid_elevation_windows._apply_path_security(
-            temporary, user_sid=user_sid, directory=False
+            temporary,
+            user_sid=user_sid,
+            directory=False,
+            read_execute_sids=(hid_elevation_windows.LOCAL_SERVICE_SID,),
         )
         os.replace(temporary, path)
     finally:
@@ -389,7 +394,7 @@ def prepare_secure_runtime() -> Path:
 
     sid = hid_elevation_windows.current_user_sid()
     program_files_root = hid_elevation_windows._program_files_root()
-    owner_root = hid_elevation_windows.protected_owner_root(
+    owner_root = hid_elevation_windows.protected_runtime_owner_root(
         sid, program_files_root=program_files_root
     )
     destination = secure_runtime_directory(
@@ -401,6 +406,7 @@ def prepare_secure_runtime() -> Path:
         user_sid=sid,
         trusted_root=program_files_root,
         security_root=owner_root,
+        read_execute_sids=(hid_elevation_windows.LOCAL_SERVICE_SID,),
     )
     hid_elevation_windows.assert_no_reparse_points(
         destination, trusted_root=program_files_root
@@ -415,7 +421,10 @@ def prepare_secure_runtime() -> Path:
             if dll_hash != GADGET_DLL_SHA256:
                 raise RuntimeError(f"Gadget DLL hash mismatch: {dll_hash}")
             hid_elevation_windows._apply_path_security(
-                temporary, user_sid=sid, directory=False
+                temporary,
+                user_sid=sid,
+                directory=False,
+                read_execute_sids=(hid_elevation_windows.LOCAL_SERVICE_SID,),
             )
             os.replace(temporary, dll_path)
         finally:
@@ -423,6 +432,12 @@ def prepare_secure_runtime() -> Path:
                 temporary.unlink(missing_ok=True)
             except OSError:
                 pass
+    hid_elevation_windows._apply_path_security(
+        dll_path,
+        user_sid=sid,
+        directory=False,
+        read_execute_sids=(hid_elevation_windows.LOCAL_SERVICE_SID,),
+    )
     _write_verified_text(
         destination / GADGET_CONFIG_NAME,
         gadget_config_text(),
@@ -433,6 +448,17 @@ def prepare_secure_runtime() -> Path:
         GADGET_SCRIPT,
         user_sid=sid,
     )
+    for runtime_directory in (owner_root, destination):
+        hid_elevation_windows.assert_no_reparse_points(
+            runtime_directory, trusted_root=program_files_root
+        )
+        if not hid_elevation_windows.validate_path_security_sddl(
+            hid_elevation_windows._read_path_security_sddl(runtime_directory),
+            user_sid=sid,
+            directory=True,
+            read_execute_sids=(hid_elevation_windows.LOCAL_SERVICE_SID,),
+        ):
+            raise RuntimeError("Gadget runtime directory ACL validation failed")
     for runtime_file in (
         dll_path,
         destination / GADGET_CONFIG_NAME,
@@ -445,6 +471,7 @@ def prepare_secure_runtime() -> Path:
             hid_elevation_windows._read_path_security_sddl(runtime_file),
             user_sid=sid,
             directory=False,
+            read_execute_sids=(hid_elevation_windows.LOCAL_SERVICE_SID,),
         ):
             raise RuntimeError("Gadget runtime ACL validation failed")
     return dll_path
