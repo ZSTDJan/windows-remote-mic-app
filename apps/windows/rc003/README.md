@@ -13,6 +13,9 @@
 > 随 Windows 启动始终保持普通权限。每个登录会话只有一个长期主进程，遥控器服务和
 > 元素导航都由该进程持有。VB-CABLE 仍是需要用户明确安装的
 > 可选第三方组件（见下文）。
+> 当前公开版本在普通权限下仍有已知异常；问题修复并完成验证前，请按仓库首页提示，
+> 临时右键无线麦并选择“以管理员身份运行”。这只是当前 workaround，不改变普通权限
+> 主程序配合按需管理员助手的目标架构。
 
 这是本仓库独立维护的 Windows 客户端，面向小米遥控器2 Pro（内部型号 RC003），
 提供按键映射和 ATVV
@@ -74,14 +77,14 @@ DJI Mic 2 不再出现在当前设备选择和自动诊断中；既有设备档�
 首选来源是本仓库的 Releases 列表页——这是列表页本身，不是指向某个具体
 tag 的链接，因此始终是获取最新预发行版的稳定入口，请直接使用这个地址：
 
-  https://github.com/miaomiaozii/windows-remote-mic-app/releases
+  https://github.com/ZSTDJan/windows-remote-mic-app/releases
 
 在列表中找到本 RC003 Windows 候选对应的预发行版（预发行版会明确标记为
 prerelease，发布说明会写清楚它基于哪一次真实 Windows CI 运行）。
 
 预发行版的仓库级 tag（例如 `v0.3.0-windows-rc003-candidate.1`）只是发布
 编号，和资产文件名里的内部构建版本号是两回事：当前内部构建版本号固定为
-`0.2.0-candidate.12`，唯一来源是 `src/ovb_rc003/VERSION`；程序窗口、冻结构建、
+`0.2.0-candidate.17`，唯一来源是 `src/ovb_rc003/VERSION`；程序窗口、冻结构建、
 安装器和 CI 包装都读取同一文件。不要因为
 文件名里的版本号和 tag 不一致就怀疑下载错了文件，具体对应关系以该
 预发行版自己的发布说明为准。
@@ -110,6 +113,24 @@ prerelease，发布说明会写清楚它基于哪一次真实 Windows CI 运行�
   再使用；
 - 或在一台 Windows 机器上自行运行 `.\build\build-candidate.ps1` 从源码
   构建（见下方"Building an unsigned candidate"一节）。
+
+### 程序内手动检查更新
+
+“设备”页“运行日志”一行提供“检查更新”。程序只在用户点击后访问固定的
+`ZSTDJan/windows-remote-mic-app` GitHub Releases，不会在启动时或后台自动检查，
+也不会在程序中保存 GitHub 账号或令牌。它按发布资产文件名里的内部版本比较，
+不会把仓库 tag 当作程序版本；若最新版本的文件尚未上传完整，会直接提示重试，
+不会退回并推荐旧版本。
+
+发现新版后，安装版下载同一次 Release 的安装器，便携版或源码运行下载便携 ZIP。
+程序会先读取同一次 Release 的 `SHA256SUMS.txt`，核对文件名、大小和 SHA-256；
+GitHub 提供资产摘要时也会一并核对。下载先写入 `.part` 临时文件，取消、中断或
+校验失败会清理临时文件，完整通过后才改为正式文件名。文件保存在
+`%LOCALAPPDATA%\RemoteMic\RC003\updates\<版本号>`。下载新版前会清理更旧的程序缓存；
+升级后首次运行会清理当前及更旧版本的程序缓存，陌生文件和链接不会删除。
+
+程序不会自动运行下载文件、关闭当前版本或覆盖安装目录。下载完成后点击“打开文件夹”，
+先完全退出无线麦，再手动运行安装器；便携版请把 ZIP 解压到新的文件夹使用。
 
 ### 安装
 
@@ -633,7 +654,7 @@ $env:PYTHONPATH = Join-Path (Get-Location) 'src'
 如果同一状态的 `build-candidate.ps1` 已成功，该项结果直接复用。
 
 Windows GitHub Actions 工作流位于 `.github/workflows/windows-rc003-ci.yml`。运行结果
-可在 <https://github.com/miaomiaozii/windows-remote-mic-app/actions> 查看。CI 没有真实 RC003 硬件，
+可在 <https://github.com/ZSTDJan/windows-remote-mic-app/actions> 查看。CI 没有真实 RC003 硬件，
 因此构建和测试通过也不能替代真机配对、按键和语音链路验收。
 
 ## 已知限制
@@ -677,10 +698,10 @@ Frida Gadget 实现；Frida 的版本、哈希和许可证见仓库根目录
 正式候选和发布的触发条件、执行顺序与去重规则见
 [`VALIDATION-AND-DELIVERY.md`](VALIDATION-AND-DELIVERY.md)。
 
-Windows 候选版以预发行版发布。首个发布：
+Windows 候选版以预发行版发布。当前公开候选：
 
-- 发布列表页：<https://github.com/miaomiaozii/windows-remote-mic-app/releases>
-- 具体发布：<https://github.com/miaomiaozii/windows-remote-mic-app/releases/tag/v0.1.0-windows-rc003-candidate.1>
+- 发布列表页：<https://github.com/ZSTDJan/windows-remote-mic-app/releases>
+- 具体发布：<https://github.com/ZSTDJan/windows-remote-mic-app/releases/tag/v0.2.0-windows-rc003-candidate.2>
 
 每个版本的安装器、便携版 ZIP 和 `SHA256SUMS.txt` 必须来自同一次 Windows CI
 构建；发布时必须在说明中准确列出已经完成和仍未完成的真实 RC003 配对、按键、

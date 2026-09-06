@@ -1,6 +1,11 @@
+import tempfile
 import unittest
+from pathlib import Path
+from unittest import mock
 
+from ovb_rc003 import bridge_runtime_status
 from ovb_rc003 import bridge_control_windows as control
+from ovb_rc003 import single_instance
 
 
 class BridgeControlWindowsTests(unittest.TestCase):
@@ -80,3 +85,89 @@ class BridgeControlWindowsTests(unittest.TestCase):
         self.assertTrue(result.requested)
         self.assertFalse(result.stopped)
         self.assertIn("限定时间", result.error)
+
+    def test_stopped_bridge_cleans_the_status_captured_before_exit(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            bridge_runtime_status.publish_status(
+                root,
+                bridge_runtime_status.BridgeConnectionState.CONNECTED,
+                pid=1111,
+            )
+
+            result = control.request_bridge_exit(
+                platform="win32",
+                stop_internal=lambda **_kwargs: True,
+                runtime_status_root=root,
+            )
+            remaining = bridge_runtime_status.read_status(root)
+
+        self.assertTrue(result.stopped)
+        self.assertFalse(result.cleanup_failed)
+        self.assertIsNone(remaining)
+
+    def test_new_status_during_exit_is_preserved_and_blocks_restart(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            bridge_runtime_status.publish_status(
+                root,
+                bridge_runtime_status.BridgeConnectionState.CONNECTED,
+                pid=1111,
+            )
+
+            def stop_and_replace(**_kwargs):
+                bridge_runtime_status.publish_status(
+                    root,
+                    bridge_runtime_status.BridgeConnectionState.WAITING_FOR_DEVICE,
+                    pid=2222,
+                )
+                return True
+
+            result = control.request_bridge_exit(
+                platform="win32",
+                stop_internal=stop_and_replace,
+                runtime_status_root=root,
+            )
+            remaining = bridge_runtime_status.read_status(root)
+
+        self.assertFalse(result.stopped)
+        self.assertTrue(result.cleanup_failed)
+        self.assertIsNotNone(remaining)
+        self.assertEqual(remaining.pid, 2222)
+
+    def test_stopping_one_windows_session_preserves_another_session_status(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            other_session = bridge_runtime_status.publish_status(
+                root,
+                bridge_runtime_status.BridgeConnectionState.CONNECTED,
+                pid=1111,
+                session_id=2,
+            )
+            with mock.patch.object(
+                bridge_runtime_status.sys,
+                "platform",
+                "win32",
+            ), mock.patch.object(
+                bridge_runtime_status,
+                "_default_status_scope",
+                bridge_runtime_status._STATUS_SCOPE_UNSET,
+            ), mock.patch.object(
+                single_instance,
+                "current_process_session_id",
+                return_value=1,
+            ):
+                result = control.request_bridge_exit(
+                    platform="win32",
+                    stop_internal=lambda **_kwargs: True,
+                    runtime_status_root=root,
+                )
+
+            remaining = bridge_runtime_status.read_status(
+                root,
+                session_id=2,
+            )
+
+        self.assertTrue(result.stopped)
+        self.assertFalse(result.cleanup_failed)
+        self.assertEqual(remaining, other_session)

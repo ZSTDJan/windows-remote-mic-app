@@ -447,7 +447,10 @@ class InProcessBridgeHandleTests(unittest.TestCase):
     def test_worker_base_exception_is_reported_as_failure(self):
         handle = bridge_launcher._InProcessBridgeHandle()
 
-        with mock.patch("ovb_rc003.app.main", side_effect=SystemExit(7)):
+        with mock.patch.object(
+            bridge_launcher.single_instance,
+            "BridgeInstanceGuard",
+        ), mock.patch("ovb_rc003.app.main", side_effect=SystemExit(7)):
             bridge_launcher._run_in_process_bridge(handle)
 
         self.assertEqual(handle.poll(), 1)

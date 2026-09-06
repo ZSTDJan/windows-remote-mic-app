@@ -1250,7 +1250,7 @@ begin
         )
       else
         MsgBox(
-          '管理员按键组件未启用。打开无线麦，在“按键接收”中点击“启用改键”即可重试。',
+          '管理员按键组件未启用。打开无线麦，在“按键接收”中点击“修复权限”即可重试。',
           mbError,
           MB_OK
         );
@@ -1364,11 +1364,18 @@ begin
 
   if not RunApplicationMaintenance('--uninstall-hid-helper', ResultCode) then
   begin
-    MsgBox(
-      '管理员按键组件未能移除，卸载尚未开始。请确认管理员权限后重试。',
-      mbError,
-      MB_OK
-    );
+    if ResultCode = HidHelperAccountUnsupportedExitCode then
+      MsgBox(
+        '当前 Windows 账号不能移除管理员按键组件。请登录原管理员账号后重试；在 UAC 中临时输入另一个管理员账号无效。',
+        mbError,
+        MB_OK
+      )
+    else
+      MsgBox(
+        '管理员按键组件未能移除，卸载尚未开始。请确认管理员权限后重试。',
+        mbError,
+        MB_OK
+      );
     ReleaseLegacyRuntimeBarriers;
     ReleaseInstallerMaintenanceMutex;
     Result := False;

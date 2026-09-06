@@ -94,6 +94,7 @@ class CheckResult:
     group: CheckGroup
     status: CheckStatus
     detail: str
+    result_code: str = ""
 
 
 @dataclass(frozen=True)
@@ -189,6 +190,7 @@ def check_raw_input(
                 CheckGroup.ORDINARY_BUTTONS,
                 CheckStatus.UNSUPPORTED,
                 "仅 Windows 可检测 Raw Input 按键设备",
+                result_code="unsupported_platform",
             )
         # RETRY 3 (independent review): this used to interpolate str(exc)
         # here. RawInputUnavailableError's real production message is
@@ -204,6 +206,7 @@ def check_raw_input(
             CheckGroup.ORDINARY_BUTTONS,
             CheckStatus.FAIL,
             "Raw Input 检测失败；检查遥控器连接后重新检测",
+            result_code="probe_failed",
         )
 
     count = len(paths)
@@ -215,6 +218,7 @@ def check_raw_input(
             CheckGroup.ORDINARY_BUTTONS,
             CheckStatus.FAIL,
             f"未找到{_REMOTE_DISPLAY_NAME}的按键设备；请先完成蓝牙配对",
+            result_code="no_device",
         )
     if count > 1:
         return CheckResult(
@@ -223,6 +227,7 @@ def check_raw_input(
             CheckGroup.ORDINARY_BUTTONS,
             CheckStatus.FAIL,
             f"找到 {count} 个匹配设备；请只保留 1 个已连接设备",
+            result_code="ambiguous",
         )
     return CheckResult(
         "raw_input",
@@ -230,6 +235,7 @@ def check_raw_input(
         CheckGroup.ORDINARY_BUTTONS,
         CheckStatus.PASS,
         f"{_REMOTE_DISPLAY_NAME} 按键设备已找到",
+        result_code="ready",
     )
 
 
@@ -1289,6 +1295,7 @@ def check_ble_candidate(
                 CheckGroup.VOICE_BRIDGE,
                 CheckStatus.UNSUPPORTED,
                 f"仅 Windows 可检测已配对的{_REMOTE_DISPLAY_NAME}",
+                result_code="unsupported_platform",
             )
         # RETRY 3 (independent review): this used to interpolate str(exc)
         # here. The real production message this raises today is API-only,
@@ -1303,6 +1310,7 @@ def check_ble_candidate(
             CheckGroup.VOICE_BRIDGE,
             CheckStatus.UNSUPPORTED,
             "WinRT 蓝牙组件不可用；请检查安装后重试",
+            result_code="winrt_unavailable",
         )
     except BleDiscoverySubprocessShutdownUnconfirmedError:
         # XRBM-035 RETRY 1: distinct from a normal cancel/timeout below -
@@ -1316,6 +1324,7 @@ def check_ble_candidate(
             CheckGroup.VOICE_BRIDGE,
             CheckStatus.FAIL,
             "未能确认蓝牙检测进程已退出；请重启应用后重试",
+            result_code="shutdown_unconfirmed",
         )
     except BleDiscoveryCancelledError:
         # XRBM-035: an honest "did not complete" result - never a FAIL
@@ -1332,6 +1341,7 @@ def check_ble_candidate(
             CheckGroup.VOICE_BRIDGE,
             CheckStatus.FAIL,
             "蓝牙检测已取消或超时；请重新检测",
+            result_code="cancelled",
         )
     except Exception:  # noqa: BLE001 - report, never crash the diagnostics page
         # RETRY 3 (independent review): a genuinely unexpected exception
@@ -1345,6 +1355,7 @@ def check_ble_candidate(
             CheckGroup.VOICE_BRIDGE,
             CheckStatus.FAIL,
             "BLE 检测失败；请重新检测",
+            result_code="probe_failed",
         )
 
     try:
@@ -1356,6 +1367,7 @@ def check_ble_candidate(
             CheckGroup.VOICE_BRIDGE,
             CheckStatus.FAIL,
             f"未找到已配对的{_REMOTE_DISPLAY_NAME}；请先完成蓝牙配对",
+            result_code="no_candidate",
         )
     except identity.AmbiguousCandidateError as exc:
         return CheckResult(
@@ -1364,6 +1376,7 @@ def check_ble_candidate(
             CheckGroup.VOICE_BRIDGE,
             CheckStatus.FAIL,
             f"找到 {exc.count} 个{_REMOTE_DISPLAY_NAME}；请只保留 1 个已配对设备",
+            result_code="ambiguous",
         )
     return CheckResult(
         "ble_candidate",
@@ -1371,6 +1384,7 @@ def check_ble_candidate(
         CheckGroup.VOICE_BRIDGE,
         CheckStatus.PASS,
         f"已找到 1 个已配对的{_REMOTE_DISPLAY_NAME}",
+        result_code="ready",
     )
 
 

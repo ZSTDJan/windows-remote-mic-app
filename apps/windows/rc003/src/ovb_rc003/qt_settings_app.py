@@ -106,6 +106,7 @@ from typing import Callable, Dict, List, Optional
 
 from . import (
     __version__,
+    application_update,
     audio_playback,
     audio_output,
     bridge_control_windows,
@@ -336,6 +337,7 @@ _APPLICATION_EXIT_SAVE_WAIT_TIMEOUT_SECONDS = (
 )
 _APPLICATION_EXIT_POLL_INTERVAL_MS = 100
 _BRIDGE_STATUS_STALE_AFTER_SECONDS = 20.0
+_BRIDGE_STATUS_MISSING_AFTER_SECONDS = _BRIDGE_STATUS_STALE_AFTER_SECONDS
 _BRIDGE_RECONNECT_BUSY_TIMEOUT_MS = 10_000
 
 
@@ -915,6 +917,7 @@ def _load_qt_classes() -> dict:
         selectedEndpointIndexChanged = Signal()
         bridgeRunningChanged = Signal()
         bridgeConnectedChanged = Signal()
+        bridgeInputStateChanged = Signal()
         bridgeLaunchPhaseChanged = Signal()
         bridgeLaunchElapsedSecondsChanged = Signal()
         bridgeRestartRecommendedChanged = Signal()
@@ -963,6 +966,8 @@ def _load_qt_classes() -> dict:
         inputCleanupReady = Signal()
         inputCleanupFailed = Signal(str)
         saveSettingsAndExitFinished = Signal(bool)
+        applicationUpdateChanged = Signal()
+        applicationUpdateDialogRequested = Signal()
         _hotkeyCaptureResult = Signal(str)
         _endpointOptionsRefreshReady = Signal(object)
         _voiceProgramStatusRefreshReady = Signal(object)
@@ -974,6 +979,9 @@ def _load_qt_classes() -> dict:
         _inputOperationReady = Signal(object)
         _applicationExitStopReady = Signal(object)
         _bridgeRestartStopReady = Signal(object)
+        _applicationUpdateCheckReady = Signal(object)
+        _applicationUpdateDownloadReady = Signal(object)
+        _applicationUpdateProgressReady = Signal(object)
 
         _TRIGGER_MODE_ORDER = (key_mapping.VoiceTriggerMode.HOLD,)
         _DEVICE_ORDER = (device_catalog.RC003_ID,)
@@ -1008,10 +1016,23 @@ def _load_qt_classes() -> dict:
             # synchronously submit the next serialized hotkey step while this
             # guard is held. Production signals are queued across threads.
             self._background_threads_lock = threading.RLock()
+            self._applicationUpdateCheckReady.connect(
+                self._on_application_update_check_ready
+            )
+            self._applicationUpdateDownloadReady.connect(
+                self._on_application_update_download_ready
+            )
+            self._applicationUpdateProgressReady.connect(
+                self._on_application_update_progress_ready
+            )
             self._input_worker_result_lock = threading.Lock()
             self._input_worker_result = None
             self._hid_helper_repair_busy = False
             self._config_root = config.config_root()
+            application_update.cleanup_obsolete_update_downloads(
+                self._config_root / "updates",
+                __version__,
+            )
             self._hid_helper_frozen_distribution = bool(
                 getattr(sys, "frozen", False)
             )
@@ -1033,6 +1054,10 @@ def _load_qt_classes() -> dict:
                 )
             self._hid_helper_process_elevated = (
                 hid_elevation_windows.is_process_elevated()
+            )
+            self._hid_helper_can_self_elevate = (
+                not self._hid_helper_frozen_distribution
+                or hid_elevation_windows.can_current_user_self_elevate()
             )
             self._hid_helper_installed_distribution = (
                 hid_elevation_windows.is_installed_distribution()
@@ -1157,12 +1182,33 @@ def _load_qt_classes() -> dict:
             self._bridge_restart_recommended = False
             self._bridge_recovery_attempted = False
             self._bridge_recovery_running = False
+            self._legacy_bridge_launch_handoff_attempted = False
             self._bridge_reconnect_available = False
             self._bridge_reconnect_busy = False
             runtime_status = (
                 bridge_runtime_status.read_status(self._config_root)
                 if self._bridge_running
                 else None
+            )
+            self._bridge_status_missing_since: Optional[float] = (
+                time.monotonic()
+                if self._bridge_running and runtime_status is None
+                else None
+            )
+            self._raw_input_state = (
+                runtime_status.raw_input_state
+                if runtime_status is not None
+                else "unknown"
+            )
+            self._hid_tap_state = (
+                runtime_status.hid_tap_state
+                if runtime_status is not None
+                else "unknown"
+            )
+            self._voice_key_physicalizer_state = (
+                runtime_status.voice_key_physicalizer_state
+                if runtime_status is not None
+                else "unknown"
             )
             self._bridge_connected = bool(
                 runtime_status is not None
@@ -1206,7 +1252,7 @@ def _load_qt_classes() -> dict:
                 )
                 self._bridge_restart_recommended = (
                     identity_match is not True
-                    or bridge_runtime_status.input_channels_failed(runtime_status)
+                    or self._runtime_status_requires_restart(runtime_status)
                 )
             self._bridge_reconnect_available = (
                 self._can_reconnect_bridge_now(runtime_status)
@@ -1214,6 +1260,19 @@ def _load_qt_classes() -> dict:
             self._has_explicit_launch_result = False
             self._status_message = ""
             self._error_message = ""
+            self._application_update_state = "idle"
+            self._application_update_message = ""
+            self._application_update_release_notes = ""
+            self._application_update_release_url = application_update.RELEASES_PAGE_URL
+            self._application_update_release = None
+            self._application_update_available = False
+            self._application_update_check_busy = False
+            self._application_update_download_busy = False
+            self._application_update_download_cancel_event = None
+            self._application_update_package_name = ""
+            self._application_update_package_size = 0
+            self._application_update_download_received = 0
+            self._application_update_download_path = ""
             self._settings_dirty = bool(self._removed_voice_bindings)
             self._settings_revision = 0
             self._settings_save_busy = False
@@ -1358,6 +1417,9 @@ def _load_qt_classes() -> dict:
             self._voice_hotkey_busy = False
             self._endpoint_preflight_token += 1
             self._endpoint_preflight_completion = None
+            cancel_event = self._application_update_download_cancel_event
+            if cancel_event is not None:
+                cancel_event.set()
 
             deadline = time.monotonic() + _SETTINGS_BACKGROUND_JOIN_TIMEOUT_SECONDS
             current_thread = threading.current_thread()
@@ -1696,6 +1758,38 @@ def _load_qt_classes() -> dict:
             self.bridgeConnectedChanged.emit()
             self.trayStateChanged.emit()
 
+        def _set_bridge_input_states(
+            self,
+            status: Optional[bridge_runtime_status.BridgeRuntimeStatus],
+        ) -> None:
+            raw_input_state = status.raw_input_state if status is not None else "unknown"
+            hid_tap_state = status.hid_tap_state if status is not None else "unknown"
+            voice_key_physicalizer_state = (
+                getattr(status, "voice_key_physicalizer_state", "unknown")
+                if status is not None
+                else "unknown"
+            )
+            if (
+                raw_input_state == self._raw_input_state
+                and hid_tap_state == self._hid_tap_state
+                and voice_key_physicalizer_state
+                == self._voice_key_physicalizer_state
+            ):
+                return
+            self._raw_input_state = raw_input_state
+            self._hid_tap_state = hid_tap_state
+            self._voice_key_physicalizer_state = voice_key_physicalizer_state
+            self.bridgeInputStateChanged.emit()
+
+        @staticmethod
+        def _runtime_status_requires_restart(
+            status: bridge_runtime_status.BridgeRuntimeStatus,
+        ) -> bool:
+            return (
+                bridge_runtime_status.input_channels_failed(status)
+                or status.voice_key_physicalizer_state in {"failed", "stopped"}
+            )
+
         def _set_bridge_restart_recommended(self, value: bool) -> None:
             value = bool(value)
             if value == self._bridge_restart_recommended:
@@ -1840,8 +1934,9 @@ def _load_qt_classes() -> dict:
             status: Optional[bridge_runtime_status.BridgeRuntimeStatus],
             *,
             schedule_recovery: bool,
+            status_missing_timed_out: bool = False,
         ) -> None:
-            recommended = False
+            recommended = bool(status_missing_timed_out)
             automatic = False
             if status is not None:
                 identity_match = bridge_runtime_status.runtime_identity_matches(
@@ -1854,6 +1949,8 @@ def _load_qt_classes() -> dict:
                 elif bridge_runtime_status.input_channels_failed(status):
                     recommended = True
                     automatic = not status.voice_active
+                elif status.voice_key_physicalizer_state in {"failed", "stopped"}:
+                    recommended = True
                 elif (
                     time.time() - status.updated_at
                     > _BRIDGE_STATUS_STALE_AFTER_SECONDS
@@ -1932,6 +2029,18 @@ def _load_qt_classes() -> dict:
                 if running
                 else None
             )
+            status_missing_timed_out = False
+            if running and runtime_status is None:
+                now = time.monotonic()
+                if self._bridge_status_missing_since is None:
+                    self._bridge_status_missing_since = now
+                status_missing_timed_out = (
+                    now - self._bridge_status_missing_since
+                    >= _BRIDGE_STATUS_MISSING_AFTER_SECONDS
+                )
+            else:
+                self._bridge_status_missing_since = None
+            self._set_bridge_input_states(runtime_status)
             connected = bool(
                 runtime_status is not None
                 and runtime_status.state
@@ -1942,6 +2051,7 @@ def _load_qt_classes() -> dict:
                 self._update_bridge_restart_recommendation(
                     runtime_status,
                     schedule_recovery=True,
+                    status_missing_timed_out=status_missing_timed_out,
                 )
                 reconnect_available = self._can_reconnect_bridge_now(runtime_status)
                 self._set_bridge_reconnect_available(reconnect_available)
@@ -1974,10 +2084,16 @@ def _load_qt_classes() -> dict:
                             "首次可能约 1 分钟"
                         )
                     elif runtime_status is None:
-                        self._set_launch_status(
-                            f"服务运行中；{device_catalog.RC003_DISPLAY_NAME} 状态未知，"
-                            "正在检查"
-                        )
+                        if status_missing_timed_out:
+                            self._set_bridge_launch_phase("failed")
+                            self._set_launch_status(
+                                "服务状态异常；请重新启动遥控器服务"
+                            )
+                        else:
+                            self._set_launch_status(
+                                f"服务运行中；{device_catalog.RC003_DISPLAY_NAME} 状态未知，"
+                                "正在检查"
+                            )
                     else:
                         self._set_launch_status(
                             f"服务运行中；等待{device_catalog.RC003_DISPLAY_NAME} 连接"
@@ -1987,6 +2103,7 @@ def _load_qt_classes() -> dict:
             self._set_bridge_restart_recommended(False)
             self._set_bridge_reconnect_available(False)
             self._set_bridge_reconnect_busy(False)
+            self._bridge_status_missing_since = None
 
             previous_phase = self._bridge_launch_phase
             if (
@@ -2016,6 +2133,7 @@ def _load_qt_classes() -> dict:
             ):
                 self._set_bridge_running(False)
                 self._set_bridge_connected(False)
+                self._set_bridge_input_states(None)
                 self._set_bridge_reconnect_available(False)
                 self._set_bridge_reconnect_busy(False)
                 if (
@@ -2092,6 +2210,12 @@ def _load_qt_classes() -> dict:
                 )
             )
 
+        def _hid_helper_account_unsupported(self) -> bool:
+            return (
+                self._hid_helper_needs_repair()
+                and not self._hid_helper_can_self_elevate
+            )
+
         def _hid_helper_cleanup_pending(self) -> bool:
             return (
                 self._hid_helper_state.available
@@ -2101,6 +2225,7 @@ def _load_qt_classes() -> dict:
         def _hid_helper_repair_available(self) -> bool:
             return (
                 self._hid_helper_frozen_distribution
+                and self._hid_helper_can_self_elevate
                 and not hid_elevation_windows.is_newer_helper_state(
                     self._hid_helper_state
                 )
@@ -2113,6 +2238,7 @@ def _load_qt_classes() -> dict:
         def _hid_helper_setup_required(self) -> bool:
             return (
                 self._hid_helper_portable_distribution
+                and self._hid_helper_can_self_elevate
                 and not self._hid_helper_state.available
                 and not hid_elevation_windows.is_newer_helper_state(
                     self._hid_helper_state
@@ -3954,6 +4080,22 @@ def _load_qt_classes() -> dict:
             notify=bridgeConnectedChanged,
         )
 
+        rawInputState = Property(
+            str,
+            lambda self: self._raw_input_state,
+            notify=bridgeInputStateChanged,
+        )
+        hidTapState = Property(
+            str,
+            lambda self: self._hid_tap_state,
+            notify=bridgeInputStateChanged,
+        )
+        voiceKeyPhysicalizerState = Property(
+            str,
+            lambda self: self._voice_key_physicalizer_state,
+            notify=bridgeInputStateChanged,
+        )
+
         bridgeRestartRecommended = Property(
             bool,
             lambda self: self._bridge_restart_recommended,
@@ -3985,6 +4127,11 @@ def _load_qt_classes() -> dict:
             _hid_helper_cleanup_pending,
             notify=hidHelperStateChanged,
         )
+        hidHelperAccountUnsupported = Property(
+            bool,
+            _hid_helper_account_unsupported,
+            notify=hidHelperStateChanged,
+        )
         hidHelperRepairVisible = Property(
             bool,
             _hid_helper_repair_available,
@@ -3994,6 +4141,7 @@ def _load_qt_classes() -> dict:
             bool,
             lambda self: (
                 self._hid_helper_portable_distribution
+                and self._hid_helper_can_self_elevate
                 and self._hid_helper_state.available
                 and not self._hid_helper_cleanup_pending()
                 and not hid_elevation_windows.is_newer_helper_state(
@@ -4010,15 +4158,17 @@ def _load_qt_classes() -> dict:
         hidHelperIssueText = Property(
             str,
             lambda self: (
-                "自定义按键映射可用，旧权限组件尚未清理"
+                "换管理员账号"
+                if self._hid_helper_account_unsupported()
+                else ""
                 if self._hid_helper_cleanup_pending()
-                else "检测到较新版本的管理员按键组件，请使用或重新安装较新版本"
+                else "请安装新版"
                 if hid_elevation_windows.is_newer_helper_state(
                     self._hid_helper_state
                 )
-                else "确认一次管理员权限后，普通启动和自启动都可使用自定义按键映射"
+                else ""
                 if self._hid_helper_setup_required()
-                else "遥控器保留 Windows 原始按键操作；自定义按键映射已停用"
+                else "改键已停用"
                 if self._hid_helper_needs_repair()
                 else ""
             ),
@@ -4180,6 +4330,117 @@ def _load_qt_classes() -> dict:
             str,
             lambda self: __version__,
             constant=True,
+        )
+        applicationUpdateState = Property(
+            str,
+            lambda self: self._application_update_state,
+            notify=applicationUpdateChanged,
+        )
+        applicationUpdateMessage = Property(
+            str,
+            lambda self: self._application_update_message,
+            notify=applicationUpdateChanged,
+        )
+        applicationUpdateLatestVersion = Property(
+            str,
+            lambda self: (
+                self._application_update_release.version.text
+                if self._application_update_release is not None
+                else ""
+            ),
+            notify=applicationUpdateChanged,
+        )
+        applicationUpdateReleaseNotes = Property(
+            str,
+            lambda self: self._application_update_release_notes,
+            notify=applicationUpdateChanged,
+        )
+        applicationUpdateReleaseUrl = Property(
+            str,
+            lambda self: self._application_update_release_url,
+            notify=applicationUpdateChanged,
+        )
+        applicationUpdatePackageName = Property(
+            str,
+            lambda self: self._application_update_package_name,
+            notify=applicationUpdateChanged,
+        )
+        applicationUpdatePackageSize = Property(
+            int,
+            lambda self: self._application_update_package_size,
+            notify=applicationUpdateChanged,
+        )
+        applicationUpdatePackageSizeText = Property(
+            str,
+            lambda self: application_update.format_file_size(
+                self._application_update_package_size
+            ),
+            notify=applicationUpdateChanged,
+        )
+        applicationUpdatePackageKindText = Property(
+            str,
+            lambda self: (
+                "安装器"
+                if self._hid_helper_installed_distribution
+                else "便携版 ZIP"
+            ),
+            constant=True,
+        )
+        applicationUpdateCheckBusy = Property(
+            bool,
+            lambda self: self._application_update_check_busy,
+            notify=applicationUpdateChanged,
+        )
+        applicationUpdateDownloadBusy = Property(
+            bool,
+            lambda self: self._application_update_download_busy,
+            notify=applicationUpdateChanged,
+        )
+        applicationUpdateBusy = Property(
+            bool,
+            lambda self: (
+                self._application_update_check_busy
+                or self._application_update_download_busy
+            ),
+            notify=applicationUpdateChanged,
+        )
+        applicationUpdateCanDownload = Property(
+            bool,
+            lambda self: (
+                self._application_update_available
+                and self._application_update_release is not None
+                and not self._application_update_check_busy
+                and not self._application_update_download_busy
+            ),
+            notify=applicationUpdateChanged,
+        )
+        applicationUpdateDownloadProgress = Property(
+            float,
+            lambda self: (
+                min(
+                    1.0,
+                    self._application_update_download_received
+                    / self._application_update_package_size,
+                )
+                if self._application_update_package_size > 0
+                else 0.0
+            ),
+            notify=applicationUpdateChanged,
+        )
+        applicationUpdateDownloadProgressText = Property(
+            str,
+            lambda self: (
+                f"{application_update.format_file_size(self._application_update_download_received)}"
+                f" / {application_update.format_file_size(self._application_update_package_size)}"
+                if self._application_update_package_size > 0
+                else ""
+            ),
+            notify=applicationUpdateChanged,
+        )
+        applicationUpdateDownloadedPath = Property(
+            str,
+            lambda self: self._application_update_download_path,
+            notify=applicationUpdateChanged,
         )
 
         def _get_device_catalog_available(self) -> bool:
@@ -4857,19 +5118,18 @@ def _load_qt_classes() -> dict:
                     if self._hid_helper_portable_distribution
                     else "修复权限"
                 )
-                message = (
-                    "管理员按键组件处理超时，尚未启用。"
-                    f"请在“按键接收”中点击“{action_text}”重试。"
-                )
+                message = f"请再次尝试点击“{action_text}”；仍失败时打开运行日志。"
             elif state.detail in {
                 f"hid_helper_setup_exit_{hid_elevation_windows.HELPER_EXIT_REQUIRES_ADMIN}",
                 f"hid_helper_setup_exit_{hid_elevation_windows.HELPER_EXIT_VALIDATION_FAILED}",
                 f"hid_helper_setup_exit_{hid_elevation_windows.HELPER_EXIT_UNEXPECTED_FAILURE}",
             } or hid_elevation_windows.is_helper_setup_failure_detail(state.detail):
-                message = (
-                    "管理员按键组件没有完成安装。"
-                    "请在“按键接收”中重试；仍失败时打开运行日志。"
+                action_text = (
+                    "启用改键"
+                    if self._hid_helper_portable_distribution
+                    else "修复权限"
                 )
+                message = f"请再次尝试点击“{action_text}”；仍失败时打开运行日志。"
             else:
                 message = (
                     "管理员按键组件启用失败。全部自定义按键映射已停用，"
@@ -4882,6 +5142,7 @@ def _load_qt_classes() -> dict:
             if (
                 self._hid_helper_repair_busy
                 or not self._hid_helper_portable_distribution
+                or not self._hid_helper_can_self_elevate
                 or not self._hid_helper_state.available
                 or self._maintenance_exit_pending
                 or self._application_exit_requested
@@ -5305,7 +5566,7 @@ def _load_qt_classes() -> dict:
                 status,
                 self._current_runtime_identity,
             )
-            if identity_match is True and not bridge_runtime_status.input_channels_failed(
+            if identity_match is True and not self._runtime_status_requires_restart(
                 status
             ):
                 self._set_bridge_restart_recommended(False)
@@ -5372,7 +5633,12 @@ def _load_qt_classes() -> dict:
             self._set_bridge_reconnect_busy(False)
             self._refresh_bridge_status()
 
-        def _begin_bridge_restart(self, *, automatic: bool) -> None:
+        def _begin_bridge_restart(
+            self,
+            *,
+            automatic: bool,
+            allow_active_voice: bool = False,
+        ) -> None:
             if (
                 self._bridge_recovery_running
                 or self._maintenance_exit_pending
@@ -5385,7 +5651,7 @@ def _load_qt_classes() -> dict:
                 self.startBridge()
                 return
             status = bridge_runtime_status.read_status(self._config_root)
-            if status is not None and status.voice_active:
+            if status is not None and status.voice_active and not allow_active_voice:
                 self._set_error_message(
                     "当前正在语音输入；结束本次语音后再重新启动服务。",
                     self._DEVICE_PAGE_INDEX,
@@ -5396,6 +5662,11 @@ def _load_qt_classes() -> dict:
             self._bridge_launch_started_at = time.monotonic()
             self._set_bridge_launch_phase("restarting")
             self._set_bridge_restart_recommended(False)
+            self._set_bridge_reconnect_available(False)
+            self._set_bridge_reconnect_busy(False)
+            self._set_bridge_connected(False)
+            self._set_bridge_input_states(None)
+            self._bridge_status_missing_since = None
             self._set_error_message("")
             self._set_launch_status(
                 "检测到旧版或按键通道异常；正在正常停止服务并启动当前版本…"
@@ -5436,6 +5707,10 @@ def _load_qt_classes() -> dict:
                 return
             self._set_bridge_running(False)
             self._set_bridge_connected(False)
+            self._set_bridge_input_states(None)
+            self._set_bridge_reconnect_available(False)
+            self._set_bridge_reconnect_busy(False)
+            self._bridge_status_missing_since = None
             self._set_bridge_launch_phase("starting")
             self._set_launch_status("旧服务已退出；正在启动当前版本…")
             QTimer.singleShot(0, self._start_bridge_process)
@@ -5524,6 +5799,11 @@ def _load_qt_classes() -> dict:
                 self._bridge_launch_elapsed_seconds = 0
                 self.bridgeLaunchElapsedSecondsChanged.emit()
             self._set_bridge_connected(False)
+            self._set_bridge_input_states(None)
+            self._set_bridge_restart_recommended(False)
+            self._set_bridge_reconnect_available(False)
+            self._set_bridge_reconnect_busy(False)
+            self._bridge_status_missing_since = None
             self._set_error_message("")
             self._set_bridge_launch_phase("starting")
             self._set_launch_status(
@@ -5537,10 +5817,35 @@ def _load_qt_classes() -> dict:
         ) -> None:
             self._pending_bridge_launch = None
             self._refresh_bridge_launch_elapsed()
+            if (
+                result.outcome is bridge_launcher.LaunchOutcome.ALREADY_RUNNING
+                and not bridge_launcher.in_process_bridge_running()
+            ):
+                self._set_bridge_running(True)
+                self._set_bridge_connected(False)
+                self._set_bridge_input_states(None)
+                self._set_bridge_reconnect_available(False)
+                self._set_bridge_reconnect_busy(False)
+                self._bridge_status_missing_since = None
+                if self._legacy_bridge_launch_handoff_attempted:
+                    self._set_bridge_launch_phase("failed")
+                    self._set_bridge_restart_recommended(True)
+                    self._set_launch_status(
+                        "旧版遥控器服务再次启动；请完全退出旧版后重新启动。"
+                    )
+                else:
+                    self._legacy_bridge_launch_handoff_attempted = True
+                    self._begin_bridge_restart(
+                        automatic=True,
+                        allow_active_voice=True,
+                    )
+                self._schedule_application_exit_poll()
+                return
             if result.outcome in {
                 bridge_launcher.LaunchOutcome.STARTED,
                 bridge_launcher.LaunchOutcome.ALREADY_RUNNING,
             }:
+                self._legacy_bridge_launch_handoff_attempted = False
                 self._set_bridge_running(True)
                 self._set_bridge_launch_phase("waiting")
                 if (
@@ -5558,6 +5863,11 @@ def _load_qt_classes() -> dict:
                 return
             self._set_bridge_running(False)
             self._set_bridge_connected(False)
+            self._set_bridge_input_states(None)
+            self._set_bridge_restart_recommended(False)
+            self._set_bridge_reconnect_available(False)
+            self._set_bridge_reconnect_busy(False)
+            self._bridge_status_missing_since = None
             self._set_bridge_launch_phase(
                 "unknown"
                 if result.outcome is bridge_launcher.LaunchOutcome.STATUS_UNKNOWN
@@ -5639,6 +5949,332 @@ def _load_qt_classes() -> dict:
                 settings_ui.describe_log_open_result(result),
                 self._DEVICE_PAGE_INDEX,
             )
+
+        def _application_update_operation_blocked(self) -> bool:
+            return bool(
+                self._background_shutdown_event.is_set()
+                or self._application_exit_requested
+                or self._application_exit_intent.is_set()
+                or self._application_exit_confirmed
+            )
+
+        def _application_update_result_discarded(self) -> bool:
+            return bool(
+                self._background_shutdown_event.is_set()
+                or self._application_exit_confirmed
+            )
+
+        def _application_update_package_kind(self):
+            return (
+                application_update.PackageKind.INSTALLER
+                if self._hid_helper_installed_distribution
+                else application_update.PackageKind.PORTABLE
+            )
+
+        def _set_application_update_release(self, release) -> None:
+            self._application_update_release = release
+            self._application_update_release_url = release.release_url
+            self._application_update_release_notes = (
+                release.notes or "暂无更新说明。"
+            )
+            package = release.package_for(self._application_update_package_kind())
+            self._application_update_package_name = package.name
+            self._application_update_package_size = package.size
+            self._application_update_download_received = 0
+            self._application_update_download_path = ""
+
+        @Slot(result=bool)
+        def checkForApplicationUpdate(self) -> bool:
+            if (
+                self._application_update_check_busy
+                or self._application_update_download_busy
+                or self._application_update_operation_blocked()
+            ):
+                return False
+
+            self._application_update_check_busy = True
+            self._application_update_available = False
+            self._application_update_state = "checking"
+            self._application_update_message = "正在检查 GitHub 更新…"
+            self._application_update_release_notes = ""
+            self._application_update_release_url = application_update.RELEASES_PAGE_URL
+            self._application_update_release = None
+            self._application_update_package_name = ""
+            self._application_update_package_size = 0
+            self._application_update_download_received = 0
+            self._application_update_download_path = ""
+            self._set_error_message("")
+            self._set_status_message(
+                "正在检查 GitHub 更新…", self._DEVICE_PAGE_INDEX
+            )
+            self.applicationUpdateChanged.emit()
+
+            def run() -> None:
+                try:
+                    result = application_update.check_for_update(__version__)
+                    payload = (True, result)
+                except application_update.ApplicationUpdateError as exc:
+                    payload = (False, exc)
+                except Exception:  # noqa: BLE001 - keep remote errors sanitized
+                    payload = (
+                        False,
+                        application_update.ApplicationUpdateError(
+                            "unexpected", "检查更新失败，请稍后重试。"
+                        ),
+                    )
+                self._emit_background_result(
+                    self._applicationUpdateCheckReady, payload
+                )
+
+            try:
+                self._start_background_task(run, "remote-mic-update-check")
+            except Exception:
+                self._application_update_check_busy = False
+                self._application_update_state = "check_error"
+                self._application_update_message = "无法启动更新检查后台任务。"
+                self._set_status_message("")
+                self._set_error_message(
+                    self._application_update_message, self._DEVICE_PAGE_INDEX
+                )
+                self.applicationUpdateChanged.emit()
+                self.applicationUpdateDialogRequested.emit()
+                return False
+            return True
+
+        def _on_application_update_check_ready(self, payload: object) -> None:
+            if self._application_update_result_discarded():
+                return
+            succeeded, value = payload
+            self._application_update_check_busy = False
+            if not succeeded:
+                self._application_update_available = False
+                self._application_update_state = "check_error"
+                self._application_update_message = str(value)
+                self._set_status_message("")
+                self._set_error_message(
+                    f"检查更新失败：{value}", self._DEVICE_PAGE_INDEX
+                )
+                self.applicationUpdateChanged.emit()
+                if not self._application_update_operation_blocked():
+                    self.applicationUpdateDialogRequested.emit()
+                return
+
+            result = value
+            self._set_application_update_release(result.release)
+            self._set_error_message("")
+            if (
+                result.outcome
+                is application_update.UpdateCheckOutcome.UPDATE_AVAILABLE
+            ):
+                self._application_update_available = True
+                self._application_update_state = "available"
+                self._application_update_message = (
+                    f"发现新版本 {result.release.version.text}。"
+                )
+            elif result.outcome is application_update.UpdateCheckOutcome.CURRENT:
+                self._application_update_available = False
+                self._application_update_state = "current"
+                self._application_update_message = "当前已是最新版本。"
+            else:
+                self._application_update_available = False
+                self._application_update_state = "local_newer"
+                self._application_update_message = (
+                    "当前版本比 GitHub 上可下载的版本更新。"
+                )
+            self._set_status_message(
+                self._application_update_message, self._DEVICE_PAGE_INDEX
+            )
+            self.applicationUpdateChanged.emit()
+            if not self._application_update_operation_blocked():
+                self.applicationUpdateDialogRequested.emit()
+
+        @Slot(result=bool)
+        def downloadApplicationUpdate(self) -> bool:
+            if (
+                not self._application_update_available
+                or self._application_update_release is None
+                or self._application_update_check_busy
+                or self._application_update_download_busy
+                or self._application_update_operation_blocked()
+            ):
+                return False
+
+            release = self._application_update_release
+            package_kind = self._application_update_package_kind()
+            cancel_event = threading.Event()
+            self._application_update_download_cancel_event = cancel_event
+            self._application_update_download_busy = True
+            self._application_update_state = "downloading"
+            self._application_update_message = (
+                f"正在下载{self.applicationUpdatePackageKindText}…"
+            )
+            self._application_update_download_received = 0
+            self._application_update_download_path = ""
+            self._set_error_message("")
+            self._set_status_message(
+                self._application_update_message, self._DEVICE_PAGE_INDEX
+            )
+            self.applicationUpdateChanged.emit()
+
+            def report_progress(received: int, total: int) -> None:
+                if not self._emit_background_result(
+                    self._applicationUpdateProgressReady,
+                    (int(received), int(total)),
+                ):
+                    cancel_event.set()
+
+            def run() -> None:
+                try:
+                    application_update.cleanup_obsolete_update_downloads(
+                        self._config_root / "updates",
+                        release.version,
+                        include_current=False,
+                    )
+                    result = application_update.download_update_package(
+                        release,
+                        package_kind,
+                        self._config_root / "updates" / release.version.text,
+                        cancel_event=cancel_event,
+                        progress_callback=report_progress,
+                    )
+                    payload = (True, result)
+                except application_update.ApplicationUpdateCancelled as exc:
+                    payload = (False, exc)
+                except application_update.ApplicationUpdateError as exc:
+                    payload = (False, exc)
+                except Exception:  # noqa: BLE001 - keep remote errors sanitized
+                    payload = (
+                        False,
+                        application_update.ApplicationUpdateError(
+                            "unexpected", "下载更新包失败，请稍后重试。"
+                        ),
+                    )
+                self._emit_background_result(
+                    self._applicationUpdateDownloadReady, payload
+                )
+
+            try:
+                self._start_background_task(run, "remote-mic-update-download")
+            except Exception:
+                cancel_event.set()
+                self._application_update_download_cancel_event = None
+                self._application_update_download_busy = False
+                self._application_update_state = "download_error"
+                self._application_update_message = "无法启动更新下载后台任务。"
+                self._set_status_message("")
+                self._set_error_message(
+                    self._application_update_message, self._DEVICE_PAGE_INDEX
+                )
+                self.applicationUpdateChanged.emit()
+                return False
+            return True
+
+        def _on_application_update_progress_ready(self, payload: object) -> None:
+            if (
+                not self._application_update_download_busy
+                or self._application_update_result_discarded()
+            ):
+                return
+            received, total = payload
+            if int(total) != self._application_update_package_size:
+                return
+            self._application_update_download_received = max(
+                0, min(int(received), self._application_update_package_size)
+            )
+            self.applicationUpdateChanged.emit()
+
+        def _on_application_update_download_ready(self, payload: object) -> None:
+            if self._application_update_result_discarded():
+                return
+            succeeded, value = payload
+            self._application_update_download_busy = False
+            self._application_update_download_cancel_event = None
+            if not succeeded:
+                if isinstance(
+                    value, application_update.ApplicationUpdateCancelled
+                ):
+                    self._application_update_state = "available"
+                    self._application_update_message = "下载已取消，可以稍后重试。"
+                    self._set_error_message("")
+                    self._set_status_message(
+                        self._application_update_message, self._DEVICE_PAGE_INDEX
+                    )
+                else:
+                    self._application_update_state = "download_error"
+                    self._application_update_message = str(value)
+                    self._set_status_message("")
+                    self._set_error_message(
+                        f"下载更新失败：{value}", self._DEVICE_PAGE_INDEX
+                    )
+                self.applicationUpdateChanged.emit()
+                return
+
+            result = value
+            self._application_update_available = False
+            self._application_update_state = "downloaded"
+            self._application_update_download_received = (
+                self._application_update_package_size
+            )
+            self._application_update_download_path = str(result.path)
+            if result.package_kind is application_update.PackageKind.INSTALLER:
+                self._application_update_message = (
+                    "更新包已下载并通过校验。请先完全退出无线麦，再在文件夹中"
+                    "手动运行安装器；程序不会自动安装。"
+                )
+            else:
+                self._application_update_message = (
+                    "便携版已下载并通过校验。请先完全退出当前版本，再解压到"
+                    "新的文件夹使用；程序不会覆盖现有目录。"
+                )
+            self._set_error_message("")
+            self._set_status_message(
+                "更新包已下载并通过校验。", self._DEVICE_PAGE_INDEX
+            )
+            self.applicationUpdateChanged.emit()
+
+        @Slot(result=bool)
+        def cancelApplicationUpdateDownload(self) -> bool:
+            cancel_event = self._application_update_download_cancel_event
+            if not self._application_update_download_busy or cancel_event is None:
+                return False
+            cancel_event.set()
+            self._application_update_message = "正在取消下载…"
+            self.applicationUpdateChanged.emit()
+            return True
+
+        @Slot(result=bool)
+        def openApplicationUpdateRelease(self) -> bool:
+            target = self._application_update_release_url
+            result = shell_targets.open_external_target(target)
+            self._report_external_target(result, self._DEVICE_PAGE_INDEX)
+            return result.outcome is shell_targets.ExternalTargetOutcome.OPENED
+
+        @Slot(result=bool)
+        def openDownloadedApplicationUpdate(self) -> bool:
+            package_path = (
+                Path(self._application_update_download_path)
+                if self._application_update_download_path
+                else None
+            )
+            if package_path is None or not package_path.is_file():
+                self._application_update_available = (
+                    self._application_update_release is not None
+                )
+                self._application_update_state = "download_error"
+                self._application_update_message = (
+                    "已下载的更新包不存在，请重新下载。"
+                )
+                self._application_update_download_received = 0
+                self._application_update_download_path = ""
+                self._set_status_message("")
+                self._set_error_message(
+                    self._application_update_message, self._DEVICE_PAGE_INDEX
+                )
+                self.applicationUpdateChanged.emit()
+                return False
+            result = shell_targets.open_external_target(str(package_path.parent))
+            self._report_external_target(result, self._DEVICE_PAGE_INDEX)
+            return result.outcome is shell_targets.ExternalTargetOutcome.OPENED
 
         @Slot(str)
         def selectButton(self, button_id: str) -> None:
@@ -5915,6 +6551,7 @@ def _load_qt_classes() -> dict:
             "group": check.group.value,
             "status": check.status.value,
             "detail": check.detail,
+            "resultCode": check.result_code,
         }
 
     class DiagnosticsController(QObject):

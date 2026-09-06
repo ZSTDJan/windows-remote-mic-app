@@ -111,6 +111,7 @@ HID_HELPER_MAINTENANCE_FAILED_EXIT_CODE = 24
 HID_HELPER_ACCOUNT_UNSUPPORTED_EXIT_CODE = 25
 ELEVATED_DESKTOP_UNSUPPORTED_EXIT_CODE = 26
 INSTALLER_MAINTENANCE_ACTIVE_EXIT_CODE = 27
+LEGACY_BRIDGE_STARTUP_BLOCKED_EXIT_CODE = 28
 HID_CONSUMER_REGISTRATION_TIMEOUT_SECONDS = 2.0
 INVALID_ARGUMENTS_EXIT_CODE = 2
 APPLICATION_EXIT_REQUEST_TIMEOUT_SECONDS = 45.0
@@ -193,6 +194,7 @@ def _dry_run() -> int:
 
     from . import (  # noqa: F401
         app,
+        application_update,
         atvv_protocol,
         atvv_session,
         audio_output,
@@ -897,6 +899,85 @@ def main() -> None:
     _run_settings()
 
 
+def _migrate_legacy_bridge_before_desktop_start() -> bool:
+    """Stop a residual standalone bridge before the desktop window exists."""
+
+    from . import (
+        bridge_control_windows,
+        bridge_launcher,
+        bridge_runtime_status,
+        config,
+        single_instance,
+    )
+
+    def clear_stale_status_or_block() -> None:
+        try:
+            # The bridge mutex proves there is no live writer while the stale
+            # status is claimed and removed. A bridge that restarts during the
+            # handoff wins the mutex and blocks this copy instead.
+            with single_instance.BridgeInstanceGuard():
+                config_root = config.config_root()
+                bridge_runtime_status.clear_status(config_root)
+                if bridge_runtime_status.read_status(config_root) is not None:
+                    raise OSError("bridge runtime status remained after cleanup")
+        except single_instance.DuplicateInstanceError:
+            single_instance.show_bridge_startup_blocked_notice(
+                "旧版遥控器服务又启动了，当前版本没有打开。\n\n"
+                "请完全退出旧版后重试。"
+            )
+            raise SystemExit(LEGACY_BRIDGE_STARTUP_BLOCKED_EXIT_CODE)
+        except (
+            OSError,
+            single_instance.SingleInstanceUnavailableError,
+            single_instance.MutexCleanupError,
+        ):
+            single_instance.show_bridge_startup_blocked_notice(
+                "无法清理上次的遥控器服务状态，当前版本没有打开。\n\n"
+                "请完全退出旧版后重试。"
+            )
+            raise SystemExit(LEGACY_BRIDGE_STARTUP_BLOCKED_EXIT_CODE)
+
+    try:
+        if bridge_launcher.in_process_bridge_running():
+            return False
+        legacy_running = single_instance.bridge_instance_running()
+    except (
+        single_instance.SingleInstanceUnavailableError,
+        single_instance.MutexCleanupError,
+    ):
+        single_instance.show_bridge_startup_blocked_notice(
+            "无法确认旧版遥控器服务是否仍在运行。\n\n"
+            "请完全退出旧版后，再打开当前版本。"
+        )
+        raise SystemExit(LEGACY_BRIDGE_STARTUP_BLOCKED_EXIT_CODE)
+
+    if not legacy_running:
+        clear_stale_status_or_block()
+        return False
+
+    try:
+        result = bridge_control_windows.request_bridge_exit()
+    except Exception:  # noqa: BLE001 - startup must fail closed
+        result = bridge_control_windows.BridgeExitResult(False, False)
+    if result.stopped:
+        clear_stale_status_or_block()
+        return True
+
+    if result.cleanup_failed:
+        single_instance.show_bridge_startup_blocked_notice(
+            "旧版退出后的状态没有清理完成，当前版本没有打开。\n\n"
+            "请完全退出旧版后重试。"
+        )
+        raise SystemExit(LEGACY_BRIDGE_STARTUP_BLOCKED_EXIT_CODE)
+
+    single_instance.show_bridge_startup_blocked_notice(
+        "旧版遥控器服务仍在运行，当前版本没有打开。\n\n"
+        "请从旧版通知区域选择“完全退出”；看不到图标时，"
+        "请在任务管理器结束旧版无线麦后重试。"
+    )
+    raise SystemExit(LEGACY_BRIDGE_STARTUP_BLOCKED_EXIT_CODE)
+
+
 def _run_settings(
     *,
     start_hidden: bool = False,
@@ -939,14 +1020,18 @@ def _run_settings(
 
     def run_owned_application() -> None:
         with single_instance.ApplicationInstanceGuard():
+            migrate_legacy_bridge = (
+                _migrate_legacy_bridge_before_desktop_start()
+            )
             _register_current_hid_helper_consumer()
+            effective_start_bridge = start_bridge or migrate_legacy_bridge
             if start_hidden:
                 settings_ui.main(
                     start_hidden=True,
-                    start_bridge=start_bridge,
+                    start_bridge=effective_start_bridge,
                 )
             else:
-                settings_ui.main(start_bridge=start_bridge)
+                settings_ui.main(start_bridge=effective_start_bridge)
 
     def handle_current_runtime_duplicate() -> None:
         if start_bridge:

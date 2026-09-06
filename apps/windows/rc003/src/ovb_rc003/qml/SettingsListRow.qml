@@ -86,7 +86,7 @@ Rectangle {
         anchors.left: parent.left
         anchors.right: parent.right
         anchors.bottom: parent.bottom
-        height: root.tokens.hairlineWidth
+        height: Math.max(1, root.tokens.hairlineWidth)
         color: root.tokens.border
     }
 }

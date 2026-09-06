@@ -4,7 +4,7 @@
 
 - 上游项目：[`nijez/open-voice-bridge`](https://github.com/nijez/open-voice-bridge)
 - 上游 Windows 实现：`apps/windows/rc003/`
-- 本仓库：[`miaomiaozii/windows-remote-mic-app`](https://github.com/miaomiaozii/windows-remote-mic-app)
+- 本仓库：[`ZSTDJan/windows-remote-mic-app`](https://github.com/ZSTDJan/windows-remote-mic-app)
 
 上游项目已经提供了 RC003 的 Windows 参考实现，包括 WinRT BLE、ATVV 语音协议、
 Windows Raw Input、SendInput、PortAudio 音频输出、Qt/QML 设置页、诊断、测试和

@@ -40,6 +40,10 @@ SE_PRIVILEGE_ENABLED = 0x00000002
 ERROR_NOT_ALL_ASSIGNED = 1300
 
 
+class HidInjectionStageError(RuntimeError):
+    """Sanitized injection-stage failure for the elevated helper."""
+
+
 class LUID(ctypes.Structure):
     _fields_ = (("LowPart", wintypes.DWORD), ("HighPart", wintypes.LONG))
 
@@ -175,7 +179,9 @@ def inject_library(pid: int, dll_path: Path) -> None:
     )
     process = kernel32.OpenProcess(rights, False, pid)
     if not process:
-        raise ctypes.WinError(ctypes.get_last_error())
+        raise HidInjectionStageError(
+            "hid_helper_target_process_open_failed"
+        ) from ctypes.WinError(ctypes.get_last_error())
     remote_path = None
     thread = None
     remote_thread_completed = False
@@ -185,19 +191,27 @@ def inject_library(pid: int, dll_path: Path) -> None:
             process, None, len(encoded), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE
         )
         if not remote_path:
-            raise ctypes.WinError(ctypes.get_last_error())
+            raise HidInjectionStageError(
+                "hid_helper_remote_memory_failed"
+            ) from ctypes.WinError(ctypes.get_last_error())
         buffer = ctypes.create_string_buffer(encoded)
         written = ctypes.c_size_t()
         if not kernel32.WriteProcessMemory(
             process, remote_path, buffer, len(encoded), ctypes.byref(written)
         ):
-            raise ctypes.WinError(ctypes.get_last_error())
+            raise HidInjectionStageError(
+                "hid_helper_remote_memory_failed"
+            ) from ctypes.WinError(ctypes.get_last_error())
         if written.value != len(encoded):
-            raise RuntimeError(f"partial remote write: {written.value}/{len(encoded)}")
+            raise HidInjectionStageError("hid_helper_remote_memory_failed")
         kernel = kernel32.GetModuleHandleW("kernel32.dll")
+        if not kernel:
+            raise HidInjectionStageError("hid_helper_remote_load_failed")
         load_library = kernel32.GetProcAddress(kernel, b"LoadLibraryW")
         if not load_library:
-            raise ctypes.WinError(ctypes.get_last_error())
+            raise HidInjectionStageError(
+                "hid_helper_remote_load_failed"
+            ) from ctypes.WinError(ctypes.get_last_error())
         thread_id = wintypes.DWORD()
         thread = kernel32.CreateRemoteThread(
             process,
@@ -209,20 +223,26 @@ def inject_library(pid: int, dll_path: Path) -> None:
             ctypes.byref(thread_id),
         )
         if not thread:
-            raise ctypes.WinError(ctypes.get_last_error())
+            raise HidInjectionStageError(
+                "hid_helper_remote_thread_failed"
+            ) from ctypes.WinError(ctypes.get_last_error())
         wait_result = int(kernel32.WaitForSingleObject(thread, 20_000))
         if wait_result == WAIT_TIMEOUT:
-            raise TimeoutError("remote LoadLibraryW timed out")
+            raise HidInjectionStageError("hid_helper_remote_load_timeout")
         if wait_result == WAIT_FAILED:
-            raise ctypes.WinError(ctypes.get_last_error())
+            raise HidInjectionStageError(
+                "hid_helper_remote_load_failed"
+            ) from ctypes.WinError(ctypes.get_last_error())
         if wait_result != WAIT_OBJECT_0:
-            raise RuntimeError("remote LoadLibraryW returned an unexpected wait result")
+            raise HidInjectionStageError("hid_helper_remote_load_failed")
         remote_thread_completed = True
         exit_code = wintypes.DWORD()
         if not kernel32.GetExitCodeThread(thread, ctypes.byref(exit_code)):
-            raise ctypes.WinError(ctypes.get_last_error())
+            raise HidInjectionStageError(
+                "hid_helper_remote_load_failed"
+            ) from ctypes.WinError(ctypes.get_last_error())
         if exit_code.value == 0:
-            raise RuntimeError("remote LoadLibraryW returned NULL")
+            raise HidInjectionStageError("hid_helper_remote_load_failed")
     finally:
         if thread:
             kernel32.CloseHandle(thread)
@@ -274,19 +294,38 @@ def inject_current_process(pid: int) -> None:
         raise PermissionError("RC003 injector requires Windows administrator elevation")
     expected_pid = find_rc003_hidogatt_host_pid()
     if expected_pid != pid:
-        raise RuntimeError(
-            f"RC003 host changed before injection: expected={expected_pid} requested={pid}"
-        )
+        raise HidInjectionStageError("hid_helper_host_changed")
     # WUDFHost denies even limited process queries until the elevated injector
     # enables SeDebugPrivilege.  Validate the target only after that succeeds.
-    enable_debug_privilege()
-    if _target_process_name(pid) != "wudfhost.exe":
-        raise RuntimeError("refusing non-WUDFHost target")
-    dll_path = prepare_secure_runtime()
-    dll_hash = sha256_file(dll_path)
+    try:
+        enable_debug_privilege()
+    except (OSError, PermissionError) as exc:
+        raise HidInjectionStageError(
+            "hid_helper_debug_privilege_failed"
+        ) from exc
+    try:
+        target_name = _target_process_name(pid)
+    except OSError as exc:
+        raise HidInjectionStageError(
+            "hid_helper_target_process_open_failed"
+        ) from exc
+    if target_name != "wudfhost.exe":
+        raise HidInjectionStageError("hid_helper_target_validation_failed")
+    try:
+        dll_path = prepare_secure_runtime()
+        dll_hash = sha256_file(dll_path)
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise HidInjectionStageError(
+            "hid_helper_runtime_preparation_failed"
+        ) from exc
     if dll_hash != GADGET_DLL_SHA256:
-        raise RuntimeError(f"verified Gadget changed before injection: {dll_hash}")
-    inject_library(pid, dll_path)
+        raise HidInjectionStageError("hid_helper_runtime_preparation_failed")
+    try:
+        inject_library(pid, dll_path)
+    except HidInjectionStageError:
+        raise
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise HidInjectionStageError("hid_helper_injection_failed") from exc
 
 
 def main(argv: list[str] | None = None) -> int:

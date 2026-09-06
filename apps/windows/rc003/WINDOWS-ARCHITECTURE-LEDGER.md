@@ -84,7 +84,8 @@ RC003 原本是面向电视/机顶盒的蓝牙语音遥控器。Windows 可以�
 - Remote Mic 主项目调研快照：`HD838A/remote-mic-app` 的 `main` 在
   2026-08-20 核验为 `4d526175817ad2c4c5fbe1650d528c946a3cdbf3`，主要维护
   macOS，不是本 Windows 客户端的直接代码基线。
-- Windows 派生仓库：`miaomiaozii/windows-remote-mic-app`。
+- 当前 Windows 公共仓库：`ZSTDJan/windows-remote-mic-app`；本地维护历史最初从
+  `miaomiaozii/windows-remote-mic-app` 派生。
 - Windows 派生起点：`271ed7947eec19c4c691ed3ba97f338461be8051`；内部实现
   基于 GPL-3.0-only 项目 `nijez/open-voice-bridge` 的 Windows RC003 客户端。
 - 最近完整源码检查点：`eafd203`；该提交证明代码修改与自动检查基线，不代表
@@ -161,15 +162,23 @@ HID、合成按键或音频资源。关闭窗口默认先释放设置页临时�
 或安全清除后，新副本才重新取得产品级 mutex 并启动。更早的不支持请求的旧版只会被
 唤出，等待用户从通知区域选择“完全退出”，不会被强杀。
 
+桌面主程序取得单实例所有权后、创建窗口前，还会迁移可能残留的历史独立桥接。只有旧服务
+已经正常停止且旧运行状态已安全清理，当前版本才继续打开并在主进程内恢复桥接；无法确认
+停止、清理失败或旧服务在交接时重新出现，都会阻止新版打开并要求用户完全退出旧版后重试。
+
 安装器、卸载器和 Start Menu“停止”入口使用 `application-exit-request.json` 请求桌面主
 进程走同一套完整退出路径。当前版本会先处理未保存提示，再停止输入监听、诊断任务、
 桥接 worker、BLE、HID、语音热键和音频资源；请求处理期间禁止新的桥接启动或自动恢复。
 请求被取消、拒绝或超时后，安装器不会覆盖正在使用的程序文件。
 
-桥接 worker 是 `bridge-runtime-status.json` 的唯一写入者。schema 2 每 5 秒原子更新
-版本与构建摘要、BLE 连接、Raw Input、HID tap、最近按键和语音活动；不写设备地址、
-窗口标题、输入文字或语音内容。设置控制器只读：能确认其它构建或两个按键通道都明确
-失败且语音空闲时，最多正常恢复一次；旧 schema、心跳滞后或语音进行中不自动停止。
+桥接 worker 是运行状态的唯一写入者。Windows 文件名包含当前登录会话 ID，与
+`Local\\` 桥接 mutex 的隔离范围一致；会话查询失败时固定退回当前进程范围，不会在运行中
+改换路径。schema 2 每 5 秒原子更新版本与构建摘要、BLE 连接、Raw Input、HID tap、
+语音按键通道、最近按键和语音活动；不写设备地址、窗口标题、输入文字或语音内容。设置
+控制器只读：能确认其它构建，或 Raw Input 与 HID tap 同时明确失败且语音空闲时，最多
+正常恢复一次；语音按键通道失败只提示用户重新启动，不自动停止服务。旧 schema、心跳滞后
+或语音进行中也不自动停止。停止旧服务后，状态清理先原子认领文件再核对旧 PID，避免退出
+中的旧进程删除新进程刚写入的状态。
 
 `--bridge-from-settings` 只是旧启动命令保留的隐藏兼容标记，不是独立运行角色。
 `--bridge` 命中已有主程序时只写入一次短时启动请求，由现有进程消费。BLE 诊断另起子进程，
@@ -436,8 +445,10 @@ session detach 成功即证明其脚本不再被会话持有；单独 script unl
 | `key_bindings.json` | 主/次手势动作、可移植物理签名映射 |
 | `logs\app.log` | 轮转运行日志 |
 | `logs\hid-helper.log` | 普通主进程一次写入并立即关闭的管理员按键组件结果 |
+| `bridge-runtime-status-s<会话 ID>.json` | 当前 Windows 登录会话的桥接心跳、连接与输入通道状态 |
 | `key-detection\` | 最多 30 秒有效的一次性按键检测 IPC |
 | `application-exit-request.json` | 安装、卸载或明确停止操作使用的一次性完整退出请求 |
+| `updates\<版本号>\` | 已校验的安装器或便携 ZIP；`.part` 只在下载未完成时临时存在 |
 | `captures\` | 用户显式运行诊断工具时生成的隐私安全 JSONL |
 
 两份 JSON 都逐文件使用临时文件、flush、`fsync`、`os.replace` 原子替换。
@@ -490,6 +501,25 @@ VB-CABLE 的检测、确认和 UAC 安装继续只有 `DiagnosticsPage.qml` 一�
 录制、真实按键检测、诊断 worker 和遗留音频预检流；某一步失败不跳过后续
 清理。
 
+### 11.1 手动更新边界
+
+软件更新的正式来源是 `application_update.py`。只有用户点击“检查更新”后，设置
+控制器才在后台 worker 访问固定的 `ZSTDJan/windows-remote-mic-app` GitHub Releases；
+启动、后台运行和定时器均不触发联网，客户端不保存 GitHub 凭据。Release tag 只作
+发布编号，版本比较严格读取同一次 Release 中安装器与便携 ZIP 文件名携带的内部版本；
+两种包、`SHA256SUMS.txt`、预发行状态或版本不能互相印证时，该 Release 不可用。
+
+API 请求只允许 `api.github.com`；资产初始地址必须属于本仓库的 `github.com` Release，
+重定向只允许 GitHub 资产域名。响应大小、资产大小均有上限，单次网络等待有超时。安装版选择
+安装器，便携版或源码运行选择 ZIP；下载写入
+`%LOCALAPPDATA%\RemoteMic\RC003\updates\<版本号>\<文件名>.part`，依次核对 API
+大小、`SHA256SUMS.txt`，以及 GitHub 提供时的 SHA-256 摘要，全部通过后才原子改为正式
+文件名。取消、中断、校验失败和写入失败会清理临时文件。
+
+当前公开版本可能按临时说明以管理员身份运行，因此更新链路绝不执行下载文件，也不
+自动关闭、覆盖或重启程序。界面只提供“打开文件夹”，安装器和便携 ZIP 都由用户在
+完全退出当前版本后手动处理。
+
 后台桥接存在时，“检测真实按键”不再争抢 Raw Input/HID tap，而是写入一次性
 本地文件请求，由桥接吞掉下一次按下/释放、返回逻辑 button id 且不执行映射。
 无法安全确认桥接 mutex 状态时，设置页停止检测，不猜测“没有运行”。
@@ -515,6 +545,7 @@ VB-CABLE 的检测、确认和 UAC 安装继续只有 `DiagnosticsPage.qml` 一�
 | HID tap 线程/管理员助手 | loopback server、固定计划任务、目标进程句柄、Gadget 消息 | 助手无动态目标参数；验证任务 XML、助手哈希和客户端 PID，心跳/大小有界 |
 | 托盘线程 | Win32 window、图标、菜单 | 退出回投 asyncio，不直接碰 BLE |
 | Qt 诊断线程 | 一次诊断任务 | 窗口退出发 stop 并有界等待 |
+| Qt 更新 worker | 用户手动触发的一次检查或下载 | 进程销毁时发 cancel；可逆退出失败前仍结算结果，真正销毁后丢弃迟到结果；不执行下载文件 |
 | PortAudio sink | native output stream | close 未确认时保留 owner 重试 |
 
 最重要的总原则是“引用代表所有权”。线程仍活、handle 未关闭、stream 未关闭
@@ -625,6 +656,7 @@ F5 不再向输入框泄漏日期时间。On-request 真机探针最终未收到
 | 豆包兼容 | `doubao_rpc.py` |
 | 配置/IPC | `config.py`、`key_detection_bridge.py`、`key_testing.py` |
 | 设置界面 | `qt_settings_app.py`、`settings_ui.py`、`qml/*.qml` |
+| 手动更新 | `application_update.py`、`qt_settings_app.py`、`qml/DevicePage.qml`、`qml/main.qml` |
 | 诊断/日志 | `windows_diagnostics.py`、`logging_setup.py`、顶层诊断脚本；历史 On-request 探针已撤下 |
 | 资源/设备目录 | `resources.py`、`device_catalog.py`、`device-profiles/` |
 | 驱动帮助 | `vb_cable_bundle.py` |

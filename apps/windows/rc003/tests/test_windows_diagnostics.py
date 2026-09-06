@@ -55,15 +55,18 @@ class RawInputCheckTests(unittest.TestCase):
     def test_zero_matches_fails(self):
         result = diag.check_raw_input(enumerate_paths=lambda: [])
         self.assertEqual(result.status, diag.CheckStatus.FAIL)
+        self.assertEqual(result.result_code, "no_device")
 
     def test_exactly_one_match_passes(self):
         result = diag.check_raw_input(enumerate_paths=lambda: ["\\\\?\\HID#VID_2717&PID_32B8#..."])
         self.assertEqual(result.status, diag.CheckStatus.PASS)
         self.assertEqual(result.detail, "小米遥控器2 Pro 按键设备已找到")
+        self.assertEqual(result.result_code, "ready")
 
     def test_ambiguous_matches_fails(self):
         result = diag.check_raw_input(enumerate_paths=lambda: ["path1", "path2"])
         self.assertEqual(result.status, diag.CheckStatus.FAIL)
+        self.assertEqual(result.result_code, "ambiguous")
 
     def test_never_reports_the_device_path_itself(self):
         secret_path = "\\\\?\\HID#VID_2717&PID_32B8#SUPERSECRETSERIAL"
@@ -135,11 +138,13 @@ class BleCandidateCheckTests(unittest.TestCase):
         result = diag.check_ble_candidate(discover=lambda: [])
         self.assertEqual(result.status, diag.CheckStatus.FAIL)
         self.assertEqual(result.group, diag.CheckGroup.VOICE_BRIDGE)
+        self.assertEqual(result.result_code, "no_candidate")
 
     def test_exactly_one_matching_candidate_passes(self):
         candidates = [identity.RC003Candidate(name="Mi RC", hardware_match=False)]
         result = diag.check_ble_candidate(discover=lambda: candidates)
         self.assertEqual(result.status, diag.CheckStatus.PASS)
+        self.assertEqual(result.result_code, "ready")
 
     def test_ambiguous_candidates_fails(self):
         candidates = [
@@ -148,6 +153,7 @@ class BleCandidateCheckTests(unittest.TestCase):
         ]
         result = diag.check_ble_candidate(discover=lambda: candidates)
         self.assertEqual(result.status, diag.CheckStatus.FAIL)
+        self.assertEqual(result.result_code, "ambiguous")
 
     def test_non_matching_candidate_is_treated_as_no_candidate(self):
         candidates = [identity.RC003Candidate(name="Some Other Device", hardware_match=False)]

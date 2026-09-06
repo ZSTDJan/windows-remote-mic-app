@@ -1371,10 +1371,80 @@ class InjectorOrderingTests(unittest.TestCase):
         ), mock.patch.object(
             frida_hid_tap_injector, "_target_process_name"
         ) as target_name:
-            with self.assertRaises(PermissionError):
+            with self.assertRaises(
+                frida_hid_tap_injector.HidInjectionStageError
+            ) as ctx:
                 frida_hid_tap_injector.inject_current_process(2468)
 
+        self.assertEqual(str(ctx.exception), "hid_helper_debug_privilege_failed")
         target_name.assert_not_called()
+
+    def test_injector_reports_the_exact_failed_stage(self):
+        cases = (
+            (
+                "target_query",
+                {"_target_process_name": OSError("denied")},
+                "hid_helper_target_process_open_failed",
+            ),
+            (
+                "target_identity",
+                {"_target_process_name": "not-wudfhost.exe"},
+                "hid_helper_target_validation_failed",
+            ),
+            (
+                "runtime",
+                {"prepare_secure_runtime": OSError("missing")},
+                "hid_helper_runtime_preparation_failed",
+            ),
+            (
+                "remote_load",
+                {
+                    "prepare_secure_runtime": Path("verified.dll"),
+                    "sha256_file": frida_hid_tap_injector.GADGET_DLL_SHA256,
+                    "inject_library": frida_hid_tap_injector.HidInjectionStageError(
+                        "hid_helper_remote_load_failed"
+                    ),
+                },
+                "hid_helper_remote_load_failed",
+            ),
+        )
+
+        for name, overrides, expected in cases:
+            patches = [
+                mock.patch.object(frida_hid_tap_injector.os, "name", "nt"),
+                mock.patch.object(
+                    frida_hid_tap_injector,
+                    "find_rc003_hidogatt_host_pid",
+                    return_value=2468,
+                ),
+                mock.patch.object(
+                    frida_hid_tap_injector,
+                    "enable_debug_privilege",
+                ),
+            ]
+            defaults = {
+                "_target_process_name": "wudfhost.exe",
+                "prepare_secure_runtime": Path("verified.dll"),
+                "sha256_file": frida_hid_tap_injector.GADGET_DLL_SHA256,
+                "inject_library": None,
+            }
+            defaults.update(overrides)
+            for target, result in defaults.items():
+                kwargs = (
+                    {"side_effect": result}
+                    if isinstance(result, BaseException)
+                    else {"return_value": result}
+                )
+                patches.append(
+                    mock.patch.object(frida_hid_tap_injector, target, **kwargs)
+                )
+            with self.subTest(name=name):
+                with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5], patches[6]:
+                    with self.assertRaises(
+                        frida_hid_tap_injector.HidInjectionStageError
+                    ) as ctx:
+                        frida_hid_tap_injector.inject_current_process(2468)
+                self.assertEqual(str(ctx.exception), expected)
 
 
 class InjectorCleanupSafetyTests(unittest.TestCase):

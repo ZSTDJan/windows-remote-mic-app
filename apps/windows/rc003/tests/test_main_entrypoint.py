@@ -20,6 +20,9 @@ from unittest import mock
 from ovb_rc003 import __main__ as main_module
 from ovb_rc003 import (
     app,
+    bridge_control_windows,
+    bridge_launcher,
+    bridge_runtime_status,
     config,
     element_navigation_runtime,
     frida_compat,
@@ -246,6 +249,294 @@ def _make_guard_class(*, raise_on_enter=None, enter_calls=None):
     return _ScriptedGuard
 
 
+class LegacyBridgeStartupTests(unittest.TestCase):
+    def setUp(self):
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmpdir.cleanup)
+        self._config_root = Path(self._tmpdir.name)
+        self._config_patch = mock.patch.object(
+            config,
+            "config_root",
+            return_value=self._config_root,
+        )
+        self._guard_patch = mock.patch.object(
+            single_instance,
+            "BridgeInstanceGuard",
+            _make_guard_class(),
+        )
+        self._config_patch.start()
+        self._guard_patch.start()
+        self.addCleanup(self._config_patch.stop)
+        self.addCleanup(self._guard_patch.stop)
+
+    def test_startup_does_not_touch_bridge_exit_when_no_legacy_owner_exists(self):
+        bridge_runtime_status.publish_status(
+            self._config_root,
+            bridge_runtime_status.BridgeConnectionState.CONNECTED,
+            pid=1111,
+        )
+        with mock.patch.object(
+            bridge_launcher,
+            "in_process_bridge_running",
+            return_value=False,
+        ), mock.patch.object(
+            single_instance,
+            "bridge_instance_running",
+            return_value=False,
+        ), mock.patch.object(
+            bridge_control_windows,
+            "request_bridge_exit",
+        ) as request_exit:
+            migrated = main_module._migrate_legacy_bridge_before_desktop_start()
+
+        self.assertFalse(migrated)
+        request_exit.assert_not_called()
+        self.assertIsNone(bridge_runtime_status.read_status(self._config_root))
+
+    def test_startup_cleanup_does_not_touch_another_windows_session(self):
+        other_session = bridge_runtime_status.publish_status(
+            self._config_root,
+            bridge_runtime_status.BridgeConnectionState.CONNECTED,
+            pid=1111,
+            session_id=1,
+        )
+        with mock.patch.object(
+            bridge_runtime_status.sys,
+            "platform",
+            "win32",
+        ), mock.patch.object(
+            bridge_runtime_status,
+            "_default_status_scope",
+            bridge_runtime_status._STATUS_SCOPE_UNSET,
+        ), mock.patch.object(
+            single_instance,
+            "current_process_session_id",
+            return_value=2,
+        ), mock.patch.object(
+            bridge_launcher,
+            "in_process_bridge_running",
+            return_value=False,
+        ), mock.patch.object(
+            single_instance,
+            "bridge_instance_running",
+            return_value=False,
+        ):
+            migrated = main_module._migrate_legacy_bridge_before_desktop_start()
+
+        self.assertFalse(migrated)
+        self.assertEqual(
+            bridge_runtime_status.read_status(
+                self._config_root,
+                session_id=1,
+            ),
+            other_session,
+        )
+
+    def test_startup_stops_a_residual_legacy_bridge_before_opening(self):
+        bridge_runtime_status.publish_status(
+            self._config_root,
+            bridge_runtime_status.BridgeConnectionState.CONNECTED,
+            pid=1111,
+        )
+        with mock.patch.object(
+            bridge_launcher,
+            "in_process_bridge_running",
+            return_value=False,
+        ), mock.patch.object(
+            single_instance,
+            "bridge_instance_running",
+            return_value=True,
+        ), mock.patch.object(
+            bridge_control_windows,
+            "request_bridge_exit",
+            return_value=bridge_control_windows.BridgeExitResult(True, True),
+        ) as request_exit:
+            migrated = main_module._migrate_legacy_bridge_before_desktop_start()
+
+        self.assertTrue(migrated)
+        request_exit.assert_called_once_with()
+        self.assertIsNone(bridge_runtime_status.read_status(self._config_root))
+
+    def test_startup_blocks_when_the_residual_bridge_cannot_exit(self):
+        bridge_runtime_status.publish_status(
+            self._config_root,
+            bridge_runtime_status.BridgeConnectionState.CONNECTED,
+            pid=1111,
+        )
+        notices = []
+        with mock.patch.object(
+            bridge_launcher,
+            "in_process_bridge_running",
+            return_value=False,
+        ), mock.patch.object(
+            single_instance,
+            "bridge_instance_running",
+            return_value=True,
+        ), mock.patch.object(
+            bridge_control_windows,
+            "request_bridge_exit",
+            return_value=bridge_control_windows.BridgeExitResult(
+                True,
+                False,
+                "private detail",
+            ),
+        ), mock.patch.object(
+            single_instance,
+            "show_bridge_startup_blocked_notice",
+            side_effect=notices.append,
+        ):
+            with self.assertRaises(SystemExit) as ctx:
+                main_module._migrate_legacy_bridge_before_desktop_start()
+
+        self.assertEqual(
+            ctx.exception.code,
+            main_module.LEGACY_BRIDGE_STARTUP_BLOCKED_EXIT_CODE,
+        )
+        self.assertEqual(len(notices), 1)
+        self.assertIn("当前版本没有打开", notices[0])
+        self.assertNotIn("private detail", notices[0])
+        self.assertIsNotNone(bridge_runtime_status.read_status(self._config_root))
+
+    def test_startup_blocks_when_legacy_bridge_state_cannot_be_confirmed(self):
+        notices = []
+        with mock.patch.object(
+            bridge_launcher,
+            "in_process_bridge_running",
+            return_value=False,
+        ), mock.patch.object(
+            single_instance,
+            "bridge_instance_running",
+            side_effect=single_instance.SingleInstanceUnavailableError(
+                "private detail"
+            ),
+        ), mock.patch.object(
+            bridge_control_windows,
+            "request_bridge_exit",
+        ) as request_exit, mock.patch.object(
+            single_instance,
+            "show_bridge_startup_blocked_notice",
+            side_effect=notices.append,
+        ):
+            with self.assertRaises(SystemExit) as ctx:
+                main_module._migrate_legacy_bridge_before_desktop_start()
+
+        self.assertEqual(
+            ctx.exception.code,
+            main_module.LEGACY_BRIDGE_STARTUP_BLOCKED_EXIT_CODE,
+        )
+        self.assertEqual(len(notices), 1)
+        self.assertIn("无法确认旧版遥控器服务", notices[0])
+        self.assertNotIn("private detail", notices[0])
+        request_exit.assert_not_called()
+
+    def test_startup_blocks_when_stale_status_cleanup_fails(self):
+        notices = []
+        bridge_runtime_status.publish_status(
+            self._config_root,
+            bridge_runtime_status.BridgeConnectionState.CONNECTED,
+            pid=1111,
+        )
+        with mock.patch.object(
+            bridge_launcher,
+            "in_process_bridge_running",
+            return_value=False,
+        ), mock.patch.object(
+            single_instance,
+            "bridge_instance_running",
+            return_value=False,
+        ), mock.patch.object(
+            bridge_runtime_status,
+            "clear_status",
+            side_effect=OSError("private detail"),
+        ), mock.patch.object(
+            single_instance,
+            "show_bridge_startup_blocked_notice",
+            side_effect=notices.append,
+        ):
+            with self.assertRaises(SystemExit) as ctx:
+                main_module._migrate_legacy_bridge_before_desktop_start()
+
+        self.assertEqual(
+            ctx.exception.code,
+            main_module.LEGACY_BRIDGE_STARTUP_BLOCKED_EXIT_CODE,
+        )
+        self.assertEqual(len(notices), 1)
+        self.assertIn("无法清理上次", notices[0])
+        self.assertNotIn("private detail", notices[0])
+
+    def test_startup_reports_status_cleanup_failure_truthfully(self):
+        notices = []
+        with mock.patch.object(
+            bridge_launcher,
+            "in_process_bridge_running",
+            return_value=False,
+        ), mock.patch.object(
+            single_instance,
+            "bridge_instance_running",
+            return_value=True,
+        ), mock.patch.object(
+            bridge_control_windows,
+            "request_bridge_exit",
+            return_value=bridge_control_windows.BridgeExitResult(
+                True,
+                False,
+                "private detail",
+                True,
+            ),
+        ), mock.patch.object(
+            single_instance,
+            "show_bridge_startup_blocked_notice",
+            side_effect=notices.append,
+        ):
+            with self.assertRaises(SystemExit) as ctx:
+                main_module._migrate_legacy_bridge_before_desktop_start()
+
+        self.assertEqual(
+            ctx.exception.code,
+            main_module.LEGACY_BRIDGE_STARTUP_BLOCKED_EXIT_CODE,
+        )
+        self.assertEqual(len(notices), 1)
+        self.assertIn("状态没有清理完成", notices[0])
+        self.assertNotIn("仍在运行", notices[0])
+        self.assertNotIn("private detail", notices[0])
+
+    def test_startup_blocks_when_legacy_bridge_restarts_during_cleanup(self):
+        notices = []
+        restarting_guard = _make_guard_class(
+            raise_on_enter=single_instance.DuplicateInstanceError()
+        )
+        with mock.patch.object(
+            bridge_launcher,
+            "in_process_bridge_running",
+            return_value=False,
+        ), mock.patch.object(
+            single_instance,
+            "bridge_instance_running",
+            return_value=True,
+        ), mock.patch.object(
+            bridge_control_windows,
+            "request_bridge_exit",
+            return_value=bridge_control_windows.BridgeExitResult(True, True),
+        ), mock.patch.object(
+            single_instance,
+            "BridgeInstanceGuard",
+            restarting_guard,
+        ), mock.patch.object(
+            single_instance,
+            "show_bridge_startup_blocked_notice",
+            side_effect=notices.append,
+        ):
+            with self.assertRaises(SystemExit) as ctx:
+                main_module._migrate_legacy_bridge_before_desktop_start()
+
+        self.assertEqual(
+            ctx.exception.code,
+            main_module.LEGACY_BRIDGE_STARTUP_BLOCKED_EXIT_CODE,
+        )
+        self.assertEqual(len(notices), 1)
+        self.assertIn("又启动了", notices[0])
+
+
 class _ArgvRestoringTestCase(unittest.TestCase):
     def setUp(self):
         self._original_argv = sys.argv
@@ -273,6 +564,9 @@ class _ArgvRestoringTestCase(unittest.TestCase):
         self._original_handoff_previous_application = (
             main_module._handoff_previous_application
         )
+        self._original_migrate_legacy_bridge = (
+            main_module._migrate_legacy_bridge_before_desktop_start
+        )
         # Never let a failure-path test open a real system-modal Win32
         # message box on a developer machine or headless CI runner.
         single_instance.show_bridge_startup_blocked_notice = lambda message: None
@@ -281,6 +575,7 @@ class _ArgvRestoringTestCase(unittest.TestCase):
         single_instance.activate_existing_settings_window = lambda: True
         single_instance.activate_current_runtime_settings_window = lambda: True
         single_instance.write_bridge_start_request = lambda _root: None
+        main_module._migrate_legacy_bridge_before_desktop_start = lambda: False
 
     def tearDown(self):
         sys.argv = self._original_argv
@@ -304,6 +599,9 @@ class _ArgvRestoringTestCase(unittest.TestCase):
         main_module._qt_runtime_check = self._original_qt_runtime_check
         main_module._handoff_previous_application = (
             self._original_handoff_previous_application
+        )
+        main_module._migrate_legacy_bridge_before_desktop_start = (
+            self._original_migrate_legacy_bridge
         )
         element_navigation_runtime.run_element_navigation = (
             self._original_element_navigation_runtime
@@ -334,6 +632,13 @@ class DesktopModeRoutingTests(_ArgvRestoringTestCase):
 
         self.assertEqual(enter_calls, [1])
         self.assertEqual(calls, [{"start_bridge": False}])
+
+    def test_residual_legacy_bridge_is_restarted_inside_the_desktop_process(self):
+        main_module._migrate_legacy_bridge_before_desktop_start = lambda: True
+
+        calls = self._run_with_settings_spy(["ovb_rc003"])
+
+        self.assertEqual(calls, [{"start_bridge": True}])
 
     def test_explicit_settings_open_the_same_desktop_application(self):
         calls = self._run_with_settings_spy(["ovb_rc003", "--settings"])

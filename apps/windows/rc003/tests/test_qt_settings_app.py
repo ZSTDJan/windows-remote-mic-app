@@ -32,6 +32,7 @@ from pathlib import Path
 from unittest import mock
 
 from ovb_rc003 import (
+    application_update,
     audio_output,
     bridge_control_windows,
     bridge_launcher,
@@ -459,6 +460,12 @@ class SettingsControllerTests(unittest.TestCase):
             return_value="3:" + ("a" * 64),
         )
         self._hid_helper_offer_patch.start()
+        self._hid_helper_self_elevate_patch = mock.patch.object(
+            qt_settings_app.hid_elevation_windows,
+            "can_current_user_self_elevate",
+            return_value=True,
+        )
+        self._hid_helper_self_elevate_patch.start()
         self._hid_helper_consumer_patch = mock.patch.object(
             qt_settings_app.hid_helper_consumers,
             "current_consumer_is_registered",
@@ -499,6 +506,7 @@ class SettingsControllerTests(unittest.TestCase):
         qt_settings_app._vb_cable_test_active_event.clear()
         qt_settings_app._driver_action_active_event.clear()
         self._hid_helper_consumer_patch.stop()
+        self._hid_helper_self_elevate_patch.stop()
         self._hid_helper_offer_patch.stop()
         self._startup_rebind_patch.stop()
         self._startup_state_patch.stop()
@@ -515,6 +523,42 @@ class SettingsControllerTests(unittest.TestCase):
             background_task_runner=lambda target, _name: target(),
         )
         return controller, model
+
+    def _application_release(self, version="0.2.0-candidate.16"):
+        parsed = application_update.parse_application_version(version)
+        base_url = (
+            f"https://github.com/{application_update.REPOSITORY_SLUG}/"
+            f"releases/download/test-{version}"
+        )
+        installer = application_update.ReleaseAsset(
+            f"RemoteMicRC003Setup-{version}-unsigned.exe",
+            80 * 1024 * 1024,
+            f"{base_url}/RemoteMicRC003Setup-{version}-unsigned.exe",
+            "a" * 64,
+        )
+        portable = application_update.ReleaseAsset(
+            f"RemoteMicRC003-{version}-portable-unsigned.zip",
+            130 * 1024 * 1024,
+            f"{base_url}/RemoteMicRC003-{version}-portable-unsigned.zip",
+            "b" * 64,
+        )
+        manifest = application_update.ReleaseAsset(
+            "SHA256SUMS.txt",
+            240,
+            f"{base_url}/SHA256SUMS.txt",
+            "c" * 64,
+        )
+        return application_update.ApplicationRelease(
+            parsed,
+            (
+                f"https://github.com/{application_update.REPOSITORY_SLUG}/"
+                f"releases/tag/test-{version}"
+            ),
+            "修复连接问题。",
+            installer,
+            portable,
+            manifest,
+        )
 
     def _continue_save_and_launch(self, controller):
         controller._continue_save_and_launch()
@@ -560,7 +604,72 @@ class SettingsControllerTests(unittest.TestCase):
 
         self.assertTrue(controller.hidHelperIssueVisible)
         self.assertTrue(controller.hidHelperRepairVisible)
-        self.assertIn("自定义按键映射已停用", controller.hidHelperIssueText)
+        self.assertEqual(controller.hidHelperIssueText, "改键已停用")
+
+    def test_standard_account_hides_helper_actions_that_cannot_succeed(self):
+        with mock.patch.object(
+            qt_settings_app.sys, "frozen", True, create=True
+        ), mock.patch.object(
+            qt_settings_app.hid_elevation_windows,
+            "inspect_installed_helper",
+            return_value=qt_settings_app.hid_elevation_windows.HidHelperState(
+                False, "hid_helper_task_missing"
+            ),
+        ), mock.patch.object(
+            qt_settings_app.hid_elevation_windows,
+            "is_installed_distribution",
+            return_value=True,
+        ), mock.patch.object(
+            qt_settings_app.hid_elevation_windows,
+            "can_current_user_self_elevate",
+            return_value=False,
+        ):
+            controller, _model = self._make_controller()
+
+        with mock.patch.object(
+            qt_settings_app.hid_helper_consumers,
+            "install_for_current_consumer",
+        ) as repair, mock.patch.object(
+            qt_settings_app.hid_helper_consumers,
+            "remove_for_portable_consumer",
+        ) as remove:
+            self.assertFalse(controller.claimPortableHidSetupPrompt())
+            controller.repairHidHelper()
+            controller.removeHidHelper()
+
+        self.assertTrue(controller.hidHelperIssueVisible)
+        self.assertTrue(controller.hidHelperAccountUnsupported)
+        self.assertFalse(controller.hidHelperSetupRequired)
+        self.assertFalse(controller.hidHelperRepairVisible)
+        self.assertFalse(controller.hidHelperRemovalVisible)
+        self.assertEqual(controller.hidHelperIssueText, "换管理员账号")
+        repair.assert_not_called()
+        remove.assert_not_called()
+
+    def test_standard_account_keeps_an_existing_valid_helper_available(self):
+        with mock.patch.object(
+            qt_settings_app.sys, "frozen", True, create=True
+        ), mock.patch.object(
+            qt_settings_app.hid_elevation_windows,
+            "inspect_installed_helper",
+            return_value=qt_settings_app.hid_elevation_windows.HidHelperState(
+                True, "ready"
+            ),
+        ), mock.patch.object(
+            qt_settings_app.hid_elevation_windows,
+            "is_installed_distribution",
+            return_value=False,
+        ), mock.patch.object(
+            qt_settings_app.hid_elevation_windows,
+            "can_current_user_self_elevate",
+            return_value=False,
+        ):
+            controller, _model = self._make_controller()
+
+        self.assertFalse(controller.hidHelperIssueVisible)
+        self.assertFalse(controller.hidHelperAccountUnsupported)
+        self.assertFalse(controller.hidHelperRepairVisible)
+        self.assertFalse(controller.hidHelperRemovalVisible)
 
     def test_portable_helper_issue_offers_one_time_enable_action(self):
         with mock.patch.object(
@@ -581,7 +690,7 @@ class SettingsControllerTests(unittest.TestCase):
         self.assertTrue(controller.hidHelperIssueVisible)
         self.assertTrue(controller.hidHelperRepairVisible)
         self.assertTrue(controller.hidHelperSetupRequired)
-        self.assertIn("确认一次管理员权限", controller.hidHelperIssueText)
+        self.assertEqual(controller.hidHelperIssueText, "")
 
     def test_newer_helper_state_hides_actions_that_cannot_succeed(self):
         newer = qt_settings_app.hid_elevation_windows.HidHelperState(
@@ -615,7 +724,7 @@ class SettingsControllerTests(unittest.TestCase):
         self.assertFalse(controller.hidHelperSetupRequired)
         self.assertFalse(controller.hidHelperRepairVisible)
         self.assertFalse(controller.hidHelperRemovalVisible)
-        self.assertIn("较新版本", controller.hidHelperIssueText)
+        self.assertEqual(controller.hidHelperIssueText, "请安装新版")
         repair.assert_not_called()
         remove.assert_not_called()
 
@@ -713,7 +822,7 @@ class SettingsControllerTests(unittest.TestCase):
         self.assertTrue(controller.hidHelperRepairVisible)
         self.assertFalse(controller.hidHelperSetupRequired)
         self.assertFalse(controller.hidHelperRemovalVisible)
-        self.assertIn("自定义按键映射可用", controller.hidHelperIssueText)
+        self.assertEqual(controller.hidHelperIssueText, "")
 
     def test_cleanup_retry_that_still_has_residue_does_not_claim_full_success(self):
         pending = qt_settings_app.hid_elevation_windows.HidHelperState(
@@ -1170,7 +1279,7 @@ class SettingsControllerTests(unittest.TestCase):
             ):
                 controller.repairHidHelper()
 
-            self.assertIn("没有完成安装", controller.errorMessage)
+            self.assertIn("请再次尝试点击", controller.errorMessage)
             self.assertIn("运行日志", controller.errorMessage)
 
     def test_portable_can_remove_the_shared_helper_after_confirmation(self):
@@ -2602,6 +2711,51 @@ class SettingsControllerTests(unittest.TestCase):
         self.assertEqual(controller.launchStatusText, settings_ui.LAUNCH_NOT_STARTED_TEXT)
         self.assertFalse(controller.bridgeRunning)
 
+    def test_other_windows_session_status_is_not_shown_or_restarted(self):
+        other_identity = bridge_runtime_status.current_runtime_identity(
+            qt_settings_app.__version__,
+            frozen=False,
+            source_root=Path(self._tmpdir.name) / "other-session",
+        )
+        bridge_runtime_status.publish_status(
+            config.config_root(),
+            bridge_runtime_status.BridgeConnectionState.CONNECTED,
+            pid=2222,
+            identity=other_identity,
+            raw_input_state="ready",
+            hid_tap_state=frida_compat.HidTapState.READY.value,
+            voice_active=True,
+            session_id=2,
+        )
+        self._bridge_status_patch.stop()
+        self._bridge_status_patch = mock.patch.object(
+            qt_settings_app.single_instance,
+            "bridge_instance_running",
+            return_value=True,
+        )
+        self._bridge_status_patch.start()
+
+        with mock.patch.object(
+            bridge_runtime_status.sys,
+            "platform",
+            "win32",
+        ), mock.patch.object(
+            bridge_runtime_status,
+            "_default_status_scope",
+            bridge_runtime_status._STATUS_SCOPE_UNSET,
+        ), mock.patch.object(
+            qt_settings_app.single_instance,
+            "current_process_session_id",
+            return_value=1,
+        ):
+            controller, _ = self._make_controller()
+
+        self.assertTrue(controller.bridgeRunning)
+        self.assertFalse(controller.bridgeConnected)
+        self.assertFalse(controller.bridgeRestartRecommended)
+        self.assertEqual(controller.rawInputState, "unknown")
+        self.assertEqual(controller.hidTapState, "unknown")
+
     def test_launch_status_recognizes_an_existing_bridge(self):
         self._bridge_status_patch.stop()
         self._bridge_status_patch = mock.patch.object(
@@ -2939,7 +3093,98 @@ class SettingsControllerTests(unittest.TestCase):
         self.assertIn("当前版本", controller.launchStatusText)
         self.assertIn("两个按键通道正常", controller.launchStatusText)
         self.assertIn("刚收到按键", controller.launchStatusText)
+        self.assertEqual(controller.rawInputState, "ready")
+        self.assertEqual(controller.hidTapState, frida_compat.HidTapState.READY.value)
         self.assertFalse(controller.bridgeRestartRecommended)
+
+    def test_bridge_refresh_updates_input_states_after_the_remote_wakes(self):
+        self._bridge_status_patch.stop()
+        self._bridge_status_patch = mock.patch.object(
+            qt_settings_app.single_instance,
+            "bridge_instance_running",
+            return_value=True,
+        )
+        self._bridge_status_patch.start()
+        identity = bridge_runtime_status.current_runtime_identity(
+            qt_settings_app.__version__
+        )
+        bridge_runtime_status.publish_status(
+            config.config_root(),
+            bridge_runtime_status.BridgeConnectionState.WAITING_FOR_DEVICE,
+            pid=4321,
+            identity=identity,
+            raw_input_state="no_device",
+            hid_tap_state=frida_compat.HidTapState.WAITING_HOST.value,
+        )
+
+        with mock.patch.object(
+            qt_settings_app.bridge_launcher,
+            "in_process_bridge_running",
+            return_value=True,
+        ):
+            controller, _ = self._make_controller()
+
+        self.assertEqual(controller.rawInputState, "no_device")
+        self.assertEqual(
+            controller.hidTapState,
+            frida_compat.HidTapState.WAITING_HOST.value,
+        )
+        changes = []
+        controller.bridgeInputStateChanged.connect(
+            lambda: changes.append(
+                (controller.rawInputState, controller.hidTapState)
+            )
+        )
+
+        bridge_runtime_status.publish_status(
+            config.config_root(),
+            bridge_runtime_status.BridgeConnectionState.CONNECTED,
+            pid=4321,
+            identity=identity,
+            raw_input_state="ready",
+            hid_tap_state=frida_compat.HidTapState.READY.value,
+        )
+        controller.refreshBridgeState()
+
+        self.assertTrue(controller.bridgeConnected)
+        self.assertEqual(controller.rawInputState, "ready")
+        self.assertEqual(controller.hidTapState, frida_compat.HidTapState.READY.value)
+        self.assertEqual(
+            changes,
+            [("ready", frida_compat.HidTapState.READY.value)],
+        )
+
+    def test_bridge_stop_clears_live_input_states(self):
+        self._bridge_status_patch.stop()
+        self._bridge_status_patch = mock.patch.object(
+            qt_settings_app.single_instance,
+            "bridge_instance_running",
+            return_value=True,
+        )
+        self._bridge_status_patch.start()
+        identity = bridge_runtime_status.current_runtime_identity(
+            qt_settings_app.__version__
+        )
+        bridge_runtime_status.publish_status(
+            config.config_root(),
+            bridge_runtime_status.BridgeConnectionState.CONNECTED,
+            pid=4321,
+            identity=identity,
+            raw_input_state="ready",
+            hid_tap_state=frida_compat.HidTapState.READY.value,
+        )
+        controller, _ = self._make_controller()
+
+        with mock.patch.object(
+            qt_settings_app.single_instance,
+            "bridge_instance_running",
+            return_value=False,
+        ):
+            controller.refreshBridgeState()
+
+        self.assertFalse(controller.bridgeRunning)
+        self.assertEqual(controller.rawInputState, "unknown")
+        self.assertEqual(controller.hidTapState, "unknown")
 
     def test_unknown_voice_shortcut_channel_is_not_reported_as_all_normal(self):
         self._bridge_status_patch.stop()
@@ -3024,6 +3269,73 @@ class SettingsControllerTests(unittest.TestCase):
             "自定义按键映射可用；语音快捷键通道异常",
             controller.launchStatusText,
         )
+        self.assertEqual(controller.voiceKeyPhysicalizerState, "failed")
+        self.assertTrue(controller.bridgeRestartRecommended)
+
+        bridge_runtime_status.publish_status(
+            config.config_root(),
+            bridge_runtime_status.BridgeConnectionState.CONNECTED,
+            pid=4321,
+            identity=identity,
+            raw_input_state="ready",
+            hid_tap_state=frida_compat.HidTapState.READY.value,
+            voice_key_physicalizer_state="ready",
+        )
+        controller.refreshBridgeState()
+
+        self.assertEqual(controller.voiceKeyPhysicalizerState, "ready")
+        self.assertFalse(controller.bridgeRestartRecommended)
+
+    def test_missing_bridge_status_requires_restart_after_the_bounded_wait(self):
+        self._bridge_status_patch.stop()
+        self._bridge_status_patch = mock.patch.object(
+            qt_settings_app.single_instance,
+            "bridge_instance_running",
+            return_value=True,
+        )
+        self._bridge_status_patch.start()
+        started_at = 120.0
+        with mock.patch.object(
+            qt_settings_app.time,
+            "monotonic",
+            return_value=started_at,
+        ):
+            controller, _ = self._make_controller()
+
+        self.assertFalse(controller.bridgeRestartRecommended)
+        self.assertEqual(controller.bridgeLaunchPhase, "waiting")
+
+        with mock.patch.object(
+            qt_settings_app.time,
+            "monotonic",
+            return_value=(
+                started_at + qt_settings_app._BRIDGE_STATUS_MISSING_AFTER_SECONDS
+            ),
+        ):
+            controller.refreshBridgeState()
+
+        self.assertTrue(controller.bridgeRestartRecommended)
+        self.assertEqual(controller.bridgeLaunchPhase, "failed")
+        self.assertIn("服务状态异常", controller.launchStatusText)
+
+        identity = bridge_runtime_status.current_runtime_identity(
+            qt_settings_app.__version__
+        )
+        bridge_runtime_status.publish_status(
+            config.config_root(),
+            bridge_runtime_status.BridgeConnectionState.CONNECTED,
+            pid=4321,
+            identity=identity,
+            raw_input_state="ready",
+            hid_tap_state=frida_compat.HidTapState.READY.value,
+            voice_key_physicalizer_state="ready",
+        )
+        controller.refreshBridgeState()
+
+        self.assertTrue(controller.bridgeConnected)
+        self.assertFalse(controller.bridgeRestartRecommended)
+        self.assertEqual(controller.bridgeLaunchPhase, "connected")
+        self.assertIsNone(controller._bridge_status_missing_since)
 
     def test_raw_input_ready_with_failed_tap_reports_all_custom_mapping_disabled(self):
         self._bridge_status_patch.stop()
@@ -3147,6 +3459,43 @@ class SettingsControllerTests(unittest.TestCase):
 
         request_exit.assert_not_called()
         self.assertIn("正在语音输入", controller.errorMessage)
+
+    def test_legacy_handoff_still_stops_when_stale_status_reports_active_voice(self):
+        self._bridge_status_patch.stop()
+        self._bridge_status_patch = mock.patch.object(
+            qt_settings_app.single_instance,
+            "bridge_instance_running",
+            return_value=True,
+        )
+        self._bridge_status_patch.start()
+        bridge_runtime_status.publish_status(
+            config.config_root(),
+            bridge_runtime_status.BridgeConnectionState.CONNECTED,
+            pid=4321,
+            identity=bridge_runtime_status.current_runtime_identity(
+                qt_settings_app.__version__
+            ),
+            voice_active=True,
+        )
+        controller, _ = self._make_controller()
+
+        with mock.patch.object(
+            qt_settings_app.bridge_control_windows,
+            "request_bridge_exit",
+            return_value=qt_settings_app.bridge_control_windows.BridgeExitResult(
+                True,
+                False,
+                "test stop failed",
+            ),
+        ) as request_exit:
+            controller._begin_bridge_restart(
+                automatic=True,
+                allow_active_voice=True,
+            )
+
+        request_exit.assert_called_once_with()
+        self.assertEqual(controller.bridgeLaunchPhase, "failed")
+        self.assertIn("test stop failed", controller.launchStatusText)
 
     def test_live_bridge_refresh_tracks_external_start_and_exit(self):
         controller, _ = self._make_controller()
@@ -3853,9 +4202,13 @@ class SettingsControllerTests(unittest.TestCase):
             callbacks.pop()()
 
         save.assert_not_called()
+        self.assertEqual(callbacks, [])
         self.assertTrue(controller.settingsDirty)
         self.assertTrue(controller.bridgeRunning)
         self.assertEqual(controller.bridgeLaunchPhase, "waiting")
+        self.assertFalse(controller.bridgeRestartRecommended)
+        self.assertEqual(controller.rawInputState, "unknown")
+        self.assertEqual(controller.hidTapState, "unknown")
 
     def test_start_bridge_double_press_queues_only_one_launch(self):
         controller, _ = self._make_controller()
@@ -4315,6 +4668,8 @@ class SettingsControllerTests(unittest.TestCase):
         with mock.patch.object(
             bridge_launcher, "start_bridge_launch", return_value=bridge_result
         ), mock.patch.object(
+            bridge_launcher, "in_process_bridge_running", return_value=True
+        ), mock.patch.object(
             qt_settings_app.voice_program_manager,
             "launch_voice_program",
             return_value=voice_result,
@@ -4339,6 +4694,8 @@ class SettingsControllerTests(unittest.TestCase):
         with mock.patch.object(
             bridge_launcher, "start_bridge_launch", return_value=bridge_result
         ), mock.patch.object(
+            bridge_launcher, "in_process_bridge_running", return_value=True
+        ), mock.patch.object(
             qt_settings_app.voice_program_manager,
             "launch_voice_program",
             side_effect=RuntimeError("unexpected launch failure"),
@@ -4349,6 +4706,38 @@ class SettingsControllerTests(unittest.TestCase):
         self.assertTrue(controller.bridgeRunning)
         self.assertEqual(controller.bridgeLaunchPhase, "waiting")
         self.assertIn("桥接不受影响", controller.errorMessage)
+
+    def test_external_bridge_winning_launch_race_gets_one_automatic_handoff(self):
+        controller, _ = self._make_controller()
+        bridge_result = bridge_launcher.LaunchResult(
+            outcome=bridge_launcher.LaunchOutcome.ALREADY_RUNNING,
+            command=("in-process",),
+            exit_code=bridge_launcher.ALREADY_RUNNING_EXIT_CODE,
+        )
+
+        with mock.patch.object(
+            bridge_launcher,
+            "in_process_bridge_running",
+            return_value=False,
+        ), mock.patch.object(
+            controller,
+            "_begin_bridge_restart",
+        ) as restart, mock.patch.object(
+            controller,
+            "_sync_bridge_connection_status",
+        ) as sync_status:
+            controller._finish_bridge_launch(bridge_result)
+            controller._finish_bridge_launch(bridge_result)
+
+        restart.assert_called_once_with(
+            automatic=True,
+            allow_active_voice=True,
+        )
+        sync_status.assert_not_called()
+        self.assertTrue(controller.bridgeRunning)
+        self.assertTrue(controller.bridgeRestartRecommended)
+        self.assertEqual(controller.bridgeLaunchPhase, "failed")
+        self.assertIn("完全退出旧版", controller.launchStatusText)
 
     def test_pending_launch_stays_in_starting_until_poll_finishes(self):
         controller, _ = self._make_controller()
@@ -5116,6 +5505,385 @@ class SettingsControllerTests(unittest.TestCase):
         controller.openLogLocation()
         self.assertIn("尚不存在", controller.statusMessage)
 
+    def test_update_check_never_runs_during_controller_startup(self):
+        with mock.patch.object(
+            qt_settings_app.application_update, "check_for_update"
+        ) as check:
+            controller, _ = self._make_controller()
+
+        check.assert_not_called()
+        self.assertEqual(controller.applicationUpdateState, "idle")
+        self.assertFalse(controller.applicationUpdateBusy)
+
+    def test_startup_cleans_downloads_for_the_running_version(self):
+        with mock.patch.object(
+            qt_settings_app.application_update,
+            "cleanup_obsolete_update_downloads",
+        ) as cleanup:
+            controller, _ = self._make_controller()
+
+        cleanup.assert_called_once_with(
+            controller._config_root / "updates",
+            qt_settings_app.__version__,
+        )
+
+    def test_manual_update_check_exposes_a_portable_download(self):
+        controller, _ = self._make_controller()
+        release = self._application_release()
+        check_result = application_update.ApplicationUpdateCheck(
+            application_update.UpdateCheckOutcome.UPDATE_AVAILABLE,
+            application_update.parse_application_version(qt_settings_app.__version__),
+            release,
+        )
+        dialog_requests = []
+        controller.applicationUpdateDialogRequested.connect(
+            lambda: dialog_requests.append(True)
+        )
+
+        with mock.patch.object(
+            qt_settings_app.application_update,
+            "check_for_update",
+            return_value=check_result,
+        ) as check:
+            accepted = controller.checkForApplicationUpdate()
+
+        self.assertTrue(accepted)
+        check.assert_called_once_with(qt_settings_app.__version__)
+        self.assertEqual(controller.applicationUpdateState, "available")
+        self.assertTrue(controller.applicationUpdateCanDownload)
+        self.assertEqual(
+            controller.applicationUpdateLatestVersion, release.version.text
+        )
+        self.assertEqual(controller.applicationUpdatePackageKindText, "便携版 ZIP")
+        self.assertEqual(
+            controller.applicationUpdatePackageName, release.portable.name
+        )
+        self.assertIn("发现新版本", controller.statusMessage)
+        self.assertEqual(dialog_requests, [True])
+
+    def test_repeated_update_check_does_not_start_parallel_workers(self):
+        controller, _ = self._make_controller()
+        queued = []
+        controller._background_task_runner = (
+            lambda target, name: queued.append((target, name))
+        )
+        release = self._application_release()
+        check_result = application_update.ApplicationUpdateCheck(
+            application_update.UpdateCheckOutcome.UPDATE_AVAILABLE,
+            application_update.parse_application_version(qt_settings_app.__version__),
+            release,
+        )
+
+        with mock.patch.object(
+            qt_settings_app.application_update,
+            "check_for_update",
+            return_value=check_result,
+        ) as check:
+            self.assertTrue(controller.checkForApplicationUpdate())
+            self.assertFalse(controller.checkForApplicationUpdate())
+            self.assertEqual(len(queued), 1)
+            queued[0][0]()
+
+        check.assert_called_once_with(qt_settings_app.__version__)
+        self.assertFalse(controller.applicationUpdateCheckBusy)
+        self.assertEqual(controller.applicationUpdateState, "available")
+
+    def test_current_and_local_newer_results_never_offer_a_download(self):
+        for outcome, expected_state in (
+            (application_update.UpdateCheckOutcome.CURRENT, "current"),
+            (application_update.UpdateCheckOutcome.LOCAL_NEWER, "local_newer"),
+        ):
+            with self.subTest(outcome=outcome.value):
+                controller, _ = self._make_controller()
+                release = self._application_release("0.2.0-candidate.15")
+                check_result = application_update.ApplicationUpdateCheck(
+                    outcome,
+                    application_update.parse_application_version(
+                        qt_settings_app.__version__
+                    ),
+                    release,
+                )
+                with mock.patch.object(
+                    qt_settings_app.application_update,
+                    "check_for_update",
+                    return_value=check_result,
+                ):
+                    controller.checkForApplicationUpdate()
+
+                self.assertEqual(
+                    controller.applicationUpdateState, expected_state
+                )
+                self.assertFalse(controller.applicationUpdateCanDownload)
+                self.assertFalse(controller.downloadApplicationUpdate())
+
+    def test_update_check_failure_is_visible_and_keeps_release_page_fallback(self):
+        controller, _ = self._make_controller()
+        failure = application_update.ApplicationUpdateError(
+            "rate_limited", "GitHub 暂时限制了检查次数。"
+        )
+
+        with mock.patch.object(
+            qt_settings_app.application_update,
+            "check_for_update",
+            side_effect=failure,
+        ):
+            controller.checkForApplicationUpdate()
+
+        self.assertEqual(controller.applicationUpdateState, "check_error")
+        self.assertIn("GitHub", controller.applicationUpdateMessage)
+        self.assertIn("检查更新失败", controller.errorMessage)
+        self.assertEqual(
+            controller.applicationUpdateReleaseUrl,
+            application_update.RELEASES_PAGE_URL,
+        )
+
+    def test_verified_portable_download_transitions_to_open_folder_state(self):
+        controller, _ = self._make_controller()
+        release = self._application_release()
+        check_result = application_update.ApplicationUpdateCheck(
+            application_update.UpdateCheckOutcome.UPDATE_AVAILABLE,
+            application_update.parse_application_version(qt_settings_app.__version__),
+            release,
+        )
+        with mock.patch.object(
+            qt_settings_app.application_update,
+            "check_for_update",
+            return_value=check_result,
+        ):
+            controller.checkForApplicationUpdate()
+
+        def fake_download(selected_release, package_kind, destination, **kwargs):
+            self.assertIs(selected_release, release)
+            self.assertIs(package_kind, application_update.PackageKind.PORTABLE)
+            path = Path(destination) / release.portable.name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"verified fixture")
+            kwargs["progress_callback"](
+                release.portable.size, release.portable.size
+            )
+            return application_update.ApplicationUpdateDownload(
+                release, package_kind, path, False
+            )
+
+        with mock.patch.object(
+            qt_settings_app.application_update,
+            "cleanup_obsolete_update_downloads",
+        ) as cleanup, mock.patch.object(
+            qt_settings_app.application_update,
+            "download_update_package",
+            side_effect=fake_download,
+        ) as download:
+            self.assertTrue(controller.downloadApplicationUpdate())
+
+        self.assertEqual(controller.applicationUpdateState, "downloaded")
+        self.assertFalse(controller.applicationUpdateCanDownload)
+        self.assertEqual(controller.applicationUpdateDownloadProgress, 1.0)
+        self.assertTrue(Path(controller.applicationUpdateDownloadedPath).is_file())
+        self.assertIn("不会覆盖现有目录", controller.applicationUpdateMessage)
+        cleanup.assert_called_once_with(
+            controller._config_root / "updates",
+            release.version,
+            include_current=False,
+        )
+        download.assert_called_once()
+
+    def test_installed_distribution_selects_installer_asset(self):
+        with mock.patch.object(
+            qt_settings_app.hid_elevation_windows,
+            "is_installed_distribution",
+            return_value=True,
+        ):
+            controller, _ = self._make_controller()
+        release = self._application_release()
+        check_result = application_update.ApplicationUpdateCheck(
+            application_update.UpdateCheckOutcome.UPDATE_AVAILABLE,
+            application_update.parse_application_version(qt_settings_app.__version__),
+            release,
+        )
+        with mock.patch.object(
+            qt_settings_app.application_update,
+            "check_for_update",
+            return_value=check_result,
+        ):
+            controller.checkForApplicationUpdate()
+
+        self.assertEqual(controller.applicationUpdatePackageKindText, "安装器")
+        self.assertEqual(
+            controller.applicationUpdatePackageName, release.installer.name
+        )
+
+    def test_download_cancel_is_retryable_and_duplicate_clicks_are_blocked(self):
+        controller, _ = self._make_controller()
+        release = self._application_release()
+        check_result = application_update.ApplicationUpdateCheck(
+            application_update.UpdateCheckOutcome.UPDATE_AVAILABLE,
+            application_update.parse_application_version(qt_settings_app.__version__),
+            release,
+        )
+        with mock.patch.object(
+            qt_settings_app.application_update,
+            "check_for_update",
+            return_value=check_result,
+        ):
+            controller.checkForApplicationUpdate()
+        queued = []
+        controller._background_task_runner = (
+            lambda target, name: queued.append((target, name))
+        )
+
+        def cancelled_download(*_args, **kwargs):
+            if kwargs["cancel_event"].is_set():
+                raise application_update.ApplicationUpdateCancelled()
+            self.fail("cancel event was not propagated")
+
+        with mock.patch.object(
+            qt_settings_app.application_update,
+            "download_update_package",
+            side_effect=cancelled_download,
+        ):
+            self.assertTrue(controller.downloadApplicationUpdate())
+            self.assertFalse(controller.downloadApplicationUpdate())
+            self.assertTrue(controller.cancelApplicationUpdateDownload())
+            queued[0][0]()
+
+        self.assertEqual(controller.applicationUpdateState, "available")
+        self.assertTrue(controller.applicationUpdateCanDownload)
+        self.assertIn("已取消", controller.applicationUpdateMessage)
+
+    def test_shutdown_discards_late_update_result_and_cancels_download(self):
+        controller, _ = self._make_controller()
+        queued = []
+        controller._background_task_runner = (
+            lambda target, name: queued.append((target, name))
+        )
+        release = self._application_release()
+        check_result = application_update.ApplicationUpdateCheck(
+            application_update.UpdateCheckOutcome.UPDATE_AVAILABLE,
+            application_update.parse_application_version(qt_settings_app.__version__),
+            release,
+        )
+        dialogs = []
+        controller.applicationUpdateDialogRequested.connect(
+            lambda: dialogs.append(True)
+        )
+        with mock.patch.object(
+            qt_settings_app.application_update,
+            "check_for_update",
+            return_value=check_result,
+        ):
+            controller.checkForApplicationUpdate()
+            controller.shutdownBackgroundTasks()
+            queued[0][0]()
+
+        self.assertEqual(dialogs, [])
+        self.assertEqual(controller.applicationUpdateState, "checking")
+
+    def test_failed_exit_does_not_leave_update_check_busy(self):
+        controller, _ = self._make_controller()
+        queued = []
+        controller._background_task_runner = (
+            lambda target, name: queued.append((target, name))
+        )
+        release = self._application_release()
+        check_result = application_update.ApplicationUpdateCheck(
+            application_update.UpdateCheckOutcome.UPDATE_AVAILABLE,
+            application_update.parse_application_version(qt_settings_app.__version__),
+            release,
+        )
+        dialogs = []
+        controller.applicationUpdateDialogRequested.connect(
+            lambda: dialogs.append(True)
+        )
+
+        with mock.patch.object(
+            qt_settings_app.application_update,
+            "check_for_update",
+            return_value=check_result,
+        ):
+            self.assertTrue(controller.checkForApplicationUpdate())
+            controller._application_exit_requested = True
+            controller._application_exit_intent.set()
+            queued[0][0]()
+
+        self.assertFalse(controller.applicationUpdateCheckBusy)
+        self.assertEqual(controller.applicationUpdateState, "available")
+        self.assertEqual(dialogs, [])
+        controller._fail_application_exit("模拟退出失败")
+        self.assertTrue(controller.applicationUpdateCanDownload)
+
+    def test_failed_exit_does_not_leave_update_download_busy(self):
+        controller, _ = self._make_controller()
+        release = self._application_release()
+        controller._set_application_update_release(release)
+        controller._application_update_available = True
+        controller._application_update_state = "available"
+        queued = []
+        controller._background_task_runner = (
+            lambda target, name: queued.append((target, name))
+        )
+
+        def completed_download(selected_release, package_kind, destination, **_kwargs):
+            path = Path(destination) / release.portable.name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"verified fixture")
+            return application_update.ApplicationUpdateDownload(
+                selected_release, package_kind, path, False
+            )
+
+        with mock.patch.object(
+            qt_settings_app.application_update,
+            "download_update_package",
+            side_effect=completed_download,
+        ):
+            self.assertTrue(controller.downloadApplicationUpdate())
+            controller._application_exit_requested = True
+            controller._application_exit_intent.set()
+            queued[0][0]()
+
+        self.assertFalse(controller.applicationUpdateDownloadBusy)
+        self.assertEqual(controller.applicationUpdateState, "downloaded")
+        controller._fail_application_exit("模拟退出失败")
+        self.assertTrue(Path(controller.applicationUpdateDownloadedPath).is_file())
+
+    def test_downloaded_update_folder_uses_the_existing_external_opener(self):
+        controller, _ = self._make_controller()
+        package = Path(self._tmpdir.name) / "updates" / "package.zip"
+        package.parent.mkdir(parents=True)
+        package.write_bytes(b"fixture")
+        controller._application_update_download_path = str(package)
+        fake_result = shell_targets.ExternalTargetResult(
+            shell_targets.ExternalTargetOutcome.OPENED,
+            str(package.parent),
+        )
+
+        with mock.patch.object(
+            shell_targets, "open_external_target", return_value=fake_result
+        ) as fake_open:
+            self.assertTrue(controller.openDownloadedApplicationUpdate())
+
+        fake_open.assert_called_once_with(str(package.parent))
+
+    def test_missing_downloaded_update_restores_the_download_action(self):
+        controller, _ = self._make_controller()
+        release = self._application_release()
+        controller._set_application_update_release(release)
+        controller._application_update_available = False
+        controller._application_update_state = "downloaded"
+        controller._application_update_download_received = release.portable.size
+        controller._application_update_download_path = str(
+            Path(self._tmpdir.name) / "updates" / release.portable.name
+        )
+
+        with mock.patch.object(shell_targets, "open_external_target") as fake_open:
+            self.assertFalse(controller.openDownloadedApplicationUpdate())
+
+        fake_open.assert_not_called()
+        self.assertEqual(controller.applicationUpdateState, "download_error")
+        self.assertTrue(controller.applicationUpdateCanDownload)
+        self.assertEqual(controller.applicationUpdateDownloadedPath, "")
+        self.assertEqual(controller.applicationUpdateDownloadProgress, 0.0)
+        self.assertIn("重新下载", controller.applicationUpdateMessage)
+
     def test_open_bluetooth_settings_reports_the_uri_it_opened(self):
         controller, _ = self._make_controller()
         controller._set_error_message("stale error")
@@ -5464,6 +6232,7 @@ class DiagnosticsControllerTests(unittest.TestCase):
         self.assertEqual(len(diag.checkResults), 6)
         ids = {row["checkId"] for row in diag.checkResults}
         self.assertIn("dictation", ids)
+        self.assertTrue(all("resultCode" in row for row in diag.checkResults))
 
     def test_check_results_never_contain_a_placeholder_raw_path_or_address(self):
         settings_controller = self._make_settings_controller()
@@ -6955,9 +7724,244 @@ print(json.dumps(result))
 """
 
 
+_APPLICATION_UPDATE_DIALOG_PROBE_SCRIPT = r"""
+import json
+import os
+
+from PySide6.QtCore import QMetaObject, QPointF, Qt
+from PySide6.QtTest import QTest
+from ovb_rc003 import application_update as u
+from ovb_rc003 import qt_settings_app as m
+
+
+def find_child(root, name):
+    children = list(root.children())
+    child_items = getattr(root, "childItems", None)
+    if callable(child_items):
+        children.extend(child for child in child_items() if child not in children)
+    for child in children:
+        if child.objectName() == name:
+            return child
+        found = find_child(child, name)
+        if found is not None:
+            return found
+    return None
+
+
+def render(window, app, count=12):
+    for _ in range(count):
+        window.grabWindow()
+        app.processEvents()
+        QTest.qWait(5)
+
+
+def item_geometry(item):
+    assert item is not None
+    origin = item.mapToScene(QPointF(0, 0))
+    width = float(item.property("width"))
+    height = float(item.property("height"))
+    return {
+        "visible": bool(item.property("visible")),
+        "x": float(origin.x()),
+        "y": float(origin.y()),
+        "width": width,
+        "height": height,
+        "right": float(origin.x()) + width,
+        "bottom": float(origin.y()) + height,
+    }
+
+
+def popup_geometry(popup):
+    x = float(popup.property("x"))
+    y = float(popup.property("y"))
+    width = float(popup.property("width"))
+    height = float(popup.property("height"))
+    return {
+        "visible": bool(popup.property("visible")),
+        "x": x,
+        "y": y,
+        "width": width,
+        "height": height,
+        "right": x + width,
+        "bottom": y + height,
+    }
+
+
+classes = m._load_qt_classes()
+QGuiApplication = classes["QGuiApplication"]
+QQmlApplicationEngine = classes["QQmlApplicationEngine"]
+QQuickStyle = classes["QQuickStyle"]
+QUrl = classes["QUrl"]
+qmlRegisterSingletonInstance = classes["qmlRegisterSingletonInstance"]
+ButtonMappingModel = classes["ButtonMappingModel"]
+SettingsController = classes["SettingsController"]
+DiagnosticsController = classes["DiagnosticsController"]
+
+QQuickStyle.setStyle("FluentWinUI3")
+app = QGuiApplication.instance() or QGuiApplication([])
+m.single_instance.bridge_instance_running = lambda: False
+m.hid_elevation_windows.inspect_installed_helper = lambda: (
+    m.hid_elevation_windows.HidHelperState(True, "ready")
+)
+model = ButtonMappingModel()
+controller = SettingsController(model)
+diagnostics_controller = DiagnosticsController(
+    controller, m.config.config_root(), auto_refresh=False
+)
+qmlRegisterSingletonInstance(SettingsController, "OvbRc003Settings", 1, 0, "SettingsController", controller)
+qmlRegisterSingletonInstance(ButtonMappingModel, "OvbRc003Settings", 1, 0, "ButtonMappingModel", model)
+qmlRegisterSingletonInstance(DiagnosticsController, "OvbRc003Settings", 1, 0, "DiagnosticsController", diagnostics_controller)
+
+engine = QQmlApplicationEngine()
+qml_dir = m._qml_directory()
+engine.addImportPath(str(qml_dir))
+warnings = []
+engine.warnings.connect(lambda values: warnings.extend(values))
+engine.load(QUrl.fromLocalFile(str(qml_dir / "main.qml")))
+assert len(engine.rootObjects()) == 1, "main.qml failed to load"
+window = engine.rootObjects()[0]
+window.setWidth(int(os.environ["PROBE_WIDTH"]))
+window.setHeight(int(os.environ["PROBE_HEIGHT"]))
+window.show()
+render(window, app)
+
+update_button = find_child(window, "checkApplicationUpdateButton")
+log_button = find_child(window, "deviceOpenLogButton")
+assert update_button is not None and log_button is not None
+update_button.forceActiveFocus(Qt.TabFocusReason)
+render(window, app, 3)
+QTest.keyClick(window, Qt.Key_Tab)
+render(window, app, 3)
+tab_forward = bool(log_button.property("activeFocus"))
+QTest.keyClick(window, Qt.Key_Backtab)
+render(window, app, 3)
+tab_backward = bool(update_button.property("activeFocus"))
+
+version = "0.2.0-candidate.16"
+base = f"https://github.com/{u.REPOSITORY_SLUG}/releases/download/test"
+release = u.ApplicationRelease(
+    u.parse_application_version(version),
+    f"https://github.com/{u.REPOSITORY_SLUG}/releases/tag/test",
+    "第一项修复。\n第二项改进。",
+    u.ReleaseAsset(f"RemoteMicRC003Setup-{version}-unsigned.exe", 80 * 1024 * 1024, f"{base}/installer.exe", "a" * 64),
+    u.ReleaseAsset(f"RemoteMicRC003-{version}-portable-unsigned.zip", 130 * 1024 * 1024, f"{base}/portable.zip", "b" * 64),
+    u.ReleaseAsset("SHA256SUMS.txt", 240, f"{base}/SHA256SUMS.txt", "c" * 64),
+)
+controller._set_application_update_release(release)
+controller._application_update_available = True
+controller._application_update_state = "available"
+controller._application_update_message = f"发现新版本 {version}。"
+controller.applicationUpdateChanged.emit()
+controller.applicationUpdateDialogRequested.emit()
+render(window, app)
+
+dialog = find_child(window, "applicationUpdateDialog")
+message = find_child(window, "applicationUpdateMessage")
+version_summary = find_child(window, "applicationUpdateVersionSummary")
+package_summary = find_child(window, "applicationUpdatePackageSummary")
+notes = find_child(window, "applicationUpdateNotes")
+close_button = find_child(window, "closeApplicationUpdateButton")
+release_button = find_child(window, "openApplicationUpdateReleaseButton")
+download_button = find_child(window, "downloadApplicationUpdateButton")
+cancel_button = find_child(window, "cancelApplicationUpdateDownloadButton")
+folder_button = find_child(window, "openDownloadedApplicationUpdateButton")
+progress = find_child(window, "applicationUpdateProgress")
+assert all(item is not None for item in (
+    dialog, message, version_summary, package_summary, notes,
+    close_button, release_button, download_button, cancel_button,
+    folder_button, progress,
+))
+
+available = {
+    "dialog": popup_geometry(dialog),
+    "title": str(dialog.property("title")),
+    "message": str(message.property("text")),
+    "version": str(version_summary.property("text")),
+    "package": str(package_summary.property("text")),
+    "notes": item_geometry(notes),
+    "close": item_geometry(close_button),
+    "release": item_geometry(release_button),
+    "download": item_geometry(download_button),
+}
+
+controller._application_update_state = "downloading"
+controller._application_update_download_busy = True
+controller._application_update_message = "正在下载便携版 ZIP…"
+controller._application_update_download_received = (
+    controller._application_update_package_size // 2
+)
+controller.applicationUpdateChanged.emit()
+render(window, app, 6)
+downloading = {
+    "title": str(dialog.property("title")),
+    "close_visible": bool(close_button.property("visible")),
+    "download_visible": bool(download_button.property("visible")),
+    "cancel": item_geometry(cancel_button),
+    "progress_visible": bool(progress.property("visible")),
+    "progress": float(progress.property("value")),
+}
+
+controller._application_update_state = "download_error"
+controller._application_update_download_busy = False
+controller._application_update_message = "连接 GitHub 超时，请稍后重试。"
+controller.applicationUpdateChanged.emit()
+render(window, app, 6)
+download_error = {
+    "title": str(dialog.property("title")),
+    "download": item_geometry(download_button),
+    "download_text": str(download_button.property("text")),
+}
+
+controller._application_update_state = "downloaded"
+controller._application_update_available = False
+controller._application_update_download_busy = False
+controller._application_update_download_received = (
+    controller._application_update_package_size
+)
+controller._application_update_message = "便携版已下载并通过校验。"
+controller.applicationUpdateChanged.emit()
+render(window, app, 6)
+downloaded = {
+    "title": str(dialog.property("title")),
+    "folder": item_geometry(folder_button),
+    "progress_visible": bool(progress.property("visible")),
+    "progress": float(progress.property("value")),
+}
+
+assert QMetaObject.invokeMethod(
+    dialog, "close", Qt.ConnectionType.DirectConnection
+)
+for _ in range(100):
+    render(window, app, 1)
+    if (not bool(dialog.property("visible"))
+            and bool(update_button.property("activeFocus"))):
+        break
+result = {
+    "warnings": [warning.toString() for warning in warnings],
+    "window": {
+        "width": float(window.property("width")),
+        "height": float(window.property("height")),
+    },
+    "tab_forward": tab_forward,
+    "tab_backward": tab_backward,
+    "focus_restored": bool(update_button.property("activeFocus")),
+    "available": available,
+    "downloading": downloading,
+    "download_error": download_error,
+    "downloaded": downloaded,
+}
+controller.shutdownBackgroundTasks()
+m._shutdown_diagnostics_workers()
+print(json.dumps(result, ensure_ascii=False))
+"""
+
+
 _RC003_ONLY_DEVICE_PAGE_PROBE_SCRIPT = r"""
 import json
+import os
+from types import SimpleNamespace
 
+from PySide6.QtCore import QPointF
 from ovb_rc003 import qt_settings_app as m
 
 
@@ -6985,12 +7989,30 @@ ButtonMappingModel = classes["ButtonMappingModel"]
 SettingsController = classes["SettingsController"]
 DiagnosticsController = classes["DiagnosticsController"]
 
-QQuickStyle.setStyle("Basic")
+QQuickStyle.setStyle(os.environ.get("PROBE_STYLE", "Basic"))
 app = QGuiApplication.instance() or QGuiApplication([])
 m.single_instance.bridge_instance_running = lambda: False
+m.hid_elevation_windows.inspect_installed_helper = lambda: (
+    m.hid_elevation_windows.HidHelperState(True, "ready")
+)
 model = ButtonMappingModel()
 controller = SettingsController(model)
-diagnostics_controller = DiagnosticsController(controller, m.config.config_root())
+diagnostics_controller = DiagnosticsController(
+    controller,
+    m.config.config_root(),
+    auto_refresh=False,
+)
+# Runtime status cases provide their own deterministic diagnostic rows.
+# Prevent the real post-connect refresh from racing and replacing those rows.
+diagnostics_controller.refreshDiagnostics = lambda: None
+diagnostics_controller._check_rows = [
+    {
+        "checkId": "probe_seed",
+        "status": "pass",
+        "detail": "",
+        "resultCode": "ready",
+    }
+]
 qmlRegisterSingletonInstance(SettingsController, "OvbRc003Settings", 1, 0, "SettingsController", controller)
 qmlRegisterSingletonInstance(ButtonMappingModel, "OvbRc003Settings", 1, 0, "ButtonMappingModel", model)
 qmlRegisterSingletonInstance(DiagnosticsController, "OvbRc003Settings", 1, 0, "DiagnosticsController", diagnostics_controller)
@@ -7001,6 +8023,9 @@ engine.addImportPath(str(qml_dir))
 engine.load(QUrl.fromLocalFile(str(qml_dir / "main.qml")))
 assert len(engine.rootObjects()) == 1, "main.qml failed to load"
 window = engine.rootObjects()[0]
+window.setProperty("initialDiagnosticsStarted", True)
+window.setWidth(640)
+window.setHeight(480)
 window.show()
 tab_bar = find_child(window, "tabBar")
 assert tab_bar is not None
@@ -7029,6 +8054,291 @@ result["device_rows"] = all(
         "runtimeLogRow",
     )
 )
+
+for timer_name in ("bridgeStatusRefreshTimer", "bridgeLaunchPollTimer"):
+    timer = find_child(window, timer_name)
+    if timer is not None:
+        timer.setProperty("running", False)
+
+current_device_row = find_child(window, "currentDeviceRow")
+button_receiver_row = find_child(window, "buttonReceiverRow")
+remote_service_row = find_child(window, "remoteServiceRow")
+assert current_device_row is not None
+assert button_receiver_row is not None
+assert remote_service_row is not None
+
+
+def settle():
+    for _ in range(4):
+        window.grabWindow()
+        app.processEvents()
+
+
+def column_snapshot(name):
+    item = find_child(window, name)
+    assert item is not None, name
+    origin = item.mapToScene(QPointF(0, 0))
+    return {
+        "x": float(origin.x()),
+        "width": float(item.property("width")),
+    }
+
+
+def row_snapshot(row):
+    color = row.property("stateColor")
+    row_name = str(row.property("objectName"))
+    state_label = find_child(window, row_name + "_stateLabel")
+    state_column = find_child(window, row_name + "_stateColumn")
+    description_label = find_child(window, row_name + "_descriptionLabel")
+    assert state_label is not None
+    assert state_column is not None
+    assert description_label is not None
+    baseline_delta = None
+    if bool(description_label.property("visible")):
+        description_origin = description_label.mapToScene(QPointF(0, 0))
+        state_origin = state_label.mapToScene(QPointF(0, 0))
+        description_baseline = (
+            float(description_origin.y())
+            + float(description_label.property("baselineOffset"))
+        )
+        state_baseline = (
+            float(state_origin.y())
+            + float(state_label.property("baselineOffset"))
+        )
+        baseline_delta = abs(description_baseline - state_baseline)
+    return {
+        "state": str(row.property("stateText")),
+        "detail": str(row.property("descriptionText")),
+        "color": color.name() if hasattr(color, "name") else str(color),
+        "state_truncated": bool(state_label.property("truncated")),
+        "state_width": float(state_column.property("width")),
+        "state_implicit_width": float(state_label.property("implicitWidth")),
+        "detail_truncated": bool(description_label.property("truncated")),
+        "detail_width": float(description_label.property("width")),
+        "detail_implicit_width": float(description_label.property("implicitWidth")),
+        "baseline_delta": baseline_delta,
+    }
+
+
+result["device_columns"] = {
+    "states": [
+        column_snapshot(name + "_stateColumn")
+        for name in (
+            "currentDeviceRow",
+            "buttonReceiverRow",
+            "remoteServiceRow",
+            "runtimeLogRow",
+        )
+    ],
+    "actions": [
+        column_snapshot(name + "_actionColumn")
+        for name in (
+            "currentDeviceRow",
+            "buttonReceiverRow",
+            "remoteServiceRow",
+            "runtimeLogRow",
+        )
+    ],
+}
+
+
+def runtime_case(
+    raw_state,
+    tap_state,
+    *,
+    voice_state="ready",
+    connected=False,
+    restart=False,
+    reconnect=False,
+    ble_code="ready",
+):
+    diagnostics_controller._is_refreshing = False
+    diagnostics_controller._check_rows = [
+        {
+            "checkId": "ble_candidate",
+            "status": "pass" if ble_code == "ready" else "fail",
+            "detail": "文案变化也不能改变状态",
+            "resultCode": ble_code,
+        }
+    ]
+    diagnostics_controller.isRefreshingChanged.emit()
+    diagnostics_controller.checkResultsChanged.emit()
+    controller._set_bridge_running(True)
+    controller._set_bridge_launch_phase("waiting")
+    controller._set_bridge_reconnect_busy(False)
+    controller._set_bridge_reconnect_available(reconnect)
+    controller._set_bridge_restart_recommended(restart)
+    controller._set_bridge_connected(connected)
+    controller._set_bridge_input_states(
+        SimpleNamespace(
+            raw_input_state=raw_state,
+            hid_tap_state=tap_state,
+            voice_key_physicalizer_state=voice_state,
+        )
+    )
+    settle()
+    action = find_child(window, "bridgeActionButton")
+    return {
+        "device": row_snapshot(current_device_row),
+        "buttons": row_snapshot(button_receiver_row),
+        "service": row_snapshot(remote_service_row),
+        "action": {
+            "visible": bool(action.property("visible")),
+            "text": str(action.property("text")),
+        },
+    }
+
+
+def diagnostics_case(*, ble_status, ble_code, raw_code):
+    controller._set_bridge_running(False)
+    controller._set_bridge_connected(False)
+    controller._set_bridge_restart_recommended(False)
+    controller._set_bridge_input_states(None)
+    controller._set_bridge_launch_phase("idle")
+    diagnostics_controller._is_refreshing = False
+    diagnostics_controller._check_rows = [
+        {
+            "checkId": "os_version",
+            "status": "pass",
+            "detail": "irrelevant",
+            "resultCode": "ready",
+        },
+        {
+            "checkId": "ble_candidate",
+            "status": ble_status,
+            "detail": "文案变化也不能改变状态",
+            "resultCode": ble_code,
+        },
+        {
+            "checkId": "raw_input",
+            "status": "fail",
+            "detail": "文案变化也不能改变状态",
+            "resultCode": raw_code,
+        },
+    ]
+    diagnostics_controller.isRefreshingChanged.emit()
+    diagnostics_controller.checkResultsChanged.emit()
+    settle()
+    action = find_child(window, "bridgeActionButton")
+    return {
+        "device": row_snapshot(current_device_row),
+        "buttons": row_snapshot(button_receiver_row),
+        "service": row_snapshot(remote_service_row),
+        "action": {
+            "visible": bool(action.property("visible")),
+            "text": str(action.property("text")),
+        },
+    }
+
+
+def helper_case(*, available, detail, portable, can_elevate=True):
+    controller._set_bridge_running(False)
+    controller._set_bridge_connected(False)
+    controller._set_bridge_restart_recommended(False)
+    controller._set_bridge_input_states(None)
+    controller._set_bridge_launch_phase("idle")
+    controller._hid_helper_frozen_distribution = True
+    controller._hid_helper_portable_distribution = portable
+    controller._hid_helper_can_self_elevate = can_elevate
+    controller._hid_helper_process_elevated = False
+    controller._set_hid_helper_repair_busy(False)
+    controller._set_hid_helper_state(
+        m.hid_elevation_windows.HidHelperState(available, detail)
+    )
+    controller.hidHelperStateChanged.emit()
+    settle()
+    action = find_child(window, "bridgeActionButton")
+    return {
+        "device": row_snapshot(current_device_row),
+        "buttons": row_snapshot(button_receiver_row),
+        "service": row_snapshot(remote_service_row),
+        "action": {
+            "visible": bool(action.property("visible")),
+            "text": str(action.property("text")),
+        },
+    }
+
+
+result["status_cases"] = {
+    "partial_raw_ready": runtime_case("ready", "failed", connected=True),
+    "conflict": runtime_case(
+        "ambiguous", "waiting_for_rc003_host", reconnect=True
+    ),
+    "asleep": runtime_case(
+        "no_device", "waiting_for_rc003_host", reconnect=True
+    ),
+    "unpaired_running": runtime_case(
+        "no_device",
+        "waiting_for_rc003_host",
+        reconnect=True,
+        ble_code="no_candidate",
+    ),
+    "connected_input_wait": runtime_case(
+        "no_device", "waiting_for_rc003_host", connected=True
+    ),
+    "restart": runtime_case("ready", "ready", connected=True, restart=True),
+    "reconnect": runtime_case(
+        "ready", "ready", connected=False, reconnect=True
+    ),
+    "voice_recovering": runtime_case(
+        "ready", "ready", voice_state="recovering", connected=True
+    ),
+    "voice_failed": runtime_case(
+        "ready",
+        "ready",
+        voice_state="failed",
+        connected=True,
+        restart=True,
+    ),
+    "raw_ready_hid_wait": runtime_case(
+        "ready", "waiting_for_rc003_host", connected=True, reconnect=True
+    ),
+    "raw_failed_hid_wait": runtime_case(
+        "failed", "waiting_for_rc003_host", reconnect=True
+    ),
+    "unknown": runtime_case("unknown", "unknown", voice_state="unknown"),
+    "raw_failure": diagnostics_case(
+        ble_status="pass",
+        ble_code="ready",
+        raw_code="probe_failed",
+    ),
+    "raw_asleep": diagnostics_case(
+        ble_status="pass",
+        ble_code="ready",
+        raw_code="no_device",
+    ),
+    "raw_unpaired": diagnostics_case(
+        ble_status="fail",
+        ble_code="no_candidate",
+        raw_code="no_device",
+    ),
+    "helper_disabled": helper_case(
+        available=False,
+        detail="helper_missing",
+        portable=True,
+    ),
+    "helper_permission": helper_case(
+        available=False,
+        detail="helper_task_acl_invalid",
+        portable=False,
+    ),
+    "helper_version": helper_case(
+        available=False,
+        detail="helper_task_contract_newer",
+        portable=False,
+    ),
+    "helper_cleanup": helper_case(
+        available=True,
+        detail="helper_cleanup_pending",
+        portable=True,
+    ),
+    "helper_account": helper_case(
+        available=False,
+        detail="current_account_cannot_self_elevate",
+        portable=True,
+        can_elevate=False,
+    ),
+}
 tab_bar.setProperty("currentIndex", 2)
 for _ in range(10):
     window.grabWindow()
@@ -7747,6 +9057,8 @@ capture_page(
         "buttonReceiverRow",
         "remoteServiceRow",
         "runtimeLogRow",
+        "checkApplicationUpdateButton",
+        "deviceOpenLogButton",
         "desktopBehaviorSection",
         "desktopBehaviorSectionTitle",
         "launchAtLoginRow",
@@ -7983,9 +9295,13 @@ class SettingsShellSourceContractTests(unittest.TestCase):
         self.assertIn("SettingsController.hidHelperRepairVisible", self.device_qml)
         self.assertIn("SettingsController.hidHelperSetupRequired", self.device_qml)
         self.assertIn("SettingsController.hidHelperCleanupPending", self.device_qml)
+        self.assertIn("SettingsController.hidHelperAccountUnsupported", self.device_qml)
         self.assertIn("启用改键", self.device_qml)
         self.assertIn("完成清理", self.device_qml)
-        self.assertIn("管理员按键组件异常", self.device_qml)
+        self.assertIn('case "disabled": return qsTr("请启用改键")', self.device_qml)
+        self.assertIn('case "account": return qsTr("请换账号")', self.device_qml)
+        self.assertIn('case "permission": return qsTr("请启用改键")', self.device_qml)
+        self.assertIn('case "version": return qsTr("请安装新版")', self.device_qml)
         self.assertIn('objectName: "hidHelperSetupDialog"', self.main_qml)
         self.assertIn(
             "建议打开管理员按键权限",
@@ -8020,10 +9336,7 @@ class SettingsShellSourceContractTests(unittest.TestCase):
             self.assertNotIn("SettingsController.errorMessage", page_text)
             self.assertNotIn("SettingsController.statusMessage", page_text)
 
-        self.assertIn(
-            "默认隐藏到通知区域；需要彻底结束时可改为完全退出",
-            self.device_qml,
-        )
+        self.assertIn("右上角 × 的行为", self.device_qml)
 
     def test_touched_pages_reuse_shared_compact_sources(self):
         self.assertIn("default property alias contentData", self.section_frame_qml)
@@ -8047,6 +9360,9 @@ class SettingsShellSourceContractTests(unittest.TestCase):
         self.assertIn("property bool editorColumnVisible", self.inline_settings_row_qml)
         self.assertIn("property int stateColumnWidth", self.inline_settings_row_qml)
         self.assertIn("property int actionColumnWidth", self.inline_settings_row_qml)
+        self.assertIn(
+            "property bool descriptionNeverElide", self.inline_settings_row_qml
+        )
         self.assertIn("default property alias actionData", self.inline_settings_row_qml)
         self.assertIn("AbstractButton {", self.mapping_card_qml)
         self.assertIn("implicitHeight: 49", self.mapping_card_qml)
@@ -8148,14 +9464,16 @@ class SettingsShellSourceContractTests(unittest.TestCase):
             self.voice_qml,
         )
         self.assertNotIn("SettingsController.saveSettings()", self.voice_qml)
-        self.assertIn(
+        self.assertIn("保持遥控器连接，让按键和语音持续可用", self.device_qml)
+        self.assertNotIn(
             "descriptionText: SettingsController.launchStatusText", self.device_qml
         )
         self.assertNotIn("saveAndLaunch", self.device_qml)
         self.assertNotIn("stopBridge", self.device_qml)
 
     def test_diagnostics_keep_details_in_the_rows_that_use_them(self):
-        self.assertIn("function combinedDetail(checkIds, fallback)", self.device_qml)
+        self.assertIn("function currentDeviceDetailText()", self.device_qml)
+        self.assertIn("让遥控器按键在电脑上生效", self.device_qml)
         self.assertIn("function checkDetail(checkId, fallback)", self.voice_qml)
         for check_id in ("ble_candidate", "os_version", "raw_input"):
             self.assertIn(f'"{check_id}"', self.device_qml)
@@ -8179,7 +9497,9 @@ class SettingsShellSourceContractTests(unittest.TestCase):
 
     def test_service_state_has_one_formal_device_page_location(self):
         self.assertIn('objectName: "remoteServiceRow"', self.device_qml)
-        self.assertIn('objectName: "restartBridgeButton"', self.device_qml)
+        self.assertEqual(self.device_qml.count('objectName: "bridgeActionButton"'), 1)
+        self.assertNotIn('objectName: "restartBridgeButton"', self.device_qml)
+        self.assertNotIn('objectName: "startBridgeButton"', self.device_qml)
         self.assertIn(
             "SettingsController.bridgeRestartRecommended",
             self.device_qml,
@@ -8187,13 +9507,102 @@ class SettingsShellSourceContractTests(unittest.TestCase):
         self.assertIn("SettingsController.restartBridge()", self.device_qml)
         self.assertIn("SettingsController.reconnectBridgeNow()", self.device_qml)
         self.assertIn("SettingsController.bridgeReconnectAvailable", self.device_qml)
-        self.assertIn('qsTr("立即重连")', self.device_qml)
-        self.assertIn('return qsTr("等待连接")', self.device_qml)
+        self.assertIn('return qsTr("重新连接")', self.device_qml)
+        self.assertIn('return qsTr("已连接")', self.device_qml)
+        self.assertIn('return qsTr("待唤醒")', self.device_qml)
+        self.assertNotIn('return qsTr("等待连接")', self.device_qml)
+        self.assertIn("function bridgeNeedsRestartAction()", self.device_qml)
+        self.assertIn("rawInputReady() && hidTapReady()", self.device_qml)
+        self.assertIn("if (buttonReceiverWaitsForRemote())", self.device_qml)
         self.assertNotIn('objectName: "mappingBridgeWarning"', self.buttons_qml)
         self.assertNotIn('objectName: "mappingListFrame"', self.buttons_qml)
         self.assertIn("SettingsController.bridgeRunning", self.device_qml)
         self.assertIn('return qsTr("未运行")', self.device_qml)
         self.assertNotIn("语音和真实按键检测不可用", self.buttons_qml)
+
+    def test_device_status_columns_are_fixed_and_never_elided(self):
+        self.assertIn("readonly property int deviceStateColumnWidth: 96", self.device_qml)
+        self.assertIn("readonly property int deviceActionColumnWidth: 150", self.device_qml)
+        self.assertEqual(
+            self.device_qml.count(
+                "stateColumnWidth: root.deviceStateColumnWidth"
+            ),
+            4,
+        )
+        self.assertEqual(
+            self.device_qml.count(
+                "actionColumnWidth: root.deviceActionColumnWidth"
+            ),
+            4,
+        )
+        self.assertIn("wrapMode: Text.NoWrap", self.inline_settings_row_qml)
+        self.assertIn("elide: Text.ElideNone", self.inline_settings_row_qml)
+        self.assertIn(
+            "elide: root.descriptionNeverElide ? Text.ElideNone : Text.ElideRight",
+            self.inline_settings_row_qml,
+        )
+        self.assertEqual(
+            self.device_qml.count("descriptionNeverElide: true"),
+            3,
+        )
+        self.assertIn(
+            "Math.max(\n                root.stateColumnWidth",
+            self.inline_settings_row_qml,
+        )
+        self.assertIn(
+            "Layout.alignment: Qt.AlignBaseline",
+            self.inline_settings_row_qml,
+        )
+        for too_long in ("版本不兼容", "等待遥控器", "系统不支持"):
+            self.assertNotIn(too_long, self.device_qml)
+
+    def test_device_page_notes_are_short_and_remove_internal_diagnostics(self):
+        for expected in (
+            "登录后后台运行",
+            "自动连接遥控器",
+            "右上角 × 的行为",
+            "待唤醒",
+            "让遥控器按键在电脑上生效",
+            "保持遥控器连接，让按键和语音持续可用",
+            "请重新连接",
+            "请重新检查",
+        ):
+            self.assertIn(expected, self.device_qml)
+
+        for removed in (
+            "需处理",
+            "待实测",
+            "部分可用",
+            "查看连接、按键、音频和程序日志",
+            "相当于自动点击一次",
+            "默认隐藏到通知区域；需要彻底结束时可改为完全退出",
+            "登录后自动在后台运行",
+            "打开无线麦后自动连接遥控器",
+            "设置右上角关闭按钮的行为",
+            "正在检查蓝牙设备",
+            "正在检查按键",
+            "正在连接遥控器",
+            "正在启动服务",
+            "启动后按键和语音才会生效",
+            "改键未生效",
+            "普通按键异常",
+            "语音连接中",
+            "正在确认状态",
+            "需重启",
+            "请重新启动",
+            "重新启动",
+            "服务异常",
+            "权限异常",
+            "语音异常",
+        ):
+            self.assertNotIn(removed, self.device_qml)
+
+        self.assertIn("SettingsController.rawInputState", self.device_qml)
+        self.assertIn("SettingsController.hidTapState", self.device_qml)
+        self.assertIn("SettingsController.voiceKeyPhysicalizerState", self.device_qml)
+        self.assertEqual(self.device_qml.count("待唤醒"), 2)
+        self.assertNotIn("function bridgeDetailText()", self.device_qml)
+        self.assertNotIn("function buttonReceiverDetailText()", self.device_qml)
 
     def test_main_window_owns_the_single_live_bridge_refresh_timer(self):
         self.assertIn('objectName: "bridgeStatusRefreshTimer"', self.main_qml)
@@ -8305,7 +9714,8 @@ class SettingsShellSourceContractTests(unittest.TestCase):
         self.assertIn("SettingsController.setLaunchBridgeOnAppStart", self.device_qml)
         self.assertIn("SettingsController.setCloseBehaviorIndex", self.device_qml)
         self.assertIn('titleText: qsTr("启动程序时自动启动桥接")', self.device_qml)
-        self.assertIn("与随 Windows 启动互不绑定", self.device_qml)
+        self.assertIn("自动连接遥控器", self.device_qml)
+        self.assertNotIn("与随 Windows 启动互不绑定", self.device_qml)
         self.assertNotIn("GeneralPage", self.main_qml)
         self.assertNotIn('objectName: "generalTabButton"', self.main_qml)
         self.assertIn('objectName: "systemTrayIcon"', self.main_qml)
@@ -8326,6 +9736,23 @@ class SettingsShellSourceContractTests(unittest.TestCase):
         self.assertNotIn("iconGlyph:", self.device_qml)
         self.assertNotIn("property string iconGlyph", self.settings_list_row_qml)
         self.assertNotIn("IconGlyph {", self.settings_list_row_qml)
+
+    def test_update_entry_is_manual_and_uses_the_existing_dialog_style(self):
+        self.assertIn(
+            'objectName: "checkApplicationUpdateButton"', self.device_qml
+        )
+        self.assertIn('qsTr("检查更新")', self.device_qml)
+        self.assertIn(
+            "SettingsController.checkForApplicationUpdate()", self.device_qml
+        )
+        self.assertIn('objectName: "applicationUpdateDialog"', self.main_qml)
+        self.assertIn("textFormat: TextEdit.PlainText", self.main_qml)
+        self.assertIn('qsTr("下载更新")', self.main_qml)
+        self.assertIn('qsTr("打开文件夹")', self.main_qml)
+        self.assertIn(
+            "SettingsController.cancelApplicationUpdateDownload()", self.main_qml
+        )
+        self.assertNotIn("launchDownloadedApplicationUpdate", self.main_qml)
 
     def test_windows_prefers_the_system_chinese_ui_font(self):
         self.assertIn(
@@ -8754,7 +10181,8 @@ class ThreePageSettingsSourceContractTests(unittest.TestCase):
             "refreshDeviceChecksButton",
             "openBluetoothSettingsButton",
             "openButtonSettingsButton",
-            "startBridgeButton",
+            "bridgeActionButton",
+            "checkApplicationUpdateButton",
             "deviceOpenLogButton",
         ):
             self.assertIn(f'objectName: "{button_name}"', self.device_qml)
@@ -8763,7 +10191,7 @@ class ThreePageSettingsSourceContractTests(unittest.TestCase):
         self.assertNotIn("stopBridge", self.device_qml)
         self.assertNotIn('text: qsTr("设备")', self.device_qml)
         self.assertIn("SettingsController.remoteDisplayName", self.device_qml)
-        self.assertIn('qsTr("启动桥接")', self.device_qml)
+        self.assertIn('return qsTr("启动服务")', self.device_qml)
 
     def test_device_toggles_share_the_compact_accent_switch(self):
         self.assertEqual(self.device_qml.count("CompactSwitch {"), 2)
@@ -8879,8 +10307,8 @@ class ThreePageSettingsSourceContractTests(unittest.TestCase):
 
     def test_inline_diagnostic_notes_strip_terminal_sentence_marks(self):
         normalization = 'replace(/[。；;]+$/, "")'
-        self.assertIn(normalization, self.device_qml)
         self.assertIn(normalization, self.voice_qml)
+        self.assertNotIn(normalization, self.device_qml)
 
 
 @unittest.skipUnless(_HAS_PYSIDE6, _SKIP_REASON)
@@ -9075,6 +10503,84 @@ class OffscreenQmlLoadTests(unittest.TestCase):
         self.assertTrue(data["mapping_dirty_on_buttons"])
         self.assertFalse(data["mapping_dirty_on_voice"])
 
+    def test_application_update_dialog_fits_and_restores_focus(self):
+        import json
+        import subprocess
+
+        for width, height in ((640, 480), (720, 560)):
+            with self.subTest(width=width, height=height), tempfile.TemporaryDirectory() as tmpdir:
+                env = dict(os.environ)
+                env.setdefault("QT_QPA_PLATFORM", "offscreen")
+                env["LOCALAPPDATA"] = tmpdir
+                env["RC003_DISABLE_LIVE_INPUT"] = "1"
+                env["PROBE_WIDTH"] = str(width)
+                env["PROBE_HEIGHT"] = str(height)
+                result = subprocess.run(
+                    [sys.executable, "-c", _APPLICATION_UPDATE_DIALOG_PROBE_SCRIPT],
+                    env=env,
+                    capture_output=True,
+                    text=True,
+                    timeout=60,
+                )
+
+                self.assertEqual(
+                    result.returncode,
+                    0,
+                    f"update dialog probe failed at {width}x{height}: "
+                    f"{result.stdout}\n{result.stderr}",
+                )
+                data = json.loads(result.stdout.strip().splitlines()[-1])
+                self.assertEqual(data["warnings"], [])
+                self.assertEqual(
+                    (data["window"]["width"], data["window"]["height"]),
+                    (width, height),
+                )
+                self.assertTrue(data["tab_forward"])
+                self.assertTrue(data["tab_backward"])
+                self.assertTrue(data["focus_restored"])
+
+                available = data["available"]
+                dialog = available["dialog"]
+                self.assertTrue(dialog["visible"])
+                self.assertGreaterEqual(dialog["x"], -0.5)
+                self.assertGreaterEqual(dialog["y"], -0.5)
+                self.assertLessEqual(dialog["right"], width + 0.5)
+                self.assertLessEqual(dialog["bottom"], height + 0.5)
+                self.assertEqual(available["title"], "发现新版本")
+                self.assertIn("0.2.0-candidate.16", available["version"])
+                self.assertIn("便携版 ZIP", available["package"])
+                self.assertTrue(available["notes"]["visible"])
+                self.assertTrue(available["close"]["visible"])
+                self.assertTrue(available["release"]["visible"])
+                self.assertTrue(available["download"]["visible"])
+                self.assertLessEqual(
+                    available["close"]["right"],
+                    available["release"]["x"] + 0.5,
+                )
+                self.assertLessEqual(
+                    available["release"]["right"],
+                    available["download"]["x"] + 0.5,
+                )
+
+                downloading = data["downloading"]
+                self.assertEqual(downloading["title"], "正在下载更新")
+                self.assertFalse(downloading["close_visible"])
+                self.assertFalse(downloading["download_visible"])
+                self.assertTrue(downloading["cancel"]["visible"])
+                self.assertTrue(downloading["progress_visible"])
+                self.assertAlmostEqual(downloading["progress"], 0.5, delta=0.01)
+
+                download_error = data["download_error"]
+                self.assertEqual(download_error["title"], "下载更新失败")
+                self.assertTrue(download_error["download"]["visible"])
+                self.assertEqual(download_error["download_text"], "重新下载")
+
+                downloaded = data["downloaded"]
+                self.assertEqual(downloaded["title"], "更新包已下载")
+                self.assertTrue(downloaded["folder"]["visible"])
+                self.assertTrue(downloaded["progress_visible"])
+                self.assertAlmostEqual(downloaded["progress"], 1.0, delta=0.001)
+
     def test_first_hid_permission_prompt_is_compact_clear_and_non_elevating(self):
         import json
         import subprocess
@@ -9141,20 +10647,30 @@ class OffscreenQmlLoadTests(unittest.TestCase):
         import json
         import subprocess
 
-        env = dict(os.environ)
-        env.setdefault("QT_QPA_PLATFORM", "offscreen")
-        env["LOCALAPPDATA"] = tempfile.mkdtemp()
-        result = subprocess.run(
-            [sys.executable, "-c", _RC003_ONLY_DEVICE_PAGE_PROBE_SCRIPT],
-            env=env,
-            capture_output=True,
-            text=True,
-            timeout=60,
-        )
-        self.assertEqual(
-            result.returncode, 0, f"RC003-only QML probe failed: {result.stderr}"
-        )
-        data = json.loads(result.stdout.strip().splitlines()[-1])
+        style_results = {}
+        for style in ("Basic", "FluentWinUI3"):
+            with self.subTest(style=style), tempfile.TemporaryDirectory() as tmpdir:
+                env = dict(os.environ)
+                env.setdefault("QT_QPA_PLATFORM", "offscreen")
+                env["LOCALAPPDATA"] = tmpdir
+                env["PROBE_STYLE"] = style
+                result = subprocess.run(
+                    [sys.executable, "-c", _RC003_ONLY_DEVICE_PAGE_PROBE_SCRIPT],
+                    env=env,
+                    capture_output=True,
+                    text=True,
+                    timeout=60,
+                )
+                self.assertEqual(
+                    result.returncode,
+                    0,
+                    f"RC003-only QML probe failed ({style}): {result.stderr}",
+                )
+                style_results[style] = json.loads(
+                    result.stdout.strip().splitlines()[-1]
+                )
+
+        data = style_results["Basic"]
         self.assertEqual(
             data["device_options"],
             [device_catalog.profile_for(device_catalog.RC003_ID).display_name],
@@ -9163,6 +10679,202 @@ class OffscreenQmlLoadTests(unittest.TestCase):
         self.assertEqual(data["mapping_page_title"], "按键映射")
         self.assertTrue(data["device_rows"])
         self.assertTrue(data["voice_sections"])
+
+        state_columns = data["device_columns"]["states"]
+        action_columns = data["device_columns"]["actions"]
+        for column in state_columns[1:]:
+            self.assertAlmostEqual(column["x"], state_columns[0]["x"], delta=0.5)
+            self.assertAlmostEqual(
+                column["width"], state_columns[0]["width"], delta=0.5
+            )
+        for column in action_columns[1:]:
+            self.assertAlmostEqual(column["x"], action_columns[0]["x"], delta=0.5)
+            self.assertAlmostEqual(
+                column["width"], action_columns[0]["width"], delta=0.5
+            )
+
+        cases = data["status_cases"]
+        self.assertEqual(
+            cases["partial_raw_ready"]["buttons"]["state"], "请重新连接"
+        )
+        self.assertEqual(
+            cases["partial_raw_ready"]["buttons"]["detail"],
+            "让遥控器按键在电脑上生效",
+        )
+        self.assertEqual(cases["partial_raw_ready"]["action"]["text"], "重新连接")
+        self.assertEqual(
+            cases["partial_raw_ready"]["service"]["state"], "请重新连接"
+        )
+        self.assertTrue(cases["partial_raw_ready"]["action"]["visible"])
+        self.assertEqual(cases["conflict"]["buttons"]["state"], "多设备")
+        self.assertEqual(
+            cases["conflict"]["buttons"]["detail"],
+            "让遥控器按键在电脑上生效",
+        )
+        self.assertEqual(cases["conflict"]["service"]["state"], "未连接")
+        self.assertFalse(cases["conflict"]["action"]["visible"])
+        self.assertEqual(cases["asleep"]["buttons"]["state"], "待唤醒")
+        self.assertEqual(
+            cases["asleep"]["buttons"]["detail"],
+            "让遥控器按键在电脑上生效",
+        )
+        self.assertEqual(
+            cases["asleep"]["service"]["detail"],
+            "保持遥控器连接，让按键和语音持续可用",
+        )
+        self.assertFalse(cases["asleep"]["action"]["visible"])
+        self.assertEqual(cases["unpaired_running"]["buttons"]["state"], "未配对")
+        self.assertEqual(
+            cases["unpaired_running"]["buttons"]["detail"],
+            "让遥控器按键在电脑上生效",
+        )
+        self.assertFalse(cases["unpaired_running"]["action"]["visible"])
+        self.assertEqual(
+            cases["connected_input_wait"]["service"]["state"], "确认中"
+        )
+        self.assertEqual(
+            cases["connected_input_wait"]["buttons"]["detail"],
+            "让遥控器按键在电脑上生效",
+        )
+        self.assertFalse(cases["connected_input_wait"]["action"]["visible"])
+        self.assertEqual(cases["restart"]["service"]["state"], "请重新连接")
+        self.assertEqual(
+            cases["restart"]["service"]["detail"],
+            "保持遥控器连接，让按键和语音持续可用",
+        )
+        self.assertNotEqual(
+            cases["restart"]["service"]["color"],
+            cases["connected_input_wait"]["service"]["color"],
+        )
+        self.assertEqual(
+            cases["reconnect"]["service"]["detail"],
+            "保持遥控器连接，让按键和语音持续可用",
+        )
+        self.assertEqual(cases["reconnect"]["service"]["state"], "请重新连接")
+        self.assertEqual(cases["reconnect"]["action"]["text"], "重新连接")
+        self.assertEqual(cases["voice_recovering"]["buttons"]["state"], "检查中")
+        self.assertEqual(
+            cases["voice_recovering"]["buttons"]["detail"],
+            "让遥控器按键在电脑上生效",
+        )
+        self.assertEqual(cases["voice_recovering"]["service"]["state"], "确认中")
+        self.assertEqual(
+            cases["voice_recovering"]["service"]["detail"],
+            "保持遥控器连接，让按键和语音持续可用",
+        )
+        self.assertFalse(cases["voice_recovering"]["action"]["visible"])
+        self.assertEqual(
+            cases["voice_failed"]["buttons"]["state"], "请重新连接"
+        )
+        self.assertEqual(
+            cases["voice_failed"]["buttons"]["detail"],
+            "让遥控器按键在电脑上生效",
+        )
+        self.assertEqual(cases["unknown"]["service"]["state"], "确认中")
+        self.assertEqual(
+            cases["unknown"]["service"]["detail"],
+            "保持遥控器连接，让按键和语音持续可用",
+        )
+        self.assertEqual(
+            cases["raw_ready_hid_wait"]["buttons"]["state"], "检查中"
+        )
+        self.assertEqual(
+            cases["raw_ready_hid_wait"]["service"]["state"], "确认中"
+        )
+        self.assertFalse(cases["raw_ready_hid_wait"]["action"]["visible"])
+        self.assertEqual(
+            cases["raw_failed_hid_wait"]["buttons"]["state"], "请重新连接"
+        )
+        self.assertEqual(
+            cases["raw_failed_hid_wait"]["service"]["state"], "请重新连接"
+        )
+        self.assertEqual(
+            cases["raw_failed_hid_wait"]["action"]["text"], "重新连接"
+        )
+        self.assertEqual(
+            cases["raw_failure"]["buttons"]["state"], "请重新检查"
+        )
+        self.assertEqual(
+            cases["raw_failure"]["buttons"]["detail"],
+            "让遥控器按键在电脑上生效",
+        )
+        self.assertEqual(cases["raw_asleep"]["buttons"]["state"], "待唤醒")
+        self.assertEqual(
+            cases["raw_asleep"]["buttons"]["detail"],
+            "让遥控器按键在电脑上生效",
+        )
+        self.assertEqual(cases["raw_unpaired"]["buttons"]["state"], "未配对")
+        self.assertEqual(
+            cases["raw_unpaired"]["buttons"]["detail"],
+            "让遥控器按键在电脑上生效",
+        )
+        self.assertEqual(
+            cases["helper_disabled"]["buttons"]["state"], "请启用改键"
+        )
+        self.assertEqual(
+            cases["helper_disabled"]["buttons"]["detail"],
+            "让遥控器按键在电脑上生效",
+        )
+        self.assertEqual(
+            cases["helper_permission"]["buttons"]["state"], "请启用改键"
+        )
+        self.assertEqual(
+            cases["helper_permission"]["buttons"]["detail"],
+            "让遥控器按键在电脑上生效",
+        )
+        self.assertEqual(cases["helper_version"]["buttons"]["state"], "请安装新版")
+        self.assertEqual(
+            cases["helper_version"]["buttons"]["detail"],
+            "让遥控器按键在电脑上生效",
+        )
+        self.assertEqual(cases["helper_cleanup"]["buttons"]["state"], "请完成清理")
+        self.assertEqual(
+            cases["helper_cleanup"]["buttons"]["detail"],
+            "让遥控器按键在电脑上生效",
+        )
+        self.assertEqual(cases["helper_account"]["buttons"]["state"], "请换账号")
+        self.assertEqual(
+            cases["helper_account"]["buttons"]["detail"],
+            "让遥控器按键在电脑上生效",
+        )
+
+        for style, style_data in style_results.items():
+            with self.subTest(style=style, check="status_geometry"):
+                style_state_columns = style_data["device_columns"]["states"]
+                style_action_columns = style_data["device_columns"]["actions"]
+                for column in style_state_columns[1:]:
+                    self.assertAlmostEqual(
+                        column["x"], style_state_columns[0]["x"], delta=0.5
+                    )
+                    self.assertAlmostEqual(
+                        column["width"],
+                        style_state_columns[0]["width"],
+                        delta=0.5,
+                    )
+                for column in style_action_columns[1:]:
+                    self.assertAlmostEqual(
+                        column["x"], style_action_columns[0]["x"], delta=0.5
+                    )
+                    self.assertAlmostEqual(
+                        column["width"],
+                        style_action_columns[0]["width"],
+                        delta=0.5,
+                    )
+                for case in style_data["status_cases"].values():
+                    for row_name in ("device", "buttons", "service"):
+                        row = case[row_name]
+                        self.assertFalse(row["state_truncated"])
+                        self.assertGreaterEqual(
+                            row["state_width"] + 0.5,
+                            row["state_implicit_width"],
+                        )
+                        self.assertFalse(row["detail_truncated"])
+                        self.assertGreaterEqual(
+                            row["detail_width"] + 0.5,
+                            row["detail_implicit_width"],
+                        )
+                        if row["baseline_delta"] is not None:
+                            self.assertLessEqual(row["baseline_delta"], 0.5)
 
     def test_three_page_shell_fits_compact_viewports_without_horizontal_overflow(self):
         import json
@@ -9209,6 +10921,23 @@ class OffscreenQmlLoadTests(unittest.TestCase):
                 outline = data["client_shell_outline"]
                 for edge in ("x", "y", "right", "bottom"):
                     self.assertAlmostEqual(outline[edge], shell[edge], delta=0.5)
+
+                device_items = data["pages"]["device"]["items"]
+                runtime_row = device_items["runtimeLogRow"]
+                update_button = device_items["checkApplicationUpdateButton"]
+                log_button = device_items["deviceOpenLogButton"]
+                self.assertTrue(update_button["visible"])
+                self.assertTrue(log_button["visible"])
+                self.assertLessEqual(update_button["right"], log_button["x"] + 0.5)
+                for button in (update_button, log_button):
+                    self.assertGreaterEqual(button["x"], runtime_row["x"] - 0.5)
+                    self.assertLessEqual(
+                        button["right"], runtime_row["right"] + 0.5
+                    )
+                    self.assertGreaterEqual(button["y"], runtime_row["y"] - 0.5)
+                    self.assertLessEqual(
+                        button["bottom"], runtime_row["bottom"] + 0.5
+                    )
 
                 descriptions = data["voice_columns"]["descriptions"]
                 launch_x = descriptions["voiceProgramLaunchText"]["x"]

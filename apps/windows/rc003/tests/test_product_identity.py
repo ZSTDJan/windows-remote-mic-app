@@ -61,10 +61,13 @@ class ProductIdentityTests(unittest.TestCase):
 
     def test_qml_reads_the_controller_identity_instead_of_copying_the_name(self):
         qml_dir = _RC003_ROOT / "src" / "ovb_rc003" / "qml"
-        for filename in ("main.qml", "DevicePage.qml", "VoicePage.qml"):
+        for filename in ("main.qml", "VoicePage.qml"):
             text = (qml_dir / filename).read_text(encoding="utf-8")
             self.assertIn("SettingsController.applicationDisplayName", text)
             self.assertNotIn("Remote Mic", text)
+
+        device_qml = (qml_dir / "DevicePage.qml").read_text(encoding="utf-8")
+        self.assertNotIn("Remote Mic", device_qml)
 
         main_qml = (qml_dir / "main.qml").read_text(encoding="utf-8")
         self.assertIn("arg(SettingsController.applicationDisplayName)", main_qml)

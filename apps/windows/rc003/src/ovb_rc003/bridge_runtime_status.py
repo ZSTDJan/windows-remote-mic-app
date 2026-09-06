@@ -1,8 +1,10 @@
-"""Atomic runtime status shared by the bridge and settings window.
+"""Atomic, session-scoped runtime status shared by bridge and settings.
 
 The in-process bridge worker is the sole writer and the settings controller
-is read-only. The
-file contains no device identity, address, HID path, or voice content; it
+is read-only. Each Windows logon session owns a separate status file, matching
+the Local\\ bridge mutex scope, so two sessions of the same user cannot delete
+or display each other's state. The file contains no device identity, address,
+HID path, or voice content; it
 only distinguishes a live process waiting for RC003 from one whose BLE/ATVV
 connection setup completed. A PID guard prevents an exiting old process from
 deleting a newer process's status during a restart race.
@@ -14,6 +16,7 @@ import json
 import hashlib
 import os
 import sys
+import threading
 import time
 import uuid
 from dataclasses import dataclass
@@ -25,6 +28,10 @@ from typing import Callable, Optional
 SCHEMA_VERSION = 2
 LEGACY_SCHEMA_VERSION = 1
 STATUS_FILENAME = "bridge-runtime-status.json"
+_SCOPED_STATUS_FILENAME_TEMPLATE = "bridge-runtime-status-{scope}.json"
+_STATUS_SCOPE_UNSET = object()
+_default_status_scope: object | str = _STATUS_SCOPE_UNSET
+_default_status_scope_lock = threading.Lock()
 FAILED_RAW_INPUT_STATES = frozenset(
     {
         "unavailable",
@@ -118,8 +125,60 @@ def current_runtime_identity(
     )
 
 
-def status_path(config_root: Path) -> Path:
-    return Path(config_root) / STATUS_FILENAME
+def _resolve_default_status_scope() -> str:
+    global _default_status_scope
+
+    cached = _default_status_scope
+    if isinstance(cached, str):
+        return cached
+    with _default_status_scope_lock:
+        cached = _default_status_scope
+        if isinstance(cached, str):
+            return cached
+        if sys.platform != "win32":
+            resolved_scope = ""
+        else:
+            from . import single_instance
+
+            try:
+                resolved_scope = (
+                    f"s{single_instance.current_process_session_id()}"
+                )
+            except (
+                single_instance.SingleInstanceUnavailableError,
+                OSError,
+                ValueError,
+            ):
+                # The in-process bridge and UI share this process fallback.
+                # Caching prevents later query recovery from changing paths.
+                resolved_scope = f"p{os.getpid()}"
+        _default_status_scope = resolved_scope
+        return resolved_scope
+
+
+def _status_scope(session_id: Optional[int]) -> str:
+    if session_id is None:
+        return _resolve_default_status_scope()
+    if isinstance(session_id, bool):
+        raise ValueError("session_id must be a non-negative integer")
+    resolved = int(session_id)
+    if resolved < 0:
+        raise ValueError("session_id must be non-negative")
+    return f"s{resolved}"
+
+
+def status_path(
+    config_root: Path,
+    *,
+    session_id: Optional[int] = None,
+) -> Path:
+    scope = _status_scope(session_id)
+    filename = (
+        _SCOPED_STATUS_FILENAME_TEMPLATE.format(scope=scope)
+        if scope
+        else STATUS_FILENAME
+    )
+    return Path(config_root) / filename
 
 
 def runtime_identity_matches(
@@ -159,6 +218,7 @@ def publish_status(
     last_button_at: Optional[float] = None,
     last_button_source: str = "",
     voice_active: bool = False,
+    session_id: Optional[int] = None,
     now: Callable[[], float] = time.time,
 ) -> BridgeRuntimeStatus:
     resolved_pid = os.getpid() if pid is None else int(pid)
@@ -183,7 +243,7 @@ def publish_status(
         last_button_source=str(last_button_source),
         voice_active=bool(voice_active),
     )
-    path = status_path(config_root)
+    path = status_path(config_root, session_id=session_id)
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
     try:
@@ -221,9 +281,9 @@ def publish_status(
     return status
 
 
-def read_status(config_root: Path) -> Optional[BridgeRuntimeStatus]:
+def _read_status_file(path: Path) -> Optional[BridgeRuntimeStatus]:
     try:
-        payload = json.loads(status_path(config_root).read_text(encoding="utf-8"))
+        payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError):
         return None
     if not isinstance(payload, dict):
@@ -298,14 +358,67 @@ def read_status(config_root: Path) -> Optional[BridgeRuntimeStatus]:
     )
 
 
-def clear_status(config_root: Path, *, pid: Optional[int] = None) -> bool:
-    path = status_path(config_root)
-    if pid is not None:
-        current = read_status(config_root)
-        if current is None or current.pid != int(pid):
-            return False
+def read_status(
+    config_root: Path,
+    *,
+    session_id: Optional[int] = None,
+) -> Optional[BridgeRuntimeStatus]:
+    return _read_status_file(status_path(config_root, session_id=session_id))
+
+
+def _restore_claimed_status(claimed: Path, path: Path) -> bool:
+    """Restore a claimed file only when no newer writer owns ``path``."""
+
     try:
-        path.unlink()
-    except FileNotFoundError:
+        if sys.platform == "win32":
+            # Windows rename fails instead of replacing an existing target.
+            os.rename(claimed, path)
+        else:
+            # POSIX rename replaces the target, so use a no-replace hard link.
+            os.link(claimed, path)
+            claimed.unlink()
+    except FileExistsError:
         return False
     return True
+
+
+def clear_status(
+    config_root: Path,
+    *,
+    pid: Optional[int] = None,
+    session_id: Optional[int] = None,
+) -> bool:
+    """Remove one atomically claimed status generation.
+
+    Claiming the current path before checking its PID prevents an exiting old
+    bridge from deleting a replacement status published by a newer bridge.
+    """
+
+    path = status_path(config_root, session_id=session_id)
+    expected_pid = None if pid is None else int(pid)
+    claimed = path.with_name(f".{path.name}.{uuid.uuid4().hex}.clear")
+    try:
+        os.replace(path, claimed)
+    except FileNotFoundError:
+        return False
+
+    remove_claimed = True
+    try:
+        if expected_pid is not None:
+            current = _read_status_file(claimed)
+            if current is None or current.pid != expected_pid:
+                try:
+                    _restore_claimed_status(claimed, path)
+                except OSError:
+                    # Keep the claimed file for diagnosis instead of deleting
+                    # the only complete copy after a failed safe restore.
+                    remove_claimed = False
+                    raise
+                return False
+        return True
+    finally:
+        if remove_claimed:
+            try:
+                claimed.unlink()
+            except FileNotFoundError:
+                pass

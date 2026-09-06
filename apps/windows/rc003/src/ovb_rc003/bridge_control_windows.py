@@ -7,9 +7,10 @@ from ctypes import wintypes
 from dataclasses import dataclass
 import sys
 import time
+from pathlib import Path
 from typing import Callable, Optional
 
-from . import bridge_tray_windows, single_instance
+from . import bridge_runtime_status, bridge_tray_windows, config, single_instance
 
 
 DEFAULT_EXIT_TIMEOUT_SECONDS = 5.0
@@ -21,6 +22,39 @@ class BridgeExitResult:
     requested: bool
     stopped: bool
     error: str = ""
+    cleanup_failed: bool = False
+
+
+def _finish_stopped_bridge(
+    *,
+    requested: bool,
+    status_root: Optional[Path],
+    status_before: Optional[bridge_runtime_status.BridgeRuntimeStatus],
+) -> BridgeExitResult:
+    if status_root is None:
+        return BridgeExitResult(requested, True)
+    try:
+        if status_before is not None:
+            bridge_runtime_status.clear_status(
+                status_root,
+                pid=status_before.pid,
+            )
+        remaining = bridge_runtime_status.read_status(status_root)
+    except OSError:
+        return BridgeExitResult(
+            requested,
+            False,
+            "遥控器服务已停止，但运行状态没有清理完成。请重试。",
+            True,
+        )
+    if remaining is not None:
+        return BridgeExitResult(
+            requested,
+            False,
+            "遥控器服务已停止，但检测到另一份运行状态。请完全退出旧版后重试。",
+            True,
+        )
+    return BridgeExitResult(requested, True)
 
 
 def _find_bridge_window() -> int:
@@ -65,12 +99,27 @@ def request_bridge_exit(
     stop_internal: Optional[Callable[..., Optional[bool]]] = None,
     sleep: Callable[[float], None] = time.sleep,
     monotonic: Callable[[], float] = time.monotonic,
+    runtime_status_root: Optional[Path] = None,
 ) -> BridgeExitResult:
     """Ask the existing bridge to use its normal tray cleanup path and wait."""
 
     current_platform = sys.platform if platform is None else platform
     if current_platform != "win32":
         return BridgeExitResult(False, False, "仅 Windows 支持自动停止遥控器服务。")
+
+    production_stop = stop_internal is None
+    status_root = (
+        Path(runtime_status_root)
+        if runtime_status_root is not None
+        else config.config_root()
+        if production_stop
+        else None
+    )
+    status_before = (
+        bridge_runtime_status.read_status(status_root)
+        if status_root is not None
+        else None
+    )
 
     # The current product hosts the bridge inside the desktop process. Stop
     # that worker directly; the Win32 control window below is only for a
@@ -83,7 +132,11 @@ def request_bridge_exit(
     internal_stopped = stop_internal(timeout=timeout)
     if internal_stopped is not None:
         if internal_stopped:
-            return BridgeExitResult(True, True)
+            return _finish_stopped_bridge(
+                requested=True,
+                status_root=status_root,
+                status_before=status_before,
+            )
         return BridgeExitResult(
             True,
             False,
@@ -91,7 +144,11 @@ def request_bridge_exit(
         )
     try:
         if not bridge_running():
-            return BridgeExitResult(False, True)
+            return _finish_stopped_bridge(
+                requested=False,
+                status_root=status_root,
+                status_before=status_before,
+            )
     except Exception:
         return BridgeExitResult(False, False, "无法确认遥控器服务是否正在运行。")
 
@@ -120,7 +177,11 @@ def request_bridge_exit(
     while monotonic() < deadline:
         try:
             if not bridge_running():
-                return BridgeExitResult(True, True)
+                return _finish_stopped_bridge(
+                    requested=True,
+                    status_root=status_root,
+                    status_before=status_before,
+                )
         except Exception:
             return BridgeExitResult(
                 True,
@@ -130,7 +191,11 @@ def request_bridge_exit(
         sleep(max(0.01, float(poll_interval)))
     try:
         if not bridge_running():
-            return BridgeExitResult(True, True)
+            return _finish_stopped_bridge(
+                requested=True,
+                status_root=status_root,
+                status_before=status_before,
+            )
     except Exception:
         return BridgeExitResult(
             True,

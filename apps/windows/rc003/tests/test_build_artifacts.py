@@ -508,7 +508,7 @@ class InnoSetupScriptTests(unittest.TestCase):
         self.assertIn("CurStepChanged", code_section)
         self.assertIn("ssPostInstall", code_section)
         self.assertIn("管理员按键组件未启用", code_section)
-        self.assertIn("启用改键", code_section)
+        self.assertIn("修复权限", code_section)
         self.assertIn("WizardForm.FinishedLabel.Caption", code_section)
 
     def test_standard_account_gets_one_direct_message_without_a_useless_uac_prompt(self):
@@ -529,6 +529,11 @@ class InnoSetupScriptTests(unittest.TestCase):
         self.assertIn("RunApplicationMaintenance('--uninstall-hid-helper'", initialize)
         self.assertIn("Result := False", initialize)
         self.assertIn("管理员按键组件未能移除", initialize)
+        unsupported = initialize.split(
+            "if ResultCode = HidHelperAccountUnsupportedExitCode then", 1
+        )[1].split("else", 1)[0]
+        self.assertIn("请登录原管理员账号后重试", unsupported)
+        self.assertIn("临时输入另一个管理员账号无效", unsupported)
 
     def test_no_autostart_shortcut_or_task(self):
         self.assertNotIn("userstartup", self.effective_text.lower())
@@ -538,6 +543,14 @@ class InnoSetupScriptTests(unittest.TestCase):
         self.assertIn(
             r"SetupIconFile=..\src\ovb_rc003\assets\icons\remote-mic.ico",
             self.text,
+        )
+
+    def test_installer_bundles_the_current_user_readme(self):
+        files_section = _iss_section(self.text, "Files")
+        self.assertIn(
+            'Source: "readme-rc003.txt"; DestDir: "{app}"; '
+            "Flags: isreadme ignoreversion",
+            files_section,
         )
 
     def test_no_vbcable_reference(self):
@@ -2729,6 +2742,21 @@ class RootDocumentConsistencyTests(unittest.TestCase):
         self.assertIn("源码/构建候选", self.root_readme_text)
         self.assertIn("不能替代", self.root_readme_text)
 
+    def test_root_readme_leads_with_the_temporary_admin_workaround(self):
+        lines = self.root_readme_text.splitlines()
+        first_content = next(line.strip() for line in lines[1:] if line.strip())
+        self.assertEqual(first_content, "> [!IMPORTANT]")
+        for phrase in (
+            "当前公开版本请暂时以管理员身份启动",
+            "普通权限运行时仍有已知异常",
+            "以管理员身份运行",
+        ):
+            self.assertIn(phrase, self.root_readme_text)
+        self.assertLess(
+            self.root_readme_text.index("当前公开版本请暂时以管理员身份启动"),
+            self.root_readme_text.index("这是 `ZSTDJan/windows-remote-mic-app` 仓库"),
+        )
+
     def test_third_party_notices_does_not_falsely_deny_all_vbcable_reference(self):
         # THIRD_PARTY_NOTICES.md previously claimed the Windows candidate
         # does not "reference VB-CABLE ... in any form" - false:
@@ -2821,15 +2849,31 @@ class PrereleaseDownloadInstructionsContractTests(unittest.TestCase):
 
     def test_links_to_the_generic_releases_page(self):
         self.assertIn(
-            "https://github.com/miaomiaozii/windows-remote-mic-app/releases", self.text
+            "https://github.com/ZSTDJan/windows-remote-mic-app/releases", self.text
         )
         # The bare list page is the stable entry point; any direct
         # /releases/tag/... link must point at a tag this repo actually
         # published (so a future tag bump that forgets to publish 404s the
         # doc instead of silently breaking).
         self.assertIn(
-            "/releases/tag/v0.1.0-windows-rc003-candidate.1", self.text
+            "/releases/tag/v0.2.0-windows-rc003-candidate.2", self.text
         )
+        self.assertNotIn("miaomiaozii/windows-remote-mic-app", self.text)
+
+    def test_current_public_release_is_not_confused_with_the_local_version(self):
+        root_readme = _ROOT_README_PATH.read_text(encoding="utf-8")
+        release_url = (
+            "https://github.com/ZSTDJan/windows-remote-mic-app/"
+            "releases/tag/v0.2.0-windows-rc003-candidate.2"
+        )
+        self.assertIn(release_url, self.text)
+        self.assertIn(release_url, root_readme)
+        for asset_name in (
+            "RemoteMicRC003Setup-0.2.0-candidate.2-unsigned.exe",
+            "RemoteMicRC003-0.2.0-candidate.2-portable-unsigned.zip",
+            "SHA256SUMS.txt",
+        ):
+            self.assertIn(asset_name, root_readme)
 
     def test_does_not_make_a_time_dependent_claim_about_prerelease_existence(self):
         # XRBM-027 RETRY 1 correction: a sentence saying "even if there is
@@ -2896,8 +2940,50 @@ class RealWindowsCiEvidenceContractTests(unittest.TestCase):
         self.assertIn("已通过真实硬件验收", self.readme_text)
 
     def test_repository_links_to_its_own_actions_and_releases(self):
-        self.assertIn("https://github.com/miaomiaozii/windows-remote-mic-app/releases", self.readme_text)
-        self.assertIn("https://github.com/miaomiaozii/windows-remote-mic-app/actions", self.readme_text)
+        self.assertIn("https://github.com/ZSTDJan/windows-remote-mic-app/releases", self.readme_text)
+        self.assertIn("https://github.com/ZSTDJan/windows-remote-mic-app/actions", self.readme_text)
+        self.assertNotIn("miaomiaozii/windows-remote-mic-app", self.readme_text)
+
+
+class ApplicationUpdateDocumentationContractTests(unittest.TestCase):
+    def setUp(self):
+        self.root_readme = _ROOT_README_PATH.read_text(encoding="utf-8")
+        self.windows_readme = _README_PATH.read_text(encoding="utf-8")
+        self.installed_readme = _INSTALLED_README_PATH.read_text(encoding="utf-8")
+        self.portable_readme = _PORTABLE_README_PATH.read_text(encoding="utf-8")
+        self.user_docs = (
+            self.root_readme,
+            self.windows_readme,
+            self.installed_readme,
+            self.portable_readme,
+        )
+
+    def test_all_user_guides_document_the_manual_verified_update_entry(self):
+        for text in self.user_docs:
+            normalized = _normalize_whitespace(text)
+            with self.subTest(document=text[:40]):
+                self.assertIn("运行日志", normalized)
+                self.assertIn("检查更新", normalized)
+                self.assertIn("只在用户点击后", normalized)
+                self.assertIn("后台自动", normalized)
+                self.assertIn("SHA256SUMS.txt", normalized)
+                self.assertIn("GitHub 提供资产摘要时", normalized)
+                self.assertIn(r"updates\<版本号>", normalized)
+                self.assertIn("打开文件夹", normalized)
+
+    def test_distribution_guides_keep_install_and_portable_updates_separate(self):
+        installed = _normalize_whitespace(self.installed_readme)
+        portable = _normalize_whitespace(self.portable_readme)
+        source = _normalize_whitespace(self.windows_readme)
+
+        self.assertIn("安装版会下载同一次 Release 的安装器", installed)
+        self.assertIn("再手动运行已下载的安装器", installed)
+        self.assertIn("取消、中断或校验失败不会覆盖当前程序", installed)
+        self.assertIn("便携版会下载同一次 Release 的便携 ZIP", portable)
+        self.assertIn("再把 ZIP 解压到新的文件夹使用", portable)
+        self.assertIn("取消、中断或校验失败不会改变当前程序", portable)
+        self.assertIn("便携版或源码运行下载便携 ZIP", source)
+        self.assertIn("不会自动运行下载文件", source)
 
 
 class PortableAndInstallerFlowContractTests(unittest.TestCase):

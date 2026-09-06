@@ -55,11 +55,11 @@ _ELEVATED_PROCESS_TERMINATION_WAIT_MS = 10_000
 
 MANIFEST_SCHEMA_VERSION = 1
 HELPER_PROTOCOL_VERSION = 1
-# Generation 6 validates the task returned by RegisterTask and reports
-# sanitized setup stages to the normal-integrity parent. Task contract 5
-# accepts Windows' equivalent inherited administrator/SYSTEM task ACLs while
-# still granting only read/execute access to the requesting user.
-HELPER_GENERATION = 6
+# Generation 7 replaces generation 6 after the task-validation and runtime
+# injection fixes changed the frozen helper binary. A generation bump is the
+# upgrade boundary that prevents an older, otherwise valid helper from being
+# silently reused by a newer application build.
+HELPER_GENERATION = 7
 TASK_CONTRACT_VERSION = 5
 MANIFEST_FILENAME = "helper-manifest.json"
 
@@ -100,6 +100,17 @@ HELPER_EXIT_UNINSTALL_ROLLBACK_FAILED = 30
 HELPER_EXIT_UNINSTALL_FAILED = 31
 HELPER_EXIT_REQUEST_INVALID = 32
 HELPER_EXIT_OPERATION_UNAVAILABLE = 33
+HELPER_EXIT_EXECUTION_IDENTITY_INVALID = 34
+HELPER_EXIT_HOST_UNAVAILABLE = 35
+HELPER_EXIT_DEBUG_PRIVILEGE_FAILED = 36
+HELPER_EXIT_TARGET_VALIDATION_FAILED = 37
+HELPER_EXIT_RUNTIME_PREPARATION_FAILED = 38
+HELPER_EXIT_TARGET_PROCESS_OPEN_FAILED = 39
+HELPER_EXIT_REMOTE_MEMORY_FAILED = 40
+HELPER_EXIT_REMOTE_THREAD_FAILED = 41
+HELPER_EXIT_REMOTE_LOAD_TIMEOUT = 42
+HELPER_EXIT_REMOTE_LOAD_FAILED = 43
+HELPER_EXIT_INJECTION_FAILED = 44
 
 _HELPER_EXIT_ERROR_DETAILS = {
     HELPER_EXIT_TASK_REGISTRATION_FAILED: "hid_helper_task_registration_failed",
@@ -157,6 +168,24 @@ _HELPER_ERROR_EXIT_CODES.update(
     }
 )
 
+_HELPER_RUNTIME_EXIT_ERROR_DETAILS = {
+    HELPER_EXIT_EXECUTION_IDENTITY_INVALID: "hid_helper_execution_identity_invalid",
+    HELPER_EXIT_HOST_UNAVAILABLE: "hid_helper_host_unavailable",
+    HELPER_EXIT_DEBUG_PRIVILEGE_FAILED: "hid_helper_debug_privilege_failed",
+    HELPER_EXIT_TARGET_VALIDATION_FAILED: "hid_helper_target_validation_failed",
+    HELPER_EXIT_RUNTIME_PREPARATION_FAILED: "hid_helper_runtime_preparation_failed",
+    HELPER_EXIT_TARGET_PROCESS_OPEN_FAILED: "hid_helper_target_process_open_failed",
+    HELPER_EXIT_REMOTE_MEMORY_FAILED: "hid_helper_remote_memory_failed",
+    HELPER_EXIT_REMOTE_THREAD_FAILED: "hid_helper_remote_thread_failed",
+    HELPER_EXIT_REMOTE_LOAD_TIMEOUT: "hid_helper_remote_load_timeout",
+    HELPER_EXIT_REMOTE_LOAD_FAILED: "hid_helper_remote_load_failed",
+    HELPER_EXIT_INJECTION_FAILED: "hid_helper_injection_failed",
+}
+_HELPER_RUNTIME_ERROR_EXIT_CODES = {
+    detail: exit_code
+    for exit_code, detail in _HELPER_RUNTIME_EXIT_ERROR_DETAILS.items()
+}
+
 _NEWER_HELPER_DETAILS = frozenset(
     {
         "helper_manifest_newer_schema",
@@ -193,6 +222,12 @@ def is_newer_helper_state(state: HidHelperState) -> bool:
 def helper_setup_detail_from_exit_code(exit_code: int) -> str:
     return _HELPER_EXIT_ERROR_DETAILS.get(
         int(exit_code), f"hid_helper_setup_exit_{int(exit_code)}"
+    )
+
+
+def helper_runtime_detail_from_exit_code(exit_code: int) -> str:
+    return _HELPER_RUNTIME_EXIT_ERROR_DETAILS.get(
+        int(exit_code), f"hid_helper_task_exit_{int(exit_code)}"
     )
 
 
@@ -1105,6 +1140,18 @@ def _task_xml_value(root: ET.Element, path: str) -> str:
     return "" if node is None or node.text is None else node.text.strip()
 
 
+_TASK_SCHEDULER_DEFAULT_SETTINGS = {
+    "AllowHardTerminate": "true",
+    "StartWhenAvailable": "false",
+    "RunOnlyIfNetworkAvailable": "false",
+    "AllowStartOnDemand": "true",
+    "Enabled": "true",
+    "RunOnlyIfIdle": "false",
+    "WakeToRun": "false",
+    "Priority": "7",
+}
+
+
 def validate_registered_task_xml(
     xml_text: str,
     *,
@@ -1194,12 +1241,22 @@ def validate_registered_task_xml(
         "ExecutionTimeLimit": TASK_EXECUTION_LIMIT,
         "Priority": "7",
     }
-    settings_valid = all(
-        len(root.findall(f"./t:Settings/t:{name}", namespace)) == 1
-        and _task_xml_value(root, f"./t:Settings/t:{name}").casefold()
-        == expected.casefold()
-        for name, expected in expected_settings.items()
-    )
+    settings_valid = True
+    for name, expected_value in expected_settings.items():
+        nodes = root.findall(f"./t:Settings/t:{name}", namespace)
+        if len(nodes) > 1:
+            settings_valid = False
+            break
+        if not nodes:
+            if _TASK_SCHEDULER_DEFAULT_SETTINGS.get(name) != expected_value:
+                settings_valid = False
+                break
+            continue
+        if _task_xml_value(
+            root, f"./t:Settings/t:{name}"
+        ).casefold() != expected_value.casefold():
+            settings_valid = False
+            break
     return (
         os.path.normcase(command) == os.path.normcase(str(expected))
         and arguments == INJECT_FLAG
@@ -1627,7 +1684,17 @@ def _run_task(task_name: str, *, _root: Optional[object] = None) -> None:
             if not hasattr(running, "State"):
                 raise HidElevationError("hid_helper_task_result_unavailable")
             deadline = time.monotonic() + _REGISTERED_TASK_COMPLETION_TIMEOUT_SECONDS
-            while int(running.State) in {2, 4}:  # queued or running
+            while True:
+                try:
+                    # comtypes can retain the initial RUNNING value until the
+                    # IRunningTask instance is refreshed explicitly.
+                    running.Refresh()
+                except Exception:
+                    # Windows can retire the instance between Refresh and the
+                    # next state read; State then exposes the completed value.
+                    pass
+                if int(running.State) not in {2, 4}:  # queued or running
+                    break
                 if time.monotonic() >= deadline:
                     raise HidElevationError("hid_helper_task_timeout")
                 time.sleep(_REGISTERED_TASK_POLL_SECONDS)
@@ -1635,7 +1702,9 @@ def _run_task(task_name: str, *, _root: Optional[object] = None) -> None:
             if exit_code == HELPER_EXIT_OPERATION_BUSY:
                 raise HidElevationError("hid_helper_operation_busy")
             if exit_code != HELPER_EXIT_OK:
-                raise HidElevationError(f"hid_helper_task_exit_{exit_code}")
+                raise HidElevationError(
+                    helper_runtime_detail_from_exit_code(exit_code)
+                )
     except Exception as exc:
         if isinstance(exc, HidElevationError):
             raise
@@ -2823,14 +2892,32 @@ def _validate_helper_execution_identity() -> None:
 
 
 def _inject_once() -> None:
-    from .frida_hid_tap_injector import inject_current_process
+    from .frida_hid_tap_injector import (
+        HidInjectionStageError,
+        inject_current_process,
+    )
     from .frida_hid_tap_runtime import find_rc003_hidogatt_host_pid
 
-    _validate_helper_execution_identity()
+    try:
+        _validate_helper_execution_identity()
+    except HidElevationError as exc:
+        raise HidElevationError(
+            "hid_helper_execution_identity_invalid"
+        ) from exc
     pid = find_rc003_hidogatt_host_pid()
     if pid is None:
-        raise RuntimeError("RC003 WUDFHost is unavailable")
-    inject_current_process(pid)
+        raise HidElevationError("hid_helper_host_unavailable")
+    try:
+        inject_current_process(pid)
+    except HidInjectionStageError as exc:
+        detail = str(exc)
+        if detail == "hid_helper_host_changed":
+            detail = "hid_helper_host_unavailable"
+        if detail not in _HELPER_RUNTIME_ERROR_EXIT_CODES:
+            detail = "hid_helper_injection_failed"
+        raise HidElevationError(detail) from exc
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise HidElevationError("hid_helper_injection_failed") from exc
 
 
 def _self_check() -> None:
@@ -2925,7 +3012,10 @@ def helper_main(argv: Optional[Sequence[str]] = None) -> int:
             return HELPER_EXIT_NEWER_PRESERVED
         if detail == "hid_helper_operation_busy":
             return HELPER_EXIT_OPERATION_BUSY
-        return _HELPER_ERROR_EXIT_CODES.get(detail, operation_failure_exit)
+        return _HELPER_ERROR_EXIT_CODES.get(
+            detail,
+            _HELPER_RUNTIME_ERROR_EXIT_CODES.get(detail, operation_failure_exit),
+        )
     except (OSError, RuntimeError, ValueError):
         return operation_failure_exit
     except Exception:

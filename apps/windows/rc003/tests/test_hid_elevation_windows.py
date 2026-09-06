@@ -98,6 +98,62 @@ class ProcessElevationStateTests(unittest.TestCase):
         ):
             self.assertFalse(hid_elevation_windows.is_process_elevated())
 
+    def test_self_elevation_is_available_for_elevated_or_split_admin_tokens(self):
+        with mock.patch.object(
+            hid_elevation_windows, "_is_windows", return_value=True
+        ), mock.patch.object(
+            hid_elevation_windows, "is_process_elevated", return_value=True
+        ), mock.patch.object(
+            hid_elevation_windows, "token_elevation_type"
+        ) as token_type:
+            self.assertTrue(hid_elevation_windows.can_current_user_self_elevate())
+        token_type.assert_not_called()
+
+        with mock.patch.object(
+            hid_elevation_windows, "_is_windows", return_value=True
+        ), mock.patch.object(
+            hid_elevation_windows, "is_process_elevated", return_value=False
+        ), mock.patch.object(
+            hid_elevation_windows,
+            "token_elevation_type",
+            return_value=hid_elevation_windows._TOKEN_ELEVATION_TYPE_LIMITED,
+        ):
+            self.assertTrue(hid_elevation_windows.can_current_user_self_elevate())
+
+    def test_self_elevation_is_unavailable_for_standard_or_unknown_tokens(self):
+        for elevation_type in (1, 2):
+            with self.subTest(elevation_type=elevation_type), mock.patch.object(
+                hid_elevation_windows, "_is_windows", return_value=True
+            ), mock.patch.object(
+                hid_elevation_windows, "is_process_elevated", return_value=False
+            ), mock.patch.object(
+                hid_elevation_windows,
+                "token_elevation_type",
+                return_value=elevation_type,
+            ):
+                self.assertFalse(
+                    hid_elevation_windows.can_current_user_self_elevate()
+                )
+
+        with mock.patch.object(
+            hid_elevation_windows, "_is_windows", return_value=True
+        ), mock.patch.object(
+            hid_elevation_windows, "is_process_elevated", return_value=False
+        ), mock.patch.object(
+            hid_elevation_windows,
+            "token_elevation_type",
+            side_effect=hid_elevation_windows.HidElevationError("unavailable"),
+        ):
+            self.assertFalse(hid_elevation_windows.can_current_user_self_elevate())
+
+        with mock.patch.object(
+            hid_elevation_windows, "_is_windows", return_value=False
+        ), mock.patch.object(
+            hid_elevation_windows, "is_process_elevated"
+        ) as elevated:
+            self.assertFalse(hid_elevation_windows.can_current_user_self_elevate())
+        elevated.assert_not_called()
+
 
 class TaskDefinitionTests(unittest.TestCase):
     def setUp(self):
@@ -222,6 +278,61 @@ class TaskDefinitionTests(unittest.TestCase):
                 task_name=task_name,
             )
         )
+
+    def test_task_validation_accepts_real_windows_registered_normalization(self):
+        normalized_settings = """  <Settings>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <ExecutionTimeLimit>PT30S</ExecutionTimeLimit>
+    <Hidden>true</Hidden>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <IdleSettings>
+      <StopOnIdleEnd>true</StopOnIdleEnd>
+      <RestartOnIdle>false</RestartOnIdle>
+    </IdleSettings>
+    <UseUnifiedSchedulingEngine>true</UseUnifiedSchedulingEngine>
+  </Settings>"""
+        start = self.xml.index("  <Settings>")
+        end = self.xml.index("  </Settings>", start) + len("  </Settings>")
+        registered = self.xml[:start] + normalized_settings + self.xml[end:]
+        registered = _with_empty_triggers(registered)
+        registered = registered.replace(
+            "  <RegistrationInfo>",
+            "  <RegistrationInfo>\n"
+            f"    <SecurityDescriptor>{hid_elevation_windows.task_security_sddl(SID)}</SecurityDescriptor>",
+            1,
+        )
+
+        self.assertTrue(
+            hid_elevation_windows.validate_registered_task_xml(
+                registered,
+                helper_path=self.helper,
+                user_sid=SID,
+                task_name=self.task_name,
+            )
+        )
+
+    def test_task_validation_rejects_missing_nondefault_registered_settings(self):
+        required = (
+            "MultipleInstancesPolicy",
+            "DisallowStartIfOnBatteries",
+            "StopIfGoingOnBatteries",
+            "Hidden",
+            "ExecutionTimeLimit",
+        )
+        for name in required:
+            with self.subTest(setting=name):
+                start = self.xml.index(f"    <{name}>")
+                end = self.xml.index(f"</{name}>", start) + len(f"</{name}>")
+                without_setting = self.xml[:start] + self.xml[end:]
+                self.assertFalse(
+                    hid_elevation_windows.validate_registered_task_xml(
+                        without_setting,
+                        helper_path=self.helper,
+                        user_sid=SID,
+                        task_name=self.task_name,
+                    )
+                )
 
     def test_task_validation_rejects_extra_actions_and_restart_policy(self):
         extra_exec = self.xml.replace(
@@ -529,6 +640,50 @@ class TaskSchedulerApiTests(unittest.TestCase):
             hid_elevation_windows._run_task(r"\task", _root=root)
 
         self.assertEqual(str(ctx.exception), "hid_helper_operation_busy")
+
+    def test_registered_task_maps_runtime_failure_exit_codes(self):
+        for exit_code, detail in (
+            hid_elevation_windows._HELPER_RUNTIME_EXIT_ERROR_DETAILS.items()
+        ):
+            with self.subTest(exit_code=exit_code, detail=detail):
+                root, _task = self._task_root(states=[3], result=exit_code)
+
+                with self.assertRaises(
+                    hid_elevation_windows.HidElevationError
+                ) as ctx:
+                    hid_elevation_windows._run_task(r"\task", _root=root)
+
+                self.assertEqual(str(ctx.exception), detail)
+
+    def test_registered_task_refreshes_stale_com_state_before_reading_result(self):
+        class StaleRunningTask:
+            def __init__(self):
+                self.State = 4
+                self.refresh_calls = 0
+
+            def Refresh(self):
+                self.refresh_calls += 1
+                if self.refresh_calls >= 2:
+                    self.State = 0
+                    raise OSError("the completed running instance was retired")
+
+        running = StaleRunningTask()
+        task = mock.Mock()
+        task.Name = "task"
+        task.Run.return_value = running
+        task.LastTaskResult = hid_elevation_windows.HELPER_EXIT_VALIDATION_FAILED
+        root = mock.Mock()
+        root.GetTasks.return_value = _Collection([task])
+
+        with mock.patch.object(hid_elevation_windows.time, "sleep"):
+            with self.assertRaises(hid_elevation_windows.HidElevationError) as ctx:
+                hid_elevation_windows._run_task(r"\task", _root=root)
+
+        self.assertEqual(
+            str(ctx.exception),
+            f"hid_helper_task_exit_{hid_elevation_windows.HELPER_EXIT_VALIDATION_FAILED}",
+        )
+        self.assertEqual(running.refresh_calls, 2)
 
     def test_registered_task_timeout_is_not_reported_as_success(self):
         root, _task = self._task_root(states=[4], result=0)
@@ -3247,8 +3402,126 @@ class ElevationRequestTests(unittest.TestCase):
 
 class HelperMainTests(unittest.TestCase):
     def test_fixed_frozen_helper_uses_a_new_generation(self):
-        self.assertGreaterEqual(hid_elevation_windows.HELPER_GENERATION, 6)
+        self.assertGreaterEqual(hid_elevation_windows.HELPER_GENERATION, 7)
         self.assertGreaterEqual(hid_elevation_windows.TASK_CONTRACT_VERSION, 5)
+
+    def test_inject_once_reports_a_stable_failure_stage(self):
+        from ovb_rc003 import frida_hid_tap_injector, frida_hid_tap_runtime
+
+        cases = (
+            (
+                "identity",
+                mock.patch.object(
+                    hid_elevation_windows,
+                    "_validate_helper_execution_identity",
+                    side_effect=hid_elevation_windows.HidElevationError(
+                        "installed_helper_hash_mismatch"
+                    ),
+                ),
+                None,
+                None,
+                "hid_helper_execution_identity_invalid",
+            ),
+            (
+                "host",
+                mock.patch.object(
+                    hid_elevation_windows,
+                    "_validate_helper_execution_identity",
+                ),
+                mock.patch.object(
+                    frida_hid_tap_runtime,
+                    "find_rc003_hidogatt_host_pid",
+                    return_value=None,
+                ),
+                None,
+                "hid_helper_host_unavailable",
+            ),
+            *(
+                (
+                    detail,
+                    mock.patch.object(
+                        hid_elevation_windows,
+                        "_validate_helper_execution_identity",
+                    ),
+                    mock.patch.object(
+                        frida_hid_tap_runtime,
+                        "find_rc003_hidogatt_host_pid",
+                        return_value=4321,
+                    ),
+                    mock.patch.object(
+                        frida_hid_tap_injector,
+                        "inject_current_process",
+                        side_effect=frida_hid_tap_injector.HidInjectionStageError(
+                            detail
+                        ),
+                    ),
+                    detail,
+                )
+                for detail in hid_elevation_windows._HELPER_RUNTIME_ERROR_EXIT_CODES
+                if detail not in {
+                    "hid_helper_execution_identity_invalid",
+                    "hid_helper_host_unavailable",
+                }
+            ),
+            (
+                "unknown_injection",
+                mock.patch.object(
+                    hid_elevation_windows,
+                    "_validate_helper_execution_identity",
+                ),
+                mock.patch.object(
+                    frida_hid_tap_runtime,
+                    "find_rc003_hidogatt_host_pid",
+                    return_value=4321,
+                ),
+                mock.patch.object(
+                    frida_hid_tap_injector,
+                    "inject_current_process",
+                    side_effect=OSError("failed"),
+                ),
+                "hid_helper_injection_failed",
+            ),
+        )
+
+        for name, identity_patch, host_patch, injector_patch, detail in cases:
+            with self.subTest(name=name), identity_patch:
+                if host_patch is None:
+                    with self.assertRaises(
+                        hid_elevation_windows.HidElevationError
+                    ) as ctx:
+                        hid_elevation_windows._inject_once()
+                else:
+                    with host_patch:
+                        if injector_patch is None:
+                            with self.assertRaises(
+                                hid_elevation_windows.HidElevationError
+                            ) as ctx:
+                                hid_elevation_windows._inject_once()
+                        else:
+                            with injector_patch, self.assertRaises(
+                                hid_elevation_windows.HidElevationError
+                            ) as ctx:
+                                hid_elevation_windows._inject_once()
+                self.assertEqual(str(ctx.exception), detail)
+
+    def test_runtime_failure_stage_survives_the_task_boundary(self):
+        for detail, expected_exit in (
+            hid_elevation_windows._HELPER_RUNTIME_ERROR_EXIT_CODES.items()
+        ):
+            with self.subTest(detail=detail), mock.patch.object(
+                hid_elevation_windows,
+                "_inject_once",
+                side_effect=hid_elevation_windows.HidElevationError(detail),
+            ):
+                result = hid_elevation_windows.helper_main(
+                    [hid_elevation_windows.INJECT_FLAG]
+                )
+
+            self.assertEqual(result, expected_exit)
+            self.assertEqual(
+                hid_elevation_windows.helper_runtime_detail_from_exit_code(result),
+                detail,
+            )
 
     def test_self_check_explicitly_imports_the_operation_lock_dependency(self):
         source = __import__("inspect").getsource(hid_elevation_windows._self_check)

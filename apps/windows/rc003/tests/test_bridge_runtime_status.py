@@ -1,7 +1,9 @@
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from ovb_rc003 import bridge_runtime_status
 
@@ -66,6 +68,129 @@ class BridgeRuntimeStatusTests(unittest.TestCase):
         self.assertNotIn("address", payload)
         self.assertNotIn("text", payload)
         self.assertFalse(payload["voice_active"])
+
+    def test_explicit_windows_sessions_keep_independent_status_files(self):
+        first = bridge_runtime_status.publish_status(
+            self.root,
+            bridge_runtime_status.BridgeConnectionState.CONNECTED,
+            pid=1111,
+            session_id=1,
+        )
+        second = bridge_runtime_status.publish_status(
+            self.root,
+            bridge_runtime_status.BridgeConnectionState.WAITING_FOR_DEVICE,
+            pid=2222,
+            session_id=2,
+        )
+
+        self.assertNotEqual(
+            bridge_runtime_status.status_path(self.root, session_id=1),
+            bridge_runtime_status.status_path(self.root, session_id=2),
+        )
+        self.assertEqual(
+            bridge_runtime_status.read_status(self.root, session_id=1), first
+        )
+        self.assertEqual(
+            bridge_runtime_status.read_status(self.root, session_id=2), second
+        )
+        self.assertTrue(
+            bridge_runtime_status.clear_status(
+                self.root,
+                pid=2222,
+                session_id=2,
+            )
+        )
+        self.assertEqual(
+            bridge_runtime_status.read_status(self.root, session_id=1), first
+        )
+
+    def test_windows_session_query_failure_uses_a_process_scoped_file(self):
+        with mock.patch.object(
+            bridge_runtime_status.sys,
+            "platform",
+            "win32",
+        ), mock.patch.object(
+            bridge_runtime_status,
+            "_default_status_scope",
+            bridge_runtime_status._STATUS_SCOPE_UNSET,
+        ), mock.patch(
+            "ovb_rc003.single_instance.current_process_session_id",
+            side_effect=OSError("session unavailable"),
+        ):
+            path = bridge_runtime_status.status_path(self.root)
+
+        self.assertEqual(
+            path.name,
+            f"bridge-runtime-status-p{os.getpid()}.json",
+        )
+
+    def test_default_windows_scope_stays_fixed_after_query_result_changes(self):
+        for initial, later, expected in (
+            (7, OSError("later failure"), "bridge-runtime-status-s7.json"),
+            (
+                OSError("initial failure"),
+                7,
+                f"bridge-runtime-status-p{os.getpid()}.json",
+            ),
+        ):
+            with self.subTest(initial=initial), mock.patch.object(
+                bridge_runtime_status.sys,
+                "platform",
+                "win32",
+            ), mock.patch.object(
+                bridge_runtime_status,
+                "_default_status_scope",
+                bridge_runtime_status._STATUS_SCOPE_UNSET,
+            ), mock.patch(
+                "ovb_rc003.single_instance.current_process_session_id",
+                side_effect=(initial, later),
+            ) as session_query:
+                first = bridge_runtime_status.status_path(self.root)
+                second = bridge_runtime_status.status_path(self.root)
+
+            self.assertEqual(first, second)
+            self.assertEqual(first.name, expected)
+            self.assertEqual(session_query.call_count, 1)
+
+    def test_windows_session_never_falls_back_to_the_legacy_shared_file(self):
+        legacy_path = self.root / bridge_runtime_status.STATUS_FILENAME
+        legacy_path.write_text(
+            json.dumps(
+                {
+                    "schema": bridge_runtime_status.SCHEMA_VERSION,
+                    "state": "connected",
+                    "pid": 1111,
+                    "updated_at": 1.0,
+                }
+            ),
+            encoding="utf-8",
+        )
+        with mock.patch.object(
+            bridge_runtime_status.sys,
+            "platform",
+            "win32",
+        ), mock.patch.object(
+            bridge_runtime_status,
+            "_default_status_scope",
+            bridge_runtime_status._STATUS_SCOPE_UNSET,
+        ), mock.patch(
+            "ovb_rc003.single_instance.current_process_session_id",
+            return_value=2,
+        ):
+            self.assertIsNone(bridge_runtime_status.read_status(self.root))
+            self.assertFalse(bridge_runtime_status.clear_status(self.root))
+
+        self.assertTrue(legacy_path.exists())
+
+    def test_negative_or_boolean_session_id_is_rejected(self):
+        for session_id in (-1, True):
+            with self.subTest(session_id=session_id), self.assertRaises(
+                ValueError
+            ):
+                bridge_runtime_status.status_path(
+                    self.root,
+                    session_id=session_id,
+                )
 
     def test_schema_one_status_remains_readable_during_upgrade(self):
         path = bridge_runtime_status.status_path(self.root)
@@ -213,6 +338,66 @@ class BridgeRuntimeStatusTests(unittest.TestCase):
         self.assertIsNotNone(bridge_runtime_status.read_status(self.root))
         self.assertTrue(bridge_runtime_status.clear_status(self.root, pid=2222))
         self.assertIsNone(bridge_runtime_status.read_status(self.root))
+
+    def test_clear_does_not_delete_status_replaced_after_atomic_claim(self):
+        bridge_runtime_status.publish_status(
+            self.root,
+            bridge_runtime_status.BridgeConnectionState.CONNECTED,
+            pid=1111,
+        )
+        original_read = bridge_runtime_status._read_status_file
+
+        def read_claimed_and_replace(path):
+            claimed = original_read(path)
+            bridge_runtime_status.publish_status(
+                self.root,
+                bridge_runtime_status.BridgeConnectionState.WAITING_FOR_DEVICE,
+                pid=2222,
+            )
+            return claimed
+
+        with mock.patch.object(
+            bridge_runtime_status,
+            "_read_status_file",
+            side_effect=read_claimed_and_replace,
+        ):
+            self.assertTrue(
+                bridge_runtime_status.clear_status(self.root, pid=1111)
+            )
+
+        remaining = bridge_runtime_status.read_status(self.root)
+        self.assertIsNotNone(remaining)
+        self.assertEqual(remaining.pid, 2222)
+
+    def test_wrong_pid_restores_claim_without_overwriting_new_status(self):
+        bridge_runtime_status.publish_status(
+            self.root,
+            bridge_runtime_status.BridgeConnectionState.CONNECTED,
+            pid=2222,
+        )
+        original_read = bridge_runtime_status._read_status_file
+
+        def read_claimed_and_replace(path):
+            claimed = original_read(path)
+            bridge_runtime_status.publish_status(
+                self.root,
+                bridge_runtime_status.BridgeConnectionState.WAITING_FOR_DEVICE,
+                pid=3333,
+            )
+            return claimed
+
+        with mock.patch.object(
+            bridge_runtime_status,
+            "_read_status_file",
+            side_effect=read_claimed_and_replace,
+        ):
+            self.assertFalse(
+                bridge_runtime_status.clear_status(self.root, pid=1111)
+            )
+
+        remaining = bridge_runtime_status.read_status(self.root)
+        self.assertIsNotNone(remaining)
+        self.assertEqual(remaining.pid, 3333)
 
     def test_non_positive_pid_is_rejected(self):
         with self.assertRaises(ValueError):
