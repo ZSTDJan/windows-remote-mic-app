@@ -8,14 +8,12 @@ fully unit testable; app.py translates those edges into the selected
 provider's host shortcut protocol.
 
 - The controller reports key-down on mic-button-press and key-up on physical
-  release. Hold providers receive those edges directly; toggle providers may
-  translate each edge into one completed shortcut tap. The device's
-  AUDIO_STOP remains a fallback for machines that expose no release edge.
+  release. Every supported provider receives those hold edges directly. The
+  device's AUDIO_STOP remains a fallback for machines that expose no release
+  edge.
 - Cleanup is provable: reset() reports whether KEY_UP is still owed and never
   leaves the controller thinking a session is active.
 
-``VoiceHostAction.TAP`` remains available for app.py's optional, separate
-"release then tap once" compatibility action. It is not a voice lifecycle.
 """
 
 from __future__ import annotations
@@ -27,7 +25,6 @@ from .key_mapping import VoiceTriggerMode
 
 
 class VoiceHostAction(str, Enum):
-    TAP = "tap"
     KEY_DOWN = "key_down"
     KEY_UP = "key_up"
 

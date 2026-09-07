@@ -368,13 +368,18 @@ Item {
     }
 
     function voiceHotkeyDescription() {
+        if (sogouSelected && root.voiceHotkeyBusy)
+            return qsTr("正在读取搜狗的按住型快捷键。")
+        if (sogouSelected
+                && SettingsController.voiceHotkeySaveState === "retry")
+            return qsTr("未读取到搜狗的按住型快捷键，请重新选择搜狗或直接录入。")
         if (sogouSelected)
-            return qsTr("请在搜狗设置界面修改快捷键，改后自动同步。或结束搜狗语音再修改。")
+            return qsTr("已读取搜狗当前的按住说快捷键。如需修改，请在「搜狗语音界面」修改按住型快捷键，改后自动同步。")
         if (wetypeSelected)
-            return qsTr("按程序记忆；请在微信输入法设置中保持一致")
+            return qsTr("需手动设置，使「微信语音界面的按住型快捷键」和「语音按键」统一。")
         if (windowsDictationSelected)
             return qsTr("Windows 语音输入固定使用 Win+H")
-        return qsTr("仅在%1中按程序记忆")
+        return qsTr("仅在%1中记录按住型快捷键")
             .arg(SettingsController.applicationDisplayName)
     }
 
@@ -918,7 +923,7 @@ Item {
                             color: root.voiceHotkeyRecording
                                 ? tokens.accent : tokens.textPrimary
                             placeholderText: qsTr("点击录入")
-                            Accessible.name: qsTr("语音按键，点击后直接录入")
+                            Accessible.name: qsTr("语音按键，仅支持录入按住型快捷键")
                             Keys.onEscapePressed: root.stopVoiceHotkeyCapture()
                             onActiveFocusChanged: {
                                 if (!activeFocus && root.voiceHotkeyRecording)

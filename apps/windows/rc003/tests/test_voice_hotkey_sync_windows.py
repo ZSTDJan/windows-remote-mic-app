@@ -196,7 +196,8 @@ class WeTypeVoiceHotkeyTests(unittest.TestCase):
 
         self.assertFalse(result.ok)
         self.assertEqual(result.code, "local_only")
-        self.assertIn("不自动打开", result.message)
+        self.assertIn("微信语音界面的按住型快捷键", result.message)
+        self.assertIn("语音按键", result.message)
 
     def test_sync_only_updates_remote_mic_and_keeps_the_normalized_value(self):
         result = voice_hotkey_sync_windows.sync_provider_hotkey(
@@ -206,7 +207,8 @@ class WeTypeVoiceHotkeyTests(unittest.TestCase):
         self.assertTrue(result.ok)
         self.assertEqual(result.code, "local_only")
         self.assertEqual(result.hotkey, "lctrl+lshift+f9")
-        self.assertIn("微信输入法设置", result.message)
+        self.assertIn("微信语音界面的按住型快捷键", result.message)
+        self.assertIn("语音按键", result.message)
 
 
 if __name__ == "__main__":

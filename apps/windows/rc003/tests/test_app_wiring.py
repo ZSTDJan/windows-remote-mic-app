@@ -1130,7 +1130,7 @@ class HostHotkeyFailureSuppressesMicOpenTests(_AppWiringTestCase):
 
         self.assertEqual(calls, [("ralt",)])
 
-    def test_wetype_provider_uses_provider_controller_for_start_and_stop(self):
+    def test_wetype_provider_uses_unmarked_hold_edges_for_start_and_stop(self):
         self.app._config["voice_program"] = (
             voice_program_manager.normalize_voice_program_settings(
                 {"provider": voice_program_manager.VOICE_PROGRAM_WETYPE}
@@ -1139,17 +1139,7 @@ class HostHotkeyFailureSuppressesMicOpenTests(_AppWiringTestCase):
         self.app._voice_hotkey = app_module.hotkey.HotkeySpec.parse(
             "lctrl+lshift+f9"
         )
-        calls = []
-
         with mock.patch.object(
-            self.app._wetype_voice_control,
-            "start",
-            side_effect=lambda tokens: calls.append(("wetype_start", tokens)) or True,
-        ), mock.patch.object(
-            self.app._wetype_voice_control,
-            "stop",
-            side_effect=lambda tokens: calls.append(("wetype_stop", tokens)) or True,
-        ), mock.patch.object(
             win32_input,
             "send_wetype_voice_key_combo_down",
         ) as wetype_down, mock.patch.object(
@@ -1174,15 +1164,8 @@ class HostHotkeyFailureSuppressesMicOpenTests(_AppWiringTestCase):
             )
 
         expected_tokens = ("lctrl", "lshift", "f9")
-        self.assertEqual(
-            calls,
-            [
-                ("wetype_start", expected_tokens),
-                ("wetype_stop", expected_tokens),
-            ],
-        )
-        wetype_down.assert_not_called()
-        wetype_up.assert_not_called()
+        wetype_down.assert_called_once_with(expected_tokens)
+        wetype_up.assert_called_once_with(expected_tokens)
         marked_tap.assert_not_called()
         marked_down.assert_not_called()
         marked_up.assert_not_called()
@@ -1220,7 +1203,7 @@ class HostHotkeyFailureSuppressesMicOpenTests(_AppWiringTestCase):
         )
         self.assertIsNone(self.app._voice_hotkey_release_pending)
 
-    def test_wetype_physical_release_waits_for_audio_stop_before_second_tap(self):
+    def test_wetype_physical_release_sends_key_up_without_waiting_for_audio_stop(self):
         self.app._config["voice_program"] = (
             voice_program_manager.normalize_voice_program_settings(
                 {"provider": voice_program_manager.VOICE_PROGRAM_WETYPE}
@@ -1232,13 +1215,13 @@ class HostHotkeyFailureSuppressesMicOpenTests(_AppWiringTestCase):
         calls = []
 
         with mock.patch.object(
-            self.app._wetype_voice_control,
-            "start",
-            side_effect=lambda tokens: calls.append(("start", tokens)) or True,
+            win32_input,
+            "send_wetype_voice_key_combo_down",
+            side_effect=lambda tokens: calls.append(("down", tokens)),
         ), mock.patch.object(
-            self.app._wetype_voice_control,
-            "stop",
-            side_effect=lambda tokens: calls.append(("stop", tokens)) or True,
+            win32_input,
+            "send_wetype_voice_key_combo_up",
+            side_effect=lambda tokens: calls.append(("up", tokens)),
         ):
             self.app._handle_mic_button_pressed()
             self.app._voice_audio_stream_active = True
@@ -1250,11 +1233,14 @@ class HostHotkeyFailureSuppressesMicOpenTests(_AppWiringTestCase):
                 )
             )
 
-            self.assertTrue(self.app._voice.active)
-            self.assertTrue(self.app._voice_pcm_forwarding_enabled)
+            self.assertFalse(self.app._voice.active)
+            self.assertFalse(self.app._voice_pcm_forwarding_enabled)
             self.assertEqual(
                 calls,
-                [("start", ("lctrl", "lshift", "f9"))],
+                [
+                    ("down", ("lctrl", "lshift", "f9")),
+                    ("up", ("lctrl", "lshift", "f9")),
+                ],
             )
 
             self.app._on_control_event(AudioStopped())
@@ -1264,8 +1250,8 @@ class HostHotkeyFailureSuppressesMicOpenTests(_AppWiringTestCase):
         self.assertEqual(
             calls,
             [
-                ("start", ("lctrl", "lshift", "f9")),
-                ("stop", ("lctrl", "lshift", "f9")),
+                ("down", ("lctrl", "lshift", "f9")),
+                ("up", ("lctrl", "lshift", "f9")),
             ],
         )
 
@@ -1305,8 +1291,8 @@ class HostHotkeyFailureSuppressesMicOpenTests(_AppWiringTestCase):
             )
         )
         with mock.patch.object(
-            self.app._wetype_voice_control,
-            "start",
+            win32_input,
+            "send_wetype_voice_key_combo_down",
             side_effect=win32_input.InputCleanupIncompleteError(
                 "simulated stuck WeType modifier"
             ),

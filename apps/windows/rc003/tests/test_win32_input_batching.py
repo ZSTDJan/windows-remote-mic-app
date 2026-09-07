@@ -947,28 +947,6 @@ class WeTypeVoiceKeyComboTests(unittest.TestCase):
         self.assertEqual(calls[1], [(ctrl, True)])
         self.assertNotIn((f9, True), calls[1])
 
-    def test_wetype_tap_uses_separate_batches_with_vibe_flow_hold(self):
-        sender = RecordingSender()
-        delays = []
-
-        win32_input.send_wetype_voice_key_combo_tap(
-            ("lctrl", "f9"),
-            _sender=sender,
-            _sleep=delays.append,
-        )
-
-        ctrl = win32_input.win32_keys.VK_CODES["lctrl"]
-        f9 = win32_input.win32_keys.VK_CODES["f9"]
-        self.assertEqual(
-            sender.calls,
-            [
-                [(ctrl, False), (f9, False)],
-                [(f9, True), (ctrl, True)],
-            ],
-        )
-        self.assertEqual(delays, [0.08])
-
-
 class VolumeTests(unittest.TestCase):
     def test_volume_up_taps_the_volume_up_key(self):
         sender = RecordingSender()

@@ -10330,11 +10330,15 @@ class SettingsShellSourceContractTests(unittest.TestCase):
         self.assertIn('titleText: qsTr("麦克风权限")', self.voice_qml)
         self.assertNotIn('stateText: qsTr("待确认")', self.voice_qml)
         self.assertIn(
-            'qsTr("请在搜狗设置界面修改快捷键，改后自动同步。或结束搜狗语音再修改。")',
+            'qsTr("已读取搜狗当前的按住说快捷键。如需修改，请在「搜狗语音界面」修改按住型快捷键，改后自动同步。")',
             self.voice_qml,
         )
         self.assertIn(
-            'qsTr("按程序记忆；请在微信输入法设置中保持一致")',
+            'qsTr("未读取到搜狗的按住型快捷键，请重新选择搜狗或直接录入。")',
+            self.voice_qml,
+        )
+        self.assertIn(
+            'qsTr("需手动设置，使「微信语音界面的按住型快捷键」和「语音按键」统一。")',
             self.voice_qml,
         )
         self.assertIn('? qsTr("录入中")', self.voice_qml)
@@ -10484,11 +10488,15 @@ class SettingsShellSourceContractTests(unittest.TestCase):
     def test_voice_hotkey_field_is_owned_by_the_voice_page(self):
         self.assertIn('placeholderText: qsTr("点击录入")', self.voice_qml)
         self.assertIn(
-            'qsTr("请在搜狗设置界面修改快捷键，改后自动同步。或结束搜狗语音再修改。")',
+            'qsTr("已读取搜狗当前的按住说快捷键。如需修改，请在「搜狗语音界面」修改按住型快捷键，改后自动同步。")',
             self.voice_qml,
         )
         self.assertIn(
-            'qsTr("按程序记忆；请在微信输入法设置中保持一致")',
+            'qsTr("需手动设置，使「微信语音界面的按住型快捷键」和「语音按键」统一。")',
+            self.voice_qml,
+        )
+        self.assertIn(
+            'Accessible.name: qsTr("语音按键，仅支持录入按住型快捷键")',
             self.voice_qml,
         )
         self.assertIn('objectName: "openVoiceProgramSettingsButton"', self.voice_qml)

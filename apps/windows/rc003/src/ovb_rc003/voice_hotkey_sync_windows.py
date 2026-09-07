@@ -103,10 +103,10 @@ def read_provider_hotkey(
         voice_program_manager.VOICE_PROGRAM_CUSTOM,
     }:
         message = (
-            f"微信输入法快捷键由{product_identity.DISPLAY_NAME}按程序记忆，"
-            "不自动打开或修改微信设置。"
+            "需手动设置，使「微信语音界面的按住型快捷键」和"
+            "「语音按键」统一。"
             if provider == voice_program_manager.VOICE_PROGRAM_WETYPE
-            else f"该程序只使用{product_identity.DISPLAY_NAME}内的快捷键。"
+            else f"该程序只使用{product_identity.DISPLAY_NAME}内记录的按住型快捷键。"
         )
         return VoiceHotkeySyncResult(
             provider, False, "local_only", message=message
@@ -148,7 +148,7 @@ def sync_provider_hotkey(
     }:
         message = (
             f"快捷键已保存到{product_identity.DISPLAY_NAME}；"
-            "请在微信输入法设置中保持一致。"
+            "请使「微信语音界面的按住型快捷键」和「语音按键」统一。"
             if provider == voice_program_manager.VOICE_PROGRAM_WETYPE
             else f"快捷键已保存到{product_identity.DISPLAY_NAME}。"
         )
@@ -242,7 +242,12 @@ def _read_sogou_hotkey(*, appdata: Optional[Path]) -> VoiceHotkeySyncResult:
             provider, False, "read_failed", message=f"读取搜狗快捷键失败：{exc}"
         )
     return VoiceHotkeySyncResult(
-        provider, True, "read", shortcut, "已读取搜狗当前的按住说快捷键。"
+        provider,
+        True,
+        "read",
+        shortcut,
+        "已读取搜狗当前的按住说快捷键。如需修改，请在"
+        "「搜狗语音界面」修改按住型快捷键，改后自动同步。",
     )
 
 
