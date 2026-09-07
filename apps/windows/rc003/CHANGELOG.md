@@ -56,6 +56,15 @@
    `bugs/BUG-025-bridge-startup-readiness-warning.md`、
 `bugs/BUG-026-bridge-liveness-and-first-key-readiness.md` 和 `TESTING.md`。
 
+### 2026-09-07 管理员组件不可用时的按键安全降级
+
+- 修正一个无权限降级例外：Windows 不认识、但曾学习为逻辑键的实体按键，在 HID tap
+  尚未接管时不再执行自定义映射。
+- HID tap 未接管时，全部 Raw Input 自定义映射统一停用；Windows 已知键只保留系统原始
+  行为和补松保护，未知键不注入操作，按键检测仍可用。HID tap 恢复后映射正常恢复。
+- 发布前复核覆盖按键交接、重复与长按、异常补松、语音释放、单实例、自启和管理员助手；
+  `candidate.24` 异机日志未发现错误、连击或锁键证据。
+
 ### 2026-09-08 candidate.24 微信按钮控制与便携测试包 024
 
 - 微信输入法改为唯一使用状态栏语音按钮控制，话筒键按下时打开语音窗口，松开时结束；

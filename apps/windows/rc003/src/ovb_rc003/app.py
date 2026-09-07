@@ -354,7 +354,6 @@ class RC003App:
         self._raw_fallback_tracking_active = False
         self._raw_fallback_hold_guards: dict[str, tuple[object, object]] = {}
         self._raw_fallback_timer_factory = threading.Timer
-        self._raw_mapped_buttons_down: set[str] = set()
         self._input_rearm_blocked_buttons: set[str] = set()
         self._key_detection_suppressed_buttons: set[str] = set()
         self._key_detection_suppression_deadlines: dict[str, float] = {}
@@ -796,14 +795,9 @@ class RC003App:
                 raw_fallback_buttons
             )
         )
-        affected_buttons = (
-            raw_fallback_buttons
-            | set(self._raw_mapped_buttons_down)
-            | tracked_physical_buttons
-        )
+        affected_buttons = raw_fallback_buttons | tracked_physical_buttons
         self._cancel_all_raw_fallback_hold_guards_locked()
         self._raw_fallback_buttons_down.clear()
-        self._raw_mapped_buttons_down.clear()
         if affected_buttons:
             self._cancel_input_gestures(
                 affected_buttons,
@@ -1621,7 +1615,6 @@ class RC003App:
             self._cancel_all_raw_fallback_hold_guards_locked()
             lost_buttons = (
                 raw_fallback_buttons
-                | set(self._raw_mapped_buttons_down)
                 | tracked_physical_buttons
                 | direct_buttons
                 | set(self._input_rearm_blocked_buttons)
@@ -1630,7 +1623,6 @@ class RC003App:
             self._direct_hid_interception_armed = False
             self._direct_hid_handover_waiting_for_neutral = False
             self._raw_fallback_buttons_down.clear()
-            self._raw_mapped_buttons_down.clear()
             self._input_rearm_blocked_buttons.clear()
             # The Raw Input collection can be re-enumerated while the
             # separately owned HID tap is still alive. Preserve a guard for
@@ -1849,7 +1841,6 @@ class RC003App:
                     windows_buttons_down is None
                 )
                 windows_buttons_down = windows_buttons_down or set()
-                raw_mapped_buttons = set(self._raw_mapped_buttons_down)
                 tracked_logical_buttons, tracked_physical_buttons = (
                     self._raw_fallback_tracked_button_ids_locked()
                 )
@@ -1863,8 +1854,7 @@ class RC003App:
                     )
                 )
                 handover_buttons = (
-                    raw_mapped_buttons
-                    | raw_fallback_buttons
+                    raw_fallback_buttons
                     | tracked_physical_buttons
                     | windows_buttons_down
                 )
@@ -1879,7 +1869,6 @@ class RC003App:
                     reason="hid_tap_handover",
                 )
                 self._raw_fallback_buttons_down.clear()
-                self._raw_mapped_buttons_down.clear()
             elif not interception_armed:
                 self._direct_hid_handover_waiting_for_neutral = False
             self._direct_hid_interception_armed = interception_armed
@@ -2106,7 +2095,6 @@ class RC003App:
             self._raw_fallback_buttons_down.clear()
             self._raw_fallback_physical_buttons_down.clear()
             self._raw_fallback_release_debts.clear()
-            self._raw_mapped_buttons_down.clear()
             self._input_rearm_blocked_buttons.clear()
         self._key_detection_suppressed_buttons.clear()
         self._key_detection_suppression_deadlines.clear()
@@ -2993,15 +2981,16 @@ class RC003App:
                 ):
                     return
 
+                # Raw Input can observe Windows' original key event, but it
+                # cannot suppress that event. Until the HID tap owns the
+                # report, every custom mapping must therefore fail closed.
+                raw_mapping_bypassed = True
+
                 if button_id in self._raw_fallback_buttons_down:
                     if not is_pressed:
                         self._cancel_raw_fallback_hold_guard_locked(button_id)
                         self._raw_fallback_buttons_down.discard(button_id)
-                    raw_mapping_bypassed = True
 
-                elif button_id in self._raw_mapped_buttons_down:
-                    if not is_pressed:
-                        self._raw_mapped_buttons_down.discard(button_id)
                 else:
                     effective_windows_button = raw_windows_button_id
                     if (
@@ -3035,9 +3024,13 @@ class RC003App:
                                 button_id,
                                 event_source,
                             )
-                        raw_mapping_bypassed = True
                     elif is_pressed:
-                        self._raw_mapped_buttons_down.add(button_id)
+                        self._logger.warning(
+                            "RC003 mapping bypassed for non-intercepted input; "
+                            "no Windows original available: button=%s source=%s",
+                            button_id,
+                            event_source,
+                        )
         if is_pressed:
             self._record_runtime_button(event_source)
         if button_id == "mic":
