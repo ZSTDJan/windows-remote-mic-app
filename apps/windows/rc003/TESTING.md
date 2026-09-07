@@ -2153,7 +2153,7 @@ Windows 语音输入的结论继续有效。
 
 - 覆盖范围：`CHECK-DESKTOP-015` 的三页用户流程，以及微信输入法直接语音按钮控制；微信
   不再录入或执行快捷键，搜狗、自定义程序和 Windows 语音输入保持原路径。
-- 自动结果：`build/build-candidate.ps1` 唯一完整入口通过；unittest 2523 项通过、7 项按环境
+- 自动结果：`build/build-candidate.ps1` 唯一完整入口通过；unittest 2516 项通过、7 项按环境
   跳过，资源释放门禁、公开边界、第三方通知、PyInstaller、主程序 `--dry-run`、管理员 HID
   助手 `--self-check` 和 Qt 运行时检查全部通过。
 - 构建来源：提交 `44a4280`；输入 219 个文件，来源指纹 SHA-256 为
