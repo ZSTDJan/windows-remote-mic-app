@@ -1,11 +1,13 @@
 # Changelog — 无线麦 RC003 (Windows)
 
-本项目按“候选发布”打标签。内部构建版本号唯一来源是
+候选阶段使用持续递增的 `candidate.N` 测试序号。内部构建版本号唯一来源是
 `src/ovb_rc003/VERSION`（当前 `0.2.0-candidate.23`），程序、冻结构建、安装器和 CI
 包装都读取该文件，
 仓库级 tag 只作为发布编号，两者对应关系以每条发布说明为准。
 
-标签格式：`v<内部版本>-windows-rc003-candidate.<序号>`。
+正式版把最终采用的候选序号放在最后一位：采用 `candidate.23` 时发布为 `v1.0.23`，
+后续候选继续从 `candidate.24` 递增。正式 tag 不带 `windows`、`rc003` 或 `candidate`。
+完整命名规则以 `VALIDATION-AND-DELIVERY.md` 的“正式发布”为准。
 
 ## [Unreleased] — 2026-08-23
 
