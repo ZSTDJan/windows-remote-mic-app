@@ -108,7 +108,17 @@ $autostartMarkers = @("CurrentVersion\Run", "userstartup")
 # bare directory-name path component (see Get-NormalizedRelativePath),
 # so this is independent of which OS/shell produced the path separators.
 $excludedDirNames = @(".venv", "dist", "pyinstaller-work", "third_party")
-$excludedRootFilePatterns = @("无线麦便携测试包-*.zip")
+$localTestPackagePrefix = -join @(
+    [char]0x65E0,
+    [char]0x7EBF,
+    [char]0x9EA6,
+    [char]0x4FBF,
+    [char]0x643A,
+    [char]0x6D4B,
+    [char]0x8BD5,
+    [char]0x5305
+)
+$excludedRootFilePatterns = @("$localTestPackagePrefix-*.zip")
 
 # Files that legitimately *define* the forbidden-term lists above, a
 # negative-test fixture, or a documented EXCLUSION statement - skip ONLY the

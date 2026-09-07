@@ -2539,6 +2539,11 @@ class PublicBoundaryScriptTests(unittest.TestCase):
     def setUp(self):
         self.text = _PUBLIC_BOUNDARY_PATH.read_text(encoding="utf-8")
 
+    def test_local_test_packages_are_excluded_without_utf8_script_literals(self):
+        self.assertIn("$localTestPackagePrefix", self.text)
+        for codepoint in ("65E0", "7EBF", "9EA6", "4FBF", "643A", "6D4B", "8BD5", "5305"):
+            self.assertIn(f"[char]0x{codepoint}", self.text)
+
     def test_timestamped_generated_directories_match_python_replay(self):
         self.assertIn('$component -like "dist-*"', self.text)
         self.assertIn('$component -like "build-*"', self.text)
