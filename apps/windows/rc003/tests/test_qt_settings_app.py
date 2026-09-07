@@ -2090,13 +2090,25 @@ class SettingsControllerTests(unittest.TestCase):
             "lctrl+lshift+f9",
         )
 
-    def test_selecting_wetype_uses_its_remembered_default_without_an_error(self):
+    def test_selecting_wetype_keeps_legacy_memory_without_requiring_it(self):
         controller, _ = self._make_controller()
 
         controller.selectedVoiceProgramIndex = 2
 
         self.assertEqual(controller.holdVoiceHotkeyText, "lctrl+lwin")
         self.assertEqual(controller.errorMessage, "")
+
+    def test_wetype_ignores_direct_shortcut_edits(self):
+        controller, _ = self._make_controller()
+        controller.selectedVoiceProgramIndex = 2
+        previous = controller.holdVoiceHotkeyText
+        self._voice_hotkey_sync_mock.reset_mock()
+
+        controller.holdVoiceHotkeyText = "ctrl+shift+f9"
+
+        self.assertEqual(controller.holdVoiceHotkeyText, previous)
+        self.assertEqual(controller.voiceHotkeySaveState, "saved")
+        self._voice_hotkey_sync_mock.assert_not_called()
 
     def test_provider_sync_failure_restores_the_previous_shortcut(self):
         controller, _ = self._make_controller()
@@ -5528,6 +5540,18 @@ class SettingsControllerTests(unittest.TestCase):
         self.assertEqual(controller._input_operation_phase, "active")
         self.assertEqual(errors, ["另一项按键输入操作正在进行，请先结束。"])
 
+    def test_hotkey_start_is_disabled_for_wetype_panel_control(self):
+        controller, _ = self._make_controller()
+        controller.selectedVoiceProgramIndex = 2
+
+        with mock.patch.object(
+            controller,
+            "_begin_input_operation_start",
+        ) as begin:
+            self.assertFalse(controller.startHotkeyCapture())
+
+        begin.assert_not_called()
+
     def test_hotkey_stop_failure_retains_capture_for_retry(self):
         controller, _ = self._make_controller()
         capture = mock.Mock()
@@ -8872,6 +8896,16 @@ result["actual_speech_cases"] = {
         physicalizer_state="failed"
     ),
     "hotkey_retry": actual_speech_case(hotkey_state="retry"),
+    "wetype_ignores_physicalizer": actual_speech_case(
+        provider="wetype",
+        program_status="running",
+        physicalizer_state="failed",
+    ),
+    "wetype_ignores_hotkey_retry": actual_speech_case(
+        provider="wetype",
+        program_status="running",
+        hotkey_state="retry",
+    ),
     "diagnostics_missing": actual_speech_case(diagnostics_ready=False),
     "audio_missing": actual_speech_case(
         cable_status="fail",
@@ -10426,6 +10460,12 @@ class SettingsShellSourceContractTests(unittest.TestCase):
             'qsTr("仅支持录入“按住型”快捷键")',
             self.voice_qml,
         )
+        self.assertIn(
+            'qsTr("无线麦直接控制微信语音，无需设置快捷键")',
+            self.voice_qml,
+        )
+        self.assertIn('text: root.wetypeSelected', self.voice_qml)
+        self.assertIn('? qsTr("无需设置")', self.voice_qml)
         self.assertIn("SettingsController.hotkeyCaptureReady", self.voice_qml)
         self.assertIn('qsTr("准备中")', self.voice_qml)
         self.assertIn('qsTr("正在准备…")', self.voice_qml)
@@ -10581,9 +10621,12 @@ class SettingsShellSourceContractTests(unittest.TestCase):
             self.voice_qml,
         )
         self.assertIn(
-            'Accessible.name: qsTr("语音按键，仅支持录入按住型快捷键")',
+            'qsTr("语音按键，仅支持录入按住型快捷键")',
             self.voice_qml,
         )
+        self.assertIn('qsTr("微信语音无需设置快捷键")', self.voice_qml)
+        self.assertIn("windowsDictationSelected || wetypeSelected", self.voice_qml)
+        self.assertIn("&& !root.wetypeSelected", self.voice_qml)
         self.assertIn('objectName: "openVoiceProgramSettingsButton"', self.voice_qml)
         self.assertIn(
             "if (!SettingsController.startHotkeyCapture())",
@@ -10892,6 +10935,7 @@ class ThreePageSettingsSourceContractTests(unittest.TestCase):
             "SettingsController.voiceKeyPhysicalizerState",
             self.voice_qml,
         )
+        self.assertIn("if (!root.wetypeSelected)", self.voice_qml)
         self.assertIn(
             "SettingsController.refreshVoiceProgramStatus()",
             self.voice_qml,
@@ -11511,6 +11555,8 @@ class OffscreenQmlLoadTests(unittest.TestCase):
             "voice_physicalizer_recovering": ("请稍候", "当前操作完成后再试", "试说一句", False),
             "voice_physicalizer_failed": ("请重启服务", "先到设备页重启服务", "打开设备", True),
             "hotkey_retry": ("请录入", "先重新录入语音按键", "重新录入", True),
+            "wetype_ignores_physicalizer": ("待实测", "在输入框中验证语音文字", "试说一句", True),
+            "wetype_ignores_hotkey_retry": ("待实测", "在输入框中验证语音文字", "试说一句", True),
             "diagnostics_missing": ("请检查", "先重新检查音频配置", "重新检查", True),
             "audio_missing": ("请装音频", "先安装虚拟音频并重启电脑", "安装音频", True),
             "audio_check_failed": ("请检查", "先重新检查虚拟音频", "重新检查", True),

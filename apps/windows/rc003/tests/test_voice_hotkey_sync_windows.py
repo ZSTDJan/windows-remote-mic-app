@@ -278,80 +278,35 @@ class SogouVoiceHotkeyTests(unittest.TestCase):
 
 
 class WeTypeVoiceHotkeyTests(unittest.TestCase):
-    def test_read_uses_the_per_program_memory_without_opening_wetype(self):
+    def test_read_reports_that_wetype_does_not_need_a_shortcut(self):
         result = voice_hotkey_sync_windows.read_provider_hotkey(
             "wetype", platform="win32"
         )
 
         self.assertFalse(result.ok)
         self.assertEqual(result.code, "local_only")
-        self.assertIn("微信语音界面的按住型快捷键", result.message)
-        self.assertIn("语音按键", result.message)
+        self.assertIn("直接控制微信语音", result.message)
+        self.assertIn("无需设置快捷键", result.message)
 
-    def test_sync_only_updates_remote_mic_and_keeps_the_normalized_value(self):
+    def test_sync_is_disabled_for_wetype_panel_control(self):
         result = voice_hotkey_sync_windows.sync_provider_hotkey(
             "wetype", "lctrl+lshift+f9", platform="win32"
         )
 
-        self.assertTrue(result.ok)
-        self.assertEqual(result.code, "local_only")
-        self.assertEqual(result.hotkey, "lctrl+lshift+f9")
-        self.assertIn("微信语音界面的按住型快捷键", result.message)
-        self.assertIn("语音按键", result.message)
-
-    def test_accepts_wetype_ctrl_win_and_common_three_key_shortcut(self):
-        for shortcut in ("lctrl+lwin", "lctrl+lshift+f9"):
-            with self.subTest(shortcut=shortcut):
-                result = voice_hotkey_sync_windows.validate_provider_hotkey(
-                    "wetype", shortcut
-                )
-
-                self.assertTrue(result.ok)
-                self.assertEqual(result.hotkey, shortcut)
-
-    def test_rejects_wetype_single_letter_without_saving_it(self):
-        result = voice_hotkey_sync_windows.sync_provider_hotkey(
-            "wetype", "a", platform="win32"
-        )
-
         self.assertFalse(result.ok)
-        self.assertEqual(result.code, "missing_modifier")
+        self.assertEqual(result.code, "not_required")
         self.assertEqual(result.hotkey, "")
+        self.assertIn("无需设置快捷键", result.message)
 
-    def test_rejects_wetype_shortcut_longer_than_three_keys(self):
-        result = voice_hotkey_sync_windows.validate_provider_hotkey(
-            "wetype", "lctrl+lshift+lalt+f9"
-        )
-
-        self.assertFalse(result.ok)
-        self.assertEqual(result.code, "too_many_keys")
-
-    def test_rejects_wetype_blocked_function_key(self):
-        for shortcut in ("lctrl+volume_up", "lctrl+vk_5f", "lctrl+vk_b4"):
+    def test_validation_is_disabled_for_every_wetype_shortcut(self):
+        for shortcut in ("lctrl+lwin", "lctrl+lshift+f9", "a", ""):
             with self.subTest(shortcut=shortcut):
                 result = voice_hotkey_sync_windows.validate_provider_hotkey(
                     "wetype", shortcut
                 )
 
                 self.assertFalse(result.ok)
-                self.assertEqual(result.code, "unsupported_key")
-
-    def test_rejects_wetype_equivalent_modifier_duplicates(self):
-        result = voice_hotkey_sync_windows.validate_provider_hotkey(
-            "wetype", "lctrl+rctrl"
-        )
-
-        self.assertFalse(result.ok)
-        self.assertEqual(result.code, "duplicate_modifier")
-
-    def test_rejects_wetype_windows_reserved_shortcut(self):
-        result = voice_hotkey_sync_windows.validate_provider_hotkey(
-            "wetype", "lctrl+lshift"
-        )
-
-        self.assertFalse(result.ok)
-        self.assertEqual(result.code, "reserved_hotkey")
-        self.assertIn("微信输入法不接受", result.message)
+                self.assertEqual(result.code, "not_required")
 
     def test_custom_program_keeps_unrestricted_single_key_support(self):
         result = voice_hotkey_sync_windows.sync_provider_hotkey(

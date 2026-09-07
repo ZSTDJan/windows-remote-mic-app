@@ -135,32 +135,5 @@ class InputStructShapeTests(unittest.TestCase):
                     | win32_input._KEYEVENTF_EXTENDEDKEY,
                 )
 
-    def test_wetype_builder_uses_unmarked_virtual_keys_without_scan_codes(self):
-        vk_codes = [
-            win32_input.win32_keys.VK_CODES[name]
-            for name in ("lctrl", "lshift", "f9")
-        ]
-        events = [(vk, False) for vk in vk_codes] + [
-            (vk, True) for vk in reversed(vk_codes)
-        ]
-
-        array, input_type = win32_input._build_virtual_key_input_array(events)
-
-        self.assertIs(input_type, win32_input.INPUT)
-        for index, (vk, key_up) in enumerate(events):
-            keybd = array[index].union.ki
-            self.assertEqual(keybd.wVk, vk)
-            self.assertEqual(keybd.wScan, 0)
-            self.assertEqual(keybd.dwExtraInfo, 0)
-            self.assertEqual(
-                keybd.dwFlags & win32_input._KEYEVENTF_SCANCODE,
-                0,
-            )
-            self.assertEqual(
-                bool(keybd.dwFlags & win32_input._KEYEVENTF_KEYUP),
-                key_up,
-            )
-
-
 if __name__ == "__main__":
     unittest.main()

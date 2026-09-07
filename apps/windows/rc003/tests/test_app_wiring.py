@@ -1130,24 +1130,17 @@ class HostHotkeyFailureSuppressesMicOpenTests(_AppWiringTestCase):
 
         self.assertEqual(calls, [("ralt",)])
 
-    def test_wetype_provider_uses_unmarked_hold_edges_for_start_and_stop(self):
+    def test_wetype_provider_uses_panel_control_for_start_and_stop(self):
         self.app._config["voice_program"] = (
             voice_program_manager.normalize_voice_program_settings(
                 {"provider": voice_program_manager.VOICE_PROGRAM_WETYPE}
             )
         )
-        self.app._voice_hotkey = app_module.hotkey.HotkeySpec.parse(
-            "lctrl+lshift+f9"
-        )
+        wetype_control = mock.Mock()
+        wetype_control.start.return_value = True
+        wetype_control.stop.return_value = True
+        self.app._wetype_voice_control = wetype_control
         with mock.patch.object(
-            win32_input,
-            "send_wetype_voice_key_combo_down",
-        ) as wetype_down, mock.patch.object(
-            win32_input,
-            "send_wetype_voice_key_combo_up",
-        ) as wetype_up, mock.patch.object(
-            win32_input, "send_voice_key_combo_tap"
-        ) as marked_tap, mock.patch.object(
             win32_input, "send_voice_key_combo_down"
         ) as marked_down, mock.patch.object(
             win32_input, "send_voice_key_combo_up"
@@ -1163,13 +1156,39 @@ class HostHotkeyFailureSuppressesMicOpenTests(_AppWiringTestCase):
                 )
             )
 
-        expected_tokens = ("lctrl", "lshift", "f9")
-        wetype_down.assert_called_once_with(expected_tokens)
-        wetype_up.assert_called_once_with(expected_tokens)
-        marked_tap.assert_not_called()
+        wetype_control.start.assert_called_once_with()
+        wetype_control.stop.assert_called_once_with()
         marked_down.assert_not_called()
         marked_up.assert_not_called()
         self.assertIsNone(self.app._voice_hotkey_release_pending)
+
+    def test_wetype_panel_open_failure_suppresses_mic_open(self):
+        self.app._config["voice_program"] = (
+            voice_program_manager.normalize_voice_program_settings(
+                {"provider": voice_program_manager.VOICE_PROGRAM_WETYPE}
+            )
+        )
+        self.app._wetype_voice_control = mock.Mock()
+        self.app._wetype_voice_control.start.return_value = False
+
+        self.app._handle_mic_button_pressed()
+
+        self.assertEqual(self.app._ble_session.mic_open_calls, 0)
+        self.assertFalse(self.app._voice.active)
+
+    def test_wetype_mapping_does_not_require_a_keyboard_shortcut_backend(self):
+        self.app._config["voice_program"] = (
+            voice_program_manager.normalize_voice_program_settings(
+                {"provider": voice_program_manager.VOICE_PROGRAM_WETYPE}
+            )
+        )
+        action = self.app._primary_button_action("mic")
+        with mock.patch.object(
+            win32_input,
+            "can_begin_tracked_hold",
+            side_effect=AssertionError("WeType must not inspect keyboard tracking"),
+        ):
+            self.assertTrue(self.app._prepare_voice_mapping_locked("mic", action))
 
     def test_successful_hold_down_is_owned_until_matching_key_up(self):
         calls = []
@@ -1203,26 +1222,18 @@ class HostHotkeyFailureSuppressesMicOpenTests(_AppWiringTestCase):
         )
         self.assertIsNone(self.app._voice_hotkey_release_pending)
 
-    def test_wetype_physical_release_sends_key_up_without_waiting_for_audio_stop(self):
+    def test_wetype_physical_release_finishes_panel_without_waiting_for_audio_stop(self):
         self.app._config["voice_program"] = (
             voice_program_manager.normalize_voice_program_settings(
                 {"provider": voice_program_manager.VOICE_PROGRAM_WETYPE}
             )
         )
-        self.app._voice_hotkey = app_module.hotkey.HotkeySpec.parse(
-            "lctrl+lshift+f9"
-        )
-        calls = []
+        wetype_control = mock.Mock()
+        wetype_control.start.return_value = True
+        wetype_control.stop.return_value = True
+        self.app._wetype_voice_control = wetype_control
 
-        with mock.patch.object(
-            win32_input,
-            "send_wetype_voice_key_combo_down",
-            side_effect=lambda tokens: calls.append(("down", tokens)),
-        ), mock.patch.object(
-            win32_input,
-            "send_wetype_voice_key_combo_up",
-            side_effect=lambda tokens: calls.append(("up", tokens)),
-        ):
+        with mock.patch.object(win32_input, "send_voice_key_combo_down") as marked_down:
             self.app._handle_mic_button_pressed()
             self.app._voice_audio_stream_active = True
             self.assertTrue(self.app._voice_pcm_forwarding_enabled)
@@ -1235,25 +1246,15 @@ class HostHotkeyFailureSuppressesMicOpenTests(_AppWiringTestCase):
 
             self.assertFalse(self.app._voice.active)
             self.assertFalse(self.app._voice_pcm_forwarding_enabled)
-            self.assertEqual(
-                calls,
-                [
-                    ("down", ("lctrl", "lshift", "f9")),
-                    ("up", ("lctrl", "lshift", "f9")),
-                ],
-            )
+            wetype_control.start.assert_called_once_with()
+            wetype_control.stop.assert_called_once_with()
+            marked_down.assert_not_called()
 
             self.app._on_control_event(AudioStopped())
 
         self.assertFalse(self.app._voice.active)
         self.assertFalse(self.app._voice_pcm_forwarding_enabled)
-        self.assertEqual(
-            calls,
-            [
-                ("down", ("lctrl", "lshift", "f9")),
-                ("up", ("lctrl", "lshift", "f9")),
-            ],
-        )
+        wetype_control.stop.assert_called_once_with()
 
     def test_non_wetype_providers_keep_the_marked_voice_backend(self):
         providers = (
@@ -1273,8 +1274,8 @@ class HostHotkeyFailureSuppressesMicOpenTests(_AppWiringTestCase):
                 with mock.patch.object(
                     win32_input, "send_voice_key_combo_down"
                 ) as marked_down, mock.patch.object(
-                    win32_input, "send_wetype_voice_key_combo_down"
-                ) as wetype_down:
+                    self.app._wetype_voice_control, "start"
+                ) as wetype_start:
                     self.assertTrue(
                         self.app._apply_voice_action(
                             app_module.voice_controller.VoiceHostAction.KEY_DOWN
@@ -1282,41 +1283,45 @@ class HostHotkeyFailureSuppressesMicOpenTests(_AppWiringTestCase):
                     )
 
                 marked_down.assert_called_once_with(DEFAULT_VOICE_TOKENS)
-                wetype_down.assert_not_called()
+                wetype_start.assert_not_called()
 
-    def test_wetype_safety_release_keeps_the_failed_session_backend(self):
+    def test_wetype_failed_stop_keeps_the_session_backend_for_retry(self):
         self.app._config["voice_program"] = (
             voice_program_manager.normalize_voice_program_settings(
                 {"provider": voice_program_manager.VOICE_PROGRAM_WETYPE}
             )
         )
-        with mock.patch.object(
-            win32_input,
-            "send_wetype_voice_key_combo_down",
-            side_effect=win32_input.InputCleanupIncompleteError(
-                "simulated stuck WeType modifier"
-            ),
-        ):
-            self.assertFalse(
-                self.app._apply_voice_action(
-                    app_module.voice_controller.VoiceHostAction.KEY_DOWN
-                )
+        wetype_control = mock.Mock()
+        wetype_control.start.return_value = True
+        wetype_control.stop.side_effect = [False, True]
+        self.app._wetype_voice_control = wetype_control
+        self.assertTrue(
+            self.app._apply_voice_action(
+                app_module.voice_controller.VoiceHostAction.KEY_DOWN
             )
+        )
 
         self.app._config["voice_program"] = (
             voice_program_manager.normalize_voice_program_settings(
                 {"provider": voice_program_manager.VOICE_PROGRAM_SOGOU}
             )
         )
-        with mock.patch.object(
-            win32_input, "send_wetype_voice_key_combo_up"
-        ) as wetype_up, mock.patch.object(
-            win32_input, "send_voice_key_combo_up"
-        ) as marked_up:
-            self.assertTrue(self.app._release_pending_voice_hotkey())
-
-        wetype_up.assert_called_once_with(DEFAULT_VOICE_TOKENS)
-        marked_up.assert_not_called()
+        self.assertFalse(
+            self.app._apply_voice_action(
+                app_module.voice_controller.VoiceHostAction.KEY_UP
+            )
+        )
+        self.assertEqual(
+            self.app._voice_hotkey_active_backend,
+            app_module._VOICE_HOTKEY_BACKEND_WETYPE,
+        )
+        self.assertTrue(
+            self.app._apply_voice_action(
+                app_module.voice_controller.VoiceHostAction.KEY_UP
+            )
+        )
+        self.assertEqual(wetype_control.stop.call_count, 2)
+        self.assertIsNone(self.app._voice_hotkey_active_backend)
 
     def test_hotkey_success_sends_mic_open(self):
         with mock.patch.object(win32_input, "send_voice_key_combo_down"):
@@ -5243,6 +5248,44 @@ class HidTapStartupStateTests(_AppWiringTestCase):
 
 class VoiceCleanupFailurePreservesPendingStateTests(_AppWiringTestCase):
     """A failed key-up must remain owed after cleanup or audio stop."""
+
+    def _configure_active_wetype_session(self, *, stop_result: bool):
+        self.app._config["voice_program"] = (
+            voice_program_manager.normalize_voice_program_settings(
+                {"provider": voice_program_manager.VOICE_PROGRAM_WETYPE}
+            )
+        )
+        control = mock.Mock()
+        control.stop.return_value = stop_result
+        self.app._wetype_voice_control = control
+        self.app._voice.on_mic_button_pressed()
+        self.app._voice_hotkey_active_backend = (
+            app_module._VOICE_HOTKEY_BACKEND_WETYPE
+        )
+        return control
+
+    def test_cleanup_finishes_an_active_wetype_panel_session(self):
+        control = self._configure_active_wetype_session(stop_result=True)
+
+        _run(self.app._cleanup_once())
+
+        control.stop.assert_called_once_with()
+        self.assertFalse(self.app._voice.active)
+        self.assertIsNone(self.app._voice_hotkey_active_backend)
+
+    def test_cleanup_retains_failed_wetype_panel_release_for_retry(self):
+        control = self._configure_active_wetype_session(stop_result=False)
+
+        with self.assertRaises(app_module.CleanupIncompleteError) as ctx:
+            _run(self.app._cleanup_once())
+
+        self.assertIn("voice hotkey", str(ctx.exception))
+        control.stop.assert_called_once_with()
+        self.assertTrue(self.app._voice.active)
+        self.assertEqual(
+            self.app._voice_hotkey_active_backend,
+            app_module._VOICE_HOTKEY_BACKEND_WETYPE,
+        )
 
     def test_cleanup_releases_and_clears_an_owned_voice_hotkey(self):
         self.app._voice.on_mic_button_pressed()

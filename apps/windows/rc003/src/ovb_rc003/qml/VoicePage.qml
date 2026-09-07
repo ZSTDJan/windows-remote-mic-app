@@ -135,18 +135,20 @@ Item {
             return "busy"
         if (hidState !== "ready")
             return "restart_service"
-        const physicalizerState = String(
-            SettingsController.voiceKeyPhysicalizerState
-        )
-        if (physicalizerState === "unknown"
-                || physicalizerState === "starting"
-                || physicalizerState === "recovering")
-            return "busy"
-        if (physicalizerState !== "ready")
-            return "restart_service"
-        if (SettingsController.voiceHotkeySaveState === "retry"
-                || String(SettingsController.holdVoiceHotkeyText).trim().length === 0)
-            return "record_hotkey"
+        if (!root.wetypeSelected) {
+            const physicalizerState = String(
+                SettingsController.voiceKeyPhysicalizerState
+            )
+            if (physicalizerState === "unknown"
+                    || physicalizerState === "starting"
+                    || physicalizerState === "recovering")
+                return "busy"
+            if (physicalizerState !== "ready")
+                return "restart_service"
+            if (SettingsController.voiceHotkeySaveState === "retry"
+                    || String(SettingsController.holdVoiceHotkeyText).trim().length === 0)
+                return "record_hotkey"
+        }
         const cableCheck = root.checkResult("vb_cable_endpoints")
         const outputCheck = root.checkResult("output_endpoint")
         if (!cableCheck || !outputCheck)
@@ -311,7 +313,7 @@ Item {
     }
 
     function startVoiceHotkeyCapture() {
-        if (windowsDictationSelected)
+        if (windowsDictationSelected || wetypeSelected)
             return
         if (voiceHotkeyRecording) {
             stopVoiceHotkeyCapture("capture_field_tapped")
@@ -821,17 +823,23 @@ Item {
                     stateColumnWidth: root.settingsStateColumnWidth
                     actionColumnWidth: root.settingsActionColumnWidth
                     titleText: qsTr("语音按键")
-                    descriptionText: root.voiceHotkeyCaptureError.length > 0
+                    descriptionText: root.wetypeSelected
+                        ? qsTr("无线麦直接控制微信语音，无需设置快捷键")
+                        : root.voiceHotkeyCaptureError.length > 0
                         ? root.voiceHotkeyCaptureError
                         : qsTr("仅支持录入“按住型”快捷键")
-                    stateText: root.voiceHotkeyRecording
+                    stateText: root.wetypeSelected
+                        ? qsTr("已就绪")
+                        : root.voiceHotkeyRecording
                         ? SettingsController.hotkeyCaptureReady
                             ? qsTr("录入中") : qsTr("准备中")
                         : root.voiceHotkeyBusy ? qsTr("处理中")
                             : root.voiceHotkeyCaptureError.length > 0
                                 || SettingsController.voiceHotkeySaveState === "retry"
                                 ? qsTr("请重试") : qsTr("已保存")
-                    stateColor: root.voiceHotkeyRecording || root.voiceHotkeyBusy
+                    stateColor: root.wetypeSelected
+                        ? tokens.successColor
+                        : root.voiceHotkeyRecording || root.voiceHotkeyBusy
                         ? tokens.voiceAccent
                         : root.voiceHotkeyCaptureError.length > 0
                             || SettingsController.voiceHotkeySaveState === "retry"
@@ -846,15 +854,20 @@ Item {
                             readOnly: true
                             enabled: !root.voiceHotkeyBusy
                                 && !root.windowsDictationSelected
+                                && !root.wetypeSelected
                                 && !root.configurationWriteBusy
-                            text: root.voiceHotkeyRecording
+                            text: root.wetypeSelected
+                                ? qsTr("无需设置")
+                                : root.voiceHotkeyRecording
                                 ? SettingsController.hotkeyCaptureReady
                                     ? qsTr("请按快捷键") : qsTr("正在准备…")
                                 : SettingsController.holdVoiceHotkeyText
                             color: root.voiceHotkeyRecording
                                 ? tokens.accent : tokens.textPrimary
                             placeholderText: qsTr("点击录入")
-                            Accessible.name: qsTr("语音按键，仅支持录入按住型快捷键")
+                            Accessible.name: root.wetypeSelected
+                                ? qsTr("微信语音无需设置快捷键")
+                                : qsTr("语音按键，仅支持录入按住型快捷键")
                             Keys.onEscapePressed: root.stopVoiceHotkeyCapture(
                                 "escape_pressed")
                             onActiveFocusChanged: {
@@ -863,6 +876,7 @@ Item {
                             }
                             TapHandler {
                                 enabled: !root.windowsDictationSelected
+                                    && !root.wetypeSelected
                                 onTapped: root.startVoiceHotkeyCapture()
                             }
                         },

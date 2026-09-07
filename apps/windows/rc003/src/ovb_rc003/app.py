@@ -80,6 +80,7 @@ from . import (
     voice_controller,
     voice_interaction_diagnostics_windows,
     voice_program_manager,
+    wetype_control_windows,
     win32_input,
     win32_keys,
 )
@@ -147,7 +148,21 @@ _BUTTON_INPUT_RELEASE_RETRY_INITIAL_SECONDS = 0.1
 _BUTTON_INPUT_RELEASE_RETRY_MAX_SECONDS = 2.0
 _DIRECTION_BUTTON_IDS = frozenset({"up", "down", "left", "right"})
 _VOICE_HOTKEY_BACKEND_MARKED = "marked_keybd_event"
-_VOICE_HOTKEY_BACKEND_WETYPE = "wetype_virtual_key_sendinput"
+_VOICE_HOTKEY_BACKEND_WETYPE = "wetype_panel"
+
+
+def _runtime_voice_hotkey_text(config_data: dict) -> str:
+    settings = voice_program_manager.normalize_voice_program_settings(
+        config_data.get("voice_program")
+    )
+    if settings["provider"] == voice_program_manager.VOICE_PROGRAM_WETYPE:
+        return key_mapping.voice_hotkey_for_trigger_mode(
+            key_mapping.VoiceTriggerMode.HOLD
+        )
+    configured = str(config_data.get("voice_hotkey", "")).strip()
+    return configured or key_mapping.voice_hotkey_for_trigger_mode(
+        key_mapping.VoiceTriggerMode.HOLD
+    )
 
 
 def open_configured_application(action: key_mapping.ButtonAction) -> bool:
@@ -226,11 +241,7 @@ class RC003App:
                 sorted(self._removed_voice_bindings),
             )
         self._voice = voice_controller.VoiceController()
-        runtime_hotkey_text = str(self._config.get("voice_hotkey", "")).strip()
-        if not runtime_hotkey_text:
-            runtime_hotkey_text = key_mapping.voice_hotkey_for_trigger_mode(
-                self._voice.trigger_mode
-            )
+        runtime_hotkey_text = _runtime_voice_hotkey_text(self._config)
         self._voice_hotkey = hotkey.HotkeySpec.parse(runtime_hotkey_text)
         self._pending_voice_settings = None
         self._pending_config = None
@@ -246,6 +257,9 @@ class RC003App:
         self._voice_focus_submit_method = ""
         self._sogou_readiness_lock = threading.Lock()
         self._sogou_readiness_check_running = False
+        self._wetype_voice_control = wetype_control_windows.WeTypeVoiceControl(
+            logger=self._logger
+        )
         self._button_action_lock = threading.RLock()
         self._button_key_release_pending: Optional[Tuple[str, ...]] = None
         self._button_mouse_release_pending: Optional[str] = None
@@ -2345,6 +2359,8 @@ class RC003App:
             )
             return False
         mode = key_mapping.VoiceTriggerMode.HOLD
+        if self._configured_voice_hotkey_backend() == _VOICE_HOTKEY_BACKEND_WETYPE:
+            return True
         try:
             voice_hotkey = hotkey.HotkeySpec.parse(
                 self._voice_hotkey_text_for_mode(mode)
@@ -2785,13 +2801,7 @@ class RC003App:
                 refreshed_bindings,
             )
             trigger_mode = key_mapping.VoiceTriggerMode.HOLD
-            refreshed_hotkey_text = str(
-                refreshed_config.get("voice_hotkey", "")
-            ).strip()
-            if not refreshed_hotkey_text:
-                refreshed_hotkey_text = key_mapping.voice_hotkey_for_trigger_mode(
-                    trigger_mode
-                )
+            refreshed_hotkey_text = _runtime_voice_hotkey_text(refreshed_config)
             voice_hotkey = hotkey.HotkeySpec.parse(refreshed_hotkey_text)
         except Exception as exc:  # noqa: BLE001 - keep the last valid settings
             self._logger.warning("settings reload skipped: %s", exc)
@@ -3975,7 +3985,11 @@ class RC003App:
             self._config.get("voice_program")
         )
         self._voice_focus_provider = str(provider_settings["provider"])
-        self._voice_focus_submit_method = "hotkey_hold"
+        self._voice_focus_submit_method = (
+            "wetype_panel"
+            if self._configured_voice_hotkey_backend() == _VOICE_HOTKEY_BACKEND_WETYPE
+            else "hotkey_hold"
+        )
         snapshot = voice_interaction_diagnostics_windows.capture_focus_snapshot()
         self._voice_focus_before = snapshot
         self._logger.info(
@@ -4001,7 +4015,8 @@ class RC003App:
         )
         self._logger.info(
             "voice interaction result: provider=%s method=%s focus=%s "
-            "text_length=%s delta=%s; shortcut release alone does not prove text insertion",
+            "text_length=%s delta=%s; host control completion alone does not prove "
+            "text insertion",
             self._voice_focus_provider or "unknown",
             self._voice_focus_submit_method or "unknown",
             observation.focus_state,
@@ -4025,6 +4040,29 @@ class RC003App:
                 or self._voice_hotkey_release_pending_backend
                 or backend
             )
+        if backend == _VOICE_HOTKEY_BACKEND_WETYPE:
+            try:
+                delivered = (
+                    self._wetype_voice_control.start()
+                    if action == voice_controller.VoiceHostAction.KEY_DOWN
+                    else self._wetype_voice_control.stop()
+                )
+            except (win32_input.Win32InputUnavailableError, OSError):
+                self._logger.exception("WeType voice panel control failed")
+                return False
+            if not delivered:
+                self._logger.warning(
+                    "WeType voice panel control did not confirm logical %s",
+                    action.value,
+                )
+                return False
+            if action == voice_controller.VoiceHostAction.KEY_DOWN:
+                self._voice_hotkey_active_backend = backend
+            else:
+                self._voice_hotkey_active_backend = None
+            self._voice_hotkey_release_pending = None
+            self._voice_hotkey_release_pending_backend = None
+            return True
         provider_action = action
         try:
             if provider_action == voice_controller.VoiceHostAction.KEY_DOWN:
@@ -4067,11 +4105,7 @@ class RC003App:
         backend: str,
     ) -> None:
         if backend == _VOICE_HOTKEY_BACKEND_WETYPE:
-            if action == voice_controller.VoiceHostAction.KEY_DOWN:
-                win32_input.send_wetype_voice_key_combo_down(tokens)
-            else:
-                win32_input.send_wetype_voice_key_combo_up(tokens)
-            return
+            raise OSError("WeType uses panel control, not a keyboard shortcut")
         if action == voice_controller.VoiceHostAction.KEY_DOWN:
             win32_input.send_voice_key_combo_down(tokens)
         else:

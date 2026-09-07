@@ -206,7 +206,29 @@ hotkey_cancel = {
 controller.selectedVoiceProgramIndex = 2
 wait_for_voice_hotkey_idle(controller, app)
 render(window, app)
+wetype_before = str(controller.holdVoiceHotkeyText)
 QTest.mouseClick(window, Qt.LeftButton, Qt.NoModifier, hotkey_center)
+render(window, app)
+wetype_hotkey = {
+    "recording": bool(voice_page.property("voiceHotkeyRecording")),
+    "enabled": bool(hotkey_field.property("enabled")),
+    "field_text": str(hotkey_field.property("text")),
+    "controller_text": str(controller.holdVoiceHotkeyText),
+    "original_text": wetype_before,
+    "description": str(controls["voiceHotkeyRow"].property("descriptionText")),
+    "state": str(controls["voiceHotkeyRow"].property("stateText")),
+}
+
+controller.selectedVoiceProgramIndex = 4
+wait_for_voice_hotkey_idle(controller, app)
+render(window, app)
+custom_hotkey_center = hotkey_field.mapToScene(
+    QPointF(
+        hotkey_field.property("width") / 2,
+        hotkey_field.property("height") / 2,
+    )
+).toPoint()
+QTest.mouseClick(window, Qt.LeftButton, Qt.NoModifier, custom_hotkey_center)
 render(window, app)
 QTest.keyPress(window, Qt.Key_Control, Qt.ControlModifier)
 QTest.keyPress(window, Qt.Key_Shift, Qt.ControlModifier | Qt.ShiftModifier)
@@ -354,6 +376,7 @@ result = {
     "managed_auto_start": managed_auto_start,
     "managed_elevated": managed_elevated,
     "hotkey_cancel": hotkey_cancel,
+    "wetype_hotkey": wetype_hotkey,
     "qt_fallback_hotkey": qt_fallback_hotkey,
     "hotkey_other_action": hotkey_other_action,
     "inactive_capture_error": inactive_capture_error,
@@ -423,6 +446,18 @@ class VoiceProgramQmlTests(unittest.TestCase):
             data["hotkey_cancel"]["controller_text"],
             data["hotkey_cancel"]["original_text"],
         )
+        self.assertFalse(data["wetype_hotkey"]["recording"])
+        self.assertFalse(data["wetype_hotkey"]["enabled"])
+        self.assertEqual(data["wetype_hotkey"]["field_text"], "无需设置")
+        self.assertEqual(
+            data["wetype_hotkey"]["controller_text"],
+            data["wetype_hotkey"]["original_text"],
+        )
+        self.assertEqual(
+            data["wetype_hotkey"]["description"],
+            "无线麦直接控制微信语音，无需设置快捷键",
+        )
+        self.assertEqual(data["wetype_hotkey"]["state"], "已就绪")
         self.assertFalse(data["qt_fallback_hotkey"]["recording"])
         self.assertEqual(
             data["qt_fallback_hotkey"]["field_text"],

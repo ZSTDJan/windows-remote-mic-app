@@ -1,9 +1,9 @@
 """Read and synchronize supported provider-owned voice shortcuts on Windows.
 
 Sogou exposes a stable on-disk shortcut setting that can be read and updated
-without opening its UI. Windows dictation has one fixed shortcut. WeType does
-not expose a stable silent settings surface, so Remote Mic only remembers its
-shortcut locally and lets the user open WeType's own settings when needed.
+without opening its UI. Windows dictation has one fixed shortcut. WeType is
+controlled through its own voice button; its stored shortcut is compatibility
+data only and is neither edited nor executed by Remote Mic.
 """
 
 from __future__ import annotations
@@ -22,7 +22,7 @@ from . import hotkey, product_identity, voice_program_manager, win32_keys
 DEFAULT_PROVIDER_HOTKEYS = {
     voice_program_manager.VOICE_PROGRAM_NONE: "ralt",
     voice_program_manager.VOICE_PROGRAM_SOGOU: "rctrl",
-    # WeType's native migration initializes hold-to-talk as Ctrl+Win.
+    # Kept only so older provider-scoped configuration remains readable.
     voice_program_manager.VOICE_PROGRAM_WETYPE: "lctrl+lwin",
     voice_program_manager.VOICE_PROGRAM_WINDOWS_DICTATION: "win+h",
     voice_program_manager.VOICE_PROGRAM_CUSTOM: "ralt",
@@ -132,42 +132,6 @@ _MODIFIER_FAMILY_BY_TOKEN = {
     "lwin": "win",
     "rwin": "win",
 }
-# WeType 2.1.3.18 applies these checks in its Windows voice shortcut recorder.
-_WETYPE_BLOCKED_KEYS = frozenset(
-    {
-        "apps",
-        "browser_back",
-        "browser_forward",
-        "media_next",
-        "media_previous",
-        "media_stop",
-        "media_play_pause",
-        "volume_mute",
-        "volume_down",
-        "volume_up",
-        # The recorder represents unsupported VKs not present in win32_keys
-        # with their lossless hexadecimal token.
-        "vk_5f",  # Sleep
-        "vk_a8",  # Browser refresh
-        "vk_a9",  # Browser stop
-        "vk_aa",  # Browser search
-        "vk_ab",  # Browser favorites
-        "vk_ac",  # Browser home
-        "vk_b4",  # Launch mail
-        "vk_b5",  # Select media
-        "vk_b6",  # Launch application 1
-        "vk_b7",  # Launch application 2
-    }
-)
-_WETYPE_INPUT_METHOD_SWITCH_CHORDS = frozenset(
-    {
-        # WeType explicitly rejects Windows input-method switching chords.
-        frozenset({"ctrl", "space"}),
-        frozenset({"ctrl", "shift"}),
-        frozenset({"alt", "shift"}),
-        frozenset({"win", "space"}),
-    }
-)
 
 
 @dataclass(frozen=True)
@@ -211,6 +175,13 @@ def validate_provider_hotkey(
     """Validate one shortcut against the selected program's input rules."""
 
     provider = str(provider_id).strip().lower()
+    if provider == voice_program_manager.VOICE_PROGRAM_WETYPE:
+        return VoiceHotkeySyncResult(
+            provider,
+            False,
+            "not_required",
+            message="无线麦直接控制微信语音，无需设置快捷键。",
+        )
     spec, parsed = _parsed_hotkey(provider, shortcut)
     if spec is None:
         return parsed
@@ -254,56 +225,6 @@ def validate_provider_hotkey(
                 ),
             )
 
-    if provider == voice_program_manager.VOICE_PROGRAM_WETYPE:
-        if len(tokens) > 3:
-            return VoiceHotkeySyncResult(
-                provider,
-                False,
-                "too_many_keys",
-                message="微信输入法最多允许 3 个按键。",
-            )
-        modifier_families = tuple(
-            family for token in tokens if (family := _modifier_family(token))
-        )
-        if not modifier_families:
-            return VoiceHotkeySyncResult(
-                provider,
-                False,
-                "missing_modifier",
-                message="微信输入法的按住型快捷键必须包含修饰键。",
-            )
-        if len(tokens) == 1 and modifier_families[0] == "win":
-            return VoiceHotkeySyncResult(
-                provider,
-                False,
-                "unsupported_single_key",
-                message="微信输入法的单键只能使用 Ctrl、Shift 或 Alt。",
-            )
-        if len(set(modifier_families)) != len(modifier_families):
-            return VoiceHotkeySyncResult(
-                provider,
-                False,
-                "duplicate_modifier",
-                message="微信输入法不接受左右同类修饰键同时使用。",
-            )
-        if any(token in _WETYPE_BLOCKED_KEYS for token in tokens):
-            return VoiceHotkeySyncResult(
-                provider,
-                False,
-                "unsupported_key",
-                message="微信输入法不支持该功能键，请换一个常用组合键。",
-            )
-        comparable_tokens = frozenset(
-            _modifier_family(token) or token for token in tokens
-        )
-        if comparable_tokens in _WETYPE_INPUT_METHOD_SWITCH_CHORDS:
-            return VoiceHotkeySyncResult(
-                provider,
-                False,
-                "reserved_hotkey",
-                message="微信输入法不接受该输入法切换组合，请换一个组合键。",
-            )
-
     return VoiceHotkeySyncResult(provider, True, "valid", normalized)
 
 
@@ -340,8 +261,7 @@ def read_provider_hotkey(
         voice_program_manager.VOICE_PROGRAM_CUSTOM,
     }:
         message = (
-            "需手动设置，使「微信语音界面的按住型快捷键」和"
-            "「语音按键」统一。"
+            "无线麦直接控制微信语音，无需设置快捷键。"
             if provider == voice_program_manager.VOICE_PROGRAM_WETYPE
             else f"该程序只使用{product_identity.DISPLAY_NAME}内记录的按住型快捷键。"
         )
@@ -367,6 +287,13 @@ def sync_provider_hotkey(
     appdata: Optional[Path] = None,
 ) -> VoiceHotkeySyncResult:
     provider = str(provider_id).strip().lower()
+    if provider == voice_program_manager.VOICE_PROGRAM_WETYPE:
+        return VoiceHotkeySyncResult(
+            provider,
+            False,
+            "not_required",
+            message="无线麦直接控制微信语音，无需设置快捷键。",
+        )
     validation = validate_provider_hotkey(provider, shortcut)
     if not validation.ok:
         return validation
@@ -375,17 +302,14 @@ def sync_provider_hotkey(
     current_platform = platform or sys.platform
     if provider in {
         voice_program_manager.VOICE_PROGRAM_NONE,
-        voice_program_manager.VOICE_PROGRAM_WETYPE,
         voice_program_manager.VOICE_PROGRAM_CUSTOM,
     }:
-        message = (
-            f"快捷键已保存到{product_identity.DISPLAY_NAME}；"
-            "请使「微信语音界面的按住型快捷键」和「语音按键」统一。"
-            if provider == voice_program_manager.VOICE_PROGRAM_WETYPE
-            else f"快捷键已保存到{product_identity.DISPLAY_NAME}。"
-        )
         return VoiceHotkeySyncResult(
-            provider, True, "local_only", normalized, message
+            provider,
+            True,
+            "local_only",
+            normalized,
+            f"快捷键已保存到{product_identity.DISPLAY_NAME}。",
         )
     if provider == voice_program_manager.VOICE_PROGRAM_WINDOWS_DICTATION:
         fixed = default_hotkey(provider)

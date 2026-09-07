@@ -3290,17 +3290,22 @@ def _load_qt_classes() -> dict:
             hotkey_text = self._voice_hotkeys[
                 key_mapping.VoiceTriggerMode.HOLD
             ].strip()
-            try:
-                parsed_hotkey = hotkey.HotkeySpec.parse(hotkey_text)
-                win32_keys.resolve_vk_codes(
-                    tuple(parsed_hotkey.modifiers) + (parsed_hotkey.key,)
-                )
-            except (hotkey.HotkeyParseError, win32_keys.UnknownKeyTokenError) as exc:
-                self._set_error_message(
-                    f"语音按键无效：{exc}",
-                    self._VOICE_PAGE_INDEX,
-                )
-                return False
+            provider_id = str(self._voice_program_settings.get("provider", ""))
+            if provider_id != voice_program_manager.VOICE_PROGRAM_WETYPE:
+                try:
+                    parsed_hotkey = hotkey.HotkeySpec.parse(hotkey_text)
+                    win32_keys.resolve_vk_codes(
+                        tuple(parsed_hotkey.modifiers) + (parsed_hotkey.key,)
+                    )
+                except (
+                    hotkey.HotkeyParseError,
+                    win32_keys.UnknownKeyTokenError,
+                ) as exc:
+                    self._set_error_message(
+                        f"语音按键无效：{exc}",
+                        self._VOICE_PAGE_INDEX,
+                    )
+                    return False
 
             new_config = dict(self._config)
             new_config["voice_trigger_mode"] = (
@@ -3308,11 +3313,12 @@ def _load_qt_classes() -> dict:
             )
             new_config.pop("voice_release_finish_tap_enabled", None)
             new_config["voice_program"] = dict(self._voice_program_settings)
-            config.set_voice_hotkey_for_provider(
-                new_config,
-                self._voice_program_settings.get("provider"),
-                hotkey_text,
-            )
+            if provider_id != voice_program_manager.VOICE_PROGRAM_WETYPE:
+                config.set_voice_hotkey_for_provider(
+                    new_config,
+                    provider_id,
+                    hotkey_text,
+                )
             config_path = config.config_path(self._config_root)
             try:
                 saved_config = config.save_config_and_load(config_path, new_config)
@@ -3349,6 +3355,9 @@ def _load_qt_classes() -> dict:
                 self._set_voice_hotkey_save_state("retry")
                 return False
             provider_id = str(self._voice_program_settings.get("provider", ""))
+            if provider_id == voice_program_manager.VOICE_PROGRAM_WETYPE:
+                self._set_voice_hotkey_save_state("saved")
+                return False
             if provider_id == voice_program_manager.VOICE_PROGRAM_WINDOWS_DICTATION:
                 value = "win+h"
             self._set_voice_hotkey_busy(True)
@@ -3986,6 +3995,15 @@ def _load_qt_classes() -> dict:
             return self._voice_hotkeys[key_mapping.VoiceTriggerMode.HOLD]
 
         def _set_hold_voice_hotkey_text(self, value: str) -> None:
+            if (
+                self._voice_program_settings.get("provider")
+                == voice_program_manager.VOICE_PROGRAM_WETYPE
+            ):
+                logging_setup.get_logger(self._config_root).info(
+                    "settings hotkey capture: ignored for WeType panel control"
+                )
+                self._set_voice_hotkey_save_state("saved")
+                return
             logging_setup.get_logger(self._config_root).info(
                 "settings hotkey capture: QML submitted provider=%s chord=%s",
                 self._voice_program_settings.get("provider", ""),
@@ -5794,6 +5812,16 @@ def _load_qt_classes() -> dict:
             """Start the settings-owned Windows keyboard shortcut recorder."""
 
             logger = logging_setup.get_logger(self._config_root)
+            provider_id = str(self._voice_program_settings.get("provider", ""))
+            if provider_id in {
+                voice_program_manager.VOICE_PROGRAM_WETYPE,
+                voice_program_manager.VOICE_PROGRAM_WINDOWS_DICTATION,
+            }:
+                logger.info(
+                    "settings hotkey capture: rejected for provider=%s",
+                    provider_id,
+                )
+                return False
             logger.info(
                 "settings hotkey capture: start requested kind=%s phase=%s "
                 "has_capture=%s key_detection=%s voice_busy=%s",

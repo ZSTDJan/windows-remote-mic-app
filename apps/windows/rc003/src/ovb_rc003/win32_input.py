@@ -22,13 +22,6 @@ an observable ``OSError``, never swallowed - the sole exception is
 platform-availability signal re-raised as-is with no rollback attempted,
 since nothing could have landed.
 
-WeType compatibility is deliberately narrower than the ordinary mapping
-path: separate virtual-key ``SendInput`` batches for key-down and key-up,
-held for the physical microphone-button lifetime,
-``wScan=0``, no ``KEYEVENTF_SCANCODE``, and ``dwExtraInfo=0``. Other providers
-retain the marked ``keybd_event`` voice path required by the existing Doubao
-compatibility layer.
-
 Testability: every public function accepts an optional ``_sender`` keyword
 (a callable matching ``RawSender``) used only by tests. Production callers
 never pass it, so the real ``ctypes``/``user32.SendInput`` path is used -
@@ -261,25 +254,6 @@ def _build_input_array(events: Sequence[Tuple[int, bool]]):
     return array, INPUT
 
 
-def _build_virtual_key_input_array(events: Sequence[Tuple[int, bool]]):
-    """Build unmarked virtual-key events for WeType's global shortcut."""
-
-    array = (INPUT * len(events))()
-    for index, (vk, key_up) in enumerate(events):
-        flags = _KEYEVENTF_KEYUP if key_up else 0
-        if vk in _EXTENDED_KEYS:
-            flags |= _KEYEVENTF_EXTENDEDKEY
-        keybd_input = KEYBDINPUT(
-            wVk=vk,
-            wScan=0,
-            dwFlags=flags,
-            time=0,
-            dwExtraInfo=0,
-        )
-        array[index] = INPUT(type=_INPUT_KEYBOARD, union=_INPUT_UNION(ki=keybd_input))
-    return array, INPUT
-
-
 def _build_mouse_input_array(events: Sequence[MouseEvent]):
     array = (INPUT * len(events))()
     for index, (flags, mouse_data) in enumerate(events):
@@ -328,12 +302,6 @@ def _real_send_input_batch(events: Sequence[Tuple[int, bool]]) -> int:
     """Submit ordinary scan-aware keyboard events in one real SendInput call."""
 
     return _real_send_input_batch_with_builder(events, _build_input_array)
-
-
-def _real_send_virtual_key_input_batch(events: Sequence[Tuple[int, bool]]) -> int:
-    """Submit unmarked, virtual-key-only events in one real SendInput call."""
-
-    return _real_send_input_batch_with_builder(events, _build_virtual_key_input_array)
 
 
 def _real_send_mouse_input_batch(events: Sequence[MouseEvent]) -> int:
@@ -1039,65 +1007,6 @@ def send_voice_key_combo_tap(
                 "voice key tap delivery could not be confirmed"
             ) from exc
         raise
-
-
-def send_wetype_voice_key_combo_down(
-    tokens: Sequence[str],
-    *,
-    _sender: Optional[RawSender] = None,
-    _key_down_query: Optional[PhysicalKeyDownQuery] = None,
-) -> None:
-    """Press WeType's shortcut through unmarked virtual-key SendInput."""
-
-    if _sender is None and _key_down_query is None:
-        _ensure_tracked_hold_available(win32_keys.resolve_vk_codes(tokens))
-    preflight_query = (
-        _key_down_query
-        if _key_down_query is not None
-        else (
-            None
-            if _sender is not None
-            else _physical_key_is_down_before_injection
-        )
-    )
-    release_query = (
-        _key_down_query
-        if _key_down_query is not None
-        else (
-            None
-            if _sender is not None
-            else _physical_key_is_down
-        )
-    )
-    send_key_combo_down(
-        tokens,
-        _sender=_sender or _real_send_virtual_key_input_batch,
-        _key_down_query=preflight_query,
-        _release_key_down_query=release_query,
-    )
-
-
-def send_wetype_voice_key_combo_up(
-    tokens: Sequence[str],
-    *,
-    _sender: Optional[RawSender] = None,
-    _key_down_query: Optional[PhysicalKeyDownQuery] = None,
-) -> None:
-    """Release WeType's shortcut through the same virtual-key transport."""
-
-    send_key_combo_up(
-        tokens,
-        _sender=_sender or _real_send_virtual_key_input_batch,
-        _key_down_query=(
-            _key_down_query
-            if _key_down_query is not None
-            else (
-                None
-                if _sender is not None
-                else _physical_key_is_down
-            )
-        ),
-    )
 
 
 def send_volume_up(*, _sender: Optional[RawSender] = None) -> None:
