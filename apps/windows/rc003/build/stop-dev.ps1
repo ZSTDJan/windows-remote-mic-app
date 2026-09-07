@@ -27,6 +27,33 @@ $InterpreterPaths = @(
     [System.IO.Path]::GetFullPath($_)
 }
 
+function Get-ProcessTreeIds {
+    param(
+        [Parameter(Mandatory = $true)]
+        [object[]]$Processes,
+        [Parameter(Mandatory = $true)]
+        [uint32[]]$RootProcessIds
+    )
+
+    [uint32[]]$result = @($RootProcessIds)
+    do {
+        [uint32[]]$newIds = @(
+            $Processes |
+                Where-Object {
+                    $result -contains [uint32]$_.ParentProcessId -and
+                    $result -notcontains [uint32]$_.ProcessId
+                } |
+                ForEach-Object { [uint32]$_.ProcessId }
+        )
+        if ($newIds.Count -eq 0) {
+            break
+        }
+        $result = @($result + $newIds)
+    } while ($true)
+
+    return @($result)
+}
+
 if ($InterpreterPaths.Count -eq 0) {
     Write-Host "[stop-dev] no local virtual environment; nothing to stop"
     exit 0
@@ -112,7 +139,13 @@ namespace RemoteMicBuild {
 $DesktopOwnerProcessId = [RemoteMicBuild.WindowProbe]::FindOwner(
     "RemoteMicRC003.ApplicationExitRequestV3"
 )
-$DevProcessIds = @($DevProcesses | ForEach-Object { [uint32]$_.ProcessId })
+$CurrentSessionProcesses = @(
+    Get-CimInstance Win32_Process |
+        Where-Object { [uint32]$_.SessionId -eq $CurrentSessionId }
+)
+$DevProcessIds = Get-ProcessTreeIds `
+    -Processes $CurrentSessionProcesses `
+    -RootProcessIds @($DevProcesses | ForEach-Object { [uint32]$_.ProcessId })
 if (
     $DesktopOwnerProcessId -eq 0 -or
     $DevProcessIds -notcontains [uint32]$DesktopOwnerProcessId
@@ -140,25 +173,11 @@ try {
 $deadline = [DateTime]::UtcNow.AddSeconds($GracefulTimeoutSeconds)
 do {
     $remaining = @(
-        Get-CimInstance Win32_Process | Where-Object {
-            $executablePath = $_.ExecutablePath
-            $commandLine = $_.CommandLine
-            if (
-                -not $executablePath -or
-                -not $commandLine -or
-                [uint32]$_.SessionId -ne $CurrentSessionId
-            ) {
-                return $false
+        Get-CimInstance Win32_Process |
+            Where-Object {
+                [uint32]$_.SessionId -eq $CurrentSessionId -and
+                $DevProcessIds -contains [uint32]$_.ProcessId
             }
-            $exactInterpreter = $InterpreterPaths | Where-Object {
-                [string]::Equals(
-                    $_,
-                    $executablePath,
-                    [System.StringComparison]::OrdinalIgnoreCase
-                )
-            }
-            return $exactInterpreter -and $commandLine.Contains($DevMarker)
-        }
     )
     if ($remaining.Count -eq 0) {
         break

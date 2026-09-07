@@ -2514,6 +2514,8 @@ class DeveloperEntryScriptTests(unittest.TestCase):
         self.assertIn("--request-exit", self.stop_text)
         self.assertIn("RemoteMicRC003.ApplicationExitRequestV3", self.stop_text)
         self.assertIn("GetCurrentProcess().SessionId", self.stop_text)
+        self.assertIn("Get-ProcessTreeIds", self.stop_text)
+        self.assertIn("ParentProcessId", self.stop_text)
         self.assertNotIn("Stop-Process", self.stop_text)
 
     def test_shortcut_targets_the_source_launcher(self):
