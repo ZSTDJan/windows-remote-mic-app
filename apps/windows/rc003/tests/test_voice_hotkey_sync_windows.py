@@ -62,6 +62,75 @@ class SogouVoiceHotkeyTests(unittest.TestCase):
         self.assertTrue(result.ok)
         self.assertEqual(result.hotkey, "lctrl+lshift+f7")
 
+    def test_accepts_sogou_single_right_ctrl(self):
+        result = voice_hotkey_sync_windows.validate_provider_hotkey(
+            "sogou", "rctrl"
+        )
+
+        self.assertTrue(result.ok)
+        self.assertEqual(result.hotkey, "rctrl")
+
+    def test_rejects_sogou_single_letter(self):
+        result = voice_hotkey_sync_windows.validate_provider_hotkey("sogou", "a")
+
+        self.assertFalse(result.ok)
+        self.assertEqual(result.code, "unsupported_single_key")
+        self.assertIn("单键", result.message)
+
+    def test_rejects_sogou_shortcut_longer_than_three_keys(self):
+        result = voice_hotkey_sync_windows.validate_provider_hotkey(
+            "sogou", "lctrl+lshift+lalt+f9"
+        )
+
+        self.assertFalse(result.ok)
+        self.assertEqual(result.code, "too_many_keys")
+
+    def test_rejects_key_not_supported_by_sogou(self):
+        before = self.path.read_bytes()
+        with mock.patch.object(
+            voice_hotkey_sync_windows,
+            "_sogou_voice_process_running",
+        ) as process_check:
+            result = voice_hotkey_sync_windows.sync_provider_hotkey(
+                "sogou",
+                "lctrl+volume_up",
+                platform="win32",
+                appdata=self.appdata,
+            )
+
+        self.assertFalse(result.ok)
+        self.assertEqual(result.code, "unsupported_key")
+        self.assertEqual(self.path.read_bytes(), before)
+        process_check.assert_not_called()
+
+    def test_converts_sogou_win_direction_and_punctuation_names(self):
+        self.assertEqual(
+            voice_hotkey_sync_windows._hotkey_to_provider_tokens(
+                "lctrl+lwin+up"
+            ),
+            ["LeftCtrl", "LeftMeta", "Up"],
+        )
+        self.assertEqual(
+            voice_hotkey_sync_windows._provider_tokens_to_hotkey(
+                ["RightMeta", "BracketLeft"]
+            ),
+            "rwin+left_bracket",
+        )
+
+    def test_reads_sogou_generic_modifier_names_from_existing_config(self):
+        self.assertEqual(
+            voice_hotkey_sync_windows._provider_tokens_to_hotkey(
+                ["Ctrl", "Meta", "F8"]
+            ),
+            "ctrl+win+f8",
+        )
+
+    def test_reports_unrepresentable_sogou_numpad_enter(self):
+        with self.assertRaisesRegex(ValueError, "不能区分数字键盘 Enter"):
+            voice_hotkey_sync_windows._provider_tokens_to_hotkey(
+                ["LeftCtrl", "NumpadEnter"]
+            )
+
     def test_writes_and_verifies_sogou_without_changing_other_settings(self):
         with mock.patch.object(
             voice_hotkey_sync_windows,
@@ -83,6 +152,26 @@ class SogouVoiceHotkeyTests(unittest.TestCase):
         )
         self.assertTrue(saved["setting"]["longPressEnabled"])
         self.assertEqual(saved["unrelated"], {"keep": True})
+
+    def test_writes_sogou_with_its_native_win_and_direction_names(self):
+        with mock.patch.object(
+            voice_hotkey_sync_windows,
+            "_sogou_voice_process_running",
+            return_value=False,
+        ):
+            result = voice_hotkey_sync_windows.sync_provider_hotkey(
+                "sogou",
+                "lctrl+lwin+up",
+                platform="win32",
+                appdata=self.appdata,
+            )
+
+        self.assertTrue(result.ok)
+        saved = json.loads(self.path.read_text(encoding="utf-8"))
+        self.assertEqual(
+            saved["setting"]["shortcutKeysPress"],
+            ["LeftCtrl", "LeftMeta", "Up"],
+        )
 
     def test_refuses_to_rewrite_a_running_sogou_assistant(self):
         before = self.path.read_bytes()
@@ -209,6 +298,68 @@ class WeTypeVoiceHotkeyTests(unittest.TestCase):
         self.assertEqual(result.hotkey, "lctrl+lshift+f9")
         self.assertIn("微信语音界面的按住型快捷键", result.message)
         self.assertIn("语音按键", result.message)
+
+    def test_accepts_wetype_ctrl_win_and_common_three_key_shortcut(self):
+        for shortcut in ("lctrl+lwin", "lctrl+lshift+f9"):
+            with self.subTest(shortcut=shortcut):
+                result = voice_hotkey_sync_windows.validate_provider_hotkey(
+                    "wetype", shortcut
+                )
+
+                self.assertTrue(result.ok)
+                self.assertEqual(result.hotkey, shortcut)
+
+    def test_rejects_wetype_single_letter_without_saving_it(self):
+        result = voice_hotkey_sync_windows.sync_provider_hotkey(
+            "wetype", "a", platform="win32"
+        )
+
+        self.assertFalse(result.ok)
+        self.assertEqual(result.code, "missing_modifier")
+        self.assertEqual(result.hotkey, "")
+
+    def test_rejects_wetype_shortcut_longer_than_three_keys(self):
+        result = voice_hotkey_sync_windows.validate_provider_hotkey(
+            "wetype", "lctrl+lshift+lalt+f9"
+        )
+
+        self.assertFalse(result.ok)
+        self.assertEqual(result.code, "too_many_keys")
+
+    def test_rejects_wetype_blocked_function_key(self):
+        for shortcut in ("lctrl+volume_up", "lctrl+vk_5f", "lctrl+vk_b4"):
+            with self.subTest(shortcut=shortcut):
+                result = voice_hotkey_sync_windows.validate_provider_hotkey(
+                    "wetype", shortcut
+                )
+
+                self.assertFalse(result.ok)
+                self.assertEqual(result.code, "unsupported_key")
+
+    def test_rejects_wetype_equivalent_modifier_duplicates(self):
+        result = voice_hotkey_sync_windows.validate_provider_hotkey(
+            "wetype", "lctrl+rctrl"
+        )
+
+        self.assertFalse(result.ok)
+        self.assertEqual(result.code, "duplicate_modifier")
+
+    def test_rejects_wetype_windows_reserved_shortcut(self):
+        result = voice_hotkey_sync_windows.validate_provider_hotkey(
+            "wetype", "lctrl+lshift"
+        )
+
+        self.assertFalse(result.ok)
+        self.assertEqual(result.code, "reserved_hotkey")
+        self.assertIn("微信输入法不接受", result.message)
+
+    def test_custom_program_keeps_unrestricted_single_key_support(self):
+        result = voice_hotkey_sync_windows.sync_provider_hotkey(
+            "custom", "a", platform="win32"
+        )
+
+        self.assertTrue(result.ok)
+        self.assertEqual(result.hotkey, "a")
 
 
 if __name__ == "__main__":

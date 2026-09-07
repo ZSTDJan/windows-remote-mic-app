@@ -22,7 +22,7 @@ from . import hotkey, product_identity, voice_program_manager, win32_keys
 DEFAULT_PROVIDER_HOTKEYS = {
     voice_program_manager.VOICE_PROGRAM_NONE: "ralt",
     voice_program_manager.VOICE_PROGRAM_SOGOU: "rctrl",
-    # WeType 2.1.2's native migration initializes hold-to-talk as Ctrl+Win.
+    # WeType's native migration initializes hold-to-talk as Ctrl+Win.
     voice_program_manager.VOICE_PROGRAM_WETYPE: "lctrl+lwin",
     voice_program_manager.VOICE_PROGRAM_WINDOWS_DICTATION: "win+h",
     voice_program_manager.VOICE_PROGRAM_CUSTOM: "ralt",
@@ -30,7 +30,10 @@ DEFAULT_PROVIDER_HOTKEYS = {
 
 _SOGOU_CONFIG_RELATIVE_PATH = Path("sogou_voice_assistant_pc") / "config.json"
 _SOGOU_PROCESS_NAME = "sogou_voice_assistant.exe"
-_REMOTE_TO_PROVIDER_TOKEN = {
+# Faithfully injectable subset of Sogou Voice Assistant 1.0.1.3272's
+# Windows shortcut vocabulary. NumpadEnter needs scan-code identity that the
+# current Remote Mic shortcut model cannot preserve.
+_REMOTE_TO_SOGOU_TOKEN = {
     "ctrl": "LeftCtrl",
     "lctrl": "LeftCtrl",
     "rctrl": "RightCtrl",
@@ -40,23 +43,129 @@ _REMOTE_TO_PROVIDER_TOKEN = {
     "alt": "LeftAlt",
     "lalt": "LeftAlt",
     "ralt": "RightAlt",
-    "win": "LeftWin",
-    "lwin": "LeftWin",
-    "rwin": "RightWin",
+    "win": "LeftMeta",
+    "lwin": "LeftMeta",
+    "rwin": "RightMeta",
+    "up": "Up",
+    "down": "Down",
+    "left": "Left",
+    "right": "Right",
+    "space": "Space",
+    "enter": "Enter",
+    "tab": "Tab",
+    "escape": "Escape",
+    "esc": "Escape",
+    "backspace": "Backspace",
+    "delete": "Delete",
+    "insert": "Insert",
+    "home": "Home",
+    "end": "End",
+    "pageup": "PageUp",
+    "page_up": "PageUp",
+    "pagedown": "PageDown",
+    "page_down": "PageDown",
+    "caps_lock": "CapsLock",
+    "num_lock": "NumLock",
+    "scroll_lock": "ScrollLock",
+    "print_screen": "PrintScreen",
+    "minus": "Minus",
+    "equals": "Equal",
+    "left_bracket": "BracketLeft",
+    "right_bracket": "BracketRight",
+    "backslash": "Backslash",
+    "semicolon": "Semicolon",
+    "quote": "Quote",
+    "comma": "Comma",
+    "period": "Period",
+    "slash": "Slash",
+    "backtick": "Backquote",
+    "numpad_add": "NumpadAdd",
+    "numpad_subtract": "NumpadSubtract",
+    "numpad_multiply": "NumpadMultiply",
+    "numpad_divide": "NumpadDivide",
+    "numpad_decimal": "NumpadDecimal",
 }
-_PROVIDER_TO_REMOTE_TOKEN = {
-    value.casefold(): key for key, value in _REMOTE_TO_PROVIDER_TOKEN.items()
+for _letter in "abcdefghijklmnopqrstuvwxyz":
+    _REMOTE_TO_SOGOU_TOKEN[_letter] = _letter.upper()
+for _digit in "0123456789":
+    _REMOTE_TO_SOGOU_TOKEN[_digit] = _digit
+    _REMOTE_TO_SOGOU_TOKEN[f"numpad{_digit}"] = f"Numpad{_digit}"
+for _function in range(1, 25):
+    _REMOTE_TO_SOGOU_TOKEN[f"f{_function}"] = f"F{_function}"
+_SOGOU_TO_REMOTE_TOKEN = {
+    value.casefold(): key for key, value in _REMOTE_TO_SOGOU_TOKEN.items()
 }
-_PROVIDER_TO_REMOTE_TOKEN.update(
+_SOGOU_TO_REMOTE_TOKEN.update(
     {
+        "ctrl": "ctrl",
+        "shift": "shift",
+        "alt": "alt",
+        "meta": "win",
         "leftctrl": "lctrl",
         "rightctrl": "rctrl",
         "leftshift": "lshift",
         "rightshift": "rshift",
         "leftalt": "lalt",
         "rightalt": "ralt",
+        "leftmeta": "lwin",
+        "rightmeta": "rwin",
+        # Older builds and existing test data used Win instead of Meta.
         "leftwin": "lwin",
         "rightwin": "rwin",
+        "pageup": "page_up",
+        "pagedown": "page_down",
+        "escape": "escape",
+    }
+)
+
+_MODIFIER_FAMILY_BY_TOKEN = {
+    "ctrl": "ctrl",
+    "lctrl": "ctrl",
+    "rctrl": "ctrl",
+    "shift": "shift",
+    "lshift": "shift",
+    "rshift": "shift",
+    "alt": "alt",
+    "lalt": "alt",
+    "ralt": "alt",
+    "win": "win",
+    "lwin": "win",
+    "rwin": "win",
+}
+# WeType 2.1.3.18 applies these checks in its Windows voice shortcut recorder.
+_WETYPE_BLOCKED_KEYS = frozenset(
+    {
+        "apps",
+        "browser_back",
+        "browser_forward",
+        "media_next",
+        "media_previous",
+        "media_stop",
+        "media_play_pause",
+        "volume_mute",
+        "volume_down",
+        "volume_up",
+        # The recorder represents unsupported VKs not present in win32_keys
+        # with their lossless hexadecimal token.
+        "vk_5f",  # Sleep
+        "vk_a8",  # Browser refresh
+        "vk_a9",  # Browser stop
+        "vk_aa",  # Browser search
+        "vk_ab",  # Browser favorites
+        "vk_ac",  # Browser home
+        "vk_b4",  # Launch mail
+        "vk_b5",  # Select media
+        "vk_b6",  # Launch application 1
+        "vk_b7",  # Launch application 2
+    }
+)
+_WETYPE_INPUT_METHOD_SWITCH_CHORDS = frozenset(
+    {
+        # WeType explicitly rejects Windows input-method switching chords.
+        frozenset({"ctrl", "space"}),
+        frozenset({"ctrl", "shift"}),
+        frozenset({"alt", "shift"}),
+        frozenset({"win", "space"}),
     }
 )
 
@@ -68,6 +177,134 @@ class VoiceHotkeySyncResult:
     code: str
     hotkey: str = ""
     message: str = ""
+
+
+def _parsed_hotkey(
+    provider_id: str, shortcut: str
+) -> tuple[Optional[hotkey.HotkeySpec], VoiceHotkeySyncResult]:
+    try:
+        spec = hotkey.HotkeySpec.parse(shortcut)
+        tokens = tuple(spec.modifiers) + (spec.key,)
+        win32_keys.resolve_vk_codes(tokens)
+    except (hotkey.HotkeyParseError, win32_keys.UnknownKeyTokenError) as exc:
+        return None, VoiceHotkeySyncResult(
+            provider_id, False, "invalid_hotkey", message=f"快捷键无效：{exc}"
+        )
+    return spec, VoiceHotkeySyncResult(
+        provider_id, True, "valid", spec.serialize()
+    )
+
+
+def _modifier_family(token: str) -> str:
+    return _MODIFIER_FAMILY_BY_TOKEN.get(token, "")
+
+
+def _is_function_key(token: str) -> bool:
+    if not token.startswith("f") or not token[1:].isdigit():
+        return False
+    return 1 <= int(token[1:]) <= 24
+
+
+def validate_provider_hotkey(
+    provider_id: object, shortcut: str
+) -> VoiceHotkeySyncResult:
+    """Validate one shortcut against the selected program's input rules."""
+
+    provider = str(provider_id).strip().lower()
+    spec, parsed = _parsed_hotkey(provider, shortcut)
+    if spec is None:
+        return parsed
+    normalized = parsed.hotkey
+    tokens = (*spec.modifiers, spec.key)
+
+    if provider == voice_program_manager.VOICE_PROGRAM_SOGOU:
+        if any(token not in _REMOTE_TO_SOGOU_TOKEN for token in tokens):
+            return VoiceHotkeySyncResult(
+                provider,
+                False,
+                "unsupported_key",
+                message="搜狗语音不支持该按键，请换一个常用组合键。",
+            )
+        if len(tokens) > 3:
+            return VoiceHotkeySyncResult(
+                provider,
+                False,
+                "too_many_keys",
+                message="搜狗语音最多允许 3 个按键。",
+            )
+        if len(tokens) == 1:
+            if not (_modifier_family(tokens[0]) or _is_function_key(tokens[0])):
+                return VoiceHotkeySyncResult(
+                    provider,
+                    False,
+                    "unsupported_single_key",
+                    message=(
+                        "搜狗语音的单键只能使用 Ctrl、Shift、Alt、Win 或 F1-F24。"
+                    ),
+                )
+        elif not any(
+            _modifier_family(token) or _is_function_key(token) for token in tokens
+        ):
+            return VoiceHotkeySyncResult(
+                provider,
+                False,
+                "missing_modifier",
+                message=(
+                    "搜狗语音的组合键必须包含 Ctrl、Shift、Alt、Win 或 F1-F24。"
+                ),
+            )
+
+    if provider == voice_program_manager.VOICE_PROGRAM_WETYPE:
+        if len(tokens) > 3:
+            return VoiceHotkeySyncResult(
+                provider,
+                False,
+                "too_many_keys",
+                message="微信输入法最多允许 3 个按键。",
+            )
+        modifier_families = tuple(
+            family for token in tokens if (family := _modifier_family(token))
+        )
+        if not modifier_families:
+            return VoiceHotkeySyncResult(
+                provider,
+                False,
+                "missing_modifier",
+                message="微信输入法的按住型快捷键必须包含修饰键。",
+            )
+        if len(tokens) == 1 and modifier_families[0] == "win":
+            return VoiceHotkeySyncResult(
+                provider,
+                False,
+                "unsupported_single_key",
+                message="微信输入法的单键只能使用 Ctrl、Shift 或 Alt。",
+            )
+        if len(set(modifier_families)) != len(modifier_families):
+            return VoiceHotkeySyncResult(
+                provider,
+                False,
+                "duplicate_modifier",
+                message="微信输入法不接受左右同类修饰键同时使用。",
+            )
+        if any(token in _WETYPE_BLOCKED_KEYS for token in tokens):
+            return VoiceHotkeySyncResult(
+                provider,
+                False,
+                "unsupported_key",
+                message="微信输入法不支持该功能键，请换一个常用组合键。",
+            )
+        comparable_tokens = frozenset(
+            _modifier_family(token) or token for token in tokens
+        )
+        if comparable_tokens in _WETYPE_INPUT_METHOD_SWITCH_CHORDS:
+            return VoiceHotkeySyncResult(
+                provider,
+                False,
+                "reserved_hotkey",
+                message="微信输入法不接受该输入法切换组合，请换一个组合键。",
+            )
+
+    return VoiceHotkeySyncResult(provider, True, "valid", normalized)
 
 
 def default_hotkey(provider_id: object) -> str:
@@ -130,15 +367,10 @@ def sync_provider_hotkey(
     appdata: Optional[Path] = None,
 ) -> VoiceHotkeySyncResult:
     provider = str(provider_id).strip().lower()
-    try:
-        spec = hotkey.HotkeySpec.parse(shortcut)
-        tokens = tuple(spec.modifiers) + (spec.key,)
-        win32_keys.resolve_vk_codes(tokens)
-        normalized = spec.serialize()
-    except (hotkey.HotkeyParseError, win32_keys.UnknownKeyTokenError) as exc:
-        return VoiceHotkeySyncResult(
-            provider, False, "invalid_hotkey", message=f"快捷键无效：{exc}"
-        )
+    validation = validate_provider_hotkey(provider, shortcut)
+    if not validation.ok:
+        return validation
+    normalized = validation.hotkey
 
     current_platform = platform or sys.platform
     if provider in {
@@ -193,7 +425,13 @@ def _provider_tokens_to_hotkey(raw_tokens: object) -> str:
     tokens = []
     for raw_token in raw_tokens:
         token = str(raw_token).strip()
-        normalized = _PROVIDER_TO_REMOTE_TOKEN.get(token.casefold(), token.lower())
+        if token.casefold() == "numpadenter":
+            raise ValueError(
+                "无线麦目前不能区分数字键盘 Enter，请在搜狗语音界面换一个快捷键"
+            )
+        normalized = _SOGOU_TO_REMOTE_TOKEN.get(token.casefold())
+        if normalized is None:
+            raise ValueError(f"搜狗快捷键包含不支持的按键：{token}")
         tokens.append(normalized)
     spec = hotkey.HotkeySpec.parse("+".join(tokens))
     win32_keys.resolve_vk_codes((*spec.modifiers, spec.key))
@@ -203,15 +441,10 @@ def _provider_tokens_to_hotkey(raw_tokens: object) -> str:
 def _hotkey_to_provider_tokens(shortcut: str) -> list[str]:
     spec = hotkey.HotkeySpec.parse(shortcut)
     tokens = (*spec.modifiers, spec.key)
-    return [
-        _REMOTE_TO_PROVIDER_TOKEN.get(
-            token,
-            token.upper()
-            if token.startswith("f") or (len(token) == 1 and token.isalpha())
-            else token,
-        )
-        for token in tokens
-    ]
+    try:
+        return [_REMOTE_TO_SOGOU_TOKEN[token] for token in tokens]
+    except KeyError as exc:
+        raise ValueError(f"搜狗语音不支持按键：{exc.args[0]}") from exc
 
 
 def _load_sogou_document(path: Path) -> dict:
