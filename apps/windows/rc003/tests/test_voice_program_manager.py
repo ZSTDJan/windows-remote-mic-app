@@ -754,9 +754,14 @@ class BridgeStartupWiringTests(unittest.TestCase):
                         "launch_configured_at_bridge_start",
                         return_value=result,
                     ) as launch,
+                    mock.patch.object(
+                        app.voice_program_manager,
+                        "prewarm_sogou_voice_component",
+                    ) as prewarm,
                 ):
                     app.RC003App()
                 launch.assert_called_once()
+                prewarm.assert_not_called()
             finally:
                 logger = logging.getLogger(logging_setup.LOGGER_NAME)
                 for handler in list(logger.handlers):

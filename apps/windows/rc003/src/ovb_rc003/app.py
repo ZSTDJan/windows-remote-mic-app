@@ -217,23 +217,9 @@ class RC003App:
                         voice_program_result.provider_id,
                         voice_program_result.code,
                     )
-            configured_voice_program = (
-                voice_program_manager.normalize_voice_program_settings(
-                    self._config.get("voice_program")
-                )
-            )
-            if (
-                configured_voice_program["provider"]
-                == voice_program_manager.VOICE_PROGRAM_SOGOU
-            ):
-                sogou_prewarm = voice_program_manager.prewarm_sogou_voice_component()
-                self._logger.info(
-                    "voice program: Sogou component prewarm=%s",
-                    sogou_prewarm.code,
-                )
         else:
             self._logger.info(
-                "voice program: startup launch and prewarm skipped during diagnostics recovery"
+                "voice program: startup launch skipped during diagnostics recovery"
             )
         if self._removed_voice_bindings:
             self._logger.warning(

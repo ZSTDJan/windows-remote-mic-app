@@ -57,7 +57,7 @@ ApplicationWindow {
     property bool portableHidSetupPromptAttempted: false
 
     function restoreWindow() {
-        window.show()
+        window.showNormal()
         window.raise()
         window.requestActivate()
         SettingsController.refreshBridgeState()
@@ -703,8 +703,7 @@ ApplicationWindow {
         icon.source: SettingsController.trayIconSource
         tooltip: SettingsController.trayTooltip
         onActivated: function(reason) {
-            if (reason === Platform.SystemTrayIcon.Trigger
-                    || reason === Platform.SystemTrayIcon.DoubleClick)
+            if (reason !== Platform.SystemTrayIcon.Context)
                 window.restoreWindow()
         }
         menu: Platform.Menu {

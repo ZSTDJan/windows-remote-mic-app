@@ -10201,6 +10201,11 @@ class SettingsShellSourceContractTests(unittest.TestCase):
         self.assertNotIn("GeneralPage", self.main_qml)
         self.assertNotIn('objectName: "generalTabButton"', self.main_qml)
         self.assertIn('objectName: "systemTrayIcon"', self.main_qml)
+        self.assertIn("window.showNormal()", self.main_qml)
+        self.assertIn(
+            "reason !== Platform.SystemTrayIcon.Context",
+            self.main_qml,
+        )
         self.assertIn("SettingsController.requestApplicationExit()", self.main_qml)
         self.assertIn("SettingsController.applicationExitConfirmed", self.main_qml)
 
