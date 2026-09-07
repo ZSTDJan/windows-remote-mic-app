@@ -25,16 +25,25 @@ _RC003_ROOT = Path(__file__).resolve().parents[1]
 # routinely contain forbidden-binary-extension files that must never be
 # treated as "committed" content.
 _EXCLUDED_DIR_NAMES = {".venv", "dist", "pyinstaller-work", "third_party"}
+_EXCLUDED_ROOT_FILE_PATTERNS = ("无线麦便携测试包-*.zip",)
 
 
-def _is_excluded_generated_path(path: Path) -> bool:
+def _is_excluded_generated_path(path: Path, root: Path) -> bool:
     """Match both canonical and timestamped build output directories."""
-    return any(
+    is_generated_directory = any(
         part in _EXCLUDED_DIR_NAMES
         or part.startswith("dist-")
         or part.startswith("build-")
         or part.startswith("pyinstaller-work-")
+        or part.startswith("smoke-dist-")
+        or part.startswith("smoke-work-")
+        or part.startswith("ui-audit-")
         for part in path.parts
+    )
+    if is_generated_directory:
+        return True
+    return path.parent == root and any(
+        path.match(pattern) for pattern in _EXCLUDED_ROOT_FILE_PATTERNS
     )
 
 _FORBIDDEN_BINARY_EXTENSIONS = {".exe", ".dll", ".pyd", ".zip", ".xz"}
@@ -147,7 +156,7 @@ def _scan(root: Path):
     violations = []
     all_files = [path for path in root.rglob("*") if path.is_file()]
     all_files = [
-        path for path in all_files if not _is_excluded_generated_path(path)
+        path for path in all_files if not _is_excluded_generated_path(path, root)
     ]
 
     for path in all_files:
@@ -347,6 +356,10 @@ class BoundaryScanReplayTests(unittest.TestCase):
                 root / "dist" / "installer" / "RemoteMicRC003Setup-unsigned.exe",
                 root / "build" / "pyinstaller-work" / "RemoteMicRC003" / "warn.txt.exe",
                 root / "build" / "third_party" / "vendored.dll",
+                root / "build" / "smoke-dist-c23" / "RemoteMicRC003.exe",
+                root / "build" / "smoke-work-c23" / "analysis.pyd",
+                root / "build" / "ui-audit-c23" / "settings.png.exe",
+                root / "无线麦便携测试包-022.zip",
             ]
             for generated_path in generated_paths:
                 generated_path.parent.mkdir(parents=True, exist_ok=True)

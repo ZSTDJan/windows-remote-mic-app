@@ -108,6 +108,7 @@ $autostartMarkers = @("CurrentVersion\Run", "userstartup")
 # bare directory-name path component (see Get-NormalizedRelativePath),
 # so this is independent of which OS/shell produced the path separators.
 $excludedDirNames = @(".venv", "dist", "pyinstaller-work", "third_party")
+$excludedRootFilePatterns = @("无线麦便携测试包-*.zip")
 
 # Files that legitimately *define* the forbidden-term lists above, a
 # negative-test fixture, or a documented EXCLUSION statement - skip ONLY the
@@ -197,7 +198,10 @@ function Test-ExcludedGeneratedPath {
             ($ExcludedDirNames -contains $component) -or
             ($component -like "dist-*") -or
             ($component -like "build-*") -or
-            ($component -like "pyinstaller-work-*")
+            ($component -like "pyinstaller-work-*") -or
+            ($component -like "smoke-dist-*") -or
+            ($component -like "smoke-work-*") -or
+            ($component -like "ui-audit-*")
         ) {
             return $true
         }
@@ -224,6 +228,11 @@ function Remove-CommentLines {
 Push-Location $ProjectRoot
 try {
     $allFiles = Get-ChildItem -Recurse -File | Where-Object {
+        $relativePath = Get-NormalizedRelativePath -FullName $_.FullName -Root $ProjectRoot
+        $isExcludedRootFile = @(
+            $excludedRootFilePatterns | Where-Object { $relativePath -like $_ }
+        ).Count -gt 0
+        -not $isExcludedRootFile -and
         -not (Test-ExcludedGeneratedPath -FullName $_.FullName -ExcludedDirNames $excludedDirNames)
     }
 
