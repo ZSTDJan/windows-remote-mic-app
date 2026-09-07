@@ -92,6 +92,24 @@ class FakeHotkeyCapture:
 
 m.hotkey_capture_windows.HotkeyCapture = FakeHotkeyCapture
 
+
+def inspect_voice_program(settings):
+    provider_id = str(settings.get("provider", ""))
+    return m.voice_program_manager.VoiceProgramStatus(
+        provider_id=provider_id,
+        display_name=m.voice_program_manager.VOICE_PROGRAM_PROVIDER_NAMES.get(
+            provider_id, "测试语音程序"
+        ),
+        available=False,
+        running=False,
+        elevated=None,
+        executable=None,
+        code="not_found",
+    )
+
+
+m.voice_program_manager.inspect_voice_program = inspect_voice_program
+
 QQuickStyle.setStyle("Basic")
 app = QGuiApplication.instance() or QGuiApplication([])
 m.single_instance.bridge_instance_running = lambda: False
