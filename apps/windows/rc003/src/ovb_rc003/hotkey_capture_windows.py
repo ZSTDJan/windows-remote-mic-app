@@ -1,4 +1,4 @@
-"""Capture one real Windows keyboard chord for the settings recorder.
+"""Capture one Windows keyboard chord for the settings recorder.
 
 The QML ``Keys`` layer intentionally does not participate in recording. Qt
 normalizes left/right modifiers and only exposes a limited set of key names,
@@ -7,6 +7,10 @@ faithfully. This module owns a real ``WH_KEYBOARD_LL`` hook instead: it keeps
 the first key-down order, preserves directional modifiers, suppresses the
 captured events so they cannot affect the foreground application, and emits
 one serialized token string after the last captured key is released.
+
+The normal low-level primitive rejects injected events. The settings UI opts
+in while the user is explicitly recording so a keyboard forwarded by remote
+control software can configure the same field as a local physical keyboard.
 
 The hook is installed only while the settings recorder dialog is open. The
 module can still be imported on non-Windows hosts; only ``start()`` requires
@@ -120,8 +124,16 @@ CaptureCallback = Callable[[str], None]
 class HotkeyCapture:
     """Own one short-lived global low-level keyboard hook."""
 
-    def __init__(self, on_captured: CaptureCallback) -> None:
+    def __init__(
+        self,
+        on_captured: CaptureCallback,
+        *,
+        accept_injected: bool = False,
+    ) -> None:
+        """Create a recorder; injected input is accepted only by explicit opt-in."""
+
         self._on_captured = on_captured
+        self._accept_injected = bool(accept_injected)
         self._thread: Optional[threading.Thread] = None
         self._thread_id = 0
         self._hook = None
@@ -234,7 +246,7 @@ class HotkeyCapture:
     def _handle_event(self, message: int, data: KBDLLHOOKSTRUCT) -> bool:
         if self._stop_event.is_set():
             return False
-        if int(data.flags) & LLKHF_INJECTED:
+        if int(data.flags) & LLKHF_INJECTED and not self._accept_injected:
             return False
         is_down = message in (WM_KEYDOWN, WM_SYSKEYDOWN)
         is_up = message in (WM_KEYUP, WM_SYSKEYUP) or bool(

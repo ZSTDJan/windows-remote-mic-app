@@ -310,79 +310,6 @@ Item {
             SettingsController.refreshVoiceProgramStatus()
     }
 
-    function voiceProgramStatusSummary() {
-        const code = SettingsController.voiceProgramStatusCode
-        if (!voiceProgramManaged)
-            return qsTr("不管理")
-        if (windowsDictationSelected)
-            return qsTr("Windows 内置")
-        if (voiceProgramSystemManaged) {
-            if (code === "running" || code === "stopped")
-                return qsTr("已识别 · 系统管理")
-            if (code === "not_found")
-                return qsTr("未找到程序")
-            return qsTr("需检查")
-        }
-        if (code === "running") {
-            const privilege = SettingsController.voiceProgramElevationStatus
-            if (privilege === "unknown")
-                return qsTr("运行中 · 权限未知")
-            const elevated = privilege === "elevated"
-            if (SettingsController.voiceProgramLaunchElevated !== elevated) {
-                return SettingsController.voiceProgramLaunchElevated
-                    ? qsTr("需重启为管理员") : qsTr("需重启为普通权限")
-            }
-            return elevated ? qsTr("管理员运行中") : qsTr("普通权限运行中")
-        }
-        if (code === "running_not_ready")
-            return qsTr("运行中 · 窗口未就绪")
-        if (code === "stopped")
-            return SettingsController.bridgeRunning
-                && SettingsController.voiceProgramSettingsDirty
-                ? qsTr("已修改 · 待应用") : qsTr("已找到 · 待启动")
-        if (code === "not_found")
-            return customProgramSelected
-                && SettingsController.voiceProgramCustomPath.length === 0
-                ? qsTr("请选择程序") : qsTr("未找到程序")
-        return qsTr("需检查")
-    }
-
-    function voiceProgramLaunchDescription() {
-        const code = SettingsController.voiceProgramStatusCode
-        if (!voiceProgramManaged)
-            return qsTr("只发送语音快捷键，不启动程序")
-        if (windowsDictationSelected)
-            return qsTr("使用 Windows 听写与联机语音识别")
-        if (sogouSelected && code !== "not_found") {
-            return voiceProgramStatusSummary()
-                + qsTr("；设置：在任务栏（含隐藏图标）右键搜狗语音图标")
-        }
-        if (voiceProgramNeedsAttention
-                || code === "not_found"
-                || code === "stopped") {
-            return voiceProgramStatusSummary()
-        }
-        if (voiceProgramSystemManaged)
-            return qsTr("由 Windows 管理，无需本程序启动")
-        return qsTr("随遥控器服务启动；失败不影响服务")
-    }
-
-    function voiceHotkeyDescription() {
-        if (sogouSelected && root.voiceHotkeyBusy)
-            return qsTr("正在读取搜狗的按住型快捷键。")
-        if (sogouSelected
-                && SettingsController.voiceHotkeySaveState === "retry")
-            return qsTr("未读取到搜狗的按住型快捷键，请重新选择搜狗或直接录入。")
-        if (sogouSelected)
-            return qsTr("已读取搜狗当前的按住说快捷键。如需修改，请在「搜狗语音界面」修改按住型快捷键，改后自动同步。")
-        if (wetypeSelected)
-            return qsTr("需手动设置，使「微信语音界面的按住型快捷键」和「语音按键」统一。")
-        if (windowsDictationSelected)
-            return qsTr("Windows 语音输入固定使用 Win+H")
-        return qsTr("仅在%1中记录按住型快捷键")
-            .arg(SettingsController.applicationDisplayName)
-    }
-
     function startVoiceHotkeyCapture() {
         if (windowsDictationSelected)
             return
@@ -617,9 +544,9 @@ Item {
             root.finishCapturedVoiceHotkey(chord)
         }
         function onHotkeyCaptureError(message) {
-            if (!root.voiceHotkeyRecording)
-                return
             root.pendingVoiceHotkey = ""
+            if (!SettingsController.hotkeyCaptureActive)
+                root.voiceHotkeyRecording = false
             root.voiceHotkeyCaptureError = message
         }
         function onHotkeyCaptureActiveChanged() {
@@ -894,9 +821,10 @@ Item {
                     titleText: qsTr("语音按键")
                     descriptionText: root.voiceHotkeyCaptureError.length > 0
                         ? root.voiceHotkeyCaptureError
-                        : root.voiceHotkeyDescription()
+                        : qsTr("仅支持录入“按住型”快捷键")
                     stateText: root.voiceHotkeyRecording
-                        ? qsTr("录入中")
+                        ? SettingsController.hotkeyCaptureReady
+                            ? qsTr("录入中") : qsTr("准备中")
                         : root.voiceHotkeyBusy ? qsTr("处理中")
                             : root.voiceHotkeyCaptureError.length > 0
                                 || SettingsController.voiceHotkeySaveState === "retry"
@@ -918,7 +846,8 @@ Item {
                                 && !root.windowsDictationSelected
                                 && !root.configurationWriteBusy
                             text: root.voiceHotkeyRecording
-                                ? qsTr("请按快捷键")
+                                ? SettingsController.hotkeyCaptureReady
+                                    ? qsTr("请按快捷键") : qsTr("正在准备…")
                                 : SettingsController.holdVoiceHotkeyText
                             color: root.voiceHotkeyRecording
                                 ? tokens.accent : tokens.textPrimary
@@ -961,17 +890,6 @@ Item {
                     }
                 }
 
-                InlineSettingsRow {
-                    objectName: "voiceProgramSpecificRow"
-                    tokens: root.tokens
-                    stateColumnWidth: root.settingsStateColumnWidth
-                    actionColumnWidth: root.settingsActionColumnWidth
-                    titleText: root.windowsDictationSelected
-                        ? qsTr("系统设置") : qsTr("程序启动")
-                    descriptionObjectName: "voiceProgramLaunchText"
-                    descriptionText: root.voiceProgramLaunchDescription()
-                    showDivider: false
-                }
             }
 
             SectionFrame {

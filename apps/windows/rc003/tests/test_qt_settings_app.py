@@ -2734,11 +2734,14 @@ class SettingsControllerTests(unittest.TestCase):
     def test_hotkey_captured_during_start_is_delivered_after_hook_start_finishes(self):
         controller, _ = self._make_controller()
         captured = []
+        instances = []
 
         class ImmediateCapture:
-            def __init__(self, callback):
+            def __init__(self, callback, *, accept_injected=False):
                 self._callback = callback
+                self.accept_injected = accept_injected
                 self.is_running = False
+                instances.append(self)
 
             def start(self):
                 self._callback("lctrl+lshift+f8")
@@ -2759,9 +2762,25 @@ class SettingsControllerTests(unittest.TestCase):
             controller.startHotkeyCapture()
 
         self.assertEqual(captured, ["lctrl+lshift+f8"])
+        self.assertTrue(instances[0].accept_injected)
+        self.assertFalse(controller.hotkeyCaptureReady)
         self.assertFalse(controller.hotkeyCaptureActive)
         self.assertIsNone(controller._hotkey_capture)
         self.assertIsNone(controller._pending_hotkey_capture_result)
+
+    def test_hotkey_capture_ready_only_after_the_hook_is_active(self):
+        controller, _ = self._make_controller()
+
+        controller._set_input_operation_state("hotkey", "starting")
+        self.assertTrue(controller.hotkeyCaptureActive)
+        self.assertFalse(controller.hotkeyCaptureReady)
+
+        controller._hotkey_capture = object()
+        controller._set_input_operation_state("hotkey", "active")
+        self.assertTrue(controller.hotkeyCaptureReady)
+
+        controller._set_input_operation_state("hotkey", "stopping")
+        self.assertFalse(controller.hotkeyCaptureReady)
 
     def test_hotkey_result_from_an_older_operation_is_ignored(self):
         controller, _ = self._make_controller()
@@ -8401,26 +8420,26 @@ def row_snapshot(row, description_name=""):
     assert state_label is not None
     assert state_column is not None
     assert description_label is not None
-    baseline_delta = None
-    title_baseline_delta = None
+    center_delta = None
+    title_center_delta = None
     if bool(description_label.property("visible")):
         title_origin = title_label.mapToScene(QPointF(0, 0))
         description_origin = description_label.mapToScene(QPointF(0, 0))
         state_origin = state_label.mapToScene(QPointF(0, 0))
-        description_baseline = (
+        description_center = (
             float(description_origin.y())
-            + float(description_label.property("baselineOffset"))
+            + float(description_label.property("height")) / 2
         )
-        state_baseline = (
+        state_center = (
             float(state_origin.y())
-            + float(state_label.property("baselineOffset"))
+            + float(state_label.property("height")) / 2
         )
-        title_baseline = (
+        title_center = (
             float(title_origin.y())
-            + float(title_label.property("baselineOffset"))
+            + float(title_label.property("height")) / 2
         )
-        baseline_delta = abs(description_baseline - state_baseline)
-        title_baseline_delta = abs(title_baseline - description_baseline)
+        center_delta = abs(description_center - state_center)
+        title_center_delta = abs(title_center - description_center)
     return {
         "state": str(row.property("stateText")),
         "detail": str(row.property("descriptionText")),
@@ -8431,8 +8450,8 @@ def row_snapshot(row, description_name=""):
         "detail_truncated": bool(description_label.property("truncated")),
         "detail_width": float(description_label.property("width")),
         "detail_implicit_width": float(description_label.property("implicitWidth")),
-        "baseline_delta": baseline_delta,
-        "title_baseline_delta": title_baseline_delta,
+        "center_delta": center_delta,
+        "title_center_delta": title_center_delta,
     }
 
 
@@ -9584,7 +9603,6 @@ voice_row_names = (
     "voiceProgramSelectionRow",
     "voiceProgramCustomPathRow",
     "voiceHotkeyRow",
-    "voiceProgramSpecificRow",
     "soundChannelTestRow",
     "actualSpeechTestRow",
 )
@@ -9621,7 +9639,7 @@ result["voice_columns"] = {
     "descriptions": {
         name: bounds(window, name)
         for name in (
-            "voiceProgramLaunchText",
+            "voiceHotkeyRow_descriptionLabel",
             "soundChannelTestDescription",
             "actualSpeechTestDescription",
         )
@@ -9629,7 +9647,6 @@ result["voice_columns"] = {
     "editor_columns": {
         name: bounds(window, name + "_editorColumn")
         for name in (
-            "voiceProgramSpecificRow",
             "soundChannelTestRow",
             "actualSpeechTestRow",
         )
@@ -10040,9 +10057,11 @@ class SettingsShellSourceContractTests(unittest.TestCase):
             "Math.max(\n                root.stateColumnWidth",
             self.inline_settings_row_qml,
         )
-        self.assertIn(
-            "Layout.alignment: Qt.AlignBaseline",
-            self.inline_settings_row_qml,
+        self.assertEqual(
+            self.inline_settings_row_qml.count(
+                "Layout.alignment: Qt.AlignVCenter"
+            ),
+            4,
         )
         for too_long in ("版本不兼容", "等待遥控器", "系统不支持"):
             self.assertNotIn(too_long, self.device_qml)
@@ -10340,17 +10359,12 @@ class SettingsShellSourceContractTests(unittest.TestCase):
         self.assertIn('titleText: qsTr("麦克风权限")', self.voice_qml)
         self.assertNotIn('stateText: qsTr("待确认")', self.voice_qml)
         self.assertIn(
-            'qsTr("已读取搜狗当前的按住说快捷键。如需修改，请在「搜狗语音界面」修改按住型快捷键，改后自动同步。")',
+            'qsTr("仅支持录入“按住型”快捷键")',
             self.voice_qml,
         )
-        self.assertIn(
-            'qsTr("未读取到搜狗的按住型快捷键，请重新选择搜狗或直接录入。")',
-            self.voice_qml,
-        )
-        self.assertIn(
-            'qsTr("需手动设置，使「微信语音界面的按住型快捷键」和「语音按键」统一。")',
-            self.voice_qml,
-        )
+        self.assertIn("SettingsController.hotkeyCaptureReady", self.voice_qml)
+        self.assertIn('qsTr("准备中")', self.voice_qml)
+        self.assertIn('qsTr("正在准备…")', self.voice_qml)
         self.assertIn('? qsTr("录入中")', self.voice_qml)
         self.assertIn(
             'SettingsController.voiceHotkeySaveState === "retry"',
@@ -10367,7 +10381,8 @@ class SettingsShellSourceContractTests(unittest.TestCase):
             "VB-CABLE 安装成功",
         ):
             self.assertNotIn(misleading_claim, self.voice_qml)
-        self.assertIn("由 Windows 管理", self.voice_qml)
+        self.assertNotIn('objectName: "voiceProgramSpecificRow"', self.voice_qml)
+        self.assertNotIn('objectName: "voiceProgramLaunchText"', self.voice_qml)
         self.assertIn('objectName: "actualSpeechInstruction"', self.voice_qml)
         self.assertIn(
             "保持光标在输入框中，按住遥控器话筒键说话，松开后查看文字。",
@@ -10498,11 +10513,7 @@ class SettingsShellSourceContractTests(unittest.TestCase):
     def test_voice_hotkey_field_is_owned_by_the_voice_page(self):
         self.assertIn('placeholderText: qsTr("点击录入")', self.voice_qml)
         self.assertIn(
-            'qsTr("已读取搜狗当前的按住说快捷键。如需修改，请在「搜狗语音界面」修改按住型快捷键，改后自动同步。")',
-            self.voice_qml,
-        )
-        self.assertIn(
-            'qsTr("需手动设置，使「微信语音界面的按住型快捷键」和「语音按键」统一。")',
+            'qsTr("仅支持录入“按住型”快捷键")',
             self.voice_qml,
         )
         self.assertIn(
@@ -10516,17 +10527,10 @@ class SettingsShellSourceContractTests(unittest.TestCase):
         )
         self.assertNotIn('objectName: "holdVoiceHotkeyField"', self.buttons_qml)
 
-    def test_voice_program_status_uses_structured_privilege_and_dirty_state(self):
-        self.assertIn(
-            "SettingsController.voiceProgramElevationStatus",
-            self.voice_qml,
-        )
-        self.assertIn(
-            "SettingsController.voiceProgramSettingsDirty",
-            self.voice_qml,
-        )
-        self.assertNotIn("SettingsController.settingsDirty", self.voice_qml)
-        self.assertNotIn("voiceProgramStatusText.indexOf", self.voice_qml)
+    def test_voice_program_section_has_no_redundant_note_only_row(self):
+        self.assertNotIn('objectName: "voiceProgramSpecificRow"', self.voice_qml)
+        self.assertNotIn('objectName: "voiceProgramLaunchText"', self.voice_qml)
+        self.assertNotIn("voiceProgramLaunchDescription", self.voice_qml)
 
     def test_voice_rows_use_the_shared_fixed_action_column(self):
         self.assertIn(
@@ -11496,10 +11500,10 @@ class OffscreenQmlLoadTests(unittest.TestCase):
                             row["detail_width"] + 0.5,
                             row["detail_implicit_width"],
                         )
-                        if row["baseline_delta"] is not None:
-                            self.assertLessEqual(row["baseline_delta"], 0.5)
-                        if row["title_baseline_delta"] is not None:
-                            self.assertLessEqual(row["title_baseline_delta"], 0.5)
+                        if row["center_delta"] is not None:
+                            self.assertLessEqual(row["center_delta"], 0.5)
+                        if row["title_center_delta"] is not None:
+                            self.assertLessEqual(row["title_center_delta"], 0.5)
                 for case in style_data["actual_speech_cases"].values():
                     row = case["row"]
                     self.assertFalse(row["state_truncated"])
@@ -11512,10 +11516,10 @@ class OffscreenQmlLoadTests(unittest.TestCase):
                         row["detail_width"] + 0.5,
                         row["detail_implicit_width"],
                     )
-                    if row["baseline_delta"] is not None:
-                        self.assertLessEqual(row["baseline_delta"], 0.5)
-                    if row["title_baseline_delta"] is not None:
-                        self.assertLessEqual(row["title_baseline_delta"], 0.5)
+                    if row["center_delta"] is not None:
+                        self.assertLessEqual(row["center_delta"], 0.5)
+                    if row["title_center_delta"] is not None:
+                        self.assertLessEqual(row["title_center_delta"], 0.5)
 
     def test_three_page_shell_fits_compact_viewports_without_horizontal_overflow(self):
         import json
@@ -11581,19 +11585,17 @@ class OffscreenQmlLoadTests(unittest.TestCase):
                     )
 
                 descriptions = data["voice_columns"]["descriptions"]
-                launch_x = descriptions["voiceProgramLaunchText"]["x"]
-                self.assertAlmostEqual(
-                    descriptions["soundChannelTestDescription"]["x"],
-                    launch_x,
-                    delta=0.5,
-                )
+                note_x = descriptions["voiceHotkeyRow_descriptionLabel"]["x"]
+                test_description_x = descriptions[
+                    "soundChannelTestDescription"
+                ]["x"]
                 self.assertAlmostEqual(
                     descriptions["actualSpeechTestDescription"]["x"],
-                    launch_x,
+                    test_description_x,
                     delta=0.5,
                 )
+                self.assertGreater(note_x, test_description_x)
                 editor_columns = data["voice_columns"]["editor_columns"]
-                self.assertFalse(editor_columns["voiceProgramSpecificRow"]["visible"])
                 self.assertFalse(editor_columns["soundChannelTestRow"]["visible"])
                 self.assertFalse(editor_columns["actualSpeechTestRow"]["visible"])
                 self.assertTrue(data["voice_recovery_editor"]["column"]["visible"])

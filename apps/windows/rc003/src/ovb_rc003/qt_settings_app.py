@@ -2465,7 +2465,7 @@ def _load_qt_classes() -> dict:
                 try:
                     hotkey_capture.stop()
                 except Exception as exc:  # noqa: BLE001 - returned to Qt
-                    errors.append(f"停止真实键盘录制时出错：{exc}")
+                    errors.append(f"停止键盘快捷键录入时出错：{exc}")
                 else:
                     remaining_capture = None
             if bridge_request is not None:
@@ -2507,7 +2507,8 @@ def _load_qt_classes() -> dict:
             capture = hotkey_capture_windows.HotkeyCapture(
                 lambda chord: self._hotkeyCaptureResult.emit(
                     (operation_token, chord)
-                )
+                ),
+                accept_injected=True,
             )
             try:
                 capture.start()
@@ -2516,13 +2517,13 @@ def _load_qt_classes() -> dict:
                     return _InputStartResult(
                         "hotkey",
                         False,
-                        f"无法启动真实键盘录制：{exc}",
+                        f"无法启动键盘快捷键录入：{exc}",
                         hotkey_capture=capture,
                     )
                 return _InputStartResult(
                     "hotkey",
                     False,
-                    f"无法启动真实键盘录制：{exc}",
+                    f"无法启动键盘快捷键录入：{exc}",
                 )
             if cancel_event.is_set():
                 stopped = self._stop_input_resources(
@@ -4599,6 +4600,16 @@ def _load_qt_classes() -> dict:
             notify=hotkeyCaptureActiveChanged,
         )
 
+        hotkeyCaptureReady = Property(
+            bool,
+            lambda self: (
+                self._input_operation_kind == "hotkey"
+                and self._input_operation_phase == "active"
+                and self._hotkey_capture is not None
+            ),
+            notify=inputOperationChanged,
+        )
+
         inputCaptureInUse = Property(
             bool,
             _get_input_capture_in_use,
@@ -5588,7 +5599,7 @@ def _load_qt_classes() -> dict:
 
         @Slot(result=bool)
         def startHotkeyCapture(self) -> bool:
-            """Start the EXE-owned physical keyboard shortcut recorder."""
+            """Start the settings-owned Windows keyboard shortcut recorder."""
 
             return self._begin_input_operation_start(
                 "hotkey", self._start_hotkey_capture_worker
@@ -5596,7 +5607,7 @@ def _load_qt_classes() -> dict:
 
         @Slot(result=bool)
         def stopHotkeyCapture(self) -> bool:
-            """Stop the physical recorder, including Cancel/window close."""
+            """Stop the recorder, including Cancel/window close."""
 
             return self._request_input_stop(kind="hotkey")
 

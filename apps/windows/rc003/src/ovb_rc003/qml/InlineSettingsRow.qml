@@ -41,7 +41,7 @@ Rectangle {
             Layout.preferredWidth: root.titleWidth
             Layout.minimumWidth: root.titleWidth
             Layout.maximumWidth: root.titleWidth
-            Layout.alignment: Qt.AlignBaseline
+            Layout.alignment: Qt.AlignVCenter
             text: root.titleText
             font.weight: Font.Medium
             elide: Text.ElideRight
@@ -66,6 +66,7 @@ Rectangle {
                 ? root.editorColumnWidth : 0
             Layout.maximumWidth: root.editorColumnWidth > 0
                 ? root.editorColumnWidth : 16777215
+            Layout.alignment: Qt.AlignVCenter
         }
 
         UiLabel {
@@ -79,7 +80,7 @@ Rectangle {
             kind: noteKind
             Layout.fillWidth: true
             Layout.minimumWidth: root.descriptionNeverElide ? implicitWidth : 0
-            Layout.alignment: Qt.AlignBaseline
+            Layout.alignment: Qt.AlignVCenter
             text: root.descriptionText
             wrapMode: Text.NoWrap
             elide: root.descriptionNeverElide ? Text.ElideNone : Text.ElideRight
@@ -110,7 +111,7 @@ Rectangle {
             Layout.preferredWidth: columnWidth
             Layout.minimumWidth: columnWidth
             Layout.maximumWidth: columnWidth
-            Layout.alignment: Qt.AlignBaseline
+            Layout.alignment: Qt.AlignVCenter
 
             UiLabel {
                 id: stateLabel

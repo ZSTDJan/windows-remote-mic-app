@@ -110,6 +110,36 @@ class HotkeyCaptureStateTests(unittest.TestCase):
         )
         self.assertEqual(captured, [])
 
+    def test_explicit_recorder_accepts_remote_injected_shortcut(self):
+        captured = []
+        recorder = hotkey_capture_windows.HotkeyCapture(
+            captured.append,
+            accept_injected=True,
+        )
+
+        self.assertTrue(
+            recorder._handle_event(
+                hotkey_capture_windows.WM_KEYDOWN,
+                self._event(
+                    0x41,
+                    0x1E,
+                    hotkey_capture_windows.LLKHF_INJECTED,
+                ),
+            )
+        )
+        self.assertTrue(
+            recorder._handle_event(
+                hotkey_capture_windows.WM_KEYUP,
+                self._event(
+                    0x41,
+                    0x1E,
+                    hotkey_capture_windows.LLKHF_INJECTED
+                    | hotkey_capture_windows.LLKHF_UP,
+                ),
+            )
+        )
+        self.assertEqual(captured, ["a"])
+
     def test_key_up_without_a_captured_down_is_not_suppressed(self):
         captured = []
         recorder = hotkey_capture_windows.HotkeyCapture(captured.append)
@@ -118,6 +148,26 @@ class HotkeyCaptureStateTests(unittest.TestCase):
             recorder._handle_event(
                 hotkey_capture_windows.WM_KEYUP,
                 self._event(0x26, 0x48, hotkey_capture_windows.LLKHF_UP),
+            )
+        )
+        self.assertEqual(captured, [])
+
+    def test_remote_injected_key_up_without_owned_down_is_not_suppressed(self):
+        captured = []
+        recorder = hotkey_capture_windows.HotkeyCapture(
+            captured.append,
+            accept_injected=True,
+        )
+
+        self.assertFalse(
+            recorder._handle_event(
+                hotkey_capture_windows.WM_KEYUP,
+                self._event(
+                    0x41,
+                    0x1E,
+                    hotkey_capture_windows.LLKHF_INJECTED
+                    | hotkey_capture_windows.LLKHF_UP,
+                ),
             )
         )
         self.assertEqual(captured, [])

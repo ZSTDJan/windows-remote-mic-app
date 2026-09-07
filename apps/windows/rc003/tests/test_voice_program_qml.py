@@ -69,8 +69,9 @@ DiagnosticsController = classes["DiagnosticsController"]
 
 
 class FakeHotkeyCapture:
-    def __init__(self, on_captured):
+    def __init__(self, on_captured, *, accept_injected=False):
         self.on_captured = on_captured
+        self.accept_injected = accept_injected
         self.is_running = False
 
     def start(self):
@@ -136,8 +137,8 @@ controls = {
         "voiceProgramSection",
         "voiceProgramCombo",
         "holdVoiceHotkeyField",
+        "voiceHotkeyRow",
         "voiceProgramElevatedCheckBox",
-        "voiceProgramLaunchText",
         "openVoiceProgramSettingsButton",
     )
 }
@@ -156,7 +157,8 @@ hotkey_center = hotkey_field.mapToScene(
 QTest.mouseClick(window, Qt.LeftButton, Qt.NoModifier, hotkey_center)
 render(window, app)
 recording_prompt = str(hotkey_field.property("text"))
-outside_target = controls["voiceProgramLaunchText"]
+outside_target = find(window, "voiceProgramSectionTitle")
+assert outside_target is not None
 outside_center = outside_target.mapToScene(
     QPointF(
         outside_target.property("width") / 2,
@@ -197,6 +199,30 @@ controller._voice_program_status_code = "not_found"
 controller.voiceProgramStatusCodeChanged.emit()
 render(window, app)
 
+voice_page.setProperty("voiceHotkeyRecording", True)
+controller.hotkeyCaptureError.emit("模拟启动失败")
+render(window, app)
+inactive_capture_error = {
+    "recording": bool(voice_page.property("voiceHotkeyRecording")),
+    "description": str(controls["voiceHotkeyRow"].property("descriptionText")),
+}
+voice_page.setProperty("voiceHotkeyCaptureError", "")
+
+retained_capture = FakeHotkeyCapture(lambda _chord: None)
+retained_capture.is_running = True
+controller._hotkey_capture = retained_capture
+controller._set_input_operation_state("hotkey", "active")
+voice_page.setProperty("voiceHotkeyRecording", True)
+controller.hotkeyCaptureError.emit("模拟停止前异常")
+render(window, app)
+active_capture_error = {
+    "recording": bool(voice_page.property("voiceHotkeyRecording")),
+    "description": str(controls["voiceHotkeyRow"].property("descriptionText")),
+}
+controller.stopHotkeyCapture()
+render(window, app)
+voice_page.setProperty("voiceHotkeyCaptureError", "")
+
 managed = {
     name: {
         "visible": bool(control.property("visible")),
@@ -209,92 +235,6 @@ managed = {
 }
 managed_auto_start = bool(controller.voiceProgramLaunchOnBridgeStart)
 managed_elevated = bool(controller.voiceProgramLaunchElevated)
-managed_status = str(controls["voiceProgramLaunchText"].property("text"))
-
-
-def rendered_status(
-    code,
-    text,
-    elevation,
-    *,
-    bridge_running,
-    settings_dirty,
-    voice_program_dirty,
-):
-    controller._set_bridge_running(bridge_running)
-    controller._set_settings_dirty(settings_dirty)
-    controller._set_voice_program_settings_dirty(voice_program_dirty)
-    controller._voice_program_status_code = code
-    controller._voice_program_status_text = text
-    controller._voice_program_elevation_status = elevation
-    controller.voiceProgramStatusCodeChanged.emit()
-    controller.voiceProgramStatusTextChanged.emit()
-    controller.voiceProgramElevationStatusChanged.emit()
-    render(window, app)
-    label = controls["voiceProgramLaunchText"]
-    return {
-        "text": str(label.property("text")),
-        "color": label.property("color").name(),
-        "settings_button_text": str(
-            controls["openVoiceProgramSettingsButton"].property("text")
-        ),
-        "settings_button_visible": bool(
-            controls["openVoiceProgramSettingsButton"].property("visible")
-        ),
-    }
-
-
-status_cases = {
-    "unknown_running": rendered_status(
-        "running",
-        "正在运行（权限状态未知）。",
-        "unknown",
-        bridge_running=True,
-        settings_dirty=False,
-        voice_program_dirty=False,
-    ),
-    "standard_mismatch": rendered_status(
-        "running",
-        "正在运行（普通权限）。",
-        "standard",
-        bridge_running=True,
-        settings_dirty=False,
-        voice_program_dirty=False,
-    ),
-}
-controller.voiceProgramLaunchElevated = False
-status_cases["standard_running"] = rendered_status(
-    "running",
-    "正在运行（普通权限）。",
-    "standard",
-    bridge_running=True,
-    settings_dirty=False,
-    voice_program_dirty=False,
-)
-status_cases["stopped_clean"] = rendered_status(
-    "stopped",
-    "已找到，当前未运行。",
-    "unknown",
-    bridge_running=True,
-    settings_dirty=False,
-    voice_program_dirty=False,
-)
-status_cases["stopped_unrelated_dirty"] = rendered_status(
-    "stopped",
-    "已找到，当前未运行。",
-    "unknown",
-    bridge_running=True,
-    settings_dirty=True,
-    voice_program_dirty=False,
-)
-status_cases["stopped_voice_program_dirty"] = rendered_status(
-    "stopped",
-    "已找到，当前未运行。",
-    "unknown",
-    bridge_running=True,
-    settings_dirty=True,
-    voice_program_dirty=True,
-)
 
 controller.selectedVoiceProgramIndex = 2
 render(window, app)
@@ -302,7 +242,6 @@ system_managed = {
     "provider": bool(controller.voiceProgramSystemManaged),
     "auto_start": bool(controller.voiceProgramLaunchOnBridgeStart),
     "elevated_visible": bool(elevated.property("visible")),
-    "launch_text": str(find(window, "voiceProgramLaunchText").property("text")),
     "custom_path_visible": bool(
         find(window, "voiceProgramCustomPathField").property("visible")
     ),
@@ -330,7 +269,6 @@ windows_dictation = {
     "settings_button_geometry": geometry(
         find(window, "openVoiceProgramSettingsButton")
     ),
-    "launch_text": str(find(window, "voiceProgramLaunchText").property("text")),
 }
 
 controller.selectedVoiceProgramIndex = 4
@@ -358,12 +296,12 @@ result = {
     "window_height": float(window.property("height")),
     "managed": managed,
     "elevated_indicator": geometry(elevated_indicator),
-    "status": managed_status,
     "managed_auto_start": managed_auto_start,
     "managed_elevated": managed_elevated,
     "hotkey_cancel": hotkey_cancel,
     "hotkey_other_action": hotkey_other_action,
-    "status_cases": status_cases,
+    "inactive_capture_error": inactive_capture_error,
+    "active_capture_error": active_capture_error,
     "system_managed": system_managed,
     "windows_dictation": windows_dictation,
     "custom_program": custom_program,
@@ -377,6 +315,8 @@ result = {
             "saveVoiceProgramButton",
             "refreshVoiceProgramButton",
             "launchVoiceProgramButton",
+            "voiceProgramSpecificRow",
+            "voiceProgramLaunchText",
         )
     ),
 }
@@ -417,12 +357,6 @@ class VoiceProgramQmlTests(unittest.TestCase):
         )
         self.assertTrue(data["managed_auto_start"])
         self.assertTrue(data["managed_elevated"])
-        self.assertTrue(
-            all(
-                not case["settings_button_visible"]
-                for case in data["status_cases"].values()
-            )
-        )
         self.assertEqual(data["hotkey_cancel"]["recording_prompt"], "请按快捷键")
         self.assertFalse(data["hotkey_cancel"]["recording"])
         self.assertEqual(
@@ -439,6 +373,16 @@ class VoiceProgramQmlTests(unittest.TestCase):
             data["hotkey_other_action"]["field_text"],
             data["hotkey_other_action"]["original_text"],
         )
+        self.assertFalse(data["inactive_capture_error"]["recording"])
+        self.assertEqual(
+            data["inactive_capture_error"]["description"],
+            "模拟启动失败",
+        )
+        self.assertTrue(data["active_capture_error"]["recording"])
+        self.assertEqual(
+            data["active_capture_error"]["description"],
+            "模拟停止前异常",
+        )
         self.assertEqual(data["elevated_indicator"]["width"], 16)
         self.assertEqual(data["elevated_indicator"]["height"], 16)
         self.assertAlmostEqual(
@@ -451,10 +395,6 @@ class VoiceProgramQmlTests(unittest.TestCase):
         self.assertFalse(data["system_managed"]["elevated_visible"])
         self.assertFalse(data["system_managed"]["custom_path_visible"])
         self.assertTrue(data["system_managed"]["settings_visible"])
-        self.assertEqual(
-            data["system_managed"]["launch_text"],
-            "由 Windows 管理，无需本程序启动",
-        )
         self.assertTrue(data["windows_dictation"]["provider"])
         self.assertFalse(data["windows_dictation"]["auto_start"])
         self.assertFalse(data["windows_dictation"]["elevated_visible"])
@@ -472,34 +412,9 @@ class VoiceProgramQmlTests(unittest.TestCase):
             data["windows_dictation"]["settings_button_geometry"]["right"],
             data["window_width"] + 1,
         )
-        self.assertEqual(
-            data["windows_dictation"]["launch_text"],
-            "使用 Windows 听写与联机语音识别",
-        )
         self.assertTrue(data["custom_program"]["path_visible"])
         self.assertTrue(data["custom_program"]["elevated_visible"])
         self.assertFalse(data["custom_program"]["settings_visible"])
-        self.assertEqual(
-            data["status_cases"]["unknown_running"]["text"],
-            "运行中 · 权限未知；设置：在任务栏（含隐藏图标）右键搜狗语音图标",
-        )
-        self.assertEqual(
-            data["status_cases"]["unknown_running"]["settings_button_text"],
-            "打开设置",
-        )
-        expected_sogou_status = {
-            "standard_mismatch": "需重启为管理员",
-            "standard_running": "普通权限运行中",
-            "stopped_clean": "已找到 · 待启动",
-            "stopped_unrelated_dirty": "已找到 · 待启动",
-            "stopped_voice_program_dirty": "已修改 · 待应用",
-        }
-        for case_name, status_text in expected_sogou_status.items():
-            self.assertEqual(
-                data["status_cases"][case_name]["text"],
-                status_text
-                + "；设置：在任务栏（含隐藏图标）右键搜狗语音图标",
-            )
         self.assertTrue(data["unmanaged_elevated"]["visible"])
         self.assertFalse(data["unmanaged_elevated"]["enabled"])
         for item in data["managed"].values():
@@ -510,7 +425,6 @@ class VoiceProgramQmlTests(unittest.TestCase):
             self.assertGreaterEqual(bounds["y"], 0)
             self.assertLessEqual(bounds["right"], data["window_width"])
             self.assertLessEqual(bounds["bottom"], data["window_height"])
-        self.assertTrue(data["status"])
 
 
 if __name__ == "__main__":
