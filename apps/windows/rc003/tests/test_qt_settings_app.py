@@ -10122,6 +10122,14 @@ class SettingsShellSourceContractTests(unittest.TestCase):
         for too_long in ("版本不兼容", "等待遥控器", "系统不支持"):
             self.assertNotIn(too_long, self.device_qml)
 
+    def test_settings_rows_share_the_global_hairline_divider(self):
+        for row_qml in (
+            self.inline_settings_row_qml,
+            self.settings_list_row_qml,
+        ):
+            self.assertIn("height: root.tokens.hairlineWidth", row_qml)
+            self.assertNotIn("Math.max(1, root.tokens.hairlineWidth)", row_qml)
+
     def test_device_page_notes_are_short_and_remove_internal_diagnostics(self):
         for expected in (
             "登录后后台运行",

@@ -1325,6 +1325,87 @@ class HostHotkeyFailureSuppressesMicOpenTests(_AppWiringTestCase):
         self.assertEqual(self.app._ble_session.mic_open_calls, 1)
         self.assertTrue(self.app._voice.active)
 
+    def test_sogou_readiness_prewarm_is_skipped_after_the_hold_ends(self):
+        self.app._config["voice_program"] = (
+            voice_program_manager.normalize_voice_program_settings(
+                {"provider": voice_program_manager.VOICE_PROGRAM_SOGOU}
+            )
+        )
+        session_token = object()
+        self.app._voice.on_mic_button_pressed()
+        self.app._voice_mic_gesture_active = True
+        self.app._voice_hold_watchdog_token = session_token
+        deferred_targets = []
+
+        class DeferredThread:
+            def __init__(self, *, target, **_kwargs):
+                deferred_targets.append(target)
+
+            def start(self):
+                return None
+
+        with mock.patch.object(
+            app_module.threading, "Thread", DeferredThread
+        ):
+            self.app._schedule_sogou_readiness_check()
+
+        self.app._voice.reset()
+        self.app._voice_mic_gesture_active = False
+        self.app._voice_hold_watchdog_token = None
+        with mock.patch.object(
+            voice_program_manager,
+            "wait_for_sogou_voice_window",
+            return_value=False,
+        ), mock.patch.object(
+            voice_program_manager, "prewarm_sogou_voice_component"
+        ) as prewarm:
+            deferred_targets[0]()
+
+        prewarm.assert_not_called()
+        self.assertFalse(self.app._sogou_readiness_check_running)
+
+    def test_sogou_readiness_prewarm_runs_for_the_same_active_hold(self):
+        self.app._config["voice_program"] = (
+            voice_program_manager.normalize_voice_program_settings(
+                {"provider": voice_program_manager.VOICE_PROGRAM_SOGOU}
+            )
+        )
+        session_token = object()
+        self.app._voice.on_mic_button_pressed()
+        self.app._voice_mic_gesture_active = True
+        self.app._voice_hold_watchdog_token = session_token
+        deferred_targets = []
+
+        class DeferredThread:
+            def __init__(self, *, target, **_kwargs):
+                deferred_targets.append(target)
+
+            def start(self):
+                return None
+
+        with mock.patch.object(
+            app_module.threading, "Thread", DeferredThread
+        ):
+            self.app._schedule_sogou_readiness_check()
+
+        repair_result = voice_program_manager.SogouComponentPrewarmResult(
+            True, "started"
+        )
+        with mock.patch.object(
+            voice_program_manager,
+            "wait_for_sogou_voice_window",
+            side_effect=(False, True),
+        ) as wait_for_window, mock.patch.object(
+            voice_program_manager,
+            "prewarm_sogou_voice_component",
+            return_value=repair_result,
+        ) as prewarm:
+            deferred_targets[0]()
+
+        prewarm.assert_called_once_with()
+        self.assertEqual(wait_for_window.call_count, 2)
+        self.assertFalse(self.app._sogou_readiness_check_running)
+
     def test_voice_hold_watchdog_forces_key_up_and_reconnect(self):
         timers = []
         reconnects = []

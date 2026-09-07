@@ -3916,6 +3916,9 @@ class RC003App:
         )
         if provider_settings["provider"] != voice_program_manager.VOICE_PROGRAM_SOGOU:
             return
+        session_token = self._voice_hold_watchdog_token
+        if session_token is None:
+            return
         with self._sogou_readiness_lock:
             if self._sogou_readiness_check_running:
                 return
@@ -3926,9 +3929,18 @@ class RC003App:
                 if voice_program_manager.wait_for_sogou_voice_window(timeout=0.7):
                     self._logger.info("voice program: Sogou voice window ready")
                     return
-                if not self._accept_input_events:
-                    return
-                repair = voice_program_manager.prewarm_sogou_voice_component()
+                with self._voice_trigger_lock:
+                    if (
+                        self._voice_hold_watchdog_token is not session_token
+                        or not self._voice.active
+                        or not self._voice_mic_gesture_active
+                        or not self._accept_input_events
+                    ):
+                        self._logger.info(
+                            "voice program: skipped stale Sogou readiness prewarm"
+                        )
+                        return
+                    repair = voice_program_manager.prewarm_sogou_voice_component()
                 ready_after_repair = (
                     repair.code == "started"
                     and self._accept_input_events
