@@ -34,11 +34,14 @@ Rectangle {
 
         UiLabel {
             id: titleLabel
+            objectName: root.objectName.length > 0
+                ? root.objectName + "_titleLabel" : ""
             tokens: root.tokens
             kind: bodyKind
             Layout.preferredWidth: root.titleWidth
             Layout.minimumWidth: root.titleWidth
             Layout.maximumWidth: root.titleWidth
+            Layout.alignment: Qt.AlignBaseline
             text: root.titleText
             font.weight: Font.Medium
             elide: Text.ElideRight

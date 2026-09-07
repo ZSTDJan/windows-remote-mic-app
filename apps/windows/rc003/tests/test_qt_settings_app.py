@@ -8390,17 +8390,21 @@ def column_snapshot(name):
 def row_snapshot(row, description_name=""):
     color = row.property("stateColor")
     row_name = str(row.property("objectName"))
+    title_label = find_child(window, row_name + "_titleLabel")
     state_label = find_child(window, row_name + "_stateLabel")
     state_column = find_child(window, row_name + "_stateColumn")
     description_label = find_child(
         window,
         description_name or row_name + "_descriptionLabel",
     )
+    assert title_label is not None
     assert state_label is not None
     assert state_column is not None
     assert description_label is not None
     baseline_delta = None
+    title_baseline_delta = None
     if bool(description_label.property("visible")):
+        title_origin = title_label.mapToScene(QPointF(0, 0))
         description_origin = description_label.mapToScene(QPointF(0, 0))
         state_origin = state_label.mapToScene(QPointF(0, 0))
         description_baseline = (
@@ -8411,7 +8415,12 @@ def row_snapshot(row, description_name=""):
             float(state_origin.y())
             + float(state_label.property("baselineOffset"))
         )
+        title_baseline = (
+            float(title_origin.y())
+            + float(title_label.property("baselineOffset"))
+        )
         baseline_delta = abs(description_baseline - state_baseline)
+        title_baseline_delta = abs(title_baseline - description_baseline)
     return {
         "state": str(row.property("stateText")),
         "detail": str(row.property("descriptionText")),
@@ -8423,6 +8432,7 @@ def row_snapshot(row, description_name=""):
         "detail_width": float(description_label.property("width")),
         "detail_implicit_width": float(description_label.property("implicitWidth")),
         "baseline_delta": baseline_delta,
+        "title_baseline_delta": title_baseline_delta,
     }
 
 
@@ -11438,7 +11448,7 @@ class OffscreenQmlLoadTests(unittest.TestCase):
             "missing_custom_program": ("请选择程序", "先在上方选择语音程序", "选择程序", True),
             "missing_managed_program": ("请安装程序", "先在上方安装语音程序", "打开设置", True),
             "stopped_managed_program": ("请启动程序", "点击右侧启动语音程序", "启动程序", True),
-            "managed_program_not_ready": ("请退出程序", "先完全退出语音程序，再点右侧重新检测", "重新检测", True),
+            "managed_program_not_ready": ("待实测", "在输入框中验证语音文字", "试说一句", True),
             "program_privilege_mismatch": ("请退出程序", "先完全退出语音程序，再点右侧重新检测", "重新检测", True),
             "reconnecting": ("请稍候", "当前操作完成后再试", "试说一句", False),
             "ready": ("待实测", "在输入框中验证语音文字", "试说一句", True),
@@ -11488,6 +11498,8 @@ class OffscreenQmlLoadTests(unittest.TestCase):
                         )
                         if row["baseline_delta"] is not None:
                             self.assertLessEqual(row["baseline_delta"], 0.5)
+                        if row["title_baseline_delta"] is not None:
+                            self.assertLessEqual(row["title_baseline_delta"], 0.5)
                 for case in style_data["actual_speech_cases"].values():
                     row = case["row"]
                     self.assertFalse(row["state_truncated"])
@@ -11502,6 +11514,8 @@ class OffscreenQmlLoadTests(unittest.TestCase):
                     )
                     if row["baseline_delta"] is not None:
                         self.assertLessEqual(row["baseline_delta"], 0.5)
+                    if row["title_baseline_delta"] is not None:
+                        self.assertLessEqual(row["title_baseline_delta"], 0.5)
 
     def test_three_page_shell_fits_compact_viewports_without_horizontal_overflow(self):
         import json

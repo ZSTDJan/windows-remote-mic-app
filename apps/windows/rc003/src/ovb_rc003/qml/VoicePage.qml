@@ -169,7 +169,7 @@ Item {
                     ? "select_program" : "install_program"
             if (!root.voiceProgramSystemManaged && programCode === "stopped")
                 return "start_program"
-            if (programCode === "running_not_ready")
+            if (programCode === "running_not_ready" && !root.sogouSelected)
                 return "restart_program"
             if (root.voiceProgramPrivilegeUnknown
                     || root.voiceProgramPrivilegeMismatch)
