@@ -10330,7 +10330,7 @@ class SettingsShellSourceContractTests(unittest.TestCase):
         self.assertIn('titleText: qsTr("麦克风权限")', self.voice_qml)
         self.assertNotIn('stateText: qsTr("待确认")', self.voice_qml)
         self.assertIn(
-            'qsTr("自动读取并同步搜狗当前的按住说快捷键")',
+            'qsTr("请在搜狗设置界面修改快捷键，改后自动同步。或结束搜狗语音再修改。")',
             self.voice_qml,
         )
         self.assertIn(
@@ -10484,7 +10484,7 @@ class SettingsShellSourceContractTests(unittest.TestCase):
     def test_voice_hotkey_field_is_owned_by_the_voice_page(self):
         self.assertIn('placeholderText: qsTr("点击录入")', self.voice_qml)
         self.assertIn(
-            'qsTr("自动读取并同步搜狗当前的按住说快捷键")',
+            'qsTr("请在搜狗设置界面修改快捷键，改后自动同步。或结束搜狗语音再修改。")',
             self.voice_qml,
         )
         self.assertIn(

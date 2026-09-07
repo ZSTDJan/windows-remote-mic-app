@@ -369,7 +369,7 @@ Item {
 
     function voiceHotkeyDescription() {
         if (sogouSelected)
-            return qsTr("自动读取并同步搜狗当前的按住说快捷键")
+            return qsTr("请在搜狗设置界面修改快捷键，改后自动同步。或结束搜狗语音再修改。")
         if (wetypeSelected)
             return qsTr("按程序记忆；请在微信输入法设置中保持一致")
         if (windowsDictationSelected)
