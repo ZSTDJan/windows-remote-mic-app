@@ -314,7 +314,7 @@ Item {
         if (windowsDictationSelected)
             return
         if (voiceHotkeyRecording) {
-            stopVoiceHotkeyCapture()
+            stopVoiceHotkeyCapture("capture_field_tapped")
             return
         }
         voiceHotkeyCaptureError = ""
@@ -327,10 +327,11 @@ Item {
         voiceHotkeyField.forceActiveFocus()
     }
 
-    function stopVoiceHotkeyCapture() {
+    function stopVoiceHotkeyCapture(reason) {
         pendingVoiceHotkey = ""
         if (!voiceHotkeyRecording)
             return true
+        SettingsController.reportHotkeyCaptureUiStop(reason || "unknown")
         if (!SettingsController.stopHotkeyCapture()) {
             voiceHotkeyCaptureError = qsTr("无法停止快捷键录入，请重试")
             return false
@@ -574,7 +575,7 @@ Item {
             SettingsController.refreshVoiceProgramOptions()
             SettingsController.refreshVoiceHotkeyFromProvider()
         } else {
-            stopVoiceHotkeyCapture()
+            stopVoiceHotkeyCapture("page_hidden")
         }
     }
 
@@ -815,6 +816,7 @@ Item {
                 InlineSettingsRow {
                     objectName: "voiceHotkeyRow"
                     tokens: root.tokens
+                    showDivider: false
                     editorColumnWidth: root.voiceHotkeyEditorWidth
                     stateColumnWidth: root.settingsStateColumnWidth
                     actionColumnWidth: root.settingsActionColumnWidth
@@ -853,10 +855,11 @@ Item {
                                 ? tokens.accent : tokens.textPrimary
                             placeholderText: qsTr("点击录入")
                             Accessible.name: qsTr("语音按键，仅支持录入按住型快捷键")
-                            Keys.onEscapePressed: root.stopVoiceHotkeyCapture()
+                            Keys.onEscapePressed: root.stopVoiceHotkeyCapture(
+                                "escape_pressed")
                             onActiveFocusChanged: {
                                 if (!activeFocus && root.voiceHotkeyRecording)
-                                    root.stopVoiceHotkeyCapture()
+                                    root.stopVoiceHotkeyCapture("focus_lost")
                             }
                             TapHandler {
                                 enabled: !root.windowsDictationSelected

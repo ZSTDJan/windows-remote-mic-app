@@ -9,6 +9,7 @@ import unittest
 _PROBE = r"""
 import json
 import os
+import time
 
 from PySide6.QtCore import QPointF, Qt
 from PySide6.QtTest import QTest
@@ -35,6 +36,14 @@ def render(window, app, count=10):
         image = window.grabWindow()
         app.processEvents()
     return image
+
+
+def wait_for_voice_hotkey_idle(controller, app, timeout=3.0):
+    deadline = time.monotonic() + timeout
+    while controller.voiceHotkeyBusy and time.monotonic() < deadline:
+        app.processEvents()
+        time.sleep(0.01)
+    assert not controller.voiceHotkeyBusy
 
 
 def geometry(item):
@@ -120,6 +129,7 @@ tab_bar.setProperty("currentIndex", 2)
 render(window, app)
 
 controller.selectedVoiceProgramIndex = 1
+wait_for_voice_hotkey_idle(controller, app)
 render(window, app)
 controller._voice_program_status_code = "not_found"
 controller.voiceProgramStatusCodeChanged.emit()
@@ -175,6 +185,33 @@ hotkey_cancel = {
     "original_text": original_hotkey,
 }
 
+controller.selectedVoiceProgramIndex = 2
+wait_for_voice_hotkey_idle(controller, app)
+render(window, app)
+QTest.mouseClick(window, Qt.LeftButton, Qt.NoModifier, hotkey_center)
+render(window, app)
+QTest.keyPress(window, Qt.Key_Control, Qt.ControlModifier)
+QTest.keyPress(window, Qt.Key_Shift, Qt.ControlModifier | Qt.ShiftModifier)
+QTest.keyPress(window, Qt.Key_F9, Qt.ControlModifier | Qt.ShiftModifier)
+QTest.keyRelease(window, Qt.Key_F9, Qt.ControlModifier | Qt.ShiftModifier)
+QTest.keyRelease(window, Qt.Key_Shift, Qt.ControlModifier)
+QTest.keyRelease(window, Qt.Key_Control, Qt.NoModifier)
+wait_for_voice_hotkey_idle(controller, app)
+render(window, app)
+qt_fallback_hotkey = {
+    "recording": bool(voice_page.property("voiceHotkeyRecording")),
+    "field_text": str(hotkey_field.property("text")),
+    "controller_text": str(controller.holdVoiceHotkeyText),
+}
+
+controller.selectedVoiceProgramIndex = 1
+wait_for_voice_hotkey_idle(controller, app)
+render(window, app)
+controller._voice_program_status_code = "not_found"
+controller.voiceProgramStatusCodeChanged.emit()
+render(window, app)
+current_hotkey = str(controller.holdVoiceHotkeyText)
+
 elevated = controls["voiceProgramElevatedCheckBox"]
 elevated_before = bool(controller.voiceProgramLaunchElevated)
 QTest.mouseClick(window, Qt.LeftButton, Qt.NoModifier, hotkey_center)
@@ -192,7 +229,7 @@ hotkey_other_action = {
     "action_completed": bool(controller.voiceProgramLaunchElevated)
     != elevated_before,
     "field_text": str(hotkey_field.property("text")),
-    "original_text": original_hotkey,
+    "original_text": current_hotkey,
 }
 controller.voiceProgramLaunchElevated = elevated_before
 controller._voice_program_status_code = "not_found"
@@ -299,6 +336,7 @@ result = {
     "managed_auto_start": managed_auto_start,
     "managed_elevated": managed_elevated,
     "hotkey_cancel": hotkey_cancel,
+    "qt_fallback_hotkey": qt_fallback_hotkey,
     "hotkey_other_action": hotkey_other_action,
     "inactive_capture_error": inactive_capture_error,
     "active_capture_error": active_capture_error,
@@ -366,6 +404,15 @@ class VoiceProgramQmlTests(unittest.TestCase):
         self.assertEqual(
             data["hotkey_cancel"]["controller_text"],
             data["hotkey_cancel"]["original_text"],
+        )
+        self.assertFalse(data["qt_fallback_hotkey"]["recording"])
+        self.assertEqual(
+            data["qt_fallback_hotkey"]["field_text"],
+            "ctrl+shift+f9",
+        )
+        self.assertEqual(
+            data["qt_fallback_hotkey"]["controller_text"],
+            "ctrl+shift+f9",
         )
         self.assertFalse(data["hotkey_other_action"]["recording"])
         self.assertTrue(data["hotkey_other_action"]["action_completed"])

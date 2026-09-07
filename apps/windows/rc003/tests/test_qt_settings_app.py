@@ -427,6 +427,7 @@ class SettingsControllerTests(unittest.TestCase):
         classes = qt_settings_app._load_qt_classes()
         self.Model = classes["ButtonMappingModel"]
         self.Controller = classes["SettingsController"]
+        self.Qt = classes["Qt"]
         self._tmpdir = tempfile.TemporaryDirectory()
         self._env_patch = mock.patch.dict(
             os.environ,
@@ -513,6 +514,11 @@ class SettingsControllerTests(unittest.TestCase):
         self._voice_hotkey_sync_patch.stop()
         self._voice_hotkey_read_patch.stop()
         self._bridge_status_patch.stop()
+        logger = logging.getLogger(qt_settings_app.logging_setup.LOGGER_NAME)
+        for handler in list(logger.handlers):
+            handler.close()
+            logger.removeHandler(handler)
+        qt_settings_app.logging_setup._configured = False
         self._env_patch.stop()
         self._tmpdir.cleanup()
 
@@ -2695,6 +2701,56 @@ class SettingsControllerTests(unittest.TestCase):
         self.assertEqual(captured, ["lctrl+lwin"])
         controller.hotkeyText = "lctrl+lwin"
         self.assertEqual(controller.hotkeyText, "lctrl+lwin")
+
+    def test_qt_fallback_records_a_shortcut_when_low_level_hook_has_no_edge(self):
+        controller, _ = self._make_controller()
+        captured = []
+        controller.hotkeyCaptured.connect(captured.append)
+        controller._hotkey_capture = object()
+        controller._set_input_operation_state("hotkey", "active")
+
+        control = self.Qt.KeyboardModifier.ControlModifier.value
+        shift = self.Qt.KeyboardModifier.ShiftModifier.value
+        controller.captureHotkeyQtEvent(
+            self.Qt.Key.Key_Control.value, control, "", True, False
+        )
+        controller.captureHotkeyQtEvent(
+            self.Qt.Key.Key_Shift.value, control | shift, "", True, False
+        )
+        controller.captureHotkeyQtEvent(
+            self.Qt.Key.Key_F9.value, control | shift, "", True, False
+        )
+        controller.captureHotkeyQtEvent(
+            self.Qt.Key.Key_F9.value, control | shift, "", False, False
+        )
+
+        self.assertEqual(captured, ["ctrl+shift+f9"])
+        self.assertEqual(controller._qt_hotkey_tokens, [])
+        self.assertEqual(controller._qt_hotkey_pressed_keys, set())
+
+    def test_qt_fallback_keeps_modifier_only_shortcuts_representable(self):
+        controller, _ = self._make_controller()
+        captured = []
+        controller.hotkeyCaptured.connect(captured.append)
+        controller._hotkey_capture = object()
+        controller._set_input_operation_state("hotkey", "active")
+
+        control = self.Qt.KeyboardModifier.ControlModifier.value
+        shift = self.Qt.KeyboardModifier.ShiftModifier.value
+        controller.captureHotkeyQtEvent(
+            self.Qt.Key.Key_Control.value, control, "", True, False
+        )
+        controller.captureHotkeyQtEvent(
+            self.Qt.Key.Key_Shift.value, control | shift, "", True, False
+        )
+        controller.captureHotkeyQtEvent(
+            self.Qt.Key.Key_Shift.value, control, "", False, False
+        )
+        controller.captureHotkeyQtEvent(
+            self.Qt.Key.Key_Control.value, 0, "", False, False
+        )
+
+        self.assertEqual(captured, ["ctrl+shift"])
 
     def test_late_hotkey_results_are_ignored_after_cleanup_or_exit_begins(self):
         cases = (
@@ -10531,6 +10587,10 @@ class SettingsShellSourceContractTests(unittest.TestCase):
         self.assertNotIn('objectName: "voiceProgramSpecificRow"', self.voice_qml)
         self.assertNotIn('objectName: "voiceProgramLaunchText"', self.voice_qml)
         self.assertNotIn("voiceProgramLaunchDescription", self.voice_qml)
+        voice_hotkey_block = self.voice_qml.split(
+            'objectName: "voiceHotkeyRow"', 1
+        )[1].split('objectName: "voiceTestSection"', 1)[0]
+        self.assertIn("showDivider: false", voice_hotkey_block)
 
     def test_voice_rows_use_the_shared_fixed_action_column(self):
         self.assertIn(

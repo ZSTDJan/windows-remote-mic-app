@@ -20,6 +20,7 @@ the Win32 APIs, so token-formatting tests remain cross-platform.
 from __future__ import annotations
 
 import ctypes
+import logging
 import sys
 import threading
 from ctypes import wintypes
@@ -35,12 +36,14 @@ WM_KEYUP = 0x0101
 WM_SYSKEYUP = 0x0105
 WM_QUIT = 0x0012
 PM_NOREMOVE = 0x0000
+VK_ESCAPE = 0x1B
 
 LLKHF_EXTENDED = 0x00000001
 LLKHF_INJECTED = 0x00000010
 LLKHF_UP = 0x00000080
 
 _STOP_JOIN_TIMEOUT_SECONDS = 2.0
+_LOGGER = logging.getLogger("ovb_rc003")
 
 
 class HotkeyCaptureUnavailableError(Exception):
@@ -254,6 +257,16 @@ class HotkeyCapture:
         )
         if not (is_down or is_up):
             return False
+        # Escape belongs to the focused settings field's cancel action. Let
+        # Qt receive both edges instead of recording Escape as a shortcut.
+        if int(data.vkCode) == VK_ESCAPE:
+            return False
+
+        _LOGGER.info(
+            "settings hotkey capture: hook event edge=%s injected=%s",
+            "down" if is_down else "up",
+            bool(int(data.flags) & LLKHF_INJECTED),
+        )
 
         token = token_for_keyboard_event(data.vkCode, data.scanCode, data.flags)
         owns_event = False
@@ -343,6 +356,19 @@ class HotkeyCapture:
                     return 1
                 return user32.CallNextHookEx(hook, n_code, w_param, l_param)
 
+            # Low-level hooks are delivered through the installing thread's
+            # message queue. Create that queue with a real writable MSG before
+            # registering the hook; a NULL lpMsg does not establish a valid
+            # queue and can leave SetWindowsHookExW looking successful while
+            # no keyboard callback is ever dispatched.
+            msg = wintypes.MSG()
+            user32.PeekMessageW(
+                ctypes.byref(msg),
+                None,
+                0,
+                0,
+                PM_NOREMOVE,
+            )
             self._hookproc_keepalive = hookproc_type(hook_proc)
             hook = user32.SetWindowsHookExW(
                 WH_KEYBOARD_LL,
@@ -362,13 +388,8 @@ class HotkeyCapture:
                     for vk_code in range(1, 256)
                     if user32.GetAsyncKeyState(vk_code) & 0x8000
                 )
-            # Force creation of this thread's message queue before exposing
-            # the capture as ready; otherwise PostThreadMessageW can fail on
-            # a stop race before the first GetMessageW call.
-            user32.PeekMessageW(None, None, 0, 0, PM_NOREMOVE)
             self._ready_event.set()
 
-            msg = wintypes.MSG()
             while not self._stop_event.is_set():
                 result = user32.GetMessageW(ctypes.byref(msg), None, 0, 0)
                 if result in (0, -1):
@@ -387,3 +408,7 @@ class HotkeyCapture:
             self._hook = None
             self._hookproc_keepalive = None
             self._ready_event.set()
+            _LOGGER.info(
+                "settings hotkey capture: hook thread stopped requested=%s",
+                self._stop_event.is_set(),
+            )

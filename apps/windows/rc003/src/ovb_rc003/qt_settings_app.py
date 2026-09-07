@@ -564,6 +564,7 @@ def _load_qt_classes() -> dict:
             Property,
             QAbstractListModel,
             QByteArray,
+            QEvent,
             QModelIndex,
             QObject,
             QTimer,
@@ -586,6 +587,102 @@ def _load_qt_classes() -> dict:
 
     _DisplayRole = Qt.ItemDataRole.DisplayRole
     _UserRole = Qt.ItemDataRole.UserRole
+
+    _QT_MODIFIER_KEY_TOKENS = {
+        Qt.Key.Key_Control.value: "ctrl",
+        Qt.Key.Key_Shift.value: "shift",
+        Qt.Key.Key_Alt.value: "alt",
+        Qt.Key.Key_AltGr.value: "alt",
+        Qt.Key.Key_Meta.value: "win",
+        Qt.Key.Key_Super_L.value: "win",
+        Qt.Key.Key_Super_R.value: "win",
+    }
+    _QT_MODIFIER_FLAG_TOKENS = (
+        (Qt.KeyboardModifier.ControlModifier.value, "ctrl"),
+        (Qt.KeyboardModifier.ShiftModifier.value, "shift"),
+        (Qt.KeyboardModifier.AltModifier.value, "alt"),
+        (Qt.KeyboardModifier.MetaModifier.value, "win"),
+    )
+    _QT_SPECIAL_KEY_TOKENS = {
+        Qt.Key.Key_Backspace.value: "backspace",
+        Qt.Key.Key_Tab.value: "tab",
+        Qt.Key.Key_Return.value: "enter",
+        Qt.Key.Key_Enter.value: "enter",
+        Qt.Key.Key_Escape.value: "escape",
+        Qt.Key.Key_Space.value: "space",
+        Qt.Key.Key_PageUp.value: "page_up",
+        Qt.Key.Key_PageDown.value: "page_down",
+        Qt.Key.Key_End.value: "end",
+        Qt.Key.Key_Home.value: "home",
+        Qt.Key.Key_Left.value: "left",
+        Qt.Key.Key_Up.value: "up",
+        Qt.Key.Key_Right.value: "right",
+        Qt.Key.Key_Down.value: "down",
+        Qt.Key.Key_Insert.value: "insert",
+        Qt.Key.Key_Delete.value: "delete",
+        Qt.Key.Key_Menu.value: "apps",
+        Qt.Key.Key_CapsLock.value: "caps_lock",
+        Qt.Key.Key_NumLock.value: "num_lock",
+        Qt.Key.Key_ScrollLock.value: "scroll_lock",
+        Qt.Key.Key_Print.value: "print_screen",
+        Qt.Key.Key_Pause.value: "pause",
+        Qt.Key.Key_Back.value: "browser_back",
+        Qt.Key.Key_Forward.value: "browser_forward",
+        Qt.Key.Key_MediaNext.value: "media_next",
+        Qt.Key.Key_MediaPrevious.value: "media_previous",
+        Qt.Key.Key_MediaStop.value: "media_stop",
+        Qt.Key.Key_MediaPlay.value: "media_play_pause",
+        Qt.Key.Key_VolumeMute.value: "volume_mute",
+        Qt.Key.Key_VolumeDown.value: "volume_down",
+        Qt.Key.Key_VolumeUp.value: "volume_up",
+    }
+    _QT_PRINTABLE_KEY_TOKENS = {
+        ";": "semicolon",
+        ":": "semicolon",
+        "=": "equals",
+        "+": "equals",
+        ",": "comma",
+        "<": "comma",
+        "-": "minus",
+        "_": "minus",
+        ".": "period",
+        ">": "period",
+        "/": "slash",
+        "?": "slash",
+        "`": "backtick",
+        "~": "backtick",
+        "[": "left_bracket",
+        "{": "left_bracket",
+        "\\": "backslash",
+        "|": "backslash",
+        "]": "right_bracket",
+        "}": "right_bracket",
+        "'": "quote",
+        '"': "quote",
+    }
+
+    def _qt_hotkey_token(key: int, text: str, modifiers: int) -> str:
+        key = int(key)
+        token = _QT_MODIFIER_KEY_TOKENS.get(key)
+        if token is not None:
+            return token
+        token = _QT_SPECIAL_KEY_TOKENS.get(key)
+        if token is not None:
+            return token
+        first_function_key = Qt.Key.Key_F1.value
+        if first_function_key <= key <= Qt.Key.Key_F24.value:
+            return f"f{key - first_function_key + 1}"
+        if Qt.Key.Key_0.value <= key <= Qt.Key.Key_9.value:
+            digit = chr(key)
+            if modifiers & Qt.KeyboardModifier.KeypadModifier.value:
+                return f"numpad{digit}"
+            return digit
+        if Qt.Key.Key_A.value <= key <= Qt.Key.Key_Z.value:
+            return chr(key).lower()
+        normalized_text = str(text or "")
+        if normalized_text:
+            return _QT_PRINTABLE_KEY_TOKENS.get(normalized_text[0], "")
+        return ""
 
     class ButtonMappingModel(QAbstractListModel):
         """One row per physical RC003 button (13 total, in
@@ -1311,7 +1408,13 @@ def _load_qt_classes() -> dict:
             self._hidTapDetectionStatus.connect(self._on_hid_tap_detection_status)
             self._hotkey_capture = None
             self._pending_hotkey_capture_result = None
+            self._qt_hotkey_tokens: List[str] = []
+            self._qt_hotkey_pressed_keys: set[int] = set()
+            self._qt_hotkey_primary_key: Optional[int] = None
             self._hotkeyCaptureResult.connect(self._on_hotkey_capture_result)
+            application = QApplication.instance()
+            if application is not None:
+                application.installEventFilter(self)
             self._input_operation_kind = ""
             self._input_operation_phase = "idle"
             self._input_operation_token = 0
@@ -2425,6 +2528,37 @@ def _load_qt_classes() -> dict:
                 or self._key_detection_tap is not None
             )
 
+        def _reset_qt_hotkey_capture_state(self) -> None:
+            self._qt_hotkey_tokens.clear()
+            self._qt_hotkey_pressed_keys.clear()
+            self._qt_hotkey_primary_key = None
+
+        def eventFilter(self, watched, event):  # noqa: N802 - Qt override
+            event_type = event.type()
+            if event_type not in {
+                QEvent.Type.KeyPress,
+                QEvent.Type.KeyRelease,
+            }:
+                return False
+            if (
+                self._input_operation_kind != "hotkey"
+                or self._input_operation_phase != "active"
+                or self._hotkey_capture is None
+            ):
+                return False
+            key = int(event.key())
+            if key == Qt.Key.Key_Escape.value:
+                return False
+            raw_modifiers = event.modifiers()
+            modifiers = int(getattr(raw_modifiers, "value", raw_modifiers))
+            return self.captureHotkeyQtEvent(
+                key,
+                modifiers,
+                event.text(),
+                event_type == QEvent.Type.KeyPress,
+                event.isAutoRepeat(),
+            )
+
         def _set_key_detection_active_state(self, value: bool) -> None:
             value = bool(value)
             if value == self._key_detection_active:
@@ -2504,15 +2638,28 @@ def _load_qt_classes() -> dict:
             cancel_event: threading.Event,
             operation_token: int,
         ) -> _InputStartResult:
+            logger = logging_setup.get_logger(self._config_root)
+
+            def report_capture(chord: str) -> None:
+                logger.info(
+                    "settings hotkey capture: hook emitted token=%s chord=%s",
+                    operation_token,
+                    chord,
+                )
+                self._hotkeyCaptureResult.emit((operation_token, chord))
+
             capture = hotkey_capture_windows.HotkeyCapture(
-                lambda chord: self._hotkeyCaptureResult.emit(
-                    (operation_token, chord)
-                ),
+                report_capture,
                 accept_injected=True,
             )
             try:
                 capture.start()
             except Exception as exc:  # noqa: BLE001 - returned to Qt
+                logger.error(
+                    "settings hotkey capture: hook start failed token=%s error=%s",
+                    operation_token,
+                    exc,
+                )
                 if getattr(capture, "is_running", False):
                     return _InputStartResult(
                         "hotkey",
@@ -2535,6 +2682,11 @@ def _load_qt_classes() -> dict:
                     stopped.message,
                     hotkey_capture=stopped.hotkey_capture,
                 )
+            logger.info(
+                "settings hotkey capture: hook ready token=%s running=%s",
+                operation_token,
+                bool(getattr(capture, "is_running", False)),
+            )
             return _InputStartResult(
                 "hotkey", True, hotkey_capture=capture
             )
@@ -2673,6 +2825,7 @@ def _load_qt_classes() -> dict:
             self._take_input_worker_result()
             if kind == "hotkey":
                 self._pending_hotkey_capture_result = None
+                self._reset_qt_hotkey_capture_state()
             cancel_event = threading.Event()
             self._input_operation_cancel_event = cancel_event
             self._set_input_operation_state(kind, "starting")
@@ -2738,6 +2891,8 @@ def _load_qt_classes() -> dict:
             if kind and active_kind and kind != active_kind:
                 return False
             if not active_kind:
+                if not kind or kind == "hotkey":
+                    self._reset_qt_hotkey_capture_state()
                 self._set_key_detection_active_state(False)
                 self._set_input_operation_state("", "idle")
                 self._after_input_operation_change()
@@ -2747,6 +2902,8 @@ def _load_qt_classes() -> dict:
             token = self._input_operation_token
             self._take_input_worker_result()
             self._set_input_operation_state(active_kind, "stopping")
+            if active_kind == "hotkey":
+                self._reset_qt_hotkey_capture_state()
             capture = self._hotkey_capture
             bridge_request = self._key_detection_bridge_request
             listener = self._key_detection_listener
@@ -3528,11 +3685,13 @@ def _load_qt_classes() -> dict:
         def _on_hotkey_capture_result(self, payload: object) -> None:
             """Forward a hook-thread result to QML on the GUI thread."""
 
+            logger = logging_setup.get_logger(self._config_root)
             try:
                 operation_token, chord = payload
                 operation_token = int(operation_token)
                 chord = str(chord)
             except (TypeError, ValueError):
+                logger.warning("settings hotkey capture: malformed hook result ignored")
                 return
             if (
                 operation_token != self._input_operation_token
@@ -3543,16 +3702,44 @@ def _load_qt_classes() -> dict:
                 or self._application_exit_confirmed
                 or self._application_exit_intent.is_set()
             ):
+                logger.warning(
+                    "settings hotkey capture: result ignored token=%s current_token=%s "
+                    "kind=%s phase=%s chord=%s",
+                    operation_token,
+                    self._input_operation_token,
+                    self._input_operation_kind,
+                    self._input_operation_phase,
+                    chord,
+                )
                 return
             if self._input_operation_phase == "starting":
                 if self._pending_hotkey_capture_result is None:
                     self._pending_hotkey_capture_result = (operation_token, chord)
+                    logger.info(
+                        "settings hotkey capture: result queued during start "
+                        "token=%s chord=%s",
+                        operation_token,
+                        chord,
+                    )
                 return
             if (
                 self._input_operation_phase != "active"
                 or self._hotkey_capture is None
             ):
+                logger.warning(
+                    "settings hotkey capture: active result had no live owner "
+                    "token=%s phase=%s chord=%s",
+                    operation_token,
+                    self._input_operation_phase,
+                    chord,
+                )
                 return
+            logger.info(
+                "settings hotkey capture: forwarding to QML token=%s chord=%s",
+                operation_token,
+                chord,
+            )
+            self._reset_qt_hotkey_capture_state()
             self.hotkeyCaptured.emit(chord)
 
         def _save(
@@ -3799,6 +3986,11 @@ def _load_qt_classes() -> dict:
             return self._voice_hotkeys[key_mapping.VoiceTriggerMode.HOLD]
 
         def _set_hold_voice_hotkey_text(self, value: str) -> None:
+            logging_setup.get_logger(self._config_root).info(
+                "settings hotkey capture: QML submitted provider=%s chord=%s",
+                self._voice_program_settings.get("provider", ""),
+                value,
+            )
             self._update_and_persist_voice_hotkey(value)
 
         holdVoiceHotkeyText = Property(
@@ -5601,15 +5793,119 @@ def _load_qt_classes() -> dict:
         def startHotkeyCapture(self) -> bool:
             """Start the settings-owned Windows keyboard shortcut recorder."""
 
-            return self._begin_input_operation_start(
+            logger = logging_setup.get_logger(self._config_root)
+            logger.info(
+                "settings hotkey capture: start requested kind=%s phase=%s "
+                "has_capture=%s key_detection=%s voice_busy=%s",
+                self._input_operation_kind,
+                self._input_operation_phase,
+                self._hotkey_capture is not None,
+                self._key_detection_active,
+                self._voice_hotkey_busy,
+            )
+            accepted = self._begin_input_operation_start(
                 "hotkey", self._start_hotkey_capture_worker
             )
+            logger.info(
+                "settings hotkey capture: start request accepted=%s token=%s",
+                accepted,
+                self._input_operation_token,
+            )
+            return accepted
 
         @Slot(result=bool)
         def stopHotkeyCapture(self) -> bool:
             """Stop the recorder, including Cancel/window close."""
 
-            return self._request_input_stop(kind="hotkey")
+            logger = logging_setup.get_logger(self._config_root)
+            logger.info(
+                "settings hotkey capture: stop requested kind=%s phase=%s "
+                "has_capture=%s",
+                self._input_operation_kind,
+                self._input_operation_phase,
+                self._hotkey_capture is not None,
+            )
+            accepted = self._request_input_stop(kind="hotkey")
+            logger.info(
+                "settings hotkey capture: stop request accepted=%s token=%s",
+                accepted,
+                self._input_operation_token,
+            )
+            return accepted
+
+        @Slot(int, int, str, bool, bool, result=bool)
+        def captureHotkeyQtEvent(
+            self,
+            key: int,
+            modifiers: int,
+            text: str,
+            pressed: bool,
+            auto_repeat: bool,
+        ) -> bool:
+            """Capture focused Qt key events when no low-level edge arrives."""
+
+            if (
+                self._input_operation_kind != "hotkey"
+                or self._input_operation_phase != "active"
+                or self._hotkey_capture is None
+            ):
+                return False
+            key = int(key)
+            modifiers = int(modifiers)
+            token = _qt_hotkey_token(key, text, modifiers)
+            if not token:
+                return False
+            if auto_repeat:
+                return True
+
+            if pressed:
+                for flag, modifier_token in _QT_MODIFIER_FLAG_TOKENS:
+                    if modifiers & flag and modifier_token not in self._qt_hotkey_tokens:
+                        self._qt_hotkey_tokens.append(modifier_token)
+                if key not in self._qt_hotkey_pressed_keys:
+                    self._qt_hotkey_pressed_keys.add(key)
+                    if token not in self._qt_hotkey_tokens:
+                        self._qt_hotkey_tokens.append(token)
+                if token not in _QT_MODIFIER_KEY_TOKENS.values():
+                    self._qt_hotkey_primary_key = key
+                return True
+
+            was_pressed = key in self._qt_hotkey_pressed_keys
+            self._qt_hotkey_pressed_keys.discard(key)
+            should_finish = (
+                self._qt_hotkey_primary_key == key
+                or (
+                    self._qt_hotkey_primary_key is None
+                    and was_pressed
+                    and not self._qt_hotkey_pressed_keys
+                )
+            )
+            if not should_finish or not self._qt_hotkey_tokens:
+                return True
+
+            chord = "+".join(self._qt_hotkey_tokens)
+            logging_setup.get_logger(self._config_root).info(
+                "settings hotkey capture: Qt fallback emitted token=%s chord=%s",
+                self._input_operation_token,
+                chord,
+            )
+            self._on_hotkey_capture_result((self._input_operation_token, chord))
+            return True
+
+        @Slot(str)
+        def reportHotkeyCaptureUiStop(self, reason: str) -> None:
+            safe_reason = str(reason).strip()
+            if safe_reason not in {
+                "capture_field_tapped",
+                "escape_pressed",
+                "focus_lost",
+                "page_hidden",
+            }:
+                safe_reason = "unknown"
+            logging_setup.get_logger(self._config_root).info(
+                "settings hotkey capture: QML requested stop reason=%s",
+                safe_reason,
+            )
 
         @Slot(result=bool)
         def stopKeyDetection(self) -> bool:
