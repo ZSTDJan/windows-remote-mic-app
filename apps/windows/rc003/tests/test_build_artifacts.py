@@ -1552,7 +1552,7 @@ class WindowsCiWorkflowTests(unittest.TestCase):
         next_step_start = self.text.index("- name:", run_step_start + 1)
         run_step_text = self.text[run_step_start:next_step_start]
 
-        self.assertIn("timeout-minutes:", run_step_text)
+        self.assertIn("timeout-minutes: 20", run_step_text)
         self.assertIn("PYTHONUNBUFFERED", run_step_text)
         self.assertIn("python -u -W error::ResourceWarning -m unittest discover", run_step_text)
         self.assertIn(
