@@ -236,6 +236,22 @@ jobs:
             }
           }
 
+      - name: Compile selected permission modules with Cython
+        shell: pwsh
+        run: |
+          python build/prepare-cython-core.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Test compiled permission modules and HID helper
+        shell: pwsh
+        env:
+          PYTHONPATH: build/cython-stage/src
+        run: |
+          python -u -W error::ResourceWarning -m unittest tests.test_hid_elevation_windows tests.test_hid_helper_consumers -v
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python build/cython-stage/src/hid_helper_launcher.py --self-check
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
       - name: PyInstaller build (unsigned candidate)
         shell: pwsh
         run: |
@@ -262,6 +278,7 @@ jobs:
           ) {
             throw "build inputs changed after their CI checks ran"
           }
+          $env:RC003_BUILD_SOURCE_ROOT = (Resolve-Path "build/cython-stage/src").Path
           python -m PyInstaller build/RemoteMicRC003.spec --distpath dist --workpath build/pyinstaller-work --noconfirm
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $inputStateAfterBuild = Get-RC003BuildInputState -RC003Root $rc003Root -RepoRoot $repoRoot
@@ -325,6 +342,16 @@ jobs:
           if ($builtVersion -ne $sourceVersion) {
             Write-Error "built VERSION mismatch: source=$sourceVersion built=$builtVersion"
             exit 1
+          }
+          $builtPackageRoot = Split-Path $builtVersionFile -Parent
+          foreach ($compiledModuleName in @("hid_elevation_windows", "hid_helper_consumers")) {
+            $compiledMatches = @(
+              Get-ChildItem -LiteralPath $builtPackageRoot -File -Filter "${compiledModuleName}*.pyd"
+            )
+            if ($compiledMatches.Count -ne 1) {
+              Write-Error "expected one compiled $compiledModuleName extension in frozen output"
+              exit 1
+            }
           }
           $rootExecutables = @(Get-ChildItem -LiteralPath "dist/RemoteMicRC003" -Force -Filter "*.exe" -File)
           if ($rootExecutables.Count -ne 1 -or $rootExecutables[0].Name -ne "RemoteMicRC003.exe") {

@@ -3571,6 +3571,10 @@ class HelperMainTests(unittest.TestCase):
                 detail,
             )
 
+    @unittest.skipIf(
+        Path(hid_elevation_windows.__file__).suffix.lower() == ".pyd",
+        "source-only structural check; the source test phase already covers it",
+    )
     def test_self_check_explicitly_imports_the_operation_lock_dependency(self):
         source = __import__("inspect").getsource(hid_elevation_windows._self_check)
         self.assertIn("single_instance", source)

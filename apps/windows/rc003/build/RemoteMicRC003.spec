@@ -16,6 +16,7 @@
 # This produces an UNSIGNED candidate under dist/RemoteMicRC003/. Real
 # code signing is out of scope for this source/build candidate.
 
+import os
 import sys
 from pathlib import Path
 
@@ -23,6 +24,11 @@ block_cipher = None
 
 RC003_ROOT = Path(SPECPATH).resolve().parent
 SRC_ROOT = RC003_ROOT / "src"
+source_root_override = os.environ.get("RC003_BUILD_SOURCE_ROOT", "").strip()
+if source_root_override:
+    SRC_ROOT = Path(source_root_override).resolve()
+if not SRC_ROOT.is_dir():
+    raise SystemExit(f"required build source directory is missing: {SRC_ROOT}")
 REPO_ROOT = RC003_ROOT.parents[2]
 REMOTE_PHOTO = REPO_ROOT / "Resources" / "RC003-remote-photo.png"
 QML_SOURCE_DIR = SRC_ROOT / "ovb_rc003" / "qml"
@@ -128,6 +134,31 @@ if VB_CABLE_BUNDLE_ZIP.is_file():
 datas.append((str(FRIDA_GADGET_ARCHIVE), "ovb_rc003/frida_assets"))
 
 hiddenimports = [
+    # Imports made inside the two Cython extension modules are opaque to
+    # PyInstaller's Python bytecode scanner. Keep their stdlib closure
+    # explicit so both the main program and the narrow helper can initialize
+    # the compiled modules without the original .py files.
+    "argparse",
+    "contextlib",
+    "ctypes",
+    "ctypes.wintypes",
+    "dataclasses",
+    "enum",
+    "hashlib",
+    "html",
+    "json",
+    "os",
+    "pathlib",
+    "re",
+    "shutil",
+    "stat",
+    "subprocess",
+    "sys",
+    "tempfile",
+    "threading",
+    "time",
+    "typing",
+    "xml.etree.ElementTree",
     "ovb_rc003.app",
     "ovb_rc003.device_catalog",  # XRBM-036: multi-device settings/runtime gate
     "ovb_rc003.settings_ui",
@@ -148,6 +179,7 @@ hiddenimports = [
     "ovb_rc003.frida_hid_tap_runtime",
     "ovb_rc003.frida_hid_tap_injector",
     "ovb_rc003.hid_elevation_windows",
+    "ovb_rc003.hid_helper_consumers",
     "ovb_rc003.single_instance",  # XRBM-021: imported lazily inside
     # __main__.py's _run_bridge(), same as the other lazily-imported
     # modules above.
@@ -293,6 +325,25 @@ helper_a = Analysis(
         (str(FRIDA_GADGET_ARCHIVE), "ovb_rc003/frida_assets"),
     ],
     hiddenimports=[
+        "argparse",
+        "contextlib",
+        "ctypes",
+        "ctypes.wintypes",
+        "dataclasses",
+        "hashlib",
+        "html",
+        "json",
+        "os",
+        "pathlib",
+        "re",
+        "shutil",
+        "stat",
+        "subprocess",
+        "sys",
+        "tempfile",
+        "time",
+        "typing",
+        "xml.etree.ElementTree",
         "ovb_rc003.hid_elevation_windows",
         "ovb_rc003.frida_hid_tap_injector",
         "ovb_rc003.frida_hid_tap_runtime",

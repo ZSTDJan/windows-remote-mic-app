@@ -255,6 +255,25 @@ try {
         Remove-Item -LiteralPath $testLogPath -Force -ErrorAction SilentlyContinue
     }
 
+    Write-Host "-- compile selected permission modules with Cython --"
+    & $venvPython (Join-Path "build" "prepare-cython-core.py")
+    Assert-LastExitCode "prepare-cython-core.py"
+
+    $cythonSourceRoot = (Resolve-Path (Join-Path "build" "cython-stage\src")).Path
+    $env:PYTHONPATH = $cythonSourceRoot
+    Write-Host "-- compiled permission module tests --"
+    & $venvPython -u -W error::ResourceWarning -m unittest `
+        tests.test_hid_elevation_windows `
+        tests.test_hid_helper_consumers `
+        -v
+    Assert-LastExitCode "compiled permission module tests"
+
+    Write-Host "-- compiled HID helper self-check (no UAC/task/HID changes) --"
+    & $venvPython (Join-Path $cythonSourceRoot "hid_helper_launcher.py") --self-check
+    Assert-LastExitCode "compiled HID helper --self-check"
+
+    $env:RC003_BUILD_SOURCE_ROOT = $cythonSourceRoot
+    Write-Host "-- PyInstaller source root: Cython stage --"
     Write-Host "-- PyInstaller build (unsigned candidate) --"
     & $venvPython -m PyInstaller (Join-Path "build" "RemoteMicRC003.spec") --distpath dist --workpath build\pyinstaller-work --noconfirm
     Assert-LastExitCode "PyInstaller"
@@ -271,6 +290,15 @@ try {
     $builtVersionFile = Join-Path "dist" (Join-Path "RemoteMicRC003" (Join-Path "_internal" (Join-Path "ovb_rc003" "VERSION")))
     if (-not (Test-Path $builtVersionFile)) {
         throw "expected built VERSION file not found: $builtVersionFile"
+    }
+    $builtPackageRoot = Split-Path $builtVersionFile -Parent
+    foreach ($compiledModuleName in @("hid_elevation_windows", "hid_helper_consumers")) {
+        $compiledMatches = @(
+            Get-ChildItem -LiteralPath $builtPackageRoot -File -Filter "${compiledModuleName}*.pyd"
+        )
+        if ($compiledMatches.Count -ne 1) {
+            throw "expected one compiled $compiledModuleName extension in frozen output"
+        }
     }
     $builtVersion = (Get-Content -LiteralPath $builtVersionFile -Raw).Trim()
     if ($builtVersion -ne $sourceVersion) {

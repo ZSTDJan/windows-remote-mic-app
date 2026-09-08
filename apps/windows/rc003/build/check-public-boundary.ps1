@@ -103,11 +103,19 @@ $autostartMarkers = @("CurrentVersion\Run", "userstartup")
 
 # Generated/build-output directories - never source, always safe to
 # regenerate, and routinely contain forbidden-binary-extension files
-# (a virtualenv's own python.exe/*.dll/*.pyd, PyInstaller's dist/work
-# output) that must never be treated as "committed" content. Matched by
+# (a virtualenv's own python.exe/*.dll/*.pyd, Cython stage/work output, and
+# PyInstaller's dist/work output) that must never be treated as "committed"
+# content. Matched by
 # bare directory-name path component (see Get-NormalizedRelativePath),
 # so this is independent of which OS/shell produced the path separators.
-$excludedDirNames = @(".venv", "dist", "pyinstaller-work", "third_party")
+$excludedDirNames = @(
+    ".venv",
+    "cython-stage",
+    "cython-work",
+    "dist",
+    "pyinstaller-work",
+    "third_party"
+)
 $localTestPackagePrefix = -join @(
     [char]0x65E0,
     [char]0x7EBF,

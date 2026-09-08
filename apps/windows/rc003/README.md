@@ -568,8 +568,11 @@ Start-Process -Verb RunAs -FilePath (Join-Path $root '.venv\Scripts\python.exe')
   -WorkingDirectory $root -ArgumentList '-m', 'ovb_rc003'
 ```
 
-本地 `build\build-candidate.ps1` 会先执行公开边界检查和完整测试，再构建
-`dist\RemoteMicRC003` PyInstaller 目录并检查冻结入口；它不会自行生成 ZIP、
+本地 `build\build-candidate.ps1` 会先执行公开边界检查和完整源码测试，再把
+`hid_elevation_windows` 与 `hid_helper_consumers` 复制到独立暂存目录并编译为
+Cython 扩展，随后执行编译态定向测试、构建 `dist\RemoteMicRC003` PyInstaller
+目录并检查冻结入口。原始 `src` 不会被改写；候选程序中这两个模块只保留编译后的
+`.pyd`，其它模块仍按现有方式打包。它不会自行生成 ZIP、
 Inno Setup 安装器或 `SHA256SUMS.txt`。完整发布封装由 Windows CI 工作流完成，
 安装器编译需要可用的 Inno Setup。构建脚本会通过固定哈希的独立步骤获取
 Frida Gadget 和 VB-CABLE 官方压缩包；程序运行时不会静默下载二进制或驱动。

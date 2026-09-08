@@ -20,11 +20,18 @@ _RC003_ROOT = Path(__file__).resolve().parents[1]
 
 # Mirrors $excludedDirNames in check-public-boundary.ps1 exactly - keep both
 # lists in sync. Generated/build-output directories, never source: a real
-# Python virtualenv's own binaries (.venv), PyInstaller's dist/work output
-# (dist, pyinstaller-work), and vendored third-party binaries (third_party)
-# routinely contain forbidden-binary-extension files that must never be
-# treated as "committed" content.
-_EXCLUDED_DIR_NAMES = {".venv", "dist", "pyinstaller-work", "third_party"}
+# Python virtualenv's own binaries (.venv), Cython stage/work output,
+# PyInstaller's dist/work output (dist, pyinstaller-work), and vendored
+# third-party binaries (third_party) routinely contain forbidden-binary-
+# extension files that must never be treated as "committed" content.
+_EXCLUDED_DIR_NAMES = {
+    ".venv",
+    "cython-stage",
+    "cython-work",
+    "dist",
+    "pyinstaller-work",
+    "third_party",
+}
 _EXCLUDED_ROOT_FILE_PATTERNS = ("无线麦便携测试包-*.zip",)
 
 
@@ -354,6 +361,8 @@ class BoundaryScanReplayTests(unittest.TestCase):
                 root / ".venv" / "Lib" / "site-packages" / "something.pyd",
                 root / "dist" / "RemoteMicRC003" / "RemoteMicRC003.exe",
                 root / "dist" / "installer" / "RemoteMicRC003Setup-unsigned.exe",
+                root / "build" / "cython-stage" / "src" / "ovb_rc003" / "core.pyd",
+                root / "build" / "cython-work" / "core.obj",
                 root / "build" / "pyinstaller-work" / "RemoteMicRC003" / "warn.txt.exe",
                 root / "build" / "third_party" / "vendored.dll",
                 root / "build" / "smoke-dist-c23" / "RemoteMicRC003.exe",

@@ -178,6 +178,7 @@ function Get-RC003BuildInputFiles {
         (Join-Path $RC003Root "build\check-public-boundary.ps1"),
         (Join-Path $RC003Root "build\check-release-readiness.py"),
         (Join-Path $RC003Root "build\check-third-party-notices.py"),
+        (Join-Path $RC003Root "build\prepare-cython-core.py"),
         (Join-Path $RC003Root "build\fetch-frida-gadget.ps1"),
         (Join-Path $RC003Root "build\fetch-vb-cable.ps1"),
         (Join-Path $RC003Root "build\stop-dev.ps1"),

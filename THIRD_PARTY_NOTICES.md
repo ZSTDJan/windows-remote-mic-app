@@ -133,6 +133,20 @@ PyInstaller is used to build the application. Its bootloader exception permits
 distribution of the resulting application under this project's GPL-3.0-only
 license.
 
+### Cython and setuptools
+
+- Build package: `cython==3.2.8`
+- Source: <https://github.com/cython/cython>
+- License: Apache-2.0
+- Build package: `setuptools==80.9.0`
+- Source: <https://github.com/pypa/setuptools>
+- License: MIT
+
+Cython and setuptools are build-time tools used to compile the selected RC003
+permission modules. They are not bundled as runtime packages in the Windows
+application; the generated extension modules remain part of this project's
+GPL-3.0-only corresponding source and binary distribution.
+
 ## Upstream protocol and implementation sources
 
 ### open-voice-bridge Windows implementation

@@ -27,6 +27,8 @@ _LAUNCHER_PATH = _RC003_ROOT / "src" / "launcher.py"
 _HID_HELPER_LAUNCHER_PATH = _RC003_ROOT / "src" / "hid_helper_launcher.py"
 _BUILD_CANDIDATE_PATH = _RC003_ROOT / "build" / "build-candidate.ps1"
 _BUILD_PROVENANCE_PATH = _RC003_ROOT / "build" / "build-provenance.ps1"
+_CYTHON_PREPARE_PATH = _RC003_ROOT / "build" / "prepare-cython-core.py"
+_REQUIREMENTS_DEV_PATH = _RC003_ROOT / "requirements-dev.txt"
 _PACKAGE_LOCAL_TEST_PATH = _RC003_ROOT / "build" / "package-local-test.ps1"
 _RUN_DEV_PATH = _RC003_ROOT / "build" / "run-dev.ps1"
 _STOP_DEV_PATH = _RC003_ROOT / "build" / "stop-dev.ps1"
@@ -135,6 +137,41 @@ def _spec_hidden_import_winrt_modules(text: str) -> set:
             values = ast.literal_eval(node.value)
             return {value for value in values if value.startswith("winrt.")}
     raise AssertionError("hiddenimports assignment not found in spec")
+
+
+class CythonCoreBuildContractTests(unittest.TestCase):
+    def setUp(self):
+        self.text = _CYTHON_PREPARE_PATH.read_text(encoding="utf-8")
+
+    def test_prepare_script_is_valid_python_and_targets_only_permission_core(self):
+        ast.parse(self.text, filename=str(_CYTHON_PREPARE_PATH))
+        self.assertIn('"ovb_rc003.hid_elevation_windows"', self.text)
+        self.assertIn('"ovb_rc003.hid_helper_consumers"', self.text)
+        self.assertNotIn('"ovb_rc003.app"', self.text)
+
+    def test_prepare_script_uses_the_proven_compatibility_directives(self):
+        for directive in (
+            '"language_level": 3',
+            '"annotation_typing": False',
+            '"binding": True',
+            '"embedsignature": True',
+            '"infer_types": False',
+            '"always_allow_keywords": True',
+        ):
+            self.assertIn(directive, self.text)
+
+    def test_prepare_script_builds_in_an_ignored_stage_without_mutating_src(self):
+        self.assertIn('STAGE_ROOT = RC003_ROOT / "build" / "cython-stage"', self.text)
+        self.assertIn('WORK_ROOT = RC003_ROOT / "build" / "cython-work"', self.text)
+        self.assertIn("shutil.copytree(", self.text)
+        self.assertIn("source.unlink()", self.text)
+        self.assertIn("source.relative_to(RC003_ROOT)", self.text)
+
+    def test_build_tool_versions_are_pinned(self):
+        requirements = _REQUIREMENTS_DEV_PATH.read_text(encoding="utf-8")
+        self.assertIn("cython==3.2.8", requirements)
+        self.assertIn("setuptools==80.9.0", requirements)
+
 
 
 class WinRTDependencyClosureContractTests(unittest.TestCase):
@@ -254,6 +291,8 @@ class PyInstallerSpecTests(unittest.TestCase):
         self.assertIn('(str(VERSION_FILE), "ovb_rc003")', helper_analysis)
         self.assertIn('"ovb_rc003/frida_assets"', helper_analysis)
         self.assertIn('"ovb_rc003.hid_elevation_windows"', helper_analysis)
+        self.assertIn('"html"', helper_analysis)
+        self.assertIn('"xml.etree.ElementTree"', helper_analysis)
         self.assertIn('"ovb_rc003.frida_hid_tap_injector"', helper_analysis)
         self.assertIn('"comtypes"', helper_analysis)
         self.assertIn('"comtypes.client"', helper_analysis)
@@ -265,6 +304,13 @@ class PyInstallerSpecTests(unittest.TestCase):
         )
         self.assertIn("*helper_exe.dependencies", text)
         self.assertNotIn("\n    helper_exe,\n", text)
+
+    def test_spec_accepts_the_checked_cython_stage_as_its_source_root(self):
+        text = _strip_hash_comments(_SPEC_PATH.read_text(encoding="utf-8"))
+        self.assertIn('os.environ.get("RC003_BUILD_SOURCE_ROOT"', text)
+        self.assertIn("Path(source_root_override).resolve()", text)
+        self.assertIn("required build source directory is missing", text)
+        self.assertIn('"ovb_rc003.hid_helper_consumers"', text)
 
     def test_main_and_helper_manifests_do_not_require_administrator(self):
         text = _strip_hash_comments(_SPEC_PATH.read_text(encoding="utf-8"))
@@ -1976,6 +2022,28 @@ class WindowsCiWorkflowTests(unittest.TestCase):
         pyinstaller_index = self.text.index("PyInstaller build (unsigned candidate)")
         self.assertLess(fetch_index, pyinstaller_index)
 
+    def test_compiles_and_tests_permission_modules_before_pyinstaller(self):
+        source_test_index = self.text.index("- name: Run test suite")
+        compile_index = self.text.index(
+            "- name: Compile selected permission modules with Cython"
+        )
+        compiled_test_index = self.text.index(
+            "- name: Test compiled permission modules and HID helper"
+        )
+        pyinstaller_index = self.text.index(
+            "- name: PyInstaller build (unsigned candidate)"
+        )
+        self.assertLess(source_test_index, compile_index)
+        self.assertLess(compile_index, compiled_test_index)
+        self.assertLess(compiled_test_index, pyinstaller_index)
+        self.assertIn("python build/prepare-cython-core.py", self.text)
+        self.assertIn("PYTHONPATH: build/cython-stage/src", self.text)
+        self.assertIn("RC003_BUILD_SOURCE_ROOT", self.text)
+
+    def test_frozen_output_requires_both_compiled_extensions(self):
+        self.assertIn('foreach ($compiledModuleName in @("hid_elevation_windows", "hid_helper_consumers"))', self.text)
+        self.assertIn("expected one compiled $compiledModuleName extension", self.text)
+
     def test_requires_the_narrow_hid_helper_in_the_built_directory(self):
         self.assertIn(
             'dist/RemoteMicRC003/_internal/RemoteMicRC003HidHelper.exe',
@@ -2013,6 +2081,7 @@ class BuildProvenanceScriptTests(unittest.TestCase):
             r"build\check-public-boundary.ps1",
             r"build\check-release-readiness.py",
             r"build\check-third-party-notices.py",
+            r"build\prepare-cython-core.py",
             r"build\fetch-frida-gadget.ps1",
             r"build\fetch-vb-cable.ps1",
             r"build\stop-dev.ps1",
@@ -2086,6 +2155,7 @@ class BuildProvenanceScriptTests(unittest.TestCase):
                 rc003_root / "build" / "check-public-boundary.ps1": "fixture\n",
                 rc003_root / "build" / "check-release-readiness.py": "fixture\n",
                 rc003_root / "build" / "check-third-party-notices.py": "fixture\n",
+                rc003_root / "build" / "prepare-cython-core.py": "fixture\n",
                 rc003_root / "build" / "fetch-frida-gadget.ps1": "fixture\n",
                 rc003_root / "build" / "fetch-vb-cable.ps1": "fixture\n",
                 rc003_root / "build" / "stop-dev.ps1": "fixture\n",
@@ -2311,6 +2381,23 @@ class BuildCandidateScriptTests(unittest.TestCase):
             'Assert-LastExitCode "fetch-frida-gadget.ps1"'
         )
         self.assertGreater(assert_index, fetch_index)
+
+    def test_compiles_and_tests_permission_modules_before_pyinstaller(self):
+        source_test_index = self.text.index('Write-Host "-- test suite --"')
+        compile_index = self.text.index("prepare-cython-core.py")
+        compiled_test_index = self.text.index("compiled permission module tests")
+        pyinstaller_index = self.text.index("PyInstaller build (unsigned candidate)")
+        self.assertLess(source_test_index, compile_index)
+        self.assertLess(compile_index, compiled_test_index)
+        self.assertLess(compiled_test_index, pyinstaller_index)
+        self.assertIn("tests.test_hid_elevation_windows", self.text)
+        self.assertIn("tests.test_hid_helper_consumers", self.text)
+        self.assertIn("compiled HID helper --self-check", self.text)
+        self.assertIn("$env:RC003_BUILD_SOURCE_ROOT = $cythonSourceRoot", self.text)
+
+    def test_frozen_output_requires_both_compiled_extensions(self):
+        self.assertIn('foreach ($compiledModuleName in @("hid_elevation_windows", "hid_helper_consumers"))', self.text)
+        self.assertIn("expected one compiled $compiledModuleName extension", self.text)
 
     def test_checks_the_real_frozen_qt_runtime_after_building(self):
         pyinstaller_index = self.text.index("PyInstaller build (unsigned candidate)")
