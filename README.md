@@ -7,6 +7,25 @@ Quicker 动作。支持单击、双击、长按和组合按键映射，按住说
 设备连接、按键处理和音频桥接由本机完成；语音识别是否联网取决于所选输入法
 或应用。
 
+## 下载无线麦
+
+**[下载 Windows 免安装版 · 解压后运行](https://github.com/ZSTDJan/windows-remote-mic-app/releases/download/v0.2.0-windows-rc003-candidate.2/RemoteMicRC003-0.2.0-candidate.2-portable-unsigned.zip)**
+
+当前公开版本：**0.2.0-candidate.2（测试版）**。完整解压 ZIP 后，运行文件夹中的
+`RemoteMicRC003.exe`；不要只把 EXE 单独取出来。
+
+[版本说明与历史附件](https://github.com/ZSTDJan/windows-remote-mic-app/releases/tag/v0.2.0-windows-rc003-candidate.2) · [校验文件 SHA256SUMS.txt](https://github.com/ZSTDJan/windows-remote-mic-app/releases/download/v0.2.0-windows-rc003-candidate.2/SHA256SUMS.txt)
+
+> **运行时需要管理员权限。** 完整解压 ZIP 后，请右键 `RemoteMicRC003.exe`，选择“以管理员身份运行”。否则程序可以打开，语音和部分
+> 按键也可能可用，但返回、音量等实体按键可能无法完整识别。当前“随 Windows 启动”
+> 使用普通权限；需要完整按键时，请退出普通权限实例后再以管理员身份打开。
+
+后续版本暂不提供安装程序，新用户请选择免安装版。旧版附件保留供历史使用与回退，
+旧文件名和下载链接不变；新中文文件名从下一次发布开始使用，产品仍是无线麦。
+
+当前测试版未签名，Windows SmartScreen 可能提示。请只从本仓库下载，
+并用 `SHA256SUMS.txt` 核对文件哈希。
+
 ![无线麦按键映射主界面](docs/screenshots/settings-buttons.png)
 
 ## 用来做什么
@@ -49,31 +68,11 @@ Quicker 动作。支持单击、双击、长按和组合按键映射，按住说
 后续输入法会按真实安装、快捷键、音频输入和文字上屏结果逐个增加内置适配；没有
 完成验证的输入法不会笼统写成“已支持”。
 
-## 下载与安装
-
-当前预发行版：
-[无线麦【Win版】｜小米遥控器 2 Pro｜2026-09-01 候选版](https://github.com/ZSTDJan/windows-remote-mic-app/releases/tag/v0.2.0-windows-rc003-candidate.2)
-
-> **运行时需要管理员权限。** 安装程序本身不需要管理员权限，但安装完成后或解压
-> 便携版后，请右键无线麦并选择“以管理员身份运行”。否则程序可以打开，语音和部分
-> 按键也可能可用，但返回、音量等实体按键可能无法完整识别。当前“随 Windows 启动”
-> 使用普通权限；需要完整按键时，请退出普通权限实例后再以管理员身份打开。
-
-从 Release 页面下载一种即可：
-
-| 下载类型 | 当前文件 | 怎么使用 |
-| --- | --- | --- |
-| 安装版 | `RemoteMicRC003Setup-0.2.0-candidate.2-unsigned.exe` | 推荐；运行安装程序后，从开始菜单或桌面打开“无线麦” |
-| 便携版 | `RemoteMicRC003-0.2.0-candidate.2-portable-unsigned.zip` | 免安装；完整解压后运行 `RemoteMicRC003.exe` |
-
-当前候选版没有代码签名，Windows SmartScreen 可能显示安全提示。请只从本仓库
-Release 下载，并同时使用 `SHA256SUMS.txt` 核对文件哈希。
-
 ## 第一次使用
 
-1. 下载并安装无线麦；使用便携版时，先完整解压 ZIP；
+1. 下载免安装 ZIP，并完整解压到新的文件夹；
 2. 打开 Windows 蓝牙设置，把小米蓝牙语音遥控器 2 Pro 与电脑配对；
-3. 右键无线麦的开始菜单、桌面快捷方式或 `RemoteMicRC003.exe`，选择“以管理员身份运行”；
+3. 右键解压目录中的 `RemoteMicRC003.exe`，选择“以管理员身份运行”；
 4. 在“设备”页点击“重新检查”，确认设备和按键接收显示正常；
 5. 进入“语音”页，按页面提示安装或检查虚拟音频并点击“应用”；在使用的输入法中，
    把麦克风输入设为 `CABLE Output`；
