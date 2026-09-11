@@ -1,7 +1,8 @@
 # 无线麦【Win版】
 
-无线麦【Win版】是一款把蓝牙语音遥控器的按键和麦克风变成 Windows 快捷操作与
-语音输入的本地桥接工具。目前公开版本首先适配小米蓝牙语音遥控器 2 Pro
+无线麦【Win版】是一款独立维护的 Windows 遥控与语音输入工具，
+把蓝牙语音遥控器的按键和麦克风转成电脑上的快捷操作与语音输入。
+目前公开版本首先适配小米蓝牙语音遥控器 2 Pro
 （RC003），可用于远距离控制应用、输入文字，以及触发键盘快捷键、系统操作和
 Quicker 动作。支持单击、双击、长按和组合按键映射，按住说话、输入法语音。
 设备连接、按键处理和音频桥接由本机完成；语音识别是否联网取决于所选输入法
@@ -59,14 +60,12 @@ Quicker 动作。支持单击、双击、长按和组合按键映射，按住说
 
 ### 语音输入
 
-- **搜狗语音输入**：内置识别，可读取和同步按住说话快捷键；
-- **微信输入法**：内置识别并可打开设置，快捷键需要在微信输入法和无线麦中保持一致；
-- **Windows 语音输入**：使用系统 `Win+H`；
-- **其它输入法或语音程序**：可通过“自定义程序”和自定义快捷键接入，豆包等目前
-  归入这一类，是否可用以实际快捷键、麦克风输入和文字上屏测试为准。
+- **搜狗语音输入**：支持按住说话，可读取和同步语音快捷键；
+- **微信输入法**：支持语音输入，需确认输入法和无线麦的语音快捷键一致；
+- **豆包输入法**：支持按住说话，将语音转换为文字输入。
 
-后续输入法会按真实安装、快捷键、音频输入和文字上屏结果逐个增加内置适配；没有
-完成验证的输入法不会笼统写成“已支持”。
+当前公开测试版的豆包需通过“自定义程序”接入；内置豆包适配已在开发版本中加入，
+尚未包含在上方下载的 `0.2.0-candidate.2` 中。
 
 ## 第一次使用
 
@@ -137,12 +136,8 @@ $env:PYTHONPATH = Join-Path (Get-Location) 'src'
 .\build\build-candidate.ps1
 ```
 
-### 来源与维护边界
+### 维护与第三方说明
 
-- Windows 实现参考了
-  [`nijez/open-voice-bridge`](https://github.com/nijez/open-voice-bridge)；
-- RC003 HID 旁路参考了
-  [`xxb26553663-star/remote-bridge-hub`](https://github.com/xxb26553663-star/remote-bridge-hub)；
 - Windows CI 位于 `.github/workflows/windows-rc003-ci.yml`；
 - 详细改动和第三方边界见
   [`apps/windows/rc003/ATTRIBUTION.md`](apps/windows/rc003/ATTRIBUTION.md)、
@@ -156,8 +151,6 @@ $env:PYTHONPATH = Join-Path (Get-Location) 'src'
 代码按 `GPL-3.0-only` 发布，完整许可证见 [`LICENSE.md`](LICENSE.md)。第三方组件
 和素材仍按各自许可与授权记录分发：
 
-- **项目来源**：本仓库从 [`HD838A/remote-mic-app`](https://github.com/HD838A/remote-mic-app)
-  的 Windows RC003 工作继续整理；macOS/Swift 内容不在本仓库维护；
 - 普通问题和修改建议见 [`CONTRIBUTING.md`](CONTRIBUTING.md)；
 - 安全漏洞请按 [`SECURITY.md`](SECURITY.md) 使用私密入口，不要公开复现细节；
 - 第三方许可与素材授权见 [`THIRD_PARTY_LICENSES`](THIRD_PARTY_LICENSES/README.md)、
