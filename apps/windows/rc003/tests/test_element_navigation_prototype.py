@@ -5,6 +5,7 @@ import random
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -171,6 +172,7 @@ class SpatialNavigationTests(unittest.TestCase):
                 "os",
                 "spatial_navigation_core",
                 "threading",
+                "time",
                 "typing",
             },
         )
@@ -233,6 +235,128 @@ class SpatialNavigationTests(unittest.TestCase):
         )
         self.assertLess(dpi_call_line, platform_import_line)
 
+    def test_windows_host_mouse_click_uses_one_confirmed_batch(self):
+        host = prototype._load_element_navigation_windows_host()
+        calls = []
+
+        host._send_mouse_click_safely(
+            "left",
+            is_button_down=lambda _button: False,
+            send_events=lambda events: calls.append(list(events)) or len(events),
+        )
+
+        self.assertEqual(
+            calls,
+            [[(host._MOUSEEVENTF_LEFTDOWN, 0), (host._MOUSEEVENTF_LEFTUP, 0)]],
+        )
+
+    def test_windows_host_mouse_click_refuses_to_interrupt_a_physical_hold(self):
+        host = prototype._load_element_navigation_windows_host()
+        calls = []
+
+        with self.assertRaises(host.MouseInputBusyError):
+            host._send_mouse_click_safely(
+                "right",
+                is_button_down=lambda _button: True,
+                send_events=lambda events: calls.append(list(events)) or len(events),
+            )
+
+        self.assertEqual(calls, [])
+
+    def test_windows_host_busy_click_does_not_move_the_pointer(self):
+        host = prototype._load_element_navigation_windows_host()
+        moves = []
+        calls = []
+
+        with self.assertRaises(host.MouseInputBusyError):
+            host._move_and_click_safely(
+                (120, 80),
+                "left",
+                is_button_down=lambda _button: True,
+                move_pointer=lambda point: moves.append(point) or True,
+                send_events=lambda events: calls.append(list(events)) or len(events),
+            )
+
+        self.assertEqual(moves, [])
+        self.assertEqual(calls, [])
+
+    def test_windows_host_busy_wheel_does_not_move_the_pointer(self):
+        host = prototype._load_element_navigation_windows_host()
+        moves = []
+        calls = []
+
+        with self.assertRaises(host.MouseInputBusyError):
+            host._move_and_wheel_safely(
+                (120, 80),
+                1,
+                pointer_move_is_blocked=lambda: True,
+                move_pointer=lambda point: moves.append(point) or True,
+                send_events=lambda events: calls.append(list(events)) or len(events),
+            )
+
+        self.assertEqual(moves, [])
+        self.assertEqual(calls, [])
+
+    def test_windows_host_partial_mouse_click_attempts_a_release(self):
+        host = prototype._load_element_navigation_windows_host()
+        calls = []
+        sent_counts = iter((1, 1))
+
+        with self.assertRaises(host.MouseInputDeliveryError):
+            host._send_mouse_click_safely(
+                "left",
+                is_button_down=lambda _button: False,
+                send_events=lambda events: (
+                    calls.append(list(events)) or next(sent_counts)
+                ),
+            )
+
+        self.assertEqual(calls[1], [(host._MOUSEEVENTF_LEFTUP, 0)])
+
+    def test_windows_host_retains_an_unconfirmed_release_until_it_succeeds(self):
+        host = prototype._load_element_navigation_windows_host()
+        state = host._MouseInputSafetyState()
+        wheel_calls = []
+        failed_release = lambda _events: 0
+        sent_counts = iter((1, 0))
+
+        with self.assertRaises(host.MouseInputCleanupIncompleteError) as ctx:
+            host._send_mouse_click_safely(
+                "left",
+                is_button_down=lambda _button: False,
+                send_events=lambda _events: next(sent_counts),
+            )
+        state.pending_button = ctx.exception.button
+
+        with self.assertRaises(host.MouseInputCleanupIncompleteError):
+            state.run(
+                lambda: wheel_calls.append("wheel"),
+                send_events=failed_release,
+            )
+        self.assertEqual(wheel_calls, [])
+        self.assertEqual(state.pending_button, "left")
+
+        state.run(
+            lambda: wheel_calls.append("wheel"),
+            send_events=lambda _events: 1,
+        )
+        self.assertEqual(wheel_calls, ["wheel"])
+        self.assertIsNone(state.pending_button)
+
+    def test_windows_host_wheel_requires_confirmed_delivery(self):
+        host = prototype._load_element_navigation_windows_host()
+        calls = []
+
+        host._send_mouse_wheel_safely(
+            -2,
+            send_events=lambda events: calls.append(list(events)) or 1,
+        )
+
+        self.assertEqual(
+            calls,
+            [[(host._MOUSEEVENTF_WHEEL, -2 * host._MOUSE_WHEEL_DELTA)]],
+        )
+
     def test_windows_host_loads_without_importing_uia_or_qt(self):
         code = f"""
 import importlib.util
@@ -259,6 +383,185 @@ assert not any(name == "PySide6" or name.startswith("PySide6.") for name in sys.
             )
 
         self.assertEqual(completed.returncode, 0, completed.stderr)
+
+    def test_navigation_cleanup_attempts_every_resource_after_one_failure(self):
+        host = prototype._load_element_navigation_windows_host()
+        calls = []
+
+        def fail_hook():
+            calls.append("hook")
+            raise RuntimeError("still running")
+
+        failures = host._stop_resources_best_effort(
+            (
+                ("timer", lambda: calls.append("timer")),
+                ("keyboard_hook", fail_hook),
+                ("worker", lambda: calls.append("worker")),
+            )
+        )
+
+        self.assertEqual(calls, ["timer", "hook", "worker"])
+        self.assertEqual(failures, ["keyboard_hook:RuntimeError"])
+
+    def test_keyboard_hook_cleanup_reports_a_thread_that_stays_alive(self):
+        tree = ast.parse(WINDOWS_HOST_PATH.read_text(encoding="utf-8"))
+        keyboard_hook = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.ClassDef) and node.name == "KeyboardHook"
+        )
+        stop = next(
+            node
+            for node in keyboard_hook.body
+            if isinstance(node, ast.FunctionDef) and node.name == "stop"
+        )
+
+        self.assertTrue(any(isinstance(node, ast.Raise) for node in ast.walk(stop)))
+
+    def test_keyboard_hook_creates_its_message_queue_before_reporting_ready(self):
+        tree = ast.parse(WINDOWS_HOST_PATH.read_text(encoding="utf-8"))
+        keyboard_hook = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.ClassDef) and node.name == "KeyboardHook"
+        )
+        run = next(
+            node
+            for node in keyboard_hook.body
+            if isinstance(node, ast.FunctionDef) and node.name == "_run"
+        )
+        source = ast.unparse(run)
+
+        self.assertLess(
+            source.index("user32.PeekMessageW"),
+            source.index("self._ready.set()"),
+        )
+
+    def test_keyboard_hook_passes_an_unowned_key_up_to_windows(self):
+        tree = ast.parse(WINDOWS_HOST_PATH.read_text(encoding="utf-8"))
+        keyboard_hook = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.ClassDef) and node.name == "KeyboardHook"
+        )
+        handle = next(
+            node
+            for node in keyboard_hook.body
+            if isinstance(node, ast.FunctionDef) and node.name == "_route_key"
+        )
+        source = ast.unparse(handle)
+
+        unmatched_release_guard = source.index("if is_up:\n")
+        navigation_interception = source.index(
+            "if self._intercepting.is_set() and action is not None:"
+        )
+        self.assertLess(unmatched_release_guard, navigation_interception)
+        self.assertIn("return user32.CallNextHookEx", source[unmatched_release_guard:])
+
+    def test_runtime_cleanup_marks_complete_only_after_all_stops_succeed(self):
+        tree = ast.parse(WINDOWS_HOST_PATH.read_text(encoding="utf-8"))
+        run_windows = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name == "_run_windows"
+        )
+        cleanup = next(
+            node
+            for node in ast.walk(run_windows)
+            if isinstance(node, ast.FunctionDef) and node.name == "cleanup"
+        )
+        completion_assignments = [
+            node
+            for node in cleanup.body
+            if isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Name)
+                and target.id == "cleanup_complete"
+                for target in node.targets
+            )
+        ]
+
+        self.assertEqual(len(completion_assignments), 1)
+        self.assertIsInstance(completion_assignments[0].value, ast.Constant)
+        self.assertIs(completion_assignments[0].value.value, True)
+        failure_guard = next(
+            node
+            for node in cleanup.body
+            if isinstance(node, ast.If)
+            and isinstance(node.test, ast.Name)
+            and node.test.id == "failures"
+        )
+        self.assertGreater(
+            completion_assignments[0].lineno,
+            failure_guard.lineno,
+        )
+
+    def test_runtime_builds_cleanup_chain_before_starting_owned_resources(self):
+        tree = ast.parse(WINDOWS_HOST_PATH.read_text(encoding="utf-8"))
+        run_windows = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name == "_run_windows"
+        )
+        cleanup_binding = next(
+            node
+            for node in ast.walk(run_windows)
+            if isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Subscript)
+                and isinstance(target.value, ast.Name)
+                and target.value.id == "cleanup_callback"
+                for target in node.targets
+            )
+            and isinstance(node.value, ast.Name)
+            and node.value.id == "cleanup"
+        )
+        owned_starts = [
+            node
+            for node in ast.walk(run_windows)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "start"
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id
+            in {
+                "worker",
+                "hook",
+                "structure_watcher",
+                "command_server",
+                "timer",
+                "geometry_timer",
+                "owner_timer",
+            }
+        ]
+
+        self.assertTrue(owned_starts)
+        self.assertTrue(
+            all(cleanup_binding.lineno < call.lineno for call in owned_starts)
+        )
+
+    def test_all_thread_owners_report_a_shutdown_timeout(self):
+        tree = ast.parse(WINDOWS_HOST_PATH.read_text(encoding="utf-8"))
+        run_windows = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name == "_run_windows"
+        )
+        for class_name in ("AutomationWorker", "StructureChangeWatcher", "KeyboardHook"):
+            owner = next(
+                node
+                for node in ast.walk(run_windows)
+                if isinstance(node, ast.ClassDef) and node.name == class_name
+            )
+            stop = next(
+                node
+                for node in owner.body
+                if isinstance(node, ast.FunctionDef) and node.name == "stop"
+            )
+            self.assertTrue(
+                any(isinstance(node, ast.Raise) for node in ast.walk(stop)),
+                class_name,
+            )
 
     def test_legacy_entry_help_works_from_an_arbitrary_directory(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -3497,7 +3800,7 @@ assert not any(name == "PySide6" or name.startswith("PySide6.") for name in sys.
         cached_elapsed = time.perf_counter() - started
 
         self.assertLess(cold_elapsed, 4.0)
-        self.assertLess(cached_elapsed, 0.2)
+        self.assertLess(cached_elapsed, 0.1)
 
     def test_irregular_layout_keeps_every_target_in_directional_rankings(self):
         targets = [
@@ -3739,7 +4042,9 @@ assert not any(name == "PySide6" or name.startswith("PySide6.") for name in sys.
             prototype.VK_RIGHT,
         ):
             with self.subTest(vk=vk):
-                ownership = prototype.DirectionInputOwnership()
+                ownership = prototype.DirectionInputOwnership(
+                    consume_wait_seconds=0
+                )
                 call_next = mock.Mock(return_value=1)
                 self.assertEqual(
                     ownership.route(
@@ -3753,6 +4058,161 @@ assert not any(name == "PySide6" or name.startswith("PySide6.") for name in sys.
                 )
                 call_next.assert_called_once_with()
 
+    def test_recorded_rc003_direction_edge_is_swallowed_once(self):
+        ownership = prototype.DirectionInputOwnership(consume_wait_seconds=0)
+        self.assertTrue(
+            ownership.record_device_edge(
+                prototype.VK_UP,
+                0x48,
+                True,
+                True,
+            )
+        )
+        call_next = mock.Mock(return_value=0)
+
+        self.assertEqual(
+            ownership.route(
+                prototype.VK_UP,
+                is_down=True,
+                is_up=False,
+                injected=False,
+                scan_code=0x48,
+                extended=True,
+                call_next=call_next,
+            ),
+            (True, 0),
+        )
+        self.assertEqual(
+            ownership.route(
+                prototype.VK_UP,
+                is_down=True,
+                is_up=False,
+                injected=True,
+                scan_code=0x48,
+                extended=True,
+                call_next=call_next,
+            ),
+            (False, 0),
+        )
+
+    def test_device_edge_requires_the_exact_keyboard_identity(self):
+        ownership = prototype.DirectionInputOwnership(consume_wait_seconds=0)
+        ownership.record_device_edge(prototype.VK_UP, 0x48, True, True)
+
+        self.assertFalse(
+            ownership.route(
+                prototype.VK_UP,
+                is_down=True,
+                is_up=False,
+                injected=False,
+                scan_code=0x48,
+                extended=False,
+                call_next=mock.Mock(return_value=0),
+            )[0]
+        )
+
+    def test_stopping_navigation_clears_device_edge_correlation(self):
+        ownership = prototype.DirectionInputOwnership(consume_wait_seconds=0)
+        ownership.record_device_edge(prototype.VK_LEFT, 0x4B, True, True)
+        ownership.reset_device_edges()
+
+        self.assertFalse(
+            ownership.route(
+                prototype.VK_LEFT,
+                is_down=True,
+                is_up=False,
+                injected=False,
+                scan_code=0x4B,
+                extended=True,
+                call_next=mock.Mock(return_value=0),
+            )[0]
+        )
+
+    def test_each_fast_rc003_press_cycle_remains_independent(self):
+        ownership = prototype.DirectionInputOwnership(consume_wait_seconds=0)
+        call_next = mock.Mock(return_value=0)
+        for _press in range(2):
+            self.assertTrue(
+                ownership.record_device_edge(
+                    prototype.VK_RIGHT,
+                    0x4D,
+                    True,
+                    True,
+                )
+            )
+            self.assertTrue(
+                ownership.route(
+                    prototype.VK_RIGHT,
+                    is_down=True,
+                    is_up=False,
+                    injected=False,
+                    scan_code=0x4D,
+                    extended=True,
+                    call_next=call_next,
+                )[0]
+            )
+            self.assertTrue(
+                ownership.record_device_edge(
+                    prototype.VK_RIGHT,
+                    0x4D,
+                    True,
+                    False,
+                )
+            )
+            self.assertTrue(
+                ownership.route(
+                    prototype.VK_RIGHT,
+                    is_down=False,
+                    is_up=True,
+                    injected=False,
+                    scan_code=0x4D,
+                    extended=True,
+                    call_next=call_next,
+                )[0]
+            )
+
+    def test_held_rc003_direction_swallows_legacy_repeats(self):
+        ownership = prototype.DirectionInputOwnership(consume_wait_seconds=0)
+        call_next = mock.Mock(return_value=0)
+        ownership.record_device_edge(prototype.VK_DOWN, 0x50, True, True)
+
+        for _repeat in range(3):
+            self.assertTrue(
+                ownership.route(
+                    prototype.VK_DOWN,
+                    is_down=True,
+                    is_up=False,
+                    injected=False,
+                    scan_code=0x50,
+                    extended=True,
+                    call_next=call_next,
+                )[0]
+            )
+
+    def test_hook_waits_for_the_same_device_edge_from_another_thread(self):
+        ownership = prototype.DirectionInputOwnership(consume_wait_seconds=0.1)
+        call_next = mock.Mock(return_value=0)
+
+        def record_edge():
+            time.sleep(0.01)
+            ownership.record_device_edge(prototype.VK_LEFT, 0x4B, True, True)
+
+        thread = threading.Thread(target=record_edge)
+        thread.start()
+        try:
+            owned, _result = ownership.route(
+                prototype.VK_LEFT,
+                is_down=True,
+                is_up=False,
+                injected=False,
+                scan_code=0x4B,
+                extended=True,
+                call_next=call_next,
+            )
+        finally:
+            thread.join(timeout=1)
+        self.assertTrue(owned)
+
     def test_raw_keyboard_direction_remains_navigation_input(self):
         for vk in (
             prototype.VK_UP,
@@ -3761,7 +4221,9 @@ assert not any(name == "PySide6" or name.startswith("PySide6.") for name in sys.
             prototype.VK_RIGHT,
         ):
             with self.subTest(vk=vk):
-                ownership = prototype.DirectionInputOwnership()
+                ownership = prototype.DirectionInputOwnership(
+                    consume_wait_seconds=0
+                )
                 call_next = mock.Mock(return_value=0)
                 self.assertEqual(
                     ownership.route(
@@ -4090,9 +4552,15 @@ assert not any(name == "PySide6" or name.startswith("PySide6.") for name in sys.
         self.assertIn("def owner_process_is_alive(process_id: int)", source)
         self.assertIn("owner_timer.start(500)", source)
         self.assertIn("QTimer.singleShot(0, monitor_owner_process)", source)
-        self.assertIn("if vk in self._passthrough:", source)
-        self.assertIn("if is_down and action is not None:", source)
+        self.assertIn("if not injected and vk in self._passthrough:", source)
+        self.assertIn(
+            "if is_down and not injected and action is not None:",
+            source,
+        )
+        self.assertIn("if is_down and not injected:", source)
         self.assertIn("self._passthrough.add(vk)", source)
+        self.assertIn("ownership_key = (vk, injected)", source)
+        self.assertIn("self._seed_passthrough()", source)
 
     def test_overlay_signature_checks_are_rate_limited(self):
         self.assertTrue(prototype.periodic_check_due(10.0, 0.0, 1.0))
@@ -5507,7 +5975,7 @@ assert not any(name == "PySide6" or name.startswith("PySide6.") for name in sys.
             )
         )
 
-    def test_msaa_window_wrapper_is_dropped_only_with_finer_targets(self):
+    def test_msaa_window_wrapper_is_always_dropped(self):
         window = prototype.Rect(0, 0, 1000, 800)
         wrapper = prototype.Rect(0, 0, 1000, 800)
         children = [
@@ -5522,14 +5990,14 @@ assert not any(name == "PySide6" or name.startswith("PySide6.") for name in sys.
                 children,
             )
         )
-        self.assertFalse(
+        self.assertTrue(
             prototype.msaa_wrapper_should_be_ignored(
                 wrapper,
                 window,
                 children[:1],
             )
         )
-        self.assertFalse(
+        self.assertTrue(
             prototype.msaa_wrapper_should_be_ignored(
                 wrapper,
                 window,
@@ -5542,6 +6010,84 @@ assert not any(name == "PySide6" or name.startswith("PySide6.") for name in sys.
                 window,
                 children,
             )
+        )
+
+    def test_broad_internal_wrapper_is_only_a_childless_fallback(self):
+        window = prototype.Rect(0, 0, 1000, 800)
+        wrapper = prototype.TargetSnapshot(
+            prototype.Rect(100, 100, 900, 500),
+            "legacy surface",
+            "LegacyControl",
+            has_action_pattern=True,
+        )
+        child = self.target(200, 180, 320, 230, "button")
+
+        self.assertEqual(
+            prototype.broad_container_keep_indices([wrapper, child], window),
+            [1],
+        )
+        self.assertEqual(
+            prototype.broad_container_keep_indices([wrapper], window),
+            [0],
+        )
+        self.assertTrue(
+            prototype.targets_need_broad_container_rescan([wrapper], window)
+        )
+
+    def test_outer_uia_wrapper_is_never_a_navigation_target(self):
+        window = prototype.Rect(0, 0, 1000, 800)
+        wrapper = prototype.TargetSnapshot(
+            window,
+            "settings window",
+            "PaneControl",
+            has_action_pattern=True,
+        )
+
+        self.assertEqual(
+            prototype.broad_container_keep_indices([wrapper], window),
+            [],
+        )
+
+    def test_compact_interactive_parent_and_child_are_preserved(self):
+        window = prototype.Rect(0, 0, 1000, 800)
+        card = prototype.TargetSnapshot(
+            prototype.Rect(100, 100, 600, 280),
+            "card",
+            "CustomControl",
+            path=(0, 1),
+            has_action_pattern=True,
+        )
+        child = self.target(
+            520,
+            120,
+            580,
+            170,
+            "more",
+            path=(0, 1, 0),
+            has_action_pattern=True,
+        )
+
+        self.assertEqual(
+            prototype.broad_container_keep_indices([card, child], window),
+            [0, 1],
+        )
+
+    def test_window_sized_input_is_not_treated_as_a_container_shell(self):
+        window = prototype.Rect(0, 0, 1000, 800)
+        editor = prototype.TargetSnapshot(
+            window,
+            "editor",
+            "EditControl",
+            keyboard_focusable=True,
+            has_action_pattern=True,
+        )
+
+        self.assertEqual(
+            prototype.broad_container_keep_indices([editor], window),
+            [0],
+        )
+        self.assertFalse(
+            prototype.targets_need_broad_container_rescan([editor], window)
         )
 
     def test_runtime_scan_wires_editor_and_msaa_wrapper_rules(self):
@@ -5558,6 +6104,12 @@ assert not any(name == "PySide6" or name.startswith("PySide6.") for name in sys.
             if isinstance(node, ast.FunctionDef)
             and node.name == "point_hierarchy_targets"
         )
+        broad_rescan = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_refresh_broad_fallback"
+        )
 
         self.assertTrue(
             any(
@@ -5572,6 +6124,21 @@ assert not any(name == "PySide6" or name.startswith("PySide6.") for name in sys.
                 and isinstance(call.func, ast.Name)
                 and call.func.id == "msaa_wrapper_should_be_ignored"
                 for call in ast.walk(point_hierarchy)
+            )
+        )
+        self.assertTrue(
+            any(
+                isinstance(call, ast.Call)
+                and isinstance(call.func, ast.Name)
+                and call.func.id == "broad_container_target_should_be_ignored"
+                for call in ast.walk(point_hierarchy)
+            )
+        )
+        self.assertTrue(
+            any(
+                isinstance(keyword, ast.keyword)
+                and keyword.arg == "deadline"
+                for keyword in ast.walk(broad_rescan)
             )
         )
 

@@ -195,6 +195,7 @@ def _import_winrt() -> WinRTModules:
 
 async def discover_candidates(
     winrt: Optional[WinRTModules] = None,
+    *, with_device_keys: bool = False,
 ) -> List[identity.RC003Candidate]:
     """Enumerate currently-paired BLE devices.
 
@@ -214,7 +215,11 @@ async def discover_candidates(
     winrt = winrt or _import_winrt()
 
     selector = winrt.bluetooth_le_device.get_device_selector_from_pairing_state(True)
-    devices = await winrt.device_information.find_all_async_aqs_filter(selector)
+    if with_device_keys:
+        devices = await winrt.device_information.find_all_async_aqs_filter_and_additional_properties(
+            selector, ["System.Devices.Aep.ContainerId"])
+    else:
+        devices = await winrt.device_information.find_all_async_aqs_filter(selector)
 
     candidates: List[identity.RC003Candidate] = []
     unique_device_ids = set()
@@ -234,9 +239,15 @@ async def discover_candidates(
             missing_device_ids += 1
         if identity.matches_rc003_name(name):
             rc003_name_matches += 1
-        candidates.append(
-            identity.RC003Candidate(name=name, hardware_match=False, handle=info)
-        )
+        key = ""
+        if with_device_keys:
+            from . import remote_selection
+            try:
+                key = remote_selection.candidate_key(info)
+            except (remote_selection.SelectionError, OSError, TypeError, ValueError):
+                pass
+        candidates.append(identity.RC003Candidate(
+            name=name, hardware_match=False, handle=info, device_key=key))
 
     _logger.info(
         "paired BLE discovery: total=%d rc003_name_matches=%d "
@@ -392,22 +403,28 @@ async def _candidate_has_voice_service_with_hard_timeout(
 async def select_connectable_candidate(
     candidates: Sequence[identity.RC003Candidate],
     *,
+    selected_key: str | None = None,
     winrt: Optional[WinRTModules] = None,
     probe: Optional[
         Callable[[identity.RC003Candidate], Awaitable[bool]]
     ] = None,
     probe_timeout: float = _CANDIDATE_PROBE_TIMEOUT_SECONDS,
 ) -> identity.RC003Candidate:
-    """Resolve one RC003, probing ATVV only when names are ambiguous.
+    """Resolve the selected RC003 without probing other physical remotes.
 
-    A sole exact identity match follows the existing fast path. With two or
-    more matches, every candidate is checked sequentially and only a single
-    reachable ATVV device is accepted. Zero reachable candidates fail; two
-    reachable candidates remain ambiguous. The resolver never guesses by
-    enumeration order, localized name, or a persisted device identifier.
+    Production callers pass selected_key: missing or ambiguous matches fail
+    closed. The optional-key path remains for standalone discovery diagnostics;
+    it probes ATVV only for multiple profile matches and accepts exactly one
+    reachable candidate. Neither path guesses by enumeration order.
     """
 
     qualifying = identity.qualifying_candidates(candidates)
+    if selected_key is not None:
+        from . import remote_selection
+        if not remote_selection.valid_key(selected_key):
+            raise identity.NoCandidateFoundError("no selected remote")
+        qualifying = [candidate for candidate in qualifying if candidate.device_key == selected_key]
+        return identity.select_single_candidate(qualifying)
     if len(qualifying) <= 1:
         return identity.select_single_candidate(qualifying)
 

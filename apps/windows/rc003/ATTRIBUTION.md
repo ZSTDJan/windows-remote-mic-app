@@ -23,14 +23,24 @@ PyInstaller/Inno Setup 构建流程。本仓库在 GPL-3.0-only 条件下保留�
 - 适配本仓库现有的 `LICENSE.md`、`COPYRIGHT.md` 和第三方声明文件；
 - 补充中文安装、配对、VB-CABLE 配置、按键映射和故障排查说明；
 - 保留上游的失败关闭策略、隐私约束、跨平台协议测试和 Windows CI 校验；
-- 明确声明当前候选版本已完成真实 RC003 硬件配对、逐键和语音链路验收；验收不能
-  被自动构建或 CI 替代。
+- 持续维护单进程桌面、按键映射、元素导航、输入法适配及链路诊断；具体演进见
+  `CHANGELOG.md`，已通过范围与待测项见 `TESTING.md`，不以历史验收替代当前版本验证。
 
-源码中仍保留 `ovb_rc003` 这一内部 Python 包名，以减少从上游同步修复时的差异；
+源码中仍保留 `ovb_rc003` 这一内部 Python 包名，以兼容现有导入、启动和构建入口；
 它不是用户看到的应用名称。上游源码及其 GPL 许可适用于本目录中的派生代码，
 本仓库根目录的 [`LICENSE.md`](../../../LICENSE.md) 是随源码发布的完整许可证。
 
 ## 其他参考来源
+
+- `scripts/voice_hotkey_probe.py` 的手动扫描码对照参考
+  [上游 v0.2.5 的 send_input_windows.rs](https://github.com/GetSayAll/remote-mic-app-windows/blob/v0.2.5/crates/sayall-windows/src/send_input_windows.rs)
+  中的修饰键编码和 80 毫秒边沿间隔。该脚本仅用于显式诊断，不作为运行后端或打包内容。
+
+- [`GetSayAll/remote-mic-app-windows`](https://github.com/GetSayAll/remote-mic-app-windows)
+  v0.2.2，标签提交 `1335b82b0028690340c7a604af058bf0e40958a0`：参考其已验证的
+  WeType 固定 `Ctrl+Win` 配方，包括独立 STA 会话级输入法激活、冷切换等待 50 毫秒和
+  `SendInput` 逐边沿 80 毫秒间隔。当前 Python 实现沿用本仓库既有输入回滚、物理键预检、
+  HID tap/F5 拦截和清理重试合同，没有引入其程序二进制或配置系统。
 
 RC003 的 ATVV UUID、控制命令、IMA/DVI ADPCM 解码和 HID 映射事实见仓库根目录的
 [`THIRD_PARTY_NOTICES.md`](../../../THIRD_PARTY_NOTICES.md)；本分支不依赖另一个平台

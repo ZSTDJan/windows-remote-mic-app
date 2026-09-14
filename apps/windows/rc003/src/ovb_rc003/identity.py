@@ -1,13 +1,11 @@
 """RC003 device discovery matching with a strict fail-closed policy.
 
-This module intentionally does NOT persist, accept, or require a manual
-Bluetooth address. It only decides, given whatever candidates the platform
-transport discovered this run, whether there is exactly one RC003 to connect
-to. Any ambiguity closes (refuses to guess) rather than picking a "best"
-candidate or falling back to a previously remembered address - a deliberate
-hardening versus the upstream reference implementation, which instead
-persisted the resolved MAC address to disk and silently reused it (see
-XRBM-014 for the citation and rationale).
+This module never persists or accepts a manual Bluetooth address. It filters
+platform candidates by supported profile and rejects ambiguity. Production
+callers additionally restrict candidates to the user's explicit selection;
+remote_selection owns that selection's ContainerId digest and persistence.
+No caller may silently fall back to another physical remote or a remembered
+MAC address (see XRBM-014 for the original privacy boundary).
 
 Pure Python, no platform dependency: candidates are opaque to this module
 beyond the name/hardware-match facts needed to decide.
@@ -51,6 +49,7 @@ class RC003Candidate:
     name: str
     hardware_match: bool
     handle: Any = None
+    device_key: str = ""
 
 
 def normalize_name(name: str) -> str:

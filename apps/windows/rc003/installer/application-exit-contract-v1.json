@@ -1,0 +1,5 @@
+{
+  "action": "exit_application",
+  "request_file": "application-exit-request.json",
+  "schema": 1
+}

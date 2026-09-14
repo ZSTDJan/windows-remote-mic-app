@@ -22,12 +22,11 @@ an observable ``OSError``, never swallowed - the sole exception is
 platform-availability signal re-raised as-is with no rollback attempted,
 since nothing could have landed.
 
-WeType compatibility is deliberately narrower than the ordinary mapping
-path: separate virtual-key ``SendInput`` batches for key-down and key-up,
-an 80 ms hold between them,
-``wScan=0``, no ``KEYEVENTF_SCANCODE``, and ``dwExtraInfo=0``. Other providers
-retain the marked ``keybd_event`` voice path required by the existing Doubao
-compatibility layer.
+The exact ordinary mapping ``Win+L`` is the one exception: Windows exposes a
+dedicated ``LockWorkStation`` operation, and successful input submission does
+not prove that the shell actually locked the session. Production dispatch
+therefore calls that operation directly instead of pretending the key batch
+itself is an outcome check.
 
 Testability: every public function accepts an optional ``_sender`` keyword
 (a callable matching ``RawSender``) used only by tests. Production callers
@@ -46,13 +45,44 @@ import time
 from ctypes import wintypes
 from typing import Callable, List, Optional, Sequence, Tuple
 
-from . import win32_keys
-from .legacy_key_suppressor_windows import VOICE_EVENT_EXTRA_INFO
+from . import diagnostic_trace, raw_input_windows, voice_key_physicalizer_windows, win32_keys
+
+VOICE_EVENT_EXTRA_INFO = voice_key_physicalizer_windows.VOICE_EVENT_EXTRA_INFO
+_VOICE_EVENT_CONFIRM_TIMEOUT_SECONDS = 1.0
+_WETYPE_VOICE_EDGE_GAP_SECONDS = 0.08
+
+_diagnostic_trace: Optional[diagnostic_trace.DiagnosticTrace] = None
+
+
+def set_diagnostic_trace(trace: Optional[diagnostic_trace.DiagnosticTrace]) -> None:
+    """Attach the optional trace sink without changing input semantics."""
+
+    global _diagnostic_trace
+    _diagnostic_trace = trace
 
 _INPUT_KEYBOARD = 1
+_INPUT_MOUSE = 0
 _KEYEVENTF_KEYUP = 0x0002
+_KEYEVENTF_UNICODE = 0x0004
 _KEYEVENTF_EXTENDEDKEY = 0x0001
 _KEYEVENTF_SCANCODE = 0x0008
+_MOUSEEVENTF_LEFTDOWN = 0x0002
+_MOUSEEVENTF_LEFTUP = 0x0004
+_MOUSEEVENTF_RIGHTDOWN = 0x0008
+_MOUSEEVENTF_RIGHTUP = 0x0010
+_MOUSEEVENTF_MIDDLEDOWN = 0x0020
+_MOUSEEVENTF_MIDDLEUP = 0x0040
+_MOUSEEVENTF_XDOWN = 0x0080
+_MOUSEEVENTF_XUP = 0x0100
+_MOUSEEVENTF_WHEEL = 0x0800
+_XBUTTON1 = 0x0001
+_XBUTTON2 = 0x0002
+_WHEEL_DELTA = 120
+_VK_LBUTTON = 0x01
+_VK_RBUTTON = 0x02
+_VK_MBUTTON = 0x04
+_VK_XBUTTON1 = 0x05
+_VK_XBUTTON2 = 0x06
 
 # Real x64 Win32 ``INPUT`` struct shape (fixed after XRBM-014 review round 2
 # P1 #1: the union previously declared only ``KEYBDINPUT``, so
@@ -122,7 +152,20 @@ class INPUT(ctypes.Structure):
 _EXTENDED_KEYS = frozenset(
     {
         win32_keys.VK_CODES[name]
-        for name in ("up", "down", "left", "right", "rctrl", "ralt", "rwin")
+        for name in (
+            "up",
+            "down",
+            "left",
+            "right",
+            "rctrl",
+            "ralt",
+            "win",
+            "lwin",
+            "rwin",
+            "volume_mute",
+            "volume_down",
+            "volume_up",
+        )
     }
 )
 
@@ -131,6 +174,10 @@ _EXTENDED_KEYS = frozenset(
 # left/right identity for directional modifiers. The boolean records whether
 # the scan code carries the E0 extended prefix.
 _PHYSICAL_SCAN_CODES = {
+    win32_keys.VK_CODES["up"]: (0x48, True),
+    win32_keys.VK_CODES["down"]: (0x50, True),
+    win32_keys.VK_CODES["left"]: (0x4B, True),
+    win32_keys.VK_CODES["right"]: (0x4D, True),
     win32_keys.VK_CODES["ctrl"]: (0x1D, False),
     win32_keys.VK_CODES["lctrl"]: (0x1D, False),
     win32_keys.VK_CODES["rctrl"]: (0x1D, True),
@@ -145,7 +192,28 @@ _PHYSICAL_SCAN_CODES = {
 }
 
 RawSender = Callable[[Sequence[Tuple[int, bool]]], int]
+MouseEvent = Tuple[int, int]
+MouseSender = Callable[[Sequence[MouseEvent]], int]
+MouseButtonDownQuery = Callable[[str], bool]
+PhysicalKeyDownQuery = Callable[[int], bool]
 VoiceSender = Callable[[int, bool], None]
+WorkstationLockSender = Callable[[], bool]
+
+_MOUSE_BUTTON_EVENTS = {
+    "left": (_MOUSEEVENTF_LEFTDOWN, _MOUSEEVENTF_LEFTUP, 0),
+    "right": (_MOUSEEVENTF_RIGHTDOWN, _MOUSEEVENTF_RIGHTUP, 0),
+    "middle": (_MOUSEEVENTF_MIDDLEDOWN, _MOUSEEVENTF_MIDDLEUP, 0),
+    "x1": (_MOUSEEVENTF_XDOWN, _MOUSEEVENTF_XUP, _XBUTTON1),
+    "x2": (_MOUSEEVENTF_XDOWN, _MOUSEEVENTF_XUP, _XBUTTON2),
+}
+
+_MOUSE_BUTTON_VK_CODES = {
+    "left": _VK_LBUTTON,
+    "right": _VK_RBUTTON,
+    "middle": _VK_MBUTTON,
+    "x1": _VK_XBUTTON1,
+    "x2": _VK_XBUTTON2,
+}
 
 _voice_backend: Optional[str] = None
 
@@ -162,13 +230,21 @@ def _require_live_input_allowed() -> None:
 
 
 class InputCleanupIncompleteError(OSError):
-    """Raised when delivery failed and a compensating key-up could not be
+    """Raised when delivery failed and a compensating input-up could not be
     confirmed.
 
     Callers must retain enough state to retry a release later. Treating this
     as an ordinary delivery failure can strand Alt/Ctrl/Win logically down
     while the application forgets that it still owes cleanup.
     """
+
+
+class MouseButtonInUseError(OSError):
+    """Raised when a real mouse already owns the requested button."""
+
+
+class PhysicalKeyInUseError(OSError):
+    """Raised before injection when a real keyboard key already owns a VK."""
 
 
 def _require_windows() -> None:
@@ -210,7 +286,7 @@ def _build_input_array(events: Sequence[Tuple[int, bool]]):
 
 
 def _build_virtual_key_input_array(events: Sequence[Tuple[int, bool]]):
-    """Build unmarked virtual-key events for WeType's global shortcut."""
+    """Build wVk-based keyboard events for a configured WeType shortcut."""
 
     array = (INPUT * len(events))()
     for index, (vk, key_up) in enumerate(events):
@@ -228,8 +304,23 @@ def _build_virtual_key_input_array(events: Sequence[Tuple[int, bool]]):
     return array, INPUT
 
 
+def _build_mouse_input_array(events: Sequence[MouseEvent]):
+    array = (INPUT * len(events))()
+    for index, (flags, mouse_data) in enumerate(events):
+        mouse_input = MOUSEINPUT(
+            dx=0,
+            dy=0,
+            mouseData=ctypes.c_uint32(mouse_data).value,
+            dwFlags=flags,
+            time=0,
+            dwExtraInfo=0,
+        )
+        array[index] = INPUT(type=_INPUT_MOUSE, union=_INPUT_UNION(mi=mouse_input))
+    return array, INPUT
+
+
 def _real_send_input_batch_with_builder(events, builder) -> int:
-    """Submit one keyboard batch using the requested INPUT-array builder."""
+    """Submit one input batch using the requested INPUT-array builder."""
 
     _require_live_input_allowed()
     _require_windows()
@@ -237,6 +328,34 @@ def _real_send_input_batch_with_builder(events, builder) -> int:
         return 0
 
     array, input_type = builder(events)
+    trace_events = []
+    for item in array:
+        if int(item.type) == _INPUT_KEYBOARD:
+            keyboard = item.union.ki
+            trace_events.append(
+                {
+                    "type": "keyboard",
+                    "vk": int(keyboard.wVk),
+                    "scan_code": int(keyboard.wScan),
+                    "flags": int(keyboard.dwFlags),
+                    "key_up": bool(int(keyboard.dwFlags) & _KEYEVENTF_KEYUP),
+                    "extended": bool(
+                        int(keyboard.dwFlags) & _KEYEVENTF_EXTENDEDKEY
+                    ),
+                    "unicode": bool(int(keyboard.dwFlags) & _KEYEVENTF_UNICODE),
+                    "extra_info": int(keyboard.dwExtraInfo),
+                }
+            )
+        else:
+            mouse = item.union.mi
+            trace_events.append(
+                {
+                    "type": "mouse",
+                    "flags": int(mouse.dwFlags),
+                    "mouse_data": int(mouse.mouseData),
+                    "extra_info": int(mouse.dwExtraInfo),
+                }
+            )
     user32 = ctypes.windll.user32  # type: ignore[attr-defined]
     # Declared explicitly (XRBM-014 review round 2 P1 #8) rather than left at
     # ctypes defaults: without an explicit restype, ctypes assumes a 32-bit
@@ -253,7 +372,25 @@ def _real_send_input_batch_with_builder(events, builder) -> int:
     # of view: ``LP_INPUT_Array_N``, not ``LP_INPUT``) and raises
     # ``ArgumentError`` before the call ever reaches Windows. ``byref()`` is
     # only correct for a pointer to a single instance, never to an array.
+    started_ms = time.monotonic_ns() // 1_000_000
+    ctypes.set_last_error(0)
     sent = user32.SendInput(len(events), array, ctypes.sizeof(input_type))
+    last_error = int(ctypes.get_last_error())
+    finished_ms = time.monotonic_ns() // 1_000_000
+    trace = _diagnostic_trace
+    if trace is not None:
+        try:
+            trace.record_send_input(
+                backend="SendInput",
+                requested=len(events),
+                returned=int(sent),
+                last_error=last_error,
+                events=trace_events,
+                started_monotonic_ms=started_ms,
+                finished_monotonic_ms=finished_ms,
+            )
+        except BaseException:
+            pass
     return int(sent)
 
 
@@ -263,13 +400,175 @@ def _real_send_input_batch(events: Sequence[Tuple[int, bool]]) -> int:
     return _real_send_input_batch_with_builder(events, _build_input_array)
 
 
-def _real_send_virtual_key_input_batch(events: Sequence[Tuple[int, bool]]) -> int:
-    """Submit unmarked, virtual-key-only events in one real SendInput call."""
+def _real_send_virtual_key_input_batch(
+    events: Sequence[Tuple[int, bool]],
+) -> int:
+    """Submit one wVk-based keyboard batch through the real SendInput API."""
 
     return _real_send_input_batch_with_builder(events, _build_virtual_key_input_array)
 
 
-def _best_effort_release(vk_codes: Sequence[int], sender: RawSender) -> bool:
+def _is_workstation_lock_combo(tokens: Sequence[str]) -> bool:
+    normalized = tuple(str(token).strip().lower() for token in tokens)
+    return (
+        len(normalized) == 2
+        and normalized[0] in {"win", "lwin", "rwin", "left_win", "right_win"}
+        and normalized[1] == "l"
+    )
+
+
+def _real_lock_workstation() -> bool:
+    _require_live_input_allowed()
+    _require_windows()
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    user32.LockWorkStation.argtypes = ()
+    user32.LockWorkStation.restype = wintypes.BOOL
+    return bool(user32.LockWorkStation())
+
+
+def lock_workstation(
+    *, _sender: Optional[WorkstationLockSender] = None
+) -> None:
+    """Lock the current Windows session through its dedicated system API."""
+
+    sender = _sender or _real_lock_workstation
+    try:
+        delivered = bool(sender())
+    except Win32InputUnavailableError:
+        raise
+    except Exception as exc:
+        raise OSError(f"LockWorkStation failed: {exc}") from exc
+    if not delivered:
+        error_code = ctypes.get_last_error() if _sender is None else 0
+        suffix = f" (Win32 error {error_code})" if error_code else ""
+        raise OSError(f"LockWorkStation did not lock the session{suffix}")
+
+
+def _real_send_mouse_input_batch(events: Sequence[MouseEvent]) -> int:
+    """Submit ordinary mouse events in one real SendInput call."""
+
+    return _real_send_input_batch_with_builder(events, _build_mouse_input_array)
+
+
+def _mouse_button_event(button: str, *, key_up: bool) -> MouseEvent:
+    try:
+        down_flag, up_flag, mouse_data = _MOUSE_BUTTON_EVENTS[button]
+    except KeyError as exc:
+        raise ValueError(f"unsupported mouse button: {button}") from exc
+    return (up_flag if key_up else down_flag, mouse_data)
+
+
+def _real_mouse_button_is_down(button: str) -> bool:
+    try:
+        vk_code = _MOUSE_BUTTON_VK_CODES[button]
+    except KeyError as exc:
+        raise ValueError(f"unsupported mouse button: {button}") from exc
+    _require_windows()
+    _require_live_input_allowed()
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    user32.GetAsyncKeyState.argtypes = (ctypes.c_int,)
+    user32.GetAsyncKeyState.restype = ctypes.c_short
+    return bool(user32.GetAsyncKeyState(vk_code) & 0x8000)
+
+
+def _best_effort_mouse_release(button: str, sender: MouseSender) -> bool:
+    try:
+        sent = sender([_mouse_button_event(button, key_up=True)])
+    except Exception:
+        return False
+    return sent == 1
+
+
+def send_mouse_button_click(
+    button: str,
+    *,
+    _sender: Optional[MouseSender] = None,
+    _button_down_query: Optional[MouseButtonDownQuery] = None,
+) -> None:
+    """Click one physical mouse button at the current pointer position.
+
+    Down and up are submitted together. If submission is partial or raises
+    after it may have reached Windows, a separate up is attempted immediately.
+    An incomplete compensating release is surfaced distinctly so the caller
+    can retain ownership and retry before another action.
+    """
+
+    sender = _sender or _real_send_mouse_input_batch
+    events = [
+        _mouse_button_event(button, key_up=False),
+        _mouse_button_event(button, key_up=True),
+    ]
+    button_down_query = _button_down_query
+    if button_down_query is None and _sender is None:
+        button_down_query = _real_mouse_button_is_down
+    if button_down_query is not None and button_down_query(button):
+        raise MouseButtonInUseError(
+            f"mouse {button} is already held by physical input"
+        )
+    try:
+        sent = sender(events)
+    except Win32InputUnavailableError:
+        raise
+    except Exception as exc:
+        cleanup_complete = _best_effort_mouse_release(button, sender)
+        error_type = _delivery_error_type(cleanup_complete)
+        raise error_type(f"mouse {button} click delivery failed: {exc}") from exc
+    if sent < len(events):
+        cleanup_complete = sent == 0 or _best_effort_mouse_release(button, sender)
+        error_type = _delivery_error_type(cleanup_complete)
+        raise error_type(
+            f"SendInput delivered only {sent}/{len(events)} events for mouse "
+            f"{button} click; safety release attempted"
+        )
+
+
+def send_mouse_button_up(
+    button: str, *, _sender: Optional[MouseSender] = None
+) -> None:
+    """Release one mouse button, retrying once if delivery is uncertain."""
+
+    sender = _sender or _real_send_mouse_input_batch
+    event = _mouse_button_event(button, key_up=True)
+    try:
+        sent = sender([event])
+    except Win32InputUnavailableError:
+        raise
+    except Exception as exc:
+        cleanup_complete = _best_effort_mouse_release(button, sender)
+        error_type = _delivery_error_type(cleanup_complete)
+        raise error_type(f"mouse {button} up delivery failed: {exc}") from exc
+    if sent < 1:
+        cleanup_complete = _best_effort_mouse_release(button, sender)
+        error_type = _delivery_error_type(cleanup_complete)
+        raise error_type(
+            f"SendInput did not deliver mouse {button} up; retry attempted"
+        )
+
+
+def send_mouse_wheel(
+    clicks: int, *, _sender: Optional[MouseSender] = None
+) -> None:
+    """Scroll vertically by an integral number of Windows wheel clicks."""
+
+    if not isinstance(clicks, int) or isinstance(clicks, bool) or clicks == 0:
+        raise ValueError("mouse wheel clicks must be a non-zero integer")
+    sender = _sender or _real_send_mouse_input_batch
+    events = [(_MOUSEEVENTF_WHEEL, clicks * _WHEEL_DELTA)]
+    try:
+        sent = sender(events)
+    except Win32InputUnavailableError:
+        raise
+    except Exception as exc:
+        raise OSError(f"mouse wheel delivery failed: {exc}") from exc
+    if sent < 1:
+        raise OSError("SendInput did not deliver the mouse wheel event")
+
+
+def _best_effort_release(
+    vk_codes: Sequence[int],
+    sender: RawSender,
+    key_down_query: Optional[PhysicalKeyDownQuery] = None,
+) -> bool:
     """Attempt every requested key-up and report whether all were confirmed.
 
     The caller still owns the observable delivery exception. This helper
@@ -279,6 +578,13 @@ def _best_effort_release(vk_codes: Sequence[int], sender: RawSender) -> bool:
 
     complete = True
     for vk in vk_codes:
+        if key_down_query is not None:
+            try:
+                if key_down_query(vk):
+                    continue
+            except Exception:
+                complete = False
+                continue
         try:
             sent = sender([(vk, True)])
         except Exception:
@@ -293,8 +599,104 @@ def _delivery_error_type(cleanup_complete: bool):
     return OSError if cleanup_complete else InputCleanupIncompleteError
 
 
+def _ensure_keys_not_physically_down(
+    vk_codes: Sequence[int],
+    query: PhysicalKeyDownQuery,
+) -> None:
+    try:
+        held = [vk for vk in dict.fromkeys(vk_codes) if query(vk)]
+    except Exception as exc:
+        raise Win32InputUnavailableError(
+            "physical keyboard state is unavailable"
+        ) from exc
+    if held:
+        trace = _diagnostic_trace
+        if trace is not None and trace.enabled:
+            try:
+                trace.emit(
+                    "input_preflight_rejected",
+                    held_vks=held,
+                    state_after_rejection=[
+                        {
+                            "vk": vk,
+                            "raw_down": raw_input_windows.physical_key_is_down(vk),
+                            "hook_down": voice_key_physicalizer_windows.physical_key_is_down(vk),
+                            "windows_down": raw_input_windows._real_async_key_is_down(vk),
+                            "ambiguous_owners": raw_input_windows.physical_key_has_ambiguous_owners(vk),
+                        }
+                        for vk in held
+                    ],
+                )
+            except Exception:
+                pass
+        formatted = ",".join(f"0x{vk:02x}" for vk in held)
+        raise PhysicalKeyInUseError(
+            f"physical keyboard input already holds requested key(s): {formatted}"
+        )
+
+
+def _physical_query_for_sender(
+    sender_was_injected: bool,
+    query: Optional[PhysicalKeyDownQuery],
+    *,
+    before_injection: bool = False,
+) -> Optional[PhysicalKeyDownQuery]:
+    if query is not None:
+        return query
+    if sender_was_injected:
+        return None
+    if before_injection:
+        return _physical_key_is_down_before_injection
+    return _physical_key_is_down
+
+
+def _physical_key_is_down(vk_code: int) -> bool:
+    return bool(
+        raw_input_windows.physical_key_is_down(vk_code)
+        or voice_key_physicalizer_windows.physical_key_is_down(vk_code)
+    )
+
+
+def _physical_key_is_down_before_injection(vk_code: int) -> bool:
+    if _physical_key_is_down(vk_code):
+        return True
+    return raw_input_windows.physical_key_is_down_before_injection(vk_code)
+
+
+def can_begin_tracked_hold(tokens: Sequence[str]) -> bool:
+    """Return whether every key can retain physical ownership after injection."""
+
+    vk_codes = win32_keys.resolve_vk_codes(tokens)
+    raw_tracking = raw_input_windows.physical_keyboard_tracking_available()
+    return all(
+        raw_tracking
+        or voice_key_physicalizer_windows.physical_key_tracking_available(vk)
+        for vk in vk_codes
+    )
+
+
+def _ensure_tracked_hold_available(vk_codes: Sequence[int]) -> None:
+    raw_tracking = raw_input_windows.physical_keyboard_tracking_available()
+    unavailable = [
+        vk
+        for vk in dict.fromkeys(vk_codes)
+        if not raw_tracking
+        and not voice_key_physicalizer_windows.physical_key_tracking_available(vk)
+    ]
+    if unavailable:
+        formatted = ",".join(f"0x{vk:02x}" for vk in unavailable)
+        raise Win32InputUnavailableError(
+            "physical keyboard tracking is unavailable for held key(s): "
+            f"{formatted}"
+        )
+
+
 def send_key_combo_down(
-    tokens: Sequence[str], *, _sender: Optional[RawSender] = None
+    tokens: Sequence[str],
+    *,
+    _sender: Optional[RawSender] = None,
+    _key_down_query: Optional[PhysicalKeyDownQuery] = None,
+    _release_key_down_query: Optional[PhysicalKeyDownQuery] = None,
 ) -> None:
     """Presses every key in ``tokens`` down, in one batched call.
 
@@ -313,20 +715,45 @@ def send_key_combo_down(
     as-is with no rollback attempted - nothing could have landed.
     """
 
-    sender = _sender or _real_send_input_batch
     vk_codes = win32_keys.resolve_vk_codes(tokens)
+    if (
+        _sender is None
+        and _key_down_query is None
+        and _release_key_down_query is None
+    ):
+        _ensure_tracked_hold_available(vk_codes)
+    preflight_query = _physical_query_for_sender(
+        _sender is not None,
+        _key_down_query,
+        before_injection=True,
+    )
+    release_query = _physical_query_for_sender(
+        _sender is not None,
+        (
+            _release_key_down_query
+            if _release_key_down_query is not None
+            else _key_down_query
+        ),
+    )
+    if preflight_query is not None:
+        _ensure_keys_not_physically_down(vk_codes, preflight_query)
+    sender = _sender or _real_send_input_batch
     events: List[Tuple[int, bool]] = [(vk, False) for vk in vk_codes]
     try:
         sent = sender(events)
     except Win32InputUnavailableError:
         raise
     except Exception as exc:
-        cleanup_complete = _best_effort_release(list(reversed(vk_codes)), sender)
+        cleanup_complete = _best_effort_release(
+            list(reversed(vk_codes)), sender, release_query
+        )
         error_type = _delivery_error_type(cleanup_complete)
         raise error_type(f"key-down delivery failed: {exc}") from exc
     if sent < len(events):
         stuck_down = [vk for vk, _key_up in events[:sent]]
-        cleanup_complete = _best_effort_release(list(reversed(stuck_down)), sender)
+        cleanup_complete = _best_effort_release(
+            list(reversed(stuck_down)), sender, release_query
+        )
         error_type = _delivery_error_type(cleanup_complete)
         raise error_type(
             f"SendInput delivered only {sent}/{len(events)} key-down events; rolled back"
@@ -334,7 +761,10 @@ def send_key_combo_down(
 
 
 def send_key_combo_up(
-    tokens: Sequence[str], *, _sender: Optional[RawSender] = None
+    tokens: Sequence[str],
+    *,
+    _sender: Optional[RawSender] = None,
+    _key_down_query: Optional[PhysicalKeyDownQuery] = None,
 ) -> None:
     """Releases every key in ``tokens`` (reverse order), in one batched call.
 
@@ -362,27 +792,58 @@ def send_key_combo_up(
 
     sender = _sender or _real_send_input_batch
     vk_codes = list(reversed(win32_keys.resolve_vk_codes(tokens)))
+    key_down_query = _physical_query_for_sender(
+        _sender is not None,
+        _key_down_query,
+    )
+    physical_query_complete = True
+    if key_down_query is not None:
+        releasable = []
+        for vk in vk_codes:
+            try:
+                held_physically = bool(key_down_query(vk))
+            except Exception:
+                physical_query_complete = False
+                continue
+            if not held_physically:
+                releasable.append(vk)
+        vk_codes = releasable
+    if not vk_codes:
+        if not physical_query_complete:
+            raise InputCleanupIncompleteError(
+                "physical keyboard state could not be confirmed for key-up"
+            )
+        return
     events: List[Tuple[int, bool]] = [(vk, True) for vk in vk_codes]
     try:
         sent = sender(events)
     except Win32InputUnavailableError:
         raise
     except Exception as exc:
-        cleanup_complete = _best_effort_release(vk_codes, sender)
+        cleanup_complete = _best_effort_release(vk_codes, sender, key_down_query)
         error_type = _delivery_error_type(cleanup_complete)
         raise error_type(f"key-up delivery failed: {exc}") from exc
     if sent < len(events):
         remaining = [vk for vk, _key_up in events[sent:]]
-        cleanup_complete = _best_effort_release(remaining, sender)
+        cleanup_complete = _best_effort_release(remaining, sender, key_down_query)
         error_type = _delivery_error_type(cleanup_complete)
         raise error_type(
             f"SendInput delivered only {sent}/{len(events)} key-up events; "
             "best-effort release attempted for the rest"
         )
+    if not physical_query_complete:
+        raise InputCleanupIncompleteError(
+            "some key-ups were deferred because physical keyboard state "
+            "could not be confirmed"
+        )
 
 
 def send_key_combo_tap(
-    tokens: Sequence[str], *, _sender: Optional[RawSender] = None
+    tokens: Sequence[str],
+    *,
+    _sender: Optional[RawSender] = None,
+    _key_down_query: Optional[PhysicalKeyDownQuery] = None,
+    _lock_sender: Optional[WorkstationLockSender] = None,
 ) -> None:
     """Presses and releases every key in ``tokens`` as ONE batched SendInput
     call (all key-downs in order, then all key-ups in reverse order).
@@ -401,8 +862,28 @@ def send_key_combo_tap(
     as the other two helpers - it is a pre-submission signal.
     """
 
-    sender = _sender or _real_send_input_batch
+    # Win+L is a Windows shell/security action rather than an ordinary
+    # application shortcut. SendInput reports only submitted events, not a
+    # confirmed lock outcome; the user's failing path reached the foreground
+    # app as L without locking. Use the system operation for production;
+    # injected senders keep the ordinary batch path for rollback tests.
+    if _sender is None and _is_workstation_lock_combo(tokens):
+        lock_workstation(_sender=_lock_sender)
+        return
+
     vk_codes = win32_keys.resolve_vk_codes(tokens)
+    preflight_query = _physical_query_for_sender(
+        _sender is not None,
+        _key_down_query,
+        before_injection=True,
+    )
+    release_query = _physical_query_for_sender(
+        _sender is not None,
+        _key_down_query,
+    )
+    if preflight_query is not None:
+        _ensure_keys_not_physically_down(vk_codes, preflight_query)
+    sender = _sender or _real_send_input_batch
     down_events: List[Tuple[int, bool]] = [(vk, False) for vk in vk_codes]
     up_events: List[Tuple[int, bool]] = [(vk, True) for vk in reversed(vk_codes)]
     events = down_events + up_events
@@ -411,7 +892,9 @@ def send_key_combo_tap(
     except Win32InputUnavailableError:
         raise
     except Exception as exc:
-        cleanup_complete = _best_effort_release(list(reversed(vk_codes)), sender)
+        cleanup_complete = _best_effort_release(
+            list(reversed(vk_codes)), sender, release_query
+        )
         error_type = _delivery_error_type(cleanup_complete)
         raise error_type(f"key tap delivery failed: {exc}") from exc
     if sent < len(events):
@@ -419,20 +902,27 @@ def send_key_combo_tap(
             # Not every key-down made it; release exactly the ones that did.
             stuck_down = [vk for vk, _key_up in down_events[:sent]]
             cleanup_complete = _best_effort_release(
-                list(reversed(stuck_down)), sender
+                list(reversed(stuck_down)), sender, release_query
             )
         else:
             # All key-downs landed; finish releasing whatever key-ups didn't.
             remaining_index = sent - len(down_events)
             remaining_ups = [vk for vk, _key_up in up_events[remaining_index:]]
-            cleanup_complete = _best_effort_release(remaining_ups, sender)
+            cleanup_complete = _best_effort_release(
+                remaining_ups, sender, release_query
+            )
         error_type = _delivery_error_type(cleanup_complete)
         raise error_type(
             f"SendInput delivered only {sent}/{len(events)} events for a key tap; rolled back"
         )
 
 
-def _real_keybd_event(vk: int, key_up: bool) -> None:
+def _real_keybd_event(
+    vk: int,
+    key_up: bool,
+    *,
+    _extra_info: int = VOICE_EVENT_EXTRA_INFO,
+) -> None:
     """Emit one voice shortcut edge through the legacy Win32 keyboard API.
 
     Doubao registers its global voice shortcut as a virtual-key shortcut.  The
@@ -458,7 +948,25 @@ def _real_keybd_event(vk: int, key_up: bool) -> None:
     flags = _KEYEVENTF_EXTENDEDKEY if vk in _EXTENDED_KEYS else 0
     if key_up:
         flags |= _KEYEVENTF_KEYUP
-    user32.keybd_event(vk, scan_code, flags, VOICE_EVENT_EXTRA_INFO)
+    def record(phase: str, error: str = "") -> None:
+        trace = _diagnostic_trace
+        if trace is None or not trace.enabled:
+            return
+        try:
+            trace.emit("voice_native_edge", **trace.current_context(),
+                       phase=phase, vk=int(vk), scan_code=scan_code, flags=flags,
+                       edge="up" if key_up else "down", marker=int(_extra_info),
+                       backend="keybd_event", error_type=error,
+                       target_response="unknown", context_source="attempt_and_timeline")
+        except Exception:
+            pass
+    record("requested")
+    try:
+        user32.keybd_event(vk, scan_code, flags, int(_extra_info))
+    except BaseException as exc:
+        record("native_call_failed", type(exc).__name__)
+        raise
+    record("native_call_returned")  # This void API does not acknowledge target handling.
 
 
 def voice_backend_name() -> str:
@@ -478,12 +986,67 @@ def _real_voice_event(vk: int, key_up: bool) -> None:
     global _voice_backend
     if _voice_backend is None:
         _voice_backend = "keybd_event_physicalized"
-    _real_keybd_event(vk, key_up)
+    if int(vk) != win32_keys.VK_CODES["ralt"]:
+        _real_keybd_event(vk, key_up)
+        return
+    trace = _diagnostic_trace
+    started = time.monotonic()
+    context = diagnostic_trace.foreground_context() if trace is not None and trace.enabled else {}
+    def record(success: bool, reason: str, marker: int = 0) -> None:
+        if trace is None or not trace.enabled:
+            return
+        try:
+            trace.emit("voice_edge_confirmation", **trace.current_context(),
+                       edge="up" if key_up else "down", backend=_voice_backend,
+                       vk=int(vk), marker=marker, success=success, reason=reason,
+                       elapsed_ms=round((time.monotonic() - started) * 1000, 2),
+                       timeout_ms=int(_VOICE_EVENT_CONFIRM_TIMEOUT_SECONDS * 1000), **context)
+        except Exception:
+            pass  # A diagnostic sink cannot change input ownership or cleanup.
+    try:
+        confirmation = voice_key_physicalizer_windows.begin_marked_voice_event(
+            key_up
+        )
+    except voice_key_physicalizer_windows.VoiceKeyPhysicalizerUnavailableError as exc:
+        record(False, "physicalizer_unavailable")
+        raise Win32InputUnavailableError(
+            "marked right-Alt physicalizer is unavailable"
+        ) from exc
+    try:
+        _real_keybd_event(
+            vk,
+            key_up,
+            _extra_info=confirmation.marker,
+        )
+    except BaseException:
+        voice_key_physicalizer_windows.cancel_marked_voice_event(confirmation)
+        record(False, "native_send_raised", confirmation.marker)
+        raise
+    if not voice_key_physicalizer_windows.wait_for_marked_voice_event(
+        confirmation,
+        _VOICE_EVENT_CONFIRM_TIMEOUT_SECONDS,
+    ):
+        record(False, "local_hook_confirmation_timeout", confirmation.marker)
+        raise InputCleanupIncompleteError(
+            "marked right-Alt edge was not confirmed by the physicalizer hook"
+        )
+    record(True, "local_hook_confirmed", confirmation.marker)
 
 
-def _best_effort_voice_up(vk_codes: Sequence[int], sender: VoiceSender) -> bool:
+def _best_effort_voice_up(
+    vk_codes: Sequence[int],
+    sender: VoiceSender,
+    key_down_query: Optional[PhysicalKeyDownQuery] = None,
+) -> bool:
     complete = True
     for vk in reversed(vk_codes):
+        if key_down_query is not None:
+            try:
+                if key_down_query(vk):
+                    continue
+            except Exception:
+                complete = False
+                continue
         try:
             sender(vk, True)
         except Exception:
@@ -491,127 +1054,326 @@ def _best_effort_voice_up(vk_codes: Sequence[int], sender: VoiceSender) -> bool:
     return complete
 
 
+def send_wetype_voice_key_combo_down(
+    tokens: Sequence[str],
+    *,
+    _sender: Optional[RawSender] = None,
+    _key_down_query: Optional[PhysicalKeyDownQuery] = None,
+    _sleep: Callable[[float], None] = time.sleep,
+) -> None:
+    """Press WeType's held shortcut one wVk edge at a time, 80 ms apart."""
+
+    vk_codes = win32_keys.resolve_vk_codes(tokens)
+    if _sender is None and _key_down_query is None:
+        _ensure_tracked_hold_available(vk_codes)
+    preflight_query = _physical_query_for_sender(
+        _sender is not None,
+        _key_down_query,
+        before_injection=True,
+    )
+    release_query = _physical_query_for_sender(
+        _sender is not None,
+        _key_down_query,
+    )
+    if preflight_query is not None:
+        _ensure_keys_not_physically_down(vk_codes, preflight_query)
+    sender = _sender or _real_send_virtual_key_input_batch
+    delivered: List[int] = []
+    for index, vk in enumerate(vk_codes):
+        if index:
+            try:
+                _sleep(_WETYPE_VOICE_EDGE_GAP_SECONDS)
+            except BaseException as exc:
+                if not _best_effort_release(
+                    list(reversed(delivered)), sender, release_query
+                ):
+                    raise InputCleanupIncompleteError(
+                        "WeType voice key-down delay was interrupted and cleanup failed"
+                    ) from exc
+                raise
+        try:
+            sent = sender([(vk, False)])
+        except Win32InputUnavailableError as exc:
+            if delivered and not _best_effort_release(
+                list(reversed(delivered)), sender, release_query
+            ):
+                raise InputCleanupIncompleteError(
+                    "WeType voice backend became unavailable and delivered keys "
+                    "could not be released"
+                ) from exc
+            raise
+        except Exception as exc:
+            cleanup_complete = _best_effort_release(
+                list(reversed([*delivered, vk])), sender, release_query
+            )
+            error_type = _delivery_error_type(cleanup_complete)
+            raise error_type(
+                f"WeType voice key-down delivery failed: {exc}"
+            ) from exc
+        if sent != 1:
+            cleanup_complete = _best_effort_release(
+                list(reversed(delivered)), sender, release_query
+            )
+            error_type = _delivery_error_type(cleanup_complete)
+            raise error_type(
+                "SendInput did not deliver one WeType voice key-down edge; "
+                "rollback attempted"
+            )
+        delivered.append(vk)
+
+
+def send_wetype_voice_key_combo_up(
+    tokens: Sequence[str],
+    *,
+    _sender: Optional[RawSender] = None,
+    _key_down_query: Optional[PhysicalKeyDownQuery] = None,
+    _sleep: Callable[[float], None] = time.sleep,
+) -> None:
+    """Release WeType's held shortcut in reverse order, 80 ms apart."""
+
+    sender = _sender or _real_send_virtual_key_input_batch
+    resolved_vk_codes = win32_keys.resolve_vk_codes(tokens)
+    vk_codes = list(reversed(resolved_vk_codes))
+    key_down_query = _physical_query_for_sender(
+        _sender is not None,
+        _key_down_query,
+    )
+    physical_query_complete = True
+    for index, vk in enumerate(vk_codes):
+        if index:
+            try:
+                _sleep(_WETYPE_VOICE_EDGE_GAP_SECONDS)
+            except BaseException as exc:
+                if not _best_effort_release(vk_codes, sender, key_down_query):
+                    raise InputCleanupIncompleteError(
+                        "WeType voice key-up delay was interrupted and cleanup failed"
+                    ) from exc
+                raise
+        if key_down_query is not None:
+            try:
+                if key_down_query(vk):
+                    continue
+            except Exception:
+                physical_query_complete = False
+                continue
+        try:
+            sent = sender([(vk, True)])
+        except Win32InputUnavailableError as exc:
+            if not _best_effort_release(vk_codes, sender, key_down_query):
+                raise InputCleanupIncompleteError(
+                    "WeType voice backend became unavailable and key-up could "
+                    "not be confirmed"
+                ) from exc
+            raise
+        except Exception as exc:
+            cleanup_complete = _best_effort_release(
+                vk_codes, sender, key_down_query
+            )
+            error_type = _delivery_error_type(cleanup_complete)
+            raise error_type(
+                f"WeType voice key-up delivery failed: {exc}"
+            ) from exc
+        if sent != 1:
+            cleanup_complete = _best_effort_release(
+                vk_codes, sender, key_down_query
+            )
+            error_type = _delivery_error_type(cleanup_complete)
+            raise error_type(
+                "SendInput did not deliver one WeType voice key-up edge; "
+                "best-effort release attempted"
+            )
+    if not physical_query_complete:
+        raise InputCleanupIncompleteError(
+            "some WeType voice key-ups were deferred because physical keyboard "
+            "state could not be confirmed"
+        )
+
+
+def _voice_physical_query_for_sender(
+    sender_was_injected: bool,
+    query: Optional[PhysicalKeyDownQuery],
+    *,
+    before_injection: bool = False,
+) -> Optional[PhysicalKeyDownQuery]:
+    fallback = _physical_query_for_sender(
+        sender_was_injected, query, before_injection=before_injection
+    )
+    if fallback is None or query is not None:
+        return fallback
+
+    def voice_query(vk_code: int) -> bool:
+        # A consumed native RAlt UP can leave Raw Input permanently down.
+        # Its marked voice path already requires the low-level modifier hook;
+        # use that physical owner for both sending and owed-UP cleanup.
+        if vk_code == win32_keys.VK_CODES["ralt"]:
+            if raw_input_windows.physical_key_has_ambiguous_owners(vk_code):
+                return fallback(vk_code)
+            if before_injection:
+                return voice_key_physicalizer_windows.physical_key_is_down_before_injection(
+                    vk_code
+                )
+            return voice_key_physicalizer_windows.physical_key_is_down(vk_code)
+        return fallback(vk_code)
+
+    return voice_query
+
+
 def send_voice_key_combo_down(
-    tokens: Sequence[str], *, _sender: Optional[VoiceSender] = None
+    tokens: Sequence[str],
+    *,
+    _sender: Optional[VoiceSender] = None,
+    _key_down_query: Optional[PhysicalKeyDownQuery] = None,
 ) -> None:
     """Press a voice shortcut through the marked virtual-key path."""
 
-    sender = _sender or _real_voice_event
     vk_codes = win32_keys.resolve_vk_codes(tokens)
+    if _sender is None and _key_down_query is None:
+        _ensure_tracked_hold_available(vk_codes)
+    preflight_query = _voice_physical_query_for_sender(
+        _sender is not None,
+        _key_down_query,
+        before_injection=True,
+    )
+    release_query = _voice_physical_query_for_sender(
+        _sender is not None,
+        _key_down_query,
+    )
+    if preflight_query is not None:
+        _ensure_keys_not_physically_down(vk_codes, preflight_query)
+    sender = _sender or _real_voice_event
     delivered: List[int] = []
     for vk in vk_codes:
         try:
             sender(vk, False)
         except Win32InputUnavailableError as exc:
-            if delivered and not _best_effort_voice_up(delivered, sender):
+            if delivered and not _best_effort_voice_up(
+                delivered, sender, release_query
+            ):
                 raise InputCleanupIncompleteError(
                     "voice backend became unavailable and delivered keys could not be released"
                 ) from exc
             raise
+        except InputCleanupIncompleteError as exc:
+            _best_effort_voice_up(
+                [*delivered, vk], sender, release_query
+            )
+            raise InputCleanupIncompleteError(
+                "voice key-down delivery could not be confirmed"
+            ) from exc
         except Exception as exc:
             # A sender can raise after the native call returned control but
             # before the wrapper could prove whether this current edge
             # landed. Treat the current key as possibly down too.
-            cleanup_complete = _best_effort_voice_up([*delivered, vk], sender)
+            cleanup_complete = _best_effort_voice_up(
+                [*delivered, vk], sender, release_query
+            )
             error_type = _delivery_error_type(cleanup_complete)
             raise error_type(f"voice key-down delivery failed: {exc}") from exc
         delivered.append(vk)
 
 
 def send_voice_key_combo_up(
-    tokens: Sequence[str], *, _sender: Optional[VoiceSender] = None
+    tokens: Sequence[str],
+    *,
+    _sender: Optional[VoiceSender] = None,
+    _key_down_query: Optional[PhysicalKeyDownQuery] = None,
 ) -> None:
     """Release a voice shortcut through the selected voice transport."""
 
     sender = _sender or _real_voice_event
     resolved_vk_codes = win32_keys.resolve_vk_codes(tokens)
+    key_down_query = _voice_physical_query_for_sender(
+        _sender is not None,
+        _key_down_query,
+    )
     vk_codes = list(reversed(resolved_vk_codes))
+    physical_query_complete = True
     for vk in vk_codes:
+        if key_down_query is not None:
+            try:
+                if key_down_query(vk):
+                    continue
+            except Exception:
+                physical_query_complete = False
+                continue
         try:
             sender(vk, True)
         except Win32InputUnavailableError as exc:
-            if not _best_effort_voice_up(resolved_vk_codes, sender):
+            if not _best_effort_voice_up(
+                resolved_vk_codes, sender, key_down_query
+            ):
                 raise InputCleanupIncompleteError(
                     "voice backend became unavailable and key-up could not be confirmed"
                 ) from exc
             raise
+        except InputCleanupIncompleteError as exc:
+            _best_effort_voice_up(
+                resolved_vk_codes, sender, key_down_query
+            )
+            raise InputCleanupIncompleteError(
+                "voice key-up delivery could not be confirmed"
+            ) from exc
         except Exception as exc:
             # Releasing an already-up key is harmless. Retry every member so
             # a failure on one edge cannot strand later modifiers down.
-            cleanup_complete = _best_effort_voice_up(resolved_vk_codes, sender)
+            cleanup_complete = _best_effort_voice_up(
+                resolved_vk_codes, sender, key_down_query
+            )
             error_type = _delivery_error_type(cleanup_complete)
             raise error_type(f"voice key-up delivery failed: {exc}") from exc
+    if not physical_query_complete:
+        raise InputCleanupIncompleteError(
+            "some voice key-ups were deferred because physical keyboard "
+            "state could not be confirmed"
+        )
 
 
 def send_voice_key_combo_tap(
-    tokens: Sequence[str], *, _sender: Optional[VoiceSender] = None
+    tokens: Sequence[str],
+    *,
+    _sender: Optional[VoiceSender] = None,
+    _key_down_query: Optional[PhysicalKeyDownQuery] = None,
 ) -> None:
     """Send a completed voice shortcut with the upstream 70 ms hold window."""
 
     sender = _sender or _real_voice_event
     vk_codes = win32_keys.resolve_vk_codes(tokens)
-    send_voice_key_combo_down(tokens, _sender=sender)
+    if _sender is None and _key_down_query is None:
+        _ensure_tracked_hold_available(vk_codes)
+    preflight_query = _voice_physical_query_for_sender(
+        _sender is not None,
+        _key_down_query,
+        before_injection=True,
+    )
+    release_query = _voice_physical_query_for_sender(
+        _sender is not None,
+        _key_down_query,
+    )
+    if preflight_query is not None:
+        _ensure_keys_not_physically_down(vk_codes, preflight_query)
+    send_voice_key_combo_down(
+        tokens,
+        _sender=sender,
+        _key_down_query=lambda _vk: False,
+    )
     try:
         time.sleep(0.07)
-        send_voice_key_combo_up(tokens, _sender=sender)
+        send_voice_key_combo_up(
+            tokens,
+            _sender=sender,
+            _key_down_query=release_query,
+        )
     except BaseException as exc:
-        cleanup_complete = _best_effort_voice_up(vk_codes, sender)
+        cleanup_complete = _best_effort_voice_up(
+            vk_codes, sender, release_query
+        )
         if not cleanup_complete:
             raise InputCleanupIncompleteError(
                 "voice key tap failed and final key-up could not be confirmed"
             ) from exc
         if isinstance(exc, InputCleanupIncompleteError):
-            raise OSError(
-                "voice key tap failed but final safety key-up completed"
-            ) from exc
-        raise
-
-
-def send_wetype_voice_key_combo_down(
-    tokens: Sequence[str], *, _sender: Optional[RawSender] = None
-) -> None:
-    """Press WeType's shortcut through unmarked virtual-key SendInput."""
-
-    send_key_combo_down(
-        tokens,
-        _sender=_sender or _real_send_virtual_key_input_batch,
-    )
-
-
-def send_wetype_voice_key_combo_up(
-    tokens: Sequence[str], *, _sender: Optional[RawSender] = None
-) -> None:
-    """Release WeType's shortcut through the same virtual-key transport."""
-
-    send_key_combo_up(
-        tokens,
-        _sender=_sender or _real_send_virtual_key_input_batch,
-    )
-
-
-def send_wetype_voice_key_combo_tap(
-    tokens: Sequence[str],
-    *,
-    _sender: Optional[RawSender] = None,
-    _sleep: Callable[[float], None] = time.sleep,
-) -> None:
-    """Send one 80 ms WeType shortcut tap."""
-
-    sender = _sender or _real_send_virtual_key_input_batch
-    vk_codes = win32_keys.resolve_vk_codes(tokens)
-    send_wetype_voice_key_combo_down(tokens, _sender=sender)
-    try:
-        _sleep(0.08)
-        send_wetype_voice_key_combo_up(tokens, _sender=sender)
-    except BaseException as exc:
-        cleanup_complete = _best_effort_release(list(reversed(vk_codes)), sender)
-        if not cleanup_complete:
             raise InputCleanupIncompleteError(
-                "WeType key tap failed and final key-up could not be confirmed"
-            ) from exc
-        if isinstance(exc, InputCleanupIncompleteError):
-            raise OSError(
-                "WeType key tap failed but final safety key-up completed"
+                "voice key tap delivery could not be confirmed"
             ) from exc
         raise
 
@@ -683,7 +1445,9 @@ def send_context_menu(*, _sender: Optional[RawSender] = None) -> None:
 
 
 def send_app_switcher(*, _sender: Optional[RawSender] = None) -> None:
-    _send_semantic_tap(("alt", "tab"), _sender=_sender)
+    # Ctrl+Alt+Tab leaves the Windows task switcher open after all keys are
+    # released, so a remote can choose with arrows and confirm with Enter.
+    _send_semantic_tap(("ctrl", "alt", "tab"), _sender=_sender)
 
 
 def send_volume_mute(*, _sender: Optional[RawSender] = None) -> None:

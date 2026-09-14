@@ -6,6 +6,7 @@ tests/test_single_instance.py's injected ``_create_mutex``/etc.).
 """
 
 import unittest
+from unittest import mock
 
 from ovb_rc003 import bridge_launcher, single_instance
 
@@ -289,6 +290,200 @@ class LaunchBridgeTests(unittest.TestCase):
 
         self.assertEqual(len(popen_calls), 1)
         self.assertTrue(popen_calls[0])  # non-empty, host-dependent contents
+
+
+class InProcessBridgeHandleTests(unittest.TestCase):
+    def test_default_product_launch_uses_the_in_process_worker(self):
+        expected = bridge_launcher.LaunchResult(
+            outcome=bridge_launcher.LaunchOutcome.STARTED,
+            command=("<in-process-bridge>",),
+            pid=1234,
+        )
+        with mock.patch.object(
+            bridge_launcher,
+            "start_in_process_bridge",
+            return_value=expected,
+        ) as start:
+            result = bridge_launcher.start_bridge_launch()
+
+        self.assertIs(result, expected)
+        start.assert_called_once_with(
+            grace_checks=bridge_launcher.DEFAULT_GRACE_CHECKS
+        )
+
+    def test_stop_requested_before_runtime_ready_is_delivered_once(self):
+        handle = bridge_launcher._InProcessBridgeHandle()
+        calls = []
+
+        handle.request_stop()
+        handle.request_stop()
+        handle.bind_stop(lambda: calls.append(1))
+
+        self.assertEqual(calls, [1])
+
+    def test_in_process_worker_forwards_the_voice_program_startup_choice(self):
+        handle = bridge_launcher._InProcessBridgeHandle(
+            launch_voice_program_on_start=False
+        )
+
+        with mock.patch.object(
+            bridge_launcher.single_instance,
+            "BridgeInstanceGuard",
+        ), mock.patch("ovb_rc003.app.main") as app_main:
+            bridge_launcher._run_in_process_bridge(handle)
+
+        app_main.assert_called_once_with(
+            show_notification_icon=False,
+            on_runtime_ready=handle.bind_stop,
+            on_reconnect_ready=handle.bind_reconnect,
+            on_settings_reload_ready=handle.bind_settings_reload,
+            launch_voice_program_on_start=False,
+        )
+        self.assertEqual(handle.poll(), 0)
+
+    def test_repeated_stop_requests_call_a_bound_callback_once(self):
+        handle = bridge_launcher._InProcessBridgeHandle()
+        calls = []
+        handle.bind_stop(lambda: calls.append(1))
+
+        handle.request_stop()
+        handle.request_stop()
+
+        self.assertEqual(calls, [1])
+
+    def test_reconnect_request_is_delivered_without_stopping_the_worker(self):
+        handle = bridge_launcher._InProcessBridgeHandle()
+        calls = []
+
+        self.assertFalse(handle.request_reconnect_now())
+        handle.bind_reconnect(lambda: calls.append("reconnect"))
+
+        self.assertTrue(handle.request_reconnect_now())
+        self.assertEqual(calls, ["reconnect"])
+
+    def test_settings_reload_request_is_delivered_to_the_live_worker(self):
+        handle = bridge_launcher._InProcessBridgeHandle()
+        calls = []
+
+        self.assertFalse(handle.request_settings_reload_now())
+        handle.bind_settings_reload(lambda: calls.append("reload"))
+
+        self.assertTrue(handle.request_settings_reload_now())
+        self.assertEqual(calls, ["reload"])
+
+    def test_public_reconnect_targets_only_the_live_in_process_worker(self):
+        class FakeHandle:
+            is_alive = True
+
+            def __init__(self):
+                self.calls = 0
+
+            def request_reconnect_now(self):
+                self.calls += 1
+                return True
+
+        handle = FakeHandle()
+        original = bridge_launcher._in_process_handle
+        bridge_launcher._in_process_handle = handle
+        try:
+            delivered = bridge_launcher.reconnect_in_process_bridge_now()
+        finally:
+            bridge_launcher._in_process_handle = original
+
+        self.assertTrue(delivered)
+        self.assertEqual(handle.calls, 1)
+
+    def test_public_stop_waits_for_the_owned_worker_and_clears_it(self):
+        class FakeHandle:
+            is_alive = True
+
+            def __init__(self):
+                self.stop_calls = 0
+                self.wait_calls = []
+
+            def request_stop(self):
+                self.stop_calls += 1
+
+            def wait(self, timeout):
+                self.wait_calls.append(timeout)
+                return True
+
+        handle = FakeHandle()
+        original = bridge_launcher._in_process_handle
+        bridge_launcher._in_process_handle = handle
+        try:
+            stopped = bridge_launcher.stop_in_process_bridge(timeout=2.5)
+        finally:
+            bridge_launcher._in_process_handle = original
+
+        self.assertTrue(stopped)
+        self.assertEqual(handle.stop_calls, 1)
+        self.assertEqual(handle.wait_calls, [2.5])
+
+    def test_finished_worker_does_not_mask_a_legacy_bridge(self):
+        class FinishedHandle:
+            is_alive = False
+
+        original = bridge_launcher._in_process_handle
+        bridge_launcher._in_process_handle = FinishedHandle()
+        try:
+            stopped = bridge_launcher.stop_in_process_bridge()
+            current = bridge_launcher._in_process_handle
+        finally:
+            bridge_launcher._in_process_handle = original
+
+        self.assertIsNone(stopped)
+        self.assertIsNone(current)
+
+    def test_mutex_cleanup_failure_blocks_every_later_in_process_restart(self):
+        class CleanupFailingGuard:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, _exc_type, _exc, _traceback):
+                raise single_instance.MutexCleanupError("simulated cleanup failure")
+
+        original_handle = bridge_launcher._in_process_handle
+        original_blocked = bridge_launcher._in_process_restart_blocked
+        bridge_launcher._in_process_handle = None
+        bridge_launcher._in_process_restart_blocked = False
+        handle = bridge_launcher._InProcessBridgeHandle()
+        try:
+            with mock.patch.object(
+                single_instance,
+                "BridgeInstanceGuard",
+                return_value=CleanupFailingGuard(),
+            ), mock.patch("ovb_rc003.app.main"):
+                bridge_launcher._run_in_process_bridge(handle)
+
+            self.assertEqual(
+                handle.poll(),
+                single_instance.CLEANUP_FAILED_EXIT_CODE,
+            )
+            self.assertTrue(bridge_launcher._in_process_restart_blocked)
+
+            result = bridge_launcher.start_in_process_bridge(grace_checks=0)
+            self.assertIsInstance(result, bridge_launcher.LaunchResult)
+            self.assertEqual(result.outcome, bridge_launcher.LaunchOutcome.QUICK_EXIT)
+            self.assertEqual(
+                result.exit_code,
+                single_instance.CLEANUP_FAILED_EXIT_CODE,
+            )
+            self.assertIsNone(bridge_launcher._in_process_handle)
+        finally:
+            bridge_launcher._in_process_handle = original_handle
+            bridge_launcher._in_process_restart_blocked = original_blocked
+
+    def test_worker_base_exception_is_reported_as_failure(self):
+        handle = bridge_launcher._InProcessBridgeHandle()
+
+        with mock.patch.object(
+            bridge_launcher.single_instance,
+            "BridgeInstanceGuard",
+        ), mock.patch("ovb_rc003.app.main", side_effect=SystemExit(7)):
+            bridge_launcher._run_in_process_bridge(handle)
+
+        self.assertEqual(handle.poll(), 1)
 
 
 class NonBlockingLaunchTests(unittest.TestCase):

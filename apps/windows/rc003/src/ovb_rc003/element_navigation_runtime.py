@@ -1,8 +1,9 @@
-"""Loads the single element-navigation source into its companion process."""
+"""Load the shared navigator for embedded product and compatibility runs."""
 
 from __future__ import annotations
 
 import importlib.util
+import logging
 import sys
 from pathlib import Path
 from typing import Any, Optional, Sequence
@@ -12,6 +13,52 @@ from . import element_navigation_control_windows, single_instance
 
 _PROTOTYPE_MODULE_NAME = "remote_mic_element_navigation"
 _DATA_DIRECTORY_NAME = "element_navigation"
+_diagnostic_trace: Any = None
+
+
+def set_diagnostic_trace(trace: Any) -> None:
+    """Reuse the active bridge writer, including its live diagnostic switch."""
+    global _diagnostic_trace
+    _diagnostic_trace = trace
+
+
+def clear_diagnostic_trace(trace: Any) -> None:
+    global _diagnostic_trace
+    if _diagnostic_trace is trace:
+        _diagnostic_trace = None
+
+
+def _diagnostic_enabled() -> bool:
+    trace = _diagnostic_trace
+    return trace is not None and bool(trace.enabled)
+
+
+def _emit_diagnostic(event: str, **fields: Any) -> None:
+    # Navigation starts before the bridge writer and stops after it. Keep
+    # lifecycle failures in the already configured application log as well.
+    if event in {
+        "element_navigation_ready", "element_navigation_startup_error",
+        "element_navigation_worker_error", "element_navigation_watcher",
+        "element_navigation_cleanup",
+    }:
+        try:
+            logging.getLogger("ovb_rc003").info(
+                "element navigation lifecycle: event=%s runtime=%s command=%s "
+                "outcome=%s error_type=%s error_code=%s failures=%s",
+                event, fields.get("navigation_runtime_id"), fields.get("command"),
+                fields.get("outcome"), fields.get("error_type"),
+                fields.get("error_code"), fields.get("failure_count"),
+            )
+        except Exception:
+            pass
+    # The desktop navigator outlives bridge restarts. Resolve the current
+    # writer per event instead of retaining a closed writer in its callback.
+    trace = _diagnostic_trace
+    if trace is not None:
+        try:
+            trace.emit(event, **fields)
+        except Exception:
+            pass
 
 
 def navigation_source_directory() -> Path:
@@ -78,4 +125,23 @@ def run_element_navigation(arguments: Sequence[str]) -> int:
         return single_instance.DUPLICATE_INSTANCE_EXIT_CODE
 
 
-__all__ = ("navigation_source_directory", "run_element_navigation")
+def start_embedded_element_navigation(application: object):
+    """Start the navigator inside the existing desktop Qt process."""
+
+    try:
+        return _load_prototype().start_embedded(
+            application, diagnostic_sink=_emit_diagnostic,
+            diagnostic_enabled=_diagnostic_enabled,
+        )
+    except Exception as exc:
+        _emit_diagnostic("element_navigation_startup_error", error_type=type(exc).__name__)
+        raise
+
+
+__all__ = (
+    "set_diagnostic_trace",
+    "clear_diagnostic_trace",
+    "navigation_source_directory",
+    "run_element_navigation",
+    "start_embedded_element_navigation",
+)

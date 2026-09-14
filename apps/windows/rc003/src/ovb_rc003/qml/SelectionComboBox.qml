@@ -26,6 +26,7 @@ ComboBox {
 
     contentItem: Label {
         text: root.displayText
+        textFormat: Text.PlainText
         color: root.enabled ? root.tokens.textPrimary : root.tokens.disabledText
         font: root.font
         verticalAlignment: Text.AlignVCenter
@@ -54,7 +55,8 @@ ComboBox {
         rightPadding: 7
         highlighted: root.highlightedIndex === index
         contentItem: Label {
-            text: root.decoratedText(index, modelData)
+            text: root.decoratedText(index, root.textAt(index))
+            textFormat: Text.PlainText
             color: root.tokens.textPrimary
             font.pixelSize: root.tokens.fontSizeControl
             font.weight: index === root.currentIndex ? Font.DemiBold : Font.Normal

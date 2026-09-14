@@ -63,6 +63,44 @@ class InputStructShapeTests(unittest.TestCase):
         self.assertIs(input_type, win32_input.INPUT)
         self.assertEqual(ctypes.sizeof(array), ctypes.sizeof(win32_input.INPUT))
 
+    def test_volume_keys_use_extended_virtual_key_events(self):
+        for name in ("volume_mute", "volume_down", "volume_up"):
+            with self.subTest(name=name):
+                vk = win32_input.win32_keys.VK_CODES[name]
+                array, _ = win32_input._build_input_array(
+                    [(vk, False), (vk, True)]
+                )
+                key_down = array[0].union.ki
+                key_up = array[1].union.ki
+                self.assertEqual((key_down.wVk, key_down.wScan), (vk, 0))
+                self.assertEqual(
+                    key_down.dwFlags, win32_input._KEYEVENTF_EXTENDEDKEY
+                )
+                self.assertEqual((key_up.wVk, key_up.wScan), (vk, 0))
+                self.assertEqual(
+                    key_up.dwFlags,
+                    win32_input._KEYEVENTF_EXTENDEDKEY
+                    | win32_input._KEYEVENTF_KEYUP,
+                )
+
+    def test_mouse_builder_uses_the_same_real_input_union(self):
+        array, input_type = win32_input._build_mouse_input_array(
+            [(win32_input._MOUSEEVENTF_XDOWN, win32_input._XBUTTON2)]
+        )
+        self.assertIs(input_type, win32_input.INPUT)
+        self.assertEqual(array[0].type, win32_input._INPUT_MOUSE)
+        self.assertEqual(array[0].union.mi.dwFlags, win32_input._MOUSEEVENTF_XDOWN)
+        self.assertEqual(array[0].union.mi.mouseData, win32_input._XBUTTON2)
+
+    def test_negative_wheel_delta_is_encoded_as_unsigned_mouse_data(self):
+        array, _ = win32_input._build_mouse_input_array(
+            [(win32_input._MOUSEEVENTF_WHEEL, -win32_input._WHEEL_DELTA)]
+        )
+        self.assertEqual(
+            array[0].union.mi.mouseData,
+            ctypes.c_uint32(-win32_input._WHEEL_DELTA).value,
+        )
+
     def test_right_alt_uses_the_extended_physical_scan_code(self):
         array, _ = win32_input._build_input_array(
             [(win32_input.win32_keys.VK_CODES["ralt"], False)]
@@ -96,32 +134,41 @@ class InputStructShapeTests(unittest.TestCase):
             win32_input._KEYEVENTF_SCANCODE | win32_input._KEYEVENTF_EXTENDEDKEY,
         )
 
-    def test_wetype_builder_uses_unmarked_virtual_keys_without_scan_codes(self):
-        vk_codes = [
-            win32_input.win32_keys.VK_CODES[name]
-            for name in ("lctrl", "lshift", "f9")
-        ]
-        events = [(vk, False) for vk in vk_codes] + [
-            (vk, True) for vk in reversed(vk_codes)
-        ]
+    def test_wetype_builder_keeps_ctrl_and_win_in_virtual_key_fields(self):
+        lctrl = win32_input.win32_keys.VK_CODES["lctrl"]
+        lwin = win32_input.win32_keys.VK_CODES["lwin"]
+        array, _ = win32_input._build_virtual_key_input_array(
+            [(lctrl, False), (lwin, True)]
+        )
 
-        array, input_type = win32_input._build_virtual_key_input_array(events)
+        self.assertEqual((array[0].union.ki.wVk, array[0].union.ki.wScan), (lctrl, 0))
+        self.assertFalse(array[0].union.ki.dwFlags & win32_input._KEYEVENTF_SCANCODE)
+        self.assertEqual((array[1].union.ki.wVk, array[1].union.ki.wScan), (lwin, 0))
+        self.assertTrue(array[1].union.ki.dwFlags & win32_input._KEYEVENTF_KEYUP)
+        self.assertTrue(
+            array[1].union.ki.dwFlags & win32_input._KEYEVENTF_EXTENDEDKEY
+        )
 
-        self.assertIs(input_type, win32_input.INPUT)
-        for index, (vk, key_up) in enumerate(events):
-            keybd = array[index].union.ki
-            self.assertEqual(keybd.wVk, vk)
-            self.assertEqual(keybd.wScan, 0)
-            self.assertEqual(keybd.dwExtraInfo, 0)
-            self.assertEqual(
-                keybd.dwFlags & win32_input._KEYEVENTF_SCANCODE,
-                0,
-            )
-            self.assertEqual(
-                bool(keybd.dwFlags & win32_input._KEYEVENTF_KEYUP),
-                key_up,
-            )
-
+    def test_all_arrow_keys_use_their_extended_physical_scan_codes(self):
+        expected = {
+            "up": 0x48,
+            "down": 0x50,
+            "left": 0x4B,
+            "right": 0x4D,
+        }
+        for name, scan_code in expected.items():
+            with self.subTest(name=name):
+                array, _ = win32_input._build_input_array(
+                    [(win32_input.win32_keys.VK_CODES[name], False)]
+                )
+                keybd = array[0].union.ki
+                self.assertEqual(keybd.wVk, 0)
+                self.assertEqual(keybd.wScan, scan_code)
+                self.assertEqual(
+                    keybd.dwFlags,
+                    win32_input._KEYEVENTF_SCANCODE
+                    | win32_input._KEYEVENTF_EXTENDEDKEY,
+                )
 
 if __name__ == "__main__":
     unittest.main()

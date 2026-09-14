@@ -550,5 +550,70 @@ class ElementNavigationRuntimeTests(unittest.TestCase):
         send.assert_not_called()
 
 
+class EmbeddedElementNavigationClientTests(unittest.TestCase):
+    def test_local_routes_require_bound_runtime_and_preserve_acceptance(self):
+        client = control.EmbeddedElementNavigationClient()
+        self.assertFalse(client.route_mapped_key(0x26))
+        self.assertFalse(client.route_local_key(0x26, True, False, False))
+        runtime_instance = mock.Mock(route_mapped_key=mock.Mock(return_value=True),
+                                     route_local_key=mock.Mock(return_value=False))
+        client.bind(runtime_instance)
+        self.assertTrue(client.route_mapped_key(0x26))
+        self.assertFalse(client.route_local_key(0x26, True, False, False))
+        runtime_instance.route_mapped_key.assert_called_once_with(0x26)
+        runtime_instance.route_local_key.assert_called_once_with(0x26, True, False, False)
+
+    def test_direction_edge_is_forwarded_only_to_bound_embedded_runtime(self):
+        calls = []
+
+        class Runtime:
+            def record_rc003_direction_edge(
+                self, vk, scan_code, extended, is_pressed
+            ):
+                calls.append((vk, scan_code, extended, is_pressed))
+                return True
+
+        client = control.EmbeddedElementNavigationClient()
+        self.assertFalse(client.record_rc003_direction_edge(0x26, 0x48, True, True))
+        client.bind(Runtime())
+
+        self.assertTrue(
+            client.record_rc003_direction_edge(0x26, 0x48, True, True)
+        )
+        self.assertEqual(calls, [(0x26, 0x48, True, True)])
+
+    def test_failed_shutdown_keeps_runtime_available_for_retry(self):
+        attempts = []
+
+        class Runtime:
+            def shutdown(self):
+                attempts.append("shutdown")
+                if len(attempts) == 1:
+                    raise RuntimeError("still stopping")
+
+        runtime_instance = Runtime()
+        client = control.EmbeddedElementNavigationClient()
+        client.bind(runtime_instance)
+
+        self.assertEqual(client.shutdown(), control.CommandSendResult.FAILED)
+        self.assertIs(client._runtime, runtime_instance)
+        self.assertEqual(client.shutdown(), control.CommandSendResult.DELIVERED)
+        self.assertIsNone(client._runtime)
+        self.assertEqual(attempts, ["shutdown", "shutdown"])
+
+    def test_successful_shutdown_does_not_clear_a_newer_runtime(self):
+        replacement = SimpleNamespace(shutdown=lambda: None)
+        client = control.EmbeddedElementNavigationClient()
+
+        class Runtime:
+            def shutdown(self):
+                client.bind(replacement)
+
+        client.bind(Runtime())
+
+        self.assertEqual(client.shutdown(), control.CommandSendResult.DELIVERED)
+        self.assertIs(client._runtime, replacement)
+
+
 if __name__ == "__main__":
     unittest.main()

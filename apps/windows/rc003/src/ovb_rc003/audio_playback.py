@@ -157,6 +157,10 @@ class EndpointPlaybackSink:
         return self._stream is not None
 
     @property
+    def endpoint_name(self) -> str:
+        return self._endpoint_name
+
+    @property
     def ready(self) -> bool:
         return self._ready and self._stream is not None
 

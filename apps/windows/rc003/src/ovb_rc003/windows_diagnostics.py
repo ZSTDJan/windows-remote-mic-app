@@ -75,14 +75,14 @@ class CheckStatus(Enum):
 
 
 class CheckGroup(Enum):
-    """The four groups In-scope item 4 requires the summary to distinguish
+    """Keep independent readiness areas from being collapsed together.
+
     - never collapsed into one another, since a passing optional-driver
-    check must never look like proof that voice or dictation works.
+    check must never look like proof that the voice bridge works.
     """
 
     ORDINARY_BUTTONS = "ordinary_buttons"
     VOICE_BRIDGE = "voice_bridge"
-    DICTATION = "dictation"
     OPTIONAL_DRIVER = "optional_driver"
     EXTERNAL_MICROPHONE = "external_microphone"
 
@@ -94,6 +94,7 @@ class CheckResult:
     group: CheckGroup
     status: CheckStatus
     detail: str
+    result_code: str = ""
 
 
 @dataclass(frozen=True)
@@ -178,9 +179,16 @@ def check_raw_input(
     enumerate_paths: Callable[
         [], Sequence[str]
     ] = raw_input_windows.enumerate_matching_device_paths,
+    selected_key: str | None = None,
 ) -> CheckResult:
     try:
         paths = enumerate_paths()
+        if selected_key is not None:
+            from . import remote_selection, hid_identity
+            try:
+                paths = [remote_selection.selected_raw_path(list(paths), selected_key)]
+            except hid_identity.HidIdentityError:
+                paths = []
     except raw_input_windows.RawInputUnavailableError:
         if sys.platform != "win32":
             return CheckResult(
@@ -189,6 +197,7 @@ def check_raw_input(
                 CheckGroup.ORDINARY_BUTTONS,
                 CheckStatus.UNSUPPORTED,
                 "仅 Windows 可检测 Raw Input 按键设备",
+                result_code="unsupported_platform",
             )
         # RETRY 3 (independent review): this used to interpolate str(exc)
         # here. RawInputUnavailableError's real production message is
@@ -204,6 +213,7 @@ def check_raw_input(
             CheckGroup.ORDINARY_BUTTONS,
             CheckStatus.FAIL,
             "Raw Input 检测失败；检查遥控器连接后重新检测",
+            result_code="probe_failed",
         )
 
     count = len(paths)
@@ -215,6 +225,7 @@ def check_raw_input(
             CheckGroup.ORDINARY_BUTTONS,
             CheckStatus.FAIL,
             f"未找到{_REMOTE_DISPLAY_NAME}的按键设备；请先完成蓝牙配对",
+            result_code="no_device",
         )
     if count > 1:
         return CheckResult(
@@ -223,6 +234,7 @@ def check_raw_input(
             CheckGroup.ORDINARY_BUTTONS,
             CheckStatus.FAIL,
             f"找到 {count} 个匹配设备；请只保留 1 个已连接设备",
+            result_code="ambiguous",
         )
     return CheckResult(
         "raw_input",
@@ -230,6 +242,7 @@ def check_raw_input(
         CheckGroup.ORDINARY_BUTTONS,
         CheckStatus.PASS,
         f"{_REMOTE_DISPLAY_NAME} 按键设备已找到",
+        result_code="ready",
     )
 
 
@@ -926,7 +939,8 @@ def _run_ble_diagnostics_subprocess(
     terminate_wait: float = _SUBPROCESS_TERMINATE_WAIT_SECONDS,
     kill_wait: float = _SUBPROCESS_KILL_WAIT_SECONDS,
     popen: Callable[..., "subprocess.Popen"] = subprocess.Popen,
-) -> BleDiagnosticsResult:
+    result_reader: Optional[Callable[[str, int], object]] = None,
+) -> object:
     """Spawns ``command`` (see ``build_ble_diagnostics_subprocess_command()``)
     and returns its validated verdict once it has exited ON ITS OWN within
     ``timeout`` (and ``cancel_event`` was never set) - never reading
@@ -993,6 +1007,8 @@ def _run_ble_diagnostics_subprocess(
 
     # The child has been CONFIRMED to have exited on its own - only now is
     # its result file ever read.
+    if result_reader is not None:
+        return result_reader(result_path, returncode)
     return _read_subprocess_verdict(result_path, returncode)
 
 
@@ -1289,6 +1305,7 @@ def check_ble_candidate(
                 CheckGroup.VOICE_BRIDGE,
                 CheckStatus.UNSUPPORTED,
                 f"仅 Windows 可检测已配对的{_REMOTE_DISPLAY_NAME}",
+                result_code="unsupported_platform",
             )
         # RETRY 3 (independent review): this used to interpolate str(exc)
         # here. The real production message this raises today is API-only,
@@ -1303,6 +1320,7 @@ def check_ble_candidate(
             CheckGroup.VOICE_BRIDGE,
             CheckStatus.UNSUPPORTED,
             "WinRT 蓝牙组件不可用；请检查安装后重试",
+            result_code="winrt_unavailable",
         )
     except BleDiscoverySubprocessShutdownUnconfirmedError:
         # XRBM-035 RETRY 1: distinct from a normal cancel/timeout below -
@@ -1316,6 +1334,7 @@ def check_ble_candidate(
             CheckGroup.VOICE_BRIDGE,
             CheckStatus.FAIL,
             "未能确认蓝牙检测进程已退出；请重启应用后重试",
+            result_code="shutdown_unconfirmed",
         )
     except BleDiscoveryCancelledError:
         # XRBM-035: an honest "did not complete" result - never a FAIL
@@ -1332,6 +1351,7 @@ def check_ble_candidate(
             CheckGroup.VOICE_BRIDGE,
             CheckStatus.FAIL,
             "蓝牙检测已取消或超时；请重新检测",
+            result_code="cancelled",
         )
     except Exception:  # noqa: BLE001 - report, never crash the diagnostics page
         # RETRY 3 (independent review): a genuinely unexpected exception
@@ -1345,6 +1365,7 @@ def check_ble_candidate(
             CheckGroup.VOICE_BRIDGE,
             CheckStatus.FAIL,
             "BLE 检测失败；请重新检测",
+            result_code="probe_failed",
         )
 
     try:
@@ -1356,6 +1377,7 @@ def check_ble_candidate(
             CheckGroup.VOICE_BRIDGE,
             CheckStatus.FAIL,
             f"未找到已配对的{_REMOTE_DISPLAY_NAME}；请先完成蓝牙配对",
+            result_code="no_candidate",
         )
     except identity.AmbiguousCandidateError as exc:
         return CheckResult(
@@ -1364,6 +1386,7 @@ def check_ble_candidate(
             CheckGroup.VOICE_BRIDGE,
             CheckStatus.FAIL,
             f"找到 {exc.count} 个{_REMOTE_DISPLAY_NAME}；请只保留 1 个已配对设备",
+            result_code="ambiguous",
         )
     return CheckResult(
         "ble_candidate",
@@ -1371,6 +1394,7 @@ def check_ble_candidate(
         CheckGroup.VOICE_BRIDGE,
         CheckStatus.PASS,
         f"已找到 1 个已配对的{_REMOTE_DISPLAY_NAME}",
+        result_code="ready",
     )
 
 
@@ -1850,20 +1874,6 @@ def check_output_endpoint_resolution(
     )
 
 
-# -- Windows dictation / Win+H (always manual) ------------------------------
-
-
-def check_dictation_manual() -> CheckResult:
-    return CheckResult(
-        "dictation",
-        "Windows 听写 (Win+H)",
-        CheckGroup.DICTATION,
-        CheckStatus.MANUAL,
-        "请手动测试 Win+H：打开文本框并说话，确认文字输入；"
-        "语音识别需在 Windows 中启用",
-    )
-
-
 # -- Orchestration -----------------------------------------------------------
 
 
@@ -1894,11 +1904,26 @@ def _isolated(
         )
 
 
+def check_selected_remote(key: str, *, cancel_event=None) -> CheckResult:
+    from . import remote_selection
+    if not key:
+        return CheckResult("ble_candidate", _BLE_CANDIDATE_TITLE, CheckGroup.VOICE_BRIDGE,
+                           CheckStatus.MANUAL, "请先选择要使用的设备。", "no_selection")
+    rows = remote_selection.scan_paired(cancel_event=cancel_event)
+    found = any(row["key"] == key and row["profile"] == "xiaomi-rc003" for row in rows)
+    return CheckResult("ble_candidate", _BLE_CANDIDATE_TITLE, CheckGroup.VOICE_BRIDGE,
+                       CheckStatus.PASS if found else CheckStatus.MANUAL,
+                       "所选设备仍在 Windows 配对列表中；按键和语音需分别验证。" if found
+                       else "未找到所选设备，请检查蓝牙配对。",
+                       "single_match" if found else "selected_missing")
+
+
 def run_diagnostics(
     *,
     saved_output_name: str = "",
     saved_output_host_api: str = "",
     cancel_event: Optional[threading.Event] = None,
+    selected_key: str | None = None,
 ) -> DiagnosticsReport:
     """Runs every check and returns a stable report. Pure aside from the
     real OS/WinRT/PortAudio calls each check function makes on Windows;
@@ -1936,12 +1961,14 @@ def run_diagnostics(
     )
     check_specs = (
         ("os_version", "Windows 版本与 64 位架构", CheckGroup.ORDINARY_BUTTONS, check_os_version),
-        ("raw_input", "Raw Input 按键设备", CheckGroup.ORDINARY_BUTTONS, check_raw_input),
+        ("raw_input", "Raw Input 按键设备", CheckGroup.ORDINARY_BUTTONS,
+         lambda: check_raw_input(selected_key=selected_key)),
         (
             "ble_candidate",
             _BLE_CANDIDATE_TITLE,
             CheckGroup.VOICE_BRIDGE,
-            lambda: check_ble_candidate(discover=ble_discover),
+            lambda: check_ble_candidate(discover=ble_discover) if selected_key is None
+            else check_selected_remote(selected_key, cancel_event=cancel_event),
         ),
         (
             "vb_cable_endpoints",
@@ -1959,7 +1986,6 @@ def run_diagnostics(
                 preflight=endpoint_preflight,
             ),
         ),
-        ("dictation", "Windows 听写 (Win+H)", CheckGroup.DICTATION, check_dictation_manual),
     )
     checks: "list[CheckResult]" = []
     for check_id, title, group, run in check_specs:

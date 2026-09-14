@@ -75,11 +75,4 @@ QtObject {
     property int pageVerticalPadding: 10
     property int sectionVerticalPadding: 10
 
-    property int comboMappingKeyColumnWidth: 92
-    property int comboMappingNoteColumnWidth: 154
-    property int comboMappingHeaderHeight: 24
-    property int comboMappingRowHeight: 32
-    property int comboMappingRowSpacing: 2
-    property int comboMappingHorizontalPadding: spacingMedium
-    property int comboMappingColumnSpacing: spacingSmall
 }

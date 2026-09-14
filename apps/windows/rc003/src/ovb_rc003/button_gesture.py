@@ -88,6 +88,13 @@ class ButtonGestureRecognizer:
     def is_tracking(self, button_id: str) -> bool:
         return button_id in self._states
 
+    def is_pressed(self, button_id: str) -> bool:
+        state = self._states.get(button_id)
+        return bool(state is not None and state.is_pressed)
+
+    def has_active_gestures(self) -> bool:
+        return bool(self._states)
+
     def press(
         self,
         button_id: str,
@@ -162,11 +169,16 @@ class ButtonGestureRecognizer:
     def reset(self) -> None:
         self._states.clear()
 
+    def cancel(self, button_id: str) -> None:
+        self._states.pop(button_id, None)
+
 
 TimerFactory = Callable[[float, Callable[[], None]], object]
 ActionConfigured = Callable[[str, ButtonTrigger], bool]
 TriggerCallback = Callable[[str, ButtonTrigger], None]
 RepeatableCallback = Callable[[str], bool]
+IdleCallback = Callable[[], None]
+DiagnosticCallback = Callable[..., None]
 
 
 class ButtonGestureDispatcher:
@@ -183,6 +195,7 @@ class ButtonGestureDispatcher:
     REPEAT_DELAY_SECONDS = 0.350
     REPEAT_INTERVAL_SECONDS = 0.100
     BACK_REPEAT_INTERVAL_SECONDS = 0.050
+    MAX_HOLD_SECONDS = 10.0
 
     def __init__(
         self,
@@ -190,25 +203,45 @@ class ButtonGestureDispatcher:
         is_action_configured: ActionConfigured,
         is_repeatable: RepeatableCallback,
         on_trigger: TriggerCallback,
+        on_idle: Optional[IdleCallback] = None,
+        on_diagnostic: Optional[DiagnosticCallback] = None,
         timer_factory: Optional[TimerFactory] = None,
+        hold_timer_factory: Optional[TimerFactory] = None,
     ) -> None:
         self._is_action_configured = is_action_configured
         self._is_repeatable = is_repeatable
         self._on_trigger = on_trigger
+        self._on_idle = on_idle
+        self._on_diagnostic = on_diagnostic
         self._timer_factory = timer_factory or (
             lambda delay, callback: threading.Timer(delay, callback)
         )
+        self._hold_timer_factory = hold_timer_factory or self._new_daemon_timer
         self._lock = threading.RLock()
+        self._callback_lock = threading.RLock()
         self._recognizer = ButtonGestureRecognizer()
         self._double_timers: Dict[str, object] = {}
         self._long_timers: Dict[str, object] = {}
         self._repeat_timers: Dict[str, object] = {}
+        self._hold_timers: Dict[str, object] = {}
+        self._double_timer_tokens: Dict[str, object] = {}
+        self._long_timer_tokens: Dict[str, object] = {}
+        self._repeat_timer_tokens: Dict[str, object] = {}
+        self._hold_timer_tokens: Dict[str, object] = {}
+        self._repeat_hold_tokens: Dict[str, object] = {}
         self._held_immediate_buttons: Set[str] = set()
+        self._blocked_until_release_buttons: Set[str] = set()
+        self._callback_reservations: Set[object] = set()
+        self._button_generations: Dict[str, int] = {}
         self._generation = 0
 
     def press(self, button_id: str) -> None:
         callbacks: List[ButtonTrigger] = []
         with self._lock:
+            if button_id in self._blocked_until_release_buttons:
+                return
+            generation = self._generation
+            button_generation = self._button_generations.get(button_id, 0)
             if button_id in self._held_immediate_buttons:
                 return
             recognizes_double = self._is_action_configured(
@@ -222,38 +255,144 @@ class ButtonGestureDispatcher:
                     return
                 self._held_immediate_buttons.add(button_id)
                 callbacks.append(ButtonTrigger.SINGLE_CLICK)
-                if self._is_repeatable(button_id):
-                    self._schedule_repeat_locked(button_id, self.REPEAT_DELAY_SECONDS)
+                if not self._schedule_hold_guard_locked(button_id):
+                    self._rollback_button_hold_locked(button_id)
+                elif self._is_repeatable(button_id):
+                    hold_token = object()
+                    self._repeat_hold_tokens[button_id] = hold_token
+                    if not self._schedule_repeat_locked(
+                        button_id,
+                        self.REPEAT_DELAY_SECONDS,
+                        hold_token,
+                    ):
+                        self._repeat_hold_tokens.pop(button_id, None)
             else:
+                was_pressed = self._recognizer.is_pressed(button_id)
                 commands = self._recognizer.press(
                     button_id,
                     recognizes_double_click=recognizes_double,
                     recognizes_long_press=recognizes_long,
                 )
+                if not was_pressed and self._recognizer.is_pressed(button_id):
+                    if not self._schedule_hold_guard_locked(button_id):
+                        self._rollback_button_hold_locked(button_id)
+                        commands = []
                 callbacks.extend(self._execute_commands_locked(commands))
-            self._emit(button_id, callbacks)
+            reservation = self._reserve_callbacks_locked(callbacks)
+        self._emit(
+            button_id,
+            callbacks,
+            generation,
+            button_generation,
+            reservation=reservation,
+        )
 
     def release(self, button_id: str) -> None:
         with self._lock:
+            generation = self._generation
+            button_generation = self._button_generations.get(button_id, 0)
+            self._cancel_timer_locked(
+                self._hold_timers,
+                self._hold_timer_tokens,
+                button_id,
+            )
+            if button_id in self._blocked_until_release_buttons:
+                self._blocked_until_release_buttons.discard(button_id)
+                return
             self._held_immediate_buttons.discard(button_id)
-            self._cancel_timer_locked(self._repeat_timers, button_id)
+            self._repeat_hold_tokens.pop(button_id, None)
+            self._cancel_timer_locked(
+                self._repeat_timers,
+                self._repeat_timer_tokens,
+                button_id,
+            )
             commands = self._recognizer.release(button_id)
             callbacks = self._execute_commands_locked(commands)
-            self._emit_many(commands, callbacks)
+            reservation = self._reserve_callbacks_locked(callbacks)
+        self._emit(
+            button_id,
+            callbacks,
+            generation,
+            button_generation,
+            reservation=reservation,
+        )
 
     def reset(self) -> None:
         with self._lock:
             self._generation += 1
-            for timers in (
-                self._double_timers,
-                self._long_timers,
-                self._repeat_timers,
+            for timers, tokens in (
+                (self._double_timers, self._double_timer_tokens),
+                (self._long_timers, self._long_timer_tokens),
+                (self._repeat_timers, self._repeat_timer_tokens),
+                (self._hold_timers, self._hold_timer_tokens),
             ):
                 for timer in timers.values():
                     self._cancel_timer(timer)
                 timers.clear()
+                tokens.clear()
+            self._repeat_hold_tokens.clear()
             self._held_immediate_buttons.clear()
+            self._blocked_until_release_buttons.clear()
+            self._button_generations.clear()
             self._recognizer.reset()
+        # A timeout may have reserved the callback gate just before the state
+        # reset. Waiting for that gate guarantees no older callback can begin
+        # after reset() returns without making release wait on SendInput.
+        with self._callback_lock:
+            pass
+
+    def cancel_buttons(self, button_ids: Set[str]) -> None:
+        """Cancel only the named gestures without disturbing other holds."""
+
+        buttons = set(button_ids)
+        if not buttons:
+            return
+        with self._lock:
+            for button_id in buttons:
+                self._button_generations[button_id] = (
+                    self._button_generations.get(button_id, 0) + 1
+                )
+                self._held_immediate_buttons.discard(button_id)
+                self._blocked_until_release_buttons.discard(button_id)
+                self._repeat_hold_tokens.pop(button_id, None)
+                for timers, tokens in (
+                    (self._double_timers, self._double_timer_tokens),
+                    (self._long_timers, self._long_timer_tokens),
+                    (self._repeat_timers, self._repeat_timer_tokens),
+                    (self._hold_timers, self._hold_timer_tokens),
+                ):
+                    self._cancel_timer_locked(timers, tokens, button_id)
+                self._recognizer.cancel(button_id)
+        # A timeout may already have reserved the callback gate. Its per-button
+        # generation now rejects it once any callback already running finishes.
+        with self._callback_lock:
+            pass
+        self._notify_idle()
+
+    def has_active_gestures(self) -> bool:
+        """Return whether a physical gesture still owns the current mapping."""
+
+        with self._lock:
+            return bool(
+                self._held_immediate_buttons
+                or self._repeat_hold_tokens
+                or self._callback_reservations
+                or self._recognizer.has_active_gestures()
+            )
+
+    def _reserve_callbacks_locked(
+        self, callbacks: List[ButtonTrigger]
+    ) -> Optional[object]:
+        if not callbacks:
+            return None
+        reservation = object()
+        self._callback_reservations.add(reservation)
+        return reservation
+
+    def _notify_idle(self) -> None:
+        callback = self._on_idle
+        if callback is not None and not self.has_active_gestures():
+            callback()
 
     def _execute_commands_locked(
         self, commands: List[GestureCommand]
@@ -261,102 +400,367 @@ class ButtonGestureDispatcher:
         callbacks: List[ButtonTrigger] = []
         for command in commands:
             if command.kind is _CommandKind.SCHEDULE_DOUBLE:
-                self._schedule_double_locked(command.button_id)
+                if not self._schedule_double_locked(command.button_id):
+                    callbacks.extend(
+                        self._execute_commands_locked(
+                            self._recognizer.double_click_timed_out(
+                                command.button_id
+                            )
+                        )
+                    )
             elif command.kind is _CommandKind.CANCEL_DOUBLE:
-                self._cancel_timer_locked(self._double_timers, command.button_id)
+                self._cancel_timer_locked(
+                    self._double_timers,
+                    self._double_timer_tokens,
+                    command.button_id,
+                )
             elif command.kind is _CommandKind.SCHEDULE_LONG:
-                self._schedule_long_locked(command.button_id)
+                if not self._schedule_long_locked(command.button_id):
+                    self._rollback_button_hold_locked(command.button_id)
+                    callbacks.clear()
+                    break
             elif command.kind is _CommandKind.CANCEL_LONG:
-                self._cancel_timer_locked(self._long_timers, command.button_id)
+                self._cancel_timer_locked(
+                    self._long_timers,
+                    self._long_timer_tokens,
+                    command.button_id,
+                )
             elif command.kind is _CommandKind.TRIGGER and command.trigger is not None:
                 callbacks.append(command.trigger)
         return callbacks
 
-    def _schedule_double_locked(self, button_id: str) -> None:
-        self._cancel_timer_locked(self._double_timers, button_id)
-        timer = self._timer_factory(
+    def _schedule_double_locked(self, button_id: str) -> bool:
+        self._cancel_timer_locked(
+            self._double_timers,
+            self._double_timer_tokens,
+            button_id,
+        )
+        token = object()
+        return self._start_timer_locked(
+            self._double_timers,
+            self._double_timer_tokens,
+            button_id,
+            token,
+            self._timer_factory,
             self.DOUBLE_CLICK_SECONDS,
-            lambda generation=self._generation: self._double_click_timeout(
-                button_id, generation
+            lambda generation=self._generation, token=token: self._double_click_timeout(
+                button_id, generation, token
             ),
         )
-        self._double_timers[button_id] = timer
-        timer.start()
 
-    def _schedule_long_locked(self, button_id: str) -> None:
-        self._cancel_timer_locked(self._long_timers, button_id)
-        timer = self._timer_factory(
+    def _schedule_long_locked(self, button_id: str) -> bool:
+        self._cancel_timer_locked(
+            self._long_timers,
+            self._long_timer_tokens,
+            button_id,
+        )
+        token = object()
+        return self._start_timer_locked(
+            self._long_timers,
+            self._long_timer_tokens,
+            button_id,
+            token,
+            self._timer_factory,
             self.LONG_PRESS_SECONDS,
-            lambda generation=self._generation: self._long_press_timeout(
-                button_id, generation
+            lambda generation=self._generation, token=token: self._long_press_timeout(
+                button_id, generation, token
             ),
         )
-        self._long_timers[button_id] = timer
-        timer.start()
 
-    def _schedule_repeat_locked(self, button_id: str, delay: float) -> None:
-        self._cancel_timer_locked(self._repeat_timers, button_id)
-        timer = self._timer_factory(
+    def _schedule_repeat_locked(
+        self,
+        button_id: str,
+        delay: float,
+        hold_token: object,
+    ) -> bool:
+        self._cancel_timer_locked(
+            self._repeat_timers,
+            self._repeat_timer_tokens,
+            button_id,
+        )
+        timer_token = object()
+        started = self._start_timer_locked(
+            self._repeat_timers,
+            self._repeat_timer_tokens,
+            button_id,
+            timer_token,
+            self._timer_factory,
             delay,
-            lambda generation=self._generation: self._repeat_timeout(
-                button_id, generation
+            lambda generation=self._generation, timer_token=timer_token: self._repeat_timeout(
+                button_id, generation, timer_token, hold_token
             ),
         )
-        self._repeat_timers[button_id] = timer
-        timer.start()
+        self._diagnostic(
+            "repeat_timer",
+            button_id,
+            phase="scheduled" if started else "schedule_failed",
+            delay_seconds=float(delay),
+        )
+        return started
 
-    def _double_click_timeout(self, button_id: str, generation: int) -> None:
+    def _schedule_hold_guard_locked(self, button_id: str) -> bool:
+        self._cancel_timer_locked(
+            self._hold_timers,
+            self._hold_timer_tokens,
+            button_id,
+        )
+        token = object()
+        return self._start_timer_locked(
+            self._hold_timers,
+            self._hold_timer_tokens,
+            button_id,
+            token,
+            self._hold_timer_factory,
+            self.MAX_HOLD_SECONDS,
+            lambda generation=self._generation, token=token: self._hold_timeout(
+                button_id, generation, token
+            ),
+        )
+
+    def _start_timer_locked(
+        self,
+        timers: Dict[str, object],
+        tokens: Dict[str, object],
+        button_id: str,
+        token: object,
+        factory: TimerFactory,
+        delay: float,
+        callback: Callable[[], None],
+    ) -> bool:
+        timer: Optional[object] = None
+        try:
+            timer = factory(delay, callback)
+            timers[button_id] = timer
+            tokens[button_id] = token
+            timer.start()
+        except BaseException:  # noqa: BLE001 - input callbacks must fail closed
+            if tokens.get(button_id) is token:
+                timers.pop(button_id, None)
+                tokens.pop(button_id, None)
+            if timer is not None:
+                self._cancel_timer(timer)
+            return False
+        return True
+
+    def _rollback_button_hold_locked(self, button_id: str) -> None:
+        self._held_immediate_buttons.discard(button_id)
+        self._repeat_hold_tokens.pop(button_id, None)
+        for timers, tokens in (
+            (self._double_timers, self._double_timer_tokens),
+            (self._long_timers, self._long_timer_tokens),
+            (self._repeat_timers, self._repeat_timer_tokens),
+            (self._hold_timers, self._hold_timer_tokens),
+        ):
+            self._cancel_timer_locked(timers, tokens, button_id)
+        self._recognizer.cancel(button_id)
+        self._blocked_until_release_buttons.add(button_id)
+
+    def _double_click_timeout(
+        self,
+        button_id: str,
+        generation: int,
+        token: object,
+    ) -> None:
         with self._lock:
-            if generation != self._generation:
+            if (
+                generation != self._generation
+                or self._double_timer_tokens.get(button_id) is not token
+            ):
                 return
             self._double_timers.pop(button_id, None)
+            self._double_timer_tokens.pop(button_id, None)
             commands = self._recognizer.double_click_timed_out(button_id)
             callbacks = self._execute_commands_locked(commands)
-            self._emit_many(commands, callbacks)
+            button_generation = self._button_generations.get(button_id, 0)
+            reservation = self._reserve_callbacks_locked(callbacks)
+        try:
+            self._emit(
+                button_id,
+                callbacks,
+                generation,
+                button_generation,
+                reservation=reservation,
+            )
+        finally:
+            self._notify_idle()
 
-    def _long_press_timeout(self, button_id: str, generation: int) -> None:
+    def _long_press_timeout(
+        self,
+        button_id: str,
+        generation: int,
+        token: object,
+    ) -> None:
         with self._lock:
-            if generation != self._generation:
+            if (
+                generation != self._generation
+                or self._long_timer_tokens.get(button_id) is not token
+            ):
                 return
             self._long_timers.pop(button_id, None)
+            self._long_timer_tokens.pop(button_id, None)
             commands = self._recognizer.long_press_timed_out(button_id)
             callbacks = self._execute_commands_locked(commands)
-            self._emit_many(commands, callbacks)
+            button_generation = self._button_generations.get(button_id, 0)
+            reservation = self._reserve_callbacks_locked(callbacks)
+        try:
+            self._emit(
+                button_id,
+                callbacks,
+                generation,
+                button_generation,
+                reservation=reservation,
+            )
+        finally:
+            self._notify_idle()
 
-    def _repeat_timeout(self, button_id: str, generation: int) -> None:
+    def _repeat_timeout(
+        self,
+        button_id: str,
+        generation: int,
+        timer_token: object,
+        hold_token: object,
+    ) -> None:
         with self._lock:
-            if generation != self._generation:
+            if (
+                generation != self._generation
+                or self._repeat_timer_tokens.get(button_id) is not timer_token
+                or self._repeat_hold_tokens.get(button_id) is not hold_token
+            ):
                 return
             if button_id not in self._held_immediate_buttons:
                 self._repeat_timers.pop(button_id, None)
+                self._repeat_timer_tokens.pop(button_id, None)
+                return
+            if not self._is_repeatable(button_id):
+                self._repeat_timers.pop(button_id, None)
+                self._repeat_timer_tokens.pop(button_id, None)
+                self._repeat_hold_tokens.pop(button_id, None)
                 return
             self._repeat_timers.pop(button_id, None)
-            interval = (
-                self.BACK_REPEAT_INTERVAL_SECONDS
-                if button_id == "back"
-                else self.REPEAT_INTERVAL_SECONDS
+            self._repeat_timer_tokens.pop(button_id, None)
+            reservation = self._reserve_callbacks_locked(
+                [ButtonTrigger.SINGLE_CLICK]
             )
-            self._schedule_repeat_locked(button_id, interval)
-            # Keep reset() mutually exclusive with callback entry. Once reset
-            # returns, no callback from an older connection generation can
-            # begin and synthesize a late host action.
-            self._on_trigger(button_id, ButtonTrigger.SINGLE_CLICK)
+            button_generation = self._button_generations.get(button_id, 0)
 
-    def _emit(self, button_id: str, callbacks: List[ButtonTrigger]) -> None:
-        for trigger in callbacks:
-            self._on_trigger(button_id, trigger)
+        self._diagnostic("repeat_timer", button_id, phase="fired")
 
-    def _emit_many(
-        self, commands: List[GestureCommand], callbacks: List[ButtonTrigger]
+        emitted = self._emit(
+            button_id,
+            [ButtonTrigger.SINGLE_CLICK],
+            generation,
+            button_generation,
+            require_hold_token=hold_token,
+            reservation=reservation,
+        )
+        if not emitted:
+            self._notify_idle()
+            return
+
+        with self._lock:
+            if (
+                generation != self._generation
+                or self._repeat_hold_tokens.get(button_id) is not hold_token
+                or button_id not in self._held_immediate_buttons
+                or not self._is_repeatable(button_id)
+            ):
+                if self._repeat_hold_tokens.get(button_id) is hold_token:
+                    self._repeat_hold_tokens.pop(button_id, None)
+            else:
+                interval = (
+                    self.BACK_REPEAT_INTERVAL_SECONDS
+                    if button_id == "back"
+                    else self.REPEAT_INTERVAL_SECONDS
+                )
+                if not self._schedule_repeat_locked(
+                    button_id, interval, hold_token
+                ):
+                    self._repeat_hold_tokens.pop(button_id, None)
+        self._notify_idle()
+
+    def _diagnostic(self, event: str, button_id: str, **fields: object) -> None:
+        callback = self._on_diagnostic
+        if callback is None:
+            return
+        try:
+            callback(event, button_id, **fields)
+        except BaseException:
+            pass
+
+    def _hold_timeout(self, button_id: str, generation: int, token: object) -> None:
+        with self._lock:
+            if (
+                generation != self._generation
+                or self._hold_timer_tokens.get(button_id) is not token
+            ):
+                return
+            self._hold_timers.pop(button_id, None)
+            self._hold_timer_tokens.pop(button_id, None)
+            self._held_immediate_buttons.discard(button_id)
+            self._repeat_hold_tokens.pop(button_id, None)
+            self._cancel_timer_locked(
+                self._repeat_timers,
+                self._repeat_timer_tokens,
+                button_id,
+            )
+            self._cancel_timer_locked(
+                self._double_timers,
+                self._double_timer_tokens,
+                button_id,
+            )
+            self._cancel_timer_locked(
+                self._long_timers,
+                self._long_timer_tokens,
+                button_id,
+            )
+            self._recognizer.cancel(button_id)
+            self._blocked_until_release_buttons.add(button_id)
+        self._notify_idle()
+
+    def _emit(
+        self,
+        button_id: str,
+        callbacks: List[ButtonTrigger],
+        generation: int,
+        button_generation: int,
+        *,
+        require_hold_token: Optional[object] = None,
+        reservation: Optional[object] = None,
+    ) -> bool:
+        emitted = False
+        try:
+            for trigger in callbacks:
+                with self._callback_lock:
+                    with self._lock:
+                        if generation != self._generation:
+                            return emitted
+                        if (
+                            button_generation
+                            != self._button_generations.get(button_id, 0)
+                        ):
+                            return emitted
+                        if (
+                            require_hold_token is not None
+                            and self._repeat_hold_tokens.get(button_id)
+                            is not require_hold_token
+                        ):
+                            return emitted
+                    self._on_trigger(button_id, trigger)
+                    emitted = True
+            return emitted
+        finally:
+            if reservation is not None:
+                with self._lock:
+                    self._callback_reservations.discard(reservation)
+
+    def _cancel_timer_locked(
+        self,
+        timers: Dict[str, object],
+        tokens: Dict[str, object],
+        button_id: str,
     ) -> None:
-        for command, trigger in zip(
-            (command for command in commands if command.kind is _CommandKind.TRIGGER),
-            callbacks,
-        ):
-            self._on_trigger(command.button_id, trigger)
-
-    def _cancel_timer_locked(self, timers: Dict[str, object], button_id: str) -> None:
         timer = timers.pop(button_id, None)
+        tokens.pop(button_id, None)
         if timer is not None:
             self._cancel_timer(timer)
 
@@ -364,4 +768,13 @@ class ButtonGestureDispatcher:
     def _cancel_timer(timer: object) -> None:
         cancel = getattr(timer, "cancel", None)
         if cancel is not None:
-            cancel()
+            try:
+                cancel()
+            except BaseException:
+                pass
+
+    @staticmethod
+    def _new_daemon_timer(delay: float, callback: Callable[[], None]) -> object:
+        timer = threading.Timer(delay, callback)
+        timer.daemon = True
+        return timer

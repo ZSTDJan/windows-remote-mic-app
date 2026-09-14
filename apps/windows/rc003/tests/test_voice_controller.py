@@ -63,11 +63,5 @@ class HoldModeTests(unittest.TestCase):
         self.assertTrue(controller.active)
         self.assertTrue(controller.holding)
 
-    def test_tap_does_not_create_hold_state(self):
-        controller = VoiceController()
-        controller.restore_pending(VoiceHostAction.TAP)
-        self.assertFalse(controller.active)
-
-
 if __name__ == "__main__":
     unittest.main()

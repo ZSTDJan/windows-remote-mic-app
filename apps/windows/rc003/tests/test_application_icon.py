@@ -14,6 +14,12 @@ _GENERATOR = _RC003_ROOT / "build" / "generate-app-icon.py"
 
 
 class ApplicationIconTests(unittest.TestCase):
+    def test_state_icons_keep_the_existing_brand_blue(self):
+        for name in ("remote-mic-connected.svg", "remote-mic-unavailable.svg"):
+            content = (_ICON_DIR / name).read_text(encoding="utf-8")
+            self.assertIn('stroke="#4AA8FF"', content)
+            self.assertNotIn("currentColor", content)
+
     def test_qt_icon_is_applied_to_the_application_and_native_window(self):
         calls = []
 

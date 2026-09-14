@@ -20,21 +20,38 @@ _RC003_ROOT = Path(__file__).resolve().parents[1]
 
 # Mirrors $excludedDirNames in check-public-boundary.ps1 exactly - keep both
 # lists in sync. Generated/build-output directories, never source: a real
-# Python virtualenv's own binaries (.venv), PyInstaller's dist/work output
-# (dist, pyinstaller-work), and vendored third-party binaries (third_party)
-# routinely contain forbidden-binary-extension files that must never be
-# treated as "committed" content.
-_EXCLUDED_DIR_NAMES = {".venv", "dist", "pyinstaller-work", "third_party"}
+# Python virtualenv's own binaries (.venv), Cython stage/work output,
+# PyInstaller's dist/work output (dist, pyinstaller-work), and vendored
+# third-party binaries (third_party) routinely contain forbidden-binary-
+# extension files that must never be treated as "committed" content.
+_EXCLUDED_DIR_NAMES = {
+    ".venv",
+    ".build",
+    "cython-stage",
+    "cython-work",
+    "dist",
+    "pyinstaller-work",
+    "third_party",
+}
+_EXCLUDED_ROOT_FILE_PATTERNS = ("无线麦便携测试包-*.zip",)
 
 
-def _is_excluded_generated_path(path: Path) -> bool:
+def _is_excluded_generated_path(path: Path, root: Path) -> bool:
     """Match both canonical and timestamped build output directories."""
-    return any(
+    is_generated_directory = any(
         part in _EXCLUDED_DIR_NAMES
         or part.startswith("dist-")
         or part.startswith("build-")
         or part.startswith("pyinstaller-work-")
+        or part.startswith("smoke-dist-")
+        or part.startswith("smoke-work-")
+        or part.startswith("ui-audit-")
         for part in path.parts
+    )
+    if is_generated_directory:
+        return True
+    return path.parent == root and any(
+        path.match(pattern) for pattern in _EXCLUDED_ROOT_FILE_PATTERNS
     )
 
 _FORBIDDEN_BINARY_EXTENSIONS = {".exe", ".dll", ".pyd", ".zip", ".xz"}
@@ -55,18 +72,24 @@ _CREDENTIAL_RE = re.compile(
     r"(api[_-]?key|client[_-]?secret|password)\s*[:=]\s*[\"'][^\"']{8,}[\"']"
 )
 _PRIVATE_WORKSPACE_MARKERS = (
-    "".join(map(chr, (0x44, 0x3A, 0x5C, 0x57, 0x75, 0x78, 0x69, 0x61, 0x6E, 0x6D, 0x61, 0x69))),
-    "".join(map(chr, (0x44, 0x3A, 0x5C, 0x43, 0x6C, 0x65, 0x61, 0x72))),
+    "D:" + "\\Wuxianmai",
+    "D:" + "\\Clear",
 )
 _NON_ATTRIBUTION_REFERENCE_MARKERS = (
-    "".join(map(chr, (0x8A00, 0x7075))),
-    "".join(map(chr, (0x76, 0x69, 0x62, 0x65, 0x2D, 0x66, 0x6C, 0x6F, 0x77))),
-    "".join(map(chr, (0x56, 0x69, 0x62, 0x65, 0x20, 0x46, 0x6C, 0x6F, 0x77))),
-    "".join(map(chr, (0x72, 0x69, 0x63, 0x68, 0x6C, 0x65, 0x61, 0x72, 0x6E, 0x74, 0x6F, 0x64, 0x6F, 0x2D, 0x64, 0x65, 0x62, 0x75, 0x67))),
-    "".join(map(chr, (0x56, 0x69, 0x62, 0x65, 0x50, 0x61, 0x64))),
-    "".join(map(chr, (0x4B, 0x65, 0x79, 0x48, 0x6F, 0x70))),
-    "".join(map(chr, (0x53, 0x61, 0x79, 0x41, 0x6C, 0x6C))),
+    chr(0x8A00) + chr(0x7075),
+    "vibe" + "-flow",
+    "Vibe " + "Flow",
+    "richlearntodo" + "-debug",
+    "Vibe" + "Pad",
+    "Key" + "Hop",
+    "Say" + "All",
 )
+
+_NON_ATTRIBUTION_REFERENCE_EXEMPT_RELATIVE_PATHS = {
+    # This is the one public provenance ledger where exact upstream
+    # repository identities are expected rather than leaked references.
+    Path("ATTRIBUTION.md"),
+}
 _FORBIDDEN_BRANDING_PATTERNS = [
     re.compile(pattern)
     for pattern in (r"2655\s*AI", r"2655ai\.com", "T1RemoteBridge", "V60PenBridge", "PV60", "汉王")
@@ -90,8 +113,11 @@ _BRANDING_CHECK_EXEMPT_RELATIVE_PATHS = {
     Path("tests/test_privacy_contract.py"),
     Path("tests/test_build_artifacts.py"),
     Path("tests/test_boundary_scan_replay.py"),
+    Path("tests/test_hid_elevation_windows.py"),
     Path("build/check-public-boundary.ps1"),
     Path("installer/readme-rc003.txt"),
+    Path("src/ovb_rc003/hid_elevation_windows.py"),
+    Path("installer/RemoteMicRC003Setup.iss"),
     Path("src/ovb_rc003/vb_cable_bundle.py"),
     Path("src/ovb_rc003/voice_program_manager.py"),
     # XRBM-031: README.md/ATTRIBUTION.md document the same disclosed
@@ -144,7 +170,7 @@ def _scan(root: Path):
     violations = []
     all_files = [path for path in root.rglob("*") if path.is_file()]
     all_files = [
-        path for path in all_files if not _is_excluded_generated_path(path)
+        path for path in all_files if not _is_excluded_generated_path(path, root)
     ]
 
     for path in all_files:
@@ -162,6 +188,9 @@ def _scan(root: Path):
         relative_path = path.relative_to(root)
         is_branding_exempt = relative_path in _BRANDING_CHECK_EXEMPT_RELATIVE_PATHS
         is_autostart_exempt = relative_path in _AUTOSTART_CHECK_EXEMPT_RELATIVE_PATHS
+        is_reference_exempt = (
+            relative_path in _NON_ATTRIBUTION_REFERENCE_EXEMPT_RELATIVE_PATHS
+        )
 
         try:
             text = path.read_text(encoding="utf-8")
@@ -181,7 +210,7 @@ def _scan(root: Path):
         folded_relative_path = relative_path.as_posix().casefold()
         if any(marker.casefold() in folded_text for marker in _PRIVATE_WORKSPACE_MARKERS):
             violations.append(f"private workspace path in: {path}")
-        if any(
+        if not is_reference_exempt and any(
             marker.casefold() in folded_text
             or marker.casefold() in folded_relative_path
             for marker in _NON_ATTRIBUTION_REFERENCE_MARKERS
@@ -264,6 +293,42 @@ class BoundaryScanReplayTests(unittest.TestCase):
         self.assertIn("winreg.QueryValueEx", text)
         self.assertNotIn("winreg.SetValueEx", text)
 
+    def test_hid_elevation_module_has_only_the_fixed_on_demand_task_boundary(self):
+        path = _RC003_ROOT / "src" / "ovb_rc003" / "hid_elevation_windows.py"
+        text = path.read_text(encoding="utf-8")
+        self.assertTrue(any(marker in text for marker in _ELEVATION_MARKERS))
+        self.assertFalse(any(pattern.search(text) for pattern in _FORBIDDEN_BRANDING_PATTERNS))
+        self.assertFalse(any(marker in text for marker in _AUTOSTART_MARKERS))
+        self.assertIn('TASK_NAME_PREFIX = r"\\RemoteMicRC003-HidTap-"', text)
+        self.assertIn("def task_name_for_sid", text)
+        self.assertIn("TASK_DONT_ADD_PRINCIPAL_ACE", text)
+        self.assertIn('INJECT_FLAG = "--inject"', text)
+        self.assertIn('lpVerb = "runas"', text)
+        self.assertNotIn('add_argument("--pid"', text)
+
+    def test_hid_elevation_test_is_exempt_only_for_the_reviewed_win32_stub(self):
+        path = _RC003_ROOT / "tests" / "test_hid_elevation_windows.py"
+        text = path.read_text(encoding="utf-8")
+        self.assertIn("ShellExecuteExW", text)
+        self.assertFalse(any(pattern.search(text) for pattern in _FORBIDDEN_BRANDING_PATTERNS))
+        self.assertFalse(any(marker in text for marker in _AUTOSTART_MARKERS))
+        for marker in (
+            "runas",
+            "IsUserAnAdmin",
+            "RequireAdministrator",
+            "PrivilegesRequired=admin",
+        ):
+            self.assertNotIn(marker, text)
+
+    def test_installer_elevation_is_not_a_login_trigger_or_admin_manifest(self):
+        path = _RC003_ROOT / "installer" / "RemoteMicRC003Setup.iss"
+        effective = _remove_comment_lines(path.read_text(encoding="utf-8"), ".iss")
+        self.assertIn("ShellExec", effective)
+        self.assertIn("'runas'", effective)
+        self.assertIn("PrivilegesRequired=lowest", effective)
+        self.assertNotIn("PrivilegesRequired=admin", effective)
+        self.assertNotIn("userstartup", effective.casefold())
+
     def test_readme_is_exempt_only_for_its_documented_elevation_reason(self):
         path = _RC003_ROOT / "README.md"
         text = path.read_text(encoding="utf-8")
@@ -271,10 +336,16 @@ class BoundaryScanReplayTests(unittest.TestCase):
         self.assertFalse(any(pattern.search(text) for pattern in _FORBIDDEN_BRANDING_PATTERNS))
         self.assertFalse(any(marker in text for marker in _AUTOSTART_MARKERS))
 
-    def test_attribution_is_exempt_only_for_its_documented_elevation_reason(self):
+    def test_attribution_exemptions_are_limited_to_documented_provenance(self):
         path = _RC003_ROOT / "ATTRIBUTION.md"
         text = path.read_text(encoding="utf-8")
         self.assertTrue(any(marker in text for marker in _ELEVATION_MARKERS))
+        self.assertTrue(
+            any(
+                marker.casefold() in text.casefold()
+                for marker in _NON_ATTRIBUTION_REFERENCE_MARKERS
+            )
+        )
         self.assertFalse(any(pattern.search(text) for pattern in _FORBIDDEN_BRANDING_PATTERNS))
         self.assertFalse(any(marker in text for marker in _AUTOSTART_MARKERS))
 
@@ -306,8 +377,14 @@ class BoundaryScanReplayTests(unittest.TestCase):
                 root / ".venv" / "Lib" / "site-packages" / "something.pyd",
                 root / "dist" / "RemoteMicRC003" / "RemoteMicRC003.exe",
                 root / "dist" / "installer" / "RemoteMicRC003Setup-unsigned.exe",
+                root / "build" / "cython-stage" / "src" / "ovb_rc003" / "core.pyd",
+                root / "build" / "cython-work" / "core.obj",
                 root / "build" / "pyinstaller-work" / "RemoteMicRC003" / "warn.txt.exe",
                 root / "build" / "third_party" / "vendored.dll",
+                root / "build" / "smoke-dist-c23" / "RemoteMicRC003.exe",
+                root / "build" / "smoke-work-c23" / "analysis.pyd",
+                root / "build" / "ui-audit-c23" / "settings.png.exe",
+                root / "无线麦便携测试包-022.zip",
             ]
             for generated_path in generated_paths:
                 generated_path.parent.mkdir(parents=True, exist_ok=True)
@@ -349,6 +426,26 @@ class BoundaryScanReplayTests(unittest.TestCase):
             self.assertEqual(
                 sum("non-attribution reference" in violation for violation in violations),
                 2,
+            )
+
+    def test_exact_reference_identity_is_allowed_only_in_attribution(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            marker = _NON_ATTRIBUTION_REFERENCE_MARKERS[-1]
+            (root / "ATTRIBUTION.md").write_text(marker, encoding="utf-8")
+            (root / "notes.md").write_text(marker, encoding="utf-8")
+
+            violations, _ = _scan(root)
+
+            self.assertFalse(
+                any("ATTRIBUTION.md" in violation for violation in violations)
+            )
+            self.assertTrue(
+                any(
+                    "non-attribution reference" in violation
+                    and "notes.md" in violation
+                    for violation in violations
+                )
             )
 
 

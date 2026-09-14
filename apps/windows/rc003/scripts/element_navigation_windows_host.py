@@ -13,7 +13,7 @@ import queue
 import sys
 import threading
 import time
-from collections import deque
+from collections import Counter, deque
 from dataclasses import dataclass, replace
 from typing import Any, Callable, Optional, Sequence
 
@@ -27,7 +27,442 @@ from element_navigation_command_windows import (
 )
 
 
-def _run_windows(args: argparse.Namespace) -> int:
+class _NavigationDiagnostics:
+    """Optional, bounded metadata sink; never export UIA objects or their text."""
+
+    _NUMBERS = frozenset({
+        "scan_token", "target_hwnd", "target_pid", "foreground_hwnd",
+        "count", "all_count", "visited", "selected", "previous_selected",
+        "hierarchy_count", "elapsed_ms", "ranked_count", "candidate_count",
+        "invalid_count", "unhittable_count", "error_code", "failure_count",
+        "property_errors", "children_errors", "depth_limited",
+        "key_seq", "vk", "scan_code", "flags", "callback_result", "collection_seq",
+    })
+    _FLAGS = frozenset({"active", "scanning", "used_cache", "injected", "retry",
+                        "broad_container", "current", "intercepting"})
+    _TAGS = frozenset({"action", "direction", "outcome", "reason", "command",
+                       "error_type", "hit_source", "edge", "control_type"})
+
+    def __init__(self, sink: Optional[Callable[..., None]] = None,
+                 enabled: Optional[Callable[[], bool]] = None) -> None:
+        self._sink = sink
+        self._enabled = enabled
+        self.runtime_id = str(time.monotonic_ns())
+        self._local = threading.local()
+        self._key_seq = 0  # Only the keyboard hook thread increments this.
+        self._collection_seq = 0  # Only the UIA worker increments this.
+        self._keyboard_context = (0, 0, 0)
+
+    def enabled(self) -> bool:
+        try:
+            return self._sink is not None and (self._enabled is None or bool(self._enabled()))
+        except Exception:
+            return False
+
+    def keyboard_context(self, token: int, hwnd: int, pid: int) -> None:
+        self._keyboard_context = (token, hwnd, pid)
+
+    def begin_key(self, foreground: Callable[[], int], **fields: Any) -> Any:
+        previous = getattr(self._local, "key_fields", {})
+        if not self.enabled():
+            return previous
+        try:
+            self._key_seq += 1
+            token, hwnd, pid = self._keyboard_context
+            self._local.key_fields = dict(key_seq=self._key_seq, scan_token=token,
+                                          target_hwnd=hwnd, target_pid=pid, **fields)
+            # A scalar Win32 read only; no window text, UIA, or process query in the hook.
+            self._local.key_fields["foreground_hwnd"] = int(foreground() or 0)
+            self.emit("key_received")
+        except Exception:
+            self.emit("key_received", reason="foreground_query_failed")
+        return previous
+
+    def end_key(self, previous: Any) -> None:
+        self._local.key_fields = previous
+
+    def key_route(self, outcome: str) -> None:
+        if getattr(self._local, "key_fields", None):
+            self.emit("key_route", outcome=outcome)
+
+    def collection(self, hwnd: int):
+        self._collection_seq += 1
+        return _CollectionDiagnostics(self, self._collection_seq, self.enabled(), hwnd)
+
+    def bind_scan(self, scan_token: int) -> None:
+        self._local.scan_token = scan_token
+
+    def emit(self, stage: str, **fields: Any) -> None:
+        if self._sink is None:
+            return
+        # Preserve the pre-existing app.log lifecycle fallback before the
+        # bridge writer starts and after it stops. Detailed data still obeys
+        # the live diagnostic switch.
+        if not self.enabled() and stage not in {
+            "ready", "startup_error", "worker_error", "watcher", "cleanup"
+        }:
+            return
+        try:
+            safe = {"scan_token": getattr(self._local, "scan_token", 0)}
+            safe.update(getattr(self._local, "key_fields", {}))
+            for key, value in fields.items():
+                if key in self._NUMBERS and type(value) in (int, float):
+                    safe[key] = value
+                elif key in self._FLAGS and type(value) is bool:
+                    safe[key] = value
+                elif key in self._TAGS and type(value) is str:
+                    safe[key] = value[:96]
+            self._sink("element_navigation_" + stage,
+                       navigation_runtime_id=self.runtime_id, **safe)
+        except Exception:
+            # Diagnosis must not interrupt the hook, worker, or Qt event loop.
+            pass
+
+    def error(self, stage: str, exc: Exception, **fields: Any) -> None:
+        self.emit(stage, error_type=type(exc).__name__,
+                  error_code=getattr(exc, "winerror", None)
+                  or getattr(exc, "hresult", None), **fields)
+
+
+class _CollectionDiagnostics:
+    """Bounded aggregate of decisions already made by the real collector."""
+
+    _TYPES = frozenset((
+        "Button Calendar CheckBox ComboBox Edit Hyperlink Image ListItem List Menu "
+        "MenuBar MenuItem ProgressBar RadioButton ScrollBar Slider Spinner StatusBar "
+        "Tab TabItem Text ToolBar ToolTip Tree TreeItem Custom Group Thumb DataGrid "
+        "DataItem Document SplitButton Window Pane Header HeaderItem Table TitleBar "
+        "Separator SemanticZoom AppBar"
+    ).split())
+
+    def __init__(self, diagnostics, sequence: int, enabled: bool, hwnd: int = 0) -> None:
+        self.diagnostics, self.sequence, self.enabled = diagnostics, sequence, enabled
+        self.hwnd = hwnd
+        self.counts = Counter()
+        self.first_error = None
+
+    def record(self, reason: str, control_type: str = "") -> None:
+        if not self.enabled:
+            return
+        try:
+            kind = control_type if (control_type.endswith("Control")
+                                   and control_type[:-7] in self._TYPES) else "UnknownControl"
+            key = (kind, reason)
+            if key not in self.counts and len(self.counts) >= 127:
+                key = ("UnknownControl", "summary_limit")
+            self.counts[key] += 1
+        except Exception:
+            pass
+
+    def error(self, exc: Exception) -> None:
+        if self.enabled and self.first_error is None:
+            self.first_error = exc
+
+    def emit(self) -> None:
+        for (kind, reason), count in self.counts.items():
+            self.diagnostics.emit("collection_filter", collection_seq=self.sequence,
+                                  target_hwnd=self.hwnd, control_type=kind, reason=reason, count=count)
+        if self.first_error is not None:
+            self.diagnostics.error("target_read_error", self.first_error,
+                                   collection_seq=self.sequence, target_hwnd=self.hwnd)
+
+
+_MOUSEEVENTF_LEFTDOWN = 0x0002
+_MOUSEEVENTF_LEFTUP = 0x0004
+_MOUSEEVENTF_RIGHTDOWN = 0x0008
+_MOUSEEVENTF_RIGHTUP = 0x0010
+_MOUSEEVENTF_WHEEL = 0x0800
+_MOUSE_WHEEL_DELTA = 120
+_MOUSE_BUTTON_EVENTS = {
+    "left": (_MOUSEEVENTF_LEFTDOWN, _MOUSEEVENTF_LEFTUP),
+    "right": (_MOUSEEVENTF_RIGHTDOWN, _MOUSEEVENTF_RIGHTUP),
+}
+
+
+class MouseInputBusyError(RuntimeError):
+    """Raised when a real mouse already owns the requested button."""
+
+
+class MouseInputDeliveryError(RuntimeError):
+    """Raised when a synthetic mouse action cannot be confirmed."""
+
+
+class MouseInputCleanupIncompleteError(MouseInputDeliveryError):
+    """Raised when a mouse button may still be held after compensation."""
+
+    def __init__(self, button: str, message: str) -> None:
+        super().__init__(message)
+        self.button = button
+
+
+def _send_mouse_button_up_safely(
+    button: str,
+    *,
+    send_events: Callable[[Sequence[tuple[int, int]]], int],
+) -> None:
+    try:
+        _down_flag, up_flag = _MOUSE_BUTTON_EVENTS[button]
+    except KeyError as exc:
+        raise ValueError(f"unsupported mouse button: {button}") from exc
+    try:
+        sent = int(send_events([(up_flag, 0)]))
+    except Exception as exc:
+        raise MouseInputCleanupIncompleteError(
+            button,
+            f"mouse {button} release delivery failed",
+        ) from exc
+    if sent != 1:
+        raise MouseInputCleanupIncompleteError(
+            button,
+            f"mouse {button} release delivery was not confirmed",
+        )
+
+
+def _send_mouse_click_safely(
+    button: str,
+    *,
+    is_button_down: Callable[[str], bool],
+    send_events: Callable[[Sequence[tuple[int, int]]], int],
+) -> None:
+    try:
+        down_flag, up_flag = _MOUSE_BUTTON_EVENTS[button]
+    except KeyError as exc:
+        raise ValueError(f"unsupported mouse button: {button}") from exc
+    if is_button_down(button):
+        raise MouseInputBusyError(f"physical mouse {button} button is held")
+    events = [(down_flag, 0), (up_flag, 0)]
+    try:
+        sent = int(send_events(events))
+    except Exception as exc:
+        try:
+            _send_mouse_button_up_safely(button, send_events=send_events)
+        except MouseInputCleanupIncompleteError as cleanup_exc:
+            raise MouseInputCleanupIncompleteError(
+                button,
+                f"mouse {button} click failed and release remains unconfirmed",
+            ) from exc
+        raise MouseInputDeliveryError(f"mouse {button} click delivery failed") from exc
+    if sent == len(events):
+        return
+    if sent != 0:
+        try:
+            _send_mouse_button_up_safely(button, send_events=send_events)
+        except MouseInputCleanupIncompleteError as exc:
+            raise MouseInputCleanupIncompleteError(
+                button,
+                f"mouse {button} click delivered {sent}/{len(events)} events; "
+                "release remains unconfirmed",
+            ) from exc
+    raise MouseInputDeliveryError(
+        f"mouse {button} click delivered {sent}/{len(events)} events"
+    )
+
+
+def _move_and_click_safely(
+    point: tuple[int, int],
+    button: str,
+    *,
+    is_button_down: Callable[[str], bool],
+    pointer_move_is_blocked: Optional[Callable[[], bool]] = None,
+    move_pointer: Callable[[tuple[int, int]], bool],
+    send_events: Callable[[Sequence[tuple[int, int]]], int],
+) -> None:
+    if (pointer_move_is_blocked is not None and pointer_move_is_blocked()) or (
+        is_button_down(button)
+    ):
+        raise MouseInputBusyError(f"physical mouse {button} button is held")
+    if not move_pointer(point):
+        raise MouseInputDeliveryError("mouse pointer move failed")
+    _send_mouse_click_safely(
+        button,
+        is_button_down=is_button_down,
+        send_events=send_events,
+    )
+
+
+class _MouseInputSafetyState:
+    def __init__(self) -> None:
+        self.pending_button: Optional[str] = None
+
+    def run(
+        self,
+        action: Callable[[], None],
+        *,
+        send_events: Callable[[Sequence[tuple[int, int]]], int],
+    ) -> None:
+        self.release_pending(send_events=send_events)
+        try:
+            action()
+        except MouseInputCleanupIncompleteError as exc:
+            self.pending_button = exc.button
+            raise
+
+    def release_pending(
+        self,
+        *,
+        send_events: Callable[[Sequence[tuple[int, int]]], int],
+    ) -> None:
+        button = self.pending_button
+        if button is None:
+            return
+        _send_mouse_button_up_safely(button, send_events=send_events)
+        self.pending_button = None
+
+
+def _move_and_wheel_safely(
+    point: tuple[int, int],
+    steps: int,
+    *,
+    pointer_move_is_blocked: Callable[[], bool],
+    move_pointer: Callable[[tuple[int, int]], bool],
+    send_events: Callable[[Sequence[tuple[int, int]]], int],
+) -> None:
+    if pointer_move_is_blocked():
+        raise MouseInputBusyError("a physical mouse button is held")
+    if not move_pointer(point):
+        raise MouseInputDeliveryError("mouse pointer move failed")
+    _send_mouse_wheel_safely(steps, send_events=send_events)
+
+
+def _send_mouse_wheel_safely(
+    steps: int,
+    *,
+    send_events: Callable[[Sequence[tuple[int, int]]], int],
+) -> None:
+    if not isinstance(steps, int) or isinstance(steps, bool) or steps == 0:
+        raise ValueError("mouse wheel steps must be a non-zero integer")
+    try:
+        sent = int(
+            send_events(
+                [(_MOUSEEVENTF_WHEEL, steps * _MOUSE_WHEEL_DELTA)]
+            )
+        )
+    except Exception as exc:
+        raise MouseInputDeliveryError("mouse wheel delivery failed") from exc
+    if sent != 1:
+        raise MouseInputDeliveryError("mouse wheel delivery was not confirmed")
+
+
+def _stop_resources_best_effort(
+    resources: Sequence[tuple[str, Callable[[], None]]],
+) -> list[str]:
+    """Attempt every cleanup step and return sanitized failure markers."""
+
+    failures: list[str] = []
+    for name, stop in resources:
+        try:
+            stop()
+        except Exception as exc:
+            failures.append(f"{name}:{type(exc).__name__}")
+    return failures
+
+
+class _LocalNavigationInput:
+    """Own only Qt-delivered edges; LL-swallowed edges never reach this path."""
+
+    def __init__(self, can_claim, enqueue, diagnostics) -> None:
+        self._can_claim = can_claim
+        self._enqueue = enqueue
+        self._diagnostics = diagnostics
+        self._owned: set[int] = set()
+        self._passed: set[int] = set()
+
+    def tap(self, vk: int) -> bool:
+        action = keyboard_navigation_action(vk)
+        if action is None or not self._can_claim(vk):
+            return False
+        self._enqueue(action)
+        self._diagnostics.emit("local_input", vk=vk, action=action,
+                               reason="mapped_action", outcome="queued")
+        return True
+
+    def edge(self, vk: int, pressed: bool, repeat: bool, modified: bool) -> bool:
+        action = keyboard_navigation_action(vk)
+        if action is None:
+            return False
+        if not pressed:
+            # Qt can synthesize releases between autorepeats. Ownership lasts
+            # until the actual release, including after navigation is closed.
+            owned = vk in self._owned
+            if not repeat:
+                self._owned.discard(vk)
+                self._passed.discard(vk)
+            return owned
+        # A fresh non-repeat press also recovers from a release delivered to
+        # another window after focus moved away.
+        if not repeat:
+            self._passed.discard(vk)
+            self._owned.discard(vk)
+        if vk in self._passed:
+            return False
+        owned = vk in self._owned
+        if not owned and (modified or repeat or not self._can_claim(vk)):
+            self._passed.add(vk)
+            return False
+        self._owned.add(vk)
+        if self._can_claim(vk) and not (owned and vk in (VK_RETURN, VK_APPS, VK_ESCAPE)):
+            self._enqueue(action)
+            self._diagnostics.emit("local_input", vk=vk, action=action,
+                                   reason="qt_key", outcome="queued")
+        return True
+
+
+class EmbeddedElementNavigationRuntime:
+    """In-process control surface owned by the main desktop application."""
+
+    def __init__(
+        self,
+        enqueue_command: Callable[[int, int], None],
+        record_direction_edge: Callable[[int, int, bool, bool], bool],
+        cleanup: Callable[[], None],
+        local_input: Optional[_LocalNavigationInput] = None,
+    ) -> None:
+        self._enqueue_command = enqueue_command
+        self._record_direction_edge = record_direction_edge
+        self._cleanup = cleanup
+        self._local_input = local_input
+
+    def route_mapped_key(self, vk: int) -> bool:
+        return self._local_input is not None and self._local_input.tap(vk)
+
+    def route_local_key(self, vk: int, pressed: bool, repeat: bool, modified: bool) -> bool:
+        return self._local_input is not None and self._local_input.edge(vk, pressed, repeat, modified)
+
+    def toggle(self, target_hwnd: int = 0) -> None:
+        self._enqueue_command(
+            ELEMENT_NAVIGATION_COMMAND_TOGGLE,
+            max(0, int(target_hwnd)),
+        )
+
+    def record_rc003_direction_edge(
+        self,
+        vk: int,
+        scan_code: int,
+        extended: bool,
+        is_pressed: bool,
+    ) -> bool:
+        return bool(
+            self._record_direction_edge(
+                int(vk),
+                int(scan_code),
+                bool(extended),
+                bool(is_pressed),
+            )
+        )
+
+    def shutdown(self) -> None:
+        self._cleanup()
+
+
+def _run_windows(
+    args: argparse.Namespace,
+    *,
+    application: Any = None,
+    run_event_loop: bool = True,
+    diagnostic_sink: Optional[Callable[..., None]] = None,
+    diagnostic_enabled: Optional[Callable[[], bool]] = None,
+) -> int | EmbeddedElementNavigationRuntime:
+    diagnostics = _NavigationDiagnostics(diagnostic_sink, diagnostic_enabled)
     # uiautomation opts into legacy system-DPI awareness during import. Set
     # per-monitor v2 first so Qt and UIA agree on mixed-DPI screen coordinates.
     dpi_user32 = ctypes.windll.user32
@@ -100,6 +535,22 @@ def _run_windows(args: argparse.Namespace) -> int:
             ("header", BitmapInfoHeader),
             ("colors", wintypes.DWORD * 3),
         ]
+
+    class MouseInput(ctypes.Structure):
+        _fields_ = [
+            ("dx", ctypes.c_int32),
+            ("dy", ctypes.c_int32),
+            ("mouseData", ctypes.c_uint32),
+            ("dwFlags", ctypes.c_uint32),
+            ("time", ctypes.c_uint32),
+            ("dwExtraInfo", ctypes.c_size_t),
+        ]
+
+    class InputUnion(ctypes.Union):
+        _fields_ = [("mi", MouseInput)]
+
+    class Input(ctypes.Structure):
+        _fields_ = [("type", ctypes.c_uint32), ("union", InputUnion)]
 
     kernel32.GetCurrentThreadId.restype = wintypes.DWORD
     kernel32.GetModuleHandleW.argtypes = [wintypes.LPCWSTR]
@@ -182,13 +633,12 @@ def _run_windows(args: argparse.Namespace) -> int:
     user32.GetGUIThreadInfo.restype = wintypes.BOOL
     user32.SetCursorPos.argtypes = [ctypes.c_int, ctypes.c_int]
     user32.SetCursorPos.restype = wintypes.BOOL
-    user32.mouse_event.argtypes = [
-        wintypes.DWORD,
-        wintypes.DWORD,
-        wintypes.DWORD,
-        wintypes.DWORD,
-        ctypes.c_size_t,
+    user32.SendInput.argtypes = [
+        wintypes.UINT,
+        ctypes.POINTER(Input),
+        ctypes.c_int,
     ]
+    user32.SendInput.restype = wintypes.UINT
     user32.GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
     user32.GetClassNameW.restype = ctypes.c_int
     user32.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
@@ -294,12 +744,13 @@ def _run_windows(args: argparse.Namespace) -> int:
     child_id_self = 0
     coinit_apartment_threaded = 0x2
     rpc_e_changed_mode = ctypes.c_long(0x80010106).value
-    mouseeventf_leftdown = 0x0002
-    mouseeventf_leftup = 0x0004
-    mouseeventf_rightdown = 0x0008
-    mouseeventf_rightup = 0x0010
-    mouseeventf_wheel = 0x0800
-    wheel_delta = 120
+    mouse_button_vk_codes = {
+        "left": 0x01,
+        "right": 0x02,
+        "middle": 0x04,
+        "x1": 0x05,
+        "x2": 0x06,
+    }
     gw_owner = 4
     ga_root = 2
     gwl_exstyle = -20
@@ -369,13 +820,21 @@ def _run_windows(args: argparse.Namespace) -> int:
         section_path: tuple[int, ...] = (),
         section_rect: Optional[Rect] = None,
         precomputed_rect: Optional[Rect] = None,
+        diagnostic_collection: Optional[_CollectionDiagnostics] = None,
     ) -> Optional[RuntimeTarget]:
+        control_type = ""
+
+        def rejected(reason: str) -> None:
+            if diagnostic_collection is not None:
+                diagnostic_collection.record(reason, control_type)
+            return None
+
         try:
             control_type = str(control.ControlTypeName or "")
             standard = control_type in interactive_types
             structural = control_type in STRUCTURAL_CONTROL_TYPES
             if not standard and not structural:
-                return None
+                return rejected("unsupported_type")
             name = str(control.Name or "").strip()
             automation_id = str(control.AutomationId or "").strip()
             enabled = bool(control.IsEnabled)
@@ -386,14 +845,16 @@ def _run_windows(args: argparse.Namespace) -> int:
                 else rect_from_control(control)
             )
             valid_size = 16 <= rect.width <= 1800 and 16 <= rect.height <= 1400
-            if not (
-                enabled
-                and not offscreen
-                and valid_size
-                and not is_navigation_noise(name)
-                and rect.intersects(window_rect)
-            ):
-                return None
+            if not enabled:
+                return rejected("disabled")
+            if offscreen:
+                return rejected("offscreen")
+            if not valid_size:
+                return rejected("size_outside_limits")
+            if is_navigation_noise(name):
+                return rejected("navigation_noise")
+            if not rect.intersects(window_rect):
+                return rejected("outside_window")
             keyboard_focusable = bool(control.IsKeyboardFocusable)
             (
                 action_pattern,
@@ -442,8 +903,8 @@ def _run_windows(args: argparse.Namespace) -> int:
                 )
             )
             if not actionable:
-                return None
-            return RuntimeTarget(
+                return rejected("no_actionable_semantics")
+            target = RuntimeTarget(
                 TargetSnapshot(
                     rect=rect,
                     name=name,
@@ -461,8 +922,13 @@ def _run_windows(args: argparse.Namespace) -> int:
                 ),
                 control,
             )
-        except Exception:
-            return None
+            if diagnostic_collection is not None:
+                diagnostic_collection.record("candidate", control_type)
+            return target
+        except Exception as exc:
+            if diagnostic_collection is not None:
+                diagnostic_collection.error(exc)
+            return rejected("target_property_error")
 
     def _msaa_rect_at_point_core(point: tuple[int, int]) -> Optional[Rect]:
         initialized = False
@@ -561,23 +1027,51 @@ def _run_windows(args: argparse.Namespace) -> int:
         except queue.Empty:
             return None
 
+    def send_mouse_events(events: Sequence[tuple[int, int]]) -> int:
+        array = (Input * len(events))()
+        for index, (flags, mouse_data) in enumerate(events):
+            mouse_input = MouseInput(
+                dx=0,
+                dy=0,
+                mouseData=ctypes.c_uint32(mouse_data).value,
+                dwFlags=flags,
+                time=0,
+                dwExtraInfo=0,
+            )
+            array[index] = Input(type=0, union=InputUnion(mi=mouse_input))
+        return int(user32.SendInput(len(events), array, ctypes.sizeof(Input)))
+
+    def mouse_button_is_down(button: str) -> bool:
+        try:
+            vk_code = mouse_button_vk_codes[button]
+        except KeyError as exc:
+            raise ValueError(f"unsupported mouse button: {button}") from exc
+        return bool(user32.GetAsyncKeyState(vk_code) & 0x8000)
+
+    def pointer_move_is_blocked() -> bool:
+        return any(mouse_button_is_down(button) for button in mouse_button_vk_codes)
+
     def click_point(point: tuple[int, int], button: str = "left") -> None:
-        user32.SetCursorPos(point[0], point[1])
-        if button == "right":
-            down, up = mouseeventf_rightdown, mouseeventf_rightup
-        else:
-            down, up = mouseeventf_leftdown, mouseeventf_leftup
-        user32.mouse_event(down, 0, 0, 0, 0)
-        user32.mouse_event(up, 0, 0, 0, 0)
+        _move_and_click_safely(
+            point,
+            button,
+            is_button_down=mouse_button_is_down,
+            pointer_move_is_blocked=pointer_move_is_blocked,
+            move_pointer=lambda target: bool(
+                user32.SetCursorPos(target[0], target[1])
+            ),
+            send_events=send_mouse_events,
+        )
 
     def scroll_point(point: tuple[int, int], steps: int) -> None:
-        user32.SetCursorPos(point[0], point[1])
-        user32.mouse_event(
-            mouseeventf_wheel,
-            0,
-            0,
-            mouse_wheel_data(steps * wheel_delta),
-            0,
+        _move_and_wheel_safely(
+            point,
+            steps,
+            pointer_move_is_blocked=pointer_move_is_blocked,
+            move_pointer=lambda target: bool(
+                user32.SetCursorPos(target[0], target[1])
+            ),
+            send_events=send_mouse_events,
         )
 
     def window_class_name(hwnd: int) -> str:
@@ -909,6 +1403,7 @@ def _run_windows(args: argparse.Namespace) -> int:
 
     def normalize_runtime_targets(
         targets: Sequence[RuntimeTarget],
+        window_rect: Optional[Rect] = None,
     ) -> list[RuntimeTarget]:
         by_rect: dict[Rect, RuntimeTarget] = {}
         for target in targets:
@@ -925,10 +1420,12 @@ def _run_windows(args: argparse.Namespace) -> int:
                 by_rect[rect] = target
         normalized = list(by_rect.values())
         snapshots = [target.snapshot for target in normalized]
-        normalized = [
-            normalized[index]
-            for index in nested_container_keep_indices(snapshots)
-        ]
+        keep_indices = (
+            broad_container_keep_indices(snapshots, window_rect)
+            if window_rect is not None
+            else nested_container_keep_indices(snapshots)
+        )
+        normalized = [normalized[index] for index in keep_indices]
         normalized.sort(
             key=lambda item: (
                 item.snapshot.rect.top,
@@ -946,6 +1443,7 @@ def _run_windows(args: argparse.Namespace) -> int:
         max_relative_depth: int,
         deadline: Optional[float] = None,
         should_cancel: Optional[Callable[[], bool]] = None,
+        diagnostic_hwnd: int = 0,
     ) -> tuple[
         list[RuntimeTarget],
         dict[tuple[int, ...], str],
@@ -953,6 +1451,7 @@ def _run_windows(args: argparse.Namespace) -> int:
         int,
         bool,
     ]:
+        collection = diagnostics.collection(diagnostic_hwnd)
         pending = deque([(root, 0, root_path)])
         by_rect: dict[Rect, RuntimeTarget] = {}
         node_types: dict[tuple[int, ...], str] = {}
@@ -961,6 +1460,8 @@ def _run_windows(args: argparse.Namespace) -> int:
         elements: list[ElementSnapshot] = []
         visited = 0
         interrupted = False
+        property_errors = children_errors = depth_limited = 0
+        first_error = None
 
         while pending and visited < args.max_nodes and len(by_rect) < args.max_elements:
             if scan_should_stop(deadline, should_cancel):
@@ -968,8 +1469,10 @@ def _run_windows(args: argparse.Namespace) -> int:
                 break
             control, relative_depth, path = pending.popleft()
             visited += 1
+            control_type = ""
             try:
                 control_type = str(control.ControlTypeName or "")
+                collection.record("visited", control_type)
                 control_rect = rect_from_control(control)
                 name = str(control.Name or "").strip()
                 automation_id = str(control.AutomationId or "").strip()
@@ -1052,6 +1555,7 @@ def _run_windows(args: argparse.Namespace) -> int:
                         section_path=section_path,
                         section_rect=node_rects.get(section_path),
                         precomputed_rect=control_rect,
+                        diagnostic_collection=collection,
                     )
                     if candidate is not None:
                         rect = candidate.snapshot.rect
@@ -1065,20 +1569,33 @@ def _run_windows(args: argparse.Namespace) -> int:
                             and bool(candidate.snapshot.name)
                         ):
                             by_rect[rect] = candidate
-            except Exception:
-                pass
+                        else:
+                            collection.record("same_rect_lower_quality", control_type)
+                else:
+                    collection.record("root_not_candidate", control_type)
+            except Exception as exc:
+                property_errors += 1
+                collection.record("collection_property_error", control_type)
+                if first_error is None:
+                    first_error = exc
 
             if relative_depth >= max_relative_depth:
+                depth_limited += 1
+                collection.record("depth_limit", control_type)
                 continue
             try:
                 for child_index, child in enumerate(control.GetChildren()):
                     pending.append(
                         (child, relative_depth + 1, path + (child_index,))
                     )
-            except Exception:
+            except Exception as exc:
+                children_errors += 1
+                collection.record("children_error", control_type)
+                if first_error is None:
+                    first_error = exc
                 continue
 
-        targets = normalize_runtime_targets(list(by_rect.values()))
+        targets = normalize_runtime_targets(list(by_rect.values()), window_rect)
         for spec in repeated_content_target_specs(elements, window_rect):
             targets.append(RuntimeTarget(spec.snapshot, None, spec.click_point))
         for spec in split_button_companion_target_specs(elements, window_rect):
@@ -1101,7 +1618,19 @@ def _run_windows(args: argparse.Namespace) -> int:
                     spec.click_point,
                 )
             )
-        targets = normalize_runtime_targets(targets)[: args.max_elements]
+        targets = normalize_runtime_targets(targets, window_rect)[: args.max_elements]
+        diagnostics.emit(
+            "collection", count=len(targets), visited=visited,
+            collection_seq=collection.sequence, target_hwnd=diagnostic_hwnd,
+            property_errors=property_errors, children_errors=children_errors,
+            depth_limited=depth_limited,
+            reason="budget_or_cancel" if interrupted else "node_limit"
+            if pending and visited >= args.max_nodes else "element_limit"
+            if pending and len(by_rect) >= args.max_elements else "exhausted",
+        )
+        collection.emit()
+        if first_error is not None:
+            diagnostics.error("collection_error", first_error)
         return targets, node_types, elements, visited, interrupted
 
     def enumerate_window_targets(
@@ -1133,6 +1662,7 @@ def _run_windows(args: argparse.Namespace) -> int:
         scan_depth = effective_scan_depth(args.max_depth, has_chromium_renderer)
         root = auto.ControlFromHandle(hwnd)
         if root is None:
+            diagnostics.emit("scan_rejected", target_hwnd=hwnd, reason="uia_root_unavailable")
             raise RuntimeError("无法从当前窗口建立 UI Automation 根元素")
         window_rect = rect_from_control(root)
         window_name = str(root.Name or "未命名窗口")
@@ -1144,6 +1674,7 @@ def _run_windows(args: argparse.Namespace) -> int:
             scan_depth,
             deadline=deadline,
             should_cancel=should_cancel,
+            diagnostic_hwnd=hwnd,
         )
         surfaces = opaque_visual_surfaces(
             elements,
@@ -1172,7 +1703,9 @@ def _run_windows(args: argparse.Namespace) -> int:
                     surfaces,
                 ):
                     targets.append(RuntimeTarget(spec.snapshot, None, spec.click_point))
-                targets = normalize_runtime_targets(targets)[: args.max_elements]
+                targets = normalize_runtime_targets(targets, window_rect)[
+                    : args.max_elements
+                ]
         return (
             targets,
             node_types,
@@ -1232,7 +1765,8 @@ def _run_windows(args: argparse.Namespace) -> int:
                     deadline=deadline,
                     should_cancel=should_cancel,
                 )
-            except Exception:
+            except Exception as exc:
+                diagnostics.error("overlay_scan_error", exc, target_hwnd=overlay_hwnd)
                 continue
             if not targets:
                 root_spec = root_only_overlay_target_spec(
@@ -1346,6 +1880,13 @@ def _run_windows(args: argparse.Namespace) -> int:
                 )
                 if match >= 0:
                     candidate = existing_targets[match]
+                if broad_container_target_should_be_ignored(
+                    candidate.snapshot,
+                    window_rect,
+                    [target.snapshot for target in existing_targets],
+                ):
+                    candidate = None
+            if candidate is not None:
                 identity = candidate.snapshot.runtime_id
                 geometry = (
                     candidate.snapshot.rect,
@@ -1438,6 +1979,7 @@ def _run_windows(args: argparse.Namespace) -> int:
             "context": 1,
             "scroll_up": 2,
             "scroll_down": 2,
+            "release_mouse": 1,
             "back": 1,
             "sync_window": 1,
             "refresh_content": 1,
@@ -1475,10 +2017,12 @@ def _run_windows(args: argparse.Namespace) -> int:
         )
         _CACHE_TTL_SECONDS = 15.0
         _PREWARM_BUDGET_SECONDS = 1.5
+        _BROAD_FALLBACK_RESCAN_BUDGET_SECONDS = 0.25
         _SCROLL_BURST_SECONDS = 0.35
         _IDLE_REFRESH_POLL_SECONDS = 0.05
 
         def __init__(self, diagnostics_enabled: bool = False) -> None:
+            self._diagnostic_scan_token = 0
             self.commands: queue.Queue[tuple[str, Any, int]] = queue.Queue()
             self.events: queue.Queue[tuple[str, Any]] = queue.Queue()
             self._post_lock = threading.Lock()
@@ -1518,6 +2062,8 @@ def _run_windows(args: argparse.Namespace) -> int:
             self._scroll_cache_point: Optional[tuple[int, int]] = None
             self._scroll_cache_at = 0.0
             self._content_settle_until = 0.0
+            self._broad_fallback_rescan_token: Optional[tuple[Any, ...]] = None
+            self._mouse_input_safety = _MouseInputSafetyState()
             self.diagnostics_enabled = diagnostics_enabled
             self._double_click_seconds = max(
                 0.2, int(user32.GetDoubleClickTime()) / 1000
@@ -1562,6 +2108,7 @@ def _run_windows(args: argparse.Namespace) -> int:
                 self._empty_follow_refresh_attempts = 0
                 self._deferred_moves.clear()
                 self._refresh_cancel_requested.set()
+            self.post("release_mouse")
 
         def _finish_refresh_interrupt(self, command: str) -> None:
             if command not in self._REFRESH_INTERRUPT_COMMANDS:
@@ -1575,8 +2122,12 @@ def _run_windows(args: argparse.Namespace) -> int:
                     self._refresh_cancel_requested.clear()
 
         def stop(self) -> None:
+            if not self._thread.is_alive():
+                return
             self.post("stop")
             self._thread.join(timeout=2)
+            if self._thread.is_alive():
+                raise RuntimeError("元素导航自动化线程未能及时退出")
 
         @staticmethod
         def _same_identity(first: TargetSnapshot, second: TargetSnapshot) -> bool:
@@ -2092,6 +2643,7 @@ def _run_windows(args: argparse.Namespace) -> int:
             return True
 
         def _prewarm(self, hwnd: int, expected_generation: int) -> None:
+            diagnostics.bind_scan(0)
             if hwnd <= 0 or self._cache_is_reusable(hwnd):
                 return
             started = time.perf_counter()
@@ -2227,6 +2779,8 @@ def _run_windows(args: argparse.Namespace) -> int:
             try:
                 refreshed = self._refresh_targets(interruptible=True)
             except Exception as exc:
+                diagnostics.error("refresh_error", exc, target_hwnd=self.hwnd,
+                                  scan_token=self._diagnostic_scan_token)
                 self._background_refresh_retry_at = now + 1.0
                 self.events.put(("refresh_failed", str(exc)))
                 return
@@ -2252,11 +2806,48 @@ def _run_windows(args: argparse.Namespace) -> int:
                 ):
                     self._deferred_moves.append(direction)
 
+        def _refresh_broad_fallback(self) -> bool:
+            with self._post_lock:
+                expected_generation = self._generation
+                if not self.context_valid or not self.hwnd:
+                    return False
+            previous = self.targets[0].snapshot
+            started = time.perf_counter()
+            committed, _partial, _empty = self._enumerate(
+                self.hwnd,
+                deadline=(
+                    started + self._BROAD_FALLBACK_RESCAN_BUDGET_SECONDS
+                ),
+                allow_partial=True,
+                expected_generation=expected_generation,
+                commit_empty=False,
+            )
+            if not committed:
+                return True
+            self._apply_targets(restore=previous)
+            self._clear_hierarchy()
+            return bool(self.targets and self.selected >= 0)
+
         def _move(
             self, direction: Direction, allow_geometry_retry: bool = True
         ) -> None:
             if not self._sync_window_geometry():
+                diagnostics.emit("move", scan_token=self._diagnostic_scan_token,
+                                 direction=direction.value, outcome="context_invalid")
                 return
+            current_snapshots = [target.snapshot for target in self.targets]
+            if targets_need_broad_container_rescan(
+                current_snapshots,
+                self.window_rect,
+            ):
+                fallback_token = self._identity_token(current_snapshots[0])
+                if fallback_token != self._broad_fallback_rescan_token:
+                    self._broad_fallback_rescan_token = fallback_token
+                    if not self._refresh_broad_fallback() or not self.context_valid:
+                        diagnostics.emit("move", scan_token=self._diagnostic_scan_token,
+                                         direction=direction.value,
+                                         outcome="broad_container_refresh_unavailable")
+                        return
 
             def load_candidates() -> tuple[
                 int,
@@ -2344,6 +2935,15 @@ def _run_windows(args: argparse.Namespace) -> int:
                 outcome: str,
                 selected_index: Optional[int] = None,
             ) -> None:
+                diagnostics.emit(
+                    "move", scan_token=self._diagnostic_scan_token,
+                    target_hwnd=self.hwnd, direction=direction.value,
+                    count=len(snapshots), previous_selected=current_index,
+                    selected=selected_index, ranked_count=len(ranked),
+                    candidate_count=len(candidates), invalid_count=len(invalid_cached),
+                    unhittable_count=len(unhittable), outcome=outcome,
+                    retry=not allow_geometry_retry,
+                )
                 if not self.diagnostics_enabled:
                     return
                 diagnostic = build_navigation_diagnostic(
@@ -2426,6 +3026,9 @@ def _run_windows(args: argparse.Namespace) -> int:
             expected_generation: int,
             scan_token: int,
         ) -> None:
+            self._diagnostic_scan_token = scan_token
+            diagnostics.bind_scan(scan_token)
+            diagnostics.emit("scan_started", scan_token=scan_token, target_hwnd=hwnd)
             started = time.perf_counter()
             with self._post_lock:
                 if expected_generation != self._generation:
@@ -2466,6 +3069,7 @@ def _run_windows(args: argparse.Namespace) -> int:
                 if point is not None and self.window_rect.contains_point(point)
                 else []
             )
+            self._broad_fallback_rescan_token = None
             self._set_hierarchy(hierarchy)
             if self.hierarchy:
                 self._apply_targets(restore=self.hierarchy[0].snapshot)
@@ -2477,6 +3081,16 @@ def _run_windows(args: argparse.Namespace) -> int:
                 self._reset_hierarchy_for_selected()
             snapshots = [target.snapshot for target in self.targets]
             elapsed = time.perf_counter() - started
+            diagnostics.emit(
+                "scan_result", scan_token=scan_token, target_hwnd=hwnd,
+                target_pid=process_id, count=len(snapshots), selected=self.selected,
+                all_count=len(self.all_targets), visited=self.visited,
+                hierarchy_count=len(self.hierarchy), elapsed_ms=round(elapsed * 1000, 2),
+                used_cache=used_cache,
+                broad_container=targets_need_broad_container_rescan(snapshots, self.window_rect),
+                hit_source=self.hierarchy[0].snapshot.source if self.hierarchy else "geometry",
+                outcome="empty" if self.selected < 0 else "single" if len(snapshots) == 1 else "ready",
+            )
             self.events.put(
                 (
                     "scan_done",
@@ -2506,6 +3120,58 @@ def _run_windows(args: argparse.Namespace) -> int:
             self._request_background_refresh()
             self._emit_selection()
 
+        def _try_mouse_action(
+            self,
+            target: RuntimeTarget,
+            operation: str,
+            action: Callable[[], None],
+        ) -> bool:
+            try:
+                self._mouse_input_safety.run(
+                    action,
+                    send_events=send_mouse_events,
+                )
+            except MouseInputBusyError:
+                self.events.put(
+                    (
+                        "mouse_input_unavailable",
+                        {
+                            "target": target.snapshot,
+                            "operation": operation,
+                            "busy": True,
+                            "cleanup_pending": False,
+                        },
+                    )
+                )
+                return False
+            except MouseInputCleanupIncompleteError:
+                self.events.put(
+                    (
+                        "mouse_input_unavailable",
+                        {
+                            "target": target.snapshot,
+                            "operation": operation,
+                            "busy": False,
+                            "cleanup_pending": True,
+                        },
+                    )
+                )
+                return False
+            except MouseInputDeliveryError:
+                self.events.put(
+                    (
+                        "mouse_input_unavailable",
+                        {
+                            "target": target.snapshot,
+                            "operation": operation,
+                            "busy": False,
+                            "cleanup_pending": False,
+                        },
+                    )
+                )
+                return False
+            return True
+
         def _activate(self) -> None:
             if not self.targets or self.selected < 0:
                 return
@@ -2513,7 +3179,12 @@ def _run_windows(args: argparse.Namespace) -> int:
             target = self.targets[self.selected]
             cached_point = self._cached_pointer_point(target)
             if cached_point is not None:
-                click_point(cached_point)
+                if not self._try_mouse_action(
+                    target,
+                    "左击",
+                    lambda: click_point(cached_point),
+                ):
+                    return
                 self._remember_pointer_point(target, cached_point)
                 self.events.put(
                     (
@@ -2542,7 +3213,12 @@ def _run_windows(args: argparse.Namespace) -> int:
                 allow_rect_center=target.control is None,
             )
             if exposed and point is not None:
-                click_point(point)
+                if not self._try_mouse_action(
+                    target,
+                    "左击",
+                    lambda: click_point(point),
+                ):
+                    return
                 self._remember_pointer_point(target, point)
                 method = (
                     "MSAA coordinate click"
@@ -2590,7 +3266,12 @@ def _run_windows(args: argparse.Namespace) -> int:
             if point is None:
                 self._refresh_invalid_target(target)
                 return
-            click_point(point, button="right")
+            if not self._try_mouse_action(
+                target,
+                "右击",
+                lambda: click_point(point, button="right"),
+            ):
+                return
             self.events.put(
                 (
                     "contexted",
@@ -2624,7 +3305,12 @@ def _run_windows(args: argparse.Namespace) -> int:
                 if point is None:
                     self._refresh_invalid_target(target)
                     return
-            scroll_point(point, steps)
+            if not self._try_mouse_action(
+                target,
+                "滚动",
+                lambda: scroll_point(point, steps),
+            ):
+                return
             self._remember_scroll_point(target, point)
             self.events.put(
                 (
@@ -2696,7 +3382,11 @@ def _run_windows(args: argparse.Namespace) -> int:
             self.events.put(("exit_requested", None))
 
         def _run(self) -> None:
-            auto.InitializeUIAutomationInCurrentThread()
+            try:
+                auto.InitializeUIAutomationInCurrentThread()
+            except Exception as exc:
+                diagnostics.error("worker_error", exc, command="initialize")
+                raise
             try:
                 while True:
                     try:
@@ -2717,9 +3407,24 @@ def _run_windows(args: argparse.Namespace) -> int:
                             command in self._NAVIGATION_COMMANDS
                             and generation != current_generation
                         ):
+                            if command in {"scan", "move"}:
+                                diagnostics.emit("command_discarded", command=command,
+                                                 scan_token=int(value[1]) if command == "scan"
+                                                 else self._diagnostic_scan_token,
+                                                 reason="generation_changed")
                             continue
                         if command == "stop":
+                            self._mouse_input_safety.release_pending(
+                                send_events=send_mouse_events
+                            )
                             return
+                        if command == "release_mouse":
+                            try:
+                                self._mouse_input_safety.release_pending(
+                                    send_events=send_mouse_events
+                                )
+                            except MouseInputCleanupIncompleteError:
+                                pass
                         if command == "scan":
                             self._scan_requested.clear()
                             scan_hwnd, scan_token = value
@@ -2737,7 +3442,12 @@ def _run_windows(args: argparse.Namespace) -> int:
                             if self.targets and self.selected >= 0:
                                 self._move(direction)
                             else:
+                                diagnostics.emit("move", scan_token=self._diagnostic_scan_token,
+                                                 direction=direction.value, outcome="deferred_no_selection")
                                 self._defer_move(direction, generation)
+                        elif command == "move":
+                            diagnostics.emit("move", scan_token=self._diagnostic_scan_token,
+                                             direction=value, outcome="context_invalid")
                         elif command == "parent" and self._sync_window_geometry():
                             self._cycle_hierarchy(1)
                         elif command == "child" and self._sync_window_geometry():
@@ -2776,6 +3486,8 @@ def _run_windows(args: argparse.Namespace) -> int:
                             and len(value) == 2
                             else 0
                         )
+                        diagnostics.error("worker_error", exc, command=command,
+                                          scan_token=scan_token or self._diagnostic_scan_token)
                         self.events.put(
                             (
                                 "error",
@@ -2788,6 +3500,10 @@ def _run_windows(args: argparse.Namespace) -> int:
                         )
                     finally:
                         self._finish_refresh_interrupt(command)
+            except Exception as exc:
+                diagnostics.error("worker_error", exc, command="worker_loop",
+                                  scan_token=self._diagnostic_scan_token)
+                raise
             finally:
                 auto.UninitializeUIAutomationInCurrentThread()
 
@@ -2928,6 +3644,8 @@ def _run_windows(args: argparse.Namespace) -> int:
             )
 
         def stop(self) -> None:
+            if not self._thread.is_alive():
+                return
             if self._thread_id and self._thread.is_alive():
                 if not user32.PostThreadMessageW(
                     self._thread_id, self.WM_QUIT, 0, 0
@@ -2935,7 +3653,7 @@ def _run_windows(args: argparse.Namespace) -> int:
                     print("界面变化监听退出消息发送失败。", file=sys.stderr)
             self._thread.join(timeout=3)
             if self._thread.is_alive():
-                print("界面变化监听未能及时退出。", file=sys.stderr)
+                raise RuntimeError("界面变化监听未能及时退出")
 
         def _handle(
             self,
@@ -2997,6 +3715,7 @@ def _run_windows(args: argparse.Namespace) -> int:
         WM_SYSKEYUP = 0x0105
         WM_QUIT = 0x0012
         LLKHF_INJECTED = 0x10
+        LLKHF_EXTENDED = 0x01
         VK_CONTROL = 0x11
         VK_MENU = 0x12
 
@@ -3047,8 +3766,8 @@ def _run_windows(args: argparse.Namespace) -> int:
             self._callback = None
             self._thread_id = 0
             self._ready = threading.Event()
-            self._down: set[int] = set()
-            self._swallowed: set[int] = set()
+            self._down: set[tuple[int, bool]] = set()
+            self._swallowed: set[tuple[int, bool]] = set()
             self._passthrough: set[int] = set()
             self._direction_input_ownership = DirectionInputOwnership()
             self._thread = threading.Thread(
@@ -3057,20 +3776,76 @@ def _run_windows(args: argparse.Namespace) -> int:
                 daemon=True,
             )
 
+        def record_device_direction_edge(
+            self,
+            vk: int,
+            scan_code: int,
+            extended: bool,
+            is_pressed: bool,
+        ) -> bool:
+            if not self._intercepting.is_set():
+                return False
+            return self._direction_input_ownership.record_device_edge(
+                vk,
+                scan_code,
+                extended,
+                is_pressed,
+            )
+
+        def reset_device_direction_edges(self) -> None:
+            self._direction_input_ownership.reset_device_edges()
+
         def start(self) -> None:
             self._thread.start()
             if not self._ready.wait(3) or not self._hook:
                 raise RuntimeError("无法安装全局键盘钩子")
 
         def stop(self) -> None:
+            if not self._thread.is_alive():
+                return
             if self._thread_id:
                 user32.PostThreadMessageW(self._thread_id, self.WM_QUIT, 0, 0)
             self._thread.join(timeout=2)
+            if self._thread.is_alive():
+                raise RuntimeError("全局键盘钩子未能及时退出")
 
         def _pressed(self, vk: int) -> bool:
             return bool(user32.GetAsyncKeyState(vk) & 0x8000)
 
+        def _seed_passthrough(self) -> None:
+            self._passthrough.update(
+                vk for vk in range(1, 256) if self._pressed(vk)
+            )
+
         def _handle(self, code: int, wparam: int, lparam: int) -> int:
+            # Observe only navigation keys. Preserve the original callback's
+            # return value and exception behavior, including every early exit.
+            if code < 0 or int(wparam) not in (
+                self.WM_KEYDOWN, self.WM_SYSKEYDOWN, self.WM_KEYUP, self.WM_SYSKEYUP
+            ) or not diagnostics.enabled():
+                return self._route_key(code, wparam, lparam)
+            data = ctypes.cast(lparam, ctypes.POINTER(self._struct)).contents
+            action = keyboard_navigation_action(int(data.vkCode))
+            if action is None:
+                return self._route_key(code, wparam, lparam)
+            previous = diagnostics.begin_key(
+                user32.GetForegroundWindow, action=action, vk=int(data.vkCode),
+                scan_code=int(data.scanCode), flags=int(data.flags),
+                edge="down" if int(wparam) in (self.WM_KEYDOWN, self.WM_SYSKEYDOWN) else "up",
+                injected=bool(data.flags & self.LLKHF_INJECTED),
+                active=self._active.is_set(), intercepting=self._intercepting.is_set(),
+            )
+            try:
+                result = self._route_key(code, wparam, lparam)
+                diagnostics.emit("key_finished", callback_result=int(result))
+                return result
+            except Exception as exc:
+                diagnostics.error("key_error", exc)
+                raise
+            finally:
+                diagnostics.end_key(previous)
+
+        def _route_key(self, code: int, wparam: int, lparam: int) -> int:
             if code < 0:
                 return user32.CallNextHookEx(self._hook, code, wparam, lparam)
             message = int(wparam)
@@ -3082,11 +3857,12 @@ def _run_windows(args: argparse.Namespace) -> int:
             data = ctypes.cast(lparam, ctypes.POINTER(self._struct)).contents
             vk = int(data.vkCode)
             injected = bool(data.flags & self.LLKHF_INJECTED)
-            was_down = vk in self._down
+            ownership_key = (vk, injected)
+            was_down = ownership_key in self._down
             if is_down:
-                self._down.add(vk)
+                self._down.add(ownership_key)
             else:
-                self._down.discard(vk)
+                self._down.discard(ownership_key)
 
             if (
                 is_up
@@ -3099,25 +3875,41 @@ def _run_windows(args: argparse.Namespace) -> int:
                         is_down=False,
                         is_up=True,
                         injected=False,
+                        scan_code=int(data.scanCode),
+                        extended=bool(data.flags & self.LLKHF_EXTENDED),
                         call_next=lambda: user32.CallNextHookEx(
                             self._hook, code, wparam, lparam
                         ),
                     )
                 )
                 self._passthrough.discard(vk)
-                self._swallowed.discard(vk)
+                self._swallowed.discard((vk, False))
+                diagnostics.key_route("forwarded_release")
                 return downstream_result or 1
 
-            if vk in self._passthrough:
+            if not injected and vk in self._passthrough:
                 if is_up:
                     self._passthrough.discard(vk)
+                diagnostics.key_route("held_before_navigation")
                 return user32.CallNextHookEx(
                     self._hook, code, wparam, lparam
                 )
 
-            if is_up and vk in self._swallowed:
-                self._swallowed.discard(vk)
+            if is_up and ownership_key in self._swallowed:
+                self._swallowed.discard(ownership_key)
+                diagnostics.key_route("owned_release")
                 return 1
+
+            # A key-up is ours only when this hook previously swallowed or
+            # forwarded the matching key-down. The hook can start while a key
+            # is already held, so claiming an otherwise unowned key-up would
+            # leave the foreground application believing the key is stuck.
+            if is_up:
+                if keyboard_navigation_action(vk) is not None:
+                    diagnostics.key_route("unowned_release")
+                return user32.CallNextHookEx(
+                    self._hook, code, wparam, lparam
+                )
 
             ctrl_alt = self._pressed(self.VK_CONTROL) and self._pressed(self.VK_MENU)
             hotkey_action = global_hotkey_action(
@@ -3125,7 +3917,7 @@ def _run_windows(args: argparse.Namespace) -> int:
                 include_developer_actions=self._include_developer_hotkeys,
             )
             if is_down and ctrl_alt and hotkey_action is not None:
-                self._swallowed.add(vk)
+                self._swallowed.add(ownership_key)
                 if not was_down:
                     self._on_action(hotkey_action)
                 return 1
@@ -3135,7 +3927,9 @@ def _run_windows(args: argparse.Namespace) -> int:
                 if self._active.is_set() and should_pass_through_native_menu(
                     vk, native_menu_mode_active()
                 ):
-                    if is_down:
+                    diagnostics.emit("key_route", action=action, injected=injected,
+                                     outcome="native_menu_passthrough")
+                    if is_down and not injected:
                         self._passthrough.add(vk)
                     return user32.CallNextHookEx(
                         self._hook, code, wparam, lparam
@@ -3146,34 +3940,51 @@ def _run_windows(args: argparse.Namespace) -> int:
                         is_down=is_down,
                         is_up=is_up,
                         injected=injected,
+                        scan_code=int(data.scanCode),
+                        extended=bool(data.flags & self.LLKHF_EXTENDED),
                         call_next=lambda: user32.CallNextHookEx(
                             self._hook, code, wparam, lparam
                         ),
                     )
                 )
                 if downstream_owned:
+                    diagnostics.emit("key_route", action=action, injected=injected,
+                                     outcome="device_edge_owned")
                     return downstream_result or 1
-                self._swallowed.add(vk)
-                if is_down and (vk in self._down):
+                self._swallowed.add(ownership_key)
+                if is_down:
                     if vk in (VK_RETURN, VK_APPS, VK_ESCAPE) and was_down:
+                        diagnostics.key_route("action_repeat_suppressed")
                         return 1
+                    diagnostics.emit("key_route", action=action, injected=injected,
+                                     outcome="queued")
                     self._on_action(action)
                 return 1
 
-            if is_down and action is not None:
+            if is_down and not injected and action is not None:
                 self._passthrough.add(vk)
+            if action is not None:
+                diagnostics.emit("key_route", action=action, injected=injected,
+                                 outcome="navigation_inactive")
             return user32.CallNextHookEx(self._hook, code, wparam, lparam)
 
         def _run(self) -> None:
             self._thread_id = int(kernel32.GetCurrentThreadId())
+            message = wintypes.MSG()
+            user32.PeekMessageW(
+                ctypes.byref(message), None, 0, 0, pm_noremove
+            )
             self._callback = self._proc_type(self._handle)
             self._hook = user32.SetWindowsHookExW(
                 self.WH_KEYBOARD_LL, self._callback, kernel32.GetModuleHandleW(None), 0
             )
+            if self._hook:
+                # A foreground application already owns keys held before the
+                # hook starts. Keep their repeats and release downstream.
+                self._seed_passthrough()
             self._ready.set()
             if not self._hook:
                 return
-            message = wintypes.MSG()
             while user32.GetMessageW(ctypes.byref(message), None, 0, 0) > 0:
                 user32.TranslateMessage(ctypes.byref(message))
                 user32.DispatchMessageW(ctypes.byref(message))
@@ -3218,12 +4029,14 @@ def _run_windows(args: argparse.Namespace) -> int:
         finally:
             auto.UninitializeUIAutomationInCurrentThread()
 
-    app = QApplication(sys.argv[:1])
-    app.setApplicationName("元素导航")
+    app = application or QApplication.instance() or QApplication(sys.argv[:1])
+    if not isinstance(app, QApplication):
+        raise RuntimeError("元素导航必须由 QApplication 主进程承载")
+    if application is None:
+        app.setApplicationName("元素导航")
     prototype_process_id = int(kernel32.GetCurrentProcessId())
     overlay = NavigationOverlay()
     worker = AutomationWorker(diagnostics_enabled=bool(args.diagnostics))
-    worker.start()
     keyboard_events: queue.Queue[tuple[str, int]] = queue.Queue()
     active = threading.Event()
     intercepting = threading.Event()
@@ -3247,6 +4060,20 @@ def _run_windows(args: argparse.Namespace) -> int:
     def enqueue_keyboard_action(action: str) -> None:
         keyboard_events.put((action, 0))
 
+    def can_claim_local_key(vk: int) -> bool:
+        # The global hook remains the only receiver for external hosts. The
+        # local path is restricted to the exact scanned in-process window.
+        return bool(
+            not shutting_down
+            and intercepting.is_set()
+            and navigation_root_hwnd > 0
+            and navigation_process_id == prototype_process_id
+            and native_handle_value(user32.GetForegroundWindow()) == navigation_root_hwnd
+            and not should_pass_through_native_menu(vk, native_menu_mode_active())
+        )
+
+    local_input = _LocalNavigationInput(can_claim_local_key, enqueue_keyboard_action, diagnostics)
+
     def enqueue_external_command(command: int, target_hwnd: int) -> None:
         if command == ELEMENT_NAVIGATION_COMMAND_TOGGLE:
             keyboard_events.put(("toggle", max(0, int(target_hwnd))))
@@ -3259,30 +4086,25 @@ def _run_windows(args: argparse.Namespace) -> int:
         intercepting,
         include_developer_hotkeys=include_developer_hotkeys,
     )
-    hook.start()
     structure_watcher = StructureChangeWatcher()
-    if not structure_watcher.start():
-        print(
-            "界面变化监听未完整启用，将按缓存时限兜底刷新。",
-            file=sys.stderr,
-        )
-    command_server = ElementNavigationCommandServer(enqueue_external_command)
-    try:
-        command_server.start()
-    except Exception:
-        hook.stop()
-        structure_watcher.stop()
-        worker.stop()
-        raise
+    command_server = None
+
+    cleanup_callback: list[Callable[[], None]] = [lambda: None]
 
     def leave_navigation() -> None:
         nonlocal navigation_root_hwnd, navigation_process_id
         nonlocal navigation_overlay_signature, navigation_overlay_checked_at
         nonlocal scanning, current_scan_token
+        if active.is_set() or scanning:
+            diagnostics.emit("leave", scan_token=scan_token_counter,
+                             target_hwnd=navigation_root_hwnd,
+                             active=active.is_set(), scanning=scanning)
         active.clear()
         intercepting.clear()
+        hook.reset_device_direction_edges()
         scanning = False
         current_scan_token = 0
+        diagnostics.keyboard_context(0, 0, 0)
         worker.deactivate()
         overlay.clear_target()
         navigation_root_hwnd = 0
@@ -3296,7 +4118,10 @@ def _run_windows(args: argparse.Namespace) -> int:
             return
         shutting_down = True
         leave_navigation()
-        app.quit()
+        if run_event_loop:
+            app.quit()
+        else:
+            cleanup_callback[0]()
 
     def refresh_navigation_overlay_signature(*, force: bool = False) -> bool:
         nonlocal navigation_overlay_signature, navigation_overlay_checked_at
@@ -3337,6 +4162,9 @@ def _run_windows(args: argparse.Namespace) -> int:
             refresh_navigation_overlay_signature(force=True)
             foreground_action = navigation_action_for_foreground(foreground)
         if foreground_action == "leave":
+            diagnostics.emit("pause", reason="foreground_changed",
+                             target_hwnd=navigation_root_hwnd, foreground_hwnd=foreground,
+                             scan_token=scan_token_counter)
             print("导航已暂停: 已切换到其它窗口，请重新按 Ctrl+Alt+N。")
             leave_navigation()
             return False
@@ -3348,6 +4176,9 @@ def _run_windows(args: argparse.Namespace) -> int:
         nonlocal scanning, navigation_root_hwnd, navigation_process_id
         nonlocal navigation_overlay_signature, navigation_overlay_checked_at
         nonlocal diagnostics_enabled, scan_token_counter, current_scan_token
+        diagnostics.emit("action", action=action, target_hwnd=target_hwnd,
+                         active=active.is_set(), scanning=scanning,
+                         scan_token=scan_token_counter)
         if action == "quit":
             request_quit()
         elif action == "toggle_diagnostics":
@@ -3366,6 +4197,7 @@ def _run_windows(args: argparse.Namespace) -> int:
                     target_hwnd or user32.GetForegroundWindow()
                 )
                 if hwnd <= 0:
+                    diagnostics.emit("scan_rejected", reason="no_foreground_window")
                     print("没有可扫描的前台窗口。")
                     return
                 navigation_root_hwnd = hwnd
@@ -3377,6 +4209,9 @@ def _run_windows(args: argparse.Namespace) -> int:
                 navigation_overlay_checked_at = time.perf_counter()
                 scan_token_counter += 1
                 current_scan_token = scan_token_counter
+                diagnostics.keyboard_context(current_scan_token, hwnd, navigation_process_id)
+                diagnostics.emit("scan_requested", scan_token=current_scan_token,
+                                 target_hwnd=hwnd, target_pid=navigation_process_id)
                 scanning = True
                 intercepting.set()
                 print("正在扫描当前窗口...")
@@ -3398,6 +4233,9 @@ def _run_windows(args: argparse.Namespace) -> int:
         elif action in {direction.value for direction in Direction} and active.is_set():
             if prepare_navigation_action():
                 worker.post("move", action)
+        elif action in {direction.value for direction in Direction}:
+            diagnostics.emit("action_ignored", action=action, scan_token=scan_token_counter,
+                             reason="scanning" if scanning else "inactive")
 
     def drain_events() -> None:
         nonlocal scanning, current_scan_token
@@ -3414,11 +4252,14 @@ def _run_windows(args: argparse.Namespace) -> int:
             except queue.Empty:
                 break
             if event == "scan_done":
-                if not scan_event_is_current(
+                current = scan_event_is_current(
                     int(payload.get("scan_token", 0)),
                     current_scan_token,
                     scanning,
-                ):
+                )
+                diagnostics.emit("scan_applied", scan_token=int(payload.get("scan_token", 0)),
+                                 current=current, outcome="applied" if current else "stale")
+                if not current:
                     continue
                 scanning = False
                 current_scan_token = 0
@@ -3442,6 +4283,7 @@ def _run_windows(args: argparse.Namespace) -> int:
                         payload["hierarchy_count"],
                     )
             elif event == "scan_cancelled":
+                diagnostics.emit("scan_cancelled", scan_token=int(payload.get("scan_token", 0)))
                 if not scan_event_is_current(
                     int(payload.get("scan_token", 0)),
                     current_scan_token,
@@ -3491,6 +4333,24 @@ def _run_windows(args: argparse.Namespace) -> int:
                     QTimer.singleShot(
                         refresh_delay, lambda: worker.post("refresh_content")
                     )
+            elif event == "mouse_input_unavailable":
+                target = payload["target"]
+                if payload["busy"]:
+                    print(
+                        f"未执行{payload['operation']}: 实体鼠标按键正在使用 "
+                        f"({target.name or target.control_type})"
+                    )
+                elif payload.get("cleanup_pending"):
+                    print(
+                        f"未执行{payload['operation']}: 鼠标按键松开未确认，"
+                        "已暂停后续鼠标操作 "
+                        f"({target.name or target.control_type})"
+                    )
+                else:
+                    print(
+                        f"未执行{payload['operation']}: 鼠标操作未能确认送达 "
+                        f"({target.name or target.control_type})"
+                    )
             elif event == "exit_requested":
                 leave_navigation()
             elif event == "geometry_synced":
@@ -3527,6 +4387,8 @@ def _run_windows(args: argparse.Namespace) -> int:
                         payload["hierarchy_count"],
                     )
             elif event == "navigation_invalidated":
+                diagnostics.emit("pause", scan_token=scan_token_counter,
+                                 reason="context_invalidated")
                 print(f"导航已暂停: {payload}，请重新按 Ctrl+Alt+N。")
                 leave_navigation()
             elif event == "prewarm_done":
@@ -3564,7 +4426,6 @@ def _run_windows(args: argparse.Namespace) -> int:
 
     timer = QTimer()
     timer.timeout.connect(drain_events)
-    timer.start(20)
 
     def monitor_navigation_context() -> None:
         nonlocal prewarm_observed_hwnd, prewarm_observed_at, prewarm_requested_hwnd
@@ -3600,6 +4461,9 @@ def _run_windows(args: argparse.Namespace) -> int:
         if foreground_action == "ignore":
             return
         if foreground_action == "leave":
+            diagnostics.emit("pause", reason="foreground_changed",
+                             target_hwnd=navigation_root_hwnd, foreground_hwnd=foreground,
+                             scan_token=scan_token_counter)
             print("导航已暂停: 已切换到其它窗口，请重新按 Ctrl+Alt+N。")
             leave_navigation()
             return
@@ -3610,7 +4474,6 @@ def _run_windows(args: argparse.Namespace) -> int:
 
     geometry_timer = QTimer()
     geometry_timer.timeout.connect(monitor_navigation_context)
-    geometry_timer.start(250)
 
     owner_timer = QTimer()
 
@@ -3620,7 +4483,6 @@ def _run_windows(args: argparse.Namespace) -> int:
 
     if managed_companion and owner_pid > 0:
         owner_timer.timeout.connect(monitor_owner_process)
-        owner_timer.start(500)
 
     cleanup_complete = False
 
@@ -3628,20 +4490,69 @@ def _run_windows(args: argparse.Namespace) -> int:
         nonlocal cleanup_complete
         if cleanup_complete:
             return
-        cleanup_complete = True
-        command_server.stop()
-        hook.stop()
-        structure_watcher.stop()
-        worker.stop()
-
-    app.aboutToQuit.connect(cleanup)
-    if managed_companion and owner_pid > 0:
-        QTimer.singleShot(0, monitor_owner_process)
-    if bool(getattr(args, "activate", False)):
-        enqueue_external_command(
-            ELEMENT_NAVIGATION_COMMAND_TOGGLE,
-            int(getattr(args, "window_handle", 0) or 0),
+        resources = [
+            # Stop intercepting first. Even if the hook thread itself cannot
+            # exit, it must immediately pass physical keys through to Windows.
+            ("deactivate", leave_navigation),
+            ("event_timer", timer.stop),
+            ("geometry_timer", geometry_timer.stop),
+            ("owner_timer", owner_timer.stop),
+        ]
+        if command_server is not None:
+            resources.append(("command_server", command_server.stop))
+        resources.extend(
+            (
+                ("keyboard_hook", hook.stop),
+                ("structure_watcher", structure_watcher.stop),
+                ("automation_worker", worker.stop),
+                ("overlay", overlay.clear_target),
+            )
         )
+        failures = _stop_resources_best_effort(resources)
+        diagnostics.emit("cleanup", outcome="failed" if failures else "stopped",
+                         failure_count=len(failures))
+        if failures:
+            raise RuntimeError(
+                "元素导航未能完整退出：" + ",".join(failures)
+            )
+        cleanup_complete = True
+
+    cleanup_callback[0] = cleanup
+
+    try:
+        app.aboutToQuit.connect(cleanup)
+        worker.start()
+        hook.start()
+        if not structure_watcher.start():
+            diagnostics.emit("watcher", outcome="polling_fallback")
+            print(
+                "界面变化监听未完整启用，将按缓存时限兜底刷新。",
+                file=sys.stderr,
+            )
+        if run_event_loop:
+            command_server = ElementNavigationCommandServer(enqueue_external_command)
+            command_server.start()
+        timer.start(20)
+        geometry_timer.start(250)
+        if managed_companion and owner_pid > 0:
+            owner_timer.start(500)
+            QTimer.singleShot(0, monitor_owner_process)
+        if bool(getattr(args, "activate", False)):
+            enqueue_external_command(
+                ELEMENT_NAVIGATION_COMMAND_TOGGLE,
+                int(getattr(args, "window_handle", 0) or 0),
+            )
+    except Exception as startup_error:
+        diagnostics.error("startup_error", startup_error)
+        try:
+            cleanup()
+        except Exception as cleanup_error:
+            raise RuntimeError(
+                "元素导航启动失败且未能完整清理："
+                f"{type(cleanup_error).__name__}"
+            ) from startup_error
+        raise
+    diagnostics.emit("ready")
     print("元素导航已启动。")
     controls = (
         "Ctrl+Alt+N 开始/退出，方向键移动，PageUp/PageDown 切换父子元素，"
@@ -3652,10 +4563,17 @@ def _run_windows(args: argparse.Namespace) -> int:
     print(controls)
     if diagnostics_enabled:
         print("导航诊断已开启。每次方向移动都会解释候选排序。")
+    if not run_event_loop:
+        return EmbeddedElementNavigationRuntime(
+            enqueue_external_command,
+            hook.record_device_direction_edge,
+            cleanup,
+            local_input,
+        )
     try:
         return int(app.exec())
     finally:
         cleanup()
 
 
-__all__ = ("_run_windows",)
+__all__ = ("EmbeddedElementNavigationRuntime", "_run_windows")

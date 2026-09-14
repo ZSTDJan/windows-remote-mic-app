@@ -40,9 +40,15 @@ class DefaultConfigPrivacyTests(unittest.TestCase):
             "lctrl+lwin",
         )
         self.assertEqual(
-            defaults["voice_hotkeys_by_provider"]["windows_dictation"]["hold"],
-            "win+h",
+            defaults["voice_hotkeys_by_provider"]["doubao_ime"]["hold"],
+            "ralt",
         )
+        self.assertNotIn(
+            "windows_dictation",
+            defaults["voice_hotkeys_by_provider"],
+        )
+        for entry in defaults["voice_hotkeys_by_provider"].values():
+            self.assertEqual(entry["source"], config.VOICE_HOTKEY_SOURCE_DEFAULT)
         self.assertEqual(defaults["schema_version"], config.SCHEMA_VERSION)
         self.assertEqual(
             defaults["voice_program"]["launch_elevated_by_provider"],
@@ -50,9 +56,11 @@ class DefaultConfigPrivacyTests(unittest.TestCase):
         )
         self.assertEqual(defaults["gain_db"], 10.0)
         self.assertFalse(defaults["launch_bridge_on_app_start"])
+        self.assertFalse(defaults["diagnostic_trace_enabled"])
         self.assertEqual(
             defaults["close_behavior"], config.CLOSE_BEHAVIOR_HIDE_TO_TRAY
         )
+        self.assertEqual(defaults["hid_helper_setup_prompted_offer_id"], "")
 
     def test_default_config_contains_no_forbidden_identity_fields(self):
         defaults = config.default_config()
@@ -93,6 +101,139 @@ class DefaultConfigPrivacyTests(unittest.TestCase):
         self.assertEqual(
             loaded["close_behavior"], config.CLOSE_BEHAVIOR_HIDE_TO_TRAY
         )
+
+    def test_legacy_hide_to_tray_choice_is_preserved(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "close_behavior": config.CLOSE_BEHAVIOR_HIDE_TO_TRAY,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            loaded = config.load_config(path)
+
+        self.assertEqual(
+            loaded["close_behavior"], config.CLOSE_BEHAVIOR_HIDE_TO_TRAY
+        )
+
+    def test_existing_quit_choice_is_preserved(self):
+        for schema_version in (1, config.SCHEMA_VERSION):
+            with self.subTest(schema_version=schema_version), tempfile.TemporaryDirectory() as tmp:
+                path = Path(tmp) / "config.json"
+                path.write_text(
+                    json.dumps(
+                        {
+                            "schema_version": schema_version,
+                            "close_behavior": config.CLOSE_BEHAVIOR_QUIT,
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                loaded = config.load_config(path)
+
+            self.assertEqual(
+                loaded["close_behavior"], config.CLOSE_BEHAVIOR_QUIT
+            )
+
+    def test_current_explicit_hide_to_tray_choice_is_preserved(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": config.SCHEMA_VERSION,
+                        "close_behavior": config.CLOSE_BEHAVIOR_HIDE_TO_TRAY,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            loaded = config.load_config(path)
+
+        self.assertEqual(
+            loaded["close_behavior"], config.CLOSE_BEHAVIOR_HIDE_TO_TRAY
+        )
+
+    def test_legacy_hid_helper_prompt_state_migrates_to_offer_id(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": config.SCHEMA_VERSION,
+                        "hid_helper_setup_prompted": True,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            loaded = config.load_config(path)
+            config.save_config(path, loaded)
+            persisted = json.loads(path.read_text(encoding="utf-8"))
+
+        self.assertEqual(
+            loaded["hid_helper_setup_prompted_offer_id"],
+            "legacy-generation:1",
+        )
+        self.assertEqual(
+            persisted["hid_helper_setup_prompted_offer_id"],
+            "legacy-generation:1",
+        )
+        self.assertNotIn("hid_helper_setup_prompted", persisted)
+        self.assertNotIn("hid_helper_setup_prompted_generation", persisted)
+
+    def test_legacy_hid_helper_prompt_generation_migrates_to_offer_id(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": config.SCHEMA_VERSION,
+                        "hid_helper_setup_prompted_generation": 2,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            loaded = config.load_config(path)
+
+        self.assertEqual(
+            loaded["hid_helper_setup_prompted_offer_id"],
+            "legacy-generation:2",
+        )
+
+    def test_invalid_hid_helper_prompt_generation_falls_back_to_empty_offer(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": config.SCHEMA_VERSION,
+                        "hid_helper_setup_prompted_generation": True,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            loaded = config.load_config(path)
+
+        self.assertEqual(loaded["hid_helper_setup_prompted_offer_id"], "")
+
+    def test_invalid_hid_helper_offer_id_falls_back_to_empty(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": config.SCHEMA_VERSION,
+                        "hid_helper_setup_prompted_offer_id": "x" * 129,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            loaded = config.load_config(path)
+
+        self.assertEqual(loaded["hid_helper_setup_prompted_offer_id"], "")
 
     def test_load_preserves_an_existing_right_alt_hold_shortcut(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -152,6 +293,10 @@ class DefaultConfigPrivacyTests(unittest.TestCase):
             loaded["voice_hotkeys_by_provider"]["sogou"]["hold"],
             "rctrl",
         )
+        self.assertEqual(
+            loaded["voice_hotkeys_by_provider"]["wetype"]["source"],
+            config.VOICE_HOTKEY_SOURCE_MANUAL,
+        )
 
     def test_switching_provider_uses_its_own_remembered_shortcut(self):
         data = config.default_config()
@@ -168,6 +313,80 @@ class DefaultConfigPrivacyTests(unittest.TestCase):
 
         self.assertEqual(data["voice_hotkey"], "lctrl+lshift+f7")
         self.assertEqual(data["voice_hotkeys"], {"hold": "lctrl+lshift+f7"})
+
+    def test_manual_and_auto_provider_sources_are_preserved(self):
+        data = config.default_config()
+        config.set_voice_hotkey_for_provider(
+            data,
+            "wetype",
+            "lctrl+lshift+f9",
+            source=config.VOICE_HOTKEY_SOURCE_MANUAL,
+        )
+        config.set_voice_hotkey_for_provider(
+            data,
+            "sogou",
+            "lctrl+lshift+f7",
+            source=config.VOICE_HOTKEY_SOURCE_AUTO,
+        )
+        config.set_voice_hotkey_for_provider(data, "wetype", "ralt")
+
+        self.assertEqual(
+            config.voice_hotkey_source_for_provider(data, "wetype"),
+            config.VOICE_HOTKEY_SOURCE_MANUAL,
+        )
+        self.assertEqual(
+            config.voice_hotkey_source_for_provider(data, "sogou"),
+            config.VOICE_HOTKEY_SOURCE_AUTO,
+        )
+
+    def test_empty_manual_shortcut_is_kept_empty_but_loses_manual_priority(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.json"
+            data = config.default_config()
+            data["voice_program"] = {"provider": "wetype"}
+            config.set_voice_hotkey_for_provider(
+                data,
+                "wetype",
+                "",
+                source=config.VOICE_HOTKEY_SOURCE_MANUAL,
+            )
+
+            config.save_config(path, data)
+            loaded = config.load_config(path)
+
+        self.assertEqual(loaded["voice_hotkey"], "")
+        self.assertEqual(
+            loaded["voice_hotkeys_by_provider"]["wetype"],
+            {"hold": "", "source": config.VOICE_HOTKEY_SOURCE_DEFAULT},
+        )
+        self.assertEqual(
+            config.voice_hotkey_source_for_provider(loaded, "wetype"),
+            config.VOICE_HOTKEY_SOURCE_DEFAULT,
+        )
+
+    def test_removed_windows_dictation_selection_migrates_to_none(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 12,
+                        "voice_program": {"provider": "windows_dictation"},
+                        "voice_hotkey": "win+h",
+                        "voice_hotkeys": {"hold": "win+h"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            loaded = config.load_config(path)
+            config.save_config(path, loaded)
+            persisted = json.loads(path.read_text(encoding="utf-8"))
+
+        self.assertEqual(loaded["voice_program"]["provider"], "none")
+        self.assertTrue(loaded[config.RUNTIME_REMOVED_WINDOWS_DICTATION_KEY])
+        self.assertEqual(persisted["voice_program"]["provider"], "none")
+        self.assertNotIn(config.RUNTIME_REMOVED_WINDOWS_DICTATION_KEY, persisted)
 
     def test_provider_scoped_wetype_native_ctrl_win_is_not_legacy_repaired(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -523,9 +742,11 @@ class RoundTripTests(unittest.TestCase):
             path = Path(tmp) / "config.json"
             original = config.default_config()
             original["gain_db"] = 3.5
+            original["diagnostic_trace_enabled"] = True
             config.save_config(path, original)
             loaded = config.load_config(path)
             self.assertEqual(loaded["gain_db"], 3.5)
+            self.assertTrue(loaded["diagnostic_trace_enabled"])
 
     def test_save_removes_the_retired_release_finish_setting(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -6,6 +6,8 @@ import OvbRc003Settings 1.0
 
 Item {
     id: root
+    signal openDeviceRequested()
+    signal openButtonsRequested()
     property var tokens
     property var backTabTarget: null
     property var tabTarget: null
@@ -13,24 +15,43 @@ Item {
     readonly property var lastFocusItem: trySpeakingButton
     property bool voiceHotkeyRecording: false
     property string voiceHotkeyCaptureError: ""
-    readonly property int settingsStateColumnWidth: 54
-    readonly property int settingsActionColumnWidth: 84
+    property string pendingVoiceHotkey: ""
+    readonly property int settingsStateColumnWidth: 96
+    readonly property int settingsActionColumnWidth: tokens.buttonWidth6Chars
     readonly property real voiceHotkeyEditorWidth:
-        Math.max(130, endpointCombo.width / 2)
+        Math.max(
+            130,
+            endpointCombo.width / 2 - tokens.buttonWidth4Chars - tokens.spacingSmall
+        )
 
     readonly property bool voiceProgramManaged:
         SettingsController.voiceProgramManaged
-    readonly property bool voiceProgramSystemManaged:
-        SettingsController.voiceProgramSystemManaged
-    readonly property bool windowsDictationSelected:
-        SettingsController.voiceProgramWindowsDictationSelected
+    readonly property bool voiceProgramLaunchable:
+        SettingsController.voiceProgramLaunchable
     readonly property bool sogouSelected:
         SettingsController.voiceProgramSogouSelected
     readonly property bool wetypeSelected:
         SettingsController.voiceProgramWeTypeSelected
+    readonly property bool doubaoSelected:
+        SettingsController.voiceProgramDoubaoSelected
     readonly property bool customProgramSelected:
         SettingsController.voiceProgramCustomSelected
     readonly property bool voiceHotkeyBusy: SettingsController.voiceHotkeyBusy
+    readonly property bool voiceHotkeyRefreshVisible:
+        root.sogouSelected || root.wetypeSelected || root.doubaoSelected
+    readonly property bool voiceHotkeyRuntimeBusy:
+        String(SettingsController.voiceRuntimeState) === "active"
+        || String(SettingsController.voiceRuntimeState) === "mic_confirmed"
+        || String(SettingsController.voiceRuntimeState) === "receiving_audio"
+        || String(SettingsController.voiceRuntimeState) === "finishing"
+    readonly property bool voiceHotkeyRefreshEnabled:
+        root.voiceHotkeyRefreshVisible
+        && !root.voiceHotkeyBusy
+        && !SettingsController.settingsSaveBusy
+        && !root.configurationWriteBusy
+        && !root.voiceHotkeyRecording
+        && !SettingsController.inputCaptureInUse
+        && !root.voiceHotkeyRuntimeBusy
     readonly property bool endpointPreflightBusy:
         SettingsController.endpointPreflightBusy
     readonly property bool configurationWriteBusy:
@@ -38,29 +59,43 @@ Item {
         || DiagnosticsController.vbCableTestRunning
         || SettingsController.bridgeLaunchBusy
         || root.endpointPreflightBusy
-    readonly property bool voiceProgramPrivilegeUnknown:
-        !voiceProgramSystemManaged
-        && SettingsController.voiceProgramStatusCode === "running"
-        && SettingsController.voiceProgramElevationStatus === "unknown"
     readonly property bool voiceProgramPrivilegeMismatch:
-        !voiceProgramSystemManaged
+        voiceProgramLaunchable
         && SettingsController.voiceProgramStatusCode === "running"
         && SettingsController.voiceProgramElevationStatus !== "unknown"
         && SettingsController.voiceProgramLaunchElevated
             !== (SettingsController.voiceProgramElevationStatus === "elevated")
-    readonly property bool voiceProgramNeedsAttention:
-        voiceProgramPrivilegeUnknown || voiceProgramPrivilegeMismatch
-        || SettingsController.voiceProgramStatusCode === "running_not_ready"
     readonly property color voiceProgramStateColor:
-        voiceProgramSystemManaged
-            && (SettingsController.voiceProgramStatusCode === "running"
-                || SettingsController.voiceProgramStatusCode === "stopped")
-            ? tokens.successColor
+        SettingsController.voiceProgramSettingsDirty
+            ? tokens.voiceAccent
             : SettingsController.voiceProgramStatusCode === "running"
-                ? (voiceProgramNeedsAttention
+                ? (voiceProgramPrivilegeMismatch
                     ? tokens.voiceAccent : tokens.successColor)
-                : SettingsController.voiceProgramStatusCode === "disabled"
-                    ? tokens.accent : tokens.voiceAccent
+                : SettingsController.voiceProgramStatusCode === "not_found"
+                    ? tokens.errorColor : tokens.disabledText
+
+    function voiceProgramStateText() {
+        if (SettingsController.voiceProgramSettingsDirty)
+            return qsTr("正在保存")
+        const code = String(SettingsController.voiceProgramStatusCode)
+        if (!root.voiceProgramManaged)
+            return qsTr("不管理")
+        if (code === "running") {
+            if (root.voiceProgramPrivilegeMismatch)
+                return qsTr("退出后点“重新检测”")
+            return qsTr("运行中")
+        }
+        if (code === "stopped")
+            return qsTr("已安装")
+        if (code === "not_found") {
+            if (root.customProgramSelected)
+                return qsTr("点击“选择”")
+            if (root.sogouSelected)
+                return qsTr("点击“去安装”")
+            return qsTr("点击“打开设置”")
+        }
+        return qsTr("正在检查")
+    }
 
     function checkResult(checkId) {
         const rows = DiagnosticsController.checkResults
@@ -73,24 +108,31 @@ Item {
 
     function checkState(checkId) {
         if (DiagnosticsController.isRefreshing)
-            return qsTr("检查中")
+            return qsTr("正在检查")
         const row = checkResult(checkId)
         if (!row)
             return qsTr("未检查")
         if (row.status === "pass")
             return qsTr("正常")
         if (row.status === "manual")
-            return qsTr("待实测")
-        return qsTr("需处理")
+            return qsTr("请手动验证")
+        if (checkId === "vb_cable_endpoints")
+            return String(row.detail || "").indexOf(qsTr("缺少")) >= 0
+                ? qsTr("点击“安装音频”") : qsTr("点击“重新检查”")
+        if (checkId === "output_endpoint")
+            return qsTr("请重新选择端点")
+        return qsTr("点击“重新检查”")
     }
 
     function checkColor(checkId) {
         const state = checkState(checkId)
         if (state === qsTr("正常"))
             return tokens.successColor
-        if (state === qsTr("需处理"))
+        if (state === qsTr("点击“安装音频”")
+                || state === qsTr("点击“重新检查”")
+                || state === qsTr("请重新选择端点"))
             return tokens.errorColor
-        if (state === qsTr("检查中") || state === qsTr("待实测"))
+        if (state === qsTr("正在检查") || state === qsTr("请手动验证"))
             return tokens.voiceAccent
         return tokens.disabledText
     }
@@ -101,90 +143,26 @@ Item {
             ? String(row.detail).trim().replace(/[。；;]+$/, "") : fallback
     }
 
-    function voiceProgramStatusSummary() {
-        const code = SettingsController.voiceProgramStatusCode
-        if (!voiceProgramManaged)
-            return qsTr("不管理")
-        if (windowsDictationSelected)
-            return qsTr("Windows 内置")
-        if (voiceProgramSystemManaged) {
-            if (code === "running" || code === "stopped")
-                return qsTr("已识别 · 系统管理")
-            if (code === "not_found")
-                return qsTr("未找到程序")
-            return qsTr("需检查")
-        }
-        if (code === "running") {
-            const privilege = SettingsController.voiceProgramElevationStatus
-            if (privilege === "unknown")
-                return qsTr("运行中 · 权限未知")
-            const elevated = privilege === "elevated"
-            if (SettingsController.voiceProgramLaunchElevated !== elevated) {
-                return SettingsController.voiceProgramLaunchElevated
-                    ? qsTr("需重启为管理员") : qsTr("需重启为普通权限")
-            }
-            return elevated ? qsTr("管理员运行中") : qsTr("普通权限运行中")
-        }
-        if (code === "running_not_ready")
-            return qsTr("运行中 · 窗口未就绪")
-        if (code === "stopped")
-            return SettingsController.bridgeRunning
-                && SettingsController.voiceProgramSettingsDirty
-                ? qsTr("已修改 · 待应用") : qsTr("已找到 · 待启动")
-        if (code === "not_found")
-            return customProgramSelected
-                && SettingsController.voiceProgramCustomPath.length === 0
-                ? qsTr("请选择程序") : qsTr("未找到程序")
-        return qsTr("需检查")
-    }
-
-    function voiceProgramLaunchDescription() {
-        const code = SettingsController.voiceProgramStatusCode
-        if (!voiceProgramManaged)
-            return qsTr("只发送语音快捷键，不启动程序")
-        if (windowsDictationSelected)
-            return qsTr("使用 Windows 听写与联机语音识别")
-        if (sogouSelected && code !== "not_found") {
-            return voiceProgramStatusSummary()
-                + qsTr("；设置：在任务栏（含隐藏图标）右键搜狗语音图标")
-        }
-        if (voiceProgramNeedsAttention
-                || code === "not_found"
-                || code === "stopped") {
-            return voiceProgramStatusSummary()
-        }
-        if (voiceProgramSystemManaged)
-            return qsTr("由 Windows 管理，无需本程序启动")
-        return qsTr("随遥控器服务启动；失败不影响服务")
-    }
-
-    function voiceHotkeyDescription() {
-        if (sogouSelected)
-            return qsTr("自动读取并同步搜狗当前的按住说快捷键")
-        if (wetypeSelected)
-            return qsTr("按程序记忆；请在微信输入法设置中保持一致")
-        if (windowsDictationSelected)
-            return qsTr("Windows 语音输入固定使用 Win+H")
-        return qsTr("仅在%1中按程序记忆")
-            .arg(SettingsController.applicationDisplayName)
-    }
-
     function startVoiceHotkeyCapture() {
-        if (windowsDictationSelected)
-            return
         if (voiceHotkeyRecording) {
-            stopVoiceHotkeyCapture()
+            stopVoiceHotkeyCapture("capture_field_tapped")
             return
         }
         voiceHotkeyCaptureError = ""
+        pendingVoiceHotkey = ""
+        if (!SettingsController.startHotkeyCapture()) {
+            voiceHotkeyCaptureError = qsTr("无法开始录入，请结束其它按键操作后重试")
+            return
+        }
         voiceHotkeyRecording = true
-        SettingsController.startHotkeyCapture()
         voiceHotkeyField.forceActiveFocus()
     }
 
-    function stopVoiceHotkeyCapture() {
+    function stopVoiceHotkeyCapture(reason) {
+        pendingVoiceHotkey = ""
         if (!voiceHotkeyRecording)
             return true
+        SettingsController.reportHotkeyCaptureUiStop(reason || "unknown")
         if (!SettingsController.stopHotkeyCapture()) {
             voiceHotkeyCaptureError = qsTr("无法停止快捷键录入，请重试")
             return false
@@ -195,8 +173,30 @@ Item {
     }
 
     function settleInputUiAfterStop() {
-        if (!SettingsController.hotkeyCaptureActive)
+        if (!SettingsController.hotkeyCaptureActive) {
             voiceHotkeyRecording = false
+            pendingVoiceHotkey = ""
+        }
+    }
+
+    function finishCapturedVoiceHotkey(chord) {
+        pendingVoiceHotkey = chord
+        if (!SettingsController.stopHotkeyCapture()) {
+            pendingVoiceHotkey = ""
+            voiceHotkeyCaptureError = qsTr("无法停止快捷键录入，请重试")
+            return
+        }
+        if (!SettingsController.hotkeyCaptureActive)
+            commitCapturedVoiceHotkey()
+    }
+
+    function commitCapturedVoiceHotkey() {
+        if (pendingVoiceHotkey.length === 0)
+            return
+        const chord = pendingVoiceHotkey
+        pendingVoiceHotkey = ""
+        voiceHotkeyRecording = false
+        SettingsController.holdVoiceHotkeyText = chord
     }
 
     FileDialog {
@@ -209,95 +209,51 @@ Item {
         onAccepted: SettingsController.voiceProgramCustomPath = selectedFile
     }
 
-    Dialog {
+    SettingsDialog {
         id: driverConfirmDialog
+        tokens: root.tokens
+        preferredWidth: 390
         objectName: "driverConfirmDialog"
         title: qsTr("安装虚拟音频？")
         modal: true
-        anchors.centerIn: parent
         standardButtons: Dialog.Ok | Dialog.Cancel
         onAccepted: DiagnosticsController.launchVbCableSetup()
 
-        UiLabel {
+        contentItem: UiLabel {
             tokens: root.tokens
             kind: bodyKind
-            width: 360
             wrapMode: Text.WordWrap
-            text: qsTr("将启动 VB-Audio 官方 VB-CABLE 安装程序并请求管理员权限。完成安装后需要重启电脑，再回到这里点击“应用”。")
+            text: qsTr("将启动 VB-Audio 官方 VB-CABLE 安装程序并请求管理员权限。完成安装后需要重启电脑，再回到这里点击“选推荐端点”。")
         }
     }
 
-    Dialog {
+    SettingsDialog {
         id: bridgeTestConfirmDialog
+        tokens: root.tokens
+        preferredWidth: 390
         objectName: "bridgeTestConfirmDialog"
         title: qsTr("临时停止遥控器服务？")
         modal: true
-        anchors.centerIn: parent
         standardButtons: Dialog.Ok | Dialog.Cancel
         onAccepted: DiagnosticsController.testVbCableChannelWithBridgeRestart()
 
-        UiLabel {
+        contentItem: UiLabel {
             tokens: root.tokens
             kind: bodyKind
-            width: 360
             wrapMode: Text.WordWrap
-            text: qsTr("声音通道测试不能和真实语音同时运行。继续后会临时停止遥控器服务，测试结束再自动恢复。")
+            text: qsTr("检查虚拟声卡时会发送一小段测试音，并临时停止遥控器服务，结束后自动恢复。此检查不测试语音识别，平时说话不用先点它。")
         }
     }
 
-    Dialog {
+    SettingsDialog {
         id: speakTestDialog
         objectName: "speakTestDialog"
-        modal: true
-        popupType: Popup.Item
-        anchors.centerIn: parent
-        width: Math.min(480, root.width - 36)
-        height: Math.min(300, root.height - 28)
-        readonly property string headerText: qsTr("实际说话")
-        title: headerText
-        standardButtons: Dialog.NoButton
-        leftPadding: 16
-        rightPadding: 16
-        topPadding: 0
-        bottomPadding: 14
-        leftInset: 0
-        rightInset: 0
-        topInset: 0
-        bottomInset: 0
-        closePolicy: Popup.CloseOnEscape
+        tokens: root.tokens
+        preferredWidth: 480
+        height: Math.min(300, parent.height - 32)
+        title: qsTr("试说一句")
+        closeButtonObjectName: "speakTestCloseButton"
         onOpened: Qt.callLater(function() { speakTestInput.forceActiveFocus() })
-
-        background: Rectangle {
-            radius: tokens.cornerRadiusLarge
-            color: tokens.surface
-            border.width: tokens.hairlineWidth
-            border.color: tokens.border
-        }
-
-        header: Item {
-            width: speakTestDialog.width
-            implicitHeight: 42
-
-            UiLabel {
-                anchors.left: parent.left
-                anchors.leftMargin: 16
-                anchors.verticalCenter: parent.verticalCenter
-                tokens: root.tokens
-                kind: sectionTitleKind
-                text: speakTestDialog.headerText
-                font.pixelSize: tokens.fontSizeTitle
-                font.weight: Font.Medium
-            }
-
-            DialogCloseButton {
-                objectName: "speakTestCloseButton"
-                tokens: root.tokens
-                anchors.right: parent.right
-                anchors.rightMargin: 8
-                anchors.verticalCenter: parent.verticalCenter
-                onCloseRequested: speakTestDialog.close()
-            }
-        }
 
         contentItem: ColumnLayout {
             spacing: tokens.spacingSmall
@@ -316,6 +272,15 @@ Item {
                 elide: Text.ElideRight
             }
 
+            UiLabel {
+                objectName: "actualSpeechInstruction"
+                tokens: root.tokens
+                kind: noteKind
+                Layout.fillWidth: true
+                wrapMode: Text.WordWrap
+                text: qsTr("点击输入框，按住遥控器话筒键说话，松开后看文字有没有进来。")
+            }
+
             ScrollView {
                 id: speakTestInputFrame
                 objectName: "speakTestInputFrame"
@@ -325,7 +290,7 @@ Item {
                 TextArea {
                     id: speakTestInput
                     objectName: "speakTestInput"
-                    placeholderText: qsTr("识别出的文字会直接输入到这里")
+                    placeholderText: qsTr("看看说的话有没有变成文字")
                     wrapMode: TextEdit.Wrap
                     selectByMouse: true
                     font.family: tokens.fontFamily
@@ -364,37 +329,32 @@ Item {
         function onHotkeyCaptured(chord) {
             if (!root.voiceHotkeyRecording)
                 return
-            SettingsController.holdVoiceHotkeyText = chord
-            root.stopVoiceHotkeyCapture()
+            root.finishCapturedVoiceHotkey(chord)
         }
         function onHotkeyCaptureError(message) {
-            if (!root.voiceHotkeyRecording)
-                return
+            root.pendingVoiceHotkey = ""
+            if (!SettingsController.hotkeyCaptureActive)
+                root.voiceHotkeyRecording = false
             root.voiceHotkeyCaptureError = message
         }
         function onHotkeyCaptureActiveChanged() {
             if (root.voiceHotkeyRecording
                     && !SettingsController.hotkeyCaptureActive) {
-                root.voiceHotkeyRecording = false
+                if (root.pendingVoiceHotkey.length > 0)
+                    root.commitCapturedVoiceHotkey()
+                else
+                    root.voiceHotkeyRecording = false
             }
         }
-    }
-
-    Timer {
-        objectName: "voiceProgramStatusRefreshTimer"
-        interval: 5000
-        repeat: true
-        running: root.visible && root.voiceProgramManaged
-        onTriggered: SettingsController.refreshVoiceProgramStatus()
     }
 
     onVisibleChanged: {
         if (visible) {
             SettingsController.refreshVoiceProgramStatus()
             SettingsController.refreshVoiceProgramOptions()
-            SettingsController.refreshVoiceHotkeyFromProvider()
+            SettingsController.loadVoiceHotkeyFromProvider()
         } else {
-            stopVoiceHotkeyCapture()
+            stopVoiceHotkeyCapture("page_hidden")
         }
     }
 
@@ -446,11 +406,17 @@ Item {
                                     qsTr("检测并选择 CABLE Input")
                                 )
                     stateText: DiagnosticsController.driverErrorMessage.length > 0
-                        ? qsTr("需处理")
+                        ? qsTr("点击“安装音频”")
                         : DiagnosticsController.driverStatusMessage.length > 0
                             ? qsTr("正常")
                             : DiagnosticsController.driverInfoMessage.length > 0
-                                ? qsTr("待完成")
+                                ? (DiagnosticsController.driverInfoMessage.indexOf(
+                                    qsTr("正在")) >= 0
+                                    ? qsTr("正在处理")
+                                    : DiagnosticsController.driverInfoMessage.indexOf(
+                                        qsTr("重启电脑")) >= 0
+                                        ? qsTr("请重启电脑")
+                                        : qsTr("点击“安装音频”"))
                                 : root.checkState("vb_cable_endpoints")
                     stateColor: DiagnosticsController.driverErrorMessage.length > 0
                         ? tokens.errorColor
@@ -466,7 +432,7 @@ Item {
                             objectName: "installVirtualAudioButton"
                             tokens: root.tokens
                             Layout.fillWidth: true
-                            text: qsTr("安装虚拟音频")
+                            text: qsTr("安装音频")
                             enabled: !root.configurationWriteBusy
                                 && !root.voiceHotkeyBusy
                             onClicked: driverConfirmDialog.open()
@@ -477,11 +443,16 @@ Item {
                         objectName: "applyVirtualAudioButton"
                         tokens: root.tokens
                         Layout.fillWidth: true
-                        text: qsTr("应用")
+                        text: qsTr("选推荐端点")
                         highlighted: true
+                        visible: SettingsController.recommendedEndpointIndex >= 0
+                            && SettingsController.selectedEndpointIndex
+                                !== SettingsController.recommendedEndpointIndex
                         enabled: !root.configurationWriteBusy
                             && !root.voiceHotkeyBusy
-                        onClicked: DiagnosticsController.selectDetectedCableInputAsOutput()
+                        onClicked: SettingsController.selectAndPersistOutputEndpointIndex(
+                            SettingsController.recommendedEndpointIndex
+                        )
                     }
                 }
 
@@ -552,9 +523,7 @@ Item {
                     actionColumnWidth: root.settingsActionColumnWidth
                     titleText: qsTr("选择程序")
                     descriptionText: ""
-                    stateText: SettingsController.voiceProgramSettingsDirty
-                        ? qsTr("待保存")
-                        : root.voiceProgramManaged ? qsTr("已保存") : qsTr("不管理")
+                    stateText: root.voiceProgramStateText()
                     stateColor: root.voiceProgramStateColor
 
                     editorData: [
@@ -563,35 +532,51 @@ Item {
                             objectName: "voiceProgramCombo"
                             tokens: root.tokens
                             Layout.fillWidth: true
-                            Layout.minimumWidth: 180
+                            Layout.minimumWidth: 130
                             model: SettingsController.voiceProgramOptions
                             currentIndex: SettingsController.selectedVoiceProgramIndex
                             enabled: !root.voiceHotkeyBusy
                                 && !root.configurationWriteBusy
                             onActivated: SettingsController.selectedVoiceProgramIndex = index
                             Accessible.name: qsTr("语音程序")
+                        },
+                        CheckBox {
+                            id: voiceProgramElevatedCheckBox
+                            objectName: "voiceProgramElevatedCheckBox"
+                            visible: !root.voiceProgramManaged
+                                || root.voiceProgramLaunchable
+                            implicitHeight: tokens.controlHeight
+                            Layout.preferredWidth: root.settingsActionColumnWidth
+                            Layout.minimumWidth: root.settingsActionColumnWidth
+                            Layout.maximumWidth: root.settingsActionColumnWidth
+                            leftPadding: 0
+                            rightPadding: 0
+                            spacing: tokens.spacingSmall
+                            indicator.width: 16
+                            indicator.height: 16
+                            enabled: root.voiceProgramManaged
+                                && !root.voiceHotkeyBusy
+                                && !root.configurationWriteBusy
+                            text: qsTr("管理员启动")
+                            font.family: tokens.fontFamily
+                            font.pixelSize: tokens.fontSizeSmall
+                            checked: SettingsController.voiceProgramLaunchElevated
+                            onClicked: SettingsController.voiceProgramLaunchElevated = checked
                         }
                     ]
-                    CheckBox {
-                        id: voiceProgramElevatedCheckBox
-                        objectName: "voiceProgramElevatedCheckBox"
-                        visible: !root.windowsDictationSelected
-                            && !root.voiceProgramSystemManaged
-                        implicitHeight: tokens.controlHeight
+                    CompactButton {
+                        objectName: "openVoiceProgramSettingsButton"
+                        visible: root.wetypeSelected
+                            || root.doubaoSelected
+                            || (root.sogouSelected
+                                && SettingsController.voiceProgramStatusCode === "not_found")
+                        tokens: root.tokens
                         Layout.fillWidth: true
-                        leftPadding: 0
-                        rightPadding: 0
-                        spacing: tokens.spacingSmall
-                        indicator.width: 16
-                        indicator.height: 16
-                        enabled: root.voiceProgramManaged
-                            && !root.voiceHotkeyBusy
-                            && !root.configurationWriteBusy
-                        text: qsTr("管理员启动")
-                        font.family: tokens.fontFamily
-                        font.pixelSize: tokens.fontSizeSmall
-                        checked: SettingsController.voiceProgramLaunchElevated
-                        onClicked: SettingsController.voiceProgramLaunchElevated = checked
+                        text: root.sogouSelected
+                            && SettingsController.voiceProgramStatusCode === "not_found"
+                            ? qsTr("去安装") : qsTr("打开设置")
+                        enabled: !root.voiceHotkeyBusy
+                        onClicked: SettingsController.openVoiceProgramSettings()
                     }
                 }
 
@@ -630,84 +615,122 @@ Item {
                 InlineSettingsRow {
                     objectName: "voiceHotkeyRow"
                     tokens: root.tokens
+                    showDivider: false
                     editorColumnWidth: root.voiceHotkeyEditorWidth
                     stateColumnWidth: root.settingsStateColumnWidth
                     actionColumnWidth: root.settingsActionColumnWidth
                     titleText: qsTr("语音按键")
                     descriptionText: root.voiceHotkeyCaptureError.length > 0
                         ? root.voiceHotkeyCaptureError
-                        : root.voiceHotkeyDescription()
+                        : root.wetypeSelected
+                        ? qsTr("点击刷新会打开微信设置读取，也可手动录入")
+                        : root.doubaoSelected
+                        ? qsTr("自动读取豆包输入法的按住型快捷键，也可手动录入")
+                        : root.sogouSelected
+                        ? qsTr("自动读取搜狗语音的按住型快捷键，也可手动录入")
+                        : qsTr("仅支持录入“按住型”快捷键")
                     stateText: root.voiceHotkeyRecording
-                        ? qsTr("录入中")
-                        : root.voiceHotkeyBusy ? qsTr("处理中") : qsTr("已保存")
+                        ? SettingsController.hotkeyCaptureReady
+                            ? qsTr("录入中") : qsTr("准备中")
+                        : root.voiceHotkeyBusy ? qsTr("正在处理")
+                            : root.voiceHotkeyCaptureError.length > 0
+                                || SettingsController.voiceHotkeySaveState === "retry"
+                                ? qsTr("点击手动录入")
+                                : SettingsController.voiceHotkeySource === "manual"
+                                    ? qsTr("手动录入")
+                                    : SettingsController.voiceHotkeySource === "auto"
+                                        ? qsTr("自动识别") : qsTr("已保存")
                     stateColor: root.voiceHotkeyRecording || root.voiceHotkeyBusy
-                        ? tokens.voiceAccent : tokens.successColor
+                        ? tokens.voiceAccent
+                        : root.voiceHotkeyCaptureError.length > 0
+                            || SettingsController.voiceHotkeySaveState === "retry"
+                            ? tokens.errorColor : tokens.successColor
 
                     editorData: [
-                        CompactTextField {
-                            id: voiceHotkeyField
-                            objectName: "holdVoiceHotkeyField"
-                            tokens: root.tokens
+                        Item {
                             Layout.fillWidth: true
-                            readOnly: true
-                            enabled: !root.voiceHotkeyBusy
-                                && !root.windowsDictationSelected
-                                && !root.configurationWriteBusy
-                            text: root.voiceHotkeyRecording
-                                ? qsTr("请按快捷键")
-                                : SettingsController.holdVoiceHotkeyText
-                            color: root.voiceHotkeyRecording
-                                ? tokens.accent : tokens.textPrimary
-                            placeholderText: qsTr("点击录入")
-                            Accessible.name: qsTr("语音按键，点击后直接录入")
-                            Keys.onEscapePressed: root.stopVoiceHotkeyCapture()
-                            onActiveFocusChanged: {
-                                if (!activeFocus && root.voiceHotkeyRecording)
-                                    root.stopVoiceHotkeyCapture()
+                            Layout.minimumWidth: 130
+                            implicitHeight: tokens.controlHeight
+
+                            CompactTextField {
+                                id: voiceHotkeyField
+                                objectName: "holdVoiceHotkeyField"
+                                anchors.fill: parent
+                                tokens: root.tokens
+                                rightPadding: root.voiceHotkeyRefreshVisible ? 34 : 7
+                                readOnly: true
+                                background.visible: root.voiceHotkeyRecording
+                                    || SettingsController.voiceHotkeySource === "manual"
+                                    || SettingsController.voiceHotkeySaveState === "processing"
+                                rightInset: root.voiceHotkeyRefreshVisible
+                                    ? refreshVoiceHotkeyButton.width + tokens.spacingTiny : 0
+                                activeFocusOnPress: root.voiceHotkeyRecording
+                                activeFocusOnTab: root.voiceHotkeyRecording
+                                selectByMouse: false
+                                enabled: !root.voiceHotkeyBusy
+                                    && !root.configurationWriteBusy
+                                text: root.voiceHotkeyRecording
+                                    ? SettingsController.hotkeyCaptureReady
+                                        ? qsTr("请按快捷键") : qsTr("正在准备…")
+                                    : SettingsController.holdVoiceHotkeyText
+                                color: root.voiceHotkeyRecording
+                                    ? tokens.accent : tokens.textPrimary
+                                placeholderText: qsTr("尚未录入")
+                                Accessible.name: qsTr("语音按键，仅支持录入按住型快捷键")
+                                Keys.onEscapePressed: root.stopVoiceHotkeyCapture(
+                                    "escape_pressed")
+                                onActiveFocusChanged: {
+                                    if (!activeFocus && root.voiceHotkeyRecording)
+                                        root.stopVoiceHotkeyCapture("focus_lost")
+                                }
                             }
-                            TapHandler {
-                                enabled: !root.windowsDictationSelected
-                                onTapped: root.startVoiceHotkeyCapture()
+                            CompactButton {
+                                id: refreshVoiceHotkeyButton
+                                objectName: "refreshVoiceHotkeyButton"
+                                visible: root.voiceHotkeyRefreshVisible
+                                anchors.right: parent.right
+                                anchors.verticalCenter: parent.verticalCenter
+                                width: 28
+                                height: parent.height
+                                tokens: root.tokens
+                                flat: true
+                                enabled: root.voiceHotkeyRefreshEnabled
+                                Accessible.name: qsTr("重新读取语音按键")
+                                onClicked: SettingsController.refreshVoiceHotkeyFromProvider()
+                                contentItem: IconGlyph {
+                                    tokens: root.tokens
+                                    glyph: "\uE72C"
+                                    glyphSize: 14
+                                    color: !refreshVoiceHotkeyButton.enabled
+                                        ? tokens.disabledText
+                                        : refreshVoiceHotkeyButton.hovered
+                                            ? tokens.accent : tokens.textSecondary
+                                }
+                                HoverHandler { id: refreshVoiceHotkeyHover }
+                                CompactToolTip {
+                                    tokens: root.tokens
+                                    active: refreshVoiceHotkeyHover.hovered
+                                    text: root.wetypeSelected
+                                        ? qsTr("打开微信设置并读取按住说话快捷键；失败保留原值")
+                                        : qsTr("重新读取输入法当前的按住型快捷键")
+                                }
                             }
-                        },
-                        CompactButton {
-                            objectName: "useWindowsDictationHotkeyButton"
-                            visible: root.windowsDictationSelected
-                            tokens: root.tokens
-                            compactMinimumWidth: tokens.buttonWidth4Chars
-                            text: qsTr("Win+H")
-                            enabled: !root.voiceHotkeyBusy
-                                && !root.configurationWriteBusy
-                            onClicked: SettingsController.useWindowsDictationHotkey()
                         }
                     ]
                     CompactButton {
-                        objectName: "openVoiceProgramSettingsButton"
-                        visible: root.wetypeSelected
-                            || root.windowsDictationSelected
-                            || (root.sogouSelected
-                                && SettingsController.voiceProgramStatusCode === "not_found")
+                        id: recordVoiceHotkeyButton
+                        objectName: "recordVoiceHotkeyButton"
                         tokens: root.tokens
                         Layout.fillWidth: true
-                        text: root.sogouSelected
-                            && SettingsController.voiceProgramStatusCode === "not_found"
-                            ? qsTr("去安装") : qsTr("打开设置")
+                        compactMinimumWidth: tokens.buttonWidth4Chars
+                        text: root.voiceHotkeyRecording
+                            ? qsTr("停止") : qsTr("手动录入")
                         enabled: !root.voiceHotkeyBusy
-                        onClicked: SettingsController.openVoiceProgramSettings()
+                            && !root.configurationWriteBusy
+                        onClicked: root.startVoiceHotkeyCapture()
                     }
                 }
 
-                InlineSettingsRow {
-                    objectName: "voiceProgramSpecificRow"
-                    tokens: root.tokens
-                    stateColumnWidth: root.settingsStateColumnWidth
-                    actionColumnWidth: root.settingsActionColumnWidth
-                    titleText: root.windowsDictationSelected
-                        ? qsTr("系统设置") : qsTr("程序启动")
-                    descriptionObjectName: "voiceProgramLaunchText"
-                    descriptionText: root.voiceProgramLaunchDescription()
-                    showDivider: false
-                }
             }
 
             SectionFrame {
@@ -730,18 +753,22 @@ Item {
                     stateColumnWidth: root.settingsStateColumnWidth
                     actionColumnWidth: root.settingsActionColumnWidth
                     editorColumnVisible: DiagnosticsController.vbCableBridgeRecoveryNeeded
-                    titleText: qsTr("声音通道")
+                    titleText: qsTr("虚拟声卡")
                     descriptionText: DiagnosticsController.vbCableTestMessage.length > 0
                         ? DiagnosticsController.vbCableTestMessage
-                        : qsTr("测试 CABLE Input → CABLE Output")
+                        : qsTr("检查声音能否通过虚拟声卡；不测试语音识别")
                     descriptionObjectName: "soundChannelTestDescription"
-                    stateText: DiagnosticsController.vbCableTestRunning
+                    stateText: DiagnosticsController.vbCableBridgeRecoveryNeeded
+                        ? qsTr("点击“启动服务”")
+                        : DiagnosticsController.vbCableTestRunning
                         ? qsTr("测试中")
                         : DiagnosticsController.vbCableTestStatus === "pass"
                             ? qsTr("正常")
                             : DiagnosticsController.vbCableTestStatus === "fail"
-                                ? qsTr("未通过") : qsTr("未测试")
-                    stateColor: DiagnosticsController.vbCableTestRunning
+                                ? qsTr("检查未通过") : qsTr("按需检查")
+                    stateColor: DiagnosticsController.vbCableBridgeRecoveryNeeded
+                        ? tokens.errorColor
+                        : DiagnosticsController.vbCableTestRunning
                         ? tokens.voiceAccent
                         : DiagnosticsController.vbCableTestStatus === "pass"
                             ? tokens.successColor
@@ -766,7 +793,7 @@ Item {
                         tokens: root.tokens
                         Layout.fillWidth: true
                         text: DiagnosticsController.vbCableTestRunning
-                            ? qsTr("测试中…") : qsTr("测试通道")
+                            ? qsTr("检查中…") : qsTr("检查虚拟声卡")
                         enabled: !DiagnosticsController.isRefreshing
                             && !root.configurationWriteBusy
                             && !root.voiceHotkeyBusy
@@ -781,13 +808,10 @@ Item {
                     tokens: root.tokens
                     stateColumnWidth: root.settingsStateColumnWidth
                     actionColumnWidth: root.settingsActionColumnWidth
-                    titleText: qsTr("实际说话")
-                    descriptionText: qsTr("在输入框中验证语音文字")
+                    titleText: qsTr("试输入")
+                    descriptionText: qsTr("打开输入框，看说的话有没有变成文字")
                     descriptionObjectName: "actualSpeechTestDescription"
-                    stateText: qsTr("待实测")
-                    stateColor: tokens.voiceAccent
                     showDivider: false
-
                     CompactButton {
                         id: trySpeakingButton
                         objectName: "trySpeakingButton"

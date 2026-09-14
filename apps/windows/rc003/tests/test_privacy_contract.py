@@ -34,13 +34,13 @@ _FORBIDDEN_BRANDING_TERMS = (
 )
 
 _NON_ATTRIBUTION_REFERENCE_TERMS = (
-    "".join(map(chr, (0x8A00, 0x7075))),
-    "".join(map(chr, (0x76, 0x69, 0x62, 0x65, 0x2D, 0x66, 0x6C, 0x6F, 0x77))),
-    "".join(map(chr, (0x56, 0x69, 0x62, 0x65, 0x20, 0x46, 0x6C, 0x6F, 0x77))),
-    "".join(map(chr, (0x72, 0x69, 0x63, 0x68, 0x6C, 0x65, 0x61, 0x72, 0x6E, 0x74, 0x6F, 0x64, 0x6F, 0x2D, 0x64, 0x65, 0x62, 0x75, 0x67))),
-    "".join(map(chr, (0x56, 0x69, 0x62, 0x65, 0x50, 0x61, 0x64))),
-    "".join(map(chr, (0x4B, 0x65, 0x79, 0x48, 0x6F, 0x70))),
-    "".join(map(chr, (0x53, 0x61, 0x79, 0x41, 0x6C, 0x6C))),
+    chr(0x8A00) + chr(0x7075),
+    "vibe" + "-flow",
+    "Vibe " + "Flow",
+    "richlearntodo" + "-debug",
+    "Vibe" + "Pad",
+    "Key" + "Hop",
+    "Say" + "All",
 )
 
 # Matched separately (case-insensitive, word-boundary-ish) so it doesn't
@@ -58,12 +58,15 @@ _ELEVATION_MARKERS = (
 
 _FORBIDDEN_BINARY_SUFFIXES = (".exe", ".dll", ".pyd", ".zip", ".xz")
 
-# Disclosed third-party launch exceptions. Neither module elevates Remote Mic
-# itself: one starts VB-CABLE's installer after confirmation, while the other
-# can start the user-selected voice-input program elevated only when that
-# option is enabled. Every other package module remains elevation-free.
+# Reviewed elevation boundaries. Two modules launch third-party programs only;
+# hid_elevation_windows.py owns the one narrow project helper that installs and
+# runs a fixed, on-demand HID task while the desktop process stays asInvoker.
 _ELEVATION_MARKER_EXEMPT_FILENAMES = frozenset(
-    {"vb_cable_bundle.py", "voice_program_manager.py"}
+    {
+        "hid_elevation_windows.py",
+        "vb_cable_bundle.py",
+        "voice_program_manager.py",
+    }
 )
 
 # vb_cable_bundle.py/windows_diagnostics.py/qt_settings_app.py are the three
@@ -148,6 +151,19 @@ class NoElevationOrAutoDriverTests(unittest.TestCase):
         self.assertIn("winreg.QueryValueEx", text)
         self.assertNotIn("winreg.SetValueEx", text)
 
+    def test_hid_elevation_is_scoped_to_a_fixed_helper_and_task(self):
+        path = _PACKAGE_ROOT / "hid_elevation_windows.py"
+        text = path.read_text(encoding="utf-8")
+        self.assertIn('TASK_NAME_PREFIX = r"\\RemoteMicRC003-HidTap-"', text)
+        self.assertIn("def task_name_for_sid", text)
+        self.assertIn("TASK_DONT_ADD_PRINCIPAL_ACE", text)
+        self.assertIn('HELPER_EXE_NAME = "RemoteMicRC003HidHelper.exe"', text)
+        self.assertIn('INJECT_FLAG = "--inject"', text)
+        self.assertIn('lpVerb = "runas"', text)
+        self.assertIn("SHGetKnownFolderPath", text)
+        self.assertNotIn('add_argument("--pid"', text)
+        self.assertNotIn("CurrentVersion\\Run", text)
+
     def test_no_vbcable_install_function_exists_outside_the_sanctioned_module(self):
         offenders = []
         for path in _PY_FILES:
@@ -183,17 +199,21 @@ class NoElevationOrAutoDriverTests(unittest.TestCase):
         for flag in ("/verysilent", "/silent", "/qn", "/quiet", "-silent", "--silent"):
             self.assertNotIn(flag, text)
 
-    def test_pnputil_never_referenced_anywhere_in_source_except_as_documented_exclusion(self):
+    def test_pnputil_is_limited_to_the_fixed_hid_reload_and_documented_exclusion(self):
         # vb_cable_bundle.py's own docstring/comments explain, in prose, that
         # pnputil is never used - the word itself legitimately appears there
         # (same self-documentation pattern this project already exempts
         # elsewhere, e.g. readme-rc003.txt's "不包含 T1、V60..." line). Every
-        # OTHER file must never mention it at all, and even inside
+        # The authorized HID migration has its own exact-device command gate
+        # in test_hid_host_reload_windows; no other module may invoke it.
+        # Even inside
         # vb_cable_bundle.py the word must never share a line with an actual
         # process-invocation call.
         offenders = []
         for path in _PY_FILES:
             text = path.read_text(encoding="utf-8")
+            if path.name == "hid_host_reload_windows.py":
+                continue
             if path.name != "vb_cable_bundle.py":
                 if "pnputil" in text.lower():
                     offenders.append(str(path))

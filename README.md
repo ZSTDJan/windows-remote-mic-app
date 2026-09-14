@@ -10,17 +10,17 @@ Quicker 动作。支持单击、双击、长按和组合按键映射，按住说
 
 ## 下载无线麦
 
-**[下载 Windows 免安装版 · 解压后运行](https://github.com/ZSTDJan/windows-remote-mic-app/releases/download/v0.2.0-windows-rc003-candidate.2/RemoteMicRC003-0.2.0-candidate.2-portable-unsigned.zip)**
+**[下载 Windows 免安装版 · 解压后运行](https://github.com/ZSTDJan/windows-remote-mic-app/releases/download/v1.0.44/无线麦-Windows-1.0.44-免安装.zip)**
 
-当前公开版本：**0.2.0-candidate.2（测试版）**。完整解压 ZIP 后，运行文件夹中的
+当前公开版本：**1.0.44（正式版）**。完整解压 ZIP 后，运行文件夹中的
 `RemoteMicRC003.exe`；不要只把 EXE 单独取出来。
 
-[版本说明与历史附件](https://github.com/ZSTDJan/windows-remote-mic-app/releases/tag/v0.2.0-windows-rc003-candidate.2) · [校验文件 SHA256SUMS.txt](https://github.com/ZSTDJan/windows-remote-mic-app/releases/download/v0.2.0-windows-rc003-candidate.2/SHA256SUMS.txt)
+[版本说明与历史附件](https://github.com/ZSTDJan/windows-remote-mic-app/releases/tag/v1.0.44) · [校验文件 SHA256SUMS.txt](https://github.com/ZSTDJan/windows-remote-mic-app/releases/download/v1.0.44/SHA256SUMS.txt)
 
-后续版本暂不提供安装程序，新用户请选择免安装版。旧版附件保留供历史使用与回退，
-旧文件名和下载链接不变；新中文文件名从下一次发布开始使用，产品仍是无线麦。
+当前及后续版本暂不提供安装程序，新用户请选择免安装版。旧版附件保留供历史使用与
+回退，旧文件名和下载链接不变。
 
-当前测试版未签名，Windows SmartScreen 可能提示。请只从本仓库下载，
+当前版本未签名，Windows SmartScreen 可能提示。请只从本仓库下载，
 并用 `SHA256SUMS.txt` 核对文件哈希。
 
 ![无线麦按键映射主界面](docs/screenshots/settings-buttons.png)
@@ -60,8 +60,7 @@ Quicker 动作。支持单击、双击、长按和组合按键映射，按住说
 - **微信输入法**：支持语音输入，需确认输入法和无线麦的语音快捷键一致；
 - **豆包输入法**：支持按住说话，将语音转换为文字输入。
 
-当前公开测试版的豆包需通过“自定义程序”接入；内置豆包适配已在开发版本中加入，
-尚未包含在上方下载的 `0.2.0-candidate.2` 中。
+三个输入法都已内置对应入口；语音快捷键和虚拟麦克风仍需按下面步骤配置。
 
 ## 第一次使用
 
@@ -78,8 +77,8 @@ Quicker 动作。支持单击、双击、长按和组合按键映射，按住说
 6. 无线麦的输出端点选择 `CABLE Input (VB-Audio Virtual Cable)`，语音程序选择
    搜狗语音输入、微信输入法或豆包输入法。
 7. 打开所选输入法的语音设置，把麦克风设为
-   `CABLE Output (VB-Audio Virtual Cable)`。把输入法的长按型语音快捷键设成与
-   无线麦“语音按键”完全相同。
+   `CABLE Output (VB-Audio Virtual Cable)`。把输入法的长按型语音快捷键设成与无线麦
+   “语音按键”完全相同。
 
 ![虚拟音频、语音程序和长按快捷键对应示意](docs/screenshots/voice-configuration-example.jpg)
 
@@ -88,6 +87,14 @@ Quicker 动作。支持单击、双击、长按和组合按键映射，按住说
 
 详细的配对、虚拟音频、输入法设置、故障排查和哈希校验见
 [`apps/windows/rc003/README.md`](apps/windows/rc003/README.md)。
+
+### 检查更新
+
+在“设备”页“检查更新”一行点击“检查更新”。程序只在用户点击后访问 GitHub，
+不会在启动时或后台自动检查。发现新版本后会下载免安装 ZIP 和同一次 Release 的
+`SHA256SUMS.txt`；GitHub 提供资产摘要时也会一并核对。文件通过校验后保存在
+`%LOCALAPPDATA%\RemoteMic\RC003\updates\<版本号>`，点击“打开文件夹”后手动解压
+使用；程序不会自动运行下载文件或覆盖当前目录。
 
 ## 使用限制与风险
 

@@ -133,6 +133,20 @@ PyInstaller is used to build the application. Its bootloader exception permits
 distribution of the resulting application under this project's GPL-3.0-only
 license.
 
+### Cython and setuptools
+
+- Build package: `cython==3.2.8`
+- Source: <https://github.com/cython/cython>
+- License: Apache-2.0
+- Build package: `setuptools==80.9.0`
+- Source: <https://github.com/pypa/setuptools>
+- License: MIT
+
+Cython and setuptools are build-time tools used to compile the selected RC003
+permission modules. They are not bundled as runtime packages in the Windows
+application; the generated extension modules remain part of this project's
+GPL-3.0-only corresponding source and binary distribution.
+
 ## Upstream protocol and implementation sources
 
 ### open-voice-bridge Windows implementation
@@ -159,14 +173,25 @@ branding is included.
 
 ## Separately licensed assets and software
 
+### Lucide application icons
+
+- Project: Lucide
+- Source: <https://github.com/lucide-icons/lucide>
+- Reference revision: `266fd1c717905b2a64c8c38faf3a6aee99791121`
+- Icons: `mic` and `mic-off`
+- License: ISC
+- License text: `THIRD_PARTY_LICENSES/Lucide-266fd1c/LICENSE.txt`
+
+The SVG stroke color is changed to the application's blue, and the Windows
+ICO is generated from the modified `mic` SVG.
+
 ### RC003 product photo
 
-The bundled file `Resources/RC003-remote-photo.png` was supplied by the user on
-2026-07-17. The repository does not currently contain a written public
-redistribution license from the photo copyright owner. This notice does not
-grant that missing permission. Formal distribution remains blocked until the
-status in `ASSET_LICENSES.md` is approved or the file is replaced with an asset
-the project may redistribute.
+The bundled file `Resources/RC003-remote-photo.png` was independently created
+by the repository maintainer from a personally owned RC003 product. It is
+licensed under GPL-3.0-only with the rest of this repository. Product names,
+appearance and visible third-party marks remain the property of their
+respective owners and are shown only to identify compatible hardware.
 
 ### VB-CABLE
 
@@ -180,12 +205,11 @@ package and verifies its pinned SHA-256. The bundle never includes the paid
 A+B/C+D products. The client does not re-license or silently install VB-CABLE,
 and it never changes the Windows system default input/output device; audio is
 written only to an explicitly selected endpoint. Installation starts only after
-an explicit user action and Windows UAC confirmation. That action elevates only
-the vendor installer; Remote Mic does not automatically elevate or change its
-own current privileges, and it never reports a driver install as successful
-merely because a process was launched. Users may obtain the same
-package directly from VB-Audio and are encouraged to support the vendor through
-its Donationware model.
+an explicit user action and Windows UAC confirmation. The installation action
+elevates only the vendor installer; it does not elevate the running Remote Mic
+process. It never reports a driver install as successful merely because a
+process was launched. Users may obtain the same package directly from VB-Audio
+and are encouraged to support the vendor through its Donationware model.
 
 ## Microsoft runtime components
 

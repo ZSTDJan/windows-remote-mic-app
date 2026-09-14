@@ -107,8 +107,10 @@ class CleanupAlwaysRunsTests(unittest.TestCase):
             task = asyncio.ensure_future(supervisor.run_forever())
             await asyncio.sleep(0)
             supervisor.request_reconnect()  # simulate a BLE disconnect callback
-            await asyncio.sleep(0)
-            await asyncio.sleep(0)
+            for _ in range(20):
+                if connect_count >= 2:
+                    break
+                await asyncio.sleep(0)
             await supervisor.stop()
             await task
 
@@ -169,6 +171,79 @@ class ThreadSafetyTests(unittest.TestCase):
 
         _run(scenario())
         self.assertGreaterEqual(connect_count, 2)
+
+    def test_retry_now_from_a_foreign_thread_wakes_the_backoff(self):
+        attempts = []
+        delays = []
+
+        async def connect():
+            attempts.append(1)
+            if len(attempts) == 1:
+                raise RuntimeError("simulated device out of range")
+
+        async def cleanup():
+            pass
+
+        async def blocking_sleep(seconds):
+            delays.append(seconds)
+            await asyncio.Event().wait()
+
+        async def scenario():
+            supervisor = ConnectionSupervisor(
+                connect,
+                cleanup,
+                retry_delay=60.0,
+                max_retry_delay=60.0,
+                sleep=blocking_sleep,
+            )
+            task = asyncio.ensure_future(supervisor.run_forever())
+            for _ in range(20):
+                if delays:
+                    break
+                await asyncio.sleep(0)
+            self.assertEqual(delays, [60.0])
+
+            worker = threading.Thread(target=supervisor.request_retry_now)
+            worker.start()
+            worker.join(timeout=2.0)
+            self.assertFalse(worker.is_alive())
+
+            for _ in range(20):
+                if len(attempts) >= 2:
+                    break
+                await asyncio.sleep(0)
+            self.assertEqual(len(attempts), 2)
+            await supervisor.stop()
+            await task
+
+        _run(scenario())
+
+    def test_stop_wakes_a_retry_backoff(self):
+        sleep_started = asyncio.Event()
+
+        async def connect():
+            raise RuntimeError("simulated device out of range")
+
+        async def cleanup():
+            pass
+
+        async def blocking_sleep(_seconds):
+            sleep_started.set()
+            await asyncio.Event().wait()
+
+        async def scenario():
+            supervisor = ConnectionSupervisor(
+                connect,
+                cleanup,
+                retry_delay=60.0,
+                sleep=blocking_sleep,
+            )
+            task = asyncio.ensure_future(supervisor.run_forever())
+            await asyncio.wait_for(sleep_started.wait(), timeout=1.0)
+            await supervisor.stop()
+            await asyncio.wait_for(task, timeout=1.0)
+
+        _run(scenario())
 
 
 class CleanupFailureFailsClosedTests(unittest.TestCase):

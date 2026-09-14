@@ -4,7 +4,8 @@ dist/
 __pycache__/
 *.pyc
 .pytest_cache/
-.codex/
+apps/windows/rc003/build/cython-stage/
+apps/windows/rc003/build/cython-work/
 
 # Local project-control records are not part of the public source release.
 docs/*
@@ -12,10 +13,3 @@ docs/*
 !docs/screenshots/settings-connection.png
 !docs/screenshots/settings-buttons.png
 AGENTS.md
-apps/windows/rc003/bugs/
-apps/windows/rc003/discussions/
-apps/windows/rc003/reviews/
-apps/windows/rc003/MAINTENANCE.md
-apps/windows/rc003/PERFORMANCE.md
-apps/windows/rc003/VALIDATION-AND-DELIVERY.md
-apps/windows/rc003/WINDOWS-ARCHITECTURE-LEDGER.md

@@ -1,6 +1,7 @@
 # PyInstaller spec for Remote Mic · RC003 (Windows source/build candidate).
 #
-# One-dir build (COLLECT), matching the layout pattern this project's
+# One-dir desktop build (COLLECT) plus one self-contained, narrow HID helper,
+# matching the layout pattern this project's
 # upstream reference uses for its own standalone products, minus everything
 # out of scope for this candidate: no other-device (T1/V60) code, and no
 # licensing/DRM modules (none exist in this tree to begin with). The pinned,
@@ -15,6 +16,7 @@
 # This produces an UNSIGNED candidate under dist/RemoteMicRC003/. Real
 # code signing is out of scope for this source/build candidate.
 
+import os
 import sys
 from pathlib import Path
 
@@ -22,6 +24,11 @@ block_cipher = None
 
 RC003_ROOT = Path(SPECPATH).resolve().parent
 SRC_ROOT = RC003_ROOT / "src"
+source_root_override = os.environ.get("RC003_BUILD_SOURCE_ROOT", "").strip()
+if source_root_override:
+    SRC_ROOT = Path(source_root_override).resolve()
+if not SRC_ROOT.is_dir():
+    raise SystemExit(f"required build source directory is missing: {SRC_ROOT}")
 REPO_ROOT = RC003_ROOT.parents[2]
 REMOTE_PHOTO = REPO_ROOT / "Resources" / "RC003-remote-photo.png"
 QML_SOURCE_DIR = SRC_ROOT / "ovb_rc003" / "qml"
@@ -46,6 +53,9 @@ DEVICE_PROFILES_DIR = REPO_ROOT / "device-profiles"
 # offline on the end-user machine.
 VB_CABLE_BUNDLE_ZIP = RC003_ROOT / "build" / "third_party" / "VBCABLE_Driver_Pack45.zip"
 FRIDA_ASSET_DIR = SRC_ROOT / "ovb_rc003" / "frida_assets"
+VERSION_FILE = SRC_ROOT / "ovb_rc003" / "VERSION"
+HID_HELPER_NAME = "RemoteMicRC003HidHelper"
+HID_HELPER_RELATIVE_PATH = Path("_internal") / f"{HID_HELPER_NAME}.exe"
 
 # Import only the stdlib-only pin/runtime helper so the build contract has one
 # authoritative filename and SHA-256. Source execution may omit the asset, but
@@ -76,6 +86,9 @@ if not REMOTE_PHOTO.is_file():
     )
 
 datas = []
+if not VERSION_FILE.is_file():
+    raise SystemExit(f"required application version file is missing: {VERSION_FILE}")
+datas.append((str(VERSION_FILE), "ovb_rc003"))
 # This places the photo under Resources/ inside the one-dir COLLECT output,
 # which PyInstaller exposes at runtime as sys._MEIPASS/Resources/. A source
 # checkout may still degrade if a user deletes the file after startup, but a
@@ -121,6 +134,31 @@ if VB_CABLE_BUNDLE_ZIP.is_file():
 datas.append((str(FRIDA_GADGET_ARCHIVE), "ovb_rc003/frida_assets"))
 
 hiddenimports = [
+    # Imports made inside the two Cython extension modules are opaque to
+    # PyInstaller's Python bytecode scanner. Keep their stdlib closure
+    # explicit so both the main program and the narrow helper can initialize
+    # the compiled modules without the original .py files.
+    "argparse",
+    "contextlib",
+    "ctypes",
+    "ctypes.wintypes",
+    "dataclasses",
+    "enum",
+    "hashlib",
+    "html",
+    "json",
+    "os",
+    "pathlib",
+    "re",
+    "shutil",
+    "stat",
+    "subprocess",
+    "sys",
+    "tempfile",
+    "threading",
+    "time",
+    "typing",
+    "xml.etree.ElementTree",
     "ovb_rc003.app",
     "ovb_rc003.device_catalog",  # XRBM-036: multi-device settings/runtime gate
     "ovb_rc003.settings_ui",
@@ -140,6 +178,8 @@ hiddenimports = [
     "ovb_rc003.frida_compat",
     "ovb_rc003.frida_hid_tap_runtime",
     "ovb_rc003.frida_hid_tap_injector",
+    "ovb_rc003.hid_elevation_windows",
+    "ovb_rc003.hid_helper_consumers",
     "ovb_rc003.single_instance",  # XRBM-021: imported lazily inside
     # __main__.py's _run_bridge(), same as the other lazily-imported
     # modules above.
@@ -215,18 +255,28 @@ a = Analysis(
 )
 
 
-def _is_ambient_icuuc(binary_entry):
-    """Reject an unrelated ICU DLL discovered through the build PATH.
+def _is_ambient_icu(binary_entry):
+    """Reject unrelated ICU DLLs discovered through the build PATH.
 
     Modern Windows provides its own ICU forwarder. PyInstaller may instead
-    discover another application's ``icuuc.dll`` through PATH and copy it to
-    the package root, where it shadows the Windows DLL and can make QtCore
-    fail before the settings window starts. Keep a future PySide6-owned copy,
-    but never bundle an ambient copy from another toolchain.
+    discover another application's ``icuuc.dll`` through PATH, then also
+    collect its companion ``icuinXX.dll`` / ``icudtXX.dll`` files. Copying
+    that foreign set can make QtCore fail before the settings window starts,
+    while leaving only a companion file wastes tens of megabytes. Keep a
+    future PySide6-owned copy, but never bundle ambient ICU files from another
+    toolchain.
     """
 
     destination_name, source_path, _type_code = binary_entry
-    if Path(destination_name).name.casefold() != "icuuc.dll":
+    destination_path = Path(destination_name)
+    stem = destination_path.stem.casefold()
+    is_icu_runtime = any(
+        stem == prefix or (
+            stem.startswith(prefix) and stem[len(prefix):].isdigit()
+        )
+        for prefix in ("icudt", "icuin", "icuuc")
+    )
+    if destination_path.suffix.casefold() != ".dll" or not is_icu_runtime:
         return False
     return "pyside6" not in {
         part.casefold() for part in Path(source_path).parts
@@ -251,7 +301,7 @@ def _is_unneeded_sounddevice_asio(binary_entry):
 a.binaries = [
     binary_entry
     for binary_entry in a.binaries
-    if not _is_ambient_icuuc(binary_entry)
+    if not _is_ambient_icu(binary_entry)
     and not _is_unneeded_sounddevice_asio(binary_entry)
 ]
 
@@ -269,10 +319,105 @@ exe = EXE(
     upx=False,
     console=False,
     icon=str(APP_ICON),
+    uac_admin=False,
 )
+
+# The helper is deliberately a one-file executable because setup copies this
+# executable alone into Program Files. It contains only the fixed task
+# lifecycle, WUDFHost validation/injection code, and the pinned Gadget asset;
+# It reads only the validated remote-selection digest from user configuration;
+# UI, BLE scans, audio and configuration normalization dependencies are excluded.
+helper_a = Analysis(
+    [str(SRC_ROOT / "hid_helper_launcher.py")],
+    pathex=[str(SRC_ROOT)],
+    binaries=[],
+    datas=[
+        (str(VERSION_FILE), "ovb_rc003"),
+        (str(FRIDA_GADGET_ARCHIVE), "ovb_rc003/frida_assets"),
+    ],
+    hiddenimports=[
+        "argparse",
+        "contextlib",
+        "ctypes",
+        "ctypes.wintypes",
+        "dataclasses",
+        "hashlib",
+        "html",
+        "json",
+        "os",
+        "pathlib",
+        "re",
+        "shutil",
+        "stat",
+        "subprocess",
+        "sys",
+        "tempfile",
+        "time",
+        "typing",
+        "xml.etree.ElementTree",
+        "ovb_rc003.hid_elevation_windows",
+        "ovb_rc003.remote_selection",
+        "ovb_rc003.config",
+        "ovb_rc003.frida_hid_tap_injector",
+        "ovb_rc003.frida_hid_tap_runtime",
+        "ovb_rc003.single_instance",
+        "comtypes",
+        "comtypes.client",
+    ],
+    hookspath=[],
+    hooksconfig={},
+    runtime_hooks=[],
+    excludes=[
+        "PySide6",
+        "numpy",
+        "sounddevice",
+        "winrt",
+        "uiautomation",
+        "ovb_rc003.app",
+        "ovb_rc003.qt_settings_app",
+        "ovb_rc003.ble_transport_winrt",
+        "ovb_rc003.audio_playback",
+        "ovb_rc003.windows_diagnostics",
+        "ovb_rc003.settings_ui",
+        "ovb_rc003.key_mapping",
+        "ovb_rc003.voice_hotkey_sync_windows",
+        "ovb_rc003.voice_program_manager",
+    ],
+    win_no_prefer_redirects=False,
+    win_private_assemblies=False,
+    cipher=block_cipher,
+    noarchive=False,
+)
+
+helper_pyz = PYZ(helper_a.pure, helper_a.zipped_data, cipher=block_cipher)
+
+helper_exe = EXE(
+    helper_pyz,
+    helper_a.scripts,
+    helper_a.binaries,
+    helper_a.datas,
+    [],
+    name=HID_HELPER_NAME,
+    debug=False,
+    bootloader_ignore_signals=False,
+    strip=False,
+    upx=False,
+    console=False,
+    icon=str(APP_ICON),
+    uac_admin=False,
+)
+
+# Keep the privileged implementation available to setup and repair flows
+# without presenting it beside the only user-facing executable. The helper
+# remains a self-contained one-file EXE; only its distribution location moves.
+helper_collect_toc = [
+    (str(HID_HELPER_RELATIVE_PATH), helper_exe.name, "EXECUTABLE"),
+    *helper_exe.dependencies,
+]
 
 coll = COLLECT(
     exe,
+    helper_collect_toc,
     a.binaries,
     a.zipfiles,
     a.datas,

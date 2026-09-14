@@ -10,9 +10,12 @@ without fighting the platform gate (see single_instance.py's docstring).
 
 import ctypes
 import inspect
+import json
 import sys
+import tempfile
 import unittest
 from ctypes import wintypes
+from pathlib import Path
 
 from ovb_rc003 import single_instance
 
@@ -442,6 +445,141 @@ class SettingsInstanceGuardTests(unittest.TestCase):
             with guard:
                 self.fail("an inaccessible existing settings mutex must block a duplicate")
 
+    def test_settings_guard_does_not_publish_exit_capability_before_window_ready(self):
+        create_calls = []
+        release_calls = []
+        close_calls = []
+
+        def create(name):
+            create_calls.append(name)
+            return single_instance.MutexCreationResult(
+                handle=1000 + len(create_calls), last_error=0
+            )
+
+        with single_instance.SettingsInstanceGuard(
+            _create_mutex=create,
+            _release_mutex=lambda handle: release_calls.append(handle) or True,
+            _close_handle=lambda handle: close_calls.append(handle) or True,
+        ):
+            self.assertEqual(create_calls, [single_instance._SETTINGS_MUTEX_NAME])
+
+        self.assertEqual(release_calls, [1001])
+        self.assertEqual(close_calls, [1001])
+
+
+class ApplicationRuntimeInstanceGuardTests(unittest.TestCase):
+    def test_runtime_identity_changes_with_version_or_location(self):
+        first = single_instance.application_runtime_mutex_name(
+            executable_path=r"C:\Apps\RemoteMicRC003.exe",
+            version="1.0.0",
+        )
+        same = single_instance.application_runtime_mutex_name(
+            executable_path=r"c:\apps\remotemicrc003.exe",
+            version="1.0.0",
+        )
+        other_version = single_instance.application_runtime_mutex_name(
+            executable_path=r"C:\Apps\RemoteMicRC003.exe",
+            version="1.0.1",
+        )
+        other_location = single_instance.application_runtime_mutex_name(
+            executable_path=r"C:\Portable\RemoteMicRC003.exe",
+            version="1.0.0",
+        )
+
+        self.assertEqual(first, same)
+        self.assertNotEqual(first, other_version)
+        self.assertNotEqual(first, other_location)
+        self.assertTrue(first.startswith("Local\\"))
+        self.assertNotIn("Apps", first)
+
+    def test_runtime_window_property_uses_the_same_private_identity(self):
+        first = single_instance.application_runtime_window_property(
+            executable_path=r"C:\Apps\RemoteMicRC003.exe",
+            version="1.0.0",
+        )
+        same = single_instance.application_runtime_window_property(
+            executable_path=r"c:\apps\remotemicrc003.exe",
+            version="1.0.0",
+        )
+        other_location = single_instance.application_runtime_window_property(
+            executable_path=r"C:\Portable\RemoteMicRC003.exe",
+            version="1.0.0",
+        )
+
+        self.assertEqual(first, same)
+        self.assertNotEqual(first, other_location)
+        self.assertTrue(first.startswith(single_instance._SETTINGS_WINDOW_PROPERTY + "."))
+        self.assertNotIn("Apps", first)
+
+    def test_runtime_guard_blocks_a_second_waiter_or_owner_of_the_same_copy(self):
+        registry = _FakeMutexRegistry()
+
+        def guard():
+            return single_instance.ApplicationRuntimeInstanceGuard(
+                name=r"Local\RemoteMicRC003_Runtime_test",
+                _create_mutex=registry.create_mutex,
+                _release_mutex=registry.release_mutex,
+                _close_handle=registry.close_handle,
+            )
+
+        with guard():
+            with self.assertRaises(single_instance.DuplicateInstanceError):
+                with guard():
+                    self.fail("the same runtime must have only one owner or waiter")
+
+    def test_handoff_confirmation_is_concise_and_names_the_clicked_version(self):
+        calls = []
+
+        result = single_instance.confirm_application_handoff(
+            "0.2.0-candidate.7",
+            _confirm=lambda title, message: calls.append((title, message)) or True,
+        )
+
+        self.assertTrue(result)
+        self.assertEqual(len(calls), 1)
+        title, message = calls[0]
+        self.assertEqual(title, "无线麦 0.2.0-candidate.7")
+        self.assertEqual(
+            message,
+            "旧版正在运行。\n\n"
+            "是否退出旧版并打开当前版本？",
+        )
+
+    def test_only_one_cross_version_handoff_guard_can_enter(self):
+        registry = _FakeMutexRegistry()
+
+        def guard():
+            return single_instance.ApplicationHandoffInstanceGuard(
+                _create_mutex=registry.create_mutex,
+                _release_mutex=registry.release_mutex,
+                _close_handle=registry.close_handle,
+            )
+
+        with guard():
+            with self.assertRaises(single_instance.DuplicateInstanceError):
+                with guard():
+                    self.fail("only one version handoff may wait at a time")
+
+    def test_only_one_full_exit_sender_can_enter_per_session(self):
+        registry = _FakeMutexRegistry()
+
+        def guard():
+            return single_instance.ApplicationExitRequestGuard(
+                _create_mutex=registry.create_mutex,
+                _release_mutex=registry.release_mutex,
+                _close_handle=registry.close_handle,
+            )
+
+        with guard():
+            with self.assertRaises(single_instance.DuplicateInstanceError):
+                with guard():
+                    self.fail("exit senders must not overwrite each other")
+
+    def test_installer_maintenance_mutex_is_global(self):
+        self.assertEqual(
+            single_instance._INSTALLER_MAINTENANCE_MUTEX_NAME,
+            r"Global\RemoteMicRC003_InstallerMaintenance",
+        )
 
 class ElementNavigationInstanceGuardTests(unittest.TestCase):
     def test_element_navigation_uses_a_distinct_local_mutex(self):
@@ -496,13 +634,60 @@ class SettingsWindowActivationTests(unittest.TestCase):
         )
 
         self.assertTrue(marked)
-        self.assertEqual(calls, [(321, single_instance._SETTINGS_WINDOW_PROPERTY)])
+        self.assertEqual(
+            calls,
+            [
+                (321, single_instance._SETTINGS_WINDOW_PROPERTY),
+                (321, single_instance.application_runtime_window_property()),
+                (
+                    321,
+                    single_instance._SETTINGS_WINDOW_RESTORE_CAPABILITY_PROPERTY,
+                ),
+                (321, single_instance._APPLICATION_EXIT_CAPABILITY_PROPERTY_V2),
+                (321, single_instance._APPLICATION_EXIT_CAPABILITY_PROPERTY),
+                (
+                    321,
+                    single_instance._APPLICATION_EXIT_WINDOW_SIGNAL_CAPABILITY_PROPERTY,
+                ),
+            ],
+        )
 
     def test_marker_failure_does_not_block_the_first_window(self):
         self.assertFalse(
             single_instance.mark_settings_window(
                 321,
                 _set_property=lambda _hwnd, _name: (_ for _ in ()).throw(OSError()),
+            )
+        )
+
+    def test_restore_request_is_consumed_once_from_the_settings_hwnd(self):
+        calls = []
+
+        self.assertTrue(
+            single_instance.consume_settings_window_restore_request(
+                321,
+                _remove_property=lambda hwnd, name: (
+                    calls.append((hwnd, name)) or 1
+                ),
+            )
+        )
+        self.assertEqual(
+            calls,
+            [
+                (
+                    321,
+                    single_instance._SETTINGS_WINDOW_RESTORE_REQUEST_PROPERTY,
+                )
+            ],
+        )
+
+    def test_restore_request_probe_failure_is_safe(self):
+        self.assertFalse(
+            single_instance.consume_settings_window_restore_request(
+                321,
+                _remove_property=lambda _hwnd, _name: (
+                    (_ for _ in ()).throw(OSError("unavailable"))
+                ),
             )
         )
 
@@ -514,6 +699,24 @@ class SettingsWindowActivationTests(unittest.TestCase):
 
         self.assertTrue(activated)
         self.assertEqual(calls, [single_instance._SETTINGS_WINDOW_PROPERTY])
+
+    def test_current_runtime_activation_uses_the_runtime_private_property(self):
+        calls = []
+        activated = single_instance.activate_current_runtime_settings_window(
+            _activate=lambda name: calls.append(name) or True
+        )
+
+        self.assertTrue(activated)
+        self.assertEqual(
+            calls,
+            [single_instance.application_runtime_window_property()],
+        )
+
+    def test_current_runtime_real_activation_requires_the_qt_restore_path(self):
+        source = inspect.getsource(
+            single_instance._real_request_marked_window_restore
+        )
+        self.assertIn("_require_restore_request=True", source)
 
     def test_activation_failure_is_best_effort_and_nonfatal(self):
         self.assertFalse(
@@ -548,6 +751,557 @@ class ShowBridgeStartupBlockedNoticeTests(unittest.TestCase):
         single_instance.show_bridge_startup_blocked_notice(
             "unavailable case", _message_box=failing_message_box
         )
+
+
+class BridgeStartRequestTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_fresh_request_is_consumed_exactly_once(self):
+        single_instance.write_bridge_start_request(self.root, now=lambda: 100.0)
+
+        self.assertTrue(
+            single_instance.consume_bridge_start_request(
+                self.root,
+                now=lambda: 110.0,
+            )
+        )
+        self.assertFalse(
+            single_instance.consume_bridge_start_request(
+                self.root,
+                now=lambda: 110.0,
+            )
+        )
+
+    def test_stale_or_invalid_request_is_discarded(self):
+        single_instance.write_bridge_start_request(self.root, now=lambda: 100.0)
+        self.assertFalse(
+            single_instance.consume_bridge_start_request(
+                self.root,
+                now=lambda: 131.0,
+            )
+        )
+
+        path = single_instance.bridge_start_request_path(self.root)
+        path.write_text(
+            json.dumps({"schema": 1, "action": "other"}),
+            encoding="utf-8",
+        )
+        self.assertFalse(single_instance.consume_bridge_start_request(self.root))
+        self.assertFalse(path.exists())
+
+    def test_session_bridge_requests_do_not_cross_sessions(self):
+        first = single_instance.write_bridge_start_request(
+            self.root,
+            session_id=11,
+            session_scoped=True,
+        )
+        second = single_instance.write_bridge_start_request(
+            self.root,
+            session_id=22,
+            session_scoped=True,
+        )
+
+        self.assertNotEqual(first, second)
+        self.assertTrue(
+            single_instance.consume_bridge_start_request(
+                self.root,
+                session_id=11,
+                session_scoped=True,
+            )
+        )
+        self.assertTrue(second.exists())
+        self.assertTrue(
+            single_instance.consume_bridge_start_request(
+                self.root,
+                session_id=22,
+                session_scoped=True,
+            )
+        )
+
+
+class ApplicationExitRequestTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_window_exit_request_is_consumed_once_from_the_settings_hwnd(self):
+        removed = []
+        request_values = iter((731, 0))
+
+        def remove_property(hwnd, property_name):
+            removed.append((hwnd, property_name))
+            if property_name == single_instance._APPLICATION_EXIT_WINDOW_REQUEST_PROPERTY:
+                return next(request_values)
+            return 0
+
+        self.assertEqual(
+            single_instance.consume_settings_window_exit_request(
+                321,
+                _remove_property=remove_property,
+            ),
+            731,
+        )
+        self.assertIsNone(
+            single_instance.consume_settings_window_exit_request(
+                321,
+                _remove_property=remove_property,
+            )
+        )
+        self.assertEqual(
+            removed,
+            [
+                (321, single_instance._APPLICATION_EXIT_WINDOW_REQUEST_PROPERTY),
+                (321, single_instance._APPLICATION_EXIT_WINDOW_REJECTED_PROPERTY),
+                (321, single_instance._APPLICATION_EXIT_WINDOW_REQUEST_PROPERTY),
+            ],
+        )
+
+    def test_window_exit_request_probe_failure_is_safe(self):
+        self.assertFalse(
+            single_instance.consume_settings_window_exit_request(
+                321,
+                _remove_property=lambda *_args: (_ for _ in ()).throw(
+                    OSError("blocked")
+                ),
+            )
+        )
+
+    def test_window_exit_rejection_echoes_the_request_token(self):
+        calls = []
+        self.assertTrue(
+            single_instance.publish_settings_window_exit_rejection(
+                321,
+                731,
+                _set_property=lambda hwnd, name, value: calls.append(
+                    (hwnd, name, value)
+                )
+                or True,
+            )
+        )
+        self.assertEqual(
+            calls,
+            [
+                (
+                    321,
+                    single_instance._APPLICATION_EXIT_WINDOW_REJECTED_PROPERTY,
+                    731,
+                )
+            ],
+        )
+
+    def test_fresh_request_is_consumed_exactly_once(self):
+        path = single_instance.write_application_exit_request(
+            self.root, now=lambda: 100.0
+        )
+
+        self.assertEqual(
+            path,
+            single_instance.application_exit_request_path(self.root),
+        )
+        self.assertTrue(
+            single_instance.consume_application_exit_request(
+                self.root,
+                now=lambda: 110.0,
+            )
+        )
+        self.assertFalse(
+            single_instance.consume_application_exit_request(
+                self.root,
+                now=lambda: 110.0,
+            )
+        )
+
+    def test_stale_or_wrong_action_is_discarded_without_touching_bridge_request(self):
+        single_instance.write_application_exit_request(
+            self.root, now=lambda: 100.0
+        )
+        single_instance.write_bridge_start_request(self.root, now=lambda: 100.0)
+
+        self.assertFalse(
+            single_instance.consume_application_exit_request(
+                self.root,
+                now=lambda: 131.0,
+            )
+        )
+        self.assertTrue(
+            single_instance.consume_bridge_start_request(
+                self.root,
+                now=lambda: 110.0,
+            )
+        )
+
+        path = single_instance.application_exit_request_path(self.root)
+        path.write_text(
+            json.dumps(
+                {
+                    "schema": 1,
+                    "action": "start_bridge",
+                    "created_at": 100.0,
+                }
+            ),
+            encoding="utf-8",
+        )
+        self.assertFalse(
+            single_instance.consume_application_exit_request(
+                self.root,
+                now=lambda: 110.0,
+            )
+        )
+        self.assertFalse(path.exists())
+
+    def test_application_probe_uses_the_product_wide_settings_mutex(self):
+        opened = []
+
+        self.assertFalse(
+            single_instance.application_instance_running(
+                _open_mutex=lambda name: opened.append(name)
+                or single_instance.MutexOpenResult(
+                    handle=0,
+                    last_error=single_instance._ERROR_FILE_NOT_FOUND,
+                )
+            )
+        )
+        self.assertEqual(opened, [single_instance._SETTINGS_MUTEX_NAME])
+
+    def test_exit_capability_requires_a_ready_window_marker(self):
+        self.assertEqual(
+            single_instance._real_application_exit_request_capability(
+                _probe=lambda: single_instance.ApplicationExitWindowMarkers(
+                    settings_window_found=True,
+                    supported_window_found=True,
+                    legacy_supported_window_found=False,
+                )
+            ),
+            single_instance.ApplicationExitRequestCapability.SUPPORTED,
+        )
+
+    def test_candidate_007_runtime_marker_is_recognized_as_legacy_supported(self):
+        self.assertTrue(
+            single_instance._is_legacy_exit_capability_property(
+                "RemoteMicRC003.SettingsWindow." + ("a" * 64)
+            )
+        )
+        self.assertFalse(
+            single_instance._is_legacy_exit_capability_property(
+                "RemoteMicRC003.SettingsWindow." + ("g" * 64)
+            )
+        )
+        self.assertEqual(
+            single_instance._real_application_exit_request_capability(
+                _probe=lambda: single_instance.ApplicationExitWindowMarkers(
+                    settings_window_found=True,
+                    supported_window_found=False,
+                    legacy_supported_window_found=True,
+                )
+            ),
+            single_instance.ApplicationExitRequestCapability.LEGACY_SUPPORTED,
+        )
+
+    def test_handoff_can_observe_its_own_request_until_the_old_copy_consumes_it(self):
+        single_instance.write_application_exit_request(
+            self.root,
+            request_id="ours",
+        )
+
+        self.assertTrue(
+            single_instance.owned_application_exit_request_pending(
+                self.root,
+                "ours",
+            )
+        )
+        self.assertTrue(single_instance.consume_application_exit_request(self.root))
+        self.assertFalse(
+            single_instance.owned_application_exit_request_pending(
+                self.root,
+                "ours",
+            )
+        )
+
+    def test_consuming_an_owned_exit_request_writes_a_matching_acknowledgement(self):
+        single_instance.write_application_exit_request(
+            self.root,
+            request_id="ours",
+            now=lambda: 100.0,
+        )
+
+        self.assertEqual(
+            single_instance.consume_and_acknowledge_application_exit_request(
+                self.root,
+                now=lambda: 101.0,
+            ),
+            single_instance.ApplicationExitRequest(request_id="ours"),
+        )
+        self.assertTrue(
+            single_instance.application_exit_request_acknowledged(
+                self.root,
+                "ours",
+            )
+        )
+
+    def test_rejected_exit_request_replaces_ack_and_can_be_cleared_by_owner(self):
+        single_instance.write_application_exit_request(
+            self.root,
+            request_id="ours",
+        )
+        request = single_instance.consume_and_acknowledge_application_exit_request(
+            self.root
+        )
+        self.assertEqual(
+            request,
+            single_instance.ApplicationExitRequest(request_id="ours"),
+        )
+
+        single_instance.write_application_exit_rejection(self.root, "ours")
+
+        self.assertFalse(
+            single_instance.application_exit_request_acknowledged(
+                self.root,
+                "ours",
+            )
+        )
+        self.assertTrue(
+            single_instance.application_exit_request_rejected(
+                self.root,
+                "ours",
+            )
+        )
+        self.assertTrue(
+            single_instance.clear_owned_application_exit_response(
+                self.root,
+                "ours",
+            )
+        )
+        self.assertFalse(single_instance.application_exit_ack_path(self.root).exists())
+
+    def test_request_disappearance_without_acknowledgement_is_not_acceptance(self):
+        path = single_instance.write_application_exit_request(
+            self.root,
+            request_id="ours",
+        )
+        path.unlink()
+
+        self.assertFalse(
+            single_instance.application_exit_request_acknowledged(
+                self.root,
+                "ours",
+            )
+        )
+
+    def test_acknowledgement_cleanup_preserves_a_replacement(self):
+        path = single_instance.write_application_exit_acknowledgement(
+            self.root,
+            "ours",
+        )
+        single_instance.write_application_exit_acknowledgement(
+            self.root,
+            "newer",
+        )
+
+        self.assertFalse(
+            single_instance.clear_owned_application_exit_acknowledgement(
+                self.root,
+                "ours",
+            )
+        )
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(payload["request_id"], "newer")
+
+    def test_handoff_never_treats_a_replacement_request_as_its_own(self):
+        single_instance.write_application_exit_request(
+            self.root,
+            request_id="newer",
+        )
+
+        self.assertFalse(
+            single_instance.owned_application_exit_request_pending(
+                self.root,
+                "ours",
+            )
+        )
+
+    def test_handoff_can_clear_only_its_own_pending_request(self):
+        path = single_instance.write_application_exit_request(
+            self.root,
+            request_id="ours",
+        )
+
+        self.assertTrue(
+            single_instance.clear_owned_application_exit_request(
+                self.root,
+                "ours",
+            )
+        )
+        self.assertFalse(path.exists())
+
+    def test_handoff_cleanup_preserves_a_replacement_request(self):
+        path = single_instance.write_application_exit_request(
+            self.root,
+            request_id="ours",
+        )
+        single_instance.write_application_exit_request(
+            self.root,
+            request_id="newer",
+        )
+
+        self.assertFalse(
+            single_instance.clear_owned_application_exit_request(
+                self.root,
+                "ours",
+            )
+        )
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(payload["request_id"], "newer")
+
+    def test_session_exit_request_round_trip_is_isolated_by_session(self):
+        first = single_instance.write_application_exit_request(
+            self.root,
+            request_id="first",
+            session_id=11,
+            session_scoped=True,
+            now=lambda: 100.0,
+        )
+        second = single_instance.write_application_exit_request(
+            self.root,
+            request_id="second",
+            session_id=22,
+            session_scoped=True,
+            now=lambda: 100.0,
+        )
+
+        request = single_instance.consume_and_acknowledge_application_exit_request(
+            self.root,
+            session_id=11,
+            now=lambda: 101.0,
+        )
+
+        self.assertEqual(
+            request,
+            single_instance.ApplicationExitRequest(
+                request_id="first",
+                session_id=11,
+                session_scoped=True,
+            ),
+        )
+        self.assertFalse(first.exists())
+        self.assertTrue(second.exists())
+        self.assertTrue(
+            single_instance.application_exit_request_acknowledged(
+                self.root,
+                "first",
+                session_id=11,
+                session_scoped=True,
+            )
+        )
+        self.assertFalse(
+            single_instance.application_exit_request_acknowledged(
+                self.root,
+                "first",
+                session_id=22,
+                session_scoped=True,
+            )
+        )
+
+    def test_session_rejection_and_cleanup_touch_only_the_owned_response(self):
+        single_instance.write_application_exit_rejection(
+            self.root,
+            "same-id",
+            session_id=11,
+            session_scoped=True,
+        )
+        other = single_instance.write_application_exit_rejection(
+            self.root,
+            "same-id",
+            session_id=22,
+            session_scoped=True,
+        )
+
+        self.assertTrue(
+            single_instance.application_exit_request_rejected(
+                self.root,
+                "same-id",
+                session_id=11,
+                session_scoped=True,
+            )
+        )
+        self.assertTrue(
+            single_instance.clear_owned_application_exit_response(
+                self.root,
+                "same-id",
+                session_id=11,
+                session_scoped=True,
+            )
+        )
+        self.assertTrue(other.exists())
+
+    def test_acknowledgement_write_failure_does_not_cancel_consumed_exit(self):
+        single_instance.write_application_exit_request(
+            self.root,
+            request_id="ours",
+            session_id=11,
+            session_scoped=True,
+            now=lambda: 100.0,
+        )
+        original = single_instance.write_application_exit_acknowledgement
+        single_instance.write_application_exit_acknowledgement = (
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("full"))
+        )
+        try:
+            request = single_instance.consume_and_acknowledge_application_exit_request(
+                self.root,
+                session_id=11,
+                now=lambda: 101.0,
+            )
+        finally:
+            single_instance.write_application_exit_acknowledgement = original
+
+        self.assertEqual(
+            request,
+            single_instance.ApplicationExitRequest(
+                request_id="ours",
+                session_id=11,
+                session_scoped=True,
+            ),
+        )
+
+    def test_v3_request_is_consumed_before_legacy_compatibility_request(self):
+        legacy = single_instance.write_application_exit_request(
+            self.root,
+            request_id="legacy",
+            now=lambda: 100.0,
+        )
+        single_instance.write_application_exit_request(
+            self.root,
+            request_id="current",
+            session_id=11,
+            session_scoped=True,
+            now=lambda: 100.0,
+        )
+
+        request = single_instance.consume_and_acknowledge_application_exit_request(
+            self.root,
+            session_id=11,
+            now=lambda: 101.0,
+        )
+
+        self.assertEqual(request.request_id, "current")
+        self.assertTrue(request.session_scoped)
+        self.assertTrue(legacy.exists())
+
+    def test_current_session_query_is_validated_through_an_injected_probe(self):
+        self.assertEqual(
+            single_instance.current_process_session_id(_query=lambda: 7),
+            7,
+        )
+        with self.assertRaises(single_instance.SingleInstanceUnavailableError):
+            single_instance.current_process_session_id(_query=lambda: -1)
 
 
 class MutexCtypesPrototypeTests(unittest.TestCase):
@@ -607,7 +1361,9 @@ class MutexCtypesPrototypeTests(unittest.TestCase):
             self.assertIn(token, source)
 
     def test_settings_window_marker_declares_the_full_real_prototype(self):
-        source = inspect.getsource(single_instance._real_set_window_property)
+        source = inspect.getsource(
+            single_instance._real_set_window_property_value
+        )
         self.assertIn("SetPropW.argtypes", source)
         self.assertIn("SetPropW.restype", source)
         for token in ("wintypes.HWND", "wintypes.LPCWSTR", "wintypes.HANDLE"):
@@ -618,6 +1374,7 @@ class MutexCtypesPrototypeTests(unittest.TestCase):
         for api in (
             "EnumWindows",
             "GetPropW",
+            "SetPropW",
             "IsWindowVisible",
             "IsIconic",
             "ShowWindow",
@@ -627,6 +1384,10 @@ class MutexCtypesPrototypeTests(unittest.TestCase):
         ):
             self.assertIn(f"{api}.argtypes", source)
             self.assertIn(f"{api}.restype", source)
+        self.assertLess(
+            source.index("_SETTINGS_WINDOW_RESTORE_REQUEST_PROPERTY"),
+            source.index("user32.ShowWindow(hwnd"),
+        )
 
 
 if __name__ == "__main__":

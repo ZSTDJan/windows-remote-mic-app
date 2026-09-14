@@ -1,0 +1,68 @@
+# BUG-001 语音已触发但无音频
+
+> 历史记录：本文的状态、命令、版本和待测项只针对当时批次，不是当前操作指引。
+> 当前能力见 [使用说明](../README.md)，最新验收见 [测试记录](../TESTING.md)，后续处理见 [维护记录](../MAINTENANCE.md)。
+
+状态：按住说话真机通过；切换模式见 BUG-005 待实测
+
+记录日期：2026-08-20
+
+## 现象
+
+RC003 麦克风键能够唤起和结束宿主语音输入，但说话没有识别结果。
+
+## 证据与根因
+
+- BLE 连接、ATVV 能力协商、语音开始和停止事件均已到达应用。
+- 每次会话的 PCM 汇总均为 `frames=0 samples=0`。
+- 已保存端点使用 `Windows WDM-KS`，PortAudio 报告阻塞 API 不受支持，
+  因而输出流在接收 PCM 前打开失败。
+- 同机以 `CABLE Input / Windows WASAPI` 和
+  `CABLE Input / Windows DirectSound` 打开输出流成功。
+- 本机合成回环检查已从 CABLE Input 写入并由 CABLE Output 捕获到非零
+  音频，证明 VB-CABLE 驱动链路本身可工作。
+- `fix4` 真机复测已记录约 2.4 秒非零 PCM，汇总结果为 `signal`，宿主产生
+  可见识别文字，证明端点、ATVV、播放和按住说话链路已经贯通。
+
+结论：问题位于应用的端点枚举、选择和保存校验，不是 RC003 BLE/ATVV
+传输失败，也不是 VB-CABLE 安装失败。
+
+## 修复设计
+
+- 当前阻塞播放实现明确拒绝 `Windows WDM-KS`。
+- 同名多 host API 视图按 `Windows WASAPI`、
+  `Windows DirectSound` 的顺序选择；同一优先级仍不唯一时继续失败关闭。
+- 设置保存和“选择检测到的 CABLE Input”在落盘前实际打开、启动并关闭
+  所选输出流，不能只验证端点文字存在。
+- 已有配置保存的是 WDM-KS 时，设置页在检测到唯一标准 CABLE Input 后
+  预选其 WASAPI/DirectSound 可用视图，但仍须用户保存且通过真实预检才落盘。
+- 语音的“按住/切换”生命周期与具体快捷键分开保存，选择生命周期不再
+  擅自覆盖用户录制的宿主快捷键。
+
+## 验证门槛
+
+自动检查：
+
+- WDM-KS 端点不会出现在可选播放端点中，手工构造时也会被拒绝。
+- 多个 CABLE Input 视图优先选 WASAPI，缺失时选 DirectSound。
+- 端点预检真实 open/start/close 失败时不保存。
+
+人工检查：按住说话见 `../TESTING.md` 的 `TEST-VOICE-001`、
+`TEST-VOICE-002`，已经通过；切换持续语音由
+`BUG-005-toggle-continuous-voice.md` 与 `TEST-VOICE-004` 单独收口。断连、
+休眠等恢复能力仍见 `TEST-VOICE-003`，不得扩大为全部语音场景已通过。
+
+## 实施与提交
+
+- 主要实现：`src/ovb_rc003/audio_output.py`、
+  `src/ovb_rc003/audio_playback.py`、`src/ovb_rc003/config.py`、
+  `src/ovb_rc003/qt_settings_app.py`、
+  `src/ovb_rc003/qml/ConnectionPage.qml`。
+- 回归测试：`tests/test_audio_output.py`、
+  `tests/test_audio_playback.py`、`tests/test_config.py`、
+  `tests/test_qt_settings_app.py`。
+- 自动验证：音频定向测试 284 项通过、2 项跳过；含旧 WDM-KS 迁移的扩展
+  定向测试 159 项通过；完整测试 950 项通过、7 项跳过；冻结候选构建成功。
+- 对应提交：`88ea7a90144ff078b7abc62de9dedc4290043fe2`。
+- 旧 WDM-KS 配置迁移补充提交：
+  `b0e18b48ede974b14bc5765a9a1b82cb23b5a7e0`。

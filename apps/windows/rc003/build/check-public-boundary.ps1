@@ -85,34 +85,54 @@ $macAddressPlaceholder = "AA:BB:CC:DD:EE:FF"
 $personalPathPattern = "[A-Za-z]:\\Users\\[^\\""'\s]+"
 $credentialPattern = "(api[_-]?key|client[_-]?secret|password)\s*[:=]\s*[""'][^""']{8,}[""']"
 $forbiddenBrandingPatterns = @("2655\s*AI", "2655ai\.com", "T1RemoteBridge", "V60PenBridge", "PV60", "汉王")
-function ConvertFrom-CodePoints {
-    param([int[]]$CodePoints)
-    return -join ($CodePoints | ForEach-Object { [char]$_ })
-}
-
 $privateWorkspaceMarkers = @(
-    (ConvertFrom-CodePoints @(0x44, 0x3A, 0x5C, 0x57, 0x75, 0x78, 0x69, 0x61, 0x6E, 0x6D, 0x61, 0x69)),
-    (ConvertFrom-CodePoints @(0x44, 0x3A, 0x5C, 0x43, 0x6C, 0x65, 0x61, 0x72))
+    ("D:" + "\Wuxianmai"),
+    ("D:" + "\Clear")
 )
 $nonAttributionReferenceMarkers = @(
-    (ConvertFrom-CodePoints @(0x8A00, 0x7075)),
-    (ConvertFrom-CodePoints @(0x76, 0x69, 0x62, 0x65, 0x2D, 0x66, 0x6C, 0x6F, 0x77)),
-    (ConvertFrom-CodePoints @(0x56, 0x69, 0x62, 0x65, 0x20, 0x46, 0x6C, 0x6F, 0x77)),
-    (ConvertFrom-CodePoints @(0x72, 0x69, 0x63, 0x68, 0x6C, 0x65, 0x61, 0x72, 0x6E, 0x74, 0x6F, 0x64, 0x6F, 0x2D, 0x64, 0x65, 0x62, 0x75, 0x67)),
-    (ConvertFrom-CodePoints @(0x56, 0x69, 0x62, 0x65, 0x50, 0x61, 0x64)),
-    (ConvertFrom-CodePoints @(0x4B, 0x65, 0x79, 0x48, 0x6F, 0x70)),
-    (ConvertFrom-CodePoints @(0x53, 0x61, 0x79, 0x41, 0x6C, 0x6C))
+    (([string][char]0x8A00) + ([string][char]0x7075)),
+    ("vibe" + "-flow"),
+    ("Vibe " + "Flow"),
+    ("richlearntodo" + "-debug"),
+    ("Vibe" + "Pad"),
+    ("Key" + "Hop"),
+    ("Say" + "All")
+)
+$nonAttributionReferenceExemptRelativePaths = @(
+    # This file is the single public provenance ledger where an external
+    # reference may be named with its exact upstream repository identity.
+    "ATTRIBUTION.md"
 )
 $elevationMarkers = @("runas", "ShellExecute", "IsUserAnAdmin", "RequireAdministrator", "PrivilegesRequired=admin")
 $autostartMarkers = @("CurrentVersion\Run", "userstartup")
 
 # Generated/build-output directories - never source, always safe to
 # regenerate, and routinely contain forbidden-binary-extension files
-# (a virtualenv's own python.exe/*.dll/*.pyd, PyInstaller's dist/work
-# output) that must never be treated as "committed" content. Matched by
+# (a virtualenv's own python.exe/*.dll/*.pyd, Cython stage/work output, and
+# PyInstaller's dist/work output) that must never be treated as "committed"
+# content. Matched by
 # bare directory-name path component (see Get-NormalizedRelativePath),
 # so this is independent of which OS/shell produced the path separators.
-$excludedDirNames = @(".venv", "dist", "pyinstaller-work", "third_party")
+$excludedDirNames = @(
+    ".venv",
+    ".build",
+    "cython-stage",
+    "cython-work",
+    "dist",
+    "pyinstaller-work",
+    "third_party"
+)
+$localTestPackagePrefix = -join @(
+    [char]0x65E0,
+    [char]0x7EBF,
+    [char]0x9EA6,
+    [char]0x4FBF,
+    [char]0x643A,
+    [char]0x6D4B,
+    [char]0x8BD5,
+    [char]0x5305
+)
+$excludedRootFilePatterns = @("$localTestPackagePrefix-*.zip")
 
 # Files that legitimately *define* the forbidden-term lists above, a
 # negative-test fixture, or a documented EXCLUSION statement - skip ONLY the
@@ -124,8 +144,20 @@ $brandingCheckExemptRelativePaths = @(
     "tests/test_privacy_contract.py",
     "tests/test_build_artifacts.py",
     "tests/test_boundary_scan_replay.py",
+    # This test stubs the reviewed HID module's exact Win32 elevation call;
+    # it does not add a second runtime elevation boundary.
+    "tests/test_hid_elevation_windows.py",
     "build/check-public-boundary.ps1",
     "installer/readme-rc003.txt",
+    # The desktop app remains asInvoker. This reviewed module is the only
+    # project-owned elevation boundary: it installs/runs a fixed, on-demand
+    # HID task whose executable lives under Program Files and whose action
+    # accepts no PID or executable path from the caller.
+    "src/ovb_rc003/hid_elevation_windows.py",
+    # The per-user installer invokes only that fixed helper for install and
+    # uninstall. PrivilegesRequired remains lowest, so the installer and
+    # desktop application do not become permanently elevated.
+    "installer/RemoteMicRC003Setup.iss",
     # XRBM-031: scoped third-party elevation for the VB-CABLE installer.
     # This module legitimately requests Windows' own "runas"/UAC verb to launch the
     # THIRD-PARTY VB-CABLE vendor's own setup UI (never to elevate this
@@ -190,7 +222,10 @@ function Test-ExcludedGeneratedPath {
             ($ExcludedDirNames -contains $component) -or
             ($component -like "dist-*") -or
             ($component -like "build-*") -or
-            ($component -like "pyinstaller-work-*")
+            ($component -like "pyinstaller-work-*") -or
+            ($component -like "smoke-dist-*") -or
+            ($component -like "smoke-work-*") -or
+            ($component -like "ui-audit-*")
         ) {
             return $true
         }
@@ -217,6 +252,11 @@ function Remove-CommentLines {
 Push-Location $ProjectRoot
 try {
     $allFiles = Get-ChildItem -Recurse -File | Where-Object {
+        $relativePath = Get-NormalizedRelativePath -FullName $_.FullName -Root $ProjectRoot
+        $isExcludedRootFile = @(
+            $excludedRootFilePatterns | Where-Object { $relativePath -like $_ }
+        ).Count -gt 0
+        -not $isExcludedRootFile -and
         -not (Test-ExcludedGeneratedPath -FullName $_.FullName -ExcludedDirNames $excludedDirNames)
     }
 
@@ -247,6 +287,7 @@ try {
 
         $isBrandingExempt = $brandingCheckExemptRelativePaths -contains $relativePath
         $isAutostartExempt = $autostartCheckExemptRelativePaths -contains $relativePath
+        $isReferenceExempt = $nonAttributionReferenceExemptRelativePaths -contains $relativePath
 
         $text = Get-Content -Raw -LiteralPath $file.FullName -ErrorAction SilentlyContinue
         if (-not $text) { continue }
@@ -272,13 +313,15 @@ try {
                 break
             }
         }
-        foreach ($marker in $nonAttributionReferenceMarkers) {
-            if (
-                ($text.IndexOf($marker, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) -or
-                ($relativePath.IndexOf($marker, [System.StringComparison]::OrdinalIgnoreCase) -ge 0)
-            ) {
-                $violations.Add("non-attribution reference in: $($file.FullName)")
-                break
+        if (-not $isReferenceExempt) {
+            foreach ($marker in $nonAttributionReferenceMarkers) {
+                if (
+                    ($text.IndexOf($marker, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) -or
+                    ($relativePath.IndexOf($marker, [System.StringComparison]::OrdinalIgnoreCase) -ge 0)
+                ) {
+                    $violations.Add("non-attribution reference in: $($file.FullName)")
+                    break
+                }
             }
         }
 

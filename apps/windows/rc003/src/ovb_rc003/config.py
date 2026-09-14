@@ -31,7 +31,18 @@ PRODUCT_ID = "RC003"
 CONFIG_FILENAME = "config.json"
 KEY_BINDINGS_FILENAME = "key_bindings.json"
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 14
+
+VOICE_HOTKEY_SOURCE_DEFAULT = "default"
+VOICE_HOTKEY_SOURCE_AUTO = "auto"
+VOICE_HOTKEY_SOURCE_MANUAL = "manual"
+VALID_VOICE_HOTKEY_SOURCES = frozenset(
+    {
+        VOICE_HOTKEY_SOURCE_DEFAULT,
+        VOICE_HOTKEY_SOURCE_AUTO,
+        VOICE_HOTKEY_SOURCE_MANUAL,
+    }
+)
 
 CLOSE_BEHAVIOR_HIDE_TO_TRAY = "hide_to_tray"
 CLOSE_BEHAVIOR_QUIT = "quit"
@@ -41,10 +52,12 @@ VALID_CLOSE_BEHAVIORS = frozenset(
 
 RUNTIME_LEGACY_VOICE_MODE_KEY = "_legacy_voice_trigger_mode"
 RUNTIME_REMOVED_VOICE_BINDINGS_KEY = "_removed_voice_bindings"
+RUNTIME_REMOVED_WINDOWS_DICTATION_KEY = "_removed_windows_dictation"
 _RUNTIME_ONLY_KEYS = frozenset(
     {
         RUNTIME_LEGACY_VOICE_MODE_KEY,
         RUNTIME_REMOVED_VOICE_BINDINGS_KEY,
+        RUNTIME_REMOVED_WINDOWS_DICTATION_KEY,
     }
 )
 
@@ -131,7 +144,11 @@ def default_config() -> Dict[str, Any]:
         # Desktop-shell behavior. Windows login startup itself is owned by
         # the user's HKCU Run value and is deliberately not mirrored here.
         "launch_bridge_on_app_start": False,
+        "diagnostic_trace_enabled": False,
         "close_behavior": CLOSE_BEHAVIOR_HIDE_TO_TRAY,
+        # A portable build offers each exact helper binary once. The explicit
+        # device-page action remains available after the automatic prompt.
+        "hid_helper_setup_prompted_offer_id": "",
     }
 
 
@@ -165,6 +182,7 @@ def _assert_no_forbidden_keys(data: Dict[str, Any]) -> None:
 
 
 def load_config(path: Path) -> Dict[str, Any]:
+    from . import remote_selection
     config = default_config()
     if path.is_file():
         with path.open("r", encoding="utf-8-sig") as handle:
@@ -183,11 +201,16 @@ def load_config(path: Path) -> Dict[str, Any]:
     _normalize_voice_program(config)
     _normalize_voice_hotkey(config)
     _normalize_desktop_behavior(config)
+    if remote_selection.KEY in config:
+        config[remote_selection.KEY] = remote_selection.normalize(config[remote_selection.KEY])
     return config
 
 
 def save_config(path: Path, config: Dict[str, Any]) -> None:
+    from . import remote_selection
     persisted = _without_runtime_only_keys(config)
+    if remote_selection.KEY in persisted:
+        persisted[remote_selection.KEY] = remote_selection.normalize(persisted[remote_selection.KEY])
     _assert_no_forbidden_keys(persisted)
     _normalize_voice_hotkey(persisted)
     _normalize_voice_program(persisted)
@@ -270,15 +293,37 @@ def _normalize_voice_hotkey(config: Dict[str, Any]) -> None:
         if not isinstance(raw_entry, dict):
             continue
         candidate = str(raw_entry.get("hold", "")).strip().lower()
-        if candidate:
-            provider_hotkeys[candidate_provider] = {"hold": candidate}
+        source = str(raw_entry.get("source", "")).strip().lower()
+        if source not in VALID_VOICE_HOTKEY_SOURCES:
+            source = VOICE_HOTKEY_SOURCE_MANUAL
+        validation = (
+            voice_hotkey_sync_windows.validate_provider_hotkey(
+                candidate_provider,
+                candidate,
+            )
+            if candidate
+            else None
+        )
+        if validation is None or not validation.ok:
+            source = VOICE_HOTKEY_SOURCE_DEFAULT
+        provider_hotkeys[candidate_provider] = {
+            "hold": validation.hotkey if validation is not None and validation.ok else "",
+            "source": source,
+        }
 
     if (
         explicit_current_override
         or not has_provider_hotkeys
         or provider_id not in raw_provider_hotkeys
     ):
-        provider_hotkeys[provider_id] = {"hold": current}
+        validation = voice_hotkey_sync_windows.validate_provider_hotkey(
+            provider_id,
+            current,
+        )
+        provider_hotkeys[provider_id] = {
+            "hold": validation.hotkey if validation.ok else "",
+            "source": VOICE_HOTKEY_SOURCE_MANUAL,
+        }
 
     current = provider_hotkeys[provider_id]["hold"]
 
@@ -304,12 +349,49 @@ def voice_hotkey_for_provider(
         if isinstance(entry, dict):
             candidate = str(entry.get("hold", "")).strip().lower()
             if candidate:
-                return candidate
+                validation = voice_hotkey_sync_windows.validate_provider_hotkey(
+                    provider,
+                    candidate,
+                )
+                return validation.hotkey if validation.ok else ""
+            return ""
     return voice_hotkey_sync_windows.default_hotkey(provider)
 
 
+def voice_hotkey_source_for_provider(
+    config_data: Dict[str, Any], provider_id: object
+) -> str:
+    provider = str(provider_id).strip().lower()
+    entries = config_data.get("voice_hotkeys_by_provider")
+    if isinstance(entries, dict):
+        entry = entries.get(provider)
+        if isinstance(entry, dict):
+            source = str(entry.get("source", "")).strip().lower()
+            if source not in VALID_VOICE_HOTKEY_SOURCES:
+                return VOICE_HOTKEY_SOURCE_DEFAULT
+            candidate = str(entry.get("hold", "")).strip().lower()
+            if source in {
+                VOICE_HOTKEY_SOURCE_AUTO,
+                VOICE_HOTKEY_SOURCE_MANUAL,
+            }:
+                from . import voice_hotkey_sync_windows
+
+                validation = voice_hotkey_sync_windows.validate_provider_hotkey(
+                    provider,
+                    candidate,
+                )
+                if not validation.ok:
+                    return VOICE_HOTKEY_SOURCE_DEFAULT
+            return source
+    return VOICE_HOTKEY_SOURCE_DEFAULT
+
+
 def set_voice_hotkey_for_provider(
-    config_data: Dict[str, Any], provider_id: object, shortcut: str
+    config_data: Dict[str, Any],
+    provider_id: object,
+    shortcut: str,
+    *,
+    source: object = None,
 ) -> None:
     """Update one provider and keep legacy current-provider mirrors coherent."""
 
@@ -319,7 +401,23 @@ def set_voice_hotkey_for_provider(
     normalized = str(shortcut).strip().lower()
     entries = config_data.get("voice_hotkeys_by_provider")
     next_entries = dict(entries) if isinstance(entries, dict) else {}
-    next_entries[provider] = {"hold": normalized}
+    existing = next_entries.get(provider)
+    existing_source = (
+        str(existing.get("source", "")).strip().lower()
+        if isinstance(existing, dict)
+        else ""
+    )
+    resolved_source = str(source or "").strip().lower()
+    if resolved_source not in VALID_VOICE_HOTKEY_SOURCES:
+        resolved_source = (
+            existing_source
+            if existing_source in VALID_VOICE_HOTKEY_SOURCES
+            else VOICE_HOTKEY_SOURCE_MANUAL
+        )
+    next_entries[provider] = {
+        "hold": normalized,
+        "source": resolved_source,
+    }
     config_data["voice_hotkeys_by_provider"] = next_entries
     current_provider = str(
         voice_program_manager.normalize_voice_program_settings(
@@ -334,8 +432,15 @@ def set_voice_hotkey_for_provider(
 def _normalize_voice_program(config: Dict[str, Any]) -> None:
     from . import voice_program_manager
 
+    raw = config.get("voice_program")
+    if (
+        isinstance(raw, dict)
+        and str(raw.get("provider", "")).strip().lower()
+        == voice_program_manager.LEGACY_VOICE_PROGRAM_WINDOWS_DICTATION
+    ):
+        config[RUNTIME_REMOVED_WINDOWS_DICTATION_KEY] = True
     config["voice_program"] = voice_program_manager.normalize_voice_program_settings(
-        config.get("voice_program")
+        raw
     )
 
 
@@ -343,6 +448,25 @@ def _normalize_desktop_behavior(config: Dict[str, Any]) -> None:
     config["launch_bridge_on_app_start"] = bool(
         config.get("launch_bridge_on_app_start", False)
     )
+    config["diagnostic_trace_enabled"] = bool(
+        config.get("diagnostic_trace_enabled", False)
+    )
+    prompted_offer_id = config.get("hid_helper_setup_prompted_offer_id", "")
+    if not isinstance(prompted_offer_id, str) or len(prompted_offer_id) > 128:
+        prompted_offer_id = ""
+    prompted_offer_id = prompted_offer_id.strip()
+    legacy_generation = config.pop("hid_helper_setup_prompted_generation", None)
+    legacy_prompted = config.pop("hid_helper_setup_prompted", False)
+    if not prompted_offer_id:
+        if (
+            isinstance(legacy_generation, int)
+            and not isinstance(legacy_generation, bool)
+            and legacy_generation > 0
+        ):
+            prompted_offer_id = f"legacy-generation:{legacy_generation}"
+        elif legacy_prompted is True:
+            prompted_offer_id = "legacy-generation:1"
+    config["hid_helper_setup_prompted_offer_id"] = prompted_offer_id
     close_behavior = str(
         config.get("close_behavior", CLOSE_BEHAVIOR_HIDE_TO_TRAY)
     ).strip()

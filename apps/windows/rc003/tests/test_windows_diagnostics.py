@@ -55,15 +55,18 @@ class RawInputCheckTests(unittest.TestCase):
     def test_zero_matches_fails(self):
         result = diag.check_raw_input(enumerate_paths=lambda: [])
         self.assertEqual(result.status, diag.CheckStatus.FAIL)
+        self.assertEqual(result.result_code, "no_device")
 
     def test_exactly_one_match_passes(self):
         result = diag.check_raw_input(enumerate_paths=lambda: ["\\\\?\\HID#VID_2717&PID_32B8#..."])
         self.assertEqual(result.status, diag.CheckStatus.PASS)
         self.assertEqual(result.detail, "小米遥控器2 Pro 按键设备已找到")
+        self.assertEqual(result.result_code, "ready")
 
     def test_ambiguous_matches_fails(self):
         result = diag.check_raw_input(enumerate_paths=lambda: ["path1", "path2"])
         self.assertEqual(result.status, diag.CheckStatus.FAIL)
+        self.assertEqual(result.result_code, "ambiguous")
 
     def test_never_reports_the_device_path_itself(self):
         secret_path = "\\\\?\\HID#VID_2717&PID_32B8#SUPERSECRETSERIAL"
@@ -135,11 +138,13 @@ class BleCandidateCheckTests(unittest.TestCase):
         result = diag.check_ble_candidate(discover=lambda: [])
         self.assertEqual(result.status, diag.CheckStatus.FAIL)
         self.assertEqual(result.group, diag.CheckGroup.VOICE_BRIDGE)
+        self.assertEqual(result.result_code, "no_candidate")
 
     def test_exactly_one_matching_candidate_passes(self):
         candidates = [identity.RC003Candidate(name="Mi RC", hardware_match=False)]
         result = diag.check_ble_candidate(discover=lambda: candidates)
         self.assertEqual(result.status, diag.CheckStatus.PASS)
+        self.assertEqual(result.result_code, "ready")
 
     def test_ambiguous_candidates_fails(self):
         candidates = [
@@ -148,6 +153,7 @@ class BleCandidateCheckTests(unittest.TestCase):
         ]
         result = diag.check_ble_candidate(discover=lambda: candidates)
         self.assertEqual(result.status, diag.CheckStatus.FAIL)
+        self.assertEqual(result.result_code, "ambiguous")
 
     def test_non_matching_candidate_is_treated_as_no_candidate(self):
         candidates = [identity.RC003Candidate(name="Some Other Device", hardware_match=False)]
@@ -415,7 +421,7 @@ class VbCableLoopbackCheckTests(unittest.TestCase):
         with mock.patch.object(diag, "check_vb_cable_loopback") as loopback:
             report = diag.run_diagnostics(cancel_event=threading.Event())
 
-        self.assertEqual(len(report.checks), 6)
+        self.assertEqual(len(report.checks), 5)
         loopback.assert_not_called()
 
     def test_isolated_check_returns_the_validated_child_result(self):
@@ -568,16 +574,8 @@ class OutputEndpointResolutionCheckTests(unittest.TestCase):
         self.assertNotIn("private endpoint detail", result.detail)
 
 
-class DictationCheckTests(unittest.TestCase):
-    def test_always_manual_never_fabricates_a_verdict(self):
-        result = diag.check_dictation_manual()
-        self.assertEqual(result.status, diag.CheckStatus.MANUAL)
-        self.assertEqual(result.group, diag.CheckGroup.DICTATION)
-        self.assertIn("Win+H", result.detail)
-
-
 class RunDiagnosticsOrchestrationTests(unittest.TestCase):
-    def test_returns_all_six_checks_with_stable_ids(self):
+    def test_returns_all_five_checks_with_stable_ids(self):
         report = diag.run_diagnostics()
         ids = {check.check_id for check in report.checks}
         self.assertEqual(
@@ -588,13 +586,12 @@ class RunDiagnosticsOrchestrationTests(unittest.TestCase):
                 "ble_candidate",
                 "vb_cable_endpoints",
                 "output_endpoint",
-                "dictation",
             },
         )
 
     def test_get_looks_up_by_id(self):
         report = diag.run_diagnostics()
-        self.assertIsNotNone(report.get("dictation"))
+        self.assertIsNotNone(report.get("output_endpoint"))
         self.assertIsNone(report.get("nonexistent"))
 
     def test_source_environment_checks_degrade_to_unsupported_not_pass(self):
@@ -654,8 +651,6 @@ class RunDiagnosticsOrchestrationTests(unittest.TestCase):
             diag, "check_ble_candidate", return_value=simple_result
         ), mock.patch.object(
             diag, "check_vb_cable_endpoints", return_value=simple_result
-        ), mock.patch.object(
-            diag, "check_dictation_manual", return_value=simple_result
         ):
             diag.run_diagnostics(
                 saved_output_name="CABLE Input",
@@ -671,7 +666,7 @@ class RunDiagnosticsOrchestrationTests(unittest.TestCase):
 
 class RunDiagnosticsIsolationTests(unittest.TestCase):
     """XRBM-031 RETRY 1 item 2: an unexpected exception from any ONE check
-    function must never abort run_diagnostics() or leave the other five
+    function must never abort run_diagnostics() or leave the other four
     checks missing - it becomes only that check's own honest FAIL result.
     """
 
@@ -685,16 +680,15 @@ class RunDiagnosticsIsolationTests(unittest.TestCase):
         ):
             report = module.run_diagnostics()
 
-        self.assertEqual(len(report.checks), 6)
+        self.assertEqual(len(report.checks), 5)
         failed = report.get("ble_candidate")
         self.assertEqual(failed.status, diag.CheckStatus.FAIL)
         self.assertEqual(failed.group, diag.CheckGroup.VOICE_BRIDGE)
         self.assertNotIn("boom", failed.detail)
-        # The other five checks still render their own real result -
+        # The other four checks still render their own real result -
         # nothing else was aborted or left missing.
         other_ids = {
             "os_version", "raw_input", "vb_cable_endpoints", "output_endpoint",
-            "dictation"
         }
         self.assertEqual({c.check_id for c in report.checks} - {"ble_candidate"}, other_ids)
         for check_id in other_ids:
@@ -723,12 +717,12 @@ class RunDiagnosticsIsolationTests(unittest.TestCase):
         from ovb_rc003 import windows_diagnostics as module
 
         with mock.patch.object(module, "check_os_version", side_effect=RuntimeError("a")):
-            with mock.patch.object(module, "check_dictation_manual", side_effect=RuntimeError("b")):
+            with mock.patch.object(module, "check_vb_cable_endpoints", side_effect=RuntimeError("b")):
                 report = module.run_diagnostics()
 
-        self.assertEqual(len(report.checks), 6)
+        self.assertEqual(len(report.checks), 5)
         self.assertEqual(report.get("os_version").status, diag.CheckStatus.FAIL)
-        self.assertEqual(report.get("dictation").status, diag.CheckStatus.FAIL)
+        self.assertEqual(report.get("vb_cable_endpoints").status, diag.CheckStatus.FAIL)
         # Untouched checks are unaffected.
         self.assertIsNotNone(report.get("ble_candidate"))
 
@@ -2213,9 +2207,9 @@ class RunDiagnosticsStopsAfterCancellationTests(unittest.TestCase):
     to be discarded unemitted anyway.
     """
 
-    def test_no_cancel_event_still_runs_all_six_checks(self):
+    def test_no_cancel_event_still_runs_all_five_checks(self):
         report = diag.run_diagnostics()
-        self.assertEqual(len(report.checks), 6)
+        self.assertEqual(len(report.checks), 5)
 
     def test_stops_immediately_after_the_check_during_which_cancellation_was_observed(self):
         cancel_event = threading.Event()

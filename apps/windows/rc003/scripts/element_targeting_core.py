@@ -145,6 +145,12 @@ VISUAL_SURFACE_MIN_HEIGHT = 120
 
 VISUAL_SURFACE_MIN_WINDOW_AREA_RATIO = 0.06
 
+WINDOW_SHELL_MIN_COVERAGE = 0.85
+
+BROAD_CONTAINER_MIN_WINDOW_AREA_RATIO = 0.18
+
+BROAD_CONTAINER_CONTROL_TYPES = WRAPPER_CONTROL_TYPES | frozenset({"LegacyControl"})
+
 @dataclass(frozen=True)
 class ElementSnapshot:
     rect: Rect
@@ -1301,20 +1307,75 @@ def msaa_wrapper_should_be_ignored(
     window_rect: Rect,
     existing_targets: Sequence[TargetSnapshot],
 ) -> bool:
-    """Ignore a window-sized legacy shell when finer UIA actions exist."""
+    """Keep legacy rectangles only as internal last-resort actions."""
 
-    if not existing_targets:
-        return False
     window_area = max(1, window_rect.width * window_rect.height)
     coverage = _rect_intersection_area(msaa_rect, window_rect) / window_area
-    if coverage < 0.85:
+    if coverage >= WINDOW_SHELL_MIN_COVERAGE:
+        return True
+    if coverage < BROAD_CONTAINER_MIN_WINDOW_AREA_RATIO:
         return False
-    contained_targets = sum(
-        target.rect != msaa_rect
-        and msaa_rect.contains(target.rect)
+    return any(
+        target.rect != msaa_rect and msaa_rect.contains(target.rect)
         for target in existing_targets
     )
-    return contained_targets >= 2
+
+
+def broad_container_target_should_be_ignored(
+    target: TargetSnapshot,
+    window_rect: Rect,
+    existing_targets: Sequence[TargetSnapshot] = (),
+) -> bool:
+    """Drop outer shells and broad containers that already expose children."""
+
+    if target.control_type not in BROAD_CONTAINER_CONTROL_TYPES:
+        return False
+    window_area = max(1, window_rect.width * window_rect.height)
+    coverage = _rect_intersection_area(target.rect, window_rect) / window_area
+    if coverage >= WINDOW_SHELL_MIN_COVERAGE:
+        return True
+    if coverage < BROAD_CONTAINER_MIN_WINDOW_AREA_RATIO:
+        return False
+    return any(
+        candidate is not target
+        and target_is_action_descendant(target, candidate)
+        for candidate in existing_targets
+    )
+
+
+def broad_container_keep_indices(
+    targets: Sequence[TargetSnapshot],
+    window_rect: Rect,
+) -> list[int]:
+    """Apply the shared outer-shell and internal-container fallback policy."""
+
+    nested_keep = set(nested_container_keep_indices(targets))
+    return [
+        index
+        for index, target in enumerate(targets)
+        if index in nested_keep
+        and not broad_container_target_should_be_ignored(
+            target,
+            window_rect,
+            targets,
+        )
+    ]
+
+
+def targets_need_broad_container_rescan(
+    targets: Sequence[TargetSnapshot],
+    window_rect: Rect,
+) -> bool:
+    """Return whether movement should first retry a lone internal fallback."""
+
+    if len(targets) != 1:
+        return False
+    target = targets[0]
+    if target.control_type not in BROAD_CONTAINER_CONTROL_TYPES:
+        return False
+    window_area = max(1, window_rect.width * window_rect.height)
+    coverage = _rect_intersection_area(target.rect, window_rect) / window_area
+    return BROAD_CONTAINER_MIN_WINDOW_AREA_RATIO <= coverage < WINDOW_SHELL_MIN_COVERAGE
 
 def nested_container_keep_indices(targets: Sequence[TargetSnapshot]) -> list[int]:
     """Drop only weak UIA wrappers, preserving real parent and child actions."""
@@ -1523,6 +1584,9 @@ __all__ = (
     'VISUAL_SURFACE_MIN_WIDTH',
     'VISUAL_SURFACE_MIN_HEIGHT',
     'VISUAL_SURFACE_MIN_WINDOW_AREA_RATIO',
+    'WINDOW_SHELL_MIN_COVERAGE',
+    'BROAD_CONTAINER_MIN_WINDOW_AREA_RATIO',
+    'BROAD_CONTAINER_CONTROL_TYPES',
     'ElementSnapshot',
     'SyntheticTargetSpec',
     'OpaqueVisualSurface',
@@ -1561,6 +1625,9 @@ __all__ = (
     'initial_target_index',
     'hit_target_match_index',
     'msaa_wrapper_should_be_ignored',
+    'broad_container_target_should_be_ignored',
+    'broad_container_keep_indices',
+    'targets_need_broad_container_rescan',
     'nested_container_keep_indices',
     'target_quality_rank',
     'flat_target_indices',

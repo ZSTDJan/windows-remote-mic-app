@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import os
 import threading
+import time
 from dataclasses import dataclass
 from typing import Any, Callable, Optional, Sequence
 
@@ -77,15 +78,177 @@ NATIVE_MENU_NAVIGATION_KEYS = frozenset(
 DIRECTION_NAVIGATION_KEYS = frozenset({VK_UP, VK_DOWN, VK_LEFT, VK_RIGHT})
 
 
-class DirectionInputOwnership:
-    """Let a downstream device hook claim raw direction-key edges."""
+@dataclass(frozen=True)
+class _ArmedDirectionEdge:
+    vk: int
+    scan_code: int
+    extended: bool
+    is_pressed: bool
+    expires_at: float
 
-    def __init__(self) -> None:
+
+@dataclass(frozen=True)
+class _TrackedDirectionState:
+    is_pressed: bool
+    expires_at: float
+
+
+class DirectionInputOwnership:
+    """Correlate one RC003 edge with the matching global keyboard edge."""
+
+    def __init__(
+        self,
+        *,
+        consume_wait_seconds: float = 0.060,
+        edge_lifetime_seconds: float = 0.180,
+        tracked_hold_seconds: float = 10.0,
+        tracked_release_seconds: float = 0.180,
+    ) -> None:
         self._forwarded_down: set[int] = set()
         self._downstream_owned: set[int] = set()
+        self._consume_wait_seconds = max(0.0, float(consume_wait_seconds))
+        self._edge_lifetime_seconds = max(0.0, float(edge_lifetime_seconds))
+        self._tracked_hold_seconds = max(0.0, float(tracked_hold_seconds))
+        self._tracked_release_seconds = max(0.0, float(tracked_release_seconds))
+        self._armed_edges: list[_ArmedDirectionEdge] = []
+        self._tracked: dict[tuple[int, int, bool], _TrackedDirectionState] = {}
+        self._edges_changed = threading.Condition(threading.Lock())
 
     def has_forwarded_down(self, vk: int) -> bool:
         return vk in self._forwarded_down
+
+    def reset_device_edges(self) -> None:
+        """Forget device correlation when navigation stops intercepting."""
+
+        with self._edges_changed:
+            self._armed_edges.clear()
+            self._tracked.clear()
+            self._edges_changed.notify_all()
+
+    def record_device_edge(
+        self,
+        vk: int,
+        scan_code: int,
+        extended: bool,
+        is_pressed: bool,
+    ) -> bool:
+        """Arm one exact device-scoped edge before Windows translates it."""
+
+        vk = int(vk)
+        if vk not in DIRECTION_NAVIGATION_KEYS:
+            return False
+        identity = (vk, int(scan_code), bool(extended))
+        with self._edges_changed:
+            now = time.monotonic()
+            self._purge_locked(now)
+            should_arm = True
+            if is_pressed:
+                self._tracked[identity] = _TrackedDirectionState(
+                    True,
+                    now + self._tracked_hold_seconds,
+                )
+            elif identity in self._tracked:
+                self._tracked[identity] = _TrackedDirectionState(
+                    False,
+                    now + self._tracked_release_seconds,
+                )
+            else:
+                # The translated release may already have consumed the tracked
+                # state. Do not leave an orphan arm for another keyboard.
+                should_arm = False
+            if should_arm:
+                self._armed_edges.append(
+                    _ArmedDirectionEdge(
+                        vk,
+                        identity[1],
+                        identity[2],
+                        bool(is_pressed),
+                        now + self._edge_lifetime_seconds,
+                    )
+                )
+                if len(self._armed_edges) > 32:
+                    self._armed_edges = self._armed_edges[-32:]
+            self._edges_changed.notify_all()
+        return should_arm
+
+    def _purge_locked(self, now: float) -> None:
+        self._armed_edges = [
+            edge for edge in self._armed_edges if edge.expires_at > now
+        ]
+        self._tracked = {
+            identity: state
+            for identity, state in self._tracked.items()
+            if state.expires_at > now
+        }
+
+    def _consume_armed_locked(
+        self,
+        identity: tuple[int, int, bool],
+        is_pressed: bool,
+        now: float,
+    ) -> bool:
+        matched = False
+        kept: list[_ArmedDirectionEdge] = []
+        for edge in self._armed_edges:
+            if (
+                not matched
+                and edge.expires_at > now
+                and (edge.vk, edge.scan_code, edge.extended) == identity
+                and edge.is_pressed == bool(is_pressed)
+            ):
+                matched = True
+                continue
+            if edge.expires_at > now:
+                kept.append(edge)
+        self._armed_edges = kept
+        return matched
+
+    def _consume_tracked_locked(
+        self,
+        identity: tuple[int, int, bool],
+        is_pressed: bool,
+        now: float,
+    ) -> bool:
+        self._purge_locked(now)
+        state = self._tracked.get(identity)
+        if state is None:
+            return False
+        if not is_pressed:
+            self._tracked.pop(identity, None)
+            return True
+        if state.is_pressed:
+            self._tracked[identity] = _TrackedDirectionState(
+                True,
+                now + self._tracked_hold_seconds,
+            )
+        return True
+
+    def _consume_device_edge(
+        self,
+        vk: int,
+        scan_code: int,
+        extended: bool,
+        is_pressed: bool,
+    ) -> bool:
+        identity = (int(vk), int(scan_code), bool(extended))
+        with self._edges_changed:
+            deadline = time.monotonic() + (
+                self._consume_wait_seconds if is_pressed else 0.0
+            )
+            while True:
+                now = time.monotonic()
+                matched = self._consume_armed_locked(identity, is_pressed, now)
+                if matched and not is_pressed:
+                    self._tracked.pop(identity, None)
+                if not matched:
+                    matched = self._consume_tracked_locked(
+                        identity,
+                        is_pressed,
+                        now,
+                    )
+                if matched or not is_pressed or now >= deadline:
+                    return matched
+                self._edges_changed.wait(deadline - now)
 
     def route(
         self,
@@ -95,13 +258,14 @@ class DirectionInputOwnership:
         is_up: bool,
         injected: bool,
         call_next: Callable[[], int],
+        scan_code: int = 0,
+        extended: bool = False,
     ) -> tuple[bool, int]:
         """Return ``(downstream_owned, downstream_result)``.
 
-        Raw direction downs are offered to the rest of the hook chain first.
-        A non-zero result means the selected RC003 suppressor claimed the
-        physical edge. Its repeats and matching release remain downstream-owned.
-        Injected mapping events bypass this path and stay available to navigation.
+        Device-scoped RC003 edges are armed by the HID tap and matched against
+        the global hook by VK, scan code, extended flag, and edge. Injected
+        mapping events bypass this path and remain available to navigation.
         """
 
         if injected or vk not in DIRECTION_NAVIGATION_KEYS:
@@ -113,7 +277,13 @@ class DirectionInputOwnership:
             return False, 0
 
         downstream_result = int(call_next())
-        downstream_owned = was_owned or downstream_result != 0
+        device_owned = self._consume_device_edge(
+            vk,
+            scan_code,
+            extended,
+            is_down,
+        )
+        downstream_owned = was_owned or downstream_result != 0 or device_owned
         if is_down:
             self._forwarded_down.add(vk)
             if downstream_result != 0:

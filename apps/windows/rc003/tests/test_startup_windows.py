@@ -17,8 +17,11 @@ class _FakeWinreg:
     KEY_SET_VALUE = 2
     REG_SZ = 1
 
-    def __init__(self, value=None):
+    def __init__(self, value=None, *, value_type=None, set_error=None):
         self.value = value
+        self.value_type = self.REG_SZ if value_type is None else value_type
+        self.set_error = set_error
+        self.set_calls = 0
 
     def OpenKey(self, root, path, reserved, access):
         if self.value is None:
@@ -31,9 +34,12 @@ class _FakeWinreg:
     def QueryValueEx(self, key, name):
         if self.value is None:
             raise FileNotFoundError(name)
-        return self.value, self.REG_SZ
+        return self.value, self.value_type
 
     def SetValueEx(self, key, name, reserved, value_type, value):
+        self.set_calls += 1
+        if self.set_error is not None:
+            raise self.set_error
         self.value = value
 
     def DeleteValue(self, key, name):
@@ -106,6 +112,155 @@ class StartupWindowsTests(unittest.TestCase):
         )
         self.assertFalse(state.enabled)
         self.assertIn("Windows", state.error)
+
+    def test_rebind_owned_frozen_startup_moves_old_portable_command_to_current_path(self):
+        old_command = startup_windows.command_line(
+            [r"D:\旧版 无线麦\RemoteMicRC003.exe", "--background"]
+        )
+        current_command = startup_windows.command_line(
+            [r"E:\新版 无线麦\RemoteMicRC003.exe", "--background"]
+        )
+        registry = _FakeWinreg(old_command)
+
+        state = startup_windows.rebind_owned_frozen_startup(
+            platform="win32",
+            frozen=True,
+            executable=r"E:\新版 无线麦\RemoteMicRC003.exe",
+            current_command=current_command,
+            winreg_module=registry,
+            command_parser=lambda _value: [
+                r"D:\旧版 无线麦\RemoteMicRC003.exe",
+                "--background",
+            ],
+        )
+
+        self.assertTrue(state.enabled)
+        self.assertEqual(state.error, "")
+        self.assertEqual(registry.value, current_command)
+        self.assertEqual(registry.set_calls, 1)
+
+    def test_rebind_owned_frozen_startup_works_when_old_exe_is_missing(self):
+        old_command = startup_windows.command_line(
+            [r"D:\已删除\RemoteMicRC003.exe", "--background"]
+        )
+        registry = _FakeWinreg(old_command)
+
+        state = startup_windows.rebind_owned_frozen_startup(
+            platform="win32",
+            frozen=True,
+            executable=r"E:\当前\RemoteMicRC003.exe",
+            winreg_module=registry,
+            command_parser=lambda _value: [
+                r"D:\已删除\RemoteMicRC003.exe",
+                "--background",
+            ],
+        )
+
+        self.assertTrue(state.enabled)
+        self.assertEqual(
+            registry.value,
+            startup_windows.command_line(
+                [r"E:\当前\RemoteMicRC003.exe", "--background"]
+            ),
+        )
+
+    def test_rebind_owned_frozen_startup_same_command_does_not_write(self):
+        current_command = startup_windows.command_line(
+            [r"E:\当前\RemoteMicRC003.exe", "--background"]
+        )
+        registry = _FakeWinreg(current_command)
+
+        state = startup_windows.rebind_owned_frozen_startup(
+            platform="win32",
+            frozen=True,
+            executable=r"E:\当前\RemoteMicRC003.exe",
+            current_command=current_command,
+            winreg_module=registry,
+            command_parser=lambda _value: self.fail("parser should not run"),
+        )
+
+        self.assertTrue(state.enabled)
+        self.assertEqual(registry.set_calls, 0)
+
+    def test_rebind_owned_frozen_startup_rejects_unknown_or_extra_arguments(self):
+        current_executable = r"E:\当前\RemoteMicRC003.exe"
+        cases = (
+            ([r"D:\旧版\RemoteMicRC003.exe", "--settings"],),
+            ([r"D:\旧版\RemoteMicRC003.exe", "--background", "--bridge"],),
+            ([r"D:\旧版\Other.exe", "--background"],),
+            ([r"python.exe", r"D:\launcher.py", "--background"],),
+        )
+        for (arguments,) in cases:
+            with self.subTest(arguments=arguments):
+                old_command = startup_windows.command_line(arguments)
+                registry = _FakeWinreg(old_command)
+                state = startup_windows.rebind_owned_frozen_startup(
+                    platform="win32",
+                    frozen=True,
+                    executable=current_executable,
+                    winreg_module=registry,
+                    command_parser=lambda _value, arguments=arguments: arguments,
+                )
+                self.assertFalse(state.enabled)
+                self.assertEqual(state.error, "")
+                self.assertEqual(registry.value, old_command)
+                self.assertEqual(registry.set_calls, 0)
+
+    def test_rebind_owned_frozen_startup_rejects_non_string_registry_value(self):
+        registry = _FakeWinreg(
+            [r"D:\旧版\RemoteMicRC003.exe", "--background"]
+        )
+
+        state = startup_windows.rebind_owned_frozen_startup(
+            platform="win32",
+            frozen=True,
+            executable=r"E:\当前\RemoteMicRC003.exe",
+            winreg_module=registry,
+            command_parser=lambda _value: self.fail("parser should not run"),
+        )
+
+        self.assertFalse(state.enabled)
+        self.assertEqual(registry.set_calls, 0)
+
+    def test_rebind_owned_frozen_startup_write_failure_preserves_old_value(self):
+        old_command = startup_windows.command_line(
+            [r"D:\旧版\RemoteMicRC003.exe", "--background"]
+        )
+        registry = _FakeWinreg(old_command, set_error=PermissionError("denied"))
+
+        state = startup_windows.rebind_owned_frozen_startup(
+            platform="win32",
+            frozen=True,
+            executable=r"E:\当前\RemoteMicRC003.exe",
+            winreg_module=registry,
+            command_parser=lambda _value: [
+                r"D:\旧版\RemoteMicRC003.exe",
+                "--background",
+            ],
+        )
+
+        self.assertFalse(state.enabled)
+        self.assertEqual(state.error, "PermissionError")
+        self.assertEqual(registry.value, old_command)
+        self.assertEqual(registry.set_calls, 1)
+
+    def test_rebind_owned_frozen_startup_ignores_non_string_registry_type(self):
+        old_command = startup_windows.command_line(
+            [r"D:\旧版\RemoteMicRC003.exe", "--background"]
+        )
+        registry = _FakeWinreg(old_command, value_type=7)
+
+        state = startup_windows.rebind_owned_frozen_startup(
+            platform="win32",
+            frozen=True,
+            executable=r"E:\当前\RemoteMicRC003.exe",
+            winreg_module=registry,
+            command_parser=lambda _value: self.fail("parser should not run"),
+        )
+
+        self.assertFalse(state.enabled)
+        self.assertEqual(registry.value, old_command)
+        self.assertEqual(registry.set_calls, 0)
 
 
 if __name__ == "__main__":

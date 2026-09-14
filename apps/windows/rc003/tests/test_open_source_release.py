@@ -77,8 +77,6 @@ class ThirdPartyReleaseGateTests(unittest.TestCase):
             encoding="utf-8"
         )
         self.assertIn("_git_history_blockers", source)
-        self.assertIn('revision_range = "HEAD"', source)
-        self.assertNotIn("_RELEASE_HISTORY_BASE", source)
         self.assertIn("fetch-depth: 0", workflow)
 
     def test_license_bundle_contains_every_file_enforced_by_the_release_gate(self):

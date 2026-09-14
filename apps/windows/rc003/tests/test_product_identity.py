@@ -61,13 +61,18 @@ class ProductIdentityTests(unittest.TestCase):
 
     def test_qml_reads_the_controller_identity_instead_of_copying_the_name(self):
         qml_dir = _RC003_ROOT / "src" / "ovb_rc003" / "qml"
-        for filename in ("main.qml", "DevicePage.qml", "VoicePage.qml"):
-            text = (qml_dir / filename).read_text(encoding="utf-8")
-            self.assertIn("SettingsController.applicationDisplayName", text)
-            self.assertNotIn("Remote Mic", text)
-
         main_qml = (qml_dir / "main.qml").read_text(encoding="utf-8")
-        self.assertIn("title: SettingsController.applicationDisplayName", main_qml)
+        self.assertIn("SettingsController.applicationDisplayName", main_qml)
+
+        voice_qml = (qml_dir / "VoicePage.qml").read_text(encoding="utf-8")
+        self.assertNotIn("Remote Mic", voice_qml)
+
+        device_qml = (qml_dir / "DevicePage.qml").read_text(encoding="utf-8")
+        self.assertNotIn("Remote Mic", device_qml)
+
+        self.assertIn("arg(SettingsController.applicationDisplayName)", main_qml)
+        self.assertIn("arg(SettingsController.applicationVersion)", main_qml)
+        self.assertNotIn(qt_settings_app.__version__, main_qml)
         self.assertNotIn('title: qsTr("%1 设置")', main_qml)
 
     def test_qt_process_identity_uses_the_shared_display_name(self):
@@ -97,9 +102,49 @@ class ProductIdentityTests(unittest.TestCase):
         self.assertIn('#define AppName "无线麦"', installer)
         self.assertIn("DefaultGroupName=无线麦", installer)
         self.assertIn("UsePreviousGroup=no", installer)
-        self.assertIn("[InstallDelete]", installer)
-        self.assertIn("Remote Mic · 小米遥控器2 Pro.lnk", installer)
-        self.assertIn("Remote Mic · RC003.lnk", installer)
+        self.assertNotIn("[InstallDelete]", installer)
+        cleanup_start = installer.index("procedure DeleteObsoleteShortcuts;")
+        cleanup_end = installer.index("\nend;", cleanup_start)
+        cleanup = installer[cleanup_start:cleanup_end]
+        for obsolete_shortcut in (
+            r"{userdesktop}\Remote Mic · 小米遥控器2 Pro.lnk",
+            r"{userdesktop}\Remote Mic · RC003.lnk",
+            r"{userprograms}\Remote Mic\Remote Mic · 小米遥控器2 Pro.lnk",
+            r"{userprograms}\Remote Mic\Remote Mic · 小米遥控器2 Pro 设置.lnk",
+            r"{userprograms}\Remote Mic\停止 Remote Mic · 小米遥控器2 Pro.lnk",
+            r"{userprograms}\Remote Mic\卸载 Remote Mic · 小米遥控器2 Pro.lnk",
+            r"{userprograms}\Remote Mic\Remote Mic · RC003.lnk",
+            r"{userprograms}\Remote Mic\Remote Mic · RC003 设置.lnk",
+            r"{userprograms}\Remote Mic\停止 Remote Mic · RC003.lnk",
+            r"{userprograms}\Remote Mic\卸载 Remote Mic · RC003.lnk",
+        ):
+            self.assertIn(
+                f"DeleteFile(ExpandConstant('{obsolete_shortcut}'))",
+                cleanup,
+            )
+        self.assertIn(
+            r"RemoveDir(ExpandConstant('{userprograms}\Remote Mic'))",
+            cleanup,
+        )
+
+        post_install = installer.index("procedure CurStepChanged(CurStep: TSetupStep);")
+        validation = installer.index(
+            "if not ValidateInstalledApplication(ValidationError)", post_install
+        )
+        commit = installer.index(
+            "if not CommitUpgradeRuntimeQuarantine(CommitError)", validation
+        )
+        files_completed = installer.index(
+            "InstallFilesCompleted := True;", commit
+        )
+        cleanup_call = installer.index("DeleteObsoleteShortcuts;", files_completed)
+        helper_install = installer.index(
+            "HidHelperInstallSucceeded := RunApplicationMaintenance(", cleanup_call
+        )
+        self.assertLess(validation, commit)
+        self.assertLess(commit, files_completed)
+        self.assertLess(files_completed, cleanup_call)
+        self.assertLess(cleanup_call, helper_install)
         self.assertIn('#define AppExeName "RemoteMicRC003.exe"', installer)
         self.assertIn("DefaultDirName={localappdata}\\RemoteMic\\{#AppFolder}", installer)
         self.assertIn("'RemoteMicRC003'", installer)

@@ -2,6 +2,19 @@
 
 Release status: APPROVED
 
+## Windows application icons
+
+- Files: `apps/windows/rc003/src/ovb_rc003/assets/icons/remote-mic-connected.svg`,
+  `apps/windows/rc003/src/ovb_rc003/assets/icons/remote-mic-unavailable.svg`, and
+  the generated `remote-mic.ico`
+- Origin: Lucide `mic` and `mic-off` icons at revision
+  `266fd1c717905b2a64c8c38faf3a6aee99791121`
+- Source: <https://github.com/lucide-icons/lucide>
+- Modification: `currentColor` was replaced with the application's blue
+  `#4AA8FF`; the ICO is generated from the connected SVG
+- License: ISC
+- License text: `THIRD_PARTY_LICENSES/Lucide-266fd1c/LICENSE.txt`
+
 ## RC003 product image
 
 - File: `Resources/RC003-remote-photo.png`

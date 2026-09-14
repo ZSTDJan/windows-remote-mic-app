@@ -66,7 +66,7 @@ class ButtonActionSerializationTests(unittest.TestCase):
             )
             self.assertFalse(key_mapping.action_allows_repeat(action))
 
-    def test_only_navigation_backspace_and_volume_actions_repeat(self):
+    def test_only_navigation_backspace_volume_and_wheel_actions_repeat(self):
         repeatable = {
             key_mapping.ActionKind.ARROW_UP,
             key_mapping.ActionKind.ARROW_DOWN,
@@ -75,6 +75,8 @@ class ButtonActionSerializationTests(unittest.TestCase):
             key_mapping.ActionKind.DELETE_BACKWARD,
             key_mapping.ActionKind.SYSTEM_VOLUME_UP,
             key_mapping.ActionKind.SYSTEM_VOLUME_DOWN,
+            key_mapping.ActionKind.MOUSE_WHEEL_UP,
+            key_mapping.ActionKind.MOUSE_WHEEL_DOWN,
         }
         for action_kind in key_mapping.ActionKind:
             action = (
@@ -111,6 +113,21 @@ class ButtonActionSerializationTests(unittest.TestCase):
         ):
             action = key_mapping.ButtonAction(action_kind)
             self.assertEqual(action.keys, ())
+            self.assertEqual(
+                key_mapping.ButtonAction.from_dict(action.to_dict()), action
+            )
+
+    def test_mouse_actions_round_trip_as_first_class_actions(self):
+        for action_kind in (
+            key_mapping.ActionKind.MOUSE_LEFT_CLICK,
+            key_mapping.ActionKind.MOUSE_RIGHT_CLICK,
+            key_mapping.ActionKind.MOUSE_MIDDLE_CLICK,
+            key_mapping.ActionKind.MOUSE_WHEEL_UP,
+            key_mapping.ActionKind.MOUSE_WHEEL_DOWN,
+            key_mapping.ActionKind.MOUSE_X1_CLICK,
+            key_mapping.ActionKind.MOUSE_X2_CLICK,
+        ):
+            action = key_mapping.ButtonAction(action_kind)
             self.assertEqual(
                 key_mapping.ButtonAction.from_dict(action.to_dict()), action
             )
@@ -212,7 +229,7 @@ class GestureBindingLookupTests(unittest.TestCase):
         )
         self.assertTrue(key_mapping.has_secondary_action(bindings, "power"))
 
-    def test_combo_modifier_exists_only_when_an_action_is_enabled(self):
+    def test_legacy_combo_configuration_remains_readable_but_is_not_enabled(self):
         empty = {
             "combo_bindings": {
                 "modifier": "tv",
@@ -233,7 +250,8 @@ class GestureBindingLookupTests(unittest.TestCase):
                 },
             }
         }
-        self.assertEqual(key_mapping.button_combo_modifier(configured), "tv")
+        self.assertFalse(key_mapping.REMOTE_BUTTON_COMBOS_SUPPORTED)
+        self.assertIsNone(key_mapping.button_combo_modifier(configured))
         self.assertEqual(
             key_mapping.button_combo_action_for(configured, "up").kind,
             key_mapping.ActionKind.QUICKER_URI,

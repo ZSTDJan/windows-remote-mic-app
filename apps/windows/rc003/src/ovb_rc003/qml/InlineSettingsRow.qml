@@ -8,6 +8,7 @@ Rectangle {
     property string titleText: ""
     property string descriptionText: ""
     property string descriptionObjectName: ""
+    property bool descriptionNeverElide: false
     property string stateText: ""
     property color stateColor: tokens.textSecondary
     property int titleWidth: 72
@@ -33,11 +34,14 @@ Rectangle {
 
         UiLabel {
             id: titleLabel
+            objectName: root.objectName.length > 0
+                ? root.objectName + "_titleLabel" : ""
             tokens: root.tokens
             kind: bodyKind
             Layout.preferredWidth: root.titleWidth
             Layout.minimumWidth: root.titleWidth
             Layout.maximumWidth: root.titleWidth
+            Layout.alignment: Qt.AlignVCenter
             text: root.titleText
             font.weight: Font.Medium
             elide: Text.ElideRight
@@ -62,18 +66,24 @@ Rectangle {
                 ? root.editorColumnWidth : 0
             Layout.maximumWidth: root.editorColumnWidth > 0
                 ? root.editorColumnWidth : 16777215
+            Layout.alignment: Qt.AlignVCenter
         }
 
         UiLabel {
             id: descriptionLabel
-            objectName: root.descriptionObjectName
+            objectName: root.descriptionObjectName.length > 0
+                ? root.descriptionObjectName
+                : root.objectName.length > 0
+                    ? root.objectName + "_descriptionLabel" : ""
             visible: root.descriptionText.length > 0
             tokens: root.tokens
             kind: noteKind
             Layout.fillWidth: true
-            Layout.minimumWidth: 0
+            Layout.minimumWidth: root.descriptionNeverElide ? implicitWidth : 0
+            Layout.alignment: Qt.AlignVCenter
             text: root.descriptionText
-            elide: Text.ElideRight
+            wrapMode: Text.NoWrap
+            elide: root.descriptionNeverElide ? Text.ElideNone : Text.ElideRight
             HoverHandler { id: descriptionHover }
             CompactToolTip {
                 tokens: root.tokens
@@ -91,16 +101,22 @@ Rectangle {
             id: stateColumn
             objectName: root.objectName.length > 0
                 ? root.objectName + "_stateColumn" : ""
-            readonly property real columnWidth: root.stateColumnWidth > 0
-                ? root.stateColumnWidth : stateLabel.implicitWidth
+            readonly property real columnWidth: Math.max(
+                root.stateColumnWidth,
+                stateLabel.implicitWidth
+            )
             visible: root.stateText.length > 0 || root.stateColumnWidth > 0
             implicitHeight: stateLabel.implicitHeight
+            baselineOffset: stateLabel.baselineOffset
             Layout.preferredWidth: columnWidth
             Layout.minimumWidth: columnWidth
             Layout.maximumWidth: columnWidth
+            Layout.alignment: Qt.AlignVCenter
 
             UiLabel {
                 id: stateLabel
+                objectName: root.objectName.length > 0
+                    ? root.objectName + "_stateLabel" : ""
                 anchors.fill: parent
                 tokens: root.tokens
                 kind: noteKind
@@ -110,7 +126,8 @@ Rectangle {
                 horizontalAlignment: root.stateColumnWidth > 0
                     ? Text.AlignRight : Text.AlignLeft
                 verticalAlignment: Text.AlignVCenter
-                elide: Text.ElideRight
+                wrapMode: Text.NoWrap
+                elide: Text.ElideNone
             }
         }
 

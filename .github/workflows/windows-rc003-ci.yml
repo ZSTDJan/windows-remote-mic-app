@@ -3,15 +3,15 @@ name: windows-rc003-ci
 # Candidate CI for the Remote Mic · RC003 Windows client
 # (apps/windows/rc003). This runs the cross-platform pure-Python test suite
 # and a public-boundary scan on a real Windows runner, builds an unsigned
-# PyInstaller artifact, smoke-checks the built executable with --dry-run and
-# --qt-runtime-check (loads the real Qt DLL chain and verifies main.qml while
-# touching no GUI/BLE/HID/audio), compiles
-# the Inno Setup installer SOURCE into an unsigned installer .exe, and
+# PyInstaller artifact, smoke-checks the narrow HID helper with --self-check,
+# then checks the built executable with --dry-run and --qt-runtime-check (loads
+# the real Qt DLL chain and verifies main.qml while
+# touching no GUI/BLE/HID/audio), and
 # packages a deterministic unsigned portable ZIP (a versioned staging
 # folder containing the built app plus the project license, copyright,
 # third-party notices and licenses, corresponding-source record, asset
 # license record, attribution and README - the same legal/provenance and
-# instructional content the installer itself carries) + installer +
+# instructional content the historical installer carries) +
 # SHA256SUMS.txt artifact set.
 #
 # Honest disclosure of what this CI run DOES touch: the Windows-only tests
@@ -26,14 +26,15 @@ name: windows-rc003-ci
 # device attached anyway, so real-device behavior remains a manual
 # verification step (see this subtree's README.md "Known gaps" section).
 #
-# All gates below are required (XRBM-018: the Inno Setup compile step was
-# promoted from best-effort/continue-on-error to a required gate, matching
-# every other step) - a failure at any step fails the whole job.
+# All active gates below are required. Installer distribution is suspended;
+# its source is retained for historical maintenance only.
 #
-# Exit-code gating (XRBM-014 review RETRY P2 #3): pwsh steps below check
-# $LASTEXITCODE explicitly after every native command, since a non-zero
-# native exit code does not automatically fail a GitHub Actions step unless
-# it is the last command in the script block.
+# Exit-code gating (XRBM-014 review RETRY P2 #3): console commands below check
+# $LASTEXITCODE explicitly, since a non-zero native exit code does not
+# automatically fail a GitHub Actions step unless it is the last command in
+# the script block. Frozen GUI-subsystem EXEs use Start-Process -Wait and the
+# returned process ExitCode because those launches can leave $LASTEXITCODE
+# unset or stale.
 
 # XRBM-022 controller pre-review correction: the installer (.iss) and the
 # PyInstaller spec both consume these repository-root files directly
@@ -44,9 +45,8 @@ name: windows-rc003-ci
 on:
   workflow_dispatch:
   push:
-    branches:
-      - main
     tags:
+      - "v[0-9]*.[0-9]*.[0-9]*"
       - "v*-windows"
       - "v*-windows-rc003-candidate.*"
     paths:
@@ -86,8 +86,6 @@ jobs:
   test-and-build:
     runs-on: windows-2025
     timeout-minutes: 60
-    env:
-      PYTHONUTF8: "1"
     defaults:
       run:
         working-directory: apps/windows/rc003
@@ -108,6 +106,13 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/')
         shell: pwsh
         run: |
+          $version = (Get-Content -Raw src\ovb_rc003\VERSION).Trim()
+          if ($version -notmatch '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-candidate\.[1-9][0-9]*)?$') {
+            throw "unsupported release VERSION: $version"
+          }
+          if ($env:GITHUB_REF_NAME -cne "v$version") {
+            throw "release tag must equal v$version; historical tags must not be reused"
+          }
           python build/check-release-readiness.py --enforce
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
@@ -136,6 +141,35 @@ jobs:
         run: |
           python build/generate-app-icon.py
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      # Fetch every ignored-but-required frozen input before taking the
+      # fingerprint that the compile/test/build/package chain must preserve.
+      - name: Fetch and verify VB-CABLE driver pack
+        shell: pwsh
+        run: |
+          ./build/fetch-vb-cable.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Fetch and verify Frida Gadget
+        shell: pwsh
+        run: |
+          ./build/fetch-frida-gadget.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Capture checked build inputs
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          . ./build/build-provenance.ps1
+          $rc003Root = (Resolve-Path ".").Path
+          $repoRoot = (Resolve-Path "../../..").Path
+          $inputState = Get-RC003BuildInputState -RC003Root $rc003Root -RepoRoot $repoRoot
+          $inputStatePath = Join-Path $env:RUNNER_TEMP "rc003-build-input.json"
+          [System.IO.File]::WriteAllText(
+            $inputStatePath,
+            (($inputState | ConvertTo-Json -Depth 3) + "`n"),
+            [System.Text.UTF8Encoding]::new($false)
+          )
 
       - name: Compile check
         shell: pwsh
@@ -174,7 +208,7 @@ jobs:
       # warning, from this cause or any other unclosed-resource cause.
       - name: Run test suite
         shell: pwsh
-        timeout-minutes: 25
+        timeout-minutes: 20
         env:
           PYTHONPATH: src
           PYTHONUNBUFFERED: "1"
@@ -206,83 +240,165 @@ jobs:
             }
           }
 
-      # XRBM-031: fetches and hash-verifies the official VB-CABLE base
-      # package BEFORE PyInstaller runs, so the frozen build deterministically
-      # bundles it (see build/RemoteMicRC003.spec) and an end user of
-      # the built candidate never needs their own network access to install
-      # the optional driver. A download failure or hash mismatch here is a
-      # required gate - it fails this whole job closed, exactly like every
-      # other step above.
-      - name: Fetch and verify VB-CABLE driver pack
+      - name: Compile selected permission modules with Cython
         shell: pwsh
         run: |
-          ./build/fetch-vb-cable.ps1
+          python build/prepare-cython-core.py
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      # Back and volume usages are absent from the normal Windows keyboard
-      # path. A distributable package without the pinned Gadget is therefore
-      # incomplete, not a valid degraded candidate.
-      - name: Fetch and verify Frida Gadget
+      - name: Test compiled permission modules and HID helper
         shell: pwsh
+        env:
+          PYTHONPATH: build/cython-stage/src
         run: |
-          ./build/fetch-frida-gadget.ps1
+          python -u -W error::ResourceWarning -m unittest tests.test_hid_elevation_windows tests.test_hid_helper_consumers -v
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python build/cython-stage/src/hid_helper_launcher.py --self-check
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: PyInstaller build (unsigned candidate)
         shell: pwsh
         run: |
+          $ErrorActionPreference = "Stop"
+          . ./build/build-provenance.ps1
+          $rc003Root = (Resolve-Path ".").Path
+          $repoRoot = (Resolve-Path "../../..").Path
+          $buildRoot = Join-Path $rc003Root "dist/RemoteMicRC003"
+          $provenancePath = Get-RC003BuildProvenancePath -BuildRoot $buildRoot
+          Remove-Item -LiteralPath $provenancePath -Force -ErrorAction SilentlyContinue
+          git -C $repoRoot diff --exit-code -- apps/windows/rc003 .github/workflows/windows-rc003-ci.yml Resources/RC003-remote-photo.png device-profiles
+          if ($LASTEXITCODE -ne 0) {
+            throw "tracked build or test inputs changed after their CI checks ran"
+          }
+          $inputStatePath = Join-Path $env:RUNNER_TEMP "rc003-build-input.json"
+          if (-not (Test-Path -LiteralPath $inputStatePath -PathType Leaf)) {
+            throw "expected checked build input fingerprint not found"
+          }
+          $inputState = Get-Content -LiteralPath $inputStatePath -Raw | ConvertFrom-Json
+          $currentInputState = Get-RC003BuildInputState -RC003Root $rc003Root -RepoRoot $repoRoot
+          if (
+            $currentInputState.FileCount -ne [int]$inputState.FileCount -or
+            $currentInputState.FingerprintSha256 -ne [string]$inputState.FingerprintSha256
+          ) {
+            throw "build inputs changed after their CI checks ran"
+          }
+          $env:RC003_BUILD_SOURCE_ROOT = (Resolve-Path "build/cython-stage/src").Path
           python -m PyInstaller build/RemoteMicRC003.spec --distpath dist --workpath build/pyinstaller-work --noconfirm
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $inputStateAfterBuild = Get-RC003BuildInputState -RC003Root $rc003Root -RepoRoot $repoRoot
+          if (
+            $inputStateAfterBuild.FileCount -ne $inputState.FileCount -or
+            $inputStateAfterBuild.FingerprintSha256 -ne $inputState.FingerprintSha256
+          ) {
+            throw "build inputs changed while PyInstaller was running"
+          }
 
       - name: Built-artifact dry-run smoke check (no GUI/BLE/HID/audio)
         shell: pwsh
         run: |
+          $ErrorActionPreference = "Stop"
+          . ./build/build-provenance.ps1
+          function Invoke-FrozenExecutableCheck {
+            param(
+              [string]$FilePath,
+              [string[]]$ArgumentList,
+              [string]$Step
+            )
+            $process = Start-Process -FilePath $FilePath -ArgumentList $ArgumentList -Wait -PassThru -WindowStyle Hidden -ErrorAction Stop
+            if ($process.ExitCode -ne 0) {
+              throw "$Step failed with exit code $($process.ExitCode)"
+            }
+          }
+
+          $rc003Root = (Resolve-Path ".").Path
+          $repoRoot = (Resolve-Path "../../..").Path
+          $buildRoot = Join-Path $rc003Root "dist/RemoteMicRC003"
+          $inputStatePath = Join-Path $env:RUNNER_TEMP "rc003-build-input.json"
+          if (-not (Test-Path -LiteralPath $inputStatePath -PathType Leaf)) {
+            throw "expected pre-build input fingerprint not found"
+          }
+          $inputState = Get-Content -LiteralPath $inputStatePath -Raw | ConvertFrom-Json
+          $inputStateBeforeChecks = Get-RC003BuildInputState -RC003Root $rc003Root -RepoRoot $repoRoot
+          if (
+            $inputStateBeforeChecks.FileCount -ne [int]$inputState.FileCount -or
+            $inputStateBeforeChecks.FingerprintSha256 -ne [string]$inputState.FingerprintSha256
+          ) {
+            throw "build inputs changed before frozen checks"
+          }
+
           $builtExe = "dist/RemoteMicRC003/RemoteMicRC003.exe"
           if (-not (Test-Path $builtExe)) {
             Write-Error "expected built executable not found: $builtExe"
             exit 1
           }
-          & $builtExe --dry-run
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-
-          & $builtExe --qt-runtime-check
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-
-      # XRBM-018: promoted from best-effort to a required gate - this
-      # SOURCE-compiles the Inno Setup script into an installer .exe
-      # artifact and must pass like every other gate above. It still never
-      # runs or installs anything: ISCC.exe only compiles, and the
-      # resulting installer .exe is uploaded as unsigned CI evidence, never
-      # executed here or anywhere else in this task.
-      - name: Compile Inno Setup installer (required gate, never run/installed)
-        shell: pwsh
-        run: |
-          choco install innosetup --version=6.7.1 -y --no-progress
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
-          if (-not (Test-Path $iscc)) {
-            Write-Error "ISCC.exe not found after installing Inno Setup"
+          $builtHidHelper = "dist/RemoteMicRC003/_internal/RemoteMicRC003HidHelper.exe"
+          if (-not (Test-Path $builtHidHelper)) {
+            Write-Error "expected narrow HID helper not found: $builtHidHelper"
             exit 1
           }
-          & $iscc installer\RemoteMicRC003Setup.iss
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $sourceVersion = (Get-Content -LiteralPath "src/ovb_rc003/VERSION" -Raw).Trim()
+          $builtVersionFile = "dist/RemoteMicRC003/_internal/ovb_rc003/VERSION"
+          if (-not (Test-Path $builtVersionFile)) {
+            Write-Error "expected built VERSION file not found: $builtVersionFile"
+            exit 1
+          }
+          $builtVersion = (Get-Content -LiteralPath $builtVersionFile -Raw).Trim()
+          if ($builtVersion -ne $sourceVersion) {
+            Write-Error "built VERSION mismatch: source=$sourceVersion built=$builtVersion"
+            exit 1
+          }
+          $builtPackageRoot = Split-Path $builtVersionFile -Parent
+          foreach ($compiledModuleName in @("hid_elevation_windows", "hid_helper_consumers")) {
+            $compiledMatches = @(
+              Get-ChildItem -LiteralPath $builtPackageRoot -File -Filter "${compiledModuleName}*.pyd"
+            )
+            if ($compiledMatches.Count -ne 1) {
+              Write-Error "expected one compiled $compiledModuleName extension in frozen output"
+              exit 1
+            }
+          }
+          $rootExecutables = @(Get-ChildItem -LiteralPath "dist/RemoteMicRC003" -Force -Filter "*.exe" -File)
+          if ($rootExecutables.Count -ne 1 -or $rootExecutables[0].Name -ne "RemoteMicRC003.exe") {
+            Write-Error "build root must expose only RemoteMicRC003.exe"
+            exit 1
+          }
+          Invoke-FrozenExecutableCheck -FilePath $builtHidHelper -ArgumentList @("--self-check") -Step "$builtHidHelper --self-check"
 
-      - name: Package deterministic unsigned release directory (ZIP + installer + SHA256SUMS)
+          Invoke-FrozenExecutableCheck -FilePath $builtExe -ArgumentList @("--dry-run") -Step "$builtExe --dry-run"
+
+          Invoke-FrozenExecutableCheck -FilePath $builtExe -ArgumentList @("--qt-runtime-check") -Step "$builtExe --qt-runtime-check"
+
+          $inputStateAfterChecks = Get-RC003BuildInputState -RC003Root $rc003Root -RepoRoot $repoRoot
+          if (
+            $inputStateAfterChecks.FileCount -ne [int]$inputState.FileCount -or
+            $inputStateAfterChecks.FingerprintSha256 -ne [string]$inputState.FingerprintSha256
+          ) {
+            throw "build inputs changed while frozen checks were running"
+          }
+          Write-RC003BuildProvenance -RC003Root $rc003Root -RepoRoot $repoRoot -BuildRoot $buildRoot -InputState $inputState | Out-Null
+          Assert-RC003BuildProvenance -RC003Root $rc003Root -RepoRoot $repoRoot -BuildRoot $buildRoot | Out-Null
+
+      - name: Package deterministic unsigned release directory (ZIP + SHA256SUMS)
         shell: pwsh
         run: |
+          $ErrorActionPreference = "Stop"
+          . ./build/build-provenance.ps1
+          $rc003Root = (Resolve-Path ".").Path
+          $repoRoot = (Resolve-Path "../../..").Path
+          $buildRoot = Join-Path $rc003Root "dist/RemoteMicRC003"
+          $initialBuildProvenance = Assert-RC003BuildProvenance -RC003Root $rc003Root -RepoRoot $repoRoot -BuildRoot $buildRoot
+
           # "Deterministic" here means deterministic, non-random/non-timestamped
-          # OUTPUT FILENAMES (derived from the .iss AppVersion, not a build
+          # OUTPUT FILENAMES (derived from the runtime VERSION source, not a build
           # number or GUID) plus a checksum manifest generated in sorted
           # order - not bit-for-bit reproducible-build byte equality, which
           # PyInstaller does not guarantee upstream. Never signed, never
           # published, never installed here.
-          $issText = Get-Content -Raw installer\RemoteMicRC003Setup.iss
-          $versionMatch = [regex]::Match($issText, '#define AppVersion "([^"]+)"')
-          if (-not $versionMatch.Success) {
-            Write-Error "could not determine AppVersion from installer\RemoteMicRC003Setup.iss"
+          $version = (Get-Content -Raw src\ovb_rc003\VERSION).Trim()
+          if ($version -notmatch '^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$') {
+            Write-Error "invalid application version in src\ovb_rc003\VERSION: $version"
             exit 1
           }
-          $version = $versionMatch.Groups[1].Value
 
           # XRBM-022 controller pre-review correction: the installer
           # packages LICENSE/COPYRIGHT/THIRD_PARTY_NOTICES.md and ships an
@@ -305,6 +421,8 @@ jobs:
           New-Item -ItemType Directory -Force -Path $stagingDir | Out-Null
 
           Copy-Item -Path "dist/RemoteMicRC003/*" -Destination $stagingDir -Recurse -Force
+          $stagedBuildProvenance = Assert-RC003BuildProvenance -RC003Root $rc003Root -RepoRoot $repoRoot -BuildRoot $stagingDir
+          Assert-RC003BuildProvenanceMatches -Expected $initialBuildProvenance -Actual $stagedBuildProvenance -Context "CI staged build verification"
 
           Copy-Item -Path "../../../LICENSE.md" -Destination (Join-Path $stagingDir "LICENSE.txt") -Force
           Copy-Item -Path "../../../COPYRIGHT.md" -Destination (Join-Path $stagingDir "COPYRIGHT.txt") -Force
@@ -313,9 +431,9 @@ jobs:
           Copy-Item -Path "../../../ASSET_LICENSES.md" -Destination (Join-Path $stagingDir "ASSET_LICENSES.md") -Force
           Copy-Item -Path "../../../THIRD_PARTY_LICENSES" -Destination (Join-Path $stagingDir "THIRD_PARTY_LICENSES") -Recurse -Force
           Copy-Item -Path "ATTRIBUTION.md" -Destination (Join-Path $stagingDir "ATTRIBUTION.md") -Force
-          Copy-Item -Path "installer/readme-rc003.txt" -Destination (Join-Path $stagingDir "README.txt") -Force
+          Copy-Item -Path "installer/readme-portable-rc003.txt" -Destination (Join-Path $stagingDir "README.txt") -Force
 
-          $zipPath = "dist/portable/RemoteMicRC003-$version-portable-unsigned.zip"
+          $zipPath = "dist/portable/无线麦-Windows-$version-免安装.zip"
           if (Test-Path $zipPath) { Remove-Item $zipPath -Force }
 
           # XRBM-025 RETRY 1 (controller-accepted self-found blocker):
@@ -337,73 +455,160 @@ jobs:
             exit 1
           }
 
-          $installerExe = Get-ChildItem -Path dist/installer -Filter "RemoteMicRC003Setup-*-unsigned.exe" | Select-Object -First 1
-          if (-not $installerExe) {
-            Write-Error "expected compiled installer .exe not found under dist/installer"
-            exit 1
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $archive = [System.IO.Compression.ZipFile]::OpenRead((Resolve-Path $zipPath).Path)
+          try {
+            $archiveFiles = @{}
+            foreach ($entry in $archive.Entries) {
+              $entryName = $entry.FullName.Replace(
+                [System.IO.Path]::DirectorySeparatorChar,
+                [char]'/'
+              )
+              if (-not $entryName -or $entryName.EndsWith('/')) {
+                continue
+              }
+              if ($archiveFiles.ContainsKey($entryName)) {
+                Write-Error "portable ZIP contains a duplicate file entry: $entryName"
+                exit 1
+              }
+              $archiveFiles[$entryName] = $entry
+            }
+            $entryNames = @($archiveFiles.Keys)
+            $topLevels = @(
+              $entryNames |
+                ForEach-Object { $_.Split('/')[0] } |
+                Sort-Object -Unique
+            )
+            if ($topLevels.Count -ne 1 -or $topLevels[0] -ne $stagingName) {
+              Write-Error "portable ZIP must contain exactly one top-level directory named $stagingName"
+              exit 1
+            }
+            $rootExecutables = @(
+              $entryNames | Where-Object {
+                $_ -match ('^' + [regex]::Escape($stagingName) + '/[^/]+\.exe$')
+              }
+            )
+            $expectedMainEntry = "$stagingName/RemoteMicRC003.exe"
+            if ($rootExecutables.Count -ne 1 -or $rootExecutables[0] -ne $expectedMainEntry) {
+              Write-Error "portable ZIP root must expose only $expectedMainEntry"
+              exit 1
+            }
+            $helperEntryName = "$stagingName/_internal/RemoteMicRC003HidHelper.exe"
+            if (-not $archiveFiles.ContainsKey($helperEntryName)) {
+              Write-Error "portable ZIP is missing the internal HID helper"
+              exit 1
+            }
+            $versionEntryName = "$stagingName/_internal/ovb_rc003/VERSION"
+            if (-not $archiveFiles.ContainsKey($versionEntryName)) {
+              Write-Error "portable ZIP is missing the frozen VERSION file"
+              exit 1
+            }
+            $provenanceEntryName = "$stagingName/_internal/build-provenance.json"
+            if (-not $archiveFiles.ContainsKey($provenanceEntryName)) {
+              Write-Error "portable ZIP is missing the build provenance file"
+              exit 1
+            }
+            $versionEntry = $archiveFiles[$versionEntryName]
+            $reader = [System.IO.StreamReader]::new($versionEntry.Open())
+            try {
+              $zipVersion = $reader.ReadToEnd().Trim()
+            } finally {
+              $reader.Dispose()
+            }
+            if ($zipVersion -ne $version) {
+              Write-Error "portable ZIP VERSION mismatch: source=$version zip=$zipVersion"
+              exit 1
+            }
+
+            $pathSeparators = [char[]]@(
+              [System.IO.Path]::DirectorySeparatorChar,
+              [char]'/'
+            )
+            $stagingRoot = (Resolve-Path $stagingDir).Path.TrimEnd($pathSeparators)
+            $stagingFiles = @(
+              Get-ChildItem -LiteralPath $stagingRoot -Force -File -Recurse | ForEach-Object {
+                $relativePath = $_.FullName.Substring($stagingRoot.Length).TrimStart(
+                  $pathSeparators
+                ).Replace([System.IO.Path]::DirectorySeparatorChar, [char]'/')
+                [pscustomobject]@{
+                  EntryName = "$stagingName/$relativePath"
+                  FullName = $_.FullName
+                  Length = $_.Length
+                }
+              }
+            )
+            if ($archiveFiles.Count -ne $stagingFiles.Count) {
+              Write-Error "portable ZIP file count mismatch: staging=$($stagingFiles.Count) zip=$($archiveFiles.Count)"
+              exit 1
+            }
+            foreach ($stagingFile in $stagingFiles) {
+              if (-not $archiveFiles.ContainsKey($stagingFile.EntryName)) {
+                Write-Error "portable ZIP is missing staging file: $($stagingFile.EntryName)"
+                exit 1
+              }
+              $entry = $archiveFiles[$stagingFile.EntryName]
+              if ($entry.Length -ne $stagingFile.Length) {
+                Write-Error "portable ZIP file length mismatch: $($stagingFile.EntryName)"
+                exit 1
+              }
+              $stagingHash = (Get-FileHash -LiteralPath $stagingFile.FullName -Algorithm SHA256).Hash
+              $stream = $entry.Open()
+              $sha256 = [System.Security.Cryptography.SHA256]::Create()
+              try {
+                $zipHash = [System.BitConverter]::ToString($sha256.ComputeHash($stream)).Replace('-', '')
+              } finally {
+                $sha256.Dispose()
+                $stream.Dispose()
+              }
+              if ($zipHash -ne $stagingHash) {
+                Write-Error "portable ZIP file hash mismatch: $($stagingFile.EntryName)"
+                exit 1
+              }
+            }
+          } finally {
+            $archive.Dispose()
           }
 
-          # XRBM-024 RETRY: stage the final ZIP, installer, and a manifest
-          # covering both into one CLEAN release directory, then upload
-          # ONLY that single directory below - never a multi-pattern path
-          # list. Red evidence this fixes: a real Windows run
-          # (29643494504) reported every step green, including this one,
-          # but the upload-artifact log itself said "With the provided
-          # path, there will be 2 files uploaded" and the downloaded
-          # artifact was missing SHA256SUMS.txt entirely - because
-          # `if-no-files-found: error` only proves at least one of several
-          # independent glob patterns matched something, never that every
-          # declared input matched. A single pre-verified directory cannot
-          # silently drop one of its members the way an unverified
-          # multi-pattern path list can.
-          # XRBM-025 RETRY: workspace-absolute, not working-directory-
-          # relative. Red evidence this fixes: run 29643870781's
-          # upload-artifact@v7 step failed "No files were found with the
-          # provided path: apps/windows/rc003/dist/release" - a relative
-          # producer path and the consumer's relative path input carry no
-          # guarantee of resolving to the same directory. Anchoring both
-          # ends on $env:GITHUB_WORKSPACE / ${{ github.workspace }}
-          # (GitHub Actions documents these as the same absolute value)
-          # removes that ambiguity entirely.
+          $finalBuildProvenance = Assert-RC003BuildProvenance -RC003Root $rc003Root -RepoRoot $repoRoot -BuildRoot $buildRoot
+          Assert-RC003BuildProvenanceMatches -Expected $initialBuildProvenance -Actual $finalBuildProvenance -Context "CI post-package verification"
+
+          # Upload only the verified portable ZIP and its UTF-8 checksum manifest.
+          # Both producer and upload use the workspace-absolute release directory.
           $releaseDir = "$env:GITHUB_WORKSPACE/apps/windows/rc003/dist/release"
           if (Test-Path $releaseDir) { Remove-Item $releaseDir -Recurse -Force }
           New-Item -ItemType Directory -Force -Path $releaseDir | Out-Null
 
           $zipName = Split-Path $zipPath -Leaf
-          $installerName = $installerExe.Name
           $releaseZipPath = Join-Path $releaseDir $zipName
-          $releaseInstallerPath = Join-Path $releaseDir $installerName
           $releaseManifestPath = Join-Path $releaseDir "SHA256SUMS.txt"
 
           Copy-Item -Path $zipPath -Destination $releaseZipPath -Force
-          Copy-Item -Path $installerExe.FullName -Destination $releaseInstallerPath -Force
 
           # The manifest is generated from, and verified against, the
           # STAGED release-directory copies below - not the original
           # dist/portable|installer files - so a copy failure or a
           # mismatch between the two locations can never pass unnoticed.
           $hashed = @(
-            (Get-FileHash -Algorithm SHA256 -LiteralPath $releaseZipPath),
-            (Get-FileHash -Algorithm SHA256 -LiteralPath $releaseInstallerPath)
+            (Get-FileHash -Algorithm SHA256 -LiteralPath $releaseZipPath)
           )
           $lines = $hashed |
             Sort-Object { Split-Path $_.Path -Leaf } |
             ForEach-Object { "{0}  {1}" -f $_.Hash.ToLowerInvariant(), (Split-Path $_.Path -Leaf) }
-          Set-Content -Path $releaseManifestPath -Value $lines -Encoding ascii
+          Set-Content -Path $releaseManifestPath -Value $lines -Encoding utf8
 
-          # Hard preflight, BEFORE upload: exactly three files, exactly the
-          # expected deterministic filenames, exactly two well-formed
-          # manifest lines, every listed file present, and every hash
+          # Hard preflight, BEFORE upload: exactly two files, exactly the
+          # expected deterministic filenames, exactly one well-formed
+          # manifest line, every listed file present, and every hash
           # independently recomputed and compared against the manifest.
           # Any mismatch fails this step - and therefore the job - instead
           # of silently uploading an incomplete or inconsistent set.
           $releaseFiles = @(Get-ChildItem -Path $releaseDir -File)
-          if ($releaseFiles.Count -ne 3) {
-            Write-Error "release directory must contain exactly 3 files, found $($releaseFiles.Count): $($releaseFiles.Name -join ', ')"
+          if ($releaseFiles.Count -ne 2) {
+            Write-Error "release directory must contain exactly 2 files, found $($releaseFiles.Count): $($releaseFiles.Name -join ', ')"
             exit 1
           }
 
-          $expectedNames = @($zipName, $installerName, "SHA256SUMS.txt") | Sort-Object
+          $expectedNames = @($zipName, "SHA256SUMS.txt") | Sort-Object
           $actualNames = @($releaseFiles.Name) | Sort-Object
           $nameDiff = Compare-Object -ReferenceObject $expectedNames -DifferenceObject $actualNames
           if ($nameDiff) {
@@ -412,8 +617,8 @@ jobs:
           }
 
           $manifestLines = @(Get-Content -Path $releaseManifestPath)
-          if ($manifestLines.Count -ne 2) {
-            Write-Error "SHA256SUMS.txt must contain exactly 2 lines, found $($manifestLines.Count)"
+          if ($manifestLines.Count -ne 1) {
+            Write-Error "SHA256SUMS.txt must contain exactly 1 line, found $($manifestLines.Count)"
             exit 1
           }
 
@@ -436,28 +641,9 @@ jobs:
             }
           }
 
-          Write-Host "release directory preflight passed: 3 files, 2 well-formed manifest lines, all hashes verified"
+          Write-Host "release directory preflight passed: 2 files, 1 well-formed manifest line, all hashes verified"
 
-      # XRBM-022 controller pre-review correction: this is the ONLY
-      # upload-artifact step in this job, and it runs LAST, after every
-      # required gate above (test suite, PyInstaller build, dry-run smoke
-      # check, and - critically - the Inno Setup compile) has already
-      # succeeded. An earlier round uploaded the raw PyInstaller output
-      # right after the dry-run smoke check, i.e. BEFORE the Inno compile
-      # gate ran - so a job whose Inno step then failed could still leave a
-      # published artifact behind. No artifact may be published before
-      # every required gate has passed.
-      #
-      # XRBM-024 RETRY: path is the single, already hard-verified
-      # dist/release directory - not a multi-pattern list - so the
-      # uploaded artifact is exactly and only that directory's flat
-      # contents (see the packaging step's preflight above).
-      #
-      # XRBM-025 RETRY: the path input is now the workspace-absolute
-      # equivalent of the producer's $releaseDir plus a single trailing
-      # "/*" wildcard, matching this action's official documentation for
-      # absolute-path/wildcard inputs - still exactly one pattern, never a
-      # multi-pattern list.
+      # Upload the single preflighted directory only after every required gate passes.
       - name: Upload deterministic distribution artifacts (unsigned, never installed/signed/published)
         if: startsWith(github.ref, 'refs/tags/')
         # actions/upload-artifact v7

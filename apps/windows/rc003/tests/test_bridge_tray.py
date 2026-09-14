@@ -57,6 +57,7 @@ class _FakeBridgeApp:
         self.started = asyncio.Event()
         self.cancelled = False
         self.stop_calls = 0
+        self.reconnect_calls = 0
 
     async def run_forever(self):
         self.started.set()
@@ -68,6 +69,9 @@ class _FakeBridgeApp:
 
     async def stop(self):
         self.stop_calls += 1
+
+    def request_connection_retry_now(self):
+        self.reconnect_calls += 1
 
 
 class _FakeTray:
@@ -89,6 +93,27 @@ class _FakeTray:
 
 
 class BridgeTrayLifecycleTests(unittest.TestCase):
+    def test_in_process_runtime_exposes_the_reconnect_callback(self):
+        async def scenario():
+            fake_app = _FakeBridgeApp()
+            callbacks = []
+            task = asyncio.create_task(
+                app_module._run(
+                    app_factory=lambda: fake_app,
+                    show_notification_icon=False,
+                    on_reconnect_ready=callbacks.append,
+                )
+            )
+            await asyncio.wait_for(fake_app.started.wait(), timeout=1.0)
+            self.assertEqual(len(callbacks), 1)
+            callbacks[0]()
+            self.assertEqual(fake_app.reconnect_calls, 1)
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+
+        asyncio.run(scenario())
+
     def test_open_settings_and_exit_are_wired_to_bridge_lifecycle(self):
         async def scenario():
             fake_app = _FakeBridgeApp()

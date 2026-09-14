@@ -26,6 +26,7 @@ from ovb_rc003.settings_ui import (
     default_display_state,
     describe_launch_result,
     describe_log_open_result,
+    normalize_mapping_hotkey_text,
     voice_hotkey_for_trigger_mode,
 )
 
@@ -57,6 +58,13 @@ class DisplayRoundTripTests(unittest.TestCase):
             "显示桌面": key_mapping.ActionKind.SHOW_DESKTOP,
             "右键菜单": key_mapping.ActionKind.CONTEXT_MENU,
             "应用切换": key_mapping.ActionKind.APP_SWITCHER,
+            "鼠标左键单击": key_mapping.ActionKind.MOUSE_LEFT_CLICK,
+            "鼠标右键单击": key_mapping.ActionKind.MOUSE_RIGHT_CLICK,
+            "鼠标中键单击": key_mapping.ActionKind.MOUSE_MIDDLE_CLICK,
+            "滚轮向上": key_mapping.ActionKind.MOUSE_WHEEL_UP,
+            "滚轮向下": key_mapping.ActionKind.MOUSE_WHEEL_DOWN,
+            "鼠标 X1 单击": key_mapping.ActionKind.MOUSE_X1_CLICK,
+            "鼠标 X2 单击": key_mapping.ActionKind.MOUSE_X2_CLICK,
             "元素导航开关": key_mapping.ActionKind.ELEMENT_NAVIGATION_TOGGLE,
         }
         for label, action_kind in expected.items():
@@ -90,6 +98,19 @@ class DisplayRoundTripTests(unittest.TestCase):
         self.assertNotIn("lctrl+win", flattened)
         self.assertNotIn("ralt", flattened)
         self.assertNotIn("ralt+space", flattened)
+        mouse_group = dict(settings_ui.ACTION_OPTION_GROUPS)["鼠标与导航"]
+        self.assertEqual(
+            mouse_group[:7],
+            (
+                "鼠标左键单击",
+                "鼠标右键单击",
+                "鼠标中键单击",
+                "滚轮向上",
+                "滚轮向下",
+                "鼠标 X1 单击",
+                "鼠标 X2 单击",
+            ),
+        )
 
     def test_legacy_alt_escape_app_switch_is_displayed_as_reference_action(self):
         action = key_mapping.ButtonAction(
@@ -151,6 +172,83 @@ class DisplayRoundTripTests(unittest.TestCase):
     def test_unknown_key_is_rejected_before_it_can_break_runtime_input(self):
         with self.assertRaises(hotkey.HotkeyParseError):
             _display_to_action("ctrl+not_a_real_key")
+
+    def test_editor_action_validation_accepts_every_supported_input_kind(self):
+        valid_values = (
+            ("power", "single_click", "Escape"),
+            ("power", "single_click", "ctrl+shift+p"),
+            ("power", "single_click", "quicker:runaction:pin-window"),
+            ("power", "single_click", ""),
+            ("power", "double_click", "未设置"),
+            ("mic", "single_click", _VOICE_HOLD_DISPLAY),
+        )
+        for button_id, trigger, text in valid_values:
+            with self.subTest(button_id=button_id, trigger=trigger, text=text):
+                self.assertEqual(
+                    settings_ui.button_action_validation_message(
+                        button_id,
+                        trigger,
+                        text,
+                    ),
+                    "",
+                )
+
+    def test_editor_action_validation_uses_direct_chinese_errors(self):
+        self.assertEqual(
+            settings_ui.button_action_validation_message(
+                "back",
+                "single_click",
+                "leftwin",
+            ),
+            "单击：“leftwin”不支持映射，请重新录入",
+        )
+        self.assertEqual(
+            settings_ui.button_action_validation_message(
+                "up",
+                "single_click",
+                _VOICE_HOLD_DISPLAY,
+            ),
+            "单击：只有实体话筒键支持“按住说话”",
+        )
+        self.assertEqual(
+            settings_ui.button_action_validation_message(
+                "mic",
+                "double_click",
+                _VOICE_HOLD_DISPLAY,
+            ),
+            "双击：语音动作只能用于主映射，请选择普通动作或快捷键",
+        )
+
+    def test_mapping_hotkey_manual_text_accepts_win_and_chinese_arrow_aliases(self):
+        expected = {
+            "Win+L": "win+l",
+            "win": "lwin",
+            "Windows键": "lwin",
+            "Lctrl+Win+左箭头": "win+lctrl+left",
+            "Rctrl＋右Win＋右方向键": "rctrl+rwin+right",
+        }
+        for source, normalized in expected.items():
+            with self.subTest(source=source):
+                self.assertEqual(
+                    normalize_mapping_hotkey_text(source),
+                    normalized,
+                )
+                action = _display_to_action(source)
+                self.assertEqual(action.kind, key_mapping.ActionKind.KEY_COMBO)
+                self.assertEqual(action.keys, tuple(normalized.split("+")))
+
+    def test_mapping_hotkey_manual_text_rejects_windows_secure_attention(self):
+        for source in ("Ctrl+Alt+Delete", "左控制键+右Alt+删除键"):
+            with self.subTest(source=source):
+                with self.assertRaisesRegex(
+                    hotkey.HotkeyParseError,
+                    "Windows 安全按键",
+                ):
+                    normalize_mapping_hotkey_text(source)
+
+    def test_voice_hotkey_parser_keeps_rejecting_a_lone_generic_win_key(self):
+        with self.assertRaises(hotkey.HotkeyParseError):
+            hotkey.HotkeySpec.parse("win")
 
 
 class VoiceTriggerPresetTests(unittest.TestCase):
@@ -285,6 +383,24 @@ class BuildSaveModelTests(unittest.TestCase):
                 base_bindings=self.base_bindings,
             )
         self.assertEqual(ctx.exception.button_id, "menu")
+
+    def test_save_model_reuses_the_editor_action_error(self):
+        expected = settings_ui.button_action_validation_message(
+            "back",
+            "single_click",
+            "leftwin",
+        )
+        with self.assertRaises(SettingsValidationError) as ctx:
+            build_save_model(
+                button_display_map={"back": "leftwin"},
+                hotkey_text="win+h",
+                trigger_mode=key_mapping.VoiceTriggerMode.HOLD,
+                endpoint_display_text="",
+                base_config=self.base_config,
+                base_bindings=self.base_bindings,
+            )
+        self.assertEqual(ctx.exception.button_id, "back")
+        self.assertEqual(ctx.exception.message, expected)
 
     def test_blank_button_mapping_is_left_unbound(self):
         new_config, new_bindings = build_save_model(
@@ -569,16 +685,23 @@ class BuildSaveModelTests(unittest.TestCase):
         )
         self.assertEqual(new_bindings["secondary_bindings"], {})
 
-    def test_combo_actions_and_notes_are_saved_under_one_modifier(self):
+    def test_retired_combo_data_is_preserved_as_opaque_legacy_state(self):
+        legacy_combo = {
+            "modifier": "menu",
+            "bindings": {
+                "up": {
+                    "kind": "quicker_uri",
+                    "keys": [],
+                    "uri": "quicker:runaction:pin-window?mode=toggle",
+                }
+            },
+            "display_notes": {"up": "置顶窗口"},
+        }
+        self.base_bindings["combo_bindings"] = legacy_combo
+
         _, new_bindings = build_save_model(
             button_display_map={"power": "escape"},
             secondary_display_map={},
-            combo_modifier="menu",
-            combo_display_map={
-                "up": "quicker:runaction:pin-window?mode=toggle",
-                "ok": "ctrl+enter",
-            },
-            combo_note_map={"up": "  置顶窗口  ", "ok": "提交"},
             hotkey_text="ralt",
             trigger_mode=key_mapping.VoiceTriggerMode.HOLD,
             endpoint_display_text="",
@@ -586,30 +709,71 @@ class BuildSaveModelTests(unittest.TestCase):
             base_bindings=self.base_bindings,
         )
 
-        combo = new_bindings["combo_bindings"]
-        self.assertEqual(combo["modifier"], "menu")
-        self.assertEqual(combo["bindings"]["up"]["kind"], "quicker_uri")
-        self.assertEqual(combo["bindings"]["ok"]["keys"], ["ctrl", "enter"])
-        self.assertEqual(combo["display_notes"], {"up": "置顶窗口", "ok": "提交"})
+        self.assertEqual(new_bindings["combo_bindings"], legacy_combo)
 
-    def test_combo_modifier_cannot_keep_double_or_long_press(self):
-        with self.assertRaises(SettingsValidationError) as ctx:
-            build_save_model(
-                button_display_map={"tv": "escape"},
-                secondary_display_map={
-                    "tv": {"double_click": "Return", "long_press": ""}
-                },
-                combo_modifier="tv",
-                combo_display_map={"up": "escape"},
-                hotkey_text="ralt",
-                trigger_mode=key_mapping.VoiceTriggerMode.HOLD,
-                endpoint_display_text="",
-                base_config=self.base_config,
-                base_bindings=self.base_bindings,
-            )
+    def test_win_shortcuts_persist_for_every_button_mapping_trigger(self):
+        _, new_bindings = build_save_model(
+            button_display_map={"power": "Win+L"},
+            secondary_display_map={
+                "power": {
+                    "double_click": "Lctrl+Win+左箭头",
+                    "long_press": "Lctrl+Win+右箭头",
+                }
+            },
+            hotkey_text="ralt",
+            trigger_mode=key_mapping.VoiceTriggerMode.HOLD,
+            endpoint_display_text="",
+            base_config=self.base_config,
+            base_bindings=self.base_bindings,
+        )
 
-        self.assertEqual(ctx.exception.button_id, "tv")
-        self.assertIn("组合主键", ctx.exception.message)
+        self.assertEqual(
+            new_bindings["bindings"]["power"]["keys"],
+            ["win", "l"],
+        )
+        self.assertEqual(
+            new_bindings["secondary_bindings"]["power"]["double_click"]["keys"],
+            ["win", "lctrl", "left"],
+        )
+        self.assertEqual(
+            new_bindings["secondary_bindings"]["power"]["long_press"]["keys"],
+            ["win", "lctrl", "right"],
+        )
+
+    def test_retired_combo_never_blocks_visible_secondary_actions(self):
+        legacy_combo = {
+            "modifier": "tv",
+            "bindings": {
+                "up": {"kind": "key_combo", "keys": ["numpad1"]}
+            },
+            "display_notes": {},
+        }
+        self.base_bindings["combo_bindings"] = legacy_combo
+
+        _, new_bindings = build_save_model(
+            button_display_map={"tv": "应用切换"},
+            secondary_display_map={
+                "tv": {
+                    "double_click": "元素导航开关",
+                    "long_press": "Return",
+                }
+            },
+            hotkey_text="ralt",
+            trigger_mode=key_mapping.VoiceTriggerMode.HOLD,
+            endpoint_display_text="",
+            base_config=self.base_config,
+            base_bindings=self.base_bindings,
+        )
+
+        self.assertEqual(
+            new_bindings["secondary_bindings"]["tv"]["double_click"]["kind"],
+            "element_navigation_toggle",
+        )
+        self.assertEqual(
+            new_bindings["secondary_bindings"]["tv"]["long_press"]["kind"],
+            "return",
+        )
+        self.assertEqual(new_bindings["combo_bindings"], legacy_combo)
 
     def test_display_notes_are_trimmed_and_kept_separate_from_actions(self):
         _, new_bindings = build_save_model(

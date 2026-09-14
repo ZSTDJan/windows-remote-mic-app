@@ -10,7 +10,6 @@ from __future__ import annotations
 import ctypes
 import os
 import re
-import subprocess
 import sys
 import time
 import uuid
@@ -25,14 +24,15 @@ from . import product_identity
 VOICE_PROGRAM_NONE = "none"
 VOICE_PROGRAM_SOGOU = "sogou"
 VOICE_PROGRAM_WETYPE = "wetype"
-VOICE_PROGRAM_WINDOWS_DICTATION = "windows_dictation"
+VOICE_PROGRAM_DOUBAO_IME = "doubao_ime"
+LEGACY_VOICE_PROGRAM_WINDOWS_DICTATION = "windows_dictation"
 VOICE_PROGRAM_CUSTOM = "custom"
 
 VOICE_PROGRAM_PROVIDER_ORDER = (
     VOICE_PROGRAM_NONE,
     VOICE_PROGRAM_SOGOU,
     VOICE_PROGRAM_WETYPE,
-    VOICE_PROGRAM_WINDOWS_DICTATION,
+    VOICE_PROGRAM_DOUBAO_IME,
     VOICE_PROGRAM_CUSTOM,
 )
 
@@ -40,21 +40,12 @@ VOICE_PROGRAM_PROVIDER_NAMES = {
     VOICE_PROGRAM_NONE: "不管理",
     VOICE_PROGRAM_SOGOU: "搜狗语音输入",
     VOICE_PROGRAM_WETYPE: "微信输入法",
-    VOICE_PROGRAM_WINDOWS_DICTATION: "Windows 语音输入（Win+H）",
+    VOICE_PROGRAM_DOUBAO_IME: "豆包输入法",
     VOICE_PROGRAM_CUSTOM: "自定义程序",
 }
 
 _SOGOU_PROCESS_NAME = "sogou_voice_assistant.exe"
 _SOGOU_RUN_VALUE_NAMES = ("搜狗语音输入法",)
-_SOGOU_COMPONENT_MANAGER_NAME = "sogoucommgr.exe"
-_SOGOU_COMPONENT_PREWARM_ARGUMENTS = (
-    "-invoke",
-    "AIVoiceInputComBundle",
-    "AIVoiceInputCom",
-    "-uwr",
-    "-param",
-    "--auto-launch",
-)
 _SOGOU_UNINSTALL_SUBKEY = "Sogou Input"
 _SOGOU_TOOLBOX_PROCESS_NAME = "SOGOUSmartAssistant.exe"
 _SOGOU_TOOLBOX_ARGUMENTS = "--from=menutool"
@@ -62,10 +53,11 @@ _WETYPE_SERVER_NAME = "wetype_server.exe"
 _WETYPE_PROCESS_NAMES = (_WETYPE_SERVER_NAME, "wetype_service.exe")
 _WETYPE_SETTINGS_EXE = "wetype_update.exe"
 _WETYPE_SETTINGS_ARGUMENTS = "-showsetting"
-_WINDOWS_SPEECH_SETTINGS_URI = "ms-settings:speech"
-_SYSTEM_MANAGED_PROVIDERS = frozenset(
-    {VOICE_PROGRAM_WETYPE, VOICE_PROGRAM_WINDOWS_DICTATION}
-)
+_DOUBAO_PROCESS_NAMES = ("ImeWatchdog.exe", "ImeService.exe")
+_DOUBAO_WATCHDOG_EXE = Path("bootstrap") / "ImeWatchdog.exe"
+_DOUBAO_SETTINGS_EXE = Path("bootstrap") / "SettingsLauncher.exe"
+_SYSTEM_MANAGED_PROVIDERS = frozenset({VOICE_PROGRAM_WETYPE})
+_BUILTIN_ADAPTER_PROVIDERS = frozenset({VOICE_PROGRAM_DOUBAO_IME})
 _LAUNCH_ELEVATED_DEFAULTS = {
     VOICE_PROGRAM_SOGOU: True,
     VOICE_PROGRAM_CUSTOM: False,
@@ -77,6 +69,8 @@ _CLSCTX_INPROC_SERVER = 0x1
 _RPC_E_CHANGED_MODE = ctypes.c_int32(0x80010106).value
 _SLGP_RAWPATH = 0x4
 _STGM_READ = 0
+_VOICE_PROGRAM_LAUNCH_CONFIRM_TIMEOUT = 1.2
+_VOICE_PROGRAM_LAUNCH_CONFIRM_POLL_INTERVAL = 0.1
 
 
 class _Guid(ctypes.Structure):
@@ -146,12 +140,6 @@ class VoiceProgramLaunchResult:
 
 
 @dataclass(frozen=True)
-class SogouComponentPrewarmResult:
-    attempted: bool
-    code: str
-
-
-@dataclass(frozen=True)
 class VoiceProgramSettingsTarget:
     provider_id: str
     display_name: str
@@ -205,7 +193,7 @@ def normalize_voice_program_settings(raw: object) -> dict[str, object]:
         "custom_executable": executable,
         "launch_on_bridge_start": (
             enabled
-            and not is_system_managed_provider(provider_id)
+            and is_launchable_provider(provider_id)
             and data.get("launch_on_bridge_start") is True
         ),
         "launch_elevated": current_elevated,
@@ -215,6 +203,15 @@ def normalize_voice_program_settings(raw: object) -> dict[str, object]:
 
 def is_system_managed_provider(provider_id: object) -> bool:
     return str(provider_id).strip().lower() in _SYSTEM_MANAGED_PROVIDERS
+
+
+def is_launchable_provider(provider_id: object) -> bool:
+    provider = str(provider_id).strip().lower()
+    return (
+        provider != VOICE_PROGRAM_NONE
+        and provider not in _SYSTEM_MANAGED_PROVIDERS
+        and provider not in _BUILTIN_ADAPTER_PROVIDERS
+    )
 
 
 def provider_options() -> list[str]:
@@ -236,8 +233,6 @@ def provider_index(provider_id: object) -> int:
 
 
 def status_text(status: VoiceProgramStatus) -> str:
-    if status.provider_id == VOICE_PROGRAM_WINDOWS_DICTATION:
-        return "Windows 内置语音输入；按 Win+H 打开，由系统管理。"
     if status.provider_id == VOICE_PROGRAM_WETYPE:
         if status.code == "not_found":
             return "未找到微信输入法；正常安装后会自动识别，无需手选路径。"
@@ -245,6 +240,13 @@ def status_text(status: VoiceProgramStatus) -> str:
             return "已找到微信输入法；由 Windows 管理，当前未检测到后台进程。"
         if status.code == "running":
             return "微信输入法已安装并正在运行（由 Windows 管理）。"
+    if status.provider_id == VOICE_PROGRAM_DOUBAO_IME:
+        if status.code == "not_found":
+            return "未找到豆包输入法；正常安装后会自动识别，无需手选路径。"
+        if status.code == "stopped":
+            return "已找到豆包输入法；当前未检测到输入法后台进程。"
+        if status.code == "running":
+            return "豆包输入法已安装并正在运行。"
     if status.code == "disabled":
         return f"未启用；{product_identity.DISPLAY_NAME}不会管理语音程序。"
     if status.code == "not_found":
@@ -257,8 +259,6 @@ def status_text(status: VoiceProgramStatus) -> str:
         if status.elevated is False:
             return "正在运行（普通权限）。"
         return "正在运行（权限状态未知）。"
-    if status.code == "running_not_ready":
-        return "进程正在运行，但语音窗口尚未就绪；遥控器服务会尝试一次组件预热。"
     return "状态未知。"
 
 
@@ -277,10 +277,15 @@ def launch_result_text(result: VoiceProgramLaunchResult) -> str:
         ),
         "cancelled": "已取消管理员启动。",
         "launch_failed": "语音程序启动失败。",
+        "launch_unconfirmed": (
+            "已发出启动请求，但没有确认语音程序真正运行；"
+            "请确认程序是否已经打开。"
+        ),
         "not_requested": "没有设置随桥接启动。",
         "system_managed": (
             f"该语音程序由 Windows 管理，{product_identity.DISPLAY_NAME}不单独启动它。"
         ),
+        "built_in_adapter": "该输入法由无线麦直接适配，不需要单独启动。",
     }
     return messages.get(result.code, "语音程序状态未知。")
 
@@ -292,6 +297,7 @@ def resolve_voice_program(
     process_iter: Optional[Callable[[], Iterable[ProcessInfo]]] = None,
     run_value_reader: Optional[Callable[[], Iterable[str]]] = None,
     wetype_install_value_reader: Optional[Callable[[], Iterable[str]]] = None,
+    doubao_install_value_reader: Optional[Callable[[], Iterable[str]]] = None,
     wetype_shortcut_iter: Optional[Callable[[], Iterable[Path]]] = None,
     shortcut_resolver: Optional[Callable[[Path], Optional[Path]]] = None,
 ) -> ResolvedVoiceProgram:
@@ -302,8 +308,6 @@ def resolve_voice_program(
 
     if provider_id == VOICE_PROGRAM_NONE:
         return ResolvedVoiceProgram(provider_id, display_name, None, (), "disabled")
-    if provider_id == VOICE_PROGRAM_WINDOWS_DICTATION:
-        return ResolvedVoiceProgram(provider_id, display_name, None, (), "system")
     if provider_id == VOICE_PROGRAM_CUSTOM:
         match_executable = configured_path
         if configured_path is not None and configured_path.suffix.casefold() == ".lnk":
@@ -345,6 +349,22 @@ def resolve_voice_program(
             executable,
         )
 
+    if provider_id == VOICE_PROGRAM_DOUBAO_IME:
+        install_root = discover_doubao_install_root(
+            platform=platform,
+            process_iter=process_iter,
+            install_value_reader=doubao_install_value_reader,
+        )
+        executable = install_root / _DOUBAO_WATCHDOG_EXE if install_root else None
+        return ResolvedVoiceProgram(
+            provider_id,
+            display_name,
+            executable if executable is not None and executable.is_file() else None,
+            _DOUBAO_PROCESS_NAMES,
+            "discovered" if executable is not None and executable.is_file() else "missing",
+            executable,
+        )
+
     executable = discover_sogou_voice_executable(
         platform=platform,
         process_iter=process_iter,
@@ -368,6 +388,7 @@ def resolve_voice_program_settings_target(
     run_value_reader: Optional[Callable[[], Iterable[str]]] = None,
     sogou_install_value_reader: Optional[Callable[[], Iterable[str]]] = None,
     wetype_install_value_reader: Optional[Callable[[], Iterable[str]]] = None,
+    doubao_install_value_reader: Optional[Callable[[], Iterable[str]]] = None,
     wetype_shortcut_iter: Optional[Callable[[], Iterable[Path]]] = None,
     shortcut_resolver: Optional[Callable[[Path], Optional[Path]]] = None,
 ) -> VoiceProgramSettingsTarget:
@@ -413,13 +434,6 @@ def resolve_voice_program_settings_target(
         return VoiceProgramSettingsTarget(
             provider_id, display_name, "missing"
         )
-    if provider_id == VOICE_PROGRAM_WINDOWS_DICTATION:
-        return VoiceProgramSettingsTarget(
-            provider_id,
-            display_name,
-            "uri",
-            _WINDOWS_SPEECH_SETTINGS_URI,
-        )
     if provider_id == VOICE_PROGRAM_WETYPE:
         resolved = resolve_voice_program(
             normalized,
@@ -444,6 +458,23 @@ def resolve_voice_program_settings_target(
                 _WETYPE_SETTINGS_ARGUMENTS,
             )
         return VoiceProgramSettingsTarget(provider_id, display_name, "missing")
+    if provider_id == VOICE_PROGRAM_DOUBAO_IME:
+        install_root = discover_doubao_install_root(
+            platform=current_platform,
+            process_iter=process_iter,
+            install_value_reader=doubao_install_value_reader,
+        )
+        settings_executable = (
+            install_root / _DOUBAO_SETTINGS_EXE if install_root is not None else None
+        )
+        if settings_executable is not None and settings_executable.is_file():
+            return VoiceProgramSettingsTarget(
+                provider_id,
+                display_name,
+                "executable",
+                str(settings_executable),
+            )
+        return VoiceProgramSettingsTarget(provider_id, display_name, "missing")
     return VoiceProgramSettingsTarget(provider_id, display_name, "unsupported")
 
 
@@ -454,9 +485,9 @@ def inspect_voice_program(
     process_iter: Optional[Callable[[], Iterable[ProcessInfo]]] = None,
     run_value_reader: Optional[Callable[[], Iterable[str]]] = None,
     wetype_install_value_reader: Optional[Callable[[], Iterable[str]]] = None,
+    doubao_install_value_reader: Optional[Callable[[], Iterable[str]]] = None,
     wetype_shortcut_iter: Optional[Callable[[], Iterable[Path]]] = None,
     shortcut_resolver: Optional[Callable[[Path], Optional[Path]]] = None,
-    visible_window_pids: Optional[Callable[[], Iterable[int]]] = None,
 ) -> VoiceProgramStatus:
     normalized = normalize_voice_program_settings(settings)
     provider_id = str(normalized["provider"])
@@ -465,7 +496,11 @@ def inspect_voice_program(
     resolve_process_iter = process_iter
     if (
         current_platform == "win32"
-        and provider_id in {VOICE_PROGRAM_SOGOU, VOICE_PROGRAM_WETYPE}
+        and provider_id in {
+            VOICE_PROGRAM_SOGOU,
+            VOICE_PROGRAM_WETYPE,
+            VOICE_PROGRAM_DOUBAO_IME,
+        }
     ):
         processes = list((process_iter or _iter_windows_processes)())
         resolve_process_iter = lambda: processes or []
@@ -475,19 +510,10 @@ def inspect_voice_program(
         process_iter=resolve_process_iter,
         run_value_reader=run_value_reader,
         wetype_install_value_reader=wetype_install_value_reader,
+        doubao_install_value_reader=doubao_install_value_reader,
         wetype_shortcut_iter=wetype_shortcut_iter,
         shortcut_resolver=shortcut_resolver,
     )
-    if resolved.provider_id == VOICE_PROGRAM_WINDOWS_DICTATION:
-        return VoiceProgramStatus(
-            resolved.provider_id,
-            resolved.display_name,
-            True,
-            False,
-            None,
-            None,
-            "stopped",
-        )
     if resolved.provider_id == VOICE_PROGRAM_NONE:
         return VoiceProgramStatus(
             resolved.provider_id,
@@ -513,17 +539,6 @@ def inspect_voice_program(
         processes = list((process_iter or _iter_windows_processes)())
     matches = _matching_processes(resolved, processes)
     elevated = _combined_elevation(matches)
-    code = "running" if matches else "stopped"
-    if (
-        resolved.provider_id == VOICE_PROGRAM_SOGOU
-        and matches
-        and not _matching_sogou_window_exists(
-            matches,
-            platform=current_platform,
-            visible_window_pids=visible_window_pids,
-        )
-    ):
-        code = "running_not_ready"
     return VoiceProgramStatus(
         resolved.provider_id,
         resolved.display_name,
@@ -531,113 +546,16 @@ def inspect_voice_program(
         bool(matches),
         elevated,
         resolved.executable,
-        code,
+        "running" if matches else "stopped",
     )
 
 
-def discover_sogou_component_manager(
-    *,
-    platform: Optional[str] = None,
-    run_value_reader: Optional[Callable[[], Iterable[str]]] = None,
-) -> Optional[Path]:
-    current_platform = sys.platform if platform is None else platform
-    if current_platform != "win32":
-        return None
-    for command in (run_value_reader or _read_sogou_run_values)():
-        executable = _command_executable(command)
-        if (
-            executable is not None
-            and executable.name.casefold() == _SOGOU_COMPONENT_MANAGER_NAME
-            and executable.is_file()
-        ):
-            return executable
-    return None
-
-
-def prewarm_sogou_voice_component(
-    *,
-    platform: Optional[str] = None,
-    run_value_reader: Optional[Callable[[], Iterable[str]]] = None,
-    popen: Callable[..., subprocess.Popen] = subprocess.Popen,
-) -> SogouComponentPrewarmResult:
-    current_platform = sys.platform if platform is None else platform
-    if current_platform != "win32":
-        return SogouComponentPrewarmResult(False, "unsupported")
-    manager = discover_sogou_component_manager(
-        platform=current_platform,
-        run_value_reader=run_value_reader,
-    )
-    if manager is None:
-        return SogouComponentPrewarmResult(False, "manager_not_found")
-    kwargs: dict[str, object] = {"cwd": str(manager.parent)}
-    if popen is subprocess.Popen:
-        kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-    try:
-        popen([str(manager), *_SOGOU_COMPONENT_PREWARM_ARGUMENTS], **kwargs)
-    except (OSError, ValueError):
-        return SogouComponentPrewarmResult(True, "launch_failed")
-    return SogouComponentPrewarmResult(True, "started")
-
-
-def _visible_window_process_ids() -> Iterable[int]:
-    if sys.platform != "win32":
-        return ()
-    user32 = ctypes.WinDLL("user32", use_last_error=True)
-    callback_type = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
-    user32.EnumWindows.argtypes = (callback_type, wintypes.LPARAM)
-    user32.EnumWindows.restype = wintypes.BOOL
-    user32.IsWindowVisible.argtypes = (wintypes.HWND,)
-    user32.IsWindowVisible.restype = wintypes.BOOL
-    user32.GetWindowThreadProcessId.argtypes = (
-        wintypes.HWND,
-        ctypes.POINTER(wintypes.DWORD),
-    )
-    user32.GetWindowThreadProcessId.restype = wintypes.DWORD
-    pids: set[int] = set()
-
-    @callback_type
-    def visit(hwnd, _lparam):
-        if user32.IsWindowVisible(hwnd):
-            pid = wintypes.DWORD(0)
-            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
-            if pid.value:
-                pids.add(int(pid.value))
-        return True
-
-    user32.EnumWindows(visit, 0)
-    return tuple(pids)
-
-
-def _matching_sogou_window_exists(
-    processes: Sequence[ProcessInfo],
-    *,
-    platform: Optional[str] = None,
-    visible_window_pids: Optional[Callable[[], Iterable[int]]] = None,
-) -> bool:
-    current_platform = sys.platform if platform is None else platform
-    if current_platform != "win32":
-        return False
-    process_pids = {
-        process.pid
-        for process in processes
-        if process.name.casefold() == _SOGOU_PROCESS_NAME
-    }
-    if not process_pids:
-        return False
-    try:
-        window_pids = set((visible_window_pids or _visible_window_process_ids)())
-    except (AttributeError, OSError, ValueError):
-        return False
-    return bool(process_pids & window_pids)
-
-
-def wait_for_sogou_voice_window(
+def wait_for_sogou_voice_process(
     *,
     timeout: float = 0.6,
     poll_interval: float = 0.1,
     platform: Optional[str] = None,
     process_iter: Optional[Callable[[], Iterable[ProcessInfo]]] = None,
-    visible_window_pids: Optional[Callable[[], Iterable[int]]] = None,
     sleep: Callable[[float], None] = time.sleep,
     monotonic: Callable[[], float] = time.monotonic,
 ) -> bool:
@@ -646,11 +564,10 @@ def wait_for_sogou_voice_window(
         return False
     deadline = monotonic() + max(0.0, float(timeout))
     while True:
-        processes = list((process_iter or _iter_windows_processes)())
-        if _matching_sogou_window_exists(
-            processes,
-            platform=current_platform,
-            visible_window_pids=visible_window_pids,
+        processes = (process_iter or _iter_windows_processes)()
+        if any(
+            process.name.casefold() == _SOGOU_PROCESS_NAME
+            for process in processes
         ):
             return True
         if monotonic() >= deadline:
@@ -665,9 +582,16 @@ def launch_voice_program(
     process_iter: Optional[Callable[[], Iterable[ProcessInfo]]] = None,
     run_value_reader: Optional[Callable[[], Iterable[str]]] = None,
     wetype_install_value_reader: Optional[Callable[[], Iterable[str]]] = None,
+    doubao_install_value_reader: Optional[Callable[[], Iterable[str]]] = None,
     wetype_shortcut_iter: Optional[Callable[[], Iterable[Path]]] = None,
     start_file: Optional[Callable[[str, str, str], None]] = None,
     shortcut_resolver: Optional[Callable[[Path], Optional[Path]]] = None,
+    launch_confirm_timeout: float = _VOICE_PROGRAM_LAUNCH_CONFIRM_TIMEOUT,
+    launch_confirm_poll_interval: float = (
+        _VOICE_PROGRAM_LAUNCH_CONFIRM_POLL_INTERVAL
+    ),
+    sleep: Callable[[float], None] = time.sleep,
+    monotonic: Callable[[], float] = time.monotonic,
 ) -> VoiceProgramLaunchResult:
     """Start the configured provider without making it a bridge dependency."""
 
@@ -678,14 +602,15 @@ def launch_voice_program(
         process_iter=process_iter,
         run_value_reader=run_value_reader,
         wetype_install_value_reader=wetype_install_value_reader,
+        doubao_install_value_reader=doubao_install_value_reader,
         wetype_shortcut_iter=wetype_shortcut_iter,
         shortcut_resolver=shortcut_resolver,
     )
     if resolved.provider_id == VOICE_PROGRAM_NONE:
         return VoiceProgramLaunchResult(resolved.provider_id, False, False, "disabled")
-    if resolved.provider_id == VOICE_PROGRAM_WINDOWS_DICTATION:
+    if resolved.provider_id in _BUILTIN_ADAPTER_PROVIDERS:
         return VoiceProgramLaunchResult(
-            resolved.provider_id, False, False, "system_managed"
+            resolved.provider_id, False, False, "built_in_adapter"
         )
     if resolved.executable is None:
         return VoiceProgramLaunchResult(resolved.provider_id, False, False, "not_found")
@@ -731,12 +656,27 @@ def launch_voice_program(
         return VoiceProgramLaunchResult(resolved.provider_id, False, False, "launch_failed")
     except Exception:
         return VoiceProgramLaunchResult(resolved.provider_id, False, False, "launch_failed")
+    confirmed_matches = _wait_for_matching_voice_program_process(
+        resolved,
+        process_iter=process_iter,
+        timeout=launch_confirm_timeout,
+        poll_interval=launch_confirm_poll_interval,
+        sleep=sleep,
+        monotonic=monotonic,
+    )
+    if not confirmed_matches:
+        return VoiceProgramLaunchResult(
+            resolved.provider_id,
+            False,
+            False,
+            "launch_unconfirmed",
+        )
     return VoiceProgramLaunchResult(
         resolved.provider_id,
         True,
         False,
         "started",
-        elevated=True if request_elevation else None,
+        elevated=_combined_elevation(confirmed_matches),
     )
 
 
@@ -916,6 +856,50 @@ def discover_wetype_executable(
     return max(existing, key=_wetype_version_key)
 
 
+def discover_doubao_install_root(
+    *,
+    platform: Optional[str] = None,
+    process_iter: Optional[Callable[[], Iterable[ProcessInfo]]] = None,
+    install_value_reader: Optional[Callable[[], Iterable[str]]] = None,
+) -> Optional[Path]:
+    current_platform = sys.platform if platform is None else platform
+    if current_platform != "win32":
+        return None
+
+    candidates: list[Path] = []
+    for process in (process_iter or _iter_windows_processes)():
+        if process.name.casefold() not in {
+            name.casefold() for name in _DOUBAO_PROCESS_NAMES
+        } or process.executable is None:
+            continue
+        for parent in process.executable.parents:
+            if parent.name.casefold() == "doubaoime":
+                candidates.append(parent)
+                break
+
+    for raw_value in (install_value_reader or _read_doubao_install_values)():
+        text = os.path.expandvars(str(raw_value).strip()).strip('"')
+        if not text:
+            continue
+        path = Path(text)
+        root = path.parent if path.suffix else path
+        for parent in (root, *root.parents):
+            if parent.name.casefold() == "doubaoime":
+                candidates.append(parent)
+                break
+
+    for variable in ("ProgramFiles", "ProgramW6432"):
+        root = os.environ.get(variable)
+        if root:
+            candidates.append(Path(root) / "DoubaoIME")
+    candidates.append(Path(r"C:\Program Files\DoubaoIME"))
+
+    for root in dict.fromkeys(candidates):
+        if (root / _DOUBAO_WATCHDOG_EXE).is_file():
+            return root
+    return None
+
+
 def _validated_configured_path(raw: object) -> Optional[Path]:
     text = str(raw).strip()
     if not text:
@@ -997,6 +981,28 @@ def _matching_processes(
         if process.name.casefold() in expected_names:
             matches.append(process)
     return matches
+
+
+def _wait_for_matching_voice_program_process(
+    resolved: ResolvedVoiceProgram,
+    *,
+    process_iter: Optional[Callable[[], Iterable[ProcessInfo]]] = None,
+    timeout: float,
+    poll_interval: float,
+    sleep: Callable[[float], None],
+    monotonic: Callable[[], float],
+) -> list[ProcessInfo]:
+    deadline = monotonic() + max(0.0, float(timeout))
+    while True:
+        matches = _matching_processes(
+            resolved,
+            list((process_iter or _iter_windows_processes)()),
+        )
+        if matches:
+            return matches
+        if monotonic() >= deadline:
+            return []
+        sleep(max(0.01, float(poll_interval)))
 
 
 def _normalized_executable_path(path: Path) -> str:
@@ -1264,6 +1270,63 @@ def _read_wetype_install_values() -> Iterable[str]:
         return ()
 
 
+def _read_doubao_install_values() -> Iterable[str]:
+    if sys.platform != "win32":
+        return ()
+    try:
+        import winreg
+
+        values: list[str] = []
+        views = tuple(
+            dict.fromkeys(
+                (
+                    0,
+                    getattr(winreg, "KEY_WOW64_64KEY", 0),
+                    getattr(winreg, "KEY_WOW64_32KEY", 0),
+                )
+            )
+        )
+        uninstall_root = r"Software\Microsoft\Windows\CurrentVersion\Uninstall"
+        for hive in (winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE):
+            for view in views:
+                try:
+                    with winreg.OpenKey(
+                        hive,
+                        uninstall_root,
+                        0,
+                        winreg.KEY_READ | view,
+                    ) as root:
+                        index = 0
+                        while True:
+                            try:
+                                subkey_name = winreg.EnumKey(root, index)
+                            except OSError:
+                                break
+                            index += 1
+                            try:
+                                with winreg.OpenKey(root, subkey_name) as key:
+                                    display_name, _ = winreg.QueryValueEx(
+                                        key, "DisplayName"
+                                    )
+                                    if str(display_name).strip() != "豆包输入法":
+                                        continue
+                                    for name in ("InstallLocation", "DisplayIcon"):
+                                        try:
+                                            value, _ = winreg.QueryValueEx(key, name)
+                                        except OSError:
+                                            continue
+                                        text = str(value).strip()
+                                        if text:
+                                            values.append(text)
+                            except OSError:
+                                continue
+                except OSError:
+                    continue
+        return tuple(dict.fromkeys(values))
+    except OSError:
+        return ()
+
+
 def _iter_wetype_shortcuts() -> Iterable[Path]:
     candidates: list[Path] = []
     for variable, suffix in (
@@ -1315,7 +1378,18 @@ def _default_start_file_with_arguments(
     )
 
 
-def _iter_windows_processes() -> Iterable[ProcessInfo]:
+def diagnostic_voice_processes() -> tuple[tuple[str, int, str], ...]:
+    """Name candidates only; reuse provider names without discovering or launching apps."""
+    names = {
+        **{name.casefold(): VOICE_PROGRAM_SOGOU for name in (_SOGOU_PROCESS_NAME,)},
+        **{name.casefold(): VOICE_PROGRAM_WETYPE for name in _WETYPE_PROCESS_NAMES},
+        **{name.casefold(): VOICE_PROGRAM_DOUBAO_IME for name in _DOUBAO_PROCESS_NAMES},
+    }
+    return tuple((names[p.name.casefold()], p.pid, p.name)
+                 for p in _iter_windows_processes(names=set(names)))
+
+
+def _iter_windows_processes(*, names: Optional[set[str]] = None) -> Iterable[ProcessInfo]:
     if sys.platform != "win32":
         return ()
 
@@ -1357,6 +1431,8 @@ def _iter_windows_processes() -> Iterable[ProcessInfo]:
     snapshot = kernel32.CreateToolhelp32Snapshot(0x00000002, 0)
     invalid_handle = ctypes.c_void_p(-1).value
     if snapshot == invalid_handle:
+        if names is not None:
+            raise OSError("process_snapshot_failed")
         return ()
 
     class PROCESSENTRY32W(ctypes.Structure):
@@ -1380,16 +1456,18 @@ def _iter_windows_processes() -> Iterable[ProcessInfo]:
         success = kernel32.Process32FirstW(snapshot, ctypes.byref(entry))
         while success:
             pid = int(entry.th32ProcessID)
-            executable, elevated = _query_process_details(kernel32, advapi32, pid)
-            entries.append(
-                ProcessInfo(
-                    pid=pid,
-                    name=str(entry.szExeFile),
-                    executable=executable,
-                    elevated=elevated,
+            name = str(entry.szExeFile)
+            if names is None or name.casefold() in names:
+                # Diagnostics need candidate PIDs only; query selected live handles later.
+                executable, elevated = _query_process_details(kernel32, advapi32, pid) if names is None else (None, None)
+                entries.append(
+                    ProcessInfo(pid=pid, name=name, executable=executable, elevated=elevated)
                 )
-            )
+                if names is not None and len(entries) >= 33:
+                    break  # The diagnostic consumer reports truncation at 32 candidates.
             success = kernel32.Process32NextW(snapshot, ctypes.byref(entry))
+        if names is not None and not success and ctypes.get_last_error() != 18:
+            raise OSError("process_enumeration_incomplete")
     finally:
         kernel32.CloseHandle(snapshot)
     return tuple(entries)

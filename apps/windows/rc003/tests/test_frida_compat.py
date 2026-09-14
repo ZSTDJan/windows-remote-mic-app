@@ -1,12 +1,21 @@
 import hashlib
+from contextlib import ExitStack
 import inspect
+import json
 import subprocess
 import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
 
-from ovb_rc003 import frida_compat, frida_hid_tap_injector
+from ovb_rc003 import (
+    config,
+    frida_compat,
+    frida_hid_tap_injector,
+    hid_elevation_windows,
+    hid_helper_consumers,
+)
+from ovb_rc003.diagnostic_trace import DiagnosticTrace
 
 
 class AssetDescriptorTests(unittest.TestCase):
@@ -51,6 +60,17 @@ class VerifyAssetTests(unittest.TestCase):
 
 
 class ReportDecodeTests(unittest.TestCase):
+    def test_direction_usages_have_exact_windows_keyboard_identities(self):
+        self.assertEqual(
+            frida_compat.TAP_DIRECTION_USAGE_TO_KEY,
+            {
+                0x004F: (0x27, 0x4D, True),
+                0x0050: (0x25, 0x4B, True),
+                0x0051: (0x28, 0x50, True),
+                0x0052: (0x26, 0x48, True),
+            },
+        )
+
     def test_decodes_verified_hidogatt_buffer(self):
         self.assertEqual(
             frida_compat.decode_rc003_ioctl_output(
@@ -76,6 +96,30 @@ class ReportDecodeTests(unittest.TestCase):
 
 
 class ReportTapTests(unittest.TestCase):
+    def test_trace_distinguishes_synthetic_release_and_resets_failed_callback_context(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            trace = DiagnosticTrace(Path(tmp), enabled=True)
+            callback = mock.Mock()
+            tap = frida_compat.RC003HidReportTap(
+                callback, enabled=False, diagnostic_trace=trace
+            )
+            # Preserve unknown usages in the raw evidence, but not in mapping.
+            tap._handle_ioctl_output(bytes.fromhex("010000350099000000"))
+            callback.side_effect = RuntimeError("callback failed")
+            with self.assertRaises(RuntimeError):
+                tap._release_active()
+            trace.emit("outside_callback")
+            trace.close()
+            records = [json.loads(line) for line in trace.path.read_text().splitlines()]
+            reports = [row for row in records if row["event"] == "hid_tap_report"]
+            self.assertEqual(reports[0]["raw_hex"], "010000350099000000")
+            self.assertEqual(reports[0]["forwarded_hex"], "350000000000")
+            self.assertEqual(reports[1]["origin"], "synthetic_release")
+            self.assertEqual(reports[1]["raw_hex"], "")
+            self.assertEqual(reports[1]["previous_usages"], [53])
+            outside = next(row for row in records if row["event"] == "outside_callback")
+            self.assertNotIn("hid_report_id", outside)
+
     def test_emits_only_edges_for_missing_usages(self):
         reports = []
         tap = frida_compat.RC003HidReportTap(
@@ -220,6 +264,97 @@ class InjectorSubprocessTests(unittest.TestCase):
             frida_compat.run_injector_subprocess(1234, _run=fake_run)
         self.assertEqual(str(ctx.exception), "injector_timeout")
 
+    def test_normal_frozen_app_uses_the_pre_authorized_task(self):
+        registered = mock.Mock()
+
+        frida_compat.run_injector_subprocess(
+            2468,
+            frozen=True,
+            _is_elevated=lambda: False,
+            _registered_injector=registered,
+        )
+
+        registered.assert_called_once_with(2468)
+
+    def test_normal_frozen_app_repairs_a_missing_consumer_before_injection(self):
+        tenant = mock.Mock()
+        marker = Path("registered-consumer.json")
+
+        with mock.patch.object(
+            hid_helper_consumers,
+            "current_consumer_is_registered",
+            side_effect=(False, True),
+        ) as registered_probe, mock.patch.object(
+            hid_helper_consumers,
+            "register_current_consumer",
+            return_value=marker,
+        ) as register_consumer, mock.patch.object(
+            hid_elevation_windows,
+            "run_registered_injector",
+            tenant,
+        ):
+            frida_compat.run_injector_subprocess(
+                2468,
+                frozen=True,
+                _is_elevated=lambda: False,
+            )
+
+        self.assertEqual(registered_probe.call_count, 2)
+        register_consumer.assert_called_once_with(
+            config.config_root(),
+            timeout_seconds=(
+                frida_compat.HID_CONSUMER_REGISTRATION_TIMEOUT_SECONDS
+            ),
+        )
+        tenant.assert_called_once_with(2468)
+
+    def test_busy_consumer_registration_is_retryable_before_injection(self):
+        tenant = mock.Mock()
+
+        with mock.patch.object(
+            hid_helper_consumers,
+            "current_consumer_is_registered",
+            return_value=False,
+        ), mock.patch.object(
+            hid_helper_consumers,
+            "register_current_consumer",
+            side_effect=hid_helper_consumers.ConsumerMaintenanceError(
+                "helper_consumer_maintenance_busy"
+            ),
+        ), mock.patch.object(
+            hid_elevation_windows,
+            "run_registered_injector",
+            tenant,
+        ):
+            with self.assertRaises(frida_compat.HidTapInjectionError) as ctx:
+                frida_compat.run_injector_subprocess(
+                    2468,
+                    frozen=True,
+                    _is_elevated=lambda: False,
+                )
+
+        self.assertEqual(str(ctx.exception), "hid_helper_operation_busy")
+        tenant.assert_not_called()
+
+    def test_elevated_frozen_app_keeps_the_direct_injector_path(self):
+        with mock.patch.object(
+            frida_compat,
+            "_run_direct_injector_subprocess",
+        ) as direct:
+            frida_compat.run_injector_subprocess(
+                2468,
+                frozen=True,
+                _is_elevated=lambda: True,
+                _registered_injector=mock.Mock(),
+            )
+
+        direct.assert_called_once_with(
+            2468,
+            timeout=frida_compat.HID_TAP_INJECTOR_TIMEOUT_SECONDS,
+            frozen=True,
+            executable=None,
+        )
+
     def test_child_entrypoint_returns_stable_permission_failure_code(self):
         with mock.patch.object(
             frida_hid_tap_injector,
@@ -238,6 +373,41 @@ class InjectorSubprocessTests(unittest.TestCase):
 
 
 class TapStateTests(unittest.TestCase):
+    def test_guarded_thread_marks_an_unexpected_return_failed(self):
+        statuses = []
+        tap = frida_compat.RC003HidReportTap(
+            lambda _report_id, _payload: None,
+            enabled=False,
+            status_handler=lambda status, detail: statuses.append((status, detail)),
+        )
+        tap._run = lambda: None
+
+        tap._run_guarded()
+
+        self.assertEqual(
+            statuses[-1],
+            (frida_compat.HidTapState.FAILED.value, "tap_thread_returned"),
+        )
+
+    def test_guarded_thread_catches_base_exception_and_fails_closed(self):
+        statuses = []
+        tap = frida_compat.RC003HidReportTap(
+            lambda _report_id, _payload: None,
+            enabled=False,
+            status_handler=lambda status, detail: statuses.append((status, detail)),
+        )
+        tap._run = mock.Mock(side_effect=SystemExit(7))
+
+        tap._run_guarded()
+
+        self.assertEqual(
+            statuses[-1],
+            (
+                frida_compat.HidTapState.FAILED.value,
+                "tap_thread_exception_SystemExit",
+            ),
+        )
+
     def test_thread_start_is_starting_not_ready(self):
         statuses = []
         tap = frida_compat.RC003HidReportTap(
@@ -282,16 +452,23 @@ class TapStateTests(unittest.TestCase):
         class FakeClient:
             def __init__(self):
                 self.calls = 0
+                self.sent = []
 
             def settimeout(self, _timeout):
                 pass
+
+            def sendall(self, payload):
+                self.sent.append(payload)
 
             def recv(self, _size):
                 self.calls += 1
                 if self.calls == 1:
                     return (
-                        b'{"kind":"ready","hook_installed":true}\n'
-                        b'{"kind":"gatt_read","raw":"010000f10000000000"}\n'
+                        b'{"kind":"ready","hook_installed":true,"protocol":4}\n'
+                        b'{"kind":"control_ack","action":"enable",'
+                        b'"accepted":true,"state":"enabled","protocol":4}\n'
+                        b'{"kind":"gatt_read","raw":"010000f10000000000",'
+                        b'"intercepted":true,"protocol":4}\n'
                     )
                 tap.stop_event.set()
                 return b""
@@ -336,6 +513,234 @@ class TapStateTests(unittest.TestCase):
             ],
         )
 
+    def test_lease_renewal_continues_while_report_handler_blocks(self):
+        reports = []
+        renew_seen = frida_compat.threading.Event()
+
+        def handle_report(report_id, payload):
+            reports.append((report_id, payload))
+            if payload != b"\x00" * 6:
+                if not renew_seen.wait(timeout=1.0):
+                    self.fail("lease renewal was blocked by the report handler")
+                tap.stop_event.set()
+
+        tap = frida_compat.RC003HidReportTap(
+            handle_report,
+            enabled=False,
+            injector=lambda _pid: None,
+            client_pid_resolver=lambda _client: 2468,
+        )
+
+        class FakeClient:
+            def __init__(self):
+                self.calls = 0
+
+            def settimeout(self, _timeout):
+                pass
+
+            def sendall(self, payload):
+                message = __import__("json").loads(payload.decode("ascii"))
+                if message["action"] == "renew":
+                    renew_seen.set()
+
+            def recv(self, _size):
+                self.calls += 1
+                if self.calls == 1:
+                    return (
+                        b'{"kind":"ready","hook_installed":true,"protocol":4}\n'
+                        b'{"kind":"control_ack","action":"enable",'
+                        b'"accepted":true,"state":"enabled","protocol":4}\n'
+                        b'{"kind":"gatt_read","raw":"010000f10000000000",'
+                        b'"intercepted":true,"protocol":4}\n'
+                    )
+                return b""
+
+            def shutdown(self, _how):
+                pass
+
+            def close(self):
+                pass
+
+        server = mock.MagicMock()
+        server.accept.return_value = (FakeClient(), ("127.0.0.1", 1))
+        with mock.patch.object(
+            frida_compat.frida_hid_tap_runtime,
+            "find_rc003_hidogatt_host_pid",
+            return_value=2468,
+        ), mock.patch.object(
+            frida_compat.socket,
+            "socket",
+            return_value=server,
+        ), mock.patch.object(
+            frida_compat,
+            "HID_INTERCEPT_RENEW_INTERVAL_SECONDS",
+            0.01,
+        ):
+            tap._run()
+
+        self.assertTrue(renew_seen.is_set())
+        self.assertEqual(reports[-1], (1, b"\x00" * 6))
+        self.assertFalse(
+            any(
+                thread.name == "rc003-hidogatt-lease-renewal"
+                and thread.is_alive()
+                for thread in frida_compat.threading.enumerate()
+            )
+        )
+
+    def test_lease_renewal_thread_start_failure_exits_without_joining(self):
+        statuses = []
+
+        def record_status(status, detail):
+            statuses.append((status, detail))
+            if detail == "gadget_control_thread_start_failed":
+                tap.stop_event.set()
+
+        tap = frida_compat.RC003HidReportTap(
+            lambda _report_id, _payload: None,
+            enabled=False,
+            injector=lambda _pid: None,
+            client_pid_resolver=lambda _client: 2468,
+            status_handler=record_status,
+        )
+
+        class FakeThread:
+            def __init__(self, **_kwargs):
+                pass
+
+            def start(self):
+                raise RuntimeError("thread unavailable")
+
+        class FakeClient:
+            def settimeout(self, _timeout):
+                pass
+
+            def sendall(self, _payload):
+                pass
+
+            def recv(self, _size):
+                return (
+                    b'{"kind":"ready","hook_installed":true,"protocol":4}\n'
+                    b'{"kind":"control_ack","action":"enable",'
+                    b'"accepted":true,"state":"enabled","protocol":4}\n'
+                )
+
+            def close(self):
+                pass
+
+        server = mock.MagicMock()
+        server.accept.return_value = (FakeClient(), ("127.0.0.1", 1))
+        with mock.patch.object(
+            frida_compat.frida_hid_tap_runtime,
+            "find_rc003_hidogatt_host_pid",
+            return_value=2468,
+        ), mock.patch.object(
+            frida_compat.socket,
+            "socket",
+            return_value=server,
+        ), mock.patch.object(
+            frida_compat.threading,
+            "Thread",
+            FakeThread,
+        ):
+            tap._run()
+
+        self.assertIn(
+            (
+                frida_compat.HidTapState.UNHEALTHY.value,
+                "gadget_control_thread_start_failed",
+            ),
+            statuses,
+        )
+
+    def test_connection_base_exception_marks_failure_before_neutral_release(self):
+        events = []
+
+        tap = frida_compat.RC003HidReportTap(
+            lambda _report_id, payload: events.append(
+                ("report", payload, tap.status)
+            ),
+            enabled=False,
+            injector=lambda _pid: None,
+            client_pid_resolver=lambda _client: 2468,
+            status_handler=lambda status, detail: events.append(
+                ("status", status, detail)
+            ),
+        )
+
+        class FakeClient:
+            def __init__(self):
+                self.calls = 0
+
+            def settimeout(self, _timeout):
+                pass
+
+            def sendall(self, _payload):
+                pass
+
+            def recv(self, _size):
+                self.calls += 1
+                if self.calls == 1:
+                    return (
+                        b'{"kind":"ready","hook_installed":true,"protocol":4}\n'
+                        b'{"kind":"control_ack","action":"enable",'
+                        b'"accepted":true,"state":"enabled","protocol":4}\n'
+                        b'{"kind":"gatt_read","raw":"010000520000000000",'
+                        b'"intercepted":true,"protocol":4}\n'
+                    )
+                raise SystemExit(9)
+
+            def close(self):
+                pass
+
+        class FakeServer:
+            def setsockopt(self, *_args):
+                pass
+
+            def bind(self, _address):
+                pass
+
+            def listen(self, _backlog):
+                pass
+
+            def settimeout(self, _timeout):
+                pass
+
+            def accept(self):
+                return FakeClient(), ("127.0.0.1", 1)
+
+            def close(self):
+                pass
+
+        with mock.patch.object(
+            frida_compat.frida_hid_tap_runtime,
+            "find_rc003_hidogatt_host_pid",
+            return_value=2468,
+        ), mock.patch.object(
+            frida_compat.socket,
+            "socket",
+            return_value=FakeServer(),
+        ):
+            with self.assertRaises(SystemExit):
+                tap._run()
+
+        failure_index = next(
+            index
+            for index, event in enumerate(events)
+            if event[:2]
+            == ("status", frida_compat.HidTapState.FAILED.value)
+        )
+        neutral_index = next(
+            index
+            for index, event in enumerate(events)
+            if event[0] == "report" and event[1] == b"\x00" * 6
+        )
+        self.assertLess(failure_index, neutral_index)
+        self.assertEqual(
+            events[neutral_index][2],
+            frida_compat.HidTapState.FAILED.value,
+        )
+
     def test_gadget_handshake_and_heartbeat_do_not_announce_hid_ready(self):
         statuses = []
         tap = frida_compat.RC003HidReportTap(
@@ -349,14 +754,23 @@ class TapStateTests(unittest.TestCase):
         class FakeClient:
             def __init__(self):
                 self.calls = 0
+                self.sent = []
 
             def settimeout(self, _timeout):
                 pass
 
+            def sendall(self, payload):
+                self.sent.append(payload)
+
             def recv(self, _size):
                 self.calls += 1
                 if self.calls == 1:
-                    return b'{"kind":"ready","hook_installed":true}\n'
+                    return (
+                        b'{"kind":"ready","hook_installed":true,'
+                        b'"protocol":4}\n'
+                        b'{"kind":"control_ack","action":"enable",'
+                        b'"accepted":true,"state":"enabled","protocol":4}\n'
+                    )
                 tap.stop_event.set()
                 return b'{"kind":"heartbeat","pid":2468}\n'
 
@@ -399,6 +813,408 @@ class TapStateTests(unittest.TestCase):
             state_names,
         )
         self.assertNotIn(frida_compat.HidTapState.READY.value, state_names)
+
+    def test_invalid_interception_contract_fails_closed(self):
+        cases = (
+            (
+                b'{"kind":"ready","hook_installed":true,"protocol":2}\n',
+                "gadget_intercept_protocol_mismatch",
+            ),
+            (
+                b'{"kind":"ready","hook_installed":true,"protocol":3}\n',
+                "gadget_intercept_protocol_mismatch",
+            ),
+            (
+                b'{"kind":"ready","hook_installed":true,"protocol":4}\n'
+                b'{"kind":"control_ack","action":"enable",'
+                b'"accepted":true,"state":"enabled","protocol":4}\n'
+                b'{"kind":"gatt_read","raw":"010000f10000000000",'
+                b'"intercepted":false,"protocol":4}\n',
+                "gadget_report_not_intercepted",
+            ),
+            (
+                b'{"kind":"ready","hook_installed":true,"protocol":4}\n'
+                b'{"kind":"control_ack","action":"enable",'
+                b'"accepted":true,"state":"enabled","protocol":4}\n'
+                b'{"kind":"gatt_read","raw":"010000f10000000000",'
+                b'"intercepted":true,"protocol":2}\n',
+                "gadget_report_not_intercepted",
+            ),
+        )
+        for payload, expected_detail in cases:
+            with self.subTest(expected_detail=expected_detail):
+                statuses = []
+                reports = []
+
+                def record_status(status, detail):
+                    statuses.append((status, detail))
+                    if detail == expected_detail:
+                        tap.stop_event.set()
+
+                tap = frida_compat.RC003HidReportTap(
+                    lambda report_id, report: reports.append((report_id, report)),
+                    enabled=False,
+                    injector=lambda _pid: None,
+                    client_pid_resolver=lambda _client: 2468,
+                    status_handler=record_status,
+                )
+
+                class FakeClient:
+                    def sendall(self, _payload):
+                        pass
+
+                    def settimeout(self, _timeout):
+                        pass
+
+                    def recv(self, _size):
+                        return payload
+
+                    def close(self):
+                        pass
+
+                server = mock.MagicMock()
+                server.accept.return_value = (FakeClient(), ("127.0.0.1", 1))
+                with mock.patch.object(
+                    frida_compat.frida_hid_tap_runtime,
+                    "find_rc003_hidogatt_host_pid",
+                    return_value=2468,
+                ), mock.patch.object(
+                    frida_compat.socket,
+                    "socket",
+                    return_value=server,
+                ):
+                    tap._run()
+
+                expected_state = (
+                    frida_compat.HidTapState.RESTART_REQUIRED
+                    if expected_detail == "gadget_intercept_protocol_mismatch"
+                    else frida_compat.HidTapState.FAILED
+                )
+                self.assertIn((expected_state.value, expected_detail), statuses)
+                self.assertNotIn(
+                    frida_compat.HidTapState.READY.value,
+                    [status for status, _detail in statuses],
+                )
+                self.assertEqual(reports, [])
+
+    def test_old_gadget_waits_for_new_host_without_hiding_restart_required(self):
+        statuses = []
+        injections = []
+        reports = []
+        lookups = []
+
+        def lookup(**_kwargs):
+            pid = 2468 if len(lookups) < 4 else 9753
+            lookups.append(pid)
+            return pid
+
+        def status_changed(status, detail):
+            statuses.append((status, detail))
+            if status == frida_compat.HidTapState.READY.value:
+                tap.stop_event.set()
+
+        tap = frida_compat.RC003HidReportTap(
+            lambda report_id, report: reports.append((report_id, report)),
+            enabled=False,
+            injector=injections.append,
+            client_pid_resolver=lambda _client: lookups[-1],
+            status_handler=status_changed,
+        )
+
+        old_client = mock.Mock()
+        old_client.recv.return_value = (
+            b'{"kind":"ready","hook_installed":true,"protocol":3}\n'
+        )
+        new_client = mock.Mock()
+        new_client.recv.return_value = (
+            b'{"kind":"ready","hook_installed":true,"protocol":4}\n'
+            b'{"kind":"control_ack","action":"enable",'
+            b'"accepted":true,"state":"enabled","protocol":4}\n'
+            b'{"kind":"gatt_read","raw":"010000520000000000",'
+            b'"intercepted":true,"protocol":4}\n'
+        )
+        server = mock.Mock()
+        server.accept.side_effect = [
+            (old_client, ("127.0.0.1", 1)),
+            (new_client, ("127.0.0.1", 1)),
+        ]
+        with mock.patch.object(
+            frida_compat.frida_hid_tap_runtime,
+            "find_rc003_hidogatt_host_pid", side_effect=lookup,
+        ), mock.patch.object(
+            frida_compat.socket, "socket", return_value=server,
+        ), mock.patch.object(tap.stop_event, "wait", return_value=False), mock.patch.object(
+            tap, "_run_lease_renewal",
+        ):
+            tap._run()
+
+        self.assertEqual(injections, [2468, 9753])
+        self.assertEqual(server.accept.call_count, 2)
+        old_client.sendall.assert_not_called()
+        new_client.sendall.assert_called_once()
+        states = [status for status, _detail in statuses]
+        restart_index = states.index(frida_compat.HidTapState.RESTART_REQUIRED.value)
+        self.assertEqual(states[restart_index + 1], frida_compat.HidTapState.INJECTING.value)
+        self.assertEqual(states[-1], frida_compat.HidTapState.READY.value)
+        self.assertTrue(reports)
+
+    def test_legacy_migration_waits_for_new_host_then_accepts_direction_report(self):
+        statuses, injections, reports = [], [], []
+        current = [2468]
+
+        def inject(pid):
+            injections.append(pid)
+            if pid == 2468:
+                current[0] = 9753
+                raise frida_compat.HidTapInjectionError("hid_helper_host_restarted")
+
+        def changed(status, detail):
+            statuses.append((status, detail))
+            if status == frida_compat.HidTapState.READY.value:
+                tap.stop_event.set()
+
+        tap = frida_compat.RC003HidReportTap(
+            lambda *report: reports.append(report), enabled=False, injector=inject,
+            client_pid_resolver=lambda _client: 9753, status_handler=changed,
+        )
+        client = mock.Mock()
+        client.recv.return_value = (
+            b'{"kind":"ready","hook_installed":true,"protocol":4}\n'
+            b'{"kind":"control_ack","action":"enable","accepted":true,"state":"enabled","protocol":4}\n'
+            b'{"kind":"gatt_read","raw":"010000520000000000","intercepted":true,"protocol":4}\n'
+        )
+        server = mock.Mock()
+        server.accept.return_value = (client, ("127.0.0.1", 1))
+        with mock.patch.object(frida_compat.frida_hid_tap_runtime, "find_rc003_hidogatt_host_pid",
+                               side_effect=lambda **_kwargs: current[0]), \
+                mock.patch.object(frida_compat.socket, "socket", return_value=server), \
+                mock.patch.object(tap.stop_event, "wait", return_value=False), \
+                mock.patch.object(tap, "_run_lease_renewal"):
+            tap._run()
+        self.assertEqual(injections, [2468, 9753])
+        self.assertIn((frida_compat.HidTapState.WAITING_HOST.value, "hid_helper_host_restarted"), statuses)
+        self.assertEqual(statuses[-1][0], "ready")
+        self.assertTrue(reports)
+
+    def test_failed_legacy_migration_stays_explicit_without_restarting_same_host(self):
+        statuses = []
+        injector = mock.Mock(side_effect=frida_compat.HidTapInjectionError(
+            "hid_helper_legacy_runtime_restart_required"))
+        tap = frida_compat.RC003HidReportTap(
+            lambda *_args: None, enabled=False, injector=injector,
+            status_handler=lambda *status: statuses.append(status),
+        )
+        waits = []
+
+        def wait(_delay):
+            waits.append(True)
+            if len(waits) == 3:
+                tap.stop_event.set()
+
+        with mock.patch.object(frida_compat.frida_hid_tap_runtime, "find_rc003_hidogatt_host_pid", return_value=2468), \
+                mock.patch.object(frida_compat.socket, "socket", return_value=mock.Mock()), \
+                mock.patch.object(tap.stop_event, "wait", side_effect=wait):
+            tap._run()
+        injector.assert_called_once_with(2468)
+        self.assertEqual(statuses[-1], ("restart_required", "hid_helper_legacy_runtime_restart_required"))
+
+    def test_gadget_clears_on_entry_and_reports_the_saved_original(self):
+        source = frida_compat.frida_hid_tap_runtime.GADGET_SCRIPT
+        intercept = source[
+            source.index("function interceptKeyboardReport") :
+            source.index("function scheduleReconnect")
+        ]
+        self.assertLess(
+            intercept.index("const raw = hex(pointer, length)"),
+            intercept.index("pointer.add(3).writeByteArray"),
+        )
+        self.assertLess(
+            intercept.index("pointer.add(3).writeByteArray"),
+            intercept.index("return raw"),
+        )
+
+        on_leave = source[
+            source.index("onLeave(retval)") :
+            source.index("hookInstalled = true")
+        ]
+        self.assertLess(
+            on_leave.index("const raw = this.ownedReport"),
+            on_leave.index('kind: "gatt_read"'),
+        )
+        self.assertIn("raw: raw", on_leave)
+        self.assertIn("intercepted: true", on_leave)
+        on_enter = source[source.index("onEnter(args)") : source.index("onLeave(retval)")]
+        self.assertIn("interceptOutgoingCopy(args, source)", on_enter)
+        self.assertNotIn("interceptKeyboardReport(this.output", on_leave)
+
+    def test_gadget_never_clears_a_report_without_a_live_lease(self):
+        source = frida_compat.frida_hid_tap_runtime.GADGET_SCRIPT
+        intercept = source[
+            source.index("function interceptKeyboardReport") :
+            source.index("function scheduleReconnect")
+        ]
+        self.assertIn("!interceptionActive()", intercept)
+        self.assertLess(
+            intercept.index("!interceptionActive()"),
+            intercept.index("pointer.add(3).writeByteArray"),
+        )
+        self.assertIn("interceptLeaseDeadline = 0", source)
+
+    def test_gadget_waits_for_a_neutral_report_before_taking_ownership(self):
+        source = frida_compat.frida_hid_tap_runtime.GADGET_SCRIPT
+        intercept = source[
+            source.index("function interceptKeyboardReport") :
+            source.index("function scheduleReconnect")
+        ]
+
+        self.assertIn('raw.slice(6) !== "000000000000"', intercept)
+        self.assertLess(
+            intercept.index('raw.slice(6) !== "000000000000"'),
+            intercept.index("pointer.add(3).writeByteArray"),
+        )
+        self.assertIn('if (action === "enable") resetCopyOwnership();', source)
+        self.assertNotIn('if (action === "renew") interceptionReady = false;', source)
+        self.assertIn('kind: "intercept_expired"', source)
+        self.assertIn('action === "disable"', source)
+        self.assertIn('action !== "enable" && action !== "renew"', source)
+
+    def test_stop_disables_interception_before_stopping_the_thread(self):
+        tap = frida_compat.RC003HidReportTap(
+            lambda _report_id, _payload: None,
+            enabled=False,
+        )
+
+        class FakeClient:
+            def __init__(self):
+                self.actions = []
+
+            def sendall(self, payload):
+                message = __import__("json").loads(payload.decode("ascii"))
+                self.actions.append(message["action"])
+                tap._record_control_ack(
+                    {
+                        "kind": "control_ack",
+                        "action": message["action"],
+                        "accepted": True,
+                        "state": "disabled",
+                        "protocol": frida_compat.HID_INTERCEPT_PROTOCOL,
+                    }
+                )
+
+        client = FakeClient()
+        tap._set_client(client)
+        tap._interception_enabled = True
+        with mock.patch.object(frida_compat.time, "sleep") as sleep:
+            tap.stop()
+
+        self.assertEqual(client.actions, ["disable"])
+        self.assertTrue(tap._stop_requested_event.is_set())
+        sleep.assert_not_called()
+
+    def test_late_enable_or_renew_is_converted_to_disable_after_stop_begins(self):
+        tap = frida_compat.RC003HidReportTap(
+            lambda _report_id, _payload: None,
+            enabled=False,
+        )
+        client = mock.Mock()
+        tap._stop_requested_event.set()
+
+        self.assertEqual(tap._send_control(client, "enable"), "disable")
+        self.assertEqual(tap._send_control(client, "renew"), "disable")
+
+        messages = [
+            __import__("json").loads(call.args[0].decode("ascii"))
+            for call in client.sendall.call_args_list
+        ]
+        self.assertEqual([message["action"] for message in messages], ["disable"] * 2)
+        self.assertTrue(all("lease_ms" not in message for message in messages))
+
+    def test_missing_disable_ack_waits_out_the_last_possible_lease(self):
+        tap = frida_compat.RC003HidReportTap(
+            lambda _report_id, _payload: None,
+            enabled=False,
+        )
+        client = mock.Mock()
+        tap._set_client(client)
+        tap._interception_enabled = True
+
+        with mock.patch.object(
+            tap._disable_ack_event,
+            "wait",
+            return_value=False,
+        ), mock.patch.object(
+            frida_compat.time,
+            "monotonic",
+            return_value=100.0,
+        ), mock.patch.object(frida_compat.time, "sleep") as sleep:
+            tap.stop()
+
+        self.assertTrue(tap._stop_requested_event.is_set())
+        sleep.assert_called_once_with(
+            frida_compat.HID_INTERCEPT_LEASE_SECONDS
+            + frida_compat.HID_INTERCEPT_LEASE_SAFETY_SECONDS
+        )
+
+    def test_expired_lease_releases_an_active_button_and_disconnects(self):
+        reports = []
+        statuses = []
+
+        def record_status(status, detail):
+            statuses.append((status, detail))
+            if detail == "gadget_intercept_lease_expired":
+                tap.stop_event.set()
+
+        tap = frida_compat.RC003HidReportTap(
+            lambda report_id, payload: reports.append((report_id, payload)),
+            enabled=False,
+            injector=lambda _pid: None,
+            client_pid_resolver=lambda _client: 2468,
+            status_handler=record_status,
+        )
+
+        class FakeClient:
+            def settimeout(self, _timeout):
+                pass
+
+            def sendall(self, _payload):
+                pass
+
+            def recv(self, _size):
+                return (
+                    b'{"kind":"ready","hook_installed":true,"protocol":4}\n'
+                    b'{"kind":"control_ack","action":"enable",'
+                    b'"accepted":true,"state":"enabled","protocol":4}\n'
+                    b'{"kind":"gatt_read","raw":"010000520000000000",'
+                    b'"intercepted":true,"protocol":4}\n'
+                    b'{"kind":"intercept_expired","protocol":4}\n'
+                )
+
+            def close(self):
+                pass
+
+        server = mock.MagicMock()
+        server.accept.return_value = (FakeClient(), ("127.0.0.1", 1))
+        with mock.patch.object(
+            frida_compat.frida_hid_tap_runtime,
+            "find_rc003_hidogatt_host_pid",
+            return_value=2468,
+        ), mock.patch.object(frida_compat.socket, "socket", return_value=server):
+            tap._run()
+
+        self.assertIn(
+            (
+                frida_compat.HidTapState.UNHEALTHY.value,
+                "gadget_intercept_lease_expired",
+            ),
+            statuses,
+        )
+        self.assertEqual(
+            reports,
+            [
+                (1, bytes.fromhex("520000000000")),
+                (1, b"\x00" * 6),
+            ],
+        )
 
     def test_non_object_json_message_is_ignored_without_killing_the_tap(self):
         statuses = []
@@ -548,6 +1364,275 @@ class TapStateTests(unittest.TestCase):
             ],
         )
 
+    def test_busy_registered_helper_retries_the_same_host_pid(self):
+        statuses = []
+        injector = mock.Mock(
+            side_effect=[
+                frida_compat.HidTapInjectionError("hid_helper_operation_busy"),
+                frida_compat.HidTapInjectionError(
+                    "injector_requires_administrator"
+                ),
+            ]
+        )
+
+        def record_status(status, detail):
+            statuses.append((status, detail))
+            if detail == "injector_requires_administrator":
+                tap.stop_event.set()
+
+        tap = frida_compat.RC003HidReportTap(
+            lambda _report_id, _payload: None,
+            enabled=False,
+            injector=injector,
+            status_handler=record_status,
+        )
+        tap.stop_event.wait = mock.Mock(return_value=False)
+        server = mock.MagicMock()
+
+        with mock.patch.object(
+            frida_compat.frida_hid_tap_runtime,
+            "find_rc003_hidogatt_host_pid",
+            return_value=2468,
+        ), mock.patch.object(frida_compat.socket, "socket", return_value=server):
+            tap._run()
+
+        self.assertEqual(injector.call_args_list, [mock.call(2468), mock.call(2468)])
+        self.assertIn(
+            (
+                frida_compat.HidTapState.FAILED.value,
+                "hid_helper_operation_busy",
+            ),
+            statuses,
+        )
+        self.assertIn(
+            (
+                frida_compat.HidTapState.FAILED.value,
+                "injector_requires_administrator",
+            ),
+            statuses,
+        )
+
+    def test_transient_task_start_failure_stops_after_three_attempts_for_same_pid(self):
+        for detail in (
+            "hid_helper_task_service_unavailable",
+            "hid_helper_task_start_failed",
+        ):
+            with self.subTest(detail=detail):
+                injector = mock.Mock(
+                    side_effect=frida_compat.HidTapInjectionError(detail)
+                )
+                tap = frida_compat.RC003HidReportTap(
+                    lambda _report_id, _payload: None,
+                    enabled=False,
+                    injector=injector,
+                )
+                wait_count = 0
+
+                def bounded_wait(_delay):
+                    nonlocal wait_count
+                    wait_count += 1
+                    if (
+                        wait_count
+                        == frida_compat.HID_TAP_TRANSIENT_INJECTION_MAX_ATTEMPTS
+                        + 1
+                    ):
+                        tap.stop_event.set()
+
+                tap.stop_event.wait = mock.Mock(side_effect=bounded_wait)
+                server = mock.MagicMock()
+
+                with mock.patch.object(
+                    frida_compat.frida_hid_tap_runtime,
+                    "find_rc003_hidogatt_host_pid",
+                    return_value=2468,
+                ), mock.patch.object(
+                    frida_compat.socket, "socket", return_value=server
+                ):
+                    tap._run()
+
+                self.assertEqual(
+                    injector.call_count,
+                    frida_compat.HID_TAP_TRANSIENT_INJECTION_MAX_ATTEMPTS,
+                )
+                self.assertEqual(
+                    wait_count,
+                    frida_compat.HID_TAP_TRANSIENT_INJECTION_MAX_ATTEMPTS + 1,
+                )
+
+    def test_transient_task_start_retry_budget_resets_for_new_host_pid(self):
+        injector = mock.Mock(
+            side_effect=frida_compat.HidTapInjectionError(
+                "hid_helper_task_start_failed"
+            )
+        )
+        tap = frida_compat.RC003HidReportTap(
+            lambda _report_id, _payload: None,
+            enabled=False,
+            injector=injector,
+        )
+        wait_count = 0
+
+        def bounded_wait(_delay):
+            nonlocal wait_count
+            wait_count += 1
+            if wait_count == (
+                frida_compat.HID_TAP_TRANSIENT_INJECTION_MAX_ATTEMPTS * 2 + 1
+            ):
+                tap.stop_event.set()
+
+        tap.stop_event.wait = mock.Mock(side_effect=bounded_wait)
+        server = mock.MagicMock()
+        first_pid = 2468
+        second_pid = 9753
+        max_attempts = frida_compat.HID_TAP_TRANSIENT_INJECTION_MAX_ATTEMPTS
+        pid_sequence = [first_pid] * max_attempts + [second_pid] * (
+            max_attempts + 1
+        )
+
+        with mock.patch.object(
+            frida_compat.frida_hid_tap_runtime,
+            "find_rc003_hidogatt_host_pid",
+            side_effect=pid_sequence,
+        ), mock.patch.object(frida_compat.socket, "socket", return_value=server):
+            tap._run()
+
+        self.assertEqual(
+            injector.call_args_list,
+            [mock.call(first_pid)] * max_attempts
+            + [mock.call(second_pid)] * max_attempts,
+        )
+
+    def test_transient_task_start_failure_then_success_waits_for_connection(self):
+        statuses = []
+        injector = mock.Mock(
+            side_effect=[
+                frida_compat.HidTapInjectionError(
+                    "hid_helper_task_service_unavailable"
+                ),
+                None,
+            ]
+        )
+        tap = frida_compat.RC003HidReportTap(
+            lambda _report_id, _payload: None,
+            enabled=False,
+            injector=injector,
+            status_handler=lambda status, detail: statuses.append((status, detail)),
+        )
+        tap.stop_event.wait = mock.Mock(return_value=False)
+        server = mock.MagicMock()
+
+        def stop_while_waiting_for_connection():
+            tap.stop_event.set()
+            raise frida_compat.socket.timeout()
+
+        server.accept.side_effect = stop_while_waiting_for_connection
+        with mock.patch.object(
+            frida_compat.frida_hid_tap_runtime,
+            "find_rc003_hidogatt_host_pid",
+            return_value=2468,
+        ), mock.patch.object(frida_compat.socket, "socket", return_value=server):
+            tap._run()
+
+        self.assertEqual(
+            injector.call_args_list,
+            [mock.call(2468), mock.call(2468)],
+        )
+        self.assertEqual(
+            statuses[-1],
+            (frida_compat.HidTapState.WAITING_CONNECTION.value, ""),
+        )
+
+    def test_registered_task_timeout_does_not_retry_the_same_host_pid(self):
+        injector = mock.Mock(
+            side_effect=frida_compat.HidTapInjectionError(
+                "hid_helper_task_timeout"
+            )
+        )
+        tap = frida_compat.RC003HidReportTap(
+            lambda _report_id, _payload: None,
+            enabled=False,
+            injector=injector,
+        )
+        wait_count = 0
+
+        def bounded_wait(_delay):
+            nonlocal wait_count
+            wait_count += 1
+            if wait_count == 2:
+                tap.stop_event.set()
+
+        tap.stop_event.wait = mock.Mock(side_effect=bounded_wait)
+        server = mock.MagicMock()
+        with mock.patch.object(
+            frida_compat.frida_hid_tap_runtime,
+            "find_rc003_hidogatt_host_pid",
+            return_value=2468,
+        ), mock.patch.object(frida_compat.socket, "socket", return_value=server):
+            tap._run()
+
+        injector.assert_called_once_with(2468)
+
+    def test_missing_gadget_connection_becomes_a_stable_failure(self):
+        statuses = []
+        tap = frida_compat.RC003HidReportTap(
+            lambda _report_id, _payload: None,
+            enabled=False,
+            injector=lambda _pid: None,
+            connection_timeout=1.0,
+            status_handler=lambda status, detail: statuses.append((status, detail)),
+        )
+        wait_count = 0
+
+        def bounded_wait(_delay):
+            nonlocal wait_count
+            wait_count += 1
+            if wait_count == 1:
+                tap.stop_event.set()
+
+        tap.stop_event.wait = mock.Mock(side_effect=bounded_wait)
+
+        class FakeServer:
+            def setsockopt(self, *_args):
+                pass
+
+            def bind(self, _address):
+                pass
+
+            def listen(self, _backlog):
+                pass
+
+            def settimeout(self, _timeout):
+                pass
+
+            def accept(self):
+                raise frida_compat.socket.timeout()
+
+            def close(self):
+                pass
+
+        with mock.patch.object(
+            frida_compat.frida_hid_tap_runtime,
+            "find_rc003_hidogatt_host_pid",
+            return_value=2468,
+        ), mock.patch.object(
+            frida_compat.socket,
+            "socket",
+            return_value=FakeServer(),
+        ), mock.patch.object(
+            frida_compat.time,
+            "monotonic",
+            side_effect=[10.0, 11.1],
+        ):
+            tap._run()
+
+        self.assertIn(
+            (
+                frida_compat.HidTapState.FAILED.value,
+                "gadget_connection_timeout",
+            ),
+            statuses,
+        )
+
 
 class InjectorOrderingTests(unittest.TestCase):
     def test_debug_privilege_is_enabled_before_wudfhost_name_query(self):
@@ -575,6 +1660,10 @@ class InjectorOrderingTests(unittest.TestCase):
             return_value=frida_hid_tap_injector.GADGET_DLL_SHA256,
         ), mock.patch.object(
             frida_hid_tap_injector,
+            "ensure_reload_capable_host",
+            return_value="fresh",
+        ), mock.patch.object(
+            frida_hid_tap_injector,
             "inject_library",
             side_effect=lambda _pid, _path: calls.append("inject"),
         ):
@@ -594,10 +1683,83 @@ class InjectorOrderingTests(unittest.TestCase):
         ), mock.patch.object(
             frida_hid_tap_injector, "_target_process_name"
         ) as target_name:
-            with self.assertRaises(PermissionError):
+            with self.assertRaises(
+                frida_hid_tap_injector.HidInjectionStageError
+            ) as ctx:
                 frida_hid_tap_injector.inject_current_process(2468)
 
+        self.assertEqual(str(ctx.exception), "hid_helper_debug_privilege_failed")
         target_name.assert_not_called()
+
+    def test_injector_reports_the_exact_failed_stage(self):
+        cases = (
+            (
+                "target_query",
+                {"_target_process_name": OSError("denied")},
+                "hid_helper_target_process_open_failed",
+            ),
+            (
+                "target_identity",
+                {"_target_process_name": "not-wudfhost.exe"},
+                "hid_helper_target_validation_failed",
+            ),
+            (
+                "runtime",
+                {"prepare_secure_runtime": OSError("missing")},
+                "hid_helper_runtime_preparation_failed",
+            ),
+            (
+                "remote_load",
+                {
+                    "prepare_secure_runtime": Path("verified.dll"),
+                    "sha256_file": frida_hid_tap_injector.GADGET_DLL_SHA256,
+                    "inject_library": frida_hid_tap_injector.HidInjectionStageError(
+                        "hid_helper_remote_load_failed"
+                    ),
+                },
+                "hid_helper_remote_load_failed",
+            ),
+        )
+
+        for name, overrides, expected in cases:
+            patches = [
+                mock.patch.object(frida_hid_tap_injector.os, "name", "nt"),
+                mock.patch.object(
+                    frida_hid_tap_injector,
+                    "find_rc003_hidogatt_host_pid",
+                    return_value=2468,
+                ),
+                mock.patch.object(
+                    frida_hid_tap_injector,
+                    "enable_debug_privilege",
+                ),
+            ]
+            defaults = {
+                "_target_process_name": "wudfhost.exe",
+                "prepare_secure_runtime": Path("verified.dll"),
+                "sha256_file": frida_hid_tap_injector.GADGET_DLL_SHA256,
+                "inject_library": None,
+                "ensure_reload_capable_host": "fresh",
+            }
+            defaults.update(overrides)
+            for target, result in defaults.items():
+                kwargs = (
+                    {"side_effect": result}
+                    if isinstance(result, BaseException)
+                    else {"return_value": result}
+                )
+                patches.append(
+                    mock.patch.object(frida_hid_tap_injector, target, **kwargs)
+                )
+            with self.subTest(name=name):
+                with ExitStack() as stack:
+                    for patch in patches:
+                        stack.enter_context(patch)
+                    with self.assertRaises(
+                        frida_hid_tap_injector.HidInjectionStageError
+                    ) as ctx:
+                        frida_hid_tap_injector.inject_current_process(2468)
+                self.assertEqual(str(ctx.exception), expected)
 
 
 class InjectorCleanupSafetyTests(unittest.TestCase):

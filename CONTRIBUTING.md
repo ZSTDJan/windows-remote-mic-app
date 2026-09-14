@@ -25,12 +25,14 @@ Issue 模板；安全漏洞按 [`SECURITY.md`](SECURITY.md) 私密报告。
 py -3.12 -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements-dev.txt
 $env:PYTHONPATH = Join-Path (Get-Location) 'src'
+$env:PYTHONUTF8 = '1'
+$env:PYTHONIOENCODING = 'utf-8'
 .\.venv\Scripts\python.exe -m unittest discover -s tests -t . -p 'test_*.py' -v
 ```
 
-完整构建、真机验收和发布不是每个改动的默认步骤。测试入口见
-[`TESTING.md`](apps/windows/rc003/TESTING.md)，真实 RC003、语音输入、音频端点和
-长期运行仍需人工检查。
+完整构建、真机验收和发布不是每个改动的默认步骤。验证深度按
+[`VALIDATION-AND-DELIVERY.md`](apps/windows/rc003/VALIDATION-AND-DELIVERY.md)
+选择，真实 RC003、语音输入、音频端点和长期运行仍需人工检查。
 
 ## 提交修改
 

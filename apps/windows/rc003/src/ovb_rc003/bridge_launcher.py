@@ -1,73 +1,16 @@
-"""Launches the bridge process from the settings window (XRBM-029), and
-reports what actually happened - not just "a process was created". This
-module never conflates a launched/still-running process with "RC003 is
-connected": that fact is only observable from ``app.log`` (see
-``logging_setup.py``), never from process liveness alone.
+"""Own the bridge worker inside the single desktop application process.
 
-Command construction (``build_launch_command``) covers exactly the two ways
-this package's own entry point (``__main__.py``) is ever invoked, so a
-future third mode cannot silently fall through unnoticed:
-
-- **Frozen** (the packaged ``RemoteMicRC003.exe``, built from
-  ``src/launcher.py`` - see that module's docstring): ``sys.executable`` IS
-  that same exe, and running it again with ``--bridge`` enters
-  ``__main__.main()``'s ``_run_bridge()`` branch. The settings-only hidden
-  flag also tells a duplicate child to return its stable exit code without
-  opening a modal notice that would block launch-outcome polling. The
-  no-argument form opens settings, so the bridge is always launched
-  EXPLICITLY - never ``--settings``, which would just open a second settings
-  window instead of starting the bridge.
-- **Source** (``python -m ovb_rc003``): ``sys.executable`` is the
-  interpreter itself; ``[sys.executable, "-m", "ovb_rc003", "--bridge"]``
-  enters the same bridge branch. This relies on the child inheriting the
-  parent process's environment (``subprocess.Popen`` does this by default) -
-  in particular ``PYTHONPATH=src``, which the settings window's own process
-  needed to have been started with in order to import ``ovb_rc003`` at all
-  (see the root README's "Running from source" section).
-
-Both branches deliberately append ``--bridge`` plus the hidden settings-
-launch marker, and never ``--settings``:
-that argument would recursively open another settings window instead of
-starting the bridge (In-scope item 2's "不得递归打开 --settings").
-
-Launch-outcome detection (``launch_bridge``) distinguishes five states by
-polling the child for a short grace period rather than assuming
-"``Popen()`` did not raise" means "the bridge is running":
-
-- ``STARTED``: the process is still alive once the grace period elapses -
-  the best evidence available from process state alone that startup is
-  proceeding, NOT proof of an RC003 connection.
-- ``ALREADY_RUNNING``: the process exited within the grace period with
-  exactly ``single_instance.DUPLICATE_INSTANCE_EXIT_CODE`` - the
-  single-instance guard in ``single_instance.py``/``__main__.py`` refused a
-  second concurrent bridge instance. Reusing that exact constant (rather
-  than redefining a second one here) keeps the two modules from silently
-  drifting apart if the exit code is ever renumbered.
-- ``QUICK_EXIT``: the process exited within the grace period with any OTHER
-  code (including ``GUARD_UNAVAILABLE_EXIT_CODE``/``CLEANUP_FAILED_EXIT_CODE``
-  or an unhandled exception's implicit ``1``) - a real failure, whose exact
-  code is always surfaced to the caller rather than swallowed, so a user or
-  reviewer can distinguish it from a clean exit without guessing.
-- ``LAUNCH_FAILED``: ``Popen()`` itself raised ``OSError`` (e.g. the target
-  executable is missing or not executable) - no process was ever created at
-  all.
-- ``STATUS_UNKNOWN``: a process was created, but querying its status raised
-  ``OSError``. The owner PID is retained and the UI must not tell the user to
-  retry, because the child may still be running.
-
-Testability: every OS-facing call (``_popen``, ``_sleep``) is injectable, so
-tests/test_bridge_launcher.py drives all four outcomes deterministically -
-including the grace-period polling loop - without spawning a real process or
-sleeping in real wall-clock time, the same dependency-injection pattern this
-package's other Win32-facing modules already use (see e.g.
-``single_instance.py``'s ``_create_mutex``/``_release_mutex``/
-``_close_handle`` parameters).
+Normal product calls start one in-process worker. Explicit commands and the
+``Popen`` seams remain only for compatibility tooling and deterministic tests;
+the settings window and login startup never create a second resident process.
 """
 
 from __future__ import annotations
 
 import subprocess
+import os
 import sys
+import threading
 import time
 from dataclasses import dataclass
 from enum import Enum
@@ -227,6 +170,276 @@ class PendingBridgeLaunch:
     checks_remaining: int
 
 
+class _InProcessBridgeHandle:
+    """Process-like view of the bridge worker running in this application."""
+
+    pid = os.getpid()
+
+    def __init__(self, *, launch_voice_program_on_start: bool = True) -> None:
+        self._lock = threading.Lock()
+        self._exit_code: Optional[int] = None
+        self._thread: Optional[threading.Thread] = None
+        self._stop_callback: Optional[Callable[[], None]] = None
+        self._reconnect_callback: Optional[Callable[[], None]] = None
+        self._settings_reload_callback: Optional[Callable[[], None]] = None
+        self._stop_requested = False
+        self._finished = threading.Event()
+        self.launch_voice_program_on_start = bool(launch_voice_program_on_start)
+
+    def attach(self, thread: threading.Thread) -> None:
+        self._thread = thread
+
+    def finish(self, exit_code: int) -> None:
+        with self._lock:
+            self._exit_code = int(exit_code)
+            self._stop_callback = None
+            self._reconnect_callback = None
+            self._settings_reload_callback = None
+        self._finished.set()
+
+    def bind_stop(self, callback: Callable[[], None]) -> None:
+        with self._lock:
+            if self._stop_requested:
+                call_now = True
+            else:
+                self._stop_callback = callback
+                call_now = False
+        if call_now:
+            callback()
+
+    def request_stop(self) -> None:
+        with self._lock:
+            if self._stop_requested:
+                return
+            self._stop_requested = True
+            callback = self._stop_callback
+            self._stop_callback = None
+        if callback is not None:
+            callback()
+
+    def bind_reconnect(self, callback: Callable[[], None]) -> None:
+        with self._lock:
+            if self._exit_code is None and not self._stop_requested:
+                self._reconnect_callback = callback
+
+    def request_reconnect_now(self) -> bool:
+        with self._lock:
+            if self._exit_code is not None or self._stop_requested:
+                return False
+            callback = self._reconnect_callback
+        if callback is None:
+            return False
+        callback()
+        return True
+
+    def bind_settings_reload(self, callback: Callable[[], None]) -> None:
+        with self._lock:
+            if self._exit_code is None and not self._stop_requested:
+                self._settings_reload_callback = callback
+
+    def request_settings_reload_now(self) -> bool:
+        with self._lock:
+            if self._exit_code is not None or self._stop_requested:
+                return False
+            callback = self._settings_reload_callback
+        if callback is None:
+            return False
+        callback()
+        return True
+
+    def wait(self, timeout: float) -> bool:
+        return self._finished.wait(max(0.0, float(timeout)))
+
+    def poll(self) -> Optional[int]:
+        with self._lock:
+            return self._exit_code
+
+    @property
+    def is_alive(self) -> bool:
+        thread = self._thread
+        return bool(thread is not None and thread.is_alive() and self.poll() is None)
+
+
+_IN_PROCESS_COMMAND = ("<in-process-bridge>",)
+_in_process_lock = threading.Lock()
+_in_process_handle: Optional[_InProcessBridgeHandle] = None
+_in_process_restart_blocked = False
+
+
+def _run_in_process_bridge(handle: _InProcessBridgeHandle) -> None:
+    """Own the legacy bridge mutex while the bridge lives in this process."""
+
+    from . import app
+
+    global _in_process_restart_blocked
+
+    exit_code = 0
+    mutex_cleanup_failed = False
+    try:
+        with single_instance.BridgeInstanceGuard():
+            app.main(
+                show_notification_icon=False,
+                on_runtime_ready=handle.bind_stop,
+                on_reconnect_ready=handle.bind_reconnect,
+                on_settings_reload_ready=handle.bind_settings_reload,
+                launch_voice_program_on_start=handle.launch_voice_program_on_start,
+            )
+    except single_instance.DuplicateInstanceError:
+        exit_code = single_instance.DUPLICATE_INSTANCE_EXIT_CODE
+    except single_instance.SingleInstanceUnavailableError:
+        exit_code = single_instance.GUARD_UNAVAILABLE_EXIT_CODE
+    except single_instance.MutexCleanupError:
+        exit_code = single_instance.CLEANUP_FAILED_EXIT_CODE
+        mutex_cleanup_failed = True
+    except BaseException:  # noqa: BLE001 - worker failure must not report success
+        exit_code = 1
+    finally:
+        if mutex_cleanup_failed:
+            with _in_process_lock:
+                _in_process_restart_blocked = True
+        handle.finish(exit_code)
+
+
+def in_process_bridge_running() -> bool:
+    with _in_process_lock:
+        handle = _in_process_handle
+        return bool(handle is not None and handle.is_alive)
+
+
+def reconnect_in_process_bridge_now() -> Optional[bool]:
+    """Wake this process's retry backoff; return None for a legacy owner."""
+
+    global _in_process_handle
+    with _in_process_lock:
+        handle = _in_process_handle
+        if handle is None:
+            return None
+        if not handle.is_alive:
+            _in_process_handle = None
+            return None
+        return handle.request_reconnect_now()
+
+
+def reload_in_process_bridge_settings() -> Optional[bool]:
+    """Ask the in-process bridge to apply its saved configuration now."""
+
+    global _in_process_handle
+    with _in_process_lock:
+        handle = _in_process_handle
+        if handle is None:
+            return None
+        if not handle.is_alive:
+            _in_process_handle = None
+            return None
+        return handle.request_settings_reload_now()
+
+
+def stop_in_process_bridge(*, timeout: float = 7.0) -> Optional[bool]:
+    """Stop this process's worker; return None when it is not the owner."""
+
+    global _in_process_handle
+    with _in_process_lock:
+        handle = _in_process_handle
+        if handle is None:
+            return None
+        if not handle.is_alive:
+            _in_process_handle = None
+            # A finished launch no longer owns the bridge mutex. Returning
+            # None lets the caller continue to the legacy standalone bridge
+            # probe instead of falsely reporting that another live service
+            # was stopped by this process.
+            return None
+        handle.request_stop()
+    stopped = handle.wait(timeout)
+    if stopped:
+        with _in_process_lock:
+            if _in_process_handle is handle:
+                _in_process_handle = None
+    return stopped
+
+
+def start_in_process_bridge(
+    *,
+    grace_checks: int = DEFAULT_GRACE_CHECKS,
+    launch_voice_program_on_start: bool = True,
+) -> Union[LaunchResult, PendingBridgeLaunch]:
+    """Start the single bridge worker without creating another OS process."""
+
+    global _in_process_handle
+    with _in_process_lock:
+        if _in_process_restart_blocked:
+            return _result_for_exit(
+                _IN_PROCESS_COMMAND,
+                os.getpid(),
+                single_instance.CLEANUP_FAILED_EXIT_CODE,
+            )
+        current = _in_process_handle
+        if current is not None and current.is_alive:
+            return LaunchResult(
+                outcome=LaunchOutcome.ALREADY_RUNNING,
+                command=_IN_PROCESS_COMMAND,
+                pid=os.getpid(),
+                exit_code=ALREADY_RUNNING_EXIT_CODE,
+            )
+        handle = _InProcessBridgeHandle(
+            launch_voice_program_on_start=launch_voice_program_on_start
+        )
+        thread = threading.Thread(
+            target=_run_in_process_bridge,
+            args=(handle,),
+            name="remote-mic-bridge",
+            daemon=False,
+        )
+        handle.attach(thread)
+        _in_process_handle = handle
+        try:
+            thread.start()
+        except Exception as exc:
+            handle.finish(1)
+            _in_process_handle = None
+            return LaunchResult(
+                outcome=LaunchOutcome.LAUNCH_FAILED,
+                command=_IN_PROCESS_COMMAND,
+                pid=os.getpid(),
+                error=type(exc).__name__,
+            )
+    checks_remaining = max(0, int(grace_checks))
+    if checks_remaining == 0:
+        return LaunchResult(
+            outcome=LaunchOutcome.STARTED,
+            command=_IN_PROCESS_COMMAND,
+            pid=os.getpid(),
+        )
+    return PendingBridgeLaunch(
+        command=_IN_PROCESS_COMMAND,
+        process=handle,
+        pid=os.getpid(),
+        checks_remaining=checks_remaining,
+    )
+
+
+def launch_in_process_bridge(
+    *,
+    grace_checks: int = DEFAULT_GRACE_CHECKS,
+    poll_interval_seconds: float = DEFAULT_POLL_INTERVAL_SECONDS,
+    _sleep: Callable[[float], None] = time.sleep,
+    launch_voice_program_on_start: bool = True,
+) -> LaunchResult:
+    """Synchronous wrapper used only by bounded background workflows."""
+
+    attempt = start_in_process_bridge(
+        grace_checks=grace_checks,
+        launch_voice_program_on_start=launch_voice_program_on_start,
+    )
+    if isinstance(attempt, LaunchResult):
+        return attempt
+    while True:
+        _sleep(poll_interval_seconds)
+        result = poll_bridge_launch(attempt)
+        if result is not None:
+            return result
+
+
 def _result_for_exit(
     command: Tuple[str, ...],
     pid: Optional[int],
@@ -251,12 +464,19 @@ def start_bridge_launch(
     _popen: Callable[..., "subprocess.Popen"] = subprocess.Popen,
     _popen_kwargs: Optional[Dict[str, object]] = None,
 ) -> Union[LaunchResult, PendingBridgeLaunch]:
-    """Create the bridge process and perform only the immediate status poll.
+    """Start the bridge and perform only the immediate status poll.
 
-    A still-live child is returned as ``PendingBridgeLaunch``. Callers can
-    poll it without blocking; ``launch_bridge`` below remains the synchronous
-    compatibility wrapper for non-GUI callers.
+    Production calls without an explicit command run inside the current
+    desktop process. Explicit commands and injected ``Popen`` callables keep
+    the bounded subprocess path for compatibility tests and tooling.
     """
+
+    if (
+        command is None
+        and _popen is subprocess.Popen
+        and _popen_kwargs is None
+    ):
+        return start_in_process_bridge(grace_checks=grace_checks)
 
     resolved_command: Tuple[str, ...] = (
         tuple(command) if command is not None else tuple(build_launch_command())

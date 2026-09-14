@@ -57,7 +57,7 @@ from ctypes import wintypes
 from dataclasses import dataclass, replace
 from typing import Callable, FrozenSet, List, Mapping, Optional, Tuple
 
-from . import hid_identity
+from . import hid_identity, key_mapping
 
 
 # Module-level (not a function-local class) so tests/test_win32_ctypes_argtypes.py
@@ -115,9 +115,16 @@ RAW_INPUT_USAGE_PAGES = (
 
 _WM_DESTROY = 0x0002
 _WM_CLOSE = 0x0010
+_WM_INPUT_DEVICE_CHANGE = 0x00FE
 _WM_INPUT = 0x00FF
+_WM_KEYDOWN = 0x0100
+_WM_KEYUP = 0x0101
+_WM_SYSKEYDOWN = 0x0104
+_WM_SYSKEYUP = 0x0105
 _HWND_MESSAGE = -3
 _RIDEV_INPUTSINK = 0x00000100
+_RIDEV_DEVNOTIFY = 0x00002000
+_GIDC_REMOVAL = 2
 _DEFAULT_START_TIMEOUT_SECONDS = 5.0
 _STOP_JOIN_TIMEOUT_SECONDS = 2.0
 
@@ -216,6 +223,191 @@ def _get_device_name(user32, device_handle, ridi_devicename: int) -> Optional[st
 
 
 ButtonEventCallback = Callable[[str, bool], None]  # (button_id, is_pressed)
+SourcedButtonEventCallback = Callable[[str, bool, str, Optional[str]], None]
+DeviceRemovedCallback = Callable[[], None]
+InputCorruptionCallback = Callable[[str], None]
+PhysicalKeyboardTrackingLostCallback = Callable[[str], None]
+
+
+_PHYSICAL_KEY_STATE_LOCK = threading.Lock()
+_PHYSICAL_KEYS_BY_DEVICE: dict[int, set[int]] = {}
+_PHYSICAL_KEY_OWNER_HISTORY: dict[int, set[int]] = {}
+_PHYSICAL_KEY_TRACKER_ACTIVE = False
+_PHYSICAL_KEY_TRACKER_HEALTHY = False
+
+_VK_SHIFT = 0x10
+_VK_CONTROL = 0x11
+_VK_MENU = 0x12
+_VK_LSHIFT = 0xA0
+_VK_RSHIFT = 0xA1
+_VK_LCONTROL = 0xA2
+_VK_RCONTROL = 0xA3
+_VK_LMENU = 0xA4
+_VK_RMENU = 0xA5
+_RI_KEY_BREAK = 0x0001
+_RI_KEY_E0 = 0x0002
+_GENERIC_KEY_VARIANTS = {
+    _VK_SHIFT: (_VK_LSHIFT, _VK_RSHIFT),
+    _VK_CONTROL: (_VK_LCONTROL, _VK_RCONTROL),
+    _VK_MENU: (_VK_LMENU, _VK_RMENU),
+}
+
+
+def _normalize_physical_keyboard_vk(
+    vkey: int,
+    make_code: int,
+    flags: int,
+) -> Optional[int]:
+    vkey = int(vkey)
+    if vkey == _VK_SHIFT:
+        return _VK_RSHIFT if int(make_code) == 0x36 else _VK_LSHIFT
+    if vkey == _VK_CONTROL:
+        return _VK_RCONTROL if int(flags) & _RI_KEY_E0 else _VK_LCONTROL
+    if vkey == _VK_MENU:
+        return _VK_RMENU if int(flags) & _RI_KEY_E0 else _VK_LMENU
+    if 0 < vkey < 0xFF:
+        return vkey
+    return None
+
+
+def _set_physical_keyboard_tracker_active(active: bool) -> bool:
+    """Reset tracker ownership and return whether availability was lost."""
+
+    global _PHYSICAL_KEY_TRACKER_ACTIVE, _PHYSICAL_KEY_TRACKER_HEALTHY
+    with _PHYSICAL_KEY_STATE_LOCK:
+        was_available = (
+            _PHYSICAL_KEY_TRACKER_ACTIVE and _PHYSICAL_KEY_TRACKER_HEALTHY
+        )
+        _PHYSICAL_KEYS_BY_DEVICE.clear()
+        _PHYSICAL_KEY_OWNER_HISTORY.clear()
+        _PHYSICAL_KEY_TRACKER_ACTIVE = bool(active)
+        _PHYSICAL_KEY_TRACKER_HEALTHY = bool(active)
+        return was_available and not active
+
+
+def _mark_physical_keyboard_tracker_unhealthy() -> bool:
+    """Reject new holds while retaining the last physical-key snapshot."""
+
+    global _PHYSICAL_KEY_TRACKER_HEALTHY
+    with _PHYSICAL_KEY_STATE_LOCK:
+        changed = (
+            _PHYSICAL_KEY_TRACKER_ACTIVE and _PHYSICAL_KEY_TRACKER_HEALTHY
+        )
+        _PHYSICAL_KEY_TRACKER_HEALTHY = False
+        return changed
+
+
+def _clear_physical_keyboard_snapshot() -> None:
+    with _PHYSICAL_KEY_STATE_LOCK:
+        _PHYSICAL_KEYS_BY_DEVICE.clear()
+        _PHYSICAL_KEY_OWNER_HISTORY.clear()
+
+
+def physical_keyboard_tracking_available() -> bool:
+    with _PHYSICAL_KEY_STATE_LOCK:
+        return bool(
+            _PHYSICAL_KEY_TRACKER_ACTIVE and _PHYSICAL_KEY_TRACKER_HEALTHY
+        )
+
+
+def record_physical_keyboard_event(
+    device_handle: int,
+    *,
+    vkey: int,
+    make_code: int,
+    flags: int,
+    message: int,
+) -> bool:
+    """Track one edge from a verified non-RC003 keyboard device."""
+
+    handle = int(device_handle)
+    vk_code = _normalize_physical_keyboard_vk(vkey, make_code, flags)
+    if handle <= 0 or vk_code is None:
+        return False
+    normalized_message = int(message)
+    if normalized_message in (_WM_KEYDOWN, _WM_SYSKEYDOWN):
+        is_pressed = True
+    elif normalized_message in (_WM_KEYUP, _WM_SYSKEYUP):
+        is_pressed = False
+    else:
+        return False
+    with _PHYSICAL_KEY_STATE_LOCK:
+        if not (
+            _PHYSICAL_KEY_TRACKER_ACTIVE and _PHYSICAL_KEY_TRACKER_HEALTHY
+        ):
+            return False
+        keys = _PHYSICAL_KEYS_BY_DEVICE.setdefault(handle, set())
+        if is_pressed:
+            keys.add(vk_code)
+            _PHYSICAL_KEY_OWNER_HISTORY.setdefault(vk_code, set()).add(handle)
+        else:
+            keys.discard(vk_code)
+            if not keys:
+                _PHYSICAL_KEYS_BY_DEVICE.pop(handle, None)
+            if not any(vk_code in held for held in _PHYSICAL_KEYS_BY_DEVICE.values()):
+                _PHYSICAL_KEY_OWNER_HISTORY.pop(vk_code, None)
+    return True
+
+
+def remove_physical_keyboard_device(device_handle: int) -> None:
+    handle = int(device_handle)
+    if handle <= 0:
+        return
+    with _PHYSICAL_KEY_STATE_LOCK:
+        removed_keys = _PHYSICAL_KEYS_BY_DEVICE.pop(handle, ())
+        for vk_code in removed_keys:
+            if not any(vk_code in held for held in _PHYSICAL_KEYS_BY_DEVICE.values()):
+                _PHYSICAL_KEY_OWNER_HISTORY.pop(vk_code, None)
+
+
+def physical_key_has_ambiguous_owners(vk_code: int) -> bool:
+    """Keep overlapping device holds protected until every owner releases.
+
+    A global hook cannot identify which keyboard produced an UP. Even after
+    one device releases or disconnects, another device can still own the key.
+    """
+
+    variants = _GENERIC_KEY_VARIANTS.get(int(vk_code), (int(vk_code),))
+    with _PHYSICAL_KEY_STATE_LOCK:
+        return _PHYSICAL_KEY_TRACKER_ACTIVE and any(
+            len(_PHYSICAL_KEY_OWNER_HISTORY.get(vk, ())) > 1 for vk in variants
+        )
+
+
+def physical_key_is_down(vk_code: int) -> bool:
+    normalized = int(vk_code)
+    variants = _GENERIC_KEY_VARIANTS.get(normalized, (normalized,))
+    with _PHYSICAL_KEY_STATE_LOCK:
+        if not _PHYSICAL_KEY_TRACKER_ACTIVE:
+            return False
+        return any(
+            variant in keys
+            for keys in _PHYSICAL_KEYS_BY_DEVICE.values()
+            for variant in variants
+        )
+
+
+def _real_async_key_is_down(vk_code: int) -> bool:
+    _require_windows()
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    user32.GetAsyncKeyState.argtypes = (ctypes.c_int,)
+    user32.GetAsyncKeyState.restype = ctypes.c_short
+    return bool(user32.GetAsyncKeyState(int(vk_code)) & 0x8000)
+
+
+def physical_key_is_down_before_injection(
+    vk_code: int,
+    *,
+    _query: Optional[Callable[[int], bool]] = None,
+) -> bool:
+    """Combine device-scoped state with a last-moment Windows preflight."""
+
+    normalized = int(vk_code)
+    variants = _GENERIC_KEY_VARIANTS.get(normalized, (normalized,))
+    if physical_key_is_down(normalized):
+        return True
+    query = _query or _real_async_key_is_down
+    return any(bool(query(variant)) for variant in variants)
 
 
 @dataclass(frozen=True)
@@ -230,6 +422,11 @@ class RawInputEvent:
     source: str
     is_pressed: bool
     button_id: Optional[str] = None
+    # The key Windows would translate before a physical-signature override
+    # changes ``button_id``. Runtime safety releases must use this value so a
+    # taught "physical Up means OK" binding can never release Enter while the
+    # real Up key remains down.
+    windows_button_id: Optional[str] = None
     vkey: Optional[int] = None
     make_code: Optional[int] = None
     flags: Optional[int] = None
@@ -330,21 +527,35 @@ class RawInputButtonListener:
         on_button_event: ButtonEventCallback,
         on_raw_event: Optional[RawInputEventCallback] = None,
         physical_bindings: Optional[Mapping[str, str]] = None,
+        on_sourced_button_event: Optional[SourcedButtonEventCallback] = None,
     ):
         self._on_button_event = on_button_event
+        self._on_sourced_button_event = on_sourced_button_event
         self._on_raw_event = on_raw_event
         self._physical_bindings = dict(physical_bindings or {})
+        self._physical_bindings_lock = threading.Lock()
         self._thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
         self._hwnd = None
         self._active_hid_usages: FrozenSet[int] = frozenset()
         self._active_hid_buttons: FrozenSet[str] = frozenset()
         self._active_keyboard_buttons: FrozenSet[str] = frozenset()
+        self._active_hid_usage_buttons: dict[int, Optional[str]] = {}
+        self._active_keyboard_signature_buttons: dict[str, Optional[str]] = {}
+        self._logical_button_sources: dict[str, str] = {}
+        self._logical_button_windows_buttons: dict[str, Optional[str]] = {}
+        self._selected_device_handles: set[int] = set()
+        self._on_device_removed: Optional[DeviceRemovedCallback] = None
+        self._on_input_corruption: Optional[InputCorruptionCallback] = None
+        self._on_physical_keyboard_tracking_lost: Optional[
+            PhysicalKeyboardTrackingLostCallback
+        ] = None
         self._ready_event = threading.Event()
         self._start_error: Optional[BaseException] = None
         self._device_path: Optional[str] = None
         self._normalized_device_path: Optional[str] = None
         self._class_name: Optional[str] = None
+        self._raw_input_header_healthy = True
 
     def set_physical_bindings(
         self, physical_bindings: Optional[Mapping[str, str]]
@@ -356,18 +567,54 @@ class RawInputButtonListener:
         ``back`` while keeping the configured ``back`` action unchanged.
         """
 
-        self._physical_bindings = dict(physical_bindings or {})
+        with self._physical_bindings_lock:
+            self._physical_bindings = dict(physical_bindings or {})
 
     def set_raw_event_callback(self, callback: Optional[RawInputEventCallback]) -> None:
         """Replace the optional observability callback after construction.
 
-        Keeping this tiny setter lets application wiring remain compatible
-        with older test/device adapters that only accepted the required
-        button callback, while the production listener still exposes the
-        exact Raw Input edge needed by the low-level duplicate suppressor.
+        Keeping this setter separate preserves the physical-learning and
+        diagnostic path without mixing it into logical button dispatch.
         """
 
         self._on_raw_event = callback
+
+    def set_sourced_button_event_callback(
+        self,
+        callback: Optional[SourcedButtonEventCallback],
+    ) -> None:
+        """Expose the Raw Input transport that produced a logical edge."""
+
+        self._on_sourced_button_event = callback
+
+    def set_device_removed_callback(
+        self,
+        callback: Optional[DeviceRemovedCallback],
+    ) -> None:
+        """Receive loss of the selected Raw Input device on its owner thread."""
+
+        self._on_device_removed = callback
+
+    def set_input_corruption_callback(
+        self,
+        callback: Optional[InputCorruptionCallback],
+    ) -> None:
+        """Report malformed selected-device input without discarding state.
+
+        The last known physical state is retained so a later real release can
+        still be emitted. The owner cancels the current logical gesture and
+        blocks it from rearming until that release arrives.
+        """
+
+        self._on_input_corruption = callback
+
+    def set_physical_keyboard_tracking_lost_callback(
+        self,
+        callback: Optional[PhysicalKeyboardTrackingLostCallback],
+    ) -> None:
+        """Report loss of trustworthy non-RC003 keyboard state."""
+
+        self._on_physical_keyboard_tracking_lost = callback
 
     @property
     def is_running(self) -> bool:
@@ -413,6 +660,8 @@ class RawInputButtonListener:
             _require_windows()
         self._device_path = device_path
         self._normalized_device_path = hid_identity.normalize_device_path(device_path)
+        self._selected_device_handles.clear()
+        self._raw_input_header_healthy = True
         self._class_name = f"RemoteMicRC003RawInputWindow-{uuid.uuid4().hex}"
         self._stop_event.clear()
         self._ready_event.clear()
@@ -548,16 +797,127 @@ class RawInputButtonListener:
         self._release_all()
 
     def _release_all(self) -> None:
-        active_buttons = (
-            self._active_hid_buttons | self._active_keyboard_buttons
+        active_buttons = self._clear_active_state()
+        for button, source, windows_button in active_buttons:
+            self._emit_button_event(
+                button,
+                False,
+                source,
+                windows_button,
+            )
+
+    def _clear_active_state(
+        self,
+    ) -> List[Tuple[str, str, Optional[str]]]:
+        active_hid_buttons = self._active_hid_buttons
+        active_keyboard_buttons = self._active_keyboard_buttons
+        active_buttons = active_hid_buttons | active_keyboard_buttons
+        logical_button_sources = dict(self._logical_button_sources)
+        logical_button_windows_buttons = dict(
+            self._logical_button_windows_buttons
         )
         self._active_hid_usages = frozenset()
         self._active_hid_buttons = frozenset()
         self._active_keyboard_buttons = frozenset()
-        for button in sorted(active_buttons):
-            self._on_button_event(button, False)
+        self._active_hid_usage_buttons.clear()
+        self._active_keyboard_signature_buttons.clear()
+        self._logical_button_sources.clear()
+        self._logical_button_windows_buttons.clear()
+        self._selected_device_handles.clear()
+        return [
+            (
+                button,
+                logical_button_sources.get(
+                    button,
+                    "hid" if button in active_hid_buttons else "keyboard",
+                ),
+                logical_button_windows_buttons.get(button),
+            )
+            for button in sorted(active_buttons)
+        ]
 
-    def _update_source_button(self, source: str, button: str, is_pressed: bool) -> None:
+    def _handle_device_change(self, wparam, lparam) -> None:
+        if int(wparam) != _GIDC_REMOVAL:
+            return
+        raw_handle = getattr(lparam, "value", lparam)
+        device_handle = int(raw_handle or 0)
+        remove_physical_keyboard_device(device_handle)
+        if not device_handle or device_handle not in self._selected_device_handles:
+            return
+
+        self._notify_input_ownership_lost()
+
+    def _notify_input_ownership_lost(self) -> None:
+        """Cancel active state when the selected input stream disappears."""
+
+        callback = self._on_device_removed
+        if callback is None:
+            self._release_all()
+            return
+        self._clear_active_state()
+        try:
+            callback()
+        except Exception:
+            pass
+
+    def _notify_input_corruption(self, reason: str) -> None:
+        callback = self._on_input_corruption
+        if callback is None:
+            return
+        try:
+            callback(reason)
+        except BaseException:
+            pass
+
+    def _notify_physical_keyboard_tracking_lost(self, reason: str) -> None:
+        callback = self._on_physical_keyboard_tracking_lost
+        if callback is None:
+            return
+        try:
+            callback(reason)
+        except BaseException:
+            pass
+
+    def _reject_physical_keyboard_tracking(self, reason: str) -> None:
+        if _mark_physical_keyboard_tracker_unhealthy():
+            try:
+                self._notify_physical_keyboard_tracking_lost(reason)
+            finally:
+                _clear_physical_keyboard_snapshot()
+
+    def _reject_raw_input_header(self) -> None:
+        if not self._raw_input_header_healthy:
+            return
+        self._raw_input_header_healthy = False
+        if self._on_input_corruption is None:
+            self._release_all()
+        else:
+            self._clear_active_state()
+            self._notify_input_corruption("raw_input_header_unavailable")
+        self._reject_physical_keyboard_tracking(
+            "raw_input_header_unavailable"
+        )
+
+    def _emit_button_event(
+        self,
+        button: str,
+        is_pressed: bool,
+        source: str,
+        windows_button: Optional[str] = None,
+    ) -> None:
+        callback = self._on_sourced_button_event
+        if callback is not None:
+            callback(button, is_pressed, source, windows_button)
+            return
+        self._on_button_event(button, is_pressed)
+
+    def _update_source_button(
+        self,
+        source: str,
+        button: str,
+        is_pressed: bool,
+        windows_button: Optional[str],
+    ) -> None:
         """Update one input source and emit only a logical button edge.
 
         Windows may expose one physical RC003 button through both the
@@ -571,14 +931,15 @@ class RawInputButtonListener:
 
         before = self._active_keyboard_buttons | self._active_hid_buttons
         if source == "keyboard":
-            if is_pressed:
-                self._active_keyboard_buttons = (
-                    self._active_keyboard_buttons | {button}
-                )
-            else:
-                self._active_keyboard_buttons = (
-                    self._active_keyboard_buttons - {button}
-                )
+            # The signature table is the authoritative keyboard state. Two
+            # observed signatures may intentionally map to the same logical
+            # button; releasing either one must not release that button while
+            # the other signature is still physically down.
+            self._active_keyboard_buttons = frozenset(
+                candidate
+                for candidate in self._active_keyboard_signature_buttons.values()
+                if candidate
+            )
         elif source == "hid":
             if is_pressed:
                 self._active_hid_buttons = self._active_hid_buttons | {button}
@@ -588,8 +949,29 @@ class RawInputButtonListener:
             raise ValueError(f"unknown Raw Input source: {source!r}")
 
         after = self._active_keyboard_buttons | self._active_hid_buttons
-        if before != after and (button in before or button in after):
-            self._on_button_event(button, is_pressed)
+        was_active = button in before
+        is_active = button in after
+        if not was_active and is_active:
+            self._logical_button_sources[button] = source
+            self._logical_button_windows_buttons[button] = windows_button
+            self._emit_button_event(
+                button,
+                True,
+                source,
+                windows_button,
+            )
+        elif was_active and not is_active:
+            owner = self._logical_button_sources.pop(button, source)
+            original_windows_button = self._logical_button_windows_buttons.pop(
+                button,
+                windows_button,
+            )
+            self._emit_button_event(
+                button,
+                False,
+                owner,
+                original_windows_button,
+            )
 
     # -- background thread: window creation + message loop ----------------
 
@@ -748,7 +1130,7 @@ class RawInputButtonListener:
                 devices[index] = RAWINPUTDEVICE(
                     usUsagePage=usage_page,
                     usUsage=usage,
-                    dwFlags=_RIDEV_INPUTSINK,
+                    dwFlags=_RIDEV_INPUTSINK | _RIDEV_DEVNOTIFY,
                     hwndTarget=self._hwnd,
                 )
             registered = user32.RegisterRawInputDevices(
@@ -756,6 +1138,8 @@ class RawInputButtonListener:
             )
             if not registered:
                 raise RawInputUnavailableError("RegisterRawInputDevices failed")
+
+            _set_physical_keyboard_tracker_active(True)
 
         except BaseException as exc:  # noqa: BLE001 - surfaced to start()
             # A failure after CreateWindowExW already succeeded (e.g.
@@ -777,6 +1161,7 @@ class RawInputButtonListener:
                     user32.UnregisterClassW(class_name, hinstance)
                 except Exception:
                     pass
+            _set_physical_keyboard_tracker_active(False)
             self._start_error = exc
             self._ready_event.set()
             return
@@ -786,34 +1171,53 @@ class RawInputButtonListener:
         import ctypes
 
         msg = wintypes.MSG()
-        while not self._stop_event.is_set():
-            result = user32.GetMessageW(ctypes.byref(msg), None, 0, 0)
-            if result <= 0:
-                break
-            user32.TranslateMessage(ctypes.byref(msg))
-            user32.DispatchMessageW(ctypes.byref(msg))
+        unexpected_exit = False
+        try:
+            while not self._stop_event.is_set():
+                try:
+                    result = user32.GetMessageW(ctypes.byref(msg), None, 0, 0)
+                    if result < 0:
+                        unexpected_exit = True
+                        break
+                    if result == 0:
+                        unexpected_exit = not self._stop_event.is_set()
+                        break
+                    user32.TranslateMessage(ctypes.byref(msg))
+                    user32.DispatchMessageW(ctypes.byref(msg))
+                except BaseException:  # noqa: BLE001 - thread must fail closed
+                    unexpected_exit = not self._stop_event.is_set()
+                    break
+        finally:
+            # Fallback only: the normal stop() path already clears self._hwnd
+            # from the WM_DESTROY handler below. This covers a failed message
+            # loop that never went through WM_CLOSE/WM_DESTROY.
+            if self._hwnd is not None:
+                try:
+                    user32.DestroyWindow(self._hwnd)
+                except Exception:
+                    pass
+                self._hwnd = None
 
-        # Fallback only: the normal stop() path already clears self._hwnd
-        # from the WM_DESTROY handler below (DestroyWindow's synchronous
-        # WM_DESTROY notification runs on this same thread before it
-        # returns). This only fires on an abnormal GetMessageW failure that
-        # never went through WM_CLOSE/WM_DESTROY.
-        if self._hwnd is not None:
-            user32.DestroyWindow(self._hwnd)
-            self._hwnd = None
+            if class_registered:
+                try:
+                    user32.UnregisterClassW(class_name, hinstance)
+                except Exception:
+                    pass
 
-        # The window is gone either way by this point; unregistering the
-        # class now (rather than never) is what makes start()/stop() safely
-        # repeatable without accumulating registered classes across many
-        # reconnect cycles (XRBM-018 RETRY 1 P1 #2). Win32 refuses to
-        # unregister a class while any window of that class still exists,
-        # which is exactly why this runs only after the DestroyWindow calls
-        # above.
-        if class_registered:
-            try:
-                user32.UnregisterClassW(class_name, hinstance)
-            except Exception:
-                pass
+            tracking_lost = _mark_physical_keyboard_tracker_unhealthy()
+            if unexpected_exit:
+                if tracking_lost:
+                    self._notify_physical_keyboard_tracking_lost(
+                        "raw_input_listener_exited"
+                    )
+                if self._on_input_corruption is None:
+                    self._release_all()
+                else:
+                    self._clear_active_state()
+                    self._notify_input_corruption(
+                        "raw_input_listener_exited"
+                    )
+            _set_physical_keyboard_tracker_active(False)
 
     def _wndproc(self, hwnd, msg, wparam, lparam):
         import ctypes
@@ -821,8 +1225,14 @@ class RawInputButtonListener:
         if msg == _WM_INPUT:
             try:
                 self._handle_raw_input(lparam)
-            except Exception:
+            except BaseException:
                 pass  # never let a decode error kill the message loop
+            return 0
+        if msg == _WM_INPUT_DEVICE_CHANGE:
+            try:
+                self._handle_device_change(wparam, lparam)
+            except Exception:
+                pass  # device loss must not terminate the message loop
             return 0
         if msg == _WM_CLOSE:
             # DestroyWindow synchronously delivers WM_DESTROY to this same
@@ -839,17 +1249,22 @@ class RawInputButtonListener:
             return 0
         return ctypes.windll.user32.DefWindowProcW(hwnd, msg, wparam, lparam)  # type: ignore[attr-defined]
 
-    def _handle_raw_input(self, lparam) -> None:
+    def _handle_raw_input(self, lparam, *, _user32=None) -> None:
         import ctypes
         from ctypes import wintypes
 
         RID_INPUT = 0x10000003
+        RID_HEADER = 0x10000005
         RIDI_DEVICENAME = 0x20000007
         RIM_TYPEMOUSE = 0
         RIM_TYPEKEYBOARD = 1
         RIM_TYPEHID = 2
+        UINT_ERROR = 0xFFFFFFFF
 
-        user32 = ctypes.windll.user32  # type: ignore[attr-defined]
+        if not self._raw_input_header_healthy:
+            return
+
+        user32 = _user32 or ctypes.windll.user32  # type: ignore[attr-defined]
         user32.GetRawInputData.argtypes = (
             wintypes.HANDLE,
             wintypes.UINT,
@@ -867,37 +1282,180 @@ class RawInputButtonListener:
                 ("wParam", wintypes.WPARAM),
             ]
 
-        size = wintypes.UINT(0)
-        user32.GetRawInputData(
-            lparam, RID_INPUT, None, ctypes.byref(size), ctypes.sizeof(RAWINPUTHEADER)
+        header_size = ctypes.sizeof(RAWINPUTHEADER)
+        header_probe = RAWINPUTHEADER()
+        probe_bytes = wintypes.UINT(header_size)
+        probe_written = user32.GetRawInputData(
+            lparam,
+            RID_HEADER,
+            ctypes.byref(header_probe),
+            ctypes.byref(probe_bytes),
+            header_size,
         )
-        if size.value == 0:
+        if probe_written == UINT_ERROR or probe_written != header_size:
+            # A failed RID_HEADER probe means no following packet can be
+            # attributed safely. Disable this listener generation until it
+            # is restarted instead of continuing with stale ownership.
+            self._reject_raw_input_header()
+            return
+
+        raw_handle = getattr(header_probe.hDevice, "value", header_probe.hDevice)
+        device_handle = int(raw_handle or 0)
+        packet_type = int(header_probe.dwType)
+        if device_handle == 0:
+            # SendInput and other unattributed packets cannot prove physical
+            # ownership and must never enter the device-scoped state.
+            return
+        selected_handle = (
+            device_handle in self._selected_device_handles
+        )
+        device_path = _get_device_name(
+            user32,
+            header_probe.hDevice,
+            RIDI_DEVICENAME,
+        )
+        if not device_path:
+            if selected_handle:
+                self._notify_input_corruption("selected_device_name_unavailable")
+            if packet_type == RIM_TYPEKEYBOARD:
+                self._reject_physical_keyboard_tracking(
+                    "physical_keyboard_device_name_unavailable"
+                )
+            return
+        normalized_device_path = hid_identity.normalize_device_path(device_path)
+        selected_device = normalized_device_path == self._normalized_device_path
+        rc003_device = hid_identity.device_path_matches_rc003(device_path)
+        physical_keyboard = (
+            packet_type == RIM_TYPEKEYBOARD
+            and not selected_device
+            and not rc003_device
+        )
+        if not selected_device and not physical_keyboard:
+            return
+        if selected_device:
+            self._selected_device_handles.add(device_handle)
+
+        size = wintypes.UINT(0)
+        size_result = user32.GetRawInputData(
+            lparam,
+            RID_INPUT,
+            None,
+            ctypes.byref(size),
+            header_size,
+        )
+        if size_result != 0 or size.value < header_size:
+            if selected_device:
+                self._notify_input_corruption("raw_input_size_unavailable")
+            else:
+                self._reject_physical_keyboard_tracking(
+                    "physical_keyboard_size_unavailable"
+                )
             return
         buffer = ctypes.create_string_buffer(size.value)
         written = user32.GetRawInputData(
-            lparam, RID_INPUT, buffer, ctypes.byref(size), ctypes.sizeof(RAWINPUTHEADER)
+            lparam,
+            RID_INPUT,
+            buffer,
+            ctypes.byref(size),
+            header_size,
         )
-        if written != size.value:
+        if written == UINT_ERROR or written != size.value:
+            if selected_device:
+                self._notify_input_corruption("raw_input_packet_truncated")
+            else:
+                self._reject_physical_keyboard_tracking(
+                    "physical_keyboard_packet_truncated"
+                )
             return
 
-        header = RAWINPUTHEADER.from_buffer_copy(buffer, 0)
-        device_path = _get_device_name(user32, header.hDevice, RIDI_DEVICENAME)
-        if not device_path:
-            return  # could not resolve a device path for this event at all
-        if hid_identity.normalize_device_path(device_path) != self._normalized_device_path:
-            # Not the exact device path selected at start() - fail-closed
-            # per-event scoping (XRBM-014 review round 2 P1 #4), not merely
-            # "some RC003-VID/PID device".
+        try:
+            header = RAWINPUTHEADER.from_buffer_copy(buffer, 0)
+        except (TypeError, ValueError):
+            if selected_device:
+                self._notify_input_corruption("raw_input_header_invalid")
+            else:
+                self._reject_physical_keyboard_tracking(
+                    "physical_keyboard_header_invalid"
+                )
+            return
+        packet_handle = getattr(header.hDevice, "value", header.hDevice)
+        if (
+            int(packet_handle or 0) != device_handle
+            or int(header.dwSize) != int(size.value)
+            or int(header.dwType) != packet_type
+        ):
+            if selected_device:
+                self._notify_input_corruption("raw_input_header_mismatch")
+            else:
+                self._reject_physical_keyboard_tracking(
+                    "physical_keyboard_header_mismatch"
+                )
             return
 
-        body = bytes(buffer.raw[ctypes.sizeof(RAWINPUTHEADER) :])
+        body = bytes(buffer.raw[header_size:])
 
-        if header.dwType == RIM_TYPEKEYBOARD:
-            self._handle_keyboard_body(body, device_path=device_path)
-        elif header.dwType == RIM_TYPEHID:
-            self._handle_hid_body(body, device_path=device_path)
-        elif header.dwType == RIM_TYPEMOUSE:
-            return  # RC003 has no mouse-usage buttons in this candidate
+        try:
+            if header.dwType == RIM_TYPEKEYBOARD:
+                if selected_device:
+                    self._handle_keyboard_body(body, device_path=device_path)
+                else:
+                    self._handle_physical_keyboard_body(
+                        body,
+                        device_handle=device_handle,
+                    )
+            elif header.dwType == RIM_TYPEHID and selected_device:
+                self._handle_hid_body(body, device_path=device_path)
+            elif header.dwType == RIM_TYPEMOUSE and selected_device:
+                return  # RC003 has no mouse-usage buttons in this candidate
+        except BaseException:
+            if selected_device:
+                self._notify_input_corruption("raw_input_handler_exception")
+            else:
+                self._reject_physical_keyboard_tracking(
+                    "physical_keyboard_handler_exception"
+                )
+            raise
+
+    def _handle_physical_keyboard_body(
+        self,
+        body: bytes,
+        *,
+        device_handle: int,
+    ) -> None:
+        import struct
+
+        if len(body) < 16:
+            self._reject_physical_keyboard_tracking(
+                "physical_keyboard_body_too_short"
+            )
+            return
+        make_code, flags, _reserved, vkey, message, _extra = struct.unpack_from(
+            "<HHHHII", body, 0
+        )
+        if message not in (
+            _WM_KEYDOWN,
+            _WM_KEYUP,
+            _WM_SYSKEYDOWN,
+            _WM_SYSKEYUP,
+        ):
+            self._reject_physical_keyboard_tracking(
+                "physical_keyboard_message_invalid"
+            )
+            return
+        message_is_release = message in (_WM_KEYUP, _WM_SYSKEYUP)
+        flags_is_release = bool(flags & _RI_KEY_BREAK)
+        if message_is_release != flags_is_release:
+            self._reject_physical_keyboard_tracking(
+                "physical_keyboard_edge_mismatch"
+            )
+            return
+        record_physical_keyboard_event(
+            device_handle,
+            vkey=vkey,
+            make_code=make_code,
+            flags=flags,
+            message=message,
+        )
 
     def _handle_keyboard_body(
         self, body: bytes, *, device_path: Optional[str] = None
@@ -907,33 +1465,51 @@ class RawInputButtonListener:
         # RAWKEYBOARD: MakeCode(u16), Flags(u16), Reserved(u16), VKey(u16),
         # Message(u32), ExtraInformation(u32) - little-endian.
         if len(body) < 16:
+            self._notify_input_corruption("keyboard_body_too_short")
             return
         _make_code, flags, _reserved, vkey, message, _extra = struct.unpack_from(
             "<HHHHII", body, 0
         )
-        button = KEYBOARD_VK_TO_BUTTON.get(vkey)
-        if button is None and vkey == 0xFF:
-            button = KEYBOARD_MAKECODE_TO_BUTTON.get(_make_code)
+        default_button = KEYBOARD_VK_TO_BUTTON.get(vkey)
+        if default_button is None and vkey == 0xFF:
+            default_button = KEYBOARD_MAKECODE_TO_BUTTON.get(_make_code)
         WM_KEYUP = 0x0101
         WM_SYSKEYUP = 0x0105
         is_pressed = message not in (WM_KEYUP, WM_SYSKEYUP)
         event = RawInputEvent(
             source="keyboard",
             is_pressed=is_pressed,
-            button_id=button,
+            button_id=default_button,
+            windows_button_id=default_button,
             vkey=vkey,
             make_code=_make_code,
             flags=flags,
             message=message,
             device_path=device_path,
         )
-        button = self._resolve_button(event, button)
+        signature = physical_signature(event)
+        if is_pressed:
+            if signature in self._active_keyboard_signature_buttons:
+                button = self._active_keyboard_signature_buttons[signature]
+            else:
+                button = self._resolve_button(event, default_button)
+                self._active_keyboard_signature_buttons[signature] = button
+        else:
+            if signature in self._active_keyboard_signature_buttons:
+                button = self._active_keyboard_signature_buttons.pop(signature)
+            else:
+                button = self._resolve_button(event, default_button)
         if button != event.button_id:
             event = replace(event, button_id=button)
         self._emit_raw_event(event)
         if button is None:
             return
-        self._update_source_button("keyboard", button, is_pressed)
+        self._update_source_button(
+            "keyboard",
+            button,
+            is_pressed,
+            default_button,
+        )
 
     def _handle_hid_body(
         self, body: bytes, *, device_path: Optional[str] = None
@@ -953,6 +1529,7 @@ class RawInputButtonListener:
                     decode_error=str(exc),
                 )
             )
+            self._notify_input_corruption("hid_payload_invalid")
             return
         for report in reports:
             try:
@@ -967,15 +1544,24 @@ class RawInputButtonListener:
                         decode_error=str(exc),
                     )
                 )
+                self._notify_input_corruption("hid_report_invalid")
                 continue
             pressed, released = hid_identity.diff_usages(
                 self._active_hid_usages, current
             )
             previous_hid_buttons = self._active_hid_buttons
+            previous_usage_buttons = dict(self._active_hid_usage_buttons)
+            current_usage_buttons = {
+                usage: (
+                    previous_usage_buttons[usage]
+                    if usage in previous_usage_buttons
+                    else self._button_for_hid_usage(usage, report, device_path)
+                )
+                for usage in current
+            }
             current_hid_buttons = frozenset(
                 button
-                for usage in current
-                for button in (self._button_for_hid_usage(usage, report, device_path),)
+                for button in current_usage_buttons.values()
                 if button
             )
             previous_logical_buttons = (
@@ -986,33 +1572,73 @@ class RawInputButtonListener:
             )
             self._active_hid_usages = current
             self._active_hid_buttons = current_hid_buttons
-            for usage in pressed:
-                button = self._button_for_hid_usage(usage, report, device_path)
+            self._active_hid_usage_buttons = current_usage_buttons
+            for usage in sorted(released):
+                button = previous_usage_buttons.get(usage)
                 self._emit_raw_event(self._hid_edge_event(
-                    usage, True, button, report, device_path
-                ))
-                if (
-                    button
-                    and button in current_logical_buttons
-                    and button not in previous_logical_buttons
-                ):
-                    self._on_button_event(button, True)
-            for usage in released:
-                button = self._button_for_hid_usage(usage, report, device_path)
-                self._emit_raw_event(self._hid_edge_event(
-                    usage, False, button, report, device_path
+                    usage,
+                    False,
+                    button,
+                    hid_identity.usage_to_button(usage),
+                    report,
+                    device_path,
                 ))
                 if (
                     button
                     and button in previous_logical_buttons
                     and button not in current_logical_buttons
                 ):
-                    self._on_button_event(button, False)
+                    owner = self._logical_button_sources.pop(button, "hid")
+                    windows_button = self._logical_button_windows_buttons.pop(
+                        button,
+                        hid_identity.usage_to_button(usage),
+                    )
+                    self._emit_button_event(
+                        button,
+                        False,
+                        owner,
+                        windows_button,
+                    )
+            for usage in sorted(
+                pressed,
+                key=lambda candidate: (
+                    current_usage_buttons.get(candidate)
+                    not in key_mapping.COMBO_MODIFIER_BUTTON_IDS,
+                    candidate,
+                ),
+            ):
+                button = current_usage_buttons.get(usage)
+                self._emit_raw_event(self._hid_edge_event(
+                    usage,
+                    True,
+                    button,
+                    hid_identity.usage_to_button(usage),
+                    report,
+                    device_path,
+                ))
+                if (
+                    button
+                    and button in current_logical_buttons
+                    and button not in previous_logical_buttons
+                ):
+                    self._logical_button_sources[button] = "hid"
+                    windows_button = hid_identity.usage_to_button(usage)
+                    self._logical_button_windows_buttons[button] = windows_button
+                    self._emit_button_event(
+                        button,
+                        True,
+                        "hid",
+                        windows_button,
+                    )
 
     def _resolve_button(
         self, event: RawInputEvent, default_button: Optional[str]
     ) -> Optional[str]:
-        return self._physical_bindings.get(physical_signature(event), default_button)
+        with self._physical_bindings_lock:
+            return self._physical_bindings.get(
+                physical_signature(event),
+                default_button,
+            )
 
     def _button_for_hid_usage(
         self, usage: int, report: bytes, device_path: Optional[str]
@@ -1022,6 +1648,7 @@ class RawInputButtonListener:
             source="hid",
             is_pressed=True,
             button_id=default_button,
+            windows_button_id=default_button,
             report=report,
             usages=(usage,),
             device_path=device_path,
@@ -1033,6 +1660,7 @@ class RawInputButtonListener:
         usage: int,
         is_pressed: bool,
         button: Optional[str],
+        windows_button: Optional[str],
         report: bytes,
         device_path: Optional[str],
     ) -> RawInputEvent:
@@ -1040,6 +1668,7 @@ class RawInputButtonListener:
             source="hid",
             is_pressed=is_pressed,
             button_id=button,
+            windows_button_id=windows_button,
             report=report,
             usages=(usage,),
             device_path=device_path,

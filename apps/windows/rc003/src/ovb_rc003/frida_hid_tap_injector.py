@@ -1,8 +1,9 @@
 """Narrowly-scoped x64 DLL injector for the RC003 WUDF host.
 
-This is adapted from remote-bridge-hub's Xiaomi injector.  Injection is only
-attempted from a process the user has explicitly started with administrator
-rights.  The normal Remote Mic process never elevates itself.
+This is adapted from remote-bridge-hub's Xiaomi injector. Injection is only
+attempted inside an already-elevated process: either the fixed pre-authorized
+HID helper or an explicitly elevated source/debug process. The normal Remote
+Mic process never elevates itself.
 """
 
 from __future__ import annotations
@@ -19,6 +20,7 @@ from .frida_hid_tap_runtime import (
     prepare_secure_runtime,
     sha256_file,
 )
+from .hid_host_reload_windows import ensure_reload_capable_host
 
 
 PROCESS_CREATE_THREAD = 0x0002
@@ -37,6 +39,10 @@ TOKEN_ADJUST_PRIVILEGES = 0x0020
 TOKEN_QUERY = 0x0008
 SE_PRIVILEGE_ENABLED = 0x00000002
 ERROR_NOT_ALL_ASSIGNED = 1300
+
+
+class HidInjectionStageError(RuntimeError):
+    """Sanitized injection-stage failure for the elevated helper."""
 
 
 class LUID(ctypes.Structure):
@@ -174,7 +180,9 @@ def inject_library(pid: int, dll_path: Path) -> None:
     )
     process = kernel32.OpenProcess(rights, False, pid)
     if not process:
-        raise ctypes.WinError(ctypes.get_last_error())
+        raise HidInjectionStageError(
+            "hid_helper_target_process_open_failed"
+        ) from ctypes.WinError(ctypes.get_last_error())
     remote_path = None
     thread = None
     remote_thread_completed = False
@@ -184,19 +192,27 @@ def inject_library(pid: int, dll_path: Path) -> None:
             process, None, len(encoded), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE
         )
         if not remote_path:
-            raise ctypes.WinError(ctypes.get_last_error())
+            raise HidInjectionStageError(
+                "hid_helper_remote_memory_failed"
+            ) from ctypes.WinError(ctypes.get_last_error())
         buffer = ctypes.create_string_buffer(encoded)
         written = ctypes.c_size_t()
         if not kernel32.WriteProcessMemory(
             process, remote_path, buffer, len(encoded), ctypes.byref(written)
         ):
-            raise ctypes.WinError(ctypes.get_last_error())
+            raise HidInjectionStageError(
+                "hid_helper_remote_memory_failed"
+            ) from ctypes.WinError(ctypes.get_last_error())
         if written.value != len(encoded):
-            raise RuntimeError(f"partial remote write: {written.value}/{len(encoded)}")
+            raise HidInjectionStageError("hid_helper_remote_memory_failed")
         kernel = kernel32.GetModuleHandleW("kernel32.dll")
+        if not kernel:
+            raise HidInjectionStageError("hid_helper_remote_load_failed")
         load_library = kernel32.GetProcAddress(kernel, b"LoadLibraryW")
         if not load_library:
-            raise ctypes.WinError(ctypes.get_last_error())
+            raise HidInjectionStageError(
+                "hid_helper_remote_load_failed"
+            ) from ctypes.WinError(ctypes.get_last_error())
         thread_id = wintypes.DWORD()
         thread = kernel32.CreateRemoteThread(
             process,
@@ -208,20 +224,26 @@ def inject_library(pid: int, dll_path: Path) -> None:
             ctypes.byref(thread_id),
         )
         if not thread:
-            raise ctypes.WinError(ctypes.get_last_error())
+            raise HidInjectionStageError(
+                "hid_helper_remote_thread_failed"
+            ) from ctypes.WinError(ctypes.get_last_error())
         wait_result = int(kernel32.WaitForSingleObject(thread, 20_000))
         if wait_result == WAIT_TIMEOUT:
-            raise TimeoutError("remote LoadLibraryW timed out")
+            raise HidInjectionStageError("hid_helper_remote_load_timeout")
         if wait_result == WAIT_FAILED:
-            raise ctypes.WinError(ctypes.get_last_error())
+            raise HidInjectionStageError(
+                "hid_helper_remote_load_failed"
+            ) from ctypes.WinError(ctypes.get_last_error())
         if wait_result != WAIT_OBJECT_0:
-            raise RuntimeError("remote LoadLibraryW returned an unexpected wait result")
+            raise HidInjectionStageError("hid_helper_remote_load_failed")
         remote_thread_completed = True
         exit_code = wintypes.DWORD()
         if not kernel32.GetExitCodeThread(thread, ctypes.byref(exit_code)):
-            raise ctypes.WinError(ctypes.get_last_error())
+            raise HidInjectionStageError(
+                "hid_helper_remote_load_failed"
+            ) from ctypes.WinError(ctypes.get_last_error())
         if exit_code.value == 0:
-            raise RuntimeError("remote LoadLibraryW returned NULL")
+            raise HidInjectionStageError("hid_helper_remote_load_failed")
     finally:
         if thread:
             kernel32.CloseHandle(thread)
@@ -261,31 +283,62 @@ def _target_process_name(pid: int) -> str:
         kernel32.CloseHandle(process)
 
 
-def inject_current_process(pid: int) -> None:
+def inject_current_process(pid: int, *, selected_key: str | None = None) -> None:
     """Inject only when this process already has the required rights.
 
-    The application deliberately does not request elevation.  Callers that
-    want the optional tap must launch the bridge explicitly from an elevated
-    terminal or executable.
+    The desktop application deliberately does not request elevation. Installed
+    builds call this function inside the fixed scheduled helper; source/debug
+    callers may instead start the process explicitly from an elevated terminal.
     """
 
     if os.name != "nt":
         raise PermissionError("RC003 injector requires Windows administrator elevation")
-    expected_pid = find_rc003_hidogatt_host_pid()
+    expected_pid = find_rc003_hidogatt_host_pid(selected_key=selected_key)
     if expected_pid != pid:
-        raise RuntimeError(
-            f"RC003 host changed before injection: expected={expected_pid} requested={pid}"
-        )
+        raise HidInjectionStageError("hid_helper_host_changed")
     # WUDFHost denies even limited process queries until the elevated injector
     # enables SeDebugPrivilege.  Validate the target only after that succeeds.
-    enable_debug_privilege()
-    if _target_process_name(pid) != "wudfhost.exe":
-        raise RuntimeError("refusing non-WUDFHost target")
-    dll_path = prepare_secure_runtime()
-    dll_hash = sha256_file(dll_path)
+    try:
+        enable_debug_privilege()
+    except (OSError, PermissionError) as exc:
+        raise HidInjectionStageError(
+            "hid_helper_debug_privilege_failed"
+        ) from exc
+    try:
+        target_name = _target_process_name(pid)
+    except OSError as exc:
+        raise HidInjectionStageError(
+            "hid_helper_target_process_open_failed"
+        ) from exc
+    if target_name != "wudfhost.exe":
+        raise HidInjectionStageError("hid_helper_target_validation_failed")
+    try:
+        dll_path = prepare_secure_runtime()
+        dll_hash = sha256_file(dll_path)
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise HidInjectionStageError(
+            "hid_helper_runtime_preparation_failed"
+        ) from exc
     if dll_hash != GADGET_DLL_SHA256:
-        raise RuntimeError(f"verified Gadget changed before injection: {dll_hash}")
-    inject_library(pid, dll_path)
+        raise HidInjectionStageError("hid_helper_runtime_preparation_failed")
+    try:
+        lifecycle = ensure_reload_capable_host(pid, dll_path, selected_key=selected_key)
+        if lifecycle == "restarted":
+            # The parent must discover and authenticate the new host itself.
+            raise HidInjectionStageError("hid_helper_host_restarted")
+        if lifecycle == "restart_required":
+            raise HidInjectionStageError("hid_helper_legacy_runtime_restart_required")
+        if lifecycle == "loaded":
+            return  # Updating the protected script triggers Gadget's reloader.
+        if lifecycle != "fresh":
+            raise HidInjectionStageError("hid_helper_runtime_preparation_failed")
+        if find_rc003_hidogatt_host_pid(selected_key=selected_key) != pid:
+            raise HidInjectionStageError("hid_helper_host_changed")
+        inject_library(pid, dll_path)
+    except HidInjectionStageError:
+        raise
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise HidInjectionStageError("hid_helper_injection_failed") from exc
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -293,10 +346,16 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--pid", type=int, required=True)
     args = parser.parse_args(argv)
     try:
-        inject_current_process(args.pid)
+        from . import remote_selection
+        inject_current_process(args.pid, selected_key=remote_selection.saved_active_key())
         return 0
     except PermissionError:
         return 3
+    except HidInjectionStageError as exc:
+        return {
+            "hid_helper_host_restarted": 6,
+            "hid_helper_legacy_runtime_restart_required": 7,
+        }.get(str(exc), 4)
     except (OSError, RuntimeError, ValueError):
         return 4
     except Exception:  # noqa: BLE001 - hidden child reports only a stable exit code

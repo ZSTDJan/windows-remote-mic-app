@@ -157,14 +157,14 @@ class VoiceProgramSettingsTests(unittest.TestCase):
         self.assertFalse(sogou["launch_elevated"])
         self.assertTrue(custom["launch_elevated"])
 
-    def test_provider_options_include_windows_dictation_and_custom_program(self):
+    def test_provider_options_include_three_supported_providers_and_custom_program(self):
         self.assertEqual(
             manager.provider_options(),
             [
                 "不管理",
                 "搜狗语音输入",
                 "微信输入法",
-                "Windows 语音输入（Win+H）",
+                "豆包输入法",
                 "自定义程序",
             ],
         )
@@ -182,7 +182,7 @@ class VoiceProgramSettingsTests(unittest.TestCase):
         self.assertTrue(normalized["launch_elevated"])
         self.assertTrue(manager.is_system_managed_provider("wetype"))
 
-    def test_windows_dictation_is_system_managed_and_never_autostarts(self):
+    def test_removed_windows_dictation_selection_fails_closed_to_none(self):
         normalized = manager.normalize_voice_program_settings(
             {
                 "provider": "windows_dictation",
@@ -191,31 +191,23 @@ class VoiceProgramSettingsTests(unittest.TestCase):
             }
         )
 
+        self.assertEqual(normalized["provider"], "none")
         self.assertFalse(normalized["launch_on_bridge_start"])
         self.assertTrue(normalized["launch_elevated"])
-        self.assertTrue(manager.is_system_managed_provider("windows_dictation"))
+        self.assertFalse(manager.is_system_managed_provider("windows_dictation"))
 
-
-class WindowsDictationTests(unittest.TestCase):
-    def test_windows_dictation_is_available_without_an_executable(self):
-        status = manager.inspect_voice_program(
-            {"provider": "windows_dictation"},
-            platform="win32",
-            process_iter=lambda: (),
-        )
-        result = manager.launch_voice_program(
-            {"provider": "windows_dictation"},
-            platform="win32",
-            process_iter=lambda: (),
-            start_file=lambda *_: self.fail("Windows 听写不应由 Remote Mic 启动进程"),
+    def test_doubao_is_directly_adapted_without_windows_management_or_autostart(self):
+        normalized = manager.normalize_voice_program_settings(
+            {
+                "provider": "doubao_ime",
+                "launch_on_bridge_start": True,
+                "launch_elevated": True,
+            }
         )
 
-        self.assertTrue(status.available)
-        self.assertFalse(status.running)
-        self.assertEqual(status.code, "stopped")
-        self.assertIn("Win+H", manager.status_text(status))
-        self.assertEqual(result.code, "system_managed")
-
+        self.assertFalse(normalized["launch_on_bridge_start"])
+        self.assertFalse(manager.is_system_managed_provider("doubao_ime"))
+        self.assertFalse(manager.is_launchable_provider("doubao_ime"))
 
 class SogouDiscoveryTests(unittest.TestCase):
     def test_running_process_path_is_preferred(self):
@@ -265,27 +257,7 @@ class SogouDiscoveryTests(unittest.TestCase):
             )
         self.assertEqual(found, newer)
 
-    def test_component_prewarm_uses_the_registered_manager_without_a_shell(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            manager_path = Path(tmp) / "SogouComMgr.exe"
-            manager_path.touch()
-            calls = []
-
-            result = manager.prewarm_sogou_voice_component(
-                platform="win32",
-                run_value_reader=lambda: (
-                    f'"{manager_path}" -invoke AIVoiceInputComBundle',
-                ),
-                popen=lambda command, **kwargs: calls.append((command, kwargs)),
-            )
-
-        self.assertTrue(result.attempted)
-        self.assertEqual(result.code, "started")
-        self.assertEqual(calls[0][0][0], str(manager_path))
-        self.assertIn("--auto-launch", calls[0][0])
-        self.assertNotIn("shell", calls[0][1])
-
-    def test_running_sogou_process_without_visible_window_is_not_ready(self):
+    def test_running_sogou_process_is_running_without_a_visible_window(self):
         with tempfile.TemporaryDirectory() as tmp:
             executable = Path(tmp) / "sogou_voice_assistant.exe"
             executable.touch()
@@ -295,26 +267,32 @@ class SogouDiscoveryTests(unittest.TestCase):
                 process_iter=lambda: (
                     manager.ProcessInfo(12, executable.name, executable, False),
                 ),
-                visible_window_pids=lambda: (),
-            )
-
-        self.assertEqual(status.code, "running_not_ready")
-        self.assertIn("尚未就绪", manager.status_text(status))
-
-    def test_running_sogou_process_with_visible_window_is_ready(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            executable = Path(tmp) / "sogou_voice_assistant.exe"
-            executable.touch()
-            status = manager.inspect_voice_program(
-                {"provider": "sogou"},
-                platform="win32",
-                process_iter=lambda: (
-                    manager.ProcessInfo(12, executable.name, executable, False),
-                ),
-                visible_window_pids=lambda: (12,),
             )
 
         self.assertEqual(status.code, "running")
+        self.assertTrue(status.running)
+        self.assertIn("正在运行", manager.status_text(status))
+
+    def test_sogou_voice_process_readiness_uses_only_a_bounded_process_poll(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            executable = Path(tmp) / "sogou_voice_assistant.exe"
+            executable.touch()
+            processes = (
+                manager.ProcessInfo(12, executable.name, executable, False),
+            )
+            idle_ready = manager.wait_for_sogou_voice_process(
+                timeout=0,
+                platform="win32",
+                process_iter=lambda: (),
+            )
+            active_ready = manager.wait_for_sogou_voice_process(
+                timeout=0,
+                platform="win32",
+                process_iter=lambda: processes,
+            )
+
+        self.assertFalse(idle_ready)
+        self.assertTrue(active_ready)
 
 
 class WeTypeDiscoveryTests(unittest.TestCase):
@@ -377,6 +355,44 @@ class WeTypeDiscoveryTests(unittest.TestCase):
         self.assertFalse(status.running)
         self.assertEqual(status.code, "stopped")
         self.assertEqual(result.code, "system_managed")
+
+
+class DoubaoDiscoveryTests(unittest.TestCase):
+    def test_install_root_detects_watchdog_and_settings_launcher(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            install_root = Path(tmp) / "DoubaoIME"
+            watchdog = install_root / "bootstrap" / "ImeWatchdog.exe"
+            settings = install_root / "bootstrap" / "SettingsLauncher.exe"
+            watchdog.parent.mkdir(parents=True)
+            watchdog.touch()
+            settings.touch()
+
+            status = manager.inspect_voice_program(
+                {"provider": "doubao_ime"},
+                platform="win32",
+                process_iter=lambda: (),
+                doubao_install_value_reader=lambda: (str(install_root),),
+            )
+            target = manager.resolve_voice_program_settings_target(
+                {"provider": "doubao_ime"},
+                platform="win32",
+                process_iter=lambda: (),
+                doubao_install_value_reader=lambda: (str(install_root),),
+            )
+            result = manager.launch_voice_program(
+                {"provider": "doubao_ime"},
+                platform="win32",
+                process_iter=lambda: (),
+                doubao_install_value_reader=lambda: (str(install_root),),
+                start_file=lambda *_: self.fail("豆包输入法不应作为普通程序启动"),
+            )
+
+        self.assertTrue(status.available)
+        self.assertEqual(status.code, "stopped")
+        self.assertFalse(manager.is_system_managed_provider("doubao_ime"))
+        self.assertTrue(target.available)
+        self.assertEqual(Path(target.target), settings)
+        self.assertEqual(result.code, "built_in_adapter")
 
 
 class VoiceProgramSettingsTargetTests(unittest.TestCase):
@@ -468,16 +484,6 @@ class VoiceProgramSettingsTargetTests(unittest.TestCase):
         self.assertEqual(Path(target.target), settings)
         self.assertEqual(target.arguments, "-showsetting")
 
-    def test_windows_dictation_settings_use_the_system_speech_uri(self):
-        target = manager.resolve_voice_program_settings_target(
-            {"provider": "windows_dictation"}, platform="win32"
-        )
-
-        self.assertTrue(target.available)
-        self.assertEqual(target.kind, "uri")
-        self.assertEqual(target.target, "ms-settings:speech")
-
-
 class VoiceProgramLaunchTests(unittest.TestCase):
     def _custom_settings(self, executable: Path, **updates):
         settings = {
@@ -519,10 +525,18 @@ class VoiceProgramLaunchTests(unittest.TestCase):
             executable = Path(tmp) / "voice.exe"
             executable.touch()
             calls = []
+            snapshots = iter(
+                (
+                    (),
+                    (manager.ProcessInfo(50, executable.name, executable, False),),
+                )
+            )
             result = manager.launch_voice_program(
                 self._custom_settings(executable),
                 platform="win32",
-                process_iter=lambda: (),
+                process_iter=lambda: next(snapshots, (
+                    manager.ProcessInfo(50, executable.name, executable, False),
+                )),
                 start_file=lambda path, operation, cwd: calls.append(
                     (path, operation, cwd)
                 ),
@@ -559,18 +573,26 @@ class VoiceProgramLaunchTests(unittest.TestCase):
             target.parent.mkdir()
             target.touch()
             calls = []
+            snapshots = iter(
+                (
+                    (),
+                    (manager.ProcessInfo(51, target.name, target, False),),
+                )
+            )
             result = manager.launch_voice_program(
                 self._custom_settings(shortcut),
                 platform="win32",
-                process_iter=lambda: (),
+                process_iter=lambda: next(snapshots, (
+                    manager.ProcessInfo(51, target.name, target, False),
+                )),
                 shortcut_resolver=lambda path: target,
                 start_file=lambda path, operation, cwd: calls.append(
                     (path, operation, cwd)
                 ),
             )
-            self.assertTrue(result.started)
-            self.assertEqual(Path(calls[0][0]).resolve(), shortcut.resolve())
-            self.assertEqual(Path(calls[0][2]).resolve(), shortcut.parent.resolve())
+        self.assertTrue(result.started)
+        self.assertEqual(Path(calls[0][0]), shortcut)
+        self.assertEqual(Path(calls[0][2]), shortcut.parent)
 
     def test_custom_program_does_not_match_same_name_from_another_path(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -670,16 +692,40 @@ class VoiceProgramLaunchTests(unittest.TestCase):
             executable = Path(tmp) / "voice.exe"
             executable.touch()
             calls = []
+            snapshots = iter(
+                (
+                    (),
+                    (manager.ProcessInfo(52, executable.name, executable, True),),
+                )
+            )
             result = manager.launch_voice_program(
                 self._custom_settings(executable, launch_elevated=True),
                 platform="win32",
-                process_iter=lambda: (),
+                process_iter=lambda: next(snapshots, (
+                    manager.ProcessInfo(52, executable.name, executable, True),
+                )),
                 start_file=lambda path, operation, cwd: calls.append(
                     (path, operation, cwd)
                 ),
             )
         self.assertTrue(result.started)
         self.assertEqual(calls[0][1], "run" + "as")
+
+    def test_launch_request_without_a_matching_process_is_not_reported_as_started(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            executable = Path(tmp) / "voice.exe"
+            executable.touch()
+            result = manager.launch_voice_program(
+                self._custom_settings(executable),
+                platform="win32",
+                process_iter=lambda: (),
+                start_file=lambda *_: None,
+                launch_confirm_timeout=0,
+            )
+
+        self.assertFalse(result.started)
+        self.assertEqual(result.code, "launch_unconfirmed")
+        self.assertIn("没有确认", manager.launch_result_text(result))
 
     def test_running_lower_privilege_program_is_not_reported_as_elevated(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -757,6 +803,29 @@ class BridgeStartupWiringTests(unittest.TestCase):
                 ):
                     app.RC003App()
                 launch.assert_called_once()
+            finally:
+                logger = logging.getLogger(logging_setup.LOGGER_NAME)
+                for handler in list(logger.handlers):
+                    handler.close()
+                    logger.removeHandler(handler)
+                logging_setup._configured = False
+                asyncio.set_event_loop(None)
+                loop.close()
+
+    def test_diagnostics_recovery_can_skip_voice_program_startup(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            try:
+                with (
+                    mock.patch.object(config, "config_root", return_value=Path(tmp)),
+                    mock.patch.object(
+                        app.voice_program_manager,
+                        "launch_configured_at_bridge_start",
+                    ) as launch,
+                ):
+                    app.RC003App(launch_voice_program_on_start=False)
+                launch.assert_not_called()
             finally:
                 logger = logging.getLogger(logging_setup.LOGGER_NAME)
                 for handler in list(logger.handlers):
