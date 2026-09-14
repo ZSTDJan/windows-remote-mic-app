@@ -54,7 +54,7 @@ DJI Mic 2 不再出现在当前设备选择和自动诊断中；既有设备档�
   产出的 `SHA256SUMS.txt` 一致。以 PowerShell 为例：
 
   ```powershell
-  Get-FileHash -Algorithm SHA256 .\无线麦-Windows-<版本号>-免安装.zip
+  Get-FileHash -Algorithm SHA256 .\RemoteMicRC003-<版本号>-portable-unsigned.zip
   ```
 
   把输出的 `Hash` 值（不区分大小写）与 `SHA256SUMS.txt` 中同一个文件名那
@@ -79,7 +79,7 @@ tag 只多一个 `v` 前缀。candidate.44 已通过本机验收，并按连续�
 
 `v1.0.44` 发布包含以下两个附件（不计 GitHub 自动提供的源码归档）：
 
-- `无线麦-Windows-<版本号>-免安装.zip`——完整解压后运行 `RemoteMicRC003.exe`；
+- `RemoteMicRC003-<版本号>-portable-unsigned.zip`——完整解压后运行 `RemoteMicRC003.exe`；
   内含带版本号的顶层文件夹，以及 LICENSE.txt、COPYRIGHT.txt、第三方许可和 README.txt。
 - `SHA256SUMS.txt`——UTF-8 校验清单，仅覆盖同一次构建的免安装 ZIP。
 

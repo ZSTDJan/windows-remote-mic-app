@@ -165,7 +165,9 @@ GitHub 云端构建不再是发布前提；自动工作流已停用，未经用�
   发布前核对 tag 与 VERSION，禁止 tag、窗口和下载文件各写一个版本。
   发布标题为 `无线麦 Windows版｜<VERSION> 测试版` 或
   `无线麦 Windows版｜<VERSION> 正式版`；候选必须勾选 GitHub 预发行标记。
-- 新下载文件固定为 `无线麦-Windows-<VERSION>-免安装.zip` 和 `SHA256SUMS.txt`。
+- GitHub 附件固定为 `RemoteMicRC003-<VERSION>-portable-unsigned.zip` 和 `SHA256SUMS.txt`。
+  2026-09-14 实际上传确认 GitHub 会剔除附件名中的中文；公开附件沿用更新器已支持的
+  英文格式，主页下载按钮仍用中文。本地交付可保留 `无线麦-Windows-<VERSION>-免安装.zip`。
   后者使用 UTF-8，仅包含该 ZIP 的文件名和 SHA-256；名称保留以兼容既有校验入口。
   不再生成或分发安装程序 EXE。ZIP 内的程序名、目录布局和配置路径保持兼容，
   “未签名”写在下载说明中，不能因文件名简化而省略提醒。
