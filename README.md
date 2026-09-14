@@ -10,12 +10,12 @@ Quicker 动作。支持单击、双击和长按映射，也支持按住说话和
 
 ## 下载无线麦
 
-**1.0.44 已完成本地打包，正在处理上传，暂不可下载。**
+**[下载 Windows 免安装版 · 解压后运行](https://github.com/ZSTDJan/windows-remote-mic-app/releases/download/v1.0.44/RemoteMicRC003-1.0.44-portable-unsigned.zip)**
 
-当前可下载版本仍为 candidate.2：[旧版免安装 ZIP](https://github.com/ZSTDJan/windows-remote-mic-app/releases/download/v0.2.0-windows-rc003-candidate.2/RemoteMicRC003-0.2.0-candidate.2-portable-unsigned.zip)。完整解压 ZIP 后，运行文件夹中的
+当前公开版本：**1.0.44（正式版）**。完整解压 ZIP 后，运行文件夹中的
 `RemoteMicRC003.exe`；不要只把 EXE 单独取出来。
 
-[版本说明与历史附件](https://github.com/ZSTDJan/windows-remote-mic-app/releases) · [旧版校验文件 SHA256SUMS.txt](https://github.com/ZSTDJan/windows-remote-mic-app/releases/download/v0.2.0-windows-rc003-candidate.2/SHA256SUMS.txt)
+[版本说明与历史附件](https://github.com/ZSTDJan/windows-remote-mic-app/releases/tag/v1.0.44) · [校验文件 SHA256SUMS.txt](https://github.com/ZSTDJan/windows-remote-mic-app/releases/download/v1.0.44/SHA256SUMS.txt)
 
 目前只提供免安装版，旧版附件保留供回退。程序未签名，Windows SmartScreen 可能
 提示；请只从本仓库下载，并用 `SHA256SUMS.txt` 核对文件哈希。
