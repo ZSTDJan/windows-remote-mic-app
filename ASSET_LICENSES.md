@@ -19,7 +19,9 @@ compatible device and do not imply endorsement.
 
 - Files: `docs/screenshots/settings-buttons.png`,
   `docs/screenshots/settings-connection.png`, and
-  `docs/screenshots/settings-voice.png`
+  `docs/screenshots/settings-voice.png`, plus the annotated configuration
+  examples `docs/screenshots/device-ready-status.jpg` and
+  `docs/screenshots/voice-configuration-example.jpg`
 - Origin: captured by the repository maintainer from this repository's own
   Windows application on a personally controlled test system
 - Private data: the published copies contain no user identity, local file
