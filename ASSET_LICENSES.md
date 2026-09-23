@@ -55,6 +55,19 @@ do not imply inclusion in, sponsorship of, or endorsement of this project.
   `docs/screenshots/voice-overview.jpg`
 - Origin: application screenshots supplied by the repository maintainer on
   2026-09-24 for the public GitHub homepage
-- Modification: copied unchanged from the supplied JPEG files
+- Modification: dark outer corner pixels were replaced with white and the
+  JPEG files were re-encoded; the displayed interface content was unchanged
 - Permission: the maintainer expressly authorized publication in this
   repository's README; this entry does not assign a license to unrelated uses
+
+## Homepage remote comparison and QQ code
+
+- File: `docs/images/remote-comparison.png`
+- Origin: the side-by-side remote photograph and illustrations supplied by the
+  repository maintainer on 2026-09-24 for the public GitHub homepage
+- Modification: copied unchanged from the supplied PNG
+- Permission: publication in this repository's README as requested by the
+  maintainer; visible device and store names do not imply endorsement
+- File: `docs/images/qq-group-89641716.png`
+- Modification: cropped the existing poster to its QR square and white quiet
+  zone; every pixel inside the retained rectangle is unchanged
