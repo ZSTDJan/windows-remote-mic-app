@@ -46,3 +46,15 @@ compatible device and do not imply endorsement.
 Third-party product names visible in the interface are compatibility examples
 only. Their names and marks remain the property of their respective owners and
 do not imply inclusion in, sponsorship of, or endorsement of this project.
+
+## Homepage interface screenshots
+
+- Files: `docs/screenshots/google-buttons.jpg`,
+  `docs/screenshots/xiaomi-buttons.jpg`,
+  `docs/screenshots/device-overview.jpg`, and
+  `docs/screenshots/voice-overview.jpg`
+- Origin: application screenshots supplied by the repository maintainer on
+  2026-09-24 for the public GitHub homepage
+- Modification: copied unchanged from the supplied JPEG files
+- Permission: the maintainer expressly authorized publication in this
+  repository's README; this entry does not assign a license to unrelated uses
