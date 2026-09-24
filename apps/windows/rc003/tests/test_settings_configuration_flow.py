@@ -280,8 +280,7 @@ assert page.bridgeActionVisible()
 assert page.bridgeActionText() == "重启服务"
 diagnostics._is_refreshing = False
 diagnostics.isRefreshingChanged.emit()
-assert find(window, "trySpeakingButton").property("enabled")
-assert find(window, "actualSpeechInstruction").property("text") == "点击输入框，用遥控器说一句话，查看文字是否输入。"
+assert find(window, "testVbCableChannelButton") is not None
 find(window, "tabBar").setProperty("currentIndex", 0)
 with mock.patch.object(controller, "restartBridge") as restart:
     find(window, "bridgeActionButton").clicked.emit()

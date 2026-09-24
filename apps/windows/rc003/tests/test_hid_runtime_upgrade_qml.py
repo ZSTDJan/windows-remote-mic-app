@@ -45,8 +45,6 @@ controller._set_bridge_connected(True)
 controller._set_bridge_connection_state("connected")
 device_page = find(window, "deviceScroll").parent()
 voice_page = find(window, "voiceScroll").parent()
-try_speaking = find(window, "trySpeakingButton")
-speech_instruction = find(window, "actualSpeechInstruction")
 root_path = m.config.config_root()
 
 def input_state(hid_state):
@@ -70,13 +68,10 @@ assert device_page.buttonReceiverStateText() == "请重启电脑一次"
 assert "旧按键组件未释放" in find(window, "buttonReceiverRow").property("descriptionText")
 assert "重启后重新打开程序" in find(window, "buttonReceiverRow").property("descriptionText")
 assert not device_page.bridgeNeedsRestartAction()
-assert try_speaking.property("enabled")
-assert speech_instruction.property("text") == "点击输入框，用遥控器说一句话，查看文字是否输入。"
 
 # A stale restart-service recommendation must not hide the required host reload.
 controller._set_bridge_restart_recommended(True)
 assert not device_page.bridgeNeedsRestartAction()
-assert try_speaking.property("enabled")
 controller._set_bridge_restart_recommended(False)
 
 # Ordinary-permission upgrades must replace the installed helper first.
@@ -90,7 +85,6 @@ controller._hid_helper_state = hid_elevation_windows.HidHelperState(
 controller.hidHelperStateChanged.emit()
 assert controller.hidHelperRepairVisible
 assert device_page.buttonReceiverStateCode() == "permission"
-assert try_speaking.property("enabled")
 controller._hid_helper_portable_distribution = True
 controller.hidHelperStateChanged.emit()
 assert device_page.buttonReceiverStateCode() == "disabled"
@@ -102,7 +96,6 @@ assert device_page.buttonReceiverStateCode() == "restart_computer"
 input_state(frida_compat.HidTapState.SHARED_HOST.value)
 assert device_page.buttonReceiverStateText() == "按键来源待区分"
 assert not device_page.bridgeNeedsRestartAction()
-assert try_speaking.property("enabled")
 
 # After a compatible component has loaded, first input and normal operation
 # retain the existing UI states.
@@ -129,7 +122,6 @@ input_state(frida_compat.HidTapState.ATTACHED_WAITING_IO.value)
 assert device_page.buttonReceiverStateText() == "正常"
 input_state(frida_compat.HidTapState.READY.value)
 assert device_page.buttonReceiverStateText() == "正常"
-assert try_speaking.property("enabled")
 
 # Chromecast does not consume the Xiaomi component or its stale failure state.
 controller._config["remote_selection"]["devices"][0]["profile"] = "chromecast-remote"

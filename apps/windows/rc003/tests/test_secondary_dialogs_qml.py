@@ -69,22 +69,8 @@ for width, height in ((640, 480), (720, 560)):
         assert not dialog.property('visible')
     assert not diagnostics.vbCableTestRunning
 
-    click('trySpeakingButton')
-    settle()
-    dialog = item('speakTestDialog')
-    field = item('speakTestInput')
-    assert dialog.property('visible') and field.property('activeFocus')
-    assert dialog.property('height') <= 300
-    for character in 'voice input':
-        QTest.keyClick(window, character)
-    assert field.property('text') == 'voice input', repr(field.property('text'))
-    assert item('actualSpeechTestRow').property('stateText') == ''
-    screenshot(f'{width}-input')
-    click('clearSpeakTestButton')
-    assert field.property('text') == '' and field.property('activeFocus')
-    click('speakTestCloseButton')
-    assert not dialog.property('visible')
-    results.append({'size': [width, height], 'input': 'typed-cleared-closed'})
+    assert item('soundChannelTestRow').property('titleText') == '虚拟声卡'
+    results.append({'size': [width, height], 'dialogs': 'opened-closed'})
     item('tabBar').setProperty('currentIndex', 0)
 
 from PySide6.QtQml import QQmlComponent
@@ -124,7 +110,7 @@ print(json.dumps(results))
 
 
 class SecondaryDialogsQmlTests(unittest.TestCase):
-    def test_compact_dialogs_and_plain_input(self):
+    def test_compact_device_and_audio_dialogs(self):
         for style in ('Basic', 'Fusion'):
             with self.subTest(style=style), tempfile.TemporaryDirectory() as directory:
                 env = dict(os.environ, LOCALAPPDATA=directory, QT_QPA_PLATFORM='offscreen',

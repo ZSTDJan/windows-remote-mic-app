@@ -10756,243 +10756,6 @@ result["voice_sections"] = all(
     )
 )
 
-actual_speech_row = find_child(window, "actualSpeechTestRow")
-try_speaking_button = find_child(window, "trySpeakingButton")
-assert actual_speech_row is not None
-assert try_speaking_button is not None
-
-
-def actual_speech_case(
-    *,
-    helper_ready=True,
-    bridge_running=True,
-    bridge_connected=True,
-    connection_state=None,
-    hid_state="ready",
-    physicalizer_state="ready",
-    restart=False,
-    hotkey_state="saved",
-    hotkey_busy=False,
-    reconnect_busy=False,
-    endpoint_ready=True,
-    diagnostics_ready=True,
-    cable_status="pass",
-    cable_detail="CABLE Input 和 CABLE Output 均可用",
-    output_status="pass",
-    mapping_ready=True,
-    provider="none",
-    program_status="disabled",
-    elevation_status="standard",
-    voice_runtime_state="not_tested",
-    voice_runtime_provider=None,
-):
-    diagnostics_controller._is_refreshing = False
-    diagnostics_controller._check_rows = (
-        [
-            {
-                "checkId": "vb_cable_endpoints",
-                "status": cable_status,
-                "detail": cable_detail,
-                "resultCode": "ready" if cable_status == "pass" else "failed",
-            },
-            {
-                "checkId": "output_endpoint",
-                "status": output_status,
-                "detail": "已选择 CABLE Input",
-                "resultCode": "ready" if output_status == "pass" else "failed",
-            },
-        ]
-        if diagnostics_ready else []
-    )
-    diagnostics_controller.isRefreshingChanged.emit()
-    diagnostics_controller.checkResultsChanged.emit()
-    controller._set_hid_helper_state(
-        m.hid_elevation_windows.HidHelperState(
-            helper_ready,
-            "ready" if helper_ready else "helper_missing",
-        )
-    )
-    controller._set_hid_helper_repair_busy(False)
-    controller._set_bridge_running(bridge_running)
-    controller._set_bridge_connected(bridge_connected)
-    controller._set_bridge_connection_state(
-        connection_state
-        if connection_state is not None
-        else "stopped"
-        if not bridge_running
-        else "connected"
-        if bridge_connected
-        else "waiting_for_device"
-    )
-    controller._hid_tap_state = hid_state
-    controller._voice_key_physicalizer_state = physicalizer_state
-    controller.bridgeInputStateChanged.emit()
-    controller._set_bridge_restart_recommended(restart)
-    controller._set_bridge_reconnect_busy(reconnect_busy)
-    controller._set_voice_hotkey_save_state(hotkey_state)
-    controller._set_voice_hotkey_busy(hotkey_busy)
-    controller._bindings["bindings"]["mic"] = m.key_mapping.ButtonAction(
-        m.key_mapping.ActionKind.VOICE_HOLD
-        if mapping_ready else m.key_mapping.ActionKind.ESCAPE
-    ).to_dict()
-    controller.voiceMappingReadyChanged.emit()
-    controller._selected_endpoint_index = 0 if endpoint_ready else -1
-    controller.selectedEndpointIndexChanged.emit()
-    controller._voice_program_settings = (
-        m.voice_program_manager.normalize_voice_program_settings(
-            {
-                "provider": provider,
-                "custom_executable": (
-                    "C:/Voice/custom.exe" if provider == "custom" else ""
-                ),
-                "launch_on_bridge_start": provider not in {
-                    "none", "wetype", "doubao_ime"
-                },
-            }
-        )
-    )
-    controller.selectedVoiceProgramIndexChanged.emit()
-    controller._voice_program_status_code = program_status
-    controller.voiceProgramStatusCodeChanged.emit()
-    controller._voice_program_elevation_status = elevation_status
-    controller.voiceProgramElevationStatusChanged.emit()
-    controller._voice_runtime_state = voice_runtime_state
-    controller._voice_runtime_provider = (
-        provider if voice_runtime_provider is None else voice_runtime_provider
-    )
-    controller.voiceRuntimeStatusChanged.emit()
-    settle()
-    return {
-        "row": row_snapshot(actual_speech_row, "actualSpeechTestDescription"),
-        "button": {
-            "enabled": bool(try_speaking_button.property("enabled")),
-            "text": str(try_speaking_button.property("text")),
-        },
-    }
-
-
-result["actual_speech_cases"] = {
-    "busy": actual_speech_case(hotkey_busy=True),
-    "helper_issue": actual_speech_case(helper_ready=False),
-    "service_stopped": actual_speech_case(
-        bridge_running=False,
-        bridge_connected=False,
-    ),
-    "restart": actual_speech_case(restart=True),
-    "remote_disconnected": actual_speech_case(bridge_connected=False),
-    "connection_retry_wait": actual_speech_case(
-        bridge_connected=False,
-        connection_state="retry_wait",
-    ),
-    "connection_connecting": actual_speech_case(
-        bridge_connected=False,
-        connection_state="connecting",
-    ),
-    "input_unconfirmed": actual_speech_case(
-        hid_state="attached_waiting_for_hid_io"
-    ),
-    "shared_host": actual_speech_case(hid_state="selected_device_shared_host"),
-    "voice_physicalizer_starting": actual_speech_case(
-        physicalizer_state="starting"
-    ),
-    "voice_physicalizer_recovering": actual_speech_case(
-        physicalizer_state="recovering"
-    ),
-    "voice_physicalizer_failed": actual_speech_case(
-        physicalizer_state="failed"
-    ),
-    "hotkey_retry": actual_speech_case(hotkey_state="retry"),
-    "wetype_ignores_physicalizer": actual_speech_case(
-        provider="wetype",
-        program_status="running",
-        physicalizer_state="failed",
-    ),
-    "wetype_hotkey_retry": actual_speech_case(
-        provider="wetype",
-        program_status="running",
-        hotkey_state="retry",
-    ),
-    "diagnostics_missing": actual_speech_case(diagnostics_ready=False),
-    "audio_missing": actual_speech_case(
-        cable_status="fail",
-        cable_detail="缺少 CABLE Output",
-    ),
-    "audio_check_failed": actual_speech_case(
-        cable_status="fail",
-        cable_detail="无法检测音频端点",
-    ),
-    "missing_endpoint": actual_speech_case(endpoint_ready=False),
-    "output_failed": actual_speech_case(output_status="fail"),
-    "mapping_missing": actual_speech_case(mapping_ready=False),
-    "missing_custom_program": actual_speech_case(
-        provider="custom",
-        program_status="not_found",
-    ),
-    "missing_managed_program": actual_speech_case(
-        provider="sogou",
-        program_status="not_found",
-    ),
-    "stopped_managed_program": actual_speech_case(
-        provider="sogou",
-        program_status="stopped",
-    ),
-    "program_privilege_mismatch": actual_speech_case(
-        provider="sogou",
-        program_status="running",
-        elevation_status="standard",
-    ),
-    "program_privilege_unknown": actual_speech_case(
-        provider="sogou",
-        program_status="running",
-        elevation_status="unknown",
-    ),
-    "reconnecting": actual_speech_case(
-        bridge_connected=False,
-        reconnect_busy=True,
-    ),
-    "voice_active": actual_speech_case(
-        provider="wetype",
-        program_status="running",
-        voice_runtime_state="active",
-    ),
-    "voice_mic_confirmed": actual_speech_case(
-        provider="wetype",
-        program_status="running",
-        voice_runtime_state="mic_confirmed",
-    ),
-    "voice_receiving_audio": actual_speech_case(
-        provider="wetype",
-        program_status="running",
-        voice_runtime_state="receiving_audio",
-    ),
-    "voice_finishing": actual_speech_case(
-        provider="wetype",
-        program_status="running",
-        voice_runtime_state="finishing",
-    ),
-    "voice_success": actual_speech_case(
-        provider="wetype",
-        program_status="running",
-        voice_runtime_state="success",
-    ),
-    "voice_host_start_failed": actual_speech_case(
-        provider="wetype",
-        program_status="running",
-        voice_runtime_state="host_start_failed",
-    ),
-    "voice_audio_empty": actual_speech_case(
-        provider="wetype",
-        program_status="running",
-        voice_runtime_state="audio_empty",
-    ),
-    "voice_provider_mismatch": actual_speech_case(
-        provider="wetype",
-        program_status="running",
-        voice_runtime_state="host_start_failed",
-        voice_runtime_provider="sogou",
-    ),
-    "ready": actual_speech_case(),
-}
 controller.shutdownBackgroundTasks()
 m._shutdown_diagnostics_workers()
 print(json.dumps(result))
@@ -11764,7 +11527,6 @@ voice_row_names = (
     "voiceProgramCustomPathRow",
     "voiceHotkeyRow",
     "soundChannelTestRow",
-    "actualSpeechTestRow",
 )
 result["voice_columns"] = {
     "states": {
@@ -11790,7 +11552,6 @@ result["voice_columns"] = {
             "browseVoiceProgramButton",
             "recordVoiceHotkeyButton",
             "testVbCableChannelButton",
-            "trySpeakingButton",
         )
     },
     "left_controls": {
@@ -11802,14 +11563,12 @@ result["voice_columns"] = {
         for name in (
             "voiceHotkeyRow_descriptionLabel",
             "soundChannelTestDescription",
-            "actualSpeechTestDescription",
         )
     },
     "editor_columns": {
         name: bounds(window, name + "_editorColumn")
         for name in (
             "soundChannelTestRow",
-            "actualSpeechTestRow",
         )
     },
 }
@@ -11832,33 +11591,6 @@ result["voice_provider_actions"] = {
         "openVoiceProgramSettingsButton",
     )
 }
-
-speak_dialog = find_child(window, "speakTestDialog")
-assert speak_dialog is not None
-assert QMetaObject.invokeMethod(
-    speak_dialog,
-    "open",
-    Qt.ConnectionType.DirectConnection,
-)
-render(window, app)
-result["speak_dialog"] = {
-    "dialog": bounds(window, "speakTestDialog"),
-    "input_frame": bounds(window, "speakTestInputFrame"),
-    "input": bounds(window, "speakTestInput"),
-    "close": bounds(window, "speakTestCloseButton"),
-}
-screenshot_dir = os.environ.get("PROBE_SCREENSHOT_DIR")
-if screenshot_dir:
-    render(window, app, 2).save(
-        os.path.join(
-            screenshot_dir,
-            f"{os.environ.get('PROBE_STYLE', 'Basic')}-"
-            f"{int(result['width'])}x{int(result['height'])}-speak-dialog.png",
-        )
-    )
-speak_dialog.close()
-speak_dialog.setProperty("visible", False)
-render(window, app, 2)
 
 mapping_button = find_child(window, "mappingTabButton")
 tab_bar.setProperty("currentIndex", 2)
@@ -12489,7 +12221,7 @@ class SettingsShellSourceContractTests(unittest.TestCase):
         self.assertNotIn("ToolTip", self.dialog_close_button_qml)
         self.assertIn("renderType: Text.QtRendering", self.icon_glyph_qml)
         self.assertEqual(self.buttons_qml.count("DialogCloseButton {"), 2)
-        self.assertEqual(self.voice_qml.count("SettingsDialog {"), 3)
+        self.assertEqual(self.voice_qml.count("SettingsDialog {"), 2)
 
     def test_tooltips_are_compact_and_follow_each_truncated_text(self):
         self.assertIn("ToolTip {", self.compact_tooltip_qml)
@@ -12590,7 +12322,7 @@ class SettingsShellSourceContractTests(unittest.TestCase):
         self.assertIn('qsTr("请重新选择端点")', self.voice_qml)
         self.assertIn('qsTr("点击“重新检查”")', self.voice_qml)
         self.assertIn('qsTr("请手动验证")', self.voice_qml)
-        self.assertIn('text: qsTr("语音试说")', self.voice_qml)
+        self.assertNotIn('text: qsTr("语音试说")', self.voice_qml)
         self.assertIn('qsTr("退出后点“重新检测”")', self.voice_qml)
         self.assertNotIn('qsTr("需处理")', self.voice_qml)
         self.assertNotIn('qsTr("待完成")', self.voice_qml)
@@ -12602,11 +12334,7 @@ class SettingsShellSourceContractTests(unittest.TestCase):
             self.assertNotIn(misleading_claim, self.voice_qml)
         self.assertNotIn('objectName: "voiceProgramSpecificRow"', self.voice_qml)
         self.assertNotIn('objectName: "voiceProgramLaunchText"', self.voice_qml)
-        self.assertIn('objectName: "actualSpeechInstruction"', self.voice_qml)
-        self.assertIn(
-            "点击输入框，用遥控器说一句话，查看文字是否输入。",
-            self.voice_qml,
-        )
+        self.assertNotIn('objectName: "speakTestDialog"', self.voice_qml)
 
     def test_voice_program_state_does_not_treat_an_idle_window_as_failure(self):
         self.assertNotIn("running_not_ready", self.voice_qml)
@@ -12916,7 +12644,6 @@ class ThreePageSettingsSourceContractTests(unittest.TestCase):
     def test_regular_frames_share_one_hairline_width(self):
         for source in (
             self.main_qml,
-            self.voice_qml,
             self.buttons_qml,
             self.mapping_card_qml,
             self.compact_button_qml,
@@ -13046,28 +12773,19 @@ class ThreePageSettingsSourceContractTests(unittest.TestCase):
         self.assertNotIn('objectName: "openSoundInputSettingsButton"', self.voice_qml)
         self.assertNotIn('text: qsTr("声音输入")', self.voice_qml)
 
-    def test_voice_tests_use_a_focused_text_box_and_safe_service_recovery(self):
+    def test_voice_channel_check_keeps_safe_service_recovery(self):
         for object_name in (
             "bridgeTestConfirmDialog",
             "testVbCableChannelButton",
             "recoverBridgeButton",
-            "trySpeakingButton",
-            "speakTestDialog",
-            "speakTestInput",
         ):
             self.assertIn(f'objectName: "{object_name}"', self.voice_qml)
         self.assertIn(
             "DiagnosticsController.testVbCableChannelWithBridgeRestart()",
             self.voice_qml,
         )
-        self.assertIn("speakTestInput.forceActiveFocus()", self.voice_qml)
-        self.assertIn('objectName: "speakTestInputFrame"', self.voice_qml)
-        self.assertIn('closeButtonObjectName: "speakTestCloseButton"', self.voice_qml)
-        self.assertNotIn("actualSpeechStateCode", self.voice_qml)
-        self.assertNotIn("recentVoiceRunDescription", self.voice_qml)
-        self.assertIn('onClicked: speakTestDialog.open()', self.voice_qml)
+        self.assertNotIn('objectName: "trySpeakingButton"', self.voice_qml)
         self.assertIn('qsTr("检查虚拟声卡")', self.voice_qml)
-        self.assertIn("Layout.minimumHeight: 150", self.voice_qml)
         self.assertIn("vbCableBridgeRecoveryNeeded", self.voice_qml)
 
     def test_button_page_keeps_real_cards_and_confirms_built_in_defaults(self):
@@ -13810,15 +13528,6 @@ class OffscreenQmlLoadTests(unittest.TestCase):
             "让遥控器按键在电脑上生效",
         )
 
-        speech_cases = data["actual_speech_cases"]
-        # The input target stays available across device and runtime states.
-        for name, case in speech_cases.items():
-            with self.subTest(actual_speech=name):
-                self.assertEqual(case["row"]["state"], "")
-                self.assertEqual(case["row"]["detail"], "检查说话内容能否输入")
-                self.assertEqual(case["button"]["text"], "语音试说")
-                self.assertTrue(case["button"]["enabled"])
-
         for style, style_data in style_results.items():
             with self.subTest(style=style, check="status_geometry"):
                 style_state_columns = style_data["device_columns"]["states"]
@@ -13864,23 +13573,6 @@ class OffscreenQmlLoadTests(unittest.TestCase):
                             self.assertLessEqual(row["center_delta"], 0.5)
                         if row["title_center_delta"] is not None:
                             self.assertLessEqual(row["title_center_delta"], 0.5)
-                for case in style_data["actual_speech_cases"].values():
-                    row = case["row"]
-                    self.assertFalse(row["state_truncated"])
-                    self.assertGreaterEqual(
-                        row["state_width"] + 0.5,
-                        row["state_implicit_width"],
-                    )
-                    self.assertFalse(row["detail_truncated"])
-                    self.assertGreaterEqual(
-                        row["detail_width"] + 0.5,
-                        row["detail_implicit_width"],
-                    )
-                    if row["center_delta"] is not None:
-                        self.assertLessEqual(row["center_delta"], 0.5)
-                    if row["title_center_delta"] is not None:
-                        self.assertLessEqual(row["title_center_delta"], 0.5)
-
     def test_three_page_shell_fits_compact_viewports_without_horizontal_overflow(self):
         import json
         import subprocess
@@ -13955,15 +13647,9 @@ class OffscreenQmlLoadTests(unittest.TestCase):
                 test_description_x = descriptions[
                     "soundChannelTestDescription"
                 ]["x"]
-                self.assertAlmostEqual(
-                    descriptions["actualSpeechTestDescription"]["x"],
-                    test_description_x,
-                    delta=0.5,
-                )
                 self.assertGreater(note_x, test_description_x)
                 editor_columns = data["voice_columns"]["editor_columns"]
                 self.assertFalse(editor_columns["soundChannelTestRow"]["visible"])
-                self.assertFalse(editor_columns["actualSpeechTestRow"]["visible"])
                 self.assertTrue(data["voice_recovery_editor"]["column"]["visible"])
                 self.assertTrue(data["voice_recovery_editor"]["button"]["visible"])
 
@@ -13980,17 +13666,6 @@ class OffscreenQmlLoadTests(unittest.TestCase):
                             background[edge], button[edge], delta=0.5
                         )
 
-                speak = data["speak_dialog"]
-                self.assertGreaterEqual(speak["input_frame"]["height"], 150)
-                self.assertGreaterEqual(speak["input"]["height"], 150)
-                self.assertEqual(speak["close"]["width"], 28)
-                self.assertEqual(speak["close"]["height"], 28)
-                self.assertGreaterEqual(
-                    speak["input_frame"]["y"], speak["dialog"]["y"]
-                )
-                self.assertLessEqual(
-                    speak["input_frame"]["bottom"], speak["dialog"]["bottom"] + 1
-                )
                 for page_name, page in data["pages"].items():
                     content = page["content"]
                     self.assertTrue(content["visible"], page_name)

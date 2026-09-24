@@ -12,7 +12,7 @@ Item {
     property var backTabTarget: null
     property var tabTarget: null
     readonly property var firstFocusItem: installVirtualAudioButton
-    readonly property var lastFocusItem: trySpeakingButton
+    readonly property var lastFocusItem: testVbCableChannelButton
     property bool voiceHotkeyRecording: false
     property string voiceHotkeyCaptureError: ""
     property string pendingVoiceHotkey: ""
@@ -276,85 +276,6 @@ Item {
             kind: bodyKind
             wrapMode: Text.WordWrap
             text: qsTr("检查虚拟声卡时会发送一小段测试音，并临时停止遥控器服务，结束后自动恢复。此检查不测试语音识别，平时说话不用先点它。")
-        }
-    }
-
-    SettingsDialog {
-        id: speakTestDialog
-        objectName: "speakTestDialog"
-        tokens: root.tokens
-        preferredWidth: 480
-        height: Math.min(300, parent.height - 32)
-        title: qsTr("语音试说")
-        closeButtonObjectName: "speakTestCloseButton"
-        onOpened: Qt.callLater(function() { speakTestInput.forceActiveFocus() })
-
-        contentItem: ColumnLayout {
-            spacing: tokens.spacingSmall
-
-            UiLabel {
-                tokens: root.tokens
-                kind: noteKind
-                Layout.fillWidth: true
-                text: root.voiceProgramManaged
-                    ? qsTr("当前：%1").arg(
-                        SettingsController.voiceProgramOptions[
-                            SettingsController.selectedVoiceProgramIndex
-                        ]
-                    )
-                    : qsTr("当前：不管理语音程序")
-                elide: Text.ElideRight
-            }
-
-            UiLabel {
-                objectName: "actualSpeechInstruction"
-                tokens: root.tokens
-                kind: noteKind
-                Layout.fillWidth: true
-                wrapMode: Text.WordWrap
-                text: qsTr("点击输入框，用遥控器说一句话，查看文字是否输入。")
-            }
-
-            ScrollView {
-                id: speakTestInputFrame
-                objectName: "speakTestInputFrame"
-                Layout.fillWidth: true
-                Layout.fillHeight: true
-                Layout.minimumHeight: 150
-                TextArea {
-                    id: speakTestInput
-                    objectName: "speakTestInput"
-                    placeholderText: qsTr("看看说的话有没有变成文字")
-                    wrapMode: TextEdit.Wrap
-                    selectByMouse: true
-                    font.family: tokens.fontFamily
-                    font.pixelSize: tokens.fontSizeBody
-                    color: tokens.textPrimary
-                    placeholderTextColor: tokens.disabledText
-                    background: Rectangle {
-                        color: tokens.fieldBackground
-                        border.width: tokens.hairlineWidth
-                        border.color: speakTestInput.activeFocus
-                            ? tokens.accent : tokens.border
-                        radius: tokens.cornerRadiusControl
-                    }
-                }
-            }
-
-            RowLayout {
-                Layout.fillWidth: true
-                Item { Layout.fillWidth: true }
-                CompactButton {
-                    objectName: "clearSpeakTestButton"
-                    tokens: root.tokens
-                    compactMinimumWidth: tokens.buttonWidth2Chars
-                    text: qsTr("清空")
-                    onClicked: {
-                        speakTestInput.clear()
-                        speakTestInput.forceActiveFocus()
-                    }
-                }
-            }
         }
     }
 
@@ -910,6 +831,7 @@ Item {
                     stateColumnWidth: root.settingsStateColumnWidth
                     actionColumnWidth: root.settingsActionColumnWidth
                     editorColumnVisible: DiagnosticsController.vbCableBridgeRecoveryNeeded
+                    showDivider: false
                     titleText: qsTr("虚拟声卡")
                     descriptionText: DiagnosticsController.vbCableTestMessage.length > 0
                         ? DiagnosticsController.vbCableTestMessage
@@ -946,6 +868,7 @@ Item {
                         }
                     ]
                     CompactButton {
+                        id: testVbCableChannelButton
                         objectName: "testVbCableChannelButton"
                         tokens: root.tokens
                         Layout.fillWidth: true
@@ -957,28 +880,10 @@ Item {
                         onClicked: SettingsController.bridgeRunning
                             ? bridgeTestConfirmDialog.open()
                             : DiagnosticsController.testVbCableChannel()
-                    }
-                }
-
-                InlineSettingsRow {
-                    objectName: "actualSpeechTestRow"
-                    tokens: root.tokens
-                    stateColumnWidth: root.settingsStateColumnWidth
-                    actionColumnWidth: root.settingsActionColumnWidth
-                    titleText: qsTr("试输入")
-                    descriptionText: qsTr("检查说话内容能否输入")
-                    descriptionObjectName: "actualSpeechTestDescription"
-                    showDivider: false
-                    CompactButton {
-                        id: trySpeakingButton
-                        objectName: "trySpeakingButton"
-                        tokens: root.tokens
-                        Layout.fillWidth: true
-                        text: qsTr("语音试说")
-                        onClicked: speakTestDialog.open()
                         KeyNavigation.tab: root.tabTarget
                     }
                 }
+
             }
 
             UiLabel {
