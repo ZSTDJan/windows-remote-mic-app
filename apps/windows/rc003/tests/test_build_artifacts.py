@@ -2981,136 +2981,45 @@ class VbCablePinConsistencyTests(unittest.TestCase):
 
 
 class UserFacingDocumentationContractTests(unittest.TestCase):
-    """XRBM-022 controller pre-review correction: structural checks that the
-    public README and the installed readme both actually contain the exact
-    facts/URLs/commands the task book requires, not just prose that a human
-    reviewer has to re-verify by eye every round.
-    """
+    """Keep the current concise Windows guide aligned with the actual release."""
 
     def setUp(self):
-        self.readme_text = _README_PATH.read_text(encoding="utf-8")
-        self.installed_readme_text = _INSTALLED_README_PATH.read_text(encoding="utf-8")
-        self.portable_readme_text = _PORTABLE_README_PATH.read_text(encoding="utf-8")
-        self.both = (self.readme_text, self.installed_readme_text)
+        self.guide = _README_PATH.read_text(encoding="utf-8")
+        self.landing = _ROOT_README_PATH.read_text(encoding="utf-8")
+        self.portable = _PORTABLE_README_PATH.read_text(encoding="utf-8")
 
-    def test_official_vbcable_url_is_present_in_both_docs(self):
-        for text in self.both:
-            self.assertIn("https://vb-audio.com/Cable/", text)
-
-    def test_checksum_verification_command_is_present_in_both_docs(self):
-        for text in self.both:
-            self.assertIn("Get-FileHash", text)
-            self.assertIn("SHA256", text)
+    def test_download_and_checksum_are_explicit(self):
+        for text in (self.guide, self.landing):
             self.assertIn("SHA256SUMS.txt", text)
+            self.assertIn("完整解压", text)
+        self.assertIn("Get-FileHash -Algorithm SHA256", self.guide)
+        self.assertIn("未签名", self.guide)
 
-    def test_exact_cable_routing_direction_is_preserved_in_both_docs(self):
-        for text in self.both:
+    def test_voice_routing_and_real_input_check_are_clear(self):
+        for text in (self.guide, self.landing):
             self.assertIn("CABLE Input", text)
             self.assertIn("CABLE Output", text)
-        # The direction itself, not just the two names in any order:
-        # the bridge's own voice-output setting selects CABLE Input, and
-        # the recognizer/system microphone input selects CABLE Output.
-        self.assertIn("语音输出设备", self.readme_text)
-        self.assertIn("CABLE Input", self.readme_text.split("语音输出设备")[1][:80])
-        self.assertIn("语音输出设备", self.installed_readme_text)
-        self.assertIn(
-            "CABLE Input", self.installed_readme_text.split("语音输出设备")[1][:120]
-        )
-
-    def test_current_voice_prerequisites_are_concrete_in_both_docs(self):
-        for text in self.both:
-            self.assertIn("可编辑", text)
             self.assertIn("记事本", text)
-            self.assertIn("手动", text)
-            self.assertIn("CABLE Output", text)
-            self.assertIn("按住", text)
-            self.assertIn("搜狗", text)
-            self.assertIn("微信", text)
-            self.assertIn("豆包", text)
-            self.assertIn("录入", text)
-            self.assertIn("主动刷新", text)
+        self.assertIn("无线麦写入声音的一侧", self.guide)
+        self.assertIn("输入法读取麦克风的一侧", self.guide)
+        for provider in ("搜狗", "微信", "豆包"):
+            self.assertIn(provider, self.guide)
+        self.assertNotIn("Win+H", self.guide)
 
-    def test_removed_win_h_product_entry_stays_absent_from_current_docs(self):
-        for text in self.both:
-            self.assertNotIn("Windows 语音输入", text)
-            self.assertNotIn("Win+H", text)
+    def test_mapping_permission_and_exit_are_explained(self):
+        for text in (self.guide, self.landing):
+            self.assertIn("按键", text)
+            self.assertIn("完全退出", text)
+        for text in (self.guide, self.portable):
+            self.assertIn("UAC", text)
+        self.assertIn("取消后自定义映射不会生效", self.guide)
+        self.assertIn("关闭设置窗口默认只是隐藏到通知区域", self.guide)
 
-    def test_thirteen_button_no_mute_key_and_back_gap_facts_are_present(self):
-        for text in self.both:
-            self.assertIn("13", text)
-            self.assertIn("没有独立的物理静音键", text)
-            self.assertIn("返回", text)
-
-    def test_hid_elevation_and_login_startup_are_explained_consistently(self):
-        for text in self.both:
-            self.assertIn("管理员按键组件", text)
-            self.assertIn("自定义按键映射", text)
-            self.assertIn("Windows 原始按键", text)
-            self.assertIn("随 Windows 启动", text)
-            self.assertIn("不再弹 UAC", text)
-            self.assertIn("当前登录", text)
-            self.assertIn("管理员组", text)
-
-    def test_hid_failure_disables_every_custom_mapping_in_all_user_guides(self):
-        for text in (
-            self.readme_text,
-            self.installed_readme_text,
-            self.portable_readme_text,
-        ):
-            normalized = _normalize_whitespace(text)
-            self.assertIn("全部自定义按键映射停用", normalized)
-            self.assertIn("只保留 Windows 原始按键操作", normalized)
-            self.assertNotIn("只保留 Windows 原始方向键一次", normalized)
-
-    def test_default_window_close_hides_to_tray_in_all_user_guides(self):
-        root_readme = _ROOT_README_PATH.read_text(encoding="utf-8")
-        self.assertIn("关闭设置窗口通常会隐藏", root_readme)
-        for text in (
-            self.readme_text,
-            self.installed_readme_text,
-            self.portable_readme_text,
-        ):
-            normalized = _normalize_whitespace(text)
-            self.assertIn("关闭窗口默认隐藏到通知区域", normalized)
-            self.assertNotIn("关闭窗口默认会完全退出", normalized)
-            self.assertNotIn("关闭窗口默认会先正常停止", normalized)
-
-    def test_current_source_and_historical_installer_versions_are_distinct(self):
-        self.assertIn("当前源码版本以 `src/ovb_rc003/VERSION` 为准", self.readme_text)
-        self.assertIn("历史安装器说明", self.installed_readme_text)
-        self.assertIn("仅保留旧安装版的维护入口", self.installed_readme_text)
-        root_readme = _ROOT_README_PATH.read_text(encoding="utf-8")
-        version = _VERSION_PATH.read_text(encoding="utf-8").strip()
-        self.assertIn(f"新版测试包为 **{version}**", root_readme)
-        self.assertIn("无线麦 win版 <版本号>.exe", root_readme)
-
-    def test_installed_readme_matches_the_current_three_page_workflow(self):
-        text = self.installed_readme_text
-        for current_term in (
-            "设备”“按键”“语音",
-            "启动桥接",
-            "安装虚拟音频",
-            "应用",
-            "导出日志",
-            "通知区域",
-            "完全退出",
-            "小米遥控器2 Pro",
-        ):
-            self.assertIn(current_term, text)
-        for obsolete_term in (
-            "保存并启动桥接",
-            "退出桥接",
-            "“连接”“按键”“权限”“诊断”四个页面",
-            "从“诊断”页",
-            "不会开机自动启动",
-        ):
-            self.assertNotIn(obsolete_term, text)
-
-    def test_frida_fetch_wording_matches_the_real_build_entrypoints(self):
-        self.assertNotIn("不会由构建脚本自动下载", self.readme_text)
-        self.assertIn("build-candidate.ps1", self.readme_text)
-        self.assertIn("Windows CI", self.readme_text)
-        self.assertIn("自动执行", self.readme_text)
+    def test_landing_page_identifies_the_formal_version(self):
+        version = _VERSION_PATH.read_text(encoding="ascii").strip()
+        self.assertIn(f"当前正式版为 **{version}**", self.landing)
+        self.assertIn(f"RemoteMicRC003-{version}-portable-unsigned.zip", self.landing)
+        self.assertIn("无线麦 win版 <版本号>.exe", self.landing)
 
 
 class RootDocumentConsistencyTests(unittest.TestCase):
@@ -3185,7 +3094,7 @@ class RootDocumentConsistencyTests(unittest.TestCase):
         windows_readme_text = _README_PATH.read_text(encoding="utf-8")
         version = _VERSION_PATH.read_text(encoding="utf-8").strip()
         self.assertIn(version, self.root_readme_text)
-        self.assertIn("当前源码版本以 `src/ovb_rc003/VERSION` 为准", windows_readme_text)
+        self.assertIn("下载页面与最新版说明", windows_readme_text)
 
 
 _CJK_CHAR_RE = r"[　-〿぀-ヿ㐀-鿿＀-￯]"
@@ -3266,350 +3175,83 @@ class PortableReleasePackagingReplayTests(unittest.TestCase):
 
 
 class PrereleaseDownloadInstructionsContractTests(unittest.TestCase):
-    """XRBM-027: the public prerelease download flow - a generic Releases
-    page link (so it survives a tag not existing yet), the exact asset name
-    patterns the CI packaging step actually produces, and the release-tag
-    vs internal-build-version distinction - must stay documented and must
-    not silently drift from what the CI workflow actually names its
-    outputs (see WindowsCiWorkflowTests above for that side of the
-    contract).
-    """
+    """Check the current formal download while retaining historical Releases."""
 
-    def setUp(self):
-        self.text = _README_PATH.read_text(encoding="utf-8")
-        self.iss_text = _ISS_PATH.read_text(encoding="utf-8")
-
-    def test_links_to_the_generic_releases_page(self):
-        self.assertIn(
-            "https://github.com/ZSTDJan/windows-remote-mic-app/releases", self.text
-        )
-        self.assertNotIn("miaomiaozii/windows-remote-mic-app", self.text)
-
-    def test_current_public_release_is_not_confused_with_the_local_version(self):
-        root_readme = _ROOT_README_PATH.read_text(encoding="utf-8")
-        version = _VERSION_PATH.read_text(encoding="utf-8").strip()
-        release_url = f"https://github.com/ZSTDJan/windows-remote-mic-app/releases/tag/v{version}"
-        self.assertIn(release_url, root_readme)
-        for asset_name in (
-            f"RemoteMicRC003-{version}-portable-unsigned.zip",
-            "SHA256SUMS.txt",
-        ):
-            self.assertIn(asset_name, root_readme)
-
-    def test_does_not_make_a_time_dependent_claim_about_prerelease_existence(self):
-        # XRBM-027 RETRY 1 correction: a sentence saying "even if there is
-        # currently no published prerelease yet" is temporally awkward and
-        # goes stale the moment the first prerelease is published. The
-        # Releases list must be described as a stable entry point without
-        # asserting anything about whether a prerelease currently exists.
-        self.assertNotIn("还没有发布任何预发行版", self.text)
-        self.assertNotIn("发布后再回来查看", self.text)
-
-    def test_asset_name_patterns_match_the_ci_workflows_actual_output_names(self):
-        self.assertIn("RemoteMicRC003-<版本号>-portable-unsigned.zip", self.text)
-        self.assertIn("SHA256SUMS.txt", self.text)
-
-    def test_documents_new_tag_alignment_and_historical_name_preservation(self):
-        self.assertIn("tag 只多一个 `v` 前缀", self.text)
-        self.assertIn("src/ovb_rc003/VERSION", self.text)
-        self.assertIn("历史 tag 和长文件名原样保留", self.text)
-
-    def test_current_downloads_only_offer_portable_and_keep_installer_history(self):
-        self.assertIn("后续暂不提供安装程序", self.text)
-        self.assertIn("旧安装包保留在历史发布页", self.text)
+    def test_current_release_links_match_version(self):
+        landing = _ROOT_README_PATH.read_text(encoding="utf-8")
+        guide = _README_PATH.read_text(encoding="utf-8")
+        version = _VERSION_PATH.read_text(encoding="ascii").strip()
+        self.assertIn(f"/releases/tag/v{version}", landing)
+        self.assertIn(f"RemoteMicRC003-{version}-portable-unsigned.zip", landing)
+        self.assertIn("SHA256SUMS.txt", landing)
+        self.assertIn("https://github.com/ZSTDJan/windows-remote-mic-app/releases", guide)
+        self.assertNotIn("miaomiaozii/windows-remote-mic-app", guide)
 
 
 class RealWindowsCiEvidenceContractTests(unittest.TestCase):
-    """The Windows README must state capabilities and verification limits
-    without copying a stale result from the upstream repository.
-    """
+    """The guide must not present a build as real device acceptance."""
 
-    def setUp(self):
-        self.readme_text = _normalize_whitespace(
-            _README_PATH.read_text(encoding="utf-8")
-        )
-
-    def test_documents_supported_windows_paths(self):
-        for phrase in ("WinRT BLE", "Raw Input", "SendInput", "PortAudio"):
-            self.assertIn(phrase, self.readme_text)
-
-    def test_current_status_distinguishes_partial_verification_from_acceptance(self):
-        # Check only the current status declaration. Historical acceptance
-        # wording elsewhere must not make the current candidate pass.
-        raw_text = _README_PATH.read_text(encoding="utf-8")
-        declaration = re.search(r"^>\s*\*\*状态：([^\r\n]+?)\*\*", raw_text, re.MULTILINE)
-        self.assertIsNotNone(declaration, "README must declare its current status")
-        current_status = declaration.group(1)
-        for fact in ("1.0.71-candidate.71", "测试版", "翻页效果待实测"):
-            self.assertIn(fact, current_status)
-        self.assertNotIn("已通过真实硬件验收", current_status)
-        self.assertIn("不能替代真机配对、按键和语音链路验收", self.readme_text)
-        self.assertNotIn("verified on real rc003 hardware", self.readme_text.lower())
-
-    def test_unsigned_and_ci_limits_are_documented(self):
-        self.assertIn("未签名", self.readme_text)
-        self.assertIn("CI 没有真实 RC003 硬件", self.readme_text)
-
-    def test_repository_links_to_its_own_actions_and_releases(self):
-        self.assertIn("https://github.com/ZSTDJan/windows-remote-mic-app/releases", self.readme_text)
-        self.assertIn("https://github.com/ZSTDJan/windows-remote-mic-app/actions", self.readme_text)
-        self.assertNotIn("miaomiaozii/windows-remote-mic-app", self.readme_text)
+    def test_windows_requirement_and_unsigned_limit(self):
+        guide = _README_PATH.read_text(encoding="utf-8")
+        self.assertIn("64 位 Windows 10 1809", guide)
+        self.assertIn("未签名", guide)
+        self.assertIn("受管理的公司电脑", guide)
+        self.assertNotIn("已通过真实硬件验收", guide)
 
 
 class ApplicationUpdateDocumentationContractTests(unittest.TestCase):
-    def setUp(self):
-        self.root_readme = _ROOT_README_PATH.read_text(encoding="utf-8")
-        self.windows_readme = _README_PATH.read_text(encoding="utf-8")
-        self.installed_readme = _INSTALLED_README_PATH.read_text(encoding="utf-8")
-        self.portable_readme = _PORTABLE_README_PATH.read_text(encoding="utf-8")
-        self.user_docs = (
-            self.root_readme,
-            self.windows_readme,
-            self.installed_readme,
-            self.portable_readme,
-        )
-
-    def test_all_user_guides_document_the_manual_verified_update_entry(self):
-        self.assertIn("版本说明", self.root_readme)
-        for text in self.user_docs:
-            normalized = _normalize_whitespace(text)
-            with self.subTest(document=text[:40]):
-                if text == self.root_readme:
-                    # The landing page links to the detailed update guide.
-                    self.assertIn("[使用说明](apps/windows/rc003/README.md)", normalized)
-                    self.assertIn("SHA256SUMS.txt", normalized)
-                    continue
-                self.assertIn("检查更新", normalized)
-                if text in (self.root_readme, self.windows_readme, self.portable_readme):
-                    self.assertIn("每个自然日最多自动检查一次", normalized)
-                    self.assertIn("不会自动打开下载对话框" if text == self.windows_readme else "点击后才打开下载对话框", normalized)
-                else:
-                    # Only the historical installer guide describes its shipped version.
-                    self.assertIn("只在用户点击后", normalized)
-                    self.assertIn("后台自动", normalized)
-                self.assertIn("SHA256SUMS.txt", normalized)
-                self.assertIn("GitHub 提供资产摘要时", normalized)
-                self.assertIn(r"updates\<版本号>", normalized)
-                self.assertIn("打开桌面" if text in (self.root_readme, self.windows_readme, self.portable_readme) else "打开文件夹", normalized)
-
-    def test_distribution_guides_keep_install_and_portable_updates_separate(self):
-        installed = _normalize_whitespace(self.installed_readme)
-        portable = _normalize_whitespace(self.portable_readme)
-        source = _normalize_whitespace(self.windows_readme)
-
-        self.assertIn("安装版会下载同一次 Release 的安装器", installed)
-        self.assertIn("再手动运行已下载的安装器", installed)
-        self.assertIn("取消、中断或校验失败不会覆盖当前程序", installed)
-        self.assertIn("便携版会下载同一次 Release 的便携 ZIP", portable)
-        self.assertIn("再把 ZIP 解压到新的文件夹使用", portable)
-        self.assertIn("取消、中断或校验失败不会改变当前程序", portable)
-        self.assertIn("请直接双击打开主程序", portable)
-        self.assertIn("已有管理员权限时直接打开", portable)
-        self.assertIn("已关闭 UAC", portable)
-        self.assertIn("普通权限下", portable)
-        self.assertNotIn("不要以管理员身份长期运行", portable)
-        self.assertIn("便携版或源码运行下载便携 ZIP", source)
-        self.assertIn("不会自动运行下载文件", source)
+    def test_manual_update_never_auto_replaces_the_running_copy(self):
+        guide = _README_PATH.read_text(encoding="utf-8")
+        landing = _ROOT_README_PATH.read_text(encoding="utf-8")
+        self.assertIn("[使用说明](apps/windows/rc003/README.md)", landing)
+        self.assertIn("检查更新", guide)
+        self.assertIn("不会自动运行下载文件或覆盖当前文件夹", guide)
+        self.assertIn("把新 ZIP 解压到新文件夹", guide)
 
 
 class PortableAndInstallerFlowContractTests(unittest.TestCase):
-    """XRBM-027 RETRY 1 correction: the installer and the portable ZIP are
-    materially different distributions - the portable ZIP has no Start
-    Menu entries, no stop script, and no uninstaller. The bridge now owns a
-    notification-area exit command, so the portable flow uses that graceful
-    path and keeps Task Manager only as a last-resort fallback. Each flow
-    still needs its own settings/start/stop/removal steps, and the portable
-    steps must name the real executable and real flags this candidate ships
-    (see __main__.py's ``--settings``/no-argument handling and the shared
-    product-presentation contract consumed by the PyInstaller spec).
-    """
+    """Current distribution is a portable ZIP; installer docs are history."""
 
-    def setUp(self):
-        self.text = _README_PATH.read_text(encoding="utf-8")
-        self.normalized = _normalize_whitespace(self.text)
+    def test_portable_start_and_exit_are_usable(self):
+        guide = _README_PATH.read_text(encoding="utf-8")
+        self.assertIn("免安装 ZIP", guide)
+        self.assertIn("文件夹顶层的无线麦 EXE", guide)
+        self.assertIn("不要只把 EXE 单独取出来", _normalize_whitespace(guide))
+        self.assertIn("通知区域", guide)
+        self.assertIn("完全退出", guide)
 
-    def test_portable_settings_command_is_exact(self):
-        self.assertIn(
-            r"& '.\无线麦 win版 <版本号>.exe' --settings", self.text
-        )
-
-    def test_portable_root_exposes_the_three_named_entries(self):
-        self.assertIn("根层固定为", self.normalized)
-        self.assertIn("`无线麦 win版 <版本号>.exe`", self.text)
-        self.assertIn("`程序文件`", self.text)
-        self.assertIn("`说明与许可`", self.text)
-        self.assertIn("不需要也不应手动打开", self.normalized)
-
-    def test_portable_start_command_uses_the_explicit_bridge_flag(self):
-        # The no-argument invocation now opens the settings window, so the
-        # bridge must be started explicitly with --bridge - paired with
-        # prose that says it starts the bridge itself.
-        self.assertIn(
-            r"`& '.\无线麦 win版 <版本号>.exe' --bridge` 启动桥接", self.normalized
-        )
-
-    def test_portable_full_exit_prefers_notification_area_with_task_manager_fallback(self):
-        self.assertIn("通知区域", self.text)
-        self.assertIn("完全退出", self.text)
-        self.assertIn("正常清理 BLE、HID、语音热键与音频资源", self.normalized)
-        self.assertIn("任务管理器", self.text)
-        self.assertIn("只有托盘不可用且程序无法正常退出时", self.normalized)
-        # Must explicitly say there is no packaged stop script/Start Menu
-        # entry for the portable flow, so this isn't confused with the
-        # installer's "停止" Start Menu shortcut.
-        self.assertIn("便携版没有停止脚本", self.normalized)
-
-    def test_portable_removal_cleans_shared_permission_before_deleting_folder(self):
-        self.assertIn("点击“移除权限”并确认一次 UAC", self.normalized)
-        self.assertIn("再删除整个解压文件夹", self.normalized)
-        self.assertIn("不会自动删除已授权助手", self.normalized)
-        portable_readme = _normalize_whitespace(
-            _PORTABLE_README_PATH.read_text(encoding="utf-8")
-        )
-        for text in (self.normalized, portable_readme):
-            self.assertIn("所有无线麦版本", text)
-            self.assertIn("重新启用", text)
-            self.assertIn("再次确认 UAC", text)
-
-    def test_portable_uses_one_uac_then_normal_startup_and_login_startup(self):
-        portable_readme = _normalize_whitespace(
-            _PORTABLE_README_PATH.read_text(encoding="utf-8")
-        )
-        for text in (self.normalized, portable_readme):
-            self.assertIn("建议打开管理员按键权限", text)
-            self.assertIn("“打开”", text)
-            self.assertIn("“不打开”", text)
-            self.assertIn("确认一次", text)
-            self.assertIn("普通", text)
-            self.assertIn("随 Windows 启动", text)
-            self.assertIn("不再反复弹 UAC", text)
-            self.assertIn("移除权限", text)
-        self.assertNotIn("便携版本身不会安装预授权 HID 助手", self.text)
-        self.assertNotIn("手动以管理员身份启动便携版", self.text)
-
-    def test_installer_flow_still_retains_start_menu_settings_start_stop_uninstall(self):
-        installer_section_start = self.text.index("方式一：安装器")
-        installer_section_end = self.text.index("方式二：便携版")
-        installer_section = self.text[installer_section_start:installer_section_end]
-        for entry in ("设置", "启动", "停止", "卸载"):
-            self.assertIn(entry, installer_section)
-        self.assertIn("Start Menu", installer_section)
-
-    def test_portable_flow_explicitly_denies_start_menu_entries(self):
-        portable_section_start = self.text.index("方式二：便携版")
-        portable_section_end = self.text.index("### 配对小米遥控器2 Pro")
-        portable_section = self.text[portable_section_start:portable_section_end]
-        self.assertIn("没有", portable_section)
-        self.assertIn("Start Menu", portable_section)
-
-    def test_installer_and_portable_steps_are_documented_in_separate_subsections(self):
-        self.assertIn("**安装器用户**", self.text)
-        self.assertIn("**便携版 ZIP 用户**", self.text)
-        installer_index = self.text.index("**安装器用户**")
-        portable_index = self.text.index("**便携版 ZIP 用户**")
-        self.assertLess(installer_index, portable_index)
+    def test_user_data_survives_portable_folder_deletion(self):
+        guide = _README_PATH.read_text(encoding="utf-8")
+        self.assertIn(r"%LOCALAPPDATA%\RemoteMic\RC003", guide)
+        self.assertIn("不会自动删除这里的数据", guide)
+        self.assertIn("移动或删除", guide)
+        self.assertIn("随 Windows 启动", guide)
 
 
 class ConfigLogResidueDisclosureContractTests(unittest.TestCase):
-    """XRBM-027 CORRECTION 1: neither uninstalling via the installer nor
-    deleting the portable ZIP's extracted folder removes the runtime
-    settings/log files, because both write to the same
-    ``config.config_root()`` location and the .iss source has no
-    ``UninstallDelete`` rule for them. Both public docs must disclose this
-    honestly, and the literal path/filename strings they use must be
-    cross-checked against the real runtime constants so a future rename in
-    config.py/logging_setup.py can't silently leave the docs wrong.
-    """
+    """The current portable guide must identify retained user data."""
 
-    def setUp(self):
-        self.readme_text = _normalize_whitespace(
-            _README_PATH.read_text(encoding="utf-8")
-        )
-        self.installed_readme_text = _normalize_whitespace(
-            _INSTALLED_README_PATH.read_text(encoding="utf-8")
-        )
-        self.both = (self.readme_text, self.installed_readme_text)
-        self.iss_text = _ISS_PATH.read_text(encoding="utf-8")
+    def test_config_root_matches_runtime_and_is_not_removed_with_zip(self):
+        guide = _README_PATH.read_text(encoding="utf-8")
+        expected = r"%LOCALAPPDATA%\{}\{}".format(config.APP_ID, config.PRODUCT_ID)
+        self.assertIn(expected, guide)
+        self.assertIn("配置和日志位于", guide)
+        self.assertIn("不会自动删除这里的数据", guide)
 
-    def test_documented_path_and_filenames_match_the_real_runtime_constants(self):
-        # Not hardcoded literals independent of the source of truth: derive
-        # the exact strings from config.py/logging_setup.py themselves, so
-        # a future rename of APP_ID/PRODUCT_ID/CONFIG_FILENAME/
-        # KEY_BINDINGS_FILENAME/LOG_FILENAME breaks this test instead of
-        # silently leaving the docs pointing at a stale path/filename.
-        expected_root = r"%LOCALAPPDATA%\{}\{}".format(
-            config.APP_ID, config.PRODUCT_ID
-        )
-        for text in self.both:
-            self.assertIn(expected_root, text)
-            self.assertIn(config.CONFIG_FILENAME, text)
-            self.assertIn(config.KEY_BINDINGS_FILENAME, text)
-            self.assertIn(logging_setup.LOG_FILENAME, text)
-            # The log file lives in a "logs" subdirectory of config_root(),
-            # not directly inside it (see logging_setup.get_logger()).
-            self.assertIn("logs" + "\\" + logging_setup.LOG_FILENAME, text)
-
-    def test_uninstall_delete_is_limited_to_fixed_upgrade_backups(self):
-        uninstall_delete = _strip_semicolon_comments(
-            _iss_section(self.iss_text, "UninstallDelete")
-        )
-        self.assertIn(r'{app}\.installing-previous', uninstall_delete)
-        self.assertIn(
-            r'{app}\{#AppExeName}.installing-previous',
-            uninstall_delete,
-        )
+    def test_historical_installer_does_not_delete_user_data(self):
+        iss = _ISS_PATH.read_text(encoding="utf-8")
+        uninstall_delete = _strip_semicolon_comments(_iss_section(iss, "UninstallDelete"))
         for user_data in ("config.json", "key_bindings.json", "logs", "captures"):
             self.assertNotIn(user_data, uninstall_delete)
 
-    def test_uninstall_does_not_claim_full_directory_removal(self):
-        for text in self.both:
-            self.assertNotIn("不留系统级文件", text)
-        # The installed readme previously claimed uninstall deletes "安装
-        # 目录" (the whole install directory) outright - inaccurate, since
-        # config_root() is the SAME directory the installer uses
-        # (DefaultDirName={localappdata}\RemoteMic\{#AppFolder}) and
-        # runtime-written files there are never enumerated by Setup, so
-        # Inno's uninstaller does not know to remove them.
-        self.assertNotIn(
-            "卸载过程会先自动停止正在运行的桥接进程，再删除安装目录",
-            self.installed_readme_text,
-        )
-
-    def test_both_docs_disclose_settings_and_logs_survive_removal(self):
-        for text in self.both:
-            self.assertIn("卸载不会自动删除设置和日志", text)
-
-    def test_both_docs_offer_conditional_manual_cleanup(self):
-        # Must be conditional (only when no other RC003 install on the same
-        # machine needs the shared directory) - not an unconditional "just
-        # delete it" instruction, since the installer and portable builds
-        # share the exact same config_root() on one machine.
-        for text in self.both:
-            self.assertIn("如果还会用到", text)
-            self.assertIn("请不要删除这个共享目录", text)
-
-    def test_portable_removal_step_names_config_root_not_just_the_extracted_folder(self):
-        # The portable "uninstall/removal" step specifically must not stop
-        # at "delete the extracted folder" - it must name the separate,
-        # shared config_root() location too.
-        portable_section_start = self.readme_text.index("**便携版 ZIP 用户**")
-        portable_section = self.readme_text[portable_section_start:]
-        self.assertIn("便携版运行时同样会把", portable_section)
-        self.assertIn(config.CONFIG_FILENAME, portable_section)
-
 
 class WindowsPrereleaseAssetScopeContractTests(unittest.TestCase):
-    """XRBM-027 CORRECTION 1: a bare "every prerelease has exactly these
-    three files" claim must not be read as covering unrelated releases or
-    other product variants.
-    """
-
-    def setUp(self):
-        self.text = _README_PATH.read_text(encoding="utf-8")
-
-    def test_asset_count_claim_is_scoped_to_the_windows_candidate(self):
-        self.assertIn("新发布的 RC003 Windows 版本包含以下两个附件", self.text)
-        self.assertNotIn("每个预发行版恰好包含以下三个文件", self.text)
+    def test_download_instructions_name_only_this_release_assets(self):
+        landing = _ROOT_README_PATH.read_text(encoding="utf-8")
+        version = _VERSION_PATH.read_text(encoding="ascii").strip()
+        self.assertIn(f"RemoteMicRC003-{version}-portable-unsigned.zip", landing)
+        self.assertIn("SHA256SUMS.txt", landing)
+        self.assertNotIn("每个预发行版恰好包含以下三个文件", landing)
 
 
 def _spec_hidden_imports(text: str) -> list:
