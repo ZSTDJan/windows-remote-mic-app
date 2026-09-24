@@ -1,12 +1,17 @@
 # Changelog — 无线麦 RC003 (Windows)
 
 候选阶段使用持续递增的 `candidate.N` 测试序号。内部构建版本号唯一来源是
-`src/ovb_rc003/VERSION`（当前 `1.0.72-candidate.72`），程序、冻结构建和
+`src/ovb_rc003/VERSION`（当前 `1.0.72`），程序、冻结构建和
 包装都读取该文件。新发布 tag 为 `v<VERSION>`，历史 tag 与包名保持原样。
 
 正式版把最终采用的候选序号放在最后一位：采用 `candidate.30` 时发布为 `v1.0.30`，
 后续候选继续从 `candidate.31` 递增。正式 tag 不带 `windows`、`rc003` 或 `candidate`。
 完整命名规则以 `VALIDATION-AND-DELIVERY.md` 的“版本与命名规则”为准。
+
+## [1.0.72] — 2026-09-24
+
+- 采用第 72 次候选源码发布正式版；按键、语音及图标沿用以下已完成改动。
+- 不提供滚轮向上／向下映射入口。`PageUp`／`PageDown` 在高权限浏览器窗口的遥控器实测尚未通过，不将其写为已解决。
 
 ## [1.0.72-candidate.72] — 2026-09-24
 

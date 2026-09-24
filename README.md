@@ -12,9 +12,9 @@
 
 ## 下载与版本
 
-**[下载正式版 1.0.44](https://github.com/ZSTDJan/windows-remote-mic-app/releases/download/v1.0.44/RemoteMicRC003-1.0.44-portable-unsigned.zip)** · [下载新版测试包 1.0.72-candidate.72](https://github.com/ZSTDJan/windows-remote-mic-app/releases/download/v1.0.72-candidate.72/RemoteMicRC003-1.0.72-candidate.72-portable-unsigned.zip) · [测试版版本说明](https://github.com/ZSTDJan/windows-remote-mic-app/releases/tag/v1.0.72-candidate.72) · [SHA256SUMS.txt](https://github.com/ZSTDJan/windows-remote-mic-app/releases/download/v1.0.72-candidate.72/SHA256SUMS.txt)
+**[下载正式版 1.0.72](https://github.com/ZSTDJan/windows-remote-mic-app/releases/download/v1.0.72/RemoteMicRC003-1.0.72-portable-unsigned.zip)** · [版本说明](https://github.com/ZSTDJan/windows-remote-mic-app/releases/tag/v1.0.72) · [SHA256SUMS.txt](https://github.com/ZSTDJan/windows-remote-mic-app/releases/download/v1.0.72/SHA256SUMS.txt)
 
-当前正式版为 **1.0.44**；新版测试包为 **1.0.72-candidate.72**，支持小米蓝牙语音遥控器 2 Pro 和图示谷歌 Chromecast 遥控器。具体功能与界面以下载的版本为准。
+当前正式版为 **1.0.72**，支持小米蓝牙语音遥控器 2 Pro 和图示谷歌 Chromecast 遥控器。具体功能与界面以下载的版本为准。
 
 完整解压 ZIP 后运行其中的 `无线麦 win版 <版本号>.exe`，不要只取出 EXE。程序未签名，Windows 可能弹出安全提示；请从本仓库下载。
 
