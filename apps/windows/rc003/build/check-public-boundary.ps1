@@ -183,10 +183,9 @@ $brandingCheckExemptRelativePaths = @(
     # never writes autostart. It also never elevates Remote Mic itself and
     # remains disabled unless the user selects a provider.
     "src/ovb_rc003/voice_program_manager.py",
-    # README.md/ATTRIBUTION.md document this same disclosed "runas"/UAC
-    # vendor-launch mechanism in prose - the word itself is documentation,
-    # not a directive.
-    "README.md",
+    # ATTRIBUTION.md documents the disclosed "runas"/UAC vendor launch.
+    # The concise README no longer contains an elevation implementation
+    # marker, so it stays subject to the normal scanner rules.
     "ATTRIBUTION.md"
 )
 

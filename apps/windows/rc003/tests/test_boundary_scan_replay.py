@@ -125,13 +125,8 @@ _BRANDING_CHECK_EXEMPT_RELATIVE_PATHS = {
     Path("installer/RemoteMicRC003Setup.iss"),
     Path("src/ovb_rc003/vb_cable_bundle.py"),
     Path("src/ovb_rc003/voice_program_manager.py"),
-    # XRBM-031: README.md/ATTRIBUTION.md document the same disclosed
-    # "runas"/UAC vendor-launch mechanism in prose (see README.md's
-    # "VB-CABLE driver helper" section and ATTRIBUTION.md's
-    # qt_settings_app.py/vb_cable_bundle.py rows) - the word itself is
-    # documentation, not a directive, matching installer/readme-rc003.txt's
-    # own precedent above.
-    Path("README.md"),
+    # ATTRIBUTION.md documents the vendor's "runas"/UAC launch. The concise
+    # README no longer has this marker and must pass the normal scan.
     Path("ATTRIBUTION.md"),
 }
 
@@ -334,10 +329,11 @@ class BoundaryScanReplayTests(unittest.TestCase):
         self.assertNotIn("PrivilegesRequired=admin", effective)
         self.assertNotIn("userstartup", effective.casefold())
 
-    def test_readme_is_exempt_only_for_its_documented_elevation_reason(self):
+    def test_readme_is_scanned_without_an_elevation_exemption(self):
         path = _RC003_ROOT / "README.md"
         text = path.read_text(encoding="utf-8")
-        self.assertTrue(any(marker in text for marker in _ELEVATION_MARKERS))
+        self.assertNotIn(Path("README.md"), _BRANDING_CHECK_EXEMPT_RELATIVE_PATHS)
+        self.assertFalse(any(marker in text for marker in _ELEVATION_MARKERS))
         self.assertFalse(any(pattern.search(text) for pattern in _FORBIDDEN_BRANDING_PATTERNS))
         self.assertFalse(any(marker in text for marker in _AUTOSTART_MARKERS))
 
