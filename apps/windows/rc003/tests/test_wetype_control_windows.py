@@ -1,10 +1,12 @@
-import inspect
+from tests.source_contract import source_text
 import threading
+import time
 import unittest
 from contextlib import contextmanager
 from unittest import mock
 
 from ovb_rc003 import wetype_control_windows, win32_input
+from ovb_rc003 import doubao_input_profile_windows as directed
 
 
 def profile(seed, *, flags=2):
@@ -144,11 +146,13 @@ class InputProfileTests(unittest.TestCase):
             wetype_control_windows,
             "_profile_registry_text",
             side_effect=profile_registry_text,
-        ):
+        ), mock.patch.object(directed, "current_target", return_value="target"), \
+                mock.patch.object(directed, "activate_for_target", return_value=(True, "target")) as switch:
             switched = wetype_control_windows._activate_doubao_input_profile()
 
         self.assertTrue(switched)
-        self.assertEqual(manager.activations, [DOUBAO_PROFILE])
+        self.assertEqual(manager.activations, [])
+        self.assertEqual(switch.call_args.args[0], DOUBAO_PROFILE)
 
     def test_unconfirmed_activation_restores_the_previous_profile(self):
         manager = FakeProfileManager(
@@ -259,6 +263,84 @@ class InputProfileTests(unittest.TestCase):
 
 
 class StaThreadTests(unittest.TestCase):
+    def test_voice_joins_selection_once_and_cancel_does_not_cancel_selection(self):
+        release = threading.Event()
+        calls = []
+        def activation():
+            calls.append(True)
+            release.wait(1)
+            return True
+        with mock.patch.object(wetype_control_windows, "_activate_doubao_for_voice_start", activation):
+            source = wetype_control_windows.begin_input_profile_selection("doubao_ime")
+            try:
+                observer = wetype_control_windows._start_sta_operation(activation)
+                observer.cancel()
+                with self.assertRaises(wetype_control_windows.InputProfilePreparationError):
+                    observer.result(0.1)
+                self.assertFalse(source.cancel_event.is_set())
+                second = wetype_control_windows._start_sta_operation(activation)
+                release.set()
+                self.assertTrue(second.result(0.5))
+                self.assertEqual(calls, [True])
+            finally:
+                release.set()
+                self.assertTrue(source.settled.wait(1))
+
+    def test_selection_wait_cannot_extend_deadline_or_start_another_provider(self):
+        release = threading.Event()
+        def activation():
+            release.wait(1)
+            return True
+        with mock.patch.object(wetype_control_windows, "_activate_doubao_for_voice_start", activation):
+            source = wetype_control_windows.begin_input_profile_selection("doubao_ime")
+            try:
+                with self.assertRaises(wetype_control_windows.InputProfilePreparationError):
+                    wetype_control_windows._start_sta_operation(lambda: True)
+                waiter = wetype_control_windows._start_sta_operation(activation)
+                source.deadline = time.monotonic() - 1
+                with self.assertRaises(wetype_control_windows.InputProfilePreparationError):
+                    waiter.result(5)
+                release.set()
+                self.assertTrue(source.settled.wait(1))
+                with self.assertRaises(TimeoutError):
+                    source.result(0)
+            finally:
+                release.set()
+                source.settled.wait(1)
+
+    def test_failed_selection_is_not_success_for_joined_voice(self):
+        release = threading.Event()
+        def activation():
+            release.wait(1)
+            raise OSError("activation failed")
+        with mock.patch.object(wetype_control_windows, "_activate_doubao_for_voice_start", activation):
+            source = wetype_control_windows.begin_input_profile_selection("doubao_ime")
+            try:
+                waiter = wetype_control_windows._start_sta_operation(activation)
+                release.set()
+                with self.assertRaises(wetype_control_windows.InputProfilePreparationError):
+                    waiter.result(0.5)
+            finally:
+                release.set()
+                source.settled.wait(1)
+
+    def test_selection_cancel_after_activation_does_not_switch_back(self):
+        cancel = threading.Event()
+        manager = FakeProfileManager([PREVIOUS_PROFILE], [DOUBAO_PROFILE])
+        def activate(target, **_kwargs):
+            manager.activations.append(target)
+            cancel.set()
+            raise TimeoutError("selection cancelled")
+        with mock.patch.object(wetype_control_windows, "_InputProfileManager", return_value=manager), \
+                mock.patch.object(wetype_control_windows, "_profile_registry_text", side_effect=profile_registry_text), \
+                mock.patch.object(directed, "current_target", return_value="target"), \
+                mock.patch.object(directed, "activate_for_target", side_effect=activate):
+            source = wetype_control_windows.begin_input_profile_selection("doubao_ime", cancel_event=cancel)
+            with self.assertRaises(TimeoutError):
+                source.result(0.5)
+            self.assertTrue(source.settled.wait(1))
+        self.assertEqual(manager.activations, [DOUBAO_PROFILE])
+
     def test_callback_runs_on_a_different_thread(self):
         caller_thread = threading.get_ident()
         worker_thread = wetype_control_windows._run_on_sta_thread(
@@ -478,6 +560,16 @@ class WeTypeMicTimestampTests(unittest.TestCase):
 
 
 class WeTypeVoiceControlTests(unittest.TestCase):
+    def test_failed_selection_preparation_never_falls_back_to_press(self):
+        press = mock.Mock()
+        def failed(callback):
+            raise wetype_control_windows.InputProfilePreparationError("selection timed out")
+        control = wetype_control_windows.WeTypeVoiceControl(
+            run_sta=failed, press_keys=press, mic_start_reader=None,
+        )
+        self.assertFalse(control.start(("lctrl", "lwin")))
+        press.assert_not_called()
+
     VOICE_KEYS = ("lctrl", "lshift", "f9")
 
     def tearDown(self):
@@ -580,7 +672,10 @@ class WeTypeVoiceControlTests(unittest.TestCase):
         self.assertFalse(controller.cleanup_pending)
 
     def test_failed_release_stays_pending_and_blocks_a_new_start(self):
-        release_results = [OSError("failed"), None]
+        release_results = [
+            win32_input.InputCleanupIncompleteError("right Alt still down"),
+            None,
+        ]
         activations = []
 
         def release(_keys):
@@ -599,6 +694,51 @@ class WeTypeVoiceControlTests(unittest.TestCase):
         self.assertFalse(controller.start(("ralt",)))
         self.assertEqual(len(activations), 1)
         self.assertTrue(controller.stop())
+        self.assertFalse(controller.cleanup_pending)
+
+    def test_swallowed_right_alt_up_remains_reachable_for_later_cleanup(self):
+        ralt = win32_input.win32_keys.VK_CODES["ralt"]
+        confirmation = mock.Mock(generation=7, installation_epoch=11)
+        guard = win32_input.voice_key_physicalizer_windows.PhysicalReleaseGuard(
+            generation=7,
+            installation_epoch=11,
+            callback_revision=3,
+        )
+        release_calls = []
+
+        def state_query(vk):
+            if len(release_calls) != 1:
+                return False
+            return win32_input._real_async_key_state_observation(
+                vk,
+                _context_query=lambda: win32_input._real_key_state_query_context(
+                    _desktop_query=lambda: "Default",
+                    _current_integrity_query=lambda: 8192,
+                    _foreground_query=lambda: (10, 20, 12288),
+                ),
+                _query=lambda _vk: 0,
+            )
+
+        def release(keys):
+            release_calls.append(tuple(keys))
+            win32_input._ensure_right_alt_release_completed(
+                ralt,
+                confirmation,
+                _state_query=state_query,
+                _guard_query=lambda _vk: guard,
+                _ambiguous_owner_query=lambda _vk: False,
+                _sleep=lambda _seconds: None,
+                _clock=iter((0.0, 1.0)).__next__,
+            )
+
+        controller = self.make_controller(release_keys=release)
+        self.assertTrue(controller.start(self.VOICE_KEYS))
+
+        self.assertFalse(controller.stop())
+        self.assertTrue(controller.cleanup_pending)
+        self.assertFalse(controller.start(("ralt",)))
+        self.assertTrue(controller.stop())
+        self.assertEqual(release_calls, [self.VOICE_KEYS, self.VOICE_KEYS])
         self.assertFalse(controller.cleanup_pending)
 
     def test_generation_advances_only_when_a_new_session_begins(self):
@@ -623,7 +763,7 @@ class WeTypeVoiceControlTests(unittest.TestCase):
         self.assertFalse(controller.cleanup_pending)
 
     def test_controller_has_no_status_bar_or_mouse_click_fallback(self):
-        source = inspect.getsource(wetype_control_windows)
+        source = source_text(wetype_control_windows)
         self.assertNotIn("wetype.statusbar.window", source)
         self.assertNotIn("PostMessageW", source)
         self.assertNotIn("WM_LBUTTON", source)
@@ -647,7 +787,7 @@ class WeTypeVoiceControlTests(unittest.TestCase):
 
     def test_microphone_confirmation_recovers_once_then_succeeds(self):
         calls = []
-        readings = iter((10, 10, 10, 11))
+        readings = iter((10,) * 13 + (11,))
         controller = self.make_controller(
             mic_start_reader=lambda: next(readings),
             on_confirmation=lambda generation, success: calls.append(
@@ -675,10 +815,9 @@ class WeTypeVoiceControlTests(unittest.TestCase):
 
     def test_microphone_confirmation_fails_after_all_recovery_retries(self):
         confirmations = []
-        readings = iter((10,) * 8)
         revivals = []
         controller = self.make_controller(
-            mic_start_reader=lambda: next(readings),
+            mic_start_reader=lambda: 10,
             on_confirmation=lambda generation, success: confirmations.append(
                 (generation, success)
             ),
@@ -691,6 +830,145 @@ class WeTypeVoiceControlTests(unittest.TestCase):
 
         self.assertEqual(confirmations, [(1, False)])
         self.assertEqual(len(revivals), 3)
+
+    def test_fast_confirmation_registers_before_result_and_stops_after_ready(self):
+        clock, calls = [0.0], []
+        controller = self.make_controller(
+            mic_start_reader=lambda: 11 if clock[0] >= .05 else 10,
+            on_started=lambda generation: calls.append(("registered", generation)),
+            on_confirmation=lambda generation, ok: calls.append(("confirmed", generation, ok, clock[0])),
+            sleep=lambda delay: clock.__setitem__(0, clock[0] + delay),
+            thread_factory=_ImmediateThread,
+        )
+        with mock.patch.object(wetype_control_windows.time, "monotonic", side_effect=lambda: clock[0]):
+            self.assertTrue(controller.start(self.VOICE_KEYS))
+        self.assertEqual(calls, [("registered", 1), ("confirmed", 1, True, .05)])
+        self.assertFalse(controller.confirmation_pending)
+        self.assertTrue(controller.stop())
+
+    def test_never_ready_has_bounded_queries_and_keeps_original_retry_times(self):
+        clock, reads, retries, confirmations = [0.0], [], [], []
+        controller = self.make_controller(
+            mic_start_reader=lambda: reads.append(clock[0]) or 10,
+            revive_profile=lambda: retries.append(clock[0]) or True,
+            on_confirmation=lambda gen, ok: confirmations.append((gen, ok)),
+            sleep=lambda delay: clock.__setitem__(0, clock[0] + delay),
+            thread_factory=_ImmediateThread,
+        )
+        with mock.patch.object(wetype_control_windows.time, "monotonic", side_effect=lambda: clock[0]):
+            self.assertTrue(controller.start(self.VOICE_KEYS))
+        self.assertEqual(len(reads), 18)  # baseline + 10 fast + final + 3 * (baseline + final)
+        self.assertEqual([round(t, 3) for t in retries], [.7, 3.4, 7.1])
+        self.assertAlmostEqual(clock[0], 12.8)
+        self.assertEqual(confirmations, [(1, False)])
+        self.assertFalse(controller.confirmation_pending)
+        self.assertTrue(controller.stop())
+        self.assertFalse(controller.cleanup_pending)
+
+    def test_slow_query_does_not_catch_up_with_burst_of_overdue_probes(self):
+        clock, count = [0.0], [0]
+        def read():
+            count[0] += 1
+            clock[0] += .6
+            return 10
+        controller = self.make_controller(
+            mic_start_reader=read, revive_profile=None,
+            sleep=lambda delay: clock.__setitem__(0, clock[0] + delay),
+            thread_factory=_ImmediateThread,
+        )
+        with mock.patch.object(wetype_control_windows.time, "monotonic", side_effect=lambda: clock[0]):
+            self.assertTrue(controller.start(self.VOICE_KEYS))
+        self.assertEqual(count[0], 3)  # baseline, one slow fast query, final check
+        self.assertFalse(controller.confirmation_pending)
+        self.assertTrue(controller.stop())
+
+    def test_one_slow_query_does_not_run_remaining_probes_back_to_back(self):
+        clock, reads = [0.0], []
+        def read():
+            reads.append(clock[0])
+            if len(reads) == 2:
+                clock[0] += .3
+            return 10
+        controller = self.make_controller(
+            mic_start_reader=read, revive_profile=None,
+            sleep=lambda delay: clock.__setitem__(0, clock[0] + delay),
+            thread_factory=_ImmediateThread,
+        )
+        with mock.patch.object(wetype_control_windows.time, "monotonic", side_effect=lambda: clock[0]):
+            self.assertTrue(controller.start(self.VOICE_KEYS))
+        self.assertTrue(all(b - a >= .049 for a, b in zip(reads, reads[1:])))
+        self.assertLessEqual(len(reads), 8)
+        self.assertTrue(controller.stop())
+
+    def test_confirmation_thread_start_failure_does_not_leave_pending_flag(self):
+        thread = mock.Mock()
+        thread.start.side_effect = RuntimeError("thread unavailable")
+        controller = self.make_controller(
+            mic_start_reader=lambda: 10, thread_factory=lambda **_: thread)
+        self.assertTrue(controller.start(self.VOICE_KEYS))
+        self.assertFalse(controller.confirmation_pending)
+        self.assertTrue(controller.stop())
+        self.assertFalse(controller.cleanup_pending)
+
+    def test_blocked_query_does_not_lock_release_or_clear_next_confirmation(self):
+        entered, proceed = threading.Event(), threading.Event()
+        pending, confirmations, reads = [], [], [0]
+        def read():
+            reads[0] += 1
+            if reads[0] == 2:
+                entered.set()
+                if not proceed.wait(2):
+                    raise TimeoutError("test query release missing")
+            return 20 if reads[0] in (2, 4) else 10
+        def spawn(**options):
+            pending.append(options["target"])
+            return mock.Mock()
+        controller = self.make_controller(
+            mic_start_reader=read, thread_factory=spawn, sleep=lambda _: None,
+            on_confirmation=lambda gen, ok: confirmations.append((gen, ok)),
+        )
+        self.assertTrue(controller.start(self.VOICE_KEYS))
+        old = threading.Thread(target=pending[0], daemon=True)
+        old.start()
+        try:
+            self.assertTrue(entered.wait(1))
+            self.assertTrue(controller.stop())
+            self.assertFalse(controller.confirmation_pending)
+            self.assertTrue(controller.start(self.VOICE_KEYS))
+            self.assertTrue(controller.confirmation_pending)
+        finally:
+            proceed.set()
+            old.join(1)
+        self.assertFalse(old.is_alive())
+        self.assertTrue(controller.confirmation_pending)
+        self.assertEqual(confirmations, [])
+        pending[1]()
+        self.assertEqual(confirmations, [(2, True)])
+        self.assertTrue(controller.stop())
+
+    def test_confirmation_error_clears_pending_and_allows_next_hold_after_release(self):
+        controller = self.make_controller(
+            mic_start_reader=mock.Mock(side_effect=[10, OSError("query failed"), 10, 20]),
+            sleep=lambda _: None, thread_factory=_ImmediateThread,
+        )
+        self.assertTrue(controller.start(self.VOICE_KEYS))
+        self.assertFalse(controller.confirmation_pending)
+        self.assertTrue(controller.stop())
+        self.assertTrue(controller.start(self.VOICE_KEYS))
+        self.assertFalse(controller.confirmation_pending)
+        self.assertTrue(controller.stop())
+
+    def test_registration_failure_keeps_pressed_keys_owned_for_cleanup(self):
+        released = []
+        controller = self.make_controller(
+            on_started=mock.Mock(side_effect=OSError("registration failed")),
+            release_keys=lambda keys: released.append(tuple(keys)),
+        )
+        self.assertFalse(controller.start(self.VOICE_KEYS))
+        self.assertTrue(controller.cleanup_pending)
+        self.assertFalse(controller.confirmation_pending)
+        self.assertTrue(controller.stop())
+        self.assertEqual(released, [self.VOICE_KEYS])
 
 
 class _ImmediateThread:
@@ -832,6 +1110,85 @@ class WeTypePlaybackMuteProtectionTests(unittest.TestCase):
 
 
 class DoubaoVoiceControlTests(unittest.TestCase):
+    def test_start_timeout_cancels_starting_generation_until_sta_settles(self):
+        activation_started = threading.Event()
+        allow_activation = threading.Event()
+        activation_count = 0
+        pressed = []
+
+        def activate():
+            nonlocal activation_count
+            activation_count += 1
+            if activation_count == 1:
+                activation_started.set()
+                allow_activation.wait(1.0)
+            return True
+
+        controller = wetype_control_windows.DoubaoVoiceControl(
+            activate_profile=activate,
+            press_keys=lambda keys: pressed.append(tuple(keys)),
+            release_keys=lambda _keys: None,
+        )
+        try:
+            with mock.patch.object(
+                wetype_control_windows,
+                "_STA_RESULT_TIMEOUT_SECONDS",
+                0.01,
+            ):
+                self.assertFalse(controller.start(("ralt",)))
+            self.assertTrue(activation_started.is_set())
+            self.assertEqual(pressed, [])
+            self.assertTrue(controller.cleanup_pending)
+            self.assertFalse(controller.stop())
+        finally:
+            allow_activation.set()
+
+        deadline = time.monotonic() + 1.0
+        while wetype_control_windows._STA_OPERATION_LOCK.locked():
+            if time.monotonic() >= deadline:
+                self.fail("timed-out STA start did not settle")
+            time.sleep(0.01)
+
+        self.assertFalse(controller.cleanup_pending)
+        self.assertTrue(controller.stop())
+        self.assertTrue(controller.start(("ralt",)))
+        self.assertEqual(pressed, [("ralt",)])
+        self.assertTrue(controller.stop())
+
+    def test_prepare_timeout_retains_sta_owner_until_worker_settles(self):
+        activation_started = threading.Event()
+        allow_activation = threading.Event()
+        pressed = []
+
+        def activate():
+            activation_started.set()
+            allow_activation.wait(1.0)
+            return True
+
+        controller = wetype_control_windows.DoubaoVoiceControl(
+            activate_profile=activate,
+            press_keys=lambda keys: pressed.append(tuple(keys)),
+        )
+        try:
+            with mock.patch.object(
+                wetype_control_windows,
+                "_STA_RESULT_TIMEOUT_SECONDS",
+                0.01,
+            ):
+                prepared = controller.prepare(("ralt",))
+            self.assertTrue(activation_started.is_set())
+            self.assertIsNotNone(prepared)
+            self.assertFalse(prepared.ready)
+            self.assertFalse(prepared.settled)
+            controller.cancel_prepared(prepared)
+            self.assertFalse(controller.dispatch_prepared(prepared))
+        finally:
+            allow_activation.set()
+
+        self.assertTrue(prepared.wait_settled(1.0))
+        self.assertEqual(pressed, [])
+        self.assertFalse(controller.cleanup_pending)
+
     def test_start_activates_doubao_then_owns_the_hold_until_stop(self):
         calls = []
         controller = wetype_control_windows.DoubaoVoiceControl(

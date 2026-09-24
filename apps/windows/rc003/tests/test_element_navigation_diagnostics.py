@@ -20,7 +20,8 @@ from ovb_rc003.diagnostic_trace import DiagnosticTrace
 
 prototype = runtime._load_prototype()
 host = prototype._load_element_navigation_windows_host()
-TREE = ast.parse(Path(host.__file__).read_text(encoding="utf-8"))
+TREE = ast.parse((Path(__file__).resolve().parents[1] / "scripts" /
+                  "element_navigation_windows_host.py").read_text(encoding="utf-8"))
 RUN = next(n for n in TREE.body if isinstance(n, ast.FunctionDef) and n.name == "_run_windows")
 
 
@@ -112,18 +113,34 @@ class NavigationDiagnosticsTests(unittest.TestCase):
         self.ns["shutting_down"] = True
         self.assertFalse(claim(host.VK_UP))
 
-    def test_mapped_local_action_reaches_real_worker_queue_and_moves_selection(self):
+    def test_mapped_remote_action_reaches_worker_without_owning_keyboard(self):
         self.scan()
         self.worker.selected = 0
         self.host_actions()
         self.ns["active"].set()
+        self.ns["intercepting"].set()
+        self.ns.update(shutting_down=False, navigation_root_hwnd=42,
+                       navigation_process_id=123,
+                       navigation_action_for_foreground=lambda hwnd: "sync" if hwnd == 42 else "leave",
+                       native_menu_mode_active=lambda: False,
+                       enqueue_keyboard_action=lambda action: self.ns["keyboard_events"].put((action, 0)))
+        load_host_nodes(self.ns, "route_mapped_key")
         self.worker.post = lambda action, value: self.worker._move(host.Direction(value)) if action == "move" else None
-        local = host._LocalNavigationInput(lambda vk: True,
-            lambda action: self.ns["keyboard_events"].put((action, 0)), self.diagnostics)
-        embedded = host.EmbeddedElementNavigationRuntime(mock.Mock(), mock.Mock(), mock.Mock(), local)
+        embedded = host.EmbeddedElementNavigationRuntime(
+            mock.Mock(), mock.Mock(), mock.Mock(),
+            mapped_input=self.ns["route_mapped_key"],
+        )
+        self.assertFalse(embedded.route_local_key(host.VK_RIGHT, True, False, False))
         self.assertTrue(embedded.route_mapped_key(host.VK_RIGHT))
         self.ns["drain_events"]()
         self.assertEqual(self.worker.selected, 1)
+        self.ns["user32"].GetForegroundWindow = lambda: 99
+        self.assertFalse(embedded.route_mapped_key(host.VK_LEFT))
+        self.ns["user32"].GetForegroundWindow = lambda: 42
+        self.ns["native_menu_mode_active"] = lambda: True
+        self.assertFalse(embedded.route_mapped_key(host.VK_RETURN))
+        self.ns["intercepting"].clear()
+        self.assertFalse(embedded.route_mapped_key(host.VK_RIGHT))
 
     def scan(self, count=2, token=7):
         def enumerate_window(*args, **kwargs):
@@ -247,6 +264,7 @@ class NavigationDiagnosticsTests(unittest.TestCase):
         hook._intercepting = hook._active
         hook._down, hook._swallowed, hook._passthrough = set(), set(), set()
         hook._pressed, hook._include_developer_hotkeys = lambda _: False, False
+        hook._include_toggle_hotkey = True
         hook._on_action = mock.Mock()
         hook._direction_input_ownership = mock.Mock(
             route=mock.Mock(return_value=(False, None)),

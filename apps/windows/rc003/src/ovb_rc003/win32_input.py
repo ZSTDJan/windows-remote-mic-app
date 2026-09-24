@@ -49,7 +49,16 @@ from . import diagnostic_trace, raw_input_windows, voice_key_physicalizer_window
 
 VOICE_EVENT_EXTRA_INFO = voice_key_physicalizer_windows.VOICE_EVENT_EXTRA_INFO
 _VOICE_EVENT_CONFIRM_TIMEOUT_SECONDS = 1.0
+_VOICE_RELEASE_SETTLE_TIMEOUT_SECONDS = 0.08
+_VOICE_RELEASE_SETTLE_POLL_SECONDS = 0.005
 _WETYPE_VOICE_EDGE_GAP_SECONDS = 0.08
+# Per-process provenance, not an authorization/security boundary. Keep outside
+# the legacy voice-physicalizer marker namespace and within ULONG_PTR on x86.
+_INPUT_EVENT_EXTRA_INFO = 0xA7000000 | int.from_bytes(os.urandom(3), "little")
+
+
+def is_own_input_event(extra_info: int) -> bool:
+    return int(extra_info) == _INPUT_EVENT_EXTRA_INFO
 
 _diagnostic_trace: Optional[diagnostic_trace.DiagnosticTrace] = None
 
@@ -74,10 +83,8 @@ _MOUSEEVENTF_MIDDLEDOWN = 0x0020
 _MOUSEEVENTF_MIDDLEUP = 0x0040
 _MOUSEEVENTF_XDOWN = 0x0080
 _MOUSEEVENTF_XUP = 0x0100
-_MOUSEEVENTF_WHEEL = 0x0800
 _XBUTTON1 = 0x0001
 _XBUTTON2 = 0x0002
-_WHEEL_DELTA = 120
 _VK_LBUTTON = 0x01
 _VK_RBUTTON = 0x02
 _VK_MBUTTON = 0x04
@@ -332,6 +339,7 @@ def _real_send_input_batch_with_builder(events, builder) -> int:
     for item in array:
         if int(item.type) == _INPUT_KEYBOARD:
             keyboard = item.union.ki
+            keyboard.dwExtraInfo = _INPUT_EVENT_EXTRA_INFO
             trace_events.append(
                 {
                     "type": "keyboard",
@@ -348,6 +356,7 @@ def _real_send_input_batch_with_builder(events, builder) -> int:
             )
         else:
             mouse = item.union.mi
+            mouse.dwExtraInfo = _INPUT_EVENT_EXTRA_INFO
             trace_events.append(
                 {
                     "type": "mouse",
@@ -471,6 +480,368 @@ def _real_mouse_button_is_down(button: str) -> bool:
     return bool(user32.GetAsyncKeyState(vk_code) & 0x8000)
 
 
+def _desktop_name(user32: object, desktop: int) -> Optional[str]:
+    UOI_NAME = 2
+    needed = wintypes.DWORD(0)
+    user32.GetUserObjectInformationW(
+        desktop,
+        UOI_NAME,
+        None,
+        0,
+        ctypes.byref(needed),
+    )
+    if needed.value <= ctypes.sizeof(ctypes.c_wchar):
+        return None
+    buffer = ctypes.create_unicode_buffer(
+        max(2, needed.value // ctypes.sizeof(ctypes.c_wchar))
+    )
+    if not user32.GetUserObjectInformationW(
+        desktop,
+        UOI_NAME,
+        buffer,
+        ctypes.sizeof(buffer),
+        ctypes.byref(needed),
+    ):
+        return None
+    return str(buffer.value)
+
+
+def _real_input_desktop_name_with_key_state_access() -> Optional[str]:
+    """Return the active desktop name only with the documented access rights."""
+
+    _require_windows()
+    _require_live_input_allowed()
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    user32.OpenInputDesktop.argtypes = (
+        wintypes.DWORD,
+        wintypes.BOOL,
+        wintypes.DWORD,
+    )
+    user32.OpenInputDesktop.restype = wintypes.HANDLE
+    user32.GetThreadDesktop.argtypes = (wintypes.DWORD,)
+    user32.GetThreadDesktop.restype = wintypes.HANDLE
+    user32.GetUserObjectInformationW.argtypes = (
+        wintypes.HANDLE,
+        ctypes.c_int,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.DWORD),
+    )
+    user32.GetUserObjectInformationW.restype = wintypes.BOOL
+    user32.CloseDesktop.argtypes = (wintypes.HANDLE,)
+    user32.CloseDesktop.restype = wintypes.BOOL
+    kernel32.GetCurrentThreadId.argtypes = ()
+    kernel32.GetCurrentThreadId.restype = wintypes.DWORD
+
+    # GetAsyncKeyState documents zero when the active desktop does not grant
+    # hook or journal-record access.  Request those exact rights together with
+    # READOBJECTS; success is used only as a validity check.
+    input_desktop = user32.OpenInputDesktop(0, False, 0x0001 | 0x0008 | 0x0010)
+    if not input_desktop:
+        return None
+    try:
+        thread_desktop = user32.GetThreadDesktop(kernel32.GetCurrentThreadId())
+        if not thread_desktop:
+            return None
+        input_name = _desktop_name(user32, input_desktop)
+        thread_name = _desktop_name(user32, thread_desktop)
+        if not input_name or input_name != thread_name:
+            return None
+        return str(input_name)
+    finally:
+        user32.CloseDesktop(input_desktop)
+
+
+def _process_integrity_level(process: int) -> Optional[int]:
+    """Read one process mandatory integrity RID without changing its token."""
+
+    class SID_AND_ATTRIBUTES(ctypes.Structure):
+        _fields_ = (("Sid", wintypes.LPVOID), ("Attributes", wintypes.DWORD))
+
+    class TOKEN_MANDATORY_LABEL(ctypes.Structure):
+        _fields_ = (("Label", SID_AND_ATTRIBUTES),)
+
+    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    advapi32.OpenProcessToken.argtypes = (
+        wintypes.HANDLE,
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.HANDLE),
+    )
+    advapi32.OpenProcessToken.restype = wintypes.BOOL
+    advapi32.GetTokenInformation.argtypes = (
+        wintypes.HANDLE,
+        ctypes.c_int,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.DWORD),
+    )
+    advapi32.GetTokenInformation.restype = wintypes.BOOL
+    advapi32.GetSidSubAuthorityCount.argtypes = (wintypes.LPVOID,)
+    advapi32.GetSidSubAuthorityCount.restype = ctypes.POINTER(ctypes.c_ubyte)
+    advapi32.GetSidSubAuthority.argtypes = (wintypes.LPVOID, wintypes.DWORD)
+    advapi32.GetSidSubAuthority.restype = ctypes.POINTER(wintypes.DWORD)
+    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    kernel32.CloseHandle.restype = wintypes.BOOL
+
+    token = wintypes.HANDLE()
+    if not advapi32.OpenProcessToken(process, 0x0008, ctypes.byref(token)):
+        return None
+    try:
+        needed = wintypes.DWORD(0)
+        advapi32.GetTokenInformation(token, 25, None, 0, ctypes.byref(needed))
+        if needed.value < ctypes.sizeof(TOKEN_MANDATORY_LABEL):
+            return None
+        buffer = ctypes.create_string_buffer(needed.value)
+        if not advapi32.GetTokenInformation(
+            token,
+            25,
+            buffer,
+            needed.value,
+            ctypes.byref(needed),
+        ):
+            return None
+        label = ctypes.cast(
+            buffer,
+            ctypes.POINTER(TOKEN_MANDATORY_LABEL),
+        ).contents
+        if not label.Label.Sid:
+            return None
+        count_ptr = advapi32.GetSidSubAuthorityCount(label.Label.Sid)
+        if not count_ptr or not count_ptr.contents.value:
+            return None
+        rid_ptr = advapi32.GetSidSubAuthority(
+            label.Label.Sid,
+            count_ptr.contents.value - 1,
+        )
+        return int(rid_ptr.contents.value) if rid_ptr else None
+    finally:
+        kernel32.CloseHandle(token)
+
+
+def _real_current_process_integrity_level() -> Optional[int]:
+    _require_windows()
+    _require_live_input_allowed()
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.GetCurrentProcess.argtypes = ()
+    kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+    return _process_integrity_level(kernel32.GetCurrentProcess())
+
+
+def _real_foreground_process_context() -> Optional[tuple[int, int, int]]:
+    """Return HWND, PID, and integrity RID for a queryable foreground process."""
+
+    _require_windows()
+    _require_live_input_allowed()
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    user32.GetForegroundWindow.argtypes = ()
+    user32.GetForegroundWindow.restype = wintypes.HWND
+    user32.GetWindowThreadProcessId.argtypes = (
+        wintypes.HWND,
+        ctypes.POINTER(wintypes.DWORD),
+    )
+    user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+    kernel32.OpenProcess.argtypes = (
+        wintypes.DWORD,
+        wintypes.BOOL,
+        wintypes.DWORD,
+    )
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    kernel32.CloseHandle.restype = wintypes.BOOL
+
+    foreground = user32.GetForegroundWindow()
+    if not foreground:
+        return None
+    process_id = wintypes.DWORD(0)
+    if not user32.GetWindowThreadProcessId(
+        foreground,
+        ctypes.byref(process_id),
+    ) or not process_id.value:
+        return None
+    process = kernel32.OpenProcess(0x1000, False, process_id.value)
+    if not process:
+        return None
+    try:
+        integrity = _process_integrity_level(process)
+    finally:
+        kernel32.CloseHandle(process)
+    if integrity is None:
+        return None
+    return (int(foreground), int(process_id.value), int(integrity))
+
+
+def _real_key_state_query_context(
+    *,
+    _desktop_query: Callable[
+        [], Optional[str]
+    ] = _real_input_desktop_name_with_key_state_access,
+    _current_integrity_query: Callable[
+        [], Optional[int]
+    ] = _real_current_process_integrity_level,
+    _foreground_query: Callable[
+        [], Optional[tuple[int, int, int]]
+    ] = _real_foreground_process_context,
+) -> Optional[tuple[str, int, int, int, int]]:
+    """Return context only when desktop rights and UIPI direction are safe."""
+
+    desktop = _desktop_query()
+    current_integrity = _current_integrity_query()
+    foreground = _foreground_query()
+    if desktop is None or current_integrity is None or foreground is None:
+        return None
+    foreground_hwnd, process_id, foreground_integrity = foreground
+    if foreground_integrity > current_integrity:
+        return None
+    return (
+        str(desktop),
+        int(foreground_hwnd),
+        int(process_id),
+        int(current_integrity),
+        int(foreground_integrity),
+    )
+
+
+def _real_get_async_key_state(vk_code: int) -> int:
+    _require_windows()
+    _require_live_input_allowed()
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    user32.GetAsyncKeyState.argtypes = (ctypes.c_int,)
+    user32.GetAsyncKeyState.restype = ctypes.c_short
+    return int(user32.GetAsyncKeyState(int(vk_code)))
+
+
+def _real_async_key_state_observation(
+    vk_code: int,
+    *,
+    _context_query: Callable[
+        [], Optional[tuple[str, int, int, int, int]]
+    ] = _real_key_state_query_context,
+    _query: Callable[[int], int] = _real_get_async_key_state,
+) -> Optional[bool]:
+    before = _context_query()
+    if before is None:
+        return None
+    state = int(_query(int(vk_code)))
+    after = _context_query()
+    if after is None or after != before:
+        return None
+    return bool(state & 0x8000)
+
+
+def _wait_for_logical_key_up(
+    vk_code: int,
+    *,
+    _confirmation: voice_key_physicalizer_windows.VoiceEventConfirmation,
+    _query: Callable[[int], Optional[bool]] = _real_async_key_state_observation,
+    _guard_query: Callable[
+        [int], Optional[voice_key_physicalizer_windows.PhysicalReleaseGuard]
+    ] = voice_key_physicalizer_windows.snapshot_physical_release_guard,
+    _ambiguous_owner_query: Callable[
+        [int], bool
+    ] = raw_input_windows.physical_key_has_ambiguous_owners,
+    _sleep: Callable[[float], None] = time.sleep,
+    _clock: Callable[[], float] = time.monotonic,
+    _timeout: float = _VOICE_RELEASE_SETTLE_TIMEOUT_SECONDS,
+) -> Optional[bool]:
+    deadline = _clock() + max(0.0, float(_timeout))
+    while True:
+        guard_before = _guard_query(int(vk_code))
+        if (
+            guard_before is None
+            or guard_before.generation != int(_confirmation.generation)
+            or guard_before.installation_epoch
+            != int(_confirmation.installation_epoch)
+            or _ambiguous_owner_query(int(vk_code))
+        ):
+            return None
+        observed_down = _query(int(vk_code))
+        guard_after = _guard_query(int(vk_code))
+        if (
+            observed_down is None
+            or guard_after != guard_before
+            or _ambiguous_owner_query(int(vk_code))
+        ):
+            return None
+        if not observed_down:
+            return True
+        remaining = deadline - _clock()
+        if remaining <= 0:
+            return False
+        _sleep(min(_VOICE_RELEASE_SETTLE_POLL_SECONDS, remaining))
+
+
+def _trace_voice_release_postcondition(result: str, **fields: object) -> None:
+    trace = _diagnostic_trace
+    if trace is None or not trace.enabled:
+        return
+    try:
+        trace.emit(
+            "voice_release_postcondition",
+            **trace.current_context(),
+            result=str(result),
+            **fields,
+        )
+    except Exception:
+        pass
+
+
+def _ensure_right_alt_release_completed(
+    vk_code: int,
+    confirmation: voice_key_physicalizer_windows.VoiceEventConfirmation,
+    *,
+    _state_query: Callable[
+        [int], Optional[bool]
+    ] = _real_async_key_state_observation,
+    _guard_query: Callable[
+        [int], Optional[voice_key_physicalizer_windows.PhysicalReleaseGuard]
+    ] = voice_key_physicalizer_windows.snapshot_physical_release_guard,
+    _ambiguous_owner_query: Callable[
+        [int], bool
+    ] = raw_input_windows.physical_key_has_ambiguous_owners,
+    _sleep: Callable[[float], None] = time.sleep,
+    _clock: Callable[[], float] = time.monotonic,
+) -> None:
+    """Prove an owned RAlt UP reached Windows, or retain cleanup ownership.
+
+    The marked edge gets a short bounded settle window.  The observation must
+    stay on the receipt's live tracker generation and active input desktop,
+    with no physical or ambiguous device owner.  This function deliberately
+    does not inject another edge: an explicit cleanup retry owns any later UP.
+    """
+
+    try:
+        released = _wait_for_logical_key_up(
+            vk_code,
+            _confirmation=confirmation,
+            _query=_state_query,
+            _guard_query=_guard_query,
+            _ambiguous_owner_query=_ambiguous_owner_query,
+            _sleep=_sleep,
+            _clock=_clock,
+        )
+    except Exception as exc:
+        _trace_voice_release_postcondition("state_query_failed")
+        raise InputCleanupIncompleteError(
+            "right-Alt release state could not be confirmed"
+        ) from exc
+    if released:
+        _trace_voice_release_postcondition(
+            "released",
+            vk=int(vk_code),
+        )
+        return
+    _trace_voice_release_postcondition(
+        "observation_unknown" if released is None else "still_down",
+        vk=int(vk_code),
+    )
+    raise InputCleanupIncompleteError(
+        "right-Alt release state could not be safely confirmed"
+    )
+
+
 def _best_effort_mouse_release(button: str, sender: MouseSender) -> bool:
     try:
         sent = sender([_mouse_button_event(button, key_up=True)])
@@ -543,25 +914,6 @@ def send_mouse_button_up(
         raise error_type(
             f"SendInput did not deliver mouse {button} up; retry attempted"
         )
-
-
-def send_mouse_wheel(
-    clicks: int, *, _sender: Optional[MouseSender] = None
-) -> None:
-    """Scroll vertically by an integral number of Windows wheel clicks."""
-
-    if not isinstance(clicks, int) or isinstance(clicks, bool) or clicks == 0:
-        raise ValueError("mouse wheel clicks must be a non-zero integer")
-    sender = _sender or _real_send_mouse_input_batch
-    events = [(_MOUSEEVENTF_WHEEL, clicks * _WHEEL_DELTA)]
-    try:
-        sent = sender(events)
-    except Win32InputUnavailableError:
-        raise
-    except Exception as exc:
-        raise OSError(f"mouse wheel delivery failed: {exc}") from exc
-    if sent < 1:
-        raise OSError("SendInput did not deliver the mouse wheel event")
 
 
 def _best_effort_release(
@@ -992,15 +1344,59 @@ def _real_voice_event(vk: int, key_up: bool) -> None:
     trace = _diagnostic_trace
     started = time.monotonic()
     context = diagnostic_trace.foreground_context() if trace is not None and trace.enabled else {}
-    def record(success: bool, reason: str, marker: int = 0) -> None:
+    def record(
+        success: bool,
+        reason: str,
+        marker: int = 0,
+        *,
+        confirmation=None,
+        health_snapshot=None,
+        health_invalidated: bool = False,
+    ) -> None:
         if trace is None or not trace.enabled:
             return
         try:
+            health_fields = (
+                health_snapshot.trace_fields()
+                if health_snapshot is not None
+                else {}
+            )
+            binding_fields = {
+                "physicalizer_binding": "unbound",
+                "physicalizer_generation": -1,
+                "physicalizer_installation_epoch": -1,
+                "physicalizer_marker_seen": False,
+                "physicalizer_downstream_completed": False,
+                "physicalizer_downstream_result": 0,
+                "physicalizer_downstream_error": False,
+            }
+            if confirmation is not None:
+                binding_fields = {
+                    "physicalizer_binding": "bound",
+                    "physicalizer_generation": int(confirmation.generation),
+                    "physicalizer_installation_epoch": int(
+                        confirmation.installation_epoch
+                    ),
+                    "physicalizer_marker_seen": bool(
+                        getattr(confirmation, "marker_seen", False)
+                    ),
+                    "physicalizer_downstream_completed": bool(
+                        getattr(confirmation, "downstream_completed", False)
+                    ),
+                    "physicalizer_downstream_result": int(
+                        getattr(confirmation, "downstream_result", 0)
+                    ),
+                    "physicalizer_downstream_error": bool(
+                        getattr(confirmation, "downstream_error", False)
+                    ),
+                }
             trace.emit("voice_edge_confirmation", **trace.current_context(),
                        edge="up" if key_up else "down", backend=_voice_backend,
                        vk=int(vk), marker=marker, success=success, reason=reason,
+                       health_invalidated=bool(health_invalidated),
                        elapsed_ms=round((time.monotonic() - started) * 1000, 2),
-                       timeout_ms=int(_VOICE_EVENT_CONFIRM_TIMEOUT_SECONDS * 1000), **context)
+                       timeout_ms=int(_VOICE_EVENT_CONFIRM_TIMEOUT_SECONDS * 1000),
+                       **binding_fields, **health_fields, **context)
         except Exception:
             pass  # A diagnostic sink cannot change input ownership or cleanup.
     try:
@@ -1020,17 +1416,61 @@ def _real_voice_event(vk: int, key_up: bool) -> None:
         )
     except BaseException:
         voice_key_physicalizer_windows.cancel_marked_voice_event(confirmation)
-        record(False, "native_send_raised", confirmation.marker)
+        record(
+            False,
+            "native_send_raised",
+            confirmation.marker,
+            confirmation=confirmation,
+        )
         raise
     if not voice_key_physicalizer_windows.wait_for_marked_voice_event(
         confirmation,
         _VOICE_EVENT_CONFIRM_TIMEOUT_SECONDS,
     ):
-        record(False, "local_hook_confirmation_timeout", confirmation.marker)
+        health_invalidated, health_snapshot = (
+            voice_key_physicalizer_windows.mark_required_confirmation_failed(
+                confirmation
+            )
+        )
+        failure_reason = "local_hook_confirmation_timeout"
+        if getattr(confirmation, "marker_seen", False) is True:
+            failure_reason = (
+                "downstream_hook_failed"
+                if confirmation.downstream_error
+                else "downstream_hook_timeout"
+            )
+        record(
+            False,
+            failure_reason,
+            confirmation.marker,
+            confirmation=confirmation,
+            health_snapshot=health_snapshot,
+            health_invalidated=health_invalidated,
+        )
         raise InputCleanupIncompleteError(
             "marked right-Alt edge was not confirmed by the physicalizer hook"
         )
-    record(True, "local_hook_confirmed", confirmation.marker)
+    if key_up:
+        try:
+            _ensure_right_alt_release_completed(vk, confirmation)
+        except InputCleanupIncompleteError:
+            record(
+                False,
+                "release_postcondition_failed",
+                confirmation.marker,
+                confirmation=confirmation,
+            )
+            raise
+    record(
+        True,
+        (
+            "release_postcondition_confirmed"
+            if key_up
+            else "local_hook_and_downstream_completed"
+        ),
+        confirmation.marker,
+        confirmation=confirmation,
+    )
 
 
 def _best_effort_voice_up(
@@ -1043,6 +1483,7 @@ def _best_effort_voice_up(
         if key_down_query is not None:
             try:
                 if key_down_query(vk):
+                    complete = False
                     continue
             except Exception:
                 complete = False
@@ -1152,6 +1593,7 @@ def send_wetype_voice_key_combo_up(
         if key_down_query is not None:
             try:
                 if key_down_query(vk):
+                    physical_query_complete = False
                     continue
             except Exception:
                 physical_query_complete = False
@@ -1288,10 +1730,13 @@ def send_voice_key_combo_up(
     )
     vk_codes = list(reversed(resolved_vk_codes))
     physical_query_complete = True
+    delivery_complete = True
+    first_error: Optional[BaseException] = None
     for vk in vk_codes:
         if key_down_query is not None:
             try:
                 if key_down_query(vk):
+                    physical_query_complete = False
                     continue
             except Exception:
                 physical_query_complete = False
@@ -1299,33 +1744,29 @@ def send_voice_key_combo_up(
         try:
             sender(vk, True)
         except Win32InputUnavailableError as exc:
-            if not _best_effort_voice_up(
-                resolved_vk_codes, sender, key_down_query
-            ):
-                raise InputCleanupIncompleteError(
-                    "voice backend became unavailable and key-up could not be confirmed"
-                ) from exc
-            raise
+            delivery_complete = False
+            if first_error is None:
+                first_error = exc
+            continue
         except InputCleanupIncompleteError as exc:
-            _best_effort_voice_up(
-                resolved_vk_codes, sender, key_down_query
-            )
-            raise InputCleanupIncompleteError(
-                "voice key-up delivery could not be confirmed"
-            ) from exc
+            # This edge may already have reached Windows.  Do not retry it
+            # inside the same release operation; continue with the other owed
+            # keys and leave the explicit cleanup coordinator to retry later.
+            delivery_complete = False
+            if first_error is None:
+                first_error = exc
+            continue
         except Exception as exc:
-            # Releasing an already-up key is harmless. Retry every member so
-            # a failure on one edge cannot strand later modifiers down.
-            cleanup_complete = _best_effort_voice_up(
-                resolved_vk_codes, sender, key_down_query
-            )
-            error_type = _delivery_error_type(cleanup_complete)
-            raise error_type(f"voice key-up delivery failed: {exc}") from exc
-    if not physical_query_complete:
+            # Every edge in this release operation is attempted once.  A
+            # whole-combo rollback here would repeat an earlier unresolved UP.
+            delivery_complete = False
+            if first_error is None:
+                first_error = exc
+            continue
+    if not physical_query_complete or not delivery_complete:
         raise InputCleanupIncompleteError(
-            "some voice key-ups were deferred because physical keyboard "
-            "state could not be confirmed"
-        )
+            "some voice key-ups remain pending"
+        ) from first_error
 
 
 def send_voice_key_combo_tap(
@@ -1364,16 +1805,18 @@ def send_voice_key_combo_tap(
             _key_down_query=release_query,
         )
     except BaseException as exc:
+        if isinstance(exc, InputCleanupIncompleteError):
+            # send_voice_key_combo_up already attempted every safe owed edge.
+            # A nested rollback would repeat the same unresolved RAlt release.
+            raise InputCleanupIncompleteError(
+                "voice key tap delivery could not be confirmed"
+            ) from exc
         cleanup_complete = _best_effort_voice_up(
             vk_codes, sender, release_query
         )
         if not cleanup_complete:
             raise InputCleanupIncompleteError(
                 "voice key tap failed and final key-up could not be confirmed"
-            ) from exc
-        if isinstance(exc, InputCleanupIncompleteError):
-            raise InputCleanupIncompleteError(
-                "voice key tap delivery could not be confirmed"
             ) from exc
         raise
 

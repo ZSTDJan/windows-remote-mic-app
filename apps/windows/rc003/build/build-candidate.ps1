@@ -45,7 +45,7 @@ $RC003Root = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $RepoRoot = (Resolve-Path (Join-Path $RC003Root "..\..\..")).Path
 . (Join-Path $PSScriptRoot "build-provenance.ps1")
 $BuildRoot = Join-Path $RC003Root "dist\RemoteMicRC003"
-$BuildProvenancePath = Get-RC003BuildProvenancePath -BuildRoot $BuildRoot
+$BuildProvenancePath = $null
 
 function Assert-LastExitCode {
     param([string]$Step)
@@ -144,10 +144,6 @@ $BuildGate = Enter-RC003BuildGate -RC003Root $RC003Root
 try {
     Push-Location $RC003Root
     try {
-    # Any failed build attempt must leave the previous dist unable to masquerade
-    # as the current source state.
-    Remove-Item -LiteralPath $BuildProvenancePath -Force -ErrorAction SilentlyContinue
-
     # Candidate builds run on a developer's interactive desktop. Tests must
     # never install a real keyboard hook or inject an actual key edge there.
     $env:RC003_DISABLE_LIVE_INPUT = "1"
@@ -177,6 +173,17 @@ try {
     if ($venvVersion -ne "3.12") {
         throw "candidate build virtual environment must use Python 3.12; .venv reported '$venvVersion'"
     }
+    $productPresentation = Get-RC003ProductPresentation `
+        -RC003Root $RC003Root `
+        -PythonExecutable $venvPython
+    $sourceVersion = [string]$productPresentation.version
+    # Any failed build attempt must leave the previous dist unable to masquerade
+    # as the current source state. Resolve the path from the same presentation
+    # contract as the build, after the selected Python 3.12 environment exists.
+    $BuildProvenancePath = Clear-RC003BuildProvenance `
+        -RC003Root $RC003Root `
+        -BuildRoot $BuildRoot `
+        -PythonExecutable $venvPython
 
     & $venvPython -m pip install --upgrade pip
     Assert-LastExitCode "pip install --upgrade pip"
@@ -214,8 +221,12 @@ try {
     & powershell -ExecutionPolicy Bypass -File (Join-Path "build" "check-public-boundary.ps1")
     Assert-LastExitCode "check-public-boundary.ps1"
 
-    Write-Host "-- test suite --"
-    $env:PYTHONPATH = Join-Path $RC003Root "src"
+    Write-Host "-- compile first-party business modules with Cython --"
+    & $venvPython (Join-Path "build" "prepare-cython-core.py")
+    Assert-LastExitCode "prepare-cython-core.py"
+    $cythonSourceRoot = (Resolve-Path (Join-Path "build" "cython-stage\src")).Path
+    $env:PYTHONPATH = $cythonSourceRoot
+    Write-Host "-- complete native-stage test suite (single pass) --"
     $testLogPath = Join-Path ([System.IO.Path]::GetTempPath()) (
         "remote-mic-rc003-tests-{0}.log" -f [guid]::NewGuid().ToString("N")
     )
@@ -227,14 +238,14 @@ try {
         $previousErrorActionPreference = $ErrorActionPreference
         try {
             $ErrorActionPreference = "Continue"
-            & $venvPython -u -W error::ResourceWarning -m unittest discover -s tests -t . -p "test_*.py" -v 2>&1 |
+            & $venvPython -u -W error::ResourceWarning (Join-Path "build" "check_native.py") --stage (Split-Path $cythonSourceRoot -Parent) --tests 2>&1 |
                 Tee-Object -FilePath $testLogPath
             $testExitCode = $LASTEXITCODE
         } finally {
             $ErrorActionPreference = $previousErrorActionPreference
         }
         if ($testExitCode -ne 0) {
-            throw "python -m unittest discover failed with exit code $testExitCode"
+            throw "native-stage test suite failed with exit code $testExitCode"
         }
 
         # Resource warnings raised during interpreter shutdown can print
@@ -255,19 +266,6 @@ try {
         Remove-Item -LiteralPath $testLogPath -Force -ErrorAction SilentlyContinue
     }
 
-    Write-Host "-- compile selected permission modules with Cython --"
-    & $venvPython (Join-Path "build" "prepare-cython-core.py")
-    Assert-LastExitCode "prepare-cython-core.py"
-
-    $cythonSourceRoot = (Resolve-Path (Join-Path "build" "cython-stage\src")).Path
-    $env:PYTHONPATH = $cythonSourceRoot
-    Write-Host "-- compiled permission module tests --"
-    & $venvPython -u -W error::ResourceWarning -m unittest `
-        tests.test_hid_elevation_windows `
-        tests.test_hid_helper_consumers `
-        -v
-    Assert-LastExitCode "compiled permission module tests"
-
     Write-Host "-- compiled HID helper self-check (no UAC/task/HID changes) --"
     & $venvPython (Join-Path $cythonSourceRoot "hid_helper_launcher.py") --self-check
     Assert-LastExitCode "compiled HID helper --self-check"
@@ -279,34 +277,34 @@ try {
     Assert-LastExitCode "PyInstaller"
 
     Write-Host "-- built-artifact dry-run smoke check (no GUI/BLE/HID/audio) --"
-    $builtExe = Join-Path "dist" (Join-Path "RemoteMicRC003" "RemoteMicRC003.exe")
+    $builtPaths = Get-RC003BuildProductPaths `
+        -RC003Root $RC003Root `
+        -BuildRoot $BuildRoot `
+        -PythonExecutable $venvPython
+    $builtExe = $builtPaths.MainExecutable
     if (-not (Test-Path $builtExe)) {
         throw "expected built executable not found: $builtExe"
     }
-    $builtHidHelper = Join-Path "dist" (Join-Path "RemoteMicRC003" (Join-Path "_internal" "RemoteMicRC003HidHelper.exe"))
+    $builtHidHelper = $builtPaths.HidHelper
     if (-not (Test-Path $builtHidHelper)) {
         throw "expected narrow HID helper not found: $builtHidHelper"
     }
-    $builtVersionFile = Join-Path "dist" (Join-Path "RemoteMicRC003" (Join-Path "_internal" (Join-Path "ovb_rc003" "VERSION")))
+    $builtVersionFile = $builtPaths.VersionFile
     if (-not (Test-Path $builtVersionFile)) {
         throw "expected built VERSION file not found: $builtVersionFile"
     }
-    $builtPackageRoot = Split-Path $builtVersionFile -Parent
-    foreach ($compiledModuleName in @("hid_elevation_windows", "hid_helper_consumers")) {
-        $compiledMatches = @(
-            Get-ChildItem -LiteralPath $builtPackageRoot -File -Filter "${compiledModuleName}*.pyd"
-        )
-        if ($compiledMatches.Count -ne 1) {
-            throw "expected one compiled $compiledModuleName extension in frozen output"
-        }
-    }
+    & $venvPython (Join-Path "build" "check_native.py") --stage (Split-Path $cythonSourceRoot -Parent) --artifact $BuildRoot
+    Assert-LastExitCode "full native artifact verification"
     $builtVersion = (Get-Content -LiteralPath $builtVersionFile -Raw).Trim()
     if ($builtVersion -ne $sourceVersion) {
         throw "built VERSION mismatch: source=$sourceVersion built=$builtVersion"
     }
     $rootExecutables = @(Get-ChildItem -LiteralPath (Split-Path $builtExe -Parent) -Force -Filter "*.exe" -File)
-    if ($rootExecutables.Count -ne 1 -or $rootExecutables[0].Name -ne "RemoteMicRC003.exe") {
-        throw "build root must expose only RemoteMicRC003.exe"
+    if (
+        $rootExecutables.Count -ne 1 -or
+        $rootExecutables[0].Name -cne [string]$productPresentation.main_executable_name
+    ) {
+        throw "build root must expose only $($productPresentation.main_executable_name)"
     }
     Write-Host "-- built HID helper self-check (no UAC/task/HID changes) --"
     Invoke-FrozenExecutableCheck `
@@ -334,19 +332,28 @@ try {
     ) {
         throw "build inputs changed while PyInstaller or frozen checks were running"
     }
+    Assert-RC003ExecutableMetadata `
+        -RC003Root $RC003Root `
+        -BuildRoot $BuildRoot `
+        -PythonExecutable $venvPython
     Write-RC003BuildProvenance `
         -RC003Root $RC003Root `
         -RepoRoot $RepoRoot `
         -BuildRoot $BuildRoot `
-        -InputState $inputStateBeforeBuild | Out-Null
+        -InputState $inputStateBeforeBuild `
+        -ExecutableMetadataVerified `
+        -PythonExecutable $venvPython | Out-Null
     Assert-RC003BuildProvenance `
         -RC003Root $RC003Root `
         -RepoRoot $RepoRoot `
-        -BuildRoot $BuildRoot | Out-Null
+        -BuildRoot $BuildRoot `
+        -PythonExecutable $venvPython | Out-Null
 
     Write-Host "== build complete: dist\RemoteMicRC003\ (unsigned) =="
     } catch {
-        Remove-Item -LiteralPath $BuildProvenancePath -Force -ErrorAction SilentlyContinue
+        if (-not [string]::IsNullOrWhiteSpace([string]$BuildProvenancePath)) {
+            Remove-Item -LiteralPath $BuildProvenancePath -Force -ErrorAction SilentlyContinue
+        }
         throw
     } finally {
         Pop-Location

@@ -66,7 +66,7 @@ class ButtonActionSerializationTests(unittest.TestCase):
             )
             self.assertFalse(key_mapping.action_allows_repeat(action))
 
-    def test_only_navigation_backspace_volume_and_wheel_actions_repeat(self):
+    def test_only_navigation_backspace_and_volume_actions_repeat(self):
         repeatable = {
             key_mapping.ActionKind.ARROW_UP,
             key_mapping.ActionKind.ARROW_DOWN,
@@ -75,8 +75,6 @@ class ButtonActionSerializationTests(unittest.TestCase):
             key_mapping.ActionKind.DELETE_BACKWARD,
             key_mapping.ActionKind.SYSTEM_VOLUME_UP,
             key_mapping.ActionKind.SYSTEM_VOLUME_DOWN,
-            key_mapping.ActionKind.MOUSE_WHEEL_UP,
-            key_mapping.ActionKind.MOUSE_WHEEL_DOWN,
         }
         for action_kind in key_mapping.ActionKind:
             action = (
@@ -117,13 +115,11 @@ class ButtonActionSerializationTests(unittest.TestCase):
                 key_mapping.ButtonAction.from_dict(action.to_dict()), action
             )
 
-    def test_mouse_actions_round_trip_as_first_class_actions(self):
+    def test_mouse_click_actions_round_trip_as_first_class_actions(self):
         for action_kind in (
             key_mapping.ActionKind.MOUSE_LEFT_CLICK,
             key_mapping.ActionKind.MOUSE_RIGHT_CLICK,
             key_mapping.ActionKind.MOUSE_MIDDLE_CLICK,
-            key_mapping.ActionKind.MOUSE_WHEEL_UP,
-            key_mapping.ActionKind.MOUSE_WHEEL_DOWN,
             key_mapping.ActionKind.MOUSE_X1_CLICK,
             key_mapping.ActionKind.MOUSE_X2_CLICK,
         ):
@@ -131,6 +127,22 @@ class ButtonActionSerializationTests(unittest.TestCase):
             self.assertEqual(
                 key_mapping.ButtonAction.from_dict(action.to_dict()), action
             )
+
+    def test_saved_wheel_actions_migrate_to_page_keys_without_writing_wheel(self):
+        for old_kind, page_key in (
+            (key_mapping.ActionKind.MOUSE_WHEEL_UP, "pageup"),
+            (key_mapping.ActionKind.MOUSE_WHEEL_DOWN, "pagedown"),
+        ):
+            with self.subTest(old_kind=old_kind):
+                old_data = {"kind": old_kind.value, "keys": []}
+                restored = key_mapping.ButtonAction.from_dict(old_data)
+                self.assertEqual(restored.kind, key_mapping.ActionKind.KEY_COMBO)
+                self.assertEqual(restored.keys, (page_key,))
+                self.assertEqual(restored.to_dict(), {"kind": "key_combo", "keys": [page_key]})
+                self.assertEqual(
+                    key_mapping.ButtonAction(old_kind).to_dict(),
+                    restored.to_dict(),
+                )
 
     def test_reference_open_app_actions_are_first_class_actions(self):
         for action_kind in (

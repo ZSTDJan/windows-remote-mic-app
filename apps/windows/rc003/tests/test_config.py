@@ -408,6 +408,44 @@ class DefaultConfigPrivacyTests(unittest.TestCase):
 
         self.assertEqual(loaded["voice_hotkey"], "lctrl+lwin")
 
+    def test_doubao_hold_and_handsfree_shortcuts_survive_round_trip_separately(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.json"
+            data = config.default_config()
+            data["voice_program"] = {"provider": "doubao_ime"}
+            data["remote_recording_mode"] = "toggle"
+            config.set_voice_hotkey_for_provider(
+                data,
+                "doubao_ime",
+                "ralt",
+                source="auto",
+                trigger="hold",
+            )
+            config.set_voice_hotkey_for_provider(
+                data,
+                "doubao_ime",
+                "lshift+f9",
+                source="auto",
+                trigger="toggle",
+            )
+            config.save_config(path, data)
+            loaded = config.load_config(path)
+
+        self.assertEqual(
+            config.voice_hotkey_for_provider(loaded, "doubao_ime"),
+            "ralt",
+        )
+        self.assertEqual(
+            config.voice_hotkey_for_provider(
+                loaded,
+                "doubao_ime",
+                trigger="toggle",
+            ),
+            "lshift+f9",
+        )
+        loaded["remote_recording_mode"] = "toggle"
+        self.assertEqual(config.voice_hotkey_trigger_for_settings(loaded), "toggle")
+
     def test_schema_7_false_elevation_choice_is_not_replaced_by_sogou_default(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "config.json"

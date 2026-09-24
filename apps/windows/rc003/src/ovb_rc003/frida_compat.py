@@ -31,6 +31,8 @@ from ctypes import wintypes
 from typing import Callable, Iterable
 
 from . import frida_hid_tap_runtime
+from . import __version__
+from . import hid_injection_diagnostics as injection_diagnostics
 from .device_profile import BUTTON_USAGE_IDS
 from .diagnostic_trace import DiagnosticTrace
 
@@ -166,7 +168,9 @@ def _diagnostic_environment() -> dict:
 
 
 class HidTapInjectionError(RuntimeError):
-    pass
+    def __init__(self, detail, *, diagnostic=None):
+        super().__init__(detail)
+        self.injection_diagnostic = diagnostic or {}
 
 
 class HidTapState(str, Enum):
@@ -176,6 +180,7 @@ class HidTapState(str, Enum):
     STARTING = "starting"
     WAITING_HOST = "waiting_for_rc003_host"
     INJECTING = "injecting"
+    RECOVERING = "recovering"
     WAITING_CONNECTION = "waiting_for_gadget_connection"
     ATTACHED_WAITING_IO = "attached_waiting_for_hid_io"
     READY = "ready"
@@ -333,7 +338,7 @@ def _run_direct_injector_subprocess(
 ) -> None:
     kwargs: dict = {
         "stdin": subprocess.DEVNULL,
-        "stdout": subprocess.DEVNULL,
+        "stdout": subprocess.PIPE,
         "stderr": subprocess.DEVNULL,
         "check": False,
         "timeout": timeout,
@@ -350,15 +355,22 @@ def _run_direct_injector_subprocess(
             **kwargs,
         )
     except subprocess.TimeoutExpired as exc:
-        raise HidTapInjectionError("injector_timeout") from exc
+        raise HidTapInjectionError("injector_timeout", diagnostic=dict(
+            injection_diagnostics.failure(exc, stage='child_wait'),
+            execution_route='direct_child', result_status='timeout')) from exc
     except OSError as exc:
-        raise HidTapInjectionError("injector_launch_failed") from exc
+        raise HidTapInjectionError("injector_launch_failed", diagnostic=dict(
+            injection_diagnostics.failure(exc, stage='child_launch'),
+            execution_route='direct_child', result_status='unavailable')) from exc
     if completed.returncode != 0:
         return_code = int(completed.returncode)
         detail = HID_TAP_INJECTOR_EXIT_DETAILS.get(
             return_code, f"injector_exit_code_{return_code}"
         )
-        raise HidTapInjectionError(detail)
+        diagnostic = injection_diagnostics.decode(
+            completed.stdout, exit_code=return_code, target_pid=pid)
+        raise HidTapInjectionError(detail, diagnostic=dict(
+            diagnostic, execution_route='direct_child'))
 
 
 _DEFAULT_SUBPROCESS_RUN = subprocess.run
@@ -417,11 +429,15 @@ def run_injector_subprocess(
                     )
                 except hid_helper_consumers.ConsumerMaintenanceError as exc:
                     raise HidTapInjectionError(
-                        "hid_helper_operation_busy"
+                        "hid_helper_operation_busy", diagnostic=dict(
+                            injection_diagnostics.failure(exc, stage='consumer_registration'),
+                            execution_route='registered_helper', result_status='unavailable')
                     ) from exc
                 except Exception as exc:
                     raise HidTapInjectionError(
-                        "helper_consumer_unregistered"
+                        "helper_consumer_unregistered", diagnostic=dict(
+                            injection_diagnostics.failure(exc, stage='consumer_registration'),
+                            execution_route='registered_helper', result_status='unavailable')
                     ) from exc
                 if marker is None or not (
                     hid_helper_consumers.current_consumer_is_registered(
@@ -429,13 +445,20 @@ def run_injector_subprocess(
                     )
                 ):
                     raise HidTapInjectionError(
-                        "helper_consumer_unregistered"
+                        "helper_consumer_unregistered", diagnostic=dict(
+                            stage='consumer_registration', execution_route='registered_helper',
+                            result_status='unavailable')
                     )
         try:
             _registered_injector(pid)
         except Exception as exc:  # noqa: BLE001 - expose only the stable detail
             detail = str(exc).strip() or "hid_helper_task_start_failed"
-            raise HidTapInjectionError(detail) from exc
+            diagnostic = getattr(exc, 'injection_diagnostic', None)
+            if not isinstance(diagnostic, dict) or not diagnostic:
+                diagnostic = dict(injection_diagnostics.failure(exc, stage='helper_task'),
+                                  result_status='missing')
+            raise HidTapInjectionError(detail, diagnostic=dict(
+                diagnostic, execution_route='registered_helper')) from exc
         return
 
     _run_direct_injector_subprocess(
@@ -498,6 +521,7 @@ class RC003HidReportTap:
         self._selected_key = selected_key
         self._diagnostic_trace = diagnostic_trace
         self._diagnostic_tap_id = uuid.uuid4().hex
+        self._diagnostic_injection_id = None
         self._diagnostic_report_seq = 0
         self._diagnostic_host_pid = None
         self._diagnostic_connection_seq = 0
@@ -538,9 +562,16 @@ class RC003HidReportTap:
         # Callers supply only fixed reason codes, counters and whitelisted metadata.
         payload = {"tap_id": self._diagnostic_tap_id, "app_pid": os.getpid(),
                    "host_pid": self._diagnostic_host_pid,
+                   "injection_attempt_id": self._diagnostic_injection_id,
                    "connection_seq": self._diagnostic_connection_seq, **fields}
+        extra = {}
+        if event == 'hid_injection_result' and payload.get('success') is False:
+            extra = {'failure_key': 'hid_injection:' + str(payload.get('stage', 'unknown')),
+                     'failure_id': uuid.uuid4().hex}
+            payload.update(extra)
         try:
-            _LOGGER.info("HID diagnostic: %s", json.dumps({"event": event, **payload}, ensure_ascii=True))
+            _LOGGER.info("HID diagnostic: %s", json.dumps({"event": event, **payload}, ensure_ascii=True),
+                         extra=extra)
         except Exception:
             pass
         try:
@@ -552,6 +583,26 @@ class RC003HidReportTap:
     @staticmethod
     def _hook_error_code(value: object) -> str:
         return value if isinstance(value, str) and value in _HOOK_ERROR_CODES else "hook_error_unresolved"
+
+    def _record_injection_failure(self, exc):
+        try:
+            raw = getattr(exc, 'injection_diagnostic', {})
+            diagnostic = injection_diagnostics.failure(exc)
+            if isinstance(raw, dict):
+                for key, allowed in (
+                    ('execution_route', {'direct_child', 'registered_helper'}),
+                    ('result_status', {'received', 'missing', 'invalid', 'timeout', 'unavailable',
+                                      'instance_mismatch'}),
+                ):
+                    value = raw.get(key)
+                    if isinstance(value, str) and value in allowed:
+                        diagnostic[key] = value
+            diagnostic['success'] = False
+            self._record_diagnostic('hid_injection_result', **diagnostic)
+        except Exception:
+            # Optional evidence cannot change the original failure/retry state.
+            self._record_diagnostic('hid_injection_result', success=False, stage='unknown',
+                                    result_status='unavailable')
 
     def _record_hook_error(self, message: dict) -> None:
         code = self._hook_error_code(message.get("code"))
@@ -1134,15 +1185,20 @@ class RC003HidReportTap:
                 server.listen(1)
                 server.settimeout(1.0)
                 if injection_attempted_pid is None:
+                    self._diagnostic_injection_id = uuid.uuid4().hex
                     self._set_status(HidTapState.INJECTING)
+                    self._record_diagnostic('hid_injection_attempt', app_version=__version__,
+                                            app_frozen=bool(getattr(sys, 'frozen', False)))
                     try:
                         self.injector(pid)
+                        self._record_diagnostic('hid_injection_result', success=True, stage='complete')
                         injection_attempted_pid = pid
                         transient_injection_failures = 0
                         connection_deadline = time.monotonic() + self.connection_timeout
                         reload_grace_deadline = connection_deadline
                         reload_mismatch = ""
                     except Exception as exc:  # noqa: BLE001 - retry with sanitized state
+                        self._record_injection_failure(exc)
                         detail = (
                             str(exc)
                             if isinstance(exc, HidTapInjectionError)
@@ -1164,7 +1220,7 @@ class RC003HidReportTap:
                         self._set_status(
                             HidTapState.RESTART_REQUIRED
                             if detail == "hid_helper_legacy_runtime_restart_required"
-                            else HidTapState.FAILED,
+                            else HidTapState.RECOVERING if retry_same_pid else HidTapState.FAILED,
                             detail,
                         )
                         self.stop_event.wait(self.retry_delay)

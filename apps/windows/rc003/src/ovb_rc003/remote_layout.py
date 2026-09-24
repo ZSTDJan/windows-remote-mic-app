@@ -4,9 +4,9 @@ row (XRBM-030).
 
 Hotspot coordinates are calibrated for the bundled RC003 product photo and
 stored as fractions (0..1) of the photo's own width/height, so they are
-resolution-independent. The same fractions apply at any display size because
-the photo's own aspect ratio (508:1030, see ``THIRD_PARTY_NOTICES.md``) is
-preserved by the Qt Quick ``PreserveAspectFit`` view.
+resolution-independent. ButtonsPage preserves each source photo's aspect
+ratio and positions hotspots relative to the rendered image, including its
+transparent padding, so the same fractions apply at any display size.
 
 This module has no Tk/Qt import at all, so it is directly unit-testable
 (see tests/test_remote_layout.py) and importable from a plain ``--dry-run``
@@ -103,5 +103,59 @@ BUTTON_HOTSPOTS_BY_ID: Dict[str, ButtonHotspot] = {
 BUTTON_ORDER: Tuple[str, ...] = tuple(hotspot.button_id for hotspot in BUTTON_HOTSPOTS)
 
 
-def hotspot_for(button_id: str) -> Optional[ButtonHotspot]:
+CHROMECAST_HOTSPOTS = (
+    ButtonHotspot("up", .50, .060, .22, .045),
+    ButtonHotspot("left", .20, .152, .17, .065),
+    ButtonHotspot("ok", .50, .152, .28, .095),
+    ButtonHotspot("right", .81, .152, .17, .065),
+    ButtonHotspot("down", .50, .250, .22, .045),
+    ButtonHotspot("back", .26, .355, .28, .090),
+    ButtonHotspot("mic", .73, .355, .28, .090, is_voice=True),
+    ButtonHotspot("home", .26, .483, .28, .090),
+    ButtonHotspot("volume_mute", .73, .483, .28, .090),
+    ButtonHotspot("youtube", .26, .612, .28, .090),
+    ButtonHotspot("netflix", .73, .612, .28, .090),
+    ButtonHotspot("power", .26, .733, .16, .052),
+    ButtonHotspot("input_source", .73, .733, .16, .052),
+    # Side rocker: the supplied front photo shows only its right edge.
+    ButtonHotspot("volume_up", .98, .208, .04, .035),
+    ButtonHotspot("volume_down", .98, .252, .04, .035),
+)
+CHROMECAST_DISPLAY_NAMES = {
+    **{key: value for key, value in BUTTON_DISPLAY_NAMES.items() if key not in {"menu", "tv"}},
+    "mic": "语音 / Assistant", "volume_mute": "静音键",
+    "youtube": "YouTube", "netflix": "Netflix", "input_source": "输入源",
+}
+CHROMECAST_REPORT_CODES = {
+    "power": 0x01, "up": 0x03, "down": 0x04, "left": 0x05, "right": 0x06,
+    "ok": 0x07, "volume_mute": 0x08, "home": 0x0A, "back": 0x0B,
+    "volume_up": 0x0C, "volume_down": 0x0D, "youtube": 0x0E,
+    "netflix": 0x0F, "input_source": 0x11,
+}
+
+
+def button_order(profile: str = "xiaomi-rc003") -> Tuple[str, ...]:
+    if profile == "chromecast-remote":
+        return tuple(item.button_id for item in CHROMECAST_HOTSPOTS)
+    return BUTTON_ORDER
+
+
+def display_names(profile: str = "xiaomi-rc003") -> Dict[str, str]:
+    return CHROMECAST_DISPLAY_NAMES if profile == "chromecast-remote" else BUTTON_DISPLAY_NAMES
+
+
+def default_actions(profile: str = "xiaomi-rc003") -> dict:
+    from . import key_mapping
+    defaults = key_mapping.default_button_actions()
+    if profile != "chromecast-remote":
+        return defaults
+    result = {button: defaults.get(button, key_mapping.ButtonAction(key_mapping.ActionKind.DISABLED))
+              for button in button_order(profile)}
+    result["volume_mute"] = key_mapping.ButtonAction(key_mapping.ActionKind.SYSTEM_VOLUME_MUTE)
+    return result
+
+
+def hotspot_for(button_id: str, profile: str = "xiaomi-rc003") -> Optional[ButtonHotspot]:
+    if profile == "chromecast-remote":
+        return next((item for item in CHROMECAST_HOTSPOTS if item.button_id == button_id), None)
     return BUTTON_HOTSPOTS_BY_ID.get(button_id)

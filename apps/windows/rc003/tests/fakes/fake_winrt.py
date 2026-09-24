@@ -70,6 +70,12 @@ class FakeGattWriteResult:
         self.status = status
 
 
+class FakeGattReadResult:
+    def __init__(self, status: int, value: bytes) -> None:
+        self.status = status
+        self.value = bytes(value)
+
+
 class FakeGattServicesResult:
     def __init__(self, status: int, services: List["FakeGattDeviceService"]) -> None:
         self.status = status
@@ -108,14 +114,43 @@ class FakeDataWriter:
             raise self.close_error
 
 
+class FakeDataReader:
+    def __init__(self, value: bytes) -> None:
+        self._value = bytes(value)
+        self._offset = 0
+        self.close_calls = 0
+
+    @property
+    def unconsumed_buffer_length(self) -> int:
+        return len(self._value) - self._offset
+
+    def read_byte(self) -> int:
+        if self._offset >= len(self._value):
+            raise EOFError("fake DataReader has no bytes left")
+        value = self._value[self._offset]
+        self._offset += 1
+        return value
+
+    def close(self) -> None:
+        self.close_calls += 1
+
+
 class FakeGattCharacteristic:
-    def __init__(self, characteristic_uuid: uuid.UUID, on_write=None) -> None:
+    def __init__(
+        self,
+        characteristic_uuid: uuid.UUID,
+        on_write=None,
+        read_value: bytes = b"",
+    ) -> None:
         self.uuid = characteristic_uuid
         self._handlers: Dict[int, Any] = {}
         self._next_token = 1
         self.cccd_history: List[int] = []
         self._on_write = on_write
         self.write_history: List[bytes] = []
+        self.read_value = bytes(read_value)
+        self.read_status = FakeGattCommunicationStatus.SUCCESS
+        self.read_cache_modes: List[int] = []
         # Test-only controllable blocking hook (XRBM-018 RETRY 1 P1 #3):
         # when set to an ``asyncio.Event``, write_value_with_result_async()
         # blocks on it (after incrementing write_started_count, so a test
@@ -156,6 +191,10 @@ class FakeGattCharacteristic:
         if self._on_write is not None:
             self._on_write(bytes(buffer))
         return FakeGattWriteResult(FakeGattCommunicationStatus.SUCCESS)
+
+    async def read_value_with_cache_mode_async(self, cache_mode) -> FakeGattReadResult:
+        self.read_cache_modes.append(cache_mode)
+        return FakeGattReadResult(self.read_status, self.read_value)
 
     def fire(self, payload: bytes) -> None:
         """Test helper: simulate a BLE notification arriving."""
@@ -213,14 +252,26 @@ class FakeGattDeviceService:
 
 
 class FakeBluetoothLEDevice:
-    def __init__(self, device_id: str, service: FakeGattDeviceService) -> None:
+    def __init__(
+        self,
+        device_id: str,
+        service_uuid: uuid.UUID,
+        service: FakeGattDeviceService,
+    ) -> None:
         self.id = device_id
-        self._service = service
+        self._services = {service_uuid: service}
         self.closed = False
         self._connection_status_handlers: Dict[int, Any] = {}
         self._next_token = 1
         self.connection_status = FakeBluetoothConnectionStatus.CONNECTED
         self.service_query_cache_modes: List[int] = []
+
+    def register_service(
+        self,
+        service_uuid: uuid.UUID,
+        service: FakeGattDeviceService,
+    ) -> None:
+        self._services[service_uuid] = service
 
     def add_connection_status_changed(self, handler) -> int:
         token = self._next_token
@@ -238,7 +289,11 @@ class FakeBluetoothLEDevice:
         assert isinstance(service_uuid, uuid.UUID), (
             f"get_gatt_services_for_uuid_async requires a uuid.UUID, got {type(service_uuid)!r}"
         )
-        return FakeGattServicesResult(FakeGattCommunicationStatus.SUCCESS, [self._service])
+        service = self._services.get(service_uuid)
+        return FakeGattServicesResult(
+            FakeGattCommunicationStatus.SUCCESS,
+            [] if service is None else [service],
+        )
 
     async def get_gatt_services_for_uuid_with_cache_mode_async(
         self, service_uuid: uuid.UUID, cache_mode
@@ -272,6 +327,7 @@ class FakeWinRTEnvironment:
         self.name = name
 
         from ovb_rc003 import atvv_protocol as proto
+        from ovb_rc003 import ble_transport_winrt
 
         self.tx_characteristic = FakeGattCharacteristic(uuid.UUID(proto.VOICE_TX_UUID))
         self.audio_characteristic = FakeGattCharacteristic(uuid.UUID(proto.VOICE_AUDIO_UUID))
@@ -286,10 +342,29 @@ class FakeWinRTEnvironment:
             uuid.UUID(proto.VOICE_CONTROL_UUID), self.control_characteristic
         )
 
-        self.device = FakeBluetoothLEDevice(device_id, self.service)
+        self.battery_characteristic = FakeGattCharacteristic(
+            uuid.UUID(ble_transport_winrt.BATTERY_LEVEL_UUID),
+            read_value=bytes((59,)),
+        )
+        self.battery_service = FakeGattDeviceService()
+        self.battery_service.register_characteristic(
+            uuid.UUID(ble_transport_winrt.BATTERY_LEVEL_UUID),
+            self.battery_characteristic,
+        )
+
+        self.device = FakeBluetoothLEDevice(
+            device_id,
+            uuid.UUID(proto.VOICE_SERVICE_UUID),
+            self.service,
+        )
+        self.device.register_service(
+            uuid.UUID(ble_transport_winrt.BATTERY_SERVICE_UUID),
+            self.battery_service,
+        )
         self.discovered_info = FakeDeviceInformation(device_id, name)
         self.discovered_infos = [self.discovered_info]
         self.data_writers: List[FakeDataWriter] = []
+        self.data_readers: List[FakeDataReader] = []
         self.data_writer_close_error: Optional[BaseException] = None
 
         self._device_information_cls = self._build_device_information_cls()
@@ -348,6 +423,11 @@ class FakeWinRTEnvironment:
             self.data_writers.append(writer)
             return writer
 
+        def data_reader_factory(value):
+            reader = FakeDataReader(value)
+            self.data_readers.append(reader)
+            return reader
+
         return WinRTModules(
             bluetooth_le_device=self._build_bluetooth_le_device_cls(),
             bluetooth_connection_status=FakeBluetoothConnectionStatus,
@@ -355,5 +435,6 @@ class FakeWinRTEnvironment:
             cccd_value=FakeGattClientCharacteristicConfigurationDescriptorValue,
             device_information=self._device_information_cls,
             data_writer_factory=data_writer_factory,
+            data_reader_factory=data_reader_factory,
             bluetooth_cache_mode=FakeBluetoothCacheMode,
         )

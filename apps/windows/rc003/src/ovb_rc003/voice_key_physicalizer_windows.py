@@ -60,6 +60,7 @@ VOICE_EVENT_MARKER_PREFIX_MASK = _VOICE_EVENT_MARKER_PREFIX_MASK
 VOICE_EVENT_MARKER_SEQUENCE_MASK = _VOICE_EVENT_MARKER_SEQUENCE_MASK
 _TRACKING_LOST_CALLBACK_TIMEOUT_SECONDS = 3.0
 _TRACKING_LOST_PUMP_INTERVAL_SECONDS = 0.005
+_RALT_STALE_OWNER_GRACE_SECONDS = 0.250
 _RC003_DIRECTION_EDGE_LIFETIME_SECONDS = 0.180
 _RC003_DIRECTION_HOLD_LIFETIME_SECONDS = 10.0
 _RC003_DIRECTION_RELEASE_LIFETIME_SECONDS = 0.180
@@ -83,9 +84,24 @@ def set_diagnostic_trace(trace: Optional[diagnostic_trace.DiagnosticTrace]) -> N
 _PHYSICAL_KEY_STATE_LOCK = threading.Lock()
 _PHYSICAL_KEYS_DOWN: set[int] = set()
 _PHYSICAL_KEYS_TOUCHED: set[int] = set()
+_PHYSICAL_KEY_REVISIONS: dict[int, int] = {}
+_PHYSICAL_KEY_LAST_EDGE_AT: dict[int, float] = {}
+_PHYSICAL_RALT_CALLBACKS_IN_FLIGHT = 0
+_PHYSICAL_RALT_CALLBACK_REVISION = 0
 _PHYSICAL_TRACKER_ACTIVE = False
 _PHYSICAL_TRACKER_DRAINING = False
 _PHYSICAL_TRACKER_GENERATION = 0
+_PHYSICAL_TRACKER_INSTALLATION_EPOCH = 0
+_PHYSICAL_TRACKER_OWNER: Optional["VoiceKeyPhysicalizer"] = None
+_PHYSICAL_TRACKER_HOOK_HANDLE = 0
+_PHYSICAL_TRACKER_OWNER_THREAD_ID = 0
+_PHYSICAL_TRACKER_OWNER_PYTHON_IDENT = 0
+_PHYSICAL_TRACKER_CALLBACK_ENTRIES = 0
+_PHYSICAL_TRACKER_MARKER_CALLBACKS = 0
+_PHYSICAL_TRACKER_MARKER_MATCHES = 0
+_PHYSICAL_TRACKER_MARKER_MISMATCHES: dict[str, int] = {}
+_PHYSICAL_TRACKER_LAST_CALLBACK_AT = 0.0
+_PHYSICAL_TRACKER_LAST_MARKER_AT = 0.0
 _GENERIC_KEY_VARIANTS = {
     VK_SHIFT: (VK_LSHIFT, VK_RSHIFT),
     VK_CONTROL: (VK_LCONTROL, VK_RCONTROL),
@@ -110,13 +126,93 @@ class VoiceEventConfirmation:
         self,
         marker: int,
         generation: int,
+        installation_epoch: int,
         key_up: bool,
+        callback_entries: int,
+        marker_callbacks: int,
+        marker_matches: int,
     ) -> None:
         self.marker = int(marker)
         self.generation = int(generation)
+        self.installation_epoch = int(installation_epoch)
         self.key_up = bool(key_up)
+        self.created_at = time.monotonic()
+        self.callback_entries = int(callback_entries)
+        self.marker_callbacks = int(marker_callbacks)
+        self.marker_matches = int(marker_matches)
         self.event = threading.Event()
+        self.marker_seen = False
+        self.downstream_completed = False
+        self.downstream_result = 0
+        self.downstream_error = False
+        self.cancelled = False
         self.confirmed = False
+
+
+@dataclass(frozen=True)
+class PhysicalizerHealthSnapshot:
+    active: bool
+    draining: bool
+    generation: int
+    installation_epoch: int
+    hook_handle: int
+    owner_thread_id: int
+    owner_python_ident: int
+    callback_entries: int
+    marker_callbacks: int
+    marker_matches: int
+    marker_mismatches: tuple[tuple[str, int], ...]
+    last_callback_age_ms: int
+    last_marker_age_ms: int
+    pending_confirmations: int
+    receipt_generation: int = -1
+    receipt_installation_epoch: int = -1
+    receipt_marker: int = 0
+    receipt_key_up: bool = False
+    receipt_age_ms: int = -1
+    receipt_callback_entry_delta: int = -1
+    receipt_marker_callback_delta: int = -1
+    receipt_marker_match_delta: int = -1
+    owner_stack: tuple[str, ...] = ()
+
+    @property
+    def accepting_new_down(self) -> bool:
+        return bool(self.active and not self.draining)
+
+    def trace_fields(self) -> dict[str, object]:
+        return {
+            "tracker_active": self.active,
+            "tracker_draining": self.draining,
+            "tracker_generation": self.generation,
+            "tracker_installation_epoch": self.installation_epoch,
+            "tracker_hook_handle": self.hook_handle,
+            "tracker_owner_thread_id": self.owner_thread_id,
+            "tracker_callback_entries": self.callback_entries,
+            "tracker_marker_callbacks": self.marker_callbacks,
+            "tracker_marker_matches": self.marker_matches,
+            "tracker_marker_mismatches": dict(self.marker_mismatches),
+            "tracker_last_callback_age_ms": self.last_callback_age_ms,
+            "tracker_last_marker_age_ms": self.last_marker_age_ms,
+            "tracker_pending_confirmations": self.pending_confirmations,
+            "receipt_generation": self.receipt_generation,
+            "receipt_installation_epoch": self.receipt_installation_epoch,
+            "receipt_marker": self.receipt_marker,
+            "receipt_edge": "up" if self.receipt_key_up else "down",
+            "receipt_age_ms": self.receipt_age_ms,
+            "receipt_callback_entry_delta": self.receipt_callback_entry_delta,
+            "receipt_marker_callback_delta": self.receipt_marker_callback_delta,
+            "receipt_marker_match_delta": self.receipt_marker_match_delta,
+            "tracker_owner_stack": list(self.owner_stack),
+        }
+
+
+@dataclass(frozen=True)
+class PhysicalReleaseGuard:
+    """One current, owner-free tracker state for a release observation."""
+
+    generation: int
+    installation_epoch: int
+    callback_revision: int
 
 
 @dataclass(frozen=True)
@@ -156,36 +252,87 @@ class KBDLLHOOKSTRUCT(ctypes.Structure):
 def physicalize_injected_event(
     event: KBDLLHOOKSTRUCT,
     key_up: bool,
-) -> bool:
-    """Consume one current ticket and clear its right-Alt injection metadata."""
+) -> Optional[VoiceEventConfirmation]:
+    """Claim one ticket and clear its right-Alt injection metadata.
 
-    if not (int(event.flags) & LLKHF_INJECTED):
-        return False
-    if int(event.vkCode) != VK_RMENU:
-        return False
+    Matching the marker proves only that this hook saw the edge.  Completion is
+    signalled separately after ``CallNextHookEx`` returns so callers cannot
+    clear release ownership while downstream hooks are still processing it.
+    """
+
     marker = int(event.dwExtraInfo)
     if not _is_voice_event_marker(marker):
-        return False
+        return None
+    global _PHYSICAL_TRACKER_MARKER_CALLBACKS
+    global _PHYSICAL_TRACKER_MARKER_MATCHES, _PHYSICAL_TRACKER_LAST_MARKER_AT
+
     with _PHYSICAL_KEY_STATE_LOCK:
+        _PHYSICAL_TRACKER_MARKER_CALLBACKS += 1
+        _PHYSICAL_TRACKER_LAST_MARKER_AT = time.monotonic()
+        if not (int(event.flags) & LLKHF_INJECTED):
+            _record_marker_mismatch_locked("not_injected")
+            return None
+        if int(event.vkCode) != VK_RMENU:
+            _record_marker_mismatch_locked("wrong_key")
+            return None
         if not _PHYSICAL_TRACKER_ACTIVE:
-            return False
+            _record_marker_mismatch_locked("inactive")
+            return None
         generation = _PHYSICAL_TRACKER_GENERATION
         with _VOICE_CONFIRMATION_LOCK:
             confirmation = _VOICE_CONFIRMATIONS.get(marker)
-            if (
-                confirmation is None
-                or confirmation.generation != generation
-                or confirmation.key_up != bool(key_up)
-            ):
-                return False
-            _VOICE_CONFIRMATIONS.pop(marker, None)
+            if confirmation is None:
+                _record_marker_mismatch_locked("missing_receipt")
+                return None
+            if confirmation.generation != generation:
+                _record_marker_mismatch_locked("stale_generation")
+                return None
+            if confirmation.key_up != bool(key_up):
+                _record_marker_mismatch_locked("wrong_edge")
+                return None
+            if confirmation.marker_seen:
+                _record_marker_mismatch_locked("duplicate_receipt")
+                return None
             event.flags = int(event.flags) & ~(
                 LLKHF_INJECTED | LLKHF_LOWER_IL_INJECTED
             )
             event.dwExtraInfo = 0
-            confirmation.confirmed = True
+            confirmation.marker_seen = True
+            _PHYSICAL_TRACKER_MARKER_MATCHES += 1
+            return confirmation
+
+
+def complete_marked_voice_event(
+    confirmation: VoiceEventConfirmation,
+    *,
+    downstream_result: int = 0,
+    downstream_error: bool = False,
+) -> None:
+    """Complete a claimed receipt after the downstream hook chain returns."""
+
+    with _PHYSICAL_KEY_STATE_LOCK:
+        current_generation = _PHYSICAL_TRACKER_GENERATION
+        current_epoch = _PHYSICAL_TRACKER_INSTALLATION_EPOCH
+        tracker_current = bool(
+            _PHYSICAL_TRACKER_ACTIVE
+            and confirmation.generation == current_generation
+            and confirmation.installation_epoch == current_epoch
+        )
+        with _VOICE_CONFIRMATION_LOCK:
+            current = _VOICE_CONFIRMATIONS.get(confirmation.marker)
+            if current is not confirmation:
+                return
+            _VOICE_CONFIRMATIONS.pop(confirmation.marker, None)
+            confirmation.downstream_completed = True
+            confirmation.downstream_result = int(downstream_result)
+            confirmation.downstream_error = bool(downstream_error)
+            confirmation.confirmed = bool(
+                tracker_current
+                and confirmation.marker_seen
+                and not confirmation.cancelled
+                and not confirmation.downstream_error
+            )
             confirmation.event.set()
-            return True
 
 
 def _is_voice_event_marker(value: int) -> bool:
@@ -195,6 +342,158 @@ def _is_voice_event_marker(value: int) -> bool:
     ) == _VOICE_EVENT_MARKER_PREFIX and bool(
         normalized & _VOICE_EVENT_MARKER_SEQUENCE_MASK
     )
+
+
+def _record_marker_mismatch_locked(reason: str) -> None:
+    _PHYSICAL_TRACKER_MARKER_MISMATCHES[reason] = (
+        _PHYSICAL_TRACKER_MARKER_MISMATCHES.get(reason, 0) + 1
+    )
+
+
+def _record_hook_callback_entry() -> None:
+    global _PHYSICAL_TRACKER_CALLBACK_ENTRIES, _PHYSICAL_TRACKER_LAST_CALLBACK_AT
+
+    with _PHYSICAL_KEY_STATE_LOCK:
+        _PHYSICAL_TRACKER_CALLBACK_ENTRIES += 1
+        _PHYSICAL_TRACKER_LAST_CALLBACK_AT = time.monotonic()
+
+
+def _owner_stack(owner_python_ident: int) -> tuple[str, ...]:
+    if not owner_python_ident:
+        return ()
+    try:
+        frame = sys._current_frames().get(int(owner_python_ident))
+    except Exception:
+        return ()
+    locations = []
+    while frame is not None and len(locations) < 32:
+        module = str(frame.f_globals.get("__name__", ""))
+        locations.append(f"{module}:{frame.f_code.co_name}:{frame.f_lineno}")
+        frame = frame.f_back
+    return tuple(locations)
+
+
+def snapshot_health(
+    confirmation: Optional[VoiceEventConfirmation] = None,
+    *,
+    include_owner_stack: bool = False,
+) -> PhysicalizerHealthSnapshot:
+    """Return a bounded, immutable tracker snapshot for diagnostics."""
+
+    now = time.monotonic()
+    with _PHYSICAL_KEY_STATE_LOCK:
+        active = _PHYSICAL_TRACKER_ACTIVE
+        draining = _PHYSICAL_TRACKER_DRAINING
+        generation = _PHYSICAL_TRACKER_GENERATION
+        installation_epoch = _PHYSICAL_TRACKER_INSTALLATION_EPOCH
+        hook_handle = _PHYSICAL_TRACKER_HOOK_HANDLE
+        owner_thread_id = _PHYSICAL_TRACKER_OWNER_THREAD_ID
+        owner_python_ident = _PHYSICAL_TRACKER_OWNER_PYTHON_IDENT
+        callback_entries = _PHYSICAL_TRACKER_CALLBACK_ENTRIES
+        marker_callbacks = _PHYSICAL_TRACKER_MARKER_CALLBACKS
+        marker_matches = _PHYSICAL_TRACKER_MARKER_MATCHES
+        marker_mismatches = tuple(
+            sorted(_PHYSICAL_TRACKER_MARKER_MISMATCHES.items())
+        )
+        last_callback_at = _PHYSICAL_TRACKER_LAST_CALLBACK_AT
+        last_marker_at = _PHYSICAL_TRACKER_LAST_MARKER_AT
+        with _VOICE_CONFIRMATION_LOCK:
+            pending_confirmations = sum(
+                item.generation == generation
+                for item in _VOICE_CONFIRMATIONS.values()
+            )
+
+    receipt_generation = -1
+    receipt_installation_epoch = -1
+    receipt_marker = 0
+    receipt_key_up = False
+    receipt_age_ms = -1
+    receipt_callback_entry_delta = -1
+    receipt_marker_callback_delta = -1
+    receipt_marker_match_delta = -1
+    if confirmation is not None:
+        receipt_generation = int(confirmation.generation)
+        receipt_installation_epoch = int(confirmation.installation_epoch)
+        receipt_marker = int(confirmation.marker)
+        receipt_key_up = bool(confirmation.key_up)
+        receipt_age_ms = max(0, int((now - confirmation.created_at) * 1000))
+        receipt_callback_entry_delta = max(
+            0, callback_entries - confirmation.callback_entries
+        )
+        receipt_marker_callback_delta = max(
+            0, marker_callbacks - confirmation.marker_callbacks
+        )
+        receipt_marker_match_delta = max(
+            0, marker_matches - confirmation.marker_matches
+        )
+
+    return PhysicalizerHealthSnapshot(
+        active=bool(active),
+        draining=bool(draining),
+        generation=int(generation),
+        installation_epoch=int(installation_epoch),
+        hook_handle=int(hook_handle),
+        owner_thread_id=int(owner_thread_id),
+        owner_python_ident=int(owner_python_ident),
+        callback_entries=int(callback_entries),
+        marker_callbacks=int(marker_callbacks),
+        marker_matches=int(marker_matches),
+        marker_mismatches=marker_mismatches,
+        last_callback_age_ms=(
+            max(0, int((now - last_callback_at) * 1000))
+            if last_callback_at
+            else -1
+        ),
+        last_marker_age_ms=(
+            max(0, int((now - last_marker_at) * 1000))
+            if last_marker_at
+            else -1
+        ),
+        pending_confirmations=int(pending_confirmations),
+        receipt_generation=receipt_generation,
+        receipt_installation_epoch=receipt_installation_epoch,
+        receipt_marker=receipt_marker,
+        receipt_key_up=receipt_key_up,
+        receipt_age_ms=receipt_age_ms,
+        receipt_callback_entry_delta=receipt_callback_entry_delta,
+        receipt_marker_callback_delta=receipt_marker_callback_delta,
+        receipt_marker_match_delta=receipt_marker_match_delta,
+        owner_stack=(
+            _owner_stack(owner_python_ident) if include_owner_stack else ()
+        ),
+    )
+
+
+def mark_required_confirmation_failed(
+    confirmation: VoiceEventConfirmation,
+) -> tuple[bool, PhysicalizerHealthSnapshot]:
+    """Close new DOWN admission for the still-current failed transaction."""
+
+    global _PHYSICAL_TRACKER_DRAINING
+
+    owner: Optional[VoiceKeyPhysicalizer] = None
+    applied = False
+    with _PHYSICAL_KEY_STATE_LOCK:
+        if (
+            not confirmation.confirmed
+            and _PHYSICAL_TRACKER_ACTIVE
+            and confirmation.generation == _PHYSICAL_TRACKER_GENERATION
+            and confirmation.installation_epoch
+            == _PHYSICAL_TRACKER_INSTALLATION_EPOCH
+        ):
+            _PHYSICAL_TRACKER_DRAINING = True
+            owner = _PHYSICAL_TRACKER_OWNER
+            applied = True
+    snapshot = snapshot_health(
+        confirmation,
+        include_owner_stack=True,
+    )
+    if applied and owner is not None:
+        owner._mark_required_confirmation_failed(
+            "required_confirmation_timeout",
+            snapshot,
+        )
+    return applied, snapshot
 
 
 def begin_marked_voice_event(key_up: bool) -> VoiceEventConfirmation:
@@ -212,6 +511,10 @@ def begin_marked_voice_event(key_up: bool) -> VoiceEventConfirmation:
                 "voice key physicalizer is draining and rejects new key-downs"
             )
         generation = _PHYSICAL_TRACKER_GENERATION
+        installation_epoch = _PHYSICAL_TRACKER_INSTALLATION_EPOCH
+        callback_entries = _PHYSICAL_TRACKER_CALLBACK_ENTRIES
+        marker_callbacks = _PHYSICAL_TRACKER_MARKER_CALLBACKS
+        marker_matches = _PHYSICAL_TRACKER_MARKER_MATCHES
     with _VOICE_CONFIRMATION_LOCK:
         sequence = _VOICE_CONFIRMATION_SEQUENCE
         while True:
@@ -222,9 +525,26 @@ def begin_marked_voice_event(key_up: bool) -> VoiceEventConfirmation:
             if marker not in _VOICE_CONFIRMATIONS:
                 break
         _VOICE_CONFIRMATION_SEQUENCE = sequence
-        confirmation = VoiceEventConfirmation(marker, generation, key_up)
+        confirmation = VoiceEventConfirmation(
+            marker,
+            generation,
+            installation_epoch,
+            key_up,
+            callback_entries,
+            marker_callbacks,
+            marker_matches,
+        )
         _VOICE_CONFIRMATIONS[marker] = confirmation
         return confirmation
+
+
+def _pending_voice_marker_for_diagnostics(key_up: bool) -> int:
+    # Observation only: a same-edge event without our marker cannot acknowledge
+    # this receipt. Do not log ordinary typing or unrelated right-Alt activity.
+    with _VOICE_CONFIRMATION_LOCK:
+        pending = [item.marker for item in _VOICE_CONFIRMATIONS.values()
+                   if item.key_up == key_up and not item.cancelled and not item.marker_seen]
+    return pending[0] if len(pending) == 1 else 0
 
 
 def cancel_marked_voice_event(confirmation: VoiceEventConfirmation) -> None:
@@ -232,6 +552,7 @@ def cancel_marked_voice_event(confirmation: VoiceEventConfirmation) -> None:
         current = _VOICE_CONFIRMATIONS.get(confirmation.marker)
         if current is confirmation:
             _VOICE_CONFIRMATIONS.pop(confirmation.marker, None)
+            confirmation.cancelled = True
             confirmation.event.set()
 
 
@@ -244,6 +565,7 @@ def wait_for_marked_voice_event(
         current = _VOICE_CONFIRMATIONS.get(confirmation.marker)
         if current is confirmation:
             _VOICE_CONFIRMATIONS.pop(confirmation.marker, None)
+            confirmation.cancelled = True
         return bool(confirmation.confirmed)
 
 
@@ -256,6 +578,7 @@ def _cancel_voice_confirmations(generation: int) -> None:
         ]
         for confirmation in cancelled:
             _VOICE_CONFIRMATIONS.pop(confirmation.marker, None)
+            confirmation.cancelled = True
             confirmation.event.set()
 
 
@@ -270,17 +593,50 @@ def record_physical_key_event(
     vk_code = _normalize_modifier_vk(event)
     if vk_code is None:
         return False
+    message = int(message)
+    if message not in (WM_KEYDOWN, WM_SYSKEYDOWN, WM_KEYUP, WM_SYSKEYUP):
+        return False
     with _PHYSICAL_KEY_STATE_LOCK:
         if not _PHYSICAL_TRACKER_ACTIVE:
             return False
+        changed_at = time.monotonic()
         _PHYSICAL_KEYS_TOUCHED.add(vk_code)
-        if int(message) in (WM_KEYDOWN, WM_SYSKEYDOWN):
+        _PHYSICAL_KEY_REVISIONS[vk_code] = _PHYSICAL_KEY_REVISIONS.get(vk_code, 0) + 1
+        _PHYSICAL_KEY_LAST_EDGE_AT[vk_code] = changed_at
+        if message in (WM_KEYDOWN, WM_SYSKEYDOWN):
             _PHYSICAL_KEYS_DOWN.add(vk_code)
-        elif int(message) in (WM_KEYUP, WM_SYSKEYUP):
-            _PHYSICAL_KEYS_DOWN.discard(vk_code)
         else:
-            return False
+            _PHYSICAL_KEYS_DOWN.discard(vk_code)
     return True
+
+
+def _begin_physical_ralt_callback(event: KBDLLHOOKSTRUCT) -> Optional[int]:
+    """Fence a real right-Alt callback until its state update completes."""
+
+    global _PHYSICAL_RALT_CALLBACKS_IN_FLIGHT, _PHYSICAL_RALT_CALLBACK_REVISION
+
+    if int(event.flags) & LLKHF_INJECTED or _normalize_modifier_vk(event) != VK_RMENU:
+        return None
+    with _PHYSICAL_KEY_STATE_LOCK:
+        if not _PHYSICAL_TRACKER_ACTIVE:
+            return None
+        generation = _PHYSICAL_TRACKER_GENERATION
+        _PHYSICAL_RALT_CALLBACKS_IN_FLIGHT += 1
+        _PHYSICAL_RALT_CALLBACK_REVISION += 1
+        return generation
+
+
+def _end_physical_ralt_callback(generation: Optional[int]) -> None:
+    global _PHYSICAL_RALT_CALLBACKS_IN_FLIGHT, _PHYSICAL_RALT_CALLBACK_REVISION
+
+    if generation is None:
+        return
+    with _PHYSICAL_KEY_STATE_LOCK:
+        if generation != _PHYSICAL_TRACKER_GENERATION:
+            return
+        if _PHYSICAL_RALT_CALLBACKS_IN_FLIGHT > 0:
+            _PHYSICAL_RALT_CALLBACKS_IN_FLIGHT -= 1
+        _PHYSICAL_RALT_CALLBACK_REVISION += 1
 
 
 def _normalize_modifier_vk(event: KBDLLHOOKSTRUCT) -> Optional[int]:
@@ -349,12 +705,99 @@ def physical_key_is_down_before_injection(
             return False
         variants = (normalized,)
     with _PHYSICAL_KEY_STATE_LOCK:
-        if _PHYSICAL_TRACKER_ACTIVE and any(
-            variant in _PHYSICAL_KEYS_DOWN for variant in variants
+        active = _PHYSICAL_TRACKER_ACTIVE
+        generation = _PHYSICAL_TRACKER_GENERATION
+        draining = _PHYSICAL_TRACKER_DRAINING
+        cached_down = tuple(
+            variant for variant in variants if variant in _PHYSICAL_KEYS_DOWN
+        )
+        revisions = {
+            variant: _PHYSICAL_KEY_REVISIONS.get(variant, 0)
+            for variant in variants
+        }
+        changed_at = {
+            variant: _PHYSICAL_KEY_LAST_EDGE_AT.get(variant, 0.0)
+            for variant in cached_down
+        }
+        callback_revision = _PHYSICAL_RALT_CALLBACK_REVISION
+        callbacks_in_flight = _PHYSICAL_RALT_CALLBACKS_IN_FLIGHT
+        if active and normalized == VK_RMENU and callbacks_in_flight:
+            return True
+        if active and cached_down:
+            # Only the marked voice right-Alt path may reconcile a missed hook
+            # release. Every other modifier keeps the existing fail-closed rule.
+            if normalized != VK_RMENU or draining:
+                return True
+            newest_edge = max(changed_at.values(), default=0.0)
+            if time.monotonic() - newest_edge <= _RALT_STALE_OWNER_GRACE_SECONDS:
+                return True
+    query = _query or _real_async_key_is_down
+    if any(bool(query(variant)) for variant in variants):
+        return True
+    if not active:
+        return False
+
+    reconciled = False
+    age_ms = 0
+    with _PHYSICAL_KEY_STATE_LOCK:
+        if (
+            not _PHYSICAL_TRACKER_ACTIVE
+            or _PHYSICAL_TRACKER_GENERATION != generation
+            or _PHYSICAL_TRACKER_DRAINING
         ):
             return True
-    query = _query or _real_async_key_is_down
-    return any(bool(query(variant)) for variant in variants)
+        current_down = tuple(
+            variant for variant in variants if variant in _PHYSICAL_KEYS_DOWN
+        )
+        current_revisions = {
+            variant: _PHYSICAL_KEY_REVISIONS.get(variant, 0)
+            for variant in variants
+        }
+        current_callback_revision = _PHYSICAL_RALT_CALLBACK_REVISION
+        current_callbacks_in_flight = _PHYSICAL_RALT_CALLBACKS_IN_FLIGHT
+        if normalized == VK_RMENU and current_callbacks_in_flight:
+            return True
+        if (
+            current_down != cached_down
+            or current_revisions != revisions
+            or (
+                normalized == VK_RMENU
+                and current_callback_revision != callback_revision
+            )
+        ):
+            return bool(current_down)
+        if not cached_down:
+            return False
+        reconciled_at = time.monotonic()
+        age_ms = max(
+            0,
+            int(
+                1000
+                * (reconciled_at - max(changed_at.values(), default=reconciled_at))
+            ),
+        )
+        for variant in cached_down:
+            _PHYSICAL_KEYS_DOWN.discard(variant)
+            _PHYSICAL_KEY_REVISIONS[variant] = (
+                _PHYSICAL_KEY_REVISIONS.get(variant, 0) + 1
+            )
+            _PHYSICAL_KEY_LAST_EDGE_AT[variant] = reconciled_at
+        reconciled = True
+    if reconciled:
+        trace = _diagnostic_trace
+        if trace is not None:
+            try:
+                trace.emit(
+                    "input_physical_state_reconciled",
+                    vk=normalized,
+                    owner_count=len(cached_down),
+                    age_ms=age_ms,
+                    windows_down=False,
+                    reason="stale_hook_owner",
+                )
+            except BaseException:
+                pass
+    return False
 
 
 def physical_key_tracking_available(vk_code: int) -> bool:
@@ -372,6 +815,38 @@ def physical_key_tracking_available(vk_code: int) -> bool:
         )
 
 
+def snapshot_physical_release_guard(
+    vk_code: int,
+) -> Optional[PhysicalReleaseGuard]:
+    """Return a stable-token candidate only while a release query is safe.
+
+    The caller must compare snapshots taken immediately before and after its
+    Windows-state observation.  A physical owner, an in-flight right-Alt edge,
+    or tracker replacement makes the observation unusable.  Draining blocks
+    new DOWN admission, but an existing owner's completed cleanup UP must still
+    be verifiable so recovery can finish.
+    """
+
+    normalized = int(vk_code)
+    variants = _GENERIC_KEY_VARIANTS.get(normalized)
+    if variants is None:
+        if normalized not in _TRACKED_PHYSICAL_KEYS:
+            return None
+        variants = (normalized,)
+    with _PHYSICAL_KEY_STATE_LOCK:
+        if not _PHYSICAL_TRACKER_ACTIVE:
+            return None
+        if any(variant in _PHYSICAL_KEYS_DOWN for variant in variants):
+            return None
+        if normalized == VK_RMENU and _PHYSICAL_RALT_CALLBACKS_IN_FLIGHT:
+            return None
+        return PhysicalReleaseGuard(
+            generation=int(_PHYSICAL_TRACKER_GENERATION),
+            installation_epoch=int(_PHYSICAL_TRACKER_INSTALLATION_EPOCH),
+            callback_revision=int(_PHYSICAL_RALT_CALLBACK_REVISION),
+        )
+
+
 def _begin_physical_tracker_drain() -> None:
     global _PHYSICAL_TRACKER_DRAINING
 
@@ -384,21 +859,52 @@ def _set_physical_tracker_active(
     active: bool,
     *,
     _query: Optional[Callable[[int], bool]] = None,
-) -> None:
+    owner: Optional["VoiceKeyPhysicalizer"] = None,
+    hook_handle: int = 0,
+    owner_thread_id: int = 0,
+    owner_python_ident: int = 0,
+) -> int:
     global _PHYSICAL_TRACKER_ACTIVE, _PHYSICAL_TRACKER_DRAINING
     global _PHYSICAL_TRACKER_GENERATION
+    global _PHYSICAL_RALT_CALLBACKS_IN_FLIGHT, _PHYSICAL_RALT_CALLBACK_REVISION
+    global _PHYSICAL_TRACKER_INSTALLATION_EPOCH, _PHYSICAL_TRACKER_OWNER
+    global _PHYSICAL_TRACKER_HOOK_HANDLE, _PHYSICAL_TRACKER_OWNER_THREAD_ID
+    global _PHYSICAL_TRACKER_OWNER_PYTHON_IDENT
+    global _PHYSICAL_TRACKER_CALLBACK_ENTRIES
+    global _PHYSICAL_TRACKER_MARKER_CALLBACKS, _PHYSICAL_TRACKER_MARKER_MATCHES
+    global _PHYSICAL_TRACKER_LAST_CALLBACK_AT, _PHYSICAL_TRACKER_LAST_MARKER_AT
 
     with _PHYSICAL_KEY_STATE_LOCK:
         previous_generation = _PHYSICAL_TRACKER_GENERATION
         _PHYSICAL_TRACKER_GENERATION += 1
         generation = _PHYSICAL_TRACKER_GENERATION
+        if active:
+            _PHYSICAL_TRACKER_INSTALLATION_EPOCH += 1
         _PHYSICAL_KEYS_DOWN.clear()
         _PHYSICAL_KEYS_TOUCHED.clear()
+        _PHYSICAL_KEY_REVISIONS.clear()
+        _PHYSICAL_KEY_LAST_EDGE_AT.clear()
+        _PHYSICAL_RALT_CALLBACKS_IN_FLIGHT = 0
+        _PHYSICAL_RALT_CALLBACK_REVISION = 0
         _PHYSICAL_TRACKER_ACTIVE = bool(active)
         _PHYSICAL_TRACKER_DRAINING = False
+        _PHYSICAL_TRACKER_OWNER = owner if active else None
+        _PHYSICAL_TRACKER_HOOK_HANDLE = int(hook_handle) if active else 0
+        _PHYSICAL_TRACKER_OWNER_THREAD_ID = (
+            int(owner_thread_id) if active else 0
+        )
+        _PHYSICAL_TRACKER_OWNER_PYTHON_IDENT = (
+            int(owner_python_ident) if active else 0
+        )
+        _PHYSICAL_TRACKER_CALLBACK_ENTRIES = 0
+        _PHYSICAL_TRACKER_MARKER_CALLBACKS = 0
+        _PHYSICAL_TRACKER_MARKER_MATCHES = 0
+        _PHYSICAL_TRACKER_MARKER_MISMATCHES.clear()
+        _PHYSICAL_TRACKER_LAST_CALLBACK_AT = 0.0
+        _PHYSICAL_TRACKER_LAST_MARKER_AT = 0.0
     if not active:
         _cancel_voice_confirmations(previous_generation)
-        return
+        return generation
     query = _query or _real_async_key_is_down
     initially_down = set()
     for vk_code in _TRACKED_PHYSICAL_KEYS:
@@ -412,9 +918,14 @@ def _set_physical_tracker_active(
             _PHYSICAL_TRACKER_ACTIVE
             and _PHYSICAL_TRACKER_GENERATION == generation
         ):
-            _PHYSICAL_KEYS_DOWN.update(
-                initially_down.difference(_PHYSICAL_KEYS_TOUCHED)
-            )
+            observed_at = time.monotonic()
+            for vk_code in initially_down.difference(_PHYSICAL_KEYS_TOUCHED):
+                _PHYSICAL_KEYS_DOWN.add(vk_code)
+                _PHYSICAL_KEY_REVISIONS[vk_code] = (
+                    _PHYSICAL_KEY_REVISIONS.get(vk_code, 0) + 1
+                )
+                _PHYSICAL_KEY_LAST_EDGE_AT[vk_code] = observed_at
+    return generation
 
 
 class VoiceKeyPhysicalizer:
@@ -428,6 +939,14 @@ class VoiceKeyPhysicalizer:
         self._hook = None
         self._hookproc_keepalive = None
         self._on_tracking_lost: Optional[Callable[[], None]] = None
+        self._on_health_failure: Optional[
+            Callable[[str, PhysicalizerHealthSnapshot], None]
+        ] = None
+        self._degraded_event = threading.Event()
+        self._health_notification_lock = threading.Lock()
+        self._health_notification_started = False
+        self._tracker_generation = 0
+        self._installation_epoch = 0
         self._direction_edges_lock = threading.Lock()
         self._armed_direction_edges: list[_ArmedDirectionEdge] = []
         self._owned_direction_holds: dict[tuple[int, int, bool], float] = {}
@@ -438,9 +957,62 @@ class VoiceKeyPhysicalizer:
     ) -> None:
         self._on_tracking_lost = callback
 
+    def set_health_failure_callback(
+        self,
+        callback: Optional[
+            Callable[[str, PhysicalizerHealthSnapshot], None]
+        ],
+    ) -> None:
+        self._on_health_failure = callback
+
     @property
     def is_running(self) -> bool:
         return self._thread is not None and self._thread.is_alive()
+
+    @property
+    def accepts_new_down(self) -> bool:
+        if not self.is_running or self._degraded_event.is_set():
+            return False
+        with _PHYSICAL_KEY_STATE_LOCK:
+            return bool(
+                _PHYSICAL_TRACKER_ACTIVE
+                and not _PHYSICAL_TRACKER_DRAINING
+                and _PHYSICAL_TRACKER_OWNER is self
+            )
+
+    @property
+    def tracker_generation(self) -> int:
+        return int(self._tracker_generation)
+
+    @property
+    def installation_epoch(self) -> int:
+        return int(self._installation_epoch)
+
+    def _mark_required_confirmation_failed(
+        self,
+        reason: str,
+        snapshot: PhysicalizerHealthSnapshot,
+    ) -> None:
+        self._degraded_event.set()
+        callback = self._on_health_failure
+        if callback is None:
+            return
+        with self._health_notification_lock:
+            if self._health_notification_started:
+                return
+            self._health_notification_started = True
+
+        def notify() -> None:
+            try:
+                callback(str(reason), snapshot)
+            except BaseException:
+                pass
+
+        threading.Thread(
+            target=notify,
+            name="remote-mic-voice-key-physicalizer-health",
+            daemon=True,
+        ).start()
 
     def record_rc003_direction_edge(
         self,
@@ -586,6 +1158,9 @@ class VoiceKeyPhysicalizer:
         self._ready_event.clear()
         self._stop_event.clear()
         self._unexpected_exit_event.clear()
+        self._degraded_event.clear()
+        with self._health_notification_lock:
+            self._health_notification_started = False
         self._start_error = None
         self.clear_rc003_direction_edges()
         self._thread = threading.Thread(
@@ -693,7 +1268,14 @@ class VoiceKeyPhysicalizer:
                     "SetWindowsHookExW failed"
                 )
 
-            _set_physical_tracker_active(True)
+            self._tracker_generation = _set_physical_tracker_active(
+                True,
+                owner=self,
+                hook_handle=int(self._hook or 0),
+                owner_thread_id=int(self._thread_id.value),
+                owner_python_ident=threading.get_ident(),
+            )
+            self._installation_epoch = snapshot_health().installation_epoch
 
             # Ensure the message queue exists before start() reports ready.
             # PeekMessageW requires a writable MSG pointer even when no
@@ -813,70 +1395,103 @@ class VoiceKeyPhysicalizer:
             WM_SYSKEYUP,
         ):
             event = KBDLLHOOKSTRUCT.from_address(int(l_param))
-            original_flags = int(event.flags)
-            original_extra_info = int(event.dwExtraInfo)
-            key_up = int(w_param) in (WM_KEYUP, WM_SYSKEYUP)
-            consumed = self.consume_rc003_direction_event(event, not key_up)
-            physicalized = False
-            if not consumed:
-                record_physical_key_event(event, int(w_param))
-                physicalized = physicalize_injected_event(event, key_up)
-            trace = _diagnostic_trace
-            if trace is not None:
-                try:
-                    trace.observe_submission_key(int(event.vkCode), key_up, original_flags)
-                except Exception:
-                    pass  # Metadata observation cannot consume or delay key delivery.
-            button_id = _TRACE_VK_TO_BUTTON.get(int(event.vkCode), "")
-            voice_marker = _is_voice_event_marker(original_extra_info)
-            if trace is not None and (button_id or voice_marker):
-                try:
-                    gesture_id = (
-                        trace.current_gesture(button_id) if button_id else None
-                    )
-                    trace.emit(
-                        "low_level_hook",
-                        gesture_id=gesture_id or "",
-                        button_id=button_id,
-                        edge="up" if key_up else "down",
-                        message=int(w_param),
-                        vk=int(event.vkCode),
-                        scan_code=int(event.scanCode),
-                        flags=original_flags,
-                        extra_info=original_extra_info,
-                        injected=bool(original_flags & LLKHF_INJECTED),
-                        lower_integrity=bool(
-                            original_flags & LLKHF_LOWER_IL_INJECTED
-                        ),
-                        matched=bool(gesture_id or voice_marker),
-                        decision=(
-                            "consume"
-                            if consumed
-                            else "physicalize"
-                            if physicalized
-                            else "pass"
-                        ),
-                        reason=(
-                            "rc003_direction_owned"
-                            if consumed
-                            else "voice_marker"
-                            if physicalized
-                            else "no_matching_ownership"
-                        ),
-                    )
-                except BaseException:
-                    pass
-            if consumed:
-                return 1
-            if physicalized:
-                try:
-                    return user32.CallNextHookEx(
-                        self._hook,
-                        n_code,
-                        w_param,
-                        int(l_param),
-                    )
-                finally:
-                    event.flags = original_flags
-                    event.dwExtraInfo = original_extra_info
+            _record_hook_callback_entry()
+            callback_generation = _begin_physical_ralt_callback(event)
+            try:
+                original_flags = int(event.flags)
+                original_extra_info = int(event.dwExtraInfo)
+                key_up = int(w_param) in (WM_KEYUP, WM_SYSKEYUP)
+                trace = _diagnostic_trace
+                awaiting_marker = (
+                    _pending_voice_marker_for_diagnostics(key_up)
+                    if trace is not None and int(event.vkCode) == VK_RMENU else 0
+                )
+                consumed = self.consume_rc003_direction_event(event, not key_up)
+                physicalization = None
+                if not consumed:
+                    record_physical_key_event(event, int(w_param))
+                    physicalization = physicalize_injected_event(event, key_up)
+                physicalized = physicalization is not None
+                if trace is not None:
+                    try:
+                        trace.observe_submission_key(
+                            int(event.vkCode), key_up, original_flags
+                        )
+                    except Exception:
+                        pass  # Metadata observation cannot consume or delay key delivery.
+                button_id = _TRACE_VK_TO_BUTTON.get(int(event.vkCode), "")
+                voice_marker = _is_voice_event_marker(original_extra_info)
+                if trace is not None and (button_id or voice_marker or awaiting_marker):
+                    try:
+                        gesture_id = (
+                            trace.current_gesture(button_id) if button_id else None
+                        )
+                        trace.emit(
+                            "low_level_hook",
+                            gesture_id=gesture_id or "",
+                            button_id=button_id,
+                            edge="up" if key_up else "down",
+                            message=int(w_param),
+                            vk=int(event.vkCode),
+                            scan_code=int(event.scanCode),
+                            flags=original_flags,
+                            extra_info=original_extra_info,
+                            awaiting_marker=awaiting_marker,
+                            receipt_correlation=(
+                                "exact_marker" if awaiting_marker == original_extra_info and awaiting_marker
+                                else "pending_edge_only" if awaiting_marker else "none"
+                            ),
+                            event_time_ms=int(event.time),
+                            injected=bool(original_flags & LLKHF_INJECTED),
+                            lower_integrity=bool(
+                                original_flags & LLKHF_LOWER_IL_INJECTED
+                            ),
+                            matched=bool(gesture_id or voice_marker),
+                            decision=(
+                                "consume"
+                                if consumed
+                                else "physicalize"
+                                if physicalized
+                                else "pass"
+                            ),
+                            reason=(
+                                "rc003_direction_owned"
+                                if consumed
+                                else "voice_marker"
+                                if physicalized
+                                else "no_matching_ownership"
+                            ),
+                        )
+                    except BaseException:
+                        pass
+                if consumed:
+                    return 1
+                if physicalized:
+                    try:
+                        downstream_result = user32.CallNextHookEx(
+                            self._hook,
+                            n_code,
+                            w_param,
+                            int(l_param),
+                        )
+                    except BaseException:
+                        if isinstance(physicalization, VoiceEventConfirmation):
+                            complete_marked_voice_event(
+                                physicalization,
+                                downstream_error=True,
+                            )
+                        raise
+                    else:
+                        if isinstance(physicalization, VoiceEventConfirmation):
+                            complete_marked_voice_event(
+                                physicalization,
+                                downstream_result=int(downstream_result),
+                            )
+                        return downstream_result
+                    finally:
+                        event.flags = original_flags
+                        event.dwExtraInfo = original_extra_info
+                return user32.CallNextHookEx(self._hook, n_code, w_param, l_param)
+            finally:
+                _end_physical_ralt_callback(callback_generation)
         return user32.CallNextHookEx(self._hook, n_code, w_param, l_param)

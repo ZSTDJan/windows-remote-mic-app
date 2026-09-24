@@ -10,7 +10,7 @@ import time
 from pathlib import Path
 from typing import Callable, Optional
 
-from . import bridge_runtime_status, bridge_tray_windows, config, single_instance
+from . import bridge_runtime_status, bridge_tray_windows, config, dev_session, single_instance
 
 
 DEFAULT_EXIT_TIMEOUT_SECONDS = 5.0
@@ -152,6 +152,8 @@ def request_bridge_exit(
     except Exception:
         return BridgeExitResult(False, False, "无法确认遥控器服务是否正在运行。")
 
+    if dev_session.is_isolated():
+        return BridgeExitResult(False, False, "隔离测试不控制其它无线麦实例，请手动退出旧版。")
     try:
         hwnd = int(find_window())
     except Exception:

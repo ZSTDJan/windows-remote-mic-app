@@ -24,6 +24,9 @@ KEY = "remote_selection"
 SCAN_FLAG = "--list-remote-devices"
 _DIGEST = re.compile(r"[0-9a-f]{64}\Z")
 _MAX_DEVICES = 128
+RC003_PROFILE = "xiaomi-rc003"
+CHROMECAST_PROFILE = "chromecast-remote"
+KNOWN_PROFILES = frozenset({RC003_PROFILE, CHROMECAST_PROFILE})
 
 
 class SelectionError(ValueError):
@@ -63,7 +66,7 @@ def normalize(value: object) -> dict:
     for row in devices:
         if (not isinstance(row, dict) or set(row) != {"key", "profile"}
                 or not valid_key(row.get("key"))
-                or row.get("profile") != "xiaomi-rc003" or row["key"] in keys):
+                or row.get("profile") not in KNOWN_PROFILES or row["key"] in keys):
             raise SelectionError("设备记录不受支持或重复。")
         keys.add(row["key"])
         records.append(dict(row))
@@ -79,7 +82,7 @@ def active_key(settings: dict) -> str:
 def require_active(settings: dict) -> str:
     key = active_key(settings)
     if not key:
-        raise SelectionError("请先在设备页点击“选择设备”，添加并选择要使用的遥控器。")
+        raise SelectionError("请先在设备页点击“选择设备”，确认要使用的遥控器。")
     return key
 
 
@@ -96,9 +99,29 @@ def saved_active_key() -> str:
     return active_key(stored)
 
 
-def label(key: str) -> str:
+def profile_for_key(selection: dict, key: str) -> str:
+    return next((row["profile"] for row in normalize(selection)["devices"] if row["key"] == key), "")
+
+
+def active_profile(settings: dict) -> str:
+    selection = normalize(settings.get(KEY))
+    return profile_for_key(selection, selection["active"])
+
+
+def runtime_ready(profile: str) -> bool:
+    # Capability only, not a claim that live source/permission checks passed.
+    return profile in (RC003_PROFILE, CHROMECAST_PROFILE)
+
+
+def label(key: str, profile: str = RC003_PROFILE, peers=()) -> str:
     from . import device_catalog
-    return f"{device_catalog.RC003_DISPLAY_NAME} · {key[:6].upper()}" if key else "未选择设备"
+    if not key:
+        return "未选择设备"
+    size = 6
+    while size < 64 and any(other != key and other[:size] == key[:size] for other in peers):
+        size += 2
+    name = device_catalog.profile_for(profile).display_name
+    return f"{name} · {key[:size].upper()}"
 
 
 def _unsupported_label(name: object, key: str) -> str:
@@ -109,7 +132,7 @@ def _unsupported_label(name: object, key: str) -> str:
 
 def add_device(selection: dict, row: dict) -> dict:
     result = normalize(selection)
-    if row.get("profile") != "xiaomi-rc003" or not valid_key(row.get("key")):
+    if row.get("profile") not in KNOWN_PROFILES or not valid_key(row.get("key")):
         raise SelectionError("这台设备暂未适配，不能添加。")
     if any(record["key"] == row["key"] for record in result["devices"]):
         return result
@@ -133,6 +156,26 @@ def select_device(selection: dict, key: str) -> dict:
         raise SelectionError("请先添加这台设备。")
     result["active"] = key
     return result
+
+
+def select_paired_device(selection: dict, key: str, paired: list[dict]) -> tuple[dict, bool]:
+    """Prepare registration + selection without writing or activating anything.
+
+    The legacy-owner decision uses all known Xiaomi identities, not just the
+    single row being registered by this confirmation. Never infer ownership
+    from an incomplete/failed scan (the caller must require a successful scan).
+    """
+    result = normalize(selection)
+    row = next((item for item in paired if item["key"] == key), None)
+    if row is None or row.get("profile") not in KNOWN_PROFILES:
+        raise SelectionError("未找到这台已配对且支持的设备，请刷新后重新选择。")
+    saved_profile = profile_for_key(result, key)
+    if saved_profile and saved_profile != row["profile"]:
+        raise SelectionError("设备型号信息与已保存记录不一致，请重新检查。")
+    known_xiaomi = {item["key"] for item in result["devices"] + paired
+                    if item.get("profile") == RC003_PROFILE}
+    result = select_device(add_device(result, row), key)
+    return result, row["profile"] == RC003_PROFILE and known_xiaomi == {key}
 
 
 def candidate_key(info: object) -> str:
@@ -213,10 +256,11 @@ async def _scan_paired() -> list[dict]:
         except (SelectionError, OSError, TypeError, ValueError):
             continue
         name = getattr(info, "name", "") or ""
-        supported = identity.matches_rc003_name(name)
+        profile = (RC003_PROFILE if identity.matches_rc003_name(name) else
+                   CHROMECAST_PROFILE if str(name).strip().casefold() == "chromecast remote" else "")
         # Unsupported names are display-only; saved selection still contains only digests/profiles.
-        row = {"key": key, "profile": "xiaomi-rc003" if supported else "",
-               "label": label(key) if supported else _unsupported_label(name, key)}
+        row = {"key": key, "profile": profile,
+               "label": label(key, profile) if profile else _unsupported_label(name, key)}
         if key in rows and rows[key]["profile"] != row["profile"]:
             raise SelectionError("同一设备的类型信息存在冲突，请重新检查。")
         rows[key] = row
@@ -261,11 +305,12 @@ def _read_scan_result(result_path: str, returncode: int) -> list[dict]:
     for row in rows:
         if (not isinstance(row, dict) or set(row) != {"key", "profile", "label"}
                 or not valid_key(row.get("key")) or row["key"] in keys
-                or row.get("profile") not in ("", "xiaomi-rc003")):
+                or row.get("profile") not in KNOWN_PROFILES | {""}):
             raise SelectionError("设备列表读取失败，请重试。")
         keys.add(row["key"])
+    for row in rows:
         if row["profile"]:
-            row["label"] = label(row["key"])
+            row["label"] = label(row["key"], row["profile"], keys)
         else:
             name = row.get("label")
             if isinstance(name, str):

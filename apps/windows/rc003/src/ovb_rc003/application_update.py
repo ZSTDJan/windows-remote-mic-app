@@ -1,8 +1,8 @@
-"""Manual GitHub release discovery and verified package download.
+"""GitHub release discovery and verified package download.
 
-The desktop UI calls this module only after the user clicks "check for
-updates".  It never runs at startup, never embeds a GitHub credential, and
-never launches a downloaded file.  A release is eligible only when its
+The desktop UI checks on request and once per day after startup. Downloads
+remain user initiated; this module never embeds a GitHub credential or
+launches a downloaded file. A release is eligible only when its
 portable package and ``SHA256SUMS.txt`` agree on one internal application
 version; repository tags are deliberately not used as application versions.
 """
@@ -16,10 +16,12 @@ import logging
 import os
 import re
 import socket
+import tempfile
 import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
+from datetime import date
 from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -174,6 +176,99 @@ class ApplicationUpdateDownload:
     package_kind: PackageKind
     path: Path
     reused_existing_file: bool
+
+
+def claim_daily_update_check(cache_directory: Path, *, today: date | None = None) -> bool:
+    """Persist the attempt before networking, including failed/offline attempts.
+
+    The desktop single-instance owner calls this from its update worker. This
+    disposable stamp is not user configuration and is not a download asset.
+    """
+    day = (today or date.today()).isoformat()
+    stamp = Path(cache_directory) / "last-automatic-check.txt"
+    temporary = None
+    try:
+        if stamp.is_file() and stamp.read_text(encoding="ascii").strip() == day:
+            return False
+        stamp.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(mode="w", encoding="ascii", dir=stamp.parent,
+                                         prefix=".update-check-", delete=False) as stream:
+            temporary = Path(stream.name)
+            stream.write(day)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, stamp)
+        return True
+    except (OSError, UnicodeError):
+        # If we cannot remember the attempt, do not repeatedly check at startup.
+        _LOGGER.debug("Automatic update check stamp unavailable", exc_info=True)
+        return False
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
+def save_update_to_desktop(
+    download: ApplicationUpdateDownload,
+    desktop_directory: Path,
+    *,
+    cancel_event: Any = None,
+) -> ApplicationUpdateDownload:
+    """Publish a verified cache file without ever replacing desktop contents.
+
+    A private staging directory on the destination volume supports redirected
+    desktops/cross-volume copies. Only a fully copied, checked package gets its
+    final name; failed exports retain the verified cache for a later retry.
+    """
+    desktop = Path(desktop_directory)
+    source = download.path
+    try:
+        if not desktop.is_dir():
+            _raise("desktop_unavailable", "无法访问桌面，更新包保留在下载缓存中，请稍后重试。")
+        expected = _sha256_file(source, cancel_event)
+        with tempfile.TemporaryDirectory(prefix=".remote-mic-update-", dir=desktop) as staging:
+            staged = Path(staging) / source.name
+            with source.open("rb") as incoming, staged.open("xb") as outgoing:
+                while True:
+                    if cancel_event is not None and cancel_event.is_set():
+                        raise ApplicationUpdateCancelled()
+                    chunk = incoming.read(DOWNLOAD_CHUNK_BYTES)
+                    if not chunk:
+                        break
+                    outgoing.write(chunk)
+                outgoing.flush()
+                os.fsync(outgoing.fileno())
+            if _sha256_file(staged, cancel_event) != expected:
+                _raise("desktop_copy_failed", "保存到桌面时校验失败，更新包保留在下载缓存中。")
+            for index in range(1000):
+                target = desktop / (source.name if index == 0 else
+                                    f"{source.stem} ({index}){source.suffix}")
+                if cancel_event is not None and cancel_event.is_set():
+                    raise ApplicationUpdateCancelled()
+                if target.exists() or target.is_symlink():
+                    if (not target.is_symlink() and target.is_file()
+                            and target.stat().st_size == staged.stat().st_size
+                            and _sha256_file(target, cancel_event) == expected):
+                        return ApplicationUpdateDownload(
+                            download.release, download.package_kind, target, True)
+                    continue
+                try:
+                    if os.name == "nt":
+                        # Windows rename is atomic and refuses an existing target.
+                        staged.rename(target)
+                    else:
+                        os.link(staged, target)
+                except FileExistsError:
+                    continue
+                return ApplicationUpdateDownload(
+                    download.release, download.package_kind, target, False)
+            _raise("desktop_name_conflict", "桌面同名更新包过多，请整理后重试。")
+    except ApplicationUpdateError:
+        raise
+    except OSError as exc:
+        raise ApplicationUpdateError(
+            "desktop_unavailable", "无法保存到桌面，更新包保留在下载缓存中，请检查桌面权限或可用空间后重试。"
+        ) from exc
 
 
 def parse_application_version(value: str) -> ApplicationVersion:

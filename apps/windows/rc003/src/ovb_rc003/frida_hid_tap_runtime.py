@@ -521,8 +521,22 @@ function interceptOutgoingCopy(args, source) {
   if (raw === null) return null;
   copyHealth.candidate_reports++;
   if (pendingCopyCandidate === null) {
+    const prebound = selectedSourceKey !== null && source.kind === "device" &&
+                     source.key === selectedSourceKey;
     pendingCopyCandidate = {handle: handle, epoch: ++copyHandleEpoch, neutral: false, announced: false,
-                            source_kind: source.kind, source_key: source.key};
+                            source_kind: source.kind, source_key: source.key, prebound: prebound};
+    if (prebound) {
+      // Device identity was proven at the native callsite. Own this first
+      // report before Windows translates it, while retaining the client bind
+      // acknowledgement as an independent validation step.
+      boundCopyHandle = handle;
+      interceptionReady = true;
+      const owned = interceptKeyboardReport(args[8], EXPECTED_OUTPUT_LENGTH);
+      if (owned !== null) return {raw: owned, candidate: pendingCopyCandidate};
+      boundCopyHandle = null;
+      interceptionReady = false;
+      pendingCopyCandidate.prebound = false;
+    }
   }
   return pendingCopyCandidate.handle === handle ? {raw: null, candidate: pendingCopyCandidate} : null;
 }
@@ -602,7 +616,7 @@ function handleControl(message) {
       return;
     }
     boundCopyHandle = candidate.handle;
-    interceptionReady = candidate.neutral;
+    interceptionReady = candidate.prebound === true || candidate.neutral;
     pendingCopyCandidate = null;
     acknowledgeControl(action, true, "bound", "");
     return;
@@ -879,7 +893,9 @@ function installHook() {
       if (this.captureEpoch === copyHandleEpoch && this.copyCandidate !== null && this.copyCandidate === pendingCopyCandidate && retval.toUInt32() === 0) {
         const raw = copyProbeReport(this.output);
         if (raw !== null) {
-          pendingCopyCandidate.neutral = raw.slice(6) === "000000000000";
+          if (pendingCopyCandidate.prebound !== true) {
+            pendingCopyCandidate.neutral = raw.slice(6) === "000000000000";
+          }
           if (!pendingCopyCandidate.announced) {
             pendingCopyCandidate.announced = true;
             emit({kind: "copy_candidate", handle: pendingCopyCandidate.handle,
@@ -914,6 +930,10 @@ function installHook() {
             emit({kind: "copy_failure", ntstatus: retval.toUInt32(), restored: restored,
                   report_owned: reportOwned,
                   diagnostic_revision: HID_DIAGNOSTIC_REVISION});
+          }
+          if (this.captureEpoch === copyHandleEpoch && this.copyCandidate !== null &&
+              this.copyCandidate === pendingCopyCandidate && this.copyCandidate.prebound === true) {
+            resetCopyOwnership();
           }
         }
         return;
@@ -1097,6 +1117,12 @@ def _write_verified_text(path: Path, content: str, *, user_sid: str) -> None:
             pass
 
 
+def _runtime_validation_error(reason: str) -> RuntimeError:
+    error = RuntimeError(reason)
+    error.injection_diagnostic = {"stage": "runtime_prepare", "reason": reason}
+    return error
+
+
 def prepare_secure_runtime() -> Path:
     from . import hid_elevation_windows
 
@@ -1105,7 +1131,7 @@ def prepare_secure_runtime() -> Path:
         raise FileNotFoundError(archive)
     archive_hash = sha256_file(archive)
     if archive_hash != GADGET_ARCHIVE_SHA256:
-        raise RuntimeError(f"Gadget archive hash mismatch: {archive_hash}")
+        raise _runtime_validation_error("runtime_archive_hash_mismatch")
 
     sid = hid_elevation_windows.current_user_sid()
     program_files_root = hid_elevation_windows._program_files_root()
@@ -1134,7 +1160,7 @@ def prepare_secure_runtime() -> Path:
                 shutil.copyfileobj(source, target, length=1024 * 1024)
             dll_hash = sha256_file(temporary)
             if dll_hash != GADGET_DLL_SHA256:
-                raise RuntimeError(f"Gadget DLL hash mismatch: {dll_hash}")
+                raise _runtime_validation_error("runtime_dll_hash_mismatch")
             hid_elevation_windows._apply_path_security(
                 temporary,
                 user_sid=sid,
@@ -1173,7 +1199,7 @@ def prepare_secure_runtime() -> Path:
             directory=True,
             read_execute_sids=(hid_elevation_windows.LOCAL_SERVICE_SID,),
         ):
-            raise RuntimeError("Gadget runtime directory ACL validation failed")
+            raise _runtime_validation_error("runtime_directory_acl_invalid")
     for runtime_file in (
         dll_path,
         destination / GADGET_CONFIG_NAME,
@@ -1188,7 +1214,7 @@ def prepare_secure_runtime() -> Path:
             directory=False,
             read_execute_sids=(hid_elevation_windows.LOCAL_SERVICE_SID,),
         ):
-            raise RuntimeError("Gadget runtime ACL validation failed")
+            raise _runtime_validation_error("runtime_file_acl_invalid")
     return dll_path
 
 

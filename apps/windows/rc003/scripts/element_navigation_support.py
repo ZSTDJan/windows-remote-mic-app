@@ -721,8 +721,11 @@ def global_hotkey_action(
     vk: int,
     *,
     include_developer_actions: bool = True,
+    include_toggle: bool = True,
 ) -> Optional[str]:
     action = GLOBAL_HOTKEY_ACTIONS.get(vk)
+    if action == "toggle" and not include_toggle:
+        return None
     if action in {"toggle_diagnostics", "quit"} and not include_developer_actions:
         return None
     return action

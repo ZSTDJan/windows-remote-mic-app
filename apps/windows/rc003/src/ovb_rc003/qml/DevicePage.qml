@@ -10,7 +10,7 @@ Item {
     property var backTabTarget: null
     property var tabTarget: null
     readonly property var firstFocusItem: openBluetoothSettingsButton
-    readonly property var lastFocusItem: closeBehaviorCombo
+    readonly property var lastFocusItem: closeBehaviorSwitch
     readonly property int deviceStateColumnWidth: 96
     readonly property int deviceActionColumnWidth: tokens.buttonWidth4Chars
     signal openButtonsRequested()
@@ -54,6 +54,13 @@ Item {
     function currentDeviceStateCode() {
         if (!SettingsController.activeRemoteKey)
             return "unselected"
+        if (!SettingsController.activeRemoteReady)
+            return "pending"
+        if (!SettingsController.isRc003Device) {
+            if (SettingsController.bridgeConnected)
+                return "paired"
+            return SettingsController.activeRemotePairingState
+        }
         if (DiagnosticsController.isRefreshing)
             return "checking"
         const row = checkResult("ble_candidate")
@@ -76,10 +83,13 @@ Item {
     function currentDeviceStateText() {
         switch (currentDeviceStateCode()) {
         case "unselected": return qsTr("请选择设备")
+        case "pending": return qsTr("接收尚未接入")
         case "selected_missing": return qsTr("所选设备未连接")
         case "checking": return qsTr("正在检查")
         case "paired": return qsTr("已配对")
         case "waiting": return qsTr("正在确认")
+        case "service_stopped": return qsTr("等待服务启动")
+        case "receiver_failed": return qsTr("接收失败")
         case "conflict": return qsTr("设备识别异常")
         case "unpaired": return qsTr("点击“蓝牙设置”")
         case "error": return qsTr("点击“重新检查”")
@@ -97,7 +107,7 @@ Item {
             return tokens.successColor
         if (code === "checking" || code === "waiting")
             return tokens.voiceAccent
-        if (code === "unchecked")
+        if (code === "unchecked" || code === "pending" || code === "service_stopped")
             return tokens.disabledText
         return tokens.errorColor
     }
@@ -111,7 +121,9 @@ Item {
     }
 
     function hidTapReady() {
-        return SettingsController.hidTapState === "ready"
+        return valueIn(SettingsController.hidTapState, [
+            "attached_waiting_for_hid_io", "ready"
+        ])
     }
 
     function rawInputWaitsForRemote() {
@@ -124,10 +136,6 @@ Item {
         return valueIn(SettingsController.hidTapState, [
             "waiting_for_rc003_host", "waiting_for_gadget_connection"
         ])
-    }
-
-    function hidTapWaitsForFirstInput() {
-        return SettingsController.hidTapState === "attached_waiting_for_hid_io"
     }
 
     function buttonReceiverWaitsForRemote() {
@@ -143,7 +151,7 @@ Item {
 
     function hidTapChecking() {
         return valueIn(SettingsController.hidTapState, [
-            "unknown", "verified_not_started", "starting", "injecting"
+            "unknown", "verified_not_started", "starting", "injecting", "recovering"
         ])
     }
 
@@ -162,6 +170,25 @@ Item {
     function buttonReceiverStateCode() {
         if (!SettingsController.activeRemoteKey)
             return "unselected"
+        if (!SettingsController.activeRemoteReady)
+            return "pending"
+        if (!SettingsController.isRc003Device) {
+            if (SettingsController.remoteSelectionBusy)
+                return "checking"
+            if (SettingsController.chromecastSetupError)
+                return "setup_failed"
+            if (valueIn(SettingsController.rawInputState, [
+                    "chromecast_sensitive_logging_disabled", "chromecast_sensitive_logging_enable_failed"]))
+                return "setup_failed"
+            if (SettingsController.rawInputState === "chromecast_input_payload_unavailable")
+                return "input_incomplete"
+            if (SettingsController.rawInputState === "chromecast_permission_cancelled")
+                return "authorization_cancelled"
+            if (!SettingsController.bridgeRunning)
+                return "service_stopped"
+            return SettingsController.buttonReceiverUsable
+                ? "ready" : (SettingsController.rawInputState === "starting" ? "checking" : "error")
+        }
         if (SettingsController.hidHelperRepairBusy)
             return "checking"
         if (SettingsController.hidHelperIssueVisible) {
@@ -175,6 +202,8 @@ Item {
                 ? "disabled" : "permission"
         }
         if (SettingsController.bridgeRunning) {
+            if (SettingsController.hidTapState === "unavailable_gadget_not_verified")
+                return "component_unavailable"
             if (SettingsController.hidTapState === "selected_device_shared_host")
                 return "shared_host"
             if (SettingsController.hidTapState === "restart_required")
@@ -187,19 +216,14 @@ Item {
             const rawReady = rawInputReady()
             const tapReady = hidTapReady()
             const deviceCode = currentDeviceStateCode()
+            if (SettingsController.buttonReceiverUsable)
+                return "ready"
             if (rawReady && tapReady) {
                 if (voiceKeyFailed())
                     return "voice_error"
                 if (voiceKeyChecking())
                     return "checking"
-                return "ready"
-            }
-            if (hidTapWaitsForFirstInput()) {
-                if (deviceCode === "unpaired")
-                    return "unpaired"
-                if (deviceCode === "conflict")
-                    return "conflict"
-                return "waiting_input"
+                return "checking"
             }
             if (buttonReceiverWaitsForRemote()) {
                 if (deviceCode === "unpaired")
@@ -212,7 +236,8 @@ Item {
                 return hidTapChecking() || hidTapWaitsForRemote()
                     ? "checking" : "original_only"
             if (tapReady)
-                return rawInputChecking() ? "checking" : "custom_only"
+                return rawInputWaitsForRemote() ? "recovering"
+                    : rawInputChecking() ? "checking" : "custom_only"
             if (rawInputChecking() || hidTapChecking())
                 return "checking"
             return "error"
@@ -244,16 +269,21 @@ Item {
     function buttonReceiverStateText() {
         switch (buttonReceiverStateCode()) {
         case "unselected": return qsTr("请先选择设备")
+        case "pending": return qsTr("接收尚未接入")
+        case "setup_failed": return qsTr("启用未完成")
+        case "authorization_cancelled": return qsTr("授权已取消")
         case "checking": return qsTr("正在检查")
         case "cleanup": return qsTr("点击“完成清理”")
+        case "recovering": return qsTr("正在恢复")
         case "account": return qsTr("请更换账号")
         case "disabled": return qsTr("点击“启用改键”")
         case "permission": return qsTr("点击“修复权限”")
         case "version": return qsTr("请安装兼容版")
+        case "component_unavailable": return qsTr("按键组件不完整")
         case "restart_computer": return qsTr("请重启电脑一次")
+        case "input_incomplete": return qsTr("按键数据不完整")
         case "shared_host": return qsTr("按键来源待区分")
-        case "waiting_remote": return qsTr("请按遥控器方向键")
-        case "waiting_input": return qsTr("请按遥控器方向键")
+        case "waiting_remote": return qsTr("未连接")
         case "unpaired": return qsTr("请先配对遥控器")
         case "conflict": return qsTr("设备识别异常")
         case "ready": return qsTr("正常")
@@ -272,21 +302,25 @@ Item {
         const code = buttonReceiverStateCode()
         if (code === "ready")
             return tokens.successColor
-        if (code === "checking" || code === "waiting_remote"
-                || code === "waiting_input" || code === "custom_only"
+        if (code === "checking" || code === "waiting_remote" || code === "recovering"
+                || code === "custom_only"
                 || code === "original_only")
             return tokens.voiceAccent
-        if (code === "cleanup" || code === "unchecked"
+        if (code === "cleanup" || code === "unchecked" || code === "pending"
                 || code === "service_stopped")
             return tokens.disabledText
         return tokens.errorColor
     }
 
     function bridgeStateText() {
+        if (SettingsController.activeRemoteKey && !SettingsController.activeRemoteReady)
+            return qsTr("接收尚未接入")
         if (SettingsController.bridgeReconnectBusy)
             return qsTr("连接中")
         if (SettingsController.bridgeLaunchBusy)
             return qsTr("启动中")
+        if (valueIn(buttonReceiverStateCode(), ["setup_failed", "authorization_cancelled"]))
+            return qsTr("请先完成启用")
         if (bridgeNeedsRestartAction())
             return qsTr("点击“重启服务”")
         const receiverCode = buttonReceiverStateCode()
@@ -299,9 +333,7 @@ Item {
             if (connectionCode === "connecting")
                 return qsTr("正在连接遥控器")
             if (receiverCode === "waiting_remote")
-                return qsTr("请按遥控器方向键")
-            if (receiverCode === "waiting_input")
-                return qsTr("请按遥控器方向键")
+                return qsTr("正在等待连接")
             if (receiverCode === "unpaired" || receiverCode === "conflict")
                 return qsTr("请先处理设备")
             if (bridgeReconnectActionAvailable())
@@ -325,14 +357,18 @@ Item {
             return true
         if (connectionCode !== "waiting_for_device")
             return false
-        return rawInputReady() && hidTapReady()
-            && !voiceKeyChecking() && !voiceKeyFailed()
+        return SettingsController.buttonReceiverUsable
     }
 
     function bridgeNeedsRestartAction() {
+        if (valueIn(buttonReceiverStateCode(), ["setup_failed", "authorization_cancelled"]))
+            return false
         if (!SettingsController.bridgeRunning)
             return false
         if (SettingsController.hidTapState === "restart_required")
+            return false
+        if (SettingsController.isRc003Device
+                && SettingsController.hidTapState === "unavailable_gadget_not_verified")
             return false
         if (SettingsController.bridgeRestartRecommended)
             return true
@@ -468,7 +504,11 @@ Item {
                             ? qsTr("检查中…") : qsTr("重新检查")
                         enabled: !DiagnosticsController.isRefreshing
                             && !DiagnosticsController.vbCableTestRunning
-                        onClicked: DiagnosticsController.refreshDiagnostics()
+                        onClicked: {
+                            DiagnosticsController.refreshDiagnostics()
+                            if (!SettingsController.isRc003Device)
+                                SettingsController.refreshRemoteDevices()
+                        }
                         KeyNavigation.backtab: selectRemoteButton
                     }
                 }
@@ -479,13 +519,27 @@ Item {
                     stateColumnWidth: root.deviceStateColumnWidth
                     actionColumnWidth: root.deviceActionColumnWidth
                     titleText: qsTr("按键接收")
-                    editorColumnVisible: SettingsController.hidHelperRepairVisible
-                        || SettingsController.hidHelperRemovalVisible
+                    editorColumnVisible: SettingsController.isRc003Device
+                        && (SettingsController.hidHelperRepairVisible
+                            || SettingsController.hidHelperRemovalVisible)
                     editorColumnWidth: root.deviceActionColumnWidth
-                    descriptionText: root.buttonReceiverStateCode() === "restart_computer"
+                    descriptionText: SettingsController.rawInputState
+                            === "chromecast_input_payload_unavailable"
+                        ? qsTr("Windows 没有提供完整按键数据；可尝试重启电脑一次，仍失败请导出日志")
+                        : root.buttonReceiverStateCode() === "setup_failed"
+                        ? (SettingsController.chromecastSetupError
+                            || qsTr("设备准备失败，请在“选择设备”中重新使用此设备"))
+                        : root.buttonReceiverStateCode() === "authorization_cancelled"
+                        ? qsTr("管理员授权已取消，请在“选择设备”中重新使用此设备")
+                        : root.buttonReceiverStateCode() === "restart_computer"
                         ? qsTr("旧按键组件未释放，重启后重新打开程序")
+                        : root.buttonReceiverStateCode() === "component_unavailable"
+                        ? qsTr("组件缺失或校验失败，补齐后重开程序；重启服务无效")
+                        : root.buttonReceiverStateCode() === "recovering"
+                        ? qsTr("按键设备尚未就绪，正在自动重试")
                         : qsTr("让遥控器按键在电脑上生效")
-                    descriptionNeverElide: true
+                    descriptionNeverElide: SettingsController.isRc003Device
+                        || root.buttonReceiverStateCode() === "input_incomplete"
                     stateText: root.buttonReceiverStateText()
                     stateColor: root.buttonReceiverStateColor()
 
@@ -531,7 +585,7 @@ Item {
                     stateColumnWidth: root.deviceStateColumnWidth
                     actionColumnWidth: root.deviceActionColumnWidth
                     titleText: qsTr("遥控器服务")
-                    descriptionText: qsTr("保持遥控器连接，让按键和语音持续可用")
+                    descriptionText: qsTr("连接遥控器，接收按键和语音")
                     descriptionNeverElide: true
                     stateText: root.bridgeStateText()
                     stateColor: root.bridgeStateColor()
@@ -545,6 +599,8 @@ Item {
                         text: root.bridgeActionText()
                         highlighted: true
                         enabled: !SettingsController.bridgeLaunchBusy
+                            && (SettingsController.bridgeRunning || !SettingsController.activeRemoteKey
+                                || SettingsController.activeRemoteReady)
                             && !SettingsController.bridgeReconnectBusy
                             && !SettingsController.hidHelperRepairBusy
                             && !DiagnosticsController.vbCableTestRunning
@@ -568,6 +624,11 @@ Item {
                     actionColumnWidth: root.deviceActionColumnWidth
                     titleText: qsTr("检查更新")
                     descriptionText: ""
+                    stateText: SettingsController.applicationUpdateCanDownload
+                        ? qsTr("有新版本") : ""
+                    stateColor: root.tokens.accent
+                    stateColumnWidth: SettingsController.applicationUpdateCanDownload
+                        ? root.deviceStateColumnWidth : 0
                     showDivider: false
 
                     editorData: Item {
@@ -593,11 +654,18 @@ Item {
                         Layout.fillWidth: true
                         compactMinimumWidth: tokens.buttonWidth4Chars
                         text: SettingsController.applicationUpdateCheckBusy
-                            ? qsTr("检查中…") : qsTr("检查更新")
+                            ? qsTr("检查中…")
+                            : (SettingsController.applicationUpdateCanDownload
+                                ? qsTr("查看更新") : qsTr("检查更新"))
                         enabled: !SettingsController.applicationUpdateBusy
                         KeyNavigation.backtab: deviceUsageLink
                         KeyNavigation.tab: launchAtLoginSwitch
-                        onClicked: SettingsController.checkForApplicationUpdate()
+                        onClicked: {
+                            if (SettingsController.applicationUpdateCanDownload)
+                                SettingsController.showApplicationUpdate()
+                            else
+                                SettingsController.checkForApplicationUpdate()
+                        }
                     }
                 }
             }
@@ -693,20 +761,17 @@ Item {
                 SettingsListRow {
                     objectName: "closeBehaviorRow"
                     tokens: root.tokens
-                    titleText: qsTr("关闭窗口时")
-                    descriptionText: qsTr("右上角 × 的行为")
+                    titleText: qsTr("关闭窗口时隐藏到任务栏")
+                    descriptionText: qsTr("保留右下角图标；关闭此项则完全退出")
                     showDivider: false
 
-                    SelectionComboBox {
-                        id: closeBehaviorCombo
-                        objectName: "closeBehaviorCombo"
+                    CompactSwitch {
+                        id: closeBehaviorSwitch
+                        objectName: "closeBehaviorSwitch"
                         tokens: root.tokens
-                        implicitWidth: tokens.buttonWidth4Chars
-                        rightPadding: indicator.width + leftPadding + tokens.spacingTiny
-                        model: SettingsController.closeBehaviorOptions
-                        currentIndex: SettingsController.closeBehavior === "quit" ? 1 : 0
-                        Accessible.name: qsTr("关闭窗口时")
-                        onActivated: SettingsController.setCloseBehaviorIndex(index)
+                        checked: SettingsController.closeBehavior !== "quit"
+                        Accessible.name: qsTr("关闭窗口时隐藏到任务栏")
+                        onToggled: SettingsController.setCloseBehaviorIndex(checked ? 0 : 1)
                         KeyNavigation.tab: root.tabTarget
                     }
                 }

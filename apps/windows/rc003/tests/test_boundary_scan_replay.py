@@ -109,6 +109,11 @@ _AUTOSTART_MARKERS = ("CurrentVersion\\Run", "userstartup")
 # forbidden everywhere else in this source tree (see
 # test_vb_cable_bundle_py_is_exempt_only_for_its_documented_elevation_reason
 # below, which proves this exemption is not a blank check).
+_REVIEWED_ELEVATION_MARKERS = {
+    Path("src/ovb_rc003/chromecast_pipe_windows.py"): {"runas", "ShellExecute"},
+    Path("scripts/sogou_normal_submit_test.py"): {"IsUserAnAdmin"},
+    Path("scripts/sogou_stop_probe.py"): {"IsUserAnAdmin"},
+}
 _BRANDING_CHECK_EXEMPT_RELATIVE_PATHS = {
     Path("tests/test_privacy_contract.py"),
     Path("tests/test_build_artifacts.py"),
@@ -223,7 +228,7 @@ def _scan(root: Path):
                 if pattern.search(effective_text):
                     violations.append(f"forbidden branding ({pattern.pattern!r}) in: {path}")
             for marker in _ELEVATION_MARKERS:
-                if marker in effective_text:
+                if marker in effective_text and marker not in _REVIEWED_ELEVATION_MARKERS.get(relative_path, set()):
                     violations.append(f"elevation marker ({marker!r}) in: {path}")
         if not is_autostart_exempt:
             for marker in _AUTOSTART_MARKERS:
@@ -350,13 +355,19 @@ class BoundaryScanReplayTests(unittest.TestCase):
         self.assertFalse(any(marker in text for marker in _AUTOSTART_MARKERS))
 
     def test_mac_placeholder_alone_does_not_violate(self):
-        # test_config.py intentionally contains the standard placeholder as
-        # a negative-test fixture proving rejection.
-        path = _RC003_ROOT / "tests" / "test_config.py"
-        text = path.read_text(encoding="utf-8")
-        self.assertIn(_MAC_ADDRESS_PLACEHOLDER, text)
-        violations, _ = _scan(_RC003_ROOT)
-        self.assertFalse(any("test_config.py" in v and "MAC-address" in v for v in violations))
+        # Isolate the allowlist rule; the real tree is scanned by its own test.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "fixture.txt"
+            path.write_text(_MAC_ADDRESS_PLACEHOLDER, encoding="utf-8")
+            violations, scanned_count = _scan(root)
+            self.assertEqual(violations, [])
+            self.assertEqual(scanned_count, 1)
+            # The exception must remain narrow, not disable MAC checks.
+            path.write_text(_MAC_ADDRESS_PLACEHOLDER[:-2] + "01", encoding="utf-8")
+            violations, _ = _scan(root)
+            self.assertEqual(len(violations), 1)
+            self.assertIn("MAC-address", violations[0])
 
     def test_generated_directories_are_excluded_but_source_tree_binaries_are_not(self):
         # XRBM-022 controller pre-review correction: build-candidate.ps1

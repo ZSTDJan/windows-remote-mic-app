@@ -385,6 +385,16 @@ class PhysicalKeyboardTrackingTests(unittest.TestCase):
         self._send(ord("H"), WM_KEYUP)
         self.assertFalse(raw_input_windows.physical_key_is_down(ord("H")))
 
+    def test_keyboard_only_mode_tracks_keys_but_never_dispatches_remote_buttons(self):
+        self.listener._normalized_device_path = None
+        with mock.patch.object(self.listener, "_handle_keyboard_body") as remote:
+            self._send(ord("H"))
+            self.assertTrue(raw_input_windows.physical_key_is_down(ord("H")))
+            self._send(ord("H"), WM_KEYUP)
+            self._send(0x26, device_path=self.RC003_PATH)
+            self.assertFalse(raw_input_windows.physical_key_is_down(ord("H")))
+            remote.assert_not_called()
+
     def test_rc003_keyboard_collection_never_enters_physical_state(self):
         self._send(
             ord("H"),

@@ -232,6 +232,17 @@ class ATVVSession:
         return UnknownControl(opcode=opcode)
 
     def handle_audio(self, payload: bytes) -> List[int]:
+        batches = self.handle_audio_with_origin(payload, origin=None)
+        return [sample for samples, _origin in batches for sample in samples]
+
+    def handle_audio_with_origin(
+        self,
+        payload: bytes,
+        *,
+        origin: Optional[int],
+    ) -> List[tuple[List[int], Optional[int]]]:
+        """Decode frames without losing fragmented-notification provenance."""
+
         if not self._mic_open:
             if (
                 self._last_mic_off_at is not None
@@ -239,17 +250,21 @@ class ATVVSession:
             ):
                 return []
 
-        frames = self._accumulator.append(payload, self._frame_size)
-        samples: List[int] = []
-        for frame in frames:
+        frames = self._accumulator.append_with_origin(
+            payload,
+            self._frame_size,
+            origin=origin,
+        )
+        batches: List[tuple[List[int], Optional[int]]] = []
+        for frame, frame_origin in frames:
             if self._pending_sync is not None:
                 self._decoder.reset(*self._pending_sync)
                 self._dc_filter.reset()
                 self._pending_sync = None
             decoded = self._decoder.decode(frame)
             centered = self._dc_filter.process(decoded)
-            samples.extend(proto.postprocess(centered, self.gain_db))
-        return samples
+            batches.append((proto.postprocess(centered, self.gain_db), frame_origin))
+        return batches
 
     def mic_open_command(self) -> bytes:
         return proto.mic_open_command(self._version)

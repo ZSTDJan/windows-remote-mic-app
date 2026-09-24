@@ -5,14 +5,19 @@
 import QtQuick
 import QtQuick.Controls
 import QtQuick.Layouts
+import QtQuick.Effects
 import OvbRc003Settings 1.0
 
 Item {
     id: root
     property var tokens
-    readonly property var leftButtonIds: ["power", "up", "left", "back", "home", "menu"]
+    readonly property var leftButtonIds: SettingsController.isRc003Device
+        ? ["power", "up", "left", "back", "home", "menu"]
+        : ["up", "left", "down", "back", "home", "youtube", "power"]
     readonly property real mappingCardGap: 2
     readonly property real mappingBoardGap: 6
+    readonly property real mappingPhotoColumnWidth: 114
+    readonly property real mappingKeyLabelWidth: 56
     property bool connectorRepaintQueued: false
     property var backTabTarget: null
     property var tabTarget: null
@@ -63,6 +68,15 @@ Item {
     }
 
     function visualRow(buttonId) {
+        if (!SettingsController.isRc003Device) {
+            const chromeRows = {
+                "up": 0, "left": 1, "down": 2,
+                "ok": 0, "right": 1, "volume_up": 2, "volume_down": 3,
+                "back": 3, "mic": 4, "home": 4, "volume_mute": 5,
+                "youtube": 5, "netflix": 6, "power": 6, "input_source": 7
+            }
+            return chromeRows[buttonId]
+        }
         const rows = {
             "power": 0, "up": 1, "left": 2, "back": 3, "home": 4, "menu": 5,
             "mic": 0, "right": 1, "ok": 2, "down": 3,
@@ -98,9 +112,15 @@ Item {
             hotspot.width / 2,
             hotspot.height / 2
         )
-        const endX = center.x
-        const endY = center.y
+        // Chromecast connectors stop at the marker edge;
+        // so neither the photo silhouette nor the line obscures the key symbol.
+        const endX = center.x + (SettingsController.isRc003Device || hotspot.buttonId === "ok" ? 0
+            : (leftSide ? -1 : 1) * hotspot.width / 2)
+        const endY = center.y - (!SettingsController.isRc003Device && hotspot.buttonId === "ok"
+            ? hotspot.height / 2 : 0)
         const direction = leftSide ? 1 : -1
+        // Both profiles use one uninterrupted cubic over the full endpoint
+        // span, with horizontal tangents. Do not squeeze its bend into a gutter.
         const controlRadius = root.connectorControlRadius(start.x, endX)
         const control1X = start.x + direction * controlRadius
         const control1Y = start.y
@@ -160,7 +180,9 @@ Item {
             "mic": qsTr("语音"), "right": qsTr("右"), "ok": qsTr("确定"),
             "down": qsTr("下"), "volume_up": "+", "volume_down": "-", "tv": "TV"
         }
-        return names[buttonId] || buttonId
+        const chromeNames = { "volume_mute": qsTr("静音"), "youtube": "YouTube",
+            "netflix": "Netflix", "input_source": qsTr("输入源") }
+        return names[buttonId] || chromeNames[buttonId] || buttonId
     }
 
     function openShortcutRecorder(buttonId, rowIndex, trigger, targetEditor) {
@@ -200,7 +222,8 @@ Item {
             kind: bodyKind
             width: 340
             wrapMode: Text.WordWrap
-            text: qsTr("这会把 13 个按键恢复为程序内置映射，并立即自动保存。")
+            text: qsTr("这会把当前遥控器的 %1 个按键恢复为内置映射，并立即自动保存。另一台的设置不变。")
+                .arg(SettingsController.isRc003Device ? 13 : 15)
         }
     }
 
@@ -547,7 +570,9 @@ Item {
             readonly property string groupTitle:
                 SettingsController.actionOptionGroupTitle(String(modelData))
             readonly property bool startsGroup:
-                SettingsController.actionOptionStartsGroup(String(modelData))
+                groupTitle.length > 0 && (index === 0 ||
+                groupTitle !== SettingsController.actionOptionGroupTitle(
+                    String(editorCombo.model[index - 1])))
             readonly property int groupHeaderHeight: startsGroup
                 ? Math.ceil(tokens.fontSizeTiny) + tokens.spacingMedium : 0
             objectName: editorCombo.objectName + "_option_" + index
@@ -833,8 +858,8 @@ Item {
                         tokens: root.tokens
                         active: primaryGestureTitleHover.hovered
                         text: actionEditor.buttonId === "mic"
-                            ? qsTr("话筒键可选按住说话、普通动作、快捷键或 Quicker URI")
-                            : qsTr("可选普通动作、快捷键或 Quicker URI")
+                            ? qsTr("话筒键可选按住说话、普通动作、快捷键或 Quicker URI；滚轮点按一格，按住连滚并提速；启动应用需已安装")
+                            : qsTr("可选普通动作、快捷键或 Quicker URI；滚轮点按一格，按住连滚并提速；启动应用需已安装")
                     }
                 }
                 RowLayout {
@@ -916,7 +941,7 @@ Item {
                         tokens: root.tokens
                     Layout.fillWidth: true
                     enabled: !actionEditor.primaryIsVoice
-                    model: SettingsController.secondaryActionOptions
+                    model: SettingsController.secondaryActionOptionsFor(actionEditor.buttonId)
                     Accessible.name: actionEditor.buttonName + qsTr("双击动作")
                     onEditTextChanged: {
                             if (!actionEditor.syncing)
@@ -973,7 +998,7 @@ Item {
                     CompactToolTip {
                         tokens: root.tokens
                         active: longGestureTitleHover.hovered
-                        text: qsTr("按住约 0.55 秒触发；设置双击或长按后，此键不再支持按住连发")
+                        text: qsTr("按住约 0.55 秒触发一次；设置双击或长按后，此键不再支持按住连发")
                     }
                 }
                 RowLayout {
@@ -986,7 +1011,7 @@ Item {
                         tokens: root.tokens
                     Layout.fillWidth: true
                     enabled: !actionEditor.primaryIsVoice
-                    model: SettingsController.secondaryActionOptions
+                    model: SettingsController.secondaryActionOptionsFor(actionEditor.buttonId)
                     Accessible.name: actionEditor.buttonName + qsTr("长按动作")
                     onEditTextChanged: {
                             if (!actionEditor.syncing)
@@ -1098,8 +1123,9 @@ Item {
                         tokens: root.tokens
                         Layout.fillWidth: true
                         Layout.preferredWidth: 1
-                        text: qsTr("小米遥控器2 Pro")
-                        highlighted: true
+                        text: SettingsController.deviceOptions[0]
+                        highlighted: SettingsController.isRc003Device
+                        subduedText: !highlighted
                         KeyNavigation.backtab: root.backTabTarget
                     }
                     CompactButton {
@@ -1108,21 +1134,29 @@ Item {
                         tokens: root.tokens
                         Layout.fillWidth: true
                         Layout.preferredWidth: 1
-                        text: qsTr("其他设备支持中...")
-                        enabled: false
+                        text: SettingsController.deviceOptions[1]
+                        highlighted: !SettingsController.isRc003Device
+                        subduedText: !highlighted
                     }
                 }
             }
 
-            Item {
+            Flickable {
                 id: mappingList
                 objectName: "mappingList"
+                clip: true
+                contentWidth: width
+                contentHeight: SettingsController.isRc003Device ? height
+                    : Math.max(height, leftSideCards.implicitHeight, rightSideCards.implicitHeight)
+                flickableDirection: Flickable.VerticalFlick
+                boundsBehavior: Flickable.StopAtBounds
+                ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
                 Layout.fillWidth: true
                 Layout.fillHeight: true
                 Layout.minimumHeight: 306
                 onWidthChanged: root.scheduleConnectorRepaint()
                 onHeightChanged: root.scheduleConnectorRepaint()
-                property int count: 13
+                property int count: SettingsController.isRc003Device ? 13 : 15
                 property int currentIndex: ButtonMappingModel.indexOfButton(
                     SettingsController.selectedButtonId
                 )
@@ -1172,7 +1206,7 @@ Item {
                     anchors.verticalCenter: parent.verticalCenter
                     width: (parent.width - photoSidebar.width - root.mappingBoardGap * 2) / 2
                     columns: 1
-                    rows: 6
+                    rows: SettingsController.isRc003Device ? 6 : 7
                     rowSpacing: root.mappingCardGap
                     z: 3
                     onXChanged: root.scheduleConnectorRepaint()
@@ -1197,6 +1231,7 @@ Item {
                             required property bool isSelected
 
                             visible: root.isLeftButton(buttonId)
+                            enabled: SettingsController.isRc003Device || buttonId !== "mic"
                             exposeObjectNames: visible
                             tokens: root.tokens
                             cardId: buttonId
@@ -1204,7 +1239,9 @@ Item {
                             Layout.fillWidth: true
                             Layout.preferredHeight: visible ? implicitHeight : 0
                             buttonName: root.shortButtonName(buttonId)
-                            singleText: actionText
+                            keyLabelWidth: root.mappingKeyLabelWidth
+                            singleText: !SettingsController.isRc003Device && buttonId === "mic"
+                                ? SettingsController.remoteRecordingModeText : actionText
                             doubleText: doubleClickText
                             longText: longPressText
                             singleNoteText: singleNote
@@ -1236,8 +1273,8 @@ Item {
                     objectName: "photoSidebar"
                     anchors.horizontalCenter: parent.horizontalCenter
                     anchors.verticalCenter: parent.verticalCenter
-                    width: 86
-                    height: 230
+                    width: root.mappingPhotoColumnWidth
+                    height: photoFrame.height + 20
                     z: 1
                     onXChanged: root.scheduleConnectorRepaint()
                     onYChanged: root.scheduleConnectorRepaint()
@@ -1250,8 +1287,12 @@ Item {
                         anchors.top: parent.top
                         anchors.horizontalCenter: parent.horizontalCenter
                         width: 86
-                        height: 210
-                        clip: true
+                        // Xiaomi's 240x360 source has transparent padding:
+                        // 270 renders its 337px body at ~253px, close to Google.
+                        height: SettingsController.isRc003Device ? 270 : 250
+                        // Keep the Xiaomi photo crop, but let Google's shadow
+                        // extend beyond the image without moving its hotspots.
+                        clip: SettingsController.isRc003Device
                         onXChanged: root.scheduleConnectorRepaint()
                         onYChanged: root.scheduleConnectorRepaint()
                         onWidthChanged: root.scheduleConnectorRepaint()
@@ -1262,14 +1303,26 @@ Item {
                             objectName: "photoImage"
                             anchors.horizontalCenter: parent.horizontalCenter
                             anchors.verticalCenter: parent.verticalCenter
-                            width: height * 240 / 360
+                            width: SettingsController.isRc003Device ? height * 240 / 360
+                                : height * sourceSize.width / Math.max(1, sourceSize.height)
                             height: parent.height
                             source: SettingsController.photoAvailable
                                 ? SettingsController.photoSource : ""
                             visible: SettingsController.photoAvailable
-                            fillMode: Image.Stretch
+                            fillMode: SettingsController.isRc003Device ? Image.Stretch : Image.PreserveAspectFit
                             smooth: true
                             mipmap: true
+                            layer.enabled: !SettingsController.isRc003Device
+                                && SettingsController.photoAvailable
+                                && GraphicsInfo.shaderType === GraphicsInfo.RhiShader
+                            layer.effect: MultiEffect {
+                                shadowEnabled: true
+                                shadowColor: root.tokens.remotePhotoShadowColor
+                                shadowBlur: 1.0
+                                blurMax: root.tokens.remotePhotoShadowRadius
+                                shadowHorizontalOffset: 0
+                                shadowVerticalOffset: root.tokens.remotePhotoShadowOffset
+                            }
                             onXChanged: root.scheduleConnectorRepaint()
                             onYChanged: root.scheduleConnectorRepaint()
                             onWidthChanged: root.scheduleConnectorRepaint()
@@ -1365,16 +1418,6 @@ Item {
                         }
                     }
 
-                    UiLabel {
-                        anchors.bottom: parent.bottom
-                        anchors.horizontalCenter: parent.horizontalCenter
-                        tokens: root.tokens
-                        kind: noteKind
-                        text: qsTr("当前：") + root.shortButtonName(
-                            SettingsController.selectedButtonId
-                        )
-                        horizontalAlignment: Text.AlignHCenter
-                    }
                 }
 
                 GridLayout {
@@ -1384,7 +1427,7 @@ Item {
                     anchors.verticalCenter: parent.verticalCenter
                     width: (parent.width - photoSidebar.width - root.mappingBoardGap * 2) / 2
                     columns: 1
-                    rows: 7
+                    rows: SettingsController.isRc003Device ? 7 : 8
                     rowSpacing: root.mappingCardGap
                     z: 3
                     onXChanged: root.scheduleConnectorRepaint()
@@ -1409,6 +1452,7 @@ Item {
                             required property bool isSelected
 
                             visible: !root.isLeftButton(buttonId)
+                            enabled: SettingsController.isRc003Device || buttonId !== "mic"
                             exposeObjectNames: visible
                             tokens: root.tokens
                             cardId: buttonId
@@ -1416,7 +1460,9 @@ Item {
                             Layout.fillWidth: true
                             Layout.preferredHeight: visible ? implicitHeight : 0
                             buttonName: root.shortButtonName(buttonId)
-                            singleText: actionText
+                            keyLabelWidth: root.mappingKeyLabelWidth
+                            singleText: !SettingsController.isRc003Device && buttonId === "mic"
+                                ? SettingsController.remoteRecordingModeText : actionText
                             doubleText: doubleClickText
                             longText: longPressText
                             singleNoteText: singleNote
@@ -1465,6 +1511,7 @@ Item {
                         compactMinimumWidth: tokens.buttonWidth6Chars
                         text: SettingsController.keyDetectionActive
                             ? qsTr("停止检测") : qsTr("检测真实按键")
+                        enabled: SettingsController.activeRemoteReady
                         highlighted: SettingsController.keyDetectionActive
                         onClicked: SettingsController.keyDetectionActive
                             ? SettingsController.stopKeyDetection()
@@ -1476,7 +1523,8 @@ Item {
                         tokens: root.tokens
                         kind: noteKind
                         Layout.fillWidth: true
-                        text: SettingsController.keyDetectionText
+                        text: SettingsController.isRc003Device ? SettingsController.keyDetectionText
+                            : SettingsController.keyDetectionText + qsTr("；检测时不启动录音")
                         elide: Text.ElideRight
                     }
                     Item { Layout.fillWidth: true }
@@ -1491,6 +1539,7 @@ Item {
                     }
                 }
             }
+
 
         }
 

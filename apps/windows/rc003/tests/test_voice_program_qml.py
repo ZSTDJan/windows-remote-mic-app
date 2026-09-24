@@ -14,6 +14,11 @@ import time
 from PySide6.QtCore import QPointF, Qt
 from PySide6.QtTest import QTest
 from ovb_rc003 import qt_settings_app as m
+from unittest.mock import Mock
+m.wetype_control_windows.begin_input_profile_selection = Mock(
+    return_value=Mock(result=Mock(return_value=False)))
+from ovb_rc003 import chromecast_etw_windows
+chromecast_etw_windows.sensitive_logging_enabled = lambda: True
 
 
 def find(root, name):
@@ -109,12 +114,23 @@ def inspect_voice_program(settings):
 
 
 m.voice_program_manager.inspect_voice_program = inspect_voice_program
+m.voice_program_manager.launch_voice_program = lambda settings: (
+    m.voice_program_manager.VoiceProgramLaunchResult(
+        str(settings.get("provider", "")), False, True, "already_running"
+    )
+)
 
 
 provider_read_requests = []
 
 
-def read_provider_hotkey(provider_id, *, allow_settings_window=False, cancel_event=None):
+def read_provider_hotkey(
+    provider_id,
+    *,
+    allow_settings_window=False,
+    cancel_event=None,
+    trigger="hold",
+):
     provider_id = str(provider_id)
     provider_read_requests.append((provider_id, allow_settings_window))
     shortcuts = {
@@ -281,6 +297,9 @@ wetype_refresh = {
     "error": str(controller.errorMessage),
 }
 wetype_before = str(controller.holdVoiceHotkeyText)
+record_button_center = record_button.mapToScene(
+    QPointF(record_button.property("width") / 2, record_button.property("height") / 2)
+).toPoint()
 QTest.mouseClick(window, Qt.LeftButton, Qt.NoModifier, record_button_center)
 render(window, app)
 wetype_hotkey = {
@@ -447,7 +466,8 @@ custom_program = {
     ),
 }
 
-controller.selectedVoiceProgramIndex = 0
+# Load a legacy unconfigured document; index zero can no longer be selected.
+controller._replace_voice_program_settings({"provider": "none"})
 render(window, app)
 unmanaged_elevated = {
     "visible": bool(elevated.property("visible")),
@@ -590,7 +610,7 @@ controller.shutdownBackgroundTasks()''',
         )
         self.assertEqual(
             data["wetype_hotkey"]["description"],
-            "点击刷新会打开微信设置读取，也可手动录入",
+            "刷新时会打开微信设置",
         )
         self.assertEqual(data["wetype_refresh"], {
             "text": "lctrl+lwin", "source": "auto", "explicit_reads": 1, "error": "",
@@ -643,12 +663,12 @@ controller.shutdownBackgroundTasks()''',
         self.assertTrue(data["doubao"]["refresh_visible"])
         self.assertEqual(
             data["doubao"]["description"],
-            "自动读取豆包输入法的按住型快捷键，也可手动录入",
+            "自动读取按住型快捷键",
         )
         self.assertTrue(data["custom_program"]["path_visible"])
         self.assertTrue(data["custom_program"]["elevated_visible"])
         self.assertFalse(data["custom_program"]["settings_visible"])
-        self.assertTrue(data["unmanaged_elevated"]["visible"])
+        self.assertFalse(data["unmanaged_elevated"]["visible"])
         self.assertFalse(data["unmanaged_elevated"]["enabled"])
         self.assertLessEqual(
             data["managed"]["holdVoiceHotkeyField"]["geometry"]["right"],

@@ -19,6 +19,7 @@ in for it.
 """
 
 import asyncio
+from contextlib import ExitStack
 import json
 from dataclasses import replace
 import logging
@@ -40,6 +41,7 @@ from ovb_rc003 import (
     key_mapping,
     logging_setup,
     raw_input_windows,
+    settings_ui,
     voice_program_manager,
     win32_input,
     win32_keys,
@@ -67,6 +69,7 @@ class _FakeBleSession:
         self.mic_close_calls = 0
         self.close_raises = close_raises
         self.close_calls = 0
+        self.audio_arrival_watermark = -1
 
     def send_mic_open_threadsafe(self):
         self.mic_open_calls += 1
@@ -103,26 +106,45 @@ class _FakeInputOwner:
 
 
 class _FakeVoicePhysicalizer:
-    def __init__(self, *, start_error=None, immediate_exit=False):
+    def __init__(
+        self,
+        *,
+        start_error=None,
+        immediate_exit=False,
+        accepts_new_down=True,
+        stop_error=None,
+    ):
         self.start_error = start_error
         self.immediate_exit = immediate_exit
         self.is_running = False
+        self.accepts_new_down = accepts_new_down
+        self.stop_error = stop_error
         self.start_calls = 0
         self.stop_calls = 0
         self.callback = None
+        self.health_callback = None
+        self.tracker_generation = 1
+        self.installation_epoch = 1
 
     def set_tracking_lost_callback(self, callback):
         self.callback = callback
+
+    def set_health_failure_callback(self, callback):
+        self.health_callback = callback
 
     def start(self):
         self.start_calls += 1
         if self.start_error is not None:
             raise self.start_error
         self.is_running = not self.immediate_exit
+        self.accepts_new_down = self.is_running
 
     def stop(self):
         self.stop_calls += 1
+        if self.stop_error is not None:
+            raise self.stop_error
         self.is_running = False
+        self.accepts_new_down = False
 
     def emit_loss(self):
         if self.callback is not None:
@@ -295,16 +317,24 @@ class _AppWiringTestCase(unittest.TestCase):
         # into ConnectionSupervisor instead - never the ambient, never-closed
         # default the old bare _build_app() call left behind.
         self.app, self._loop = _build_app_with_owned_loop(Path(self._tmp.name))
+        # Voice wiring tests need an explicitly configured provider, not the
+        # retired none mode. This empty fixture is never launched.
+        voice_exe = Path(self._tmp.name) / "test-voice.exe"
+        voice_exe.touch()
+        self.app._config["voice_program"] = voice_program_manager.normalize_voice_program_settings(
+            {"provider": "custom", "custom_executable": str(voice_exe),
+             "launch_on_bridge_start": False})
         # This wiring harness represents an explicitly selected device. PnP
         # identity isolation is tested separately in test_remote_selection.
         self.app._selected_remote_key = "a" * 64
+        self.app._remote_profile = app_module.remote_selection.RC003_PROFILE
         selection_patch = mock.patch(
             "ovb_rc003.remote_selection.selected_raw_path",
             side_effect=lambda paths, _key: app_module.hid_identity.select_single_device_path(paths),
         )
         selection_patch.start()
         self.addCleanup(selection_patch.stop)
-        self.app._playback = _FakePlaybackSink()
+        self.app._voice_audio.sink = _FakePlaybackSink()
         self.app._ble_session = _FakeBleSession()
         self.app._accept_ble_events = True
         # Most wiring tests exercise the product's mapped-button path. That
@@ -316,10 +346,27 @@ class _AppWiringTestCase(unittest.TestCase):
         # directly, so establish the same ready state explicitly.
         raw_input_windows._set_physical_keyboard_tracker_active(True)
         self.app._voice_key_physicalizer_ready = True
-        self.app._doubao_physicalizer = mock.Mock()
-        self.app._doubao_physicalizer.start.return_value = True
-        self.app._doubao_physicalizer.status = "active"
-        self.app._doubao_physicalizer.error = None
+        self.app._voice_shortcut.doubao_physicalizer = mock.Mock()
+        self.app._voice_shortcut.doubao_physicalizer.start.return_value = True
+        self.app._voice_shortcut.doubao_physicalizer.status = "active"
+        self.app._voice_shortcut.doubao_physicalizer.error = None
+        self.app._voice_shortcut.doubao_physicalizer.generation = 1
+        self.app._voice_shortcut.doubao_physicalizer.target_pid = 123
+        self.app._voice_shortcut.doubao_physicalizer.is_active_generation.return_value = True
+        class ReadyDoubaoCapture:
+            identity = None
+            status = "waiting"
+
+            def begin(inner_self):
+                return None
+
+            def poll(inner_self, _now):
+                inner_self.identity = "test-capture"
+                inner_self.status = "tracking"
+                return False
+
+        self.production_doubao_capture_watch_factory = self.app._doubao_capture_watch_factory
+        self.app._doubao_capture_watch_factory = ReadyDoubaoCapture
         self.app._raw_windows_key_down_query = lambda _vk_code: False
         self._button_input_release_timers = []
 
@@ -340,17 +387,20 @@ class _AppWiringTestCase(unittest.TestCase):
             self._voice_hotkey_release_timers.append(timer)
             return timer
 
-        self.app._voice_hotkey_release_timer_factory = (
+        self.app._voice_shortcut.timer_factory = (
             voice_hotkey_release_timer_factory
         )
 
     def tearDown(self):
+        self.app._doubao_session.cancel_current()
+        self.app._doubao_session.wait_current(1.0)
         with self.app._button_action_lock:
             self.app._button_input_release_retry_stopping = True
             self.app._cancel_button_input_release_retry_locked(reset_delay=False)
-        with self.app._voice_trigger_lock:
-            self.app._voice_hotkey_release_retry_stopping = True
-            self.app._cancel_voice_hotkey_release_retry_locked(reset_delay=False)
+        with self.app._voice_shortcut.lock:
+            self.app._cancel_voice_hold_watchdog_locked()
+            self.app._voice_shortcut.retry_stopping = True
+            self.app._voice_shortcut.cancel_release_retry(reset_delay=False)
         with self.app._voice_key_physicalizer_lifecycle_lock:
             self.app._voice_key_physicalizer_stopping = True
             self.app._cancel_voice_key_physicalizer_retry_locked()
@@ -361,11 +411,11 @@ class _AppWiringTestCase(unittest.TestCase):
             False
         )
         raw_input_windows._set_physical_keyboard_tracker_active(False)
-        playback_writer = self.app._playback_writer
+        playback_writer = self.app._voice_audio.writer
         if playback_writer is not None:
             playback_writer.flush(1.0)
             playback_writer.stop(1.0)
-            self.app._playback_writer = None
+            self.app._voice_audio.writer = None
         # XRBM-023: logging_setup.get_logger() configures its FileHandler
         # exactly once per process (module-global ``_configured``) and never
         # closes it - correct for a real long-running app, but in this suite
@@ -393,13 +443,26 @@ class _AppWiringTestCase(unittest.TestCase):
     def _drain_event_loop(self):
         self._loop.run_until_complete(asyncio.sleep(0))
 
+    def _wait_for_doubao_attempt(self):
+        attempt = self.app._doubao_session.current
+        self.assertIsNotNone(attempt)
+        self.assertTrue(
+            attempt.worker_done.wait(1.0),
+            (
+                f"outcome={attempt.outcome} phase={attempt.phase} "
+                f"debts={sorted(attempt.cleanup_debt_snapshot())}"
+            ),
+        )
+        return attempt
+
     def _flush_playback(self):
-        writer = self.app._playback_writer
+        writer = self.app._voice_audio.writer
         self.assertIsNotNone(writer)
         return writer.flush(1.0)
 
     def _save_voice_settings(self, *, mode: str, hotkey_text: str) -> None:
         refreshed = config.load_config(self.app._config_path)
+        refreshed["voice_program"] = dict(self.app._config["voice_program"])
         refreshed["voice_trigger_mode"] = mode
         refreshed["voice_hotkey"] = hotkey_text
         config.save_config(self.app._config_path, refreshed)
@@ -452,6 +515,58 @@ class StartupIdentityLoggingTests(unittest.TestCase):
 
 
 class LiveSettingsReloadTests(_AppWiringTestCase):
+    def test_chromecast_attempt_claim_defers_provider_and_hotkey_reload(self):
+        host = mock.Mock(_settings_claimed=True)
+        self.app._chromecast_runtime.voice_host = host
+        refreshed = config.load_config(self.app._config_path)
+        refreshed["voice_program"] = (
+            voice_program_manager.normalize_voice_program_settings(
+                {"provider": voice_program_manager.VOICE_PROGRAM_DOUBAO_IME}
+            )
+        )
+        config.set_voice_hotkey_for_provider(
+            refreshed,
+            voice_program_manager.VOICE_PROGRAM_DOUBAO_IME,
+            "ralt+space",
+        )
+        config.save_config(self.app._config_path, refreshed)
+
+        worker = threading.Thread(target=self.app._reload_settings_if_changed)
+        worker.start()
+        worker.join(1.0)
+
+        self.assertFalse(worker.is_alive())
+        self.assertNotEqual(
+            self.app._config["voice_program"]["provider"],
+            voice_program_manager.VOICE_PROGRAM_DOUBAO_IME,
+        )
+        self.assertIsNotNone(self.app._pending_config)
+
+        host._settings_claimed = False
+        with self.app._voice_shortcut.lock:
+            self.app._apply_pending_voice_settings_if_idle_locked()
+
+        self.assertEqual(
+            self.app._config["voice_program"]["provider"],
+            voice_program_manager.VOICE_PROGRAM_DOUBAO_IME,
+        )
+        self.assertEqual(self.app._voice_shortcut.hotkey.serialize(), "ralt+space")
+
+    def test_reload_never_applies_another_entity_settings(self):
+        from ovb_rc003 import remote_selection
+        original = {"schema": 1, "active": "a" * 64, "devices": [
+            {"key": "a" * 64, "profile": "xiaomi-rc003"},
+            {"key": "b" * 64, "profile": "chromecast-remote"}]}
+        self.app._config[remote_selection.KEY] = original
+        incoming = dict(self.app._config)
+        incoming[remote_selection.KEY] = dict(original, active="b" * 64)
+        config.save_config(self.app._config_path, incoming)
+        old_mapping = self.app._bindings
+        self.app._reload_settings_if_changed()
+        self.assertEqual(remote_selection.active_key(self.app._config), "a" * 64)
+        self.assertIs(self.app._bindings, old_mapping)
+        self.assertIsNone(self.app._pending_config)
+
     def _use_manual_gesture_timers(self):
         timers = []
 
@@ -482,15 +597,15 @@ class LiveSettingsReloadTests(_AppWiringTestCase):
 
         self.assertEqual(reconstructed._config["voice_hotkey"], "ralt")
         self.assertEqual(reconstructed._configured_voice_buttons(), [])
-        self.assertEqual(reconstructed._voice_hotkey.serialize(), "ralt")
+        self.assertEqual(reconstructed._voice_shortcut.hotkey.serialize(), "ralt")
 
     def test_voice_mode_and_hotkey_reload_while_idle(self):
         self._save_voice_settings(mode="hold", hotkey_text="ctrl+l")
 
         self.app._reload_settings_if_changed()
 
-        self.assertEqual(self.app._voice.trigger_mode, key_mapping.VoiceTriggerMode.HOLD)
-        self.assertEqual(self.app._voice_hotkey.serialize(), "ctrl+l")
+        self.assertEqual(self.app._voice_shortcut.controller.trigger_mode, key_mapping.VoiceTriggerMode.HOLD)
+        self.assertEqual(self.app._voice_shortcut.hotkey.serialize(), "ctrl+l")
         self.assertIsNone(self.app._pending_voice_settings)
 
     def test_doubao_provider_refresh_is_used_by_the_next_voice_action(self):
@@ -504,11 +619,13 @@ class LiveSettingsReloadTests(_AppWiringTestCase):
         config.save_config(self.app._config_path, refreshed)
         control = mock.Mock()
         control.start.return_value = True
+        control.prepare.return_value = object()
+        control.dispatch_prepared.return_value = True
         control.stop.return_value = True
-        self.app._doubao_voice_control = control
+        self.app._voice_shortcut.doubao_control = control
 
         self.app._reload_settings_if_changed()
-        delivered = self.app._apply_voice_action(
+        delivered = self.app._voice_shortcut.apply(
             app_module.voice_controller.VoiceHostAction.KEY_DOWN
         )
 
@@ -518,13 +635,13 @@ class LiveSettingsReloadTests(_AppWiringTestCase):
             app_module._VOICE_HOTKEY_BACKEND_DOUBAO,
         )
         control.start.assert_called_once_with(("ralt",))
-        self.app._doubao_physicalizer.start.assert_called_once_with((0xA5,))
+        self.app._voice_shortcut.doubao_physicalizer.start.assert_called_once_with((0xA5,))
         self.assertTrue(
-            self.app._apply_voice_action(
+            self.app._voice_shortcut.apply(
                 app_module.voice_controller.VoiceHostAction.KEY_UP
             )
         )
-        self.app._doubao_physicalizer.expect_markers.assert_has_calls(
+        self.app._voice_shortcut.doubao_physicalizer.expect_markers.assert_has_calls(
             [mock.call("down", 1), mock.call("up", 1)]
         )
 
@@ -617,15 +734,15 @@ class LiveSettingsReloadTests(_AppWiringTestCase):
     def test_deferred_physical_bindings_update_when_voice_becomes_idle(self):
         listener = mock.Mock()
         self.app._hid_listener = listener
-        self.app._voice.on_mic_button_pressed()
+        self.app._voice_shortcut.controller.on_mic_button_pressed()
         refreshed = config.load_key_bindings(self.app._bindings_path)
         refreshed["physical_bindings"] = {"hid:1234": "up"}
         config.save_key_bindings(self.app._bindings_path, refreshed)
 
         self.app._reload_settings_if_changed()
         listener.set_physical_bindings.assert_not_called()
-        self.app._voice.on_mic_button_released()
-        with self.app._voice_trigger_lock:
+        self.app._voice_shortcut.controller.on_mic_button_released()
+        with self.app._voice_shortcut.lock:
             self.app._apply_pending_voice_settings_if_idle_locked()
 
         listener.set_physical_bindings.assert_called_once_with({"hid:1234": "up"})
@@ -642,26 +759,26 @@ class LiveSettingsReloadTests(_AppWiringTestCase):
         ):
             self.app._on_control_event(AudioStarted(session_id=1))
 
-        self.assertEqual(self.app._voice.trigger_mode, key_mapping.VoiceTriggerMode.HOLD)
-        self.assertEqual(self.app._voice_hotkey.serialize(), "ctrl+l")
+        self.assertEqual(self.app._voice_shortcut.controller.trigger_mode, key_mapping.VoiceTriggerMode.HOLD)
+        self.assertEqual(self.app._voice_shortcut.hotkey.serialize(), "ctrl+l")
         self.assertEqual(delivered, [("ctrl", "l")])
 
     def test_voice_settings_reload_is_deferred_until_active_hold_releases(self):
-        self.app._voice.on_mic_button_pressed()
+        self.app._voice_shortcut.controller.on_mic_button_pressed()
         self._save_voice_settings(mode="hold", hotkey_text="ctrl+l")
 
         self.app._reload_settings_if_changed()
 
-        self.assertEqual(self.app._voice.trigger_mode, key_mapping.VoiceTriggerMode.HOLD)
-        self.assertEqual(self.app._voice_hotkey.serialize(), "ralt")
+        self.assertEqual(self.app._voice_shortcut.controller.trigger_mode, key_mapping.VoiceTriggerMode.HOLD)
+        self.assertEqual(self.app._voice_shortcut.hotkey.serialize(), "ralt")
         self.assertIsNotNone(self.app._pending_voice_settings)
 
-        self.app._voice.on_mic_button_released()
-        with self.app._voice_trigger_lock:
+        self.app._voice_shortcut.controller.on_mic_button_released()
+        with self.app._voice_shortcut.lock:
             self.app._apply_pending_voice_settings_if_idle_locked()
 
-        self.assertEqual(self.app._voice.trigger_mode, key_mapping.VoiceTriggerMode.HOLD)
-        self.assertEqual(self.app._voice_hotkey.serialize(), "ctrl+l")
+        self.assertEqual(self.app._voice_shortcut.controller.trigger_mode, key_mapping.VoiceTriggerMode.HOLD)
+        self.assertEqual(self.app._voice_shortcut.hotkey.serialize(), "ctrl+l")
         self.assertIsNone(self.app._pending_voice_settings)
 
     def test_invalid_voice_settings_keep_the_last_valid_runtime_values(self):
@@ -671,8 +788,8 @@ class LiveSettingsReloadTests(_AppWiringTestCase):
 
         self.app._reload_settings_if_changed()
 
-        self.assertEqual(self.app._voice.trigger_mode, key_mapping.VoiceTriggerMode.HOLD)
-        self.assertEqual(self.app._voice_hotkey.serialize(), "ralt")
+        self.assertEqual(self.app._voice_shortcut.controller.trigger_mode, key_mapping.VoiceTriggerMode.HOLD)
+        self.assertEqual(self.app._voice_shortcut.hotkey.serialize(), "ralt")
         self.assertIsNone(self.app._pending_voice_settings)
 
     def test_delayed_single_click_keeps_the_mapping_owned_at_first_press(self):
@@ -870,13 +987,11 @@ class LiveSettingsReloadTests(_AppWiringTestCase):
         self._save_button_bindings(original)
 
         with mock.patch.object(win32_input, "send_arrow_up") as old_action, mock.patch.object(
-            win32_input, "send_mouse_wheel"
+            win32_input, "send_key_combo_tap"
         ) as new_action:
             self.app._on_button_event("up", True, event_source="hid")
             changed = config.load_key_bindings(self.app._bindings_path)
-            changed["bindings"]["up"] = key_mapping.ButtonAction(
-                key_mapping.ActionKind.MOUSE_WHEEL_UP
-            ).to_dict()
+            changed["bindings"]["up"] = {"kind": "mouse_wheel_up", "keys": []}
             self._save_button_bindings(changed)
             timers[0].fire()
             self.app._on_button_event("up", False, event_source="hid")
@@ -1089,6 +1204,50 @@ class CandidateResolutionWiringTests(_AppWiringTestCase):
                     ],
                 )
 
+    def test_optional_battery_setup_failure_does_not_fail_core_connection(self):
+        candidate = object()
+
+        async def discover(*, with_device_keys):
+            self.assertTrue(with_device_keys)
+            return [candidate]
+
+        async def resolve(candidates, *, selected_key):
+            return candidates[0]
+
+        class Session:
+            def __init__(inner_self, **_callbacks):
+                pass
+
+            async def connect(inner_self, selected):
+                self.assertIs(selected, candidate)
+
+            def start_battery_monitor(inner_self):
+                raise OSError("private optional detail")
+
+        logger = mock.Mock()
+        self.app._logger = logger
+        with mock.patch.object(
+            app_module.ble_transport_winrt, "discover_candidates", discover
+        ), mock.patch.object(
+            app_module.ble_transport_winrt,
+            "select_connectable_candidate",
+            resolve,
+        ), mock.patch.object(
+            app_module.ble_transport_winrt, "RC003BleSession", Session
+        ), mock.patch.object(
+            self.app, "_publish_runtime_status"
+        ) as publish_status:
+            self._loop.run_until_complete(self.app._connect_once())
+
+        self.assertEqual(
+            publish_status.call_args_list[-1],
+            mock.call(bridge_runtime_status.BridgeConnectionState.CONNECTED),
+        )
+        logger.warning.assert_called_once_with(
+            "optional RC003 battery monitor start failed: error_type=%s",
+            "OSError",
+        )
+
     def test_disconnect_waits_for_device_but_protocol_error_waits_to_retry(self):
         reconnects = []
         self.app._supervisor.request_reconnect = lambda: reconnects.append(True)
@@ -1103,6 +1262,24 @@ class CandidateResolutionWiringTests(_AppWiringTestCase):
             [mock.call(waiting), mock.call(retry_wait)],
         )
         self.assertEqual(reconnects, [True, True])
+
+    def test_late_battery_is_rejected_after_disconnect_or_session_error(self):
+        states = bridge_runtime_status.BridgeConnectionState
+        self.app._supervisor.request_reconnect = mock.Mock()
+        self.app._accept_ble_events = True
+        for callback in (
+            self.app._on_disconnected,
+            lambda: self.app._on_session_error(RuntimeError("test")),
+        ):
+            self.app._publish_runtime_status(states.CONNECTED)
+            self.app._on_battery_level(59)
+            self.assertEqual(self.app._runtime_battery_level, 59)
+            callback()
+            self.app._on_battery_level(58)
+            self.assertIsNone(self.app._runtime_battery_level)
+            self.assertIsNone(
+                bridge_runtime_status.read_status(self.app._config_root).battery_level
+            )
 
     def test_previous_ble_session_callbacks_are_rejected_after_reconnect(self):
         sessions = []
@@ -1143,19 +1320,24 @@ class CandidateResolutionWiringTests(_AppWiringTestCase):
         with mock.patch.object(
             self.app, "_handle_mic_button_pressed"
         ) as pressed, mock.patch.object(
-            self.app, "_ensure_playback_writer", return_value=False
+            self.app._voice_audio, "ensure_writer", return_value=False
         ) as ensure_writer:
             sessions[0].callbacks["on_disconnected"]()
             sessions[0].callbacks["on_error"](RuntimeError("stale"))
             sessions[0].callbacks["on_control_event"](MicButtonPressed())
             sessions[0].callbacks["on_pcm_frame"]([1, 2, 3])
+            sessions[0].callbacks["on_battery_level"](91)
 
         self.assertEqual(reconnects, [])
         pressed.assert_not_called()
         ensure_writer.assert_not_called()
+        self.assertIsNone(self.app._runtime_battery_level)
 
+        sessions[1].callbacks["on_battery_level"](47)
+        self.assertEqual(self.app._runtime_battery_level, 47)
         sessions[1].callbacks["on_disconnected"]()
         self.assertEqual(reconnects, [True])
+        self.assertIsNone(self.app._runtime_battery_level)
 
 
 class DiagnosticVoiceWiringTests(_AppWiringTestCase):
@@ -1191,28 +1373,46 @@ class DiagnosticVoiceWiringTests(_AppWiringTestCase):
                 {"provider": provider}
             )
         )
-        self.app._voice_hotkey = app_module.hotkey.HotkeySpec.parse("+".join(tokens))
+        self.app._voice_shortcut.hotkey = app_module.hotkey.HotkeySpec.parse("+".join(tokens))
         control = mock.Mock(
             current_generation=1, cleanup_pending=False, completion_pending=False
         )
         control.start.return_value = True
+        control.prepare.return_value = object()
+        control.dispatch_prepared.return_value = True
         control.stop.return_value = True
         if provider == "wetype":
-            self.app._wetype_voice_control = control
+            self.app._voice_shortcut.wetype_control = control
         else:
-            self.app._doubao_voice_control = control
+            self.app._voice_shortcut.doubao_control = control
         return control
 
     def _assert_provider_roundtrip(self, provider, tokens):
         control = self._configure_provider(provider, tokens)
         self.app._on_control_event(AudioStarted(session_id=87))
-        self.assertTrue(self.app._voice.active)
+        attempt = None
+        if provider == "doubao_ime":
+            attempt = self._wait_for_doubao_attempt()
+        self.assertTrue(self.app._voice_shortcut.controller.active)
         self.app._on_control_event(AudioStopped())
 
-        control.start.assert_called_once_with(tokens)
+        if provider == "doubao_ime":
+            self.assertTrue(attempt.settled.wait(1.0))
+            control.prepare.assert_called_once_with(
+                tokens,
+                cancelled=mock.ANY,
+                cancel_event=mock.ANY,
+            )
+            control.dispatch_prepared.assert_called_once_with(
+                control.prepare.return_value,
+                cancelled=mock.ANY,
+            )
+            control.start.assert_not_called()
+        else:
+            control.start.assert_called_once_with(tokens)
         control.stop.assert_called_once_with()
-        self.assertFalse(self.app._voice.active)
-        self.assertIsNone(self.app._voice_hotkey_release_pending)
+        self.assertFalse(self.app._voice_shortcut.controller.active)
+        self.assertIsNone(self.app._voice_shortcut.pending_tokens)
         self.app._supervisor.request_reconnect.assert_not_called()
         records = self._read_trace()
         started = next(r for r in records if r["event"] == "attempt_started")
@@ -1239,10 +1439,33 @@ class DiagnosticVoiceWiringTests(_AppWiringTestCase):
             with self.subTest(provider=provider):
                 control = self._configure_provider(provider, DEFAULT_VOICE_TOKENS)
                 control.start.return_value = False
-                self.assertFalse(self.app._handle_mic_button_pressed())
-                control.start.assert_called_once_with(DEFAULT_VOICE_TOKENS)
+                control.dispatch_prepared.return_value = False
+                if provider == "doubao_ime":
+                    with self.app._voice_shortcut.lock:
+                        self.assertTrue(
+                            self.app._begin_voice_mic_gesture(
+                                "test", physical_down=True
+                            )
+                        )
+                accepted = self.app._handle_mic_button_pressed()
+                if provider == "doubao_ime":
+                    self.assertTrue(accepted)
+                    self._wait_for_doubao_attempt()
+                    control.prepare.assert_called_once_with(
+                        DEFAULT_VOICE_TOKENS,
+                        cancelled=mock.ANY,
+                        cancel_event=mock.ANY,
+                    )
+                    control.dispatch_prepared.assert_called_once_with(
+                        control.prepare.return_value,
+                        cancelled=mock.ANY,
+                    )
+                    control.start.assert_not_called()
+                else:
+                    self.assertFalse(accepted)
+                    control.start.assert_called_once_with(DEFAULT_VOICE_TOKENS)
                 control.stop.assert_not_called()
-                self.assertFalse(self.app._voice.active)
+                self.assertFalse(self.app._voice_shortcut.controller.active)
                 self.assertIsNone(self.app._voice_attempt_id)
         self.assertEqual(self.app._ble_session.mic_open_calls, 0)
         records = self._read_trace()
@@ -1259,7 +1482,7 @@ class DiagnosticVoiceWiringTests(_AppWiringTestCase):
             self.app._on_control_event(AudioStopped())
         down.assert_called_once_with(DEFAULT_VOICE_TOKENS)
         up.assert_called_once_with(DEFAULT_VOICE_TOKENS)
-        self.assertFalse(self.app._voice.active)
+        self.assertFalse(self.app._voice_shortcut.controller.active)
         self.app._supervisor.request_reconnect.assert_not_called()
 
     def test_control_events_keep_trace_session_and_atvv_session_separate(self):
@@ -1281,6 +1504,659 @@ class DiagnosticVoiceWiringTests(_AppWiringTestCase):
             self.assertEqual({r["reason"] for r in events}, {0})
 
 
+class DoubaoAsyncStartupTests(_AppWiringTestCase):
+    def test_production_capture_watch_checks_promptly_and_keeps_verified_pid(self):
+        from ovb_rc003.voice_playback_session_windows import CaptureSession
+        reader_path = "ovb_rc003.chromecast_host_activity.read_doubao_capture_for_pid"
+        with mock.patch(reader_path, side_effect=[(), (), (CaptureSession("endpoint", "capture", 123, 1),)]) as reader:
+            watch = self.production_doubao_capture_watch_factory(123)
+            watch.begin()
+            watch.poll(1)
+            self.assertIsNone(watch.identity)
+            watch.poll(1.06)
+            self.assertEqual(watch.status, "tracking")
+            self.assertEqual(reader.call_args_list, [mock.call(123)] * 3)
+
+    def _cold_process(self):
+        physicalizer = self.app._voice_shortcut.doubao_physicalizer
+        physicalizer.status = "unavailable"
+        physicalizer.error = "ImeService.exe is not running"
+        return physicalizer
+
+    def test_cold_process_appearing_later_dispatches_once_in_same_attempt(self):
+        physicalizer = self._cold_process()
+        physicalizer.start.side_effect = [False, False, True]
+
+        attempt, control = self._start_ready_attempt()
+
+        self.assertEqual(physicalizer.start.call_count, 3)
+        control.prepare.assert_called_once()
+        control.dispatch_prepared.assert_called_once()
+        self.assertEqual(attempt.outcome, "active")
+
+    def test_release_during_process_wait_never_dispatches_late(self):
+        self._configure_doubao()
+        first_check = threading.Event()
+        physicalizer = self._cold_process()
+        physicalizer.start.side_effect = lambda *_: first_check.set() or False
+        control = mock.Mock(current_generation=1, cleanup_pending=False)
+        control.prepare.return_value = object()
+        self.app._voice_shortcut.doubao_control = control
+        self._begin_gesture()
+        self.assertTrue(first_check.wait(1.0))
+
+        with self.app._voice_shortcut.lock:
+            self.app._voice_mic_gesture_hid_released = True
+            self.app._release_hold_voice_on_physical_release_locked(
+                "test release while process is starting"
+            )
+        attempt = self._wait_for_doubao_attempt()
+
+        self.assertEqual(attempt.outcome, "cancelled_before_dispatch")
+        control.dispatch_prepared.assert_not_called()
+        self.assertFalse(self.app._voice_pcm_forwarding_enabled)
+        self.assertEqual(self.app._ble_session.mic_open_calls, 0)
+
+    def test_missing_process_stops_at_deadline_without_dispatch(self):
+        self._configure_doubao()
+        physicalizer = self._cold_process()
+        physicalizer.start.return_value = False
+        control = mock.Mock(current_generation=1, cleanup_pending=False)
+        control.prepare.return_value = object()
+        self.app._voice_shortcut.doubao_control = control
+        with mock.patch.object(app_module, "_DOUBAO_PROCESS_READY_TIMEOUT_SECONDS", .08):
+            self._begin_gesture()
+            attempt = self._wait_for_doubao_attempt()
+
+        self.assertEqual(attempt.outcome, "physicalizer_failed")
+        self.assertGreaterEqual(physicalizer.start.call_count, 1)
+        control.dispatch_prepared.assert_not_called()
+        self.assertFalse(self.app._voice_pcm_forwarding_enabled)
+
+    def test_non_process_failures_are_not_retried(self):
+        physicalizer = self.app._voice_shortcut.doubao_physicalizer
+        physicalizer.start.return_value = False
+        for status, error in (("unsupported_version", "unsupported"),
+                              ("unavailable", "Python frida package is not installed"),
+                              ("cleanup_required", "retained resources")):
+            with self.subTest(status=status, error=error):
+                physicalizer.start.reset_mock()
+                physicalizer.status, physicalizer.error = status, error
+                self.assertFalse(self.app._prepare_doubao_voice_physicalizer(
+                    ("ralt",), cancel_event=threading.Event()
+                ))
+                physicalizer.start.assert_called_once()
+
+    def test_synchronous_caller_does_not_wait_for_missing_process(self):
+        physicalizer = self._cold_process()
+        physicalizer.start.return_value = False
+        self.assertFalse(self.app._prepare_doubao_voice_physicalizer(("ralt",)))
+        physicalizer.start.assert_called_once()
+
+    def _configure_doubao(self):
+        self.app._config["voice_program"] = (
+            voice_program_manager.normalize_voice_program_settings(
+                {"provider": voice_program_manager.VOICE_PROGRAM_DOUBAO_IME}
+            )
+        )
+        self.app._voice_shortcut.hotkey = app_module.hotkey.HotkeySpec.parse("ralt")
+
+    def _begin_gesture(self):
+        with self.app._voice_shortcut.lock:
+            self.assertTrue(
+                self.app._begin_voice_mic_gesture("hid_tap", physical_down=True)
+            )
+            self.assertTrue(
+                self.app._handle_mic_button_pressed(send_device_open=False)
+            )
+
+    def _start_ready_attempt(self, control=None):
+        self._configure_doubao()
+        control = control or mock.Mock(current_generation=1, cleanup_pending=False)
+        control.prepare.return_value = object()
+        control.dispatch_prepared.return_value = True
+        control.stop.return_value = True
+        self.app._voice_shortcut.doubao_control = control
+        self._begin_gesture()
+        attempt = self._wait_for_doubao_attempt()
+        self.assertEqual(attempt.outcome, "active")
+        return attempt, control
+
+    def test_release_during_prepare_cancels_without_dispatch_or_mic_open(self):
+        self._configure_doubao()
+        prepare_started = threading.Event()
+        release_prepare = threading.Event()
+        control = mock.Mock(current_generation=1, cleanup_pending=False)
+
+        def prepare(_tokens, *, cancelled, cancel_event=None):
+            prepare_started.set()
+            release_prepare.wait(1.0)
+            return None if cancelled() else object()
+
+        control.prepare.side_effect = prepare
+        control.stop.return_value = True
+        self.app._voice_shortcut.doubao_control = control
+
+        self._begin_gesture()
+        self.assertTrue(prepare_started.wait(1.0))
+        with self.app._voice_shortcut.lock:
+            self.app._voice_mic_gesture_hid_released = True
+            self.assertTrue(
+                self.app._release_hold_voice_on_physical_release_locked(
+                    "test release during prepare"
+                )
+            )
+        release_prepare.set()
+        attempt = self._wait_for_doubao_attempt()
+
+        self.assertEqual(attempt.outcome, "cancelled_before_dispatch")
+        control.dispatch_prepared.assert_not_called()
+        self.assertEqual(self.app._ble_session.mic_open_calls, 0)
+        self.assertFalse(self.app._voice_shortcut.controller.active)
+        self.assertFalse(self.app._voice_pcm_forwarding_enabled)
+
+    def test_only_pcm_arriving_after_host_ready_is_forwarded(self):
+        self._configure_doubao()
+        host_ready = threading.Event()
+        dispatched = threading.Event()
+        prepared = object()
+        control = mock.Mock(current_generation=9, cleanup_pending=False)
+        control.prepare.return_value = prepared
+        control.dispatch_prepared.side_effect = lambda *_args, **_kwargs: (
+            dispatched.set() or True
+        )
+        control.stop.return_value = True
+        self.app._voice_shortcut.doubao_control = control
+
+        class ControlledCapture:
+            identity = None
+            status = "waiting"
+
+            def begin(inner_self):
+                return None
+
+            def poll(inner_self, _now):
+                if host_ready.is_set():
+                    inner_self.identity = "attempt-capture"
+                    inner_self.status = "tracking"
+                return False
+
+        self.app._doubao_capture_watch_factory = ControlledCapture
+        self._begin_gesture()
+        self.assertTrue(dispatched.wait(1.0))
+
+        self.app._ble_session.audio_arrival_watermark = 7
+        self.app._on_pcm_frame([5], _arrival_sequence=5)
+        host_ready.set()
+        attempt = self._wait_for_doubao_attempt()
+        self.assertEqual(attempt.outcome, "active")
+        self.assertTrue(self.app._voice_shortcut.controller.active)
+
+        self.app._on_pcm_frame([6], _arrival_sequence=6)
+        self.app._on_pcm_frame([8], _arrival_sequence=8)
+        self.assertTrue(self._flush_playback().completed)
+        self.assertEqual(self.app._voice_audio.sink.write_calls, [(8,)])
+
+        with self.app._voice_shortcut.lock:
+            self.app._voice_mic_gesture_hid_released = True
+            self.assertTrue(
+                self.app._release_hold_voice_on_physical_release_locked(
+                    "test release after ready"
+                )
+            )
+
+    def test_release_while_waiting_for_host_stops_without_publishing_audio(self):
+        self._configure_doubao()
+        dispatched = threading.Event()
+        control = mock.Mock(current_generation=4, cleanup_pending=True)
+        control.prepare.return_value = object()
+        control.dispatch_prepared.side_effect = lambda *_args, **_kwargs: (
+            dispatched.set() or True
+        )
+        control.stop.return_value = True
+        self.app._voice_shortcut.doubao_control = control
+
+        class WaitingCapture:
+            identity = None
+            status = "waiting"
+
+            def begin(inner_self):
+                return None
+
+            def poll(inner_self, _now):
+                return False
+
+        self.app._doubao_capture_watch_factory = WaitingCapture
+        self._begin_gesture()
+        self.assertTrue(dispatched.wait(1.0))
+
+        with self.app._voice_shortcut.lock:
+            self.app._voice_mic_gesture_hid_released = True
+            self.assertTrue(
+                self.app._release_hold_voice_on_physical_release_locked(
+                    "test release waiting for host"
+                )
+            )
+        attempt = self._wait_for_doubao_attempt()
+
+        self.assertEqual(attempt.outcome, "cancelled_waiting_host")
+        control.stop.assert_called_once_with()
+
+    def test_audio_stop_first_reaches_terminal_runtime_and_diagnostic_state(self):
+        attempt, control = self._start_ready_attempt()
+        self.app._voice_audio_stream_active = True
+
+        self.app._on_control_event(AudioStopped())
+
+        self.assertTrue(attempt.settled.wait(1.0))
+        with self.app._runtime_status_lock:
+            state = self.app._runtime_voice_state
+        self.assertEqual(state, bridge_runtime_status.VOICE_RUNTIME_AUDIO_EMPTY)
+        self.assertIsNone(self.app._voice_attempt_id)
+        control.stop.assert_called_once_with()
+
+    def test_physical_release_first_reaches_terminal_runtime_state(self):
+        attempt, control = self._start_ready_attempt()
+
+        with self.app._voice_shortcut.lock:
+            self.app._voice_mic_gesture_hid_released = True
+            self.assertTrue(
+                self.app._release_hold_voice_on_physical_release_locked(
+                    "test physical release first"
+                )
+            )
+
+        self.assertTrue(attempt.settled.wait(1.0))
+        with self.app._runtime_status_lock:
+            state = self.app._runtime_voice_state
+        self.assertEqual(state, bridge_runtime_status.VOICE_RUNTIME_AUDIO_EMPTY)
+        self.assertIsNone(self.app._voice_attempt_id)
+        control.stop.assert_called_once_with()
+        self.assertEqual(self.app._ble_session.mic_open_calls, 0)
+        self.assertFalse(self.app._voice_shortcut.controller.active)
+        self.assertFalse(self.app._voice_pcm_forwarding_enabled)
+
+    def test_target_detach_after_ready_discards_pcm_and_releases_once(self):
+        attempt, control = self._start_ready_attempt()
+        self.app._voice_shortcut.doubao_physicalizer.is_active_generation.return_value = False
+
+        self.app._on_pcm_frame([9], _arrival_sequence=1)
+
+        self.assertTrue(attempt.settled.wait(1.0))
+        self.assertEqual(self.app._voice_audio.sink.write_calls, [])
+        self.assertFalse(self.app._voice_shortcut.controller.active)
+        control.stop.assert_called_once_with()
+        control.dispatch_prepared.assert_called_once()
+
+    def test_physical_release_returns_while_flush_runs_in_cleanup_worker(self):
+        attempt, control = self._start_ready_attempt()
+        old_writer = self.app._voice_audio.writer
+        self.assertIsNotNone(old_writer)
+        self.assertTrue(old_writer.flush(1.0).completed)
+        self.assertTrue(old_writer.stop(1.0))
+
+        flush_entered = threading.Event()
+        allow_flush = threading.Event()
+
+        class BlockingWriter:
+            def flush(inner_self, *_args):
+                flush_entered.set()
+                allow_flush.wait(1.0)
+                return app_module.audio_playback_worker.PlaybackFlushResult(True)
+
+            def stop(inner_self, *_args):
+                return True
+
+        self.app._voice_audio.writer = BlockingWriter()
+        callback_done = threading.Event()
+
+        def release_callback():
+            with self.app._voice_shortcut.lock:
+                self.app._voice_mic_gesture_hid_released = True
+                self.assertTrue(
+                    self.app._release_hold_voice_on_physical_release_locked(
+                        "test nonblocking release"
+                    )
+                )
+            callback_done.set()
+
+        callback = threading.Thread(target=release_callback)
+        callback.start()
+        self.assertTrue(flush_entered.wait(1.0))
+        self.assertTrue(callback_done.wait(0.2))
+        allow_flush.set()
+        callback.join(1.0)
+
+        self.assertTrue(attempt.settled.wait(1.0))
+        control.stop.assert_called_once_with()
+
+    def test_connection_cleanup_does_not_compete_with_async_doubao_owner(self):
+        attempt, control = self._start_ready_attempt()
+        old_writer = self.app._voice_audio.writer
+        self.assertIsNotNone(old_writer)
+        self.assertTrue(old_writer.flush(1.0).completed)
+        self.assertTrue(old_writer.stop(1.0))
+
+        flush_entered = threading.Event()
+        allow_flush = threading.Event()
+        writer_stop_calls = []
+
+        class BlockingWriter:
+            def flush(inner_self, *_args):
+                flush_entered.set()
+                allow_flush.wait(1.0)
+                return app_module.audio_playback_worker.PlaybackFlushResult(True)
+
+            def stop(inner_self, *_args):
+                writer_stop_calls.append(True)
+                return True
+
+        self.app._voice_audio.writer = BlockingWriter()
+        with self.app._voice_shortcut.lock:
+            self.app._voice_mic_gesture_hid_released = True
+            self.assertTrue(
+                self.app._release_hold_voice_on_physical_release_locked(
+                    "test cleanup owner race"
+                )
+            )
+        self.assertTrue(flush_entered.wait(1.0))
+
+        with mock.patch.object(
+            app_module,
+            "_DOUBAO_ATTEMPT_JOIN_TIMEOUT_SECONDS",
+            0.01,
+        ):
+            with self.assertRaises(app_module.CleanupIncompleteError):
+                _run(self.app._cleanup_once())
+
+        self.assertEqual(control.stop.call_count, 0)
+        self.assertEqual(writer_stop_calls, [])
+        allow_flush.set()
+        self.assertTrue(attempt.settled.wait(1.0))
+        control.stop.assert_called_once_with()
+
+        _run(self.app._cleanup_once())
+        self.assertEqual(control.stop.call_count, 1)
+        self.assertEqual(writer_stop_calls, [True])
+
+    def test_watchdog_and_connection_cleanup_share_one_doubao_release_owner(self):
+        stop_entered = threading.Event()
+        allow_stop = threading.Event()
+        control = mock.Mock(current_generation=11, cleanup_pending=True)
+
+        def stop():
+            stop_entered.set()
+            allow_stop.wait(1.0)
+            return True
+
+        control.stop.side_effect = stop
+        attempt, control = self._start_ready_attempt(control)
+        token = object()
+        self.app._voice_hold_watchdog_token = token
+        self.app._voice_hold_watchdog_timer = mock.Mock()
+
+        callback_done = threading.Event()
+        callback = threading.Thread(
+            target=lambda: (
+                self.app._voice_hold_watchdog_expired(token),
+                callback_done.set(),
+            )
+        )
+        callback.start()
+        self.assertTrue(stop_entered.wait(1.0))
+        self.assertTrue(callback_done.wait(0.2))
+
+        with mock.patch.object(
+            app_module,
+            "_DOUBAO_ATTEMPT_JOIN_TIMEOUT_SECONDS",
+            0.01,
+        ):
+            with self.assertRaises(app_module.CleanupIncompleteError):
+                _run(self.app._cleanup_once())
+
+        self.assertEqual(control.stop.call_count, 1)
+        allow_stop.set()
+        callback.join(1.0)
+        self.assertTrue(attempt.settled.wait(1.0))
+        self.assertEqual(control.stop.call_count, 1)
+
+    def test_flush_exception_still_releases_owned_doubao_hotkey(self):
+        attempt, control = self._start_ready_attempt()
+        old_writer = self.app._voice_audio.writer
+        self.assertIsNotNone(old_writer)
+        self.assertTrue(old_writer.flush(1.0).completed)
+        self.assertTrue(old_writer.stop(1.0))
+
+        class RaisingWriter:
+            def flush(inner_self, *_args):
+                raise RuntimeError("test flush failure")
+
+        self.app._voice_audio.writer = RaisingWriter()
+        with self.app._voice_shortcut.lock:
+            self.app._voice_mic_gesture_hid_released = True
+            self.assertTrue(
+                self.app._release_hold_voice_on_physical_release_locked(
+                    "test independent cleanup"
+                )
+            )
+
+        deadline = time.monotonic() + 1.0
+        while attempt.cleanup_worker_running:
+            if time.monotonic() >= deadline:
+                self.fail("Doubao cleanup worker did not finish")
+            time.sleep(0.01)
+        control.stop.assert_called_once_with()
+        self.assertEqual(attempt.cleanup_debt_snapshot(), frozenset({"playback"}))
+        self.app._voice_audio.writer = None
+        self.assertTrue(attempt.resolve_cleanup_debt("playback"))
+        self.assertTrue(attempt.settled.is_set())
+
+    def test_failed_key_up_retries_without_a_second_key_down(self):
+        first_stop = threading.Event()
+        second_stop = threading.Event()
+        stop_count = 0
+        control = mock.Mock(current_generation=1, cleanup_pending=False)
+
+        def stop():
+            nonlocal stop_count
+            stop_count += 1
+            if stop_count == 1:
+                first_stop.set()
+                return False
+            second_stop.set()
+            return True
+
+        control.stop.side_effect = stop
+        attempt, control = self._start_ready_attempt(control)
+        with self.app._voice_shortcut.lock:
+            self.app._voice_mic_gesture_hid_released = True
+            self.assertTrue(
+                self.app._release_hold_voice_on_physical_release_locked(
+                    "test retry release"
+                )
+            )
+
+        self.assertTrue(first_stop.wait(1.0))
+        deadline = time.monotonic() + 1.0
+        while not self._voice_hotkey_release_timers:
+            if time.monotonic() >= deadline:
+                self.fail("key-up retry was not scheduled")
+            time.sleep(0.01)
+        self.assertFalse(attempt.settled.is_set())
+        deadline = time.monotonic() + 1.0
+        while True:
+            with self.app._runtime_status_lock:
+                state = self.app._runtime_voice_state
+            if state == bridge_runtime_status.VOICE_RUNTIME_HOST_STOP_FAILED:
+                break
+            if time.monotonic() >= deadline:
+                self.fail(f"cleanup failure state was not published: {state}")
+            time.sleep(0.01)
+        self._voice_hotkey_release_timers[-1].fire()
+
+        self.assertTrue(second_stop.wait(1.0))
+        self.assertTrue(attempt.settled.wait(1.0))
+        with self.app._runtime_status_lock:
+            state = self.app._runtime_voice_state
+        self.assertEqual(state, bridge_runtime_status.VOICE_RUNTIME_AUDIO_EMPTY)
+        self.assertIsNone(self.app._voice_attempt_id)
+        self.assertEqual(control.stop.call_count, 2)
+        control.dispatch_prepared.assert_called_once()
+
+    def test_failed_private_endpoint_close_is_recovered_by_connection_cleanup(self):
+        self._configure_doubao()
+        self.app._voice_audio.sink = None
+
+        class FailingOpenSink:
+            def __init__(inner_self):
+                inner_self.close_calls = 0
+                inner_self.owned_before_open = False
+
+            def open(inner_self):
+                attempt = self.app._doubao_session.current
+                inner_self.owned_before_open = (
+                    attempt is not None
+                    and attempt.resource("endpoint") is inner_self
+                )
+                raise app_module.audio_output.AudioOutputUnavailableError(
+                    "test open failure"
+                )
+
+            def close(inner_self):
+                inner_self.close_calls += 1
+                if inner_self.close_calls == 1:
+                    raise RuntimeError("test close failure")
+
+        sink = FailingOpenSink()
+        self.app._create_private_doubao_playback = mock.Mock(return_value=sink)
+        self._begin_gesture()
+        attempt = self._wait_for_doubao_attempt()
+
+        self.assertTrue(sink.owned_before_open)
+        self.assertEqual(attempt.cleanup_debt_snapshot(), frozenset({"endpoint"}))
+        self.assertIs(self.app._voice_audio.sink, sink)
+        with mock.patch.object(
+            app_module,
+            "_DOUBAO_ATTEMPT_JOIN_TIMEOUT_SECONDS",
+            0.01,
+        ):
+            _run(self.app._cleanup_once())
+
+        self.assertTrue(attempt.settled.is_set())
+        self.assertEqual(sink.close_calls, 2)
+        self.assertIsNone(self.app._voice_audio.sink)
+
+    def test_writer_start_failure_retains_endpoint_until_close_recovers(self):
+        self._configure_doubao()
+        self.app._voice_audio.sink = None
+        control = mock.Mock(current_generation=4, cleanup_pending=False)
+        control.prepare.return_value = object()
+        control.dispatch_prepared.return_value = True
+        control.stop.return_value = True
+        self.app._voice_shortcut.doubao_control = control
+
+        class WriterFailureSink:
+            def __init__(inner_self):
+                inner_self.close_calls = 0
+                inner_self.ready = True
+
+            def open(inner_self):
+                return None
+
+            def close(inner_self):
+                inner_self.close_calls += 1
+                if inner_self.close_calls == 1:
+                    raise RuntimeError("test close failure")
+
+        sink = WriterFailureSink()
+        self.app._create_private_doubao_playback = mock.Mock(return_value=sink)
+        self.app._voice_audio.ensure_writer = mock.Mock(return_value=False)
+        self._begin_gesture()
+        attempt = self._wait_for_doubao_attempt()
+
+        self.assertEqual(attempt.outcome, "playback_writer_failed")
+        self.assertIs(attempt.resource("endpoint"), sink)
+        self.assertTrue(attempt.has_cleanup_debt("endpoint"))
+        self.assertIs(self.app._voice_audio.sink, sink)
+
+        _run(self.app._cleanup_once())
+
+        self.assertTrue(attempt.settled.is_set())
+        self.assertEqual(sink.close_calls, 2)
+        self.assertIsNone(self.app._voice_audio.sink)
+
+    def test_retry_can_resolve_hotkey_before_delayed_endpoint_finalization(self):
+        self._configure_doubao()
+        self.app._voice_audio.sink = None
+        dispatched = threading.Event()
+        close_entered = threading.Event()
+        allow_close = threading.Event()
+        stop_count = 0
+        control = mock.Mock(current_generation=3, cleanup_pending=True)
+        control.prepare.return_value = object()
+        control.dispatch_prepared.side_effect = lambda *_args, **_kwargs: (
+            dispatched.set() or True
+        )
+
+        def stop():
+            nonlocal stop_count
+            stop_count += 1
+            return stop_count > 1
+
+        control.stop.side_effect = stop
+        self.app._voice_shortcut.doubao_control = control
+
+        class DelayedCloseSink:
+            ready = True
+
+            def open(inner_self):
+                return None
+
+            def close(inner_self):
+                close_entered.set()
+                allow_close.wait(1.0)
+
+        sink = DelayedCloseSink()
+        self.app._create_private_doubao_playback = mock.Mock(return_value=sink)
+
+        class WaitingCapture:
+            identity = None
+            status = "waiting"
+
+            def begin(inner_self):
+                return None
+
+            def poll(inner_self, _now):
+                return False
+
+        self.app._doubao_capture_watch_factory = WaitingCapture
+        self._begin_gesture()
+        self.assertTrue(dispatched.wait(1.0))
+        with self.app._voice_shortcut.lock:
+            self.app._voice_mic_gesture_hid_released = True
+            self.assertTrue(
+                self.app._release_hold_voice_on_physical_release_locked(
+                    "test cancel before host ready"
+                )
+            )
+
+        self.assertTrue(close_entered.wait(1.0))
+        deadline = time.monotonic() + 1.0
+        while not self._voice_hotkey_release_timers:
+            if time.monotonic() >= deadline:
+                self.fail("key-up retry was not scheduled")
+            time.sleep(0.01)
+        attempt = self.app._doubao_session.current
+        self.assertTrue(attempt.has_cleanup_debt("hotkey"))
+        self._voice_hotkey_release_timers[-1].fire()
+        self.assertEqual(stop_count, 2)
+        self.assertFalse(attempt.has_cleanup_debt("hotkey"))
+        self.assertFalse(attempt.worker_done.is_set())
+
+        allow_close.set()
+        self.assertTrue(attempt.settled.wait(1.0))
+        self.assertTrue(attempt.cleanup_complete)
+        control.dispatch_prepared.assert_called_once()
 class HostHotkeyFailureSuppressesMicOpenTests(_AppWiringTestCase):
     def test_failed_voice_start_has_one_complete_diagnostic_attempt(self):
         trace = mock.Mock()
@@ -1351,7 +2227,7 @@ class HostHotkeyFailureSuppressesMicOpenTests(_AppWiringTestCase):
         self.app._handle_mic_button_pressed()
 
         self.assertEqual(self.app._ble_session.mic_open_calls, 0)
-        self.assertFalse(self.app._voice.active)
+        self.assertFalse(self.app._voice_shortcut.controller.active)
 
     def test_hotkey_partial_delivery_suppresses_mic_open(self):
         with mock.patch.object(
@@ -1362,7 +2238,7 @@ class HostHotkeyFailureSuppressesMicOpenTests(_AppWiringTestCase):
             self.app._handle_mic_button_pressed()
 
         self.assertEqual(self.app._ble_session.mic_open_calls, 0)
-        self.assertFalse(self.app._voice.active)
+        self.assertFalse(self.app._voice_shortcut.controller.active)
 
     def test_incomplete_hotkey_rollback_is_retained_for_a_later_safety_release(self):
         with mock.patch.object(
@@ -1375,25 +2251,25 @@ class HostHotkeyFailureSuppressesMicOpenTests(_AppWiringTestCase):
             self.app._handle_mic_button_pressed()
 
         self.assertEqual(self.app._ble_session.mic_open_calls, 0)
-        self.assertFalse(self.app._voice.active)
-        self.assertEqual(self.app._voice_hotkey_release_pending, DEFAULT_VOICE_TOKENS)
+        self.assertFalse(self.app._voice_shortcut.controller.active)
+        self.assertEqual(self.app._voice_shortcut.pending_tokens, DEFAULT_VOICE_TOKENS)
 
     def test_voice_hotkey_release_debt_keeps_only_one_retry_timer(self):
-        self.app._voice_hotkey_release_pending = DEFAULT_VOICE_TOKENS
+        self.app._voice_shortcut.pending_tokens = DEFAULT_VOICE_TOKENS
 
-        with self.app._voice_trigger_lock:
-            self.app._schedule_voice_hotkey_release_retry_locked()
-            self.app._schedule_voice_hotkey_release_retry_locked()
+        with self.app._voice_shortcut.lock:
+            self.app._voice_shortcut.schedule_release_retry()
+            self.app._voice_shortcut.schedule_release_retry()
 
         self.assertEqual(len(self._voice_hotkey_release_timers), 1)
         self.assertIs(
-            self.app._voice_hotkey_release_retry_timer,
+            self.app._voice_shortcut.retry_timer,
             self._voice_hotkey_release_timers[0],
         )
 
     def test_voice_hotkey_release_retry_uses_bounded_backoff(self):
-        self.app._voice_hotkey_release_pending = DEFAULT_VOICE_TOKENS
-        self.app._voice_hotkey_release_pending_backend = (
+        self.app._voice_shortcut.pending_tokens = DEFAULT_VOICE_TOKENS
+        self.app._voice_shortcut.pending_backend = (
             app_module._VOICE_HOTKEY_BACKEND_MARKED
         )
 
@@ -1402,8 +2278,8 @@ class HostHotkeyFailureSuppressesMicOpenTests(_AppWiringTestCase):
             "send_voice_key_combo_up",
             side_effect=OSError("simulated key-up failure"),
         ) as send_up:
-            with self.app._voice_trigger_lock:
-                self.app._schedule_voice_hotkey_release_retry_locked()
+            with self.app._voice_shortcut.lock:
+                self.app._voice_shortcut.schedule_release_retry()
             self._voice_hotkey_release_timers[0].fire()
             self._voice_hotkey_release_timers[1].fire()
 
@@ -1413,32 +2289,32 @@ class HostHotkeyFailureSuppressesMicOpenTests(_AppWiringTestCase):
             [initial, initial * 2.0, initial * 4.0],
         )
         self.assertEqual(send_up.call_count, 2)
-        self.assertEqual(self.app._voice_hotkey_release_pending, DEFAULT_VOICE_TOKENS)
+        self.assertEqual(self.app._voice_shortcut.pending_tokens, DEFAULT_VOICE_TOKENS)
 
     def test_successful_voice_hotkey_release_retry_clears_all_debt(self):
-        self.app._voice_hotkey_release_pending = DEFAULT_VOICE_TOKENS
-        self.app._voice_hotkey_release_pending_backend = (
+        self.app._voice_shortcut.pending_tokens = DEFAULT_VOICE_TOKENS
+        self.app._voice_shortcut.pending_backend = (
             app_module._VOICE_HOTKEY_BACKEND_MARKED
         )
-        with self.app._voice_trigger_lock:
-            self.app._schedule_voice_hotkey_release_retry_locked()
+        with self.app._voice_shortcut.lock:
+            self.app._voice_shortcut.schedule_release_retry()
 
         with mock.patch.object(win32_input, "send_voice_key_combo_up") as send_up:
             self._voice_hotkey_release_timers[0].fire()
 
         send_up.assert_called_once_with(DEFAULT_VOICE_TOKENS)
-        self.assertIsNone(self.app._voice_hotkey_release_pending)
-        self.assertIsNone(self.app._voice_hotkey_release_pending_backend)
-        self.assertIsNone(self.app._voice_hotkey_release_retry_timer)
+        self.assertIsNone(self.app._voice_shortcut.pending_tokens)
+        self.assertIsNone(self.app._voice_shortcut.pending_backend)
+        self.assertIsNone(self.app._voice_shortcut.retry_timer)
         self.assertEqual(
-            self.app._voice_hotkey_release_retry_delay,
+            self.app._voice_shortcut.retry_delay,
             app_module._VOICE_HOTKEY_RELEASE_RETRY_INITIAL_SECONDS,
         )
 
     def test_new_voice_session_releases_previous_hotkey_debt_first(self):
         previous_tokens = ("lctrl",)
-        self.app._voice_hotkey_release_pending = previous_tokens
-        self.app._voice_hotkey_release_pending_backend = (
+        self.app._voice_shortcut.pending_tokens = previous_tokens
+        self.app._voice_shortcut.pending_backend = (
             app_module._VOICE_HOTKEY_BACKEND_MARKED
         )
         calls = []
@@ -1461,8 +2337,8 @@ class HostHotkeyFailureSuppressesMicOpenTests(_AppWiringTestCase):
         self.assertEqual(self.app._ble_session.mic_open_calls, 1)
 
     def test_safety_release_uses_the_original_shortcut_after_settings_change(self):
-        self.app._voice_hotkey_release_pending = ("ralt",)
-        self.app._voice_hotkey = app_module.hotkey.HotkeySpec.parse("lctrl+l")
+        self.app._voice_shortcut.pending_tokens = ("ralt",)
+        self.app._voice_shortcut.hotkey = app_module.hotkey.HotkeySpec.parse("lctrl+l")
         calls = []
 
         with mock.patch.object(
@@ -1470,25 +2346,25 @@ class HostHotkeyFailureSuppressesMicOpenTests(_AppWiringTestCase):
             "send_voice_key_combo_up",
             side_effect=lambda tokens: calls.append(tokens),
         ):
-            self.assertTrue(self.app._release_pending_voice_hotkey())
+            self.assertTrue(self.app._voice_shortcut.release_pending())
 
         self.assertEqual(calls, [("ralt",)])
 
     def test_playback_mute_guard_is_wetype_only_and_uses_open_sink_identity(self):
         self.assertEqual(
-            self.app._wetype_voice_control._prepare_playback_mute_guard,
+            self.app._voice_shortcut.wetype_control._prepare_playback_mute_guard,
             self.app._prepare_wetype_playback_mute_guard,
         )
-        self.assertIsNone(self.app._doubao_voice_control._prepare_playback_mute_guard)
+        self.assertIsNone(self.app._voice_shortcut.doubao_control._prepare_playback_mute_guard)
         with mock.patch.object(
             app_module.voice_playback_session_windows, "prepare_playback_mute_guard"
         ) as prepare:
-            self.app._playback = None
+            self.app._voice_audio.sink = None
             self.assertIsNone(self.app._prepare_wetype_playback_mute_guard())
-            self.app._playback = mock.Mock(ready=False, endpoint_name="not-open")
+            self.app._voice_audio.sink = mock.Mock(ready=False, endpoint_name="not-open")
             self.assertIsNone(self.app._prepare_wetype_playback_mute_guard())
             prepare.assert_not_called()
-            self.app._playback = mock.Mock(ready=True, endpoint_name="opened-endpoint")
+            self.app._voice_audio.sink = mock.Mock(ready=True, endpoint_name="opened-endpoint")
             self.app._config["output_endpoint_name"] = "different-config"
             self.assertIs(self.app._prepare_wetype_playback_mute_guard(), prepare.return_value)
             prepare.assert_called_once_with("opened-endpoint")
@@ -1499,25 +2375,25 @@ class HostHotkeyFailureSuppressesMicOpenTests(_AppWiringTestCase):
                 {"provider": voice_program_manager.VOICE_PROGRAM_WETYPE}
             )
         )
-        self.app._voice_hotkey = app_module.hotkey.HotkeySpec.parse(
+        self.app._voice_shortcut.hotkey = app_module.hotkey.HotkeySpec.parse(
             "+".join(WETYPE_VOICE_TOKENS)
         )
         wetype_control = mock.Mock()
         wetype_control.start.return_value = True
         wetype_control.stop.return_value = True
-        self.app._wetype_voice_control = wetype_control
+        self.app._voice_shortcut.wetype_control = wetype_control
         with mock.patch.object(
             win32_input, "send_voice_key_combo_down"
         ) as marked_down, mock.patch.object(
             win32_input, "send_voice_key_combo_up"
         ) as marked_up:
             self.assertTrue(
-                self.app._apply_voice_action(
+                self.app._voice_shortcut.apply(
                     app_module.voice_controller.VoiceHostAction.KEY_DOWN
                 )
             )
             self.assertTrue(
-                self.app._apply_voice_action(
+                self.app._voice_shortcut.apply(
                     app_module.voice_controller.VoiceHostAction.KEY_UP
                 )
             )
@@ -1526,7 +2402,28 @@ class HostHotkeyFailureSuppressesMicOpenTests(_AppWiringTestCase):
         wetype_control.stop.assert_called_once_with()
         marked_down.assert_not_called()
         marked_up.assert_not_called()
-        self.assertIsNone(self.app._voice_hotkey_release_pending)
+        self.assertIsNone(self.app._voice_shortcut.pending_tokens)
+
+    def test_wetype_confirmation_before_start_returns_is_not_lost(self):
+        from tests.test_wetype_control_windows import _ImmediateThread
+        self.app._config["voice_program"] = voice_program_manager.normalize_voice_program_settings(
+            {"provider": voice_program_manager.VOICE_PROGRAM_WETYPE})
+        control = self.app._voice_shortcut.wetype_control
+        with (
+            mock.patch.object(control, "_activate_profile", return_value=True),
+            mock.patch.object(control, "_run_sta", side_effect=lambda callback: callback()),
+            mock.patch.object(control, "_press_keys"),
+            mock.patch.object(control, "_release_keys"),
+            mock.patch.object(control, "_prepare_playback_mute_guard", None),
+            mock.patch.object(control, "_mic_start_reader", side_effect=[10, 20]),
+            mock.patch.object(control, "_sleep"),
+            mock.patch.object(control, "_thread_factory", _ImmediateThread),
+        ):
+            self.assertTrue(self.app._voice_shortcut.apply(app_module.voice_controller.VoiceHostAction.KEY_DOWN))
+            self.assertTrue(self.app._voice_shortcut.runtime_mic_confirmed)
+            self.assertEqual(self.app._voice_shortcut.runtime_generation, control.current_generation)
+            self.assertTrue(self.app._voice_shortcut.apply(app_module.voice_controller.VoiceHostAction.KEY_UP))
+            self.assertFalse(control.cleanup_pending)
 
     def test_doubao_provider_activates_its_profile_control_for_start_and_stop(self):
         self.app._config["voice_program"] = (
@@ -1537,32 +2434,32 @@ class HostHotkeyFailureSuppressesMicOpenTests(_AppWiringTestCase):
         doubao_control = mock.Mock()
         doubao_control.start.return_value = True
         doubao_control.stop.return_value = True
-        self.app._doubao_voice_control = doubao_control
+        self.app._voice_shortcut.doubao_control = doubao_control
         with mock.patch.object(
             win32_input, "send_voice_key_combo_down"
         ) as direct_down, mock.patch.object(
             win32_input, "send_voice_key_combo_up"
         ) as direct_up, mock.patch.object(
-            self.app._wetype_voice_control, "start"
+            self.app._voice_shortcut.wetype_control, "start"
         ) as wetype_start:
             self.assertTrue(
-                self.app._apply_voice_action(
+                self.app._voice_shortcut.apply(
                     app_module.voice_controller.VoiceHostAction.KEY_DOWN
                 )
             )
             self.assertTrue(
-                self.app._apply_voice_action(
+                self.app._voice_shortcut.apply(
                     app_module.voice_controller.VoiceHostAction.KEY_UP
                 )
             )
 
         doubao_control.start.assert_called_once_with(DEFAULT_VOICE_TOKENS)
         doubao_control.stop.assert_called_once_with()
-        self.app._doubao_physicalizer.start.assert_called_once_with((0xA5,))
+        self.app._voice_shortcut.doubao_physicalizer.start.assert_called_once_with((0xA5,))
         wetype_start.assert_not_called()
         direct_down.assert_not_called()
         direct_up.assert_not_called()
-        self.assertIsNone(self.app._voice_hotkey_release_pending)
+        self.assertIsNone(self.app._voice_shortcut.pending_tokens)
 
     def test_doubao_physicalizer_failure_suppresses_shortcut_and_mic_open(self):
         self.app._config["voice_program"] = (
@@ -1571,19 +2468,21 @@ class HostHotkeyFailureSuppressesMicOpenTests(_AppWiringTestCase):
             )
         )
         doubao_control = mock.Mock()
-        self.app._doubao_voice_control = doubao_control
-        self.app._doubao_physicalizer.start.return_value = False
-        self.app._doubao_physicalizer.status = "unsupported_version"
-        self.app._doubao_physicalizer.error = "unsupported"
+        self.app._voice_shortcut.doubao_control = doubao_control
+        self.app._voice_shortcut.doubao_physicalizer.start.return_value = False
+        self.app._voice_shortcut.doubao_physicalizer.status = "unsupported_version"
+        self.app._voice_shortcut.doubao_physicalizer.error = "unsupported"
 
-        self.assertFalse(self.app._handle_mic_button_pressed())
+        self.assertTrue(self.app._handle_mic_button_pressed())
+        attempt = self._wait_for_doubao_attempt()
+        self.assertEqual(attempt.outcome, "physicalizer_failed")
 
         doubao_control.start.assert_not_called()
         self.assertEqual(self.app._ble_session.mic_open_calls, 0)
-        self.assertFalse(self.app._voice.active)
+        self.assertFalse(self.app._voice_shortcut.controller.active)
         self.assertFalse(self.app._voice_pcm_forwarding_enabled)
-        self.assertIsNone(self.app._voice_hotkey_release_pending)
-        self.assertIsNone(self.app._voice_hotkey_active_backend)
+        self.assertIsNone(self.app._voice_shortcut.pending_tokens)
+        self.assertIsNone(self.app._voice_shortcut.active_backend)
 
     def test_doubao_right_alt_mapping_still_requires_the_physicalizer(self):
         self.app._config["voice_program"] = (
@@ -1602,13 +2501,13 @@ class HostHotkeyFailureSuppressesMicOpenTests(_AppWiringTestCase):
                 {"provider": voice_program_manager.VOICE_PROGRAM_WETYPE}
             )
         )
-        self.app._wetype_voice_control = mock.Mock()
-        self.app._wetype_voice_control.start.return_value = False
+        self.app._voice_shortcut.wetype_control = mock.Mock()
+        self.app._voice_shortcut.wetype_control.start.return_value = False
 
         self.app._handle_mic_button_pressed()
 
         self.assertEqual(self.app._ble_session.mic_open_calls, 0)
-        self.assertFalse(self.app._voice.active)
+        self.assertFalse(self.app._voice_shortcut.controller.active)
         self.assertFalse(self.app._voice_pcm_forwarding_enabled)
         status = bridge_runtime_status.read_status(self.app._config_root)
         self.assertIsNotNone(status)
@@ -1625,24 +2524,24 @@ class HostHotkeyFailureSuppressesMicOpenTests(_AppWiringTestCase):
                 {"provider": voice_program_manager.VOICE_PROGRAM_WETYPE}
             )
         )
-        self.app._voice_hotkey = app_module.hotkey.HotkeySpec.parse(
+        self.app._voice_shortcut.hotkey = app_module.hotkey.HotkeySpec.parse(
             "+".join(WETYPE_VOICE_TOKENS)
         )
         wetype_control = mock.Mock()
         wetype_control.start.return_value = False
         wetype_control.current_generation = 4
         wetype_control.cleanup_pending = True
-        self.app._wetype_voice_control = wetype_control
+        self.app._voice_shortcut.wetype_control = wetype_control
 
         self.app._handle_mic_button_pressed()
 
         self.assertEqual(self.app._ble_session.mic_open_calls, 0)
         self.assertEqual(
-            self.app._voice_hotkey_release_pending,
+            self.app._voice_shortcut.pending_tokens,
             WETYPE_VOICE_TOKENS,
         )
         self.assertEqual(
-            self.app._voice_hotkey_release_pending_backend,
+            self.app._voice_shortcut.pending_backend,
             app_module._VOICE_HOTKEY_BACKEND_WETYPE,
         )
 
@@ -1658,7 +2557,7 @@ class HostHotkeyFailureSuppressesMicOpenTests(_AppWiringTestCase):
         wetype_control.current_generation = 7
         wetype_control.cleanup_pending = False
         wetype_control.completion_pending = False
-        self.app._wetype_voice_control = wetype_control
+        self.app._voice_shortcut.wetype_control = wetype_control
 
         self.app._handle_mic_button_pressed()
         active = bridge_runtime_status.read_status(self.app._config_root)
@@ -1668,14 +2567,14 @@ class HostHotkeyFailureSuppressesMicOpenTests(_AppWiringTestCase):
         )
         self.assertTrue(active.voice_active)
 
-        self.app._on_wetype_voice_confirmation_finished(7, True)
+        self.app._voice_shortcut.on_confirmation(7, True)
         confirmed = bridge_runtime_status.read_status(self.app._config_root)
         self.assertEqual(
             confirmed.voice_runtime_state,
             bridge_runtime_status.VOICE_RUNTIME_MIC_CONFIRMED,
         )
 
-        self.app._voice_pcm_stats.add([100, -100])
+        self.app._voice_audio.stats.add([100, -100])
         self.app._voice_audio_stream_active = True
         self.app._on_control_event(AudioStopped())
 
@@ -1699,11 +2598,11 @@ class HostHotkeyFailureSuppressesMicOpenTests(_AppWiringTestCase):
         wetype_control.current_generation = 7
         wetype_control.cleanup_pending = False
         wetype_control.completion_pending = False
-        self.app._wetype_voice_control = wetype_control
+        self.app._voice_shortcut.wetype_control = wetype_control
         self.app._supervisor.request_reconnect = mock.Mock()
 
         self.assertTrue(self.app._handle_mic_button_pressed())
-        self.app._on_wetype_voice_confirmation_finished(7, False)
+        self.app._voice_shortcut.on_confirmation(7, False)
 
         failed = bridge_runtime_status.read_status(self.app._config_root)
         self.assertEqual(
@@ -1728,14 +2627,14 @@ class HostHotkeyFailureSuppressesMicOpenTests(_AppWiringTestCase):
         wetype_control.current_generation = 9
         wetype_control.cleanup_pending = False
         wetype_control.completion_pending = True
-        self.app._wetype_voice_control = wetype_control
+        self.app._voice_shortcut.wetype_control = wetype_control
         self.app._supervisor.request_reconnect = mock.Mock()
 
         self.app._handle_mic_button_pressed()
-        self.app._voice_pcm_stats.add([100, -100])
+        self.app._voice_audio.stats.add([100, -100])
         self.app._voice_audio_stream_active = True
         self.app._on_control_event(AudioStopped())
-        self.app._on_wetype_cleanup_finished(9, False)
+        self.app._voice_shortcut.on_cleanup(9, False)
 
         failed = bridge_runtime_status.read_status(self.app._config_root)
         self.assertEqual(
@@ -1743,7 +2642,7 @@ class HostHotkeyFailureSuppressesMicOpenTests(_AppWiringTestCase):
             bridge_runtime_status.VOICE_RUNTIME_HOST_STOP_FAILED,
         )
         self.assertEqual(
-            self.app._voice_hotkey_release_pending_backend,
+            self.app._voice_shortcut.pending_backend,
             app_module._VOICE_HOTKEY_BACKEND_WETYPE,
         )
         self.app._supervisor.request_reconnect.assert_called_once_with()
@@ -1760,21 +2659,21 @@ class HostHotkeyFailureSuppressesMicOpenTests(_AppWiringTestCase):
         )
 
     def test_stale_wetype_completion_cannot_overwrite_a_new_session(self):
-        self.app._wetype_runtime_generation = 12
+        self.app._voice_shortcut.runtime_generation = 12
         self.app._set_runtime_voice_result(
             bridge_runtime_status.VOICE_RUNTIME_ACTIVE,
             provider="wetype",
         )
         self.app._supervisor.request_reconnect = mock.Mock()
 
-        self.app._on_wetype_cleanup_finished(11, False)
+        self.app._voice_shortcut.on_cleanup(11, False)
 
         status = bridge_runtime_status.read_status(self.app._config_root)
         self.assertEqual(
             status.voice_runtime_state,
             bridge_runtime_status.VOICE_RUNTIME_ACTIVE,
         )
-        self.assertIsNone(self.app._voice_hotkey_release_pending)
+        self.assertIsNone(self.app._voice_shortcut.pending_tokens)
         self.app._supervisor.request_reconnect.assert_not_called()
 
     def test_wetype_mapping_does_not_require_a_keyboard_shortcut_backend(self):
@@ -1803,16 +2702,16 @@ class HostHotkeyFailureSuppressesMicOpenTests(_AppWiringTestCase):
             side_effect=lambda tokens: calls.append(("up", tokens)),
         ):
             self.assertTrue(
-                self.app._apply_voice_action(
+                self.app._voice_shortcut.apply(
                     app_module.voice_controller.VoiceHostAction.KEY_DOWN
                 )
             )
             self.assertEqual(
-                self.app._voice_hotkey_release_pending,
+                self.app._voice_shortcut.pending_tokens,
                 DEFAULT_VOICE_TOKENS,
             )
             self.assertTrue(
-                self.app._apply_voice_action(
+                self.app._voice_shortcut.apply(
                     app_module.voice_controller.VoiceHostAction.KEY_UP
                 )
             )
@@ -1821,7 +2720,7 @@ class HostHotkeyFailureSuppressesMicOpenTests(_AppWiringTestCase):
             calls,
             [("down", DEFAULT_VOICE_TOKENS), ("up", DEFAULT_VOICE_TOKENS)],
         )
-        self.assertIsNone(self.app._voice_hotkey_release_pending)
+        self.assertIsNone(self.app._voice_shortcut.pending_tokens)
 
     def test_wetype_physical_release_finishes_shortcut_without_waiting_for_audio_stop(self):
         self.app._config["voice_program"] = (
@@ -1832,7 +2731,7 @@ class HostHotkeyFailureSuppressesMicOpenTests(_AppWiringTestCase):
         wetype_control = mock.Mock()
         wetype_control.start.return_value = True
         wetype_control.stop.return_value = True
-        self.app._wetype_voice_control = wetype_control
+        self.app._voice_shortcut.wetype_control = wetype_control
 
         with mock.patch.object(win32_input, "send_voice_key_combo_down") as marked_down:
             self.app._handle_mic_button_pressed()
@@ -1845,7 +2744,7 @@ class HostHotkeyFailureSuppressesMicOpenTests(_AppWiringTestCase):
                 )
             )
 
-            self.assertFalse(self.app._voice.active)
+            self.assertFalse(self.app._voice_shortcut.controller.active)
             self.assertFalse(self.app._voice_pcm_forwarding_enabled)
             wetype_control.start.assert_called_once_with(DEFAULT_VOICE_TOKENS)
             wetype_control.stop.assert_called_once_with()
@@ -1853,7 +2752,7 @@ class HostHotkeyFailureSuppressesMicOpenTests(_AppWiringTestCase):
 
             self.app._on_control_event(AudioStopped())
 
-        self.assertFalse(self.app._voice.active)
+        self.assertFalse(self.app._voice_shortcut.controller.active)
         self.assertFalse(self.app._voice_pcm_forwarding_enabled)
         wetype_control.stop.assert_called_once_with()
 
@@ -1870,14 +2769,14 @@ class HostHotkeyFailureSuppressesMicOpenTests(_AppWiringTestCase):
                         {"provider": provider}
                     )
                 )
-                self.app._voice_hotkey_active_backend = None
+                self.app._voice_shortcut.active_backend = None
                 with mock.patch.object(
                     win32_input, "send_voice_key_combo_down"
                 ) as marked_down, mock.patch.object(
-                    self.app._wetype_voice_control, "start"
+                    self.app._voice_shortcut.wetype_control, "start"
                 ) as wetype_start:
                     self.assertTrue(
-                        self.app._apply_voice_action(
+                        self.app._voice_shortcut.apply(
                             app_module.voice_controller.VoiceHostAction.KEY_DOWN
                         )
                     )
@@ -1894,9 +2793,9 @@ class HostHotkeyFailureSuppressesMicOpenTests(_AppWiringTestCase):
         wetype_control = mock.Mock()
         wetype_control.start.return_value = True
         wetype_control.stop.side_effect = [False, True]
-        self.app._wetype_voice_control = wetype_control
+        self.app._voice_shortcut.wetype_control = wetype_control
         self.assertTrue(
-            self.app._apply_voice_action(
+            self.app._voice_shortcut.apply(
                 app_module.voice_controller.VoiceHostAction.KEY_DOWN
             )
         )
@@ -1907,28 +2806,28 @@ class HostHotkeyFailureSuppressesMicOpenTests(_AppWiringTestCase):
             )
         )
         self.assertFalse(
-            self.app._apply_voice_action(
+            self.app._voice_shortcut.apply(
                 app_module.voice_controller.VoiceHostAction.KEY_UP
             )
         )
         self.assertEqual(
-            self.app._voice_hotkey_active_backend,
+            self.app._voice_shortcut.active_backend,
             app_module._VOICE_HOTKEY_BACKEND_WETYPE,
         )
         self.assertTrue(
-            self.app._apply_voice_action(
+            self.app._voice_shortcut.apply(
                 app_module.voice_controller.VoiceHostAction.KEY_UP
             )
         )
         self.assertEqual(wetype_control.stop.call_count, 2)
-        self.assertIsNone(self.app._voice_hotkey_active_backend)
+        self.assertIsNone(self.app._voice_shortcut.active_backend)
 
     def test_hotkey_success_sends_mic_open(self):
         with mock.patch.object(win32_input, "send_voice_key_combo_down"):
             self.app._handle_mic_button_pressed()
 
         self.assertEqual(self.app._ble_session.mic_open_calls, 1)
-        self.assertTrue(self.app._voice.active)
+        self.assertTrue(self.app._voice_shortcut.controller.active)
 
     def test_sogou_process_is_confirmed_before_hotkey_and_mic_open(self):
         self.app._config["voice_program"] = (
@@ -1985,7 +2884,7 @@ class HostHotkeyFailureSuppressesMicOpenTests(_AppWiringTestCase):
         wait_for_process.assert_called_once_with(timeout=0.6)
         send_down.assert_not_called()
         self.assertEqual(self.app._ble_session.mic_open_calls, 0)
-        self.assertFalse(self.app._voice.active)
+        self.assertFalse(self.app._voice_shortcut.controller.active)
         self.assertFalse(self.app._voice_pcm_forwarding_enabled)
         status = bridge_runtime_status.read_status(self.app._config_root)
         self.assertEqual(
@@ -2029,7 +2928,7 @@ class HostHotkeyFailureSuppressesMicOpenTests(_AppWiringTestCase):
             bridge_runtime_status.VOICE_RUNTIME_ACTIVE,
         )
 
-        self.app._write_playback_frame(self.app._playback, [100, -100])
+        self.app._voice_audio.write_frame(self.app._voice_audio.sink, [100, -100])
 
         receiving = bridge_runtime_status.read_status(self.app._config_root)
         self.assertEqual(
@@ -2062,7 +2961,7 @@ class HostHotkeyFailureSuppressesMicOpenTests(_AppWiringTestCase):
             calls,
             [("down", DEFAULT_VOICE_TOKENS), ("up", DEFAULT_VOICE_TOKENS)],
         )
-        self.assertFalse(self.app._voice.active)
+        self.assertFalse(self.app._voice_shortcut.controller.active)
         self.assertEqual(self.app._ble_session.mic_open_calls, 1)
         self.assertEqual(self.app._ble_session.mic_close_calls, 1)
         self.assertEqual(reconnects, [True])
@@ -2085,7 +2984,7 @@ class HostHotkeyFailureSuppressesMicOpenTests(_AppWiringTestCase):
         ):
             self.app._handle_mic_button_pressed()
             first_callback = timers[0].callback
-            with self.app._voice_trigger_lock:
+            with self.app._voice_shortcut.lock:
                 self.assertTrue(
                     self.app._release_hold_voice_on_physical_release_locked(
                         "test first release"
@@ -2094,7 +2993,7 @@ class HostHotkeyFailureSuppressesMicOpenTests(_AppWiringTestCase):
             self.app._handle_mic_button_pressed()
             first_callback()
 
-        self.assertTrue(self.app._voice.active)
+        self.assertTrue(self.app._voice_shortcut.controller.active)
         self.assertEqual(
             calls,
             [
@@ -2135,7 +3034,7 @@ class HostHotkeyFailureSuppressesMicOpenTests(_AppWiringTestCase):
             calls,
             [("down", DEFAULT_VOICE_TOKENS), ("up", DEFAULT_VOICE_TOKENS)],
         )
-        self.assertFalse(self.app._voice.active)
+        self.assertFalse(self.app._voice_shortcut.controller.active)
         self.assertEqual(self.app._ble_session.mic_open_calls, 0)
         self.assertEqual(self.app._ble_session.mic_close_calls, 1)
         self.assertEqual(reconnects, [True])
@@ -2162,7 +3061,7 @@ class HostHotkeyFailureSuppressesMicOpenTests(_AppWiringTestCase):
             [("down", DEFAULT_VOICE_TOKENS), ("up", DEFAULT_VOICE_TOKENS)],
         )
         self.assertEqual(self.app._ble_session.mic_open_calls, 0)
-        self.assertFalse(self.app._voice.active)
+        self.assertFalse(self.app._voice_shortcut.controller.active)
 
     def test_audio_start_uses_configured_hotkey_without_waiting_for_f5(self):
         self._save_voice_settings(mode="hold", hotkey_text="ralt")
@@ -2176,7 +3075,7 @@ class HostHotkeyFailureSuppressesMicOpenTests(_AppWiringTestCase):
             self.app._on_control_event(AudioStarted(session_id=1))
 
         self.assertEqual(calls, [("ralt",)])
-        self.assertTrue(self.app._voice.active)
+        self.assertTrue(self.app._voice_shortcut.controller.active)
         self.assertEqual(self.app._ble_session.mic_open_calls, 0)
 
     def test_audio_start_can_fallback_without_a_physical_key_edge(self):
@@ -2191,7 +3090,7 @@ class HostHotkeyFailureSuppressesMicOpenTests(_AppWiringTestCase):
             self.app._on_control_event(AudioStarted(session_id=1))
 
         self.assertEqual(calls, [("ctrl", "l")])
-        self.assertTrue(self.app._voice.active)
+        self.assertTrue(self.app._voice_shortcut.controller.active)
         self.assertEqual(self.app._ble_session.mic_open_calls, 0)
 
     def test_duplicate_audio_start_does_not_send_a_second_key_down(self):
@@ -2207,7 +3106,7 @@ class HostHotkeyFailureSuppressesMicOpenTests(_AppWiringTestCase):
             self.app._on_control_event(AudioStarted(session_id=1))
 
         self.assertEqual(calls, [("ctrl", "l")])
-        self.assertTrue(self.app._voice.active)
+        self.assertTrue(self.app._voice_shortcut.controller.active)
 
     def test_hid_mic_button_is_ignored_until_ble_session_is_connected(self):
         self.app._ble_session = None
@@ -2215,7 +3114,7 @@ class HostHotkeyFailureSuppressesMicOpenTests(_AppWiringTestCase):
             self.app._on_button_event("mic", True)
 
         hotkey.assert_not_called()
-        self.assertFalse(self.app._voice.active)
+        self.assertFalse(self.app._voice_shortcut.controller.active)
 
     def test_mic_button_before_audio_start_does_not_send_a_second_key_down(self):
         self._save_voice_settings(mode="hold", hotkey_text="ctrl+l")
@@ -2230,11 +3129,11 @@ class HostHotkeyFailureSuppressesMicOpenTests(_AppWiringTestCase):
             self.app._on_control_event(AudioStarted(session_id=1))
 
         self.assertEqual(calls, [("ctrl", "l")])
-        self.assertTrue(self.app._voice.active)
+        self.assertTrue(self.app._voice_shortcut.controller.active)
         self.assertEqual(self.app._ble_session.mic_open_calls, 1)
 
     def test_no_usable_endpoint_suppresses_hotkey_and_mic_open(self):
-        self.app._playback = None
+        self.app._voice_audio.sink = None
         self.app._config["output_endpoint_name"] = "some endpoint that is not open"
 
         with mock.patch.object(win32_input, "send_voice_key_combo_down") as hotkey:
@@ -2277,7 +3176,7 @@ class HostHotkeyFailureSuppressesMicOpenTests(_AppWiringTestCase):
             ],
         )
         finish_tap.assert_not_called()
-        self.assertFalse(self.app._voice.active)
+        self.assertFalse(self.app._voice_shortcut.controller.active)
 
     def test_windows_actually_delivers_the_hold_hotkey(self):
         original_platform = sys.platform
@@ -2291,7 +3190,7 @@ class HostHotkeyFailureSuppressesMicOpenTests(_AppWiringTestCase):
             win32_input._real_voice_event = original_sender
 
         self.assertEqual(self.app._ble_session.mic_open_calls, 1)
-        self.assertTrue(self.app._voice.active)
+        self.assertTrue(self.app._voice_shortcut.controller.active)
 
 
 class CorruptButtonBindingFailsClosedTests(_AppWiringTestCase):
@@ -2306,7 +3205,7 @@ class CorruptButtonBindingFailsClosedTests(_AppWiringTestCase):
             self.app._bindings = {"bindings": {"back": malformed}}
             self.app._on_button_event("back", True)
 
-        self.assertFalse(self.app._voice.active)
+        self.assertFalse(self.app._voice_shortcut.controller.active)
 
 
 class OrdinaryButtonGestureWiringTests(_AppWiringTestCase):
@@ -2395,6 +3294,21 @@ class OrdinaryButtonGestureWiringTests(_AppWiringTestCase):
             route.assert_not_called()
             inject.assert_called_once_with(("up",))
 
+    def test_remote_page_key_controls_navigation_only_when_claimed(self):
+        control = app_module.element_navigation_control_windows
+        for token, vk in (
+            ("pageup", 0x21), ("page_up", 0x21),
+            ("pagedown", 0x22), ("page_down", 0x22),
+        ):
+            action = settings_ui._display_to_action(token)
+            for accepted in (True, False):
+                with self.subTest(token=token, accepted=accepted), mock.patch.object(
+                    control, "route_mapped_navigation_key", return_value=accepted
+                ) as route, mock.patch.object(win32_input, "send_key_combo_tap") as inject:
+                    self.app._apply_button_action(action)
+                    route.assert_called_once_with(vk)
+                    self.assertEqual(inject.call_count, 0 if accepted else 1)
+
     def test_app_switcher_cleanup_tracks_all_persistent_switcher_keys(self):
         with mock.patch.object(
             win32_input,
@@ -2444,6 +3358,45 @@ class OrdinaryButtonGestureWiringTests(_AppWiringTestCase):
         self.assertTrue(
             any("element navigation toggle failed" in line for line in captured.output)
         )
+
+    def test_element_navigation_diagnostic_matches_the_dispatch_result(self):
+        control = app_module.element_navigation_control_windows
+        cases = [
+            (control.ToggleResult(kind, 321, error="unavailable"),
+             kind != control.ToggleResultKind.FAILED, "")
+            for kind in control.ToggleResultKind
+        ]
+        cases.append((RuntimeError("simulated companion failure"), False, "RuntimeError"))
+        for result, success, error_type in cases:
+            with self.subTest(result=result), mock.patch.object(
+                control, "toggle_element_navigation",
+                side_effect=result if isinstance(result, Exception) else None,
+                return_value=result,
+            ), mock.patch.object(self.app._diagnostic_trace, "emit") as emit:
+                self.app._apply_button_action(key_mapping.ButtonAction(
+                    key_mapping.ActionKind.ELEMENT_NAVIGATION_TOGGLE))
+                outcomes = [call.kwargs for call in emit.call_args_list
+                            if call.args[0] == "action_result"]
+                self.assertEqual(len(outcomes), 1)
+                self.assertEqual(outcomes[0]["success"], success)
+                self.assertEqual(outcomes[0]["error"],
+                                 "" if success else "element_navigation_failed")
+                self.assertEqual(outcomes[0]["error_type"], error_type)
+
+    def test_application_diagnostic_matches_launch_availability(self):
+        for available in (False, True):
+            with self.subTest(available=available), mock.patch.object(
+                app_module, "open_configured_application", return_value=available,
+            ) as launch, mock.patch.object(self.app._diagnostic_trace, "emit") as emit:
+                action = key_mapping.ButtonAction(key_mapping.ActionKind.OPEN_CODEX)
+                self.app._apply_button_action(action)
+                launch.assert_called_once_with(action)
+                outcomes = [call.kwargs for call in emit.call_args_list
+                            if call.args[0] == "action_result"]
+                self.assertEqual(len(outcomes), 1)
+                self.assertEqual(outcomes[0]["success"], available)
+                self.assertEqual(outcomes[0]["error"],
+                                 "" if available else "application_unavailable")
 
     def test_incomplete_button_rollback_is_released_before_the_next_action(self):
         original_up = win32_input.send_arrow_up
@@ -2559,17 +3512,12 @@ class OrdinaryButtonGestureWiringTests(_AppWiringTestCase):
             self._button_input_release_timers[0],
         )
 
-    def test_mouse_actions_dispatch_physical_buttons_and_wheel_steps(self):
+    def test_mouse_actions_dispatch_physical_buttons(self):
         button_calls = []
-        wheel_calls = []
         with mock.patch.object(
             win32_input,
             "send_mouse_button_click",
             side_effect=lambda button: button_calls.append(button),
-        ), mock.patch.object(
-            win32_input,
-            "send_mouse_wheel",
-            side_effect=lambda clicks: wheel_calls.append(clicks),
         ):
             for action_kind in (
                 key_mapping.ActionKind.MOUSE_LEFT_CLICK,
@@ -2577,13 +3525,62 @@ class OrdinaryButtonGestureWiringTests(_AppWiringTestCase):
                 key_mapping.ActionKind.MOUSE_MIDDLE_CLICK,
                 key_mapping.ActionKind.MOUSE_X1_CLICK,
                 key_mapping.ActionKind.MOUSE_X2_CLICK,
-                key_mapping.ActionKind.MOUSE_WHEEL_UP,
-                key_mapping.ActionKind.MOUSE_WHEEL_DOWN,
             ):
                 self.app._apply_button_action(key_mapping.ButtonAction(action_kind))
 
         self.assertEqual(button_calls, ["left", "right", "middle", "x1", "x2"])
-        self.assertEqual(wheel_calls, [1, -1])
+
+    def test_old_wheel_mapping_becomes_nonrepeating_page_key(self):
+        for button_id in ("mic", "power", "up", "down", "left", "right", "ok", "back",
+                          "volume_up", "volume_down", "home", "menu", "tv"):
+            for kind in (key_mapping.ActionKind.MOUSE_WHEEL_UP,
+                         key_mapping.ActionKind.MOUSE_WHEEL_DOWN):
+                with self.subTest(button_id=button_id, kind=kind):
+                    self.app._bindings["bindings"][button_id] = {"kind": kind.value, "keys": []}
+                    self.assertFalse(self.app._is_button_repeatable(button_id))
+                    action = key_mapping.button_action_for(
+                        self.app._bindings, button_id, key_mapping.ButtonTrigger.SINGLE_CLICK
+                    )
+                    self.assertEqual(action.kind, key_mapping.ActionKind.KEY_COMBO)
+
+    def test_every_visible_action_option_saves_and_has_an_execution_route(self):
+        senders = (
+            "send_key_combo_tap", "send_escape", "send_return", "send_arrow_up",
+            "send_arrow_down", "send_arrow_left", "send_arrow_right",
+            "send_delete_backward", "send_show_desktop", "send_context_menu",
+            "send_app_switcher", "send_volume_up", "send_volume_down",
+            "send_volume_mute", "send_play_pause", "send_mouse_button_click",
+        )
+        with ExitStack() as stack:
+            effects = [stack.enter_context(mock.patch.object(win32_input, name)) for name in senders]
+            effects.append(stack.enter_context(mock.patch.object(
+                app_module, "open_configured_application", return_value=True
+            )))
+            effects.append(stack.enter_context(mock.patch.object(
+                app_module.element_navigation_control_windows,
+                "toggle_element_navigation",
+                return_value=app_module.element_navigation_control_windows.ToggleResult(
+                    app_module.element_navigation_control_windows.ToggleResultKind.DELIVERED, 321
+                ),
+            )))
+            stack.enter_context(mock.patch.object(
+                app_module.element_navigation_control_windows,
+                "route_mapped_navigation_key", return_value=False
+            ))
+            for option in settings_ui._PRESET_KEY_COMBOS:
+                with self.subTest(option=option):
+                    self.assertEqual(settings_ui.button_action_validation_message(
+                        "up", "single_click", option
+                    ), "")
+                    self.assertEqual(settings_ui.button_action_validation_message(
+                        "up", "double_click", option
+                    ), "")
+                    action = settings_ui._display_to_action(option)
+                    if action.kind == key_mapping.ActionKind.DISABLED:
+                        continue
+                    before = sum(effect.call_count for effect in effects)
+                    self.app._apply_button_action(action)
+                    self.assertEqual(sum(effect.call_count for effect in effects), before + 1)
 
     def test_physical_mouse_hold_skips_click_without_recording_cleanup_debt(self):
         with mock.patch.object(
@@ -2729,6 +3726,21 @@ class OrdinaryButtonGestureWiringTests(_AppWiringTestCase):
             self.app._on_button_event("up", False, event_source="hid")
 
         self.assertEqual(calls, ["up"])
+
+    def test_unconfigured_voice_does_not_block_ordinary_buttons_or_open_audio(self):
+        for provider in ("none", "unknown", "custom"):
+            with self.subTest(provider=provider):
+                self.app._config["voice_program"] = {"provider": provider}
+                with mock.patch.object(self.app._voice_audio, "open") as output:
+                    self.assertFalse(self.app._prepare_voice_mapping_locked(
+                        "mic", self.app._primary_button_action("mic")))
+                    self.assertFalse(self.app._handle_mic_button_pressed())
+                    output.assert_not_called()
+                with mock.patch.object(win32_input, "send_arrow_up") as up:
+                    self.app._on_button_event("up", True, event_source="hid_tap")
+                    self.app._on_button_event("up", False, event_source="hid_tap")
+                    up.assert_called_once()
+                self.assertEqual(self.app._ble_session.mic_open_calls, 0)
 
     def test_direct_direction_edge_arms_global_hook_before_mapping_injection(self):
         up_usage = next(
@@ -3441,12 +4453,12 @@ class OrdinaryButtonGestureWiringTests(_AppWiringTestCase):
             win32_input, "send_voice_key_combo_up"
         ) as voice_up:
             self.app._on_direct_hid_report(1, direct_down)
-            self.assertTrue(self.app._voice.active)
+            self.assertTrue(self.app._voice_shortcut.controller.active)
 
             self.app._on_raw_physical_event(raw_down)
             self.app._on_raw_physical_event(raw_down)
 
-            self.assertTrue(self.app._voice.active)
+            self.assertTrue(self.app._voice_shortcut.controller.active)
             voice_up.assert_not_called()
             self.app._on_direct_hid_report(1, b"\x00" * 6)
 
@@ -3477,22 +4489,22 @@ class OrdinaryButtonGestureWiringTests(_AppWiringTestCase):
             win32_input, "send_voice_key_combo_up"
         ) as voice_up:
             self.app._on_control_event(AudioStarted(session_id=1))
-            self.assertTrue(self.app._voice.active)
+            self.assertTrue(self.app._voice_shortcut.controller.active)
             self.assertTrue(self.app._voice_pcm_forwarding_enabled)
 
             self.app._on_raw_physical_event(raw_down)
-            self.assertTrue(self.app._voice.active)
+            self.assertTrue(self.app._voice_shortcut.controller.active)
             self.assertTrue(self.app._voice_pcm_forwarding_enabled)
             voice_up.assert_not_called()
 
             self.app._on_direct_hid_report(1, direct_down)
             self.assertIn("hid_tap", self.app._voice_mic_gesture_sources_down)
             self.app._on_pcm_frame([1, 2, 3])
-            self.assertTrue(self.app._playback_writer.flush(1.0).completed)
-            self.assertEqual(self.app._playback.write_calls, [(1, 2, 3)])
+            self.assertTrue(self.app._voice_audio.writer.flush(1.0).completed)
+            self.assertEqual(self.app._voice_audio.sink.write_calls, [(1, 2, 3)])
 
             self.app._on_direct_hid_report(1, b"\x00" * 6)
-            self.assertFalse(self.app._voice.active)
+            self.assertFalse(self.app._voice_shortcut.controller.active)
             self.assertFalse(self.app._voice_pcm_forwarding_enabled)
             self.app._on_control_event(AudioStopped())
 
@@ -4323,7 +5335,7 @@ class VoiceMappingProductBoundaryTests(_AppWiringTestCase):
             calls,
             [("down", DEFAULT_VOICE_TOKENS), ("up", DEFAULT_VOICE_TOKENS)],
         )
-        self.assertFalse(self.app._voice.active)
+        self.assertFalse(self.app._voice_shortcut.controller.active)
 
 
 
@@ -4353,7 +5365,7 @@ class VoiceMappingProductBoundaryTests(_AppWiringTestCase):
             calls,
             [("down", DEFAULT_VOICE_TOKENS), ("up", DEFAULT_VOICE_TOKENS)],
         )
-        self.assertFalse(self.app._voice.active)
+        self.assertFalse(self.app._voice_shortcut.controller.active)
 
     def test_physical_mic_release_failure_retains_state_and_reconnects(self):
         reconnect_calls = []
@@ -4367,7 +5379,7 @@ class VoiceMappingProductBoundaryTests(_AppWiringTestCase):
             self.app._on_button_event("mic", True, event_source="hid")
             self.app._on_button_event("mic", False, event_source="hid")
 
-        self.assertTrue(self.app._voice.active)
+        self.assertTrue(self.app._voice_shortcut.controller.active)
         self.assertEqual(reconnect_calls, [1])
 
     def test_mic_normal_mapping_dispatches_once_and_rejects_unsolicited_voice(self):
@@ -4569,7 +5581,7 @@ class LiveBridgeKeyDetectionTests(_AppWiringTestCase):
 
         self.assertEqual(key_detection_bridge.poll_detection(request), "mic")
         self.assertEqual(hotkey_calls, [DEFAULT_VOICE_TOKENS])
-        self.assertTrue(self.app._voice.active)
+        self.assertTrue(self.app._voice_shortcut.controller.active)
         self.assertEqual(self.app._ble_session.mic_open_calls, 0)
 
     def test_detection_suppression_timeout_allows_a_later_real_press(self):
@@ -4596,7 +5608,7 @@ class PlaybackWriteFailureTests(_AppWiringTestCase):
 
     def test_write_failure_requests_reconnect_and_cleanup_closes_sink(self):
         sink = _FakePlaybackSink(fail_write=True)
-        self.app._playback = sink
+        self.app._voice_audio.sink = sink
         self.app._voice_pcm_forwarding_enabled = True
         reconnect_calls = []
         self.app._supervisor.request_reconnect = lambda: reconnect_calls.append(1)
@@ -4607,12 +5619,12 @@ class PlaybackWriteFailureTests(_AppWiringTestCase):
         self.assertTrue(result.completed)
         self.assertIsInstance(result.error, OSError)
         self.assertFalse(sink.closed)
-        self.assertIs(self.app._playback, sink)
+        self.assertIs(self.app._voice_audio.sink, sink)
         self.assertEqual(reconnect_calls, [1])
 
         _run(self.app._cleanup_once())
         self.assertTrue(sink.closed)
-        self.assertIsNone(self.app._playback)
+        self.assertIsNone(self.app._voice_audio.sink)
 
     def test_write_success_does_not_touch_playback_or_reconnect(self):
         self.app._voice_pcm_forwarding_enabled = True
@@ -4622,7 +5634,7 @@ class PlaybackWriteFailureTests(_AppWiringTestCase):
         self.app._on_pcm_frame([0, 0])
         self.assertTrue(self._flush_playback().ok)
 
-        self.assertIsNotNone(self.app._playback)
+        self.assertIsNotNone(self.app._voice_audio.sink)
         self.assertEqual(reconnect_calls, [])
 
     def test_write_success_logs_the_latest_playback_timing_snapshot(self):
@@ -4636,7 +5648,7 @@ class PlaybackWriteFailureTests(_AppWiringTestCase):
                     underflow_count=2,
                 )
 
-        self.app._playback = TimedSink()
+        self.app._voice_audio.sink = TimedSink()
         self.app._voice_pcm_forwarding_enabled = True
 
         with self.assertLogs(self.app._logger, level="INFO") as captured:
@@ -4658,7 +5670,7 @@ class PlaybackWriteFailureTests(_AppWiringTestCase):
                 release_write.wait(2.0)
                 super().write(samples)
 
-        self.app._playback = BlockingSink()
+        self.app._voice_audio.sink = BlockingSink()
         self.app._voice_pcm_forwarding_enabled = True
 
         started = time.monotonic()
@@ -4681,8 +5693,8 @@ class PlaybackWriteFailureTests(_AppWiringTestCase):
                 release_write.wait(2.0)
                 super().write(samples)
 
-        self.app._playback = BlockingSink()
-        self.app._voice.on_mic_button_pressed()
+        self.app._voice_audio.sink = BlockingSink()
+        self.app._voice_shortcut.controller.on_mic_button_pressed()
         self.app._voice_audio_stream_active = True
         self.app._voice_audio_stop_processed = False
         self.app._voice_pcm_forwarding_enabled = True
@@ -4717,17 +5729,17 @@ class PlaybackWriteFailureTests(_AppWiringTestCase):
         def write(samples):
             write_started.set()
             release_write.wait(2.0)
-            self.app._write_playback_frame(sink, samples)
+            self.app._voice_audio.write_frame(sink, samples)
 
-        self.app._playback = sink
+        self.app._voice_audio.sink = sink
         self.app._supervisor.request_reconnect = lambda: reconnect_calls.append(1)
         writer = app_module.audio_playback_worker.PlaybackWriteWorker(
             write,
-            self.app._on_playback_worker_error,
+            self.app._voice_audio.on_worker_error,
             max_pending_frames=1,
         )
         writer.start()
-        self.app._playback_writer = writer
+        self.app._voice_audio.writer = writer
         self.app._voice_pcm_forwarding_enabled = True
         self.app._on_pcm_frame([1])
         self.assertTrue(write_started.wait(1.0))
@@ -4744,7 +5756,7 @@ class PlaybackWriteFailureTests(_AppWiringTestCase):
         self.assertTrue(self._flush_playback().completed)
 
     def test_no_playback_open_is_a_silent_no_op(self):
-        self.app._playback = None
+        self.app._voice_audio.sink = None
         self.app._voice_pcm_forwarding_enabled = True
         reconnect_calls = []
         self.app._supervisor.request_reconnect = lambda: reconnect_calls.append(1)
@@ -4754,7 +5766,7 @@ class PlaybackWriteFailureTests(_AppWiringTestCase):
         self.assertEqual(reconnect_calls, [])
 
     def test_ordinary_mic_unsolicited_audio_never_reaches_existing_sink(self):
-        sink = self.app._playback
+        sink = self.app._voice_audio.sink
         self.app._bindings["bindings"]["mic"] = key_mapping.ButtonAction(
             key_mapping.ActionKind.ESCAPE
         ).to_dict()
@@ -4774,7 +5786,7 @@ class CrossThreadReconnectTests(_AppWiringTestCase):
     """
 
     def test_on_pcm_frame_failure_from_a_real_worker_thread_requests_reconnect(self):
-        self.app._playback = _FakePlaybackSink(fail_write=True)
+        self.app._voice_audio.sink = _FakePlaybackSink(fail_write=True)
         self.app._voice_pcm_forwarding_enabled = True
         reconnect_calls = []
         self.app._supervisor.request_reconnect = lambda: reconnect_calls.append(
@@ -4974,6 +5986,286 @@ class InputLifecycleTests(_AppWiringTestCase):
             self.app._runtime_voice_key_physicalizer_state,
             "stopped",
         )
+
+    def test_stale_recovery_timer_cannot_stop_replacement_generation(self):
+        timers = []
+        old = _FakeVoicePhysicalizer(accepts_new_down=False)
+        old.is_running = True
+        self.app._voice_key_physicalizer = old
+        self.app._voice_key_physicalizer_generation = 1
+        self.app._voice_key_physicalizer_timer_factory = (
+            lambda _delay, callback: timers.append(_ManualTimer(callback))
+            or timers[-1]
+        )
+        with self.app._voice_key_physicalizer_lifecycle_lock:
+            self.app._schedule_voice_key_physicalizer_recovery_locked()
+
+        replacement = _FakeVoicePhysicalizer(accepts_new_down=False)
+        replacement.is_running = True
+        self.app._voice_key_physicalizer = replacement
+        self.app._voice_key_physicalizer_generation = 2
+        with mock.patch.object(
+            app_module.voice_key_physicalizer_windows,
+            "VoiceKeyPhysicalizer",
+        ) as build:
+            timers[0].fire()
+
+        self.assertEqual(replacement.stop_calls, 0)
+        self.assertIs(self.app._voice_key_physicalizer, replacement)
+        build.assert_not_called()
+
+    def test_required_confirmation_failure_closes_admission_and_schedules_recovery(self):
+        timers = []
+        physicalizer = _FakeVoicePhysicalizer(accepts_new_down=False)
+        physicalizer.is_running = True
+        self.app._voice_key_physicalizer = physicalizer
+        self.app._voice_key_physicalizer_generation = 7
+        self.app._voice_key_physicalizer_ready = True
+        self.app._voice_key_physicalizer_timer_factory = (
+            lambda _delay, callback: timers.append(_ManualTimer(callback))
+            or timers[-1]
+        )
+        snapshot = mock.Mock(
+            generation=11,
+            receipt_callback_entry_delta=0,
+            receipt_marker_callback_delta=0,
+        )
+        snapshot.trace_fields.return_value = {}
+
+        self.app._on_voice_key_physicalizer_health_failure(
+            physicalizer,
+            7,
+            "required_confirmation_timeout",
+            snapshot,
+        )
+
+        self.assertFalse(self.app._voice_key_physicalizer_ready)
+        self.assertEqual(
+            self.app._runtime_voice_key_physicalizer_state,
+            "recovering",
+        )
+        self.assertEqual(len(timers), 1)
+
+    def test_tracking_lost_owner_still_running_never_republishes_ready(self):
+        timers = []
+        physicalizer = _FakeVoicePhysicalizer()
+        physicalizer.is_running = True
+        self.app._voice_key_physicalizer = physicalizer
+        self.app._voice_key_physicalizer_generation = 8
+        self.app._voice_key_physicalizer_lost_generation = 8
+        self.app._voice_key_physicalizer_ready = False
+        self.app._voice_key_physicalizer_timer_factory = (
+            lambda _delay, callback: timers.append(_ManualTimer(callback))
+            or timers[-1]
+        )
+        with self.app._voice_key_physicalizer_lifecycle_lock:
+            self.app._schedule_voice_key_physicalizer_recovery_locked()
+
+        timers[0].fire()
+
+        self.assertFalse(self.app._voice_key_physicalizer_ready)
+        self.assertEqual(physicalizer.stop_calls, 0)
+        self.assertEqual(len(timers), 2)
+
+    def test_degraded_owner_waits_for_cleanup_then_restarts_once(self):
+        timers = []
+        old = _FakeVoicePhysicalizer(accepts_new_down=False)
+        old.is_running = True
+        replacement = _FakeVoicePhysicalizer()
+        self.app._voice_key_physicalizer = old
+        self.app._voice_key_physicalizer_generation = 4
+        self.app._voice_key_physicalizer_ready = False
+        self.app._voice_shortcut.pending_tokens = ("ralt",)
+        self.app._voice_key_physicalizer_degraded_retry_deadline = (
+            time.monotonic() + 10.0
+        )
+        self.app._voice_key_physicalizer_timer_factory = (
+            lambda _delay, callback: timers.append(_ManualTimer(callback))
+            or timers[-1]
+        )
+        with self.app._voice_key_physicalizer_lifecycle_lock:
+            self.app._schedule_voice_key_physicalizer_recovery_locked()
+
+        with mock.patch.object(
+            app_module.voice_key_physicalizer_windows,
+            "VoiceKeyPhysicalizer",
+            return_value=replacement,
+        ) as build:
+            timers[0].fire()
+            self.assertEqual(old.stop_calls, 0)
+            self.assertEqual(len(timers), 2)
+            self.app._voice_shortcut.pending_tokens = None
+            timers[1].fire()
+
+        self.assertEqual(old.stop_calls, 1)
+        self.assertEqual(replacement.start_calls, 1)
+        self.assertIs(self.app._voice_key_physicalizer, replacement)
+        self.assertTrue(self.app._voice_key_physicalizer_ready)
+        build.assert_called_once_with()
+
+    def test_persistent_cleanup_debt_enters_failed_state_without_restart_loop(self):
+        timers = []
+        physicalizer = _FakeVoicePhysicalizer(accepts_new_down=False)
+        physicalizer.is_running = True
+        self.app._voice_key_physicalizer = physicalizer
+        self.app._voice_key_physicalizer_generation = 3
+        self.app._voice_key_physicalizer_ready = False
+        self.app._voice_shortcut.pending_tokens = ("ralt",)
+        self.app._voice_key_physicalizer_degraded_retry_deadline = (
+            time.monotonic() - 0.1
+        )
+        self.app._voice_key_physicalizer_timer_factory = (
+            lambda _delay, callback: timers.append(_ManualTimer(callback))
+            or timers[-1]
+        )
+        with self.app._voice_key_physicalizer_lifecycle_lock:
+            self.app._schedule_voice_key_physicalizer_recovery_locked()
+
+        timers[0].fire()
+
+        self.assertEqual(physicalizer.stop_calls, 0)
+        self.assertEqual(len(timers), 1)
+        self.assertEqual(
+            self.app._runtime_voice_key_physicalizer_state,
+            "failed",
+        )
+
+    def test_late_direct_key_up_resumes_failed_degraded_owner_recovery(self):
+        timers = []
+        old = _FakeVoicePhysicalizer(accepts_new_down=False)
+        old.is_running = True
+        replacement = _FakeVoicePhysicalizer()
+        self.app._voice_key_physicalizer = old
+        self.app._voice_key_physicalizer_generation = 9
+        self.app._voice_key_physicalizer_ready = False
+        self.app._voice_key_physicalizer_degraded_retry_deadline = (
+            time.monotonic() - 0.1
+        )
+        self.app._voice_shortcut.pending_tokens = None
+        self.app._voice_shortcut.controller.on_mic_button_pressed()
+        self.app._voice_key_physicalizer_timer_factory = (
+            lambda _delay, callback: timers.append(_ManualTimer(callback))
+            or timers[-1]
+        )
+        with self.app._voice_key_physicalizer_lifecycle_lock:
+            self.app._schedule_voice_key_physicalizer_recovery_locked()
+
+        timers[0].fire()
+
+        self.assertTrue(self.app._voice_shortcut.controller.active)
+        self.assertIsNone(self.app._voice_shortcut.pending_tokens)
+        self.assertEqual(
+            self.app._runtime_voice_key_physicalizer_state,
+            "failed",
+        )
+        self.assertEqual(len(timers), 1)
+
+        with mock.patch.object(
+            win32_input,
+            "send_voice_key_combo_up",
+        ) as send_up, mock.patch.object(
+            win32_input,
+            "send_voice_key_combo_down",
+        ) as send_down, mock.patch.object(
+            app_module.voice_key_physicalizer_windows,
+            "VoiceKeyPhysicalizer",
+            return_value=replacement,
+        ):
+            with self.app._voice_shortcut.lock:
+                self.assertTrue(
+                    self.app._release_hold_voice_on_physical_release_locked(
+                        "late physical release"
+                    )
+                )
+            self.assertEqual(len(timers), 2)
+            timers[1].fire()
+
+        send_up.assert_called_once_with(DEFAULT_VOICE_TOKENS)
+        send_down.assert_not_called()
+        self.assertEqual(old.stop_calls, 1)
+        self.assertEqual(replacement.start_calls, 1)
+        self.assertEqual(replacement.stop_calls, 0)
+        self.assertIs(self.app._voice_key_physicalizer, replacement)
+        self.assertTrue(self.app._voice_key_physicalizer_ready)
+
+    def test_replacement_start_failure_replaces_retired_generation_timer(self):
+        timers = []
+        retired = _FakeVoicePhysicalizer(accepts_new_down=False)
+        failed_replacement = _FakeVoicePhysicalizer(
+            start_error=(
+                app_module.voice_key_physicalizer_windows.
+                VoiceKeyPhysicalizerUnavailableError("failed")
+            )
+        )
+        ready_replacement = _FakeVoicePhysicalizer()
+        self.app._voice_key_physicalizer = retired
+        self.app._voice_key_physicalizer_generation = 12
+        self.app._voice_key_physicalizer_timer_factory = (
+            lambda _delay, callback: timers.append(_ManualTimer(callback))
+            or timers[-1]
+        )
+        with self.app._voice_key_physicalizer_lifecycle_lock:
+            self.app._schedule_voice_key_physicalizer_recovery_locked()
+        retired_callback = timers[0].callback
+
+        retired.is_running = False
+        with mock.patch.object(
+            app_module.voice_key_physicalizer_windows,
+            "VoiceKeyPhysicalizer",
+            side_effect=[failed_replacement, ready_replacement],
+        ):
+            self.app._start_voice_key_physicalizer(recovering=True)
+            self.assertTrue(timers[0].cancelled)
+            self.assertEqual(len(timers), 2)
+            self.assertIs(
+                self.app._voice_key_physicalizer_retry_timer,
+                timers[1],
+            )
+
+            retired_callback()
+            self.assertIs(
+                self.app._voice_key_physicalizer_retry_timer,
+                timers[1],
+            )
+            timers[1].fire()
+            retired_callback()
+
+        self.assertEqual(failed_replacement.start_calls, 1)
+        self.assertEqual(ready_replacement.start_calls, 1)
+        self.assertEqual(ready_replacement.stop_calls, 0)
+        self.assertIs(self.app._voice_key_physicalizer, ready_replacement)
+        self.assertTrue(self.app._voice_key_physicalizer_ready)
+
+    def test_failed_degraded_owner_stop_never_starts_replacement(self):
+        timers = []
+        physicalizer = _FakeVoicePhysicalizer(
+            accepts_new_down=False,
+            stop_error=RuntimeError("stuck"),
+        )
+        physicalizer.is_running = True
+        self.app._voice_key_physicalizer = physicalizer
+        self.app._voice_key_physicalizer_generation = 5
+        self.app._voice_key_physicalizer_ready = False
+        self.app._voice_key_physicalizer_timer_factory = (
+            lambda _delay, callback: timers.append(_ManualTimer(callback))
+            or timers[-1]
+        )
+        with self.app._voice_key_physicalizer_lifecycle_lock:
+            self.app._schedule_voice_key_physicalizer_recovery_locked()
+
+        with mock.patch.object(
+            app_module.voice_key_physicalizer_windows,
+            "VoiceKeyPhysicalizer",
+        ) as build:
+            timers[0].fire()
+
+        self.assertEqual(physicalizer.stop_calls, 1)
+        self.assertIs(self.app._voice_key_physicalizer, physicalizer)
+        self.assertEqual(
+            self.app._runtime_voice_key_physicalizer_state,
+            "failed",
+        )
+        build.assert_not_called()
 
     def test_repeated_raw_start_failures_keep_one_capped_backoff_timer(self):
         timers = []
@@ -5501,9 +6793,9 @@ class InputLifecycleTests(_AppWiringTestCase):
         self.app._voice_key_physicalizer = physicalizer
         self.app._voice_key_physicalizer_generation = 1
         self.app._voice_key_physicalizer_ready = True
-        self.app._voice_hotkey = app_module.hotkey.HotkeySpec.parse("ralt")
-        self.app._voice_hotkey_release_pending = ("ralt",)
-        self.app._voice_hotkey_release_pending_backend = (
+        self.app._voice_shortcut.hotkey = app_module.hotkey.HotkeySpec.parse("ralt")
+        self.app._voice_shortcut.pending_tokens = ("ralt",)
+        self.app._voice_shortcut.pending_backend = (
             app_module._VOICE_HOTKEY_BACKEND_MARKED
         )
         self.app._voice_key_physicalizer_timer_factory = (
@@ -5537,8 +6829,8 @@ class InputLifecycleTests(_AppWiringTestCase):
         self.app._voice_key_physicalizer = physicalizer
         self.app._voice_key_physicalizer_generation = 1
         self.app._voice_key_physicalizer_ready = True
-        self.app._voice_hotkey = app_module.hotkey.HotkeySpec.parse("lctrl+f9")
-        self.app._voice_hotkey_release_pending = ("lctrl", "f9")
+        self.app._voice_shortcut.hotkey = app_module.hotkey.HotkeySpec.parse("lctrl+f9")
+        self.app._voice_shortcut.pending_tokens = ("lctrl", "f9")
         self.app._voice_key_physicalizer_timer_factory = (
             lambda _delay, callback: timers.append(_ManualTimer(callback))
             or timers[-1]
@@ -5566,7 +6858,7 @@ class InputLifecycleTests(_AppWiringTestCase):
         self.app._voice_key_physicalizer = physicalizer
         self.app._voice_key_physicalizer_generation = 1
         self.app._voice_key_physicalizer_ready = True
-        self.app._voice_hotkey_release_pending = ("lctrl", "lwin")
+        self.app._voice_shortcut.pending_tokens = ("lctrl", "lwin")
         self.app._button_key_release_pending = ("lctrl", "lwin")
         self.app._voice_key_physicalizer_timer_factory = (
             lambda _delay, callback: timers.append(_ManualTimer(callback))
@@ -5733,14 +7025,14 @@ class CleanupOwnershipTests(_AppWiringTestCase):
         hid = _FakeHidListener()
         self.app._hid_listener = hid
         self.app._ble_session = _FakeBleSession()
-        self.app._playback = _FakePlaybackSink()
+        self.app._voice_audio.sink = _FakePlaybackSink()
 
         _run(self.app._cleanup_once())  # must not raise
 
         self.assertIs(self.app._hid_listener, hid)
         self.assertEqual(hid.stop_calls, 0)
         self.assertIsNone(self.app._ble_session)
-        self.assertIsNone(self.app._playback)
+        self.assertIsNone(self.app._voice_audio.sink)
         self.assertTrue(self.app._accept_input_events)
         self.assertFalse(self.app._accept_ble_events)
 
@@ -5854,7 +7146,7 @@ class CleanupOwnershipTests(_AppWiringTestCase):
         playback = _FakePlaybackSink()
         self.app._hid_listener = hid
         self.app._ble_session = ble
-        self.app._playback = playback
+        self.app._voice_audio.sink = playback
 
         with self.assertRaises(app_module.CleanupIncompleteError) as ctx:
             _run(self.app._cleanup_once())
@@ -5866,7 +7158,7 @@ class CleanupOwnershipTests(_AppWiringTestCase):
         self.assertEqual(hid.stop_calls, 0)
         self.assertIs(self.app._hid_listener, hid)
         self.assertTrue(playback.closed)
-        self.assertIsNone(self.app._playback)
+        self.assertIsNone(self.app._voice_audio.sink)
 
     def test_ble_and_input_failures_are_reported_by_separate_lifecycles(self):
         hid = _FakeHidListener(stop_raises=True)
@@ -5874,7 +7166,7 @@ class CleanupOwnershipTests(_AppWiringTestCase):
         playback = _FakePlaybackSink()
         self.app._hid_listener = hid
         self.app._ble_session = ble
-        self.app._playback = playback
+        self.app._voice_audio.sink = playback
 
         with self.assertRaises(app_module.CleanupIncompleteError) as ble_ctx:
             _run(self.app._cleanup_once())
@@ -5887,7 +7179,7 @@ class CleanupOwnershipTests(_AppWiringTestCase):
         self.assertIs(self.app._hid_listener, hid)
         self.assertIs(self.app._ble_session, ble)
         self.assertTrue(playback.closed)
-        self.assertIsNone(self.app._playback)
+        self.assertIsNone(self.app._voice_audio.sink)
 
     def test_cleanup_failure_propagates_out_of_run_forever_without_a_second_connect(self):
         """End-to-end: wires _cleanup_once() as the real
@@ -5899,7 +7191,7 @@ class CleanupOwnershipTests(_AppWiringTestCase):
         hid = _FakeHidListener()
         self.app._hid_listener = hid
         self.app._ble_session = _FakeBleSession(close_raises=True)
-        self.app._playback = _FakePlaybackSink()
+        self.app._voice_audio.sink = _FakePlaybackSink()
 
         connect_calls = []
 
@@ -6051,7 +7343,7 @@ class HidTapStartupStateTests(_AppWiringTestCase):
             [("down", DEFAULT_VOICE_TOKENS), ("up", DEFAULT_VOICE_TOKENS)],
         )
         self.assertEqual(self.app._voice_mic_gesture_sources_down, set())
-        self.assertFalse(self.app._voice.active)
+        self.assertFalse(self.app._voice_shortcut.controller.active)
         self.assertFalse(self.app._direct_hid_interception_ready)
         self.assertEqual(self.app._ble_session.mic_close_calls, 0)
 
@@ -6119,9 +7411,9 @@ class VoiceCleanupFailurePreservesPendingStateTests(_AppWiringTestCase):
         )
         control = mock.Mock()
         control.stop.return_value = stop_result
-        self.app._wetype_voice_control = control
-        self.app._voice.on_mic_button_pressed()
-        self.app._voice_hotkey_active_backend = (
+        self.app._voice_shortcut.wetype_control = control
+        self.app._voice_shortcut.controller.on_mic_button_pressed()
+        self.app._voice_shortcut.active_backend = (
             app_module._VOICE_HOTKEY_BACKEND_WETYPE
         )
         return control
@@ -6132,8 +7424,8 @@ class VoiceCleanupFailurePreservesPendingStateTests(_AppWiringTestCase):
         _run(self.app._cleanup_once())
 
         control.stop.assert_called_once_with()
-        self.assertFalse(self.app._voice.active)
-        self.assertIsNone(self.app._voice_hotkey_active_backend)
+        self.assertFalse(self.app._voice_shortcut.controller.active)
+        self.assertIsNone(self.app._voice_shortcut.active_backend)
 
     def test_cleanup_retains_failed_wetype_shortcut_release_for_retry(self):
         control = self._configure_active_wetype_session(stop_result=False)
@@ -6143,14 +7435,14 @@ class VoiceCleanupFailurePreservesPendingStateTests(_AppWiringTestCase):
 
         self.assertIn("voice hotkey", str(ctx.exception))
         control.stop.assert_called_once_with()
-        self.assertTrue(self.app._voice.active)
+        self.assertTrue(self.app._voice_shortcut.controller.active)
         self.assertEqual(
-            self.app._voice_hotkey_active_backend,
+            self.app._voice_shortcut.active_backend,
             app_module._VOICE_HOTKEY_BACKEND_WETYPE,
         )
 
     def test_cleanup_releases_and_clears_an_owned_voice_hotkey(self):
-        self.app._voice.on_mic_button_pressed()
+        self.app._voice_shortcut.controller.on_mic_button_pressed()
         released = []
 
         with mock.patch.object(
@@ -6161,12 +7453,12 @@ class VoiceCleanupFailurePreservesPendingStateTests(_AppWiringTestCase):
             _run(self.app._cleanup_once())
 
         self.assertEqual(released, [DEFAULT_VOICE_TOKENS])
-        self.assertFalse(self.app._voice.active)
-        self.assertFalse(self.app._voice.holding)
+        self.assertFalse(self.app._voice_shortcut.controller.active)
+        self.assertFalse(self.app._voice_shortcut.controller.holding)
 
     def test_cleanup_once_preserves_hold_key_up_on_failure(self):
-        self.app._voice.on_mic_button_pressed()
-        self.assertTrue(self.app._voice.holding)
+        self.app._voice_shortcut.controller.on_mic_button_pressed()
+        self.assertTrue(self.app._voice_shortcut.controller.holding)
 
         with mock.patch.object(
             win32_input,
@@ -6177,11 +7469,11 @@ class VoiceCleanupFailurePreservesPendingStateTests(_AppWiringTestCase):
                 _run(self.app._cleanup_once())
 
         self.assertIn("voice hotkey", str(ctx.exception))
-        self.assertTrue(self.app._voice.holding)
-        self.assertTrue(self.app._voice.active)
+        self.assertTrue(self.app._voice_shortcut.controller.holding)
+        self.assertTrue(self.app._voice_shortcut.controller.active)
 
     def test_audio_stopped_preserves_hold_key_up_on_failure_and_reconnects(self):
-        self.app._voice.on_mic_button_pressed()
+        self.app._voice_shortcut.controller.on_mic_button_pressed()
         reconnect_calls = []
         self.app._supervisor.request_reconnect = lambda: reconnect_calls.append(1)
 
@@ -6192,7 +7484,7 @@ class VoiceCleanupFailurePreservesPendingStateTests(_AppWiringTestCase):
         ):
             self.app._on_control_event(AudioStopped())
 
-        self.assertTrue(self.app._voice.holding)
+        self.assertTrue(self.app._voice_shortcut.controller.holding)
         self.assertEqual(reconnect_calls, [1])
 
 
@@ -6226,7 +7518,7 @@ class PlaybackCleanupOwnershipTests(_AppWiringTestCase):
                     underflow_count=0,
                 )
 
-        self.app._playback = None
+        self.app._voice_audio.sink = None
         self.app._config["output_endpoint_name"] = "CABLE Input"
         self.app._config["output_endpoint_host_api"] = "Windows WASAPI"
         endpoint = app_module.audio_output.AudioEndpoint(
@@ -6246,7 +7538,7 @@ class PlaybackCleanupOwnershipTests(_AppWiringTestCase):
             "EndpointPlaybackSink",
             OpenSink,
         ), self.assertLogs(self.app._logger, level="INFO") as captured:
-            self.assertTrue(self.app._open_playback_for_new_session())
+            self.assertTrue(self.app._voice_audio.open())
 
         self.assertIn(
             "voice playback opened: endpoint=CABLE Input "
@@ -6258,13 +7550,13 @@ class PlaybackCleanupOwnershipTests(_AppWiringTestCase):
         sink = _FakePlaybackSink(close_raises=True)
         self.app._hid_listener = None
         self.app._ble_session = _FakeBleSession()
-        self.app._playback = sink
+        self.app._voice_audio.sink = sink
 
         with self.assertRaises(app_module.CleanupIncompleteError) as ctx:
             _run(self.app._cleanup_once())
         self.assertIn("audio playback", str(ctx.exception))
 
-        self.assertIs(self.app._playback, sink)
+        self.assertIs(self.app._voice_audio.sink, sink)
         self.assertEqual(sink.close_calls, 1)
         self.assertFalse(sink.closed)
 
@@ -6285,20 +7577,20 @@ class PlaybackCleanupOwnershipTests(_AppWiringTestCase):
 
         self.app._hid_listener = None
         self.app._ble_session = _FakeBleSession()
-        self.app._playback = sink
-        self.app._playback_writer = StuckWriter()
+        self.app._voice_audio.sink = sink
+        self.app._voice_audio.writer = StuckWriter()
 
         with self.assertRaises(app_module.CleanupIncompleteError) as ctx:
             _run(self.app._cleanup_once())
 
         self.assertIn("audio playback writer", str(ctx.exception))
-        self.assertIs(self.app._playback, sink)
-        self.assertIsNotNone(self.app._playback_writer)
+        self.assertIs(self.app._voice_audio.sink, sink)
+        self.assertIsNotNone(self.app._voice_audio.writer)
         self.assertEqual(sink.close_calls, 0)
 
     def test_write_fail_then_cleanup_close_raise_retains_owner(self):
         sink = _FakePlaybackSink(fail_write=True, close_raises=True)
-        self.app._playback = sink
+        self.app._voice_audio.sink = sink
         self.app._voice_pcm_forwarding_enabled = True
         reconnect_calls = []
         self.app._supervisor.request_reconnect = lambda: reconnect_calls.append(1)
@@ -6312,7 +7604,7 @@ class PlaybackCleanupOwnershipTests(_AppWiringTestCase):
             _run(self.app._cleanup_once())
 
         # Retained, not discarded - close() also failed:
-        self.assertIs(self.app._playback, sink)
+        self.assertIs(self.app._voice_audio.sink, sink)
         self.assertEqual(sink.close_calls, 1)
         # Still fails closed via reconnect either way:
         self.assertEqual(reconnect_calls, [1])
@@ -6332,7 +7624,7 @@ class PlaybackCleanupOwnershipTests(_AppWiringTestCase):
                     "simulated open failure"
                 )
 
-        self.app._playback = None
+        self.app._voice_audio.sink = None
         self.app._config["output_endpoint_name"] = "CABLE Input"
         self.app._config["output_endpoint_host_api"] = "Windows WASAPI"
         reconnect_calls = []
@@ -6354,9 +7646,9 @@ class PlaybackCleanupOwnershipTests(_AppWiringTestCase):
             "EndpointPlaybackSink",
             FailedOpenSink,
         ):
-            self.assertFalse(self.app._open_playback_for_new_session())
+            self.assertFalse(self.app._voice_audio.open())
 
-        self.assertIs(self.app._playback, instances[0])
+        self.assertIs(self.app._voice_audio.sink, instances[0])
         self.assertEqual(reconnect_calls, [1])
 
 
@@ -6391,6 +7683,9 @@ class LoggingHandlerCleanupRegressionTests(unittest.TestCase):
             self.assertEqual(
                 Path(handler1.baseFilename).parent, Path(tmp1.name) / "logs"
             )
+            # App logging is asynchronous; wait for the queued startup record
+            # before inspecting its worker-owned stream.
+            self.assertTrue(handler1.flush_pending())
             self.assertIsNotNone(handler1.stream)
 
             # Exactly what _AppWiringTestCase.tearDown now does.
@@ -6404,6 +7699,10 @@ class LoggingHandlerCleanupRegressionTests(unittest.TestCase):
             asyncio.set_event_loop(None)
             if loop1 is not None:
                 loop1.close()
+            for handler in list(logging.getLogger(logging_setup.LOGGER_NAME).handlers):
+                handler.close()
+                logging.getLogger(logging_setup.LOGGER_NAME).removeHandler(handler)
+            logging_setup._configured = False
             # Must not raise: on Windows this would be the PermissionError
             # from outcome 1 if the handle above were still open.
             tmp1.cleanup()

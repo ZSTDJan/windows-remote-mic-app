@@ -136,6 +136,21 @@ class ATVVSessionControlEventTests(unittest.TestCase):
 
 
 class ATVVSessionAudioTests(unittest.TestCase):
+    def test_fragmented_frame_reports_oldest_notification_origin(self):
+        session = atvv_session.ATVVSession()
+        session.handle_control(_caps_payload(frame_size=2))
+        session.handle_control(bytes((proto.OPCODE_AUDIO_START, 0, 0, 1)))
+
+        self.assertEqual(
+            session.handle_audio_with_origin(bytes((0x00,)), origin=5),
+            [],
+        )
+        batches = session.handle_audio_with_origin(bytes((0x00,)), origin=6)
+
+        self.assertEqual(len(batches), 1)
+        self.assertEqual(batches[0][1], 5)
+        self.assertEqual(len(batches[0][0]), 4)
+
     def test_audio_start_resets_decoder_regardless_of_prior_sync(self):
         session = atvv_session.ATVVSession()
         session.handle_control(_caps_payload(frame_size=1))

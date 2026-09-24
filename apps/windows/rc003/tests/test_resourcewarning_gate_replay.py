@@ -183,7 +183,7 @@ class WorkflowGateTextConsistencyTests(unittest.TestCase):
         run_step_start = self.ci_text.index("- name: Run test suite")
         next_step_start = self.ci_text.index("- name:", run_step_start + 1)
         run_step_text = self.ci_text[run_step_start:next_step_start]
-        unittest_index = run_step_text.index("-m unittest discover")
+        unittest_index = run_step_text.index("check_native.py --stage build/cython-stage --tests")
         gate_index = run_step_text.index("$forbiddenPatterns")
         self.assertLess(unittest_index, gate_index)
         self.assertIn("exit 1", run_step_text[gate_index:])

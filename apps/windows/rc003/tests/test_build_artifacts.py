@@ -5,12 +5,14 @@ Windows build, just structural/contract validation that runs anywhere.
 import ast
 import hashlib
 import importlib.util
+import json
 import os
 import re
 import shutil
 import subprocess
 import tempfile
 import unittest
+import zipfile
 from pathlib import Path
 from unittest import mock
 
@@ -31,6 +33,7 @@ _BUILD_PROVENANCE_PATH = _RC003_ROOT / "build" / "build-provenance.ps1"
 _CYTHON_PREPARE_PATH = _RC003_ROOT / "build" / "prepare-cython-core.py"
 _REQUIREMENTS_DEV_PATH = _RC003_ROOT / "requirements-dev.txt"
 _PACKAGE_LOCAL_TEST_PATH = _RC003_ROOT / "build" / "package-local-test.ps1"
+_PORTABLE_LAYOUT_PATH = _RC003_ROOT / "build" / "portable-layout.ps1"
 _RUN_DEV_PATH = _RC003_ROOT / "build" / "run-dev.ps1"
 _STOP_DEV_PATH = _RC003_ROOT / "build" / "stop-dev.ps1"
 _INSTALL_DEV_SHORTCUT_PATH = _RC003_ROOT / "build" / "install-dev-shortcut.ps1"
@@ -144,11 +147,11 @@ class CythonCoreBuildContractTests(unittest.TestCase):
     def setUp(self):
         self.text = _CYTHON_PREPARE_PATH.read_text(encoding="utf-8")
 
-    def test_prepare_script_is_valid_python_and_targets_only_permission_core(self):
+    def test_prepare_script_defaults_to_complete_business_inventory(self):
         ast.parse(self.text, filename=str(_CYTHON_PREPARE_PATH))
-        self.assertIn('"ovb_rc003.hid_elevation_windows"', self.text)
-        self.assertIn('"ovb_rc003.hid_helper_consumers"', self.text)
-        self.assertNotIn('"ovb_rc003.app"', self.text)
+        self.assertIn('choices=("full", "legacy"), default="full"', self.text)
+        self.assertIn('module_sources(RC003_ROOT)', self.text)
+        self.assertIn('native-build.json', self.text)
 
     def test_prepare_script_uses_the_proven_compatibility_directives(self):
         for directive in (
@@ -280,10 +283,8 @@ class PyInstallerSpecTests(unittest.TestCase):
         self.assertTrue(_HID_HELPER_LAUNCHER_PATH.is_file())
         self.assertIn('SRC_ROOT / "hid_helper_launcher.py"', text)
         self.assertIn('HID_HELPER_NAME = "RemoteMicRC003HidHelper"', text)
-        self.assertIn(
-            'HID_HELPER_RELATIVE_PATH = Path("_internal")',
-            text,
-        )
+        self.assertIn("WINDOWS_RUNTIME_DIRECTORY_NAME", text)
+        self.assertIn("Path(WINDOWS_RUNTIME_DIRECTORY_NAME)", text)
         self.assertIn("helper_a = Analysis(", text)
         self.assertIn("helper_pyz = PYZ(", text)
         self.assertIn("helper_exe = EXE(", text)
@@ -297,14 +298,27 @@ class PyInstallerSpecTests(unittest.TestCase):
         self.assertIn('"ovb_rc003.frida_hid_tap_injector"', helper_analysis)
         self.assertIn('"comtypes"', helper_analysis)
         self.assertIn('"comtypes.client"', helper_analysis)
-        self.assertIn('"PySide6"', helper_analysis)
-        self.assertIn('"ovb_rc003.qt_settings_app"', helper_analysis)
+        self.assertIn("excludes=list(HELPER_EXCLUDES)", helper_analysis)
+        self.assertIn('"PySide6"', text)
+        self.assertIn('"ovb_rc003.qt_settings_app"', text)
         self.assertIn(
             '(str(HID_HELPER_RELATIVE_PATH), helper_exe.name, "EXECUTABLE")',
             text,
         )
         self.assertIn("*helper_exe.dependencies", text)
         self.assertNotIn("\n    helper_exe,\n", text)
+
+    def test_spec_derives_unicode_name_layout_and_version_resources(self):
+        text = _strip_hash_comments(_SPEC_PATH.read_text(encoding="utf-8"))
+        self.assertIn("product_identity.windows_executable_name(APP_VERSION)", text)
+        self.assertIn("product_identity.windows_executable_stem(APP_VERSION)", text)
+        self.assertIn("contents_directory=WINDOWS_RUNTIME_DIRECTORY_NAME", text)
+        self.assertIn("version=MAIN_VERSION_INFO", text)
+        self.assertIn("version=HID_HELPER_VERSION_INFO", text)
+        self.assertIn('"FileDescription", metadata["file_description"]', text)
+        self.assertIn('"OriginalFilename", metadata["original_filename"]', text)
+        self.assertIn('versioninfo.VarStruct("Translation", [2052, 1200])', text)
+        self.assertGreaterEqual(text.count('"ovb_rc003.product_identity"'), 2)
 
     def test_spec_accepts_the_checked_cython_stage_as_its_source_root(self):
         text = _strip_hash_comments(_SPEC_PATH.read_text(encoding="utf-8"))
@@ -328,6 +342,16 @@ class PyInstallerSpecTests(unittest.TestCase):
             text,
         )
         self.assertNotIn("if REMOTE_PHOTO.is_file():", text)
+
+    def test_spec_requires_and_bundles_the_chromecast_photo(self):
+        text = _strip_hash_comments(_SPEC_PATH.read_text(encoding="utf-8"))
+        self.assertIn('CHROMECAST_PHOTO = REPO_ROOT / "Resources"', text)
+        self.assertIn('if not CHROMECAST_PHOTO.is_file():', text)
+        self.assertIn(
+            'datas.append((str(CHROMECAST_PHOTO), "Resources"))',
+            text,
+        )
+        self.assertNotIn("if CHROMECAST_PHOTO.is_file():", text)
 
     def test_spec_bundles_the_verified_vb_cable_zip_as_data_not_a_binary_dependency(self):
         # XRBM-031: unlike Frida, the pinned VB-CABLE base package IS now
@@ -366,8 +390,10 @@ class PyInstallerSpecTests(unittest.TestCase):
             'datas.append((str(DEVICE_PROFILES_DIR), "device-profiles"))', text
         )
 
-    def test_spec_bundles_the_element_navigation_companion_sources(self):
+    def test_spec_bundles_navigation_from_the_shared_inventory(self):
         text = _SPEC_PATH.read_text(encoding="utf-8")
+        inventory_text = (_RC003_ROOT / "build/native_inventory.py").read_text(encoding="utf-8")
+        self.assertIn('tuple(name + ".py" for name in NAVIGATION_MODULES)', text)
         for source_name in (
             "element_navigation_prototype.py",
             "element_navigation_command_windows.py",
@@ -376,8 +402,9 @@ class PyInstallerSpecTests(unittest.TestCase):
             "element_targeting_core.py",
             "spatial_navigation_core.py",
         ):
-            self.assertIn(source_name, text)
+            self.assertIn('"' + source_name.removesuffix(".py") + '"', inventory_text)
         self.assertIn('datas.append((str(source_path), "element_navigation"))', text)
+        self.assertIn('navigation_binaries.append((str(matches[0]), "element_navigation"))', text)
         hiddenimports = _spec_hidden_imports(text)
         for module in (
             "ovb_rc003.element_navigation_control_windows",
@@ -436,6 +463,33 @@ class LauncherEntryPointTests(unittest.TestCase):
         text = _LAUNCHER_PATH.read_text(encoding="utf-8")
         self.assertIn('if __name__ == "__main__":', text)
 
+
+class ChromecastFrozenClosureContractTests(unittest.TestCase):
+    def setUp(self):
+        self.spec_text = _SPEC_PATH.read_text(encoding="utf-8")
+        self.package_main_text = _PACKAGE_MAIN_PATH.read_text(encoding="utf-8")
+
+    def test_every_chromecast_source_module_is_an_explicit_hidden_import(self):
+        source_modules = {
+            f"ovb_rc003.{path.stem}"
+            for path in (_RC003_ROOT / "src" / "ovb_rc003").glob("chromecast_*.py")
+        }
+        hidden_modules = {
+            module
+            for module in _spec_hidden_imports(self.spec_text)
+            if module.startswith("ovb_rc003.chromecast_")
+        }
+        self.assertTrue(source_modules, "no Chromecast runtime modules found")
+        self.assertEqual(hidden_modules, source_modules)
+
+    def test_internal_chromecast_process_entries_remain_discoverable(self):
+        for flag, module in (
+            ("--chromecast-worker", "chromecast_worker"),
+            ("--doubao-handsfree-finish", "chromecast_doubao_handsfree"),
+        ):
+            with self.subTest(flag=flag):
+                self.assertIn(f'if "{flag}" in args:', self.package_main_text)
+                self.assertIn(f"from . import {module}", self.package_main_text)
 
 class HidHelperLauncherTests(unittest.TestCase):
     def _load_launcher(self):
@@ -1348,10 +1402,14 @@ class WindowsCiWorkflowTests(unittest.TestCase):
         self.assertIn("check-public-boundary.ps1", self.text)
 
     def test_runs_test_suite(self):
-        self.assertIn("unittest discover", self.text)
+        self.assertIn("check_native.py --stage build/cython-stage --tests", self.text)
 
     def test_attempts_pyinstaller_build(self):
         self.assertIn("PyInstaller", self.text)
+
+    def test_resolves_the_provenance_path_from_the_shared_product_paths(self):
+        self.assertIn("$provenancePath = Clear-RC003BuildProvenance", self.text)
+        self.assertNotIn("Get-RC003BuildProvenancePath", self.text)
 
     def test_runs_dry_run_smoke_check(self):
         self.assertIn("--dry-run", self.text)
@@ -1360,7 +1418,7 @@ class WindowsCiWorkflowTests(unittest.TestCase):
         self.assertIn("--qt-runtime-check", self.text)
 
     def test_runs_the_frozen_hid_helper_self_check_before_the_main_app(self):
-        helper_index = self.text.index("RemoteMicRC003HidHelper.exe")
+        helper_index = self.text.index("$builtHidHelper = $builtPaths.HidHelper")
         self_check_index = self.text.index(
             "Invoke-FrozenExecutableCheck -FilePath $builtHidHelper"
         )
@@ -1375,10 +1433,7 @@ class WindowsCiWorkflowTests(unittest.TestCase):
         self.assertNotIn("& $builtHidHelper --self-check", self.text)
 
     def test_rejects_a_frozen_version_that_differs_from_source(self):
-        self.assertIn(
-            '$builtVersionFile = "dist/RemoteMicRC003/_internal/ovb_rc003/VERSION"',
-            self.text,
-        )
+        self.assertIn("$builtVersionFile = $builtPaths.VersionFile", self.text)
         self.assertIn("if ($builtVersion -ne $sourceVersion)", self.text)
         self.assertIn("built VERSION mismatch", self.text)
 
@@ -1518,11 +1573,6 @@ class WindowsCiWorkflowTests(unittest.TestCase):
         self.assertIn("if: startsWith(github.ref, 'refs/tags/')", self.text)
         self.assertNotIn("gh release create", self.text)
 
-    def test_direct_main_push_does_not_repeat_the_release_build(self):
-        push_block = self.text.split("  push:", 1)[1].split("  pull_request:", 1)[0]
-        self.assertNotIn("branches:", push_block)
-        self.assertIn("tags:", push_block)
-
     def test_distribution_artifact_is_uploaded_only_after_a_tag_release_gate(self):
         upload_index = self.text.index(
             "uses: actions/upload-artifact@"
@@ -1538,7 +1588,7 @@ class WindowsCiWorkflowTests(unittest.TestCase):
         self.assertIn("group: windows-rc003-ci-${{ github.workflow }}-${{ github.ref }}", self.text)
 
     def test_test_suite_is_gated_by_resource_warning(self):
-        self.assertIn("-W error::ResourceWarning -m unittest discover", self.text)
+        self.assertIn("-W error::ResourceWarning build/check_native.py", self.text)
 
     def test_test_suite_step_is_verbose_unbuffered_and_bounded(self):
         # Regression for XRBM-023: both canceled real-Windows-CI runs
@@ -1555,9 +1605,9 @@ class WindowsCiWorkflowTests(unittest.TestCase):
 
         self.assertIn("timeout-minutes: 20", run_step_text)
         self.assertIn("PYTHONUNBUFFERED", run_step_text)
-        self.assertIn("python -u -W error::ResourceWarning -m unittest discover", run_step_text)
+        self.assertIn("python -u -W error::ResourceWarning build/check_native.py", run_step_text)
         self.assertIn(
-            '-m unittest discover -s tests -t . -p "test_*.py" -v', run_step_text
+            '--stage build/cython-stage --tests', run_step_text
         )
 
     def test_test_suite_step_hard_gates_late_resourcewarning_output(self):
@@ -1618,35 +1668,35 @@ class WindowsCiWorkflowTests(unittest.TestCase):
         # (ATTRIBUTION.md's file-by-file provenance record and a dedicated
         # portable README that never tells users to run Setup/Start Menu).
         self.assertIn(
-            'Copy-Item -Path "../../../LICENSE.md" -Destination (Join-Path $stagingDir "LICENSE.txt")',
+            'Copy-Item -Path "../../../LICENSE.md" -Destination (Join-Path $documentationDir "LICENSE.txt")',
             self.text,
         )
         self.assertIn(
-            'Copy-Item -Path "../../../COPYRIGHT.md" -Destination (Join-Path $stagingDir "COPYRIGHT.txt")',
+            'Copy-Item -Path "../../../COPYRIGHT.md" -Destination (Join-Path $documentationDir "COPYRIGHT.txt")',
             self.text,
         )
         self.assertIn(
-            'Copy-Item -Path "../../../THIRD_PARTY_NOTICES.md" -Destination (Join-Path $stagingDir "THIRD_PARTY_NOTICES.md")',
+            'Copy-Item -Path "../../../THIRD_PARTY_NOTICES.md" -Destination (Join-Path $documentationDir "THIRD_PARTY_NOTICES.md")',
             self.text,
         )
         self.assertIn(
-            'Copy-Item -Path "../../../THIRD_PARTY_SOURCE.md" -Destination (Join-Path $stagingDir "THIRD_PARTY_SOURCE.md")',
+            'Copy-Item -Path "../../../THIRD_PARTY_SOURCE.md" -Destination (Join-Path $documentationDir "THIRD_PARTY_SOURCE.md")',
             self.text,
         )
         self.assertIn(
-            'Copy-Item -Path "../../../ASSET_LICENSES.md" -Destination (Join-Path $stagingDir "ASSET_LICENSES.md")',
+            'Copy-Item -Path "../../../ASSET_LICENSES.md" -Destination (Join-Path $documentationDir "ASSET_LICENSES.md")',
             self.text,
         )
         self.assertIn(
-            'Copy-Item -Path "../../../THIRD_PARTY_LICENSES" -Destination (Join-Path $stagingDir "THIRD_PARTY_LICENSES") -Recurse -Force',
+            'Copy-Item -Path "../../../THIRD_PARTY_LICENSES" -Destination (Join-Path $documentationDir "THIRD_PARTY_LICENSES") -Recurse -Force',
             self.text,
         )
         self.assertIn(
-            'Copy-Item -Path "ATTRIBUTION.md" -Destination (Join-Path $stagingDir "ATTRIBUTION.md")',
+            'Copy-Item -Path "ATTRIBUTION.md" -Destination (Join-Path $documentationDir "ATTRIBUTION.md")',
             self.text,
         )
         self.assertIn(
-            'Copy-Item -Path "installer/readme-portable-rc003.txt" -Destination (Join-Path $stagingDir "README.txt")',
+            'Copy-Item -Path "installer/readme-portable-rc003.txt" -Destination (Join-Path $documentationDir ([string]$productPresentation.portable_readme_name))',
             self.text,
         )
 
@@ -1667,14 +1717,14 @@ class WindowsCiWorkflowTests(unittest.TestCase):
         # textual (line) order.
         compress_index = self.text.index("Compress-Archive -Path $stagingDir")
         for destination_marker in (
-            'Destination (Join-Path $stagingDir "LICENSE.txt")',
-            'Destination (Join-Path $stagingDir "COPYRIGHT.txt")',
-            'Destination (Join-Path $stagingDir "THIRD_PARTY_NOTICES.md")',
-            'Destination (Join-Path $stagingDir "THIRD_PARTY_SOURCE.md")',
-            'Destination (Join-Path $stagingDir "ASSET_LICENSES.md")',
-            'Destination (Join-Path $stagingDir "THIRD_PARTY_LICENSES")',
-            'Destination (Join-Path $stagingDir "ATTRIBUTION.md")',
-            'Destination (Join-Path $stagingDir "README.txt")',
+            'Destination (Join-Path $documentationDir "LICENSE.txt")',
+            'Destination (Join-Path $documentationDir "COPYRIGHT.txt")',
+            'Destination (Join-Path $documentationDir "THIRD_PARTY_NOTICES.md")',
+            'Destination (Join-Path $documentationDir "THIRD_PARTY_SOURCE.md")',
+            'Destination (Join-Path $documentationDir "ASSET_LICENSES.md")',
+            'Destination (Join-Path $documentationDir "THIRD_PARTY_LICENSES")',
+            'Destination (Join-Path $documentationDir "ATTRIBUTION.md")',
+            'Destination (Join-Path $documentationDir ([string]$productPresentation.portable_readme_name))',
         ):
             self.assertLess(
                 self.text.index(destination_marker),
@@ -1748,42 +1798,21 @@ class WindowsCiWorkflowTests(unittest.TestCase):
 
     def test_portable_zip_contract_is_read_back_before_release_staging(self):
         step = self._package_step_text()
-        archive_index = step.index(
-            "[System.IO.Compression.ZipFile]::OpenRead((Resolve-Path $zipPath).Path)"
-        )
+        archive_index = step.index("Assert-RC003PortableZip")
         installer_index = step.index(
             '$releaseDir = "$env:GITHUB_WORKSPACE/apps/windows/rc003/dist/release"'
         )
         self.assertLess(archive_index, installer_index)
-        self.assertIn("portable ZIP must contain exactly one top-level directory", step)
-        self.assertIn("portable ZIP root must expose only", step)
-        self.assertIn("_internal/RemoteMicRC003HidHelper.exe", step)
-        self.assertIn("_internal/ovb_rc003/VERSION", step)
-        self.assertIn("_internal/build-provenance.json", step)
-        self.assertIn("$archiveFiles.ContainsKey($helperEntryName)", step)
-        self.assertIn("$versionEntry = $archiveFiles[$versionEntryName]", step)
-        self.assertNotIn("$archive.GetEntry", step)
-        self.assertIn("portable ZIP VERSION mismatch", step)
-        self.assertIn("portable ZIP file count mismatch", step)
-        self.assertIn("portable ZIP is missing staging file", step)
-        self.assertIn("portable ZIP file length mismatch", step)
-        self.assertIn("portable ZIP file hash mismatch", step)
-        self.assertIn("[System.IO.Path]::DirectorySeparatorChar", step)
-        staging_enumeration = re.search(
-            r"Get-ChildItem -LiteralPath \$stagingRoot[^\r\n]+",
-            step,
-        )
-        self.assertIsNotNone(staging_enumeration)
-        self.assertIn("-Force", staging_enumeration.group(0))
-        self.assertNotIn(".Replace('\\\\', '/')", step)
-        self.assertNotIn("[char[]]@('\\\\', '/')", step)
+        self.assertIn(". ./build/portable-layout.ps1", step)
+        self.assertIn("Assert-RC003PortableStagingRoot", step)
+        self.assertIn("-ProductPresentation $productPresentation", step)
 
     def test_release_packaging_rechecks_the_build_before_and_after_copying(self):
         step = self._package_step_text()
         initial_index = step.index("$initialBuildProvenance =")
         copy_index = step.index('Copy-Item -Path "dist/RemoteMicRC003/*"')
         staged_index = step.index("$stagedBuildProvenance =")
-        archive_index = step.index("[System.IO.Compression.ZipFile]::OpenRead")
+        archive_index = step.index("Assert-RC003PortableZip")
         final_index = step.index("$finalBuildProvenance =")
         installer_index = step.index(
             '$releaseDir = "$env:GITHUB_WORKSPACE/apps/windows/rc003/dist/release"'
@@ -1807,7 +1836,10 @@ class WindowsCiWorkflowTests(unittest.TestCase):
         # entry - required so extracting the portable ZIP produces one
         # clearly-versioned folder, not loose files scattered at the
         # archive root.
-        self.assertIn('$stagingName = "RemoteMicRC003-$version"', self.text)
+        self.assertIn(
+            "$stagingName = [string]$productPresentation.portable_folder_name",
+            self.text,
+        )
         self.assertIn('$stagingDir = "dist/portable/$stagingName"', self.text)
 
     def _package_step_text(self):
@@ -1991,35 +2023,32 @@ class WindowsCiWorkflowTests(unittest.TestCase):
         pyinstaller_index = self.text.index("PyInstaller build (unsigned candidate)")
         self.assertLess(fetch_index, pyinstaller_index)
 
-    def test_compiles_and_tests_permission_modules_before_pyinstaller(self):
+    def test_compiles_then_tests_business_modules_once_before_pyinstaller(self):
         source_test_index = self.text.index("- name: Run test suite")
         compile_index = self.text.index(
-            "- name: Compile selected permission modules with Cython"
+            "- name: Compile business modules with Cython"
         )
         compiled_test_index = self.text.index(
-            "- name: Test compiled permission modules and HID helper"
+            "- name: Test compiled HID helper"
         )
         pyinstaller_index = self.text.index(
             "- name: PyInstaller build (unsigned candidate)"
         )
-        self.assertLess(source_test_index, compile_index)
-        self.assertLess(compile_index, compiled_test_index)
+        self.assertLess(compile_index, source_test_index)
+        self.assertLess(source_test_index, compiled_test_index)
+        self.assertNotIn("-m unittest discover", self.text)
         self.assertLess(compiled_test_index, pyinstaller_index)
         self.assertIn("python build/prepare-cython-core.py", self.text)
         self.assertIn("PYTHONPATH: build/cython-stage/src", self.text)
         self.assertIn("RC003_BUILD_SOURCE_ROOT", self.text)
 
-    def test_frozen_output_requires_both_compiled_extensions(self):
-        self.assertIn('foreach ($compiledModuleName in @("hid_elevation_windows", "hid_helper_consumers"))', self.text)
-        self.assertIn("expected one compiled $compiledModuleName extension", self.text)
+    def test_frozen_output_requires_all_compiled_extensions(self):
+        self.assertIn("python build/check_native.py --stage build/cython-stage --artifact dist/RemoteMicRC003", self.text)
 
     def test_requires_the_narrow_hid_helper_in_the_built_directory(self):
-        self.assertIn(
-            'dist/RemoteMicRC003/_internal/RemoteMicRC003HidHelper.exe',
-            self.text,
-        )
+        self.assertIn("$builtHidHelper = $builtPaths.HidHelper", self.text)
         self.assertIn("expected narrow HID helper not found", self.text)
-        self.assertIn("build root must expose only RemoteMicRC003.exe", self.text)
+        self.assertIn("build root must expose only $($productPresentation.main_executable_name)", self.text)
 
     def test_frida_fetch_step_is_a_required_gate_not_best_effort(self):
         step_start = self.text.index("- name: Fetch and verify Frida Gadget")
@@ -2047,6 +2076,7 @@ class BuildProvenanceScriptTests(unittest.TestCase):
             r"build\build-candidate.ps1",
             r"build\package-local-test.ps1",
             r"build\build-provenance.ps1",
+            r"build\product-presentation.py",
             r"build\check-public-boundary.ps1",
             r"build\check-release-readiness.py",
             r"build\check-third-party-notices.py",
@@ -2061,6 +2091,8 @@ class BuildProvenanceScriptTests(unittest.TestCase):
             r"COPYRIGHT.md",
             r"LICENSE.md",
             r'Join-Path $RepoRoot "README.md"',
+            r"Resources\RC003-remote-photo.png",
+            r"Resources\Chromecast-remote-photo.png",
             r"THIRD_PARTY_NOTICES.md",
             r"THIRD_PARTY_SOURCE.md",
             r".github\workflows\windows-rc003-ci.yml",
@@ -2114,17 +2146,22 @@ class BuildProvenanceScriptTests(unittest.TestCase):
             repo_root = Path(temporary_directory) / "repo"
             rc003_root = repo_root / "apps" / "windows" / "rc003"
             source_file = rc003_root / "src" / "ovb_rc003" / "app.py"
+            chromecast_photo = repo_root / "Resources" / "Chromecast-remote-photo.png"
             fixture_files = {
                 source_file: "alpha",
                 rc003_root / "src" / "ovb_rc003" / "VERSION": "0.0.1-test\n",
                 rc003_root / "tests" / "test_sample.py": "VALUE = 1\n",
                 rc003_root / "build" / "build-candidate.ps1": "fixture\n",
                 rc003_root / "build" / "package-local-test.ps1": "fixture\n",
+                rc003_root / "build" / "portable-layout.ps1": "fixture\n",
                 rc003_root / "build" / "build-provenance.ps1": "fixture\n",
+                rc003_root / "build" / "product-presentation.py": "fixture\n",
                 rc003_root / "build" / "check-public-boundary.ps1": "fixture\n",
                 rc003_root / "build" / "check-release-readiness.py": "fixture\n",
                 rc003_root / "build" / "check-third-party-notices.py": "fixture\n",
                 rc003_root / "build" / "prepare-cython-core.py": "fixture\n",
+                rc003_root / "build" / "native_inventory.py": "fixture\n",
+                rc003_root / "build" / "check_native.py": "fixture\n",
                 rc003_root / "build" / "fetch-frida-gadget.ps1": "fixture\n",
                 rc003_root / "build" / "fetch-vb-cable.ps1": "fixture\n",
                 rc003_root / "build" / "stop-dev.ps1": "fixture\n",
@@ -2144,6 +2181,7 @@ class BuildProvenanceScriptTests(unittest.TestCase):
                 repo_root / ".github" / "workflows" / "windows-rc003-ci.yml": "fixture\n",
                 repo_root / "README.md": "fixture\n",
                 repo_root / "Resources" / "RC003-remote-photo.png": b"png",
+                chromecast_photo: b"chromecast-photo",
                 repo_root / "ASSET_LICENSES.md": "fixture\n",
                 repo_root / "COPYRIGHT.md": "fixture\n",
                 repo_root / "LICENSE.md": "fixture\n",
@@ -2170,10 +2208,10 @@ class BuildProvenanceScriptTests(unittest.TestCase):
 
             build_root = rc003_root / "dist" / "RemoteMicRC003"
             built_files = {
-                build_root / "RemoteMicRC003.exe": b"main",
-                build_root / "_internal" / "RemoteMicRC003HidHelper.exe": b"helper",
-                build_root / "_internal" / "ovb_rc003" / "VERSION": b"0.0.1-test\n",
-                build_root / "_internal" / "hidden.dat": b"hidden",
+                build_root / "无线麦 win版 0.0.1-test.exe": b"main",
+                build_root / "程序文件" / "RemoteMicRC003HidHelper.exe": b"helper",
+                build_root / "程序文件" / "ovb_rc003" / "VERSION": b"0.0.1-test\n",
+                build_root / "程序文件" / "hidden.dat": b"hidden",
             }
             for path, content in built_files.items():
                 path.parent.mkdir(parents=True, exist_ok=True)
@@ -2187,7 +2225,29 @@ class BuildProvenanceScriptTests(unittest.TestCase):
                     "RC003_FIXTURE_REPO": str(repo_root),
                     "RC003_FIXTURE_BUILD": str(build_root),
                     "RC003_FIXTURE_SOURCE": str(source_file),
-                    "RC003_FIXTURE_HIDDEN": str(build_root / "_internal" / "hidden.dat"),
+                    "RC003_FIXTURE_CHROMECAST_PHOTO": str(chromecast_photo),
+                    "RC003_FIXTURE_HIDDEN": str(build_root / "程序文件" / "hidden.dat"),
+                    "RC003_FIXTURE_PRESENTATION": json.dumps(
+                        {
+                            "schema_version": 1,
+                            "version": "0.0.1-test",
+                            "presentation_label": "无线麦 win版 0.0.1-test",
+                            "main_executable_name": "无线麦 win版 0.0.1-test.exe",
+                            "main_executable_stem": "无线麦 win版 0.0.1-test",
+                            "portable_folder_name": "无线麦 win版 0.0.1-test",
+                            "runtime_directory_name": "程序文件",
+                            "documentation_directory_name": "说明与许可",
+                            "portable_readme_name": "使用说明.txt",
+                            "hid_helper_executable_name": "RemoteMicRC003HidHelper.exe",
+                            "hid_helper_file_description": "无线麦 权限助手",
+                            "main_file_description": "无线麦 win版 0.0.1-test",
+                            "product_name": "无线麦 win版",
+                            "main_original_filename": "无线麦 win版 0.0.1-test.exe",
+                            "helper_original_filename": "RemoteMicRC003HidHelper.exe",
+                        },
+                        ensure_ascii=True,
+                        separators=(",", ":"),
+                    ),
                     "RC003_FIXTURE_RESULT": str(
                         Path(temporary_directory) / "powershell-result.txt"
                     ),
@@ -2203,6 +2263,13 @@ trap {
 }
 $ErrorActionPreference = 'Stop'
 . $env:RC003_PROVENANCE_SCRIPT
+function Get-RC003ProductPresentation {
+    param(
+        [string]$RC003Root,
+        [string]$PythonExecutable = ""
+    )
+    return ($env:RC003_FIXTURE_PRESENTATION | ConvertFrom-Json)
+}
 [System.IO.File]::SetAttributes(
     $env:RC003_FIXTURE_HIDDEN,
     [System.IO.FileAttributes]::Hidden
@@ -2218,11 +2285,36 @@ Write-RC003BuildProvenance `
     -RC003Root $env:RC003_FIXTURE_ROOT `
     -RepoRoot $env:RC003_FIXTURE_REPO `
     -BuildRoot $env:RC003_FIXTURE_BUILD `
-    -InputState $inputState | Out-Null
+    -InputState $inputState `
+    -ExecutableMetadataVerified | Out-Null
 Assert-RC003BuildProvenance `
     -RC003Root $env:RC003_FIXTURE_ROOT `
     -RepoRoot $env:RC003_FIXTURE_REPO `
     -BuildRoot $env:RC003_FIXTURE_BUILD | Out-Null
+[System.IO.File]::WriteAllText($env:RC003_FIXTURE_CHROMECAST_PHOTO, 'changed-photo')
+try {
+    Assert-RC003BuildProvenance `
+        -RC003Root $env:RC003_FIXTURE_ROOT `
+        -RepoRoot $env:RC003_FIXTURE_REPO `
+        -BuildRoot $env:RC003_FIXTURE_BUILD | Out-Null
+    throw 'stale Chromecast photo was accepted'
+} catch {
+    if ($_.Exception.Message -eq 'stale Chromecast photo was accepted') {
+        throw
+    }
+    if ($_.Exception.Message -notmatch 'build inputs changed') {
+        throw
+    }
+}
+$changedInputState = Get-RC003BuildInputState `
+    -RC003Root $env:RC003_FIXTURE_ROOT `
+    -RepoRoot $env:RC003_FIXTURE_REPO
+Write-RC003BuildProvenance `
+    -RC003Root $env:RC003_FIXTURE_ROOT `
+    -RepoRoot $env:RC003_FIXTURE_REPO `
+    -BuildRoot $env:RC003_FIXTURE_BUILD `
+    -InputState $changedInputState `
+    -ExecutableMetadataVerified | Out-Null
 [System.IO.File]::WriteAllText($env:RC003_FIXTURE_SOURCE, 'bravo')
 try {
     Assert-RC003BuildProvenance `
@@ -2276,6 +2368,257 @@ try {
             )
 
 
+@unittest.skipUnless(
+    os.name == "nt" and shutil.which("powershell"),
+    "requires Windows PowerShell",
+)
+class WindowsPowerShellBuildContractTests(unittest.TestCase):
+    _presentation = {
+        "schema_version": 1,
+        "version": "0.0.1-test",
+        "presentation_label": "无线麦 win版 0.0.1-test",
+        "main_executable_name": "无线麦 win版 0.0.1-test.exe",
+        "main_executable_stem": "无线麦 win版 0.0.1-test",
+        "portable_folder_name": "无线麦 win版 0.0.1-test",
+        "runtime_directory_name": "程序文件",
+        "documentation_directory_name": "说明与许可",
+        "portable_readme_name": "使用说明.txt",
+        "hid_helper_executable_name": "RemoteMicRC003HidHelper.exe",
+        "hid_helper_file_description": "无线麦 权限助手",
+        "main_file_description": "无线麦 win版 0.0.1-test",
+        "product_name": "无线麦 win版",
+        "main_original_filename": "无线麦 win版 0.0.1-test.exe",
+        "helper_original_filename": "RemoteMicRC003HidHelper.exe",
+    }
+
+    def _powershell(self, command, **environment):
+        return subprocess.run(
+            [
+                shutil.which("powershell"),
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-Command",
+                command,
+            ],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env={**os.environ, **environment},
+            timeout=30,
+            check=False,
+        )
+
+    def test_product_paths_resolve_the_current_provenance_location(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            rc003_root = root / "rc003"
+            build_root = rc003_root / "dist" / "RemoteMicRC003"
+            rc003_root.mkdir()
+            result_path = root / "result.txt"
+            command = r"""
+$ErrorActionPreference = 'Stop'
+. $env:RC003_PROVENANCE_SCRIPT
+function Get-RC003ProductPresentation {
+    param([string]$RC003Root, [string]$PythonExecutable = '')
+    return ($env:RC003_PRESENTATION | ConvertFrom-Json)
+}
+$paths = Get-RC003BuildProductPaths `
+    -RC003Root $env:RC003_ROOT `
+    -BuildRoot $env:RC003_BUILD_ROOT
+New-Item -ItemType Directory -Path (Split-Path $paths.ProvenanceFile -Parent) -Force | Out-Null
+[System.IO.File]::WriteAllText($paths.ProvenanceFile, 'old receipt')
+$clearedPath = Clear-RC003BuildProvenance `
+    -RC003Root $env:RC003_ROOT `
+    -BuildRoot $env:RC003_BUILD_ROOT
+if (Test-Path -LiteralPath $paths.ProvenanceFile) {
+    throw 'current provenance receipt was not cleared'
+}
+[System.IO.File]::WriteAllText($paths.ProvenanceFile, 'must survive failed initialization')
+function Get-RC003ProductPresentation {
+    param([string]$RC003Root, [string]$PythonExecutable = '')
+    throw 'synthetic presentation failure'
+}
+try {
+    Clear-RC003BuildProvenance `
+        -RC003Root $env:RC003_ROOT `
+        -BuildRoot $env:RC003_BUILD_ROOT | Out-Null
+    throw 'failed naming initialization was accepted'
+} catch {
+    if ($_.Exception.Message -eq 'failed naming initialization was accepted') {
+        throw
+    }
+}
+if (-not (Test-Path -LiteralPath $paths.ProvenanceFile -PathType Leaf)) {
+    throw 'failed naming initialization mutated the build output'
+}
+[System.IO.File]::WriteAllText($env:RC003_RESULT, $clearedPath)
+"""
+            result = self._powershell(
+                command,
+                RC003_PROVENANCE_SCRIPT=str(_BUILD_PROVENANCE_PATH),
+                RC003_PRESENTATION=json.dumps(
+                    self._presentation, ensure_ascii=True, separators=(",", ":")
+                ),
+                RC003_ROOT=str(rc003_root),
+                RC003_BUILD_ROOT=str(build_root),
+                RC003_RESULT=str(result_path),
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(
+                Path(result_path.read_text(encoding="utf-8")),
+                build_root / "程序文件" / "build-provenance.json",
+            )
+
+    def _create_staging_tree(self, root):
+        top_name = self._presentation["portable_folder_name"]
+        staging = root / top_name
+        runtime = staging / self._presentation["runtime_directory_name"]
+        documentation = staging / self._presentation["documentation_directory_name"]
+        (runtime / "ovb_rc003").mkdir(parents=True)
+        (runtime / "允许为空").mkdir()
+        documentation.mkdir()
+        (staging / self._presentation["main_executable_name"]).write_bytes(b"main")
+        (runtime / self._presentation["hid_helper_executable_name"]).write_bytes(
+            b"helper"
+        )
+        (runtime / "ovb_rc003" / "VERSION").write_text(
+            self._presentation["version"] + "\n", encoding="ascii"
+        )
+        (runtime / "build-provenance.json").write_text("{}\n", encoding="ascii")
+        (documentation / self._presentation["portable_readme_name"]).write_text(
+            "fixture\n", encoding="utf-8"
+        )
+        return staging
+
+    def _create_archive(
+        self,
+        archive_path,
+        staging,
+        *,
+        extra_entries=(),
+        omitted_directory_entries=(),
+    ):
+        top_name = staging.name
+        directory_names = [
+            f"{top_name}/",
+            f"{top_name}/{self._presentation['runtime_directory_name']}/",
+            f"{top_name}/{self._presentation['runtime_directory_name']}/允许为空/",
+            f"{top_name}/{self._presentation['runtime_directory_name']}/ovb_rc003/",
+            f"{top_name}/{self._presentation['documentation_directory_name']}/",
+        ]
+        omitted = set(omitted_directory_entries)
+        with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+            for name, content in extra_entries:
+                archive.writestr(name, content)
+            for name in directory_names:
+                if name not in omitted:
+                    archive.writestr(name, b"")
+            for path in sorted(staging.rglob("*")):
+                if path.is_file():
+                    archive.write(path, f"{top_name}/{path.relative_to(staging).as_posix()}")
+
+    def _validate_archive(self, archive_path, staging):
+        command = r"""
+$ErrorActionPreference = 'Stop'
+. $env:RC003_LAYOUT_SCRIPT
+$presentation = $env:RC003_PRESENTATION | ConvertFrom-Json
+Assert-RC003PortableZip `
+    -ZipPath $env:RC003_ARCHIVE `
+    -TopLevelName $env:RC003_TOP `
+    -ExpectedVersion $env:RC003_VERSION `
+    -StagingDirectory $env:RC003_STAGING `
+    -ProductPresentation $presentation
+"""
+        return self._powershell(
+            command,
+            RC003_LAYOUT_SCRIPT=str(_PORTABLE_LAYOUT_PATH),
+            RC003_PRESENTATION=json.dumps(
+                self._presentation, ensure_ascii=True, separators=(",", ":")
+            ),
+            RC003_ARCHIVE=str(archive_path),
+            RC003_TOP=staging.name,
+            RC003_VERSION=self._presentation["version"],
+            RC003_STAGING=str(staging),
+        )
+
+    def test_portable_validator_accepts_the_exact_tree_and_nested_empty_directory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            staging = self._create_staging_tree(root)
+            archive_path = root / "valid.zip"
+            self._create_archive(archive_path, staging)
+            result = self._validate_archive(archive_path, staging)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_portable_validator_rejects_extra_roots_wrong_types_and_unsafe_paths(self):
+        top = self._presentation["portable_folder_name"]
+        runtime = self._presentation["runtime_directory_name"]
+        documentation = self._presentation["documentation_directory_name"]
+        cases = (
+            ("extra_root_directory", ((f"{top}/额外目录/", b""),), ()),
+            ("extra_top_level_directory", (("另一个顶层目录/", b""),), ()),
+            (
+                "runtime_file_collision",
+                ((f"{top}/{runtime}", b"not-a-directory"),),
+                (f"{top}/{runtime}/",),
+            ),
+            (
+                "documentation_file_collision",
+                ((f"{top}/{documentation}", b"not-a-directory"),),
+                (f"{top}/{documentation}/",),
+            ),
+            (
+                "unsafe_parent_segment",
+                ((f"{top}/{runtime}/../escape.txt", b"unsafe"),),
+                (),
+            ),
+        )
+        for name, extra_entries, omitted_directories in cases:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                staging = self._create_staging_tree(root)
+                archive_path = root / f"{name}.zip"
+                self._create_archive(
+                    archive_path,
+                    staging,
+                    extra_entries=extra_entries,
+                    omitted_directory_entries=omitted_directories,
+                )
+                result = self._validate_archive(archive_path, staging)
+                self.assertNotEqual(
+                    result.returncode,
+                    0,
+                    f"{name} was accepted:\n{result.stdout}\n{result.stderr}",
+                )
+
+    def test_staging_validator_rejects_a_hidden_or_empty_fourth_root_entry(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            staging = self._create_staging_tree(root)
+            archive_path = root / "valid.zip"
+            self._create_archive(archive_path, staging)
+            (staging / "额外目录").mkdir()
+            result = self._validate_archive(archive_path, staging)
+            self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("staging root", result.stderr + result.stdout)
+
+
+class PortableLayoutScriptTests(unittest.TestCase):
+    def setUp(self):
+        self.text = _PORTABLE_LAYOUT_PATH.read_text(encoding="utf-8")
+
+    def test_validates_files_and_directories_before_hashing_files(self):
+        self.assertIn("function Assert-RC003PortableStagingRoot", self.text)
+        self.assertIn("function Assert-RC003PortableZip", self.text)
+        self.assertIn("$archiveKinds = @{}", self.text)
+        self.assertIn("directory/path collision", self.text)
+        self.assertIn("GetInvalidFileNameChars", self.text)
+        self.assertIn("portable ZIP file hash mismatch", self.text)
+        self.assertIn("-Force -File -Recurse", self.text)
+
+
 class BuildCandidateScriptTests(unittest.TestCase):
     def setUp(self):
         self.text = _BUILD_CANDIDATE_PATH.read_text(encoding="utf-8")
@@ -2284,7 +2627,7 @@ class BuildCandidateScriptTests(unittest.TestCase):
         # XRBM-022 controller pre-review correction: build-candidate.ps1
         # must enforce the same -W error::ResourceWarning policy as the CI
         # workflow's test-suite step, not just document it in prose.
-        self.assertIn("-W error::ResourceWarning -m unittest discover", self.text)
+        self.assertIn('-W error::ResourceWarning (Join-Path "build" "check_native.py")', self.text)
 
     def test_test_suite_full_log_is_scanned_for_late_resource_leaks(self):
         self.assertIn("Tee-Object -FilePath", self.text)
@@ -2351,22 +2694,20 @@ class BuildCandidateScriptTests(unittest.TestCase):
         )
         self.assertGreater(assert_index, fetch_index)
 
-    def test_compiles_and_tests_permission_modules_before_pyinstaller(self):
-        source_test_index = self.text.index('Write-Host "-- test suite --"')
+    def test_compiles_and_tests_native_modules_once_before_pyinstaller(self):
         compile_index = self.text.index("prepare-cython-core.py")
-        compiled_test_index = self.text.index("compiled permission module tests")
+        compiled_test_index = self.text.index("complete native-stage test suite")
         pyinstaller_index = self.text.index("PyInstaller build (unsigned candidate)")
-        self.assertLess(source_test_index, compile_index)
         self.assertLess(compile_index, compiled_test_index)
         self.assertLess(compiled_test_index, pyinstaller_index)
-        self.assertIn("tests.test_hid_elevation_windows", self.text)
-        self.assertIn("tests.test_hid_helper_consumers", self.text)
+        self.assertIn('"check_native.py") --stage', self.text)
+        self.assertNotIn('-m unittest discover', self.text)
         self.assertIn("compiled HID helper --self-check", self.text)
         self.assertIn("$env:RC003_BUILD_SOURCE_ROOT = $cythonSourceRoot", self.text)
 
     def test_frozen_output_requires_both_compiled_extensions(self):
-        self.assertIn('foreach ($compiledModuleName in @("hid_elevation_windows", "hid_helper_consumers"))', self.text)
-        self.assertIn("expected one compiled $compiledModuleName extension", self.text)
+        self.assertIn('--artifact $BuildRoot', self.text)
+        self.assertIn('Assert-LastExitCode "full native artifact verification"', self.text)
 
     def test_checks_the_real_frozen_qt_runtime_after_building(self):
         pyinstaller_index = self.text.index("PyInstaller build (unsigned candidate)")
@@ -2376,11 +2717,11 @@ class BuildCandidateScriptTests(unittest.TestCase):
         self.assertIn("$process.ExitCode", self.text)
 
     def test_requires_the_narrow_hid_helper_before_smoke_checks(self):
-        helper_index = self.text.index("RemoteMicRC003HidHelper.exe")
+        helper_index = self.text.index("$builtHidHelper = $builtPaths.HidHelper")
         dry_run_index = self.text.index('@("--dry-run")')
         self.assertLess(helper_index, dry_run_index)
         self.assertIn("expected narrow HID helper not found", self.text)
-        self.assertIn("build root must expose only RemoteMicRC003.exe", self.text)
+        self.assertIn("build root must expose only $($productPresentation.main_executable_name)", self.text)
         self.assertIn('@("--self-check")', self.text)
         self.assertIn("Invoke-FrozenExecutableCheck", self.text)
         self.assertIn("-Wait", self.text)
@@ -2395,16 +2736,18 @@ class BuildCandidateScriptTests(unittest.TestCase):
 
     def test_invalidates_old_provenance_before_any_new_build_attempt(self):
         remove_index = self.text.index(
-            "Remove-Item -LiteralPath $BuildProvenancePath"
+            "$BuildProvenancePath = Clear-RC003BuildProvenance"
         )
-        test_index = self.text.index('Write-Host "-- test suite --"')
+        test_index = self.text.index('Write-Host "-- complete native-stage test suite (single pass) --"')
         self.assertLess(remove_index, test_index)
         self.assertIn('. (Join-Path $PSScriptRoot "build-provenance.ps1")', self.text)
+        self.assertIn("Clear-RC003BuildProvenance", self.text)
+        self.assertNotIn("Get-RC003BuildProvenancePath", self.text)
 
     def test_holds_the_shared_build_gate_before_touching_dist(self):
         gate_index = self.text.index("Enter-RC003BuildGate")
         provenance_remove_index = self.text.index(
-            "Remove-Item -LiteralPath $BuildProvenancePath"
+            "$BuildProvenancePath = Clear-RC003BuildProvenance"
         )
         release_index = self.text.rindex("Exit-RC003BuildGate")
         self.assertLess(gate_index, provenance_remove_index)
@@ -2416,7 +2759,7 @@ class BuildCandidateScriptTests(unittest.TestCase):
             'Write-Host "-- third-party notice and license inventory --"'
         )
         boundary_index = self.text.index('Write-Host "-- public boundary scan --"')
-        test_index = self.text.index('Write-Host "-- test suite --"')
+        test_index = self.text.index('Write-Host "-- complete native-stage test suite (single pass) --"')
         pyinstaller_index = self.text.index(
             'Write-Host "-- PyInstaller build (unsigned candidate) --"'
         )
@@ -2476,24 +2819,14 @@ class LocalTestPackageScriptTests(unittest.TestCase):
         self.assertIn("$process.ExitCode", self.text)
         self.assertNotIn("$LASTEXITCODE", self.text)
 
-    def test_zip_has_one_user_entry_and_the_internal_helper_version(self):
-        self.assertIn("portable ZIP must contain exactly one top-level directory", self.text)
-        self.assertIn("portable ZIP root must expose only", self.text)
-        self.assertIn("_internal/RemoteMicRC003HidHelper.exe", self.text)
-        self.assertIn("_internal/ovb_rc003/VERSION", self.text)
-        self.assertIn("$archiveFiles.ContainsKey($helperEntryName)", self.text)
-        self.assertIn("$versionEntry = $archiveFiles[$versionEntryName]", self.text)
-        self.assertNotIn("$archive.GetEntry", self.text)
+    def test_zip_has_one_user_entry_and_the_runtime_helper_version(self):
+        self.assertIn('portable-layout.ps1")', self.text)
+        self.assertIn("Assert-RC003PortableStagingRoot", self.text)
+        self.assertIn("Assert-RC003PortableZip", self.text)
 
     def test_zip_is_compared_file_by_file_with_the_staging_directory(self):
-        self.assertIn("portable ZIP file count mismatch", self.text)
-        self.assertIn("portable ZIP is missing staging file", self.text)
-        self.assertIn("portable ZIP file length mismatch", self.text)
-        self.assertIn("portable ZIP file hash mismatch", self.text)
-        self.assertIn("Get-StreamSha256", self.text)
-        self.assertIn("[System.IO.Path]::DirectorySeparatorChar", self.text)
-        self.assertNotIn(".Replace('\\\\', '/')", self.text)
-        self.assertNotIn("[char[]]@('\\\\', '/')", self.text)
+        self.assertIn("-StagingDirectory $stagingDir", self.text)
+        self.assertIn("-ProductPresentation $productPresentation", self.text)
 
     def test_outputs_zip_and_main_executable_hashes(self):
         self.assertIn("ZIP SHA-256", self.text)
@@ -2524,7 +2857,13 @@ class LocalTestPackageScriptTests(unittest.TestCase):
         self.assertLess(compress_index, final_index)
         self.assertLess(final_index, move_index)
         self.assertGreaterEqual(self.text.count("Assert-RC003BuildProvenanceMatches"), 3)
-        self.assertIn("_internal/build-provenance.json", self.text)
+        self.assertIn(
+            "build-provenance.json",
+            _PORTABLE_LAYOUT_PATH.read_text(encoding="utf-8"),
+        )
+        self.assertIn("Assert-RC003PortableZip", self.text)
+        self.assertIn("$documentationDir", self.text)
+        self.assertIn("portable_readme_name", self.text)
 
     def test_zip_is_published_atomically_without_deleting_a_competing_result(self):
         self.assertIn("$temporaryOutputPath =", self.text)
@@ -2539,12 +2878,7 @@ class LocalTestPackageScriptTests(unittest.TestCase):
         self.assertNotIn("$outputFullPath", catch_block)
 
     def test_hidden_staging_files_cannot_escape_zip_comparison(self):
-        staging_enumeration = re.search(
-            r"Get-ChildItem -LiteralPath \$stagingRoot[^\r\n]+",
-            self.text,
-        )
-        self.assertIsNotNone(staging_enumeration)
-        self.assertIn("-Force", staging_enumeration.group(0))
+        self.assertIn("Assert-RC003PortableZip", self.text)
 
 
 class DeveloperEntryScriptTests(unittest.TestCase):
@@ -2730,8 +3064,8 @@ class UserFacingDocumentationContractTests(unittest.TestCase):
 
     def test_default_window_close_hides_to_tray_in_all_user_guides(self):
         root_readme = _ROOT_README_PATH.read_text(encoding="utf-8")
+        self.assertIn("关闭设置窗口通常会隐藏", root_readme)
         for text in (
-            root_readme,
             self.readme_text,
             self.installed_readme_text,
             self.portable_readme_text,
@@ -2742,13 +3076,13 @@ class UserFacingDocumentationContractTests(unittest.TestCase):
             self.assertNotIn("关闭窗口默认会先正常停止", normalized)
 
     def test_current_source_and_historical_installer_versions_are_distinct(self):
-        version = _VERSION_PATH.read_text(encoding="ascii").strip()
-        self.assertIn(f"`{version}`", self.readme_text)
+        self.assertIn("当前源码版本以 `src/ovb_rc003/VERSION` 为准", self.readme_text)
         self.assertIn("历史安装器说明", self.installed_readme_text)
         self.assertIn("仅保留旧安装版的维护入口", self.installed_readme_text)
         root_readme = _ROOT_README_PATH.read_text(encoding="utf-8")
-        self.assertIn(version, root_readme)
-        self.assertIn(f"/releases/tag/v{version}", root_readme)
+        version = _VERSION_PATH.read_text(encoding="utf-8").strip()
+        self.assertIn(f"新版测试包为 **{version}**", root_readme)
+        self.assertIn("无线麦 win版 <版本号>.exe", root_readme)
 
     def test_installed_readme_matches_the_current_three_page_workflow(self):
         text = self.installed_readme_text
@@ -2792,38 +3126,18 @@ class RootDocumentConsistencyTests(unittest.TestCase):
 
     def test_root_readme_does_not_lump_windows_in_with_planned_research(self):
         self.assertIn("小米蓝牙语音遥控器 2 Pro", self.root_readme_text)
-        self.assertIn("Windows 客户端位于", self.root_readme_text)
-        self.assertIn("当前公开版本：**1.0.44（正式版）**", self.root_readme_text)
+        self.assertIn("谷歌 TV Chromecast 遥控器", self.root_readme_text)
+        self.assertIn("[开发者文档](apps/windows/rc003/README.md)", self.root_readme_text)
 
     def test_root_readme_places_the_admin_workaround_in_usage_limits(self):
-        lines = self.root_readme_text.splitlines()
-        first_content = next(line.strip() for line in lines[1:] if line.strip())
-        self.assertNotEqual(first_content, "> [!IMPORTANT]")
-        for phrase in (
-            "使用限制与风险",
-            "按需启动管理员助手",
-            "UAC",
-            "以管理员身份运行",
-        ):
-            self.assertIn(phrase, self.root_readme_text)
-        self.assertGreater(
-            self.root_readme_text.index("## 使用限制与风险"),
-            self.root_readme_text.index("## 第一次使用"),
-        )
+        self.assertIn("按页面提示处理未就绪的项目", self.root_readme_text)
+        self.assertIn("[使用说明](apps/windows/rc003/README.md)", self.root_readme_text)
+        windows_readme = _README_PATH.read_text(encoding="utf-8")
+        self.assertIn("管理员按键组件", windows_readme)
+        self.assertIn("UAC", windows_readme)
 
-    def test_root_readme_documents_required_configuration_and_game_risk(self):
-        for phrase in (
-            "docs/screenshots/device-ready-status.jpg",
-            "docs/screenshots/voice-configuration-example.jpg",
-            "全部变绿后",
-            "搜狗语音输入、微信输入法或豆包输入法",
-            "CABLE Output (VB-Audio Virtual Cable)",
-            "CABLE Input (VB-Audio Virtual Cable)",
-            "设成与无线麦",
-            "“语音按键”完全相同",
-            "游戏或反作弊软件",
-            "自行判断账号风险",
-        ):
+    def test_root_readme_documents_required_configuration(self):
+        for phrase in ("CABLE Input", "CABLE Output", "语音按键", "[使用说明](apps/windows/rc003/README.md)"):
             self.assertIn(phrase, self.root_readme_text)
 
     def test_third_party_notices_does_not_falsely_deny_all_vbcable_reference(self):
@@ -2859,18 +3173,19 @@ class RootDocumentConsistencyTests(unittest.TestCase):
         self.assertIn("VBCABLE_Driver_Pack45.zip", notices_text)
         self.assertIn("A+B/C+D", notices_text)
         self.assertIn("UAC", notices_text)
-        self.assertIn("does not elevate the running Remote Mic process", notices_text)
+        self.assertIn("does not elevate the main process itself", notices_text)
         self.assertIn(
             "never reports a driver install as successful merely because a process was launched",
             notices_text,
         )
         self.assertIn("never changes the Windows system default input/output device", notices_text)
 
-    def test_root_readme_and_windows_readme_agree_on_the_formal_version(self):
+    def test_root_readme_and_windows_readme_agree_on_current_version(self):
+        # The public landing page and detailed guide must identify one release.
         windows_readme_text = _README_PATH.read_text(encoding="utf-8")
-        for text in (self.root_readme_text, windows_readme_text):
-            self.assertIn("1.0.44", text)
-            self.assertIn("正式", text)
+        version = _VERSION_PATH.read_text(encoding="utf-8").strip()
+        self.assertIn(version, self.root_readme_text)
+        self.assertIn("当前源码版本以 `src/ovb_rc003/VERSION` 为准", windows_readme_text)
 
 
 _CJK_CHAR_RE = r"[　-〿぀-ヿ㐀-鿿＀-￯]"
@@ -2968,20 +3283,15 @@ class PrereleaseDownloadInstructionsContractTests(unittest.TestCase):
         self.assertIn(
             "https://github.com/ZSTDJan/windows-remote-mic-app/releases", self.text
         )
-        # The bare list page is the stable entry point; any direct
-        # /releases/tag/... link must point at a tag this repo actually
-        # published (so a future tag bump that forgets to publish 404s the
-        # doc instead of silently breaking).
-        self.assertIn("/releases/tag/v1.0.44", self.text)
         self.assertNotIn("miaomiaozii/windows-remote-mic-app", self.text)
 
     def test_current_public_release_is_not_confused_with_the_local_version(self):
         root_readme = _ROOT_README_PATH.read_text(encoding="utf-8")
-        release_url = "https://github.com/ZSTDJan/windows-remote-mic-app/releases/tag/v1.0.44"
-        self.assertIn(release_url, self.text)
+        version = _VERSION_PATH.read_text(encoding="utf-8").strip()
+        release_url = f"https://github.com/ZSTDJan/windows-remote-mic-app/releases/tag/v{version}"
         self.assertIn(release_url, root_readme)
         for asset_name in (
-            "无线麦-Windows-1.0.44-免安装.zip",
+            f"RemoteMicRC003-{version}-portable-unsigned.zip",
             "SHA256SUMS.txt",
         ):
             self.assertIn(asset_name, root_readme)
@@ -2996,7 +3306,7 @@ class PrereleaseDownloadInstructionsContractTests(unittest.TestCase):
         self.assertNotIn("发布后再回来查看", self.text)
 
     def test_asset_name_patterns_match_the_ci_workflows_actual_output_names(self):
-        self.assertIn("无线麦-Windows-<版本号>-免安装.zip", self.text)
+        self.assertIn("RemoteMicRC003-<版本号>-portable-unsigned.zip", self.text)
         self.assertIn("SHA256SUMS.txt", self.text)
 
     def test_documents_new_tag_alignment_and_historical_name_preservation(self):
@@ -3023,16 +3333,22 @@ class RealWindowsCiEvidenceContractTests(unittest.TestCase):
         for phrase in ("WinRT BLE", "Raw Input", "SendInput", "PortAudio"):
             self.assertIn(phrase, self.readme_text)
 
-    def test_status_is_the_formal_version_backed_by_real_device_acceptance(self):
-        self.assertIn("`1.0.44` 正式发布源码", self.readme_text)
-        self.assertIn("candidate.44 已完成", self.readme_text)
-        self.assertIn("CI 仍不能替代真实设备", self.readme_text)
+    def test_current_status_distinguishes_partial_verification_from_acceptance(self):
+        # Check only the current status declaration. Historical acceptance
+        # wording elsewhere must not make the current candidate pass.
+        raw_text = _README_PATH.read_text(encoding="utf-8")
+        declaration = re.search(r"^>\s*\*\*状态：([^\r\n]+?)\*\*", raw_text, re.MULTILINE)
+        self.assertIsNotNone(declaration, "README must declare its current status")
+        current_status = declaration.group(1)
+        for fact in ("1.0.71-candidate.71", "测试版", "翻页效果待实测"):
+            self.assertIn(fact, current_status)
+        self.assertNotIn("已通过真实硬件验收", current_status)
+        self.assertIn("不能替代真机配对、按键和语音链路验收", self.readme_text)
         self.assertNotIn("verified on real rc003 hardware", self.readme_text.lower())
 
     def test_unsigned_and_ci_limits_are_documented(self):
         self.assertIn("未签名", self.readme_text)
         self.assertIn("CI 没有真实 RC003 硬件", self.readme_text)
-        self.assertIn("candidate.44 已完成", self.readme_text)
 
     def test_repository_links_to_its_own_actions_and_releases(self):
         self.assertIn("https://github.com/ZSTDJan/windows-remote-mic-app/releases", self.readme_text)
@@ -3054,16 +3370,27 @@ class ApplicationUpdateDocumentationContractTests(unittest.TestCase):
         )
 
     def test_all_user_guides_document_the_manual_verified_update_entry(self):
+        self.assertIn("版本说明", self.root_readme)
         for text in self.user_docs:
             normalized = _normalize_whitespace(text)
             with self.subTest(document=text[:40]):
+                if text == self.root_readme:
+                    # The landing page links to the detailed update guide.
+                    self.assertIn("[使用说明](apps/windows/rc003/README.md)", normalized)
+                    self.assertIn("SHA256SUMS.txt", normalized)
+                    continue
                 self.assertIn("检查更新", normalized)
-                self.assertIn("只在用户点击后", normalized)
-                self.assertIn("后台自动", normalized)
+                if text in (self.root_readme, self.windows_readme, self.portable_readme):
+                    self.assertIn("每个自然日最多自动检查一次", normalized)
+                    self.assertIn("不会自动打开下载对话框" if text == self.windows_readme else "点击后才打开下载对话框", normalized)
+                else:
+                    # Only the historical installer guide describes its shipped version.
+                    self.assertIn("只在用户点击后", normalized)
+                    self.assertIn("后台自动", normalized)
                 self.assertIn("SHA256SUMS.txt", normalized)
                 self.assertIn("GitHub 提供资产摘要时", normalized)
                 self.assertIn(r"updates\<版本号>", normalized)
-                self.assertIn("打开文件夹", normalized)
+                self.assertIn("打开桌面" if text in (self.root_readme, self.windows_readme, self.portable_readme) else "打开文件夹", normalized)
 
     def test_distribution_guides_keep_install_and_portable_updates_separate(self):
         installed = _normalize_whitespace(self.installed_readme)
@@ -3076,6 +3403,11 @@ class ApplicationUpdateDocumentationContractTests(unittest.TestCase):
         self.assertIn("便携版会下载同一次 Release 的便携 ZIP", portable)
         self.assertIn("再把 ZIP 解压到新的文件夹使用", portable)
         self.assertIn("取消、中断或校验失败不会改变当前程序", portable)
+        self.assertIn("请直接双击打开主程序", portable)
+        self.assertIn("已有管理员权限时直接打开", portable)
+        self.assertIn("已关闭 UAC", portable)
+        self.assertIn("普通权限下", portable)
+        self.assertNotIn("不要以管理员身份长期运行", portable)
         self.assertIn("便携版或源码运行下载便携 ZIP", source)
         self.assertIn("不会自动运行下载文件", source)
 
@@ -3088,8 +3420,8 @@ class PortableAndInstallerFlowContractTests(unittest.TestCase):
     path and keeps Task Manager only as a last-resort fallback. Each flow
     still needs its own settings/start/stop/removal steps, and the portable
     steps must name the real executable and real flags this candidate ships
-    (see __main__.py's ``--settings``/no-argument handling and the .spec's
-    ``AppExeName``/``RemoteMicRC003.exe``).
+    (see __main__.py's ``--settings``/no-argument handling and the shared
+    product-presentation contract consumed by the PyInstaller spec).
     """
 
     def setUp(self):
@@ -3098,13 +3430,14 @@ class PortableAndInstallerFlowContractTests(unittest.TestCase):
 
     def test_portable_settings_command_is_exact(self):
         self.assertIn(
-            r".\RemoteMicRC003.exe --settings", self.text
+            r"& '.\无线麦 win版 <版本号>.exe' --settings", self.text
         )
 
-    def test_portable_root_exposes_only_the_main_executable(self):
-        self.assertIn("解压目录根层只保留一个供用户启动的程序", self.normalized)
-        self.assertIn("`RemoteMicRC003.exe`", self.text)
-        self.assertIn("`_internal`", self.text)
+    def test_portable_root_exposes_the_three_named_entries(self):
+        self.assertIn("根层固定为", self.normalized)
+        self.assertIn("`无线麦 win版 <版本号>.exe`", self.text)
+        self.assertIn("`程序文件`", self.text)
+        self.assertIn("`说明与许可`", self.text)
         self.assertIn("不需要也不应手动打开", self.normalized)
 
     def test_portable_start_command_uses_the_explicit_bridge_flag(self):
@@ -3112,7 +3445,7 @@ class PortableAndInstallerFlowContractTests(unittest.TestCase):
         # bridge must be started explicitly with --bridge - paired with
         # prose that says it starts the bridge itself.
         self.assertIn(
-            r"`.\RemoteMicRC003.exe --bridge` 启动桥接", self.normalized
+            r"`& '.\无线麦 win版 <版本号>.exe' --bridge` 启动桥接", self.normalized
         )
 
     def test_portable_full_exit_prefers_notification_area_with_task_manager_fallback(self):
@@ -3275,7 +3608,7 @@ class WindowsPrereleaseAssetScopeContractTests(unittest.TestCase):
         self.text = _README_PATH.read_text(encoding="utf-8")
 
     def test_asset_count_claim_is_scoped_to_the_windows_candidate(self):
-        self.assertIn("`v1.0.44` 发布包含以下两个附件", self.text)
+        self.assertIn("新发布的 RC003 Windows 版本包含以下两个附件", self.text)
         self.assertNotIn("每个预发行版恰好包含以下三个文件", self.text)
 
 

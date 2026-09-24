@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import List, Optional, Sequence
+from typing import List, Optional, Sequence, Tuple
 
 VOICE_SERVICE_UUID = "AB5E0001-5A21-4F05-BC7D-AF01F617B664"
 VOICE_TX_UUID = "AB5E0002-5A21-4F05-BC7D-AF01F617B664"
@@ -217,16 +217,49 @@ class FrameAccumulator:
 
     def __init__(self) -> None:
         self._pending = bytearray()
+        self._pending_origins: List[Optional[int]] = []
 
     def append(self, data: bytes, frame_size: int) -> List[bytes]:
+        return [
+            frame
+            for frame, _origin in self.append_with_origin(
+                data,
+                frame_size,
+                origin=None,
+            )
+        ]
+
+    def append_with_origin(
+        self,
+        data: bytes,
+        frame_size: int,
+        *,
+        origin: Optional[int],
+    ) -> List[Tuple[bytes, Optional[int]]]:
+        """Return frames tagged with their oldest contributing notification.
+
+        A codec frame may span multiple BLE notifications.  The oldest origin
+        is therefore the safe admission boundary for the whole decoded frame.
+        """
+
         if frame_size <= 0:
             return []
         self._pending.extend(data)
-        frames: List[bytes] = []
+        self._pending_origins.extend([origin] * len(data))
+        frames: List[Tuple[bytes, Optional[int]]] = []
         while len(self._pending) >= frame_size:
-            frames.append(bytes(self._pending[:frame_size]))
+            frame_origins = self._pending_origins[:frame_size]
+            numeric_origins = [item for item in frame_origins if item is not None]
+            frames.append(
+                (
+                    bytes(self._pending[:frame_size]),
+                    min(numeric_origins) if numeric_origins else None,
+                )
+            )
             del self._pending[:frame_size]
+            del self._pending_origins[:frame_size]
         return frames
 
     def reset(self) -> None:
         self._pending.clear()
+        self._pending_origins.clear()

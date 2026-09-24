@@ -1,6 +1,6 @@
 """Privacy-safe focus/result diagnostics for Windows voice input.
 
-Only handles, process IDs, class names, and text lengths are observed. Window
+Only handles, process IDs, class names, native input metadata and text lengths are observed. Window
 titles and user text are deliberately never read or logged.
 """
 
@@ -50,6 +50,10 @@ class FocusSnapshot:
     process_query_status: str = "unavailable"
     keyboard_layout: int = 0
     foreground_stable: bool = False
+    focus_editable: Optional[bool] = None
+    focus_read_only: Optional[bool] = None
+    focus_native_caret_detected: Optional[bool] = None
+    focus_input_status: str = "unknown"
 
 
 @dataclass(frozen=True)
@@ -81,6 +85,41 @@ def _window_text_length(user32, hwnd: int) -> Optional[int]:
         ctypes.byref(result),
     )
     return int(result.value) if delivered else None
+
+
+def _focus_input_state(user32, focus: int, class_name: str, info,
+                       gui_info_ok: bool, stable: bool) -> dict:
+    """Best-effort native metadata, never a verdict on user error or IME readiness."""
+    result = dict(focus_editable=None, focus_read_only=None,
+                  focus_native_caret_detected=None, focus_input_status="unknown")
+    if not stable:
+        result["focus_input_status"] = "foreground_changed"
+        return result
+    if not gui_info_ok or not focus or int(info.hwndFocus or 0) != focus:
+        result["focus_input_status"] = "focus_unavailable"
+        return result
+    # False means no native caret observed on this focus, not no text cursor:
+    # browsers and other custom controls can draw their own caret.
+    result["focus_native_caret_detected"] = int(info.hwndCaret or 0) == focus
+    if class_name.casefold() not in {
+        "edit", "richedit", "richedit20a", "richedit20w", "richedit50w",
+        "richeditd2dpt",
+    }:
+        result["focus_input_status"] = "unsupported_control"
+        return result
+    try:
+        ctypes.set_last_error(0)
+        style = int(user32.GetWindowLongW(wintypes.HWND(focus), -16))
+        if not style and ctypes.get_last_error():
+            result["focus_input_status"] = "style_unavailable"
+            return result
+        read_only = bool(style & 0x0800)  # ES_READONLY, also used by Rich Edit.
+        result.update(focus_read_only=read_only,
+                      focus_editable=not read_only and not bool(style & 0x08000000),
+                      focus_input_status="native_edit_style")  # WS_DISABLED
+    except (AttributeError, OSError, ValueError):
+        result["focus_input_status"] = "style_unavailable"
+    return result
 
 
 def _process_basename(process_id: int) -> tuple[str, str]:
@@ -140,6 +179,8 @@ def _capture_windows_focus(*, include_text_length: bool = True) -> FocusSnapshot
     user32.SendMessageTimeoutW.restype = wintypes.LPARAM
     user32.GetKeyboardLayout.argtypes = (wintypes.DWORD,)
     user32.GetKeyboardLayout.restype = wintypes.HANDLE
+    user32.GetWindowLongW.argtypes = (wintypes.HWND, ctypes.c_int)
+    user32.GetWindowLongW.restype = wintypes.LONG
 
     foreground = user32.GetForegroundWindow()
     if not foreground:
@@ -149,26 +190,34 @@ def _capture_windows_focus(*, include_text_length: bool = True) -> FocusSnapshot
     info = _GuiThreadInfo()
     info.cbSize = ctypes.sizeof(_GuiThreadInfo)
     focus = int(foreground)
-    if thread_id and user32.GetGUIThreadInfo(thread_id, ctypes.byref(info)):
+    gui_info_ok = bool(thread_id and user32.GetGUIThreadInfo(thread_id, ctypes.byref(info)))
+    if gui_info_ok:
         focus = int(info.hwndFocus or foreground)
     try:
         executable, process_status = _process_basename(int(process_id.value))
     except (OSError, AttributeError, ValueError):
         executable, process_status = "", "query_failed"
     layout = int(user32.GetKeyboardLayout(thread_id) or 0) if thread_id else 0
+    focus_class = _window_class_name(user32, focus)
+    text_length = _window_text_length(user32, focus) if include_text_length else None
+    input_state = _focus_input_state(user32, focus, focus_class, info, gui_info_ok, True)
+    stable = int(user32.GetForegroundWindow() or 0) == int(foreground)
+    if not stable:
+        input_state = _focus_input_state(user32, focus, focus_class, info, gui_info_ok, False)
     return FocusSnapshot(
         supported=True,
         foreground_pid=int(process_id.value),
         foreground_class=_window_class_name(user32, int(foreground)),
         focus_handle=focus,
-        focus_class=_window_class_name(user32, focus),
-        text_length=_window_text_length(user32, focus) if include_text_length else None,
+        focus_class=focus_class,
+        text_length=text_length,
         foreground_handle=int(foreground),
         foreground_thread_id=int(thread_id),
         foreground_executable=executable,
         process_query_status=process_status,
         keyboard_layout=layout,
-        foreground_stable=int(user32.GetForegroundWindow() or 0) == int(foreground),
+        foreground_stable=stable,
+        **input_state,
     )
 
 
@@ -195,6 +244,10 @@ def context_fields(snapshot: FocusSnapshot) -> dict:
                 foreground_stable=snapshot.foreground_stable,
                 foreground_is_app=snapshot.foreground_pid == os.getpid(),
                 focus_handle=snapshot.focus_handle, focus_class=snapshot.focus_class,
+                focus_editable=snapshot.focus_editable,
+                focus_read_only=snapshot.focus_read_only,
+                focus_native_caret_detected=snapshot.focus_native_caret_detected,
+                focus_input_status=snapshot.focus_input_status,
                 keyboard_layout=snapshot.keyboard_layout,
                 input_method_identity="not_inferred_from_layout",
                 observation_status=snapshot.error or "captured")
@@ -210,6 +263,7 @@ class ContextTimeline:
         self.deadline = 0.0
         self.next_sample = 0.0
         self.previous = None
+        self.last_observation = 0.0
         self.context = {}
         self.voice_active = False
 
@@ -249,10 +303,15 @@ class ContextTimeline:
             fields['environment_status'] = 'capture_failed'
         fields['observation_stage'] = ('voice_active' if self.voice_active else
                                        'after_voice' if self.context.get('attempt_id') else 'mapping')
-        if fields == self.previous:
+        # Sampling timestamps describe freshness, not a change in the environment.
+        comparison = {key: value for key, value in fields.items() if key not in {
+            "process_sample_monotonic_ms", "response_sample_monotonic_ms"}}
+        unchanged = comparison == self.previous
+        if unchanged and now - self.last_observation < 5.0:
             return None
-        phase = "initial" if self.previous is None else "changed"
-        self.previous = fields
+        phase = "initial" if self.previous is None else "heartbeat" if unchanged else "changed"
+        self.previous = comparison
+        self.last_observation = now
         return dict(self.context, **fields, phase=phase, sampling_interval_ms=250,
                     observation_scope="local_input_environment", target_response="unknown")
 

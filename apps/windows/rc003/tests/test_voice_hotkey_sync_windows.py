@@ -1,6 +1,8 @@
 import json
+import os
 from pathlib import Path
 import tempfile
+import threading
 import unittest
 from unittest import mock
 
@@ -150,6 +152,80 @@ class SogouVoiceHotkeyTests(unittest.TestCase):
         )
         self.assertTrue(saved["setting"]["longPressEnabled"])
         self.assertEqual(saved["unrelated"], {"keep": True})
+        self.assertIsNotNone(result.write_receipt)
+
+    def test_guarded_restore_recovers_exact_original_provider_document(self):
+        original = {
+            "setting": {
+                "shortcutKeysPress": ["LeftCtrl", "LeftShift", "F7"],
+                "longPressEnabled": False,
+                "freespeakEnabled": True,
+            },
+            "unrelated": {"keep": "original"},
+        }
+        self.path.write_text(
+            json.dumps(original, ensure_ascii=False, indent="\t") + "\n",
+            encoding="utf-8",
+        )
+        original_bytes = self.path.read_bytes()
+        with mock.patch.object(
+            voice_hotkey_sync_windows,
+            "_sogou_voice_process_running",
+            return_value=False,
+        ):
+            written = voice_hotkey_sync_windows.sync_provider_hotkey(
+                "sogou",
+                "lctrl+lshift+f9",
+                platform="win32",
+                appdata=self.appdata,
+            )
+            restored = voice_hotkey_sync_windows.restore_provider_write(
+                "sogou",
+                written.write_receipt,
+                platform="win32",
+                appdata=self.appdata,
+            )
+
+        self.assertTrue(written.ok)
+        self.assertTrue(restored.ok)
+        self.assertEqual(restored.hotkey, "lctrl+lshift+f7")
+        self.assertEqual(self.path.read_bytes(), original_bytes)
+
+    def test_guarded_restore_preserves_newer_external_document(self):
+        with mock.patch.object(
+            voice_hotkey_sync_windows,
+            "_sogou_voice_process_running",
+            return_value=False,
+        ):
+            written = voice_hotkey_sync_windows.sync_provider_hotkey(
+                "sogou",
+                "lctrl+lshift+f9",
+                platform="win32",
+                appdata=self.appdata,
+            )
+            newer = {
+                "setting": {
+                    "shortcutKeysPress": ["RightCtrl"],
+                    "longPressEnabled": False,
+                    "freespeakEnabled": True,
+                },
+                "unrelated": {"keep": "external"},
+            }
+            self.path.write_text(
+                json.dumps(newer, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            newer_bytes = self.path.read_bytes()
+            restored = voice_hotkey_sync_windows.restore_provider_write(
+                "sogou",
+                written.write_receipt,
+                platform="win32",
+                appdata=self.appdata,
+            )
+
+        self.assertFalse(restored.ok)
+        self.assertEqual(restored.code, "conflict")
+        self.assertEqual(self.path.read_bytes(), newer_bytes)
 
     def test_writes_sogou_with_its_native_win_and_direction_names(self):
         with mock.patch.object(
@@ -207,6 +283,95 @@ class SogouVoiceHotkeyTests(unittest.TestCase):
         self.assertEqual(result.code, "process_check_failed")
         self.assertEqual(self.path.read_bytes(), before)
 
+    def test_cancelled_sogou_sync_does_not_replace_the_provider_file(self):
+        before = self.path.read_bytes()
+        cancellation = threading.Event()
+        cancellation.set()
+        with mock.patch.object(
+            voice_hotkey_sync_windows,
+            "_sogou_voice_process_running",
+            return_value=False,
+        ), mock.patch.object(
+            voice_hotkey_sync_windows,
+            "_replace_bytes_atomically",
+        ) as replace:
+            result = voice_hotkey_sync_windows.sync_provider_hotkey(
+                "sogou",
+                "lctrl+lshift+f9",
+                platform="win32",
+                appdata=self.appdata,
+                cancel_event=cancellation,
+            )
+
+        self.assertFalse(result.ok)
+        self.assertEqual(result.code, "cancelled")
+        self.assertEqual(self.path.read_bytes(), before)
+        replace.assert_not_called()
+
+    def test_sogou_sync_rechecks_cancellation_immediately_before_replace(self):
+        before = self.path.read_bytes()
+        cancellation = threading.Event()
+        cancellation.set()
+        with mock.patch.object(os, "replace") as replace:
+            with self.assertRaises(
+                voice_hotkey_sync_windows._ProviderWriteCancelled
+            ):
+                voice_hotkey_sync_windows._replace_bytes_atomically(
+                    self.path,
+                    b"replacement",
+                    cancel_event=cancellation,
+                )
+
+        self.assertEqual(self.path.read_bytes(), before)
+        replace.assert_not_called()
+
+    def test_sogou_rollback_rejects_a_newer_file_receipt(self):
+        before = self.path.read_bytes()
+        with mock.patch.object(
+            voice_hotkey_sync_windows,
+            "_sogou_voice_process_running",
+            return_value=False,
+        ), mock.patch.object(
+            voice_hotkey_sync_windows,
+            "_replace_bytes_atomically",
+        ) as replace:
+            result = voice_hotkey_sync_windows.sync_provider_hotkey(
+                "sogou",
+                "rctrl",
+                platform="win32",
+                appdata=self.appdata,
+                expected_current_sha256="not-the-current-file",
+            )
+
+        self.assertFalse(result.ok)
+        self.assertEqual(result.code, "conflict")
+        self.assertEqual(self.path.read_bytes(), before)
+        replace.assert_not_called()
+
+    def test_sogou_rollback_rejects_a_newer_external_shortcut(self):
+        before = self.path.read_bytes()
+        with mock.patch.object(
+            voice_hotkey_sync_windows,
+            "_sogou_voice_process_running",
+            return_value=False,
+        ), mock.patch.object(
+            voice_hotkey_sync_windows,
+            "_replace_bytes_atomically",
+        ) as replace:
+            result = voice_hotkey_sync_windows.sync_provider_hotkey(
+                "sogou",
+                "rctrl",
+                platform="win32",
+                appdata=self.appdata,
+                expected_current="lctrl+lshift+f9",
+            )
+
+        self.assertFalse(result.ok)
+        self.assertEqual(result.code, "conflict")
+        self.assertEqual(result.hotkey, "lctrl+lshift+f7")
+        self.assertEqual(self.path.read_bytes(), before)
+        replace.assert_not_called()
+
     def test_reports_sogou_config_read_permission_error_without_raising(self):
         with mock.patch.object(
             Path,
@@ -243,12 +408,12 @@ class SogouVoiceHotkeyTests(unittest.TestCase):
                 )
             return real_read(appdata=appdata)
 
-        def replace_with_rollback_failure(path, content):
+        def replace_with_rollback_failure(path, content, **kwargs):
             nonlocal replace_count
             replace_count += 1
             if replace_count == 2:
                 raise OSError("rollback locked")
-            real_replace(path, content)
+            real_replace(path, content, **kwargs)
 
         with mock.patch.object(
             voice_hotkey_sync_windows,
@@ -273,6 +438,52 @@ class SogouVoiceHotkeyTests(unittest.TestCase):
         self.assertFalse(result.ok)
         self.assertEqual(result.code, "rollback_failed")
         self.assertEqual(result.hotkey, "lctrl+lshift+f9")
+
+    def test_failed_write_does_not_overwrite_a_newer_external_change(self):
+        real_read = voice_hotkey_sync_windows._read_sogou_hotkey
+        external_document = dict(self.document)
+        external_document["setting"] = dict(self.document["setting"])
+        external_document["setting"]["shortcutKeysPress"] = ["LeftCtrl", "F11"]
+        read_count = 0
+
+        def read_with_external_change(*, appdata):
+            nonlocal read_count
+            read_count += 1
+            if read_count == 1:
+                self.path.write_text(
+                    json.dumps(external_document, ensure_ascii=False),
+                    encoding="utf-8",
+                )
+                return voice_hotkey_sync_windows.VoiceHotkeySyncResult(
+                    "sogou", False, "read_failed", message="verification failed"
+                )
+            return real_read(appdata=appdata)
+
+        with mock.patch.object(
+            voice_hotkey_sync_windows,
+            "_sogou_voice_process_running",
+            return_value=False,
+        ), mock.patch.object(
+            voice_hotkey_sync_windows,
+            "_read_sogou_hotkey",
+            side_effect=read_with_external_change,
+        ):
+            result = voice_hotkey_sync_windows.sync_provider_hotkey(
+                "sogou",
+                "lctrl+lshift+f9",
+                platform="win32",
+                appdata=self.appdata,
+            )
+
+        self.assertFalse(result.ok)
+        self.assertEqual(result.code, "rollback_failed")
+        self.assertEqual(result.hotkey, "lctrl+f11")
+        self.assertEqual(
+            json.loads(self.path.read_text(encoding="utf-8"))["setting"][
+                "shortcutKeysPress"
+            ],
+            ["LeftCtrl", "F11"],
+        )
 
 
 class WeTypeVoiceHotkeyTests(unittest.TestCase):
@@ -443,6 +654,37 @@ class DoubaoVoiceHotkeyTests(unittest.TestCase):
         self.assertTrue(result.ok)
         self.assertEqual(result.code, "read")
         self.assertEqual(result.hotkey, "ralt")
+
+    def test_reads_doubao_handsfree_shortcut_without_reusing_hold(self):
+        self.path.write_text(
+            json.dumps(
+                {
+                    "voice": {
+                        "voiceLongPressShortcut": {
+                            "modifierFlags": 2049,
+                            "keyCode": 0,
+                        },
+                        "voiceShortcut": {
+                            "modifierFlags": 0x1004,
+                            "keyCode": 0x78,
+                        },
+                    }
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+
+        hold = voice_hotkey_sync_windows.read_provider_hotkey(
+            "doubao_ime", platform="win32", appdata=self.appdata
+        )
+        toggle = voice_hotkey_sync_windows.read_provider_hotkey(
+            "doubao_ime", platform="win32", appdata=self.appdata, trigger="toggle"
+        )
+
+        self.assertEqual(hold.hotkey, "ralt")
+        self.assertEqual(toggle.hotkey, "lshift+f9")
+        self.assertIn("免按模式", toggle.message)
 
     def test_reads_every_sided_doubao_modifier(self):
         cases = (

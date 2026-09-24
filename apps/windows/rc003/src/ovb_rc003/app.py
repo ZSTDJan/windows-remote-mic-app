@@ -59,6 +59,8 @@ from . import (
     audio_output,
     audio_playback,
     audio_playback_worker,
+    voice_audio_session,
+    voice_shortcut_session,
     action_executor,
     ble_transport_winrt,
     bridge_launcher,
@@ -66,6 +68,8 @@ from . import (
     bridge_tray_windows,
     button_combo,
     button_gesture,
+    chromecast_host_activity,
+    chromecast_runtime,
     config,
     connection_supervisor,
     diagnostic_trace,
@@ -79,6 +83,7 @@ from . import (
     key_mapping,
     logging_setup,
     raw_input_windows,
+    rc003_doubao_session,
     remote_selection,
     voice_key_physicalizer_windows,
     voice_controller,
@@ -90,6 +95,16 @@ from . import (
     win32_keys,
 )
 from .atvv_session import AudioStarted, AudioStopped, CapsReceived, MicButtonPressed, PcmStats
+
+
+from .voice_shortcut_session import (
+    _VOICE_HOTKEY_RELEASE_RETRY_INITIAL_SECONDS,
+    _VOICE_HOTKEY_RELEASE_RETRY_MAX_SECONDS,
+    _VOICE_HOTKEY_BACKEND_MARKED,
+    _VOICE_HOTKEY_BACKEND_WETYPE,
+    _VOICE_HOTKEY_BACKEND_DOUBAO,
+    _INPUT_PROFILE_VOICE_HOTKEY_BACKENDS
+)
 
 
 class CleanupIncompleteError(RuntimeError):
@@ -121,8 +136,7 @@ _BUTTON_ACTION_MOUSE_BUTTONS = {
     key_mapping.ActionKind.MOUSE_X2_CLICK: "x2",
 }
 
-# Semantic tap mappings only. Custom key combinations retain their native
-# semantics and RC003 physical-edge correlation remains a separate concern.
+# Semantic tap mappings only. RC003 physical-edge correlation is separate.
 _BUTTON_ACTION_NAVIGATION_VKS = {
     key_mapping.ActionKind.ARROW_UP: 0x26,
     key_mapping.ActionKind.ARROW_DOWN: 0x28,
@@ -133,6 +147,16 @@ _BUTTON_ACTION_NAVIGATION_VKS = {
     key_mapping.ActionKind.CONTEXT_MENU: 0x5D,
     key_mapping.ActionKind.SYSTEM_VOLUME_UP: 0xAF,
     key_mapping.ActionKind.SYSTEM_VOLUME_DOWN: 0xAE,
+}
+
+# The remote has no dedicated parent/child actions. A user-mapped, unmodified
+# PageUp/PageDown tap keeps those navigation steps available without claiming
+# the computer keyboard or changing multi-key shortcut semantics.
+_BUTTON_NAVIGATION_SINGLE_KEYS = {
+    ("pageup",): 0x21,
+    ("page_up",): 0x21,
+    ("pagedown",): 0x22,
+    ("page_down",): 0x22,
 }
 
 _RAW_FALLBACK_KEY_TOKENS = {
@@ -161,19 +185,16 @@ _KEY_DETECTION_SUPPRESSION_MAX_SECONDS = 2.0
 _RUNTIME_STATUS_HEARTBEAT_SECONDS = 5.0
 _VOICE_HOLD_SAFETY_SECONDS = 120.0
 _VOICE_KEY_PHYSICALIZER_RETRY_SECONDS = 1.0
+_VOICE_KEY_PHYSICALIZER_DEGRADED_RETRY_WINDOW_SECONDS = 10.0
 _RAW_INPUT_RETRY_INITIAL_SECONDS = 1.0
 _RAW_INPUT_RETRY_MAX_SECONDS = 30.0
 _BUTTON_INPUT_RELEASE_RETRY_INITIAL_SECONDS = 0.1
 _BUTTON_INPUT_RELEASE_RETRY_MAX_SECONDS = 2.0
-_VOICE_HOTKEY_RELEASE_RETRY_INITIAL_SECONDS = 0.1
-_VOICE_HOTKEY_RELEASE_RETRY_MAX_SECONDS = 2.0
+_DOUBAO_HOST_READY_TIMEOUT_SECONDS = 3.0
+_DOUBAO_HOST_READY_POLL_SECONDS = 0.05
+_DOUBAO_PROCESS_READY_TIMEOUT_SECONDS = 2.0
+_DOUBAO_ATTEMPT_JOIN_TIMEOUT_SECONDS = 3.5
 _DIRECTION_BUTTON_IDS = frozenset({"up", "down", "left", "right"})
-_VOICE_HOTKEY_BACKEND_MARKED = "marked_keybd_event"
-_VOICE_HOTKEY_BACKEND_WETYPE = "wetype_hotkey"
-_VOICE_HOTKEY_BACKEND_DOUBAO = "doubao_hotkey"
-_INPUT_PROFILE_VOICE_HOTKEY_BACKENDS = frozenset(
-    {_VOICE_HOTKEY_BACKEND_WETYPE, _VOICE_HOTKEY_BACKEND_DOUBAO}
-)
 
 
 def _runtime_voice_hotkey_text(config_data: dict) -> str:
@@ -196,6 +217,10 @@ class RC003App:
         self._config = config.load_config(self._config_path)
         from . import remote_selection
         self._selected_remote_key = remote_selection.active_key(self._config)
+        selected_profile = remote_selection.active_profile(self._config)
+        self._remote_profile = selected_profile
+        if selected_profile and not remote_selection.runtime_ready(selected_profile):
+            raise remote_selection.SelectionError("当前型号尚未提供接收，请在设备页重新选择。")
         self._config_mtime_ns = self._settings_file_mtime_ns(self._config_path)
         self._bindings_path = config.key_bindings_path(self._config_root)
         self._bindings = config.load_key_bindings(
@@ -211,6 +236,7 @@ class RC003App:
             is_action_configured=self._is_button_action_configured,
             is_repeatable=self._is_button_repeatable,
             on_trigger=self._on_button_trigger,
+            repeat_interval_for=self._button_repeat_interval,
             on_idle=self._apply_pending_settings_if_idle,
             on_diagnostic=self._on_button_gesture_diagnostic,
         )
@@ -243,6 +269,7 @@ class RC003App:
         self._runtime_voice_state = bridge_runtime_status.VOICE_RUNTIME_NOT_TESTED
         self._runtime_voice_provider = ""
         self._runtime_voice_updated_at: Optional[float] = None
+        self._runtime_battery_level: Optional[int] = None
         self._runtime_last_button_publish_monotonic = 0.0
         self._logger.info(
             "startup: app identity: version=%s runtime=%s package=%s",
@@ -250,7 +277,11 @@ class RC003App:
             self._runtime_identity.runtime_kind,
             self._runtime_identity.package_name,
         )
-        if launch_voice_program_on_start:
+        if launch_voice_program_on_start and (
+            selected_profile != remote_selection.CHROMECAST_PROFILE
+            or self._config.get("voice_program", {}).get("provider")
+            == voice_program_manager.VOICE_PROGRAM_SOGOU
+        ):
             try:
                 voice_program_result = (
                     voice_program_manager.launch_configured_at_bridge_start(self._config)
@@ -275,47 +306,42 @@ class RC003App:
                 "legacy voice mappings disabled until user reselects actions: %s",
                 sorted(self._removed_voice_bindings),
             )
-        self._voice = voice_controller.VoiceController()
-        runtime_hotkey_text = _runtime_voice_hotkey_text(self._config)
-        self._voice_hotkey = hotkey.HotkeySpec.parse(runtime_hotkey_text)
+        self._voice_shortcut = voice_shortcut_session.VoiceShortcutSession(
+            hotkey_text=_runtime_voice_hotkey_text(self._config),
+            logger=self._logger, trace=self._diagnostic_trace,
+            services=voice_shortcut_session.ShortcutServices(
+                configured_backend=lambda: self._configured_voice_hotkey_backend(),
+                prepare_doubao=lambda tokens: self._prepare_doubao_voice_physicalizer(tokens),
+                resume_tracking=lambda: self._resume_degraded_voice_key_physicalizer_recovery(),
+                active_doubao_attempt=lambda: self._active_doubao_attempt_locked(),
+                doubao_session=lambda: self._doubao_session,
+                cleanup_doubao=lambda attempt, **kw: self._run_active_doubao_cleanup(attempt, **kw),
+                set_result=lambda *args, **kw: self._set_runtime_voice_result(*args, **kw),
+                current_state=self._current_voice_runtime_state,
+                request_cleanup=lambda: self._supervisor.request_reconnect(),
+                prepare_mute_guard=self._prepare_wetype_playback_mute_guard,
+            ),
+        )
         self._pending_voice_settings = None
         self._pending_config = None
         self._pending_bindings = None
         self._voice_audio_start_fallback_pending = False
-        self._voice_hotkey_release_pending: Optional[Tuple[str, ...]] = None
-        self._voice_hotkey_active_backend: Optional[str] = None
-        self._voice_hotkey_release_pending_backend: Optional[str] = None
-        self._voice_hotkey_release_retry_timer: Optional[object] = None
-        self._voice_hotkey_release_retry_token: Optional[object] = None
-        self._voice_hotkey_release_retry_delay = (
-            _VOICE_HOTKEY_RELEASE_RETRY_INITIAL_SECONDS
-        )
-        self._voice_hotkey_release_retry_stopping = False
-        self._voice_hotkey_release_timer_factory = threading.Timer
         self._voice_focus_before: Optional[
             voice_interaction_diagnostics_windows.FocusSnapshot
         ] = None
         self._voice_focus_provider = ""
         self._voice_focus_submit_method = ""
-        self._voice_ui_confirmation = "unknown"
         self._voice_text_observation = "unknown"
-        self._wetype_runtime_lock = threading.Lock()
-        self._wetype_runtime_generation: Optional[int] = None
-        self._wetype_runtime_audio_finished = False
-        self._wetype_runtime_pcm_frames = 0
-        self._wetype_runtime_cleanup_result: Optional[bool] = None
-        self._wetype_runtime_backend: Optional[str] = None
-        self._wetype_runtime_mic_confirmed: Optional[bool] = None
-        self._wetype_voice_control = wetype_control_windows.WeTypeVoiceControl(
-            logger=self._logger,
-            on_completion=self._on_wetype_cleanup_finished,
-            on_confirmation=self._on_wetype_voice_confirmation_finished,
-            prepare_playback_mute_guard=self._prepare_wetype_playback_mute_guard,
+        self._doubao_session = rc003_doubao_session.DoubaoSessionCoordinator()
+        self._doubao_capture_watch_factory = lambda target_pid: (
+            chromecast_host_activity.CaptureWatch(
+                reader=lambda: chromecast_host_activity.read_doubao_capture_for_pid(
+                    target_pid
+                ),
+                fast_start=True,
+            )
         )
-        self._doubao_voice_control = wetype_control_windows.DoubaoVoiceControl(
-            logger=self._logger,
-        )
-        self._doubao_physicalizer = doubao_rpc.DoubaoPhysicalizer()
+        self._voice_pcm_min_arrival_sequence: Optional[int] = None
         self._button_action_lock = threading.RLock()
         self._button_key_release_pending: Optional[Tuple[str, ...]] = None
         self._button_mouse_release_pending: Optional[str] = None
@@ -329,11 +355,10 @@ class RC003App:
         # Raw Input and the ATVV control channel arrive on different worker
         # threads. Serialize the voice state machine so one physical press
         # cannot race into two host shortcut deliveries.
-        self._voice_trigger_lock = threading.Lock()
         self._logger.info(
             "startup: voice settings active: trigger_mode=%s hotkey=%s",
-            self._voice.trigger_mode.value,
-            self._voice_hotkey.serialize(),
+            self._voice_shortcut.controller.trigger_mode.value,
+            self._voice_shortcut.hotkey.serialize(),
         )
         # One RC003 microphone press is reported independently by HID, the
         # ATVV mic opcode, and sometimes AUDIO_STARTED first. Keep all reports
@@ -386,6 +411,7 @@ class RC003App:
         self._voice_key_physicalizer_stopping = False
         self._voice_key_physicalizer_retry_timer: Optional[object] = None
         self._voice_key_physicalizer_retry_token: Optional[object] = None
+        self._voice_key_physicalizer_degraded_retry_deadline = 0.0
         self._voice_key_physicalizer_timer_factory = threading.Timer
         self._hid_report_tap: Optional[frida_compat.RC003HidReportTap] = None
         self._direct_hid_usages: set[int] = set()
@@ -420,11 +446,13 @@ class RC003App:
         self._key_detection_mic_release_deadline: Optional[float] = None
         self._key_detection_mic_audio_started = False
         self._key_detection_mic_sources_down: set[str] = set()
-        self._playback: Optional[audio_playback.EndpointPlaybackSink] = None
-        self._playback_writer: Optional[
-            audio_playback_worker.PlaybackWriteWorker
-        ] = None
-        self._voice_pcm_stats = PcmStats()
+        self._voice_audio = voice_audio_session.VoiceAudioSession(
+            config=lambda: self._config,
+            logger=self._logger,
+            request_cleanup=lambda: self._supervisor.request_reconnect(),
+            disable_forwarding=lambda: setattr(self, "_voice_pcm_forwarding_enabled", False),
+            on_first_frame=self._on_voice_audio_first_frame,
+        )
         self._event_loop = asyncio.get_event_loop()
         # Physical input belongs to the bridge-worker lifetime, not to one BLE
         # connection attempt. BLE callbacks have their own generation gate.
@@ -441,6 +469,75 @@ class RC003App:
             loop=self._event_loop,
         )
 
+        # Construct shared-service bindings after their state is initialized.
+        self._chromecast_runtime = chromecast_runtime.ChromecastRuntime(
+            chromecast_runtime.RuntimeServices(
+                selected_key=lambda: self._selected_remote_key,
+                logger=self._logger,
+                create_voice_host=self._create_chromecast_voice_host,
+                set_input_state=lambda **kw: self._set_runtime_input_state(**kw),
+                publish_status=lambda state: self._publish_runtime_status(state),
+                start_input=lambda: self._start_input_channels(),
+                stop_input=lambda: self._stop_input_channels(),
+                disable_input=lambda: setattr(self, "_accept_input_events", False),
+                cancel_mappings=self._cancel_chromecast_mappings,
+                release_inputs=self._release_chromecast_inputs,
+                route_edge=self._route_chromecast_edge,
+            )
+        )
+
+    def _create_chromecast_voice_host(self):
+        from .chromecast_voice_host import VoiceHost, VoiceHostServices
+        return VoiceHost(VoiceHostServices(
+            audio=self._voice_audio,
+            shortcut=self._voice_shortcut,
+            settings=lambda: self._config,
+            config_root=self._config_root,
+            logger=self._logger,
+            configured_backend=lambda: self._configured_voice_hotkey_backend(),
+            voice_mapping_enabled=lambda: self._voice_mode_for_primary_button(
+                "mic", self._primary_button_action("mic")) is not None,
+            ensure_key_tracking=lambda *args: self._ensure_voice_key_physicalizer_for_hotkey(*args),
+            reload_settings=lambda: self._reload_settings_if_changed(),
+            apply_pending_settings=lambda: self._apply_pending_voice_settings_if_idle_locked(),
+            begin_diagnostic=lambda *args, **kw: self._ensure_voice_diagnostic_attempt(*args, **kw),
+            finish_diagnostic=lambda *args, **kw: self._finish_voice_diagnostic_attempt(*args, **kw),
+            set_active=lambda active: self._set_runtime_voice_active(active),
+            set_result=lambda *args, **kw: self._set_runtime_voice_result(*args, **kw),
+            wait_sogou=lambda: self._wait_for_sogou_voice_process(),
+            disable_forwarding=lambda: setattr(self, "_voice_pcm_forwarding_enabled", False),
+        ))
+
+    def _current_voice_runtime_state(self):
+        with self._runtime_status_lock:
+            return self._runtime_voice_state
+
+    def _on_voice_audio_first_frame(self):
+        with self._runtime_status_lock:
+            voice_active = self._runtime_voice_active
+        if voice_active:
+            self._set_runtime_voice_result(bridge_runtime_status.VOICE_RUNTIME_RECEIVING_AUDIO)
+
+    def _cancel_chromecast_mappings(self):
+        with self._input_arbitration_lock:
+            self._accept_input_events = False
+            self._button_combos.reset()
+            self._button_gestures.reset()
+
+    def _release_chromecast_inputs(self):
+        with self._button_action_lock:
+            self._button_input_release_retry_stopping = True
+            self._cancel_button_input_release_retry_locked(reset_delay=False)
+            return self._release_pending_button_inputs()
+
+    def _route_chromecast_edge(self, edge):
+        if edge.action == "cancel":
+            with self._input_arbitration_lock:
+                self._cancel_input_gestures_for_buttons({edge.button}, reason="chromecast_cancel",
+                                                       block_until_release=False)
+        else:
+            self._on_button_event(edge.button, edge.action == "down", event_source="chromecast")
+
     # -- lifecycle: driven by ConnectionSupervisor -------------------------
 
     async def run_forever(self) -> None:
@@ -448,11 +545,15 @@ class RC003App:
             self._runtime_status_heartbeat()
         )
         try:
+            if self._remote_profile == remote_selection.CHROMECAST_PROFILE:
+                await self._chromecast_runtime.run()
+                return
             self._start_input_channels()
             await self._supervisor.run_forever()
         finally:
             try:
-                self._stop_input_channels()
+                if self._remote_profile != remote_selection.CHROMECAST_PROFILE:
+                    self._stop_input_channels()
             finally:
                 element_navigation_runtime.clear_diagnostic_trace(self._diagnostic_trace)
                 self._diagnostic_trace.close()
@@ -460,11 +561,25 @@ class RC003App:
                 await asyncio.gather(heartbeat, return_exceptions=True)
 
     async def stop(self) -> None:
+        if self._remote_profile == remote_selection.CHROMECAST_PROFILE:
+            await self._chromecast_runtime.stop()
+            return
         await self._supervisor.stop()
 
     def request_connection_retry_now(self) -> None:
+        if self._remote_profile == remote_selection.CHROMECAST_PROFILE:
+            return  # No unsolicited, repeated UAC prompts or cross-device retry.
         self._logger.info("manual reconnect requested; waking retry backoff")
         self._supervisor.request_retry_now()
+
+    def _press_wetype_voice_keys(self, tokens):
+        win32_input.send_wetype_voice_key_combo_down(tokens)
+
+    def _release_wetype_voice_keys(self, tokens):
+        win32_input.send_wetype_voice_key_combo_up(tokens)
+
+
+
 
     async def _runtime_status_heartbeat(self) -> None:
         while True:
@@ -478,6 +593,11 @@ class RC003App:
         with self._runtime_status_lock:
             if state is not None:
                 self._runtime_connection_state = state
+            if (
+                self._runtime_connection_state
+                is not bridge_runtime_status.BridgeConnectionState.CONNECTED
+            ):
+                self._runtime_battery_level = None
             try:
                 bridge_runtime_status.publish_status(
                     self._config_root,
@@ -494,6 +614,7 @@ class RC003App:
                     voice_runtime_state=self._runtime_voice_state,
                     voice_runtime_provider=self._runtime_voice_provider,
                     voice_runtime_updated_at=self._runtime_voice_updated_at,
+                    battery_level=self._runtime_battery_level,
                 )
             except (OSError, ValueError):
                 self._logger.exception(
@@ -527,6 +648,21 @@ class RC003App:
             self._runtime_voice_active = active
         self._publish_runtime_status()
 
+    def _set_runtime_battery_level(self, level: Optional[int]) -> None:
+        resolved = None if level is None else int(level)
+        if resolved is not None and not 0 <= resolved <= 100:
+            return
+        with self._runtime_status_lock:
+            if (
+                self._runtime_connection_state
+                is not bridge_runtime_status.BridgeConnectionState.CONNECTED
+            ):
+                return
+            if resolved == self._runtime_battery_level:
+                return
+            self._runtime_battery_level = resolved
+        self._publish_runtime_status()
+
     def _set_runtime_voice_result(
         self,
         state: str,
@@ -548,6 +684,12 @@ class RC003App:
             self._runtime_voice_updated_at = time.time()
         self._publish_runtime_status()
         trace = getattr(self, '_diagnostic_trace', None)
+        if ((previous_state, previous_provider) != (str(state), str(resolved_provider))
+                and state in {bridge_runtime_status.VOICE_RUNTIME_HOST_START_FAILED,
+                              bridge_runtime_status.VOICE_RUNTIME_HOST_STOP_FAILED,
+                              bridge_runtime_status.VOICE_RUNTIME_OUTPUT_OPEN_FAILED}):
+            self._logger.warning("Voice runtime failed: state=%s provider=%s", state, resolved_provider,
+                                 extra={"failure_key": f"voice:{resolved_provider}:{state}"})
         if trace is not None and (previous_state, previous_provider) != (str(state), str(resolved_provider)):
             try:
                 trace.emit('voice_runtime_state', state=str(state), previous_state=previous_state,
@@ -555,19 +697,10 @@ class RC003App:
             except Exception:
                 pass  # Diagnostic failures must never change voice state or cleanup.
 
-    @staticmethod
-    def _input_profile_provider_for_backend(backend: str) -> str:
-        if backend == _VOICE_HOTKEY_BACKEND_DOUBAO:
-            return voice_program_manager.VOICE_PROGRAM_DOUBAO_IME
-        return voice_program_manager.VOICE_PROGRAM_WETYPE
 
-    def _input_profile_voice_control(self, backend: str):
-        if backend == _VOICE_HOTKEY_BACKEND_DOUBAO:
-            return self._doubao_voice_control
-        return self._wetype_voice_control
 
     def _prepare_wetype_playback_mute_guard(self):
-        sink = self._playback
+        sink = self._voice_audio.sink
         if sink is None or not getattr(sink, "ready", False):
             return None
         name = getattr(sink, "endpoint_name", "")
@@ -575,163 +708,12 @@ class RC003App:
             return None
         return voice_playback_session_windows.prepare_playback_mute_guard(name)
 
-    def _begin_wetype_runtime_session(
-        self, backend: str = _VOICE_HOTKEY_BACKEND_WETYPE
-    ) -> None:
-        with self._wetype_runtime_lock:
-            self._wetype_runtime_generation = None
-            self._wetype_runtime_audio_finished = False
-            self._wetype_runtime_pcm_frames = 0
-            self._wetype_runtime_cleanup_result = None
-            self._wetype_runtime_backend = backend
-            self._wetype_runtime_mic_confirmed = None
 
-    def _wetype_control_generation(
-        self, backend: str = _VOICE_HOTKEY_BACKEND_WETYPE
-    ) -> Optional[int]:
-        control = self._input_profile_voice_control(backend)
-        value = getattr(control, "current_generation", None)
-        if isinstance(value, int) and not isinstance(value, bool):
-            return value
-        return None
 
-    def _wetype_control_flag(
-        self, name: str, backend: str = _VOICE_HOTKEY_BACKEND_WETYPE
-    ) -> bool:
-        control = self._input_profile_voice_control(backend)
-        value = getattr(control, name, False)
-        return value if isinstance(value, bool) else False
 
-    def _track_wetype_runtime_generation(
-        self,
-        generation: Optional[int],
-        backend: str = _VOICE_HOTKEY_BACKEND_WETYPE,
-    ) -> None:
-        if generation is None:
-            return
-        with self._wetype_runtime_lock:
-            self._wetype_runtime_generation = generation
-            self._wetype_runtime_backend = backend
 
-    def _record_wetype_audio_result(self, frames: int) -> bool:
-        with self._wetype_runtime_lock:
-            if self._wetype_runtime_generation is None:
-                return False
-            self._wetype_runtime_audio_finished = True
-            self._wetype_runtime_pcm_frames = max(0, int(frames))
-            cleanup_result = self._wetype_runtime_cleanup_result
-            backend = self._wetype_runtime_backend or _VOICE_HOTKEY_BACKEND_WETYPE
-            mic_confirmed = self._wetype_runtime_mic_confirmed
-        if backend == _VOICE_HOTKEY_BACKEND_WETYPE and mic_confirmed is not True:
-            state = bridge_runtime_status.VOICE_RUNTIME_HOST_START_FAILED
-        elif cleanup_result is True:
-            state = (
-                bridge_runtime_status.VOICE_RUNTIME_SUCCESS
-                if frames > 0
-                else bridge_runtime_status.VOICE_RUNTIME_AUDIO_EMPTY
-            )
-        elif cleanup_result is False:
-            state = bridge_runtime_status.VOICE_RUNTIME_HOST_STOP_FAILED
-        else:
-            state = bridge_runtime_status.VOICE_RUNTIME_FINISHING
-        self._set_runtime_voice_result(
-            state,
-            provider=self._input_profile_provider_for_backend(backend),
-        )
-        return True
 
-    def _on_wetype_voice_confirmation_finished(
-        self,
-        generation: int,
-        success: bool,
-    ) -> None:
-        with self._wetype_runtime_lock:
-            if (
-                generation != self._wetype_runtime_generation
-                or self._wetype_runtime_backend != _VOICE_HOTKEY_BACKEND_WETYPE
-            ):
-                self._logger.info(
-                    "WeType voice confirmation ignored for stale generation=%s",
-                    generation,
-                )
-                return
-            self._wetype_runtime_mic_confirmed = bool(success)
-            self._voice_ui_confirmation = (
-                "confirmed" if success else "not_confirmed"
-            )
-        if success:
-            with self._runtime_status_lock:
-                current_state = self._runtime_voice_state
-            if current_state == bridge_runtime_status.VOICE_RUNTIME_ACTIVE:
-                self._set_runtime_voice_result(
-                    bridge_runtime_status.VOICE_RUNTIME_MIC_CONFIRMED,
-                    provider=voice_program_manager.VOICE_PROGRAM_WETYPE,
-                )
-            self._logger.info("WeType microphone open confirmed")
-            return
 
-        self._logger.warning(
-            "WeType microphone open was not confirmed after recovery retries; "
-            "preserving the active hold until the physical microphone key is released"
-        )
-
-    def _on_wetype_cleanup_finished(
-        self,
-        generation: int,
-        success: bool,
-        backend: Optional[str] = None,
-    ) -> None:
-        with self._wetype_runtime_lock:
-            if generation != self._wetype_runtime_generation:
-                self._logger.info(
-                    "input profile runtime completion ignored for stale generation=%s",
-                    generation,
-                )
-                return
-            resolved_backend = (
-                backend
-                or self._wetype_runtime_backend
-                or _VOICE_HOTKEY_BACKEND_WETYPE
-            )
-            if (
-                self._wetype_runtime_backend is not None
-                and resolved_backend != self._wetype_runtime_backend
-            ):
-                self._logger.info(
-                    "input profile runtime completion ignored for stale backend=%s",
-                    resolved_backend,
-                )
-                return
-            self._wetype_runtime_cleanup_result = bool(success)
-            audio_finished = self._wetype_runtime_audio_finished
-            frames = self._wetype_runtime_pcm_frames
-        provider = self._input_profile_provider_for_backend(resolved_backend)
-        if not success:
-            tokens = tuple(self._voice_hotkey.modifiers) + (self._voice_hotkey.key,)
-            with self._voice_trigger_lock:
-                self._voice_hotkey_release_pending = tokens
-                self._voice_hotkey_release_pending_backend = resolved_backend
-                self._voice_hotkey_active_backend = None
-            self._set_runtime_voice_result(
-                bridge_runtime_status.VOICE_RUNTIME_HOST_STOP_FAILED,
-                provider=provider,
-            )
-            self._supervisor.request_reconnect()
-            return
-        if not audio_finished:
-            self._set_runtime_voice_result(
-                bridge_runtime_status.VOICE_RUNTIME_FINISHING,
-                provider=provider,
-            )
-            return
-        self._set_runtime_voice_result(
-            (
-                bridge_runtime_status.VOICE_RUNTIME_SUCCESS
-                if frames > 0
-                else bridge_runtime_status.VOICE_RUNTIME_AUDIO_EMPTY
-            ),
-            provider=provider,
-        )
 
     def _record_runtime_button(self, event_source: str) -> None:
         now_wall = time.time()
@@ -754,10 +736,12 @@ class RC003App:
             self._logger.exception("bridge runtime status cleanup failed")
 
     async def _connect_once(self) -> None:
-        with self._voice_trigger_lock:
+        with self._voice_shortcut.lock:
             self._ble_callback_generation += 1
             callback_generation = self._ble_callback_generation
             self._accept_ble_events = True
+        with self._runtime_status_lock:
+            self._runtime_battery_level = None
         self._publish_runtime_status(
             bridge_runtime_status.BridgeConnectionState.CONNECTING
         )
@@ -780,6 +764,11 @@ class RC003App:
                     samples,
                     _ble_generation=callback_generation,
                 ),
+                on_pcm_frame_with_sequence=lambda samples, sequence: self._on_pcm_frame(
+                    samples,
+                    _ble_generation=callback_generation,
+                    _arrival_sequence=sequence,
+                ),
                 on_control_event=lambda event: self._on_control_event(
                     event,
                     _ble_generation=callback_generation,
@@ -789,6 +778,10 @@ class RC003App:
                     _ble_generation=callback_generation,
                 ),
                 on_disconnected=lambda: self._on_disconnected(
+                    _ble_generation=callback_generation,
+                ),
+                on_battery_level=lambda level: self._on_battery_level(
+                    level,
                     _ble_generation=callback_generation,
                 ),
                 gain_db=float(self._config["gain_db"]),
@@ -811,6 +804,19 @@ class RC003App:
         self._publish_runtime_status(
             bridge_runtime_status.BridgeConnectionState.CONNECTED
         )
+        start_battery_monitor = getattr(
+            self._ble_session,
+            "start_battery_monitor",
+            None,
+        )
+        if callable(start_battery_monitor):
+            try:
+                start_battery_monitor()
+            except Exception as exc:
+                self._logger.warning(
+                    "optional RC003 battery monitor start failed: error_type=%s",
+                    type(exc).__name__,
+                )
 
     def _start_input_channels(self) -> None:
         """Start process-lifetime input resources before any BLE attempt."""
@@ -819,12 +825,15 @@ class RC003App:
         if not self._selected_remote_key:
             raise remote_selection.SelectionError("请先在设备页选择要使用的遥控器。")
 
-        with self._voice_trigger_lock:
+        with self._voice_shortcut.lock:
             self._accept_input_events = True
         with self._voice_key_physicalizer_lifecycle_lock:
             self._voice_key_physicalizer_stopping = False
         with self._raw_input_lifecycle_lock:
             self._raw_input_stopping = False
+        if self._remote_profile == remote_selection.CHROMECAST_PROFILE:
+            self._start_hid_listener()
+            return
         self._start_voice_key_physicalizer()
         self._start_hid_listener()
         self._start_hid_report_tap()
@@ -838,8 +847,26 @@ class RC003App:
                 ):
                     return
                 current = self._voice_key_physicalizer
-                if current is not None and current.is_running:
+                if (
+                    current is not None
+                    and current.is_running
+                    and bool(getattr(current, "accepts_new_down", True))
+                ):
                     return
+                if current is not None and current.is_running:
+                    self._voice_key_physicalizer_ready = False
+                    if not self._voice_key_physicalizer_degraded_retry_deadline:
+                        self._voice_key_physicalizer_degraded_retry_deadline = (
+                            time.monotonic()
+                            + _VOICE_KEY_PHYSICALIZER_DEGRADED_RETRY_WINDOW_SECONDS
+                        )
+                    self._schedule_voice_key_physicalizer_recovery_locked()
+                    return
+                # A queued callback belongs to the owner/generation captured
+                # when it was scheduled. Retire that work before publishing a
+                # replacement so a failed replacement start can own the sole
+                # retry slot.
+                self._cancel_voice_key_physicalizer_retry_locked()
                 self._voice_key_physicalizer = None
                 self._voice_key_physicalizer_generation += 1
                 generation = self._voice_key_physicalizer_generation
@@ -864,6 +891,23 @@ class RC003App:
                         self._on_voice_key_physicalizer_tracking_lost(
                             physicalizer,
                             generation,
+                        )
+                    )
+                )
+            set_health_failure_callback = getattr(
+                physicalizer,
+                "set_health_failure_callback",
+                None,
+            )
+            if callable(set_health_failure_callback):
+                set_health_failure_callback(
+                    lambda reason, snapshot, physicalizer=physicalizer,
+                    generation=generation: (
+                        self._on_voice_key_physicalizer_health_failure(
+                            physicalizer,
+                            generation,
+                            reason,
+                            snapshot,
                         )
                     )
                 )
@@ -913,6 +957,7 @@ class RC003App:
                     self._schedule_voice_key_physicalizer_recovery_locked()
                 else:
                     self._voice_key_physicalizer_ready = True
+                    self._voice_key_physicalizer_degraded_retry_deadline = 0.0
             if stop_stale_instance:
                 try:
                     physicalizer.stop()
@@ -952,10 +997,20 @@ class RC003App:
         ):
             return
         token = object()
+        expected_physicalizer = self._voice_key_physicalizer
+        expected_generation = self._voice_key_physicalizer_generation
         try:
             timer = self._voice_key_physicalizer_timer_factory(
                 _VOICE_KEY_PHYSICALIZER_RETRY_SECONDS,
-                lambda token=token: self._recover_voice_key_physicalizer(token),
+                lambda token=token,
+                expected_physicalizer=expected_physicalizer,
+                expected_generation=expected_generation: (
+                    self._recover_voice_key_physicalizer(
+                        token,
+                        expected_physicalizer,
+                        expected_generation,
+                    )
+                ),
             )
             if isinstance(timer, threading.Thread):
                 timer.daemon = True
@@ -971,7 +1026,14 @@ class RC003App:
                 type(exc).__name__,
             )
 
-    def _recover_voice_key_physicalizer(self, token: object) -> None:
+    def _recover_voice_key_physicalizer(
+        self,
+        token: object,
+        expected_physicalizer: Optional[
+            voice_key_physicalizer_windows.VoiceKeyPhysicalizer
+        ],
+        expected_generation: int,
+    ) -> None:
         with self._voice_key_physicalizer_lifecycle_lock:
             if self._voice_key_physicalizer_retry_token is not token:
                 return
@@ -982,15 +1044,132 @@ class RC003App:
                 or not self._accept_input_events
             ):
                 return
+            if (
+                self._voice_key_physicalizer is not expected_physicalizer
+                or self._voice_key_physicalizer_generation
+                != expected_generation
+            ):
+                return
             physicalizer = self._voice_key_physicalizer
-            if physicalizer is not None and physicalizer.is_running:
-                self._schedule_voice_key_physicalizer_recovery_locked()
+            generation = self._voice_key_physicalizer_generation
+            running = bool(physicalizer is not None and physicalizer.is_running)
+            accepts_new_down = bool(
+                running and getattr(physicalizer, "accepts_new_down", True)
+            )
+            if running and accepts_new_down:
+                if self._voice_key_physicalizer_lost_generation == generation:
+                    self._schedule_voice_key_physicalizer_recovery_locked()
+                    return
+                self._voice_key_physicalizer_ready = True
+                self._voice_key_physicalizer_degraded_retry_deadline = 0.0
+                return
+        if running:
+            with self._voice_shortcut.lock:
+                cleanup_blocks_recovery = bool(
+                    self._voice_shortcut.pending_tokens is not None
+                    or self._voice_shortcut.controller.active
+                    or self._doubao_session.busy
+                )
+            if cleanup_blocks_recovery:
+                with self._voice_key_physicalizer_lifecycle_lock:
+                    if (
+                        self._voice_key_physicalizer is not physicalizer
+                        or self._voice_key_physicalizer_generation != generation
+                        or self._voice_key_physicalizer_stopping
+                        or not self._accept_input_events
+                    ):
+                        return
+                    if (
+                        self._voice_key_physicalizer_degraded_retry_deadline
+                        and time.monotonic()
+                        < self._voice_key_physicalizer_degraded_retry_deadline
+                    ):
+                        self._schedule_voice_key_physicalizer_recovery_locked()
+                        return
+                self._set_runtime_input_state(
+                    voice_key_physicalizer_state="failed"
+                )
+                self._diagnostic_trace.emit(
+                    "voice_key_physicalizer_health",
+                    status="blocked",
+                    reason="owned_cleanup_unresolved",
+                    app_generation=int(generation),
+                )
+                self._logger.error(
+                    "voice key physicalizer recovery blocked: owned voice "
+                    "shortcut cleanup is still unresolved"
+                )
+                return
+
+            stop_succeeded = False
+            with self._voice_key_physicalizer_operation_lock:
+                with self._voice_key_physicalizer_lifecycle_lock:
+                    if (
+                        self._voice_key_physicalizer is not physicalizer
+                        or self._voice_key_physicalizer_generation != generation
+                        or self._voice_key_physicalizer_stopping
+                        or not self._accept_input_events
+                    ):
+                        return
+                try:
+                    physicalizer.stop()
+                except Exception:
+                    self._logger.exception(
+                        "voice key physicalizer recovery could not retire the "
+                        "degraded owner; replacement not started"
+                    )
+                else:
+                    stop_succeeded = True
+                    with self._voice_key_physicalizer_lifecycle_lock:
+                        if (
+                            self._voice_key_physicalizer is physicalizer
+                            and self._voice_key_physicalizer_generation == generation
+                        ):
+                            self._voice_key_physicalizer = None
+                            self._voice_key_physicalizer_ready = False
+            if not stop_succeeded:
+                self._set_runtime_input_state(
+                    voice_key_physicalizer_state="failed"
+                )
+                return
+            self._set_runtime_input_state(
+                voice_key_physicalizer_state="recovering"
+            )
+            self._start_voice_key_physicalizer(recovering=True)
+            return
+
+        with self._voice_key_physicalizer_lifecycle_lock:
+            if (
+                self._voice_key_physicalizer is not physicalizer
+                or self._voice_key_physicalizer_generation != generation
+                or self._voice_key_physicalizer_stopping
+                or not self._accept_input_events
+            ):
                 return
             self._voice_key_physicalizer = None
         self._set_runtime_input_state(
             voice_key_physicalizer_state="recovering"
         )
         self._start_voice_key_physicalizer(recovering=True)
+
+    def _resume_degraded_voice_key_physicalizer_recovery(self) -> None:
+        """Resume one blocked recovery after authoritative cleanup succeeds."""
+
+        with self._voice_key_physicalizer_lifecycle_lock:
+            physicalizer = self._voice_key_physicalizer
+            if (
+                physicalizer is None
+                or not physicalizer.is_running
+                or bool(getattr(physicalizer, "accepts_new_down", True))
+                or self._voice_key_physicalizer_stopping
+                or not self._accept_input_events
+            ):
+                return
+            self._voice_key_physicalizer_degraded_retry_deadline = (
+                time.monotonic()
+                + _VOICE_KEY_PHYSICALIZER_DEGRADED_RETRY_WINDOW_SECONDS
+            )
+            self._schedule_voice_key_physicalizer_recovery_locked()
 
 
     def _cancel_raw_input_retry_locked(self) -> None:
@@ -1093,6 +1272,18 @@ class RC003App:
                     self._raw_input_retry_timer = None
                     if self._raw_input_stopping or not self._accept_input_events:
                         return
+                    if (self._remote_profile == remote_selection.CHROMECAST_PROFILE
+                            and self._chromecast_runtime.voice_host is not None
+                            and not self._chromecast_runtime.voice_host.closed):
+                        # Preserve physical ownership until the voice owner has
+                        # released its keys. A tracker restart clears snapshots.
+                        self._chromecast_runtime.voice_host.cancel_recording()
+                        self._schedule_raw_input_recovery_locked()
+                        return
+                    if (self._remote_profile == remote_selection.CHROMECAST_PROFILE
+                            and not self._release_pending_button_keys()):
+                        self._schedule_raw_input_recovery_locked()
+                        return
                     listener = self._hid_listener
                     if listener is not None:
                         # Invalidate every callback before stop() can emit
@@ -1109,9 +1300,7 @@ class RC003App:
                 try:
                     listener.stop()
                 except Exception:
-                    self._set_runtime_input_state(
-                        raw_input_state="failed_stopping"
-                    )
+                    self._set_raw_listener_state("failed_stopping")
                     self._logger.exception(
                         "Raw Input recovery could not stop the old listener"
                     )
@@ -1135,6 +1324,14 @@ class RC003App:
     def _start_hid_listener(self, *, recovering: bool = False) -> None:
         with self._raw_input_operation_lock:
             self._start_hid_listener_owned(recovering=recovering)
+
+    def _set_raw_listener_state(self, state: str) -> None:
+        # Chromecast's device status belongs to its receiver, not the auxiliary
+        # keyboard tracker. Do not replace chromecast_ready on tracker recovery.
+        if self._remote_profile == remote_selection.CHROMECAST_PROFILE:
+            self._logger.info("keyboard safety tracking state=%s", state)
+        else:
+            self._set_runtime_input_state(raw_input_state=state)
 
     def _start_hid_listener_owned(self, *, recovering: bool = False) -> None:
         """Best-effort: buttons fail closed independently of BLE/voice.
@@ -1173,13 +1370,13 @@ class RC003App:
                 generation = self._raw_input_generation
                 self._raw_input_lost_generation = -1
 
-        self._set_runtime_input_state(
-            raw_input_state="recovering" if recovering else "starting"
-        )
+        self._set_raw_listener_state("recovering" if recovering else "starting")
+        keyboard_only = self._remote_profile == remote_selection.CHROMECAST_PROFILE
         try:
-            paths = raw_input_windows.enumerate_matching_device_paths()
-            from . import remote_selection
-            device_path = remote_selection.selected_raw_path(paths, self._selected_remote_key)
+            device_path = None
+            if not keyboard_only:
+                paths = raw_input_windows.enumerate_matching_device_paths()
+                device_path = remote_selection.selected_raw_path(paths, self._selected_remote_key)
         except raw_input_windows.RawInputUnavailableError as exc:
             self._set_runtime_input_state(raw_input_state="unavailable")
             self._logger.info("startup: Raw Input unavailable; buttons disabled: %s", exc)
@@ -1215,13 +1412,14 @@ class RC003App:
             ):
                 return
             self._hid_listener = listener
-        self._sync_physical_bindings_to_listener()
+        if not keyboard_only:
+            self._sync_physical_bindings_to_listener()
         set_sourced_button_event_callback = getattr(
             listener,
             "set_sourced_button_event_callback",
             None,
         )
-        if callable(set_sourced_button_event_callback):
+        if not keyboard_only and callable(set_sourced_button_event_callback):
             set_sourced_button_event_callback(
                 lambda button_id, is_pressed, source, windows_button_id: (
                     self._on_raw_button_event(
@@ -1239,7 +1437,7 @@ class RC003App:
             "set_raw_event_callback",
             None,
         )
-        if callable(set_raw_event_callback):
+        if not keyboard_only and callable(set_raw_event_callback):
             set_raw_event_callback(
                 lambda event: self._on_raw_physical_event(
                     event,
@@ -1258,7 +1456,7 @@ class RC003App:
             "set_device_removed_callback",
             None,
         )
-        if callable(set_device_removed_callback):
+        if not keyboard_only and callable(set_device_removed_callback):
             set_device_removed_callback(
                 lambda: self._on_raw_input_device_removed(
                     _listener=listener,
@@ -1270,7 +1468,7 @@ class RC003App:
             "set_input_corruption_callback",
             None,
         )
-        if callable(set_input_corruption_callback):
+        if not keyboard_only and callable(set_input_corruption_callback):
             set_input_corruption_callback(
                 lambda reason: self._on_raw_input_corruption(
                     reason,
@@ -1295,7 +1493,7 @@ class RC003App:
             listener.start(device_path)
         except raw_input_windows.RawInputUnavailableError as exc:
             if listener.is_running:
-                self._set_runtime_input_state(raw_input_state="failed_running")
+                self._set_raw_listener_state("failed_running")
                 self._logger.exception(
                     "startup: Raw Input listener failed to start but is still running; "
                     "owner retained for cleanup to retry"
@@ -1310,7 +1508,7 @@ class RC003App:
                     self._hid_listener = None
                     self._raw_fallback_tracking_active = False
                     self._schedule_raw_input_recovery_locked()
-            self._set_runtime_input_state(raw_input_state="failed")
+            self._set_raw_listener_state("failed")
             return
         with self._input_arbitration_lock:
             with self._raw_input_lifecycle_lock:
@@ -1329,11 +1527,7 @@ class RC003App:
                         _RAW_INPUT_RETRY_INITIAL_SECONDS
                     )
             if not stale:
-                self._set_runtime_input_state(
-                    raw_input_state=(
-                        "recovering" if lost or not running else "ready"
-                    )
-                )
+                self._set_raw_listener_state("recovering" if lost or not running else "ready")
         if stale:
             if listener.is_running:
                 try:
@@ -1436,11 +1630,13 @@ class RC003App:
                 self._ordinary_mic_gesture_active = False
             with self._key_detection_mic_lock:
                 self._reset_key_detection_mic_gesture_locked()
-            with self._voice_trigger_lock:
+            with self._voice_shortcut.lock:
                 self._voice_mic_gesture_sources_down.clear()
                 self._voice_mic_gesture_hid_released = True
-                if self._voice.active:
+                if self._voice_shortcut.controller.active:
                     self._release_hold_voice_on_physical_release_locked(reason)
+                elif self._doubao_session.busy:
+                    self._doubao_session.cancel_current()
                 if (
                     self._voice_mic_gesture_active
                     and not self._voice_audio_stream_active
@@ -1488,11 +1684,13 @@ class RC003App:
                 self._ordinary_mic_gesture_active = False
             with self._key_detection_mic_lock:
                 self._reset_key_detection_mic_gesture_locked()
-            with self._voice_trigger_lock:
+            with self._voice_shortcut.lock:
                 self._voice_mic_gesture_sources_down.clear()
                 self._voice_mic_gesture_hid_released = True
-                if self._voice.active:
+                if self._voice_shortcut.controller.active:
                     self._release_hold_voice_on_physical_release_locked(reason)
+                elif self._doubao_session.busy:
+                    self._doubao_session.cancel_current()
                 if (
                     self._voice_mic_gesture_active
                     and not self._voice_audio_stream_active
@@ -1510,14 +1708,15 @@ class RC003App:
     def _active_audio_owns_late_raw_mic(self) -> bool:
         """Return whether ATVV audio already owns the current mic press."""
 
-        with self._voice_trigger_lock:
+        with self._voice_shortcut.lock:
             return (
                 self._voice_mic_gesture_active
                 and self._voice_mic_gesture_audio_started
                 and self._voice_audio_stream_active
                 and (
-                    self._voice.active
-                    or self._voice_hotkey_release_pending is not None
+                    self._voice_shortcut.controller.active
+                    or self._doubao_session.busy
+                    or self._voice_shortcut.pending_tokens is not None
                 )
             )
 
@@ -2057,16 +2256,21 @@ class RC003App:
                 )
                 self._raw_input_lost_generation = resolved_generation
                 self._schedule_raw_input_recovery_locked()
-            self._set_runtime_input_state(raw_input_state="unhealthy")
-            with self._voice_trigger_lock:
-                tokens = tuple(self._voice_hotkey.modifiers) + (
-                    self._voice_hotkey.key,
+            self._set_raw_listener_state("unhealthy")
+            if self._remote_profile == remote_selection.CHROMECAST_PROFILE:
+                host = self._chromecast_runtime.voice_host
+                if host is not None:
+                    host.cancel_recording()
+            with self._voice_shortcut.lock:
+                tokens = tuple(self._voice_shortcut.hotkey.modifiers) + (
+                    self._voice_shortcut.hotkey.key,
                 )
                 active_hold = (
-                    self._voice.active
-                    or self._voice_hotkey_release_pending is not None
+                    self._voice_shortcut.controller.active
+                    or self._voice_shortcut.pending_tokens is not None
                 )
-                if active_hold and not win32_input.can_begin_tracked_hold(tokens):
+                if (self._remote_profile != remote_selection.CHROMECAST_PROFILE
+                        and active_hold and not win32_input.can_begin_tracked_hold(tokens)):
                     self._force_voice_hold_release_locked(
                         "physical keyboard tracking lost"
                     )
@@ -2104,12 +2308,37 @@ class RC003App:
         self._set_runtime_input_state(
             voice_key_physicalizer_state="recovering"
         )
+        if self._remote_profile == remote_selection.CHROMECAST_PROFILE:
+            host = self._chromecast_runtime.voice_host
+            if host is not None:
+                wait_for_release = getattr(
+                    host,
+                    "cancel_recording_and_wait",
+                    None,
+                )
+                if callable(wait_for_release):
+                    wait_for_release(2.5)
+                else:
+                    host.cancel_recording()
+            with self._voice_key_physicalizer_lifecycle_lock:
+                if (
+                    self._voice_key_physicalizer is resolved_physicalizer
+                    and self._voice_key_physicalizer_generation
+                    == resolved_generation
+                    and not self._voice_key_physicalizer_stopping
+                ):
+                    self._schedule_voice_key_physicalizer_recovery_locked()
+            self._logger.warning(
+                "voice key physicalizer stopped unexpectedly; "
+                "Chromecast voice cancelled and recovery scheduled"
+            )
+            return
         raw_tracking_available = (
             raw_input_windows.physical_keyboard_tracking_available()
         )
-        with self._voice_trigger_lock:
-            tokens = tuple(self._voice_hotkey.modifiers) + (
-                self._voice_hotkey.key,
+        with self._voice_shortcut.lock:
+            tokens = tuple(self._voice_shortcut.hotkey.modifiers) + (
+                self._voice_shortcut.hotkey.key,
             )
             try:
                 uses_right_alt = (
@@ -2119,8 +2348,8 @@ class RC003App:
             except win32_keys.UnknownKeyTokenError:
                 uses_right_alt = False
             active_hold = (
-                self._voice.active
-                or self._voice_hotkey_release_pending is not None
+                self._voice_shortcut.controller.active
+                or self._voice_shortcut.pending_tokens is not None
             )
             if (
                 active_hold
@@ -2151,6 +2380,51 @@ class RC003App:
                 self._schedule_voice_key_physicalizer_recovery_locked()
         self._logger.warning(
             "voice key physicalizer stopped unexpectedly; recovery scheduled"
+        )
+
+    def _on_voice_key_physicalizer_health_failure(
+        self,
+        physicalizer: voice_key_physicalizer_windows.VoiceKeyPhysicalizer,
+        generation: int,
+        reason: str,
+        snapshot: voice_key_physicalizer_windows.PhysicalizerHealthSnapshot,
+    ) -> None:
+        """Close admission immediately and recover only after owned cleanup."""
+
+        with self._voice_key_physicalizer_lifecycle_lock:
+            if (
+                self._voice_key_physicalizer is not physicalizer
+                or self._voice_key_physicalizer_generation != int(generation)
+                or self._voice_key_physicalizer_stopping
+            ):
+                return
+            self._voice_key_physicalizer_ready = False
+            self._voice_key_physicalizer_degraded_retry_deadline = (
+                time.monotonic()
+                + _VOICE_KEY_PHYSICALIZER_DEGRADED_RETRY_WINDOW_SECONDS
+            )
+            self._schedule_voice_key_physicalizer_recovery_locked()
+        self._set_runtime_input_state(
+            voice_key_physicalizer_state="recovering"
+        )
+        try:
+            self._diagnostic_trace.emit(
+                "voice_key_physicalizer_health",
+                status="degraded",
+                reason=str(reason),
+                app_generation=int(generation),
+                **snapshot.trace_fields(),
+            )
+        except BaseException:
+            pass
+        self._logger.warning(
+            "voice key physicalizer degraded after required acknowledgement "
+            "failure; new voice starts blocked until owned cleanup completes: "
+            "generation=%s tracker_generation=%s callback_delta=%s marker_delta=%s",
+            generation,
+            snapshot.generation,
+            snapshot.receipt_callback_entry_delta,
+            snapshot.receipt_marker_callback_delta,
         )
 
     def _on_hid_tap_status(self, status: str, detail: str) -> None:
@@ -2433,6 +2707,7 @@ class RC003App:
         with self._voice_key_physicalizer_lifecycle_lock:
             self._voice_key_physicalizer_stopping = True
             self._voice_key_physicalizer_generation += 1
+            self._voice_key_physicalizer_degraded_retry_deadline = 0.0
             self._cancel_voice_key_physicalizer_retry_locked()
         with self._input_arbitration_lock:
             with self._raw_input_lifecycle_lock:
@@ -2442,9 +2717,18 @@ class RC003App:
         with self._button_action_lock:
             self._button_input_release_retry_stopping = True
             self._cancel_button_input_release_retry_locked(reset_delay=False)
-        with self._voice_trigger_lock:
-            self._voice_hotkey_release_retry_stopping = True
-            self._cancel_voice_hotkey_release_retry_locked(reset_delay=False)
+        with self._voice_shortcut.lock:
+            self._voice_shortcut.retry_stopping = True
+            self._voice_shortcut.cancel_release_retry(reset_delay=False)
+            self._doubao_session.cancel_current()
+
+        doubao_attempt_settled = self._doubao_session.wait_current(
+            _DOUBAO_ATTEMPT_JOIN_TIMEOUT_SECONDS
+        )
+        if not doubao_attempt_settled:
+            failures.append(
+                "Doubao startup attempt did not settle; input owners retained"
+            )
 
         # Input loss is cancellation, not a click. Clear gesture timers before
         # listener shutdown emits forced releases, and release any Windows key
@@ -2497,10 +2781,10 @@ class RC003App:
                 "state retained"
             )
 
-        with self._voice_trigger_lock:
-            if self._voice_hotkey_release_pending is not None:
-                if self._release_pending_voice_hotkey():
-                    self._voice.cancel_pending()
+        with self._voice_shortcut.lock:
+            if self._voice_shortcut.pending_tokens is not None:
+                if self._voice_shortcut.release_pending():
+                    self._voice_shortcut.controller.cancel_pending()
                 else:
                     keyboard_release_complete = False
                     failures.append(
@@ -2534,7 +2818,7 @@ class RC003App:
         else:
             self._set_runtime_input_state(raw_input_state="retained_for_cleanup")
 
-        with self._voice_trigger_lock:
+        with self._voice_shortcut.lock:
             self._accept_input_events = False
 
         with self._direct_hid_lock:
@@ -2564,9 +2848,9 @@ class RC003App:
         self._button_gestures.reset()
 
         physicalizer_state = "stopped"
-        if keyboard_release_complete:
+        if keyboard_release_complete and doubao_attempt_settled:
             try:
-                self._doubao_physicalizer.stop()
+                self._voice_shortcut.doubao_physicalizer.stop()
             except Exception:
                 keyboard_release_complete = False
                 physicalizer_state = "failed"
@@ -2577,7 +2861,7 @@ class RC003App:
                     "Doubao voice physicalizer did not stop; owner retained"
                 )
 
-        if keyboard_release_complete:
+        if keyboard_release_complete and doubao_attempt_settled:
             with self._voice_key_physicalizer_operation_lock:
                 with self._voice_key_physicalizer_lifecycle_lock:
                     physicalizer = self._voice_key_physicalizer
@@ -2615,38 +2899,80 @@ class RC003App:
 
         with self._runtime_status_lock:
             connection_state = self._runtime_connection_state
+            self._runtime_battery_level = None
         if connection_state is bridge_runtime_status.BridgeConnectionState.CONNECTED:
             self._publish_runtime_status(
                 bridge_runtime_status.BridgeConnectionState.WAITING_FOR_DEVICE
             )
         failures: List[str] = []
-        with self._voice_trigger_lock:
+        with self._voice_shortcut.lock:
             self._accept_ble_events = False
+            attempt = self._doubao_session.cancel_current()
+            active_attempt = self._active_doubao_attempt_locked()
+            cleanup_attempt = active_attempt
+            if (
+                cleanup_attempt is None
+                and attempt is not None
+                and (
+                    attempt.has_cleanup_debt("hotkey")
+                    or attempt.has_cleanup_debt("playback")
+                )
+            ):
+                cleanup_attempt = attempt
+            if cleanup_attempt is not None:
+                self._voice_shortcut.controller.reset()
+                self._voice_pcm_forwarding_enabled = False
+                self._voice_pcm_min_arrival_sequence = None
+                self._request_active_doubao_cleanup_locked(
+                    cleanup_attempt,
+                    reason="connection cleanup",
+                )
+
+        doubao_settled = await asyncio.to_thread(
+            self._doubao_session.wait_current,
+            _DOUBAO_ATTEMPT_JOIN_TIMEOUT_SECONDS,
+        )
 
         try:
-            with self._voice_trigger_lock:
+            with self._voice_shortcut.lock:
+                doubao_cleanup_running = bool(
+                    attempt is not None and attempt.cleanup_worker_running
+                )
                 self._voice_audio_start_fallback_pending = False
                 self._voice_raw_input_trigger_pending = False
                 self._voice_audio_stream_active = False
                 self._voice_audio_stop_processed = False
                 self._voice_pcm_forwarding_enabled = False
-                flush_result = self._flush_playback_writer_locked("cleanup")
-                if not flush_result.completed:
-                    failures.append(
-                        "audio playback queue did not flush; owner retained"
-                    )
+                self._voice_pcm_min_arrival_sequence = None
+                if not doubao_cleanup_running:
+                    flush_result = self._voice_audio.flush("cleanup")
+                    if not flush_result.completed:
+                        failures.append(
+                            "audio playback queue did not flush; owner retained"
+                        )
                 self._unsolicited_mic_close_pending = False
                 self._finish_voice_mic_gesture()
-                if self._voice_hotkey_release_pending is not None:
-                    if self._release_pending_voice_hotkey():
-                        self._voice.cancel_pending()
+                if self._voice_shortcut.pending_tokens is not None:
+                    doubao_release_owned = bool(
+                        attempt is not None
+                        and attempt.has_cleanup_debt("hotkey")
+                        and self._voice_shortcut.pending_backend
+                        == _VOICE_HOTKEY_BACKEND_DOUBAO
+                    )
+                    if doubao_release_owned:
+                        self._request_active_doubao_cleanup_locked(
+                            attempt,
+                            reason="connection cleanup",
+                        )
+                    elif self._voice_shortcut.release_pending():
+                        self._voice_shortcut.controller.cancel_pending()
                     else:
                         failures.append(
                             "voice hotkey safety release did not fully deliver; state retained"
                         )
                 else:
-                    reset_action = self._voice.reset()
-                    if reset_action is not None and not self._apply_voice_action(
+                    reset_action = self._voice_shortcut.controller.reset()
+                    if reset_action is not None and not self._voice_shortcut.apply(
                         reset_action
                     ):
                         # _apply_voice_action() already logged the specific failure.
@@ -2654,7 +2980,7 @@ class RC003App:
                         # state before we knew delivery would fail - restore it so
                         # a held shortcut isn't recorded as released while it may
                         # still be physically down (XRBM-019 review round 1 P1 #4).
-                        self._voice.restore_pending(reset_action)
+                        self._voice_shortcut.controller.restore_pending(reset_action)
                         failures.append(
                             "voice hotkey release did not fully deliver; state retained"
                         )
@@ -2684,31 +3010,51 @@ class RC003App:
                 failures.append("BLE session did not fully close; owner retained")
                 # self._ble_session is intentionally NOT cleared here either.
 
-        playback_writer_stopped = True
-        if self._playback_writer is not None:
-            playback_writer_stopped = self._playback_writer.stop()
+        doubao_cleanup_running = bool(
+            attempt is not None and attempt.cleanup_worker_running
+        )
+        playback_writer_stopped = not doubao_cleanup_running
+        if doubao_cleanup_running:
+            failures.append(
+                "Doubao asynchronous cleanup still owns audio resources"
+            )
+        elif self._voice_audio.writer is not None:
+            playback_writer_stopped = self._voice_audio.stop_writer()
             if playback_writer_stopped:
-                self._playback_writer = None
+                if attempt is not None:
+                    attempt.resolve_cleanup_debt("playback")
             else:
                 failures.append(
                     "audio playback writer did not stop; owner retained"
                 )
 
-        if self._playback is not None and playback_writer_stopped:
+        if self._voice_audio.sink is not None and playback_writer_stopped:
+            playback = self._voice_audio.sink
             try:
-                self._playback.close()
-                self._playback = None
+                self._voice_audio.close_sink()
+                if attempt is not None:
+                    if attempt.release_resource("endpoint", playback):
+                        attempt.resolve_cleanup_debt("endpoint")
             except Exception:
                 self._logger.exception("cleanup: closing audio playback failed")
                 failures.append("audio playback did not fully close; owner retained")
-                # self._playback is intentionally NOT cleared here either -
+                # self._voice_audio.sink is intentionally NOT cleared here either -
                 # it owns a PortAudio stream; discarding the reference would
                 # hide an incompletely closed resource and let a reconnect
                 # open a second sink over it (XRBM-019 review round 1 P1
                 # #5).
 
+        if attempt is not None and not attempt.settled.is_set():
+            failures.append(
+                "Doubao attempt cleanup remains unsettled; owner retained"
+            )
+        elif not doubao_settled and attempt is not None:
+            self._logger.info(
+                "Doubao attempt settled during independent cleanup"
+            )
+
         if not failures:
-            with self._voice_trigger_lock:
+            with self._voice_shortcut.lock:
                 self._apply_pending_voice_settings_if_idle_locked()
 
         self._logger.info("cleanup: attempted release of hotkey state and BLE/HID/audio")
@@ -2742,6 +3088,16 @@ class RC003App:
         )
         self._logger.info("ATVV protocol error, requesting reconnect: %s", exc)
         self._supervisor.request_reconnect()
+
+    def _on_battery_level(
+        self,
+        level: int,
+        *,
+        _ble_generation: Optional[int] = None,
+    ) -> None:
+        if not self._accepts_ble_callback(_ble_generation):
+            return
+        self._set_runtime_battery_level(level)
 
     def _accepts_ble_callback(self, generation: Optional[int]) -> bool:
         """Reject callbacks left behind by an older BLE session."""
@@ -2802,11 +3158,62 @@ class RC003App:
             return _VOICE_HOTKEY_BACKEND_DOUBAO
         return _VOICE_HOTKEY_BACKEND_MARKED
 
+    def _ensure_voice_key_physicalizer_for_hotkey(
+        self,
+        tokens: Tuple[str, ...],
+        backend: str,
+    ) -> bool:
+        """Start the process-level right-Alt tracker only when it is needed."""
+
+        if backend not in {
+            _VOICE_HOTKEY_BACKEND_MARKED,
+            _VOICE_HOTKEY_BACKEND_DOUBAO,
+        }:
+            return True
+        try:
+            uses_right_alt = (
+                win32_keys.VK_CODES["ralt"]
+                in win32_keys.resolve_vk_codes(tokens)
+            )
+        except win32_keys.UnknownKeyTokenError:
+            return False
+        if not uses_right_alt:
+            return True
+        with self._voice_key_physicalizer_lifecycle_lock:
+            ready = self._voice_key_physicalizer_ready
+            physicalizer = self._voice_key_physicalizer
+            accepts_new_down = bool(
+                physicalizer is not None
+                and getattr(physicalizer, "accepts_new_down", True)
+            )
+            if ready and not accepts_new_down:
+                self._voice_key_physicalizer_ready = False
+                ready = False
+                if not self._voice_key_physicalizer_degraded_retry_deadline:
+                    self._voice_key_physicalizer_degraded_retry_deadline = (
+                        time.monotonic()
+                        + _VOICE_KEY_PHYSICALIZER_DEGRADED_RETRY_WINDOW_SECONDS
+                    )
+                self._schedule_voice_key_physicalizer_recovery_locked()
+        if not ready:
+            self._start_voice_key_physicalizer()
+        with self._voice_key_physicalizer_lifecycle_lock:
+            physicalizer = self._voice_key_physicalizer
+            return bool(
+                self._voice_key_physicalizer_ready
+                and physicalizer is not None
+                and getattr(physicalizer, "accepts_new_down", True)
+            )
+
     def _prepare_voice_mapping_locked(
         self,
         button_id: str,
         action: key_mapping.ButtonAction,
     ) -> bool:
+        issue = voice_program_manager.voice_configuration_issue(self._config.get("voice_program"))
+        if issue:
+            self._logger.warning("voice mapping ignored: %s", issue)
+            return False
         if not self._direct_hid_interception_ready:
             self._logger.warning(
                 "voice mapping ignored: RC003 HID interception is not ready"
@@ -2855,7 +3262,7 @@ class RC003App:
             )
             return False
         requested = (mode, voice_hotkey.serialize())
-        current = (self._voice.trigger_mode, self._voice_hotkey.serialize())
+        current = (self._voice_shortcut.controller.trigger_mode, self._voice_shortcut.hotkey.serialize())
         if requested != current:
             if not self._voice_settings_idle_locked():
                 self._logger.info(
@@ -2957,6 +3364,7 @@ class RC003App:
             self._accept_ble_events = False
             self._ble_callback_generation += 1
         self._voice_pcm_forwarding_enabled = False
+        self._voice_pcm_min_arrival_sequence = None
         self._voice_audio_stream_active = False
         self._voice_audio_stop_processed = True
         self._voice_raw_input_trigger_pending = False
@@ -2964,17 +3372,32 @@ class RC003App:
         self._voice_mic_gesture_sources_down.clear()
         self._voice_mic_gesture_hid_released = True
 
-        action = self._voice.reset()
+        doubao_attempt = self._active_doubao_attempt_locked()
+        action = self._voice_shortcut.controller.reset()
         released = True
-        if action is not None:
-            released = self._apply_voice_action(action)
+        doubao_cleanup_requested = False
+        if doubao_attempt is not None:
+            released = self._request_active_doubao_cleanup_locked(
+                doubao_attempt,
+                reason=reason,
+            )
+            doubao_cleanup_requested = released
+            if released:
+                self._set_runtime_voice_result(
+                    bridge_runtime_status.VOICE_RUNTIME_FINISHING,
+                    provider=voice_program_manager.VOICE_PROGRAM_DOUBAO_IME,
+                )
+        elif action is not None:
+            released = self._voice_shortcut.apply(action)
             if not released:
-                self._voice.restore_pending(action)
-        elif self._voice_hotkey_release_pending is not None:
-            released = self._release_pending_voice_hotkey()
+                self._voice_shortcut.controller.restore_pending(action)
+        elif self._voice_shortcut.pending_tokens is not None:
+            released = self._voice_shortcut.release_pending()
 
         self._finish_voice_mic_gesture()
-        if released:
+        if released and doubao_cleanup_requested:
+            self._set_runtime_voice_active(False)
+        elif released:
             self._set_runtime_voice_active(False)
             self._log_voice_submission_observation()
             self._finish_voice_diagnostic_attempt(
@@ -3002,12 +3425,12 @@ class RC003App:
         return released
 
     def _voice_hold_watchdog_expired(self, token: object) -> None:
-        with self._voice_trigger_lock:
+        with self._voice_shortcut.lock:
             if self._voice_hold_watchdog_token is not token:
                 return
             self._voice_hold_watchdog_timer = None
             self._voice_hold_watchdog_token = None
-            if not self._voice.active and self._voice_hotkey_release_pending is None:
+            if not self._voice_shortcut.controller.active and self._voice_shortcut.pending_tokens is None:
                 return
 
             self._force_voice_hold_release_locked("voice hold safety release failed")
@@ -3022,7 +3445,7 @@ class RC003App:
         if not (
             self._voice_mic_gesture_active
             and self._voice_mic_gesture_audio_stopped
-            and not self._voice.active
+            and not self._voice_shortcut.controller.active
             and self._voice_mic_gesture_hid_released
         ):
             return False
@@ -3042,14 +3465,29 @@ class RC003App:
     ) -> bool:
         """Release HOLD shortcuts without depending solely on AUDIO_STOP."""
 
-        action = self._voice.on_mic_button_released()
+        self._doubao_session.cancel_current()
+        action = self._voice_shortcut.controller.on_mic_button_released()
         if action is None:
             self._cancel_voice_hold_watchdog_locked()
             return True
         self._voice_raw_input_trigger_pending = False
         self._voice_audio_start_fallback_pending = False
         self._voice_pcm_forwarding_enabled = False
-        if self._apply_voice_action(action):
+        self._voice_pcm_min_arrival_sequence = None
+        doubao_attempt = self._active_doubao_attempt_locked()
+        if doubao_attempt is not None:
+            accepted = self._request_active_doubao_cleanup_locked(
+                doubao_attempt,
+                reason=reason,
+            )
+            if accepted:
+                self._cancel_voice_hold_watchdog_locked()
+                self._set_runtime_voice_result(
+                    bridge_runtime_status.VOICE_RUNTIME_FINISHING,
+                    provider=voice_program_manager.VOICE_PROGRAM_DOUBAO_IME,
+                )
+            return accepted
+        if self._voice_shortcut.apply(action):
             self._cancel_voice_hold_watchdog_locked()
             self._logger.info("voice hold hotkey released on %s", reason)
             if not self._voice_audio_stream_active:
@@ -3065,7 +3503,7 @@ class RC003App:
                 )
             return True
 
-        self._voice.restore_pending(action)
+        self._voice_shortcut.controller.restore_pending(action)
         self._set_runtime_voice_result(
             bridge_runtime_status.VOICE_RUNTIME_HOST_STOP_FAILED
         )
@@ -3076,6 +3514,194 @@ class RC003App:
         )
         self._supervisor.request_reconnect()
         return False
+
+    def _active_doubao_attempt_locked(
+        self,
+    ) -> Optional[rc003_doubao_session.DoubaoAttempt]:
+        attempt = self._doubao_session.current
+        if (
+            self._remote_profile == remote_selection.RC003_PROFILE
+            and attempt is not None
+            and attempt.is_active()
+        ):
+            return attempt
+        return None
+
+    def _request_active_doubao_cleanup_locked(
+        self,
+        attempt: rc003_doubao_session.DoubaoAttempt,
+        *,
+        reason: str,
+    ) -> bool:
+        if attempt.has_cleanup_debt("active_session"):
+            attempt.replace_cleanup_debt(
+                "active_session",
+                "hotkey",
+                "playback",
+            )
+        self._voice_shortcut.pending_tokens = attempt.snapshot.tokens
+        self._voice_shortcut.pending_backend = _VOICE_HOTKEY_BACKEND_DOUBAO
+        self._voice_shortcut.active_backend = _VOICE_HOTKEY_BACKEND_DOUBAO
+        started = self._doubao_session.request_cleanup(
+            attempt,
+            lambda owned: self._run_active_doubao_cleanup(owned, reason=reason),
+        )
+        if not started and not attempt.cleanup_worker_running:
+            self._voice_shortcut.schedule_release_retry()
+            self._supervisor.request_reconnect()
+        return started or attempt.cleanup_worker_running
+
+    def _run_active_doubao_cleanup(
+        self,
+        attempt: rc003_doubao_session.DoubaoAttempt,
+        *,
+        reason: str,
+    ) -> None:
+        debts = attempt.cleanup_debt_snapshot()
+        generation = self._voice_shortcut.control_generation(
+            _VOICE_HOTKEY_BACKEND_DOUBAO
+        )
+        if "playback" in debts:
+            writer = self._voice_audio.writer
+            if writer is None:
+                attempt.resolve_cleanup_debt("playback")
+            else:
+                try:
+                    result = writer.flush()
+                except Exception:
+                    result = None
+                    self._logger.exception(
+                        "Doubao playback flush raised during %s",
+                        reason,
+                    )
+                if result is not None and result.completed:
+                    attempt.resolve_cleanup_debt("playback")
+                else:
+                    self._logger.error(
+                        "Doubao playback flush failed during %s: %s",
+                        reason,
+                        (
+                            result.error
+                            if result is not None and result.error
+                            else "unknown error"
+                        ),
+                    )
+                    self._supervisor.request_reconnect()
+
+        released = True
+        if "hotkey" in debts:
+            try:
+                expected_markers = len(
+                    tuple(
+                        dict.fromkeys(
+                            win32_keys.resolve_vk_codes(attempt.snapshot.tokens)
+                        )
+                    )
+                )
+            except win32_keys.UnknownKeyTokenError:
+                expected_markers = 0
+            self._voice_shortcut.doubao_physicalizer.expect_markers("up", expected_markers)
+            trace_context = {
+                **self._diagnostic_trace.current_context(),
+                "action": voice_controller.VoiceHostAction.KEY_UP.value,
+            }
+            self._diagnostic_trace.emit(
+                "voice_hotkey_requested",
+                **trace_context,
+                backend=_VOICE_HOTKEY_BACKEND_DOUBAO,
+                tokens=list(attempt.snapshot.tokens),
+                source="rc003_doubao_session",
+            )
+            try:
+                released = bool(self._voice_shortcut.doubao_control.stop())
+            except Exception:
+                released = False
+                self._logger.exception(
+                    "Doubao asynchronous voice release failed"
+                )
+            self._diagnostic_trace.emit(
+                "voice_hotkey_result",
+                **trace_context,
+                backend=_VOICE_HOTKEY_BACKEND_DOUBAO,
+                delivered=bool(released),
+                generation=int(generation) if generation is not None else -1,
+                cleanup_pending=bool(
+                    self._voice_shortcut.control_flag(
+                        "cleanup_pending", _VOICE_HOTKEY_BACKEND_DOUBAO
+                    )
+                ),
+            )
+
+        with self._voice_shortcut.lock:
+            if released and "hotkey" in debts:
+                if (
+                    self._voice_shortcut.pending_tokens
+                    == attempt.snapshot.tokens
+                    and self._voice_shortcut.pending_backend
+                    == _VOICE_HOTKEY_BACKEND_DOUBAO
+                ):
+                    self._voice_shortcut.pending_tokens = None
+                    self._voice_shortcut.pending_backend = None
+                    self._voice_shortcut.active_backend = None
+                self._voice_shortcut.cancel_release_retry()
+                attempt.resolve_cleanup_debt("hotkey")
+            elif not released:
+                self._voice_shortcut.schedule_release_retry()
+                self._supervisor.request_reconnect()
+
+            cleanup_succeeded = not (
+                attempt.has_cleanup_debt("hotkey")
+                or attempt.has_cleanup_debt("playback")
+            )
+
+        if generation is not None:
+            self._voice_shortcut.on_cleanup(
+                generation,
+                cleanup_succeeded,
+                _VOICE_HOTKEY_BACKEND_DOUBAO,
+            )
+
+        with self._voice_shortcut.lock:
+            if cleanup_succeeded:
+                self._set_runtime_voice_active(False)
+                if not self._voice_audio_stream_active:
+                    stats = self._voice_audio.stats.summary()
+                    self._voice_shortcut.record_audio_result(int(stats["frames"]))
+                    self._finish_voice_mic_gesture()
+                    self._finish_doubao_diagnostic_after_cleanup_locked(
+                        reason="asynchronous_release_complete",
+                    )
+                self._apply_pending_voice_settings_if_idle_locked()
+        if cleanup_succeeded:
+            self._resume_degraded_voice_key_physicalizer_recovery()
+
+    def _finish_doubao_diagnostic_after_cleanup_locked(
+        self,
+        *,
+        reason: str,
+    ) -> None:
+        if self._voice_attempt_id is None:
+            return
+        stats = self._voice_audio.stats.summary()
+        observation = self._log_voice_submission_observation()
+        text_changed = bool(
+            observation is not None
+            and observation.text_delta is not None
+            and observation.text_delta > 0
+        )
+        if text_changed:
+            result = "text_changed"
+        elif self._voice_shortcut.ui_confirmation == "confirmed" and stats["frames"] > 0:
+            result = "host_confirmed_audio_ok"
+        else:
+            result = "unknown"
+        self._finish_voice_diagnostic_attempt(
+            result,
+            frames=int(stats["frames"]),
+            samples=int(stats["samples"]),
+            audio_signal=bool(stats["frames"] > 0),
+            reason=reason,
+        )
 
     def _reset_key_detection_mic_gesture_locked(self) -> None:
         self._key_detection_mic_gesture_active = False
@@ -3116,7 +3742,7 @@ class RC003App:
             "atvv_press",
             "audio_started",
         }
-        with self._voice_trigger_lock:
+        with self._voice_shortcut.lock:
             # A detection request may appear while a real voice press is still
             # active. Its late HID/F5/audio edges belong to that owned press and
             # must remain available to close the host shortcut. Leave the
@@ -3206,12 +3832,18 @@ class RC003App:
             return -1
 
     def _voice_settings_idle_locked(self) -> bool:
+        chromecast_host = self._chromecast_runtime.voice_host
         return not (
-            self._voice.active
+            self._voice_shortcut.controller.active
+            or self._doubao_session.busy
             or self._voice_mic_gesture_active
             or self._voice_audio_stream_active
             or self._ordinary_mic_gesture_active
-            or self._voice_hotkey_release_pending is not None
+            or self._voice_shortcut.pending_tokens is not None
+            or (
+                chromecast_host is not None
+                and getattr(chromecast_host, "_settings_claimed", False)
+            )
         )
 
     def _ordinary_button_mappings_idle(self) -> bool:
@@ -3227,8 +3859,8 @@ class RC003App:
     ) -> None:
         if trigger_mode != key_mapping.VoiceTriggerMode.HOLD:
             raise ValueError("RC003 voice settings support hold-to-talk only")
-        self._voice = voice_controller.VoiceController()
-        self._voice_hotkey = voice_hotkey
+        self._voice_shortcut.controller = voice_controller.VoiceController()
+        self._voice_shortcut.hotkey = voice_hotkey
         self._config["voice_trigger_mode"] = trigger_mode.value
         self._config["voice_hotkey"] = voice_hotkey.serialize()
         self._logger.info(
@@ -3267,7 +3899,7 @@ class RC003App:
                     self._diagnostic_trace.emit("voice_configuration_applied", result="recovered")
 
     def _apply_pending_settings_if_idle(self) -> None:
-        with self._voice_trigger_lock:
+        with self._voice_shortcut.lock:
             self._apply_pending_voice_settings_if_idle_locked()
 
     def _reload_settings_if_changed(self) -> None:
@@ -3282,6 +3914,9 @@ class RC003App:
             return
         try:
             refreshed_config = config.load_config(self._config_path)
+            from . import remote_selection
+            if remote_selection.active_key(refreshed_config) != remote_selection.active_key(self._config):
+                raise remote_selection.SelectionError("设备选择已变化，须先停止旧服务再切换。")
             refreshed_bindings = config.load_key_bindings(self._bindings_path)
             removed_voice_bindings = config.normalize_voice_product_boundary(
                 refreshed_config,
@@ -3292,7 +3927,7 @@ class RC003App:
             voice_hotkey = hotkey.HotkeySpec.parse(refreshed_hotkey_text)
         except Exception as exc:  # noqa: BLE001 - keep the last valid settings
             self._logger.warning("settings reload skipped: %s", exc)
-            with self._voice_trigger_lock:
+            with self._voice_shortcut.lock:
                 self._config_mtime_ns = current_config_mtime_ns
                 self._bindings_mtime_ns = current_bindings_mtime_ns
             return
@@ -3301,12 +3936,12 @@ class RC003App:
             bool(refreshed_config.get("diagnostic_trace_enabled", False))
         )
         self._record_device_diagnostic_context()
-        with self._voice_trigger_lock:
+        with self._voice_shortcut.lock:
             with self._button_mapping_lock:
                 refreshed_settings = (trigger_mode, voice_hotkey.serialize())
                 current_settings = (
-                    self._voice.trigger_mode,
-                    self._voice_hotkey.serialize(),
+                    self._voice_shortcut.controller.trigger_mode,
+                    self._voice_shortcut.hotkey.serialize(),
                 )
                 if self._voice_settings_idle_locked():
                     self._config = refreshed_config
@@ -3333,7 +3968,7 @@ class RC003App:
                         "settings reload deferred until active voice session is idle"
                     )
                     self._diagnostic_trace.emit("voice_configuration_deferred",
-                        release_pending=self._voice_hotkey_release_pending is not None,
+                        release_pending=self._voice_shortcut.pending_tokens is not None,
                         reason="active_voice_not_idle", **self._diagnostic_trace.current_context())
                 self._config_mtime_ns = current_config_mtime_ns
                 self._bindings_mtime_ns = current_bindings_mtime_ns
@@ -3639,6 +4274,9 @@ class RC003App:
                     button_id,
                     primary_action,
                 )
+                if (getattr(self, "_remote_profile", "") == remote_selection.CHROMECAST_PROFILE
+                        and key_mapping.is_voice_action(primary_action)):
+                    return  # Voice belongs to the next stage, including remapped ordinary buttons.
                 if button_id == "mic" and voice_mode is None:
                     self._handle_ordinary_mic_edge(event_source, is_pressed)
                     ordinary_mic_handled = True
@@ -3651,7 +4289,7 @@ class RC003App:
 
         if button_id == "mic":
             if not is_pressed:
-                with self._voice_trigger_lock:
+                with self._voice_shortcut.lock:
                     source_was_down = (
                         self._voice_mic_gesture_active
                         and event_source in self._voice_mic_gesture_sources_down
@@ -3670,7 +4308,7 @@ class RC003App:
                         self._voice_mic_gesture_hid_released = True
                     self._voice_mic_gesture_sources_down.discard(event_source)
                     if (
-                        self._voice.trigger_mode
+                        self._voice_shortcut.controller.trigger_mode
                         == key_mapping.VoiceTriggerMode.HOLD
                         and (
                             matched_hid_released
@@ -3702,7 +4340,7 @@ class RC003App:
                         self._finish_voice_mic_gesture()
                     self._apply_pending_voice_settings_if_idle_locked()
                 return
-            with self._voice_trigger_lock:
+            with self._voice_shortcut.lock:
                 self._rollover_completed_voice_mic_gesture_locked(event_source)
                 if not self._prepare_voice_mapping_locked(
                     button_id,
@@ -3718,7 +4356,7 @@ class RC003App:
                         event_source,
                     )
                     return
-                if self._voice.active:
+                if self._voice_shortcut.controller.active:
                     self._logger.info(
                         "voice physical trigger ignored: hold session already active"
                     )
@@ -3734,7 +4372,7 @@ class RC003App:
                 self._handle_mic_button_pressed(
                     send_device_open=False,
                 )
-                if not self._voice.active:
+                if not self._voice_shortcut.controller.active and not self._doubao_session.busy:
                     self._voice_raw_input_trigger_pending = False
             return
 
@@ -3824,6 +4462,11 @@ class RC003App:
         return True
 
     def _is_button_repeatable(self, button_id: str) -> bool:
+        action = key_mapping.button_action_for(
+            self._bindings,
+            button_id,
+            key_mapping.ButtonTrigger.SINGLE_CLICK,
+        )
         if button_id not in {
             "up",
             "down",
@@ -3834,12 +4477,17 @@ class RC003App:
             "volume_down",
         }:
             return False
+        return key_mapping.action_allows_repeat(action)
+
+    def _button_repeat_interval(self, button_id: str, repeat_count: int) -> float:
         action = key_mapping.button_action_for(
             self._bindings,
             button_id,
             key_mapping.ButtonTrigger.SINGLE_CLICK,
         )
-        return key_mapping.action_allows_repeat(action)
+        if button_id == "back":
+            return button_gesture.ButtonGestureDispatcher.BACK_REPEAT_INTERVAL_SECONDS
+        return button_gesture.ButtonGestureDispatcher.REPEAT_INTERVAL_SECONDS
 
     def _on_button_gesture_diagnostic(
         self, event: str, button_id: str, **fields: object
@@ -3929,6 +4577,8 @@ class RC003App:
             if action.kind == key_mapping.ActionKind.DISABLED:
                 return
             navigation_vk = _BUTTON_ACTION_NAVIGATION_VKS.get(action.kind)
+            if action.kind == key_mapping.ActionKind.KEY_COMBO:
+                navigation_vk = _BUTTON_NAVIGATION_SINGLE_KEYS.get(tuple(action.keys))
             if navigation_vk is not None and element_navigation_control_windows.route_mapped_navigation_key(navigation_vk):
                 # Accepted commands must not also be injected through SendInput.
                 pass
@@ -3966,22 +4616,21 @@ class RC003App:
                 win32_input.send_mouse_button_click(
                     _BUTTON_ACTION_MOUSE_BUTTONS[action.kind]
                 )
-            elif action.kind == key_mapping.ActionKind.MOUSE_WHEEL_UP:
-                win32_input.send_mouse_wheel(1)
-            elif action.kind == key_mapping.ActionKind.MOUSE_WHEEL_DOWN:
-                win32_input.send_mouse_wheel(-1)
             elif action.kind == key_mapping.ActionKind.ELEMENT_NAVIGATION_TOGGLE:
                 try:
                     result = (
                         element_navigation_control_windows.toggle_element_navigation()
                     )
-                except Exception:
+                except Exception as exc:
+                    action_error = "element_navigation_failed"
+                    action_error_type = type(exc).__name__
                     self._logger.exception("element navigation toggle failed unexpectedly")
                     return
                 if (
                     result.kind
                     == element_navigation_control_windows.ToggleResultKind.FAILED
                 ):
+                    action_error = "element_navigation_failed"
                     self._logger.warning(
                         "element navigation toggle failed: %s",
                         result.error or "unknown_error",
@@ -3996,12 +4645,13 @@ class RC003App:
                 action_executor.open_quicker_uri(action)
             elif action_executor.is_application_action(action):
                 if not open_configured_application(action):
+                    action_error = "application_unavailable"
                     self._logger.warning(
                         "application action unavailable: action=%s", action.kind.value
                     )
             # Voice actions are edge-driven in _on_button_event and never
             # enter this tap-only ordinary action executor.
-            action_success = True
+            action_success = not action_error
         except win32_input.MouseButtonInUseError:
             action_error = "mouse_button_in_use"
             self._logger.info(
@@ -4234,10 +4884,10 @@ class RC003App:
                 mic_action,
             )
             if mic_voice_mode is None:
-                with self._voice_trigger_lock:
+                with self._voice_shortcut.lock:
                     if not self._accepts_ble_callback(_ble_generation):
                         return
-                    if not self._voice.active:
+                    if not self._voice_shortcut.controller.active:
                         self._logger.info(
                             "ATVV mic trigger ignored: physical mic has an ordinary mapping"
                         )
@@ -4248,7 +4898,7 @@ class RC003App:
                             self._unsolicited_mic_close_pending = True
                             self._ble_session.send_mic_close_threadsafe()
                 return
-            with self._voice_trigger_lock:
+            with self._voice_shortcut.lock:
                 if not self._accepts_ble_callback(_ble_generation):
                     return
                 if not self._prepare_voice_mapping_locked("mic", mic_action):
@@ -4286,7 +4936,7 @@ class RC003App:
                         "voice action suppressed"
                     )
                 return
-            with self._voice_trigger_lock:
+            with self._voice_shortcut.lock:
                 if not self._accepts_ble_callback(_ble_generation):
                     return
                 self._logger.info("voice audio started")
@@ -4298,14 +4948,14 @@ class RC003App:
                     return
                 self._voice_audio_stream_active = True
                 self._voice_audio_stop_processed = False
-                self._voice_pcm_stats.reset()
+                self._voice_audio.stats.reset()
                 self._voice_audio_start_fallback_pending = False
                 mic_action = self._primary_button_action("mic")
                 mic_voice_mode = self._voice_mode_for_primary_button(
                     "mic",
                     mic_action,
                 )
-                if not self._voice.active and mic_voice_mode is None:
+                if not self._voice_shortcut.controller.active and mic_voice_mode is None:
                     self._abort_voice_audio_start_locked(
                         "physical mic has an ordinary mapping"
                     )
@@ -4320,7 +4970,7 @@ class RC003App:
                         self._ble_session.send_mic_close_threadsafe()
                     return
                 if (
-                    not self._voice.active
+                    not self._voice_shortcut.controller.active
                     and not self._prepare_voice_mapping_locked("mic", mic_action)
                 ):
                     self._abort_voice_audio_start_locked(
@@ -4346,7 +4996,7 @@ class RC003App:
                         self._logger.info(
                             "voice audio start matched current multi-source gesture"
                         )
-                elif not self._voice.active:
+                elif not self._voice_shortcut.controller.active:
                     self._logger.info("voice audio start used as microphone trigger")
                     if self._begin_voice_mic_gesture("audio_started"):
                         started = self._handle_mic_button_pressed(
@@ -4356,7 +5006,9 @@ class RC003App:
                             self._abort_voice_audio_start_locked(
                                 "voice host start failed after audio started"
                             )
-                        self._voice_audio_start_fallback_pending = self._voice.active
+                        self._voice_audio_start_fallback_pending = (
+                            self._voice_shortcut.controller.active or self._doubao_session.busy
+                        )
         elif isinstance(event, AudioStopped):
             self._diagnostic_trace.emit(
                 "audio_stopped",
@@ -4372,7 +5024,7 @@ class RC003App:
                     "key detection mic audio stopped; voice state unchanged"
                 )
                 return
-            with self._voice_trigger_lock:
+            with self._voice_shortcut.lock:
                 if not self._accepts_ble_callback(_ble_generation):
                     return
                 if (
@@ -4382,18 +5034,23 @@ class RC003App:
                     self._logger.info("voice duplicate audio stop ignored")
                     return
                 runtime_voice_was_active = self._runtime_voice_active
+                self._doubao_session.cancel_current()
                 self._voice_audio_stream_active = False
                 self._voice_audio_stop_processed = True
                 self._voice_pcm_forwarding_enabled = False
+                self._voice_pcm_min_arrival_sequence = None
                 self._set_runtime_voice_active(False)
-                flush_result = self._flush_playback_writer_locked("audio stop")
-                if flush_result.error is not None:
-                    self._logger.error(
-                        "voice playback flush completed with failure: %s",
-                        flush_result.error,
-                    )
+                doubao_attempt = self._active_doubao_attempt_locked()
+                defer_doubao_diagnostic = doubao_attempt is not None
+                if doubao_attempt is None:
+                    flush_result = self._voice_audio.flush("audio stop")
+                    if flush_result.error is not None:
+                        self._logger.error(
+                            "voice playback flush completed with failure: %s",
+                            flush_result.error,
+                        )
                 self._logger.info("voice audio stopped")
-                stats = self._voice_pcm_stats.summary()
+                stats = self._voice_audio.stats.summary()
                 self._diagnostic_trace.emit(
                     "audio_summary",
                     **self._diagnostic_trace.current_context(),
@@ -4420,7 +5077,7 @@ class RC003App:
                     stats["result"],
                 )
                 timing_snapshot = getattr(
-                    self._playback, "timing_snapshot", None
+                    self._voice_audio.sink, "timing_snapshot", None
                 )
                 if callable(timing_snapshot):
                     timing = timing_snapshot()
@@ -4439,10 +5096,16 @@ class RC003App:
                 if self._voice_mic_gesture_active:
                     self._voice_mic_gesture_audio_started = False
                     self._voice_mic_gesture_audio_stopped = True
-                action = self._voice.on_audio_stopped()
-                action_applied = (
-                    True if action is None else self._apply_voice_action(action)
-                )
+                action = self._voice_shortcut.controller.on_audio_stopped()
+                if doubao_attempt is not None and action is not None:
+                    action_applied = self._request_active_doubao_cleanup_locked(
+                        doubao_attempt,
+                        reason="audio stop",
+                    )
+                else:
+                    action_applied = (
+                        True if action is None else self._voice_shortcut.apply(action)
+                    )
                 if action is None or action_applied:
                     self._cancel_voice_hold_watchdog_locked()
                 if action is not None and not action_applied:
@@ -4454,7 +5117,7 @@ class RC003App:
                     # fail closed by requesting a reconnect, the same way a BLE
                     # disconnect or a playback write failure does (XRBM-019
                     # review round 1 P1 #4).
-                    self._voice.restore_pending(action)
+                    self._voice_shortcut.controller.restore_pending(action)
                     self._logger.info(
                         "voice closing action failed to fully deliver; state retained, "
                         "requesting reconnect"
@@ -4468,7 +5131,7 @@ class RC003App:
                     ):
                         self._finish_voice_mic_gesture()
                 if runtime_voice_was_active:
-                    wetype_result_recorded = self._record_wetype_audio_result(
+                    wetype_result_recorded = self._voice_shortcut.record_audio_result(
                         int(stats["frames"])
                     )
                     if action is not None and not action_applied:
@@ -4494,18 +5157,19 @@ class RC003App:
                 if text_changed:
                     attempt_result = "text_changed"
                 elif (
-                    self._voice_ui_confirmation == "confirmed"
+                    self._voice_shortcut.ui_confirmation == "confirmed"
                     and stats["frames"] > 0
                 ):
                     attempt_result = "host_confirmed_audio_ok"
                 else:
                     attempt_result = "unknown"
-                self._finish_voice_diagnostic_attempt(
-                    attempt_result,
-                    frames=int(stats["frames"]),
-                    samples=int(stats["samples"]),
-                    audio_signal=bool(stats["frames"] > 0),
-                )
+                if not defer_doubao_diagnostic:
+                    self._finish_voice_diagnostic_attempt(
+                        attempt_result,
+                        frames=int(stats["frames"]),
+                        samples=int(stats["samples"]),
+                        audio_signal=bool(stats["frames"] > 0),
+                    )
                 self._apply_pending_voice_settings_if_idle_locked()
 
     def _record_device_diagnostic_context(self) -> None:
@@ -4517,25 +5181,90 @@ class RC003App:
                         for row in selected["devices"]],
         )
 
-    def _ensure_voice_diagnostic_attempt(self) -> None:
+    def _ensure_voice_diagnostic_attempt(
+        self,
+        *,
+        provider_shortcut_mode: Optional[str] = None,
+        effective_hotkey_tokens: Optional[Tuple[str, ...]] = None,
+        effective_backend: Optional[str] = None,
+    ) -> None:
         if self._voice_attempt_id is not None:
             return
-        backend = self._configured_voice_hotkey_backend()
-        self._voice_ui_confirmation = "unknown"
+        self._voice_shortcut.ui_confirmation = "unknown"
         self._voice_text_observation = "unknown"
+        if not self._diagnostic_trace.enabled:
+            # Preserve the active-attempt sentinel without collecting diagnostics.
+            self._voice_attempt_id = ""
+            return
+        backend = effective_backend or self._configured_voice_hotkey_backend()
+        tokens = effective_hotkey_tokens or tuple(
+            (*self._voice_shortcut.hotkey.modifiers, self._voice_shortcut.hotkey.key)
+        )
+        shortcut_mode = str(
+            provider_shortcut_mode or self._voice_shortcut.controller.trigger_mode.value
+        )
+        provider = voice_program_manager.normalize_voice_program_settings(
+            self._config.get("voice_program")
+        )["provider"]
+        physicalizer_generation = -1
+        physicalizer_installation_epoch = -1
+        physicalizer_observed_generation = -1
+        physicalizer_observed_installation_epoch = -1
+        physicalizer_binding = "not_required"
+        physicalizer_observation = "not_required"
+        try:
+            uses_right_alt = (
+                win32_keys.VK_CODES["ralt"]
+                in win32_keys.resolve_vk_codes(tokens)
+            )
+        except win32_keys.UnknownKeyTokenError:
+            uses_right_alt = False
+        if (
+            uses_right_alt
+            and backend
+            in {
+                _VOICE_HOTKEY_BACKEND_MARKED,
+                _VOICE_HOTKEY_BACKEND_DOUBAO,
+            }
+        ):
+            with self._voice_key_physicalizer_lifecycle_lock:
+                physicalizer = self._voice_key_physicalizer
+                if physicalizer is not None:
+                    physicalizer_observed_generation = int(
+                        getattr(physicalizer, "tracker_generation", -1)
+                    )
+                    physicalizer_observed_installation_epoch = int(
+                        getattr(physicalizer, "installation_epoch", -1)
+                    )
+                    physicalizer_binding = "observed"
+                    physicalizer_observation = (
+                        "accepting"
+                        if bool(getattr(physicalizer, "accepts_new_down", True))
+                        else "degraded"
+                    )
+                else:
+                    physicalizer_binding = "unbound"
+                    physicalizer_observation = "missing"
         self._voice_attempt_id = self._diagnostic_trace.begin_attempt(
             self._diagnostic_trace.current_gesture("mic"),
-            provider=voice_program_manager.normalize_voice_program_settings(
-                self._config.get("voice_program")
-            )["provider"],
+            provider=provider,
         )
         self._diagnostic_trace.emit(
             "voice_attempt_context",
             **self._diagnostic_trace.current_context(),
             backend=str(backend),
-            trigger_mode=str(self._voice.trigger_mode.value),
-            hotkey_tokens=list(
-                (*self._voice_hotkey.modifiers, self._voice_hotkey.key)
+            remote_recording_mode=str(
+                self._config.get("remote_recording_mode", "hold")
+            ),
+            provider_shortcut_mode=shortcut_mode,
+            hotkey_tokens=list(tokens),
+            physicalizer_binding=physicalizer_binding,
+            physicalizer_generation=physicalizer_generation,
+            physicalizer_installation_epoch=physicalizer_installation_epoch,
+            physicalizer_observation=physicalizer_observation,
+            physicalizer_observed_generation=physicalizer_observed_generation,
+            physicalizer_observed_installation_epoch=(
+                physicalizer_observed_installation_epoch
             ),
             **diagnostic_trace.foreground_context(),
         )
@@ -4544,7 +5273,7 @@ class RC003App:
         self, result: str, **fields: object
     ) -> None:
         payload = {
-            "host_ui": self._voice_ui_confirmation or "unknown",
+            "host_ui": self._voice_shortcut.ui_confirmation or "unknown",
             "text_state": self._voice_text_observation or "unknown",
         }
         payload.update(fields)
@@ -4554,6 +5283,479 @@ class RC003App:
             **payload,
         )
         self._voice_attempt_id = None
+
+    def _doubao_settings_identity(self) -> tuple[object, ...]:
+        return (
+            self._settings_file_mtime_ns(self._config_path),
+            remote_selection.active_key(self._config),
+            self._configured_voice_hotkey_backend(),
+            self._voice_shortcut.hotkey.serialize(),
+            str(self._config.get("output_endpoint_name") or ""),
+            str(self._config.get("output_endpoint_host_api") or ""),
+        )
+
+    def _doubao_attempt_matches_locked(
+        self, attempt: rc003_doubao_session.DoubaoAttempt
+    ) -> bool:
+        snapshot = attempt.snapshot
+        return bool(
+            self._doubao_session.is_current(attempt)
+            and not attempt.cancelled()
+            and self._accept_input_events
+            and self._accept_ble_events
+            and snapshot.ble_generation == self._ble_callback_generation
+            and snapshot.remote_key == self._selected_remote_key
+            and snapshot.settings_identity == self._doubao_settings_identity()
+            and self._configured_voice_hotkey_backend()
+            == _VOICE_HOTKEY_BACKEND_DOUBAO
+            and self._voice_mic_gesture_active
+            and not self._voice_mic_gesture_hid_released
+        )
+
+    def _doubao_attempt_target_healthy(
+        self,
+        attempt: rc003_doubao_session.DoubaoAttempt,
+    ) -> bool:
+        generation, pid = attempt.target_identity()
+        return bool(
+            generation is not None
+            and pid is not None
+            and self._voice_shortcut.doubao_physicalizer.is_active_generation(generation)
+            and self._voice_shortcut.doubao_physicalizer.target_pid == pid
+        )
+
+    def _begin_rc003_doubao_attempt_locked(
+        self, *, send_device_open: bool
+    ) -> bool:
+        if self._remote_profile != remote_selection.RC003_PROFILE:
+            return False
+        if self._doubao_session.busy:
+            self._logger.info(
+                "Doubao voice start ignored: an earlier attempt still owns cleanup"
+            )
+            return False
+        existing_sink = self._voice_audio.sink
+        if existing_sink is not None and not getattr(existing_sink, "ready", True):
+            self._logger.warning(
+                "Doubao voice start rejected: failed playback owner is retained"
+            )
+            self._supervisor.request_reconnect()
+            return False
+        tokens = tuple(self._voice_shortcut.hotkey.modifiers) + (self._voice_shortcut.hotkey.key,)
+        session = self._ble_session
+        arrival_watermark = int(
+            getattr(session, "audio_arrival_watermark", -1)
+        )
+        snapshot = rc003_doubao_session.DoubaoAttemptSnapshot(
+            ble_generation=self._ble_callback_generation,
+            remote_key=self._selected_remote_key,
+            settings_identity=self._doubao_settings_identity(),
+            tokens=tokens,
+            endpoint_name=str(self._config.get("output_endpoint_name") or ""),
+            endpoint_host_api=str(
+                self._config.get("output_endpoint_host_api") or ""
+            ),
+            send_device_open=bool(send_device_open),
+            arrival_watermark=arrival_watermark,
+        )
+        self._voice_pcm_forwarding_enabled = False
+        self._voice_pcm_min_arrival_sequence = None
+        try:
+            attempt = self._doubao_session.begin(
+                snapshot,
+                lambda owned: self._run_rc003_doubao_attempt(
+                    owned,
+                    existing_sink=existing_sink,
+                ),
+            )
+        except BaseException as exc:  # noqa: BLE001 - input callback must fail closed
+            self._logger.error(
+                "Doubao voice attempt worker failed to start: error_type=%s",
+                type(exc).__name__,
+            )
+            return False
+        if attempt is None:
+            return False
+        self._diagnostic_trace.emit(
+            "doubao_start_pending",
+            **self._diagnostic_trace.current_context(),
+            arrival_watermark=int(arrival_watermark),
+            send_device_open=bool(send_device_open),
+        )
+        return True
+
+    def _create_private_doubao_playback(
+        self, snapshot: rc003_doubao_session.DoubaoAttemptSnapshot
+    ):
+        endpoints = audio_output.enumerate_output_endpoints()
+        audio_output.resolve_selected_endpoint(
+            endpoints,
+            snapshot.endpoint_name,
+            snapshot.endpoint_host_api,
+        )
+        sink = audio_playback.EndpointPlaybackSink(
+            snapshot.endpoint_name,
+            snapshot.endpoint_host_api,
+        )
+        return sink
+
+    def _finish_cancelled_doubao_control(
+        self,
+        attempt: rc003_doubao_session.DoubaoAttempt,
+        prepared: Optional[wetype_control_windows.PreparedDoubaoVoiceStart],
+        *,
+        dispatched: bool,
+    ) -> set[str]:
+        control = self._voice_shortcut.doubao_control
+        if prepared is not None and not dispatched:
+            try:
+                control.cancel_prepared(prepared)
+            except Exception:
+                self._logger.exception("Doubao prepared start cancellation failed")
+                return {"preparation"}
+            wait_settled = getattr(prepared, "wait_settled", None)
+            if callable(wait_settled) and not wait_settled(None):
+                return {"preparation"}
+        if not dispatched and not getattr(control, "cleanup_pending", False):
+            return set()
+        try:
+            expected_markers = len(
+                tuple(dict.fromkeys(win32_keys.resolve_vk_codes(attempt.snapshot.tokens)))
+            )
+        except win32_keys.UnknownKeyTokenError:
+            expected_markers = 0
+        self._voice_shortcut.doubao_physicalizer.expect_markers("up", expected_markers)
+        try:
+            released = bool(control.stop())
+        except Exception:
+            released = False
+            self._logger.exception("Doubao cancelled start could not release shortcut")
+        if not released:
+            attempt.add_cleanup_debts("hotkey")
+            with self._voice_shortcut.lock:
+                self._voice_shortcut.pending_tokens = attempt.snapshot.tokens
+                self._voice_shortcut.pending_backend = (
+                    _VOICE_HOTKEY_BACKEND_DOUBAO
+                )
+                self._voice_shortcut.schedule_release_retry()
+            self._supervisor.request_reconnect()
+            return {"hotkey"}
+        return set()
+
+    def _run_rc003_doubao_attempt(
+        self,
+        attempt: rc003_doubao_session.DoubaoAttempt,
+        *,
+        existing_sink,
+    ) -> None:
+        snapshot = attempt.snapshot
+        sink = existing_sink
+        private_sink = False
+        prepared = None
+        dispatched = False
+        dispatch_may_have_sent = False
+        committed = False
+        outcome = "failed_before_dispatch"
+        cleanup_debts: set[str] = set()
+        error_type = ""
+        watch = None
+        try:
+            if sink is None:
+                sink = self._create_private_doubao_playback(snapshot)
+                private_sink = True
+                attempt.retain_resource("endpoint", sink)
+                sink.open()
+            if attempt.cancelled():
+                outcome = "cancelled_before_dispatch"
+                return
+            prepared = self._voice_shortcut.doubao_control.prepare(
+                snapshot.tokens,
+                cancelled=attempt.cancelled,
+                cancel_event=attempt.cancel_event,
+            )
+            if prepared is None:
+                outcome = (
+                    "cancelled_before_dispatch"
+                    if attempt.cancelled()
+                    else "prepare_failed"
+                )
+                return
+            if not getattr(prepared, "ready", True):
+                outcome = "prepare_timeout"
+                return
+            if not self._prepare_doubao_voice_physicalizer(
+                snapshot.tokens, cancel_event=attempt.cancel_event
+            ):
+                outcome = (
+                    "cancelled_before_dispatch"
+                    if attempt.cancelled()
+                    else "physicalizer_failed"
+                )
+                return
+            physicalizer_generation = int(self._voice_shortcut.doubao_physicalizer.generation)
+            physicalizer_pid = self._voice_shortcut.doubao_physicalizer.target_pid
+            if (
+                physicalizer_pid is None
+                or not self._voice_shortcut.doubao_physicalizer.is_active_generation(
+                    physicalizer_generation
+                )
+            ):
+                outcome = "physicalizer_target_unavailable"
+                return
+            attempt.bind_physicalizer(
+                physicalizer_generation,
+                int(physicalizer_pid),
+            )
+            try:
+                watch = self._doubao_capture_watch_factory(int(physicalizer_pid))
+            except TypeError:
+                # Test/injected factories predating target scoping remain
+                # usable; the production factory always consumes the PID.
+                watch = self._doubao_capture_watch_factory()
+            watch.begin()
+            self._capture_voice_focus_before()
+            with self._voice_shortcut.lock:
+                if (
+                    not self._doubao_attempt_matches_locked(attempt)
+                    or not self._doubao_attempt_target_healthy(attempt)
+                ):
+                    outcome = "cancelled_before_dispatch"
+                    return
+            try:
+                expected_markers = len(
+                    tuple(dict.fromkeys(win32_keys.resolve_vk_codes(snapshot.tokens)))
+                )
+            except win32_keys.UnknownKeyTokenError:
+                expected_markers = 0
+            self._voice_shortcut.doubao_physicalizer.expect_markers("down", expected_markers)
+            trace_context = {
+                **self._diagnostic_trace.current_context(),
+                "action": voice_controller.VoiceHostAction.KEY_DOWN.value,
+            }
+            self._diagnostic_trace.emit(
+                "voice_hotkey_requested",
+                **trace_context,
+                backend=_VOICE_HOTKEY_BACKEND_DOUBAO,
+                tokens=list(snapshot.tokens),
+                source="rc003_doubao_session",
+            )
+            attempt.mark_dispatch_started()
+            dispatched = bool(
+                self._voice_shortcut.doubao_control.dispatch_prepared(
+                    prepared,
+                    cancelled=attempt.cancelled,
+                )
+            )
+            dispatch_may_have_sent = bool(
+                dispatched
+                or self._voice_shortcut.control_flag(
+                    "cleanup_pending",
+                    _VOICE_HOTKEY_BACKEND_DOUBAO,
+                )
+            )
+            generation = self._voice_shortcut.control_generation(
+                _VOICE_HOTKEY_BACKEND_DOUBAO
+            )
+            self._diagnostic_trace.emit(
+                "voice_hotkey_result",
+                **trace_context,
+                backend=_VOICE_HOTKEY_BACKEND_DOUBAO,
+                delivered=bool(dispatched),
+                generation=int(generation) if generation is not None else -1,
+                cleanup_pending=bool(
+                    self._voice_shortcut.control_flag(
+                        "cleanup_pending", _VOICE_HOTKEY_BACKEND_DOUBAO
+                    )
+                ),
+            )
+            if not dispatched:
+                outcome = (
+                    "cancelled_before_dispatch"
+                    if attempt.cancelled()
+                    else (
+                        "dispatch_uncertain"
+                        if dispatch_may_have_sent
+                        else "dispatch_failed"
+                    )
+                )
+                return
+            attempt.transition(rc003_doubao_session.WAITING_HOST)
+            deadline = time.monotonic() + _DOUBAO_HOST_READY_TIMEOUT_SECONDS
+            host_ready = False
+            while not attempt.cancelled() and time.monotonic() < deadline:
+                if not self._doubao_attempt_target_healthy(attempt):
+                    outcome = "physicalizer_target_unavailable"
+                    return
+                watch.poll(time.monotonic())
+                if watch.identity is not None and watch.status == "tracking":
+                    host_ready = True
+                    break
+                attempt.cancel_event.wait(_DOUBAO_HOST_READY_POLL_SECONDS)
+            if not host_ready:
+                outcome = (
+                    "cancelled_waiting_host"
+                    if attempt.cancelled()
+                    else "host_not_ready"
+                )
+                return
+            session = self._ble_session
+            readiness_watermark = int(
+                getattr(session, "audio_arrival_watermark", snapshot.arrival_watermark)
+            )
+            with self._voice_shortcut.lock:
+                if (
+                    not self._doubao_attempt_matches_locked(attempt)
+                    or not self._doubao_attempt_target_healthy(attempt)
+                ):
+                    outcome = "cancelled_waiting_host"
+                    return
+                if private_sink:
+                    if self._voice_audio.sink is not None:
+                        outcome = "playback_owner_changed"
+                        return
+                elif self._voice_audio.sink is not sink:
+                    outcome = "playback_owner_changed"
+                    return
+                action = self._voice_shortcut.controller.on_mic_button_pressed()
+                if action != voice_controller.VoiceHostAction.KEY_DOWN:
+                    outcome = "logical_start_rejected"
+                    return
+                if private_sink:
+                    self._voice_audio.adopt(sink)
+                if not self._voice_audio.ensure_writer(sink):
+                    if private_sink and self._voice_audio.sink is sink:
+                        self._voice_audio.detach(sink)
+                    self._voice_shortcut.controller.cancel_pending()
+                    outcome = "playback_writer_failed"
+                    return
+                if private_sink:
+                    attempt.release_resource("endpoint", sink)
+                # From this point the ordinary connection cleanup owns the
+                # published sink and its writer, including a later watchdog
+                # failure. The attempt must not close it behind that worker.
+                private_sink = False
+                self._voice_shortcut.active_backend = _VOICE_HOTKEY_BACKEND_DOUBAO
+                self._voice_shortcut.pending_tokens = None
+                self._voice_shortcut.pending_backend = None
+                self._voice_shortcut.begin_runtime(_VOICE_HOTKEY_BACKEND_DOUBAO)
+                generation = self._voice_shortcut.control_generation(
+                    _VOICE_HOTKEY_BACKEND_DOUBAO
+                )
+                self._voice_shortcut.track_generation(
+                    generation,
+                    _VOICE_HOTKEY_BACKEND_DOUBAO,
+                )
+                self._voice_shortcut.ui_confirmation = "confirmed"
+                self._voice_pcm_min_arrival_sequence = readiness_watermark
+                self._voice_pcm_forwarding_enabled = True
+                self._set_runtime_voice_result(
+                    bridge_runtime_status.VOICE_RUNTIME_ACTIVE,
+                    provider=voice_program_manager.VOICE_PROGRAM_DOUBAO_IME,
+                )
+                self._set_runtime_voice_active(True)
+                self._diagnostic_trace.emit(
+                    "hotkey_sent",
+                    **self._diagnostic_trace.current_context(),
+                    backend=_VOICE_HOTKEY_BACKEND_DOUBAO,
+                )
+                if not self._arm_voice_hold_watchdog_locked():
+                    self._force_voice_hold_release_locked(
+                        "voice hold safety timer unavailable"
+                    )
+                    outcome = "watchdog_failed"
+                    return
+                if snapshot.send_device_open and self._ble_session is not None:
+                    self._ble_session.send_mic_open_threadsafe()
+                committed = True
+                attempt.mark_active()
+                self._diagnostic_trace.emit(
+                    "doubao_host_ready",
+                    **self._diagnostic_trace.current_context(),
+                    readiness_watermark=int(readiness_watermark),
+                )
+            outcome = "active"
+        except audio_output.AudioOutputUnavailableError as exc:
+            error_type = type(exc).__name__
+            outcome = "output_open_failed"
+            self._logger.info("Doubao playback unavailable, failing closed: %s", exc)
+        except BaseException as exc:  # noqa: BLE001 - always settle attempt ownership
+            error_type = type(exc).__name__
+            outcome = "failed_after_dispatch" if dispatched else "failed_before_dispatch"
+            self._logger.exception("Doubao asynchronous voice start failed")
+        finally:
+            if not committed:
+                cleanup_debts.update(
+                    self._finish_cancelled_doubao_control(
+                        attempt,
+                        prepared,
+                        dispatched=dispatched,
+                    )
+                )
+                if private_sink and sink is not None:
+                    try:
+                        sink.close()
+                    except Exception:
+                        cleanup_debts.add("endpoint")
+                        attempt.add_cleanup_debts("endpoint")
+                        with self._voice_shortcut.lock:
+                            if self._voice_audio.sink is None:
+                                self._voice_audio.adopt(sink)
+                        self._logger.exception(
+                            "Doubao private playback cleanup failed; owner retained"
+                        )
+                        self._supervisor.request_reconnect()
+                    else:
+                        attempt.release_resource("endpoint", sink)
+                with self._voice_shortcut.lock:
+                    self._voice_pcm_forwarding_enabled = False
+                    self._voice_pcm_min_arrival_sequence = None
+                    if (
+                        self._voice_shortcut.controller.active
+                        and self._voice_shortcut.active_backend
+                        in (None, _VOICE_HOTKEY_BACKEND_DOUBAO)
+                    ):
+                        self._voice_shortcut.controller.cancel_pending()
+                        self._voice_shortcut.active_backend = None
+                    self._voice_focus_before = None
+                    self._voice_focus_provider = ""
+                    self._voice_focus_submit_method = ""
+                    self._set_runtime_voice_active(False)
+                    self._set_runtime_voice_result(
+                        (
+                            bridge_runtime_status.VOICE_RUNTIME_OUTPUT_OPEN_FAILED
+                            if outcome == "output_open_failed"
+                            else bridge_runtime_status.VOICE_RUNTIME_HOST_START_FAILED
+                        ),
+                        provider=voice_program_manager.VOICE_PROGRAM_DOUBAO_IME,
+                    )
+                    self._finish_voice_diagnostic_attempt(
+                        (
+                            "failed_after_send"
+                            if dispatch_may_have_sent
+                            else "failed_before_send"
+                        ),
+                        reason=outcome,
+                    )
+            if committed:
+                attempt.finish(
+                    outcome,
+                    error_type=error_type,
+                )
+            else:
+                attempt.finish(
+                    outcome,
+                    error_type=error_type,
+                )
+            self._diagnostic_trace.emit(
+                "doubao_start_finished",
+                outcome=outcome,
+                dispatch_started=bool(attempt.dispatch_started),
+                cleanup_complete=bool(attempt.cleanup_complete),
+                error_type=error_type or "none",
+                capture_watch_status=(
+                    str(watch.status) if watch is not None else "not_started"
+                ),
+            )
 
     def _handle_mic_button_pressed(
         self,
@@ -4571,6 +5773,11 @@ class RC003App:
         endpoint.
         """
 
+        issue = voice_program_manager.voice_configuration_issue(self._config.get("voice_program"))
+        if issue:
+            self._logger.warning("voice startup rejected: %s", issue)
+            self._set_runtime_voice_result(bridge_runtime_status.VOICE_RUNTIME_HOST_START_FAILED)
+            return False
         self._ensure_voice_diagnostic_attempt()
         if not self._accept_input_events or not self._accept_ble_events:
             self._voice_pcm_forwarding_enabled = False
@@ -4587,8 +5794,8 @@ class RC003App:
             )
             return False
 
-        if self._voice_hotkey_release_pending is not None:
-            if not self._release_pending_voice_hotkey():
+        if self._voice_shortcut.pending_tokens is not None:
+            if not self._voice_shortcut.release_pending():
                 self._voice_pcm_forwarding_enabled = False
                 self._set_runtime_voice_result(
                     bridge_runtime_status.VOICE_RUNTIME_HOST_STOP_FAILED
@@ -4600,9 +5807,19 @@ class RC003App:
                     "failed_before_send", reason="previous_release_pending"
                 )
                 return False
-            self._voice_hotkey_release_pending = None
+            self._voice_shortcut.pending_tokens = None
 
-        if not self._open_playback_for_new_session():
+        if (
+            self._remote_profile == remote_selection.RC003_PROFILE
+            and self._configured_voice_hotkey_backend()
+            == _VOICE_HOTKEY_BACKEND_DOUBAO
+        ):
+            return self._begin_rc003_doubao_attempt_locked(
+                send_device_open=send_device_open
+            )
+
+        self._voice_pcm_min_arrival_sequence = None
+        if not self._voice_audio.open():
             self._voice_pcm_forwarding_enabled = False
             self._set_runtime_voice_result(
                 bridge_runtime_status.VOICE_RUNTIME_OUTPUT_OPEN_FAILED
@@ -4630,8 +5847,8 @@ class RC003App:
             return False
 
         self._capture_voice_focus_before()
-        action = self._voice.on_mic_button_pressed()
-        action_delivered = self._apply_voice_action(action)
+        action = self._voice_shortcut.controller.on_mic_button_pressed()
+        action_delivered = self._voice_shortcut.apply(action)
         if not action_delivered:
             self._voice_focus_before = None
             self._voice_focus_provider = ""
@@ -4643,7 +5860,7 @@ class RC003App:
             # Nothing physically landed (win32_input.py's own batching already
             # rolled back any partial key-down), so clear the logical hold
             # without attempting a second delivery.
-            self._voice.cancel_pending()
+            self._voice_shortcut.controller.cancel_pending()
             self._logger.info(
                 "voice failing closed: host hotkey delivery failed; device command suppressed"
             )
@@ -4676,7 +5893,7 @@ class RC003App:
         self._voice_raw_input_trigger_pending = False
         self._voice_pcm_forwarding_enabled = False
         self._set_runtime_voice_active(False)
-        flush_result = self._flush_playback_writer_locked(reason)
+        flush_result = self._voice_audio.flush(reason)
         if flush_result.error is not None:
             self._logger.error(
                 "voice audio start rollback flush failed: %s",
@@ -4783,7 +6000,7 @@ class RC003App:
                 else -1
             ),
             diagnostic=after.error or "captured",
-            voice_ui=self._voice_ui_confirmation or "unknown",
+            voice_ui=self._voice_shortcut.ui_confirmation or "unknown",
             foreground_executable=after.foreground_executable,
             process_query_status=after.process_query_status,
             foreground_thread_id=after.foreground_thread_id,
@@ -4813,143 +6030,12 @@ class RC003App:
         self._voice_focus_submit_method = ""
         return observation
 
-    def _apply_voice_action(self, action: voice_controller.VoiceHostAction) -> bool:
-        backend = self._configured_voice_hotkey_backend()
-        tokens = tuple(self._voice_hotkey.modifiers) + (self._voice_hotkey.key,)
-        if action == voice_controller.VoiceHostAction.KEY_UP:
-            backend = (
-                self._voice_hotkey_active_backend
-                or self._voice_hotkey_release_pending_backend
-                or backend
-            )
-        trace_context = {
-            **self._diagnostic_trace.current_context(),
-            "action": str(action.value),
-        }
-        self._diagnostic_trace.emit(
-            "voice_hotkey_requested",
-            **trace_context,
-            backend=str(backend),
-            tokens=list(tokens),
-            source="voice_controller",
-        )
-        if backend in _INPUT_PROFILE_VOICE_HOTKEY_BACKENDS:
-            control = self._input_profile_voice_control(backend)
-            provider = self._input_profile_provider_for_backend(backend)
-            if action == voice_controller.VoiceHostAction.KEY_DOWN:
-                if (
-                    backend == _VOICE_HOTKEY_BACKEND_DOUBAO
-                    and not self._prepare_doubao_voice_physicalizer(tokens)
-                ):
-                    return False
-                self._begin_wetype_runtime_session(backend)
-            if backend == _VOICE_HOTKEY_BACKEND_DOUBAO:
-                try:
-                    expected_markers = len(
-                        tuple(dict.fromkeys(win32_keys.resolve_vk_codes(tokens)))
-                    )
-                except win32_keys.UnknownKeyTokenError:
-                    expected_markers = 0
-                self._doubao_physicalizer.expect_markers(
-                    "down"
-                    if action == voice_controller.VoiceHostAction.KEY_DOWN
-                    else "up",
-                    expected_markers,
-                )
-            try:
-                delivered = (
-                    control.start(tokens)
-                    if action == voice_controller.VoiceHostAction.KEY_DOWN
-                    else control.stop()
-                )
-            except (win32_input.Win32InputUnavailableError, OSError):
-                self._logger.exception(
-                    "%s voice shortcut control failed",
-                    provider,
-                )
-                return False
-            generation = self._wetype_control_generation(backend)
-            self._diagnostic_trace.emit(
-                "voice_hotkey_result",
-                **trace_context,
-                backend=str(backend),
-                delivered=bool(delivered),
-                generation=int(generation) if generation is not None else -1,
-                cleanup_pending=bool(
-                    self._wetype_control_flag("cleanup_pending", backend)
-                ),
-            )
-            cleanup_pending = self._wetype_control_flag("cleanup_pending", backend)
-            if delivered or cleanup_pending:
-                self._track_wetype_runtime_generation(generation, backend)
-            if not delivered:
-                if action == voice_controller.VoiceHostAction.KEY_DOWN and cleanup_pending:
-                    self._voice_hotkey_release_pending = tokens
-                    self._voice_hotkey_release_pending_backend = backend
-                    self._schedule_voice_hotkey_release_retry_locked()
-                self._logger.warning(
-                    "%s voice shortcut did not confirm logical %s",
-                    provider,
-                    action.value,
-                )
-                return False
-            if action == voice_controller.VoiceHostAction.KEY_DOWN:
-                self._voice_hotkey_active_backend = backend
-            else:
-                self._voice_hotkey_active_backend = None
-                if self._wetype_control_flag("completion_pending", backend):
-                    self._set_runtime_voice_result(
-                        bridge_runtime_status.VOICE_RUNTIME_FINISHING,
-                        provider=provider,
-                    )
-                elif generation is not None:
-                    self._on_wetype_cleanup_finished(
-                        generation,
-                        True,
-                        backend,
-                    )
-            self._voice_hotkey_release_pending = None
-            self._voice_hotkey_release_pending_backend = None
-            return True
-        provider_action = action
-        try:
-            if provider_action == voice_controller.VoiceHostAction.KEY_DOWN:
-                self._voice_hotkey_release_pending = tokens
-                self._voice_hotkey_release_pending_backend = backend
-            self._send_voice_hotkey_action(provider_action, tokens, backend)
-            if action == voice_controller.VoiceHostAction.KEY_DOWN:
-                self._voice_hotkey_active_backend = backend
-            if action == voice_controller.VoiceHostAction.KEY_UP:
-                self._voice_hotkey_release_pending = None
-                self._voice_hotkey_release_pending_backend = None
-                self._voice_hotkey_active_backend = None
-            return True
-        except win32_input.Win32InputUnavailableError:
-            if provider_action == voice_controller.VoiceHostAction.KEY_DOWN:
-                self._voice_hotkey_release_pending = None
-                self._voice_hotkey_release_pending_backend = None
-                self._voice_hotkey_active_backend = None
-            self._logger.info("voice hotkey action skipped: no usable voice input backend")
-            return False
-        except win32_input.InputCleanupIncompleteError:
-            self._voice_hotkey_release_pending = tokens
-            self._voice_hotkey_release_pending_backend = backend
-            self._schedule_voice_hotkey_release_retry_locked()
-            self._logger.exception(
-                "voice hotkey action failed and safety key-up remains pending"
-            )
-            return False
-        except OSError:
-            if provider_action == voice_controller.VoiceHostAction.KEY_DOWN:
-                self._voice_hotkey_release_pending = None
-                self._voice_hotkey_release_pending_backend = None
-                self._voice_hotkey_active_backend = None
-            self._logger.exception("voice hotkey action failed to fully deliver")
-            return False
 
     def _prepare_doubao_voice_physicalizer(
         self,
         tokens: Tuple[str, ...],
+        *,
+        cancel_event: Optional[threading.Event] = None,
     ) -> bool:
         try:
             vk_codes = tuple(win32_keys.resolve_vk_codes(tokens))
@@ -4958,314 +6044,98 @@ class RC003App:
                 "Doubao voice physicalizer rejected an unknown hotkey token"
             )
             return False
-        if self._doubao_physicalizer.start(vk_codes):
-            self._logger.info(
-                "Doubao voice physicalizer ready for configured shortcut"
-            )
-            return True
+        # ActivateProfile can finish before ImeService.exe is created. Only
+        # the asynchronous RC003 attempt may wait here; synchronous callers
+        # retain their non-waiting behavior. Never retry a hook/permission/
+        # version failure, or resend a shortcut while waiting for the host.
+        deadline = time.monotonic() + _DOUBAO_PROCESS_READY_TIMEOUT_SECONDS
+        waiting_logged = False
+        while cancel_event is None or not cancel_event.is_set():
+            if self._voice_shortcut.doubao_physicalizer.start(vk_codes):
+                self._logger.info(
+                    "Doubao voice physicalizer ready for configured shortcut"
+                )
+                return True
+            if (
+                cancel_event is None
+                or self._voice_shortcut.doubao_physicalizer.status != "unavailable"
+                or self._voice_shortcut.doubao_physicalizer.error != "ImeService.exe is not running"
+            ):
+                break
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            if not waiting_logged:
+                self._logger.info("Waiting for Doubao process after profile activation")
+                waiting_logged = True
+            if cancel_event.wait(min(_DOUBAO_HOST_READY_POLL_SECONDS, remaining)):
+                return False
+            if time.monotonic() >= deadline:
+                break
         self._logger.warning(
             "Doubao voice physicalizer unavailable: status=%s error=%s",
-            self._doubao_physicalizer.status,
-            self._doubao_physicalizer.error or "unknown",
+            self._voice_shortcut.doubao_physicalizer.status,
+            self._voice_shortcut.doubao_physicalizer.error or "unknown",
         )
         return False
 
-    @staticmethod
-    def _send_voice_hotkey_action(
-        action: voice_controller.VoiceHostAction,
-        tokens: Tuple[str, ...],
-        backend: str,
-    ) -> None:
-        if backend in _INPUT_PROFILE_VOICE_HOTKEY_BACKENDS:
-            raise OSError("input profile shortcut is owned by its voice control")
-        if action == voice_controller.VoiceHostAction.KEY_DOWN:
-            win32_input.send_voice_key_combo_down(tokens)
-        else:
-            win32_input.send_voice_key_combo_up(tokens)
 
-    def _cancel_voice_hotkey_release_retry_locked(
-        self,
-        *,
-        reset_delay: bool = True,
-    ) -> None:
-        timer = self._voice_hotkey_release_retry_timer
-        self._voice_hotkey_release_retry_timer = None
-        self._voice_hotkey_release_retry_token = None
-        if reset_delay:
-            self._voice_hotkey_release_retry_delay = (
-                _VOICE_HOTKEY_RELEASE_RETRY_INITIAL_SECONDS
-            )
-        if timer is not None:
-            cancel = getattr(timer, "cancel", None)
-            if callable(cancel):
-                cancel()
 
-    def _schedule_voice_hotkey_release_retry_locked(self) -> None:
-        if (
-            self._voice_hotkey_release_retry_stopping
-            or self._voice_hotkey_release_pending is None
-            or self._voice_hotkey_release_retry_timer is not None
-        ):
-            return
-        token = object()
-        try:
-            timer = self._voice_hotkey_release_timer_factory(
-                self._voice_hotkey_release_retry_delay,
-                lambda: self._retry_pending_voice_hotkey_release(token),
-            )
-            timer.daemon = True
-            self._voice_hotkey_release_retry_token = token
-            self._voice_hotkey_release_retry_timer = timer
-            timer.start()
-        except Exception:
-            if self._voice_hotkey_release_retry_token is token:
-                self._voice_hotkey_release_retry_token = None
-                self._voice_hotkey_release_retry_timer = None
-            self._logger.exception("voice hotkey safety-release timer failed")
 
-    def _retry_pending_voice_hotkey_release(self, token: object) -> None:
-        with self._voice_trigger_lock:
-            if self._voice_hotkey_release_retry_token is not token:
-                return
-            self._voice_hotkey_release_retry_token = None
-            self._voice_hotkey_release_retry_timer = None
-            if (
-                self._voice_hotkey_release_retry_stopping
-                or self._voice_hotkey_release_pending is None
-            ):
-                return
-            self._voice_hotkey_release_retry_delay = min(
-                _VOICE_HOTKEY_RELEASE_RETRY_MAX_SECONDS,
-                max(
-                    _VOICE_HOTKEY_RELEASE_RETRY_INITIAL_SECONDS,
-                    self._voice_hotkey_release_retry_delay * 2.0,
-                ),
-            )
-            self._release_pending_voice_hotkey()
 
-    def _release_pending_voice_hotkey(self) -> bool:
-        tokens = self._voice_hotkey_release_pending
-        if tokens is None:
-            return True
-        backend = (
-            self._voice_hotkey_release_pending_backend
-            or self._voice_hotkey_active_backend
-            or self._configured_voice_hotkey_backend()
-        )
-        try:
-            if backend in _INPUT_PROFILE_VOICE_HOTKEY_BACKENDS:
-                control = self._input_profile_voice_control(backend)
-                provider = self._input_profile_provider_for_backend(backend)
-                delivered = control.stop()
-                if not delivered:
-                    self._schedule_voice_hotkey_release_retry_locked()
-                    return False
-                generation = self._wetype_control_generation(backend)
-                if self._wetype_control_flag("completion_pending", backend):
-                    self._set_runtime_voice_result(
-                        bridge_runtime_status.VOICE_RUNTIME_FINISHING,
-                        provider=provider,
-                    )
-                elif generation is not None:
-                    self._on_wetype_cleanup_finished(
-                        generation,
-                        True,
-                        backend,
-                    )
-            else:
-                self._send_voice_hotkey_action(
-                    voice_controller.VoiceHostAction.KEY_UP,
-                    tokens,
-                    backend,
-                )
-        except (win32_input.Win32InputUnavailableError, OSError):
-            self._logger.exception("voice hotkey safety release failed")
-            self._schedule_voice_hotkey_release_retry_locked()
-            return False
-        self._voice_hotkey_release_pending = None
-        self._voice_hotkey_release_pending_backend = None
-        self._voice_hotkey_active_backend = None
-        self._cancel_voice_hotkey_release_retry_locked()
-        self._logger.info("voice hotkey safety release completed")
-        return True
 
-    def _open_playback_for_new_session(self) -> bool:
-        if self._playback is not None:
-            if getattr(self._playback, "ready", True):
-                return self._ensure_playback_writer(self._playback)
-            self._logger.warning(
-                "voice playback cannot reopen while a failed stream remains owned; "
-                "requesting cleanup"
-            )
-            self._supervisor.request_reconnect()
-            return False
-        endpoint_name = self._config.get("output_endpoint_name") or ""
-        endpoint_host_api = self._config.get("output_endpoint_host_api") or ""
-        sink = None
-        try:
-            endpoints = audio_output.enumerate_output_endpoints()
-            audio_output.resolve_selected_endpoint(endpoints, endpoint_name, endpoint_host_api)
-            sink = audio_playback.EndpointPlaybackSink(endpoint_name, endpoint_host_api)
-            self._playback = sink
-            sink.open()
-            if not self._ensure_playback_writer(sink):
-                raise audio_output.AudioOutputUnavailableError(
-                    "audio playback writer could not start"
-                )
-            timing_snapshot = getattr(sink, "timing_snapshot", None)
-            timing = timing_snapshot() if callable(timing_snapshot) else None
-            if timing is None:
-                self._logger.info(
-                    "voice playback opened: endpoint=%s host_api=%s "
-                    "sample_rate=%s channels=%s",
-                    endpoint_name or "unspecified",
-                    endpoint_host_api or "unspecified",
-                    sink.output_sample_rate_hz,
-                    sink.output_channels,
-                )
-            else:
-                self._logger.info(
-                    "voice playback opened: endpoint=%s host_api=%s "
-                    "sample_rate=%s channels=%s open_ms=%.2f",
-                    endpoint_name or "unspecified",
-                    endpoint_host_api or "unspecified",
-                    sink.output_sample_rate_hz,
-                    sink.output_channels,
-                    timing.open_elapsed_ms,
-                )
-            return True
-        except audio_output.AudioOutputUnavailableError as exc:
-            self._logger.info("voice audio unavailable, failing closed: %s", exc)
-            if sink is None or not sink.owns_stream:
-                self._playback = None
-            else:
-                self._logger.warning(
-                    "voice audio open cleanup incomplete; playback owner retained"
-                )
-                self._supervisor.request_reconnect()
-            return False
-        except Exception:
-            self._logger.exception("voice audio failed to open, failing closed")
-            if sink is None or not sink.owns_stream:
-                self._playback = None
-            else:
-                self._logger.warning(
-                    "voice audio open cleanup incomplete; playback owner retained"
-                )
-                self._supervisor.request_reconnect()
-            return False
 
-    def _ensure_playback_writer(self, sink) -> bool:
-        writer = self._playback_writer
-        if writer is not None:
-            if writer.is_alive and writer.failure is None:
-                return True
-            self._logger.warning(
-                "voice playback writer is unavailable; requesting cleanup"
-            )
-            self._supervisor.request_reconnect()
-            return False
-        writer = audio_playback_worker.PlaybackWriteWorker(
-            lambda samples: self._write_playback_frame(sink, samples),
-            self._on_playback_worker_error,
-        )
-        try:
-            writer.start()
-        except Exception:
-            self._logger.exception("voice playback writer failed to start")
-            return False
-        self._playback_writer = writer
-        return True
 
-    def _on_playback_worker_error(self, error: BaseException) -> None:
-        self._voice_pcm_forwarding_enabled = False
-        self._logger.error("audio playback worker failed; failing closed: %s", error)
-        self._supervisor.request_reconnect()
 
-    def _flush_playback_writer_locked(
-        self,
-        reason: str,
-    ) -> audio_playback_worker.PlaybackFlushResult:
-        writer = self._playback_writer
-        if writer is None:
-            return audio_playback_worker.PlaybackFlushResult(True)
-        result = writer.flush()
-        if not result.completed:
-            self._voice_pcm_forwarding_enabled = False
-            self._logger.error(
-                "audio playback flush failed during %s: %s",
-                reason,
-                result.error or "unknown error",
-            )
-            self._supervisor.request_reconnect()
-        return result
 
-    def _write_playback_frame(self, sink, samples) -> None:
-        if sink is not self._playback:
-            raise RuntimeError("audio playback sink changed while a write was queued")
-        self._voice_pcm_stats.add(samples)
-        if self._voice_pcm_stats.frames == 1:
-            with self._runtime_status_lock:
-                voice_active = self._runtime_voice_active
-            if voice_active:
-                self._set_runtime_voice_result(
-                    bridge_runtime_status.VOICE_RUNTIME_RECEIVING_AUDIO
-                )
-        sink.write(samples)
-        if (
-            self._voice_pcm_stats.frames in (1, 10)
-            or self._voice_pcm_stats.frames % 200 == 0
-        ):
-            stats = self._voice_pcm_stats.summary()
-            timing_snapshot = getattr(sink, "timing_snapshot", None)
-            timing = timing_snapshot() if callable(timing_snapshot) else None
-            if timing is None:
-                self._logger.info(
-                    "voice PCM progress: frames=%s samples=%s peak=%s rms=%.1f "
-                    "mean_abs=%.1f clipped=%.3f%%",
-                    stats["frames"],
-                    stats["samples"],
-                    stats["peak"],
-                    stats["rms"],
-                    stats["mean_abs"],
-                    stats["clipped_pct"],
-                )
-            else:
-                self._logger.info(
-                    "voice PCM progress: frames=%s samples=%s peak=%s rms=%.1f "
-                    "mean_abs=%.1f clipped=%.3f%% write_ms=%.2f "
-                    "max_write_ms=%.2f underflows=%s",
-                    stats["frames"],
-                    stats["samples"],
-                    stats["peak"],
-                    stats["rms"],
-                    stats["mean_abs"],
-                    stats["clipped_pct"],
-                    timing.last_write_elapsed_ms,
-                    timing.max_write_elapsed_ms,
-                    timing.underflow_count,
-                )
 
     def _on_pcm_frame(
         self,
         samples,
         *,
         _ble_generation: Optional[int] = None,
+        _arrival_sequence: Optional[int] = None,
     ) -> None:
         """Queue one immutable PCM frame without blocking the BLE worker."""
 
-        with self._voice_trigger_lock:
-            sink = self._playback
+        with self._voice_shortcut.lock:
+            sink = self._voice_audio.sink
+            doubao_attempt = self._active_doubao_attempt_locked()
+            if (
+                doubao_attempt is not None
+                and not self._doubao_attempt_target_healthy(doubao_attempt)
+            ):
+                self._voice_pcm_forwarding_enabled = False
+                self._voice_shortcut.controller.on_mic_button_released()
+                self._request_active_doubao_cleanup_locked(
+                    doubao_attempt,
+                    reason="physicalizer target lost",
+                )
+                return
+            cutoff = self._voice_pcm_min_arrival_sequence
+            arrived_before_ready = bool(
+                cutoff is not None
+                and _arrival_sequence is not None
+                and int(_arrival_sequence) <= cutoff
+            )
+            if arrived_before_ready:
+                self._diagnostic_trace.emit(
+                    "doubao_pcm_discarded",
+                    **self._diagnostic_trace.current_context(),
+                    arrival_sequence=int(_arrival_sequence),
+                    readiness_watermark=int(cutoff),
+                )
             if (
                 sink is None
                 or not self._accepts_ble_callback(_ble_generation)
                 or not self._voice_pcm_forwarding_enabled
+                or arrived_before_ready
             ):
                 return
-            if not self._ensure_playback_writer(sink):
+            if not self._voice_audio.ensure_writer(sink):
                 self._voice_pcm_forwarding_enabled = False
                 return
-            writer = self._playback_writer
+            writer = self._voice_audio.writer
             if writer is None or not writer.submit(samples):
                 self._voice_pcm_forwarding_enabled = False
 

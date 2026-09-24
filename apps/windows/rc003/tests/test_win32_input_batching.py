@@ -590,26 +590,10 @@ class MouseInputTests(unittest.TestCase):
         )
         self.assertEqual(len(sender.calls), 2)
 
-    def test_vertical_wheel_uses_one_windows_wheel_delta_per_click(self):
-        up_sender = RecordingSender()
-        down_sender = RecordingSender()
-        win32_input.send_mouse_wheel(1, _sender=up_sender)
-        win32_input.send_mouse_wheel(-1, _sender=down_sender)
-        self.assertEqual(
-            up_sender.calls,
-            [[(win32_input._MOUSEEVENTF_WHEEL, win32_input._WHEEL_DELTA)]],
-        )
-        self.assertEqual(
-            down_sender.calls,
-            [[(win32_input._MOUSEEVENTF_WHEEL, -win32_input._WHEEL_DELTA)]],
-        )
-
-    def test_unknown_button_and_zero_wheel_are_rejected_before_submission(self):
+    def test_unknown_button_is_rejected_before_submission(self):
         sender = RecordingSender()
         with self.assertRaises(ValueError):
             win32_input.send_mouse_button_click("unknown", _sender=sender)
-        with self.assertRaises(ValueError):
-            win32_input.send_mouse_wheel(0, _sender=sender)
         self.assertEqual(sender.calls, [])
 
 
@@ -820,7 +804,7 @@ class VoiceKeyComboTests(unittest.TestCase):
             ],
         )
 
-    def test_up_failure_retries_every_modifier_that_may_still_be_down(self):
+    def test_up_failure_attempts_each_modifier_once_and_reports_incomplete(self):
         calls = []
 
         def sender(vk, key_up):
@@ -828,27 +812,21 @@ class VoiceKeyComboTests(unittest.TestCase):
             if len(calls) == 1:
                 raise RuntimeError("simulated voice sender failure")
 
-        with self.assertRaises(OSError) as ctx:
+        with self.assertRaises(win32_input.InputCleanupIncompleteError):
             win32_input.send_voice_key_combo_up(
                 ("ctrl", "alt", "f8"), _sender=sender
             )
 
-        self.assertNotIsInstance(
-            ctx.exception,
-            win32_input.InputCleanupIncompleteError,
-        )
-
         self.assertEqual(
             calls,
             [
-                (win32_input.win32_keys.VK_CODES["f8"], True),
                 (win32_input.win32_keys.VK_CODES["f8"], True),
                 (win32_input.win32_keys.VK_CODES["alt"], True),
                 (win32_input.win32_keys.VK_CODES["ctrl"], True),
             ],
         )
 
-    def test_up_reports_when_a_retry_still_cannot_release_the_primary_key(self):
+    def test_up_reports_when_primary_key_release_remains_unresolved(self):
         f8 = win32_input.win32_keys.VK_CODES["f8"]
         alt = win32_input.win32_keys.VK_CODES["alt"]
         ctrl = win32_input.win32_keys.VK_CODES["ctrl"]
@@ -869,9 +847,92 @@ class VoiceKeyComboTests(unittest.TestCase):
             calls,
             [
                 (f8, True),
-                (f8, True),
                 (alt, True),
                 (ctrl, True),
+            ],
+        )
+
+    def test_incomplete_right_alt_up_is_not_retried_inside_same_release(self):
+        rctrl = win32_input.win32_keys.VK_CODES["rctrl"]
+        ralt = win32_input.win32_keys.VK_CODES["ralt"]
+        calls = []
+
+        def sender(vk, key_up):
+            calls.append((vk, key_up))
+            if vk == ralt and key_up:
+                raise win32_input.InputCleanupIncompleteError("still down")
+
+        with self.assertRaises(win32_input.InputCleanupIncompleteError):
+            win32_input.send_voice_key_combo_up(
+                ("rctrl", "ralt"),
+                _sender=sender,
+            )
+
+        self.assertEqual(calls, [(ralt, True), (rctrl, True)])
+
+    def test_mixed_incomplete_and_generic_failures_do_not_restart_release(self):
+        rctrl = win32_input.win32_keys.VK_CODES["rctrl"]
+        ralt = win32_input.win32_keys.VK_CODES["ralt"]
+        calls = []
+
+        def sender(vk, key_up):
+            calls.append((vk, key_up))
+            if vk == ralt:
+                raise win32_input.InputCleanupIncompleteError("still down")
+            raise OSError("later failure")
+
+        with self.assertRaises(win32_input.InputCleanupIncompleteError):
+            win32_input.send_voice_key_combo_up(
+                ("rctrl", "ralt"),
+                _sender=sender,
+            )
+
+        self.assertEqual(calls, [(ralt, True), (rctrl, True)])
+
+    def test_tap_does_not_add_nested_retry_after_incomplete_right_alt_up(self):
+        ralt = win32_input.win32_keys.VK_CODES["ralt"]
+        calls = []
+
+        def sender(vk, key_up):
+            calls.append((vk, key_up))
+            if key_up:
+                raise win32_input.InputCleanupIncompleteError("still down")
+
+        with mock.patch.object(win32_input.time, "sleep"), self.assertRaises(
+            win32_input.InputCleanupIncompleteError
+        ):
+            win32_input.send_voice_key_combo_tap(
+                ("ralt",),
+                _sender=sender,
+            )
+
+        self.assertEqual(calls, [(ralt, False), (ralt, True)])
+
+    def test_partial_down_rollback_attempts_each_up_only_once(self):
+        rctrl = win32_input.win32_keys.VK_CODES["rctrl"]
+        ralt = win32_input.win32_keys.VK_CODES["ralt"]
+        calls = []
+
+        def sender(vk, key_up):
+            calls.append((vk, key_up))
+            if vk == ralt and not key_up:
+                raise win32_input.InputCleanupIncompleteError("down unknown")
+            if vk == ralt and key_up:
+                raise win32_input.InputCleanupIncompleteError("up unknown")
+
+        with self.assertRaises(win32_input.InputCleanupIncompleteError):
+            win32_input.send_voice_key_combo_down(
+                ("rctrl", "ralt"),
+                _sender=sender,
+            )
+
+        self.assertEqual(
+            calls,
+            [
+                (rctrl, False),
+                (ralt, False),
+                (ralt, True),
+                (rctrl, True),
             ],
         )
 
@@ -912,7 +973,7 @@ class VoiceKeyComboTests(unittest.TestCase):
 
         self.assertGreaterEqual(len(calls), 4)
 
-    def test_tap_downgrades_prior_incomplete_error_after_final_release_succeeds(self):
+    def test_tap_keeps_generic_up_failure_incomplete_without_retry(self):
         calls = []
         failed_once = {win32_input.win32_keys.VK_CODES["space"]: False}
 
@@ -922,19 +983,17 @@ class VoiceKeyComboTests(unittest.TestCase):
                 failed_once[vk] = True
                 raise RuntimeError("simulated transient key-up failure")
 
-        with self.assertRaises(OSError) as ctx:
+        with self.assertRaises(win32_input.InputCleanupIncompleteError):
             win32_input.send_voice_key_combo_tap(
                 ("ralt", "space"),
                 _sender=sender,
             )
 
-        self.assertNotIsInstance(
-            ctx.exception,
-            win32_input.InputCleanupIncompleteError,
-        )
         self.assertEqual(
-            calls[-2:],
+            calls,
             [
+                (win32_input.win32_keys.VK_CODES["ralt"], False),
+                (win32_input.win32_keys.VK_CODES["space"], False),
                 (win32_input.win32_keys.VK_CODES["space"], True),
                 (win32_input.win32_keys.VK_CODES["ralt"], True),
             ],
@@ -978,11 +1037,12 @@ class VoiceKeyComboTests(unittest.TestCase):
         lalt = win32_input.win32_keys.VK_CODES["lalt"]
         f8 = win32_input.win32_keys.VK_CODES["f8"]
 
-        win32_input.send_voice_key_combo_up(
-            ("lalt", "f8"),
-            _sender=lambda vk, key_up: calls.append((vk, key_up)),
-            _key_down_query=lambda vk: vk == lalt,
-        )
+        with self.assertRaises(win32_input.InputCleanupIncompleteError):
+            win32_input.send_voice_key_combo_up(
+                ("lalt", "f8"),
+                _sender=lambda vk, key_up: calls.append((vk, key_up)),
+                _key_down_query=lambda vk: vk == lalt,
+            )
 
         self.assertEqual(calls, [(f8, True)])
 
@@ -1109,6 +1169,17 @@ class VoiceRightAltOwnershipTests(unittest.TestCase):
             win32_input.send_voice_key_combo_down(("ralt",))
         self.assertEqual(self.sent, [])
 
+    def test_stale_hook_right_alt_owner_no_longer_blocks_voice(self):
+        self._physical_edge(False)
+        with self.hook._PHYSICAL_KEY_STATE_LOCK:
+            self.hook._PHYSICAL_KEY_LAST_EDGE_AT[self.ralt] -= 1.0
+
+        win32_input.send_voice_key_combo_down(("ralt",))
+        win32_input.send_voice_key_combo_up(("ralt",))
+
+        self.assertEqual(self.sent, [(self.ralt, False), (self.ralt, True)])
+        self.assertFalse(self.hook.physical_key_is_down(self.ralt))
+
     def test_current_windows_hold_still_blocks_after_hook_reports_release(self):
         self._replay_missing_raw_release()
         self.windows_down = True
@@ -1128,7 +1199,8 @@ class VoiceRightAltOwnershipTests(unittest.TestCase):
         self._replay_missing_raw_release()
         win32_input.send_voice_key_combo_down(("ralt",))
         self._physical_edge(False)
-        win32_input.send_voice_key_combo_up(("ralt",))
+        with self.assertRaises(win32_input.InputCleanupIncompleteError):
+            win32_input.send_voice_key_combo_up(("ralt",))
         self.assertEqual(self.sent, [(self.ralt, False)])
         self._physical_edge(True)
         win32_input.send_voice_key_combo_up(("ralt",))
@@ -1191,7 +1263,8 @@ class VoiceRightAltOwnershipTests(unittest.TestCase):
         self.assertTrue(self.raw.physical_key_has_ambiguous_owners(self.ralt))
         with self.assertRaises(win32_input.PhysicalKeyInUseError):
             win32_input.send_voice_key_combo_down(("ralt",))
-        win32_input.send_voice_key_combo_up(("ralt",))
+        with self.assertRaises(win32_input.InputCleanupIncompleteError):
+            win32_input.send_voice_key_combo_up(("ralt",))
         self.assertEqual(self.sent, [])
         self.raw.record_physical_keyboard_event(
             101, vkey=0x12, make_code=0x38, flags=3, message=0x101
@@ -1230,6 +1303,73 @@ class VoiceRightAltOwnershipTests(unittest.TestCase):
 
 
 class MarkedVoiceEventConfirmationTests(unittest.TestCase):
+    def test_confirmation_trace_binds_to_dispatch_receipt_generation(self):
+        trace = mock.Mock(enabled=True)
+        trace.current_context.return_value = {}
+        ticket = types.SimpleNamespace(
+            marker=12345,
+            generation=23,
+            installation_epoch=41,
+        )
+        with mock.patch.object(
+            win32_input,
+            "_diagnostic_trace",
+            trace,
+        ), mock.patch.object(
+            win32_input.diagnostic_trace,
+            "foreground_context",
+            return_value={},
+        ), mock.patch.object(
+            win32_input.voice_key_physicalizer_windows,
+            "begin_marked_voice_event",
+            return_value=ticket,
+        ), mock.patch.object(
+            win32_input,
+            "_real_keybd_event",
+        ), mock.patch.object(
+            win32_input.voice_key_physicalizer_windows,
+            "wait_for_marked_voice_event",
+            return_value=True,
+        ):
+            win32_input._real_voice_event(
+                win32_input.win32_keys.VK_CODES["ralt"],
+                False,
+            )
+
+        fields = trace.emit.call_args.kwargs
+        self.assertEqual(fields["physicalizer_binding"], "bound")
+        self.assertEqual(fields["physicalizer_generation"], 23)
+        self.assertEqual(fields["physicalizer_installation_epoch"], 41)
+
+    def test_failure_before_dispatch_receipt_is_never_reported_as_bound(self):
+        trace = mock.Mock(enabled=True)
+        trace.current_context.return_value = {}
+        with mock.patch.object(
+            win32_input,
+            "_diagnostic_trace",
+            trace,
+        ), mock.patch.object(
+            win32_input.diagnostic_trace,
+            "foreground_context",
+            return_value={},
+        ), mock.patch.object(
+            win32_input.voice_key_physicalizer_windows,
+            "begin_marked_voice_event",
+            side_effect=(
+                win32_input.voice_key_physicalizer_windows.
+                VoiceKeyPhysicalizerUnavailableError("unavailable")
+            ),
+        ), self.assertRaises(win32_input.Win32InputUnavailableError):
+            win32_input._real_voice_event(
+                win32_input.win32_keys.VK_CODES["ralt"],
+                False,
+            )
+
+        fields = trace.emit.call_args.kwargs
+        self.assertEqual(fields["physicalizer_binding"], "unbound")
+        self.assertEqual(fields["physicalizer_generation"], -1)
+        self.assertEqual(fields["physicalizer_installation_epoch"], -1)
+
     def test_real_right_alt_edge_uses_its_hook_ticket(self):
         sent = []
         ticket = mock.Mock(marker=12345)
@@ -1276,12 +1416,18 @@ class MarkedVoiceEventConfirmationTests(unittest.TestCase):
             win32_input.voice_key_physicalizer_windows,
             "wait_for_marked_voice_event",
             return_value=False,
-        ):
+        ), mock.patch.object(
+            win32_input.voice_key_physicalizer_windows,
+            "mark_required_confirmation_failed",
+            return_value=(False, mock.Mock()),
+        ) as mark_failed:
             with self.assertRaises(win32_input.InputCleanupIncompleteError):
                 win32_input._real_voice_event(
                     win32_input.win32_keys.VK_CODES["ralt"],
                     True,
                 )
+
+        mark_failed.assert_called_once_with(ticket)
 
     def test_combo_keeps_confirmation_failure_even_if_retry_returns(self):
         calls = []
@@ -1298,6 +1444,286 @@ class MarkedVoiceEventConfirmationTests(unittest.TestCase):
             )
 
         self.assertEqual(calls, [False, True])
+
+
+class RightAltReleasePostconditionTests(unittest.TestCase):
+    def setUp(self):
+        self.ralt = win32_input.win32_keys.VK_CODES["ralt"]
+        self.confirmation = mock.Mock(
+            generation=17,
+            installation_epoch=23,
+        )
+
+    @staticmethod
+    def _guard(revision=1):
+        return win32_input.voice_key_physicalizer_windows.PhysicalReleaseGuard(
+            generation=17,
+            installation_epoch=23,
+            callback_revision=revision,
+        )
+
+    @staticmethod
+    def _clock():
+        value = {"now": 0.0}
+
+        def tick():
+            value["now"] += 0.1
+            return value["now"]
+
+        return tick
+
+    def test_valid_delayed_release_is_confirmed_without_another_input_edge(self):
+        states = iter((True, False))
+        win32_input._ensure_right_alt_release_completed(
+            self.ralt,
+            self.confirmation,
+            _state_query=lambda _vk: next(states),
+            _guard_query=lambda _vk: self._guard(),
+            _ambiguous_owner_query=lambda _vk: False,
+            _sleep=lambda _seconds: None,
+            _clock=iter((0.0, 0.01, 0.02, 0.03)).__next__,
+        )
+
+    def test_still_down_retains_release_debt_without_hidden_retry(self):
+        with self.assertRaises(win32_input.InputCleanupIncompleteError):
+            win32_input._ensure_right_alt_release_completed(
+                self.ralt,
+                self.confirmation,
+                _state_query=lambda _vk: True,
+                _guard_query=lambda _vk: self._guard(),
+                _ambiguous_owner_query=lambda _vk: False,
+                _sleep=lambda _seconds: None,
+                _clock=self._clock(),
+            )
+
+    def test_unknown_state_observation_retains_release_debt(self):
+        with self.assertRaises(win32_input.InputCleanupIncompleteError):
+            win32_input._ensure_right_alt_release_completed(
+                self.ralt,
+                self.confirmation,
+                _state_query=lambda _vk: None,
+                _guard_query=lambda _vk: self._guard(),
+                _ambiguous_owner_query=lambda _vk: False,
+                _sleep=lambda _seconds: None,
+                _clock=self._clock(),
+            )
+
+    def test_tracker_replacement_during_observation_retains_release_debt(self):
+        guards = iter((self._guard(1), self._guard(2)))
+        with self.assertRaises(win32_input.InputCleanupIncompleteError):
+            win32_input._ensure_right_alt_release_completed(
+                self.ralt,
+                self.confirmation,
+                _state_query=lambda _vk: False,
+                _guard_query=lambda _vk: next(guards),
+                _ambiguous_owner_query=lambda _vk: False,
+                _sleep=lambda _seconds: None,
+                _clock=self._clock(),
+            )
+
+    def test_ambiguous_device_owner_retains_release_debt(self):
+        with self.assertRaises(win32_input.InputCleanupIncompleteError):
+            win32_input._ensure_right_alt_release_completed(
+                self.ralt,
+                self.confirmation,
+                _state_query=lambda _vk: False,
+                _guard_query=lambda _vk: self._guard(),
+                _ambiguous_owner_query=lambda _vk: True,
+                _sleep=lambda _seconds: None,
+                _clock=self._clock(),
+            )
+
+    def test_native_zero_is_unknown_when_foreground_access_is_unavailable(self):
+        query = mock.Mock(return_value=0)
+        self.assertIsNone(
+            win32_input._real_async_key_state_observation(
+                self.ralt,
+                _context_query=lambda: None,
+                _query=query,
+            )
+        )
+        query.assert_not_called()
+
+    def test_native_zero_is_unknown_when_access_context_changes(self):
+        contexts = iter(
+            (
+                ("Default", 10, 20, 8192, 8192),
+                ("Default", 10, 20, 8192, 4096),
+            )
+        )
+        self.assertIsNone(
+            win32_input._real_async_key_state_observation(
+                self.ralt,
+                _context_query=lambda: next(contexts),
+                _query=lambda _vk: 0,
+            )
+        )
+
+    def test_native_zero_is_valid_up_in_stable_access_context(self):
+        context = ("Default", 10, 20, 8192, 8192)
+        self.assertFalse(
+            win32_input._real_async_key_state_observation(
+                self.ralt,
+                _context_query=lambda: context,
+                _query=lambda _vk: 0,
+            )
+        )
+
+    def test_production_context_rejects_higher_integrity_foreground(self):
+        self.assertIsNone(
+            win32_input._real_key_state_query_context(
+                _desktop_query=lambda: "Default",
+                _current_integrity_query=lambda: 8192,
+                _foreground_query=lambda: (10, 20, 12288),
+            )
+        )
+
+    def test_production_context_rejects_missing_required_desktop_access(self):
+        self.assertIsNone(
+            win32_input._real_key_state_query_context(
+                _desktop_query=lambda: None,
+                _current_integrity_query=lambda: 8192,
+                _foreground_query=lambda: (10, 20, 8192),
+            )
+        )
+
+    def test_desktop_probe_requests_key_state_access_rights(self):
+        user32 = mock.Mock()
+        kernel32 = mock.Mock()
+        user32.OpenInputDesktop.return_value = 101
+        user32.GetThreadDesktop.return_value = 102
+        user32.CloseDesktop.return_value = True
+        kernel32.GetCurrentThreadId.return_value = 7
+
+        def load_library(name, **_kwargs):
+            return user32 if name == "user32" else kernel32
+
+        with mock.patch.object(
+            win32_input.ctypes,
+            "WinDLL",
+            side_effect=load_library,
+        ), mock.patch.object(
+            win32_input,
+            "_require_windows",
+        ), mock.patch.object(
+            win32_input,
+            "_require_live_input_allowed",
+        ), mock.patch.object(
+            win32_input,
+            "_desktop_name",
+            side_effect=("Default", "Default"),
+        ):
+            self.assertEqual(
+                win32_input._real_input_desktop_name_with_key_state_access(),
+                "Default",
+            )
+
+        user32.OpenInputDesktop.assert_called_once_with(
+            0,
+            False,
+            0x0001 | 0x0008 | 0x0010,
+        )
+        user32.CloseDesktop.assert_called_once_with(101)
+
+    def test_production_context_accepts_verified_equal_integrity(self):
+        self.assertEqual(
+            win32_input._real_key_state_query_context(
+                _desktop_query=lambda: "Default",
+                _current_integrity_query=lambda: 8192,
+                _foreground_query=lambda: (10, 20, 8192),
+            ),
+            ("Default", 10, 20, 8192, 8192),
+        )
+
+    def test_draining_tracker_can_validate_owned_cleanup_up(self):
+        physicalizer = win32_input.voice_key_physicalizer_windows
+        physicalizer._set_physical_tracker_active(
+            True,
+            _query=lambda _vk: False,
+        )
+        failed = physicalizer.begin_marked_voice_event(False)
+        try:
+            applied, _snapshot = physicalizer.mark_required_confirmation_failed(
+                failed
+            )
+            self.assertTrue(applied)
+            release = physicalizer.begin_marked_voice_event(True)
+            event = physicalizer.KBDLLHOOKSTRUCT(
+                vkCode=physicalizer.VK_RMENU,
+                scanCode=0x38,
+                flags=physicalizer.LLKHF_INJECTED,
+                time=0,
+                dwExtraInfo=release.marker,
+            )
+            self.assertIs(
+                physicalizer.physicalize_injected_event(event, True),
+                release,
+            )
+            physicalizer.complete_marked_voice_event(
+                release,
+                downstream_result=0,
+            )
+            self.assertTrue(
+                physicalizer.wait_for_marked_voice_event(release, 0.01)
+            )
+
+            win32_input._ensure_right_alt_release_completed(
+                self.ralt,
+                release,
+                _state_query=lambda _vk: False,
+                _ambiguous_owner_query=lambda _vk: False,
+                _sleep=lambda _seconds: None,
+                _clock=self._clock(),
+            )
+            with self.assertRaises(
+                physicalizer.VoiceKeyPhysicalizerUnavailableError
+            ):
+                physicalizer.begin_marked_voice_event(False)
+        finally:
+            physicalizer.cancel_marked_voice_event(failed)
+            physicalizer._set_physical_tracker_active(False)
+
+    def test_real_voice_up_waits_for_release_postcondition(self):
+        ticket = mock.Mock(marker=12345)
+        with mock.patch.object(
+            win32_input.voice_key_physicalizer_windows,
+            "begin_marked_voice_event",
+            return_value=ticket,
+        ), mock.patch.object(
+            win32_input,
+            "_real_keybd_event",
+        ), mock.patch.object(
+            win32_input.voice_key_physicalizer_windows,
+            "wait_for_marked_voice_event",
+            return_value=True,
+        ), mock.patch.object(
+            win32_input,
+            "_ensure_right_alt_release_completed",
+        ) as ensure:
+            win32_input._real_voice_event(self.ralt, True)
+
+        ensure.assert_called_once_with(self.ralt, ticket)
+
+    def test_failed_release_postcondition_propagates_incomplete_cleanup(self):
+        ticket = mock.Mock(marker=12345)
+        with mock.patch.object(
+            win32_input.voice_key_physicalizer_windows,
+            "begin_marked_voice_event",
+            return_value=ticket,
+        ), mock.patch.object(
+            win32_input,
+            "_real_keybd_event",
+        ), mock.patch.object(
+            win32_input.voice_key_physicalizer_windows,
+            "wait_for_marked_voice_event",
+            return_value=True,
+        ), mock.patch.object(
+            win32_input,
+            "_ensure_right_alt_release_completed",
+            side_effect=win32_input.InputCleanupIncompleteError("still down"),
+        ):
+            with self.assertRaises(win32_input.InputCleanupIncompleteError):
+                win32_input._real_voice_event(self.ralt, True)
 
 
 class VolumeTests(unittest.TestCase):

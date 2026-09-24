@@ -135,6 +135,31 @@ rpc.exports.sourcescenario = function (scenario, selected) {
     objects[1].add(0xc8).writePointer(ptr(0x123));
     ensure(deviceCopy(1, RIGHT, {handle: 0x123}).records.length === 0, "device identity was replaced by handle equality");
     ensure(deviceCopy(0, RIGHT).kernelCopy === NEUTRAL, "other object on same transport retired selected device");
+  } else if (scenario === "first_selected_press") {
+    const first = deviceCopy(0, MIC);
+    const candidate = first.records.find(r => r.kind === "copy_candidate");
+    const mapped = first.records.filter(r => r.kind === "gatt_read");
+    ensure(first.kernelCopy === NEUTRAL, "first selected-device press reached Windows");
+    ensure(candidate && candidate.source_kind === "device" && candidate.source_key === selected,
+      "first selected-device press lost its independent bind evidence");
+    ensure(mapped.length === 1 && mapped[0].raw === MIC,
+      "first selected-device press was not mapped exactly once");
+    ensure(boundCopyHandle === "0x123" && interceptionReady,
+      "verified first report did not establish provisional ownership");
+    handleControl({...candidate, kind: "intercept_control", action: "bind_copy_handle"});
+    ensure(boundCopyHandle === "0x123" && interceptionReady,
+      "client acknowledgement discarded provisional readiness");
+    ensure(deviceCopy(1, RIGHT).kernelCopy === RIGHT,
+      "first-report ownership crossed to another device");
+    ensure(deviceCopy(0, NEUTRAL).records.some(r => r.kind === "gatt_read"),
+      "first selected-device release was lost");
+  } else if (scenario === "first_selected_press_failure") {
+    const failed = deviceCopy(0, MIC, {status: 0xc0000001});
+    ensure(failed.afterReturn === MIC, "failed provisional copy did not restore source");
+    ensure(boundCopyHandle === null && pendingCopyCandidate === null && !interceptionReady,
+      "failed provisional copy retained ownership");
+    ensure(!failed.records.some(r => r.kind === "copy_candidate" || r.kind === "gatt_read"),
+      "failed provisional copy was forwarded");
   } else if (scenario === "unknown_source") {
     iidMemory.writeU8(0);
     const unknown = deviceCopy(0, RIGHT);
@@ -341,7 +366,8 @@ class DeviceSourceRuntimeTests(unittest.TestCase):
 
     def test_shared_host_copy_routing_and_lifecycle(self):
         selected = hashlib.sha256(b"RemoteMic physical remote v1\0" + uuid.UUID("11223344-5566-7788-99aa-bbccddeeff00").bytes).hexdigest()
-        for scenario in ("two_devices", "unknown_source", "exclusive_fallback", "known_other_beats_fallback",
+        for scenario in ("two_devices", "first_selected_press", "first_selected_press_failure",
+                         "unknown_source", "exclusive_fallback", "known_other_beats_fallback",
                          "rejected_fallback_recovers", "bound_source_lost",
                          "closed_reused_handle", "changed_selection_inflight", "missing_or_bad_selection"):
             with self.subTest(scenario=scenario):

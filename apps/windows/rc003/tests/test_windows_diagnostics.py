@@ -1851,8 +1851,11 @@ class RunOutputEndpointPreflightSubprocessTests(unittest.TestCase):
 def _spawn_ovb_rc003(*args: str) -> "list[str]":
     env = dict(os.environ)
     repo_src = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src")
+    if os.environ.get("RC003_NATIVE_STAGE"):
+        repo_src = os.path.join(os.environ["RC003_NATIVE_STAGE"], "src")
     env["PYTHONPATH"] = repo_src
-    return [sys.executable, "-m", "ovb_rc003", *args], env
+    from tests.source_contract import entry_command
+    return entry_command(*args), env
 
 
 class RunBleDiagnosticsSubprocessTests(unittest.TestCase):

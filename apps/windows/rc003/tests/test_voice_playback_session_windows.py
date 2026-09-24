@@ -197,5 +197,46 @@ class NativeSessionSelectionTests(unittest.TestCase):
         self.assertEqual(ctypes.sizeof(subject._PropVariant), 8 + 2 * ctypes.sizeof(ctypes.c_void_p))
 
 
+class CaptureMetadataTests(unittest.TestCase):
+    def find(self, devices, pids, *, fail=False):
+        class CaptureApi(FakeCoreAudio):
+            def call(self, pointer, index, types, *args):
+                kind, data = self.objects[pointer.value]
+                if kind == "enumerator" and index == 3:
+                    assert args[:2] == (1, 1)  # Capture, never render/default mutation.
+                    self.pointer(args[-1], ("devices", self.devices))
+                elif fail and kind == "control" and index == 3:
+                    raise OSError("partial enumeration")
+                else:
+                    super().call(pointer, index, types, *args)
+        api = CaptureApi(devices)
+        with mock.patch.object(subject, "_call", side_effect=api.call), \
+             mock.patch.object(subject, "_release", side_effect=lambda p: api.releases.append(p.value)), \
+             mock.patch.object(subject._Session, "_string", lambda _, p, i: api.string(p, i)):
+            snapshot = subject._CaptureSessions(pids)
+            snapshot._ole = SimpleNamespace(CoCreateInstance=api.create)
+            try:
+                snapshot._find()
+            finally:
+                snapshot.__exit__()
+                self.assertEqual(len(api.releases), len(api.objects))
+                self.assertFalse(api.writes)
+        return snapshot.sessions
+
+    def test_pid_filter_and_inactive_state_keep_stable_instance_identity(self):
+        states = self.find([device("cap", "Capture", native_session("other", pid=99),
+                                  native_session("voice", pid=20, active=False))], {20})
+        self.assertEqual(states, [subject.CaptureSession("cap", "voice", 20, 2)])
+
+    def test_partial_native_failure_does_not_become_empty_snapshot(self):
+        with self.assertRaises(OSError):
+            self.find([device("cap", "Capture", native_session(pid=20))], {20}, fail=True)
+
+    def test_no_target_process_does_not_open_native_audio_interfaces(self):
+        with mock.patch.object(subject, "_CaptureSessions") as native:
+            self.assertEqual(subject.read_capture_sessions(set()), ())
+        native.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()

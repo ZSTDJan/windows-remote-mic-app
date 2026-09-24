@@ -29,6 +29,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Mapping, Optional, Sequence
 
+from . import dev_session, product_identity
+from . import hid_injection_diagnostics as injection_diagnostics
+
 
 LEGACY_TASK_NAME = r"\RemoteMic\RC003\HidTapInjector"
 LEGACY_HELPER_RELATIVE_PATH = (
@@ -39,7 +42,13 @@ PROTECTED_NAMESPACE = "HidHelperUsersV1"
 PROTECTED_RUNTIME_NAMESPACE = "HidRuntimeUsersV1"
 LOCAL_SERVICE_SID = "S-1-5-19"
 HELPER_EXE_NAME = "RemoteMicRC003HidHelper.exe"
-HELPER_BUNDLE_RELATIVE_PATH = Path("_internal") / HELPER_EXE_NAME
+LEGACY_HELPER_BUNDLE_RELATIVE_PATH = Path("_internal") / HELPER_EXE_NAME
+CURRENT_HELPER_BUNDLE_RELATIVE_PATH = (
+    Path(product_identity.WINDOWS_RUNTIME_DIRECTORY_NAME) / HELPER_EXE_NAME
+)
+# Compatibility alias for tests and older callers that construct a legacy
+# RemoteMicRC003.exe distribution. New code must call bundled_helper_path().
+HELPER_BUNDLE_RELATIVE_PATH = LEGACY_HELPER_BUNDLE_RELATIVE_PATH
 INSTALL_FLAG = "--install-task"
 UNINSTALL_FLAG = "--uninstall-task"
 INJECT_FLAG = "--inject"
@@ -57,12 +66,14 @@ _ELEVATED_PROCESS_TERMINATION_WAIT_MS = 10_000
 
 MANIFEST_SCHEMA_VERSION = 1
 HELPER_PROTOCOL_VERSION = 1
-# Generation 10 adds protected script reload and the exclusive-device legacy
-# migration. Generation 9 still loads a non-reloadable runtime. Protocol 4,
-# the administrator-only helper and LocalService runtime ACLs are unchanged.
-HELPER_GENERATION = 13
+# Generation 14 installs the native first-report ownership fix. Generation 10
+# added protected script reload and the exclusive-device legacy migration.
+# Protocol 4, the administrator-only helper and LocalService runtime ACLs are
+# unchanged.
+HELPER_GENERATION = 14
 TASK_CONTRACT_VERSION = 5
 MANIFEST_FILENAME = "helper-manifest.json"
+INJECTION_RESULT_FILENAME = "hid-injection-result.json"
 
 TASK_CREATE_OR_UPDATE = 0x6
 TASK_DONT_ADD_PRINCIPAL_ACE = 0x10
@@ -560,8 +571,16 @@ def bundled_helper_path(
         frozen = bool(getattr(sys, "frozen", False))
     if not frozen:
         return None
-    base = Path(executable or sys.executable).resolve().parent
-    return base / HELPER_BUNDLE_RELATIVE_PATH
+    application = Path(executable or sys.executable).resolve()
+    try:
+        runtime_directory = (
+            product_identity.windows_runtime_relative_directory_for_executable(
+                application.name
+            )
+        )
+    except ValueError:
+        return None
+    return application.parent / runtime_directory / HELPER_EXE_NAME
 
 
 def bundled_helper_offer_id(
@@ -1343,6 +1362,36 @@ def _canonical_acl_sid(raw_sid: str) -> str:
         "BA": "S-1-5-32-544",
         "LS": LOCAL_SERVICE_SID,
     }
+    if sid == "LA" and _is_windows():
+        # LA is this machine's built-in Administrator, not every RID-500
+        # account (for example a different machine or domain Administrator).
+        advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        advapi32.ConvertStringSidToSidW.argtypes = (
+            wintypes.LPCWSTR, ctypes.POINTER(ctypes.c_void_p),
+        )
+        advapi32.ConvertStringSidToSidW.restype = wintypes.BOOL
+        advapi32.ConvertSidToStringSidW.argtypes = (
+            ctypes.c_void_p, ctypes.POINTER(ctypes.c_wchar_p),
+        )
+        advapi32.ConvertSidToStringSidW.restype = wintypes.BOOL
+        kernel32.LocalFree.argtypes = (ctypes.c_void_p,)
+        kernel32.LocalFree.restype = ctypes.c_void_p
+        sid_pointer = ctypes.c_void_p()
+        if not advapi32.ConvertStringSidToSidW(sid, ctypes.byref(sid_pointer)):
+            return sid  # Unresolved aliases cannot satisfy numeric SID checks.
+        try:
+            sid_text = ctypes.c_wchar_p()
+            if not advapi32.ConvertSidToStringSidW(
+                sid_pointer, ctypes.byref(sid_text)
+            ):
+                return sid
+            try:
+                return canonical_user_sid(sid_text.value or "")
+            finally:
+                kernel32.LocalFree(ctypes.cast(sid_text, ctypes.c_void_p))
+        finally:
+            kernel32.LocalFree(sid_pointer)
     return aliases.get(sid, sid)
 
 
@@ -1741,6 +1790,81 @@ def _cleanup_legacy_contract_for_user(
     return snapshot is not None
 
 
+def _diagnostic_result_path():
+    """Fixed protected cache, never a caller-supplied elevated output path."""
+    sid = current_user_sid()
+    trusted = _program_files_root()
+    root = protected_owner_root(sid, program_files_root=trusted)
+    path = root / INJECTION_RESULT_FILENAME
+    assert_no_reparse_points(path, trusted_root=trusted)
+    if not validate_path_security_sddl(_read_path_security_sddl(root), user_sid=sid, directory=True):
+        raise HidElevationError('protected_helper_acl_invalid')
+    return path, sid
+
+
+def _helper_task_instance():
+    try:
+        if not getattr(sys, 'frozen', False):
+            return None  # Only the installed frozen helper owns this result cache.
+        with _task_service_session(None) as root:
+            task = _find_registered_task(root, task_name_for_sid(current_user_sid()))
+            instances = list(_collection_items(task.GetInstances(0)))
+            if len(instances) == 1:
+                return injection_diagnostics.instance_id(instances[0].InstanceGuid)
+    except Exception:
+        pass
+    return None
+
+
+def _publish_injection_result(record, instance):
+    # Single bounded cache, replaced atomically. It is not a second log source.
+    temporary = None
+    try:
+        if instance is None:
+            return
+        path, sid = _diagnostic_result_path()
+        payload = json.dumps({'instance': instance, 'result': json.loads(
+            injection_diagnostics.encode(record))}, separators=(',', ':')).encode('ascii')
+        if len(payload) > injection_diagnostics.RESULT_LIMIT:
+            return
+        with tempfile.NamedTemporaryFile(mode='wb', dir=path.parent, prefix='.hid-result-',
+                                         suffix='.tmp', delete=False) as stream:
+            temporary = Path(stream.name)
+            stream.write(payload)
+        _apply_path_security(temporary, user_sid=sid, directory=False)
+        temporary.replace(path)
+    except Exception:
+        pass
+    finally:
+        if temporary is not None:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
+def _read_injection_result(instance, exit_code):
+    if instance is None:
+        return {'result_status': 'missing'}
+    try:
+        path, _sid = _diagnostic_result_path()
+        with path.open('rb') as stream:
+            payload = stream.read(injection_diagnostics.RESULT_LIMIT + 1)
+        if len(payload) > injection_diagnostics.RESULT_LIMIT:
+            return {'result_status': 'invalid'}
+        value = json.loads(payload)
+        if not isinstance(value, dict) or value.get('instance') != instance:
+            return {'result_status': 'instance_mismatch'}
+        return injection_diagnostics.decode(json.dumps(value.get('result')).encode('ascii'),
+                                             exit_code=exit_code)
+    except FileNotFoundError:
+        return {'result_status': 'missing'}
+    except (ValueError, TypeError, RecursionError):
+        return {'result_status': 'invalid'}
+    except Exception:
+        return {'result_status': 'unavailable'}
+
+
 def _run_task(task_name: str, *, _root: Optional[object] = None) -> None:
     try:
         with _task_service_session(_root) as root:
@@ -1748,6 +1872,10 @@ def _run_task(task_name: str, *, _root: Optional[object] = None) -> None:
             if task is None:
                 raise HidElevationError("hid_helper_task_start_failed")
             running = task.Run("")
+            try:
+                instance = injection_diagnostics.instance_id(running.InstanceGuid)
+            except Exception:
+                instance = None
             if not hasattr(running, "State"):
                 raise HidElevationError("hid_helper_task_result_unavailable")
             deadline = time.monotonic() + _REGISTERED_TASK_COMPLETION_TIMEOUT_SECONDS
@@ -1769,11 +1897,15 @@ def _run_task(task_name: str, *, _root: Optional[object] = None) -> None:
             if exit_code == HELPER_EXIT_OPERATION_BUSY:
                 raise HidElevationError("hid_helper_operation_busy")
             if exit_code != HELPER_EXIT_OK:
-                raise HidElevationError(
-                    helper_runtime_detail_from_exit_code(exit_code)
-                )
+                failure = HidElevationError(helper_runtime_detail_from_exit_code(exit_code))
+                failure.injection_diagnostic = _read_injection_result(instance, exit_code)
+                raise failure
     except Exception as exc:
         if isinstance(exc, HidElevationError):
+            if not hasattr(exc, 'injection_diagnostic'):
+                exc.injection_diagnostic = dict(
+                    injection_diagnostics.failure(exc, stage='helper_task'),
+                    result_status='timeout' if str(exc) == 'hid_helper_task_timeout' else 'unavailable')
             raise
         raise HidElevationError("hid_helper_task_start_failed") from exc
 
@@ -2157,7 +2289,13 @@ def run_registered_injector(
     state = inspect_installed_helper()
     if not state.available:
         raise HidElevationError(state.detail or "hid_helper_unavailable")
-    _run_registered_task(task_name_for_sid(current_user_sid()))
+    try:
+        _run_registered_task(task_name_for_sid(current_user_sid()))
+    except HidElevationError as exc:
+        result = getattr(exc, 'injection_diagnostic', {})
+        if isinstance(result, dict) and result.get('target_pid') not in (None, expected_pid):
+            exc.injection_diagnostic = {'result_status': 'invalid'}
+        raise
 
 
 def _copy_verified_helper(
@@ -2680,6 +2818,7 @@ def uninstall_task(
     # reinstall or Windows cleanup instead of turning a normal uninstall into
     # a permanent failure.
     try:
+        (root / INJECTION_RESULT_FILENAME).unlink(missing_ok=True)
         root.rmdir()
     except OSError:
         pass
@@ -2822,6 +2961,8 @@ def request_install_elevation(
     _current_sid: Callable[[], str] = current_user_sid,
     _sleep: Optional[Callable[[float], None]] = None,
 ) -> HidHelperState:
+    if dev_session.is_isolated():
+        return HidHelperState(False, "isolated_test_no_install")
     if not _is_windows():
         return HidHelperState(False, "windows_only")
     source = helper_path or bundled_helper_path()
@@ -2886,6 +3027,8 @@ def request_uninstall_elevation(
         _installation_requires_elevated_removal
     ),
 ) -> HidHelperState:
+    if dev_session.is_isolated():
+        return HidHelperState(False, "isolated_test_no_uninstall")
     if not _is_windows():
         return HidHelperState(False, "windows_only")
     sid: Optional[str] = None
@@ -2959,6 +3102,34 @@ def _validate_helper_execution_identity() -> None:
 
 
 def _inject_once() -> None:
+    instance = _helper_task_instance()
+    record = None
+    try:
+        pid = _inject_once_impl()
+    except Exception as exc:
+        try:
+            code = (_HELPER_RUNTIME_ERROR_EXIT_CODES.get(str(exc), HELPER_EXIT_VALIDATION_FAILED)
+                    if isinstance(exc, (HidElevationError, OSError, RuntimeError, ValueError))
+                    else HELPER_EXIT_UNEXPECTED_FAILURE)
+            record = injection_diagnostics.result_record(success=False, exit_code=code, exc=exc,
+                                                         stage='helper_identity')
+        except Exception:
+            pass
+        raise
+    else:
+        try:
+            record = injection_diagnostics.result_record(success=True, target_pid=pid, exit_code=0)
+        except Exception:
+            pass
+    finally:
+        if record is not None:
+            try:
+                _publish_injection_result(record, instance)
+            except Exception:
+                pass
+
+
+def _inject_once_impl() -> int:
     from . import remote_selection
     from .frida_hid_tap_injector import (
         HidInjectionStageError,
@@ -2972,10 +3143,16 @@ def _inject_once() -> None:
         raise HidElevationError(
             "hid_helper_execution_identity_invalid"
         ) from exc
-    selected_key = remote_selection.saved_active_key()
-    pid = find_rc003_hidogatt_host_pid(selected_key=selected_key)
+    try:
+        selected_key = remote_selection.saved_active_key()
+        pid = find_rc003_hidogatt_host_pid(selected_key=selected_key)
+    except Exception as exc:
+        exc.injection_diagnostic = {'stage': 'host_lookup'}
+        raise
     if pid is None:
-        raise HidElevationError("hid_helper_host_unavailable")
+        failure = HidElevationError("hid_helper_host_unavailable")
+        failure.injection_diagnostic = {'stage': 'host_lookup'}
+        raise failure
     try:
         inject_current_process(pid, selected_key=selected_key)
     except HidInjectionStageError as exc:
@@ -2984,9 +3161,12 @@ def _inject_once() -> None:
             detail = "hid_helper_host_unavailable"
         if detail not in _HELPER_RUNTIME_ERROR_EXIT_CODES:
             detail = "hid_helper_injection_failed"
-        raise HidElevationError(detail) from exc
+        failure = HidElevationError(detail)
+        failure.injection_diagnostic = {'target_pid': pid}
+        raise failure from exc
     except (OSError, RuntimeError, ValueError) as exc:
         raise HidElevationError("hid_helper_injection_failed") from exc
+    return pid
 
 
 def _self_check() -> None:

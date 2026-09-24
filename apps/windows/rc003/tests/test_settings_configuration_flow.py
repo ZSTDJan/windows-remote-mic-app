@@ -21,6 +21,10 @@ class ConfigurationFlowTests(unittest.TestCase):
 
         self.qt = QCoreApplication.instance() or QCoreApplication([])
         self.fixture = controller_tests.SettingsControllerTests()
+        # We invoke this fixture manually, so unittest will not run its
+        # registered patch cleanups. Register them before setup and keep
+        # teardown first (cleanups execute in reverse order).
+        self.addCleanup(self.fixture.doCleanups)
         self.fixture.setUp()
         self.addCleanup(self.fixture.tearDown)
 
@@ -168,6 +172,82 @@ class ConfigurationFlowTests(unittest.TestCase):
         self.assertFalse(controller.voiceHotkeyBusy)
         self.assertEqual(controller.statusMessage, message)
 
+    def test_sogou_timeout_keeps_operation_owned_until_external_write_settles(self):
+
+        controller, _ = self.controller()
+        controller.selectedVoiceProgramIndex = 1  # Sogou, through the public property.
+        pending = []
+        controller._background_task_runner = lambda callback, _name: pending.append(callback)
+        config_file = config.config_path(config.config_root())
+        local_before = config_file.read_bytes()
+        provider_root = config.config_root() / "sogou-appdata"
+        provider_file = (
+            qt_settings_app.voice_hotkey_sync_windows._sogou_config_path(provider_root)
+        )
+        provider_file.parent.mkdir(parents=True)
+        provider_file.write_text(
+            json.dumps(
+                {
+                    "setting": {
+                        "shortcutKeysPress": ["RightCtrl"],
+                        "longPressEnabled": True,
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        replace_started = threading.Event()
+        release_replace = threading.Event()
+        original_replace = qt_settings_app.voice_hotkey_sync_windows._replace_bytes_atomically
+
+        def blocked_replace(path, content, **kwargs):
+            replace_started.set()
+            if not release_replace.wait(2.0):
+                raise TimeoutError("test did not release provider write")
+            original_replace(path, content, **kwargs)
+
+        def real_temporary_sync(provider_id, shortcut, **kwargs):
+            self.assertEqual(provider_id, "sogou")
+            return qt_settings_app.voice_hotkey_sync_windows._sync_sogou_hotkey(
+                shortcut,
+                appdata=provider_root,
+                cancel_event=kwargs.get("cancel_event"),
+            )
+
+        self.fixture._voice_hotkey_sync_mock.side_effect = real_temporary_sync
+        with mock.patch.object(
+            qt_settings_app.voice_hotkey_sync_windows,
+            "_sogou_voice_process_running",
+            return_value=False,
+        ), mock.patch.object(
+            qt_settings_app.voice_hotkey_sync_windows,
+            "_replace_bytes_atomically",
+            side_effect=blocked_replace,
+        ):
+            controller.holdVoiceHotkeyText = "lctrl+lshift+f10"
+            self.assertTrue(controller.voiceHotkeyBusy)
+            self.assertEqual(len(pending), 1)
+            worker = threading.Thread(target=pending.pop(), daemon=True)
+            worker.start()
+            try:
+                self.assertTrue(replace_started.wait(1.0))
+                controller._on_voice_hotkey_task_timeout()
+                self.assertTrue(controller.voiceHotkeyBusy)
+                self.assertIn("等待安全结束", controller.statusMessage)
+            finally:
+                release_replace.set()
+                worker.join(1.0)
+
+        self.qt.processEvents()
+        external = qt_settings_app.voice_hotkey_sync_windows._read_sogou_hotkey(
+            appdata=provider_root
+        )
+        self.assertTrue(external.ok)
+        self.assertEqual(external.hotkey, "rctrl")
+        self.assertEqual(config_file.read_bytes(), local_before)
+        self.assertNotEqual(controller.holdVoiceHotkeyText, "lctrl+lshift+f10")
+        self.assertFalse(controller.voiceHotkeyBusy)
+
 
 @unittest.skipUnless(controller_tests._HAS_PYSIDE6, controller_tests._SKIP_REASON)
 class ConfigurationQmlFlowTests(unittest.TestCase):
@@ -201,7 +281,7 @@ assert page.bridgeActionText() == "重启服务"
 diagnostics._is_refreshing = False
 diagnostics.isRefreshingChanged.emit()
 assert find(window, "trySpeakingButton").property("enabled")
-assert find(window, "actualSpeechInstruction").property("text") == "点击输入框，按住遥控器话筒键说话，松开后看文字有没有进来。"
+assert find(window, "actualSpeechInstruction").property("text") == "点击输入框，用遥控器说一句话，查看文字是否输入。"
 find(window, "tabBar").setProperty("currentIndex", 0)
 with mock.patch.object(controller, "restartBridge") as restart:
     find(window, "bridgeActionButton").clicked.emit()

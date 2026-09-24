@@ -214,3 +214,74 @@ def prepare_playback_mute_guard(endpoint_name: str) -> Optional[PlaybackMuteGuar
         if session.muted is not False or not session.instance_id:
             return None
         return PlaybackMuteGuard(session.endpoint_id, session.instance_id)
+
+
+@dataclass(frozen=True)
+class CaptureSession:
+    """Read-only identity/state; no COM pointers cross threads."""
+    endpoint_id: str
+    instance_id: str
+    pid: int
+    state: int
+
+    @property
+    def identity(self) -> tuple[str, str, int]:
+        return self.endpoint_id, self.instance_id, self.pid
+
+
+class _CaptureSessions(_Session):
+    """Reuse apartment/pointer ownership, never create a capture stream."""
+    def __init__(self, pids: set[int]):
+        super().__init__()
+        self._pids = pids
+        self.sessions: list[CaptureSession] = []
+
+    def _find(self) -> None:
+        enumerator = self._pointer()
+        clsid = _guid("BCDE0395-E52F-467C-8E3D-C4579291692E")
+        iid = _guid("A95664D2-9614-4F35-A746-DE8DB63617E6")
+        _check(int(self._ole.CoCreateInstance(
+            ctypes.byref(clsid), None, 1, ctypes.byref(iid), ctypes.byref(enumerator)
+        )))
+        devices = self._pointer()
+        _call(enumerator, 3, (_I, _U, _P), 1, 1, ctypes.byref(devices))  # Active capture endpoints.
+        count = _U()
+        _call(devices, 3, (_P,), ctypes.byref(count))
+        if count.value > 256:
+            raise OSError("capture endpoint enumeration exceeds safety limit")
+        for index in range(count.value):
+            device = self._pointer()
+            _call(devices, 4, (_U, _P), index, ctypes.byref(device))
+            endpoint = self._string(device, 5)
+            manager = self._pointer()
+            iid = _guid("77AA99A0-1BD6-484F-8BC7-2C654C9A9B6F")
+            _call(device, 3, (_P, _U, _P, _P), ctypes.byref(iid), 23, None, ctypes.byref(manager))
+            sessions = self._pointer()
+            _call(manager, 5, (_P,), ctypes.byref(sessions))
+            size = _I()
+            _call(sessions, 3, (_P,), ctypes.byref(size))
+            if not 0 <= size.value <= 512:
+                raise OSError("capture session enumeration exceeds safety limit")
+            for session_index in range(size.value):
+                control, control2 = self._pointer(), self._pointer()
+                _call(sessions, 4, (_I, _P), session_index, ctypes.byref(control))
+                iid = _guid("BFB7FF88-7239-4FC9-8FA2-07C950BE9C6D")
+                _call(control, 0, (_P, _P), ctypes.byref(iid), ctypes.byref(control2))
+                pid = _U()
+                _call(control2, 14, (_P,), ctypes.byref(pid))
+                if pid.value not in self._pids:
+                    continue
+                state = _I()
+                _call(control2, 3, (_P,), ctypes.byref(state))
+                instance = self._string(control2, 13)
+                if not endpoint or not instance or state.value not in (0, 1, 2):
+                    raise OSError("capture session metadata is incomplete")
+                self.sessions.append(CaptureSession(endpoint, instance, pid.value, state.value))
+
+
+def read_capture_sessions(pids: set[int]) -> tuple[CaptureSession, ...]:
+    """Failed/partial enumeration raises; do not interpret it as empty."""
+    if not pids:
+        return ()
+    with _CaptureSessions(pids) as snapshot:
+        return tuple(snapshot.sessions)

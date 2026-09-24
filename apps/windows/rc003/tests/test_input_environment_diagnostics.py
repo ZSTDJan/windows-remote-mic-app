@@ -252,12 +252,57 @@ class ObservationIntegrationTests(unittest.TestCase):
     def test_sogou_diagnostic_attempt_uses_actual_provider(self):
         from ovb_rc003.app import RC003App
         app = RC003App.__new__(RC003App)
+        app._voice_shortcut = types.SimpleNamespace()
         app._voice_attempt_id = None
         app._config = {'voice_program': {'provider': 'sogou'}}
         app._diagnostic_trace = mock.Mock()
         app._diagnostic_trace.current_context.return_value = {}
-        app._voice = types.SimpleNamespace(trigger_mode=types.SimpleNamespace(value='hold'))
-        app._voice_hotkey = types.SimpleNamespace(modifiers=('lctrl', 'lshift'), key='f7')
+        app._voice_shortcut.controller = types.SimpleNamespace(trigger_mode=types.SimpleNamespace(value='hold'))
+        app._voice_shortcut.hotkey = types.SimpleNamespace(modifiers=('lctrl', 'lshift'), key='f7')
+        with mock.patch.object(diagnostic_trace, 'foreground_context', return_value={}):
+            app._ensure_voice_diagnostic_attempt(
+                provider_shortcut_mode='toggle',
+                effective_hotkey_tokens=('lshift', 'f8'),
+                effective_backend='toggle_shortcut',
+            )
+        self.assertEqual(app._diagnostic_trace.begin_attempt.call_args.kwargs['provider'], 'sogou')
+        fields = app._diagnostic_trace.emit.call_args.kwargs
+        self.assertEqual(fields['provider_shortcut_mode'], 'toggle')
+        self.assertEqual(fields['hotkey_tokens'], ['lshift', 'f8'])
+        self.assertEqual(fields['backend'], 'toggle_shortcut')
+        self.assertEqual(fields['physicalizer_binding'], 'not_required')
+
+    def test_voice_attempt_only_observes_tracker_before_dispatch_receipt(self):
+        from ovb_rc003.app import RC003App
+        app = RC003App.__new__(RC003App)
+        app._voice_shortcut = types.SimpleNamespace()
+        app._voice_attempt_id = None
+        app._config = {'voice_program': {'provider': 'custom'}}
+        app._diagnostic_trace = mock.Mock()
+        app._diagnostic_trace.current_context.return_value = {}
+        app._voice_shortcut.controller = types.SimpleNamespace(
+            trigger_mode=types.SimpleNamespace(value='hold')
+        )
+        app._voice_shortcut.hotkey = types.SimpleNamespace(modifiers=(), key='ralt')
+        app._voice_key_physicalizer_lifecycle_lock = threading.RLock()
+        first = types.SimpleNamespace(
+            tracker_generation=17,
+            installation_epoch=31,
+            accepts_new_down=True,
+        )
+        app._voice_key_physicalizer = first
+
         with mock.patch.object(diagnostic_trace, 'foreground_context', return_value={}):
             app._ensure_voice_diagnostic_attempt()
-        self.assertEqual(app._diagnostic_trace.begin_attempt.call_args.kwargs['provider'], 'sogou')
+        app._voice_key_physicalizer = types.SimpleNamespace(
+            tracker_generation=18,
+            installation_epoch=32,
+            accepts_new_down=True,
+        )
+
+        fields = app._diagnostic_trace.emit.call_args.kwargs
+        self.assertEqual(fields['physicalizer_binding'], 'observed')
+        self.assertEqual(fields['physicalizer_generation'], -1)
+        self.assertEqual(fields['physicalizer_installation_epoch'], -1)
+        self.assertEqual(fields['physicalizer_observed_generation'], 17)
+        self.assertEqual(fields['physicalizer_observed_installation_epoch'], 31)

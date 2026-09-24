@@ -18,11 +18,39 @@ tests/windows/test_windows_only.py.
 
 import ctypes
 import unittest
+from unittest import mock
 
 from ovb_rc003 import win32_input
 
 
 class InputStructShapeTests(unittest.TestCase):
+    def test_sendinput_marks_all_three_builders_without_changing_input_payload(self):
+        user32 = mock.Mock()
+        for builder, events, union_name in (
+            (win32_input._build_input_array, [(0x4e, False), (0x4e, True)], "ki"),
+            (win32_input._build_virtual_key_input_array, [(0xa2, False), (0x5b, True)], "ki"),
+            (win32_input._build_mouse_input_array, [(win32_input._MOUSEEVENTF_XDOWN, win32_input._XBUTTON2)], "mi"),
+        ):
+            with self.subTest(builder=builder.__name__):
+                expected, input_type = builder(events)
+                def send(count, actual, size):
+                    self.assertEqual(size, ctypes.sizeof(input_type))
+                    self.assertEqual(count, len(events))
+                    for index in range(count):
+                        item = getattr(actual[index].union, union_name)
+                        self.assertTrue(win32_input.is_own_input_event(item.dwExtraInfo))
+                        self.assertFalse(win32_input.voice_key_physicalizer_windows._is_voice_event_marker(item.dwExtraInfo))
+                        getattr(expected[index].union, union_name).dwExtraInfo = item.dwExtraInfo
+                        self.assertEqual(bytes(actual[index]), bytes(expected[index]))
+                    return count
+                user32.SendInput.side_effect = send
+                with mock.patch.object(win32_input, "_require_live_input_allowed"), \
+                     mock.patch.object(win32_input, "_require_windows"), \
+                     mock.patch.object(win32_input.ctypes, "windll", mock.Mock(user32=user32), create=True), \
+                     mock.patch.object(win32_input.ctypes, "set_last_error", create=True), \
+                     mock.patch.object(win32_input.ctypes, "get_last_error", return_value=0, create=True):
+                    self.assertEqual(win32_input._real_send_input_batch_with_builder(events, builder), len(events))
+
     def test_sizeof_input_matches_the_documented_x64_win32_abi(self):
         # Microsoft's own SendInput documentation and headers put
         # sizeof(INPUT) at 40 bytes on x64 - this is the exact value
@@ -91,15 +119,6 @@ class InputStructShapeTests(unittest.TestCase):
         self.assertEqual(array[0].type, win32_input._INPUT_MOUSE)
         self.assertEqual(array[0].union.mi.dwFlags, win32_input._MOUSEEVENTF_XDOWN)
         self.assertEqual(array[0].union.mi.mouseData, win32_input._XBUTTON2)
-
-    def test_negative_wheel_delta_is_encoded_as_unsigned_mouse_data(self):
-        array, _ = win32_input._build_mouse_input_array(
-            [(win32_input._MOUSEEVENTF_WHEEL, -win32_input._WHEEL_DELTA)]
-        )
-        self.assertEqual(
-            array[0].union.mi.mouseData,
-            ctypes.c_uint32(-win32_input._WHEEL_DELTA).value,
-        )
 
     def test_right_alt_uses_the_extended_physical_scan_code(self):
         array, _ = win32_input._build_input_array(

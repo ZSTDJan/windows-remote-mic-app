@@ -337,6 +337,7 @@ class InjectorSubprocessTests(unittest.TestCase):
         tenant.assert_not_called()
 
     def test_elevated_frozen_app_keeps_the_direct_injector_path(self):
+        registered = mock.Mock()
         with mock.patch.object(
             frida_compat,
             "_run_direct_injector_subprocess",
@@ -345,7 +346,7 @@ class InjectorSubprocessTests(unittest.TestCase):
                 2468,
                 frozen=True,
                 _is_elevated=lambda: True,
-                _registered_injector=mock.Mock(),
+                _registered_injector=registered,
             )
 
         direct.assert_called_once_with(
@@ -354,6 +355,7 @@ class InjectorSubprocessTests(unittest.TestCase):
             frozen=True,
             executable=None,
         )
+        registered.assert_not_called()
 
     def test_child_entrypoint_returns_stable_permission_failure_code(self):
         with mock.patch.object(
@@ -1399,7 +1401,7 @@ class TapStateTests(unittest.TestCase):
         self.assertEqual(injector.call_args_list, [mock.call(2468), mock.call(2468)])
         self.assertIn(
             (
-                frida_compat.HidTapState.FAILED.value,
+                frida_compat.HidTapState.RECOVERING.value,
                 "hid_helper_operation_busy",
             ),
             statuses,
@@ -1764,7 +1766,8 @@ class InjectorOrderingTests(unittest.TestCase):
 
 class InjectorCleanupSafetyTests(unittest.TestCase):
     def test_remote_buffer_is_only_freed_after_thread_completion(self):
-        source = inspect.getsource(frida_hid_tap_injector.inject_library)
+        from tests.source_contract import source_text
+        source = source_text(frida_hid_tap_injector.inject_library)
 
         self.assertIn("remote_thread_completed = False", source)
         self.assertIn("remote_thread_completed = True", source)
@@ -1774,7 +1777,8 @@ class InjectorCleanupSafetyTests(unittest.TestCase):
         )
 
     def test_wait_timeout_and_failure_are_distinguished(self):
-        source = inspect.getsource(frida_hid_tap_injector.inject_library)
+        from tests.source_contract import source_text
+        source = source_text(frida_hid_tap_injector.inject_library)
 
         self.assertIn("wait_result == WAIT_TIMEOUT", source)
         self.assertIn("wait_result == WAIT_FAILED", source)

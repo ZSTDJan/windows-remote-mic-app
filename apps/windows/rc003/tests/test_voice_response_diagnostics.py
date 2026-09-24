@@ -226,6 +226,7 @@ class WorkflowEvidenceTests(unittest.TestCase):
         app._runtime_status_lock = threading.Lock()
         app._runtime_voice_state, app._runtime_voice_provider = 'active', 'wetype'
         app._publish_runtime_status = mock.Mock()
+        app._logger = mock.Mock()
         app._diagnostic_trace = mock.Mock()
         app._diagnostic_trace.current_context.return_value = {'attempt_id': 'a'}
         app._set_runtime_voice_result('host_start_failed', provider='wetype')

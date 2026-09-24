@@ -140,13 +140,14 @@ class _SettingsAccess:
             raise SettingsReadError("navigation_failed", "切换微信语音输入页失败；请手动切到该页后再刷新。")
 
 
-def _snapshot(root, check):
+def _snapshot(root, check, *, trigger="hold"):
     """Read only the selected window; never search the desktop or click a field."""
     pending = [(root, 0)]
     rows = []
     navigation = []
     voice_page = False
     count = 0
+    expected_title = "启动语音输入" if trigger == "toggle" else "按住说话"
     while pending:
         check()
         control, depth = pending.pop()
@@ -161,13 +162,17 @@ def _snapshot(root, check):
             elif {"输入", "语音输入"}.issubset({str(child.Name) for child in children}):
                 voice_page = True
         for index, child in enumerate(children[:-1]):
-            if " ".join(str(child.Name or "").split()) == "按住说话 按住可语音输入，松手结束":
+            # WeType combines the title and a version-dependent description in
+            # Name. Match the complete title, keeping the adjacent field and
+            # unique-row checks below; never search arbitrary description text.
+            label = " ".join(str(child.Name or "").split())
+            if label == expected_title or label.startswith(expected_title + " "):
                 field = children[index + 1]
                 if field.ControlTypeName != "GroupControl" or not field.IsEnabled:
-                    raise SettingsReadError("unavailable_shortcut", "微信按住说话快捷键不可读取；请手动核对设置。")
+                    raise SettingsReadError("unavailable_shortcut", f"微信{expected_title}快捷键不可读取；请手动核对设置。")
                 values = [str(item.Name).strip() for item in field.GetChildren() if str(item.Name or "").strip()]
                 if len(values) != 1:
-                    raise SettingsReadError("ambiguous_shortcut", "无法唯一确认微信按住说话快捷键；请手动录入。")
+                    raise SettingsReadError("ambiguous_shortcut", f"无法唯一确认微信{expected_title}快捷键；请手动录入。")
                 rows.append(values[0])
         pending.extend((child, depth + 1) for child in children)
     if len(rows) > 1 or len(navigation) > 1:
@@ -175,7 +180,7 @@ def _snapshot(root, check):
     return (rows[0] if voice_page and rows else ""), (navigation[0] if navigation else None), voice_page
 
 
-def _read_with_access(access, cancel_event, *, timeout=5.0):
+def _read_with_access(access, cancel_event, *, timeout=5.0, trigger="hold"):
     deadline = time.monotonic() + timeout
     origin = access.foreground()
     hwnd = None
@@ -218,7 +223,8 @@ def _read_with_access(access, cancel_event, *, timeout=5.0):
             hwnd = matches[0]
         check()
         if hwnd is not None:
-            value, navigation, voice_page = _snapshot(access.root(hwnd), check)
+            value, navigation, voice_page = (_snapshot(access.root(hwnd), check, trigger="toggle")
+                                             if trigger == "toggle" else _snapshot(access.root(hwnd), check))
             check()
             if value and value == previous:
                 if access.windows(executable) != (hwnd,):
@@ -238,3 +244,10 @@ def read_hold_shortcut(*, cancel_event=None) -> str:
 
     with auto.UIAutomationInitializerInThread():
         return _read_with_access(_SettingsAccess(auto), cancel_event)
+
+
+def read_toggle_shortcut(*, cancel_event=None) -> str:
+    import uiautomation as auto
+
+    with auto.UIAutomationInitializerInThread():
+        return _read_with_access(_SettingsAccess(auto), cancel_event, trigger="toggle")

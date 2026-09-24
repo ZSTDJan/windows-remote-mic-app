@@ -37,7 +37,7 @@ VOICE_PROGRAM_PROVIDER_ORDER = (
 )
 
 VOICE_PROGRAM_PROVIDER_NAMES = {
-    VOICE_PROGRAM_NONE: "不管理",
+    VOICE_PROGRAM_NONE: "请选择语音程序",
     VOICE_PROGRAM_SOGOU: "搜狗语音输入",
     VOICE_PROGRAM_WETYPE: "微信输入法",
     VOICE_PROGRAM_DOUBAO_IME: "豆包输入法",
@@ -161,6 +161,17 @@ def normalize_voice_program_settings(raw: object) -> dict[str, object]:
         provider_id = VOICE_PROGRAM_NONE
     executable = str(data.get("custom_executable", "")).strip()
     enabled = provider_id != VOICE_PROGRAM_NONE
+    # Keep the legacy scalar as an active-provider mirror. Preferences survive
+    # switching through a system-managed provider and remain entity-scoped via
+    # the existing voice_program snapshot; none never executes a stored path.
+    start_preferences = {}
+    raw_start_preferences = data.get("launch_on_bridge_start_by_provider")
+    if isinstance(raw_start_preferences, Mapping):
+        for candidate in (VOICE_PROGRAM_SOGOU, VOICE_PROGRAM_CUSTOM):
+            if candidate in raw_start_preferences:
+                start_preferences[candidate] = raw_start_preferences[candidate] is True
+    elif is_launchable_provider(provider_id) and "launch_on_bridge_start" in data:
+        start_preferences[provider_id] = data["launch_on_bridge_start"] is True
     raw_elevation_preferences = data.get("launch_elevated_by_provider")
     if isinstance(raw_elevation_preferences, Mapping):
         elevation_preferences = dict(_LAUNCH_ELEVATED_DEFAULTS)
@@ -194,8 +205,12 @@ def normalize_voice_program_settings(raw: object) -> dict[str, object]:
         "launch_on_bridge_start": (
             enabled
             and is_launchable_provider(provider_id)
-            and data.get("launch_on_bridge_start") is True
+            # Sogou follows the selected service automatically. Keep legacy
+            # preferences for compatibility; custom programs remain optional.
+            and (provider_id == VOICE_PROGRAM_SOGOU
+                 or start_preferences.get(provider_id) is True)
         ),
+        "launch_on_bridge_start_by_provider": start_preferences,
         "launch_elevated": current_elevated,
         "launch_elevated_by_provider": elevation_preferences,
     }
@@ -207,11 +222,7 @@ def is_system_managed_provider(provider_id: object) -> bool:
 
 def is_launchable_provider(provider_id: object) -> bool:
     provider = str(provider_id).strip().lower()
-    return (
-        provider != VOICE_PROGRAM_NONE
-        and provider not in _SYSTEM_MANAGED_PROVIDERS
-        and provider not in _BUILTIN_ADAPTER_PROVIDERS
-    )
+    return provider in {VOICE_PROGRAM_SOGOU, VOICE_PROGRAM_CUSTOM}
 
 
 def provider_options() -> list[str]:
@@ -248,7 +259,7 @@ def status_text(status: VoiceProgramStatus) -> str:
         if status.code == "running":
             return "豆包输入法已安装并正在运行。"
     if status.code == "disabled":
-        return f"未启用；{product_identity.DISPLAY_NAME}不会管理语音程序。"
+        return "请选择语音程序；未配置时仅普通按键可用。"
     if status.code == "not_found":
         return f"未找到{status.display_name}。"
     if status.code == "stopped":
@@ -263,8 +274,17 @@ def status_text(status: VoiceProgramStatus) -> str:
 
 
 def launch_result_text(result: VoiceProgramLaunchResult) -> str:
+    if result.provider_id == VOICE_PROGRAM_SOGOU:
+        sogou_messages = {
+            "not_found": "未找到搜狗语音程序，请先安装或手动启动。",
+            "launch_failed": "搜狗语音程序启动失败，请手动启动后再试。",
+            "launch_unconfirmed": "还未确认搜狗语音程序已启动，请稍等或手动启动后再试。",
+            "cancelled": "已取消启动搜狗语音程序，请手动启动后再试。",
+        }
+        if result.code in sogou_messages:
+            return sogou_messages[result.code]
     messages = {
-        "disabled": "未启用语音程序管理。",
+        "disabled": "请先选择语音程序。",
         "not_found": "没有找到可启动的语音程序。",
         "started": (
             "已请求以管理员权限启动语音程序。"
@@ -409,6 +429,7 @@ def resolve_voice_program_settings_target(
             platform=current_platform,
             process_iter=process_snapshot,
             run_value_reader=run_value_reader,
+            install_value_reader=sogou_install_value_reader,
         )
         if executable is not None:
             return VoiceProgramSettingsTarget(
@@ -715,6 +736,7 @@ def discover_sogou_voice_executable(
     platform: Optional[str] = None,
     process_iter: Optional[Callable[[], Iterable[ProcessInfo]]] = None,
     run_value_reader: Optional[Callable[[], Iterable[str]]] = None,
+    install_value_reader: Optional[Callable[[], Iterable[str]]] = None,
 ) -> Optional[Path]:
     current_platform = sys.platform if platform is None else platform
     if current_platform != "win32":
@@ -728,12 +750,33 @@ def discover_sogou_voice_executable(
         ):
             return process.executable
 
-    candidates: list[Path] = []
+    component_dirs: list[Path] = []
     for command in (run_value_reader or _read_sogou_run_values)():
         manager_path = _command_executable(command)
         if manager_path is None:
             continue
-        components_dir = manager_path.parent
+        component_dirs.append(manager_path.parent)
+    from_startup = _sogou_voice_from_components(component_dirs)
+    if from_startup is not None:
+        return from_startup
+    # The startup entry may be disabled or absent. Use the installed product's
+    # own registration; never guess a drive or recursively scan user folders.
+    for raw_value in (install_value_reader or _read_sogou_install_values)():
+        text = os.path.expandvars(str(raw_value).strip())
+        if not text:
+            continue
+        path = _command_executable(text) if ".exe" in text.casefold() else Path(text.strip('"'))
+        if path is None:
+            continue
+        root = path.parent if ".exe" in text.casefold() else path
+        for parent in (root, *root.parents[:3]):
+            component_dirs.append(parent / "Components")
+    return _sogou_voice_from_components(component_dirs)
+
+
+def _sogou_voice_from_components(component_dirs: Iterable[Path]) -> Optional[Path]:
+    candidates: list[Path] = []
+    for components_dir in dict.fromkeys(component_dirs):
         voice_root = components_dir / "ai_voice_input"
         if not voice_root.is_dir():
             continue
@@ -908,9 +951,21 @@ def _validated_configured_path(raw: object) -> Optional[Path]:
     if path.suffix.casefold() not in _ALLOWED_EXECUTABLE_SUFFIXES:
         return None
     try:
-        return path.resolve(strict=True)
-    except OSError:
+        resolved = path.resolve(strict=True)
+        return resolved if resolved.is_file() else None
+    except (OSError, ValueError):
         return None
+
+
+def voice_configuration_issue(raw: object) -> str:
+    """Shared preflight, without launching a host or changing system settings."""
+    settings = normalize_voice_program_settings(raw)
+    if settings["provider"] == VOICE_PROGRAM_NONE:
+        return "请先在语音页选择语音程序；普通按键不受影响。"
+    if settings["provider"] == VOICE_PROGRAM_CUSTOM:
+        if not resolve_voice_program(settings).available:
+            return "自定义程序路径无效，请选择现有的 .exe 或有效的 .lnk。"
+    return ""
 
 
 def _command_executable(command: str) -> Optional[Path]:
@@ -1378,13 +1433,17 @@ def _default_start_file_with_arguments(
     )
 
 
-def diagnostic_voice_processes() -> tuple[tuple[str, int, str], ...]:
+def diagnostic_voice_processes(*, include_wetype_capture: bool = False) -> tuple[tuple[str, int, str], ...]:
     """Name candidates only; reuse provider names without discovering or launching apps."""
     names = {
         **{name.casefold(): VOICE_PROGRAM_SOGOU for name in (_SOGOU_PROCESS_NAME,)},
         **{name.casefold(): VOICE_PROGRAM_WETYPE for name in _WETYPE_PROCESS_NAMES},
         **{name.casefold(): VOICE_PROGRAM_DOUBAO_IME for name in _DOUBAO_PROCESS_NAMES},
     }
+    if include_wetype_capture:
+        # WeType 2.1.3.18 also hosts capture in its settings executable. This
+        # must not widen launcher readiness or foreground/input-stop ownership.
+        names[_WETYPE_SETTINGS_EXE.casefold()] = VOICE_PROGRAM_WETYPE
     return tuple((names[p.name.casefold()], p.pid, p.name)
                  for p in _iter_windows_processes(names=set(names)))
 

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import ctypes
+from contextlib import contextmanager
 from ctypes import wintypes
 import os
 from pathlib import Path
@@ -21,6 +22,7 @@ from .frida_hid_tap_runtime import (
     sha256_file,
 )
 from .hid_host_reload_windows import ensure_reload_capable_host
+from . import hid_injection_diagnostics as injection_diagnostics
 
 
 PROCESS_CREATE_THREAD = 0x0002
@@ -43,6 +45,38 @@ ERROR_NOT_ALL_ASSIGNED = 1300
 
 class HidInjectionStageError(RuntimeError):
     """Sanitized injection-stage failure for the elevated helper."""
+
+    def __init__(self, detail, **fields):
+        super().__init__(detail)
+        stage = {
+            'hid_helper_host_changed': 'host_recheck',
+            'hid_helper_debug_privilege_failed': 'debug_privilege',
+            'hid_helper_target_process_open_failed': 'target_open',
+            'hid_helper_target_validation_failed': 'target_identity',
+            'hid_helper_runtime_preparation_failed': 'runtime_prepare',
+            'hid_helper_host_restarted': 'host_reload',
+            'hid_helper_legacy_runtime_restart_required': 'host_reload',
+            'hid_helper_remote_thread_failed': 'remote_thread',
+            'hid_helper_remote_load_timeout': 'remote_wait',
+        }.get(detail, 'unknown')
+        self.injection_diagnostic = dict(stage=stage, **fields) if 'stage' not in fields else fields
+
+
+def _win_error(api):
+    # Capture before cleanup or any subsequent Windows API can overwrite it.
+    error = ctypes.WinError(ctypes.get_last_error())
+    error.injection_diagnostic = {'api': api}
+    return error
+
+
+@contextmanager
+def _diagnostic_stage(stage):
+    try:
+        yield
+    except Exception as exc:
+        if not getattr(exc, 'injection_diagnostic', None):
+            exc.injection_diagnostic = {'stage': stage}
+        raise
 
 
 class LUID(ctypes.Structure):
@@ -95,13 +129,13 @@ def enable_debug_privilege() -> None:
         TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY,
         ctypes.byref(token),
     ):
-        raise ctypes.WinError(ctypes.get_last_error())
+        raise _win_error('OpenProcessToken')
     try:
         luid = LUID()
         if not advapi32.LookupPrivilegeValueW(
             None, "SeDebugPrivilege", ctypes.byref(luid)
         ):
-            raise ctypes.WinError(ctypes.get_last_error())
+            raise _win_error('LookupPrivilegeValueW')
         privileges = TOKEN_PRIVILEGES()
         privileges.PrivilegeCount = 1
         privileges.Privileges[0].Luid = luid
@@ -110,12 +144,17 @@ def enable_debug_privilege() -> None:
         if not advapi32.AdjustTokenPrivileges(
             token, False, ctypes.byref(privileges), 0, None, None
         ):
-            raise ctypes.WinError(ctypes.get_last_error())
+            raise _win_error('AdjustTokenPrivileges')
         error = ctypes.get_last_error()
         if error == ERROR_NOT_ALL_ASSIGNED:
-            raise PermissionError("SeDebugPrivilege is not assigned")
+            failure = PermissionError("SeDebugPrivilege is not assigned")
+            failure.winerror = error
+            failure.injection_diagnostic = {'api': 'AdjustTokenPrivileges'}
+            raise failure
         if error:
-            raise ctypes.WinError(error)
+            failure = ctypes.WinError(error)
+            failure.injection_diagnostic = {'api': 'AdjustTokenPrivileges'}
+            raise failure
     finally:
         kernel32.CloseHandle(token)
 
@@ -182,7 +221,7 @@ def inject_library(pid: int, dll_path: Path) -> None:
     if not process:
         raise HidInjectionStageError(
             "hid_helper_target_process_open_failed"
-        ) from ctypes.WinError(ctypes.get_last_error())
+        ) from _win_error('OpenProcess')
     remote_path = None
     thread = None
     remote_thread_completed = False
@@ -193,26 +232,29 @@ def inject_library(pid: int, dll_path: Path) -> None:
         )
         if not remote_path:
             raise HidInjectionStageError(
-                "hid_helper_remote_memory_failed"
-            ) from ctypes.WinError(ctypes.get_last_error())
+                "hid_helper_remote_memory_failed", stage='remote_allocate'
+            ) from _win_error('VirtualAllocEx')
         buffer = ctypes.create_string_buffer(encoded)
         written = ctypes.c_size_t()
         if not kernel32.WriteProcessMemory(
             process, remote_path, buffer, len(encoded), ctypes.byref(written)
         ):
             raise HidInjectionStageError(
-                "hid_helper_remote_memory_failed"
-            ) from ctypes.WinError(ctypes.get_last_error())
+                "hid_helper_remote_memory_failed", stage='remote_write'
+            ) from _win_error('WriteProcessMemory')
         if written.value != len(encoded):
-            raise HidInjectionStageError("hid_helper_remote_memory_failed")
+            raise HidInjectionStageError("hid_helper_remote_memory_failed", stage='remote_write',
+                                         api='WriteProcessMemory', expected_bytes=len(encoded),
+                                         actual_bytes=written.value)
         kernel = kernel32.GetModuleHandleW("kernel32.dll")
         if not kernel:
-            raise HidInjectionStageError("hid_helper_remote_load_failed")
+            raise HidInjectionStageError("hid_helper_remote_load_failed", stage='load_library_lookup'
+                                         ) from _win_error('GetModuleHandleW')
         load_library = kernel32.GetProcAddress(kernel, b"LoadLibraryW")
         if not load_library:
             raise HidInjectionStageError(
-                "hid_helper_remote_load_failed"
-            ) from ctypes.WinError(ctypes.get_last_error())
+                "hid_helper_remote_load_failed", stage='load_library_lookup'
+            ) from _win_error('GetProcAddress')
         thread_id = wintypes.DWORD()
         thread = kernel32.CreateRemoteThread(
             process,
@@ -226,24 +268,28 @@ def inject_library(pid: int, dll_path: Path) -> None:
         if not thread:
             raise HidInjectionStageError(
                 "hid_helper_remote_thread_failed"
-            ) from ctypes.WinError(ctypes.get_last_error())
+            ) from _win_error('CreateRemoteThread')
         wait_result = int(kernel32.WaitForSingleObject(thread, 20_000))
         if wait_result == WAIT_TIMEOUT:
-            raise HidInjectionStageError("hid_helper_remote_load_timeout")
+            raise HidInjectionStageError("hid_helper_remote_load_timeout", api='WaitForSingleObject',
+                                         return_value=wait_result)
         if wait_result == WAIT_FAILED:
             raise HidInjectionStageError(
-                "hid_helper_remote_load_failed"
-            ) from ctypes.WinError(ctypes.get_last_error())
+                "hid_helper_remote_load_failed", stage='remote_wait', return_value=wait_result
+            ) from _win_error('WaitForSingleObject')
         if wait_result != WAIT_OBJECT_0:
-            raise HidInjectionStageError("hid_helper_remote_load_failed")
+            raise HidInjectionStageError("hid_helper_remote_load_failed", stage='remote_wait',
+                                         api='WaitForSingleObject', return_value=wait_result)
         remote_thread_completed = True
         exit_code = wintypes.DWORD()
         if not kernel32.GetExitCodeThread(thread, ctypes.byref(exit_code)):
             raise HidInjectionStageError(
-                "hid_helper_remote_load_failed"
-            ) from ctypes.WinError(ctypes.get_last_error())
+                "hid_helper_remote_load_failed", stage='remote_exit'
+            ) from _win_error('GetExitCodeThread')
         if exit_code.value == 0:
-            raise HidInjectionStageError("hid_helper_remote_load_failed")
+            # A remote LoadLibraryW return value is not this process's last error.
+            raise HidInjectionStageError("hid_helper_remote_load_failed", stage='remote_exit',
+                                         api='GetExitCodeThread', return_value=exit_code.value)
     finally:
         if thread:
             kernel32.CloseHandle(thread)
@@ -270,14 +316,14 @@ def _target_process_name(pid: int) -> str:
     kernel32.CloseHandle.restype = wintypes.BOOL
     process = kernel32.OpenProcess(0x1000, False, pid)
     if not process:
-        raise ctypes.WinError(ctypes.get_last_error())
+        raise _win_error('OpenProcess')
     try:
         buffer = ctypes.create_unicode_buffer(32768)
         length = wintypes.DWORD(len(buffer))
         if not kernel32.QueryFullProcessImageNameW(
             process, 0, buffer, ctypes.byref(length)
         ):
-            raise ctypes.WinError(ctypes.get_last_error())
+            raise _win_error('QueryFullProcessImageNameW')
         return Path(buffer.value[: length.value]).name.casefold()
     finally:
         kernel32.CloseHandle(process)
@@ -293,9 +339,10 @@ def inject_current_process(pid: int, *, selected_key: str | None = None) -> None
 
     if os.name != "nt":
         raise PermissionError("RC003 injector requires Windows administrator elevation")
-    expected_pid = find_rc003_hidogatt_host_pid(selected_key=selected_key)
+    with _diagnostic_stage('host_lookup'):
+        expected_pid = find_rc003_hidogatt_host_pid(selected_key=selected_key)
     if expected_pid != pid:
-        raise HidInjectionStageError("hid_helper_host_changed")
+        raise HidInjectionStageError("hid_helper_host_changed", stage='host_lookup')
     # WUDFHost denies even limited process queries until the elevated injector
     # enables SeDebugPrivilege.  Validate the target only after that succeeds.
     try:
@@ -314,15 +361,18 @@ def inject_current_process(pid: int, *, selected_key: str | None = None) -> None
         raise HidInjectionStageError("hid_helper_target_validation_failed")
     try:
         dll_path = prepare_secure_runtime()
-        dll_hash = sha256_file(dll_path)
+        with _diagnostic_stage('runtime_hash'):
+            dll_hash = sha256_file(dll_path)
     except (OSError, RuntimeError, ValueError) as exc:
         raise HidInjectionStageError(
             "hid_helper_runtime_preparation_failed"
         ) from exc
     if dll_hash != GADGET_DLL_SHA256:
-        raise HidInjectionStageError("hid_helper_runtime_preparation_failed")
+        raise HidInjectionStageError("hid_helper_runtime_preparation_failed", stage='runtime_hash',
+                                     reason='runtime_dll_hash_mismatch')
     try:
-        lifecycle = ensure_reload_capable_host(pid, dll_path, selected_key=selected_key)
+        with _diagnostic_stage('host_reload'):
+            lifecycle = ensure_reload_capable_host(pid, dll_path, selected_key=selected_key)
         if lifecycle == "restarted":
             # The parent must discover and authenticate the new host itself.
             raise HidInjectionStageError("hid_helper_host_restarted")
@@ -332,7 +382,9 @@ def inject_current_process(pid: int, *, selected_key: str | None = None) -> None
             return  # Updating the protected script triggers Gadget's reloader.
         if lifecycle != "fresh":
             raise HidInjectionStageError("hid_helper_runtime_preparation_failed")
-        if find_rc003_hidogatt_host_pid(selected_key=selected_key) != pid:
+        with _diagnostic_stage('host_recheck'):
+            current_pid = find_rc003_hidogatt_host_pid(selected_key=selected_key)
+        if current_pid != pid:
             raise HidInjectionStageError("hid_helper_host_changed")
         inject_library(pid, dll_path)
     except HidInjectionStageError:
@@ -345,21 +397,29 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--pid", type=int, required=True)
     args = parser.parse_args(argv)
+    failure = None
+    exit_code = 0
     try:
         from . import remote_selection
         inject_current_process(args.pid, selected_key=remote_selection.saved_active_key())
-        return 0
-    except PermissionError:
-        return 3
+    except PermissionError as exc:
+        failure, exit_code = exc, 3
     except HidInjectionStageError as exc:
-        return {
+        failure = exc
+        exit_code = {
             "hid_helper_host_restarted": 6,
             "hid_helper_legacy_runtime_restart_required": 7,
         }.get(str(exc), 4)
-    except (OSError, RuntimeError, ValueError):
-        return 4
-    except Exception:  # noqa: BLE001 - hidden child reports only a stable exit code
-        return 5
+    except (OSError, RuntimeError, ValueError) as exc:
+        failure, exit_code = exc, 4
+    except Exception as exc:  # noqa: BLE001 - preserve the stable exit code
+        failure, exit_code = exc, 5
+    try:
+        injection_diagnostics.write_stdout(injection_diagnostics.result_record(
+            success=exit_code == 0, target_pid=args.pid, exit_code=exit_code, exc=failure))
+    except Exception:
+        pass
+    return exit_code
 
 
 if __name__ == "__main__":

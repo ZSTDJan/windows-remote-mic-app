@@ -8,6 +8,7 @@ AbstractButton {
     property var tokens
     property string cardId: ""
     property string buttonName: ""
+    property real keyLabelWidth: 32
     property string singleText: ""
     property string doubleText: ""
     property string longText: ""
@@ -128,9 +129,9 @@ AbstractButton {
                     font.family: cell.usingNote
                         ? root.tokens.fontFamily : root.tokens.fontFamilyMono
                     font.pixelSize: cell.usingNote
-                        ? root.tokens.fontSizeMapPrimary
+                        ? root.tokens.fontSizeSmall
                         : root.tokens.fontSizeMapGesture
-                    font.weight: cell.usingNote ? Font.Medium : Font.Normal
+                    font.weight: Font.Normal
                     horizontalAlignment: Text.AlignHCenter
                     verticalAlignment: Text.AlignVCenter
                     elide: Text.ElideRight
@@ -180,8 +181,6 @@ AbstractButton {
                 Layout.preferredHeight: 22
                 text: qsTr("语音模式下暂停")
                 color: root.tokens.disabledText
-                font.pixelSize: root.tokens.fontSizeMapGesture
-                font.weight: Font.Normal
                 horizontalAlignment: Text.AlignHCenter
                 verticalAlignment: Text.AlignVCenter
                 elide: Text.ElideRight
@@ -206,9 +205,9 @@ AbstractButton {
         MappingKeyLabel {
             objectName: root.exposeObjectNames ? "mappingKeyCell_" + root.cardId : ""
             tokens: root.tokens
-            Layout.preferredWidth: 32
-            Layout.minimumWidth: 32
-            Layout.maximumWidth: 32
+            Layout.preferredWidth: root.keyLabelWidth
+            Layout.minimumWidth: root.keyLabelWidth
+            Layout.maximumWidth: root.keyLabelWidth
             Layout.fillHeight: true
             text: root.buttonName
             Accessible.name: text

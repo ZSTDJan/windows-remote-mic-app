@@ -1,17 +1,106 @@
 import hashlib
+import ctypes
 import lzma
+import sys
 import tempfile
 import unittest
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from unittest import mock
 
 from ovb_rc003 import frida_hid_tap_runtime, hid_elevation_windows
+from ovb_rc003 import frida_hid_tap_injector as injector, hid_injection_diagnostics as diagnostics
 
 
 SID = "S-1-5-21-111-222-333-1001"
 
 
+@contextmanager
+def isolated_runtime(sid=SID):
+    with tempfile.TemporaryDirectory() as raw, ExitStack() as stack:
+        root = Path(raw)
+        payload = b"isolated gadget payload"
+        archive = root / "gadget.xz"
+        archive.write_bytes(lzma.compress(payload))
+        def read_acl(path):
+            return hid_elevation_windows._path_security_sddl_text(
+                sid, directory=path.is_dir(),
+                read_execute_sids=(hid_elevation_windows.LOCAL_SERVICE_SID,),
+            )
+        for module, name, value in (
+            (frida_hid_tap_runtime, "gadget_archive_path", lambda: archive),
+            (frida_hid_tap_runtime, "GADGET_ARCHIVE_SHA256", hashlib.sha256(archive.read_bytes()).hexdigest()),
+            (frida_hid_tap_runtime, "GADGET_DLL_SHA256", hashlib.sha256(payload).hexdigest()),
+            (hid_elevation_windows, "current_user_sid", lambda: sid),
+            (hid_elevation_windows, "_program_files_root", lambda: root),
+            (hid_elevation_windows, "ensure_protected_directory", lambda path, **kw: path.mkdir(parents=True, exist_ok=True)),
+            (hid_elevation_windows, "assert_no_reparse_points", lambda *a, **kw: None),
+            (hid_elevation_windows, "_apply_path_security", lambda *a, **kw: None),
+            (hid_elevation_windows, "_read_path_security_sddl", read_acl),
+        ):
+            stack.enter_context(mock.patch.object(module, name, value))
+        yield root, archive, read_acl
+
+
 class ProtectedRuntimePathTests(unittest.TestCase):
+    @unittest.skipUnless(sys.platform == "win32", "Windows injector entrypoint")
+    def test_validation_failures_preserve_distinct_reason_through_injector(self):
+        for reason in diagnostics.REASONS:
+            with self.subTest(reason=reason), isolated_runtime() as (_, archive, read_acl), ExitStack() as stack:
+                if reason == "runtime_archive_hash_mismatch":
+                    archive.write_bytes(b"corrupt")
+                elif reason == "runtime_dll_hash_mismatch":
+                    stack.enter_context(mock.patch.object(frida_hid_tap_runtime, "GADGET_DLL_SHA256", "bad"))
+                else:
+                    fail_directory = reason == "runtime_directory_acl_invalid"
+                    stack.enter_context(mock.patch.object(
+                        hid_elevation_windows, "_read_path_security_sddl",
+                        side_effect=lambda path: "invalid" if path.is_dir() == fail_directory else read_acl(path),
+                    ))
+                stack.enter_context(mock.patch.object(injector, "find_rc003_hidogatt_host_pid", return_value=2468))
+                stack.enter_context(mock.patch.object(injector, "enable_debug_privilege"))
+                stack.enter_context(mock.patch.object(injector, "_target_process_name", return_value="wudfhost.exe"))
+                inject = stack.enter_context(mock.patch.object(injector, "inject_library"))
+                with self.assertRaises(injector.HidInjectionStageError) as caught:
+                    injector.inject_current_process(2468)
+                fields = diagnostics.failure(caught.exception)
+                self.assertEqual(fields["stage"], "runtime_prepare")
+                self.assertEqual(fields["reason"], reason)
+                self.assertEqual(fields["error_type"], "RuntimeError")
+                inject.assert_not_called()
+
+    @unittest.skipUnless(sys.platform == "win32", "Windows SDDL serialization")
+    def test_runtime_accepts_windows_serialized_builtin_administrator_acl(self):
+        helper = hid_elevation_windows
+        admin = helper._canonical_acl_sid("LA")
+        self.assertTrue(admin.endswith("-500"))
+        api = ctypes.WinDLL("advapi32", use_last_error=True)
+        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        api.ConvertStringSecurityDescriptorToSecurityDescriptorW.argtypes = (
+            ctypes.c_wchar_p, ctypes.c_ulong, ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p)
+        api.ConvertSecurityDescriptorToStringSecurityDescriptorW.argtypes = (
+            ctypes.c_void_p, ctypes.c_ulong, ctypes.c_ulong, ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p)
+        kernel.LocalFree.argtypes = (ctypes.c_void_p,)
+        serialized = []
+        with isolated_runtime(admin) as (_, _, read_acl):
+            def native_read(path):
+                # Windows maps generic file rights before reading the descriptor.
+                text = read_acl(path).replace("GRGX", "0x1200a9").replace(";GR;", ";0x120089;")
+                descriptor, output = ctypes.c_void_p(), ctypes.c_void_p()
+                self.assertTrue(api.ConvertStringSecurityDescriptorToSecurityDescriptorW(text, 1, ctypes.byref(descriptor), None))
+                try:
+                    self.assertTrue(api.ConvertSecurityDescriptorToStringSecurityDescriptorW(descriptor, 1, 7, ctypes.byref(output), None))
+                    result = ctypes.wstring_at(output)
+                    serialized.append(result)
+                    return result
+                finally:
+                    kernel.LocalFree(output)
+                    kernel.LocalFree(descriptor)
+            with mock.patch.object(helper, "_read_path_security_sddl", side_effect=native_read):
+                self.assertTrue(frida_hid_tap_runtime.prepare_secure_runtime().is_file())
+        self.assertEqual(len(serialized), 5)
+        self.assertTrue(all(";;;LA)" in text for text in serialized))
+
     def test_runtime_is_under_the_sid_isolated_program_files_root(self):
         program_files = Path(r"C:\Program Files")
         first = frida_hid_tap_runtime.secure_runtime_directory(

@@ -36,6 +36,7 @@ class BridgeRuntimeStatusTests(unittest.TestCase):
             voice_runtime_state=bridge_runtime_status.VOICE_RUNTIME_HOST_START_FAILED,
             voice_runtime_provider="wetype",
             voice_runtime_updated_at=41.0,
+            battery_level=59,
             now=lambda: 42.5,
         )
 
@@ -53,7 +54,35 @@ class BridgeRuntimeStatusTests(unittest.TestCase):
         )
         self.assertEqual(written.voice_runtime_provider, "wetype")
         self.assertEqual(written.voice_runtime_updated_at, 41.0)
+        self.assertEqual(written.battery_level, 59)
         self.assertEqual(bridge_runtime_status.read_status(self.root), written)
+
+    def test_invalid_battery_values_are_never_published_or_displayed(self):
+        for invalid in (-1, 101, True, 59.5):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                bridge_runtime_status.publish_status(
+                    self.root,
+                    bridge_runtime_status.BridgeConnectionState.CONNECTED,
+                    pid=1234,
+                    battery_level=invalid,
+                )
+
+        path = bridge_runtime_status.status_path(self.root)
+        path.write_text(
+            json.dumps(
+                {
+                    "schema": bridge_runtime_status.SCHEMA_VERSION,
+                    "state": "connected",
+                    "pid": 1234,
+                    "updated_at": 42.0,
+                    "battery_level": 101,
+                }
+            ),
+            encoding="utf-8",
+        )
+        status = bridge_runtime_status.read_status(self.root)
+        self.assertIsNotNone(status)
+        self.assertIsNone(status.battery_level)
 
     def test_existing_schema_two_status_defaults_new_voice_runtime_fields(self):
         path = bridge_runtime_status.status_path(self.root)
@@ -378,6 +407,40 @@ class BridgeRuntimeStatusTests(unittest.TestCase):
         )
 
         self.assertFalse(bridge_runtime_status.input_channels_ready(status))
+
+    def test_complete_button_receiver_readiness_is_profile_aware(self):
+        self.assertTrue(
+            bridge_runtime_status.button_receiver_usable(
+                "xiaomi-rc003",
+                raw_input_state="ready",
+                hid_tap_state="attached_waiting_for_hid_io",
+                voice_key_physicalizer_state="ready",
+            )
+        )
+        self.assertFalse(
+            bridge_runtime_status.button_receiver_usable(
+                "xiaomi-rc003",
+                raw_input_state="no_device",
+                hid_tap_state="attached_waiting_for_hid_io",
+                voice_key_physicalizer_state="ready",
+            )
+        )
+        self.assertFalse(
+            bridge_runtime_status.button_receiver_usable(
+                "xiaomi-rc003",
+                raw_input_state="ready",
+                hid_tap_state="ready",
+                voice_key_physicalizer_state="recovering",
+            )
+        )
+        self.assertTrue(
+            bridge_runtime_status.button_receiver_usable(
+                "chromecast-remote",
+                raw_input_state="chromecast_ready",
+                hid_tap_state="failed",
+                voice_key_physicalizer_state="failed",
+            )
+        )
 
     def test_invalid_or_partial_file_is_treated_as_unknown(self):
         path = bridge_runtime_status.status_path(self.root)

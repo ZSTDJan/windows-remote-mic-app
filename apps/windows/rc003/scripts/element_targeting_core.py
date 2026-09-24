@@ -581,9 +581,9 @@ def opaque_visual_surfaces(
         ]
         content_rect = Rect(
             rect.left,
-            max([rect.top, *header_bottoms]),
+            max([rect.top] + header_bottoms),
             rect.right,
-            min([rect.bottom, *scrollbar_tops]),
+            min([rect.bottom] + scrollbar_tops),
         )
         if content_rect.width < VISUAL_SURFACE_MIN_WIDTH or content_rect.height < 80:
             continue
@@ -736,7 +736,10 @@ def visual_grid_target_specs(
 
     def is_ink(x: int, y: int) -> bool:
         offset = y * bytes_per_line + x * 3
-        red, green, blue = rgb[offset : offset + 3]
+        # Preserve slice/unpack semantics while avoiding Cython's closure-slice
+        # parallel-assignment compiler crash (3.2.8).
+        pixel = rgb[offset : offset + 3]
+        red, green, blue = pixel
         high = max(red, green, blue)
         low = min(red, green, blue)
         return bool(high < 178 or (high - low > 72 and low < 92))

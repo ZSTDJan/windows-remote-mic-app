@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import importlib.machinery
 import logging
 import sys
 from pathlib import Path
@@ -69,28 +70,41 @@ def navigation_source_directory() -> Path:
 
 
 def _load_prototype() -> Any:
-    source_path = navigation_source_directory() / "element_navigation_prototype.py"
+    directory = navigation_source_directory()
+    native = any(__file__.endswith(suffix)
+                 for suffix in importlib.machinery.EXTENSION_SUFFIXES)
+    module_name = _PROTOTYPE_MODULE_NAME
+    source_path = directory / "element_navigation_prototype.py"
+    if native:
+        matches = [directory / ("element_navigation_prototype" + suffix)
+                   for suffix in importlib.machinery.EXTENSION_SUFFIXES
+                   if (directory / ("element_navigation_prototype" + suffix)).is_file()]
+        if len(matches) != 1:
+            raise ImportError("expected one native element-navigation entry")
+        source_path = matches[0]
+        # The name must match the extension's exported PyInit function.
+        module_name = "element_navigation_prototype"
     if not source_path.is_file():
         raise RuntimeError(f"element navigation source is missing: {source_path}")
     expected_path = source_path.resolve()
-    existing = sys.modules.get(_PROTOTYPE_MODULE_NAME)
+    existing = sys.modules.get(module_name)
     if existing is not None:
         existing_path = Path(str(getattr(existing, "__file__", ""))).resolve()
         if existing_path != expected_path:
             raise ImportError("element navigation module refers to a different file")
         return existing
     spec = importlib.util.spec_from_file_location(
-        _PROTOTYPE_MODULE_NAME,
+        module_name,
         expected_path,
     )
     if spec is None or spec.loader is None:
         raise ImportError("cannot load element navigation entry")
     module = importlib.util.module_from_spec(spec)
-    sys.modules[_PROTOTYPE_MODULE_NAME] = module
+    sys.modules[module_name] = module
     try:
         spec.loader.exec_module(module)
     except Exception:
-        sys.modules.pop(_PROTOTYPE_MODULE_NAME, None)
+        sys.modules.pop(module_name, None)
         raise
     return module
 

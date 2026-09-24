@@ -11,85 +11,80 @@ SettingsDialog {
     dismissalEnabled: !SettingsController.remoteSelectionBusy
     closeButtonObjectName: "closeRemoteDialogButton"
     preferredWidth: 520
-    onOpened: {
-        const rows = SettingsController.registeredRemotes
-        let activeIndex = 0
-        for (let i = 0; i < rows.length; i++) {
-            if (rows[i].key === SettingsController.activeRemoteKey)
-                activeIndex = i
+    readonly property var deviceRows: SettingsController.remoteDeviceChoices
+    property string pendingRemoteKey: ""
+    readonly property int pendingRemoteIndex: indexForKey(pendingRemoteKey)
+    readonly property var pendingChoice: {
+        for (const row of deviceRows) {
+            if (row.key === pendingRemoteKey)
+                return row
         }
-        registered.currentIndex = rows.length ? activeIndex : -1
+        return null
+    }
+    onPendingRemoteKeyChanged: syncSelection()
+
+    function syncSelection() {
+        devices.currentIndex = indexForKey(pendingRemoteKey)
+    }
+
+    function indexForKey(key) {
+        const rows = deviceRows
+        for (let i = 0; i < rows.length; i++) {
+            if (rows[i].key === key)
+                return i
+        }
+        return -1
+    }
+    onAboutToShow: {
+        pendingRemoteKey = SettingsController.activeRemoteKey
         SettingsController.refreshRemoteDevices()
     }
+    onAboutToHide: pendingRemoteKey = ""
     contentItem: ColumnLayout {
         spacing: root.tokens.spacingLarge
-        GridLayout {
+        RowLayout {
             Layout.fillWidth: true
-            columns: 4
-            columnSpacing: root.tokens.spacingSmall
-            rowSpacing: root.tokens.spacingLarge
-            UiLabel { tokens: root.tokens; kind: bodyKind; text: qsTr("已添加设备") }
+            spacing: root.tokens.spacingSmall
+            UiLabel { tokens: root.tokens; kind: bodyKind; text: qsTr("遥控器") }
             SelectionComboBox {
-                id: registered
-                objectName: "registeredRemoteCombo"
+                id: devices
+                objectName: "remoteDeviceCombo"
                 tokens: root.tokens
                 Layout.fillWidth: true
-                model: SettingsController.registeredRemotes
+                Layout.minimumWidth: 0
+                model: root.deviceRows
                 textRole: "label"
-                displayText: count > 0 ? currentText : qsTr("请先在下方添加设备")
+                currentIndex: -1
+                // ComboBox may reset to row zero when its model is replaced.
+                // Restore the explicit draft after its native model update.
+                onModelChanged: Qt.callLater(root.syncSelection)
+                onCountChanged: Qt.callLater(root.syncSelection)
+                effectiveIndex: root.indexForKey(SettingsController.activeRemoteKey)
+                showEffectiveMarker: true
+                displayText: root.pendingChoice
+                    ? decoratedText(root.pendingRemoteIndex, root.pendingChoice.label)
+                    : SettingsController.remoteDevicesRefreshing ? qsTr("正在读取设备…")
+                    : count > 0 ? qsTr("请选择遥控器") : qsTr("没有可用的已配对遥控器")
                 enabled: !SettingsController.remoteSelectionBusy && count > 0
-                Accessible.name: qsTr("已添加的遥控器")
+                Accessible.name: qsTr("已配对的受支持遥控器")
+                onActivated: index => root.pendingRemoteKey = model[index].key
             }
             CompactButton {
                 objectName: "useRemoteButton"
                 tokens: root.tokens
                 text: qsTr("使用此设备")
                 highlighted: true
-                enabled: !SettingsController.remoteSelectionBusy && registered.currentIndex >= 0
-                onClicked: SettingsController.useRemoteDevice(registered.model[registered.currentIndex].key)
-            }
-            CompactButton {
-                objectName: "removeRemoteButton"
-                tokens: root.tokens
-                text: qsTr("移除设备")
-                enabled: !SettingsController.remoteSelectionBusy && registered.currentIndex >= 0
-                onClicked: SettingsController.removeRemoteDevice(registered.model[registered.currentIndex].key)
-            }
-            UiLabel {
-                tokens: root.tokens
-                kind: bodyKind
-                text: qsTr("已配对设备")
-                HoverHandler { id: pairedLabelHover }
-                CompactToolTip {
-                    tokens: root.tokens
-                    active: pairedLabelHover.hovered
-                    text: qsTr("Windows 已配对、尚未添加的设备")
-                }
-            }
-            SelectionComboBox {
-                id: available
-                objectName: "availableRemoteCombo"
-                tokens: root.tokens
-                Layout.fillWidth: true
-                model: SettingsController.availableRemotes
-                textRole: "label"
-                displayText: count > 0 ? currentText : qsTr("没有可添加的已配对设备")
-                enabled: !SettingsController.remoteSelectionBusy && count > 0
-                Accessible.name: qsTr("可添加的已配对设备")
-            }
-            CompactButton {
-                objectName: "addRemoteButton"
-                tokens: root.tokens
-                text: qsTr("添加设备")
-                enabled: !SettingsController.remoteSelectionBusy && available.currentIndex >= 0
-                    && available.model[available.currentIndex].profile === "xiaomi-rc003"
-                onClicked: SettingsController.addRemoteDevice(available.model[available.currentIndex].key)
+                enabled: !SettingsController.remoteSelectionBusy
+                    && !SettingsController.remoteDevicesRefreshing
+                    && root.pendingRemoteKey.length > 0
+                    && root.pendingChoice !== null && root.pendingChoice.canUse
+                onClicked: SettingsController.useRemoteDevice(root.pendingRemoteKey)
             }
             CompactButton {
                 objectName: "refreshRemotesButton"
                 tokens: root.tokens
-                text: qsTr("重新读取")
-                enabled: !SettingsController.remoteSelectionBusy
+                text: qsTr("刷新")
+                enabled: !SettingsController.remoteSelectionBusy && !SettingsController.remoteDevicesRefreshing
                 onClicked: SettingsController.refreshRemoteDevices()
             }
         }
@@ -103,10 +98,11 @@ SettingsDialog {
             wrapMode: Text.WordWrap
         }
         UiLabel {
+            objectName: "remoteDeviceHelpNote"
             tokens: root.tokens
             kind: noteKind
             Layout.fillWidth: true
-            text: qsTr("切换会结束当前录音。移除当前设备会停止服务，保留 Windows 蓝牙配对。")
+            text: qsTr("切换会结束录音，各设备设置分别保留。")
             wrapMode: Text.WordWrap
         }
     }

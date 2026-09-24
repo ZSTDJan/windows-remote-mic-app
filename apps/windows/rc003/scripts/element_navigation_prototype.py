@@ -19,16 +19,28 @@ from __future__ import annotations
 
 import argparse
 import importlib.util
+import importlib.machinery
 import os
 import sys
 from typing import Any, Optional, Sequence
 
 
+def _sibling_module_path(name: str) -> str:
+    directory = os.path.dirname(os.path.abspath(__file__))
+    native = any(__file__.endswith(suffix)
+                 for suffix in importlib.machinery.EXTENSION_SUFFIXES)
+    if not native:
+        return os.path.join(directory, name + ".py")
+    matches = [os.path.join(directory, name + suffix)
+               for suffix in importlib.machinery.EXTENSION_SUFFIXES
+               if os.path.isfile(os.path.join(directory, name + suffix))]
+    if len(matches) != 1:
+        raise ImportError(f"expected one native navigation module: {name}")
+    return matches[0]
+
+
 _SPATIAL_NAVIGATION_CORE_NAME = "spatial_navigation_core"
-_SPATIAL_NAVIGATION_CORE_PATH = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)),
-    "spatial_navigation_core.py",
-)
+_SPATIAL_NAVIGATION_CORE_PATH = _sibling_module_path(_SPATIAL_NAVIGATION_CORE_NAME)
 
 
 def _load_spatial_navigation_core() -> Any:
@@ -71,10 +83,7 @@ del _core_export
 
 
 _ELEMENT_TARGETING_CORE_NAME = "element_targeting_core"
-_ELEMENT_TARGETING_CORE_PATH = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)),
-    "element_targeting_core.py",
-)
+_ELEMENT_TARGETING_CORE_PATH = _sibling_module_path(_ELEMENT_TARGETING_CORE_NAME)
 
 
 def _load_element_targeting_core() -> Any:
@@ -126,10 +135,7 @@ del _targeting_export
 
 
 _ELEMENT_NAVIGATION_SUPPORT_NAME = "element_navigation_support"
-_ELEMENT_NAVIGATION_SUPPORT_PATH = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)),
-    "element_navigation_support.py",
-)
+_ELEMENT_NAVIGATION_SUPPORT_PATH = _sibling_module_path(_ELEMENT_NAVIGATION_SUPPORT_NAME)
 
 
 def _load_element_navigation_support() -> Any:
@@ -182,10 +188,7 @@ del _support_export
 
 
 _ELEMENT_NAVIGATION_COMMAND_NAME = "element_navigation_command_windows"
-_ELEMENT_NAVIGATION_COMMAND_PATH = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)),
-    "element_navigation_command_windows.py",
-)
+_ELEMENT_NAVIGATION_COMMAND_PATH = _sibling_module_path(_ELEMENT_NAVIGATION_COMMAND_NAME)
 
 
 def _load_element_navigation_command() -> Any:
@@ -282,10 +285,7 @@ def _parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
 
 
 _ELEMENT_NAVIGATION_WINDOWS_HOST_NAME = "element_navigation_windows_host"
-_ELEMENT_NAVIGATION_WINDOWS_HOST_PATH = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)),
-    "element_navigation_windows_host.py",
-)
+_ELEMENT_NAVIGATION_WINDOWS_HOST_PATH = _sibling_module_path(_ELEMENT_NAVIGATION_WINDOWS_HOST_NAME)
 
 
 def _load_element_navigation_windows_host() -> Any:

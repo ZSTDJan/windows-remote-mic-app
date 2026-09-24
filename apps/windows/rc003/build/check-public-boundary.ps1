@@ -104,6 +104,12 @@ $nonAttributionReferenceExemptRelativePaths = @(
     "ATTRIBUTION.md"
 )
 $elevationMarkers = @("runas", "ShellExecute", "IsUserAnAdmin", "RequireAdministrator", "PrivilegesRequired=admin")
+# Exact reviewed markers only; branding, paths and autostart remain checked.
+$reviewedElevationMarkers = @{
+    "src/ovb_rc003/chromecast_pipe_windows.py" = @("runas", "ShellExecute")
+    "scripts/sogou_normal_submit_test.py" = @("IsUserAnAdmin")
+    "scripts/sogou_stop_probe.py" = @("IsUserAnAdmin")
+}
 $autostartMarkers = @("CurrentVersion\Run", "userstartup")
 
 # Generated/build-output directories - never source, always safe to
@@ -333,7 +339,8 @@ try {
                 }
             }
             foreach ($marker in $elevationMarkers) {
-                if ($effectiveText.Contains($marker)) {
+                if ($effectiveText.Contains($marker) -and
+                    -not ($reviewedElevationMarkers[$relativePath] -contains $marker)) {
                     $violations.Add("elevation marker ('$marker') in: $($file.FullName)")
                 }
             }

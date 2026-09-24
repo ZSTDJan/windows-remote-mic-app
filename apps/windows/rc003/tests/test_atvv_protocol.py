@@ -215,6 +215,21 @@ class FrameAccumulatorTests(unittest.TestCase):
         self.assertEqual(accumulator.append(b"23", frame_size=4), [b"0123"])
         self.assertEqual(accumulator.append(b"4567890", frame_size=4), [b"4567"])
 
+    def test_fragmented_frame_retains_oldest_notification_origin(self):
+        accumulator = proto.FrameAccumulator()
+        self.assertEqual(
+            accumulator.append_with_origin(b"0", frame_size=2, origin=5),
+            [],
+        )
+        self.assertEqual(
+            accumulator.append_with_origin(b"12", frame_size=2, origin=6),
+            [(b"01", 5)],
+        )
+        self.assertEqual(
+            accumulator.append_with_origin(b"3", frame_size=2, origin=7),
+            [(b"23", 6)],
+        )
+
     def test_reset_drops_pending_bytes(self):
         accumulator = proto.FrameAccumulator()
         accumulator.append(b"01", frame_size=4)

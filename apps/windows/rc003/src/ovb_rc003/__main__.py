@@ -1,4 +1,4 @@
-"""``python -m ovb_rc003`` (or the packaged ``RemoteMicRC003.exe``,
+"""``python -m ovb_rc003`` (or the packaged versioned Windows executable,
 built from the standalone ``src/launcher.py`` entry point - see XRBM-021):
 
 - (no args)     open the settings window - the DEFAULT double-click
@@ -109,7 +109,7 @@ APPLICATION_EXIT_REQUEST_TIMEOUT_EXIT_CODE = 20
 APPLICATION_EXIT_REQUEST_REJECTED_EXIT_CODE = 21
 HID_HELPER_MAINTENANCE_FAILED_EXIT_CODE = 24
 HID_HELPER_ACCOUNT_UNSUPPORTED_EXIT_CODE = 25
-ELEVATED_DESKTOP_UNSUPPORTED_EXIT_CODE = 26
+DESKTOP_PERMISSION_UNAVAILABLE_EXIT_CODE = 26
 INSTALLER_MAINTENANCE_ACTIVE_EXIT_CODE = 27
 LEGACY_BRIDGE_STARTUP_BLOCKED_EXIT_CODE = 28
 HID_CONSUMER_REGISTRATION_TIMEOUT_SECONDS = 2.0
@@ -806,6 +806,27 @@ def _handoff_previous_application(
 
 def main() -> None:
     args = dev_session.consume_marker(sys.argv[1:])
+    if "--doubao-handsfree-finish" in args:
+        from . import chromecast_doubao_handsfree
+        if args[0] != chromecast_doubao_handsfree.FLAG:
+            raise SystemExit(2)
+        raise SystemExit(chromecast_doubao_handsfree.child_main(args[1:]))
+    if "--sogou-normal-submit" in args:
+        from . import sogou_submit_windows
+        if args[0] != sogou_submit_windows.FLAG:
+            raise SystemExit(2)
+        raise SystemExit(sogou_submit_windows.child_main(args[1:]))
+    if "--chromecast-worker" in args:
+        if args[0] != "--chromecast-worker":
+            raise SystemExit(2)
+        from . import chromecast_worker
+        raise SystemExit(chromecast_worker.main(args[1:]))
+    if dev_session.is_isolated() and any(flag in args for flag in (
+        "--request-exit", "--install-hid-helper", "--uninstall-hid-helper",
+        "--element-navigation", "--background", "--bridge",
+    )):
+        print("隔离测试不使用旧版控制、后台启动或组件安装入口。", file=sys.stderr)
+        raise SystemExit(INVALID_ARGUMENTS_EXIT_CODE)
     if "--observe-shortcut" in args:
         from . import shortcut_observation_windows
         if not args or args[0] != shortcut_observation_windows.FLAG:
@@ -1005,21 +1026,20 @@ def _run_settings(
 ) -> None:
     from . import hid_elevation_windows, settings_ui, single_instance
 
+    if dev_session.is_isolated():
+        _run_isolated_settings()
+        return
     if getattr(sys, "frozen", False) and sys.platform == "win32":
         try:
-            process_elevated = hid_elevation_windows.query_process_elevated()
+            # Both token states are supported. The HID injector chooses the
+            # direct child or registered helper from the actual process token.
+            hid_elevation_windows.query_process_elevated()
         except Exception:  # noqa: BLE001 - the desktop startup must fail closed
             single_instance.show_bridge_startup_blocked_notice(
                 "无法确认无线麦当前的权限状态。\n\n"
                 "请关闭程序后重新普通双击打开。"
             )
-            raise SystemExit(ELEVATED_DESKTOP_UNSUPPORTED_EXIT_CODE)
-        if process_elevated:
-            single_instance.show_bridge_startup_blocked_notice(
-                f"{product_identity.DISPLAY_NAME}不能以管理员身份长期运行。\n\n"
-                "请关闭后普通双击打开；自定义按键映射由管理员按键组件处理。"
-            )
-            raise SystemExit(ELEVATED_DESKTOP_UNSUPPORTED_EXIT_CODE)
+            raise SystemExit(DESKTOP_PERMISSION_UNAVAILABLE_EXIT_CODE)
         try:
             maintenance_active = single_instance.installer_maintenance_running()
         except (
@@ -1109,6 +1129,28 @@ def _run_settings(
             f"{product_identity.DISPLAY_NAME}设置窗口无法启动。现有配置不会被自动覆盖；"
             "请检查日志目录和配置文件后重试。"
         )
+        raise SystemExit(SETTINGS_STARTUP_FAILED_EXIT_CODE)
+
+
+def _run_isolated_settings() -> None:
+    """Share the hardware ownership guard, but never hand off another copy."""
+    from . import settings_ui, single_instance
+
+    dev_session.isolated_root()
+    try:
+        with single_instance.ApplicationInstanceGuard():
+            if single_instance.bridge_instance_running():
+                raise single_instance.DuplicateInstanceError("legacy bridge")
+            # No consumer registration, legacy bridge migration or exit request.
+            settings_ui.main(start_bridge=False)
+    except single_instance.DuplicateInstanceError:
+        single_instance.show_bridge_startup_blocked_notice(
+            "隔离测试没有启动。请先从通知区域完全退出正在运行的无线麦，再打开测试版。"
+        )
+        raise SystemExit(single_instance.DUPLICATE_INSTANCE_EXIT_CODE)
+    except Exception as exc:
+        print(f"isolated startup failed: error_type={type(exc).__name__}", file=sys.stderr)
+        single_instance.show_bridge_startup_blocked_notice("无法确认独立测试的运行条件，本次没有启动。")
         raise SystemExit(SETTINGS_STARTUP_FAILED_EXIT_CODE)
 
 

@@ -56,6 +56,7 @@ class ActionKind(str, Enum):
     MOUSE_LEFT_CLICK = "mouse_left_click"
     MOUSE_RIGHT_CLICK = "mouse_right_click"
     MOUSE_MIDDLE_CLICK = "mouse_middle_click"
+    # Retained only to read bindings saved by older releases.
     MOUSE_WHEEL_UP = "mouse_wheel_up"
     MOUSE_WHEEL_DOWN = "mouse_wheel_down"
     MOUSE_X1_CLICK = "mouse_x1_click"
@@ -216,8 +217,6 @@ REPEATABLE_ACTIONS = frozenset(
         ActionKind.DELETE_BACKWARD,
         ActionKind.SYSTEM_VOLUME_UP,
         ActionKind.SYSTEM_VOLUME_DOWN,
-        ActionKind.MOUSE_WHEEL_UP,
-        ActionKind.MOUSE_WHEEL_DOWN,
     }
 )
 
@@ -302,6 +301,9 @@ class ButtonAction:
     uri: str = ""
 
     def to_dict(self) -> dict:
+        if self.kind in (ActionKind.MOUSE_WHEEL_UP, ActionKind.MOUSE_WHEEL_DOWN):
+            page_key = "pageup" if self.kind == ActionKind.MOUSE_WHEEL_UP else "pagedown"
+            return {"kind": ActionKind.KEY_COMBO.value, "keys": [page_key]}
         data = {"kind": self.kind.value, "keys": list(self.keys)}
         if self.kind == ActionKind.QUICKER_URI:
             data["uri"] = normalize_quicker_uri(self.uri)
@@ -330,6 +332,9 @@ class ButtonAction:
             uri = normalize_quicker_uri(uri)
         elif uri:
             raise ValueError("non-URI action must not contain a URI")
+        if kind in (ActionKind.MOUSE_WHEEL_UP, ActionKind.MOUSE_WHEEL_DOWN):
+            page_key = "pageup" if kind == ActionKind.MOUSE_WHEEL_UP else "pagedown"
+            return cls(kind=ActionKind.KEY_COMBO, keys=(page_key,))
         return cls(kind=kind, keys=keys, uri=uri)
 
 

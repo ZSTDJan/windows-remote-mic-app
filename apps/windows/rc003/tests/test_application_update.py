@@ -6,7 +6,9 @@ import unittest
 import urllib.error
 import urllib.parse
 from dataclasses import replace
+from datetime import date
 from pathlib import Path
+from unittest import mock
 
 from ovb_rc003 import application_update
 
@@ -127,6 +129,89 @@ def _api_opener(payload) -> MappingOpener:
             )
         }
     )
+
+
+class UpdateDeliveryTests(unittest.TestCase):
+    def test_daily_attempt_survives_restart_and_cache_cleanup(self):
+        with tempfile.TemporaryDirectory() as root:
+            cache = Path(root) / "updates"
+            self.assertTrue(application_update.claim_daily_update_check(cache, today=date(2026, 9, 18)))
+            application_update.cleanup_obsolete_update_downloads(cache, "1.0.44")
+            self.assertFalse(application_update.claim_daily_update_check(cache, today=date(2026, 9, 18)))
+            self.assertTrue(application_update.claim_daily_update_check(cache, today=date(2026, 9, 19)))
+
+    def test_unwritable_stamp_skips_automatic_network_attempt(self):
+        with tempfile.TemporaryDirectory() as root:
+            cache = Path(root) / "not-a-directory"
+            cache.write_text("keep", encoding="utf-8")
+            self.assertFalse(application_update.claim_daily_update_check(cache))
+            self.assertEqual(cache.read_text(), "keep")
+
+    def _download(self, root):
+        payload, _ = _release_payload("1.0.45")
+        release = application_update.check_for_update(
+            "1.0.44", opener=_api_opener([payload])
+        ).release
+        cache = Path(root) / "cache"
+        cache.mkdir()
+        source = cache / release.portable.name
+        source.write_bytes(b"portable")
+        return application_update.ApplicationUpdateDownload(
+            release, application_update.PackageKind.PORTABLE, source, False
+        )
+
+    def test_redirected_desktop_copy_reuse_and_conflicting_user_file(self):
+        with tempfile.TemporaryDirectory() as root:
+            download = self._download(root)
+            desktop = Path(root) / "重定向桌面"
+            desktop.mkdir()
+            occupied = desktop / download.path.name
+            occupied.write_bytes(b"user-owned")
+            result = application_update.save_update_to_desktop(download, desktop)
+            self.assertEqual(occupied.read_bytes(), b"user-owned")
+            self.assertEqual(result.path.parent, desktop)
+            self.assertIn(" (1)", result.path.name)
+            self.assertEqual(result.path.read_bytes(), b"portable")
+            reused = application_update.save_update_to_desktop(download, desktop)
+            self.assertEqual(reused.path, result.path)
+            self.assertTrue(reused.reused_existing_file)
+            self.assertEqual(len(list(desktop.iterdir())), 2)
+
+    def test_desktop_failure_and_cancel_keep_verified_cache_without_partial_package(self):
+        with tempfile.TemporaryDirectory() as root:
+            download = self._download(root)
+            desktop = Path(root) / "desktop"
+            with self.assertRaises(application_update.ApplicationUpdateError):
+                application_update.save_update_to_desktop(download, desktop)
+            desktop.mkdir()
+            cancel = threading.Event()
+            cancel.set()
+            with self.assertRaises(application_update.ApplicationUpdateCancelled):
+                application_update.save_update_to_desktop(download, desktop, cancel_event=cancel)
+            with mock.patch.object(Path, "rename", side_effect=PermissionError("locked")):
+                if application_update.os.name == "nt":
+                    with self.assertRaises(application_update.ApplicationUpdateError):
+                        application_update.save_update_to_desktop(download, desktop)
+            self.assertEqual(download.path.read_bytes(), b"portable")
+            self.assertEqual(list(desktop.iterdir()), [])
+
+    def test_desktop_publish_race_does_not_overwrite_new_user_file(self):
+        if application_update.os.name != "nt":
+            self.skipTest("Windows exclusive rename behavior")
+        with tempfile.TemporaryDirectory() as root:
+            download = self._download(root)
+            desktop = Path(root) / "desktop"
+            desktop.mkdir()
+            original_rename = Path.rename
+            def race(source, target):
+                if target.name == download.path.name:
+                    target.write_bytes(b"arrived during copy")
+                return original_rename(source, target)
+            with mock.patch.object(Path, "rename", race):
+                result = application_update.save_update_to_desktop(download, desktop)
+            self.assertEqual((desktop / download.path.name).read_bytes(), b"arrived during copy")
+            self.assertEqual(result.path.read_bytes(), b"portable")
+            self.assertNotEqual(result.path.name, download.path.name)
 
 
 class ApplicationVersionTests(unittest.TestCase):

@@ -227,9 +227,9 @@ class PostMessageWArgtypeTests(unittest.TestCase):
         # four parameter types plus a restype, not rely on ctypes defaults
         # for any of them - defends against a partial fix that only
         # prototypes some of PostMessageW's four parameters.
-        import inspect
+        from tests.source_contract import source_text
 
-        source = inspect.getsource(raw_input_windows.RawInputButtonListener._post_close_message)
+        source = source_text(raw_input_windows.RawInputButtonListener._post_close_message)
         self.assertIn("PostMessageW.argtypes", source)
         self.assertIn("PostMessageW.restype", source)
         for token in (
@@ -247,10 +247,10 @@ class PostMessageWArgtypeTests(unittest.TestCase):
         # every stop/failed-start path") instead of re-declaring (or
         # forgetting to declare) the prototype independently at each call
         # site.
-        import inspect
+        from tests.source_contract import source_text
 
-        stop_source = inspect.getsource(raw_input_windows.RawInputButtonListener.stop)
-        abandon_source = inspect.getsource(
+        stop_source = source_text(raw_input_windows.RawInputButtonListener.stop)
+        abandon_source = source_text(
             raw_input_windows.RawInputButtonListener._abandon_failed_start
         )
         self.assertIn("self._post_close_message()", stop_source)

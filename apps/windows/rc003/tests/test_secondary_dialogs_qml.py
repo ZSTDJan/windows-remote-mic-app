@@ -41,11 +41,10 @@ for width, height in ((640, 480), (720, 560)):
     assert dialog.property('width') <= 520
     assert dialog.property('height') < 250
     for combo, action, other in (
-        ('registeredRemoteCombo', 'useRemoteButton', 'removeRemoteButton'),
-        ('availableRemoteCombo', 'addRemoteButton', 'refreshRemotesButton'),
+        ('remoteDeviceCombo', 'useRemoteButton', 'refreshRemotesButton'),
     ):
         cb, bt, extra = [bounds(item(n)) for n in (combo, action, other)]
-        assert cb[2] <= 300, cb
+        assert 120 <= cb[2] < dialog.property('width'), cb
         assert abs(cb[1] - bt[1]) < 1, (cb, bt)
         assert abs(cb[1] - extra[1]) < 1, (cb, extra)
         assert cb[0] + cb[2] <= bt[0], (cb, bt)
@@ -129,8 +128,9 @@ class SecondaryDialogsQmlTests(unittest.TestCase):
         for style in ('Basic', 'Fusion'):
             with self.subTest(style=style), tempfile.TemporaryDirectory() as directory:
                 env = dict(os.environ, LOCALAPPDATA=directory, QT_QPA_PLATFORM='offscreen',
-                           RC003_DISABLE_LIVE_INPUT='1', PYTHONUTF8='1', PYTHONIOENCODING='utf-8')
-                probe = _PROBE.replace("setStyle('Basic')", f"setStyle('{style}')")
+                           RC003_DISABLE_LIVE_INPUT='1', PYTHONUTF8='1', PYTHONIOENCODING='utf-8',
+                           REMOTE_SELECTION_STYLE=style)
+                probe = _PROBE
                 result = subprocess.run([sys.executable, '-c', probe], env=env,
                                         capture_output=True, text=True, encoding='utf-8', timeout=30)
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)

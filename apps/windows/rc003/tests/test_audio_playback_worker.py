@@ -1,3 +1,4 @@
+import queue
 import threading
 import time
 import unittest
@@ -117,6 +118,82 @@ class PlaybackWriteWorkerTests(unittest.TestCase):
             audio_playback_worker.PlaybackBackpressureError,
         )
         self.assertTrue(worker.stop(1.0))
+
+    def test_blocked_serial_control_callback_releases_a_burst_into_bounded_writer(self):
+        """Characterize the incident mechanism without claiming exact log inventory.
+
+        The BLE transport dispatches control and audio on one serial worker.  A
+        slow control callback can therefore leave audio notifications queued;
+        once it returns, those notifications reach the playback writer as a
+        burst.  This diagnostic harness deliberately keeps the playback sink
+        paced/blocked and proves that the burst can exceed a bounded queue.
+        """
+
+        incoming = queue.Queue()
+        prepare_started = threading.Event()
+        release_prepare = threading.Event()
+        write_started = threading.Event()
+        release_write = threading.Event()
+        dispatch_done = threading.Event()
+        accepted = []
+        failures = []
+        dispatch_errors = []
+
+        def write(_samples):
+            write_started.set()
+            release_write.wait(2.0)
+
+        playback = audio_playback_worker.PlaybackWriteWorker(
+            write,
+            failures.append,
+            max_pending_frames=2,
+        )
+        playback.start()
+
+        def dispatch_serially():
+            try:
+                while True:
+                    kind, value = incoming.get()
+                    if kind == "stop":
+                        return
+                    if kind == "control":
+                        prepare_started.set()
+                        if not release_prepare.wait(1.0):
+                            raise AssertionError("preparation was not released")
+                        continue
+                    accepted.append(playback.submit([value]))
+                    if value == 1 and not write_started.wait(1.0):
+                        raise AssertionError("paced playback write did not start")
+            except BaseException as exc:  # Surface worker failures in the test thread.
+                dispatch_errors.append(exc)
+            finally:
+                dispatch_done.set()
+
+        dispatcher = threading.Thread(target=dispatch_serially, daemon=True)
+        dispatcher.start()
+        try:
+            incoming.put(("control", None))
+            self.assertTrue(prepare_started.wait(1.0))
+            for frame in range(1, 5):
+                incoming.put(("audio", frame))
+            self.assertEqual(incoming.qsize(), 4)
+
+            release_prepare.set()
+            incoming.put(("stop", None))
+            self.assertTrue(dispatch_done.wait(1.0))
+            self.assertEqual(dispatch_errors, [])
+            self.assertEqual(accepted, [True, True, True, False])
+            self.assertEqual(len(failures), 1)
+            self.assertIsInstance(
+                failures[0],
+                audio_playback_worker.PlaybackBackpressureError,
+            )
+        finally:
+            release_prepare.set()
+            release_write.set()
+            incoming.put(("stop", None))
+            dispatcher.join(1.0)
+            playback.stop(1.0)
 
     def test_stop_is_bounded_when_write_does_not_return(self):
         write_started = threading.Event()

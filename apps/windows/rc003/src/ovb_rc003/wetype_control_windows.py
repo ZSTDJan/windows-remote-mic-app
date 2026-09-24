@@ -18,11 +18,11 @@ import uuid
 from dataclasses import dataclass
 from typing import Callable, Optional, Sequence, TypeVar, cast
 
-from . import diagnostic_trace, voice_playback_session_windows, win32_input
+from . import chromecast_host_activity, diagnostic_trace, voice_playback_session_windows, win32_input
 
 _STA_RESULT_TIMEOUT_SECONDS = 0.5
 _SESSION_REBIND_SETTLE_SECONDS = 0.05
-_WETYPE_CONFIRM_DELAY_SECONDS = 0.7
+_WETYPE_CONFIRM_WINDOW_SECONDS = 0.7
 _WETYPE_RETRY_SETTLE_SECONDS = (2.0, 3.0, 5.0)
 
 _COINIT_APARTMENTTHREADED = 0x2
@@ -86,6 +86,8 @@ _PROFILE_MATCHERS = {
     "doubao": ("doubao", "豆包输入法"),
 }
 _STA_OPERATION_LOCK = threading.Lock()
+_STA_DISPATCH_LOCK = threading.Lock()
+_selection_operation = None
 _STA_REQUEST_LOCAL = threading.local()
 _diagnostic_trace: Optional[diagnostic_trace.DiagnosticTrace] = None
 
@@ -95,13 +97,15 @@ def set_diagnostic_trace(trace: Optional[diagnostic_trace.DiagnosticTrace]) -> N
     _diagnostic_trace = trace
 
 
-def _trace(event: str, **fields: object) -> None:
+def _trace(event: str, *, capture_foreground: bool = False, **fields: object) -> None:
     trace = _diagnostic_trace
-    if trace is None:
+    if trace is None or not trace.enabled:
         return
     try:
         payload = dict(trace.current_context())
         payload.update(fields)
+        if capture_foreground:
+            payload.update(diagnostic_trace.foreground_context())
         trace.emit(event, **payload)
     except BaseException:
         pass
@@ -395,7 +399,10 @@ def _discover_input_profile(
 
 def _sta_cancelled() -> bool:
     event = getattr(_STA_REQUEST_LOCAL, "cancel_event", None)
-    return bool(event is not None and event.is_set())
+    selection = getattr(_STA_REQUEST_LOCAL, "selection_operation", None)
+    return bool(event is not None and event.is_set()) or bool(
+        selection is not None and time.monotonic() >= selection.deadline
+    )
 
 
 def _activate_input_profile(
@@ -404,6 +411,8 @@ def _activate_input_profile(
     *,
     _sleep: Callable[[float], None] = time.sleep,
 ) -> bool:
+    if provider_id == "doubao":
+        return _activate_doubao_for_voice_start(_sleep=_sleep)
     started_ms = time.monotonic_ns() // 1_000_000
     _trace(
         "input_profile_activation_started",
@@ -422,6 +431,8 @@ def _activate_input_profile(
                 **_profile_trace_fields("target", target),
             )
             if _same_profile(previous, target):
+                if _sta_cancelled():
+                    raise TimeoutError(f"{provider_name} input profile request was cancelled")
                 _trace(
                     "input_profile_activation_finished",
                     provider=str(provider_id),
@@ -435,7 +446,8 @@ def _activate_input_profile(
                 raise TimeoutError(f"{provider_name} input profile request was cancelled")
             manager.activate_profile(target)
             if _sta_cancelled():
-                manager.activate_profile(previous)
+                if getattr(_STA_REQUEST_LOCAL, "selection_operation", None) is None:
+                    manager.activate_profile(previous)
                 raise TimeoutError(f"{provider_name} input profile request was cancelled")
             current = manager.get_active_profile()
             confirmed = _same_profile(current, target)
@@ -449,7 +461,8 @@ def _activate_input_profile(
             )
             if not confirmed:
                 try:
-                    manager.activate_profile(previous)
+                    if getattr(_STA_REQUEST_LOCAL, "selection_operation", None) is None:
+                        manager.activate_profile(previous)
                 except OSError:
                     pass
                 raise OSError(
@@ -457,7 +470,8 @@ def _activate_input_profile(
                 )
             _sleep(_SESSION_REBIND_SETTLE_SECONDS)
             if _sta_cancelled():
-                manager.activate_profile(previous)
+                if getattr(_STA_REQUEST_LOCAL, "selection_operation", None) is None:
+                    manager.activate_profile(previous)
                 raise TimeoutError(f"{provider_name} input profile request was cancelled")
             _trace(
                 "input_profile_activation_finished",
@@ -489,9 +503,9 @@ def _activate_wetype_input_profile() -> bool:
 
 
 def _activate_doubao_input_profile() -> bool:
-    """Activate Doubao IME for the current Windows session."""
+    """Activate Doubao only for the current input target."""
 
-    return _activate_input_profile("doubao", "Doubao")
+    return _activate_doubao_for_voice_start()
 
 
 def _activate_wetype_for_voice_start(
@@ -503,7 +517,35 @@ def _activate_wetype_for_voice_start(
 def _activate_doubao_for_voice_start(
     *, _sleep: Callable[[float], None] = time.sleep
 ) -> bool:
-    return _activate_input_profile("doubao", "Doubao", _sleep=_sleep)
+    from . import doubao_input_profile_windows as directed
+
+    started = time.monotonic()
+    _trace("input_profile_activation_started", provider="doubao",
+           provider_name="Doubao", route="active_context_proxy")
+    try:
+        expected = directed.current_target()
+        if _sta_cancelled():
+            raise TimeoutError("Doubao input profile request was cancelled")
+        with _InputProfileManager() as manager:
+            target = _discover_input_profile(manager, "doubao")
+            switched, input_target = directed.activate_for_target(
+                target, cancelled=_sta_cancelled, trace=_trace, expected=expected)
+        if _sta_cancelled():
+            raise TimeoutError("Doubao input profile request was cancelled")
+        operation = getattr(_STA_REQUEST_LOCAL, "operation", None)
+        if operation is not None:
+            operation.input_target = input_target
+        _trace("input_profile_activation_finished", provider="doubao",
+               route="active_context_proxy", success=True, switched=switched,
+               confirmed=True, elapsed_ms=int((time.monotonic() - started) * 1000))
+        return switched
+    except BaseException as exc:
+        _trace("input_profile_activation_finished", provider="doubao",
+               route="active_context_proxy", success=False, confirmed=False,
+               error_type=type(exc).__name__, error=str(exc),
+               cancelled=isinstance(exc, TimeoutError),
+               elapsed_ms=int((time.monotonic() - started) * 1000))
+        raise
 
 
 def _cycle_wetype_input_profile(
@@ -548,41 +590,139 @@ def _cycle_wetype_input_profile(
 _T = TypeVar("_T")
 
 
-def _run_on_sta_thread(
+class _StaOperation:
+    """Own a TSF request after a caller deadline until its worker settles."""
+
+    def __init__(
+        self,
+        cancel_event: Optional[threading.Event] = None,
+    ) -> None:
+        self.cancel_event = cancel_event or threading.Event()
+        self.settled = threading.Event()
+        self._succeeded = False
+        self._value: object = None
+        self.selection_provider = ""
+        self.deadline: Optional[float] = None
+        self.input_target = None
+
+    def cancel(self) -> None:
+        self.cancel_event.set()
+
+    def set_result(self, succeeded: bool, value: object) -> None:
+        self._succeeded = bool(succeeded)
+        self._value = value
+
+    def mark_settled(self) -> None:
+        self.settled.set()
+
+    def result(self, timeout_seconds: float = _STA_RESULT_TIMEOUT_SECONDS) -> object:
+        if self.deadline is not None:
+            timeout_seconds = min(timeout_seconds, max(0.0, self.deadline - time.monotonic()))
+        if not self.settled.wait(max(0.0, float(timeout_seconds))):
+            self.cancel()
+            raise TimeoutError(
+                "WeType input profile activation timed out after "
+                f"{timeout_seconds:.3f}s"
+            )
+        if self._succeeded:
+            return self._value
+        if isinstance(self._value, BaseException):
+            raise self._value
+        raise OSError("WeType STA operation failed without an exception")
+
+
+class InputProfilePreparationError(OSError):
+    """A selection-owned preparation must not fall through to a shortcut."""
+
+
+class _SelectionWait(_StaOperation):
+    """Observe UI preparation without taking ownership of its cancellation."""
+
+    def __init__(self, source: _StaOperation, cancel_event=None) -> None:
+        super().__init__(cancel_event)
+        self.source = source
+        self.settled = source.settled
+
+    def result(self, timeout_seconds: float) -> object:
+        assert self.source.deadline is not None
+        deadline = min(time.monotonic() + timeout_seconds, self.source.deadline)
+        while not self.source.settled.is_set():
+            if self.cancel_event.is_set() or time.monotonic() >= deadline:
+                raise InputProfilePreparationError("input profile preparation wait cancelled or timed out")
+            self.source.settled.wait(min(0.01, max(0.0, deadline - time.monotonic())))
+        if self.cancel_event.is_set():
+            raise InputProfilePreparationError("input profile preparation wait cancelled")
+        try:
+            value = self.source.result(0)
+            self.input_target = self.source.input_target
+            return value
+        except Exception as exc:
+            raise InputProfilePreparationError("input profile selection did not complete") from exc
+
+
+def begin_input_profile_selection(provider: str, *, cancel_event=None) -> _StaOperation:
+    """Start only profile activation; never send keys or begin a voice session."""
+    callbacks = {"wetype": _activate_wetype_for_voice_start,
+                 "doubao_ime": _activate_doubao_for_voice_start}
+    if provider not in callbacks:
+        raise ValueError("provider does not use input profile preparation")
+    return _start_sta_operation(callbacks[provider], cancel_event=cancel_event,
+                                selection_provider=provider)
+
+
+def _start_sta_operation(
     callback: Callable[[], _T],
-    timeout_seconds: float = _STA_RESULT_TIMEOUT_SECONDS,
-) -> _T:
-    """Run one TSF operation on a fresh STA thread with a bounded wait."""
-
-    if not _STA_OPERATION_LOCK.acquire(blocking=False):
-        _trace("input_profile_sta", phase="rejected", reason="operation_in_progress")
-        raise OSError("an input profile STA operation is still in progress")
-
-    result_queue: queue.Queue[tuple[bool, object]] = queue.Queue(maxsize=1)
-
-    cancel_event = threading.Event()
+    *,
+    cancel_event: Optional[threading.Event] = None,
+    selection_provider: str = "",
+) -> _StaOperation:
+    global _selection_operation
+    with _STA_DISPATCH_LOCK:
+        pending = _selection_operation
+        if pending is not None and not pending.settled.is_set():
+            expected = (_activate_wetype_for_voice_start if pending.selection_provider == "wetype"
+                        else _activate_doubao_for_voice_start)
+            if not selection_provider and callback is expected:
+                _trace("input_profile_sta", phase="join_selection", provider=pending.selection_provider)
+                return _SelectionWait(pending, cancel_event)
+            raise InputProfilePreparationError("another input profile selection is still in progress")
+        if not _STA_OPERATION_LOCK.acquire(blocking=False):
+            _trace("input_profile_sta", phase="rejected", reason="operation_in_progress")
+            raise OSError("an input profile STA operation is still in progress")
+        operation = _StaOperation(cancel_event)
+        if selection_provider:
+            operation.selection_provider = selection_provider
+            operation.deadline = time.monotonic() + _STA_RESULT_TIMEOUT_SECONDS
+            _selection_operation = operation
 
     def run() -> None:
-        _trace("input_profile_sta", phase="started")
+        _trace("input_profile_sta", phase="started", selection_provider=selection_provider)
         try:
-            _STA_REQUEST_LOCAL.cancel_event = cancel_event
-            if cancel_event.is_set():
+            _STA_REQUEST_LOCAL.cancel_event = operation.cancel_event
+            _STA_REQUEST_LOCAL.selection_operation = operation if selection_provider else None
+            _STA_REQUEST_LOCAL.operation = operation
+            if operation.cancel_event.is_set():
                 raise TimeoutError("STA request was cancelled before it started")
             value = callback()
-            result_queue.put((True, value))
+            if selection_provider and _sta_cancelled():
+                raise TimeoutError("input profile selection was cancelled or timed out")
+            operation.set_result(True, value)
         except BaseException as exc:
             _trace(
                 "input_profile_sta",
                 phase="callback_failed",
                 error_type=type(exc).__name__,
             )
-            result_queue.put((False, exc))
+            operation.set_result(False, exc)
         finally:
             try:
                 del _STA_REQUEST_LOCAL.cancel_event
+                del _STA_REQUEST_LOCAL.selection_operation
+                del _STA_REQUEST_LOCAL.operation
             except AttributeError:
                 pass
             _STA_OPERATION_LOCK.release()
+            operation.mark_settled()
             _trace("input_profile_sta", phase="finished")
 
     thread = threading.Thread(
@@ -594,31 +734,34 @@ def _run_on_sta_thread(
         thread.start()
     except RuntimeError as exc:
         _STA_OPERATION_LOCK.release()
+        operation.set_result(False, exc)
+        operation.mark_settled()
         _trace(
             "input_profile_sta",
             phase="thread_start_failed",
             error_type=type(exc).__name__,
         )
         raise OSError(f"WeType STA thread could not start: {exc}") from exc
+    return operation
+
+
+def _run_on_sta_thread(
+    callback: Callable[[], _T],
+    timeout_seconds: float = _STA_RESULT_TIMEOUT_SECONDS,
+) -> _T:
+    """Run one TSF operation on a fresh STA thread with a bounded wait."""
     try:
-        succeeded, value = result_queue.get(timeout=timeout_seconds)
-    except queue.Empty as exc:
-        cancel_event.set()
+        value = _start_sta_operation(callback).result(timeout_seconds)
+    except TimeoutError:
         _trace(
             "input_profile_sta",
             phase="timeout",
             timeout_ms=int(timeout_seconds * 1000),
             cancelled=True,
         )
-        raise TimeoutError(
-            f"WeType input profile activation timed out after {timeout_seconds:.3f}s"
-        ) from exc
-    if succeeded:
-        _trace("input_profile_sta", phase="result", success=True)
-        return cast(_T, value)
-    if isinstance(value, BaseException):
-        raise value
-    raise OSError("WeType STA operation failed without an exception")
+        raise
+    _trace("input_profile_sta", phase="result", success=True)
+    return cast(_T, value)
 
 
 def _wetype_mic_start_timestamp() -> Optional[int]:
@@ -676,6 +819,7 @@ class WeTypeVoiceControl:
         ),
         on_completion: Optional[Callable[[int, bool], None]] = None,
         on_confirmation: Optional[Callable[[int, bool], None]] = None,
+        on_started: Optional[Callable[[int], None]] = None,
         mic_start_reader: Optional[Callable[[], Optional[int]]] = (
             _wetype_mic_start_timestamp
         ),
@@ -695,6 +839,7 @@ class WeTypeVoiceControl:
         self._release_keys = release_keys
         self._on_completion = on_completion
         self._on_confirmation = on_confirmation
+        self._on_started = on_started
         self._mic_start_reader = mic_start_reader
         self._revive_profile = revive_profile
         self._sleep = sleep
@@ -770,6 +915,10 @@ class WeTypeVoiceControl:
         with self._state_lock:
             return self._active_generation == generation
 
+    def _session_is_starting(self, generation: int) -> bool:
+        with self._state_lock:
+            return self._starting_generation == generation
+
     def _finish_confirmation(self, generation: int, success: bool) -> None:
         callback = None
         with self._state_lock:
@@ -792,6 +941,41 @@ class WeTypeVoiceControl:
             return False
         return baseline is None or current > baseline
 
+    def _check_microphone_start(self, generation, baseline, *, fast):
+        """Bounded first-start probes; no state/I/O lock is held while waiting.
+
+        The final check keeps the old retry boundary. Recovery retries do not
+        replenish the fast-query budget, and a stopped generation cannot report.
+        """
+        started = time.monotonic()
+        offsets = ([index * chromecast_host_activity.STARTUP_POLL_SECONDS
+                    for index in range(1, chromecast_host_activity.STARTUP_MAX_FAST_POLLS + 1)]
+                   if fast else [])
+        offsets.append(_WETYPE_CONFIRM_WINDOW_SECONDS)
+        current = None
+        last_probe_at = started
+        for offset in offsets:
+            if not self._session_is_active(generation):
+                return None, current
+            final = offset == _WETYPE_CONFIRM_WINDOW_SECONDS
+            if not final and time.monotonic() - started >= chromecast_host_activity.STARTUP_FAST_WINDOW_SECONDS:
+                continue
+            next_probe = started + offset
+            if not final:
+                next_probe = max(next_probe, last_probe_at + chromecast_host_activity.STARTUP_POLL_SECONDS)
+            self._sleep(max(0.0, next_probe - time.monotonic()))
+            if not self._session_is_active(generation):
+                return None, current
+            if not final and time.monotonic() - started > chromecast_host_activity.STARTUP_FAST_WINDOW_SECONDS:
+                continue
+            last_probe_at = time.monotonic()
+            current = self._mic_start_reader()
+            if not self._session_is_active(generation):
+                return None, current
+            if self._mic_reacted(baseline, current):
+                return True, current
+        return False, current
+
     def _schedule_confirmation(
         self,
         generation: int,
@@ -812,6 +996,8 @@ class WeTypeVoiceControl:
                 for retry_index, retry_delay in enumerate(
                     (None, *_WETYPE_RETRY_SETTLE_SECONDS)
                 ):
+                    if not self._session_is_active(generation):
+                        return
                     if retry_delay is not None:
                         if self._revive_profile is None:
                             break
@@ -864,8 +1050,9 @@ class WeTypeVoiceControl:
                             keys=list(keys),
                         )
 
-                    self._sleep(_WETYPE_CONFIRM_DELAY_SECONDS)
-                    if not self._session_is_active(generation):
+                    reacted, current = self._check_microphone_start(
+                        generation, confirmation_baseline, fast=retry_index == 0)
+                    if reacted is None:
                         _trace(
                             "voice_host_confirmation_check",
                             provider=self._provider_name.casefold(),
@@ -874,8 +1061,6 @@ class WeTypeVoiceControl:
                             result="cancelled",
                         )
                         return
-                    current = self._mic_start_reader()
-                    reacted = self._mic_reacted(confirmation_baseline, current)
                     _trace(
                         "voice_host_confirmation_check",
                         provider=self._provider_name.casefold(),
@@ -907,6 +1092,12 @@ class WeTypeVoiceControl:
                     self._provider_name,
                 )
                 self._finish_confirmation(generation, False)
+            finally:
+                # Cancellation/exception must not leave a phantom confirmation
+                # owner; an older worker must never clear a newer generation.
+                with self._state_lock:
+                    if self._confirmation_generation == generation:
+                        self._confirmation_generation = None
 
         try:
             thread = self._thread_factory(
@@ -968,7 +1159,12 @@ class WeTypeVoiceControl:
             )
             self._logger.exception("WeType own playback mute recovery failed")
 
-    def start(self, keys: Sequence[str]) -> bool:
+    def start(
+        self,
+        keys: Sequence[str],
+        *,
+        cancelled: Optional[Callable[[], bool]] = None,
+    ) -> bool:
         session_keys = tuple(str(key) for key in keys)
         if not session_keys:
             _trace(
@@ -995,6 +1191,9 @@ class WeTypeVoiceControl:
                 "%s voice shortcut start ignored: cleanup is pending",
                 self._provider_name,
             )
+            return False
+        if cancelled is not None and cancelled():
+            self._cancel_starting(generation)
             return False
         _trace(
             "voice_hotkey_control",
@@ -1050,7 +1249,7 @@ class WeTypeVoiceControl:
                 continued=bool(self._continue_after_activation_error),
                 error_type=type(exc).__name__,
             )
-            if not self._continue_after_activation_error:
+            if not self._continue_after_activation_error or isinstance(exc, InputProfilePreparationError):
                 self._logger.exception(
                     "%s input profile activation failed on STA thread",
                     self._provider_name,
@@ -1076,8 +1275,14 @@ class WeTypeVoiceControl:
                 self._provider_name,
                 switched,
             )
+        if cancelled is not None and cancelled():
+            self._cancel_starting(generation)
+            return False
         try:
             with self._io_lock:
+                if cancelled is not None and cancelled():
+                    self._cancel_starting(generation)
+                    return False
                 self._press_keys(session_keys)
         except win32_input.InputCleanupIncompleteError as exc:
             self._mark_active(generation, session_keys)
@@ -1090,7 +1295,7 @@ class WeTypeVoiceControl:
                 cleanup_pending=True,
                 error_type="InputCleanupIncompleteError",
                 system_error=getattr(exc, "winerror", None),
-                **diagnostic_trace.foreground_context(),
+                capture_foreground=True,
             )
             self._logger.exception(
                 "%s voice shortcut failed and key-up remains pending",
@@ -1108,7 +1313,7 @@ class WeTypeVoiceControl:
                 cleanup_pending=False,
                 error_type=type(exc).__name__,
                 system_error=getattr(exc, "winerror", None),
-                **diagnostic_trace.foreground_context(),
+                capture_foreground=True,
             )
             self._logger.exception(
                 "%s voice shortcut could not be delivered", self._provider_name
@@ -1132,6 +1337,13 @@ class WeTypeVoiceControl:
             keys=list(session_keys),
         )
         self._logger.info("%s configured voice shortcut pressed", self._provider_name)
+        if self._on_started is not None:
+            try:
+                self._on_started(generation)
+            except Exception:
+                # Keep the pressed-key owner for ordinary cleanup/retry.
+                self._logger.exception("%s voice start registration failed", self._provider_name)
+                return False
         self._schedule_confirmation(generation, session_keys, baseline, playback_guard)
         return True
 
@@ -1178,7 +1390,7 @@ class WeTypeVoiceControl:
                 cleanup_pending=True,
                 error_type=type(exc).__name__,
                 system_error=getattr(exc, "winerror", None),
-                **diagnostic_trace.foreground_context(),
+                capture_foreground=True,
             )
             self._logger.exception(
                 "%s voice shortcut release failed; cleanup remains pending",
@@ -1195,6 +1407,30 @@ class WeTypeVoiceControl:
         )
         self._logger.info("%s configured voice shortcut released", self._provider_name)
         return True
+
+
+@dataclass(frozen=True)
+class PreparedDoubaoVoiceStart:
+    generation: int
+    keys: tuple[str, ...]
+    ready: bool = True
+    sta_operation: Optional[_StaOperation] = None
+    input_target: object = None
+
+    @property
+    def settled(self) -> bool:
+        operation = self.sta_operation
+        return operation is None or operation.settled.is_set()
+
+    def cancel(self) -> None:
+        if self.sta_operation is not None:
+            self.sta_operation.cancel()
+
+    def wait_settled(self, timeout: Optional[float] = None) -> bool:
+        operation = self.sta_operation
+        if operation is None:
+            return True
+        return operation.settled.wait(timeout)
 
 
 class DoubaoVoiceControl(WeTypeVoiceControl):
@@ -1223,3 +1459,252 @@ class DoubaoVoiceControl(WeTypeVoiceControl):
             provider_name="Doubao",
             continue_after_activation_error=False,
         )
+        self._doubao_start_sta = (
+            _start_sta_operation if run_sta is _run_on_sta_thread else None
+        )
+        self._pending_prepared: Optional[PreparedDoubaoVoiceStart] = None
+
+    def _reconcile_pending_prepared_locked(self) -> None:
+        prepared = self._pending_prepared
+        if prepared is None or not prepared.settled:
+            return
+        if self._starting_generation == int(prepared.generation):
+            self._starting_generation = None
+        self._pending_prepared = None
+
+    @property
+    def cleanup_pending(self) -> bool:
+        with self._state_lock:
+            self._reconcile_pending_prepared_locked()
+            return (
+                self._starting_generation is not None
+                or self._active_generation is not None
+            )
+
+    def _begin_session(self) -> Optional[int]:
+        with self._state_lock:
+            self._reconcile_pending_prepared_locked()
+            if (
+                self._starting_generation is not None
+                or self._active_generation is not None
+            ):
+                return None
+            self._generation += 1
+            self._starting_generation = self._generation
+            return self._generation
+
+    def _retain_pending_prepared(
+        self, prepared: PreparedDoubaoVoiceStart
+    ) -> None:
+        with self._state_lock:
+            if self._starting_generation == int(prepared.generation):
+                self._pending_prepared = prepared
+
+    def prepare(
+        self,
+        keys: Sequence[str],
+        *,
+        cancelled: Optional[Callable[[], bool]] = None,
+        cancel_event: Optional[threading.Event] = None,
+    ) -> Optional[PreparedDoubaoVoiceStart]:
+        """Activate the IME profile without dispatching the shortcut yet."""
+
+        session_keys = tuple(str(key) for key in keys)
+        if not session_keys:
+            return None
+        generation = self._begin_session()
+        if generation is None:
+            self._logger.warning(
+                "Doubao voice shortcut prepare ignored: cleanup is pending"
+            )
+            return None
+        if cancelled is not None and cancelled():
+            self._cancel_starting(generation)
+            return None
+        _trace(
+            "voice_hotkey_control",
+            provider="doubao",
+            phase="prepare_requested",
+            generation=int(generation),
+            keys=list(session_keys),
+        )
+        operation: Optional[_StaOperation] = None
+        try:
+            if self._doubao_start_sta is not None:
+                operation = self._doubao_start_sta(
+                    self._activate_profile,
+                    cancel_event=cancel_event,
+                )
+                switched = bool(operation.result(_STA_RESULT_TIMEOUT_SECONDS))
+            else:
+                switched = self._run_sta(self._activate_profile)
+        except TimeoutError as exc:
+            if operation is not None:
+                operation.cancel()
+                _trace(
+                    "voice_hotkey_control",
+                    provider="doubao",
+                    phase="profile_activation",
+                    generation=int(generation),
+                    success=False,
+                    cleanup_pending=True,
+                    error_type=type(exc).__name__,
+                )
+                prepared = PreparedDoubaoVoiceStart(
+                    generation,
+                    session_keys,
+                    ready=False,
+                    sta_operation=operation,
+                )
+                self._retain_pending_prepared(prepared)
+                return prepared
+            self._cancel_starting(generation)
+            return None
+        except Exception as exc:
+            self._cancel_starting(generation)
+            _trace(
+                "voice_hotkey_control",
+                provider="doubao",
+                phase="profile_activation",
+                generation=int(generation),
+                success=False,
+                error_type=type(exc).__name__,
+            )
+            self._logger.exception(
+                "Doubao input profile activation failed on STA thread"
+            )
+            return None
+        _trace(
+            "voice_hotkey_control",
+            provider="doubao",
+            phase="profile_activation",
+            generation=int(generation),
+            success=True,
+            switched=bool(switched),
+        )
+        if cancelled is not None and cancelled():
+            self._cancel_starting(generation)
+            return None
+        return PreparedDoubaoVoiceStart(
+            generation,
+            session_keys,
+            sta_operation=operation,
+            input_target=getattr(operation, "input_target", None),
+        )
+
+    def dispatch_prepared(
+        self,
+        prepared: PreparedDoubaoVoiceStart,
+        *,
+        cancelled: Optional[Callable[[], bool]] = None,
+    ) -> bool:
+        """Dispatch exactly one previously prepared shortcut."""
+
+        generation = int(prepared.generation)
+        session_keys = tuple(prepared.keys)
+        if not prepared.ready or not prepared.settled:
+            return False
+        if not self._session_is_starting(generation):
+            return False
+        if cancelled is not None and cancelled():
+            self._cancel_starting(generation)
+            return False
+        try:
+            with self._io_lock:
+                if not self._session_is_starting(generation):
+                    return False
+                if cancelled is not None and cancelled():
+                    self._cancel_starting(generation)
+                    return False
+                if prepared.input_target is not None:
+                    from . import doubao_input_profile_windows as directed
+                    if not directed.target_is_current(prepared.input_target):
+                        _trace("voice_hotkey_control", provider="doubao",
+                               phase="dispatch_blocked", reason="input_target_changed",
+                               generation=generation, success=False)
+                        self._cancel_starting(generation)
+                        return False
+                self._press_keys(session_keys)
+        except win32_input.InputCleanupIncompleteError as exc:
+            self._mark_active(generation, session_keys)
+            _trace(
+                "voice_hotkey_control",
+                provider="doubao",
+                phase="key_down",
+                generation=int(generation),
+                success=False,
+                cleanup_pending=True,
+                error_type="InputCleanupIncompleteError",
+                system_error=getattr(exc, "winerror", None),
+                capture_foreground=True,
+            )
+            self._logger.exception(
+                "Doubao voice shortcut failed and key-up remains pending"
+            )
+            return False
+        except (win32_input.Win32InputUnavailableError, OSError) as exc:
+            self._cancel_starting(generation)
+            _trace(
+                "voice_hotkey_control",
+                provider="doubao",
+                phase="key_down",
+                generation=int(generation),
+                success=False,
+                cleanup_pending=False,
+                error_type=type(exc).__name__,
+                system_error=getattr(exc, "winerror", None),
+                capture_foreground=True,
+            )
+            self._logger.exception("Doubao voice shortcut could not be delivered")
+            return False
+        if not self._mark_active(generation, session_keys):
+            try:
+                self._release_keys(session_keys)
+            except OSError:
+                self._logger.exception(
+                    "Doubao superseded shortcut could not be released"
+                )
+            return False
+        _trace(
+            "voice_hotkey_control",
+            provider="doubao",
+            phase="key_down",
+            generation=int(generation),
+            success=True,
+            keys=list(session_keys),
+        )
+        self._logger.info("Doubao configured voice shortcut pressed")
+        return True
+
+    def cancel_prepared(self, prepared: PreparedDoubaoVoiceStart) -> None:
+        prepared.cancel()
+        if prepared.settled:
+            self._cancel_starting(int(prepared.generation))
+            with self._state_lock:
+                if self._pending_prepared is prepared:
+                    self._pending_prepared = None
+            return
+        self._retain_pending_prepared(prepared)
+
+    def stop(self) -> bool:
+        with self._state_lock:
+            self._reconcile_pending_prepared_locked()
+            pending = self._pending_prepared
+        if pending is not None:
+            pending.cancel()
+            return False
+        return super().stop()
+
+    def start(
+        self,
+        keys: Sequence[str],
+        *,
+        cancelled: Optional[Callable[[], bool]] = None,
+    ) -> bool:
+        prepared = self.prepare(keys, cancelled=cancelled)
+        if prepared is None:
+            return False
+        if not prepared.ready:
+            self.cancel_prepared(prepared)
+            return False
+        return self.dispatch_prepared(prepared, cancelled=cancelled)

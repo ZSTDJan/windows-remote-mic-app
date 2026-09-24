@@ -25,11 +25,13 @@ ToolTip {
     rightPadding: 7
     topPadding: 4
     bottomPadding: 4
+    implicitWidth: Math.min(tipMetrics.advanceWidth, maximumTextWidth)
+        + leftPadding + rightPadding
 
     TextMetrics {
         id: tipMetrics
         font.family: root.tokens.fontFamily
-        font.pixelSize: root.tokens.fontSizeTiny
+        font.pixelSize: root.tokens.fontSizeSmall
         text: root.text
     }
 
@@ -38,7 +40,7 @@ ToolTip {
         width: Math.min(tipMetrics.advanceWidth, root.maximumTextWidth)
         color: root.tokens.textSecondary
         font.family: root.tokens.fontFamily
-        font.pixelSize: root.tokens.fontSizeTiny
+        font.pixelSize: root.tokens.fontSizeSmall
         font.weight: Font.Normal
         wrapMode: Text.Wrap
         lineHeight: 1.15

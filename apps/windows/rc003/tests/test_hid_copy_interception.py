@@ -20,6 +20,7 @@ emit = payload => records.push(payload);
 installHook();
 const NEUTRAL = "010000000000000000";
 const RIGHT = "0100004f0000000000";
+const MIC = "0100003e0000000000";
 function ensure(condition, detail) { if (!condition) throw Error(detail); }
 function invoke(raw, options = {}) {
   const metadata = Memory.alloc(8);

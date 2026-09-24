@@ -74,7 +74,8 @@ class BridgeInstanceStatusTests(unittest.TestCase):
             )
 
     def test_real_open_mutex_declares_pointer_safe_win32_prototype(self):
-        source = inspect.getsource(single_instance._real_open_mutex)
+        from tests.source_contract import source_text
+        source = source_text(single_instance._real_open_mutex)
         self.assertIn("OpenMutexW.argtypes", source)
         self.assertIn("OpenMutexW.restype = wintypes.HANDLE", source)
         self.assertIn("use_last_error=True", source)

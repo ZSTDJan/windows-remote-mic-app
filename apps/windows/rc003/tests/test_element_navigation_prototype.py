@@ -1,5 +1,7 @@
 import ast
 import importlib.util
+import importlib.machinery
+import os
 import json
 import random
 import subprocess
@@ -20,7 +22,21 @@ SCRIPT_PATH = (
 TARGETING_CORE_PATH = SCRIPT_PATH.with_name("element_targeting_core.py")
 SUPPORT_PATH = SCRIPT_PATH.with_name("element_navigation_support.py")
 WINDOWS_HOST_PATH = SCRIPT_PATH.with_name("element_navigation_windows_host.py")
-SPEC = importlib.util.spec_from_file_location("element_navigation_prototype", SCRIPT_PATH)
+def runtime_navigation_path(source_path):
+    stage = os.environ.get("RC003_NATIVE_STAGE")
+    if not stage:
+        return source_path
+    directory = Path(stage) / "scripts"
+    matches = [directory / (source_path.stem + suffix)
+               for suffix in importlib.machinery.EXTENSION_SUFFIXES
+               if (directory / (source_path.stem + suffix)).is_file()]
+    if len(matches) != 1:
+        raise RuntimeError(f"missing native test target: {source_path.stem}")
+    return matches[0]
+
+
+SPEC = importlib.util.spec_from_file_location(
+    "element_navigation_prototype", runtime_navigation_path(SCRIPT_PATH))
 assert SPEC is not None and SPEC.loader is not None
 prototype = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = prototype
@@ -70,7 +86,7 @@ class SpatialNavigationTests(unittest.TestCase):
 
         self.assertEqual(
             Path(core.__file__).resolve(),
-            SCRIPT_PATH.with_name("spatial_navigation_core.py"),
+            runtime_navigation_path(SCRIPT_PATH.with_name("spatial_navigation_core.py")),
         )
         self.assertIs(prototype.Direction, core.Direction)
         self.assertIs(prototype.Rect, core.Rect)
@@ -105,7 +121,7 @@ class SpatialNavigationTests(unittest.TestCase):
     def test_legacy_entry_reexports_every_element_targeting_symbol(self):
         targeting = prototype._element_targeting_core
 
-        self.assertEqual(Path(targeting.__file__).resolve(), TARGETING_CORE_PATH)
+        self.assertEqual(Path(targeting.__file__).resolve(), runtime_navigation_path(TARGETING_CORE_PATH))
         self.assertTrue(
             set(targeting.__all__).isdisjoint(
                 prototype._spatial_navigation_core.__all__
@@ -145,7 +161,7 @@ class SpatialNavigationTests(unittest.TestCase):
             prototype._element_targeting_core.__all__
         )
 
-        self.assertEqual(Path(support.__file__).resolve(), SUPPORT_PATH)
+        self.assertEqual(Path(support.__file__).resolve(), runtime_navigation_path(SUPPORT_PATH))
         self.assertTrue(set(support.__all__).isdisjoint(existing_exports))
         for name in support.__all__:
             with self.subTest(name=name):
@@ -362,13 +378,13 @@ class SpatialNavigationTests(unittest.TestCase):
 import importlib.util
 import sys
 
-path = {str(SCRIPT_PATH)!r}
-spec = importlib.util.spec_from_file_location("isolated_element_navigation", path)
+path = {str(runtime_navigation_path(SCRIPT_PATH))!r}
+spec = importlib.util.spec_from_file_location("element_navigation_prototype", path)
 module = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = module
 spec.loader.exec_module(module)
 host = module._load_element_navigation_windows_host()
-assert host.__file__ == {str(WINDOWS_HOST_PATH)!r}
+assert host.__file__ == {str(runtime_navigation_path(WINDOWS_HOST_PATH))!r}
 assert "uiautomation" not in sys.modules
 assert not any(name == "PySide6" or name.startswith("PySide6.") for name in sys.modules)
 """
@@ -4512,7 +4528,7 @@ assert not any(name == "PySide6" or name.startswith("PySide6.") for name in sys.
         self.assertFalse(prototype.scan_event_is_current(4, 4, False))
         self.assertFalse(prototype.scan_event_is_current(0, 0, True))
 
-    def test_managed_companion_intercepts_scan_keys_and_hides_dev_hotkeys(self):
+    def test_embedded_remote_mode_skips_keyboard_hook_and_hides_hotkeys(self):
         source = WINDOWS_HOST_PATH.read_text(encoding="utf-8")
         self.assertIn("intercepting.set()", source)
         self.assertIn("intercepting.clear()", source)
@@ -4549,6 +4565,9 @@ assert not any(name == "PySide6" or name.startswith("PySide6.") for name in sys.
             "include_developer_hotkeys = not managed_companion or diagnostics_enabled",
             source,
         )
+        self.assertIn("embedded_remote_only = managed_companion and not run_event_loop", source)
+        self.assertIn("if not embedded_remote_only:\n        hook = KeyboardHook(", source)
+        self.assertIn("include_toggle_hotkey = not managed_companion", source)
         self.assertIn("def owner_process_is_alive(process_id: int)", source)
         self.assertIn("owner_timer.start(500)", source)
         self.assertIn("QTimer.singleShot(0, monitor_owner_process)", source)
@@ -4737,6 +4756,9 @@ assert not any(name == "PySide6" or name.startswith("PySide6.") for name in sys.
                 include_developer_actions=False,
             ),
             "toggle",
+        )
+        self.assertIsNone(
+            prototype.global_hotkey_action(prototype.VK_N, include_toggle=False)
         )
         self.assertIsNone(
             prototype.global_hotkey_action(
@@ -5362,7 +5384,8 @@ assert not any(name == "PySide6" or name.startswith("PySide6.") for name in sys.
                 encoding="utf-8",
             )
             support._QUICKER_ASSOCIATION_CACHE.clear()
-            with mock.patch("builtins.open", wraps=open) as patched_open:
+            # Count actual JSON reads; Cython can call CPython's open directly.
+            with mock.patch.object(support.json, "load", wraps=support.json.load) as patched_open:
                 first = prototype.load_quicker_overlay_associations(str(path))
                 second = prototype.load_quicker_overlay_associations(str(path))
             support._QUICKER_ASSOCIATION_CACHE.clear()

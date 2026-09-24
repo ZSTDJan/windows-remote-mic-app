@@ -8,15 +8,15 @@
 
 ![图示谷歌与小米遥控器实物对比](docs/images/remote-comparison.png)
 
-<sub>设备参考：小米遥控器约 65–99 元，Type-C 充电；录音仅支持按住型，单次限 60 秒内。图示谷歌遥控器约 15 元，支持按住型和开关型；后续版本的开关型可录制超过 60 秒，最长可设 10 分钟，实际时长也受语音软件限制。谷歌遥控器版本较多，图示款购自某多多平台「IN数码配件」，仅作型号参考，无利益关联；价格以购买时为准。</sub>
+<sub>设备参考：小米遥控器约 65–99 元，Type-C 充电；录音仅支持按住型，单次限 60 秒内。图示谷歌遥控器约 15 元，支持按住型和开关型；新版测试包的开关型可录制超过 60 秒，最长可设 10 分钟，实际时长也受语音软件限制。谷歌遥控器版本较多，图示款购自某多多平台「IN数码配件」，仅作型号参考，无利益关联；价格以购买时为准。</sub>
 
 ## 下载与版本
 
-**[下载 Windows 免安装版](https://github.com/ZSTDJan/windows-remote-mic-app/releases/download/v1.0.44/RemoteMicRC003-1.0.44-portable-unsigned.zip)** · [版本说明](https://github.com/ZSTDJan/windows-remote-mic-app/releases/tag/v1.0.44) · [校验文件](https://github.com/ZSTDJan/windows-remote-mic-app/releases/download/v1.0.44/SHA256SUMS.txt)
+**[下载正式版 1.0.44](https://github.com/ZSTDJan/windows-remote-mic-app/releases/download/v1.0.44/RemoteMicRC003-1.0.44-portable-unsigned.zip)** · [下载新版测试包 1.0.71-candidate.71](https://github.com/ZSTDJan/windows-remote-mic-app/releases/download/v1.0.71-candidate.71/RemoteMicRC003-1.0.71-candidate.71-portable-unsigned.zip) · [测试版版本说明](https://github.com/ZSTDJan/windows-remote-mic-app/releases/tag/v1.0.71-candidate.71) · [SHA256SUMS.txt](https://github.com/ZSTDJan/windows-remote-mic-app/releases/download/v1.0.71-candidate.71/SHA256SUMS.txt)
 
-当前公开下载的是 **1.0.44**，支持小米遥控器。谷歌遥控器已加入后续版本并在测试，**上面的公开下载包暂不支持谷歌遥控器**。页面截图来自后续版本，具体界面以安装的版本为准。
+当前正式版为 **1.0.44**；新版测试包为 **1.0.71-candidate.71**，支持小米蓝牙语音遥控器 2 Pro 和图示谷歌 Chromecast 遥控器。具体功能与界面以下载的版本为准。
 
-完整解压 ZIP 后运行 `RemoteMicRC003.exe`，不要只取出 EXE。程序未签名，Windows 可能弹出安全提示；请从本仓库下载。
+完整解压 ZIP 后运行其中的 `无线麦 win版 <版本号>.exe`，不要只取出 EXE。程序未签名，Windows 可能弹出安全提示；请从本仓库下载。
 
 ## 能做什么
 
@@ -39,7 +39,7 @@
 ### 再设置语音输入
 
 1. 在“语音”页安装音频组件。无线麦的输出端点选 `CABLE Input`，输入法的麦克风选 `CABLE Output`。
-2. 选择搜狗、微信或豆包输入法，核对无线麦“语音按键”与输入法对应模式的快捷键一致；自动读取失败时可手动录入。小米使用按住型；后续版本的谷歌还可选择开关型。
+2. 选择搜狗、微信或豆包输入法，核对无线麦“语音按键”与输入法对应模式的快捷键一致；自动读取失败时可手动录入。小米使用按住型；谷歌还可选择开关型。
 3. 先在记事本中用电脑键盘试这个快捷键，确认能打开语音输入。再把光标留在文字框里试遥控器：按住型是按住说话、松开结束；开关型是按一次开始、再按一次结束。
 
 ![输入法快捷键与虚拟麦克风配置教程](docs/screenshots/voice-configuration-example.jpg)

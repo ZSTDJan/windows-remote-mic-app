@@ -148,7 +148,7 @@ class PersistentLogPrivacyTests(unittest.TestCase):
                 return_value=fake_logger,
             ), mock.patch.object(
                 logging_setup,
-                "RotatingFileHandler",
+                "EvidenceFileHandler",
                 side_effect=handler_factory,
             ):
                 def configure_logger():

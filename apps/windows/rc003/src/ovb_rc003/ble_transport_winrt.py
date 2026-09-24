@@ -97,16 +97,20 @@ from typing import Any, Awaitable, Callable, List, Optional, Sequence
 from . import atvv_protocol as proto
 from . import atvv_session
 from . import identity
+from .battery_monitor_winrt import BATTERY_LEVEL_UUID, BATTERY_SERVICE_UUID, BatteryMonitor
 
 PcmCallback = Callable[[List[int]], None]
+SequencedPcmCallback = Callable[[List[int], int], None]
 ControlEventCallback = Callable[[object], None]
 ErrorCallback = Callable[[BaseException], None]
 DisconnectedCallback = Callable[[], None]
+BatteryLevelCallback = Callable[[int], None]
 
 _QUEUE_MAXSIZE = 64
 _CONTROL_QUEUE_MAXSIZE = 32
 _WORKER_POLL_SECONDS = 0.2
 _CANDIDATE_PROBE_TIMEOUT_SECONDS = 8.0
+_BATTERY_SETUP_TIMEOUT_SECONDS = 3.0
 _logger = logging.getLogger(__name__)
 
 
@@ -138,6 +142,7 @@ class WinRTModules:
     cccd_value: Any
     device_information: Any
     data_writer_factory: Callable[[], Any]
+    data_reader_factory: Callable[[Any], Any]
     bluetooth_cache_mode: Any
 
 
@@ -164,7 +169,7 @@ def _import_winrt() -> WinRTModules:
             GattCommunicationStatus,
         )
         from winrt.windows.devices.enumeration import DeviceInformation
-        from winrt.windows.storage.streams import DataWriter
+        from winrt.windows.storage.streams import DataReader, DataWriter
 
         # XRBM-024: not referenced by name anywhere below - discovered only
         # when a real WinRT call is awaited (DeviceInformation.find_all_
@@ -189,6 +194,7 @@ def _import_winrt() -> WinRTModules:
         cccd_value=GattClientCharacteristicConfigurationDescriptorValue,
         device_information=DeviceInformation,
         data_writer_factory=DataWriter,
+        data_reader_factory=DataReader.from_buffer,
         bluetooth_cache_mode=BluetoothCacheMode,
     )
 
@@ -495,11 +501,15 @@ class RC003BleSession:
         get_capabilities_command: bytes = proto.GET_CAPABILITIES_V10,
         winrt: Optional[WinRTModules] = None,
         loop: Optional[asyncio.AbstractEventLoop] = None,
+        on_pcm_frame_with_sequence: Optional[SequencedPcmCallback] = None,
+        on_battery_level: Optional[BatteryLevelCallback] = None,
     ) -> None:
         self._on_pcm_frame = on_pcm_frame
+        self._on_pcm_frame_with_sequence = on_pcm_frame_with_sequence
         self._on_control_event = on_control_event
         self._on_error = on_error
         self._on_disconnected = on_disconnected
+        self._on_battery_level = on_battery_level
         self._session = atvv_session.ATVVSession(gain_db=gain_db)
         self._get_capabilities_command = bytes(get_capabilities_command)
         self._winrt = winrt
@@ -511,6 +521,8 @@ class RC003BleSession:
         self._audio_token = None
         self._control_token = None
         self._connection_status_token = None
+        self._battery_monitor = None
+        self._device_id: Optional[str] = None
         # WinRT notification callbacks are not guaranteed to run on the
         # asyncio thread that owns connect()/close(); this loop reference
         # lets the thread-safe mic command helpers hop back onto it safely.
@@ -543,10 +555,18 @@ class RC003BleSession:
     def session(self) -> atvv_session.ATVVSession:
         return self._session
 
+    @property
+    def audio_arrival_watermark(self) -> int:
+        """Last notification sequence assigned before the caller's snapshot."""
+
+        with self._event_sequence_lock:
+            return self._next_event_sequence - 1
+
     async def connect(self, candidate: identity.RC003Candidate) -> None:
         winrt = self._winrt or _import_winrt()
         self._winrt = winrt
 
+        self._device_id = str(candidate.handle.id)
         self._generation += 1
         my_generation = self._generation
 
@@ -603,6 +623,39 @@ class RC003BleSession:
 
         self._start_worker(my_generation)
         await self._write_tx(self._get_capabilities_command)
+
+    def start_battery_monitor(self) -> None:
+        """Start telemetry on a separate owner so GATT cannot hold teardown."""
+        if self._device is None or self._closing or self._battery_monitor is not None:
+            return
+        generation = self._generation
+        # Only the device ID crosses into the worker, never the live ATVV
+        # device. Injected modules are test factories, not device resources.
+        modules = self._winrt
+        monitor = BatteryMonitor(
+            self._device_id,
+            self._loop,
+            lambda level: self._deliver_battery_level(level, generation),
+            lambda: modules or _import_winrt(),
+            timeout=_BATTERY_SETUP_TIMEOUT_SECONDS,
+        )
+        if monitor.start():
+            self._battery_monitor = monitor
+
+    def _deliver_battery_level(self, level: int, generation: int) -> None:
+        if (
+            self._on_battery_level is None
+            or self._closing
+            or generation != self._generation
+        ):
+            return
+        try:
+            self._on_battery_level(level)
+        except Exception as exc:  # never feed optional UI failures into reconnect
+            _logger.warning(
+                "RC003 battery callback failed: error_type=%s",
+                type(exc).__name__,
+            )
 
     @staticmethod
     async def _require_characteristic(service, characteristic_uuid: str, winrt: WinRTModules):
@@ -867,7 +920,7 @@ class RC003BleSession:
                         self._drain_audio_before_stop(generation, sequence)
                     self._process_control(payload)
                 elif kind == "audio":
-                    self._process_audio(payload)
+                    self._process_audio(payload, sequence)
             except Exception as exc:  # noqa: BLE001 - reconnect on any worker failure
                 # One unexpected decoder/application callback failure must
                 # not make the worker disappear while the BLE connection
@@ -904,7 +957,7 @@ class RC003BleSession:
             if sequence >= stop_sequence:
                 self._deferred_audio_event = item
                 break
-            self._process_audio(payload)
+            self._process_audio(payload, sequence)
             drained += 1
         if drained:
             _logger.info(
@@ -932,7 +985,18 @@ class RC003BleSession:
         if self._on_control_event is not None:
             self._on_control_event(event)
 
-    def _process_audio(self, payload: bytes) -> None:
+    def _process_audio(self, payload: bytes, sequence: Optional[int] = None) -> None:
+        if self._on_pcm_frame_with_sequence is not None and sequence is not None:
+            for samples, origin in self._session.handle_audio_with_origin(
+                payload,
+                origin=int(sequence),
+            ):
+                if samples:
+                    self._on_pcm_frame_with_sequence(
+                        samples,
+                        int(origin if origin is not None else sequence),
+                    )
+            return
         samples = self._session.handle_audio(payload)
         if samples:
             self._on_pcm_frame(samples)
@@ -961,6 +1025,9 @@ class RC003BleSession:
         # this coroutine runs on) so any send_mic_open_threadsafe() callback
         # already queued via call_soon_threadsafe sees it the moment it runs.
         self._closing = True
+        if self._battery_monitor is not None:
+            self._battery_monitor.stop()
+            self._battery_monitor = None
         # Then, before anything else touches GATT resources: cancel/await
         # any mic command write that is already in flight (XRBM-018 RETRY 1
         # P1 #3) - closing the gate above only stops *new* writes from being

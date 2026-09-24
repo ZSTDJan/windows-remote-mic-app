@@ -39,6 +39,7 @@ from ovb_rc003 import atvv_protocol as proto
 from ovb_rc003 import atvv_session
 from ovb_rc003 import identity
 from ovb_rc003.ble_transport_winrt import (
+    BATTERY_SERVICE_UUID,
     NoReachableCandidateError,
     RC003BleSession,
     _candidate_has_voice_service,
@@ -427,6 +428,261 @@ class ConnectTests(unittest.TestCase):
             _run(session.close())
 
 
+class BatteryMonitorTests(unittest.TestCase):
+    async def _wait(self, predicate):
+        deadline = asyncio.get_running_loop().time() + 2.0
+        while not predicate():
+            if asyncio.get_running_loop().time() >= deadline:
+                self.fail("battery worker did not reach expected state")
+            await asyncio.sleep(0.005)
+
+    def _session_and_candidate(self, env, levels):
+        battery_env = FakeWinRTEnvironment(device_id=env.device_id)
+        modules = env.build_winrt_modules()
+        owner_thread = threading.get_ident()
+        original_open = modules.bluetooth_le_device.from_id_async
+
+        async def open_device(device_id):
+            if threading.get_ident() == owner_thread:
+                return await original_open(device_id)
+            self.assertEqual(device_id, battery_env.device_id)
+            return battery_env.device
+
+        modules.bluetooth_le_device.from_id_async = staticmethod(open_device)
+        session = RC003BleSession(
+            on_pcm_frame=lambda _samples: None,
+            on_battery_level=levels.append,
+            winrt=modules,
+            loop=asyncio.get_running_loop(),
+        )
+        candidate = identity.RC003Candidate(
+            name=env.name, hardware_match=False, handle=env.discovered_info,
+        )
+        return session, candidate, battery_env
+
+    def test_reads_notifies_and_closes_only_independently_owned_resources(self):
+        env = FakeWinRTEnvironment()
+        levels = []
+
+        async def scenario():
+            session, candidate, battery = self._session_and_candidate(env, levels)
+            await session.connect(candidate)
+            self.assertEqual(levels, [])
+            session.start_battery_monitor()
+            monitor = session._battery_monitor
+            try:
+                await self._wait(lambda: levels == [59])
+                self.assertEqual(battery.battery_characteristic.read_cache_modes, [1])
+                self.assertIn(1, battery.battery_characteristic.cccd_history)
+                battery.battery_characteristic.fire(bytes((42,)))
+                battery.battery_characteristic.fire(bytes((101,)))
+                battery.battery_characteristic.fire(b"")
+                battery.battery_characteristic.fire(bytes((1, 2)))
+                await self._wait(lambda: levels == [59, 42])
+                # Main loop callback already queued when stop revokes delivery.
+                battery.battery_characteristic.fire(bytes((41,)))
+                monitor.stop()
+                await self._wait(lambda: not monitor._thread.is_alive())
+                self.assertEqual(levels, [59, 42])
+                self.assertTrue(battery.device.closed)
+                self.assertTrue(battery.battery_service.closed)
+                self.assertFalse(env.device.closed)
+                self.assertFalse(env.service.closed)
+                self.assertIn(0, battery.battery_characteristic.cccd_history)
+                self.assertEqual(battery.battery_characteristic._handlers, {})
+                self.assertTrue(all(r.close_calls == 1 for r in env.data_readers))
+            finally:
+                await session.close()
+                await self._wait(lambda: not monitor._thread.is_alive())
+            self.assertTrue(env.device.closed)
+
+        _run(scenario())
+
+    def test_native_block_at_each_stage_cannot_hold_core_commands_close_or_reconnect(self):
+        # Blocking Event.wait deliberately stalls the worker's event loop:
+        # unlike asyncio.Event it cannot respond to task cancellation.
+        for stage in ("open", "service", "characteristics", "subscribe", "read", "unsubscribe"):
+            with self.subTest(stage=stage):
+                env = FakeWinRTEnvironment(device_id="battery-" + stage)
+                levels = []
+                entered = threading.Event()
+                release = threading.Event()
+
+                async def scenario():
+                    session, candidate, battery = self._session_and_candidate(env, levels)
+                    await session.connect(candidate)
+                    if stage == "open":
+                        target = session._winrt.bluetooth_le_device
+                        name = "from_id_async"
+                    elif stage == "service":
+                        target = battery.device
+                        name = "get_gatt_services_for_uuid_with_cache_mode_async"
+                    elif stage == "characteristics":
+                        target = battery.battery_service
+                        name = "get_characteristics_with_cache_mode_async"
+                    elif stage == "read":
+                        target = battery.battery_characteristic
+                        name = "read_value_with_cache_mode_async"
+                    else:
+                        target = battery.battery_characteristic
+                        name = "write_client_characteristic_configuration_descriptor_async"
+                    original = getattr(target, name)
+
+                    async def blocked(*args):
+                        should_block = threading.current_thread().name == "rc003-battery"
+                        if stage == "unsubscribe":
+                            should_block = should_block and args[0] == 0
+                        if should_block:
+                            entered.set()
+                            if not release.wait(3.0):
+                                raise AssertionError("native test gate not released")
+                        return await original(*args)
+
+                    setattr(target, name, blocked)
+                    monitor = None
+                    replacement = None
+                    try:
+                        session.start_battery_monitor()
+                        monitor = session._battery_monitor
+                        if stage == "unsubscribe":
+                            await self._wait(lambda: levels == [59])
+                            monitor.stop()
+                        await self._wait(entered.is_set)
+                        # ATVV command remains executable while optional GATT is stuck.
+                        await asyncio.wait_for(session._write_tx(bytes((0x0C,))), 0.5)
+                        await asyncio.wait_for(session.close(), 0.5)
+                        self.assertTrue(env.device.closed)
+                        self.assertTrue(monitor._thread.is_alive())
+                        next_env = FakeWinRTEnvironment(device_id=env.device_id)
+                        replacement, next_candidate, _ = self._session_and_candidate(next_env, levels)
+                        await asyncio.wait_for(replacement.connect(next_candidate), 0.5)
+                        replacement.start_battery_monitor()
+                        # Registry keeps the old resource owner; no thread buildup.
+                        self.assertIsNone(replacement._battery_monitor)
+                        self.assertFalse(next_env.device.closed)
+                    finally:
+                        release.set()
+                        await session.close()
+                        if replacement is not None:
+                            await replacement.close()
+                        if monitor is not None:
+                            await self._wait(lambda: not monitor._thread.is_alive())
+                    self.assertEqual(levels, [59] if stage == "unsubscribe" else [])
+                    self.assertTrue(battery.device.closed)
+
+                _run(scenario())
+
+    def test_setup_deadline_discards_late_value_and_releases_slot_after_cleanup(self):
+        env = FakeWinRTEnvironment(device_id="battery-timeout")
+        levels = []
+        entered = threading.Event()
+        release = threading.Event()
+
+        async def scenario():
+            session, candidate, battery = self._session_and_candidate(env, levels)
+            await session.connect(candidate)
+            original = battery.battery_characteristic.read_value_with_cache_mode_async
+
+            async def blocked(*args):
+                entered.set()
+                release.wait(3.0)
+                return await original(*args)
+
+            battery.battery_characteristic.read_value_with_cache_mode_async = blocked
+            with mock.patch("ovb_rc003.ble_transport_winrt._BATTERY_SETUP_TIMEOUT_SECONDS", 0.05):
+                session.start_battery_monitor()
+            monitor = session._battery_monitor
+            try:
+                await self._wait(entered.is_set)
+                await self._wait(monitor._stopped.is_set)
+                self.assertTrue(monitor._thread.is_alive())
+                self.assertEqual(levels, [])
+                self.assertFalse(env.device.closed)
+            finally:
+                release.set()
+                await self._wait(lambda: not monitor._thread.is_alive())
+                await session.close()
+            self.assertEqual(levels, [])
+            self.assertTrue(battery.device.closed)
+            # Once cleanup ends, a later connection can acquire telemetry again.
+            next_env = FakeWinRTEnvironment(device_id=env.device_id)
+            next_session, next_candidate, _ = self._session_and_candidate(next_env, levels)
+            await next_session.connect(next_candidate)
+            next_session.start_battery_monitor()
+            next_monitor = next_session._battery_monitor
+            try:
+                await self._wait(lambda: levels == [59])
+            finally:
+                await next_session.close()
+                await self._wait(lambda: not next_monitor._thread.is_alive())
+
+        _run(scenario())
+
+    def test_missing_service_and_invalid_read_are_fail_soft(self):
+        for payload in (None, b"", bytes((101,)), bytes((1, 2))):
+            with self.subTest(payload=payload):
+                env = FakeWinRTEnvironment()
+                levels = []
+
+                async def scenario():
+                    session, candidate, battery = self._session_and_candidate(env, levels)
+                    if payload is None:
+                        battery.device._services.pop(uuid.UUID(BATTERY_SERVICE_UUID))
+                    else:
+                        battery.battery_characteristic.read_value = payload
+                    await session.connect(candidate)
+                    session.start_battery_monitor()
+                    monitor = session._battery_monitor
+                    try:
+                        await self._wait(lambda: not monitor._thread.is_alive())
+                        self.assertEqual(levels, [])
+                        self.assertFalse(env.device.closed)
+                        self.assertFalse(session.session.mic_open)
+                        self.assertTrue(battery.device.closed)
+                    finally:
+                        await session.close()
+
+                _run(scenario())
+
+    def test_permanently_stuck_native_call_does_not_prevent_process_exit(self):
+        import subprocess
+        import sys
+        import textwrap
+
+        result = subprocess.run(
+            [sys.executable, "-c", textwrap.dedent('''
+                import asyncio
+                import threading
+                from types import SimpleNamespace
+                from ovb_rc003.battery_monitor_winrt import BatteryMonitor
+
+                entered = threading.Event()
+                async def open_device(_device_id):
+                    entered.set()
+                    threading.Event().wait()  # deliberately never released
+
+                async def scenario():
+                    modules = SimpleNamespace(bluetooth_le_device=SimpleNamespace(
+                        from_id_async=open_device))
+                    monitor = BatteryMonitor("exit-test", asyncio.get_running_loop(),
+                                             lambda level: None, lambda: modules)
+                    assert monitor.start()
+                    while not entered.is_set():
+                        await asyncio.sleep(0.005)
+                    monitor.stop()
+                    assert monitor._thread.is_alive()
+
+                asyncio.run(scenario())
+                print("main loop exited")
+            ''')],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("main loop exited", result.stdout)
+
+
 class NotificationProcessingTests(unittest.TestCase):
     def test_concurrent_producers_insert_in_their_assigned_sequence_order(self):
         class BlockingAudioQueue(queue.Queue):
@@ -495,7 +751,7 @@ class NotificationProcessingTests(unittest.TestCase):
             on_pcm_frame=lambda samples: None,
             loop=loop,
         )
-        session._process_audio = lambda _payload: processed.append("audio")
+        session._process_audio = lambda _payload, _sequence=None: processed.append("audio")
         session._process_control = lambda _payload: processed.append("control")
         try:
             for _ in range(200):
@@ -563,7 +819,7 @@ class NotificationProcessingTests(unittest.TestCase):
         session._process_control = lambda payload: processed.append(
             ("control", payload)
         )
-        session._process_audio = lambda payload: processed.append(("audio", payload))
+        session._process_audio = lambda payload, _sequence=None: processed.append(("audio", payload))
         first_start = bytes((proto.OPCODE_AUDIO_START, 0x03, 0x02, 0x01))
         first_audio = b"first-audio"
         first_stop = bytes((proto.OPCODE_AUDIO_STOP, 0x02))
@@ -629,6 +885,71 @@ class NotificationProcessingTests(unittest.TestCase):
                     )
                 )
             )
+        finally:
+            _run(session.close())
+
+    def test_pcm_callback_receives_notification_arrival_sequence(self):
+        env = FakeWinRTEnvironment()
+        sequenced = []
+
+        async def scenario():
+            session = RC003BleSession(
+                on_pcm_frame=lambda _samples: None,
+                on_pcm_frame_with_sequence=(
+                    lambda samples, sequence: sequenced.append((samples, sequence))
+                ),
+                winrt=env.build_winrt_modules(),
+                loop=asyncio.get_event_loop(),
+            )
+            candidate = identity.RC003Candidate(
+                name=env.name, hardware_match=False, handle=env.discovered_info
+            )
+            await session.connect(candidate)
+            return session
+
+        session = _run(scenario())
+        try:
+            env.control_characteristic.fire(_caps_payload(frame_size=2))
+            env.control_characteristic.fire(bytes((proto.OPCODE_AUDIO_START, 0, 0, 1)))
+            env.audio_characteristic.fire(bytes((0x00, 0x00)))
+
+            self.assertTrue(_wait_until(lambda: bool(sequenced)))
+            self.assertEqual(sequenced[0][1], session.audio_arrival_watermark)
+        finally:
+            _run(session.close())
+
+    def test_fragmented_pcm_callback_keeps_oldest_arrival_sequence(self):
+        env = FakeWinRTEnvironment()
+        sequenced = []
+
+        async def scenario():
+            session = RC003BleSession(
+                on_pcm_frame=lambda _samples: None,
+                on_pcm_frame_with_sequence=(
+                    lambda samples, sequence: sequenced.append((samples, sequence))
+                ),
+                winrt=env.build_winrt_modules(),
+                loop=asyncio.get_event_loop(),
+            )
+            candidate = identity.RC003Candidate(
+                name=env.name,
+                hardware_match=False,
+                handle=env.discovered_info,
+            )
+            await session.connect(candidate)
+            return session
+
+        session = _run(scenario())
+        try:
+            session.session.handle_control(_caps_payload(frame_size=2))
+            session.session.handle_control(
+                bytes((proto.OPCODE_AUDIO_START, 0, 0, 1))
+            )
+            session._process_audio(bytes((0x00,)), sequence=5)
+            self.assertEqual(sequenced, [])
+            session._process_audio(bytes((0x00,)), sequence=6)
+            self.assertEqual(len(sequenced), 1)
+            self.assertEqual(sequenced[0][1], 5)
         finally:
             _run(session.close())
 

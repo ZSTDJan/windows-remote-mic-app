@@ -30,7 +30,7 @@ corresponding source available from a location controlled by this project.
 The Windows build installs the official `PySide6-Essentials==6.11.1` and
 `shiboken6==6.11.1` PyPI wheels and does not patch their source. PyInstaller
 keeps Qt as replaceable DLLs and QML/plugin files under the application's
-`_internal/PySide6` directory rather than statically linking them into the main
+`程序文件/PySide6` directory rather than statically linking them into the main
 executable.
 
 The corresponding-source delivery was verified on 2026-09-01:

@@ -36,7 +36,9 @@ from ovb_rc003 import (
 
 class DryRunCoverageTests(unittest.TestCase):
     def test_dry_run_imports_every_top_level_first_party_module_in_a_fresh_process(self):
-        src_root = Path(__file__).resolve().parents[1] / "src"
+        src_root = (Path(os.environ["RC003_NATIVE_STAGE"]) / "src"
+                    if os.environ.get("RC003_NATIVE_STAGE") else
+                    Path(__file__).resolve().parents[1] / "src")
         script = """
 import pkgutil
 import sys
@@ -981,32 +983,36 @@ class DesktopModeRoutingTests(_ArgvRestoringTestCase):
         self.assertEqual(len(notice_calls), 1)
         self.assertNotIn("private detail", notice_calls[0])
 
-    def test_frozen_desktop_refuses_to_run_elevated(self):
+    def test_frozen_desktop_opens_with_either_known_permission_state(self):
         from ovb_rc003 import settings_ui
 
-        notices = []
-        with mock.patch.object(sys, "frozen", True, create=True), mock.patch.object(
-            hid_elevation_windows,
-            "query_process_elevated",
-            return_value=True,
-        ), mock.patch.object(
-            single_instance,
-            "show_bridge_startup_blocked_notice",
-            side_effect=notices.append,
-        ), mock.patch.object(
-            settings_ui,
-            "main",
-        ) as settings_main:
-            with self.assertRaises(SystemExit) as ctx:
-                main_module._run_settings()
+        for elevated in (False, True):
+            for arguments, expected in (
+                ([], {"start_bridge": False}),
+                (["--settings"], {"start_bridge": False}),
+                (["--background"], {"start_hidden": True, "start_bridge": False}),
+                (["--bridge"], {"start_hidden": True, "start_bridge": True}),
+            ):
+                with self.subTest(elevated=elevated, arguments=arguments), mock.patch.object(
+                    sys, "frozen", True, create=True
+                ), mock.patch.object(sys, "platform", "win32"), mock.patch.object(
+                    sys, "argv", ["RemoteMicRC003.exe", *arguments]
+                ), mock.patch.object(
+                    hid_elevation_windows, "query_process_elevated", return_value=elevated
+                ) as query, mock.patch.object(
+                    single_instance, "installer_maintenance_running", return_value=False
+                ) as maintenance, mock.patch.object(
+                    main_module, "_register_current_hid_helper_consumer"
+                ) as register, mock.patch.object(
+                    single_instance, "show_bridge_startup_blocked_notice"
+                ) as notice, mock.patch.object(settings_ui, "main") as settings_main:
+                    main_module.main()
 
-        self.assertEqual(
-            ctx.exception.code,
-            main_module.ELEVATED_DESKTOP_UNSUPPORTED_EXIT_CODE,
-        )
-        settings_main.assert_not_called()
-        self.assertEqual(len(notices), 1)
-        self.assertIn("不能以管理员身份长期运行", notices[0])
+                query.assert_called_once_with()
+                maintenance.assert_called_once_with()
+                register.assert_called_once_with()
+                settings_main.assert_called_once_with(**expected)
+                notice.assert_not_called()
 
     def test_frozen_desktop_refuses_to_start_when_elevation_is_unknown(self):
         from ovb_rc003 import settings_ui
@@ -1032,7 +1038,7 @@ class DesktopModeRoutingTests(_ArgvRestoringTestCase):
 
         self.assertEqual(
             ctx.exception.code,
-            main_module.ELEVATED_DESKTOP_UNSUPPORTED_EXIT_CODE,
+            main_module.DESKTOP_PERMISSION_UNAVAILABLE_EXIT_CODE,
         )
         maintenance.assert_not_called()
         settings_main.assert_not_called()
@@ -1043,32 +1049,52 @@ class DesktopModeRoutingTests(_ArgvRestoringTestCase):
     def test_frozen_desktop_does_not_start_during_installer_maintenance(self):
         from ovb_rc003 import settings_ui
 
-        notices = []
-        with mock.patch.object(sys, "frozen", True, create=True), mock.patch.object(
-            hid_elevation_windows,
-            "query_process_elevated",
-            return_value=False,
-        ), mock.patch.object(
-            single_instance,
-            "installer_maintenance_running",
-            return_value=True,
-        ), mock.patch.object(
-            single_instance,
-            "show_bridge_startup_blocked_notice",
-            side_effect=notices.append,
-        ), mock.patch.object(
-            settings_ui,
-            "main",
-        ) as settings_main:
-            with self.assertRaises(SystemExit) as ctx:
-                main_module._run_settings()
+        for elevated in (False, True):
+            notices = []
+            with self.subTest(elevated=elevated), mock.patch.object(
+                sys, "frozen", True, create=True
+            ), mock.patch.object(sys, "platform", "win32"), mock.patch.object(
+                hid_elevation_windows,
+                "query_process_elevated",
+                return_value=elevated,
+            ), mock.patch.object(
+                single_instance,
+                "installer_maintenance_running",
+                return_value=True,
+            ), mock.patch.object(
+                single_instance,
+                "show_bridge_startup_blocked_notice",
+                side_effect=notices.append,
+            ), mock.patch.object(settings_ui, "main") as settings_main:
+                with self.assertRaises(SystemExit) as ctx:
+                    main_module._run_settings()
 
-        self.assertEqual(
-            ctx.exception.code,
-            main_module.INSTALLER_MAINTENANCE_ACTIVE_EXIT_CODE,
-        )
+            self.assertEqual(
+                ctx.exception.code,
+                main_module.INSTALLER_MAINTENANCE_ACTIVE_EXIT_CODE,
+            )
+            settings_main.assert_not_called()
+            self.assertEqual(notices, ["无线麦正在安装或卸载。完成后再打开。"])
+
+    def test_elevated_frozen_duplicate_only_activates_the_existing_window(self):
+        from ovb_rc003 import settings_ui
+
+        with mock.patch.object(sys, "frozen", True, create=True), mock.patch.object(
+            sys, "platform", "win32"
+        ), mock.patch.object(
+            hid_elevation_windows, "query_process_elevated", return_value=True
+        ), mock.patch.object(
+            single_instance, "installer_maintenance_running", return_value=False
+        ), mock.patch.object(
+            single_instance, "ApplicationRuntimeInstanceGuard",
+            _make_guard_class(raise_on_enter=single_instance.DuplicateInstanceError()),
+        ), mock.patch.object(
+            single_instance, "activate_current_runtime_settings_window", return_value=True
+        ) as activate, mock.patch.object(settings_ui, "main") as settings_main:
+            main_module._run_settings()
+
+        activate.assert_called_once_with()
         settings_main.assert_not_called()
-        self.assertEqual(notices, ["无线麦正在安装或卸载。完成后再打开。"])
 
 
 class ArgumentModeBypassTests(_ArgvRestoringTestCase):
@@ -1336,9 +1362,8 @@ class DiagnoseBleCandidatesDispatchTests(_ArgvRestoringTestCase):
         # --help/bare invocation's import graph). This regression test is
         # what keeps that literal from silently drifting out of sync with
         # the module that actually owns the IPC contract.
-        import inspect
-
-        source = inspect.getsource(main_module)
+        from tests.source_contract import source_text
+        source = source_text(main_module)
         self.assertIn(
             f'"{windows_diagnostics.BLE_DIAGNOSTICS_SUBPROCESS_FLAG}" in args', source
         )
@@ -2223,9 +2248,8 @@ class DiagnoseVbCableLoopbackDispatchTests(_ArgvRestoringTestCase):
         self.assertEqual(ctx.exception.code, 1)
 
     def test_flag_literal_stays_in_sync(self):
-        import inspect
-
-        source = inspect.getsource(main_module)
+        from tests.source_contract import source_text
+        source = source_text(main_module)
         self.assertIn(
             f'"{windows_diagnostics.VB_CABLE_LOOPBACK_SUBPROCESS_FLAG}" in args',
             source,
@@ -2283,9 +2307,8 @@ class OutputEndpointPreflightDispatchTests(_ArgvRestoringTestCase):
         self.assertEqual(ctx.exception.code, 1)
 
     def test_flag_literal_stays_in_sync(self):
-        import inspect
-
-        source = inspect.getsource(main_module)
+        from tests.source_contract import source_text
+        source = source_text(main_module)
         self.assertIn(
             f'"{windows_diagnostics.OUTPUT_ENDPOINT_PREFLIGHT_SUBPROCESS_FLAG}" in args',
             source,

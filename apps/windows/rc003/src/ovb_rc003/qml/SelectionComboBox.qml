@@ -6,6 +6,10 @@ ComboBox {
 
     property var tokens
     property int recommendedIndex: -1
+    // Immediate-selection consumers keep currentIndex; confirmation dialogs
+    // can distinguish the effective choice from a merely browsed option.
+    property int effectiveIndex: currentIndex
+    property bool showEffectiveMarker: false
 
     function decoratedText(index, rawText) {
         const value = rawText === undefined || rawText === null
@@ -51,21 +55,32 @@ ComboBox {
         objectName: root.objectName + "_option_" + index
         width: ListView.view ? ListView.view.width : root.width
         height: 28
-        leftPadding: 7
+        leftPadding: 7 + (root.showEffectiveMarker ? 18 : 0)
         rightPadding: 7
         highlighted: root.highlightedIndex === index
+        IconGlyph {
+            objectName: root.objectName + "_effectiveMark_" + index
+            anchors.left: parent.left
+            anchors.leftMargin: 7
+            anchors.verticalCenter: parent.verticalCenter
+            tokens: root.tokens
+            glyph: "\uE73E"
+            glyphSize: 12
+            visible: root.showEffectiveMarker && index === root.effectiveIndex
+        }
         contentItem: Label {
             text: root.decoratedText(index, root.textAt(index))
             textFormat: Text.PlainText
             color: root.tokens.textPrimary
             font.pixelSize: root.tokens.fontSizeControl
-            font.weight: index === root.currentIndex ? Font.DemiBold : Font.Normal
+            font.weight: index === root.effectiveIndex ? Font.DemiBold : Font.Normal
             verticalAlignment: Text.AlignVCenter
             elide: Text.ElideRight
         }
         background: Rectangle {
             color: parent.highlighted ? root.tokens.accentSoft : root.tokens.surface
         }
-        Accessible.name: contentItem.text
+        Accessible.name: (root.showEffectiveMarker && index === root.effectiveIndex
+            ? qsTr("当前使用：") : "") + contentItem.text
     }
 }

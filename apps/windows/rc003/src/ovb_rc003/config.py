@@ -31,7 +31,7 @@ PRODUCT_ID = "RC003"
 CONFIG_FILENAME = "config.json"
 KEY_BINDINGS_FILENAME = "key_bindings.json"
 
-SCHEMA_VERSION = 14
+SCHEMA_VERSION = 17
 
 VOICE_HOTKEY_SOURCE_DEFAULT = "default"
 VOICE_HOTKEY_SOURCE_AUTO = "auto"
@@ -95,6 +95,9 @@ class ConfigTransactionError(RuntimeError):
 
 
 def config_root() -> Path:
+    from . import dev_session
+    if dev_session.is_isolated():
+        return dev_session.isolated_root()
     base = os.environ.get("LOCALAPPDATA")
     if not base:
         base = str(Path.home())
@@ -124,6 +127,9 @@ def default_config() -> Dict[str, Any]:
         # RC003's upstream decoder applies a 10 dB speech gain before the
         # 16 kHz PCM is sent to the virtual microphone.
         "gain_db": 10.0,
+        # Remote-side gesture, distinct from the input method's hold shortcut.
+        "remote_recording_mode": "hold",
+        "remote_recording_limit_seconds": 120,
         "retry_delay": 5.0,
         "max_retry_delay": 60.0,
         "voice_shortcut_enabled": True,
@@ -182,7 +188,7 @@ def _assert_no_forbidden_keys(data: Dict[str, Any]) -> None:
 
 
 def load_config(path: Path) -> Dict[str, Any]:
-    from . import remote_selection
+    from . import remote_selection, remote_settings
     config = default_config()
     if path.is_file():
         with path.open("r", encoding="utf-8-sig") as handle:
@@ -190,6 +196,8 @@ def load_config(path: Path) -> Dict[str, Any]:
         if not isinstance(stored, dict):
             raise ConfigFormatError("config.json root must be a JSON object")
         _assert_no_forbidden_keys(stored)
+        stored = remote_settings.project(stored, remote_settings.CONFIG_FIELDS,
+                                         remote_selection.active_key(stored))
         # Normalize the persisted voice fields before merging defaults. A
         # shallow merge would otherwise make a newly introduced default look
         # like an explicitly saved top-level/nested shortcut and could hide
@@ -203,11 +211,15 @@ def load_config(path: Path) -> Dict[str, Any]:
     _normalize_desktop_behavior(config)
     if remote_selection.KEY in config:
         config[remote_selection.KEY] = remote_selection.normalize(config[remote_selection.KEY])
+    profile = remote_selection.active_profile(config)
+    if profile:
+        config["selected_device_profile"] = profile
+    _normalize_remote_recording_mode(config, profile)
     return config
 
 
 def save_config(path: Path, config: Dict[str, Any]) -> None:
-    from . import remote_selection
+    from . import remote_selection, remote_settings
     persisted = _without_runtime_only_keys(config)
     if remote_selection.KEY in persisted:
         persisted[remote_selection.KEY] = remote_selection.normalize(persisted[remote_selection.KEY])
@@ -215,8 +227,40 @@ def save_config(path: Path, config: Dict[str, Any]) -> None:
     _normalize_voice_hotkey(persisted)
     _normalize_voice_program(persisted)
     _normalize_desktop_behavior(persisted)
+    profile = remote_selection.active_profile(persisted)
+    _normalize_remote_recording_mode(persisted, profile)
     persisted = _without_runtime_only_keys(persisted)
+    latest = _read_settings_document(path)
+    if remote_settings.STORE in latest and remote_selection.active_key(latest) != persisted.get(remote_settings.OWNER):
+        raise remote_settings.RemoteSettingsError("当前设备已切换，请重新载入设置。")
+    persisted = remote_settings.pack(persisted, remote_settings.CONFIG_FIELDS,
+                                    remote_selection.active_key(persisted), latest)
+    if profile:
+        persisted.pop("selected_device_profile", None)  # Derived, never a second selection.
     _save_json_atomic(path, persisted)
+
+
+def _normalize_remote_recording_mode(document, profile):
+    from .remote_selection import CHROMECAST_PROFILE
+    from .chromecast_voice import LIMITS, DEFAULT_LIMIT
+    mode = document.get("remote_recording_mode", "hold")
+    if mode not in ("hold", "toggle"):
+        raise ConfigFormatError("录音方式不受支持。")
+    document["remote_recording_mode"] = mode if profile == CHROMECAST_PROFILE else "hold"
+    limit = document.get("remote_recording_limit_seconds", DEFAULT_LIMIT)
+    if type(limit) is not int or limit not in LIMITS:
+        raise ConfigFormatError("最长录音时间不受支持。")
+    document["remote_recording_limit_seconds"] = limit
+
+
+def _read_settings_document(path):
+    if not Path(path).is_file():
+        return {}
+    value = json.loads(Path(path).read_text(encoding="utf-8-sig"))
+    if not isinstance(value, dict):
+        raise ConfigFormatError("设置文件不是对象。")
+    _assert_no_forbidden_keys(value)
+    return value
 
 
 def save_config_and_load(path: Path, config_data: Dict[str, Any]) -> Dict[str, Any]:
@@ -327,6 +371,16 @@ def _normalize_voice_hotkey(config: Dict[str, Any]) -> None:
 
     current = provider_hotkeys[provider_id]["hold"]
 
+    # Additive per-provider field; never migrate a held shortcut into a toggle.
+    for toggle_provider in ("wetype", "sogou", "doubao_ime"):
+        entry = raw_provider_hotkeys.get(toggle_provider, {})
+        if isinstance(entry, dict) and "toggle" in entry:
+            result = voice_hotkey_sync_windows.validate_provider_hotkey(toggle_provider, entry.get("toggle", ""))
+            provider_hotkeys[toggle_provider]["toggle"] = result.hotkey if result.ok else ""
+            toggle_source = str(entry.get("toggle_source", VOICE_HOTKEY_SOURCE_DEFAULT)).strip().lower()
+            provider_hotkeys[toggle_provider]["toggle_source"] = (toggle_source if result.ok and
+                toggle_source in VALID_VOICE_HOTKEY_SOURCES else VOICE_HOTKEY_SOURCE_DEFAULT)
+
     config["schema_version"] = SCHEMA_VERSION
     config["voice_trigger_mode"] = key_mapping.VoiceTriggerMode.HOLD.value
     config["voice_hotkey"] = current
@@ -335,8 +389,14 @@ def _normalize_voice_hotkey(config: Dict[str, Any]) -> None:
     config.pop("voice_release_finish_tap_enabled", None)
 
 
+def voice_hotkey_trigger_for_settings(config_data, provider_id=None):
+    """UI selection only; the legacy runtime mirrors remain held shortcuts."""
+    provider = provider_id or config_data.get("voice_program", {}).get("provider")
+    return "toggle" if provider in ("wetype", "sogou", "doubao_ime") and config_data.get("remote_recording_mode") == "toggle" else "hold"
+
+
 def voice_hotkey_for_provider(
-    config_data: Dict[str, Any], provider_id: object
+    config_data: Dict[str, Any], provider_id: object, *, trigger="hold"
 ) -> str:
     """Return one provider's normalized hold shortcut without changing selection."""
 
@@ -347,7 +407,7 @@ def voice_hotkey_for_provider(
     if isinstance(entries, dict):
         entry = entries.get(provider)
         if isinstance(entry, dict):
-            candidate = str(entry.get("hold", "")).strip().lower()
+            candidate = str(entry.get(trigger, "")).strip().lower()
             if candidate:
                 validation = voice_hotkey_sync_windows.validate_provider_hotkey(
                     provider,
@@ -355,21 +415,21 @@ def voice_hotkey_for_provider(
                 )
                 return validation.hotkey if validation.ok else ""
             return ""
-    return voice_hotkey_sync_windows.default_hotkey(provider)
+    return "" if trigger == "toggle" else voice_hotkey_sync_windows.default_hotkey(provider)
 
 
 def voice_hotkey_source_for_provider(
-    config_data: Dict[str, Any], provider_id: object
+    config_data: Dict[str, Any], provider_id: object, *, trigger="hold"
 ) -> str:
     provider = str(provider_id).strip().lower()
     entries = config_data.get("voice_hotkeys_by_provider")
     if isinstance(entries, dict):
         entry = entries.get(provider)
         if isinstance(entry, dict):
-            source = str(entry.get("source", "")).strip().lower()
+            source = str(entry.get("toggle_source" if trigger == "toggle" else "source", "")).strip().lower()
             if source not in VALID_VOICE_HOTKEY_SOURCES:
                 return VOICE_HOTKEY_SOURCE_DEFAULT
-            candidate = str(entry.get("hold", "")).strip().lower()
+            candidate = str(entry.get(trigger, "")).strip().lower()
             if source in {
                 VOICE_HOTKEY_SOURCE_AUTO,
                 VOICE_HOTKEY_SOURCE_MANUAL,
@@ -392,18 +452,21 @@ def set_voice_hotkey_for_provider(
     shortcut: str,
     *,
     source: object = None,
+    trigger="hold",
 ) -> None:
     """Update one provider and keep legacy current-provider mirrors coherent."""
 
     from . import voice_program_manager
 
     provider = str(provider_id).strip().lower()
+    if trigger not in ("hold", "toggle") or trigger == "toggle" and provider not in ("wetype", "sogou", "doubao_ime"):
+        raise ValueError("unsupported voice shortcut trigger")
     normalized = str(shortcut).strip().lower()
     entries = config_data.get("voice_hotkeys_by_provider")
     next_entries = dict(entries) if isinstance(entries, dict) else {}
     existing = next_entries.get(provider)
     existing_source = (
-        str(existing.get("source", "")).strip().lower()
+        str(existing.get("toggle_source" if trigger == "toggle" else "source", "")).strip().lower()
         if isinstance(existing, dict)
         else ""
     )
@@ -414,17 +477,16 @@ def set_voice_hotkey_for_provider(
             if existing_source in VALID_VOICE_HOTKEY_SOURCES
             else VOICE_HOTKEY_SOURCE_MANUAL
         )
-    next_entries[provider] = {
-        "hold": normalized,
-        "source": resolved_source,
-    }
+    next_entries[provider] = dict(existing) if isinstance(existing, dict) else {}
+    next_entries[provider].update({trigger: normalized,
+        "toggle_source" if trigger == "toggle" else "source": resolved_source})
     config_data["voice_hotkeys_by_provider"] = next_entries
     current_provider = str(
         voice_program_manager.normalize_voice_program_settings(
             config_data.get("voice_program")
         )["provider"]
     )
-    if provider == current_provider:
+    if provider == current_provider and trigger == "hold":
         config_data["voice_hotkey"] = normalized
         config_data["voice_hotkeys"] = {"hold": normalized}
 
@@ -476,16 +538,16 @@ def _normalize_desktop_behavior(config: Dict[str, Any]) -> None:
     config["schema_version"] = SCHEMA_VERSION
 
 
-def default_key_bindings() -> Dict[str, Any]:
+def default_key_bindings(profile: str = "xiaomi-rc003") -> Dict[str, Any]:
     # Imported lazily to avoid a hard import-order dependency between the two
     # modules at package-load time.
-    from . import key_mapping
+    from . import key_mapping, remote_layout
 
     return {
         "schema_version": SCHEMA_VERSION,
         "bindings": {
             button_id: action.to_dict()
-            for button_id, action in key_mapping.default_button_actions().items()
+            for button_id, action in remote_layout.default_actions(profile).items()
         },
         # Secondary gestures follow the reference project's separate map.
         # Keeping the primary action flat preserves compatibility with all
@@ -509,13 +571,19 @@ def default_key_bindings() -> Dict[str, Any]:
 
 
 def load_key_bindings(path: Path) -> Dict[str, Any]:
-    bindings = default_key_bindings()
+    from . import remote_settings, remote_selection
+    selected = _read_settings_document(Path(path).with_name(CONFIG_FILENAME))
+    profile = remote_selection.active_profile(selected) or remote_selection.RC003_PROFILE
+    bindings = default_key_bindings(profile)
     if path.is_file():
         with path.open("r", encoding="utf-8-sig") as handle:
             stored = json.load(handle)
         if not isinstance(stored, dict):
             raise ConfigFormatError("key_bindings.json root must be a JSON object")
         _assert_no_forbidden_keys(stored)
+        if remote_settings.STORE in stored:
+            stored = remote_settings.project(stored, remote_settings.BINDING_FIELDS,
+                                             remote_selection.active_key(selected))
         for key, value in stored.items():
             if key in {
                 "bindings",
@@ -542,7 +610,12 @@ def load_key_bindings(path: Path) -> Dict[str, Any]:
     _normalize_semantic_actions(bindings)
     _normalize_secondary_bindings(bindings)
     _normalize_combo_bindings(bindings)
-    _normalize_display_notes(bindings)
+    _normalize_display_notes(bindings, profile)
+    if profile == remote_selection.CHROMECAST_PROFILE:
+        from . import remote_layout
+        valid_buttons = set(remote_layout.button_order(profile))
+        for field in ("bindings", "secondary_bindings"):
+            bindings[field] = {key: value for key, value in bindings[field].items() if key in valid_buttons}
     bindings["schema_version"] = SCHEMA_VERSION
     return bindings
 
@@ -748,10 +821,13 @@ def _normalize_physical_bindings(bindings: Dict[str, Any]) -> None:
     }
 
 
-def _normalize_display_notes(bindings: Dict[str, Any]) -> None:
+def _normalize_display_notes(bindings: Dict[str, Any], profile: str = "xiaomi-rc003") -> None:
     """Keep optional display-only labels separate from executable actions."""
 
-    from . import device_profile, key_mapping
+    from . import device_profile, key_mapping, remote_layout
+
+    valid_buttons = (set(remote_layout.button_order(profile)) if profile == "chromecast-remote"
+                     else device_profile.ALL_BUTTON_IDS)
 
     raw_notes = bindings.get("display_notes")
     if not isinstance(raw_notes, dict):
@@ -764,7 +840,7 @@ def _normalize_display_notes(bindings: Dict[str, Any]) -> None:
     }
     normalized: Dict[str, Dict[str, str]] = {}
     for button_id, trigger_map in raw_notes.items():
-        if button_id not in device_profile.ALL_BUTTON_IDS or not isinstance(
+        if button_id not in valid_buttons or not isinstance(
             trigger_map, dict
         ):
             continue
@@ -782,10 +858,69 @@ def _normalize_display_notes(bindings: Dict[str, Any]) -> None:
 
 
 def save_key_bindings(path: Path, bindings: Dict[str, Any]) -> None:
+    from . import remote_settings, remote_selection
     persisted = _without_runtime_only_keys(bindings)
     persisted["schema_version"] = SCHEMA_VERSION
     _assert_no_forbidden_keys(persisted)
+    latest = _read_settings_document(path)
+    selected = _read_settings_document(Path(path).with_name(CONFIG_FILENAME))
+    persisted = remote_settings.pack(persisted, remote_settings.BINDING_FIELDS,
+                                    remote_selection.active_key(selected), latest)
     _save_json_atomic(path, persisted)
+
+
+def switch_remote_settings(config_file: Path, bindings_file: Path, selection: dict,
+                           *, allow_legacy_binding: bool = True):
+    """Switch canonical records only after the caller has stopped old execution.
+
+    Migration is explicit and reversible, not a side effect of load. Unbound
+    legacy fields stay unassigned, never inherited by an arbitrary new device.
+    """
+    from . import remote_settings, remote_selection
+    if (Path(bindings_file).with_name(CONFIG_FILENAME).absolute() != Path(config_file).absolute()
+            or Path(config_file).absolute() == Path(bindings_file).absolute()):
+        raise ValueError("remote settings must use the same configuration directory")
+    old_config = load_config(config_file)
+    old_bindings = load_key_bindings(bindings_file)
+    settings, bindings = remote_settings.switch_views(
+        old_config, old_bindings, selection, allow_legacy_binding=allow_legacy_binding)
+    # Supply fresh defaults for a genuinely new entity, never the old view.
+    merged = default_config()
+    merged.update(settings)
+    settings = merged
+    merged = default_key_bindings(remote_selection.active_profile(settings))
+    merged.update(bindings)
+    bindings = merged
+    _normalize_voice_program(settings)
+    _normalize_voice_hotkey(settings)
+    profile = remote_selection.active_profile(settings)
+    _normalize_remote_recording_mode(settings, profile)
+    active = remote_selection.active_key(settings)
+    settings = remote_settings.pack(_without_runtime_only_keys(settings), remote_settings.CONFIG_FIELDS, active)
+    bindings = remote_settings.pack(_without_runtime_only_keys(bindings), remote_settings.BINDING_FIELDS, active)
+    settings.pop("selected_device_profile", None)
+    _assert_no_forbidden_keys(settings)
+    _assert_no_forbidden_keys(bindings)
+    snapshots = [(config_file, _read_file_snapshot(config_file)),
+                 (bindings_file, _read_file_snapshot(bindings_file))]
+    try:
+        # Both old and new mapping records are present. Publish them before the
+        # single active-selection pointer, so an interrupted switch cannot
+        # interpret a legacy flat mapping as belonging to the new entity.
+        _save_json_atomic(bindings_file, bindings)
+        _save_json_atomic(config_file, settings)
+        return load_config(config_file), load_key_bindings(bindings_file)
+    except BaseException as error:
+        failures = []
+        for filename, snapshot in snapshots:
+            try:
+                _restore_file_snapshot(filename, snapshot)
+                _verify_file_snapshot(filename, snapshot)
+            except Exception as restore_error:
+                failures.append(restore_error)
+        if failures:
+            raise ConfigTransactionError("设备切换失败且设置未能完全恢复。") from error
+        raise
 
 
 def save_settings_pair(

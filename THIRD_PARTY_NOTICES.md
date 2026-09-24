@@ -52,7 +52,7 @@ recorded in `THIRD_PARTY_SOURCE.md`.
 - Main license text: `THIRD_PARTY_LICENSES/NumPy-2.4.3/LICENSE.txt`
 
 PyInstaller also preserves NumPy's complete package license tree under
-`_internal/numpy-2.4.3.dist-info/licenses/` in the frozen application.
+`程序文件/numpy-2.4.3.dist-info/licenses/` in current frozen applications.
 
 ### python-sounddevice and PortAudio
 
@@ -185,6 +185,14 @@ branding is included.
 The SVG stroke color is changed to the application's blue, and the Windows
 ICO is generated from the modified `mic` SVG.
 
+### Chromecast product photo
+
+`Resources/Chromecast-remote-photo.png` is the user-supplied photo selected on
+2026-09-16 for the Chromecast mapping page. It was imported without changing
+pixels. The copyright owner confirmed on 2026-09-24 that this unchanged image
+may be publicly redistributed with Remote Mic. See `ASSET_LICENSES.md` for the
+permission boundary; this notice does not grant broader reuse or modification.
+
 ### RC003 product photo
 
 The bundled file `Resources/RC003-remote-photo.png` was independently created
@@ -206,10 +214,11 @@ A+B/C+D products. The client does not re-license or silently install VB-CABLE,
 and it never changes the Windows system default input/output device; audio is
 written only to an explicitly selected endpoint. Installation starts only after
 an explicit user action and Windows UAC confirmation. The installation action
-elevates only the vendor installer; it does not elevate the running Remote Mic
-process. It never reports a driver install as successful merely because a
-process was launched. Users may obtain the same package directly from VB-Audio
-and are encouraged to support the vendor through its Donationware model.
+does not elevate the main process itself; users may have started the application
+as administrator under the current public-version workaround. It never reports a driver install as
+successful merely because a process was launched. Users may obtain the same
+package directly from VB-Audio and are encouraged to support the vendor through
+its Donationware model.
 
 ## Microsoft runtime components
 

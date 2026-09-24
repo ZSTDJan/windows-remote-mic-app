@@ -6,6 +6,7 @@ Rectangle {
 
     property var tokens
     property string titleText: ""
+    property int titleFontWeight: Font.Medium
     property string descriptionText: ""
     property string descriptionObjectName: ""
     property bool descriptionNeverElide: false
@@ -43,7 +44,7 @@ Rectangle {
             Layout.maximumWidth: root.titleWidth
             Layout.alignment: Qt.AlignVCenter
             text: root.titleText
-            font.weight: Font.Medium
+            font.weight: root.titleFontWeight
             elide: Text.ElideRight
             HoverHandler { id: titleHover }
             CompactToolTip {
@@ -93,7 +94,8 @@ Rectangle {
         }
 
         Item {
-            visible: !editorRow.visible && !descriptionLabel.visible
+            visible: !descriptionLabel.visible
+                && (!editorRow.visible || root.editorColumnWidth > 0)
             Layout.fillWidth: true
         }
 
@@ -145,12 +147,9 @@ Rectangle {
         }
     }
 
-    Rectangle {
+    SettingsRowDivider {
+        objectName: root.objectName + "_divider"
+        tokens: root.tokens
         visible: root.showDivider
-        anchors.left: parent.left
-        anchors.right: parent.right
-        anchors.bottom: parent.bottom
-        height: root.tokens.hairlineWidth
-        color: root.tokens.border
     }
 }

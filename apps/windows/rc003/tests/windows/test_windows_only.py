@@ -78,6 +78,21 @@ class Win32InputUnavailableOffWindowsTests(unittest.TestCase):
 
 @unittest.skipUnless(_ON_WINDOWS, "Windows-only: Raw Input requires the Win32 API")
 class RawInputWindowsTests(unittest.TestCase):
+    def test_keyboard_safety_only_reaches_ready_and_restarts_without_remote(self):
+        """Native hidden window only; no injection, remote selection or capture log."""
+        from ovb_rc003 import raw_input_windows
+        listener = raw_input_windows.RawInputButtonListener(lambda *_: None)
+        for _ in range(2):
+            try:
+                listener.start(None)
+                self.assertTrue(listener.is_running)
+                self.assertTrue(raw_input_windows.physical_keyboard_tracking_available())
+                self.assertIsNone(listener._normalized_device_path)
+            finally:
+                listener.stop()
+            self.assertFalse(listener.is_running)
+            self.assertFalse(raw_input_windows.physical_keyboard_tracking_available())
+
     def test_enumerate_matching_device_paths_runs_without_raising(self):
         # No RC003 is paired in CI; this only proves enumeration itself works,
         # not that a real device is found (that's a real-machine 待核验 item).

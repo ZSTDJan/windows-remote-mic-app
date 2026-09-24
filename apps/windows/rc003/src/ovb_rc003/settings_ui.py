@@ -66,15 +66,13 @@ _REFERENCE_ACTION_LABELS: Dict[key_mapping.ActionKind, str] = {
     key_mapping.ActionKind.MOUSE_LEFT_CLICK: "鼠标左键单击",
     key_mapping.ActionKind.MOUSE_RIGHT_CLICK: "鼠标右键单击",
     key_mapping.ActionKind.MOUSE_MIDDLE_CLICK: "鼠标中键单击",
-    key_mapping.ActionKind.MOUSE_WHEEL_UP: "滚轮向上",
-    key_mapping.ActionKind.MOUSE_WHEEL_DOWN: "滚轮向下",
     key_mapping.ActionKind.MOUSE_X1_CLICK: "鼠标 X1 单击",
     key_mapping.ActionKind.MOUSE_X2_CLICK: "鼠标 X2 单击",
     key_mapping.ActionKind.ELEMENT_NAVIGATION_TOGGLE: "元素导航开关",
     key_mapping.ActionKind.OPEN_REMOTE_MIC: _OPEN_APPLICATION_DISPLAY,
     key_mapping.ActionKind.OPEN_CODEX: "打开 Codex",
     key_mapping.ActionKind.OPEN_CLAUDE: "打开 Claude",
-    key_mapping.ActionKind.OPEN_CMUX: "打开 cmux",
+    key_mapping.ActionKind.OPEN_CMUX: "打开 cmux 终端",
     key_mapping.ActionKind.OPEN_WECHAT: "打开微信",
     key_mapping.ActionKind.OPEN_CURSOR: "打开 Cursor",
     key_mapping.ActionKind.OPEN_SLACK: "打开 Slack",
@@ -95,6 +93,7 @@ _LEGACY_REFERENCE_ACTION_KINDS_BY_LABEL: Dict[str, key_mapping.ActionKind] = {
     "Return": key_mapping.ActionKind.RETURN,
     "Delete（退格）": key_mapping.ActionKind.DELETE_BACKWARD,
     "上下文菜单": key_mapping.ActionKind.CONTEXT_MENU,
+    "打开 cmux": key_mapping.ActionKind.OPEN_CMUX,
 }
 
 # Preset choices shown in the mapping dropdown. Any other
@@ -109,11 +108,11 @@ ACTION_OPTION_GROUPS: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
         ),
     ),
     (
-        "鼠标与导航",
+        "鼠标操作",
         (
-            "鼠标左键单击", "鼠标右键单击", "鼠标中键单击",
-            "滚轮向上", "滚轮向下", "鼠标 X1 单击", "鼠标 X2 单击",
-            "元素导航开关", "右键菜单",
+            "元素导航开关", "鼠标左键单击", "鼠标右键单击", "鼠标中键单击",
+            "鼠标 X1 单击", "鼠标 X2 单击",
+            "右键菜单",
         ),
     ),
     (
@@ -126,7 +125,7 @@ ACTION_OPTION_GROUPS: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
     (
         "启动应用",
         (
-            _OPEN_APPLICATION_DISPLAY, "打开 Codex", "打开 Claude", "打开 cmux", "打开微信",
+            _OPEN_APPLICATION_DISPLAY, "打开 Claude", "打开 cmux 终端", "打开微信",
             "打开 Cursor", "打开 Slack", "打开企业微信", "打开网易云音乐",
             "打开 Chrome", "打开 Edge", "打开 Zed",
         ),
@@ -255,6 +254,14 @@ class SettingsValidationError(Exception):
 
 
 def _action_to_display(action: key_mapping.ButtonAction) -> str:
+    if action.kind == key_mapping.ActionKind.KEY_COMBO and action.keys in (("pageup",), ("page_up",)):
+        return "PageUp"
+    if action.kind == key_mapping.ActionKind.KEY_COMBO and action.keys in (("pagedown",), ("page_down",)):
+        return "PageDown"
+    if action.kind == key_mapping.ActionKind.MOUSE_WHEEL_UP:
+        return "PageUp"
+    if action.kind == key_mapping.ActionKind.MOUSE_WHEEL_DOWN:
+        return "PageDown"
     if action.kind == key_mapping.ActionKind.DISABLED:
         return "禁用"
     if action.kind == key_mapping.ActionKind.VOICE:
@@ -450,6 +457,8 @@ def build_save_model(
     SettingsValidationError on invalid input; never raises a Tk exception.
     """
 
+    from . import remote_layout
+    allowed_buttons = set(remote_layout.button_order(selected_device_profile))
     trigger_mode = key_mapping.VoiceTriggerMode.HOLD
     mode_hotkeys = {
         "hold": key_mapping.voice_hotkey_for_trigger_mode(trigger_mode)
@@ -462,6 +471,8 @@ def build_save_model(
     bindings: Dict[str, dict] = {}
     voice_binding: Optional[Tuple[str, key_mapping.VoiceTriggerMode]] = None
     for button_id, text in button_display_map.items():
+        if selected_device_profile == device_catalog.CHROMECAST_ID and button_id not in allowed_buttons:
+            raise SettingsValidationError(button_id, "该按键不属于当前遥控器。")
         action = _validated_button_action(
             button_id,
             key_mapping.ButtonTrigger.SINGLE_CLICK.value,
@@ -469,6 +480,9 @@ def build_save_model(
         )
         if action is None:
             continue
+        if (selected_device_profile == device_catalog.CHROMECAST_ID and button_id == "mic"
+                and action.kind != key_mapping.ActionKind.VOICE_HOLD):
+            raise SettingsValidationError(button_id, "Assistant 暂时保留为语音专用键。")
         voice_mode = key_mapping.voice_trigger_mode_for_action(
             action,
             legacy_mode=trigger_mode,
@@ -544,6 +558,8 @@ def build_save_model(
                     continue
                 if action.kind == key_mapping.ActionKind.DISABLED:
                     continue
+                if selected_device_profile == device_catalog.CHROMECAST_ID and button_id == "mic":
+                    raise SettingsValidationError(button_id, "Assistant 暂不开放普通双击和长按映射。")
                 secondary_bindings.setdefault(button_id, {})[trigger_name] = action.to_dict()
 
     if display_note_map is None:
@@ -561,7 +577,7 @@ def build_save_model(
             key_mapping.ButtonTrigger.LONG_PRESS.value,
         }
         for button_id, trigger_map in display_note_map.items():
-            if button_id not in device_profile.ALL_BUTTON_IDS or not isinstance(
+            if button_id not in allowed_buttons or not isinstance(
                 trigger_map, dict
             ):
                 continue
@@ -617,19 +633,20 @@ class DefaultDisplayState:
     trigger_mode_label: str
 
 
-def default_display_state() -> DefaultDisplayState:
-    defaults = key_mapping.default_button_actions()
+def default_display_state(profile: str = "xiaomi-rc003") -> DefaultDisplayState:
+    from . import remote_layout
+    defaults = remote_layout.default_actions(profile)
     button_display_map = {
         button_id: _action_to_display(action) for button_id, action in defaults.items()
     }
-    for button_id in _USER_FACING_BUTTON_IDS:
+    for button_id in remote_layout.button_order(profile):
         button_display_map.setdefault(button_id, "")
     secondary_display_map = {
         button_id: {
             key_mapping.ButtonTrigger.DOUBLE_CLICK.value: "",
             key_mapping.ButtonTrigger.LONG_PRESS.value: "",
         }
-        for button_id in _USER_FACING_BUTTON_IDS
+        for button_id in remote_layout.button_order(profile)
     }
     voice_hotkeys = {
         "hold": key_mapping.voice_hotkey_for_trigger_mode(

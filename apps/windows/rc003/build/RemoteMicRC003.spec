@@ -18,7 +18,11 @@
 
 import os
 import sys
+import importlib.machinery
 from pathlib import Path
+
+from PyInstaller.utils.win32 import versioninfo
+from PyInstaller.config import CONF
 
 block_cipher = None
 
@@ -31,18 +35,30 @@ if not SRC_ROOT.is_dir():
     raise SystemExit(f"required build source directory is missing: {SRC_ROOT}")
 REPO_ROOT = RC003_ROOT.parents[2]
 REMOTE_PHOTO = REPO_ROOT / "Resources" / "RC003-remote-photo.png"
+CHROMECAST_PHOTO = REPO_ROOT / "Resources" / "Chromecast-remote-photo.png"
 QML_SOURCE_DIR = SRC_ROOT / "ovb_rc003" / "qml"
 APP_ICON_DIR = SRC_ROOT / "ovb_rc003" / "assets" / "icons"
 APP_ICON = APP_ICON_DIR / "remote-mic.ico"
 ELEMENT_NAVIGATION_SOURCE_DIR = RC003_ROOT / "scripts"
-ELEMENT_NAVIGATION_SOURCE_FILES = (
-    "element_navigation_prototype.py",
-    "element_navigation_command_windows.py",
-    "element_navigation_support.py",
-    "element_navigation_windows_host.py",
-    "element_targeting_core.py",
-    "spatial_navigation_core.py",
-)
+sys.path.insert(0, str(RC003_ROOT / "build"))
+from native_inventory import NAVIGATION_MODULES, import_closure
+ELEMENT_NAVIGATION_SOURCE_FILES = tuple(name + ".py" for name in NAVIGATION_MODULES)
+
+LEGACY_COMPARISON = os.environ.get("RC003_BUILD_LEGACY_COMPARISON") == "1"
+if LEGACY_COMPARISON:
+    # A private same-source benchmark cannot masquerade as a deliverable.
+    if not all(Path(path).resolve().is_relative_to(RC003_ROOT / ".build")
+               for path in (DISTPATH, CONF["workpath"], SRC_ROOT)):
+        raise SystemExit("legacy comparison is restricted to private .build caches")
+NATIVE_STAGE = (SRC_ROOT.parent / "native-build.json").is_file() and not LEGACY_COMPARISON
+if source_root_override:
+    from check_native import verify_stage
+    verify_stage(SRC_ROOT.parent, require_full=not LEGACY_COMPARISON)
+elif LEGACY_COMPARISON:
+    raise SystemExit("legacy comparison requires an explicit staged source root")
+navigation_binaries = []
+if NATIVE_STAGE:
+    ELEMENT_NAVIGATION_SOURCE_DIR = SRC_ROOT.parent / "scripts"
 DEVICE_PROFILES_DIR = REPO_ROOT / "device-profiles"
 # XRBM-031: build/fetch-vb-cable.ps1 (a REQUIRED step in both
 # build-candidate.ps1 and windows-rc003-ci.yml, run before this spec) writes
@@ -55,13 +71,80 @@ VB_CABLE_BUNDLE_ZIP = RC003_ROOT / "build" / "third_party" / "VBCABLE_Driver_Pac
 FRIDA_ASSET_DIR = SRC_ROOT / "ovb_rc003" / "frida_assets"
 VERSION_FILE = SRC_ROOT / "ovb_rc003" / "VERSION"
 HID_HELPER_NAME = "RemoteMicRC003HidHelper"
-HID_HELPER_RELATIVE_PATH = Path("_internal") / f"{HID_HELPER_NAME}.exe"
 
 # Import only the stdlib-only pin/runtime helper so the build contract has one
 # authoritative filename and SHA-256. Source execution may omit the asset, but
 # every frozen build must contain the exact pinned archive.
+if not VERSION_FILE.is_file():
+    raise SystemExit(f"required application version file is missing: {VERSION_FILE}")
 sys.path.insert(0, str(SRC_ROOT))
-from ovb_rc003 import frida_hid_tap_runtime  # noqa: E402
+from ovb_rc003 import frida_hid_tap_runtime, product_identity  # noqa: E402
+
+APP_VERSION = product_identity.validate_version(
+    VERSION_FILE.read_text(encoding="ascii").strip()
+)
+MAIN_EXECUTABLE_NAME = product_identity.windows_executable_name(APP_VERSION)
+MAIN_EXECUTABLE_STEM = product_identity.windows_executable_stem(APP_VERSION)
+WINDOWS_RUNTIME_DIRECTORY_NAME = product_identity.WINDOWS_RUNTIME_DIRECTORY_NAME
+HID_HELPER_RELATIVE_PATH = (
+    Path(WINDOWS_RUNTIME_DIRECTORY_NAME) / f"{HID_HELPER_NAME}.exe"
+)
+
+
+def _version_resource(metadata):
+    fixed_version = metadata["fixed_file_version"]
+    return versioninfo.VSVersionInfo(
+        ffi=versioninfo.FixedFileInfo(
+            filevers=fixed_version,
+            prodvers=fixed_version,
+            mask=0x3F,
+            flags=0x2 if metadata["prerelease"] else 0x0,
+            OS=0x40004,
+            fileType=0x1,
+            subtype=0x0,
+            date=(0, 0),
+        ),
+        kids=[
+            versioninfo.StringFileInfo(
+                [
+                    versioninfo.StringTable(
+                        "080404B0",
+                        [
+                            versioninfo.StringStruct(
+                                "FileDescription", metadata["file_description"]
+                            ),
+                            versioninfo.StringStruct(
+                                "FileVersion", metadata["file_version"]
+                            ),
+                            versioninfo.StringStruct(
+                                "InternalName", metadata["internal_name"]
+                            ),
+                            versioninfo.StringStruct(
+                                "OriginalFilename", metadata["original_filename"]
+                            ),
+                            versioninfo.StringStruct(
+                                "ProductName", metadata["product_name"]
+                            ),
+                            versioninfo.StringStruct(
+                                "ProductVersion", metadata["product_version"]
+                            ),
+                        ],
+                    )
+                ]
+            ),
+            versioninfo.VarFileInfo(
+                [versioninfo.VarStruct("Translation", [2052, 1200])]
+            ),
+        ],
+    )
+
+
+MAIN_VERSION_INFO = _version_resource(
+    product_identity.windows_main_version_metadata(APP_VERSION)
+)
+HID_HELPER_VERSION_INFO = _version_resource(
+    product_identity.windows_hid_helper_version_metadata(APP_VERSION)
+)
 
 FRIDA_GADGET_ARCHIVE = (
     FRIDA_ASSET_DIR / frida_hid_tap_runtime.GADGET_ARCHIVE_NAME
@@ -86,14 +169,15 @@ if not REMOTE_PHOTO.is_file():
     )
 
 datas = []
-if not VERSION_FILE.is_file():
-    raise SystemExit(f"required application version file is missing: {VERSION_FILE}")
 datas.append((str(VERSION_FILE), "ovb_rc003"))
 # This places the photo under Resources/ inside the one-dir COLLECT output,
 # which PyInstaller exposes at runtime as sys._MEIPASS/Resources/. A source
 # checkout may still degrade if a user deletes the file after startup, but a
 # frozen candidate is incomplete without the real button-layout reference.
 datas.append((str(REMOTE_PHOTO), "Resources"))
+if not CHROMECAST_PHOTO.is_file():
+    raise SystemExit(f"required Chromecast photo is missing: {CHROMECAST_PHOTO}")
+datas.append((str(CHROMECAST_PHOTO), "Resources"))
 if QML_SOURCE_DIR.is_dir():
     # XRBM-030: the settings window's entire QML source tree is made of real
     # files on disk, not a Python module - PyInstaller's Analysis never
@@ -110,6 +194,15 @@ if QML_SOURCE_DIR.is_dir():
 if APP_ICON_DIR.is_dir():
     datas.append((str(APP_ICON_DIR), "app_icons"))
 for source_name in ELEMENT_NAVIGATION_SOURCE_FILES:
+    if NATIVE_STAGE:
+        stem = Path(source_name).stem
+        matches = [ELEMENT_NAVIGATION_SOURCE_DIR / (stem + suffix)
+                   for suffix in importlib.machinery.EXTENSION_SUFFIXES
+                   if (ELEMENT_NAVIGATION_SOURCE_DIR / (stem + suffix)).is_file()]
+        if len(matches) != 1:
+            raise SystemExit(f"required native navigation module is missing: {stem}")
+        navigation_binaries.append((str(matches[0]), "element_navigation"))
+        continue
     source_path = ELEMENT_NAVIGATION_SOURCE_DIR / source_name
     if not source_path.is_file():
         raise SystemExit(f"required element-navigation source is missing: {source_path}")
@@ -180,10 +273,37 @@ hiddenimports = [
     "ovb_rc003.frida_hid_tap_injector",
     "ovb_rc003.hid_elevation_windows",
     "ovb_rc003.hid_helper_consumers",
+    "ovb_rc003.product_identity",
+    # Chromecast Remote runs several child-process and lazy-import paths.
+    # Keep the whole first-party closure explicit: the contract test below
+    # derives this inventory from every chromecast_*.py source file, so a new
+    # runtime module cannot silently miss the frozen application.
+    "ovb_rc003.chromecast_buttons",
+    "ovb_rc003.chromecast_channel",
+    "ovb_rc003.chromecast_client",
+    "ovb_rc003.chromecast_runtime",
+    "ovb_rc003.chromecast_device_windows",
+    "ovb_rc003.chromecast_diagnostics_windows",
+    "ovb_rc003.chromecast_doubao_handsfree",
+    "ovb_rc003.chromecast_etw_windows",
+    "ovb_rc003.chromecast_hid_tap_windows",
+    "ovb_rc003.chromecast_hid_worker",
+    "ovb_rc003.chromecast_host_activity",
+    "ovb_rc003.chromecast_observation",
+    "ovb_rc003.chromecast_pipe_windows",
+    "ovb_rc003.chromecast_voice",
+    "ovb_rc003.chromecast_voice_host",
+    "ovb_rc003.voice_audio_session",
+    "ovb_rc003.voice_shortcut_session",
+    "ovb_rc003.chromecast_voice_receiver",
+    "ovb_rc003.chromecast_wetype_finish",
+    "ovb_rc003.chromecast_wetype_toggle",
+    "ovb_rc003.chromecast_worker",
     "ovb_rc003.single_instance",  # XRBM-021: imported lazily inside
     # __main__.py's _run_bridge(), same as the other lazily-imported
     # modules above.
     "frida",
+    "pefile",
     "uiautomation",
     "comtypes",
     "comtypes.client",
@@ -221,6 +341,12 @@ hiddenimports = [
     "PySide6.QtWidgets",
 ]
 
+# Native imports cannot be discovered from bytecode. Keep runtime-generated
+# imports above, and derive ordinary imports from the original source inventory.
+if NATIVE_STAGE:
+    hiddenimports = sorted(set(hiddenimports) | (set(import_closure(RC003_ROOT))
+                                                - set(NAVIGATION_MODULES)))
+
 a = Analysis(
     # XRBM-021: analyze the standalone src/launcher.py, NOT the package's
     # own src/ovb_rc003/__main__.py. PyInstaller treats its entry script as
@@ -234,7 +360,7 @@ a = Analysis(
     # main`), which needs no parent package.
     [str(SRC_ROOT / "launcher.py")],
     pathex=[str(SRC_ROOT)],
-    binaries=[],
+    binaries=navigation_binaries,
     datas=datas,
     hiddenimports=hiddenimports,
     hookspath=[],
@@ -312,14 +438,16 @@ exe = EXE(
     a.scripts,
     [],
     exclude_binaries=True,
-    name="RemoteMicRC003",
+    name=MAIN_EXECUTABLE_STEM,
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
     upx=False,
     console=False,
     icon=str(APP_ICON),
+    version=MAIN_VERSION_INFO,
     uac_admin=False,
+    contents_directory=WINDOWS_RUNTIME_DIRECTORY_NAME,
 )
 
 # The helper is deliberately a one-file executable because setup copies this
@@ -327,6 +455,17 @@ exe = EXE(
 # lifecycle, WUDFHost validation/injection code, and the pinned Gadget asset;
 # It reads only the validated remote-selection digest from user configuration;
 # UI, BLE scans, audio and configuration normalization dependencies are excluded.
+HELPER_EXCLUDES = (
+    "PySide6", "numpy", "sounddevice", "winrt", "uiautomation",
+    "ovb_rc003.app", "ovb_rc003.qt_settings_app", "ovb_rc003.ble_transport_winrt",
+    "ovb_rc003.audio_playback", "ovb_rc003.windows_diagnostics",
+    "ovb_rc003.settings_ui", "ovb_rc003.key_mapping",
+    "ovb_rc003.voice_hotkey_sync_windows", "ovb_rc003.voice_program_manager",
+)
+helper_native_imports = import_closure(
+    RC003_ROOT, ["ovb_rc003.hid_elevation_windows", "ovb_rc003.frida_hid_tap_injector"],
+    excludes=HELPER_EXCLUDES,
+) if NATIVE_STAGE else []
 helper_a = Analysis(
     [str(SRC_ROOT / "hid_helper_launcher.py")],
     pathex=[str(SRC_ROOT)],
@@ -356,6 +495,7 @@ helper_a = Analysis(
         "typing",
         "xml.etree.ElementTree",
         "ovb_rc003.hid_elevation_windows",
+        "ovb_rc003.product_identity",
         "ovb_rc003.remote_selection",
         "ovb_rc003.config",
         "ovb_rc003.frida_hid_tap_injector",
@@ -363,26 +503,11 @@ helper_a = Analysis(
         "ovb_rc003.single_instance",
         "comtypes",
         "comtypes.client",
-    ],
+    ] + helper_native_imports,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=[
-        "PySide6",
-        "numpy",
-        "sounddevice",
-        "winrt",
-        "uiautomation",
-        "ovb_rc003.app",
-        "ovb_rc003.qt_settings_app",
-        "ovb_rc003.ble_transport_winrt",
-        "ovb_rc003.audio_playback",
-        "ovb_rc003.windows_diagnostics",
-        "ovb_rc003.settings_ui",
-        "ovb_rc003.key_mapping",
-        "ovb_rc003.voice_hotkey_sync_windows",
-        "ovb_rc003.voice_program_manager",
-    ],
+    excludes=list(HELPER_EXCLUDES),
     win_no_prefer_redirects=False,
     win_private_assemblies=False,
     cipher=block_cipher,
@@ -404,6 +529,7 @@ helper_exe = EXE(
     upx=False,
     console=False,
     icon=str(APP_ICON),
+    version=HID_HELPER_VERSION_INFO,
     uac_admin=False,
 )
 

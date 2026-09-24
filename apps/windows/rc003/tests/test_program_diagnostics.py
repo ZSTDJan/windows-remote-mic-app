@@ -115,8 +115,9 @@ class ReceiverTests(unittest.TestCase):
     def test_real_entry_dry_run_has_no_desktop_or_hook(self):
         with tempfile.TemporaryDirectory() as tmp:
             output = Path(tmp) / "capture.jsonl"
-            result = subprocess.run([sys.executable, "-m", "ovb_rc003", receiver.FLAG,
-                                     "--keys", "ralt+i", "--output", str(output), "--dry-run"],
+            from tests.source_contract import entry_command
+            result = subprocess.run(entry_command(receiver.FLAG,
+                                     "--keys", "ralt+i", "--output", str(output), "--dry-run"),
                                     capture_output=True, timeout=15)
             self.assertEqual(result.returncode, 0, result.stderr)
             rows = [json.loads(x) for x in output.read_text().splitlines()]

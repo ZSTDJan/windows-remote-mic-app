@@ -17,6 +17,7 @@ from typing import Iterable, Mapping, Optional, Tuple
 from . import audio_output, resources
 
 RC003_ID = "xiaomi-rc003"
+CHROMECAST_ID = "chromecast-remote"
 DJI_MIC_2_ID = "dji-mic-2"
 
 _VALID_STATUSES = frozenset(("implemented", "research", "planned", "unsupported"))

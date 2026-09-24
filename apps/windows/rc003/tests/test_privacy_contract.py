@@ -64,6 +64,7 @@ _FORBIDDEN_BINARY_SUFFIXES = (".exe", ".dll", ".pyd", ".zip", ".xz")
 _ELEVATION_MARKER_EXEMPT_FILENAMES = frozenset(
     {
         "hid_elevation_windows.py",
+        "chromecast_pipe_windows.py",
         "vb_cable_bundle.py",
         "voice_program_manager.py",
     }
@@ -117,6 +118,20 @@ class NoForbiddenBrandingTests(unittest.TestCase):
 
 
 class NoElevationOrAutoDriverTests(unittest.TestCase):
+    def test_chromecast_elevation_uses_only_this_distribution_and_fixed_worker(self):
+        text = (_PACKAGE_ROOT / "chromecast_pipe_windows.py").read_text(encoding="utf-8")
+        tree = ast.parse(text)
+        launch = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "launch_worker")
+        self.assertEqual([arg.arg for arg in launch.args.args], ["identity", "parent"])
+        self.assertIn('info.verb, info.file = "runas", sys.executable', text)
+        self.assertIn('command += [WORKER_FLAG, str(parent.pid), str(parent.born), identity.entity, identity.generation, identity.token]', text)
+        self.assertNotIn("RequireAdministrator", text)
+        for name in ("sogou_normal_submit_test.py", "sogou_stop_probe.py"):
+            script = (_SOURCE_ROOT.parent / "scripts" / name).read_text(encoding="utf-8")
+            self.assertIn("IsUserAnAdmin", script)
+            for marker in ("runas", "ShellExecute", "RequireAdministrator", "winreg.SetValueEx"):
+                self.assertNotIn(marker, script)
+
     def test_no_admin_elevation_requested_in_source(self):
         offenders = []
         for path in _PY_FILES:
@@ -334,7 +349,16 @@ class UserControlledAutoStartTests(unittest.TestCase):
             text = path.read_text(encoding="utf-8")
             if "winreg.SetValueEx" in text or "winreg.DeleteValue" in text:
                 writers.append(path.name)
-        self.assertEqual(writers, ["startup_windows.py"])
+        self.assertEqual(sorted(writers), ["chromecast_etw_windows.py", "startup_windows.py"])
+        text = (_PACKAGE_ROOT / "chromecast_etw_windows.py").read_text(encoding="utf-8")
+        self.assertIn('_PARAMETERS_KEY = r"SYSTEM\\CurrentControlSet\\Services\\BthPort\\Parameters"', text)
+        self.assertIn('_SENSITIVE_VALUE = "EtwLogSensitiveData"', text)
+        self.assertIn('winreg.CreateKeyEx(winreg.HKEY_LOCAL_MACHINE, _PARAMETERS_KEY,', text)
+        self.assertIn('_CAPTURE_SETTINGS = {_SENSITIVE_VALUE: 1, "MaxEtwBytes": 0x400, "EtwDropLargeEvents": 0}', text)
+        self.assertIn('winreg.SetValueEx(key, name, 0, winreg.REG_DWORD, value)', text)
+        self.assertEqual(text.count("winreg.SetValueEx"), 1)
+        self.assertNotIn("winreg.DeleteValue", text)
+        self.assertNotIn("CurrentVersion\\Run", text)
 
 
 if __name__ == "__main__":

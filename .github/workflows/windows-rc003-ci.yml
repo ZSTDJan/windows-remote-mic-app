@@ -45,6 +45,8 @@ name: windows-rc003-ci
 on:
   workflow_dispatch:
   push:
+    branches:
+      - main
     tags:
       - "v[0-9]*.[0-9]*.[0-9]*"
       - "v*-windows"
@@ -206,15 +208,21 @@ jobs:
       # closes that loophole structurally: it fails the step even if some
       # future regression again produces a late, exit-code-invisible
       # warning, from this cause or any other unclosed-resource cause.
+      - name: Compile business modules with Cython
+        shell: pwsh
+        run: |
+          python build/prepare-cython-core.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
       - name: Run test suite
         shell: pwsh
         timeout-minutes: 20
         env:
-          PYTHONPATH: src
+          PYTHONPATH: build/cython-stage/src
           PYTHONUNBUFFERED: "1"
         run: |
           $logPath = "test-output.log"
-          python -u -W error::ResourceWarning -m unittest discover -s tests -t . -p "test_*.py" -v 2>&1 | Tee-Object -FilePath $logPath
+          python -u -W error::ResourceWarning build/check_native.py --stage build/cython-stage --tests 2>&1 | Tee-Object -FilePath $logPath
           $testExitCode = $LASTEXITCODE
           if ($testExitCode -ne 0) { exit $testExitCode }
 
@@ -240,19 +248,11 @@ jobs:
             }
           }
 
-      - name: Compile selected permission modules with Cython
-        shell: pwsh
-        run: |
-          python build/prepare-cython-core.py
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-
-      - name: Test compiled permission modules and HID helper
+      - name: Test compiled HID helper
         shell: pwsh
         env:
           PYTHONPATH: build/cython-stage/src
         run: |
-          python -u -W error::ResourceWarning -m unittest tests.test_hid_elevation_windows tests.test_hid_helper_consumers -v
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           python build/cython-stage/src/hid_helper_launcher.py --self-check
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
@@ -264,8 +264,7 @@ jobs:
           $rc003Root = (Resolve-Path ".").Path
           $repoRoot = (Resolve-Path "../../..").Path
           $buildRoot = Join-Path $rc003Root "dist/RemoteMicRC003"
-          $provenancePath = Get-RC003BuildProvenancePath -BuildRoot $buildRoot
-          Remove-Item -LiteralPath $provenancePath -Force -ErrorAction SilentlyContinue
+          $provenancePath = Clear-RC003BuildProvenance -RC003Root $rc003Root -BuildRoot $buildRoot -PythonExecutable "python"
           git -C $repoRoot diff --exit-code -- apps/windows/rc003 .github/workflows/windows-rc003-ci.yml Resources/RC003-remote-photo.png device-profiles
           if ($LASTEXITCODE -ne 0) {
             throw "tracked build or test inputs changed after their CI checks ran"
@@ -313,6 +312,8 @@ jobs:
           $rc003Root = (Resolve-Path ".").Path
           $repoRoot = (Resolve-Path "../../..").Path
           $buildRoot = Join-Path $rc003Root "dist/RemoteMicRC003"
+          $productPresentation = Get-RC003ProductPresentation -RC003Root $rc003Root -PythonExecutable "python"
+          $builtPaths = Get-RC003BuildProductPaths -RC003Root $rc003Root -BuildRoot $buildRoot -PythonExecutable "python"
           $inputStatePath = Join-Path $env:RUNNER_TEMP "rc003-build-input.json"
           if (-not (Test-Path -LiteralPath $inputStatePath -PathType Leaf)) {
             throw "expected pre-build input fingerprint not found"
@@ -326,18 +327,18 @@ jobs:
             throw "build inputs changed before frozen checks"
           }
 
-          $builtExe = "dist/RemoteMicRC003/RemoteMicRC003.exe"
+          $builtExe = $builtPaths.MainExecutable
           if (-not (Test-Path $builtExe)) {
             Write-Error "expected built executable not found: $builtExe"
             exit 1
           }
-          $builtHidHelper = "dist/RemoteMicRC003/_internal/RemoteMicRC003HidHelper.exe"
+          $builtHidHelper = $builtPaths.HidHelper
           if (-not (Test-Path $builtHidHelper)) {
             Write-Error "expected narrow HID helper not found: $builtHidHelper"
             exit 1
           }
           $sourceVersion = (Get-Content -LiteralPath "src/ovb_rc003/VERSION" -Raw).Trim()
-          $builtVersionFile = "dist/RemoteMicRC003/_internal/ovb_rc003/VERSION"
+          $builtVersionFile = $builtPaths.VersionFile
           if (-not (Test-Path $builtVersionFile)) {
             Write-Error "expected built VERSION file not found: $builtVersionFile"
             exit 1
@@ -347,19 +348,11 @@ jobs:
             Write-Error "built VERSION mismatch: source=$sourceVersion built=$builtVersion"
             exit 1
           }
-          $builtPackageRoot = Split-Path $builtVersionFile -Parent
-          foreach ($compiledModuleName in @("hid_elevation_windows", "hid_helper_consumers")) {
-            $compiledMatches = @(
-              Get-ChildItem -LiteralPath $builtPackageRoot -File -Filter "${compiledModuleName}*.pyd"
-            )
-            if ($compiledMatches.Count -ne 1) {
-              Write-Error "expected one compiled $compiledModuleName extension in frozen output"
-              exit 1
-            }
-          }
+          python build/check_native.py --stage build/cython-stage --artifact dist/RemoteMicRC003
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $rootExecutables = @(Get-ChildItem -LiteralPath "dist/RemoteMicRC003" -Force -Filter "*.exe" -File)
-          if ($rootExecutables.Count -ne 1 -or $rootExecutables[0].Name -ne "RemoteMicRC003.exe") {
-            Write-Error "build root must expose only RemoteMicRC003.exe"
+          if ($rootExecutables.Count -ne 1 -or $rootExecutables[0].Name -cne [string]$productPresentation.main_executable_name) {
+            Write-Error "build root must expose only $($productPresentation.main_executable_name)"
             exit 1
           }
           Invoke-FrozenExecutableCheck -FilePath $builtHidHelper -ArgumentList @("--self-check") -Step "$builtHidHelper --self-check"
@@ -375,17 +368,20 @@ jobs:
           ) {
             throw "build inputs changed while frozen checks were running"
           }
-          Write-RC003BuildProvenance -RC003Root $rc003Root -RepoRoot $repoRoot -BuildRoot $buildRoot -InputState $inputState | Out-Null
-          Assert-RC003BuildProvenance -RC003Root $rc003Root -RepoRoot $repoRoot -BuildRoot $buildRoot | Out-Null
+          Assert-RC003ExecutableMetadata -RC003Root $rc003Root -BuildRoot $buildRoot -PythonExecutable "python"
+          Write-RC003BuildProvenance -RC003Root $rc003Root -RepoRoot $repoRoot -BuildRoot $buildRoot -InputState $inputState -ExecutableMetadataVerified -PythonExecutable "python" | Out-Null
+          Assert-RC003BuildProvenance -RC003Root $rc003Root -RepoRoot $repoRoot -BuildRoot $buildRoot -PythonExecutable "python" | Out-Null
 
       - name: Package deterministic unsigned release directory (ZIP + SHA256SUMS)
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
           . ./build/build-provenance.ps1
+          . ./build/portable-layout.ps1
           $rc003Root = (Resolve-Path ".").Path
           $repoRoot = (Resolve-Path "../../..").Path
           $buildRoot = Join-Path $rc003Root "dist/RemoteMicRC003"
+          $productPresentation = Get-RC003ProductPresentation -RC003Root $rc003Root -PythonExecutable "python"
           $initialBuildProvenance = Assert-RC003BuildProvenance -RC003Root $rc003Root -RepoRoot $repoRoot -BuildRoot $buildRoot
 
           # "Deterministic" here means deterministic, non-random/non-timestamped
@@ -415,7 +411,10 @@ jobs:
           # is given the staging FOLDER itself (not a "/*" content glob), so
           # the resulting ZIP has exactly one top-level versioned folder to
           # extract into - never loose files scattered at the archive root.
-          $stagingName = "RemoteMicRC003-$version"
+          if ([string]$productPresentation.version -cne $version) {
+            throw "product presentation VERSION mismatch"
+          }
+          $stagingName = [string]$productPresentation.portable_folder_name
           $stagingDir = "dist/portable/$stagingName"
           if (Test-Path $stagingDir) { Remove-Item $stagingDir -Recurse -Force }
           New-Item -ItemType Directory -Force -Path $stagingDir | Out-Null
@@ -424,15 +423,18 @@ jobs:
           $stagedBuildProvenance = Assert-RC003BuildProvenance -RC003Root $rc003Root -RepoRoot $repoRoot -BuildRoot $stagingDir
           Assert-RC003BuildProvenanceMatches -Expected $initialBuildProvenance -Actual $stagedBuildProvenance -Context "CI staged build verification"
 
-          Copy-Item -Path "../../../LICENSE.md" -Destination (Join-Path $stagingDir "LICENSE.txt") -Force
-          Copy-Item -Path "../../../COPYRIGHT.md" -Destination (Join-Path $stagingDir "COPYRIGHT.txt") -Force
-          Copy-Item -Path "../../../THIRD_PARTY_NOTICES.md" -Destination (Join-Path $stagingDir "THIRD_PARTY_NOTICES.md") -Force
-          Copy-Item -Path "../../../THIRD_PARTY_SOURCE.md" -Destination (Join-Path $stagingDir "THIRD_PARTY_SOURCE.md") -Force
-          Copy-Item -Path "../../../ASSET_LICENSES.md" -Destination (Join-Path $stagingDir "ASSET_LICENSES.md") -Force
-          Copy-Item -Path "../../../THIRD_PARTY_LICENSES" -Destination (Join-Path $stagingDir "THIRD_PARTY_LICENSES") -Recurse -Force
-          Copy-Item -Path "ATTRIBUTION.md" -Destination (Join-Path $stagingDir "ATTRIBUTION.md") -Force
-          Copy-Item -Path "installer/readme-portable-rc003.txt" -Destination (Join-Path $stagingDir "README.txt") -Force
+          $documentationDir = Join-Path $stagingDir ([string]$productPresentation.documentation_directory_name)
+          New-Item -ItemType Directory -Force -Path $documentationDir | Out-Null
+          Copy-Item -Path "../../../LICENSE.md" -Destination (Join-Path $documentationDir "LICENSE.txt") -Force
+          Copy-Item -Path "../../../COPYRIGHT.md" -Destination (Join-Path $documentationDir "COPYRIGHT.txt") -Force
+          Copy-Item -Path "../../../THIRD_PARTY_NOTICES.md" -Destination (Join-Path $documentationDir "THIRD_PARTY_NOTICES.md") -Force
+          Copy-Item -Path "../../../THIRD_PARTY_SOURCE.md" -Destination (Join-Path $documentationDir "THIRD_PARTY_SOURCE.md") -Force
+          Copy-Item -Path "../../../ASSET_LICENSES.md" -Destination (Join-Path $documentationDir "ASSET_LICENSES.md") -Force
+          Copy-Item -Path "../../../THIRD_PARTY_LICENSES" -Destination (Join-Path $documentationDir "THIRD_PARTY_LICENSES") -Recurse -Force
+          Copy-Item -Path "ATTRIBUTION.md" -Destination (Join-Path $documentationDir "ATTRIBUTION.md") -Force
+          Copy-Item -Path "installer/readme-portable-rc003.txt" -Destination (Join-Path $documentationDir ([string]$productPresentation.portable_readme_name)) -Force
 
+          Assert-RC003PortableStagingRoot -StagingDirectory $stagingDir -ProductPresentation $productPresentation
           $zipPath = "dist/portable/无线麦-Windows-$version-免安装.zip"
           if (Test-Path $zipPath) { Remove-Item $zipPath -Force }
 
@@ -455,25 +457,37 @@ jobs:
             exit 1
           }
 
+          Assert-RC003PortableZip `
+            -ZipPath (Resolve-Path $zipPath).Path `
+            -TopLevelName $stagingName `
+            -ExpectedVersion $version `
+            -StagingDirectory $stagingDir `
+            -ProductPresentation $productPresentation
+
           Add-Type -AssemblyName System.IO.Compression.FileSystem
           $archive = [System.IO.Compression.ZipFile]::OpenRead((Resolve-Path $zipPath).Path)
           try {
+            $archiveEntries = @{}
             $archiveFiles = @{}
             foreach ($entry in $archive.Entries) {
               $entryName = $entry.FullName.Replace(
                 [System.IO.Path]::DirectorySeparatorChar,
                 [char]'/'
               )
-              if (-not $entryName -or $entryName.EndsWith('/')) {
+              if (-not $entryName) {
                 continue
               }
-              if ($archiveFiles.ContainsKey($entryName)) {
-                Write-Error "portable ZIP contains a duplicate file entry: $entryName"
+              if ($archiveEntries.ContainsKey($entryName)) {
+                Write-Error "portable ZIP contains a duplicate entry: $entryName"
                 exit 1
+              }
+              $archiveEntries[$entryName] = $entry
+              if ($entryName.EndsWith('/')) {
+                continue
               }
               $archiveFiles[$entryName] = $entry
             }
-            $entryNames = @($archiveFiles.Keys)
+            $entryNames = @($archiveEntries.Keys)
             $topLevels = @(
               $entryNames |
                 ForEach-Object { $_.Split('/')[0] } |
@@ -488,22 +502,41 @@ jobs:
                 $_ -match ('^' + [regex]::Escape($stagingName) + '/[^/]+\.exe$')
               }
             )
-            $expectedMainEntry = "$stagingName/RemoteMicRC003.exe"
+            $rootEntries = @(
+              $entryNames |
+                ForEach-Object {
+                  $relativeName = $_.Substring($stagingName.Length).TrimStart('/').TrimEnd('/')
+                  if ($relativeName) {
+                    $relativeName.Split('/')[0]
+                  }
+                } |
+                Sort-Object -Unique
+            )
+            $expectedRootEntries = @(
+              [string]$productPresentation.main_executable_name,
+              [string]$productPresentation.runtime_directory_name,
+              [string]$productPresentation.documentation_directory_name
+            ) | Sort-Object
+            if (Compare-Object -ReferenceObject $expectedRootEntries -DifferenceObject ($rootEntries | Sort-Object) -CaseSensitive) {
+              Write-Error "portable ZIP root must contain exactly the main executable, runtime directory, and documentation directory"
+              exit 1
+            }
+            $expectedMainEntry = "$stagingName/$($productPresentation.main_executable_name)"
             if ($rootExecutables.Count -ne 1 -or $rootExecutables[0] -ne $expectedMainEntry) {
               Write-Error "portable ZIP root must expose only $expectedMainEntry"
               exit 1
             }
-            $helperEntryName = "$stagingName/_internal/RemoteMicRC003HidHelper.exe"
+            $helperEntryName = "$stagingName/$($productPresentation.runtime_directory_name)/$($productPresentation.hid_helper_executable_name)"
             if (-not $archiveFiles.ContainsKey($helperEntryName)) {
               Write-Error "portable ZIP is missing the internal HID helper"
               exit 1
             }
-            $versionEntryName = "$stagingName/_internal/ovb_rc003/VERSION"
+            $versionEntryName = "$stagingName/$($productPresentation.runtime_directory_name)/ovb_rc003/VERSION"
             if (-not $archiveFiles.ContainsKey($versionEntryName)) {
               Write-Error "portable ZIP is missing the frozen VERSION file"
               exit 1
             }
-            $provenanceEntryName = "$stagingName/_internal/build-provenance.json"
+            $provenanceEntryName = "$stagingName/$($productPresentation.runtime_directory_name)/build-provenance.json"
             if (-not $archiveFiles.ContainsKey($provenanceEntryName)) {
               Write-Error "portable ZIP is missing the build provenance file"
               exit 1

@@ -54,8 +54,10 @@ FAILED_HID_TAP_STATES = frozenset(
         "stopped",
     }
 )
-READY_RAW_INPUT_STATES = frozenset({"ready"})
+READY_RAW_INPUT_STATES = frozenset({"ready", "chromecast_ready"})
 READY_HID_TAP_STATES = frozenset({"attached_waiting_for_hid_io", "ready"})
+RC003_PROFILE = "xiaomi-rc003"
+CHROMECAST_PROFILE = "chromecast-remote"
 VOICE_RUNTIME_NOT_TESTED = "not_tested"
 VOICE_RUNTIME_ACTIVE = "active"
 VOICE_RUNTIME_MIC_CONFIRMED = "mic_confirmed"
@@ -102,6 +104,7 @@ class BridgeRuntimeStatus:
     voice_runtime_state: str = VOICE_RUNTIME_NOT_TESTED
     voice_runtime_provider: str = ""
     voice_runtime_updated_at: Optional[float] = None
+    battery_level: Optional[int] = None
 
 
 def current_runtime_identity(
@@ -222,6 +225,32 @@ def input_channels_ready(status: BridgeRuntimeStatus) -> bool:
     )
 
 
+def button_receiver_usable(
+    profile: str,
+    *,
+    raw_input_state: str,
+    hid_tap_state: str,
+    voice_key_physicalizer_state: str,
+) -> bool:
+    """Return whether the selected profile's complete button path is usable.
+
+    RC003 interception is usable as soon as the acknowledged HID lease is
+    armed. The first report still passes through the normal report/source
+    validation in ``app.py``; it is not a setup action. Chromecast has its own
+    receiver and must not inherit RC003 helper requirements.
+    """
+
+    if profile == CHROMECAST_PROFILE:
+        return raw_input_state == "chromecast_ready"
+    if profile != RC003_PROFILE:
+        return False
+    return (
+        raw_input_state == "ready"
+        and hid_tap_state in READY_HID_TAP_STATES
+        and voice_key_physicalizer_state == "ready"
+    )
+
+
 def publish_status(
     config_root: Path,
     state: BridgeConnectionState,
@@ -237,6 +266,7 @@ def publish_status(
     voice_runtime_state: str = VOICE_RUNTIME_NOT_TESTED,
     voice_runtime_provider: str = "",
     voice_runtime_updated_at: Optional[float] = None,
+    battery_level: Optional[int] = None,
     session_id: Optional[int] = None,
     now: Callable[[], float] = time.time,
 ) -> BridgeRuntimeStatus:
@@ -248,6 +278,13 @@ def publish_status(
         last_button_at = float(last_button_at)
     if voice_runtime_updated_at is not None:
         voice_runtime_updated_at = float(voice_runtime_updated_at)
+    if battery_level is not None:
+        if (
+            not isinstance(battery_level, int)
+            or isinstance(battery_level, bool)
+            or not 0 <= battery_level <= 100
+        ):
+            raise ValueError("battery_level must be an integer from 0 to 100")
     status = BridgeRuntimeStatus(
         schema=SCHEMA_VERSION,
         state=BridgeConnectionState(state),
@@ -266,6 +303,7 @@ def publish_status(
         voice_runtime_state=str(voice_runtime_state),
         voice_runtime_provider=str(voice_runtime_provider),
         voice_runtime_updated_at=voice_runtime_updated_at,
+        battery_level=battery_level,
     )
     path = status_path(config_root, session_id=session_id)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -293,6 +331,7 @@ def publish_status(
                     "voice_runtime_state": status.voice_runtime_state,
                     "voice_runtime_provider": status.voice_runtime_provider,
                     "voice_runtime_updated_at": status.voice_runtime_updated_at,
+                    "battery_level": status.battery_level,
                 },
                 ensure_ascii=True,
                 sort_keys=True,
@@ -377,6 +416,16 @@ def _read_status_file(path: Path) -> Optional[BridgeRuntimeStatus]:
         or isinstance(voice_runtime_updated_at, bool)
     ):
         return None
+    battery_level = payload.get("battery_level")
+    if (
+        battery_level is not None
+        and (
+            not isinstance(battery_level, int)
+            or isinstance(battery_level, bool)
+            or not 0 <= battery_level <= 100
+        )
+    ):
+        battery_level = None
     return BridgeRuntimeStatus(
         schema=schema,
         state=state,
@@ -403,6 +452,7 @@ def _read_status_file(path: Path) -> Optional[BridgeRuntimeStatus]:
             if voice_runtime_updated_at is None
             else float(voice_runtime_updated_at)
         ),
+        battery_level=battery_level,
     )
 
 

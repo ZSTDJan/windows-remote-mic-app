@@ -142,15 +142,17 @@ def _require_windows() -> None:
         )
 
 
-def enumerate_matching_device_paths() -> List[str]:
+def enumerate_matching_device_paths(*, matches=None) -> List[str]:
     """Return every currently attached Raw-Input-visible device path whose
-    VID/PID matches the RC003 (see hid_identity.device_path_matches_rc003).
+    matches the supplied predicate; the default remains RC003 VID/PID matching.
 
     Uses the standard two-pass GetRawInputDeviceList pattern. Windows-only;
     raises RawInputUnavailableError elsewhere.
     """
 
     _require_windows()
+
+    matches = matches or hid_identity.device_path_matches_rc003
 
     RIDI_DEVICENAME = 0x20000007
 
@@ -190,7 +192,7 @@ def enumerate_matching_device_paths() -> List[str]:
     for index in range(written if isinstance(written, int) else count.value):
         device_handle = device_list[index].hDevice
         path = _get_device_name(user32, device_handle, RIDI_DEVICENAME)
-        if path and hid_identity.device_path_matches_rc003(path):
+        if path and matches(path):
             paths.append(path)
     return paths
 
@@ -622,7 +624,7 @@ class RawInputButtonListener:
 
     def start(
         self,
-        device_path: str,
+        device_path: Optional[str],
         *,
         start_timeout: float = _DEFAULT_START_TIMEOUT_SECONDS,
         _run_target: Optional[Callable[[], None]] = None,
@@ -630,6 +632,10 @@ class RawInputButtonListener:
         """Starts the background message-loop thread scoped to
         ``device_path`` (the single device path the caller already resolved
         via enumerate_matching_device_paths + hid_identity.select_single_device_path).
+
+        None explicitly selects keyboard-safety-only mode: register keyboard
+        input, track physical ownership, and never decode a remote button.
+        This mode needs no RC003 device or device selection.
 
         Fail-closed on startup timeout (XRBM-014 review round 2 P1 #3): a
         stall waiting for ``_ready_event`` used to be silently treated as
@@ -659,7 +665,9 @@ class RawInputButtonListener:
         if _run_target is None:
             _require_windows()
         self._device_path = device_path
-        self._normalized_device_path = hid_identity.normalize_device_path(device_path)
+        self._normalized_device_path = (
+            hid_identity.normalize_device_path(device_path) if device_path is not None else None
+        )
         self._selected_device_handles.clear()
         self._raw_input_header_healthy = True
         self._class_name = f"RemoteMicRC003RawInputWindow-{uuid.uuid4().hex}"
@@ -1125,8 +1133,9 @@ class RawInputButtonListener:
             )
             user32.RegisterRawInputDevices.restype = wintypes.BOOL
 
-            devices = (RAWINPUTDEVICE * len(RAW_INPUT_USAGE_PAGES))()
-            for index, (usage_page, usage) in enumerate(RAW_INPUT_USAGE_PAGES):
+            usages = RAW_INPUT_USAGE_PAGES if self._device_path is not None else ((0x01, 0x06),)
+            devices = (RAWINPUTDEVICE * len(usages))()
+            for index, (usage_page, usage) in enumerate(usages):
                 devices[index] = RAWINPUTDEVICE(
                     usUsagePage=usage_page,
                     usUsage=usage,
@@ -1323,7 +1332,8 @@ class RawInputButtonListener:
                 )
             return
         normalized_device_path = hid_identity.normalize_device_path(device_path)
-        selected_device = normalized_device_path == self._normalized_device_path
+        selected_device = (self._normalized_device_path is not None
+                           and normalized_device_path == self._normalized_device_path)
         rc003_device = hid_identity.device_path_matches_rc003(device_path)
         physical_keyboard = (
             packet_type == RIM_TYPEKEYBOARD

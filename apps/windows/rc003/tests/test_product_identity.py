@@ -1,4 +1,7 @@
 import inspect
+import json
+import subprocess
+import sys
 import unittest
 from pathlib import Path
 
@@ -17,6 +20,125 @@ _RC003_ROOT = Path(__file__).resolve().parents[1]
 
 
 class ProductIdentityTests(unittest.TestCase):
+    def test_windows_portable_presentation_uses_full_version(self):
+        version = "1.0.51-candidate.51"
+        self.assertEqual(
+            product_identity.windows_presentation_label(version),
+            "无线麦 win版 1.0.51-candidate.51",
+        )
+        self.assertEqual(
+            product_identity.windows_executable_name(version),
+            "无线麦 win版 1.0.51-candidate.51.exe",
+        )
+        self.assertEqual(
+            product_identity.windows_portable_folder_name(version),
+            "无线麦 win版 1.0.51-candidate.51",
+        )
+        self.assertEqual(
+            product_identity.windows_fixed_file_version(version),
+            (1, 0, 51, 0),
+        )
+        self.assertTrue(product_identity.windows_version_is_prerelease(version))
+
+    def test_windows_executable_recognition_is_exact_and_layout_aware(self):
+        cases = {
+            "RemoteMicRC003.exe": "legacy",
+            "REMOTEMICRC003.EXE": "legacy",
+            "无线麦 win版 1.0.51-candidate.51.exe": "current",
+            "无线麦 WIN版 1.0.51-candidate.51.EXE": "current",
+            "无线麦 win版 1.0.51.exe": "current",
+        }
+        for name, layout in cases.items():
+            with self.subTest(name=name):
+                self.assertEqual(
+                    product_identity.recognized_windows_executable_layout(name),
+                    layout,
+                )
+
+        for name in (
+            "RemoteMicRC003-old.exe",
+            "无线麦 win版.exe",
+            "无线麦 win版 1.0.exe",
+            "无线麦 win版 01.0.51.exe",
+            "无线麦 win版 1.0.51-.exe",
+            "C:\\Apps\\无线麦 win版 1.0.51.exe",
+            "..\\无线麦 win版 1.0.51.exe",
+            "无线麦 win版 1.0.51.exe.bak",
+        ):
+            with self.subTest(name=name):
+                self.assertIsNone(
+                    product_identity.recognized_windows_executable_layout(name)
+                )
+
+        self.assertEqual(
+            product_identity.windows_runtime_relative_directory_for_executable(
+                "RemoteMicRC003.exe"
+            ),
+            Path("_internal"),
+        )
+        self.assertEqual(
+            product_identity.windows_runtime_relative_directory_for_executable(
+                "无线麦 win版 1.0.51-candidate.51.exe"
+            ),
+            Path("程序文件"),
+        )
+
+    def test_windows_version_rejects_unsafe_or_unrepresentable_values(self):
+        for version in (
+            " 1.0.51",
+            "1.0",
+            "1.0.51-",
+            "1.0.51/other",
+            "1.0.51\\other",
+            "01.0.51",
+            "1.0.51-candidate..51",
+        ):
+            with self.subTest(version=version):
+                with self.assertRaises(ValueError):
+                    product_identity.validate_version(version)
+        with self.assertRaises(ValueError):
+            product_identity.windows_fixed_file_version("65536.0.0")
+
+    def test_build_adapter_exports_ascii_json_from_the_same_contract(self):
+        script = _RC003_ROOT / "build" / "product-presentation.py"
+        completed = subprocess.run(
+            [
+                sys.executable,
+                str(script),
+                "--source-root",
+                str(_RC003_ROOT / "src"),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+            encoding="ascii",
+        )
+        payload = json.loads(completed.stdout)
+        version = (
+            _RC003_ROOT / "src" / "ovb_rc003" / "VERSION"
+        ).read_text(encoding="ascii").strip()
+        self.assertEqual(payload["version"], version)
+        self.assertEqual(
+            payload["main_executable_name"],
+            product_identity.windows_executable_name(version),
+        )
+        self.assertEqual(payload["runtime_directory_name"], "程序文件")
+        self.assertEqual(payload["documentation_directory_name"], "说明与许可")
+        self.assertEqual(payload["portable_readme_name"], "使用说明.txt")
+        self.assertTrue(completed.stdout.isascii())
+
+    def test_windows_version_metadata_distinguishes_main_and_helper(self):
+        main = product_identity.windows_main_version_metadata("1.0.51-candidate.51")
+        helper = product_identity.windows_hid_helper_version_metadata(
+            "1.0.51-candidate.51"
+        )
+        self.assertEqual(main["file_description"], "无线麦 win版 1.0.51-candidate.51")
+        self.assertEqual(main["original_filename"], "无线麦 win版 1.0.51-candidate.51.exe")
+        self.assertEqual(main["internal_name"], "RemoteMicRC003")
+        self.assertEqual(helper["file_description"], "无线麦 权限助手")
+        self.assertEqual(helper["original_filename"], "RemoteMicRC003HidHelper.exe")
+        self.assertTrue(main["prerelease"])
+
     def test_user_visible_name_has_one_runtime_source(self):
         self.assertEqual(product_identity.DISPLAY_NAME, "无线麦")
         self.assertEqual(
@@ -54,15 +176,17 @@ class ProductIdentityTests(unittest.TestCase):
         for text in (
             read_result.message,
             save_result.message,
-            voice_program_manager.status_text(disabled_status),
         ):
             self.assertIn(product_identity.DISPLAY_NAME, text)
             self.assertNotIn("Remote Mic", text)
+        self.assertEqual(voice_program_manager.status_text(disabled_status),
+                         "请选择语音程序；未配置时仅普通按键可用。")
 
     def test_qml_reads_the_controller_identity_instead_of_copying_the_name(self):
         qml_dir = _RC003_ROOT / "src" / "ovb_rc003" / "qml"
         main_qml = (qml_dir / "main.qml").read_text(encoding="utf-8")
         self.assertIn("SettingsController.applicationDisplayName", main_qml)
+        self.assertIn("SettingsController.applicationPresentationLabel", main_qml)
 
         voice_qml = (qml_dir / "VoicePage.qml").read_text(encoding="utf-8")
         self.assertNotIn("Remote Mic", voice_qml)
@@ -70,8 +194,10 @@ class ProductIdentityTests(unittest.TestCase):
         device_qml = (qml_dir / "DevicePage.qml").read_text(encoding="utf-8")
         self.assertNotIn("Remote Mic", device_qml)
 
-        self.assertIn("arg(SettingsController.applicationDisplayName)", main_qml)
-        self.assertIn("arg(SettingsController.applicationVersion)", main_qml)
+        self.assertIn(
+            "title: SettingsController.applicationPresentationLabel", main_qml
+        )
+        self.assertNotIn('title: "%1 · %2"', main_qml)
         self.assertNotIn(qt_settings_app.__version__, main_qml)
         self.assertNotIn('title: qsTr("%1 设置")', main_qml)
 

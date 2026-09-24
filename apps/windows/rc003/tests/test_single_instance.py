@@ -9,7 +9,7 @@ without fighting the platform gate (see single_instance.py's docstring).
 """
 
 import ctypes
-import inspect
+from tests.source_contract import source_text
 import json
 import sys
 import tempfile
@@ -713,7 +713,7 @@ class SettingsWindowActivationTests(unittest.TestCase):
         )
 
     def test_current_runtime_real_activation_requires_the_qt_restore_path(self):
-        source = inspect.getsource(
+        source = source_text(
             single_instance._real_request_marked_window_restore
         )
         self.assertIn("_require_restore_request=True", source)
@@ -1316,7 +1316,7 @@ class MutexCtypesPrototypeTests(unittest.TestCase):
         self.assertEqual(ctypes.sizeof(wintypes.HANDLE), ctypes.sizeof(ctypes.c_void_p))
 
     def test_create_mutex_declares_the_full_real_prototype(self):
-        source = inspect.getsource(single_instance._real_create_mutex)
+        source = source_text(single_instance._real_create_mutex)
         self.assertIn("CreateMutexW.argtypes", source)
         self.assertIn("CreateMutexW.restype", source)
         for token in ("wintypes.LPVOID", "wintypes.BOOL", "wintypes.LPCWSTR", "wintypes.HANDLE"):
@@ -1327,7 +1327,7 @@ class MutexCtypesPrototypeTests(unittest.TestCase):
         # a use_last_error=True WinDLL handle immediately after
         # CreateMutexW, inside the SAME function - never via a separate,
         # later, independently-callable GetLastError wrapper.
-        source = inspect.getsource(single_instance._real_create_mutex)
+        source = source_text(single_instance._real_create_mutex)
         self.assertIn("use_last_error=True", source)
         self.assertIn("ctypes.get_last_error()", source)
         self.assertNotIn("windll.kernel32", source)  # must use the WinDLL(...) form, not the shared cache
@@ -1340,28 +1340,28 @@ class MutexCtypesPrototypeTests(unittest.TestCase):
         self.assertFalse(hasattr(single_instance, "GetLastErrorFn"))
 
     def test_release_mutex_declares_the_full_real_prototype(self):
-        source = inspect.getsource(single_instance._real_release_mutex)
+        source = source_text(single_instance._real_release_mutex)
         self.assertIn("ReleaseMutex.argtypes", source)
         self.assertIn("ReleaseMutex.restype", source)
         self.assertIn("wintypes.HANDLE", source)
         self.assertIn("wintypes.BOOL", source)
 
     def test_close_handle_declares_the_full_real_prototype(self):
-        source = inspect.getsource(single_instance._real_close_handle)
+        source = source_text(single_instance._real_close_handle)
         self.assertIn("CloseHandle.argtypes", source)
         self.assertIn("CloseHandle.restype", source)
         self.assertIn("wintypes.HANDLE", source)
         self.assertIn("wintypes.BOOL", source)
 
     def test_message_box_declares_the_full_real_prototype(self):
-        source = inspect.getsource(single_instance._real_message_box)
+        source = source_text(single_instance._real_message_box)
         self.assertIn("MessageBoxW.argtypes", source)
         self.assertIn("MessageBoxW.restype", source)
         for token in ("wintypes.HWND", "wintypes.LPCWSTR", "wintypes.UINT"):
             self.assertIn(token, source)
 
     def test_settings_window_marker_declares_the_full_real_prototype(self):
-        source = inspect.getsource(
+        source = source_text(
             single_instance._real_set_window_property_value
         )
         self.assertIn("SetPropW.argtypes", source)
@@ -1370,7 +1370,7 @@ class MutexCtypesPrototypeTests(unittest.TestCase):
             self.assertIn(token, source)
 
     def test_settings_window_activation_declares_pointer_safe_prototypes(self):
-        source = inspect.getsource(single_instance._real_activate_marked_window)
+        source = source_text(single_instance._real_activate_marked_window)
         for api in (
             "EnumWindows",
             "GetPropW",

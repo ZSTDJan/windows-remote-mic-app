@@ -53,7 +53,8 @@ Rectangle {
             }
             UiLabel {
                 id: descriptionLabel
-                objectName: root.descriptionObjectName
+                objectName: root.descriptionObjectName.length > 0
+                    ? root.descriptionObjectName : root.objectName + "_descriptionLabel"
                 tokens: root.tokens
                 kind: noteKind
                 Layout.row: root.inlineDescription ? 0 : 1
@@ -81,12 +82,9 @@ Rectangle {
         }
     }
 
-    Rectangle {
+    SettingsRowDivider {
+        objectName: root.objectName + "_divider"
+        tokens: root.tokens
         visible: root.showDivider
-        anchors.left: parent.left
-        anchors.right: parent.right
-        anchors.bottom: parent.bottom
-        height: root.tokens.hairlineWidth
-        color: root.tokens.border
     }
 }

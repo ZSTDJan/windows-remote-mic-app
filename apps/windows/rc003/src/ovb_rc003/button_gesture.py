@@ -177,6 +177,7 @@ TimerFactory = Callable[[float, Callable[[], None]], object]
 ActionConfigured = Callable[[str, ButtonTrigger], bool]
 TriggerCallback = Callable[[str, ButtonTrigger], None]
 RepeatableCallback = Callable[[str], bool]
+RepeatIntervalCallback = Callable[[str, int], float]
 IdleCallback = Callable[[], None]
 DiagnosticCallback = Callable[..., None]
 
@@ -203,6 +204,7 @@ class ButtonGestureDispatcher:
         is_action_configured: ActionConfigured,
         is_repeatable: RepeatableCallback,
         on_trigger: TriggerCallback,
+        repeat_interval_for: Optional[RepeatIntervalCallback] = None,
         on_idle: Optional[IdleCallback] = None,
         on_diagnostic: Optional[DiagnosticCallback] = None,
         timer_factory: Optional[TimerFactory] = None,
@@ -210,6 +212,7 @@ class ButtonGestureDispatcher:
     ) -> None:
         self._is_action_configured = is_action_configured
         self._is_repeatable = is_repeatable
+        self._repeat_interval_for = repeat_interval_for
         self._on_trigger = on_trigger
         self._on_idle = on_idle
         self._on_diagnostic = on_diagnostic
@@ -229,6 +232,7 @@ class ButtonGestureDispatcher:
         self._repeat_timer_tokens: Dict[str, object] = {}
         self._hold_timer_tokens: Dict[str, object] = {}
         self._repeat_hold_tokens: Dict[str, object] = {}
+        self._repeat_counts: Dict[str, int] = {}
         self._held_immediate_buttons: Set[str] = set()
         self._blocked_until_release_buttons: Set[str] = set()
         self._callback_reservations: Set[object] = set()
@@ -260,6 +264,7 @@ class ButtonGestureDispatcher:
                 elif self._is_repeatable(button_id):
                     hold_token = object()
                     self._repeat_hold_tokens[button_id] = hold_token
+                    self._repeat_counts[button_id] = 0
                     if not self._schedule_repeat_locked(
                         button_id,
                         self.REPEAT_DELAY_SECONDS,
@@ -301,6 +306,7 @@ class ButtonGestureDispatcher:
                 return
             self._held_immediate_buttons.discard(button_id)
             self._repeat_hold_tokens.pop(button_id, None)
+            self._repeat_counts.pop(button_id, None)
             self._cancel_timer_locked(
                 self._repeat_timers,
                 self._repeat_timer_tokens,
@@ -331,6 +337,7 @@ class ButtonGestureDispatcher:
                 timers.clear()
                 tokens.clear()
             self._repeat_hold_tokens.clear()
+            self._repeat_counts.clear()
             self._held_immediate_buttons.clear()
             self._blocked_until_release_buttons.clear()
             self._button_generations.clear()
@@ -355,6 +362,7 @@ class ButtonGestureDispatcher:
                 self._held_immediate_buttons.discard(button_id)
                 self._blocked_until_release_buttons.discard(button_id)
                 self._repeat_hold_tokens.pop(button_id, None)
+                self._repeat_counts.pop(button_id, None)
                 for timers, tokens in (
                     (self._double_timers, self._double_timer_tokens),
                     (self._long_timers, self._long_timer_tokens),
@@ -545,6 +553,7 @@ class ButtonGestureDispatcher:
     def _rollback_button_hold_locked(self, button_id: str) -> None:
         self._held_immediate_buttons.discard(button_id)
         self._repeat_hold_tokens.pop(button_id, None)
+        self._repeat_counts.pop(button_id, None)
         for timers, tokens in (
             (self._double_timers, self._double_timer_tokens),
             (self._long_timers, self._long_timer_tokens),
@@ -667,8 +676,12 @@ class ButtonGestureDispatcher:
                 if self._repeat_hold_tokens.get(button_id) is hold_token:
                     self._repeat_hold_tokens.pop(button_id, None)
             else:
+                repeat_count = self._repeat_counts.get(button_id, 0) + 1
+                self._repeat_counts[button_id] = repeat_count
                 interval = (
-                    self.BACK_REPEAT_INTERVAL_SECONDS
+                    self._repeat_interval_for(button_id, repeat_count)
+                    if self._repeat_interval_for is not None
+                    else self.BACK_REPEAT_INTERVAL_SECONDS
                     if button_id == "back"
                     else self.REPEAT_INTERVAL_SECONDS
                 )
@@ -698,6 +711,7 @@ class ButtonGestureDispatcher:
             self._hold_timer_tokens.pop(button_id, None)
             self._held_immediate_buttons.discard(button_id)
             self._repeat_hold_tokens.pop(button_id, None)
+            self._repeat_counts.pop(button_id, None)
             self._cancel_timer_locked(
                 self._repeat_timers,
                 self._repeat_timer_tokens,

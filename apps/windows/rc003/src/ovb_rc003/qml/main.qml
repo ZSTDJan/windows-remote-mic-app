@@ -6,8 +6,7 @@ import OvbRc003Settings 1.0
 
 ApplicationWindow {
     id: window
-    title: "%1 · %2".arg(SettingsController.applicationDisplayName)
-        .arg(SettingsController.applicationVersion)
+    title: SettingsController.applicationPresentationLabel
     width: 720
     height: 560
     minimumWidth: 640
@@ -225,6 +224,15 @@ ApplicationWindow {
         if (SettingsController.startHidden)
             window.hide()
         SettingsController.startBridgeOnApplicationStart()
+        startupUpdateTimer.start()
+    }
+
+    Timer {
+        id: startupUpdateTimer
+        objectName: "startupUpdateTimer"
+        interval: 5000
+        repeat: false
+        onTriggered: SettingsController.checkForApplicationUpdateOnStartup()
     }
 
     onClosing: function(close) {
@@ -308,6 +316,10 @@ ApplicationWindow {
             window.restoreWindow()
             applicationUpdateDialog.returnFocusItem = returnFocus
             applicationUpdateDialog.open()
+        }
+        function onApplicationUpdateNotificationRequested(message) {
+            systemTrayIcon.showMessage(SettingsController.applicationDisplayName,
+                message, Platform.SystemTrayIcon.Information)
         }
     }
 
@@ -495,7 +507,7 @@ ApplicationWindow {
                     objectName: "openDownloadedApplicationUpdateButton"
                     visible: SettingsController.applicationUpdateState === "downloaded"
                     tokens: window.tokens
-                    text: qsTr("打开文件夹")
+                    text: qsTr("打开桌面")
                     highlighted: true
                     onClicked: {
                         if (SettingsController.openDownloadedApplicationUpdate())
@@ -722,6 +734,7 @@ ApplicationWindow {
         visible: true
         icon.source: SettingsController.trayIconSource
         tooltip: SettingsController.trayTooltip
+        onMessageClicked: SettingsController.showApplicationUpdate()
         onActivated: function(reason) {
             if (reason !== Platform.SystemTrayIcon.Context)
                 window.restoreWindow()
@@ -891,6 +904,17 @@ ApplicationWindow {
                     KeyNavigation.backtab: mappingTabButton
                 }
             }
+
+            BatteryGauge {
+                id: remoteBatteryGauge
+                objectName: "remoteBatteryGauge"
+                anchors.horizontalCenter: parent.horizontalCenter
+                anchors.bottom: parent.bottom
+                anchors.bottomMargin: 8
+                tokens: window.tokens
+                level: SettingsController.remoteBatteryLevel
+                visible: SettingsController.isRc003Device
+            }
         }
 
         ColumnLayout {
@@ -964,8 +988,7 @@ ApplicationWindow {
                 Layout.preferredHeight: tokens.statusBarMinHeight
                 color: hasError
                     ? tokens.errorBackground
-                    : hasDirtySettings || hasMessage
-                        ? tokens.statusBackground : tokens.background
+                    : tokens.background
 
                 RowLayout {
                     anchors.fill: parent
@@ -973,9 +996,11 @@ ApplicationWindow {
                     anchors.rightMargin: tokens.spacingSmall
                     spacing: tokens.spacingSmall
 
-                    Label {
+                    UiLabel {
                         id: globalStatusText
                         objectName: "globalStatusText"
+                        tokens: window.tokens
+                        kind: noteKind
                         Layout.fillWidth: true
                         Layout.fillHeight: true
                         text: globalStatusBar.hasError
@@ -986,14 +1011,13 @@ ApplicationWindow {
                                     : qsTr("按键映射正在等待自动保存。"))
                                 : globalStatusBar.hasMessage
                                     ? SettingsController.statusMessage
-                                    : qsTr("黄色或红色表示仍需处理，请按状态提示操作；需要处理的项目变为绿色后即可使用。")
+                                    : qsTr("请按页面提示处理黄色或红色状态。")
                         color: globalStatusBar.hasError
                             ? tokens.errorColor
                             : globalStatusBar.hasDirtySettings
                                 ? tokens.voiceAccent
                                 : globalStatusBar.hasMessage
                                     ? tokens.textSecondary : tokens.disabledText
-                        font.pixelSize: tokens.fontSizeSmall
                         verticalAlignment: Text.AlignVCenter
                         elide: Text.ElideRight
                         Accessible.name: text

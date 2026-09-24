@@ -4,16 +4,31 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from ovb_rc003 import hid_elevation_windows, hid_helper_consumers
+from ovb_rc003 import hid_elevation_windows, hid_helper_consumers, product_identity
 
 
 class HidHelperConsumerTests(unittest.TestCase):
-    def _distribution(self, root: Path, name: str, *, installed: bool) -> Path:
+    def _distribution(
+        self,
+        root: Path,
+        name: str,
+        *,
+        installed: bool,
+        versioned: bool = False,
+    ) -> Path:
         directory = root / name
         directory.mkdir()
-        app = directory / "RemoteMicRC003.exe"
+        app = directory / (
+            product_identity.windows_executable_name("1.0.51-candidate.51")
+            if versioned
+            else "RemoteMicRC003.exe"
+        )
         app.write_bytes(b"app")
-        helper = directory / hid_elevation_windows.HELPER_BUNDLE_RELATIVE_PATH
+        helper = hid_elevation_windows.bundled_helper_path(
+            frozen=True,
+            executable=str(app),
+        )
+        assert helper is not None
         helper.parent.mkdir()
         helper.write_bytes((name + "-helper").encode("ascii"))
         if installed:
@@ -35,6 +50,60 @@ class HidHelperConsumerTests(unittest.TestCase):
             self.assertIsNotNone(marker)
             self.assertTrue(
                 hid_helper_consumers.has_valid_portable_consumer(config_root)
+            )
+
+    def test_legacy_and_versioned_portable_consumers_coexist(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            config_root = root / "config"
+            legacy = self._distribution(root, "legacy", installed=False)
+            current = self._distribution(
+                root,
+                "current",
+                installed=False,
+                versioned=True,
+            )
+
+            legacy_marker = hid_helper_consumers.register_current_consumer(
+                config_root,
+                frozen=True,
+                executable=str(legacy),
+            )
+            current_marker = hid_helper_consumers.register_current_consumer(
+                config_root,
+                frozen=True,
+                executable=str(current),
+            )
+
+            self.assertIsNotNone(legacy_marker)
+            self.assertIsNotNone(current_marker)
+            self.assertNotEqual(legacy_marker, current_marker)
+            self.assertTrue(legacy_marker.is_file())
+            self.assertTrue(current_marker.is_file())
+            self.assertEqual(
+                hid_helper_consumers._inspect_marker(legacy_marker)[0],
+                hid_helper_consumers._MarkerState.VALID,
+            )
+            self.assertEqual(
+                hid_helper_consumers._inspect_marker(current_marker)[0],
+                hid_helper_consumers._MarkerState.VALID,
+            )
+
+    def test_unrecognized_executable_name_cannot_register_consumer(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            app = root / "WirelessMic.exe"
+            app.write_bytes(b"app")
+            (root / "程序文件").mkdir()
+            (root / "程序文件" / hid_elevation_windows.HELPER_EXE_NAME).write_bytes(
+                b"helper"
+            )
+            self.assertIsNone(
+                hid_helper_consumers.register_current_consumer(
+                    root / "config",
+                    frozen=True,
+                    executable=str(app),
+                )
             )
 
     def test_installed_consumer_does_not_block_helper_removal(self):

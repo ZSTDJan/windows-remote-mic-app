@@ -24,6 +24,9 @@ QtObject {
     property color border: darkMode ? "#343941" : "#e2e4e7"
     property color borderStrong: darkMode ? "#474d57" : "#cfd4da"
     property color cardBorder: border
+    property color remotePhotoShadowColor: "#66000000"
+    property int remotePhotoShadowRadius: 5
+    property int remotePhotoShadowOffset: 2
     property color accent: "#087cf0"
     property color accentText: "#ffffff"
     property color accentSoft: darkMode ? "#183653" : "#e7f2ff"
@@ -34,14 +37,12 @@ QtObject {
     property color voiceAccent: darkMode ? "#efb66b" : "#aa6410"
     property color successColor: darkMode ? "#64d78d" : "#119c4c"
     property color errorColor: darkMode ? "#ff6764" : "#c42b1c"
-    property color statusBackground: accentSoft
     property color errorBackground: darkMode ? "#422421" : "#fdeceb"
 
     property string fontFamily: "Microsoft YaHei UI"
     property string fontFamilyMono: "Consolas"
     property real fontSizeTiny: 9.5
     property real fontSizeMapGesture: 9.5
-    property real fontSizeMapPrimary: 10.5
     property real fontSizeSmall: 10.5
     property real fontSizeMappingKey: fontSizeSmall
     property real fontSizeControl: 11

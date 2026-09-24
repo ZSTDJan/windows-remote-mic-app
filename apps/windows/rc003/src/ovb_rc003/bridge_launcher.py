@@ -12,6 +12,7 @@ import os
 import sys
 import threading
 import time
+import logging
 from dataclasses import dataclass
 from enum import Enum
 from typing import Callable, Dict, List, Optional, Sequence, Tuple, Union
@@ -349,8 +350,13 @@ def stop_in_process_bridge(*, timeout: float = 7.0) -> Optional[bool]:
             # probe instead of falsely reporting that another live service
             # was stopped by this process.
             return None
+        logging.getLogger("ovb_rc003").info("bridge stop requested: timeout_seconds=%.1f", timeout)
         handle.request_stop()
     stopped = handle.wait(timeout)
+    logging.getLogger("ovb_rc003").info("bridge stop wait: stopped=%s", stopped)
+    if not stopped:
+        from .diagnostic_trace import log_shutdown_threads
+        log_shutdown_threads(logging.getLogger("ovb_rc003"))
     if stopped:
         with _in_process_lock:
             if _in_process_handle is handle:

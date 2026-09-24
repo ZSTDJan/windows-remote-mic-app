@@ -88,10 +88,22 @@ class VoiceEvidenceTests(unittest.TestCase):
                 with self.subTest(key_up=key_up, confirmed=confirmed):
                     trace = mock.Mock(enabled=True)
                     trace.current_context.return_value = {"attempt_id": "attempt-1"}
+                    confirmation = (
+                        win32_input.voice_key_physicalizer_windows.VoiceEventConfirmation(
+                            marker=123,
+                            generation=-1,
+                            installation_epoch=-1,
+                            key_up=key_up,
+                            callback_entries=0,
+                            marker_callbacks=0,
+                            marker_matches=0,
+                        )
+                    )
                     with mock.patch.object(win32_input, "_diagnostic_trace", trace), \
                          mock.patch.object(diagnostics, "foreground_context", return_value={"foreground_is_app": True}), \
-                         mock.patch.object(win32_input, "_real_keybd_event") as send, \
-                         mock.patch.object(win32_input.voice_key_physicalizer_windows, "begin_marked_voice_event", return_value=mock.Mock(marker=123)), \
+                          mock.patch.object(win32_input, "_real_keybd_event") as send, \
+                          mock.patch.object(win32_input, "_ensure_right_alt_release_completed"), \
+                          mock.patch.object(win32_input.voice_key_physicalizer_windows, "begin_marked_voice_event", return_value=confirmation), \
                          mock.patch.object(win32_input.voice_key_physicalizer_windows, "wait_for_marked_voice_event", return_value=confirmed):
                         if confirmed:
                             win32_input._real_voice_event(0xA5, key_up)
@@ -104,13 +116,21 @@ class VoiceEvidenceTests(unittest.TestCase):
                     self.assertEqual(fields["edge"], "up" if key_up else "down")
                     self.assertEqual(fields["attempt_id"], "attempt-1")
                     self.assertTrue(fields["foreground_is_app"])
-                    self.assertEqual(fields["reason"], "local_hook_confirmed" if confirmed else "local_hook_confirmation_timeout")
+                    expected_reason = "local_hook_confirmation_timeout"
+                    if confirmed:
+                        expected_reason = (
+                            "release_postcondition_confirmed"
+                            if key_up
+                            else "local_hook_and_downstream_completed"
+                        )
+                    self.assertEqual(fields["reason"], expected_reason)
 
     def test_broken_sink_cannot_turn_success_into_input_failure(self):
         trace = mock.Mock(enabled=True)
         trace.current_context.side_effect = RuntimeError("sink failed")
         with mock.patch.object(win32_input, "_diagnostic_trace", trace), \
              mock.patch.object(win32_input, "_real_keybd_event"), \
+             mock.patch.object(win32_input, "_ensure_right_alt_release_completed"), \
              mock.patch.object(win32_input.voice_key_physicalizer_windows, "begin_marked_voice_event", return_value=mock.Mock(marker=123)), \
              mock.patch.object(win32_input.voice_key_physicalizer_windows, "wait_for_marked_voice_event", return_value=True):
             win32_input._real_voice_event(0xA5, True)

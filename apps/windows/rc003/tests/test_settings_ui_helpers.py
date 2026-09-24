@@ -61,8 +61,6 @@ class DisplayRoundTripTests(unittest.TestCase):
             "鼠标左键单击": key_mapping.ActionKind.MOUSE_LEFT_CLICK,
             "鼠标右键单击": key_mapping.ActionKind.MOUSE_RIGHT_CLICK,
             "鼠标中键单击": key_mapping.ActionKind.MOUSE_MIDDLE_CLICK,
-            "滚轮向上": key_mapping.ActionKind.MOUSE_WHEEL_UP,
-            "滚轮向下": key_mapping.ActionKind.MOUSE_WHEEL_DOWN,
             "鼠标 X1 单击": key_mapping.ActionKind.MOUSE_X1_CLICK,
             "鼠标 X2 单击": key_mapping.ActionKind.MOUSE_X2_CLICK,
             "元素导航开关": key_mapping.ActionKind.ELEMENT_NAVIGATION_TOGGLE,
@@ -98,19 +96,31 @@ class DisplayRoundTripTests(unittest.TestCase):
         self.assertNotIn("lctrl+win", flattened)
         self.assertNotIn("ralt", flattened)
         self.assertNotIn("ralt+space", flattened)
-        mouse_group = dict(settings_ui.ACTION_OPTION_GROUPS)["鼠标与导航"]
+        self.assertNotIn("打开 Codex", flattened)
+        self.assertIn("打开 Claude", flattened)
+        mouse_group = dict(settings_ui.ACTION_OPTION_GROUPS)["鼠标操作"]
         self.assertEqual(
-            mouse_group[:7],
+            mouse_group[:6],
             (
+                "元素导航开关",
                 "鼠标左键单击",
                 "鼠标右键单击",
                 "鼠标中键单击",
-                "滚轮向上",
-                "滚轮向下",
                 "鼠标 X1 单击",
                 "鼠标 X2 单击",
             ),
         )
+
+    def test_old_wheel_actions_display_as_page_keys(self):
+        for old_kind, label in (
+            (key_mapping.ActionKind.MOUSE_WHEEL_UP, "PageUp"),
+            (key_mapping.ActionKind.MOUSE_WHEEL_DOWN, "PageDown"),
+        ):
+            self.assertEqual(_action_to_display(key_mapping.ButtonAction(old_kind)), label)
+            self.assertEqual(
+                _display_to_action(label),
+                key_mapping.ButtonAction(key_mapping.ActionKind.KEY_COMBO, (label.lower(),)),
+            )
 
     def test_legacy_alt_escape_app_switch_is_displayed_as_reference_action(self):
         action = key_mapping.ButtonAction(
@@ -123,7 +133,7 @@ class DisplayRoundTripTests(unittest.TestCase):
             "打开无线麦": key_mapping.ActionKind.OPEN_REMOTE_MIC,
             "打开 Codex": key_mapping.ActionKind.OPEN_CODEX,
             "打开 Claude": key_mapping.ActionKind.OPEN_CLAUDE,
-            "打开 cmux": key_mapping.ActionKind.OPEN_CMUX,
+            "打开 cmux 终端": key_mapping.ActionKind.OPEN_CMUX,
             "打开 Chrome": key_mapping.ActionKind.OPEN_CHROME,
         }
         for label, action_kind in expected.items():

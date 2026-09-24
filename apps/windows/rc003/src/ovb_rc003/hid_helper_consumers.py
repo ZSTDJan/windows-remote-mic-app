@@ -13,7 +13,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Callable, Iterator, Optional
 
-from . import hid_elevation_windows, single_instance
+from . import hid_elevation_windows, product_identity, single_instance
 
 
 CONSUMER_SCHEMA_VERSION = 1
@@ -118,7 +118,10 @@ def _distribution_kind(executable: Path) -> str:
 
 
 def _marker_payload(executable: Path) -> dict[str, Any]:
-    bundled = executable.parent / hid_elevation_windows.HELPER_BUNDLE_RELATIVE_PATH
+    bundled = hid_elevation_windows.bundled_helper_path(
+        frozen=True,
+        executable=str(executable),
+    )
     return {
         "schema_version": CONSUMER_SCHEMA_VERSION,
         "kind": _distribution_kind(executable),
@@ -126,7 +129,9 @@ def _marker_payload(executable: Path) -> dict[str, Any]:
         "helper_protocol_version": hid_elevation_windows.HELPER_PROTOCOL_VERSION,
         "helper_generation": hid_elevation_windows.HELPER_GENERATION,
         "bundled_helper_sha256": (
-            hid_elevation_windows._sha256(bundled) if bundled.is_file() else ""
+            hid_elevation_windows._sha256(bundled)
+            if bundled is not None and bundled.is_file()
+            else ""
         ),
     }
 
@@ -142,8 +147,11 @@ def _register_current_consumer_unlocked(
     if not frozen:
         return None
     app = _lexical_executable_path(executable)
-    bundled = app.parent / hid_elevation_windows.HELPER_BUNDLE_RELATIVE_PATH
-    if not app.is_file() or not bundled.is_file():
+    bundled = hid_elevation_windows.bundled_helper_path(
+        frozen=True,
+        executable=str(app),
+    )
+    if not app.is_file() or bundled is None or not bundled.is_file():
         return None
     directory = consumer_directory(config_root)
     directory.mkdir(parents=True, exist_ok=True)
@@ -238,7 +246,7 @@ def _inspect_marker(
     if not isinstance(executable_path, str) or not executable_path.strip():
         return _MarkerState.UNKNOWN, None
     app = _lexical_executable_path(executable_path)
-    if app.name.casefold() != "remotemicrc003.exe":
+    if not product_identity.is_recognized_windows_executable_name(app.name):
         return _MarkerState.UNKNOWN, None
     if _consumer_key(app) != path.stem:
         return _MarkerState.UNKNOWN, None
@@ -257,8 +265,11 @@ def _inspect_marker(
         or generation <= 0
     ):
         return _MarkerState.UNKNOWN, None
-    bundled = app.parent / hid_elevation_windows.HELPER_BUNDLE_RELATIVE_PATH
-    if not bundled.is_file():
+    bundled = hid_elevation_windows.bundled_helper_path(
+        frozen=True,
+        executable=str(app),
+    )
+    if bundled is None or not bundled.is_file():
         # The distribution still exists but is damaged or quarantined. Do not
         # let another copy treat it as gone and remove a helper it may still
         # rely on after repair.

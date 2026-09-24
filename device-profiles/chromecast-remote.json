@@ -1,0 +1,19 @@
+{
+  "schemaVersion": 1,
+  "id": "chromecast-remote",
+  "displayName": "谷歌 Chromecast 遥控器",
+  "vendor": "Google",
+  "model": "Chromecast Voice Remote",
+  "support": {
+    "status": "research",
+    "notes": "本机独立按键、语音和开关控制已验证；产品接收尚未接入，当前仅支持设备选择与配置隔离。"
+  },
+  "identity": {"bluetoothNames": ["Chromecast Remote"], "hid": {"vendorId": 6353, "productId": 37968}},
+  "transports": [
+    {"kind": "ble-gatt", "role": "voice-input", "status": "research", "notes": "当前研究通过 Windows 蓝牙 ETW 接收通知、WinRT GATT 发送控制。"},
+    {"kind": "bluetooth-hid", "role": "button-input", "status": "research", "notes": "独立验证的 8 字节 ATT 按键报告，不能使用小米接收器。"}
+  ],
+  "capabilities": ["voice-capture", "press-to-talk", "button-input", "host-key-mapping"],
+  "platforms": [{"platform": "windows", "status": "research", "notes": "产品接入与双设备回归待完成。"}],
+  "sources": ["apps/windows/rc003/discussions/chromecast-remote-integration.md"]
+}

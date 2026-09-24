@@ -150,6 +150,33 @@ class ButtonGestureDispatcherTests(unittest.TestCase):
             ],
         )
 
+    def test_wheel_repeat_accelerates_and_release_cancels_next_step(self):
+        delays = []
+        timers = []
+
+        def timer_factory(delay, callback):
+            delays.append(delay)
+            timer = _FakeTimer(callback)
+            timers.append(timer)
+            return timer
+
+        dispatcher = ButtonGestureDispatcher(
+            is_action_configured=lambda _button, trigger: trigger == ButtonTrigger.SINGLE_CLICK,
+            is_repeatable=lambda _button: True,
+            on_trigger=lambda button, trigger: self.triggers.append((button, trigger)),
+            repeat_interval_for=lambda _button, count: 0.05 if count >= 10 else 0.1,
+            timer_factory=timer_factory,
+        )
+        dispatcher.press("home")
+        self.assertEqual(delays[0], 0.35)
+        for _ in range(10):
+            timers[-1].fire()
+        self.assertEqual(delays[1:10], [0.1] * 9)
+        self.assertEqual(delays[10], 0.05)
+        dispatcher.release("home")
+        timers[-1].fire()
+        self.assertEqual(len(self.triggers), 11)
+
     def test_diagnostic_callback_failure_never_blocks_the_action(self):
         self.dispatcher._on_diagnostic = lambda *_args, **_fields: (_ for _ in ()).throw(
             RuntimeError("diagnostic failed")

@@ -794,6 +794,51 @@ class ElevatedProcessTests(unittest.TestCase):
 
 
 class ProtectedPathTests(unittest.TestCase):
+    @unittest.skipUnless(sys.platform == "win32", "Windows SDDL aliases")
+    def test_local_administrator_alias_is_exact_and_keeps_acl_restrictions(self):
+        admin = hid_elevation_windows._canonical_acl_sid("LA")
+        self.assertRegex(admin, r"^S-1-5-21-\d+-\d+-\d+-500$")
+        other_admin = "S-1-5-21-111-222-333-500"
+        self.assertNotEqual(admin, other_admin)
+        readers = (hid_elevation_windows.LOCAL_SERVICE_SID,)
+        for directory in (True, False):
+            with self.subTest(directory=directory):
+                valid = hid_elevation_windows._path_security_sddl_text(
+                    admin, directory=directory, read_execute_sids=readers,
+                ).replace(admin, "LA")
+                def validate(text, owner=admin):
+                    return hid_elevation_windows.validate_path_security_sddl(
+                        text, user_sid=owner, directory=directory,
+                        read_execute_sids=readers,
+                    )
+                self.assertTrue(validate(valid))
+                self.assertFalse(validate(valid, SID))
+                self.assertFalse(validate(valid, other_admin))
+                flags = "OICI" if directory else ""
+                rights = "GRGX" if directory else "GR"
+                self.assertFalse(validate(valid.replace(
+                    f"(A;{flags};{rights};;;LA)", f"(A;{flags};FA;;;LA)")))
+                self.assertFalse(validate(valid + f"(A;{flags};GR;;;WD)"))
+        task = hid_elevation_windows.task_security_sddl(admin).replace(admin, "LA")
+        self.assertTrue(hid_elevation_windows.validate_task_security_sddl(task, user_sid=admin))
+        self.assertFalse(hid_elevation_windows.validate_task_security_sddl(task, user_sid=other_admin))
+
+    @unittest.skipUnless(sys.platform == "win32", "Windows SDDL aliases")
+    def test_alias_conversion_failure_fails_closed_and_frees_native_memory(self):
+        for fails_first in (True, False):
+            with self.subTest(fails_first=fails_first):
+                api = mock.Mock()
+                def allocate(_text, pointer):
+                    pointer._obj.value = 123
+                    return True
+                api.ConvertStringSidToSidW.side_effect = (
+                    (lambda *_: False) if fails_first else allocate
+                )
+                api.ConvertSidToStringSidW.return_value = False
+                with mock.patch.object(ctypes, "WinDLL", return_value=api):
+                    self.assertEqual(hid_elevation_windows._canonical_acl_sid("LA"), "LA")
+                self.assertEqual(api.LocalFree.call_count, 0 if fails_first else 1)
+
     def test_path_acl_rejects_user_write_or_extra_everyone_access(self):
         valid = hid_elevation_windows._path_security_sddl_text(
             SID, directory=True
@@ -1177,7 +1222,7 @@ class InstalledHelperTests(unittest.TestCase):
         state = hid_elevation_windows.inspect_installed_helper(frozen=False)
         self.assertEqual(state, hid_elevation_windows.HidHelperState(False, "source_runtime"))
 
-    def test_frozen_distribution_keeps_bundled_helper_under_internal(self):
+    def test_legacy_distribution_keeps_bundled_helper_under_internal(self):
         with tempfile.TemporaryDirectory() as raw:
             executable = Path(raw) / "RemoteMicRC003.exe"
             self.assertEqual(
@@ -1186,6 +1231,28 @@ class InstalledHelperTests(unittest.TestCase):
                     executable=str(executable),
                 ),
                 Path(raw) / "_internal" / hid_elevation_windows.HELPER_EXE_NAME,
+            )
+
+    def test_versioned_distribution_uses_program_files_directory(self):
+        with tempfile.TemporaryDirectory() as raw:
+            executable = (
+                Path(raw) / "无线麦 win版 1.0.51-candidate.51.exe"
+            )
+            self.assertEqual(
+                hid_elevation_windows.bundled_helper_path(
+                    frozen=True,
+                    executable=str(executable),
+                ),
+                Path(raw) / "程序文件" / hid_elevation_windows.HELPER_EXE_NAME,
+            )
+
+    def test_unknown_frozen_executable_does_not_offer_a_helper(self):
+        with tempfile.TemporaryDirectory() as raw:
+            self.assertIsNone(
+                hid_elevation_windows.bundled_helper_path(
+                    frozen=True,
+                    executable=str(Path(raw) / "WirelessMic.exe"),
+                )
             )
 
     def test_offer_id_is_stable_for_different_binaries_in_the_same_contract(self):
@@ -3481,7 +3548,7 @@ class ElevationRequestTests(unittest.TestCase):
 
 class HelperMainTests(unittest.TestCase):
     def test_fixed_frozen_helper_uses_a_new_generation(self):
-        self.assertGreaterEqual(hid_elevation_windows.HELPER_GENERATION, 8)
+        self.assertGreaterEqual(hid_elevation_windows.HELPER_GENERATION, 14)
         self.assertGreaterEqual(hid_elevation_windows.TASK_CONTRACT_VERSION, 5)
 
     def test_inject_once_reports_a_stable_failure_stage(self):

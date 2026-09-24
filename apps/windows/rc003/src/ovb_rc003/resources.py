@@ -18,9 +18,10 @@ run", i.e. wherever the bootloader actually placed the bundled ``datas``,
 regardless of the exact on-disk layout. That is NOT necessarily the same
 directory as the executable file itself in a modern one-dir build: since
 PyInstaller 6's default one-dir layout, most bundled content (including
-anything listed in ``datas``) is placed in a ``_internal`` subdirectory
+anything listed in ``datas``) is placed in the configured one-dir contents
+subdirectory (``程序文件`` in current packages)
 next to the executable, not loose alongside it, and ``sys._MEIPASS`` points
-at that ``_internal`` directory rather than the top-level dist folder the
+at that contents directory rather than the top-level dist folder the
 ``.exe`` itself lives in. Checking ``Path(sys._MEIPASS) / "Resources" /
 ...`` first (below) is correct regardless of which exact subdirectory
 ``_MEIPASS`` resolves to, precisely because it is always wherever the
@@ -42,6 +43,7 @@ cover the unfrozen/dev case exactly as before.
 from __future__ import annotations
 
 import sys
+import importlib.machinery
 from pathlib import Path
 from typing import Iterator, Optional
 
@@ -55,23 +57,33 @@ _APP_ICON_FILENAMES = {
 }
 
 
-def _candidate_paths() -> Iterator[Path]:
+def _source_resource_root() -> Path:
+    module_path = Path(__file__).resolve()
+    if any(str(module_path).endswith(s) for s in importlib.machinery.EXTENSION_SUFFIXES):
+        # Unfrozen native-stage tests use the build's copied resources. Frozen
+        # execution still exclusively uses _MEIPASS in the callers below.
+        return module_path.parents[2]
+    return module_path.parents[5]
+
+
+def _candidate_paths(profile: str = "xiaomi-rc003") -> Iterator[Path]:
+    filename = "Chromecast-remote-photo.png" if profile == "chromecast-remote" else _PHOTO_FILENAME
     frozen_root = getattr(sys, "_MEIPASS", None)
     if frozen_root:
         # Packaged (frozen) build: PyInstaller's bootloader sets this before
         # any application code runs, so it's always current - checked
         # dynamically here (not cached at import time) so tests can
         # simulate a frozen bundle by monkeypatching sys._MEIPASS.
-        yield Path(frozen_root) / "Resources" / _PHOTO_FILENAME
+        yield Path(frozen_root) / "Resources" / filename
     # Unfrozen packaged build (e.g. launched with CWD already set to the
     # dist folder): PyInstaller spec copies the photo next to the exe.
-    yield Path("Resources") / _PHOTO_FILENAME
+    yield Path("Resources") / filename
     # Source checkout: apps/windows/rc003/src/ovb_rc003/resources.py -> repo root.
-    yield Path(__file__).resolve().parents[5] / "Resources" / _PHOTO_FILENAME
+    yield _source_resource_root() / "Resources" / filename
 
 
-def find_remote_photo() -> Optional[Path]:
-    for candidate in _candidate_paths():
+def find_remote_photo(profile: str = "xiaomi-rc003") -> Optional[Path]:
+    for candidate in _candidate_paths(profile):
         if candidate.is_file():
             return candidate
     return None
@@ -83,7 +95,7 @@ def _device_profile_directory_candidates() -> Iterator[Path]:
         yield Path(frozen_root) / _DEVICE_PROFILES_DIRECTORY
         return
     # Source checkout: apps/windows/rc003/src/ovb_rc003/resources.py -> repo root.
-    yield Path(__file__).resolve().parents[5] / _DEVICE_PROFILES_DIRECTORY
+    yield _source_resource_root() / _DEVICE_PROFILES_DIRECTORY
 
 
 def find_device_profiles_directory() -> Optional[Path]:

@@ -416,13 +416,18 @@ class EmbeddedElementNavigationRuntime:
         record_direction_edge: Callable[[int, int, bool, bool], bool],
         cleanup: Callable[[], None],
         local_input: Optional[_LocalNavigationInput] = None,
+        *,
+        mapped_input: Optional[Callable[[int], bool]] = None,
     ) -> None:
         self._enqueue_command = enqueue_command
         self._record_direction_edge = record_direction_edge
         self._cleanup = cleanup
         self._local_input = local_input
+        self._mapped_input = mapped_input
 
     def route_mapped_key(self, vk: int) -> bool:
+        if self._mapped_input is not None:
+            return bool(self._mapped_input(vk))
         return self._local_input is not None and self._local_input.tap(vk)
 
     def route_local_key(self, vk: int, pressed: bool, repeat: bool, modified: bool) -> bool:
@@ -3726,6 +3731,7 @@ def _run_windows(
             intercepting: Optional[threading.Event] = None,
             *,
             include_developer_hotkeys: bool = True,
+            include_toggle_hotkey: bool = True,
         ) -> None:
             ulong_ptr = wintypes.WPARAM
 
@@ -3762,6 +3768,7 @@ def _run_windows(
             self._active = active
             self._intercepting = intercepting or active
             self._include_developer_hotkeys = include_developer_hotkeys
+            self._include_toggle_hotkey = include_toggle_hotkey
             self._hook = None
             self._callback = None
             self._thread_id = 0
@@ -3915,6 +3922,7 @@ def _run_windows(
             hotkey_action = global_hotkey_action(
                 vk,
                 include_developer_actions=self._include_developer_hotkeys,
+                include_toggle=self._include_toggle_hotkey,
             )
             if is_down and ctrl_alt and hotkey_action is not None:
                 self._swallowed.add(ownership_key)
@@ -4054,8 +4062,14 @@ def _run_windows(
     overlay_signature_poll_seconds = 1.0
     diagnostics_enabled = bool(args.diagnostics)
     managed_companion = bool(getattr(args, "managed_companion", False))
+    embedded_remote_only = managed_companion and not run_event_loop
     owner_pid = max(0, int(getattr(args, "owner_pid", 0) or 0))
     include_developer_hotkeys = not managed_companion or diagnostics_enabled
+    include_toggle_hotkey = not managed_companion
+    restart_hint = (
+        "请再次触发元素导航开关。" if managed_companion
+        else "请重新按 Ctrl+Alt+N。"
+    )
 
     def enqueue_keyboard_action(action: str) -> None:
         keyboard_events.put((action, 0))
@@ -4072,7 +4086,30 @@ def _run_windows(
             and not should_pass_through_native_menu(vk, native_menu_mode_active())
         )
 
-    local_input = _LocalNavigationInput(can_claim_local_key, enqueue_keyboard_action, diagnostics)
+    local_input = None
+    if not embedded_remote_only:
+        local_input = _LocalNavigationInput(
+            can_claim_local_key, enqueue_keyboard_action, diagnostics
+        )
+
+    def route_mapped_key(vk: int) -> bool:
+        action = keyboard_navigation_action(vk)
+        if action is None or shutting_down or not intercepting.is_set():
+            return False
+        foreground = native_handle_value(user32.GetForegroundWindow())
+        if foreground <= 0 or navigation_root_hwnd <= 0:
+            return False
+        if navigation_process_id == prototype_process_id:
+            if foreground != navigation_root_hwnd:
+                return False
+        elif navigation_action_for_foreground(foreground) not in {"sync", "follow"}:
+            return False
+        if should_pass_through_native_menu(vk, native_menu_mode_active()):
+            return False
+        enqueue_keyboard_action(action)
+        diagnostics.emit("local_input", vk=vk, action=action,
+                         reason="mapped_action", outcome="queued")
+        return True
 
     def enqueue_external_command(command: int, target_hwnd: int) -> None:
         if command == ELEMENT_NAVIGATION_COMMAND_TOGGLE:
@@ -4080,12 +4117,15 @@ def _run_windows(
         elif command == ELEMENT_NAVIGATION_COMMAND_QUIT:
             keyboard_events.put(("quit", 0))
 
-    hook = KeyboardHook(
-        enqueue_keyboard_action,
-        active,
-        intercepting,
-        include_developer_hotkeys=include_developer_hotkeys,
-    )
+    hook = None
+    if not embedded_remote_only:
+        hook = KeyboardHook(
+            enqueue_keyboard_action,
+            active,
+            intercepting,
+            include_developer_hotkeys=include_developer_hotkeys,
+            include_toggle_hotkey=include_toggle_hotkey,
+        )
     structure_watcher = StructureChangeWatcher()
     command_server = None
 
@@ -4101,7 +4141,8 @@ def _run_windows(
                              active=active.is_set(), scanning=scanning)
         active.clear()
         intercepting.clear()
-        hook.reset_device_direction_edges()
+        if hook is not None:
+            hook.reset_device_direction_edges()
         scanning = False
         current_scan_token = 0
         diagnostics.keyboard_context(0, 0, 0)
@@ -4165,7 +4206,7 @@ def _run_windows(
             diagnostics.emit("pause", reason="foreground_changed",
                              target_hwnd=navigation_root_hwnd, foreground_hwnd=foreground,
                              scan_token=scan_token_counter)
-            print("导航已暂停: 已切换到其它窗口，请重新按 Ctrl+Alt+N。")
+            print("导航已暂停: 已切换到其它窗口，" + restart_hint)
             leave_navigation()
             return False
         if foreground_action == "follow":
@@ -4389,7 +4430,7 @@ def _run_windows(
             elif event == "navigation_invalidated":
                 diagnostics.emit("pause", scan_token=scan_token_counter,
                                  reason="context_invalidated")
-                print(f"导航已暂停: {payload}，请重新按 Ctrl+Alt+N。")
+                print(f"导航已暂停: {payload}，" + restart_hint)
                 leave_navigation()
             elif event == "prewarm_done":
                 print(
@@ -4464,7 +4505,7 @@ def _run_windows(
             diagnostics.emit("pause", reason="foreground_changed",
                              target_hwnd=navigation_root_hwnd, foreground_hwnd=foreground,
                              scan_token=scan_token_counter)
-            print("导航已暂停: 已切换到其它窗口，请重新按 Ctrl+Alt+N。")
+            print("导航已暂停: 已切换到其它窗口，" + restart_hint)
             leave_navigation()
             return
         if foreground_action == "follow":
@@ -4500,14 +4541,13 @@ def _run_windows(
         ]
         if command_server is not None:
             resources.append(("command_server", command_server.stop))
-        resources.extend(
-            (
-                ("keyboard_hook", hook.stop),
-                ("structure_watcher", structure_watcher.stop),
-                ("automation_worker", worker.stop),
-                ("overlay", overlay.clear_target),
-            )
-        )
+        if hook is not None:
+            resources.append(("keyboard_hook", hook.stop))
+        resources.extend((
+            ("structure_watcher", structure_watcher.stop),
+            ("automation_worker", worker.stop),
+            ("overlay", overlay.clear_target),
+        ))
         failures = _stop_resources_best_effort(resources)
         diagnostics.emit("cleanup", outcome="failed" if failures else "stopped",
                          failure_count=len(failures))
@@ -4522,7 +4562,8 @@ def _run_windows(
     try:
         app.aboutToQuit.connect(cleanup)
         worker.start()
-        hook.start()
+        if hook is not None:
+            hook.start()
         if not structure_watcher.start():
             diagnostics.emit("watcher", outcome="polling_fallback")
             print(
@@ -4555,8 +4596,13 @@ def _run_windows(
     diagnostics.emit("ready")
     print("元素导航已启动。")
     controls = (
-        "Ctrl+Alt+N 开始/退出，方向键移动，PageUp/PageDown 切换父子元素，"
-        "Enter 左击（快速两次为双击），菜单键右击，音量键滚动，Esc 退出。"
+        "使用遥控器映射的元素导航开关进入/退出，遥控器方向键移动，"
+        if managed_companion else
+        "Ctrl+Alt+N 开始/退出，方向键移动，"
+    )
+    controls += (
+        "PageUp/PageDown 切换父子元素，Enter 左击（快速两次为双击），"
+        "菜单键右击，音量键滚动，Esc 退出。"
     )
     if include_developer_hotkeys:
         controls += " Ctrl+Alt+D 开关导航诊断，Ctrl+Alt+Q 关闭。"
@@ -4566,9 +4612,11 @@ def _run_windows(
     if not run_event_loop:
         return EmbeddedElementNavigationRuntime(
             enqueue_external_command,
-            hook.record_device_direction_edge,
+            hook.record_device_direction_edge if hook is not None else
+            lambda _vk, _scan, _extended, _pressed: False,
             cleanup,
             local_input,
+            mapped_input=route_mapped_key if embedded_remote_only else None,
         )
     try:
         return int(app.exec())

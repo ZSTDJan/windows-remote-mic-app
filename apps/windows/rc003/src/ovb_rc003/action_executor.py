@@ -10,6 +10,7 @@ real application.
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import subprocess
@@ -110,9 +111,7 @@ def _candidate_paths(executable_names: Sequence[str]) -> Iterable[Path]:
                 yield root / directory / executable_name
 
 
-def _start_menu_shortcuts(
-    names: Sequence[str], *, exact_only: bool = False
-) -> Iterable[Path]:
+def _start_menu_shortcuts(names: Sequence[str]) -> Iterable[Path]:
     roots = []
     for variable in ("APPDATA", "PROGRAMDATA"):
         raw = os.environ.get(variable, "").strip()
@@ -129,30 +128,67 @@ def _start_menu_shortcuts(
             shortcuts = root.rglob("*.lnk")
             for shortcut in shortcuts:
                 stem = shortcut.stem.casefold()
-                if stem in wanted or (
-                    not exact_only and any(name in stem for name in wanted)
-                ):
+                # A substring also matches uninstallers, updaters and other
+                # applications. Only the known product names/aliases may launch.
+                if stem in wanted:
                     yield shortcut
-        except OSError:
-            continue
-
-
-def _packaged_codex_paths() -> Iterable[Path]:
-    # Codex is commonly delivered as a Windows Store package.  It may not be
-    # on PATH or in Start Menu as a normal exe, but the running package exposes
-    # this stable relative resource path.  The glob handles version updates.
-    for root in _windows_roots():
-        windows_apps = root / "WindowsApps"
-        if not windows_apps.is_dir():
-            continue
-        try:
-            yield from windows_apps.glob("OpenAI.Codex_*/app/resources/codex.exe")
         except OSError:
             continue
 
 
 def _path_is_file(path: Path) -> bool:
     return path.is_file()
+
+
+def _is_agent_cli_path(kind: key_mapping.ActionKind, path: Path) -> bool:
+    parts = tuple(part.casefold() for part in path.parts)
+    if kind == key_mapping.ActionKind.OPEN_CODEX:
+        return "openai" in parts and "codex" in parts and "bin" in parts
+    if kind == key_mapping.ActionKind.OPEN_CLAUDE:
+        return len(parts) >= 3 and parts[-3:-1] == (".local", "bin")
+    return False
+
+
+def _packaged_desktop_command(kind: key_mapping.ActionKind) -> Optional[Command]:
+    # Store apps need their registered AppID. Their embedded codex.exe or
+    # claude.exe may be a command-line tool rather than a desktop launcher.
+    names = {
+        key_mapping.ActionKind.OPEN_CODEX: "Codex",
+        key_mapping.ActionKind.OPEN_CLAUDE: "Claude",
+    }
+    name = names.get(kind)
+    if name is None or sys.platform != "win32":
+        return None
+    try:
+        result = subprocess.run(
+            ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command",
+             "Get-StartApps | Where-Object { $_.Name -eq 'Codex' -or $_.Name -eq 'Claude' } | "
+             "Select-Object Name,AppID | ConvertTo-Json -Compress"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            check=False,
+        )
+        if result.returncode != 0 or not result.stdout.strip():
+            return None
+        entries = json.loads(result.stdout)
+    except (OSError, subprocess.TimeoutExpired, ValueError):
+        return None
+    if isinstance(entries, dict):
+        entries = [entries]
+    if not isinstance(entries, list):
+        return None
+    for entry in entries:
+        if not isinstance(entry, dict) or entry.get("Name") != name:
+            continue
+        app_id = entry.get("AppID")
+        if (isinstance(app_id, str) and "!" in app_id
+                and not any(char in app_id for char in "\r\n\x00")):
+            explorer = Path(os.environ.get("WINDIR", r"C:\Windows")) / "explorer.exe"
+            if explorer.is_file():
+                return (str(explorer), "shell:AppsFolder\\" + app_id)
+    return None
 
 
 def _resolve_application_command_uncached(
@@ -176,23 +212,26 @@ def _resolve_application_command_uncached(
     names = _APPLICATION_EXECUTABLES.get(action.kind)
     if not names:
         return None
+    if action.kind in {
+        key_mapping.ActionKind.OPEN_CODEX,
+        key_mapping.ActionKind.OPEN_CLAUDE,
+    }:
+        for shortcut in _start_menu_shortcuts(
+            _APPLICATION_SHORTCUT_NAMES.get(action.kind, ())
+        ):
+            if executable_exists(shortcut):
+                return (str(shortcut),)
     for candidate in _candidate_paths(names):
-        if executable_exists(candidate):
+        if not _is_agent_cli_path(action.kind, candidate) and executable_exists(candidate):
             return (str(candidate),)
-    if action.kind == key_mapping.ActionKind.OPEN_CODEX:
-        for candidate in _packaged_codex_paths():
-            if executable_exists(candidate):
-                return (str(candidate),)
-    exact_shortcut_action = action.kind in {
-        key_mapping.ActionKind.OPEN_WECHAT,
-        key_mapping.ActionKind.OPEN_WECOM,
-    }
-    for shortcut in _start_menu_shortcuts(
-        _APPLICATION_SHORTCUT_NAMES.get(action.kind, ()),
-        exact_only=exact_shortcut_action,
-    ):
+    for shortcut in _start_menu_shortcuts(_APPLICATION_SHORTCUT_NAMES.get(action.kind, ())):
         if executable_exists(shortcut):
             return (str(shortcut),)
+    if action.kind in {
+        key_mapping.ActionKind.OPEN_CODEX,
+        key_mapping.ActionKind.OPEN_CLAUDE,
+    }:
+        return _packaged_desktop_command(action.kind)
     return None
 
 
@@ -250,7 +289,11 @@ def open_configured_application(
     command = resolve_application_command(action)
     if command is None:
         return False
-    starter = launcher or _launch_command
+    starter = launcher or (
+        _launch_cmux_command
+        if action.kind == key_mapping.ActionKind.OPEN_CMUX
+        else _launch_command
+    )
     try:
         starter(command)
     except Exception:
@@ -296,4 +339,18 @@ def _launch_command(command: Sequence[str]) -> None:
         stderr=subprocess.DEVNULL,
         close_fds=(sys.platform != "win32"),
         creationflags=creation_flags,
+    )
+
+
+def _launch_cmux_command(command: Sequence[str]) -> None:
+    # The Windows cmux build is a terminal program. It needs its own visible
+    # console and standard handles; _launch_command would discard its UI.
+    if len(command) == 1 and Path(command[0]).suffix.casefold() == ".lnk":
+        os.startfile(command[0])  # type: ignore[attr-defined]
+        return
+    subprocess.Popen(
+        list(command),
+        close_fds=(sys.platform != "win32"),
+        creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0)
+        if sys.platform == "win32" else 0,
     )

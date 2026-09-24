@@ -18,11 +18,31 @@ Item {
     property string pendingVoiceHotkey: ""
     readonly property int settingsStateColumnWidth: 96
     readonly property int settingsActionColumnWidth: tokens.buttonWidth6Chars
-    readonly property real voiceHotkeyEditorWidth:
-        Math.max(
-            130,
-            endpointCombo.width / 2 - tokens.buttonWidth4Chars - tokens.spacingSmall
-        )
+    // One group width for provider, shortcut (including refresh), and mode + limit.
+    // Long endpoint names and custom paths keep their own flexible columns.
+    readonly property real voiceEditorGroupWidth:
+        remoteRecordingModeComboWidth + tokens.spacingSmall + remoteRecordingLimitComboWidth
+    readonly property real voiceHotkeyEditorWidth: voiceEditorGroupWidth
+    readonly property real remoteRecordingModeComboWidth:
+        Math.max(tokens.buttonWidth4Chars, Math.ceil(remoteRecordingModeMetrics.advanceWidth) + 31)
+    readonly property real remoteRecordingLimitComboWidth:
+        Math.max(tokens.buttonWidth4Chars, Math.ceil(remoteRecordingLimitMetrics.advanceWidth) + 31)
+
+    TextMetrics {
+        id: remoteRecordingModeMetrics
+        font.family: root.tokens.fontFamily
+        font.pixelSize: root.tokens.fontSizeControl
+        font.weight: Font.Medium
+        text: qsTr("开关型")
+    }
+
+    TextMetrics {
+        id: remoteRecordingLimitMetrics
+        font.family: root.tokens.fontFamily
+        font.pixelSize: root.tokens.fontSizeControl
+        font.weight: Font.Medium
+        text: qsTr("10 分钟")
+    }
 
     readonly property bool voiceProgramManaged:
         SettingsController.voiceProgramManaged
@@ -34,8 +54,18 @@ Item {
         SettingsController.voiceProgramWeTypeSelected
     readonly property bool doubaoSelected:
         SettingsController.voiceProgramDoubaoSelected
+    readonly property string voiceHotkeyModeLabel:
+        !SettingsController.isRc003Device
+            && SettingsController.remoteRecordingModeIndex === 1
+            && (root.sogouSelected || root.wetypeSelected || root.doubaoSelected)
+        ? qsTr("开关型") : qsTr("按住型")
     readonly property bool customProgramSelected:
         SettingsController.voiceProgramCustomSelected
+    readonly property bool voiceProgramUnsupported:
+        SettingsController.activeRemoteKey.length > 0
+        && !SettingsController.isRc003Device
+        && root.voiceProgramManaged
+        && !root.wetypeSelected && !root.sogouSelected && !root.doubaoSelected
     readonly property bool voiceHotkeyBusy: SettingsController.voiceHotkeyBusy
     readonly property bool voiceHotkeyRefreshVisible:
         root.sogouSelected || root.wetypeSelected || root.doubaoSelected
@@ -46,6 +76,7 @@ Item {
         || String(SettingsController.voiceRuntimeState) === "finishing"
     readonly property bool voiceHotkeyRefreshEnabled:
         root.voiceHotkeyRefreshVisible
+        && !root.voiceProgramUnsupported
         && !root.voiceHotkeyBusy
         && !SettingsController.settingsSaveBusy
         && !root.configurationWriteBusy
@@ -66,7 +97,8 @@ Item {
         && SettingsController.voiceProgramLaunchElevated
             !== (SettingsController.voiceProgramElevationStatus === "elevated")
     readonly property color voiceProgramStateColor:
-        SettingsController.voiceProgramSettingsDirty
+        root.voiceProgramUnsupported ? tokens.disabledText
+        : SettingsController.voiceProgramSettingsDirty
             ? tokens.voiceAccent
             : SettingsController.voiceProgramStatusCode === "running"
                 ? (voiceProgramPrivilegeMismatch
@@ -79,7 +111,9 @@ Item {
             return qsTr("正在保存")
         const code = String(SettingsController.voiceProgramStatusCode)
         if (!root.voiceProgramManaged)
-            return qsTr("不管理")
+            return qsTr("待配置")
+        if (root.voiceProgramUnsupported)
+            return qsTr("尚未接通")
         if (code === "running") {
             if (root.voiceProgramPrivilegeMismatch)
                 return qsTr("退出后点“重新检测”")
@@ -251,7 +285,7 @@ Item {
         tokens: root.tokens
         preferredWidth: 480
         height: Math.min(300, parent.height - 32)
-        title: qsTr("试说一句")
+        title: qsTr("语音试说")
         closeButtonObjectName: "speakTestCloseButton"
         onOpened: Qt.callLater(function() { speakTestInput.forceActiveFocus() })
 
@@ -278,7 +312,7 @@ Item {
                 kind: noteKind
                 Layout.fillWidth: true
                 wrapMode: Text.WordWrap
-                text: qsTr("点击输入框，按住遥控器话筒键说话，松开后看文字有没有进来。")
+                text: qsTr("点击输入框，用遥控器说一句话，查看文字是否输入。")
             }
 
             ScrollView {
@@ -386,7 +420,7 @@ Item {
                 SettingsSectionTitle {
                     objectName: "audioPrerequisiteSectionTitle"
                     tokens: root.tokens
-                    text: qsTr("音频前置")
+                    text: qsTr("音频前置") + " · " + SettingsController.activeRemoteLabel
                 }
 
                 InlineSettingsRow {
@@ -489,7 +523,7 @@ Item {
                     tokens: root.tokens
                     actionColumnWidth: root.settingsActionColumnWidth
                     titleText: qsTr("麦克风权限")
-                    descriptionText: qsTr("确认桌面语音软件可以访问麦克风")
+                    descriptionText: qsTr("允许语音程序访问麦克风")
                     showDivider: false
 
                     CompactButton {
@@ -519,10 +553,18 @@ Item {
                 InlineSettingsRow {
                     objectName: "voiceProgramSelectionRow"
                     tokens: root.tokens
+                    // Do not let a long note shrink the editor below its children.
+                    // Keep this provider-specific sizing out of the shared row.
+                    editorColumnWidth: root.voiceEditorGroupWidth
+                        + (root.voiceProgramLaunchable
+                            ? root.settingsActionColumnWidth + tokens.spacingSmall : 0)
                     stateColumnWidth: root.settingsStateColumnWidth
                     actionColumnWidth: root.settingsActionColumnWidth
                     titleText: qsTr("选择程序")
-                    descriptionText: ""
+                    descriptionText: root.voiceProgramUnsupported
+                        ? qsTr("谷歌遥控已接通微信、搜狗和豆包；此选择暂不能用于语音")
+                        : !root.voiceProgramManaged
+                            ? qsTr("请选择语音程序，普通按键不受影响") : ""
                     stateText: root.voiceProgramStateText()
                     stateColor: root.voiceProgramStateColor
 
@@ -531,20 +573,33 @@ Item {
                             id: voiceProgramCombo
                             objectName: "voiceProgramCombo"
                             tokens: root.tokens
-                            Layout.fillWidth: true
-                            Layout.minimumWidth: 130
-                            model: SettingsController.voiceProgramOptions
-                            currentIndex: SettingsController.selectedVoiceProgramIndex
+                            Layout.preferredWidth: root.voiceEditorGroupWidth
+                            Layout.minimumWidth: root.voiceEditorGroupWidth
+                            Layout.maximumWidth: root.voiceEditorGroupWidth
+                            // Controller indices stay stable for legacy provider settings.
+                            // Hide the reserved none entry; -1 is a prompt, not an option.
+                            model: SettingsController.voiceProgramOptions.slice(1)
+                            currentIndex: SettingsController.selectedVoiceProgramIndex - 1
+                            // Qt selects row zero when an asynchronously refreshed
+                            // model arrives; restore the explicit persisted choice.
+                            function restoreSelectedProgram() {
+                                currentIndex = Qt.binding(function() {
+                                    return SettingsController.selectedVoiceProgramIndex - 1
+                                })
+                            }
+                            onModelChanged: Qt.callLater(restoreSelectedProgram)
+                            Component.onCompleted: Qt.callLater(restoreSelectedProgram)
+                            displayText: !root.voiceProgramManaged
+                                ? qsTr("请选择语音程序") : currentText
                             enabled: !root.voiceHotkeyBusy
                                 && !root.configurationWriteBusy
-                            onActivated: SettingsController.selectedVoiceProgramIndex = index
+                            onActivated: SettingsController.selectedVoiceProgramIndex = index + 1
                             Accessible.name: qsTr("语音程序")
                         },
                         CheckBox {
                             id: voiceProgramElevatedCheckBox
                             objectName: "voiceProgramElevatedCheckBox"
-                            visible: !root.voiceProgramManaged
-                                || root.voiceProgramLaunchable
+                            visible: root.voiceProgramLaunchable
                             implicitHeight: tokens.controlHeight
                             Layout.preferredWidth: root.settingsActionColumnWidth
                             Layout.minimumWidth: root.settingsActionColumnWidth
@@ -581,6 +636,77 @@ Item {
                 }
 
                 InlineSettingsRow {
+                    objectName: "rc003RemoteRecordingModeRow"
+                    visible: SettingsController.isRc003Device
+                    tokens: root.tokens
+                    titleText: qsTr("按键模式")
+                    descriptionText: qsTr("仅支持按住型")
+                    showDivider: root.voiceProgramManaged
+                }
+
+                InlineSettingsRow {
+                    objectName: "remoteRecordingModeRow"
+                    visible: !SettingsController.isRc003Device
+                    tokens: root.tokens
+                    titleText: qsTr("按键模式")
+                    showDivider: root.voiceProgramManaged
+                    descriptionText: SettingsController.remoteRecordingModeIndex === 0
+                        ? qsTr("按住说话，松开结束")
+                        : root.doubaoSelected
+                            ? qsTr("按一下开始，再按结束；到时或操作键盘也会结束")
+                        : root.wetypeSelected || root.sogouSelected
+                            ? qsTr("按一下开始，再按结束；到时停止遥控音频")
+                            : qsTr("按下开始，再按结束。注意期间按键处于按下状态")
+                    editorColumnWidth: root.remoteRecordingModeComboWidth
+                        + (SettingsController.remoteRecordingModeIndex === 1
+                            ? root.remoteRecordingLimitComboWidth : 0)
+                        + (SettingsController.remoteRecordingModeIndex === 1 ? root.tokens.spacingSmall : 0)
+                    editorData: [SelectionComboBox {
+                        objectName: "remoteRecordingModeCombo"
+                        tokens: root.tokens
+                        Layout.preferredWidth: root.remoteRecordingModeComboWidth
+                        Layout.minimumWidth: root.remoteRecordingModeComboWidth
+                        Layout.maximumWidth: root.remoteRecordingModeComboWidth
+                        model: [
+                            qsTr("按住型"),
+                            qsTr("开关型")
+                        ]
+                        currentIndex: SettingsController.remoteRecordingModeIndex
+                        enabled: !SettingsController.settingsSaveBusy && !root.configurationWriteBusy
+                            && !SettingsController.remoteSelectionBusy && !SettingsController.inputCaptureInUse
+                            && !root.voiceHotkeyRuntimeBusy && !root.voiceHotkeyBusy
+                        onActivated: function(index) {
+                            SettingsController.setRemoteRecordingPreferences(
+                                index, SettingsController.remoteRecordingLimitIndex)
+                            currentIndex = Qt.binding(function() {
+                                return SettingsController.remoteRecordingModeIndex
+                            })
+                        }
+                        Accessible.name: qsTr("按键模式")
+                    }, SelectionComboBox {
+                        objectName: "remoteRecordingLimitCombo"
+                        visible: SettingsController.remoteRecordingModeIndex === 1
+                        tokens: root.tokens
+                        Layout.preferredWidth: root.remoteRecordingLimitComboWidth
+                        Layout.minimumWidth: root.remoteRecordingLimitComboWidth
+                        Layout.maximumWidth: root.remoteRecordingLimitComboWidth
+                        model: SettingsController.remoteRecordingLimitOptions
+                        currentIndex: SettingsController.remoteRecordingLimitIndex
+                        enabled: !SettingsController.settingsSaveBusy && !root.configurationWriteBusy
+                            && !SettingsController.remoteSelectionBusy && !SettingsController.inputCaptureInUse
+                            && !root.voiceHotkeyRuntimeBusy && !root.voiceHotkeyBusy
+                        onActivated: function(index) {
+                            SettingsController.setRemoteRecordingPreferences(
+                                SettingsController.remoteRecordingModeIndex, index)
+                            currentIndex = Qt.binding(function() {
+                                return SettingsController.remoteRecordingLimitIndex
+                            })
+                        }
+                        Accessible.name: qsTr("最长录音时间")
+                    }]
+                }
+
+                InlineSettingsRow {
                     objectName: "voiceProgramCustomPathRow"
                     visible: root.customProgramSelected
                     tokens: root.tokens
@@ -595,9 +721,13 @@ Item {
                             tokens: root.tokens
                             Layout.fillWidth: true
                             Layout.minimumWidth: 180
-                            readOnly: true
+                            enabled: !root.voiceHotkeyBusy && !root.configurationWriteBusy
                             text: SettingsController.voiceProgramCustomPath
-                            placeholderText: qsTr("选择 .exe 或 .lnk")
+                            placeholderText: qsTr("选择或粘贴 .exe / .lnk 路径")
+                            onEditingFinished: {
+                                SettingsController.voiceProgramCustomPath = text
+                                text = Qt.binding(function() { return SettingsController.voiceProgramCustomPath })
+                            }
                             Accessible.name: qsTr("自定义语音程序路径")
                         }
                     ]
@@ -614,8 +744,9 @@ Item {
 
                 InlineSettingsRow {
                     objectName: "voiceHotkeyRow"
+                    visible: root.voiceProgramManaged
                     tokens: root.tokens
-                    showDivider: false
+                    showDivider: root.customProgramSelected
                     editorColumnWidth: root.voiceHotkeyEditorWidth
                     stateColumnWidth: root.settingsStateColumnWidth
                     actionColumnWidth: root.settingsActionColumnWidth
@@ -623,12 +754,14 @@ Item {
                     descriptionText: root.voiceHotkeyCaptureError.length > 0
                         ? root.voiceHotkeyCaptureError
                         : root.wetypeSelected
-                        ? qsTr("点击刷新会打开微信设置读取，也可手动录入")
+                        ? qsTr("刷新时会打开微信设置")
                         : root.doubaoSelected
-                        ? qsTr("自动读取豆包输入法的按住型快捷键，也可手动录入")
+                        ? SettingsController.remoteRecordingModeIndex === 1
+                            ? qsTr("自动读取开关型快捷键")
+                            : qsTr("自动读取按住型快捷键")
                         : root.sogouSelected
-                        ? qsTr("自动读取搜狗语音的按住型快捷键，也可手动录入")
-                        : qsTr("仅支持录入“按住型”快捷键")
+                        ? qsTr("自动读取%1快捷键").arg(root.voiceHotkeyModeLabel)
+                        : qsTr("请录入按住型快捷键")
                     stateText: root.voiceHotkeyRecording
                         ? SettingsController.hotkeyCaptureReady
                             ? qsTr("录入中") : qsTr("准备中")
@@ -669,6 +802,7 @@ Item {
                                 selectByMouse: false
                                 enabled: !root.voiceHotkeyBusy
                                     && !root.configurationWriteBusy
+                                    && !root.voiceProgramUnsupported
                                 text: root.voiceHotkeyRecording
                                     ? SettingsController.hotkeyCaptureReady
                                         ? qsTr("请按快捷键") : qsTr("正在准备…")
@@ -676,7 +810,7 @@ Item {
                                 color: root.voiceHotkeyRecording
                                     ? tokens.accent : tokens.textPrimary
                                 placeholderText: qsTr("尚未录入")
-                                Accessible.name: qsTr("语音按键，仅支持录入按住型快捷键")
+                                Accessible.name: qsTr("语音按键，录入%1快捷键").arg(root.voiceHotkeyModeLabel)
                                 Keys.onEscapePressed: root.stopVoiceHotkeyCapture(
                                     "escape_pressed")
                                 onActiveFocusChanged: {
@@ -711,8 +845,10 @@ Item {
                                     tokens: root.tokens
                                     active: refreshVoiceHotkeyHover.hovered
                                     text: root.wetypeSelected
-                                        ? qsTr("打开微信设置并读取按住说话快捷键；失败保留原值")
-                                        : qsTr("重新读取输入法当前的按住型快捷键")
+                                        ? SettingsController.remoteRecordingModeIndex === 1
+                                            ? qsTr("打开微信设置并读取启动语音输入快捷键；失败保留原值")
+                                            : qsTr("打开微信设置并读取按住说话快捷键；失败保留原值")
+                                        : qsTr("重新读取输入法当前的%1快捷键").arg(root.voiceHotkeyModeLabel)
                                 }
                             }
                         }
@@ -727,7 +863,28 @@ Item {
                             ? qsTr("停止") : qsTr("手动录入")
                         enabled: !root.voiceHotkeyBusy
                             && !root.configurationWriteBusy
+                            && !root.voiceProgramUnsupported
                         onClicked: root.startVoiceHotkeyCapture()
+                    }
+                }
+
+                SettingsListRow {
+                    objectName: "voiceProgramAutoStartRow"
+                    visible: root.customProgramSelected
+                    tokens: root.tokens
+                    showDivider: false
+                    titleText: qsTr("随遥控器服务启动")
+                    descriptionText: qsTr("关闭后请自行启动语音程序")
+                    CompactSwitch {
+                        objectName: "voiceProgramAutoStartSwitch"
+                        tokens: root.tokens
+                        checked: SettingsController.voiceProgramLaunchOnBridgeStart
+                        enabled: !root.voiceHotkeyBusy && !root.configurationWriteBusy
+                        Accessible.name: qsTr("随遥控器服务启动语音程序")
+                        onToggled: {
+                            if (checked !== SettingsController.voiceProgramLaunchOnBridgeStart)
+                                SettingsController.voiceProgramLaunchOnBridgeStart = checked
+                        }
                     }
                 }
 
@@ -756,7 +913,7 @@ Item {
                     titleText: qsTr("虚拟声卡")
                     descriptionText: DiagnosticsController.vbCableTestMessage.length > 0
                         ? DiagnosticsController.vbCableTestMessage
-                        : qsTr("检查声音能否通过虚拟声卡；不测试语音识别")
+                        : qsTr("只检查声音通路，不验证识别结果")
                     descriptionObjectName: "soundChannelTestDescription"
                     stateText: DiagnosticsController.vbCableBridgeRecoveryNeeded
                         ? qsTr("点击“启动服务”")
@@ -809,7 +966,7 @@ Item {
                     stateColumnWidth: root.settingsStateColumnWidth
                     actionColumnWidth: root.settingsActionColumnWidth
                     titleText: qsTr("试输入")
-                    descriptionText: qsTr("打开输入框，看说的话有没有变成文字")
+                    descriptionText: qsTr("检查说话内容能否输入")
                     descriptionObjectName: "actualSpeechTestDescription"
                     showDivider: false
                     CompactButton {
@@ -817,12 +974,20 @@ Item {
                         objectName: "trySpeakingButton"
                         tokens: root.tokens
                         Layout.fillWidth: true
-                        text: qsTr("试说一句")
-                        highlighted: true
+                        text: qsTr("语音试说")
                         onClicked: speakTestDialog.open()
                         KeyNavigation.tab: root.tabTarget
                     }
                 }
+            }
+
+            UiLabel {
+                objectName: "holdRecordingNote"
+                tokens: root.tokens
+                kind: noteKind
+                Layout.fillWidth: true
+                wrapMode: Text.Wrap
+                text: qsTr("按住型录音期间，语音快捷键会保持按下。请避免同时操作其他按键/鼠标操作。设置快捷键时，请留意与常用操作的冲突。")
             }
 
             Item { Layout.preferredHeight: tokens.pageVerticalPadding }

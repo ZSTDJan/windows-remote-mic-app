@@ -99,6 +99,8 @@ _SETTINGS_WINDOW_RESTORE_CAPABILITY_PROPERTY = (
 _SETTINGS_WINDOW_RESTORE_REQUEST_PROPERTY = (
     "RemoteMicRC003.SettingsWindowRestorePendingV1"
 )
+_SETTINGS_WINDOW_RESTORE_EVENT_PROPERTY = "RemoteMicRC003.SettingsWindowRestoreEventV1"
+_settings_window_restore_events: dict[int, int] = {}
 _APPLICATION_EXIT_CAPABILITY_PROPERTY = (
     "RemoteMicRC003.ApplicationExitRequestV3"
 )
@@ -366,6 +368,117 @@ def _real_remove_window_property(hwnd: int, property_name: str) -> int:
     return int(raw_value) if raw_value else 0
 
 
+def _restore_event_name(hwnd: int, token: int) -> str:
+    return rf"Local\RemoteMicRC003_Restore_{hwnd:x}_{token:x}"
+
+
+def _restore_event_api():
+    _require_windows()
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateEventExW.argtypes = (
+        ctypes.c_void_p, wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+    )
+    kernel32.CreateEventExW.restype = wintypes.HANDLE
+    kernel32.OpenEventW.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.LPCWSTR)
+    kernel32.OpenEventW.restype = wintypes.HANDLE
+    kernel32.SetEvent.argtypes = (wintypes.HANDLE,)
+    kernel32.SetEvent.restype = wintypes.BOOL
+    kernel32.WaitForSingleObject.argtypes = (wintypes.HANDLE, wintypes.DWORD)
+    kernel32.WaitForSingleObject.restype = wintypes.DWORD
+    kernel32.LocalFree.argtypes = (ctypes.c_void_p,)
+    kernel32.LocalFree.restype = ctypes.c_void_p
+    return kernel32
+
+
+def _real_create_restore_event(hwnd: int, token: int) -> int:
+    from . import hid_elevation_windows
+
+    class SecurityAttributes(ctypes.Structure):
+        _fields_ = [
+            ("nLength", wintypes.DWORD),
+            ("lpSecurityDescriptor", ctypes.c_void_p),
+            ("bInheritHandle", wintypes.BOOL),
+        ]
+
+    kernel32 = _restore_event_api()
+    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    convert = advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW
+    convert.argtypes = (
+        wintypes.LPCWSTR, wintypes.DWORD,
+        ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(wintypes.DWORD),
+    )
+    convert.restype = wintypes.BOOL
+    sid = hid_elevation_windows.canonical_user_sid(hid_elevation_windows.current_user_sid())
+    descriptor = ctypes.c_void_p()
+    # Only this user in this Windows session can signal/wait. The explicit
+    # medium label permits a normal launch to notify an elevated owner; low
+    # integrity callers still cannot write. This event carries no commands.
+    sddl = f"D:P(A;;0x00100002;;;{sid})S:(ML;;NW;;;ME)"
+    if not convert(sddl, 1, ctypes.byref(descriptor), None):
+        return 0
+    try:
+        attributes = SecurityAttributes(ctypes.sizeof(SecurityAttributes), descriptor, False)
+        # Auto-reset, initially nonsignaled; do not request EVENT_ALL_ACCESS.
+        raw_handle = kernel32.CreateEventExW(
+            ctypes.byref(attributes), _restore_event_name(hwnd, token), 0,
+            _SYNCHRONIZE | 0x0002,
+        )
+        error = ctypes.get_last_error()
+        if not raw_handle:
+            return 0
+        handle = int(raw_handle)
+        if error == _ERROR_ALREADY_EXISTS:
+            _real_close_handle(handle)
+            return 0
+        return handle
+    finally:
+        kernel32.LocalFree(descriptor)
+
+
+def _real_signal_restore_event(hwnd: int, token: int) -> bool:
+    kernel32 = _restore_event_api()
+    handle = kernel32.OpenEventW(0x0002, False, _restore_event_name(hwnd, token))
+    if not handle:
+        return False
+    try:
+        return bool(kernel32.SetEvent(handle))
+    finally:
+        _real_close_handle(int(handle))
+
+
+def register_settings_window_restore_event(hwnd: int) -> bool:
+    """Publish a best-effort cross-integrity notification for this Qt window."""
+    if not hwnd:
+        return False
+    if hwnd in _settings_window_restore_events:
+        return True
+    handle = 0
+    try:
+        token = (uuid.uuid4().int & 0x7FFFFFFF) or 1
+        handle = _real_create_restore_event(hwnd, token)
+        if not handle:
+            return False
+        if not _real_set_window_property_value(hwnd, _SETTINGS_WINDOW_RESTORE_EVENT_PROPERTY, token):
+            return False
+        _settings_window_restore_events[hwnd] = handle
+        return True
+    except Exception:
+        return False
+    finally:
+        if handle and hwnd not in _settings_window_restore_events:
+            _real_close_handle(handle)
+
+
+def release_settings_window_restore_event(hwnd: int) -> None:
+    handle = _settings_window_restore_events.pop(hwnd, 0)
+    if not handle:
+        return
+    try:
+        _real_remove_window_property(hwnd, _SETTINGS_WINDOW_RESTORE_EVENT_PROPERTY)
+    finally:
+        _real_close_handle(handle)
+
+
 def mark_settings_window(
     hwnd: int,
     *,
@@ -404,12 +517,20 @@ def consume_settings_window_restore_request(
 
     if not hwnd:
         return False
+    requested = False
+    handle = _settings_window_restore_events.get(hwnd, 0)
+    if handle:
+        try:
+            requested = _restore_event_api().WaitForSingleObject(handle, 0) == 0
+        except Exception:
+            pass
     try:
-        return bool(
+        legacy_requested = bool(
             _remove_property(hwnd, _SETTINGS_WINDOW_RESTORE_REQUEST_PROPERTY)
         )
+        return requested or legacy_requested
     except Exception:
-        return False
+        return requested
 
 
 def consume_settings_window_exit_request(
@@ -646,6 +767,11 @@ def _real_activate_marked_window(
         return False
 
     hwnd = matches[0]
+    restore_event_token = user32.GetPropW(hwnd, _SETTINGS_WINDOW_RESTORE_EVENT_PROPERTY)
+    if restore_event_token:
+        # UIPI blocks SetPropW from medium to high integrity. Signal the
+        # owner's narrowly scoped event instead; Qt still owns visibility.
+        return _real_signal_restore_event(hwnd, int(restore_event_token))
     if _require_restore_request or user32.GetPropW(
         hwnd, _SETTINGS_WINDOW_RESTORE_CAPABILITY_PROPERTY
     ):

@@ -32,11 +32,40 @@ class SemanticApplicationActionTests(unittest.TestCase):
             ):
                 shortcuts = list(
                     action_executor._start_menu_shortcuts(
-                        ("微信", "WeChat"), exact_only=True
+                        ("微信", "WeChat")
                     )
                 )
 
         self.assertEqual(shortcuts, [])
+
+    def test_application_lookup_rejects_related_shortcuts_and_keeps_exact_aliases(self):
+        # Exercise the resolver and real shortcut filter together; no shortcut
+        # is launched and the user's Start Menu is never read or changed.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "Microsoft" / "Windows" / "Start Menu" / "Programs"
+            root.mkdir(parents=True)
+            with mock.patch.dict(os.environ, {"APPDATA": tmp, "PROGRAMDATA": ""}), \
+                 mock.patch.object(action_executor, "_candidate_paths", return_value=[]), \
+                 mock.patch.object(action_executor, "_packaged_desktop_command", return_value=None):
+                for kind, aliases in action_executor._APPLICATION_SHORTCUT_NAMES.items():
+                    action = key_mapping.ButtonAction(kind)
+                    for alias in aliases:
+                        with self.subTest(action=kind.value, alias=alias):
+                            related = [root / (name + ".lnk") for name in (
+                                "Uninstall " + alias, alias + " Update",
+                                "卸载" + alias, alias + " 帮助", "Other " + alias,
+                            )]
+                            for path in related:
+                                path.touch()
+                            resolve = lambda: action_executor.resolve_application_command(
+                                action, executable_exists=lambda path: path.is_file())
+                            self.assertIsNone(resolve())
+                            exact = root / (alias.swapcase() + ".lnk")
+                            exact.touch()
+                            self.assertEqual(resolve(), (str(exact),))
+                            exact.unlink()
+                            for path in related:
+                                path.unlink()
 
     def test_missing_start_menu_environment_never_searches_the_working_directory(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -74,6 +103,49 @@ class SemanticApplicationActionTests(unittest.TestCase):
                 command = action_executor.resolve_application_command(action)
 
         self.assertEqual(command, (str(executable),))
+
+    def test_desktop_agent_actions_do_not_launch_command_line_agents(self):
+        for kind, cli_path in (
+            (key_mapping.ActionKind.OPEN_CODEX, Path("C:/Users/Test/AppData/Local/OpenAI/Codex/bin/build/codex.exe")),
+            (key_mapping.ActionKind.OPEN_CLAUDE, Path("C:/Users/Test/.local/bin/claude.exe")),
+        ):
+            with self.subTest(kind=kind), mock.patch.object(
+                action_executor, "_candidate_paths", return_value=[cli_path]
+            ), mock.patch.object(
+                action_executor, "_start_menu_shortcuts", return_value=[]
+            ), mock.patch.object(
+                action_executor, "_packaged_desktop_command", return_value=None
+            ):
+                self.assertIsNone(action_executor.resolve_application_command(
+                    key_mapping.ButtonAction(kind), executable_exists=lambda _path: True
+                ))
+
+    def test_store_claude_action_uses_registered_desktop_app_id(self):
+        result = mock.Mock(returncode=0, stdout='[{"Name":"Claude","AppID":"Claude_example!Claude"}]')
+        with mock.patch.object(action_executor.subprocess, "run", return_value=result):
+            command = action_executor._packaged_desktop_command(
+                key_mapping.ActionKind.OPEN_CLAUDE
+            )
+        self.assertIsNotNone(command)
+        self.assertEqual(Path(command[0]).name.casefold(), "explorer.exe")
+        self.assertEqual(command[1], "shell:AppsFolder\\Claude_example!Claude")
+
+    def test_cmux_launch_uses_a_visible_console(self):
+        with mock.patch.object(action_executor.subprocess, "Popen") as popen, \
+             mock.patch.object(action_executor.subprocess, "CREATE_NEW_CONSOLE", 0x10, create=True):
+            action_executor._launch_cmux_command(("C:/Apps/cmux.exe",))
+        popen.assert_called_once()
+        self.assertEqual(popen.call_args.args[0], ["C:/Apps/cmux.exe"])
+        self.assertEqual(popen.call_args.kwargs["creationflags"], 0x10)
+        self.assertNotIn("stdout", popen.call_args.kwargs)
+
+    def test_cmux_mapping_selects_console_launcher(self):
+        action = key_mapping.ButtonAction(key_mapping.ActionKind.OPEN_CMUX)
+        with mock.patch.object(action_executor, "resolve_application_command",
+                               return_value=("C:/Apps/cmux.exe",)), \
+             mock.patch.object(action_executor, "_launch_cmux_command") as launch:
+            self.assertTrue(action_executor.open_configured_application(action))
+        launch.assert_called_once_with(("C:/Apps/cmux.exe",))
 
     def test_open_uses_the_resolved_command_and_does_not_start_a_real_process(self):
         action = key_mapping.ButtonAction(key_mapping.ActionKind.OPEN_CHROME)

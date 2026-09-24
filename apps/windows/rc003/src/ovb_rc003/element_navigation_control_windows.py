@@ -41,6 +41,8 @@ _LOGGER = logging.getLogger(__name__)
 
 
 def _remote_mic_quicker_state_file() -> str:
+    if dev_session.is_isolated():
+        return str(dev_session.isolated_root() / "quicker-navigation.json")
     local_app_data = os.environ.get("LOCALAPPDATA", "").strip()
     if not local_app_data:
         return ""
@@ -268,6 +270,10 @@ def send_element_navigation_command(
         _real_send_window_command
     ),
 ) -> CommandSendResult:
+    if dev_session.is_isolated():
+        # The test desktop owns its embedded navigator; never find/control
+        # another copy through the legacy global window protocol.
+        return CommandSendResult.FAILED
     try:
         command_window = int(_find_window())
     except Exception:

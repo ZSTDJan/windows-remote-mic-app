@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path, PureWindowsPath
 from typing import Callable, Optional, Sequence
 
-from . import dev_session
+from . import dev_session, product_identity
 
 
 RUN_KEY_PATH = r"Software\Microsoft\Windows\CurrentVersion\Run"
@@ -104,9 +104,8 @@ def _owned_frozen_startup_command(
     if len(arguments) != 2 or arguments[1] != BACKGROUND_START_FLAG:
         return False
     executable = PureWindowsPath(arguments[0])
-    if (
-        not executable.is_absolute()
-        or executable.name.casefold() != "remotemicrc003.exe"
+    if not executable.is_absolute() or not product_identity.is_recognized_windows_executable_name(
+        executable.name
     ):
         return False
     return command_line(arguments) == value
@@ -123,14 +122,15 @@ def rebind_owned_frozen_startup(
 ) -> StartupState:
     """Move this product's existing login entry to the current frozen copy."""
 
+    if dev_session.is_isolated():
+        return StartupState(False, "隔离测试不修改随系统启动。")
     current_platform = sys.platform if platform is None else platform
     current_frozen = bool(getattr(sys, "frozen", False)) if frozen is None else bool(frozen)
     if current_platform != "win32" or not current_frozen:
         return StartupState(False)
     current_executable = PureWindowsPath(executable or sys.executable)
-    if (
-        not current_executable.is_absolute()
-        or current_executable.name.casefold() != "remotemicrc003.exe"
+    if not current_executable.is_absolute() or not product_identity.is_recognized_windows_executable_name(
+        current_executable.name
     ):
         return StartupState(False, "ValueError")
     expected = current_command or command_line(
@@ -178,6 +178,8 @@ def read_startup_state(
     expected_command: Optional[str] = None,
     winreg_module=None,
 ) -> StartupState:
+    if dev_session.is_isolated():
+        return StartupState(False, "隔离测试不使用随系统启动。")
     current_platform = sys.platform if platform is None else platform
     if current_platform != "win32":
         return StartupState(False, "仅 Windows 支持随系统启动。")
@@ -206,6 +208,8 @@ def set_startup_enabled(
     startup_command: Optional[str] = None,
     winreg_module=None,
 ) -> StartupState:
+    if dev_session.is_isolated():
+        return StartupState(False, "隔离测试不修改随系统启动。")
     current_platform = sys.platform if platform is None else platform
     if current_platform != "win32":
         return StartupState(False, "仅 Windows 支持随系统启动。")

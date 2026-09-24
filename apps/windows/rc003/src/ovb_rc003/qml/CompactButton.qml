@@ -6,6 +6,7 @@ Button {
 
     property var tokens
     property int compactMinimumWidth: 0
+    property bool subduedText: false
 
     hoverEnabled: true
     implicitHeight: tokens ? tokens.buttonHeight : 30
@@ -22,7 +23,7 @@ Button {
             ? root.tokens.disabledText
             : root.highlighted
                 ? root.tokens.accentText
-                : root.tokens.textPrimary
+                : root.subduedText ? root.tokens.disabledText : root.tokens.textPrimary
         font: root.font
         horizontalAlignment: Text.AlignHCenter
         verticalAlignment: Text.AlignVCenter

@@ -34,7 +34,10 @@ def _log_names() -> tuple[str, ...]:
     for name, backups in ((logging_setup.LOG_FILENAME, logging_setup.LOG_BACKUP_COUNT),
                           (diagnostic_trace.TRACE_FILENAME, diagnostic_trace.TRACE_BACKUP_COUNT)):
         names.extend([name] + [f'{name}.{i}' for i in range(1, backups + 1)])
-    return (*names, logging_setup.HID_HELPER_LOG_FILENAME, diagnostic_trace.REPORT_FILENAME)
+    helper = logging_setup.HID_HELPER_LOG_FILENAME
+    return (*names, helper,
+            *(f'{helper}.{i}' for i in range(1, logging_setup.HID_HELPER_LOG_BACKUP_COUNT + 1)),
+            diagnostic_trace.REPORT_FILENAME)
 
 
 def _snapshot(path: Path) -> tuple[bytes, dict]:
@@ -72,6 +75,10 @@ def export_logs(destination: Path, *, root: Path | None = None,
         if cancelled():
             return ExportResult('cancelled')
         directory = logging_setup.log_dir(root)
+        # Flush what already arrived; do not wait for the post-failure window.
+        application_flushed = logging_setup.flush_application_logs(directory)
+        diagnostic_flushed = diagnostic_trace.flush_diagnostic_logs(directory)
+        report_flushed = diagnostic_trace.flush_fault_report(directory)
         records, captured = [], []
         # Read a bounded snapshot first so empty/wholly unreadable logs create no archive.
         for name in _log_names():
@@ -90,8 +97,11 @@ def export_logs(destination: Path, *, root: Path | None = None,
         if not captured:
             outcome = 'read_failed' if any(r['status'] == 'unreadable' for r in records) else 'no_logs'
             return ExportResult(outcome)
-        incomplete = any(r['status'] == 'unreadable' or r.get('truncated') for r in records)
+        incomplete = not all((application_flushed, diagnostic_flushed, report_flushed)) or any(r['status'] == 'unreadable' or r.get('truncated') for r in records)
         manifest = dict(schema_version=1, app_version=__version__,
+                        fault_report_flushed=report_flushed,
+                        application_log_flushed=application_flushed,
+                        diagnostic_trace_flushed=diagnostic_flushed,
                         exported_at=datetime.now().astimezone().isoformat(),
                         snapshot='bounded_live_files_not_atomic', files=records,
                         includes_configuration=False, includes_recordings=False)
@@ -120,7 +130,7 @@ def export_logs(destination: Path, *, root: Path | None = None,
 
 def describe_result(result: ExportResult) -> str:
     if result.outcome == 'exported':
-        note = '；部分日志已截取或未能读取，详情见包内说明' if result.incomplete else ''
+        note = '；部分日志未能完整保存或读取，详情见包内说明' if result.incomplete else ''
         return f'已导出 {result.file_count} 个日志文件：{result.path}{note}'
     return {
         'no_logs': '暂无可导出的日志。请先运行服务，复现问题后再导出。',

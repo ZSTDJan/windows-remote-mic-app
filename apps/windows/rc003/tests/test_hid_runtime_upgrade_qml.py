@@ -71,7 +71,7 @@ assert "旧按键组件未释放" in find(window, "buttonReceiverRow").property(
 assert "重启后重新打开程序" in find(window, "buttonReceiverRow").property("descriptionText")
 assert not device_page.bridgeNeedsRestartAction()
 assert try_speaking.property("enabled")
-assert speech_instruction.property("text") == "点击输入框，按住遥控器话筒键说话，松开后看文字有没有进来。"
+assert speech_instruction.property("text") == "点击输入框，用遥控器说一句话，查看文字是否输入。"
 
 # A stale restart-service recommendation must not hide the required host reload.
 controller._set_bridge_restart_recommended(True)
@@ -106,11 +106,45 @@ assert try_speaking.property("enabled")
 
 # After a compatible component has loaded, first input and normal operation
 # retain the existing UI states.
+input_state(frida_compat.HidTapState.UNAVAILABLE.value)
+assert device_page.buttonReceiverStateCode() == "component_unavailable"
+assert device_page.buttonReceiverStateText() == "按键组件不完整"
+assert "缺失或校验失败" in find(window, "buttonReceiverRow").property("descriptionText")
+assert not device_page.bridgeNeedsRestartAction()
+assert not device_page.bridgeActionVisible()
+assert device_page.bridgeStateText() == "已连接"
+controller._set_bridge_restart_recommended(True)
+assert not device_page.bridgeNeedsRestartAction()
+assert not device_page.bridgeActionVisible()
+controller._set_bridge_restart_recommended(False)
+
+# A transient interception failure still offers the existing service restart.
+input_state(frida_compat.HidTapState.UNHEALTHY.value)
+assert device_page.buttonReceiverStateCode() == "original_only"
+assert device_page.bridgeNeedsRestartAction()
+assert device_page.bridgeActionVisible()
+assert device_page.bridgeActionText() == "重启服务"
+
 input_state(frida_compat.HidTapState.ATTACHED_WAITING_IO.value)
-assert device_page.buttonReceiverStateText() == "请按遥控器方向键"
+assert device_page.buttonReceiverStateText() == "正常"
 input_state(frida_compat.HidTapState.READY.value)
 assert device_page.buttonReceiverStateText() == "正常"
 assert try_speaking.property("enabled")
+
+# Chromecast does not consume the Xiaomi component or its stale failure state.
+controller._config["remote_selection"]["devices"][0]["profile"] = "chromecast-remote"
+controller.remoteSelectionChanged.emit()
+assert not controller.isRc003Device
+bridge_runtime_status.publish_status(
+    root_path, bridge_runtime_status.BridgeConnectionState.CONNECTED,
+    pid=os.getpid(), raw_input_state="chromecast_ready",
+    hid_tap_state=frida_compat.HidTapState.UNAVAILABLE.value,
+)
+controller._set_bridge_input_states(bridge_runtime_status.read_status(root_path))
+assert device_page.buttonReceiverStateText() == "正常"
+assert not device_page.bridgeNeedsRestartAction()
+controller._config["remote_selection"]["devices"][0]["profile"] = "xiaomi-rc003"
+controller.remoteSelectionChanged.emit()
 
 input_state(frida_compat.HidTapState.RESTART_REQUIRED.value)
 render(window, app)

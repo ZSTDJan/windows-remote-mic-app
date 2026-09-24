@@ -57,6 +57,51 @@ class WeTypeSettingsReaderTests(unittest.TestCase):
         self.open.assert_not_called()
         self.assertEqual(self.access.root.call_count, 2)
 
+    def test_updated_descriptions_read_each_modes_own_shortcut(self):
+        from ovb_rc003.voice_hotkey_sync_windows import _parse_wetype_settings_shortcut
+
+        root, _ = page(shortcut="左Ctrl 左Alt F8")
+        fields = root.children[0].children[-1].children
+        fields[0].Name = "启动语音输入 按下可开启语音输入，再次按快捷键或 Enter 结束"
+        fields[1].children[0].Name = "左Shift 左Alt F8"
+        self.access.root.return_value = root
+        self.assertEqual(_parse_wetype_settings_shortcut(self.read(trigger="toggle")), "lshift+lalt+f8")
+        self.assertEqual(_parse_wetype_settings_shortcut(self.read()), "lctrl+lalt+f8")
+        self.open.assert_not_called()
+        self.access.select_voice_page.assert_not_called()
+
+    def test_titles_allow_description_changes_but_not_similar_names(self):
+        for trigger, index, title in (("toggle", 0, "启动语音输入"), ("hold", 2, "按住说话")):
+            for label, matches in ((title, True), (title + "\n新的说明", True),
+                                   (title + "设置", False), ("说明 " + title, False)):
+                with self.subTest(trigger=trigger, label=label):
+                    root, _ = page()
+                    fields = root.children[0].children[-1].children
+                    fields[index].Name = label
+                    value, _, _ = reader._snapshot(root, lambda: None, trigger=trigger)
+                    self.assertEqual(bool(value), matches)
+
+    def test_toggle_duplicate_rows_and_invalid_fields_are_rejected(self):
+        for variant, code in (("duplicate", "ambiguous_ui"),
+                              ("disabled", "unavailable_shortcut"),
+                              ("wrong_type", "unavailable_shortcut"),
+                              ("multiple_values", "ambiguous_shortcut")):
+            with self.subTest(variant=variant):
+                root, _ = page()
+                fields = root.children[0].children[-1].children
+                fields[0].Name = "启动语音输入 新的说明"
+                if variant == "duplicate":
+                    fields.extend(fields[:2])
+                elif variant == "disabled":
+                    fields[1].IsEnabled = False
+                elif variant == "wrong_type":
+                    fields[1].ControlTypeName = "ButtonControl"
+                else:
+                    fields[1].children.append(Control("F8"))
+                with self.assertRaises(reader.SettingsReadError) as raised:
+                    reader._snapshot(root, lambda: None, trigger="toggle")
+                self.assertEqual(raised.exception.code, code)
+
     def test_closed_window_is_opened_once_then_voice_page_is_invoked_once(self):
         input_page, button = page(False)
         self.access.windows.side_effect = [(), (22,), (22,), (22,), (22,)]

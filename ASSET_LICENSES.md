@@ -2,6 +2,16 @@
 
 Release status: APPROVED
 
+## Chromecast product photo
+
+- File: `Resources/Chromecast-remote-photo.png`
+- Origin: user-supplied JANN.library image selected for the Chromecast mapping page on 2026-09-16
+- Import: copied without pixel changes; SHA-256 `72F0350E9CAFD91F2D13C7AA8618FBD5E6C89F27EFFDB46D74EDEDDB093F9712`
+- Copyright owner: the repository maintainer, confirmed on 2026-09-24
+- Permission: the owner authorized public redistribution of this unchanged image
+  with Remote Mic on 2026-09-24; no broader reuse or modification license is
+  implied by this record
+
 ## Windows application icons
 
 - Files: `apps/windows/rc003/src/ovb_rc003/assets/icons/remote-mic-connected.svg`,
@@ -14,6 +24,9 @@ Release status: APPROVED
   `#4AA8FF`; the ICO is generated from the connected SVG
 - License: ISC
 - License text: `THIRD_PARTY_LICENSES/Lucide-266fd1c/LICENSE.txt`
+- The newer user-owned JANN.library icons were allowed for public distribution
+  only in their original form. Their recolored SVGs and derived ICO are not in
+  this release.
 
 ## RC003 product image
 

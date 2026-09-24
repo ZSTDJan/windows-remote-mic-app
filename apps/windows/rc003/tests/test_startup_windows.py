@@ -49,6 +49,21 @@ class _FakeWinreg:
 
 
 class StartupWindowsTests(unittest.TestCase):
+    def test_new_versioned_unicode_executable_builds_startup_command(self):
+        command = startup_windows.command_line(
+            startup_windows.build_startup_command(
+                frozen=True,
+                executable=(
+                    r"C:\无线麦 测试\无线麦 win版 "
+                    r"1.0.51-candidate.51.exe"
+                ),
+            )
+        )
+        self.assertEqual(
+            command,
+            '"C:\\无线麦 测试\\无线麦 win版 1.0.51-candidate.51.exe" --background',
+        )
+
     def test_frozen_command_uses_background_shell(self):
         self.assertEqual(
             startup_windows.build_startup_command(
@@ -138,6 +153,69 @@ class StartupWindowsTests(unittest.TestCase):
         self.assertEqual(state.error, "")
         self.assertEqual(registry.value, current_command)
         self.assertEqual(registry.set_calls, 1)
+
+    def test_rebind_owned_frozen_startup_migrates_legacy_to_versioned_name(self):
+        old_executable = r"D:\旧版\RemoteMicRC003.exe"
+        new_executable = (
+            r"E:\新版 无线麦\无线麦 win版 1.0.51-candidate.51.exe"
+        )
+        old_command = startup_windows.command_line(
+            [old_executable, "--background"]
+        )
+        registry = _FakeWinreg(old_command)
+
+        state = startup_windows.rebind_owned_frozen_startup(
+            platform="win32",
+            frozen=True,
+            executable=new_executable,
+            winreg_module=registry,
+            command_parser=lambda _value: [old_executable, "--background"],
+        )
+
+        self.assertTrue(state.enabled)
+        self.assertEqual(
+            registry.value,
+            startup_windows.command_line([new_executable, "--background"]),
+        )
+
+    def test_rebind_owned_frozen_startup_migrates_between_versioned_names(self):
+        old_executable = r"D:\旧版\无线麦 win版 1.0.50-candidate.50.exe"
+        new_executable = r"E:\新版\无线麦 win版 1.0.51-candidate.51.exe"
+        old_command = startup_windows.command_line(
+            [old_executable, "--background"]
+        )
+        registry = _FakeWinreg(old_command)
+
+        state = startup_windows.rebind_owned_frozen_startup(
+            platform="win32",
+            frozen=True,
+            executable=new_executable,
+            winreg_module=registry,
+            command_parser=lambda _value: [old_executable, "--background"],
+        )
+
+        self.assertTrue(state.enabled)
+        self.assertEqual(
+            registry.value,
+            startup_windows.command_line([new_executable, "--background"]),
+        )
+
+    def test_rebind_owned_frozen_startup_rejects_unrecognized_current_name(self):
+        registry = _FakeWinreg(
+            startup_windows.command_line(
+                [r"D:\旧版\RemoteMicRC003.exe", "--background"]
+            )
+        )
+        state = startup_windows.rebind_owned_frozen_startup(
+            platform="win32",
+            frozen=True,
+            executable=r"E:\新版\无线麦.exe",
+            winreg_module=registry,
+            command_parser=lambda _value: self.fail("parser should not run"),
+        )
+        self.assertFalse(state.enabled)
+        self.assertEqual(state.error, "ValueError")
+        self.assertEqual(registry.set_calls, 0)
 
     def test_rebind_owned_frozen_startup_works_when_old_exe_is_missing(self):
         old_command = startup_windows.command_line(

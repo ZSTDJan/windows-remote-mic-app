@@ -9,6 +9,43 @@ from ovb_rc003 import app, config, logging_setup, voice_program_manager as manag
 
 
 class VoiceProgramSettingsTests(unittest.TestCase):
+    def test_sogou_start_follows_service_even_with_legacy_false(self):
+        value = manager.normalize_voice_program_settings({
+            "provider": "sogou", "launch_on_bridge_start": False,
+            "launch_on_bridge_start_by_provider": {"sogou": False, "custom": False}})
+        self.assertTrue(value["launch_on_bridge_start"])
+        self.assertEqual(manager.normalize_voice_program_settings(value), value)
+        value["provider"] = "custom"
+        self.assertFalse(manager.normalize_voice_program_settings(value)["launch_on_bridge_start"])
+        for provider in ("wetype", "doubao_ime", "none"):
+            value["provider"] = provider
+            self.assertFalse(manager.normalize_voice_program_settings(value)["launch_on_bridge_start"])
+
+    def test_start_preference_normalization_is_stable_and_preserves_legacy_false(self):
+        value = manager.normalize_voice_program_settings(
+            {"provider": "custom", "launch_on_bridge_start": False})
+        self.assertEqual(value["launch_on_bridge_start_by_provider"], {"custom": False})
+        value["provider"] = "wetype"
+        value = manager.normalize_voice_program_settings(value)
+        self.assertFalse(value["launch_on_bridge_start"])
+        value["provider"] = "custom"
+        value = manager.normalize_voice_program_settings(value)
+        self.assertFalse(value["launch_on_bridge_start"])
+        self.assertEqual(manager.normalize_voice_program_settings(value), value)
+
+    def test_unconfigured_and_invalid_paths_fail_voice_only(self):
+        for provider in ("none", "unknown", ""):
+            self.assertIn("选择语音程序", manager.voice_configuration_issue({"provider": provider}))
+            self.assertFalse(manager.is_launchable_provider(provider))
+        with tempfile.TemporaryDirectory() as temp:
+            executable = Path(temp) / "voice.exe"
+            executable.mkdir()
+            settings = {"provider": "custom", "custom_executable": str(executable)}
+            self.assertIn("路径无效", manager.voice_configuration_issue(settings))
+            executable.rmdir()
+            executable.touch()
+            self.assertEqual(manager.voice_configuration_issue(settings), "")
+
     def test_defaults_keep_provider_management_disabled(self):
         self.assertEqual(
             manager.normalize_voice_program_settings(None),
@@ -16,6 +53,7 @@ class VoiceProgramSettingsTests(unittest.TestCase):
                 "provider": "none",
                 "custom_executable": "",
                 "launch_on_bridge_start": False,
+                "launch_on_bridge_start_by_provider": {},
                 "launch_elevated": False,
                 "launch_elevated_by_provider": {
                     "sogou": True,
@@ -38,6 +76,7 @@ class VoiceProgramSettingsTests(unittest.TestCase):
                 "provider": "none",
                 "custom_executable": "voice.exe",
                 "launch_on_bridge_start": False,
+                "launch_on_bridge_start_by_provider": {},
                 "launch_elevated": False,
                 "launch_elevated_by_provider": {
                     "sogou": False,
@@ -90,6 +129,7 @@ class VoiceProgramSettingsTests(unittest.TestCase):
                 "provider": "none",
                 "custom_executable": "voice.exe",
                 "launch_on_bridge_start": False,
+                "launch_on_bridge_start_by_provider": {},
                 "launch_elevated": True,
                 "launch_elevated_by_provider": {
                     "sogou": True,
@@ -161,7 +201,7 @@ class VoiceProgramSettingsTests(unittest.TestCase):
         self.assertEqual(
             manager.provider_options(),
             [
-                "不管理",
+                "请选择语音程序",
                 "搜狗语音输入",
                 "微信输入法",
                 "豆包输入法",
@@ -210,6 +250,59 @@ class VoiceProgramSettingsTests(unittest.TestCase):
         self.assertFalse(manager.is_launchable_provider("doubao_ime"))
 
 class SogouDiscoveryTests(unittest.TestCase):
+    def setUp(self):
+        patch = mock.patch.object(manager, "_read_sogou_install_values", return_value=())
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def test_install_registration_finds_voice_without_startup_entry_or_process(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "Sogou Input.1"
+            voice = root / "Components/ai_voice_input/1.0.1.3272/bin/sogou_voice_assistant.exe"
+            voice.parent.mkdir(parents=True)
+            voice.touch()
+            icon = root / "16.6.0.4777/SGTool.exe"
+            for value in (str(root), f'"{icon}",0'):
+                with self.subTest(value=value):
+                    found = manager.discover_sogou_voice_executable(
+                        platform="win32", process_iter=lambda: (),
+                        run_value_reader=lambda: (), install_value_reader=lambda: (value,),
+                    )
+                    self.assertEqual(found, voice)
+
+    def test_installed_input_method_without_voice_component_does_not_launch(self):
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(
+            manager, "_read_sogou_install_values", return_value=(tmp,)
+        ):
+            launcher = mock.Mock()
+            result = manager.launch_voice_program(
+                {"provider": "sogou"}, platform="win32",
+                process_iter=lambda: (), run_value_reader=lambda: (), start_file=launcher,
+            )
+            launcher.assert_not_called()
+            self.assertEqual(result.code, "not_found")
+            self.assertEqual(manager.launch_result_text(result),
+                             "未找到搜狗语音程序，请先安装或手动启动。")
+
+    def test_installed_voice_launch_is_confirmed_and_repeated_launch_is_reused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            voice = Path(tmp) / "Components/ai_voice_input/1.0/bin/sogou_voice_assistant.exe"
+            voice.parent.mkdir(parents=True)
+            voice.touch()
+            processes = []
+            def start(path, operation, cwd):
+                self.assertEqual(Path(path), voice)
+                self.assertEqual(operation, "open")
+                processes.append(manager.ProcessInfo(10, voice.name, voice, False))
+            launcher = mock.Mock(side_effect=start)
+            with mock.patch.object(manager, "_read_sogou_install_values", return_value=(tmp,)):
+                kwargs = dict(platform="win32", process_iter=lambda: processes,
+                              run_value_reader=lambda: (), start_file=launcher)
+                settings = {"provider": "sogou", "launch_elevated": False}
+                self.assertEqual(manager.launch_voice_program(settings, **kwargs).code, "started")
+                self.assertEqual(manager.launch_voice_program(settings, **kwargs).code, "already_running")
+                launcher.assert_called_once()
+
     def test_running_process_path_is_preferred(self):
         with tempfile.TemporaryDirectory() as tmp:
             executable = Path(tmp) / "sogou_voice_assistant.exe"
@@ -760,7 +853,7 @@ class VoiceProgramLaunchTests(unittest.TestCase):
 
     def test_bridge_start_does_nothing_until_explicitly_enabled(self):
         result = manager.launch_configured_at_bridge_start(
-            {"voice_program": {"provider": "sogou"}}
+            {"voice_program": {"provider": "custom"}}
         )
         self.assertEqual(result.code, "not_requested")
 
@@ -773,7 +866,7 @@ class VoiceProgramLaunchTests(unittest.TestCase):
             {
                 "voice_program": {
                     "provider": "sogou",
-                    "launch_on_bridge_start": True,
+                    "launch_on_bridge_start": False,
                 }
             },
             launcher=lambda settings: calls.append(dict(settings)) or expected,
@@ -783,6 +876,37 @@ class VoiceProgramLaunchTests(unittest.TestCase):
 
 
 class BridgeStartupWiringTests(unittest.TestCase):
+    def test_chromecast_launches_only_sogou_and_skips_diagnostic_recovery(self):
+        from ovb_rc003 import remote_selection
+        with tempfile.TemporaryDirectory() as tmp:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            try:
+                for provider, normal_start, expected in (("sogou", True, True),
+                        ("sogou", False, False), ("wetype", True, False),
+                        ("doubao_ime", True, False), ("custom", True, False)):
+                    with self.subTest(provider=provider, normal_start=normal_start):
+                        settings = config.default_config()
+                        settings['voice_program'] = manager.normalize_voice_program_settings({
+                            'provider': provider, 'launch_on_bridge_start': False})
+                        with (
+                            mock.patch.object(config, 'config_root', return_value=Path(tmp)),
+                            mock.patch.object(config, 'load_config', return_value=settings),
+                            mock.patch.object(remote_selection, 'active_profile', return_value=remote_selection.CHROMECAST_PROFILE),
+                            mock.patch.object(manager, 'launch_configured_at_bridge_start',
+                                return_value=manager.VoiceProgramLaunchResult(provider, False, True, 'already_running')) as launch,
+                        ):
+                            app.RC003App(launch_voice_program_on_start=normal_start)
+                        self.assertEqual(launch.call_count, int(expected))
+            finally:
+                logger = logging.getLogger(logging_setup.LOGGER_NAME)
+                for handler in list(logger.handlers):
+                    handler.close()
+                    logger.removeHandler(handler)
+                logging_setup._configured = False
+                asyncio.set_event_loop(None)
+                loop.close()
+
     def test_app_invokes_the_optional_voice_program_startup_gate(self):
         with tempfile.TemporaryDirectory() as tmp:
             loop = asyncio.new_event_loop()
