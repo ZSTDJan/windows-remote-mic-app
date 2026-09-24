@@ -160,6 +160,8 @@ _EXTENDED_KEYS = frozenset(
     {
         win32_keys.VK_CODES[name]
         for name in (
+            "pageup",
+            "pagedown",
             "up",
             "down",
             "left",
@@ -181,6 +183,8 @@ _EXTENDED_KEYS = frozenset(
 # left/right identity for directional modifiers. The boolean records whether
 # the scan code carries the E0 extended prefix.
 _PHYSICAL_SCAN_CODES = {
+    win32_keys.VK_CODES["pageup"]: (0x49, True),
+    win32_keys.VK_CODES["pagedown"]: (0x51, True),
     win32_keys.VK_CODES["up"]: (0x48, True),
     win32_keys.VK_CODES["down"]: (0x50, True),
     win32_keys.VK_CODES["left"]: (0x4B, True),

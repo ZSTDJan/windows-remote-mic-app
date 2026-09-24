@@ -17,16 +17,12 @@ Release status: APPROVED
 - Files: `apps/windows/rc003/src/ovb_rc003/assets/icons/remote-mic-connected.svg`,
   `apps/windows/rc003/src/ovb_rc003/assets/icons/remote-mic-unavailable.svg`, and
   the generated `remote-mic.ico`
-- Origin: Lucide `mic` and `mic-off` icons at revision
-  `266fd1c717905b2a64c8c38faf3a6aee99791121`
-- Source: <https://github.com/lucide-icons/lucide>
-- Modification: `currentColor` was replaced with the application's blue
-  `#4AA8FF`; the ICO is generated from the connected SVG
-- License: ISC
-- License text: `THIRD_PARTY_LICENSES/Lucide-266fd1c/LICENSE.txt`
-- The newer user-owned JANN.library icons were allowed for public distribution
-  only in their original form. Their recolored SVGs and derived ICO are not in
-  this release.
+- Origin: the maintainer's selected `JANN.library` microphone and
+  microphone-off designs, finalized for Remote Mic with `#4AA8FF` strokes
+- Copyright owner: the repository maintainer, confirmed on 2026-09-24
+- Permission: the owner approved public distribution of these exact finalized
+  blue SVGs and the ICO generated from the connected SVG with Remote Mic on
+  2026-09-24. This record does not authorize other changes to the designs.
 
 ## RC003 product image
 

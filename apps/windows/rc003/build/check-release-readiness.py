@@ -30,7 +30,6 @@ _REQUIRED_LICENSE_FILES = (
     "typing_extensions-4.16.0/LICENSE.txt",
     "PyInstaller-6.21.0/COPYING.txt",
     "OpenSSL-3/LICENSE.txt",
-    "Lucide-266fd1c/LICENSE.txt",
 )
 
 _PRIVATE_HISTORY_MARKERS = tuple(

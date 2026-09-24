@@ -173,18 +173,6 @@ branding is included.
 
 ## Separately licensed assets and software
 
-### Lucide application icons
-
-- Project: Lucide
-- Source: <https://github.com/lucide-icons/lucide>
-- Reference revision: `266fd1c717905b2a64c8c38faf3a6aee99791121`
-- Icons: `mic` and `mic-off`
-- License: ISC
-- License text: `THIRD_PARTY_LICENSES/Lucide-266fd1c/LICENSE.txt`
-
-The SVG stroke color is changed to the application's blue, and the Windows
-ICO is generated from the modified `mic` SVG.
-
 ### Chromecast product photo
 
 `Resources/Chromecast-remote-photo.png` is the user-supplied photo selected on

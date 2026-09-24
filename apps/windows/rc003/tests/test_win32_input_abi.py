@@ -189,5 +189,23 @@ class InputStructShapeTests(unittest.TestCase):
                     | win32_input._KEYEVENTF_EXTENDEDKEY,
                 )
 
+    def test_page_keys_use_extended_physical_scan_codes(self):
+        for name, scan_code in (("pageup", 0x49), ("pagedown", 0x51)):
+            with self.subTest(name=name):
+                vk = win32_input.win32_keys.VK_CODES[name]
+                array, _ = win32_input._build_input_array(
+                    [(vk, False), (vk, True)]
+                )
+                for index, key_up in ((0, False), (1, True)):
+                    keyboard = array[index].union.ki
+                    self.assertEqual((keyboard.wVk, keyboard.wScan), (0, scan_code))
+                    expected_flags = (
+                        win32_input._KEYEVENTF_SCANCODE
+                        | win32_input._KEYEVENTF_EXTENDEDKEY
+                    )
+                    if key_up:
+                        expected_flags |= win32_input._KEYEVENTF_KEYUP
+                    self.assertEqual(keyboard.dwFlags, expected_flags)
+
 if __name__ == "__main__":
     unittest.main()
