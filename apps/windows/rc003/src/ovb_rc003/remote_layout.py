@@ -133,6 +133,16 @@ CHROMECAST_REPORT_CODES = {
     "netflix": 0x0F, "input_source": 0x11,
 }
 
+# Consumer Control usages seen in the B remote's two-byte GATT reports.
+# Keep semantic button names shared with the existing eight-byte mapping.
+CHROMECAST_CONSUMER_USAGES = {
+    "power": 0x019E, "input_source": 0x0189,
+    "up": 0x0042, "down": 0x0043, "left": 0x0044, "right": 0x0045,
+    "ok": 0x0041, "back": 0x0224, "home": 0x0223,
+    "volume_up": 0x00E9, "volume_down": 0x00EA, "volume_mute": 0x00E2,
+    "youtube": 0x0077, "netflix": 0x0078,
+}
+
 
 def button_order(profile: str = "xiaomi-rc003") -> Tuple[str, ...]:
     if profile == "chromecast-remote":

@@ -15,11 +15,16 @@ from .chromecast_voice import GET_CAPABILITIES
 # Observed model/revision contract, NOT a default for arbitrary Chromecast
 # firmware. Both PnP identity and the live nonce proof must succeed each run.
 _VERIFIED_INPUT_HANDLES = {(0x18D1, 0x9450, 0x0110): 0x29}
-# The same verified firmware exposes declaration handles through WinRT, while
-# ATT notifications carry VALUE handles. These are not interchangeable. Never
-# guess "+1" for an unknown layout; open() has already enforced the PnP revision.
+# Raw ATT capture is restricted to the verified A layout. Direct WinRT callbacks
+# are bound to the discovered characteristic object, so their routing keys can
+# use its actual declaration handle without guessing an ATT value handle.
 _VERIFIED_VOICE_DECLARATIONS = (0x39, 0x3B, 0x3E)  # TX, audio, control
 _VERIFIED_VOICE_VALUES = {0x3C: "audio", 0x3F: "control"}
+_VOICE_SERVICE_ID = uuid.UUID("ab5e0001-5a21-4f05-bc7d-af01f617b664")
+# Windows may spend seven seconds establishing an unreachable GATT connection.
+# The worker keeps processing input/stop while this bounded query is pending.
+_VOICE_SERVICE_TIMEOUT = 10
+_VOICE_SESSION_TIMEOUT = 5
 _PNP = re.compile(r"(?:dev_vid&[0-9a-f]{2}|vid_)([0-9a-f]{4})(?:_pid&|&pid_)([0-9a-f]{4})(?:_rev&|&rev_)([0-9a-f]{4})", re.I)
 
 
@@ -60,6 +65,9 @@ class SelectedDevice:
         self.watcher = self.device = None
         self.tokens = []
         self.voice_service = self.voice_tx = None
+        self.voice_session = None
+        self._voice_services = []
+        self._voice_cleanup_failed = False
         self.voice_attributes = {}
         self.input_pending = False
         self.probe_status = -1
@@ -68,6 +76,9 @@ class SelectedDevice:
         self._voice_tokens = []
         self._voice_subscribed = []
         self._voice_open = False
+        self.voice_queries = []
+        self.voice_retryable = False
+        self._voice_cache_checked = False
 
     async def _resolve_input(self):
         # The worker owns the existing 20-second startup deadline and continues
@@ -136,40 +147,219 @@ class SelectedDevice:
             service.close()
         return int(result.status) == 0, len(services)
 
+    def _connection_status(self):
+        try:
+            return int(self.device.connection_status)
+        except Exception:
+            return -1
+
+    def _voice_link(self, step, *, outcome="success", started=None, error=None):
+        # Read-only status snapshots. Never request permissions or log device IDs.
+        def read(call, maximum):
+            try:
+                value = int(call())
+                return value if 0 <= value <= maximum else -1
+            except Exception:
+                return -1
+        code = getattr(error, "winerror", None)
+        row = dict(kind="voice_link", step=step, outcome=outcome,
+            duration_ms=0 if started is None else max(0, min(2147483647,
+                round((time.monotonic() - started) * 1000))),
+            hresult=(code & 0xffffffff) if type(code) is int else -1,
+            connected=self._connection_status(),
+            device_access=read(lambda: self.device.device_access_information.current_status, 3),
+            service_access=read(lambda: self.voice_service.device_access_information.current_status, 3),
+            sharing=read(lambda: self.voice_service.sharing_mode, 1),
+            service_handle=read(lambda: self.voice_service.attribute_handle, 65535),
+            session_status=read(lambda: self.voice_session.session_status, 1),
+            maintain=read(lambda: self.voice_session.maintain_connection, 1),
+            can_maintain=read(lambda: self.voice_session.can_maintain_connection, 1))
+        if len(self.voice_queries) < 16:
+            self.voice_queries.append(row)
+
+    async def _start_voice_session(self):
+        from winrt.windows.devices.bluetooth.genericattributeprofile import GattSession
+        started, outcome, error = time.monotonic(), "success", None
+        try:
+            self.voice_session = await asyncio.wait_for(
+                GattSession.from_device_id_async(self.device.bluetooth_device_id), _VOICE_SESSION_TIMEOUT)
+            if self.voice_session is None or not self.voice_session.can_maintain_connection:
+                raise PipeError("unsupported_layout")
+            self.voice_session.maintain_connection = True
+        except BaseException as exc:
+            error = exc
+            self.voice_retryable = isinstance(exc, TimeoutError)
+            outcome = "cancelled" if isinstance(exc, asyncio.CancelledError) else (
+                "timeout" if isinstance(exc, TimeoutError) else "exception")
+            raise
+        finally:
+            self._voice_link("session_create", outcome=outcome, started=started, error=error)
+
+    async def _wait_voice_session(self):
+        from winrt.windows.devices.bluetooth.genericattributeprofile import GattSessionStatus
+        started, outcome, error = time.monotonic(), "success", None
+        try:
+            async with asyncio.timeout(_VOICE_SESSION_TIMEOUT):
+                while self.voice_session.session_status != GattSessionStatus.ACTIVE:
+                    if self.changed.is_set():
+                        raise PipeError("radio_ambiguous")
+                    await asyncio.sleep(.05)
+        except BaseException as exc:
+            error = exc
+            self.voice_retryable = isinstance(exc, TimeoutError)
+            outcome = "cancelled" if isinstance(exc, asyncio.CancelledError) else (
+                "timeout" if isinstance(exc, TimeoutError) else "exception")
+            raise
+        finally:
+            self._voice_link("session_active", outcome=outcome, started=started, error=error)
+
+    async def _voice_query(self, step, call, *, cached=False, timeout=5):
+        """Keep only bounded interface metadata, never values or exception text."""
+        started = time.monotonic()
+        row = dict(step=step, cache="cached" if cached else "live", duration_ms=0,
+                   connected_before=self._connection_status(), connected_after=-1,
+                   outcome="exception", status=-1, protocol_error=-1, hresult=-1, item_count=0, items=[])
+        result = None
+        try:
+            result = await asyncio.wait_for(call(), timeout)
+            row["status"] = int(result if isinstance(result, int) else result.status)
+            try:
+                protocol_error = getattr(result, "protocol_error", None)
+                if type(protocol_error) is int and 0 <= protocol_error <= 255:
+                    row["protocol_error"] = protocol_error
+            except Exception:
+                pass
+            row["outcome"] = "success" if row["status"] == 0 else "status_failed"
+            return result
+        except asyncio.CancelledError:
+            row["outcome"] = "cancelled"
+            raise
+        except Exception as error:
+            row["outcome"] = "timeout" if isinstance(error, TimeoutError) else (
+                "os_error" if isinstance(error, OSError) else "exception")
+            code = getattr(error, "winerror", None)
+            if type(code) is int:
+                row["hresult"] = code & 0xffffffff
+            raise
+        finally:
+            row["connected_after"] = self._connection_status()
+            row["duration_ms"] = max(0, min(2147483647, round((time.monotonic() - started) * 1000)))
+            try:
+                items = list(getattr(result, step, ())) if step in {"services", "characteristics"} else []
+                row["item_count"] = min(len(items), 65535)
+                for item in items[:32]:
+                    row["items"].append(dict(uuid=str(uuid.UUID(str(item.uuid))),
+                        handle=int(item.attribute_handle),
+                        properties=int(item.characteristic_properties) if step == "characteristics" else -1))
+            except Exception:
+                pass  # Metadata access cannot change a successful query.
+            if len(self.voice_queries) < 16:
+                self.voice_queries.append(row)
+            if step == "characteristics" and not cached:
+                self._voice_link("characteristics", outcome=row["outcome"])
+
+    async def _cached_voice_inventory(self):
+        """A once-per-run diagnostic fallback; cached data never enables voice."""
+        if self._voice_cache_checked:
+            return
+        self._voice_cache_checked = True
+        from winrt.windows.devices.bluetooth import BluetoothCacheMode
+        services = []
+        try:
+            result = await self._voice_query("services", lambda:
+                self.device.get_gatt_services_with_cache_mode_async(BluetoothCacheMode.CACHED),
+                cached=True, timeout=3)
+            services = list(result.services)
+            if int(result.status) == 0:
+                selected = [s for s in services if s.uuid == _VOICE_SERVICE_ID]
+                if len(selected) == 1:
+                    await self._voice_query("characteristics", lambda:
+                        selected[0].get_characteristics_with_cache_mode_async(BluetoothCacheMode.CACHED),
+                        cached=True, timeout=3)
+        except Exception:
+            pass  # Its failure is already recorded; preserve the live failure.
+        finally:
+            for service in services:
+                try:
+                    service.close()
+                except Exception:
+                    pass  # Cached diagnostic cleanup must not mask the live error.
+
     async def open_voice(self, *, direct=False):
+        self.voice_queries = []
+        self.voice_retryable = False
         self.voice_evidence = dict(step="service", status=-1, tx=-1, audio=-1, control=-1,
             tx_handle=-1, audio_handle=-1, control_handle=-1, service_count=-1, characteristic_count=-1, mtu=-1)
+        try:
+            if self._voice_cleanup_failed or self.voice_session is not None or self._voice_services:
+                raise PipeError("cleanup_failed")
+            if direct:
+                await self._start_voice_session()
+            await self._discover_voice(direct=direct)
+            self._voice_link("ready")
+        except BaseException as error:
+            self._voice_link("failed", outcome="cancelled" if isinstance(error, asyncio.CancelledError)
+                             else "exception", error=error)
+            try:
+                await self.close_voice()
+            except Exception:
+                self.voice_retryable = False
+            raise
+
+    async def _discover_voice(self, *, direct):
         from winrt.windows.devices.bluetooth import BluetoothCacheMode
         from winrt.windows.devices.bluetooth.genericattributeprofile import GattCharacteristicProperties, GattWriteOption
-        service_id = uuid.UUID("ab5e0001-5a21-4f05-bc7d-af01f617b664")
-        result = await asyncio.wait_for(self.device.get_gatt_services_for_uuid_with_cache_mode_async(
-            service_id, BluetoothCacheMode.UNCACHED), 5)
-        services = list(result.services)
-        self.voice_evidence["status"] = int(result.status)
-        self.voice_evidence["service_count"] = len(services)
-        if int(result.status) != 0 or len(services) != 1:
-            for service in services:
-                service.close()
-            raise PipeError("unsupported_layout")
-        self.voice_service = services[0]
         try:
-            self.voice_evidence["mtu"] = int(self.voice_service.session.max_pdu_size)
+            result = await self._voice_query("services", lambda:
+                self.device.get_gatt_services_with_cache_mode_async(BluetoothCacheMode.UNCACHED),
+                timeout=_VOICE_SERVICE_TIMEOUT)
+        except (TimeoutError, OSError) as error:
+            self.voice_retryable = isinstance(error, TimeoutError)
+            await self._cached_voice_inventory()
+            raise
+        services = self._voice_services = list(result.services)
+        selected = [service for service in services if service.uuid == _VOICE_SERVICE_ID]
+        self.voice_evidence["status"] = int(result.status)
+        self.voice_evidence["service_count"] = len(selected)
+        if int(result.status) != 0 or len(selected) != 1:
+            self.voice_retryable = int(result.status) == 1  # DeviceUnreachable only.
+            if self.voice_retryable:
+                await self._cached_voice_inventory()
+            raise PipeError("unsupported_layout")
+        self.voice_service = selected[0]
+        if direct:
+            await self._wait_voice_session()
+        try:
+            session = self.voice_session if direct else self.voice_service.session
+            self.voice_evidence["mtu"] = int(session.max_pdu_size)
         except Exception:
             pass  # Read-only diagnostic; never create or configure a session.
         self.voice_evidence.update(step="characteristics", status=-1)
-        result = await asyncio.wait_for(self.voice_service.get_characteristics_with_cache_mode_async(BluetoothCacheMode.UNCACHED), 5)
-        characteristics = {str(c.uuid).lower(): c for c in result.characteristics}
+        result = await self._voice_query("characteristics", lambda:
+            self.voice_service.get_characteristics_with_cache_mode_async(BluetoothCacheMode.UNCACHED))
+        discovered = list(result.characteristics)
+        characteristics = {str(c.uuid).lower(): c for c in discovered}
         self.voice_evidence["status"] = int(result.status)
         self.voice_evidence["characteristic_count"] = len(characteristics)
         keys = [f"ab5e000{part}-5a21-4f05-bc7d-af01f617b664" for part in (2, 3, 4)]
-        if int(result.status) != 0 or not all(key in characteristics for key in keys):
+        if (int(result.status) != 0 or len(characteristics) != len(discovered)
+                or not all(key in characteristics for key in keys)):
             raise PipeError("unsupported_layout")
         tx, audio, control = (characteristics[key] for key in keys)
         self.voice_evidence.update(tx=int(tx.characteristic_properties),
                                    audio=int(audio.characteristic_properties), control=int(control.characteristic_properties),
                                    tx_handle=int(tx.attribute_handle), audio_handle=int(audio.attribute_handle),
                                    control_handle=int(control.attribute_handle))
-        if tuple(int(c.attribute_handle) for c in (tx, audio, control)) != _VERIFIED_VOICE_DECLARATIONS:
+        handles = tuple(int(c.attribute_handle) for c in (tx, audio, control))
+        if len(set(handles)) != 3 or not all(0 < h <= 65535 for h in handles):
+            raise PipeError("unsupported_layout")
+        if direct and not all(h > int(self.voice_service.attribute_handle) for h in handles):
+            raise PipeError("unsupported_layout")
+        if not direct and handles != _VERIFIED_VOICE_DECLARATIONS:
+            raise PipeError("unsupported_layout")
+        if direct and any(not (c.characteristic_properties &
+                (GattCharacteristicProperties.NOTIFY | GattCharacteristicProperties.INDICATE))
+                for c in (audio, control)):
             raise PipeError("unsupported_layout")
         self.voice_tx = tx
         properties = tx.characteristic_properties
@@ -179,14 +369,15 @@ class SelectedDevice:
             self.voice_write_option = GattWriteOption.WRITE_WITHOUT_RESPONSE
         else:
             raise PipeError("unsupported_layout")
-        self.voice_attributes = dict(_VERIFIED_VOICE_VALUES)
+        self.voice_attributes = ({handles[1]: "audio", handles[2]: "control"} if direct
+                                 else dict(_VERIFIED_VOICE_VALUES))
         if direct:
             from winrt.windows.devices.bluetooth.genericattributeprofile import (
                 GattClientCharacteristicConfigurationDescriptorValue as CccdValue,
             )
             self._voice_open = True
-            for characteristic, attribute in ((audio, 0x3C), (control, 0x3F)):
-                self.voice_evidence["step"] = "audio_subscription" if attribute == 0x3C else "control_subscription"
+            for characteristic, attribute, kind in ((audio, handles[1], "audio"), (control, handles[2], "control")):
+                self.voice_evidence["step"] = kind + "_subscription"
                 self.voice_evidence["status"] = -1
                 def notify(_sender, args, attribute=attribute):
                     if not self._voice_open:
@@ -208,12 +399,14 @@ class SelectedDevice:
                     mode = CccdValue.INDICATE
                 else:
                     raise PipeError("unsupported_layout")
-                status = await asyncio.wait_for(
-                    characteristic.write_client_characteristic_configuration_descriptor_async(mode), 5)
+                # A timed-out write may already have enabled the remote CCCD.
+                # Include every attempted subscription in bounded cleanup.
+                self._voice_subscribed.append(characteristic)
+                status = await self._voice_query(self.voice_evidence["step"], lambda:
+                    characteristic.write_client_characteristic_configuration_descriptor_async(mode))
                 self.voice_evidence["status"] = int(status)
                 if int(status) != 0:
                     raise PipeError("voice_subscribe_failed")
-                self._voice_subscribed.append(characteristic)
         self.voice_evidence["step"] = "ready"
 
     def poll_voice(self):
@@ -237,20 +430,64 @@ class SelectedDevice:
                 characteristic.remove_value_changed(token)
             except Exception:
                 failed = True
-        if subscribed:
-            from winrt.windows.devices.bluetooth.genericattributeprofile import (
-                GattClientCharacteristicConfigurationDescriptorValue as CccdValue,
-            )
-            for characteristic in subscribed:
-                try:
-                    status = await asyncio.wait_for(
-                        characteristic.write_client_characteristic_configuration_descriptor_async(CccdValue.NONE), 3)
-                    if int(status) != 0:
+        try:
+            if subscribed:
+                from winrt.windows.devices.bluetooth.genericattributeprofile import (
+                    GattClientCharacteristicConfigurationDescriptorValue as CccdValue,
+                )
+                for characteristic in subscribed:
+                    try:
+                        status = await asyncio.wait_for(
+                            characteristic.write_client_characteristic_configuration_descriptor_async(CccdValue.NONE), 3)
+                        if int(status) != 0:
+                            failed = True
+                    except Exception:
                         failed = True
-                except Exception:
-                    failed = True
-        if failed:
+        except asyncio.CancelledError:
+            failed = True
+            raise
+        finally:
+            failed = not self._release_voice_resources() or failed
+            self._voice_cleanup_failed = failed or self._voice_cleanup_failed
+            self._voice_link("closed", outcome="exception" if self._voice_cleanup_failed else "success")
+        if self._voice_cleanup_failed:
             raise PipeError("cleanup_failed")
+
+    def _release_voice_resources(self):
+        self._voice_open = False
+        self.voice_tx = None
+        self.voice_attributes = {}
+        failed_services = []
+        session = self.voice_session
+        ok = True
+        for service in self._voice_services:
+            try:
+                service.close()
+            except Exception:
+                ok = False
+                failed_services.append(service)
+        # Failed closes remain owned so final worker cleanup can try again.
+        self._voice_services = failed_services
+        if not any(service is self.voice_service for service in failed_services):
+            self.voice_service = None
+        if session is not None:
+            try:
+                session.maintain_connection = False
+            except Exception:
+                ok = False
+            try:
+                session.close()
+            except Exception:
+                ok = False
+            else:
+                self.voice_session = None
+        while not self._voice_events.empty():
+            try:
+                self._voice_events.get_nowait()
+            except queue.Empty:
+                break
+        self._voice_overflow.clear()
+        return ok
 
     async def write_voice(self, command):
         from winrt.windows.devices.bluetooth import BluetoothConnectionStatus
@@ -273,10 +510,7 @@ class SelectedDevice:
             writer.close()
 
     def close(self):
-        if self.voice_service:
-            self.voice_tx = None
-            self.voice_service.close()
-            self.voice_service = None
+        clean = self._release_voice_resources()
         if self.watcher:
             watcher, self.watcher = self.watcher, None
             for name, token in self.tokens:
@@ -286,3 +520,5 @@ class SelectedDevice:
         if self.device:
             device, self.device = self.device, None
             device.close()
+        if not clean or self._voice_cleanup_failed:
+            raise PipeError("cleanup_failed")

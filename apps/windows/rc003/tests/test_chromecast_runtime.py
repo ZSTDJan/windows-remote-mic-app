@@ -1000,6 +1000,21 @@ class ProductRoutingTests(_AppWiringTestCase):
 
 
 class DetectionUiTests(unittest.TestCase):
+    def test_selected_google_detection_logs_gui_acceptance_without_button_content(self):
+        from tests.test_remote_selection import B
+        from ovb_rc003 import qt_settings_app as qt
+        controller = self.seed_chromecast()
+        with mock.patch.object(controller, "_refresh_bridge_status", return_value=False):
+            controller.useRemoteDevice(B)
+        controller._key_detection_active = True
+        controller._input_operation_phase = "active"
+        with mock.patch.object(qt.logging_setup, "get_logger") as logger, \
+             mock.patch.object(controller, "stopKeyDetection", return_value=True), \
+             mock.patch.object(controller, "selectButton") as select:
+            controller._on_raw_key_detected("up", "")
+        logger.return_value.info.assert_called_once_with("Chromecast key detection: gui_accepted=1")
+        select.assert_called_once_with("up")
+
     from tests.test_remote_selection import SelectionControllerTests as _Fixture
     setUp = _Fixture.setUp
     tearDown = _Fixture.tearDown

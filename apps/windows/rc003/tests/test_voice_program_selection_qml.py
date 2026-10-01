@@ -29,6 +29,8 @@ assert combo.property("currentIndex") == -1, (combo.property("currentIndex"), co
 assert combo.property("displayText") == "请选择语音程序"
 assert not find(window, "voiceHotkeyRow").property("visible")
 assert not find(window, "voiceProgramAutoStartRow").property("visible")
+assert QMetaObject.invokeMethod(combo, "activated", Q_ARG(int, 4))
+assert controller.selectedVoiceProgramIndex == 0
 
 def choose(index, provider):
     assert QMetaObject.invokeMethod(combo, "activated", Q_ARG(int, index))
@@ -49,12 +51,36 @@ for provider_index, provider in ((0, "sogou"), (1, "wetype"), (2, "doubao_ime"))
     assert row.y() + row.height() <= section.height() + 1
     for name in ("refreshVoiceHotkeyButton", "recordVoiceHotkeyButton"):
         assert find(window, name).property("visible"), (provider, name)
+choose(3, "chatterfly")
+assert find(window, "voiceHotkeyRow").property("visible")
+assert not find(window, "refreshVoiceHotkeyButton").property("visible")
+assert find(window, "recordVoiceHotkeyButton").property("visible")
+assert find(window, "openVoiceProgramSettingsButton").property("visible")
 choose(1, "wetype")
 assert not switch.property("visible")
 choose(2, "doubao_ime")
 assert not switch.property("visible")
-choose(3, "custom")
+# Restore an existing configuration; the custom entry cannot be newly selected.
+def load_legacy_custom():
+    saved = dict(controller._config)
+    saved["voice_program"] = dict(controller._voice_program_settings, provider="custom")
+    m.config.save_config(m.config.config_path(m.config.config_root()), saved)
+    before = m.config.config_path(m.config.config_root()).read_bytes()
+    controller._config = m.config.load_config(m.config.config_path(m.config.config_root()))
+    controller._replace_voice_program_settings(controller._config["voice_program"])
+    render(window, app)
+    assert combo.property("currentIndex") == -1
+    assert combo.property("displayText") == "自定义程序（旧）"
+    assert combo.property("count") == 4
+    assert m.config.config_path(m.config.config_root()).read_bytes() == before
+
+load_legacy_custom()
+notice = find(window, "legacyVoiceProgramNotice")
+assert notice.property("visible") and not notice.property("truncated")
+assert "旧自定义配置已保留" in notice.property("text")
 assert switch.property("visible")
+switch.setProperty("checked", True)
+assert QMetaObject.invokeMethod(switch, "toggled")
 switch.setProperty("checked", False)
 assert QMetaObject.invokeMethod(switch, "toggled")
 assert not controller.voiceProgramLaunchOnBridgeStart
@@ -79,7 +105,9 @@ if image_dir:
     window.grabWindow().save(str(image_path / (os.environ["VOICE_SELECTION_STYLE"] + ".png")))
 choose(0, "sogou")
 assert controller.voiceProgramLaunchOnBridgeStart
-choose(3, "custom")
+assert QMetaObject.invokeMethod(combo, "activated", Q_ARG(int, 4))
+assert controller.selectedVoiceProgramIndex == 1
+load_legacy_custom()
 assert not controller.voiceProgramLaunchOnBridgeStart
 
 controller._config["remote_selection"] = {"schema": 1, "active": "a" * 64,
@@ -93,12 +121,12 @@ assert not rc003_recording_row.property("visible")
 assert find(window, "remoteRecordingModeRow").property("visible")
 row = find(window, "voiceProgramSelectionRow")
 assert row.property("stateText") == "尚未接通"
-assert "已接通微信、搜狗和豆包" in row.property("descriptionText")
+assert "此旧配置不能用于谷歌语音" in notice.property("text")
+assert notice.property("visible") and not notice.property("truncated")
 editor_bounds = geometry(find(window, "voiceProgramSelectionRow_editorColumn"))
 permission_bounds = geometry(find(window, "voiceProgramElevatedCheckBox"))
-note_bounds = geometry(find(window, "voiceProgramSelectionRow_descriptionLabel"))
 assert permission_bounds["right"] <= editor_bounds["right"] + 1, (editor_bounds, permission_bounds)
-assert note_bounds["x"] >= permission_bounds["right"], (note_bounds, permission_bounds)
+assert notice.y() + notice.height() <= row.y() + 1
 if image_dir:
     window.grabWindow().save(str(image_path / (os.environ["VOICE_SELECTION_STYLE"] + "-unsupported.png")))
 # The current page remains usable at minimum width; horizontal overflow must
@@ -107,13 +135,12 @@ for name in ("voiceProgramCombo", "voiceProgramElevatedCheckBox"):
     item = find(window, name)
     bounds = geometry(item)
     assert bounds["x"] >= 0 and bounds["right"] <= window.property("width"), (name, bounds)
-choose(3, "custom")
-note_bounds = geometry(find(window, "voiceProgramSelectionRow_descriptionLabel"))
-permission_bounds = geometry(find(window, "voiceProgramElevatedCheckBox"))
-assert note_bounds["x"] >= permission_bounds["right"], (note_bounds, permission_bounds)
+load_legacy_custom()
+assert not notice.property("truncated")
 if image_dir:
     window.grabWindow().save(str(image_path / (os.environ["VOICE_SELECTION_STYLE"] + "-custom-unsupported.png")))
 choose(1, "wetype")
+assert not notice.property("visible")
 assert row.property("stateText") != "尚未接通"
 choose(2, "doubao_ime")
 assert controller.remoteRecordingModeIndex == 0
@@ -125,6 +152,9 @@ assert row.property("descriptionText") == ""
 assert find(window, "remoteRecordingModeRow").property("descriptionText") == "按一下开始，再按结束；到时或操作键盘也会结束"
 assert find(window, "refreshVoiceHotkeyButton").property("enabled")
 assert find(window, "recordVoiceHotkeyButton").property("enabled")
+choose(3, "chatterfly")
+assert row.property("stateText") != "尚未接通"
+assert not find(window, "refreshVoiceHotkeyButton").property("visible")
 
 # Returning to Xiaomi restores the read-only row without stealing focus or
 # causing a configuration write/restart as a side effect of rendering it.

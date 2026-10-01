@@ -28,6 +28,7 @@ import logging
 from logging.handlers import RotatingFileHandler
 import os
 import re
+import stat
 import threading
 import time
 import hashlib
@@ -44,10 +45,12 @@ from . import config
 LOGGER_NAME = "ovb_rc003"
 LOG_FILENAME = "app.log"
 HID_HELPER_LOG_FILENAME = "hid-helper.log"
-HID_HELPER_LOG_MAX_BYTES = 1024 * 1024
+HID_HELPER_LOG_MAX_BYTES = 512 * 1024
 HID_HELPER_LOG_BACKUP_COUNT = 1
-LOG_MAX_BYTES = 5 * 1024 * 1024
-LOG_BACKUP_COUNT = 3
+LOG_MAX_BYTES = 512 * 1024
+LOG_BACKUP_COUNT = 1
+# Pre-512-KiB app/trace backups remain exportable until a successful rotation.
+LEGACY_LOG_BACKUP_COUNT = 3
 LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
 
 _HID_EVENT_MARKER_PATTERN = re.compile(r"[A-Za-z0-9_.:=+-]{1,160}")
@@ -89,6 +92,23 @@ class PrivacySafeExceptionFilter(logging.Filter):
         return True
 
 
+def prune_legacy_log_backups(path: Path, backup_count: int) -> None:
+    """Retire only known old backups after the caller completes its rotation."""
+    if backup_count <= 0:
+        return
+    for index in range(backup_count + 1, LEGACY_LOG_BACKUP_COUNT + 1):
+        backup = path.with_name(f"{path.name}.{index}")
+        try:
+            metadata = backup.lstat()
+            if (stat.S_ISREG(metadata.st_mode)
+                    and not getattr(metadata, 'st_file_attributes', 0)
+                    & stat.FILE_ATTRIBUTE_REPARSE_POINT):
+                backup.unlink()
+        except OSError:
+            # Keep unreadable/locked history exportable; retry on the next rotation.
+            pass
+
+
 class EvidenceFileHandler(RotatingFileHandler):
     """Optional bounded application writer; fault archives use the shared writer.
 
@@ -120,6 +140,10 @@ class EvidenceFileHandler(RotatingFileHandler):
         if self._asynchronous:
             Path(self.baseFilename).parent.mkdir(parents=True, exist_ok=True)
         return super()._open()
+
+    def doRollover(self):
+        super().doRollover()
+        prune_legacy_log_backups(Path(self.baseFilename), self.backupCount)
 
     def emit(self, record):
         if self._worker is None:

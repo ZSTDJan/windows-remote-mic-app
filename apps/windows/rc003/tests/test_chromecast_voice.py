@@ -991,10 +991,11 @@ class DeviceVoiceLayoutTests(unittest.IsolatedAsyncioTestCase):
                                 attribute_handle=handle,
                                 characteristic_properties=GattCharacteristicProperties.WRITE)
                  for part, handle in ((2, 0x39), (3, 0x3b), (4, 0x3e))]
-        service = SimpleNamespace(get_characteristics_with_cache_mode_async=mock.AsyncMock(
+        service = SimpleNamespace(uuid=uuid.UUID("ab5e0001-5a21-4f05-bc7d-af01f617b664"),
+            attribute_handle=0x37, close=mock.Mock(), get_characteristics_with_cache_mode_async=mock.AsyncMock(
             return_value=SimpleNamespace(status=0, characteristics=chars)))
         device = SelectedDevice("a" * 64)
-        device.device = SimpleNamespace(get_gatt_services_for_uuid_with_cache_mode_async=mock.AsyncMock(
+        device.device = SimpleNamespace(get_gatt_services_with_cache_mode_async=mock.AsyncMock(
             return_value=SimpleNamespace(status=0, services=[service])))
         await device.open_voice()
         self.assertEqual(device.voice_attributes, {0x3c: "audio", 0x3f: "control"})
@@ -1002,6 +1003,7 @@ class DeviceVoiceLayoutTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(valid_record(dict(kind="gatt", elapsed_ms=0, **device.voice_evidence)))
         self.assertEqual(device.voice_evidence["control_handle"], 0x3e)
         self.assertEqual(device.voice_evidence["mtu"], -1)
+        await device.close_voice()
         chars[1].attribute_handle = 0x4b
         with self.assertRaises(PipeError):
             await device.open_voice()

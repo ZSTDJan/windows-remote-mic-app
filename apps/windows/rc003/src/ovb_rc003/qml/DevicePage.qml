@@ -734,14 +734,24 @@ Item {
                         tokens: root.tokens
                         text: SettingsController.logExportBusy ? qsTr("导出中…") : qsTr("导出日志")
                         enabled: !SettingsController.logExportBusy
-                        Layout.rightMargin: root.deviceActionColumnWidth
-                            - diagnosticTraceSwitch.implicitWidth
                         KeyNavigation.backtab: launchBridgeOnAppStartSwitch
-                        KeyNavigation.tab: diagnosticTraceSwitch
+                        KeyNavigation.tab: deviceLogLocationLink
                         onClicked: {
                             logExportDialog.selectedFile = SettingsController.logExportDefaultFile()
                             logExportDialog.open()
                         }
+                    }
+
+                    CompactLink {
+                        id: deviceLogLocationLink
+                        objectName: "deviceLogLocationLink"
+                        tokens: root.tokens
+                        text: qsTr("打开日志位置")
+                        Layout.rightMargin: root.deviceActionColumnWidth
+                            - diagnosticTraceSwitch.implicitWidth
+                        KeyNavigation.backtab: deviceOpenLogButton
+                        KeyNavigation.tab: diagnosticTraceSwitch
+                        onClicked: SettingsController.openLogLocation()
                     }
 
                     CompactSwitch {
@@ -750,7 +760,7 @@ Item {
                         tokens: root.tokens
                         checked: SettingsController.diagnosticTraceEnabled
                         Accessible.name: qsTr("诊断日志")
-                        KeyNavigation.backtab: deviceOpenLogButton
+                        KeyNavigation.backtab: deviceLogLocationLink
                         onToggled: {
                             if (checked !== SettingsController.diagnosticTraceEnabled)
                                 SettingsController.setDiagnosticTraceEnabled(checked)

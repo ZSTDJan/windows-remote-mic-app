@@ -116,6 +116,79 @@ class ConfigurationFlowTests(unittest.TestCase):
         self.assertFalse(controller._save_mapping())
         self.assertTrue(controller.mappingDirty)
 
+    def test_legacy_mapping_edit_and_unrelated_autosave_keep_saved_key_order(self):
+        path = config.key_bindings_path(config.config_root())
+        document = config.load_key_bindings(path)
+        old = {
+            "single_click": {"kind": "key_combo", "keys": ["vk_a2", "shift"]},
+            "double_click": {"kind": "key_combo", "keys": ["vk_11"]},
+            "long_press": {"kind": "key_combo", "keys": ["vk_00"]},
+        }
+        document["bindings"]["power"] = old["single_click"]
+        document.setdefault("secondary_bindings", {})["power"] = {
+            key: value for key, value in old.items() if key != "single_click"
+        }
+        config.save_key_bindings(path, document)
+        before = path.read_bytes()
+        controller, model = self.controller()
+        row = model.index_of("power")
+        self.assertEqual(path.read_bytes(), before)
+        for gesture, role in (("single_click", model.ActionTextRole),
+                              ("double_click", model.DoubleClickTextRole),
+                              ("long_press", model.LongPressTextRole)):
+            label = model.data(model.index(row, 0), role)
+            self.assertEqual(controller.buttonActionValidationMessage("power", gesture, label), "")
+            if gesture == "single_click":
+                self.assertEqual(label, "左 Ctrl（键码 0xA2） + Shift")
+                model.setActionTextAt(row, label.lower().replace(" + ", "＋"))
+            else:
+                model.setSecondaryActionTextAt(row, gesture, label)
+        self.assertFalse(controller.mappingDirty)
+        self.assertEqual(path.read_bytes(), before)
+        # Saving a note in this editor, then another button, must also retain
+        # the invalid legacy gesture without making it executable.
+        model.setDisplayNoteAt(row, "single_click", "保留旧键码")
+        controller._run_mapping_auto_save()
+        self.assertFalse(controller.mappingDirty, controller.errorMessage)
+        model.setActionTextAt(model.index_of("up"), "Ctrl+F9")
+        controller._run_mapping_auto_save()
+        self.assertFalse(controller.mappingDirty, controller.errorMessage)
+        saved = config.load_key_bindings(path)
+        for gesture, expected in old.items():
+            self.assertEqual(key_mapping.button_action_for(
+                saved, "power", key_mapping.ButtonTrigger(gesture)).to_dict(), expected)
+        self.assertEqual(saved["bindings"]["up"]["keys"], ["ctrl", "f9"])
+        controller._load_bindings_into_model()
+        self.assertEqual(model.to_display_map()["power"], "vk_a2+shift")
+        from ovb_rc003 import win32_input, win32_keys
+        sender = mock.Mock(side_effect=lambda events: len(events))
+        action = key_mapping.button_action_for(saved, "power", key_mapping.ButtonTrigger.SINGLE_CLICK)
+        win32_input.send_key_combo_tap(action.keys, _sender=sender, _key_down_query=lambda vk: False)
+        sender.assert_called_once_with([(0xA2, False), (0x10, False), (0x10, True), (0xA2, True)])
+        sender.reset_mock()
+        invalid = key_mapping.button_action_for(saved, "power", key_mapping.ButtonTrigger.LONG_PRESS)
+        with self.assertRaises(win32_keys.UnknownKeyTokenError):
+            win32_input.send_key_combo_tap(invalid.keys, _sender=sender, _key_down_query=lambda vk: False)
+        sender.assert_not_called()
+
+    def test_invalid_voice_key_keeps_saved_value_and_never_syncs_provider(self):
+        controller, _ = self.controller()
+        controller.selectedVoiceProgramIndex = 2
+        controller.holdVoiceHotkeyText = "ctrl+shift+f9"
+        previous = controller.holdVoiceHotkeyText
+        path = config.config_path(config.config_root())
+        before = path.read_bytes()
+        self.fixture._voice_hotkey_sync_mock.reset_mock()
+        for text, reason in (("Ctrl+A+A", "一个普通键"), ("Ctrl+vk_00", "无效"),
+                             ("Ctrl+numpad_left", "NumLock")):
+            with self.subTest(text=text):
+                controller.holdVoiceHotkeyText = text
+                self.assertEqual(controller.holdVoiceHotkeyText, previous)
+                self.assertEqual(path.read_bytes(), before)
+                self.assertIn(reason, controller.errorMessage)
+                self.assertEqual(controller.voiceHotkeySaveState, "retry")
+        self.fixture._voice_hotkey_sync_mock.assert_not_called()
+
     def test_voice_launch_keeps_qt_responsive_and_rejects_duplicate_requests(self):
         from PySide6.QtCore import QTimer
 

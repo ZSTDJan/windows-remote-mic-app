@@ -52,6 +52,7 @@ _VOICE_EVENT_CONFIRM_TIMEOUT_SECONDS = 1.0
 _VOICE_RELEASE_SETTLE_TIMEOUT_SECONDS = 0.08
 _VOICE_RELEASE_SETTLE_POLL_SECONDS = 0.005
 _WETYPE_VOICE_EDGE_GAP_SECONDS = 0.08
+_STALE_LWIN_RECHECK_SECONDS = 0.05
 # Per-process provenance, not an authorization/security boundary. Keep outside
 # the legacy voice-physicalizer marker namespace and within ULONG_PTR on x86.
 _INPUT_EVENT_EXTRA_INFO = 0xA7000000 | int.from_bytes(os.urandom(3), "little")
@@ -1047,6 +1048,66 @@ def _ensure_tracked_hold_available(vk_codes: Sequence[int]) -> None:
         )
 
 
+def _verified_lwin_is_up(*, settle_seconds: float = 0.0) -> bool:
+    """Observe LWin twice on the Raw-only Chromecast input path."""
+
+    lwin = win32_keys.VK_CODES["lwin"]
+    before = voice_key_physicalizer_windows.snapshot_health()
+    if before.active or before.draining:
+        return False
+    try:
+        desktop_before = _real_key_state_query_context()
+        if desktop_before is None:
+            return False
+        if _real_async_key_state_observation(lwin) is not False:
+            return False
+        if settle_seconds:
+            time.sleep(settle_seconds)
+            if _real_async_key_state_observation(lwin) is not False:
+                return False
+        if _real_key_state_query_context() != desktop_before:
+            return False
+    except Exception:
+        return False
+    after = voice_key_physicalizer_windows.snapshot_health()
+    if (
+        after.active
+        or after.draining
+        or after.generation != before.generation
+        or after.installation_epoch != before.installation_epoch
+        or after.callback_entries != before.callback_entries
+    ):
+        return False
+    return True
+
+
+def _reconcile_stale_wetype_lwin_owner() -> bool:
+    """Clear a missed Raw LWin UP only after independent Windows checks."""
+
+    raw_snapshot = raw_input_windows.snapshot_stale_lwin_owner()
+    if raw_snapshot is None:
+        return False
+    lwin = win32_keys.VK_CODES["lwin"]
+    if not _verified_lwin_is_up(settle_seconds=_STALE_LWIN_RECHECK_SECONDS):
+        return False
+    if not raw_input_windows.clear_stale_lwin_owner_if_unchanged(raw_snapshot):
+        return False
+    trace = _diagnostic_trace
+    if trace is not None and trace.enabled:
+        try:
+            trace.emit(
+                "input_physical_state_reconciled",
+                vk=lwin,
+                owner_count=1,
+                age_ms=raw_snapshot.age_ms,
+                windows_down=False,
+                reason="stale_raw_lwin_owner",
+            )
+        except Exception:
+            pass
+    return True
+
+
 def send_key_combo_down(
     tokens: Sequence[str],
     *,
@@ -1509,8 +1570,11 @@ def send_wetype_voice_key_combo_down(
     """Press WeType's held shortcut one wVk edge at a time, 80 ms apart."""
 
     vk_codes = win32_keys.resolve_vk_codes(tokens)
+    reconciled_lwin = False
     if _sender is None and _key_down_query is None:
         _ensure_tracked_hold_available(vk_codes)
+        if win32_keys.VK_CODES["lwin"] in vk_codes:
+            reconciled_lwin = _reconcile_stale_wetype_lwin_owner()
     preflight_query = _physical_query_for_sender(
         _sender is not None,
         _key_down_query,
@@ -1534,6 +1598,26 @@ def send_wetype_voice_key_combo_down(
                 ):
                     raise InputCleanupIncompleteError(
                         "WeType voice key-down delay was interrupted and cleanup failed"
+                    ) from exc
+                raise
+        if preflight_query is not None:
+            try:
+                _ensure_keys_not_physically_down((vk,), preflight_query)
+                if (
+                    reconciled_lwin
+                    and vk == win32_keys.VK_CODES["lwin"]
+                    and not _verified_lwin_is_up()
+                ):
+                    raise Win32InputUnavailableError(
+                        "left Win release could not be safely confirmed"
+                    )
+            except (PhysicalKeyInUseError, Win32InputUnavailableError) as exc:
+                if delivered and not _best_effort_release(
+                    list(reversed(delivered)), sender, release_query
+                ):
+                    raise InputCleanupIncompleteError(
+                        "WeType voice physical key changed and delivered keys "
+                        "could not be released"
                     ) from exc
                 raise
         try:

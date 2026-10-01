@@ -197,7 +197,7 @@ class VoiceProgramSettingsTests(unittest.TestCase):
         self.assertFalse(sogou["launch_elevated"])
         self.assertTrue(custom["launch_elevated"])
 
-    def test_provider_options_include_three_supported_providers_and_custom_program(self):
+    def test_provider_options_exclude_legacy_custom_without_losing_its_identity(self):
         self.assertEqual(
             manager.provider_options(),
             [
@@ -205,8 +205,16 @@ class VoiceProgramSettingsTests(unittest.TestCase):
                 "搜狗语音输入",
                 "微信输入法",
                 "豆包输入法",
-                "自定义程序",
+                "Chatterfly",
             ],
+        )
+        self.assertEqual(manager.provider_index("custom"), 4)
+        self.assertEqual(manager.provider_id_for_index(4), "custom")
+        self.assertEqual(manager.provider_index("chatterfly"), 5)
+        self.assertEqual(manager.provider_id_for_index(5), "chatterfly")
+        self.assertEqual(
+            manager.normalize_voice_program_settings({"provider": "custom"})["provider"],
+            "custom",
         )
 
     def test_system_managed_provider_never_requests_bridge_autostart(self):

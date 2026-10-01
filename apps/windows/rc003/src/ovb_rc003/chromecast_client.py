@@ -15,6 +15,7 @@ import time
 
 from .chromecast_buttons import ButtonEdge
 from . import chromecast_diagnostics_windows as diagnostics
+from .diagnostic_trace import CleanupProgress
 from .chromecast_channel import Channel, SessionIdentity
 from .chromecast_pipe_windows import Pipe, PipeError, api, inspect_peer, verify_peer, bind_worker_peer, launch_worker
 
@@ -53,6 +54,7 @@ class Client:
         self.on_voice = on_voice
         self._voice_commands = queue.Queue(maxsize=32)
         self.cancel, self.finished, self.ready = threading.Event(), threading.Event(), threading.Event()
+        self._gadget_fallback_seen = threading.Event()
         self.thread = None
         self.reason = "capture_failed"
         self.cleanup_confirmed = False
@@ -66,8 +68,34 @@ class Client:
         self.failure_stage = "initializing"
         self.failure_code = ""
         self._first_worker_failure = ""
+        self._input_counts = dict.fromkeys(("received", "delivered", "down_delivered",
+                                            "suppressed", "callback_failed", "stale"), 0)
+        self._last_input_log = 0.0
+        logger = logging.getLogger("ovb_rc003")
+        self._shutdown = CleanupProgress(logger, "receiver", self.identity.generation[:12])
+        self._worker_shutdown = CleanupProgress(logger, "worker_observed", self.identity.generation[:12])
+        self._terminal_type = "none"
+        self._terminal_at = None
+        self._process_identities = {}
+
+    def _count_input(self, name):
+        self._input_counts[name] = min(2**31 - 1, self._input_counts[name] + 1)
+
+    def _log_input_flow(self, *, final=False):
+        now = time.monotonic()
+        if not final and now - self._last_input_log < 2:
+            return
+        self._last_input_log = now
+        try:
+            logging.getLogger("ovb_rc003").info(
+                "Chromecast input delivery run=%s mode=%s final=%s counts=%s",
+                self.identity.generation[:12], self.mode, final,
+                json.dumps(self._input_counts, separators=(",", ":")))
+        except Exception:
+            pass  # Logging failures cannot block a release or cleanup.
 
     def _observe_diagnostic(self, event):
+        self._worker_shutdown.update(event["stage"], event["phase"], elapsed_ms=event.get("elapsed_ms", -1))
         if event["phase"] == "failed":
             logging.getLogger("ovb_rc003").warning(
                 "Chromecast failure evidence: stage=%s reason=%s", event["stage"], event["reason"],
@@ -94,6 +122,7 @@ class Client:
         self.thread = threading.Thread(target=self._run, name="chromecast-receiver", daemon=True)
         self.thread.start()
         deadline = time.monotonic() + 40
+        fallback_extended = False
         if self.mode == "setup":
             while not self.finished.wait(.02):
                 if time.monotonic() >= deadline or (cancel_event and cancel_event.is_set()):
@@ -107,6 +136,9 @@ class Client:
                 raise RuntimeError(message(self.reason))
             return
         while not self.ready.wait(.02):
+            if not fallback_extended and self._gadget_fallback_seen.is_set():
+                deadline = max(deadline, time.monotonic() + 40)
+                fallback_extended = True
             if self.finished.is_set() or time.monotonic() >= deadline or (cancel_event and cancel_event.is_set()):
                 self.stop()
                 raise RuntimeError(message(self.reason))
@@ -117,6 +149,13 @@ class Client:
     def stop(self):
         # Serialize with delivery: after stop returns no ordinary edge can run.
         with self._callback_lock:
+            if not self.cancel.is_set():
+                try:
+                    logging.getLogger("ovb_rc003").info(
+                        "Chromecast receiver stop requested: run=%s terminal=%s failure_stage=%s failure_code=%s",
+                        self.identity.generation[:12], self._terminal_type, self.failure_stage, self.failure_code)
+                except Exception:
+                    pass
             self.cancel.set()
         if self.thread is None:
             self.cleanup_confirmed = True
@@ -150,12 +189,38 @@ class Client:
             self.cleanup_confirmed = True
             self.exit_succeeded = True
             for handle in handles:
+                role = "launcher" if handle == self._process else "worker"
                 code = W.DWORD()
                 read_ok = bool(self._kernel.GetExitCodeProcess(handle, C.byref(code)))
                 logging.getLogger("ovb_rc003").info(
                     "Chromecast process exited: role=%s exit_code_read=%s exit_code=%s started=%s",
-                    "launcher" if handle == self._process else "worker", read_ok,
+                    role, read_ok,
                     code.value if read_ok else None, self._started)
+                peer = self._process_identities.get(role)
+                logger = logging.getLogger("ovb_rc003")
+                try:
+                    logger.info(
+                        "Chromecast exit evidence: run=%s role=%s pid=%s exit_hex=%s "
+                        "owner_stop_requested=%s terminal=%s since_terminal_ms=%s "
+                        "last_worker_stage=%s last_worker_state=%s last_completed=%s native_stack=unavailable",
+                        self.identity.generation[:12], role, peer.pid if peer else 0,
+                        f"0x{code.value:08X}" if read_ok else "unavailable", self.cancel.is_set(),
+                        self._terminal_type, int((time.monotonic() - self._terminal_at) * 1000)
+                        if self._terminal_at is not None else -1,
+                        self._worker_shutdown.state[0], self._worker_shutdown.state[1], self._worker_shutdown.state[3])
+                    if not read_ok or code.value != 0:
+                        logger.warning("Chromecast abnormal exit: run=%s role=%s exit_code_read=%s cause=unconfirmed",
+                                       self.identity.generation[:12], role, read_ok,
+                                       extra={"failure_key": "chromecast:abnormal_exit"})
+                        if peer is not None and read_ok and code.value >= 0xc0000000:
+                            diagnostics.request_process_exit(self.identity.generation, peer.pid, peer.born, code.value)
+                        else:
+                            logger.warning("Chromecast crash evidence unavailable: run=%s reason=%s",
+                                           self.identity.generation[:12],
+                                           "non_exception_exit_code" if read_ok and code.value < 0xc0000000
+                                           else "process_identity_or_exit_code_missing")
+                except Exception:
+                    pass  # OS-confirmed exit must still release the owned handles.
                 # The OS wait proves process termination. A nonzero exit is a
                 # recorded runtime/cleanup failure, not a still-running owner.
                 # Conflating them discards the handles but blocks every retry.
@@ -166,7 +231,16 @@ class Client:
     def _deliver(self, edge):
         with self._callback_lock:
             if not self.cancel.is_set() or edge.action == "cancel":
-                self.on_edge(edge)
+                try:
+                    self.on_edge(edge)
+                except Exception:
+                    self._count_input("callback_failed")
+                    raise
+                self._count_input("delivered")
+                if edge.action == "down":
+                    self._count_input("down_delivered")
+            else:
+                self._count_input("suppressed")
 
     def voice_host(self, attempt, result):
         if self.cancel.is_set() or self.finished.is_set():
@@ -191,10 +265,12 @@ class Client:
             child = launch_worker(self.identity, parent)
             kernel, _ = api()
             launched = inspect_peer(kernel.GetProcessId(child))
+            self._process_identities["launcher"] = launched
             self.failure_stage = "pipe_connect"
             pipe.connect(time.monotonic() + 10, self.cancel)
             self.failure_stage = "peer_identity"
             expected, self._worker_process = bind_worker_peer(pipe, launched, parent)
+            self._process_identities["worker"] = expected
             pid = expected.pid
             if self.cancel.is_set() or (self._external_cancel and self._external_cancel.is_set()):
                 return
@@ -211,11 +287,9 @@ class Client:
                     pipe.write(outgoing.encode("stop"))
                     # A fallback symbol lookup is bounded to 18 seconds; let
                     # its worker finish and detach before declaring peer loss.
-                    stop_deadline = now + 25
+                    stop_deadline = now + (35 if self._gadget_fallback_seen.is_set() else 25)
                 if stop_deadline is not None and now >= stop_deadline:
                     raise PipeError("peer_lost")
-                if not self.ready.is_set() and now > ready_deadline:
-                    raise PipeError("source_unconfirmed")
                 if now - last_peer >= 1:
                     verify_peer(inspect_peer(pid), expected)
                     last_peer = now
@@ -234,14 +308,22 @@ class Client:
                         break
                     event = incoming.decode(raw)
                     if event["type"] == "evidence":
+                        record = event["record"]
+                        if (record.get("kind") == "hid_startup"
+                                and record.get("step") == "gadget_fallback"
+                                and record.get("state") == "begin"):
+                            self._gadget_fallback_seen.set()
+                            ready_deadline = max(ready_deadline, time.monotonic() + 40)
                         logging.getLogger("ovb_rc003").info("Chromecast evidence run=%s seq=%s record=%s",
                             self.identity.generation[:12], event["seq"], json.dumps(event["record"], separators=(",", ":")))
                     elif event["type"] == "ready":
                         self.ready.set()
                         diagnostics.request(self.identity.entity, "ready")
                     elif event["type"] == "edge":
+                        self._count_input("received")
                         age = time.monotonic() - event["time"]
                         if not -.1 <= age <= 1:
+                            self._count_input("stale")
                             raise PipeError("capture_lost")
                         self._deliver(ButtonEdge(self.identity.entity, self.identity.generation,
                                                 event["time"], event["button"], event["action"]))
@@ -274,11 +356,17 @@ class Client:
                             self.on_voice(event)
                     else:
                         terminal, self.reason = True, event["reason"]
+                        self._terminal_type, self._terminal_at = event["type"], time.monotonic()
                         logging.getLogger("ovb_rc003").info(
                             "Chromecast terminal: type=%s reason=%s", event["type"], self.reason,
                             extra={"failure_key": f"chromecast:terminal:{self.reason}"
                                    if event["type"] == "error" else ""})
                         return
+                # Read already queued startup evidence before deciding whether
+                # the normal readiness budget has expired.
+                if not self.ready.is_set() and time.monotonic() > ready_deadline:
+                    raise PipeError("source_unconfirmed")
+                self._log_input_flow()
                 time.sleep(.01)
         except Exception as error:
             # Log only fixed error codes; never paths, tokens or arbitrary text.
@@ -297,6 +385,12 @@ class Client:
                     self.failure_stage, self.reason, self.failure_code,
                     extra={"failure_key": f"chromecast:receiver:{self.reason}"})
         finally:
+            try:
+                logging.getLogger("ovb_rc003").info(
+                    "Chromecast receiver ending: run=%s owner_stop_requested=%s terminal=%s reason=%s failure_code=%s",
+                    self.identity.generation[:12], self.cancel.is_set(), self._terminal_type, self.reason, self.failure_code)
+            except Exception:
+                pass
             if self.on_lost:
                 try:
                     self.on_lost()
@@ -308,9 +402,11 @@ class Client:
                     self._deliver(edge)
                 except Exception:
                     pass
+            self._log_input_flow(final=True)
             # Ask only this authenticated worker to stop. Closing the pipe also
             # expires its lease. Keep the owner until OS exit is confirmed.
             if pipe:
+                self._shutdown.update("pipe_close", "begin")
                 try:
                     if started and not outgoing.closed:
                         pipe.write(outgoing.encode("stop"))
@@ -322,11 +418,16 @@ class Client:
                     except Exception:
                         if not self._first_worker_failure:
                             self.reason = "capture_failed"
+                        self._shutdown.update("pipe_close", "failed")
+                    else:
+                        self._shutdown.update("pipe_close", "done")
             if child:
                 kernel = kernel or api()[0]
                 self._process, self._kernel, self._started = child, kernel, started
+                self._shutdown.update("process_exit_wait", "begin")
                 kernel.WaitForSingleObject(child, 12000)
                 self._confirm_exit()
+                self._shutdown.update("process_exit_wait", "done" if self.cleanup_confirmed else "pending")
             else:
                 self.cleanup_confirmed = True
             self.ready.clear()

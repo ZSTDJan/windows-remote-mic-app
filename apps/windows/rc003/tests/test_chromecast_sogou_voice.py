@@ -59,8 +59,35 @@ class SogouHostTests(unittest.TestCase):
         self.host._handle(event)
         self.host._handle(event)
         self.assertEqual(self.tap.call_count, 2)
+        self.assertEqual(self.owner._ensure_voice_key_physicalizer_for_hotkey.call_args_list,
+                         [mock.call(('lshift', 'f8'), 'marked_keybd_event')] * 2)
         self.assertTrue(self.host.closed)
         self.owner._voice_shortcut.record_audio_result.assert_not_called()
+
+    def test_unavailable_toggle_tracking_sends_nothing_and_can_stop(self):
+        self.owner._ensure_voice_key_physicalizer_for_hotkey.return_value = False
+        self.host._start_host(1)
+        self.tap.assert_not_called()
+        self.host.client.voice_host.assert_called_once_with(1, 'failed')
+        self.assertTrue(self.host._stop_host())
+        self.assertTrue(self.host.closed)
+
+    def test_physical_key_rejection_can_close_and_start_a_new_attempt(self):
+        self.tap.side_effect = host_module.win32_input.PhysicalKeyInUseError('physical key held')
+        with mock.patch.object(host_module.win32_input, 'send_voice_key_combo_up',
+                               side_effect=host_module.win32_input.InputCleanupIncompleteError('physical key held')) as up:
+            self.host._start_host(1)
+            self.host.client.voice_host.assert_called_once_with(1, 'failed')
+            self.assertTrue(self.host._stop_host())
+            self.assertTrue(self.host.closed)
+            up.assert_not_called()
+        self.host._handle({'event': 'state', 'attempt': 1, 'data': 'idle'})
+        self.tap.side_effect = None
+        self.host._start_host(2)
+        self.assertTrue(self.host.engaged)
+        self.host.client.voice_host.assert_called_with(2, 'ready')
+        self.assertTrue(self.host._stop_host())
+        self.assertEqual(self.tap.call_count, 2)
 
     def test_queued_second_press_keeps_reason_after_an_earlier_audio_event(self):
         self.host._start_host(1)

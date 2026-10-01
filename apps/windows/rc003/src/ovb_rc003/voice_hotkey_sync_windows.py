@@ -27,24 +27,15 @@ DEFAULT_PROVIDER_HOTKEYS = {
     voice_program_manager.VOICE_PROGRAM_SOGOU: "rctrl",
     voice_program_manager.VOICE_PROGRAM_WETYPE: "lctrl+lwin",
     voice_program_manager.VOICE_PROGRAM_DOUBAO_IME: "ralt",
+    # Chatterfly does not publish a stable default or a supported shortcut API.
+    # Require the user's actual shortcut instead of copying this machine's value.
+    voice_program_manager.VOICE_PROGRAM_CHATTERFLY: "",
     voice_program_manager.VOICE_PROGRAM_CUSTOM: "ralt",
 }
 
 _SOGOU_CONFIG_RELATIVE_PATH = Path("sogou_voice_assistant_pc") / "config.json"
 _DOUBAO_CONFIG_RELATIVE_PATH = Path("DoubaoIme") / "conf" / "config.json"
 _SOGOU_PROCESS_NAME = "sogou_voice_assistant.exe"
-_WETYPE_MODIFIER_TEXT = re.compile(r"^(左|右)?(Ctrl|Shift|Alt|Win)$", re.I)
-_WETYPE_KEY_NAMES = {
-    "空格": "space",
-    "回车": "enter",
-    "制表": "tab",
-    "退格": "backspace",
-    "删除": "delete",
-    "上": "up",
-    "下": "down",
-    "左": "left",
-    "右": "right",
-}
 # Faithfully injectable subset of Sogou Voice Assistant 1.0.1.3272's
 # Windows shortcut vocabulary. NumpadEnter needs scan-code identity that the
 # current Remote Mic shortcut model cannot preserve.
@@ -386,12 +377,18 @@ def read_provider_hotkey(
     if provider in {
         voice_program_manager.VOICE_PROGRAM_NONE,
         voice_program_manager.VOICE_PROGRAM_CUSTOM,
+        voice_program_manager.VOICE_PROGRAM_CHATTERFLY,
     }:
+        message = (
+            "请在 Chatterfly 设置中核对语音输入快捷键，再手动录入无线麦。"
+            if provider == voice_program_manager.VOICE_PROGRAM_CHATTERFLY
+            else f"该程序只使用{product_identity.DISPLAY_NAME}内记录的按住型快捷键。"
+        )
         return VoiceHotkeySyncResult(
             provider,
             False,
             "local_only",
-            message=f"该程序只使用{product_identity.DISPLAY_NAME}内记录的按住型快捷键。",
+            message=message,
         )
     if current_platform != "win32":
         return VoiceHotkeySyncResult(
@@ -436,6 +433,7 @@ def sync_provider_hotkey(
         voice_program_manager.VOICE_PROGRAM_NONE,
         voice_program_manager.VOICE_PROGRAM_WETYPE,
         voice_program_manager.VOICE_PROGRAM_DOUBAO_IME,
+        voice_program_manager.VOICE_PROGRAM_CHATTERFLY,
         voice_program_manager.VOICE_PROGRAM_CUSTOM,
     }:
         if provider == voice_program_manager.VOICE_PROGRAM_WETYPE:
@@ -445,6 +443,8 @@ def sync_provider_hotkey(
             message = "快捷键已保存到无线麦；请确保与豆包输入法中的" + (
                 "免按模式" if trigger == "toggle" else "按住型"
             ) + "快捷键一致。"
+        elif provider == voice_program_manager.VOICE_PROGRAM_CHATTERFLY:
+            message = "快捷键已保存到无线麦；请确保与 Chatterfly 的语音输入快捷键一致。"
         else:
             message = f"快捷键已保存到{product_identity.DISPLAY_NAME}。"
         return VoiceHotkeySyncResult(
@@ -629,24 +629,14 @@ def _read_doubao_hotkey(*, appdata: Optional[Path], trigger="hold") -> VoiceHotk
 
 def _wetype_key_text_to_token(value: str) -> str:
     text = str(value).strip()
-    modifier = _WETYPE_MODIFIER_TEXT.fullmatch(text)
-    if modifier:
-        side, family = modifier.groups()
-        prefix = "l" if side == "左" else "r" if side == "右" else ""
-        return prefix + family.casefold()
-    if text in _WETYPE_KEY_NAMES:
-        return _WETYPE_KEY_NAMES[text]
-    normalized = text.casefold()
-    if re.fullmatch(r"[a-z0-9]", normalized) or re.fullmatch(
-        r"f(?:[1-9]|1\d|2[0-4])", normalized
-    ):
-        return normalized
-    raise ValueError(f"微信按住型快捷键包含不支持的按键：{text}")
+    return win32_keys.key_token_from_text(text)
 
 
 def _parse_wetype_settings_shortcut(value: str) -> str:
     text = re.sub(r"(左|右)\s+(?=Ctrl|Shift|Alt|Win)", r"\1", value, flags=re.I)
-    tokens = [_wetype_key_text_to_token(part) for part in re.split(r"\s+|\+", text.strip())]
+    text = re.sub(r"小键盘\s+(?=\d)", "小键盘", text)
+    parts = text.split("+") if "+" in text else text.split()
+    tokens = [_wetype_key_text_to_token(part) for part in parts]
     result = validate_provider_hotkey("wetype", "+".join(tokens))
     if not result.ok:
         raise ValueError(result.message)

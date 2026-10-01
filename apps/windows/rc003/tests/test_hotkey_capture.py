@@ -5,6 +5,13 @@ from ovb_rc003 import hotkey, hotkey_capture_windows, win32_keys
 
 
 class KeyboardTokenTests(unittest.TestCase):
+    def test_keypad_enter_cannot_silently_turn_into_main_enter(self):
+        self.assertEqual(hotkey_capture_windows.token_for_keyboard_event(0x0D, 0x1C, 0), "enter")
+        token = hotkey_capture_windows.token_for_keyboard_event(0x0D, 0x1C, 1)
+        self.assertEqual(token, "numpad_enter")
+        with self.assertRaisesRegex(hotkey.HotkeyParseError, "小键盘 Enter"):
+            hotkey.HotkeySpec.from_user_text(token, mapping=True)
+
     def test_directional_modifiers_keep_their_physical_side(self):
         self.assertEqual(
             hotkey_capture_windows.token_for_keyboard_event(0xA2, 0x1D, 0),
@@ -26,9 +33,34 @@ class KeyboardTokenTests(unittest.TestCase):
         )
 
     def test_unknown_virtual_keys_round_trip_through_dynamic_token(self):
-        token = hotkey_capture_windows.token_for_keyboard_event(0xE7, 0, 0)
-        self.assertEqual(token, "vk_e7")
-        self.assertEqual(win32_keys.resolve_vk_codes((token,)), [0xE7])
+        token = hotkey_capture_windows.token_for_keyboard_event(0xE2, 0x56, 0)
+        self.assertEqual(token, "vk_e2")
+        self.assertEqual(win32_keys.resolve_vk_codes((token,)), [0xE2])
+
+    def test_numlock_off_keypad_navigation_cannot_turn_into_main_keys(self):
+        cases = (
+            (0x0C, 0x4C, "clear"), (0x21, 0x49, "page_up"),
+            (0x22, 0x51, "page_down"), (0x23, 0x4F, "end"),
+            (0x24, 0x47, "home"), (0x25, 0x4B, "left"),
+            (0x26, 0x48, "up"), (0x27, 0x4D, "right"),
+            (0x28, 0x50, "down"), (0x2D, 0x52, "insert"),
+            (0x2E, 0x53, "delete"),
+        )
+        for vk, scan, name in cases:
+            with self.subTest(name=name):
+                token = hotkey_capture_windows.token_for_keyboard_event(vk, scan, 0)
+                self.assertEqual(token, "numpad_" + name)
+                for text in (token, win32_keys.key_label(token)):
+                    with self.assertRaisesRegex(hotkey.HotkeyParseError, "NumLock"):
+                        hotkey.HotkeySpec.from_user_text(text, mapping=True)
+                if name != "clear":
+                    self.assertEqual(hotkey_capture_windows.token_for_keyboard_event(vk, scan, 1), name)
+                    self.assertEqual(hotkey_capture_windows.token_for_keyboard_event(vk, 0, 0), name)
+
+    def test_out_of_range_vk_is_not_truncated_into_a_different_key(self):
+        for vk in (-1, 0x141, 0x1A2):
+            with self.subTest(vk=vk):
+                self.assertEqual(hotkey_capture_windows.token_for_keyboard_event(vk, 0, 0), "unsupported_key")
 
 
 class HotkeyCaptureStateTests(unittest.TestCase):

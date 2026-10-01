@@ -30,6 +30,7 @@ GADGET_ARCHIVE_SHA256 = (
     "b566d70189b6d551ad8f4e0bea24de08a3d4c0f559bb35b2bdb67d45182240c2"
 )
 GADGET_DLL_NAME = "RemoteMicRC003HidTap.dll"
+GOOGLE_GADGET_DLL_NAME = "RemoteMicGoogleHidTap.dll"
 GADGET_DLL_SHA256 = (
     "6fca4007b2284c765a6c15c967a741f536b5865bf83867326a54029a3b752748"
 )
@@ -1084,7 +1085,8 @@ def gadget_config_text() -> str:
     )
 
 
-def _write_verified_text(path: Path, content: str, *, user_sid: str) -> None:
+def _write_verified_text(path: Path, content: str, *, user_sid: str,
+                         include_user: bool = True) -> None:
     from . import hid_elevation_windows
 
     encoded = content.encode("utf-8")
@@ -1096,6 +1098,7 @@ def _write_verified_text(path: Path, content: str, *, user_sid: str) -> None:
                     user_sid=user_sid,
                     directory=False,
                     read_execute_sids=(hid_elevation_windows.LOCAL_SERVICE_SID,),
+                    include_user=include_user,
                 )
                 return
         except OSError:
@@ -1108,6 +1111,7 @@ def _write_verified_text(path: Path, content: str, *, user_sid: str) -> None:
             user_sid=user_sid,
             directory=False,
             read_execute_sids=(hid_elevation_windows.LOCAL_SERVICE_SID,),
+            include_user=include_user,
         )
         os.replace(temporary, path)
     finally:

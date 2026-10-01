@@ -10,7 +10,7 @@ import threading
 import time
 from dataclasses import dataclass
 from typing import Callable, Any
-from . import bridge_runtime_status
+from . import bridge_runtime_status, diagnostic_trace
 
 
 @dataclass(frozen=True)
@@ -89,9 +89,12 @@ class ChromecastRuntime:
         finally:
             # Keep ownership on teardown failure; the desktop must not switch
             # entities over a receiver whose exit has not been confirmed.
-            self.services.logger.info("Chromecast shutdown: stage=cancel_input state=begin")
+            progress = diagnostic_trace.CleanupProgress(
+                self.services.logger, "chromecast_runtime",
+                getattr(getattr(self.client, "identity", None), "generation", "none")[:12])
+            progress.update("cancel_input", "begin")
             self.cancel_input()
-            self.services.logger.info("Chromecast shutdown: stage=cancel_input state=done")
+            progress.update("cancel_input", "done")
             cleanup_last_log = {}
             while True:
                 try:
@@ -102,13 +105,12 @@ class ChromecastRuntime:
                         report = started - cleanup_last_log.get(stage, float("-inf")) >= 5
                         if report:
                             cleanup_last_log[stage] = started
-                            self.services.logger.info("Chromecast shutdown: stage=%s state=begin", stage)
+                        progress.update(stage, "begin", report=report)
                         await asyncio.to_thread(cleanup)
-                        if report:
-                            self.services.logger.info("Chromecast shutdown: stage=%s state=done elapsed_ms=%.0f",
-                                              stage, (time.monotonic() - started) * 1000)
+                        progress.update(stage, "done", report=report)
                     break
                 except RuntimeError as exc:
+                    progress.update(stage, "retry", report=report)
                     if report:
                         self.services.logger.warning("Chromecast shutdown: stage=%s state=retry error_type=%s elapsed_ms=%.0f",
                                              stage, type(exc).__name__, (time.monotonic() - started) * 1000)
@@ -117,12 +119,13 @@ class ChromecastRuntime:
                     self.services.set_input_state(raw_input_state="failed_stopping")
                     await asyncio.sleep(.25)
                 except Exception as exc:
+                    progress.update(stage, "failed")
                     self.services.logger.error("Chromecast shutdown: stage=%s state=error error_type=%s",
                                        stage, type(exc).__name__)
                     raise
             self.client = None
             self.voice_host = None
-            self.services.logger.info("Chromecast shutdown: stage=release_inputs state=begin")
+            progress.update("release_inputs", "begin")
             while True:
                 released = self.services.release_inputs()
                 if released:
@@ -130,4 +133,4 @@ class ChromecastRuntime:
                 self.services.set_input_state(raw_input_state="failed_stopping")
                 await asyncio.sleep(.25)
             self.services.set_input_state(raw_input_state="stopped")
-            self.services.logger.info("Chromecast shutdown: stage=release_inputs state=done")
+            progress.update("release_inputs", "done")

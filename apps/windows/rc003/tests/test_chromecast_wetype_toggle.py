@@ -1,6 +1,8 @@
 import tempfile
+import threading
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 from ovb_rc003 import config, remote_selection, chromecast_channel as channel
@@ -14,6 +16,113 @@ from tests.test_chromecast_host_activity import session
 
 
 class PulseTests(unittest.TestCase):
+    def test_physical_key_preflight_rejection_has_no_release_debt(self):
+        original_tap = pulse.win32_input.send_voice_key_combo_tap
+        original_up = pulse.win32_input.send_voice_key_combo_up
+        for shortcut, held_vk in (('ralt', 0xa5), ('lctrl+f9', 0xa2), ('lctrl+f9', 0x78)):
+            with self.subTest(shortcut=shortcut, held_vk=held_vk):
+                held = True
+                edges = []
+                sender = lambda vk, up: edges.append((vk, up))
+                query = lambda vk: held and vk == held_vk
+                control = pulse.ToggleShortcut(shortcut, prepare=lambda: False)
+                with (
+                    mock.patch.object(pulse.win32_input, 'send_voice_key_combo_tap',
+                        side_effect=lambda keys: original_tap(keys, _sender=sender, _key_down_query=query)),
+                    mock.patch.object(pulse.win32_input, 'send_voice_key_combo_up',
+                        side_effect=lambda keys, **kw: original_up(
+                            keys, **(kw or {'_sender': sender, '_key_down_query': query}))) as up,
+                    mock.patch.object(pulse.win32_input.time, 'sleep'),
+                ):
+                    with self.assertRaises(pulse.win32_input.PhysicalKeyInUseError):
+                        control.send(lambda: False)
+                    self.assertFalse(control.release_pending)
+                    self.assertTrue(control.cleanup())
+                    self.assertTrue(control.cleanup())
+                    self.assertEqual(edges, [])
+                    up.assert_not_called()
+                    held = False
+                    control.send(lambda: False)
+                    self.assertFalse(control.release_pending)
+                    self.assertEqual(sum(not key_up for _, key_up in edges), len(control.tokens))
+                    self.assertEqual(sum(key_up for _, key_up in edges), len(control.tokens))
+
+    def test_missing_right_alt_tracker_has_no_release_debt_or_native_input(self):
+        from ovb_rc003 import raw_input_windows, voice_key_physicalizer_windows as tracker
+        control = pulse.ToggleShortcut('ralt', prepare=lambda: False)
+        with (
+            mock.patch.object(raw_input_windows, 'physical_keyboard_tracking_available', return_value=True),
+            mock.patch.object(tracker, '_PHYSICAL_TRACKER_ACTIVE', False),
+            mock.patch.object(tracker, 'physical_key_is_down_before_injection', return_value=False),
+            mock.patch.object(pulse.win32_input, '_real_keybd_event') as native,
+            mock.patch.object(pulse.win32_input, 'send_voice_key_combo_up', side_effect=OSError('unavailable')) as up,
+        ):
+            with self.assertRaises(pulse.win32_input.Win32InputUnavailableError):
+                control.send(lambda: False)
+            self.assertFalse(control.release_pending)
+            self.assertTrue(control.cleanup())
+            native.assert_not_called()
+            up.assert_not_called()
+
+    def test_partial_combo_unavailable_retains_only_unconfirmed_cleanup(self):
+        original_tap = pulse.win32_input.send_voice_key_combo_tap
+        for release_fails in (False, True):
+            with self.subTest(release_fails=release_fails):
+                edges = []
+
+                def sender(vk, key_up):
+                    edges.append((vk, key_up))
+                    if vk == 0xa5:
+                        raise pulse.win32_input.Win32InputUnavailableError('tracker missing')
+                    if key_up and release_fails:
+                        raise OSError('release unconfirmed')
+
+                control = pulse.ToggleShortcut('lctrl+ralt', prepare=lambda: False)
+                with (
+                    mock.patch.object(pulse.win32_input, 'send_voice_key_combo_tap',
+                        side_effect=lambda keys: original_tap(keys, _sender=sender, _key_down_query=lambda vk: False)),
+                    mock.patch.object(pulse.win32_input, 'send_voice_key_combo_up') as up,
+                ):
+                    error = (pulse.win32_input.InputCleanupIncompleteError if release_fails
+                             else pulse.win32_input.Win32InputUnavailableError)
+                    with self.assertRaises(error):
+                        control.send(lambda: False)
+                    self.assertEqual(control.release_pending, release_fails)
+                    up.assert_not_called()
+                    self.assertEqual(edges, [(0xa2, False), (0xa5, False), (0xa2, True)])
+                    self.assertTrue(control.cleanup())
+                    self.assertEqual(up.call_count, int(release_fails))
+
+    def test_tracking_checked_for_each_press_before_preparation(self):
+        events = []
+        control = pulse.ToggleShortcut('ralt',
+            prepare=lambda: events.append('prepare'),
+            ensure_key_tracking=lambda keys: events.append(('tracking', keys)) or True)
+        with mock.patch.object(pulse.win32_input, 'send_voice_key_combo_tap',
+                               side_effect=lambda keys: events.append('tap')):
+            control.send(lambda: False)
+            control.send(lambda: False)
+        self.assertEqual(events, [('tracking', ('ralt',)), 'prepare', 'tap'] * 2)
+
+    def test_unavailable_tracking_and_cancellation_create_no_release_debt(self):
+        for ready in (False, True):
+            with self.subTest(ready=ready):
+                stopped = False
+
+                def ensure(keys):
+                    nonlocal stopped
+                    stopped = True
+                    return ready
+
+                prepare = mock.Mock()
+                control = pulse.ToggleShortcut('ralt', prepare=prepare, ensure_key_tracking=ensure)
+                with mock.patch.object(pulse.win32_input, 'send_voice_key_combo_tap') as tap:
+                    with self.assertRaises((OSError, pulse.win32_input.Win32InputUnavailableError)):
+                        control.send(lambda: stopped)
+                    self.assertTrue(control.cleanup())
+                    prepare.assert_not_called()
+                    tap.assert_not_called()
+
     def test_prepare_then_single_tap_and_cleanup_never_taps(self):
         events = []
         with (mock.patch.object(pulse.wetype, '_run_on_sta_thread', side_effect=lambda fn: events.append('prepare')),
@@ -81,6 +190,70 @@ class ToggleHostTests(unittest.TestCase):
     def _confirm_capture(self, identity='wetype-capture'):
         self.host.capture_watch.reader = mock.Mock(return_value=(session(identity),))
         self.host._poll_host()
+
+    def test_right_alt_uses_actual_toggle_transport_and_starts_tracker_lazily(self):
+        from ovb_rc003.app import RC003App
+        self.owner._config['voice_hotkeys_by_provider']['wetype']['toggle'] = 'ralt'
+        self.owner._voice_key_physicalizer_lifecycle_lock = threading.RLock()
+        self.owner._voice_key_physicalizer_ready = False
+        self.owner._voice_key_physicalizer = None
+
+        def start():
+            self.owner._voice_key_physicalizer_ready = True
+            self.owner._voice_key_physicalizer = SimpleNamespace(accepts_new_down=True)
+
+        self.owner._start_voice_key_physicalizer.side_effect = start
+        self.owner._ensure_voice_key_physicalizer_for_hotkey.side_effect = (
+            lambda *args: RC003App._ensure_voice_key_physicalizer_for_hotkey(self.owner, *args))
+        self.tap.side_effect = lambda keys: self.assertTrue(self.owner._voice_key_physicalizer_ready)
+        self.host._start_host(1)
+        self._confirm_capture()
+        self.host._handle({'event': 'host_stop', 'attempt': 1, 'data': 'second_press'})
+        self.assertTrue(self.host.closed)
+        self.owner._start_voice_key_physicalizer.assert_called_once_with()
+        self.assertEqual(self.owner._ensure_voice_key_physicalizer_for_hotkey.call_args_list,
+                         [mock.call(('ralt',), 'marked_keybd_event')] * 2)
+        self.assertEqual(self.tap.call_count, 2)
+
+    def test_unavailable_tracker_can_stop_and_next_attempt_can_start(self):
+        self.owner._ensure_voice_key_physicalizer_for_hotkey.return_value = False
+        self.host._start_host(1)
+        self.tap.assert_not_called()
+        self.prepare.assert_not_called()
+        self.host.client.voice_host.assert_called_once_with(1, 'failed')
+        self.assertTrue(self.host._stop_host())
+        self.assertTrue(self.host.closed)
+        self.host._handle({'event': 'state', 'attempt': 1, 'data': 'idle'})
+        self.owner._ensure_voice_key_physicalizer_for_hotkey.return_value = True
+        self.host._start_host(2)
+        self.tap.assert_called_once()
+        self.assertTrue(self.host.engaged)
+
+    def test_tracker_lost_before_down_can_stop_without_retrying_unowed_up(self):
+        self.tap.side_effect = pulse.win32_input.Win32InputUnavailableError('tracker stopped')
+        with mock.patch.object(pulse.win32_input, 'send_voice_key_combo_up', side_effect=OSError('tracker stopped')) as up:
+            self.host._start_host(1)
+            self.assertTrue(self.host._stop_host())
+            self.assertTrue(self.host.closed)
+            self.host.client.voice_host.assert_called_with(1, 'released')
+            up.assert_not_called()
+
+    def test_physical_key_rejection_can_close_and_start_a_new_attempt(self):
+        self.tap.side_effect = pulse.win32_input.PhysicalKeyInUseError('physical key held')
+        with mock.patch.object(pulse.win32_input, 'send_voice_key_combo_up',
+                               side_effect=pulse.win32_input.InputCleanupIncompleteError('physical key held')) as up:
+            self.host._start_host(1)
+            self.host.client.voice_host.assert_called_once_with(1, 'failed')
+            self.assertTrue(self.host._stop_host())
+            self.assertTrue(self.host.closed)
+            up.assert_not_called()
+        self.host._handle({'event': 'state', 'attempt': 1, 'data': 'idle'})
+        self.tap.side_effect = None
+        self.host._start_host(2)
+        self.assertTrue(self.host.engaged)
+        self._confirm_capture()
+        self.assertTrue(self.host._stop_host())
+        self.assertEqual(self.tap.call_count, 2)
 
     def test_start_checks_capture_promptly_without_sending_extra_shortcuts(self):
         from ovb_rc003 import chromecast_voice_host as host_module

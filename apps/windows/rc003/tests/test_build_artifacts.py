@@ -44,6 +44,13 @@ _PORTABLE_README_PATH = (
     _RC003_ROOT / "installer" / "readme-portable-rc003.txt"
 )
 _ROOT_README_PATH = _REPO_ROOT / "README.md"
+
+
+def _formal_version_from_landing(landing):
+    match = re.search(r"当前正式版为 \*\*(\d+\.\d+\.\d+)\*\*", landing)
+    if match is None:
+        raise AssertionError("landing page does not identify a formal release")
+    return match.group(1)
 _THIRD_PARTY_NOTICES_PATH = _REPO_ROOT / "THIRD_PARTY_NOTICES.md"
 
 
@@ -3016,7 +3023,7 @@ class UserFacingDocumentationContractTests(unittest.TestCase):
         self.assertIn("关闭设置窗口默认只是隐藏到通知区域", self.guide)
 
     def test_landing_page_identifies_the_formal_version(self):
-        version = _VERSION_PATH.read_text(encoding="ascii").strip()
+        version = _formal_version_from_landing(self.landing)
         self.assertIn(f"当前正式版为 **{version}**", self.landing)
         self.assertIn(f"RemoteMicRC003-{version}-portable-unsigned.zip", self.landing)
         self.assertIn("无线麦 win版 <版本号>.exe", self.landing)
@@ -3089,11 +3096,11 @@ class RootDocumentConsistencyTests(unittest.TestCase):
         )
         self.assertIn("never changes the Windows system default input/output device", notices_text)
 
-    def test_root_readme_and_windows_readme_agree_on_current_version(self):
-        # The public landing page and detailed guide must identify one release.
+    def test_root_readme_and_windows_readme_agree_on_formal_release(self):
+        # A local test build can be newer than the public download.
         windows_readme_text = _README_PATH.read_text(encoding="utf-8")
-        version = _VERSION_PATH.read_text(encoding="utf-8").strip()
-        self.assertIn(version, self.root_readme_text)
+        version = _formal_version_from_landing(self.root_readme_text)
+        self.assertIn(f"RemoteMicRC003-{version}-portable-unsigned.zip", self.root_readme_text)
         self.assertIn("下载页面与最新版说明", windows_readme_text)
 
 
@@ -3180,7 +3187,7 @@ class PrereleaseDownloadInstructionsContractTests(unittest.TestCase):
     def test_current_release_links_match_version(self):
         landing = _ROOT_README_PATH.read_text(encoding="utf-8")
         guide = _README_PATH.read_text(encoding="utf-8")
-        version = _VERSION_PATH.read_text(encoding="ascii").strip()
+        version = _formal_version_from_landing(landing)
         self.assertIn(f"/releases/tag/v{version}", landing)
         self.assertIn(f"RemoteMicRC003-{version}-portable-unsigned.zip", landing)
         self.assertIn("SHA256SUMS.txt", landing)
@@ -3248,7 +3255,7 @@ class ConfigLogResidueDisclosureContractTests(unittest.TestCase):
 class WindowsPrereleaseAssetScopeContractTests(unittest.TestCase):
     def test_download_instructions_name_only_this_release_assets(self):
         landing = _ROOT_README_PATH.read_text(encoding="utf-8")
-        version = _VERSION_PATH.read_text(encoding="ascii").strip()
+        version = _formal_version_from_landing(landing)
         self.assertIn(f"RemoteMicRC003-{version}-portable-unsigned.zip", landing)
         self.assertIn("SHA256SUMS.txt", landing)
         self.assertNotIn("每个预发行版恰好包含以下三个文件", landing)

@@ -996,7 +996,7 @@ def _migrate_legacy_bridge_before_desktop_start() -> bool:
         return False
 
     try:
-        result = bridge_control_windows.request_bridge_exit()
+        result = bridge_control_windows.request_bridge_exit(reason="legacy_replacement")
     except Exception:  # noqa: BLE001 - startup must fail closed
         result = bridge_control_windows.BridgeExitResult(False, False)
     if result.stopped:

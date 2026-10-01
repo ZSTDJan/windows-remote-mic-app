@@ -335,7 +335,12 @@ def reload_in_process_bridge_settings() -> Optional[bool]:
         return handle.request_settings_reload_now()
 
 
-def stop_in_process_bridge(*, timeout: float = 7.0) -> Optional[bool]:
+def stop_reason(reason: str) -> str:
+    return reason if isinstance(reason, str) and reason in {"device_change", "application_exit", "process_exit",
+        "user_restart", "automatic_restart", "audio_test", "legacy_replacement"} else "unspecified"
+
+
+def stop_in_process_bridge(*, timeout: float = 7.0, reason: str = "unspecified") -> Optional[bool]:
     """Stop this process's worker; return None when it is not the owner."""
 
     global _in_process_handle
@@ -350,7 +355,7 @@ def stop_in_process_bridge(*, timeout: float = 7.0) -> Optional[bool]:
             # probe instead of falsely reporting that another live service
             # was stopped by this process.
             return None
-        logging.getLogger("ovb_rc003").info("bridge stop requested: timeout_seconds=%.1f", timeout)
+        logging.getLogger("ovb_rc003").info("bridge stop requested: reason=%s timeout_seconds=%.1f", stop_reason(reason), timeout)
         handle.request_stop()
     stopped = handle.wait(timeout)
     logging.getLogger("ovb_rc003").info("bridge stop wait: stopped=%s", stopped)

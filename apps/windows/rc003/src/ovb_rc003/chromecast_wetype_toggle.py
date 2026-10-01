@@ -8,10 +8,11 @@ from . import hotkey, win32_input, wetype_control_windows as wetype
 
 
 class ToggleShortcut:
-    def __init__(self, shortcut, *, prepare=None):
+    def __init__(self, shortcut, *, prepare=None, ensure_key_tracking=None):
         spec = hotkey.HotkeySpec.parse(shortcut)
         self.tokens = (*spec.modifiers, spec.key)
         self.release_pending = False
+        self.ensure_key_tracking = ensure_key_tracking
         # Default WeType preparation is unchanged; Sogou only checks its process.
         self.prepare = prepare or (lambda: wetype._run_on_sta_thread(wetype._activate_wetype_for_voice_start))
 
@@ -20,6 +21,12 @@ class ToggleShortcut:
             raise OSError("previous toggle key release is unconfirmed")
         if cancelled():
             raise OSError("toggle cancelled before input profile preparation")
+        if self.ensure_key_tracking is not None:
+            if not self.ensure_key_tracking(self.tokens):
+                raise win32_input.Win32InputUnavailableError(
+                    "toggle key tracking is unavailable; shortcut not sent")
+            if cancelled():
+                raise OSError("toggle cancelled after key tracking; shortcut not sent")
         switched = self.prepare()
         if cancelled():
             raise OSError("toggle cancelled after input profile preparation; shortcut not sent")
@@ -30,6 +37,12 @@ class ToggleShortcut:
         self.release_pending = True
         try:
             win32_input.send_voice_key_combo_tap(self.tokens)
+        except (win32_input.Win32InputUnavailableError, win32_input.PhysicalKeyInUseError):
+            # PhysicalKeyInUseError is a preflight rejection before any DOWN.
+            # Unavailable also guarantees no remaining DOWN; failed/uncertain
+            # rollback is promoted to InputCleanupIncompleteError by the sender.
+            self.release_pending = False
+            raise
         except win32_input.InputCleanupIncompleteError:
             raise
         except BaseException:

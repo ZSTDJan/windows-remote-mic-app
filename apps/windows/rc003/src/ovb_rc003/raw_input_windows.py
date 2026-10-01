@@ -52,6 +52,7 @@ from __future__ import annotations
 import ctypes
 import sys
 import threading
+import time
 import uuid
 from ctypes import wintypes
 from dataclasses import dataclass, replace
@@ -234,8 +235,23 @@ PhysicalKeyboardTrackingLostCallback = Callable[[str], None]
 _PHYSICAL_KEY_STATE_LOCK = threading.Lock()
 _PHYSICAL_KEYS_BY_DEVICE: dict[int, set[int]] = {}
 _PHYSICAL_KEY_OWNER_HISTORY: dict[int, set[int]] = {}
+_PHYSICAL_KEY_REVISIONS: dict[int, int] = {}
+_PHYSICAL_KEY_LAST_EDGE_AT: dict[int, float] = {}
+_PHYSICAL_KEY_TRACKER_EPOCH = 0
 _PHYSICAL_KEY_TRACKER_ACTIVE = False
 _PHYSICAL_KEY_TRACKER_HEALTHY = False
+# A low-level hook may delay the Windows async state by up to one second.
+# Reconcile only an older hold; ordinary key transitions remain protected.
+_STALE_LWIN_OWNER_GRACE_SECONDS = 2.0
+_VK_LWIN = 0x5B
+
+
+@dataclass(frozen=True)
+class StaleLWinOwnerSnapshot:
+    device_handle: int
+    tracker_epoch: int
+    key_revision: int
+    age_ms: int
 
 _VK_SHIFT = 0x10
 _VK_CONTROL = 0x11
@@ -276,12 +292,15 @@ def _set_physical_keyboard_tracker_active(active: bool) -> bool:
     """Reset tracker ownership and return whether availability was lost."""
 
     global _PHYSICAL_KEY_TRACKER_ACTIVE, _PHYSICAL_KEY_TRACKER_HEALTHY
+    global _PHYSICAL_KEY_TRACKER_EPOCH
     with _PHYSICAL_KEY_STATE_LOCK:
         was_available = (
             _PHYSICAL_KEY_TRACKER_ACTIVE and _PHYSICAL_KEY_TRACKER_HEALTHY
         )
         _PHYSICAL_KEYS_BY_DEVICE.clear()
         _PHYSICAL_KEY_OWNER_HISTORY.clear()
+        _PHYSICAL_KEY_LAST_EDGE_AT.clear()
+        _PHYSICAL_KEY_TRACKER_EPOCH += 1
         _PHYSICAL_KEY_TRACKER_ACTIVE = bool(active)
         _PHYSICAL_KEY_TRACKER_HEALTHY = bool(active)
         return was_available and not active
@@ -290,19 +309,23 @@ def _set_physical_keyboard_tracker_active(active: bool) -> bool:
 def _mark_physical_keyboard_tracker_unhealthy() -> bool:
     """Reject new holds while retaining the last physical-key snapshot."""
 
-    global _PHYSICAL_KEY_TRACKER_HEALTHY
+    global _PHYSICAL_KEY_TRACKER_HEALTHY, _PHYSICAL_KEY_TRACKER_EPOCH
     with _PHYSICAL_KEY_STATE_LOCK:
         changed = (
             _PHYSICAL_KEY_TRACKER_ACTIVE and _PHYSICAL_KEY_TRACKER_HEALTHY
         )
         _PHYSICAL_KEY_TRACKER_HEALTHY = False
+        _PHYSICAL_KEY_TRACKER_EPOCH += 1
         return changed
 
 
 def _clear_physical_keyboard_snapshot() -> None:
+    global _PHYSICAL_KEY_TRACKER_EPOCH
     with _PHYSICAL_KEY_STATE_LOCK:
         _PHYSICAL_KEYS_BY_DEVICE.clear()
         _PHYSICAL_KEY_OWNER_HISTORY.clear()
+        _PHYSICAL_KEY_LAST_EDGE_AT.clear()
+        _PHYSICAL_KEY_TRACKER_EPOCH += 1
 
 
 def physical_keyboard_tracking_available() -> bool:
@@ -339,6 +362,10 @@ def record_physical_keyboard_event(
         ):
             return False
         keys = _PHYSICAL_KEYS_BY_DEVICE.setdefault(handle, set())
+        _PHYSICAL_KEY_REVISIONS[vk_code] = (
+            _PHYSICAL_KEY_REVISIONS.get(vk_code, 0) + 1
+        )
+        _PHYSICAL_KEY_LAST_EDGE_AT[vk_code] = time.monotonic()
         if is_pressed:
             keys.add(vk_code)
             _PHYSICAL_KEY_OWNER_HISTORY.setdefault(vk_code, set()).add(handle)
@@ -358,8 +385,69 @@ def remove_physical_keyboard_device(device_handle: int) -> None:
     with _PHYSICAL_KEY_STATE_LOCK:
         removed_keys = _PHYSICAL_KEYS_BY_DEVICE.pop(handle, ())
         for vk_code in removed_keys:
+            _PHYSICAL_KEY_REVISIONS[vk_code] = (
+                _PHYSICAL_KEY_REVISIONS.get(vk_code, 0) + 1
+            )
+            _PHYSICAL_KEY_LAST_EDGE_AT[vk_code] = time.monotonic()
             if not any(vk_code in held for held in _PHYSICAL_KEYS_BY_DEVICE.values()):
                 _PHYSICAL_KEY_OWNER_HISTORY.pop(vk_code, None)
+
+
+def snapshot_stale_lwin_owner() -> Optional[StaleLWinOwnerSnapshot]:
+    """Find one old Raw owner; the caller must verify independent key state."""
+
+    with _PHYSICAL_KEY_STATE_LOCK:
+        if not (_PHYSICAL_KEY_TRACKER_ACTIVE and _PHYSICAL_KEY_TRACKER_HEALTHY):
+            return None
+        owners = tuple(
+            handle
+            for handle, keys in _PHYSICAL_KEYS_BY_DEVICE.items()
+            if _VK_LWIN in keys
+        )
+        if len(owners) != 1 or _PHYSICAL_KEY_OWNER_HISTORY.get(_VK_LWIN) != {
+            owners[0]
+        }:
+            return None
+        age = time.monotonic() - _PHYSICAL_KEY_LAST_EDGE_AT.get(_VK_LWIN, 0.0)
+        if age <= _STALE_LWIN_OWNER_GRACE_SECONDS:
+            return None
+        return StaleLWinOwnerSnapshot(
+            device_handle=owners[0],
+            tracker_epoch=_PHYSICAL_KEY_TRACKER_EPOCH,
+            key_revision=_PHYSICAL_KEY_REVISIONS.get(_VK_LWIN, 0),
+            age_ms=max(0, int(age * 1000)),
+        )
+
+
+def clear_stale_lwin_owner_if_unchanged(snapshot: StaleLWinOwnerSnapshot) -> bool:
+    """Drop only the verified Raw LWin owner after an external UP observation."""
+
+    with _PHYSICAL_KEY_STATE_LOCK:
+        if not (
+            _PHYSICAL_KEY_TRACKER_ACTIVE
+            and _PHYSICAL_KEY_TRACKER_HEALTHY
+            and _PHYSICAL_KEY_TRACKER_EPOCH == snapshot.tracker_epoch
+            and _PHYSICAL_KEY_REVISIONS.get(_VK_LWIN, 0) == snapshot.key_revision
+            and _PHYSICAL_KEY_OWNER_HISTORY.get(_VK_LWIN)
+            == {snapshot.device_handle}
+            and tuple(
+                handle
+                for handle, keys in _PHYSICAL_KEYS_BY_DEVICE.items()
+                if _VK_LWIN in keys
+            )
+            == (snapshot.device_handle,)
+            and time.monotonic() - _PHYSICAL_KEY_LAST_EDGE_AT.get(_VK_LWIN, 0.0)
+            > _STALE_LWIN_OWNER_GRACE_SECONDS
+        ):
+            return False
+        keys = _PHYSICAL_KEYS_BY_DEVICE[snapshot.device_handle]
+        keys.remove(_VK_LWIN)
+        if not keys:
+            _PHYSICAL_KEYS_BY_DEVICE.pop(snapshot.device_handle)
+        _PHYSICAL_KEY_OWNER_HISTORY.pop(_VK_LWIN, None)
+        _PHYSICAL_KEY_REVISIONS[_VK_LWIN] = snapshot.key_revision + 1
+        _PHYSICAL_KEY_LAST_EDGE_AT[_VK_LWIN] = time.monotonic()
+        return True
 
 
 def physical_key_has_ambiguous_owners(vk_code: int) -> bool:

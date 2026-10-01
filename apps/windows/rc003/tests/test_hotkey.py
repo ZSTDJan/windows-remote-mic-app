@@ -4,6 +4,100 @@ from ovb_rc003 import hotkey, key_mapping
 
 
 class HotkeySpecTests(unittest.TestCase):
+    def test_visible_names_resolve_to_the_same_physical_keys(self):
+        from ovb_rc003 import win32_keys
+        for token in win32_keys.VK_CODES:
+            if token in {"ctrl", "alt", "shift", "win"}:
+                text = f"{token}+a"
+            else:
+                text = token
+            with self.subTest(token=token):
+                spec = hotkey.HotkeySpec.parse(text)
+                visible = hotkey.format_hotkey_text(text)
+                parsed = hotkey.HotkeySpec.from_user_text(visible, mapping=True)
+                self.assertEqual(
+                    win32_keys.resolve_vk_codes((*parsed.modifiers, parsed.key)),
+                    win32_keys.resolve_vk_codes((*spec.modifiers, spec.key)),
+                )
+
+    def test_manual_punctuation_and_common_names_accept_harmless_variations(self):
+        cases = {
+            " 左 Ctrl ＋ [ ": "lctrl+left_bracket",
+            "CTRL+CapsLock": "ctrl+caps_lock",
+            "Ctrl + Del": "ctrl+delete",
+            "Win + L": "win+l",
+            "Ctrl+小键盘加号": "ctrl+numpad_add",
+            "ctrl + ctrl + A": "ctrl+a",
+            "Ctrl+PrintScreen": "ctrl+print_screen",
+            "Ctrl+vk_41": "ctrl+a",
+            "vk_a2 + 左 Ctrl + [": "lctrl+left_bracket",
+            "Ctrl+键码 0xE2": "ctrl+vk_e2",
+            "左 Ctrl + Shift + 左 Ctrl": "shift+lctrl",
+            "Ctrl+Shift+Ctrl": "shift+ctrl",
+        }
+        for text, expected in cases.items():
+            with self.subTest(text=text):
+                self.assertEqual(hotkey.HotkeySpec.from_user_text(text, mapping=True).serialize(), expected)
+
+    def test_ambiguous_incomplete_or_unsupported_keys_are_never_dropped(self):
+        cases = {
+            "Ctrl+": "补全",
+            "Ctrl++": "小键盘加号",
+            "Ctrl+{": "Shift",
+            "Ctrl+小键盘 Enter": "暂不支持",
+            "Ctrl+unsupported_key": "无法识别",
+            "Ctrl+A+B": "一个普通键",
+            "Ctrl+A+A": "一个普通键",
+            "Ctrl+A+vk_41": "一个普通键",
+            "Ctrl+[+left_bracket": "一个普通键",
+            "Ctrl+Del+Delete": "一个普通键",
+            "Ctrl+vk_e2+键码 0xE2": "一个普通键",
+            "Ctrl+小键盘 ←": "NumLock",
+            "Ctrl+vk_00": "无效",
+            "Ctrl+不存在": "不存在",
+        }
+        for text, message in cases.items():
+            with self.subTest(text=text):
+                with self.assertRaisesRegex(hotkey.HotkeyParseError, message):
+                    hotkey.HotkeySpec.from_user_text(text, mapping=True)
+
+    def test_dynamic_key_display_can_be_edited_without_changing_its_vk(self):
+        from ovb_rc003 import win32_keys
+        for token in ("vk_e2", "vk_a8", "vk_41", "vk_a5"):
+            with self.subTest(token=token):
+                visible = hotkey.format_hotkey_text(f"ctrl+{token}")
+                self.assertNotIn("vk_", visible)
+                parsed = hotkey.HotkeySpec.from_user_text(visible, mapping=True)
+                self.assertEqual(
+                    win32_keys.resolve_vk_codes((*parsed.modifiers, parsed.key)),
+                    win32_keys.resolve_vk_codes(("ctrl", token)),
+                )
+
+    def test_legacy_raw_vk_chords_keep_their_vk_and_press_order(self):
+        from ovb_rc003 import win32_keys
+        modifiers = ("ctrl", "shift", "alt", "win", "lctrl", "rctrl",
+                     "lshift", "rshift", "lalt", "ralt", "lwin", "rwin")
+        for vk in range(256):
+            token = f"vk_{vk:02x}"
+            cases = [token]
+            for modifier in modifiers:
+                cases.extend((f"{token}+{modifier}", f"{modifier}+{token}"))
+            for text in cases:
+                expected = hotkey.HotkeySpec.parse(text)
+                for value in (text, hotkey.format_hotkey_text(text)):
+                    with self.subTest(value=value):
+                        if vk in (0x00, 0xFF, 0x01, 0x02, 0x04, 0x05, 0x06, 0xE5, 0xE7):
+                            with self.assertRaises(hotkey.HotkeyParseError):
+                                hotkey.HotkeySpec.from_user_text(value)
+                            continue
+                        actual = hotkey.HotkeySpec.from_user_text(value)
+                        if vk in (0x10, 0x11, 0x12, 0x5B, 0x5C, 0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5):
+                            self.assertEqual(actual, expected)
+                        self.assertEqual(
+                            win32_keys.resolve_vk_codes((*actual.modifiers, actual.key)),
+                            win32_keys.resolve_vk_codes((*expected.modifiers, expected.key)),
+                        )
+
     def test_default_voice_hotkey_uses_the_hold_to_talk_key(self):
         self.assertEqual(hotkey.DEFAULT_VOICE_HOTKEY.serialize(), "ralt")
 

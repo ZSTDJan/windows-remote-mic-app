@@ -59,7 +59,10 @@ def loaded_gadget_paths(pid: int) -> list[Path]:
             if not length or length >= len(name):
                 raise OSError("module path unavailable")
             path = Path(name.value)
-            if path.name.casefold() == runtime.GADGET_DLL_NAME.casefold():
+            if path.name.casefold() in {
+                runtime.GADGET_DLL_NAME.casefold(),
+                runtime.GOOGLE_GADGET_DLL_NAME.casefold(),
+            }:
                 paths.append(path)
         return paths
     finally:
@@ -139,6 +142,16 @@ def ensure_reload_capable_host(pid: int, dll_path: Path, *, selected_key: str | 
     """Return fresh/loaded/restarted/restart_required without injecting twice."""
     paths = loaded_gadget_paths(pid)
     if not paths:
+        # Google's timed-out LoadLibrary can finish after the module snapshot.
+        # Both routes use the same helper mutex, so honor its durable marker.
+        try:
+            from . import chromecast_gadget_windows as google
+            if google.pending_injection_for_host(pid):
+                _LOGGER.warning("HID runtime reload blocked: Google injection still uncertain")
+                return "restart_required"
+        except Exception:
+            _LOGGER.warning("HID runtime reload blocked: Google marker unreadable")
+            return "restart_required"
         return "fresh"
     canonical = lambda path: os.path.normcase(os.path.abspath(path))
     if len(paths) == 1 and canonical(paths[0]) == canonical(dll_path):

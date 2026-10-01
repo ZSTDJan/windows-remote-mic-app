@@ -672,6 +672,7 @@ def _path_security_sddl_text(
     *,
     directory: bool,
     read_execute_sids: Sequence[str] = (),
+    include_user: bool = True,
 ) -> str:
     sid = canonical_user_sid(user_sid)
     readers = _additional_read_execute_sids(sid, read_execute_sids)
@@ -680,7 +681,7 @@ def _path_security_sddl_text(
         f"(A;{flags};FA;;;SY)",
         f"(A;{flags};FA;;;BA)",
         *(f"(A;{flags};GRGX;;;{reader})" for reader in readers),
-        f"(A;{flags};{'GRGX' if directory else 'GR'};;;{sid})",
+        *([f"(A;{flags};{'GRGX' if directory else 'GR'};;;{sid})"] if include_user else []),
     ]
     return "O:BAG:BAD:P" + "".join(entries)
 
@@ -691,6 +692,7 @@ def _apply_path_security(
     user_sid: str,
     directory: bool,
     read_execute_sids: Sequence[str] = (),
+    include_user: bool = True,
 ) -> None:
     if not _is_windows():
         raise HidElevationError("windows_only")
@@ -719,6 +721,7 @@ def _apply_path_security(
         user_sid,
         directory=directory,
         read_execute_sids=read_execute_sids,
+        include_user=include_user,
     )
     if not advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW(
         sddl,
@@ -824,6 +827,7 @@ def validate_path_security_sddl(
     user_sid: str,
     directory: bool,
     read_execute_sids: Sequence[str] = (),
+    include_user: bool = True,
 ) -> bool:
     try:
         expected_sid = canonical_user_sid(user_sid)
@@ -846,7 +850,7 @@ def validate_path_security_sddl(
     ):
         return False
     raw_aces = re.findall(r"\(([^()]*)\)", ace_blob)
-    if len(raw_aces) != 3 + len(expected_readers) or "".join(
+    if len(raw_aces) != 2 + int(include_user) + len(expected_readers) or "".join(
         f"({ace})" for ace in raw_aces
     ) != ace_blob:
         return False
@@ -870,8 +874,9 @@ def validate_path_security_sddl(
     expected = {
         "S-1-5-18": (expected_flags, "full"),
         "S-1-5-32-544": (expected_flags, "full"),
-        expected_sid: (expected_flags, expected_user_rights),
     }
+    if include_user:
+        expected[expected_sid] = (expected_flags, expected_user_rights)
     expected.update(
         {
             reader: (expected_flags, "read_execute")

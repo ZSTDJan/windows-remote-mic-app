@@ -88,16 +88,6 @@ _GENERIC_MODIFIER_BY_PHYSICAL_KEY: Dict[Tuple[int, bool], str] = {
 _GENERIC_MODIFIER_VKS = {0x10, 0x11, 0x12}
 
 
-def _reverse_vk_table() -> Dict[int, str]:
-    reverse: Dict[int, str] = {}
-    for token, vk in win32_keys.VK_CODES.items():
-        reverse.setdefault(vk, token)
-    return reverse
-
-
-_VK_TO_TOKEN = _reverse_vk_table()
-
-
 def token_for_keyboard_event(vk_code: int, scan_code: int, flags: int) -> str:
     """Return the lossless token used by the mapping parser for one VK edge.
 
@@ -106,19 +96,25 @@ def token_for_keyboard_event(vk_code: int, scan_code: int, flags: int) -> str:
     resolves that form back to the original virtual-key code at runtime.
     """
 
-    vk = int(vk_code) & 0xFF
+    vk = int(vk_code)
+    if not 0 <= vk <= 0xFF:
+        return "unsupported_key"
     scan = int(scan_code) & 0xFF
     is_extended = bool(int(flags) & LLKHF_EXTENDED)
+    if vk == 0x0D and is_extended:
+        # The current persisted/send model has no extended Enter identity.
+        # Keep an explicit unsupported token; never silently record main Enter.
+        return "numpad_enter"
+    keypad = win32_keys.KEYPAD_NAVIGATION_KEYS.get(vk)
+    if keypad is not None and scan == keypad[1] and not is_extended:
+        return keypad[0]
     if vk in _DIRECTIONAL_VK_TO_TOKEN:
         return _DIRECTIONAL_VK_TO_TOKEN[vk]
     if vk in _GENERIC_MODIFIER_VKS:
         token = _GENERIC_MODIFIER_BY_PHYSICAL_KEY.get((scan, is_extended))
         if token is not None:
             return token
-    token = _VK_TO_TOKEN.get(vk)
-    if token is not None:
-        return token
-    return f"vk_{vk:02x}"
+    return win32_keys.key_token_for_vk(vk)
 
 
 CaptureCallback = Callable[[str], None]

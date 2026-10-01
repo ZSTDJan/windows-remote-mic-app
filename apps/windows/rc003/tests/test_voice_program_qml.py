@@ -5,6 +5,8 @@ import sys
 import tempfile
 import unittest
 
+from ovb_rc003.hotkey import HotkeySpec
+
 
 _PROBE = r"""
 import json
@@ -327,7 +329,7 @@ wetype_program_running = str(
     controls["voiceProgramSelectionRow"].property("stateText")
 )
 
-controller.selectedVoiceProgramIndex = 4
+controller._replace_voice_program_settings(dict(controller._voice_program_settings, provider="custom"))
 wait_for_voice_hotkey_idle(controller, app)
 render(window, app)
 custom_record_button_center = record_button.mapToScene(
@@ -453,7 +455,7 @@ doubao = {
     "description": str(controls["voiceHotkeyRow"].property("descriptionText")),
 }
 
-controller.selectedVoiceProgramIndex = 4
+controller._replace_voice_program_settings(dict(controller._voice_program_settings, provider="custom"))
 wait_for_voice_hotkey_idle(controller, app)
 render(window, app)
 custom_program = {
@@ -538,11 +540,13 @@ controller.shutdownBackgroundTasks()''',
         env = dict(os.environ)
         env.setdefault("QT_QPA_PLATFORM", "offscreen")
         env["LOCALAPPDATA"] = tempfile.mkdtemp()
+        env["PYTHONIOENCODING"] = "utf-8"
         result = subprocess.run(
             [sys.executable, "-c", probe],
             env=env,
             capture_output=True,
             text=True,
+            encoding="utf-8",
             timeout=60,
         )
         self.assertEqual(
@@ -557,11 +561,13 @@ controller.shutdownBackgroundTasks()''',
         env = dict(os.environ)
         env.setdefault("QT_QPA_PLATFORM", "offscreen")
         env["LOCALAPPDATA"] = tempfile.mkdtemp()
+        env["PYTHONIOENCODING"] = "utf-8"
         result = subprocess.run(
             [sys.executable, "-c", _PROBE],
             env=env,
             capture_output=True,
             text=True,
+            encoding="utf-8",
             timeout=60,
         )
         self.assertEqual(
@@ -594,7 +600,7 @@ controller.shutdownBackgroundTasks()''',
         self.assertEqual(data["hotkey_cancel"]["recording_prompt"], "请按快捷键")
         self.assertFalse(data["hotkey_cancel"]["recording"])
         self.assertEqual(
-            data["hotkey_cancel"]["field_text"],
+            HotkeySpec.from_user_text(data["hotkey_cancel"]["field_text"]).serialize(),
             data["hotkey_cancel"]["original_text"],
         )
         self.assertEqual(
@@ -620,7 +626,7 @@ controller.shutdownBackgroundTasks()''',
         self.assertEqual(data["wetype_program_running"], "运行中")
         self.assertFalse(data["qt_fallback_hotkey"]["recording"])
         self.assertEqual(
-            data["qt_fallback_hotkey"]["field_text"],
+            HotkeySpec.from_user_text(data["qt_fallback_hotkey"]["field_text"]).serialize(),
             "ctrl+shift+f9",
         )
         self.assertEqual(
@@ -630,7 +636,7 @@ controller.shutdownBackgroundTasks()''',
         self.assertFalse(data["hotkey_other_action"]["recording"])
         self.assertTrue(data["hotkey_other_action"]["action_completed"])
         self.assertEqual(
-            data["hotkey_other_action"]["field_text"],
+            HotkeySpec.from_user_text(data["hotkey_other_action"]["field_text"]).serialize(),
             data["hotkey_other_action"]["original_text"],
         )
         self.assertFalse(data["inactive_capture_error"]["recording"])

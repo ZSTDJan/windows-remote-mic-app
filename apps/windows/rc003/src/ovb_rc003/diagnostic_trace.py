@@ -27,8 +27,8 @@ from typing import Any, Optional
 
 SCHEMA_VERSION = 1
 TRACE_FILENAME = "diagnostic-trace.jsonl"
-TRACE_MAX_BYTES = 5 * 1024 * 1024
-TRACE_BACKUP_COUNT = 3
+TRACE_MAX_BYTES = 512 * 1024
+TRACE_BACKUP_COUNT = 1
 TRACE_QUEUE_SIZE = 2048
 TRACE_FLUSH_SECONDS = 0.25
 TRACE_FLUSH_RECORDS = 64
@@ -44,6 +44,46 @@ REPORT_MERGE_SECONDS = 60
 REPORT_EVENT_BYTES = 4096
 REPORT_BEFORE_COUNT = 96
 REPORT_EVENT_COUNT = 192
+_shutdown_owners = weakref.WeakSet()
+_shutdown_lock = threading.Lock()
+
+
+class CleanupProgress:
+    """Bounded in-memory breadcrumbs, visible even without Cython Python frames.
+
+    Callers supply fixed code markers only. No paths, exception text, or input
+    contents. Weak ownership prevents completed receiver runs accumulating.
+    """
+    def __init__(self, logger, owner, run="none"):
+        self.logger, self.owner, self.run = logger, owner, run
+        self.state = ("none", "idle", time.monotonic(), "none", 0.0)
+        with _shutdown_lock:
+            _shutdown_owners.add(self)
+
+    def update(self, stage, state, *, report=True, elapsed_ms=None):
+        previous, _, started, completed, _ = self.state
+        now = time.monotonic()
+        if state == "begin" or previous != stage:
+            started = now
+        elapsed = (now - started) * 1000 if elapsed_ms is None else elapsed_ms
+        if state == "done":
+            completed = stage
+        self.state = (stage, state, started, completed, elapsed)
+        if report:
+            try:
+                self.logger.info(
+                    "shutdown progress: owner=%s run=%s stage=%s state=%s elapsed_ms=%.0f last_completed=%s",
+                    self.owner, self.run, stage, state, elapsed, completed)
+            except Exception:
+                pass  # Evidence must not prevent the next cleanup operation.
+
+    def snapshot(self, logger):
+        stage, state, started, completed, elapsed = self.state
+        if state == "begin":
+            elapsed = (time.monotonic() - started) * 1000
+        logger.warning(
+            "shutdown progress snapshot: owner=%s run=%s stage=%s state=%s elapsed_ms=%.0f last_completed=%s",
+            self.owner, self.run, stage, state, elapsed, completed)
 
 
 def log_shutdown_threads(logger) -> None:
@@ -52,20 +92,45 @@ def log_shutdown_threads(logger) -> None:
     try:
         logger.warning("Shutdown exceeded cleanup deadline; capturing thread locations",
                        extra={"failure_key": "shutdown:cleanup_timeout"})
+        with _shutdown_lock:
+            owners = list(_shutdown_owners)[:64]
+        for owner in owners:
+            try:
+                owner.snapshot(logger)
+            except Exception as exc:
+                logger.warning("shutdown progress snapshot unavailable: error_type=%s", type(exc).__name__)
         frames = sys._current_frames()
-        for thread in threading.enumerate()[:64]:
+        threads = threading.enumerate()[:64]
+        captured = business = 0
+        for thread in threads:
             frame = frames.get(thread.ident)
             locations = []
             relevant = False
             while frame is not None and len(locations) < 64:
                 module = str(frame.f_globals.get("__name__", ""))
+                if not module or len(module) > 128 or any(
+                        char not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_."
+                        for char in module):
+                    module = "unknown"
+                name = str(frame.f_code.co_name)
+                if not name or len(name) > 128 or any(
+                        char not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_<>"
+                        for char in name):
+                    name = "unknown"
                 relevant |= module.startswith("ovb_rc003.")
                 # Use the module rather than an absolute filename (user paths).
-                locations.append(f"{module}:{frame.f_code.co_name}:{frame.f_lineno}")
+                locations.append(f"{module}:{name}:{frame.f_lineno}")
                 frame = frame.f_back
-            if relevant:
+            if locations:
+                captured += 1
+                business += int(relevant)
                 logger.warning("shutdown thread: ident=%s stack=%s", thread.ident,
                                " <- ".join(locations[:32]))
+        logger.warning(
+            "shutdown thread snapshot: threads=%s captured=%s business_frames=%s missing=%s "
+            "business_locations=%s native_stack=unavailable cleanup_owners=%s",
+            len(threads), captured, business, len(threads) - captured,
+            "available" if business else "unavailable", len(owners))
     except Exception as exc:
         logger.warning("shutdown thread snapshot unavailable: error_type=%s", type(exc).__name__)
 
@@ -273,6 +338,7 @@ class _ReportWriter:
         self.stop = threading.Event()
         self.lock = threading.Lock()
         self.dropped = 0
+        self.loss_seen = False
         self.thread = threading.Thread(target=self._run, name="remote-mic-fault-report", daemon=True)
         self.thread.start()
 
@@ -288,6 +354,7 @@ class _ReportWriter:
                 self.dropped = 0
             except queue.Full:
                 self.dropped += 1
+                self.loss_seen = True
                 if _FaultReport.failed(item):
                     # Replace only ordinary evidence, never an earlier failure
                     # or an export barrier. Keep queue size/order atomically.
@@ -302,14 +369,25 @@ class _ReportWriter:
                                 break
 
     def flush(self, timeout=.5):
-        if not self.thread.is_alive():
-            return False
-        barrier = threading.Event()
-        try:
-            self.queue.put_nowait(barrier)
-        except queue.Full:
-            return False
+        with self.lock:
+            if not self.thread.is_alive() or self.stop.is_set():
+                return False
+            barrier = threading.Event()
+            barrier.loss_record = self._loss_record()
+            try:
+                self.queue.put_nowait(barrier)
+            except queue.Full:
+                return False
+            self.dropped = 0
         return barrier.wait(timeout) and getattr(barrier, "persisted", False)
+
+    def _loss_record(self):
+        # Called under lock. Treat lost evidence as a report failure so the
+        # count is saved even when no device failure follows the overflow.
+        return (dict(event='fault_report_queue_overflow', wall_time=time.time(),
+                     archive_session_id=self.session_id, session_id=self.session_id,
+                     queue_dropped_before=self.dropped, failure_key='fault_report_queue_overflow')
+                if self.dropped else None)
 
     def _run(self):
         report = None
@@ -323,8 +401,10 @@ class _ReportWriter:
                     report.flush()
                     continue
                 if isinstance(item, threading.Event):
+                    if getattr(item, 'loss_record', None) is not None:
+                        report.accept(item.loss_record)
                     report.flush(force=True)
-                    item.persisted = not report.dirty
+                    item.persisted = not report.dirty and not self.loss_seen
                     item.set()
                 else:
                     report.accept(item)
@@ -332,6 +412,11 @@ class _ReportWriter:
             pass  # Evidence failure never changes input, audio or service decisions.
         finally:
             if report is not None:
+                with self.lock:
+                    loss = self._loss_record()
+                    self.dropped = 0
+                if loss is not None:
+                    report.accept(loss)
                 report.flush(force=True)
 
 
@@ -410,6 +495,8 @@ class _TraceFileState:
             self.rotation_index -= 1
         path.replace(path.with_name(f"{TRACE_FILENAME}.1"))
         self.rotation_index = None
+        from .logging_setup import prune_legacy_log_backups
+        prune_legacy_log_backups(path, TRACE_BACKUP_COUNT)
 
 
 # Keep the tiny state for the process lifetime: a service restart replaces the
@@ -471,6 +558,23 @@ class DiagnosticTrace:
         with self._lock:
             return self._dropped
 
+    def _event_locked(self, event: str, **fields: Any) -> dict:
+        self._seq += 1
+        return {
+            "schema_version": SCHEMA_VERSION,
+            "session_id": self.session_id,
+            "event_id": uuid.uuid4().hex,
+            "seq": self._seq,
+            "wall_time": time.time(),
+            "monotonic_ms": time.monotonic_ns() // 1_000_000,
+            "pid": os.getpid(),
+            "thread_id": threading.get_ident(),
+            "thread_name": threading.current_thread().name,
+            "native_thread_id": threading.get_native_id(),
+            "event": str(event),
+            **fields,
+        }
+
     def emit(self, event: str, **fields: Any) -> bool:
         if not self.enabled:
             return False
@@ -482,22 +586,7 @@ class DiagnosticTrace:
         with self._lock:
             if not self.enabled:
                 return False
-            self._seq += 1
-            item = {
-                "schema_version": SCHEMA_VERSION,
-                "session_id": self.session_id,
-                "event_id": uuid.uuid4().hex,
-                "seq": self._seq,
-                "wall_time": time.time(),
-                "monotonic_ms": time.monotonic_ns() // 1_000_000,
-                "pid": os.getpid(),
-                "thread_id": threading.get_ident(),
-                "thread_name": threading.current_thread().name,
-                "native_thread_id": threading.get_native_id(),
-                "event": str(event),
-                **getattr(self._local, "hid_report_fields", {}),
-                **safe_fields,
-            }
+            item = self._event_locked(event, **{**getattr(self._local, "hid_report_fields", {}), **safe_fields})
             self._update_gesture_stats_locked(item)
             if self._dropped:
                 item["dropped_before"] = self._dropped
@@ -508,6 +597,7 @@ class DiagnosticTrace:
                 self._queue.put_nowait(item)
             except queue.Full:
                 self._dropped += 1
+                self._write_failed = True  # A later successful flush cannot restore lost events.
                 return False
             self._dropped = 0
         return True
@@ -871,14 +961,20 @@ class DiagnosticTrace:
 
     def flush(self, timeout: float = 1.0) -> bool:
         with self._lifecycle_lock:
-            thread = self._thread
-            if thread is None or not thread.is_alive():
-                return not self._write_failed and (not self.enabled or self._queue.empty())
-            barrier = threading.Event()
-            try:
-                self._queue.put_nowait(barrier)
-            except queue.Full:
-                return False
+            with self._lock:
+                thread = self._thread
+                if thread is None or not thread.is_alive():
+                    return not self._write_failed and not self._dropped and (not self.enabled or self._queue.empty())
+                barrier = threading.Event()
+                if self._dropped:
+                    barrier.loss_record = self._event_locked('trace_queue_overflow', dropped_before=self._dropped)
+                try:
+                    self._queue.put_nowait(barrier)
+                except queue.Full:
+                    return False
+                # The marker and barrier share one slot, even in a size-one
+                # queue. Failed enqueue keeps the count for the next flush.
+                self._dropped = 0
         return barrier.wait(timeout) and getattr(barrier, "persisted", False)
 
     def _writer_main(self, trace_queue, stop):
@@ -944,6 +1040,42 @@ class DiagnosticTrace:
             self._retry_after = time.monotonic() + TRACE_RETRY_SECONDS
             close_stream()
 
+        def write_record(item):
+            nonlocal stream, size, pending, last_flush
+            if time.monotonic() < self._retry_after:
+                return False  # Bounded loss, already marked; never busy-retry disk I/O.
+            line = json.dumps(item, ensure_ascii=True, separators=(",", ":")) + "\n"
+            line_bytes = len(line.encode("utf-8"))
+            if line_bytes > TRACE_MAX_BYTES:
+                self._write_failed = True
+                return False
+            try:
+                if stream is None:
+                    self.path.parent.mkdir(parents=True, exist_ok=True)
+                    stream = self.path.open("a", encoding="utf-8", newline="\n")
+                    self._stream = stream
+                    size = self.path.stat().st_size
+                if (size + line_bytes > TRACE_MAX_BYTES
+                        or self._file_state.rotation_index is not None):
+                    # Any failed rename stops this append. Never grow an
+                    # unrotatable file or silently report a successful flush.
+                    stream.close()
+                    stream = self._stream = None
+                    pending = 0
+                    self._file_state.rotate(self.path)
+                    stream = self.path.open("a", encoding="utf-8", newline="\n")
+                    self._stream = stream
+                    size = self.path.stat().st_size
+                stream.write(line)
+                size += line_bytes
+                pending += 1
+                if pending >= TRACE_FLUSH_RECORDS or _FaultReport.failed(item):
+                    stream.flush()
+                    pending, last_flush = 0, time.monotonic()
+            except OSError:
+                failed_write()
+            return True
+
         try:
             from .voice_interaction_diagnostics_windows import ContextTimeline
             timeline = ContextTimeline()
@@ -974,6 +1106,8 @@ class DiagnosticTrace:
                 if item is None:
                     break
                 if isinstance(item, threading.Event):
+                    if getattr(item, 'loss_record', None) is not None:
+                        write_record(item.loss_record)
                     try:
                         if stream is not None:
                             stream.flush()
@@ -983,38 +1117,7 @@ class DiagnosticTrace:
                     item.persisted = not self._write_failed
                     item.set()
                     continue
-                if time.monotonic() < self._retry_after:
-                    continue  # Bounded loss, already marked; never busy-retry disk I/O.
-                line = json.dumps(item, ensure_ascii=True, separators=(",", ":")) + "\n"
-                line_bytes = len(line.encode("utf-8"))
-                if line_bytes > TRACE_MAX_BYTES:
-                    self._write_failed = True
-                    continue
-                try:
-                    if stream is None:
-                        self.path.parent.mkdir(parents=True, exist_ok=True)
-                        stream = self.path.open("a", encoding="utf-8", newline="\n")
-                        self._stream = stream
-                        size = self.path.stat().st_size
-                    if (size + line_bytes > TRACE_MAX_BYTES
-                            or self._file_state.rotation_index is not None):
-                        # Any failed rename stops this append. Never grow an
-                        # unrotatable file or silently report a successful flush.
-                        stream.close()
-                        stream = self._stream = None
-                        pending = 0
-                        self._file_state.rotate(self.path)
-                        stream = self.path.open("a", encoding="utf-8", newline="\n")
-                        self._stream = stream
-                        size = self.path.stat().st_size
-                    stream.write(line)
-                    size += line_bytes
-                    pending += 1
-                    if pending >= TRACE_FLUSH_RECORDS or _FaultReport.failed(item):
-                        stream.flush()
-                        pending, last_flush = 0, time.monotonic()
-                except OSError:
-                    failed_write()
-                timeline.accept(item)
+                if write_record(item):
+                    timeline.accept(item)
         finally:
             close_stream()

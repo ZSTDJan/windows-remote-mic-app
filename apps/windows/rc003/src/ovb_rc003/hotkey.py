@@ -15,7 +15,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Tuple
 
-from . import key_mapping
+from . import key_mapping, win32_keys
 
 _MODIFIER_ORDER = (
     "ctrl", "shift", "alt", "win",
@@ -23,14 +23,10 @@ _MODIFIER_ORDER = (
 )
 _VALID_MODIFIERS = frozenset(_MODIFIER_ORDER)
 _TOKEN_ALIASES = {
-    "left_ctrl": "lctrl",
-    "right_ctrl": "rctrl",
-    "left_shift": "lshift",
-    "right_shift": "rshift",
-    "left_alt": "lalt",
-    "right_alt": "ralt",
-    "left_win": "lwin",
-    "right_win": "rwin",
+    token: win32_keys.canonical_key_token(token)
+    for token in win32_keys.VK_CODES
+    if token not in _VALID_MODIFIERS
+    and win32_keys.canonical_key_token(token) in _VALID_MODIFIERS
 }
 
 
@@ -53,6 +49,44 @@ class HotkeySpec:
     def serialize(self) -> str:
         ordered = tuple(m for m in _MODIFIER_ORDER if m in self.modifiers)
         return "+".join((*ordered, self.key.lower()))
+
+    @classmethod
+    def from_user_text(cls, text: str, *, mapping: bool = False) -> "HotkeySpec":
+        """Parse a complete editor value; persisted tokens still use parse()."""
+        value = str(text).strip().replace("＋", "+")
+        parts = [part.strip() for part in value.split("+")]
+        if not value or any(not part for part in parts):
+            raise HotkeyParseError(
+                "请补全 + 两侧的按键名；主键盘加号用 Shift+=，小键盘加号填“小键盘加号”。"
+            )
+        try:
+            tokens = [win32_keys.key_token_from_text(p) for p in parts]
+        except win32_keys.UnknownKeyTokenError as exc:
+            raise HotkeyParseError(str(exc)) from exc
+        # Persisted raw modifier VKs were parsed as the final trigger, even
+        # when written before a named modifier. Retain that role on edit.
+        # With an ordinary key present, raw modifier aliases can still be
+        # normalized like other modifier spellings.
+        candidates = [t for t in tokens if t not in _VALID_MODIFIERS]
+        raw_trigger = candidates[0] if len(candidates) == 1 else None
+        tokens = [
+            t if not t.startswith("vk_") or (
+                t == raw_trigger
+                and win32_keys.key_token_for_vk(int(t[3:], 16)) in _VALID_MODIFIERS
+            ) else win32_keys.key_token_for_vk(int(t[3:], 16))
+            for t in tokens
+        ]
+        if len([t for t in tokens if t not in _VALID_MODIFIERS]) > 1:
+            raise HotkeyParseError("组合键只能包含一个普通键，另可搭配 Ctrl、Shift、Alt、Win。")
+        # Repeated modifiers are harmless spellings; repeated ordinary keys
+        # are an invalid chord and must not disappear during normalization.
+        # In a modifier-only chord, keep the last modifier as its trigger.
+        tokens = list(reversed(dict.fromkeys(reversed(tokens))))
+        if mapping and tokens == ["win"]:
+            tokens = ["lwin"]
+        if len(tokens) == 1 and tokens[0] in {"ctrl", "shift", "alt", "win"}:
+            raise HotkeyParseError(f"单独使用 {win32_keys.key_label(tokens[0])} 时，请明确填写左键或右键。")
+        return cls.parse("+".join(tokens))
 
     @classmethod
     def parse(cls, text: str) -> "HotkeySpec":
@@ -95,6 +129,16 @@ class HotkeySpec:
                 f"hotkey must have exactly one non-modifier key: {text!r}"
             )
         return cls(modifiers=modifiers, key=keys[0])
+
+
+def format_hotkey_text(text: str) -> str:
+    """Project canonical tokens to editable labels without changing storage."""
+    try:
+        spec = HotkeySpec.parse(text)
+        tokens = (*spec.modifiers, spec.key)
+    except HotkeyParseError:
+        return text
+    return " + ".join(win32_keys.key_label(token) for token in tokens)
 
 
 # The established right-Alt hold trigger remains the fresh-install default.

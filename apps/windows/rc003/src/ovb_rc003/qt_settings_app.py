@@ -669,8 +669,9 @@ def _load_qt_classes() -> dict:
     _QT_SPECIAL_KEY_TOKENS = {
         Qt.Key.Key_Backspace.value: "backspace",
         Qt.Key.Key_Tab.value: "tab",
+        Qt.Key.Key_Backtab.value: "tab",
         Qt.Key.Key_Return.value: "enter",
-        Qt.Key.Key_Enter.value: "enter",
+        Qt.Key.Key_Enter.value: "numpad_enter",
         Qt.Key.Key_Escape.value: "escape",
         Qt.Key.Key_Space.value: "space",
         Qt.Key.Key_PageUp.value: "page_up",
@@ -699,29 +700,26 @@ def _load_qt_classes() -> dict:
         Qt.Key.Key_VolumeDown.value: "volume_down",
         Qt.Key.Key_VolumeUp.value: "volume_up",
     }
-    _QT_PRINTABLE_KEY_TOKENS = {
-        ";": "semicolon",
-        ":": "semicolon",
-        "=": "equals",
-        "+": "equals",
-        ",": "comma",
-        "<": "comma",
-        "-": "minus",
-        "_": "minus",
-        ".": "period",
-        ">": "period",
-        "/": "slash",
-        "?": "slash",
-        "`": "backtick",
-        "~": "backtick",
-        "[": "left_bracket",
-        "{": "left_bracket",
-        "\\": "backslash",
-        "|": "backslash",
-        "]": "right_bracket",
-        "}": "right_bracket",
-        "'": "quote",
-        '"': "quote",
+    _QT_KEYPAD_TOKENS = {
+        Qt.Key.Key_Plus.value: "numpad_add",
+        Qt.Key.Key_Minus.value: "numpad_subtract",
+        Qt.Key.Key_Asterisk.value: "numpad_multiply",
+        Qt.Key.Key_Slash.value: "numpad_divide",
+        Qt.Key.Key_Period.value: "numpad_decimal",
+        Qt.Key.Key_Comma.value: "numpad_decimal",
+        Qt.Key.Key_Enter.value: "numpad_enter",
+        Qt.Key.Key_Return.value: "numpad_enter",
+        Qt.Key.Key_Clear.value: "numpad_clear",
+        Qt.Key.Key_PageUp.value: "numpad_page_up",
+        Qt.Key.Key_PageDown.value: "numpad_page_down",
+        Qt.Key.Key_End.value: "numpad_end",
+        Qt.Key.Key_Home.value: "numpad_home",
+        Qt.Key.Key_Left.value: "numpad_left",
+        Qt.Key.Key_Up.value: "numpad_up",
+        Qt.Key.Key_Right.value: "numpad_right",
+        Qt.Key.Key_Down.value: "numpad_down",
+        Qt.Key.Key_Insert.value: "numpad_insert",
+        Qt.Key.Key_Delete.value: "numpad_delete",
     }
 
     def _qt_hotkey_token(
@@ -733,37 +731,45 @@ def _load_qt_classes() -> dict:
         native_scan_code: int = 0,
     ) -> str:
         key = int(key)
-        token = _QT_MODIFIER_KEY_TOKENS.get(key)
+        keypad_token = (_QT_KEYPAD_TOKENS.get(key)
+                        if modifiers & Qt.KeyboardModifier.KeypadModifier.value else None)
+        if keypad_token in win32_keys.UNSUPPORTED_KEY_MESSAGES:
+            return keypad_token
+        # Native identity survives Ctrl control characters, IMEs and layouts.
+        # The same decoder is used by the low-level hook and the Qt fallback.
+        if sys.platform == "win32" and native_virtual_key:
+            flags = (hotkey_capture_windows.LLKHF_EXTENDED
+                     if native_scan_code & 0xFF00 == 0xE000 else 0)
+            if native_virtual_key == 0x0D and (key == Qt.Key.Key_Enter.value
+                                            or modifiers & Qt.KeyboardModifier.KeypadModifier.value):
+                flags |= hotkey_capture_windows.LLKHF_EXTENDED
+            return hotkey_capture_windows.token_for_keyboard_event(
+                native_virtual_key, native_scan_code, flags
+            )
+        if modifiers & Qt.KeyboardModifier.KeypadModifier.value:
+            if keypad_token is not None:
+                return keypad_token
+            if Qt.Key.Key_0.value <= key <= Qt.Key.Key_9.value:
+                return f"numpad{chr(key)}"
+            return "unsupported_key"
+        token = _QT_MODIFIER_KEY_TOKENS.get(key) or _QT_SPECIAL_KEY_TOKENS.get(key)
         if token is not None:
-            if sys.platform == "win32" and native_virtual_key:
-                # Qt's Windows scan code carries the E0 prefix, not LL hook flags.
-                flags = (
-                    hotkey_capture_windows.LLKHF_EXTENDED
-                    if native_scan_code & 0xFF00 == 0xE000 else 0
-                )
-                native_token = hotkey_capture_windows.token_for_keyboard_event(
-                    native_virtual_key, native_scan_code, flags
-                )
-                if native_token in {f"l{token}", f"r{token}"}:
-                    return native_token
             return token
-        token = _QT_SPECIAL_KEY_TOKENS.get(key)
-        if token is not None:
-            return token
-        first_function_key = Qt.Key.Key_F1.value
-        if first_function_key <= key <= Qt.Key.Key_F24.value:
-            return f"f{key - first_function_key + 1}"
+        if Qt.Key.Key_F1.value <= key <= Qt.Key.Key_F24.value:
+            return f"f{key - Qt.Key.Key_F1.value + 1}"
         if Qt.Key.Key_0.value <= key <= Qt.Key.Key_9.value:
-            digit = chr(key)
-            if modifiers & Qt.KeyboardModifier.KeypadModifier.value:
-                return f"numpad{digit}"
-            return digit
+            return chr(key)
         if Qt.Key.Key_A.value <= key <= Qt.Key.Key_Z.value:
             return chr(key).lower()
-        normalized_text = str(text or "")
-        if normalized_text:
-            return _QT_PRINTABLE_KEY_TOKENS.get(normalized_text[0], "")
-        return ""
+        if 0 <= key <= 0x10ffff:
+            symbol = chr(key)
+            token = win32_keys.KEY_SYMBOL_TOKENS.get(symbol)
+            if token is None and modifiers & Qt.KeyboardModifier.ShiftModifier.value:
+                token = win32_keys.KEY_SHIFTED_SYMBOL_TOKENS.get(symbol)
+            if token is not None:
+                return token
+        # Retain an unrecognized edge so a chord cannot silently lose a key.
+        return "unsupported_key"
 
     class ButtonMappingModel(QAbstractListModel):
         """One row per physical RC003 button (13 total, in
@@ -875,15 +881,15 @@ def _load_qt_classes() -> dict:
                     return f"普通报告 0x{code:02X}" if code is not None else "ATVV 语音控制（非普通报告）"
                 return remote_layout.hid_usage_display(button_id)
             if role == self.ActionTextRole:
-                return self._action_text[button_id]
+                return settings_ui.format_action_text(self._action_text[button_id])
             if role == self.DoubleClickTextRole:
-                return self._secondary_action_text[button_id][
+                return settings_ui.format_action_text(self._secondary_action_text[button_id][
                     key_mapping.ButtonTrigger.DOUBLE_CLICK.value
-                ]
+                ])
             if role == self.LongPressTextRole:
-                return self._secondary_action_text[button_id][
+                return settings_ui.format_action_text(self._secondary_action_text[button_id][
                     key_mapping.ButtonTrigger.LONG_PRESS.value
-                ]
+                ])
             if role == self.IsMicRole:
                 return button_id == "mic"
             if role == self.IsSelectedRole:
@@ -1030,6 +1036,10 @@ def _load_qt_classes() -> dict:
             if not (0 <= row < len(self._button_ids)):
                 return
             button_id = self._button_ids[row]
+            original = self._action_text[button_id]
+            if settings_ui.action_text_matches_original(text, original):
+                return
+            text = settings_ui.normalize_action_text(text)
             if text == self._action_text[button_id]:
                 return
             self._action_text[button_id] = text
@@ -1048,6 +1058,10 @@ def _load_qt_classes() -> dict:
             }:
                 return
             button_id = self._button_ids[row]
+            original = self._secondary_action_text[button_id][trigger]
+            if settings_ui.action_text_matches_original(text, original):
+                return
+            text = settings_ui.normalize_action_text(text)
             if text == self._secondary_action_text[button_id][trigger]:
                 return
             self._secondary_action_text[button_id][trigger] = text
@@ -2304,7 +2318,7 @@ def _load_qt_classes() -> dict:
                 return
             def stop():
                 try:
-                    result = bridge_control_windows.request_bridge_exit()
+                    result = bridge_control_windows.request_bridge_exit(reason="device_change")
                     payload = (bool(result.stopped), "旧设备未能正常停止，原选择保留。")
                 except Exception:
                     payload = (False, "旧设备停止失败，原选择保留。")
@@ -4112,6 +4126,7 @@ def _load_qt_classes() -> dict:
                 voice_program_manager.VOICE_PROGRAM_SOGOU,
                 voice_program_manager.VOICE_PROGRAM_WETYPE,
                 voice_program_manager.VOICE_PROGRAM_DOUBAO_IME,
+                voice_program_manager.VOICE_PROGRAM_CHATTERFLY,
             ):
                 candidate = dict(settings_snapshot)
                 candidate["provider"] = provider_id
@@ -4121,7 +4136,7 @@ def _load_qt_classes() -> dict:
                     continue
                 if status.code != "not_found":
                     continue
-                index = voice_program_manager.provider_index(provider_id)
+                index = voice_program_manager.VOICE_PROGRAM_SELECTABLE_PROVIDER_ORDER.index(provider_id)
                 options[index] += "（未安装）"
             return options
 
@@ -4274,6 +4289,13 @@ def _load_qt_classes() -> dict:
             previous = self._voice_hotkeys[mode]
             if self._voice_hotkey_busy or self._voice_settings_write_start_blocked():
                 self._set_voice_hotkey_save_state("retry")
+                return False
+            try:
+                value = hotkey.HotkeySpec.from_user_text(value).serialize()
+            except hotkey.HotkeyParseError as exc:
+                self._set_voice_hotkey_save_state("retry")
+                self._set_error_message(str(exc), self._VOICE_PAGE_INDEX)
+                self.hotkeyCaptureError.emit(str(exc))
                 return False
             provider_id = str(self._voice_program_settings.get("provider", ""))
             self._set_voice_hotkey_busy(True)
@@ -4597,6 +4619,11 @@ def _load_qt_classes() -> dict:
                 or self._input_operation_phase != "active"
             ):
                 return
+            if self.activeRemoteProfile == remote_selection.CHROMECAST_PROFILE:
+                try:
+                    logging_setup.get_logger(self._config_root).info("Chromecast key detection: gui_accepted=1")
+                except Exception:
+                    pass
             stop_requested = self.stopKeyDetection()
             if button_id:
                 self.selectButton(button_id)
@@ -5145,8 +5172,11 @@ def _load_qt_classes() -> dict:
             if self._voice_hotkey_busy or self._voice_settings_write_start_blocked():
                 return
             provider_id = voice_program_manager.provider_id_for_index(value)
-            # Index zero is retained only for legacy storage/lookup, not a mode.
-            if provider_id == voice_program_manager.VOICE_PROGRAM_NONE:
+            # Disabled/custom IDs remain readable for old configurations only.
+            if (
+                provider_id == voice_program_manager.VOICE_PROGRAM_NONE
+                or provider_id not in voice_program_manager.VOICE_PROGRAM_SELECTABLE_PROVIDER_ORDER
+            ):
                 return
             if provider_id == self._voice_program_settings.get("provider"):
                 self.loadVoiceHotkeyFromProvider()
@@ -5261,7 +5291,10 @@ def _load_qt_classes() -> dict:
                 )
             else:
                 self._set_voice_hotkey_save_state("saved")
-                if provider_id == voice_program_manager.VOICE_PROGRAM_WETYPE:
+                if provider_id in (
+                    voice_program_manager.VOICE_PROGRAM_WETYPE,
+                    voice_program_manager.VOICE_PROGRAM_CHATTERFLY,
+                ):
                     self._set_error_message("")
                     self._set_status_message(read_result.message, self._VOICE_PAGE_INDEX)
             if provider_id in {voice_program_manager.VOICE_PROGRAM_WETYPE,
@@ -5340,6 +5373,27 @@ def _load_qt_classes() -> dict:
             notify=selectedVoiceProgramIndexChanged,
         )
 
+        voiceProgramMenuIndex = Property(
+            int,
+            lambda self: (
+                voice_program_manager.VOICE_PROGRAM_SELECTABLE_PROVIDER_ORDER.index(
+                    self._voice_program_settings.get("provider")
+                ) - 1
+                if self._voice_program_settings.get("provider")
+                in voice_program_manager.VOICE_PROGRAM_SELECTABLE_PROVIDER_ORDER
+                else -1
+            ),
+            notify=selectedVoiceProgramIndexChanged,
+        )
+
+        @Slot(int)
+        def selectVoiceProgramMenuOption(self, index: int) -> None:
+            choices = voice_program_manager.VOICE_PROGRAM_SELECTABLE_PROVIDER_ORDER[1:]
+            if 0 <= index < len(choices):
+                self._set_selected_voice_program_index(
+                    voice_program_manager.provider_index(choices[index])
+                )
+
         def _selected_voice_program_is(self, provider_id: str) -> bool:
             return self._voice_program_settings.get("provider") == provider_id
 
@@ -5368,6 +5422,13 @@ def _load_qt_classes() -> dict:
             bool,
             lambda self: self._selected_voice_program_is(
                 voice_program_manager.VOICE_PROGRAM_DOUBAO_IME
+            ),
+            notify=selectedVoiceProgramIndexChanged,
+        )
+        voiceProgramChatterflySelected = Property(
+            bool,
+            lambda self: self._selected_voice_program_is(
+                voice_program_manager.VOICE_PROGRAM_CHATTERFLY
             ),
             notify=selectedVoiceProgramIndexChanged,
         )
@@ -6150,6 +6211,14 @@ def _load_qt_classes() -> dict:
         def actionOptionStartsGroup(self, option: str) -> bool:
             return option in settings_ui.ACTION_OPTION_GROUP_STARTS
 
+        @Slot(str, result=str)
+        def formatActionText(self, text: str) -> str:
+            return settings_ui.format_action_text(text)
+
+        @Slot(str, result=str)
+        def formatHotkeyText(self, text: str) -> str:
+            return hotkey.format_hotkey_text(text)
+
         @Slot(str, result="QVariantMap")
         def normalizeMappingHotkeyText(self, text: str) -> object:
             try:
@@ -6169,6 +6238,7 @@ def _load_qt_classes() -> dict:
                 button_id,
                 trigger,
                 text,
+                base_bindings=self._bindings,
             )
 
         def _get_secondary_action_options(self) -> List[str]:
@@ -6530,7 +6600,7 @@ def _load_qt_classes() -> dict:
 
             def stop_and_exit() -> None:
                 try:
-                    result = bridge_control_windows.request_bridge_exit()
+                    result = bridge_control_windows.request_bridge_exit(reason="application_exit")
                 except Exception as exc:  # noqa: BLE001 - must remain retryable
                     payload = (False, f"完全退出失败：{type(exc).__name__}")
                 else:
@@ -7701,7 +7771,8 @@ def _load_qt_classes() -> dict:
 
             def stop_for_restart() -> None:
                 try:
-                    result = bridge_control_windows.request_bridge_exit()
+                    result = bridge_control_windows.request_bridge_exit(
+                        reason="automatic_restart" if automatic else "user_restart")
                 except Exception as exc:  # noqa: BLE001 - surfaced in the UI
                     payload = (False, f"重新启动失败：{type(exc).__name__}")
                 else:
@@ -8037,6 +8108,22 @@ def _load_qt_classes() -> dict:
         def logExportDefaultFile(self) -> str:
             folder = QStandardPaths.writableLocation(QStandardPaths.DesktopLocation)
             return QUrl.fromLocalFile(str(Path(folder or str(Path.home())) / log_export.default_filename())).toString()
+
+        @Slot(result=bool)
+        def openLogLocation(self) -> bool:
+            if self._application_update_operation_blocked():
+                return False
+            result = logging_setup.open_log_location(self._config_root)
+            self._set_error_message('')
+            if result.outcome is logging_setup.LogOpenOutcome.OPENED:
+                self._set_status_message('已打开日志文件夹。', self._DEVICE_PAGE_INDEX)
+                return True
+            if result.outcome is logging_setup.LogOpenOutcome.DIRECTORY_MISSING:
+                self._set_status_message('日志文件夹尚未生成。请先运行服务。', self._DEVICE_PAGE_INDEX)
+            else:
+                self._set_status_message('')
+                self._set_error_message('无法打开日志文件夹，请稍后重试。', self._DEVICE_PAGE_INDEX)
+            return False
 
         @Slot(str, result=bool)
         def exportLogs(self, selected_file: str) -> bool:
@@ -8534,6 +8621,9 @@ def _load_qt_classes() -> dict:
                     else "未找到豆包输入法设置程序。"
                     if target.provider_id
                     == voice_program_manager.VOICE_PROGRAM_DOUBAO_IME
+                    else "未找到 Chatterfly 设置程序。"
+                    if target.provider_id
+                    == voice_program_manager.VOICE_PROGRAM_CHATTERFLY
                     else "当前语音程序没有可打开的设置入口。"
                 )
                 self._set_error_message(message, self._VOICE_PAGE_INDEX)
@@ -9395,7 +9485,7 @@ def _load_qt_classes() -> dict:
                     restart_skipped_for_exit = False
                     if bridge_running:
                         try:
-                            stop_result = bridge_control_windows.request_bridge_exit()
+                            stop_result = bridge_control_windows.request_bridge_exit(reason="audio_test")
                         except Exception:  # noqa: BLE001 - keep the test retryable
                             stop_error = (
                                 "无法临时停止遥控器服务；未运行声音通道测试"
@@ -9821,7 +9911,7 @@ def run_settings_window(
                 )
         finally:
             try:
-                bridge_stopped = bridge_launcher.stop_in_process_bridge()
+                bridge_stopped = bridge_launcher.stop_in_process_bridge(reason="process_exit")
                 if bridge_stopped is False:
                     logging_setup.get_logger(config.config_root()).error(
                         "in-process bridge did not stop before desktop shutdown"

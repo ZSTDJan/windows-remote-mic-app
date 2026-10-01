@@ -20,7 +20,7 @@ from .chromecast_buttons import ButtonEdge, STOP_REASONS
 from .chromecast_voice import parse_lifecycle
 from .chromecast_observation import valid_record
 
-VERSION = 15
+VERSION = 24
 MAX_MESSAGE_BYTES = 2048
 HEARTBEAT_TIMEOUT = 10.0
 _BUTTONS = frozenset(remote_layout.CHROMECAST_REPORT_CODES)
@@ -32,7 +32,9 @@ _REASONS = frozenset({"source_unconfirmed", "unsupported_layout", "radio_ambiguo
     "hid_source_unconfirmed", "hid_symbol_unavailable", "hid_capture_failed", "invalid_message"})
 DIAGNOSTIC_REASONS = _REASONS | STOP_REASONS | frozenset({"cleanup_unconfirmed", "cleanup_failed"})
 DIAGNOSTIC_STAGES = frozenset({"start", "selection", "logging", "device_open", "source_probe",
-    "capture", "receive", "voice_open", "voice_tick", "voice_stop", "voice_close", "capture_stop", "device_close"})
+    "capture", "receive", "voice_open", "voice_tick", "voice_stop", "voice_close", "capture_stop", "device_close",
+    "initialize_cancel", "tap_start_wait", "device_voice_close", "input_release", "observation_flush",
+    "hid_script_unload", "hid_session_detach"})
 ACL_ISSUES = frozenset({"none", "header_unavailable", "invalid_handle", "reserved_flags",
     "empty_payload", "declared_length_mismatch"})
 ACL_LENGTH_RELATIONS = frozenset({"unknown", "short", "exact", "surplus"})
@@ -211,6 +213,10 @@ class Channel:
             if not valid_record(message.get("record")):
                 raise ChannelError("invalid_evidence")
         elif kind == "diagnostic":
+            if "elapsed_ms" in message:
+                expected.add("elapsed_ms")
+                if type(message["elapsed_ms"]) is not int or not -1 <= message["elapsed_ms"] <= 2**31 - 1:
+                    raise ChannelError("invalid_diagnostic_duration")
             expected.update(("stage", "phase", "reason", "event_kind", "attribute", "length", "report_code",
                              "tail_nonzero", "acl_header_parsed", "acl_issue", "acl_flags", "acl_handle",
                              "acl_boundary", "acl_declared_length", "acl_actual_length", "acl_length_relation",

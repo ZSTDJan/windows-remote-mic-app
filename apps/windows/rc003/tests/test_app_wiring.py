@@ -3742,6 +3742,18 @@ class OrdinaryButtonGestureWiringTests(_AppWiringTestCase):
                     up.assert_called_once()
                 self.assertEqual(self.app._ble_session.mic_open_calls, 0)
 
+    def test_chatterfly_without_its_own_key_never_sends_runtime_fallback(self):
+        self.app._config["voice_program"] = {"provider": "chatterfly"}
+        config.set_voice_hotkey_for_provider(self.app._config, "chatterfly", "")
+        with mock.patch.object(self.app._voice_audio, "open") as output, \
+                mock.patch.object(self.app._voice_shortcut, "apply") as press:
+            self.assertFalse(self.app._prepare_voice_mapping_locked(
+                "mic", self.app._primary_button_action("mic")))
+            self.assertFalse(self.app._handle_mic_button_pressed())
+            output.assert_not_called()
+            press.assert_not_called()
+        self.assertEqual(self.app._ble_session.mic_open_calls, 0)
+
     def test_direct_direction_edge_arms_global_hook_before_mapping_injection(self):
         up_usage = next(
             usage

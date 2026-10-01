@@ -295,7 +295,7 @@ class ButtonMappingModelTests(unittest.TestCase):
         row = model.index_of("power")
         model.setActionTextAt(row, "escape")
         index = model.index(row, 0)
-        self.assertEqual(model.data(index, model.ActionTextRole), "escape")
+        self.assertEqual(model.data(index, model.ActionTextRole), "Esc")
 
     def test_mapping_edited_emits_only_when_an_action_really_changes(self):
         model = self.Model()
@@ -323,7 +323,7 @@ class ButtonMappingModelTests(unittest.TestCase):
         model.setSecondaryActionTextAt(row, "double_click", "f5")
         model.setSecondaryActionTextAt(row, "long_press", "系统音量 +")
         index = model.index(row, 0)
-        self.assertEqual(model.data(index, model.DoubleClickTextRole), "f5")
+        self.assertEqual(model.data(index, model.DoubleClickTextRole), "F5")
         self.assertEqual(model.data(index, model.LongPressTextRole), "系统音量 +")
         self.assertEqual(
             model.to_secondary_display_map()["power"],
@@ -2206,7 +2206,9 @@ class SettingsControllerTests(unittest.TestCase):
         self.assertEqual(controller.voiceProgramOptions[0], "请选择语音程序")
         self.assertEqual(controller.voiceProgramOptions[2], "微信输入法")
         self.assertEqual(controller.voiceProgramOptions[3], "豆包输入法")
-        self.assertEqual(controller.voiceProgramOptions[4], "自定义程序")
+        self.assertEqual(controller.voiceProgramOptions[4], "Chatterfly")
+        self.assertEqual(len(controller.voiceProgramOptions), 5)
+        self.assertNotIn("自定义程序", controller.voiceProgramOptions)
         self.assertEqual(controller.selectedVoiceProgramIndex, 0)
         self.assertFalse(controller.voiceProgramSystemManaged)
         self.assertFalse(controller.voiceProgramLaunchOnBridgeStart)
@@ -2214,6 +2216,38 @@ class SettingsControllerTests(unittest.TestCase):
         self.assertFalse(controller.voiceProgramSettingsDirty)
         self.assertEqual(controller.voiceProgramElevationStatus, "unknown")
         self.assertIn("请选择语音程序", controller.voiceProgramStatusText)
+
+    def test_legacy_custom_load_and_failed_reselection_preserve_saved_settings(self):
+        saved = config.default_config()
+        saved["voice_program"] = {
+            "provider": "custom", "custom_executable": "C:/legacy/voice.exe",
+            "launch_on_bridge_start": True, "launch_elevated": False,
+        }
+        config.set_voice_hotkey_for_provider(saved, "custom", "ctrl+f8", source="manual")
+        path = config.config_path(config.config_root())
+        config.save_config(path, saved)
+        before = path.read_bytes()
+        controller, _ = self._make_controller()
+        self.assertEqual(controller.selectedVoiceProgramIndex, 4)
+        self.assertTrue(controller.voiceProgramCustomSelected)
+        self.assertEqual(controller.voiceProgramCustomPath, "C:/legacy/voice.exe")
+        self.assertEqual(path.read_bytes(), before)
+        with mock.patch.object(config, "save_config", side_effect=OSError("locked")):
+            controller.selectedVoiceProgramIndex = 2
+        self.assertTrue(controller.voiceProgramCustomSelected)
+        self.assertEqual(path.read_bytes(), before)
+        controller.selectedVoiceProgramIndex = 2
+        stored = config.load_config(path)
+        self.assertEqual(stored["voice_program"]["provider"], "wetype")
+        self.assertEqual(stored["voice_program"]["custom_executable"], "C:/legacy/voice.exe")
+        self.assertEqual(config.voice_hotkey_for_provider(stored, "custom"), "ctrl+f8")
+        after = path.read_bytes()
+        controller.selectedVoiceProgramIndex = 4
+        self.assertEqual(controller.selectedVoiceProgramIndex, 2)
+        self.assertEqual(path.read_bytes(), after)
+        reopened, _ = self._make_controller()
+        self.assertEqual(reopened.selectedVoiceProgramIndex, 2)
+        self.assertEqual(path.read_bytes(), after)
 
     def test_voice_program_status_exposes_actual_elevation_without_parsing_text(self):
         controller, _ = self._make_controller()
@@ -2406,6 +2440,21 @@ class SettingsControllerTests(unittest.TestCase):
         self.assertFalse(controller.voiceProgramLaunchable)
         self.assertFalse(controller.voiceProgramLaunchOnBridgeStart)
         self.assertFalse(controller.voiceProgramSettingsDirty)
+
+    def test_selecting_chatterfly_uses_menu_mode_and_requires_own_shortcut(self):
+        controller, _ = self._make_controller()
+
+        controller.selectVoiceProgramMenuOption(3)
+
+        self.assertTrue(controller.voiceProgramChatterflySelected)
+        self.assertEqual(controller.selectedVoiceProgramIndex, 5)
+        self.assertEqual(controller.voiceProgramMenuIndex, 3)
+        self.assertTrue(controller.voiceProgramSystemManaged)
+        self.assertFalse(controller.voiceProgramLaunchOnBridgeStart)
+        self.assertEqual(controller.holdVoiceHotkeyText, "")
+        saved = config.load_config(config.config_path(config.config_root()))
+        self.assertEqual(saved["voice_program"]["provider"], "chatterfly")
+        self.assertEqual(config.voice_hotkey_for_provider(saved, "chatterfly"), "")
 
     def test_selecting_doubao_uses_the_direct_adapter_without_autostart(self):
         controller, _ = self._make_controller()
@@ -3210,6 +3259,7 @@ class SettingsControllerTests(unittest.TestCase):
         self.assertEqual(controller.voiceProgramOptions[1], "搜狗语音输入（未安装）")
         self.assertEqual(controller.voiceProgramOptions[2], "微信输入法")
         self.assertEqual(controller.voiceProgramOptions[3], "豆包输入法")
+        self.assertEqual(controller.voiceProgramOptions[4], "Chatterfly")
         self.assertEqual(len(controller.voiceProgramOptions), 5)
 
     def test_unrelated_mapping_edit_does_not_mark_voice_program_dirty(self):
@@ -3245,24 +3295,22 @@ class SettingsControllerTests(unittest.TestCase):
         self.assertFalse(reopened.voiceProgramLaunchElevated)
 
     def test_sogou_and_custom_elevation_preferences_are_remembered_separately(self):
+        saved = config.default_config()
+        saved["voice_program"]["provider"] = "custom"
+        config.save_config(config.config_path(config.config_root()), saved)
         controller, _ = self._make_controller()
-
-        controller.selectedVoiceProgramIndex = 1
-        self.assertTrue(controller.voiceProgramLaunchElevated)
-        controller.voiceProgramLaunchElevated = False
-        controller.selectedVoiceProgramIndex = 4
         self.assertFalse(controller.voiceProgramLaunchElevated)
         controller.voiceProgramLaunchElevated = True
-        controller.selectedVoiceProgramIndex = 1
-        self.assertFalse(controller.voiceProgramLaunchElevated)
-        controller.selectedVoiceProgramIndex = 4
-        self.assertTrue(controller.voiceProgramLaunchElevated)
-
         reopened, _ = self._make_controller()
         self.assertEqual(reopened.selectedVoiceProgramIndex, 4)
         self.assertTrue(reopened.voiceProgramLaunchElevated)
         reopened.selectedVoiceProgramIndex = 1
+        self.assertTrue(reopened.voiceProgramLaunchElevated)
+        reopened.voiceProgramLaunchElevated = False
         self.assertFalse(reopened.voiceProgramLaunchElevated)
+        self.assertTrue(reopened._voice_program_settings["launch_elevated_by_provider"]["custom"])
+        reopened.selectedVoiceProgramIndex = 4
+        self.assertEqual(reopened.selectedVoiceProgramIndex, 1)
 
     def test_existing_sogou_false_uses_automatic_start_without_changing_elevation(self):
         saved = config.default_config()
@@ -3285,8 +3333,10 @@ class SettingsControllerTests(unittest.TestCase):
     def test_voice_program_settings_persist_without_the_mapping_save(self):
         executable = Path(self._tmpdir.name) / "voice.exe"
         executable.touch()
+        saved = config.default_config()
+        saved["voice_program"]["provider"] = "custom"
+        config.save_config(config.config_path(config.config_root()), saved)
         controller, _ = self._make_controller()
-        controller.selectedVoiceProgramIndex = 4
         controller.voiceProgramCustomPath = str(executable)
         controller.voiceProgramLaunchOnBridgeStart = True
         controller.voiceProgramLaunchElevated = True
@@ -3331,12 +3381,16 @@ class SettingsControllerTests(unittest.TestCase):
         self.assertIn("语音设置保存失败", controller.errorMessage)
 
     def test_voice_start_preferences_survive_program_switch_and_reopen(self):
+        saved = config.default_config()
+        saved["voice_program"] = {"provider": "custom",
+                                  "launch_on_bridge_start_by_provider": {"custom": True}}
+        config.save_config(config.config_path(config.config_root()), saved)
         controller, _ = self._make_controller()
-        controller.selectedVoiceProgramIndex = 1
+        self.assertTrue(controller.voiceProgramLaunchOnBridgeStart)
+        with mock.patch.object(config, "save_config", side_effect=OSError("locked")):
+            controller.voiceProgramLaunchOnBridgeStart = False
+        self.assertTrue(controller.voiceProgramLaunchOnBridgeStart)
         controller.voiceProgramLaunchOnBridgeStart = False
-        self.assertTrue(controller.voiceProgramLaunchOnBridgeStart)
-        controller.selectedVoiceProgramIndex = 4
-        self.assertTrue(controller.voiceProgramLaunchOnBridgeStart)
         controller.selectedVoiceProgramIndex = 2
         self.assertFalse(controller.voiceProgramLaunchOnBridgeStart)
         controller.selectedVoiceProgramIndex = 1
@@ -3344,14 +3398,15 @@ class SettingsControllerTests(unittest.TestCase):
         reopened, _ = self._make_controller()
         self.assertTrue(reopened.voiceProgramLaunchOnBridgeStart)
         reopened.selectedVoiceProgramIndex = 4
+        self.assertEqual(reopened.selectedVoiceProgramIndex, 1)
         self.assertTrue(reopened.voiceProgramLaunchOnBridgeStart)
-        with mock.patch.object(config, "save_config", side_effect=OSError("locked")):
-            reopened.voiceProgramLaunchOnBridgeStart = False
-        self.assertTrue(reopened.voiceProgramLaunchOnBridgeStart)
+        self.assertFalse(reopened._voice_program_settings["launch_on_bridge_start_by_provider"]["custom"])
 
     def test_custom_path_paste_validation_and_save_failure_preserve_previous(self):
+        saved = config.default_config()
+        saved["voice_program"]["provider"] = "custom"
+        config.save_config(config.config_path(config.config_root()), saved)
         controller, _ = self._make_controller()
-        controller.selectedVoiceProgramIndex = 4
         executable = Path(self._tmpdir.name) / "语音 程序.exe"
         executable.touch()
         controller.voiceProgramCustomPath = '  "' + str(executable) + '"  '
@@ -3624,9 +3679,9 @@ class SettingsControllerTests(unittest.TestCase):
             controller.buttonActionValidationMessage(
                 "back",
                 "single_click",
-                "leftwin",
+                "not_a_key",
             ),
-            "单击：“leftwin”不支持映射，请重新录入",
+            "单击：不认识按键“not_a_key”，请检查键名或使用按键录入。",
         )
         self.assertEqual(
             controller.buttonActionValidationMessage(
@@ -3788,6 +3843,65 @@ class SettingsControllerTests(unittest.TestCase):
 
         self.assertEqual(captured, ["ctrl+shift+f9"])
         self.assertEqual(controller._qt_hotkey_tokens, [])
+
+    def test_qt_capture_keeps_punctuation_keypad_and_backtab_identity(self):
+        controller, model = self._make_controller()
+        captured = []
+        controller.hotkeyCaptured.connect(captured.append)
+        C = self.Qt.KeyboardModifier.ControlModifier.value
+        S = self.Qt.KeyboardModifier.ShiftModifier.value
+        K = self.Qt.KeyboardModifier.KeypadModifier.value
+        cases = [
+            (self.Qt.Key.Key_BracketLeft, "\x1b", C, 0xDB, 0x1A, "left_bracket"),
+            (self.Qt.Key.Key_BracketLeft, "", C, 0, 0, "left_bracket"),
+            (self.Qt.Key.Key_Backtab, "\t", S, 0, 0, "tab"),
+            (self.Qt.Key.Key_Plus, "+", K, 0, 0, "numpad_add"),
+            (self.Qt.Key.Key_Minus, "-", K, 0, 0, "numpad_subtract"),
+            (self.Qt.Key.Key_Asterisk, "*", K, 0, 0, "numpad_multiply"),
+            (self.Qt.Key.Key_Slash, "/", K, 0, 0, "numpad_divide"),
+            (self.Qt.Key.Key_Period, ".", K, 0, 0, "numpad_decimal"),
+            (self.Qt.Key.Key_Enter, "\r", K, 0x0D, 0xE01C, "numpad_enter"),
+            (self.Qt.Key.Key_Enter, "\r", 0, 0, 0, "numpad_enter"),
+            (self.Qt.Key.Key_Return, "\r", K, 0, 0, "numpad_enter"),
+            (self.Qt.Key.Key_Left, "", K, 0, 0, "numpad_left"),
+            (self.Qt.Key.Key_Left, "", K, 0x25, 0, "numpad_left"),
+            (self.Qt.Key.Key_Left, "", 0, 0x25, 0x4B, "numpad_left"),
+            (self.Qt.Key.Key_Left, "", 0, 0x25, 0xE04B, "left"),
+            (self.Qt.Key.Key_Left, "", 0, 0, 0, "left"),
+            (self.Qt.Key.Key_Delete, "", K, 0, 0, "numpad_delete"),
+            (self.Qt.Key.Key_Clear, "", K, 0, 0, "numpad_clear"),
+            (self.Qt.Key.Key_Equal, "=", K, 0, 0, "unsupported_key"),
+            (self.Qt.Key.Key_unknown, "", C, 0xE2, 0x56, "vk_e2"),
+            (self.Qt.Key.Key_unknown, "", C, 0xE7, 0, "vk_e7"),
+            (self.Qt.Key.Key_unknown, "", C, 0, 0, "unsupported_key"),
+        ]
+        for key, text, mods, vk, scan, expected in cases:
+            with self.subTest(key=key, expected=expected):
+                controller._hotkey_capture = mock.Mock()
+                controller._set_input_operation_state("hotkey", "active")
+                controller._reset_qt_hotkey_capture_state()
+                for pressed in (True, False):
+                    controller._capture_hotkey_qt_event(
+                        key.value, mods, text, pressed, False,
+                        native_virtual_key=vk, native_scan_code=scan,
+                    )
+                chord = captured[-1]
+                self.assertEqual(chord.split("+")[-1], expected)
+                result = controller.normalizeMappingHotkeyText(chord)
+                self.assertEqual(result["ok"], expected in {
+                    "left_bracket", "tab", "numpad_add", "numpad_subtract",
+                    "numpad_multiply", "numpad_divide", "numpad_decimal", "left", "vk_e2",
+                })
+
+    def test_readable_mapping_labels_never_replace_the_stored_key_tokens(self):
+        controller, model = self._make_controller()
+        row = model.index_of("up")
+        model.setActionTextAt(row, "左 Ctrl + [")
+        model.setSecondaryActionTextAt(row, "double_click", "Ctrl + 小键盘加号")
+        self.assertEqual(model.to_display_map()["up"], "lctrl+left_bracket")
+        self.assertEqual(model.data(model.index(row, 0), model.ActionTextRole), "左 Ctrl + [")
+        self.assertEqual(model.to_secondary_display_map()["up"]["double_click"], "ctrl+numpad_add")
+        self.assertEqual(controller.formatHotkeyText("lctrl+left_bracket"), "左 Ctrl + [")
         self.assertEqual(controller._qt_hotkey_pressed_keys, set())
 
     def test_qt_fallback_keeps_modifier_only_shortcuts_representable(self):
@@ -4945,7 +5059,7 @@ class SettingsControllerTests(unittest.TestCase):
                 allow_active_voice=True,
             )
 
-        request_exit.assert_called_once_with()
+        request_exit.assert_called_once_with(reason="automatic_restart")
         self.assertEqual(controller.bridgeLaunchPhase, "failed")
         self.assertIn("test stop failed", controller.launchStatusText)
 
@@ -5707,7 +5821,7 @@ class SettingsControllerTests(unittest.TestCase):
         del reloaded_controller
         mic_index = reloaded_model.index(reloaded_model.index_of("mic"), 0)
         self.assertEqual(reloaded_model.data(mic_index, reloaded_model.ActionTextRole), "Escape")
-        self.assertEqual(reloaded_model.data(mic_index, reloaded_model.DoubleClickTextRole), "f5")
+        self.assertEqual(reloaded_model.data(mic_index, reloaded_model.DoubleClickTextRole), "F5")
         self.assertEqual(
             reloaded_model.data(mic_index, reloaded_model.LongPressTextRole),
             "系统音量 +",
@@ -7361,6 +7475,27 @@ class SettingsControllerTests(unittest.TestCase):
         self.assertIn("暂无可导出", controller.statusMessage)
         self.assertFalse(destination.exists())
         self.assertFalse(controller.logExportBusy)
+
+    def test_open_log_location_reports_outcomes_and_works_with_diagnostics_off(self):
+        controller, _ = self._make_controller()
+        controller._diagnostic_trace_enabled = False
+        location = qt_settings_app.logging_setup.describe_log_location(controller._config_root)
+        for outcome, message in (
+            (qt_settings_app.logging_setup.LogOpenOutcome.OPENED, '已打开日志文件夹'),
+            (qt_settings_app.logging_setup.LogOpenOutcome.DIRECTORY_MISSING, '日志文件夹尚未生成'),
+            (qt_settings_app.logging_setup.LogOpenOutcome.OPEN_FAILED, '无法打开日志文件夹'),
+        ):
+            with self.subTest(outcome=outcome), mock.patch.object(
+                qt_settings_app.logging_setup, 'open_log_location', return_value=
+                    qt_settings_app.logging_setup.LogOpenResult(outcome, location, 'private error')) as opener:
+                self.assertEqual(controller.openLogLocation(), outcome is qt_settings_app.logging_setup.LogOpenOutcome.OPENED)
+                opener.assert_called_once_with(controller._config_root)
+                self.assertIn(message, controller.statusMessage + controller.errorMessage)
+                self.assertNotIn('private error', controller.statusMessage + controller.errorMessage)
+        controller.shutdownBackgroundTasks()
+        with mock.patch.object(qt_settings_app.logging_setup, 'open_log_location') as opener:
+            self.assertFalse(controller.openLogLocation())
+            opener.assert_not_called()
 
     def test_export_logs_with_diagnostics_off_and_repeated_clicks(self):
         import zipfile
@@ -9496,7 +9631,7 @@ visibility = {
 }
 
 if slow_bridge_exit:
-    def delayed_bridge_exit():
+    def delayed_bridge_exit(**_kwargs):
         time.sleep(0.6)
         return SimpleNamespace(stopped=True, error="")
 
@@ -10078,7 +10213,8 @@ render(window, app)
 update_button = find_child(window, "checkApplicationUpdateButton")
 usage_link = find_child(window, "deviceUsageLink")
 log_button = find_child(window, "deviceOpenLogButton")
-assert update_button is not None and log_button is not None and usage_link is not None
+location_link = find_child(window, "deviceLogLocationLink")
+assert all(item is not None for item in (update_button, log_button, usage_link, location_link))
 usage_link.forceActiveFocus(Qt.TabFocusReason)
 render(window, app, 3)
 QTest.keyClick(window, Qt.Key_Tab)
@@ -10090,7 +10226,13 @@ tab_backward = bool(usage_link.property("activeFocus"))
 log_button.forceActiveFocus(Qt.TabFocusReason)
 QTest.keyClick(window, Qt.Key_Tab)
 render(window, app, 3)
+assert location_link.property("activeFocus")
+QTest.keyClick(window, Qt.Key_Tab)
+render(window, app, 3)
 assert find_child(window, "diagnosticTraceSwitch").property("activeFocus")
+QTest.keyClick(window, Qt.Key_Backtab)
+render(window, app, 3)
+assert location_link.property("activeFocus")
 QTest.keyClick(window, Qt.Key_Backtab)
 render(window, app, 3)
 assert log_button.property("activeFocus")
@@ -10150,6 +10292,28 @@ for enabled in (False, True):
             assert archive.testzip() is None
     else:
         assert "暂无可导出" in controller.statusMessage
+    # Exercise the real QML click/controller/location helper, replacing only
+    # Explorer so this isolated test never opens a desktop window.
+    with mock.patch.object(m.logging_setup.os, "startfile") as opener:
+        click_item(location_link)
+        if enabled:
+            opener.assert_called_once_with(str(log_directory))
+            assert "已打开日志文件夹" in controller.statusMessage
+        else:
+            opener.assert_not_called()
+            assert "日志文件夹尚未生成" in controller.statusMessage
+
+controller._diagnostic_trace_enabled = False
+controller._log_export_busy = True
+controller.desktopBehaviorChanged.emit()
+controller.logExportBusyChanged.emit()
+render(window, app, 3)
+assert location_link.property("enabled") and not log_button.property("enabled")
+with mock.patch.object(m.logging_setup.os, "startfile") as opener:
+    click_item(location_link)
+    opener.assert_called_once_with(str(log_directory))
+controller._log_export_busy = False
+controller.logExportBusyChanged.emit()
 
 state_column = item_geometry(find_child(window, "currentDeviceRow_stateColumn"))
 main_actions = [item_geometry(find_child(window, name)) for name in (
@@ -10163,11 +10327,13 @@ assert abs(main_actions[0]["x"] - state_column["right"] - 6) <= 0.5
 bluetooth_button = item_geometry(find_child(window, "openBluetoothSettingsButton"))
 assert bluetooth_button["right"] < state_column["x"]
 note_color = find_child(window, "currentDeviceRow_descriptionLabel").property("color")
-for link in (usage_link, log_button):
+for link in (usage_link, log_button, location_link):
     assert link.property("contentItem").property("color") == note_color
     assert link.property("background").property("color") is None
+    assert link.property("font").underline()
 assert abs(item_geometry(usage_link)["right"] - state_column["right"]) <= 0.5
-assert abs(item_geometry(log_button)["right"] - state_column["right"]) <= 1.1
+assert abs(item_geometry(location_link)["right"] - state_column["right"]) <= 1.1
+assert item_geometry(log_button)["right"] < item_geometry(location_link)["x"]
 assert item_geometry(find_child(window, "diagnosticTraceSwitch"))["right"] == item_geometry(find_child(window, "launchAtLoginSwitch"))["right"]
 if os.environ.get("PROBE_SCREENSHOT_DIR"):
     window.grabWindow().save(os.path.join(os.environ["PROBE_SCREENSHOT_DIR"], "device-links.png"))
@@ -11484,6 +11650,7 @@ capture_page(
         "checkApplicationUpdateButton",
         "deviceUsageLink",
         "deviceOpenLogButton",
+        "deviceLogLocationLink",
         "desktopBehaviorSection",
         "desktopBehaviorSectionTitle",
         "launchAtLoginRow",
@@ -11502,7 +11669,7 @@ capture_page(
         "photoSidebar",
     ),
 )
-controller.selectedVoiceProgramIndex = 4
+controller._replace_voice_program_settings(dict(controller._voice_program_settings, provider="custom"))
 wait_for_voice_hotkey_idle(controller, app)
 capture_page(
     2,
@@ -11866,6 +12033,8 @@ class SettingsShellSourceContractTests(unittest.TestCase):
         self.assertIn('fileMode: FileDialog.SaveFile', self.device_qml)
         self.assertIn('qsTr("导出日志")', self.device_qml)
         self.assertIn('titleText: qsTr("诊断日志")', self.device_qml)
+        self.assertEqual(self.device_qml.count('SettingsController.openLogLocation()'), 1)
+        self.assertIn('text: qsTr("打开日志位置")', self.device_qml)
 
     def test_device_start_and_virtual_audio_apply_keep_distinct_commands(self):
         self.assertIn("SettingsController.startBridge()", self.device_qml)
@@ -12820,7 +12989,7 @@ class ThreePageSettingsSourceContractTests(unittest.TestCase):
             self.buttons_qml,
         )
         self.assertIn(
-            'qsTr("例如 Win+L 或 Lctrl+Win+左箭头")',
+            'placeholderText: qsTr("例如 Ctrl+[、Win+L 或 左 Ctrl+←")',
             self.buttons_qml,
         )
         self.assertRegex(
@@ -13091,11 +13260,13 @@ class OffscreenQmlLoadTests(unittest.TestCase):
                 env["RC003_DISABLE_LIVE_INPUT"] = "1"
                 env["PROBE_WIDTH"] = str(width)
                 env["PROBE_HEIGHT"] = str(height)
+                env["PYTHONIOENCODING"] = "utf-8"
                 result = subprocess.run(
                     [sys.executable, "-c", _APPLICATION_UPDATE_DIALOG_PROBE_SCRIPT],
                     env=env,
                     capture_output=True,
                     text=True,
+                    encoding="utf-8",
                     timeout=60,
                 )
 
@@ -13623,15 +13794,18 @@ class OffscreenQmlLoadTests(unittest.TestCase):
                 runtime_row = device_items["runtimeLogRow"]
                 update_button = device_items["checkApplicationUpdateButton"]
                 log_button = device_items["deviceOpenLogButton"]
+                location_link = device_items["deviceLogLocationLink"]
                 usage_link = device_items["deviceUsageLink"]
                 diagnostic_row = device_items["diagnosticTraceRow"]
                 self.assertTrue(update_button["visible"])
                 self.assertTrue(log_button["visible"])
                 self.assertLessEqual(usage_link["right"], update_button["x"] + 0.5)
-                self.assertAlmostEqual(usage_link["right"], log_button["right"], delta=1.1)
+                self.assertTrue(location_link["visible"])
+                self.assertAlmostEqual(usage_link["right"], location_link["right"], delta=1.1)
+                self.assertLess(log_button["right"], location_link["x"])
                 for button, row in (
                     (update_button, runtime_row), (usage_link, runtime_row),
-                    (log_button, diagnostic_row),
+                    (log_button, diagnostic_row), (location_link, diagnostic_row),
                 ):
                     self.assertGreaterEqual(button["x"], row["x"] - 0.5)
                     self.assertLessEqual(
@@ -14287,6 +14461,16 @@ def _mapping_snapshot(window, app, model, controller, screenshot_env):
 
 classes = m._load_qt_classes()
 m.hotkey_capture_windows.HotkeyCapture = FakeHotkeyCapture
+legacy_mapping_path = m.config.key_bindings_path(m.config.config_root())
+legacy_document = m.config.load_key_bindings(legacy_mapping_path)
+legacy_primary = {"kind": "key_combo", "keys": ["vk_a2", "shift"]}
+legacy_secondary = {
+    "double_click": {"kind": "key_combo", "keys": ["vk_11"]},
+    "long_press": {"kind": "key_combo", "keys": ["vk_00"]},
+}
+legacy_document["bindings"]["power"] = legacy_primary
+legacy_document.setdefault("secondary_bindings", {})["power"] = legacy_secondary
+m.config.save_key_bindings(legacy_mapping_path, legacy_document)
 QGuiApplication = classes["QGuiApplication"]
 QQmlApplicationEngine = classes["QQmlApplicationEngine"]
 QQuickStyle = classes["QQuickStyle"]
@@ -14384,17 +14568,18 @@ editor_save_button = _find_child_by_object_name(
 assert validation_error is not None
 assert editor_cancel_button is not None and editor_save_button is not None
 
-# Invalid editable text must remain a dialog-only draft. The disabled button
-# is the visible guard, while saveDraft() itself is the lifecycle/exit guard.
+# Incomplete/invalid text stays quiet until confirmation and remains a draft.
 invalid_center = combo.mapToScene(
     QPointF(combo.property("width") / 2, combo.property("height") / 2)
 ).toPoint()
 QTest.mouseClick(window, Qt.LeftButton, Qt.NoModifier, invalid_center)
 app.processEvents()
 QTest.keySequence(window, QKeySequence.SelectAll)
-for ch in "leftwin":
+for ch in "not_a_key":
     QTest.keyClick(window, ord(ch))
     app.processEvents()
+assert not validation_error.property("visible")
+QTest.keyClick(window, Qt.Key_Return)
 _wait_until(
     window,
     app,
@@ -14402,9 +14587,9 @@ _wait_until(
     "invalid mapping did not show its dialog error",
 )
 assert validation_error.property("text") == (
-    "单击：“leftwin”不支持映射，请重新录入"
+    "单击：不认识按键“not_a_key”，请检查键名或使用按键录入。"
 )
-assert not editor_save_button.property("enabled")
+assert editor_save_button.property("enabled")
 before_invalid_primary = model.to_display_map()["mic"]
 before_invalid_secondary = dict(model.to_secondary_display_map()["mic"])
 assert QMetaObject.invokeMethod(
@@ -14575,10 +14760,41 @@ _wait_until(
     lambda: not bool(recorder.property("visible")),
     "manual shortcut confirmation did not close the recorder",
 )
-assert combo.property("editText") == "win+l"
-assert editor.property("primaryText") == "win+l"
+assert combo.property("editText") == "Win + L"
+assert editor.property("primaryText") == "Win + L"
 assert FakeHotkeyCapture.start_calls == 1
 assert FakeHotkeyCapture.stop_calls == 1
+
+# Feed captured key identities through the actual QML recorder. An unsupported
+# key stays in the recorder for correction and cannot replace the draft.
+QTest.mouseClick(window, Qt.LeftButton, Qt.NoModifier, record_center)
+_wait_until(window, app, lambda: controller.hotkeyCaptureReady, "capture not ready")
+controller._on_hotkey_capture_result((controller._input_operation_token, "numpad_enter"))
+_wait_until(window, app, lambda: not controller.hotkeyCaptureActive, "capture did not stop")
+assert recorder.property("visible")
+assert recorder.property("inputMode") == "manual"
+assert "小键盘 Enter" in recorder.property("manualErrorText")
+assert editor.property("primaryText") == "Win + L"
+for invalid, reason in (("Ctrl+A+A", "一个普通键"), ("Ctrl+vk_00", "无效"),
+                        ("Ctrl+小键盘 ←", "NumLock")):
+    manual_field.setProperty("text", invalid)
+    QMetaObject.invokeMethod(recorder, "commitManualShortcut", Qt.ConnectionType.DirectConnection)
+    app.processEvents()
+    assert recorder.property("visible")
+    assert manual_field.property("text") == invalid
+    assert reason in recorder.property("manualErrorText")
+    assert editor.property("primaryText") == "Win + L"
+    assert model.to_display_map()["mic"] == "按住说话"
+manual_field.setProperty("text", "lctrl+[")
+QMetaObject.invokeMethod(recorder, "commitManualShortcut", Qt.ConnectionType.DirectConnection)
+_wait_until(window, app, lambda: not recorder.property("visible"), "corrected capture did not close")
+assert combo.property("editText") == "左 Ctrl + ["
+QTest.mouseClick(window, Qt.LeftButton, Qt.NoModifier, record_center)
+_wait_until(window, app, lambda: controller.hotkeyCaptureReady, "capture not ready")
+controller._on_hotkey_capture_result((controller._input_operation_token, "lctrl+left_bracket"))
+_wait_until(window, app, lambda: not recorder.property("visible"), "captured bracket did not close")
+assert combo.property("editText") == "左 Ctrl + ["
+assert model.to_display_map()["mic"] == "按住说话"
 
 # Choose real preset rows through each visible ComboBox popup. The editable
 # field and backing model must change as soon as the popup activates the row;
@@ -14593,7 +14809,7 @@ _select_combo_option(
     double_combo,
     list(controller.secondaryActionOptionsFor("mic")).index("f5"),
 )
-assert double_combo.property("editText") == "f5"
+assert double_combo.property("editText") == "F5"
 double_indicator = double_combo.mapToScene(
     QPointF(double_combo.property("width") - 8, double_combo.property("height") / 2)
 ).toPoint()
@@ -14649,7 +14865,8 @@ assert combo.property("activeFocus"), "click did not focus the ComboBox"
 # text matches real lowercase typing exactly.
 QTest.keySequence(window, QKeySequence.SelectAll)
 app.processEvents()
-typed = "ctrl+shift+p"
+typed = "ctrl+shift+["
+canonical = "ctrl+shift+left_bracket"
 for ch in typed:
     QTest.keyClick(window, Qt.Key_Plus if ch == "+" else ord(ch))
     app.processEvents()
@@ -14673,7 +14890,7 @@ done_center = editor_save_button.mapToScene(
 ).toPoint()
 QTest.mouseClick(window, Qt.LeftButton, Qt.NoModifier, done_center)
 assert not editor.property("visible")
-assert model.to_display_map()["mic"] == typed
+assert model.to_display_map()["mic"] == canonical
 assert model.to_secondary_display_map()["mic"]["double_click"] == "Escape"
 assert model.to_secondary_display_map()["mic"]["long_press"] == "回车"
 
@@ -14691,9 +14908,45 @@ saved_view = _mapping_snapshot(
     "RC003_MAPPING_AFTER_SCREENSHOT",
 )
 
+QTest.mouseClick(window, Qt.LeftButton, Qt.NoModifier, edit_center)
+_render(window, app, 3)
+assert combo.property("editText") == "Ctrl + Shift + ["
+QTest.mouseClick(window, Qt.LeftButton, Qt.NoModifier, center)
+QTest.keyClick(window, Qt.Key_End)
+QTest.keyClick(window, Qt.Key_Backspace)
+QTest.keyClick(window, Qt.Key_BracketRight)
+assert combo.property("editText") == "Ctrl + Shift + ]"
+assert model.to_display_map()["mic"] == canonical
+QMetaObject.invokeMethod(editor, "close", Qt.ConnectionType.DirectConnection)
+_render(window, app, 3)
+
 assert not controller.settingsDirty
 assert controller.errorMessage == "", f"auto-save reported a validation error: {controller.errorMessage}"
 assert "按键映射已自动保存" in controller.statusMessage
+
+# Opening an old row and clicking Done must keep all three gestures. The
+# unrelated microphone edit above must not have rewritten these values.
+legacy_saved = m.config.load_key_bindings(legacy_mapping_path)
+assert legacy_saved["bindings"]["power"] == legacy_primary
+assert legacy_saved["secondary_bindings"]["power"] == legacy_secondary
+legacy_before = legacy_mapping_path.read_bytes()
+power_edit = _find_child_by_object_name(window, "editMapping_power")
+power_center = power_edit.mapToScene(
+    QPointF(power_edit.property("width") / 2, power_edit.property("height") / 2)
+).toPoint()
+QTest.mouseClick(window, Qt.LeftButton, Qt.NoModifier, power_center)
+_wait_until(window, app, lambda: bool(editor.property("opened")), "legacy editor did not open")
+assert combo.property("editText") == "左 Ctrl（键码 0xA2） + Shift"
+assert double_combo.property("editText") == "Ctrl（键码 0x11）"
+assert long_combo.property("editText") == "vk_00"
+assert editor.property("validationError") == ""
+done_center = editor_save_button.mapToScene(
+    QPointF(editor_save_button.property("width") / 2, editor_save_button.property("height") / 2)
+).toPoint()
+QTest.mouseClick(window, Qt.LeftButton, Qt.NoModifier, done_center)
+_wait_until(window, app, lambda: not editor.property("visible"), "legacy editor did not close")
+assert not controller.mappingDirty
+assert legacy_mapping_path.read_bytes() == legacy_before
 
 future_device_button = _find_child_by_object_name(window, "futureDeviceButton")
 assert future_device_button is not None
@@ -14753,10 +15006,10 @@ class ButtonsPageDirectAutoSaveIntegrationTests(unittest.TestCase):
                 )
             action = key_mapping.ButtonAction.from_dict(bindings["bindings"]["mic"])
             self.assertEqual(action.kind, key_mapping.ActionKind.KEY_COMBO)
-            self.assertEqual(action.keys, ("ctrl", "shift", "p"))
+            self.assertEqual(action.keys, ("ctrl", "shift", "left_bracket"))
             self.assertEqual(
                 visual["manual_capture"],
-                {"starts": 1, "stops": 1},
+                {"starts": 3, "stops": 3},
             )
 
 
@@ -14881,7 +15134,7 @@ tab_bar.setProperty("currentIndex", 1)
 image = render()
 sample_control(results, image, "restoreMappingDefaultsButton")
 
-controller.selectedVoiceProgramIndex = controller.voiceProgramOptions.index("自定义程序")
+controller._replace_voice_program_settings(dict(controller._voice_program_settings, provider="custom"))
 tab_bar.setProperty("currentIndex", 2)
 image = render()
 sample_control(results, image, "holdVoiceHotkeyField")
@@ -14958,7 +15211,7 @@ import json
 import os
 
 from ovb_rc003 import qt_settings_app as m, remote_layout
-from PySide6.QtCore import QPoint, QPointF, Qt
+from PySide6.QtCore import QMetaObject, QPoint, QPointF, Qt
 from PySide6.QtTest import QTest
 
 
@@ -15144,7 +15397,8 @@ if editor_screenshot:
     assert window.grabWindow().save(editor_screenshot)
 
 QTest.mouseMove(window, QPoint(2, 2))
-primary_combo.setProperty("editText", "leftwin")
+primary_combo.setProperty("editText", "not_a_key")
+assert QMetaObject.invokeMethod(editor, "saveDraft", Qt.ConnectionType.DirectConnection)
 _render(window, app, 5)
 validation_error = _find(window, "actionEditorValidationError")
 editor_cancel_button = _find(window, "actionEditorCancelButton")
@@ -15153,9 +15407,9 @@ assert validation_error is not None
 assert editor_cancel_button is not None and editor_save_button is not None
 assert validation_error.property("visible")
 assert validation_error.property("text") == (
-    "单击：“leftwin”不支持映射，请重新录入"
+    "单击：不认识按键“not_a_key”，请检查键名或使用按键录入。"
 )
-assert not editor_save_button.property("enabled")
+assert editor_save_button.property("enabled")
 
 power_layout = remote_layout.hotspot_for("power")
 assert power_layout is not None
@@ -15295,9 +15549,9 @@ class ButtonsPageMappingCardTests(unittest.TestCase):
                 error = data["editor_error"]
                 self.assertEqual(
                     error["text"],
-                    "单击：“leftwin”不支持映射，请重新录入",
+                    "单击：不认识按键“not_a_key”，请检查键名或使用按键录入。",
                 )
-                self.assertFalse(error["save_enabled"])
+                self.assertTrue(error["save_enabled"])
                 self.assertTrue(error["message"]["visible"])
                 self.assertLessEqual(
                     error["message"]["bottom"],

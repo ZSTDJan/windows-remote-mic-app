@@ -25,15 +25,25 @@ VOICE_PROGRAM_NONE = "none"
 VOICE_PROGRAM_SOGOU = "sogou"
 VOICE_PROGRAM_WETYPE = "wetype"
 VOICE_PROGRAM_DOUBAO_IME = "doubao_ime"
+VOICE_PROGRAM_CHATTERFLY = "chatterfly"
 LEGACY_VOICE_PROGRAM_WINDOWS_DICTATION = "windows_dictation"
 VOICE_PROGRAM_CUSTOM = "custom"
 
+VOICE_PROGRAM_SELECTABLE_PROVIDER_ORDER = (
+    VOICE_PROGRAM_NONE,
+    VOICE_PROGRAM_SOGOU,
+    VOICE_PROGRAM_WETYPE,
+    VOICE_PROGRAM_DOUBAO_IME,
+    VOICE_PROGRAM_CHATTERFLY,
+)
+# Keep the legacy custom index (4) readable; new menu choices use their own order.
 VOICE_PROGRAM_PROVIDER_ORDER = (
     VOICE_PROGRAM_NONE,
     VOICE_PROGRAM_SOGOU,
     VOICE_PROGRAM_WETYPE,
     VOICE_PROGRAM_DOUBAO_IME,
     VOICE_PROGRAM_CUSTOM,
+    VOICE_PROGRAM_CHATTERFLY,
 )
 
 VOICE_PROGRAM_PROVIDER_NAMES = {
@@ -41,6 +51,7 @@ VOICE_PROGRAM_PROVIDER_NAMES = {
     VOICE_PROGRAM_SOGOU: "搜狗语音输入",
     VOICE_PROGRAM_WETYPE: "微信输入法",
     VOICE_PROGRAM_DOUBAO_IME: "豆包输入法",
+    VOICE_PROGRAM_CHATTERFLY: "Chatterfly",
     VOICE_PROGRAM_CUSTOM: "自定义程序",
 }
 
@@ -56,7 +67,10 @@ _WETYPE_SETTINGS_ARGUMENTS = "-showsetting"
 _DOUBAO_PROCESS_NAMES = ("ImeWatchdog.exe", "ImeService.exe")
 _DOUBAO_WATCHDOG_EXE = Path("bootstrap") / "ImeWatchdog.exe"
 _DOUBAO_SETTINGS_EXE = Path("bootstrap") / "SettingsLauncher.exe"
-_SYSTEM_MANAGED_PROVIDERS = frozenset({VOICE_PROGRAM_WETYPE})
+_CHATTERFLY_PROCESS_NAME = "ChatterflyCloud.exe"
+_CHATTERFLY_SETTINGS_EXE = "FySetting.exe"
+_CHATTERFLY_LAUNCHER_EXE = Path("ChatterflyExe") / "ChatterflyExe.exe"
+_SYSTEM_MANAGED_PROVIDERS = frozenset({VOICE_PROGRAM_WETYPE, VOICE_PROGRAM_CHATTERFLY})
 _BUILTIN_ADAPTER_PROVIDERS = frozenset({VOICE_PROGRAM_DOUBAO_IME})
 _LAUNCH_ELEVATED_DEFAULTS = {
     VOICE_PROGRAM_SOGOU: True,
@@ -226,7 +240,7 @@ def is_launchable_provider(provider_id: object) -> bool:
 
 
 def provider_options() -> list[str]:
-    return [VOICE_PROGRAM_PROVIDER_NAMES[item] for item in VOICE_PROGRAM_PROVIDER_ORDER]
+    return [VOICE_PROGRAM_PROVIDER_NAMES[item] for item in VOICE_PROGRAM_SELECTABLE_PROVIDER_ORDER]
 
 
 def provider_id_for_index(index: int) -> str:
@@ -258,6 +272,13 @@ def status_text(status: VoiceProgramStatus) -> str:
             return "已找到豆包输入法；当前未检测到输入法后台进程。"
         if status.code == "running":
             return "豆包输入法已安装并正在运行。"
+    if status.provider_id == VOICE_PROGRAM_CHATTERFLY:
+        if status.code == "not_found":
+            return "未找到 Chatterfly；正常安装后会自动识别。"
+        if status.code == "stopped":
+            return "已找到 Chatterfly；当前未检测到语音后台进程。"
+        if status.code == "running":
+            return "Chatterfly 已安装并正在运行；语音是否就绪仍需实际验证。"
     if status.code == "disabled":
         return "请选择语音程序；未配置时仅普通按键可用。"
     if status.code == "not_found":
@@ -318,6 +339,7 @@ def resolve_voice_program(
     run_value_reader: Optional[Callable[[], Iterable[str]]] = None,
     wetype_install_value_reader: Optional[Callable[[], Iterable[str]]] = None,
     doubao_install_value_reader: Optional[Callable[[], Iterable[str]]] = None,
+    chatterfly_install_value_reader: Optional[Callable[[], Iterable[str]]] = None,
     wetype_shortcut_iter: Optional[Callable[[], Iterable[Path]]] = None,
     shortcut_resolver: Optional[Callable[[Path], Optional[Path]]] = None,
 ) -> ResolvedVoiceProgram:
@@ -385,6 +407,21 @@ def resolve_voice_program(
             executable,
         )
 
+    if provider_id == VOICE_PROGRAM_CHATTERFLY:
+        executable = discover_chatterfly_executable(
+            platform=platform,
+            process_iter=process_iter,
+            install_value_reader=chatterfly_install_value_reader,
+        )
+        return ResolvedVoiceProgram(
+            provider_id,
+            display_name,
+            executable,
+            (_CHATTERFLY_PROCESS_NAME,),
+            "discovered" if executable is not None else "missing",
+            executable,
+        )
+
     executable = discover_sogou_voice_executable(
         platform=platform,
         process_iter=process_iter,
@@ -409,6 +446,7 @@ def resolve_voice_program_settings_target(
     sogou_install_value_reader: Optional[Callable[[], Iterable[str]]] = None,
     wetype_install_value_reader: Optional[Callable[[], Iterable[str]]] = None,
     doubao_install_value_reader: Optional[Callable[[], Iterable[str]]] = None,
+    chatterfly_install_value_reader: Optional[Callable[[], Iterable[str]]] = None,
     wetype_shortcut_iter: Optional[Callable[[], Iterable[Path]]] = None,
     shortcut_resolver: Optional[Callable[[Path], Optional[Path]]] = None,
 ) -> VoiceProgramSettingsTarget:
@@ -496,6 +534,26 @@ def resolve_voice_program_settings_target(
                 str(settings_executable),
             )
         return VoiceProgramSettingsTarget(provider_id, display_name, "missing")
+    if provider_id == VOICE_PROGRAM_CHATTERFLY:
+        executable = discover_chatterfly_executable(
+            platform=current_platform,
+            process_iter=process_iter,
+            install_value_reader=chatterfly_install_value_reader,
+        )
+        if executable is not None:
+            settings_exe = executable.parent / _CHATTERFLY_SETTINGS_EXE
+            if settings_exe.is_file():
+                for root in (executable.parent.parent, executable.parent):
+                    launcher = root / _CHATTERFLY_LAUNCHER_EXE
+                    if launcher.is_file():
+                        return VoiceProgramSettingsTarget(
+                            provider_id,
+                            display_name,
+                            "executable",
+                            str(launcher),
+                            f'"{settings_exe}" --page=settings',
+                        )
+        return VoiceProgramSettingsTarget(provider_id, display_name, "missing")
     return VoiceProgramSettingsTarget(provider_id, display_name, "unsupported")
 
 
@@ -507,6 +565,7 @@ def inspect_voice_program(
     run_value_reader: Optional[Callable[[], Iterable[str]]] = None,
     wetype_install_value_reader: Optional[Callable[[], Iterable[str]]] = None,
     doubao_install_value_reader: Optional[Callable[[], Iterable[str]]] = None,
+    chatterfly_install_value_reader: Optional[Callable[[], Iterable[str]]] = None,
     wetype_shortcut_iter: Optional[Callable[[], Iterable[Path]]] = None,
     shortcut_resolver: Optional[Callable[[Path], Optional[Path]]] = None,
 ) -> VoiceProgramStatus:
@@ -521,6 +580,7 @@ def inspect_voice_program(
             VOICE_PROGRAM_SOGOU,
             VOICE_PROGRAM_WETYPE,
             VOICE_PROGRAM_DOUBAO_IME,
+            VOICE_PROGRAM_CHATTERFLY,
         }
     ):
         processes = list((process_iter or _iter_windows_processes)())
@@ -532,6 +592,7 @@ def inspect_voice_program(
         run_value_reader=run_value_reader,
         wetype_install_value_reader=wetype_install_value_reader,
         doubao_install_value_reader=doubao_install_value_reader,
+        chatterfly_install_value_reader=chatterfly_install_value_reader,
         wetype_shortcut_iter=wetype_shortcut_iter,
         shortcut_resolver=shortcut_resolver,
     )
@@ -604,6 +665,7 @@ def launch_voice_program(
     run_value_reader: Optional[Callable[[], Iterable[str]]] = None,
     wetype_install_value_reader: Optional[Callable[[], Iterable[str]]] = None,
     doubao_install_value_reader: Optional[Callable[[], Iterable[str]]] = None,
+    chatterfly_install_value_reader: Optional[Callable[[], Iterable[str]]] = None,
     wetype_shortcut_iter: Optional[Callable[[], Iterable[Path]]] = None,
     start_file: Optional[Callable[[str, str, str], None]] = None,
     shortcut_resolver: Optional[Callable[[Path], Optional[Path]]] = None,
@@ -624,6 +686,7 @@ def launch_voice_program(
         run_value_reader=run_value_reader,
         wetype_install_value_reader=wetype_install_value_reader,
         doubao_install_value_reader=doubao_install_value_reader,
+        chatterfly_install_value_reader=chatterfly_install_value_reader,
         wetype_shortcut_iter=wetype_shortcut_iter,
         shortcut_resolver=shortcut_resolver,
     )
@@ -941,6 +1004,40 @@ def discover_doubao_install_root(
         if (root / _DOUBAO_WATCHDOG_EXE).is_file():
             return root
     return None
+
+
+def discover_chatterfly_executable(
+    *,
+    platform: Optional[str] = None,
+    process_iter: Optional[Callable[[], Iterable[ProcessInfo]]] = None,
+    install_value_reader: Optional[Callable[[], Iterable[str]]] = None,
+) -> Optional[Path]:
+    current_platform = sys.platform if platform is None else platform
+    if current_platform != "win32":
+        return None
+
+    candidates: list[Path] = []
+    for process in (process_iter or _iter_windows_processes)():
+        executable = process.executable
+        if (process.name.casefold() == _CHATTERFLY_PROCESS_NAME.casefold()
+                and executable is not None):
+            candidates.append(executable)
+    for raw_value in (install_value_reader or _read_chatterfly_install_values)():
+        raw_root = os.path.expandvars(str(raw_value).strip().strip('"'))
+        if not raw_root:
+            continue
+        root = Path(raw_root)
+        try:
+            candidates.append(root / _CHATTERFLY_PROCESS_NAME)
+            candidates.extend(root.glob(f"*/{_CHATTERFLY_PROCESS_NAME}"))
+        except (OSError, ValueError):
+            continue
+    existing = [path for path in dict.fromkeys(candidates) if path.is_file()]
+    if not existing:
+        return None
+    return max(existing, key=lambda path: tuple(
+        int(part) for part in re.findall(r"\d+", path.parent.name)
+    ) or (0,))
 
 
 def _validated_configured_path(raw: object) -> Optional[Path]:
@@ -1325,6 +1422,33 @@ def _read_wetype_install_values() -> Iterable[str]:
         return ()
 
 
+def _read_chatterfly_install_values() -> Iterable[str]:
+    if sys.platform != "win32":
+        return ()
+    try:
+        import winreg
+
+        subkey = r"Software\Microsoft\Windows\CurrentVersion\Uninstall\Chatterfly"
+        values: list[str] = []
+        views = tuple(dict.fromkeys((
+            0,
+            getattr(winreg, "KEY_WOW64_64KEY", 0),
+            getattr(winreg, "KEY_WOW64_32KEY", 0),
+        )))
+        for hive in (winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE):
+            for view in views:
+                try:
+                    with winreg.OpenKey(hive, subkey, 0, winreg.KEY_READ | view) as key:
+                        value, _ = winreg.QueryValueEx(key, "InstallLocation")
+                        if str(value).strip():
+                            values.append(str(value))
+                except OSError:
+                    continue
+        return tuple(dict.fromkeys(values))
+    except OSError:
+        return ()
+
+
 def _read_doubao_install_values() -> Iterable[str]:
     if sys.platform != "win32":
         return ()
@@ -1439,6 +1563,7 @@ def diagnostic_voice_processes(*, include_wetype_capture: bool = False) -> tuple
         **{name.casefold(): VOICE_PROGRAM_SOGOU for name in (_SOGOU_PROCESS_NAME,)},
         **{name.casefold(): VOICE_PROGRAM_WETYPE for name in _WETYPE_PROCESS_NAMES},
         **{name.casefold(): VOICE_PROGRAM_DOUBAO_IME for name in _DOUBAO_PROCESS_NAMES},
+        **{name.casefold(): VOICE_PROGRAM_CHATTERFLY for name in (_CHATTERFLY_PROCESS_NAME, "voiceinput.exe")},
     }
     if include_wetype_capture:
         # WeType 2.1.3.18 also hosts capture in its settings executable. This

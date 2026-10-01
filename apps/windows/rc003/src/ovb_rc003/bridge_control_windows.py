@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ctypes
+import logging
 from ctypes import wintypes
 from dataclasses import dataclass
 import sys
@@ -90,6 +91,7 @@ def _post_exit_command(hwnd: int) -> bool:
 
 def request_bridge_exit(
     *,
+    reason: str = "unspecified",
     timeout: float = DEFAULT_EXIT_TIMEOUT_SECONDS,
     poll_interval: float = DEFAULT_POLL_INTERVAL_SECONDS,
     platform: Optional[str] = None,
@@ -127,7 +129,13 @@ def request_bridge_exit(
     if stop_internal is None:
         from . import bridge_launcher
 
-        stop_internal = bridge_launcher.stop_in_process_bridge
+        stop_internal = lambda **kwargs: bridge_launcher.stop_in_process_bridge(reason=reason, **kwargs)
+
+    from .bridge_launcher import stop_reason
+    try:
+        logging.getLogger("ovb_rc003").info("bridge exit intent: reason=%s", stop_reason(reason))
+    except Exception:
+        pass  # Diagnostic logging never blocks a requested stop.
 
     internal_stopped = stop_internal(timeout=timeout)
     if internal_stopped is not None:

@@ -54,18 +54,28 @@ Item {
         SettingsController.voiceProgramWeTypeSelected
     readonly property bool doubaoSelected:
         SettingsController.voiceProgramDoubaoSelected
+    readonly property bool chatterflySelected:
+        SettingsController.voiceProgramChatterflySelected
     readonly property string voiceHotkeyModeLabel:
+        root.chatterflySelected ? qsTr("语音输入") :
         !SettingsController.isRc003Device
             && SettingsController.remoteRecordingModeIndex === 1
             && (root.sogouSelected || root.wetypeSelected || root.doubaoSelected)
         ? qsTr("开关型") : qsTr("按住型")
     readonly property bool customProgramSelected:
         SettingsController.voiceProgramCustomSelected
+    readonly property int voiceProgramMenuIndex:
+        SettingsController.voiceProgramMenuIndex
+    readonly property string voiceProgramDisplayText:
+        root.customProgramSelected ? qsTr("自定义程序（旧）")
+        : SettingsController.voiceProgramOptions[root.voiceProgramMenuIndex + 1]
+            || qsTr("请选择语音程序")
     readonly property bool voiceProgramUnsupported:
         SettingsController.activeRemoteKey.length > 0
         && !SettingsController.isRc003Device
         && root.voiceProgramManaged
         && !root.wetypeSelected && !root.sogouSelected && !root.doubaoSelected
+        && !root.chatterflySelected
     readonly property bool voiceHotkeyBusy: SettingsController.voiceHotkeyBusy
     readonly property bool voiceHotkeyRefreshVisible:
         root.sogouSelected || root.wetypeSelected || root.doubaoSelected
@@ -471,6 +481,20 @@ Item {
                     text: qsTr("语音程序")
                 }
 
+                UiLabel {
+                    objectName: "legacyVoiceProgramNotice"
+                    visible: root.customProgramSelected
+                    tokens: root.tokens
+                    kind: noteKind
+                    Layout.fillWidth: true
+                    Layout.leftMargin: root.tokens.spacingLarge
+                    Layout.rightMargin: root.tokens.spacingLarge
+                    wrapMode: Text.WordWrap
+                    text: root.voiceProgramUnsupported
+                        ? qsTr("此旧配置不能用于谷歌语音，请改选已适配程序")
+                        : qsTr("旧自定义配置已保留，请改选已适配程序")
+                }
+
                 InlineSettingsRow {
                     objectName: "voiceProgramSelectionRow"
                     tokens: root.tokens
@@ -482,9 +506,7 @@ Item {
                     stateColumnWidth: root.settingsStateColumnWidth
                     actionColumnWidth: root.settingsActionColumnWidth
                     titleText: qsTr("选择程序")
-                    descriptionText: root.voiceProgramUnsupported
-                        ? qsTr("谷歌遥控已接通微信、搜狗和豆包；此选择暂不能用于语音")
-                        : !root.voiceProgramManaged
+                    descriptionText: !root.voiceProgramManaged
                             ? qsTr("请选择语音程序，普通按键不受影响") : ""
                     stateText: root.voiceProgramStateText()
                     stateColor: root.voiceProgramStateColor
@@ -500,21 +522,20 @@ Item {
                             // Controller indices stay stable for legacy provider settings.
                             // Hide the reserved none entry; -1 is a prompt, not an option.
                             model: SettingsController.voiceProgramOptions.slice(1)
-                            currentIndex: SettingsController.selectedVoiceProgramIndex - 1
+                            currentIndex: root.voiceProgramMenuIndex
                             // Qt selects row zero when an asynchronously refreshed
                             // model arrives; restore the explicit persisted choice.
                             function restoreSelectedProgram() {
                                 currentIndex = Qt.binding(function() {
-                                    return SettingsController.selectedVoiceProgramIndex - 1
+                                    return root.voiceProgramMenuIndex
                                 })
                             }
                             onModelChanged: Qt.callLater(restoreSelectedProgram)
                             Component.onCompleted: Qt.callLater(restoreSelectedProgram)
-                            displayText: !root.voiceProgramManaged
-                                ? qsTr("请选择语音程序") : currentText
+                            displayText: root.voiceProgramDisplayText
                             enabled: !root.voiceHotkeyBusy
                                 && !root.configurationWriteBusy
-                            onActivated: SettingsController.selectedVoiceProgramIndex = index + 1
+                            onActivated: SettingsController.selectVoiceProgramMenuOption(index)
                             Accessible.name: qsTr("语音程序")
                         },
                         CheckBox {
@@ -544,6 +565,7 @@ Item {
                         objectName: "openVoiceProgramSettingsButton"
                         visible: root.wetypeSelected
                             || root.doubaoSelected
+                            || root.chatterflySelected
                             || (root.sogouSelected
                                 && SettingsController.voiceProgramStatusCode === "not_found")
                         tokens: root.tokens
@@ -682,11 +704,16 @@ Item {
                             : qsTr("自动读取按住型快捷键")
                         : root.sogouSelected
                         ? qsTr("自动读取%1快捷键").arg(root.voiceHotkeyModeLabel)
+                        : root.chatterflySelected
+                        ? qsTr("与 Chatterfly 语音输入键一致；避开 Ctrl＋Shift 等系统切换键")
                         : qsTr("请录入按住型快捷键")
                     stateText: root.voiceHotkeyRecording
                         ? SettingsController.hotkeyCaptureReady
                             ? qsTr("录入中") : qsTr("准备中")
                         : root.voiceHotkeyBusy ? qsTr("正在处理")
+                            : root.chatterflySelected
+                                && SettingsController.holdVoiceHotkeyText.length === 0
+                                ? qsTr("待录入")
                             : root.voiceHotkeyCaptureError.length > 0
                                 || SettingsController.voiceHotkeySaveState === "retry"
                                 ? qsTr("点击手动录入")
@@ -727,7 +754,7 @@ Item {
                                 text: root.voiceHotkeyRecording
                                     ? SettingsController.hotkeyCaptureReady
                                         ? qsTr("请按快捷键") : qsTr("正在准备…")
-                                    : SettingsController.holdVoiceHotkeyText
+                                    : SettingsController.formatHotkeyText(SettingsController.holdVoiceHotkeyText)
                                 color: root.voiceHotkeyRecording
                                     ? tokens.accent : tokens.textPrimary
                                 placeholderText: qsTr("尚未录入")

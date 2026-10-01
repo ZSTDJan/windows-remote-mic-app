@@ -306,15 +306,23 @@ Item {
         }
 
         function commitShortcut(chord) {
-            previewText = chord
-            pendingChord = chord
+            const result = SettingsController.normalizeMappingHotkeyText(chord)
+            if (!result.ok) {
+                pendingChord = ""
+                selectManualMode()
+                manualShortcutField.text = SettingsController.formatHotkeyText(chord)
+                manualErrorText = result.message
+                return
+            }
+            previewText = SettingsController.formatHotkeyText(result.text)
+            pendingChord = SettingsController.formatActionText(result.text)
             requestClose()
         }
 
         function finishClose() {
             if (pendingChord.length > 0) {
                 if (targetEditor) {
-                    targetEditor.editText = pendingChord
+                    targetEditor.setEditorValue(pendingChord)
                 } else {
                     actionEditor.applyCapturedShortcut(
                         rowIndex, trigger, pendingChord
@@ -495,7 +503,7 @@ Item {
                         tokens: root.tokens
                         Layout.fillWidth: true
                         enabled: !SettingsController.hotkeyCaptureActive
-                        placeholderText: qsTr("例如 Win+L 或 Lctrl+Win+左箭头")
+                        placeholderText: qsTr("例如 Ctrl+[、Win+L 或 左 Ctrl+←")
                         selectByMouse: true
                         onTextChanged: shortcutRecorder.manualErrorText = ""
                         onAccepted: shortcutRecorder.commitManualShortcut()
@@ -508,7 +516,7 @@ Item {
                         wrapMode: Text.WordWrap
                         text: shortcutRecorder.manualErrorText.length > 0
                             ? shortcutRecorder.manualErrorText
-                            : qsTr("按键名不区分大小写，可用 + 连接；单独 Win 按左 Win 发送")
+                            : qsTr("可直接修改键名；用 + 连接，确认时检查；单独 Win 按左 Win 发送")
                         color: shortcutRecorder.manualErrorText.length > 0
                             ? tokens.errorColor : tokens.textSecondary
                     }
@@ -543,7 +551,20 @@ Item {
         id: editorCombo
         property var tokens
 
+        function setEditorValue(value) {
+            const display = SettingsController.formatActionText(value)
+            currentIndex = -1
+            for (let i = 0; i < model.length; ++i) {
+                if (SettingsController.formatActionText(String(model[i])) === display) {
+                    currentIndex = i
+                    break
+                }
+            }
+            editText = display
+        }
+
         editable: true
+        onAccepted: actionEditor.validationRequested = true
         selectTextByMouse: true
         implicitHeight: tokens.controlHeight
         leftPadding: 7
@@ -584,7 +605,7 @@ Item {
             rightPadding: 7
             highlighted: editorCombo.highlightedIndex === index
             contentItem: Label {
-                text: modelData
+                text: SettingsController.formatActionText(String(modelData))
                 color: tokens.textPrimary
                 font.family: tokens.fontFamily
                 font.pixelSize: tokens.fontSizeControl
@@ -636,7 +657,7 @@ Item {
                 height: optionDelegate.groupHeaderHeight
                 acceptedButtons: Qt.LeftButton
             }
-            Accessible.name: String(modelData)
+            Accessible.name: SettingsController.formatActionText(String(modelData))
         }
     }
 
@@ -711,6 +732,10 @@ Item {
         property string originalDoubleNote: ""
         property string originalLongNote: ""
         property bool syncing: false
+        property bool validationRequested: false
+        onPrimaryTextChanged: validationRequested = false
+        onDoubleTextChanged: validationRequested = false
+        onLongTextChanged: validationRequested = false
         readonly property string normalizedPrimaryText: primaryText.trim()
         readonly property bool primaryIsVoice:
             normalizedPrimaryText === "按住说话"
@@ -743,6 +768,7 @@ Item {
                             primaryValue, doubleValue, longValue,
                             primaryNoteValue, doubleNoteValue, longNoteValue) {
             syncing = true
+            validationRequested = false
             rowIndex = rowIndexValue
             buttonId = buttonIdValue
             buttonName = buttonNameValue
@@ -758,9 +784,9 @@ Item {
             originalPrimaryNote = primaryNoteValue
             originalDoubleNote = doubleNoteValue
             originalLongNote = longNoteValue
-            primaryCombo.editText = primaryValue
-            doubleCombo.editText = doubleValue
-            longCombo.editText = longValue
+            primaryCombo.setEditorValue(primaryValue)
+            doubleCombo.setEditorValue(doubleValue)
+            longCombo.setEditorValue(longValue)
             primaryNoteField.text = primaryNoteValue
             doubleNoteField.text = doubleNoteValue
             longNoteField.text = longNoteValue
@@ -775,18 +801,19 @@ Item {
             syncing = true
             if (trigger === "single_click") {
                 primaryText = chord
-                primaryCombo.editText = chord
+                primaryCombo.setEditorValue(chord)
             } else if (trigger === "double_click") {
                 doubleText = chord
-                doubleCombo.editText = chord
+                doubleCombo.setEditorValue(chord)
             } else if (trigger === "long_press") {
                 longText = chord
-                longCombo.editText = chord
+                longCombo.setEditorValue(chord)
             }
             syncing = false
         }
 
         function saveDraft() {
+            validationRequested = true
             if (rowIndex < 0 || validationError.length > 0)
                 return false
             ButtonMappingModel.setActionTextAt(rowIndex, primaryText)
@@ -880,7 +907,7 @@ Item {
                             actionEditor.primaryText = editText
                     }
                     onActivated: {
-                        const selectedText = currentText
+                        const selectedText = SettingsController.formatActionText(currentText)
                         actionEditor.syncing = true
                         editText = selectedText
                         actionEditor.primaryText = selectedText
@@ -948,7 +975,7 @@ Item {
                             actionEditor.doubleText = editText
                     }
                     onActivated: {
-                        const selectedText = currentText
+                        const selectedText = SettingsController.formatActionText(currentText)
                         actionEditor.syncing = true
                         editText = selectedText
                         actionEditor.doubleText = selectedText
@@ -1018,7 +1045,7 @@ Item {
                             actionEditor.longText = editText
                     }
                     onActivated: {
-                        const selectedText = currentText
+                        const selectedText = SettingsController.formatActionText(currentText)
                         actionEditor.syncing = true
                         editText = selectedText
                         actionEditor.longText = selectedText
@@ -1062,7 +1089,7 @@ Item {
                 kind: noteKind
                 Layout.fillWidth: true
                 visible: text.length > 0
-                text: actionEditor.validationError
+                text: actionEditor.validationRequested ? actionEditor.validationError : ""
                 color: tokens.errorColor
                 wrapMode: Text.WordWrap
                 Accessible.name: text
@@ -1084,7 +1111,7 @@ Item {
                     tokens: root.tokens
                     compactMinimumWidth: tokens.buttonWidth2Chars
                     text: qsTr("完成")
-                    enabled: actionEditor.validationError.length === 0
+                    enabled: actionEditor.rowIndex >= 0
                     highlighted: true
                     onClicked: actionEditor.saveDraft()
                 }

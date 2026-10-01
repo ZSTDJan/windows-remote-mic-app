@@ -276,6 +276,9 @@ class ConfigPrivacyKeysNotHardcodedElsewhereTests(unittest.TestCase):
             if path.name == "config.py":
                 continue
             text = path.read_text(encoding="utf-8")
+            if path.name == "chromecast_gadget_windows.py":
+                # Frida's loopback listen address is not a saved device identity.
+                text = text.replace('"address": "127.0.0.1"', "", 1)
             for key in (
                 "address",
                 "device_match",

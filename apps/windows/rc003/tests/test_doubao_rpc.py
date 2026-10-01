@@ -43,6 +43,45 @@ class DoubaoRpcTests(unittest.TestCase):
     def tearDown(self):
         doubao_rpc.clear_cached_api()
 
+    def test_voice_stop_requires_matching_modules_for_each_verified_build(self):
+        path = Path(r"C:\Program Files\DoubaoIME\rpc.dll")
+        builds = tuple(doubao_rpc._VERIFIED_VOICE_STOP_BUILDS.items())
+        for rpc_hash, (service_hash, tsf_hash, stop_wparam) in builds:
+            hashes = {
+                "rpc.dll": rpc_hash,
+                "ImeService.exe": service_hash,
+                "tsf-oime-core.dll": tsf_hash,
+            }
+            with self.subTest(rpc_hash=rpc_hash), mock.patch.object(
+                doubao_rpc, "_module_sha256",
+                side_effect=lambda value: hashes[Path(value).name],
+            ):
+                self.assertTrue(doubao_rpc._verified_voice_stop_build(str(path)))
+                self.assertEqual(
+                    doubao_rpc._verified_voice_stop_layout(str(path)),
+                    (service_hash, tsf_hash, stop_wparam),
+                )
+                for changed_name in ("ImeService.exe", "tsf-oime-core.dll"):
+                    original = hashes[changed_name]
+                    other = next(value for key, value in builds if key != rpc_hash)
+                    hashes[changed_name] = other[
+                        0 if changed_name == "ImeService.exe" else 1
+                    ]
+                    self.assertFalse(doubao_rpc._verified_voice_stop_build(str(path)))
+                    hashes[changed_name] = original
+
+    def test_voice_stop_rejects_unknown_rpc_or_missing_companion(self):
+        path = r"C:\Program Files\DoubaoIME\rpc.dll"
+        with mock.patch.object(
+            doubao_rpc, "_module_sha256", return_value="unverified"
+        ) as digest:
+            self.assertFalse(doubao_rpc._verified_voice_stop_build(path))
+            digest.assert_called_once_with(path)
+        with mock.patch.object(
+            doubao_rpc, "_module_sha256", side_effect=OSError("missing")
+        ):
+            self.assertFalse(doubao_rpc._verified_voice_stop_build(path))
+
     def test_same_path_hash_reads_current_contents_without_cache_clear(self):
 
         with tempfile.TemporaryDirectory() as directory:
@@ -112,7 +151,7 @@ class DoubaoRpcTests(unittest.TestCase):
         with mock.patch.object(
             doubao_rpc,
             "_load_voice_stop_api",
-            return_value=library.RpcPipe_SimpleMessageEx,
+            return_value=(library.RpcPipe_SimpleMessageEx, 0),
         ):
             doubao_rpc.send_voice_press_stop()
 
@@ -129,6 +168,18 @@ class DoubaoRpcTests(unittest.TestCase):
             ],
         )
 
+    def test_voice_stop_uses_each_verified_build_parameter_once(self):
+        for stop_wparam in (0, 1):
+            function = _FakeFunction()
+            with self.subTest(stop_wparam=stop_wparam), mock.patch.object(
+                doubao_rpc,
+                "_load_voice_stop_api",
+                return_value=(function, stop_wparam),
+            ):
+                doubao_rpc.send_voice_press_stop()
+            self.assertEqual(len(function.calls), 1)
+            self.assertEqual(function.calls[0][1:4], (0x3E9, stop_wparam, 0))
+
     def test_voice_stop_loader_rejects_unverified_build_before_loading(self):
         loader = mock.Mock()
         with mock.patch.object(
@@ -136,7 +187,7 @@ class DoubaoRpcTests(unittest.TestCase):
         ), mock.patch.object(
             doubao_rpc, "_resolve_rpc_dll_path", return_value=r"C:\DoubaoIME\rpc.dll"
         ), mock.patch.object(
-            doubao_rpc, "_verified_voice_stop_build", return_value=False
+            doubao_rpc, "_verified_voice_stop_layout", return_value=None
         ), mock.patch.object(
             doubao_rpc.ctypes, "WinDLL", loader
         ):
@@ -153,13 +204,15 @@ class DoubaoRpcTests(unittest.TestCase):
         ), mock.patch.object(
             doubao_rpc, "_resolve_rpc_dll_path", return_value=dll_path
         ), mock.patch.object(
-            doubao_rpc, "_verified_voice_stop_build", return_value=True
+            doubao_rpc, "_verified_voice_stop_layout",
+            return_value=("service", "tsf", 0)
         ), mock.patch.object(
             doubao_rpc.ctypes, "WinDLL", return_value=library
         ) as loader:
-            function = doubao_rpc._load_voice_stop_api()
+            function, stop_wparam = doubao_rpc._load_voice_stop_api()
 
         self.assertIs(function, library.RpcPipe_SimpleMessageEx)
+        self.assertEqual(stop_wparam, 0)
         loader.assert_called_once_with(dll_path)
         self.assertEqual(
             function.argtypes,
@@ -182,8 +235,8 @@ class DoubaoRpcTests(unittest.TestCase):
             doubao_rpc, "_resolve_rpc_dll_path", return_value=dll_path
         ), mock.patch.object(
             doubao_rpc,
-            "_verified_voice_stop_build",
-            side_effect=(True, False),
+            "_verified_voice_stop_layout",
+            side_effect=(("service", "tsf", 0), None),
         ) as verified, mock.patch.object(
             doubao_rpc.ctypes, "WinDLL", return_value=library
         ) as loader:
@@ -194,12 +247,34 @@ class DoubaoRpcTests(unittest.TestCase):
         self.assertEqual(verified.call_count, 2)
         loader.assert_called_once_with(dll_path)
 
+    def test_new_build_loader_uses_native_button_stop_parameter(self):
+        library = _FakeLibrary()
+        hashes = {
+            "rpc.dll": "0be0cb35d864d06b2c8b5267d9f0669a1383493f557a45c6a1ebbfa203e85e53",
+            "ImeService.exe": "94ace7e504e6aa70c15095d5219604aee93e17247eb85429a046c7a4fdb95e90",
+            "tsf-oime-core.dll": "8544bfb87d8d2cc847b13e2ccc9bbd2220b20bceafdd1fc88ad5eaff5a28bb02",
+        }
+        with mock.patch.object(
+            doubao_rpc.sys, "platform", "win32"
+        ), mock.patch.object(
+            doubao_rpc, "_resolve_rpc_dll_path",
+            return_value=r"C:\Program Files\DoubaoIME\versions\v0.9.1.22\rpc.dll",
+        ), mock.patch.object(
+            doubao_rpc, "_module_sha256",
+            side_effect=lambda value: hashes[Path(value).name],
+        ), mock.patch.object(
+            doubao_rpc.ctypes, "WinDLL", return_value=library
+        ):
+            function, stop_wparam = doubao_rpc._load_voice_stop_api()
+        self.assertIs(function, library.RpcPipe_SimpleMessageEx)
+        self.assertEqual(stop_wparam, 1)
+
     def test_voice_stop_nonzero_status_is_a_call_error(self):
         function = _FakeFunction(result=7)
         with mock.patch.object(
             doubao_rpc,
             "_load_voice_stop_api",
-            return_value=function,
+            return_value=(function, 0),
         ):
             with self.assertRaises(doubao_rpc.DoubaoRpcCallError):
                 doubao_rpc.send_voice_press_stop()
@@ -215,6 +290,59 @@ class DoubaoPhysicalizerTests(unittest.TestCase):
     def tearDown(self):
         doubao_rpc.set_diagnostic_trace(None)
         doubao_rpc.clear_cached_api()
+
+    def test_each_build_checks_its_own_gate_bytes_before_installing_hooks(self):
+        cases = (
+            ((0x7426C0, 0x7427F1, 0x7427F7, 0x7431CD, 0x38),
+             "0xFF, 0x15, 0x59, 0x9B, 0x8A, 0x00, 0xE9, 0xFB, 0x09, 0x00, 0x00",
+             "0x80, 0x7C, 0x24, 0x38, 0x00, 0x75, 0x14"),
+            ((0x782D80, 0x782EB2, 0x782EB8, 0x783B7A, 0x38),
+             "0xFF, 0x15, 0xD0, 0xF4, 0x95, 0x00, 0xE9, 0xE9, 0x0C, 0x00, 0x00",
+             "0x80, 0x7C, 0x24, 0x38, 0x00, 0x75, 0x16"),
+        )
+        for layout, early_bytes, decision_bytes in cases:
+            with self.subTest(callback=layout[0]):
+                source = doubao_rpc._physicalizer_source((0xA3, 0x4C), *layout)
+                self.assertIn(f"hasBytes(earlyForward, [{early_bytes}])", source)
+                self.assertIn(f"hasBytes(decisionGate, [{decision_bytes}])", source)
+                self.assertLess(
+                    source.index("throw new Error('verified Doubao hook layout changed')"),
+                    source.index("Interceptor.attach(callback"),
+                )
+
+    def test_mixed_or_unknown_layout_cannot_create_a_hook_script(self):
+        for layout in (
+            (0x782D80, 0x7427F1, 0x7427F7, 0x7431CD, 0x38),
+            (0x782D80, 0x782EB2, 0x782EB8, 0x783B7A, 0x40),
+        ):
+            with self.subTest(layout=layout):
+                with self.assertRaises(doubao_rpc.DoubaoRpcUnavailableError):
+                    doubao_rpc._physicalizer_source((0xA3, 0x4C), *layout)
+
+    def test_new_build_starts_with_new_layout_and_cleans_up(self):
+        script = _ready_script()
+        session = mock.Mock()
+        session.create_script.return_value = script
+        self.processes.return_value = [
+            types.SimpleNamespace(pid=46500, name="ImeService.exe")
+        ]
+        fake_frida = types.SimpleNamespace(attach=mock.Mock(return_value=session))
+        physicalizer = doubao_rpc.DoubaoPhysicalizer()
+        with mock.patch.dict(sys.modules, {"frida": fake_frida}), mock.patch.object(
+            physicalizer, "_probe_module",
+            return_value=r"C:\Program Files\DoubaoIME\versions\v0.9.1.22\ImeService.exe",
+        ), mock.patch.object(
+            doubao_rpc, "_module_sha256",
+            return_value="94ace7e504e6aa70c15095d5219604aee93e17247eb85429a046c7a4fdb95e90",
+        ):
+            self.assertTrue(physicalizer.start((0xA3, 0x4C)))
+        source = session.create_script.call_args.args[0]
+        self.assertIn("module.base.add(0x782D80)", source)
+        self.assertIn("module.base.add(0x783B7A)", source)
+        self.assertEqual(physicalizer.status, "active")
+        physicalizer.stop()
+        script.unload.assert_called_once()
+        session.detach.assert_called_once()
 
     def test_script_only_clears_marked_configured_keys_in_doubao_callback(self):
         source = doubao_rpc._physicalizer_source(

@@ -1,6 +1,11 @@
 """Attempt-local WeType capture metadata, not speech or bubble visibility."""
 from __future__ import annotations
 
+import ctypes
+import sys
+from ctypes import wintypes
+from dataclasses import dataclass
+
 from . import voice_playback_session_windows as audio, voice_program_manager
 
 # Shared startup cadence. A time limit and a count limit both fence the burst.
@@ -53,6 +58,59 @@ def read_doubao_capture_for_pid(pid: int):
     if target_pid <= 0:
         return ()
     return audio.read_capture_sessions({target_pid})
+
+
+@dataclass(frozen=True)
+class _VisibleVoiceWindow:
+    identity: tuple[str, int, int]
+    state: int = 1
+
+
+def read_chatterfly_voice_windows():
+    """Observe only Chatterfly's visible voice UI, never its prearmed mic session."""
+    if sys.platform != "win32":
+        return ()
+    processes = voice_program_manager.diagnostic_voice_processes()
+    if len(processes) > 32:
+        raise OSError("voice process enumeration is incomplete")
+    pids = {
+        pid for provider, pid, name in processes
+        if provider == voice_program_manager.VOICE_PROGRAM_CHATTERFLY
+        and name.casefold() == "voiceinput.exe"
+    }
+    if not pids:
+        return ()
+
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    callback_type = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    user32.EnumWindows.argtypes = [callback_type, wintypes.LPARAM]
+    user32.EnumWindows.restype = wintypes.BOOL
+    user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+    user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+    user32.GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+    user32.GetClassNameW.restype = ctypes.c_int
+    user32.IsWindowVisible.argtypes = [wintypes.HWND]
+    user32.IsWindowVisible.restype = wintypes.BOOL
+    visible_pids = set()
+
+    def visit(hwnd, _unused):
+        pid = wintypes.DWORD()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        if pid.value not in pids or not user32.IsWindowVisible(hwnd):
+            return True
+        class_name = ctypes.create_unicode_buffer(64)
+        if user32.GetClassNameW(hwnd, class_name, len(class_name)):
+            if class_name.value in {"VoiceBarWnd", "VoiceBubbleWnd"}:
+                visible_pids.add(pid.value)
+        return True
+
+    callback = callback_type(visit)
+    if not user32.EnumWindows(callback, 0):
+        raise OSError(ctypes.get_last_error(), "Chatterfly window enumeration failed")
+    return tuple(
+        _VisibleVoiceWindow(("ChatterflyVoiceUi", 0, pid))
+        for pid in sorted(visible_pids)
+    )
 
 
 class CaptureWatch:

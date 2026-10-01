@@ -3214,6 +3214,15 @@ class RC003App:
         if issue:
             self._logger.warning("voice mapping ignored: %s", issue)
             return False
+        if (
+            self._config.get("voice_program", {}).get("provider")
+            == voice_program_manager.VOICE_PROGRAM_CHATTERFLY
+            and not config.voice_hotkey_for_provider(
+                self._config, voice_program_manager.VOICE_PROGRAM_CHATTERFLY
+            )
+        ):
+            self._logger.warning("voice mapping ignored: Chatterfly shortcut is not configured")
+            return False
         if not self._direct_hid_interception_ready:
             self._logger.warning(
                 "voice mapping ignored: RC003 HID interception is not ready"
@@ -5778,6 +5787,16 @@ class RC003App:
             self._logger.warning("voice startup rejected: %s", issue)
             self._set_runtime_voice_result(bridge_runtime_status.VOICE_RUNTIME_HOST_START_FAILED)
             return False
+        if (
+            self._config.get("voice_program", {}).get("provider")
+            == voice_program_manager.VOICE_PROGRAM_CHATTERFLY
+            and not config.voice_hotkey_for_provider(
+                self._config, voice_program_manager.VOICE_PROGRAM_CHATTERFLY
+            )
+        ):
+            self._logger.warning("voice startup rejected: Chatterfly shortcut is not configured")
+            self._set_runtime_voice_result(bridge_runtime_status.VOICE_RUNTIME_HOST_START_FAILED)
+            return False
         self._ensure_voice_diagnostic_attempt()
         if not self._accept_input_events or not self._accept_ble_events:
             self._voice_pcm_forwarding_enabled = False
@@ -6173,8 +6192,19 @@ async def _run(
             )
 
     def request_exit() -> None:
+        try:
+            app._logger.info("bridge cancellation requested: source=app_callback")
+        except Exception:
+            pass
         tray_exit_requested.set()
         loop.call_soon_threadsafe(run_task.cancel)
+
+    def request_tray_exit() -> None:
+        try:
+            app._logger.info("bridge exit intent: reason=tray_or_legacy_control")
+        except Exception:
+            pass
+        request_exit()
 
     if on_runtime_ready is not None:
         on_runtime_ready(request_exit)
@@ -6189,7 +6219,7 @@ async def _run(
             try:
                 tray = tray_factory(
                     on_open_settings=open_settings,
-                    on_exit_requested=request_exit,
+                    on_exit_requested=request_tray_exit,
                     status_handler=lambda message: app._logger.info(
                         "notification area: %s", message
                     ),

@@ -21,6 +21,28 @@ class ResolveVkCodesTests(unittest.TestCase):
         with self.assertRaises(win32_keys.UnknownKeyTokenError):
             win32_keys.resolve_vk_codes(["not_a_real_key"])
 
+    def test_non_keyboard_and_non_replayable_codes_are_rejected(self):
+        for vk in (0x00, 0xFF, 0x01, 0x02, 0x04, 0x05, 0x06, 0xE5, 0xE7):
+            with self.subTest(vk=vk):
+                token = f"vk_{vk:02x}"
+                for value in (token, win32_keys.key_label(token)):
+                    with self.assertRaises(win32_keys.UnknownKeyTokenError):
+                        win32_keys.key_token_from_text(value)
+                with self.assertRaises(win32_keys.UnknownKeyTokenError):
+                    win32_keys.resolve_vk_codes((token,))
+
+    def test_valid_oem_and_extended_function_codes_remain_compatible(self):
+        self.assertEqual(
+            win32_keys.resolve_vk_codes(("vk_e2", "vk_a8", "vk_b4", "vk_03")),
+            [0xE2, 0xA8, 0xB4, 0x03],
+        )
+
+    def test_explicit_code_labels_keep_identity_and_reject_conflicting_names(self):
+        self.assertEqual(win32_keys.key_label("vk_11"), "Ctrl（键码 0x11）")
+        self.assertEqual(win32_keys.key_token_from_text("Ctrl（键码 0x11）"), "vk_11")
+        with self.assertRaises(win32_keys.UnknownKeyTokenError):
+            win32_keys.key_token_from_text("Shift（键码 0x11）")
+
     def test_full_function_and_navigation_key_range_resolves(self):
         self.assertEqual(win32_keys.resolve_vk_codes(["f1", "f24"]), [0x70, 0x87])
         for token in ("home", "end", "page_up", "page_down", "insert", "delete"):

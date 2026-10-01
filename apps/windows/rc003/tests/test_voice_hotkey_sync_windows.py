@@ -10,6 +10,15 @@ from ovb_rc003 import voice_hotkey_sync_windows
 
 
 class VoiceHotkeyDefaultsTests(unittest.TestCase):
+    def test_all_providers_reject_non_replayable_keys_with_a_specific_reason(self):
+        for provider in ("sogou", "wetype", "doubao_ime", "custom"):
+            for token, reason in (("numpad_left", "NumLock"), ("vk_00", "无效"),
+                                  ("vk_e7", "文字输入"), ("vk_01", "鼠标")):
+                with self.subTest(provider=provider, token=token):
+                    result = voice_hotkey_sync_windows.validate_provider_hotkey(provider, "lctrl+" + token)
+                    self.assertFalse(result.ok)
+                    self.assertIn(reason, result.message)
+
     def test_defaults_match_each_supported_provider_shortcut(self):
         self.assertEqual(voice_hotkey_sync_windows.default_hotkey("sogou"), "rctrl")
         self.assertEqual(
@@ -508,6 +517,14 @@ class WeTypeVoiceHotkeyTests(unittest.TestCase):
         reader.assert_called_once_with(cancel_event=None)
 
     def test_parses_the_hold_shortcut_text_from_wetype_settings(self):
+        for text, expected in {
+            "左Ctrl + [": "lctrl+left_bracket",
+            "左Ctrl+PageUp": "lctrl+page_up",
+            "左Ctrl+Tab": "lctrl+tab",
+            "左Ctrl+小键盘加号": "lctrl+numpad_add",
+        }.items():
+            with self.subTest(text=text):
+                self.assertEqual(voice_hotkey_sync_windows._parse_wetype_settings_shortcut(text), expected)
         self.assertEqual(
             voice_hotkey_sync_windows._parse_wetype_settings_shortcut(
                 "左 Ctrl 左 Shift F9"

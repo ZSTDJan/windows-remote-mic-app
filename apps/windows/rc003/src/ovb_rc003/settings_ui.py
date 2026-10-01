@@ -155,52 +155,6 @@ _TRIGGER_MODE_LABELS = {
     key_mapping.VoiceTriggerMode.HOLD: "按住说话",
 }
 
-_MAPPING_HOTKEY_TOKEN_ALIASES = {
-    "控制": "ctrl",
-    "控制键": "ctrl",
-    "左控制": "lctrl",
-    "左控制键": "lctrl",
-    "左ctrl": "lctrl",
-    "右控制": "rctrl",
-    "右控制键": "rctrl",
-    "右ctrl": "rctrl",
-    "左shift": "lshift",
-    "右shift": "rshift",
-    "左alt": "lalt",
-    "右alt": "ralt",
-    "windows": "win",
-    "windows键": "win",
-    "win键": "win",
-    "徽标键": "win",
-    "左win": "lwin",
-    "左windows": "lwin",
-    "左windows键": "lwin",
-    "右win": "rwin",
-    "右windows": "rwin",
-    "右windows键": "rwin",
-    "左箭头": "left",
-    "左方向键": "left",
-    "方向左": "left",
-    "右箭头": "right",
-    "右方向键": "right",
-    "方向右": "right",
-    "上箭头": "up",
-    "上方向键": "up",
-    "方向上": "up",
-    "下箭头": "down",
-    "下方向键": "down",
-    "方向下": "down",
-    "空格": "space",
-    "空格键": "space",
-    "回车": "enter",
-    "回车键": "enter",
-    "退格": "backspace",
-    "退格键": "backspace",
-    "删除": "delete",
-    "删除键": "delete",
-    "菜单键": "apps",
-}
-
 _CTRL_HOTKEY_TOKENS = frozenset({"ctrl", "lctrl", "rctrl"})
 _ALT_HOTKEY_TOKENS = frozenset({"alt", "lalt", "ralt"})
 
@@ -286,26 +240,15 @@ def _action_to_display(action: key_mapping.ButtonAction) -> str:
 def normalize_mapping_hotkey_text(text: str) -> str:
     """Validate manual button-mapping text and return persisted key tokens.
 
-    This is deliberately separate from voice-hotkey parsing. Button mappings
-    accept a few user-facing Chinese aliases and treat a lone generic ``win``
-    as the physical left Windows key, while voice settings keep their existing
-    stricter rules.
+    Names use the shared editor codec. Mapping-specific policy treats a lone
+    Win as the left Windows key and rejects secure attention sequences;
+    voice providers keep their own restrictions.
     """
 
-    normalized_text = str(text).strip().replace("＋", "+")
-    raw_tokens = [token.strip() for token in normalized_text.split("+")]
-    if not normalized_text or any(not token for token in raw_tokens):
-        raise hotkey.HotkeyParseError("请输入单键或用 + 连接的组合键。")
-    tokens = [
-        _MAPPING_HOTKEY_TOKEN_ALIASES.get(token.casefold(), token.casefold())
-        for token in raw_tokens
-    ]
-    if len(tokens) == 1 and tokens[0] == "win":
-        tokens[0] = "lwin"
-    parsed = hotkey.HotkeySpec.parse("+".join(tokens))
+    parsed = hotkey.HotkeySpec.from_user_text(text, mapping=True)
     resolved_tokens = tuple(parsed.modifiers) + (parsed.key,)
     if (
-        parsed.key == "delete"
+        win32_keys.resolve_vk_codes((parsed.key,)) == [win32_keys.VK_CODES["delete"]]
         and _CTRL_HOTKEY_TOKENS.intersection(resolved_tokens)
         and _ALT_HOTKEY_TOKENS.intersection(resolved_tokens)
     ):
@@ -338,6 +281,12 @@ def _display_to_action(text: str) -> key_mapping.ButtonAction:
     # reference label into the Windows field.
     if text == "Command-Tab":
         return key_mapping.ButtonAction(key_mapping.ActionKind.APP_SWITCHER)
+    # The .72 PageUp/PageDown options use these persisted spellings when
+    # converting saved wheel actions. Keep that storage format stable.
+    if text in ("PageUp", "PageDown"):
+        return key_mapping.ButtonAction(
+            key_mapping.ActionKind.KEY_COMBO, (text.lower(),)
+        )
     if text.casefold().startswith("quicker:"):
         try:
             uri = key_mapping.normalize_quicker_uri(text)
@@ -355,10 +304,64 @@ def _display_to_action(text: str) -> key_mapping.ButtonAction:
     )
 
 
+def format_action_text(text: str) -> str:
+    """Format only key chords; semantic actions and incomplete drafts stay intact."""
+    try:
+        action = _display_to_action(text)
+    except hotkey.HotkeyParseError:
+        action = None
+    if action is not None and action.kind != key_mapping.ActionKind.KEY_COMBO:
+        return text
+    # Button actions replay the stored list directly, unlike voice hotkeys
+    # whose parser orders modifiers before a trigger. Never reorder a saved
+    # mapping just to render it, including labels formatted more than once.
+    try:
+        tokens = [
+            win32_keys.key_token_from_text(part)
+            for part in text.replace("＋", "+").split("+")
+        ]
+    except win32_keys.UnknownKeyTokenError:
+        return text
+    return " + ".join(win32_keys.key_label(token) for token in tokens)
+
+
+def normalize_action_text(text: str) -> str:
+    """Keep model storage canonical, including after editing a displayed label."""
+    try:
+        action = _display_to_action(text)
+    except hotkey.HotkeyParseError:
+        return text
+    return "+".join(action.keys) if action.kind == key_mapping.ActionKind.KEY_COMBO else text
+
+
+def action_text_matches_original(text: str, original: str) -> bool:
+    """Compare editor labels with the stored, ordered key sequence."""
+    if text.strip() in (original, format_action_text(original)):
+        return True
+    for candidate in (original, text):
+        try:
+            if _display_to_action(candidate).kind != key_mapping.ActionKind.KEY_COMBO:
+                return False
+        except hotkey.HotkeyParseError:
+            pass
+    try:
+        tokens = [
+            win32_keys.key_token_from_text(part)
+            for part in text.replace("＋", "+").split("+")
+        ]
+        return win32_keys.resolve_vk_codes(tokens) == win32_keys.resolve_vk_codes(
+            original.split("+")
+        )
+    except win32_keys.UnknownKeyTokenError:
+        return False
+
+
 def _validated_button_action(
     button_id: str,
     trigger: str,
     text: str,
+    *,
+    base_bindings: Optional[dict] = None,
 ) -> Optional[key_mapping.ButtonAction]:
     """Parse one editor field using the same rules as the final save."""
 
@@ -381,14 +384,22 @@ def _validated_button_action(
             f"{trigger_label}：旧语音配置已停用，请重新选择",
         )
 
+    if base_bindings is not None:
+        original = key_mapping.button_action_for(
+            base_bindings, button_id, key_mapping.ButtonTrigger(trigger)
+        )
+        if original.kind == key_mapping.ActionKind.KEY_COMBO:
+            original_text = "+".join(original.keys)
+            if action_text_matches_original(clean_text, original_text):
+                # Retain untouched legacy values, including keys no longer
+                # accepted for new input. The sender still rejects unsafe VKs.
+                return original
+
     try:
         action = _display_to_action(clean_text)
     except hotkey.HotkeyParseError as exc:
         detail = str(exc).strip()
-        if detail.startswith("Quicker URI") or "Windows 安全按键" in detail:
-            message = f"{trigger_label}：{detail}"
-        else:
-            message = f"{trigger_label}：“{clean_text}”不支持映射，请重新录入"
+        message = f"{trigger_label}：{detail}"
         raise SettingsValidationError(button_id, message) from exc
 
     if key_mapping.is_voice_action(action):
@@ -409,11 +420,13 @@ def button_action_validation_message(
     button_id: str,
     trigger: str,
     text: str,
+    *,
+    base_bindings: Optional[dict] = None,
 ) -> str:
     """Return a user-facing editor error, or an empty string when valid."""
 
     try:
-        _validated_button_action(button_id, trigger, text)
+        _validated_button_action(button_id, trigger, text, base_bindings=base_bindings)
     except SettingsValidationError as exc:
         return exc.message
     return ""
@@ -477,6 +490,7 @@ def build_save_model(
             button_id,
             key_mapping.ButtonTrigger.SINGLE_CLICK.value,
             text,
+            base_bindings=base_bindings,
         )
         if action is None:
             continue
@@ -553,6 +567,7 @@ def build_save_model(
                     button_id,
                     trigger_name,
                     text,
+                    base_bindings=base_bindings,
                 )
                 if action is None:
                     continue

@@ -98,6 +98,7 @@ class EnvironmentTests(unittest.TestCase):
             snapshot = evidence._raw_snapshot(ENTITY)
         text = json.dumps(snapshot)
         self.assertEqual(snapshot["interfaces"][0]["pnp_tuple"], "18d1:9450:0110")
+        self.assertEqual(snapshot["interfaces"][0]["pnp_id"], "dev_vid&0118d1_pid&9450_rev&0110")
         self.assertNotIn("private", text)
         self.assertNotIn("b" * 12, text)
 
@@ -133,13 +134,15 @@ class EnvironmentTests(unittest.TestCase):
     def test_timeout_keeps_quick_snapshot_and_omits_exception_text(self):
         settings = {"MaxEtwBytes": {"state": "missing", "ready": False}}
         with mock.patch.object(evidence, "_raw_snapshot", return_value={"total": 0}), \
+             mock.patch.object(evidence, "_hid_driver_snapshot", return_value={"state": "read", "version": [10, 0, 22631, 1]}), \
              mock.patch("ovb_rc003.chromecast_etw_windows.capture_settings_snapshot", return_value=settings), \
              mock.patch.object(evidence, "_environment", side_effect=subprocess.TimeoutExpired("private-command", 25)), \
              self.assertLogs("ovb_rc003", level="INFO") as logs:
             evidence._collect(ENTITY, "ready", 123)
         self.assertIn('"raw_input":{"total":0}', logs.output[0])
+        self.assertIn('"version":[10,0,22631,1]', logs.output[0])
         self.assertIn('"capture_settings":{"MaxEtwBytes":{"state":"missing","ready":false}}', logs.output[0])
-        self.assertIn("query_timeout", logs.output[1])
+        self.assertEqual(sum('query_timeout' in line for line in logs.output), 4)
         self.assertNotIn("private-command", str(logs.output))
 
     def test_requests_are_bounded_throttled_and_never_run_inline(self):
@@ -179,3 +182,76 @@ class EnvironmentTests(unittest.TestCase):
             self.assertTrue(evidence._closing)
         process.kill.assert_called_once()
         process.wait.assert_called_once_with(timeout=1)
+
+    def test_timeout_retains_last_complete_environment_snapshot(self):
+        process = mock.Mock(returncode=-1)
+        process.communicate.side_effect = [subprocess.TimeoutExpired('PRIVATE', 25),
+            (b'{"query_stage":"registry"}\n{"query_stage":"nodes","nodes":[{"model":{"state":"unavailable"}}]}\n{"incomplete":', None)]
+        with mock.patch.object(evidence.subprocess, "Popen", return_value=process):
+            result = evidence._environment()
+        self.assertEqual(result['query_stage'], 'nodes')
+        self.assertEqual(result['nodes'][0]['model']['state'], 'unavailable')
+        self.assertEqual(result['error'], 'query_timeout')
+        self.assertTrue(result['partial'])
+        self.assertNotIn('PRIVATE', str(result))
+        process.kill.assert_called_once()
+        self.assertIsNone(evidence._child)
+
+    def test_complete_snapshots_use_final_result_and_keep_exit_query_atomic(self):
+        process = mock.Mock(returncode=0)
+        process.communicate.return_value = (b'{"query_stage":"registry"}\n{"query_stage":"complete","nodes":[]}\n', None)
+        with mock.patch.object(evidence.subprocess, "Popen", return_value=process):
+            self.assertEqual(evidence._environment(), {'query_stage': 'complete', 'nodes': []})
+        process.communicate.side_effect = [subprocess.TimeoutExpired('PRIVATE', 8), (b'{"events":[]}', None)]
+        with mock.patch.object(evidence.subprocess, "Popen", return_value=process), self.assertRaises(subprocess.TimeoutExpired):
+            evidence._environment('exit-query', timeout=8)
+
+    def test_fixed_powershell_query_projects_model_and_missing_firmware(self):
+        prefix = r'''
+function Get-PnpDevice { [pscustomobject]@{Class='Bluetooth';Status='OK';FriendlyName='Chromecast Remote';InstanceId='BTHLE\PRIVATE'} }
+function Get-PnpDeviceProperty($InstanceId,$KeyName) {
+ foreach($key in $KeyName) {
+  $data = switch($key) {
+   'DEVPKEY_Device_ContainerId' { '11111111-2222-3333-4444-555555555555' }
+   'DEVPKEY_Device_IsPresent' { $true }
+   'DEVPKEY_Device_ProblemCode' { 0 }
+   'DEVPKEY_Device_HardwareIds' { 'BTHLEDevice\Dev_VID&0218d1_PID&9450_REV&011b_PRIVATE' }
+   'DEVPKEY_Device_Model' { 'GZRNL' }
+   'DEVPKEY_Device_FirmwareVersion' { '1.2.3' }
+   default { $null }
+  }
+  [pscustomobject]@{KeyName=$key;Data=$data;Type=$(if($null -eq $data){'Empty'}else{'String'})}
+ }
+}
+function Get-CimInstance { @() }
+function Get-WinEvent { @() }
+'''
+        result = evidence._environment(prefix + evidence._QUERY, timeout=8, snapshots=True)
+        self.assertEqual(result['query_stage'], 'complete')
+        node = result['nodes'][0]
+        self.assertEqual(node['model'], {'state': 'read', 'value': 'GZRNL'})
+        self.assertEqual(node['firmware_version'], {'state': 'read', 'value': '1.2.3'})
+        self.assertEqual(node['firmware_revision'], {'state': 'unavailable'})
+        self.assertEqual(node['pnp_tuples'], ['Dev_VID&0218d1_PID&9450_REV&011b'])
+        self.assertNotIn('PRIVATE', json.dumps(result))
+
+    def test_driver_fingerprint_uses_fixed_file_and_retains_digest_on_parse_failure(self):
+        from ovb_rc003.chromecast_hid_tap_windows import MODULE
+        version = SimpleNamespace(FileVersionMS=(10 << 16), FileVersionLS=(22631 << 16) + 1)
+        image = SimpleNamespace(FILE_HEADER=SimpleNamespace(Machine=0x8664),
+                                VS_FIXEDFILEINFO=[version], parse_data_directories=mock.Mock(), close=mock.Mock())
+        with mock.patch('ovb_rc003.frida_hid_tap_runtime.sha256_file', return_value='b' * 64) as digest, \
+             mock.patch('pefile.PE', return_value=image):
+            result = evidence._hid_driver_snapshot()
+        digest.assert_called_once_with(MODULE)
+        self.assertEqual(result['version'], [10, 0, 22631, 1])
+        self.assertEqual(result['machine'], 0x8664)
+        self.assertEqual(result['state'], 'read')
+        self.assertFalse(result['known_layout'])
+        image.close.assert_called_once()
+        with mock.patch('ovb_rc003.frida_hid_tap_runtime.sha256_file', return_value='c' * 64), \
+             mock.patch('pefile.PE', side_effect=ValueError('PRIVATE')):
+            result = evidence._hid_driver_snapshot()
+        self.assertEqual(result['sha256'], 'c' * 64)
+        self.assertEqual(result['state'], 'unavailable')
+        self.assertNotIn('PRIVATE', str(result))

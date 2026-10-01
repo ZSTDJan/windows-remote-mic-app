@@ -9,7 +9,7 @@ import unittest
 import tempfile
 from pathlib import Path
 
-from ovb_rc003 import audio_output, bridge_launcher, config, hotkey, key_mapping, logging_setup, settings_ui, single_instance
+from ovb_rc003 import audio_output, bridge_launcher, config, device_catalog, hotkey, key_mapping, logging_setup, settings_ui, single_instance
 from ovb_rc003.settings_ui import (
     LAUNCH_ALREADY_RUNNING_TEXT,
     LAUNCH_NOT_STARTED_TEXT,
@@ -208,9 +208,9 @@ class DisplayRoundTripTests(unittest.TestCase):
             settings_ui.button_action_validation_message(
                 "back",
                 "single_click",
-                "leftwin",
+                "not_a_key",
             ),
-            "单击：“leftwin”不支持映射，请重新录入",
+            "单击：不认识按键“not_a_key”，请检查键名或使用按键录入。",
         )
         self.assertEqual(
             settings_ui.button_action_validation_message(
@@ -304,6 +304,54 @@ class BuildSaveModelTests(unittest.TestCase):
         self.base_config = {"voice_hotkey": "ralt", "voice_trigger_mode": "hold"}
         self.base_bindings = {"schema_version": 1, "bindings": {}}
 
+    def test_untouched_legacy_keys_keep_order_for_both_devices_and_all_gestures(self):
+        modifier_vks = (0x10, 0x11, 0x12, 0x5B, 0x5C, 0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5)
+        rejected_vks = (0x00, 0xFF, 0x01, 0x02, 0x04, 0x05, 0x06, 0xE5, 0xE7)
+        key_lists = [[f"vk_{vk:02x}"] for vk in (*modifier_vks, *rejected_vks)]
+        for vk in modifier_vks:
+            key_lists.extend(([f"vk_{vk:02x}", "shift"], ["shift", f"vk_{vk:02x}"]))
+        key_lists.append(["shift", "ctrl", "f8"])
+        for profile in (device_catalog.RC003_ID, device_catalog.CHROMECAST_ID):
+            for gesture in ("single_click", "double_click", "long_press"):
+                for keys in key_lists:
+                    original = {"kind": "key_combo", "keys": keys}
+                    base = {"schema_version": 1, "bindings": {}, "secondary_bindings": {}}
+                    primary = {"up": "Ctrl+F9"}
+                    secondary = {}
+                    if gesture == "single_click":
+                        base["bindings"]["power"] = original
+                    else:
+                        base["secondary_bindings"]["power"] = {gesture: original}
+                    raw = "+".join(keys)
+                    for text in (raw, settings_ui.format_action_text(raw)):
+                        with self.subTest(profile=profile, gesture=gesture, text=text):
+                            if gesture == "single_click":
+                                primary["power"] = text
+                            else:
+                                secondary["power"] = {gesture: text}
+                            _, saved = build_save_model(
+                                button_display_map=primary,
+                                secondary_display_map=secondary,
+                                hotkey_text="ralt", trigger_mode=key_mapping.VoiceTriggerMode.HOLD,
+                                endpoint_display_text="", base_config=self.base_config,
+                                base_bindings=base, selected_device_profile=profile,
+                            )
+                            actual = key_mapping.button_action_for(saved, "power", key_mapping.ButtonTrigger(gesture))
+                            self.assertEqual(actual.keys, tuple(keys))
+                            self.assertEqual(saved["bindings"]["up"]["keys"], ["ctrl", "f9"])
+                            self.assertEqual(settings_ui.button_action_validation_message(
+                                "power", gesture, text, base_bindings=base), "")
+
+    def test_legacy_exception_is_bound_to_the_same_button_and_gesture(self):
+        base = {"bindings": {"power": {"kind": "key_combo", "keys": ["vk_00"]}}}
+        for button, gesture, text in (
+            ("up", "single_click", "vk_00"), ("power", "double_click", "vk_00"),
+            ("power", "single_click", "vk_ff"), ("power", "single_click", "ctrl+vk_00"),
+        ):
+            with self.subTest(button=button, gesture=gesture, text=text):
+                self.assertTrue(settings_ui.button_action_validation_message(
+                    button, gesture, text, base_bindings=base))
+
     def test_default_mic_mapping_saves_without_raising(self):
         # Direct regression test for the P1 #7 bug via the actual save path
         # a user hits when they change nothing (or click "restore defaults").
@@ -394,15 +442,31 @@ class BuildSaveModelTests(unittest.TestCase):
             )
         self.assertEqual(ctx.exception.button_id, "menu")
 
+    def test_invalid_key_chords_are_rejected_for_both_remotes_and_all_gestures(self):
+        for profile in (device_catalog.RC003_ID, device_catalog.CHROMECAST_ID):
+            for gesture in ("single_click", "double_click", "long_press"):
+                for text in ("Ctrl+A+A", "Ctrl+[+left_bracket", "Ctrl+vk_00", "Ctrl+numpad_left"):
+                    with self.subTest(profile=profile, gesture=gesture, text=text):
+                        with self.assertRaises(SettingsValidationError) as ctx:
+                            build_save_model(
+                                button_display_map={"power": text if gesture == "single_click" else "escape"},
+                                secondary_display_map={"power": {gesture: text}} if gesture != "single_click" else {},
+                                hotkey_text="ralt", trigger_mode=key_mapping.VoiceTriggerMode.HOLD,
+                                endpoint_display_text="", base_config=self.base_config,
+                                base_bindings=self.base_bindings, selected_device_profile=profile,
+                                validate_voice_hotkeys=False,
+                            )
+                        self.assertEqual(ctx.exception.button_id, "power")
+
     def test_save_model_reuses_the_editor_action_error(self):
         expected = settings_ui.button_action_validation_message(
             "back",
             "single_click",
-            "leftwin",
+            "not_a_key",
         )
         with self.assertRaises(SettingsValidationError) as ctx:
             build_save_model(
-                button_display_map={"back": "leftwin"},
+                button_display_map={"back": "not_a_key"},
                 hotkey_text="win+h",
                 trigger_mode=key_mapping.VoiceTriggerMode.HOLD,
                 endpoint_display_text="",

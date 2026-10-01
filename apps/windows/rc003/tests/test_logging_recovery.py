@@ -1,18 +1,209 @@
 """Disk failure and writer ownership regressions; no user files or devices."""
 import json
 import logging
+import os
 from pathlib import Path
 import queue
+import stat
 import tempfile
 import threading
 import unittest
 import zipfile
+from types import SimpleNamespace
 from unittest import mock
 
 from ovb_rc003 import diagnostic_trace as trace, logging_setup, log_export
 
 
 class LoggingRecoveryTests(unittest.TestCase):
+    def test_trace_flush_saves_final_overflow_without_followup_event(self):
+        entered, release, drained = threading.Event(), threading.Event(), threading.Event()
+        original = trace.DiagnosticTrace._writer_loop
+        def paused(owner, items, stop):
+            get = items.get
+            def observed_get(*args, **kwargs):
+                item = get(*args, **kwargs)
+                drained.set()
+                return item
+            items.get = observed_get
+            entered.set()
+            release.wait(5)
+            original(owner, items, stop)
+
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.object(trace.DiagnosticTrace, '_writer_loop', paused):
+            root = Path(tmp)
+            detailed = trace.DiagnosticTrace(root, enabled=True, queue_size=1)
+            try:
+                self.assertTrue(entered.wait(1))
+                for _ in range(3):
+                    self.assertFalse(detailed.emit('rejected'))
+                self.assertFalse(detailed.flush(.01))  # Full: retain the pending count.
+                self.assertEqual(detailed.dropped_count, 3)
+                release.set()
+                self.assertTrue(drained.wait(1))
+                self.assertFalse(detailed.flush(2))  # Loss remains incomplete, though marker is saved.
+                rows = [json.loads(line) for line in detailed.path.read_text().splitlines()]
+                losses = [row for row in rows if row['event'] == 'trace_queue_overflow']
+                self.assertEqual([row['dropped_before'] for row in losses], [3])
+                self.assertEqual(detailed.dropped_count, 0)
+                result = log_export.export_logs(root / 'logs.zip', root=root)
+                self.assertTrue(result.incomplete)
+                with zipfile.ZipFile(result.path) as archive:
+                    manifest = json.loads(archive.read('export-info.json'))
+                    self.assertFalse(manifest['diagnostic_trace_flushed'])
+                    records = [json.loads(line) for line in archive.read(trace.TRACE_FILENAME).splitlines()]
+                    self.assertEqual(sum(r['event'] == 'trace_queue_overflow' for r in records), 1)
+            finally:
+                release.set()
+                detailed.close()
+
+    def test_fault_report_flush_saves_final_overflow_without_followup_event(self):
+        entered, release, drained = threading.Event(), threading.Event(), threading.Event()
+        original = trace._ReportWriter._run
+        def paused(writer):
+            get = writer.queue.get
+            def observed_get(*args, **kwargs):
+                item = get(*args, **kwargs)
+                drained.set()
+                return item
+            writer.queue.get = observed_get
+            entered.set()
+            release.wait(5)
+            original(writer)
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.object(trace, 'TRACE_QUEUE_SIZE', 1), \
+                mock.patch.object(trace._ReportWriter, '_run', paused):
+            writer = trace.acquire_fault_report(Path(tmp))
+            try:
+                self.assertTrue(entered.wait(1))
+                writer.submit(dict(event='ordinary', wall_time=1))
+                for _ in range(3):
+                    writer.submit(dict(event='rejected', wall_time=2))
+                self.assertFalse(writer.flush(.01))
+                self.assertEqual(writer.dropped, 3)
+                release.set()
+                self.assertTrue(drained.wait(1))
+                self.assertFalse(writer.flush(2))
+                saved = json.loads(Path(tmp, trace.REPORT_FILENAME).read_text())
+                self.assertEqual(saved['incidents'][-1]['last_failure_event']['queue_dropped_before'], 3)
+                self.assertEqual(writer.dropped, 0)
+                self.assertFalse(writer.flush(2))
+                saved_again = json.loads(Path(tmp, trace.REPORT_FILENAME).read_text())
+                self.assertEqual(saved_again['incidents'][-1]['failure_count'], 1)
+            finally:
+                release.set()
+                trace.release_fault_report(writer)
+
+    def test_legacy_backups_export_until_their_writer_successfully_rotates(self):
+        for name in (logging_setup.LOG_FILENAME, trace.TRACE_FILENAME):
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                logs = root / 'logs'
+                logs.mkdir()
+                active = logs / name
+                active.write_bytes(b'previous record\n' * 40000)
+                for index in (1, 2, 3, 99):
+                    active.with_name(f'{name}.{index}').write_bytes(f'backup-{index}\n'.encode())
+                before = log_export.export_logs(root / 'before.zip', root=root)
+                with zipfile.ZipFile(before.path) as archive:
+                    self.assertIn(name + '.2', archive.namelist())
+                    self.assertIn(name + '.3', archive.namelist())
+                if name == logging_setup.LOG_FILENAME:
+                    handler = logging_setup.EvidenceFileHandler(active, encoding='utf-8',
+                        maxBytes=logging_setup.LOG_MAX_BYTES, backupCount=logging_setup.LOG_BACKUP_COUNT)
+                    try:
+                        handler.handle(logging.LogRecord('test', logging.INFO, __file__, 0, 'new record', (), None))
+                    finally:
+                        handler.close()
+                else:
+                    detailed = trace.DiagnosticTrace(root, enabled=True)
+                    try:
+                        self.assertTrue(detailed.flush())
+                    finally:
+                        detailed.close()
+                self.assertTrue(active.exists())
+                self.assertTrue(active.with_name(name + '.1').exists())
+                self.assertFalse(active.with_name(name + '.2').exists())
+                self.assertFalse(active.with_name(name + '.3').exists())
+                self.assertTrue(active.with_name(name + '.99').exists())
+                after = log_export.export_logs(root / 'after.zip', root=root)
+                with zipfile.ZipFile(after.path) as archive:
+                    self.assertIn(name + '.1', archive.namelist())
+                    self.assertNotIn(name + '.2', archive.namelist())
+                    self.assertNotIn(name + '.3', archive.namelist())
+                self.assertTrue((root / 'before.zip').exists())
+
+    def test_failed_rotation_preserves_legacy_backups_until_success(self):
+        for name in (logging_setup.LOG_FILENAME, trace.TRACE_FILENAME):
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as tmp:
+                active = Path(tmp) / name
+                active.write_text('active', encoding='utf-8')
+                for index in (1, 2, 3):
+                    active.with_name(f'{name}.{index}').write_text(f'backup-{index}', encoding='utf-8')
+                handler = None
+                if name == logging_setup.LOG_FILENAME:
+                    handler = logging_setup.EvidenceFileHandler(active, encoding='utf-8',
+                        maxBytes=logging_setup.LOG_MAX_BYTES, backupCount=logging_setup.LOG_BACKUP_COUNT)
+                    rotate = handler.doRollover
+                    failing = mock.patch.object(handler, 'rotate', side_effect=PermissionError('locked'))
+                else:
+                    state = trace._TraceFileState()
+                    rotate = lambda: state.rotate(active)
+                    failing = mock.patch.object(Path, 'replace', side_effect=PermissionError('locked'))
+                try:
+                    with failing:
+                        with self.assertRaises(PermissionError):
+                            rotate()
+                    for index in (2, 3):
+                        self.assertEqual(active.with_name(f'{name}.{index}').read_text(), f'backup-{index}')
+                    rotate()
+                    self.assertEqual(active.with_name(name + '.1').read_text(), 'active')
+                    self.assertFalse(active.with_name(name + '.2').exists())
+                    self.assertFalse(active.with_name(name + '.3').exists())
+                finally:
+                    if handler is not None:
+                        handler.close()
+
+    @unittest.skipUnless(os.name == 'nt', 'Windows file-sharing semantics')
+    def test_locked_legacy_backup_retries_after_next_completed_rotation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            active = Path(tmp) / trace.TRACE_FILENAME
+            active.write_text('first', encoding='utf-8')
+            old = active.with_name(active.name + '.2')
+            old.write_text('legacy', encoding='utf-8')
+            state = trace._TraceFileState()
+            with old.open('rb'):
+                state.rotate(active)
+                self.assertIsNone(state.rotation_index)
+                self.assertEqual(old.read_text(), 'legacy')
+                self.assertEqual(active.with_name(active.name + '.1').read_text(), 'first')
+            active.write_text('second', encoding='utf-8')
+            state.rotate(active)
+            self.assertFalse(old.exists())
+            self.assertEqual(active.with_name(active.name + '.1').read_text(), 'second')
+
+    def test_legacy_cleanup_skips_reparse_points_directories_and_unknown_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            active = Path(tmp) / logging_setup.LOG_FILENAME
+            reparse = active.with_name(active.name + '.2')
+            reparse.write_text('keep', encoding='utf-8')
+            directory = active.with_name(active.name + '.3')
+            directory.mkdir()
+            unknown = active.with_name(active.name + '.99')
+            unknown.write_text('keep', encoding='utf-8')
+            original = Path.lstat
+            def metadata(path):
+                if path == reparse:
+                    return SimpleNamespace(st_mode=stat.S_IFREG,
+                                           st_file_attributes=stat.FILE_ATTRIBUTE_REPARSE_POINT)
+                return original(path)
+            with mock.patch.object(Path, 'lstat', metadata):
+                logging_setup.prune_legacy_log_backups(active, 1)
+            self.assertEqual(reparse.read_text(), 'keep')
+            self.assertTrue(directory.is_dir())
+            self.assertEqual(unknown.read_text(), 'keep')
+
     def test_trace_queue_counts_all_rejections_until_a_record_is_accepted(self):
         entered, release = threading.Event(), threading.Event()
         original = trace.DiagnosticTrace._writer_loop
@@ -110,7 +301,8 @@ class LoggingRecoveryTests(unittest.TestCase):
     def test_rotation_retries_do_not_shift_backups_again(self):
         for denied_name in (trace.TRACE_FILENAME, trace.TRACE_FILENAME + '.1'):
             with self.subTest(denied=denied_name), tempfile.TemporaryDirectory() as tmp, \
-                    mock.patch.object(trace, 'TRACE_MAX_BYTES', 1024):
+                    mock.patch.object(trace, 'TRACE_MAX_BYTES', 1024), \
+                    mock.patch.object(trace, 'TRACE_BACKUP_COUNT', 3):
                 logs = Path(tmp, 'logs')
                 logs.mkdir()
                 active = logs / trace.TRACE_FILENAME

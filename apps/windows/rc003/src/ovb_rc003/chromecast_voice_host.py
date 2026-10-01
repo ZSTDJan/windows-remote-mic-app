@@ -13,13 +13,14 @@ import time
 from dataclasses import dataclass
 from typing import Callable
 from .voice_audio_session import VoiceAudioSession
-from .voice_shortcut_session import VoiceShortcutSession
+from .voice_shortcut_session import VoiceShortcutSession, _VOICE_HOTKEY_BACKEND_MARKED
 
 from .atvv_session import ATVVSession
 from .chromecast_host_activity import (
     CaptureWatch,
     read_doubao_capture,
     read_sogou_capture,
+    read_chatterfly_voice_windows,
 )
 from .chromecast_wetype_toggle import ToggleShortcut
 from . import chromecast_doubao_handsfree
@@ -236,6 +237,12 @@ class VoiceHost:
         if issue:
             self._fail_voice(issue)
             return
+        if (self.provider == voice_program_manager.VOICE_PROGRAM_CHATTERFLY
+                and not config.voice_hotkey_for_provider(
+                    services.settings(), voice_program_manager.VOICE_PROGRAM_CHATTERFLY
+                )):
+            self._fail_voice("请先录入与 Chatterfly 语音输入一致的快捷键。")
+            return
         self.decoder = ATVVSession(gain_db=services.settings().get("gain_db", 10.0))
         # Do not call a generic shortcut return value 'host ready'. Other host
         # proof adapters can be added without changing the recording policy.
@@ -243,6 +250,7 @@ class VoiceHost:
                     "wetype",
                     "sogou",
                     voice_program_manager.VOICE_PROGRAM_DOUBAO_IME,
+                    voice_program_manager.VOICE_PROGRAM_CHATTERFLY,
                 )
                 or (self.provider == "wetype" and services.configured_backend() != "wetype_hotkey")
                 or not services.voice_mapping_enabled()):
@@ -261,6 +269,10 @@ class VoiceHost:
                 and trigger == "toggle"
             ):
                 self._start_doubao_handsfree(input_epoch)
+                return
+            if (self.provider == voice_program_manager.VOICE_PROGRAM_CHATTERFLY
+                    and trigger == "toggle"):
+                self._start_chatterfly_toggle(input_epoch)
                 return
             if config.voice_hotkey_trigger_for_settings(services.settings()) == "toggle":
                 self._start_toggle(input_epoch)
@@ -287,12 +299,24 @@ class VoiceHost:
             )
             self.diagnostic_started = True
             self.capture_watch = CaptureWatch(
-                read_doubao_capture
-                if self.provider == voice_program_manager.VOICE_PROGRAM_DOUBAO_IME
-                else None,
-                fast_start=self.provider == voice_program_manager.VOICE_PROGRAM_DOUBAO_IME,
+                (read_doubao_capture
+                 if self.provider == voice_program_manager.VOICE_PROGRAM_DOUBAO_IME
+                 else read_chatterfly_voice_windows
+                 if self.provider == voice_program_manager.VOICE_PROGRAM_CHATTERFLY
+                 else None),
+                fast_start=self.provider in {
+                    voice_program_manager.VOICE_PROGRAM_DOUBAO_IME,
+                    voice_program_manager.VOICE_PROGRAM_CHATTERFLY,
+                },
             )
             self.capture_watch.begin()
+            if self.provider == voice_program_manager.VOICE_PROGRAM_CHATTERFLY:
+                if self.capture_watch.baseline is None:
+                    self._fail_voice("Chatterfly 语音浮窗状态无法读取；未发送快捷键。")
+                    return
+                if self.capture_watch.baseline:
+                    self._fail_voice("Chatterfly 已在收音；未重复发送快捷键。")
+                    return
             cancelled = lambda: (
                 self.stopping.is_set()
                 or self.input_lost.is_set()
@@ -326,8 +350,54 @@ class VoiceHost:
             self.engaged = True
             if cancelled():
                 return  # Poll cancels this attempt before ready/PCM can escape.
-            services.set_active(True)
-            services.set_result(status.VOICE_RUNTIME_ACTIVE)
+            if self.provider != voice_program_manager.VOICE_PROGRAM_CHATTERFLY:
+                services.set_active(True)
+                services.set_result(status.VOICE_RUNTIME_ACTIVE)
+
+    def _start_chatterfly_toggle(self, input_epoch):
+        services = self.services
+        shortcut = config.voice_hotkey_for_provider(
+            services.settings(), voice_program_manager.VOICE_PROGRAM_CHATTERFLY
+        )
+        if not shortcut:
+            self._fail_voice("请先录入与 Chatterfly 语音输入一致的快捷键。")
+            return
+        self.capture_watch = CaptureWatch(read_chatterfly_voice_windows, fast_start=True)
+        self.capture_watch.begin()
+        if self.capture_watch.baseline is None:
+            self._fail_voice("Chatterfly 语音浮窗状态无法读取；未发送快捷键。")
+            return
+        if self.capture_watch.baseline:
+            self._fail_voice("Chatterfly 已在收音；未重复发送快捷键。")
+            return
+        if not services.audio.open():
+            self._fail_voice("audio output could not open", status.VOICE_RUNTIME_OUTPUT_OPEN_FAILED)
+            return
+        self._toggle = ToggleShortcut(shortcut, prepare=lambda: False)
+        services.audio.stats.reset()
+        tokens = self._toggle.tokens
+        services.begin_diagnostic(
+            provider_shortcut_mode="toggle",
+            effective_hotkey_tokens=tokens,
+            effective_backend="toggle_shortcut",
+        )
+        self.diagnostic_started = True
+        cancelled = lambda: (
+            self.stopping.is_set() or self.input_lost.is_set()
+            or self._attempt_cancelled(self.attempt)
+            or input_epoch is not None and input_epoch != self.input_epoch
+        )
+        try:
+            self._toggle.send(cancelled)
+        except Exception:
+            services.logger.exception("Chatterfly toggle shortcut failed; no automatic resend")
+            self._fail_voice("Chatterfly 启动快捷键发送失败；未自动重发。")
+            return
+        self.engaged = True
+        services.logger.info(
+            "Chromecast Chatterfly attempt=%s shortcut_sent=True host_state=waiting_window",
+            self.attempt,
+        )
 
     def _start_doubao_handsfree(self, input_epoch):
         services = self.services
@@ -456,7 +526,11 @@ class VoiceHost:
                              input_epoch is not None and input_epoch != self.input_epoch)
         try:
             if trigger == "toggle":
-                self._toggle = ToggleShortcut(shortcut, prepare=self._prepare_sogou_shortcut)
+                self._toggle = ToggleShortcut(
+                    shortcut, prepare=self._prepare_sogou_shortcut,
+                    ensure_key_tracking=lambda tokens: services.ensure_key_tracking(
+                        tokens, _VOICE_HOTKEY_BACKEND_MARKED),
+                )
                 self._toggle.send(cancelled)
             else:
                 self._prepare_sogou_shortcut()
@@ -489,7 +563,13 @@ class VoiceHost:
         if not services.audio.open():
             self._fail_voice("audio output could not open", status.VOICE_RUNTIME_OUTPUT_OPEN_FAILED)
             return
-        self._toggle = ToggleShortcut(shortcut)
+        # ToggleShortcut uses marked keybd_event even when the provider's
+        # hold-mode backend is wetype_hotkey. Prepare its actual transport.
+        self._toggle = ToggleShortcut(
+            shortcut,
+            ensure_key_tracking=lambda tokens: services.ensure_key_tracking(
+                tokens, _VOICE_HOTKEY_BACKEND_MARKED),
+        )
         try:
             self._toggle_playback_guard = playback_sessions.prepare_playback_mute_guard(
                 services.settings().get("output_endpoint_name", ""))
@@ -548,6 +628,18 @@ class VoiceHost:
             return
         if self.provider == "wetype" and not self.confirmed:
             return
+        if (self.provider == voice_program_manager.VOICE_PROGRAM_CHATTERFLY
+                and (not self.confirmed or self.capture_watch is None
+                     or self.capture_watch.status != "tracking")):
+            return
+        if self.provider == voice_program_manager.VOICE_PROGRAM_CHATTERFLY:
+            try:
+                visible = {window.identity for window in read_chatterfly_voice_windows()}
+            except Exception:
+                self.services.logger.exception("Chatterfly stop state unavailable; no second toggle")
+                return
+            if self.capture_watch.identity not in visible:
+                return
         self._toggle_stop_sent = True  # Never resend after a failure or duplicate notification.
         try:
             switched = self._toggle.send(lambda: self.stopping.is_set() or self.input_lost.is_set())
@@ -604,6 +696,10 @@ class VoiceHost:
         # its watcher. No other stop reason or cleanup retry may submit the host.
         finish_deadline = ((time.monotonic() if received_at is None else received_at)
                            + chromecast_wetype_finish.STOP_WINDOW_SECONDS)
+        if (reason in ("device_ended", "time_limit")
+                and self.provider == voice_program_manager.VOICE_PROGRAM_CHATTERFLY
+                and not self.stopping.is_set() and not self.input_lost.is_set()):
+            self._toggle_second_press()
         finish_wetype = (
             reason in ("device_ended", "time_limit") and self.provider == "wetype"
             and self._toggle is not None and not self._toggle_stop_sent
@@ -682,9 +778,11 @@ class VoiceHost:
                 released = self._release_host_shortcut()
             released = released and audio_released
             services.set_active(False)
-            if released and (self._toggle is not None or self.provider == "sogou") and self.failure_result is None:
+            if released and (self._toggle is not None or self.provider in {
+                    "sogou", voice_program_manager.VOICE_PROGRAM_CHATTERFLY,
+                }) and self.failure_result is None:
                 # Do not leave the settings page stuck in ACTIVE, or claim that
-                # WeType recognized audio merely because a toggle was delivered.
+                # a provider recognized audio merely because a shortcut was delivered.
                 services.set_result(status.VOICE_RUNTIME_NOT_TESTED)
             if released and self.engaged:
                 if self.failure_result is None and self._toggle is None and self.provider in {
@@ -897,22 +995,32 @@ class VoiceHost:
                                             self.attempt, outcome)
             if current != self._capture_watch_status:
                 identity = self.capture_watch.identity
-                # Only process identity and a correlation token; session strings
-                # can contain paths. Capture ownership is not bubble visibility.
-                capture_token = (hashlib.sha256(repr(identity).encode("utf-8")).hexdigest()[:16]
-                                 if identity is not None else "none")
-                self.services.logger.info(
-                    "Chromecast host activity attempt=%s state=%s provider=%s "
-                    "capture_pid=%s capture_token=%s baseline_count=%s bubble=unobserved",
-                    self.attempt, current, self.provider,
-                    identity[2] if identity is not None else 0, capture_token,
-                    len(self.capture_watch.baseline) if self.capture_watch.baseline is not None else -1)
+                if self.provider == voice_program_manager.VOICE_PROGRAM_CHATTERFLY:
+                    self.services.logger.info(
+                        "Chromecast Chatterfly voice window attempt=%s state=%s "
+                        "pid=%s visible=%s",
+                        self.attempt, current,
+                        identity[2] if identity is not None else 0,
+                        current == "tracking",
+                    )
+                else:
+                    # Only process identity and a correlation token; session
+                    # strings can contain paths. Capture is not bubble visibility.
+                    capture_token = (hashlib.sha256(repr(identity).encode("utf-8")).hexdigest()[:16]
+                                     if identity is not None else "none")
+                    self.services.logger.info(
+                        "Chromecast host activity attempt=%s state=%s provider=%s "
+                        "capture_pid=%s capture_token=%s baseline_count=%s bubble=unobserved",
+                        self.attempt, current, self.provider,
+                        identity[2] if identity is not None else 0, capture_token,
+                        len(self.capture_watch.baseline) if self.capture_watch.baseline is not None else -1)
                 self._capture_watch_status = current
             if ended:
                 label = {
                     "sogou": "搜狗",
                     "wetype": "微信",
                     voice_program_manager.VOICE_PROGRAM_DOUBAO_IME: "豆包",
+                    voice_program_manager.VOICE_PROGRAM_CHATTERFLY: "Chatterfly",
                 }.get(self.provider, "语音程序")
                 self.services.logger.info("Chromecast recording attempt=%s 原因=%s接收已结束(host_capture_ended)", self.attempt, label)
                 self.reply("stop")
@@ -942,6 +1050,7 @@ class VoiceHost:
         elif self.provider in {
             "sogou",
             voice_program_manager.VOICE_PROGRAM_DOUBAO_IME,
+            voice_program_manager.VOICE_PROGRAM_CHATTERFLY,
         } or wetype_toggle:
             confirmed = True if self.capture_watch is not None and self.capture_watch.status == "tracking" else None
         else:
@@ -952,7 +1061,7 @@ class VoiceHost:
                 self._stop_host()
                 return
             self.confirmed = self.ready_sent = True
-            if wetype_toggle:
+            if wetype_toggle or self.provider == voice_program_manager.VOICE_PROGRAM_CHATTERFLY:
                 services.set_active(True)
                 services.set_result(status.VOICE_RUNTIME_ACTIVE)
                 services.logger.info(
@@ -969,6 +1078,7 @@ class VoiceHost:
                 "sogou": "Sogou",
                 "wetype": "WeType",
                 voice_program_manager.VOICE_PROGRAM_DOUBAO_IME: "Doubao",
+                voice_program_manager.VOICE_PROGRAM_CHATTERFLY: "Chatterfly",
             }.get(self.provider, "Voice host")
             self._fail_voice(f"{label} microphone startup was not confirmed")
             self._stop_host()

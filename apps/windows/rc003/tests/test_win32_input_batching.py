@@ -8,10 +8,25 @@ import unittest
 import types
 from unittest import mock
 
-from ovb_rc003 import win32_input
+from ovb_rc003 import win32_input, win32_keys
 
 
 class RejectedInputTraceTests(unittest.TestCase):
+    def test_invalid_saved_key_is_rejected_before_any_input_is_sent(self):
+        for send in (win32_input.send_key_combo_down, win32_input.send_key_combo_up,
+                     win32_input.send_key_combo_tap,
+                     win32_input.send_wetype_voice_key_combo_down,
+                     win32_input.send_wetype_voice_key_combo_up,
+                     win32_input.send_voice_key_combo_down,
+                     win32_input.send_voice_key_combo_up,
+                     win32_input.send_voice_key_combo_tap):
+            for token in ("vk_00", "vk_ff", "vk_e5", "vk_e7", "vk_01", "numpad_left"):
+                with self.subTest(send=send.__name__, token=token):
+                    sender = mock.Mock()
+                    with self.assertRaises(win32_keys.UnknownKeyTokenError):
+                        send(("ctrl", token), _sender=sender)
+                    sender.assert_not_called()
+
     def test_rejection_records_key_state_without_submitting_input(self):
         trace = mock.Mock(enabled=True)
         sender = mock.Mock()
@@ -725,6 +740,263 @@ class WeTypeVoiceKeyComboTests(unittest.TestCase):
 
         lctrl = win32_input.win32_keys.VK_CODES["lctrl"]
         self.assertEqual(sender.calls, [[(lctrl, False)], [(lctrl, True)]])
+
+
+class WeTypeStaleLWinRecoveryTests(unittest.TestCase):
+    def setUp(self):
+        self.raw = win32_input.raw_input_windows
+        self.hook = win32_input.voice_key_physicalizer_windows
+        self.lwin = win32_input.win32_keys.VK_CODES["lwin"]
+        self.lctrl = win32_input.win32_keys.VK_CODES["lctrl"]
+        self.raw._set_physical_keyboard_tracker_active(True)
+        self.hook._set_physical_tracker_active(False)
+        self.addCleanup(self.raw._set_physical_keyboard_tracker_active, False)
+        self.addCleanup(self.hook._set_physical_tracker_active, False)
+        self.sent = []
+        sender = mock.patch.object(
+            win32_input,
+            "_real_send_virtual_key_input_batch",
+            side_effect=self._send,
+        )
+        sender.start()
+        self.addCleanup(sender.stop)
+        windows_query = mock.patch.object(
+            self.raw, "_real_async_key_is_down", return_value=False
+        )
+        windows_query.start()
+        self.addCleanup(windows_query.stop)
+        observation = mock.patch.object(
+            win32_input, "_real_async_key_state_observation", return_value=False
+        )
+        self.observation = observation.start()
+        self.addCleanup(observation.stop)
+        context = mock.patch.object(
+            win32_input,
+            "_real_key_state_query_context",
+            return_value=("Default", 10, 20, 8192, 8192),
+        )
+        self.context = context.start()
+        self.addCleanup(context.stop)
+
+    def _send(self, events):
+        self.sent.extend(events)
+        return len(events)
+
+    def _raw_down(self, handle=101):
+        self.raw.record_physical_keyboard_event(
+            handle, vkey=self.lwin, make_code=0, flags=0, message=0x100
+        )
+
+    def _old_raw_down(self, handle=101):
+        self._raw_down(handle)
+        with self.raw._PHYSICAL_KEY_STATE_LOCK:
+            self.raw._PHYSICAL_KEY_LAST_EDGE_AT[self.lwin] -= 3.0
+
+    def _press(self):
+        win32_input.send_wetype_voice_key_combo_down(
+            ("lctrl", "lwin"), _sleep=lambda _seconds: None
+        )
+
+    def _release(self):
+        win32_input.send_wetype_voice_key_combo_up(
+            ("lctrl", "lwin"), _sleep=lambda _seconds: None
+        )
+
+    def test_missed_raw_up_recovers_down_and_matching_up(self):
+        self._old_raw_down()
+        trace = mock.Mock(enabled=True)
+        with mock.patch.object(win32_input, "_diagnostic_trace", trace):
+            self._press()
+            self._release()
+
+        self.assertEqual(
+            self.sent,
+            [
+                (self.lctrl, False), (self.lwin, False),
+                (self.lwin, True), (self.lctrl, True),
+            ],
+        )
+        self.assertFalse(self.raw.physical_key_is_down(self.lwin))
+        self.assertEqual(self.observation.call_count, 3)
+        self.assertEqual(
+            trace.emit.call_args.kwargs["reason"], "stale_raw_lwin_owner"
+        )
+
+    def test_current_physical_hold_stays_blocked(self):
+        self._old_raw_down()
+        self.observation.return_value = True
+        with self.assertRaises(win32_input.PhysicalKeyInUseError):
+            self._press()
+        self.assertEqual(self.sent, [])
+        self.assertTrue(self.raw.physical_key_is_down(self.lwin))
+
+    def test_active_hook_does_not_use_the_raw_only_recovery(self):
+        self.hook._set_physical_tracker_active(True, _query=lambda _vk: False)
+        self._old_raw_down()
+        with self.assertRaises(win32_input.PhysicalKeyInUseError):
+            self._press()
+        self.assertTrue(self.raw.physical_key_is_down(self.lwin))
+        self.assertEqual(self.sent, [])
+
+    def test_recent_or_ambiguous_raw_owner_stays_blocked(self):
+        for setup in (
+            lambda: self._raw_down(),
+            lambda: (self._old_raw_down(), self._old_raw_down(102)),
+            lambda: (
+                self._old_raw_down(),
+                self._old_raw_down(102),
+                self.raw.record_physical_keyboard_event(
+                    102, vkey=self.lwin, make_code=0, flags=1, message=0x101
+                ),
+            ),
+        ):
+            with self.subTest(setup=setup):
+                self.raw._set_physical_keyboard_tracker_active(True)
+                setup()
+                with self.assertRaises(win32_input.PhysicalKeyInUseError):
+                    self._press()
+                self.assertEqual(self.sent, [])
+        self.observation.assert_not_called()
+
+    def test_hold_inside_two_second_grace_stays_blocked(self):
+        self._raw_down()
+        with self.raw._PHYSICAL_KEY_STATE_LOCK:
+            self.raw._PHYSICAL_KEY_LAST_EDGE_AT[self.lwin] -= 1.5
+        with self.assertRaises(win32_input.PhysicalKeyInUseError):
+            self._press()
+        self.observation.assert_not_called()
+        self.assertEqual(self.sent, [])
+
+    def test_unknown_windows_state_stays_blocked(self):
+        self._old_raw_down()
+        self.observation.return_value = None
+        with self.assertRaises(win32_input.PhysicalKeyInUseError):
+            self._press()
+        self.assertEqual(self.sent, [])
+
+    def test_desktop_change_during_observation_stays_blocked(self):
+        self._old_raw_down()
+        self.context.side_effect = (
+            ("Default", 10, 20, 8192, 8192),
+            ("Other", 11, 21, 8192, 8192),
+        )
+        with self.assertRaises(win32_input.PhysicalKeyInUseError):
+            self._press()
+        self.assertEqual(self.sent, [])
+        self.assertTrue(self.raw.physical_key_is_down(self.lwin))
+
+    def test_raw_only_hook_start_during_observation_stays_blocked(self):
+        self._old_raw_down()
+
+        def start_hook(_vk):
+            self.hook._set_physical_tracker_active(True, _query=lambda _key: False)
+            return False
+
+        self.observation.side_effect = start_hook
+        with self.assertRaises(win32_input.PhysicalKeyInUseError):
+            self._press()
+        self.assertEqual(self.sent, [])
+        self.assertTrue(self.raw.physical_key_is_down(self.lwin))
+
+    def test_raw_down_up_aba_during_observation_stays_blocked(self):
+        self._old_raw_down()
+
+        def raw_aba(_vk):
+            self.raw.record_physical_keyboard_event(
+                101, vkey=self.lwin, make_code=0, flags=1, message=0x101
+            )
+            self._old_raw_down()
+            return False
+
+        self.observation.side_effect = raw_aba
+        with self.assertRaises(win32_input.PhysicalKeyInUseError):
+            self._press()
+        self.assertEqual(self.sent, [])
+        self.assertTrue(self.raw.physical_key_is_down(self.lwin))
+
+    def test_raw_tracker_replacement_during_observation_stays_blocked(self):
+        self._old_raw_down()
+
+        def replace_tracker(_vk):
+            self.raw._set_physical_keyboard_tracker_active(True)
+            self._old_raw_down()
+            return False
+
+        self.observation.side_effect = replace_tracker
+        with self.assertRaises(win32_input.PhysicalKeyInUseError):
+            self._press()
+        self.assertEqual(self.sent, [])
+        self.assertTrue(self.raw.physical_key_is_down(self.lwin))
+
+    def test_failed_second_down_still_releases_first_key(self):
+        self._old_raw_down()
+        calls = []
+
+        def fail_on_lwin(events):
+            calls.extend(events)
+            if events == [(self.lwin, False)]:
+                return 0
+            return len(events)
+
+        with mock.patch.object(
+            win32_input, "_real_send_virtual_key_input_batch", side_effect=fail_on_lwin
+        ), self.assertRaises(OSError):
+            self._press()
+        self.assertEqual(
+            calls,
+            [(self.lctrl, False), (self.lwin, False), (self.lctrl, True)],
+        )
+
+    def test_new_physical_lwin_during_edge_gap_blocks_and_releases_ctrl(self):
+        self._old_raw_down()
+
+        def physical_press_during_gap(_seconds):
+            self._raw_down()
+
+        with self.assertRaises(win32_input.PhysicalKeyInUseError):
+            win32_input.send_wetype_voice_key_combo_down(
+                ("lctrl", "lwin"), _sleep=physical_press_during_gap
+            )
+        self.assertEqual(
+            self.sent, [(self.lctrl, False), (self.lctrl, True)]
+        )
+        self.assertTrue(self.raw.physical_key_is_down(self.lwin))
+
+    def test_unknown_lwin_state_after_ctrl_down_releases_ctrl(self):
+        self._old_raw_down()
+        self.observation.side_effect = (False, False, None)
+        with self.assertRaises(win32_input.Win32InputUnavailableError):
+            self._press()
+        self.assertEqual(
+            self.sent, [(self.lctrl, False), (self.lctrl, True)]
+        )
+
+    def test_new_physical_lwin_during_hold_defers_its_up_until_release(self):
+        self._old_raw_down()
+        self._press()
+        self._raw_down()
+        with self.assertRaises(win32_input.InputCleanupIncompleteError):
+            self._release()
+        self.assertEqual(
+            self.sent,
+            [
+                (self.lctrl, False), (self.lwin, False),
+                (self.lctrl, True),
+            ],
+        )
+        self.raw.record_physical_keyboard_event(
+            101, vkey=self.lwin, make_code=0, flags=1, message=0x101
+        )
+        self._release()
+        self.assertEqual(
+            self.sent[-2:], [(self.lwin, True), (self.lctrl, True)]
+        )
+
+    def test_ordinary_shortcut_keeps_stale_raw_lwin_protection(self):
+        self._old_raw_down()
+        with self.assertRaises(win32_input.PhysicalKeyInUseError):
+            win32_input.send_key_combo_down(("lwin",))
+        self.assertEqual(self.sent, [])
 
 
 class VoiceKeyComboTests(unittest.TestCase):

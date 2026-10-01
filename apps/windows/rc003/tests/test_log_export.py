@@ -26,11 +26,15 @@ class LogExportTests(unittest.TestCase):
         return path
 
     def test_actual_zip_includes_known_logs_and_backups_without_private_extras(self):
-        names = ('app.log', 'app.log.1', 'app.log.3', 'hid-helper.log',
-                 'diagnostic-trace.jsonl', 'diagnostic-trace.jsonl.3', 'diagnostic-report.json')
+        names = ('app.log', 'app.log.1', 'app.log.2', 'app.log.3',
+                 'hid-helper.log', 'hid-helper.log.1', 'diagnostic-trace.jsonl',
+                 'diagnostic-trace.jsonl.1', 'diagnostic-trace.jsonl.2',
+                 'diagnostic-trace.jsonl.3', 'diagnostic-report.json')
         for name in names:
             self.write_log(name)
-        for name in ('config.json', 'capture.wav', 'app.log.99', 'unknown.log', 'diagnostic-report.tmp'):
+        for name in ('config.json', 'capture.wav', 'app.log.4', 'hid-helper.log.2',
+                     'diagnostic-trace.jsonl.4',
+                     'app.log.99', 'unknown.log', 'diagnostic-report.tmp'):
             self.write_log(name, b'PRIVATE')
         result = log_export.export_logs(self.destination, root=self.root)
         self.assertEqual(result.outcome, 'exported')
@@ -45,7 +49,7 @@ class LogExportTests(unittest.TestCase):
             self.assertEqual(manifest['app_version'], __version__)
             self.assertNotIn(str(self.root), json.dumps(manifest))
             self.assertFalse(manifest['includes_configuration'])
-            self.assertTrue(any(row['status'] == 'missing' for row in manifest['files']))
+            self.assertEqual(sum(row['status'] == 'included' for row in manifest['files']), len(names))
 
     def test_no_logs_does_not_create_directory_or_overwrite_destination(self):
         self.destination.write_bytes(b'previous archive')
@@ -79,6 +83,30 @@ class LogExportTests(unittest.TestCase):
         with zipfile.ZipFile(self.destination) as archive:
             self.assertEqual(archive.read('app.log'), b'last line\n')
 
+    def test_legacy_log_export_uses_current_512_kib_cap(self):
+        names = ('app.log', 'app.log.2', 'diagnostic-trace.jsonl.3')
+        for name in names:
+            self.write_log(name, b'old marker\n' + (b'x' * 100 + b'\n') * 6000 + b'new marker\n')
+        result = log_export.export_logs(self.destination, root=self.root)
+        self.assertTrue(result.incomplete)
+        with zipfile.ZipFile(self.destination) as archive:
+            records = {row['name']: row for row in json.loads(archive.read('export-info.json'))['files']}
+            for name in names:
+                exported = archive.read(name)
+                self.assertLessEqual(len(exported), log_export.MAX_FILE_BYTES)
+                self.assertNotIn(b'old marker', exported)
+                self.assertTrue(exported.endswith(b'new marker\n'))
+                self.assertTrue(records[name]['truncated'])
+
+    def test_report_keeps_its_separate_capacity_when_log_export_is_bounded(self):
+        report = b'{"schema":2,"incidents":[]}'
+        self.write_log('diagnostic-report.json', report)
+        with mock.patch.object(log_export, 'MAX_FILE_BYTES', 16):
+            result = log_export.export_logs(self.destination, root=self.root)
+        self.assertFalse(result.incomplete)
+        with zipfile.ZipFile(self.destination) as archive:
+            self.assertEqual(archive.read('diagnostic-report.json'), report)
+
     def test_failed_publish_preserves_existing_file_and_removes_scratch(self):
         self.write_log()
         self.destination.write_bytes(b'keep')
@@ -104,6 +132,87 @@ class LogExportTests(unittest.TestCase):
     def test_relative_and_non_zip_destinations_are_rejected(self):
         for destination in (Path('file.zip'), self.root / 'file.txt'):
             self.assertEqual(log_export.export_logs(destination, root=self.root).outcome, 'invalid_destination')
+
+    def test_rotation_retries_whole_collection_and_keeps_newest_log_once(self):
+        self.write_log(content=b'previous current\n')
+        self.write_log('app.log.1', b'old backup\n')
+        original = log_export._snapshot
+        rotated = False
+        def read(path):
+            nonlocal rotated
+            result = original(path)
+            if path.name == 'app.log' and not rotated:
+                rotated = True
+                (self.logs / 'app.log.1').replace(self.logs / 'app.log.2')
+                path.replace(self.logs / 'app.log.1')
+                path.write_bytes(b'new during export\n')
+            return result
+        with mock.patch.object(log_export, '_snapshot', side_effect=read):
+            result = log_export.export_logs(self.destination, root=self.root)
+        self.assertFalse(result.incomplete)
+        with zipfile.ZipFile(self.destination) as archive:
+            self.assertEqual(archive.read('app.log'), b'new during export\n')
+            self.assertEqual(archive.read('app.log.1'), b'previous current\n')
+            self.assertEqual(archive.read('app.log.2'), b'old backup\n')
+            manifest = json.loads(archive.read('export-info.json'))
+            self.assertEqual(manifest['snapshot_attempts'], 2)
+            self.assertTrue(manifest['snapshot_stable'])
+            self.assertNotIn('_identity', str(manifest))
+
+    def test_continuous_file_changes_are_bounded_and_marked_incomplete(self):
+        self.write_log()
+        original = log_export._snapshot
+        attempts = []
+        def read(path):
+            result = original(path)
+            if path.name == 'app.log':
+                attempts.append(1)
+                path.replace(self.logs / 'app.log.1')
+                path.write_bytes(b'next current\n')
+            return result
+        with mock.patch.object(log_export, '_snapshot', side_effect=read):
+            result = log_export.export_logs(self.destination, root=self.root)
+        self.assertEqual(len(attempts), 2)
+        self.assertTrue(result.incomplete)
+        self.assertIn('部分日志', log_export.describe_result(result))
+        with zipfile.ZipFile(self.destination) as archive:
+            manifest = json.loads(archive.read('export-info.json'))
+            self.assertFalse(manifest['snapshot_stable'])
+            self.assertTrue(manifest['incomplete'])
+        from tests.test_log_bundle_scope import audit_module
+        limitations = audit_module.audit(self.destination)['limitations']
+        self.assertIn('export_changed_during_collection', limitations)
+        self.assertIn('export_marked_incomplete', limitations)
+
+    def test_changed_during_read_reaches_ui_and_manifest(self):
+        self.write_log()
+        original = log_export._snapshot
+        def read(path):
+            content, metadata = original(path)
+            metadata['changed_during_read'] = True
+            return content, metadata
+        with mock.patch.object(log_export, '_snapshot', side_effect=read):
+            result = log_export.export_logs(self.destination, root=self.root)
+        self.assertTrue(result.incomplete)
+        self.assertIn('部分日志', log_export.describe_result(result))
+        with zipfile.ZipFile(self.destination) as archive:
+            manifest = json.loads(archive.read('export-info.json'))
+            self.assertTrue(manifest['files'][0]['changed_during_read'])
+            self.assertTrue(manifest['incomplete'])
+
+    def test_new_file_in_an_already_read_slot_triggers_retry(self):
+        self.write_log('app.log.1')
+        original = log_export._snapshot
+        def read(path):
+            result = original(path)
+            if path.name == 'app.log.1' and not (self.logs / 'app.log').exists():
+                self.write_log(content=b'new current\n')
+            return result
+        with mock.patch.object(log_export, '_snapshot', side_effect=read):
+            result = log_export.export_logs(self.destination, root=self.root)
+        self.assertFalse(result.incomplete)
+        with zipfile.ZipFile(self.destination) as archive:
+            self.assertEqual(archive.read('app.log'), b'new current\n')
 
     def test_non_regular_log_is_unreadable_and_never_followed(self):
         self.write_log()

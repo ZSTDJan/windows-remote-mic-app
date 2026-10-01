@@ -301,7 +301,8 @@ class LoggingEfficiencyTests(unittest.TestCase):
             self.assertEqual(rows[-1]['event'], 'session_finished')
 
     def test_buffered_trace_rotation_and_close_keep_complete_records(self):
-        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(trace, 'TRACE_MAX_BYTES', 1024):
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(trace, 'TRACE_MAX_BYTES', 1024), \
+                mock.patch.object(trace, 'TRACE_BACKUP_COUNT', 3):
             root = Path(tmp)
             detailed = trace.DiagnosticTrace(root, enabled=True)
             for index in range(6):

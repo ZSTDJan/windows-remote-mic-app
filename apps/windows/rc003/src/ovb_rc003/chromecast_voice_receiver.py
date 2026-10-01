@@ -36,6 +36,9 @@ class VoiceReceiver:
         self._startup = deque()
         self._startup_bytes = 0
         self._startup_overflow = False
+        self._open_attempts = 0
+        self._open_started = 0.0
+        self._last_activity = -1.0
 
     def _stage(self, name):
         if self.observation:
@@ -73,18 +76,41 @@ class VoiceReceiver:
             self.pipe_failed = True  # Metadata delivery must not interrupt closing a stream.
 
     async def open(self):
+        self._open_attempts += 1
+        self._open_started = time.monotonic()
+        self._caps_event.clear()
+        self.capabilities = None
+        self._startup_overflow = False
+        if self._open_attempts == 2:
+            self._stage("voice_wake_retry")
         if self.observation:
             self.observation.stage("voice_open_begin")
+        opened = False
         try:
             if self.direct_notifications:
                 await self.device.open_voice(direct=True)
             else:
                 await self.device.open_voice()
+            opened = True
             if not self.detect_only:
                 await self._negotiate()
             self.available = True
         except Exception:
             self.available = False
+        finally:
+            # Discovery succeeded but negotiation may have failed or been
+            # cancelled. Release our maintained link and subscriptions as well.
+            if opened and not self.available:
+                try:
+                    await self.device.close_voice()
+                except Exception:
+                    pass  # The device retains cleanup failure for final shutdown.
+            if self.observation:
+                for row in getattr(self.device, "voice_queries", ()):
+                    if row.get("kind") == "voice_link":
+                        self.observation.voice_link(row, self._open_attempts)
+                    else:
+                        self.observation.voice_query(row, self._open_attempts)
         if self.observation:
             details = getattr(self.device, "voice_evidence", None)
             if details:
@@ -98,9 +124,21 @@ class VoiceReceiver:
             # asynchronous write completes. Replay only selected-device packets
             # received AFTER valid CAPS; bounded RAM only, never a disk recording.
             for attribute, value, stamp in self._startup:
-                self.notification(attribute, value, stamp)
+                self.notification(attribute, value, stamp, replay=True)
         self._startup.clear()
         self._startup_bytes = 0
+
+    def note_activity(self, stamp):
+        # Called only for a selected-device known HID press, never host-wide
+        # copy counters or a timer. Activity during discovery also counts.
+        self._last_activity = max(self._last_activity, stamp)
+
+    def retry_after_activity(self):
+        # Only retry an initial session/service connection failure. Failed capabilities,
+        # changed layouts and partially subscribed sessions need no blind retry.
+        return (self.direct_notifications and not self.stopping and not self.available
+                and self._open_attempts == 1 and self._last_activity >= self._open_started
+                and getattr(self.device, "voice_retryable", False) is True)
 
     def effects(self, effects):
         for effect in effects:
@@ -129,8 +167,10 @@ class VoiceReceiver:
                               f"{data}/{gate.mode}/{gate.limit}/{self.recording_elapsed_ms}/{gate.reason or 'none'}",
                               time.monotonic())
 
-    def notification(self, attribute, value, stamp):
+    def notification(self, attribute, value, stamp, *, replay=False):
         kind = self.device.voice_attributes.get(attribute)
+        if self.direct_notifications and self.observation and not replay:
+            self.observation.voice_notification(kind, value)
         if self._caps_waiting and kind == "control" and value[:1] == b"\x0b":
             fresh = stamp >= self._caps_requested_at and not self._caps_event.is_set()
             if fresh:
@@ -149,9 +189,9 @@ class VoiceReceiver:
                 self._startup_overflow = True
             return
         if not self.available:
-            if self.observation and attribute in (0x3c, 0x3f):
+            if self.observation and kind in ("audio", "control"):
                 self.observation.count("not_available")
-                if attribute == 0x3f:
+                if kind == "control":
                     self.observation.control(value, stamp, "unavailable", "not_available")
             return
         now = time.monotonic()

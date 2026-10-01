@@ -81,7 +81,8 @@ class GadgetLifecycleTests(unittest.TestCase):
                 connection.close()
             finally:
                 # Cooperative exit also closes the venv launcher's child.
-                child.communicate(timeout=10)
+                child.stdin.close()
+                child.wait(timeout=10)
             self.assertEqual(child.returncode, 0)
 
 

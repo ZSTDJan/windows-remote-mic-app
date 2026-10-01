@@ -16,7 +16,7 @@ import time
 from pathlib import Path
 from unittest import mock
 
-from ovb_rc003 import logging_setup
+from ovb_rc003 import diagnostic_trace, logging_setup
 
 
 class LogPathHelpersTests(unittest.TestCase):
@@ -64,8 +64,12 @@ class PersistentLogPrivacyTests(unittest.TestCase):
         self.assertIsNone(record.exc_info)
 
     def test_logger_uses_bounded_rotation(self):
-        self.assertEqual(logging_setup.LOG_MAX_BYTES, 5 * 1024 * 1024)
-        self.assertEqual(logging_setup.LOG_BACKUP_COUNT, 3)
+        self.assertEqual(logging_setup.LOG_MAX_BYTES, 512 * 1024)
+        self.assertEqual(logging_setup.LOG_BACKUP_COUNT, 1)
+        self.assertEqual(logging_setup.HID_HELPER_LOG_MAX_BYTES, 512 * 1024)
+        self.assertEqual(logging_setup.HID_HELPER_LOG_BACKUP_COUNT, 1)
+        self.assertEqual(diagnostic_trace.TRACE_MAX_BYTES, 512 * 1024)
+        self.assertEqual(diagnostic_trace.TRACE_BACKUP_COUNT, 1)
 
     def test_one_shot_hid_event_is_sanitized_and_closes_the_file(self):
         with tempfile.TemporaryDirectory() as tmp:

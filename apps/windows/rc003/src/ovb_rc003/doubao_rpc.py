@@ -27,15 +27,38 @@ _RPC_DLL_NAME = "rpc.dll"
 _IME_SERVICE_NAME = "ImeService.exe"
 _TSF_CORE_NAME = "tsf-oime-core.dll"
 VOICE_PRESS_STOP_MESSAGE = 0x3E9
+_DOUBAO_0900_HOOK_LAYOUT = (0x7426C0, 0x7427F1, 0x7427F7, 0x7431CD, 0x38)
+_DOUBAO_09122_HOOK_LAYOUT = (0x782D80, 0x782EB2, 0x782EB8, 0x783B7A, 0x38)
 _VERIFIED_IME_SERVICE_BUILDS = {
-    "94b17bdca571ac3cd2dafa687b4cb8e3a789cda9d044276483003b0a9e8f77a6": (
-        0x7426C0, 0x7427F1, 0x7427F7, 0x7431CD, 0x38
+    "94b17bdca571ac3cd2dafa687b4cb8e3a789cda9d044276483003b0a9e8f77a6":
+        _DOUBAO_0900_HOOK_LAYOUT,
+    "94ace7e504e6aa70c15095d5219604aee93e17247eb85429a046c7a4fdb95e90":
+        _DOUBAO_09122_HOOK_LAYOUT,
+}
+# These gates belong to the same exact build as the callback, not just the
+# same version label. Both are checked in loaded memory before any hook.
+_VERIFIED_HOOK_SIGNATURES = {
+    _DOUBAO_0900_HOOK_LAYOUT: (
+        bytes.fromhex("FF 15 59 9B 8A 00 E9 FB 09 00 00"),
+        bytes.fromhex("80 7C 24 38 00 75 14"),
+    ),
+    _DOUBAO_09122_HOOK_LAYOUT: (
+        bytes.fromhex("FF 15 D0 F4 95 00 E9 E9 0C 00 00"),
+        bytes.fromhex("80 7C 24 38 00 75 16"),
     ),
 }
 _VERIFIED_VOICE_STOP_BUILDS = {
     "a3ead1a55850257bac01a878c899f42291a1f41bd2b834e0caa5c5b66a674e02": (
         "94b17bdca571ac3cd2dafa687b4cb8e3a789cda9d044276483003b0a9e8f77a6",
         "77d58bfc5bbc9016ee58135967603fbab19a30e79a1c338bce6a2df62ce60a83",
+        0,
+    ),
+    "0be0cb35d864d06b2c8b5267d9f0669a1383493f557a45c6a1ebbfa203e85e53": (
+        "94ace7e504e6aa70c15095d5219604aee93e17247eb85429a046c7a4fdb95e90",
+        "8544bfb87d8d2cc847b13e2ccc9bbd2220b20bceafdd1fc88ad5eaff5a28bb02",
+        # 0.9.1.22's own stop button sends wParam=1. Without it, the
+        # service suppresses a stop during the first 800 ms after triggering.
+        1,
     ),
 }
 _PHYSICALIZER_READY_TIMEOUT_SECONDS = 2.0
@@ -100,6 +123,17 @@ def _physicalizer_source(
     decision_gate_rva: int,
     consumed_stack_offset: int,
 ) -> str:
+    layout = (
+        callback_rva, early_forward_rva, early_continue_rva,
+        decision_gate_rva, consumed_stack_offset,
+    )
+    signatures = _VERIFIED_HOOK_SIGNATURES.get(layout)
+    if signatures is None:
+        raise DoubaoRpcUnavailableError("Doubao hook signatures are not verified")
+    early_forward_bytes, decision_gate_bytes = (
+        ", ".join(f"0x{byte:02X}" for byte in signature)
+        for signature in signatures
+    )
     allowed_vks = ", ".join(f"0x{int(vk):02X}" for vk in vk_codes)
     # The final non-modifier edge is the only part that can leak printable
     # text into the foreground application. Doubao's verified callback sees it
@@ -132,9 +166,8 @@ function hasBytes(address, expected) {{
   }}
   return true;
 }}
-if (!hasBytes(earlyForward, [0xFF, 0x15, 0x59, 0x9B, 0x8A, 0x00,
-                             0xE9, 0xFB, 0x09, 0x00, 0x00]) ||
-    !hasBytes(decisionGate, [0x80, 0x7C, 0x24, 0x38, 0x00, 0x75, 0x14])) {{
+if (!hasBytes(earlyForward, [{early_forward_bytes}]) ||
+    !hasBytes(decisionGate, [{decision_gate_bytes}])) {{
   throw new Error('verified Doubao hook layout changed');
 }}
 function currentFrame() {{
@@ -914,24 +947,30 @@ def _resolve_rpc_dll_path() -> str:
     return dll_path
 
 
-def _verified_voice_stop_build(dll_path: str) -> bool:
+def _verified_voice_stop_layout(dll_path: str) -> Optional[tuple[str, str, int]]:
     try:
         path = Path(dll_path)
         if (
             path.name.casefold() != _RPC_DLL_NAME.casefold()
             or "doubaoime" not in str(path.parent).casefold()
         ):
-            return False
+            return None
         expected = _VERIFIED_VOICE_STOP_BUILDS.get(_module_sha256(str(path)))
         if expected is None:
-            return False
-        service_hash, tsf_hash = expected
-        return (
+            return None
+        service_hash, tsf_hash, _stop_wparam = expected
+        if (
             _module_sha256(str(path.with_name(_IME_SERVICE_NAME))) == service_hash
             and _module_sha256(str(path.with_name(_TSF_CORE_NAME))) == tsf_hash
-        )
+        ):
+            return expected
+        return None
     except OSError:
-        return False
+        return None
+
+
+def _verified_voice_stop_build(dll_path: str) -> bool:
+    return _verified_voice_stop_layout(dll_path) is not None
 
 
 def _configure_function(
@@ -976,7 +1015,7 @@ def _load_api() -> Tuple[RpcFunction, RpcFunction]:
     return key_down, key_up
 
 
-def _load_voice_stop_api() -> RpcFunction:
+def _load_voice_stop_api() -> tuple[RpcFunction, int]:
     if sys.platform != "win32":
         raise DoubaoRpcUnavailableError("Doubao RPC is Windows-only")
 
@@ -985,7 +1024,8 @@ def _load_voice_stop_api() -> RpcFunction:
         raise DoubaoRpcUnavailableError("ctypes.WinDLL is unavailable")
 
     dll_path = _resolve_rpc_dll_path()
-    if not _verified_voice_stop_build(dll_path):
+    layout = _verified_voice_stop_layout(dll_path)
+    if layout is None:
         raise DoubaoRpcUnavailableError(
             "Doubao voice-stop RPC build is not verified"
         )
@@ -995,7 +1035,7 @@ def _load_voice_stop_api() -> RpcFunction:
         raise DoubaoRpcUnavailableError(
             f"could not load Doubao rpc.dll: {exc}"
         ) from exc
-    return _configure_function(
+    function = _configure_function(
         library,
         "RpcPipe_SimpleMessageEx",
         (
@@ -1006,6 +1046,7 @@ def _load_voice_stop_api() -> RpcFunction:
             ctypes.c_char_p,
         ),
     )
+    return function, layout[2]
 
 
 def clear_cached_api() -> None:
@@ -1026,12 +1067,12 @@ def send_voice_press_stop(
     committing the finalized text into the focused editor.
     """
 
-    stop = _load_voice_stop_api()
+    stop, stop_wparam = _load_voice_stop_api()
     try:
         result = stop(
             endpoint.encode("ascii"),
             VOICE_PRESS_STOP_MESSAGE,
-            0,
+            stop_wparam,
             0,
             context,
         )

@@ -356,7 +356,7 @@ class LegacyBridgeStartupTests(unittest.TestCase):
             migrated = main_module._migrate_legacy_bridge_before_desktop_start()
 
         self.assertTrue(migrated)
-        request_exit.assert_called_once_with()
+        request_exit.assert_called_once_with(reason="legacy_replacement")
         self.assertIsNone(bridge_runtime_status.read_status(self._config_root))
 
     def test_startup_blocks_when_the_residual_bridge_cannot_exit(self):

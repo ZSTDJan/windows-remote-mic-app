@@ -12,6 +12,7 @@ from ovb_rc003 import chromecast_hid_worker as worker
 from ovb_rc003 import chromecast_device_windows as device
 from ovb_rc003.chromecast_buttons import HidButtonReceiver
 from ovb_rc003.chromecast_channel import Channel, SessionIdentity
+from ovb_rc003.chromecast_observation import HID_COUNTS
 from ovb_rc003.chromecast_pipe_windows import PipeError
 from ovb_rc003.chromecast_voice_receiver import VoiceReceiver
 from ovb_rc003.chromecast_voice import GET_CAPABILITIES
@@ -48,11 +49,18 @@ class HidWorkerTests(unittest.IsolatedAsyncioTestCase):
         inbox = deque([commands.encode("start", mode="run")])
         received = []
         reports = deque([("hook_ready", "", time.monotonic())])
+        reports.append(("hid_flow", dict(kind="hid_flow", elapsed_ms=0, sample_ms=2000,
+            counts=dict.fromkeys(HID_COUNTS, 0), lengths=[], copy_buffer_lengths=[],
+            copy_hook_state="ready", copy_scope="selected_host_unattributed",
+            last_error_step="none"), 0.0))
         target = SimpleNamespace(changed=threading.Event(),
                                  open=mock.AsyncMock(), close_voice=mock.AsyncMock(), close=mock.Mock())
 
         class Tap:
             def start(self):
+                pass
+
+            def abort_start(self):
                 pass
 
             def source_alive(self):
@@ -63,7 +71,7 @@ class HidWorkerTests(unittest.IsolatedAsyncioTestCase):
                 reports.clear()
                 return result
 
-            def close(self):
+            def close(self, *, diagnostic=None):
                 pass
 
         def read():
@@ -89,6 +97,17 @@ class HidWorkerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([event["type"] for event in received if event["type"] not in ("evidence", "diagnostic")],
                          ["ready", "edge", "edge", "stopped"])
         self.assertEqual([event["action"] for event in received if event["type"] == "edge"], ["down", "up"])
+        summary = [event["record"] for event in received
+                   if event["type"] == "evidence" and event["record"]["kind"] == "summary"][-1]
+        self.assertEqual(summary["counts"]["ordinary"], 2)
+        self.assertEqual(summary["counts"]["hid_edges"], 2)
+        self.assertEqual(len([event for event in received
+            if event["type"] == "evidence" and event["record"]["kind"] == "hid_flow"]), 1)
+        phases = {(event['stage'], event['phase']): event['elapsed_ms']
+                  for event in received if event['type'] == 'diagnostic'}
+        for step in ('capture_stop', 'device_voice_close', 'device_close', 'observation_flush'):
+            self.assertEqual(phases[(step, 'begin')], 0)
+            self.assertGreaterEqual(phases[(step, 'done')], 0)
         target.close_voice.assert_awaited_once()
 
     async def test_device_closes_even_if_voice_unsubscribe_fails(self):
@@ -104,6 +123,9 @@ class HidWorkerTests(unittest.IsolatedAsyncioTestCase):
             def start(self):
                 pass
 
+            def abort_start(self):
+                pass
+
             def source_alive(self):
                 return True
 
@@ -112,7 +134,7 @@ class HidWorkerTests(unittest.IsolatedAsyncioTestCase):
                 reports.clear()
                 return result
 
-            def close(self):
+            def close(self, *, diagnostic=None):
                 pass
 
         def write(raw):
@@ -140,6 +162,9 @@ class HidWorkerTests(unittest.IsolatedAsyncioTestCase):
             def start(self):
                 pass
 
+            def abort_start(self):
+                pass
+
             def source_alive(self):
                 return True
 
@@ -148,7 +173,7 @@ class HidWorkerTests(unittest.IsolatedAsyncioTestCase):
                 reports.clear()
                 return result
 
-            def close(self):
+            def close(self, *, diagnostic=None):
                 pass
 
         async def write_voice(command):
@@ -219,17 +244,21 @@ class DirectVoiceTests(unittest.IsolatedAsyncioTestCase):
                 add_value_changed=mock.Mock(return_value=part), remove_value_changed=mock.Mock(),
                 write_client_characteristic_configuration_descriptor_async=mock.AsyncMock(return_value=0))
             chars.append(characteristic)
-        service = SimpleNamespace(get_characteristics_with_cache_mode_async=mock.AsyncMock(
+        service = SimpleNamespace(uuid=device._VOICE_SERVICE_ID, attribute_handle=0x37, close=mock.Mock(),
+            get_characteristics_with_cache_mode_async=mock.AsyncMock(
             return_value=SimpleNamespace(status=0, characteristics=chars)))
         target = device.SelectedDevice(ENTITY)
-        target.device = SimpleNamespace(get_gatt_services_for_uuid_with_cache_mode_async=mock.AsyncMock(
+        target.device = SimpleNamespace(bluetooth_device_id=object(), get_gatt_services_with_cache_mode_async=mock.AsyncMock(
             return_value=SimpleNamespace(status=0, services=[service])))
-        await target.open_voice(direct=True)
+        from tests.test_chromecast_voice_discovery import session
+        with mock.patch('winrt.windows.devices.bluetooth.genericattributeprofile.GattSession',
+                SimpleNamespace(from_device_id_async=mock.AsyncMock(return_value=session()))):
+            await target.open_voice(direct=True)
         self.assertEqual(len(target._voice_tokens), 2)
         chars[2].add_value_changed.call_args.args[0](None, SimpleNamespace(characteristic_value=b"\x0b"))
         chars[1].add_value_changed.call_args.args[0](None, SimpleNamespace(characteristic_value=b"\x01\x02"))
         self.assertEqual([(attribute, value) for attribute, value, _ in target.poll_voice()],
-                         [(0x3F, b"\x0b"), (0x3C, b"\x01\x02")])
+                         [(0x3E, b"\x0b"), (0x3B, b"\x01\x02")])
         await target.close_voice()
         chars[1].remove_value_changed.assert_called_once_with(3)
         chars[2].remove_value_changed.assert_called_once_with(4)

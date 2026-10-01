@@ -278,6 +278,7 @@ hiddenimports = [
     # Keep the whole first-party closure explicit: the contract test below
     # derives this inventory from every chromecast_*.py source file, so a new
     # runtime module cannot silently miss the frozen application.
+    "ovb_rc003.chromecast_attach_diagnostics_windows",
     "ovb_rc003.chromecast_buttons",
     "ovb_rc003.chromecast_channel",
     "ovb_rc003.chromecast_client",
@@ -286,6 +287,7 @@ hiddenimports = [
     "ovb_rc003.chromecast_diagnostics_windows",
     "ovb_rc003.chromecast_doubao_handsfree",
     "ovb_rc003.chromecast_etw_windows",
+    "ovb_rc003.chromecast_gadget_windows",
     "ovb_rc003.chromecast_hid_tap_windows",
     "ovb_rc003.chromecast_hid_worker",
     "ovb_rc003.chromecast_host_activity",

@@ -13,8 +13,8 @@ import zipfile
 
 from . import __version__, diagnostic_trace, logging_setup
 
-# Log writers rotate at 5 MiB. Bound older/unrotated helper logs as well.
-MAX_FILE_BYTES = 8 * 1024 * 1024
+# Bound older logs from previous versions without changing the source files.
+MAX_FILE_BYTES = 512 * 1024
 
 
 @dataclass(frozen=True)
@@ -33,7 +33,9 @@ def _log_names() -> tuple[str, ...]:
     names = []
     for name, backups in ((logging_setup.LOG_FILENAME, logging_setup.LOG_BACKUP_COUNT),
                           (diagnostic_trace.TRACE_FILENAME, diagnostic_trace.TRACE_BACKUP_COUNT)):
-        names.extend([name] + [f'{name}.{i}' for i in range(1, backups + 1)])
+        # Old-version history is read-only here; its writer retires it on rotation.
+        retained = max(backups, logging_setup.LEGACY_LOG_BACKUP_COUNT)
+        names.extend([name] + [f'{name}.{i}' for i in range(1, retained + 1)])
     helper = logging_setup.HID_HELPER_LOG_FILENAME
     return (*names, helper,
             *(f'{helper}.{i}' for i in range(1, logging_setup.HID_HELPER_LOG_BACKUP_COUNT + 1)),
@@ -49,9 +51,11 @@ def _snapshot(path: Path) -> tuple[bytes, dict]:
         opened = os.fstat(source.fileno())
         if (before.st_dev, before.st_ino) != (opened.st_dev, opened.st_ino):
             raise OSError('log_replaced_during_open')
-        offset = max(0, opened.st_size - MAX_FILE_BYTES)
+        limit = (diagnostic_trace.REPORT_MAX_BYTES
+                 if path.name == diagnostic_trace.REPORT_FILENAME else MAX_FILE_BYTES)
+        offset = max(0, opened.st_size - limit)
         source.seek(offset)
-        content = source.read(min(opened.st_size, MAX_FILE_BYTES))
+        content = source.read(min(opened.st_size, limit))
         after = os.fstat(source.fileno())
     # A truncated text log starts at its first complete line, not in a UTF-8 character.
     if offset and path.name != diagnostic_trace.REPORT_FILENAME:
@@ -59,8 +63,23 @@ def _snapshot(path: Path) -> tuple[bytes, dict]:
         content = content[newline + 1:] if newline >= 0 else b''
     return content, dict(source_bytes=opened.st_size, exported_bytes=len(content),
                          truncated=bool(offset), modified_ns=opened.st_mtime_ns,
+                         _identity=(opened.st_dev, opened.st_ino),
                          changed_during_read=(after.st_size, after.st_mtime_ns)
                          != (opened.st_size, opened.st_mtime_ns))
+
+
+def _file_state(path: Path):
+    """Compare names after the whole collection, including missing/new files."""
+    try:
+        info = path.lstat()
+        if (not stat.S_ISREG(info.st_mode)
+                or getattr(info, 'st_file_attributes', 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT):
+            return 'unreadable'
+        return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns)
+    except FileNotFoundError:
+        return 'missing'
+    except OSError:
+        return 'unreadable'
 
 
 def export_logs(destination: Path, *, root: Path | None = None,
@@ -79,26 +98,39 @@ def export_logs(destination: Path, *, root: Path | None = None,
         application_flushed = logging_setup.flush_application_logs(directory)
         diagnostic_flushed = diagnostic_trace.flush_diagnostic_logs(directory)
         report_flushed = diagnostic_trace.flush_fault_report(directory)
-        records, captured = [], []
-        # Read a bounded snapshot first so empty/wholly unreadable logs create no archive.
-        for name in _log_names():
-            if cancelled():
-                return ExportResult('cancelled')
-            try:
-                content, metadata = _snapshot(directory / name)
-            except FileNotFoundError:
-                records.append(dict(name=name, status='missing'))
-                continue
-            except OSError:
-                records.append(dict(name=name, status='unreadable'))
-                continue
-            records.append(dict(name=name, status='included', **metadata))
-            captured.append((name, content))
+        # A rotation can move an already-read file into a later backup slot.
+        # Retry the entire bounded collection once; never lock the live writers
+        # or silently call an unstable second collection complete.
+        for attempt in range(1, 3):
+            records, captured, states = [], [], {}
+            for name in _log_names():
+                if cancelled():
+                    return ExportResult('cancelled')
+                try:
+                    content, metadata = _snapshot(directory / name)
+                except FileNotFoundError:
+                    states[name] = 'missing'
+                    records.append(dict(name=name, status='missing'))
+                    continue
+                except OSError:
+                    states[name] = 'unreadable'
+                    records.append(dict(name=name, status='unreadable'))
+                    continue
+                states[name] = (*metadata.pop('_identity'), metadata['source_bytes'], metadata['modified_ns'])
+                records.append(dict(name=name, status='included', **metadata))
+                captured.append((name, content))
+            stable = all(_file_state(directory / name) == state for name, state in states.items())
+            stable = stable and not any(r.get('changed_during_read') for r in records)
+            if stable:
+                break
         if not captured:
             outcome = 'read_failed' if any(r['status'] == 'unreadable' for r in records) else 'no_logs'
             return ExportResult(outcome)
-        incomplete = not all((application_flushed, diagnostic_flushed, report_flushed)) or any(r['status'] == 'unreadable' or r.get('truncated') for r in records)
+        incomplete = not all((application_flushed, diagnostic_flushed, report_flushed, stable)) or any(
+            r['status'] == 'unreadable' or r.get('truncated') or r.get('changed_during_read')
+            for r in records)
         manifest = dict(schema_version=1, app_version=__version__,
+                        incomplete=incomplete, snapshot_stable=stable, snapshot_attempts=attempt,
                         fault_report_flushed=report_flushed,
                         application_log_flushed=application_flushed,
                         diagnostic_trace_flushed=diagnostic_flushed,
