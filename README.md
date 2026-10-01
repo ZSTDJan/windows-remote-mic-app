@@ -16,6 +16,10 @@
 
 当前正式版为 **1.0.72**，支持小米蓝牙语音遥控器 2 Pro 和图示谷歌 Chromecast 遥控器。具体功能与界面以下载的版本为准。
 
+**[下载测试版 1.0.86-candidate.86](https://github.com/ZSTDJan/windows-remote-mic-app/releases/download/v1.0.86-candidate.86/RemoteMicRC003-1.0.86-candidate.86-portable-unsigned.zip)** · [测试版说明](https://github.com/ZSTDJan/windows-remote-mic-app/releases/tag/v1.0.86-candidate.86) · [SHA256SUMS.txt](https://github.com/ZSTDJan/windows-remote-mic-app/releases/download/v1.0.86-candidate.86/SHA256SUMS.txt)
+
+测试版适配豆包输入法 0.9.1.22，包含 B 款微信语音久置修复、连接兼容、Chatterfly 及快捷键和日志改进。本机检查已完成；实体遥控器、文字上屏、久置／休眠恢复和异机仍待实测。正式用户不会自动收到候选更新。
+
 完整解压 ZIP 后运行其中的 `无线麦 win版 <版本号>.exe`，不要只取出 EXE。程序未签名，Windows 可能弹出安全提示；请从本仓库下载。
 
 ## 能做什么
