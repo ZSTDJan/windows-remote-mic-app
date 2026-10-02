@@ -45,10 +45,11 @@ def _emit_diagnostic(event: str, **fields: Any) -> None:
         try:
             logging.getLogger("ovb_rc003").info(
                 "element navigation lifecycle: event=%s runtime=%s command=%s "
-                "outcome=%s error_type=%s error_code=%s failures=%s",
+                "outcome=%s error_type=%s error_code=%s cause_type=%s cause_code=%s failures=%s",
                 event, fields.get("navigation_runtime_id"), fields.get("command"),
                 fields.get("outcome"), fields.get("error_type"),
-                fields.get("error_code"), fields.get("failure_count"),
+                fields.get("error_code"), fields.get("cause_type"),
+                fields.get("cause_code"), fields.get("failure_count"),
             )
         except Exception:
             pass

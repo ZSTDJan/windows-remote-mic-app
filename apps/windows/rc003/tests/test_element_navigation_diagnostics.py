@@ -10,11 +10,12 @@ import threading
 import time
 import unittest
 import zipfile
+from ctypes import wintypes
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
-from ovb_rc003 import element_navigation_runtime as runtime, log_export
+from ovb_rc003 import element_navigation_runtime as runtime, log_export, win32_input
 from ovb_rc003.diagnostic_trace import DiagnosticTrace
 
 
@@ -158,6 +159,294 @@ class NavigationDiagnosticsTests(unittest.TestCase):
 
     def last(self, event):
         return next(r for r in reversed(self.records) if r["event"] == "element_navigation_" + event)
+
+    def mouse_fixture(self, *, semantic=False):
+        rect = host.Rect(100, 100, 240, 180)
+        control = SimpleNamespace(runtime_id=(1,), rect=rect,
+                                  ControlTypeName="ButtonControl", Name="PRIVATE TEXT",
+                                  GetParentControl=mock.Mock(return_value=None))
+        target = SimpleNamespace(snapshot=host.TargetSnapshot(
+            rect, "PRIVATE TEXT", "ButtonControl", path=(0,), runtime_id=(1,),
+            has_action_pattern=semantic), control=control, click_point=None)
+        self.ns.update(auto=SimpleNamespace(ControlFromPoint=mock.Mock(return_value=control)),
+                       runtime_id_from_control=lambda item: item.runtime_id,
+                       rect_from_control=lambda item: item.rect,
+                       click_point=mock.Mock(), scroll_point=mock.Mock(),
+                       send_mouse_events=mock.Mock(return_value=1),
+                       try_semantic_invoke=mock.Mock(return_value="InvokePattern"))
+        self.worker.targets = self.worker.all_targets = [target]
+        self.worker.selected = 0
+        self.worker.context_valid = True
+        self.worker._update_live_target = mock.Mock(return_value=True)
+        self.worker._cached_pointer_point = lambda item: None
+        self.worker._cached_scroll_point = lambda item: None
+        self.worker._request_background_refresh = mock.Mock()
+        self.worker._emit_selection = mock.Mock()
+        return target, control
+
+    def test_hit_test_exception_retries_and_clicks_only_the_later_verified_point(self):
+        for operation in ("_activate", "_context_click", "_scroll"):
+            with self.subTest(operation=operation):
+                target, control = self.mouse_fixture()
+                self.ns["auto"].ControlFromPoint.side_effect = [OSError("PRIVATE"), control]
+                if operation == "_scroll":
+                    self.worker._scroll(1)
+                else:
+                    getattr(self.worker, operation)()
+                click = self.ns["scroll_point"] if operation == "_scroll" else self.ns["click_point"]
+                self.assertEqual(click.call_count, 1)
+                probe = self.last("point_probe")
+                self.assertEqual((probe["outcome"], probe["count"]), ("verified", 2))
+                self.assertEqual(self.last("point_probe_error")["reason"], "hit_test_failed")
+                expected = host.available_target_probe_points(target.snapshot, [target.snapshot])[1]
+                self.assertEqual(target.click_point, expected)
+                self.assertEqual(click.call_args.args[0], expected)
+                self.assertEqual(self.last("mouse_action")["outcome"], "submitted")
+
+    def test_parent_query_exception_does_not_cancel_remaining_probe_points(self):
+        target, control = self.mouse_fixture()
+        broken_child = SimpleNamespace(runtime_id=(2,), rect=control.rect,
+                                       ControlTypeName="TextControl", Name="PRIVATE",
+                                       GetParentControl=mock.Mock(side_effect=OSError("PRIVATE")))
+        self.ns["auto"].ControlFromPoint.side_effect = [broken_child, control]
+        self.assertTrue(self.worker._target_is_exposed(target, allow_semantic_bypass=False))
+        self.assertEqual(self.last("point_probe")["count"], 2)
+        self.assertEqual(self.last("point_probe_error")["reason"], "parent_query_failed")
+
+    def test_probe_misses_and_exceptions_do_not_create_an_unverified_center_click(self):
+        for failure in (None, OSError("PRIVATE")):
+            for operation in ("_activate", "_context_click"):
+                with self.subTest(failure=type(failure).__name__, operation=operation):
+                    target, control = self.mouse_fixture()
+                    probe = self.ns["auto"].ControlFromPoint
+                    if failure is None:
+                        probe.return_value = None
+                    else:
+                        probe.side_effect = failure
+                    getattr(self.worker, operation)()
+                    self.assertIsNone(target.click_point)
+                    self.assertEqual(probe.call_count, len(host.target_probe_points(target.snapshot.rect)))
+                    self.ns["click_point"].assert_not_called()
+                    self.assertEqual(self.last("point_probe")["outcome"], "missed")
+                    self.assertEqual(self.last("target_skipped")["reason"], "target_unavailable")
+
+    def test_ordinary_descendant_is_clickable_but_retained_child_action_is_not(self):
+        target, control = self.mouse_fixture()
+        child_rect = host.Rect(140, 125, 190, 160)
+        child = SimpleNamespace(runtime_id=(2,), rect=child_rect,
+                                ControlTypeName="TextControl", Name="PRIVATE CHILD",
+                                GetParentControl=mock.Mock(return_value=control))
+        self.ns["auto"].ControlFromPoint.return_value = child
+        self.assertTrue(self.worker._target_is_exposed(target, allow_semantic_bypass=False))
+        target.click_point = None
+        self.worker.targets.append(SimpleNamespace(snapshot=host.TargetSnapshot(
+            child_rect, child.Name, child.ControlTypeName, path=(0, 1), runtime_id=(2,),
+            has_action_pattern=True), control=child, click_point=None))
+        self.assertFalse(self.worker._target_is_exposed(target, allow_semantic_bypass=False))
+        self.assertIsNone(target.click_point)
+
+    def test_child_actions_covering_all_probes_never_fall_back_to_the_parent_center(self):
+        target, control = self.mouse_fixture()
+        self.worker.targets.append(SimpleNamespace(snapshot=host.TargetSnapshot(
+            target.snapshot.rect, "PRIVATE CHILD", "ButtonControl", path=(0, 1),
+            runtime_id=(2,), has_action_pattern=True), control=control, click_point=None))
+        self.worker._context_click()
+        self.ns["auto"].ControlFromPoint.assert_not_called()
+        self.ns["click_point"].assert_not_called()
+        self.assertEqual(self.last("point_probe")["reason"], "no_available_point")
+
+    def test_semantic_fallback_remains_left_click_only_and_does_not_send_mouse_input(self):
+        target, control = self.mouse_fixture(semantic=True)
+        self.ns["auto"].ControlFromPoint.return_value = None
+        self.worker._activate()
+        self.ns["try_semantic_invoke"].assert_called_once_with(target)
+        self.ns["click_point"].assert_not_called()
+        self.assertEqual(self.last("semantic_action")["outcome"], "returned")
+        self.ns["try_semantic_invoke"].reset_mock()
+        self.worker._context_click()
+        self.ns["try_semantic_invoke"].assert_not_called()
+        self.ns["click_point"].assert_not_called()
+
+    def test_mouse_guard_failures_and_original_cause_are_logged_without_error_text(self):
+        target, control = self.mouse_fixture()
+        failures = [(host.MouseInputBusyError("PRIVATE"), "busy"),
+                    (host.MouseInputDeliveryError("PRIVATE"), "failed"),
+                    (host.MouseInputCleanupIncompleteError("left", "PRIVATE"), "cleanup_pending")]
+        failures[-1][0].__cause__ = ctypes.ArgumentError("PRIVATE INPUT")
+        for error, outcome in failures:
+            with self.subTest(outcome=outcome):
+                self.worker._mouse_input_safety = host._MouseInputSafetyState()
+                self.assertFalse(self.worker._try_mouse_action(
+                    target, "左击", mock.Mock(side_effect=error)))
+                row = self.last("mouse_action")
+                self.assertEqual((row["outcome"], row["error_type"]), (outcome, type(error).__name__))
+        self.assertEqual(self.last("mouse_action")["cause_type"], "ArgumentError")
+        self.assertNotIn("PRIVATE", json.dumps(self.records))
+
+    def test_click_queue_suppression_and_invalid_context_are_visible(self):
+        self.ns.update(auto=mock.Mock(), send_mouse_events=mock.Mock(return_value=1))
+        self.worker.post("activate")
+        self.worker.post("activate")
+        self.worker.post("activate")
+        self.assertEqual(self.last("command_discarded")["reason"], "pending_limit")
+        self.worker._generation = 1
+        self.worker.context_valid = False
+        self.worker.commands.put(("context", None, 1))
+        self.worker.commands.put(("stop", None, 1))
+        self.worker._run()
+        rows = [r for r in self.records if r["event"] == "element_navigation_command_discarded"]
+        self.assertIn("generation_changed", {r["reason"] for r in rows})
+        self.assertEqual(self.last("command_started")["outcome"], "context_invalid")
+
+    def test_pending_mouse_release_still_blocks_until_a_confirmed_release(self):
+        target, control = self.mouse_fixture()
+        self.worker._mouse_input_safety.pending_button = "left"
+        self.ns["send_mouse_events"].side_effect = [ctypes.ArgumentError("PRIVATE"), 1]
+        self.assertFalse(self.worker._try_mouse_action(target, "右击", self.ns["click_point"]))
+        self.ns["click_point"].assert_not_called()
+        self.assertEqual(self.worker._mouse_input_safety.pending_button, "left")
+        self.assertTrue(self.worker._try_mouse_action(target, "右击", self.ns["click_point"]))
+        self.assertIsNone(self.worker._mouse_input_safety.pending_button)
+        self.ns["click_point"].assert_called_once()
+
+    def test_exit_release_failure_preserves_the_cause_and_remains_retryable(self):
+        self.worker._mouse_input_safety.pending_button = "left"
+        self.ns.update(auto=mock.Mock(), send_mouse_events=mock.Mock(
+            side_effect=[ctypes.ArgumentError("PRIVATE"), 1]))
+        self.worker.commands.put(("stop", None, 0))
+        self.worker.commands.put(("stop", None, 0))
+        self.worker._run()
+        row = self.last("worker_error")
+        self.assertEqual((row["command"], row["cause_type"]), ("stop", "ArgumentError"))
+        self.assertIsNone(self.worker._mouse_input_safety.pending_button)
+        self.assertNotIn("PRIVATE", json.dumps(self.records))
+
+    @unittest.skipUnless(hasattr(ctypes, "WinDLL"), "Windows native ctypes binding")
+    def test_native_keyboard_and_two_navigators_keep_independent_input_bindings(self):
+        callbacks, submissions = [], []
+
+        def callback_for(label):
+            @ctypes.WINFUNCTYPE(wintypes.UINT, wintypes.UINT, ctypes.c_void_p, ctypes.c_int)
+            def send(count, address, size):
+                submissions.append((label, int(count), int(size)))
+                return count
+            callbacks.append(send)  # Keep the native callback alive.
+            return send
+
+        shared = SimpleNamespace(SendInput=callback_for("ordinary"))
+        binding_nodes = [n for n in RUN.body if isinstance(n, ast.Assign)
+                         and any(ast.unparse(t) in {"user32", "user32.SendInput.argtypes",
+                                                   "user32.SendInput.restype"} for t in n.targets)]
+        senders = []
+        with mock.patch.object(ctypes, "windll", SimpleNamespace(user32=shared)), \
+                mock.patch.object(win32_input, "_require_live_input_allowed"):
+            for label in ("first", "second"):
+                ns = dict(vars(host), wintypes=wintypes, diagnostics=self.diagnostics)
+                load_host_nodes(ns, "MouseInput", "InputUnion", "Input", "send_mouse_events")
+                exec(compile(ast.fix_missing_locations(ast.Module(body=binding_nodes, type_ignores=[])),
+                             host.__file__, "exec"), ns)
+                # Load the actual WinDLL and production declarations, then
+                # replace only its function address; no OS input is submitted.
+                send = callback_for(label)
+                send.argtypes = ns["user32"].SendInput.argtypes
+                ns["user32"].SendInput = send
+                senders.append(ns["send_mouse_events"])
+            self.assertEqual(senders[0]([(2, 0), (4, 0)]), 2)
+            for ordinary, events in ((win32_input._real_send_input_batch, [(75, False), (75, True)]),
+                                     (win32_input._real_send_virtual_key_input_batch, [(162, False)]),
+                                     (win32_input._real_send_mouse_input_batch, [(2, 0), (4, 0)])):
+                self.assertEqual(ordinary(events), len(events))
+                for sender in senders:
+                    state = host._MouseInputSafetyState()
+                    moves = []
+                    for button in ("left", "right"):
+                        state.run(lambda: host._move_and_click_safely(
+                            (100, 100), button, is_button_down=lambda _: False,
+                            move_pointer=lambda point: moves.append(point) or True,
+                            send_events=sender), send_events=sender)
+                    state.run(lambda: host._move_and_wheel_safely(
+                        (100, 100), 1, pointer_move_is_blocked=lambda: False,
+                        move_pointer=lambda point: moves.append(point) or True,
+                        send_events=sender), send_events=sender)
+                    state.release_pending(send_events=sender)
+                    self.assertIsNone(state.pending_button)
+                    self.assertEqual(len(moves), 3)
+        self.assertEqual({label for label, _, _ in submissions}, {"ordinary", "first", "second"})
+        self.assertEqual({size for _, _, size in submissions}, {40})
+
+    @unittest.skipUnless(hasattr(ctypes, "WinDLL"), "Windows native ctypes binding")
+    def test_native_submission_failures_recovery_and_probe_results_survive_zip_export(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            trace = DiagnosticTrace(root, enabled=True)
+            self.addCleanup(trace.close)
+            self.addCleanup(runtime.clear_diagnostic_trace, trace)
+            runtime.set_diagnostic_trace(trace)
+            self.diagnostics._sink = runtime._emit_diagnostic
+            self.diagnostics._enabled = runtime._diagnostic_enabled
+            target, control = self.mouse_fixture()
+            native_calls, moves, delivery = [], [], [None]
+
+            @ctypes.WINFUNCTYPE(wintypes.UINT, wintypes.UINT, ctypes.c_void_p, ctypes.c_int)
+            def native_callback(count, pointer, size):
+                native_calls.append(int(count))
+                return count if delivery[0] is None else min(count, delivery[0])
+
+            self.ns.update(wintypes=wintypes, user32=SimpleNamespace(SendInput=native_callback))
+            load_host_nodes(self.ns, "MouseInput", "InputUnion", "Input", "send_mouse_events")
+            sender = self.ns["send_mouse_events"]
+            self.ns["click_point"] = lambda point, button="left": host._move_and_click_safely(
+                point, button, is_button_down=lambda _: False,
+                move_pointer=lambda item: moves.append(item) or True, send_events=sender)
+            # Genuine ctypes argument conversion fails before this native callback.
+            native_callback.argtypes = (wintypes.UINT, ctypes.POINTER(win32_input.INPUT), ctypes.c_int)
+            self.worker._activate()
+            self.worker._context_click()
+            self.assertEqual((len(moves), native_calls), (1, []))
+            self.assertEqual(self.worker._mouse_input_safety.pending_button, "left")
+            native_callback.argtypes = (wintypes.UINT, ctypes.POINTER(self.ns["Input"]), ctypes.c_int)
+            self.worker._context_click()
+            self.assertIsNone(self.worker._mouse_input_safety.pending_button)
+            # Partial submission is distinct from a pre-call conversion exception.
+            delivery[0] = 1
+            self.worker._activate()
+            delivery[0] = None
+            self.ns["auto"].ControlFromPoint.side_effect = [TimeoutError("PRIVATE"), control]
+            self.worker._context_click()
+            self.ns["auto"].ControlFromPoint.side_effect = None
+            self.worker._generation = 1
+            self.worker.commands.put(("activate", None, 0))
+            self.worker.commands.put(("stop", None, 1))
+            self.ns["auto"].InitializeUIAutomationInCurrentThread = mock.Mock()
+            self.ns["auto"].UninitializeUIAutomationInCurrentThread = mock.Mock()
+            self.worker._run()
+            # Diagnostic disable and a replacement writer must keep the same
+            # live navigator attached, without producing disabled mouse records.
+            trace.set_enabled(False)
+            self.worker._activate()
+            trace.set_enabled(True)
+            self.worker._activate()
+            trace.close()
+            destination = root / "mouse-evidence.zip"
+            self.assertEqual(log_export.export_logs(destination, root=root).outcome, "exported")
+            with zipfile.ZipFile(destination) as archive:
+                data = archive.read("diagnostic-trace.jsonl").decode("utf-8")
+                manifest = json.loads(archive.read("export-info.json"))
+            rows = [json.loads(line) for line in data.splitlines()]
+            actions = [r for r in rows if r["event"] == "element_navigation_mouse_action"]
+            self.assertEqual({r["outcome"] for r in actions}, {"submitted", "failed", "cleanup_pending"})
+            self.assertTrue(any(r.get("cause_type") == "ArgumentError" for r in actions))
+            submissions = [r for r in rows if r["event"] == "element_navigation_mouse_submission"]
+            self.assertEqual({r["outcome"] for r in submissions}, {"submitted", "incomplete", "exception"})
+            self.assertTrue(any(r.get("requested") == 2 and r.get("returned") == 1 for r in submissions))
+            self.assertTrue(any(r["event"] == "element_navigation_point_probe_error"
+                                and r["error_type"] == "TimeoutError" for r in rows))
+            self.assertTrue(any(r["event"] == "element_navigation_command_discarded"
+                                and r["reason"] == "generation_changed" for r in rows))
+            sessions = [r for r in rows if r["event"] == "session_finished"]
+            self.assertEqual((len(sessions), {r["dropped"] for r in sessions}), (2, {0}))
+            self.assertFalse(manifest["incomplete"])
+            self.assertNotIn("PRIVATE", data)
 
     def test_scan_and_actual_movement_share_token_without_text(self):
         self.scan()
@@ -509,6 +798,16 @@ class NavigationDiagnosticsTests(unittest.TestCase):
             host._NavigationDiagnostics(runtime._emit_diagnostic, runtime._diagnostic_enabled).error(
                 "worker_error", PermissionError("PRIVATE"), command="initialize")
         self.assertIn("PermissionError", logs.output[0])
+        self.assertNotIn("PRIVATE", logs.output[0])
+
+    def test_exit_failure_keeps_native_cause_in_application_log_without_a_trace(self):
+        error = host.MouseInputCleanupIncompleteError("left", "PRIVATE")
+        error.__cause__ = ctypes.ArgumentError("PRIVATE INPUT")
+        with mock.patch.object(runtime, "_diagnostic_trace", None), \
+                self.assertLogs("ovb_rc003", level="INFO") as logs:
+            host._NavigationDiagnostics(runtime._emit_diagnostic, runtime._diagnostic_enabled).error(
+                "worker_error", error, command="stop")
+        self.assertIn("cause_type=ArgumentError", logs.output[0])
         self.assertNotIn("PRIVATE", logs.output[0])
 
 

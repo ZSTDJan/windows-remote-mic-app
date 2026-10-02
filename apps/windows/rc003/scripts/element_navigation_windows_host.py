@@ -37,11 +37,12 @@ class _NavigationDiagnostics:
         "invalid_count", "unhittable_count", "error_code", "failure_count",
         "property_errors", "children_errors", "depth_limited",
         "key_seq", "vk", "scan_code", "flags", "callback_result", "collection_seq",
+        "requested", "returned", "last_error", "cause_code", "point_x", "point_y",
     })
     _FLAGS = frozenset({"active", "scanning", "used_cache", "injected", "retry",
                         "broad_container", "current", "intercepting"})
     _TAGS = frozenset({"action", "direction", "outcome", "reason", "command",
-                       "error_type", "hit_source", "edge", "control_type"})
+                       "error_type", "cause_type", "hit_source", "edge", "control_type"})
 
     def __init__(self, sink: Optional[Callable[..., None]] = None,
                  enabled: Optional[Callable[[], bool]] = None) -> None:
@@ -119,9 +120,13 @@ class _NavigationDiagnostics:
             pass
 
     def error(self, stage: str, exc: Exception, **fields: Any) -> None:
+        cause = exc.__cause__
         self.emit(stage, error_type=type(exc).__name__,
                   error_code=getattr(exc, "winerror", None)
-                  or getattr(exc, "hresult", None), **fields)
+                  or getattr(exc, "hresult", None),
+                  cause_type=type(cause).__name__ if cause is not None else None,
+                  cause_code=getattr(cause, "winerror", None)
+                  or getattr(cause, "hresult", None), **fields)
 
 
 class _CollectionDiagnostics:
@@ -480,7 +485,10 @@ def _run_windows(
     from PySide6.QtCore import Qt, QRect, QTimer
     from PySide6.QtGui import QColor, QFont, QGuiApplication, QPainter, QPen
     from PySide6.QtWidgets import QApplication, QWidget
-    user32 = ctypes.windll.user32
+    # DLLLoader caches both the DLL and its functions. Ordinary RC003 input
+    # declares a different INPUT class on that shared SendInput object, so
+    # the navigator must own its binding (also across navigator instances).
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
     kernel32 = ctypes.windll.kernel32
     gdi32 = ctypes.windll.gdi32
     oleacc = ctypes.WinDLL("oleacc")
@@ -1044,7 +1052,21 @@ def _run_windows(
                 dwExtraInfo=0,
             )
             array[index] = Input(type=0, union=InputUnion(mi=mouse_input))
-        return int(user32.SendInput(len(events), array, ctypes.sizeof(Input)))
+        started = time.perf_counter()
+        ctypes.set_last_error(0)
+        try:
+            sent = int(user32.SendInput(len(events), array, ctypes.sizeof(Input)))
+        except Exception as exc:
+            diagnostics.error("mouse_submission", exc, outcome="exception",
+                              requested=len(events),
+                              elapsed_ms=(time.perf_counter() - started) * 1000)
+            raise
+        last_error = int(ctypes.get_last_error())
+        diagnostics.emit("mouse_submission", requested=len(events), returned=sent,
+                         last_error=last_error,
+                         outcome="submitted" if sent == len(events) else "incomplete",
+                         elapsed_ms=(time.perf_counter() - started) * 1000)
+        return sent
 
     def mouse_button_is_down(button: str) -> bool:
         try:
@@ -2088,6 +2110,10 @@ def _run_windows(
                 if limit is not None:
                     pending = self._pending_counts.get(command, 0)
                     if pending >= limit:
+                        if command in {"activate", "context", "scroll_up", "scroll_down"}:
+                            diagnostics.emit("command_discarded", command=command,
+                                             scan_token=self._diagnostic_scan_token,
+                                             reason="pending_limit")
                         if command in self._REFRESH_INTERRUPT_COMMANDS:
                             self._refresh_interrupt_generation += 1
                             self._last_refresh_interrupt_at = time.perf_counter()
@@ -2297,10 +2323,13 @@ def _run_windows(
             allow_semantic_bypass: bool = True,
         ) -> bool:
             if target.control is None:
+                diagnostics.emit("point_probe", outcome="msaa_geometry", count=0)
                 return True
             target.click_point = None
             try:
                 if not self._update_live_target(target):
+                    diagnostics.emit("point_probe", outcome="invalid", count=0,
+                                     reason="live_target_invalid")
                     return False
                 live_rect = target.snapshot.rect
                 snapshots = [item.snapshot for item in self.targets]
@@ -2326,10 +2355,17 @@ def _run_windows(
                     if not snapshot.name
                 }
 
+                probe_count = 0
                 for point in available_target_probe_points(
                     target.snapshot, snapshots
                 ):
-                    control = auto.ControlFromPoint(point[0], point[1])
+                    probe_count += 1
+                    try:
+                        control = auto.ControlFromPoint(point[0], point[1])
+                    except Exception as exc:
+                        diagnostics.error("point_probe_error", exc, reason="hit_test_failed",
+                                          count=probe_count)
+                        continue
                     intercepted_by_finer_target = False
                     for _depth in range(40):
                         if control is None:
@@ -2358,6 +2394,8 @@ def _run_windows(
                             if intercepted_by_finer_target:
                                 break
                             target.click_point = point
+                            diagnostics.emit("point_probe", outcome="verified", count=probe_count,
+                                             point_x=point[0], point_y=point[1])
                             return True
                         if (
                             (runtime_id and runtime_id in finer_runtime_ids)
@@ -2373,13 +2411,23 @@ def _run_windows(
                             )
                         ):
                             intercepted_by_finer_target = True
-                        control = control.GetParentControl()
-            except Exception:
+                        try:
+                            control = control.GetParentControl()
+                        except Exception as exc:
+                            diagnostics.error("point_probe_error", exc,
+                                              reason="parent_query_failed", count=probe_count)
+                            break
+            except Exception as exc:
+                diagnostics.error("point_probe_error", exc, reason="target_query_failed")
                 return False
-            return bool(
+            bypass = bool(
                 allow_semantic_bypass
                 and semantic_action_can_bypass_point_hit(target.snapshot)
             )
+            diagnostics.emit("point_probe", outcome="semantic_bypass" if bypass else "missed",
+                             count=probe_count,
+                             reason="no_verified_hit" if probe_count else "no_available_point")
+            return bypass
 
         def _update_live_target(self, target: RuntimeTarget) -> bool:
             if target.control is None:
@@ -3120,6 +3168,8 @@ def _run_windows(
             )
 
         def _refresh_invalid_target(self, target: RuntimeTarget) -> None:
+            diagnostics.emit("target_skipped", reason="target_unavailable",
+                             scan_token=self._diagnostic_scan_token)
             self.invalid_targets.add(self._identity_token(target.snapshot))
             self.events.put(("target_skipped", target.snapshot))
             self._request_background_refresh()
@@ -3136,7 +3186,8 @@ def _run_windows(
                     action,
                     send_events=send_mouse_events,
                 )
-            except MouseInputBusyError:
+            except MouseInputBusyError as exc:
+                diagnostics.error("mouse_action", exc, action=operation, outcome="busy")
                 self.events.put(
                     (
                         "mouse_input_unavailable",
@@ -3149,7 +3200,9 @@ def _run_windows(
                     )
                 )
                 return False
-            except MouseInputCleanupIncompleteError:
+            except MouseInputCleanupIncompleteError as exc:
+                diagnostics.error("mouse_action", exc, action=operation,
+                                  outcome="cleanup_pending")
                 self.events.put(
                     (
                         "mouse_input_unavailable",
@@ -3162,7 +3215,8 @@ def _run_windows(
                     )
                 )
                 return False
-            except MouseInputDeliveryError:
+            except MouseInputDeliveryError as exc:
+                diagnostics.error("mouse_action", exc, action=operation, outcome="failed")
                 self.events.put(
                     (
                         "mouse_input_unavailable",
@@ -3175,6 +3229,7 @@ def _run_windows(
                     )
                 )
                 return False
+            diagnostics.emit("mouse_action", action=operation, outcome="submitted")
             return True
 
         def _activate(self) -> None:
@@ -3236,6 +3291,9 @@ def _run_windows(
                     if target.snapshot.has_action_pattern
                     else None
                 )
+                diagnostics.emit("semantic_action", action="activate",
+                                 hit_source=method,
+                                 outcome="returned" if method is not None else "unavailable")
                 if method is None:
                     self._refresh_invalid_target(target)
                     return
@@ -3412,12 +3470,20 @@ def _run_windows(
                             command in self._NAVIGATION_COMMANDS
                             and generation != current_generation
                         ):
-                            if command in {"scan", "move"}:
+                            if command in {"scan", "move", "activate", "context",
+                                           "scroll_up", "scroll_down"}:
                                 diagnostics.emit("command_discarded", command=command,
                                                  scan_token=int(value[1]) if command == "scan"
                                                  else self._diagnostic_scan_token,
                                                  reason="generation_changed")
                             continue
+                        if command in {"activate", "context", "scroll_up", "scroll_down"}:
+                            diagnostics.emit("command_started", command=command,
+                                             scan_token=self._diagnostic_scan_token,
+                                             selected=self.selected, count=len(self.targets),
+                                             outcome=("context_invalid" if not self.context_valid
+                                                      else "ready" if self.targets and self.selected >= 0
+                                                      else "no_selection"))
                         if command == "stop":
                             self._mouse_input_safety.release_pending(
                                 send_events=send_mouse_events
