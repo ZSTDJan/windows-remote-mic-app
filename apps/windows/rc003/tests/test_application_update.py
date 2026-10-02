@@ -510,6 +510,167 @@ class UpdateCheckTests(unittest.TestCase):
         self.assertEqual(caught.exception.code, "unsafe_url")
 
 
+class ReleasePaginationTests(unittest.TestCase):
+    def page_url(self, page, *, numeric=False):
+        path = "/repositories/12345/releases" if numeric else f"/repos/{application_update.REPOSITORY_SLUG}/releases"
+        return f"https://api.github.com{path}?per_page=30&page={page}"
+
+    def response(self, items, url, *, next_url=None):
+        response = FakeResponse(json.dumps(items).encode("utf-8"), url)
+        if next_url is not None:
+            response.headers["Link"] = f'<{next_url}>; rel="next"'
+        return response
+
+    def two_pages(self, first, second, *, numeric=False):
+        first_url = application_update.RELEASES_API_URL
+        second_url = self.page_url(2, numeric=numeric)
+        responses = [self.response(first, first_url, next_url=second_url),
+                     self.response(second, second_url)]
+        return MappingOpener(dict(zip((first_url, second_url), responses))), responses
+
+    def test_formal_release_hidden_behind_30_candidates_is_found(self):
+        candidates = [_release_payload(f"1.0.87-candidate.{i}")[0] for i in range(1, 31)]
+        formal, _ = _release_payload("1.0.86")
+        opener, responses = self.two_pages(candidates, [formal], numeric=True)
+        result = application_update.check_for_update("1.0.72", opener=opener)
+        self.assertEqual(result.release.version.text, "1.0.86")
+        self.assertEqual(result.outcome, application_update.UpdateCheckOutcome.UPDATE_AVAILABLE)
+        self.assertEqual(len(opener.calls), 2)
+        self.assertTrue(all(response.closed for response in responses))
+
+    def test_candidate_comparison_includes_the_later_page(self):
+        old, _ = _release_payload("1.0.87-candidate.1")
+        new, _ = _release_payload("1.0.87-candidate.2")
+        opener, _ = self.two_pages([old], [new])
+        result = application_update.check_for_update("1.0.87-candidate.1", opener=opener)
+        self.assertEqual(result.release.version.text, "1.0.87-candidate.2")
+
+    def test_incomplete_newest_release_on_later_page_is_not_hidden(self):
+        old, _ = _release_payload("1.0.85")
+        new, _ = _release_payload("1.0.86")
+        new["assets"] = new["assets"][:1]
+        opener, responses = self.two_pages([old], [new])
+        with self.assertRaises(application_update.ApplicationUpdateError) as caught:
+            application_update.check_for_update("1.0.85", opener=opener)
+        self.assertEqual(caught.exception.code, "invalid_release")
+        self.assertTrue(all(response.closed for response in responses))
+
+    def test_shifted_release_id_is_merged_but_distinct_duplicate_versions_are_rejected(self):
+        release, _ = _release_payload("1.0.86")
+        release["id"] = 123
+        for second_id in (123, 124):
+            with self.subTest(second_id=second_id):
+                shifted = dict(release, id=second_id, body="latest notes")
+                opener, _ = self.two_pages([release], [shifted])
+                if second_id == 123:
+                    result = application_update.check_for_update("1.0.86", opener=opener)
+                    self.assertEqual(result.outcome, application_update.UpdateCheckOutcome.CURRENT)
+                    self.assertEqual(result.release.notes, "latest notes")
+                else:
+                    with self.assertRaises(application_update.ApplicationUpdateError) as caught:
+                        application_update.check_for_update("1.0.86", opener=opener)
+                    self.assertEqual(caught.exception.code, "duplicate_release")
+
+    def test_unsafe_cross_repository_and_nonsequential_next_links_are_rejected(self):
+        unsafe_links = (
+            "https://example.invalid/releases?page=2",
+            "http://api.github.com/repos/ZSTDJan/windows-remote-mic-app/releases?page=2",
+            "https://api.github.com/repos/other/other/releases?page=2",
+            self.page_url(1), self.page_url(3),
+            self.page_url(2) + "&page=2", self.page_url(2) + "&token=secret",
+            self.page_url(2).replace("per_page=30", "per_page=100"),
+            self.page_url(2) + "#fragment",
+        )
+        for url in unsafe_links:
+            with self.subTest(url=url):
+                response = self.response([], application_update.RELEASES_API_URL, next_url=url)
+                opener = MappingOpener({application_update.RELEASES_API_URL: response})
+                with self.assertRaises(application_update.ApplicationUpdateError) as caught:
+                    application_update.check_for_update("1.0.86", opener=opener)
+                self.assertIn(caught.exception.code, ("invalid_response", "unsafe_url"))
+                self.assertEqual(len(opener.calls), 1)
+                self.assertTrue(response.closed)
+
+    def test_numeric_repository_identity_cannot_change_on_a_later_page(self):
+        first = self.response([], application_update.RELEASES_API_URL,
+                              next_url=self.page_url(2, numeric=True))
+        second_url = self.page_url(2, numeric=True)
+        second = self.response([], second_url, next_url=self.page_url(3, numeric=True).replace("12345", "999"))
+        opener = MappingOpener({application_update.RELEASES_API_URL: first, second_url: second})
+        with self.assertRaises(application_update.ApplicationUpdateError) as caught:
+            application_update.check_for_update("1.0.86", opener=opener)
+        self.assertEqual(caught.exception.code, "invalid_response")
+        self.assertTrue(first.closed and second.closed)
+
+    def test_page_limit_never_reports_a_truncated_list_as_current(self):
+        release, _ = _release_payload("1.0.86")
+        responses = {}
+        for page in range(1, application_update.MAX_RELEASE_PAGES + 1):
+            url = application_update.RELEASES_API_URL if page == 1 else self.page_url(page)
+            responses[url] = self.response([release] if page == 1 else [], url,
+                                           next_url=self.page_url(page + 1))
+        opener = MappingOpener(responses)
+        with self.assertRaises(application_update.ApplicationUpdateError) as caught:
+            application_update.check_for_update("1.0.86", opener=opener)
+        self.assertEqual(caught.exception.code, "invalid_response")
+        self.assertEqual(len(opener.calls), application_update.MAX_RELEASE_PAGES)
+        self.assertTrue(all(response.closed for response in responses.values()))
+
+    def test_all_pages_share_the_response_size_budget(self):
+        opener, responses = self.two_pages([], [])
+        responses[0]._data = b"[ ] "
+        responses[1]._data = b"[ ] "
+        with mock.patch.object(application_update, "MAX_RELEASES_RESPONSE_BYTES", 6):
+            with self.assertRaises(application_update.ApplicationUpdateError) as caught:
+                application_update.check_for_update("1.0.86", opener=opener)
+        self.assertEqual(caught.exception.code, "response_too_large")
+        self.assertTrue(all(response.closed for response in responses))
+
+    def test_later_requests_use_the_remaining_total_timeout(self):
+        release, _ = _release_payload("1.0.86")
+        opener, responses = self.two_pages([], [release])
+        clock = [0.0]
+        original = responses[0].read
+        def delayed_read(size):
+            clock[0] += 0.4
+            return original(size)
+        responses[0].read = delayed_read
+        with mock.patch.object(application_update.time, "monotonic", side_effect=lambda: clock[0]):
+            result = application_update.check_for_update("1.0.86", opener=opener, timeout=2.5)
+        self.assertEqual(result.outcome, application_update.UpdateCheckOutcome.CURRENT)
+        self.assertEqual(opener.calls[0][1], 2.5)
+        self.assertAlmostEqual(opener.calls[1][1], 1.7)
+
+    def test_total_timeout_during_read_is_reported_and_closed(self):
+        opener, responses = self.two_pages([], [])
+        clock = [0.0]
+        original = responses[0].read
+        def delayed_read(size):
+            clock[0] += 1.1
+            return original(size)
+        responses[0].read = delayed_read
+        with mock.patch.object(application_update.time, "monotonic", side_effect=lambda: clock[0]):
+            with self.assertRaises(application_update.ApplicationUpdateError) as caught:
+                application_update.check_for_update("1.0.86", opener=opener, timeout=1.0)
+        self.assertEqual(caught.exception.code, "timeout")
+        self.assertTrue(responses[0].closed)
+        self.assertEqual(len(opener.calls), 1)
+
+    def test_malformed_later_page_and_multiple_next_links_fail_closed(self):
+        opener, responses = self.two_pages([], [])
+        responses[1]._data = b"not JSON"
+        with self.assertRaises(application_update.ApplicationUpdateError) as caught:
+            application_update.check_for_update("1.0.86", opener=opener)
+        self.assertEqual(caught.exception.code, "invalid_response")
+        self.assertTrue(all(response.closed for response in responses))
+        for link in ("broken", f'<{self.page_url(2)}>; rel="next", <{self.page_url(2)}>; rel="next"'):
+            response = self.response([], application_update.RELEASES_API_URL)
+            response.headers['Link'] = link
+            with self.subTest(link=link), self.assertRaises(application_update.ApplicationUpdateError):
+                application_update.check_for_update("1.0.86", opener=MappingOpener({application_update.RELEASES_API_URL: response}))
+            self.assertTrue(response.closed)
+
+
 class PortableOnlyReleaseTests(unittest.TestCase):
     def _payload(self, version="0.2.0-candidate.31", *, chinese=True, bom=False):
         payload, _ = _release_payload(version, tag=f"v{version}")

@@ -1,4 +1,7 @@
 import json
+import ctypes
+import os
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -12,6 +15,109 @@ EXPORT_SCRIPT = TEMPLATE_ROOT / "tools" / "export-source.ps1"
 
 
 class ElementNavigationExportTests(unittest.TestCase):
+    def run_export(self, script, destination, *, force=False):
+        command = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
+                   "-File", str(script), "-Destination", str(destination)]
+        if force:
+            command.append("-Force")
+        return subprocess.run(command, capture_output=True, text=True, timeout=30)
+
+    def isolated_repository(self, root):
+        repository = root / "Source repository"
+        template = repository / "apps" / "windows" / "orthofocus"
+        (template / "tools").mkdir(parents=True)
+        for directory in ("scripts", "tests"):
+            (repository / "apps" / "windows" / "rc003" / directory).mkdir(parents=True)
+        script = template / "tools" / EXPORT_SCRIPT.name
+        shutil.copyfile(EXPORT_SCRIPT, script)
+        sentinel = repository / "keep-source.txt"
+        sentinel.write_text("source must remain", encoding="utf-8")
+        return repository, script, sentinel
+
+    def test_force_rejects_repository_ancestors_and_descendants_before_deleting(self):
+        for case in ("repository", "ancestor", "existing_child", "missing_child", "root"):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                repository, script, sentinel = self.isolated_repository(root)
+                destinations = {
+                    "repository": repository,
+                    "ancestor": root,
+                    "existing_child": repository / "apps",
+                    "missing_child": repository / "new" / "export",
+                    "root": Path(root.anchor),
+                }
+                destination = destinations[case]
+                # A missing regression guard must never be allowed to test a
+                # real drive root. Root rejection is exercised without Force.
+                result = self.run_export(script, destination, force=case != "root")
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("outside the repository", result.stderr)
+                self.assertEqual(sentinel.read_text(encoding="utf-8"), "source must remain")
+                self.assertTrue(script.exists())
+                if case == "missing_child":
+                    self.assertFalse(destination.exists())
+
+    def test_force_rejects_junction_destination_parent_and_nested_link(self):
+        for case in ("destination", "parent", "nested"):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                repository, script, sentinel = self.isolated_repository(root)
+                export = root / "export"
+                if case == "nested":
+                    export.mkdir()
+                    link = export / "source-link"
+                    destination = export
+                else:
+                    link = root / "source-link"
+                    destination = link if case == "destination" else link / "new-export"
+                subprocess.run(["cmd", "/c", "mklink", "/J", str(link), str(repository)],
+                               check=True, capture_output=True)
+                try:
+                    result = self.run_export(script, destination, force=True)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn("links", result.stderr)
+                    self.assertEqual(sentinel.read_text(encoding="utf-8"), "source must remain")
+                finally:
+                    if link.exists():
+                        os.rmdir(link)  # Remove only the junction, never its target.
+
+    def test_force_rejects_short_name_alias_of_the_repository(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            repository, script, sentinel = self.isolated_repository(Path(temporary))
+            get_short_path = ctypes.WinDLL("kernel32", use_last_error=True).GetShortPathNameW
+            get_short_path.argtypes = [ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_uint32]
+            get_short_path.restype = ctypes.c_uint32
+            buffer = ctypes.create_unicode_buffer(32768)
+            self.assertGreater(get_short_path(str(repository), buffer, len(buffer)), 0)
+            if buffer.value.casefold() == str(repository).casefold():
+                self.skipTest("This volume does not generate DOS short names")
+            result = self.run_export(script, buffer.value, force=True)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("outside the repository", result.stderr)
+            self.assertTrue(sentinel.exists())
+
+    def test_force_preserves_a_source_directory_reached_through_a_junction(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            repository, script, sentinel = self.isolated_repository(root)
+            external = root / "External source"
+            external.mkdir()
+            external_sentinel = external / "keep-source.txt"
+            external_sentinel.write_text("external source", encoding="utf-8")
+            source_link = repository / "apps" / "windows" / "rc003" / "scripts"
+            os.rmdir(source_link)  # Fixture creates this as an empty directory.
+            subprocess.run(["cmd", "/c", "mklink", "/J", str(source_link), str(external)],
+                           check=True, capture_output=True)
+            try:
+                result = self.run_export(script, external, force=True)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("outside the repository", result.stderr)
+                self.assertEqual(external_sentinel.read_text(encoding="utf-8"), "external source")
+                self.assertTrue(sentinel.exists())
+            finally:
+                if source_link.exists():
+                    os.rmdir(source_link)
+
     def test_template_has_an_independent_entry_and_exact_runtime_dependencies(self):
         pyproject = (TEMPLATE_ROOT / "pyproject.toml").read_text(encoding="utf-8")
         requirements = (TEMPLATE_ROOT / "requirements.txt").read_text(
@@ -86,6 +192,15 @@ class ElementNavigationExportTests(unittest.TestCase):
             self.assertTrue(
                 (destination / "docs" / "screenshots" / "orthogonal-territory-grid.png").is_file()
             )
+            marker = destination / "obsolete.txt"
+            marker.write_text("old export", encoding="utf-8")
+            refused = self.run_export(EXPORT_SCRIPT, destination)
+            self.assertNotEqual(refused.returncode, 0)
+            self.assertTrue(marker.exists())
+            replaced = self.run_export(EXPORT_SCRIPT, destination, force=True)
+            self.assertEqual(replaced.returncode, 0, replaced.stderr)
+            self.assertFalse(marker.exists())
+            self.assertTrue((destination / "SOURCE-SNAPSHOT.json").is_file())
 
 
 if __name__ == "__main__":

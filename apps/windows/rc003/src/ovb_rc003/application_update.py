@@ -17,6 +17,7 @@ import os
 import re
 import socket
 import tempfile
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -38,6 +39,7 @@ RELEASES_API_URL = (
 NETWORK_TIMEOUT_SECONDS = 10.0
 MAX_RELEASES_RESPONSE_BYTES = 2 * 1024 * 1024
 MAX_RELEASE_COUNT = 50
+MAX_RELEASE_PAGES = 10
 MAX_RELEASE_NOTES_CHARS = 12_000
 MAX_MANIFEST_BYTES = 64 * 1024
 MAX_PACKAGE_BYTES = 1024 * 1024 * 1024
@@ -548,6 +550,7 @@ def _read_limited_response(
     allowed_final_hosts: frozenset[str],
     maximum_bytes: int,
     cancel_event: Any = None,
+    deadline: Optional[float] = None,
 ) -> bytes:
     if _response_status(response) != 200:
         _raise("http_error", "GitHub 请求未成功，请稍后重试。")
@@ -560,10 +563,14 @@ def _read_limited_response(
     while True:
         if cancel_event is not None and cancel_event.is_set():
             raise ApplicationUpdateCancelled()
+        if deadline is not None and time.monotonic() >= deadline:
+            _raise("timeout", "GitHub 请求超时，请稍后重试。")
         try:
             chunk = response.read(min(DOWNLOAD_CHUNK_BYTES, maximum_bytes + 1))
         except Exception as exc:
             raise _translate_open_error(exc) from exc
+        if deadline is not None and time.monotonic() >= deadline:
+            _raise("timeout", "GitHub 请求超时，请稍后重试。")
         if not chunk:
             break
         received += len(chunk)
@@ -739,8 +746,10 @@ def _parse_release(
     )
 
 
-def _select_release(payload: Any, current: ApplicationVersion) -> ApplicationRelease:
-    if not isinstance(payload, list) or len(payload) > MAX_RELEASE_COUNT:
+def _select_release(
+    payload: Any, current: ApplicationVersion, *, maximum_count: int = MAX_RELEASE_COUNT
+) -> ApplicationRelease:
+    if not isinstance(payload, list) or len(payload) > maximum_count:
         _raise("invalid_response", "GitHub 返回了无法识别的发布列表。")
     releases: list[ApplicationRelease] = []
     recognized_invalid = False
@@ -779,6 +788,93 @@ def _select_release(payload: Any, current: ApplicationVersion) -> ApplicationRel
     return selected
 
 
+def _next_release_page(response: Any, page: int, repository_path: str) -> tuple[Optional[str], str]:
+    headers = getattr(response, "headers", {})
+    link = headers.get("Link", headers.get("link", ""))
+    if not link:
+        return None, repository_path
+    if not isinstance(link, str):
+        _raise("invalid_response", "GitHub 返回了无法识别的发布分页信息。")
+    next_urls = []
+    for entry in link.split(","):
+        match = re.fullmatch(r'\s*<([^<>]+)>\s*((?:;[^,]*)?)\s*', entry)
+        if match is None:
+            _raise("invalid_response", "GitHub 返回了无法识别的发布分页信息。")
+        relations = re.findall(r';\s*rel\s*=\s*(?:"([^"]+)"|([^;\s]+))', match[2])
+        if any("next" in (quoted or plain).split() for quoted, plain in relations):
+            next_urls.append(match[1])
+    if not next_urls:
+        return None, repository_path
+    if len(next_urls) != 1:
+        _raise("invalid_response", "GitHub 返回了重复的发布分页信息。")
+    url = next_urls[0]
+    _require_https_host(url, frozenset({"api.github.com"}))
+    parsed = urllib.parse.urlsplit(url)
+    # GitHub's Link header can use the repository's numeric API path. Accept
+    # that identity from the first trusted response, then keep it fixed.
+    if page == 1 and re.fullmatch(r"/repositories/[1-9][0-9]*/releases", parsed.path):
+        repository_path = parsed.path
+    parameters = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
+    if (
+        parsed.fragment
+        or parsed.path.casefold() != repository_path.casefold()
+        or set(parameters) - {"page", "per_page"}
+        or parameters.get("page") != [str(page + 1)]
+        or parameters.get("per_page", ["30"]) != ["30"]
+    ):
+        _raise("invalid_response", "GitHub 返回了不安全或不连续的发布分页信息。")
+    return url, repository_path
+
+
+def _fetch_release_list(*, opener: Callable[..., Any], timeout: float) -> list[Any]:
+    url: Optional[str] = RELEASES_API_URL
+    repository_path = urllib.parse.urlsplit(RELEASES_API_URL).path
+    deadline = time.monotonic() + timeout
+    received = 0
+    payload: list[Any] = []
+    identities: dict[int, tuple[int, int]] = {}
+    for page in range(1, MAX_RELEASE_PAGES + 1):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            _raise("timeout", "GitHub 请求超时，请稍后重试。")
+        _require_https_host(url, frozenset({"api.github.com"}))
+        response = _open_response(
+            _request(url, "application/vnd.github+json"),
+            opener=opener, timeout=timeout if page == 1 else min(timeout, remaining),
+        )
+        try:
+            raw = _read_limited_response(
+                response, request_url=url, allowed_final_hosts=frozenset({"api.github.com"}),
+                maximum_bytes=MAX_RELEASES_RESPONSE_BYTES - received, deadline=deadline,
+            )
+            received += len(raw)
+            try:
+                items = json.loads(raw.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise ApplicationUpdateError(
+                    "invalid_response", "GitHub 返回了无法识别的更新信息。"
+                ) from exc
+            if not isinstance(items, list) or len(items) > MAX_RELEASE_COUNT:
+                _raise("invalid_response", "GitHub 返回了无法识别的发布列表。")
+            # A release published while pages are being read can shift an
+            # existing item onto the next page. Only identical release IDs
+            # are merged; distinct releases sharing a version still fail.
+            for item in items:
+                identity = item.get("id") if isinstance(item, dict) else None
+                if isinstance(identity, int) and not isinstance(identity, bool) and identity > 0:
+                    if identity in identities and identities[identity][1] < page:
+                        payload[identities[identity][0]] = item
+                        continue
+                    identities[identity] = (len(payload), page)
+                payload.append(item)
+            url, repository_path = _next_release_page(response, page, repository_path)
+        finally:
+            _close_response(response)
+        if url is None:
+            return payload
+    _raise("invalid_response", "GitHub 发布列表超过检查上限，请打开发布页确认。")
+
+
 def check_for_update(
     current_version: str,
     *,
@@ -791,22 +887,8 @@ def check_for_update(
         raise ApplicationUpdateError(
             "invalid_local_version", "当前程序版本无法识别，不能安全比较更新。"
         ) from exc
-    _require_https_host(RELEASES_API_URL, frozenset({"api.github.com"}))
-    raw = _fetch_bytes(
-        RELEASES_API_URL,
-        accept="application/vnd.github+json",
-        allowed_final_hosts=frozenset({"api.github.com"}),
-        maximum_bytes=MAX_RELEASES_RESPONSE_BYTES,
-        opener=opener,
-        timeout=timeout,
-    )
-    try:
-        payload = json.loads(raw.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise ApplicationUpdateError(
-            "invalid_response", "GitHub 返回了无法识别的更新信息。"
-        ) from exc
-    release = _select_release(payload, current)
+    payload = _fetch_release_list(opener=opener, timeout=timeout)
+    release = _select_release(payload, current, maximum_count=MAX_RELEASE_COUNT * MAX_RELEASE_PAGES)
     if release.version > current:
         outcome = UpdateCheckOutcome.UPDATE_AVAILABLE
     elif release.version == current:

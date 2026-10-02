@@ -92,6 +92,8 @@ class EndpointPlaybackSink:
         self._output_channels = DEFAULT_CHANNELS
         self._previous_sample = 0
         self._have_previous_sample = False
+        self._resample_input_count = 0
+        self._resample_output_count = 0
         self._timing_lock = threading.Lock()
         self._open_elapsed_ms = 0.0
         self._last_write_elapsed_ms = 0.0
@@ -151,6 +153,8 @@ class EndpointPlaybackSink:
             ) from exc
         self._previous_sample = 0
         self._have_previous_sample = False
+        self._resample_input_count = 0
+        self._resample_output_count = 0
 
     @property
     def owns_stream(self) -> bool:
@@ -277,12 +281,34 @@ class EndpointPlaybackSink:
             self._previous_sample = values[-1]
             self._have_previous_sample = True
             array = np.asarray(output, dtype="int16").reshape(-1, 1)
-        elif self._output_sample_rate_hz != SOURCE_SAMPLE_RATE_HZ and len(array) > 1:
-            ratio = self._output_sample_rate_hz / SOURCE_SAMPLE_RATE_HZ
-            output_length = max(1, int(round(len(array) * ratio)))
-            source_positions = np.arange(len(array), dtype=np.float64)
-            target_positions = np.linspace(0, len(array) - 1, output_length)
-            resampled = np.interp(target_positions, source_positions, array[:, 0])
+        elif self._output_sample_rate_hz != SOURCE_SAMPLE_RATE_HZ and len(array) > 0:
+            # Keep a single sample clock across notifications, including rates
+            # such as 44.1 kHz where a 240-sample frame produces 661.5 samples.
+            rate = self._output_sample_rate_hz
+            input_start = self._resample_input_count
+            output_start = self._resample_output_count
+            input_end = input_start + len(array)
+            output_end = input_end * rate // SOURCE_SAMPLE_RATE_HZ
+            output_length = output_end - output_start
+            previous = self._previous_sample if self._have_previous_sample else int(array[0, 0])
+            source_values = np.concatenate(([previous], array[:, 0]))
+            self._previous_sample = int(array[-1, 0])
+            self._have_previous_sample = True
+            self._resample_input_count = input_end
+            self._resample_output_count = output_end
+            if output_length == 0:
+                return
+            # Causal interpolation uses the previous input sample at position
+            # -1. Integer clock arithmetic keeps the local phase small even
+            # after a long session; chunk boundaries never reset that phase.
+            phase = (output_start + 1) * SOURCE_SAMPLE_RATE_HZ - input_start * rate
+            positions = phase + np.arange(output_length, dtype=np.int64) * SOURCE_SAMPLE_RATE_HZ - rate
+            left, fraction = np.divmod(positions, rate)
+            left_values = source_values[left + 1]
+            right_values = source_values[np.minimum(left + 2, len(array))]
+            # Divide only the final integer weighted value. This also keeps
+            # half-sample rounding identical for whole and split buffers.
+            resampled = (left_values * rate + (right_values - left_values) * fraction) / rate
             array = np.rint(resampled).clip(-32768, 32767).astype("int16").reshape(-1, 1)
         if self._output_channels > 1:
             array = np.repeat(array, self._output_channels, axis=1)

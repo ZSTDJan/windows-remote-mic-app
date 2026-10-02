@@ -123,12 +123,11 @@ def export_logs(destination: Path, *, root: Path | None = None,
             stable = stable and not any(r.get('changed_during_read') for r in records)
             if stable:
                 break
-        if not captured:
-            outcome = 'read_failed' if any(r['status'] == 'unreadable' for r in records) else 'no_logs'
-            return ExportResult(outcome)
         incomplete = not all((application_flushed, diagnostic_flushed, report_flushed, stable)) or any(
             r['status'] == 'unreadable' or r.get('truncated') or r.get('changed_during_read')
             for r in records)
+        if not any(content for _, content in captured):
+            return ExportResult('read_failed' if incomplete else 'no_logs')
         manifest = dict(schema_version=1, app_version=__version__,
                         incomplete=incomplete, snapshot_stable=stable, snapshot_attempts=attempt,
                         fault_report_flushed=report_flushed,

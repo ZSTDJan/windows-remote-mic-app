@@ -75,6 +75,67 @@ class LogExportTests(unittest.TestCase):
             self.assertNotIn(b'private path', manifest)
         self.assertIn('部分日志', log_export.describe_result(result))
 
+    def test_only_empty_logs_do_not_report_success_or_replace_an_existing_zip(self):
+        names = ('app.log', 'diagnostic-trace.jsonl', 'hid-helper.log')
+        for name in names:
+            self.write_log(name, b'')
+        self.destination.write_bytes(b'previous archive')
+        result = log_export.export_logs(self.destination, root=self.root)
+        self.assertEqual(result.outcome, 'no_logs')
+        self.assertEqual(result.file_count, 0)
+        self.assertIn('暂无可导出的日志', log_export.describe_result(result))
+        self.assertEqual(self.destination.read_bytes(), b'previous archive')
+        self.assertTrue(all((self.logs / name).read_bytes() == b'' for name in names))
+        self.assertEqual(list(self.root.glob('.remote-mic-logs-*')), [])
+
+    def test_empty_logs_beside_real_content_keep_the_zip_manifest_consistent(self):
+        self.write_log(content=b'')
+        self.write_log('hid-helper.log', b'actual event\n')
+        result = log_export.export_logs(self.destination, root=self.root)
+        self.assertEqual(result.outcome, 'exported')
+        self.assertEqual(result.file_count, 2)
+        self.assertFalse(result.incomplete)
+        with zipfile.ZipFile(self.destination) as archive:
+            manifest = json.loads(archive.read('export-info.json'))
+            included = {row['name'] for row in manifest['files'] if row['status'] == 'included'}
+            self.assertEqual(included, {'app.log', 'hid-helper.log'})
+            self.assertEqual(set(archive.namelist()), included | {'export-info.json'})
+            self.assertEqual(archive.read('app.log'), b'')
+            self.assertEqual(archive.read('hid-helper.log'), b'actual event\n')
+            self.assertEqual(manifest['schema_version'], 1)
+
+    def test_empty_logs_do_not_hide_a_read_failure(self):
+        self.write_log(content=b'')
+        original = log_export._snapshot
+        def read(path):
+            if path.name == 'hid-helper.log':
+                raise PermissionError('cannot read')
+            return original(path)
+        with mock.patch.object(log_export, '_snapshot', side_effect=read):
+            result = log_export.export_logs(self.destination, root=self.root)
+        self.assertEqual(result.outcome, 'read_failed')
+        self.assertFalse(self.destination.exists())
+
+    def test_empty_collection_with_a_flush_failure_is_not_reported_as_no_logs(self):
+        self.write_log(content=b'')
+        self.destination.write_bytes(b'previous archive')
+        for module, function in (
+            (log_export.logging_setup, 'flush_application_logs'),
+            (log_export.diagnostic_trace, 'flush_diagnostic_logs'),
+            (log_export.diagnostic_trace, 'flush_fault_report'),
+        ):
+            with self.subTest(function=function), mock.patch.object(module, function, return_value=False):
+                result = log_export.export_logs(self.destination, root=self.root)
+                self.assertEqual(result.outcome, 'read_failed')
+                self.assertEqual(self.destination.read_bytes(), b'previous archive')
+
+    def test_truncation_that_retains_no_complete_line_is_reported_as_read_failure(self):
+        self.write_log(content=b'one line longer than the export cap')
+        with mock.patch.object(log_export, 'MAX_FILE_BYTES', 8):
+            result = log_export.export_logs(self.destination, root=self.root)
+        self.assertEqual(result.outcome, 'read_failed')
+        self.assertFalse(self.destination.exists())
+
     def test_large_text_file_retains_recent_complete_lines_and_marks_truncation(self):
         self.write_log(content=b'old line\nnew line\nlast line\n')
         with mock.patch.object(log_export, 'MAX_FILE_BYTES', 16):

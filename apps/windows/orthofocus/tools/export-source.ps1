@@ -17,19 +17,115 @@ $destinationPath = if ([System.IO.Path]::IsPathRooted($Destination)) {
 } else {
     [System.IO.Path]::GetFullPath((Join-Path (Get-Location) $Destination))
 }
-$protectedPaths = @(
-    [System.IO.Path]::GetFullPath($templateRoot),
-    [System.IO.Path]::GetFullPath($repositoryRoot),
-    [System.IO.Path]::GetPathRoot($destinationPath)
-)
-if ($protectedPaths -contains $destinationPath) {
-    throw "Destination must be a dedicated export directory: $destinationPath"
+
+# GetFullPath alone does not expand short names or resolve directory junctions.
+# Resolve the existing ancestor through Windows before comparing path boundaries.
+if (-not ("OrthoFocus.ExportPathNative" -as [type])) {
+    Add-Type -TypeDefinition @'
+using System;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+using System.Text;
+using Microsoft.Win32.SafeHandles;
+namespace OrthoFocus {
+    public static class ExportPathNative {
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern SafeFileHandle CreateFileW(string path, uint access,
+            uint share, IntPtr security, uint creation, uint flags, IntPtr template);
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern uint GetFinalPathNameByHandleW(SafeFileHandle handle,
+            StringBuilder path, uint size, uint flags);
+        public static string Resolve(string path) {
+            using (var handle = CreateFileW(path, 0, 7, IntPtr.Zero, 3,
+                    0x02000000, IntPtr.Zero)) {
+                if (handle.IsInvalid) throw new Win32Exception(Marshal.GetLastWin32Error());
+                var buffer = new StringBuilder(512);
+                uint length = GetFinalPathNameByHandleW(handle, buffer, (uint)buffer.Capacity, 0);
+                if (length >= buffer.Capacity) {
+                    buffer = new StringBuilder(checked((int)length + 1));
+                    length = GetFinalPathNameByHandleW(handle, buffer, (uint)buffer.Capacity, 0);
+                }
+                if (length == 0 || length >= buffer.Capacity)
+                    throw new Win32Exception(Marshal.GetLastWin32Error());
+                string result = buffer.ToString();
+                if (result.StartsWith(@"\\?\UNC\", StringComparison.OrdinalIgnoreCase))
+                    return @"\\" + result.Substring(8);
+                if (result.StartsWith(@"\\?\", StringComparison.Ordinal)) return result.Substring(4);
+                return result;
+            }
+        }
+    }
+}
+'@
 }
 
+function Get-CanonicalExportPath {
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    $existing = [System.IO.Path]::GetFullPath($Path)
+    $suffix = New-Object 'System.Collections.Generic.List[string]'
+    while (-not (Test-Path -LiteralPath $existing)) {
+        $suffix.Insert(0, [System.IO.Path]::GetFileName($existing))
+        $parent = [System.IO.Path]::GetDirectoryName($existing)
+        if (-not $parent -or $parent -eq $existing) {
+            throw "Cannot resolve export directory: $Path"
+        }
+        $existing = $parent
+    }
+    $resolved = [OrthoFocus.ExportPathNative]::Resolve($existing)
+    foreach ($name in $suffix) {
+        $resolved = [System.IO.Path]::Combine($resolved, $name)
+    }
+    return $resolved.TrimEnd([char[]]"\/")
+}
+
+function Assert-ExportDestination {
+    # Reject reparse points in the destination chain instead of deleting through
+    # a link whose target can be unrelated to the requested export directory.
+    $ancestor = $destinationPath
+    while ($ancestor) {
+        if (Test-Path -LiteralPath $ancestor) {
+            $item = Get-Item -LiteralPath $ancestor -Force
+            if ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
+                throw "Destination must not use directory links: $destinationPath"
+            }
+        }
+        $ancestor = [System.IO.Path]::GetDirectoryName($ancestor)
+    }
+    $destination = Get-CanonicalExportPath $destinationPath
+    $root = ([System.IO.Path]::GetPathRoot($destination)).TrimEnd([char[]]"\/")
+    $comparison = [System.StringComparison]::OrdinalIgnoreCase
+    if ($destination.Equals($root, $comparison)) {
+        throw "Destination must be outside the repository and its ancestors: $destinationPath"
+    }
+    foreach ($protected in @($repositoryRoot, $templateRoot, $sourceRoot, $testRoot)) {
+        $source = Get-CanonicalExportPath ([string]$protected)
+        if ($destination.Equals($source, $comparison) -or
+            $destination.StartsWith($source + "\", $comparison) -or
+            $source.StartsWith($destination + "\", $comparison)) {
+            throw "Destination must be outside the repository and its ancestors: $destinationPath"
+        }
+    }
+    if ($Force -and (Test-Path -LiteralPath $destinationPath -PathType Container)) {
+        $pending = New-Object 'System.Collections.Generic.Stack[string]'
+        $pending.Push($destinationPath)
+        while ($pending.Count -gt 0) {
+            foreach ($child in (Get-ChildItem -LiteralPath $pending.Pop() -Force)) {
+                if ($child.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
+                    throw "Existing export must not contain links: $destinationPath"
+                }
+                if ($child.PSIsContainer) { $pending.Push($child.FullName) }
+            }
+        }
+    }
+}
+
+Assert-ExportDestination
 if (Test-Path -LiteralPath $destinationPath) {
     if (-not $Force) {
         throw "Destination already exists: $destinationPath"
     }
+    Assert-ExportDestination
     Remove-Item -LiteralPath $destinationPath -Recurse -Force
 }
 

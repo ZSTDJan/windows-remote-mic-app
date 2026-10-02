@@ -11,6 +11,8 @@ import time
 import unittest
 from unittest import mock
 
+import numpy as np
+
 from ovb_rc003 import audio_output, audio_playback
 from ovb_rc003.audio_playback import EndpointPlaybackSink
 
@@ -194,6 +196,72 @@ class SelectOutputSampleRateTests(unittest.TestCase):
         )
         with self.assertRaises(audio_output.AudioOutputUnavailableError):
             sink._resolve_device_index(sd)
+
+
+class ContinuousResamplingTests(unittest.TestCase):
+    def sink(self, rate, channels=1):
+        writes = []
+        sink = EndpointPlaybackSink("CABLE Input")
+        sink._output_sample_rate_hz = rate
+        sink._output_channels = channels
+        sink._stream = mock.Mock()
+        sink._stream.write.side_effect = lambda array: writes.append(array.copy()) or False
+        return sink, writes
+
+    def test_real_240_sample_frames_do_not_accumulate_44100_rounding_error(self):
+        sink, writes = self.sink(44100)
+        for _ in range(1000):
+            sink.write([300] * 240)
+        self.assertEqual(sum(len(array) for array in writes), 661500)
+        self.assertEqual([len(array) for array in writes[:4]], [661, 662, 661, 662])
+        self.assertTrue(all(np.all(array == 300) for array in writes))
+
+    def test_pcm_is_independent_of_notification_boundaries(self):
+        samples = np.random.default_rng(42).integers(-32768, 32768, 1001).tolist()
+        for rate in (44100, 22050, 8000, 96000):
+            with self.subTest(rate=rate):
+                whole, whole_writes = self.sink(rate, channels=2)
+                split, split_writes = self.sink(rate, channels=2)
+                whole.write(samples)
+                start = 0
+                for size in (1, 1, 239, 240, 3, 517):
+                    split.write(samples[start:start + size])
+                    start += size
+                np.testing.assert_array_equal(np.concatenate(split_writes), whole_writes[0])
+                self.assertEqual(len(whole_writes[0]), len(samples) * rate // 16000)
+                np.testing.assert_array_equal(whole_writes[0][:, 0], whole_writes[0][:, 1])
+
+    def test_44100_interpolates_across_the_previous_notification(self):
+        sink, writes = self.sink(44100)
+        sink.write([0, 300])
+        sink.write([600])
+        # At output time j*16000/44100-1, the ramp has value 300*t.
+        np.testing.assert_array_equal(
+            np.concatenate(writes)[:, 0], [0, 0, 27, 135, 244, 353, 462, 571]
+        )
+
+    def test_downsampling_single_sample_frames_waits_for_output_without_empty_write(self):
+        sink, writes = self.sink(8000)
+        sink.write([100])
+        self.assertEqual(writes, [])
+        self.assertEqual(sink.timing_snapshot().write_count, 0)
+        sink.write([200])
+        np.testing.assert_array_equal(writes[0][:, 0], [200])
+
+    def test_reopening_resets_the_resampler_clock_and_previous_sample(self):
+        sink, writes = self.sink(44100)
+        sink.write([300])
+        sink.close()
+        sd = FakeSoundDevice([_device("CABLE Input", 1, 0, 44100)], [{"name": "WASAPI"}])
+        stream = mock.Mock()
+        stream.write.side_effect = lambda array: writes.append(array.copy()) or False
+        sd.OutputStream = mock.Mock(return_value=stream)
+        with mock.patch.dict("sys.modules", {"sounddevice": sd}):
+            sink.open()
+            sink.write([900])
+        self.assertEqual(len(writes[-1]), 2)
+        self.assertTrue(np.all(writes[-1] == 900))
+        sink.close()
 
 
 class PlaybackPreflightTests(unittest.TestCase):
