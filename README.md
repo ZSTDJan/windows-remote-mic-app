@@ -12,11 +12,11 @@
 
 ## 下载与版本
 
-**[下载正式版 1.0.86](https://github.com/ZSTDJan/windows-remote-mic-app/releases/download/v1.0.86/RemoteMicRC003-1.0.86-portable-unsigned.zip)** · [版本说明](https://github.com/ZSTDJan/windows-remote-mic-app/releases/tag/v1.0.86) · [SHA256SUMS.txt](https://github.com/ZSTDJan/windows-remote-mic-app/releases/download/v1.0.86/SHA256SUMS.txt)
+**[下载正式版 1.0.87](https://github.com/ZSTDJan/windows-remote-mic-app/releases/download/v1.0.87/RemoteMicRC003-1.0.87-portable-unsigned.zip)** · [版本说明](https://github.com/ZSTDJan/windows-remote-mic-app/releases/tag/v1.0.87) · [SHA256SUMS.txt](https://github.com/ZSTDJan/windows-remote-mic-app/releases/download/v1.0.87/SHA256SUMS.txt)
 
-当前正式版为 **1.0.86**，支持小米蓝牙语音遥控器 2 Pro 和图示谷歌 Chromecast 遥控器。适配豆包输入法 0.9.1.22，包含 B 款微信语音久置修复、连接兼容、Chatterfly 及快捷键和日志改进。具体功能与界面以下载的版本为准。
+当前正式版为 **1.0.87**，支持小米蓝牙语音遥控器 2 Pro 和图示谷歌 Chromecast 遥控器。修复元素导航确认及右键的输入冲突，补齐点击诊断，并改进音频采样、更新检查和日志导出；保留豆包输入法 0.9.1.22、B 款微信、连接兼容、Chatterfly 及快捷键支持。具体功能与界面以下载的版本为准。
 
-版本沿用同一条递增更新主线：`1.0.72 → 1.0.86`；测试版序号转正后继续使用相同数字，不另设产品发布分支。旧正式版和测试版保留在 [历史版本](https://github.com/ZSTDJan/windows-remote-mic-app/releases)。本机检查已完成；实体遥控器、文字上屏、久置／休眠恢复和异机仍按各自项目实测，原反馈电脑已按用户要求取消验收。
+版本沿用同一条递增更新主线：`1.0.72 → 1.0.86 → 1.0.87`；测试版序号转正后继续使用相同数字，不另设产品发布分支。旧正式版和测试版保留在 [历史版本](https://github.com/ZSTDJan/windows-remote-mic-app/releases)。实体遥控器、宿主点击、44.1k 音频、文字上屏、久置／休眠恢复和异机仍按各自项目实测，原微信久置反馈电脑已按用户要求取消验收。
 
 完整解压 ZIP 后运行其中的 `无线麦 win版 <版本号>.exe`，不要只取出 EXE。程序未签名，Windows 可能弹出安全提示；请从本仓库下载。
 
