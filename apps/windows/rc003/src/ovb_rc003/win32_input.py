@@ -203,6 +203,28 @@ _PHYSICAL_SCAN_CODES = {
     win32_keys.VK_CODES["rwin"]: (0x5C, True),
 }
 
+# Consumer-control keys (volume / media transport / browser forward-back)
+# have no conventional physical scan code on real hardware, so they are
+# intentionally delivered as wVk-based events. A scan-code fallback for these
+# would be unreliable, so the else-branch of ``_build_input_array`` keeps
+# them on the wVk path.
+_MULTIMEDIA_VK_CODES = frozenset(
+    {
+        win32_keys.VK_CODES[name]
+        for name in (
+            "volume_mute",
+            "volume_down",
+            "volume_up",
+            "media_next",
+            "media_previous",
+            "media_stop",
+            "media_play_pause",
+            "browser_back",
+            "browser_forward",
+        )
+    }
+)
+
 RawSender = Callable[[Sequence[Tuple[int, bool]]], int]
 MouseEvent = Tuple[int, int]
 MouseSender = Callable[[Sequence[MouseEvent]], int]
@@ -266,6 +288,27 @@ def _require_windows() -> None:
         )
 
 
+def _virtual_key_to_scan_code(vk: int) -> int:
+    """Translate a virtual key to its physical scan code via the live
+    ``MapVirtualKeyW`` when available.
+
+    Returns 0 when the translation is unavailable (a non-Windows host, an
+    absent/mocked ``user32``, or a key with no scan code) so callers can fall
+    back to a wVk-based event. Mirrors the mapping setup used by
+    ``_real_keybd_event``.
+    """
+    try:
+        user32 = ctypes.windll.user32  # type: ignore[attr-defined]
+    except Exception:
+        return 0
+    try:
+        user32.MapVirtualKeyW.argtypes = (wintypes.UINT, wintypes.UINT)
+        user32.MapVirtualKeyW.restype = wintypes.UINT
+        return int(user32.MapVirtualKeyW(vk, 0))
+    except Exception:
+        return 0
+
+
 def _build_input_array(events: Sequence[Tuple[int, bool]]):
     array = (INPUT * len(events))()
     for index, (vk, key_up) in enumerate(events):
@@ -285,7 +328,9 @@ def _build_input_array(events: Sequence[Tuple[int, bool]]):
                 time=0,
                 dwExtraInfo=0,
             )
-        else:
+        elif vk in _MULTIMEDIA_VK_CODES:
+            # Consumer-control keys stay wVk-based; they have no reliable
+            # physical scan code (see _MULTIMEDIA_VK_CODES above).
             keybd_input = KEYBDINPUT(
                 wVk=vk,
                 wScan=0,
@@ -293,6 +338,28 @@ def _build_input_array(events: Sequence[Tuple[int, bool]]):
                 time=0,
                 dwExtraInfo=0,
             )
+        else:
+            # Fill the physical scan code for ordinary keys so injected
+            # events carry event.code to Chromium/Electron apps instead of an
+            # empty string (which happens when only wVk is populated). Fall
+            # back to a wVk event when no scan code can be resolved.
+            scan_code = _virtual_key_to_scan_code(vk)
+            if scan_code:
+                keybd_input = KEYBDINPUT(
+                    wVk=0,
+                    wScan=scan_code,
+                    dwFlags=flags | _KEYEVENTF_SCANCODE,
+                    time=0,
+                    dwExtraInfo=0,
+                )
+            else:
+                keybd_input = KEYBDINPUT(
+                    wVk=vk,
+                    wScan=0,
+                    dwFlags=flags,
+                    time=0,
+                    dwExtraInfo=0,
+                )
         array[index] = INPUT(type=_INPUT_KEYBOARD, union=_INPUT_UNION(ki=keybd_input))
     return array, INPUT
 

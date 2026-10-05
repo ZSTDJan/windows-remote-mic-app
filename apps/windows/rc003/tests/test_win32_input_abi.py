@@ -26,29 +26,34 @@ from ovb_rc003 import win32_input
 class InputStructShapeTests(unittest.TestCase):
     def test_sendinput_marks_all_three_builders_without_changing_input_payload(self):
         user32 = mock.Mock()
+        # _build_input_array now resolves ordinary keys' scan codes through
+        # ctypes.windll.user32.MapVirtualKeyW; pin it to 0 here so the builder
+        # falls back to its wVk path and the before/after payload comparison
+        # stays deterministic on every host.
+        user32.MapVirtualKeyW.return_value = 0
         for builder, events, union_name in (
             (win32_input._build_input_array, [(0x4e, False), (0x4e, True)], "ki"),
             (win32_input._build_virtual_key_input_array, [(0xa2, False), (0x5b, True)], "ki"),
             (win32_input._build_mouse_input_array, [(win32_input._MOUSEEVENTF_XDOWN, win32_input._XBUTTON2)], "mi"),
         ):
             with self.subTest(builder=builder.__name__):
-                expected, input_type = builder(events)
-                def send(count, actual, size):
-                    self.assertEqual(size, ctypes.sizeof(input_type))
-                    self.assertEqual(count, len(events))
-                    for index in range(count):
-                        item = getattr(actual[index].union, union_name)
-                        self.assertTrue(win32_input.is_own_input_event(item.dwExtraInfo))
-                        self.assertFalse(win32_input.voice_key_physicalizer_windows._is_voice_event_marker(item.dwExtraInfo))
-                        getattr(expected[index].union, union_name).dwExtraInfo = item.dwExtraInfo
-                        self.assertEqual(bytes(actual[index]), bytes(expected[index]))
-                    return count
-                user32.SendInput.side_effect = send
                 with mock.patch.object(win32_input, "_require_live_input_allowed"), \
                      mock.patch.object(win32_input, "_require_windows"), \
                      mock.patch.object(win32_input.ctypes, "windll", mock.Mock(user32=user32), create=True), \
                      mock.patch.object(win32_input.ctypes, "set_last_error", create=True), \
                      mock.patch.object(win32_input.ctypes, "get_last_error", return_value=0, create=True):
+                    expected, input_type = builder(events)
+                    def send(count, actual, size):
+                        self.assertEqual(size, ctypes.sizeof(input_type))
+                        self.assertEqual(count, len(events))
+                        for index in range(count):
+                            item = getattr(actual[index].union, union_name)
+                            self.assertTrue(win32_input.is_own_input_event(item.dwExtraInfo))
+                            self.assertFalse(win32_input.voice_key_physicalizer_windows._is_voice_event_marker(item.dwExtraInfo))
+                            getattr(expected[index].union, union_name).dwExtraInfo = item.dwExtraInfo
+                            self.assertEqual(bytes(actual[index]), bytes(expected[index]))
+                        return count
+                    user32.SendInput.side_effect = send
                     self.assertEqual(win32_input._real_send_input_batch_with_builder(events, builder), len(events))
 
     def test_sizeof_input_matches_the_documented_x64_win32_abi(self):
@@ -206,6 +211,57 @@ class InputStructShapeTests(unittest.TestCase):
                     if key_up:
                         expected_flags |= win32_input._KEYEVENTF_KEYUP
                     self.assertEqual(keyboard.dwFlags, expected_flags)
+
+    def test_ordinary_keys_get_a_physical_scan_code(self):
+        # MapVirtualKeyW resolves 'A' (0x41) -> 0x1E; the builder must emit
+        # that scan code with the SCANCODE flag so Chromium/Electron receive
+        # a real event.code instead of an empty string.
+        user32 = mock.Mock()
+        user32.MapVirtualKeyW.return_value = 0x1E
+        with mock.patch.object(
+            win32_input.ctypes,
+            "windll",
+            mock.Mock(user32=user32),
+            create=True,
+        ):
+            array, _ = win32_input._build_input_array([(0x41, False)])
+        keybd = array[0].union.ki
+        self.assertEqual(keybd.wVk, 0)
+        self.assertEqual(keybd.wScan, 0x1E)
+        self.assertEqual(keybd.dwFlags, win32_input._KEYEVENTF_SCANCODE)
+
+    def test_media_keys_stay_on_the_virtual_key_path(self):
+        # Consumer-control keys have no reliable physical scan code; they
+        # must keep their wVk-based event even when a mapping is available.
+        user32 = mock.Mock()
+        user32.MapVirtualKeyW.return_value = 0x30
+        vk = win32_input.win32_keys.VK_CODES["volume_up"]
+        with mock.patch.object(
+            win32_input.ctypes,
+            "windll",
+            mock.Mock(user32=user32),
+            create=True,
+        ):
+            array, _ = win32_input._build_input_array([(vk, False)])
+        keybd = array[0].union.ki
+        self.assertEqual((keybd.wVk, keybd.wScan), (vk, 0))
+        self.assertFalse(keybd.dwFlags & win32_input._KEYEVENTF_SCANCODE)
+
+    def test_scan_code_fallback_keeps_wvk_when_mapping_returns_zero(self):
+        # A key with no resolvable scan code must fall back to a wVk-based
+        # event rather than raising.
+        user32 = mock.Mock()
+        user32.MapVirtualKeyW.return_value = 0
+        with mock.patch.object(
+            win32_input.ctypes,
+            "windll",
+            mock.Mock(user32=user32),
+            create=True,
+        ):
+            array, _ = win32_input._build_input_array([(0x41, False)])
+        keybd = array[0].union.ki
+        self.assertEqual((keybd.wVk, keybd.wScan), (0x41, 0))
+        self.assertFalse(keybd.dwFlags & win32_input._KEYEVENTF_SCANCODE)
 
 if __name__ == "__main__":
     unittest.main()
