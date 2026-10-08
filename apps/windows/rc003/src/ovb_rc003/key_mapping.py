@@ -32,6 +32,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
+import os
+from pathlib import PureWindowsPath
 from typing import Dict, Optional, Tuple
 
 
@@ -39,6 +41,7 @@ class ActionKind(str, Enum):
     DISABLED = "disabled"
     KEY_COMBO = "key_combo"
     QUICKER_URI = "quicker_uri"
+    CUSTOM_PROGRAM = "custom_program"
     ESCAPE = "escape"
     RETURN = "return"
     ARROW_UP = "arrow_up"
@@ -193,6 +196,7 @@ LEGACY_SEMANTIC_ACTIONS = {
 
 APPLICATION_ACTIONS = frozenset(
     {
+        ActionKind.CUSTOM_PROGRAM,
         ActionKind.OPEN_REMOTE_MIC,
         ActionKind.OPEN_CODEX,
         ActionKind.OPEN_CLAUDE,
@@ -294,11 +298,31 @@ def voice_hotkey_for_trigger_mode(trigger_mode: VoiceTriggerMode) -> str:
     return VOICE_HOTKEY_PRESETS[trigger_mode]
 
 
+def normalize_custom_program_path(path: str) -> str:
+    """Validate a user-selected Windows executable or shortcut path."""
+
+    if not isinstance(path, str):
+        raise TypeError("custom program path must be text")
+    normalized = os.path.expandvars(path.strip().strip('"'))
+    if not normalized:
+        raise ValueError("custom program path must not be empty")
+    if len(normalized) > 4096 or any(
+        character in normalized for character in ("\x00", "\r", "\n")
+    ):
+        raise ValueError("custom program path is invalid")
+    if not PureWindowsPath(normalized).is_absolute():
+        raise ValueError("custom program path must be absolute")
+    if PureWindowsPath(normalized).suffix.casefold() not in {".exe", ".lnk"}:
+        raise ValueError("custom program path must point to an .exe or .lnk")
+    return normalized
+
+
 @dataclass(frozen=True)
 class ButtonAction:
     kind: ActionKind
     keys: Tuple[str, ...] = field(default_factory=tuple)
     uri: str = ""
+    path: str = ""
 
     def to_dict(self) -> dict:
         if self.kind in (ActionKind.MOUSE_WHEEL_UP, ActionKind.MOUSE_WHEEL_DOWN):
@@ -307,6 +331,8 @@ class ButtonAction:
         data = {"kind": self.kind.value, "keys": list(self.keys)}
         if self.kind == ActionKind.QUICKER_URI:
             data["uri"] = normalize_quicker_uri(self.uri)
+        elif self.kind == ActionKind.CUSTOM_PROGRAM:
+            data["path"] = normalize_custom_program_path(self.path)
         return data
 
     @classmethod
@@ -324,6 +350,10 @@ class ButtonAction:
         if not isinstance(raw_uri, str):
             raise ValueError("button action URI must be text")
         uri = raw_uri.strip()
+        raw_path = data.get("path", "")
+        if not isinstance(raw_path, str):
+            raise ValueError("button action program path must be text")
+        path = raw_path.strip()
         if kind == ActionKind.KEY_COMBO and not keys:
             raise ValueError("key_combo action must contain at least one key")
         if kind != ActionKind.KEY_COMBO and keys:
@@ -332,10 +362,14 @@ class ButtonAction:
             uri = normalize_quicker_uri(uri)
         elif uri:
             raise ValueError("non-URI action must not contain a URI")
+        if kind == ActionKind.CUSTOM_PROGRAM:
+            path = normalize_custom_program_path(path)
+        elif path:
+            raise ValueError("non-program action must not contain a program path")
         if kind in (ActionKind.MOUSE_WHEEL_UP, ActionKind.MOUSE_WHEEL_DOWN):
             page_key = "pageup" if kind == ActionKind.MOUSE_WHEEL_UP else "pagedown"
             return cls(kind=ActionKind.KEY_COMBO, keys=(page_key,))
-        return cls(kind=kind, keys=keys, uri=uri)
+        return cls(kind=kind, keys=keys, uri=uri, path=path)
 
 
 def button_action_for(
