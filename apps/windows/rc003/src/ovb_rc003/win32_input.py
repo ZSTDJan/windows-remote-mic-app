@@ -179,10 +179,10 @@ _EXTENDED_KEYS = frozenset(
     }
 )
 
-# Modifier VK codes are intentionally emitted as physical scan-code events.
-# This keeps generic modifiers on their left-side physical key and preserves
-# left/right identity for directional modifiers. The boolean records whether
-# the scan code carries the E0 extended prefix.
+# Keys whose physical identity needs an explicit choice. MapVirtualKey can
+# return the keypad variant for navigation keys and SysRq for PrintScreen.
+# Generic modifiers keep their left-side identity; directional modifiers keep
+# their exact side. The boolean records the E0 extended prefix.
 _PHYSICAL_SCAN_CODES = {
     win32_keys.VK_CODES["pageup"]: (0x49, True),
     win32_keys.VK_CODES["pagedown"]: (0x51, True),
@@ -190,6 +190,13 @@ _PHYSICAL_SCAN_CODES = {
     win32_keys.VK_CODES["down"]: (0x50, True),
     win32_keys.VK_CODES["left"]: (0x4B, True),
     win32_keys.VK_CODES["right"]: (0x4D, True),
+    win32_keys.VK_CODES["home"]: (0x47, True),
+    win32_keys.VK_CODES["end"]: (0x4F, True),
+    win32_keys.VK_CODES["insert"]: (0x52, True),
+    win32_keys.VK_CODES["delete"]: (0x53, True),
+    win32_keys.VK_CODES["apps"]: (0x5D, True),
+    win32_keys.VK_CODES["numpad_divide"]: (0x35, True),
+    win32_keys.VK_CODES["print_screen"]: (0x37, True),
     win32_keys.VK_CODES["ctrl"]: (0x1D, False),
     win32_keys.VK_CODES["lctrl"]: (0x1D, False),
     win32_keys.VK_CODES["rctrl"]: (0x1D, True),
@@ -202,6 +209,32 @@ _PHYSICAL_SCAN_CODES = {
     win32_keys.VK_CODES["win"]: (0x5B, True),
     win32_keys.VK_CODES["rwin"]: (0x5C, True),
 }
+
+# Preserve the existing virtual-key delivery for consumer controls. Their
+# mapped scan codes are not a compatibility guarantee for media commands.
+_MULTIMEDIA_VK_CODES = frozenset(
+    {
+        win32_keys.VK_CODES[name]
+        for name in (
+            "volume_mute",
+            "volume_down",
+            "volume_up",
+            "media_next",
+            "media_previous",
+            "media_stop",
+            "media_play_pause",
+            "browser_back",
+            "browser_forward",
+        )
+    }
+)
+
+# A scan-only keypad digit follows NumLock and can become a navigation key.
+# Keep the requested VK while adding its physical code to the event.
+_NUMPAD_NUMERIC_VK_CODES = frozenset(
+    [win32_keys.VK_CODES[f"numpad{digit}"] for digit in range(10)]
+    + [win32_keys.VK_CODES["numpad_decimal"]]
+)
 
 RawSender = Callable[[Sequence[Tuple[int, bool]]], int]
 MouseEvent = Tuple[int, int]
@@ -266,6 +299,25 @@ def _require_windows() -> None:
         )
 
 
+def _virtual_key_to_scan_code(vk: int) -> int:
+    """Return a scan code with its E0 prefix, or 0 for a safe VK fallback."""
+    try:
+        user32 = ctypes.windll.user32  # type: ignore[attr-defined]
+    except Exception:
+        return 0
+    try:
+        user32.MapVirtualKeyW.argtypes = (wintypes.UINT, wintypes.UINT)
+        user32.MapVirtualKeyW.restype = wintypes.UINT
+        # MAPVK_VK_TO_VSC_EX retains E0/E1. KEYEVENTF_EXTENDEDKEY represents
+        # E0 only; special E1 sequences (such as Pause) retain VK delivery.
+        scan_code = int(user32.MapVirtualKeyW(vk, 4))
+        if scan_code & 0xFF and scan_code >> 8 in (0, 0xE0):
+            return scan_code
+        return 0
+    except Exception:
+        return 0
+
+
 def _build_input_array(events: Sequence[Tuple[int, bool]]):
     array = (INPUT * len(events))()
     for index, (vk, key_up) in enumerate(events):
@@ -273,13 +325,19 @@ def _build_input_array(events: Sequence[Tuple[int, bool]]):
         if vk in _EXTENDED_KEYS:
             flags |= _KEYEVENTF_EXTENDEDKEY
         physical_scan = _PHYSICAL_SCAN_CODES.get(vk)
+        if physical_scan is None and vk not in _MULTIMEDIA_VK_CODES:
+            mapped_scan = _virtual_key_to_scan_code(vk)
+            if mapped_scan:
+                physical_scan = (mapped_scan & 0xFF, mapped_scan >> 8 == 0xE0)
         if physical_scan is not None:
             scan_code, is_extended = physical_scan
-            flags |= _KEYEVENTF_SCANCODE
+            use_scan_code = vk not in _NUMPAD_NUMERIC_VK_CODES
+            if use_scan_code:
+                flags |= _KEYEVENTF_SCANCODE
             if is_extended:
                 flags |= _KEYEVENTF_EXTENDEDKEY
             keybd_input = KEYBDINPUT(
-                wVk=0,
+                wVk=0 if use_scan_code else vk,
                 wScan=scan_code,
                 dwFlags=flags,
                 time=0,

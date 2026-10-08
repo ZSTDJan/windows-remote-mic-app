@@ -19,8 +19,14 @@ class VoiceHotkeyProbeTests(unittest.TestCase):
                 self.assertEqual((event["vk"], event["scan_code"], event["flags"]),
                                  (0, scan, flags))
                 self.assertEqual(event["extra_info"], 0)
-        event = probe.planned_edge("sendinput-scan", 0x78, False)
-        self.assertEqual((event["vk"], event["scan_code"]), (0x78, 0))
+
+    def test_scan_format_reports_the_ordinary_key_scan_code(self):
+        with mock.patch.object(probe.win32_input, "_virtual_key_to_scan_code",
+                               return_value=0x43):
+            for key_up in (False, True):
+                event = probe.planned_edge("sendinput-scan", 0x78, key_up)
+                self.assertEqual((event["vk"], event["scan_code"], event["flags"]),
+                                 (0, 0x43, 10 if key_up else 8))
 
     def test_virtual_key_format_preserves_vk(self):
         event = probe.planned_edge("sendinput-vk", 0xA5, True)
