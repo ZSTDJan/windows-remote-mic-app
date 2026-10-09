@@ -43,6 +43,7 @@ from . import (
 )
 
 _OPEN_APPLICATION_DISPLAY = f"打开{product_identity.DISPLAY_NAME}"
+_CUSTOM_PROGRAM_DISPLAY = "启动程序："
 
 # Reference action names map to semantic values.  The Windows implementation
 # is intentionally behind these values; the dropdown must never turn
@@ -130,6 +131,7 @@ ACTION_OPTION_GROUPS: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
             "打开 Chrome", "打开 Edge", "打开 Zed",
         ),
     ),
+    ("自定义", (_CUSTOM_PROGRAM_DISPLAY,)),
     ("其他", ("禁用",)),
 )
 
@@ -226,6 +228,8 @@ def _action_to_display(action: key_mapping.ButtonAction) -> str:
         return _VOICE_HOLD_DISPLAY
     if action.kind == key_mapping.ActionKind.QUICKER_URI:
         return action.uri
+    if action.kind == key_mapping.ActionKind.CUSTOM_PROGRAM:
+        return _CUSTOM_PROGRAM_DISPLAY + action.path
     reference_label = _REFERENCE_ACTION_LABELS.get(action.kind)
     if reference_label is not None:
         return reference_label
@@ -298,6 +302,18 @@ def _display_to_action(text: str) -> key_mapping.ButtonAction:
             key_mapping.ActionKind.QUICKER_URI,
             uri=uri,
         )
+    for prefix in (_CUSTOM_PROGRAM_DISPLAY, "启动程序:"):
+        if text.startswith(prefix):
+            try:
+                path = key_mapping.normalize_custom_program_path(text[len(prefix):])
+            except (TypeError, ValueError) as exc:
+                raise hotkey.HotkeyParseError(
+                    "自定义程序必须填写有效的 .exe 或 .lnk 绝对路径。"
+                ) from exc
+            return key_mapping.ButtonAction(
+                key_mapping.ActionKind.CUSTOM_PROGRAM,
+                path=path,
+            )
     normalized_hotkey = normalize_mapping_hotkey_text(text)
     return key_mapping.ButtonAction(
         key_mapping.ActionKind.KEY_COMBO, tuple(normalized_hotkey.split("+"))

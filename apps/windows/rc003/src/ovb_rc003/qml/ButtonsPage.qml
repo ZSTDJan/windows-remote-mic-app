@@ -4,6 +4,7 @@
 // SettingsController/ButtonMappingModel are QML singletons - see main.qml.
 import QtQuick
 import QtQuick.Controls
+import QtQuick.Dialogs
 import QtQuick.Layouts
 import QtQuick.Effects
 import OvbRc003Settings 1.0
@@ -194,11 +195,64 @@ Item {
         shortcutRecorder.open()
     }
 
+    function openCustomProgramDialog(trigger) {
+        customProgramFileDialog.trigger = trigger
+        customProgramFileDialog.open()
+    }
+
+    function localPathFromSelectedFile(value) {
+        if (!value)
+            return ""
+        if (typeof value.toLocalFile === "function") {
+            const localPath = value.toLocalFile()
+            if (localPath)
+                return localPath
+        }
+        let text = String(value)
+        if (text.indexOf("file:///") === 0)
+            text = text.slice(8)
+        else if (text.indexOf("file://") === 0)
+            text = text.slice(7)
+        try {
+            return decodeURIComponent(text)
+        } catch (error) {
+            return text
+        }
+    }
+
     Timer {
         interval: 100
         repeat: true
         running: SettingsController.keyDetectionActive
         onTriggered: SettingsController.pollKeyDetectionBridge()
+    }
+
+    FileDialog {
+        id: customProgramFileDialog
+        title: qsTr("选择要启动的程序")
+        nameFilters: [
+            qsTr("程序或快捷方式 (*.exe *.lnk)"),
+            qsTr("所有文件 (*)")
+        ]
+        property string trigger: "single_click"
+        onAccepted: {
+            const path = root.localPathFromSelectedFile(selectedFile)
+            if (!path)
+                return
+            const value = "启动程序：" + path
+            actionEditor.syncing = true
+            if (trigger === "single_click") {
+                actionEditor.primaryText = value
+                actionEditor.primaryCombo.setEditorValue(value)
+            } else if (trigger === "double_click") {
+                actionEditor.doubleText = value
+                actionEditor.doubleCombo.setEditorValue(value)
+            } else {
+                actionEditor.longText = value
+                actionEditor.longCombo.setEditorValue(value)
+            }
+            actionEditor.syncing = false
+        }
     }
 
     Connections {
@@ -885,8 +939,8 @@ Item {
                         tokens: root.tokens
                         active: primaryGestureTitleHover.hovered
                         text: actionEditor.buttonId === "mic"
-                            ? qsTr("话筒键可选按住说话、普通动作、快捷键或 Quicker URI；滚轮点按一格，按住连滚并提速；启动应用需已安装")
-                            : qsTr("可选普通动作、快捷键或 Quicker URI；滚轮点按一格，按住连滚并提速；启动应用需已安装")
+                            ? qsTr("话筒键可选按住说话、普通动作、快捷键、Quicker URI 或自定义程序；滚轮点按一格，按住连滚并提速")
+                            : qsTr("可选普通动作、快捷键、Quicker URI 或自定义程序；滚轮点按一格，按住连滚并提速")
                     }
                 }
                 RowLayout {
@@ -912,6 +966,8 @@ Item {
                         editText = selectedText
                         actionEditor.primaryText = selectedText
                         actionEditor.syncing = false
+                        if (selectedText === "启动程序：")
+                            root.openCustomProgramDialog("single_click")
                     }
                 }
                     CompactButton {
@@ -980,6 +1036,8 @@ Item {
                         editText = selectedText
                         actionEditor.doubleText = selectedText
                         actionEditor.syncing = false
+                        if (selectedText === "启动程序：")
+                            root.openCustomProgramDialog("double_click")
                     }
                 }
                     CompactButton {
@@ -1050,6 +1108,8 @@ Item {
                         editText = selectedText
                         actionEditor.longText = selectedText
                         actionEditor.syncing = false
+                        if (selectedText === "启动程序：")
+                            root.openCustomProgramDialog("long_press")
                     }
                 }
                     CompactButton {
