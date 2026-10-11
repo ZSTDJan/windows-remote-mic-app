@@ -2220,7 +2220,7 @@ class SettingsControllerTests(unittest.TestCase):
         self.assertEqual(controller.voiceProgramOptions[2], "微信输入法")
         self.assertEqual(controller.voiceProgramOptions[3], "豆包输入法")
         self.assertEqual(controller.voiceProgramOptions[4], "Chatterfly")
-        self.assertEqual(len(controller.voiceProgramOptions), 5)
+        self.assertEqual(len(controller.voiceProgramOptions), 6)
         self.assertNotIn("自定义程序", controller.voiceProgramOptions)
         self.assertEqual(controller.selectedVoiceProgramIndex, 0)
         self.assertFalse(controller.voiceProgramSystemManaged)
@@ -3323,7 +3323,7 @@ class SettingsControllerTests(unittest.TestCase):
         self.assertEqual(controller.voiceProgramOptions[2], "微信输入法")
         self.assertEqual(controller.voiceProgramOptions[3], "豆包输入法")
         self.assertEqual(controller.voiceProgramOptions[4], "Chatterfly")
-        self.assertEqual(len(controller.voiceProgramOptions), 5)
+        self.assertEqual(len(controller.voiceProgramOptions), 6)
 
     def test_unrelated_mapping_edit_does_not_mark_voice_program_dirty(self):
         controller, model = self._make_controller()

@@ -471,11 +471,13 @@ def _normalize_voice_hotkey(config: Dict[str, Any]) -> None:
             "source": source,
         }
 
-    # This provider has no historical scalar shortcut.  Selecting it in an
+    # These providers have no historical scalar shortcut.  Selecting one in an
     # older configuration must not inherit the previous input method's key.
     if (
-        not (provider_id == voice_program_manager.VOICE_PROGRAM_CHATTERFLY
-             and provider_id not in raw_provider_hotkeys)
+        not (provider_id in (
+            voice_program_manager.VOICE_PROGRAM_CHATTERFLY,
+            voice_program_manager.VOICE_PROGRAM_BAGESHUO,
+        ) and provider_id not in raw_provider_hotkeys)
         and (
             explicit_current_override
             or not has_provider_hotkeys
@@ -494,7 +496,7 @@ def _normalize_voice_hotkey(config: Dict[str, Any]) -> None:
     current = provider_hotkeys[provider_id]["hold"]
 
     # Additive per-provider field; never migrate a held shortcut into a toggle.
-    for toggle_provider in ("wetype", "sogou", "doubao_ime"):
+    for toggle_provider in ("wetype", "sogou", "doubao_ime", "bageshuo"):
         entry = raw_provider_hotkeys.get(toggle_provider, {})
         if isinstance(entry, dict) and "toggle" in entry:
             result = voice_hotkey_sync_windows.validate_provider_hotkey(toggle_provider, entry.get("toggle", ""))
@@ -514,7 +516,7 @@ def _normalize_voice_hotkey(config: Dict[str, Any]) -> None:
 def voice_hotkey_trigger_for_settings(config_data, provider_id=None):
     """UI selection only; the legacy runtime mirrors remain held shortcuts."""
     provider = provider_id or config_data.get("voice_program", {}).get("provider")
-    return "toggle" if provider in ("wetype", "sogou", "doubao_ime") and config_data.get("remote_recording_mode") == "toggle" else "hold"
+    return "toggle" if provider in ("wetype", "sogou", "doubao_ime", "bageshuo") and config_data.get("remote_recording_mode") == "toggle" else "hold"
 
 
 def voice_hotkey_for_provider(
@@ -581,7 +583,12 @@ def set_voice_hotkey_for_provider(
     from . import voice_program_manager
 
     provider = str(provider_id).strip().lower()
-    if trigger not in ("hold", "toggle") or trigger == "toggle" and provider not in ("wetype", "sogou", "doubao_ime"):
+    if trigger not in ("hold", "toggle") or trigger == "toggle" and provider not in (
+        "wetype",
+        "sogou",
+        "doubao_ime",
+        voice_program_manager.VOICE_PROGRAM_BAGESHUO,
+    ):
         raise ValueError("unsupported voice shortcut trigger")
     normalized = str(shortcut).strip().lower()
     entries = config_data.get("voice_hotkeys_by_provider")

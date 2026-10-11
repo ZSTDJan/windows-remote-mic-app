@@ -24,12 +24,12 @@ assert rc003_recording_row.property("descriptionText") == "仅支持按住型"
 assert not rc003_recording_row.property("editorColumnVisible")
 assert not find(window, "remoteRecordingModeRow").property("visible")
 combo = find(window, "voiceProgramCombo")
-assert combo.property("count") == 4
+assert combo.property("count") == 5
 assert combo.property("currentIndex") == -1, (combo.property("currentIndex"), controller.selectedVoiceProgramIndex)
 assert combo.property("displayText") == "请选择语音程序"
 assert not find(window, "voiceHotkeyRow").property("visible")
 assert not find(window, "voiceProgramAutoStartRow").property("visible")
-assert QMetaObject.invokeMethod(combo, "activated", Q_ARG(int, 4))
+assert QMetaObject.invokeMethod(combo, "activated", Q_ARG(int, 5))
 assert controller.selectedVoiceProgramIndex == 0
 
 def choose(index, provider):
@@ -71,7 +71,7 @@ def load_legacy_custom():
     render(window, app)
     assert combo.property("currentIndex") == -1
     assert combo.property("displayText") == "自定义程序（旧）"
-    assert combo.property("count") == 4
+    assert combo.property("count") == 5
     assert m.config.config_path(m.config.config_root()).read_bytes() == before
 
 load_legacy_custom()
@@ -105,7 +105,7 @@ if image_dir:
     window.grabWindow().save(str(image_path / (os.environ["VOICE_SELECTION_STYLE"] + ".png")))
 choose(0, "sogou")
 assert controller.voiceProgramLaunchOnBridgeStart
-assert QMetaObject.invokeMethod(combo, "activated", Q_ARG(int, 4))
+assert QMetaObject.invokeMethod(combo, "activated", Q_ARG(int, 5))
 assert controller.selectedVoiceProgramIndex == 1
 load_legacy_custom()
 assert not controller.voiceProgramLaunchOnBridgeStart
@@ -155,6 +155,21 @@ assert find(window, "recordVoiceHotkeyButton").property("enabled")
 choose(3, "chatterfly")
 assert row.property("stateText") != "尚未接通"
 assert find(window, "refreshVoiceHotkeyButton").property("visible")
+choose(4, "bageshuo")
+assert row.property("stateText") != "尚未接通"
+assert find(window, "voiceHotkeyRow").property("visible")
+assert (find(window, "voiceHotkeyRow").property("descriptionText")
+        == "自动读取叭哥说“语音润色”键；按一次开始、再按停止")
+assert find(window, "refreshVoiceHotkeyButton").property("visible")
+assert find(window, "recordVoiceHotkeyButton").property("visible")
+assert find(window, "openVoiceProgramSettingsButton").property("visible")
+# The device-level mode stays meaningful for 网易叭哥说: toggle keeps the
+# press-once behaviour, while hold is emulated as press-to-talk. The hint has
+# to follow the real setting instead of advertising one fixed mode.
+controller.setRemoteRecordingPreferences(0, controller.remoteRecordingLimitIndex)
+render(window, app)
+assert (find(window, "voiceHotkeyRow").property("descriptionText")
+        == "自动读取叭哥说“语音润色”键；按住说话、松手停止")
 
 # Returning to Xiaomi restores the read-only row without stealing focus or
 # causing a configuration write/restart as a side effect of rendering it.

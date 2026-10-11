@@ -206,12 +206,15 @@ class VoiceProgramSettingsTests(unittest.TestCase):
                 "微信输入法",
                 "豆包输入法",
                 "Chatterfly",
+                "网易叭哥说",
             ],
         )
         self.assertEqual(manager.provider_index("custom"), 4)
         self.assertEqual(manager.provider_id_for_index(4), "custom")
         self.assertEqual(manager.provider_index("chatterfly"), 5)
         self.assertEqual(manager.provider_id_for_index(5), "chatterfly")
+        self.assertEqual(manager.provider_index("bageshuo"), 6)
+        self.assertEqual(manager.provider_id_for_index(6), "bageshuo")
         self.assertEqual(
             manager.normalize_voice_program_settings({"provider": "custom"})["provider"],
             "custom",

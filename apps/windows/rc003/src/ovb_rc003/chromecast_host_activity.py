@@ -33,6 +33,23 @@ def read_sogou_capture():
     return audio.read_capture_sessions({pid for provider, pid, _ in candidates if provider == "sogou"})
 
 
+def read_bageshuo_capture():
+    """Observe NetEase Bageshuo's own capture session on the active mic endpoint.
+
+    Bageshuo keeps its capture sessions registered and flips the active one to
+    state 1 only while dictating, so this mirrors the Sogou/WeType/豆包 path
+    instead of the Chatterfly window-visibility path.
+    """
+
+    candidates = voice_program_manager.diagnostic_voice_processes()
+    if len(candidates) > 32:
+        raise OSError("voice process enumeration is incomplete")
+    return audio.read_capture_sessions(
+        {pid for provider, pid, _ in candidates
+         if provider == voice_program_manager.VOICE_PROGRAM_BAGESHUO}
+    )
+
+
 def doubao_capture_pids():
     """Return only the adapter's exact, still-to-be-verified capture candidate."""
 

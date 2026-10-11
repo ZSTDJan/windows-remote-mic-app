@@ -4211,6 +4211,7 @@ def _load_qt_classes() -> dict:
                 voice_program_manager.VOICE_PROGRAM_WETYPE,
                 voice_program_manager.VOICE_PROGRAM_DOUBAO_IME,
                 voice_program_manager.VOICE_PROGRAM_CHATTERFLY,
+                voice_program_manager.VOICE_PROGRAM_BAGESHUO,
             ):
                 candidate = dict(settings_snapshot)
                 candidate["provider"] = provider_id
@@ -5399,6 +5400,7 @@ def _load_qt_classes() -> dict:
                 if provider_id in (
                     voice_program_manager.VOICE_PROGRAM_WETYPE,
                     voice_program_manager.VOICE_PROGRAM_CHATTERFLY,
+                    voice_program_manager.VOICE_PROGRAM_BAGESHUO,
                 ):
                     self._set_error_message("")
                     self._set_status_message(read_result.message, self._VOICE_PAGE_INDEX)
@@ -5534,6 +5536,13 @@ def _load_qt_classes() -> dict:
             bool,
             lambda self: self._selected_voice_program_is(
                 voice_program_manager.VOICE_PROGRAM_CHATTERFLY
+            ),
+            notify=selectedVoiceProgramIndexChanged,
+        )
+        voiceProgramBageshuoSelected = Property(
+            bool,
+            lambda self: self._selected_voice_program_is(
+                voice_program_manager.VOICE_PROGRAM_BAGESHUO
             ),
             notify=selectedVoiceProgramIndexChanged,
         )

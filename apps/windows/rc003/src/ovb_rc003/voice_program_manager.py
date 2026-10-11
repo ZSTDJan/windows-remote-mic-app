@@ -26,6 +26,7 @@ VOICE_PROGRAM_SOGOU = "sogou"
 VOICE_PROGRAM_WETYPE = "wetype"
 VOICE_PROGRAM_DOUBAO_IME = "doubao_ime"
 VOICE_PROGRAM_CHATTERFLY = "chatterfly"
+VOICE_PROGRAM_BAGESHUO = "bageshuo"
 LEGACY_VOICE_PROGRAM_WINDOWS_DICTATION = "windows_dictation"
 VOICE_PROGRAM_CUSTOM = "custom"
 
@@ -35,8 +36,10 @@ VOICE_PROGRAM_SELECTABLE_PROVIDER_ORDER = (
     VOICE_PROGRAM_WETYPE,
     VOICE_PROGRAM_DOUBAO_IME,
     VOICE_PROGRAM_CHATTERFLY,
+    VOICE_PROGRAM_BAGESHUO,
 )
 # Keep the legacy custom index (4) readable; new menu choices use their own order.
+# Append new providers at the end so existing indices stay stable.
 VOICE_PROGRAM_PROVIDER_ORDER = (
     VOICE_PROGRAM_NONE,
     VOICE_PROGRAM_SOGOU,
@@ -44,6 +47,7 @@ VOICE_PROGRAM_PROVIDER_ORDER = (
     VOICE_PROGRAM_DOUBAO_IME,
     VOICE_PROGRAM_CUSTOM,
     VOICE_PROGRAM_CHATTERFLY,
+    VOICE_PROGRAM_BAGESHUO,
 )
 
 VOICE_PROGRAM_PROVIDER_NAMES = {
@@ -52,6 +56,7 @@ VOICE_PROGRAM_PROVIDER_NAMES = {
     VOICE_PROGRAM_WETYPE: "微信输入法",
     VOICE_PROGRAM_DOUBAO_IME: "豆包输入法",
     VOICE_PROGRAM_CHATTERFLY: "Chatterfly",
+    VOICE_PROGRAM_BAGESHUO: "网易叭哥说",
     VOICE_PROGRAM_CUSTOM: "自定义程序",
 }
 
@@ -70,6 +75,13 @@ _DOUBAO_SETTINGS_EXE = Path("bootstrap") / "SettingsLauncher.exe"
 _CHATTERFLY_PROCESS_NAME = "ChatterflyCloud.exe"
 _CHATTERFLY_SETTINGS_EXE = "FySetting.exe"
 _CHATTERFLY_LAUNCHER_EXE = Path("ChatterflyExe") / "ChatterflyExe.exe"
+# NetEase Bageshuo (网易叭哥说): a Tauri/WebView2 voice-writing assistant installed
+# per-user under %LOCALAPPDATA%\bageshuo. Its dictation shortcut lives in a plain
+# JSON store under %APPDATA%\com.bageshuo.
+_BAGESHUO_PROCESS_NAME = "bageshuo.exe"
+_BAGESHUO_INSTALL_DIRECTORY_NAME = "bageshuo"
+_BAGESHUO_STORE_DIRECTORY_NAME = "com.bageshuo"
+_BAGESHUO_STORE_FILE_NAME = "bageshuo-store.json"
 _SYSTEM_MANAGED_PROVIDERS = frozenset({VOICE_PROGRAM_WETYPE, VOICE_PROGRAM_CHATTERFLY})
 _BUILTIN_ADAPTER_PROVIDERS = frozenset({VOICE_PROGRAM_DOUBAO_IME})
 _LAUNCH_ELEVATED_DEFAULTS = {
@@ -279,6 +291,13 @@ def status_text(status: VoiceProgramStatus) -> str:
             return "已找到 Chatterfly；当前未检测到语音后台进程。"
         if status.code == "running":
             return "Chatterfly 已安装并正在运行；语音是否就绪仍需实际验证。"
+    if status.provider_id == VOICE_PROGRAM_BAGESHUO:
+        if status.code == "not_found":
+            return "未找到网易叭哥说；正常安装后会自动识别，无需手选路径。"
+        if status.code == "stopped":
+            return "已找到网易叭哥说；当前未检测到语音后台进程。"
+        if status.code == "running":
+            return "网易叭哥说已安装并正在运行；语音是否就绪仍需实际验证。"
     if status.code == "disabled":
         return "请选择语音程序；未配置时仅普通按键可用。"
     if status.code == "not_found":
@@ -422,6 +441,20 @@ def resolve_voice_program(
             executable,
         )
 
+    if provider_id == VOICE_PROGRAM_BAGESHUO:
+        executable = discover_bageshuo_executable(
+            platform=platform,
+            process_iter=process_iter,
+        )
+        return ResolvedVoiceProgram(
+            provider_id,
+            display_name,
+            executable,
+            (_BAGESHUO_PROCESS_NAME,),
+            "discovered" if executable is not None else "missing",
+            executable,
+        )
+
     executable = discover_sogou_voice_executable(
         platform=platform,
         process_iter=process_iter,
@@ -532,6 +565,21 @@ def resolve_voice_program_settings_target(
                 display_name,
                 "executable",
                 str(settings_executable),
+            )
+        return VoiceProgramSettingsTarget(provider_id, display_name, "missing")
+    if provider_id == VOICE_PROGRAM_BAGESHUO:
+        # Bageshuo owns its settings UI inside the main app window, so the
+        # settings entry is the application executable itself.
+        executable = discover_bageshuo_executable(
+            platform=current_platform,
+            process_iter=process_iter,
+        )
+        if executable is not None:
+            return VoiceProgramSettingsTarget(
+                provider_id,
+                display_name,
+                "executable",
+                str(executable),
             )
         return VoiceProgramSettingsTarget(provider_id, display_name, "missing")
     if provider_id == VOICE_PROGRAM_CHATTERFLY:
@@ -1038,6 +1086,57 @@ def discover_chatterfly_executable(
     return max(existing, key=lambda path: tuple(
         int(part) for part in re.findall(r"\d+", path.parent.name)
     ) or (0,))
+
+
+def discover_bageshuo_executable(
+    *,
+    platform: Optional[str] = None,
+    process_iter: Optional[Callable[[], Iterable[ProcessInfo]]] = None,
+    install_root_reader: Optional[Callable[[], Iterable[str]]] = None,
+) -> Optional[Path]:
+    """Locate NetEase Bageshuo's per-user main executable.
+
+    A running process wins over the documented install directory, mirroring the
+    other providers. Bageshuo installs per user under %LOCALAPPDATA%\\bageshuo
+    and does not expose a machine-wide install value.
+    """
+
+    current_platform = sys.platform if platform is None else platform
+    if current_platform != "win32":
+        return None
+
+    candidates: list[Path] = []
+    for process in (process_iter or _iter_windows_processes)():
+        executable = process.executable
+        if (process.name.casefold() == _BAGESHUO_PROCESS_NAME.casefold()
+                and executable is not None):
+            candidates.append(executable)
+    for raw_root in (install_root_reader or _read_bageshuo_install_roots)():
+        raw_text = str(raw_root).strip().strip('"')
+        if not raw_text:
+            continue
+        root = Path(os.path.expandvars(raw_text))
+        try:
+            candidates.append(root / _BAGESHUO_PROCESS_NAME)
+        except (OSError, ValueError):
+            continue
+    existing = [path for path in dict.fromkeys(candidates) if path.is_file()]
+    if not existing:
+        return None
+    return max(existing, key=_bageshuo_version_key)
+
+
+def _read_bageshuo_install_roots() -> Iterable[str]:
+    """Return the documented per-user install root without touching the registry."""
+
+    local_appdata = os.environ.get("LOCALAPPDATA")
+    if not local_appdata:
+        return ()
+    return (str(Path(local_appdata) / _BAGESHUO_INSTALL_DIRECTORY_NAME),)
+
+
+def _bageshuo_version_key(path: Path) -> tuple[int, ...]:
+    return tuple(int(part) for part in re.findall(r"\d+", path.parent.name)) or (0,)
 
 
 def _validated_configured_path(raw: object) -> Optional[Path]:
@@ -1564,6 +1663,7 @@ def diagnostic_voice_processes(*, include_wetype_capture: bool = False) -> tuple
         **{name.casefold(): VOICE_PROGRAM_WETYPE for name in _WETYPE_PROCESS_NAMES},
         **{name.casefold(): VOICE_PROGRAM_DOUBAO_IME for name in _DOUBAO_PROCESS_NAMES},
         **{name.casefold(): VOICE_PROGRAM_CHATTERFLY for name in (_CHATTERFLY_PROCESS_NAME, "voiceinput.exe")},
+        **{name.casefold(): VOICE_PROGRAM_BAGESHUO for name in (_BAGESHUO_PROCESS_NAME,)},
     }
     if include_wetype_capture:
         # WeType 2.1.3.18 also hosts capture in its settings executable. This
