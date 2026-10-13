@@ -14,9 +14,9 @@
 
 **[下载正式版 1.0.91](https://github.com/ZSTDJan/windows-remote-mic-app/releases/download/v1.0.91/RemoteMicRC003-1.0.91-portable-unsigned.zip)** · [版本说明](https://github.com/ZSTDJan/windows-remote-mic-app/releases/tag/v1.0.91) · [SHA256SUMS.txt](https://github.com/ZSTDJan/windows-remote-mic-app/releases/download/v1.0.91/SHA256SUMS.txt)
 
-当前正式版为 **1.0.91**，支持小米蓝牙语音遥控器 2 Pro 和图示谷歌 Chromecast 遥控器。新增鼠标左／右／X1／X2 长按及按键配置管理，Chatterfly 改为直接启停，修复切换设备或模式后自动快捷键未及时更新；包含豆包 0.9.2.7 适配、按键录入、普通按键权限和此前主线修复。具体功能与界面以下载的版本为准。
+当前正式版为 **1.0.91**。本版新增鼠标长按和按键配置管理，改进 Chatterfly 录音控制、自动快捷键更新及豆包兼容。
 
-旧正式版和测试版保留在 [历史版本](https://github.com/ZSTDJan/windows-remote-mic-app/releases)。实体遥控器、宿主点击、44.1k 音频、文字上屏、久置／休眠恢复和异机仍按各自项目实测，原微信久置反馈电脑已按用户要求取消验收。
+旧版可在 [历史版本](https://github.com/ZSTDJan/windows-remote-mic-app/releases) 中下载。
 
 完整解压 ZIP 后运行其中的 `无线麦 win版 <版本号>.exe`，不要只取出 EXE。程序未签名，Windows 可能弹出安全提示；请从本仓库下载。
 
@@ -43,13 +43,13 @@
 
 1. 在“语音”页安装音频组件。无线麦的输出端点选 `CABLE Input`，输入法的麦克风选 `CABLE Output`。
 2. 选择搜狗、微信、豆包或 Chatterfly。搜狗、微信和豆包须核对无线麦“语音按键”与输入法对应模式一致，自动读取失败可手动录入；Chatterfly 直接控制录音，快捷键供键盘对照。小米使用按住型；谷歌还可选择开关型。
-3. 先在记事本中用电脑键盘试这个快捷键，确认能打开语音输入。再把光标留在文字框里试遥控器：按住型是按住说话、松开结束；开关型是按一次开始、再按一次结束。
+3. 打开记事本，把光标放在文字框里试遥控器：按住型是按住说话、松开结束；开关型是按一次开始、再按一次结束。搜狗、微信和豆包可先用电脑键盘测试语音快捷键，确认输入法能正常录音。
 
 ![输入法快捷键与虚拟麦克风配置教程](docs/screenshots/voice-configuration-example.jpg)
 
 <sub>语音教程图以豆包输入法为例，重点是两边快捷键一致，并在输入法中选择 `CABLE Output`；新版界面位置可能略有变化。</sub>
 
-**快捷键注意：**使用模拟快捷键的输入法应避开 Windows 和其他软件已占用的组合键；按住说话期间，这组键会保持按下，松开话筒键才释放。Chatterfly 的遥控录音使用直接控制。
+**快捷键注意：** 搜狗、微信和豆包应避开 Windows 和其他软件已占用的组合键；按住说话期间，这组键会保持按下，松开话筒键才释放。
 
 首次配对、音频安装和故障排查的详细步骤见 [使用说明](apps/windows/rc003/README.md)。
 
@@ -72,16 +72,6 @@
 
 Windows 客户端的运行、构建和技术说明见 [开发者文档](apps/windows/rc003/README.md)。
 元素导航的独立项目 OrthoFocus 见 [项目说明](apps/windows/orthofocus/README.md)。
-
-从源码运行设置界面：
-
-```powershell
-Set-Location apps/windows/rc003
-py -3.12 -m venv .venv
-.\.venv\Scripts\python.exe -m pip install -r requirements-dev.txt
-$env:PYTHONPATH = Join-Path (Get-Location) 'src'
-.\.venv\Scripts\python.exe -m ovb_rc003 --settings
-```
 
 </details>
 
