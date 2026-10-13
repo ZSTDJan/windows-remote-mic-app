@@ -1306,7 +1306,31 @@ def _load_qt_classes() -> dict:
             self._hidHelperRemovalReady.connect(
                 self._on_hid_helper_removal_ready
             )
-            self._config = config.load_config(config.config_path(self._config_root))
+            self._config, self._bindings, self._configuration_issues = (
+                config.load_window_settings(self._config_root)
+            )
+            self._configuration_error = ""
+            if self._configuration_issues:
+                details = "；".join(
+                    f"{issue.filename}：{issue.message}" for issue in self._configuration_issues
+                )
+                self._configuration_error = (
+                    f"{details} 原文件已保留，当前仅供查看；未读出的内容使用临时显示值。"
+                    "保存和遥控器服务已暂停，可在设备页导出日志；修复配置后请重新打开。"
+                )
+                try:
+                    logger = logging_setup.get_logger(self._config_root)
+                    for issue in self._configuration_issues:
+                        logger.error(
+                            "settings load failed: file=%s error_type=%s reason=%s",
+                            issue.filename, issue.error_type, issue.message,
+                        )
+                    if not logging_setup.flush_application_logs(logging_setup.log_dir(self._config_root)):
+                        self._configuration_error += " 本次原因未能完整写入日志。"
+                except Exception:
+                    # A read-only/unavailable data directory must not also
+                    # prevent the user from seeing the recovery explanation.
+                    self._configuration_error += " 本次原因未能写入日志。"
             self._remote_devices = []
             self._remote_scan_busy = False
             self._remote_scan_valid = False
@@ -1324,7 +1348,7 @@ def _load_qt_classes() -> dict:
                 self._config.get("hid_helper_setup_prompted_offer_id", "")
             )
             self._hid_helper_setup_attempted_this_session = False
-            self._start_hidden = bool(start_hidden)
+            self._start_hidden = bool(start_hidden) and not self.configurationReadOnly
             self._start_bridge_requested = bool(start_bridge)
             self._launch_bridge_on_app_start = bool(
                 self._config.get("launch_bridge_on_app_start", False)
@@ -1337,7 +1361,8 @@ def _load_qt_classes() -> dict:
                     "close_behavior", config.CLOSE_BEHAVIOR_HIDE_TO_TRAY
                 )
             )
-            startup_windows.rebind_owned_frozen_startup()
+            if not self.configurationReadOnly:
+                startup_windows.rebind_owned_frozen_startup()
             startup_state = startup_windows.read_startup_state()
             self._launch_at_login = startup_state.enabled
             self._application_exit_requested = False
@@ -1362,9 +1387,6 @@ def _load_qt_classes() -> dict:
                 self._on_bridge_restart_stop_ready
             )
             self._window_hide_requested = False
-            self._bindings = config.load_key_bindings(
-                config.key_bindings_path(self._config_root)
-            )
             self._removed_voice_bindings = config.normalize_voice_product_boundary(
                 self._config,
                 self._bindings,
@@ -1573,8 +1595,8 @@ def _load_qt_classes() -> dict:
             self._application_update_package_size = 0
             self._application_update_download_received = 0
             self._application_update_download_path = ""
-            self._settings_dirty = bool(self._removed_voice_bindings)
-            self._mapping_dirty = bool(self._removed_voice_bindings)
+            self._settings_dirty = bool(self._removed_voice_bindings) and not self.configurationReadOnly
+            self._mapping_dirty = bool(self._removed_voice_bindings) and not self.configurationReadOnly
             self._settings_revision = 0
             self._settings_save_busy = False
             self._mapping_preset_rows: List[dict] = []
@@ -2120,6 +2142,8 @@ def _load_qt_classes() -> dict:
 
         @Slot(int, int)
         def setRemoteRecordingPreferences(self, mode_index: int, limit_index: int) -> None:
+            if self.configurationReadOnly:
+                return
             from .chromecast_voice import MODES, LIMITS
             logger = logging_setup.get_logger(self._config_root)
             if (self.isRc003Device or self._remote_selection_busy or self._settings_save_busy
@@ -2237,6 +2261,8 @@ def _load_qt_classes() -> dict:
                 "没有找到已配对且支持的遥控器，请先在 Windows 蓝牙设置中配对。"))
 
         def _save_remote_selection(self, selection: dict, *, allow_legacy_binding=True) -> bool:
+            if self.configurationReadOnly:
+                return False
             from . import remote_selection
             try:
                 # Read the latest saved settings so device management cannot
@@ -2312,6 +2338,8 @@ def _load_qt_classes() -> dict:
             self._change_active_remote(updated, allow_legacy_binding=legacy_binding)
 
         def _change_active_remote(self, updated: dict, *, allow_legacy_binding=True) -> None:
+            if self.configurationReadOnly:
+                return
             if self._chromecast_setup_client is not None and updated["active"] != self.activeRemoteKey:
                 self._remote_feedback("上次谷歌启用进程尚未退出，请先重新使用当前设备完成清理。")
                 return
@@ -2760,6 +2788,8 @@ def _load_qt_classes() -> dict:
                 QTimer.singleShot(0, self._start_automatic_bridge_recovery)
 
         def _persist_desktop_behavior(self, key: str, value: object) -> bool:
+            if self.configurationReadOnly:
+                return False
             next_config = dict(self._config)
             next_config[key] = value
             try:
@@ -3113,6 +3143,8 @@ def _load_qt_classes() -> dict:
             self._set_settings_dirty(True)
 
         def _queue_mapping_auto_save(self, delay_ms: int = 0) -> None:
+            if self.configurationReadOnly:
+                return
             self._set_mapping_auto_save_retry_available(False)
             if self._mapping_auto_save_scheduled or self._mapping_auto_save_running:
                 return
@@ -3120,6 +3152,9 @@ def _load_qt_classes() -> dict:
             self._mapping_auto_save_timer.start(max(0, int(delay_ms)))
 
         def _on_mapping_edited(self) -> None:
+            if self.configurationReadOnly:
+                self._load_bindings_into_model()
+                return
             self._mark_mapping_dirty()
             self._set_error_message("")
             self._set_status_message(
@@ -4244,6 +4279,8 @@ def _load_qt_classes() -> dict:
             self._request_voice_program_status_refresh()
 
         def _voice_settings_write_block_reason(self) -> str:
+            if self.configurationReadOnly:
+                return self._configuration_error
             if _vb_cable_test_active_event.is_set():
                 return "VB-CABLE 通道测试正在运行；测试结束后再修改语音设置。"
             if self._get_bridge_launch_busy():
@@ -4827,6 +4864,9 @@ def _load_qt_classes() -> dict:
                     completion(bool(result))
                 return bool(result)
 
+            if self.configurationReadOnly:
+                return finish(False)
+
             saved_voice_hotkeys = self._config.get("voice_hotkeys", {})
             saved_hotkey = str(
                 saved_voice_hotkeys.get(
@@ -4950,6 +4990,9 @@ def _load_qt_classes() -> dict:
                             "设置保存未完成，程序没有退出。"
                         )
                 return bool(result)
+
+            if self.configurationReadOnly:
+                return finish(False)
 
             if self._settings_save_busy:
                 self._set_error_message(
@@ -5935,6 +5978,13 @@ def _load_qt_classes() -> dict:
 
         errorMessage = Property(str, _get_error_message, notify=errorMessageChanged)
 
+        configurationReadOnly = Property(
+            bool, lambda self: bool(self._configuration_issues), constant=True
+        )
+        configurationError = Property(
+            str, lambda self: self._configuration_error, constant=True
+        )
+
         def _get_settings_dirty(self) -> bool:
             return self._settings_dirty
 
@@ -6376,6 +6426,8 @@ def _load_qt_classes() -> dict:
 
         @Slot(bool)
         def setLaunchAtLogin(self, enabled: bool) -> None:
+            if self.configurationReadOnly:
+                return
             enabled = bool(enabled)
             if enabled == self._launch_at_login:
                 return
@@ -6451,6 +6503,8 @@ def _load_qt_classes() -> dict:
 
         @Slot()
         def startBridgeOnApplicationStart(self) -> None:
+            if self.configurationReadOnly:
+                return
             if self._maintenance_exit_pending:
                 return
             if (
@@ -6761,6 +6815,8 @@ def _load_qt_classes() -> dict:
             return self._record_hid_helper_setup_prompted()
 
         def _record_hid_helper_setup_prompted(self) -> bool:
+            if self.configurationReadOnly:
+                return False
             offer_id = self._hid_helper_offer_id
             if not offer_id:
                 if self._hid_helper_portable_distribution:
@@ -7090,6 +7146,9 @@ def _load_qt_classes() -> dict:
 
         @Slot()
         def _refresh_voice_hotkey_from_provider(self, *, explicit: bool) -> None:
+            if self.configurationReadOnly:
+                self._clear_pending_voice_hotkey_load()
+                return
             if (self._background_shutdown_event.is_set()
                     or self._application_exit_requested
                     or self._application_exit_confirmed
@@ -7783,6 +7842,8 @@ def _load_qt_classes() -> dict:
 
         @Slot()
         def reconnectBridgeNow(self) -> None:
+            if self.configurationReadOnly:
+                return
             if (
                 self._bridge_reconnect_busy
                 or self._maintenance_exit_pending
@@ -7843,6 +7904,8 @@ def _load_qt_classes() -> dict:
             automatic: bool,
             allow_active_voice: bool = False,
         ) -> None:
+            if self.configurationReadOnly:
+                return
             if (
                 self._remote_selection_busy
                 or self._remote_save_uncertain
@@ -7950,6 +8013,8 @@ def _load_qt_classes() -> dict:
             return replacement is None or replacement.pid != stale_status.pid
 
         def _start_bridge_process(self) -> None:
+            if self.configurationReadOnly:
+                return
             if self.activeRemoteKey and not self.activeRemoteReady:
                 self._set_bridge_launch_phase("failed")
                 self._set_launch_status("当前型号尚未提供接收，请在设备页重新选择。")
@@ -8008,6 +8073,8 @@ def _load_qt_classes() -> dict:
         def startBridge(self) -> None:
             """Start the bridge without saving unrelated unsaved page edits."""
 
+            if self.configurationReadOnly:
+                return
             if self._remote_selection_busy:
                 return
             if self._chromecast_setup_client is not None:
@@ -8159,6 +8226,8 @@ def _load_qt_classes() -> dict:
         def restoreMappingDefaults(self) -> None:
             """Reset only the button-page values without touching voice setup."""
 
+            if self.configurationReadOnly:
+                return
             defaults = settings_ui.default_display_state(self._selected_device_id())
             self._model.load_display_map(
                 defaults.button_display_map,
@@ -8190,6 +8259,8 @@ def _load_qt_classes() -> dict:
         def mappingPresetAction(self, operation: str, identity: str, text: str) -> dict:
             """Modal UI operations use stable ids, never mutable row indices."""
             try:
+                if self.configurationReadOnly:
+                    raise config.ConfigReadOnlyError(self._configuration_error)
                 if (self._mapping_auto_save_temporarily_blocked() or self._remote_selection_busy
                         or self._get_input_capture_in_use() or self._application_exit_requested):
                     raise ValueError("正在处理设置或输入，请完成后重试。")
@@ -8278,7 +8349,7 @@ def _load_qt_classes() -> dict:
             not misled into thinking anything was written to disk.
             """
 
-            if self._voice_hotkey_busy:
+            if self.configurationReadOnly or self._voice_hotkey_busy:
                 return
 
             defaults = settings_ui.default_display_state(self._selected_device_id())
@@ -8916,6 +8987,10 @@ def _load_qt_classes() -> dict:
             *,
             allow_driver_action: bool = False,
         ) -> bool:
+            if self.configurationReadOnly:
+                if completion is not None:
+                    completion(False, self._configuration_error)
+                return False
             if (
                 _vb_cable_test_active_event.is_set()
                 or self._voice_hotkey_busy
@@ -9514,6 +9589,8 @@ def _load_qt_classes() -> dict:
 
         @Slot()
         def startInitialDiagnostics(self) -> None:
+            if self._settings_controller.configurationReadOnly:
+                return
             if self._check_rows or self._is_refreshing:
                 return
             self.refreshDiagnostics()
@@ -9534,6 +9611,10 @@ def _load_qt_classes() -> dict:
             might not have time for.
             """
 
+            if self._settings_controller.configurationReadOnly:
+                self._diagnostics_error_message = "配置读取异常，请先导出日志排查；本次未启动设备检查。"
+                self.diagnosticsErrorMessageChanged.emit()
+                return
             if self._is_refreshing or self._vb_cable_test_running:
                 return
             if _diagnostics_shutdown_event.is_set():
@@ -9602,6 +9683,11 @@ def _load_qt_classes() -> dict:
 
         def _start_vb_cable_test(self, *, allow_bridge_restart: bool) -> None:
 
+            if self._settings_controller.configurationReadOnly:
+                self._set_vb_cable_test_state(
+                    "fail", "配置读取异常，本次未启动声音通道测试。", running=False,
+                )
+                return
             if self._vb_cable_test_running or self._is_refreshing:
                 return
             if _diagnostics_shutdown_event.is_set():

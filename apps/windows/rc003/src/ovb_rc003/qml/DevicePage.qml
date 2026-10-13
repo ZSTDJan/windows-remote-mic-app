@@ -506,6 +506,7 @@ Item {
                     }, CompactButton {
                         id: selectRemoteButton
                         objectName: "selectRemoteButton"
+                        enabled: !SettingsController.configurationReadOnly
                         tokens: root.tokens
                         Layout.fillWidth: true
                         compactMinimumWidth: tokens.buttonWidth4Chars
@@ -525,6 +526,7 @@ Item {
                             ? qsTr("检查中…") : qsTr("重新检查")
                         enabled: !DiagnosticsController.isRefreshing
                             && !DiagnosticsController.vbCableTestRunning
+                            && !SettingsController.configurationReadOnly
                         onClicked: {
                             DiagnosticsController.refreshDiagnostics()
                             if (!SettingsController.isRc003Device)
@@ -582,6 +584,7 @@ Item {
                         highlighted: true
                         enabled: !SettingsController.hidHelperRepairBusy
                             && !SettingsController.bridgeLaunchBusy
+                            && !SettingsController.configurationReadOnly
                         onClicked: root.enableHidHelperRequested()
                     }, CompactButton {
                         objectName: "removeHidHelperButton"
@@ -591,6 +594,7 @@ Item {
                         text: qsTr("移除权限")
                         enabled: !SettingsController.hidHelperRepairBusy
                             && !SettingsController.bridgeLaunchBusy
+                            && !SettingsController.configurationReadOnly
                         onClicked: root.removeHidHelperRequested()
                     }]
 
@@ -624,6 +628,7 @@ Item {
                         text: root.bridgeActionText()
                         highlighted: true
                         enabled: !SettingsController.bridgeLaunchBusy
+                            && !SettingsController.configurationReadOnly
                             && (SettingsController.bridgeRunning || !SettingsController.activeRemoteKey
                                 || SettingsController.activeRemoteReady)
                             && !SettingsController.bridgeReconnectBusy
@@ -711,6 +716,7 @@ Item {
 
                 SettingsListRow {
                     objectName: "launchAtLoginRow"
+                    enabled: !SettingsController.configurationReadOnly
                     tokens: root.tokens
                     titleText: qsTr("随 Windows 启动")
                     descriptionText: qsTr("登录后后台运行")
@@ -730,6 +736,7 @@ Item {
 
                 SettingsListRow {
                     objectName: "launchBridgeOnAppStartRow"
+                    enabled: !SettingsController.configurationReadOnly
                     tokens: root.tokens
                     titleText: qsTr("启动程序时自动运行服务")
                     descriptionText: qsTr("自动连接遥控器")
@@ -782,6 +789,7 @@ Item {
                     CompactSwitch {
                         id: diagnosticTraceSwitch
                         objectName: "diagnosticTraceSwitch"
+                        enabled: !SettingsController.configurationReadOnly
                         tokens: root.tokens
                         checked: SettingsController.diagnosticTraceEnabled
                         Accessible.name: qsTr("诊断日志")
@@ -795,6 +803,7 @@ Item {
 
                 SettingsListRow {
                     objectName: "closeBehaviorRow"
+                    enabled: !SettingsController.configurationReadOnly
                     tokens: root.tokens
                     titleText: qsTr("关闭窗口时隐藏到任务栏")
                     descriptionText: qsTr("保留右下角图标；关闭此项则完全退出")

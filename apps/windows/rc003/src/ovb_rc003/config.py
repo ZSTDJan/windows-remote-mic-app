@@ -22,6 +22,7 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Union
 
@@ -53,11 +54,13 @@ VALID_CLOSE_BEHAVIORS = frozenset(
 RUNTIME_LEGACY_VOICE_MODE_KEY = "_legacy_voice_trigger_mode"
 RUNTIME_REMOVED_VOICE_BINDINGS_KEY = "_removed_voice_bindings"
 RUNTIME_REMOVED_WINDOWS_DICTATION_KEY = "_removed_windows_dictation"
+RUNTIME_READ_ONLY_KEY = "_configuration_read_only"
 _RUNTIME_ONLY_KEYS = frozenset(
     {
         RUNTIME_LEGACY_VOICE_MODE_KEY,
         RUNTIME_REMOVED_VOICE_BINDINGS_KEY,
         RUNTIME_REMOVED_WINDOWS_DICTATION_KEY,
+        RUNTIME_READ_ONLY_KEY,
     }
 )
 
@@ -92,6 +95,44 @@ class ConfigFormatError(ValueError):
 
 class ConfigTransactionError(RuntimeError):
     """Raised when a paired settings save also fails to roll back."""
+
+
+class ConfigReadOnlyError(ValueError):
+    """A preview of unreadable settings must never replace the saved files."""
+
+
+@dataclass(frozen=True)
+class SettingsLoadIssue:
+    filename: str
+    error_type: str
+    message: str
+
+
+_SETTINGS_READ_ERRORS = (
+    OSError, ValueError, TypeError, AttributeError, RecursionError, ConfigPrivacyError,
+)
+
+
+def _settings_load_issue(filename: str, error: Exception) -> SettingsLoadIssue:
+    from . import remote_selection, remote_settings
+
+    if isinstance(error, json.JSONDecodeError):
+        message = "JSON 内容不完整或格式错误。"
+    elif isinstance(error, UnicodeError):
+        message = "文件编码无法读取。"
+    elif isinstance(error, OSError):
+        message = "文件无法读取。"
+    elif isinstance(error, ConfigPrivacyError):
+        message = "含有不支持保存的设备信息。"
+    elif isinstance(error, (remote_selection.SelectionError, remote_settings.RemoteSettingsError)):
+        message = str(error)  # These validators contain fixed messages only.
+    elif isinstance(error, ConfigFormatError) and str(error) in {
+        "录音方式不受支持。", "最长录音时间不受支持。",
+    }:
+        message = str(error)
+    else:
+        message = "配置内容格式不正确。"
+    return SettingsLoadIssue(filename, type(error).__name__, message)
 
 
 def config_root() -> Path:
@@ -188,14 +229,13 @@ def _assert_no_forbidden_keys(data: Dict[str, Any]) -> None:
 
 
 def load_config(path: Path) -> Dict[str, Any]:
+    return _normalize_loaded_config(_read_settings_document(path))
+
+
+def _normalize_loaded_config(stored: dict) -> Dict[str, Any]:
     from . import remote_selection, remote_settings
     config = default_config()
-    if path.is_file():
-        with path.open("r", encoding="utf-8-sig") as handle:
-            stored = json.load(handle)
-        if not isinstance(stored, dict):
-            raise ConfigFormatError("config.json root must be a JSON object")
-        _assert_no_forbidden_keys(stored)
+    if stored:
         stored = remote_settings.project(stored, remote_settings.CONFIG_FIELDS,
                                          remote_selection.active_key(stored))
         # Normalize the persisted voice fields before merging defaults. A
@@ -216,6 +256,82 @@ def load_config(path: Path) -> Dict[str, Any]:
         config["selected_device_profile"] = profile
     _normalize_remote_recording_mode(config, profile)
     return config
+
+
+def _preview_config(path: Path) -> Dict[str, Any]:
+    """Best-effort display only. Never repair or write the original document."""
+    from . import remote_selection, remote_settings
+
+    try:
+        stored = _read_settings_document(path)
+        try:
+            active = remote_selection.active_key(stored)
+        except remote_selection.SelectionError:
+            stored.pop(remote_selection.KEY, None)
+            # An unknown owner cannot borrow any device's private settings.
+            if remote_settings.STORE in stored:
+                for field in remote_settings.CONFIG_FIELDS:
+                    stored.pop(field, None)
+            stored.pop(remote_settings.STORE, None)
+            active = ""
+        try:
+            stored = remote_settings.project(stored, remote_settings.CONFIG_FIELDS, active)
+        except remote_settings.RemoteSettingsError:
+            store = stored.get(remote_settings.STORE)
+            try:
+                # An unrelated broken record must not hide a valid selected
+                # record in this read-only preview. The original stays intact.
+                if (not isinstance(store, dict) or type(store.get("schema")) is not int
+                        or store["schema"] != 1 or not isinstance(store.get("records"), dict)):
+                    raise remote_settings.RemoteSettingsError("invalid preview store")
+                preview = dict(stored)
+                preview[remote_settings.STORE] = {
+                    "schema": 1,
+                    "records": {active: store["records"][active]} if active in store["records"] else {},
+                    "unassigned": {} if active else store.get("unassigned", {}),
+                }
+                stored = remote_settings.project(preview, remote_settings.CONFIG_FIELDS, active)
+            except remote_settings.RemoteSettingsError:
+                for field in remote_settings.CONFIG_FIELDS:
+                    stored.pop(field, None)
+        stored.pop(remote_settings.STORE, None)
+        stored.pop(remote_settings.OWNER, None)
+        from .chromecast_voice import LIMITS, DEFAULT_LIMIT
+        if stored.get("remote_recording_mode", "hold") not in ("hold", "toggle"):
+            stored["remote_recording_mode"] = "hold"
+        limit = stored.get("remote_recording_limit_seconds", DEFAULT_LIMIT)
+        if type(limit) is not int or limit not in LIMITS:
+            stored["remote_recording_limit_seconds"] = DEFAULT_LIMIT
+        return _normalize_loaded_config(stored)
+    except _SETTINGS_READ_ERRORS:
+        return default_config()
+
+
+def load_window_settings(root: Path) -> tuple[dict, dict, tuple[SettingsLoadIssue, ...]]:
+    """Open the settings shell even when the strict runtime loaders reject data.
+
+    Preview values remain process-local and are write-protected as a pair.
+    The bridge and all other consumers retain the strict loaders above/below.
+    """
+    from . import remote_selection
+
+    issues = []
+    try:
+        settings = load_config(config_path(root))
+    except _SETTINGS_READ_ERRORS as error:
+        issues.append(_settings_load_issue(CONFIG_FILENAME, error))
+        settings = _preview_config(config_path(root))
+    try:
+        bindings = (_load_key_bindings_for_selection(key_bindings_path(root), settings)
+                    if issues else load_key_bindings(key_bindings_path(root)))
+    except _SETTINGS_READ_ERRORS as error:
+        issues.append(_settings_load_issue(KEY_BINDINGS_FILENAME, error))
+        bindings = default_key_bindings(remote_selection.active_profile(settings))
+        bindings["bindings"] = {}  # Do not present fallback actions as saved mappings.
+    if issues:
+        settings[RUNTIME_READ_ONLY_KEY] = True
+        bindings[RUNTIME_READ_ONLY_KEY] = True
+    return settings, bindings, tuple(issues)
 
 
 def save_config(path: Path, config: Dict[str, Any]) -> None:
@@ -577,8 +693,12 @@ def default_key_bindings(profile: str = "xiaomi-rc003") -> Dict[str, Any]:
 
 
 def load_key_bindings(path: Path) -> Dict[str, Any]:
-    from . import remote_settings, remote_selection
     selected = _read_settings_document(Path(path).with_name(CONFIG_FILENAME))
+    return _load_key_bindings_for_selection(path, selected)
+
+
+def _load_key_bindings_for_selection(path: Path, selected: dict) -> Dict[str, Any]:
+    from . import remote_settings, remote_selection
     profile = remote_selection.active_profile(selected) or remote_selection.RC003_PROFILE
     bindings = default_key_bindings(profile)
     if path.is_file():
@@ -946,6 +1066,8 @@ def save_settings_pair(
 
     if Path(config_file).absolute() == Path(bindings_file).absolute():
         raise ValueError("paired settings paths must be distinct")
+    _assert_settings_writable(config_data)
+    _assert_settings_writable(bindings_data)
     _assert_no_forbidden_keys(config_data)
     _assert_no_forbidden_keys(bindings_data)
 
@@ -974,11 +1096,17 @@ def _save_json_atomic(path: Path, data: Dict[str, Any]) -> None:
 
 
 def _without_runtime_only_keys(data: Dict[str, Any]) -> Dict[str, Any]:
+    _assert_settings_writable(data)
     return {
         key: value
         for key, value in data.items()
         if key not in _RUNTIME_ONLY_KEYS
     }
+
+
+def _assert_settings_writable(data: dict) -> None:
+    if data.get(RUNTIME_READ_ONLY_KEY):
+        raise ConfigReadOnlyError("配置读取异常，原文件已保留；修复后请重新打开无线麦。")
 
 
 def _save_bytes_atomic(path: Path, content: bytes) -> None:
