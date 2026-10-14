@@ -29,11 +29,14 @@ _TSF_CORE_NAME = "tsf-oime-core.dll"
 VOICE_PRESS_STOP_MESSAGE = 0x3E9
 _DOUBAO_0900_HOOK_LAYOUT = (0x7426C0, 0x7427F1, 0x7427F7, 0x7431CD, 0x38)
 _DOUBAO_09122_HOOK_LAYOUT = (0x782D80, 0x782EB2, 0x782EB8, 0x783B7A, 0x38)
+_DOUBAO_0927_HOOK_LAYOUT = (0x7829E0, 0x782B12, 0x782B18, 0x7837DA, 0x38)
 _VERIFIED_IME_SERVICE_BUILDS = {
     "94b17bdca571ac3cd2dafa687b4cb8e3a789cda9d044276483003b0a9e8f77a6":
         _DOUBAO_0900_HOOK_LAYOUT,
     "94ace7e504e6aa70c15095d5219604aee93e17247eb85429a046c7a4fdb95e90":
         _DOUBAO_09122_HOOK_LAYOUT,
+    "38742f838d58b6e5b87a08564c6917da1d75ac6b81ec6ee3388ffaaac7c9f3ad":
+        _DOUBAO_0927_HOOK_LAYOUT,
 }
 # These gates belong to the same exact build as the callback, not just the
 # same version label. Both are checked in loaded memory before any hook.
@@ -44,6 +47,10 @@ _VERIFIED_HOOK_SIGNATURES = {
     ),
     _DOUBAO_09122_HOOK_LAYOUT: (
         bytes.fromhex("FF 15 D0 F4 95 00 E9 E9 0C 00 00"),
+        bytes.fromhex("80 7C 24 38 00 75 16"),
+    ),
+    _DOUBAO_0927_HOOK_LAYOUT: (
+        bytes.fromhex("FF 15 40 E8 95 00 E9 E9 0C 00 00"),
         bytes.fromhex("80 7C 24 38 00 75 16"),
     ),
 }
@@ -58,6 +65,12 @@ _VERIFIED_VOICE_STOP_BUILDS = {
         "8544bfb87d8d2cc847b13e2ccc9bbd2220b20bceafdd1fc88ad5eaff5a28bb02",
         # 0.9.1.22's own stop button sends wParam=1. Without it, the
         # service suppresses a stop during the first 800 ms after triggering.
+        1,
+    ),
+    "e3ee88527bf6bd38156e86b93413ca004a829809ad51f064a42db44814e9a5d5": (
+        "38742f838d58b6e5b87a08564c6917da1d75ac6b81ec6ee3388ffaaac7c9f3ad",
+        "ef827968a374de491529f65eade36d58c7eab78933ebe8508bd2fed8563290c0",
+        # 0.9.2.7 retains the native stop button's wParam=1 fast-stop path.
         1,
     ),
 }

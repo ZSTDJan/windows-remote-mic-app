@@ -1229,12 +1229,43 @@ def find_rc003_hidogatt_host_pid(*, diagnostic: dict | None = None,
     matched_services = 0
     lookup_error = {}
     selected_pids = set()
+    selected_ref = ""
+    details = dict(instances_seen=0, selected_instances=0, identity_mismatches=0,
+                   identity_failures=0, host_pid_missing=0, host_pid_invalid=0,
+                   host_pid_read_failures=0, positive_pid_count=0,
+                   scan_complete=False, error_samples=[], errors_omitted=0)
+    stage = "open_enumerator"
+
+    def record_error(error, error_stage):
+        # No registry paths, ContainerIDs, values or exception messages.
+        sample = {"stage": error_stage, "error_type": "ValueError"}
+        if isinstance(error, OSError):
+            sample.update(_registry_error_details(error))
+        elif isinstance(error, TypeError):
+            sample["error_type"] = "TypeError"
+        if len(details["error_samples"]) < 3:
+            details["error_samples"].append(sample)
+        else:
+            details["errors_omitted"] += 1
 
     def result(pid: int | None = None, reason: str = "host_pid_unavailable") -> int | None:
         if diagnostic is not None:
             diagnostic.update(reason=reason, matched_services=matched_services)
             if pid is None and lookup_error:
                 diagnostic.update(lookup_error)
+            # Keep the legacy reason/return contract; explain previously collapsed cases.
+            outcome = (reason if pid is not None else
+                       "host_pid_invalid" if lookup_error.get("reason") == "host_pid_invalid" else
+                       "registry_scan_failed" if lookup_error else
+                       "ambiguous_selected_hosts" if len(selected_pids) > 1 else
+                       "host_pid_invalid" if details["host_pid_invalid"] else
+                       "host_pid_missing" if details["host_pid_missing"] else
+                       "identity_read_failed" if details["identity_failures"] else
+                       "selected_identity_mismatch" if details["identity_mismatches"] else
+                       "no_service_instances" if matched_services and not details["instances_seen"] else reason)
+            details["positive_pid_count"] = len(selected_pids)
+            diagnostic.update(details, lookup_outcome=outcome, selected_ref=selected_ref,
+                              resolved_host_pid=pid)
         return pid
 
     if os.name != "nt" or winreg is None:
@@ -1243,15 +1274,20 @@ def find_rc003_hidogatt_host_pid(*, diagnostic: dict | None = None,
         from . import remote_selection
         if not remote_selection.valid_key(selected_key):
             return result(reason="no_selected_device")
+        selected_ref = selected_key[:12]
     try:
         with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, BTHLE_ENUM_KEY) as root:
             service_index = 0
             while True:
+                stage = "enumerate_services"
                 try:
                     service_name = winreg.EnumKey(root, service_index)
                 except OSError as exc:
                     if getattr(exc, "winerror", None) != 259:
                         lookup_error = _registry_error_details(exc)
+                        record_error(exc, stage)
+                    else:
+                        details["scan_complete"] = not details["error_samples"]
                     break
                 service_index += 1
                 folded = service_name.casefold()
@@ -1260,46 +1296,68 @@ def find_rc003_hidogatt_host_pid(*, diagnostic: dict | None = None,
                 if RC003_HARDWARE_TOKEN not in folded:
                     continue
                 matched_services += 1
+                stage = "open_service"
                 with winreg.OpenKey(root, service_name) as service_key:
                     instance_index = 0
                     while True:
+                        stage = "enumerate_instances"
                         try:
                             instance_name = winreg.EnumKey(service_key, instance_index)
                         except OSError as exc:
                             if getattr(exc, "winerror", None) != 259:
                                 lookup_error = _registry_error_details(exc)
+                                record_error(exc, stage)
                             break
                         instance_index += 1
+                        details["instances_seen"] += 1
                         if selected_key is not None:
                             try:
+                                stage = "open_instance"
                                 with winreg.OpenKey(service_key, instance_name) as instance_key:
+                                    stage = "read_container_id"
                                     container, _ = winreg.QueryValueEx(instance_key, "ContainerID")
+                                stage = "parse_container_id"
                                 if remote_selection.container_key(container) != selected_key:
+                                    details["identity_mismatches"] += 1
                                     continue
-                            except (OSError, ValueError):
+                            except (OSError, ValueError) as exc:
+                                details["identity_failures"] += 1
+                                record_error(exc, stage)
                                 continue
+                            details["selected_instances"] += 1
                         diagnostic_path = (
                             f"{service_name}\\{instance_name}\\{WUDF_DIAGNOSTIC_SUFFIX}"
                         )
                         try:
+                            stage = "open_host_diagnostic"
                             with winreg.OpenKey(root, diagnostic_path) as diagnostic_key:
+                                stage = "read_host_pid"
                                 value, _ = winreg.QueryValueEx(diagnostic_key, "HostPid")
+                            stage = "parse_host_pid"
                             pid = int(value)
                             if pid > 0:
+                                selected_pids.add(pid)
                                 if selected_key is not None:
-                                    selected_pids.add(pid)
                                     continue
                                 return result(pid, "host_found")
-                        except FileNotFoundError:
+                            details["host_pid_invalid"] += 1
+                        except FileNotFoundError as exc:
+                            details["host_pid_missing"] += 1
+                            record_error(exc, stage)
                             continue
                         except OSError as exc:
+                            details["host_pid_read_failures"] += 1
                             lookup_error = _registry_error_details(exc)
+                            record_error(exc, stage)
                             continue
-                        except (TypeError, ValueError):
+                        except (TypeError, ValueError) as exc:
+                            details["host_pid_invalid"] += 1
                             lookup_error = {"reason": "host_pid_invalid"}
+                            record_error(exc, stage)
                             continue
     except OSError as exc:
         lookup_error = _registry_error_details(exc)
+        record_error(exc, stage)
     if selected_key is not None and not lookup_error and len(selected_pids) == 1:
         return result(next(iter(selected_pids)), "selected_host_found")
     return result(reason="host_pid_unavailable" if matched_services else "rc003_service_not_found")

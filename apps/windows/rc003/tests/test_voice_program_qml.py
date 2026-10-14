@@ -85,7 +85,7 @@ DiagnosticsController = classes["DiagnosticsController"]
 
 
 class FakeHotkeyCapture:
-    def __init__(self, on_captured, *, accept_injected=False):
+    def __init__(self, on_captured, *, accept_injected=False, isolated=False, on_error=None):
         self.on_captured = on_captured
         self.accept_injected = accept_injected
         self.is_running = False
@@ -139,6 +139,7 @@ def read_provider_hotkey(
         "sogou": "rctrl",
         "wetype": "lctrl+lwin",
         "doubao_ime": "ralt",
+        "chatterfly": "rctrl+rshift+0",
     }
     shortcut = shortcuts.get(provider_id, "")
     if provider_id == "wetype" and not allow_settings_window:
@@ -329,6 +330,20 @@ wetype_program_running = str(
     controls["voiceProgramSelectionRow"].property("stateText")
 )
 
+controller.selectedVoiceProgramIndex = 5
+wait_for_voice_hotkey_idle(controller, app)
+render(window, app)
+chatterfly = {
+    "shortcut": str(hotkey_field.property("text")),
+    "refresh_visible": bool(refresh_button.property("visible")),
+    "refresh_enabled": bool(refresh_button.property("enabled")),
+    "state": str(controls["voiceHotkeyRow"].property("stateText")),
+}
+voice_page.setProperty("voiceHotkeyRecording", True)
+render(window, app)
+chatterfly["recording_refresh_enabled"] = bool(refresh_button.property("enabled"))
+voice_page.setProperty("voiceHotkeyRecording", False)
+
 controller._replace_voice_program_settings(dict(controller._voice_program_settings, provider="custom"))
 wait_for_voice_hotkey_idle(controller, app)
 render(window, app)
@@ -497,6 +512,7 @@ result = {
     "active_capture_error": active_capture_error,
     "system_managed": system_managed,
     "doubao": doubao,
+    "chatterfly": chatterfly,
     "custom_program": custom_program,
     "unmanaged_elevated": unmanaged_elevated,
     "retired_controls_absent": all(
@@ -577,6 +593,11 @@ controller.shutdownBackgroundTasks()''',
         )
         data = json.loads(result.stdout.strip().splitlines()[-1])
         self.assertEqual(data["warnings"], [])
+        self.assertEqual(data["chatterfly"], {
+            "shortcut": "右 Ctrl + 右 Shift + 0",
+            "refresh_visible": True, "refresh_enabled": True,
+            "state": "自动识别", "recording_refresh_enabled": False,
+        })
         self.assertTrue(data["retired_controls_absent"])
         self.assertTrue(all(item["visible"] for item in data["managed"].values()))
         self.assertTrue(all(item["enabled"] for item in data["managed"].values()))

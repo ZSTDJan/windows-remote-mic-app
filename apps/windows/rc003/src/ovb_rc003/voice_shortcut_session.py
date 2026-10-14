@@ -9,11 +9,13 @@ import threading
 from dataclasses import dataclass
 from typing import Callable, Optional, Tuple
 from . import (hotkey, voice_controller, voice_program_manager, wetype_control_windows,
-               win32_input, win32_keys, bridge_runtime_status, doubao_rpc)
+               win32_input, win32_keys, bridge_runtime_status, doubao_rpc,
+               chatterfly_control_windows)
 
 _VOICE_HOTKEY_RELEASE_RETRY_INITIAL_SECONDS = 0.1
 _VOICE_HOTKEY_RELEASE_RETRY_MAX_SECONDS = 2.0
 _VOICE_HOTKEY_BACKEND_MARKED = "marked_keybd_event"
+_VOICE_HOTKEY_BACKEND_CHATTERFLY = "chatterfly_hotkey"
 _VOICE_HOTKEY_BACKEND_WETYPE = "wetype_hotkey"
 _VOICE_HOTKEY_BACKEND_DOUBAO = "doubao_hotkey"
 _INPUT_PROFILE_VOICE_HOTKEY_BACKENDS = frozenset(
@@ -32,6 +34,7 @@ class ShortcutServices:
     current_state: Callable
     request_cleanup: Callable
     prepare_mute_guard: Callable
+    chatterfly_state: Callable = lambda generation, state: None
 
 
 class VoiceShortcutSession:
@@ -73,6 +76,15 @@ class VoiceShortcutSession:
             logger=self.logger,
         )
         self.doubao_physicalizer = doubao_rpc.DoubaoPhysicalizer()
+        self.chatterfly_control = chatterfly_control_windows.ChatterflyVoiceControl(
+            logger=logger, on_state=self._chatterfly_state,
+        )
+
+    def _chatterfly_state(self, generation, state):
+        if generation != self.chatterfly_control.current_generation:
+            return
+        self.ui_confirmation = "confirmed" if state == "ready" else "unknown"
+        self.services.chatterfly_state(generation, state)
 
     @staticmethod
     def provider_for_backend(backend: str) -> str:
@@ -82,6 +94,8 @@ class VoiceShortcutSession:
 
 
     def control_for_backend(self, backend: str):
+        if backend == _VOICE_HOTKEY_BACKEND_CHATTERFLY:
+            return self.chatterfly_control
         if backend == _VOICE_HOTKEY_BACKEND_DOUBAO:
             return self.doubao_control
         return self.wetype_control
@@ -97,6 +111,7 @@ class VoiceShortcutSession:
             self.runtime_cleanup_result = None
             self.runtime_backend = backend
             self.runtime_mic_confirmed = None
+            self.ui_confirmation = "unknown"
 
 
     def control_generation(
@@ -135,26 +150,26 @@ class VoiceShortcutSession:
                 return False
             self.runtime_audio_finished = True
             self.runtime_pcm_frames = max(0, int(frames))
-            cleanup_result = self.runtime_cleanup_result
             backend = self.runtime_backend or _VOICE_HOTKEY_BACKEND_WETYPE
-            mic_confirmed = self.runtime_mic_confirmed
-        if backend == _VOICE_HOTKEY_BACKEND_WETYPE and mic_confirmed is not True:
-            state = bridge_runtime_status.VOICE_RUNTIME_HOST_START_FAILED
-        elif cleanup_result is True:
-            state = (
-                bridge_runtime_status.VOICE_RUNTIME_SUCCESS
-                if frames > 0
-                else bridge_runtime_status.VOICE_RUNTIME_AUDIO_EMPTY
-            )
-        elif cleanup_result is False:
-            state = bridge_runtime_status.VOICE_RUNTIME_HOST_STOP_FAILED
-        else:
-            state = bridge_runtime_status.VOICE_RUNTIME_FINISHING
+            state = self._finished_result_locked()
         self.services.set_result(
             state,
             provider=self.provider_for_backend(backend),
         )
         return True
+
+
+    def _finished_result_locked(self) -> str:
+        if self.runtime_cleanup_result is False:
+            return bridge_runtime_status.VOICE_RUNTIME_HOST_STOP_FAILED
+        if self.runtime_cleanup_result is None or not self.runtime_audio_finished:
+            return bridge_runtime_status.VOICE_RUNTIME_FINISHING
+        if self.runtime_pcm_frames <= 0:
+            return bridge_runtime_status.VOICE_RUNTIME_AUDIO_EMPTY
+        if (self.runtime_backend == _VOICE_HOTKEY_BACKEND_WETYPE
+                and self.runtime_mic_confirmed is not True):
+            return bridge_runtime_status.VOICE_RUNTIME_HOST_UNCONFIRMED
+        return bridge_runtime_status.VOICE_RUNTIME_SUCCESS
 
 
     def on_confirmation(
@@ -166,29 +181,32 @@ class VoiceShortcutSession:
             if (
                 generation != self.runtime_generation
                 or self.runtime_backend != _VOICE_HOTKEY_BACKEND_WETYPE
+                or self.runtime_audio_finished
+                or self.runtime_cleanup_result is not None
             ):
                 self.logger.info(
                     "WeType voice confirmation ignored for stale generation=%s",
                     generation,
                 )
                 return
-            self.runtime_mic_confirmed = bool(success)
-            self.ui_confirmation = (
-                "confirmed" if success else "not_confirmed"
-            )
-        if success:
-            current_state = self.services.current_state()
-            if current_state == bridge_runtime_status.VOICE_RUNTIME_ACTIVE:
+            # False here means observation unavailable, not failed delivery.
+            # Chromecast keeps its independent ready deadline for that case.
+            self.runtime_mic_confirmed = True if success else None
+            self.ui_confirmation = "confirmed" if success else "unknown"
+            # Publish under the same generation lock so a delayed callback
+            # cannot label the next attempt as confirmed.
+            if success and self.services.current_state() == bridge_runtime_status.VOICE_RUNTIME_ACTIVE:
                 self.services.set_result(
                     bridge_runtime_status.VOICE_RUNTIME_MIC_CONFIRMED,
                     provider=voice_program_manager.VOICE_PROGRAM_WETYPE,
                 )
+        if success:
             self.logger.info("WeType microphone open confirmed")
             return
 
-        self.logger.warning(
-            "WeType microphone open was not confirmed after recovery retries; "
-            "preserving the active hold until the physical microphone key is released"
+        self.logger.info(
+            "WeType microphone state is unknown; preserving the active hold "
+            "until the microphone key is released; no shortcut retry"
         )
 
 
@@ -220,8 +238,7 @@ class VoiceShortcutSession:
                 )
                 return
             self.runtime_cleanup_result = bool(success)
-            audio_finished = self.runtime_audio_finished
-            frames = self.runtime_pcm_frames
+            state = self._finished_result_locked()
         provider = self.provider_for_backend(resolved_backend)
         if not success:
             tokens = tuple(self.hotkey.modifiers) + (self.hotkey.key,)
@@ -235,20 +252,7 @@ class VoiceShortcutSession:
             )
             self.services.request_cleanup()
             return
-        if not audio_finished:
-            self.services.set_result(
-                bridge_runtime_status.VOICE_RUNTIME_FINISHING,
-                provider=provider,
-            )
-            return
-        self.services.set_result(
-            (
-                bridge_runtime_status.VOICE_RUNTIME_SUCCESS
-                if frames > 0
-                else bridge_runtime_status.VOICE_RUNTIME_AUDIO_EMPTY
-            ),
-            provider=provider,
-        )
+        self.services.set_result(state, provider=provider)
 
 
     def apply(
@@ -280,6 +284,31 @@ class VoiceShortcutSession:
             tokens=list(tokens),
             source="voice_controller",
         )
+        if backend == _VOICE_HOTKEY_BACKEND_CHATTERFLY:
+            if action == voice_controller.VoiceHostAction.KEY_DOWN:
+                try:
+                    delivered = self.chatterfly_control.start(cancelled=cancelled)
+                except OSError:
+                    self.logger.exception("Chatterfly voice IPC start failed")
+                    delivered = False
+                if delivered:
+                    self.active_backend = backend
+                if delivered or self.chatterfly_control.cleanup_pending:
+                    self.pending_tokens, self.pending_backend = tokens, backend
+                    if not delivered:
+                        self.schedule_release_retry()
+            else:
+                delivered = self.release_pending()
+                if not delivered and self.chatterfly_control.completion_pending:
+                    # Logical stop was accepted. Keep pending ownership until
+                    # the observer confirms close; callers must not reconnect
+                    # merely because the host needs time to finish recording.
+                    self.services.set_result(bridge_runtime_status.VOICE_RUNTIME_FINISHING)
+                    delivered = True
+            self.trace.emit("voice_hotkey_result", **trace_context, backend=backend,
+                            delivered=bool(delivered), transport="chatterfly_ipc",
+                            generation=self.chatterfly_control.current_generation)
+            return delivered
         if backend in _INPUT_PROFILE_VOICE_HOTKEY_BACKENDS:
             control = self.control_for_backend(backend)
             provider = self.provider_for_backend(backend)
@@ -407,8 +436,8 @@ class VoiceShortcutSession:
         tokens: Tuple[str, ...],
         backend: str,
     ) -> None:
-        if backend in _INPUT_PROFILE_VOICE_HOTKEY_BACKENDS:
-            raise OSError("input profile shortcut is owned by its voice control")
+        if backend in _INPUT_PROFILE_VOICE_HOTKEY_BACKENDS or backend == _VOICE_HOTKEY_BACKEND_CHATTERFLY:
+            raise OSError("voice action is owned by its provider control")
         if action == voice_controller.VoiceHostAction.KEY_DOWN:
             win32_input.send_voice_key_combo_down(tokens)
         else:
@@ -504,7 +533,13 @@ class VoiceShortcutSession:
             or self.services.configured_backend()
         )
         try:
-            if backend in _INPUT_PROFILE_VOICE_HOTKEY_BACKENDS:
+            if backend == _VOICE_HOTKEY_BACKEND_CHATTERFLY:
+                if not self.chatterfly_control.stop():
+                    self.schedule_release_retry()
+                    return False
+                if self.services.current_state() == bridge_runtime_status.VOICE_RUNTIME_FINISHING:
+                    self.services.set_result(bridge_runtime_status.VOICE_RUNTIME_NOT_TESTED)
+            elif backend in _INPUT_PROFILE_VOICE_HOTKEY_BACKENDS:
                 control = self.control_for_backend(backend)
                 provider = self.provider_for_backend(backend)
                 delivered = control.stop()

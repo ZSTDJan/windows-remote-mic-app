@@ -465,107 +465,13 @@ class StaThreadTests(unittest.TestCase):
         )
 
 
-class WeTypeMicTimestampTests(unittest.TestCase):
-    OLD_RECORD = "C:#Tencent#WeType#2.1.2.13#wetype_update.exe"
-    CURRENT_RECORD = "C:#Tencent#WeType#2.1.3.18#wetype_update.exe"
-
-    @staticmethod
-    @contextmanager
-    def registry(records, *, unavailable=False):
-        registry = mock.Mock()
-        root = mock.MagicMock()
-        root.__enter__.return_value = root
-
-        def open_key(parent, name):
-            if parent is registry.HKEY_CURRENT_USER:
-                if unavailable:
-                    raise PermissionError("microphone history unavailable")
-                return root
-            key = mock.MagicMock()
-            key.__enter__.return_value = name
-            return key
-
-        def enum_key(_root, index):
-            try:
-                return list(records)[index]
-            except IndexError:
-                raise OSError("no more records") from None
-
-        def query_value(key, name):
-            if name != "LastUsedTimeStart":
-                raise AssertionError(name)
-            value = records[key]
-            if isinstance(value, Exception):
-                raise value
-            return value, 11
-
-        registry.OpenKey.side_effect = open_key
-        registry.EnumKey.side_effect = enum_key
-        registry.QueryValueEx.side_effect = query_value
-        with mock.patch.dict("sys.modules", {"winreg": registry}), mock.patch.object(
-            wetype_control_windows.os, "name", "nt"
-        ):
-            yield registry
-
-    def test_latest_record_wins_independently_of_version_enumeration_order(self):
-        entries = [(self.OLD_RECORD, 100), (self.CURRENT_RECORD, 200)]
-        for ordered in (entries, list(reversed(entries))):
-            with self.subTest(ordered=ordered), self.registry(dict(ordered)):
-                self.assertEqual(wetype_control_windows._wetype_mic_start_timestamp(), 200)
-
-    def test_unrelated_application_cannot_confirm_wetype(self):
-        with self.registry({"C:#DoubaoIME#ImeService.exe": 999, self.CURRENT_RECORD: 200}):
-            self.assertEqual(wetype_control_windows._wetype_mic_start_timestamp(), 200)
-
-    def test_invalid_old_record_does_not_hide_a_valid_later_record(self):
-        for invalid in (None, "broken", b"200", True, -1, 0, PermissionError("denied")):
-            with self.subTest(invalid=invalid), self.registry(
-                {self.OLD_RECORD: invalid, self.CURRENT_RECORD: 200}
-            ):
-                self.assertEqual(wetype_control_windows._wetype_mic_start_timestamp(), 200)
-
-    def test_missing_or_unreadable_history_stays_unconfirmed(self):
-        for records, unavailable in (({}, False), ({self.OLD_RECORD: 0}, False), ({}, True)):
-            with self.subTest(records=records, unavailable=unavailable), self.registry(
-                records, unavailable=unavailable
-            ):
-                self.assertIsNone(wetype_control_windows._wetype_mic_start_timestamp())
-
-    def test_current_version_capture_does_not_retrigger_an_active_hold(self):
-        records = {self.OLD_RECORD: 100, self.CURRENT_RECORD: 200}
-        pressed, released, confirmations = [], [], []
-        revive = mock.Mock(return_value=True)
-
-        def press(keys):
-            pressed.append(tuple(keys))
-            records[self.CURRENT_RECORD] = 201
-
-        with self.registry(records):
-            controller = WeTypeVoiceControlTests.make_controller(
-                mic_start_reader=wetype_control_windows._wetype_mic_start_timestamp,
-                press_keys=press,
-                release_keys=lambda keys: released.append(tuple(keys)),
-                revive_profile=revive,
-                on_confirmation=lambda generation, ok: confirmations.append((generation, ok)),
-                sleep=lambda _delay: None,
-                thread_factory=_ImmediateThread,
-            )
-            self.assertTrue(controller.start(WeTypeVoiceControlTests.VOICE_KEYS))
-            self.assertEqual(confirmations, [(1, True)])
-            self.assertEqual(pressed, [WeTypeVoiceControlTests.VOICE_KEYS])
-            self.assertEqual(released, [])
-            revive.assert_not_called()
-            self.assertTrue(controller.stop())
-            self.assertEqual(released, [WeTypeVoiceControlTests.VOICE_KEYS])
-
-
 class WeTypeVoiceControlTests(unittest.TestCase):
     def test_failed_selection_preparation_never_falls_back_to_press(self):
         press = mock.Mock()
         def failed(callback):
             raise wetype_control_windows.InputProfilePreparationError("selection timed out")
         control = wetype_control_windows.WeTypeVoiceControl(
-            run_sta=failed, press_keys=press, mic_start_reader=None,
+            run_sta=failed, press_keys=press, capture_reader=None,
         )
         self.assertFalse(control.start(("lctrl", "lwin")))
         press.assert_not_called()
@@ -582,7 +488,7 @@ class WeTypeVoiceControlTests(unittest.TestCase):
             "run_sta": lambda callback: callback(),
             "press_keys": lambda _keys: None,
             "release_keys": lambda _keys: None,
-            "mic_start_reader": None,
+            "capture_reader": None,
         }
         options.update(overrides)
         return wetype_control_windows.WeTypeVoiceControl(**options)
@@ -768,196 +674,6 @@ class WeTypeVoiceControlTests(unittest.TestCase):
         self.assertNotIn("PostMessageW", source)
         self.assertNotIn("WM_LBUTTON", source)
 
-    def test_first_microphone_confirmation_succeeds_without_recovery(self):
-        confirmations = []
-        readings = iter((10, 11))
-        controller = self.make_controller(
-            mic_start_reader=lambda: next(readings),
-            on_confirmation=lambda generation, success: confirmations.append(
-                (generation, success)
-            ),
-            sleep=lambda _delay: None,
-            thread_factory=_ImmediateThread,
-        )
-
-        self.assertTrue(controller.start(self.VOICE_KEYS))
-
-        self.assertEqual(confirmations, [(1, True)])
-        self.assertFalse(controller.confirmation_pending)
-
-    def test_microphone_confirmation_recovers_once_then_succeeds(self):
-        calls = []
-        readings = iter((10,) * 13 + (11,))
-        controller = self.make_controller(
-            mic_start_reader=lambda: next(readings),
-            on_confirmation=lambda generation, success: calls.append(
-                ("confirmed", generation, success)
-            ),
-            revive_profile=lambda: calls.append("revive") or True,
-            press_keys=lambda keys: calls.append(("down", tuple(keys))),
-            release_keys=lambda keys: calls.append(("up", tuple(keys))),
-            sleep=lambda _delay: None,
-            thread_factory=_ImmediateThread,
-        )
-
-        self.assertTrue(controller.start(self.VOICE_KEYS))
-
-        self.assertEqual(
-            calls,
-            [
-                ("down", self.VOICE_KEYS),
-                "revive",
-                ("up", self.VOICE_KEYS),
-                ("down", self.VOICE_KEYS),
-                ("confirmed", 1, True),
-            ],
-        )
-
-    def test_microphone_confirmation_fails_after_all_recovery_retries(self):
-        confirmations = []
-        revivals = []
-        controller = self.make_controller(
-            mic_start_reader=lambda: 10,
-            on_confirmation=lambda generation, success: confirmations.append(
-                (generation, success)
-            ),
-            revive_profile=lambda: revivals.append(True) or True,
-            sleep=lambda _delay: None,
-            thread_factory=_ImmediateThread,
-        )
-
-        self.assertTrue(controller.start(self.VOICE_KEYS))
-
-        self.assertEqual(confirmations, [(1, False)])
-        self.assertEqual(len(revivals), 3)
-
-    def test_fast_confirmation_registers_before_result_and_stops_after_ready(self):
-        clock, calls = [0.0], []
-        controller = self.make_controller(
-            mic_start_reader=lambda: 11 if clock[0] >= .05 else 10,
-            on_started=lambda generation: calls.append(("registered", generation)),
-            on_confirmation=lambda generation, ok: calls.append(("confirmed", generation, ok, clock[0])),
-            sleep=lambda delay: clock.__setitem__(0, clock[0] + delay),
-            thread_factory=_ImmediateThread,
-        )
-        with mock.patch.object(wetype_control_windows.time, "monotonic", side_effect=lambda: clock[0]):
-            self.assertTrue(controller.start(self.VOICE_KEYS))
-        self.assertEqual(calls, [("registered", 1), ("confirmed", 1, True, .05)])
-        self.assertFalse(controller.confirmation_pending)
-        self.assertTrue(controller.stop())
-
-    def test_never_ready_has_bounded_queries_and_keeps_original_retry_times(self):
-        clock, reads, retries, confirmations = [0.0], [], [], []
-        controller = self.make_controller(
-            mic_start_reader=lambda: reads.append(clock[0]) or 10,
-            revive_profile=lambda: retries.append(clock[0]) or True,
-            on_confirmation=lambda gen, ok: confirmations.append((gen, ok)),
-            sleep=lambda delay: clock.__setitem__(0, clock[0] + delay),
-            thread_factory=_ImmediateThread,
-        )
-        with mock.patch.object(wetype_control_windows.time, "monotonic", side_effect=lambda: clock[0]):
-            self.assertTrue(controller.start(self.VOICE_KEYS))
-        self.assertEqual(len(reads), 18)  # baseline + 10 fast + final + 3 * (baseline + final)
-        self.assertEqual([round(t, 3) for t in retries], [.7, 3.4, 7.1])
-        self.assertAlmostEqual(clock[0], 12.8)
-        self.assertEqual(confirmations, [(1, False)])
-        self.assertFalse(controller.confirmation_pending)
-        self.assertTrue(controller.stop())
-        self.assertFalse(controller.cleanup_pending)
-
-    def test_slow_query_does_not_catch_up_with_burst_of_overdue_probes(self):
-        clock, count = [0.0], [0]
-        def read():
-            count[0] += 1
-            clock[0] += .6
-            return 10
-        controller = self.make_controller(
-            mic_start_reader=read, revive_profile=None,
-            sleep=lambda delay: clock.__setitem__(0, clock[0] + delay),
-            thread_factory=_ImmediateThread,
-        )
-        with mock.patch.object(wetype_control_windows.time, "monotonic", side_effect=lambda: clock[0]):
-            self.assertTrue(controller.start(self.VOICE_KEYS))
-        self.assertEqual(count[0], 3)  # baseline, one slow fast query, final check
-        self.assertFalse(controller.confirmation_pending)
-        self.assertTrue(controller.stop())
-
-    def test_one_slow_query_does_not_run_remaining_probes_back_to_back(self):
-        clock, reads = [0.0], []
-        def read():
-            reads.append(clock[0])
-            if len(reads) == 2:
-                clock[0] += .3
-            return 10
-        controller = self.make_controller(
-            mic_start_reader=read, revive_profile=None,
-            sleep=lambda delay: clock.__setitem__(0, clock[0] + delay),
-            thread_factory=_ImmediateThread,
-        )
-        with mock.patch.object(wetype_control_windows.time, "monotonic", side_effect=lambda: clock[0]):
-            self.assertTrue(controller.start(self.VOICE_KEYS))
-        self.assertTrue(all(b - a >= .049 for a, b in zip(reads, reads[1:])))
-        self.assertLessEqual(len(reads), 8)
-        self.assertTrue(controller.stop())
-
-    def test_confirmation_thread_start_failure_does_not_leave_pending_flag(self):
-        thread = mock.Mock()
-        thread.start.side_effect = RuntimeError("thread unavailable")
-        controller = self.make_controller(
-            mic_start_reader=lambda: 10, thread_factory=lambda **_: thread)
-        self.assertTrue(controller.start(self.VOICE_KEYS))
-        self.assertFalse(controller.confirmation_pending)
-        self.assertTrue(controller.stop())
-        self.assertFalse(controller.cleanup_pending)
-
-    def test_blocked_query_does_not_lock_release_or_clear_next_confirmation(self):
-        entered, proceed = threading.Event(), threading.Event()
-        pending, confirmations, reads = [], [], [0]
-        def read():
-            reads[0] += 1
-            if reads[0] == 2:
-                entered.set()
-                if not proceed.wait(2):
-                    raise TimeoutError("test query release missing")
-            return 20 if reads[0] in (2, 4) else 10
-        def spawn(**options):
-            pending.append(options["target"])
-            return mock.Mock()
-        controller = self.make_controller(
-            mic_start_reader=read, thread_factory=spawn, sleep=lambda _: None,
-            on_confirmation=lambda gen, ok: confirmations.append((gen, ok)),
-        )
-        self.assertTrue(controller.start(self.VOICE_KEYS))
-        old = threading.Thread(target=pending[0], daemon=True)
-        old.start()
-        try:
-            self.assertTrue(entered.wait(1))
-            self.assertTrue(controller.stop())
-            self.assertFalse(controller.confirmation_pending)
-            self.assertTrue(controller.start(self.VOICE_KEYS))
-            self.assertTrue(controller.confirmation_pending)
-        finally:
-            proceed.set()
-            old.join(1)
-        self.assertFalse(old.is_alive())
-        self.assertTrue(controller.confirmation_pending)
-        self.assertEqual(confirmations, [])
-        pending[1]()
-        self.assertEqual(confirmations, [(2, True)])
-        self.assertTrue(controller.stop())
-
-    def test_confirmation_error_clears_pending_and_allows_next_hold_after_release(self):
-        controller = self.make_controller(
-            mic_start_reader=mock.Mock(side_effect=[10, OSError("query failed"), 10, 20]),
-            sleep=lambda _: None, thread_factory=_ImmediateThread,
-        )
-        self.assertTrue(controller.start(self.VOICE_KEYS))
-        self.assertFalse(controller.confirmation_pending)
-        self.assertTrue(controller.stop())
-        self.assertTrue(controller.start(self.VOICE_KEYS))
-        self.assertFalse(controller.confirmation_pending)
-        self.assertTrue(controller.stop())
-
     def test_registration_failure_keeps_pressed_keys_owned_for_cleanup(self):
         released = []
         controller = self.make_controller(
@@ -971,142 +687,422 @@ class WeTypeVoiceControlTests(unittest.TestCase):
         self.assertEqual(released, [self.VOICE_KEYS])
 
 
-class _ImmediateThread:
-    def __init__(self, *, target, **_kwargs):
-        self._target = target
+class WeTypeCaptureObservationTests(unittest.TestCase):
+    KEYS = ("lctrl", "lwin")
+    CAPTURE = wetype_control_windows.voice_playback_session_windows.CaptureSession("mic", "new", 42, 1)
 
-    def start(self):
-        self._target()
+    def setUp(self):
+        self.clock = 0.0
+        self.edges = []
+        self.confirmations = []
+        self.workers = []
+        self.controls = []
+        self.time_patch = mock.patch.object(wetype_control_windows.time, "monotonic", side_effect=lambda: self.clock)
+        self.time_patch.start()
 
+    def tearDown(self):
+        for control in self.controls:
+            control.stop()
+        for worker in self.workers:
+            worker.join(1)
+            self.assertFalse(worker.is_alive(), "observer did not settle")
+        self.time_patch.stop()
+        wetype_control_windows.set_diagnostic_trace(None)
 
-class WeTypePlaybackMuteProtectionTests(unittest.TestCase):
-    def make_control(self, guard, **overrides):
-        self.pending = []
-        def thread_factory(**options):
-            self.pending.append(options["target"])
-            return mock.Mock()
+    def advance(self, delay):
+        self.clock += delay
+
+    def wait_for_cancel(self, cancelled, delay):
+        self.advance(delay)
+        return cancelled.is_set()
+
+    def make_control(self, **overrides):
+        down = [False]
+        def press(keys):
+            self.edges.append(("down", tuple(keys), self.clock))
+            down[0] = True
+        def release(keys):
+            self.edges.append(("up", tuple(keys), self.clock))
+            down[0] = False
+        def spawn(**options):
+            thread = threading.Thread(**options)
+            self.workers.append(thread)
+            return thread
         options = dict(
-            prepare_playback_mute_guard=lambda: guard,
-            mic_start_reader=mock.Mock(side_effect=[10, 20, 20, 30]),
-            thread_factory=thread_factory,
-            sleep=lambda _: None,
+            capture_reader=lambda: (self.CAPTURE,) if down[0] else (),
+            press_keys=press, release_keys=release,
+            on_confirmation=lambda gen, ok: self.confirmations.append((gen, ok)),
+            thread_factory=spawn, wait_for_cancel=self.wait_for_cancel, logger=mock.Mock(),
         )
         options.update(overrides)
-        return WeTypeVoiceControlTests.make_controller(**options)
+        control = WeTypeVoiceControlTests.make_controller(**options)
+        self.controls.append(control)
+        return control
 
-    def test_baseline_precedes_key_down_and_each_confirmed_hold_restores_once(self):
+    def settle(self):
+        for worker in self.workers:
+            worker.join(1)
+            self.assertFalse(worker.is_alive())
+
+    def test_basic_hold_confirms_without_repress_and_ends_on_release(self):
+        registered = []
+        control = self.make_control(on_started=lambda gen: registered.append(gen))
+        self.assertTrue(control.start(self.KEYS))
+        self.settle()
+        self.assertEqual(registered, [1])
+        self.assertEqual(self.confirmations, [(1, True)])
+        self.assertEqual([edge[0] for edge in self.edges], ["down"])
+        self.clock = 15.0
+        self.assertTrue(control.stop())
+        self.assertEqual([edge[0] for edge in self.edges], ["down", "up"])
+        self.assertFalse(control.cleanup_pending)
+
+    def test_late_capture_uses_original_baseline_and_does_not_repress(self):
+        for start_at in (4, 8.5, 12):
+            with self.subTest(start_at=start_at):
+                self.clock = 0.0
+                self.edges.clear()
+                self.confirmations.clear()
+                guard = mock.Mock()
+                guard.restore_if_muted.return_value = "restored"
+                control = self.make_control(
+                    capture_reader=lambda: (self.CAPTURE,) if self.clock >= start_at else (),
+                    prepare_playback_mute_guard=lambda: guard,
+                )
+                self.assertTrue(control.start(self.KEYS))
+                self.settle()
+                self.assertEqual(self.confirmations, [(1, True)])
+                self.assertGreaterEqual(self.clock, start_at)
+                self.assertEqual([edge[0] for edge in self.edges], ["down"])
+                guard.restore_if_muted.assert_called_once_with()
+                self.assertTrue(control.stop())
+
+    def test_missing_old_or_ambiguous_capture_never_interrupts_hold(self):
+        other = wetype_control_windows.voice_playback_session_windows.CaptureSession("mic", "other", 43, 1)
+        for kind in ("empty", "old", "ambiguous", "baseline_error", "query_error"):
+            with self.subTest(kind=kind):
+                self.clock = 0.0
+                self.confirmations.clear()
+                self.edges.clear()
+                reads = []
+                def read():
+                    reads.append(self.clock)
+                    if kind == "baseline_error" or (kind == "query_error" and len(reads) > 1):
+                        raise OSError("metadata unavailable")
+                    if kind == "old":
+                        return (self.CAPTURE,)
+                    if kind == "ambiguous" and len(reads) > 1:
+                        return (self.CAPTURE, other)
+                    return ()
+                guard = mock.Mock()
+                def wait(cancelled, delay):
+                    self.advance(delay)
+                    if self.clock >= 15:
+                        # The device ends this hold, never the observer.
+                        self.assertEqual([edge[0] for edge in self.edges], ["down"])
+                        control.stop()
+                    return cancelled.is_set()
+                control = self.make_control(capture_reader=read, prepare_playback_mute_guard=lambda: guard,
+                                            wait_for_cancel=wait)
+                self.assertTrue(control.start(self.KEYS))
+                self.settle()
+                self.assertEqual(self.confirmations, [(1, False)] if kind == "baseline_error" else [])
+                self.assertFalse(control.confirmation_pending)
+                self.assertLessEqual(len(reads), 69)
+                guard.restore_if_muted.assert_not_called()
+                self.assertTrue(control.stop())
+                self.assertEqual([edge[0] for edge in self.edges], ["down", "up"])
+
+    def test_transient_query_error_does_not_reset_baseline(self):
+        read = mock.Mock(side_effect=[(), OSError("busy"), (self.CAPTURE,)])
+        control = self.make_control(capture_reader=read)
+        control.start(self.KEYS)
+        self.settle()
+        self.assertEqual(self.confirmations, [(1, True)])
+
+    def test_slow_queries_have_no_catch_up_burst_and_can_confirm_late(self):
+        reads = []
+        def read():
+            reads.append(self.clock)
+            if len(reads) > 1:
+                self.clock += .6
+            return (self.CAPTURE,) if self.clock >= 4 else ()
+        control = self.make_control(capture_reader=read)
+        control.start(self.KEYS)
+        self.settle()
+        self.assertEqual(self.confirmations, [(1, True)])
+        self.assertLessEqual(len(reads), 7)
+        self.assertTrue(all(b - a >= .049 for a, b in zip(reads, reads[1:])))
+
+    def test_blocked_baseline_is_bounded_and_cannot_spawn_more_workers(self):
+        entered, proceed = threading.Event(), threading.Event()
+        def read():
+            entered.set()
+            proceed.wait(2)
+            return ()
+        control = self.make_control(capture_reader=read)
+        try:
+            with mock.patch.object(wetype_control_windows, "_WETYPE_BASELINE_WAIT_SECONDS", .02):
+                self.assertTrue(control.start(self.KEYS))
+            self.assertTrue(entered.is_set())
+            self.assertEqual(self.confirmations, [(1, False)])
+            self.assertTrue(control.stop())
+            self.assertTrue(control.start(self.KEYS))
+            self.assertEqual(self.confirmations, [(1, False), (2, False)])
+            self.assertEqual(len(self.workers), 1)
+        finally:
+            proceed.set()
+            self.settle()
+        self.assertFalse(control.confirmation_pending)
+        self.assertTrue(control.cleanup_pending)
+
+    def test_blocked_post_press_query_does_not_lock_release_or_touch_next_hold(self):
+        entered, proceed = threading.Event(), threading.Event()
+        count = [0]
+        def read():
+            count[0] += 1
+            if count[0] == 1:
+                return ()
+            entered.set()
+            proceed.wait(2)
+            return (self.CAPTURE,)
+        guard = mock.Mock()
+        control = self.make_control(capture_reader=read, prepare_playback_mute_guard=lambda: guard)
+        try:
+            self.assertTrue(control.start(self.KEYS))
+            self.assertTrue(entered.wait(1))
+            self.assertTrue(control.stop())
+            self.assertTrue(control.start(self.KEYS))
+            self.assertEqual(self.confirmations, [(2, False)])
+            self.assertEqual(len(self.workers), 1)
+        finally:
+            proceed.set()
+            self.settle()
+        guard.restore_if_muted.assert_not_called()
+        self.assertEqual(self.confirmations, [(2, False)])
+        self.assertTrue(control.cleanup_pending)
+
+    def test_capture_returning_after_release_cannot_confirm_or_unmute(self):
+        count = [0]
+        def read():
+            count[0] += 1
+            if count[0] == 1:
+                return ()
+            self.clock = 4
+            control.stop()
+            return (self.CAPTURE,)
+        guard = mock.Mock()
+        control = self.make_control(capture_reader=read, prepare_playback_mute_guard=lambda: guard)
+        control.start(self.KEYS)
+        self.settle()
+        self.assertEqual(self.confirmations, [])
+        guard.restore_if_muted.assert_not_called()
+
+    def test_thread_failure_is_unknown_and_keeps_key_ownership(self):
+        factory = mock.Mock(side_effect=RuntimeError("no thread"))
+        control = self.make_control(thread_factory=factory)
+        self.assertTrue(control.start(self.KEYS))
+        self.assertEqual(self.confirmations, [(1, False)])
+        self.assertFalse(control.confirmation_pending)
+        self.assertTrue(control.stop())
+
+    def test_release_before_first_probe_cancels_confirmation(self):
+        control = self.make_control(wait_for_cancel=lambda event, delay: control.stop())
+        self.assertTrue(control.start(self.KEYS))
+        self.settle()
+        self.assertEqual(self.confirmations, [])
+        self.assertFalse(control.cleanup_pending)
+
+    def test_failed_key_down_or_registration_cancels_observer(self):
+        for target in ("press_keys", "on_started"):
+            with self.subTest(target=target):
+                control = self.make_control(**{target: mock.Mock(side_effect=OSError("failed"))})
+                self.assertFalse(control.start(self.KEYS))
+                self.settle()
+                self.assertFalse(control.confirmation_pending)
+                self.assertEqual(self.confirmations, [])
+                self.assertTrue(control.stop())
+
+    def test_cancel_during_baseline_does_not_deliver_keys(self):
+        cancelled = threading.Event()
+        def read():
+            cancelled.set()
+            return ()
+        control = self.make_control(capture_reader=read)
+        self.assertFalse(control.start(self.KEYS, cancelled=cancelled.is_set))
+        self.settle()
+        self.assertEqual(self.edges, [])
+        self.assertFalse(control.cleanup_pending)
+
+    def test_playback_baseline_precedes_key_down_and_restores_once_per_hold(self):
         calls = []
         guard = mock.Mock()
         guard.restore_if_muted.return_value = "restored"
         control = self.make_control(
-            guard,
             prepare_playback_mute_guard=lambda: calls.append("baseline") or guard,
             press_keys=lambda _: calls.append("down"),
-        )
+            capture_reader=lambda: (self.CAPTURE,) if self.clock > 0 else ())
         for _ in range(2):
-            self.assertTrue(control.start(("f9",)))
-            self.pending.pop(0)()
-            self.assertTrue(control.stop())
+            self.clock = 0.0
+            control.start(self.KEYS)
+            self.settle()
+            control.stop()
         self.assertEqual(calls, ["baseline", "down", "baseline", "down"])
         self.assertEqual(guard.restore_if_muted.call_count, 2)
+        self.assertEqual(self.confirmations, [(1, True), (2, True)])
 
-    def test_short_press_and_stale_confirmation_do_not_restore(self):
-        guard = mock.Mock()
-        control = self.make_control(guard)
-        self.assertTrue(control.start(("f9",)))
-        control.stop()
-        self.assertTrue(control.start(("f9",)))
-        self.pending[0]()
-        guard.restore_if_muted.assert_not_called()
-        control.stop()
-
-    def test_no_mic_confirmation_does_not_restore(self):
-        guard = mock.Mock()
-        control = self.make_control(guard, mic_start_reader=lambda: 10, revive_profile=None)
-        control.start(("f9",))
-        self.pending[0]()
-        guard.restore_if_muted.assert_not_called()
-        control.stop()
-
-    def test_late_mute_is_bounded_and_stops_after_first_restore(self):
+    def test_late_mute_window_stops_after_restore_or_session_change(self):
         for results, expected in ((["waiting", "restored"], 2), (["waiting"] * 16, 16), (["session_changed"], 1)):
             with self.subTest(results=results):
                 guard = mock.Mock()
                 guard.restore_if_muted.side_effect = results
-                control = self.make_control(guard)
-                control.start(("f9",))
-                self.pending[0]()
+                control = self.make_control(prepare_playback_mute_guard=lambda: guard)
+                control.start(self.KEYS)
+                self.settle()
                 self.assertEqual(guard.restore_if_muted.call_count, expected)
                 control.stop()
 
-    def test_release_during_wait_cancels_further_probes(self):
+    def test_guard_errors_cannot_break_confirmation_or_release(self):
+        for baseline_error in (False, True):
+            with self.subTest(baseline_error=baseline_error):
+                guard = mock.Mock()
+                guard.restore_if_muted.side_effect = OSError("session gone")
+                prepare = mock.Mock(return_value=guard)
+                if baseline_error:
+                    prepare.side_effect = OSError("unavailable")
+                control = self.make_control(prepare_playback_mute_guard=prepare)
+                control.start(self.KEYS)
+                self.settle()
+                self.assertTrue(self.confirmations[-1][1])
+                self.assertTrue(control.stop())
+
+    def test_failed_release_stops_mute_recovery_and_only_retries_key_up(self):
         guard = mock.Mock()
         guard.restore_if_muted.return_value = "waiting"
-        control = self.make_control(guard, sleep=lambda delay: control.stop() if delay == 0.1 else None)
-        control.start(("f9",))
-        self.pending[0]()
+        release = mock.Mock(side_effect=[OSError("busy"), None])
+        def wait(cancelled, delay):
+            self.advance(delay)
+            if delay == .1:
+                self.assertFalse(control.stop())
+            return cancelled.is_set()
+        control = self.make_control(prepare_playback_mute_guard=lambda: guard, release_keys=release,
+                                    wait_for_cancel=wait)
+        control.start(self.KEYS)
+        self.settle()
+        self.assertTrue(control.cleanup_pending)
+        self.assertFalse(control.start(self.KEYS))
+        self.assertTrue(control.stop())
+        self.assertEqual(release.call_count, 2)
+        self.assertEqual(len(self.edges), 1)
         guard.restore_if_muted.assert_called_once_with()
-        self.assertFalse(control.cleanup_pending)
-
-    def test_guard_failure_does_not_break_key_release_or_confirmation(self):
-        for baseline_failure in (False, True):
-            with self.subTest(baseline_failure=baseline_failure):
-                guard = mock.Mock()
-                guard.restore_if_muted.side_effect = OSError("gone")
-                factory = mock.Mock(return_value=guard)
-                if baseline_failure:
-                    factory.side_effect = OSError("unavailable")
-                confirmation = mock.Mock()
-                control = self.make_control(guard, prepare_playback_mute_guard=factory, on_confirmation=confirmation)
-                control.start(("f9",))
-                self.pending[0]()
-                confirmation.assert_called_once_with(1, True)
-                self.assertTrue(control.stop())
 
     def test_setter_and_key_release_are_serialized(self):
         entered, proceed, stopping = threading.Event(), threading.Event(), threading.Event()
         calls = []
         guard = mock.Mock()
-
         def restore():
             entered.set()
-            if not proceed.wait(1.0):
-                raise AssertionError("test did not release probe")
+            proceed.wait(2)
             calls.append("restore")
             return "restored"
-
         guard.restore_if_muted.side_effect = restore
-        control = self.make_control(guard, release_keys=lambda _: calls.append("up"))
-        control.start(("f9",))
-        worker = threading.Thread(target=self.pending[0])
+        control = self.make_control(prepare_playback_mute_guard=lambda: guard, release_keys=lambda _: calls.append("up"))
         stopper = threading.Thread(target=lambda: (stopping.set(), control.stop()))
         try:
-            worker.start()
-            self.assertTrue(entered.wait(1.0))
+            control.start(self.KEYS)
+            self.assertTrue(entered.wait(1))
             stopper.start()
-            self.assertTrue(stopping.wait(1.0))
-            self.assertNotIn("up", calls)
+            self.assertTrue(stopping.wait(1))
+            self.assertEqual(calls, [])
         finally:
             proceed.set()
-            worker.join(1.0)
-            if stopper.ident is not None:
-                stopper.join(1.0)
-        self.assertFalse(worker.is_alive())
-        self.assertFalse(stopper.is_alive())
+            stopper.join(1)
+            self.settle()
         self.assertEqual(calls, ["restore", "up"])
         control._protect_playback_session(1, guard)
         guard.restore_if_muted.assert_called_once_with()
 
-    def test_unavailable_guard_or_failed_key_down_does_not_write(self):
-        control = self.make_control(None)
-        self.assertTrue(control.start(("f9",)))
-        self.pending[0]()
-        self.assertTrue(control.stop())
-        guard = mock.Mock()
-        control = self.make_control(guard, press_keys=mock.Mock(side_effect=OSError("failed")))
-        self.assertFalse(control.start(("f9",)))
-        self.assertEqual(self.pending, [])
-        guard.restore_if_muted.assert_not_called()
+
+class WeTypeObservationHandoffTests(unittest.TestCase):
+    def test_rapid_reopen_wakes_wait_and_hands_off_before_new_baseline(self):
+        # Use real Event waits; pausing the cancelled worker's unwind makes
+        # this exercise the handoff too, not just favourable scheduling.
+        for phase in ("capture", "mute"):
+            with self.subTest(phase=phase):
+                entered, cancelled_wait, unwind = (threading.Event() for _ in range(3))
+                workers, edges, confirmations, baseline_generations = [], [], [], []
+                down = False
+                generation = 0
+                guards = [mock.Mock(), mock.Mock()]
+                guards[0].restore_if_muted.return_value = "waiting"
+                guards[1].restore_if_muted.return_value = "restored"
+                capture = wetype_control_windows.voice_playback_session_windows.CaptureSession("mic", "new", 42, 1)
+
+                def press(keys):
+                    nonlocal down, generation
+                    generation += 1
+                    down = True
+                    edges.append("down")
+
+                def release(keys):
+                    nonlocal down
+                    down = False
+                    edges.append("up")
+
+                def read():
+                    if not down:
+                        baseline_generations.append(generation + 1)
+                    return (capture,) if down and (generation == 2 or phase == "mute") else ()
+
+                def wait(cancelled, delay):
+                    target = .25 if phase == "capture" else .1
+                    if generation == 1 and delay == target:
+                        entered.set()
+                        result = cancelled.wait(1)
+                        if result:
+                            cancelled_wait.set()
+                            unwind.wait(1)
+                        return result
+                    return cancelled.wait(delay)
+
+                def spawn(**options):
+                    worker = threading.Thread(**options)
+                    workers.append(worker)
+                    return worker
+
+                control = WeTypeVoiceControlTests.make_controller(
+                    capture_reader=read, press_keys=press, release_keys=release,
+                    on_confirmation=lambda gen, ok: confirmations.append((gen, ok)),
+                    prepare_playback_mute_guard=lambda: guards[generation],
+                    wait_for_cancel=wait, thread_factory=spawn, logger=mock.Mock(),
+                )
+                timer = threading.Timer(.04, unwind.set)
+                try:
+                    self.assertTrue(control.start(("lctrl", "lwin")))
+                    self.assertTrue(entered.wait(1))
+                    self.assertTrue(control.stop())
+                    self.assertTrue(cancelled_wait.wait(1), "release did not wake the observer")
+                    # No join between release and reopen. The previous worker
+                    # still owns the observer gate when the new start arrives.
+                    self.assertTrue(workers[0].is_alive())
+                    timer.start()
+                    self.assertTrue(control.start(("lctrl", "lwin")))
+                    for worker in workers:
+                        worker.join(1)
+                    self.assertTrue(all(not worker.is_alive() for worker in workers))
+                    self.assertEqual(len(workers), 2)
+                    self.assertEqual(baseline_generations, [1, 2])
+                    self.assertEqual(confirmations, ([(1, True)] if phase == "mute" else []) + [(2, True)])
+                    self.assertEqual(edges, ["down", "up", "down"])
+                    self.assertEqual(guards[0].restore_if_muted.call_count, 1 if phase == "mute" else 0)
+                    guards[1].restore_if_muted.assert_called_once_with()
+                finally:
+                    unwind.set()
+                    control.stop()
+                    if timer.ident is not None:
+                        timer.join(1)
+                    for worker in workers:
+                        worker.join(1)
 
 
 class DoubaoVoiceControlTests(unittest.TestCase):

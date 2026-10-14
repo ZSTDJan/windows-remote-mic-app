@@ -107,6 +107,8 @@ $elevationMarkers = @("runas", "ShellExecute", "IsUserAnAdmin", "RequireAdminist
 # Exact reviewed markers only; branding, paths and autostart remain checked.
 $reviewedElevationMarkers = @{
     "src/ovb_rc003/chromecast_pipe_windows.py" = @("runas", "ShellExecute")
+    # Source-only one-shot HID worker; fixed launcher and authenticated pipe.
+    "src/ovb_rc003/hid_source_injector.py" = @("runas", "ShellExecute")
     "scripts/sogou_normal_submit_test.py" = @("IsUserAnAdmin")
     "scripts/sogou_stop_probe.py" = @("IsUserAnAdmin")
 }

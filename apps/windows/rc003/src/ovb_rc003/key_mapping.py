@@ -64,6 +64,10 @@ class ActionKind(str, Enum):
     MOUSE_WHEEL_DOWN = "mouse_wheel_down"
     MOUSE_X1_CLICK = "mouse_x1_click"
     MOUSE_X2_CLICK = "mouse_x2_click"
+    MOUSE_LEFT_HOLD = "mouse_left_hold"
+    MOUSE_RIGHT_HOLD = "mouse_right_hold"
+    MOUSE_X1_HOLD = "mouse_x1_hold"
+    MOUSE_X2_HOLD = "mouse_x2_hold"
     ELEMENT_NAVIGATION_TOGGLE = "element_navigation_toggle"
     # ``VOICE`` and ``VOICE_TOGGLE`` remain parseable only so schema-1 files
     # can be failed closed with an explicit migration notice. They are not
@@ -83,6 +87,14 @@ class ActionKind(str, Enum):
     OPEN_CHROME = "open_chrome"
     OPEN_EDGE = "open_edge"
     OPEN_ZED = "open_zed"
+
+
+MOUSE_HOLD_BUTTONS = {
+    ActionKind.MOUSE_LEFT_HOLD: "left",
+    ActionKind.MOUSE_RIGHT_HOLD: "right",
+    ActionKind.MOUSE_X1_HOLD: "x1",
+    ActionKind.MOUSE_X2_HOLD: "x2",
+}
 
 
 class ButtonTrigger(str, Enum):
@@ -399,7 +411,10 @@ def button_action_for(
     if not isinstance(raw, dict):
         return ButtonAction(ActionKind.DISABLED)
     try:
-        return ButtonAction.from_dict(raw)
+        action = ButtonAction.from_dict(raw)
+        if action.kind in MOUSE_HOLD_BUTTONS and trigger != ButtonTrigger.LONG_PRESS:
+            return ButtonAction(ActionKind.DISABLED)
+        return action
     except (KeyError, TypeError, ValueError):
         return ButtonAction(ActionKind.DISABLED)
 
@@ -449,7 +464,7 @@ def button_combo_action_for(
         action = ButtonAction.from_dict(raw_action)
     except (KeyError, TypeError, ValueError):
         return ButtonAction(ActionKind.DISABLED)
-    if is_voice_action(action):
+    if is_voice_action(action) or action.kind in MOUSE_HOLD_BUTTONS:
         return ButtonAction(ActionKind.DISABLED)
     return action
 

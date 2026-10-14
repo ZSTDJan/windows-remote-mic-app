@@ -125,6 +125,7 @@ from . import (
     hotkey_capture_windows,
     key_detection_bridge,
     key_mapping,
+    mapping_presets,
     log_export,
     logging_setup,
     product_identity,
@@ -731,6 +732,10 @@ def _load_qt_classes() -> dict:
         native_scan_code: int = 0,
     ) -> str:
         key = int(key)
+        # A forwarded hook-health probe can also reach Qt. Qt does not retain
+        # LLKHF_INJECTED; VK_NONAME is reserved and cannot be a user key here.
+        if native_virtual_key == hotkey_capture_windows.VK_NONAME:
+            return ""
         keypad_token = (_QT_KEYPAD_TOKENS.get(key)
                         if modifiers & Qt.KeyboardModifier.KeypadModifier.value else None)
         if keypad_token in win32_keys.UNSUPPORTED_KEY_MESSAGES:
@@ -1117,6 +1122,7 @@ def _load_qt_classes() -> dict:
         no validation or business logic of its own.
         """
 
+        mappingPresetsChanged = Signal()
         hotkeyTextChanged = Signal()
         holdVoiceHotkeyTextChanged = Signal()
         endpointOptionsChanged = Signal()
@@ -1191,6 +1197,7 @@ def _load_qt_classes() -> dict:
         logExportBusyChanged = Signal()
         _logExportReady = Signal(object)
         _hotkeyCaptureResult = Signal(object)
+        _hotkeyCaptureFailed = Signal(object)
         _endpointOptionsRefreshReady = Signal(object)
         _voiceProgramStatusRefreshReady = Signal(object)
         _voiceProgramOptionsRefreshReady = Signal(object)
@@ -1397,6 +1404,12 @@ def _load_qt_classes() -> dict:
                 self._on_voice_program_options_refresh_ready
             )
             self._voice_hotkey_busy = False
+            self._voice_hotkey_load_pending = None
+            self._voice_hotkey_load_timer = QTimer(self)
+            self._voice_hotkey_load_timer.setSingleShot(True)
+            self._voice_hotkey_load_timer.timeout.connect(
+                self._retry_pending_voice_hotkey_load
+            )
             self._voice_hotkey_save_state = "saved"
             self._voice_hotkey_task_token = 0
             self._voice_hotkey_task_completion = None
@@ -1564,6 +1577,8 @@ def _load_qt_classes() -> dict:
             self._mapping_dirty = bool(self._removed_voice_bindings)
             self._settings_revision = 0
             self._settings_save_busy = False
+            self._mapping_preset_rows: List[dict] = []
+            self._mapping_applied_overrides: Dict[str, str] = {}
             self._mapping_auto_save_scheduled = False
             self._mapping_auto_save_running = False
             self._mapping_auto_save_retry_available = False
@@ -1605,6 +1620,7 @@ def _load_qt_classes() -> dict:
             self._qt_hotkey_pressed_keys: set[str] = set()
             self._qt_hotkey_primary_key: Optional[int] = None
             self._hotkeyCaptureResult.connect(self._on_hotkey_capture_result)
+            self._hotkeyCaptureFailed.connect(self._on_hotkey_capture_failed)
             application = QApplication.instance()
             if application is not None:
                 application.installEventFilter(self)
@@ -1716,6 +1732,7 @@ def _load_qt_classes() -> dict:
             self._endpoint_options_refresh_pending = False
             self._voice_program_status_refresh_pending = False
             self._voice_program_options_refresh_pending = False
+            self._clear_pending_voice_hotkey_load()
             self._voice_hotkey_task_token += 1
             self._voice_hotkey_task_completion = None
             voice_hotkey_cancel = self._voice_hotkey_task_cancel_event
@@ -2268,6 +2285,8 @@ def _load_qt_classes() -> dict:
             self._remote_save_uncertain = False
             self._bump_settings_revision()
             self.remoteSelectionChanged.emit()
+            if changed:
+                self.loadVoiceHotkeyFromProvider()
             return True
 
         @Slot(str)
@@ -2513,6 +2532,8 @@ def _load_qt_classes() -> dict:
         def _runtime_status_requires_restart(
             status: bridge_runtime_status.BridgeRuntimeStatus,
         ) -> bool:
+            if status.hid_tap_state in {"authorization_cancelled", "authorization_failed"}:
+                return False
             return (
                 bridge_runtime_status.input_channels_failed(status)
                 or status.voice_key_physicalizer_state in {"failed", "stopped"}
@@ -2583,6 +2604,7 @@ def _load_qt_classes() -> dict:
             self,
             status: bridge_runtime_status.BridgeRuntimeStatus,
         ) -> str:
+            unconfirmed_text = "已收到声音，未确认微信开麦；若未输入文字，请松开后重试"
             if remote_selection.active_profile(self._config) == remote_selection.CHROMECAST_PROFILE:
                 from .chromecast_client import message
                 state = ("普通按键接收正常" if status.raw_input_state == "chromecast_ready"
@@ -2590,6 +2612,7 @@ def _load_qt_classes() -> dict:
                          else message(status.raw_input_state.removeprefix("chromecast_")))
                 voice_state = {
                     bridge_runtime_status.VOICE_RUNTIME_HOST_START_FAILED: "语音启动失败，请查看运行日志",
+                    bridge_runtime_status.VOICE_RUNTIME_HOST_UNCONFIRMED: unconfirmed_text,
                     bridge_runtime_status.VOICE_RUNTIME_HOST_STOP_FAILED: "语音尚未正常结束，请先停止服务",
                     bridge_runtime_status.VOICE_RUNTIME_OUTPUT_OPEN_FAILED: "语音输出未打开，请检查声音通道",
                 }.get(status.voice_runtime_state, "语音请先用微信输入法验证")
@@ -2641,7 +2664,9 @@ def _load_qt_classes() -> dict:
                 in {"failed", "stopped"}
             )
             physicalizer_ready = status.voice_key_physicalizer_state == "ready"
-            if raw_ready and tap_ready:
+            if status.hid_tap_state in {"authorization_cancelled", "authorization_failed"}:
+                input_text = "按键授权未完成；请在设备页点击“重新授权”"
+            elif raw_ready and tap_ready:
                 if physicalizer_recovering:
                     input_text = (
                         "自定义按键映射可用；语音快捷键通道正在恢复"
@@ -2676,6 +2701,8 @@ def _load_qt_classes() -> dict:
                 if age <= 10.0:
                     input_text += f"，刚收到按键（{status.last_button_source or '来源未知'}）"
             voice_text = "语音进行中" if status.voice_active else "语音空闲"
+            if status.voice_runtime_state == bridge_runtime_status.VOICE_RUNTIME_HOST_UNCONFIRMED:
+                voice_text = unconfirmed_text
             stale_text = (
                 "；状态更新滞后"
                 if time.time() - status.updated_at
@@ -2701,7 +2728,9 @@ def _load_qt_classes() -> dict:
                     status,
                     self._current_runtime_identity,
                 )
-                if identity_match is not True:
+                if status.hid_tap_state in {"authorization_cancelled", "authorization_failed"}:
+                    recommended = False
+                elif identity_match is not True:
                     recommended = True
                     automatic = identity_match is False and not status.voice_active
                 elif bridge_runtime_status.input_channels_failed(status):
@@ -3559,6 +3588,8 @@ def _load_qt_classes() -> dict:
             capture = hotkey_capture_windows.HotkeyCapture(
                 report_capture,
                 accept_injected=True,
+                isolated=True,
+                on_error=lambda message: self._hotkeyCaptureFailed.emit((operation_token, message)),
             )
             try:
                 capture.start()
@@ -3881,6 +3912,11 @@ def _load_qt_classes() -> dict:
             if token != self._input_operation_token:
                 return
             self._clear_input_worker_result(token, action)
+            hotkey_start_cancelled = bool(
+                action == "start" and result.kind == "hotkey"
+                and self._input_operation_cancel_event is not None
+                and self._input_operation_cancel_event.is_set()
+            )
             self._input_operation_cancel_event = None
             if action == "start":
                 self._hotkey_capture = result.hotkey_capture
@@ -3900,6 +3936,16 @@ def _load_qt_classes() -> dict:
                 if result.kind == "hotkey":
                     if result.message:
                         self.hotkeyCaptureError.emit(result.message)
+                    # The child's error/EOF and the start worker's ready
+                    # signal can arrive in either order. Cancellation still
+                    # owns the handoff after the worker's last flag check.
+                    if hotkey_start_cancelled:
+                        self._pending_hotkey_capture_result = None
+                        if has_resource:
+                            self._request_input_stop(kind="hotkey")
+                        else:
+                            self._after_input_operation_change()
+                        return
                     pending_hotkey = self._pending_hotkey_capture_result
                     self._pending_hotkey_capture_result = None
                     if (
@@ -4671,7 +4717,9 @@ def _load_qt_classes() -> dict:
                 or self._input_operation_phase != "active"
             ):
                 return
-            if status == frida_compat.HidTapState.ATTACHED_WAITING_IO.value:
+            if status in {"authorization_cancelled", "authorization_failed"}:
+                self._set_key_detection_text("按键授权未完成；请回设备页点击“重新授权”")
+            elif status == frida_compat.HidTapState.ATTACHED_WAITING_IO.value:
                 if self._key_detection_listener is not None:
                     waiting_text = (
                         "补充按键通道已连接；请按要检测的按键，常规按键也可继续检测"
@@ -4698,6 +4746,14 @@ def _load_qt_classes() -> dict:
                 self._set_key_detection_text(
                     f"补充按键通道暂不可用{suffix}；返回键、音量键可能测不到，正在重连"
                 )
+
+        def _on_hotkey_capture_failed(self, payload: object) -> None:
+            token, message = payload
+            if token != self._input_operation_token or self._input_operation_kind != "hotkey":
+                return
+            self._pending_hotkey_capture_result = None
+            self._request_input_stop(kind="hotkey")
+            self.hotkeyCaptureError.emit(str(message))
 
         def _on_hotkey_capture_result(self, payload: object) -> None:
             """Forward a hook-thread result to QML on the GUI thread."""
@@ -4762,6 +4818,7 @@ def _load_qt_classes() -> dict:
         def _save_mapping(
             self,
             completion: Optional[Callable[[bool], None]] = None,
+            *, replacement: Optional[dict] = None,
         ) -> bool:
             """Persist the button-page model without adopting other page drafts."""
 
@@ -4829,6 +4886,8 @@ def _load_qt_classes() -> dict:
                 )
                 return finish(False)
 
+            if replacement is not None:
+                new_bindings = replacement
             config_path = config.config_path(self._config_root)
             bindings_path = config.key_bindings_path(self._config_root)
             try:
@@ -6254,6 +6313,10 @@ def _load_qt_classes() -> dict:
                 return list(_SECONDARY_ACTION_OPTIONS)
             return self._mapping_options_available_now(_SECONDARY_ACTION_OPTIONS)
 
+        @Slot(str, result=list)
+        def longPressActionOptionsFor(self, button_id: str) -> List[str]:
+            return self.secondaryActionOptionsFor(button_id) + list(settings_ui.LONG_PRESS_ACTION_LABELS.values())
+
         # Compatibility alias for older QML probes. New code uses the two
         # semantically distinct option properties above.
         presetActionOptions = Property(
@@ -6986,6 +7049,7 @@ def _load_qt_classes() -> dict:
                 })
             if (
                 self._settings_save_busy
+                or self._remote_selection_busy
                 or self._voice_settings_write_start_blocked()
                 or self._get_input_capture_in_use()
                 or self._voice_runtime_state
@@ -7000,23 +7064,47 @@ def _load_qt_classes() -> dict:
                     return True
             return bool(
                 self._settings_save_busy
+                or self._remote_selection_busy
                 or self._voice_settings_write_start_blocked()
                 or self._get_input_capture_in_use()
                 or self._voice_runtime_state
                 in blocked_states
             )
 
+        def _voice_hotkey_load_target(self) -> tuple:
+            return (
+                self.activeRemoteKey,
+                str(self._voice_program_settings.get("provider", "")),
+                self._voice_hotkey_trigger(),
+            )
+
+        def _clear_pending_voice_hotkey_load(self) -> None:
+            self._voice_hotkey_load_pending = None
+            self._voice_hotkey_load_timer.stop()
+
+        def _retry_pending_voice_hotkey_load(self) -> None:
+            if self._voice_hotkey_load_pending != self._voice_hotkey_load_target():
+                self._clear_pending_voice_hotkey_load()
+                return
+            self.loadVoiceHotkeyFromProvider()
+
         @Slot()
         def _refresh_voice_hotkey_from_provider(self, *, explicit: bool) -> None:
-            if self._voice_hotkey_busy:
+            if (self._background_shutdown_event.is_set()
+                    or self._application_exit_requested
+                    or self._application_exit_confirmed
+                    or self._application_exit_intent.is_set()):
+                self._clear_pending_voice_hotkey_load()
                 return
             provider_id = str(self._voice_program_settings.get("provider", ""))
             if provider_id in {
                 voice_program_manager.VOICE_PROGRAM_NONE,
                 voice_program_manager.VOICE_PROGRAM_CUSTOM,
             }:
+                self._clear_pending_voice_hotkey_load()
                 return
             if not explicit and provider_id == voice_program_manager.VOICE_PROGRAM_WETYPE:
+                self._clear_pending_voice_hotkey_load()
                 return
             if (
                 not explicit
@@ -7027,9 +7115,15 @@ def _load_qt_classes() -> dict:
                 )
                 == config.VOICE_HOTKEY_SOURCE_MANUAL
             ):
+                self._clear_pending_voice_hotkey_load()
                 return
-            if self._voice_hotkey_refresh_blocked(refresh_runtime=True):
+            if self._voice_hotkey_busy or self._voice_hotkey_refresh_blocked(refresh_runtime=True):
+                if not explicit:
+                    self._voice_hotkey_load_pending = self._voice_hotkey_load_target()
+                    self._voice_hotkey_load_timer.start(150)
                 return
+            self._clear_pending_voice_hotkey_load()
+            refresh_target = self._voice_hotkey_load_target()
             self._set_voice_hotkey_busy(True)
             if provider_id == voice_program_manager.VOICE_PROGRAM_WETYPE:
                 self._wetype_hotkey_refresh_cancel = threading.Event()
@@ -7049,7 +7143,9 @@ def _load_qt_classes() -> dict:
                         provider_id, allow_settings_window=True, cancel_event=cancel_event,
                         trigger=trigger,
                     ),
-                    lambda ok, payload: self._on_voice_hotkey_refresh_ready(explicit, ok, payload),
+                    lambda ok, payload: self._on_voice_hotkey_refresh_ready(
+                        explicit, ok, payload, refresh_target=refresh_target
+                    ),
                     timeout_ms=6500,
                 )
                 return
@@ -7063,6 +7159,7 @@ def _load_qt_classes() -> dict:
                     explicit,
                     ok,
                     payload,
+                    refresh_target=refresh_target,
                 ),
             )
 
@@ -7079,7 +7176,13 @@ def _load_qt_classes() -> dict:
             explicit: bool,
             ok: bool,
             payload: object,
+            *,
+            refresh_target: tuple | None = None,
         ) -> None:
+            if refresh_target is not None and refresh_target != self._voice_hotkey_load_target():
+                self._set_status_message("语音设置已改变；本次刷新结果未保存。", self._VOICE_PAGE_INDEX)
+                self._finish_voice_hotkey_operation()
+                return
             if (
                 self._wetype_hotkey_refresh_cancel is not None
                 and self._wetype_hotkey_refresh_cancel.is_set()
@@ -7096,7 +7199,10 @@ def _load_qt_classes() -> dict:
                     self._VOICE_PAGE_INDEX,
                 )
                 self._finish_voice_hotkey_operation()
+                if not explicit:
+                    self.loadVoiceHotkeyFromProvider()
                 return
+            self._clear_pending_voice_hotkey_load()
             if not ok:
                 current_validation = voice_hotkey_sync_windows.validate_provider_hotkey(
                     self._voice_program_settings.get("provider"),
@@ -7141,6 +7247,9 @@ def _load_qt_classes() -> dict:
                 result.provider_id,
                 trigger=self._voice_hotkey_trigger(result.provider_id),
             )
+            if not explicit and current_source == config.VOICE_HOTKEY_SOURCE_MANUAL:
+                self._finish_voice_hotkey_operation()
+                return
             if (
                 result.hotkey == current
                 and current_source == config.VOICE_HOTKEY_SOURCE_AUTO
@@ -7380,7 +7489,9 @@ def _load_qt_classes() -> dict:
                     return
                 if not bridge_runtime_status.input_channels_ready(runtime_status):
                     blocked("input_channel_unavailable",
-                        "后台服务当前没有可用的按键通道；请先修复按键通道或重启服务"
+                        "按键授权未完成；请回设备页点击“重新授权”"
+                        if runtime_status.hid_tap_state in {"authorization_cancelled", "authorization_failed"}
+                        else "后台服务当前没有可用的按键通道；请先修复按键通道或重启服务"
                     )
                     return
             logger.info("key detection start accepted: service_running=%s", bool(bridge_running))
@@ -8062,6 +8173,100 @@ def _load_qt_classes() -> dict:
                 self._BUTTONS_PAGE_INDEX,
             )
             self._queue_mapping_auto_save()
+
+        mappingPresets = Property(list, lambda self: self._mapping_preset_rows, notify=mappingPresetsChanged)
+
+        def _refresh_mapping_presets(self) -> None:
+            profile = self._selected_device_id()
+            entries = mapping_presets.PresetStore(self._config_root).view(
+                self._bindings, profile, applied_override=self._mapping_applied_overrides.get(profile))
+            self._mapping_preset_rows = [
+                {key: entry[key] for key in ("id", "name", "automatic", "applied")}
+                for entry in entries
+            ]
+            self.mappingPresetsChanged.emit()
+
+        @Slot(str, str, str, result="QVariantMap")
+        def mappingPresetAction(self, operation: str, identity: str, text: str) -> dict:
+            """Modal UI operations use stable ids, never mutable row indices."""
+            try:
+                if (self._mapping_auto_save_temporarily_blocked() or self._remote_selection_busy
+                        or self._get_input_capture_in_use() or self._application_exit_requested):
+                    raise ValueError("正在处理设置或输入，请完成后重试。")
+                store = mapping_presets.PresetStore(self._config_root)
+                profile = self._selected_device_id()
+                message = ""
+                if operation == "refresh":
+                    pass
+                elif operation == "import":
+                    url = QUrl(text)
+                    if not url.isLocalFile():
+                        raise ValueError("请选择本地 JSON 配置文件。")
+                    identity = store.import_file(Path(url.toLocalFile()), profile)
+                    message = "配置已导入；点击“应用配置”后才会生效。"
+                else:
+                    if identity == mapping_presets.AUTO_ID:
+                        if operation in ("rename", "delete"):
+                            raise ValueError("自动保存项代表当前按键设置，不能重命名或删除。")
+                        if self._mapping_dirty:
+                            raise ValueError("当前映射尚未保存，请先完成自动保存或重试保存。")
+                        entry = {"id": mapping_presets.AUTO_ID, "name": mapping_presets.AUTO_NAME,
+                                 "profile": profile,
+                                 "mapping": mapping_presets.snapshot(self._bindings, profile)}
+                    else:
+                        entry = store.get(identity)
+                    if entry["profile"] != profile:
+                        raise ValueError("所选配置与当前遥控器型号不符，请重新打开面板。")
+                    if operation == "copy":
+                        identity = store.create(text, profile, entry["mapping"])
+                        message = "配置已复制。"
+                    elif operation == "rename":
+                        store.rename(identity, text)
+                        message = "配置已重命名。"
+                    elif operation == "delete":
+                        store.delete(identity)
+                        identity = ""
+                        message = "保存的配置已删除，当前按键设置不变。"
+                    elif operation == "apply":
+                        if self._mapping_dirty:
+                            raise ValueError("当前映射尚未保存，请先完成自动保存或重试保存。")
+                        bindings = mapping_presets.apply_to(self._bindings, entry, profile)
+                        if not self._save_mapping(replacement=bindings):
+                            raise ValueError("未能确认配置保存成功，请检查按键页的保存提示并重试。")
+                        message = "配置已应用；正在按住的按键结束后生效。"
+                        try:
+                            store.mark_applied(profile, identity)
+                            self._mapping_applied_overrides.pop(profile, None)
+                        except Exception:
+                            # Applying the mapping already succeeded. A separate marker failure
+                            # must not misreport it as an unapplied configuration.
+                            self._mapping_applied_overrides[profile] = identity
+                            message += " 应用标记未能保存，重启后可能无法保留加粗提示。"
+                    elif operation == "export":
+                        url = QUrl(text)
+                        if not url.isLocalFile():
+                            raise ValueError("请选择本地 JSON 保存位置。")
+                        store.export_entry(entry, Path(url.toLocalFile()))
+                        message = "配置已导出。"
+                    else:
+                        raise ValueError("不支持的配置操作。")
+                try:
+                    self._refresh_mapping_presets()
+                except Exception:
+                    if operation == "refresh":
+                        raise
+                    # The operation has already committed. Do not invite the user
+                    # to repeat an import/copy because a later list read failed.
+                    return {"ok": True, "id": identity,
+                            "message": message + " 列表未能刷新，请重新打开面板查看。"}
+                if not identity:
+                    identity = next(row["id"] for row in self._mapping_preset_rows if row["applied"])
+                return {"ok": True, "id": identity, "message": message}
+            except Exception as exc:  # Qt slots must preserve UI state on bad files or disk errors.
+                # Imported values can appear in parser errors; keep the modal usable.
+                detail = str(exc)
+                message = detail if len(detail) <= 240 else detail[:240] + "…"
+                return {"ok": False, "id": identity, "message": message}
 
         @Slot()
         def restoreDefaults(self) -> None:

@@ -111,6 +111,7 @@ _AUTOSTART_MARKERS = ("CurrentVersion\\Run", "userstartup")
 # below, which proves this exemption is not a blank check).
 _REVIEWED_ELEVATION_MARKERS = {
     Path("src/ovb_rc003/chromecast_pipe_windows.py"): {"runas", "ShellExecute"},
+    Path("src/ovb_rc003/hid_source_injector.py"): {"runas", "ShellExecute"},
     Path("scripts/sogou_normal_submit_test.py"): {"IsUserAnAdmin"},
     Path("scripts/sogou_stop_probe.py"): {"IsUserAnAdmin"},
 }

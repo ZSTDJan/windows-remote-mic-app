@@ -108,6 +108,19 @@ class Client:
             self._first_worker_failure = event["reason"]
             diagnostics.request(self.identity.entity, event["reason"])
 
+    def _observe_evidence(self, event):
+        record = event["record"]
+        logger = logging.getLogger("ovb_rc003")
+        logger.info("Chromecast evidence run=%s seq=%s record=%s",
+            self.identity.generation[:12], event["seq"], json.dumps(record, separators=(",", ":")))
+        if (record.get("kind") == "voice_cleanup" and record["state"] == "done"
+                and record["outcome"] != "success"):
+            # The report keeps the first failure and latest summary independently
+            # of its rotating tail. The summary carries the original native code.
+            logger.warning("Chromecast cleanup evidence run=%s record=%s",
+                self.identity.generation[:12], json.dumps(record, separators=(",", ":")),
+                extra={"failure_key": f"chromecast:cleanup:{self.identity.generation[:12]}"})
+
     @property
     def is_running(self):
         return bool(self.thread and self.thread.is_alive() and not self.finished.is_set())
@@ -215,12 +228,11 @@ class Client:
                         if peer is not None and read_ok and code.value >= 0xc0000000:
                             diagnostics.request_process_exit(self.identity.generation, peer.pid, peer.born, code.value)
                         else:
-                            logger.warning("Chromecast crash evidence unavailable: run=%s reason=%s",
-                                           self.identity.generation[:12],
-                                           "non_exception_exit_code" if read_ok and code.value < 0xc0000000
-                                           else "process_identity_or_exit_code_missing")
-                except Exception:
-                    pass  # OS-confirmed exit must still release the owned handles.
+                            diagnostics._crash_unavailable(self.identity.generation,
+                                "non_exception_exit_code" if read_ok and code.value < 0xc0000000
+                                else "process_identity_or_exit_code_missing")
+                except Exception as error:
+                    diagnostics._crash_unavailable(self.identity.generation, "request_failed", error)
                 # The OS wait proves process termination. A nonzero exit is a
                 # recorded runtime/cleanup failure, not a still-running owner.
                 # Conflating them discards the handles but blocks every retry.
@@ -314,8 +326,7 @@ class Client:
                                 and record.get("state") == "begin"):
                             self._gadget_fallback_seen.set()
                             ready_deadline = max(ready_deadline, time.monotonic() + 40)
-                        logging.getLogger("ovb_rc003").info("Chromecast evidence run=%s seq=%s record=%s",
-                            self.identity.generation[:12], event["seq"], json.dumps(event["record"], separators=(",", ":")))
+                        self._observe_evidence(event)
                     elif event["type"] == "ready":
                         self.ready.set()
                         diagnostics.request(self.identity.entity, "ready")

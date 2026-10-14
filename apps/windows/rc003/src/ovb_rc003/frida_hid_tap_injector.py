@@ -332,9 +332,9 @@ def _target_process_name(pid: int) -> str:
 def inject_current_process(pid: int, *, selected_key: str | None = None) -> None:
     """Inject only when this process already has the required rights.
 
-    The desktop application deliberately does not request elevation. Installed
-    builds call this function inside the fixed scheduled helper; source/debug
-    callers may instead start the process explicitly from an elevated terminal.
+    The desktop application stays unelevated. Installed builds use the fixed
+    scheduled helper; ordinary source runs use a consented one-shot child.
+    Already elevated callers retain the direct subprocess path.
     """
 
     if os.name != "nt":
@@ -393,15 +393,13 @@ def inject_current_process(pid: int, *, selected_key: str | None = None) -> None
         raise HidInjectionStageError("hid_helper_injection_failed") from exc
 
 
-def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(add_help=False)
-    parser.add_argument("--pid", type=int, required=True)
-    args = parser.parse_args(argv)
+def injection_result(pid: int) -> tuple[int, dict]:
+    """Run the same validated operation for direct and consented source children."""
     failure = None
     exit_code = 0
     try:
         from . import remote_selection
-        inject_current_process(args.pid, selected_key=remote_selection.saved_active_key())
+        inject_current_process(pid, selected_key=remote_selection.saved_active_key())
     except PermissionError as exc:
         failure, exit_code = exc, 3
     except HidInjectionStageError as exc:
@@ -415,8 +413,23 @@ def main(argv: list[str] | None = None) -> int:
     except Exception as exc:  # noqa: BLE001 - preserve the stable exit code
         failure, exit_code = exc, 5
     try:
-        injection_diagnostics.write_stdout(injection_diagnostics.result_record(
-            success=exit_code == 0, target_pid=args.pid, exit_code=exit_code, exc=failure))
+        record = injection_diagnostics.result_record(
+            success=exit_code == 0, target_pid=pid, exit_code=exit_code, exc=failure)
+    except Exception:
+        # Diagnostics must never change a completed injection's exit status.
+        record = dict(schema=injection_diagnostics.RESULT_SCHEMA, success=exit_code == 0,
+                      target_pid=pid, worker_pid=os.getpid(), exit_code=exit_code,
+                      stage="complete" if exit_code == 0 else "unknown")
+    return exit_code, record
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--pid", type=int, required=True)
+    args = parser.parse_args(argv)
+    exit_code, record = injection_result(args.pid)
+    try:
+        injection_diagnostics.write_stdout(record)
     except Exception:
         pass
     return exit_code

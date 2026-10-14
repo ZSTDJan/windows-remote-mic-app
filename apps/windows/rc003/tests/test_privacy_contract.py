@@ -61,9 +61,12 @@ _FORBIDDEN_BINARY_SUFFIXES = (".exe", ".dll", ".pyd", ".zip", ".xz")
 # Reviewed elevation boundaries. Two modules launch third-party programs only;
 # hid_elevation_windows.py owns the one narrow project helper that installs and
 # runs a fixed, on-demand HID task while the desktop process stays asInvoker.
+# hid_source_injector.py is the source-only, one-shot equivalent; it accepts no
+# executable, script or command from the pipe and installs no persistent task.
 _ELEVATION_MARKER_EXEMPT_FILENAMES = frozenset(
     {
         "hid_elevation_windows.py",
+        "hid_source_injector.py",
         "chromecast_pipe_windows.py",
         "vb_cable_bundle.py",
         "voice_program_manager.py",
@@ -118,6 +121,19 @@ class NoForbiddenBrandingTests(unittest.TestCase):
 
 
 class NoElevationOrAutoDriverTests(unittest.TestCase):
+    def test_source_hid_elevation_has_a_fixed_entry_and_no_command_channel(self):
+        text = (_PACKAGE_ROOT / "hid_source_injector.py").read_text(encoding="utf-8")
+        tree = ast.parse(text)
+        launch = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "_launch")
+        self.assertEqual([arg.arg for arg in launch.args.args], ["parent", "identity", "pid"])
+        self.assertIn('info.verb, info.file = "runas", executable', text)
+        self.assertIn('return parent.image, dev_session.mark_command([', text)
+        self.assertIn('str(launcher), FLAG, str(parent.pid), str(parent.born)', text)
+        self.assertIn('transport.verify_same_user_image(actual, parent)', text)
+        self.assertIn('transport.verify_peer(transport.inspect_peer(pipe.peer_pid()), parent)', text)
+        for forbidden in ('RequireAdministrator', 'winreg.SetValueEx', 'schtasks', 'shell=True'):
+            self.assertNotIn(forbidden, text)
+
     def test_chromecast_elevation_uses_only_this_distribution_and_fixed_worker(self):
         text = (_PACKAGE_ROOT / "chromecast_pipe_windows.py").read_text(encoding="utf-8")
         tree = ast.parse(text)

@@ -8,11 +8,13 @@ from . import hotkey, win32_input, wetype_control_windows as wetype
 
 
 class ToggleShortcut:
-    def __init__(self, shortcut, *, prepare=None, ensure_key_tracking=None):
+    def __init__(self, shortcut, *, prepare=None, ensure_key_tracking=None,
+                 physicalize=False):
         spec = hotkey.HotkeySpec.parse(shortcut)
         self.tokens = (*spec.modifiers, spec.key)
         self.release_pending = False
         self.ensure_key_tracking = ensure_key_tracking
+        self.physicalize = bool(physicalize)
         # Default WeType preparation is unchanged; Sogou only checks its process.
         self.prepare = prepare or (lambda: wetype._run_on_sta_thread(wetype._activate_wetype_for_voice_start))
 
@@ -36,7 +38,10 @@ class ToggleShortcut:
             raise OSError("toggle cancelled before shortcut; shortcut not sent")
         self.release_pending = True
         try:
-            win32_input.send_voice_key_combo_tap(self.tokens)
+            if self.physicalize:
+                win32_input.send_voice_key_combo_tap(self.tokens, physicalize=True)
+            else:
+                win32_input.send_voice_key_combo_tap(self.tokens)
         except (win32_input.Win32InputUnavailableError, win32_input.PhysicalKeyInUseError):
             # PhysicalKeyInUseError is a preflight rejection before any DOWN.
             # Unavailable also guarantees no remaining DOWN; failed/uncertain
@@ -56,7 +61,10 @@ class ToggleShortcut:
     def cleanup(self):
         if self.release_pending:
             try:
-                win32_input.send_voice_key_combo_up(self.tokens)
+                if self.physicalize:
+                    win32_input.send_voice_key_combo_up(self.tokens, physicalize=True)
+                else:
+                    win32_input.send_voice_key_combo_up(self.tokens)
             except Exception:
                 return False
             self.release_pending = False

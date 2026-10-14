@@ -83,6 +83,7 @@ async def receive(identity, parent, pipe):
 
         stage = "device_open"
         device = SelectedDevice(identity.entity)
+        device.cleanup_observer = observation.voice_cleanup
         initialize = asyncio.create_task(device.open(require_input=False))
         deadline = time.monotonic() + 20
         last_peer = 0.0

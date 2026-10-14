@@ -249,6 +249,7 @@ class _FaultReport:
         # Keep sticky context even when a user waits a long time before reproducing.
         if item.get("event") in {"session_started", "device_context", "hid_environment",
                 "hid_runtime_capabilities", "hid_copy_host_scope", "hid_source_evidence",
+                "hid_raw_input_lookup", "hid_host_lookup",
                 "voice_attempt_context", "voice_edge_confirmation", "voice_hotkey_control"}:
             self.context[item["event"]] = item
         now = float(item.get("wall_time", 0))

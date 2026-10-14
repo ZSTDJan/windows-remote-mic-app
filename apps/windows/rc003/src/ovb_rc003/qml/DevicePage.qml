@@ -202,6 +202,10 @@ Item {
                 ? "disabled" : "permission"
         }
         if (SettingsController.bridgeRunning) {
+            if (SettingsController.hidTapState === "authorization_cancelled")
+                return "source_authorization_cancelled"
+            if (SettingsController.hidTapState === "authorization_failed")
+                return "source_authorization_failed"
             if (SettingsController.hidTapState === "unavailable_gadget_not_verified")
                 return "component_unavailable"
             if (SettingsController.hidTapState === "selected_device_shared_host")
@@ -272,6 +276,8 @@ Item {
         case "pending": return qsTr("接收尚未接入")
         case "setup_failed": return qsTr("启用未完成")
         case "authorization_cancelled": return qsTr("授权已取消")
+        case "source_authorization_cancelled": return qsTr("授权已取消")
+        case "source_authorization_failed": return qsTr("授权未完成")
         case "checking": return qsTr("正在检查")
         case "cleanup": return qsTr("点击“完成清理”")
         case "recovering": return qsTr("正在恢复")
@@ -313,6 +319,8 @@ Item {
     }
 
     function bridgeStateText() {
+        if (sourceAuthorizationRetryAvailable())
+            return qsTr("等待按键授权")
         if (SettingsController.activeRemoteKey && !SettingsController.activeRemoteReady)
             return qsTr("接收尚未接入")
         if (SettingsController.bridgeReconnectBusy)
@@ -361,6 +369,8 @@ Item {
     }
 
     function bridgeNeedsRestartAction() {
+        if (sourceAuthorizationRetryAvailable())
+            return false
         if (valueIn(buttonReceiverStateCode(), ["setup_failed", "authorization_cancelled"]))
             return false
         if (!SettingsController.bridgeRunning)
@@ -378,6 +388,8 @@ Item {
     }
 
     function bridgeActionVisible() {
+        if (sourceAuthorizationRetryAvailable())
+            return true
         if (!SettingsController.bridgeRunning)
             return true
         if (SettingsController.bridgeLaunchBusy
@@ -397,12 +409,16 @@ Item {
             return qsTr("启动中…")
         if (!SettingsController.bridgeRunning)
             return qsTr("启动服务")
+        if (sourceAuthorizationRetryAvailable())
+            return qsTr("重新授权")
         if (bridgeNeedsRestartAction())
             return qsTr("重启服务")
         return qsTr("重新连接")
     }
 
     function bridgeStateColor() {
+        if (sourceAuthorizationRetryAvailable())
+            return tokens.errorColor
         if (bridgeNeedsRestartAction())
             return tokens.errorColor
         if (SettingsController.bridgeConnectionState === "retry_wait")
@@ -421,6 +437,11 @@ Item {
                 || !SettingsController.bridgeRunning)
             return tokens.voiceAccent
         return tokens.disabledText
+    }
+
+    function sourceAuthorizationRetryAvailable() {
+        return SettingsController.isRc003Device && SettingsController.bridgeRunning
+            && valueIn(SettingsController.hidTapState, ["authorization_cancelled", "authorization_failed"])
     }
 
     RemoteDeviceDialog {
@@ -526,6 +547,10 @@ Item {
                     descriptionText: SettingsController.rawInputState
                             === "chromecast_input_payload_unavailable"
                         ? qsTr("Windows 没有提供完整按键数据；可尝试重启电脑一次，仍失败请导出日志")
+                        : root.buttonReceiverStateCode() === "source_authorization_cancelled"
+                        ? qsTr("未完成管理员授权，点击“重新授权”后确认 Windows 提示")
+                        : root.buttonReceiverStateCode() === "source_authorization_failed"
+                        ? qsTr("未取得按键权限；确认当前账号可授权后点击“重新授权”")
                         : root.buttonReceiverStateCode() === "setup_failed"
                         ? (SettingsController.chromecastSetupError
                             || qsTr("设备准备失败，请在“选择设备”中重新使用此设备"))
@@ -610,7 +635,7 @@ Item {
                         onClicked: {
                             if (!SettingsController.bridgeRunning)
                                 SettingsController.startBridge()
-                            else if (root.bridgeNeedsRestartAction())
+                            else if (root.sourceAuthorizationRetryAvailable() || root.bridgeNeedsRestartAction())
                                 SettingsController.restartBridge()
                             else if (root.bridgeReconnectActionAvailable())
                                 SettingsController.reconnectBridgeNow()

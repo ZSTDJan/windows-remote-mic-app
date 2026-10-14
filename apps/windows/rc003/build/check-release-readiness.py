@@ -49,6 +49,13 @@ _PRIVATE_HISTORY_PATH_PATTERNS = (
     re.compile(r"[A-Za-z]:\\Users\\[^\\\"'\s]+", re.IGNORECASE),
 )
 
+# PR #14 was already public when merged. The project owner explicitly
+# approved retaining this contributor's original email on 2026-10-13.
+# Exact immutable commits only; this does not exempt content or subjects.
+_APPROVED_PUBLIC_CONTRIBUTOR_COMMITS = frozenset({
+    "2dc521834df4b30d3492f9ab5355ccf4a125b8c5",
+})
+
 
 def _run_git(*args: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
@@ -95,8 +102,9 @@ def _git_history_blockers() -> list[str]:
             blockers.append("Git history metadata contains an unreadable commit record")
             break
         commit, author_email, committer_email, subject = fields
-        if not _is_public_git_email(author_email) or not _is_public_git_email(
-            committer_email
+        if commit not in _APPROVED_PUBLIC_CONTRIBUTOR_COMMITS and (
+            not _is_public_git_email(author_email)
+            or not _is_public_git_email(committer_email)
         ):
             private_email_commits.add(commit)
         folded_subject = subject.casefold()

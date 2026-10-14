@@ -226,7 +226,9 @@ try {
   if($r.events.Count -ge 4) { break }
  }
 } catch {
- if($_.FullyQualifiedErrorId -notlike 'NoMatchingEventsFound*') { $r.status='query_failed' }
+ if($_.FullyQualifiedErrorId -notlike 'NoMatchingEventsFound*') {
+  $r.status='query_failed'; $r.native_code=[long]$_.Exception.HResult
+ }
 }
 $r | ConvertTo-Json -Depth 4 -Compress
 '''
@@ -299,9 +301,7 @@ def _shutdown():
         if _active_environment is not None:
             environments.insert(0, _active_environment)
     for key in ([active] if active is not None else []) + waiting:
-        logging.getLogger('ovb_rc003').warning(
-            'Chromecast crash evidence unavailable: run=%s reason=application_closing_before_query_completed',
-            key[1][:12])
+        _crash_unavailable(key[1], 'application_closing_before_query_completed')
     for entity, cause in environments:
         logging.getLogger('ovb_rc003').warning(
             'Chromecast environment unavailable: device_ref=%s cause=%s reason=application_closing_before_query_completed',
@@ -369,8 +369,11 @@ def _drain():
                 _collect_exit(*key[1:], stamp)
             else:
                 _collect(*key, stamp)
-        except Exception:
-            logging.getLogger("ovb_rc003").info("Chromecast environment: query_failed")
+        except Exception as error:
+            if len(key) == 5 and key[0] == 'exit':
+                _crash_unavailable(key[1], 'collector_failed', error)
+            else:
+                logging.getLogger("ovb_rc003").info("Chromecast environment: query_failed")
         finally:
             if len(key) == 5 and key[0] == 'exit':
                 with _lock:
@@ -415,8 +418,12 @@ def request(entity, cause):
 
 def _collect_exit(run, pid, born, code, stamp):
     query = _EXIT_QUERY.replace('__PID__', str(pid)).replace('__BORN__', str(born)).replace('__STAMP__', str(int(stamp)))
+    error_type, native_code = 'none', -1
     try:
         raw = _environment(query, timeout=8)
+        value = raw.get('native_code')
+        if type(value) is int and -(2**31) <= value <= 0xffffffff:
+            native_code = value & 0xffffffff
         status = raw.get('status', raw.get('error', 'query_failed'))
         if status not in {'matched', 'no_matching_event', 'query_failed', 'query_cancelled', 'query_size_limit'}:
             status = 'query_failed'
@@ -438,11 +445,39 @@ def _collect_exit(run, pid, born, code, stamp):
             status = 'query_failed'
     except subprocess.TimeoutExpired:
         status, events = 'query_timeout', []
-    except Exception:
+        error_type = 'TimeoutExpired'
+    except Exception as error:
+        from .chromecast_observation import HID_ERROR_TYPES
         status, events = 'query_failed', []
+        name = type(error).__name__
+        error_type = name if name in HID_ERROR_TYPES else 'other'
+        value = getattr(error, 'winerror', None)
+        native_code = value & 0xffffffff if type(value) is int else -1
     logging.getLogger('ovb_rc003').warning("Chromecast crash evidence: %s", json.dumps(
         dict(run=run[:12], pid=pid, exit_hex=f'0x{code:08X}', status=status, events=events,
-             scope='immediate_system_event_sample_not_native_stack_or_root_cause'), separators=(',', ':')))
+             error_type=error_type, query_native_code=native_code,
+             scope='immediate_system_event_sample_not_native_stack_or_root_cause'), separators=(',', ':')),
+        extra={'failure_key': f'chromecast:crash_evidence:{run[:12]}'})
+
+
+def _crash_unavailable(run, reason, error=None):
+    """Persist collection failure in the existing fault report, without error text."""
+    try:
+        from .chromecast_observation import HID_ERROR_TYPES
+        ref = run[:12] if remote_selection.valid_key(run) else 'unknown'
+        allowed = {'application_closing_before_query_completed', 'application_closing', 'queue_full',
+            'collector_failed', 'thread_start_failed', 'request_failed', 'invalid_process_identity',
+            'non_exception_exit_code', 'process_identity_or_exit_code_missing'}
+        reason = reason if isinstance(reason, str) and reason in allowed else 'unknown'
+        error_type = type(error).__name__ if error is not None else 'none'
+        error_type = error_type if error_type in HID_ERROR_TYPES else 'other'
+        code = getattr(error, 'winerror', None)
+        logging.getLogger('ovb_rc003').warning(
+            'Chromecast crash evidence unavailable: run=%s reason=%s error_type=%s native_code=%s',
+            ref, reason, error_type, code & 0xffffffff if type(code) is int else -1,
+            extra={'failure_key': f'chromecast:crash_evidence:{ref}'})
+    except Exception:
+        pass  # OS-confirmed exit must still release the owned handles.
 
 
 def request_process_exit(run, pid, born, code):
@@ -452,16 +487,16 @@ def request_process_exit(run, pid, born, code):
         if (not remote_selection.valid_key(run) or type(pid) is not int or not 0 < pid <= 0xffffffff
                 or type(born) is not int or not 0 < born < 2**63
                 or type(code) is not int or not 0 <= code <= 0xffffffff):
+            _crash_unavailable(run, 'invalid_process_identity')
             return
         key = ('exit', run, pid, born, code)
         logger = logging.getLogger('ovb_rc003')
         with _lock:
-            if _closing or len(_pending) >= 2:
-                logger.warning('Chromecast crash evidence unavailable: run=%s reason=%s', run[:12],
-                               'application_closing' if _closing else 'queue_full')
-                return
             if key in _recent:
                 return  # Launcher and authenticated worker can name the same OS process.
+            if _closing or len(_pending) >= 2:
+                _crash_unavailable(run, 'application_closing' if _closing else 'queue_full')
+                return
             if len(_recent) >= 64:
                 _recent.clear()
             _recent[key] = time.monotonic()
@@ -471,9 +506,9 @@ def request_process_exit(run, pid, born, code):
                 _running = True
                 try:
                     threading.Thread(target=_drain, name='chromecast-evidence', daemon=True).start()
-                except Exception:
+                except Exception as error:
                     _running = False
                     _pending.pop(key, None)
-                    logger.warning('Chromecast crash evidence unavailable: run=%s reason=thread_start_failed', run[:12])
-    except Exception:
-        pass
+                    _crash_unavailable(run, 'thread_start_failed', error)
+    except Exception as error:
+        _crash_unavailable(run, 'request_failed', error)

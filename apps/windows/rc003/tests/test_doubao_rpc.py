@@ -63,11 +63,13 @@ class DoubaoRpcTests(unittest.TestCase):
                 )
                 for changed_name in ("ImeService.exe", "tsf-oime-core.dll"):
                     original = hashes[changed_name]
-                    other = next(value for key, value in builds if key != rpc_hash)
-                    hashes[changed_name] = other[
-                        0 if changed_name == "ImeService.exe" else 1
-                    ]
-                    self.assertFalse(doubao_rpc._verified_voice_stop_build(str(path)))
+                    for other_hash, other in builds:
+                        if other_hash == rpc_hash:
+                            continue
+                        hashes[changed_name] = other[
+                            0 if changed_name == "ImeService.exe" else 1
+                        ]
+                        self.assertFalse(doubao_rpc._verified_voice_stop_build(str(path)))
                     hashes[changed_name] = original
 
     def test_voice_stop_rejects_unknown_rpc_or_missing_companion(self):
@@ -269,6 +271,30 @@ class DoubaoRpcTests(unittest.TestCase):
         self.assertIs(function, library.RpcPipe_SimpleMessageEx)
         self.assertEqual(stop_wparam, 1)
 
+    def test_0927_stop_loads_native_button_parameter_with_matching_modules(self):
+        library = _FakeLibrary()
+        hashes = {
+            "rpc.dll": "e3ee88527bf6bd38156e86b93413ca004a829809ad51f064a42db44814e9a5d5",
+            "ImeService.exe": "38742f838d58b6e5b87a08564c6917da1d75ac6b81ec6ee3388ffaaac7c9f3ad",
+            "tsf-oime-core.dll": "ef827968a374de491529f65eade36d58c7eab78933ebe8508bd2fed8563290c0",
+        }
+        with mock.patch.object(
+            doubao_rpc, "_resolve_rpc_dll_path",
+            return_value=r"C:\Program Files\DoubaoIME\versions\v0.9.2.7\rpc.dll",
+        ), mock.patch.object(
+            doubao_rpc, "_module_sha256",
+            side_effect=lambda value: hashes[Path(value).name],
+        ), mock.patch.object(
+            doubao_rpc.ctypes, "WinDLL", return_value=library
+        ):
+            function, stop_wparam = doubao_rpc._load_voice_stop_api()
+            doubao_rpc.send_voice_press_stop()
+        self.assertIs(function, library.RpcPipe_SimpleMessageEx)
+        self.assertEqual(stop_wparam, 1)
+        self.assertEqual(library.RpcPipe_SimpleMessageEx.calls, [
+            (b"\\\\.\\pipe\\ObricIme\\oime-server", 0x3E9, 1, 0, None),
+        ])
+
     def test_voice_stop_nonzero_status_is_a_call_error(self):
         function = _FakeFunction(result=7)
         with mock.patch.object(
@@ -299,6 +325,9 @@ class DoubaoPhysicalizerTests(unittest.TestCase):
             ((0x782D80, 0x782EB2, 0x782EB8, 0x783B7A, 0x38),
              "0xFF, 0x15, 0xD0, 0xF4, 0x95, 0x00, 0xE9, 0xE9, 0x0C, 0x00, 0x00",
              "0x80, 0x7C, 0x24, 0x38, 0x00, 0x75, 0x16"),
+            ((0x7829E0, 0x782B12, 0x782B18, 0x7837DA, 0x38),
+             "0xFF, 0x15, 0x40, 0xE8, 0x95, 0x00, 0xE9, 0xE9, 0x0C, 0x00, 0x00",
+             "0x80, 0x7C, 0x24, 0x38, 0x00, 0x75, 0x16"),
         )
         for layout, early_bytes, decision_bytes in cases:
             with self.subTest(callback=layout[0]):
@@ -314,6 +343,8 @@ class DoubaoPhysicalizerTests(unittest.TestCase):
         for layout in (
             (0x782D80, 0x7427F1, 0x7427F7, 0x7431CD, 0x38),
             (0x782D80, 0x782EB2, 0x782EB8, 0x783B7A, 0x40),
+            (0x7829E0, 0x782EB2, 0x782EB8, 0x783B7A, 0x38),
+            (0x7829E0, 0x782B12, 0x782B18, 0x7837DA, 0x40),
         ):
             with self.subTest(layout=layout):
                 with self.assertRaises(doubao_rpc.DoubaoRpcUnavailableError):
@@ -339,6 +370,32 @@ class DoubaoPhysicalizerTests(unittest.TestCase):
         source = session.create_script.call_args.args[0]
         self.assertIn("module.base.add(0x782D80)", source)
         self.assertIn("module.base.add(0x783B7A)", source)
+        self.assertEqual(physicalizer.status, "active")
+        physicalizer.stop()
+        script.unload.assert_called_once()
+        session.detach.assert_called_once()
+
+    def test_0927_starts_at_verified_callback_and_cleans_up(self):
+        script = _ready_script()
+        session = mock.Mock()
+        session.create_script.return_value = script
+        self.processes.return_value = [
+            types.SimpleNamespace(pid=46500, name="ImeService.exe")
+        ]
+        fake_frida = types.SimpleNamespace(attach=mock.Mock(return_value=session))
+        physicalizer = doubao_rpc.DoubaoPhysicalizer()
+        with mock.patch.dict(sys.modules, {"frida": fake_frida}), mock.patch.object(
+            physicalizer, "_probe_module",
+            return_value=r"C:\Program Files\DoubaoIME\versions\v0.9.2.7\ImeService.exe",
+        ), mock.patch.object(
+            doubao_rpc, "_module_sha256",
+            return_value="38742f838d58b6e5b87a08564c6917da1d75ac6b81ec6ee3388ffaaac7c9f3ad",
+        ):
+            self.assertTrue(physicalizer.start((0xA3, 0x4C)))
+        source = session.create_script.call_args.args[0]
+        self.assertIn("module.base.add(0x7829E0)", source)
+        self.assertIn("module.base.add(0x782B12)", source)
+        self.assertIn("module.base.add(0x7837DA)", source)
         self.assertEqual(physicalizer.status, "active")
         physicalizer.stop()
         script.unload.assert_called_once()

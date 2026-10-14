@@ -74,6 +74,7 @@ _REFERENCE_ACTION_LABELS: Dict[key_mapping.ActionKind, str] = {
     key_mapping.ActionKind.OPEN_CODEX: "打开 Codex",
     key_mapping.ActionKind.OPEN_CLAUDE: "打开 Claude",
     key_mapping.ActionKind.OPEN_CMUX: "打开 cmux 终端",
+    # Keep saved mappings readable; this action is no longer a menu preset.
     key_mapping.ActionKind.OPEN_WECHAT: "打开微信",
     key_mapping.ActionKind.OPEN_CURSOR: "打开 Cursor",
     key_mapping.ActionKind.OPEN_SLACK: "打开 Slack",
@@ -86,6 +87,17 @@ _REFERENCE_ACTION_LABELS: Dict[key_mapping.ActionKind, str] = {
 _REFERENCE_ACTION_KINDS_BY_LABEL: Dict[str, key_mapping.ActionKind] = {
     label: action_kind for action_kind, label in _REFERENCE_ACTION_LABELS.items()
 }
+
+LONG_PRESS_ACTION_LABELS = {
+    key_mapping.ActionKind.MOUSE_LEFT_HOLD: "鼠标左键长按",
+    key_mapping.ActionKind.MOUSE_RIGHT_HOLD: "鼠标右键长按",
+    key_mapping.ActionKind.MOUSE_X1_HOLD: "鼠标 X1 长按",
+    key_mapping.ActionKind.MOUSE_X2_HOLD: "鼠标 X2 长按",
+}
+_REFERENCE_ACTION_LABELS.update(LONG_PRESS_ACTION_LABELS)
+_REFERENCE_ACTION_KINDS_BY_LABEL.update(
+    {label: kind for kind, label in LONG_PRESS_ACTION_LABELS.items()}
+)
 
 # Older display spellings remain accepted for editable fields and tests that
 # construct the UI model directly. Persisted bindings store semantic action
@@ -126,7 +138,7 @@ ACTION_OPTION_GROUPS: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
     (
         "启动应用",
         (
-            _OPEN_APPLICATION_DISPLAY, "打开 Claude", "打开 cmux 终端", "打开微信",
+            _OPEN_APPLICATION_DISPLAY, "打开 Claude", "打开 cmux 终端",
             "打开 Cursor", "打开 Slack", "打开企业微信", "打开网易云音乐",
             "打开 Chrome", "打开 Edge", "打开 Zed",
         ),
@@ -152,6 +164,10 @@ ACTION_OPTION_GROUP_STARTS = frozenset(
     for _group_title, group_options in ACTION_OPTION_GROUPS
     if group_options
 )
+ACTION_OPTION_GROUP_BY_LABEL.update(
+    {label: "鼠标长按" for label in LONG_PRESS_ACTION_LABELS.values()}
+)
+ACTION_OPTION_GROUP_STARTS |= {next(iter(LONG_PRESS_ACTION_LABELS.values()))}
 
 _TRIGGER_MODE_LABELS = {
     key_mapping.VoiceTriggerMode.HOLD: "按住说话",
@@ -418,6 +434,8 @@ def _validated_button_action(
         message = f"{trigger_label}：{detail}"
         raise SettingsValidationError(button_id, message) from exc
 
+    if action.kind in key_mapping.MOUSE_HOLD_BUTTONS and trigger != "long_press":
+        raise SettingsValidationError(button_id, "鼠标长按只能用于长按映射。")
     if key_mapping.is_voice_action(action):
         if trigger != key_mapping.ButtonTrigger.SINGLE_CLICK.value:
             raise SettingsValidationError(
@@ -558,7 +576,7 @@ def build_save_model(
         for button_id, trigger_map in secondary_bindings.items():
             if not isinstance(trigger_map, dict):
                 continue
-            for raw_action in trigger_map.values():
+            for trigger_name, raw_action in trigger_map.items():
                 try:
                     action = key_mapping.ButtonAction.from_dict(raw_action)
                 except (KeyError, TypeError, ValueError) as exc:
@@ -568,6 +586,8 @@ def build_save_model(
                     ) from exc
                 if action.kind == key_mapping.ActionKind.DISABLED:
                     continue
+                if action.kind in key_mapping.MOUSE_HOLD_BUTTONS and trigger_name != "long_press":
+                    raise SettingsValidationError(button_id, "鼠标长按只能用于长按映射。")
                 if key_mapping.is_voice_action(action):
                     raise SettingsValidationError(
                         button_id,

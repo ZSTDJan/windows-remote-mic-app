@@ -1,6 +1,7 @@
 """Resolve the selected entity/radio and its narrowly scoped voice commands."""
 from __future__ import annotations
 import asyncio
+from contextlib import contextmanager
 import hashlib
 import queue
 import re
@@ -79,6 +80,99 @@ class SelectedDevice:
         self.voice_queries = []
         self.voice_retryable = False
         self._voice_cache_checked = False
+        self.cleanup_observer = None
+        self._cleanup_attempt = 0
+        self._cleanup_cycle = 0
+        self._cleanup_previous_failed = False
+        self._cleanup_current_failed = False
+        self._cleanup_first = None
+        self._cleanup_emitted = self._cleanup_omitted = 0
+        self._cleanup_fault_sent = False
+
+    @staticmethod
+    def _cleanup_handle(resource):
+        try:
+            value = int(resource.attribute_handle)
+            return value if 0 <= value <= 65535 else -1
+        except Exception:
+            return -1
+
+    def _cleanup_emit(self, step, state, *, started=None, error=None, status=-1, handle=-1,
+                      outcome=None):
+        try:
+            self._cleanup_metadata(step, state, started=started, error=error, status=status,
+                handle=handle, outcome=outcome)
+        except Exception:
+            pass  # Metadata construction must not skip the next native release.
+
+    def _cleanup_metadata(self, step, state, *, started=None, error=None, status=-1, handle=-1,
+                          outcome=None):
+        """Fixed metadata only; never let evidence change native cleanup ownership."""
+        from .chromecast_observation import HID_ERROR_TYPES
+        if outcome is None:
+            outcome = ("none" if state == "begin" else "cancelled" if isinstance(error, asyncio.CancelledError)
+                else "timeout" if isinstance(error, TimeoutError) else "os_error" if isinstance(error, OSError)
+                else "exception" if error is not None else "status_failed" if status > 0 else "success")
+        code = getattr(error, "winerror", None)
+        hresult = code & 0xffffffff if type(code) is int else -1
+        error_type = type(error).__name__ if error is not None else "none"
+        error_type = error_type if error_type in HID_ERROR_TYPES else "other"
+        if state == "done" and outcome not in ("none", "success", "history_failed"):
+            self._cleanup_current_failed = True
+            if self._cleanup_first is None and step != "summary":
+                self._cleanup_first = dict(first_step=step, first_outcome=outcome, first_hresult=hresult,
+                    first_status=status, first_handle=handle, first_error_type=error_type)
+        first = self._cleanup_first or dict(first_step="none", first_outcome="none", first_hresult=-1,
+            first_status=-1, first_handle=-1, first_error_type="none")
+        row = dict(kind="voice_cleanup", attempt=max(1, self._cleanup_attempt), cycle=self._cleanup_cycle,
+            step=step, state=state, outcome=outcome, duration_ms=0 if started is None else
+                max(0, min(2147483647, round((time.monotonic() - started) * 1000))),
+            hresult=hresult, status=status, handle=handle, error_type=error_type,
+            previous_failed=int(self._cleanup_previous_failed), current_failed=int(self._cleanup_current_failed),
+            remaining_services=min(65535, len(self._voice_services)), session_owned=int(self.voice_session is not None),
+            **first)
+        failure = state == "done" and outcome not in ("none", "success", "history_failed") and step != "summary"
+        # At most 64 ordinary rows, the first failing operation and two summary
+        # rows per cleanup. Large inventories cannot flood the pipe/log writer.
+        if step != "summary" and not (failure and not self._cleanup_fault_sent):
+            if self._cleanup_emitted >= 64:
+                self._cleanup_omitted = min(2147483647, self._cleanup_omitted + 1)
+                return
+            self._cleanup_emitted += 1
+        if failure:
+            self._cleanup_fault_sent = True
+        row["omitted"] = self._cleanup_omitted
+        try:
+            if self.cleanup_observer is not None:
+                self.cleanup_observer(row)
+        except Exception:
+            pass
+
+    def _cleanup_begin(self):
+        self._cleanup_cycle = min(65535, self._cleanup_cycle + 1)
+        self._cleanup_previous_failed = self._voice_cleanup_failed
+        self._cleanup_current_failed = False
+        self._cleanup_emitted = self._cleanup_omitted = 0
+        self._cleanup_fault_sent = False
+        self._cleanup_emit("summary", "begin")
+
+    def _cleanup_summary(self):
+        self._cleanup_emit("summary", "done", outcome="exception" if self._cleanup_current_failed else
+            "history_failed" if self._voice_cleanup_failed else "success")
+
+    @contextmanager
+    def _cleanup_operation(self, step, *, handle=-1):
+        started = time.monotonic()
+        result = {"status": -1}
+        self._cleanup_emit(step, "begin", handle=handle)
+        try:
+            yield result
+        except BaseException as error:
+            self._cleanup_current_failed = True
+            self._cleanup_emit(step, "done", started=started, error=error, handle=handle)
+            raise
+        else:
+            self._cleanup_emit(step, "done", started=started, status=result["status"], handle=handle)
 
     async def _resolve_input(self):
         # The worker owns the existing 20-second startup deadline and continues
@@ -286,6 +380,7 @@ class SelectedDevice:
                     pass  # Cached diagnostic cleanup must not mask the live error.
 
     async def open_voice(self, *, direct=False):
+        self._cleanup_attempt = min(2, self._cleanup_attempt + 1)
         self.voice_queries = []
         self.voice_retryable = False
         self.voice_evidence = dict(step="service", status=-1, tx=-1, audio=-1, control=-1,
@@ -421,24 +516,29 @@ class SelectedDevice:
         return events
 
     async def close_voice(self):
+        self._cleanup_begin()
         self._voice_open = False
         tokens, self._voice_tokens = self._voice_tokens, []
         subscribed, self._voice_subscribed = self._voice_subscribed, []
         failed = False
         for characteristic, token in tokens:
             try:
-                characteristic.remove_value_changed(token)
+                with self._cleanup_operation("callback_remove", handle=self._cleanup_handle(characteristic)):
+                    characteristic.remove_value_changed(token)
             except Exception:
                 failed = True
         try:
             if subscribed:
-                from winrt.windows.devices.bluetooth.genericattributeprofile import (
-                    GattClientCharacteristicConfigurationDescriptorValue as CccdValue,
-                )
+                with self._cleanup_operation("subscription_api"):
+                    from winrt.windows.devices.bluetooth.genericattributeprofile import (
+                        GattClientCharacteristicConfigurationDescriptorValue as CccdValue,
+                    )
                 for characteristic in subscribed:
                     try:
-                        status = await asyncio.wait_for(
-                            characteristic.write_client_characteristic_configuration_descriptor_async(CccdValue.NONE), 3)
+                        with self._cleanup_operation("subscription_disable", handle=self._cleanup_handle(characteristic)) as evidence:
+                            status = await asyncio.wait_for(
+                                characteristic.write_client_characteristic_configuration_descriptor_async(CccdValue.NONE), 3)
+                            evidence["status"] = int(status)
                         if int(status) != 0:
                             failed = True
                     except Exception:
@@ -448,8 +548,10 @@ class SelectedDevice:
             raise
         finally:
             failed = not self._release_voice_resources() or failed
+            self._cleanup_current_failed = self._cleanup_current_failed or failed
             self._voice_cleanup_failed = failed or self._voice_cleanup_failed
             self._voice_link("closed", outcome="exception" if self._voice_cleanup_failed else "success")
+            self._cleanup_summary()
         if self._voice_cleanup_failed:
             raise PipeError("cleanup_failed")
 
@@ -462,7 +564,8 @@ class SelectedDevice:
         ok = True
         for service in self._voice_services:
             try:
-                service.close()
+                with self._cleanup_operation("service_close", handle=self._cleanup_handle(service)):
+                    service.close()
             except Exception:
                 ok = False
                 failed_services.append(service)
@@ -472,11 +575,13 @@ class SelectedDevice:
             self.voice_service = None
         if session is not None:
             try:
-                session.maintain_connection = False
+                with self._cleanup_operation("session_release"):
+                    session.maintain_connection = False
             except Exception:
                 ok = False
             try:
-                session.close()
+                with self._cleanup_operation("session_close"):
+                    session.close()
             except Exception:
                 ok = False
             else:
@@ -510,15 +615,23 @@ class SelectedDevice:
             writer.close()
 
     def close(self):
-        clean = self._release_voice_resources()
-        if self.watcher:
-            watcher, self.watcher = self.watcher, None
-            for name, token in self.tokens:
-                getattr(watcher, "remove_" + name)(token)
-            self.tokens.clear()
-            watcher.stop()
-        if self.device:
-            device, self.device = self.device, None
-            device.close()
-        if not clean or self._voice_cleanup_failed:
-            raise PipeError("cleanup_failed")
+        self._cleanup_begin()
+        try:
+            clean = self._release_voice_resources()
+            self._cleanup_current_failed = self._cleanup_current_failed or not clean
+            if self.watcher:
+                watcher, self.watcher = self.watcher, None
+                for name, token in self.tokens:
+                    with self._cleanup_operation("watcher_remove"):
+                        getattr(watcher, "remove_" + name)(token)
+                self.tokens.clear()
+                with self._cleanup_operation("watcher_stop"):
+                    watcher.stop()
+            if self.device:
+                device, self.device = self.device, None
+                with self._cleanup_operation("device_close"):
+                    device.close()
+            if not clean or self._voice_cleanup_failed:
+                raise PipeError("cleanup_failed")
+        finally:
+            self._cleanup_summary()

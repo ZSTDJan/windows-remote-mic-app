@@ -195,10 +195,12 @@ def bind_worker_peer(pipe, launched: Peer, parent: Peer):
 
 
 class Pipe:
+    NAME_PREFIX = "\\\\.\\pipe\\RemoteMic.Chromecast."
+
     def __init__(self, identity: SessionIdentity, *, server: bool):
         self.k, self.a = api()
         self.handle = None
-        self.name = "\\\\.\\pipe\\RemoteMic.Chromecast." + identity.generation
+        self.name = self.NAME_PREFIX + identity.generation
         self.server = server
         if server:
             sid = hid_elevation_windows.canonical_user_sid(hid_elevation_windows.current_user_sid())

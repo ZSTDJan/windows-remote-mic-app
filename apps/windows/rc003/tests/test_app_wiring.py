@@ -330,7 +330,7 @@ class _AppWiringTestCase(unittest.TestCase):
         self.app._remote_profile = app_module.remote_selection.RC003_PROFILE
         selection_patch = mock.patch(
             "ovb_rc003.remote_selection.selected_raw_path",
-            side_effect=lambda paths, _key: app_module.hid_identity.select_single_device_path(paths),
+            side_effect=lambda paths, _key, **_kwargs: app_module.hid_identity.select_single_device_path(paths),
         )
         selection_patch.start()
         self.addCleanup(selection_patch.stop)
@@ -2404,20 +2404,32 @@ class HostHotkeyFailureSuppressesMicOpenTests(_AppWiringTestCase):
         marked_up.assert_not_called()
         self.assertIsNone(self.app._voice_shortcut.pending_tokens)
 
-    def test_wetype_confirmation_before_start_returns_is_not_lost(self):
-        from tests.test_wetype_control_windows import _ImmediateThread
+    def test_wetype_fast_confirmation_uses_registered_generation(self):
+        from ovb_rc003.voice_playback_session_windows import CaptureSession
         self.app._config["voice_program"] = voice_program_manager.normalize_voice_program_settings(
             {"provider": voice_program_manager.VOICE_PROGRAM_WETYPE})
         control = self.app._voice_shortcut.wetype_control
+        workers = []
+        def spawn(**kwargs):
+            worker = threading.Thread(**kwargs)
+            workers.append(worker)
+            return worker
+        schedule = control._schedule_confirmation
+        def confirm_before_return(observation):
+            schedule(observation)
+            for worker in workers:
+                worker.join(1)
+                self.assertFalse(worker.is_alive())
         with (
             mock.patch.object(control, "_activate_profile", return_value=True),
             mock.patch.object(control, "_run_sta", side_effect=lambda callback: callback()),
             mock.patch.object(control, "_press_keys"),
             mock.patch.object(control, "_release_keys"),
             mock.patch.object(control, "_prepare_playback_mute_guard", None),
-            mock.patch.object(control, "_mic_start_reader", side_effect=[10, 20]),
-            mock.patch.object(control, "_sleep"),
-            mock.patch.object(control, "_thread_factory", _ImmediateThread),
+            mock.patch.object(control, "_capture_reader", side_effect=[(), (CaptureSession("mic", "new", 42, 1),)]),
+            mock.patch.object(control, "_wait_for_cancel", return_value=False),
+            mock.patch.object(control, "_thread_factory", spawn),
+            mock.patch.object(control, "_schedule_confirmation", side_effect=confirm_before_return),
         ):
             self.assertTrue(self.app._voice_shortcut.apply(app_module.voice_controller.VoiceHostAction.KEY_DOWN))
             self.assertTrue(self.app._voice_shortcut.runtime_mic_confirmed)
@@ -2614,6 +2626,68 @@ class HostHotkeyFailureSuppressesMicOpenTests(_AppWiringTestCase):
         self.assertEqual(self.app._ble_session.mic_close_calls, 0)
         wetype_control.stop.assert_not_called()
         self.app._supervisor.request_reconnect.assert_not_called()
+
+    def test_wetype_unknown_capture_exports_truthful_status_without_retry_or_failure(self):
+        import json
+        import zipfile
+        from ovb_rc003 import log_export, diagnostic_trace
+        self.app._config["voice_program"] = voice_program_manager.normalize_voice_program_settings(
+            {"provider": voice_program_manager.VOICE_PROGRAM_WETYPE})
+        trace = self.app._diagnostic_trace
+        from contextlib import closing
+        with closing(trace):
+            self.assertTrue(trace.set_enabled(True))
+            control = self.app._voice_shortcut.wetype_control
+            workers = []
+            polled = threading.Event()
+            reads = 0
+            def read_capture():
+                nonlocal reads
+                reads += 1
+                if reads > 1:
+                    polled.set()
+                return ()
+            def spawn(**kwargs):
+                thread = threading.Thread(**kwargs)
+                workers.append(thread)
+                return thread
+            with (
+                mock.patch.object(control, "_run_sta", return_value=True),
+                mock.patch.object(control, "_press_keys") as down,
+                mock.patch.object(control, "_release_keys") as up,
+                mock.patch.object(control, "_capture_reader", side_effect=read_capture),
+                mock.patch.object(control, "_prepare_playback_mute_guard", None),
+                mock.patch.object(control, "_thread_factory", spawn),
+            ):
+                self.assertTrue(self.app._handle_mic_button_pressed())
+                self.assertTrue(polled.wait(1))
+                self.assertTrue(workers[0].is_alive())
+                down.assert_called_once()
+                up.assert_not_called()
+                self.app._voice_audio.stats.add([100, -100])
+                self.app._voice_audio_stream_active = True
+                self.app._on_control_event(AudioStopped())
+                up.assert_called_once()
+                for worker in workers:
+                    worker.join(1)
+                    self.assertFalse(worker.is_alive())
+            state = bridge_runtime_status.read_status(self.app._config_root)
+            self.assertEqual(state.voice_runtime_state, bridge_runtime_status.VOICE_RUNTIME_HOST_UNCONFIRMED)
+            self.assertFalse(state.voice_active)
+            trace.flush()
+            destination = self.app._config_root / "hold-observation.zip"
+            result = log_export.export_logs(destination, root=self.app._config_root)
+            self.assertFalse(result.incomplete)
+            with zipfile.ZipFile(destination) as archive:
+                self.assertIsNone(archive.testzip())
+                records = [json.loads(line) for line in archive.read("diagnostic-trace.jsonl").decode("utf-8").splitlines()]
+                self.assertIn("Voice runtime unconfirmed:", archive.read("app.log").decode("utf-8"))
+            observed = [r for r in records if r["event"] == "voice_host_confirmation"]
+            self.assertEqual(observed, [])
+            unknown = [r for r in records if r.get("state") == "host_unconfirmed"]
+            self.assertTrue(unknown)
+            self.assertFalse(any(diagnostic_trace._FaultReport.failed(r) for r in unknown))
+            self.assertFalse(any(r["event"] in {"voice_hotkey_retry", "voice_host_recovery"} for r in records))
 
     def test_wetype_async_cleanup_failure_is_written_back_and_retried(self):
         self.app._config["voice_program"] = (
@@ -3209,6 +3283,89 @@ class CorruptButtonBindingFailsClosedTests(_AppWiringTestCase):
 
 
 class OrdinaryButtonGestureWiringTests(_AppWiringTestCase):
+    def _use_recorded_repeat_timers(self):
+        timers = []
+
+        def timer_factory(delay, callback):
+            timer = _ManualTimer(callback)
+            timer.delay = delay
+            timers.append(timer)
+            return timer
+
+        self.app._button_gestures._timer_factory = timer_factory
+        self.app._button_gestures._hold_timer_factory = (
+            lambda _delay, callback: _ManualTimer(callback)
+        )
+        self.addCleanup(self.app._button_gestures.reset)
+        return timers
+
+    def test_direction_hold_repeats_faster_and_release_stops_both_sources(self):
+        timers = self._use_recorded_repeat_timers()
+        for source in ("hid_tap", "chromecast"):
+            for button in ("up", "down", "left", "right"):
+                with self.subTest(source=source, button=button), mock.patch.object(
+                    win32_input, "send_arrow_" + button
+                ) as send, mock.patch.object(
+                    app_module.element_navigation_control_windows,
+                    "route_mapped_navigation_key", return_value=False,
+                ):
+                    self.app._on_button_event(button, True, event_source=source)
+                    send.assert_called_once_with()
+                    self.assertEqual(timers[-1].delay, 0.350)
+                    # Repeated device DOWN reports must not add extra steps.
+                    self.app._on_button_event(button, True, event_source=source)
+                    send.assert_called_once_with()
+                    for _ in range(3):
+                        timers[-1].fire()
+                        self.assertEqual(timers[-1].delay, 0.065)
+                    self.assertEqual(send.call_count, 4)
+                    stale_timer = timers[-1]
+                    self.app._on_button_event(button, False, event_source=source)
+                    # A timer already dispatched before cancellation is stale too.
+                    stale_timer.callback()
+                    self.assertEqual(send.call_count, 4)
+                    self.app._on_button_event(button, True, event_source=source)
+                    self.assertEqual(send.call_count, 5)
+                    self.assertEqual(timers[-1].delay, 0.350)
+                    stale_timer.callback()
+                    self.assertEqual(send.call_count, 5)
+                    self.app._on_button_event(button, False, event_source=source)
+
+    def test_direction_speed_does_not_change_other_repeatable_actions(self):
+        timers = self._use_recorded_repeat_timers()
+        cases = (
+            ("up", key_mapping.ActionKind.SYSTEM_VOLUME_UP, 0.100),
+            ("up", key_mapping.ActionKind.DELETE_BACKWARD, 0.100),
+            ("volume_up", key_mapping.ActionKind.SYSTEM_VOLUME_UP, 0.100),
+            ("volume_down", key_mapping.ActionKind.ARROW_DOWN, 0.100),
+            ("back", key_mapping.ActionKind.DELETE_BACKWARD, 0.050),
+        )
+        for button, kind, interval in cases:
+            with self.subTest(button=button, kind=kind), mock.patch.object(
+                self.app, "_apply_button_action"
+            ) as apply:
+                self.app._bindings["bindings"][button] = key_mapping.ButtonAction(kind).to_dict()
+                self.app._on_button_event(button, True, event_source="hid_tap")
+                self.assertEqual(timers[-1].delay, 0.350)
+                timers[-1].fire()
+                self.assertEqual(timers[-1].delay, interval)
+                self.assertEqual(apply.call_count, 2)
+                self.app._on_button_event(button, False, event_source="hid_tap")
+
+    def test_faster_direction_repeat_routes_navigation_without_duplicate_input(self):
+        timers = self._use_recorded_repeat_timers()
+        with mock.patch.object(
+            app_module.element_navigation_control_windows,
+            "route_mapped_navigation_key", return_value=True,
+        ) as route, mock.patch.object(win32_input, "send_arrow_up") as send:
+            self.app._on_button_event("up", True, event_source="hid_tap")
+            timers[-1].fire()
+            self.assertEqual(timers[-1].delay, 0.065)
+            self.app._on_button_event("up", False, event_source="hid_tap")
+            timers[-1].callback()
+            self.assertEqual(route.call_args_list, [mock.call(0x26), mock.call(0x26)])
+            send.assert_not_called()
+
     def test_dispatch_callback_does_not_reacquire_the_mapping_lock(self):
         lock_held = threading.Event()
         release_lock = threading.Event()
@@ -3742,16 +3899,16 @@ class OrdinaryButtonGestureWiringTests(_AppWiringTestCase):
                     up.assert_called_once()
                 self.assertEqual(self.app._ble_session.mic_open_calls, 0)
 
-    def test_chatterfly_without_its_own_key_never_sends_runtime_fallback(self):
+    def test_chatterfly_without_its_own_key_uses_control_without_keyboard_fallback(self):
         self.app._config["voice_program"] = {"provider": "chatterfly"}
         config.set_voice_hotkey_for_provider(self.app._config, "chatterfly", "")
-        with mock.patch.object(self.app._voice_audio, "open") as output, \
-                mock.patch.object(self.app._voice_shortcut, "apply") as press:
-            self.assertFalse(self.app._prepare_voice_mapping_locked(
+        with mock.patch.object(self.app._voice_audio, "open", return_value=True) as output, \
+                mock.patch.object(self.app._voice_shortcut, "apply", return_value=True) as press:
+            self.assertTrue(self.app._prepare_voice_mapping_locked(
                 "mic", self.app._primary_button_action("mic")))
-            self.assertFalse(self.app._handle_mic_button_pressed())
-            output.assert_not_called()
-            press.assert_not_called()
+            self.assertTrue(self.app._handle_mic_button_pressed())
+            output.assert_called_once_with()
+            press.assert_called_once_with(app_module.voice_controller.VoiceHostAction.KEY_DOWN)
         self.assertEqual(self.app._ble_session.mic_open_calls, 0)
 
     def test_direct_direction_edge_arms_global_hook_before_mapping_injection(self):
@@ -7267,7 +7424,7 @@ class StartHidListenerOwnershipTests(_AppWiringTestCase):
         original_enumerate = app_module.raw_input_windows.enumerate_matching_device_paths
         original_select = app_module.hid_identity.select_single_device_path
         original_listener_cls = app_module.raw_input_windows.RawInputButtonListener
-        app_module.raw_input_windows.enumerate_matching_device_paths = lambda: ["fake-path"]
+        app_module.raw_input_windows.enumerate_matching_device_paths = lambda **_kwargs: ["fake-path"]
         app_module.hid_identity.select_single_device_path = lambda paths: paths[0]
         app_module.raw_input_windows.RawInputButtonListener = lambda callback: fake_listener
 

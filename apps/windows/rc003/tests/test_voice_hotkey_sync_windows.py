@@ -38,6 +38,94 @@ class VoiceHotkeyDefaultsTests(unittest.TestCase):
         self.assertEqual(result.code, "unsupported_provider")
 
 
+class ChatterflyVoiceHotkeyTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.path = self.root / "ChatterflyPY.users" / "00000001" / "env.ini"
+        self.path.parent.mkdir(parents=True)
+        self.write_config()
+        patcher = mock.patch.object(
+            voice_hotkey_sync_windows, "_chatterfly_scan_token",
+            side_effect=lambda scan: {0x0B: "0", 0x1E: "a", 0x39: "space"}[scan],
+        )
+        self.scan = patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def write_config(self, shortcut="0000140B", active="1", *, encoding="utf-16"):
+        self.path.write_text(
+            "[Setting]\nYbVoiceInputHotkey=" + shortcut
+            + "\nYbVoiceInputHotkeyActive=" + active
+            + "\nYbVoiceCmdHotkey=00001426\n[Unrelated]\nKeep=100%\n",
+            encoding=encoding,
+        )
+
+    def read(self, **kwargs):
+        return voice_hotkey_sync_windows.read_provider_hotkey(
+            "chatterfly", platform="win32", appdata=self.root, **kwargs
+        )
+
+    def test_reads_voice_input_for_both_modes_without_modifying_provider(self):
+        original = self.path.read_bytes()
+        for trigger in ("hold", "toggle"):
+            with self.subTest(trigger=trigger):
+                result = self.read(trigger=trigger)
+                self.assertTrue(result.ok, result.message)
+                self.assertEqual(result.hotkey, "rctrl+rshift+0")
+                self.assertEqual(self.path.read_bytes(), original)
+
+    def test_preserves_each_modifier_side_and_modifier_only_chords(self):
+        expected = {
+            "00000200": "lctrl", "00000400": "rctrl",
+            "00000800": "lshift", "00001000": "rshift",
+            "00002000": "lalt", "00004000": "ralt",
+            "00008000": "lwin", "00010000": "rwin",
+            "00000A1E": "lctrl+lshift+a", "00004439": "rctrl+ralt+space",
+        }
+        for raw, shortcut in expected.items():
+            with self.subTest(raw=raw):
+                self.write_config(raw, encoding="utf-8-sig")
+                self.assertEqual(self.read().hotkey, shortcut)
+
+    def test_rejects_sequences_unknown_flags_empty_and_invalid_encoding(self):
+        for raw in ("00000400,00000400", "0002010B", "00000000", "140B", "G000140B"):
+            with self.subTest(raw=raw):
+                self.write_config(raw)
+                result = self.read()
+                self.assertFalse(result.ok)
+                self.assertEqual(result.hotkey, "")
+        self.path.write_bytes(b"\xff\xfe\xff")
+        self.assertEqual(self.read().code, "read_failed")
+
+    def test_disabled_and_missing_activation_are_not_guessed(self):
+        self.write_config(active="0")
+        self.assertEqual(self.read().code, "disabled")
+        self.path.write_text("[Setting]\nYbVoiceInputHotkey=0000140B\n", encoding="utf-16")
+        self.assertEqual(self.read().code, "read_failed")
+
+    def test_does_not_choose_a_profile_by_age_or_account_number(self):
+        second = self.path.parent.parent / "00000002" / "env.ini"
+        second.parent.mkdir()
+        second.write_bytes(self.path.read_bytes())
+        self.assertEqual(self.read().code, "ambiguous_profile")
+
+    def test_missing_unreadable_and_unsupported_scan_keep_no_result(self):
+        self.path.unlink()
+        self.assertEqual(self.read().code, "not_found")
+        self.write_config()
+        with mock.patch.object(Path, "open", side_effect=PermissionError("denied")):
+            self.assertEqual(self.read().code, "read_failed")
+        self.scan.side_effect = ValueError("unknown scan")
+        self.assertEqual(self.read().code, "read_failed")
+
+    def test_non_windows_does_not_resolve_windows_profile(self):
+        with mock.patch.object(voice_hotkey_sync_windows, "_chatterfly_local_low") as resolve:
+            result = voice_hotkey_sync_windows.read_provider_hotkey("chatterfly", platform="linux")
+        self.assertEqual(result.code, "unsupported_platform")
+        resolve.assert_not_called()
+
+
 class SogouVoiceHotkeyTests(unittest.TestCase):
     def setUp(self):
         self._tmpdir = tempfile.TemporaryDirectory()

@@ -187,6 +187,8 @@ class HidTapState(str, Enum):
     UNHEALTHY = "unhealthy"
     RESTART_REQUIRED = "restart_required"
     SHARED_HOST = "selected_device_shared_host"
+    AUTHORIZATION_CANCELLED = "authorization_cancelled"
+    AUTHORIZATION_FAILED = "authorization_failed"
     FAILED = "failed"
     STOPPED = "stopped"
 
@@ -385,6 +387,7 @@ def run_injector_subprocess(
     executable: str | None = None,
     _is_elevated: Callable[[], bool] | None = None,
     _registered_injector: Callable[[int], None] | None = None,
+    cancel: threading.Event | None = None,
 ) -> None:
     """Start the narrow injector without elevating the desktop application."""
 
@@ -459,6 +462,24 @@ def run_injector_subprocess(
                                   result_status='missing')
             raise HidTapInjectionError(detail, diagnostic=dict(
                 diagnostic, execution_route='registered_helper')) from exc
+        return
+
+    if not resolved_frozen and not _is_elevated():
+        from . import hid_source_injector
+
+        try:
+            code, diagnostic = hid_source_injector.run(pid, timeout=timeout, cancel=cancel)
+        except Exception as exc:
+            detail = str(exc) if isinstance(exc, hid_source_injector.SourceInjectionError) else "source_injector_failed"
+            raise HidTapInjectionError(detail, diagnostic=dict(
+                injection_diagnostics.failure(exc, stage='child_launch'),
+                execution_route='source_elevated', result_status='unavailable')) from exc
+        if code != 0:
+            detail = ("source_authorization_failed"
+                      if diagnostic.get('stage') == 'debug_privilege' or code == 3
+                      else HID_TAP_INJECTOR_EXIT_DETAILS.get(code, "injector_unexpected_failure"))
+            raise HidTapInjectionError(detail, diagnostic=dict(
+                diagnostic, execution_route='source_elevated'))
         return
 
     _run_direct_injector_subprocess(
@@ -542,9 +563,10 @@ class RC003HidReportTap:
         self.heartbeat_timeout = max(10.0, float(heartbeat_timeout))
         self.connection_timeout = max(1.0, float(connection_timeout))
         self.status_handler = status_handler or (lambda _status, _detail: None)
-        self.injector = injector
         self.client_pid_resolver = client_pid_resolver
         self.stop_event = threading.Event()
+        self.injector = (lambda pid: run_injector_subprocess(pid, cancel=self.stop_event)
+                         ) if injector is run_injector_subprocess else injector
         self._stop_requested_event = threading.Event()
         self.thread: threading.Thread | None = None
         self.active_usages: set[int] = set()
@@ -569,6 +591,9 @@ class RC003HidReportTap:
             extra = {'failure_key': 'hid_injection:' + str(payload.get('stage', 'unknown')),
                      'failure_id': uuid.uuid4().hex}
             payload.update(extra)
+        elif event == 'hid_host_lookup' and payload.get('reason') not in {'host_found', 'selected_host_found'}:
+            extra = {'failure_key': 'hid_discovery:host_lookup', 'failure_id': uuid.uuid4().hex}
+            payload.update(extra)
         try:
             _LOGGER.info("HID diagnostic: %s", json.dumps({"event": event, **payload}, ensure_ascii=True),
                          extra=extra)
@@ -590,7 +615,7 @@ class RC003HidReportTap:
             diagnostic = injection_diagnostics.failure(exc)
             if isinstance(raw, dict):
                 for key, allowed in (
-                    ('execution_route', {'direct_child', 'registered_helper'}),
+                    ('execution_route', {'direct_child', 'registered_helper', 'source_elevated'}),
                     ('result_status', {'received', 'missing', 'invalid', 'timeout', 'unavailable',
                                       'instance_mismatch'}),
                 ):
@@ -1134,12 +1159,17 @@ class RC003HidReportTap:
     def _run(self) -> None:
         reload_grace_deadline = 0.0
         reload_mismatch = ""
+        authorization_blocked = False
         injection_attempted_pid: int | None = None
         injection_failed_pid: int | None = None
         transient_retry_pid: int | None = None
         transient_injection_failures = 0
         connection_deadline: float | None = None
         while not self.stop_event.is_set():
+            if authorization_blocked:
+                # Consent must be retried explicitly, even if the HID host changes.
+                self.stop_event.wait(self.retry_delay)
+                continue
             lookup_details = {}
             pid = frida_hid_tap_runtime.find_rc003_hidogatt_host_pid(
                 diagnostic=lookup_details, selected_key=self._selected_key)
@@ -1205,6 +1235,10 @@ class RC003HidReportTap:
                             else f"injector_exception_{type(exc).__name__}"
                         )
                         retry_same_pid = detail in HID_TAP_RETRYABLE_INJECTION_DETAILS
+                        authorization_blocked = detail in {
+                            "source_authorization_cancelled", "source_authorization_failed",
+                            "source_authorization_timeout",
+                        }
                         if detail in HID_TAP_BOUNDED_RETRYABLE_INJECTION_DETAILS:
                             transient_injection_failures += 1
                             retry_same_pid = (
@@ -1218,7 +1252,11 @@ class RC003HidReportTap:
                             self.stop_event.wait(self.retry_delay)
                             continue
                         self._set_status(
-                            HidTapState.RESTART_REQUIRED
+                            HidTapState.AUTHORIZATION_CANCELLED
+                            if detail == "source_authorization_cancelled"
+                            else HidTapState.AUTHORIZATION_FAILED
+                            if detail in {"source_authorization_failed", "source_authorization_timeout"}
+                            else HidTapState.RESTART_REQUIRED
                             if detail == "hid_helper_legacy_runtime_restart_required"
                             else HidTapState.RECOVERING if retry_same_pid else HidTapState.FAILED,
                             detail,

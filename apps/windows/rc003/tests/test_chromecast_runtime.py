@@ -923,8 +923,8 @@ class ProductRoutingTests(_AppWiringTestCase):
         raw_input_windows._set_physical_keyboard_tracker_active(False)
         activate = mock.Mock(return_value=True)
         control = wetype_control_windows.WeTypeVoiceControl(
-            activate_profile=activate, run_sta=lambda fn: fn(), mic_start_reader=None,
-            revive_profile=None, press_keys=self.app._press_wetype_voice_keys,
+            activate_profile=activate, run_sta=lambda fn: fn(), capture_reader=None,
+            press_keys=self.app._press_wetype_voice_keys,
             release_keys=self.app._release_wetype_voice_keys)
         self.app._voice_shortcut.wetype_control = control
         self.app._voice_shortcut.hotkey = SimpleNamespace(modifiers=("lctrl",), key="lwin")
@@ -1045,7 +1045,7 @@ class DetectionUiTests(unittest.TestCase):
              mock.patch.object(controller, "_get_input_capture_in_use", return_value=False), \
              mock.patch.object(controller, "_get_bridge_launch_busy", return_value=False), \
              mock.patch.object(controller, "_refresh_bridge_status", return_value=True), \
-             mock.patch.object(bridge_runtime_status, "read_status", return_value=object()), \
+             mock.patch.object(bridge_runtime_status, "read_status", return_value=SimpleNamespace(hid_tap_state="unknown")), \
              mock.patch.object(bridge_runtime_status, "input_channels_ready", return_value=False), \
              mock.patch.object(controller, "_begin_input_operation_start") as start:
             controller.startKeyDetection()

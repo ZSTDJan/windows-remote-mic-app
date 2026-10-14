@@ -1,6 +1,6 @@
 # 无线麦【Win版】
 
-无线麦把蓝牙语音遥控器的按键和麦克风变成 Windows 快捷操作与语音输入工具，可远距离控制应用、输入文字和触发 Quicker 动作。支持按键单击、双击、长按映射，适配小米蓝牙语音遥控器 2 Pro 和谷歌 TV Chromecast 遥控器，可配合搜狗、微信、豆包输入法使用。QQ 群：89641716。
+无线麦把蓝牙语音遥控器的按键和麦克风变成 Windows 快捷操作与语音输入工具，可远距离控制应用、输入文字和触发 Quicker 动作。支持按键单击、双击、长按映射，适配小米蓝牙语音遥控器 2 Pro 和谷歌 TV Chromecast 遥控器，可配合搜狗、微信、豆包和 Chatterfly 使用。QQ 群：89641716。
 
 | 谷歌遥控器按键映射 | 小米遥控器按键映射 |
 | --- | --- |
@@ -8,22 +8,23 @@
 
 ![图示谷歌与小米遥控器实物对比](docs/images/remote-comparison.png)
 
-<sub>设备参考：<br>1. 小米遥控器约 65-99 元 Type-C充电（录音功能有限制——仅支持按住型，单次录音限制 60 秒内）；<br>2. 图示谷歌遥控器约 15 元（录音功能无限制——支持按住型&开关型，录制超 60 秒）；谷歌遥控器版本较多，图示款购自某多多平台「IN数码配件」，仅作型号参考，无利益关联；</sub>
+设备参考：<br>1. 小米遥控器约 65-99 元 Type-C充电（录音功能有限制——仅支持按住型，单次录音限制 60 秒内）；<br>2. 图示谷歌遥控器约 15 元（录音功能无限制——支持按住型&开关型，录制超 60 秒）；<ins><strong>谷歌遥控器版本较多，图示款购自某多多平台「IN数码配件」，仅作型号参考，无利益关联；<br>购买谷歌遥控时注意看遥控版本差别（电池仓内）！以免买来不能用。。。</strong></ins>
 
 ## 下载与版本
 
-**[下载正式版 1.0.87](https://github.com/ZSTDJan/windows-remote-mic-app/releases/download/v1.0.87/RemoteMicRC003-1.0.87-portable-unsigned.zip)** · [版本说明](https://github.com/ZSTDJan/windows-remote-mic-app/releases/tag/v1.0.87) · [SHA256SUMS.txt](https://github.com/ZSTDJan/windows-remote-mic-app/releases/download/v1.0.87/SHA256SUMS.txt)
+**[下载正式版 1.0.91](https://github.com/ZSTDJan/windows-remote-mic-app/releases/download/v1.0.91/RemoteMicRC003-1.0.91-portable-unsigned.zip)** · [版本说明](https://github.com/ZSTDJan/windows-remote-mic-app/releases/tag/v1.0.91) · [SHA256SUMS.txt](https://github.com/ZSTDJan/windows-remote-mic-app/releases/download/v1.0.91/SHA256SUMS.txt)
 
-当前正式版为 **1.0.87**，支持小米蓝牙语音遥控器 2 Pro 和图示谷歌 Chromecast 遥控器。修复元素导航确认及右键的输入冲突，补齐点击诊断，并改进音频采样、更新检查和日志导出；保留豆包输入法 0.9.1.22、B 款微信、连接兼容、Chatterfly 及快捷键支持。具体功能与界面以下载的版本为准。
+当前正式版为 **1.0.91**。本版新增鼠标长按和按键配置管理，改进 Chatterfly 录音控制、自动快捷键更新及豆包兼容。
 
-版本沿用同一条递增更新主线：`1.0.72 → 1.0.86 → 1.0.87`；测试版序号转正后继续使用相同数字，不另设产品发布分支。旧正式版和测试版保留在 [历史版本](https://github.com/ZSTDJan/windows-remote-mic-app/releases)。实体遥控器、宿主点击、44.1k 音频、文字上屏、久置／休眠恢复和异机仍按各自项目实测，原微信久置反馈电脑已按用户要求取消验收。
+旧版可在 [历史版本](https://github.com/ZSTDJan/windows-remote-mic-app/releases) 中下载。
 
 完整解压 ZIP 后运行其中的 `无线麦 win版 <版本号>.exe`，不要只取出 EXE。程序未签名，Windows 可能弹出安全提示；请从本仓库下载。
 
 ## 能做什么
 
 - 给遥控器按键设置方向、确认、音量、快捷键、鼠标操作或 Quicker 动作；同一按键可分别设置单击、双击和长按。
-- 用遥控器话筒键说话，在文字输入框中使用搜狗、微信或豆包输入法输入文字。
+- 用遥控器话筒键说话，在文字输入框中使用搜狗、微信、豆包或 Chatterfly 输入文字。
+- 在“管理按键配置”中复制、应用、重命名和删除配置副本，或导出／导入文件备份；当前映射始终自动保存。
 - 在通知区域保持运行；关闭设置窗口通常会隐藏，结束程序请从通知区域选择“完全退出”。
 
 ## 第一次使用
@@ -41,14 +42,14 @@
 ### 再设置语音输入
 
 1. 在“语音”页安装音频组件。无线麦的输出端点选 `CABLE Input`，输入法的麦克风选 `CABLE Output`。
-2. 选择搜狗、微信或豆包输入法，核对无线麦“语音按键”与输入法对应模式的快捷键一致；自动读取失败时可手动录入。小米使用按住型；谷歌还可选择开关型。
-3. 先在记事本中用电脑键盘试这个快捷键，确认能打开语音输入。再把光标留在文字框里试遥控器：按住型是按住说话、松开结束；开关型是按一次开始、再按一次结束。
+2. 选择搜狗、微信、豆包或 Chatterfly。搜狗、微信和豆包须核对无线麦“语音按键”与输入法对应模式一致，自动读取失败可手动录入；Chatterfly 直接控制录音，快捷键供键盘对照。小米使用按住型；谷歌还可选择开关型。
+3. 打开记事本，把光标放在文字框里试遥控器：按住型是按住说话、松开结束；开关型是按一次开始、再按一次结束。搜狗、微信和豆包可先用电脑键盘测试语音快捷键，确认输入法能正常录音。
 
 ![输入法快捷键与虚拟麦克风配置教程](docs/screenshots/voice-configuration-example.jpg)
 
 <sub>语音教程图以豆包输入法为例，重点是两边快捷键一致，并在输入法中选择 `CABLE Output`；新版界面位置可能略有变化。</sub>
 
-**快捷键注意：**避开 Windows 和其他软件正在使用的组合键。按住说话期间，这组快捷键会一直保持按下，松开话筒键才释放；这段时间不要同时操作其他键或鼠标。
+**快捷键注意：** 搜狗、微信和豆包应避开 Windows 和其他软件已占用的组合键；按住说话期间，这组键会保持按下，松开话筒键才释放。
 
 首次配对、音频安装和故障排查的详细步骤见 [使用说明](apps/windows/rc003/README.md)。
 
@@ -71,16 +72,6 @@
 
 Windows 客户端的运行、构建和技术说明见 [开发者文档](apps/windows/rc003/README.md)。
 元素导航的独立项目 OrthoFocus 见 [项目说明](apps/windows/orthofocus/README.md)。
-
-从源码运行设置界面：
-
-```powershell
-Set-Location apps/windows/rc003
-py -3.12 -m venv .venv
-.\.venv\Scripts\python.exe -m pip install -r requirements-dev.txt
-$env:PYTHONPATH = Join-Path (Get-Location) 'src'
-.\.venv\Scripts\python.exe -m ovb_rc003 --settings
-```
 
 </details>
 

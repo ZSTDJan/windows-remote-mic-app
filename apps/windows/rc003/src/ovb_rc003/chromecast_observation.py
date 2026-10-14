@@ -130,6 +130,11 @@ HID_ERROR_TYPES = frozenset({"none", "other", "TapError", "GadgetAttachError", "
     "TransportError", "ProtocolError", "ServerNotRunningError", "ExecutableNotFoundError", "TimeoutExpired",
     "ExecutableNotSupportedError", "AddressInUseError", "OperationCancelledError", "TimedOutError"})
 
+CLEANUP_STEPS = frozenset({"callback_remove", "subscription_api", "subscription_disable", "service_close",
+    "session_release", "session_close", "watcher_remove", "watcher_stop", "device_close", "summary"})
+CLEANUP_OUTCOMES = frozenset({"none", "success", "status_failed", "timeout", "cancelled",
+    "os_error", "exception", "history_failed"})
+
 
 def _integer(value, low=0, high=MAX_COUNT):
     return type(value) is int and low <= value <= high
@@ -139,6 +144,26 @@ def valid_record(row):
     if not isinstance(row, dict):
         return False
     kind = row.get("kind")
+    if kind == "voice_cleanup":
+        return (set(row) == {"kind", "elapsed_ms", "attempt", "cycle", "step", "state", "outcome",
+                            "duration_ms", "hresult", "status", "handle", "error_type", "previous_failed",
+                            "current_failed", "remaining_services", "session_owned", "omitted", "first_step",
+                            "first_outcome", "first_hresult", "first_status", "first_handle", "first_error_type"}
+                and all(isinstance(row[k], str) for k in
+                    ("step", "state", "outcome", "error_type", "first_step", "first_outcome", "first_error_type"))
+                and _integer(row["elapsed_ms"]) and _integer(row["attempt"], 1, 2)
+                and _integer(row["cycle"], 1, 65535) and row["step"] in CLEANUP_STEPS
+                and row["state"] in ("begin", "done") and row["outcome"] in CLEANUP_OUTCOMES
+                and _integer(row["duration_ms"]) and _integer(row["hresult"], -1, 0xffffffff)
+                and _integer(row["status"], -1, 65535) and _integer(row["handle"], -1, 65535)
+                and row["error_type"] in HID_ERROR_TYPES
+                and all(_integer(row[k], 0, 1) for k in ("previous_failed", "current_failed", "session_owned"))
+                and _integer(row["remaining_services"], 0, 65535)
+                and _integer(row["omitted"])
+                and row["first_step"] in CLEANUP_STEPS | {"none"}
+                and row["first_outcome"] in CLEANUP_OUTCOMES and row["first_error_type"] in HID_ERROR_TYPES
+                and _integer(row["first_hresult"], -1, 0xffffffff)
+                and _integer(row["first_status"], -1, 65535) and _integer(row["first_handle"], -1, 65535))
     if kind == "hid_startup":
         return (set(row) == {"kind", "elapsed_ms", "step", "state", "duration_ms", "error_type",
                             "cause_type", "native_code", "cause_code", "host_pid", "script_line", "reason", "details"}
@@ -306,6 +331,13 @@ class Observation:
 
     def voice_link(self, data, attempt):
         row = dict(data, elapsed_ms=max(0, self._ms(self.clock())), attempt=attempt)
+        if valid_record(row):
+            self._send(row)
+        else:
+            self.count('metadata_rejected')
+
+    def voice_cleanup(self, data):
+        row = dict(data, elapsed_ms=max(0, self._ms(self.clock())))
         if valid_record(row):
             self._send(row)
         else:

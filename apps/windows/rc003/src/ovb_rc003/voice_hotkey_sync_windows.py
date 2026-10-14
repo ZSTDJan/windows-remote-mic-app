@@ -4,11 +4,15 @@ Sogou exposes a stable on-disk shortcut setting that can be read and updated
 without opening its UI. Doubao exposes its current hold shortcut in its user
 configuration. WeType is read only from its visible settings page on explicit
 refresh; its hidden status-bar hint can retain an obsolete shortcut.
+Chatterfly's LocalLow user configuration stores a scan code and sided modifier
+bits. Read only an unambiguous profile; never choose an account by file age.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import configparser
+import ctypes
 import hashlib
 import json
 import os
@@ -18,6 +22,7 @@ import sys
 import tempfile
 import threading
 from typing import Optional
+from uuid import UUID
 
 from . import hotkey, product_identity, voice_program_manager, win32_keys
 
@@ -27,8 +32,7 @@ DEFAULT_PROVIDER_HOTKEYS = {
     voice_program_manager.VOICE_PROGRAM_SOGOU: "rctrl",
     voice_program_manager.VOICE_PROGRAM_WETYPE: "lctrl+lwin",
     voice_program_manager.VOICE_PROGRAM_DOUBAO_IME: "ralt",
-    # Chatterfly does not publish a stable default or a supported shortcut API.
-    # Require the user's actual shortcut instead of copying this machine's value.
+    # Read the user's actual shortcut; no machine-specific default.
     voice_program_manager.VOICE_PROGRAM_CHATTERFLY: "",
     voice_program_manager.VOICE_PROGRAM_CUSTOM: "ralt",
 }
@@ -189,6 +193,16 @@ _DOUBAO_SIDED_MODIFIERS = (
 )
 _DOUBAO_BASIC_MODIFIER_MASK = 0x000F
 _DOUBAO_SIDED_MODIFIER_MASK = 0xFF00
+
+# Chatterfly 1.0.0.5531, YbVoiceInputHotkey: low byte = scan code;
+# bits 9..16 = left/right Ctrl, Shift, Alt, Win. A sequence (double tap)
+# contains more than one packed value and cannot be replayed as one chord.
+_CHATTERFLY_MODIFIERS = (
+    (0x0200, "lctrl"), (0x0400, "rctrl"),
+    (0x0800, "lshift"), (0x1000, "rshift"),
+    (0x2000, "lalt"), (0x4000, "ralt"),
+    (0x8000, "lwin"), (0x10000, "rwin"),
+)
 
 
 @dataclass(frozen=True, repr=False)
@@ -377,18 +391,12 @@ def read_provider_hotkey(
     if provider in {
         voice_program_manager.VOICE_PROGRAM_NONE,
         voice_program_manager.VOICE_PROGRAM_CUSTOM,
-        voice_program_manager.VOICE_PROGRAM_CHATTERFLY,
     }:
-        message = (
-            "请在 Chatterfly 设置中核对语音输入快捷键，再手动录入无线麦。"
-            if provider == voice_program_manager.VOICE_PROGRAM_CHATTERFLY
-            else f"该程序只使用{product_identity.DISPLAY_NAME}内记录的按住型快捷键。"
-        )
         return VoiceHotkeySyncResult(
             provider,
             False,
             "local_only",
-            message=message,
+            message=f"该程序只使用{product_identity.DISPLAY_NAME}内记录的按住型快捷键。",
         )
     if current_platform != "win32":
         return VoiceHotkeySyncResult(
@@ -406,6 +414,9 @@ def read_provider_hotkey(
                 else _read_wetype_hotkey(cancel_event=cancel_event))
     if provider == voice_program_manager.VOICE_PROGRAM_DOUBAO_IME:
         return _read_doubao_hotkey(appdata=appdata, trigger=trigger)
+    if provider == voice_program_manager.VOICE_PROGRAM_CHATTERFLY:
+        # Both remote modes use the same Chatterfly voice-input shortcut.
+        return _read_chatterfly_hotkey(appdata=appdata)
     return VoiceHotkeySyncResult(
         provider, False, "unsupported_provider", message="暂不支持读取该程序。"
     )
@@ -551,6 +562,106 @@ def _preferred_token_for_vk(vk_code: int) -> str:
         if candidate == vk_code and token not in _MODIFIER_FAMILY_BY_TOKEN:
             return token
     raise ValueError(f"不支持的按键代码：{vk_code}")
+
+
+def _chatterfly_local_low() -> Path:
+    # Use the actual known folder, including redirected Windows profiles.
+    folder_id = ctypes.create_string_buffer(
+        UUID("A520A1A4-1780-4FF6-BD18-167343C5AF16").bytes_le, 16
+    )
+    shell = ctypes.WinDLL("shell32", use_last_error=True)
+    ole = ctypes.WinDLL("ole32", use_last_error=True)
+    shell.SHGetKnownFolderPath.argtypes = (
+        ctypes.c_void_p, ctypes.c_uint32, ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_wchar_p),
+    )
+    shell.SHGetKnownFolderPath.restype = ctypes.c_long
+    ole.CoTaskMemFree.argtypes = (ctypes.c_void_p,)
+    ole.CoTaskMemFree.restype = None
+    pointer = ctypes.c_wchar_p()
+    try:
+        result = shell.SHGetKnownFolderPath(folder_id, 0, None, ctypes.byref(pointer))
+        if result != 0 or not pointer.value:
+            raise OSError("无法确定 Chatterfly 用户配置目录")
+        return Path(pointer.value)
+    finally:
+        if pointer:
+            ole.CoTaskMemFree(ctypes.cast(pointer, ctypes.c_void_p))
+
+
+def _chatterfly_scan_token(scan: int) -> str:
+    user = ctypes.WinDLL("user32", use_last_error=True)
+    user.MapVirtualKeyW.argtypes = (ctypes.c_uint, ctypes.c_uint)
+    user.MapVirtualKeyW.restype = ctypes.c_uint
+    vk = int(user.MapVirtualKeyW(scan, 3))  # MAPVK_VSC_TO_VK_EX
+    token = _preferred_token_for_vk(vk)
+    if token in _MODIFIER_FAMILY_BY_TOKEN:
+        raise ValueError("Chatterfly 主键编码无效")
+    return token
+
+
+def _chatterfly_shortcut_to_hotkey(raw: str) -> str:
+    if not re.fullmatch(r"[0-9A-Fa-f]{8}", raw):
+        raise ValueError("暂不支持该 Chatterfly 快捷键格式（如双击按键）")
+    packed = int(raw, 16)
+    if packed & ~0x1FEFF:
+        raise ValueError("暂不识别该 Chatterfly 按键标记")
+    tokens = [token for flag, token in _CHATTERFLY_MODIFIERS if packed & flag]
+    scan = packed & 0xFF
+    if scan:
+        tokens.append(_chatterfly_scan_token(scan))
+    if not tokens:
+        raise ValueError("Chatterfly 语音输入快捷键为空")
+    result = validate_provider_hotkey("chatterfly", "+".join(tokens))
+    if not result.ok:
+        raise ValueError(result.message)
+    return result.hotkey
+
+
+def _read_chatterfly_hotkey(*, appdata: Optional[Path]) -> VoiceHotkeySyncResult:
+    provider = voice_program_manager.VOICE_PROGRAM_CHATTERFLY
+    try:
+        # For this provider the optional test root is LocalLow, not Roaming.
+        root = appdata if appdata is not None else _chatterfly_local_low()
+        profiles = list((root / "ChatterflyPY.users").glob("*/env.ini"))
+        if not profiles:
+            return VoiceHotkeySyncResult(
+                provider, False, "not_found", message="未找到 Chatterfly 快捷键配置。"
+            )
+        if len(profiles) != 1:
+            return VoiceHotkeySyncResult(
+                provider, False, "ambiguous_profile",
+                message="发现多个 Chatterfly 账号配置，无法确认当前快捷键，请手动录入。",
+            )
+        with profiles[0].open("rb") as handle:
+            content = handle.read(1024 * 1024 + 1)
+        if len(content) > 1024 * 1024:
+            raise ValueError("Chatterfly 配置过大")
+        document = configparser.ConfigParser(interpolation=None)
+        document.read_string(content.decode(
+            "utf-16" if content.startswith((b"\xff\xfe", b"\xfe\xff")) else "utf-8-sig"
+        ))
+        if document.get("Setting", "YbVoiceInputHotkeyActive") != "1":
+            return VoiceHotkeySyncResult(
+                provider, False, "disabled",
+                message="Chatterfly 的语音输入快捷键未启用，请先在 Chatterfly 设置中开启。",
+            )
+        shortcut = _chatterfly_shortcut_to_hotkey(
+            document.get("Setting", "YbVoiceInputHotkey").strip()
+        )
+    except (OSError, UnicodeError, configparser.Error):
+        # INI parser errors can include unrelated account configuration text.
+        return VoiceHotkeySyncResult(
+            provider, False, "read_failed",
+            message="无法读取 Chatterfly 快捷键配置，或配置格式无效，请手动录入。",
+        )
+    except ValueError as exc:
+        return VoiceHotkeySyncResult(
+            provider, False, "read_failed", message=f"读取 Chatterfly 快捷键失败：{exc}"
+        )
+    return VoiceHotkeySyncResult(
+        provider, True, "read", shortcut, "已读取 Chatterfly 的语音输入快捷键。"
+    )
 
 
 def _doubao_shortcut_to_hotkey(raw: object, *, label="快捷键") -> str:

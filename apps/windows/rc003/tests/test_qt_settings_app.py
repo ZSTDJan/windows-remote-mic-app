@@ -2691,6 +2691,56 @@ class SettingsControllerTests(unittest.TestCase):
             "ralt",
         )
 
+    def test_chatterfly_manual_value_requires_explicit_refresh_then_survives_reopen(self):
+        data = config.default_config()
+        config.set_voice_hotkey_for_provider(data, "chatterfly", "rctrl+rshift",
+                                            source=config.VOICE_HOTKEY_SOURCE_MANUAL)
+        path = config.config_path(config.config_root())
+        config.save_config(path, data)
+        controller, _ = self._make_controller()
+        self._voice_hotkey_read_mock.reset_mock()
+        controller.selectedVoiceProgramIndex = 5
+        controller.loadVoiceHotkeyFromProvider()
+        self._voice_hotkey_read_mock.assert_not_called()
+        self.assertEqual(controller.holdVoiceHotkeyText, "rctrl+rshift")
+        self._voice_hotkey_read_mock.side_effect = None
+        self._voice_hotkey_read_mock.return_value = (
+            qt_settings_app.voice_hotkey_sync_windows.VoiceHotkeySyncResult(
+                "chatterfly", True, "read", "rctrl+rshift+0", "已读取"
+            )
+        )
+        controller.refreshVoiceHotkeyFromProvider()
+        self.assertEqual(controller.holdVoiceHotkeyText, "rctrl+rshift+0")
+        self.assertEqual(controller.voiceHotkeySource, "auto")
+        self.assertFalse(controller.voiceHotkeyBusy)
+        reopened, _ = self._make_controller()
+        self.assertEqual(reopened.holdVoiceHotkeyText, "rctrl+rshift+0")
+        self.assertEqual(reopened.voiceHotkeySource, "auto")
+
+    def test_chatterfly_failed_refresh_preserves_manual_value_and_disk(self):
+        data = config.default_config()
+        config.set_voice_hotkey_for_provider(data, "chatterfly", "rctrl+rshift",
+                                            source=config.VOICE_HOTKEY_SOURCE_MANUAL)
+        path = config.config_path(config.config_root())
+        config.save_config(path, data)
+        controller, _ = self._make_controller()
+        controller.selectedVoiceProgramIndex = 5
+        before = path.read_bytes()
+        self._voice_hotkey_read_mock.side_effect = None
+        for code in ("not_found", "ambiguous_profile", "disabled", "read_failed"):
+            with self.subTest(code=code):
+                self._voice_hotkey_read_mock.return_value = (
+                    qt_settings_app.voice_hotkey_sync_windows.VoiceHotkeySyncResult(
+                        "chatterfly", False, code, message=code
+                    )
+                )
+                controller.refreshVoiceHotkeyFromProvider()
+                self.assertEqual(controller.holdVoiceHotkeyText, "rctrl+rshift")
+                self.assertEqual(controller.voiceHotkeySource, "manual")
+                self.assertEqual(path.read_bytes(), before)
+                self.assertIn("已保留当前快捷键", controller.errorMessage)
+                self.assertFalse(controller.voiceHotkeyBusy)
+
     def test_wetype_saves_direct_shortcut_edits_locally(self):
         controller, _ = self._make_controller()
         controller.selectedVoiceProgramIndex = 2
@@ -3893,6 +3943,33 @@ class SettingsControllerTests(unittest.TestCase):
                     "numpad_multiply", "numpad_divide", "numpad_decimal", "left", "vk_e2",
                 })
 
+    def test_qt_capture_does_not_reintroduce_forwarded_chatterfly_probe(self):
+        controller, _ = self._make_controller()
+        captured = []
+        controller.hotkeyCaptured.connect(captured.append)
+        controller._hotkey_capture = mock.Mock()
+        controller._set_input_operation_state("hotkey", "active")
+        control = self.Qt.KeyboardModifier.ControlModifier.value
+        shift = self.Qt.KeyboardModifier.ShiftModifier.value
+        controller._capture_hotkey_qt_event(
+            self.Qt.Key.Key_Control.value, control, "", True, False,
+            native_virtual_key=0xA3, native_scan_code=0xE01D)
+        before = list(controller._qt_hotkey_tokens)
+        for pressed in (True, False):
+            self.assertFalse(controller._capture_hotkey_qt_event(
+                self.Qt.Key.Key_unknown.value, control, "", pressed, False,
+                native_virtual_key=0xFC, native_scan_code=0))
+        self.assertEqual(controller._qt_hotkey_tokens, before)
+        self.assertEqual(captured, [])
+        controller._capture_hotkey_qt_event(
+            self.Qt.Key.Key_Shift.value, control | shift, "", True, False,
+            native_virtual_key=0xA1, native_scan_code=0x36)
+        for pressed in (True, False):
+            controller._capture_hotkey_qt_event(
+                self.Qt.Key.Key_0.value, control | shift, "", pressed, False,
+                native_virtual_key=0x30, native_scan_code=0x0B)
+        self.assertEqual(captured, ["rctrl+rshift+0"])
+
     def test_readable_mapping_labels_never_replace_the_stored_key_tokens(self):
         controller, model = self._make_controller()
         row = model.index_of("up")
@@ -4120,7 +4197,7 @@ class SettingsControllerTests(unittest.TestCase):
         instances = []
 
         class ImmediateCapture:
-            def __init__(self, callback, *, accept_injected=False):
+            def __init__(self, callback, *, accept_injected=False, isolated=False, on_error=None):
                 self._callback = callback
                 self.accept_injected = accept_injected
                 self.is_running = False
@@ -4150,6 +4227,40 @@ class SettingsControllerTests(unittest.TestCase):
         self.assertFalse(controller.hotkeyCaptureActive)
         self.assertIsNone(controller._hotkey_capture)
         self.assertIsNone(controller._pending_hotkey_capture_result)
+
+    def test_hotkey_cancel_or_child_failure_wins_over_late_start_and_result(self):
+        for failed in (False, True):
+            with self.subTest(child_failed=failed):
+                controller, _ = self._make_controller()
+                captured, errors = [], []
+                controller.hotkeyCaptured.connect(captured.append)
+                controller.hotkeyCaptureError.connect(errors.append)
+                controller._set_input_operation_state("hotkey", "starting")
+                controller._input_operation_cancel_event = threading.Event()
+                token = controller._input_operation_token
+                capture = mock.Mock()
+                if failed:
+                    controller._on_hotkey_capture_failed((token, "录入已中断"))
+                else:
+                    controller.stopHotkeyCapture()
+                controller._on_hotkey_capture_result((token, "rctrl+rshift+0"))
+                controller._on_input_operation_ready((
+                    token, "start", qt_settings_app._InputStartResult(
+                        "hotkey", True, hotkey_capture=capture,
+                    ),
+                ))
+                self.assertEqual(captured, [])
+                self.assertEqual(errors, ["录入已中断"] if failed else [])
+                self.assertEqual(controller._input_operation_phase, "idle")
+                self.assertIsNone(controller._pending_hotkey_capture_result)
+                capture.stop.assert_called_once_with()
+
+    def test_stale_hotkey_child_failure_cannot_stop_a_new_recording(self):
+        controller, _ = self._make_controller()
+        controller._set_input_operation_state("hotkey", "active")
+        with mock.patch.object(controller, "_request_input_stop") as stop:
+            controller._on_hotkey_capture_failed((controller._input_operation_token - 1, "旧错误"))
+        stop.assert_not_called()
 
     def test_hotkey_capture_ready_only_after_the_hook_is_active(self):
         controller, _ = self._make_controller()
@@ -4929,6 +5040,22 @@ class SettingsControllerTests(unittest.TestCase):
             bridge_runtime_status.VOICE_RUNTIME_HOST_START_FAILED,
         )
         self.assertEqual(controller.voiceRuntimeProvider, "wetype")
+
+    def test_unknown_wetype_capture_is_shown_without_start_failure(self):
+        from ovb_rc003 import remote_selection
+        controller, _ = self._make_controller()
+        status = bridge_runtime_status.BridgeRuntimeStatus(
+            schema=bridge_runtime_status.SCHEMA_VERSION,
+            state=bridge_runtime_status.BridgeConnectionState.CONNECTED,
+            pid=4321, updated_at=time.time(),
+            voice_runtime_state=bridge_runtime_status.VOICE_RUNTIME_HOST_UNCONFIRMED,
+            voice_runtime_provider="wetype", voice_active=False)
+        for profile in (remote_selection.RC003_PROFILE, remote_selection.CHROMECAST_PROFILE):
+            with self.subTest(profile=profile), mock.patch.object(remote_selection, "active_profile", return_value=profile):
+                text = controller._describe_runtime_status(status)
+                self.assertIn("已收到声音，未确认微信开麦", text)
+                self.assertIn("若未输入文字，请松开后重试", text)
+                self.assertNotIn("启动失败", text)
 
     def test_legacy_bridge_recommends_manual_restart_without_auto_stopping(self):
         self._bridge_status_patch.stop()
@@ -12590,7 +12717,11 @@ class SettingsShellSourceContractTests(unittest.TestCase):
         self.assertIn("actionEditor.buttonId", self.buttons_qml)
         self.assertEqual(
             self.buttons_qml.count("model: SettingsController.secondaryActionOptionsFor(actionEditor.buttonId)"),
-            2,
+            1,
+        )
+        self.assertEqual(
+            self.buttons_qml.count("model: SettingsController.longPressActionOptionsFor(actionEditor.buttonId)"),
+            1,
         )
         self.assertEqual(self.buttons_qml.count("cardId: buttonId"), 2)
         self.assertIn('objectName: "actionEditorDialog"', self.buttons_qml)
@@ -14328,7 +14459,7 @@ class FakeHotkeyCapture:
     start_calls = 0
     stop_calls = 0
 
-    def __init__(self, on_captured, *, accept_injected=False):
+    def __init__(self, on_captured, *, accept_injected=False, isolated=False, on_error=None):
         self.on_captured = on_captured
         self.accept_injected = accept_injected
         self.is_running = False
@@ -14544,7 +14675,7 @@ assert combo.property("visible")
 assert double_combo.property("visible") and long_combo.property("visible")
 assert int(combo.property("count")) == len(controller.primaryActionOptionsFor("mic"))
 assert int(double_combo.property("count")) == len(controller.secondaryActionOptionsFor("mic"))
-assert int(long_combo.property("count")) == len(controller.secondaryActionOptionsFor("mic"))
+assert int(long_combo.property("count")) == len(controller.longPressActionOptionsFor("mic"))
 assert not double_combo.property("enabled") and not long_combo.property("enabled")
 assert combo.property("selectTextByMouse")
 assert double_combo.property("selectTextByMouse")

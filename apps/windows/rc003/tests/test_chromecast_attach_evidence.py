@@ -192,7 +192,13 @@ class AttachEvidenceTests(unittest.TestCase):
         self.assertTrue(all(valid_record(row) for row in rows))
         self.assertEqual([row['step'] for row in rows],
                          ['attach_helper_scan', 'attach_helper_manager', 'attach_helper_service'])
-        self.assertEqual(rows[0]['details']['query_complete'], 1)
+        # Other, protected Frida services can make a real machine-wide scan
+        # partial. The owned child's lifecycle must still be observed, without
+        # claiming that unreadable processes were successfully inspected.
+        scan = rows[0]['details']
+        self.assertGreaterEqual(scan['sample_count'], 1)
+        self.assertEqual(scan['query_complete'],
+                         int(not scan['scan_errors'] and not scan['scan_limited']))
         self.assertEqual(rows[1]['details']['helper_count'], 1)
         self.assertEqual(rows[1]['details']['helper_pid'], child.pid)
         self.assertEqual(rows[1]['details']['alive'], 0)

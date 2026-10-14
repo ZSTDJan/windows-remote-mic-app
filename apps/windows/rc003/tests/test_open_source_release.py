@@ -6,6 +6,7 @@ import subprocess
 import sys
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 RC003_ROOT = Path(__file__).resolve().parents[1]
@@ -44,6 +45,49 @@ class CommunityHealthFileTests(unittest.TestCase):
 
 
 class ThirdPartyReleaseGateTests(unittest.TestCase):
+    def _history_blockers(self, commit, *, subject="contribution", patch="", content=""):
+        script_path = BUILD_ROOT / "check-release-readiness.py"
+        namespace = {"__name__": "release_gate_contract", "__file__": str(script_path)}
+        exec(compile(script_path.read_text(encoding="utf-8"), str(script_path), "exec"), namespace)
+
+        def run_git(*args):
+            output = ""
+            if args[0] == "rev-parse":
+                output = str(REPO_ROOT)
+            elif args[:2] == ("log", "--format=%H%x00%ae%x00%ce%x00%s"):
+                output = "\x00".join((commit, "author@example.test", "committer@example.test", subject))
+            elif "--patch" in args:
+                output = patch
+            elif "-S" in args:
+                output = content
+            return subprocess.CompletedProcess(args, 0, output, "")
+
+        with mock.patch.dict(namespace, {"_run_git": run_git}):
+            return namespace["_git_history_blockers"]()
+
+    def test_explicitly_approved_contributor_commit_keeps_original_email(self):
+        self.assertEqual(self._history_blockers("2dc521834df4b30d3492f9ab5355ccf4a125b8c5"), [])
+
+    def test_other_commits_with_ordinary_email_are_still_blocked(self):
+        self.assertIn("1 commits expose a non-noreply email", self._history_blockers("0" * 40))
+
+    def test_approved_email_does_not_exempt_internal_subjects(self):
+        marker = "".join(map(chr, (0x56, 0x69, 0x62, 0x65, 0x50, 0x61, 0x64)))
+        self.assertIn("1 commit subjects expose internal references", self._history_blockers(
+            "2dc521834df4b30d3492f9ab5355ccf4a125b8c5", subject=marker,
+        ))
+
+    def test_approved_email_does_not_exempt_internal_content(self):
+        self.assertTrue(any("internal-reference markers" in item for item in self._history_blockers(
+            "2dc521834df4b30d3492f9ab5355ccf4a125b8c5", content="fixture",
+        )))
+
+    def test_approved_email_does_not_exempt_private_paths(self):
+        private_path = chr(92).join(("C:", "Users", "fixture", "private"))
+        self.assertIn("Git history contains a private absolute path", self._history_blockers(
+            "2dc521834df4b30d3492f9ab5355ccf4a125b8c5", patch=private_path,
+        ))
+
     def test_pinned_dependencies_have_notice_entries(self):
         result = subprocess.run(
             [sys.executable, str(BUILD_ROOT / "check-third-party-notices.py")],

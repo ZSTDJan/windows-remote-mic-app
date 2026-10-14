@@ -212,6 +212,7 @@ def _dry_run() -> int:
         element_navigation_runtime,
         frida_compat,
         frida_hid_tap_injector,
+        hid_source_injector,
         hid_elevation_windows,
         hid_helper_consumers,
         hid_identity,
@@ -806,6 +807,11 @@ def _handoff_previous_application(
 
 def main() -> None:
     args = dev_session.consume_marker(sys.argv[1:])
+    if "--capture-hotkey-worker" in args:
+        from . import hotkey_capture_process
+        if args[0] != hotkey_capture_process.FLAG:
+            raise SystemExit(2)
+        raise SystemExit(hotkey_capture_process.child_main(args[1:]))
     if "--doubao-handsfree-finish" in args:
         from . import chromecast_doubao_handsfree
         if args[0] != chromecast_doubao_handsfree.FLAG:
@@ -816,6 +822,11 @@ def main() -> None:
         if args[0] != sogou_submit_windows.FLAG:
             raise SystemExit(2)
         raise SystemExit(sogou_submit_windows.child_main(args[1:]))
+    if "--rc003-source-injector" in args:
+        from . import hid_source_injector
+        if args[0] != hid_source_injector.FLAG:
+            raise SystemExit(2)
+        raise SystemExit(hid_source_injector.main(args[1:]))
     if "--chromecast-worker" in args:
         if args[0] != "--chromecast-worker":
             raise SystemExit(2)

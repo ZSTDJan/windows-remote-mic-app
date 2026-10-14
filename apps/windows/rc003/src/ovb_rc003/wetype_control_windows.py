@@ -15,15 +15,14 @@ import queue
 import threading
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Callable, Optional, Sequence, TypeVar, cast
 
 from . import chromecast_host_activity, diagnostic_trace, voice_playback_session_windows, win32_input
 
 _STA_RESULT_TIMEOUT_SECONDS = 0.5
 _SESSION_REBIND_SETTLE_SECONDS = 0.05
-_WETYPE_CONFIRM_WINDOW_SECONDS = 0.7
-_WETYPE_RETRY_SETTLE_SECONDS = (2.0, 3.0, 5.0)
+_WETYPE_BASELINE_WAIT_SECONDS = 0.25
 
 _COINIT_APARTMENTTHREADED = 0x2
 _CLSCTX_INPROC_SERVER = 0x1
@@ -548,45 +547,6 @@ def _activate_doubao_for_voice_start(
         raise
 
 
-def _cycle_wetype_input_profile(
-    *, _sleep: Callable[[float], None] = time.sleep
-) -> bool:
-    with _InputProfileManager() as manager:
-        target = _discover_input_profile(manager, "wetype")
-        previous = manager.get_active_profile()
-        alternatives = tuple(
-            profile
-            for profile in manager.enum_profiles(_LANGUAGE_ID_ZH_CN)
-            if profile.profile_type == _TF_PROFILETYPE_INPUTPROCESSOR
-            and not _same_profile(profile, target)
-            and (not profile.flags or profile.flags & _TF_IPP_FLAG_ENABLED)
-        )
-        if not alternatives:
-            raise OSError("no enabled alternative input profile is available")
-        if _sta_cancelled():
-            raise TimeoutError("WeType input profile cycle was cancelled")
-        manager.activate_profile(alternatives[0])
-        if _sta_cancelled():
-            manager.activate_profile(previous)
-            raise TimeoutError("WeType input profile cycle was cancelled")
-        _sleep(_SESSION_REBIND_SETTLE_SECONDS)
-        if _sta_cancelled():
-            manager.activate_profile(previous)
-            raise TimeoutError("WeType input profile cycle was cancelled")
-        manager.activate_profile(target)
-        if _sta_cancelled():
-            manager.activate_profile(previous)
-            raise TimeoutError("WeType input profile cycle was cancelled")
-        _sleep(_SESSION_REBIND_SETTLE_SECONDS)
-        if _sta_cancelled():
-            manager.activate_profile(previous)
-            raise TimeoutError("WeType input profile cycle was cancelled")
-        if not _same_profile(manager.get_active_profile(), target):
-            manager.activate_profile(previous)
-            raise OSError("WeType input profile cycle could not be confirmed")
-        return True
-
-
 _T = TypeVar("_T")
 
 
@@ -764,42 +724,14 @@ def _run_on_sta_thread(
     return cast(_T, value)
 
 
-def _wetype_mic_start_timestamp() -> Optional[int]:
-    if os.name != "nt":
-        return None
-    latest = None
-    try:
-        import winreg
-
-        relative = (
-            "Software\\Microsoft\\Windows\\CurrentVersion\\CapabilityAccessManager\\"
-            "ConsentStore\\microphone\\NonPackaged"
-        )
-        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, relative) as root:
-            index = 0
-            while True:
-                try:
-                    child = winreg.EnumKey(root, index)
-                except OSError:
-                    break
-                index += 1
-                if "wetype" not in child.casefold():
-                    continue
-                try:
-                    with winreg.OpenKey(root, child) as key:
-                        value, _kind = winreg.QueryValueEx(
-                            key, "LastUsedTimeStart"
-                        )
-                except OSError:
-                    continue
-                if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
-                    continue
-                # Windows retains records for old installations; enumeration
-                # order must not hide microphone activity from a newer version.
-                latest = value if latest is None else max(latest, value)
-    except (OSError, TypeError, ValueError):
-        return None
-    return latest
+@dataclass
+class _CaptureObservation:
+    generation: int
+    ready: threading.Event = field(default_factory=threading.Event)
+    pressed: threading.Event = field(default_factory=threading.Event)
+    cancelled: threading.Event = field(default_factory=threading.Event)
+    pressed_at: float = 0.0
+    reason: str = "waiting"
 
 
 class WeTypeVoiceControl:
@@ -820,11 +752,10 @@ class WeTypeVoiceControl:
         on_completion: Optional[Callable[[int, bool], None]] = None,
         on_confirmation: Optional[Callable[[int, bool], None]] = None,
         on_started: Optional[Callable[[int], None]] = None,
-        mic_start_reader: Optional[Callable[[], Optional[int]]] = (
-            _wetype_mic_start_timestamp
-        ),
-        revive_profile: Optional[Callable[[], bool]] = _cycle_wetype_input_profile,
-        sleep: Callable[[float], None] = time.sleep,
+        capture_reader: Optional[Callable[[], Sequence[
+            voice_playback_session_windows.CaptureSession
+        ]]] = chromecast_host_activity.read_wetype_capture,
+        wait_for_cancel: Callable[[threading.Event, float], bool] = threading.Event.wait,
         thread_factory: Callable[..., threading.Thread] = threading.Thread,
         provider_name: str = "WeType",
         continue_after_activation_error: bool = True,
@@ -840,9 +771,8 @@ class WeTypeVoiceControl:
         self._on_completion = on_completion
         self._on_confirmation = on_confirmation
         self._on_started = on_started
-        self._mic_start_reader = mic_start_reader
-        self._revive_profile = revive_profile
-        self._sleep = sleep
+        self._capture_reader = capture_reader
+        self._wait_for_cancel = wait_for_cancel
         self._thread_factory = thread_factory
         self._provider_name = str(provider_name)
         self._continue_after_activation_error = bool(
@@ -856,6 +786,9 @@ class WeTypeVoiceControl:
         self._active_generation: Optional[int] = None
         self._active_keys: Optional[tuple[str, ...]] = None
         self._confirmation_generation: Optional[int] = None
+        self._observation: Optional[_CaptureObservation] = None
+        # At most one native observer per owner, even if a COM call stalls.
+        self._observation_lock = threading.Lock()
 
     @property
     def current_generation(self) -> int:
@@ -891,6 +824,7 @@ class WeTypeVoiceControl:
             return self._generation
 
     def _cancel_starting(self, generation: int) -> None:
+        self._cancel_observation(generation)
         with self._state_lock:
             if self._starting_generation == generation:
                 self._starting_generation = None
@@ -930,208 +864,168 @@ class WeTypeVoiceControl:
             "voice_host_confirmation",
             provider=self._provider_name.casefold(),
             generation=int(generation),
-            success=bool(success),
+            result="confirmed" if success else "unknown",
         )
         if callback is not None:
             callback(generation, bool(success))
 
-    @staticmethod
-    def _mic_reacted(baseline: Optional[int], current: Optional[int]) -> bool:
-        if current is None:
-            return False
-        return baseline is None or current > baseline
-
-    def _check_microphone_start(self, generation, baseline, *, fast):
-        """Bounded first-start probes; no state/I/O lock is held while waiting.
-
-        The final check keeps the old retry boundary. Recovery retries do not
-        replenish the fast-query budget, and a stopped generation cannot report.
-        """
-        started = time.monotonic()
-        offsets = ([index * chromecast_host_activity.STARTUP_POLL_SECONDS
-                    for index in range(1, chromecast_host_activity.STARTUP_MAX_FAST_POLLS + 1)]
-                   if fast else [])
-        offsets.append(_WETYPE_CONFIRM_WINDOW_SECONDS)
-        current = None
-        last_probe_at = started
-        for offset in offsets:
-            if not self._session_is_active(generation):
-                return None, current
-            final = offset == _WETYPE_CONFIRM_WINDOW_SECONDS
-            if not final and time.monotonic() - started >= chromecast_host_activity.STARTUP_FAST_WINDOW_SECONDS:
-                continue
-            next_probe = started + offset
-            if not final:
-                next_probe = max(next_probe, last_probe_at + chromecast_host_activity.STARTUP_POLL_SECONDS)
-            self._sleep(max(0.0, next_probe - time.monotonic()))
-            if not self._session_is_active(generation):
-                return None, current
-            if not final and time.monotonic() - started > chromecast_host_activity.STARTUP_FAST_WINDOW_SECONDS:
-                continue
-            last_probe_at = time.monotonic()
-            current = self._mic_start_reader()
-            if not self._session_is_active(generation):
-                return None, current
-            if self._mic_reacted(baseline, current):
-                return True, current
-        return False, current
-
-    def _schedule_confirmation(
-        self,
-        generation: int,
-        keys: tuple[str, ...],
-        baseline: Optional[int],
-        playback_guard: Optional[voice_playback_session_windows.PlaybackMuteGuard] = None,
-    ) -> None:
-        if self._mic_start_reader is None:
-            return
+    def _cancel_observation(self, generation: int) -> None:
         with self._state_lock:
-            if self._active_generation != generation:
-                return
-            self._confirmation_generation = generation
+            observation = self._observation
+            if observation is not None and observation.generation == generation:
+                observation.cancelled.set()
+                observation.pressed.set()
+            if self._confirmation_generation == generation:
+                self._confirmation_generation = None
 
-        def confirm() -> None:
+    def _observation_is_active(self, observation: _CaptureObservation) -> bool:
+        return (not observation.cancelled.is_set()
+                and self._session_is_active(observation.generation))
+
+    def _prepare_confirmation(self, generation: int) -> Optional[_CaptureObservation]:
+        if self._capture_reader is None:
+            return None
+        observation = _CaptureObservation(generation)
+        with self._state_lock:
+            self._observation = observation
+        # A cancelled observer may still be leaving its wait or native query.
+        # Give it a bounded handoff before taking the new pre-key baseline.
+        # The handoff and baseline share one budget; a stalled native call must
+        # neither delay key delivery indefinitely nor spawn another observer.
+        deadline = time.monotonic() + _WETYPE_BASELINE_WAIT_SECONDS
+        if not self._observation_lock.acquire(timeout=_WETYPE_BASELINE_WAIT_SECONDS):
+            observation.reason = "observer_busy"
+            observation.cancelled.set()
+            return observation
+
+        def observe() -> None:
             try:
-                confirmation_baseline = baseline
-                for retry_index, retry_delay in enumerate(
-                    (None, *_WETYPE_RETRY_SETTLE_SECONDS)
-                ):
-                    if not self._session_is_active(generation):
+                watch = chromecast_host_activity.CaptureWatch(self._capture_reader, fast_start=True)
+                watch.begin()
+                if observation.cancelled.is_set():
+                    return
+                guard = None
+                if (watch.baseline is not None and not observation.cancelled.is_set()
+                        and self._prepare_playback_mute_guard is not None):
+                    try:
+                        guard = self._prepare_playback_mute_guard()
+                    except Exception:
+                        self._logger.exception("WeType playback mute baseline unavailable")
+                    if observation.cancelled.is_set():
                         return
-                    if retry_delay is not None:
-                        if self._revive_profile is None:
-                            break
-                        try:
-                            revived = self._run_sta(self._revive_profile)
-                        except Exception as exc:
-                            _trace(
-                                "voice_host_recovery",
-                                provider=self._provider_name.casefold(),
-                                generation=int(generation),
-                                retry_index=int(retry_index),
-                                success=False,
-                                error_type=type(exc).__name__,
-                            )
-                            self._logger.exception(
-                                "%s voice recovery profile cycle failed; "
-                                "retrying the shortcut without aborting the hold",
-                                self._provider_name,
-                            )
-                        else:
-                            _trace(
-                                "voice_host_recovery",
-                                provider=self._provider_name.casefold(),
-                                generation=int(generation),
-                                retry_index=int(retry_index),
-                                success=True,
-                                profile_cycled=bool(revived),
-                            )
-                        self._sleep(retry_delay)
-                        if not self._session_is_active(generation):
-                            _trace(
-                                "voice_host_confirmation_check",
-                                provider=self._provider_name.casefold(),
-                                generation=int(generation),
-                                retry_index=int(retry_index),
-                                result="cancelled",
-                            )
-                            return
-                        confirmation_baseline = self._mic_start_reader()
-                        with self._io_lock:
-                            if not self._session_is_active(generation):
-                                return
-                            self._release_keys(keys)
-                            self._press_keys(keys)
-                        _trace(
-                            "voice_hotkey_retry",
-                            provider=self._provider_name.casefold(),
-                            generation=int(generation),
-                            retry_index=int(retry_index),
-                            keys=list(keys),
-                        )
-
-                    reacted, current = self._check_microphone_start(
-                        generation, confirmation_baseline, fast=retry_index == 0)
-                    if reacted is None:
-                        _trace(
-                            "voice_host_confirmation_check",
-                            provider=self._provider_name.casefold(),
-                            generation=int(generation),
-                            retry_index=int(retry_index),
-                            result="cancelled",
-                        )
-                        return
-                    _trace(
-                        "voice_host_confirmation_check",
-                        provider=self._provider_name.casefold(),
-                        generation=int(generation),
-                        retry_index=int(retry_index),
-                        baseline=(
-                            int(confirmation_baseline)
-                            if confirmation_baseline is not None
-                            else -1
-                        ),
-                        current=int(current) if current is not None else -1,
-                        result="confirmed" if reacted else "not_confirmed",
-                    )
-                    if reacted:
-                        self._finish_confirmation(generation, True)
-                        self._protect_playback_session(generation, playback_guard)
-                        return
-                self._finish_confirmation(generation, False)
+                    _trace("voice_playback_mute_guard", generation=generation,
+                           phase="baseline", available=guard is not None)
+                _trace("voice_host_baseline", provider="wetype", generation=generation,
+                       source="capture_session", available=watch.baseline is not None,
+                       active_count=len(watch.baseline or ()))
+                observation.ready.set()
+                # The start owner signals on success or cancellation. A native
+                # key sender that never returns must not retain this worker.
+                if not observation.pressed.wait(2.0):
+                    observation.reason = "start_timeout"
+                    observation.cancelled.set()
+                    return
+                if not self._observation_is_active(observation):
+                    return
+                if watch.baseline is None:
+                    observation.reason = "baseline_unavailable"
+                else:
+                    self._observe_capture(observation, watch, guard)
+                    return
+                self._report_observation(observation, False)
             except Exception as exc:
-                _trace(
-                    "voice_host_confirmation_check",
-                    provider=self._provider_name.casefold(),
-                    generation=int(generation),
-                    result="failed",
-                    error_type=type(exc).__name__,
-                )
-                self._logger.exception(
-                    "%s voice confirmation/retry failed",
-                    self._provider_name,
-                )
-                self._finish_confirmation(generation, False)
+                observation.reason = "query_failed"
+                observation.cancelled.set()
+                _trace("voice_host_confirmation_check", provider="wetype",
+                       generation=generation, result="unknown", error_type=type(exc).__name__)
+                self._logger.exception("WeType capture observation unavailable; hold unchanged")
+                self._report_observation(observation, False, unavailable=True)
             finally:
-                # Cancellation/exception must not leave a phantom confirmation
-                # owner; an older worker must never clear a newer generation.
+                observation.ready.set()
                 with self._state_lock:
                     if self._confirmation_generation == generation:
                         self._confirmation_generation = None
+                self._observation_lock.release()
 
         try:
-            thread = self._thread_factory(
-                target=confirm,
-                name="wetype-voice-confirmation",
-                daemon=True,
-            )
-            thread.start()
-        except RuntimeError as exc:
-            _trace(
-                "voice_host_confirmation_check",
-                provider=self._provider_name.casefold(),
-                generation=int(generation),
-                result="thread_start_failed",
-                error_type=type(exc).__name__,
-            )
-            self._logger.exception(
-                "%s voice confirmation thread could not start",
-                self._provider_name,
-            )
-            self._finish_confirmation(generation, False)
+            self._thread_factory(target=observe, name="wetype-voice-confirmation", daemon=True).start()
+        except RuntimeError:
+            self._observation_lock.release()
+            observation.reason = "thread_start_failed"
+            observation.cancelled.set()
+            self._logger.exception("WeType capture observer could not start; hold unchanged")
+        else:
+            if not observation.ready.wait(max(0.0, deadline - time.monotonic())):
+                observation.reason = "baseline_timeout"
+                observation.cancelled.set()
+                observation.pressed.set()
+        return observation
+
+    def _schedule_confirmation(self, observation: Optional[_CaptureObservation]) -> None:
+        if observation is None:
+            return
+        with self._state_lock:
+            if self._active_generation != observation.generation:
+                observation.cancelled.set()
+                observation.pressed.set()
+                return
+            self._confirmation_generation = observation.generation
+        if observation.cancelled.is_set():
+            self._report_observation(observation, False, unavailable=True)
+            return
+        observation.pressed_at = time.monotonic()
+        observation.pressed.set()
+
+    def _report_observation(self, observation, confirmed, *, unavailable=False):
+        if (not self._session_is_active(observation.generation)
+                or (observation.cancelled.is_set() and not unavailable)):
+            return
+        _trace("voice_host_confirmation_check", provider="wetype",
+               generation=observation.generation, source="capture_session",
+               result="confirmed" if confirmed else "unknown", reason=observation.reason)
+        self._finish_confirmation(observation.generation, confirmed)
+
+    def _observe_capture(self, observation, watch, guard):
+        # Observe until this hold confirms or ends, using the original baseline.
+        # Device owners keep their own deadlines (Chromecast: 9 seconds).
+        # Only the initial burst is fast; slow/unknown hosts stay rate-limited.
+        index = 0
+        while self._observation_is_active(observation):
+            delay = (chromecast_host_activity.STARTUP_POLL_SECONDS
+                     if index < chromecast_host_activity.STARTUP_MAX_FAST_POLLS
+                     and time.monotonic() - observation.pressed_at < chromecast_host_activity.STARTUP_FAST_WINDOW_SECONDS
+                     else watch.POLL_SECONDS)
+            if self._wait_for_cancel(observation.cancelled, delay):
+                return
+            if not self._observation_is_active(observation):
+                return
+            watch.poll(time.monotonic())
+            index += 1
+            if not self._observation_is_active(observation):
+                return
+            observation.reason = watch.status
+            if watch.status == "tracking":
+                self._report_observation(observation, True)
+                self._protect_playback_session(observation.generation, guard)
+                return
 
     def _protect_playback_session(self, generation: int, guard) -> None:
         if guard is None:
+            return
+        with self._state_lock:
+            observation = self._observation
+        if observation is None or observation.generation != generation:
             return
         try:
             # A short startup-only window catches host mute after mic confirmation.
             # Never fight a later user mute, and serialize the setter with key-up.
             result = "waiting"
             for index in range(16):
-                if index:
-                    self._sleep(0.1)
+                if index and self._wait_for_cancel(observation.cancelled, 0.1):
+                    result = "cancelled"
+                    break
                 with self._io_lock:
-                    if not self._session_is_active(generation):
+                    if not self._observation_is_active(observation):
                         result = "cancelled"
                         break
                     result = guard.restore_if_muted()
@@ -1202,41 +1096,6 @@ class WeTypeVoiceControl:
             generation=int(generation),
             keys=list(session_keys),
         )
-        baseline = None
-        if self._mic_start_reader is not None:
-            try:
-                baseline = self._mic_start_reader()
-            except Exception as exc:
-                _trace(
-                    "voice_host_baseline",
-                    provider=self._provider_name.casefold(),
-                    generation=int(generation),
-                    available=False,
-                    error_type=type(exc).__name__,
-                )
-                self._logger.exception(
-                    "%s microphone baseline could not be read",
-                    self._provider_name,
-                )
-        playback_guard = None
-        if self._prepare_playback_mute_guard is not None:
-            try:
-                playback_guard = self._prepare_playback_mute_guard()
-                _trace(
-                    "voice_playback_mute_guard",
-                    generation=int(generation),
-                    phase="baseline",
-                    available=playback_guard is not None,
-                )
-            except Exception as exc:
-                _trace(
-                    "voice_playback_mute_guard",
-                    generation=int(generation),
-                    phase="baseline",
-                    available=False,
-                    error_type=type(exc).__name__,
-                )
-                self._logger.exception("WeType playback mute baseline unavailable")
         try:
             switched = self._run_sta(self._activate_profile)
         except Exception as exc:
@@ -1278,6 +1137,7 @@ class WeTypeVoiceControl:
         if cancelled is not None and cancelled():
             self._cancel_starting(generation)
             return False
+        observation = self._prepare_confirmation(generation)
         try:
             with self._io_lock:
                 if cancelled is not None and cancelled():
@@ -1285,6 +1145,7 @@ class WeTypeVoiceControl:
                     return False
                 self._press_keys(session_keys)
         except win32_input.InputCleanupIncompleteError as exc:
+            self._cancel_observation(generation)
             self._mark_active(generation, session_keys)
             _trace(
                 "voice_hotkey_control",
@@ -1320,6 +1181,7 @@ class WeTypeVoiceControl:
             )
             return False
         if not self._mark_active(generation, session_keys):
+            self._cancel_observation(generation)
             try:
                 self._release_keys(session_keys)
             except OSError:
@@ -1343,8 +1205,9 @@ class WeTypeVoiceControl:
             except Exception:
                 # Keep the pressed-key owner for ordinary cleanup/retry.
                 self._logger.exception("%s voice start registration failed", self._provider_name)
+                self._cancel_observation(generation)
                 return False
-        self._schedule_confirmation(generation, session_keys, baseline, playback_guard)
+        self._schedule_confirmation(observation)
         return True
 
     def stop(self) -> bool:
@@ -1378,6 +1241,7 @@ class WeTypeVoiceControl:
             return False
         try:
             with self._io_lock:
+                self._cancel_observation(generation)
                 self._release_keys(session_keys)
                 self._clear_active(generation)
         except (win32_input.Win32InputUnavailableError, OSError) as exc:
@@ -1454,8 +1318,7 @@ class DoubaoVoiceControl(WeTypeVoiceControl):
             release_keys=release_keys,
             on_completion=on_completion,
             on_confirmation=None,
-            mic_start_reader=None,
-            revive_profile=None,
+            capture_reader=None,
             provider_name="Doubao",
             continue_after_activation_error=False,
         )

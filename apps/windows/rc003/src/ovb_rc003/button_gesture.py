@@ -209,6 +209,9 @@ class ButtonGestureDispatcher:
         on_diagnostic: Optional[DiagnosticCallback] = None,
         timer_factory: Optional[TimerFactory] = None,
         hold_timer_factory: Optional[TimerFactory] = None,
+        is_sustained: Optional[Callable[[str], bool]] = None,
+        on_hold_start: Optional[Callable[[str, object], None]] = None,
+        on_hold_end: Optional[Callable[[object], None]] = None,
     ) -> None:
         self._is_action_configured = is_action_configured
         self._is_repeatable = is_repeatable
@@ -216,6 +219,10 @@ class ButtonGestureDispatcher:
         self._on_trigger = on_trigger
         self._on_idle = on_idle
         self._on_diagnostic = on_diagnostic
+        self._is_sustained = is_sustained or (lambda button: False)
+        self._on_hold_start = on_hold_start or (lambda button, token: on_trigger(button, ButtonTrigger.LONG_PRESS))
+        self._on_hold_end = on_hold_end or (lambda token: None)
+        self._sustained_tokens: Dict[str, object] = {}
         self._timer_factory = timer_factory or (
             lambda delay, callback: threading.Timer(delay, callback)
         )
@@ -279,7 +286,9 @@ class ButtonGestureDispatcher:
                     recognizes_long_press=recognizes_long,
                 )
                 if not was_pressed and self._recognizer.is_pressed(button_id):
-                    if not self._schedule_hold_guard_locked(button_id):
+                    if recognizes_long and self._is_sustained(button_id):
+                        self._sustained_tokens[button_id] = object()
+                    elif not self._schedule_hold_guard_locked(button_id):
                         self._rollback_button_hold_locked(button_id)
                         commands = []
                 callbacks.extend(self._execute_commands_locked(commands))
@@ -293,7 +302,21 @@ class ButtonGestureDispatcher:
         )
 
     def release(self, button_id: str) -> None:
+        # Sustained actions serialize their final down/up with timer callbacks.
+        # Ordinary releases retain the existing nonblocking repeat cancellation.
+        if self._is_sustained(button_id):
+            with self._callback_lock:
+                with self._lock:
+                    token = self._sustained_tokens.get(button_id)
+                self._release(button_id)
+                if token is not None:
+                    self._on_hold_end(token)
+        else:
+            self._release(button_id)
+
+    def _release(self, button_id: str) -> None:
         with self._lock:
+            self._sustained_tokens.pop(button_id, None)
             generation = self._generation
             button_generation = self._button_generations.get(button_id, 0)
             self._cancel_timer_locked(
@@ -325,6 +348,8 @@ class ButtonGestureDispatcher:
 
     def reset(self) -> None:
         with self._lock:
+            sustained = list(self._sustained_tokens.values())
+            self._sustained_tokens.clear()
             self._generation += 1
             for timers, tokens in (
                 (self._double_timers, self._double_timer_tokens),
@@ -346,7 +371,8 @@ class ButtonGestureDispatcher:
         # reset. Waiting for that gate guarantees no older callback can begin
         # after reset() returns without making release wait on SendInput.
         with self._callback_lock:
-            pass
+            for token in sustained:
+                self._on_hold_end(token)
 
     def cancel_buttons(self, button_ids: Set[str]) -> None:
         """Cancel only the named gestures without disturbing other holds."""
@@ -355,7 +381,11 @@ class ButtonGestureDispatcher:
         if not buttons:
             return
         with self._lock:
+            sustained = []
             for button_id in buttons:
+                token = self._sustained_tokens.pop(button_id, None)
+                if token is not None:
+                    sustained.append(token)
                 self._button_generations[button_id] = (
                     self._button_generations.get(button_id, 0) + 1
                 )
@@ -374,7 +404,8 @@ class ButtonGestureDispatcher:
         # A timeout may already have reserved the callback gate. Its per-button
         # generation now rejects it once any callback already running finishes.
         with self._callback_lock:
-            pass
+            for token in sustained:
+                self._on_hold_end(token)
         self._notify_idle()
 
     def has_active_gestures(self) -> bool:
@@ -551,6 +582,7 @@ class ButtonGestureDispatcher:
         return True
 
     def _rollback_button_hold_locked(self, button_id: str) -> None:
+        self._sustained_tokens.pop(button_id, None)
         self._held_immediate_buttons.discard(button_id)
         self._repeat_hold_tokens.pop(button_id, None)
         self._repeat_counts.pop(button_id, None)
@@ -611,6 +643,7 @@ class ButtonGestureDispatcher:
             callbacks = self._execute_commands_locked(commands)
             button_generation = self._button_generations.get(button_id, 0)
             reservation = self._reserve_callbacks_locked(callbacks)
+            sustained_token = self._sustained_tokens.get(button_id)
         try:
             self._emit(
                 button_id,
@@ -618,6 +651,7 @@ class ButtonGestureDispatcher:
                 generation,
                 button_generation,
                 reservation=reservation,
+                require_sustained_token=sustained_token,
             )
         finally:
             self._notify_idle()
@@ -740,6 +774,7 @@ class ButtonGestureDispatcher:
         *,
         require_hold_token: Optional[object] = None,
         reservation: Optional[object] = None,
+        require_sustained_token: Optional[object] = None,
     ) -> bool:
         emitted = False
         try:
@@ -747,6 +782,9 @@ class ButtonGestureDispatcher:
                 with self._callback_lock:
                     with self._lock:
                         if generation != self._generation:
+                            return emitted
+                        if (require_sustained_token is not None
+                                and self._sustained_tokens.get(button_id) is not require_sustained_token):
                             return emitted
                         if (
                             button_generation
@@ -759,7 +797,10 @@ class ButtonGestureDispatcher:
                             is not require_hold_token
                         ):
                             return emitted
-                    self._on_trigger(button_id, trigger)
+                    if require_sustained_token is not None:
+                        self._on_hold_start(button_id, require_sustained_token)
+                    else:
+                        self._on_trigger(button_id, trigger)
                     emitted = True
             return emitted
         finally:

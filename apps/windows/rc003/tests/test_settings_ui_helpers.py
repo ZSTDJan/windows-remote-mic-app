@@ -91,8 +91,12 @@ class DisplayRoundTripTests(unittest.TestCase):
         self.assertEqual(flattened, settings_ui._PRESET_KEY_COMBOS)
         self.assertEqual(
             settings_ui.ACTION_OPTION_GROUP_STARTS,
-            frozenset(group_options[0] for _, group_options in settings_ui.ACTION_OPTION_GROUPS),
+            frozenset(group_options[0] for _, group_options in settings_ui.ACTION_OPTION_GROUPS)
+            | {next(iter(settings_ui.LONG_PRESS_ACTION_LABELS.values()))},
         )
+        for label in settings_ui.LONG_PRESS_ACTION_LABELS.values():
+            self.assertNotIn(label, flattened)
+            self.assertEqual(settings_ui.ACTION_OPTION_GROUP_BY_LABEL[label], "鼠标长按")
         self.assertNotIn("lctrl+win", flattened)
         self.assertNotIn("ralt", flattened)
         self.assertNotIn("ralt+space", flattened)

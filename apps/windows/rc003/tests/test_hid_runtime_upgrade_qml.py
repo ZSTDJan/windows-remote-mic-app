@@ -74,6 +74,28 @@ controller._set_bridge_restart_recommended(True)
 assert not device_page.bridgeNeedsRestartAction()
 controller._set_bridge_restart_recommended(False)
 
+# Source consent failures remain actionable without recommending a restart.
+for state in ("authorization_cancelled", "authorization_failed"):
+    input_state(state)
+    controller._set_bridge_restart_recommended(True)
+    assert device_page.buttonReceiverStateCode() == "source_" + state
+    assert "重新授权" in find(window, "buttonReceiverRow").property("descriptionText")
+    assert not device_page.bridgeNeedsRestartAction()
+    assert device_page.bridgeActionVisible()
+    assert device_page.bridgeActionText() == "重新授权"
+    assert device_page.bridgeStateText() == "等待按键授权"
+    status = bridge_runtime_status.read_status(root_path)
+    controller._update_bridge_restart_recommendation(status, schedule_recovery=True)
+    assert not controller.bridgeRestartRecommended
+    assert "重新授权" in controller._describe_runtime_status(status)
+    from unittest import mock
+    with mock.patch.object(controller, "_begin_bridge_restart") as restart:
+        find(window, "bridgeActionButton").clicked.emit()
+        assert restart.call_count == 1
+        restart.assert_called_once_with(automatic=False)
+controller._set_bridge_restart_recommended(False)
+input_state(frida_compat.HidTapState.RESTART_REQUIRED.value)
+
 # Ordinary-permission upgrades must replace the installed helper first.
 controller._hid_helper_frozen_distribution = True
 controller._hid_helper_process_elevated = False

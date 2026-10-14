@@ -11,8 +11,11 @@ import zipfile
 import json
 import subprocess
 import sys
+import asyncio
 
-from ovb_rc003 import bridge_launcher, chromecast_client, diagnostic_trace, log_export
+from ovb_rc003 import bridge_launcher, chromecast_client, diagnostic_trace, log_export, logging_setup
+from ovb_rc003.chromecast_device_windows import SelectedDevice
+from ovb_rc003.chromecast_observation import Observation, valid_record
 from ovb_rc003.chromecast_voice_host import VoiceHost
 from ovb_rc003 import chromecast_diagnostics_windows as system_evidence
 from ovb_rc003.chromecast_channel import Channel, SessionIdentity, ChannelError
@@ -217,6 +220,135 @@ class ShutdownDiagnosticsTests(unittest.TestCase):
              self.assertLogs('ovb_rc003', level='WARNING') as captured:
             system_evidence.request_process_exit('a' * 64, 4, 123, 2)
         self.assertIn('application_closing', '\n'.join(captured.output))
+
+    def test_crash_collection_failures_are_specific_and_never_keep_dead_handles(self):
+        failure = OSError('PRIVATE identity')
+        failure.winerror = 5
+        with mock.patch.object(system_evidence, '_pending', {}), \
+             mock.patch.object(system_evidence, '_recent', {}), \
+             mock.patch.object(system_evidence, '_running', False), \
+             mock.patch.object(system_evidence, '_closing', False), \
+             mock.patch.object(system_evidence.threading, 'Thread', side_effect=failure), \
+             self.assertLogs('ovb_rc003', level='WARNING') as captured:
+            system_evidence.request_process_exit('a' * 64, 4, 123, 0xc0000005)
+            self.assertFalse(system_evidence._running)
+            self.assertEqual(system_evidence._pending, {})
+        self.assertIn('thread_start_failed', '\n'.join(captured.output))
+        self.assertIn('native_code=5', '\n'.join(captured.output))
+        self.assertNotIn('PRIVATE', '\n'.join(captured.output))
+        with mock.patch.object(system_evidence, '_pending', {('exit', 'a'*64, 4, 123, 0xc0000005): 1000}), \
+             mock.patch.object(system_evidence, '_collect_exit', side_effect=failure), \
+             self.assertLogs('ovb_rc003', level='WARNING') as captured:
+            system_evidence._drain()
+        self.assertIn('collector_failed', '\n'.join(captured.output))
+        self.assertIsNone(system_evidence._active_exit)
+        with self.assertLogs('ovb_rc003', level='WARNING') as captured:
+            system_evidence.request_process_exit('PRIVATE', 4, 123, 0xc0000005)
+        self.assertIn('invalid_process_identity', '\n'.join(captured.output))
+        self.assertNotIn('PRIVATE', '\n'.join(captured.output))
+
+    def test_duplicate_crash_request_does_not_misreport_full_queue(self):
+        key = ('exit', 'a'*64, 4, 123, 0xc0000005)
+        with mock.patch.object(system_evidence, '_pending', {key: 1000, ('b'*64, 'ready'): 1001}), \
+             mock.patch.object(system_evidence, '_recent', {key: 10}), \
+             self.assertNoLogs('ovb_rc003'):
+            system_evidence.request_process_exit('a'*64, 4, 123, 0xc0000005)
+
+    def test_arbitrary_collection_reason_and_exception_text_are_not_logged(self):
+        with self.assertLogs('ovb_rc003', level='WARNING') as captured:
+            system_evidence._crash_unavailable('a'*64, 'PRIVATE username and path', OSError('PRIVATE address'))
+        self.assertIn('reason=unknown', '\n'.join(captured.output))
+        self.assertIn('error_type=OSError', '\n'.join(captured.output))
+        self.assertNotIn('PRIVATE', '\n'.join(captured.output))
+
+    def test_failed_collection_request_releases_os_confirmed_exit(self):
+        client = chromecast_client.Client('a'*64, mode='run', on_edge=lambda _: None)
+        client._process = 42
+        client._process_identities['launcher'] = SimpleNamespace(pid=321, born=456)
+        def exit_code(_handle, pointer):
+            ctypes.cast(pointer, ctypes.POINTER(ctypes.c_ulong)).contents.value = 0xc0000005
+            return True
+        client._kernel = SimpleNamespace(WaitForSingleObject=lambda *_: 0,
+            GetExitCodeProcess=exit_code, CloseHandle=mock.Mock())
+        with mock.patch.object(system_evidence, 'request_process_exit', side_effect=OSError('PRIVATE')), \
+             self.assertLogs('ovb_rc003', level='WARNING') as captured:
+            client._confirm_exit()
+        self.assertIn('request_failed', '\n'.join(captured.output))
+        self.assertNotIn('PRIVATE', '\n'.join(captured.output))
+        self.assertTrue(client.cleanup_confirmed)
+        self.assertIsNone(client._process)
+        client._kernel.CloseHandle.assert_called_once_with(42)
+
+    def test_cleanup_ipc_and_crash_results_survive_real_writer_rotation_and_export(self):
+        client = chromecast_client.Client('a'*64, mode='run', on_edge=lambda _: None)
+        sender, reader = Channel(client.identity, commands=False), Channel(client.identity, commands=False)
+        rows = []
+        def send(row):
+            event = reader.decode(sender.encode('evidence', record=row))
+            rows.append(event['record'])
+            client._observe_evidence(event)
+        target = SelectedDevice('a'*64)
+        target.cleanup_observer = Observation(send).voice_cleanup
+        failure = OSError('PRIVATE device, audio, token')
+        failure.winerror = -2140864509
+        target._voice_subscribed = [SimpleNamespace(attribute_handle=0x3b,
+            write_client_characteristic_configuration_descriptor_async=mock.AsyncMock(side_effect=failure))]
+        target._voice_services = [SimpleNamespace(attribute_handle=0x37, close=mock.Mock())]
+        target.voice_session = SimpleNamespace(maintain_connection=True, close=mock.Mock())
+        async def cleanup():
+            with self.assertRaisesRegex(Exception, 'cleanup_failed'):
+                await target.close_voice()
+        logger = logging.getLogger('ovb_rc003')
+        before = logger.level
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root/'logs').mkdir()
+            handler = logging_setup.EvidenceFileHandler(root/'logs/app.log', asynchronous=True,
+                maxBytes=2048, backupCount=1, encoding='utf-8')
+            logger.addHandler(handler)
+            logger.setLevel(logging.INFO)
+            try:
+                asyncio.run(cleanup())
+                for index in range(260):
+                    logger.info('bounded rotation sample %s %s', index, 'x'*80)
+                self.assertTrue(handler.flush_pending())
+                with self.assertRaisesRegex(Exception, 'cleanup_failed'):
+                    target.close()
+                for result in ({'status': 'matched', 'events': [dict(module='receiver.dll', module_version='1.2.3',
+                        exception_code='c0000005', fault_offset='1234', correlation='pid_creation_and_time')]},
+                        {'error': 'query_cancelled'}, {'status': 'query_failed', 'native_code': -2147024891}):
+                    with mock.patch.object(system_evidence, '_environment', return_value=result):
+                        system_evidence._collect_exit(client.identity.generation, 4, 123, 0xc0000005, 1000)
+                system_evidence._crash_unavailable('b'*64, 'queue_full')
+                destination = root/'export.zip'
+                self.assertEqual(log_export.export_logs(destination, root=root).outcome, 'exported')
+                with zipfile.ZipFile(destination) as archive:
+                    self.assertIsNone(archive.testzip())
+                    info = json.loads(archive.read('export-info.json'))
+                    report = json.loads(archive.read('diagnostic-report.json'))
+                    content = '\n'.join(archive.read(name).decode('utf-8') for name in archive.namelist()
+                        if name.startswith('app.log'))
+                    self.assertFalse(info['incomplete'])
+                    self.assertTrue(info['snapshot_stable'])
+                serialized = json.dumps(report)
+                incident = next(i for i in report['incidents'] if i['failure_key'].startswith('chromecast:cleanup:'))
+                final = incident['last_failure_event']['message']
+                self.assertIn('history_failed', final)
+                self.assertIn('2154102787', final)
+                self.assertIn('"current_failed":0', final)
+                self.assertIn('query_failed', serialized)
+                self.assertIn('2147942405', serialized)
+                self.assertIn('queue_full', serialized)
+                self.assertIn('receiver.dll', content + serialized)
+                self.assertIn('query_cancelled', content + serialized)
+                self.assertNotIn('PRIVATE', content + serialized)
+                self.assertTrue(all(valid_record(row) for row in rows))
+                self.assertEqual(rows[-1]['remaining_services'], 0)
+                self.assertEqual(rows[-1]['session_owned'], 0)
+            finally:
+                logger.removeHandler(handler)
+                handler.close()
+                logger.setLevel(before)
 
     @unittest.skipUnless(sys.platform == 'win32', 'Windows PowerShell projection')
     def test_real_powershell_query_projects_synthetic_event_and_rejects_other_birth(self):

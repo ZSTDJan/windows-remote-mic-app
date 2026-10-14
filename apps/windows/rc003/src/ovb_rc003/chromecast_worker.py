@@ -93,6 +93,7 @@ async def receive(identity, parent, pipe):
             return 0
         stage = "device_open"
         device = SelectedDevice(identity.entity)
+        device.cleanup_observer = observation.voice_cleanup
         # Initialization runs concurrently with the control loop below: native
         # discovery cannot prevent heartbeat/stop checks from being consumed.
         initialize = asyncio.create_task(device.open())

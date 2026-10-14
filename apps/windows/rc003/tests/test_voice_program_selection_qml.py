@@ -53,7 +53,7 @@ for provider_index, provider in ((0, "sogou"), (1, "wetype"), (2, "doubao_ime"))
         assert find(window, name).property("visible"), (provider, name)
 choose(3, "chatterfly")
 assert find(window, "voiceHotkeyRow").property("visible")
-assert not find(window, "refreshVoiceHotkeyButton").property("visible")
+assert find(window, "refreshVoiceHotkeyButton").property("visible")
 assert find(window, "recordVoiceHotkeyButton").property("visible")
 assert find(window, "openVoiceProgramSettingsButton").property("visible")
 choose(1, "wetype")
@@ -154,7 +154,7 @@ assert find(window, "refreshVoiceHotkeyButton").property("enabled")
 assert find(window, "recordVoiceHotkeyButton").property("enabled")
 choose(3, "chatterfly")
 assert row.property("stateText") != "尚未接通"
-assert not find(window, "refreshVoiceHotkeyButton").property("visible")
+assert find(window, "refreshVoiceHotkeyButton").property("visible")
 
 # Returning to Xiaomi restores the read-only row without stealing focus or
 # causing a configuration write/restart as a side effect of rendering it.

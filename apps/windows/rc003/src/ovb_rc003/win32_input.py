@@ -956,6 +956,30 @@ def send_mouse_button_click(
         )
 
 
+def send_mouse_button_down(
+    button: str, *, _sender: Optional[MouseSender] = None,
+    _button_down_query: Optional[MouseButtonDownQuery] = None,
+) -> None:
+    """Start a hold; uncertain delivery retains the caller's cleanup duty."""
+    sender = _sender or _real_send_mouse_input_batch
+    event = _mouse_button_event(button, key_up=False)
+    query = _button_down_query
+    if query is None and _sender is None:
+        query = _real_mouse_button_is_down
+    if query is not None and query(button):
+        raise MouseButtonInUseError(f"mouse {button} is already held")
+    try:
+        sent = sender([event])
+    except Win32InputUnavailableError:
+        raise
+    except Exception as exc:
+        complete = _best_effort_mouse_release(button, sender)
+        raise _delivery_error_type(complete)(f"mouse {button} down failed") from exc
+    if sent != 1:
+        complete = sent == 0 or _best_effort_mouse_release(button, sender)
+        raise _delivery_error_type(complete)(f"mouse {button} down was not delivered")
+
+
 def send_mouse_button_up(
     button: str, *, _sender: Optional[MouseSender] = None
 ) -> None:
@@ -1450,18 +1474,21 @@ def voice_backend_name() -> str:
     return _voice_backend or "unselected"
 
 
-def _real_voice_event(vk: int, key_up: bool) -> None:
+def _real_chatterfly_voice_event(vk: int, key_up: bool) -> None:
+    _real_voice_event(vk, key_up, physicalize=True)
+
+
+def _real_voice_event(vk: int, key_up: bool, *, physicalize: bool = False) -> None:
     """Emit a marked voice edge through the legacy ``keybd_event`` path.
 
-    The optional compatibility hook clears the injected flag only for the
-    right-Alt target. Other user-configured combinations remain normal
-    injected key sequences.
+    Legacy callers require compatibility for right Alt only. Chatterfly opts
+    in for each configured key; the hook must acknowledge its exact ticket.
     """
 
     global _voice_backend
     if _voice_backend is None:
         _voice_backend = "keybd_event_physicalized"
-    if int(vk) != win32_keys.VK_CODES["ralt"]:
+    if not physicalize and int(vk) != win32_keys.VK_CODES["ralt"]:
         _real_keybd_event(vk, key_up)
         return
     trace = _diagnostic_trace
@@ -1523,13 +1550,19 @@ def _real_voice_event(vk: int, key_up: bool) -> None:
         except Exception:
             pass  # A diagnostic sink cannot change input ownership or cleanup.
     try:
-        confirmation = voice_key_physicalizer_windows.begin_marked_voice_event(
-            key_up
+        # A host can reinstall its hook after ours. Reorder before every edge,
+        # including UP; a failed preparation must never send an unmarked DOWN.
+        if physicalize:
+            voice_key_physicalizer_windows.ensure_voice_forwarding_order()
+        confirmation = (
+            voice_key_physicalizer_windows.begin_marked_voice_event(key_up, vk_code=vk)
+            if physicalize else
+            voice_key_physicalizer_windows.begin_marked_voice_event(key_up)
         )
     except voice_key_physicalizer_windows.VoiceKeyPhysicalizerUnavailableError as exc:
         record(False, "physicalizer_unavailable")
         raise Win32InputUnavailableError(
-            "marked right-Alt physicalizer is unavailable"
+            "marked voice key physicalizer is unavailable"
         ) from exc
     try:
         _real_keybd_event(
@@ -1571,9 +1604,9 @@ def _real_voice_event(vk: int, key_up: bool) -> None:
             health_invalidated=health_invalidated,
         )
         raise InputCleanupIncompleteError(
-            "marked right-Alt edge was not confirmed by the physicalizer hook"
+            "marked voice edge was not confirmed by the physicalizer hook"
         )
-    if key_up:
+    if key_up and int(vk) == win32_keys.VK_CODES["ralt"]:
         try:
             _ensure_right_alt_release_completed(vk, confirmation)
         except InputCleanupIncompleteError:
@@ -1588,7 +1621,7 @@ def _real_voice_event(vk: int, key_up: bool) -> None:
         True,
         (
             "release_postcondition_confirmed"
-            if key_up
+            if key_up and int(vk) == win32_keys.VK_CODES["ralt"]
             else "local_hook_and_downstream_completed"
         ),
         confirmation.marker,
@@ -1809,6 +1842,7 @@ def _voice_physical_query_for_sender(
 def send_voice_key_combo_down(
     tokens: Sequence[str],
     *,
+    physicalize: bool = False,
     _sender: Optional[VoiceSender] = None,
     _key_down_query: Optional[PhysicalKeyDownQuery] = None,
 ) -> None:
@@ -1828,9 +1862,18 @@ def send_voice_key_combo_down(
     )
     if preflight_query is not None:
         _ensure_keys_not_physically_down(vk_codes, preflight_query)
-    sender = _sender or _real_voice_event
+    sender = _sender or (_real_chatterfly_voice_event if physicalize else _real_voice_event)
     delivered: List[int] = []
     for vk in vk_codes:
+        if physicalize and preflight_query is not None:
+            try:
+                _ensure_keys_not_physically_down((vk,), preflight_query)
+            except (PhysicalKeyInUseError, Win32InputUnavailableError) as exc:
+                if delivered and not _best_effort_voice_up(delivered, sender, release_query):
+                    raise InputCleanupIncompleteError(
+                        "physical key changed while sending Chatterfly shortcut"
+                    ) from exc
+                raise
         try:
             sender(vk, False)
         except Win32InputUnavailableError as exc:
@@ -1863,12 +1906,13 @@ def send_voice_key_combo_down(
 def send_voice_key_combo_up(
     tokens: Sequence[str],
     *,
+    physicalize: bool = False,
     _sender: Optional[VoiceSender] = None,
     _key_down_query: Optional[PhysicalKeyDownQuery] = None,
 ) -> None:
     """Release a voice shortcut through the selected voice transport."""
 
-    sender = _sender or _real_voice_event
+    sender = _sender or (_real_chatterfly_voice_event if physicalize else _real_voice_event)
     resolved_vk_codes = win32_keys.resolve_vk_codes(tokens)
     key_down_query = _voice_physical_query_for_sender(
         _sender is not None,
@@ -1918,12 +1962,13 @@ def send_voice_key_combo_up(
 def send_voice_key_combo_tap(
     tokens: Sequence[str],
     *,
+    physicalize: bool = False,
     _sender: Optional[VoiceSender] = None,
     _key_down_query: Optional[PhysicalKeyDownQuery] = None,
 ) -> None:
     """Send a completed voice shortcut with the upstream 70 ms hold window."""
 
-    sender = _sender or _real_voice_event
+    sender = _sender or (_real_chatterfly_voice_event if physicalize else _real_voice_event)
     vk_codes = win32_keys.resolve_vk_codes(tokens)
     if _sender is None and _key_down_query is None:
         _ensure_tracked_hold_available(vk_codes)
@@ -1940,8 +1985,9 @@ def send_voice_key_combo_tap(
         _ensure_keys_not_physically_down(vk_codes, preflight_query)
     send_voice_key_combo_down(
         tokens,
+        physicalize=physicalize,
         _sender=sender,
-        _key_down_query=lambda _vk: False,
+        _key_down_query=preflight_query if physicalize else lambda _vk: False,
     )
     try:
         time.sleep(0.07)

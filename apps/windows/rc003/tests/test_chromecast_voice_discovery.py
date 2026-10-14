@@ -99,6 +99,18 @@ class DiscoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(self.sessions[-1].maintain_connection)
         self.sessions[-1].close.assert_called_once()
 
+    async def test_metadata_construction_failure_still_runs_native_cleanup(self):
+        voice = service()
+        target = self.target(lambda _: SimpleNamespace(status=0, services=[voice]))
+        await target.open_voice(direct=True)
+        with mock.patch.object(target, '_cleanup_metadata', side_effect=OSError('PRIVATE')):
+            await target.close_voice()
+            target.close()
+        self.assertFalse(target._voice_cleanup_failed)
+        self.assertIsNone(target.device)
+        voice.close.assert_called_once()
+        self.sessions[-1].close.assert_called_once()
+
     async def test_timeout_keeps_cached_inventory_distinct_and_never_enables_voice(self):
         cached = service()
         target = self.target(None)
@@ -424,6 +436,181 @@ class DiscoveryTests(unittest.IsolatedAsyncioTestCase):
         bad = copy.deepcopy(rows[0])
         bad["items"][0]["uuid"] = "PRIVATE".ljust(36, "0")
         self.assertFalse(valid_record(bad))
+
+
+    def cleanup_rows(self, target):
+        rows = []
+        observation = Observation(rows.append)
+        target.cleanup_observer = observation.voice_cleanup
+        return rows
+
+    async def test_failed_unsubscribe_and_later_empty_cleanup_preserve_first_native_failure(self):
+        voice = service()
+        failure = OSError('PRIVATE remote address and audio')
+        failure.winerror = -2140864509  # 0x80650003
+        voice.chars[1].write_client_characteristic_configuration_descriptor_async.side_effect = failure
+        target = self.target(lambda _: SimpleNamespace(status=0, services=[voice]))
+        rows = self.cleanup_rows(target)
+        with self.assertRaises(OSError):
+            await target.open_voice(direct=True)
+        first = rows[-1]
+        self.assertEqual(first['first_step'], 'subscription_disable')
+        self.assertEqual(first['first_hresult'], 0x80650003)
+        self.assertEqual(first['first_handle'], 0x3b)
+        self.assertEqual(first['first_error_type'], 'OSError')
+        self.assertEqual(first['current_failed'], 1)
+        self.assertEqual(first['remaining_services'], 0)
+        self.assertEqual(first['session_owned'], 0)
+        self.assertEqual(next(r for r in target.voice_queries if r['step'] == 'audio_subscription')['hresult'], 0x80650003)
+        with self.assertRaisesRegex(PipeError, 'cleanup_failed'):
+            await target.close_voice()
+        with self.assertRaisesRegex(PipeError, 'cleanup_failed'):
+            target.close()
+        final = rows[-1]
+        self.assertEqual(final['outcome'], 'history_failed')
+        self.assertEqual(final['previous_failed'], 1)
+        self.assertEqual(final['current_failed'], 0)
+        self.assertEqual(final['first_hresult'], first['first_hresult'])
+        identity = SessionIdentity.create(ENTITY)
+        sender, reader = Channel(identity, commands=False), Channel(identity, commands=False)
+        for row in rows:
+            self.assertTrue(valid_record(row), row)
+            self.assertEqual(reader.decode(sender.encode('evidence', record=row))['record'], row)
+        self.assertNotIn('PRIVATE', str(rows))
+
+    async def test_cleanup_status_timeout_cancellation_and_exception_are_distinct(self):
+        for outcome in ('status_failed', 'timeout', 'cancelled', 'os_error', 'exception'):
+            with self.subTest(outcome=outcome):
+                voice = service()
+                target = self.target(lambda _: SimpleNamespace(status=0, services=[voice]))
+                await target.open_voice(direct=True)
+                rows = self.cleanup_rows(target)
+                if outcome == 'status_failed':
+                    voice.chars[1].write_client_characteristic_configuration_descriptor_async.return_value = 3
+                else:
+                    error = {'timeout': TimeoutError('PRIVATE'), 'cancelled': asyncio.CancelledError('PRIVATE'),
+                        'os_error': OSError('PRIVATE'), 'exception': RuntimeError('PRIVATE')}[outcome]
+                    voice.chars[1].write_client_characteristic_configuration_descriptor_async.side_effect = error
+                expected = asyncio.CancelledError if outcome == 'cancelled' else PipeError
+                with self.assertRaises(expected):
+                    await target.close_voice()
+                failure = next(r for r in rows if r['step'] == 'subscription_disable' and r['state'] == 'done')
+                self.assertEqual(failure['outcome'], outcome)
+                self.assertEqual(failure['status'], 3 if outcome == 'status_failed' else -1)
+                self.assertEqual(rows[-1]['first_outcome'], outcome)
+                self.assertTrue(target._voice_cleanup_failed)
+                self.assertEqual(target._voice_services, [])
+                self.assertIsNone(target.voice_session)
+                self.assertNotIn('PRIVATE', str(rows))
+
+    async def test_service_failure_retains_owner_and_reports_successful_later_release(self):
+        voice = service()
+        target = self.target(lambda _: SimpleNamespace(status=0, services=[voice]))
+        await target.open_voice(direct=True)
+        rows = self.cleanup_rows(target)
+        voice.close.side_effect = OSError('PRIVATE')
+        with self.assertRaises(PipeError):
+            await target.close_voice()
+        self.assertEqual(rows[-1]['remaining_services'], 1)
+        self.assertEqual(rows[-1]['first_step'], 'service_close')
+        self.assertEqual(rows[-1]['first_handle'], voice.attribute_handle)
+        voice.close.side_effect = None
+        with self.assertRaises(PipeError):
+            target.close()
+        self.assertEqual(rows[-1]['remaining_services'], 0)
+        self.assertEqual(rows[-1]['current_failed'], 0)
+        self.assertEqual(rows[-1]['outcome'], 'history_failed')
+
+    async def test_pending_unsubscribe_deadline_records_timeout_and_releases_session(self):
+        voice = service()
+        target = self.target(lambda _: SimpleNamespace(status=0, services=[voice]))
+        await target.open_voice(direct=True)
+        rows = self.cleanup_rows(target)
+        async def pending(*_):
+            await asyncio.Event().wait()
+        voice.chars[1].write_client_characteristic_configuration_descriptor_async.side_effect = pending
+        wait_for = asyncio.wait_for
+        async def short_wait(call, timeout):
+            return await wait_for(call, .01)
+        with mock.patch.object(device.asyncio, 'wait_for', new=short_wait):
+            with self.assertRaises(PipeError):
+                await target.close_voice()
+        self.assertEqual(rows[-1]['first_outcome'], 'timeout')
+        self.assertIsNone(target.voice_session)
+        self.assertEqual(target._voice_services, [])
+
+    async def test_normal_cleanup_and_observer_failure_do_not_change_native_calls(self):
+        voice = service()
+        target = self.target(lambda _: SimpleNamespace(status=0, services=[voice]))
+        await target.open_voice(direct=True)
+        rows = self.cleanup_rows(target)
+        await target.close_voice()
+        self.assertEqual(rows[-1]['outcome'], 'success')
+        self.assertEqual(rows[-1]['first_step'], 'none')
+        self.assertTrue(all(valid_record(r) for r in rows))
+        target.cleanup_observer = mock.Mock(side_effect=OSError('PRIVATE evidence failure'))
+        target.close()
+        self.assertFalse(target._voice_cleanup_failed)
+        self.assertIsNone(target.device)
+        voice.close.assert_called_once()
+        self.sessions[-1].close.assert_called_once()
+
+    async def test_large_cleanup_bounds_rows_but_retains_late_failure_and_rejects_private_metadata(self):
+        target = self.target(lambda _: None)
+        target._voice_services = [service(voice=False, handle=i) for i in range(80)]
+        target._voice_services[-1].close.side_effect = OSError('PRIVATE')
+        rows = self.cleanup_rows(target)
+        with self.assertRaises(PipeError):
+            target.close()
+        self.assertLessEqual(len(rows), 67)
+        self.assertGreater(rows[-1]['omitted'], 0)
+        self.assertEqual(rows[-1]['first_handle'], 79)
+        identity = SessionIdentity.create(ENTITY)
+        for row in rows:
+            self.assertTrue(valid_record(row))
+            Channel(identity, commands=False).encode('evidence', record=row)
+        for changed in ({'omitted': True}, {'handle': 'PRIVATE'}, {'step': ['PRIVATE']},
+                {'first_error_type': 'PRIVATE'}, {'attempt': 3}, {'error_text': 'PRIVATE'}):
+            bad = dict(rows[-1], **changed)
+            self.assertFalse(valid_record(bad))
+            with self.assertRaises(ChannelError):
+                Channel(identity, commands=False).encode('evidence', record=bad)
+
+    async def test_missing_operation_metadata_does_not_hide_actual_cleanup_failure_or_invent_code(self):
+        voice = service()
+        target = self.target(lambda _: SimpleNamespace(status=0, services=[voice]))
+        await target.open_voice(direct=True)
+        rows = self.cleanup_rows(target)
+        voice.close.side_effect = OSError('PRIVATE native failure')
+        original = target._cleanup_metadata
+        def metadata(step, state, **details):
+            if step == 'service_close' and state == 'done':
+                raise RuntimeError('PRIVATE metadata failure')
+            original(step, state, **details)
+        with mock.patch.object(target, '_cleanup_metadata', new=metadata):
+            with self.assertRaises(PipeError):
+                await target.close_voice()
+        self.assertEqual(rows[-1]['current_failed'], 1)
+        self.assertEqual(rows[-1]['remaining_services'], 1)
+        self.assertEqual(rows[-1]['first_step'], 'none')
+        self.assertEqual(rows[-1]['first_hresult'], -1)
+        self.assertTrue(target._voice_cleanup_failed)
+
+    async def test_watcher_and_device_failure_report_exact_step_without_swallowing_it(self):
+        for step in ('watcher_remove', 'watcher_stop', 'device_close'):
+            with self.subTest(step=step):
+                target = self.target(lambda _: None)
+                rows = self.cleanup_rows(target)
+                target.watcher = SimpleNamespace(remove_added=mock.Mock(), stop=mock.Mock())
+                target.tokens = [('added', object())]
+                callback = {'watcher_remove': target.watcher.remove_added,
+                    'watcher_stop': target.watcher.stop, 'device_close': target.device.close}[step]
+                callback.side_effect = OSError('PRIVATE')
+                with self.assertRaises(OSError):
+                    target.close()
+                self.assertEqual(rows[-1]['first_step'], step)
+                self.assertEqual(rows[-1]['current_failed'], 1)
+                self.assertTrue(all(valid_record(r) for r in rows))
 
 
 class WakeRetryTests(unittest.IsolatedAsyncioTestCase):

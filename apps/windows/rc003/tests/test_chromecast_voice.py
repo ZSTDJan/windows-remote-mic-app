@@ -384,6 +384,97 @@ class HostTests(unittest.TestCase):
         self.host._poll_host()
         self.assertEqual(self.host.client.voice_host.call_count, 1)
 
+    def test_unknown_hold_capture_waits_for_protocol_deadline_without_repress(self):
+        self.host._start_host(1)
+        started = self.host.start_at
+        with mock.patch("ovb_rc003.chromecast_voice_host.time.monotonic", return_value=started + 3.1):
+            self.host._poll_host()
+        self.host.client.voice_host.assert_not_called()
+        self.assertTrue(self.host.engaged)
+        self.owner._voice_shortcut.apply.assert_called_once()
+        with mock.patch("ovb_rc003.chromecast_voice_host.time.monotonic", return_value=started + 9.1):
+            self.host._poll_host()
+        self.assertIn(mock.call(1, "failed"), self.host.client.voice_host.call_args_list)
+        self.assertTrue(self.host.closed)
+        downs = [c for c in self.owner._voice_shortcut.apply.call_args_list
+                 if c.args[0] == voice_controller.VoiceHostAction.KEY_DOWN]
+        self.assertEqual(len(downs), 1)
+
+    def test_real_hold_observer_confirms_slow_capture_within_protocol_deadline(self):
+        from ovb_rc003 import wetype_control_windows as wetype
+        from ovb_rc003.voice_playback_session_windows import CaptureSession
+        for latency in (4.0, 8.5, 9.1):
+            with self.subTest(latency=latency):
+                clock = [100.0]
+                step = threading.Event()
+                workers, edges = [], []
+                shortcut = self.owner._voice_shortcut
+                capture = CaptureSession("mic", "slow-start", 42, 1)
+                guard = mock.Mock()
+                guard.restore_if_muted.return_value = "restored"
+
+                def wait(cancelled, delay):
+                    step.wait(1)
+                    return cancelled.is_set()
+
+                def spawn(**options):
+                    worker = threading.Thread(**options)
+                    workers.append(worker)
+                    return worker
+
+                def confirm(generation, success):
+                    with shortcut.runtime_lock:
+                        shortcut.runtime_mic_confirmed = True if success else None
+
+                control = wetype.WeTypeVoiceControl(
+                    activate_profile=lambda: True, run_sta=lambda fn: fn(),
+                    capture_reader=lambda: (capture,) if clock[0] >= 100 + latency else (),
+                    press_keys=lambda keys: edges.append("down"),
+                    release_keys=lambda keys: edges.append("up"),
+                    on_confirmation=confirm,
+                    prepare_playback_mute_guard=lambda: guard,
+                    wait_for_cancel=wait, thread_factory=spawn, logger=mock.Mock(),
+                )
+                shortcut.runtime_mic_confirmed = None
+                shortcut.apply.side_effect = lambda action, **kwargs: (
+                    control.start(("lctrl", "lwin"))
+                    if action == voice_controller.VoiceHostAction.KEY_DOWN else control.stop())
+                shortcut.release_pending.side_effect = control.stop
+                shortcut.control_flag.side_effect = lambda name, *args: getattr(control, name)
+                self.host._handle({"event": "state", "attempt": self.host.attempt, "data": "idle"})
+                self.host.client.reset_mock()
+                with mock.patch.object(wetype.time, "monotonic", side_effect=lambda: clock[0]):
+                    try:
+                        self.host._start_host(int(latency))
+                        self.assertTrue(self.host.engaged)
+                        self.host._poll_host()
+                        self.host.client.voice_host.assert_not_called()
+                        clock[0] += latency
+                        step.set()
+                        for worker in workers:
+                            worker.join(1)
+                            self.assertFalse(worker.is_alive())
+                        self.host._poll_host()
+                        self.assertTrue(self.host.ready_sent)
+                        if latency < 9:
+                            self.assertTrue(self.host.confirmed)
+                            self.assertIsNone(self.host.failure_result)
+                            self.host.client.voice_host.assert_called_once_with(int(latency), "ready")
+                            self.assertEqual(edges, ["down"])
+                        else:
+                            self.assertNotIn(mock.call(int(latency), "ready"), self.host.client.voice_host.call_args_list)
+                            self.assertIn(mock.call(int(latency), "failed"), self.host.client.voice_host.call_args_list)
+                            self.assertTrue(self.host.closed)
+                        guard.restore_if_muted.assert_called_once_with()
+                        self.assertTrue(self.host._stop_host())
+                        self.assertEqual(edges, ["down", "up"])
+                    finally:
+                        control.stop()
+                        step.set()
+                        self.host._stop_host()
+                        for worker in workers:
+                            worker.join(1)
+
     def test_capture_diagnostics_identify_owner_without_exposing_session_strings(self):
         from ovb_rc003.chromecast_host_activity import CaptureWatch
         from ovb_rc003.voice_playback_session_windows import CaptureSession

@@ -404,6 +404,7 @@ class SelectionControllerTests(unittest.TestCase):
     setUp = _Fixture.setUp
     tearDown = _Fixture.tearDown
     _make_controller = _Fixture._make_controller
+    _wait_for_qt = _Fixture._wait_for_qt
 
     def seed(self):
         settings = config.default_config()
@@ -701,6 +702,267 @@ class SelectionControllerTests(unittest.TestCase):
         self.assertTrue(notified)
         self.assertFalse(controller._has_unsaved_non_mapping_settings())
 
+    def _seed_chatterfly_switch(self, *, source="auto", provider="chatterfly"):
+        path = config.config_path(config.config_root())
+        bindings_path = config.key_bindings_path(config.config_root())
+        previous = config.load_config(path) if path.exists() else {}
+        if selection.active_key(previous) in (A, B):
+            if selection.active_key(previous) == B:
+                config.switch_remote_settings(
+                    path, bindings_path, selection.select_device(previous[selection.KEY], A)
+                )
+            controller = self._make_controller()[0]
+            controller._on_remote_devices_ready(([
+                dict(row, label=selection.label(row["key"], row["profile"]))
+                for row in controller._remote_selection()["devices"]
+            ], ""))
+        else:
+            controller = self.seed_chromecast()
+        config.switch_remote_settings(
+            path, bindings_path, selection.select_device(controller._remote_selection(), B)
+        )
+        saved = config.load_config(path)
+        saved["voice_program"]["provider"] = provider
+        config.set_voice_hotkey_for_provider(
+            saved, provider, "rctrl+rshift+0", source=source
+        )
+        config.save_config(path, saved)
+        config.switch_remote_settings(path, bindings_path, controller._remote_selection())
+        from ovb_rc003 import voice_hotkey_sync_windows
+        self._voice_hotkey_read_mock.side_effect = None
+        self._voice_hotkey_read_mock.return_value = (
+            voice_hotkey_sync_windows.VoiceHotkeySyncResult(
+                provider, True, "read", "rshift+i", "已读取"
+            )
+        )
+        self._voice_hotkey_read_mock.reset_mock()
+        return controller
+
+    def test_switch_corrects_remembered_automatic_chatterfly_shortcut_without_refresh(self):
+        from PySide6.QtCore import QCoreApplication
+        app = QCoreApplication.instance() or QCoreApplication([])
+        controller = self._seed_chatterfly_switch()
+        with mock.patch.object(controller, "_refresh_bridge_status", return_value=False):
+            controller.useRemoteDevice(B)
+            self._wait_for_qt(
+                app, lambda: controller.holdVoiceHotkeyText == "rshift+i",
+                "device switch did not read the current automatic shortcut",
+            )
+        self._voice_hotkey_read_mock.assert_called_once_with("chatterfly")
+        self.assertEqual(controller.voiceHotkeySource, "auto")
+        self.assertEqual(controller.activeRemoteKey, B)
+        reopened, _ = self._make_controller()
+        self.assertEqual(reopened.holdVoiceHotkeyText, "rshift+i")
+
+    def test_switch_waits_for_busy_work_then_coalesces_automatic_shortcut_reads(self):
+        from PySide6.QtCore import QCoreApplication
+        from PySide6.QtTest import QTest
+        from ovb_rc003 import bridge_runtime_status
+        app = QCoreApplication.instance() or QCoreApplication([])
+        for field, busy in (
+            ("_settings_save_busy", True),
+            ("_voice_runtime_state", bridge_runtime_status.VOICE_RUNTIME_ACTIVE),
+            ("_voice_runtime_state", bridge_runtime_status.VOICE_RUNTIME_FINISHING),
+            ("_bridge_launch_phase", "starting"),
+            ("_input_operation_phase", "active"),
+        ):
+            with self.subTest(field=field, busy=busy):
+                controller = self._seed_chatterfly_switch()
+                with mock.patch.object(controller, "_refresh_bridge_status", return_value=False):
+                    controller.useRemoteDevice(B)
+                    previous = getattr(controller, field)
+                    setattr(controller, field, busy)
+                    controller.loadVoiceHotkeyFromProvider()
+                    controller.loadVoiceHotkeyFromProvider()
+                    QTest.qWait(200)
+                    self._voice_hotkey_read_mock.assert_not_called()
+                    self.assertEqual(controller.holdVoiceHotkeyText, "rctrl+rshift+0")
+                    setattr(controller, field, previous)
+                    self._wait_for_qt(
+                        app, lambda: controller.holdVoiceHotkeyText == "rshift+i",
+                        "automatic read was lost while busy",
+                    )
+                    QTest.qWait(200)
+                self._voice_hotkey_read_mock.assert_called_once_with("chatterfly")
+
+    def test_switch_preserves_manual_chatterfly_shortcut_without_reading(self):
+        from PySide6.QtCore import QCoreApplication
+        from PySide6.QtTest import QTest
+        app = QCoreApplication.instance() or QCoreApplication([])
+        controller = self._seed_chatterfly_switch(source="manual")
+        with mock.patch.object(controller, "_refresh_bridge_status", return_value=False):
+            controller.useRemoteDevice(B)
+            QTest.qWait(200)
+        self._voice_hotkey_read_mock.assert_not_called()
+        self.assertEqual(controller.holdVoiceHotkeyText, "rctrl+rshift+0")
+        self.assertEqual(controller.voiceHotkeySource, "manual")
+        reopened, _ = self._make_controller()
+        self.assertEqual(reopened.holdVoiceHotkeyText, "rctrl+rshift+0")
+
+    def test_both_remote_models_reload_all_silent_providers_and_keep_manual_values(self):
+        from PySide6.QtCore import QCoreApplication
+        from ovb_rc003 import voice_hotkey_sync_windows, voice_program_manager
+        app = QCoreApplication.instance() or QCoreApplication([])
+        for provider in ("sogou", "doubao_ime", "chatterfly"):
+            for source in ("auto", "manual"):
+                with self.subTest(provider=provider, source=source):
+                    controller = self._seed_chatterfly_switch(source=source, provider=provider)
+                    with mock.patch.object(controller, "_refresh_bridge_status", return_value=False):
+                        controller.useRemoteDevice(B)
+                        self._wait_for_qt(
+                            app, lambda: controller._voice_hotkey_load_pending is None,
+                            "device reload did not finish",
+                        )
+                        expected = "rshift+i" if source == "auto" else "rctrl+rshift+0"
+                        self.assertEqual(controller.holdVoiceHotkeyText, expected)
+                        self.assertEqual(controller.voiceHotkeySource, source)
+                        if source == "manual":
+                            self._voice_hotkey_read_mock.assert_not_called()
+                        else:
+                            self._voice_hotkey_read_mock.assert_called_once_with(provider)
+                        controller.useRemoteDevice(A)
+                        controller.selectedVoiceProgramIndex = voice_program_manager.provider_index(provider)
+                        controller.holdVoiceHotkeyText = "ralt+i"
+                        # An explicit read restores automatic ownership for this model.
+                        if source == "auto":
+                            controller.refreshVoiceHotkeyFromProvider()
+                        controller.useRemoteDevice(B)
+                        self._wait_for_qt(app, lambda: controller._voice_hotkey_load_pending is None,
+                                          "second model reload did not finish")
+                        self._voice_hotkey_read_mock.reset_mock()
+                        self._voice_hotkey_read_mock.return_value = voice_hotkey_sync_windows.VoiceHotkeySyncResult(
+                            provider, True, "read", "ralt+u", "已读取"
+                        )
+                        controller.useRemoteDevice(A)
+                        self._wait_for_qt(app, lambda: controller._voice_hotkey_load_pending is None,
+                                          "first model reload did not finish")
+                        self.assertEqual(controller.holdVoiceHotkeyText, "ralt+u" if source == "auto" else "ralt+i")
+                        self.assertEqual(controller.voiceHotkeySource, source)
+                        if source == "manual":
+                            self._voice_hotkey_read_mock.assert_not_called()
+                        else:
+                            self._voice_hotkey_read_mock.assert_called_once_with(provider)
+
+    def test_recording_mode_reload_waits_for_busy_runtime_and_uses_the_new_trigger(self):
+        from PySide6.QtCore import QCoreApplication
+        from PySide6.QtTest import QTest
+        from ovb_rc003 import voice_hotkey_sync_windows
+        app = QCoreApplication.instance() or QCoreApplication([])
+        for provider in ("sogou", "doubao_ime"):
+            with self.subTest(provider=provider):
+                controller = self._seed_chatterfly_switch(provider=provider)
+                with mock.patch.object(controller, "_refresh_bridge_status", return_value=False):
+                    controller.useRemoteDevice(B)
+                    self._wait_for_qt(app, lambda: controller._voice_hotkey_load_pending is None,
+                                      "initial reload did not finish")
+                    self._voice_hotkey_read_mock.reset_mock()
+                    self._voice_hotkey_read_mock.return_value = voice_hotkey_sync_windows.VoiceHotkeySyncResult(
+                        provider, True, "read", "ralt+u", "已读取"
+                    )
+                    controller._bridge_launch_phase = "starting"
+                    controller.setRemoteRecordingPreferences(1, 1)
+                    self.assertEqual(controller.remoteRecordingModeIndex, 1)
+                    QTest.qWait(200)
+                    self._voice_hotkey_read_mock.assert_not_called()
+                    controller._bridge_launch_phase = "idle"
+                    self._wait_for_qt(app, lambda: controller.holdVoiceHotkeyText == "ralt+u",
+                                      "mode reload was lost while busy")
+                    self._voice_hotkey_read_mock.assert_called_once_with(provider, trigger="toggle")
+                    self._voice_hotkey_read_mock.reset_mock()
+                    controller.setRemoteRecordingPreferences(0, 1)
+                    self.assertEqual(controller.holdVoiceHotkeyText, "ralt+u")
+                    self._voice_hotkey_read_mock.assert_called_once_with(provider)
+
+    def test_automatic_result_during_voice_is_deferred_and_refreshed_when_idle(self):
+        from PySide6.QtCore import QCoreApplication
+        from ovb_rc003 import bridge_runtime_status, voice_hotkey_sync_windows
+        app = QCoreApplication.instance() or QCoreApplication([])
+        controller = self._seed_chatterfly_switch()
+        def read(provider, **kwargs):
+            controller._voice_runtime_state = bridge_runtime_status.VOICE_RUNTIME_ACTIVE
+            return voice_hotkey_sync_windows.VoiceHotkeySyncResult(provider, True, "read", "rshift+i")
+        self._voice_hotkey_read_mock.side_effect = read
+        with mock.patch.object(controller, "_refresh_bridge_status", return_value=False):
+            controller.useRemoteDevice(B)
+            self._wait_for_qt(app, lambda: self._voice_hotkey_read_mock.called,
+                              "automatic read did not start")
+            self.assertEqual(controller.holdVoiceHotkeyText, "rctrl+rshift+0")
+            self.assertIsNotNone(controller._voice_hotkey_load_pending)
+            self._voice_hotkey_read_mock.side_effect = None
+            controller._voice_runtime_state = bridge_runtime_status.VOICE_RUNTIME_NOT_TESTED
+            self._wait_for_qt(app, lambda: controller.holdVoiceHotkeyText == "rshift+i",
+                              "busy result did not refresh after voice ended")
+        self.assertEqual(self._voice_hotkey_read_mock.call_count, 2)
+
+    def test_failed_switch_shortcut_read_preserves_saved_bytes_and_does_not_retry(self):
+        from PySide6.QtCore import QCoreApplication
+        from PySide6.QtTest import QTest
+        from ovb_rc003 import voice_hotkey_sync_windows
+        app = QCoreApplication.instance() or QCoreApplication([])
+        for code in ("not_found", "ambiguous_profile", "disabled", "read_failed"):
+            with self.subTest(code=code):
+                controller = self._seed_chatterfly_switch()
+                self._voice_hotkey_read_mock.return_value = (
+                    voice_hotkey_sync_windows.VoiceHotkeySyncResult(
+                        "chatterfly", False, code, message=code
+                    )
+                )
+                with mock.patch.object(controller, "_refresh_bridge_status", return_value=False):
+                    controller.useRemoteDevice(B)
+                    path = config.config_path(config.config_root())
+                    before = path.read_bytes()
+                    self._wait_for_qt(
+                        app, lambda: self._voice_hotkey_read_mock.called and not controller.voiceHotkeyBusy,
+                        "automatic read did not settle",
+                    )
+                    QTest.qWait(200)
+                self._voice_hotkey_read_mock.assert_called_once_with("chatterfly")
+                self.assertEqual(controller.holdVoiceHotkeyText, "rctrl+rshift+0")
+                self.assertEqual(controller.voiceHotkeySource, "auto")
+                self.assertEqual(path.read_bytes(), before)
+
+    def test_switch_back_discards_pending_shortcut_read_for_previous_device(self):
+        from PySide6.QtCore import QCoreApplication
+        from PySide6.QtTest import QTest
+        app = QCoreApplication.instance() or QCoreApplication([])
+        controller = self._seed_chatterfly_switch()
+        with mock.patch.object(controller, "_refresh_bridge_status", return_value=False):
+            controller.useRemoteDevice(B)
+            controller.useRemoteDevice(A)
+            path = config.config_path(config.config_root())
+            before = path.read_bytes()
+            QTest.qWait(200)
+        self._voice_hotkey_read_mock.assert_not_called()
+        self.assertEqual(controller.activeRemoteKey, A)
+        self.assertEqual(path.read_bytes(), before)
+
+    def test_manual_edit_before_pending_read_keeps_priority(self):
+        from PySide6.QtCore import QCoreApplication
+        from PySide6.QtTest import QTest
+        app = QCoreApplication.instance() or QCoreApplication([])
+        controller = self._seed_chatterfly_switch()
+        with mock.patch.object(controller, "_refresh_bridge_status", return_value=False):
+            controller.useRemoteDevice(B)
+            controller.holdVoiceHotkeyText = "ralt+i"
+            QTest.qWait(200)
+        self._voice_hotkey_read_mock.assert_not_called()
+        self.assertEqual(controller.holdVoiceHotkeyText, "ralt+i")
+        self.assertEqual(controller.voiceHotkeySource, "manual")
+
+    def test_shutdown_discards_pending_automatic_shortcut_read(self):
+        from PySide6.QtCore import QCoreApplication
+        from PySide6.QtTest import QTest
+        app = QCoreApplication.instance() or QCoreApplication([])
+        controller = self._seed_chatterfly_switch()
+        with mock.patch.object(controller, "_refresh_bridge_status", return_value=False):
+            controller.useRemoteDevice(B)
+            path = config.config_path(config.config_root())
+            before = path.read_bytes()
+            controller.shutdownBackgroundTasks()
+            QTest.qWait(200)
+        self._voice_hotkey_read_mock.assert_not_called()
+        self.assertEqual(path.read_bytes(), before)
+
     def test_unsaved_mapping_stays_on_old_entity(self):
         controller = self.seed_chromecast()
         controller._set_mapping_dirty(True)
@@ -896,10 +1158,36 @@ for _ in range(20):
     app.processEvents()
     QTest.qWait(5)
 assert item('remoteDeviceDialog').property('pendingRemoteKey') == A
+hotkey_scenario = bool(os.environ.get('REMOTE_SELECTION_HOTKEY_SCENARIO'))
+hotkey_reads = []
+if hotkey_scenario:
+    # Seed an old automatic value through the same device-owned persistence API.
+    path = m.config.config_path(controller._config_root)
+    bindings_path = m.config.key_bindings_path(controller._config_root)
+    seeded = selection.add_device(controller._remote_selection(), paired_rows[1])
+    m.config.switch_remote_settings(path, bindings_path, selection.select_device(seeded, B))
+    saved = m.config.load_config(path)
+    saved['voice_program']['provider'] = 'chatterfly'
+    m.config.set_voice_hotkey_for_provider(saved, 'chatterfly', 'rctrl+rshift+0', source='auto')
+    m.config.save_config(path, saved)
+    m.config.switch_remote_settings(path, bindings_path, controller._remote_selection())
+    def read_current(provider, **kwargs):
+        hotkey_reads.append(provider)
+        return m.voice_hotkey_sync_windows.VoiceHotkeySyncResult(provider, True, 'read', 'rshift+i', '已读取')
+    m.voice_hotkey_sync_windows.read_provider_hotkey = read_current
 choose(B)
 click('useRemoteButton')
 assert controller.activeRemoteKey == B
 assert controller.activeRemoteProfile == profile_b
+if hotkey_scenario:
+    deadline = time.monotonic() + 2
+    while controller.holdVoiceHotkeyText != 'rshift+i' and time.monotonic() < deadline:
+        app.processEvents()
+        QTest.qWait(5)
+    assert controller.holdVoiceHotkeyText == 'rshift+i'
+    assert controller.voiceHotkeySource == 'auto'
+    assert hotkey_reads == ['chatterfly'], hotkey_reads
+    assert m.config.voice_hotkey_for_provider(m.config.load_config(path), 'chatterfly') == 'rshift+i'
 if profile_b == 'xiaomi-rc003':
     click('closeRemoteDialogButton')
     assert QMetaObject.invokeMethod(item('mappingTabButton'), 'pressed')
@@ -957,6 +1245,8 @@ if profile_b == 'chromecast-remote':
     item('buttonsPageLoader').setProperty('active', True)
     item('voicePageLoader').setProperty('active', True)
     app.processEvents()
+    if hotkey_scenario:
+        assert item('holdVoiceHotkeyField').property('text') == controller.formatHotkeyText('rshift+i')
     assert item('rc003DeviceButton').property('text') == '小米遥控器2 Pro'
     assert item('futureDeviceButton').property('text') == '谷歌 Chromecast 遥控器'
     assert not item('rc003DeviceButton').property('highlighted')
@@ -1119,6 +1409,16 @@ print(json.dumps({'journey': 'choose-confirm-refresh-switch-cancel', 'warnings':
 
 
 class SelectionQmlTests(unittest.TestCase):
+    def test_real_device_dialog_updates_the_automatic_shortcut_without_refresh(self):
+        with tempfile.TemporaryDirectory() as directory:
+            env = dict(os.environ, LOCALAPPDATA=directory, QT_QPA_PLATFORM="offscreen",
+                       RC003_DISABLE_LIVE_INPUT="1", PYTHONUTF8="1", PYTHONIOENCODING="utf-8",
+                       REMOTE_SELECTION_PROFILE_B="chromecast-remote", REMOTE_SELECTION_HOTKEY_SCENARIO="1")
+            result = subprocess.run([sys.executable, "-c", _QML_PROBE], env=env,
+                                    capture_output=True, text=True, encoding="utf-8", timeout=30)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn('"warnings": []', result.stdout)
+
     def test_isolated_source_data_and_visible_title(self):
         with tempfile.TemporaryDirectory() as directory:
             env = dict(os.environ, QT_QPA_PLATFORM="offscreen", TEST_ISOLATED_ROOT=directory,

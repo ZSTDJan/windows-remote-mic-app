@@ -66,6 +66,7 @@ VOICE_RUNTIME_FINISHING = "finishing"
 VOICE_RUNTIME_SUCCESS = "success"
 VOICE_RUNTIME_OUTPUT_OPEN_FAILED = "output_open_failed"
 VOICE_RUNTIME_HOST_START_FAILED = "host_start_failed"
+VOICE_RUNTIME_HOST_UNCONFIRMED = "host_unconfirmed"
 VOICE_RUNTIME_AUDIO_EMPTY = "audio_empty"
 VOICE_RUNTIME_HOST_STOP_FAILED = "host_stop_failed"
 

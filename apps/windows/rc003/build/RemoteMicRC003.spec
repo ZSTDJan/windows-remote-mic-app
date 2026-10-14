@@ -297,6 +297,7 @@ hiddenimports = [
     "ovb_rc003.chromecast_voice_host",
     "ovb_rc003.voice_audio_session",
     "ovb_rc003.voice_shortcut_session",
+    "ovb_rc003.chatterfly_control_windows",
     "ovb_rc003.chromecast_voice_receiver",
     "ovb_rc003.chromecast_wetype_finish",
     "ovb_rc003.chromecast_wetype_toggle",

@@ -46,12 +46,14 @@ for Raw Input, HID tap, and the voice-key physicalizer.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 from pathlib import Path
 import sys
 import threading
 import time
+import uuid
 from typing import List, Optional, Tuple
 
 from . import __version__
@@ -101,6 +103,7 @@ from .voice_shortcut_session import (
     _VOICE_HOTKEY_RELEASE_RETRY_INITIAL_SECONDS,
     _VOICE_HOTKEY_RELEASE_RETRY_MAX_SECONDS,
     _VOICE_HOTKEY_BACKEND_MARKED,
+    _VOICE_HOTKEY_BACKEND_CHATTERFLY,
     _VOICE_HOTKEY_BACKEND_WETYPE,
     _VOICE_HOTKEY_BACKEND_DOUBAO,
     _INPUT_PROFILE_VOICE_HOTKEY_BACKENDS
@@ -135,6 +138,9 @@ _BUTTON_ACTION_MOUSE_BUTTONS = {
     key_mapping.ActionKind.MOUSE_X1_CLICK: "x1",
     key_mapping.ActionKind.MOUSE_X2_CLICK: "x2",
 }
+
+# Keep the first-repeat delay shared, but make ordinary D-pad movement quicker.
+_DIRECTION_BUTTON_REPEAT_INTERVAL_SECONDS = 0.065
 
 # Semantic tap mappings only. RC003 physical-edge correlation is separate.
 _BUTTON_ACTION_NAVIGATION_VKS = {
@@ -239,9 +245,14 @@ class RC003App:
             repeat_interval_for=self._button_repeat_interval,
             on_idle=self._apply_pending_settings_if_idle,
             on_diagnostic=self._on_button_gesture_diagnostic,
+            is_sustained=self._is_mouse_hold_button,
+            on_hold_start=lambda button, token: self._on_button_trigger(
+                button, button_gesture.ButtonTrigger.LONG_PRESS, hold_owner=token),
+            on_hold_end=self._end_button_mouse_hold,
         )
         self._button_combos = button_combo.ButtonComboRecognizer()
         self._logger: logging.Logger = logging_setup.get_logger(self._config_root)
+        self._last_raw_input_lookup_diagnostic = None
         self._diagnostic_trace = diagnostic_trace.DiagnosticTrace(
             self._config_root,
             enabled=bool(self._config.get("diagnostic_trace_enabled", False)),
@@ -320,6 +331,7 @@ class RC003App:
                 current_state=self._current_voice_runtime_state,
                 request_cleanup=lambda: self._supervisor.request_reconnect(),
                 prepare_mute_guard=self._prepare_wetype_playback_mute_guard,
+                chatterfly_state=self._on_chatterfly_voice_state,
             ),
         )
         self._pending_voice_settings = None
@@ -345,6 +357,8 @@ class RC003App:
         self._button_action_lock = threading.RLock()
         self._button_key_release_pending: Optional[Tuple[str, ...]] = None
         self._button_mouse_release_pending: Optional[str] = None
+        self._button_mouse_holds: Dict[str, set[object]] = {}
+        self._button_hold_release_pending: set[str] = set()
         self._button_input_release_retry_timer: Optional[object] = None
         self._button_input_release_retry_token: Optional[object] = None
         self._button_input_release_retry_delay = (
@@ -518,6 +532,36 @@ class RC003App:
         if voice_active:
             self._set_runtime_voice_result(bridge_runtime_status.VOICE_RUNTIME_RECEIVING_AUDIO)
 
+    def _on_chatterfly_voice_state(self, generation, state):
+        # Chromecast owns its ready/PCM handshake. Xiaomi enables forwarding
+        # only after this attempt's actual voice window has appeared.
+        if self._remote_profile != remote_selection.RC003_PROFILE:
+            return
+        with self._voice_shortcut.lock:
+            control = self._voice_shortcut.chatterfly_control
+            if (generation != control.current_generation
+                    or self._voice_shortcut.active_backend != _VOICE_HOTKEY_BACKEND_CHATTERFLY):
+                return
+            if not self._voice_shortcut.controller.active:
+                if state == "cleanup_pending":
+                    self._set_runtime_voice_result(bridge_runtime_status.VOICE_RUNTIME_HOST_STOP_FAILED)
+                return
+            if state == "ready":
+                if not self._accept_input_events or not self._accept_ble_events:
+                    self._force_voice_hold_release_locked("Chatterfly ready after input stopped")
+                    return
+                self._voice_pcm_forwarding_enabled = True
+                self._set_runtime_voice_active(True)
+                self._set_runtime_voice_result(bridge_runtime_status.VOICE_RUNTIME_MIC_CONFIRMED)
+                if getattr(self, "_chatterfly_send_device_open", False) and self._ble_session is not None:
+                    self._ble_session.send_mic_open_threadsafe()
+            elif state in {"failed", "closed", "cleanup_pending"}:
+                self._force_voice_hold_release_locked("Chatterfly voice session ended or failed")
+                if state != "closed":
+                    self._set_runtime_voice_result(
+                        bridge_runtime_status.VOICE_RUNTIME_HOST_STOP_FAILED
+                        if state == "cleanup_pending" else bridge_runtime_status.VOICE_RUNTIME_HOST_START_FAILED)
+
     def _cancel_chromecast_mappings(self):
         with self._input_arbitration_lock:
             self._accept_input_events = False
@@ -690,6 +734,10 @@ class RC003App:
                               bridge_runtime_status.VOICE_RUNTIME_OUTPUT_OPEN_FAILED}):
             self._logger.warning("Voice runtime failed: state=%s provider=%s", state, resolved_provider,
                                  extra={"failure_key": f"voice:{resolved_provider}:{state}"})
+        if (state == bridge_runtime_status.VOICE_RUNTIME_HOST_UNCONFIRMED
+                and (previous_state, previous_provider) != (str(state), str(resolved_provider))):
+            self._logger.info("Voice runtime unconfirmed: state=%s provider=%s; audio received, host capture unknown",
+                              state, resolved_provider)
         if trace is not None and (previous_state, previous_provider) != (str(state), str(resolved_provider)):
             try:
                 trace.emit('voice_runtime_state', state=str(state), previous_state=previous_state,
@@ -1333,6 +1381,33 @@ class RC003App:
         else:
             self._set_runtime_input_state(raw_input_state=state)
 
+    def _record_raw_input_lookup(self, generation, outcome, enumeration, selection) -> None:
+        # The producers supply only fixed labels/counts/codes, never device paths.
+        fields = dict(outcome=outcome, enumeration=enumeration, selection=selection,
+                      selected_ref=self._selected_remote_key[:12]
+                      if remote_selection.valid_key(self._selected_remote_key) else "")
+        signature = json.dumps(fields, sort_keys=True, ensure_ascii=True)
+        if signature == self._last_raw_input_lookup_diagnostic:
+            return
+        fields.update(generation=generation, app_pid=os.getpid())
+        extra = {}
+        if outcome in {"no_device", "unavailable", "ambiguous"}:
+            extra = dict(failure_key="hid_discovery:raw_input", failure_id=uuid.uuid4().hex)
+            fields.update(extra)
+        recorded = False
+        try:
+            self._logger.info("HID diagnostic: %s", json.dumps(
+                dict(event="hid_raw_input_lookup", **fields), ensure_ascii=True), extra=extra)
+            recorded = True
+        except Exception:
+            pass
+        try:
+            recorded = self._diagnostic_trace.emit("hid_raw_input_lookup", **fields) or recorded
+        except Exception:
+            pass
+        if recorded:
+            self._last_raw_input_lookup_diagnostic = signature
+
     def _start_hid_listener_owned(self, *, recovering: bool = False) -> None:
         """Best-effort: buttons fail closed independently of BLE/voice.
 
@@ -1372,12 +1447,17 @@ class RC003App:
 
         self._set_raw_listener_state("recovering" if recovering else "starting")
         keyboard_only = self._remote_profile == remote_selection.CHROMECAST_PROFILE
+        enumeration, selection = {}, {}
+        lookup_outcome = "lookup_interrupted"
         try:
             device_path = None
             if not keyboard_only:
-                paths = raw_input_windows.enumerate_matching_device_paths()
-                device_path = remote_selection.selected_raw_path(paths, self._selected_remote_key)
+                paths = raw_input_windows.enumerate_matching_device_paths(diagnostic=enumeration)
+                device_path = remote_selection.selected_raw_path(
+                    paths, self._selected_remote_key, diagnostic=selection)
+                lookup_outcome = "path_selected"
         except raw_input_windows.RawInputUnavailableError as exc:
+            lookup_outcome = "unavailable"
             self._set_runtime_input_state(raw_input_state="unavailable")
             self._logger.info("startup: Raw Input unavailable; buttons disabled: %s", exc)
             with self._raw_input_lifecycle_lock:
@@ -1385,6 +1465,7 @@ class RC003App:
                     self._schedule_raw_input_recovery_locked()
             return
         except hid_identity.NoDevicePathFoundError:
+            lookup_outcome = "no_device"
             self._set_runtime_input_state(raw_input_state="no_device")
             self._logger.info("startup: no RC003 HID device path found; buttons unavailable")
             with self._raw_input_lifecycle_lock:
@@ -1392,6 +1473,7 @@ class RC003App:
                     self._schedule_raw_input_recovery_locked()
             return
         except hid_identity.AmbiguousDevicePathError as exc:
+            lookup_outcome = "ambiguous"
             self._set_runtime_input_state(raw_input_state="ambiguous")
             self._logger.info(
                 "startup: buttons failing closed, ambiguous HID device paths: %s", exc
@@ -1400,6 +1482,9 @@ class RC003App:
                 if self._raw_input_generation == generation:
                     self._schedule_raw_input_recovery_locked()
             return
+        finally:
+            if not keyboard_only:
+                self._record_raw_input_lookup(generation, lookup_outcome, enumeration, selection)
 
         listener = raw_input_windows.RawInputButtonListener(
             self._on_raw_button_event
@@ -3156,6 +3241,8 @@ class RC003App:
             return _VOICE_HOTKEY_BACKEND_WETYPE
         if settings["provider"] == voice_program_manager.VOICE_PROGRAM_DOUBAO_IME:
             return _VOICE_HOTKEY_BACKEND_DOUBAO
+        if settings["provider"] == voice_program_manager.VOICE_PROGRAM_CHATTERFLY:
+            return _VOICE_HOTKEY_BACKEND_CHATTERFLY
         return _VOICE_HOTKEY_BACKEND_MARKED
 
     def _ensure_voice_key_physicalizer_for_hotkey(
@@ -3163,7 +3250,7 @@ class RC003App:
         tokens: Tuple[str, ...],
         backend: str,
     ) -> bool:
-        """Start the process-level right-Alt tracker only when it is needed."""
+        """Prepare the keyboard hook only for backends that send key events."""
 
         if backend not in {
             _VOICE_HOTKEY_BACKEND_MARKED,
@@ -3214,15 +3301,6 @@ class RC003App:
         if issue:
             self._logger.warning("voice mapping ignored: %s", issue)
             return False
-        if (
-            self._config.get("voice_program", {}).get("provider")
-            == voice_program_manager.VOICE_PROGRAM_CHATTERFLY
-            and not config.voice_hotkey_for_provider(
-                self._config, voice_program_manager.VOICE_PROGRAM_CHATTERFLY
-            )
-        ):
-            self._logger.warning("voice mapping ignored: Chatterfly shortcut is not configured")
-            return False
         if not self._direct_hid_interception_ready:
             self._logger.warning(
                 "voice mapping ignored: RC003 HID interception is not ready"
@@ -3238,7 +3316,7 @@ class RC003App:
             return False
         mode = key_mapping.VoiceTriggerMode.HOLD
         backend = self._configured_voice_hotkey_backend()
-        if backend == _VOICE_HOTKEY_BACKEND_WETYPE:
+        if backend in {_VOICE_HOTKEY_BACKEND_WETYPE, _VOICE_HOTKEY_BACKEND_CHATTERFLY}:
             return True
         try:
             voice_hotkey = hotkey.HotkeySpec.parse(
@@ -3261,13 +3339,12 @@ class RC003App:
             )
             return False
         if (
-            backend
-            in {_VOICE_HOTKEY_BACKEND_MARKED, _VOICE_HOTKEY_BACKEND_DOUBAO}
-            and win32_keys.VK_CODES["ralt"] in resolved_vk_codes
+            (backend in {_VOICE_HOTKEY_BACKEND_MARKED, _VOICE_HOTKEY_BACKEND_DOUBAO}
+             and win32_keys.VK_CODES["ralt"] in resolved_vk_codes)
             and not self._voice_key_physicalizer_ready
         ):
             self._logger.warning(
-                "voice mapping ignored: marked right-Alt physicalizer is unavailable"
+                "voice mapping ignored: required voice key physicalizer is unavailable"
             )
             return False
         requested = (mode, voice_hotkey.serialize())
@@ -4435,6 +4512,57 @@ class RC003App:
         )
         self._apply_button_action(action)
 
+    def _is_mouse_hold_button(self, button_id: str) -> bool:
+        return key_mapping.button_action_for(
+            self._bindings, button_id, key_mapping.ButtonTrigger.LONG_PRESS
+        ).kind in key_mapping.MOUSE_HOLD_BUTTONS
+
+    def _begin_button_mouse_hold(self, owner: object, action: key_mapping.ButtonAction) -> None:
+        button = key_mapping.MOUSE_HOLD_BUTTONS[action.kind]
+        with self._button_action_lock:
+            if not self._accept_input_events or not self._release_pending_button_inputs():
+                return
+            owners = self._button_mouse_holds.get(button)
+            if owners:
+                owners.add(owner)
+                return
+            try:
+                win32_input.send_mouse_button_down(button)
+            except win32_input.InputCleanupIncompleteError:
+                self._button_hold_release_pending.add(button)
+                self._schedule_button_input_release_retry_locked()
+                self._logger.exception("mouse hold down has pending cleanup: %s", button)
+            except (win32_input.MouseButtonInUseError, win32_input.Win32InputUnavailableError, OSError):
+                self._logger.info("mouse hold down skipped: %s", button, exc_info=True)
+            else:
+                self._button_mouse_holds[button] = {owner}
+
+    def _end_button_mouse_hold(self, owner: object) -> None:
+        with self._button_action_lock:
+            for button, owners in list(self._button_mouse_holds.items()):
+                owners.discard(owner)
+                if not owners:
+                    del self._button_mouse_holds[button]
+                    self._button_hold_release_pending.add(button)
+            self._release_pending_button_inputs()
+
+    def _release_pending_mouse_holds_locked(self) -> bool:
+        for button in tuple(self._button_hold_release_pending):
+            try:
+                win32_input.send_mouse_button_up(button)
+            except (win32_input.InputCleanupIncompleteError, win32_input.Win32InputUnavailableError):
+                self._logger.warning("mouse hold release remains pending: %s", button)
+                continue
+            except OSError:
+                # Ordinary OSError means the sender confirmed fallback release.
+                self._logger.info("mouse hold release completed through fallback: %s", button)
+            self._button_hold_release_pending.remove(button)
+        if self._button_hold_release_pending:
+            self._schedule_button_input_release_retry_locked()
+            return False
+        self._finish_button_input_release_if_complete_locked()
+        return True
+
     def _is_button_combo_participant(self, button_id: str) -> bool:
         modifier = key_mapping.button_combo_modifier(self._bindings)
         if modifier is None:
@@ -4494,6 +4622,13 @@ class RC003App:
             button_id,
             key_mapping.ButtonTrigger.SINGLE_CLICK,
         )
+        if button_id in {"up", "down", "left", "right"} and action.kind in {
+            key_mapping.ActionKind.ARROW_UP,
+            key_mapping.ActionKind.ARROW_DOWN,
+            key_mapping.ActionKind.ARROW_LEFT,
+            key_mapping.ActionKind.ARROW_RIGHT,
+        }:
+            return _DIRECTION_BUTTON_REPEAT_INTERVAL_SECONDS
         if button_id == "back":
             return button_gesture.ButtonGestureDispatcher.BACK_REPEAT_INTERVAL_SECONDS
         return button_gesture.ButtonGestureDispatcher.REPEAT_INTERVAL_SECONDS
@@ -4509,7 +4644,8 @@ class RC003App:
         )
 
     def _on_button_trigger(
-        self, button_id: str, trigger: button_gesture.ButtonTrigger
+        self, button_id: str, trigger: button_gesture.ButtonTrigger,
+        *, hold_owner: Optional[object] = None,
     ) -> None:
         # ButtonGestureDispatcher keeps a callback reservation until this
         # function returns, so settings reload cannot replace the mapping we
@@ -4561,7 +4697,11 @@ class RC003App:
                 trigger.value,
             )
             return
-        self._apply_button_action(action)
+        if action.kind in key_mapping.MOUSE_HOLD_BUTTONS:
+            if hold_owner is not None:
+                self._begin_button_mouse_hold(hold_owner, action)
+        else:
+            self._apply_button_action(action)
 
     def _apply_button_action(self, action: key_mapping.ButtonAction) -> None:
         with self._button_action_lock:
@@ -4571,6 +4711,7 @@ class RC003App:
         if (
             self._button_key_release_pending is not None
             or self._button_mouse_release_pending is not None
+            or self._button_hold_release_pending
         ) and not self._release_pending_button_inputs():
             self._logger.info(
                 "button action suppressed: an earlier input release is still pending"
@@ -4622,6 +4763,8 @@ class RC003App:
             elif action.kind == key_mapping.ActionKind.PLAY_PAUSE:
                 win32_input.send_play_pause()
             elif action.kind in _BUTTON_ACTION_MOUSE_BUTTONS:
+                if _BUTTON_ACTION_MOUSE_BUTTONS[action.kind] in self._button_mouse_holds:
+                    return
                 win32_input.send_mouse_button_click(
                     _BUTTON_ACTION_MOUSE_BUTTONS[action.kind]
                 )
@@ -4734,6 +4877,7 @@ class RC003App:
             or (
                 self._button_key_release_pending is None
                 and self._button_mouse_release_pending is None
+                and not self._button_hold_release_pending
             )
         ):
             return
@@ -4781,6 +4925,7 @@ class RC003App:
         if (
             self._button_key_release_pending is None
             and self._button_mouse_release_pending is None
+            and not self._button_hold_release_pending
         ):
             self._cancel_button_input_release_retry_locked()
 
@@ -4842,7 +4987,8 @@ class RC003App:
         with self._button_action_lock:
             key_complete = self._release_pending_button_keys()
             mouse_complete = self._release_pending_button_mouse()
-            return key_complete and mouse_complete
+            hold_complete = self._release_pending_mouse_holds_locked()
+            return key_complete and mouse_complete and hold_complete
 
     # -- ATVV control-channel events (mic button + audio start/stop) ------
 
@@ -5229,9 +5375,7 @@ class RC003App:
         except win32_keys.UnknownKeyTokenError:
             uses_right_alt = False
         if (
-            uses_right_alt
-            and backend
-            in {
+            uses_right_alt and backend in {
                 _VOICE_HOTKEY_BACKEND_MARKED,
                 _VOICE_HOTKEY_BACKEND_DOUBAO,
             }
@@ -5787,16 +5931,6 @@ class RC003App:
             self._logger.warning("voice startup rejected: %s", issue)
             self._set_runtime_voice_result(bridge_runtime_status.VOICE_RUNTIME_HOST_START_FAILED)
             return False
-        if (
-            self._config.get("voice_program", {}).get("provider")
-            == voice_program_manager.VOICE_PROGRAM_CHATTERFLY
-            and not config.voice_hotkey_for_provider(
-                self._config, voice_program_manager.VOICE_PROGRAM_CHATTERFLY
-            )
-        ):
-            self._logger.warning("voice startup rejected: Chatterfly shortcut is not configured")
-            self._set_runtime_voice_result(bridge_runtime_status.VOICE_RUNTIME_HOST_START_FAILED)
-            return False
         self._ensure_voice_diagnostic_attempt()
         if not self._accept_input_events or not self._accept_ble_events:
             self._voice_pcm_forwarding_enabled = False
@@ -5866,6 +6000,7 @@ class RC003App:
             return False
 
         self._capture_voice_focus_before()
+        self._chatterfly_send_device_open = send_device_open
         action = self._voice_shortcut.controller.on_mic_button_pressed()
         action_delivered = self._voice_shortcut.apply(action)
         if not action_delivered:
@@ -5887,6 +6022,14 @@ class RC003App:
                 "failed_after_send", reason="hotkey_delivery_failed"
             )
             return False
+
+        if self._configured_voice_hotkey_backend() == _VOICE_HOTKEY_BACKEND_CHATTERFLY:
+            self._voice_pcm_forwarding_enabled = False
+            self._set_runtime_voice_result(bridge_runtime_status.VOICE_RUNTIME_NOT_TESTED)
+            if not self._arm_voice_hold_watchdog_locked():
+                self._force_voice_hold_release_locked("voice hold safety timer unavailable")
+                return False
+            return True  # The owned IPC observer, not the acknowledgement, enables PCM.
 
         self._voice_pcm_forwarding_enabled = True
         self._diagnostic_trace.emit(

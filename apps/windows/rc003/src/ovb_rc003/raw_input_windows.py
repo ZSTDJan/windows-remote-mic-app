@@ -143,7 +143,7 @@ def _require_windows() -> None:
         )
 
 
-def enumerate_matching_device_paths(*, matches=None) -> List[str]:
+def enumerate_matching_device_paths(*, matches=None, diagnostic: dict | None = None) -> List[str]:
     """Return every currently attached Raw-Input-visible device path whose
     matches the supplied predicate; the default remains RC003 VID/PID matching.
 
@@ -151,13 +151,21 @@ def enumerate_matching_device_paths(*, matches=None) -> List[str]:
     raises RawInputUnavailableError elsewhere.
     """
 
+    if diagnostic is not None:
+        diagnostic.update(reason="raw_input_unavailable", device_count=0, returned_devices=0,
+                          matching_paths=0, name_failures=0, error_samples=[], errors_omitted=0)
     _require_windows()
 
     matches = matches or hid_identity.device_path_matches_rc003
 
     RIDI_DEVICENAME = 0x20000007
 
-    user32 = ctypes.windll.user32  # type: ignore[attr-defined]
+    # Own these declarations and capture the thread-local error immediately.
+    try:
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+    except OSError as exc:
+        _record_enumeration_error(diagnostic, "load_user32", None, getattr(exc, "winerror", None))
+        raise
     user32.GetRawInputDeviceList.argtypes = (
         ctypes.POINTER(RAWINPUTDEVICELIST),
         ctypes.POINTER(wintypes.UINT),
@@ -166,13 +174,17 @@ def enumerate_matching_device_paths(*, matches=None) -> List[str]:
     user32.GetRawInputDeviceList.restype = ctypes.c_uint
 
     count = wintypes.UINT(0)
+    ctypes.set_last_error(0)
     result = user32.GetRawInputDeviceList(
         None, ctypes.byref(count), ctypes.sizeof(RAWINPUTDEVICELIST)
     )
     if result != 0:
+        _record_enumeration_error(diagnostic, "device_list_count", result, ctypes.get_last_error())
         raise RawInputUnavailableError(
             f"GetRawInputDeviceList (count pass) failed: {result}"
         )
+    if diagnostic is not None:
+        diagnostic.update(reason="enumerated", device_count=count.value)
     if count.value == 0:
         return []
 
@@ -183,22 +195,43 @@ def enumerate_matching_device_paths(*, matches=None) -> List[str]:
     # like SendInput's INPUT array above. ``ctypes.byref(device_list)``
     # instead yields a pointer-to-array (``LP_RAWINPUTDEVICELIST_Array_N``),
     # which ctypes' argument-type checking rejects with ``ArgumentError``.
+    ctypes.set_last_error(0)
     written = user32.GetRawInputDeviceList(
         device_list, ctypes.byref(count), ctypes.sizeof(RAWINPUTDEVICELIST)
     )
     if written == 0xFFFFFFFF or written < 0:
+        _record_enumeration_error(diagnostic, "device_list_fill", written, ctypes.get_last_error())
         raise RawInputUnavailableError("GetRawInputDeviceList (fill pass) failed")
 
     paths: List[str] = []
+    if diagnostic is not None:
+        diagnostic["returned_devices"] = written
     for index in range(written if isinstance(written, int) else count.value):
         device_handle = device_list[index].hDevice
-        path = _get_device_name(user32, device_handle, RIDI_DEVICENAME)
+        name_details = {} if diagnostic is not None else None
+        path = _get_device_name(user32, device_handle, RIDI_DEVICENAME, diagnostic=name_details)
+        if diagnostic is not None and name_details:
+            diagnostic["name_failures"] += 1
+            _record_enumeration_error(diagnostic, **name_details)
         if path and matches(path):
             paths.append(path)
+    if diagnostic is not None:
+        diagnostic.update(reason="partial_name_read" if diagnostic["name_failures"] else "enumerated",
+                          matching_paths=len(paths))
     return paths
 
 
-def _get_device_name(user32, device_handle, ridi_devicename: int) -> Optional[str]:
+def _record_enumeration_error(diagnostic, stage, result, winerror):
+    if diagnostic is None:
+        return
+    diagnostic["reason"] = "native_api_failed"
+    if len(diagnostic["error_samples"]) < 3:
+        diagnostic["error_samples"].append({"stage": stage, "result": result, "winerror": winerror})
+    else:
+        diagnostic["errors_omitted"] += 1
+
+
+def _get_device_name(user32, device_handle, ridi_devicename: int, *, diagnostic=None) -> Optional[str]:
     import ctypes
     from ctypes import wintypes
 
@@ -211,17 +244,33 @@ def _get_device_name(user32, device_handle, ridi_devicename: int) -> Optional[st
     user32.GetRawInputDeviceInfoW.restype = ctypes.c_uint
 
     size = wintypes.UINT(0)
-    user32.GetRawInputDeviceInfoW(
+    if diagnostic is not None:
+        ctypes.set_last_error(0)
+    result = user32.GetRawInputDeviceInfoW(
         device_handle, ridi_devicename, None, ctypes.byref(size)
     )
+    error = ctypes.get_last_error() if diagnostic is not None else None
+    if diagnostic is not None and result == 0xFFFFFFFF:
+        diagnostic.update(stage="device_name_count", result=result, winerror=error)
     if size.value == 0:
+        if diagnostic is not None:
+            diagnostic.update(stage="device_name_count", result=result,
+                              winerror=error if result == 0xFFFFFFFF else None)
         return None
     buffer = ctypes.create_unicode_buffer(size.value)
+    if diagnostic is not None:
+        ctypes.set_last_error(0)
     written = user32.GetRawInputDeviceInfoW(
         device_handle, ridi_devicename, buffer, ctypes.byref(size)
     )
+    error = ctypes.get_last_error() if diagnostic is not None else None
     if written in (0, 0xFFFFFFFF):
+        if diagnostic is not None and not diagnostic:
+            diagnostic.update(stage="device_name_fill", result=written,
+                              winerror=error if written == 0xFFFFFFFF else None)
         return None
+    if diagnostic is not None and not diagnostic and not buffer.value:
+        diagnostic.update(stage="device_name_empty", result=written, winerror=None)
     return buffer.value
 
 

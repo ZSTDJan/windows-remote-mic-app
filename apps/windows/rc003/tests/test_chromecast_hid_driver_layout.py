@@ -87,13 +87,16 @@ class DriverLayoutTests(unittest.TestCase):
     def test_start_injects_resolved_offset_without_relaxing_selected_address(self):
         session, script = mock.Mock(), mock.Mock()
         session.create_script.return_value = script
+        fake_frida = SimpleNamespace(attach=lambda pid: session)
         for offset in (8, 24):
             with self.subTest(offset=offset), \
-                    mock.patch.dict("sys.modules", frida=SimpleNamespace(attach=lambda pid: session)), \
+                    mock.patch.dict("sys.modules", frida=fake_frida), \
                     mock.patch.object(tap, "selected_host_and_address", return_value=(123, "060504030201")), \
-                    mock.patch.object(tap, "_driver_layout", return_value=(0x157FC, offset)):
+                    mock.patch.object(tap, "_driver_layout", return_value=(0x157FC, offset)), \
+                    mock.patch.object(tap.HidTap, "_attach", return_value=session) as attach:
                 instance = tap.HidTap("a" * 64)
                 instance.start()
+                attach.assert_called_once_with(fake_frida, 123)
                 source = session.create_script.call_args.args[0]
                 self.assertIn(f"adapter.add({offset}).readByteArray(6)", source)
                 self.assertIn("const expectedAddress = [1, 2, 3, 4, 5, 6];", source)

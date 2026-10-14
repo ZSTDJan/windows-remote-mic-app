@@ -32,6 +32,7 @@ LLKHF_EXTENDED = 0x00000001
 PM_NOREMOVE = 0x0000
 PM_REMOVE = 0x0001
 WM_QUIT = 0x0012
+_WM_REFRESH_ORDER = 0x8000 + 73
 VK_RMENU = 0xA5
 VK_SHIFT = 0x10
 VK_CONTROL = 0x11
@@ -131,8 +132,10 @@ class VoiceEventConfirmation:
         callback_entries: int,
         marker_callbacks: int,
         marker_matches: int,
+        vk_code: int = VK_RMENU,
     ) -> None:
         self.marker = int(marker)
+        self.vk_code = int(vk_code)
         self.generation = int(generation)
         self.installation_epoch = int(installation_epoch)
         self.key_up = bool(key_up)
@@ -253,7 +256,7 @@ def physicalize_injected_event(
     event: KBDLLHOOKSTRUCT,
     key_up: bool,
 ) -> Optional[VoiceEventConfirmation]:
-    """Claim one ticket and clear its right-Alt injection metadata.
+    """Claim one exact key/edge ticket and clear its injection metadata.
 
     Matching the marker proves only that this hook saw the edge.  Completion is
     signalled separately after ``CallNextHookEx`` returns so callers cannot
@@ -272,9 +275,6 @@ def physicalize_injected_event(
         if not (int(event.flags) & LLKHF_INJECTED):
             _record_marker_mismatch_locked("not_injected")
             return None
-        if int(event.vkCode) != VK_RMENU:
-            _record_marker_mismatch_locked("wrong_key")
-            return None
         if not _PHYSICAL_TRACKER_ACTIVE:
             _record_marker_mismatch_locked("inactive")
             return None
@@ -283,6 +283,9 @@ def physicalize_injected_event(
             confirmation = _VOICE_CONFIRMATIONS.get(marker)
             if confirmation is None:
                 _record_marker_mismatch_locked("missing_receipt")
+                return None
+            if int(event.vkCode) != confirmation.vk_code:
+                _record_marker_mismatch_locked("wrong_key")
                 return None
             if confirmation.generation != generation:
                 _record_marker_mismatch_locked("stale_generation")
@@ -496,8 +499,25 @@ def mark_required_confirmation_failed(
     return applied, snapshot
 
 
-def begin_marked_voice_event(key_up: bool) -> VoiceEventConfirmation:
-    """Reserve one exact hook acknowledgement for a marked right-Alt edge."""
+def ensure_voice_forwarding_order() -> None:
+    """Require the live process hook ahead of the host before a Chatterfly edge."""
+    with _PHYSICAL_KEY_STATE_LOCK:
+        owner = _PHYSICAL_TRACKER_OWNER
+        generation = _PHYSICAL_TRACKER_GENERATION
+    if owner is None or not owner.refresh_forwarding_order():
+        raise VoiceKeyPhysicalizerUnavailableError("voice hook order is unavailable")
+    with _PHYSICAL_KEY_STATE_LOCK:
+        if not _PHYSICAL_TRACKER_ACTIVE or _PHYSICAL_TRACKER_GENERATION != generation:
+            raise VoiceKeyPhysicalizerUnavailableError("voice hook changed during preparation")
+
+
+def begin_marked_voice_event(
+    key_up: bool, *, vk_code: int = VK_RMENU,
+) -> VoiceEventConfirmation:
+    """Reserve one exact hook acknowledgement; legacy callers target RAlt."""
+
+    if not 0 < int(vk_code) < 256:
+        raise ValueError("invalid voice virtual key")
 
     global _VOICE_CONFIRMATION_SEQUENCE
 
@@ -505,6 +525,12 @@ def begin_marked_voice_event(key_up: bool) -> VoiceEventConfirmation:
         if not _PHYSICAL_TRACKER_ACTIVE:
             raise VoiceKeyPhysicalizerUnavailableError(
                 "voice key physicalizer is not running"
+            )
+        if getattr(_PHYSICAL_TRACKER_OWNER, "_extra_hooks", ()):
+            # An unconfirmed replacement must not see our physicalized event
+            # a second time and mistake it for a real keyboard owner.
+            raise VoiceKeyPhysicalizerUnavailableError(
+                "voice hook replacement cleanup is pending"
             )
         if _PHYSICAL_TRACKER_DRAINING and not key_up:
             raise VoiceKeyPhysicalizerUnavailableError(
@@ -533,6 +559,7 @@ def begin_marked_voice_event(key_up: bool) -> VoiceEventConfirmation:
             callback_entries,
             marker_callbacks,
             marker_matches,
+            vk_code,
         )
         _VOICE_CONFIRMATIONS[marker] = confirmation
         return confirmation
@@ -950,6 +977,71 @@ class VoiceKeyPhysicalizer:
         self._direction_edges_lock = threading.Lock()
         self._armed_direction_edges: list[_ArmedDirectionEdge] = []
         self._owned_direction_holds: dict[tuple[int, int, bool], float] = {}
+        self._refresh_lock = threading.Lock()
+        self._refresh_request = None
+        self._extra_hooks = []
+
+    def refresh_forwarding_order(self, timeout: float = 0.5) -> bool:
+        """Move our existing hook ahead of a host that installed/repaired its hook.
+
+        The owner thread replaces the handle without resetting physical-key
+        ownership. A timed-out request cannot claim success or send input.
+        """
+        with self._refresh_lock:
+            if not self.is_running or self._stop_event.is_set():
+                return False
+            request = {"done": threading.Event(), "success": False}
+            self._refresh_request = request
+            try:
+                user32 = ctypes.windll.user32
+                user32.PostThreadMessageW.argtypes = (
+                    wintypes.DWORD, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM,
+                )
+                user32.PostThreadMessageW.restype = wintypes.BOOL
+                if not user32.PostThreadMessageW(
+                    self._thread_id.value, _WM_REFRESH_ORDER, 0, 0,
+                ):
+                    return False
+                return bool(request["done"].wait(timeout) and request["success"])
+            finally:
+                if self._refresh_request is request:
+                    self._refresh_request = None
+
+    def _refresh_forwarding_order_on_owner(self, user32, kernel32) -> None:
+        request = self._refresh_request
+        if request is None:
+            return
+        try:
+            if self._stop_event.is_set() or not self._hook:
+                return
+            # Do not invalidate an acknowledgement belonging to another sender.
+            with _VOICE_CONFIRMATION_LOCK:
+                if _VOICE_CONFIRMATIONS:
+                    return
+            for extra in tuple(self._extra_hooks):
+                if not user32.UnhookWindowsHookEx(extra):
+                    return
+                self._extra_hooks.remove(extra)
+            replacement = user32.SetWindowsHookExW(
+                WH_KEYBOARD_LL, self._hookproc_keepalive,
+                kernel32.GetModuleHandleW(None), 0,
+            )
+            if not replacement:
+                return
+            if not user32.UnhookWindowsHookEx(self._hook):
+                if not user32.UnhookWindowsHookEx(replacement):
+                    self._extra_hooks.append(replacement)
+                return
+            self._hook = replacement
+            global _PHYSICAL_TRACKER_HOOK_HANDLE, _PHYSICAL_TRACKER_INSTALLATION_EPOCH
+            with _PHYSICAL_KEY_STATE_LOCK:
+                if _PHYSICAL_TRACKER_OWNER is self:
+                    _PHYSICAL_TRACKER_HOOK_HANDLE = int(replacement)
+                    _PHYSICAL_TRACKER_INSTALLATION_EPOCH += 1
+                    self._installation_epoch = _PHYSICAL_TRACKER_INSTALLATION_EPOCH
+                    request["success"] = True
+        finally:
+            request["done"].set()
 
     def set_tracking_lost_callback(
         self,
@@ -1145,6 +1237,10 @@ class VoiceKeyPhysicalizer:
         start_timeout: float = 5.0,
         _run_target: Optional[Callable[[], None]] = None,
     ) -> None:
+        if self._extra_hooks:
+            raise VoiceKeyPhysicalizerUnavailableError(
+                "voice hook replacement cleanup is pending"
+            )
         if self.is_running:
             raise VoiceKeyPhysicalizerUnavailableError(
                 "voice key physicalizer is already running; call stop() first"
@@ -1201,6 +1297,10 @@ class VoiceKeyPhysicalizer:
         self._stop_event.set()
         self.clear_rc003_direction_edges()
         if self._thread is None:
+            if self._extra_hooks:
+                raise VoiceKeyPhysicalizerUnavailableError(
+                    "voice hook replacement cleanup is unconfirmed"
+                )
             return
         if sys.platform == "win32" and self._thread_id.value:
             user32 = ctypes.windll.user32  # type: ignore[attr-defined]
@@ -1215,6 +1315,10 @@ class VoiceKeyPhysicalizer:
         if not self._join_thread_or_report_alive():
             raise VoiceKeyPhysicalizerUnavailableError(
                 "voice key physicalizer thread did not stop within 2.0s"
+            )
+        if self._extra_hooks:
+            raise VoiceKeyPhysicalizerUnavailableError(
+                "voice hook replacement cleanup is unconfirmed"
             )
 
     def _run(self) -> None:
@@ -1303,6 +1407,8 @@ class VoiceKeyPhysicalizer:
                 if user32.GetMessageW(ctypes.byref(msg), None, 0, 0) <= 0:
                     unexpected_exit = not self._stop_event.is_set()
                     break
+                if int(msg.message) == _WM_REFRESH_ORDER:
+                    self._refresh_forwarding_order_on_owner(user32, kernel32)
         except BaseException as exc:  # noqa: BLE001 - surfaced to start()
             if not ready_announced:
                 self._start_error = exc
@@ -1324,6 +1430,12 @@ class VoiceKeyPhysicalizer:
                 except Exception:
                     pass
                 self._hook = None
+            for extra in tuple(self._extra_hooks):
+                try:
+                    if user32.UnhookWindowsHookEx(extra):
+                        self._extra_hooks.remove(extra)
+                except Exception:
+                    pass
 
     def _build_message_pump(self, user32):
         user32.TranslateMessage.argtypes = (ctypes.POINTER(wintypes.MSG),)
@@ -1341,6 +1453,9 @@ class VoiceKeyPhysicalizer:
                 PM_REMOVE,
             ):
                 if int(msg.message) == WM_QUIT:
+                    continue
+                if int(msg.message) == _WM_REFRESH_ORDER:
+                    self._refresh_forwarding_order_on_owner(user32, ctypes.windll.kernel32)
                     continue
                 user32.TranslateMessage(ctypes.byref(msg))
                 user32.DispatchMessageW(ctypes.byref(msg))

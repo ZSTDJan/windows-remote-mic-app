@@ -78,7 +78,7 @@ Item {
         && !root.chatterflySelected
     readonly property bool voiceHotkeyBusy: SettingsController.voiceHotkeyBusy
     readonly property bool voiceHotkeyRefreshVisible:
-        root.sogouSelected || root.wetypeSelected || root.doubaoSelected
+        root.sogouSelected || root.wetypeSelected || root.doubaoSelected || root.chatterflySelected
     readonly property bool voiceHotkeyRuntimeBusy:
         String(SettingsController.voiceRuntimeState) === "active"
         || String(SettingsController.voiceRuntimeState) === "mic_confirmed"
@@ -705,7 +705,7 @@ Item {
                         : root.sogouSelected
                         ? qsTr("自动读取%1快捷键").arg(root.voiceHotkeyModeLabel)
                         : root.chatterflySelected
-                        ? qsTr("与 Chatterfly 语音输入键一致；避开 Ctrl＋Shift 等系统切换键")
+                        ? qsTr("自动读取 Chatterfly 语音输入快捷键")
                         : qsTr("请录入按住型快捷键")
                     stateText: root.voiceHotkeyRecording
                         ? SettingsController.hotkeyCaptureReady

@@ -57,91 +57,90 @@ class ChatterflyHostTests(unittest.TestCase):
             voice_hotkeys_by_provider={"chatterfly": {"hold": "f8", "source": "manual"}},
         )
         self.owner._voice_shortcut.hotkey = SimpleNamespace(modifiers=(), key="f8")
-        self.owner._configured_voice_hotkey_backend.return_value = "marked"
-        patcher = mock.patch.object(host_module, "read_chatterfly_voice_windows", return_value=())
-        self.windows = patcher.start()
-        self.addCleanup(patcher.stop)
-        patcher = mock.patch(
-            "ovb_rc003.chromecast_wetype_toggle.win32_input.send_voice_key_combo_tap"
-        )
+        self.owner._configured_voice_hotkey_backend.return_value = "chatterfly_hotkey"
+        self.windows = mock.Mock(return_value=())
+        self.owner._voice_shortcut.chatterfly_control = SimpleNamespace(activity=self.windows)
+        patcher = mock.patch("ovb_rc003.chromecast_wetype_toggle.win32_input.send_voice_key_combo_tap")
         self.tap = patcher.start()
         self.addCleanup(patcher.stop)
 
-    def test_toggle_waits_for_visible_voice_window_and_stops_once(self):
-        self.owner._config["remote_recording_mode"] = "toggle"
-        self.host._start_host(1)
-        self.tap.assert_called_once_with(("f8",))
-        self.host.client.voice_host.assert_not_called()
-        self.windows.return_value = (visible_voice_window(),)
-        self.host._poll_host()
-        self.host.client.voice_host.assert_called_once_with(1, "ready")
-        self.host._handle({"event": "state", "attempt": 1, "data": "recording"})
-        stop = {"event": "host_stop", "attempt": 1, "data": "second_press"}
-        self.host._handle(stop)
-        self.host._handle(stop)
-        self.assertEqual(self.tap.call_count, 2)
-        self.owner._voice_shortcut.apply.assert_not_called()
+    def test_both_device_modes_use_explicit_start_stop_and_wait_for_owned_window(self):
+        for mode in ("hold", "toggle"):
+            with self.subTest(mode=mode):
+                self.owner._config["remote_recording_mode"] = mode
+                self.host._start_host(self.host.attempt + 1)
+                self.assertTrue(self.host.engaged)
+                self.assertFalse(self.host.ready_sent)
+                call = self.owner._voice_shortcut.apply.call_args
+                self.assertEqual(call.args, (voice_controller.VoiceHostAction.KEY_DOWN,))
+                self.assertEqual(call.kwargs["backend_override"], "chatterfly_hotkey")
+                self.windows.return_value = (visible_voice_window(),)
+                self.host._poll_host()
+                self.assertTrue(self.host.ready_sent)
+                self.host._handle({"event": "host_stop", "attempt": self.host.attempt,
+                                   "data": "second_press" if mode == "toggle" else "released"})
+                call = self.owner._voice_shortcut.apply.call_args
+                self.assertEqual(call.args, (voice_controller.VoiceHostAction.KEY_UP,))
+                self.assertEqual(call.kwargs["backend_override"], "chatterfly_hotkey")
+                self.assertTrue(self.host.closed)
+                self.tap.assert_not_called()
+                self.host._handle({"event": "state", "attempt": self.host.attempt, "data": "idle"})
+                self.windows.return_value = ()
 
-    def test_toggle_rejects_an_existing_voice_window(self):
-        self.owner._config["remote_recording_mode"] = "toggle"
-        self.windows.return_value = (visible_voice_window(),)
+    def test_ipc_refusal_does_not_publish_ready(self):
+        self.owner._voice_shortcut.apply.return_value = False
         self.host._start_host(1)
-        self.tap.assert_not_called()
+        self.assertFalse(self.host.engaged)
         self.host.client.voice_host.assert_called_with(1, "failed")
+        self.tap.assert_not_called()
 
-    def test_empty_provider_shortcut_never_uses_the_runtime_fallback(self):
+    def test_empty_shortcut_and_unavailable_key_hook_do_not_block_ipc(self):
         self.owner._config["voice_hotkeys_by_provider"]["chatterfly"]["hold"] = ""
-        self.owner._config["remote_recording_mode"] = "toggle"
+        self.owner._ensure_voice_key_physicalizer_for_hotkey.return_value = False
         self.host._start_host(1)
+        self.assertTrue(self.host.engaged)
+        self.owner._ensure_voice_key_physicalizer_for_hotkey.assert_not_called()
         self.tap.assert_not_called()
-        self.owner._voice_shortcut.apply.assert_not_called()
-        self.host.client.voice_host.assert_called_with(1, "failed")
 
-    def test_time_limit_stops_only_a_still_visible_voice_window(self):
-        self.owner._config["remote_recording_mode"] = "toggle"
+    def test_duplicate_end_never_dispatches_an_extra_start_or_stop(self):
         self.host._start_host(1)
         self.windows.return_value = (visible_voice_window(),)
         self.host._poll_host()
         self.host._handle({"event": "state", "attempt": 1, "data": "recording"})
-        self.host._handle({"event": "host_stop", "attempt": 1, "data": "time_limit"})
-        self.assertEqual(self.tap.call_count, 2)
+        for _ in range(2):
+            self.host._handle({"event": "host_stop", "attempt": 1, "data": "time_limit"})
+        self.assertEqual([c.args[0] for c in self.owner._voice_shortcut.apply.call_args_list],
+                         [voice_controller.VoiceHostAction.KEY_DOWN, voice_controller.VoiceHostAction.KEY_UP])
 
-    def test_time_limit_does_not_restart_an_already_hidden_voice_window(self):
-        self.owner._config["remote_recording_mode"] = "toggle"
-        self.host._start_host(1)
-        self.windows.return_value = (visible_voice_window(),)
-        self.host._poll_host()
-        self.host._handle({"event": "state", "attempt": 1, "data": "recording"})
-        self.windows.return_value = ()
-        self.host._handle({"event": "host_stop", "attempt": 1, "data": "time_limit"})
-        self.tap.assert_called_once_with(("f8",))
-
-    def test_no_visible_window_times_out_without_a_compensating_toggle(self):
-        self.owner._config["remote_recording_mode"] = "toggle"
+    def test_no_window_times_out_and_asks_same_owner_to_clean_up(self):
         with mock.patch.object(host_module.time, "monotonic", return_value=10) as clock:
             self.host._start_host(1)
             clock.return_value = 19.1
             self.host._poll_host()
         self.host.client.voice_host.assert_any_call(1, "failed")
-        self.tap.assert_called_once_with(("f8",))
+        self.assertTrue(self.host.closed)
+        self.tap.assert_not_called()
 
-    def test_hold_uses_key_edges_and_waits_for_window(self):
-        self.owner._config["remote_recording_mode"] = "hold"
+    def test_cancel_during_start_releases_same_owner_without_readiness(self):
         self.host._start_host(1)
-        self.owner._voice_shortcut.apply.assert_called_once_with(
-            voice_controller.VoiceHostAction.KEY_DOWN
-        )
-        self.host.client.voice_host.assert_not_called()
+        self.host._handle({"event": "host_stop", "attempt": 1, "data": "released"})
         self.windows.return_value = (visible_voice_window(),)
         self.host._poll_host()
-        self.host.client.voice_host.assert_called_once_with(1, "ready")
+        self.assertNotIn(mock.call(1, "ready"), self.host.client.voice_host.call_args_list)
+        self.assertTrue(self.host.closed)
+
+    def test_normal_async_close_waits_without_reporting_release_failure(self):
+        self.host._start_host(1)
+        self.owner._voice_shortcut.release_pending.return_value = False
+        self.owner._voice_shortcut.chatterfly_control.completion_pending = True
         self.host._handle({"event": "host_stop", "attempt": 1, "data": "released"})
-        self.assertEqual(
-            self.owner._voice_shortcut.apply.call_args_list,
-            [mock.call(voice_controller.VoiceHostAction.KEY_DOWN),
-             mock.call(voice_controller.VoiceHostAction.KEY_UP)],
-        )
-        self.tap.assert_not_called()
+        self.assertFalse(self.host.closed)
+        self.owner._set_runtime_voice_result.assert_called_with('finishing')
+        self.assertNotIn(mock.call(1, 'release_failed'), self.host.client.voice_host.call_args_list)
+        self.owner._voice_shortcut.release_pending.return_value = True
+        self.owner._voice_shortcut.chatterfly_control.completion_pending = False
+        self.assertTrue(self.host._stop_host())
+        self.host.client.voice_host.assert_called_with(1, 'released')
 
 
 if __name__ == "__main__":
