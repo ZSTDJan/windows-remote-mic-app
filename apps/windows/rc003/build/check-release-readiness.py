@@ -56,6 +56,16 @@ _APPROVED_PUBLIC_CONTRIBUTOR_COMMITS = frozenset({
     "2dc521834df4b30d3492f9ab5355ccf4a125b8c5",
 })
 
+# The owner approved retaining one already-public project-directory reference
+# on 2026-10-15. Pin its exact marker and immutable insertion/removal commits;
+# this does not exempt new occurrences, other markers, emails or subjects.
+_APPROVED_PUBLIC_CONTENT_COMMITS = {
+    "".join(map(chr, (0x44, 0x3A, 0x5C, 0x57, 0x75, 0x78, 0x69, 0x61, 0x6E, 0x6D, 0x61, 0x69))): frozenset({
+        "3f685c42b6a99a83162db81ef80c647fde6dfc66",
+        "f8a50650082ca25f821d57bab7bf50470de1e3ae",
+    }),
+}
+
 
 def _run_git(*args: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
@@ -126,7 +136,9 @@ def _git_history_blockers() -> list[str]:
         if matches.returncode != 0:
             blockers.append("Git history content could not be checked")
             break
-        if matches.stdout.strip():
+        matched_commits = set(matches.stdout.splitlines())
+        approved_commits = _APPROVED_PUBLIC_CONTENT_COMMITS.get(marker, frozenset())
+        if matched_commits - approved_commits:
             private_content_markers += 1
     if private_content_markers:
         blockers.append(

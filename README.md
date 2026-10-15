@@ -12,9 +12,9 @@
 
 ## 下载与版本
 
-**[下载正式版 1.0.91](https://github.com/ZSTDJan/windows-remote-mic-app/releases/download/v1.0.91/RemoteMicRC003-1.0.91-portable-unsigned.zip)** · [版本说明](https://github.com/ZSTDJan/windows-remote-mic-app/releases/tag/v1.0.91) · [SHA256SUMS.txt](https://github.com/ZSTDJan/windows-remote-mic-app/releases/download/v1.0.91/SHA256SUMS.txt)
+**[下载正式版 1.0.92](https://github.com/ZSTDJan/windows-remote-mic-app/releases/download/v1.0.92/RemoteMicRC003-1.0.92-portable-unsigned.zip)** · [版本说明](https://github.com/ZSTDJan/windows-remote-mic-app/releases/tag/v1.0.92) · [SHA256SUMS.txt](https://github.com/ZSTDJan/windows-remote-mic-app/releases/download/v1.0.92/SHA256SUMS.txt)
 
-当前正式版为 **1.0.91**。本版新增鼠标长按和按键配置管理，改进 Chatterfly 录音控制、自动快捷键更新及豆包兼容。
+当前正式版为 **1.0.92**。本版修复部分小米遥控器一直显示“点击重新连接”及连接探测停止后无法重新启动的问题，并在配置异常时保留设置窗口和日志导出。
 
 旧版可在 [历史版本](https://github.com/ZSTDJan/windows-remote-mic-app/releases) 中下载。
 
