@@ -418,10 +418,13 @@ async def select_connectable_candidate(
 ) -> identity.RC003Candidate:
     """Resolve the selected RC003 without probing other physical remotes.
 
-    Production callers pass selected_key: missing or ambiguous matches fail
-    closed. The optional-key path remains for standalone discovery diagnostics;
-    it probes ATVV only for multiple profile matches and accepts exactly one
-    reachable candidate. Neither path guesses by enumeration order.
+    Production callers pass selected_key and first restrict candidates to that
+    identity. Windows can expose multiple BLE records for the same ContainerId;
+    probe those records and accept exactly one reachable ATVV service. A single
+    record keeps the normal connection fast path. Missing identities, no usable
+    record or multiple usable records still fail closed. The optional-key path
+    remains for standalone discovery diagnostics. Neither path guesses by
+    enumeration order or falls back outside the requested selection.
     """
 
     qualifying = identity.qualifying_candidates(candidates)
@@ -430,7 +433,6 @@ async def select_connectable_candidate(
         if not remote_selection.valid_key(selected_key):
             raise identity.NoCandidateFoundError("no selected remote")
         qualifying = [candidate for candidate in qualifying if candidate.device_key == selected_key]
-        return identity.select_single_candidate(qualifying)
     if len(qualifying) <= 1:
         return identity.select_single_candidate(qualifying)
 

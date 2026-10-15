@@ -385,11 +385,15 @@ Windows 的物理边沿，不执行映射。tap 从 `READY` 变为失联或异�
 
 `ble_transport_winrt.py` 使用 WinRT 枚举已配对 BLE 设备，并通过 UNCACHED
 GATT 查询连接 ATVV voice service。生产入口先按用户选择的 ContainerId 摘要过滤，
-只连接唯一匹配的 RC003；所选设备消失或身份有歧义时失败关闭，不探测或改选其它设备。
+单条匹配直接连接；同一身份有多条 BLE 记录时，复用有界 UNCACHED ATVV 探测，
+每条最多等待八秒，只接受唯一探测成功的记录。没有可用记录或多条都可用时仍失败关闭，
+不按枚举顺序猜选，不探测或改选其它身份，也不修改 Windows 配对。探测只查询服务，
+不发送话筒开启命令；沿用临时句柄清理、取消和同一设备 ID 的在途探测限制。
 摘要与持久化合同由 `remote_selection.py` 持有；Raw Input 接口经 PnP 属性取得
 ContainerId，HID 宿主定位经节点 ContainerID 取得同一身份。共享宿主内部报告来源无法
 核实时仍拒绝接管，并显示 `selected_device_shared_host`；这不等于必须重启电脑。
-独立诊断的未传选择参数路径保留旧多候选 ATVV 探测，生产桥接不得使用该路径。
+独立诊断的未传选择参数路径保留旧多候选 ATVV 探测；生产桥接必须传选择参数，
+不能通过省略选择参数扩大探测范围。验证与人工边界见 `TESTING.md/CHECK-BLE-003`。
 
 谷歌的独立入口 `chromecast_device_windows.SelectedDevice.open_voice` 枚举所选设备的
 实时 GATT 服务，服务查询最多等待 10 秒。直接 WinRT 路径先创建所选设备的 `GattSession`

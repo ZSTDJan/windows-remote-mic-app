@@ -102,8 +102,63 @@ class SelectionContractTests(unittest.TestCase):
 
     def test_repeated_ble_entries_do_not_allow_arbitrary_selection(self):
         a = identity.RC003Candidate("", True, object(), A)
+        probe = mock.AsyncMock(return_value=True)
         with self.assertRaises(identity.AmbiguousCandidateError):
-            asyncio.run(ble_transport_winrt.select_connectable_candidate([a, a], selected_key=A))
+            asyncio.run(ble_transport_winrt.select_connectable_candidate(
+                [a, a], selected_key=A, probe=probe))
+
+    def test_ble_duplicate_records_resolve_only_within_the_selected_identity(self):
+        stale = identity.RC003Candidate("MI RC", False, SimpleNamespace(id="stale"), A)
+        live = identity.RC003Candidate("MI RC", False, SimpleNamespace(id="live"), A)
+        other = identity.RC003Candidate("MI RC", False, SimpleNamespace(id="other"), B)
+        unknown = identity.RC003Candidate("MI RC", False, SimpleNamespace(id="unknown"))
+        unsupported = identity.RC003Candidate("unsupported", False, object(), A)
+        for records in ([stale, live], [live, stale]):
+            with self.subTest(first=records[0].handle.id):
+                probe = mock.AsyncMock(side_effect=lambda candidate: candidate is live)
+                chosen = asyncio.run(ble_transport_winrt.select_connectable_candidate(
+                    [other, unknown, *records, unsupported], selected_key=A, probe=probe))
+                self.assertIs(chosen, live)
+                self.assertEqual(probe.await_args_list, [mock.call(row) for row in records])
+
+    def test_unreachable_selected_records_never_fall_back_to_another_remote(self):
+        records = [identity.RC003Candidate("MI RC", False, object(), A) for _ in range(2)]
+        other = identity.RC003Candidate("MI RC", False, object(), B)
+        probe = mock.AsyncMock(side_effect=lambda candidate: candidate is other)
+        with self.assertRaises(ble_transport_winrt.NoReachableCandidateError) as caught:
+            asyncio.run(ble_transport_winrt.select_connectable_candidate(
+                [other, *records], selected_key=A, probe=probe))
+        self.assertEqual(caught.exception.count, 2)
+        self.assertEqual(probe.await_args_list, [mock.call(row) for row in records])
+
+    def test_invalid_or_absent_selection_never_probes_other_devices(self):
+        records = [identity.RC003Candidate("MI RC", False, object(), A) for _ in range(2)]
+        for key in ("", "invalid", B):
+            with self.subTest(key=key):
+                probe = mock.AsyncMock(return_value=True)
+                with self.assertRaises(identity.NoCandidateFoundError):
+                    asyncio.run(ble_transport_winrt.select_connectable_candidate(
+                        records, selected_key=key, probe=probe))
+                probe.assert_not_called()
+
+    def test_selected_duplicate_records_use_bounded_probe_and_skip_stalled_record(self):
+        records = [identity.RC003Candidate("MI RC", False, object(), A) for _ in range(2)]
+        with mock.patch.object(ble_transport_winrt,
+                               "_candidate_has_voice_service_with_hard_timeout",
+                               side_effect=[None, True]) as probe:
+            chosen = asyncio.run(ble_transport_winrt.select_connectable_candidate(
+                records, selected_key=A, probe_timeout=0.02))
+        self.assertIs(chosen, records[1])
+        self.assertEqual(probe.await_args_list, [
+            mock.call(row, winrt=None, timeout=0.02) for row in records])
+
+    def test_cancelling_selected_record_probe_does_not_try_next_record(self):
+        records = [identity.RC003Candidate("MI RC", False, object(), A) for _ in range(2)]
+        probe = mock.AsyncMock(side_effect=asyncio.CancelledError)
+        with self.assertRaises(asyncio.CancelledError):
+            asyncio.run(ble_transport_winrt.select_connectable_candidate(
+                records, selected_key=A, probe=probe))
+        probe.assert_awaited_once_with(records[0])
 
     def test_scan_rejects_malformed_output(self):
         def child(_command, *, result_path, result_reader, **_kwargs):

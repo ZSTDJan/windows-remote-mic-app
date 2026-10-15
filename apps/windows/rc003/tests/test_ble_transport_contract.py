@@ -294,6 +294,40 @@ class SelectConnectableCandidateTests(unittest.TestCase):
         self.assertFalse(reachable)
         self.assertTrue(env.device.closed)
 
+    def test_selected_records_use_real_probe_and_release_handles_without_mic_writes(self):
+        selected_key = "a" * 64
+        env = FakeWinRTEnvironment(device_id="selected-live", name="MI RC")
+        modules = env.build_winrt_modules()
+        records = [
+            identity.RC003Candidate("MI RC", False, FakeDeviceInformation(device_id, "MI RC"), key)
+            for device_id, key in (("unselected", "b" * 64),
+                                   ("selected-stale", selected_key),
+                                   (env.device_id, selected_key))
+        ]
+        opened = []
+
+        async def from_id(device_id):
+            opened.append(device_id)
+            if device_id == "selected-stale":
+                raise OSError("private selected-stale platform detail")
+            self.assertEqual(device_id, env.device_id)
+            return env.device
+
+        modules.bluetooth_le_device.from_id_async = from_id
+        with self.assertLogs("ovb_rc003.ble_transport_winrt", level="INFO") as logs:
+            chosen = _run(select_connectable_candidate(
+                records, selected_key=selected_key, winrt=modules))
+
+        self.assertIs(chosen, records[2])
+        self.assertEqual(opened, ["selected-stale", env.device_id])
+        self.assertEqual(env.device.service_query_cache_modes, [modules.bluetooth_cache_mode.UNCACHED])
+        self.assertTrue(env.service.closed)
+        self.assertTrue(env.device.closed)
+        self.assertEqual(env.tx_characteristic.write_history, [])
+        self.assertIn("error_type=OSError", "\n".join(logs.output))
+        for private in (selected_key, "selected-live", "selected-stale", "unselected"):
+            self.assertNotIn(private, "\n".join(logs.output))
+
 
 class RejectsWrongIdDomainTests(unittest.TestCase):
     """XRBM-018 DoD 2: "the fake no longer accepts a GATT service id as a

@@ -37,6 +37,7 @@ from ovb_rc003 import (
     bridge_runtime_status,
     config,
     frida_compat,
+    identity,
     key_detection_bridge,
     key_mapping,
     logging_setup,
@@ -1034,6 +1035,39 @@ class LiveSettingsReloadTests(_AppWiringTestCase):
 
 
 class CandidateResolutionWiringTests(_AppWiringTestCase):
+    def test_selected_duplicate_records_reach_session_only_after_unique_probe(self):
+        selected_key = self.app._selected_remote_key
+        records = [identity.RC003Candidate("MI RC", False, object(), selected_key)
+                   for _ in range(2)]
+        other = identity.RC003Candidate("MI RC", False, object(), "b" * 64)
+        transport = app_module.ble_transport_winrt
+        for outcomes, error in (((False, True), None),
+                                ((False, False), transport.NoReachableCandidateError),
+                                ((True, True), identity.AmbiguousCandidateError)):
+            with self.subTest(outcomes=outcomes):
+                session = mock.Mock(connect=mock.AsyncMock(), close=mock.AsyncMock())
+                self.app._ble_session = None
+                with mock.patch.object(transport, "discover_candidates",
+                                       return_value=[other, *records]), mock.patch.object(
+                    transport, "_candidate_has_voice_service_with_hard_timeout",
+                    side_effect=outcomes,
+                ) as probe, mock.patch.object(
+                    transport, "RC003BleSession", return_value=session,
+                ) as factory:
+                    if error is None:
+                        self._loop.run_until_complete(self.app._connect_once())
+                        session.connect.assert_awaited_once_with(records[1])
+                        factory.assert_called_once()
+                        expected_state = bridge_runtime_status.BridgeConnectionState.CONNECTED
+                    else:
+                        with self.assertRaises(error):
+                            self._loop.run_until_complete(self.app._connect_once())
+                        factory.assert_not_called()
+                        expected_state = bridge_runtime_status.BridgeConnectionState.RETRY_WAIT
+                self.assertEqual([call.args[0] for call in probe.await_args_list], records)
+                status = bridge_runtime_status.read_status(self.app._config_root)
+                self.assertEqual(status.state, expected_state)
+
     def test_runtime_status_identifies_build_channels_recent_button_and_voice(self):
         self.app._runtime_raw_input_state = "ready"
         self.app._runtime_hid_tap_state = frida_compat.HidTapState.READY.value
