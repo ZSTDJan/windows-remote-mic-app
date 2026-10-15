@@ -113,7 +113,7 @@ async def probe(device_id: str, *, timeout: float) -> bool | None:
 
     if not isinstance(device_id, str) or not device_id:
         return False
-    request = (json.dumps({"device_id": device_id}) + "\n").encode("utf-8")
+    request = (json.dumps(device_id) + "\n").encode("utf-8")
     if len(request) > _MAX_REQUEST_BYTES:
         return False
     with _owners_lock:
@@ -196,8 +196,7 @@ def child_main(args: list[str]) -> int:
                 return 2
             request.extend(chunk)
         payload = json.loads(request)
-        if (not isinstance(payload, dict) or set(payload) != {"device_id"}
-                or not isinstance(payload["device_id"], str) or not payload["device_id"]):
+        if not isinstance(payload, str) or not payload:
             return 2
 
         def watch_parent():
@@ -226,7 +225,7 @@ def child_main(args: list[str]) -> int:
         logger.setLevel(logging.INFO)
         logger.addHandler(Capture())
         candidate = identity.RC003Candidate(
-            "MI RC", False, SimpleNamespace(id=payload["device_id"]))
+            "MI RC", False, SimpleNamespace(id=payload))
         try:
             reachable = asyncio.run(ble_transport_winrt._candidate_has_voice_service(candidate))
         except Exception as exc:

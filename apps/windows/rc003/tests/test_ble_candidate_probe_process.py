@@ -80,7 +80,8 @@ class CommandTests(unittest.TestCase):
         incoming.assert_not_called()
 
     def test_bad_requests_never_touch_winrt(self):
-        for value in (b"{}\n", b'{"device_id":"x", "extra":1}\n', b"bad\n", b"x" * 2049):
+        for value in (b"{}\n", b'{"device_id":"x", "extra":1}\n', b'""\n', b"null\n",
+                      b"123\n", b"bad\n", b"x" * 2049):
             chunks = iter(bytes([item]) for item in value)
             with self.subTest(value=value[:24]), mock.patch.object(worker, "_pipe_fd", return_value=0), \
                     mock.patch.object(worker.os, "read", side_effect=lambda *_: next(chunks, b"")), \

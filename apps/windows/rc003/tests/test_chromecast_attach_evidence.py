@@ -277,12 +277,18 @@ class AttachEvidenceTests(unittest.TestCase):
             checked(a.ConvertStringSecurityDescriptorToSecurityDescriptorW('D:(A;;GA;;;SY)', 1, C.byref(descriptor), None))
             checked(a.SetKernelObjectSecurity(int(child._handle), 4, descriptor))
             evidence = native.BoundedAttachEvidence(child.pid, emit)
-            with mock.patch.object(native, 'agent_candidates', return_value=({}, {'candidates': 0})):
+            # This fixture verifies native denial and its exported evidence.
+            # A busy desktop can spend the normal 250 ms budget on the first
+            # controller read, correctly timing out before the denied query.
+            # Deadline behavior is covered separately by the blocked-query tests.
+            with mock.patch.object(native, 'agent_candidates', return_value=({}, {'candidates': 0})), \
+                 mock.patch.object(native, 'BEFORE_WAIT_SECONDS', 2), \
+                 mock.patch.object(native, 'AFTER_WAIT_SECONDS', 2):
                 evidence.begin()
                 evidence.finish(RuntimeError('the connection is closed'))
                 self.assertTrue(evidence.done.wait(2))
             denied = [r for r in rows if r['step'] == 'attach_process_before']
-            self.assertEqual(len(denied), 1)
+            self.assertEqual(len(denied), 1, rows)
             if denied[0]['state'] != 'failed':
                 self.skipTest('caller already has process DACL bypass privilege')
             self.assertEqual(denied[0]['native_code'], 5)
