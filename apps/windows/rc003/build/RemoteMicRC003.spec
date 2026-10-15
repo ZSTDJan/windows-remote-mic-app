@@ -263,6 +263,7 @@ hiddenimports = [
     "ovb_rc003.voice_hotkey_sync_windows",
     "ovb_rc003.voice_program_manager",
     "ovb_rc003.ble_transport_winrt",
+    "ovb_rc003.ble_candidate_probe_process",
     "ovb_rc003.raw_input_windows",
     "ovb_rc003.audio_playback",
     "ovb_rc003.win32_input",

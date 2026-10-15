@@ -38,6 +38,10 @@ built from the standalone ``src/launcher.py`` entry point - see XRBM-021):
                    modules used by the settings window and verifies the
                    frozen main QML file exists. It constructs no window and
                    touches no BLE/HID/audio resource.
+- ``--probe-rc003-candidate``  HIDDEN disposable ATVV query worker. One
+                  device ID arrives through an inherited anonymous pipe;
+                  it never opens the desktop or acquires bridge ownership.
+                  Cancellation/timeout is handled by its owning parent.
 - ``--diagnose-ble-candidates <result-path>``  HIDDEN, undocumented in
                   ``--help`` on purpose (XRBM-035 RETRY 1): the settings
                   window's "检查与修复" page's BLE candidate check
@@ -807,6 +811,14 @@ def _handoff_previous_application(
 
 def main() -> None:
     args = dev_session.consume_marker(sys.argv[1:])
+    if "--probe-rc003-candidate" in args:
+        import os
+        from . import ble_candidate_probe_process
+        if args[0] != ble_candidate_probe_process.FLAG:
+            raise SystemExit(2)
+        # The query has already closed its GATT handles. Avoid interpreter
+        # teardown waiting on the daemon watcher reading the parent pipe.
+        os._exit(ble_candidate_probe_process.child_main(args[1:]))
     if "--capture-hotkey-worker" in args:
         from . import hotkey_capture_process
         if args[0] != hotkey_capture_process.FLAG:
