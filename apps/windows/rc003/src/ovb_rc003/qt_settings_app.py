@@ -9698,6 +9698,11 @@ def _load_qt_classes() -> dict:
                 or self._settings_controller._application_exit_intent.is_set()
             ):
                 return
+            if bridge_launcher.in_process_bridge_cleanup_failed():
+                self._set_vb_cable_test_state(
+                    "fail", bridge_launcher.CLEANUP_FAILED_TEXT, running=False,
+                )
+                return
             if self._driver_action_running:
                 self._set_vb_cable_test_state(
                     "fail",

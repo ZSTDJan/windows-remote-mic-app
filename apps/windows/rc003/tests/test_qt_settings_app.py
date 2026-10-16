@@ -2126,6 +2126,19 @@ class SettingsControllerTests(unittest.TestCase):
         self.assertFalse(controller._mapping_auto_save_scheduled)
         controller.requestApplicationExit.assert_not_called()
 
+    def test_full_exit_finishes_when_bridge_cleanup_failed(self):
+        for running in (False, True):
+            with self.subTest(running=running):
+                controller, _model = self._make_controller()
+                ready = []
+                controller.applicationExitReady.connect(lambda: ready.append(True))
+                with mock.patch.object(qt_settings_app.single_instance, "bridge_instance_running", return_value=running), \
+                        mock.patch.object(bridge_launcher, "_in_process_restart_blocked", True), \
+                        mock.patch.object(bridge_launcher, "stop_in_process_bridge", return_value=True):
+                    controller.requestApplicationExit()
+                self.assertEqual(ready, [True])
+                self.assertTrue(controller.applicationExitConfirmed)
+
     def test_full_exit_waits_for_the_bridge_to_stop(self):
         controller, _model = self._make_controller()
         ready = []
@@ -9121,6 +9134,22 @@ class DiagnosticsControllerTests(unittest.TestCase):
         self.assertEqual(diag.vbCableTestStatus, "fail")
         self.assertIn("临时停止", diag.vbCableTestMessage)
         loopback.assert_not_called()
+
+    def test_vb_cable_channel_test_refuses_retained_resources_after_worker_exit(self):
+        settings_controller = self._make_settings_controller()
+        diag = self.DiagnosticsController(settings_controller, self._config_root)
+        self._pump_until(lambda: not diag.isRefreshing)
+        with mock.patch.object(settings_controller, "_refresh_bridge_status", return_value=False), \
+                mock.patch.object(bridge_launcher, "_in_process_restart_blocked", True), \
+                mock.patch.object(windows_diagnostics, "check_vb_cable_loopback_isolated") as loopback, \
+                mock.patch.object(bridge_launcher, "launch_in_process_bridge") as restart:
+            for start in (diag.testVbCableChannel, diag.testVbCableChannelWithBridgeRestart):
+                start()
+                self.assertFalse(diag.vbCableTestRunning)
+                self.assertEqual(diag.vbCableTestStatus, "fail")
+                self.assertIn("完全退出", diag.vbCableTestMessage)
+            loopback.assert_not_called()
+            restart.assert_not_called()
 
     def test_vb_cable_channel_test_temporarily_stops_and_restores_bridge(self):
         settings_controller = self._make_settings_controller()

@@ -7224,6 +7224,29 @@ class InputLifecycleTests(_AppWiringTestCase):
 class CleanupOwnershipTests(_AppWiringTestCase):
     """BLE retries clean BLE/audio state without tearing down input."""
 
+    def test_unreleased_voice_owner_cannot_be_hidden_by_worker_replacement(self):
+        launcher = app_module.bridge_launcher
+        self.app._voice_shortcut.pending_tokens = ("ralt",)
+        physicalizer = self.app._voice_shortcut.doubao_physicalizer
+        tracker = _FakeVoicePhysicalizer()
+        tracker.is_running = True
+        self.app._voice_key_physicalizer = tracker
+        listener = _FakeHidListener()
+        self.app._hid_listener = listener
+        handle = launcher._InProcessBridgeHandle()
+        with mock.patch.object(launcher, "_in_process_restart_blocked", False), \
+                mock.patch.object(launcher.single_instance, "BridgeInstanceGuard"), \
+                mock.patch.object(self.app._voice_shortcut, "release_pending", return_value=False), \
+                mock.patch.object(app_module, "main", side_effect=lambda **_kwargs: self.app._stop_input_channels()), \
+                mock.patch.object(launcher.threading, "Thread") as replacement:
+            launcher._run_in_process_bridge(handle)
+            result = launcher.start_in_process_bridge(grace_checks=0)
+            self.assertEqual(result.exit_code, launcher.single_instance.CLEANUP_FAILED_EXIT_CODE)
+            physicalizer.stop.assert_not_called()
+            self.assertEqual(tracker.stop_calls, 0)
+            self.assertEqual(listener.stop_calls, 0)
+            replacement.assert_not_called()
+
     def test_ble_cleanup_keeps_input_owner_and_clears_ble_audio(self):
         hid = _FakeHidListener()
         self.app._hid_listener = hid

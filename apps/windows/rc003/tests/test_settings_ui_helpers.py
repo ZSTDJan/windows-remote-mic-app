@@ -978,6 +978,17 @@ class DescribeLaunchResultTests(unittest.TestCase):
         quick_exit_text = describe_launch_result(quick_exit_result)
         self.assertNotEqual(already_running_text, quick_exit_text)
 
+    def test_cleanup_failure_explains_full_exit_instead_of_suggesting_more_restarts(self):
+        result = bridge_launcher.LaunchResult(
+            outcome=bridge_launcher.LaunchOutcome.QUICK_EXIT,
+            command=("<in-process-bridge>",),
+            exit_code=single_instance.CLEANUP_FAILED_EXIT_CODE,
+        )
+        text = describe_launch_result(result)
+        self.assertIn("未清理完成", text)
+        self.assertIn("完全退出", text)
+        self.assertIn("重新打开", text)
+
     def test_quick_exit_preserves_the_real_exit_code_and_points_at_the_log(self):
         result = bridge_launcher.LaunchResult(
             outcome=bridge_launcher.LaunchOutcome.QUICK_EXIT,

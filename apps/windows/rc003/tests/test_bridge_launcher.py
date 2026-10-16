@@ -263,6 +263,46 @@ class LaunchBridgeTests(unittest.TestCase):
 
 
 class InProcessBridgeHandleTests(unittest.TestCase):
+    def test_input_cleanup_failure_blocks_replacement_but_not_worker_exit(self):
+        from ovb_rc003.app import CleanupIncompleteError
+
+        handle = bridge_launcher._InProcessBridgeHandle()
+        with mock.patch.object(bridge_launcher, "_in_process_restart_blocked", False), \
+                mock.patch.object(bridge_launcher, "_in_process_handle", handle), \
+                mock.patch.object(single_instance, "BridgeInstanceGuard"), \
+                mock.patch("ovb_rc003.app.main", side_effect=CleanupIncompleteError("owned input remains")), \
+                mock.patch.object(bridge_launcher.threading, "Thread") as replacement:
+            bridge_launcher._run_in_process_bridge(handle)
+
+            self.assertTrue(handle.wait(0))
+            self.assertEqual(handle.poll(), single_instance.CLEANUP_FAILED_EXIT_CODE)
+            self.assertTrue(bridge_launcher.in_process_bridge_cleanup_failed())
+            for launch in (bridge_launcher.start_in_process_bridge,
+                           bridge_launcher.start_bridge_launch,
+                           bridge_launcher.launch_in_process_bridge):
+                with self.subTest(launch=launch.__name__):
+                    result = launch(grace_checks=0)
+                    self.assertEqual(result.outcome, bridge_launcher.LaunchOutcome.QUICK_EXIT)
+                    self.assertEqual(result.exit_code, single_instance.CLEANUP_FAILED_EXIT_CODE)
+            replacement.assert_not_called()
+            self.assertIsNone(bridge_launcher.stop_in_process_bridge(reason="application_exit"))
+            self.assertTrue(bridge_launcher.in_process_bridge_cleanup_failed())
+
+    def test_clean_worker_can_start_again_without_a_sticky_failure(self):
+        with mock.patch.object(bridge_launcher, "_in_process_restart_blocked", False), \
+                mock.patch.object(bridge_launcher, "_in_process_handle", None), \
+                mock.patch.object(single_instance, "BridgeInstanceGuard"), \
+                mock.patch("ovb_rc003.app.main") as run:
+            for _ in range(2):
+                result = bridge_launcher.start_in_process_bridge(grace_checks=0)
+                handle = bridge_launcher._in_process_handle
+                self.assertTrue(handle.wait(2))
+                handle._thread.join(2)
+                self.assertEqual(result.outcome, bridge_launcher.LaunchOutcome.STARTED)
+                self.assertEqual(handle.poll(), 0)
+                self.assertFalse(bridge_launcher.in_process_bridge_cleanup_failed())
+            self.assertEqual(run.call_count, 2)
+
     def test_default_product_launch_uses_the_in_process_worker(self):
         expected = bridge_launcher.LaunchResult(
             outcome=bridge_launcher.LaunchOutcome.STARTED,

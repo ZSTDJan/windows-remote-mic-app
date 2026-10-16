@@ -3,12 +3,40 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from ovb_rc003 import bridge_runtime_status
+from ovb_rc003 import bridge_launcher, bridge_runtime_status
 from ovb_rc003 import bridge_control_windows as control
 from ovb_rc003 import single_instance
 
 
 class BridgeControlWindowsTests(unittest.TestCase):
+    def test_retained_input_blocks_reuse_even_after_the_worker_has_finished(self):
+        for reason in ("user_restart", "automatic_restart", "device_change", "audio_test", "legacy_replacement"):
+            for stopped in (True, None):
+                with self.subTest(reason=reason, stopped=stopped), \
+                        tempfile.TemporaryDirectory() as raw, \
+                        mock.patch.object(bridge_launcher, "_in_process_restart_blocked", True), \
+                        mock.patch.object(bridge_launcher, "stop_in_process_bridge", return_value=stopped):
+                    result = control.request_bridge_exit(
+                        reason=reason, platform="win32", runtime_status_root=Path(raw),
+                        bridge_running=lambda: self.fail("must not fall back to a legacy process"),
+                    )
+                    self.assertFalse(result.stopped)
+                    self.assertTrue(result.cleanup_failed)
+                    self.assertIn("完全退出", result.error)
+
+    def test_cleanup_failure_allows_full_exit_only_after_the_worker_finishes(self):
+        for stopped in (True, None, False):
+            with self.subTest(stopped=stopped), tempfile.TemporaryDirectory() as raw, \
+                    mock.patch.object(bridge_launcher, "_in_process_restart_blocked", True), \
+                    mock.patch.object(bridge_launcher, "stop_in_process_bridge", return_value=stopped):
+                result = control.request_bridge_exit(
+                    reason="application_exit", platform="win32", runtime_status_root=Path(raw),
+                    bridge_running=lambda: False,
+                )
+                self.assertEqual(result.stopped, stopped is not False)
+                if stopped is False:
+                    self.assertIn("限定时间", result.error)
+
     def test_already_stopped_needs_no_window_message(self):
         result = control.request_bridge_exit(
             platform="win32",

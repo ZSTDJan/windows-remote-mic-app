@@ -39,6 +39,7 @@ from . import (
     key_mapping,
     logging_setup,
     product_identity,
+    single_instance,
     win32_keys,
 )
 
@@ -726,6 +727,8 @@ def describe_launch_result(result: bridge_launcher.LaunchResult) -> str:
         pid_text = f"（PID {result.pid}）" if result.pid is not None else ""
         return f"服务已创建{pid_text}，但状态未知；请查看 app.log，勿重复启动"
     if result.outcome is bridge_launcher.LaunchOutcome.QUICK_EXIT:
+        if result.exit_code == single_instance.CLEANUP_FAILED_EXIT_CODE:
+            return bridge_launcher.CLEANUP_FAILED_TEXT
         return f"服务启动后立即退出（代码 {result.exit_code}）；请查看 app.log"
     # LAUNCH_FAILED
     return f"服务启动失败：{result.error}；请查看 app.log"

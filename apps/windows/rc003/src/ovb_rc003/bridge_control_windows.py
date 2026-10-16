@@ -131,13 +131,21 @@ def request_bridge_exit(
 
         stop_internal = lambda **kwargs: bridge_launcher.stop_in_process_bridge(reason=reason, **kwargs)
 
-    from .bridge_launcher import stop_reason
+    from .bridge_launcher import (
+        CLEANUP_FAILED_TEXT, in_process_bridge_cleanup_failed, stop_reason,
+    )
     try:
         logging.getLogger("ovb_rc003").info("bridge exit intent: reason=%s", stop_reason(reason))
     except Exception:
         pass  # Diagnostic logging never blocks a requested stop.
 
     internal_stopped = stop_internal(timeout=timeout)
+    if (production_stop and in_process_bridge_cleanup_failed()
+            and reason not in {"application_exit", "process_exit"}):
+        # Restart, device changes and audio tests reuse this desktop process.
+        # Full exit may still finish once the worker has ended: it creates no
+        # replacement owner, and process termination retires the old hooks.
+        return BridgeExitResult(True, False, CLEANUP_FAILED_TEXT, True)
     if internal_stopped is not None:
         if internal_stopped:
             return _finish_stopped_bridge(

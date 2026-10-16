@@ -25,6 +25,7 @@ SETTINGS_LAUNCH_FLAG = "--bridge-from-settings"
 
 DEFAULT_GRACE_CHECKS = 10
 DEFAULT_POLL_INTERVAL_SECONDS = 0.15
+CLEANUP_FAILED_TEXT = "上次服务未清理完成，请从通知区域完全退出无线麦后重新打开。"
 
 
 class BridgeLaunchConfigurationError(Exception):
@@ -275,7 +276,7 @@ def _run_in_process_bridge(handle: _InProcessBridgeHandle) -> None:
     global _in_process_restart_blocked
 
     exit_code = 0
-    mutex_cleanup_failed = False
+    cleanup_failed = False
     try:
         with single_instance.BridgeInstanceGuard():
             app.main(
@@ -289,16 +290,35 @@ def _run_in_process_bridge(handle: _InProcessBridgeHandle) -> None:
         exit_code = single_instance.DUPLICATE_INSTANCE_EXIT_CODE
     except single_instance.SingleInstanceUnavailableError:
         exit_code = single_instance.GUARD_UNAVAILABLE_EXIT_CODE
-    except single_instance.MutexCleanupError:
+    except (single_instance.MutexCleanupError, app.CleanupIncompleteError) as exc:
         exit_code = single_instance.CLEANUP_FAILED_EXIT_CODE
-        mutex_cleanup_failed = True
+        cleanup_failed = True
+        try:
+            logging.getLogger("ovb_rc003").error(
+                "bridge cleanup failed; new service starts blocked until application exit: error_type=%s",
+                type(exc).__name__,
+            )
+        except Exception:
+            pass  # Logging must not prevent the restart gate or worker completion.
     except BaseException:  # noqa: BLE001 - worker failure must not report success
         exit_code = 1
     finally:
-        if mutex_cleanup_failed:
+        if cleanup_failed:
             with _in_process_lock:
                 _in_process_restart_blocked = True
         handle.finish(exit_code)
+
+
+def in_process_bridge_cleanup_failed() -> bool:
+    """Report retained process-lifetime resources, even after the worker exits.
+
+    A finished worker/mutex does not prove that its input owners stopped.
+    Only desktop-process exit retires this failure; a replacement worker
+    must never install another set of hooks over those retained owners.
+    """
+
+    with _in_process_lock:
+        return _in_process_restart_blocked
 
 
 def in_process_bridge_running() -> bool:
