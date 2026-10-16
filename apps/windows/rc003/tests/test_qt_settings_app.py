@@ -15366,7 +15366,7 @@ class RenderedContrastTests(unittest.TestCase):
 # Proves, against the real rendered ButtonsPage, that the compact left/right
 # card board remains contained, keeps three equal gesture cells, and shares
 # selection with the calibrated product photo.
-_MAPPING_CARD_BOARD_PROBE_SCRIPT = r"""
+_MAPPING_CARD_BOARD_SETUP_SCRIPT = r"""
 import json
 import os
 
@@ -15422,6 +15422,15 @@ SettingsController = classes["SettingsController"]
 DiagnosticsController = classes["DiagnosticsController"]
 
 QQuickStyle.setStyle(os.environ["RC003_TEST_STYLE"])
+profile = os.environ.get("RC003_TEST_MAPPING_PROFILE")
+if profile:
+    from ovb_rc003 import remote_selection
+    settings = m.config.default_config()
+    settings[remote_selection.KEY] = dict(
+        schema=1, active="a" * 64,
+        devices=[dict(key="a" * 64, profile=profile)],
+    )
+    m.config.save_config(m.config.config_path(), settings)
 app = QGuiApplication.instance() or QGuiApplication([])
 model = ButtonMappingModel()
 controller = SettingsController(model)
@@ -15468,6 +15477,9 @@ assert left_cards is not None and right_cards is not None
 assert photo_sidebar is not None, "photoSidebar not found"
 assert photo_frame is not None and photo_frame.property("visible"), "photoFrame not visible"
 assert photo_image is not None and photo_image.property("visible"), "photoImage not visible"
+"""
+
+_MAPPING_CARD_BOARD_PROBE_SCRIPT = _MAPPING_CARD_BOARD_SETUP_SCRIPT + r"""
 assert mapping_list.property("count") == 13
 assert mapping_list.property("visible")
 assert rc003_device_button.property("highlighted")
@@ -15648,9 +15660,56 @@ print(json.dumps(results_out))
 """
 
 
+_MAPPING_CARD_BOUNDS_PROBE_SCRIPT = _MAPPING_CARD_BOARD_SETUP_SCRIPT + r"""
+results = []
+for width in (640, 641, 720, 721, 722, 723, 1023, 1024):
+    window.setWidth(width)
+    _render(window, app)
+    viewport = _geometry(mapping_list)
+    scrollbar = _geometry(_find(window, "mappingScrollBar"))
+    count = 0
+    for column in (left_cards, right_cards):
+        for card in column.childItems():
+            if not card.objectName().startswith("editMapping_") or not card.isVisible():
+                continue
+            count += 1
+            for item in (card, card.property("background")):
+                bounds = _geometry(item)
+                assert bounds["x"] >= viewport["x"] - .01, (width, bounds, viewport)
+                assert bounds["right"] <= viewport["right"] + .01, (width, bounds, viewport)
+                assert bounds["right"] <= scrollbar["x"] + .01, (width, bounds, scrollbar)
+    assert count == (13 if controller.isRc003Device else 15), count
+    assert mapping_list.property("clip")
+    assert abs(left_cards.width() - right_cards.width()) < .01
+    results.append(dict(width=window.width(), viewport=viewport, count=count))
+controller.shutdownBackgroundTasks()
+m._shutdown_diagnostics_workers()
+print(json.dumps(results))
+"""
+
+
 @unittest.skipUnless(_HAS_PYSIDE6, _SKIP_REASON)
 class ButtonsPageMappingCardTests(unittest.TestCase):
     """The compact card board, photo marker, and real editor stay connected."""
+
+    def test_cards_stay_inside_the_clip_at_adjacent_window_widths(self):
+        import subprocess
+
+        for profile in ("xiaomi-rc003", "chromecast-remote"):
+            with self.subTest(profile=profile), tempfile.TemporaryDirectory() as directory:
+                env = dict(os.environ)
+                env.update(
+                    QT_QPA_PLATFORM="offscreen", LOCALAPPDATA=directory,
+                    RC003_DISABLE_LIVE_INPUT="1", RC003_TEST_MAPPING_PROFILE=profile,
+                    RC003_TEST_VIEWPORT_WIDTH="721", RC003_TEST_VIEWPORT_HEIGHT="500",
+                    RC003_TEST_STYLE="FluentWinUI3",
+                )
+                result = subprocess.run(
+                    [sys.executable, "-c", _MAPPING_CARD_BOUNDS_PROBE_SCRIPT],
+                    env=env, capture_output=True, text=True, timeout=120,
+                )
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(len(json.loads(result.stdout.strip().splitlines()[-1])), 8)
 
     def _run_probe(self, width=1024, height=720, style="Basic"):
         import json

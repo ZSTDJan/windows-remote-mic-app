@@ -18,6 +18,11 @@ Item {
     readonly property real mappingCardGap: 2
     readonly property real mappingBoardGap: 6
     readonly property real mappingPhotoColumnWidth: 114
+    // GridLayout rounds child widths to whole logical pixels. Keep both
+    // columns integral so the rightmost card cannot grow past the clip.
+    readonly property int mappingCardColumnWidth: Math.floor(
+        (mappingList.width - mappingPhotoColumnWidth - mappingBoardGap * 2) / 2
+    )
     readonly property real mappingKeyLabelWidth: 56
     property bool connectorRepaintQueued: false
     property var backTabTarget: null
@@ -1242,7 +1247,7 @@ Item {
                     objectName: "leftMappingCards"
                     anchors.left: parent.left
                     anchors.verticalCenter: parent.verticalCenter
-                    width: (parent.width - photoSidebar.width - root.mappingBoardGap * 2) / 2
+                    width: root.mappingCardColumnWidth
                     columns: 1
                     rows: SettingsController.isRc003Device ? 6 : 7
                     rowSpacing: root.mappingCardGap
@@ -1463,7 +1468,7 @@ Item {
                     objectName: "rightMappingCards"
                     anchors.right: parent.right
                     anchors.verticalCenter: parent.verticalCenter
-                    width: (parent.width - photoSidebar.width - root.mappingBoardGap * 2) / 2
+                    width: root.mappingCardColumnWidth
                     columns: 1
                     rows: SettingsController.isRc003Device ? 7 : 8
                     rowSpacing: root.mappingCardGap
