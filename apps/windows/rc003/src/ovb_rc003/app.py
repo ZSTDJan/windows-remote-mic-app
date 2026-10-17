@@ -795,15 +795,20 @@ class RC003App:
         )
         self._set_runtime_voice_active(False)
         stage = "discover_candidates"
+        from .ble_connection_diagnostics import ConnectionDiagnostics
+        connection_evidence = ConnectionDiagnostics(selected_key=self._selected_remote_key)
         try:
             self._logger.info("startup: resolving RC003 identity")
-            candidates = await ble_transport_winrt.discover_candidates(with_device_keys=True)
+            with connection_evidence.step("discover_candidates") as evidence:
+                candidates = await ble_transport_winrt.discover_candidates(with_device_keys=True)
+                evidence["item_count"] = len(candidates)
             # The selection is fixed for this service lifetime. Reconnection
             # must never probe or select a different physical remote.
             stage = "select_connectable_candidate"
-            candidate = await ble_transport_winrt.select_connectable_candidate(
-                candidates, selected_key=self._selected_remote_key
-            )
+            with connection_evidence.step("select_candidate"):
+                candidate = await ble_transport_winrt.select_connectable_candidate(
+                    candidates, selected_key=self._selected_remote_key
+                )
             self._logger.info("startup: exactly one RC003 candidate resolved")
 
             stage = "create_ble_session"
@@ -833,6 +838,7 @@ class RC003App:
                     _ble_generation=callback_generation,
                 ),
                 gain_db=float(self._config["gain_db"]),
+                diagnostics=connection_evidence,
             )
             stage = "connect_gatt"
             await self._ble_session.connect(candidate)

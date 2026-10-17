@@ -42,6 +42,8 @@ async def query(candidate, winrt=None):
             bluetooth_le_device=SimpleNamespace(from_id_async=unavailable)))
     if {failure!r} == "worker":
         raise RuntimeError("private-worker-error-text")
+    if {failure!r} == "exit":
+        os._exit(2)
     return candidate.handle.id == "private-live-record"
 original_query = transport._candidate_has_voice_service
 transport._candidate_has_voice_service = query
@@ -260,10 +262,21 @@ class NativeProcessTests(unittest.TestCase):
         logger.addHandler(handler)
         logger.setLevel(logging.INFO)
         try:
-            for failure in ("native", "worker"):
+            for failure in ("native", "worker", "exit"):
                 command = self.command(failure=failure)
                 with mock.patch.object(worker, "_command", return_value=command):
                     self.assertFalse(asyncio.run(worker.probe("private-live-record", timeout=5)))
+            with mock.patch.object(worker, "_command", return_value=self.command(blocked=True)):
+                self.assertIsNone(asyncio.run(worker.probe("private-live-record", timeout=1)))
+            self.marker.unlink(missing_ok=True)
+            async def cancel_running():
+                task = asyncio.create_task(worker.probe("private-live-record", timeout=30))
+                await wait_until(self.marker.exists)
+                task.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await task
+            with mock.patch.object(worker, "_command", return_value=self.command(blocked=True)):
+                asyncio.run(cancel_running())
             destination = root / "export.zip"
             result = log_export.export_logs(destination, root=root)
             self.assertEqual(result.outcome, "exported")
@@ -271,6 +284,17 @@ class NativeProcessTests(unittest.TestCase):
                 text = archive.read("app.log").decode("utf-8")
             self.assertIn("ATVV candidate probe unavailable: error_type=OSError", text)
             self.assertIn("ATVV candidate probe worker failed: error_type=RuntimeError", text)
+            rows = [json.loads(line.split("BLE diagnostic: ", 1)[1])
+                    for line in text.splitlines() if "BLE diagnostic: " in line]
+            self.assertTrue(any(row["scope"] == "probe" and row["stage"] == "open_device"
+                                and row["state"] == "exception" and row["errors"][0]["error_type"] == "OSError"
+                                for row in rows))
+            self.assertTrue(any(row["stage"] == "candidate_probe" and row["state"] == "timeout"
+                                and row["process_exited"] == 1 for row in rows))
+            self.assertTrue(any(row["stage"] == "candidate_probe" and row["state"] == "cancelled"
+                                and row["process_exited"] == 1 for row in rows))
+            self.assertTrue(any(row.get("reason") == "probe_exit_failed" and row["exit_code"] == 2
+                                and row["process_exited"] == 1 for row in rows))
             self.assertNotIn("private-", text)
         finally:
             handler.close()

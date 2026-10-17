@@ -18,6 +18,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -149,6 +150,24 @@ def _diagnostic_environment() -> dict:
         return fields
     version = sys.getwindowsversion()
     fields["windows_version"] = list(version.platform_version)
+    fields["windows_version_source"] = "kernel32_file_version"
+    # Fixed local registry values only. WMI is deliberately avoided on this
+    # startup worker; a component build is not the operating-system release.
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
+                r"SOFTWARE\Microsoft\Windows NT\CurrentVersion") as key:
+            build = winreg.QueryValueEx(key, "CurrentBuildNumber")[0]
+            if isinstance(build, str) and re.fullmatch(r"[0-9]{4,6}", build):
+                fields["windows_os_build"] = int(build)
+            revision = winreg.QueryValueEx(key, "UBR")[0]
+            if type(revision) is int and 0 <= revision <= 0xffffffff:
+                fields["windows_os_revision"] = revision
+            release = winreg.QueryValueEx(key, "DisplayVersion")[0]
+            if isinstance(release, str) and re.fullmatch(r"[0-9]{2}H[12]", release):
+                fields["windows_release"] = release
+    except Exception as exc:
+        fields["windows_release_error_type"] = type(exc).__name__
     try:
         fields["elevated"] = hid_elevation_windows.query_process_elevated()
     except Exception as exc:

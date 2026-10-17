@@ -17,6 +17,7 @@ import sys
 import threading
 import time
 from dataclasses import dataclass
+from . import ble_connection_diagnostics as connection_evidence
 
 FLAG = "--probe-rc003-candidate"
 _MAX_REQUEST_BYTES = 2048
@@ -92,29 +93,46 @@ def _read_diagnostics(process: subprocess.Popen) -> bool:
         if len(raw) > _MAX_DIAGNOSTIC_BYTES:
             return False
         records = json.loads(raw)
-        if not isinstance(records, list) or len(records) > len(_PROBE_LOG_MESSAGES):
+        if not isinstance(records, list) or len(records) > len(_PROBE_LOG_MESSAGES) + 3:
             return False
         for row in records:
+            if (isinstance(row, list) and len(row) == 2 and row[0] == "evidence"
+                    and connection_evidence.valid_record(row[1]) and row[1]["scope"] == "probe"):
+                continue
             if (not isinstance(row, list) or len(row) != 2 or row[0] not in _PROBE_LOG_MESSAGES
                     or not isinstance(row[1], str) or len(row[1]) > 80
                     or not row[1].isascii() or not row[1].isidentifier()):
                 return False
         logger = logging.getLogger("ovb_rc003.ble_transport_winrt")
         for stage, error_type in records:
-            logger.info(_PROBE_LOG_MESSAGES[stage], error_type)
+            if stage == "evidence":
+                connection_evidence.replay(error_type)
+            else:
+                logger.info(_PROBE_LOG_MESSAGES[stage], error_type)
         return True
     except (OSError, ValueError, TypeError):
         return False
 
 
 async def probe(device_id: str, *, timeout: float) -> bool | None:
+    with connection_evidence.ConnectionDiagnostics(scope="probe").step("candidate_probe") as evidence:
+        result = await _probe_owned(device_id, timeout=timeout, evidence=evidence)
+        if result is not True and "_state" not in evidence:
+            evidence["_state"] = "failed"
+            evidence.setdefault("reason", "probe_unreachable" if result is False else "probe_busy")
+        return result
+
+
+async def _probe_owned(device_id: str, *, timeout: float, evidence: dict) -> bool | None:
     """Return after exit; None means timeout or another active owner of this ID."""
     from .windows_diagnostics import _popen_kwargs
 
     if not isinstance(device_id, str) or not device_id:
+        evidence["reason"] = "probe_request_invalid"
         return False
     request = (json.dumps(device_id) + "\n").encode("utf-8")
     if len(request) > _MAX_REQUEST_BYTES:
+        evidence["reason"] = "probe_request_invalid"
         return False
     with _owners_lock:
         previous = _owners.get(device_id)
@@ -134,23 +152,33 @@ async def probe(device_id: str, *, timeout: float) -> bool | None:
         kwargs.update(stdin=subprocess.PIPE, stdout=subprocess.PIPE, env=env, bufsize=0)
         owner.process = subprocess.Popen(command, **kwargs)
         process = owner.process
+        connection_evidence.read_number(evidence, "probe_pid", process, "pid")
         if process.stdin.write(request) != len(request):
             return False
         deadline = time.monotonic() + max(0.001, float(timeout))
         while process.poll() is None:
             if time.monotonic() >= deadline:
+                evidence.update(_state="timeout", reason="probe_timeout_or_busy", evidence_partial=True)
                 return None
             await asyncio.sleep(_POLL_SECONDS)
-        if process.returncode not in (0, 1) or not _read_diagnostics(process):
+        if process.returncode not in (0, 1):
+            evidence.update(reason="probe_exit_failed", evidence_partial=True)
+            return False
+        if not _read_diagnostics(process):
+            evidence.update(reason="diagnostic_unavailable", evidence_partial=True)
             return False
         return process.returncode == 0
     except asyncio.CancelledError:
         cancelled = True
+        evidence["evidence_partial"] = True
         raise
     finally:
         # Synchronous bounded cleanup cannot be interrupted by another task
         # cancellation. The GUI owns a different thread from this bridge loop.
         exited = _reap(owner)
+        evidence["process_exited"] = int(exited)
+        if owner.process is not None:
+            connection_evidence.read_number(evidence, "exit_code", owner.process, "returncode")
         with _owners_lock:
             owner.active = False
             if exited and _owners.get(device_id) is owner:
@@ -211,9 +239,21 @@ def child_main(args: list[str]) -> int:
         from types import SimpleNamespace
         from . import ble_transport_winrt, identity
         records = []
+        observations = {}
 
         class Capture(logging.Handler):
             def emit(self, record):
+                if record.msg == connection_evidence.MESSAGE:
+                    try:
+                        row = json.loads(record.args[0])
+                        if connection_evidence.valid_record(row) and row["state"] != "begin":
+                            if row["stage"] in {"open_device", "services"}:
+                                observations[row["stage"]] = row
+                            if row["state"] in {"exception", "failed", "timeout"}:
+                                observations.setdefault("failure", row)
+                    except Exception:
+                        pass
+                    return
                 for stage, message in _PROBE_LOG_MESSAGES.items():
                     if record.msg == message and not any(row[0] == stage for row in records):
                         error_type = record.args[0]
@@ -232,7 +272,24 @@ def child_main(args: list[str]) -> int:
             logger.info(_PROBE_LOG_MESSAGES["worker"], type(exc).__name__)
             reachable = False
         outgoing = _pipe_fd("stdout", -11, os.O_WRONLY)
-        payload = json.dumps(records).encode("utf-8")
+        # The parent waits for exit before reading; keep the original 2 KiB
+        # bound so the child cannot block on a full anonymous output pipe.
+        omitted = False
+        for key in ("failure", "services", "open_device"):
+            row = observations.get(key)
+            item = ["evidence", row]
+            if row is not None and item not in records:
+                if len(json.dumps(records + [item], separators=(",", ":")).encode("utf-8")) <= _MAX_DIAGNOSTIC_BYTES:
+                    records.append(item)
+                else:
+                    omitted = True
+        if omitted:
+            for item in records:
+                if item[0] == "evidence":
+                    item[1]["evidence_partial"] = True
+            while len(json.dumps(records, separators=(",", ":")).encode("utf-8")) > _MAX_DIAGNOSTIC_BYTES:
+                records.pop()  # Newly appended evidence, never the original fixed error records.
+        payload = json.dumps(records, separators=(",", ":")).encode("utf-8")
         if os.write(outgoing, payload) != len(payload):
             return 2
         return 0 if reachable else 1

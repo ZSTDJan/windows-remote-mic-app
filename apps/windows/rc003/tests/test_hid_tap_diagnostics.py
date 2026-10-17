@@ -163,6 +163,26 @@ class HidTapDiagnosticsTests(unittest.TestCase):
         self.assertEqual(fields["fingerprint_scope"], "on_disk_not_loaded_modules")
         self.assertNotIn("private-content", json.dumps(fields))
 
+    def test_os_registry_build_is_separate_and_survives_missing_release(self):
+        for missing in (False, True):
+            with self.subTest(missing_release=missing):
+                registry = mock.MagicMock(HKEY_LOCAL_MACHINE=0)
+                registry.QueryValueEx.side_effect = [("22631", 1), (5189, 4),
+                    FileNotFoundError("private-value") if missing else ("23H2", 1)]
+                version = mock.Mock(platform_version=(10, 0, 22621))
+                with mock.patch.dict("sys.modules", {"winreg": registry}), \
+                        mock.patch.object(frida_compat.os, "name", "nt"), \
+                        mock.patch.object(frida_compat.sys, "getwindowsversion", return_value=version, create=True), \
+                        mock.patch("ovb_rc003.hid_elevation_windows.query_process_elevated", return_value=False), \
+                        mock.patch.object(frida_hid_tap_runtime, "sha256_file", return_value="a" * 64):
+                    fields = frida_compat._diagnostic_environment()
+                self.assertEqual(fields["windows_version"], [10, 0, 22621])
+                self.assertEqual(fields["windows_os_build"], 22631)
+                self.assertEqual(fields["windows_os_revision"], 5189)
+                self.assertEqual(fields["windows_version_source"], "kernel32_file_version")
+                self.assertEqual(fields.get("windows_release"), None if missing else "23H2")
+                self.assertNotIn("private-value", json.dumps(fields))
+
     def test_host_discovery_reports_denied_missing_and_valid_separately(self):
         service = frida_hid_tap_runtime.HID_SERVICE_PREFIX + "_" + frida_hid_tap_runtime.RC003_HARDWARE_TOKEN
         exhausted = OSError("end")

@@ -97,6 +97,7 @@ from typing import Any, Awaitable, Callable, List, Optional, Sequence
 from . import atvv_protocol as proto
 from . import atvv_session
 from . import identity
+from .ble_connection_diagnostics import ConnectionDiagnostics, read_number, result_fields
 from .battery_monitor_winrt import BATTERY_LEVEL_UUID, BATTERY_SERVICE_UUID, BatteryMonitor
 
 PcmCallback = Callable[[List[int]], None]
@@ -269,25 +270,33 @@ async def _candidate_has_voice_service(
     Windows GATT cache.
     """
 
+    diagnostic = ConnectionDiagnostics(scope="probe", selected_key=candidate.device_key)
     winrt = winrt or _import_winrt()
     device = None
     services = []
     reachable = False
     cleanup_ok = True
     try:
-        device = await winrt.bluetooth_le_device.from_id_async(candidate.handle.id)
-        if device is None:
-            return False
+        with diagnostic.step("open_device") as evidence:
+            device = await winrt.bluetooth_le_device.from_id_async(candidate.handle.id)
+            if device is None:
+                evidence.update(_state="failed", reason="device_unavailable")
+                return False
 
-        result = await device.get_gatt_services_for_uuid_with_cache_mode_async(
-            uuid.UUID(proto.VOICE_SERVICE_UUID),
-            winrt.bluetooth_cache_mode.UNCACHED,
-        )
-        services = list(result.services or [])
-        reachable = (
-            result.status == winrt.gatt_communication_status.SUCCESS
-            and bool(services)
-        )
+        with diagnostic.step("services") as evidence:
+            result = await device.get_gatt_services_for_uuid_with_cache_mode_async(
+                uuid.UUID(proto.VOICE_SERVICE_UUID),
+                winrt.bluetooth_cache_mode.UNCACHED,
+            )
+            result_fields(evidence, result, "services")
+            services = list(result.services or [])
+            reachable = (
+                result.status == winrt.gatt_communication_status.SUCCESS
+                and bool(services)
+            )
+            if not reachable:
+                evidence.update(_state="failed", reason="service_query_failed" if result.status !=
+                                winrt.gatt_communication_status.SUCCESS else "service_not_found")
     except Exception as exc:  # noqa: BLE001 - one stale paired record must
         # not prevent another candidate from being checked. Log only the
         # exception type so a device ID embedded in a platform message never
@@ -299,7 +308,8 @@ async def _candidate_has_voice_service(
     finally:
         for service in services:
             try:
-                service.close()
+                with diagnostic.step("close_service"):
+                    service.close()
             except Exception as exc:  # noqa: BLE001 - cleanup is best effort
                 cleanup_ok = False
                 _logger.info(
@@ -308,7 +318,8 @@ async def _candidate_has_voice_service(
                 )
         if device is not None:
             try:
-                device.close()
+                with diagnostic.step("close_device"):
+                    device.close()
             except Exception as exc:  # noqa: BLE001 - cleanup is best effort
                 cleanup_ok = False
                 _logger.info(
@@ -439,6 +450,7 @@ class RC003BleSession:
         loop: Optional[asyncio.AbstractEventLoop] = None,
         on_pcm_frame_with_sequence: Optional[SequencedPcmCallback] = None,
         on_battery_level: Optional[BatteryLevelCallback] = None,
+        diagnostics: Optional[ConnectionDiagnostics] = None,
     ) -> None:
         self._on_pcm_frame = on_pcm_frame
         self._on_pcm_frame_with_sequence = on_pcm_frame_with_sequence
@@ -458,6 +470,7 @@ class RC003BleSession:
         self._control_token = None
         self._connection_status_token = None
         self._battery_monitor = None
+        self._connection_diagnostics = diagnostics or ConnectionDiagnostics()
         self._device_id: Optional[str] = None
         # WinRT notification callbacks are not guaranteed to run on the
         # asyncio thread that owns connect()/close(); this loop reference
@@ -499,6 +512,11 @@ class RC003BleSession:
             return self._next_event_sequence - 1
 
     async def connect(self, candidate: identity.RC003Candidate) -> None:
+        self._connection_diagnostics.select_key(candidate.device_key)
+        with self._connection_diagnostics.step("connect"):
+            await self._connect_observed(candidate)
+
+    async def _connect_observed(self, candidate: identity.RC003Candidate) -> None:
         winrt = self._winrt or _import_winrt()
         self._winrt = winrt
 
@@ -506,13 +524,17 @@ class RC003BleSession:
         self._generation += 1
         my_generation = self._generation
 
-        self._device = await winrt.bluetooth_le_device.from_id_async(candidate.handle.id)
-        if self._device is None:
-            raise ConnectionError("could not open the selected RC003 candidate")
+        diagnostic = self._connection_diagnostics
+        with diagnostic.step("open_device") as evidence:
+            self._device = await winrt.bluetooth_le_device.from_id_async(candidate.handle.id)
+            if self._device is None:
+                evidence["reason"] = "device_unavailable"
+                raise ConnectionError("could not open the selected RC003 candidate")
 
-        self._connection_status_token = self._device.add_connection_status_changed(
-            self._handle_connection_status_changed
-        )
+        with diagnostic.step("connection_handler"):
+            self._connection_status_token = self._device.add_connection_status_changed(
+                self._handle_connection_status_changed
+            )
 
         service_uuid = uuid.UUID(proto.VOICE_SERVICE_UUID)
         # Windows caches the GATT table per device; a stale or incomplete
@@ -521,43 +543,53 @@ class RC003BleSession:
         # and characteristics with UNCACHED so the device is re-read on the
         # wire instead of trusting the local cache, matching the upstream
         # remote-bridge-hub transport.
-        service_result = await self._device.get_gatt_services_for_uuid_with_cache_mode_async(
-            service_uuid, winrt.bluetooth_cache_mode.UNCACHED
-        )
-        if (
-            service_result.status != winrt.gatt_communication_status.SUCCESS
-            or not service_result.services
-        ):
-            raise ConnectionError("ATVV voice service not found on this device")
-        self._service = service_result.services[0]
+        with diagnostic.step("services") as evidence:
+            service_result = await self._device.get_gatt_services_for_uuid_with_cache_mode_async(
+                service_uuid, winrt.bluetooth_cache_mode.UNCACHED
+            )
+            result_fields(evidence, service_result, "services")
+            if (
+                service_result.status != winrt.gatt_communication_status.SUCCESS
+                or not service_result.services
+            ):
+                evidence["reason"] = ("service_query_failed" if service_result.status !=
+                                      winrt.gatt_communication_status.SUCCESS else "service_not_found")
+                raise ConnectionError("ATVV voice service not found on this device")
+            self._service = service_result.services[0]
 
         self._tx_characteristic = await self._require_characteristic(
-            self._service, proto.VOICE_TX_UUID, winrt
+            self._service, proto.VOICE_TX_UUID, winrt, diagnostic=diagnostic, role="tx"
         )
         self._audio_characteristic = await self._require_characteristic(
-            self._service, proto.VOICE_AUDIO_UUID, winrt
+            self._service, proto.VOICE_AUDIO_UUID, winrt, diagnostic=diagnostic, role="audio"
         )
         self._control_characteristic = await self._require_characteristic(
-            self._service, proto.VOICE_CONTROL_UUID, winrt
+            self._service, proto.VOICE_CONTROL_UUID, winrt, diagnostic=diagnostic, role="control"
         )
 
-        self._audio_token = self._audio_characteristic.add_value_changed(
-            self._handle_audio_notification
-        )
-        self._control_token = self._control_characteristic.add_value_changed(
-            self._handle_control_notification
-        )
+        with diagnostic.step("notification_handlers"):
+            self._audio_token = self._audio_characteristic.add_value_changed(
+                self._handle_audio_notification
+            )
+            self._control_token = self._control_characteristic.add_value_changed(
+                self._handle_control_notification
+            )
 
         for characteristic in (self._audio_characteristic, self._control_characteristic):
-            subscribe_status = await characteristic.write_client_characteristic_configuration_descriptor_async(  # noqa: E501
-                winrt.cccd_value.NOTIFY
-            )
-            if subscribe_status != winrt.gatt_communication_status.SUCCESS:
-                raise ConnectionError(
-                    f"subscribing to notifications failed: {subscribe_status}"
+            stage = "subscribe_audio" if characteristic is self._audio_characteristic else "subscribe_control"
+            with diagnostic.step(stage) as evidence:
+                subscribe_status = await characteristic.write_client_characteristic_configuration_descriptor_async(  # noqa: E501
+                    winrt.cccd_value.NOTIFY
                 )
+                read_number(evidence, "status", subscribe_status)
+                if subscribe_status != winrt.gatt_communication_status.SUCCESS:
+                    evidence["reason"] = "subscription_failed"
+                    raise ConnectionError(
+                        f"subscribing to notifications failed: {subscribe_status}"
+                    )
 
-        self._start_worker(my_generation)
+        with diagnostic.step("start_worker"):
+            self._start_worker(my_generation)
         await self._write_tx(self._get_capabilities_command)
 
     def start_battery_monitor(self) -> None:
@@ -594,22 +626,35 @@ class RC003BleSession:
             )
 
     @staticmethod
-    async def _require_characteristic(service, characteristic_uuid: str, winrt: WinRTModules):
+    async def _require_characteristic(service, characteristic_uuid: str, winrt: WinRTModules,
+                                      *, diagnostic=None, role="tx"):
         parsed_uuid = uuid.UUID(characteristic_uuid)
         # Enumerate the service's full characteristic table with UNCACHED
         # (the exact-UUID lookup can return an empty/unsuccessful result when
         # the per-service GATT cache is incomplete) and match on the UUID.
-        result = await service.get_characteristics_with_cache_mode_async(
-            winrt.bluetooth_cache_mode.UNCACHED
-        )
-        if result.status != winrt.gatt_communication_status.SUCCESS:
+        diagnostic = diagnostic or ConnectionDiagnostics()
+        with diagnostic.step("characteristics_" + role) as evidence:
+            result = await service.get_characteristics_with_cache_mode_async(
+                winrt.bluetooth_cache_mode.UNCACHED
+            )
+            result_fields(evidence, result, "characteristics")
+            if result.status != winrt.gatt_communication_status.SUCCESS:
+                evidence["reason"] = "characteristic_query_failed"
+                raise ConnectionError(f"ATVV characteristic not found: {characteristic_uuid}")
+            for characteristic in result.characteristics:
+                if str(characteristic.uuid).casefold() == str(parsed_uuid).casefold():
+                    read_number(evidence, "properties", characteristic, "characteristic_properties")
+                    read_number(evidence, "handle", characteristic, "attribute_handle")
+                    return characteristic
+            evidence["reason"] = "characteristic_not_found"
             raise ConnectionError(f"ATVV characteristic not found: {characteristic_uuid}")
-        for characteristic in result.characteristics:
-            if str(characteristic.uuid).casefold() == str(parsed_uuid).casefold():
-                return characteristic
-        raise ConnectionError(f"ATVV characteristic not found: {characteristic_uuid}")
 
     async def _write_tx(self, data: bytes) -> None:
+        stage = "get_capabilities" if data == self._get_capabilities_command else "tx_write"
+        with self._connection_diagnostics.step(stage) as evidence:
+            await self._write_tx_observed(data, evidence)
+
+    async def _write_tx_observed(self, data: bytes, evidence: dict) -> None:
         winrt = self._winrt or _import_winrt()
         writer = winrt.data_writer_factory()
         try:
@@ -617,9 +662,11 @@ class RC003BleSession:
             result = await self._tx_characteristic.write_value_with_result_async(
                 writer.detach_buffer()
             )
+            result_fields(evidence, result)
         finally:
             writer.close()
         if result.status != winrt.gatt_communication_status.SUCCESS:
+            evidence["reason"] = "tx_write_failed"
             raise ConnectionError(
                 f"writing to ATVV TX characteristic failed: {result.status}"
             )
@@ -754,11 +801,17 @@ class RC003BleSession:
     def _handle_connection_status_changed(self, sender, _args) -> None:
         winrt = self._winrt
         try:
-            disconnected = (
-                sender.connection_status == winrt.bluetooth_connection_status.DISCONNECTED
-            )
-        except Exception:  # noqa: BLE001 - treat any read failure as "assume disconnected"
+            status = sender.connection_status
+            disconnected = status == winrt.bluetooth_connection_status.DISCONNECTED
+        except Exception as error:  # noqa: BLE001 - keep the existing assume-disconnected policy
+            self._connection_diagnostics.emit("disconnect_status", "exception", error=error,
+                                              reason="native_status_read_failed")
             disconnected = True
+        else:
+            evidence = {}
+            read_number(evidence, "connection_status", status)
+            self._connection_diagnostics.emit("disconnect_status", "success",
+                reason="reported_disconnected" if disconnected else "other_status", **evidence)
         if disconnected and self._on_disconnected is not None:
             try:
                 self._on_disconnected()
@@ -938,6 +991,10 @@ class RC003BleSession:
             self._on_pcm_frame(samples)
 
     async def close(self) -> None:
+        with self._connection_diagnostics.step("close"):
+            await self._close_observed()
+
+    async def _close_observed(self) -> None:
         """Closes the BLE session, always attempting every independent
         cleanup step regardless of any single step's outcome, then raises
         if the worker thread, GATT service, or BLE device did not actually
@@ -1003,42 +1060,54 @@ class RC003BleSession:
         if winrt is not None:
             if self._audio_characteristic is not None:
                 try:
-                    await self._audio_characteristic.write_client_characteristic_configuration_descriptor_async(  # noqa: E501
-                        winrt.cccd_value.NONE
-                    )
+                    with self._connection_diagnostics.step("unsubscribe_audio") as evidence:
+                        status = await self._audio_characteristic.write_client_characteristic_configuration_descriptor_async(  # noqa: E501
+                            winrt.cccd_value.NONE
+                        )
+                        read_number(evidence, "status", status)
+                        if status != winrt.gatt_communication_status.SUCCESS:
+                            evidence.update(_state="failed", reason="subscription_failed")
                 except Exception:
                     pass
                 if self._audio_token is not None:
                     try:
-                        self._audio_characteristic.remove_value_changed(self._audio_token)
+                        with self._connection_diagnostics.step("remove_audio_handler"):
+                            self._audio_characteristic.remove_value_changed(self._audio_token)
                         self._audio_token = None
                     except Exception:
                         pass
             if self._control_characteristic is not None:
                 try:
-                    await self._control_characteristic.write_client_characteristic_configuration_descriptor_async(  # noqa: E501
-                        winrt.cccd_value.NONE
-                    )
+                    with self._connection_diagnostics.step("unsubscribe_control") as evidence:
+                        status = await self._control_characteristic.write_client_characteristic_configuration_descriptor_async(  # noqa: E501
+                            winrt.cccd_value.NONE
+                        )
+                        read_number(evidence, "status", status)
+                        if status != winrt.gatt_communication_status.SUCCESS:
+                            evidence.update(_state="failed", reason="subscription_failed")
                 except Exception:
                     pass
                 if self._control_token is not None:
                     try:
-                        self._control_characteristic.remove_value_changed(self._control_token)
+                        with self._connection_diagnostics.step("remove_control_handler"):
+                            self._control_characteristic.remove_value_changed(self._control_token)
                         self._control_token = None
                     except Exception:
                         pass
             if self._device is not None and self._connection_status_token is not None:
                 try:
-                    self._device.remove_connection_status_changed(
-                        self._connection_status_token
-                    )
+                    with self._connection_diagnostics.step("remove_connection_handler"):
+                        self._device.remove_connection_status_changed(
+                            self._connection_status_token
+                        )
                     self._connection_status_token = None
                 except Exception:
                     pass
 
         if self._service is not None:
             try:
-                self._service.close()
+                with self._connection_diagnostics.step("close_service"):
+                    self._service.close()
             except Exception:
                 cleanup_failures.append("GATT service did not close")
             else:
@@ -1050,7 +1119,8 @@ class RC003BleSession:
                 self._control_token = None
         if self._device is not None:
             try:
-                self._device.close()
+                with self._connection_diagnostics.step("close_device"):
+                    self._device.close()
             except Exception:
                 cleanup_failures.append("BLE device did not close")
             else:
