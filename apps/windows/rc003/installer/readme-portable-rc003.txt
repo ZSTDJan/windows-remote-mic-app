@@ -1,4 +1,4 @@
-无线麦便携版 - 小米遥控器2 Pro Windows 客户端
+无线麦便携版 - Windows 客户端
 ================================================
 
 这是解压即用的便携版，不是安装程序。请先完整解压整个 ZIP，再双击解压目录
@@ -75,7 +75,10 @@
 只会移除程序本体，不会自动移除已授权助手，也不会删除这些设置和日志。只有确定
 以后不再使用任何 RC003 版本时，才手动删除该 LocalAppData 目录。
 
-本测试版尚需真实小米遥控器2 Pro、真实输入法和长期运行复测。许可、第三方来源和
-素材说明见本“说明与许可”目录中的 LICENSE.txt、COPYRIGHT.txt、THIRD_PARTY_NOTICES.md、
-THIRD_PARTY_SOURCE.md、ASSET_LICENSES.md、ATTRIBUTION.md 和
+持续显示“点击重新连接”、豆包首次语音启动偶发异常，以及 Chatterfly 有录音气泡
+但不上屏的部分反馈，尚未确认解决。最新使用与故障排查说明见：
+https://github.com/ZSTDJan/windows-remote-mic-app/blob/main/apps/windows/rc003/README.md
+
+许可、第三方来源和素材说明见本“说明与许可”目录中的 LICENSE.txt、COPYRIGHT.txt、
+THIRD_PARTY_NOTICES.md、THIRD_PARTY_SOURCE.md、ASSET_LICENSES.md、ATTRIBUTION.md 和
 THIRD_PARTY_LICENSES 目录。
