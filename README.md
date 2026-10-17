@@ -12,9 +12,9 @@
 
 ## 下载与版本
 
-**[下载正式版 1.0.94](https://github.com/ZSTDJan/windows-remote-mic-app/releases/download/v1.0.94/RemoteMicRC003-1.0.94-portable-unsigned.zip)** · [版本说明](https://github.com/ZSTDJan/windows-remote-mic-app/releases/tag/v1.0.94) · [SHA256SUMS.txt](https://github.com/ZSTDJan/windows-remote-mic-app/releases/download/v1.0.94/SHA256SUMS.txt)
+**[下载正式版 1.0.95](https://github.com/ZSTDJan/windows-remote-mic-app/releases/download/v1.0.95/RemoteMicRC003-1.0.95-portable-unsigned.zip)** · [版本说明](https://github.com/ZSTDJan/windows-remote-mic-app/releases/tag/v1.0.95) · [SHA256SUMS.txt](https://github.com/ZSTDJan/windows-remote-mic-app/releases/download/v1.0.95/SHA256SUMS.txt)
 
-当前正式版为 **1.0.94**。本版修复按键页右侧卡片边框裁切，并防止语音资源清理失败后重复启动服务；遇到清理失败提示时，请从通知区域完全退出后重新打开。首次语音启动偶发失败的原因仍待确认。
+当前正式版为 **1.0.95**。本版修复按键页右侧卡片边框裁切，防止语音资源清理失败后重复启动服务，并补全小米遥控器连接失败的诊断日志。遇到清理失败提示时，请从通知区域完全退出后重新打开；持续显示“点击重新连接”的部分反馈仍在排查，本版不承诺升级即可恢复。
 
 旧版可在 [历史版本](https://github.com/ZSTDJan/windows-remote-mic-app/releases) 中下载。
 
