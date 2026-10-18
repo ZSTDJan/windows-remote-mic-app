@@ -27,6 +27,9 @@ Get-FileHash -Algorithm SHA256 .\RemoteMicRC003-<版本号>-portable-unsigned.zi
 
 ## 第一次使用
 
+- **首次配置前，请先暂时退出 360 等杀毒软件；配置和测试完成后及时恢复防护。**
+- **首次使用语音前，必须先安装虚拟音频组件 VB-CABLE，并重启电脑；重启后再配置语音。**
+
 ### 1. 在 Windows 中配对遥控器
 
 先打开 Windows“设置 → 蓝牙和设备”，让遥控器进入配对状态并完成配对。
@@ -70,7 +73,7 @@ Get-FileHash -Algorithm SHA256 .\RemoteMicRC003-<版本号>-portable-unsigned.zi
 
 如果要把遥控器声音送进搜狗、微信、豆包或 Chatterfly，需要安装并配置 VB-CABLE：
 
-1. 打开“语音”页，点击“安装音频”，按提示安装后重启电脑。
+1. 打开“语音”页，点击“安装音频”，安装虚拟音频组件 VB-CABLE，**安装完成后先重启电脑**。
 2. 无线麦的“输出端点”选择 `CABLE Input — Windows WASAPI`；没有 WASAPI 时，
    可选 `Windows DirectSound`。
 3. 在输入法的麦克风设置中选择 `CABLE Output`。
