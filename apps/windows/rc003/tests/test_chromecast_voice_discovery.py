@@ -152,18 +152,18 @@ class DiscoveryTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(row["protocol_error"], 5 if status == 2 else -1)
                 self.assertEqual(row["outcome"], "success" if status == 0 else "status_failed")
 
-    async def test_all_four_connection_attempts_preserve_query_and_cleanup_evidence(self):
+    async def test_all_five_connection_attempts_preserve_query_and_cleanup_evidence(self):
         target = self.target(lambda _: SimpleNamespace(status=1, services=[], protocol_error=None))
         rows = []
         target.cleanup_observer = Observation(rows.append).voice_cleanup
-        for attempt in range(1, 5):
+        for attempt in range(1, 6):
             with self.assertRaises(PipeError):
                 await target.open_voice(direct=True)
             self.check_rows(target, attempt=attempt)
             self.assertEqual(target._cleanup_attempt, attempt)
             self.assertIsNone(target.voice_session)
             self.assertFalse(target._voice_services)
-        self.assertEqual({r["attempt"] for r in rows}, {1, 2, 3, 4})
+        self.assertEqual({r["attempt"] for r in rows}, {1, 2, 3, 4, 5})
         sender = Channel(SessionIdentity.create(ENTITY), commands=False)
         for row in rows:
             self.assertTrue(valid_record(row))
@@ -444,7 +444,7 @@ class DiscoveryTests(unittest.IsolatedAsyncioTestCase):
         for svc in services:
             svc.close.assert_called_once()
         for changes in ({"items": rows[0]["items"] * 2}, {"hresult": "PRIVATE"},
-                        {"attempt": 5}, {"cache": "guess"}, {"error": "PRIVATE"},
+                        {"attempt": 6}, {"cache": "guess"}, {"error": "PRIVATE"},
                         {"connected_before": True}, {"item_offset": 7}):
             bad = dict(rows[0], **changes)
             self.assertFalse(valid_record(bad))
@@ -587,7 +587,7 @@ class DiscoveryTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(valid_record(row))
             Channel(identity, commands=False).encode('evidence', record=row)
         for changed in ({'omitted': True}, {'handle': 'PRIVATE'}, {'step': ['PRIVATE']},
-                {'first_error_type': 'PRIVATE'}, {'attempt': 5}, {'error_text': 'PRIVATE'}):
+                {'first_error_type': 'PRIVATE'}, {'attempt': 6}, {'error_text': 'PRIVATE'}):
             bad = dict(rows[-1], **changed)
             self.assertFalse(valid_record(bad))
             with self.assertRaises(ChannelError):
@@ -650,7 +650,7 @@ class WakeRetryTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(receiver.retry_ready())
 
     async def test_worker_delivers_buttons_and_bounded_retries_then_stops_or_cancels(self):
-        for outcome in ("ready", "failed", "cancel", "auto_ready", "auto_exhausted", "stop_wait"):
+        for outcome in ("ready", "failed", "cancel", "auto_ready", "auto_exhausted", "last_ready", "stop_wait"):
             with self.subTest(outcome=outcome):
                 identity = SessionIdentity.create(ENTITY)
                 commands, events = Channel(identity, commands=True), Channel(identity, commands=False)
@@ -664,7 +664,8 @@ class WakeRetryTests(unittest.IsolatedAsyncioTestCase):
                 async def open_voice(**_):
                     nonlocal attempts, cancelled
                     attempts += 1
-                    if attempts == 1 or outcome in ("failed", "auto_exhausted"):
+                    if (attempts == 1 or outcome in ("failed", "auto_exhausted")
+                            or (outcome == "last_ready" and attempts < 5)):
                         raise TimeoutError
                     if outcome == "cancel":
                         inbox.append(commands.encode("stop"))
@@ -689,8 +690,8 @@ class WakeRetryTests(unittest.IsolatedAsyncioTestCase):
                     def close(self, **_): pass
                     def poll(self):
                         nonlocal after_second_failure
-                        if ((attempts == 4 and outcome == "failed")
-                                or (attempts == 3 and outcome == "auto_exhausted")):
+                        if ((attempts == 5 and outcome == "failed")
+                                or (attempts == 4 and outcome == "auto_exhausted")):
                             after_second_failure += 1
                             if after_second_failure == 4:
                                 inbox.append(commands.encode("stop"))
@@ -706,7 +707,7 @@ class WakeRetryTests(unittest.IsolatedAsyncioTestCase):
                             inbox.append(commands.encode("stop"))
                         elif outcome == "stop_wait":
                             inbox.append(commands.encode("stop"))
-                        elif outcome in ("ready", "failed", "cancel"):
+                        elif outcome in ("ready", "failed", "cancel", "last_ready"):
                             reports.extend(("report", value, time.monotonic()) for value in
                                 ("0600000000000000", "0000000000000000"))
 
@@ -718,15 +719,15 @@ class WakeRetryTests(unittest.IsolatedAsyncioTestCase):
                      mock.patch.object(worker, "SelectedDevice", return_value=target), \
                      mock.patch.object(worker, "HidTap", return_value=Tap()), \
                      mock.patch.object(worker, "verify_peer"), mock.patch.object(worker, "inspect_peer"), \
-                     mock.patch.object(adapter, "VOICE_OPEN_RETRY_DELAYS", (.01, .02)), \
+                     mock.patch.object(adapter, "VOICE_OPEN_RETRY_DELAYS", (.01, .02, .03)), \
                      mock.patch.object(adapter.config, "load_config", return_value={}):
                     result = await asyncio.wait_for(worker.receive(identity, SimpleNamespace(pid=1),
                         SimpleNamespace(read=lambda: inbox.popleft() if inbox else None, write=write)), 3)
                 self.assertEqual(result, 0)
-                expected_attempts = {"failed": 4, "auto_exhausted": 3, "stop_wait": 1}.get(outcome, 2)
+                expected_attempts = {"failed": 5, "auto_exhausted": 4, "last_ready": 5, "stop_wait": 1}.get(outcome, 2)
                 self.assertEqual(attempts, expected_attempts)
                 self.assertEqual(any(e["type"] == "edge" and e["action"] == "down" for e in received),
-                                 outcome in ("ready", "failed", "cancel"))
+                                 outcome in ("ready", "failed", "cancel", "last_ready"))
                 self.assertEqual(sum(e.get("record", {}).get("stage") == "voice_wake_retry"
                                      for e in received), expected_attempts - 1)
                 self.assertEqual(cancelled, outcome == "cancel")
@@ -737,7 +738,7 @@ class WakeRetryTests(unittest.IsolatedAsyncioTestCase):
                                  voice_retryable=True, voice_attributes={})
         with mock.patch.object(adapter.config, "load_config", return_value={}):
             receiver = adapter.VoiceReceiver(target, lambda *args: None, direct_notifications=True)
-        for attempt, delay in ((1, 1.0), (2, 3.0)):
+        for attempt, delay in ((1, 1.0), (2, 3.0), (3, 5.0)):
             await receiver.open()
             self.assertEqual(receiver._open_attempts, attempt)
             with mock.patch.object(adapter.time, "monotonic", return_value=receiver._open_finished + delay - .001):
@@ -752,7 +753,7 @@ class WakeRetryTests(unittest.IsolatedAsyncioTestCase):
         await receiver.open()
         receiver.note_activity(time.monotonic())
         self.assertFalse(receiver.retry_ready())
-        self.assertEqual(target.open_voice.await_count, 4)
+        self.assertEqual(target.open_voice.await_count, 5)
 
     async def test_capability_failure_and_pipe_loss_do_not_retry(self):
         target = SimpleNamespace(open_voice=mock.AsyncMock(), close_voice=mock.AsyncMock(),

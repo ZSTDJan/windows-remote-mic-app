@@ -848,7 +848,7 @@ class UpdateDownloadTests(unittest.TestCase):
                 "https://release-assets.githubusercontent.com/installer",
                 content_length=len(package_data),
                 fail_after=application_update.DOWNLOAD_CHUNK_BYTES,
-            ), OSError("offline"), OSError("offline")
+            ), OSError("offline"), OSError("offline"), OSError("offline"), OSError("offline")
         ]
         with tempfile.TemporaryDirectory() as tmpdir:
             destination = Path(tmpdir)
@@ -860,7 +860,7 @@ class UpdateDownloadTests(unittest.TestCase):
             part = destination / f"{release.installer.name}.part"
             self.assertEqual(part.read_bytes(), package_data[:application_update.DOWNLOAD_CHUNK_BYTES])
             self.assertFalse((destination / release.installer.name).exists())
-            self.assertEqual(sum(call[0] == release.installer.download_url for call in opener.calls), 3)
+            self.assertEqual(sum(call[0] == release.installer.download_url for call in opener.calls), 5)
 
     def test_timeout_closes_response_and_next_click_resumes(self):
         release, opener, package_data, _manifest = self._release_and_opener()
@@ -871,7 +871,7 @@ class UpdateDownloadTests(unittest.TestCase):
             fail_after=application_update.DOWNLOAD_CHUNK_BYTES,
             fail_with=TimeoutError("timed out while downloading"),
         )
-        opener._responses[release.installer.download_url] = [response, TimeoutError(), TimeoutError()]
+        opener._responses[release.installer.download_url] = [response] + [TimeoutError() for _ in range(4)]
 
         with tempfile.TemporaryDirectory() as tmpdir:
             destination = Path(tmpdir)
@@ -998,6 +998,29 @@ class UpdateDownloadTests(unittest.TestCase):
             self.assertEqual(result.path.read_bytes(), data)
         self.assertEqual([call[0] for call in opener.calls],
                          [release.manifest.download_url] * 2 + [release.installer.download_url])
+
+    def test_manifest_and_package_can_succeed_on_fifth_attempt(self):
+        release, opener, data, manifest = self._release_and_opener()
+        for url, body in ((release.manifest.download_url, manifest),
+                          (release.installer.download_url, data)):
+            opener._responses[url] = [TimeoutError() for _ in range(4)] + [
+                FakeResponse(body, url, content_length=len(body))]
+        with tempfile.TemporaryDirectory() as root, mock.patch.object(
+                application_update, "_wait_download_retry") as wait:
+            result = application_update.download_update_package(release, "installer", Path(root), opener=opener)
+            self.assertEqual(result.path.read_bytes(), data)
+        self.assertEqual([call[0] for call in opener.calls],
+                         [release.manifest.download_url] * 5 + [release.installer.download_url] * 5)
+        self.assertEqual(wait.call_args_list, [mock.call(i, None) for i in range(4)] * 2)
+
+    def test_manifest_failure_stops_after_five_attempts_without_package_request(self):
+        release, opener, _, _ = self._release_and_opener()
+        opener._responses[release.manifest.download_url] = [TimeoutError() for _ in range(5)]
+        with tempfile.TemporaryDirectory() as root:
+            with self.assertRaises(application_update.ApplicationUpdateError) as caught:
+                application_update.download_update_package(release, "installer", Path(root), opener=opener)
+            self.assertEqual(caught.exception.code, "timeout")
+        self.assertEqual([call[0] for call in opener.calls], [release.manifest.download_url] * 5)
 
     def test_complete_prefix_is_reverified_without_requesting_asset(self):
         release, opener, data, _ = self._release_and_opener()

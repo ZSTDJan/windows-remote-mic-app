@@ -23,8 +23,8 @@ EXTEND_SECONDS = 20.0  # Internal protocol maintenance, never a UI preference.
 # below implements v1.0, 16-kHz ADPCM and physical hold-to-talk streams only.
 GET_CAPABILITIES = bytes((0x0a, 1, 0, 0, 2, 3))
 CAPABILITIES_TIMEOUT = 3.0
-VOICE_OPEN_RETRY_DELAYS = (1.0, 3.0)
-# Initial connection, two timed retries, then at most one fresh-button fallback.
+VOICE_OPEN_RETRY_DELAYS = (1.0, 3.0, 5.0)
+# Initial connection, three timed retries, then at most one fresh-button fallback.
 VOICE_OPEN_MAX_ATTEMPTS = 1 + len(VOICE_OPEN_RETRY_DELAYS) + 1
 
 
