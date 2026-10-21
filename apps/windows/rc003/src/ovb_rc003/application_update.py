@@ -37,6 +37,10 @@ RELEASES_API_URL = (
 )
 
 NETWORK_TIMEOUT_SECONDS = 10.0
+DOWNLOAD_TIMEOUT_SECONDS = 30.0
+DOWNLOAD_ATTEMPTS = 3
+DOWNLOAD_READ_BYTES = 32 * 1024
+DOWNLOAD_PROGRESS_INTERVAL_SECONDS = 0.1
 MAX_RELEASES_RESPONSE_BYTES = 2 * 1024 * 1024
 MAX_RELEASE_COUNT = 50
 MAX_RELEASE_PAGES = 10
@@ -328,8 +332,11 @@ def _owned_download_names(version: ApplicationVersion) -> frozenset[str]:
             portable,
             f"{installer}.part",
             f"{portable}.part",
+            f"{installer}.part.json",
+            f"{portable}.part.json",
             chinese_portable,
             f"{chinese_portable}.part",
+            f"{chinese_portable}.part.json",
         }
     )
 
@@ -996,39 +1003,74 @@ def _download_asset(
     cancel_event: Any,
     progress_callback: Optional[Callable[[int, int], None]],
 ) -> None:
-    request = _request(asset.download_url, "application/octet-stream")
-    response = _open_response(request, opener=opener, timeout=timeout)
-    received = 0
+    received = part_path.stat().st_size if part_path.exists() else 0
     digest = hashlib.sha256()
+    if received:
+        with part_path.open("rb") as existing:
+            while chunk := existing.read(DOWNLOAD_CHUNK_BYTES):
+                _check_download_cancelled(cancel_event)
+                digest.update(chunk)
+    if received == asset.size:
+        _verify_download_digest(digest.hexdigest(), asset, expected_sha256)
+        if progress_callback is not None:
+            progress_callback(received, asset.size)
+        return
+    request = _request(asset.download_url, "application/octet-stream")
+    if received:
+        request.add_header("Range", f"bytes={received}-")
+    response = _open_response(request, opener=opener, timeout=timeout)
     try:
-        if _response_status(response) != 200:
-            _raise("http_error", "GitHub 更新包下载失败，请稍后重试。")
         _require_https_host(
             _response_url(response, asset.download_url), _ALLOWED_NETWORK_HOSTS
         )
+        status = _response_status(response)
+        end = asset.size
+        if status == 200:
+            # Servers may ignore Range. Restart the file rather than append
+            # a whole response to an old prefix.
+            received = 0
+            digest = hashlib.sha256()
+        elif status == 206 and received:
+            value = response.headers.get("Content-Range", "")
+            match = re.fullmatch(r"bytes (\d+)-(\d+)/(\d+)", value)
+            if (match is None or int(match[1]) != received
+                    or not received <= int(match[2]) < asset.size
+                    or int(match[3]) != asset.size):
+                _raise("invalid_range", "GitHub 续传范围与更新包不一致，请重新下载。")
+            end = int(match[2]) + 1
+        else:
+            _raise("http_error", "GitHub 更新包下载失败，请稍后重试。")
         declared_length = _content_length(response)
-        if declared_length is not None and declared_length != asset.size:
+        if declared_length is not None and declared_length != end - received:
             _raise("size_mismatch", "GitHub 更新包大小与发布信息不一致。")
         if progress_callback is not None:
-            progress_callback(0, asset.size)
+            progress_callback(received, asset.size)
+        last_progress = time.monotonic()
         try:
-            with part_path.open("xb") as stream:
+            mode = "ab" if received else ("wb" if part_path.exists() else "xb")
+            with part_path.open(mode) as stream:
                 while True:
-                    if cancel_event is not None and cancel_event.is_set():
-                        raise ApplicationUpdateCancelled()
+                    _check_download_cancelled(cancel_event)
                     try:
-                        chunk = response.read(DOWNLOAD_CHUNK_BYTES)
+                        # read1 returns available bytes without waiting to fill
+                        # 256 KiB on slow links; tests/other openers may expose read.
+                        read = getattr(response, "read1", response.read)
+                        chunk = read(DOWNLOAD_READ_BYTES)
                     except Exception as exc:
                         raise _translate_open_error(exc) from exc
                     if not chunk:
                         break
                     received += len(chunk)
-                    if received > asset.size or received > MAX_PACKAGE_BYTES:
+                    if received > end or received > MAX_PACKAGE_BYTES:
                         _raise("size_mismatch", "下载的更新包大小超过发布信息。")
                     stream.write(chunk)
                     digest.update(chunk)
-                    if progress_callback is not None:
+                    now = time.monotonic()
+                    if progress_callback is not None and (
+                        received == asset.size or now - last_progress >= DOWNLOAD_PROGRESS_INTERVAL_SECONDS
+                    ):
                         progress_callback(received, asset.size)
+                        last_progress = now
                 stream.flush()
                 os.fsync(stream.fileno())
         except ApplicationUpdateError:
@@ -1040,12 +1082,68 @@ def _download_asset(
     finally:
         _close_response(response)
     if received != asset.size:
-        _raise("incomplete_download", "更新包下载不完整，临时文件已清理。")
-    actual_sha256 = digest.hexdigest()
+        _raise("incomplete_download", "更新包下载中断，请稍后继续下载。")
+    _verify_download_digest(digest.hexdigest(), asset, expected_sha256)
+
+
+def _verify_download_digest(actual_sha256, asset, expected_sha256):
     if actual_sha256 != expected_sha256:
         _raise("checksum_mismatch", "更新包 SHA-256 校验失败，临时文件已清理。")
     if asset.github_sha256 is not None and actual_sha256 != asset.github_sha256:
         _raise("digest_mismatch", "更新包与 GitHub 摘要不一致，临时文件已清理。")
+
+
+_DOWNLOAD_RETRY_CODES = frozenset({
+    "timeout", "network_unavailable", "service_unavailable",
+    "incomplete_response", "incomplete_download",
+})
+
+
+def _check_download_cancelled(cancel_event):
+    if cancel_event is not None and cancel_event.is_set():
+        raise ApplicationUpdateCancelled()
+
+
+def _wait_download_retry(attempt, cancel_event):
+    delay = float(attempt + 1)
+    if cancel_event is None:
+        time.sleep(delay)
+    elif cancel_event.wait(delay):
+        raise ApplicationUpdateCancelled()
+    _check_download_cancelled(cancel_event)
+
+
+def _retry_download(operation, cancel_event):
+    for attempt in range(DOWNLOAD_ATTEMPTS):
+        _check_download_cancelled(cancel_event)
+        try:
+            return operation()
+        except ApplicationUpdateError as exc:
+            if exc.code not in _DOWNLOAD_RETRY_CODES or attempt + 1 == DOWNLOAD_ATTEMPTS:
+                raise
+            _wait_download_retry(attempt, cancel_event)
+
+
+def _prepare_partial_download(part_path, metadata_path, asset, expected_sha256):
+    # Disposable updater cache only. Bind a prefix to the current verified
+    # manifest; never append an older release's bytes or trust its saved hash.
+    expected = {"sha256": expected_sha256, "size": asset.size}
+    for path in (part_path, metadata_path):
+        if _path_is_link_like(path) or (path.exists() and not path.is_file()):
+            _raise("invalid_destination", "更新临时路径不是普通文件，无法继续下载。")
+    saved = None
+    if metadata_path.exists():
+        try:
+            if metadata_path.stat().st_size <= 512:
+                saved = json.loads(metadata_path.read_text(encoding="ascii"))
+        except (ValueError, UnicodeError):
+            pass
+    if saved != expected or (part_path.exists() and part_path.stat().st_size > asset.size):
+        _remove_partial(part_path)
+        _remove_partial(metadata_path)
+    if not metadata_path.exists():
+        with metadata_path.open("x", encoding="ascii") as stream:
+            json.dump(expected, stream)
 
 
 def download_update_package(
@@ -1054,7 +1152,7 @@ def download_update_package(
     destination_directory: Path,
     *,
     opener: Callable[..., Any] = _default_open,
-    timeout: float = NETWORK_TIMEOUT_SECONDS,
+    timeout: float = DOWNLOAD_TIMEOUT_SECONDS,
     cancel_event: Any = None,
     progress_callback: Optional[Callable[[int, int], None]] = None,
 ) -> ApplicationUpdateDownload:
@@ -1073,7 +1171,7 @@ def download_update_package(
     asset = release.package_for(kind)
     if release.installer is None:
         kind = PackageKind.PORTABLE
-    manifest_data = _fetch_bytes(
+    manifest_data = _retry_download(lambda: _fetch_bytes(
         release.manifest.download_url,
         accept="application/octet-stream",
         allowed_final_hosts=_ALLOWED_NETWORK_HOSTS,
@@ -1081,7 +1179,7 @@ def download_update_package(
         opener=opener,
         timeout=timeout,
         cancel_event=cancel_event,
-    )
+    ), cancel_event)
     if len(manifest_data) != release.manifest.size:
         _raise("size_mismatch", "SHA256SUMS.txt 大小与发布信息不一致。")
     _verify_bytes_digest(manifest_data, release.manifest.github_sha256)
@@ -1098,17 +1196,20 @@ def download_update_package(
         _raise("invalid_destination", "更新下载位置不是文件夹。")
     final_path = directory / asset.name
     part_path = directory / f"{asset.name}.part"
-    _remove_partial(part_path)
+    metadata_path = directory / f"{asset.name}.part.json"
 
     if _existing_file_is_valid(
         final_path, asset, expected_sha256, cancel_event
     ):
+        _remove_partial(part_path)
+        _remove_partial(metadata_path)
         if progress_callback is not None:
             progress_callback(asset.size, asset.size)
         return ApplicationUpdateDownload(release, kind, final_path, True)
 
     try:
-        _download_asset(
+        _prepare_partial_download(part_path, metadata_path, asset, expected_sha256)
+        _retry_download(lambda: _download_asset(
             asset,
             part_path,
             expected_sha256=expected_sha256,
@@ -1116,14 +1217,22 @@ def download_update_package(
             timeout=timeout,
             cancel_event=cancel_event,
             progress_callback=progress_callback,
-        )
+        ), cancel_event)
+        _check_download_cancelled(cancel_event)
         try:
             os.replace(part_path, final_path)
         except OSError as exc:
             raise ApplicationUpdateError(
                 "file_replace_failed", "更新包已校验，但无法写入最终文件名。"
             ) from exc
-    except Exception:
-        _remove_partial(part_path)
+    except Exception as exc:
+        if not isinstance(exc, ApplicationUpdateError) or exc.code not in _DOWNLOAD_RETRY_CODES:
+            _remove_partial(part_path)
+            _remove_partial(metadata_path)
+        elif part_path.exists() and part_path.stat().st_size:
+            raise ApplicationUpdateError(
+                exc.code, f"{exc} 已保留下载进度，点击“重新下载”可继续。"
+            ) from exc
         raise
+    _remove_partial(metadata_path)
     return ApplicationUpdateDownload(release, kind, final_path, False)

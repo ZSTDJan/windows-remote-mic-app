@@ -8,7 +8,8 @@ import asyncio
 from collections import deque
 import time
 from . import config
-from .chromecast_voice import Recording, GET_CAPABILITIES, CAPABILITIES_TIMEOUT, supported_capabilities
+from .chromecast_voice import (Recording, GET_CAPABILITIES, CAPABILITIES_TIMEOUT,
+                              VOICE_OPEN_RETRY_DELAYS, VOICE_OPEN_MAX_ATTEMPTS, supported_capabilities)
 
 
 class VoiceReceiver:
@@ -38,6 +39,8 @@ class VoiceReceiver:
         self._startup_overflow = False
         self._open_attempts = 0
         self._open_started = 0.0
+        self._open_finished = 0.0
+        self._open_retryable = False
         self._last_activity = -1.0
 
     def _stage(self, name):
@@ -78,10 +81,11 @@ class VoiceReceiver:
     async def open(self):
         self._open_attempts += 1
         self._open_started = time.monotonic()
+        self._open_retryable = False
         self._caps_event.clear()
         self.capabilities = None
         self._startup_overflow = False
-        if self._open_attempts == 2:
+        if self._open_attempts > 1:
             self._stage("voice_wake_retry")
         if self.observation:
             self.observation.stage("voice_open_begin")
@@ -97,6 +101,7 @@ class VoiceReceiver:
             self.available = True
         except Exception:
             self.available = False
+            self._open_retryable = (not opened and getattr(self.device, "voice_retryable", False) is True)
         finally:
             # Discovery succeeded but negotiation may have failed or been
             # cancelled. Release our maintained link and subscriptions as well.
@@ -111,6 +116,7 @@ class VoiceReceiver:
                         self.observation.voice_link(row, self._open_attempts)
                     else:
                         self.observation.voice_query(row, self._open_attempts)
+            self._open_finished = time.monotonic()
         if self.observation:
             details = getattr(self.device, "voice_evidence", None)
             if details:
@@ -133,12 +139,20 @@ class VoiceReceiver:
         # copy counters or a timer. Activity during discovery also counts.
         self._last_activity = max(self._last_activity, stamp)
 
-    def retry_after_activity(self):
-        # Only retry an initial session/service connection failure. Failed capabilities,
-        # changed layouts and partially subscribed sessions need no blind retry.
-        return (self.direct_notifications and not self.stopping and not self.available
-                and self._open_attempts == 1 and self._last_activity >= self._open_started
-                and getattr(self.device, "voice_retryable", False) is True)
+    def retry_ready(self):
+        # Called only after open() and its cleanup have settled. Keep all attempts
+        # on the existing worker loop, so input/stop/peer checks remain responsive.
+        if (not self.direct_notifications or self.stopping or self.pipe_failed or self.available
+                or not self._open_retryable or not 1 <= self._open_attempts < VOICE_OPEN_MAX_ATTEMPTS
+                or getattr(self.device, "voice_retryable", False) is not True):
+            return False
+        fresh_activity = self._last_activity >= self._open_started
+        if self._open_attempts <= len(VOICE_OPEN_RETRY_DELAYS):
+            delay = VOICE_OPEN_RETRY_DELAYS[self._open_attempts - 1]
+            return fresh_activity or time.monotonic() >= self._open_finished + delay
+        # Preserve the original wake-by-button recovery after the timed budget,
+        # but never turn repeated button presses into an infinite retry loop.
+        return fresh_activity
 
     def effects(self, effects):
         for effect in effects:

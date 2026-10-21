@@ -20,7 +20,7 @@ from .chromecast_buttons import ButtonEdge, STOP_REASONS
 from .chromecast_voice import parse_lifecycle
 from .chromecast_observation import valid_record
 
-VERSION = 25
+VERSION = 26
 MAX_MESSAGE_BYTES = 2048
 HEARTBEAT_TIMEOUT = 10.0
 _BUTTONS = frozenset(remote_layout.CHROMECAST_REPORT_CODES)

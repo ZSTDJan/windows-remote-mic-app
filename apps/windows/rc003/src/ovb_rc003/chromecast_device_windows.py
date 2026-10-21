@@ -380,7 +380,8 @@ class SelectedDevice:
                     pass  # Cached diagnostic cleanup must not mask the live error.
 
     async def open_voice(self, *, direct=False):
-        self._cleanup_attempt = min(2, self._cleanup_attempt + 1)
+        from .chromecast_voice import VOICE_OPEN_MAX_ATTEMPTS
+        self._cleanup_attempt = min(VOICE_OPEN_MAX_ATTEMPTS, self._cleanup_attempt + 1)
         self.voice_queries = []
         self.voice_retryable = False
         self.voice_evidence = dict(step="service", status=-1, tx=-1, audio=-1, control=-1,

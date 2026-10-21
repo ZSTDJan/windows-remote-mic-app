@@ -8,6 +8,7 @@ from collections import deque
 import time
 
 from .chromecast_buttons import STOP_REASONS
+from .chromecast_voice import VOICE_OPEN_MAX_ATTEMPTS
 
 COUNTERS = frozenset({"rx_acl", "tx_acl", "other_connection", "preproof_notify",
     "controls", "audio_packets", "audio_bytes", "ordinary", "other_notify",
@@ -151,7 +152,7 @@ def valid_record(row):
                             "first_outcome", "first_hresult", "first_status", "first_handle", "first_error_type"}
                 and all(isinstance(row[k], str) for k in
                     ("step", "state", "outcome", "error_type", "first_step", "first_outcome", "first_error_type"))
-                and _integer(row["elapsed_ms"]) and _integer(row["attempt"], 1, 2)
+                and _integer(row["elapsed_ms"]) and _integer(row["attempt"], 1, VOICE_OPEN_MAX_ATTEMPTS)
                 and _integer(row["cycle"], 1, 65535) and row["step"] in CLEANUP_STEPS
                 and row["state"] in ("begin", "done") and row["outcome"] in CLEANUP_OUTCOMES
                 and _integer(row["duration_ms"]) and _integer(row["hresult"], -1, 0xffffffff)
@@ -180,7 +181,7 @@ def valid_record(row):
         return (set(row) == {"kind", "elapsed_ms", "attempt", "step", "outcome", "duration_ms", "hresult",
                             "connected", "device_access", "service_access", "sharing", "service_handle",
                             "session_status", "maintain", "can_maintain"}
-                and _integer(row["elapsed_ms"]) and _integer(row["attempt"], 1, 2)
+                and _integer(row["elapsed_ms"]) and _integer(row["attempt"], 1, VOICE_OPEN_MAX_ATTEMPTS)
                 and row["step"] in ("session_create", "session_active", "characteristics", "ready", "failed", "closed")
                 and row["outcome"] in ("success", "status_failed", "timeout", "cancelled", "os_error", "exception")
                 and _integer(row["duration_ms"]) and _integer(row["hresult"], -1, 0xffffffff)
@@ -193,7 +194,7 @@ def valid_record(row):
         return (set(row) == {"kind", "elapsed_ms", "attempt", "step", "cache", "duration_ms",
                             "connected_before", "connected_after", "outcome", "status", "protocol_error", "hresult",
                             "item_count", "item_offset", "items"}
-                and _integer(row["elapsed_ms"]) and _integer(row["attempt"], 1, 2)
+                and _integer(row["elapsed_ms"]) and _integer(row["attempt"], 1, VOICE_OPEN_MAX_ATTEMPTS)
                 and row["step"] in ("services", "characteristics", "audio_subscription", "control_subscription")
                 and row["cache"] in ("cached", "live") and _integer(row["duration_ms"])
                 and all(_integer(row[k], -1, 1) for k in ("connected_before", "connected_after"))

@@ -205,7 +205,7 @@ async def receive(identity, parent, pipe):
                     voice.notification(attribute, value, stamp)
                 if voice_open.done():
                     await voice_open
-                    if voice.retry_after_activity():
+                    if voice.retry_ready():
                         voice_open = asyncio.create_task(voice.open())
                     else:
                         await voice.tick()

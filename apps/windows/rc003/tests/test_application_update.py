@@ -751,6 +751,11 @@ class PortableOnlyReleaseTests(unittest.TestCase):
 
 
 class UpdateDownloadTests(unittest.TestCase):
+    def setUp(self):
+        self.retry_wait = mock.patch.object(application_update, "_wait_download_retry")
+        self.retry_wait.start()
+        self.addCleanup(self.retry_wait.stop)
+
     def _release_and_opener(self, *, package_data: bytes = b"P" * 700_000):
         release_payload, manifest = _release_payload(
             "0.2.0-candidate.2", installer_data=package_data
@@ -835,7 +840,7 @@ class UpdateDownloadTests(unittest.TestCase):
             self.assertFalse((destination / release.installer.name).exists())
             self.assertFalse((destination / f"{release.installer.name}.part").exists())
 
-    def test_interrupted_download_cleans_part_file(self):
+    def test_interrupted_download_preserves_progress_after_bounded_retries(self):
         release, opener, package_data, _manifest = self._release_and_opener()
         opener._responses[release.installer.download_url] = [
             FakeResponse(
@@ -843,7 +848,7 @@ class UpdateDownloadTests(unittest.TestCase):
                 "https://release-assets.githubusercontent.com/installer",
                 content_length=len(package_data),
                 fail_after=application_update.DOWNLOAD_CHUNK_BYTES,
-            )
+            ), OSError("offline"), OSError("offline")
         ]
         with tempfile.TemporaryDirectory() as tmpdir:
             destination = Path(tmpdir)
@@ -852,9 +857,12 @@ class UpdateDownloadTests(unittest.TestCase):
                     release, "installer", destination, opener=opener
                 )
 
-            self.assertFalse((destination / f"{release.installer.name}.part").exists())
+            part = destination / f"{release.installer.name}.part"
+            self.assertEqual(part.read_bytes(), package_data[:application_update.DOWNLOAD_CHUNK_BYTES])
+            self.assertFalse((destination / release.installer.name).exists())
+            self.assertEqual(sum(call[0] == release.installer.download_url for call in opener.calls), 3)
 
-    def test_timeout_during_download_closes_response_and_cleans_part_file(self):
+    def test_timeout_closes_response_and_next_click_resumes(self):
         release, opener, package_data, _manifest = self._release_and_opener()
         response = FakeResponse(
             package_data,
@@ -863,7 +871,7 @@ class UpdateDownloadTests(unittest.TestCase):
             fail_after=application_update.DOWNLOAD_CHUNK_BYTES,
             fail_with=TimeoutError("timed out while downloading"),
         )
-        opener._responses[release.installer.download_url] = [response]
+        opener._responses[release.installer.download_url] = [response, TimeoutError(), TimeoutError()]
 
         with tempfile.TemporaryDirectory() as tmpdir:
             destination = Path(tmpdir)
@@ -875,7 +883,151 @@ class UpdateDownloadTests(unittest.TestCase):
             self.assertEqual(caught.exception.code, "timeout")
             self.assertTrue(response.closed)
             self.assertFalse((destination / release.installer.name).exists())
-            self.assertFalse((destination / f"{release.installer.name}.part").exists())
+            offset = application_update.DOWNLOAD_CHUNK_BYTES
+            self.assertEqual((destination / f"{release.installer.name}.part").stat().st_size, offset)
+            resumed = self._resumed_response(release, package_data, offset)
+            opener._responses[release.installer.download_url] = [resumed]
+            opener._responses[release.manifest.download_url] = [FakeResponse(
+                _manifest, release.manifest.download_url, content_length=len(_manifest))]
+            result = application_update.download_update_package(
+                release, "installer", destination, opener=opener)
+            self.assertEqual(result.path.read_bytes(), package_data)
+            self.assertEqual(opener.calls[-1][2]["Range"], f"bytes={offset}-")
+            self.assertFalse((destination / f"{release.installer.name}.part.json").exists())
+
+    @staticmethod
+    def _resumed_response(release, data, offset):
+        response = FakeResponse(data[offset:], release.installer.download_url,
+                                status=206, content_length=len(data) - offset)
+        response.headers["Content-Range"] = f"bytes {offset}-{len(data)-1}/{len(data)}"
+        return response
+
+    def test_network_interruption_automatically_resumes_and_verifies_all_bytes(self):
+        release, opener, data, _ = self._release_and_opener()
+        offset = application_update.DOWNLOAD_CHUNK_BYTES
+        failed = FakeResponse(data, release.installer.download_url, content_length=len(data),
+                              fail_after=offset, fail_with=TimeoutError())
+        resumed = self._resumed_response(release, data, offset)
+        opener._responses[release.installer.download_url] = [failed, resumed]
+        progress = []
+        with tempfile.TemporaryDirectory() as root:
+            result = application_update.download_update_package(release, "installer", Path(root),
+                opener=opener, progress_callback=lambda value, total: progress.append(value))
+            self.assertEqual(result.path.read_bytes(), data)
+            self.assertFalse(list(Path(root).glob("*.part*")))
+        self.assertTrue(failed.closed and resumed.closed)
+        self.assertEqual(opener.calls[-1][2]["Range"], f"bytes={offset}-")
+        self.assertEqual(progress[-1], len(data))
+        self.assertEqual([v for v in progress if v == 0], [0])
+
+    def test_server_ignoring_range_restarts_instead_of_appending(self):
+        release, opener, data, _ = self._release_and_opener()
+        opener._responses[release.installer.download_url] = [
+            FakeResponse(data, release.installer.download_url, fail_after=application_update.DOWNLOAD_CHUNK_BYTES),
+            FakeResponse(data, release.installer.download_url, content_length=len(data))]
+        with tempfile.TemporaryDirectory() as root:
+            result = application_update.download_update_package(release, "installer", Path(root), opener=opener)
+            self.assertEqual(result.path.read_bytes(), data)
+
+    def test_invalid_range_or_changed_manifest_never_publishes_mixed_bytes(self):
+        for scenario in ("wrong_start", "wrong_total", "missing_range", "bad_length", "corrupt_prefix", "old_manifest"):
+            with self.subTest(scenario=scenario), tempfile.TemporaryDirectory() as root:
+                release, opener, data, _ = self._release_and_opener()
+                path = Path(root) / f"{release.installer.name}.part"
+                metadata = Path(str(path) + ".json")
+                offset = application_update.DOWNLOAD_CHUNK_BYTES
+                path.write_bytes((b"X" * offset) if scenario == "corrupt_prefix" else data[:offset])
+                metadata.write_text(json.dumps({"size": len(data), "sha256":
+                    "0" * 64 if scenario == "old_manifest" else hashlib.sha256(data).hexdigest()}))
+                response = self._resumed_response(release, data, offset)
+                if scenario == "wrong_start": response.headers["Content-Range"] = f"bytes 0-{len(data)-1}/{len(data)}"
+                if scenario == "wrong_total": response.headers["Content-Range"] = f"bytes {offset}-{len(data)-1}/{len(data)+1}"
+                if scenario == "missing_range": response.headers.pop("Content-Range")
+                if scenario == "bad_length": response.headers["Content-Length"] = "1"
+                if scenario == "old_manifest": response = FakeResponse(data, release.installer.download_url, content_length=len(data))
+                opener._responses[release.installer.download_url] = [response]
+                if scenario == "old_manifest":
+                    result = application_update.download_update_package(release, "installer", Path(root), opener=opener)
+                    self.assertEqual(result.path.read_bytes(), data)
+                    self.assertNotIn("Range", opener.calls[-1][2])
+                else:
+                    with self.assertRaises(application_update.ApplicationUpdateError):
+                        application_update.download_update_package(release, "installer", Path(root), opener=opener)
+                    self.assertFalse((Path(root) / release.installer.name).exists())
+                self.assertFalse(path.exists() or metadata.exists())
+
+    def test_incomplete_response_resumes_and_download_timeout_is_separate(self):
+        release, opener, data, _ = self._release_and_opener()
+        offset = application_update.DOWNLOAD_READ_BYTES
+        opener._responses[release.installer.download_url] = [
+            FakeResponse(data[:offset], release.installer.download_url, content_length=len(data)),
+            self._resumed_response(release, data, offset)]
+        with tempfile.TemporaryDirectory() as root:
+            result = application_update.download_update_package(release, "installer", Path(root), opener=opener)
+            self.assertEqual(result.path.read_bytes(), data)
+        self.assertTrue(all(call[1] == 30 for call in opener.calls))
+        self.assertEqual(application_update.NETWORK_TIMEOUT_SECONDS, 10)
+
+    def test_fast_reads_do_not_flood_progress_but_always_report_completion(self):
+        release, opener, data, _ = self._release_and_opener()
+        progress = []
+        with tempfile.TemporaryDirectory() as root, mock.patch.object(
+                application_update.time, "monotonic", return_value=1.0):
+            result = application_update.download_update_package(release, "installer", Path(root),
+                opener=opener, progress_callback=lambda value, total: progress.append(value))
+            self.assertEqual(result.path.read_bytes(), data)
+        self.assertEqual(progress, [0, len(data)])
+
+    def test_nonretryable_http_error_is_not_repeated(self):
+        release, opener, _, _ = self._release_and_opener()
+        error = urllib.error.HTTPError(release.installer.download_url, 403, "forbidden", {}, None)
+        opener._responses[release.installer.download_url] = [error]
+        with tempfile.TemporaryDirectory() as root:
+            with self.assertRaises(application_update.ApplicationUpdateError) as caught:
+                application_update.download_update_package(release, "installer", Path(root), opener=opener)
+            self.assertEqual(caught.exception.code, "rate_limited")
+            self.assertEqual(list(Path(root).iterdir()), [])
+        self.assertEqual(len(opener.calls), 2)
+
+    def test_manifest_network_failure_retries_before_starting_package(self):
+        release, opener, data, manifest = self._release_and_opener()
+        opener._responses[release.manifest.download_url] = [TimeoutError(),
+            FakeResponse(manifest, release.manifest.download_url, content_length=len(manifest))]
+        with tempfile.TemporaryDirectory() as root:
+            result = application_update.download_update_package(release, "installer", Path(root), opener=opener)
+            self.assertEqual(result.path.read_bytes(), data)
+        self.assertEqual([call[0] for call in opener.calls],
+                         [release.manifest.download_url] * 2 + [release.installer.download_url])
+
+    def test_complete_prefix_is_reverified_without_requesting_asset(self):
+        release, opener, data, _ = self._release_and_opener()
+        progress = []
+        with tempfile.TemporaryDirectory() as root:
+            part = Path(root) / (release.installer.name + ".part")
+            part.write_bytes(data)
+            Path(str(part) + ".json").write_text(json.dumps(
+                {"size": len(data), "sha256": hashlib.sha256(data).hexdigest()}))
+            result = application_update.download_update_package(release, "installer", Path(root), opener=opener,
+                progress_callback=lambda received, total: progress.append(received))
+            self.assertEqual(result.path.read_bytes(), data)
+            self.assertFalse(list(Path(root).glob("*.part*")))
+        self.assertEqual(len(opener.calls), 1)
+        self.assertEqual(progress, [len(data)])
+
+    def test_cancel_during_retry_wait_stops_before_another_request(self):
+        release, opener, _, _ = self._release_and_opener()
+        opener._responses[release.installer.download_url] = [TimeoutError()]
+        cancel = threading.Event()
+        def cancel_wait(*_):
+            cancel.set()
+            application_update._check_download_cancelled(cancel)
+        with tempfile.TemporaryDirectory() as root, mock.patch.object(
+                application_update, "_wait_download_retry", side_effect=cancel_wait):
+            with self.assertRaises(application_update.ApplicationUpdateCancelled):
+                application_update.download_update_package(release, "installer", Path(root),
+                    opener=opener, cancel_event=cancel)
+            self.assertEqual(list(Path(root).iterdir()), [])
+        self.assertEqual(len(opener.calls), 2)
 
     def test_cancel_during_download_cleans_part_file(self):
         release, opener, _package_data, _manifest = self._release_and_opener()
@@ -946,6 +1098,7 @@ class UpdateCleanupTests(unittest.TestCase):
                 "0.2.0-candidate.16",
             ):
                 self._write_owned_package(root / version, version)
+            (root / "0.2.0-candidate.14" / "RemoteMicRC003-0.2.0-candidate.14-portable-unsigned.zip.part.json").write_text("{}")
             preserved_foreign = root / "0.2.0-candidate.13"
             preserved_foreign.mkdir()
             (preserved_foreign / "user-note.txt").write_text(
