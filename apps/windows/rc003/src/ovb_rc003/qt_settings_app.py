@@ -1958,7 +1958,10 @@ def _load_qt_classes() -> dict:
                 self.endpointOptionsChanged.emit()
             if recommended_changed:
                 self.recommendedEndpointIndexChanged.emit()
-            if selected_changed:
+            # Replacing the QML ComboBox model resets its currentIndex. Restore
+            # the saved selection even when its numeric index (including -1)
+            # stayed the same; the first item is not a fallback selection.
+            if options_changed or selected_changed:
                 self.selectedEndpointIndexChanged.emit()
             migration_message = str(payload.get("migration_message", ""))
             if migration_message:

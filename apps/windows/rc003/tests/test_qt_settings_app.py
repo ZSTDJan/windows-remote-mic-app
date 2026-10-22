@@ -11640,6 +11640,130 @@ print(json.dumps(result, ensure_ascii=False))
 """
 
 
+_OUTPUT_ENDPOINT_REFRESH_PROBE_SCRIPT = r"""
+import json
+from unittest import mock
+
+from PySide6.QtCore import QUrl, Qt
+from PySide6.QtGui import QGuiApplication
+from PySide6.QtQml import QQmlComponent, QQmlEngine, qmlRegisterSingletonInstance
+from PySide6.QtQuickControls2 import QQuickStyle
+from PySide6.QtTest import QTest
+from ovb_rc003 import audio_output, config, qt_settings_app as m
+from tests.test_qt_settings_app import SettingsControllerTests
+
+QQuickStyle.setStyle("FluentWinUI3")
+app = QGuiApplication.instance() or QGuiApplication([])
+fixture = SettingsControllerTests()
+fixture.setUp()
+try:
+    cable = audio_output.AudioEndpoint("CABLE Input (VB-Audio Virtual Cable)", "Windows WASAPI")
+    line = audio_output.AudioEndpoint("CABLE In 16ch (VB-Audio Virtual Cable)", "Windows WASAPI")
+    speakers = audio_output.AudioEndpoint("Speakers", "Windows WASAPI")
+    saved = config.default_config()
+    saved.update(output_endpoint_name=cable.name, output_endpoint_host_api=cable.host_api)
+    config.save_config(config.config_path(), saved)
+    with mock.patch.object(audio_output, "enumerate_output_endpoints", return_value=[line, cable]) as enumerate_endpoints, mock.patch.object(m.windows_diagnostics, "preflight_output_endpoint_isolated") as preflight:
+        controller, model = fixture._make_controller()
+        diagnostics = m._load_qt_classes()["DiagnosticsController"](
+            controller, config.config_root(), auto_refresh=False
+        )
+        # Keep the real page, controller and model-reset signals together.
+        for instance, name in ((controller, "SettingsController"), (model, "ButtonMappingModel"), (diagnostics, "DiagnosticsController")):
+            qmlRegisterSingletonInstance(type(instance), "OvbRc003Settings", 1, 0, name, instance)
+        engine = QQmlEngine()
+        component = QQmlComponent(engine)
+        component.setData(b'''import QtQuick
+import QtQuick.Controls
+ApplicationWindow {
+    visible: true; width: 760; height: 900
+    Tokens { id: theme }
+    VoicePage { anchors.fill: parent; tokens: theme }
+}''', QUrl.fromLocalFile(str(m._qml_directory() / "OutputEndpointRefreshProbe.qml")))
+        assert component.isReady(), [error.toString() for error in component.errors()]
+        window = component.create()
+        assert window is not None, [error.toString() for error in component.errors()]
+
+        def find(root, name):
+            children = list(root.children())
+            if callable(getattr(root, "childItems", None)):
+                children.extend(child for child in root.childItems() if child not in children)
+            for child in children:
+                if child.objectName() == name:
+                    return child
+                found = find(child, name)
+                if found is not None:
+                    return found
+            return None
+
+        combo = find(window, "endpointCombo")
+        assert combo is not None
+        results = []
+
+        def check(label, index, name):
+            for _ in range(4):
+                app.processEvents()
+                window.grabWindow()
+            assert controller.selectedEndpointIndex == index, label
+            assert combo.property("currentIndex") == index, (label, combo.property("currentText"))
+            expected_text = controller.endpointOptions[index] if index >= 0 else ""
+            assert combo.property("currentText") == expected_text, label
+            assert config.load_config(config.config_path())["output_endpoint_name"] == name, label
+            results.append(label)
+
+        check("initial", 1, cable.name)
+        saved_bytes = config.config_path().read_bytes()
+        for label, endpoints, index in (
+            ("added", [line, cable, speakers], 1),
+            ("removed", [line, cable], 1),
+            ("reordered", [audio_output.AudioEndpoint("A Speakers", cable.host_api), line, cable], 2),
+            ("missing_saved", [line, speakers], 0),
+            ("restored", [line, cable], 1),
+        ):
+            enumerate_endpoints.return_value = endpoints
+            controller._request_endpoint_options_refresh()
+            check(label, index, cable.name)
+        preflight.assert_not_called()
+        assert config.config_path().read_bytes() == saved_bytes
+
+        # An unconfigured device stays blank when its available outputs change.
+        controller._config.update(output_endpoint_name="", output_endpoint_host_api="")
+        config.save_config(config.config_path(), controller._config)
+        controller._request_endpoint_options_refresh()
+        check("unselected", -1, "")
+        enumerate_endpoints.return_value = [line, cable, speakers]
+        controller._request_endpoint_options_refresh()
+        check("unselected_model_changed", -1, "")
+        preflight.assert_not_called()
+
+        # Exercise the real control's keyboard activation and rollback binding.
+        enumerate_endpoints.return_value = [line, cable]
+        controller._request_endpoint_options_refresh()
+        combo.forceActiveFocus()
+        QTest.keyClick(window, Qt.Key_End)
+        check("user_saved", 1, cable.name)
+        assert preflight.call_count == 1
+        preflight.side_effect = audio_output.AudioOutputUnavailableError("unavailable")
+        QTest.keyClick(window, Qt.Key_Up)
+        check("open_failed", 1, cable.name)
+        assert preflight.call_count == 2
+        assert controller.errorMessage
+        preflight.side_effect = None
+        with mock.patch.object(config, "save_config", side_effect=OSError("disk full")):
+            QTest.keyClick(window, Qt.Key_Up)
+            check("save_failed", 1, cable.name)
+        assert preflight.call_count == 3
+        assert "无法写入" in controller.errorMessage
+        window.close()
+        engine.deleteLater()
+        app.processEvents()
+finally:
+    fixture.tearDown()
+    fixture.doCleanups()
+print(json.dumps(results))
+"""
+
+
 _THREE_PAGE_LAYOUT_PROBE_SCRIPT = r"""
 import json
 import os
@@ -13179,6 +13303,20 @@ class ThreePageSettingsSourceContractTests(unittest.TestCase):
 
 @unittest.skipUnless(_HAS_PYSIDE6, _SKIP_REASON)
 class SelectionComboBoxBehaviorTests(unittest.TestCase):
+    def test_output_endpoint_refresh_preserves_the_saved_selection_in_real_voice_page(self):
+        import subprocess
+
+        env = dict(os.environ, QT_QPA_PLATFORM="offscreen", PYTHONIOENCODING="utf-8")
+        result = subprocess.run(
+            [sys.executable, "-c", _OUTPUT_ENDPOINT_REFRESH_PROBE_SCRIPT],
+            env=env, capture_output=True, text=True, encoding="utf-8", timeout=60,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(json.loads(result.stdout.strip().splitlines()[-1]), [
+            "initial", "added", "removed", "reordered", "missing_saved", "restored",
+            "unselected", "unselected_model_changed", "user_saved", "open_failed", "save_failed",
+        ])
+
     def test_recommendation_decorates_only_a_real_recommended_index(self):
         import subprocess
 
