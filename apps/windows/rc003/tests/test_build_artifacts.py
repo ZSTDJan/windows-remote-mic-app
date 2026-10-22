@@ -3041,12 +3041,12 @@ class RootDocumentConsistencyTests(unittest.TestCase):
         self.notices_text = _THIRD_PARTY_NOTICES_PATH.read_text(encoding="utf-8")
 
     def test_root_readme_does_not_lump_windows_in_with_planned_research(self):
-        self.assertIn("小米蓝牙语音遥控器 2 Pro", self.root_readme_text)
-        self.assertIn("谷歌 TV Chromecast 遥控器", self.root_readme_text)
+        self.assertIn("小米遥控器2 Pro", self.root_readme_text)
+        self.assertIn("谷歌 Chromecast 遥控器", self.root_readme_text)
         self.assertIn("[开发者文档](apps/windows/rc003/README.md)", self.root_readme_text)
 
     def test_root_readme_places_the_admin_workaround_in_usage_limits(self):
-        self.assertIn("按页面提示处理未就绪的项目", self.root_readme_text)
+        self.assertIn("未就绪提示，按页面说明处理", self.root_readme_text)
         self.assertIn("[使用说明](apps/windows/rc003/README.md)", self.root_readme_text)
         windows_readme = _README_PATH.read_text(encoding="utf-8")
         self.assertIn("管理员按键组件", windows_readme)
