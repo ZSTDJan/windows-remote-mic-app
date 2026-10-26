@@ -99,7 +99,7 @@ class EtwRecoveryTests(unittest.TestCase):
             self.assertIsNone(capture._guard)
 
 
-def window_api(rows):
+def window_api(rows, titles=None):
     """Win32 metadata fixture: hwnd -> (pid, class, mark, visible)."""
     api = mock.Mock()
     def enumerate_windows(visit, _):
@@ -119,12 +119,43 @@ def window_api(rows):
     api.EnumWindows.side_effect = enumerate_windows
     api.GetWindowThreadProcessId.side_effect = process_id
     api.GetClassNameW.side_effect = class_name
+    def window_title(hwnd, buffer, capacity):
+        title = (titles or {}).get(hwnd)
+        if title is None:
+            return 0
+        buffer.value = title[:capacity - 1]
+        return len(buffer.value)
+    api.GetWindowTextW.side_effect = window_title
     api.GetPropW.side_effect = lambda hwnd, _: rows[hwnd][2]
     api.IsWindowVisible.side_effect = lambda hwnd: rows[hwnd][3]
     return api, lambda visit: visit
 
 
 class WindowSelectionTests(unittest.TestCase):
+    def test_new_build_selects_ordinary_voice_and_excludes_summary_windows(self):
+        rows = {h: (42, 'wetype.flutter.setting', 1, True) for h in (1, 2, 3)}
+        titles = {1: '语音输入', 2: '录音笔', 3: 'wetype_voice_summary_mini'}
+        api, callback = window_api(rows, titles)
+        with mock.patch.object(finish, '_api', return_value=(api, callback)):
+            self.assertEqual(finish._windows(42, require_voice_title=True), (1,))
+            rows.pop(1)
+            self.assertEqual(finish._windows(42, require_voice_title=True), ())
+            # Old builds do not acquire the new title requirement.
+            api.GetWindowTextW.reset_mock()
+            self.assertEqual(finish._windows(42), (2, 3))
+            api.GetWindowTextW.assert_not_called()
+
+    def test_new_title_failure_truncation_and_ambiguity_are_not_unique_targets(self):
+        rows = {h: (42, 'wetype.flutter.setting', 1, True) for h in (1, 2)}
+        for title in (None, '', '语' * 256):
+            with self.subTest(title=title), mock.patch.object(
+                    finish, '_api', return_value=window_api(rows, {1: '语音输入', 2: title})):
+                with self.assertRaises(OSError):
+                    finish._windows(42, require_voice_title=True)
+        with mock.patch.object(finish, '_api', return_value=window_api(
+                rows, {1: '语音输入', 2: '语音输入'})):
+            self.assertEqual(finish._windows(42, require_voice_title=True), (1, 2))
+
     def test_voice_selected_with_statusbar_menu_and_ordinary_settings_visible(self):
         rows = {
             1: (42, 'wetype.flutter.setting', 1, True),
@@ -172,6 +203,35 @@ class FinishTests(unittest.TestCase):
         self._active.side_effect = [{self.target.identity}, set()]
         self.assertEqual(self.run_finish(), ('requested', 'capture_ended', 0))
         self._send.assert_called_once_with(99)
+
+    def test_each_verified_build_preserves_its_selector_through_bind_and_finish(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder, 'wetype_update.exe')
+            path.write_bytes(b'non-executable fixture')
+            peer = Peer(42, 123, 'sid', 1, str(path))
+            self.inspect_peer.return_value = peer
+            for digest, title_required in finish._VERIFIED.items():
+                with self.subTest(digest=digest), mock.patch.object(finish.hashlib, 'file_digest') as hashed:
+                    hashed.return_value.hexdigest.return_value = digest
+                    self._active.side_effect = None
+                    self._active.return_value = {self.target.identity}
+                    self._windows.return_value = (99,)
+                    target, result = finish.bind(self.target.identity)
+                    self.assertEqual(result, 'bound')
+                    self.assertEqual(target.require_voice_title, title_required)
+                    self._windows.assert_called_with(42, require_voice_title=title_required)
+                    self._active.side_effect = [{self.target.identity}, set()]
+                    self._send.reset_mock()
+                    outcome = finish.finish(target, deadline=time.monotonic() + 1, cancelled=lambda: False)
+                    self.assertEqual(outcome, ('requested', 'capture_ended', 0))
+                    self._windows.assert_called_with(42, require_voice_title=title_required)
+                    self._send.assert_called_once_with(99)
+                    # A renamed/disappeared target between bind and finish is rejected.
+                    self._windows.return_value = ()
+                    self._send.reset_mock()
+                    self.assertEqual(finish.finish(target, deadline=time.monotonic() + 1,
+                                                  cancelled=lambda: False)[0], 'target_changed')
+                    self._send.assert_not_called()
 
     def test_no_message_for_manual_replacement_process_window_or_expired(self):
         for name, value in [('_active', {('endpoint', 'manual', 42)}),

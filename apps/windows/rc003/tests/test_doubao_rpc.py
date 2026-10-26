@@ -305,6 +305,30 @@ class DoubaoRpcTests(unittest.TestCase):
             with self.assertRaises(doubao_rpc.DoubaoRpcCallError):
                 doubao_rpc.send_voice_press_stop()
 
+    def test_09320_stop_preserves_native_button_parameter_and_abi(self):
+        library = _FakeLibrary()
+        hashes = {
+            "rpc.dll": "a3116866686a6c3f2b5d022ff9575ad70849899e5016d519dc5b5eb2b5bbf791",
+            "ImeService.exe": "0352f9b70b33a2cde9632154435611dbea7731c85461457da143a683dae5a646",
+            "tsf-oime-core.dll": "984b8e80b8221ea0b659a93f5b8a396207f0e846879b135872e12a765de6c39f",
+        }
+        with mock.patch.object(
+            doubao_rpc, "_resolve_rpc_dll_path",
+            return_value=r"C:\Program Files\DoubaoIME\versions\v0.9.3.20\rpc.dll",
+        ), mock.patch.object(
+            doubao_rpc, "_module_sha256",
+            side_effect=lambda value: hashes[Path(value).name],
+        ), mock.patch.object(doubao_rpc.ctypes, "WinDLL", return_value=library):
+            doubao_rpc.send_voice_press_stop()
+        self.assertEqual(library.RpcPipe_SimpleMessageEx.calls, [
+            (b"\\\\.\\pipe\\ObricIme\\oime-server", 0x3E9, 1, 0, None),
+        ])
+        self.assertEqual(library.RpcPipe_SimpleMessageEx.argtypes, (
+            ctypes.c_char_p, ctypes.c_uint32, ctypes.c_uint32,
+            ctypes.c_uint32, ctypes.c_char_p,
+        ))
+        self.assertIs(library.RpcPipe_SimpleMessageEx.restype, ctypes.c_int32)
+
 
 class DoubaoPhysicalizerTests(unittest.TestCase):
     def setUp(self):
@@ -345,10 +369,56 @@ class DoubaoPhysicalizerTests(unittest.TestCase):
             (0x782D80, 0x782EB2, 0x782EB8, 0x783B7A, 0x40),
             (0x7829E0, 0x782EB2, 0x782EB8, 0x783B7A, 0x38),
             (0x7829E0, 0x782B12, 0x782B18, 0x7837DA, 0x40),
+            (0x7CD5A0, 0x7CE5B2, 0x7CE5B8, 0x7837DA, 0x38),
+            (0x7CD5A0, 0x7CE5B2, 0x7CE5B9, 0, 0),
+            (0x7829E0, 0x7CE5B2, 0x7CE5B8, 0, 0),
         ):
             with self.subTest(layout=layout):
                 with self.assertRaises(doubao_rpc.DoubaoRpcUnavailableError):
                     doubao_rpc._physicalizer_source((0xA3, 0x4C), *layout)
+
+    def test_09320_checks_entry_and_forward_before_hooks_without_stack_writes(self):
+        source = doubao_rpc._physicalizer_source(
+            (0xA3, 0x4C), 0x7CD5A0, 0x7CE5B2, 0x7CE5B8, 0, 0)
+        self.assertIn("hasBytes(callback, [0x40, 0x55, 0x56, 0x57", source)
+        self.assertIn("hasBytes(earlyForward, [0xFF, 0x15, 0x50, 0xAE, 0xB9", source)
+        self.assertLess(source.index("throw new Error('verified Doubao hook layout changed')"),
+                        source.index("Interceptor.attach(callback"))
+        self.assertEqual(source.count("Interceptor.attach("), 1)
+        self.assertEqual(source.count("Interceptor.replace("), 1)
+        self.assertNotIn("decisionGate", source)
+        self.assertNotIn("consumedStackOffset", source)
+        self.assertNotIn("this.context.rsp", source)
+        self.assertNotIn("this.context.pc", source)
+        self.assertIn("this.returnAddress.equals(earlyContinue)", source)
+        self.assertIn("event.equals(frame.event)", source)
+        self.assertIn("forwardSlot.readPointer().equals(nextHook)", source)
+        self.assertIn("return originalNextHook(hook, code, message, event)", source)
+        self.assertIn("callback_path = 'native_forward'", source)
+        self.assertIn("const suppressVks = new Set([0x4C])", source)
+
+    def test_09320_start_uses_only_verified_forward_and_unloads(self):
+        script = _ready_script()
+        session = mock.Mock()
+        session.create_script.return_value = script
+        self.processes.return_value = [types.SimpleNamespace(pid=46500, name="ImeService.exe")]
+        fake_frida = types.SimpleNamespace(attach=mock.Mock(return_value=session))
+        physicalizer = doubao_rpc.DoubaoPhysicalizer()
+        with mock.patch.dict(sys.modules, {"frida": fake_frida}), mock.patch.object(
+            physicalizer, "_probe_module",
+            return_value=r"C:\Program Files\DoubaoIME\versions\v0.9.3.20\ImeService.exe",
+        ), mock.patch.object(doubao_rpc, "_module_sha256",
+            return_value="0352f9b70b33a2cde9632154435611dbea7731c85461457da143a683dae5a646",
+        ):
+            self.assertTrue(physicalizer.start((0xA3, 0x4C)))
+        source = session.create_script.call_args.args[0]
+        for address in ("7CD5A0", "7CE5B2", "7CE5B8"):
+            self.assertIn(f"module.base.add(0x{address})", source)
+        self.assertNotIn("consumedStackOffset", source)
+        self.assertEqual(physicalizer.status, "active")
+        physicalizer.stop()
+        script.unload.assert_called_once()
+        session.detach.assert_called_once()
 
     def test_new_build_starts_with_new_layout_and_cleans_up(self):
         script = _ready_script()
@@ -419,7 +489,7 @@ class DoubaoPhysicalizerTests(unittest.TestCase):
         self.assertIn("module.base.add(0x7427F7)", source)
         self.assertIn("module.base.add(0x7431CD)", source)
         self.assertIn("verified Doubao hook layout changed", source)
-        self.assertIn("const frame = { payload: null }", source)
+        self.assertIn("const frame = { payload: null, event: null }", source)
         self.assertLess(
             source.index("stack.push(frame)"),
             source.index("if (args[0].toInt32() < 0) return"),

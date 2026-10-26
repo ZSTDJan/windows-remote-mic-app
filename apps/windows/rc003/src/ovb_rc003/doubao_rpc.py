@@ -30,6 +30,10 @@ VOICE_PRESS_STOP_MESSAGE = 0x3E9
 _DOUBAO_0900_HOOK_LAYOUT = (0x7426C0, 0x7427F1, 0x7427F7, 0x7431CD, 0x38)
 _DOUBAO_09122_HOOK_LAYOUT = (0x782D80, 0x782EB2, 0x782EB8, 0x783B7A, 0x38)
 _DOUBAO_0927_HOOK_LAYOUT = (0x7829E0, 0x782B12, 0x782B18, 0x7837DA, 0x38)
+# 0.9.3.20 has one shared CallNextHookEx exit after native processing.
+# Zero decision/stack fields mean no consumed-byte hook; never reuse the old
+# callback's stack layout in this rewritten callback.
+_DOUBAO_09320_HOOK_LAYOUT = (0x7CD5A0, 0x7CE5B2, 0x7CE5B8, 0, 0)
 _VERIFIED_IME_SERVICE_BUILDS = {
     "94b17bdca571ac3cd2dafa687b4cb8e3a789cda9d044276483003b0a9e8f77a6":
         _DOUBAO_0900_HOOK_LAYOUT,
@@ -37,6 +41,8 @@ _VERIFIED_IME_SERVICE_BUILDS = {
         _DOUBAO_09122_HOOK_LAYOUT,
     "38742f838d58b6e5b87a08564c6917da1d75ac6b81ec6ee3388ffaaac7c9f3ad":
         _DOUBAO_0927_HOOK_LAYOUT,
+    "0352f9b70b33a2cde9632154435611dbea7731c85461457da143a683dae5a646":
+        _DOUBAO_09320_HOOK_LAYOUT,
 }
 # These gates belong to the same exact build as the callback, not just the
 # same version label. Both are checked in loaded memory before any hook.
@@ -52,6 +58,14 @@ _VERIFIED_HOOK_SIGNATURES = {
     _DOUBAO_0927_HOOK_LAYOUT: (
         bytes.fromhex("FF 15 40 E8 95 00 E9 E9 0C 00 00"),
         bytes.fromhex("80 7C 24 38 00 75 16"),
+    ),
+}
+# Entry and the single forward call plus its cleanup continuation. These are
+# checked before either hook is installed, alongside the exact disk digest.
+_VERIFIED_FORWARD_ONLY_SIGNATURES = {
+    _DOUBAO_09320_HOOK_LAYOUT: (
+        bytes.fromhex("40 55 56 57 41 54 41 55 41 56 41 57 48 8D AC 24 D0 F6 FF FF"),
+        bytes.fromhex("FF 15 50 AE B9 00 48 8B D8 48 8D 8D A0 05 00 00 E8 49 9B FF FF 48 8B C3"),
     ),
 }
 _VERIFIED_VOICE_STOP_BUILDS = {
@@ -71,6 +85,13 @@ _VERIFIED_VOICE_STOP_BUILDS = {
         "38742f838d58b6e5b87a08564c6917da1d75ac6b81ec6ee3388ffaaac7c9f3ad",
         "ef827968a374de491529f65eade36d58c7eab78933ebe8508bd2fed8563290c0",
         # 0.9.2.7 retains the native stop button's wParam=1 fast-stop path.
+        1,
+    ),
+    "a3116866686a6c3f2b5d022ff9575ad70849899e5016d519dc5b5eb2b5bbf791": (
+        "0352f9b70b33a2cde9632154435611dbea7731c85461457da143a683dae5a646",
+        "984b8e80b8221ea0b659a93f5b8a396207f0e846879b135872e12a765de6c39f",
+        # Native stop button and RPC handler still use source 1 to bypass
+        # the first-800-ms guard; an idle RPC stop cannot start recording.
         1,
     ),
 }
@@ -140,17 +161,80 @@ def _physicalizer_source(
         callback_rva, early_forward_rva, early_continue_rva,
         decision_gate_rva, consumed_stack_offset,
     )
-    signatures = _VERIFIED_HOOK_SIGNATURES.get(layout)
+    forward_only = layout in _VERIFIED_FORWARD_ONLY_SIGNATURES
+    signatures = (_VERIFIED_FORWARD_ONLY_SIGNATURES.get(layout) if forward_only
+                  else _VERIFIED_HOOK_SIGNATURES.get(layout))
     if signatures is None:
         raise DoubaoRpcUnavailableError("Doubao hook signatures are not verified")
-    early_forward_bytes, decision_gate_bytes = (
+    first_bytes, second_bytes = (
         ", ".join(f"0x{byte:02X}" for byte in signature)
         for signature in signatures
     )
+    if forward_only:
+        gate_declarations = """
+const nextHook = Process.getModuleByName('user32.dll').getExportByName('CallNextHookEx');
+const forwardSlot = earlyForward.add(6).add(earlyForward.add(2).readS32());
+"""
+        gate_check = (f"!hasBytes(callback, [{first_bytes}]) ||\n"
+                      f"    !hasBytes(earlyForward, [{second_bytes}]) ||\n"
+                      "    !forwardSlot.readPointer().equals(nextHook)")
+        decision_hook = ""
+        forward_hook = """
+const nextHookTypes = ['pointer', 'int', 'uint64', 'pointer'];
+const originalNextHook = new NativeFunction(nextHook, 'int64', nextHookTypes);
+Interceptor.replace(nextHook, new NativeCallback(function(hook, code, message, event) {
+  const frame = currentFrame();
+  if (this.returnAddress.equals(earlyContinue) && code >= 0 &&
+      frame !== null && frame.payload !== null &&
+      event.equals(frame.event) && message.toNumber() === frame.payload.message &&
+      suppressVks.has(frame.payload.vk)) {
+    frame.payload.callback_suppressed = true;
+    frame.payload.callback_path = 'native_forward';
+    return 1;
+  }
+  return originalNextHook(hook, code, message, event);
+}, 'int64', nextHookTypes));
+"""
+    else:
+        gate_declarations = (
+            f"const decisionGate = module.base.add(0x{int(decision_gate_rva):X});\n"
+            f"const consumedStackOffset = 0x{int(consumed_stack_offset):X};"
+        )
+        gate_check = (f"!hasBytes(earlyForward, [{first_bytes}]) ||\n"
+                      f"    !hasBytes(decisionGate, [{second_bytes}])")
+        decision_hook = """
+Interceptor.attach(decisionGate, {
+  onEnter(args) {
+    const frame = currentFrame();
+    if (frame === null || frame.payload === null ||
+        !suppressVks.has(frame.payload.vk)) return;
+    const consumed = this.context.rsp.add(consumedStackOffset);
+    frame.payload.original_consumed = consumed.readU8() !== 0;
+    consumed.writeU8(1);
+    frame.payload.callback_suppressed = true;
+    frame.payload.callback_path = 'normal_decision';
+  }
+});
+"""
+        forward_hook = """
+Interceptor.attach(earlyForward, {
+  onEnter(args) {
+    const frame = currentFrame();
+    if (frame === null || frame.payload === null ||
+        !suppressVks.has(frame.payload.vk)) return;
+    this.context.rax = ptr(1);
+    this.context.pc = earlyContinue;
+    frame.payload.callback_suppressed = true;
+    frame.payload.callback_path = 'early_bypass';
+  }
+});
+"""
     allowed_vks = ", ".join(f"0x{int(vk):02X}" for vk in vk_codes)
     # The final non-modifier edge is the only part that can leak printable
     # text into the foreground application. Doubao's verified callback sees it
-    # first, then one of the verified forward gates marks it consumed.
+    # first, then a verified forward gate marks it consumed. The forward-only
+    # route replaces forwarding only from the verified call site and owned
+    # event. Native cleanup runs normally; every other caller is passed through.
     suppressed_vks = ", ".join(
         f"0x{int(vk):02X}"
         for vk in _shortcut_vks_to_suppress(vk_codes)
@@ -163,8 +247,7 @@ const module = Process.getModuleByName('ImeService.exe');
 const callback = module.base.add(0x{int(callback_rva):X});
 const earlyForward = module.base.add(0x{int(early_forward_rva):X});
 const earlyContinue = module.base.add(0x{int(early_continue_rva):X});
-const decisionGate = module.base.add(0x{int(decision_gate_rva):X});
-const consumedStackOffset = 0x{int(consumed_stack_offset):X};
+{gate_declarations}
 const allowedVks = new Set([{allowed_vks}]);
 const suppressVks = new Set([{suppressed_vks}]);
 const pendingByThread = new Map();
@@ -179,8 +262,7 @@ function hasBytes(address, expected) {{
   }}
   return true;
 }}
-if (!hasBytes(earlyForward, [{early_forward_bytes}]) ||
-    !hasBytes(decisionGate, [{decision_gate_bytes}])) {{
+if ({gate_check}) {{
   throw new Error('verified Doubao hook layout changed');
 }}
 function currentFrame() {{
@@ -196,7 +278,7 @@ Interceptor.attach(callback, {{
       stack = [];
       pendingByThread.set(threadId, stack);
     }}
-    const frame = {{ payload: null }};
+    const frame = {{ payload: null, event: null }};
     stack.push(frame);
     this.remoteMicFrame = frame;
     this.remoteMicThread = threadId;
@@ -224,6 +306,7 @@ Interceptor.attach(callback, {{
       callback_path: 'native'
     }};
     frame.payload = payload;
+    frame.event = event;
   }},
   onLeave(retval) {{
     const frame = this.remoteMicFrame;
@@ -237,31 +320,11 @@ Interceptor.attach(callback, {{
     if (frame.payload !== null) send(frame.payload);
   }}
 }});
-Interceptor.attach(earlyForward, {{
-  onEnter(args) {{
-    const frame = currentFrame();
-    if (frame === null || frame.payload === null ||
-        !suppressVks.has(frame.payload.vk)) return;
-    this.context.rax = ptr(1);
-    this.context.pc = earlyContinue;
-    frame.payload.callback_suppressed = true;
-    frame.payload.callback_path = 'early_bypass';
-  }}
-}});
-Interceptor.attach(decisionGate, {{
-  onEnter(args) {{
-    const frame = currentFrame();
-    if (frame === null || frame.payload === null ||
-        !suppressVks.has(frame.payload.vk)) return;
-    const consumed = this.context.rsp.add(consumedStackOffset);
-    frame.payload.original_consumed = consumed.readU8() !== 0;
-    consumed.writeU8(1);
-    frame.payload.callback_suppressed = true;
-    frame.payload.callback_path = 'normal_decision';
-  }}
-}});
+{forward_hook}
+{decision_hook}
 send({{type: 'ready', callback: callback.toString(),
-      early_forward: earlyForward.toString(), decision_gate: decisionGate.toString()}});
+      early_forward: earlyForward.toString(),
+      decision_gate: {"null" if forward_only else "decisionGate.toString()"}}});
 """
 
 
@@ -407,7 +470,7 @@ class DoubaoPhysicalizer:
             verified=layout is not None,
             callback_rva=int(layout[0]) if layout is not None else -1,
             early_forward_rva=int(layout[1]) if layout is not None else -1,
-            decision_gate_rva=int(layout[3]) if layout is not None else -1,
+            decision_gate_rva=int(layout[3]) if layout is not None and layout[3] else -1,
         )
         return layout
 

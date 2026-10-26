@@ -1,7 +1,7 @@
 """One normal finish for a Google-owned WeType toggle capture, never a toggle.
 
 Private message ABI is pinned to inspected binaries. Unknown versions decline.
-No text, process-memory reads, foreground changes or key injection are used.
+No transcription text, process-memory reads, foreground changes or key injection.
 """
 from __future__ import annotations
 
@@ -15,17 +15,22 @@ import time
 from .chromecast_host_activity import read_wetype_capture
 from .chromecast_pipe_windows import inspect_peer, _bind
 
-_VERIFIED = frozenset({
-    "7aae1bd693bd1e94fd2da9ccf577c8c92bfa88d87b719df3b9330fa81d19c292",  # 2.1.4.6: live + static
-    "99ee9c3b517275c3be1ac6bc941a70d78ee7bc1139dba1bf9df9275d7de4d1ab",  # 2.1.4.10: static
-})
+# Exact build -> whether its reused summary-window class requires a title check.
+_VERIFIED = {
+    "7aae1bd693bd1e94fd2da9ccf577c8c92bfa88d87b719df3b9330fa81d19c292": False,  # 2.1.4.6
+    "99ee9c3b517275c3be1ac6bc941a70d78ee7bc1139dba1bf9df9275d7de4d1ab": False,  # 2.1.4.10
+    "30c235d59ca403c0fdad6c1cae57001d450fc71c5bbcf2e48d59d4d0a82dbffe": True,  # 3.0.0.38
+}
 STOP_WINDOW_SECONDS = 1.0
 BIND_WINDOW_SECONDS = 1.0
 BIND_POLL_SECONDS = .25
-# In both verified binaries, StatusBarWnd and ConfigMenuWindow also carry
+# In the verified binaries, StatusBarWnd and ConfigMenuWindow also carry
 # WeTypeVoiceOwnUi. Only VoiceBridge's Flutter window is a finish target;
 # the ordinary settings window shares this class but does not have the mark.
 _VOICE_WINDOW_CLASS = "wetype.flutter.setting"
+# 3.0.0.38 also marks summary windows of this class. Preserve the older
+# builds' selector; require the ordinary VoiceBridge title only for this build.
+_VOICE_WINDOW_TITLE = "语音输入"
 
 
 @dataclass(frozen=True)
@@ -34,6 +39,7 @@ class Target:
     peer: object
     hwnd: int
     image_stamp: tuple
+    require_voice_title: bool = False
 
 
 def _api():
@@ -44,12 +50,13 @@ def _api():
     _bind(u, "GetWindowThreadProcessId", W.DWORD, W.HWND, C.POINTER(W.DWORD))
     _bind(u, "GetPropW", W.HANDLE, W.HWND, W.LPCWSTR)
     _bind(u, "GetClassNameW", C.c_int, W.HWND, W.LPWSTR, C.c_int)
+    _bind(u, "GetWindowTextW", C.c_int, W.HWND, W.LPWSTR, C.c_int)
     _bind(u, "SendMessageTimeoutW", C.c_ssize_t, W.HWND, W.UINT, W.WPARAM,
           W.LPARAM, W.UINT, W.UINT, C.POINTER(C.c_size_t))
     return u, callback
 
 
-def _windows(pid):
+def _windows(pid, *, require_voice_title=False):
     u, callback = _api()
     found = []
     class_unavailable = False
@@ -67,6 +74,14 @@ def _windows(pid):
                 class_unavailable = True
                 return False
             if name.value == _VOICE_WINDOW_CLASS:
+                if require_voice_title:
+                    title = C.create_unicode_buffer(256)
+                    length = u.GetWindowTextW(hwnd, title, len(title))
+                    if length <= 0 or length >= len(title) - 1:
+                        class_unavailable = True
+                        return False
+                    if title.value != _VOICE_WINDOW_TITLE:
+                        return True
                 found.append(int(hwnd))
         return True
 
@@ -106,7 +121,8 @@ def bind(identity, *, expected_peer=None, expected_stamp=None):
         # cannot be mistaken for a reason to keep retrying.
         if _active() != {identity}:
             return None, "capture_mismatch"
-        windows = _windows(peer.pid)
+        require_voice_title = _VERIFIED[digest]
+        windows = _windows(peer.pid, require_voice_title=require_voice_title)
         if not windows:
             return None, "voice_window_missing"
         if len(windows) != 1:
@@ -115,7 +131,7 @@ def bind(identity, *, expected_peer=None, expected_stamp=None):
             return None, "capture_mismatch"
         if inspect_peer(peer.pid) != peer:
             return None, "process_changed"
-        return Target(identity, peer, windows[0], before), "bound"
+        return Target(identity, peer, windows[0], before, require_voice_title), "bound"
     except Exception:
         return None, "unavailable"
 
@@ -189,7 +205,8 @@ def finish(target, *, deadline, cancelled):
         if (inspect_peer(target.peer.pid) != target.peer
                 or _stamp(Path(target.peer.image)) != target.image_stamp):
             return "process_changed", "unobserved", 0
-        if _windows(target.peer.pid) != (target.hwnd,) or _active() != {target.identity}:
+        if (_windows(target.peer.pid, require_voice_title=target.require_voice_title)
+                != (target.hwnd,) or _active() != {target.identity}):
             return "target_changed", "unobserved", 0
         if cancelled() or time.monotonic() >= deadline:
             return "expired_or_cancelled", "unobserved", 0
