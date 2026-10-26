@@ -19,13 +19,13 @@
 
 ## 下载与版本
 
-**[下载正式版 1.0.97](https://github.com/ZSTDJan/windows-remote-mic-app/releases/download/v1.0.97/RemoteMicRC003-1.0.97-portable-unsigned.zip)** · [版本说明](https://github.com/ZSTDJan/windows-remote-mic-app/releases/tag/v1.0.97) · [SHA256SUMS.txt](https://github.com/ZSTDJan/windows-remote-mic-app/releases/download/v1.0.97/SHA256SUMS.txt)
+**[下载正式版 1.0.98](https://github.com/ZSTDJan/windows-remote-mic-app/releases/download/v1.0.98/RemoteMicRC003-1.0.98-portable-unsigned.zip)** · [版本说明](https://github.com/ZSTDJan/windows-remote-mic-app/releases/tag/v1.0.98) · [SHA256SUMS.txt](https://github.com/ZSTDJan/windows-remote-mic-app/releases/download/v1.0.98/SHA256SUMS.txt)
 
-当前正式版为 **1.0.97**，本版主要变化：
+当前正式版为 **1.0.98**，本版主要变化：
 
-- 修复语音页输出端点列表变化后，下拉框可能跳到第一项、与已保存设置不一致的问题。
-- 改善内置更新下载中断后的恢复，支持校验后的断点续传；清单和程序包分别最多尝试五次，实际速度仍取决于下载线路。
-- 谷歌遥控器启动时遇到临时语音连接失败，可自动补连；含首次及普通按键后备，最多尝试五次，成功、停止或不可重试错误后结束。
+- 补充豆包输入法 0.9.3.20 的语音按键与正常结束适配，保留此前已适配的旧版路径。
+- 补充微信输入法 3.0.0.38 的谷歌遥控器开关型正常结束适配，并区分普通语音与总结窗口。
+- 搜狗输入法 16.9 的语音组件仍兼容现有校验；其它输入法更新后的兼容性需分别确认。
 
 **仍在排查：** 持续显示“点击重新连接”、豆包首次语音启动偶发异常，以及 Chatterfly 有录音气泡但不上屏的部分反馈，尚未确认解决。
 
