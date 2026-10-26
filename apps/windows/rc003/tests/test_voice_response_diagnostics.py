@@ -112,7 +112,8 @@ class MicrophoneHistoryTests(unittest.TestCase):
         registry.OpenKey.side_effect = open_key
         registry.QueryValueEx.side_effect = lambda key, field: (
             (200 if 'Private' in key else 100) if field=='LastUsedTimeStart' else 0, 11)
-        with mock.patch.dict(sys.modules, {'winreg': registry}):
+        with mock.patch.dict(sys.modules, {'winreg': registry}), \
+                mock.patch.object(response.time, 'monotonic', return_value=1):
             result = response.microphone_history({'imeservice.exe': 'doubao_ime'})
         self.assertEqual(result['status'], 'captured')
         self.assertEqual(result['entries'][0]['last_start'], 200)
@@ -121,6 +122,19 @@ class MicrophoneHistoryTests(unittest.TestCase):
         self.assertNotIn(names[-1], opened)
         self.assertNotIn('Private', json.dumps(result))
         registry.SetValueEx.assert_not_called()
+
+    def test_history_time_budget_stays_partial_without_claiming_live_capture(self):
+        registry = mock.Mock(HKEY_CURRENT_USER=1, KEY_READ=0x20019)
+        registry.OpenKey.return_value = mock.MagicMock()
+        with mock.patch.dict(sys.modules, {'winreg': registry}), \
+                mock.patch.object(response.time, 'monotonic', side_effect=[1, 1.051]):
+            result = response.microphone_history({'imeservice.exe': 'doubao_ime'})
+        self.assertEqual(result['status'], 'partial')
+        self.assertFalse(result['complete'])
+        self.assertEqual(result['entries'], [])
+        self.assertEqual(result['live_capture_confirmation'], 'unknown')
+        registry.EnumKey.assert_not_called()
+        registry.QueryValueEx.assert_not_called()
 
     def test_denied_registry_is_not_microphone_closed(self):
         registry = mock.Mock(HKEY_CURRENT_USER=1, KEY_READ=1)
