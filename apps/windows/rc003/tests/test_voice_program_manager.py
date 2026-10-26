@@ -207,6 +207,7 @@ class VoiceProgramSettingsTests(unittest.TestCase):
                 "豆包输入法",
                 "Chatterfly",
                 "网易叭哥说",
+                "智谱AI输入法",
             ],
         )
         self.assertEqual(manager.provider_index("custom"), 4)
@@ -215,6 +216,8 @@ class VoiceProgramSettingsTests(unittest.TestCase):
         self.assertEqual(manager.provider_id_for_index(5), "chatterfly")
         self.assertEqual(manager.provider_index("bageshuo"), 6)
         self.assertEqual(manager.provider_id_for_index(6), "bageshuo")
+        self.assertEqual(manager.provider_index("autoglm"), 7)
+        self.assertEqual(manager.provider_id_for_index(7), "autoglm")
         self.assertEqual(
             manager.normalize_voice_program_settings({"provider": "custom"})["provider"],
             "custom",

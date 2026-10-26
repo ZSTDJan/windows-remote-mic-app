@@ -50,6 +50,25 @@ def read_bageshuo_capture():
     )
 
 
+def read_autoglm_capture():
+    """Observe Zhipu AutoGLM's own capture session on the active mic endpoint.
+
+    AutoGLM is Electron: several identically named processes exist, but only the
+    main process holds the WASAPI capture session registered by its Rust
+    recorder. That session is kept open and flips to state 1 exactly while
+    dictating (measured +119 ms after the shortcut, matching its own
+    HOLD_START_DELAY_MS=120), so this mirrors the Bageshuo path.
+    """
+
+    candidates = voice_program_manager.diagnostic_voice_processes()
+    if len(candidates) > 32:
+        raise OSError("voice process enumeration is incomplete")
+    return audio.read_capture_sessions(
+        {pid for provider, pid, _ in candidates
+         if provider == voice_program_manager.VOICE_PROGRAM_AUTOGLM}
+    )
+
+
 def doubao_capture_pids():
     """Return only the adapter's exact, still-to-be-verified capture candidate."""
 

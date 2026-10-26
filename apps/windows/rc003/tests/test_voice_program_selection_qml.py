@@ -24,12 +24,12 @@ assert rc003_recording_row.property("descriptionText") == "仅支持按住型"
 assert not rc003_recording_row.property("editorColumnVisible")
 assert not find(window, "remoteRecordingModeRow").property("visible")
 combo = find(window, "voiceProgramCombo")
-assert combo.property("count") == 5
+assert combo.property("count") == 6
 assert combo.property("currentIndex") == -1, (combo.property("currentIndex"), controller.selectedVoiceProgramIndex)
 assert combo.property("displayText") == "请选择语音程序"
 assert not find(window, "voiceHotkeyRow").property("visible")
 assert not find(window, "voiceProgramAutoStartRow").property("visible")
-assert QMetaObject.invokeMethod(combo, "activated", Q_ARG(int, 5))
+assert QMetaObject.invokeMethod(combo, "activated", Q_ARG(int, 6))
 assert controller.selectedVoiceProgramIndex == 0
 
 def choose(index, provider):
@@ -71,7 +71,7 @@ def load_legacy_custom():
     render(window, app)
     assert combo.property("currentIndex") == -1
     assert combo.property("displayText") == "自定义程序（旧）"
-    assert combo.property("count") == 5
+    assert combo.property("count") == 6
     assert m.config.config_path(m.config.config_root()).read_bytes() == before
 
 load_legacy_custom()
@@ -105,7 +105,7 @@ if image_dir:
     window.grabWindow().save(str(image_path / (os.environ["VOICE_SELECTION_STYLE"] + ".png")))
 choose(0, "sogou")
 assert controller.voiceProgramLaunchOnBridgeStart
-assert QMetaObject.invokeMethod(combo, "activated", Q_ARG(int, 5))
+assert QMetaObject.invokeMethod(combo, "activated", Q_ARG(int, 6))
 assert controller.selectedVoiceProgramIndex == 1
 load_legacy_custom()
 assert not controller.voiceProgramLaunchOnBridgeStart
@@ -170,6 +170,20 @@ controller.setRemoteRecordingPreferences(0, controller.remoteRecordingLimitIndex
 render(window, app)
 assert (find(window, "voiceHotkeyRow").property("descriptionText")
         == "自动读取叭哥说“语音润色”键；按住说话、松手停止")
+choose(5, "autoglm")
+assert row.property("stateText") != "尚未接通"
+assert find(window, "voiceHotkeyRow").property("visible")
+assert (find(window, "voiceHotkeyRow").property("descriptionText")
+        == "自动读取智谱“按住录音”键；按住超过 1 秒才会上屏")
+assert find(window, "refreshVoiceHotkeyButton").property("visible")
+assert find(window, "recordVoiceHotkeyButton").property("visible")
+assert find(window, "openVoiceProgramSettingsButton").property("visible")
+# AutoGLM really has both dictation keys, so the hint must follow the device
+# setting instead of advertising one fixed mode.
+controller.setRemoteRecordingPreferences(1, controller.remoteRecordingLimitIndex)
+render(window, app)
+assert (find(window, "voiceHotkeyRow").property("descriptionText")
+        == "自动读取智谱“点按录音”键；录音短于 1 秒不会上屏")
 
 # Returning to Xiaomi restores the read-only row without stealing focus or
 # causing a configuration write/restart as a side effect of rendering it.

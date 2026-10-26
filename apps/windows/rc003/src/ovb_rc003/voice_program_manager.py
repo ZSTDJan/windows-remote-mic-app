@@ -27,6 +27,7 @@ VOICE_PROGRAM_WETYPE = "wetype"
 VOICE_PROGRAM_DOUBAO_IME = "doubao_ime"
 VOICE_PROGRAM_CHATTERFLY = "chatterfly"
 VOICE_PROGRAM_BAGESHUO = "bageshuo"
+VOICE_PROGRAM_AUTOGLM = "autoglm"
 LEGACY_VOICE_PROGRAM_WINDOWS_DICTATION = "windows_dictation"
 VOICE_PROGRAM_CUSTOM = "custom"
 
@@ -37,6 +38,7 @@ VOICE_PROGRAM_SELECTABLE_PROVIDER_ORDER = (
     VOICE_PROGRAM_DOUBAO_IME,
     VOICE_PROGRAM_CHATTERFLY,
     VOICE_PROGRAM_BAGESHUO,
+    VOICE_PROGRAM_AUTOGLM,
 )
 # Keep the legacy custom index (4) readable; new menu choices use their own order.
 # Append new providers at the end so existing indices stay stable.
@@ -48,6 +50,7 @@ VOICE_PROGRAM_PROVIDER_ORDER = (
     VOICE_PROGRAM_CUSTOM,
     VOICE_PROGRAM_CHATTERFLY,
     VOICE_PROGRAM_BAGESHUO,
+    VOICE_PROGRAM_AUTOGLM,
 )
 
 VOICE_PROGRAM_PROVIDER_NAMES = {
@@ -57,6 +60,7 @@ VOICE_PROGRAM_PROVIDER_NAMES = {
     VOICE_PROGRAM_DOUBAO_IME: "豆包输入法",
     VOICE_PROGRAM_CHATTERFLY: "Chatterfly",
     VOICE_PROGRAM_BAGESHUO: "网易叭哥说",
+    VOICE_PROGRAM_AUTOGLM: "智谱AI输入法",
     VOICE_PROGRAM_CUSTOM: "自定义程序",
 }
 
@@ -82,6 +86,13 @@ _BAGESHUO_PROCESS_NAME = "bageshuo.exe"
 _BAGESHUO_INSTALL_DIRECTORY_NAME = "bageshuo"
 _BAGESHUO_STORE_DIRECTORY_NAME = "com.bageshuo"
 _BAGESHUO_STORE_FILE_NAME = "bageshuo-store.json"
+# Zhipu AutoGLM (智谱AI输入法): an Electron voice-typing app installed per user
+# under %LOCALAPPDATA%\Programs\AutoGLM. It exposes two independent dictation
+# shortcuts (recordHold / recordToggle) in %APPDATA%\智谱AI输入法\settings.json.
+_AUTOGLM_PROCESS_NAME = "AutoGLM.exe"
+_AUTOGLM_INSTALL_DIRECTORY_PARTS = ("Programs", "AutoGLM")
+_AUTOGLM_STORE_DIRECTORY_NAME = "智谱AI输入法"
+_AUTOGLM_STORE_FILE_NAME = "settings.json"
 _SYSTEM_MANAGED_PROVIDERS = frozenset({VOICE_PROGRAM_WETYPE, VOICE_PROGRAM_CHATTERFLY})
 _BUILTIN_ADAPTER_PROVIDERS = frozenset({VOICE_PROGRAM_DOUBAO_IME})
 _LAUNCH_ELEVATED_DEFAULTS = {
@@ -298,6 +309,13 @@ def status_text(status: VoiceProgramStatus) -> str:
             return "已找到网易叭哥说；当前未检测到语音后台进程。"
         if status.code == "running":
             return "网易叭哥说已安装并正在运行；语音是否就绪仍需实际验证。"
+    if status.provider_id == VOICE_PROGRAM_AUTOGLM:
+        if status.code == "not_found":
+            return "未找到智谱AI输入法；正常安装后会自动识别，无需手选路径。"
+        if status.code == "stopped":
+            return "已找到智谱AI输入法；当前未检测到主进程。"
+        if status.code == "running":
+            return "智谱AI输入法已安装并正在运行；录音短于 1 秒不会上屏。"
     if status.code == "disabled":
         return "请选择语音程序；未配置时仅普通按键可用。"
     if status.code == "not_found":
@@ -455,6 +473,20 @@ def resolve_voice_program(
             executable,
         )
 
+    if provider_id == VOICE_PROGRAM_AUTOGLM:
+        executable = discover_autoglm_executable(
+            platform=platform,
+            process_iter=process_iter,
+        )
+        return ResolvedVoiceProgram(
+            provider_id,
+            display_name,
+            executable,
+            (_AUTOGLM_PROCESS_NAME,),
+            "discovered" if executable is not None else "missing",
+            executable,
+        )
+
     executable = discover_sogou_voice_executable(
         platform=platform,
         process_iter=process_iter,
@@ -571,6 +603,21 @@ def resolve_voice_program_settings_target(
         # Bageshuo owns its settings UI inside the main app window, so the
         # settings entry is the application executable itself.
         executable = discover_bageshuo_executable(
+            platform=current_platform,
+            process_iter=process_iter,
+        )
+        if executable is not None:
+            return VoiceProgramSettingsTarget(
+                provider_id,
+                display_name,
+                "executable",
+                str(executable),
+            )
+        return VoiceProgramSettingsTarget(provider_id, display_name, "missing")
+    if provider_id == VOICE_PROGRAM_AUTOGLM:
+        # AutoGLM keeps its shortcut editor inside the Electron main window, so
+        # the settings entry is the application executable itself.
+        executable = discover_autoglm_executable(
             platform=current_platform,
             process_iter=process_iter,
         )
@@ -1139,6 +1186,57 @@ def _bageshuo_version_key(path: Path) -> tuple[int, ...]:
     return tuple(int(part) for part in re.findall(r"\d+", path.parent.name)) or (0,)
 
 
+def discover_autoglm_executable(
+    *,
+    platform: Optional[str] = None,
+    process_iter: Optional[Callable[[], Iterable[ProcessInfo]]] = None,
+    install_root_reader: Optional[Callable[[], Iterable[str]]] = None,
+) -> Optional[Path]:
+    """Locate Zhipu AutoGLM's per-user main executable.
+
+    AutoGLM is an Electron app: one installation spawns several identically
+    named processes, so a running process is preferred over the documented
+    install directory exactly like the other providers.
+    """
+
+    current_platform = sys.platform if platform is None else platform
+    if current_platform != "win32":
+        return None
+
+    candidates: list[Path] = []
+    for process in (process_iter or _iter_windows_processes)():
+        executable = process.executable
+        if (process.name.casefold() == _AUTOGLM_PROCESS_NAME.casefold()
+                and executable is not None):
+            candidates.append(executable)
+    for raw_root in (install_root_reader or _read_autoglm_install_roots)():
+        raw_text = str(raw_root).strip().strip('"')
+        if not raw_text:
+            continue
+        root = Path(os.path.expandvars(raw_text))
+        try:
+            candidates.append(root / _AUTOGLM_PROCESS_NAME)
+        except (OSError, ValueError):
+            continue
+    existing = [path for path in dict.fromkeys(candidates) if path.is_file()]
+    if not existing:
+        return None
+    return max(existing, key=_autoglm_version_key)
+
+
+def _read_autoglm_install_roots() -> Iterable[str]:
+    """Return the documented per-user install root without touching the registry."""
+
+    local_appdata = os.environ.get("LOCALAPPDATA")
+    if not local_appdata:
+        return ()
+    return (str(Path(local_appdata).joinpath(*_AUTOGLM_INSTALL_DIRECTORY_PARTS)),)
+
+
+def _autoglm_version_key(path: Path) -> tuple[int, ...]:
+    return tuple(int(part) for part in re.findall(r"\d+", path.parent.name)) or (0,)
+
+
 def _validated_configured_path(raw: object) -> Optional[Path]:
     text = str(raw).strip()
     if not text:
@@ -1664,6 +1762,7 @@ def diagnostic_voice_processes(*, include_wetype_capture: bool = False) -> tuple
         **{name.casefold(): VOICE_PROGRAM_DOUBAO_IME for name in _DOUBAO_PROCESS_NAMES},
         **{name.casefold(): VOICE_PROGRAM_CHATTERFLY for name in (_CHATTERFLY_PROCESS_NAME, "voiceinput.exe")},
         **{name.casefold(): VOICE_PROGRAM_BAGESHUO for name in (_BAGESHUO_PROCESS_NAME,)},
+        **{name.casefold(): VOICE_PROGRAM_AUTOGLM for name in (_AUTOGLM_PROCESS_NAME,)},
     }
     if include_wetype_capture:
         # WeType 2.1.3.18 also hosts capture in its settings executable. This

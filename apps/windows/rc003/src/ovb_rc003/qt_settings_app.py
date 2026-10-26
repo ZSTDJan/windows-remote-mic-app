@@ -4212,6 +4212,7 @@ def _load_qt_classes() -> dict:
                 voice_program_manager.VOICE_PROGRAM_DOUBAO_IME,
                 voice_program_manager.VOICE_PROGRAM_CHATTERFLY,
                 voice_program_manager.VOICE_PROGRAM_BAGESHUO,
+                voice_program_manager.VOICE_PROGRAM_AUTOGLM,
             ):
                 candidate = dict(settings_snapshot)
                 candidate["provider"] = provider_id
@@ -5401,6 +5402,7 @@ def _load_qt_classes() -> dict:
                     voice_program_manager.VOICE_PROGRAM_WETYPE,
                     voice_program_manager.VOICE_PROGRAM_CHATTERFLY,
                     voice_program_manager.VOICE_PROGRAM_BAGESHUO,
+                    voice_program_manager.VOICE_PROGRAM_AUTOGLM,
                 ):
                     self._set_error_message("")
                     self._set_status_message(read_result.message, self._VOICE_PAGE_INDEX)
@@ -5543,6 +5545,13 @@ def _load_qt_classes() -> dict:
             bool,
             lambda self: self._selected_voice_program_is(
                 voice_program_manager.VOICE_PROGRAM_BAGESHUO
+            ),
+            notify=selectedVoiceProgramIndexChanged,
+        )
+        voiceProgramAutoglmSelected = Property(
+            bool,
+            lambda self: self._selected_voice_program_is(
+                voice_program_manager.VOICE_PROGRAM_AUTOGLM
             ),
             notify=selectedVoiceProgramIndexChanged,
         )
@@ -8912,6 +8921,9 @@ def _load_qt_classes() -> dict:
                     else "未找到 Chatterfly 设置程序。"
                     if target.provider_id
                     == voice_program_manager.VOICE_PROGRAM_CHATTERFLY
+                    else "未找到智谱AI输入法程序。"
+                    if target.provider_id
+                    == voice_program_manager.VOICE_PROGRAM_AUTOGLM
                     else "当前语音程序没有可打开的设置入口。"
                 )
                 self._set_error_message(message, self._VOICE_PAGE_INDEX)

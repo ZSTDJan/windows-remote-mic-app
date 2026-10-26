@@ -496,7 +496,7 @@ def _normalize_voice_hotkey(config: Dict[str, Any]) -> None:
     current = provider_hotkeys[provider_id]["hold"]
 
     # Additive per-provider field; never migrate a held shortcut into a toggle.
-    for toggle_provider in ("wetype", "sogou", "doubao_ime", "bageshuo"):
+    for toggle_provider in ("wetype", "sogou", "doubao_ime", "bageshuo", "autoglm"):
         entry = raw_provider_hotkeys.get(toggle_provider, {})
         if isinstance(entry, dict) and "toggle" in entry:
             result = voice_hotkey_sync_windows.validate_provider_hotkey(toggle_provider, entry.get("toggle", ""))
@@ -516,7 +516,7 @@ def _normalize_voice_hotkey(config: Dict[str, Any]) -> None:
 def voice_hotkey_trigger_for_settings(config_data, provider_id=None):
     """UI selection only; the legacy runtime mirrors remain held shortcuts."""
     provider = provider_id or config_data.get("voice_program", {}).get("provider")
-    return "toggle" if provider in ("wetype", "sogou", "doubao_ime", "bageshuo") and config_data.get("remote_recording_mode") == "toggle" else "hold"
+    return "toggle" if provider in ("wetype", "sogou", "doubao_ime", "bageshuo", "autoglm") and config_data.get("remote_recording_mode") == "toggle" else "hold"
 
 
 def voice_hotkey_for_provider(
@@ -588,6 +588,7 @@ def set_voice_hotkey_for_provider(
         "sogou",
         "doubao_ime",
         voice_program_manager.VOICE_PROGRAM_BAGESHUO,
+        voice_program_manager.VOICE_PROGRAM_AUTOGLM,
     ):
         raise ValueError("unsupported voice shortcut trigger")
     normalized = str(shortcut).strip().lower()
