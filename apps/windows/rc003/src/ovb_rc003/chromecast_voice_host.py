@@ -22,6 +22,8 @@ from .chromecast_host_activity import (
     CaptureWatch,
     read_doubao_capture,
     read_sogou_capture,
+    read_bageshuo_capture,
+    read_autoglm_capture,
 )
 from .chromecast_wetype_toggle import ToggleShortcut
 from . import chromecast_doubao_handsfree
@@ -220,6 +222,14 @@ class VoiceHost:
             trigger = str(
                 services.settings().get("remote_recording_mode", "hold")
             ).strip().lower()
+            if self.provider == voice_program_manager.VOICE_PROGRAM_BAGESHUO:
+                # 网易叭哥说 has no hold-to-talk: one press starts dictation and
+                # the next press stops it, so the shortcut itself is always a
+                # toggle regardless of the device-level recording mode shared
+                # with other providers. Hold mode is emulated on top of it:
+                # the physical press starts the dictation and _stop_host sends
+                # the closing press when the button is released.
+                trigger = "toggle"
         # The running service also owns the mapping page's detection request.
         # Claim before output/hotkey preparation; suppress this whole attempt.
         if key_detection_bridge.publish_next_button(services.config_root, "mic"):
@@ -246,6 +256,8 @@ class VoiceHost:
                     "sogou",
                     voice_program_manager.VOICE_PROGRAM_DOUBAO_IME,
                     voice_program_manager.VOICE_PROGRAM_CHATTERFLY,
+                    voice_program_manager.VOICE_PROGRAM_BAGESHUO,
+                    voice_program_manager.VOICE_PROGRAM_AUTOGLM,
                 )
                 or (self.provider == "wetype" and services.configured_backend() != "wetype_hotkey")
                 or not services.voice_mapping_enabled()):
@@ -268,6 +280,14 @@ class VoiceHost:
             if self.provider == voice_program_manager.VOICE_PROGRAM_CHATTERFLY:
                 self._start_chatterfly(input_epoch, trigger)
                 return
+            if (self.provider == voice_program_manager.VOICE_PROGRAM_BAGESHUO
+                    and trigger == "toggle"):
+                self._start_bageshuo_toggle(input_epoch)
+                return
+            if (self.provider == voice_program_manager.VOICE_PROGRAM_AUTOGLM
+                    and trigger == "toggle"):
+                self._start_autoglm_toggle(input_epoch)
+                return
             if config.voice_hotkey_trigger_for_settings(services.settings()) == "toggle":
                 self._start_toggle(input_epoch)
                 return
@@ -276,11 +296,20 @@ class VoiceHost:
             if not win32_input.can_begin_tracked_hold(tokens):
                 self._fail_voice("keyboard safety tracking is unavailable; shortcut was not sent")
                 return
-            if (
-                self.provider == voice_program_manager.VOICE_PROGRAM_DOUBAO_IME
-                and not services.ensure_key_tracking(tokens, backend)
-            ):
-                self._fail_voice("语音按键兼容处理不可用；未发送快捷键。")
+            # A marked right-Alt hold needs the process-level physicalizer so an
+            # injected right-Alt is never confused with a physical one. The
+            # helper returns True for every shortcut that does not use right-Alt,
+            # so this stays provider-agnostic: WeType/豆包 keep working and
+            # 网易叭哥说 (default right-Alt) is covered without a special case.
+            if not services.ensure_key_tracking(tokens, backend):
+                label = {
+                    "wetype": "微信",
+                    "sogou": "搜狗",
+                    voice_program_manager.VOICE_PROGRAM_DOUBAO_IME: "豆包",
+                    voice_program_manager.VOICE_PROGRAM_BAGESHUO: "网易叭哥说",
+                    voice_program_manager.VOICE_PROGRAM_AUTOGLM: "智谱AI输入法",
+                }.get(self.provider, "语音程序")
+                self._fail_voice(f"{label}右 Alt 按键跟踪不可用；未发送快捷键。")
                 return
             if not services.audio.open():
                 self._fail_voice("audio output could not open", status.VOICE_RUNTIME_OUTPUT_OPEN_FAILED)
@@ -295,8 +324,16 @@ class VoiceHost:
             self.capture_watch = CaptureWatch(
                 (read_doubao_capture
                  if self.provider == voice_program_manager.VOICE_PROGRAM_DOUBAO_IME
+                 else read_bageshuo_capture
+                 if self.provider == voice_program_manager.VOICE_PROGRAM_BAGESHUO
+                 else read_autoglm_capture
+                 if self.provider == voice_program_manager.VOICE_PROGRAM_AUTOGLM
                  else None),
-                fast_start=self.provider == voice_program_manager.VOICE_PROGRAM_DOUBAO_IME,
+                fast_start=self.provider in {
+                    voice_program_manager.VOICE_PROGRAM_DOUBAO_IME,
+                    voice_program_manager.VOICE_PROGRAM_BAGESHUO,
+                    voice_program_manager.VOICE_PROGRAM_AUTOGLM,
+                },
             )
             self.capture_watch.begin()
             cancelled = lambda: (
@@ -367,6 +404,123 @@ class VoiceHost:
         self.engaged = True
         services.logger.info(
             "Chromecast Chatterfly attempt=%s transport=ipc host_state=waiting_window",
+            self.attempt,
+        )
+
+    def _start_bageshuo_toggle(self, input_epoch):
+        services = self.services
+        shortcut = config.voice_hotkey_for_provider(
+            services.settings(),
+            voice_program_manager.VOICE_PROGRAM_BAGESHUO,
+            trigger="toggle",
+        ) or config.voice_hotkey_for_provider(
+            # Bageshuo exposes a single shortcut, so fall back to the value the
+            # hold column already carries when no separate toggle value exists.
+            services.settings(),
+            voice_program_manager.VOICE_PROGRAM_BAGESHUO,
+        )
+        if not shortcut:
+            self._fail_voice("请先录入与网易叭哥说语音润色一致的快捷键。")
+            return
+        self.capture_watch = CaptureWatch(read_bageshuo_capture, fast_start=True)
+        self.capture_watch.begin()
+        if self.capture_watch.baseline is None:
+            self._fail_voice("网易叭哥说录音状态无法读取；本次未发送快捷键。")
+            return
+        if self.capture_watch.baseline:
+            self._fail_voice("网易叭哥说已在收音；未重复发送快捷键。")
+            return
+        if not services.audio.open():
+            self._fail_voice("audio output could not open", status.VOICE_RUNTIME_OUTPUT_OPEN_FAILED)
+            return
+        # Bageshuo owns its own activation, so never run WeType's preparation;
+        # but a right-Alt shortcut still needs the marked-key physicalizer.
+        self._toggle = ToggleShortcut(
+            shortcut,
+            prepare=lambda: False,
+            ensure_key_tracking=lambda tokens: services.ensure_key_tracking(
+                tokens, _VOICE_HOTKEY_BACKEND_MARKED),
+        )
+        services.audio.stats.reset()
+        tokens = self._toggle.tokens
+        services.begin_diagnostic(
+            provider_shortcut_mode="toggle",
+            effective_hotkey_tokens=tokens,
+            effective_backend="toggle_shortcut",
+        )
+        self.diagnostic_started = True
+        cancelled = lambda: (
+            self.stopping.is_set() or self.input_lost.is_set()
+            or self._attempt_cancelled(self.attempt)
+            or input_epoch is not None and input_epoch != self.input_epoch
+        )
+        try:
+            self._toggle.send(cancelled)
+        except Exception:
+            services.logger.exception("Bageshuo toggle shortcut failed; no automatic resend")
+            self._fail_voice("网易叭哥说启动快捷键发送失败；未自动重发。")
+            return
+        self.engaged = True
+        services.logger.info(
+            "Chromecast Bageshuo attempt=%s shortcut_sent=True host_state=waiting_capture",
+            self.attempt,
+        )
+
+    def _start_autoglm_toggle(self, input_epoch):
+        services = self.services
+        # AutoGLM registers two independent shortcuts. A toggle attempt must use
+        # its own recordToggle key: its recordHold key only spans a key-down/key-up
+        # pair, so tapping it would open and close dictation inside one frame and
+        # drop the audio under its 1 s upload threshold.
+        shortcut = config.voice_hotkey_for_provider(
+            services.settings(),
+            voice_program_manager.VOICE_PROGRAM_AUTOGLM,
+            trigger="toggle",
+        )
+        if not shortcut:
+            self._fail_voice("请先在智谱AI输入法中录入点按录音快捷键，然后刷新语音按键。")
+            return
+        self.capture_watch = CaptureWatch(read_autoglm_capture, fast_start=True)
+        self.capture_watch.begin()
+        if self.capture_watch.baseline is None:
+            self._fail_voice("智谱AI输入法录音状态无法读取；本次未发送快捷键。")
+            return
+        if self.capture_watch.baseline:
+            self._fail_voice("智谱AI输入法已在收音；未重复发送快捷键。")
+            return
+        if not services.audio.open():
+            self._fail_voice("audio output could not open", status.VOICE_RUNTIME_OUTPUT_OPEN_FAILED)
+            return
+        # AutoGLM owns its own activation, so never run WeType's preparation; the
+        # marked-key physicalizer stays wired for a user-chosen virtualized key.
+        self._toggle = ToggleShortcut(
+            shortcut,
+            prepare=lambda: False,
+            ensure_key_tracking=lambda tokens: services.ensure_key_tracking(
+                tokens, _VOICE_HOTKEY_BACKEND_MARKED),
+        )
+        services.audio.stats.reset()
+        tokens = self._toggle.tokens
+        services.begin_diagnostic(
+            provider_shortcut_mode="toggle",
+            effective_hotkey_tokens=tokens,
+            effective_backend="toggle_shortcut",
+        )
+        self.diagnostic_started = True
+        cancelled = lambda: (
+            self.stopping.is_set() or self.input_lost.is_set()
+            or self._attempt_cancelled(self.attempt)
+            or input_epoch is not None and input_epoch != self.input_epoch
+        )
+        try:
+            self._toggle.send(cancelled)
+        except Exception:
+            services.logger.exception("AutoGLM toggle shortcut failed; no automatic resend")
+            self._fail_voice("智谱AI输入法启动快捷键发送失败；未自动重发。")
+            return
+        self.engaged = True
+        services.logger.info(
+            "Chromecast AutoGLM attempt=%s shortcut_sent=True host_state=waiting_capture",
             self.attempt,
         )
 
@@ -599,6 +753,34 @@ class VoiceHost:
             return
         if self.provider == "wetype" and not self.confirmed:
             return
+        if self.provider == voice_program_manager.VOICE_PROGRAM_BAGESHUO:
+            # Two equally bad failure modes, and neither the lifecycle reason
+            # nor self.confirmed can tell them apart: a missed closing press
+            # leaves the dictation running and rejects the next attempt as
+            # "already recording", while a press sent after it stopped starts
+            # a NEW dictation. Ask the ground truth instead -- only a live
+            # capture on the active mic endpoint justifies the press. This
+            # also covers a release that arrives before the host confirmed
+            # readiness, which self.confirmed alone would have refused.
+            try:
+                if not any(item.state == 1 for item in read_bageshuo_capture()):
+                    return
+            except Exception:
+                self.services.logger.exception(
+                    "Bageshuo stop state unavailable; no second toggle")
+                return
+        if self.provider == voice_program_manager.VOICE_PROGRAM_AUTOGLM:
+            # Same two failure modes as Bageshuo, and AutoGLM also exposes its
+            # live capture state, so ask the ground truth instead of the
+            # lifecycle reason. A hold attempt has no ToggleShortcut and never
+            # reaches this branch.
+            try:
+                if not any(item.state == 1 for item in read_autoglm_capture()):
+                    return
+            except Exception:
+                self.services.logger.exception(
+                    "AutoGLM stop state unavailable; no second toggle")
+                return
         self._toggle_stop_sent = True  # Never resend after a failure or duplicate notification.
         try:
             switched = self._toggle.send(lambda: self.stopping.is_set() or self.input_lost.is_set())
@@ -655,6 +837,20 @@ class VoiceHost:
         # its watcher. No other stop reason or cleanup retry may submit the host.
         finish_deadline = ((time.monotonic() if received_at is None else received_at)
                            + chromecast_wetype_finish.STOP_WINDOW_SECONDS)
+        # 网易叭哥说 and 智谱AI输入法 own their own dictation session, so EVERY
+        # lifecycle end may be the last chance to close it. This used to be
+        # limited to the device-reported ends, which left two paths with the
+        # third-party dictation still running: a start timeout (holding the
+        # physical button past START_TIMEOUT in toggle mode never activates the
+        # software stream) and a plain release in hold mode. A running leftover
+        # then rejects the next attempt as "already recording", so the user could
+        # not recover from the app. _toggle_second_press proves a live capture
+        # before sending, so widening this cannot double-press; AutoGLM's hold
+        # attempt owns no ToggleShortcut and returns there immediately.
+        if (self.provider in (voice_program_manager.VOICE_PROGRAM_BAGESHUO,
+                              voice_program_manager.VOICE_PROGRAM_AUTOGLM)
+                and not self.stopping.is_set() and not self.input_lost.is_set()):
+            self._toggle_second_press()
         finish_wetype = (
             reason in ("device_ended", "time_limit") and self.provider == "wetype"
             and self._toggle is not None and not self._toggle_stop_sent
@@ -739,6 +935,7 @@ class VoiceHost:
             services.set_active(False)
             if released and (self._toggle is not None or self.provider in {
                     "sogou", voice_program_manager.VOICE_PROGRAM_CHATTERFLY,
+                    voice_program_manager.VOICE_PROGRAM_BAGESHUO,
                 }) and self.failure_result is None:
                 # Do not leave the settings page stuck in ACTIVE, or claim that
                 # a provider recognized audio merely because a shortcut was delivered.
@@ -987,6 +1184,8 @@ class VoiceHost:
                     "wetype": "微信",
                     voice_program_manager.VOICE_PROGRAM_DOUBAO_IME: "豆包",
                     voice_program_manager.VOICE_PROGRAM_CHATTERFLY: "Chatterfly",
+                    voice_program_manager.VOICE_PROGRAM_BAGESHUO: "网易叭哥说",
+                    voice_program_manager.VOICE_PROGRAM_AUTOGLM: "智谱AI输入法",
                 }.get(self.provider, "语音程序")
                 self.services.logger.info("Chromecast recording attempt=%s 原因=%s接收已结束(host_capture_ended)", self.attempt, label)
                 self.reply("stop")
@@ -1019,6 +1218,8 @@ class VoiceHost:
             "sogou",
             voice_program_manager.VOICE_PROGRAM_DOUBAO_IME,
             voice_program_manager.VOICE_PROGRAM_CHATTERFLY,
+            voice_program_manager.VOICE_PROGRAM_BAGESHUO,
+            voice_program_manager.VOICE_PROGRAM_AUTOGLM,
         } or wetype_toggle:
             confirmed = True if self.capture_watch is not None and self.capture_watch.status == "tracking" else None
         else:
@@ -1029,7 +1230,10 @@ class VoiceHost:
                 self._stop_host()
                 return
             self.confirmed = self.ready_sent = True
-            if wetype_toggle or self.provider == voice_program_manager.VOICE_PROGRAM_CHATTERFLY:
+            if (wetype_toggle
+                    or self.provider == voice_program_manager.VOICE_PROGRAM_CHATTERFLY
+                    or self.provider == voice_program_manager.VOICE_PROGRAM_BAGESHUO
+                    or self.provider == voice_program_manager.VOICE_PROGRAM_AUTOGLM):
                 services.set_active(True)
                 services.set_result(status.VOICE_RUNTIME_ACTIVE)
                 services.logger.info(
@@ -1047,6 +1251,8 @@ class VoiceHost:
                 "wetype": "WeType",
                 voice_program_manager.VOICE_PROGRAM_DOUBAO_IME: "Doubao",
                 voice_program_manager.VOICE_PROGRAM_CHATTERFLY: "Chatterfly",
+                voice_program_manager.VOICE_PROGRAM_BAGESHUO: "Bageshuo",
+                voice_program_manager.VOICE_PROGRAM_AUTOGLM: "AutoGLM",
             }.get(self.provider, "Voice host")
             self._fail_voice(f"{label} microphone startup was not confirmed")
             self._stop_host()

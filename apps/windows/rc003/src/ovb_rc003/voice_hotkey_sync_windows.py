@@ -34,6 +34,12 @@ DEFAULT_PROVIDER_HOTKEYS = {
     voice_program_manager.VOICE_PROGRAM_DOUBAO_IME: "ralt",
     # Read the user's actual shortcut; no machine-specific default.
     voice_program_manager.VOICE_PROGRAM_CHATTERFLY: "",
+    # Bageshuo ships RightAlt as the dictate (语音润色) shortcut and keeps it in a
+    # plain JSON store, so the default can be read back automatically.
+    voice_program_manager.VOICE_PROGRAM_BAGESHUO: "ralt",
+    # AutoGLM ships RightCtrl as its hold shortcut and keeps both dictation
+    # shortcuts (recordHold / recordToggle) in settings.json.
+    voice_program_manager.VOICE_PROGRAM_AUTOGLM: "rctrl",
     voice_program_manager.VOICE_PROGRAM_CUSTOM: "ralt",
 }
 
@@ -417,6 +423,10 @@ def read_provider_hotkey(
     if provider == voice_program_manager.VOICE_PROGRAM_CHATTERFLY:
         # Both remote modes use the same Chatterfly voice-input shortcut.
         return _read_chatterfly_hotkey(appdata=appdata)
+    if provider == voice_program_manager.VOICE_PROGRAM_BAGESHUO:
+        return _read_bageshuo_hotkey(appdata=appdata, trigger=trigger)
+    if provider == voice_program_manager.VOICE_PROGRAM_AUTOGLM:
+        return _read_autoglm_hotkey(appdata=appdata, trigger=trigger)
     return VoiceHotkeySyncResult(
         provider, False, "unsupported_provider", message="暂不支持读取该程序。"
     )
@@ -445,6 +455,7 @@ def sync_provider_hotkey(
         voice_program_manager.VOICE_PROGRAM_WETYPE,
         voice_program_manager.VOICE_PROGRAM_DOUBAO_IME,
         voice_program_manager.VOICE_PROGRAM_CHATTERFLY,
+        voice_program_manager.VOICE_PROGRAM_AUTOGLM,
         voice_program_manager.VOICE_PROGRAM_CUSTOM,
     }:
         if provider == voice_program_manager.VOICE_PROGRAM_WETYPE:
@@ -456,6 +467,10 @@ def sync_provider_hotkey(
             ) + "快捷键一致。"
         elif provider == voice_program_manager.VOICE_PROGRAM_CHATTERFLY:
             message = "快捷键已保存到无线麦；请确保与 Chatterfly 的语音输入快捷键一致。"
+        elif provider == voice_program_manager.VOICE_PROGRAM_AUTOGLM:
+            message = "快捷键已保存到无线麦；请确保与智谱AI输入法中的" + (
+                "点按录音" if trigger == "toggle" else "按住录音"
+            ) + "快捷键一致。"
         else:
             message = f"快捷键已保存到{product_identity.DISPLAY_NAME}。"
         return VoiceHotkeySyncResult(
@@ -736,6 +751,167 @@ def _read_doubao_hotkey(*, appdata: Optional[Path], trigger="hold") -> VoiceHotk
         provider, True, "read", shortcut,
         f"已读取豆包输入法的{'免按模式' if trigger == 'toggle' else '按住型'}快捷键。",
     )
+
+
+# Bageshuo writes shortcuts as JavaScript-style key names joined by "+",
+# for example "RightAlt", "RightAlt+RightShift", "RightAlt+Space".
+_BAGESHUO_KEY_ALIASES = {
+    "rightalt": "ralt", "altright": "ralt",
+    "leftalt": "lalt", "altleft": "lalt",
+    "rightshift": "rshift", "shiftright": "rshift",
+    "leftshift": "lshift", "shiftleft": "lshift",
+    "rightcontrol": "rctrl", "controlright": "rctrl", "rightctrl": "rctrl",
+    "leftcontrol": "lctrl", "controlleft": "lctrl", "leftctrl": "lctrl",
+    "rightmeta": "rwin", "metaright": "rwin", "rightwin": "rwin",
+    "leftmeta": "lwin", "metaleft": "lwin", "leftwin": "lwin",
+    "space": "space", "spacebar": "space",
+    "return": "enter", "esc": "escape",
+    "del": "delete", "ins": "insert",
+    "pagedown": "pagedown", "pageup": "pageup",
+}
+
+
+def _bageshuo_store_path(appdata: Optional[Path] = None) -> Path:
+    root = (
+        Path(appdata)
+        if appdata is not None
+        else Path(os.environ.get("APPDATA", str(Path.home() / "AppData" / "Roaming")))
+    )
+    return root / voice_program_manager._BAGESHUO_STORE_DIRECTORY_NAME / (
+        voice_program_manager._BAGESHUO_STORE_FILE_NAME
+    )
+
+
+def _bageshuo_component_to_token(component: str) -> str:
+    text = component.strip()
+    if not text:
+        raise ValueError("快捷键包含空片段")
+    lowered = text.casefold()
+    alias = _BAGESHUO_KEY_ALIASES.get(lowered)
+    if alias is not None:
+        return alias
+    if lowered.startswith("key") and len(lowered) == 4:
+        return lowered[3:]
+    if lowered.startswith("digit") and len(lowered) == 6:
+        return lowered[5:]
+    if lowered.startswith("f") and lowered[1:].isdigit():
+        return lowered
+    return lowered
+
+
+def _bageshuo_shortcut_to_hotkey(raw: object, *, label: str = "快捷键") -> str:
+    text = str(raw or "").strip()
+    if not text:
+        raise ValueError(f"网易叭哥说{label}为空")
+    tokens = [_bageshuo_component_to_token(part) for part in text.split("+")]
+    spec = hotkey.HotkeySpec.parse("+".join(tokens))
+    win32_keys.resolve_vk_codes((*spec.modifiers, spec.key))
+    return spec.serialize()
+
+
+def _read_bageshuo_hotkey(
+    *, appdata: Optional[Path] = None, trigger="hold"
+) -> VoiceHotkeySyncResult:
+    provider = voice_program_manager.VOICE_PROGRAM_BAGESHUO
+    # Bageshuo decides hold-versus-toggle inside its own settings and reuses the
+    # same 语音润色 shortcut for both, so hold and toggle read the same value.
+    path = _bageshuo_store_path(appdata)
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return VoiceHotkeySyncResult(
+            provider,
+            False,
+            "not_found",
+            message="未找到网易叭哥说配置；请先启动并登录一次再刷新。",
+        )
+    except (OSError, ValueError) as exc:
+        return VoiceHotkeySyncResult(
+            provider,
+            False,
+            "unreadable",
+            message=f"无法读取网易叭哥说配置：{exc}",
+        )
+    settings = payload.get("settings") if isinstance(payload, dict) else None
+    raw_shortcut = settings.get("polishHotkey") if isinstance(settings, dict) else None
+    try:
+        shortcut = _bageshuo_shortcut_to_hotkey(raw_shortcut, label="语音润色快捷键")
+    except (ValueError, hotkey.HotkeyParseError, win32_keys.UnknownKeyTokenError) as exc:
+        return VoiceHotkeySyncResult(
+            provider,
+            False,
+            "invalid_hotkey",
+            message=f"网易叭哥说语音润色快捷键无法识别：{exc}",
+        )
+    return VoiceHotkeySyncResult(provider, True, "synced", shortcut)
+
+
+# AutoGLM keeps two independent dictation shortcuts instead of one, so the same
+# settings file answers hold and toggle separately.
+_AUTOGLM_RECORD_KEY_FIELDS = {"hold": "recordHold", "toggle": "recordToggle"}
+
+
+def _autoglm_store_path(appdata: Optional[Path] = None) -> Path:
+    root = (
+        Path(appdata)
+        if appdata is not None
+        else Path(os.environ.get("APPDATA", str(Path.home() / "AppData" / "Roaming")))
+    )
+    return root / voice_program_manager._AUTOGLM_STORE_DIRECTORY_NAME / (
+        voice_program_manager._AUTOGLM_STORE_FILE_NAME
+    )
+
+
+def _read_autoglm_hotkey(
+    *, appdata: Optional[Path] = None, trigger="hold"
+) -> VoiceHotkeySyncResult:
+    provider = voice_program_manager.VOICE_PROGRAM_AUTOGLM
+    field = _AUTOGLM_RECORD_KEY_FIELDS["toggle" if trigger == "toggle" else "hold"]
+    path = _autoglm_store_path(appdata)
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return VoiceHotkeySyncResult(
+            provider,
+            False,
+            "not_found",
+            message="未找到智谱AI输入法配置；请先启动并登录一次再刷新。",
+        )
+    except (OSError, ValueError) as exc:
+        return VoiceHotkeySyncResult(
+            provider,
+            False,
+            "unreadable",
+            message=f"无法读取智谱AI输入法配置：{exc}",
+        )
+    key_map = payload.get("keyMap") if isinstance(payload, dict) else None
+    raw_shortcut = key_map.get(field) if isinstance(key_map, dict) else None
+    text = str(raw_shortcut or "").strip()
+    if not text:
+        return VoiceHotkeySyncResult(
+            provider,
+            False,
+            "not_configured",
+            message=(
+                "智谱AI输入法的开关型快捷键未设置；请先在智谱AI输入法中录入" +
+                ("点按录音" if trigger == "toggle" else "按住录音") + "快捷键。"
+            ),
+        )
+    try:
+        # AutoGLM writes iohook key names, which share Bageshuo's JavaScript-style
+        # spelling; reuse that token converter but keep this provider's messages.
+        tokens = [_bageshuo_component_to_token(part) for part in text.split("+")]
+        spec = hotkey.HotkeySpec.parse("+".join(tokens))
+        win32_keys.resolve_vk_codes((*spec.modifiers, spec.key))
+        shortcut = spec.serialize()
+    except (ValueError, hotkey.HotkeyParseError, win32_keys.UnknownKeyTokenError) as exc:
+        return VoiceHotkeySyncResult(
+            provider,
+            False,
+            "invalid_hotkey",
+            message=f"智谱AI输入法录音快捷键无法识别：{exc}",
+        )
+    return VoiceHotkeySyncResult(provider, True, "synced", shortcut)
 
 
 def _wetype_key_text_to_token(value: str) -> str:

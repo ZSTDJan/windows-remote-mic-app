@@ -56,11 +56,16 @@ Item {
         SettingsController.voiceProgramDoubaoSelected
     readonly property bool chatterflySelected:
         SettingsController.voiceProgramChatterflySelected
+    readonly property bool bageshuoSelected:
+        SettingsController.voiceProgramBageshuoSelected
+    readonly property bool autoglmSelected:
+        SettingsController.voiceProgramAutoglmSelected
     readonly property string voiceHotkeyModeLabel:
         root.chatterflySelected ? qsTr("语音输入") :
         !SettingsController.isRc003Device
             && SettingsController.remoteRecordingModeIndex === 1
-            && (root.sogouSelected || root.wetypeSelected || root.doubaoSelected)
+            && (root.sogouSelected || root.wetypeSelected || root.doubaoSelected
+                || root.bageshuoSelected || root.autoglmSelected)
         ? qsTr("开关型") : qsTr("按住型")
     readonly property bool customProgramSelected:
         SettingsController.voiceProgramCustomSelected
@@ -75,10 +80,13 @@ Item {
         && !SettingsController.isRc003Device
         && root.voiceProgramManaged
         && !root.wetypeSelected && !root.sogouSelected && !root.doubaoSelected
-        && !root.chatterflySelected
+        && !root.chatterflySelected && !root.bageshuoSelected
+        && !root.autoglmSelected
     readonly property bool voiceHotkeyBusy: SettingsController.voiceHotkeyBusy
     readonly property bool voiceHotkeyRefreshVisible:
-        root.sogouSelected || root.wetypeSelected || root.doubaoSelected || root.chatterflySelected
+        root.sogouSelected || root.wetypeSelected || root.doubaoSelected
+        || root.chatterflySelected || root.bageshuoSelected
+        || root.autoglmSelected
     readonly property bool voiceHotkeyRuntimeBusy:
         String(SettingsController.voiceRuntimeState) === "active"
         || String(SettingsController.voiceRuntimeState) === "mic_confirmed"
@@ -566,6 +574,8 @@ Item {
                         visible: root.wetypeSelected
                             || root.doubaoSelected
                             || root.chatterflySelected
+                            || root.bageshuoSelected
+                            || root.autoglmSelected
                             || (root.sogouSelected
                                 && SettingsController.voiceProgramStatusCode === "not_found")
                         tokens: root.tokens
@@ -704,6 +714,14 @@ Item {
                             : qsTr("自动读取按住型快捷键")
                         : root.sogouSelected
                         ? qsTr("自动读取%1快捷键").arg(root.voiceHotkeyModeLabel)
+                        : root.bageshuoSelected
+                        ? SettingsController.remoteRecordingModeIndex === 1
+                            ? qsTr("自动读取叭哥说“语音润色”键；按一次开始、再按停止")
+                            : qsTr("自动读取叭哥说“语音润色”键；按住说话、松手停止")
+                        : root.autoglmSelected
+                        ? SettingsController.remoteRecordingModeIndex === 1
+                            ? qsTr("自动读取智谱“点按录音”键；录音短于 1 秒不会上屏")
+                            : qsTr("自动读取智谱“按住录音”键；按住超过 1 秒才会上屏")
                         : root.chatterflySelected
                         ? qsTr("自动读取 Chatterfly 语音输入快捷键")
                         : qsTr("请录入按住型快捷键")
