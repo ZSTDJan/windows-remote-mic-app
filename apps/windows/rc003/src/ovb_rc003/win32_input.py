@@ -1465,6 +1465,8 @@ def _write_clipboard_text(text: str) -> int:
     for name in ("EmptyClipboard", "CloseClipboard"):
         getattr(user, name).argtypes = ()
         getattr(user, name).restype = wintypes.BOOL
+    user.GetClipboardOwner.argtypes = ()
+    user.GetClipboardOwner.restype = wintypes.HWND
     user.SetClipboardData.argtypes = (wintypes.UINT, wintypes.HANDLE)
     user.SetClipboardData.restype = wintypes.HANDLE
     kernel.GlobalAlloc.argtypes = (wintypes.UINT, ctypes.c_size_t)
@@ -1501,7 +1503,16 @@ def _write_clipboard_text(text: str) -> int:
         if not user.SetClipboardData(13, memory):  # CF_UNICODETEXT
             raise OSError("clipboard text transfer failed")
         memory = None  # Ownership passed to Windows; never free or restore it.
-        return _clipboard_sequence()
+        # Closing synthesizes Windows text formats and advances the sequence.
+        # Read the completed write's sequence, while our owner still exists,
+        # and reject another writer taking ownership during CloseClipboard.
+        if not user.CloseClipboard():
+            raise OSError("clipboard close failed")
+        opened = False
+        sequence = _clipboard_sequence()
+        if user.GetClipboardOwner() != window:
+            raise OSError("clipboard changed while completing text transfer")
+        return sequence
     finally:
         if opened:
             user.CloseClipboard()

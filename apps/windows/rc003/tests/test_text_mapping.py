@@ -160,8 +160,13 @@ class PasteBoundaryTests(unittest.TestCase):
         proxy = User()
         proxy.OpenClipboard = mock.Mock(return_value=True)
         proxy.EmptyClipboard = mock.Mock(return_value=True)
-        proxy.CloseClipboard = mock.Mock(return_value=True)
         proxy.GetClipboardSequenceNumber = mock.Mock(return_value=17)
+        def close():
+            # Windows synthesizes text formats when closing the clipboard.
+            proxy.GetClipboardSequenceNumber.return_value = 20
+            return True
+        proxy.CloseClipboard = mock.Mock(side_effect=close)
+        proxy.GetClipboardOwner = mock.Mock(side_effect=lambda: proxy.OpenClipboard.call_args.args[0])
         def transfer(format_id, handle):
             self.assertEqual(format_id, 13)
             address = kernel.GlobalLock(handle)
@@ -175,10 +180,14 @@ class PasteBoundaryTests(unittest.TestCase):
         with mock.patch.object(ctypes, "WinDLL", side_effect=lambda name, **kw:
                                proxy if name == "user32" else kernel if name == "kernel32" else native_dll(name, **kw)):
             try:
-                self.assertEqual(win32_input._write_clipboard_text(TEXT), 17)
+                self.assertEqual(win32_input._write_clipboard_text(TEXT), 20)
                 self.assertEqual(transferred, [TEXT.replace("\n", "\r\n")])
                 self.assertTrue(proxy.OpenClipboard.call_args.args[0])
                 proxy.CloseClipboard.assert_called_once()
+                proxy.GetClipboardOwner.side_effect = None
+                proxy.GetClipboardOwner.return_value = None
+                with self.assertRaisesRegex(OSError, "clipboard changed"):
+                    win32_input._write_clipboard_text(TEXT)
             finally:
                 for handle in allocations:
                     self.assertFalse(kernel.GlobalFree(handle))
