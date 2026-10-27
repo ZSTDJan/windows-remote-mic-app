@@ -203,6 +203,13 @@ def _resolve_application_command_uncached(
     persisted in the config file.
     """
 
+    if action.kind == key_mapping.ActionKind.CUSTOM_PROGRAM:
+        try:
+            path = Path(key_mapping.normalize_custom_program_path(action.path))
+        except (TypeError, ValueError):
+            return None
+        return (str(path),) if executable_exists(path) else None
+
     if action.kind == key_mapping.ActionKind.OPEN_REMOTE_MIC:
         executable = Path(sys.executable)
         if getattr(sys, "frozen", False) and executable_exists(executable):
@@ -251,6 +258,12 @@ def resolve_application_command(
     executable_exists: Callable[[Path], bool] = _path_is_file,
 ) -> Optional[Command]:
     """Resolve an application action with a process-local install cache."""
+
+    if action.kind == key_mapping.ActionKind.CUSTOM_PROGRAM:
+        return _resolve_application_command_uncached(
+            action,
+            executable_exists=executable_exists,
+        )
 
     if executable_exists is not _path_is_file:
         return _resolve_application_command_uncached(
