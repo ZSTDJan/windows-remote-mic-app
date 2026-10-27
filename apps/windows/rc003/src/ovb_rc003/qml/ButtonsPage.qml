@@ -569,7 +569,8 @@ Item {
             editText = display
         }
 
-        editable: true
+        editable: editText.trim() !== SettingsController.textActionLabel
+        displayText: editText
         onAccepted: actionEditor.validationRequested = true
         selectTextByMouse: true
         implicitHeight: tokens.controlHeight
@@ -667,6 +668,50 @@ Item {
         }
     }
 
+    component PresetTextEditor: ColumnLayout {
+        id: presetEditor
+        property var tokens
+        property alias text: contentField.text
+        property string accessibleLabel
+        spacing: tokens.spacingSmall
+
+        UiLabel {
+            tokens: presetEditor.tokens
+            kind: noteKind
+            text: qsTr("预设文字")
+        }
+        ScrollView {
+            Layout.fillWidth: true
+            Layout.preferredHeight: presetEditor.tokens.controlHeight * 3
+            clip: true
+            ScrollBar.horizontal.policy: ScrollBar.AlwaysOff
+            TextArea {
+                id: contentField
+                objectName: presetEditor.objectName + "Field"
+                textFormat: TextEdit.PlainText
+                wrapMode: TextEdit.Wrap
+                selectByMouse: true
+                padding: presetEditor.tokens.spacingSmall
+                color: presetEditor.tokens.textPrimary
+                placeholderTextColor: presetEditor.tokens.disabledText
+                selectionColor: presetEditor.tokens.accent
+                selectedTextColor: presetEditor.tokens.accentText
+                font.family: presetEditor.tokens.fontFamily
+                font.pixelSize: presetEditor.tokens.fontSizeControl
+                placeholderText: qsTr("填写要粘贴的文字，可换行")
+                Accessible.name: presetEditor.accessibleLabel
+                onTextChanged: actionEditor.validationRequested = false
+                background: Rectangle {
+                    radius: presetEditor.tokens.cornerRadiusControl
+                    color: presetEditor.tokens.fieldBackground
+                    border.width: presetEditor.tokens.hairlineWidth
+                    border.color: contentField.activeFocus
+                        ? presetEditor.tokens.accent : presetEditor.tokens.border
+                }
+            }
+        }
+    }
+
     Dialog {
         id: actionEditor
         objectName: "actionEditorDialog"
@@ -674,6 +719,7 @@ Item {
         popupType: Popup.Item
         anchors.centerIn: parent
         width: Math.min(430, root.width - tokens.spacingLarge * 2)
+        height: Math.min(implicitHeight, root.height - tokens.spacingLarge * 2)
         readonly property string headerText: buttonName.length > 0
             ? qsTr("编辑：") + buttonName
             : qsTr("编辑")
@@ -737,6 +783,13 @@ Item {
         property string originalPrimaryNote: ""
         property string originalDoubleNote: ""
         property string originalLongNote: ""
+        property string originalPrimaryContent: ""
+        property string originalDoubleContent: ""
+        property string originalLongContent: ""
+        property var originalTextContents: ({})
+        readonly property bool primaryIsText: primaryText.trim() === SettingsController.textActionLabel
+        readonly property bool doubleIsText: doubleText.trim() === SettingsController.textActionLabel
+        readonly property bool longIsText: longText.trim() === SettingsController.textActionLabel
         property bool syncing: false
         property bool validationRequested: false
         onPrimaryTextChanged: validationRequested = false
@@ -748,15 +801,15 @@ Item {
             || normalizedPrimaryText.indexOf("已停用：旧语音配置") === 0
         readonly property string primaryValidationError: rowIndex >= 0
             ? SettingsController.buttonActionValidationMessage(
-                buttonId, "single_click", primaryText
+                buttonId, "single_click", primaryText, primaryContent.text
             ) : ""
         readonly property string doubleValidationError: rowIndex >= 0
             ? SettingsController.buttonActionValidationMessage(
-                buttonId, "double_click", doubleText
+                buttonId, "double_click", doubleText, doubleContent.text
             ) : ""
         readonly property string longValidationError: rowIndex >= 0
             ? SettingsController.buttonActionValidationMessage(
-                buttonId, "long_press", longText
+                buttonId, "long_press", longText, longContent.text
             ) : ""
         readonly property string validationError:
             primaryValidationError.length > 0 ? primaryValidationError
@@ -769,6 +822,9 @@ Item {
             || primaryNote !== originalPrimaryNote
             || doubleNote !== originalDoubleNote
             || longNote !== originalLongNote
+            || (primaryIsText && primaryContent.text !== originalPrimaryContent)
+            || (doubleIsText && doubleContent.text !== originalDoubleContent)
+            || (longIsText && longContent.text !== originalLongContent)
 
         function openForRow(rowIndexValue, buttonIdValue, buttonNameValue,
                             primaryValue, doubleValue, longValue,
@@ -790,6 +846,19 @@ Item {
             originalPrimaryNote = primaryNoteValue
             originalDoubleNote = doubleNoteValue
             originalLongNote = longNoteValue
+            originalTextContents = {
+                single_click: ButtonMappingModel.textContentAt(rowIndex, "single_click"),
+                double_click: ButtonMappingModel.textContentAt(rowIndex, "double_click"),
+                long_press: ButtonMappingModel.textContentAt(rowIndex, "long_press")
+            }
+            primaryContent.text = originalTextContents.single_click
+            doubleContent.text = originalTextContents.double_click
+            longContent.text = originalTextContents.long_press
+            // TextArea renders CRLF as LF. Compare with its initial rendering,
+            // but keep the original stored content when no text was edited.
+            originalPrimaryContent = primaryContent.text
+            originalDoubleContent = doubleContent.text
+            originalLongContent = longContent.text
             primaryCombo.setEditorValue(primaryValue)
             doubleCombo.setEditorValue(doubleValue)
             longCombo.setEditorValue(longValue)
@@ -818,10 +887,20 @@ Item {
             syncing = false
         }
 
+        function contentForSave(trigger, content, baseline) {
+            return content === baseline ? originalTextContents[trigger] : content
+        }
+
         function saveDraft() {
             validationRequested = true
             if (rowIndex < 0 || validationError.length > 0)
                 return false
+            ButtonMappingModel.setTextContentAt(rowIndex, "single_click", primaryIsText
+                ? contentForSave("single_click", primaryContent.text, originalPrimaryContent) : "")
+            ButtonMappingModel.setTextContentAt(rowIndex, "double_click", doubleIsText
+                ? contentForSave("double_click", doubleContent.text, originalDoubleContent) : "")
+            ButtonMappingModel.setTextContentAt(rowIndex, "long_press", longIsText
+                ? contentForSave("long_press", longContent.text, originalLongContent) : "")
             ButtonMappingModel.setActionTextAt(rowIndex, primaryText)
             ButtonMappingModel.setSecondaryActionTextAt(
                 rowIndex, "double_click", doubleText
@@ -850,7 +929,17 @@ Item {
         contentItem: ColumnLayout {
             spacing: 9
 
+            ScrollView {
+                id: editorScroll
+                Layout.fillWidth: true
+                Layout.fillHeight: true
+                implicitHeight: editorGrid.implicitHeight
+                clip: true
+                ScrollBar.horizontal.policy: ScrollBar.AlwaysOff
+
             GridLayout {
+                id: editorGrid
+                width: editorScroll.availableWidth
                 Layout.fillWidth: true
                 columns: 3
                 columnSpacing: tokens.spacingMedium
@@ -864,7 +953,7 @@ Item {
                 UiLabel {
                     tokens: root.tokens
                     kind: noteKind
-                    text: qsTr("按键录入")
+                    text: qsTr("映射动作")
                 }
                 UiLabel {
                     tokens: root.tokens
@@ -922,6 +1011,7 @@ Item {
                 }
                     CompactButton {
                     objectName: "actionEditorPrimaryRecordButton"
+                    visible: !actionEditor.primaryIsText
                         tokens: root.tokens
                         compactMinimumWidth: tokens.buttonWidth2Chars
                     text: qsTr("录入")
@@ -945,6 +1035,16 @@ Item {
                             actionEditor.primaryNote = text
                     }
                     Accessible.name: qsTr("单击备注名称")
+                }
+
+                PresetTextEditor {
+                    id: primaryContent
+                    objectName: "actionEditorPrimaryContent"
+                    tokens: root.tokens
+                    Layout.columnSpan: 3
+                    Layout.fillWidth: true
+                    visible: actionEditor.primaryIsText
+                    accessibleLabel: qsTr("单击预设文字")
                 }
 
                 UiLabel {
@@ -990,6 +1090,7 @@ Item {
                 }
                     CompactButton {
                     objectName: "actionEditorDoubleRecordButton"
+                    visible: !actionEditor.doubleIsText
                         tokens: root.tokens
                         compactMinimumWidth: tokens.buttonWidth2Chars
                     enabled: !actionEditor.primaryIsVoice
@@ -1015,6 +1116,17 @@ Item {
                             actionEditor.doubleNote = text
                     }
                     Accessible.name: qsTr("双击备注名称")
+                }
+
+                PresetTextEditor {
+                    id: doubleContent
+                    objectName: "actionEditorDoubleContent"
+                    tokens: root.tokens
+                    Layout.columnSpan: 3
+                    Layout.fillWidth: true
+                    visible: actionEditor.doubleIsText
+                    enabled: !actionEditor.primaryIsVoice
+                    accessibleLabel: qsTr("双击预设文字")
                 }
 
                 UiLabel {
@@ -1060,6 +1172,7 @@ Item {
                 }
                     CompactButton {
                     objectName: "actionEditorLongRecordButton"
+                    visible: !actionEditor.longIsText
                         tokens: root.tokens
                         compactMinimumWidth: tokens.buttonWidth2Chars
                     enabled: !actionEditor.primaryIsVoice
@@ -1086,6 +1199,27 @@ Item {
                     }
                     Accessible.name: qsTr("长按备注名称")
                 }
+
+                PresetTextEditor {
+                    id: longContent
+                    objectName: "actionEditorLongContent"
+                    tokens: root.tokens
+                    Layout.columnSpan: 3
+                    Layout.fillWidth: true
+                    visible: actionEditor.longIsText
+                    enabled: !actionEditor.primaryIsVoice
+                    accessibleLabel: qsTr("长按预设文字")
+                }
+            }
+            }
+
+            UiLabel {
+                tokens: root.tokens
+                kind: noteKind
+                Layout.fillWidth: true
+                visible: actionEditor.primaryIsText || actionEditor.doubleIsText || actionEditor.longIsText
+                wrapMode: Text.WordWrap
+                text: qsTr("原样粘贴到当前输入位置，剪贴板保留该内容；不额外发送回车。")
             }
 
             UiLabel {

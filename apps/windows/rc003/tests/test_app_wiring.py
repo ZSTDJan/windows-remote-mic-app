@@ -3740,7 +3740,7 @@ class OrdinaryButtonGestureWiringTests(_AppWiringTestCase):
             "send_arrow_down", "send_arrow_left", "send_arrow_right",
             "send_delete_backward", "send_show_desktop", "send_context_menu",
             "send_app_switcher", "send_volume_up", "send_volume_down",
-            "send_volume_mute", "send_play_pause", "send_mouse_button_click",
+            "send_volume_mute", "send_play_pause", "send_mouse_button_click", "paste_text",
         )
         with ExitStack() as stack:
             effects = [stack.enter_context(mock.patch.object(win32_input, name)) for name in senders]
@@ -3760,13 +3760,14 @@ class OrdinaryButtonGestureWiringTests(_AppWiringTestCase):
             ))
             for option in settings_ui._PRESET_KEY_COMBOS:
                 with self.subTest(option=option):
+                    content = "预设文字" if option == "输入文字" else None
                     self.assertEqual(settings_ui.button_action_validation_message(
-                        "up", "single_click", option
+                        "up", "single_click", option, text_content=content
                     ), "")
                     self.assertEqual(settings_ui.button_action_validation_message(
-                        "up", "double_click", option
+                        "up", "double_click", option, text_content=content
                     ), "")
-                    action = settings_ui._display_to_action(option)
+                    action = settings_ui._validated_button_action("up", "single_click", option, text_content=content)
                     if action.kind == key_mapping.ActionKind.DISABLED:
                         continue
                     before = sum(effect.call_count for effect in effects)

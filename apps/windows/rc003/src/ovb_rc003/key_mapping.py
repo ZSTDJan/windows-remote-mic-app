@@ -39,6 +39,7 @@ class ActionKind(str, Enum):
     DISABLED = "disabled"
     KEY_COMBO = "key_combo"
     QUICKER_URI = "quicker_uri"
+    TEXT = "text"
     ESCAPE = "escape"
     RETURN = "return"
     ARROW_UP = "arrow_up"
@@ -235,6 +236,22 @@ REPEATABLE_ACTIONS = frozenset(
 
 QUICKER_URI_PREFIX = "quicker:runaction:"
 MAX_QUICKER_URI_LENGTH = 2048
+MAX_TEXT_LENGTH = 10000
+
+
+def validate_preset_text(text: str) -> str:
+    """Validate literal clipboard content without trimming or parsing commands."""
+    if not isinstance(text, str) or not text:
+        raise ValueError("请填写预设文字。")
+    if len(text) > MAX_TEXT_LENGTH:
+        raise ValueError(f"预设文字最多 {MAX_TEXT_LENGTH} 个字符。")
+    if "\x00" in text:
+        raise ValueError("预设文字不能包含空字符。")
+    try:
+        text.encode("utf-16-le")
+    except UnicodeEncodeError as exc:
+        raise ValueError("预设文字包含无效字符。") from exc
+    return text
 
 # The first combination implementation deliberately behaves like one Fn
 # layer.  Only a non-repeating utility key may be the modifier, while the
@@ -311,6 +328,7 @@ class ButtonAction:
     kind: ActionKind
     keys: Tuple[str, ...] = field(default_factory=tuple)
     uri: str = ""
+    text: str = field(default="", repr=False)
 
     def to_dict(self) -> dict:
         if self.kind in (ActionKind.MOUSE_WHEEL_UP, ActionKind.MOUSE_WHEEL_DOWN):
@@ -319,6 +337,8 @@ class ButtonAction:
         data = {"kind": self.kind.value, "keys": list(self.keys)}
         if self.kind == ActionKind.QUICKER_URI:
             data["uri"] = normalize_quicker_uri(self.uri)
+        if self.kind == ActionKind.TEXT:
+            data["text"] = validate_preset_text(self.text)
         return data
 
     @classmethod
@@ -344,10 +364,17 @@ class ButtonAction:
             uri = normalize_quicker_uri(uri)
         elif uri:
             raise ValueError("non-URI action must not contain a URI")
+        text = data.get("text", "")
+        if not isinstance(text, str):
+            raise ValueError("button action text must be a string")
+        if kind == ActionKind.TEXT:
+            text = validate_preset_text(text)
+        elif text:
+            raise ValueError("non-text action must not contain text")
         if kind in (ActionKind.MOUSE_WHEEL_UP, ActionKind.MOUSE_WHEEL_DOWN):
             page_key = "pageup" if kind == ActionKind.MOUSE_WHEEL_UP else "pagedown"
             return cls(kind=ActionKind.KEY_COMBO, keys=(page_key,))
-        return cls(kind=kind, keys=keys, uri=uri)
+        return cls(kind=kind, keys=keys, uri=uri, text=text)
 
 
 def button_action_for(

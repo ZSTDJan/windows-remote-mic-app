@@ -41,6 +41,7 @@ from __future__ import annotations
 import ctypes
 import os
 import sys
+import threading
 import time
 from ctypes import wintypes
 from typing import Callable, List, Optional, Sequence, Tuple
@@ -72,6 +73,7 @@ def set_diagnostic_trace(trace: Optional[diagnostic_trace.DiagnosticTrace]) -> N
 
 _INPUT_KEYBOARD = 1
 _INPUT_MOUSE = 0
+_text_paste_lock = threading.Lock()
 _KEYEVENTF_KEYUP = 0x0002
 _KEYEVENTF_UNICODE = 0x0004
 _KEYEVENTF_EXTENDEDKEY = 0x0001
@@ -1414,6 +1416,130 @@ def send_key_combo_tap(
         raise error_type(
             f"SendInput delivered only {sent}/{len(events)} events for a key tap; rolled back"
         )
+
+
+def _foreground_text_target() -> tuple[int, int]:
+    """Read window/focus identity only; never inspect the user's editor text."""
+    class GUITHREADINFO(ctypes.Structure):
+        _fields_ = [("cbSize", wintypes.DWORD), ("flags", wintypes.DWORD)] + [
+            (name, wintypes.HWND) for name in
+            ("hwndActive", "hwndFocus", "hwndCapture", "hwndMenuOwner", "hwndMoveSize", "hwndCaret")
+        ] + [("rcCaret", wintypes.RECT)]
+
+    user = ctypes.WinDLL("user32", use_last_error=True)
+    user.GetForegroundWindow.restype = wintypes.HWND
+    user.GetGUIThreadInfo.argtypes = (wintypes.DWORD, ctypes.POINTER(GUITHREADINFO))
+    user.GetGUIThreadInfo.restype = wintypes.BOOL
+    window = user.GetForegroundWindow()
+    info = GUITHREADINFO(cbSize=ctypes.sizeof(GUITHREADINFO))
+    if not window or not user.GetGUIThreadInfo(0, ctypes.byref(info)) or not info.hwndFocus:
+        raise OSError("text paste target is unavailable")
+    if user.GetForegroundWindow() != window:
+        raise OSError("text paste target changed")
+    return int(window), int(info.hwndFocus)
+
+
+def _clipboard_sequence() -> int:
+    user = ctypes.WinDLL("user32", use_last_error=True)
+    user.GetClipboardSequenceNumber.restype = wintypes.DWORD
+    return int(user.GetClipboardSequenceNumber())
+
+
+def _write_clipboard_text(text: str) -> int:
+    """Transfer eager UTF-16 data to Windows, retaining it after this call.
+
+    No clipboard backup, delayed rendering or restoration. Use a real, hidden
+    owner HWND: EmptyClipboard with a NULL owner makes SetClipboardData fail.
+    Allocation happens before clearing the old clipboard. A busy clipboard
+    fails immediately instead of blocking the remote's input callback.
+    """
+    user = ctypes.WinDLL("user32", use_last_error=True)
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    user.CreateWindowExW.argtypes = (wintypes.DWORD, wintypes.LPCWSTR, wintypes.LPCWSTR,
+        wintypes.DWORD, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+        wintypes.HWND, wintypes.HMENU, wintypes.HINSTANCE, wintypes.LPVOID)
+    user.CreateWindowExW.restype = wintypes.HWND
+    for name in ("DestroyWindow", "OpenClipboard"):
+        getattr(user, name).argtypes = (wintypes.HWND,)
+        getattr(user, name).restype = wintypes.BOOL
+    for name in ("EmptyClipboard", "CloseClipboard"):
+        getattr(user, name).argtypes = ()
+        getattr(user, name).restype = wintypes.BOOL
+    user.SetClipboardData.argtypes = (wintypes.UINT, wintypes.HANDLE)
+    user.SetClipboardData.restype = wintypes.HANDLE
+    kernel.GlobalAlloc.argtypes = (wintypes.UINT, ctypes.c_size_t)
+    kernel.GlobalAlloc.restype = wintypes.HGLOBAL
+    for name in ("GlobalLock", "GlobalUnlock", "GlobalFree"):
+        getattr(kernel, name).argtypes = (wintypes.HGLOBAL,)
+    kernel.GlobalLock.restype = wintypes.LPVOID
+    kernel.GlobalUnlock.restype = wintypes.BOOL
+    kernel.GlobalFree.restype = wintypes.HGLOBAL
+
+    # Windows text clipboard uses CRLF; storage/editor content stays literal.
+    payload = (text.replace("\r\n", "\n").replace("\r", "\n").replace("\n", "\r\n") + "\0").encode("utf-16-le")
+    memory = kernel.GlobalAlloc(0x0002, len(payload))  # GMEM_MOVEABLE
+    if not memory:
+        raise OSError("clipboard allocation failed")
+    window = None
+    opened = False
+    try:
+        address = kernel.GlobalLock(memory)
+        if not address:
+            raise OSError("clipboard memory lock failed")
+        try:
+            ctypes.memmove(address, payload, len(payload))
+        finally:
+            kernel.GlobalUnlock(memory)
+        window = user.CreateWindowExW(0, "STATIC", "", 0, 0, 0, 0, 0, -3, None, None, None)
+        if not window:
+            raise OSError("clipboard owner creation failed")
+        if not user.OpenClipboard(window):
+            raise OSError("clipboard is busy")
+        opened = True
+        if not user.EmptyClipboard():
+            raise OSError("clipboard clear failed")
+        if not user.SetClipboardData(13, memory):  # CF_UNICODETEXT
+            raise OSError("clipboard text transfer failed")
+        memory = None  # Ownership passed to Windows; never free or restore it.
+        return _clipboard_sequence()
+    finally:
+        if opened:
+            user.CloseClipboard()
+        if window:
+            user.DestroyWindow(window)
+        if memory:
+            kernel.GlobalFree(memory)
+
+
+def paste_text(
+    text: str, *, _writer=None, _target_query=None, _sequence_query=None,
+    _key_down_query=None, _sender=None,
+) -> None:
+    """Write literal text then submit one Ctrl+V, without Enter or retries.
+
+    Serialization covers clipboard write and shortcut submission. SendInput
+    confirms submission, not consumption by an arbitrary target application.
+    After a successful write, the preset remains available for manual paste.
+    """
+    from .key_mapping import validate_preset_text
+    validate_preset_text(text)
+    if _writer is None:
+        _require_live_input_allowed()
+        _require_windows()
+    target_query = _target_query or _foreground_text_target
+    sequence_query = _sequence_query or _clipboard_sequence
+    key_query = _key_down_query or _physical_key_is_down_before_injection
+    with _text_paste_lock:
+        target = target_query()
+        # A held Shift/Alt/Win would change Ctrl+V into a different command.
+        _ensure_keys_not_physically_down((0x10, 0x11, 0x12, 0x5B, 0x5C, 0x56), key_query)
+        sequence = (_writer or _write_clipboard_text)(text)
+        if target_query() != target:
+            raise OSError("text paste target changed before submission")
+        if sequence_query() != sequence:
+            raise OSError("clipboard changed before text paste submission")
+        _ensure_keys_not_physically_down((0x10, 0x11, 0x12, 0x5B, 0x5C, 0x56), key_query)
+        send_key_combo_tap(("ctrl", "v"), _sender=_sender, _key_down_query=key_query)
 
 
 def _real_keybd_event(

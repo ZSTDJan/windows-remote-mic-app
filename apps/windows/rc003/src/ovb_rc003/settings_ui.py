@@ -50,6 +50,7 @@ _OPEN_APPLICATION_DISPLAY = f"打开{product_identity.DISPLAY_NAME}"
 # ``方向上`` back into a generic ``key_combo`` just because the platform uses
 # a key event to deliver it.
 _REFERENCE_ACTION_LABELS: Dict[key_mapping.ActionKind, str] = {
+    key_mapping.ActionKind.TEXT: "输入文字",
     key_mapping.ActionKind.ESCAPE: "Escape",
     key_mapping.ActionKind.RETURN: "回车",
     key_mapping.ActionKind.ARROW_UP: "方向上",
@@ -128,6 +129,7 @@ ACTION_OPTION_GROUPS: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
             "右键菜单",
         ),
     ),
+    ("文字输入", ("输入文字",)),
     (
         "系统与媒体",
         (
@@ -379,6 +381,7 @@ def _validated_button_action(
     text: str,
     *,
     base_bindings: Optional[dict] = None,
+    text_content: Optional[str] = None,
 ) -> Optional[key_mapping.ButtonAction]:
     """Parse one editor field using the same rules as the final save."""
 
@@ -419,6 +422,18 @@ def _validated_button_action(
         message = f"{trigger_label}：{detail}"
         raise SettingsValidationError(button_id, message) from exc
 
+    if action.kind == key_mapping.ActionKind.TEXT:
+        if text_content is None and base_bindings is not None:
+            original = key_mapping.button_action_for(
+                base_bindings, button_id, key_mapping.ButtonTrigger(trigger)
+            )
+            text_content = original.text if original.kind == key_mapping.ActionKind.TEXT else ""
+        try:
+            content = key_mapping.validate_preset_text(text_content)
+        except ValueError as exc:
+            raise SettingsValidationError(button_id, f"{trigger_label}：{exc}") from exc
+        action = key_mapping.ButtonAction(key_mapping.ActionKind.TEXT, text=content)
+
     if action.kind in key_mapping.MOUSE_HOLD_BUTTONS and trigger != "long_press":
         raise SettingsValidationError(button_id, "鼠标长按只能用于长按映射。")
     if key_mapping.is_voice_action(action):
@@ -441,11 +456,13 @@ def button_action_validation_message(
     text: str,
     *,
     base_bindings: Optional[dict] = None,
+    text_content: Optional[str] = None,
 ) -> str:
     """Return a user-facing editor error, or an empty string when valid."""
 
     try:
-        _validated_button_action(button_id, trigger, text, base_bindings=base_bindings)
+        _validated_button_action(button_id, trigger, text, base_bindings=base_bindings,
+                                 text_content=text_content)
     except SettingsValidationError as exc:
         return exc.message
     return ""
@@ -474,6 +491,7 @@ def build_save_model(
     button_display_map: Dict[str, str],
     secondary_display_map: Optional[Dict[str, Dict[str, str]]] = None,
     display_note_map: Optional[Dict[str, Dict[str, str]]] = None,
+    text_content_map: Optional[Dict[str, Dict[str, str]]] = None,
     hotkey_text: str,
     trigger_mode: key_mapping.VoiceTriggerMode,
     endpoint_display_text: str,
@@ -510,6 +528,8 @@ def build_save_model(
             key_mapping.ButtonTrigger.SINGLE_CLICK.value,
             text,
             base_bindings=base_bindings,
+            text_content=(text_content_map.get(button_id, {}).get("single_click", "")
+                          if text_content_map is not None else None),
         )
         if action is None:
             continue
@@ -589,6 +609,8 @@ def build_save_model(
                     trigger_name,
                     text,
                     base_bindings=base_bindings,
+                    text_content=(text_content_map.get(button_id, {}).get(trigger_name, "")
+                                  if text_content_map is not None else None),
                 )
                 if action is None:
                     continue

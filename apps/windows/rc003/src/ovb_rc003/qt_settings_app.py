@@ -825,6 +825,9 @@ def _load_qt_classes() -> dict:
         def _initialize_rows(self) -> None:
             self._button_ids: List[str] = list(remote_layout.button_order(self._profile))
             self._action_text: Dict[str, str] = {bid: "" for bid in self._button_ids}
+            self._text_content: Dict[str, Dict[str, str]] = {
+                bid: {} for bid in self._button_ids
+            }
             self._secondary_action_text: Dict[str, Dict[str, str]] = {
                 bid: {
                     key_mapping.ButtonTrigger.DOUBLE_CLICK.value: (
@@ -928,6 +931,7 @@ def _load_qt_classes() -> dict:
             display_map: Dict[str, str],
             secondary_display_map: Optional[Dict[str, Dict[str, str]]] = None,
             display_note_map: Optional[Dict[str, Dict[str, str]]] = None,
+            text_content_map: Optional[Dict[str, Dict[str, str]]] = None,
         ) -> None:
             """Apply persisted values without rebuilding QML delegates.
 
@@ -938,6 +942,7 @@ def _load_qt_classes() -> dict:
 
             for row, button_id in enumerate(self._button_ids):
                 changed_roles = []
+                self._text_content[button_id] = dict((text_content_map or {}).get(button_id, {}))
                 primary_text = display_map.get(button_id, "")
                 if primary_text != self._action_text[button_id]:
                     self._action_text[button_id] = primary_text
@@ -1025,6 +1030,27 @@ def _load_qt_classes() -> dict:
                 for button_id, trigger_map in self._display_notes.items()
                 if any(note.strip() for note in trigger_map.values())
             }
+
+        def to_text_content_map(self) -> Dict[str, Dict[str, str]]:
+            return {button: dict(contents) for button, contents in self._text_content.items()}
+
+        @Slot(int, str, result=str)
+        def textContentAt(self, row: int, trigger: str) -> str:
+            if not 0 <= row < len(self._button_ids):
+                return ""
+            return self._text_content[self._button_ids[row]].get(trigger, "")
+
+        @Slot(int, str, str)
+        def setTextContentAt(self, row: int, trigger: str, content: str) -> None:
+            if not 0 <= row < len(self._button_ids):
+                return
+            if trigger not in {item.value for item in key_mapping.ButtonTrigger}:
+                return
+            contents = self._text_content[self._button_ids[row]]
+            if contents.get(trigger, "") == content:
+                return
+            contents[trigger] = content
+            self.mappingEdited.emit()
 
         def index_of(self, button_id: str) -> int:
             try:
@@ -2027,6 +2053,7 @@ def _load_qt_classes() -> dict:
             bindings = self._bindings.get("bindings", {})
             display_map: Dict[str, str] = {}
             secondary_display_map: Dict[str, Dict[str, str]] = {}
+            text_content_map: Dict[str, Dict[str, str]] = {}
             raw_display_notes = self._bindings.get("display_notes", {})
             display_note_map = (
                 raw_display_notes if isinstance(raw_display_notes, dict) else {}
@@ -2041,6 +2068,8 @@ def _load_qt_classes() -> dict:
                     try:
                         action = key_mapping.ButtonAction.from_dict(action_dict)
                         display_map[button_id] = settings_ui._action_to_display(action)
+                        if action.kind == key_mapping.ActionKind.TEXT:
+                            text_content_map.setdefault(button_id, {})["single_click"] = action.text
                     except (KeyError, TypeError, ValueError):
                         display_map[button_id] = ""
                 else:
@@ -2064,10 +2093,13 @@ def _load_qt_classes() -> dict:
                         secondary_display_map[button_id][trigger_name] = (
                             settings_ui._action_to_display(action)
                         )
+                        if action.kind == key_mapping.ActionKind.TEXT:
+                            text_content_map.setdefault(button_id, {})[trigger_name] = action.text
             self._model.load_display_map(
                 display_map,
                 secondary_display_map,
                 display_note_map,
+                text_content_map,
             )
             self._model.set_selected_button(self._selected_button_id)
 
@@ -4898,6 +4930,7 @@ def _load_qt_classes() -> dict:
                     button_display_map=self._model.to_display_map(),
                     secondary_display_map=self._model.to_secondary_display_map(),
                     display_note_map=self._model.to_display_note_map(),
+                    text_content_map=self._model.to_text_content_map(),
                     hotkey_text=saved_hotkey,
                     trigger_mode=key_mapping.VoiceTriggerMode.HOLD,
                     endpoint_display_text=saved_endpoint_display,
@@ -5029,6 +5062,7 @@ def _load_qt_classes() -> dict:
                     button_display_map=self._model.to_display_map(),
                     secondary_display_map=self._model.to_secondary_display_map(),
                     display_note_map=self._model.to_display_note_map(),
+                    text_content_map=self._model.to_text_content_map(),
                     hotkey_text=(config.voice_hotkey_for_provider(self._config, self._voice_program_settings.get("provider"))
                                  if self._voice_hotkey_trigger() == "toggle" else self._voice_hotkeys[trigger_mode]),
                     trigger_mode=trigger_mode,
@@ -6327,6 +6361,11 @@ def _load_qt_classes() -> dict:
         def formatActionText(self, text: str) -> str:
             return settings_ui.format_action_text(text)
 
+        textActionLabel = Property(
+            str, lambda self: settings_ui._REFERENCE_ACTION_LABELS[key_mapping.ActionKind.TEXT],
+            constant=True,
+        )
+
         @Slot(str, result=str)
         def formatHotkeyText(self, text: str) -> str:
             return hotkey.format_hotkey_text(text)
@@ -6340,17 +6379,20 @@ def _load_qt_classes() -> dict:
             return {"ok": True, "text": normalized, "message": ""}
 
         @Slot(str, str, str, result=str)
+        @Slot(str, str, str, str, result=str)
         def buttonActionValidationMessage(
             self,
             button_id: str,
             trigger: str,
             text: str,
+            text_content: Optional[str] = None,
         ) -> str:
             return settings_ui.button_action_validation_message(
                 button_id,
                 trigger,
                 text,
                 base_bindings=self._bindings,
+                text_content=text_content,
             )
 
         def _get_secondary_action_options(self) -> List[str]:

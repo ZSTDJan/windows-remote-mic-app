@@ -4740,6 +4740,10 @@ class RC003App:
                 pass
             elif action.kind == key_mapping.ActionKind.KEY_COMBO:
                 win32_input.send_key_combo_tap(action.keys)
+            elif action.kind == key_mapping.ActionKind.TEXT:
+                if not self._accept_input_events:
+                    return
+                win32_input.paste_text(action.text)
             elif action.kind == key_mapping.ActionKind.ESCAPE:
                 win32_input.send_escape()
             elif action.kind == key_mapping.ActionKind.RETURN:
@@ -4852,6 +4856,8 @@ class RC003App:
     ) -> Optional[Tuple[str, ...]]:
         if action.kind == key_mapping.ActionKind.KEY_COMBO:
             return tuple(action.keys)
+        if action.kind == key_mapping.ActionKind.TEXT:
+            return ("ctrl", "v")
         return _BUTTON_ACTION_KEY_TOKENS.get(action.kind)
 
     def _cancel_button_input_release_retry_locked(
