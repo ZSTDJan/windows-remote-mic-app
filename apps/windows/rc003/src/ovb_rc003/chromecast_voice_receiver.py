@@ -187,7 +187,8 @@ class VoiceReceiver:
                             max(0, round((gate.phase_at - gate.started) * 1000))
                             if gate.started else 0)
                     self.emit("lifecycle", effect.attempt,
-                              f"{data}/{gate.mode}/{gate.limit}/{self.recording_elapsed_ms}/{gate.reason or 'none'}",
+                              f"{data}/{gate.mode}/{gate.limit}/{self.recording_elapsed_ms}/"
+                              f"{(gate.reason if effect.reason is None else effect.reason) or 'none'}",
                               time.monotonic())
 
     def notification(self, attribute, value, stamp, *, replay=False):
@@ -263,9 +264,9 @@ class VoiceReceiver:
         elif kind == "audio":
             effects = self.gate.audio(value, now)
             if self.observation:
-                self.observation.count("accepted_audio" if effects else "ignored_audio")
+                self.observation.count("accepted_audio" if self.gate.audio_accepted else "ignored_audio")
             stream = "stream" if self.gate.stream is not None else "no_stream"
-            decision = "accepted" if effects else "ignored"
+            decision = "accepted" if self.gate.audio_accepted else "ignored"
             self._probe_decision(f"audio/{len(value)}/{self.gate.state}/{stream}/{decision}", now)
             self.effects(effects)
 

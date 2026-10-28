@@ -18,6 +18,8 @@ START_TIMEOUT = 10.0
 STOP_TIMEOUT = 5.0
 QUIET_SECONDS = .3
 EXTEND_SECONDS = 20.0  # Internal protocol maintenance, never a UI preference.
+_HOLD_HANDOFF_PACKETS = 128  # Leave room in the host's 256-event queue for control/live data.
+_HOLD_HANDOFF_BYTES = 32768  # Bounded RAM only; never keep a recording on disk.
 
 # Google initialization is explicit on every receiver connection. The runtime
 # below implements v1.0, 16-kHz ADPCM and physical hold-to-talk streams only.
@@ -84,6 +86,7 @@ class Effect:
     kind: str
     attempt: int
     value: object = None
+    reason: str | None = None  # Snapshot when one call completes and starts attempts.
 
 
 class Recording:
@@ -110,6 +113,27 @@ class Recording:
         self.next_extend = 0.0
         self.stop_seen = None
         self.closed_streams = set()
+        self.audio_accepted = False
+        self._clear_hold_start()
+
+    def _clear_hold_start(self):
+        self._hold_restart_allowed = False
+        self._hold_start = None
+        self._hold_packets = []
+        self._hold_bytes = 0
+        self._hold_audio_at = 0.0
+
+    def _buffer_hold_packet(self, kind, payload, now):
+        if (len(self._hold_packets) >= _HOLD_HANDOFF_PACKETS
+                or self._hold_bytes + len(payload) > _HOLD_HANDOFF_BYTES):
+            # Do not start with a truncated decoder history or wait indefinitely.
+            self._clear_hold_start()
+            return self._close_stream()
+        self._hold_packets.append((kind, payload))
+        self._hold_bytes += len(payload)
+        if kind == "audio":
+            self._hold_audio_at = now
+        return []
 
     def _clock(self, now):
         if (type(now) not in (int, float) or not math.isfinite(now)
@@ -121,6 +145,7 @@ class Recording:
         return Effect(kind, self.attempt, value)
 
     def _begin(self, now):
+        self._clear_hold_start()
         self.attempt += 1
         self.state, self.phase_at = "starting", now
         self.reason = ""
@@ -148,11 +173,13 @@ class Recording:
     def finish(self, now, reason="stopped", *, shutdown=False):
         self._clock(now)
         self.shutting_down |= shutdown
+        self._clear_hold_start()
         if self.state == "idle" and self.stream is None and not self.possible_open:
             return []
         if self.state in ("stopping", "blocked"):
             return self._close_stream()
         self.state, self.phase_at, self.reason = "stopping", now, reason
+        self._hold_restart_allowed = self.mode == "hold" and reason == "released" and not self.shutting_down
         self.open_pending = False
         effects = [self._effect("host_stop", reason if reason in ("second_press", "time_limit", "device_ended") else None),
                    self._effect("state", "stopping")]
@@ -176,9 +203,15 @@ class Recording:
 
     def host_stopped(self, attempt, success, now):
         self._clock(now)
+        effects = []
         if attempt == self.attempt and self.state in ("stopping", "blocked"):
             self.host_released = success is True
-        return self.tick(now)
+            if not self.host_released:
+                pending_hold = self._hold_start is not None
+                self._clear_hold_start()
+                if pending_hold:
+                    effects += self._close_stream()
+        return effects + self.tick(now)
 
     def control(self, payload, now):
         self._clock(now)
@@ -198,11 +231,23 @@ class Recording:
             if stream == self.stream:
                 self.control_result = "duplicate_start"
                 return []  # Duplicate start must not reset host or decoder.
-            self.stream, self.stop_seen = stream, None
+            # Only a fresh physical hold following a normal release may cross
+            # cleanup. Keep the old STOP/quiet proof separate from new audio.
+            handoff = (self.state == "stopping" and self._hold_restart_allowed
+                       and not self.shutting_down and not self.possible_open
+                       and stream[1] == 3 and now - self.phase_at < STOP_TIMEOUT
+                       and (self.stream is None or self._hold_start is not None))
+            self.stream = stream
             if stream[1] == 3:
                 # A new proven HTT stream replaces the old software stream.
                 self.possible_open = False
             self.closed_streams.discard(stream[0])
+            if handoff:
+                self._clear_hold_start()
+                self._hold_restart_allowed = True
+                self._hold_start = payload
+                return self.tick(now)
+            self.stop_seen = None
             if self.state in ("stopping", "blocked") or self.shutting_down:
                 return self.finish(now, "stopped", shutdown=self.shutting_down)
             if self.state == "idle":
@@ -231,6 +276,11 @@ class Recording:
                 self.control_result = "invalid_stop"
                 return self.finish(now, "device_stop_failed")
             self.control_result = "accepted_stop"
+            # Once released, a waiting press must never start in the background.
+            if self._hold_start is not None:
+                allowed = self._hold_restart_allowed
+                self._clear_hold_start()
+                self._hold_restart_allowed = allowed
             previous, self.stream = self.stream, None
             self.stop_seen = now
             if previous == (0, 0):
@@ -256,11 +306,20 @@ class Recording:
             return self.finish(now, "device_open_failed")
         if opcode == 0x0a and len(payload) == 7 and self.stream is not None:
             self.control_result = "accepted_sync"
+            if self._hold_start is not None:
+                return self._buffer_hold_packet("control", payload, now)
             return [self._effect("control", payload)]
         return []
 
     def audio(self, payload, now):
         self._clock(now)
+        self.audio_accepted = False
+        if self._hold_start is not None:
+            if isinstance(payload, bytes) and 1 <= len(payload) <= 512:
+                effects = self._buffer_hold_packet("audio", payload, now)
+                self.audio_accepted = self._hold_start is not None
+                return effects
+            return []
         if self.state in ("stopping", "blocked"):
             self.last_audio = now  # Late packets postpone quiet confirmation.
             return []
@@ -268,6 +327,7 @@ class Recording:
                 or not isinstance(payload, bytes) or not 1 <= len(payload) <= 512):
             return []
         self.last_audio = now
+        self.audio_accepted = True
         return [self._effect("audio", payload)]
 
     def command_valid(self, effect):
@@ -298,6 +358,7 @@ class Recording:
         if effect.attempt != self.attempt or success is True:
             return []
         if effect.value[0] == 0x0d:
+            self._clear_hold_start()
             self.state, self.reason = "blocked", "device_stop_unconfirmed"
             return [self._effect("state", "blocked")]
         return self.finish(now, "device_command_failed")
@@ -313,11 +374,25 @@ class Recording:
                 self.next_extend = now + EXTEND_SECONDS
                 return [self._effect("device", bytes((0x0e, self.stream[0])))]
         if self.state in ("stopping", "blocked"):
+            if self._hold_start is not None:
+                if now - self.phase_at >= STOP_TIMEOUT:
+                    self._clear_hold_start()
+                    self.state, self.reason = "blocked", "cleanup_unconfirmed"
+                    return self._close_stream() + [self._effect("state", "blocked")]
+                if (self.host_released and self.stop_seen is not None
+                        and now - max(self.stop_seen, self.last_audio) >= QUIET_SECONDS):
+                    start, packets, last_audio = self._hold_start, self._hold_packets, self._hold_audio_at
+                    # Host needs the old idle before claiming the next attempt.
+                    effects = [Effect("state", self.attempt, "idle", self.reason)] + self._begin(now)
+                    self.last_audio = last_audio
+                    return (effects + [self._effect("control", start)]
+                            + [self._effect(kind, data) for kind, data in packets])
             if (self.host_released and self.stream is None and not self.possible_open
                     and self.stop_seen is not None and now - max(self.stop_seen, self.last_audio) >= QUIET_SECONDS):
                 self.state = "idle"
                 return [self._effect("state", "idle")]
             if self.state == "stopping" and now - self.phase_at >= STOP_TIMEOUT:
+                self._clear_hold_start()
                 self.state, self.reason = "blocked", "cleanup_unconfirmed"
                 return [self._effect("state", "blocked")]
         return []
