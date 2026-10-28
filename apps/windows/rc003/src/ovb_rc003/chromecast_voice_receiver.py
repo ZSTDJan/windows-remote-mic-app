@@ -13,8 +13,10 @@ from .chromecast_voice import (Recording, GET_CAPABILITIES, CAPABILITIES_TIMEOUT
 
 
 class VoiceReceiver:
-    def __init__(self, device, send, *, detect_only=False, observation=None, direct_notifications=False):
+    def __init__(self, device, send, *, detect_only=False, observation=None, direct_notifications=False,
+                 input_epoch=0):
         self.device, self.send = device, send
+        self.input_epoch = input_epoch
         self.observation = observation
         settings = config.load_config(config.config_path())
         self.gate = Recording(settings.get("remote_recording_mode", "hold"),
@@ -171,6 +173,8 @@ class VoiceReceiver:
                 self.queue.append(effect)
             else:
                 data = effect.value.hex() if isinstance(effect.value, bytes) else effect.value or ""
+                if effect.kind == "host_start":
+                    data = f"epoch/{self.input_epoch}"
                 self.emit(effect.kind, effect.attempt, data, time.monotonic())
                 if effect.kind == "host_start" and self.capabilities:
                     # Each host attempt creates a new decoder; apply negotiated
@@ -276,6 +280,16 @@ class VoiceReceiver:
         if data not in self.seen_decisions and len(self.seen_decisions) < 48:
             self.seen_decisions.add(data)
             self.emit("probe", 0, data, now)
+
+    def cancel_input(self, epoch):
+        if epoch <= self.input_epoch:
+            return
+        self.input_epoch = epoch
+        # Cancellation also applies while capabilities negotiation is pending.
+        self._startup.clear()
+        self._startup_bytes = 0
+        if not self.detect_only:
+            self.effects(self.gate.finish(time.monotonic(), "host_stop"))
 
     def host(self, message):
         if not self.available or self.detect_only:

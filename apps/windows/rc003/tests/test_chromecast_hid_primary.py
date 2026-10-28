@@ -176,14 +176,28 @@ class HidWorkerTests(unittest.IsolatedAsyncioTestCase):
                                      and event["data"] == "ready" for event in received))
                 self.assertEqual(received[-1]["type"], "stopped" if cancel_kind == "stop" else "error")
 
-    async def _run_voice_initialization(self, *, reply_at=1, cancel_kind=None):
+    async def test_input_cancel_survives_initialization_and_reaches_live_receiver(self):
+        received, _ = await self._run_voice_initialization(cancel_input=True)
+        self.assertEqual(received[-1]["type"], "stopped")
+
+    async def _run_voice_initialization(self, *, reply_at=1, cancel_kind=None, cancel_input=False):
         identity = SessionIdentity.create(ENTITY)
         commands, events = Channel(identity, commands=True), Channel(identity, commands=False)
         inbox = deque([commands.encode("start", mode="run", voice=True)])
+        if cancel_input:
+            inbox.extend(commands.encode("voice_cancel", input_epoch=e) for e in (2, 1))
         received = []
         reports = deque([("hook_ready", "", time.monotonic())])
         notifications = deque()
         requests = 0
+        adapters = []
+
+        def make_voice(*args, **kwargs):
+            receiver = VoiceReceiver(*args, **kwargs)
+            if cancel_input:
+                self.assertEqual(receiver.input_epoch, 2)
+            adapters.append(receiver)
+            return receiver
 
         class Tap:
             def start(self):
@@ -231,6 +245,8 @@ class HidWorkerTests(unittest.IsolatedAsyncioTestCase):
             event = events.decode(raw)
             received.append(event)
             if event["type"] == "voice" and event["event"] == "available" and event["data"] == "ready":
+                if cancel_input:
+                    inbox.append(commands.encode("voice_cancel", input_epoch=3))
                 inbox.append(commands.encode("stop"))
 
         with mock.patch.object(worker, "_selected", return_value=True), \
@@ -238,6 +254,7 @@ class HidWorkerTests(unittest.IsolatedAsyncioTestCase):
              mock.patch.object(worker, "HidTap", return_value=Tap()), \
              mock.patch.object(worker, "verify_peer"), mock.patch.object(worker, "inspect_peer"), \
              mock.patch("ovb_rc003.chromecast_voice_receiver.CAPABILITIES_TIMEOUT", .1), \
+             mock.patch("ovb_rc003.chromecast_voice_receiver.VoiceReceiver", side_effect=make_voice), \
              mock.patch("ovb_rc003.chromecast_voice_receiver.config.load_config", return_value={}):
             result = await asyncio.wait_for(worker.receive(identity, SimpleNamespace(pid=1),
                 SimpleNamespace(read=lambda: inbox.popleft() if inbox else None, write=write)), 3)
@@ -245,6 +262,8 @@ class HidWorkerTests(unittest.IsolatedAsyncioTestCase):
         target.open_voice.assert_awaited_once_with(direct=True)
         target.close.assert_called_once()
         self.assertEqual(target.close_voice.await_count, 2 if cancel_kind else 1)
+        if cancel_input:
+            self.assertEqual(adapters[0].input_epoch, 3)
         return received, requests
 
 

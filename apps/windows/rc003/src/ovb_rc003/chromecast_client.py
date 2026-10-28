@@ -255,10 +255,16 @@ class Client:
                 self._count_input("suppressed")
 
     def voice_host(self, attempt, result):
+        return self._queue_voice_command("voice_host", attempt=attempt, result=result)
+
+    def cancel_voice(self, input_epoch):
+        return self._queue_voice_command("voice_cancel", input_epoch=input_epoch)
+
+    def _queue_voice_command(self, kind, **fields):
         if self.cancel.is_set() or self.finished.is_set():
             return False
         try:
-            self._voice_commands.put_nowait((attempt, result))
+            self._voice_commands.put_nowait((kind, fields))
             return True
         except queue.Full:
             self.cancel.set()
@@ -310,10 +316,10 @@ class Client:
                     last_heartbeat = now
                 while not outgoing.closed:
                     try:
-                        attempt, result = self._voice_commands.get_nowait()
+                        kind, fields = self._voice_commands.get_nowait()
                     except queue.Empty:
                         break
-                    pipe.write(outgoing.encode("voice_host", attempt=attempt, result=result))
+                    pipe.write(outgoing.encode(kind, **fields))
                 for _ in range(64):
                     raw = pipe.read()
                     if raw is None:

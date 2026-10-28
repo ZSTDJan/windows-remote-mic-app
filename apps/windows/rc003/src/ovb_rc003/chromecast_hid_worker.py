@@ -30,6 +30,7 @@ async def receive(identity, parent, pipe):
     cleanup_ok = True
     reason, stage = "stopped", "start"
     voice_enabled = False
+    input_epoch = 0
     observation = Observation(lambda row: pipe.write(events.encode("evidence", record=row)))
     step_started = {}
     fallback_extended = False
@@ -110,6 +111,10 @@ async def receive(identity, parent, pipe):
                     break
                 if command["type"] == "voice_host" and voice:
                     voice.host(command)
+                elif command["type"] == "voice_cancel":
+                    input_epoch = max(input_epoch, command["input_epoch"])
+                    if voice:
+                        voice.cancel_input(input_epoch)
             if stop:
                 if tap is not None:
                     tap.abort_start()
@@ -198,7 +203,7 @@ async def receive(identity, parent, pipe):
                 voice = VoiceReceiver(device, lambda kind, attempt, data, stamp:
                     pipe.write(events.encode("voice", event=kind, attempt=attempt, data=data, time=stamp)),
                     detect_only=start["mode"] == "detect", observation=observation,
-                    direct_notifications=True)
+                    direct_notifications=True, input_epoch=input_epoch)
                 voice_open = asyncio.create_task(voice.open())
             if voice is not None:
                 for attribute, value, stamp in device.poll_voice():

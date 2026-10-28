@@ -738,6 +738,46 @@ p.close()
         self.assertTrue(receiver.cleanup_confirmed)
         self.assertTrue(receiver.finished.is_set())
 
+    def test_voice_cancel_uses_ordered_command_pipe_and_stops_cleanly(self):
+        receiver = client.Client(ENTITY, mode="run", on_edge=mock.Mock(), on_voice=mock.Mock())
+        outgoing = channel.Channel(receiver.identity, commands=False)
+        incoming = channel.Channel(receiver.identity, commands=True)
+        events = deque([outgoing.encode("ready"), outgoing.encode("stopped", reason="stopped")])
+        sent = []
+        receiver.voice_host(1, "released")
+        receiver.cancel_voice(1)
+        receiver.voice_host(2, "failed")
+        peer = pipes.Peer(1, 2, "sid", 3, "image")
+        pipe = SimpleNamespace(connect=mock.Mock(), peer_pid=lambda: 1,
+                               read=lambda: events.popleft() if events else None,
+                               write=lambda raw: sent.append(incoming.decode(raw)), close=mock.Mock())
+
+        def exit_code(handle, pointer):
+            C.cast(pointer, C.POINTER(C.c_ulong)).contents.value = 0
+            return True
+
+        kernel = SimpleNamespace(GetProcessId=lambda _: 1, WaitForSingleObject=lambda *_: 0,
+                                 GetExitCodeProcess=exit_code, CloseHandle=mock.Mock())
+        with mock.patch.multiple(client, inspect_peer=lambda _: peer, Pipe=lambda *_args, **_kwargs: pipe,
+                                 launch_worker=lambda *_: 42, api=lambda: (kernel, None),
+                                 bind_worker_peer=lambda *_: (peer, None)):
+            receiver._run()
+        self.assertEqual([e["type"] for e in sent if e["type"].startswith("voice_")],
+                         ["voice_host", "voice_cancel", "voice_host"])
+        self.assertEqual(next(e["input_epoch"] for e in sent if e["type"] == "voice_cancel"), 1)
+        self.assertTrue(receiver.cleanup_confirmed)
+        self.assertTrue(receiver.finished.is_set())
+        self.assertFalse(receiver.cancel_voice(2))
+
+    def test_voice_cancel_queue_overflow_stops_instead_of_losing_cancellation(self):
+        receiver = client.Client(ENTITY, mode="run", on_edge=mock.Mock(), on_voice=mock.Mock())
+        for _ in range(32):
+            self.assertTrue(receiver.voice_host(1, "released"))
+        self.assertFalse(receiver.cancel_voice(1))
+        self.assertTrue(receiver.cancel.is_set())
+        self.assertFalse(receiver.voice_host(1, "ready"))
+        self.assertFalse(receiver.cancel_voice(2))
+
     def test_cancel_before_launch_and_no_late_delivery(self):
         callback = mock.Mock()
         receiver = client.Client(ENTITY, mode="detect", on_edge=callback)

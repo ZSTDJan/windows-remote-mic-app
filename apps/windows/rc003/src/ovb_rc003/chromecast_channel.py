@@ -17,10 +17,10 @@ import secrets
 
 from . import remote_selection, remote_layout
 from .chromecast_buttons import ButtonEdge, STOP_REASONS
-from .chromecast_voice import parse_lifecycle
+from .chromecast_voice import MAX_INPUT_EPOCH, parse_lifecycle, parse_start_epoch
 from .chromecast_observation import valid_record
 
-VERSION = 27
+VERSION = 28
 MAX_MESSAGE_BYTES = 2048
 HEARTBEAT_TIMEOUT = 10.0
 _BUTTONS = frozenset(remote_layout.CHROMECAST_REPORT_CODES)
@@ -200,6 +200,12 @@ class Channel:
                     expected.add("voice")
                     if type(message["voice"]) is not bool or message.get("mode") == "setup":
                         raise ChannelError("invalid_voice_start")
+            elif kind == "voice_cancel":
+                expected.add("input_epoch")
+                if (self.mode != "run" or not self.voice_enabled
+                        or type(message.get("input_epoch")) is not int
+                        or not 1 <= message["input_epoch"] <= MAX_INPUT_EPOCH):
+                    raise ChannelError("invalid_voice_cancel")
             elif kind == "voice_host":
                 expected.update(("attempt", "result"))
                 if (self.mode != "run" or not self.voice_enabled or type(message.get("attempt")) is not int
@@ -277,8 +283,12 @@ class Channel:
                 value = message["data"]
                 if not value or len(value) % 2 or any(ch not in "0123456789abcdef" for ch in value):
                     raise ChannelError("invalid_voice_payload")
-            elif (message["event"] == "host_start" and message["data"] or
-                  message["event"] == "host_stop" and message["data"] not in ("", "second_press", "time_limit", "device_ended")):
+            elif message["event"] == "host_start":
+                try:
+                    parse_start_epoch(message["data"])
+                except ValueError as exc:
+                    raise ChannelError("invalid_voice_host_payload") from exc
+            elif message["event"] == "host_stop" and message["data"] not in ("", "second_press", "time_limit", "device_ended"):
                 raise ChannelError("invalid_voice_host_payload")
             elif message["event"] == "state" and message["data"] not in ("idle", "starting", "recording", "stopping", "blocked"):
                 raise ChannelError("invalid_voice_state")

@@ -55,6 +55,7 @@ async def receive(identity, parent, pipe):
     hid_tap, hid_start, hid_deadline, hid_armed = None, None, None, False
     voice, voice_open = None, None
     voice_enabled = False
+    input_epoch = 0
     reason, cleanup_ok, announced = "stopped", True, False
     stage = "start"
     observation = Observation(lambda row: pipe.write(events.encode("evidence", record=row)))
@@ -122,6 +123,10 @@ async def receive(identity, parent, pipe):
                     break
                 if command["type"] == "voice_host" and voice:
                     voice.host(command)
+                elif command["type"] == "voice_cancel":
+                    input_epoch = max(input_epoch, command["input_epoch"])
+                    if voice:
+                        voice.cancel_input(input_epoch)
             if stop:
                 break
             if device.changed.is_set():
@@ -229,7 +234,7 @@ async def receive(identity, parent, pipe):
                 from .chromecast_voice_receiver import VoiceReceiver
                 voice = VoiceReceiver(device, lambda kind, attempt, data, stamp:
                     pipe.write(events.encode("voice", event=kind, attempt=attempt, data=data, time=stamp)),
-                    detect_only=start["mode"] == "detect", observation=observation)
+                    detect_only=start["mode"] == "detect", observation=observation, input_epoch=input_epoch)
                 receiver.on_notification = voice.notification
                 voice_open = asyncio.create_task(voice.open())
             if voice and voice_open.done():

@@ -7,6 +7,7 @@ from unittest import mock
 
 from ovb_rc003.chromecast_voice import Recording, Effect, STOP_TIMEOUT
 from ovb_rc003.chromecast_voice_receiver import VoiceReceiver
+from ovb_rc003.chromecast_channel import Channel, SessionIdentity
 from tests import test_chromecast_voice as voice_tests
 
 
@@ -205,6 +206,11 @@ class HoldHandoffIntegrationTests(unittest.TestCase):
         self.now = 1.0
         self.replies = deque()
         self.delivered = []
+        identity = SessionIdentity.create("a" * 64)
+        self.event_out, self.event_in = (Channel(identity, commands=False) for _ in range(2))
+        self.command_out, self.command_in = (Channel(identity, commands=True) for _ in range(2))
+        self.event_in.decode(self.event_out.encode("ready"))
+        self.command_in.decode(self.command_out.encode("start", mode="run", voice=True))
         patcher = mock.patch("ovb_rc003.chromecast_voice_receiver.time",
                              SimpleNamespace(monotonic=lambda: self.now))
         patcher.start()
@@ -217,7 +223,9 @@ class HoldHandoffIntegrationTests(unittest.TestCase):
                                       write_voice=mock.AsyncMock())
         self.receiver = self.make_receiver()
         self.host.client.voice_host.side_effect = lambda attempt, result: self.replies.append(
-            {"attempt": attempt, "result": result})
+            self.command_out.encode("voice_host", attempt=attempt, result=result))
+        self.host.client.cancel_voice.side_effect = lambda epoch: self.replies.append(
+            self.command_out.encode("voice_cancel", input_epoch=epoch))
         self.writers = []
 
         def open_output():
@@ -233,7 +241,8 @@ class HoldHandoffIntegrationTests(unittest.TestCase):
 
     def make_receiver(self):
         def send(kind, attempt, data, stamp):
-            event = {"event": kind, "attempt": attempt, "data": data}
+            event = self.event_in.decode(self.event_out.encode(
+                "voice", event=kind, attempt=attempt, data=data, time=stamp))
             self.host.enqueue(event)
             self.delivered.append(event)
         receiver = VoiceReceiver(self.device, send, direct_notifications=True)
@@ -250,7 +259,11 @@ class HoldHandoffIntegrationTests(unittest.TestCase):
             while not self.host.events.empty():
                 self.host._handle(self.host.events.get_nowait())
             while self.replies:
-                self.receiver.host(self.replies.popleft())
+                reply = self.command_in.decode(self.replies.popleft())
+                if "input_epoch" in reply:
+                    self.receiver.cancel_input(reply["input_epoch"])
+                else:
+                    self.receiver.host(reply)
 
     def first_recording(self):
         self.notify(START, 1)
@@ -297,6 +310,112 @@ class HoldHandoffIntegrationTests(unittest.TestCase):
         old_idle = next(e for e in self.delivered if e["event"] == "lifecycle"
                         and e["attempt"] == 1 and e["data"].startswith("idle/"))
         self.assertEqual(old_idle["data"], "idle/hold/120/1245/released")
+
+    def assert_fresh_press_recovers(self):
+        self.notify(STOP, 2.7)
+        self.now = 3.1
+        asyncio.run(self.receiver.tick())
+        self.pump()
+        self.assertEqual(self.receiver.gate.state, "idle")
+        self.host._poll_host()  # The host loop resumes after its queued stop.
+        self.pump()
+        self.notify(bytes((4, 3, 2, 3)), 3.2)
+        self.pump()
+        self.assertEqual(self.owner._voice_audio.open.call_count, 2)
+        self.owner._voice_shortcut.runtime_mic_confirmed = True
+        self.host._poll_host()
+        self.pump()
+        self.assertEqual(self.receiver.gate.state, "recording")
+        # Replayed cancellation must not terminate the fresh press.
+        self.receiver.cancel_input(self.host.input_epoch)
+        self.receiver.cancel_input(self.host.input_epoch - 1)
+        self.assertEqual(self.receiver.gate.state, "recording")
+        self.notify(RELEASE, 4)
+        self.pump()
+        self.now = 4.4
+        asyncio.run(self.receiver.tick())
+        self.pump()
+        self.assertTrue(self.host.closed)
+        self.assertFalse(self.owner._voice_shortcut.controller.active)
+
+    def test_cancelled_waiting_press_does_not_disable_next_real_press(self):
+        self.first_recording()
+        self.now = 2.3
+        self.pump()
+        self.host.cancel_recording()
+        self.host._poll_host()
+        self.pump()
+        self.assert_fresh_press_recovers()
+
+    def test_delayed_start_after_tracker_recovers_is_still_cancelled(self):
+        self.first_recording()
+        self.now = 2.3
+        self.pump()
+        # Hold the transport after the worker emits the handoff, before enqueue.
+        delayed, send = [], self.receiver.send
+        self.receiver.send = lambda *event: delayed.append(event)
+        self.now = 2.6
+        asyncio.run(self.receiver.tick())
+        self.receiver.send = send
+        self.assertTrue(any(event[0] == "host_start" for event in delayed))
+        self.host.cancel_recording()
+        self.host._poll_host()
+        self.assertFalse(self.host.input_lost.is_set())
+        # The worker has not received cancellation yet; the host has recovered.
+        for event in delayed:
+            send(*event)
+        self.pump()
+        self.assertEqual(self.owner._voice_audio.open.call_count, 1)
+        self.assert_fresh_press_recovers()
+
+    def test_cancel_after_handoff_is_queued_also_allows_next_real_press(self):
+        self.first_recording()
+        self.now = 2.3
+        self.pump()
+        self.now = 2.6
+        asyncio.run(self.receiver.tick())
+        self.host.cancel_recording()
+        self.host.cancel_recording()
+        self.host._poll_host()
+        self.pump()
+        self.assertEqual(self.owner._voice_audio.open.call_count, 1)
+        self.assert_fresh_press_recovers()
+
+    def test_cancel_while_old_host_still_cleaning_discards_pending_start(self):
+        self.first_recording()
+        self.host.cancel_recording()
+        self.host._poll_host()
+        self.pump()
+        self.assertIsNone(self.receiver.gate._hold_start)
+        self.assertEqual(self.owner._voice_audio.open.call_count, 1)
+        self.assert_fresh_press_recovers()
+
+    def test_cancel_before_client_is_attached_is_synchronized_on_start(self):
+        client = self.host.client
+        self.host.client = None
+        self.host.cancel_recording()
+        with mock.patch("ovb_rc003.chromecast_voice_host.threading.Thread"):
+            self.host.start(client)
+        self.pump()
+        self.assertEqual(self.receiver.input_epoch, self.host.input_epoch)
+        client.cancel_voice.assert_called_once_with(1)
+
+    def test_tracking_cancel_after_host_closed_discards_waiting_press(self):
+        self.first_recording()
+        self.now = 2.3
+        self.pump()
+        self.assertTrue(self.host.closed)
+        self.assertIsNotNone(self.receiver.gate._hold_start)
+        self.host.cancel_recording()
+        self.host._poll_host()
+        self.pump()
+        self.now = 2.6
+        asyncio.run(self.receiver.tick())
+        self.pump()
+        self.assertEqual(self.owner._voice_audio.open.call_count, 1)
+        self.assertIsNone(self.receiver.gate._hold_start)
+        self.assertTrue(self.host.closed)
+        self.assertFalse(self.owner._voice_shortcut.controller.active)
 
     def test_release_before_host_cleanup_never_emits_second_hotkey(self):
         self.first_recording()

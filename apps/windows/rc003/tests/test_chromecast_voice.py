@@ -689,7 +689,7 @@ class HostTests(unittest.TestCase):
         self.assertTrue(self.host.engaged)
 
     def test_old_queued_start_rejected_after_tracker_recovers(self):
-        self.host.enqueue({"event": "host_start", "attempt": 1, "data": ""})
+        self.host.enqueue({"event": "host_start", "attempt": 1, "data": "epoch/0"})
         self.host.cancel_recording()
         self.host._poll_host()
         self.host._handle(self.host.events.get_nowait())
@@ -1007,6 +1007,12 @@ class WorkerVoiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(receiver.hardware_stopped)
 
     async def test_selected_wire_to_open_close_and_clean_worker_exit(self):
+        await self._selected_wire_to_open_close()
+
+    async def test_worker_keeps_cancel_epoch_before_and_after_receiver_creation(self):
+        await self._selected_wire_to_open_close(cancel_input=True)
+
+    async def _selected_wire_to_open_close(self, *, cancel_input=False):
         from ovb_rc003 import chromecast_worker as worker
         from ovb_rc003 import chromecast_voice_receiver as adapter
         from tests.test_chromecast_buttons import acl
@@ -1014,6 +1020,14 @@ class WorkerVoiceTests(unittest.IsolatedAsyncioTestCase):
         commands = channel.Channel(identity, commands=True)
         events = channel.Channel(identity, commands=False)
         inbound = deque([commands.encode("start", mode="run", voice=True)])
+        if cancel_input:
+            inbound.extend(commands.encode("voice_cancel", input_epoch=e) for e in (2, 1))
+        receiver_type = adapter.VoiceReceiver
+
+        def make_voice(*args, **kwargs):
+            receiver = receiver_type(*args, **kwargs)
+            self.assertEqual(receiver.input_epoch, 2 if cancel_input else 0)
+            return receiver
         packets, received, writes = [], [], []
         target = SimpleNamespace(radio="c" * 64, attribute=0x29, changed=threading.Event(),
                                  voice_attributes={0x3f: "control", 0x3c: "audio"})
@@ -1034,8 +1048,11 @@ class WorkerVoiceTests(unittest.IsolatedAsyncioTestCase):
             event = events.decode(raw)
             received.append(event)
             if event.get("event") == "available":
+                if cancel_input:
+                    inbound.append(commands.encode("voice_cancel", input_epoch=3))
                 notify(PHYSICAL)
             elif event.get("event") == "host_start":
+                self.assertEqual(event["data"], "epoch/3" if cancel_input else "epoch/0")
                 inbound.append(commands.encode("voice_host", attempt=event["attempt"], result="ready"))
                 notify(RELEASE)
             elif event.get("event") == "state" and event["data"] == "recording":
@@ -1056,6 +1073,7 @@ class WorkerVoiceTests(unittest.IsolatedAsyncioTestCase):
              mock.patch.object(worker, "SelectedDevice", return_value=target), \
              mock.patch.object(worker, "Capture", return_value=capture), \
              mock.patch.object(worker, "verify_peer"), mock.patch.object(worker, "inspect_peer"), \
+             mock.patch.object(adapter, "VoiceReceiver", side_effect=make_voice), \
              mock.patch.object(adapter.config, "load_config", return_value={"remote_recording_mode": "toggle"}):
             result = await asyncio.wait_for(worker.receive(identity, parent, pipe), 4)
         self.assertEqual(result, 0)

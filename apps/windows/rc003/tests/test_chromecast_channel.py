@@ -23,6 +23,34 @@ class ChannelTests(unittest.TestCase):
         self.assertEqual(receiver.decode(sender.encode_edge(edge))["button"], "input_source")
         self.assertNotEqual(self.identity.generation, self.identity.token)
 
+    def test_voice_cancel_and_start_epoch_are_strict_and_session_scoped(self):
+        sender, receiver = (Channel(self.identity, commands=True) for _ in range(2))
+        receiver.decode(sender.encode("start", mode="run", voice=True))
+        self.assertEqual(receiver.decode(sender.encode("voice_cancel", input_epoch=2))["input_epoch"], 2)
+        for fields in ({}, {"input_epoch": True}, {"input_epoch": 1.0}, {"input_epoch": -1},
+                       {"input_epoch": 0}, {"input_epoch": 2**31}, {"input_epoch": 1, "extra": 1}):
+            with self.subTest(fields=fields), self.assertRaises(ChannelError):
+                sender.encode("voice_cancel", **fields)
+        for mode, voice in (("run", False), ("detect", True)):
+            commands = Channel(self.identity, commands=True)
+            commands.encode("start", mode=mode, voice=voice)
+            with self.subTest(mode=mode, voice=voice), self.assertRaises(ChannelError):
+                commands.encode("voice_cancel", input_epoch=1)
+        with self.assertRaises(ChannelError):
+            Channel(self.identity, commands=True).encode("voice_cancel", input_epoch=1)
+        out, inc = (Channel(self.identity, commands=False) for _ in range(2))
+        inc.decode(out.encode("ready"))
+        for data in ("epoch/0", "epoch/1", "epoch/2147483647"):
+            self.assertEqual(inc.decode(out.encode("voice", event="host_start", attempt=1,
+                                                  data=data, time=1))["data"], data)
+        for data in ("", "epoch/-1", "epoch/01", "epoch/1.0", "epoch/2147483648", "epoch/1/extra"):
+            with self.subTest(data=data), self.assertRaises(ChannelError):
+                out.encode("voice", event="host_start", attempt=1, data=data, time=1)
+        old = json.loads(Channel(self.identity, commands=True).encode("start", mode="run", voice=True))
+        old["version"] = 27
+        with self.assertRaises(ChannelError):
+            Channel(self.identity, commands=True).decode(json.dumps(old).encode())
+
     def test_diagnostics_are_bounded_nonterminal_and_never_commands(self):
         fields = empty_stop_details() | dict(
             stage="receive", phase="failed", reason="unknown_key_report",

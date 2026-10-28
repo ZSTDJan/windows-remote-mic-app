@@ -20,6 +20,8 @@ QUIET_SECONDS = .3
 EXTEND_SECONDS = 20.0  # Internal protocol maintenance, never a UI preference.
 _HOLD_HANDOFF_PACKETS = 128  # Leave room in the host's 256-event queue for control/live data.
 _HOLD_HANDOFF_BYTES = 32768  # Bounded RAM only; never keep a recording on disk.
+MAX_INPUT_EPOCH = 2**31 - 1
+
 
 # Google initialization is explicit on every receiver connection. The runtime
 # below implements v1.0, 16-kHz ADPCM and physical hold-to-talk streams only.
@@ -29,6 +31,16 @@ CAPABILITIES_MAX_ATTEMPTS = 5
 VOICE_OPEN_RETRY_DELAYS = (1.0, 3.0, 5.0)
 # Initial connection, three timed retries, then at most one fresh-button fallback.
 VOICE_OPEN_MAX_ATTEMPTS = 1 + len(VOICE_OPEN_RETRY_DELAYS) + 1
+
+
+def parse_start_epoch(data):
+    """A receiver-owned cancellation generation, not the event's arrival time."""
+    if not isinstance(data, str) or not re.fullmatch(r"epoch/(?:0|[1-9][0-9]{0,9})", data):
+        raise ValueError("invalid_voice_start_epoch")
+    epoch = int(data[6:])
+    if epoch > MAX_INPUT_EPOCH:
+        raise ValueError("invalid_voice_start_epoch")
+    return epoch
 
 
 def supported_capabilities(payload):

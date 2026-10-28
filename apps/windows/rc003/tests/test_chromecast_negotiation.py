@@ -71,7 +71,7 @@ class NegotiationTests(unittest.IsolatedAsyncioTestCase):
         await target.open()
         self.assertTrue(target.available)
         sequence = [(e[0], e[2]) for e in self.sent if e[0] in ("host_start", "control", "audio")]
-        self.assertEqual(sequence, [("host_start", ""), ("control", CAPS.hex()),
+        self.assertEqual(sequence, [("host_start", "epoch/0"), ("control", CAPS.hex()),
                                     ("control", PHYSICAL.hex()), ("audio", bytes(160).hex())])
         decoder = ATVVSession(gain_db=0)
         pcm = []
@@ -89,6 +89,25 @@ class NegotiationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(target.gate.stream)
         self.assertEqual(self.device.write_voice.await_args_list,
                          [mock.call(GET_CAPABILITIES), mock.call(b"\x0d\x01")])
+        self.validate_journal()
+        await target.close()
+
+    async def test_cancel_during_negotiation_discards_pre_cancel_start_and_audio(self):
+        target = self.receiver()
+
+        async def write(command):
+            self.notify(CAPS)
+            self.notify(PHYSICAL)
+            self.notify(bytes(160), 0x3c)
+            self.assertTrue(target._startup)
+            target.cancel_input(1)
+
+        self.device.write_voice.side_effect = write
+        await target.open()
+        self.assertTrue(target.available)
+        self.assertFalse(any(e[0] in ("host_start", "audio") for e in self.sent))
+        self.notify(PHYSICAL)
+        self.assertEqual([e[2] for e in self.sent if e[0] == "host_start"], ["epoch/1"])
         self.validate_journal()
         await target.close()
 

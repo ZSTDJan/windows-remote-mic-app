@@ -18,6 +18,7 @@ from .voice_shortcut_session import (
 )
 
 from .atvv_session import ATVVSession
+from .chromecast_voice import parse_start_epoch
 from .chromecast_host_activity import (
     CaptureWatch,
     read_doubao_capture,
@@ -107,7 +108,10 @@ class VoiceHost:
         self._cancelled_attempts = set()
 
     def start(self, client):
-        self.client = client
+        with self._input_lock:
+            self.client = client
+            if self.input_epoch:
+                client.cancel_voice(self.input_epoch)
         self.thread = threading.Thread(target=self._run, name="chromecast-voice-host", daemon=True)
         self.thread.start()
 
@@ -116,11 +120,13 @@ class VoiceHost:
             return
         try:
             with self._input_lock:
+                epoch = (parse_start_epoch(event.get("data")) if event.get("event") == "host_start"
+                         else self.input_epoch)
                 if event.get("event") == "host_stop":
                     self._cancelled_attempts.add(int(event.get("attempt", 0)))
                     if len(self._cancelled_attempts) > 32:
                         self._cancelled_attempts.discard(min(self._cancelled_attempts))
-                self.events.put_nowait(dict(event, _input_epoch=self.input_epoch,
+                self.events.put_nowait(dict(event, _input_epoch=epoch,
                                             _received_at=time.monotonic()))
         except queue.Full:
             self.request_stop()
@@ -133,12 +139,14 @@ class VoiceHost:
     def cancel_recording(self):
         """Cancel on tracker loss without destroying the reusable voice services.
 
-        A local epoch rejects queued starts from before the loss, even if the
-        tracker has already recovered when the voice thread handles them.
+        The receiver cancels its pending press; its epoch on each start also
+        rejects old starts still in transit when the tracker recovers.
         """
         with self._input_lock:
             self.input_epoch += 1
             self.input_lost.set()
+            if self.client:
+                self.client.cancel_voice(self.input_epoch)
 
     def cancel_recording_and_wait(self, timeout):
         """Give a failing right-Alt hook a bounded window to deliver owned UPs."""
