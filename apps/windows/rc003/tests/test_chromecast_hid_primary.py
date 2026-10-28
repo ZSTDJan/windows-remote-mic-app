@@ -151,12 +151,39 @@ class HidWorkerTests(unittest.IsolatedAsyncioTestCase):
         target.close.assert_called_once()
 
     async def test_voice_starts_from_direct_gatt_without_etw_probe(self):
+        received, requests = await self._run_voice_initialization()
+        self.assertEqual(requests, 1)
+        self.assertIn(("available", "ready"),
+                      [(event["event"], event["data"]) for event in received if event["type"] == "voice"])
+
+    async def test_caps_retry_keeps_ordinary_input_live_and_stops_normally_after_recovery(self):
+        received, requests = await self._run_voice_initialization(reply_at=2)
+        self.assertEqual(requests, 2)
+        ready = next(i for i, event in enumerate(received)
+                     if event["type"] == "voice" and event["event"] == "available"
+                     and event["data"] == "ready")
+        self.assertEqual([event["action"] for event in received[:ready] if event["type"] == "edge"],
+                         ["down", "up"])
+        self.assertEqual(received[-1]["type"], "stopped")
+
+    async def test_stop_or_disconnect_during_caps_retry_cancels_pending_initialization(self):
+        for cancel_kind in ("stop", "disconnect"):
+            with self.subTest(cancel_kind=cancel_kind):
+                received, requests = await self._run_voice_initialization(
+                    reply_at=5, cancel_kind=cancel_kind)
+                self.assertEqual(requests, 2)
+                self.assertFalse(any(event["type"] == "voice" and event["event"] == "available"
+                                     and event["data"] == "ready" for event in received))
+                self.assertEqual(received[-1]["type"], "stopped" if cancel_kind == "stop" else "error")
+
+    async def _run_voice_initialization(self, *, reply_at=1, cancel_kind=None):
         identity = SessionIdentity.create(ENTITY)
         commands, events = Channel(identity, commands=True), Channel(identity, commands=False)
         inbox = deque([commands.encode("start", mode="run", voice=True)])
         received = []
         reports = deque([("hook_ready", "", time.monotonic())])
         notifications = deque()
+        requests = 0
 
         class Tap:
             def start(self):
@@ -177,8 +204,18 @@ class HidWorkerTests(unittest.IsolatedAsyncioTestCase):
                 pass
 
         async def write_voice(command):
+            nonlocal requests
             if command == GET_CAPABILITIES:
-                notifications.append((0x3F, bytes((11, 1, 0, 2, 3, 0, 160, 0, 0)), time.monotonic()))
+                requests += 1
+                if requests == 1:
+                    reports.extend(("report", value, time.monotonic()) for value in
+                                   ("0300000000000000", "0000000000000000"))
+                if requests == 2 and cancel_kind == "stop":
+                    inbox.append(commands.encode("stop"))
+                elif requests == 2 and cancel_kind == "disconnect":
+                    target.changed.set()
+                elif requests == reply_at:
+                    notifications.append((0x3F, bytes((11, 1, 0, 2, 3, 0, 160, 0, 0)), time.monotonic()))
 
         def poll_voice():
             result = list(notifications)
@@ -200,13 +237,15 @@ class HidWorkerTests(unittest.IsolatedAsyncioTestCase):
              mock.patch.object(worker, "SelectedDevice", return_value=target), \
              mock.patch.object(worker, "HidTap", return_value=Tap()), \
              mock.patch.object(worker, "verify_peer"), mock.patch.object(worker, "inspect_peer"), \
+             mock.patch("ovb_rc003.chromecast_voice_receiver.CAPABILITIES_TIMEOUT", .1), \
              mock.patch("ovb_rc003.chromecast_voice_receiver.config.load_config", return_value={}):
             result = await asyncio.wait_for(worker.receive(identity, SimpleNamespace(pid=1),
                 SimpleNamespace(read=lambda: inbox.popleft() if inbox else None, write=write)), 3)
         self.assertEqual(result, 0)
         target.open_voice.assert_awaited_once_with(direct=True)
-        self.assertIn(("available", "ready"),
-                      [(event["event"], event["data"]) for event in received if event["type"] == "voice"])
+        target.close.assert_called_once()
+        self.assertEqual(target.close_voice.await_count, 2 if cancel_kind else 1)
+        return received, requests
 
 
 class DirectVoiceTests(unittest.IsolatedAsyncioTestCase):

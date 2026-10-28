@@ -31,7 +31,8 @@ class NegotiationTests(unittest.IsolatedAsyncioTestCase):
 
     def receiver(self, *, detect=False):
         self.sent, self.rows = [], []
-        self.device = SimpleNamespace(open_voice=mock.AsyncMock(), write_voice=mock.AsyncMock(),
+        self.device = SimpleNamespace(open_voice=mock.AsyncMock(), close_voice=mock.AsyncMock(),
+                                      write_voice=mock.AsyncMock(),
                                       voice_attributes={0x3f: "control", 0x3c: "audio"})
         self.observation = Observation(self.rows.append)
         patcher = mock.patch.object(adapter.config, "load_config", return_value={})
@@ -107,7 +108,7 @@ class NegotiationTests(unittest.IsolatedAsyncioTestCase):
                 self.device.write_voice.assert_awaited_once_with(GET_CAPABILITIES)
                 self.validate_journal()
 
-    async def test_write_failure_and_missing_response_are_distinct_without_retry(self):
+    async def test_only_missing_response_retries_and_stops_after_five_requests(self):
         for write_error, stage in ((OSError("private detail"), "voice_caps_write_failed"),
                                    (None, "voice_caps_timeout")):
             target = self.receiver()
@@ -116,9 +117,125 @@ class NegotiationTests(unittest.IsolatedAsyncioTestCase):
                 await target.open()
             self.assertFalse(target.available)
             self.assertIn(stage, [r.get("stage") for r in self.rows])
-            self.device.write_voice.assert_awaited_once_with(GET_CAPABILITIES)
+            expected = 1 if write_error else 5
+            self.assertEqual(self.device.write_voice.await_args_list,
+                             [mock.call(GET_CAPABILITIES)] * expected)
+            self.device.close_voice.assert_awaited_once()
+            target.note_activity(time.monotonic())
+            self.assertFalse(target.retry_ready())
             self.assertNotIn("private detail", str(self.rows))
             self.validate_journal()
+
+    async def test_missing_caps_recovers_on_same_fifth_connection_without_replaying_old_press(self):
+        for mode in ("hold", "toggle"):
+            with self.subTest(mode=mode):
+                target = self.receiver()
+                target.direct_notifications = True
+                target._open_attempts = 4
+                async def write(_):
+                    if self.device.write_voice.await_count == 1:
+                        # The user log: valid button/audio before any CAPS reply.
+                        for payload in (b"\x00\x02", b"\x04\x03\x02\x39", b"\x08"):
+                            self.notify(payload)
+                        self.notify(bytes(160), 0x3c)
+                        self.notify(bytes(160), 0x3c)
+                        self.notify(RELEASE)
+                    else:
+                        self.notify(CAPS)
+                self.device.write_voice.side_effect = write
+                with mock.patch.object(adapter, "CAPABILITIES_TIMEOUT", .01), \
+                     mock.patch.object(adapter.config, "load_config",
+                                       return_value={"remote_recording_mode": mode}):
+                    await target.open()
+                    self.assertTrue(target.available)
+                    self.assertFalse(any(e[0] == "host_start" for e in self.sent))
+                    self.notify(PHYSICAL)
+                    self.notify(bytes(160), 0x3c)
+                self.assertEqual(target.gate.mode, mode)
+                self.assertEqual(sum(e[0] == "host_start" for e in self.sent), 1)
+                self.assertEqual(sum(e[0] == "audio" for e in self.sent), 1)
+                self.assertEqual(self.observation.counts["not_available"], 6)
+                self.device.open_voice.assert_awaited_once_with(direct=True)
+                self.device.close_voice.assert_not_awaited()
+                self.assertEqual(self.device.write_voice.await_count, 2)
+                self.assertEqual(target._open_attempts, 5)
+                self.validate_journal()
+                await target.close()
+
+    async def test_last_caps_request_can_succeed_and_new_receiver_has_its_own_budget(self):
+        for connection in range(2):
+            with self.subTest(connection=connection):
+                target = self.receiver()
+                def write(_):
+                    if self.device.write_voice.await_count == 5:
+                        self.notify(CAPS)
+                        self.notify(PHYSICAL)
+                self.device.write_voice.side_effect = write
+                with mock.patch.object(adapter, "CAPABILITIES_TIMEOUT", .01):
+                    await target.open()
+                self.assertTrue(target.available)
+                self.assertEqual(self.device.write_voice.await_count, 5)
+                self.assertEqual(sum(e[0] == "host_start" for e in self.sent), 1)
+                self.device.open_voice.assert_awaited_once()
+                self.device.close_voice.assert_not_awaited()
+                self.validate_journal()
+                await target.close()
+
+    async def test_cancel_while_waiting_for_retry_reply_closes_without_further_writes(self):
+        target = self.receiver()
+        second = asyncio.Event()
+        def write(_):
+            if self.device.write_voice.await_count == 2:
+                second.set()
+        self.device.write_voice.side_effect = write
+        with mock.patch.object(adapter, "CAPABILITIES_TIMEOUT", .02):
+            task = asyncio.create_task(target.open())
+            try:
+                await asyncio.wait_for(second.wait(), 1)
+                task.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await task
+            finally:
+                if not task.done():
+                    task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+        target.stop()
+        await target.close()
+        self.assertEqual(self.device.write_voice.await_count, 2)
+        self.device.close_voice.assert_awaited_once()
+        self.assertFalse(target._caps_waiting)
+        self.assertFalse(target.available)
+        self.assertFalse(any(e[0] == "host_start" for e in self.sent))
+
+    async def test_write_timeout_during_retry_is_not_treated_as_missing_reply(self):
+        target = self.receiver()
+        self.device.write_voice.side_effect = [None, TimeoutError()]
+        with mock.patch.object(adapter, "CAPABILITIES_TIMEOUT", .01):
+            await target.open()
+        self.assertEqual(self.device.write_voice.await_count, 2)
+        self.device.close_voice.assert_awaited_once()
+        self.assertFalse(target.available)
+        stages = [r.get("stage") for r in self.rows]
+        self.assertEqual(stages.count("voice_caps_timeout"), 1)
+        self.assertEqual(stages.count("voice_caps_write_failed"), 1)
+        self.validate_journal()
+
+    async def test_delayed_caps_from_first_request_remains_valid_during_retry(self):
+        target = self.receiver()
+        first_reply_stamp = None
+        async def write(_):
+            nonlocal first_reply_stamp
+            if self.device.write_voice.await_count == 1:
+                first_reply_stamp = time.monotonic()
+            else:
+                self.notify(CAPS, stamp=first_reply_stamp)
+        self.device.write_voice.side_effect = write
+        with mock.patch.object(adapter, "CAPABILITIES_TIMEOUT", .01):
+            await target.open()
+        self.assertTrue(target.available)
+        self.assertEqual(self.device.write_voice.await_count, 2)
+        self.device.close_voice.assert_not_awaited()
+        self.validate_journal()
 
     async def test_stale_or_wrong_attribute_caps_cannot_complete_negotiation(self):
         target = self.receiver()

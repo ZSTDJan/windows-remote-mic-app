@@ -8,7 +8,7 @@ import asyncio
 from collections import deque
 import time
 from . import config
-from .chromecast_voice import (Recording, GET_CAPABILITIES, CAPABILITIES_TIMEOUT,
+from .chromecast_voice import (Recording, GET_CAPABILITIES, CAPABILITIES_TIMEOUT, CAPABILITIES_MAX_ATTEMPTS,
                               VOICE_OPEN_RETRY_DELAYS, VOICE_OPEN_MAX_ATTEMPTS, supported_capabilities)
 
 
@@ -50,18 +50,27 @@ class VoiceReceiver:
     async def _negotiate(self):
         self._caps_waiting = True
         self._caps_requested_at = time.monotonic()
-        self._stage("voice_caps_request")
         try:
-            try:
-                await self.device.write_voice(GET_CAPABILITIES)
-            except Exception:
-                self._stage("voice_caps_write_failed")
-                raise
-            try:
-                await asyncio.wait_for(self._caps_event.wait(), CAPABILITIES_TIMEOUT)
-            except TimeoutError:
-                self._stage("voice_caps_timeout")
-                raise
+            # Keep the proven connection/subscriptions while retrying only a
+            # missing CAPS reply. A late reply to an earlier identical request
+            # is still valid on this connection; never replay pre-CAPS audio.
+            for attempt in range(CAPABILITIES_MAX_ATTEMPTS):
+                if self._caps_event.is_set():
+                    break
+                self._stage("voice_caps_request")
+                try:
+                    await self.device.write_voice(GET_CAPABILITIES)
+                except Exception:
+                    self._stage("voice_caps_write_failed")
+                    raise
+                try:
+                    await asyncio.wait_for(self._caps_event.wait(), CAPABILITIES_TIMEOUT)
+                except TimeoutError:
+                    self._stage("voice_caps_timeout")
+                    if attempt + 1 == CAPABILITIES_MAX_ATTEMPTS:
+                        raise
+                else:
+                    break
             if not supported_capabilities(self.capabilities):
                 self._stage("voice_caps_unsupported")
                 raise ValueError("unsupported_voice_capabilities")
