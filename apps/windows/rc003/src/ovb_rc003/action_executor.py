@@ -11,6 +11,9 @@ real application.
 from __future__ import annotations
 
 import json
+import ctypes
+from ctypes import wintypes
+import logging
 import os
 import shutil
 import subprocess
@@ -20,7 +23,7 @@ import time
 from pathlib import Path
 from typing import Callable, Dict, Iterable, Optional, Sequence, Tuple
 
-from . import key_mapping
+from . import key_mapping, product_identity
 
 
 Command = Tuple[str, ...]
@@ -32,6 +35,114 @@ _application_command_cache: Dict[
     key_mapping.ActionKind, Tuple[float, Optional[Command]]
 ] = {}
 _application_command_cache_lock = threading.Lock()
+_program_launch_lock = threading.Lock()
+
+
+def request_program_launch(
+    action: key_mapping.ButtonAction,
+    *,
+    logger: Optional[logging.Logger] = None,
+) -> bool:
+    """Accept one launch, without blocking input on UAC or a Shell error dialog.
+
+    There is no pending queue or retry. While Windows is processing the request,
+    further requests are ignored rather than accumulating delayed launches.
+    """
+    if action.kind != key_mapping.ActionKind.OPEN_PROGRAM:
+        return False
+    path = key_mapping.normalize_program_path(action.program_path)
+    if not _program_launch_lock.acquire(blocking=False):
+        return False
+    log = logger or logging.getLogger(__name__)
+
+    def run() -> None:
+        try:
+            _shell_open_program(path)
+            log.info("user program launch accepted by Windows")
+        except Exception as exc:
+            log.warning("user program launch failed: error_type=%s winerror=%s",
+                        type(exc).__name__, getattr(exc, "winerror", None))
+            # Cancelling Windows authorization needs no second dialog. Keep
+            # the launch guard until any failure message has been dismissed.
+            if getattr(exc, "winerror", None) != 1223:
+                try:
+                    _show_program_launch_error(path, exc)
+                except Exception:
+                    log.warning("user program launch error dialog unavailable")
+        finally:
+            _program_launch_lock.release()
+
+    worker = threading.Thread(target=run, name="mapped-program-launch", daemon=True)
+    try:
+        worker.start()
+    except Exception:
+        _program_launch_lock.release()
+        raise
+    return True
+
+
+def _shell_open_program(path: str) -> None:
+    """Open a literal EXE with normal Windows security and failure feedback."""
+    if sys.platform != "win32":
+        raise OSError("Windows program launch is unavailable")
+    if not Path(path).is_file():
+        raise FileNotFoundError("Configured program file is unavailable")
+
+    class ShellExecuteInfo(ctypes.Structure):
+        _fields_ = [
+            ("cbSize", wintypes.DWORD), ("fMask", wintypes.ULONG),
+            ("hwnd", wintypes.HWND), ("lpVerb", wintypes.LPCWSTR),
+            ("lpFile", wintypes.LPCWSTR), ("lpParameters", wintypes.LPCWSTR),
+            ("lpDirectory", wintypes.LPCWSTR), ("nShow", ctypes.c_int),
+            ("hInstApp", wintypes.HINSTANCE), ("lpIDList", ctypes.c_void_p),
+            ("lpClass", wintypes.LPCWSTR), ("hkeyClass", wintypes.HKEY),
+            ("dwHotKey", wintypes.DWORD), ("hIcon", wintypes.HANDLE),
+            ("hProcess", wintypes.HANDLE),
+        ]
+
+    shell = ctypes.WinDLL("shell32", use_last_error=True)
+    ole = ctypes.WinDLL("ole32", use_last_error=True)
+    shell.ShellExecuteExW.argtypes = [ctypes.POINTER(ShellExecuteInfo)]
+    shell.ShellExecuteExW.restype = wintypes.BOOL
+    ole.CoInitializeEx.argtypes = [ctypes.c_void_p, wintypes.DWORD]
+    ole.CoInitializeEx.restype = ctypes.c_long
+    ole.CoUninitialize.argtypes = []
+    ole.CoUninitialize.restype = None
+    result = ole.CoInitializeEx(None, 0x2 | 0x4)  # STA, disable OLE1 DDE
+    if result < 0:
+        raise OSError("Cannot initialize the Windows program launcher")
+    try:
+        info = ShellExecuteInfo()
+        info.cbSize = ctypes.sizeof(info)
+        # The short-lived worker must finish Shell/DDE work before exiting.
+        # Provide one actionable error below. UAC/security prompts are still
+        # handled by Windows; SEE_MASK_FLAG_NO_UI does not suppress them.
+        info.fMask = 0x00000100 | 0x00000400  # NOASYNC | FLAG_NO_UI
+        info.lpVerb = "open"
+        info.lpFile = path
+        info.lpDirectory = str(Path(path).parent)
+        info.nShow = 1  # SW_SHOWNORMAL; do not hide a requested application.
+        if not shell.ShellExecuteExW(ctypes.byref(info)):
+            raise ctypes.WinError(ctypes.get_last_error())
+    finally:
+        ole.CoUninitialize()
+
+
+def _show_program_launch_error(path: str, error: Exception) -> None:
+    code = getattr(error, "winerror", None)
+    if isinstance(error, FileNotFoundError) or code in (2, 3):
+        message = "找不到程序，请在按键映射中重新填写或浏览选择 .exe 文件。"
+    elif code == 5:
+        message = "没有权限打开程序，请检查该文件的访问权限。"
+    elif code in (193, 216):
+        message = "此文件不是可运行的 Windows 程序，或与当前系统不兼容，请重新选择。"
+    else:
+        message = "程序启动失败，请检查路径，并尝试在文件资源管理器中双击该文件。"
+    user = ctypes.WinDLL("user32", use_last_error=True)
+    user.MessageBoxW.argtypes = [wintypes.HWND, wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.UINT]
+    user.MessageBoxW.restype = ctypes.c_int
+    user.MessageBoxW(None, message + "\n\n" + path,
+                     product_identity.DISPLAY_NAME + "：无法打开程序", 0x30 | 0x10000)
 
 
 # These are executable names rather than guessed window titles.  We resolve

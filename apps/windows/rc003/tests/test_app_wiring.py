@@ -3748,6 +3748,9 @@ class OrdinaryButtonGestureWiringTests(_AppWiringTestCase):
                 app_module, "open_configured_application", return_value=True
             )))
             effects.append(stack.enter_context(mock.patch.object(
+                app_module.action_executor, "request_program_launch", return_value=True
+            )))
+            effects.append(stack.enter_context(mock.patch.object(
                 app_module.element_navigation_control_windows,
                 "toggle_element_navigation",
                 return_value=app_module.element_navigation_control_windows.ToggleResult(
@@ -3761,13 +3764,15 @@ class OrdinaryButtonGestureWiringTests(_AppWiringTestCase):
             for option in settings_ui._PRESET_KEY_COMBOS:
                 with self.subTest(option=option):
                     content = "预设文字" if option == "输入文字" else None
+                    program_path = r"C:\Programs\Example.exe" if option == "打开程序" else None
                     self.assertEqual(settings_ui.button_action_validation_message(
-                        "up", "single_click", option, text_content=content
+                        "up", "single_click", option, text_content=content, program_path=program_path
                     ), "")
                     self.assertEqual(settings_ui.button_action_validation_message(
-                        "up", "double_click", option, text_content=content
+                        "up", "double_click", option, text_content=content, program_path=program_path
                     ), "")
-                    action = settings_ui._validated_button_action("up", "single_click", option, text_content=content)
+                    action = settings_ui._validated_button_action("up", "single_click", option,
+                                                                  text_content=content, program_path=program_path)
                     if action.kind == key_mapping.ActionKind.DISABLED:
                         continue
                     before = sum(effect.call_count for effect in effects)

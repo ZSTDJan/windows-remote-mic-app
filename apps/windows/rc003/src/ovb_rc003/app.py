@@ -4803,6 +4803,11 @@ class RC003App:
                     result=str(result.kind.value),
                     target_hwnd=int(result.target_hwnd),
                 )
+            elif action.kind == key_mapping.ActionKind.OPEN_PROGRAM:
+                if not self._accept_input_events:
+                    return
+                if not action_executor.request_program_launch(action, logger=self._logger):
+                    action_error = "program_launch_busy"
             elif action.kind == key_mapping.ActionKind.QUICKER_URI:
                 action_executor.open_quicker_uri(action)
             elif action_executor.is_application_action(action):

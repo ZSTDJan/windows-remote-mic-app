@@ -12856,7 +12856,9 @@ class SettingsShellSourceContractTests(unittest.TestCase):
             "SettingsController.actionOptionGroupTitle(String(modelData))",
             self.buttons_qml,
         )
-        self.assertIn("groupTitle !== SettingsController.actionOptionGroupTitle(", self.buttons_qml)
+        self.assertIn("title !== SettingsController.actionOptionGroupTitle(", self.buttons_qml)
+        self.assertIn("groupHeaderHeight: editorCombo.groupHeaderHeightAt(index)", self.buttons_qml)
+        self.assertIn("value: editorCombo.optionsHeight", self.buttons_qml)
         self.assertIn("Math.ceil(tokens.fontSizeTiny) + tokens.spacingMedium", self.buttons_qml)
         self.assertIn("topPadding: groupHeaderHeight", self.buttons_qml)
         self.assertIn("bottomPadding: 0", self.buttons_qml)

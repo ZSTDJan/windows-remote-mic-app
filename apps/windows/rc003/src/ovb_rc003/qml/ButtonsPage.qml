@@ -6,6 +6,7 @@ import QtQuick
 import QtQuick.Controls
 import QtQuick.Layouts
 import QtQuick.Effects
+import QtQuick.Dialogs
 import OvbRc003Settings 1.0
 
 Item {
@@ -557,6 +558,28 @@ Item {
         id: editorCombo
         property var tokens
 
+        function groupHeaderHeightAt(optionIndex) {
+            const title = SettingsController.actionOptionGroupTitle(String(model[optionIndex]))
+            const starts = title.length > 0 && (optionIndex === 0
+                || title !== SettingsController.actionOptionGroupTitle(String(model[optionIndex - 1])))
+            return starts ? Math.ceil(tokens.fontSizeTiny) + tokens.spacingMedium : 0
+        }
+
+        readonly property real optionsHeight: {
+            let total = 0
+            for (let i = 0; i < model.length; ++i)
+                total += tokens.controlHeight + groupHeaderHeightAt(i)
+            return total
+        }
+
+        // Grouped rows have different heights. Use their exact sum so the
+        // platform popup does not resize from ListView's changing estimate.
+        Binding {
+            target: editorCombo.popup.contentItem
+            property: "implicitHeight"
+            value: editorCombo.optionsHeight
+        }
+
         function setEditorValue(value) {
             const display = SettingsController.formatActionText(value)
             currentIndex = -1
@@ -570,6 +593,7 @@ Item {
         }
 
         editable: editText.trim() !== SettingsController.textActionLabel
+            && editText.trim() !== SettingsController.programActionLabel
         displayText: editText
         onAccepted: actionEditor.validationRequested = true
         selectTextByMouse: true
@@ -597,12 +621,8 @@ Item {
             id: optionDelegate
             readonly property string groupTitle:
                 SettingsController.actionOptionGroupTitle(String(modelData))
-            readonly property bool startsGroup:
-                groupTitle.length > 0 && (index === 0 ||
-                groupTitle !== SettingsController.actionOptionGroupTitle(
-                    String(editorCombo.model[index - 1])))
-            readonly property int groupHeaderHeight: startsGroup
-                ? Math.ceil(tokens.fontSizeTiny) + tokens.spacingMedium : 0
+            readonly property int groupHeaderHeight: editorCombo.groupHeaderHeightAt(index)
+            readonly property bool startsGroup: groupHeaderHeight > 0
             objectName: editorCombo.objectName + "_option_" + index
             width: ListView.view ? ListView.view.width : editorCombo.width
             height: tokens.controlHeight + groupHeaderHeight
@@ -666,6 +686,70 @@ Item {
             }
             Accessible.name: SettingsController.formatActionText(String(modelData))
         }
+    }
+
+    component ProgramPathEditor: RowLayout {
+        id: programEditor
+        property var tokens
+        property alias text: pathField.text
+        property string accessibleLabel
+        spacing: tokens.spacingSmall
+        UiLabel {
+            objectName: programEditor.objectName + "Label"
+            tokens: programEditor.tokens
+            kind: noteKind
+            text: qsTr("程序路径")
+        }
+        CompactTextField {
+            id: pathField
+            objectName: programEditor.objectName + "Field"
+            tokens: programEditor.tokens
+            Layout.fillWidth: true
+            Layout.minimumWidth: 0
+            placeholderText: qsTr("填写完整的 .exe 路径")
+            Accessible.name: programEditor.accessibleLabel
+            color: activeFocus ? tokens.textPrimary : "transparent"
+            onTextChanged: actionEditor.validationRequested = false
+            Label {
+                objectName: programEditor.objectName + "Preview"
+                anchors.fill: parent
+                anchors.leftMargin: pathField.leftPadding
+                anchors.rightMargin: pathField.rightPadding
+                text: pathField.text
+                textFormat: Text.PlainText
+                font: pathField.font
+                color: programEditor.tokens.textPrimary
+                elide: Text.ElideLeft
+                verticalAlignment: Text.AlignVCenter
+                visible: !pathField.activeFocus && pathField.text.length > 0
+            }
+        }
+        CompactButton {
+            objectName: programEditor.objectName + "Browse"
+            tokens: programEditor.tokens
+            compactMinimumWidth: programEditor.tokens.buttonWidth2Chars
+            text: qsTr("浏览…")
+            Accessible.name: programEditor.accessibleLabel + qsTr("浏览")
+            onClicked: {
+                programFileDialog.targetEditor = programEditor
+                programFileDialog.open()
+            }
+        }
+    }
+
+    FileDialog {
+        id: programFileDialog
+        objectName: "mappingProgramFileDialog"
+        property var targetEditor: null
+        title: qsTr("选择要打开的程序")
+        fileMode: FileDialog.OpenFile
+        nameFilters: [qsTr("应用程序 (*.exe)")]
+        onAccepted: {
+            if (targetEditor && actionEditor.visible)
+                targetEditor.text = SettingsController.programPathFromFileUrl(String(selectedFile))
+            targetEditor = null
+        }
+        onRejected: targetEditor = null
     }
 
     component PresetTextEditor: ColumnLayout {
@@ -787,9 +871,15 @@ Item {
         property string originalDoubleContent: ""
         property string originalLongContent: ""
         property var originalTextContents: ({})
+        property string originalPrimaryPath: ""
+        property string originalDoublePath: ""
+        property string originalLongPath: ""
         readonly property bool primaryIsText: primaryText.trim() === SettingsController.textActionLabel
+        readonly property bool primaryIsProgram: primaryText.trim() === SettingsController.programActionLabel
         readonly property bool doubleIsText: doubleText.trim() === SettingsController.textActionLabel
+        readonly property bool doubleIsProgram: doubleText.trim() === SettingsController.programActionLabel
         readonly property bool longIsText: longText.trim() === SettingsController.textActionLabel
+        readonly property bool longIsProgram: longText.trim() === SettingsController.programActionLabel
         property bool syncing: false
         property bool validationRequested: false
         onPrimaryTextChanged: validationRequested = false
@@ -801,15 +891,15 @@ Item {
             || normalizedPrimaryText.indexOf("已停用：旧语音配置") === 0
         readonly property string primaryValidationError: rowIndex >= 0
             ? SettingsController.buttonActionValidationMessage(
-                buttonId, "single_click", primaryText, primaryContent.text
+                buttonId, "single_click", primaryText, primaryContent.text, primaryPath.text
             ) : ""
         readonly property string doubleValidationError: rowIndex >= 0
             ? SettingsController.buttonActionValidationMessage(
-                buttonId, "double_click", doubleText, doubleContent.text
+                buttonId, "double_click", doubleText, doubleContent.text, doublePath.text
             ) : ""
         readonly property string longValidationError: rowIndex >= 0
             ? SettingsController.buttonActionValidationMessage(
-                buttonId, "long_press", longText, longContent.text
+                buttonId, "long_press", longText, longContent.text, longPath.text
             ) : ""
         readonly property string validationError:
             primaryValidationError.length > 0 ? primaryValidationError
@@ -823,8 +913,11 @@ Item {
             || doubleNote !== originalDoubleNote
             || longNote !== originalLongNote
             || (primaryIsText && primaryContent.text !== originalPrimaryContent)
+            || (primaryIsProgram && primaryPath.text !== originalPrimaryPath)
             || (doubleIsText && doubleContent.text !== originalDoubleContent)
+            || (doubleIsProgram && doublePath.text !== originalDoublePath)
             || (longIsText && longContent.text !== originalLongContent)
+            || (longIsProgram && longPath.text !== originalLongPath)
 
         function openForRow(rowIndexValue, buttonIdValue, buttonNameValue,
                             primaryValue, doubleValue, longValue,
@@ -857,8 +950,14 @@ Item {
             // TextArea renders CRLF as LF. Compare with its initial rendering,
             // but keep the original stored content when no text was edited.
             originalPrimaryContent = primaryContent.text
+            primaryPath.text = ButtonMappingModel.programPathAt(rowIndex, "single_click")
+            originalPrimaryPath = primaryPath.text
             originalDoubleContent = doubleContent.text
+            doublePath.text = ButtonMappingModel.programPathAt(rowIndex, "double_click")
+            originalDoublePath = doublePath.text
             originalLongContent = longContent.text
+            longPath.text = ButtonMappingModel.programPathAt(rowIndex, "long_press")
+            originalLongPath = longPath.text
             primaryCombo.setEditorValue(primaryValue)
             doubleCombo.setEditorValue(doubleValue)
             longCombo.setEditorValue(longValue)
@@ -901,6 +1000,9 @@ Item {
                 ? contentForSave("double_click", doubleContent.text, originalDoubleContent) : "")
             ButtonMappingModel.setTextContentAt(rowIndex, "long_press", longIsText
                 ? contentForSave("long_press", longContent.text, originalLongContent) : "")
+            ButtonMappingModel.setProgramPathAt(rowIndex, "single_click", primaryIsProgram ? primaryPath.text : "")
+            ButtonMappingModel.setProgramPathAt(rowIndex, "double_click", doubleIsProgram ? doublePath.text : "")
+            ButtonMappingModel.setProgramPathAt(rowIndex, "long_press", longIsProgram ? longPath.text : "")
             ButtonMappingModel.setActionTextAt(rowIndex, primaryText)
             ButtonMappingModel.setSecondaryActionTextAt(
                 rowIndex, "double_click", doubleText
@@ -922,6 +1024,8 @@ Item {
         }
 
         onClosed: {
+            programFileDialog.close()
+            programFileDialog.targetEditor = null
             syncing = true
             rowIndex = -1
         }
@@ -1011,7 +1115,7 @@ Item {
                 }
                     CompactButton {
                     objectName: "actionEditorPrimaryRecordButton"
-                    visible: !actionEditor.primaryIsText
+                    visible: !actionEditor.primaryIsText && !actionEditor.primaryIsProgram
                         tokens: root.tokens
                         compactMinimumWidth: tokens.buttonWidth2Chars
                     text: qsTr("录入")
@@ -1035,6 +1139,17 @@ Item {
                             actionEditor.primaryNote = text
                     }
                     Accessible.name: qsTr("单击备注名称")
+                }
+
+                ProgramPathEditor {
+                    id: primaryPath
+                    objectName: "actionEditorPrimaryPath"
+                    tokens: root.tokens
+                    Layout.columnSpan: 3
+                    Layout.fillWidth: true
+                    visible: actionEditor.primaryIsProgram
+                    enabled: true
+                    accessibleLabel: qsTr("单击程序路径")
                 }
 
                 PresetTextEditor {
@@ -1090,7 +1205,7 @@ Item {
                 }
                     CompactButton {
                     objectName: "actionEditorDoubleRecordButton"
-                    visible: !actionEditor.doubleIsText
+                    visible: !actionEditor.doubleIsText && !actionEditor.doubleIsProgram
                         tokens: root.tokens
                         compactMinimumWidth: tokens.buttonWidth2Chars
                     enabled: !actionEditor.primaryIsVoice
@@ -1116,6 +1231,17 @@ Item {
                             actionEditor.doubleNote = text
                     }
                     Accessible.name: qsTr("双击备注名称")
+                }
+
+                ProgramPathEditor {
+                    id: doublePath
+                    objectName: "actionEditorDoublePath"
+                    tokens: root.tokens
+                    Layout.columnSpan: 3
+                    Layout.fillWidth: true
+                    visible: actionEditor.doubleIsProgram
+                    enabled: !actionEditor.primaryIsVoice
+                    accessibleLabel: qsTr("双击程序路径")
                 }
 
                 PresetTextEditor {
@@ -1172,7 +1298,7 @@ Item {
                 }
                     CompactButton {
                     objectName: "actionEditorLongRecordButton"
-                    visible: !actionEditor.longIsText
+                    visible: !actionEditor.longIsText && !actionEditor.longIsProgram
                         tokens: root.tokens
                         compactMinimumWidth: tokens.buttonWidth2Chars
                     enabled: !actionEditor.primaryIsVoice
@@ -1200,6 +1326,17 @@ Item {
                     Accessible.name: qsTr("长按备注名称")
                 }
 
+                ProgramPathEditor {
+                    id: longPath
+                    objectName: "actionEditorLongPath"
+                    tokens: root.tokens
+                    Layout.columnSpan: 3
+                    Layout.fillWidth: true
+                    visible: actionEditor.longIsProgram
+                    enabled: !actionEditor.primaryIsVoice
+                    accessibleLabel: qsTr("长按程序路径")
+                }
+
                 PresetTextEditor {
                     id: longContent
                     objectName: "actionEditorLongContent"
@@ -1220,6 +1357,15 @@ Item {
                 visible: actionEditor.primaryIsText || actionEditor.doubleIsText || actionEditor.longIsText
                 wrapMode: Text.WordWrap
                 text: qsTr("原样粘贴到当前输入位置，剪贴板保留该内容；不额外发送回车。")
+            }
+
+            UiLabel {
+                tokens: root.tokens
+                kind: noteKind
+                Layout.fillWidth: true
+                visible: actionEditor.primaryIsProgram || actionEditor.doubleIsProgram || actionEditor.longIsProgram
+                wrapMode: Text.WordWrap
+                text: qsTr("每次触发打开一次；只填写程序路径，不附加参数。程序移动后请重新选择。")
             }
 
             UiLabel {

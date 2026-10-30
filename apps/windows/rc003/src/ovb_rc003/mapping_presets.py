@@ -62,7 +62,7 @@ def validate_mapping(value: object, profile: str) -> dict:
 
 
 def _validate_action(raw: object, button: str, trigger: str, profile: str) -> key_mapping.ButtonAction:
-    if not isinstance(raw, dict) or set(raw) - {"kind", "keys", "uri", "text"}:
+    if not isinstance(raw, dict) or set(raw) - {"kind", "keys", "uri", "text", "program_path"}:
         raise ValueError("按键动作格式无效。")
     action = key_mapping.ButtonAction.from_dict(raw)
     if action.kind in {key_mapping.ActionKind.VOICE, key_mapping.ActionKind.VOICE_TOGGLE}:
@@ -71,7 +71,7 @@ def _validate_action(raw: object, button: str, trigger: str, profile: str) -> ke
         win32_keys.resolve_vk_codes(action.keys)
     try:
         settings_ui._validated_button_action(button, trigger, settings_ui._action_to_display(action),
-                                            text_content=action.text)
+                                            text_content=action.text, program_path=action.program_path)
     except settings_ui.SettingsValidationError as exc:
         raise ValueError(exc.message) from exc
     if profile == device_catalog.CHROMECAST_ID and button == "mic":

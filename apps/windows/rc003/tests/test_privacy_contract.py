@@ -121,6 +121,19 @@ class NoForbiddenBrandingTests(unittest.TestCase):
 
 
 class NoElevationOrAutoDriverTests(unittest.TestCase):
+    def test_user_program_launcher_uses_only_ordinary_open_without_parameters(self):
+        text = (_PACKAGE_ROOT / "action_executor.py").read_text(encoding="utf-8")
+        tree = ast.parse(text)
+        launch = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "_shell_open_program")
+        verbs = [node.value.value for node in ast.walk(launch)
+                 if isinstance(node, ast.Assign) and isinstance(node.value, ast.Constant)
+                 and any(isinstance(target, ast.Attribute) and target.attr == "lpVerb" for target in node.targets)]
+        self.assertEqual(verbs, ["open"])
+        self.assertFalse(any(isinstance(node, ast.Assign)
+                             and any(isinstance(target, ast.Attribute) and target.attr == "lpParameters" for target in node.targets)
+                             for node in ast.walk(launch)))
+        self.assertNotIn("runas", text)
+
     def test_source_hid_elevation_has_a_fixed_entry_and_no_command_channel(self):
         text = (_PACKAGE_ROOT / "hid_source_injector.py").read_text(encoding="utf-8")
         tree = ast.parse(text)
@@ -155,6 +168,8 @@ class NoElevationOrAutoDriverTests(unittest.TestCase):
                 continue
             text = path.read_text(encoding="utf-8")
             for marker in _ELEVATION_MARKERS:
+                if path == _PACKAGE_ROOT / "action_executor.py" and marker == "ShellExecute":
+                    continue
                 if marker in text:
                     offenders.append((str(path), marker))
         self.assertEqual(offenders, [], f"elevation marker found: {offenders}")

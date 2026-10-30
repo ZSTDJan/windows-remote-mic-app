@@ -32,6 +32,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
+from pathlib import PureWindowsPath
 from typing import Dict, Optional, Tuple
 
 
@@ -40,6 +41,7 @@ class ActionKind(str, Enum):
     KEY_COMBO = "key_combo"
     QUICKER_URI = "quicker_uri"
     TEXT = "text"
+    OPEN_PROGRAM = "open_program"
     ESCAPE = "escape"
     RETURN = "return"
     ARROW_UP = "arrow_up"
@@ -253,6 +255,32 @@ def validate_preset_text(text: str) -> str:
         raise ValueError("预设文字包含无效字符。") from exc
     return text
 
+
+def normalize_program_path(value: str) -> str:
+    """Accept a literal absolute Windows EXE path, never a command line.
+
+    Do not check existence here: portable snapshots and missing installations
+    must remain loadable. Windows reports launch failures at execution time.
+    """
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("请填写程序的完整 .exe 路径。")
+    value = value.strip()
+    if len(value) >= 2 and value[0] == value[-1] == '"':
+        value = value[1:-1]
+    if any(ord(char) < 32 or char in '<>"|?*' for char in value):
+        raise ValueError("程序路径包含无效字符，请只填写 .exe 路径。")
+    try:
+        value.encode("utf-16-le")
+    except UnicodeEncodeError as exc:
+        raise ValueError("程序路径包含无效字符。") from exc
+    path = PureWindowsPath(value)
+    if (not path.is_absolute() or path.drive.startswith(("\\\\?", "\\\\."))
+            or ":" in value[2:] or path.suffix.casefold() != ".exe"
+            or len(value) > 32760):
+        raise ValueError("请填写完整的 .exe 文件路径，不要附加启动参数。")
+    return str(path)
+
+
 # The first combination implementation deliberately behaves like one Fn
 # layer.  Only a non-repeating utility key may be the modifier, while the
 # second key stays in the ordinary navigation cluster.  This avoids exposing
@@ -329,6 +357,7 @@ class ButtonAction:
     keys: Tuple[str, ...] = field(default_factory=tuple)
     uri: str = ""
     text: str = field(default="", repr=False)
+    program_path: str = field(default="", repr=False)
 
     def to_dict(self) -> dict:
         if self.kind in (ActionKind.MOUSE_WHEEL_UP, ActionKind.MOUSE_WHEEL_DOWN):
@@ -339,6 +368,8 @@ class ButtonAction:
             data["uri"] = normalize_quicker_uri(self.uri)
         if self.kind == ActionKind.TEXT:
             data["text"] = validate_preset_text(self.text)
+        if self.kind == ActionKind.OPEN_PROGRAM:
+            data["program_path"] = normalize_program_path(self.program_path)
         return data
 
     @classmethod
@@ -371,10 +402,17 @@ class ButtonAction:
             text = validate_preset_text(text)
         elif text:
             raise ValueError("non-text action must not contain text")
+        program_path = data.get("program_path", "")
+        if not isinstance(program_path, str):
+            raise ValueError("button action program path must be a string")
+        if kind == ActionKind.OPEN_PROGRAM:
+            program_path = normalize_program_path(program_path)
+        elif program_path:
+            raise ValueError("non-program action must not contain a program path")
         if kind in (ActionKind.MOUSE_WHEEL_UP, ActionKind.MOUSE_WHEEL_DOWN):
             page_key = "pageup" if kind == ActionKind.MOUSE_WHEEL_UP else "pagedown"
             return cls(kind=ActionKind.KEY_COMBO, keys=(page_key,))
-        return cls(kind=kind, keys=keys, uri=uri, text=text)
+        return cls(kind=kind, keys=keys, uri=uri, text=text, program_path=program_path)
 
 
 def button_action_for(

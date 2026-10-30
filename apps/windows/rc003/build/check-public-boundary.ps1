@@ -106,6 +106,8 @@ $nonAttributionReferenceExemptRelativePaths = @(
 $elevationMarkers = @("runas", "ShellExecute", "IsUserAnAdmin", "RequireAdministrator", "PrivilegesRequired=admin")
 # Exact reviewed markers only; branding, paths and autostart remain checked.
 $reviewedElevationMarkers = @{
+    # User-selected EXE launch: fixed ordinary open verb, no elevation request.
+    "src/ovb_rc003/action_executor.py" = @("ShellExecute")
     "src/ovb_rc003/chromecast_pipe_windows.py" = @("runas", "ShellExecute")
     # Source-only one-shot HID worker; fixed launcher and authenticated pipe.
     "src/ovb_rc003/hid_source_injector.py" = @("runas", "ShellExecute")

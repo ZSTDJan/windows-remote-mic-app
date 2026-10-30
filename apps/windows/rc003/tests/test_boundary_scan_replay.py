@@ -110,6 +110,7 @@ _AUTOSTART_MARKERS = ("CurrentVersion\\Run", "userstartup")
 # test_vb_cable_bundle_py_is_exempt_only_for_its_documented_elevation_reason
 # below, which proves this exemption is not a blank check).
 _REVIEWED_ELEVATION_MARKERS = {
+    Path("src/ovb_rc003/action_executor.py"): {"ShellExecute"},
     Path("src/ovb_rc003/chromecast_pipe_windows.py"): {"runas", "ShellExecute"},
     Path("src/ovb_rc003/hid_source_injector.py"): {"runas", "ShellExecute"},
     Path("scripts/sogou_normal_submit_test.py"): {"IsUserAnAdmin"},
