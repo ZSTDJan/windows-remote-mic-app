@@ -20,6 +20,7 @@ from .chromecast_channel import Channel, SessionIdentity
 from .chromecast_pipe_windows import Pipe, PipeError, api, inspect_peer, verify_peer, bind_worker_peer, launch_worker
 
 _MESSAGES = {
+    "recovering": "谷歌遥控器接收中断，正在恢复；恢复后请松开按键再按一次。",
     "source_unconfirmed": "还没有核实这只遥控器的信号，请唤醒遥控器后重新启动服务。",
     "unsupported_layout": "这只 Chromecast 的报告格式尚未验证，本次没有接收按键。",
     "input_interface_unavailable": "Windows 尚未提供谷歌遥控器的按键接口，请短按遥控器方向键后重新启动服务；仍失败请导出日志。",
@@ -54,6 +55,11 @@ class Client:
         self.on_voice = on_voice
         self._voice_commands = queue.Queue(maxsize=32)
         self.cancel, self.finished, self.ready = threading.Event(), threading.Event(), threading.Event()
+        self.failed, self.retry_ready = threading.Event(), threading.Event()
+        self._restart_requested = threading.Event()
+        self._restart_host = None
+        self._lost_notified = False
+        self.on_ready = None
         self._gadget_fallback_seen = threading.Event()
         self.thread = None
         self.reason = "capture_failed"
@@ -107,6 +113,32 @@ class Client:
                 and not self._first_worker_failure):
             self._first_worker_failure = event["reason"]
             diagnostics.request(self.identity.entity, event["reason"])
+        if (event["phase"] == "failed" and event["stage"] in
+                {"selection", "device_open", "source_probe", "capture", "receive"}):
+            self._lose_input(event["reason"])
+
+    def _lose_input(self, reason):
+        # Receipt of a fatal input failure is enough to withdraw readiness.
+        # Native teardown may take time; it must not keep the UI/actions live.
+        with self._callback_lock:
+            self.reason = reason
+            self.ready.clear()
+            self.failed.set()
+            if not self._lost_notified:
+                self._lost_notified = True
+                if self.on_lost:
+                    self.on_lost()
+
+    def restart(self, on_voice, on_restart=None):
+        """Resume only an acknowledged, fully cleaned session on this pipe."""
+        with self._callback_lock:
+            if (self.mode != "run" or self.cancel.is_set() or self.finished.is_set()
+                    or not self.retry_ready.is_set() or self._restart_requested.is_set()):
+                return False
+            self.on_voice = on_voice
+            self._restart_host = on_restart
+            self._restart_requested.set()
+            return True
 
     def _observe_evidence(self, event):
         record = event["record"]
@@ -149,6 +181,8 @@ class Client:
                 raise RuntimeError(message(self.reason))
             return
         while not self.ready.wait(.02):
+            if self.mode == "run" and self.retry_ready.is_set():
+                break  # A short-lived first ready must not strand owner recovery.
             if not fallback_extended and self._gadget_fallback_seen.is_set():
                 deadline = max(deadline, time.monotonic() + 40)
                 fallback_extended = True
@@ -242,7 +276,7 @@ class Client:
 
     def _deliver(self, edge):
         with self._callback_lock:
-            if not self.cancel.is_set() or edge.action == "cancel":
+            if (not self.cancel.is_set() and not self.failed.is_set()) or edge.action == "cancel":
                 try:
                     self.on_edge(edge)
                 except Exception:
@@ -294,6 +328,8 @@ class Client:
                 return
             self.failure_stage = "receive"
             voice_fields = {"voice": True} if self.on_voice is not None else {}
+            if self.mode == "run":
+                voice_fields["recover"] = True
             pipe.write(outgoing.encode("start", mode=self.mode, **voice_fields))
             started = True
             last_heartbeat, last_peer = 0.0, 0.0
@@ -308,6 +344,34 @@ class Client:
                     stop_deadline = now + (35 if self._gadget_fallback_seen.is_set() else 25)
                 if stop_deadline is not None and now >= stop_deadline:
                     raise PipeError("peer_lost")
+                if self._restart_requested.is_set() and not outgoing.closed:
+                    # The old host has stopped before this request is allowed.
+                    # Drop its pending replies; new channels reject all old runs.
+                    with self._callback_lock:
+                        while not self._voice_commands.empty():
+                            self._voice_commands.get_nowait()
+                        generation = SessionIdentity.create(self.identity.entity).generation
+                        pipe.write(outgoing.encode("restart", next_generation=generation))
+                        self._log_input_flow(final=True)
+                        self.identity = SessionIdentity(self.identity.entity, generation, self.identity.token)
+                        incoming, outgoing = Channel(self.identity, commands=False), Channel(self.identity, commands=True)
+                        self._input_counts = dict.fromkeys(self._input_counts, 0)
+                        self._last_input_log = 0.0
+                        self._worker_shutdown = CleanupProgress(logging.getLogger("ovb_rc003"), "worker_observed", generation[:12])
+                        self._shutdown = CleanupProgress(logging.getLogger("ovb_rc003"), "receiver", generation[:12])
+                        self._first_worker_failure = ""
+                        self._terminal_type, self._terminal_at = "none", None
+                        self._lost_notified = False
+                        self.failed.clear()
+                        self.retry_ready.clear()
+                        self._restart_requested.clear()
+                        self._gadget_fallback_seen.clear()
+                        pipe.write(outgoing.encode("start", mode=self.mode, **voice_fields))
+                        if self._restart_host is not None:
+                            self._restart_host(self)
+                            self._restart_host = None
+                        ready_deadline = time.monotonic() + 30
+                        logging.getLogger("ovb_rc003").info("Chromecast receiver session restarted: run=%s", generation[:12])
                 if now - last_peer >= 1:
                     verify_peer(inspect_peer(pid), expected)
                     last_peer = now
@@ -334,6 +398,10 @@ class Client:
                             ready_deadline = max(ready_deadline, time.monotonic() + 40)
                         self._observe_evidence(event)
                     elif event["type"] == "ready":
+                        if self.failed.is_set():
+                            continue
+                        if self.on_ready is not None:
+                            self.on_ready()
                         self.ready.set()
                         diagnostics.request(self.identity.entity, "ready")
                     elif event["type"] == "edge":
@@ -341,7 +409,12 @@ class Client:
                         age = time.monotonic() - event["time"]
                         if not -.1 <= age <= 1:
                             self._count_input("stale")
-                            raise PipeError("capture_lost")
+                            if self.mode != "run":
+                                raise PipeError("capture_lost")
+                            if not self.failed.is_set() and not outgoing.closed:
+                                self._lose_input("capture_lost")
+                                pipe.write(outgoing.encode("recover"))
+                            continue
                         self._deliver(ButtonEdge(self.identity.entity, self.identity.generation,
                                                 event["time"], event["button"], event["action"]))
                     elif event["type"] == "diagnostic":
@@ -360,8 +433,14 @@ class Client:
                                 "capture_length_match",
                             )))
                     elif event["type"] == "voice":
+                        if self.failed.is_set():
+                            continue
                         if not -.1 <= time.monotonic() - event["time"] <= 1:
-                            raise PipeError("capture_lost")
+                            if self.mode != "run":
+                                raise PipeError("capture_lost")
+                            self._lose_input("capture_lost")
+                            pipe.write(outgoing.encode("recover"))
+                            continue
                         if event["event"] == "probe":
                             logging.getLogger("ovb_rc003").info("Chromecast voice receive %s", event["data"])
                         if event["event"] == "lifecycle":
@@ -371,6 +450,16 @@ class Client:
                             continue  # Diagnostic metadata never drives host actions.
                         if self.on_voice:
                             self.on_voice(event)
+                    elif event["type"] == "retry":
+                        if self.mode != "run":
+                            raise PipeError("invalid_message")
+                        self._lose_input(event["reason"])
+                        self.retry_ready.set()
+                        logging.getLogger("ovb_rc003").info("Chromecast retry offered: run=%s reason=%s",
+                            self.identity.generation[:12], event["reason"])
+                        # The event direction is now closed; the worker waits
+                        # for the owner's ordered restart or stop command.
+                        break
                     else:
                         terminal, self.reason = True, event["reason"]
                         self._terminal_type, self._terminal_at = event["type"], time.monotonic()
@@ -381,7 +470,7 @@ class Client:
                         return
                 # Read already queued startup evidence before deciding whether
                 # the normal readiness budget has expired.
-                if not self.ready.is_set() and time.monotonic() > ready_deadline:
+                if not self.ready.is_set() and not self.failed.is_set() and time.monotonic() > ready_deadline:
                     raise PipeError("source_unconfirmed")
                 self._log_input_flow()
                 time.sleep(.01)
@@ -408,11 +497,10 @@ class Client:
                     self.identity.generation[:12], self.cancel.is_set(), self._terminal_type, self.reason, self.failure_code)
             except Exception:
                 pass
-            if self.on_lost:
-                try:
-                    self.on_lost()
-                except Exception:
-                    pass
+            try:
+                self._lose_input(self.reason)
+            except Exception:
+                pass
             edge = incoming.cancel_pending(time.monotonic())
             if edge:
                 try:

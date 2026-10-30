@@ -187,7 +187,8 @@ Item {
             if (!SettingsController.bridgeRunning)
                 return "service_stopped"
             return SettingsController.buttonReceiverUsable
-                ? "ready" : (SettingsController.rawInputState === "starting" ? "checking" : "error")
+                ? "ready" : (valueIn(SettingsController.rawInputState, ["starting", "chromecast_recovering"])
+                    ? "checking" : "error")
         }
         if (SettingsController.hidHelperRepairBusy)
             return "checking"

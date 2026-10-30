@@ -20,9 +20,13 @@ from .chromecast_buttons import ButtonEdge, STOP_REASONS
 from .chromecast_voice import MAX_INPUT_EPOCH, parse_lifecycle, parse_start_epoch
 from .chromecast_observation import valid_record
 
-VERSION = 28
+VERSION = 29
 MAX_MESSAGE_BYTES = 2048
 HEARTBEAT_TIMEOUT = 10.0
+RECOVERY_DELAYS = (1.0, 3.0, 5.0)
+RECOVERABLE_RECEIVE_REASONS = frozenset({
+    "capture_lost", "hid_source_unconfirmed", "hid_capture_failed", "peer_lost", "radio_ambiguous",
+})
 _BUTTONS = frozenset(remote_layout.CHROMECAST_REPORT_CODES)
 _BASE = frozenset({"version", "entity", "generation", "token", "seq", "type"})
 _REASONS = frozenset({"source_unconfirmed", "unsupported_layout", "radio_ambiguous",
@@ -176,6 +180,7 @@ class Channel:
         self.last_edge_time = 0.0
         self.mode = ""
         self.voice_enabled = False
+        self.recovery_enabled = False
 
     def _validate(self, message):
         if self.closed or not isinstance(message, dict):
@@ -200,6 +205,19 @@ class Channel:
                     expected.add("voice")
                     if type(message["voice"]) is not bool or message.get("mode") == "setup":
                         raise ChannelError("invalid_voice_start")
+                if "recover" in message:
+                    expected.add("recover")
+                    if type(message["recover"]) is not bool or message.get("mode") != "run":
+                        raise ChannelError("invalid_recovery_start")
+            elif kind in ("recover", "restart"):
+                if self.mode != "run" or not self.recovery_enabled:
+                    raise ChannelError("invalid_recovery_command")
+                if kind == "restart":
+                    expected.add("next_generation")
+                    generation = message.get("next_generation")
+                    if (not isinstance(generation, str) or not re.fullmatch(r"[0-9a-f]{64}", generation)
+                            or generation == identity.generation):
+                        raise ChannelError("invalid_recovery_generation")
             elif kind == "voice_cancel":
                 expected.add("input_epoch")
                 if (self.mode != "run" or not self.voice_enabled
@@ -323,10 +341,12 @@ class Channel:
             if ((message["action"] == "down" and self.held_button is not None)
                     or (message["action"] != "down" and self.held_button != message["button"])):
                 raise ChannelError("invalid_edge_order")
-        elif kind in ("error", "stopped"):
+        elif kind in ("error", "stopped", "retry"):
             expected.add("reason")
             if message.get("reason") not in _REASONS:
                 raise ChannelError("invalid_reason")
+            if kind == "retry" and message["reason"] not in RECOVERABLE_RECEIVE_REASONS:
+                raise ChannelError("invalid_recovery_reason")
         elif kind != "ready" or self.ready:
             raise ChannelError("invalid_event")
         if set(message) != expected:
@@ -334,12 +354,13 @@ class Channel:
         self.sequence = message["seq"]
         if self.commands and kind == "start":
             self.mode, self.voice_enabled = message["mode"], message.get("voice", False)
+            self.recovery_enabled = message.get("recover", False)
         if not self.commands and kind == "ready":
             self.ready = True
         elif not self.commands and kind == "edge":
             self.held_button = message["button"] if message["action"] == "down" else None
             self.last_edge_time = message["time"]
-        if kind in ("stop", "stopped", "error"):
+        if kind in ("stop", "stopped", "error", "retry", "restart"):
             self.closed = True
         return message
 

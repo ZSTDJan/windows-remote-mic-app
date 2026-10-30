@@ -1282,6 +1282,23 @@ if profile_b == 'chromecast-remote':
         raw_input_state='chromecast_input_payload_unavailable'))
     app.processEvents()
     page = item('deviceScroll').parent()
+    controller._set_bridge_input_states(runtime_status.BridgeRuntimeStatus(
+        3, runtime_status.BridgeConnectionState.CONNECTING, os.getpid(), time.time(),
+        raw_input_state='chromecast_recovering', hid_tap_state='starting'))
+    app.processEvents()
+    assert page.buttonReceiverStateCode() == 'checking'
+    assert not controller.buttonReceiverUsable
+    assert not page.bridgeNeedsRestartAction()
+    controller._set_bridge_input_states(runtime_status.BridgeRuntimeStatus(
+        3, runtime_status.BridgeConnectionState.WAITING_FOR_DEVICE, os.getpid(), time.time(),
+        raw_input_state='chromecast_capture_lost', hid_tap_state='failed'))
+    app.processEvents()
+    assert page.buttonReceiverStateCode() == 'error'
+    assert page.bridgeNeedsRestartAction()
+    controller._set_bridge_input_states(runtime_status.BridgeRuntimeStatus(
+        3, runtime_status.BridgeConnectionState.WAITING_FOR_DEVICE, os.getpid(), time.time(),
+        raw_input_state='chromecast_input_payload_unavailable'))
+    app.processEvents()
     assert item('buttonReceiverRow').property('stateText') == '按键数据不完整'
     assert item('buttonReceiverRow').property('descriptionText') == 'Windows 没有提供完整按键数据；可尝试重启电脑一次，仍失败请导出日志'
     assert item('buttonReceiverRow').property('descriptionNeverElide')

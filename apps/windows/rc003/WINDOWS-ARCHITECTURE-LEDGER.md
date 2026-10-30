@@ -379,6 +379,13 @@ Windows 的物理边沿，不执行映射。tap 从 `READY` 变为失联或异�
 `HidButtonReceiver` 处理按下、重复和松开。未知 usage 不映射，不修改 Windows 缓冲区。
 同宿主下游复制计数继续仅作诊断，不能替代所选地址的来源证明。
 
+2026-10-30 起，谷歌运行中的接收恢复由 `chromecast_hid_worker.receive`、`Client` 和
+`ChromecastRuntime` 共同持有：接收失败立即撤销就绪，原接收端与主端资源都确认释放后，
+才在同一个已认证、已提权进程内按有界次数重建。内部协议 29 的固定恢复交接更换 generation，
+重建通道与语音宿主，不重放旧事件；普通键先等松开再接受新按下。首次启用失败、权限/父进程身份异常、
+清理未确认及次数用尽不继续恢复，不重复授权或重启 Windows 宿主。验证边界见
+`TESTING.md/CHECK-CHROMECAST-RECEIVER-RECOVERY-001`。
+
 ## 9. 语音链路
 
 ### 9.1 BLE 连接与 ATVV 协议

@@ -7669,7 +7669,7 @@ def _load_qt_classes() -> dict:
             if not self.isRc003Device and self._key_detection_listener is not None:
                 from .chromecast_client import Client, message
                 receiver = self._key_detection_listener
-                if isinstance(receiver, Client) and receiver.finished.is_set():
+                if isinstance(receiver, Client) and (receiver.finished.is_set() or receiver.failed.is_set()):
                     self._request_input_stop(kind="key_detection",
                                              key_detection_success_message=message(receiver.reason))
                     return
@@ -7699,6 +7699,11 @@ def _load_qt_classes() -> dict:
             button_id = key_detection_bridge.poll_detection(request)
             if button_id is not None:
                 self._on_raw_key_detected(button_id, " 来源=后台服务。")
+            elif not self.isRc003Device:
+                status = bridge_runtime_status.read_status(self._config_root)
+                if status is not None and not bridge_runtime_status.input_channels_ready(status):
+                    self._request_input_stop(kind="key_detection", key_detection_success_message=
+                        "谷歌遥控器接收已中断；恢复后请重新检测。")
 
         def _start_hotkey_capture(self, *, enforce_voice_provider: bool) -> bool:
             logger = logging_setup.get_logger(self._config_root)

@@ -732,7 +732,9 @@ p.close()
                                  bind_worker_peer=lambda *_: (peer, None)), \
              self.assertLogs("ovb_rc003", level="INFO") as logs:
             receiver._run()
-        self.assertEqual([(e.button, e.action) for e in edges], [("ok", "down"), ("ok", "cancel")])
+        # A queued down after a fatal receive diagnostic must not execute while
+        # native cleanup is still pending. The channel still cancels its edge.
+        self.assertEqual([(e.button, e.action) for e in edges], [("ok", "cancel")])
         self.assertIn("l2cap_declared_length=11", " ".join(logs.output))
         self.assertIn("att_missing_length=8", " ".join(logs.output))
         self.assertTrue(receiver.cleanup_confirmed)
@@ -874,6 +876,22 @@ class ProductRoutingTests(_AppWiringTestCase):
     def edge(self, action, button="ok", entity=ENTITY):
         self.app._chromecast_runtime.on_edge(ButtonEdge(entity, self.app._chromecast_runtime.client.identity.generation,
                                               time.monotonic(), button, action))
+
+    def test_receiver_recovery_resumes_lost_keyboard_tracking_and_new_input(self):
+        self.app._accept_input_events = False
+        self.app._button_input_release_retry_stopping = True
+        self.app._hid_listener = mock.Mock(is_running=False)
+        with mock.patch.object(self.app, "_schedule_raw_input_recovery_locked") as recover:
+            self.app._resume_chromecast_input()
+        self.assertTrue(self.app._accept_input_events)
+        self.assertFalse(self.app._button_input_release_retry_stopping)
+        recover.assert_called_once()
+
+    def test_stopping_rejects_edges_even_before_worker_exits(self):
+        self.app._chromecast_runtime.stopping.set()
+        with mock.patch.object(self.app, "_on_button_event") as route:
+            self.edge("down")
+        route.assert_not_called()
 
     def test_mapping_uses_shared_executor_and_cancel_is_not_release(self):
         with mock.patch.object(self.app, "_apply_button_action") as execute:
@@ -1040,6 +1058,44 @@ class ProductRoutingTests(_AppWiringTestCase):
 
 
 class DetectionUiTests(unittest.TestCase):
+    def test_running_detection_stops_waiting_when_google_channel_is_lost(self):
+        from tests.test_remote_selection import B
+        controller = self.seed_chromecast()
+        with mock.patch.object(controller, "_refresh_bridge_status", return_value=False):
+            controller.useRemoteDevice(B)
+        controller._key_detection_active = True
+        controller._key_detection_started_at = time.monotonic()
+        controller._key_detection_bridge_request = object()
+        for raw, ready in (("chromecast_ready", True), ("chromecast_capture_lost", False),
+                           ("chromecast_recovering", False)):
+            status = bridge_runtime_status.BridgeRuntimeStatus(3,
+                bridge_runtime_status.BridgeConnectionState.CONNECTED, os.getpid(), time.time(),
+                raw_input_state=raw, hid_tap_state="not_used")
+            with mock.patch.object(bridge_runtime_status, "read_status", return_value=status), \
+                 mock.patch.object(key_detection_bridge, "poll_detection", return_value=None), \
+                 mock.patch.object(controller, "_request_input_stop", return_value=True) as stop:
+                controller.pollKeyDetectionBridge()
+            self.assertEqual(stop.call_count, 0 if ready else 1)
+        controller._key_detection_bridge_request = None
+        controller._key_detection_active = False
+
+    def test_failed_standalone_receiver_reports_before_process_cleanup_finishes(self):
+        from tests.test_remote_selection import B
+        controller = self.seed_chromecast()
+        with mock.patch.object(controller, "_refresh_bridge_status", return_value=False):
+            controller.useRemoteDevice(B)
+        receiver = client.Client(B, mode="detect", on_edge=mock.Mock())
+        receiver.reason = "capture_lost"
+        receiver.failed.set()
+        controller._key_detection_listener = receiver
+        controller._key_detection_active = True
+        with mock.patch.object(controller, "_request_input_stop", return_value=True) as stop:
+            controller.pollKeyDetectionBridge()
+        stop.assert_called_once_with(kind="key_detection", key_detection_success_message=client.message("capture_lost"))
+        self.assertFalse(receiver.finished.is_set())
+        controller._key_detection_listener = None
+        controller._key_detection_active = False
+
     def test_selected_google_detection_logs_gui_acceptance_without_button_content(self):
         from tests.test_remote_selection import B
         from ovb_rc003 import qt_settings_app as qt

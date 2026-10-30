@@ -9,7 +9,8 @@ import time
 
 from . import config, remote_selection
 from .chromecast_buttons import HidButtonReceiver, empty_stop_details
-from .chromecast_channel import Channel, ParentLease, DIAGNOSTIC_REASONS
+from .chromecast_channel import (Channel, ParentLease, SessionIdentity, DIAGNOSTIC_REASONS,
+                                RECOVERY_DELAYS, RECOVERABLE_RECEIVE_REASONS)
 from .chromecast_device_windows import SelectedDevice
 from .chromecast_hid_tap_windows import HidTap, startup_record
 from .chromecast_observation import Observation
@@ -23,7 +24,42 @@ def _selected(entity):
 
 
 async def receive(identity, parent, pipe):
+    # Reuse the authenticated elevated process, never launch another UAC prompt.
+    # Every iteration owns and releases a complete device/voice/tap session.
+    for attempt in range(len(RECOVERY_DELAYS) + 1):
+        recovery = dict(attempt=attempt, retry=False)
+        result = await _receive_once(identity, parent, pipe, recovery)
+        if not recovery["retry"]:
+            return result
+        commands = recovery["commands"]
+        deadline = time.monotonic() + 30
+        lease = ParentLease(time.monotonic())
+        while time.monotonic() < deadline:
+            now = time.monotonic()
+            verify_peer(inspect_peer(parent.pid), parent)
+            if not _selected(identity.entity) or not lease.alive(now):
+                return 2
+            raw = pipe.read()
+            if raw is None:
+                await asyncio.sleep(.05)
+                continue
+            command = commands.decode(raw)
+            lease.renew(now)
+            if command["type"] == "stop":
+                return 0
+            if command["type"] == "restart":
+                identity = SessionIdentity(identity.entity, command["next_generation"], identity.token)
+                break
+            # Replies and cancellations already in flight belong to the closed
+            # recording. Decode them for authentication/order, never replay them.
+        else:
+            return 2
+    return 2
+
+
+async def _receive_once(identity, parent, pipe, recovery):
     commands, events = Channel(identity, commands=True), Channel(identity, commands=False)
+    recovery["commands"] = commands
     lease = ParentLease(time.monotonic())
     device = tap = receiver = voice = voice_open = initialize = tap_start = None
     announced = False
@@ -34,6 +70,7 @@ async def receive(identity, parent, pipe):
     observation = Observation(lambda row: pipe.write(events.encode("evidence", record=row)))
     step_started = {}
     fallback_extended = False
+    rearming = recovery["attempt"] > 0
 
     def startup_evidence():
         nonlocal deadline, fallback_extended
@@ -109,6 +146,10 @@ async def receive(identity, parent, pipe):
                 if command["type"] == "stop":
                     stop = True
                     break
+                if command["type"] == "recover":
+                    raise PipeError("capture_lost")
+                if command["type"] == "restart":
+                    raise PipeError("invalid_message")  # Only after confirmed cleanup.
                 if command["type"] == "voice_host" and voice:
                     voice.host(command)
                 elif command["type"] == "voice_cancel":
@@ -186,14 +227,21 @@ async def receive(identity, parent, pipe):
                 if not 0 <= time.monotonic() - stamp <= 1:
                     raise PipeError("capture_lost")
                 observation.count("ordinary")
-                for edge in receiver.feed(value, stamp):
+                edges = receiver.feed(value, stamp)
+                if receiver.stopped:
+                    diagnostic("failed", receiver.reason, receiver.stop_details)
+                    raise PipeError(receiver.reason)
+                if rearming:
+                    # A held key observed again after reattachment is not a new
+                    # press. Require a neutral report before accepting a down.
+                    if value == bytes(8):
+                        rearming = False
+                    continue
+                for edge in edges:
                     pipe.write(events.encode_edge(edge))
                     observation.count("hid_edges")
                 if voice is not None and value[0] and not receiver.stopped:
                     voice.note_activity(stamp)
-                if receiver.stopped:
-                    diagnostic("failed", receiver.reason, receiver.stop_details)
-                    raise PipeError(receiver.reason)
             if not announced and now > deadline:
                 observation.hid_startup(startup_record("wait_ready", "failed", started=deadline - 5,
                                                       reason="ready_timeout"))
@@ -330,7 +378,12 @@ async def receive(identity, parent, pipe):
         diagnostic("done", reason)
         if cleanup_ok and not events.closed:
             try:
-                pipe.write(events.encode("stopped" if reason in ("stopped", "configured") else "error", reason=reason))
+                retry = (commands.recovery_enabled and (announced or recovery["attempt"] > 0)
+                         and recovery["attempt"] < len(RECOVERY_DELAYS)
+                         and reason in RECOVERABLE_RECEIVE_REASONS and not commands.closed)
+                pipe.write(events.encode("retry" if retry else
+                    "stopped" if reason in ("stopped", "configured") else "error", reason=reason))
+                recovery["retry"] = retry
             except Exception:
                 pass
     return 0 if cleanup_ok else 2

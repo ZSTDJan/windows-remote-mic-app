@@ -11,6 +11,7 @@ import time
 from dataclasses import dataclass
 from typing import Callable, Any
 from . import bridge_runtime_status, diagnostic_trace
+from .chromecast_channel import RECOVERY_DELAYS
 
 
 @dataclass(frozen=True)
@@ -26,6 +27,7 @@ class RuntimeServices:
     cancel_mappings: Callable
     release_inputs: Callable
     route_edge: Callable
+    resume_input: Callable = lambda: None
 
 
 class ChromecastRuntime:
@@ -43,12 +45,23 @@ class ChromecastRuntime:
             await asyncio.to_thread(self.client.stop)
 
     def cancel_input(self):
+        self.services.disable_input()
+        if self.client is not None and not self.stopping.is_set():
+            self.services.set_input_state(raw_input_state="chromecast_" + self.client.reason,
+                                          hid_tap_state="failed")
+            self.services.publish_status(bridge_runtime_status.BridgeConnectionState.WAITING_FOR_DEVICE)
         if self.voice_host is not None:
             self.voice_host.request_stop()
         self.services.cancel_mappings()
 
+    def receiver_ready(self):
+        if not self.stopping.is_set():
+            self.services.resume_input()
+            self.services.set_input_state(raw_input_state="chromecast_ready", hid_tap_state="ready")
+            self.services.publish_status(bridge_runtime_status.BridgeConnectionState.CONNECTED)
+
     def on_edge(self, edge):
-        if (self.client is None or edge.entity != self.services.selected_key()
+        if (self.stopping.is_set() or self.client is None or edge.entity != self.services.selected_key()
                 or edge.generation != self.client.identity.generation):
             return
         self.services.route_edge(edge)
@@ -62,15 +75,40 @@ class ChromecastRuntime:
         self.client = Client(self.services.selected_key(), mode="run", on_edge=self.on_edge,
                                   on_lost=self.cancel_input,
                                   on_voice=self.voice_host.enqueue)
+        self.client.on_ready = self.receiver_ready
         self.voice_host.start(self.client)
         try:
             # Keyboard ownership is shared safety infrastructure, not the
             # Xiaomi remote decoder. Start it before accepting host shortcuts.
             self.services.start_input()
             await asyncio.to_thread(self.client.start, cancel_event=self.stopping)
-            self.services.set_input_state(raw_input_state="chromecast_ready", hid_tap_state="ready")
-            self.services.publish_status(bridge_runtime_status.BridgeConnectionState.CONNECTED)
+            restarted_generation = None
+            recoveries = 0
             while not self.stopping.is_set() and not self.client.finished.is_set():
+                retry_ready = getattr(self.client, "retry_ready", None)
+                if (retry_ready is not None and retry_ready.is_set()
+                        and self.client.identity.generation != restarted_generation):
+                    # Both sides must confirm cleanup. In particular, receiving
+                    # a worker 'retry' does not prove the host released its keys.
+                    try:
+                        await asyncio.to_thread(self.voice_host.stop)
+                        if not self.services.release_inputs():
+                            raise RuntimeError("input release pending")
+                    except RuntimeError:
+                        self.services.set_input_state(raw_input_state="failed_stopping", hid_tap_state="failed")
+                        await asyncio.sleep(.25)
+                        continue
+                    self.services.set_input_state(raw_input_state="chromecast_recovering", hid_tap_state="starting")
+                    self.services.publish_status(bridge_runtime_status.BridgeConnectionState.CONNECTING)
+                    await asyncio.sleep(RECOVERY_DELAYS[min(recoveries, len(RECOVERY_DELAYS) - 1)])
+                    if self.stopping.is_set() or self.client.finished.is_set():
+                        break
+                    self.voice_host = self.services.create_voice_host()
+                    restarted_generation = self.client.identity.generation
+                    if not self.client.restart(self.voice_host.enqueue, self.voice_host.start):
+                        raise RuntimeError("receiver restart cancelled")
+                    recoveries += 1
+                    self.services.logger.info("Chromecast recovery requested: attempt=%s", recoveries)
                 await asyncio.sleep(.05)
             if self.client.finished.is_set() and not self.stopping.is_set():
                 raise RuntimeError(message(self.client.reason))

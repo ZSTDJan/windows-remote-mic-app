@@ -497,6 +497,7 @@ class RC003App:
                 cancel_mappings=self._cancel_chromecast_mappings,
                 release_inputs=self._release_chromecast_inputs,
                 route_edge=self._route_chromecast_edge,
+                resume_input=self._resume_chromecast_input,
             )
         )
 
@@ -567,6 +568,15 @@ class RC003App:
             self._accept_input_events = False
             self._button_combos.reset()
             self._button_gestures.reset()
+
+    def _resume_chromecast_input(self):
+        with self._input_arbitration_lock:
+            self._button_input_release_retry_stopping = False
+            self._accept_input_events = True
+            with self._raw_input_lifecycle_lock:
+                if (self._hid_listener is None or not self._hid_listener.is_running
+                        or self._raw_input_lost_generation == self._raw_input_generation):
+                    self._schedule_raw_input_recovery_locked()
 
     def _release_chromecast_inputs(self):
         with self._button_action_lock:
