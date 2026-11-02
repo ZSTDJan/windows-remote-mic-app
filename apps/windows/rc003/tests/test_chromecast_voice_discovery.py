@@ -620,6 +620,7 @@ class DiscoveryTests(unittest.IsolatedAsyncioTestCase):
                 rows = self.cleanup_rows(target)
                 target.watcher = SimpleNamespace(remove_added=mock.Mock(), stop=mock.Mock())
                 target.tokens = [('added', object())]
+                watcher, native_device = target.watcher, target.device
                 callback = {'watcher_remove': target.watcher.remove_added,
                     'watcher_stop': target.watcher.stop, 'device_close': target.device.close}[step]
                 callback.side_effect = OSError('PRIVATE')
@@ -628,6 +629,22 @@ class DiscoveryTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(rows[-1]['first_step'], step)
                 self.assertEqual(rows[-1]['current_failed'], 1)
                 self.assertTrue(all(valid_record(r) for r in rows))
+                watcher.stop.assert_called_once()
+                native_device.close.assert_called_once()
+                self.assertTrue(target._voice_cleanup_failed)
+                if step == 'device_close':
+                    self.assertIs(target.device, native_device)
+                else:
+                    self.assertIsNone(target.device)
+                    self.assertIs(target.watcher, watcher)
+                callback.side_effect = None
+                with self.assertRaisesRegex(PipeError, 'cleanup_failed'):
+                    target.close()
+                self.assertIsNone(target.device)
+                self.assertIsNone(target.watcher)
+                self.assertEqual(target.tokens, [])
+                self.assertEqual(watcher.stop.call_count, 2 if step == 'watcher_stop' else 1)
+                self.assertEqual(rows[-1]['outcome'], 'history_failed')
 
 
 class WakeRetryTests(unittest.IsolatedAsyncioTestCase):

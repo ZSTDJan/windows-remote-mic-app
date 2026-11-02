@@ -64,6 +64,7 @@ class SelectedDevice:
         self.enumerated = threading.Event()
         self.ids = set()
         self.watcher = self.device = None
+        self._watcher_stop_requested = False
         self.tokens = []
         self.voice_service = self.voice_tx = None
         self.voice_session = None
@@ -195,6 +196,7 @@ class SelectedDevice:
         from winrt.windows.devices.bluetooth import BluetoothAdapter, BluetoothLEDevice
         from winrt.windows.devices.enumeration import DeviceInformation
         self.watcher = DeviceInformation.create_watcher_aqs_filter(BluetoothAdapter.get_device_selector())
+        self._watcher_stop_requested = False
         def added(sender, info):
             if self.enumerated.is_set():
                 self.changed.set()
@@ -617,22 +619,49 @@ class SelectedDevice:
 
     def close(self):
         self._cleanup_begin()
+        first_error = None
         try:
             clean = self._release_voice_resources()
             self._cleanup_current_failed = self._cleanup_current_failed or not clean
             if self.watcher:
-                watcher, self.watcher = self.watcher, None
+                watcher = self.watcher
+                remaining_tokens = []
                 for name, token in self.tokens:
-                    with self._cleanup_operation("watcher_remove"):
-                        getattr(watcher, "remove_" + name)(token)
-                self.tokens.clear()
-                with self._cleanup_operation("watcher_stop"):
-                    watcher.stop()
+                    try:
+                        with self._cleanup_operation("watcher_remove"):
+                            getattr(watcher, "remove_" + name)(token)
+                    except Exception as error:
+                        remaining_tokens.append((name, token))
+                        if first_error is None:
+                            first_error = error
+                self.tokens = remaining_tokens
+                if not self._watcher_stop_requested:
+                    try:
+                        with self._cleanup_operation("watcher_stop"):
+                            watcher.stop()
+                    except Exception as error:
+                        if first_error is None:
+                            first_error = error
+                    else:
+                        self._watcher_stop_requested = True
+                if self._watcher_stop_requested and not self.tokens:
+                    self.watcher = None
             if self.device:
-                device, self.device = self.device, None
-                with self._cleanup_operation("device_close"):
-                    device.close()
-            if not clean or self._voice_cleanup_failed:
+                try:
+                    with self._cleanup_operation("device_close"):
+                        self.device.close()
+                except Exception as error:
+                    if first_error is None:
+                        first_error = error
+                else:
+                    self.device = None
+            # A failed native release must not skip independent resources or
+            # lose their ownership. Preserve failure even if a later cleanup
+            # succeeds, so the worker cannot falsely announce a clean restart.
+            self._voice_cleanup_failed = self._voice_cleanup_failed or not clean or first_error is not None
+            if first_error is not None:
+                raise first_error
+            if self._voice_cleanup_failed:
                 raise PipeError("cleanup_failed")
         finally:
             self._cleanup_summary()
