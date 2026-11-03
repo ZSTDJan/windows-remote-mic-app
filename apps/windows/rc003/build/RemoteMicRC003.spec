@@ -369,7 +369,7 @@ a = Analysis(
     hiddenimports=hiddenimports,
     hookspath=[],
     hooksconfig={},
-    runtime_hooks=[],
+    runtime_hooks=[str(SRC_ROOT / "remote_scan_runtime_hook.py")],
     excludes=[
         # Defensive: this tree never contains these, but excluding them keeps
         # the boundary explicit if the spec is ever copy-pasted elsewhere.

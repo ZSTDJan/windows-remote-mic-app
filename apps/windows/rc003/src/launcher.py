@@ -25,6 +25,13 @@ that can actually run once frozen.
 
 from __future__ import annotations
 
+import sys
+
+if len(sys.argv) >= 4 and sys.argv[1] == "--list-remote-devices":
+    import remote_scan_bootstrap
+    remote_scan_bootstrap.activate()
+    remote_scan_bootstrap.mark("entrypoint_import")
+
 from ovb_rc003.__main__ import main
 
 if __name__ == "__main__":

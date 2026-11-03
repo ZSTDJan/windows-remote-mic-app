@@ -38,6 +38,12 @@ def choose(index, provider):
     render(window, app)
     assert controller._voice_program_settings["provider"] == provider
     assert combo.property("currentIndex") == index
+    update_notice = find(window, "doubaoUpdateNotice")
+    assert update_notice.property("visible") == (provider == "doubao_ime")
+    if provider == "doubao_ime":
+        assert update_notice.property("height") > 0 and not update_notice.property("truncated")
+        bounds = geometry(update_notice)
+        assert bounds["right"] <= window.property("width") + 1, bounds
 
 choose(0, "sogou")
 switch = find(window, "voiceProgramAutoStartSwitch")

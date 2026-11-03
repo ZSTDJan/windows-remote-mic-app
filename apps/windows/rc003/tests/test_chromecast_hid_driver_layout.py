@@ -19,12 +19,34 @@ NEW_PROLOGUE = bytes.fromhex(
     "4c894c2420 48894c2408 53 55 56 57 4154 4156 4157 4883ec50 "
     "4d8bf1 410fb7e8 488bf9 488d05 c38f0100 488901 48895108"
 )
+# First 64 bytes retained in the affected user's matching DLL/PDB diagnostics.
+REGISTER_VARIANT_PROLOGUE = bytes.fromhex(
+    "4c894c242048894c2408535556574154415541564883ec504d8bf1410fb7e8488bf9"
+    "488d05b7060200488901488951084533e44c8961104c896118498b014889"
+)
 
 
 class DriverLayoutTests(unittest.TestCase):
     def test_verified_constructor_layouts(self):
         self.assertEqual(tap._constructor_address_offset(OLD_PROLOGUE), 24)
         self.assertEqual(tap._constructor_address_offset(NEW_PROLOGUE), 8)
+        self.assertEqual(tap._constructor_address_offset(REGISTER_VARIANT_PROLOGUE), 8)
+
+    def test_user_register_variant_requires_complete_instructions(self):
+        required = REGISTER_VARIANT_PROLOGUE[:48]
+        for index in range(len(required)):
+            if 37 <= index < 41:  # Only the RIP-relative vtable displacement varies.
+                continue
+            changed = bytearray(required)
+            changed[index] ^= 0x80
+            with self.subTest(index=index), self.assertRaises(tap.TapError):
+                tap._constructor_address_offset(bytes(changed))
+        for length in range(len(required)):
+            with self.subTest(length=length), self.assertRaises(tap.TapError):
+                tap._constructor_address_offset(required[:length])
+        for displacement in (b"\0" * 4, b"\xff" * 4, bytes.fromhex("12345678")):
+            self.assertEqual(tap._constructor_address_offset(
+                required[:37] + displacement + required[41:]), 8)
 
     def test_unrecognized_truncated_or_shifted_instructions_fail_closed(self):
         for code in (b"", NEW_PROLOGUE[:-1], b"\x90" + OLD_PROLOGUE,
@@ -63,7 +85,8 @@ class DriverLayoutTests(unittest.TestCase):
                 self.assertEqual(self.resolve(self.image(), digest), (layout, 0))
 
     def test_unlisted_driver_requires_matching_symbols_and_constructor(self):
-        for code, offset in ((OLD_PROLOGUE, 24), (NEW_PROLOGUE, 8)):
+        for code, offset in ((OLD_PROLOGUE, 24), (NEW_PROLOGUE, 8),
+                             (REGISTER_VARIANT_PROLOGUE, 8)):
             image = self.image(code)
             self.assertEqual(self.resolve(image), ((0x1800, offset), 1))
             image.get_data.assert_called_once_with(0x1100, 64)

@@ -10,6 +10,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 import zipfile
@@ -469,6 +470,21 @@ class LauncherEntryPointTests(unittest.TestCase):
         # call main() merely by being imported/analyzed.
         text = _LAUNCHER_PATH.read_text(encoding="utf-8")
         self.assertIn('if __name__ == "__main__":', text)
+
+    def test_scan_guard_is_a_main_runtime_hook_and_does_not_change_helper_startup(self):
+        tree = ast.parse(_SPEC_PATH.read_text(encoding="utf-8"))
+        analyses = [node for node in ast.walk(tree) if isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Name) and node.func.id == "Analysis"]
+        self.assertEqual(len(analyses), 2)
+        hooks = [next(k.value for k in node.keywords if k.arg == 'runtime_hooks') for node in analyses]
+        self.assertIn('remote_scan_runtime_hook.py', ast.unparse(hooks[0]))
+        self.assertEqual(ast.literal_eval(hooks[1]), [])
+        hook = _RC003_ROOT / 'src/remote_scan_runtime_hook.py'
+        import remote_scan_bootstrap
+        with mock.patch.object(sys, 'argv', ['app', '--settings']), \
+                mock.patch.object(remote_scan_bootstrap, 'activate') as activate:
+            _exec_as_top_level_no_package(hook, module_name='frozen_scan_hook_simulation')
+        activate.assert_not_called()
 
 
 class ChromecastFrozenClosureContractTests(unittest.TestCase):

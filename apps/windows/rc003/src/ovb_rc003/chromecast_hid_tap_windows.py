@@ -327,8 +327,19 @@ def _constructor_address_offset(code: bytes) -> int:
         "4c894c2420 48894c2408 53 55 56 57 4154 4156 4157 4883ec50 "
         "4d8bf1 410fb7e8 488bf9"
     )
-    for offset, initialize in ((24, bytes.fromhex("4533e4 4c896108 4c896110")), (8, b"")):
-        start = prefix + initialize + bytes.fromhex("488d05")
+    # 26100.9818 saves R13/R14 instead of R14/R15; RCX and the RDX
+    # address store remain unchanged. Admit only that complete observed form.
+    register_variant = bytes.fromhex(
+        "4c894c2420 48894c2408 53 55 56 57 4154 4155 4156 4883ec50 "
+        "4d8bf1 410fb7e8 488bf9"
+    )
+    layouts = (
+        (prefix, 24, bytes.fromhex("4533e4 4c896108 4c896110")),
+        (prefix, 8, b""),
+        (register_variant, 8, b""),
+    )
+    for verified_prefix, offset, initialize in layouts:
+        start = verified_prefix + initialize + bytes.fromhex("488d05")
         end = bytes.fromhex("488901 488951") + bytes([offset])
         if code.startswith(start) and code[len(start) + 4:len(start) + 4 + len(end)] == end:
             return offset

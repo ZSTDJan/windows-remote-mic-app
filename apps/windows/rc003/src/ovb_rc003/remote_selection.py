@@ -13,12 +13,17 @@ import ctypes
 from ctypes import wintypes
 import hashlib
 import json
+import logging
+import os
 from pathlib import Path
 import re
+import subprocess
 import sys
 import tempfile
 import threading
+import time
 import uuid
+import remote_scan_bootstrap as scan_bootstrap
 
 KEY = "remote_selection"
 SCAN_FLAG = "--list-remote-devices"
@@ -27,6 +32,91 @@ _MAX_DEVICES = 128
 RC003_PROFILE = "xiaomi-rc003"
 CHROMECAST_PROFILE = "chromecast-remote"
 KNOWN_PROFILES = frozenset({RC003_PROFILE, CHROMECAST_PROFILE})
+_SCAN_STAGES = scan_bootstrap.STAGES
+_SCAN_COUNTS = scan_bootstrap.COUNTS
+_ScanDiagnostic = scan_bootstrap.ScanDiagnostic
+_SCAN_SPAWN_LOCK = threading.Lock()
+
+
+def _read_scan_diagnostic(path):
+    """Only allow fixed markers and numbers across the child/log boundary."""
+    def unavailable(reason, error=None):
+        result = {"evidence_unavailable": True, "evidence_reason": reason}
+        if error is not None:
+            result["evidence_errors"] = scan_bootstrap.error_fields(error)["errors"]
+        return result
+    try:
+        path = Path(path)
+        # Read with a real bound even if the child file changed after stat().
+        with path.open("rb") as stream:
+            data = stream.read(65537)
+        if len(data) > 65536:
+            return unavailable("too_large")
+        if not data:
+            return unavailable("empty")
+        values, invalid = [], 0
+        for line in data.splitlines():
+            try:
+                row = json.loads(line)
+                if (not isinstance(row, dict) or type(row.get("schema")) is not int
+                        or row.get("schema") not in (1, 2)
+                        or not isinstance(row.get("stage"), str) or row.get("stage") not in _SCAN_STAGES
+                        or not isinstance(row.get("state"), str)
+                        or row.get("state") not in {"running", "success", "failed"}):
+                    raise ValueError("invalid diagnostic schema")
+                values.append(row)
+            except (ValueError, UnicodeError):
+                invalid += 1
+        if not values:
+            return unavailable("invalid_record")
+        value = values[-1]
+        result = {"child_stage": value["stage"], "child_state": value["state"]}
+        if invalid:
+            result["evidence_partial"] = True
+        result["child_steps"] = list(dict.fromkeys(row["stage"] for row in values))
+        if value.get("failure_stage") in _SCAN_STAGES:
+            result["failure_stage"] = value["failure_stage"]
+        for key in (*_SCAN_COUNTS, "write_failures"):
+            count = value.get(key)
+            if type(count) is int and 0 <= count <= 0xffffffff:
+                result[key] = count
+        for key in ("errors", "identity_errors", "write_errors", "channel_errors"):
+            errors = value.get(key)
+            if not isinstance(errors, list) or len(errors) > 2:
+                continue
+            safe = []
+            for error in errors:
+                if not isinstance(error, dict):
+                    continue
+                name = error.get("error_type")
+                row = {"error_type": name if isinstance(name, str) and
+                       re.fullmatch(r"[A-Za-z_][A-Za-z_0-9]{0,79}", name) else "Exception"}
+                for code in ("winerror", "hresult", "errno"):
+                    number = error.get(code)
+                    if type(number) is int and -(2**31) <= number <= 0xffffffff:
+                        row[code] = number
+                frames = error.get("frames", [])
+                if isinstance(frames, list) and len(frames) <= 6:
+                    safe_frames = []
+                    for frame in frames:
+                        if not isinstance(frame, dict):
+                            continue
+                        module, line = frame.get("module"), frame.get("line")
+                        if (isinstance(module, str) and len(module) <= 120
+                                and re.fullmatch(r"(?:ovb_rc003\.[a-z_0-9.]+|remote_scan_bootstrap|pyi_rth_[a-z_0-9]+)", module)
+                                and type(line) is int and 0 < line <= 1000000):
+                            safe_frames.append({"module": module, "line": line})
+                    if safe_frames:
+                        row["frames"] = safe_frames
+                safe.append(row)
+            result["child_errors" if key == "errors" else key] = safe
+        return result
+    except FileNotFoundError as exc:
+        return unavailable("missing", exc)
+    except OSError as exc:
+        return unavailable("read_failed", exc)
+    except Exception as exc:
+        return unavailable("collector_failed", exc)
 
 
 class SelectionError(ValueError):
@@ -282,21 +372,32 @@ def selected_raw_path(paths: list[str], key: str, *, resolve=None, diagnostic: d
     return hid_identity.select_single_device_path(matches)
 
 
-async def _scan_paired() -> list[dict]:
+async def _scan_paired(*, diagnostic=None) -> list[dict]:
+    diagnostic = diagnostic or _ScanDiagnostic()
+    diagnostic.stage("winrt_import")
     from . import ble_transport_winrt, identity
     winrt = ble_transport_winrt._import_winrt()
+    diagnostic.stage("selector")
     selector = winrt.bluetooth_le_device.get_device_selector_from_pairing_state(True)
+    diagnostic.stage("enumerate")
     devices = await winrt.device_information.find_all_async_aqs_filter_and_additional_properties(
         selector, ["System.Devices.Aep.ContainerId"])
+    diagnostic.stage("device_rows")
     rows = {}
     for info in devices:
+        diagnostic.record["enumerated"] += 1
         try:
             key = candidate_key(info)
-        except (SelectionError, OSError, TypeError, ValueError):
+        except (SelectionError, OSError, TypeError, ValueError) as exc:
+            from .ble_connection_diagnostics import exception_fields
+            diagnostic.record["identity_failed"] += 1
+            if "identity_errors" not in diagnostic.record:
+                diagnostic.record["identity_errors"] = exception_fields(exc)["errors"]
             continue
         name = getattr(info, "name", "") or ""
         profile = (RC003_PROFILE if identity.matches_rc003_name(name) else
                    CHROMECAST_PROFILE if str(name).strip().casefold() == "chromecast remote" else "")
+        diagnostic.record["supported" if profile else "unsupported"] += 1
         # Unsupported names are display-only; saved selection still contains only digests/profiles.
         row = {"key": key, "profile": profile,
                "label": label(key, profile) if profile else _unsupported_label(name, key)}
@@ -309,28 +410,135 @@ async def _scan_paired() -> list[dict]:
 
 
 def scan_main(args: list[str]) -> int:
-    if len(args) != 1 or not args[0]:
+    if len(args) not in (1, 2) or not args[0] or (len(args) == 2 and not args[1]):
         return 2
+    diagnostic = scan_bootstrap.diagnostic_for(args[1] if len(args) == 2 else None)
+    async def collect():
+        try:
+            return await _scan_paired(diagnostic=diagnostic)
+        except Exception as exc:
+            diagnostic.error(exc)
+            raise
+        finally:
+            diagnostic.stage("loop_shutdown")
     try:
-        rows = asyncio.run(_scan_paired())
+        diagnostic.stage("loop_init")
+        rows = asyncio.run(collect())
+        diagnostic.stage("result_write")
         Path(args[0]).write_text(json.dumps(rows, ensure_ascii=False), encoding="utf-8")
-    except Exception:  # no platform identity/exception escapes the disposable scan
+    except Exception as exc:  # No native exception text or identity leaves the scan.
+        diagnostic.error(exc)
         return 1
-    return 0
+    else:
+        diagnostic.record.update(stage="finished", state="success")
+        return 0
+    finally:
+        diagnostic.save()
+        diagnostic.close()
 
 
-def scan_paired(*, cancel_event: threading.Event | None = None) -> list[dict]:
+def scan_paired(*, cancel_event: threading.Event | None = None, logger=None) -> list[dict]:
     from . import windows_diagnostics
-    with tempfile.TemporaryDirectory(prefix="remote-mic-devices-") as directory:
-        result = Path(directory) / "result.json"
-        command = [sys.executable]
-        if not getattr(sys, "frozen", False):
-            command += ["-m", "ovb_rc003"]
-        command += [SCAN_FLAG, str(result)]
-        return windows_diagnostics._run_ble_diagnostics_subprocess(
-            command, result_path=str(result), cancel_event=cancel_event or threading.Event(),
-            timeout=windows_diagnostics.BLE_DISCOVERY_TIMEOUT_SECONDS,
-            result_reader=_read_scan_result)
+    from . import __version__
+    from .ble_connection_diagnostics import exception_fields
+    cancel_event = cancel_event or threading.Event()
+    started = time.monotonic()
+    record = {"state": "failed", "stage": "temporary_directory",
+              "app_version": __version__, "diagnostic_schema": 2,
+              "runtime": "frozen" if getattr(sys, "frozen", False) else "source"}
+    def read_result(path, returncode):
+        record.update(stage="result_read", exit_code=returncode)
+        return _read_scan_result(path, returncode)
+    try:
+        with tempfile.TemporaryDirectory(prefix="remote-mic-devices-") as directory:
+            result = Path(directory) / "result.json"
+            evidence = Path(directory) / "diagnostic.json"
+            command = [sys.executable]
+            if not getattr(sys, "frozen", False):
+                command += ["-m", "remote_scan_bootstrap"]
+            command += [SCAN_FLAG, str(result), str(evidence)]
+            record.update(stage="subprocess", child_started=False)
+            channel = None
+            child = None
+            try:
+                channel = evidence.open("wb", buffering=0)
+                record["evidence_channel"] = "ready"
+            except OSError as exc:
+                record.update(evidence_channel="open_failed",
+                              evidence_channel_errors=exception_fields(exc)["errors"])
+            def spawn(arguments, **options):
+                nonlocal child
+                environment = dict(os.environ)
+                environment.pop(scan_bootstrap.HANDLE_ENV, None)
+                if channel is not None:
+                    if sys.platform == "win32":
+                        import msvcrt
+                        handle = msvcrt.get_osfhandle(channel.fileno())
+                        info = subprocess.STARTUPINFO()
+                        info.lpAttributeList = {"handle_list": [handle]}
+                        options.update(startupinfo=info, close_fds=True)
+                    else:
+                        handle = channel.fileno()
+                        options["pass_fds"] = (handle,)
+                    environment[scan_bootstrap.HANDLE_ENV] = str(handle)
+                options["env"] = environment
+                # No unbounded pipe reader. Only this process inherits the
+                # already-open temporary journal; the parent retains ownership.
+                with _SCAN_SPAWN_LOCK:
+                    if channel is not None and sys.platform == "win32":
+                        try:
+                            os.set_handle_inheritable(handle, True)
+                        except OSError as exc:
+                            options.pop("startupinfo", None)
+                            environment.pop(scan_bootstrap.HANDLE_ENV, None)
+                            record.update(evidence_channel="inherit_failed",
+                                          evidence_channel_errors=exception_fields(exc)["errors"])
+                    try:
+                        child = subprocess.Popen(arguments, **options)
+                    finally:
+                        if channel is not None and sys.platform == "win32":
+                            try:
+                                os.set_handle_inheritable(handle, False)
+                            except OSError as exc:
+                                record["evidence_channel_errors"] = exception_fields(exc)["errors"]
+                record.update(child_pid=child.pid, child_started=True)
+                return child
+            try:
+                rows = windows_diagnostics._run_ble_diagnostics_subprocess(
+                    command, result_path=str(result), cancel_event=cancel_event,
+                    timeout=windows_diagnostics.BLE_DISCOVERY_TIMEOUT_SECONDS,
+                    result_reader=read_result, popen=spawn)
+            finally:
+                if child is not None:
+                    try:
+                        code = child.poll()
+                        record.update(child_exited=code is not None, child_exit_code=code)
+                    except OSError as exc:
+                        record["child_status_errors"] = exception_fields(exc)["errors"]
+                if channel is not None:
+                    try:
+                        channel.close()
+                    except OSError as exc:
+                        record["evidence_channel_errors"] = exception_fields(exc)["errors"]
+                record.update(_read_scan_diagnostic(evidence))
+            record.update(stage="temporary_cleanup", result_count=len(rows))
+        record.update(state="success", stage="finished")
+        return rows
+    except windows_diagnostics.BleDiscoveryCancelledError:
+        record["state"] = "cancelled" if cancel_event.is_set() else "timeout"
+        raise
+    except Exception as exc:
+        record.update(state="failed", **exception_fields(exc))
+        raise
+    finally:
+        record["elapsed_ms"] = int((time.monotonic() - started) * 1000)
+        try:
+            target = logger if logger is not None else logging.getLogger("ovb_rc003")
+            target.log(logging.INFO if record["state"] in {"success", "cancelled"}
+                       else logging.WARNING, "Remote device scan: %s",
+                       json.dumps(record, separators=(",", ":"), sort_keys=True))
+        except Exception:
+            pass
 
 
 def _read_scan_result(result_path: str, returncode: int) -> list[dict]:

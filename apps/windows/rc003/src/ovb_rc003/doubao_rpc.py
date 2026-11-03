@@ -34,6 +34,7 @@ _DOUBAO_0927_HOOK_LAYOUT = (0x7829E0, 0x782B12, 0x782B18, 0x7837DA, 0x38)
 # Zero decision/stack fields mean no consumed-byte hook; never reuse the old
 # callback's stack layout in this rewritten callback.
 _DOUBAO_09320_HOOK_LAYOUT = (0x7CD5A0, 0x7CE5B2, 0x7CE5B8, 0, 0)
+_DOUBAO_10023_HOOK_LAYOUT = (0x7DDD90, 0x7DF19D, 0x7DF1A3, 0, 0)
 _VERIFIED_IME_SERVICE_BUILDS = {
     "94b17bdca571ac3cd2dafa687b4cb8e3a789cda9d044276483003b0a9e8f77a6":
         _DOUBAO_0900_HOOK_LAYOUT,
@@ -43,6 +44,8 @@ _VERIFIED_IME_SERVICE_BUILDS = {
         _DOUBAO_0927_HOOK_LAYOUT,
     "0352f9b70b33a2cde9632154435611dbea7731c85461457da143a683dae5a646":
         _DOUBAO_09320_HOOK_LAYOUT,
+    "fee3566aeb39913707b0afe6afd1c4e0ab84d5c676bf3abe1f9ea265d878cec3":
+        _DOUBAO_10023_HOOK_LAYOUT,
 }
 # These gates belong to the same exact build as the callback, not just the
 # same version label. Both are checked in loaded memory before any hook.
@@ -66,6 +69,10 @@ _VERIFIED_FORWARD_ONLY_SIGNATURES = {
     _DOUBAO_09320_HOOK_LAYOUT: (
         bytes.fromhex("40 55 56 57 41 54 41 55 41 56 41 57 48 8D AC 24 D0 F6 FF FF"),
         bytes.fromhex("FF 15 50 AE B9 00 48 8B D8 48 8D 8D A0 05 00 00 E8 49 9B FF FF 48 8B C3"),
+    ),
+    _DOUBAO_10023_HOOK_LAYOUT: (
+        bytes.fromhex("4C 8B DC 53 56 57 41 54 41 55 41 56 41 57 48 81 EC B0 0A 00 00"),
+        bytes.fromhex("FF 15 7D 72 DE 00 48 8B D8 48 8D 8C 24 20 07 00 00 E8 1D 88 FF FF 48 8B C3"),
     ),
 }
 _VERIFIED_VOICE_STOP_BUILDS = {
@@ -92,6 +99,13 @@ _VERIFIED_VOICE_STOP_BUILDS = {
         "984b8e80b8221ea0b659a93f5b8a396207f0e846879b135872e12a765de6c39f",
         # Native stop button and RPC handler still use source 1 to bypass
         # the first-800-ms guard; an idle RPC stop cannot start recording.
+        1,
+    ),
+    "de0ab466cd4b667bf6a6ec7710c4f0750c41fb806c7809d52538f1d4d5b07749": (
+        "fee3566aeb39913707b0afe6afd1c4e0ab84d5c676bf3abe1f9ea265d878cec3",
+        "8fa4b16de76d88d179d8e1133eaa18652a665c51abe086060ce0b88dff0ea67b",
+        # 1.0.0.23's native stop path still sends command 0x3E9/source 1;
+        # the handler retains the same source-1 bypass of the 800-ms guard.
         1,
     ),
 }

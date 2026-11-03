@@ -856,6 +856,8 @@ def main() -> None:
             raise SystemExit(2)
         raise SystemExit(shortcut_observation_windows.main(args[1:]))
     if "--list-remote-devices" in args:
+        import remote_scan_bootstrap
+        remote_scan_bootstrap.mark("scan_import")
         from . import remote_selection
         if not args or args[0] != remote_selection.SCAN_FLAG:
             raise SystemExit(2)

@@ -2301,7 +2301,13 @@ def _load_qt_classes() -> dict:
             def scan():
                 from . import remote_selection
                 try:
-                    rows = remote_selection.scan_paired(cancel_event=self._background_shutdown_event)
+                    try:
+                        scan_logger = logging_setup.get_logger(self._config_root)
+                    except Exception:
+                        scan_logger = None
+                    rows = remote_selection.scan_paired(
+                        cancel_event=self._background_shutdown_event,
+                        logger=scan_logger)
                     payload = (rows, "")
                 except Exception:
                     payload = (None, "读取设备失败；请稍后重试，或检查 Windows 蓝牙设置。")

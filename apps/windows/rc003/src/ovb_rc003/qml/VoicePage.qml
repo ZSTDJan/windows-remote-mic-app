@@ -578,6 +578,20 @@ Item {
                     }
                 }
 
+                UiLabel {
+                    objectName: "doubaoUpdateNotice"
+                    visible: root.doubaoSelected
+                    tokens: root.tokens
+                    kind: noteKind
+                    Layout.fillWidth: true
+                    Layout.leftMargin: root.tokens.spacingLarge
+                    Layout.rightMargin: root.tokens.spacingLarge
+                    Layout.topMargin: root.tokens.spacingSmall
+                    Layout.bottomMargin: root.tokens.spacingSmall
+                    wrapMode: Text.WordWrap
+                    text: qsTr("豆包更新可能导致遥控语音暂时不可用。建议关闭豆包自动更新，确认兼容后再手动更新。")
+                }
+
                 InlineSettingsRow {
                     objectName: "rc003RemoteRecordingModeRow"
                     visible: SettingsController.isRc003Device
