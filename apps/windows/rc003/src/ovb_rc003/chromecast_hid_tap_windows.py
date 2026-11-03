@@ -33,6 +33,12 @@ _KNOWN_LAYOUTS = {
     "8a18571ddfa447bd590354ccdf7800b815a098806359ab195d395158f9d07cc5": (0x12FCC, 24),
     "de2b7ff2a61d50473cfe1e00ec012e99bda9361d563249ef93dce59f576e9936": (0x1580C, 8),
     "372c3628e3366c18152199eb8fb554d27bb4f02d1356b1f514f711328df4a8d6": (0x157FC, 8),
+    # Microsoft.Bluetooth.Profiles.HidOverGatt.dll shipped by the
+    # 2026-10-30 Windows Update (observed on Windows 11 24H2-based
+    # Build 26300; FileVersion still reports 10.0.26100.1, so only the
+    # contents hash identifies it). Constructor stores the Bluetooth
+    # address at offset +8, same as the previous two entries.
+    "63633289822aa0157adb32e0ec062bf0f3cb31db25bdfc92eb8e39cea0a5475a": (0x18DAC, 8),
 }
 _HID_SERVICE = "{00001812-0000-1000-8000-00805f9b34fb}"
 _GOOGLE_HARDWARE = (

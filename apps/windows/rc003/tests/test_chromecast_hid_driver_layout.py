@@ -79,6 +79,7 @@ class DriverLayoutTests(unittest.TestCase):
             "8a18571ddfa447bd590354ccdf7800b815a098806359ab195d395158f9d07cc5": (0x12FCC, 24),
             "de2b7ff2a61d50473cfe1e00ec012e99bda9361d563249ef93dce59f576e9936": (0x1580C, 8),
             "372c3628e3366c18152199eb8fb554d27bb4f02d1356b1f514f711328df4a8d6": (0x157FC, 8),
+            "63633289822aa0157adb32e0ec062bf0f3cb31db25bdfc92eb8e39cea0a5475a": (0x18DAC, 8),
         }
         for digest, layout in expected.items():
             with self.subTest(digest=digest):
