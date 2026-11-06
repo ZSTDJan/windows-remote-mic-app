@@ -50,7 +50,7 @@ HID_STARTUP_STEPS = frozenset({"import_frida", "selected_host", "driver_layout",
     "attach_controller", "attach_process_before", "attach_process_after", "attach_token", "attach_exception",
     "attach_assets_before", "attach_assets_after", "attach_asset_access", "attach_evidence", "session_detached",
     "attach_policy", "attach_modules_before", "attach_modules_after", "attach_asset_file",
-    "attach_helper_scan", "attach_helper_manager", "attach_helper_service"})
+    "attach_helper_scan", "attach_helper_manager", "attach_helper_service", "se_debug_privilege"})
 HID_STARTUP_REASONS = frozenset({"none", "invalid_entity", "registry_read", "no_selected_host",
     "ambiguous_host", "debug_entries", "debug_signature", "pdb_name", "cache_root", "download_exit",
     "download_size", "download_signature", "symbol_initialize_failed", "symbol_load_failed",
