@@ -2258,37 +2258,76 @@ def focus_foreground_input_element(
         import uiautomation as auto
         window = auto.ControlFromHandle(hwnd)
         if window:
+            win_rect = window.BoundingRectangle
+            win_w = win_rect.width()
+            win_h = win_rect.height()
+
             candidates = []
-            for ctrl, depth in auto.WalkControl(window, includeTop=False, maxDepth=14):
+            count = 0
+            for ctrl, depth in auto.WalkControl(window, includeTop=False, maxDepth=45):
+                count += 1
+                if count > 2500:
+                    break
                 try:
                     if getattr(ctrl, "IsOffscreen", False):
                         continue
                     if not getattr(ctrl, "IsEnabled", True):
                         continue
 
-                    c_type = ctrl.ControlType
-                    # Match EditControl (50004), DocumentControl (50030)
-                    is_edit = c_type in (auto.ControlType.EditControl, auto.ControlType.DocumentControl)
-                    if not is_edit:
-                        if getattr(ctrl, "IsKeyboardFocusable", False):
-                            c_name = getattr(ctrl, "ClassName", "").lower()
-                            if any(k in c_name for k in ("edit", "text", "input", "rich")):
-                                is_edit = True
-
-                    if not is_edit:
-                        continue
-
                     rect = ctrl.BoundingRectangle
-                    w = rect.width()
-                    h = rect.height()
-                    if w < 10 or h < 8:
+                    w_px = rect.width()
+                    h_px = rect.height()
+                    if w_px < 15 or h_px < 10:
                         continue
 
-                    # Score candidate:
-                    # In chat / social / web apps, the input box is typically towards the bottom of the window
-                    # or is a large multi-line editing area (DocumentControl or large EditControl).
-                    area = w * h
-                    score = rect.bottom + (10000 if area > 2000 else 0) + (5000 if h > 25 else 0)
+                    # Reject root document / full window canvas containers
+                    if (win_w > 0 and win_h > 0 and w_px >= win_w * 0.85 and h_px >= win_h * 0.85) or getattr(ctrl, "AutomationId", "") == "RootWebArea":
+                        continue
+
+                    c_type = ctrl.ControlType
+                    name_lower = (ctrl.Name or "").lower()
+                    class_lower = (ctrl.ClassName or "").lower()
+                    is_focusable = getattr(ctrl, "IsKeyboardFocusable", False)
+
+                    is_input = False
+                    type_bonus = 0
+
+                    # 1. EditControl is the primary standard
+                    if c_type == auto.ControlType.EditControl:
+                        is_input = True
+                        type_bonus = 50000
+                    # 2. DocumentControl that is an editor (not whole-window)
+                    elif c_type == auto.ControlType.DocumentControl:
+                        if win_h == 0 or h_px < win_h * 0.7:
+                            is_input = True
+                            type_bonus = 30000
+                    # 3. ComboBoxControl with input traits (e.g. Antigravity chat input)
+                    elif c_type == auto.ControlType.ComboBoxControl:
+                        if any(k in name_lower for k in ("message", "input", "prompt", "chat", "search", "输入")) or "cursor-text" in class_lower:
+                            is_input = True
+                            type_bonus = 50000
+                        elif is_focusable and h_px < 150:
+                            is_input = True
+                            type_bonus = 20000
+                    # 4. Other custom controls with text editor classes or input names
+                    elif is_focusable:
+                        if "cursor-text" in class_lower or "ql-editor" in class_lower:
+                            is_input = True
+                            type_bonus = 50000
+                        elif any(k in name_lower for k in ("message input", "chat input", "输入提示", "发送消息", "输入消息")):
+                            is_input = True
+                            type_bonus = 40000
+
+                    if not is_input:
+                        continue
+
+                    name_bonus = 0
+                    if any(k in name_lower for k in ("message", "prompt", "消息", "提示", "chat", "发送")):
+                        name_bonus = 60000
+                    if any(k in name_lower for k in ("search", "搜索")) or "omnibox" in class_lower:
+                        name_bonus = -20000
+
+                    score = type_bonus + name_bonus + rect.bottom * 10 + min(w_px * h_px, 10000)
                     candidates.append((score, ctrl, rect))
                 except Exception:
                     pass
@@ -2297,9 +2336,10 @@ def focus_foreground_input_element(
                 candidates.sort(key=lambda item: item[0], reverse=True)
                 score, target_el, target_rect = candidates[0]
                 _logger.info(
-                    "focus_foreground_input_element: uiautomation found %d candidate(s), chosen %s rect=%s score=%d",
+                    "focus_foreground_input_element: uiautomation found %d candidate(s), chosen %s name=%r rect=%s score=%d",
                     len(candidates),
                     getattr(target_el, "ControlTypeName", "element"),
+                    getattr(target_el, "Name", ""),
                     target_rect,
                     score,
                 )
@@ -2308,8 +2348,8 @@ def focus_foreground_input_element(
                 except Exception as exc:
                     _logger.debug("target_el.SetFocus failed: %s", exc)
                 try:
-                    click_x = min(target_rect.left + 25, (target_rect.left + target_rect.right) // 2)
-                    click_y = min(target_rect.top + 15, (target_rect.top + target_rect.bottom) // 2)
+                    click_x = (target_rect.left + target_rect.right) // 2
+                    click_y = (target_rect.top + target_rect.bottom) // 2
                     user.SetCursorPos.argtypes = (ctypes.c_int, ctypes.c_int)
                     user.SetCursorPos.restype = wintypes.BOOL
                     user.SetCursorPos(click_x, click_y)
