@@ -69,6 +69,7 @@ class ActionKind(str, Enum):
     MOUSE_X1_HOLD = "mouse_x1_hold"
     MOUSE_X2_HOLD = "mouse_x2_hold"
     ELEMENT_NAVIGATION_TOGGLE = "element_navigation_toggle"
+    FOCUS_INPUT = "focus_input"
     # ``VOICE`` and ``VOICE_TOGGLE`` remain parseable only so schema-1 files
     # can be failed closed with an explicit migration notice. They are not
     # selectable or executable product actions anymore.

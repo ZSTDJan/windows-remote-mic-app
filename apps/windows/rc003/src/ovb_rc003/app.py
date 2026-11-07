@@ -4813,6 +4813,15 @@ class RC003App:
                     result=str(result.kind.value),
                     target_hwnd=int(result.target_hwnd),
                 )
+            elif action.kind == key_mapping.ActionKind.FOCUS_INPUT:
+                try:
+                    focused = win32_input.focus_foreground_input_element()
+                    if not focused:
+                        self._logger.info("focus foreground input: no editable input element found")
+                except Exception as exc:
+                    action_error = "focus_input_failed"
+                    action_error_type = type(exc).__name__
+                    self._logger.exception("focus foreground input element failed unexpectedly")
             elif action.kind == key_mapping.ActionKind.OPEN_PROGRAM:
                 if not self._accept_input_events:
                     return

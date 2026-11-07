@@ -64,6 +64,7 @@ class DisplayRoundTripTests(unittest.TestCase):
             "鼠标 X1 单击": key_mapping.ActionKind.MOUSE_X1_CLICK,
             "鼠标 X2 单击": key_mapping.ActionKind.MOUSE_X2_CLICK,
             "元素导航开关": key_mapping.ActionKind.ELEMENT_NAVIGATION_TOGGLE,
+            "聚焦输入框": key_mapping.ActionKind.FOCUS_INPUT,
         }
         for label, action_kind in expected.items():
             restored = _display_to_action(label)

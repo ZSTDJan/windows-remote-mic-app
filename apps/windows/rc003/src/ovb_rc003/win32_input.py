@@ -2228,3 +2228,113 @@ def send_volume_mute(*, _sender: Optional[RawSender] = None) -> None:
 
 def send_play_pause(*, _sender: Optional[RawSender] = None) -> None:
     _send_semantic_tap(("media_play_pause",), _sender=_sender)
+
+
+def focus_foreground_input_element(
+    *,
+    _target_hwnd: Optional[int] = None,
+    _sender: Optional[MouseSender] = None,
+) -> bool:
+    """Find and focus the primary editable text element in the foreground window.
+
+    Supports UIAutomation (Win32, WPF, UWP, Chromium / Electron apps) with a
+    standard Win32 EnumChildWindows fallback for traditional dialogs.
+    """
+    _require_windows()
+    user = ctypes.WinDLL("user32", use_last_error=True)
+    user.GetForegroundWindow.argtypes = ()
+    user.GetForegroundWindow.restype = wintypes.HWND
+    hwnd = _target_hwnd if _target_hwnd is not None else user.GetForegroundWindow()
+    if not hwnd:
+        return False
+
+    # 1. UIAutomation path
+    try:
+        import uiautomation as auto
+        window = auto.ControlFromHandle(hwnd)
+        if window and window.Exists(0, 0):
+            candidates = []
+            for ctrl_type in (auto.ControlType.EditControlId, auto.ControlType.DocumentControlId):
+                cond = auto.CreatePropertyCondition(auto.PropertyId.ControlTypePropertyId, ctrl_type)
+                found = window.FindAll(auto.TreeScope.Descendants, cond)
+                if found:
+                    for el in found:
+                        try:
+                            if not el.IsEnabled:
+                                continue
+                            rect = el.BoundingRectangle
+                            w = rect.width()
+                            h = rect.height()
+                            if w < 10 or h < 8:
+                                continue
+                            candidates.append((el, rect, w * h))
+                        except Exception:
+                            pass
+            if candidates:
+                candidates.sort(key=lambda item: (item[2] > 2000, item[1].top, item[2]), reverse=True)
+                target_el, target_rect, _ = candidates[0]
+                try:
+                    target_el.SetFocus()
+                except Exception:
+                    pass
+                try:
+                    cx = (target_rect.left + target_rect.right) // 2
+                    cy = (target_rect.top + target_rect.bottom) // 2
+                    user.SetCursorPos.argtypes = (ctypes.c_int, ctypes.c_int)
+                    user.SetCursorPos.restype = wintypes.BOOL
+                    user.SetCursorPos(cx, cy)
+                    send_mouse_button_click("left", _sender=_sender)
+                    return True
+                except Exception:
+                    pass
+                return True
+    except Exception:
+        pass
+
+    # 2. Pure Win32 fallback
+    try:
+        edit_candidates = []
+        user.IsWindowVisible.argtypes = (wintypes.HWND,)
+        user.IsWindowVisible.restype = wintypes.BOOL
+        user.IsWindowEnabled.argtypes = (wintypes.HWND,)
+        user.IsWindowEnabled.restype = wintypes.BOOL
+        user.GetClassNameW.argtypes = (wintypes.HWND, wintypes.LPWSTR, ctypes.c_int)
+        user.GetClassNameW.restype = ctypes.c_int
+        user.GetWindowRect.argtypes = (wintypes.HWND, ctypes.POINTER(wintypes.RECT))
+        user.GetWindowRect.restype = wintypes.BOOL
+        user.SetFocus.argtypes = (wintypes.HWND,)
+        user.SetFocus.restype = wintypes.HWND
+        user.SetCursorPos.argtypes = (ctypes.c_int, ctypes.c_int)
+        user.SetCursorPos.restype = wintypes.BOOL
+
+        def _enum_child(h: int, _: int) -> bool:
+            class_name = (ctypes.c_wchar * 256)()
+            user.GetClassNameW(h, class_name, 256)
+            cname = class_name.value.lower()
+            if "edit" in cname:
+                if user.IsWindowVisible(h) and user.IsWindowEnabled(h):
+                    rect = wintypes.RECT()
+                    user.GetWindowRect(h, ctypes.byref(rect))
+                    w = rect.right - rect.left
+                    h_val = rect.bottom - rect.top
+                    if w > 10 and h_val > 8:
+                        edit_candidates.append((h, rect, w * h_val))
+            return True
+
+        WNDENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+        user.EnumChildWindows.argtypes = (wintypes.HWND, WNDENUMPROC, wintypes.LPARAM)
+        user.EnumChildWindows.restype = wintypes.BOOL
+        user.EnumChildWindows(hwnd, WNDENUMPROC(_enum_child), 0)
+        if edit_candidates:
+            edit_candidates.sort(key=lambda item: (item[2] > 2000, item[1].top, item[2]), reverse=True)
+            target_h, target_rect, _ = edit_candidates[0]
+            user.SetFocus(target_h)
+            cx = (target_rect.left + target_rect.right) // 2
+            cy = (target_rect.top + target_rect.bottom) // 2
+            user.SetCursorPos(cx, cy)
+            send_mouse_button_click("left", _sender=_sender)
+            return True
+    except Exception:
+        pass
+
+    return False

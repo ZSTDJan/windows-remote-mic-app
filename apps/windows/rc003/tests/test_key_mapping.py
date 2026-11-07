@@ -108,6 +108,7 @@ class ButtonActionSerializationTests(unittest.TestCase):
             key_mapping.ActionKind.CONTEXT_MENU,
             key_mapping.ActionKind.APP_SWITCHER,
             key_mapping.ActionKind.ELEMENT_NAVIGATION_TOGGLE,
+            key_mapping.ActionKind.FOCUS_INPUT,
         ):
             action = key_mapping.ButtonAction(action_kind)
             self.assertEqual(action.keys, ())

@@ -72,6 +72,7 @@ _REFERENCE_ACTION_LABELS: Dict[key_mapping.ActionKind, str] = {
     key_mapping.ActionKind.MOUSE_X1_CLICK: "鼠标 X1 单击",
     key_mapping.ActionKind.MOUSE_X2_CLICK: "鼠标 X2 单击",
     key_mapping.ActionKind.ELEMENT_NAVIGATION_TOGGLE: "元素导航开关",
+    key_mapping.ActionKind.FOCUS_INPUT: "聚焦输入框",
     key_mapping.ActionKind.OPEN_REMOTE_MIC: _OPEN_APPLICATION_DISPLAY,
     key_mapping.ActionKind.OPEN_CODEX: "打开 Codex",
     key_mapping.ActionKind.OPEN_CLAUDE: "打开 Claude",
@@ -127,7 +128,7 @@ ACTION_OPTION_GROUPS: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
         (
             "元素导航开关", "鼠标左键单击", "鼠标右键单击", "鼠标中键单击",
             "鼠标 X1 单击", "鼠标 X2 单击",
-            "右键菜单",
+            "右键菜单", "聚焦输入框",
         ),
     ),
     ("文字输入", ("输入文字",)),

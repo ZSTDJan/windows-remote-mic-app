@@ -3574,6 +3574,15 @@ class OrdinaryButtonGestureWiringTests(_AppWiringTestCase):
                                  "" if success else "element_navigation_failed")
                 self.assertEqual(outcomes[0]["error_type"], error_type)
 
+    def test_focus_input_action_dispatches_to_win32_input(self):
+        with mock.patch.object(
+            win32_input, "focus_foreground_input_element", return_value=True
+        ) as focus_mock:
+            self.app._apply_button_action(
+                key_mapping.ButtonAction(key_mapping.ActionKind.FOCUS_INPUT)
+            )
+        focus_mock.assert_called_once_with()
+
     def test_application_diagnostic_matches_launch_availability(self):
         for available in (False, True):
             with self.subTest(available=available), mock.patch.object(
@@ -3741,6 +3750,7 @@ class OrdinaryButtonGestureWiringTests(_AppWiringTestCase):
             "send_delete_backward", "send_show_desktop", "send_context_menu",
             "send_app_switcher", "send_volume_up", "send_volume_down",
             "send_volume_mute", "send_play_pause", "send_mouse_button_click", "paste_text",
+            "focus_foreground_input_element",
         )
         with ExitStack() as stack:
             effects = [stack.enter_context(mock.patch.object(win32_input, name)) for name in senders]
