@@ -4643,6 +4643,8 @@ class RC003App:
             key_mapping.ActionKind.ARROW_DOWN,
             key_mapping.ActionKind.ARROW_LEFT,
             key_mapping.ActionKind.ARROW_RIGHT,
+            key_mapping.ActionKind.MOUSE_WHEEL_UP,
+            key_mapping.ActionKind.MOUSE_WHEEL_DOWN,
         }:
             return _DIRECTION_BUTTON_REPEAT_INTERVAL_SECONDS
         if button_id == "back":
@@ -4747,7 +4749,7 @@ class RC003App:
                 navigation_vk = _BUTTON_NAVIGATION_SINGLE_KEYS.get(tuple(action.keys))
             if navigation_vk is not None and element_navigation_control_windows.route_mapped_navigation_key(navigation_vk):
                 # Accepted commands must not also be injected through SendInput.
-                pass
+                self._logger.debug("navigation key 0x%02X routed to element navigation", navigation_vk)
             elif action.kind == key_mapping.ActionKind.KEY_COMBO:
                 win32_input.send_key_combo_tap(action.keys)
             elif action.kind == key_mapping.ActionKind.TEXT:
@@ -4755,6 +4757,9 @@ class RC003App:
                     return
                 win32_input.paste_text(action.text)
             elif action.kind == key_mapping.ActionKind.ESCAPE:
+                if element_navigation_control_windows.is_element_navigation_active():
+                    self._logger.info("element navigation dismissed by action: escape")
+                    element_navigation_control_windows.leave_element_navigation()
                 win32_input.send_escape()
             elif action.kind == key_mapping.ActionKind.RETURN:
                 win32_input.send_return()
@@ -4767,8 +4772,14 @@ class RC003App:
             elif action.kind == key_mapping.ActionKind.ARROW_RIGHT:
                 win32_input.send_arrow_right()
             elif action.kind == key_mapping.ActionKind.DELETE_BACKWARD:
+                if element_navigation_control_windows.is_element_navigation_active():
+                    self._logger.info("element navigation dismissed by action: delete_backward")
+                    element_navigation_control_windows.leave_element_navigation()
+                    return
                 win32_input.send_delete_backward()
             elif action.kind == key_mapping.ActionKind.SHOW_DESKTOP:
+                if element_navigation_control_windows.is_element_navigation_active():
+                    element_navigation_control_windows.leave_element_navigation()
                 win32_input.send_show_desktop()
             elif action.kind == key_mapping.ActionKind.CONTEXT_MENU:
                 win32_input.send_context_menu()
@@ -4788,6 +4799,16 @@ class RC003App:
                 win32_input.send_mouse_button_click(
                     _BUTTON_ACTION_MOUSE_BUTTONS[action.kind]
                 )
+            elif action.kind == key_mapping.ActionKind.MOUSE_WHEEL_UP:
+                if element_navigation_control_windows.is_element_navigation_active():
+                    self._logger.info("element navigation dismissed by action: mouse_wheel_up")
+                    element_navigation_control_windows.leave_element_navigation()
+                win32_input.send_mouse_wheel_up()
+            elif action.kind == key_mapping.ActionKind.MOUSE_WHEEL_DOWN:
+                if element_navigation_control_windows.is_element_navigation_active():
+                    self._logger.info("element navigation dismissed by action: mouse_wheel_down")
+                    element_navigation_control_windows.leave_element_navigation()
+                win32_input.send_mouse_wheel_down()
             elif action.kind == key_mapping.ActionKind.ELEMENT_NAVIGATION_TOGGLE:
                 try:
                     result = (
@@ -4814,6 +4835,9 @@ class RC003App:
                     target_hwnd=int(result.target_hwnd),
                 )
             elif action.kind == key_mapping.ActionKind.FOCUS_INPUT:
+                if element_navigation_control_windows.is_element_navigation_active():
+                    self._logger.info("element navigation dismissed by action: focus_input")
+                    element_navigation_control_windows.leave_element_navigation()
                 try:
                     focused = win32_input.focus_foreground_input_element()
                     if not focused:
