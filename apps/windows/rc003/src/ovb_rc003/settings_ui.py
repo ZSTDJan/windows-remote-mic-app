@@ -69,6 +69,8 @@ _REFERENCE_ACTION_LABELS: Dict[key_mapping.ActionKind, str] = {
     key_mapping.ActionKind.MOUSE_LEFT_CLICK: "鼠标左键单击",
     key_mapping.ActionKind.MOUSE_RIGHT_CLICK: "鼠标右键单击",
     key_mapping.ActionKind.MOUSE_MIDDLE_CLICK: "鼠标中键单击",
+    key_mapping.ActionKind.MOUSE_WHEEL_UP: "滚轮向上",
+    key_mapping.ActionKind.MOUSE_WHEEL_DOWN: "滚轮向下",
     key_mapping.ActionKind.MOUSE_X1_CLICK: "鼠标 X1 单击",
     key_mapping.ActionKind.MOUSE_X2_CLICK: "鼠标 X2 单击",
     key_mapping.ActionKind.ELEMENT_NAVIGATION_TOGGLE: "元素导航开关",
@@ -128,6 +130,7 @@ ACTION_OPTION_GROUPS: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
         (
             "元素导航开关", "鼠标左键单击", "鼠标右键单击", "鼠标中键单击",
             "鼠标 X1 单击", "鼠标 X2 单击",
+            "滚轮向上", "滚轮向下",
             "右键菜单", "聚焦输入框",
         ),
     ),
@@ -232,10 +235,6 @@ def _action_to_display(action: key_mapping.ButtonAction) -> str:
     if action.kind == key_mapping.ActionKind.KEY_COMBO and action.keys in (("pageup",), ("page_up",)):
         return "PageUp"
     if action.kind == key_mapping.ActionKind.KEY_COMBO and action.keys in (("pagedown",), ("page_down",)):
-        return "PageDown"
-    if action.kind == key_mapping.ActionKind.MOUSE_WHEEL_UP:
-        return "PageUp"
-    if action.kind == key_mapping.ActionKind.MOUSE_WHEEL_DOWN:
         return "PageDown"
     if action.kind == key_mapping.ActionKind.DISABLED:
         return "禁用"

@@ -87,6 +87,8 @@ _MOUSEEVENTF_MIDDLEDOWN = 0x0020
 _MOUSEEVENTF_MIDDLEUP = 0x0040
 _MOUSEEVENTF_XDOWN = 0x0080
 _MOUSEEVENTF_XUP = 0x0100
+_MOUSEEVENTF_WHEEL = 0x0800
+_MOUSE_WHEEL_DELTA = 120
 _XBUTTON1 = 0x0001
 _XBUTTON2 = 0x0002
 _VK_LBUTTON = 0x01
@@ -1004,6 +1006,68 @@ def send_mouse_button_up(
         raise error_type(
             f"SendInput did not deliver mouse {button} up; retry attempted"
         )
+
+
+def _ensure_cursor_in_foreground_window() -> None:
+    """If the mouse cursor is outside the active foreground window, place it inside."""
+    try:
+        if sys.platform != "win32":
+            return
+        user32 = ctypes.windll.user32
+        foreground = user32.GetForegroundWindow()
+        if not foreground:
+            return
+        rect = wintypes.RECT()
+        if not user32.GetWindowRect(foreground, ctypes.byref(rect)):
+            return
+        if rect.right <= rect.left or rect.bottom <= rect.top:
+            return
+        pt = wintypes.POINT()
+        if not user32.GetCursorPos(ctypes.byref(pt)):
+            return
+        if not (rect.left <= pt.x < rect.right and rect.top <= pt.y < rect.bottom):
+            cx = rect.left + (rect.right - rect.left) // 2
+            cy = rect.top + (rect.bottom - rect.top) // 2
+            user32.SetCursorPos(cx, cy)
+    except Exception:
+        pass
+
+
+def send_mouse_wheel(
+    delta: int = _MOUSE_WHEEL_DELTA,
+    *,
+    _sender: Optional[MouseSender] = None,
+) -> None:
+    """Submit a mouse wheel rotation event. Positive delta scrolls up, negative down."""
+    _ensure_cursor_in_foreground_window()
+    sender = _sender or _real_send_mouse_input_batch
+    event: MouseEvent = (_MOUSEEVENTF_WHEEL, int(delta))
+    try:
+        sent = sender([event])
+    except Win32InputUnavailableError:
+        raise
+    except Exception as exc:
+        raise OSError(f"mouse wheel delivery failed: {exc}") from exc
+    if sent < 1:
+        raise OSError("SendInput did not deliver mouse wheel event")
+
+
+def send_mouse_wheel_up(
+    delta: int = _MOUSE_WHEEL_DELTA,
+    *,
+    _sender: Optional[MouseSender] = None,
+) -> None:
+    """Scroll mouse wheel up (forward)."""
+    send_mouse_wheel(abs(delta), _sender=_sender)
+
+
+def send_mouse_wheel_down(
+    delta: int = _MOUSE_WHEEL_DELTA,
+    *,
+    _sender: Optional[MouseSender] = None,
+) -> None:
+    """Scroll mouse wheel down (backward)."""
+    send_mouse_wheel(-abs(delta), _sender=_sender)
 
 
 def _best_effort_release(
