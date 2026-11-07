@@ -75,6 +75,8 @@ class ButtonActionSerializationTests(unittest.TestCase):
             key_mapping.ActionKind.DELETE_BACKWARD,
             key_mapping.ActionKind.SYSTEM_VOLUME_UP,
             key_mapping.ActionKind.SYSTEM_VOLUME_DOWN,
+            key_mapping.ActionKind.MOUSE_WHEEL_UP,
+            key_mapping.ActionKind.MOUSE_WHEEL_DOWN,
         }
         for action_kind in key_mapping.ActionKind:
             action = (
@@ -108,6 +110,7 @@ class ButtonActionSerializationTests(unittest.TestCase):
             key_mapping.ActionKind.CONTEXT_MENU,
             key_mapping.ActionKind.APP_SWITCHER,
             key_mapping.ActionKind.ELEMENT_NAVIGATION_TOGGLE,
+            key_mapping.ActionKind.FOCUS_INPUT,
         ):
             action = key_mapping.ButtonAction(action_kind)
             self.assertEqual(action.keys, ())
@@ -128,20 +131,20 @@ class ButtonActionSerializationTests(unittest.TestCase):
                 key_mapping.ButtonAction.from_dict(action.to_dict()), action
             )
 
-    def test_saved_wheel_actions_migrate_to_page_keys_without_writing_wheel(self):
-        for old_kind, page_key in (
-            (key_mapping.ActionKind.MOUSE_WHEEL_UP, "pageup"),
-            (key_mapping.ActionKind.MOUSE_WHEEL_DOWN, "pagedown"),
+    def test_wheel_actions_round_trip_cleanly(self):
+        for kind in (
+            key_mapping.ActionKind.MOUSE_WHEEL_UP,
+            key_mapping.ActionKind.MOUSE_WHEEL_DOWN,
         ):
-            with self.subTest(old_kind=old_kind):
-                old_data = {"kind": old_kind.value, "keys": []}
-                restored = key_mapping.ButtonAction.from_dict(old_data)
-                self.assertEqual(restored.kind, key_mapping.ActionKind.KEY_COMBO)
-                self.assertEqual(restored.keys, (page_key,))
-                self.assertEqual(restored.to_dict(), {"kind": "key_combo", "keys": [page_key]})
+            with self.subTest(kind=kind):
+                data = {"kind": kind.value, "keys": []}
+                restored = key_mapping.ButtonAction.from_dict(data)
+                self.assertEqual(restored.kind, kind)
+                self.assertEqual(restored.keys, ())
+                self.assertEqual(restored.to_dict(), {"kind": kind.value, "keys": []})
                 self.assertEqual(
-                    key_mapping.ButtonAction(old_kind).to_dict(),
-                    restored.to_dict(),
+                    key_mapping.ButtonAction(kind).to_dict(),
+                    data,
                 )
 
     def test_reference_open_app_actions_are_first_class_actions(self):

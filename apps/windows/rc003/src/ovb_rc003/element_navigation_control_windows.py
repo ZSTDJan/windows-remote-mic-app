@@ -630,6 +630,24 @@ class EmbeddedElementNavigationClient:
         route = getattr(runtime, "route_local_key", None)
         return bool(route(vk, pressed, repeat, modified)) if callable(route) else False
 
+    def is_active(self) -> bool:
+        with self._lock:
+            runtime = self._runtime
+        checker = getattr(runtime, "is_active", None)
+        return bool(checker()) if callable(checker) else False
+
+    def leave(self) -> bool:
+        with self._lock:
+            runtime = self._runtime
+        leaver = getattr(runtime, "leave", None)
+        if callable(leaver):
+            try:
+                leaver()
+                return True
+            except Exception:
+                return False
+        return False
+
     def shutdown(self) -> CommandSendResult:
         with self._lock:
             runtime = self._runtime
@@ -658,6 +676,14 @@ def toggle_element_navigation() -> ToggleResult:
 
 def route_mapped_navigation_key(vk: int) -> bool:
     return _DEFAULT_CLIENT.route_mapped_key(vk)
+
+
+def is_element_navigation_active() -> bool:
+    return _DEFAULT_CLIENT.is_active()
+
+
+def leave_element_navigation() -> bool:
+    return _DEFAULT_CLIENT.leave()
 
 
 def route_local_navigation_key(vk: int, pressed: bool, repeat: bool, modified: bool) -> bool:

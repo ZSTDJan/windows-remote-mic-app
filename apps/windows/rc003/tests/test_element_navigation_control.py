@@ -551,6 +551,18 @@ class ElementNavigationRuntimeTests(unittest.TestCase):
 
 
 class EmbeddedElementNavigationClientTests(unittest.TestCase):
+    def test_is_active_and_leave_require_bound_runtime(self):
+        client = control.EmbeddedElementNavigationClient()
+        self.assertFalse(client.is_active())
+        self.assertFalse(client.leave())
+        runtime_instance = mock.Mock(is_active=mock.Mock(return_value=True),
+                                     leave=mock.Mock())
+        client.bind(runtime_instance)
+        self.assertTrue(client.is_active())
+        self.assertTrue(client.leave())
+        runtime_instance.is_active.assert_called_once()
+        runtime_instance.leave.assert_called_once()
+
     def test_local_routes_require_bound_runtime_and_preserve_acceptance(self):
         client = control.EmbeddedElementNavigationClient()
         self.assertFalse(client.route_mapped_key(0x26))

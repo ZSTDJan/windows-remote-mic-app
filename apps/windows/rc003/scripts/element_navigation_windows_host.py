@@ -423,12 +423,23 @@ class EmbeddedElementNavigationRuntime:
         local_input: Optional[_LocalNavigationInput] = None,
         *,
         mapped_input: Optional[Callable[[int], bool]] = None,
+        is_active: Optional[Callable[[], bool]] = None,
+        leave: Optional[Callable[[], None]] = None,
     ) -> None:
         self._enqueue_command = enqueue_command
         self._record_direction_edge = record_direction_edge
         self._cleanup = cleanup
         self._local_input = local_input
         self._mapped_input = mapped_input
+        self._is_active = is_active
+        self._leave = leave
+
+    def is_active(self) -> bool:
+        return bool(self._is_active()) if callable(self._is_active) else False
+
+    def leave(self) -> None:
+        if callable(self._leave):
+            self._leave()
 
     def route_mapped_key(self, vk: int) -> bool:
         if self._mapped_input is not None:
@@ -4196,11 +4207,12 @@ def _run_windows(
     command_server = None
 
     cleanup_callback: list[Callable[[], None]] = [lambda: None]
+    last_navigation_activity_at = 0.0
 
     def leave_navigation() -> None:
         nonlocal navigation_root_hwnd, navigation_process_id
         nonlocal navigation_overlay_signature, navigation_overlay_checked_at
-        nonlocal scanning, current_scan_token
+        nonlocal scanning, current_scan_token, last_navigation_activity_at
         if active.is_set() or scanning:
             diagnostics.emit("leave", scan_token=scan_token_counter,
                              target_hwnd=navigation_root_hwnd,
@@ -4211,6 +4223,7 @@ def _run_windows(
             hook.reset_device_direction_edges()
         scanning = False
         current_scan_token = 0
+        last_navigation_activity_at = 0.0
         diagnostics.keyboard_context(0, 0, 0)
         worker.deactivate()
         overlay.clear_target()
@@ -4283,11 +4296,15 @@ def _run_windows(
         nonlocal scanning, navigation_root_hwnd, navigation_process_id
         nonlocal navigation_overlay_signature, navigation_overlay_checked_at
         nonlocal diagnostics_enabled, scan_token_counter, current_scan_token
+        nonlocal last_navigation_activity_at
+        last_navigation_activity_at = time.perf_counter()
         diagnostics.emit("action", action=action, target_hwnd=target_hwnd,
                          active=active.is_set(), scanning=scanning,
                          scan_token=scan_token_counter)
         if action == "quit":
             request_quit()
+        elif action in {"leave", "cancel_leave"}:
+            leave_navigation()
         elif action == "toggle_diagnostics":
             diagnostics_enabled = not diagnostics_enabled
             worker.post("diagnostics", diagnostics_enabled)
@@ -4411,13 +4428,16 @@ def _run_windows(
                     f"已执行: {target.name or target.control_type} "
                     f"({payload['method']} / {payload['elapsed']:.3f}s)"
                 )
-                refresh_delay = content_refresh_delay_ms(
-                    event, payload["repeat"]
-                )
-                if refresh_delay and active.is_set():
-                    QTimer.singleShot(
-                        refresh_delay, lambda: worker.post("refresh_content")
+                if embedded_remote_only:
+                    leave_navigation()
+                else:
+                    refresh_delay = content_refresh_delay_ms(
+                        event, payload["repeat"]
                     )
+                    if refresh_delay and active.is_set():
+                        QTimer.singleShot(
+                            refresh_delay, lambda: worker.post("refresh_content")
+                        )
             elif event == "contexted":
                 target = payload["target"]
                 print(
@@ -4560,6 +4580,13 @@ def _run_windows(
             return
         if foreground <= 0:
             return
+        if (active.is_set() or scanning) and last_navigation_activity_at > 0 and (time.perf_counter() - last_navigation_activity_at > 15.0):
+            diagnostics.emit("pause", reason="idle_timeout",
+                             target_hwnd=navigation_root_hwnd,
+                             scan_token=scan_token_counter)
+            print("导航超时已自动退出")
+            leave_navigation()
+            return
         overlay_signature_checked = refresh_navigation_overlay_signature()
         foreground_action = navigation_action_for_foreground(foreground)
         if foreground_action == "leave" and not overlay_signature_checked:
@@ -4676,6 +4703,13 @@ def _run_windows(
     if diagnostics_enabled:
         print("导航诊断已开启。每次方向移动都会解释候选排序。")
     if not run_event_loop:
+        def is_navigation_active() -> bool:
+            return active.is_set() or scanning or intercepting.is_set()
+
+        def request_leave() -> None:
+            intercepting.clear()
+            keyboard_events.put(("leave", 0))
+
         return EmbeddedElementNavigationRuntime(
             enqueue_external_command,
             hook.record_device_direction_edge if hook is not None else
@@ -4683,6 +4717,8 @@ def _run_windows(
             cleanup,
             local_input,
             mapped_input=route_mapped_key if embedded_remote_only else None,
+            is_active=is_navigation_active,
+            leave=request_leave,
         )
     try:
         return int(app.exec())
