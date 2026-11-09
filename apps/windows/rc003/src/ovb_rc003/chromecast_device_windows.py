@@ -27,6 +27,38 @@ _VOICE_SERVICE_ID = uuid.UUID("ab5e0001-5a21-4f05-bc7d-af01f617b664")
 _VOICE_SERVICE_TIMEOUT = 10
 _VOICE_SESSION_TIMEOUT = 5
 _PNP = re.compile(r"(?:dev_vid&[0-9a-f]{2}|vid_)([0-9a-f]{4})(?:_pid&|&pid_)([0-9a-f]{4})(?:_rev&|&rev_)([0-9a-f]{4})", re.I)
+_PAIRED_BLE_ENDPOINT = re.compile(
+    r"BluetoothLE#BluetoothLE([0-9a-f]{2}(?::[0-9a-f]{2}){5})-"
+    r"([0-9a-f]{2}(?::[0-9a-f]{2}){5})", re.I,
+)
+
+
+async def _paired_endpoint_on_radio(candidates, radio_id, adapter_from_id):
+    # After an adapter swap Windows can retain two AEPs for the selected
+    # container. Only interpret the observed local-address/peer-address form.
+    endpoints = []
+    for candidate in candidates:
+        match = _PAIRED_BLE_ENDPOINT.fullmatch(candidate.id)
+        if match is None:
+            raise PipeError("source_unconfirmed")
+        local, peer = (int(address.replace(":", ""), 16) for address in match.groups())
+        endpoints.append((candidate, local, peer))
+    if len({peer for _, _, peer in endpoints}) != 1:
+        raise PipeError("source_unconfirmed")
+
+    try:
+        adapter = await asyncio.wait_for(adapter_from_id(radio_id), timeout=5)
+        if adapter is None or adapter.device_id != radio_id:
+            raise PipeError("source_unconfirmed")
+        address = adapter.bluetooth_address
+    except (OSError, TimeoutError) as error:
+        raise PipeError("source_unconfirmed") from error
+    if not 0 < address < 0xFFFFFFFFFFFF:
+        raise PipeError("source_unconfirmed")
+    matches = [candidate for candidate, local, _ in endpoints if local == address]
+    if len(matches) != 1:
+        raise PipeError("source_unconfirmed")
+    return matches[0]
 
 
 def supported_path(path):
@@ -214,7 +246,8 @@ class SelectedDevice:
             await asyncio.sleep(.05)
         if not self.enumerated.is_set() or len(self.ids) != 1 or self.changed.is_set():
             raise PipeError("radio_ambiguous")
-        self.radio = hashlib.sha256(b"RemoteMic radio v1\0" + next(iter(self.ids)).encode("utf-8")).hexdigest()
+        radio_id = next(iter(self.ids))
+        self.radio = hashlib.sha256(b"RemoteMic radio v1\0" + radio_id.encode("utf-8")).hexdigest()
         selector = BluetoothLEDevice.get_device_selector_from_pairing_state(True)
         infos = await DeviceInformation.find_all_async_aqs_filter_and_additional_properties(selector, ["System.Devices.Aep.ContainerId"])
         selected = []
@@ -224,6 +257,12 @@ class SelectedDevice:
                     selected.append(info)
             except remote_selection.SelectionError:
                 continue
+        if self.changed.is_set():
+            raise PipeError("radio_ambiguous")
+        if len(selected) > 1:
+            selected = [await _paired_endpoint_on_radio(selected, radio_id, BluetoothAdapter.from_id_async)]
+            if self.changed.is_set():
+                raise PipeError("radio_ambiguous")
         if len(selected) != 1 or selected[0].name.strip().casefold() != "chromecast remote":
             raise PipeError("source_unconfirmed")
         if require_input:
@@ -613,7 +652,14 @@ class SelectedDevice:
             result = await asyncio.wait_for(self.voice_tx.write_value_with_result_and_option_async(
                 writer.detach_buffer(), self.voice_write_option), 3)
             if int(result.status) != 0:
-                raise PipeError("voice_write_failed")
+                error = PipeError("voice_write_failed")
+                error.gatt_status = int(result.status)
+                try:
+                    if result.protocol_error is not None:
+                        error.protocol_error = int(result.protocol_error)
+                except Exception:
+                    pass
+                raise error
         finally:
             writer.close()
 

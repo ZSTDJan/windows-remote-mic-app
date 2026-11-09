@@ -21,11 +21,13 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from dataclasses import dataclass
 from datetime import date
 from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Optional
+from .logging_setup import log_diagnostic
 
 
 REPOSITORY_OWNER = "ZSTDJan"
@@ -1002,8 +1004,13 @@ def _download_asset(
     timeout: float,
     cancel_event: Any,
     progress_callback: Optional[Callable[[int, int], None]],
+    diagnostic_operation_id=None,
 ) -> None:
     received = part_path.stat().st_size if part_path.exists() else 0
+    started = time.monotonic()
+    log_diagnostic(_LOGGER, 'download_transfer', operation_id=diagnostic_operation_id,
+                   phase='request', offset=received, expected_bytes=asset.size,
+                   timeout_ms=round(timeout * 1000))
     digest = hashlib.sha256()
     if received:
         with part_path.open("rb") as existing:
@@ -1024,6 +1031,9 @@ def _download_asset(
             _response_url(response, asset.download_url), _ALLOWED_NETWORK_HOSTS
         )
         status = _response_status(response)
+        log_diagnostic(_LOGGER, 'download_transfer', operation_id=diagnostic_operation_id,
+                       phase='response', http_status=status, requested_offset=received,
+                       elapsed_ms=round((time.monotonic() - started) * 1000))
         end = asset.size
         if status == 200:
             # Servers may ignore Range. Restart the file rather than append
@@ -1046,6 +1056,8 @@ def _download_asset(
         if progress_callback is not None:
             progress_callback(received, asset.size)
         last_progress = time.monotonic()
+        last_diagnostic = last_progress
+        first_chunk = True
         try:
             mode = "ab" if received else ("wb" if part_path.exists() else "xb")
             with part_path.open(mode) as stream:
@@ -1057,6 +1069,9 @@ def _download_asset(
                         read = getattr(response, "read1", response.read)
                         chunk = read(DOWNLOAD_READ_BYTES)
                     except Exception as exc:
+                        log_diagnostic(_LOGGER, 'download_transfer', operation_id=diagnostic_operation_id,
+                                       phase='read_failed', received_bytes=received,
+                                       elapsed_ms=round((time.monotonic() - started) * 1000), error=exc)
                         raise _translate_open_error(exc) from exc
                     if not chunk:
                         break
@@ -1066,6 +1081,13 @@ def _download_asset(
                     stream.write(chunk)
                     digest.update(chunk)
                     now = time.monotonic()
+                    if first_chunk or now - last_diagnostic >= 5:
+                        log_diagnostic(_LOGGER, 'download_transfer', operation_id=diagnostic_operation_id,
+                                       phase='first_bytes' if first_chunk else 'progress',
+                                       received_bytes=received, expected_bytes=asset.size,
+                                       elapsed_ms=round((now - started) * 1000))
+                        first_chunk = False
+                        last_diagnostic = now
                     if progress_callback is not None and (
                         received == asset.size or now - last_progress >= DOWNLOAD_PROGRESS_INTERVAL_SECONDS
                     ):
@@ -1080,6 +1102,9 @@ def _download_asset(
                 "file_write_failed", "无法保存更新包，请检查磁盘空间或目录权限。"
             ) from exc
     finally:
+        log_diagnostic(_LOGGER, 'download_transfer', operation_id=diagnostic_operation_id,
+                       phase='response_closed', received_bytes=received, expected_bytes=asset.size,
+                       elapsed_ms=round((time.monotonic() - started) * 1000))
         _close_response(response)
     if received != asset.size:
         _raise("incomplete_download", "更新包下载中断，请稍后继续下载。")
@@ -1113,15 +1138,38 @@ def _wait_download_retry(attempt, cancel_event):
     _check_download_cancelled(cancel_event)
 
 
-def _retry_download(operation, cancel_event):
+def _retry_download(operation, cancel_event, *, stage='package', operation_id=None):
+    operation_id = operation_id or uuid.uuid4().hex
     for attempt in range(DOWNLOAD_ATTEMPTS):
-        _check_download_cancelled(cancel_event)
+        started = time.monotonic()
         try:
-            return operation()
+            _check_download_cancelled(cancel_event)
+            log_diagnostic(_LOGGER, 'download_operation', operation_id=operation_id,
+                           phase='attempt_begin', stage=stage, attempt=attempt + 1,
+                           max_attempts=DOWNLOAD_ATTEMPTS)
+            result = operation()
+            log_diagnostic(_LOGGER, 'download_operation', operation_id=operation_id,
+                           phase='attempt_done', stage=stage, attempt=attempt + 1,
+                           elapsed_ms=round((time.monotonic() - started) * 1000))
+            return result
         except ApplicationUpdateError as exc:
-            if exc.code not in _DOWNLOAD_RETRY_CODES or attempt + 1 == DOWNLOAD_ATTEMPTS:
+            retry = exc.code in _DOWNLOAD_RETRY_CODES and attempt + 1 < DOWNLOAD_ATTEMPTS
+            log_diagnostic(_LOGGER, 'download_operation', operation_id=operation_id,
+                           phase='attempt_cancelled' if isinstance(exc, ApplicationUpdateCancelled) else 'attempt_failed',
+                           failure=not retry and not isinstance(exc, ApplicationUpdateCancelled),
+                           stage=stage, attempt=attempt + 1, code=exc.code, retry=retry,
+                           elapsed_ms=round((time.monotonic() - started) * 1000), error=exc)
+            if not retry:
                 raise
-            _wait_download_retry(attempt, cancel_event)
+            log_diagnostic(_LOGGER, 'download_operation', operation_id=operation_id,
+                           phase='retry_wait', stage=stage, attempt=attempt + 1,
+                           delay_ms=(attempt + 1) * 1000)
+            try:
+                _wait_download_retry(attempt, cancel_event)
+            except ApplicationUpdateCancelled:
+                log_diagnostic(_LOGGER, 'download_operation', operation_id=operation_id,
+                               phase='wait_cancelled', stage=stage, attempt=attempt + 1)
+                raise
 
 
 def _prepare_partial_download(part_path, metadata_path, asset, expected_sha256):
@@ -1156,6 +1204,9 @@ def download_update_package(
     cancel_event: Any = None,
     progress_callback: Optional[Callable[[int, int], None]] = None,
 ) -> ApplicationUpdateDownload:
+    operation_id = uuid.uuid4().hex
+    log_diagnostic(_LOGGER, 'download_operation', operation_id=operation_id, phase='begin',
+                   version=release.version.text)
     try:
         kind = (
             package_kind
@@ -1179,7 +1230,7 @@ def download_update_package(
         opener=opener,
         timeout=timeout,
         cancel_event=cancel_event,
-    ), cancel_event)
+    ), cancel_event, stage='manifest', operation_id=operation_id)
     if len(manifest_data) != release.manifest.size:
         _raise("size_mismatch", "SHA256SUMS.txt 大小与发布信息不一致。")
     _verify_bytes_digest(manifest_data, release.manifest.github_sha256)
@@ -1205,6 +1256,8 @@ def download_update_package(
         _remove_partial(metadata_path)
         if progress_callback is not None:
             progress_callback(asset.size, asset.size)
+        log_diagnostic(_LOGGER, 'download_operation', operation_id=operation_id,
+                       phase='verified_existing', received_bytes=asset.size)
         return ApplicationUpdateDownload(release, kind, final_path, True)
 
     try:
@@ -1217,7 +1270,8 @@ def download_update_package(
             timeout=timeout,
             cancel_event=cancel_event,
             progress_callback=progress_callback,
-        ), cancel_event)
+            diagnostic_operation_id=operation_id,
+        ), cancel_event, stage='package', operation_id=operation_id)
         _check_download_cancelled(cancel_event)
         try:
             os.replace(part_path, final_path)
@@ -1235,4 +1289,6 @@ def download_update_package(
             ) from exc
         raise
     _remove_partial(metadata_path)
+    log_diagnostic(_LOGGER, 'download_operation', operation_id=operation_id,
+                   phase='verified_saved', received_bytes=asset.size)
     return ApplicationUpdateDownload(release, kind, final_path, False)

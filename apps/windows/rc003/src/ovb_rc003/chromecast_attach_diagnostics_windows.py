@@ -324,28 +324,12 @@ class BoundedAttachEvidence:
 
 def exception_details(error):
     """Preserve error identity and known Frida distinctions without raw text."""
+    from .diagnostic_errors import error_detail
     text = str(error)[:4096]
-    family = 'unclassified'
-    if 'refused to load frida-agent, or terminated during injection' in text:
-        family = 'agent_load_or_process_exit'
-    elif text.strip().lower() == 'the connection is closed':
-        family = 'connection_closed'
-    elif 'unable to communicate with remote frida-server' in text.lower():
-        family = 'agent_transport'
-    elif 'access is denied' in text.lower() or 'access denied' in text.lower():
-        family = 'access_denied'
-    elif 'timed out' in text.lower() or 'timeout' in text.lower():
-        family = 'timeout'
-    elif 'process not found' in text.lower():
-        family = 'process_missing'
-    result = dict(error_family=family, error_sha256=hashlib.sha256(text.encode('utf-8', errors='replace')).hexdigest(),
-                  error_chars=len(text), error_clipped=int(len(str(error)) > 4096))
-    # Only known native error forms. A PID, address or number elsewhere is NOT a code.
-    match = re.search(r'\b(OpenProcess|CreateRemoteThread|VirtualAllocEx|WriteProcessMemory|LoadLibraryW)\b.*?\b(?:error|code)\s*[=:]\s*(0x[0-9a-fA-F]+|[0-9]+)\b', text)
-    if match:
-        number = int(match[2], 16 if match[2].startswith('0x') else 10)
-        if number <= 0xffffffff:
-            result.update(native_api=match[1], reported_code=number)
+    meaning = error_detail(error)
+    result = {key: value for key, value in meaning.items()
+              if key in ('error_family', 'error_sha256', 'native_api', 'reported_code')}
+    result.update(error_chars=len(text), error_clipped=int(len(str(error)) > 4096))
     return result
 
 

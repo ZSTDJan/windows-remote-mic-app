@@ -6,7 +6,7 @@ interface path, device token, or decoded voice content. The primary guarantee
 comes from code review plus tests/test_privacy_contract.py, which statically
 scans this package's source for sensitive field names and MAC-address-shaped
 literals. As defense in depth, the persistent handler also removes traceback
-text and replaces exception arguments with their exception type; this is not
+text and retains safe error types, native codes and code locations; this is not
 a substitute for keeping sensitive values out of ordinary log messages.
 
 ``log_dir``/``log_file_path``/``hid_helper_log_file_path`` (XRBM-029) expose
@@ -34,6 +34,8 @@ import time
 import hashlib
 import copy
 import weakref
+import json
+import uuid
 from collections import deque
 from dataclasses import dataclass
 from enum import Enum
@@ -41,6 +43,7 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from . import config
+from .diagnostic_errors import exception_snapshot
 
 LOGGER_NAME = "ovb_rc003"
 LOG_FILENAME = "app.log"
@@ -69,8 +72,8 @@ class PrivacySafeExceptionFilter(logging.Filter):
 
     WinRT, Raw Input, PortAudio, Frida, and shell exceptions can embed a
     device interface path or other machine-local identifier in ``str(exc)``
-    and in a formatted traceback. Preserve the exception type for diagnosis,
-    but never persist the raw exception text or traceback.
+    and in a formatted traceback. Preserve bounded safe meanings for diagnosis,
+    but never persist raw exception text, traceback text or frame locals.
     """
 
     @staticmethod
@@ -80,6 +83,12 @@ class PrivacySafeExceptionFilter(logging.Filter):
         return value
 
     def filter(self, record: logging.LogRecord) -> bool:
+        error = (record.exc_info[1] if isinstance(record.exc_info, tuple)
+                 and len(record.exc_info) > 1 else None)
+        if error is None:
+            values = record.args.values() if isinstance(record.args, dict) else record.args
+            if isinstance(values, (tuple, list)) or isinstance(record.args, dict):
+                error = next((v for v in values if isinstance(v, BaseException)), None)
         if isinstance(record.args, tuple):
             record.args = tuple(self._safe_argument(value) for value in record.args)
         elif isinstance(record.args, dict):
@@ -89,7 +98,54 @@ class PrivacySafeExceptionFilter(logging.Filter):
         if record.exc_info is not None:
             record.exc_info = None
             record.exc_text = None
+        if error is not None and not hasattr(record, '_diagnostic_error'):
+            try:
+                snapshot = exception_snapshot(error)
+                record._diagnostic_error = snapshot
+                record.msg = record.getMessage() + ' error=' + json.dumps(snapshot, separators=(',', ':'))
+                record.args = ()
+            except Exception:
+                record.msg = record.getMessage() + ' error_type=' + type(error).__name__
+                record.args = ()
         return True
+
+
+_EVENT_MARKER = re.compile(r'[A-Za-z0-9_.:=+-]{1,160}\Z')
+_EVENT_RESERVED = frozenset({'event', 'session_id', 'wall_time', 'monotonic_ms', 'pid',
+                             'thread_id', 'archive_session_id', 'message'})
+
+
+def log_diagnostic(logger, event, *, operation_id=None, failure=False, error=None, **fields):
+    """Publish fixed metadata through the existing async writer, even with trace off.
+
+    Callers supply code markers/opaque references, never arbitrary user values.
+    No logging error is allowed to change the operation being observed.
+    """
+    try:
+        if not isinstance(event, str) or not _EVENT_MARKER.fullmatch(event):
+            return
+        payload = {'event': event}
+        if operation_id and isinstance(operation_id, str) and _EVENT_MARKER.fullmatch(operation_id):
+            payload['operation_id'] = operation_id
+        for key, value in list(fields.items())[:28]:
+            if key in _EVENT_RESERVED or not _EVENT_MARKER.fullmatch(key):
+                continue
+            if value is None or type(value) in (bool, int):
+                payload[key] = value
+            elif isinstance(value, float) and value == value and abs(value) < 1e12:
+                payload[key] = round(value, 3)
+            elif isinstance(value, str):
+                payload[key] = value if _EVENT_MARKER.fullmatch(value) else 'redacted'
+        if error is not None:
+            payload.update(exception_snapshot(error))
+        extra = {'diagnostic_event': payload}
+        if failure:
+            extra['failure_key'] = event
+            extra['failure_id'] = (operation_id or uuid.uuid4().hex) + ':' + event
+        logger.log(logging.WARNING if failure else logging.INFO,
+                   'Diagnostic: %s', json.dumps(payload, separators=(',', ':')), extra=extra)
+    except Exception:
+        pass
 
 
 def prune_legacy_log_backups(path: Path, backup_count: int) -> None:
@@ -128,7 +184,10 @@ class EvidenceFileHandler(RotatingFileHandler):
         self._pending_condition = threading.Condition()
         self._stopping = False
         self._dropped = 0
+        self._dropped_total = 0
+        self._queue_peak = 0
         self._write_failed = False
+        self._write_failure_reported = False
         if asynchronous:
             self._worker = threading.Thread(target=self._write_loop,
                                             name="remote-mic-application-log", daemon=True)
@@ -164,6 +223,8 @@ class EvidenceFileHandler(RotatingFileHandler):
             self._submit_evidence(record)
             if len(self._pending) >= LOG_QUEUE_SIZE:
                 self._dropped += 1
+                self._dropped_total += 1
+                self._write_failed = True
                 if record.levelno >= logging.ERROR or getattr(record, "failure_key", ""):
                     for index, old in enumerate(self._pending):
                         if (isinstance(old, logging.LogRecord) and old.levelno < logging.ERROR
@@ -175,6 +236,7 @@ class EvidenceFileHandler(RotatingFileHandler):
                 else:
                     return
             self._pending.append(record)
+            self._queue_peak = max(self._queue_peak, len(self._pending))
             self._pending_condition.notify()
 
     def _emit_record(self, record):
@@ -202,12 +264,24 @@ class EvidenceFileHandler(RotatingFileHandler):
             failure_id = getattr(record, "failure_id", "")
             if failure_id:
                 evidence["failure_id"] = str(failure_id)[:128]
+            structured = getattr(record, 'diagnostic_event', None)
+            if isinstance(structured, dict):
+                evidence.update(structured)
+                # The structured copy is authoritative. Do not duplicate its
+                # JSON in the message and crowd out native failure metadata.
+                evidence['message'] = str(structured.get('event', 'diagnostic'))
+                evidence['message_truncated'] = False
+            snapshot = getattr(record, '_diagnostic_error', None)
+            if snapshot is not None:
+                evidence['error_detail'] = snapshot
+                evidence['message'] = message.split(' error=', 1)[0][:1024]
             writer.submit(evidence)
         except Exception:
             pass
 
     def handleError(self, record):
         self._write_failed = True
+        self._report_write_failure()
         self._retry_after = time.monotonic() + LOG_RETRY_SECONDS
         if not self._asynchronous:
             super().handleError(record)
@@ -220,7 +294,17 @@ class EvidenceFileHandler(RotatingFileHandler):
         except Exception:
             # A transient file/formatting failure must not kill the queue owner.
             self._write_failed = True
+            self._report_write_failure()
             self._retry_after = time.monotonic() + LOG_RETRY_SECONDS
+
+    def _report_write_failure(self):
+        if self._write_failure_reported:
+            return
+        self._write_failure_reported = True
+        writer = getattr(self, '_report_writer', None)
+        if writer is not None:
+            writer.submit(dict(event='application_log_write_failed', wall_time=time.time(),
+                               session_id=writer.session_id, failure_key='application_log_write_failed'))
 
     def _write_loop(self):
         try:
@@ -235,6 +319,7 @@ class EvidenceFileHandler(RotatingFileHandler):
                     overflow = logging.LogRecord(LOGGER_NAME, logging.WARNING, __file__, 0,
                         "application log queue overflow: dropped=%s", (dropped,), None)
                     overflow.failure_key = "application_log_queue_overflow"
+                    overflow.diagnostic_event = dict(event='application_log_loss', dropped=dropped)
                     self._submit_evidence(overflow)
                     self._write_record_safely(overflow)
                 if isinstance(item, threading.Event):
@@ -309,6 +394,15 @@ def flush_application_logs(directory: Path) -> bool:
     with _async_handlers_lock:
         handlers = [h for h in _async_handlers if Path(h.baseFilename).parent == directory]
     return all([handler.flush_pending() for handler in handlers])
+
+
+def application_log_health(directory: Path) -> dict:
+    with _async_handlers_lock:
+        handlers = [h for h in _async_handlers if Path(h.baseFilename).parent == directory.resolve()]
+    return {'state': 'active' if handlers else 'not_active_in_exporting_process',
+            'dropped': sum(h._dropped_total for h in handlers),
+            'queue_peak': max((h._queue_peak for h in handlers), default=0),
+            'write_failed': any(h._write_failed for h in handlers)}
 
 
 def get_logger(root: Optional[Path] = None) -> logging.Logger:

@@ -3216,7 +3216,7 @@ class RealWindowsCiEvidenceContractTests(unittest.TestCase):
 
     def test_windows_requirement_and_unsigned_limit(self):
         guide = _README_PATH.read_text(encoding="utf-8")
-        self.assertIn("64 位 Windows 10 1809", guide)
+        self.assertIn("x64 Windows 10 1809", guide)
         self.assertIn("未签名", guide)
         self.assertIn("受管理的公司电脑", guide)
         self.assertNotIn("已通过真实硬件验收", guide)

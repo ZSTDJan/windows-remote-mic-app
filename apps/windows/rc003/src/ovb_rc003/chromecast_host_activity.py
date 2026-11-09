@@ -7,6 +7,7 @@ from ctypes import wintypes
 from dataclasses import dataclass
 
 from . import voice_playback_session_windows as audio, voice_program_manager
+from .diagnostic_errors import error_detail
 
 # Shared startup cadence. A time limit and a count limit both fence the burst.
 STARTUP_POLL_SECONDS = .05
@@ -135,11 +136,32 @@ class CaptureWatch:
         self.next_poll = 0.0
         self.ended = False
         self.status = "waiting"
+        self.observation = dict(query_complete=False, active_count=-1, candidate_count=-1,
+                                bound_present=False, replacement_same_process=0,
+                                replacement_same_endpoint=0)
+
+    def _observe_active(self, active):
+        self.observation = dict(query_complete=True, active_count=len(active),
+                                candidate_count=len(active - (self.baseline or set())),
+                                bound_present=self.identity in active,
+                                replacement_same_process=0, replacement_same_endpoint=0)
+        if isinstance(self.identity, tuple) and len(self.identity) >= 3:
+            others = {s for s in active - {self.identity} if isinstance(s, tuple) and len(s) >= 3}
+            self.observation['replacement_same_process'] = sum(s[2] == self.identity[2] for s in others)
+            self.observation['replacement_same_endpoint'] = sum(s[0] == self.identity[0] for s in others)
+
+    def _observe_error(self, error):
+        detail = error_detail(error)
+        self.observation = dict(query_complete=False, query_error_type=detail['error_type'],
+                                query_error_family=detail['error_family'],
+                                query_native_code=detail.get('hresult', detail.get('winerror', -1)))
 
     def begin(self):
         try:
             self.baseline = {s.identity for s in self.reader() if s.state == 1}
-        except Exception:
+            self._observe_active(self.baseline)
+        except Exception as error:
+            self._observe_error(error)
             self.status = "unavailable"
 
     def poll(self, now):
@@ -157,10 +179,12 @@ class CaptureWatch:
         self.next_poll = now + (self.STARTUP_POLL_SECONDS if fast else self.POLL_SECONDS)
         try:
             active = {s.identity for s in self.reader() if s.state == 1}
-        except Exception:
+        except Exception as error:
+            self._observe_error(error)
             self.inactive_since = None
             self.status = "unknown"
             return False
+        self._observe_active(active)
         if self.identity is None:
             candidates = active - self.baseline
             if len(candidates) != 1:
@@ -168,6 +192,7 @@ class CaptureWatch:
                 return False
             self.identity = next(iter(candidates))
             self.next_poll = now + self.POLL_SECONDS
+        self._observe_active(active)
         if self.identity in active:
             self.inactive_since = None
             self.status = "tracking"

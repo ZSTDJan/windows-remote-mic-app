@@ -144,7 +144,9 @@ class Client:
         record = event["record"]
         logger = logging.getLogger("ovb_rc003")
         logger.info("Chromecast evidence run=%s seq=%s record=%s",
-            self.identity.generation[:12], event["seq"], json.dumps(record, separators=(",", ":")))
+            self.identity.generation[:12], event["seq"], json.dumps(record, separators=(",", ":")),
+            extra={'diagnostic_event': dict(event='receiver_evidence',
+                   operation_id=self.identity.generation[:12], record=record)})
         if (record.get("kind") == "voice_cleanup" and record["state"] == "done"
                 and record["outcome"] != "success"):
             # The report keeps the first failure and latest summary independently

@@ -78,6 +78,20 @@ class PlaybackWriteWorker:
         self._failure: Optional[BaseException] = None
         self._started = False
         self._stopping = False
+        self._accepted_frames = self._accepted_samples = 0
+        self._rejected_frames = self._discarded_frames = 0
+        self._written_frames = self._written_samples = self._failed_frames = 0
+        self._queue_peak = 0
+
+    def diagnostic_counts(self):
+        """Read-only counters; a completed write proves only the output API call."""
+        return dict(queued_frames=self._accepted_frames, queued_samples=self._accepted_samples,
+                    rejected_frames=self._rejected_frames, discarded_frames=self._discarded_frames,
+                    written_frames=self._written_frames, written_samples=self._written_samples,
+                    failed_frames=self._failed_frames, queue_peak=self._queue_peak,
+                    pending=self.pending_count, writer_alive=self.is_alive,
+                    writer_failed=self.failure is not None, snapshot_atomic=False,
+                    write_proof='output_api_returned')
 
     @property
     def failure(self) -> Optional[BaseException]:
@@ -109,12 +123,17 @@ class PlaybackWriteWorker:
     def submit(self, samples: Sequence[int]) -> bool:
         with self._state_lock:
             if not self._started or self._stopping or self._failure is not None:
+                self._rejected_frames += 1
                 return False
         item = _QueuedFrame(tuple(samples), time.monotonic())
         try:
             self._queue.put_nowait(item)
+            self._accepted_frames += 1
+            self._accepted_samples += len(item.samples)
+            self._queue_peak = max(self._queue_peak, self._queue.qsize())
             return True
         except queue.Full:
+            self._rejected_frames += 1
             pending, oldest_ms = self._queue_metrics()
             self._record_failure(
                 PlaybackBackpressureError(
@@ -183,10 +202,14 @@ class PlaybackWriteWorker:
                 if not isinstance(item, _QueuedFrame):
                     continue
                 if self.failure is not None:
+                    self._discarded_frames += 1
                     continue
                 try:
                     self._write(item.samples)
+                    self._written_frames += 1
+                    self._written_samples += len(item.samples)
                 except BaseException as exc:  # noqa: BLE001 - fail worker closed
+                    self._failed_frames += 1
                     self._record_failure(exc)
             finally:
                 self._queue.task_done()

@@ -77,6 +77,12 @@ Item {
         && !root.wetypeSelected && !root.sogouSelected && !root.doubaoSelected
         && !root.chatterflySelected
     readonly property bool voiceHotkeyBusy: SettingsController.voiceHotkeyBusy
+    readonly property bool voiceHoldHotkeyNeedsSetup:
+        SettingsController.activeRemoteKey.length > 0
+        && !SettingsController.isRc003Device
+        && SettingsController.remoteRecordingModeIndex === 0
+        && (root.wetypeSelected || root.doubaoSelected)
+        && SettingsController.holdVoiceHotkeyText.length === 0
     readonly property bool voiceHotkeyRefreshVisible:
         root.sogouSelected || root.wetypeSelected || root.doubaoSelected || root.chatterflySelected
     readonly property bool voiceHotkeyRuntimeBusy:
@@ -710,6 +716,8 @@ Item {
                     titleText: qsTr("语音按键")
                     descriptionText: root.voiceHotkeyCaptureError.length > 0
                         ? root.voiceHotkeyCaptureError
+                        : root.voiceHoldHotkeyNeedsSetup
+                        ? qsTr("请刷新或手动录入")
                         : root.wetypeSelected
                         ? qsTr("刷新时会打开微信设置")
                         : root.doubaoSelected
@@ -731,6 +739,8 @@ Item {
                             : root.voiceHotkeyCaptureError.length > 0
                                 || SettingsController.voiceHotkeySaveState === "retry"
                                 ? qsTr("点击手动录入")
+                                : root.voiceHoldHotkeyNeedsSetup
+                                    ? qsTr("待录入")
                                 : SettingsController.voiceHotkeySource === "manual"
                                     ? qsTr("手动录入")
                                     : SettingsController.voiceHotkeySource === "auto"
@@ -739,6 +749,7 @@ Item {
                         ? tokens.voiceAccent
                         : root.voiceHotkeyCaptureError.length > 0
                             || SettingsController.voiceHotkeySaveState === "retry"
+                            || root.voiceHoldHotkeyNeedsSetup
                             ? tokens.errorColor : tokens.successColor
 
                     editorData: [

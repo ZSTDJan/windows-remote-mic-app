@@ -59,7 +59,9 @@ class PersistentLogPrivacyTests(unittest.TestCase):
         self.assertTrue(logging_setup.PrivacySafeExceptionFilter().filter(record))
         rendered = logging.Formatter("%(message)s").format(record)
 
-        self.assertEqual(rendered, "native operation failed: RuntimeError")
+        self.assertTrue(rendered.startswith("native operation failed: RuntimeError error="))
+        self.assertEqual(record._diagnostic_error['errors'][0]['error_type'], 'RuntimeError')
+        self.assertEqual(record._diagnostic_error['errors'][0]['error_family'], 'unclassified')
         self.assertNotIn("sensitive", rendered)
         self.assertIsNone(record.exc_info)
 

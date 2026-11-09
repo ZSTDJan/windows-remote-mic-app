@@ -240,6 +240,34 @@ class HostTests(unittest.TestCase):
             self.addCleanup(patcher.stop)
         self.host.client = mock.Mock()
 
+    def test_empty_or_invalid_hold_shortcut_does_not_send_the_legacy_right_alt(self):
+        from ovb_rc003 import config, hotkey
+        from ovb_rc003.app import RC003App, _runtime_voice_hotkey_text
+
+        for provider, backend in (("wetype", "wetype_hotkey"), ("doubao_ime", "doubao_hotkey")):
+            for saved in ("", "invalid_key"):
+                with self.subTest(provider=provider, saved=saved):
+                    settings = config.default_config()
+                    settings["voice_program"] = {"provider": provider}
+                    config.set_voice_hotkey_for_provider(settings, provider, saved)
+                    self.owner._config = config._normalize_loaded_config(settings)
+                    self.owner._configured_voice_hotkey_backend.return_value = backend
+                    self.owner._voice_shortcut.hotkey = hotkey.HotkeySpec.parse(
+                        _runtime_voice_hotkey_text(self.owner._config))
+                    self.assertEqual(self.owner._voice_shortcut.hotkey.key, "ralt")
+                    self.owner._voice_audio.open.reset_mock()
+                    self.owner._voice_shortcut.apply.reset_mock()
+                    self.host = RC003App._create_chromecast_voice_host(self.owner)
+                    self.host.client = mock.Mock()
+
+                    self.host._start_host(1)
+
+                    self.host.client.voice_host.assert_called_once_with(1, "failed")
+                    self.owner._voice_audio.open.assert_not_called()
+                    self.owner._voice_shortcut.apply.assert_not_called()
+                    self.owner._logger.warning.assert_called_with(
+                        "Chromecast voice failed: %s", "请先刷新或手动录入按住型语音快捷键。")
+
     def test_delayed_confirmation_preserves_pcm_without_exhausting_writer(self):
         # Hold the real worker while five seconds of small decoder frames arrive.
         # Capacity must cover samples, not depend on the worker winning a race.

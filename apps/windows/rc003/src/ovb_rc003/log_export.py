@@ -136,6 +136,26 @@ def export_logs(destination: Path, *, root: Path | None = None,
                         exported_at=datetime.now().astimezone().isoformat(),
                         snapshot='bounded_live_files_not_atomic', files=records,
                         includes_configuration=False, includes_recordings=False)
+        manifest['diagnostic_coverage'] = diagnostic_trace.diagnostic_coverage(directory)
+        manifest['diagnostic_coverage']['basic'] = logging_setup.application_log_health(directory)
+        # Export can run in a different process, or after the service exited.
+        # Do not treat absent live handlers as evidence of loss-free collection.
+        persisted_health = None
+        for name, content in captured:
+            if name == diagnostic_trace.REPORT_FILENAME:
+                try:
+                    report = json.loads(content)
+                    value = report.get('coverage_losses') if isinstance(report, dict) else None
+                    if isinstance(value, dict):
+                        persisted_health = {k: v for k, v in value.items()
+                                            if k in {'basic_dropped', 'report_dropped', 'trace_dropped',
+                                                     'basic_write_failed', 'trace_write_failed'}
+                                            and type(v) in (int, bool) and 0 <= v <= 0x7fffffff}
+                except (ValueError, UnicodeError):
+                    pass
+        manifest['diagnostic_coverage']['retained_report_losses'] = persisted_health
+        if persisted_health and any(persisted_health.values()):
+            incomplete = manifest['incomplete'] = True
         with tempfile.NamedTemporaryFile(prefix='.remote-mic-logs-', suffix='.tmp',
                                          dir=destination.parent, delete=False) as output:
             temporary = Path(output.name)

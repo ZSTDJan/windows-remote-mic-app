@@ -19,16 +19,16 @@
 
 ## 下载与版本
 
-**[下载正式版 1.0.103](https://github.com/ZSTDJan/windows-remote-mic-app/releases/download/v1.0.103/RemoteMicRC003-1.0.103-portable-unsigned.zip)** · [版本说明](https://github.com/ZSTDJan/windows-remote-mic-app/releases/tag/v1.0.103) · [SHA256SUMS.txt](https://github.com/ZSTDJan/windows-remote-mic-app/releases/download/v1.0.103/SHA256SUMS.txt)
+**[下载正式版 1.0.104](https://github.com/ZSTDJan/windows-remote-mic-app/releases/download/v1.0.104/RemoteMicRC003-1.0.104-portable-unsigned.zip)** · [版本说明](https://github.com/ZSTDJan/windows-remote-mic-app/releases/tag/v1.0.104) · [SHA256SUMS.txt](https://github.com/ZSTDJan/windows-remote-mic-app/releases/download/v1.0.104/SHA256SUMS.txt)
 
-当前正式版为 **1.0.103**，本版主要变化：
+当前正式版为 **1.0.104**。
 
-- 新增“输入文字”和“打开程序”按键动作，单击、双击、长按可分别设置。
-- 修复谷歌遥控器连续语音时，上一句结束后紧接着按下一句可能不生效的问题；改善按键接收中断后的自动恢复。
-- 改善谷歌遥控器在部分蓝牙驱动下的兼容性，增加豆包输入法 1.0.0.23 适配。
-- 补充设备读取失败的错误日志，并在选择豆包时显示更新提醒。
+- 补充谷歌 Chromecast A 款对 Windows 蓝牙组件 10.0.17763.7671 的识别。
+- 更换蓝牙适配器后，同一谷歌遥控器有多条配对记录时，使用与当前适配器唯一匹配的记录（#28）。
+- 适配微信输入法 3.0.2.36 的谷歌开关型自动结束。谷歌按住型缺少所需语音快捷键时会提示录入。
+- 完善日志，便于定位遥控器收音、声音输出和输入法响应的问题。
 
-**已知问题：** 部分电脑的连接失败、断联、设备列表缺失及首次语音异常仍未全部解决。
+Win10 #28 的原机恢复、微信 .36 的实体遥控器语音和睡眠唤醒恢复仍待实测。部分电脑的连接、设备识别和首次语音异常仍在排查。
 
 旧版可在 [历史版本](https://github.com/ZSTDJan/windows-remote-mic-app/releases) 中下载。
 
@@ -45,7 +45,7 @@
 
 ## 第一次使用
 
-- **系统兼容性：** 开发环境为 Windows 11 23H2。较早 Windows 版本的兼容性尚未全面验证。
+- **最低系统要求为 x64 Windows 10 1809 或更新版本。** 软件主要在 Windows 11 上验证。Windows 10 的蓝牙兼容性仍在验证，部分谷歌遥控器与蓝牙驱动组合可能出现服务启动失败、按键无响应或断线。
 - **首次配置前，请先暂时退出 360 等杀毒软件；配置和测试完成后及时恢复防护。**
 - **误报与隔离：** 部分杀毒软件可能误报或隔离无线麦及相关组件，导致启动、按键或语音异常。请先核实来自本仓库，并核对下载页的 SHA-256。
 - **信任与白名单：** 确认为误报后，在杀毒软件中恢复相关文件，将无线麦程序或其专用安装／解压目录加入信任或白名单；范围仅限无线麦，保留其它防护。

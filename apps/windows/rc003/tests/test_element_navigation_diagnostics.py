@@ -39,6 +39,22 @@ def load_host_nodes(namespace, *names):
 
 
 class NavigationDiagnosticsTests(unittest.TestCase):
+    def test_filter_details_are_bounded_but_summary_and_first_error_remain(self):
+        rows = []
+        diagnostics = host._NavigationDiagnostics(lambda event, **fields: rows.append(dict(event=event, **fields)))
+        collection = diagnostics.collection(42)
+        for i in range(60):
+            collection.record('reason_' + str(i), 'ButtonControl')
+        collection.error(OSError(5, 'not exported'))
+        collection.emit()
+        details = [r for r in rows if r['event'] == 'element_navigation_collection_filter']
+        summary = next(r for r in rows if r['event'] == 'element_navigation_collection_filter_summary')
+        self.assertEqual(len(details), collection.MAX_FILTER_ROWS)
+        self.assertEqual(sum(r['count'] for r in details) + summary['omitted_count'], 60)
+        self.assertEqual(summary['omitted_groups'], 60 - collection.MAX_FILTER_ROWS)
+        self.assertTrue(any(r['event'] == 'element_navigation_target_read_error' for r in rows))
+        self.assertNotIn('not exported', json.dumps(rows))
+
     def setUp(self):
         self.records = []
         self.diagnostics = host._NavigationDiagnostics(

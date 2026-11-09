@@ -10,9 +10,11 @@ import hashlib
 import queue
 import threading
 import time
+import uuid
 from dataclasses import dataclass
 from typing import Callable
 from .voice_audio_session import VoiceAudioSession
+from .logging_setup import log_diagnostic
 from .voice_shortcut_session import (
     VoiceShortcutSession, _VOICE_HOTKEY_BACKEND_MARKED, _VOICE_HOTKEY_BACKEND_CHATTERFLY,
 )
@@ -106,6 +108,22 @@ class VoiceHost:
         self._doubao_finish_attempted = False
         self._settings_claimed = False
         self._cancelled_attempts = set()
+        self._diagnostic_operation_id = None
+        self._diagnostic_counts = dict(received_frames=0, received_bytes=0, decoded_samples=0,
+                                       ignored_frames=0, startup_discarded_samples=0)
+        self._diagnostic_ignored_events = set()
+        self._diagnostic_last_audio = 0.0
+        self._capture_observation_signature = None
+
+    def _observe(self, phase, *, failure=False, **fields):
+        log_diagnostic(self.services.logger, 'voice_operation',
+                       operation_id=getattr(self, '_diagnostic_operation_id', None),
+                       failure=failure, phase=phase, attempt=self.attempt, provider=self.provider,
+                       state=self.state, confirmed=self.confirmed, closed=self.closed,
+                       last_audio_age_ms=round((time.monotonic() - self._diagnostic_last_audio) * 1000)
+                       if self._diagnostic_last_audio else -1,
+                       buffered_samples=self.pending_samples, output_buffer_samples=len(self._output_pcm),
+                       **getattr(self, '_diagnostic_counts', {}), **fields)
 
     def start(self, client):
         with self._input_lock:
@@ -228,6 +246,19 @@ class VoiceHost:
             trigger = str(
                 services.settings().get("remote_recording_mode", "hold")
             ).strip().lower()
+        generation = getattr(getattr(self.client, 'identity', None), 'generation', '')
+        run = generation[:12] if isinstance(generation, str) else ''
+        self._diagnostic_operation_id = f'{run or uuid.uuid4().hex}:voice:{attempt}'
+        self._diagnostic_counts = dict(received_frames=0, received_bytes=0, decoded_samples=0,
+                                       ignored_frames=0, startup_discarded_samples=0)
+        self._diagnostic_ignored_events.clear()
+        self._diagnostic_last_audio = 0.0
+        self._capture_observation_signature = None
+        observe_audio = getattr(services.audio, 'begin_observation', None)
+        if callable(observe_audio):
+            observe_audio(self._diagnostic_operation_id)
+        self._observe('start', run=run or 'unknown', mode=trigger,
+                      backend=services.configured_backend(), startup_budget_ms=9000)
         # The running service also owns the mapping page's detection request.
         # Claim before output/hotkey preparation; suppress this whole attempt.
         if key_detection_bridge.publish_next_button(services.config_root, "mic"):
@@ -278,6 +309,9 @@ class VoiceHost:
                 return
             if config.voice_hotkey_trigger_for_settings(services.settings()) == "toggle":
                 self._start_toggle(input_epoch)
+                return
+            if not config.voice_hotkey_for_provider(services.settings(), self.provider):
+                self._fail_voice("请先刷新或手动录入按住型语音快捷键。")
                 return
             tokens = tuple(services.shortcut.hotkey.modifiers) + (services.shortcut.hotkey.key,)
             backend = services.configured_backend()
@@ -663,6 +697,7 @@ class VoiceHost:
         # its watcher. No other stop reason or cleanup retry may submit the host.
         finish_deadline = ((time.monotonic() if received_at is None else received_at)
                            + chromecast_wetype_finish.STOP_WINDOW_SECONDS)
+        self._observe('stop_begin', reason=reason or 'cleanup')
         finish_wetype = (
             reason in ("device_ended", "time_limit") and self.provider == "wetype"
             and self._toggle is not None and not self._toggle_stop_sent
@@ -828,6 +863,8 @@ class VoiceHost:
         if (released or self.provider != voice_program_manager.VOICE_PROGRAM_CHATTERFLY
                 or not services.shortcut.chatterfly_control.completion_pending):
             self.reply("released" if released else "release_failed")
+        self._observe('stop_done', reason=reason or 'cleanup', released=released,
+                      failure=not released)
         return released
 
     def _handle(self, event):
@@ -839,6 +876,12 @@ class VoiceHost:
             self._start_host(attempt, event.get("_input_epoch"))
             return
         if attempt != self.attempt:
+            key = (attempt, kind)
+            if key not in self._diagnostic_ignored_events and len(self._diagnostic_ignored_events) < 16:
+                self._diagnostic_ignored_events.add(key)
+                log_diagnostic(self.services.logger, 'voice_event_ignored',
+                               operation_id=getattr(self, '_diagnostic_operation_id', None),
+                               attempt=attempt, current_attempt=self.attempt, reason='stale_attempt', kind=kind)
             return
         if kind == "host_stop":
             with self._input_lock:
@@ -848,6 +891,8 @@ class VoiceHost:
             self._stop_host(event.get("data", ""), event.get("_received_at"))
         elif kind == "state":
             self.services.logger.info("Chromecast recording attempt=%s state=%s", attempt, event["data"])
+            self._observe('receiver_state', receiver_state=event['data'],
+                          failure=event['data'] == 'blocked')
             if event["data"] == "idle" and self.closed:
                 self.state = "idle"
                 self.decoder = None
@@ -859,17 +904,26 @@ class VoiceHost:
                 return
             self.decoder.handle_control(bytes.fromhex(event["data"]))
         elif kind == "audio" and self.decoder and self.decoder.mic_open and self.state in ("starting", "recording"):
+            counters = self._diagnostic_counts
+            counters['received_frames'] += 1
+            counters['received_bytes'] += len(event['data']) // 2
+            self._diagnostic_last_audio = time.monotonic()
             if self._attempt_cancelled(attempt):
+                counters['ignored_frames'] += 1
                 return
             samples = self.decoder.handle_audio(bytes.fromhex(event["data"]))
+            counters['decoded_samples'] += len(samples) if samples is not None else 0
             if not samples:
                 return
+            if counters['received_frames'] == 1:
+                self._observe('first_decoded_audio')
             if self.confirmed:
                 self._output(samples)
             elif self.pending_samples + len(samples) <= _MAX_STARTUP_SAMPLES:
                 self.pending_pcm.append(samples)
                 self.pending_samples += len(samples)
             else:
+                counters['startup_discarded_samples'] += len(samples)
                 self.reply("failed")
                 self._stop_host()
 
@@ -961,6 +1015,20 @@ class VoiceHost:
         if self.engaged and not self.closed and self.capture_watch is not None:
             ended = self.capture_watch.poll(now)
             current = self.capture_watch.status
+            observation = getattr(self.capture_watch, 'observation', {})
+            if not isinstance(observation, dict):
+                observation = {}
+            signature = (current, tuple(sorted(observation.items())))
+            if signature != self._capture_observation_signature:
+                self._capture_observation_signature = signature
+                identity = self.capture_watch.identity
+                log_diagnostic(self.services.logger, 'capture_observation',
+                               operation_id=self._diagnostic_operation_id,
+                               state=current, attempt=self.attempt, provider=self.provider,
+                               bound_ref=hashlib.sha256(repr(identity).encode('utf-8')).hexdigest()[:16]
+                               if identity is not None else 'none',
+                               endpoint_ref=hashlib.sha256(repr(identity[0]).encode('utf-8')).hexdigest()[:16]
+                               if isinstance(identity, tuple) and identity else 'unknown', **observation)
             if self.provider == "wetype" and self._toggle is not None:
                 outcome = self._wetype_finish_binding.poll(
                     self.capture_watch.identity, current, now)
@@ -1084,7 +1152,7 @@ class VoiceHost:
                 if self.state == "stopping" and not self.closed:
                     self._stop_host()
         except Exception:
-            self.services.logger.exception("Chromecast voice processing failed")
+            self.services.logger.exception("Chromecast voice processing failed: attempt=%s", self.attempt)
             self.reply("stop")
         finally:
             self.reply("stop")

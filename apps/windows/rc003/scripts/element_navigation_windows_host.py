@@ -38,6 +38,7 @@ class _NavigationDiagnostics:
         "property_errors", "children_errors", "depth_limited",
         "key_seq", "vk", "scan_code", "flags", "callback_result", "collection_seq",
         "requested", "returned", "last_error", "cause_code", "point_x", "point_y",
+        "filter_groups", "omitted_groups", "omitted_count",
     })
     _FLAGS = frozenset({"active", "scanning", "used_cache", "injected", "retry",
                         "broad_container", "current", "intercepting"})
@@ -139,6 +140,7 @@ class _CollectionDiagnostics:
         "DataItem Document SplitButton Window Pane Header HeaderItem Table TitleBar "
         "Separator SemanticZoom AppBar"
     ).split())
+    MAX_FILTER_ROWS = 16
 
     def __init__(self, diagnostics, sequence: int, enabled: bool, hwnd: int = 0) -> None:
         self.diagnostics, self.sequence, self.enabled = diagnostics, sequence, enabled
@@ -164,9 +166,16 @@ class _CollectionDiagnostics:
             self.first_error = exc
 
     def emit(self) -> None:
-        for (kind, reason), count in self.counts.items():
+        groups = sorted(self.counts.items(), key=lambda row: (-row[1], row[0]))
+        for (kind, reason), count in groups[:self.MAX_FILTER_ROWS]:
             self.diagnostics.emit("collection_filter", collection_seq=self.sequence,
                                   target_hwnd=self.hwnd, control_type=kind, reason=reason, count=count)
+        if len(groups) > self.MAX_FILTER_ROWS:
+            self.diagnostics.emit('collection_filter_summary', collection_seq=self.sequence,
+                                  target_hwnd=self.hwnd, filter_groups=len(groups),
+                                  count=sum(self.counts.values()),
+                                  omitted_groups=len(groups) - self.MAX_FILTER_ROWS,
+                                  omitted_count=sum(count for _, count in groups[self.MAX_FILTER_ROWS:]))
         if self.first_error is not None:
             self.diagnostics.error("target_read_error", self.first_error,
                                    collection_seq=self.sequence, target_hwnd=self.hwnd)

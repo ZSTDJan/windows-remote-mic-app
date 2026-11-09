@@ -73,7 +73,10 @@ class CleanupProgress:
             try:
                 self.logger.info(
                     "shutdown progress: owner=%s run=%s stage=%s state=%s elapsed_ms=%.0f last_completed=%s",
-                    self.owner, self.run, stage, state, elapsed, completed)
+                    self.owner, self.run, stage, state, elapsed, completed,
+                    extra={'diagnostic_event': dict(event='cleanup_progress', operation_id=self.run,
+                           owner=self.owner, stage=stage, state=state, elapsed_ms=round(elapsed),
+                           last_completed=completed)})
             except Exception:
                 pass  # Evidence must not prevent the next cleanup operation.
 
@@ -83,7 +86,10 @@ class CleanupProgress:
             elapsed = (time.monotonic() - started) * 1000
         logger.warning(
             "shutdown progress snapshot: owner=%s run=%s stage=%s state=%s elapsed_ms=%.0f last_completed=%s",
-            self.owner, self.run, stage, state, elapsed, completed)
+            self.owner, self.run, stage, state, elapsed, completed,
+            extra={'diagnostic_event': dict(event='cleanup_snapshot', operation_id=self.run,
+                   owner=self.owner, stage=stage, state=state, elapsed_ms=round(elapsed),
+                   last_completed=completed, native_completion='unknown')})
 
 
 def log_shutdown_threads(logger) -> None:
@@ -213,9 +219,16 @@ class _FaultReport:
         self.incidents: list[dict] = []
         self.last_write = 0.0
         self.dirty = False
+        self.coverage_losses = dict(basic_dropped=0, report_dropped=0, trace_dropped=0,
+                                    basic_write_failed=False, trace_write_failed=False)
         try:
             if self.path.is_file() and self.path.stat().st_size <= REPORT_MAX_BYTES:
                 saved = json.loads(self.path.read_text(encoding="utf-8"))
+                health = saved.get('coverage_losses', {}) if isinstance(saved, dict) else {}
+                for key, default in self.coverage_losses.items():
+                    value = health.get(key) if isinstance(health, dict) else None
+                    if type(value) is type(default) and (isinstance(value, bool) or 0 <= value <= 0x7fffffff):
+                        self.coverage_losses[key] = value
                 if saved.get("schema") in (1, 2) and isinstance(saved.get("incidents"), list):
                     self.incidents = [item for item in saved["incidents"][-3:]
                                       if isinstance(item, dict) and isinstance(item.get("events"), list)
@@ -236,18 +249,41 @@ class _FaultReport:
         return (item.get("success") is False or item.get("verified") is False
                 or bool(item.get("failure_key"))
                 or result.startswith("failed") or result in {"timeout", "host_stop_failed"}
-                or str(item.get("state")) in {"host_start_failed", "host_stop_failed", "output_open_failed"}
+                or str(item.get("state")) in {"host_start_failed", "host_stop_failed", "output_open_failed", "blocked"}
                 or str(item.get("status")) in {"failed", "unhealthy", "selected_device_shared_host"}
                 or str(item.get("event")) in {"hid_hook_failure", "hid_copy_failure"})
 
     def accept(self, item: dict) -> None:
+        for field, amount in (
+                ('basic_dropped', item.get('dropped', 0) if item.get('event') == 'application_log_loss' else 0),
+                ('trace_dropped', item.get('trace_dropped_delta', 0)),
+                ('report_dropped', item.get('queue_dropped_before', 0))):
+            if type(amount) is int and amount > 0:
+                self.coverage_losses[field] = min(0x7fffffff, self.coverage_losses[field] + amount)
+                self.dirty = True
+        for event, field in (('application_log_write_failed', 'basic_write_failed'),
+                             ('trace_write_failed', 'trace_write_failed')):
+            if item.get('event') == event:
+                self.coverage_losses[field] = self.dirty = True
         if len(json.dumps(item, ensure_ascii=True)) > REPORT_EVENT_BYTES:
+            original = item
             item = {key: item[key] for key in ("event", "session_id", "seq", "wall_time",
                     "pid", "thread_id", "success", "verified", "result", "status", "state",
-                    "archive_session_id", "failure_key", "failure_id", "queue_dropped_before") if key in item}
+                    "archive_session_id", "failure_key", "failure_id", "queue_dropped_before",
+                    "operation_id", "reason") if key in item}
             item["report_fields_truncated"] = True
+            for key in ('error_detail', 'errors', 'locations', 'native_text', 'record'):
+                if key in original:
+                    candidate = dict(item, **{key: original[key]})
+                    if len(json.dumps(candidate, ensure_ascii=True)) <= REPORT_EVENT_BYTES:
+                        item = candidate
         # Keep sticky context even when a user waits a long time before reproducing.
-        if item.get("event") in {"session_started", "device_context", "hid_environment",
+        if item.get('event') == 'application_context':
+            old = self.context.get('application_context', {})
+            if old.get('operation_id') != item.get('operation_id'):
+                self.context.clear()
+        if item.get("event") in {"session_started", "device_context", "application_context",
+                "voice_operation", "receiver_context", "download_operation", "hid_environment",
                 "hid_runtime_capabilities", "hid_copy_host_scope", "hid_source_evidence",
                 "hid_raw_input_lookup", "hid_host_lookup",
                 "voice_attempt_context", "voice_edge_confirmation", "voice_hotkey_control"}:
@@ -265,8 +301,11 @@ class _FaultReport:
                       ("event", "provider", "result", "status", "state", "reason")))[:256]
             if item.get("event") == "voice_runtime_state":
                 key = f"voice:{item.get('provider', '')}:{item.get('state', '')}"
+            operation = item.get('operation_id')
             incident = next((i for i in reversed(self.incidents)
-                             if i.get("archive_session_id") == scope and i.get("failure_key") == key
+                             if i.get("archive_session_id") == scope
+                             and (i.get('operation_id') == operation if operation
+                                  else i.get("failure_key") == key)
                              and 0 <= now - i["last_failure_at"] <= REPORT_MERGE_SECONDS), None)
             if incident is None:
                 before = [e for e in self.recent if 0 <= now - e.get("wall_time", 0) <= REPORT_BEFORE_SECONDS]
@@ -277,6 +316,8 @@ class _FaultReport:
                             "before_count": len(before), "dropped_after": 0,
                             "before_limited": len(before) == REPORT_BEFORE_COUNT,
                             "context": dict(self.context), "events": before + [item]}
+                if operation:
+                    incident['operation_id'] = operation
                 self.incidents.append(incident)
                 self.incidents = self.incidents[-3:]
                 trigger = incident
@@ -301,7 +342,7 @@ class _FaultReport:
             return
         payload = {"schema": 2, "updated_at": time.time(), "scope": "existing_logs_and_diagnostic_events",
                    "before_seconds": REPORT_BEFORE_SECONDS, "after_seconds": REPORT_AFTER_SECONDS,
-                   "incidents": self.incidents}
+                   "incidents": self.incidents, "coverage_losses": self.coverage_losses}
         temporary = self.path.with_suffix(".tmp")
         try:
             encoded = json.dumps(payload, ensure_ascii=True, separators=(",", ":")).encode("utf-8")
@@ -472,6 +513,25 @@ def flush_diagnostic_logs(directory):
     return all([trace.flush() for trace in traces])
 
 
+def diagnostic_coverage(directory):
+    """Collection state is distinct from copying existing files successfully."""
+    directory = Path(directory).resolve()
+    with _traces_lock:
+        traces = [item for item in _traces if item.path.parent.resolve() == directory]
+    with _report_writers_lock:
+        writer = _report_writers.get(directory)
+    return {'detailed': {'state': ('enabled' if any(t.enabled for t in traces) else
+                                  'disabled' if traces else 'not_active_in_exporting_process'),
+                         'write_failed': any(t._write_failed for t in traces),
+                         'pending_dropped': sum(t.dropped_count for t in traces)},
+            'fault_report': {'state': ('active' if writer and writer.thread.is_alive() else
+                                      'unavailable' if writer else 'not_active_in_exporting_process'),
+                             'loss_seen': bool(writer and writer.loss_seen)},
+            'history': 'bounded_rotation_and_sampled_incidents',
+            'navigation_filter_details': 'bounded_counts_plus_omission_summary',
+            'native_text': 'not_collected'}
+
+
 def _truthy(value: object) -> bool:
     return str(value).strip().casefold() in {"1", "true", "yes", "on"}
 
@@ -600,6 +660,9 @@ class DiagnosticTrace:
                 self._dropped += 1
                 self._write_failed = True  # A later successful flush cannot restore lost events.
                 return False
+            if self._dropped and report_writer is not None:
+                report_writer.submit(self._event_locked('trace_log_loss',
+                    trace_dropped_delta=self._dropped, failure_key='trace_log_loss'))
             self._dropped = 0
         return True
 
@@ -975,6 +1038,9 @@ class DiagnosticTrace:
                     return False
                 # The marker and barrier share one slot, even in a size-one
                 # queue. Failed enqueue keeps the count for the next flush.
+                if self._dropped and self._report_writer is not None:
+                    self._report_writer.submit(self._event_locked('trace_log_loss',
+                        trace_dropped_delta=self._dropped, failure_key='trace_log_loss'))
                 self._dropped = 0
         return barrier.wait(timeout) and getattr(barrier, "persisted", False)
 
@@ -1038,6 +1104,12 @@ class DiagnosticTrace:
 
         def failed_write():
             self._write_failed = True
+            if not getattr(self, '_write_failure_reported', False):
+                self._write_failure_reported = True
+                writer = self._report_writer
+                if writer is not None:
+                    writer.submit(dict(event='trace_write_failed', wall_time=time.time(),
+                                       session_id=self.session_id, failure_key='trace_write_failed'))
             self._retry_after = time.monotonic() + TRACE_RETRY_SECONDS
             close_stream()
 

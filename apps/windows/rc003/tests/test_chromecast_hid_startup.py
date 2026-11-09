@@ -10,7 +10,7 @@ from unittest import mock
 from ovb_rc003 import chromecast_hid_tap_windows as tap
 from ovb_rc003 import chromecast_hid_worker as worker
 from ovb_rc003.chromecast_channel import Channel, ChannelError, SessionIdentity
-from ovb_rc003.chromecast_observation import Observation, valid_record
+from ovb_rc003.chromecast_observation import HID_CONSTRUCTOR_PROBE_BYTES, Observation, valid_record
 
 
 ENTITY = "a" * 64
@@ -177,12 +177,15 @@ class StartupEvidenceTests(unittest.IsolatedAsyncioTestCase):
         row = instance.poll_startup()[0]
         sender = Channel(SessionIdentity.create(ENTITY), commands=False)
         self.assertLess(len(sender.encode("evidence", record=row)), 2048)
+        constructor = dict(row, step="constructor_layout",
+                           details={"constructor_prefix": "00" * HID_CONSTRUCTOR_PROBE_BYTES})
+        self.assertLess(len(sender.encode("evidence", record=constructor)), 2048)
         for changes in ({"message": "PRIVATE"}, {"step": "PRIVATE"}, {"error_type": "PRIVATE"},
                         {"step": []}, {"native_code": True}, {"host_pid": -2}, {"script_line": 65536},
                         {"reason": "PRIVATE"}, {"details": {"path": "PRIVATE"}},
                         {"details": {"pdb_key": "PRIVATE"}}, {"details": {"constructor_prefix": "zz"}},
                         {"details": {"driver_sha256": "PRIVATE"}}, {"details": {"size": True}},
-                        {"details": {"constructor_prefix": "00"*65}}):
+                        {"details": {"constructor_prefix": "00" * (HID_CONSTRUCTOR_PROBE_BYTES + 1)}}):
             with self.subTest(changes=changes), self.assertRaises(ChannelError):
                 self.assertFalse(valid_record(dict(row, **changes)))
                 sender = Channel(SessionIdentity.create(ENTITY), commands=False)

@@ -23,7 +23,7 @@ import time
 import uuid
 
 from . import remote_layout, remote_selection
-from .chromecast_observation import HID_COUNTS, HID_ERROR_TYPES, valid_record
+from .chromecast_observation import HID_CONSTRUCTOR_PROBE_BYTES, HID_COUNTS, HID_ERROR_TYPES, valid_record
 
 
 MODULE = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "drivers" / "umdf" / "microsoft.bluetooth.profiles.hidovergatt.dll"
@@ -333,10 +333,18 @@ def _constructor_address_offset(code: bytes) -> int:
         "4c894c2420 48894c2408 53 55 56 57 4154 4155 4156 4883ec50 "
         "4d8bf1 410fb7e8 488bf9"
     )
+    # 17763.7671 uses RAX for the initial stack saves. The complete
+    # RDX address store at this+24 ends just beyond the former 64-byte probe.
+    stack_save_variant = bytes.fromhex(
+        "488bc4 4c894820 48894808 55 56 57 4156 4157 4883ec50 "
+        "48c740c8feffffff 48895818 498bf1 410fb7e8 488bf9 "
+        "4533f6 4c897108 4c897110"
+    )
     layouts = (
         (prefix, 24, bytes.fromhex("4533e4 4c896108 4c896110")),
         (prefix, 8, b""),
         (register_variant, 8, b""),
+        (stack_save_variant, 24, b""),
     )
     for verified_prefix, offset, initialize in layouts:
         start = verified_prefix + initialize + bytes.fromhex("488d05")
@@ -366,7 +374,8 @@ def _driver_layout(module: Path = MODULE) -> tuple[int, int]:
             details["machine"] = image.FILE_HEADER.Machine
             if image.FILE_HEADER.Machine != 0x8664:
                 raise TapError("hid_symbol_unavailable", detail="unsupported_architecture")
-        for location, size in ((rva, 1),) + (((constructor, 64),) if constructor is not None else ()):
+        constructor_probe_size = 64
+        for location, size in ((rva, 1),) + (((constructor, constructor_probe_size),) if constructor is not None else ()):
             with _trace_step("callback_range" if size == 1 else "constructor_range") as details:
                 details["callback_rva" if size == 1 else "constructor_rva"] = location
                 executable = [section for section in image.sections if section.Characteristics & 0x20000000
@@ -375,9 +384,13 @@ def _driver_layout(module: Path = MODULE) -> tuple[int, int]:
                 details["executable_sections"] = len(executable)
                 if len(executable) != 1:
                     raise TapError("hid_symbol_unavailable", detail="nonexecutable_rva")
+                if size != 1:
+                    section = executable[0]
+                    backed_end = section.VirtualAddress + min(section.Misc_VirtualSize, section.SizeOfRawData)
+                    constructor_probe_size = min(HID_CONSTRUCTOR_PROBE_BYTES, backed_end - location)
         if constructor is not None:
             with _trace_step("constructor_layout") as details:
-                code = image.get_data(constructor, 64)
+                code = image.get_data(constructor, constructor_probe_size)
                 details["size"] = len(code)
                 details["constructor_prefix"] = code.hex()
                 address_offset = _constructor_address_offset(code)

@@ -20,6 +20,7 @@ _VERIFIED = {
     "7aae1bd693bd1e94fd2da9ccf577c8c92bfa88d87b719df3b9330fa81d19c292": False,  # 2.1.4.6
     "99ee9c3b517275c3be1ac6bc941a70d78ee7bc1139dba1bf9df9275d7de4d1ab": False,  # 2.1.4.10
     "30c235d59ca403c0fdad6c1cae57001d450fc71c5bbcf2e48d59d4d0a82dbffe": True,  # 3.0.0.38
+    "df84ba7a6fe51156360ff739a944b83e090baecfa38b368c65a5616bf75d7898": True,  # 3.0.2.36
 }
 STOP_WINDOW_SECONDS = 1.0
 BIND_WINDOW_SECONDS = 1.0
@@ -28,8 +29,8 @@ BIND_POLL_SECONDS = .25
 # WeTypeVoiceOwnUi. Only VoiceBridge's Flutter window is a finish target;
 # the ordinary settings window shares this class but does not have the mark.
 _VOICE_WINDOW_CLASS = "wetype.flutter.setting"
-# 3.0.0.38 also marks summary windows of this class. Preserve the older
-# builds' selector; require the ordinary VoiceBridge title only for this build.
+# Verified 3.x builds also mark summary windows of this class, so they
+# require the ordinary VoiceBridge title in addition to the class and mark.
 _VOICE_WINDOW_TITLE = "语音输入"
 
 

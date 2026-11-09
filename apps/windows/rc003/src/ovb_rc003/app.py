@@ -54,6 +54,7 @@ import sys
 import threading
 import time
 import uuid
+import hashlib
 from typing import List, Optional, Tuple
 
 from . import __version__
@@ -262,6 +263,10 @@ class RC003App:
         wetype_control_windows.set_diagnostic_trace(self._diagnostic_trace)
         doubao_rpc.set_diagnostic_trace(self._diagnostic_trace)
         element_navigation_runtime.set_diagnostic_trace(self._diagnostic_trace)
+        self._diagnostic_application_id = uuid.uuid4().hex
+        logging_setup.log_diagnostic(self._logger, 'application_context',
+                                     operation_id=self._diagnostic_application_id,
+                                     app_version=__version__, trace_enabled=self._diagnostic_trace.enabled)
         self._record_device_diagnostic_context()
         self._voice_attempt_id: Optional[str] = None
         self._runtime_identity = bridge_runtime_status.current_runtime_identity(
@@ -738,12 +743,22 @@ class RC003App:
             self._runtime_voice_updated_at = time.time()
         self._publish_runtime_status()
         trace = getattr(self, '_diagnostic_trace', None)
+        failed = state in {bridge_runtime_status.VOICE_RUNTIME_HOST_START_FAILED,
+                           bridge_runtime_status.VOICE_RUNTIME_HOST_STOP_FAILED,
+                           bridge_runtime_status.VOICE_RUNTIME_OUTPUT_OPEN_FAILED}
+        if not failed and (previous_state, previous_provider) != (str(state), str(resolved_provider)):
+            logging_setup.log_diagnostic(getattr(self, '_logger', None), 'voice_result',
+                                         operation_id=getattr(self, '_voice_operation_id', None),
+                                         state=str(state), previous_state=previous_state,
+                                         provider=str(resolved_provider))
         if ((previous_state, previous_provider) != (str(state), str(resolved_provider))
-                and state in {bridge_runtime_status.VOICE_RUNTIME_HOST_START_FAILED,
-                              bridge_runtime_status.VOICE_RUNTIME_HOST_STOP_FAILED,
-                              bridge_runtime_status.VOICE_RUNTIME_OUTPUT_OPEN_FAILED}):
+                and failed):
             self._logger.warning("Voice runtime failed: state=%s provider=%s", state, resolved_provider,
-                                 extra={"failure_key": f"voice:{resolved_provider}:{state}"})
+                                 extra={"failure_key": f"voice:{resolved_provider}:{state}",
+                                        'diagnostic_event': dict(event='voice_result',
+                                            operation_id=getattr(self, '_voice_operation_id', None),
+                                            state=str(state), previous_state=previous_state,
+                                            provider=str(resolved_provider))})
         if (state == bridge_runtime_status.VOICE_RUNTIME_HOST_UNCONFIRMED
                 and (previous_state, previous_provider) != (str(state), str(resolved_provider))):
             self._logger.info("Voice runtime unconfirmed: state=%s provider=%s; audio received, host capture unknown",
@@ -3974,6 +3989,7 @@ class RC003App:
     def _apply_pending_voice_settings_if_idle_locked(self) -> None:
         if not self._voice_settings_idle_locked():
             return
+        configuration_changed = self._pending_config is not None
         if self._pending_config is not None:
             self._config = self._pending_config
             self._pending_config = None
@@ -3999,6 +4015,8 @@ class RC003App:
                         "deferred settings mappings applied after active input became idle"
                     )
                     self._diagnostic_trace.emit("voice_configuration_applied", result="recovered")
+        if configuration_changed:
+            self._record_device_diagnostic_context()
 
     def _apply_pending_settings_if_idle(self) -> None:
         with self._voice_shortcut.lock:
@@ -4034,10 +4052,14 @@ class RC003App:
                 self._bindings_mtime_ns = current_bindings_mtime_ns
             return
 
+        trace_was_enabled = self._diagnostic_trace.enabled
         self._diagnostic_trace.set_enabled(
             bool(refreshed_config.get("diagnostic_trace_enabled", False))
         )
-        self._record_device_diagnostic_context()
+        if trace_was_enabled != self._diagnostic_trace.enabled:
+            logging_setup.log_diagnostic(self._logger, 'trace_collection_state',
+                                         operation_id=getattr(self, '_diagnostic_application_id', None),
+                                         enabled=self._diagnostic_trace.enabled)
         with self._voice_shortcut.lock:
             with self._button_mapping_lock:
                 refreshed_settings = (trigger_mode, voice_hotkey.serialize())
@@ -4069,11 +4091,16 @@ class RC003App:
                     self._logger.info(
                         "settings reload deferred until active voice session is idle"
                     )
+                    logging_setup.log_diagnostic(self._logger, 'configuration_state',
+                                                 operation_id=getattr(self, '_voice_operation_id', None),
+                                                 phase='deferred', reason='active_voice_not_idle')
                     self._diagnostic_trace.emit("voice_configuration_deferred",
                         release_pending=self._voice_shortcut.pending_tokens is not None,
                         reason="active_voice_not_idle", **self._diagnostic_trace.current_context())
                 self._config_mtime_ns = current_config_mtime_ns
                 self._bindings_mtime_ns = current_bindings_mtime_ns
+        if self._pending_config is None:
+            self._record_device_diagnostic_context()
         if removed_voice_bindings:
             self._logger.warning(
                 "legacy voice mappings disabled until user reselects actions: %s",
@@ -5355,7 +5382,16 @@ class RC003App:
                 self._apply_pending_voice_settings_if_idle_locked()
 
     def _record_device_diagnostic_context(self) -> None:
+        if getattr(self, '_diagnostic_trace', None) is None:
+            return
         selected = remote_selection.normalize(self._config.get(remote_selection.KEY))
+        active = next((row for row in selected['devices'] if row['key'] == selected['active']), {})
+        program = voice_program_manager.normalize_voice_program_settings(self._config.get('voice_program'))
+        logging_setup.log_diagnostic(self._logger, 'device_context',
+                                     operation_id=getattr(self, '_diagnostic_application_id', None),
+                                     app_version=__version__, selected_ref=selected['active'][:12] or 'none',
+                                     profile=active.get('profile', 'unknown'), provider=program['provider'],
+                                     mode=str(self._config.get('remote_recording_mode', 'hold')))
         self._diagnostic_trace.emit(
             "device_context", app_version=__version__,
             selected_ref=selected["active"][:12],
@@ -5372,6 +5408,30 @@ class RC003App:
     ) -> None:
         if self._voice_attempt_id is not None:
             return
+        self._voice_operation_id = uuid.uuid4().hex
+        audio = getattr(self, '_voice_audio', None)
+        if (audio is not None and remote_selection.active_profile(self._config)
+                != remote_selection.CHROMECAST_PROFILE):
+            audio.begin_observation(self._voice_operation_id)
+        try:
+            backend = effective_backend or self._configured_voice_hotkey_backend()
+            tokens = effective_hotkey_tokens or tuple(
+                (*self._voice_shortcut.hotkey.modifiers, self._voice_shortcut.hotkey.key))
+            mode = str(provider_shortcut_mode or self._voice_shortcut.controller.trigger_mode.value)
+            effective = (backend, tokens, mode, self._config.get('remote_recording_mode', 'hold'),
+                         self._config.get('output_endpoint_name'), self._config.get('output_endpoint_host_api'),
+                         self._config.get('gain_db'))
+            logging_setup.log_diagnostic(self._logger, 'voice_attempt_begin',
+                                         operation_id=self._voice_operation_id,
+                                         application_id=getattr(self, '_diagnostic_application_id', 'unknown'),
+                                         audio_operation_id=getattr(audio, 'operation_id', None),
+                                         backend=backend, shortcut_mode=mode,
+                                         settings_ref=hashlib.sha256(repr(effective).encode('utf-8')).hexdigest()[:16],
+                                         mode=str(self._config.get('remote_recording_mode', 'hold')),
+                                         provider=voice_program_manager.normalize_voice_program_settings(
+                                             self._config.get('voice_program'))['provider'])
+        except Exception:
+            pass
         self._voice_shortcut.ui_confirmation = "unknown"
         self._voice_text_observation = "unknown"
         if not self._diagnostic_trace.enabled:
@@ -5452,6 +5512,14 @@ class RC003App:
     def _finish_voice_diagnostic_attempt(
         self, result: str, **fields: object
     ) -> None:
+        logging_setup.log_diagnostic(getattr(self, '_logger', None), 'voice_attempt_end',
+                                     operation_id=getattr(self, '_voice_operation_id', None),
+                                     result=str(result), **fields)
+        audio = getattr(self, '_voice_audio', None)
+        if audio is not None:
+            observe = getattr(audio, 'observe', None)
+            if callable(observe):
+                observe('attempt_end', result=str(result))
         payload = {
             "host_ui": self._voice_shortcut.ui_confirmation or "unknown",
             "text_state": self._voice_text_observation or "unknown",

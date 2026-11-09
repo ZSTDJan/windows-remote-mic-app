@@ -10,6 +10,8 @@ import time
 from .chromecast_buttons import STOP_REASONS
 from .chromecast_voice import VOICE_OPEN_MAX_ATTEMPTS
 
+HID_CONSTRUCTOR_PROBE_BYTES = 69
+
 COUNTERS = frozenset({"rx_acl", "tx_acl", "other_connection", "preproof_notify",
     "controls", "audio_packets", "audio_bytes", "ordinary", "other_notify",
     "no_handler", "not_available", "accepted_audio", "ignored_audio",
@@ -84,8 +86,8 @@ HID_DETAIL_CHOICES = {
     'sample_phase': {'before', 'after'},
     'sample_outcome': {'finished', 'timeout', 'busy', 'failed'},
     'query_outcome': {'captured', 'partial', 'unavailable', 'failed'},
-    'error_family': {'unclassified', 'agent_load_or_process_exit', 'agent_transport', 'connection_closed', 'access_denied', 'timeout', 'process_missing'},
-    'native_api': {'OpenProcess', 'CreateRemoteThread', 'VirtualAllocEx', 'WriteProcessMemory', 'LoadLibraryW'},
+    'error_family': {'unclassified', 'agent_load_or_process_exit', 'agent_transport', 'connection_closed', 'access_denied', 'timeout', 'process_missing', 'helper_start', 'file_missing', 'module_load', 'cancelled'},
+    'native_api': {'OpenProcess', 'CreateRemoteThread', 'VirtualAllocEx', 'WriteProcessMemory', 'LoadLibraryW', 'LoadLibraryExW', 'GetProcAddress', 'SetNamedSecurityInfoW'},
     'asset_scope': {'candidates_not_proven_loaded_path', 'candidate_file_dacl_only', 'candidate_parent_dacl_only'},
     'asset_location': {'temporary', 'elevated_helper'},
     'detach_reason': {'application-requested', 'process-replaced', 'process-terminated', 'connection-terminated', 'device-lost', 'unknown'},
@@ -110,7 +112,8 @@ def _valid_hid_details(info):
             if not isinstance(value, str) or len(value) > 32 or not re.fullmatch(r'[0-9]+(?:\.[0-9]+){1,3}', value):
                 return False
         elif key == "constructor_prefix":
-            if not isinstance(value, str) or len(value) > 128 or len(value) % 2 or any(c not in "0123456789abcdef" for c in value):
+            if (not isinstance(value, str) or len(value) > 2 * HID_CONSTRUCTOR_PROBE_BYTES
+                    or len(value) % 2 or any(c not in "0123456789abcdef" for c in value)):
                 return False
         elif key == "pdb_key":
             # Public build identifier, never a device GUID or local path.
@@ -145,6 +148,20 @@ def valid_record(row):
     if not isinstance(row, dict):
         return False
     kind = row.get("kind")
+    if kind == 'voice_command':
+        return (set(row) == {'kind', 'elapsed_ms', 'attempt', 'opcode', 'stream', 'state',
+                            'duration_ms', 'error_type', 'error_family', 'native_code',
+                            'status', 'protocol_error'}
+                and _integer(row['elapsed_ms']) and _integer(row['attempt'], 0)
+                and _integer(row['opcode'], 0, 255) and _integer(row['stream'], -1, 128)
+                and all(isinstance(row[k], str) for k in ('state', 'error_type', 'error_family'))
+                and row['state'] in {'begin', 'written', 'failed', 'native_pending',
+                                     'cancel_requested', 'cancel_settled', 'caps_reply_timeout'}
+                and _integer(row['duration_ms']) and row['error_type'] in HID_ERROR_TYPES
+                and row['error_family'] in HID_DETAIL_CHOICES['error_family']
+                and _integer(row['native_code'], -1, 0xffffffff)
+                and _integer(row['status'], -1, 65535)
+                and _integer(row['protocol_error'], -1, 255))
     if kind == "voice_cleanup":
         return (set(row) == {"kind", "elapsed_ms", "attempt", "cycle", "step", "state", "outcome",
                             "duration_ms", "hresult", "status", "handle", "error_type", "previous_failed",
@@ -332,6 +349,13 @@ class Observation:
 
     def voice_link(self, data, attempt):
         row = dict(data, elapsed_ms=max(0, self._ms(self.clock())), attempt=attempt)
+        if valid_record(row):
+            self._send(row)
+        else:
+            self.count('metadata_rejected')
+
+    def voice_command(self, data):
+        row = dict(data, kind='voice_command', elapsed_ms=max(0, self._ms(self.clock())))
         if valid_record(row):
             self._send(row)
         else:

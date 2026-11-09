@@ -6,6 +6,7 @@ import unittest
 from unittest import mock
 
 from ovb_rc003 import chromecast_hid_tap_windows as tap
+from ovb_rc003.chromecast_observation import HID_CONSTRUCTOR_PROBE_BYTES
 
 
 # Constructor starts from Microsoft's matching x64 DLL/PDBs. Only the vtable
@@ -24,6 +25,11 @@ REGISTER_VARIANT_PROLOGUE = bytes.fromhex(
     "4c894c242048894c2408535556574154415541564883ec504d8bf1410fb7e8488bf9"
     "488d05b7060200488901488951084533e44c8961104c896118498b014889"
 )
+# Microsoft PDB D99711ADDEFBD94DD00035FB99AF1FCA1, constructor RVA 0x90B4.
+STACK_SAVE_VARIANT_PROLOGUE = bytes.fromhex(
+    "488bc44c89482048894808555657415641574883ec5048c740c8feffffff48895818"
+    "498bf1410fb7e8488bf94533f64c8971084c897110488d055ea8010048890148895118"
+)
 
 
 class DriverLayoutTests(unittest.TestCase):
@@ -31,6 +37,22 @@ class DriverLayoutTests(unittest.TestCase):
         self.assertEqual(tap._constructor_address_offset(OLD_PROLOGUE), 24)
         self.assertEqual(tap._constructor_address_offset(NEW_PROLOGUE), 8)
         self.assertEqual(tap._constructor_address_offset(REGISTER_VARIANT_PROLOGUE), 8)
+        self.assertEqual(tap._constructor_address_offset(STACK_SAVE_VARIANT_PROLOGUE), 24)
+
+    def test_stack_save_variant_requires_the_complete_address_store(self):
+        required = STACK_SAVE_VARIANT_PROLOGUE
+        self.assertEqual(len(required), HID_CONSTRUCTOR_PROBE_BYTES)
+        for length in range(len(required)):
+            with self.subTest(length=length), self.assertRaises(tap.TapError):
+                tap._constructor_address_offset(required[:length])
+        for index in range(len(required)):
+            if 58 <= index < 62:  # RIP-relative vtable displacement.
+                continue
+            changed = bytearray(required)
+            changed[index] ^= 0x80
+            with self.subTest(index=index), self.assertRaises(tap.TapError):
+                tap._constructor_address_offset(bytes(changed))
+        self.assertEqual(tap._constructor_address_offset(required[:58] + b"\0" * 4 + required[62:]), 24)
 
     def test_user_register_variant_requires_complete_instructions(self):
         required = REGISTER_VARIANT_PROLOGUE[:48]
@@ -86,11 +108,24 @@ class DriverLayoutTests(unittest.TestCase):
 
     def test_unlisted_driver_requires_matching_symbols_and_constructor(self):
         for code, offset in ((OLD_PROLOGUE, 24), (NEW_PROLOGUE, 8),
-                             (REGISTER_VARIANT_PROLOGUE, 8)):
+                             (REGISTER_VARIANT_PROLOGUE, 8), (STACK_SAVE_VARIANT_PROLOGUE, 24)):
             image = self.image(code)
             self.assertEqual(self.resolve(image), ((0x1800, offset), 1))
-            image.get_data.assert_called_once_with(0x1100, 64)
+            image.get_data.assert_called_once_with(0x1100, HID_CONSTRUCTOR_PROBE_BYTES)
             image.close.assert_called_once()
+
+    def test_probe_does_not_read_past_backed_executable_bytes(self):
+        for code, accepted in ((OLD_PROLOGUE, True), (STACK_SAVE_VARIANT_PROLOGUE, False)):
+            with self.subTest(accepted=accepted):
+                image = self.image()
+                image.sections[0].SizeOfRawData = 0x140  # Exactly 64 backed bytes at constructor.
+                image.get_data.side_effect = lambda _rva, length: code[:length]
+                if accepted:
+                    self.assertEqual(self.resolve(image, symbols=(0x1000, 0x1100)), ((0x1000, 24), 1))
+                else:
+                    with self.assertRaisesRegex(tap.TapError, "hid_symbol_unavailable"):
+                        self.resolve(image, symbols=(0x1000, 0x1100))
+                image.get_data.assert_called_once_with(0x1100, 64)
 
     def test_wrong_architecture_nonexecutable_or_out_of_bounds_rvas_fail(self):
         images = [self.image() for _ in range(4)]

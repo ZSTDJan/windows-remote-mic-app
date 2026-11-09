@@ -8,6 +8,7 @@ import asyncio
 from collections import deque
 import time
 from . import config
+from .diagnostic_errors import error_detail
 from .chromecast_voice import (Recording, GET_CAPABILITIES, CAPABILITIES_TIMEOUT, CAPABILITIES_MAX_ATTEMPTS,
                               VOICE_OPEN_RETRY_DELAYS, VOICE_OPEN_MAX_ATTEMPTS, supported_capabilities)
 
@@ -23,6 +24,8 @@ class VoiceReceiver:
                               settings.get("remote_recording_limit_seconds", 120))
         self.queue = deque()
         self.pending = None
+        self._pending_started = 0.0
+        self._pending_reported = False
         self.available = False
         self.stopping = False
         self.pipe_failed = False
@@ -49,6 +52,24 @@ class VoiceReceiver:
         if self.observation:
             self.observation.stage(name)
 
+    def _observe_command(self, value, attempt, state, started, error=None):
+        try:
+            if self.observation is None or not hasattr(self.observation, 'voice_command'):
+                return
+            detail = error_detail(error) if error is not None else {}
+            kind = detail.get('error_type', 'none')
+            from .chromecast_observation import HID_ERROR_TYPES
+            self.observation.voice_command(dict(
+                attempt=attempt, opcode=value[0], stream=value[1] if len(value) > 1 else -1,
+                state=state, duration_ms=max(0, round((time.monotonic() - started) * 1000)),
+                error_type=kind if kind in HID_ERROR_TYPES else 'other',
+                error_family=detail.get('error_family', 'unclassified'),
+                native_code=detail.get('hresult', detail.get('winerror', detail.get('reported_code', -1))) & 0xffffffff
+                if any(k in detail for k in ('hresult', 'winerror', 'reported_code')) else -1,
+                status=detail.get('gatt_status', -1), protocol_error=detail.get('protocol_error', -1)))
+        except Exception:
+            pass
+
     async def _negotiate(self):
         self._caps_waiting = True
         self._caps_requested_at = time.monotonic()
@@ -60,14 +81,20 @@ class VoiceReceiver:
                 if self._caps_event.is_set():
                     break
                 self._stage("voice_caps_request")
+                command = GET_CAPABILITIES
+                started = time.monotonic()
+                self._observe_command(command, 0, 'begin', started)
                 try:
-                    await self.device.write_voice(GET_CAPABILITIES)
-                except Exception:
+                    await self.device.write_voice(command)
+                    self._observe_command(command, 0, 'written', started)
+                except Exception as error:
+                    self._observe_command(command, 0, 'failed', started, error)
                     self._stage("voice_caps_write_failed")
                     raise
                 try:
                     await asyncio.wait_for(self._caps_event.wait(), CAPABILITIES_TIMEOUT)
                 except TimeoutError:
+                    self._observe_command(command, 0, 'caps_reply_timeout', started)
                     self._stage("voice_caps_timeout")
                     if attempt + 1 == CAPABILITIES_MAX_ATTEMPTS:
                         raise
@@ -323,14 +350,23 @@ class VoiceReceiver:
             try:
                 await task
                 success = True
-            except Exception:
+                self._observe_command(effect.value, effect.attempt, 'written', self._pending_started)
+            except Exception as error:
                 success = False
+                self._observe_command(effect.value, effect.attempt, 'failed', self._pending_started, error)
             self.effects(self.gate.command_result(effect, success, time.monotonic()))
+        elif self.pending is not None and not self._pending_reported and time.monotonic() - self._pending_started >= 3:
+            effect, _ = self.pending
+            self._observe_command(effect.value, effect.attempt, 'native_pending', self._pending_started)
+            self._pending_reported = True
         self.effects(self.gate.tick(time.monotonic()))
         if self.pending is None:
             while self.queue:
                 effect = self.queue.popleft()
                 if self.gate.command_submitted(effect):
+                    self._pending_started = time.monotonic()
+                    self._pending_reported = False
+                    self._observe_command(effect.value, effect.attempt, 'begin', self._pending_started)
                     self.pending = effect, asyncio.create_task(self.device.write_voice(effect.value))
                     break
 
@@ -339,6 +375,9 @@ class VoiceReceiver:
         self._startup.clear()
         self._startup_bytes = 0
         if self.pending:
+            effect, _ = self.pending
+            self._observe_command(effect.value, effect.attempt, 'cancel_requested', self._pending_started)
             self.pending[1].cancel()
             await asyncio.gather(self.pending[1], return_exceptions=True)
+            self._observe_command(effect.value, effect.attempt, 'cancel_settled', self._pending_started)
             self.pending = None

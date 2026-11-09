@@ -160,8 +160,14 @@ class LayoutTests(unittest.TestCase):
 
 
 class DeviceDiscoveryTests(unittest.IsolatedAsyncioTestCase):
-    async def test_selected_entity_single_radio_and_hotplug_invalidation(self):
-        target = device.SelectedDevice(ENTITY)
+    @staticmethod
+    def _paired_id(radio_address, peer_address=0xAABBCCDDEEFF):
+        radio = radio_address.to_bytes(6, "big").hex(":")
+        peer = peer_address.to_bytes(6, "big").hex(":")
+        return f"BluetoothLE#BluetoothLE{radio}-{peer}"
+
+    @staticmethod
+    def _discovery(records):
         callbacks = {}
         watcher = SimpleNamespace(stop=mock.Mock())
         for name in ("added", "removed", "stopped", "enumeration_completed"):
@@ -171,21 +177,90 @@ class DeviceDiscoveryTests(unittest.IsolatedAsyncioTestCase):
             callbacks["added"](None, SimpleNamespace(id="radio"))
             callbacks["enumeration_completed"](None, None)
         watcher.start = start
-        opened = SimpleNamespace(device_id="chosen", close=mock.Mock())
-        ble = SimpleNamespace(get_device_selector_from_pairing_state=lambda _: "paired", from_id_async=mock.AsyncMock(return_value=opened))
+        adapter = SimpleNamespace(get_device_selector=lambda: "radio", from_id_async=mock.AsyncMock(
+            return_value=SimpleNamespace(device_id="radio", bluetooth_address=0x102030405060)))
+        ble = SimpleNamespace(get_device_selector_from_pairing_state=lambda _: "paired", from_id_async=mock.AsyncMock(
+            side_effect=lambda endpoint: SimpleNamespace(device_id=endpoint, close=mock.Mock())))
         infos = SimpleNamespace(create_watcher_aqs_filter=lambda _: watcher,
-            find_all_async_aqs_filter_and_additional_properties=mock.AsyncMock(return_value=[SimpleNamespace(id="chosen", name="Chromecast Remote")]))
-        modules = {"winrt.windows.devices.bluetooth": SimpleNamespace(BluetoothAdapter=SimpleNamespace(get_device_selector=lambda: "radio"), BluetoothLEDevice=ble),
+            find_all_async_aqs_filter_and_additional_properties=mock.AsyncMock(return_value=records))
+        modules = {"winrt.windows.devices.bluetooth": SimpleNamespace(BluetoothAdapter=adapter, BluetoothLEDevice=ble),
                    "winrt.windows.devices.enumeration": SimpleNamespace(DeviceInformation=infos)}
+        return modules, adapter, ble, callbacks, watcher
+
+    async def test_selected_entity_single_radio_and_hotplug_invalidation(self):
+        target = device.SelectedDevice(ENTITY)
+        modules, adapter, ble, callbacks, watcher = self._discovery([
+            SimpleNamespace(id="chosen", name="Chromecast Remote")])
         with mock.patch.dict(sys.modules, modules), mock.patch.object(device.remote_selection, "candidate_key", return_value=ENTITY), mock.patch.object(device, "input_handle", return_value=0x29):
             await target.open()
+            opened = target.device
             self.assertFalse(target.changed.is_set())
+            adapter.from_id_async.assert_not_awaited()
             ble.from_id_async.assert_awaited_once_with("chosen")
             callbacks["removed"](None, None)
             self.assertTrue(target.changed.is_set())
             target.close()
         opened.close.assert_called_once()
         watcher.stop.assert_called_once()
+
+    async def test_duplicate_pairing_opens_only_the_endpoint_on_the_watched_radio(self):
+        current = self._paired_id(0x102030405060).upper()
+        stale = self._paired_id(0x112233445566)
+        other = SimpleNamespace(id="other-device", name="Chromecast Remote", entity="b" * 64)
+        for ids in ((stale, current), (current, stale)):
+            with self.subTest(stale_first=ids[0] == stale):
+                target = device.SelectedDevice(ENTITY)
+                records = [SimpleNamespace(id=id_, name="Chromecast Remote", entity=ENTITY) for id_ in ids]
+                modules, adapter, ble, _, watcher = self._discovery([other, *records])
+                with mock.patch.dict(sys.modules, modules), mock.patch.object(
+                    device.remote_selection, "candidate_key", side_effect=lambda item: item.entity
+                ), mock.patch.object(device, "input_handle", return_value=0x29):
+                    try:
+                        await target.open()
+                        adapter.from_id_async.assert_awaited_once_with("radio")
+                        ble.from_id_async.assert_awaited_once_with(current)
+                        opened = target.device
+                    finally:
+                        target.close()
+                opened.close.assert_called_once()
+                watcher.stop.assert_called_once()
+
+    async def test_unverified_duplicate_pairing_never_opens_an_endpoint(self):
+        current = self._paired_id(0x102030405060)
+        stale = self._paired_id(0x112233445566)
+        other_peer = self._paired_id(0x112233445566, 0xAABBCCDDEE00)
+        other_radio = self._paired_id(0x112233445567)
+        for ids, change, reason in (
+            ((current, "opaque"), None, "source_unconfirmed"),
+            ((current, other_peer), None, "source_unconfirmed"),
+            ((stale, other_radio), None, "source_unconfirmed"),
+            ((current, current), None, "source_unconfirmed"),
+            ((current, stale), "different radio", "source_unconfirmed"),
+            ((current, stale), "lookup failed", "source_unconfirmed"),
+            ((current, stale), "hotplug", "radio_ambiguous"),
+        ):
+            with self.subTest(ids=ids, change=change):
+                target = device.SelectedDevice(ENTITY)
+                records = [SimpleNamespace(id=id_, name="Chromecast Remote") for id_ in ids]
+                modules, adapter, ble, callbacks, _ = self._discovery(records)
+                if change == "different radio":
+                    adapter.from_id_async.return_value.device_id = "different radio"
+                elif change == "lookup failed":
+                    adapter.from_id_async.side_effect = OSError("adapter unavailable")
+                elif change == "hotplug":
+                    def remove_radio(_):
+                        callbacks["removed"](None, None)
+                        return adapter.from_id_async.return_value
+                    adapter.from_id_async.side_effect = remove_radio
+                with mock.patch.dict(sys.modules, modules), mock.patch.object(
+                    device.remote_selection, "candidate_key", return_value=ENTITY
+                ), mock.patch.object(device, "input_handle", return_value=0x29):
+                    try:
+                        with self.assertRaisesRegex(pipes.PipeError, reason):
+                            await target.open()
+                        ble.from_id_async.assert_not_awaited()
+                    finally:
+                        target.close()
 
     async def test_multiple_adapters_rejected_before_ble_discovery(self):
         target = device.SelectedDevice(ENTITY)
