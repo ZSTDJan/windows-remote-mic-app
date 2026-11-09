@@ -131,6 +131,16 @@ Windows 客户端的运行、构建和技术说明见 [开发者文档](apps/win
 
 </details>
 
+## 支持项目
+
+无线麦完全免费。如果它对你有帮助，欢迎点亮 GitHub 页面右上角的 Star，谢谢！
+
+也欢迎用微信或支付宝扫描下方二维码自愿赞助，金额随意。
+
+| 微信 | 支付宝 |
+| :---: | :---: |
+| <img src="docs/images/support-wechat.png" alt="微信赞助二维码" width="220"> | <img src="docs/images/support-alipay.png" alt="支付宝赞助二维码" width="220"> |
+
 ## 开源与安全
 
 代码按 [GPL-3.0-only](LICENSE.md) 发布；第三方组件和素材按各自的许可与授权使用，见 [第三方说明](THIRD_PARTY_LICENSES/README.md) 和 [素材授权](ASSET_LICENSES.md)。普通问题与建议见 [参与说明](CONTRIBUTING.md)，安全漏洞请通过 [私密报告入口](SECURITY.md) 提交。

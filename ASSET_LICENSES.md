@@ -80,3 +80,12 @@ do not imply inclusion in, sponsorship of, or endorsement of this project.
 - File: `docs/images/qq-group-89641716.png`
 - Modification: cropped the existing poster to its QR square and white quiet
   zone; every pixel inside the retained rectangle is unchanged
+
+## Homepage support codes
+
+- Files `docs/images/support-wechat.png` and `docs/images/support-alipay.png`
+- Origin from the repository maintainer's supplied payment QR images
+- The center avatars were replaced with payment platform icons. Both edited
+  images were decoded and matched byte-for-byte with the supplied QR data.
+- Use is limited to the repository homepage as requested by the maintainer.
+  Platform marks identify the payment services.
