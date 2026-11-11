@@ -33,6 +33,109 @@ _KNOWN_LAYOUTS = {
     "8a18571ddfa447bd590354ccdf7800b815a098806359ab195d395158f9d07cc5": (0x12FCC, 24),
     "de2b7ff2a61d50473cfe1e00ec012e99bda9361d563249ef93dce59f576e9936": (0x1580C, 8),
     "372c3628e3366c18152199eb8fb554d27bb4f02d1356b1f514f711328df4a8d6": (0x157FC, 8),
+    # Additional exact files verified against matching Microsoft DLLs/PDBs.
+    # Native evidence: tests/fixtures/chromecast_hid_layouts.json (not shipped).
+    "27e8443e8604a87f48301d1920b324876469e6263db01ae71d1d659d52d5a473": (0xCD80, 24),  # 10.0.17763.194
+    "b94ed614f20490bc4d625722d4f7632fb2d173df356aeb411cb10299ceeebeda": (0xCD40, 24),  # 10.0.17763.1007
+    "dda878748055f423b5c76c7e370bffb20112893ccabd0f6fcdce4e075c35f2da": (0xCD40, 24),  # 10.0.17763.1697
+    "0202af88c2720a8cfcbb9cef27390bc83c2d8693910c41a3050c92eda9b0dd89": (0xCD40, 24),  # 10.0.17763.7560
+    "04cefb29306c5ba9ce81f249b1cd520cecf3c56dd9efe586b8748cab69ac3fdb": (0xCD40, 24),  # 10.0.17763.9119
+    "bd21283baeaa3d01058bce30323b4f930bbd061b68366773a29376684b27e62b": (0xF1B8, 24),  # 10.0.19041.746
+    "440a7fec332fa1d4c03070e000c632d1b1a433b13d46434f95606ff8e548848b": (0xF1B8, 24),  # 10.0.19041.1001
+    "aa5b49cc5466384d15268fa41b078da0a8cf6aa916f8b3f235d5c8d67754cd4d": (0xF1B8, 24),  # 10.0.19041.4170
+    "38bc43fddd625df4a35c27d66a937188cd1b161cecf0bd17d30d8323f1feae76": (0xF1B8, 24),  # 10.0.19041.5125
+    "c3ecffe0efcaf9b540d87d9e818c4742a79f6435fbb96ac2a6af937372bf7afe": (0xF378, 24),  # 10.0.19041.7811
+    "c69e3628088f395d8395a51f470d126ca47e3cadcd182aa4d0a308ef967ddae9": (0x135C4, 24),  # 10.0.22000.1696
+    "c7ec5ce4cce5fc2c0e2154355a380091ad0b76ee4d40109ec92035e8df1aa04f": (0x135C4, 24),  # 10.0.22000.2836
+    "be831a14599c2584b4e2a7efb93ba089188f319b436dfd892f23857e65db44bd": (0x135C4, 24),  # 10.0.22406.1000
+    "617b31d23907545226cbdee01f1bb733b7ce690188e75f23841cdf2930ad5ca3": (0x12C48, 24),  # 10.0.22621.1078
+    "a9f89ded60aebb0432c95350703f3ee0488a83fa8a2bc82cd9b4f7ee4606c574": (0x12FCC, 24),  # 10.0.22621.1409
+    "c9db2a4e404bc7fc1a156a79b7b782853a6c83e86a2dfe766c8c785f94c930db": (0x12C48, 24),  # 10.0.22621.1989
+    "cff0c7190575ab1cb76c4397d5370be01d066c38f8e7e67c032940620ecda0cb": (0x12C48, 24),  # 10.0.22621.2280
+    "7bed7dcd7dd825c49324e27abc63c940c34803a74bcc929fb8032b60e0dd535a": (0x12C48, 24),  # 10.0.22621.3209
+    "bcd139ff61e6b60f6cfdc36b19193432fc6d967b5420990a66e36f7c6a893bab": (0x12C48, 24),  # 10.0.22621.3785
+    "ba507ef0822257a2e6de743b4cd158639eece92c1916c3d0a52a3261a3beb5be": (0x1760C, 24),  # 10.0.22621.4034
+    "d4466dd7d02a8c23d9498c51b9e119fa60be8ab9c0977659d29dd306ffdccf0a": (0x12FCC, 24),  # 10.0.22621.4746
+    "b7fa66a37539fc2288b8084dabc2a378c25bf7c972f1ea928803a0ba45d22cdf": (0x12FCC, 24),  # 10.0.22621.5305
+    "75f52295a05414298e5523d194fcd77180aaca9a4c75a4a20c195846464f7ac3": (0x1312C, 24),  # 10.0.22621.5541
+    "9c7e905adaf694859f68db33767ce33231d2e61f7edeb1b7e7a83982f36a7cb5": (0x1312C, 24),  # 10.0.22621.5771
+    "7ceeac8d0a1fabfc92d7e5bb75896862faec6495c4371a95a390a8e1c209a3ef": (0x12FCC, 24),  # 10.0.22621.7622
+    "427f9aba196120da2b4c793be9042128382e2203e105d07cd507f69458f0c87b": (0x12458, 24),  # 10.0.26100.1
+    "a7353a9040a718da4198387a5daaccfcdfeed595e907f3aac927e7039163e1e6": (0x12458, 24),  # 10.0.26100.2
+    "e8ecfa225157d1835029950bde1eeca366a0dee84671b57997c7246d178cce98": (0x12458, 24),  # 10.0.26100.1150
+    "20d0be76a07286bd2e910bfd0a0dad087454618af38d9b946d8611af187b4029": (0x1B138, 24),  # 10.0.26100.3037
+    "40efcf0aa89577cea6999b69b84830f080e029d4487ed1d6a383c2fb387017d7": (0x1B848, 24),  # 10.0.26100.3323
+    "ea98f5babd0d8573e9e9750258dca1ec8b54dc94ff792e59189b3f2a751ac087": (0x1E28C, 24),  # 10.0.26100.3624
+    "0ec88c7bca32f59756bb9c423f2f6f54e5fbc8656728a90290a21eb63a953c77": (0x1E28C, 24),  # 10.0.26100.4061
+    "6cdaf9e8bb90ddf30988736d9a150713d1d94062cce6fa60c19390e65c5b397b": (0x1FA6C, 24),  # 10.0.26100.4202
+    "fdfbed129fd625c07b8bf42f7dfc54af1e5c30becf17806f18348971da56015f": (0x1F9EC, 24),  # 10.0.26100.4484
+    "743736b5abc5530210a4efb520731e74961cdffa5a3cf8d58585b29e9fbe509d": (0x1F97C, 24),  # 10.0.26100.4768
+    "c208b31f1cad14d94d0dd29f6ed6199480a40fe44f2bc39b15ec64f1a769118b": (0x18C5C, 24),  # 10.0.26100.5074
+    "4e5d969af6622c1f13d24a1ce5e3e020041027406562f5b5e4f0d38c3443a1f3": (0x1873C, 24),  # 10.0.26100.6725
+    "4340c3e38e91a4c3fac1e43d0c77365be18ee67b306fe076ba93d69c7fb7d2e8": (0x17D0C, 24),  # 10.0.26100.7019
+    "23ce3be4a7906cb7c806e11881b12a5abfd534dfb0dde554dd674e7aa4438dcf": (0x177FC, 24),  # 10.0.26100.7309
+    "41d2998c7f38e104b0a469404cfb05ddbfe7c0a912b9020f446f005f3f4156d4": (0x178AC, 24),  # 10.0.26100.8115
+    "daefe991172faaade504db81796cc970c731b48cb34baa05886c9e0ef18f1d61": (0x178EC, 24),  # 10.0.26100.8328
+    "8dcc8f8365ddbb5d2ec711c2601968456ccfc7e71c49109098e6339e5bd0ab9d": (0x178EC, 24),  # 10.0.26100.8474
+    "056bcdf18700deceba1f4f9fb9427fd7cb64fca9f49603f089e29e241e6684f8": (0x1622C, 8),  # 10.0.26100.8491
+    "ad74c175268e13c103bb4a6697dbce6a0d2bf3d2e42e861a1ab56cf90f61222b": (0x178EC, 24),  # 10.0.26100.8493
+    "f1e79360ed0f76adbd13d6f13e8c03a15a79fc1c5c93acf888f8183d199164ff": (0x1622C, 8),  # 10.0.26100.8497
+    "9709118ceec764e1b773aa3abbbd5c060d92a78b953374de2bb54de32cde3d38": (0x178EC, 24),  # 10.0.26100.8521
+    "f7fa7b8bd7d6185000fa080bf5381444a323eefd62176ce399b7b290ad22837d": (0x1622C, 8),  # 10.0.26100.8544
+    "f292381e02a6c8a7d4f62498b1dc7a806924dbc57783f739566f4cf8521c9eb2": (0x1622C, 8),  # 10.0.26100.8553
+    "184ee7009b8546dca6db9e4ec1b73dc815dc3ba9036b45cd605a4d8c89ef9285": (0x1580C, 8),  # 10.0.26100.8680
+    "0556829a1a986f0eae303831b1418745631c537f899a820e0b9b4fc24eac9630": (0x1580C, 8),  # 10.0.26100.8687
+    "bbac057106e21f5fbea4197dbf8ec5fb56b1cf315b5a8bf34dbf9b6851acea75": (0x1580C, 8),  # 10.0.26100.8690
+    "198161e0a8c0364df24deb6d51c8f105e8234bc40c8acb76a92dbf464f02b55e": (0x1580C, 8),  # 10.0.26100.8697
+    "e68d7f683648414cd3e4242817636d9789955a87e31c8223265461dd1e785b3e": (0x1580C, 8),  # 10.0.26100.8764
+    "85f99b06b088256d2fb12e5b983dfded07382e7b7a4647bda454ce306b4d6795": (0x1580C, 8),  # 10.0.26100.8772
+    "cca3419676008625b6d34591d1d7b355e6adf0291009466891609c7e21b59690": (0x157FC, 8),  # 10.0.26100.8925
+    "63f57bea9a45f71a0873d74a94acb58758efe43dea3f64403505d0ac20a8517d": (0x157FC, 8),  # 10.0.26100.8935
+    "d628c3a9c6b34e51d79f91c204a787ad6a598f863bf24395e612fbfd3bbe0b87": (0x157FC, 8),  # 10.0.26100.8972
+    "1a3c0a4ed1d01735e2ef4897f82633d175d2f89864c72816c15c02d11ce79087": (0x157FC, 8),  # 10.0.26100.9492
+    "d2987ac89fabc155b53a3bbc6a69f5c090a3b6d855761a441ee7423e807967ca": (0x157FC, 8),  # 10.0.26100.9502
+    "752a7bef81b3dcbb0e80bf183ddbe8eeb9b31df6b86ddba3c3cd21c80ad994d4": (0x157FC, 8),  # 10.0.26100.9539
+    "09648a6511eea778b3b72a149ddbc585422bed55ab35ac19769c6f065bbd61ad": (0x157FC, 8),  # 10.0.26100.9549
+    "6e9e3e939fa31092b54538b10eef3314e06f3b036418ea876abba681ded0a725": (0x1964C, 8),  # 10.0.26100.9568
+    "9939b2ae9e6d51d6467c6a101bea2b1198012540a2292d9baf45c196ca73fbeb": (0x1964C, 8),  # 10.0.26100.9577
+    "4acd0c10707972ef06dbd7b7b564d1662bac02a92b61257e4a9213f6e7d8a359": (0x18DAC, 8),  # 10.0.26100.9587
+    "073f4d8f057fd9fa5c479a0e95a77d04035e07d732e8a1badec3d30048f58fae": (0x18DAC, 8),  # 10.0.26100.9596
+    "ece5e843787c9e4cfcc4d8ccdb9f7333d2f6649bfd901d021b94814c8bc8c537": (0x18DAC, 8),  # 10.0.26100.9739
+    "35532a64bcf8d8126ee5282c92ca4975ee5139ca6cb07535c10a20e3fa423b4a": (0x18DAC, 8),  # 10.0.26100.9750
+    "a654b44ea6833e9f5a54958ff958fcafe3fa5f2a6b97ffc747d58172d3332cc4": (0x18DAC, 8),  # 10.0.26100.9756
+    "433726b642915874d8adc288b006726d15ce484f04c2d3eed56632a83712757a": (0x18DAC, 8),  # 10.0.26100.9767
+    "b9dc053c133e850fd0fbcfa85381c0240306fbe2d789c85f4e0a1d4c47345b78": (0x18DAC, 8),  # 10.0.26100.9807
+    "63633289822aa0157adb32e0ec062bf0f3cb31db25bdfc92eb8e39cea0a5475a": (0x18DAC, 8),  # 10.0.26100.9818
+    "f1b6274eca6941a8fbc66b59734d0e3ed7a330907612785ba651d63b2356aa6d": (0x186AC, 24),  # 10.0.28000.1
+    "69fd00fcdc7164ce3fed849978edf093eac4d88f27a6e53d536debed65aa7035": (0x186AC, 24),  # 10.0.28000.4
+    "706da7971d192bc39f575f4a6e2123112d38c35df0541f3dcc52c7808699b0a2": (0x1819C, 24),  # 10.0.28000.1516
+    "e697c015864c87585265731c398d107d16e6a99a7d458cff80ef6c7041d29d69": (0x1828C, 24),  # 10.0.28000.1873
+    "cf80fe81f0bd89e8bdaed04d000339231461b7ca07fb80f62c4e9b8f3d113929": (0x1828C, 24),  # 10.0.28000.2179
+    "dbb06c96cfd73916672ca9ed11a1f4e63b62aa04c4938b61ce8066d69355ca1c": (0x15FAC, 8),  # 10.0.28000.2298
+    "59d30fa244df9b34659a4466bca2a39b85cce0199cc2c7930b36dde8f1164e00": (0x15FAC, 8),  # 10.0.28000.2302
+    "db56f5663a780aaa9ff2c19f7e17f0c6bfd585530d80179b384c107c32034840": (0x169EC, 8),  # 10.0.28000.2307
+    "e680c946c4c607471ac0fa4abedb16c5221507468e85b15725f64227607401fc": (0x169EC, 8),  # 10.0.28000.2315
+    "44f928ecc724ca4083160f02999116ed5dadd95ad62f622aade435f08d043216": (0x15FAC, 8),  # 10.0.28000.2336
+    "b3800cab8466609a8340380a03d4f89d9e9d2ca1329d4a2982524be16875364f": (0x15FAC, 8),  # 10.0.28000.2380
+    "70b6e770e383822f6ec9256b0bec046bd8017dca1877a6f40a8a8dfe13023a70": (0x15FAC, 8),  # 10.0.28000.2387
+    "9eaeeb448c31c4e284c0909c8456a757305a55361369f1b4081a1f94e62e6d8f": (0x15FAC, 8),  # 10.0.28000.2605
+    "fcac57ab72c460689deeb1541f2f81e83f09ee0875700437b4a5186554336412": (0x15F9C, 8),  # 10.0.28000.2623
+    "bc96f69b461f14ee7228e0b9b75c755da6247afa44adf076c8008781549c7f75": (0x15F9C, 8),  # 10.0.28000.2804
+    "72ce679353267bdbde2bb8ee8c68fabecefd9843739267bf309e82b7cdc27d9a": (0x18F64, 8),  # 10.0.28000.3262
+    "60fba714c161686d9049b4a1eb0a177ecfdfda37d807e412bf06cb54148dc76d": (0x18F64, 8),  # 10.0.28000.3272
+    "cfcd870605ee924f0e897c86c148deb552ed659c371ee5cfdd583817c34cd0f9": (0x18F74, 8),  # 10.0.28000.3292
+    "25114039c6557454b8983e4e967f7106048da5435c1dcffe5621edad3c67b4cc": (0x18F74, 8),  # 10.0.28000.3302
+    "559c6a511c02392278535511ec8efa03aee0ff3404477ba232f6132f9f04b578": (0x18F64, 8),  # 10.0.28000.3351
+    "63b1618589ecc11bf26b3445d6b6632d53c45f06cf8cc29ad78e5b8e48cd60bc": (0x18F64, 8),  # 10.0.28000.3365
+    "74ba8266056d3f04c52185fbb71d27376873767b266d3c7b5de3efe06a14e54f": (0x18F74, 8),  # 10.0.28000.3382
+    "b054e79e0ae2e678a49fac5153f6b4fca791b8ed957987cf5f0da76492e99dc2": (0x18F74, 8),  # 10.0.28000.3393
+    "bacfc3f2191db651227837bad23f82c154014ae08cf2e02cf098f22a52d94667": (0x17134, 24),  # 10.0.29591.1000
+    "6c61c230adc1a8d8005e8ed789fbf05efdf6bf65d2d58e5423d8fe4634f8968e": (0x17134, 24),  # 10.0.29595.1000
+    "79bbf5edce77da933fbc29cbff9a0fccbfc9ae5b988532e71969555e689b418c": (0x17134, 24),  # 10.0.29599.1000
+    "c12aae6dedd729b6ffec416a323754b74425b2d73c3e6a6b30260569dab84dbb": (0x17134, 24),  # 10.0.29610.1000
+    "192c791dd42668c204e23fd39aec91f9f4e51f3487e92b1c5e02bd66eb2921f4": (0x17134, 24),  # 10.0.29613.1000
+    "d424771cb89988f572ab12216d049214409e6909627fc25118adacac18d7b862": (0x17134, 24),  # 10.0.29617.1000
+    "f46dffc77f31f267e8cfd9e73621fe4629c6be5115ab8385de23d60070bb448a": (0x1B6A4, 8),  # 10.0.29704.1000
 }
 _HID_SERVICE = "{00001812-0000-1000-8000-00805f9b34fb}"
 _GOOGLE_HARDWARE = (
@@ -53,7 +156,39 @@ class TapError(RuntimeError):
 
 
 _startup_sink = ContextVar("chromecast_hid_startup_sink", default=None)
+_startup_cancel = ContextVar("chromecast_hid_startup_cancel", default=None)
 _STARTUP_LIMIT = 128
+_PDB_DOWNLOAD_ATTEMPTS = 5
+_PDB_DOWNLOAD_SECONDS = 20
+
+
+def _check_start_cancelled():
+    cancelled = _startup_cancel.get()
+    if cancelled is not None and cancelled.is_set():
+        raise TapError("hid_symbol_unavailable", detail="startup_cancelled")
+
+
+def _download_pdb(arguments, deadline):
+    """Own and reap curl so stopping startup never leaves a downloader running."""
+    _check_start_cancelled()
+    with subprocess.Popen(arguments, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                          creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)) as process:
+        try:
+            while True:
+                _check_start_cancelled()
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise subprocess.TimeoutExpired("curl", _PDB_DOWNLOAD_SECONDS)
+                try:
+                    stdout, stderr = process.communicate(timeout=min(.1, remaining))
+                    _check_start_cancelled()
+                    return subprocess.CompletedProcess(arguments, process.returncode, stdout, stderr)
+                except subprocess.TimeoutExpired:
+                    continue
+        finally:
+            if process.poll() is None:
+                process.kill()
+            process.communicate()
 
 
 def startup_record(step, state, *, started=None, error=None, script_line=-1, host_pid=-1,
@@ -215,18 +350,44 @@ def _ensure_pdb(module: Path) -> Path:
     temporary = target.with_name(f"{name}.{os.getpid()}.{threading.get_ident()}.tmp")
     url = f"https://msdl.microsoft.com/download/symbols/{name}/{index}/{name}"
     curl = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "curl.exe"
+    deadline = time.monotonic() + _PDB_DOWNLOAD_SECONDS
     try:
-        with _trace_step("pdb_download") as details:
-            result = subprocess.run(
-                [str(curl), "--fail", "--location", "--silent", "--show-error", "--max-time", "15",
-                 "--max-filesize", "2097152", "--write-out", "%{http_code}", "--output", str(temporary), url],
-                capture_output=True, timeout=18, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-            )
-            details["return_code"] = result.returncode & 0xffffffff
-            status = result.stdout.strip()
-            details["http_status"] = int(status) if re.fullmatch(rb"[0-9]{3}", status) else -1
-            if result.returncode:
-                raise TapError("hid_symbol_unavailable", detail="download_exit")
+        for attempt in range(1, _PDB_DOWNLOAD_ATTEMPTS + 1):
+            retryable = False
+            try:
+                with _trace_step("pdb_download") as details:
+                    details["download_attempt"] = attempt
+                    _check_start_cancelled()
+                    temporary.unlink(missing_ok=True)
+                    result = _download_pdb(
+                        [str(curl), "--fail", "--location", "--silent", "--show-error", "--max-time", "15",
+                         "--max-filesize", "2097152", "--write-out", "%{http_code}", "--output", str(temporary), url],
+                        deadline,
+                    )
+                    details["return_code"] = result.returncode & 0xffffffff
+                    status = result.stdout.strip()
+                    http = int(status) if re.fullmatch(rb"[0-9]{3}", status) else -1
+                    details["http_status"] = http
+                    if result.returncode == 0:
+                        break
+                    retryable = result.returncode in {5, 6, 7, 18, 28, 35, 52, 55, 56, 92} or (
+                        result.returncode == 22 and (http in {408, 429} or 500 <= http <= 599))
+                    if retryable and attempt < _PDB_DOWNLOAD_ATTEMPTS:
+                        details["retry_scheduled"] = 1
+                    raise TapError("hid_symbol_unavailable", detail="download_exit")
+            except TapError as error:
+                if error.detail != "download_exit" or not retryable or attempt == _PDB_DOWNLOAD_ATTEMPTS:
+                    raise
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired("curl", _PDB_DOWNLOAD_SECONDS)
+            cancelled = _startup_cancel.get()
+            if cancelled is None:
+                time.sleep(min(.2, remaining))
+            else:
+                cancelled.wait(min(.2, remaining))
+            _check_start_cancelled()
+        _check_start_cancelled()
         with _trace_step("download_validate") as details:
             details["size"] = temporary.stat().st_size if temporary.is_file() else -1
             if not 100_000 <= details["size"] <= 2_097_152:
@@ -236,6 +397,7 @@ def _ensure_pdb(module: Path) -> Path:
             if not downloaded[:32].startswith(b"Microsoft C/C++ MSF 7.00"):
                 raise TapError("hid_symbol_unavailable", detail="download_signature")
         with _trace_step("cache_commit"):
+            _check_start_cancelled()
             os.replace(temporary, target)
         return target
     except (OSError, subprocess.TimeoutExpired) as exc:
@@ -673,9 +835,12 @@ class HidTap:
 
     def start(self):
         token = _startup_sink.set(self._startup_record)
+        cancel_token = _startup_cancel.set(self._abort_start)
         try:
+            _check_start_cancelled()
             return self._start()
         finally:
+            _startup_cancel.reset(cancel_token)
             _startup_sink.reset(token)
 
     def _start(self):
@@ -687,6 +852,7 @@ class HidTap:
         with self._step("driver_layout") as details:
             rva, address_offset = _driver_layout()
             details.update(callback_rva=rva, address_offset=address_offset)
+        _check_start_cancelled()
         with self._step("script_prepare"):
             source = (_SCRIPT.replace("__PATH__", json.dumps(str(MODULE).lower().replace("\\", "/")))
                  .replace("__ADDRESS__", json.dumps(list(bytes.fromhex(address)[::-1])))

@@ -255,6 +255,7 @@ async def receive(identity, parent, pipe):
     finally:
         observation.stage("stop")
         if hid_start is not None:
+            hid_tap.abort_start()
             try:
                 await hid_start
             except Exception:

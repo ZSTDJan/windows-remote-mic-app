@@ -92,19 +92,19 @@ class SymbolDiagnosticsTests(unittest.TestCase):
             yield self.root / 'cache' / 'Driver.pdb' / PDB_KEY / 'Driver.pdb'
 
     def download(self, content=PDB_DATA, code=0, status=b'200', error=None):
-        def run(args, **kwargs):
+        def run(args, deadline):
             if error:
                 raise error
             Path(args[args.index('--output')+1]).write_bytes(content)
             return SimpleNamespace(returncode=code, stdout=status, stderr=b'PRIVATE_PROXY_PATH')
-        return mock.patch.object(tap.subprocess, 'run', side_effect=run)
+        return mock.patch.object(tap, '_download_pdb', side_effect=run)
 
     def test_download_and_cache_success_are_distinguishable_and_no_second_download(self):
         with self.cache() as target, self.download() as run, self.observe() as instance:
             self.assertEqual(tap._ensure_pdb(self.module), target)
             rows = self.rows(instance)
             done = {r['step']: r for r in rows if r['state'] == 'success'}
-            self.assertEqual(done['pdb_download']['details'], {'return_code': 0, 'http_status': 200})
+            self.assertEqual(done['pdb_download']['details'], {'return_code': 0, 'http_status': 200, 'download_attempt': 1})
             self.assertEqual(done['cache_lookup']['details']['cache_present'], 0)
             self.assertEqual(target.read_bytes(), PDB_DATA)
             with self.observe() as cached:

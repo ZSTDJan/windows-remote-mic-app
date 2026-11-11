@@ -55,7 +55,7 @@ HID_STARTUP_STEPS = frozenset({"import_frida", "selected_host", "driver_layout",
     "attach_helper_scan", "attach_helper_manager", "attach_helper_service"})
 HID_STARTUP_REASONS = frozenset({"none", "invalid_entity", "registry_read", "no_selected_host",
     "ambiguous_host", "debug_entries", "debug_signature", "pdb_name", "cache_root", "download_exit",
-    "download_size", "download_signature", "symbol_initialize_failed", "symbol_load_failed",
+    "download_size", "download_signature", "startup_cancelled", "symbol_initialize_failed", "symbol_load_failed",
     "symbol_enumerate_failed", "symbol_missing_or_ambiguous", "unsupported_architecture",
     "nonexecutable_rva", "constructor_unrecognized", "module_missing", "module_path_mismatch",
     "hook_exception", "device_open_timeout", "startup_timeout", "ready_timeout", "records_dropped", "records_rejected",
@@ -70,7 +70,7 @@ HID_STARTUP_REASONS = frozenset({"none", "invalid_entity", "registry_read", "no_
     "gadget_host_membership_unreadable", "gadget_rc003_host_conflict"})
 HID_DETAIL_NUMBERS = frozenset({"registry_nodes", "hardware_matches", "selected_matches", "invalid_address",
     "missing_container", "host_candidates", "invalid_pid", "size", "cache_size", "cache_present", "cache_valid",
-    "return_code", "http_status", "callback_matches", "constructor_matches", "callback_rva", "constructor_rva",
+    "return_code", "http_status", "download_attempt", "retry_scheduled", "callback_matches", "constructor_matches", "callback_rva", "constructor_rva",
     "address_offset", "machine", "known_layout", "debug_entries", "executable_sections", "dropped",
     "module_present", "module_path_match", "pointer_size", "loaded_size", "native_result", "native_code",
     "query_ms", "query_complete", "process_handle", "alive", "exit_code", "created_low", "created_high",
