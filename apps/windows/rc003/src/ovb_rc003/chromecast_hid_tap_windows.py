@@ -622,7 +622,7 @@ function report(buffer) {
     if (lengths.has(size)) lengths.set(size, Math.min(2147483647, lengths.get(size) + 1));
     else if (lengths.size < 16) lengths.set(size, 1);
     else count("lengths_overflow");
-    if (size !== 8 && size !== 2) { count("length_rejected"); return null; }
+    if (size !== 8 && size !== 2 && size !== 1) { count("length_rejected"); return null; }
     errorStep = "access";
     const accessOut = Memory.alloc(Process.pointerSize);
     if (method(buffer, 0, "int", ["pointer", "pointer", "pointer"])(buffer, iid, accessOut) !== 0) {
@@ -635,6 +635,20 @@ function report(buffer) {
       count("data_error"); return null;
     }
     const bytes = new Uint8Array(bytesOut.readPointer().readByteArray(size));
+    if (size === 1) {
+      // Single-byte notifications: some Chromecast remotes (VID 18d1:9450,
+      // revision 0110) report buttons as device-private codes
+      // (CHROMECAST_REPORT_CODES), not Consumer usages. Only the code byte is
+      // visible at this layer; the downstream Windows copy appends report ID
+      // 0x01. Unknown codes are still dropped by the caller's shape check.
+      return new Uint8Array([bytes[0], 0, 0, 0, 0, 0, 0, 0]);
+    }
+    if (size === 2 && bytes[0] === 0x01) {
+      // Same variant one layer down: report ID 0x01 followed by the code.
+      // No Consumer usage in the selected layout starts with a 0x01 low byte,
+      // so this cannot shadow the two-byte GATT reports handled below.
+      return new Uint8Array([bytes[1], 0, 0, 0, 0, 0, 0, 0]);
+    }
     if (size === 2) {
       // GATT omits the 0x02 report ID added by the downstream Windows copy.
       // Normalize only known Consumer usages from the selected adapter.
