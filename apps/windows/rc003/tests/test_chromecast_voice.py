@@ -11,7 +11,8 @@ import subprocess
 import sys
 import tempfile
 
-from ovb_rc003.chromecast_voice import Recording, Effect, LIMITS, DEFAULT_LIMIT, GET_CAPABILITIES
+from ovb_rc003.chromecast_voice import (Recording, Effect, LIMITS, DEFAULT_LIMIT,
+                                        GET_CAPABILITIES, supported_capabilities)
 from ovb_rc003.chromecast_voice_host import VoiceHost
 from ovb_rc003.audio_playback_worker import PlaybackWriteWorker
 from ovb_rc003 import voice_controller, chromecast_channel as channel, win32_input, raw_input_windows
@@ -26,6 +27,26 @@ CAPS = bytes((11, 1, 0, 2, 3, 0, 160, 0, 0))
 def reply_caps(receiver, command):
     if command == GET_CAPABILITIES:
         receiver.notification(0x3f, CAPS, time.monotonic())
+
+
+class CapabilitiesTests(unittest.TestCase):
+    def test_canonical_nine_byte_record_is_accepted(self):
+        self.assertTrue(supported_capabilities(CAPS))
+
+    def test_ten_byte_record_from_chromecast_remote_is_accepted(self):
+        # VID 18d1:9450 revision 0110 appends one trailing byte to the record.
+        self.assertTrue(supported_capabilities(CAPS + b"\x00"))
+
+    def test_ten_byte_record_still_requires_the_canonical_prefix(self):
+        self.assertFalse(supported_capabilities(b"\x0c" + CAPS[1:] + b"\x00"))
+
+    def test_zero_interaction_stays_unsupported(self):
+        self.assertFalse(supported_capabilities(CAPS[:4] + b"\x00" + CAPS[5:]))
+        self.assertFalse(supported_capabilities(CAPS[:4] + b"\x00" + CAPS[5:] + b"\x00"))
+
+    def test_other_lengths_stay_rejected(self):
+        for payload in (b"", CAPS[:8], CAPS + b"\x00\x00"):
+            self.assertFalse(supported_capabilities(payload))
 
 
 class RecordingTests(unittest.TestCase):
