@@ -44,9 +44,27 @@ def parse_start_epoch(data):
 
 
 def supported_capabilities(payload):
+    """Validate an ATVV v1.0 CAPS_RESP notification.
+
+    Layout: 0x0b | version (2) | codecs (1) | interaction (1) | frame size (2).
+    ``payload[3]`` is the codec bitmap (bit1 = IMA ADPCM 16 kHz) and
+    ``payload[4]`` the interaction bitmap (bit0 = push-to-talk, bit1 =
+    hands-free). The interaction byte must be non-zero: a remote answering
+    interaction=0 accepts the session but never emits MIC stage events, which
+    is indistinguishable from a voice key that does nothing.
+
+    Some Chromecast remotes (VID 18d1:9450, revision 0110) answer with ten
+    bytes — the canonical nine-byte record plus one trailing byte. The
+    canonical fields keep their offsets, so only that trailing byte is dropped
+    here; every other length still fails closed.
+    """
+    if isinstance(payload, bytes) and len(payload) == 10 and payload[:1] == b"\x0b":
+        payload = payload[:9]
     return (isinstance(payload, bytes) and len(payload) == 9
-            and payload[:3] == b"\x0b\x01\x00" and payload[3] & 2 != 0
-            and payload[4] == 3 and 1 <= int.from_bytes(payload[5:7], "big") <= 512)
+            and payload[:3] == b"\x0b\x01\x00"
+            and payload[3] & 2 != 0
+            and payload[4] & 0x03 != 0
+            and 1 <= int.from_bytes(payload[5:7], "big") <= 512)
 
 
 # A bounded diagnostic vocabulary shared by the receiver and parent. It carries
