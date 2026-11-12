@@ -19,15 +19,14 @@
 
 ## 下载与版本
 
-**[下载正式版 1.0.105](https://github.com/ZSTDJan/windows-remote-mic-app/releases/download/v1.0.105/RemoteMicRC003-1.0.105-portable-unsigned.zip)** · [版本说明](https://github.com/ZSTDJan/windows-remote-mic-app/releases/tag/v1.0.105) · [SHA256SUMS.txt](https://github.com/ZSTDJan/windows-remote-mic-app/releases/download/v1.0.105/SHA256SUMS.txt)
+**[下载正式版 1.0.106](https://github.com/ZSTDJan/windows-remote-mic-app/releases/download/v1.0.106/RemoteMicRC003-1.0.106-portable-unsigned.zip)** · [版本说明](https://github.com/ZSTDJan/windows-remote-mic-app/releases/tag/v1.0.106) · [SHA256SUMS.txt](https://github.com/ZSTDJan/windows-remote-mic-app/releases/download/v1.0.106/SHA256SUMS.txt)
 
-当前正式版为 **1.0.105**。
+当前正式版为 **1.0.106**。
 
-- 扩充谷歌遥控器所需的 Windows 蓝牙组件内置识别信息，从 3 条增至 104 条，已覆盖的文件无需下载符号。
-- 未覆盖版本下载遇到临时网络错误时，最多尝试 5 次，共用 20 秒总时限；明确的文件不存在或证书错误不重复尝试。
-- 启动期间停止服务或退出时，及时取消符号下载并清理临时文件。
+- 补充微信输入法 Windows 3.0.2.39 的正常结束接口识别，用于谷歌遥控器开关型到时或设备报告结束的场景。
+- 保留已有微信版本的适配、普通语音窗口筛选及未知版本保护。
 
-受影响用户原机的按键、语音、重连和退出效果仍待实测；本次不代表所有蓝牙驱动兼容问题已经解决。
+新版文件校验和隔离窗口检查已通过；微信 .39 的真实语音识别、文字上屏和实体遥控器效果仍待实测。
 
 旧版可在 [历史版本](https://github.com/ZSTDJan/windows-remote-mic-app/releases) 中下载。
 

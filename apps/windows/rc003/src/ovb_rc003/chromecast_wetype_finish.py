@@ -21,6 +21,7 @@ _VERIFIED = {
     "99ee9c3b517275c3be1ac6bc941a70d78ee7bc1139dba1bf9df9275d7de4d1ab": False,  # 2.1.4.10
     "30c235d59ca403c0fdad6c1cae57001d450fc71c5bbcf2e48d59d4d0a82dbffe": True,  # 3.0.0.38
     "df84ba7a6fe51156360ff739a944b83e090baecfa38b368c65a5616bf75d7898": True,  # 3.0.2.36
+    "50e9b3818ea2cfcacab558b1f39f4d22f9ce61f7b182b8cd1d56b3bedff93d96": True,  # 3.0.2.39
 }
 STOP_WINDOW_SECONDS = 1.0
 BIND_WINDOW_SECONDS = 1.0
