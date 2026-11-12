@@ -69,6 +69,7 @@ class ActionKind(str, Enum):
     MOUSE_X1_HOLD = "mouse_x1_hold"
     MOUSE_X2_HOLD = "mouse_x2_hold"
     ELEMENT_NAVIGATION_TOGGLE = "element_navigation_toggle"
+    FOCUS_INPUT = "focus_input"
     # ``VOICE`` and ``VOICE_TOGGLE`` remain parseable only so schema-1 files
     # can be failed closed with an explicit migration notice. They are not
     # selectable or executable product actions anymore.
@@ -232,6 +233,8 @@ REPEATABLE_ACTIONS = frozenset(
         ActionKind.DELETE_BACKWARD,
         ActionKind.SYSTEM_VOLUME_UP,
         ActionKind.SYSTEM_VOLUME_DOWN,
+        ActionKind.MOUSE_WHEEL_UP,
+        ActionKind.MOUSE_WHEEL_DOWN,
     }
 )
 
@@ -360,9 +363,6 @@ class ButtonAction:
     program_path: str = field(default="", repr=False)
 
     def to_dict(self) -> dict:
-        if self.kind in (ActionKind.MOUSE_WHEEL_UP, ActionKind.MOUSE_WHEEL_DOWN):
-            page_key = "pageup" if self.kind == ActionKind.MOUSE_WHEEL_UP else "pagedown"
-            return {"kind": ActionKind.KEY_COMBO.value, "keys": [page_key]}
         data = {"kind": self.kind.value, "keys": list(self.keys)}
         if self.kind == ActionKind.QUICKER_URI:
             data["uri"] = normalize_quicker_uri(self.uri)
@@ -409,9 +409,6 @@ class ButtonAction:
             program_path = normalize_program_path(program_path)
         elif program_path:
             raise ValueError("non-program action must not contain a program path")
-        if kind in (ActionKind.MOUSE_WHEEL_UP, ActionKind.MOUSE_WHEEL_DOWN):
-            page_key = "pageup" if kind == ActionKind.MOUSE_WHEEL_UP else "pagedown"
-            return cls(kind=ActionKind.KEY_COMBO, keys=(page_key,))
         return cls(kind=kind, keys=keys, uri=uri, text=text, program_path=program_path)
 
 
