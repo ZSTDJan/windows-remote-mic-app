@@ -914,6 +914,17 @@ class HidTap:
         selected_address = isinstance(self.address, str) and re.fullmatch(r"[0-9a-f]{12}", self.address)
         if selected_address and gadget.loaded_or_pending_for_host(pid):
             return self._attach_gadget(frida, gadget, pid)
+        # The HID host (WUDFHost) runs as LOCAL SERVICE at SYSTEM integrity; on
+        # some hosts its DACL grants no access even to an elevated admin, so the
+        # direct attach fails with ERROR_ACCESS_DENIED (native 5) unless
+        # SeDebugPrivilege is enabled first. Interactive admin tokens carry it
+        # assigned but disabled; enabling is best-effort so tokens without it
+        # (for example a standard user under disabled UAC) keep the old failure.
+        try:
+            from .frida_hid_tap_injector import enable_debug_privilege
+            enable_debug_privilege()
+        except Exception as error:
+            self._startup_record('se_debug_privilege', 'failed', error=error)
         evidence = None
         try:
             from .chromecast_attach_diagnostics_windows import BoundedAttachEvidence

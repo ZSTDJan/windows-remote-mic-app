@@ -468,6 +468,35 @@ class AttachEvidenceTests(unittest.TestCase):
         self.assertIs(caught.exception, original)
         close.assert_called_once()
 
+    def test_se_debug_privilege_precedes_direct_attach_and_failure_is_bounded(self):
+        from ovb_rc003 import frida_hid_tap_injector as injector
+        order = []
+        instance = tap.HidTap('a'*64)
+        with mock.patch.object(injector, 'enable_debug_privilege',
+                               side_effect=lambda: order.append('se_debug')) as enable, \
+             mock.patch.object(native, 'BoundedAttachEvidence') as evidence:
+            session = mock.Mock()
+            frida = mock.Mock()
+            frida.attach.side_effect = lambda pid: (order.append('attach'), session)[1]
+            self.assertIs(instance._attach(frida, 42), session)
+            enable.assert_called_once()
+            self.assertEqual(order, ['se_debug', 'attach'])
+            self.assertFalse(any(r['step'] == 'se_debug_privilege' for r in instance.poll_startup()))
+            # A token without the privilege (standard user under disabled UAC)
+            # must keep the plain attach failure instead of a new error class.
+            denied = PermissionError('SeDebugPrivilege is not assigned')
+            denied.winerror = 1300
+            enable.side_effect = denied
+            again = tap.HidTap('a'*64)
+            self.assertIs(again._attach(frida, 42), session)
+            rows = [row for row in again.poll_startup() if row['step'] == 'se_debug_privilege']
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]['state'], 'failed')
+            self.assertEqual(rows[0]['error_type'], 'PermissionError')
+            self.assertEqual(rows[0]['native_code'], 1300)
+            self.assertTrue(valid_record(rows[0]))
+            evidence.assert_called()
+
     def test_independent_system_sources_finish_when_pnp_times_out(self):
         def collect(query, **kwargs):
             if 'Get-PnpDevice)' in query:
