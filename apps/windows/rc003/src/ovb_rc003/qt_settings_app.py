@@ -117,7 +117,6 @@ from . import (
     config,
     device_catalog,
     element_navigation_control_windows,
-    element_navigation_runtime,
     frida_compat,
     hid_elevation_windows,
     hid_helper_consumers,
@@ -2668,6 +2667,44 @@ def _load_qt_classes() -> dict:
             self._bridge_reconnect_busy = value
             self.bridgeReconnectBusyChanged.emit()
 
+        def _resident_process_running(self) -> bool:
+            """Whether a worker owner already exists for this copy.
+
+            The settings window is a separate, on-demand process, so the
+            worker normally lives in the resident process; the per-runtime
+            mutex is the evidence that such a process exists to receive
+            start/reconnect requests. A worker embedded in this process (an
+            older embedding or a test double) counts as well.
+            """
+
+            if bridge_launcher.in_process_bridge_running():
+                return True
+            try:
+                with single_instance.ApplicationRuntimeInstanceGuard():
+                    return False
+            except single_instance.DuplicateInstanceError:
+                return True
+            except (
+                single_instance.SingleInstanceUnavailableError,
+                single_instance.MutexCleanupError,
+            ):
+                return False
+
+        def _request_start_from_resident(self) -> bool:
+            """Ask the resident to start (or immediately retry) its worker."""
+
+            try:
+                single_instance.write_bridge_start_request(
+                    self._config_root,
+                    session_scoped=True,
+                )
+            except (
+                OSError,
+                single_instance.SingleInstanceUnavailableError,
+            ):
+                return False
+            return True
+
         def _can_reconnect_bridge_now(
             self,
             status: Optional[bridge_runtime_status.BridgeRuntimeStatus],
@@ -2697,7 +2734,7 @@ def _load_qt_classes() -> dict:
                 > _BRIDGE_STATUS_STALE_AFTER_SECONDS
             ):
                 return False
-            return bridge_launcher.in_process_bridge_running()
+            return self._resident_process_running()
 
         def _describe_runtime_status(
             self,
@@ -6606,11 +6643,10 @@ def _load_qt_classes() -> dict:
                 return
             if (
                 self._bridge_running
-                and not bridge_launcher.in_process_bridge_running()
+                and not self._resident_process_running()
             ):
-                # Upgrade path: preserve a running legacy service, but move it
-                # into this process so the product does not keep two resident
-                # executables after the settings shell has opened.
+                # A legacy service from an older build still owns the
+                # hardware; restart it so this version can take over.
                 self._begin_bridge_restart(automatic=True)
                 return
             if (
@@ -7550,10 +7586,15 @@ def _load_qt_classes() -> dict:
                 )
             else:
                 try:
+                    # A resident owns the product-wide exit request; this
+                    # on-demand window only consumes it when it is the sole
+                    # process left (e.g. the resident already stopped).
                     exit_request = (
                         single_instance.consume_and_acknowledge_application_exit_request(
                             self._config_root
                         )
+                        if not self._resident_process_running()
+                        else None
                     )
                 except (
                     OSError,
@@ -7976,7 +8017,10 @@ def _load_qt_classes() -> dict:
                     self._DEVICE_PAGE_INDEX,
                 )
                 return
-            if bridge_launcher.reconnect_in_process_bridge_now() is not True:
+            if not (
+                self._resident_process_running()
+                and self._request_start_from_resident()
+            ):
                 self._set_bridge_reconnect_available(False)
                 self._set_error_message(
                     "立即重连请求暂未送达；请稍后再试。",
@@ -8096,6 +8140,7 @@ def _load_qt_classes() -> dict:
                     return True
                 if (
                     bridge_launcher.in_process_bridge_running()
+                    or self._resident_process_running()
                     or single_instance.bridge_instance_running()
                 ):
                     return True
@@ -8154,6 +8199,25 @@ def _load_qt_classes() -> dict:
                     "无法清理上次服务状态；请完全退出无线麦后重试。"
                 )
                 self._schedule_application_exit_poll()
+                return
+            if self._resident_process_running():
+                # The resident already owns the session; ask it to start the
+                # worker instead of spawning a duplicate process.
+                if not self._request_start_from_resident():
+                    self._finish_bridge_launch(
+                        bridge_launcher.LaunchResult(
+                            outcome=bridge_launcher.LaunchOutcome.LAUNCH_FAILED,
+                            command=(),
+                            error="resident_request_failed",
+                        )
+                    )
+                    return
+                self._finish_bridge_launch(
+                    bridge_launcher.LaunchResult(
+                        outcome=bridge_launcher.LaunchOutcome.ALREADY_RUNNING,
+                        command=(),
+                    )
+                )
                 return
             try:
                 attempt = bridge_launcher.start_bridge_launch()
@@ -8257,7 +8321,7 @@ def _load_qt_classes() -> dict:
             self._refresh_bridge_launch_elapsed()
             if (
                 result.outcome is bridge_launcher.LaunchOutcome.ALREADY_RUNNING
-                and not bridge_launcher.in_process_bridge_running()
+                and not self._resident_process_running()
             ):
                 self._set_bridge_running(True)
                 self._set_bridge_connected(False)
@@ -9920,7 +9984,7 @@ def _load_qt_classes() -> dict:
                         ):
                             try:
                                 restart_result = (
-                                    bridge_launcher.launch_in_process_bridge(
+                                    bridge_launcher.launch_bridge(
                                         launch_voice_program_on_start=False
                                     )
                                 )
@@ -10117,7 +10181,8 @@ def _load_qt_classes() -> dict:
 
     _qt_classes_cache = {
         # Keep the established cache key for tests/callers, but construct the
-        # QWidget-capable application required by embedded element navigation.
+        # QWidget-capable application: main.qml's Qt.labs.platform import
+        # needs Qt Widgets even though the notification-area icon is hidden.
         "QGuiApplication": QApplication,
         "QIcon": QIcon,
         "QQmlApplicationEngine": QQmlApplicationEngine,
@@ -10177,7 +10242,9 @@ def run_settings_window(
         app, "setQuitOnLastWindowClosed", None
     )
     if callable(set_quit_on_last_window_closed):
-        set_quit_on_last_window_closed(False)
+        # The settings window is the whole on-demand process: closing it ends
+        # this process while the resident service keeps running.
+        set_quit_on_last_window_closed(True)
 
     model = ButtonMappingModel()
     controller = SettingsController(
@@ -10272,26 +10339,6 @@ def run_settings_window(
             hwnd=settings_window_hwnd,
         )
 
-        if (
-            sys.platform == "win32"
-            and os.environ.get("RC003_DISABLE_LIVE_INPUT") != "1"
-        ):
-            try:
-                navigation_runtime = (
-                    element_navigation_runtime.start_embedded_element_navigation(
-                        app
-                    )
-                )
-            except Exception as exc:
-                logging_setup.get_logger(config.config_root()).warning(
-                    "element navigation unavailable in main process: %s",
-                    type(exc).__name__,
-                )
-            else:
-                element_navigation_control_windows.bind_embedded_element_navigation(
-                    navigation_runtime
-                )
-
         return app.exec()
     finally:
         try:
@@ -10309,22 +10356,12 @@ def run_settings_window(
                 )
         finally:
             try:
-                bridge_stopped = bridge_launcher.stop_in_process_bridge(reason="process_exit")
-                if bridge_stopped is False:
-                    logging_setup.get_logger(config.config_root()).error(
-                        "in-process bridge did not stop before desktop shutdown"
-                    )
+                # XRBM-035: called HERE, synchronously - whether
+                # app.exec() returned normally, engine.load() raised,
+                # rootObjects() was empty, input cleanup raised, or
+                # anything else in this block raised.
+                _shutdown_diagnostics_workers()
             finally:
-                try:
-                    element_navigation_control_windows.shutdown_element_navigation()
-                finally:
-                    try:
-                        # XRBM-035: called HERE, synchronously - whether
-                        # app.exec() returned normally, engine.load() raised,
-                        # rootObjects() was empty, input cleanup raised, or
-                        # anything else in this block raised.
-                        _shutdown_diagnostics_workers()
-                    finally:
-                        audio_playback.cleanup_retained_portaudio_test_resources(
-                            blocking=False
-                        )
+                audio_playback.cleanup_retained_portaudio_test_resources(
+                    blocking=False
+                )

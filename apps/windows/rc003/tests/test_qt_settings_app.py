@@ -4512,9 +4512,9 @@ class SettingsControllerTests(unittest.TestCase):
             "in_process_bridge_running",
             return_value=True,
         ), mock.patch.object(
-            qt_settings_app.bridge_launcher,
-            "reconnect_in_process_bridge_now",
-            return_value=True,
+            qt_settings_app.single_instance,
+            "write_bridge_start_request",
+            return_value=None,
         ) as reconnect, mock.patch(
             "PySide6.QtCore.QTimer.singleShot",
             side_effect=lambda delay, callback: callbacks.append((delay, callback)),
@@ -4523,7 +4523,7 @@ class SettingsControllerTests(unittest.TestCase):
             controller.reconnectBridgeNow()
             controller.reconnectBridgeNow()
 
-        reconnect.assert_called_once_with()
+        reconnect.assert_called_once_with(controller._config_root, session_scoped=True)
         self.assertTrue(controller.bridgeReconnectBusy)
         self.assertEqual(controller.bridgeLaunchPhase, "reconnecting")
         self.assertIn("正在立即连接", controller.launchStatusText)
@@ -4714,9 +4714,9 @@ class SettingsControllerTests(unittest.TestCase):
             "in_process_bridge_running",
             return_value=True,
         ), mock.patch.object(
-            qt_settings_app.bridge_launcher,
-            "reconnect_in_process_bridge_now",
-            return_value=False,
+            qt_settings_app.single_instance,
+            "write_bridge_start_request",
+            side_effect=OSError("request unavailable"),
         ):
             controller, _ = self._make_controller()
             controller.reconnectBridgeNow()
@@ -9142,7 +9142,7 @@ class DiagnosticsControllerTests(unittest.TestCase):
         with mock.patch.object(settings_controller, "_refresh_bridge_status", return_value=False), \
                 mock.patch.object(bridge_launcher, "_in_process_restart_blocked", True), \
                 mock.patch.object(windows_diagnostics, "check_vb_cable_loopback_isolated") as loopback, \
-                mock.patch.object(bridge_launcher, "launch_in_process_bridge") as restart:
+                mock.patch.object(bridge_launcher, "launch_bridge") as restart:
             for start in (diag.testVbCableChannel, diag.testVbCableChannelWithBridgeRestart):
                 start()
                 self.assertFalse(diag.vbCableTestRunning)
@@ -9179,7 +9179,7 @@ class DiagnosticsControllerTests(unittest.TestCase):
             return_value=loopback_result,
         ), mock.patch.object(
             bridge_launcher,
-            "launch_in_process_bridge",
+            "launch_bridge",
             return_value=restart_result,
         ) as restart:
             diag.testVbCableChannelWithBridgeRestart()
@@ -9220,7 +9220,7 @@ class DiagnosticsControllerTests(unittest.TestCase):
             return_value=loopback_result,
         ), mock.patch.object(
             bridge_launcher,
-            "launch_in_process_bridge",
+            "launch_bridge",
             return_value=restart_result,
         ):
             diag.testVbCableChannelWithBridgeRestart()
@@ -9641,29 +9641,27 @@ class RunSettingsWindowShutdownCoverageTests(unittest.TestCase):
             self.assertEqual(qt_settings_app.run_settings_window(), 0)
         shutdown.assert_called_once()
 
-    def test_exit_capability_is_marked_before_embedded_runtime_startup(self):
+    def test_exit_capability_is_marked_before_the_event_loop_runs(self):
         class _FakeWindow:
             def winId(self):
                 return 4321
 
         events = mock.Mock()
-        runtime = object()
         fake_classes = self._fake_classes(root_objects=[_FakeWindow()], exec_return=0)
-        with mock.patch.dict(
-            os.environ,
-            {"RC003_DISABLE_LIVE_INPUT": "0"},
-        ), mock.patch.object(
+        original_exec = fake_classes["QGuiApplication"].exec
+
+        def exec_and_record(fake_app):
+            events.event_loop_started()
+            return original_exec(fake_app)
+
+        with mock.patch.object(
             qt_settings_app, "_load_qt_classes", return_value=fake_classes
         ), mock.patch.object(
             qt_settings_app.sys, "platform", "win32"
         ), mock.patch.object(
-            qt_settings_app.element_navigation_runtime,
-            "start_embedded_element_navigation",
-            side_effect=lambda _app: events.runtime_started() or runtime,
-        ), mock.patch.object(
-            qt_settings_app.element_navigation_control_windows,
-            "bind_embedded_element_navigation",
-            side_effect=lambda _runtime: events.runtime_bound(),
+            fake_classes["QGuiApplication"],
+            "exec",
+            exec_and_record,
         ), mock.patch.object(
             qt_settings_app.single_instance,
             "mark_settings_window",
@@ -9672,11 +9670,10 @@ class RunSettingsWindowShutdownCoverageTests(unittest.TestCase):
             self.assertEqual(qt_settings_app.run_settings_window(), 0)
 
         self.assertEqual(
-            events.mock_calls[:3],
+            events.mock_calls[:2],
             [
                 mock.call.window_marked(),
-                mock.call.runtime_started(),
-                mock.call.runtime_bound(),
+                mock.call.event_loop_started(),
             ],
         )
 
@@ -9694,34 +9691,22 @@ class RunSettingsWindowShutdownCoverageTests(unittest.TestCase):
 
         prompt.assert_not_called()
 
-    def test_live_navigation_is_bound_and_shutdown_with_the_desktop_app(self):
-        runtime = object()
+    def test_settings_window_does_not_host_element_navigation(self):
         fake_classes = self._fake_classes(root_objects=[object()], exec_return=0)
-        with mock.patch.dict(
-            os.environ,
-            {"RC003_DISABLE_LIVE_INPUT": "0"},
-        ), mock.patch.object(
+        with mock.patch.object(
             qt_settings_app, "_load_qt_classes", return_value=fake_classes
         ), mock.patch.object(
-            qt_settings_app.sys, "platform", "win32"
-        ), mock.patch.object(
-            qt_settings_app.element_navigation_runtime,
-            "start_embedded_element_navigation",
-            return_value=runtime,
-        ) as start_navigation, mock.patch.object(
             qt_settings_app.element_navigation_control_windows,
             "bind_embedded_element_navigation",
         ) as bind_navigation, mock.patch.object(
             qt_settings_app.element_navigation_control_windows,
             "shutdown_element_navigation",
-            return_value=qt_settings_app.element_navigation_control_windows.CommandSendResult.DELIVERED,
         ) as shutdown_navigation:
             self.assertEqual(qt_settings_app.run_settings_window(), 0)
 
-        start_navigation.assert_called_once()
-        self.assertIs(start_navigation.call_args.args[0].__class__, fake_classes["QGuiApplication"])
-        bind_navigation.assert_called_once_with(runtime)
-        shutdown_navigation.assert_called_once_with()
+        # Navigation belongs to the resident process now.
+        bind_navigation.assert_not_called()
+        shutdown_navigation.assert_not_called()
 
     def test_settings_cleanup_failure_cannot_skip_diagnostics_shutdown(self):
         fake_classes = self._fake_classes(root_objects=[object()], exec_return=0)
@@ -10065,6 +10050,45 @@ m._shutdown_diagnostics_workers()
 print("STAGE:shutdown", file=sys.stderr, flush=True)
 
 print(json.dumps(result))
+"""
+
+
+# Proves the split-process contract end to end: closing the REAL settings
+# window must end that process (Qt.quit()), not leave a hidden window alive.
+_CLOSE_EXITS_PROCESS_PROBE_SCRIPT = r"""
+import json
+import sys
+import time
+
+from PySide6.QtCore import QTimer
+from ovb_rc003 import qt_settings_app as m
+
+original_connect = m._connect_application_exit
+state = {"windows": None, "closed": False}
+
+def connect(app, controller):
+    original_connect(app, controller)
+
+    def close_window():
+        windows = app.topLevelWindows()
+        state["windows"] = len(windows)
+        if windows:
+            state["closed"] = True
+            windows[0].close()
+
+    QTimer.singleShot(3000, close_window)
+    QTimer.singleShot(12000, lambda: app.exit(9))
+
+m._connect_application_exit = connect
+started = time.monotonic()
+result = m.run_settings_window()
+print(json.dumps({
+    "result": result,
+    "elapsed": time.monotonic() - started,
+    "windows": state["windows"],
+    "closed": state["closed"],
+}))
+sys.exit(0 if result == 0 else 2)
 """
 
 
@@ -13485,6 +13509,33 @@ class ApplicationExitIntegrationTests(unittest.TestCase):
         self.assertFalse(data["visible_during_cleanup"])
         self.assertGreater(data["elapsed"], 0.5)
         self.assertLess(data["elapsed"], 5.0)
+
+    def test_closing_the_settings_window_ends_that_process(self):
+        import subprocess
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            env = dict(os.environ)
+            env.setdefault("QT_QPA_PLATFORM", "offscreen")
+            env["LOCALAPPDATA"] = tmpdir
+            env["RC003_DISABLE_LIVE_INPUT"] = "1"
+            result = subprocess.run(
+                [sys.executable, "-c", _CLOSE_EXITS_PROCESS_PROBE_SCRIPT],
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+
+        self.assertEqual(
+            result.returncode,
+            0,
+            f"close-exit probe failed: {result.stdout}\n{result.stderr}",
+        )
+        data = json.loads(result.stdout.strip().splitlines()[-1])
+        self.assertEqual(data["windows"], 1)
+        self.assertTrue(data["closed"])
+        self.assertEqual(data["result"], 0)
+        self.assertLess(data["elapsed"], 10.0)
 
 
 @unittest.skipUnless(_HAS_PYSIDE6, _SKIP_REASON)

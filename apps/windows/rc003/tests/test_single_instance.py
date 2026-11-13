@@ -643,12 +643,6 @@ class SettingsWindowActivationTests(unittest.TestCase):
                     321,
                     single_instance._SETTINGS_WINDOW_RESTORE_CAPABILITY_PROPERTY,
                 ),
-                (321, single_instance._APPLICATION_EXIT_CAPABILITY_PROPERTY_V2),
-                (321, single_instance._APPLICATION_EXIT_CAPABILITY_PROPERTY),
-                (
-                    321,
-                    single_instance._APPLICATION_EXIT_WINDOW_SIGNAL_CAPABILITY_PROPERTY,
-                ),
             ],
         )
 

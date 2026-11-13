@@ -278,7 +278,6 @@ class InProcessBridgeHandleTests(unittest.TestCase):
             self.assertEqual(handle.poll(), single_instance.CLEANUP_FAILED_EXIT_CODE)
             self.assertTrue(bridge_launcher.in_process_bridge_cleanup_failed())
             for launch in (bridge_launcher.start_in_process_bridge,
-                           bridge_launcher.start_bridge_launch,
                            bridge_launcher.launch_in_process_bridge):
                 with self.subTest(launch=launch.__name__):
                     result = launch(grace_checks=0)
@@ -303,23 +302,28 @@ class InProcessBridgeHandleTests(unittest.TestCase):
                 self.assertFalse(bridge_launcher.in_process_bridge_cleanup_failed())
             self.assertEqual(run.call_count, 2)
 
-    def test_default_product_launch_uses_the_in_process_worker(self):
-        expected = bridge_launcher.LaunchResult(
-            outcome=bridge_launcher.LaunchOutcome.STARTED,
-            command=("<in-process-bridge>",),
-            pid=1234,
-        )
-        with mock.patch.object(
-            bridge_launcher,
-            "start_in_process_bridge",
-            return_value=expected,
-        ) as start:
-            result = bridge_launcher.start_bridge_launch()
+    def test_default_product_launch_starts_the_resident_process(self):
+        process = _FakeProcess([None, None], pid=2468)
+        popen_calls = []
 
-        self.assertIs(result, expected)
-        start.assert_called_once_with(
-            grace_checks=bridge_launcher.DEFAULT_GRACE_CHECKS
+        def fake_popen(command):
+            popen_calls.append(command)
+            return process
+
+        with mock.patch.object(
+            bridge_launcher, "start_in_process_bridge"
+        ) as start:
+            result = bridge_launcher.start_bridge_launch(
+                grace_checks=0, _popen=fake_popen
+            )
+
+        start.assert_not_called()
+        self.assertEqual(result.outcome, bridge_launcher.LaunchOutcome.STARTED)
+        self.assertEqual(result.pid, 2468)
+        self.assertEqual(
+            popen_calls[0], bridge_launcher.build_launch_command()
         )
+        self.assertIn("--bridge", popen_calls[0])
 
     def test_stop_requested_before_runtime_ready_is_delivered_once(self):
         handle = bridge_launcher._InProcessBridgeHandle()

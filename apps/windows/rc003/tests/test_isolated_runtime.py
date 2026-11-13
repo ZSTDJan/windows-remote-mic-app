@@ -81,7 +81,7 @@ class IsolatedRuntimeTests(unittest.TestCase):
              patch.object(entry, "_register_current_hid_helper_consumer") as register, \
              patch.object(entry, "_migrate_legacy_bridge_before_desktop_start") as migrate, \
              patch.object(entry, "_handoff_previous_application") as handoff:
-            entry._run_settings(start_bridge=True)
+            entry._run_settings()
             desktop.assert_called_once_with(start_bridge=False)
             register.assert_not_called()
             migrate.assert_not_called()
