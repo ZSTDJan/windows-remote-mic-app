@@ -2,17 +2,17 @@
 built from the standalone ``src/launcher.py`` entry point - see XRBM-021):
 
 - (no args)     open the settings window - the DEFAULT double-click
-                behavior. One per-session application guard owns the window,
-                notification icon, bridge worker and embedded navigator; a
-                repeat launch of the same copy restores that process. A
-                different version/location asks to switch, waits for the old
-                copy to exit normally, then continues the original launch.
+                behavior. The window is an on-demand process: closing it ends
+                that process, while the separate resident process keeps the
+                notification area, bridge worker and embedded navigator.
 - ``--settings``  open the settings window (explicit form of the default)
-- ``--background``  start the desktop shell hidden in the notification area
-- ``--bridge``  compatibility form for old shortcuts. It starts the same
-                desktop application hidden and asks that single process to
-                run its bridge worker; it never creates a second long-lived
-                bridge process.
+- ``--background``  start the windowless resident process (notification area,
+                bridge worker and element navigation; used by logon startup)
+- ``--bridge``  compatibility form for old shortcuts: start the resident
+                process and ask it to run its bridge worker immediately.
+- ``--no-voice-program``  HIDDEN launch option appended by the settings
+                window's bridge start: keep the resident from launching the
+                voice program on startup.
 - ``--bridge-from-settings``  HIDDEN compatibility marker retained in old
                 launch commands. Current product startup already routes
                 ``--bridge`` to the one desktop process, so the marker has no
@@ -177,6 +177,7 @@ def _validate_desktop_arguments(args: list[str]) -> None:
         "--background",
         "--bridge",
         bridge_launcher.SETTINGS_LAUNCH_FLAG,
+        bridge_launcher.NO_VOICE_PROGRAM_FLAG,
     }
     unknown = [argument for argument in args if argument not in allowed]
     if not unknown:
@@ -400,7 +401,7 @@ def _request_application_exit(
                 )
                 coordination_ready = False
 
-        if coordination_ready and not running:
+        if coordination_ready and not running and not single_instance.settings_window_running():
             result = 0
         elif coordination_ready:
             request_ready = True
@@ -458,7 +459,7 @@ def _request_application_exit(
                         )
                         result = APPLICATION_EXIT_REQUEST_FAILED_EXIT_CODE
                         break
-                    if not running:
+                    if not running and not single_instance.settings_window_running():
                         result = 0
                         break
                     if request_id is not None:
@@ -942,19 +943,20 @@ def main() -> None:
         raise SystemExit(exit_code)
 
     _validate_desktop_arguments(args)
+    from . import bridge_launcher
+
+    launch_voice_program_on_start = (
+        bridge_launcher.NO_VOICE_PROGRAM_FLAG not in args
+    )
     if "--settings" in args:
         _run_settings()
         return
-    if "--background" in args:
-        _run_settings(start_hidden=True, activate_duplicate=False)
-        return
-    if "--bridge" in args:
-        # Compatibility for old shortcuts: bridge mode is now the same
-        # desktop application, started hidden with its in-process bridge on.
-        _run_settings(
-            start_hidden=True,
-            start_bridge=True,
-            activate_duplicate=False,
+    if "--background" in args or "--bridge" in args:
+        # The resident process owns the bridge, notification area and element
+        # navigation; the settings window is a separate on-demand process.
+        _run_resident(
+            start_bridge="--bridge" in args,
+            launch_voice_program_on_start=launch_voice_program_on_start,
         )
         return
 
@@ -1043,108 +1045,167 @@ def _migrate_legacy_bridge_before_desktop_start() -> bool:
     raise SystemExit(LEGACY_BRIDGE_STARTUP_BLOCKED_EXIT_CODE)
 
 
-def _run_settings(
+def _configured_start_bridge() -> bool:
+    """Read the saved "start the service with Windows" choice for the resident."""
+
+    from . import config
+
+    try:
+        settings = config.load_config(config.config_path(config.config_root()))
+    except Exception:  # noqa: BLE001 - a bad file must not block the resident
+        return False
+    return bool(settings.get("launch_bridge_on_app_start", False))
+
+
+def _verify_desktop_permissions(*, silent: bool) -> None:
+    """Fail closed before any desktop startup when the environment is unsafe."""
+
+    from . import hid_elevation_windows, single_instance
+
+    if not (getattr(sys, "frozen", False) and sys.platform == "win32"):
+        return
+    try:
+        # Both token states are supported. The HID injector chooses the
+        # direct child or registered helper from the actual process token.
+        hid_elevation_windows.query_process_elevated()
+    except Exception:  # noqa: BLE001 - the desktop startup must fail closed
+        single_instance.show_bridge_startup_blocked_notice(
+            "无法确认无线麦当前的权限状态。\n\n"
+            "请关闭程序后重新普通双击打开。"
+        )
+        raise SystemExit(DESKTOP_PERMISSION_UNAVAILABLE_EXIT_CODE)
+    try:
+        maintenance_active = single_instance.installer_maintenance_running()
+    except (
+        single_instance.SingleInstanceUnavailableError,
+        single_instance.MutexCleanupError,
+    ):
+        single_instance.show_bridge_startup_blocked_notice(
+            "无法确认安装状态。请等待安装或卸载结束后重试。"
+        )
+        raise SystemExit(INSTALLER_MAINTENANCE_ACTIVE_EXIT_CODE)
+    if maintenance_active:
+        if not silent:
+            single_instance.show_bridge_startup_blocked_notice(
+                "无线麦正在安装或卸载。完成后再打开。"
+            )
+        raise SystemExit(INSTALLER_MAINTENANCE_ACTIVE_EXIT_CODE)
+
+
+def _run_resident(
     *,
-    start_hidden: bool = False,
     start_bridge: bool = False,
-    activate_duplicate: bool = True,
+    launch_voice_program_on_start: bool = True,
 ) -> None:
-    from . import hid_elevation_windows, settings_ui, single_instance
+    """Run the windowless resident process (``--background``/``--bridge``)."""
+
+    from . import resident_shell, single_instance, startup_windows
 
     if dev_session.is_isolated():
         _run_isolated_settings()
         return
-    if getattr(sys, "frozen", False) and sys.platform == "win32":
+    _verify_desktop_permissions(silent=True)
+
+    def request_bridge_start() -> None:
+        if not start_bridge:
+            return
+        from . import config
+
         try:
-            # Both token states are supported. The HID injector chooses the
-            # direct child or registered helper from the actual process token.
-            hid_elevation_windows.query_process_elevated()
-        except Exception:  # noqa: BLE001 - the desktop startup must fail closed
-            single_instance.show_bridge_startup_blocked_notice(
-                "无法确认无线麦当前的权限状态。\n\n"
-                "请关闭程序后重新普通双击打开。"
+            single_instance.write_bridge_start_request(
+                config.config_root(),
+                session_scoped=True,
             )
-            raise SystemExit(DESKTOP_PERMISSION_UNAVAILABLE_EXIT_CODE)
-        try:
-            maintenance_active = single_instance.installer_maintenance_running()
         except (
+            OSError,
             single_instance.SingleInstanceUnavailableError,
-            single_instance.MutexCleanupError,
         ):
             single_instance.show_bridge_startup_blocked_notice(
-                "无法确认安装状态。请等待安装或卸载结束后重试。"
+                "现有程序正在运行，但无法向它发送启动遥控器服务的请求。"
+                "请打开现有窗口后手动启动服务。"
             )
-            raise SystemExit(INSTALLER_MAINTENANCE_ACTIVE_EXIT_CODE)
-        if maintenance_active:
-            if not start_hidden:
-                single_instance.show_bridge_startup_blocked_notice(
-                    "无线麦正在安装或卸载。完成后再打开。"
-                )
-            raise SystemExit(INSTALLER_MAINTENANCE_ACTIVE_EXIT_CODE)
 
-    def run_owned_application() -> None:
+    def run_owned_application() -> int:
         with single_instance.ApplicationInstanceGuard():
+            # The resident is what logon startup launches, so it also keeps
+            # this product's owned login entry on the current frozen copy.
+            startup_windows.rebind_owned_frozen_startup()
             migrate_legacy_bridge = (
                 _migrate_legacy_bridge_before_desktop_start()
             )
             _register_current_hid_helper_consumer()
-            effective_start_bridge = start_bridge or migrate_legacy_bridge
-            if start_hidden:
-                settings_ui.main(
-                    start_hidden=True,
-                    start_bridge=effective_start_bridge,
-                )
-            else:
-                settings_ui.main(start_bridge=effective_start_bridge)
+            return resident_shell.main(
+                start_bridge=(
+                    start_bridge
+                    or migrate_legacy_bridge
+                    or _configured_start_bridge()
+                ),
+                launch_voice_program_on_start=launch_voice_program_on_start,
+            )
 
-    def handle_current_runtime_duplicate() -> None:
-        if start_bridge:
-            from . import config
-
-            try:
-                single_instance.write_bridge_start_request(
-                    config.config_root(),
-                    session_scoped=True,
-                )
-            except (
-                OSError,
-                single_instance.SingleInstanceUnavailableError,
-            ):
-                single_instance.show_bridge_startup_blocked_notice(
-                    "现有程序正在运行，但无法向它发送启动遥控器服务的请求。"
-                    "请打开现有窗口后手动启动服务。"
-                )
-            return
-        if activate_duplicate:
-            if single_instance.activate_current_runtime_settings_window():
-                return
-            activated = single_instance.activate_existing_settings_window()
-            if not activated:
-                single_instance.show_bridge_startup_blocked_notice(
-                    f"{product_identity.DISPLAY_NAME}已经在启动或运行。\n\n"
-                    "请从通知区域打开现有程序。"
-                )
     try:
         with single_instance.ApplicationRuntimeInstanceGuard():
             try:
-                run_owned_application()
+                exit_code = run_owned_application()
             except single_instance.DuplicateInstanceError:
-                if start_bridge or not activate_duplicate:
-                    handle_current_runtime_duplicate()
-                    return
-                if not _handoff_previous_application():
+                # The product is owned by another version or location. A
+                # service start is a user action, so offer the version
+                # handoff; a plain background start stays silent at logon.
+                if not start_bridge or not _handoff_previous_application():
                     return
                 try:
-                    run_owned_application()
+                    exit_code = run_owned_application()
                 except single_instance.DuplicateInstanceError:
-                    single_instance.activate_existing_settings_window()
-                    single_instance.show_bridge_startup_blocked_notice(
-                        "旧版退出后，另一个无线麦副本先取得了运行权。"
-                        "当前副本没有继续启动，请使用已经打开的窗口。"
-                    )
+                    return
+            if exit_code:
+                raise SystemExit(exit_code)
     except single_instance.DuplicateInstanceError:
-        handle_current_runtime_duplicate()
+        # This exact copy already holds the resident role.
+        request_bridge_start()
         return
+    except SystemExit:
+        raise
+    except Exception as exc:
+        print(
+            f"resident startup failed: error_type={type(exc).__name__}",
+            file=sys.stderr,
+        )
+        single_instance.show_bridge_startup_blocked_notice(
+            f"{product_identity.DISPLAY_NAME}后台服务无法启动。"
+            "请检查日志目录和配置文件后重试。"
+        )
+        raise SystemExit(SETTINGS_STARTUP_FAILED_EXIT_CODE)
+
+
+def _run_settings() -> None:
+    """Open the on-demand settings window process.
+
+    This process only hosts Qt Quick/QML and its controllers: it never owns
+    the bridge, notification area or element navigation, so closing the
+    window ends the whole process.
+    """
+
+    from . import settings_ui, single_instance
+
+    if dev_session.is_isolated():
+        _run_isolated_settings()
+        return
+    _verify_desktop_permissions(silent=False)
+
+    def run_owned_window() -> None:
+        with single_instance.SettingsWindowInstanceGuard():
+            settings_ui.main(start_bridge=False)
+
+    try:
+        run_owned_window()
+    except single_instance.DuplicateInstanceError:
+        if single_instance.activate_current_runtime_settings_window():
+            return
+        if not single_instance.activate_existing_settings_window():
+            single_instance.show_bridge_startup_blocked_notice(
+                f"{product_identity.DISPLAY_NAME}设置窗口已经打开。\n\n"
+                "请从任务栏或通知区域使用现有窗口。"
+            )
     except Exception as exc:
         print(
             f"settings startup failed: error_type={type(exc).__name__}",

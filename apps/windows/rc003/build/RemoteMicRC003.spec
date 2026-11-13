@@ -255,6 +255,7 @@ hiddenimports = [
     "ovb_rc003.app",
     "ovb_rc003.device_catalog",  # XRBM-036: multi-device settings/runtime gate
     "ovb_rc003.settings_ui",
+    "ovb_rc003.resident_shell",  # separate resident process (--background/--bridge)
     "ovb_rc003.element_navigation_control_windows",
     "ovb_rc003.element_navigation_runtime",
     "ovb_rc003.qt_settings_app",  # XRBM-030
