@@ -71,17 +71,35 @@ class ChromecastRuntime:
         self.services.set_input_state(raw_input_state="starting", hid_tap_state="starting",
                                       voice_key_physicalizer_state="not_used")
         self.services.publish_status(bridge_runtime_status.BridgeConnectionState.CONNECTING)
-        self.voice_host = self.services.create_voice_host()
-        self.client = Client(self.services.selected_key(), mode="run", on_edge=self.on_edge,
-                                  on_lost=self.cancel_input,
-                                  on_voice=self.voice_host.enqueue)
-        self.client.on_ready = self.receiver_ready
-        self.voice_host.start(self.client)
+        entity = self.services.selected_key()
+
+        def create_receiver(**options):
+            self.voice_host = self.services.create_voice_host()
+            self.client = Client(entity, mode="run", on_edge=self.on_edge,
+                                 on_lost=self.cancel_input, on_voice=self.voice_host.enqueue, **options)
+            self.client.on_ready = self.receiver_ready
+            self.voice_host.start(self.client)
+
+        create_receiver()
         try:
             # Keyboard ownership is shared safety infrastructure, not the
             # Xiaomi remote decoder. Start it before accepting host shortcuts.
             self.services.start_input()
-            await asyncio.to_thread(self.client.start, cancel_event=self.stopping)
+            try:
+                await asyncio.to_thread(self.client.start, cancel_event=self.stopping)
+            except RuntimeError:
+                if (self.stopping.is_set() or self.services.selected_key() != entity
+                        or not self.client.can_retry_work_directory()):
+                    raise
+                await asyncio.to_thread(self.voice_host.stop)
+                if (self.stopping.is_set() or self.services.selected_key() != entity
+                        or not self.services.release_inputs()):
+                    raise
+                self.services.set_input_state(raw_input_state="chromecast_recovering", hid_tap_state="starting")
+                self.services.publish_status(bridge_runtime_status.BridgeConnectionState.CONNECTING)
+                self.services.logger.info("Chromecast work directory recovery: retrying with a fresh process")
+                create_receiver(private_work_directory=True)
+                await asyncio.to_thread(self.client.start, cancel_event=self.stopping)
             restarted_generation = None
             recoveries = 0
             while not self.stopping.is_set() and not self.client.finished.is_set():

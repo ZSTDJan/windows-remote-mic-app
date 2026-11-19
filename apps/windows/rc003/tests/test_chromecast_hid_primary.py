@@ -236,8 +236,14 @@ class HidWorkerTests(unittest.IsolatedAsyncioTestCase):
             notifications.clear()
             return result
 
+        async def open_voice(*, direct, source_ready):
+            self.assertTrue(direct)
+            self.assertIsInstance(source_ready, asyncio.Event)
+            await source_ready.wait()
+
         target = SimpleNamespace(changed=threading.Event(), voice_attributes={0x3F: "control", 0x3C: "audio"},
-                                 voice_evidence=None, open=mock.AsyncMock(), open_voice=mock.AsyncMock(),
+                                 voice_evidence=None, open=mock.AsyncMock(),
+                                 open_voice=mock.AsyncMock(side_effect=open_voice),
                                  write_voice=write_voice, poll_voice=poll_voice,
                                  close_voice=mock.AsyncMock(), close=mock.Mock())
 
@@ -259,7 +265,7 @@ class HidWorkerTests(unittest.IsolatedAsyncioTestCase):
             result = await asyncio.wait_for(worker.receive(identity, SimpleNamespace(pid=1),
                 SimpleNamespace(read=lambda: inbox.popleft() if inbox else None, write=write)), 3)
         self.assertEqual(result, 0)
-        target.open_voice.assert_awaited_once_with(direct=True)
+        target.open_voice.assert_awaited_once_with(direct=True, source_ready=mock.ANY)
         target.close.assert_called_once()
         self.assertEqual(target.close_voice.await_count, 2 if cancel_kind else 1)
         if cancel_input:

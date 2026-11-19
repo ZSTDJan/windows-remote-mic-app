@@ -1,5 +1,5 @@
 import json
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 import stat
 import tempfile
 import threading
@@ -58,6 +58,24 @@ class LogExportTests(unittest.TestCase):
         self.assertFalse(self.logs.exists())
         self.assertEqual(self.destination.read_bytes(), b'previous archive')
 
+    def test_export_redacts_retained_logs_without_changing_the_originals(self):
+        account = 'private_profile'
+        address = ':'.join(['AB'] * 6)
+        path = rf"{PureWindowsPath("C:/Users")}\Someone Else's profile\capture.txt"
+        original = f'{account} {address} secret@example.invalid {path}: Access denied\n'.encode()
+        legacy = self.write_log('app.log.2', original)
+        trace = json.dumps(dict(error=f'File "{path}": Access denied', code=5,
+                                url='https://example.invalid/private')).encode() + b'\n'
+        trace_file = self.write_log('diagnostic-trace.jsonl', trace)
+        with mock.patch.dict(log_export.os.environ, USERNAME=account):
+            result = log_export.export_logs(self.destination, root=self.root)
+        self.assertEqual(result.outcome, 'exported')
+        with zipfile.ZipFile(self.destination) as archive:
+            self.assertEqual(archive.read(legacy.name), b'<identity> <device> <email> <path>: Access denied\n')
+            self.assertEqual(json.loads(archive.read(trace_file.name)),
+                             dict(error='File "<path>": Access denied', code=5, url='<url>'))
+        self.assertEqual(legacy.read_bytes(), original)
+        self.assertEqual(trace_file.read_bytes(), trace)
     def test_partial_read_failure_is_visible_in_result_and_archive(self):
         self.write_log()
         self.write_log('hid-helper.log')

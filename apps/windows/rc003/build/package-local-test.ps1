@@ -159,6 +159,7 @@ try {
     Copy-Item -LiteralPath (Join-Path $RepoRoot "THIRD_PARTY_LICENSES") -Destination (Join-Path $documentationDir "THIRD_PARTY_LICENSES") -Recurse -Force
     Copy-Item -LiteralPath (Join-Path $RC003Root "ATTRIBUTION.md") -Destination (Join-Path $documentationDir "ATTRIBUTION.md") -Force
     Copy-Item -LiteralPath (Join-Path $RC003Root "installer\readme-portable-rc003.txt") -Destination (Join-Path $documentationDir ([string]$productPresentation.portable_readme_name)) -Force
+    Copy-RC003PortableReportLauncher -RC003Root $RC003Root -DocumentationDirectory $documentationDir -ProductPresentation $productPresentation
 
     Assert-RC003PortableStagingRoot `
         -StagingDirectory $stagingDir `

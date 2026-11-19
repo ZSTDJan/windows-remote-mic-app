@@ -11,6 +11,8 @@ import uuid
 
 from . import raw_input_windows, remote_selection
 from .chromecast_pipe_windows import PipeError
+from .receiver_startup_errors import DeviceOpenLog
+from .chromecast_cleanup import PendingCleanup, finish_cleanup
 from .chromecast_voice import GET_CAPABILITIES
 
 # Observed model/revision contract, NOT a default for arbitrary Chromecast
@@ -102,6 +104,7 @@ class SelectedDevice:
         self.voice_session = None
         self._voice_services = []
         self._voice_cleanup_failed = False
+        self._voice_cleanup_pending = None
         self.voice_attributes = {}
         self.input_pending = False
         self.probe_status = -1
@@ -114,6 +117,7 @@ class SelectedDevice:
         self.voice_retryable = False
         self._voice_cache_checked = False
         self.cleanup_observer = None
+        self.open_observer = None
         self._cleanup_attempt = 0
         self._cleanup_cycle = 0
         self._cleanup_previous_failed = False
@@ -225,53 +229,68 @@ class SelectedDevice:
             self.input_pending = False
 
     async def open(self, *, require_input=True):
-        from winrt.windows.devices.bluetooth import BluetoothAdapter, BluetoothLEDevice
-        from winrt.windows.devices.enumeration import DeviceInformation
-        self.watcher = DeviceInformation.create_watcher_aqs_filter(BluetoothAdapter.get_device_selector())
-        self._watcher_stop_requested = False
-        def added(sender, info):
-            if self.enumerated.is_set():
-                self.changed.set()
-            self.ids.add(info.id)
-        self.tokens = [
-            ("added", self.watcher.add_added(added)),
-            ("removed", self.watcher.add_removed(lambda *_: self.changed.set())),
-            ("stopped", self.watcher.add_stopped(lambda *_: self.changed.set())),
-            ("enumeration_completed", self.watcher.add_enumeration_completed(lambda *_: self.enumerated.set())),
-        ]
-        self.watcher.start()
-        for _ in range(160):
-            if self.enumerated.is_set():
-                break
-            await asyncio.sleep(.05)
-        if not self.enumerated.is_set() or len(self.ids) != 1 or self.changed.is_set():
-            raise PipeError("radio_ambiguous")
-        radio_id = next(iter(self.ids))
-        self.radio = hashlib.sha256(b"RemoteMic radio v1\0" + radio_id.encode("utf-8")).hexdigest()
-        selector = BluetoothLEDevice.get_device_selector_from_pairing_state(True)
-        infos = await DeviceInformation.find_all_async_aqs_filter_and_additional_properties(selector, ["System.Devices.Aep.ContainerId"])
-        selected = []
-        for info in infos:
-            try:
-                if remote_selection.candidate_key(info) == self.entity:
-                    selected.append(info)
-            except remote_selection.SelectionError:
-                continue
-        if self.changed.is_set():
-            raise PipeError("radio_ambiguous")
-        if len(selected) > 1:
-            selected = [await _paired_endpoint_on_radio(selected, radio_id, BluetoothAdapter.from_id_async)]
+        journal = DeviceOpenLog(self.open_observer)
+        with journal.operation("open", summary=True):
+            with journal.operation("winrt_import"):
+                from winrt.windows.devices.bluetooth import BluetoothAdapter, BluetoothLEDevice
+                from winrt.windows.devices.enumeration import DeviceInformation
+            selector = journal.call("adapter_selector", BluetoothAdapter.get_device_selector)
+            self.watcher = journal.call("watcher_create", DeviceInformation.create_watcher_aqs_filter, selector)
+            self._watcher_stop_requested = False
+            def added(sender, info):
+                if self.enumerated.is_set():
+                    self.changed.set()
+                self.ids.add(info.id)
+            self.tokens = [
+                ("added", journal.call("watcher_add_added", self.watcher.add_added, added)),
+                ("removed", journal.call("watcher_add_removed", self.watcher.add_removed, lambda *_: self.changed.set())),
+                ("stopped", journal.call("watcher_add_stopped", self.watcher.add_stopped, lambda *_: self.changed.set())),
+                ("enumeration_completed", journal.call("watcher_add_enumeration_completed", self.watcher.add_enumeration_completed, lambda *_: self.enumerated.set())),
+            ]
+            journal.call("watcher_start", self.watcher.start)
+            with journal.operation("adapter_enumeration") as facts:
+                for _ in range(160):
+                    if self.enumerated.is_set():
+                        break
+                    await asyncio.sleep(.05)
+                facts.update(enumeration_complete=int(self.enumerated.is_set()), adapter_count=len(self.ids),
+                    radio_changed=int(self.changed.is_set()))
+            with journal.operation("adapter_validate"):
+                if not self.enumerated.is_set() or len(self.ids) != 1 or self.changed.is_set():
+                    raise PipeError("radio_ambiguous")
+                radio_id = next(iter(self.ids))
+                self.radio = hashlib.sha256(b"RemoteMic radio v1\0" + radio_id.encode("utf-8")).hexdigest()
+            selector = journal.call("paired_selector", BluetoothLEDevice.get_device_selector_from_pairing_state, True)
+            with journal.operation("paired_enumerate"):
+                infos = await DeviceInformation.find_all_async_aqs_filter_and_additional_properties(selector, ["System.Devices.Aep.ContainerId"])
+            selected = []
+            with journal.operation("paired_identity_scan", pair_count=0) as facts:
+                for info in infos:
+                    facts["pair_count"] += 1
+                    try:
+                        if journal.call("candidate_identity", remote_selection.candidate_key, info, expected=(remote_selection.SelectionError,)) == self.entity:
+                            selected.append(info)
+                    except remote_selection.SelectionError:
+                        continue
+                facts["selected_count"] = len(selected)
+                if self.changed.is_set():
+                    raise PipeError("radio_ambiguous")
+                if len(selected) > 1:
+                    selected = [await _paired_endpoint_on_radio(selected, radio_id, BluetoothAdapter.from_id_async)]
+                    if self.changed.is_set():
+                        raise PipeError("radio_ambiguous")
+            if len(selected) != 1 or journal.call("selected_name_read", lambda: selected[0].name).strip().casefold() != "chromecast remote":
+                raise PipeError("source_unconfirmed")
+            if require_input:
+                with journal.operation("input_resolve"):
+                    self.attribute = await self._resolve_input()
+            with journal.operation("ble_from_id"):
+                self.device = await BluetoothLEDevice.from_id_async(journal.call("paired_id_read", lambda: selected[0].id))
+            with journal.operation("ble_validate", returned_none=int(self.device is None)):
+                if self.device is None or journal.call("ble_id_read", lambda: self.device.device_id) != journal.call("paired_id_read", lambda: selected[0].id):
+                    raise PipeError("source_unconfirmed")
             if self.changed.is_set():
                 raise PipeError("radio_ambiguous")
-        if len(selected) != 1 or selected[0].name.strip().casefold() != "chromecast remote":
-            raise PipeError("source_unconfirmed")
-        if require_input:
-            self.attribute = await self._resolve_input()
-        self.device = await BluetoothLEDevice.from_id_async(selected[0].id)
-        if self.device is None or self.device.device_id != selected[0].id:
-            raise PipeError("source_unconfirmed")
-        if self.changed.is_set():
-            raise PipeError("radio_ambiguous")
 
     async def probe(self, marker):
         from winrt.windows.devices.bluetooth import BluetoothCacheMode
@@ -420,7 +439,7 @@ class SelectedDevice:
                 except Exception:
                     pass  # Cached diagnostic cleanup must not mask the live error.
 
-    async def open_voice(self, *, direct=False):
+    async def open_voice(self, *, direct=False, source_ready=None):
         from .chromecast_voice import VOICE_OPEN_MAX_ATTEMPTS
         self._cleanup_attempt = min(VOICE_OPEN_MAX_ATTEMPTS, self._cleanup_attempt + 1)
         self.voice_queries = []
@@ -432,6 +451,11 @@ class SelectedDevice:
                 raise PipeError("cleanup_failed")
             if direct:
                 await self._start_voice_session()
+            if source_ready is not None:
+                # MaintainConnection can start the Windows connection on its own.
+                # Leave the potentially slow live query and subscriptions behind
+                # the input gate, including when the capture directory is denied.
+                await source_ready.wait()
             await self._discover_voice(direct=direct)
             self._voice_link("ready")
         except BaseException as error:
@@ -558,6 +582,8 @@ class SelectedDevice:
         return events
 
     async def close_voice(self):
+        if self.cleanup_pending:
+            raise PipeError("cleanup_failed")
         self._cleanup_begin()
         self._voice_open = False
         tokens, self._voice_tokens = self._voice_tokens, []
@@ -578,18 +604,28 @@ class SelectedDevice:
                 for characteristic in subscribed:
                     try:
                         with self._cleanup_operation("subscription_disable", handle=self._cleanup_handle(characteristic)) as evidence:
-                            status = await asyncio.wait_for(
-                                characteristic.write_client_characteristic_configuration_descriptor_async(CccdValue.NONE), 3)
+                            task = asyncio.ensure_future(
+                                characteristic.write_client_characteristic_configuration_descriptor_async(CccdValue.NONE))
+                            try:
+                                status = await finish_cleanup(task)
+                            except PendingCleanup:
+                                self._voice_cleanup_pending = task
+                                raise
                             evidence["status"] = int(status)
                         if int(status) != 0:
                             failed = True
                     except Exception:
                         failed = True
+                        if self.cleanup_pending:
+                            break  # No more native calls under an unsettled write.
         except asyncio.CancelledError:
             failed = True
             raise
         finally:
-            failed = not self._release_voice_resources() or failed
+            if self.cleanup_pending:
+                failed = True  # Keep the task and native owners until process exit.
+            else:
+                failed = not self._release_voice_resources() or failed
             self._cleanup_current_failed = self._cleanup_current_failed or failed
             self._voice_cleanup_failed = failed or self._voice_cleanup_failed
             self._voice_link("closed", outcome="exception" if self._voice_cleanup_failed else "success")
@@ -597,7 +633,15 @@ class SelectedDevice:
         if self._voice_cleanup_failed:
             raise PipeError("cleanup_failed")
 
+    @property
+    def cleanup_pending(self):
+        # Once the deadline is exceeded this owner is quarantined. A later Task
+        # cancellation/result must not turn it into a reusable native session.
+        return self._voice_cleanup_pending is not None
+
     def _release_voice_resources(self):
+        if self.cleanup_pending:
+            return False
         self._voice_open = False
         self.voice_tx = None
         self.voice_attributes = {}
@@ -664,6 +708,8 @@ class SelectedDevice:
             writer.close()
 
     def close(self):
+        if self.cleanup_pending:
+            raise PipeError("cleanup_failed")
         self._cleanup_begin()
         first_error = None
         try:

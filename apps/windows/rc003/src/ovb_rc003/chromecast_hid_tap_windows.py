@@ -940,6 +940,12 @@ class HidTap:
                 sample(lambda: evidence.finish(error))
         if error is None:
             return session
+        from .receiver_startup_errors import WORK_DIRECTORY_FAILED
+
+        denied = getattr(frida, "PermissionDeniedError", None)
+        if (isinstance(denied, type) and isinstance(error, denied)
+                and str(error).startswith("error creating directory ")):
+            raise TapError(WORK_DIRECTORY_FAILED) from error
         nonresponding = getattr(frida, "ProcessNotRespondingError", None)
         if selected_address and isinstance(nonresponding, type) and isinstance(error, nonresponding):
             if self._abort_start.is_set():

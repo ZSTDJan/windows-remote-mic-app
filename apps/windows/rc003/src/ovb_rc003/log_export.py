@@ -6,15 +6,18 @@ from datetime import datetime
 import json
 import os
 from pathlib import Path
+import re
 import stat
 import tempfile
 import threading
 import zipfile
 
 from . import __version__, diagnostic_trace, logging_setup
+from .receiver_startup_errors import private_identity_pattern, redact_private_text
 
 # Bound older logs from previous versions without changing the source files.
 MAX_FILE_BYTES = 512 * 1024
+_QUOTED_TEXT = re.compile(r'"[^"\\\r\n]*(?:\\.[^"\\\r\n]*)*"')
 
 
 @dataclass(frozen=True)
@@ -82,11 +85,32 @@ def _file_state(path: Path):
         return 'unreadable'
 
 
+def _redact_snapshot(content: bytes) -> bytes:
+    text = content.decode('utf-8', errors='replace')
+    parts = []
+    end = 0
+    identities = private_identity_pattern()
+    for match in _QUOTED_TEXT.finditer(text):
+        parts.append(redact_private_text(text[end:match.start()], identities=identities))
+        token = match.group()
+        try:
+            value = json.loads(token) if '\\' in token else token[1:-1]
+        except ValueError:
+            value = token[1:-1]  # Plain text log with an unescaped quoted path.
+        masked = redact_private_text(value, identities=identities)
+        parts.append(token if value == masked else json.dumps(masked, ensure_ascii=True))
+        end = match.end()
+    parts.append(redact_private_text(text[end:], identities=identities))
+    return ''.join(parts).encode('utf-8')
+
+
 def export_logs(destination: Path, *, root: Path | None = None,
-                cancel: threading.Event | None = None) -> ExportResult:
-    """Replace only the selected ZIP, atomically after success; keep original logs intact."""
+                cancel: threading.Event | None = None, receiver_report: dict | None = None,
+                overwrite: bool = True) -> ExportResult:
+    """Write one ZIP for logs and optional on-demand diagnostics, without altering the logs."""
     destination = Path(destination)
-    if not destination.is_absolute() or destination.suffix.casefold() != '.zip':
+    if (not destination.is_absolute() or destination.suffix.casefold() != '.zip'
+            or (not overwrite and destination.exists())):
         return ExportResult('invalid_destination')
     cancelled = cancel.is_set if cancel is not None else lambda: False
     temporary = None
@@ -126,7 +150,8 @@ def export_logs(destination: Path, *, root: Path | None = None,
         incomplete = not all((application_flushed, diagnostic_flushed, report_flushed, stable)) or any(
             r['status'] == 'unreadable' or r.get('truncated') or r.get('changed_during_read')
             for r in records)
-        if not any(content for _, content in captured):
+        has_logs = any(content for _, content in captured)
+        if not has_logs and receiver_report is None:
             return ExportResult('read_failed' if incomplete else 'no_logs')
         manifest = dict(schema_version=1, app_version=__version__,
                         incomplete=incomplete, snapshot_stable=stable, snapshot_attempts=attempt,
@@ -160,15 +185,32 @@ def export_logs(destination: Path, *, root: Path | None = None,
                                          dir=destination.parent, delete=False) as output:
             temporary = Path(output.name)
         with zipfile.ZipFile(temporary, 'w', zipfile.ZIP_DEFLATED, compresslevel=3) as archive:
-            for name, content in captured:
+            included = (row for row in records if row['status'] == 'included')
+            for (name, content), row in zip(captured, included, strict=True):
                 if cancelled():
                     return ExportResult('cancelled')
+                content = _redact_snapshot(content)
+                row['exported_bytes'] = len(content)
                 archive.writestr(name, content)
             archive.writestr('export-info.json', json.dumps(manifest, ensure_ascii=False, indent=2))
+            if receiver_report is not None:
+                report = dict(receiver_report, logs_incomplete=incomplete,
+                              log_export='exported' if has_logs else 'read_failed' if incomplete else 'no_logs')
+                archive.writestr('receiver-startup-report.json', json.dumps(report, ensure_ascii=False, indent=2))
+        if receiver_report is not None:
+            with zipfile.ZipFile(temporary) as archive:
+                if archive.testzip() is not None:
+                    return ExportResult('write_failed')
         if cancelled():
             return ExportResult('cancelled')
-        os.replace(temporary, destination)
-        return ExportResult('exported', destination, len(captured), incomplete)
+        if overwrite:
+            os.replace(temporary, destination)
+        else:
+            # Windows rename does not replace a destination created in the meantime.
+            temporary.rename(destination)
+        if receiver_report is not None:
+            incomplete |= receiver_report['outcome'] != 'complete'
+        return ExportResult('exported', destination, len(captured) if has_logs else 0, incomplete)
     except (OSError, ValueError, zipfile.BadZipFile):
         return ExportResult('write_failed')
     finally:

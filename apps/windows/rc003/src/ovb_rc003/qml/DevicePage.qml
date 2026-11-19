@@ -31,7 +31,7 @@ Item {
     FileDialog {
         id: logExportDialog
         objectName: "logExportDialog"
-        title: qsTr("导出日志")
+        title: qsTr("导出诊断报告")
         fileMode: FileDialog.SaveFile
         nameFilters: [qsTr("ZIP 压缩文件 (*.zip)")]
         defaultSuffix: "zip"

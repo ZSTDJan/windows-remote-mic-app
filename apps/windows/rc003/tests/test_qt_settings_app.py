@@ -7609,11 +7609,18 @@ class SettingsControllerTests(unittest.TestCase):
                     self.assertIn("浏览器不可用", controller.errorMessage)
 
     def test_export_logs_reports_honestly_when_never_run(self):
+        import zipfile
+        from ovb_rc003 import receiver_startup_report
+
         controller, _ = self._make_controller()
         destination = Path(self._tmpdir.name) / '日志.zip'
-        controller.exportLogs(destination.as_uri())
-        self.assertIn("暂无可导出", controller.statusMessage)
-        self.assertFalse(destination.exists())
+        with mock.patch.object(receiver_startup_report, '_collect_evidence',
+                               return_value=('child_failed', 17, None)):
+            controller.exportLogs(destination.as_uri())
+        self.assertIn('暂无运行日志', controller.statusMessage)
+        self.assertIn('部分诊断', controller.statusMessage)
+        with zipfile.ZipFile(destination) as archive:
+            self.assertIn('receiver-startup-report.json', archive.namelist())
         self.assertFalse(controller.logExportBusy)
 
     def test_open_log_location_reports_outcomes_and_works_with_diagnostics_off(self):
@@ -7639,6 +7646,8 @@ class SettingsControllerTests(unittest.TestCase):
 
     def test_export_logs_with_diagnostics_off_and_repeated_clicks(self):
         import zipfile
+        from ovb_rc003 import receiver_startup_report
+
         controller, _ = self._make_controller()
         controller._diagnostic_trace_enabled = False
         directory = controller._config_root / 'logs'
@@ -7651,11 +7660,14 @@ class SettingsControllerTests(unittest.TestCase):
         self.assertTrue(controller.logExportBusy)
         self.assertFalse(controller.exportLogs(destination.as_uri()))
         self.assertEqual(len(queued), 1)
-        queued[0]()
+        with mock.patch.object(receiver_startup_report, '_collect_evidence',
+                               return_value=('child_failed', 17, None)):
+            queued[0]()
         self.assertFalse(controller.logExportBusy)
-        self.assertIn('已导出 1 个', controller.statusMessage)
+        self.assertIn('已导出诊断报告', controller.statusMessage)
         with zipfile.ZipFile(destination) as archive:
             self.assertEqual(archive.read('app.log'), b'event\n')
+            self.assertIn('receiver-startup-report.json', archive.namelist())
 
     def test_export_cancel_invalid_url_and_worker_start_failure(self):
         controller, _ = self._make_controller()
@@ -10270,6 +10282,7 @@ from PySide6.QtCore import QMetaObject, QPointF, Qt
 from PySide6.QtTest import QTest
 from ovb_rc003 import application_update as u
 from ovb_rc003 import qt_settings_app as m
+from ovb_rc003 import receiver_startup_report
 
 # This QML probe uses local release fixtures only, including its startup timer.
 u.claim_daily_update_check = lambda _cache: False
@@ -10434,20 +10447,23 @@ for enabled in (False, True):
         log_directory.mkdir()
         for name in ("app.log", "hid-helper.log", "diagnostic-trace.jsonl"):
             (log_directory / name).write_bytes(b'event\n')
-    QMetaObject.invokeMethod(log_dialog, "accept", Qt.DirectConnection)
-    for _ in range(60):
-        render(window, app, 1)
-        if not controller.logExportBusy:
-            break
-    if enabled:
-        import zipfile
-        assert "已导出 3 个" in controller.statusMessage
-        assert destination.exists(), controller.statusMessage
-        with zipfile.ZipFile(destination) as archive:
+    with mock.patch.object(receiver_startup_report, "_collect_evidence",
+                           return_value=("child_failed", 17, None)):
+        QMetaObject.invokeMethod(log_dialog, "accept", Qt.DirectConnection)
+        for _ in range(60):
+            render(window, app, 1)
+            if not controller.logExportBusy:
+                break
+    import zipfile
+    assert "已导出诊断报告" in controller.statusMessage
+    assert destination.exists(), controller.statusMessage
+    with zipfile.ZipFile(destination) as archive:
+        assert "receiver-startup-report.json" in archive.namelist()
+        assert archive.testzip() is None
+        if enabled:
             assert archive.read("hid-helper.log") == b'event\n'
-            assert archive.testzip() is None
-    else:
-        assert "暂无可导出" in controller.statusMessage
+        else:
+            assert "暂无运行日志" in controller.statusMessage
     # Exercise the real QML click/controller/location helper, replacing only
     # Explorer so this isolated test never opens a desktop window.
     with mock.patch.object(m.logging_setup.os, "startfile") as opener:

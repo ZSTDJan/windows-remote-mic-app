@@ -18,6 +18,7 @@ from . import chromecast_diagnostics_windows as diagnostics
 from .diagnostic_trace import CleanupProgress
 from .chromecast_channel import Channel, SessionIdentity
 from .chromecast_pipe_windows import Pipe, PipeError, api, inspect_peer, verify_peer, bind_worker_peer, launch_worker
+from .receiver_startup_errors import WORK_DIRECTORY_FAILED
 
 _MESSAGES = {
     "recovering": "谷歌遥控器接收中断，正在恢复；恢复后请松开按键再按一次。",
@@ -35,6 +36,7 @@ _MESSAGES = {
     "hid_source_unconfirmed": "未能确认所选谷歌遥控器的按键来源，已停止接收；请导出日志核查。",
     "hid_symbol_unavailable": "未能定位当前蓝牙驱动的按键入口，已停止接收；请检查网络后重试或导出日志。",
     "hid_capture_failed": "谷歌按键接收没有取得可靠报告，已停止接收；请导出日志核查。",
+    WORK_DIRECTORY_FAILED: "谷歌接收组件无法创建工作目录。请导出日志反馈。",
     "stopped": "Chromecast 按键接收已停止。",
     "peer_identity_failed": "接收进程身份核对失败，本次未开始接收；请提供日志核查。",
     "pipe_connect_failed": "接收进程未能建立通信，本次未开始接收；请提供日志核查。",
@@ -46,11 +48,15 @@ def message(reason):
 
 
 class Client:
-    def __init__(self, entity, *, mode, on_edge, on_lost=None, on_voice=None):
+    def __init__(self, entity, *, mode, on_edge, on_lost=None, on_voice=None,
+                 private_work_directory=False):
         if mode not in ("detect", "run", "setup") or (mode == "setup" and on_voice is not None):
             raise ValueError("invalid_mode")
         self.identity = SessionIdentity.create(entity)
         self.mode, self.on_edge = mode, on_edge
+        if private_work_directory and mode != "run":
+            raise ValueError("invalid_work_directory_mode")
+        self._private_work_directory = private_work_directory
         self.on_lost = on_lost
         self.on_voice = on_voice
         self._voice_commands = queue.Queue(maxsize=32)
@@ -158,6 +164,13 @@ class Client:
     @property
     def is_running(self):
         return bool(self.thread and self.thread.is_alive() and not self.finished.is_set())
+
+    def can_retry_work_directory(self) -> bool:
+        return (
+            self.mode == "run" and not self._private_work_directory
+            and self._terminal_type == "error" and self.reason == WORK_DIRECTORY_FAILED
+            and self.finished.is_set() and self.cleanup_confirmed and self.exit_succeeded
+        )
 
     def start(self, *, cancel_event=None):
         if self.thread is not None:
@@ -332,6 +345,8 @@ class Client:
             voice_fields = {"voice": True} if self.on_voice is not None else {}
             if self.mode == "run":
                 voice_fields["recover"] = True
+            if self._private_work_directory:
+                voice_fields["private_work_directory"] = True
             pipe.write(outgoing.encode("start", mode=self.mode, **voice_fields))
             started = True
             last_heartbeat, last_peer = 0.0, 0.0

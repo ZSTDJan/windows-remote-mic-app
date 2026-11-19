@@ -280,8 +280,11 @@ hiddenimports = [
     # derives this inventory from every chromecast_*.py source file, so a new
     # runtime module cannot silently miss the frozen application.
     "ovb_rc003.chromecast_attach_diagnostics_windows",
+    "ovb_rc003.receiver_startup_errors",
+    "ovb_rc003.receiver_startup_report",
     "ovb_rc003.chromecast_buttons",
     "ovb_rc003.chromecast_channel",
+    "ovb_rc003.chromecast_cleanup",
     "ovb_rc003.chromecast_client",
     "ovb_rc003.chromecast_runtime",
     "ovb_rc003.chromecast_device_windows",

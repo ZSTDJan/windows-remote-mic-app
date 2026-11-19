@@ -111,6 +111,114 @@ class DiscoveryTests(unittest.IsolatedAsyncioTestCase):
         voice.close.assert_called_once()
         self.sessions[-1].close.assert_called_once()
 
+    async def test_legacy_worker_prepares_voice_before_input_ready_but_only_records_after_ready(self):
+        for outcome in ("first_hold", "stop_during_start", "work_directory_denied", "voice_unreachable"):
+            with self.subTest(outcome=outcome):
+                voice_service = service()
+                preparing, release_tap = threading.Event(), threading.Event()
+                identity = SessionIdentity.create(ENTITY)
+                commands, events = Channel(identity, commands=True), Channel(identity, commands=False)
+                inbox = deque([commands.encode("start", mode="run", voice=True)])
+                received = []
+                create_session = self.session_factory.side_effect
+
+                def prepare(device_id):
+                    result = create_session(device_id)
+                    preparing.set()
+                    if outcome == "stop_during_start":
+                        inbox.append(commands.encode("stop"))
+                    return result
+
+                def query(cache):
+                    if cache == BluetoothCacheMode.UNCACHED and outcome == "voice_unreachable":
+                        return SimpleNamespace(status=1, services=[])
+                    return SimpleNamespace(status=0, services=[voice_service])
+
+                target = self.target(query)
+                target.open = mock.AsyncMock()
+
+                def notify(part, payload):
+                    callback = voice_service.chars[part].add_value_changed.call_args.args[0]
+                    callback(None, SimpleNamespace(characteristic_value=payload))
+
+                async def write_voice(command):
+                    self.assertEqual(command, GET_CAPABILITIES)
+                    notify(2, CAPS)
+                    notify(2, bytes.fromhex("04030207"))
+
+                target.write_voice = mock.AsyncMock(side_effect=write_voice)
+
+                class Tap:
+                    def start(self):
+                        if not preparing.wait(2):
+                            raise TimeoutError("voice did not prepare alongside input")
+                        if outcome == "stop_during_start":
+                            release_tap.wait(2)
+                        elif outcome == "work_directory_denied":
+                            raise RuntimeError(worker.WORK_DIRECTORY_FAILED)
+
+                    def abort_start(self):
+                        release_tap.set()
+
+                    def source_alive(self):
+                        return True
+
+                    def close(self, **_):
+                        return True
+
+                    def poll(self):
+                        return [("hook_ready", "", time.monotonic())]
+
+                def write(raw):
+                    event = events.decode(raw)
+                    received.append(event)
+                    if event["type"] == "ready":
+                        self.assertTrue(self.sessions[-1].maintain_connection)
+                        target.device.get_gatt_services_with_cache_mode_async.assert_not_called()
+                        for char in voice_service.chars:
+                            char.add_value_changed.assert_not_called()
+                        target.write_voice.assert_not_called()
+                    elif event["type"] == "voice":
+                        if event["event"] == "host_start":
+                            inbox.append(commands.encode("voice_host", attempt=event["attempt"], result="ready"))
+                            notify(1, bytes(160))
+                            notify(2, b"\x00\x02")
+                        elif event["event"] == "host_stop":
+                            inbox.append(commands.encode("voice_host", attempt=event["attempt"], result="released"))
+                            inbox.append(commands.encode("stop"))
+                        elif event["event"] == "available" and event["data"] == "unavailable":
+                            inbox.append(commands.encode("stop"))
+
+                with (mock.patch.object(worker, "_selected", return_value=True),
+                      mock.patch.object(worker, "SelectedDevice", return_value=target),
+                      mock.patch.object(worker, "HidTap", return_value=Tap()),
+                      mock.patch.object(worker, "verify_peer"), mock.patch.object(worker, "inspect_peer"),
+                      mock.patch('winrt.windows.devices.bluetooth.genericattributeprofile.GattSession',
+                                 SimpleNamespace(from_device_id_async=mock.AsyncMock(side_effect=prepare))),
+                      mock.patch.object(adapter.config, "load_config", return_value={})):
+                    result = await asyncio.wait_for(worker.receive(identity, SimpleNamespace(pid=1),
+                        SimpleNamespace(read=lambda: inbox.popleft() if inbox else None, write=write)), 4)
+
+                self.assertEqual(result, 0)
+                self.assertTrue(preparing.is_set())
+                self.assertIsNone(target.device)
+                self.sessions[-1].close.assert_called_once()
+                self.assertFalse(self.sessions[-1].maintain_connection)
+                voice_events = [event["event"] for event in received if event["type"] == "voice"]
+                if outcome == "first_hold":
+                    self.assertEqual(voice_events.count("host_start"), 1)
+                    self.assertIn("audio", voice_events)
+                    self.assertEqual(voice_events.count("host_stop"), 1)
+                elif outcome == "voice_unreachable":
+                    self.assertEqual(voice_events, ["available"])
+                else:
+                    self.assertEqual(voice_events, [])
+                if outcome == "work_directory_denied":
+                    self.assertEqual(received[-1]["type"], "error")
+                    self.assertEqual(received[-1]["reason"], worker.WORK_DIRECTORY_FAILED)
+                else:
+                    self.assertEqual(received[-1]["type"], "stopped")
+
     async def test_timeout_keeps_cached_inventory_distinct_and_never_enables_voice(self):
         cached = service()
         target = self.target(None)

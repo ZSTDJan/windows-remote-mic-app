@@ -8517,12 +8517,16 @@ def _load_qt_classes() -> dict:
             self._log_export_busy = True
             self.logExportBusyChanged.emit()
             self._set_error_message('')
-            self._set_status_message('正在导出日志…', self._DEVICE_PAGE_INDEX)
+            self._set_status_message('正在生成诊断报告…', self._DEVICE_PAGE_INDEX)
 
             def run() -> None:
                 try:
-                    result = log_export.export_logs(destination, root=self._config_root,
-                                                    cancel=self._background_shutdown_event)
+                    from . import receiver_startup_report
+
+                    result = receiver_startup_report.collect(
+                        destination, root=self._config_root, cancel=self._background_shutdown_event,
+                        overwrite=True, discard_on_cancel=True,
+                    )
                 except Exception:
                     result = log_export.ExportResult('write_failed')
                 self._emit_background_result(self._logExportReady, result)
@@ -8538,8 +8542,14 @@ def _load_qt_classes() -> dict:
                 return
             self._log_export_busy = False
             self.logExportBusyChanged.emit()
-            message = log_export.describe_result(result)
-            if result.outcome in {'exported', 'no_logs', 'cancelled'}:
+            if result.outcome == 'exported':
+                note = '；部分诊断未能完整收集，详情见包内说明' if result.incomplete else ''
+                if not result.file_count:
+                    note += '；暂无运行日志'
+                message = f'已导出诊断报告：{result.path}{note}'
+            else:
+                message = log_export.describe_result(result)
+            if result.outcome in {'exported', 'cancelled'}:
                 self._set_status_message(message, self._DEVICE_PAGE_INDEX)
             else:
                 self._set_status_message('')

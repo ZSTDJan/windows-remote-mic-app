@@ -95,6 +95,7 @@ async def receive(identity, parent, pipe):
         stage = "device_open"
         device = SelectedDevice(identity.entity)
         device.cleanup_observer = observation.voice_cleanup
+        device.open_observer = observation.hid_startup
         # Initialization runs concurrently with the control loop below: native
         # discovery cannot prevent heartbeat/stop checks from being consumed.
         initialize = asyncio.create_task(device.open())
@@ -343,6 +344,17 @@ async def receive(identity, parent, pipe):
     return 0 if cleanup_ok else 2
 
 
+async def _receive_owned(receive, identity, parent, pipe):
+    from .chromecast_cleanup import RetireWorker
+    try:
+        return await receive(identity, parent, pipe)
+    except RetireWorker:
+        # main() has authenticated this elevated receiver and its parent. The
+        # input hook is already detached. Bypass Python/COM finalizers over the
+        # pending native operation; the OS closes only this process's handles.
+        os._exit(2)
+
+
 def main(args):
     pipe = None
     try:
@@ -365,7 +377,7 @@ def main(args):
         init_apartment(ApartmentType.MULTI_THREADED)
         try:
             from .chromecast_hid_worker import receive as receive_hid
-            return asyncio.run(receive_hid(identity, parent, pipe))
+            return asyncio.run(_receive_owned(receive_hid, identity, parent, pipe))
         finally:
             uninit_apartment()
     except Exception:

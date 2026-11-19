@@ -52,7 +52,8 @@ HID_STARTUP_STEPS = frozenset({"import_frida", "selected_host", "driver_layout",
     "attach_controller", "attach_process_before", "attach_process_after", "attach_token", "attach_exception",
     "attach_assets_before", "attach_assets_after", "attach_asset_access", "attach_evidence", "session_detached",
     "attach_policy", "attach_modules_before", "attach_modules_after", "attach_asset_file",
-    "attach_helper_scan", "attach_helper_manager", "attach_helper_service"})
+    "attach_helper_scan", "attach_helper_manager", "attach_helper_service", "attach_failure_text", "attach_failure_environment",
+    "device_open_call", "device_open_error", "device_open_summary"})
 HID_STARTUP_REASONS = frozenset({"none", "invalid_entity", "registry_read", "no_selected_host",
     "ambiguous_host", "debug_entries", "debug_signature", "pdb_name", "cache_root", "download_exit",
     "download_size", "download_signature", "startup_cancelled", "symbol_initialize_failed", "symbol_load_failed",
@@ -80,7 +81,8 @@ HID_DETAIL_NUMBERS = frozenset({"registry_nodes", "hardware_matches", "selected_
     "error_chars", "error_clipped", "chain_depth", "reported_code", "crash_present", "parent_depth", "requested_access",
     "dynamic_code", "extension_points", "signature_policy", "dynamic_code_error", "extension_points_error",
     "signature_policy_error", "process_changed", "module_limit", "module_name_errors", "loaded_driver", "loaded_agent",
-    "pe_valid", "hash_complete", "file_unchanged", "sample_count", "helper_count", "helper_pid"})
+    "pe_valid", "hash_complete", "file_unchanged", "sample_count", "helper_count", "helper_pid", "configured_mask", "call_index", "rows_omitted", "source_line", "enumeration_complete",
+    "adapter_count", "pair_count", "selected_count", "radio_changed", "returned_none", "device_id_size"})
 
 HID_DETAIL_CHOICES = {
     'sample_phase': {'before', 'after'},
@@ -101,11 +103,33 @@ def _valid_hid_details(info):
         if key in HID_DETAIL_NUMBERS:
             if not _integer(value, -1, 0xffffffff):
                 return False
-        elif key in ("driver_sha256", "pdb_sha256", "error_sha256", "asset_ref", "agent_sha256"):
+        elif key in ("driver_sha256", "pdb_sha256", "error_sha256", "asset_ref", "agent_sha256", "temp_ref", "tmp_ref", "tmpdir_ref", "device_id_ref"):
             if not isinstance(value, str) or len(value) != 64 or any(c not in "0123456789abcdef" for c in value):
+                return False
+        elif key == 'open_call':
+            from .receiver_startup_errors import DEVICE_OPEN_CALLS
+            if not isinstance(value, str) or value not in DEVICE_OPEN_CALLS:
+                return False
+        elif key == 'open_outcome':
+            from .receiver_startup_errors import DEVICE_OPEN_OUTCOMES
+            if not isinstance(value, str) or value not in DEVICE_OPEN_OUTCOMES:
+                return False
+        elif key == 'error_origin':
+            if value not in ('remote_selection', 'chromecast_device_windows', 'native_or_external'):
+                return False
+        elif key == 'device_id_kind':
+            if value not in ('paired_ble', 'interface', 'other', 'not_string'):
                 return False
         elif key in HID_DETAIL_CHOICES:
             if not isinstance(value, str) or value not in HID_DETAIL_CHOICES[key]:
+                return False
+        elif key == 'error_message':
+            from .receiver_startup_errors import MAX_MESSAGE, safe_message
+            if (not isinstance(value, str) or len(value) > MAX_MESSAGE
+                    or safe_message(value) != value):
+                return False
+        elif key == 'message_clipped':
+            if type(value) is not int or value not in (0, 1):
                 return False
         elif key == 'frida_version':
             import re
@@ -142,6 +166,14 @@ CLEANUP_OUTCOMES = frozenset({"none", "success", "status_failed", "timeout", "ca
 
 def _integer(value, low=0, high=MAX_COUNT):
     return type(value) is int and low <= value <= high
+
+
+def _valid_open_message(row):
+    if row['step'] not in ('device_open_call', 'device_open_error', 'device_open_summary'):
+        return True
+    from .receiver_startup_errors import device_open_message
+    text = row['details'].get('error_message', '')
+    return device_open_message(text) == text
 
 
 def valid_record(row):
@@ -193,7 +225,8 @@ def valid_record(row):
                 and _integer(row["cause_code"], -1, 0xffffffff)
                 and _integer(row["host_pid"], -1) and _integer(row["script_line"], -1, 65535)
                 and isinstance(row["reason"], str) and row["reason"] in HID_STARTUP_REASONS
-                and _valid_hid_details(row["details"]))
+                and _valid_hid_details(row["details"])
+                and _valid_open_message(row))
     if kind == "voice_link":
         return (set(row) == {"kind", "elapsed_ms", "attempt", "step", "outcome", "duration_ms", "hresult",
                             "connected", "device_access", "service_access", "sharing", "service_handle",

@@ -811,6 +811,15 @@ def _handoff_previous_application(
 
 def main() -> None:
     args = dev_session.consume_marker(sys.argv[1:])
+    if any(flag in args for flag in ('--receiver-startup-report', '--receiver-report-worker')):
+        from . import receiver_startup_report
+        if not args or args[0] not in (receiver_startup_report.FLAG, receiver_startup_report.CHILD_FLAG):
+            raise SystemExit(2)
+        if args[0] == receiver_startup_report.CHILD_FLAG:
+            if len(args) != 2:
+                raise SystemExit(2)
+            raise SystemExit(receiver_startup_report.worker(args[1]))
+        raise SystemExit(receiver_startup_report.main(args[1:]))
     if "--probe-rc003-candidate" in args:
         import os
         from . import ble_candidate_probe_process

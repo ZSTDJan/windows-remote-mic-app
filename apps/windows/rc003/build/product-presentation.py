@@ -38,6 +38,7 @@ def main() -> int:
         "runtime_directory_name": product_identity.WINDOWS_RUNTIME_DIRECTORY_NAME,
         "documentation_directory_name": product_identity.WINDOWS_DOCUMENTATION_DIRECTORY_NAME,
         "portable_readme_name": product_identity.WINDOWS_PORTABLE_README_NAME,
+        "receiver_report_launcher_name": product_identity.WINDOWS_RECEIVER_REPORT_LAUNCHER_NAME,
         "hid_helper_executable_name": product_identity.HID_HELPER_EXECUTABLE_NAME,
         "hid_helper_file_description": product_identity.HID_HELPER_FILE_DESCRIPTION,
         "main_file_description": main_metadata["file_description"],

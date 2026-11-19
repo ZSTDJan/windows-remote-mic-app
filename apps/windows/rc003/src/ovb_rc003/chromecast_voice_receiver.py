@@ -7,6 +7,7 @@ from __future__ import annotations
 import asyncio
 from collections import deque
 import time
+from .chromecast_cleanup import finish_cleanup
 from . import config
 from .diagnostic_errors import error_detail
 from .chromecast_voice import (Recording, GET_CAPABILITIES, CAPABILITIES_TIMEOUT, CAPABILITIES_MAX_ATTEMPTS,
@@ -116,7 +117,7 @@ class VoiceReceiver:
         except Exception:
             self.pipe_failed = True  # Metadata delivery must not interrupt closing a stream.
 
-    async def open(self):
+    async def open(self, *, source_ready=None):
         self._open_attempts += 1
         self._open_started = time.monotonic()
         self._open_retryable = False
@@ -129,7 +130,9 @@ class VoiceReceiver:
             self.observation.stage("voice_open_begin")
         opened = False
         try:
-            if self.direct_notifications:
+            if source_ready is not None:
+                await self.device.open_voice(direct=True, source_ready=source_ready)
+            elif self.direct_notifications:
                 await self.device.open_voice(direct=True)
             else:
                 await self.device.open_voice()
@@ -155,6 +158,9 @@ class VoiceReceiver:
                     else:
                         self.observation.voice_query(row, self._open_attempts)
             self._open_finished = time.monotonic()
+        if source_ready is not None:
+            # An early discovery failure must not announce voice before input ready.
+            await source_ready.wait()
         if self.observation:
             details = getattr(self.device, "voice_evidence", None)
             if details:
@@ -377,7 +383,6 @@ class VoiceReceiver:
         if self.pending:
             effect, _ = self.pending
             self._observe_command(effect.value, effect.attempt, 'cancel_requested', self._pending_started)
-            self.pending[1].cancel()
-            await asyncio.gather(self.pending[1], return_exceptions=True)
+            await finish_cleanup(self.pending[1], cancel=True)
             self._observe_command(effect.value, effect.attempt, 'cancel_settled', self._pending_started)
             self.pending = None

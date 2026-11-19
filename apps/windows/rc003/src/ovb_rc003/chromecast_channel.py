@@ -19,8 +19,9 @@ from . import remote_selection, remote_layout
 from .chromecast_buttons import ButtonEdge, STOP_REASONS
 from .chromecast_voice import MAX_INPUT_EPOCH, parse_lifecycle, parse_start_epoch
 from .chromecast_observation import valid_record
+from .receiver_startup_errors import WORK_DIRECTORY_FAILED
 
-VERSION = 29
+VERSION = 32
 MAX_MESSAGE_BYTES = 2048
 HEARTBEAT_TIMEOUT = 10.0
 RECOVERY_DELAYS = (1.0, 3.0, 5.0)
@@ -33,10 +34,12 @@ _REASONS = frozenset({"source_unconfirmed", "unsupported_layout", "radio_ambiguo
     "input_interface_unavailable", "input_identity_unconfirmed",
     "permission_required", "sensitive_logging_disabled", "sensitive_logging_enable_failed", "configured", "capture_lost", "capture_failed",
     "peer_lost", "stopped", "connection_changed", "input_payload_unavailable",
-    "hid_source_unconfirmed", "hid_symbol_unavailable", "hid_capture_failed", "invalid_message"})
+    "hid_source_unconfirmed", "hid_symbol_unavailable", "hid_capture_failed", "invalid_message",
+    WORK_DIRECTORY_FAILED})
 DIAGNOSTIC_REASONS = _REASONS | STOP_REASONS | frozenset({"cleanup_unconfirmed", "cleanup_failed"})
 DIAGNOSTIC_STAGES = frozenset({"start", "selection", "logging", "device_open", "source_probe",
-    "capture", "receive", "voice_open", "voice_tick", "voice_stop", "voice_close", "capture_stop", "device_close",
+    "capture", "receive", "working_directory", "voice_open", "voice_tick", "voice_stop", "voice_close",
+    "capture_stop", "device_close",
     "initialize_cancel", "tap_start_wait", "device_voice_close", "input_release", "observation_flush",
     "hid_script_unload", "hid_session_detach"})
 ACL_ISSUES = frozenset({"none", "header_unavailable", "invalid_handle", "reserved_flags",
@@ -209,6 +212,10 @@ class Channel:
                     expected.add("recover")
                     if type(message["recover"]) is not bool or message.get("mode") != "run":
                         raise ChannelError("invalid_recovery_start")
+                if "private_work_directory" in message:
+                    expected.add("private_work_directory")
+                    if message["private_work_directory"] is not True or message.get("mode") != "run":
+                        raise ChannelError("invalid_work_directory_start")
             elif kind in ("recover", "restart"):
                 if self.mode != "run" or not self.recovery_enabled:
                     raise ChannelError("invalid_recovery_command")

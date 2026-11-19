@@ -5,22 +5,38 @@ The legacy BTHPORT trace is never a readiness gate or an input source here.
 from __future__ import annotations
 
 import asyncio
+import os
 import time
 
-from . import config, remote_selection
+from . import config, hid_elevation_windows, remote_selection
 from .chromecast_buttons import HidButtonReceiver, empty_stop_details
 from .chromecast_channel import (Channel, ParentLease, SessionIdentity, DIAGNOSTIC_REASONS,
                                 RECOVERY_DELAYS, RECOVERABLE_RECEIVE_REASONS)
 from .chromecast_device_windows import SelectedDevice
 from .chromecast_hid_tap_windows import HidTap, startup_record
 from .chromecast_observation import Observation
+from .chromecast_cleanup import PendingCleanup, RetireWorker, finish_cleanup
 from .chromecast_pipe_windows import PipeError, inspect_peer, verify_peer
+from .receiver_startup_errors import WORK_DIRECTORY_FAILED
 
 
 def _selected(entity):
     settings = config.load_config(config.config_path())
     return (remote_selection.active_key(settings) == entity
             and remote_selection.active_profile(settings) == remote_selection.CHROMECAST_PROFILE)
+
+
+def _use_private_work_directory():
+    security = hid_elevation_windows
+    sid = security.current_user_sid()
+    directory = security.protected_runtime_owner_root(sid) / "receiver-temp"
+    directory = security.ensure_protected_directory(
+        directory, user_sid=sid, read_execute_sids=(security.LOCAL_SERVICE_SID,),
+    )
+    # This process owns all subsequent Frida sessions, including reconnects.
+    # GLib caches the location, so choose it before any capture starts.
+    for name in ("TEMP", "TMP", "TMPDIR"):
+        os.environ[name] = str(directory)
 
 
 async def receive(identity, parent, pipe):
@@ -63,6 +79,7 @@ async def _receive_once(identity, parent, pipe, recovery):
     lease = ParentLease(time.monotonic())
     device = tap = receiver = voice = voice_open = initialize = tap_start = None
     announced = False
+    source_ready = asyncio.Event()
     cleanup_ok = True
     reason, stage = "stopped", "start"
     voice_enabled = False
@@ -71,6 +88,16 @@ async def _receive_once(identity, parent, pipe, recovery):
     step_started = {}
     fallback_extended = False
     rearming = recovery["attempt"] > 0
+
+    def start_voice(*, prepare_early=False):
+        nonlocal voice, voice_open
+        from .chromecast_voice_receiver import VoiceReceiver
+        voice = VoiceReceiver(device, lambda kind, attempt, data, stamp:
+            pipe.write(events.encode("voice", event=kind, attempt=attempt, data=data, time=stamp)),
+            detect_only=start["mode"] == "detect", observation=observation,
+            direct_notifications=True, input_epoch=input_epoch)
+        opening = voice.open(source_ready=source_ready) if prepare_early else voice.open()
+        voice_open = asyncio.create_task(opening)
 
     def startup_evidence():
         nonlocal deadline, fallback_extended
@@ -119,9 +146,19 @@ async def _receive_once(identity, parent, pipe, recovery):
             cleanup_ok = True
             return 0
 
+        if start.get("private_work_directory") and recovery["attempt"] == 0:
+            stage = "working_directory"
+            diagnostic("begin", WORK_DIRECTORY_FAILED)
+            try:
+                _use_private_work_directory()
+            except (OSError, hid_elevation_windows.HidElevationError):
+                raise PipeError(WORK_DIRECTORY_FAILED) from None
+            diagnostic("done", WORK_DIRECTORY_FAILED)
+
         stage = "device_open"
         device = SelectedDevice(identity.entity)
         device.cleanup_observer = observation.voice_cleanup
+        device.open_observer = observation.hid_startup
         initialize = asyncio.create_task(device.open(require_input=False))
         deadline = time.monotonic() + 20
         last_peer = 0.0
@@ -179,6 +216,10 @@ async def _receive_once(identity, parent, pipe, recovery):
                 tap_started = time.monotonic()
                 deadline = tap_started + 25
                 observation.stage("hid_primary_start")
+                if voice_enabled and start["mode"] == "run" and not getattr(device, "google_tv_input", False):
+                    # Start the Windows connection for the paired device while the
+                    # input source starts. Device discovery still waits for ready.
+                    start_voice(prepare_early=True)
             if tap_start is not None:
                 startup_evidence()
                 if not tap_start.done():
@@ -194,7 +235,8 @@ async def _receive_once(identity, parent, pipe, recovery):
                     await completed_start
                 except Exception as error:
                     code = str(error)
-                    raise PipeError(code if code in {"hid_source_unconfirmed", "hid_symbol_unavailable"}
+                    raise PipeError(code if code in {"hid_source_unconfirmed", "hid_symbol_unavailable",
+                                                     WORK_DIRECTORY_FAILED}
                                     else "hid_capture_failed") from None
                 finally:
                     startup_evidence()
@@ -215,6 +257,7 @@ async def _receive_once(identity, parent, pipe, recovery):
                         receiver.confirm_source()
                         pipe.write(events.encode("ready"))
                         announced = True
+                        source_ready.set()
                         observation.stage("hid_primary_ready")
                         observation.stage("source_ready")
                     continue
@@ -247,12 +290,7 @@ async def _receive_once(identity, parent, pipe, recovery):
                                                       reason="ready_timeout"))
                 raise PipeError("hid_capture_failed")
             if announced and voice_enabled and voice is None:
-                from .chromecast_voice_receiver import VoiceReceiver
-                voice = VoiceReceiver(device, lambda kind, attempt, data, stamp:
-                    pipe.write(events.encode("voice", event=kind, attempt=attempt, data=data, time=stamp)),
-                    detect_only=start["mode"] == "detect", observation=observation,
-                    direct_notifications=True, input_epoch=input_epoch)
-                voice_open = asyncio.create_task(voice.open())
+                start_voice()
             if voice is not None:
                 for attribute, value, stamp in device.poll_voice():
                     voice.notification(attribute, value, stamp)
@@ -273,14 +311,25 @@ async def _receive_once(identity, parent, pipe, recovery):
             diagnostic("failed", reason)
     finally:
         observation.stage("stop")
+        native_pending = False
+        unsettled_tasks = []
+        capture_released = tap is None
         if tap is not None:
             tap.abort_start()
+        if not announced and voice_open is not None and not voice_open.done():
+            # Do not keep preparing voice while the aborted input startup settles.
+            voice_open.cancel()
         if initialize is not None:
             stage = "initialize_cancel"
             diagnostic("begin", reason)
-            initialize.cancel()
-            await asyncio.gather(initialize, return_exceptions=True)
-            diagnostic("done", reason)
+            try:
+                await finish_cleanup(initialize, cancel=True)
+                diagnostic("done", reason)
+            except PendingCleanup as error:
+                native_pending = True
+                unsettled_tasks.append(error.task)
+                cleanup_ok = False
+                diagnostic("failed", "cleanup_unconfirmed")
         if tap_start is not None:
             stage = "tap_start_wait"
             diagnostic("begin", reason)
@@ -309,6 +358,7 @@ async def _receive_once(identity, parent, pipe, recovery):
                 diagnostic("failed", "cleanup_failed")
             else:
                 cleanup_ok = cleanup_ok and tap_clean is not False
+                capture_released = tap_clean is True
                 diagnostic("done" if tap_clean is not False else "failed",
                            reason if tap_clean is not False else "cleanup_failed")
             finally:
@@ -318,8 +368,7 @@ async def _receive_once(identity, parent, pipe, recovery):
             diagnostic("begin", reason)
             try:
                 if voice_open is not None and not voice_open.done():
-                    voice_open.cancel()
-                    await asyncio.gather(voice_open, return_exceptions=True)
+                    await finish_cleanup(voice_open, cancel=True)
                 voice.stop()
                 deadline = time.monotonic() + 5
                 while time.monotonic() < deadline and not voice.hardware_stopped:
@@ -331,6 +380,11 @@ async def _receive_once(identity, parent, pipe, recovery):
                 cleanup_ok = cleanup_ok and voice.hardware_stopped
                 diagnostic("done" if voice.hardware_stopped else "failed",
                            reason if voice.hardware_stopped else "cleanup_unconfirmed")
+            except PendingCleanup as error:
+                native_pending = True
+                unsettled_tasks.append(error.task)
+                cleanup_ok = False
+                diagnostic("failed", "cleanup_unconfirmed")
             except Exception:
                 cleanup_ok = False
                 diagnostic("failed", "cleanup_failed")
@@ -338,8 +392,13 @@ async def _receive_once(identity, parent, pipe, recovery):
                 stage = "voice_close"
                 diagnostic("begin", reason)
                 try:
-                    await voice.close()
+                    await finish_cleanup(asyncio.create_task(voice.close()))
                     diagnostic("done", reason)
+                except PendingCleanup as error:
+                    native_pending = True
+                    unsettled_tasks.append(error.task)
+                    cleanup_ok = False
+                    diagnostic("failed", "cleanup_unconfirmed")
                 except Exception:
                     cleanup_ok = False
                     diagnostic("failed", "cleanup_failed")
@@ -353,7 +412,7 @@ async def _receive_once(identity, parent, pipe, recovery):
                 except Exception:
                     pass
             diagnostic("done", reason)
-        if device is not None:
+        if device is not None and not native_pending:
             stage = "device_voice_close"
             diagnostic("begin", reason)
             try:
@@ -363,6 +422,8 @@ async def _receive_once(identity, parent, pipe, recovery):
                 diagnostic("failed", "cleanup_failed")
             else:
                 diagnostic("done", reason)
+            native_pending = getattr(device, "cleanup_pending", False) is True
+        if device is not None and not native_pending:
             stage = "device_close"
             diagnostic("begin", reason)
             try:
@@ -376,6 +437,20 @@ async def _receive_once(identity, parent, pipe, recovery):
         diagnostic("begin", reason)
         observation.flush(final=True)
         diagnostic("done", reason)
+        if native_pending:
+            if capture_released:
+                # Do not close native owners under an in-flight operation or
+                # enter asyncio.run's unbounded cancellation/finalizer path.
+                # The authenticated entry retires ONLY this receiver process;
+                # the parent still requires an OS-confirmed process exit.
+                raise RetireWorker("cleanup_unconfirmed")
+            # A hook that did not detach is not permission to force an exit.
+            # Preserve its owner and the original completion wait in this
+            # separate failure branch, rather than guessing it is safe.
+            if device is not None and getattr(device, "cleanup_pending", False) is True:
+                unsettled_tasks.append(device._voice_cleanup_pending)
+            if unsettled_tasks:
+                await asyncio.wait(unsettled_tasks)
         if cleanup_ok and not events.closed:
             try:
                 retry = (commands.recovery_enabled and (announced or recovery["attempt"] > 0)

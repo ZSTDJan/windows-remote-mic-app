@@ -19,14 +19,9 @@
 
 ## 下载与版本
 
-**[下载正式版 1.0.106](https://github.com/ZSTDJan/windows-remote-mic-app/releases/download/v1.0.106/RemoteMicRC003-1.0.106-portable-unsigned.zip)** · [版本说明](https://github.com/ZSTDJan/windows-remote-mic-app/releases/tag/v1.0.106) · [SHA256SUMS.txt](https://github.com/ZSTDJan/windows-remote-mic-app/releases/download/v1.0.106/SHA256SUMS.txt)
+**[下载正式版 1.0.111](https://github.com/ZSTDJan/windows-remote-mic-app/releases/download/v1.0.111/RemoteMicRC003-1.0.111-portable-unsigned.zip)** · [版本说明](https://github.com/ZSTDJan/windows-remote-mic-app/releases/tag/v1.0.111) · [SHA256SUMS.txt](https://github.com/ZSTDJan/windows-remote-mic-app/releases/download/v1.0.111/SHA256SUMS.txt)
 
-当前正式版为 **1.0.106**。
-
-- 补充微信输入法 Windows 3.0.2.39 的正常结束接口识别，用于谷歌遥控器开关型到时或设备报告结束的场景。
-- 保留已有微信版本的适配、普通语音窗口筛选及未知版本保护。
-
-新版文件校验和隔离窗口检查已通过；微信 .39 的真实语音识别、文字上屏和实体遥控器效果仍待实测。
+当前正式版为 **1.0.111**。本版调整了谷歌遥控器的语音启动和停止流程，并补充接收诊断报告。9450 开机首按效果待实测。
 
 旧版可在 [历史版本](https://github.com/ZSTDJan/windows-remote-mic-app/releases) 中下载。
 

@@ -1,5 +1,17 @@
 #requires -Version 5.1
 
+function Copy-RC003PortableReportLauncher {
+    param(
+        [Parameter(Mandatory = $true)][string]$RC003Root,
+        [Parameter(Mandatory = $true)][string]$DocumentationDirectory,
+        [Parameter(Mandatory = $true)]$ProductPresentation
+    )
+
+    $source = Join-Path $RC003Root "scripts\collect-receiver-startup-report.cmd"
+    $target = Join-Path $DocumentationDirectory ([string]$ProductPresentation.receiver_report_launcher_name)
+    Copy-Item -LiteralPath $source -Destination $target -Force -ErrorAction Stop
+}
+
 function Get-RC003PortableStreamSha256 {
     param([Parameter(Mandatory = $true)][System.IO.Stream]$Stream)
 

@@ -284,7 +284,7 @@ def audit(path, *, since=None, until=None, version=None, device=None):
                 result['trace_events'][info.filename] = dict(events)
                 if invalid:
                     result['limitations'].append(f'invalid_trace:{info.filename}')
-            elif info.filename in ('export-info.json', 'diagnostic-report.json'):
+            elif info.filename in ('export-info.json', 'diagnostic-report.json', 'receiver-startup-report.json'):
                 try:
                     parsed[info.filename] = json.loads(text)
                     if not isinstance(parsed[info.filename], dict):

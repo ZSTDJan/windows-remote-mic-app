@@ -211,6 +211,10 @@ def record_exception(error, emit):
             break
         seen.add(id(error))
         emit('attach_exception', 'failed', details=dict(exception_details(error), chain_depth=depth), error=error)
+        from .receiver_startup_errors import failure_details, failure_environment
+        if depth == 0:
+            emit('attach_failure_environment', 'failed', details=failure_environment())
+        emit('attach_failure_text', 'failed', details=dict(failure_details(error), chain_depth=depth), error=error)
         error = error.__cause__ or (None if error.__suppress_context__ else error.__context__)
 
 
