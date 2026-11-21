@@ -3574,6 +3574,15 @@ class OrdinaryButtonGestureWiringTests(_AppWiringTestCase):
                                  "" if success else "element_navigation_failed")
                 self.assertEqual(outcomes[0]["error_type"], error_type)
 
+    def test_focus_input_action_dispatches_to_win32_input(self):
+        with mock.patch.object(
+            win32_input, "focus_foreground_input_element", return_value=True
+        ) as focus_mock:
+            self.app._apply_button_action(
+                key_mapping.ButtonAction(key_mapping.ActionKind.FOCUS_INPUT)
+            )
+        focus_mock.assert_called_once_with()
+
     def test_application_diagnostic_matches_launch_availability(self):
         for available in (False, True):
             with self.subTest(available=available), mock.patch.object(
@@ -3721,18 +3730,22 @@ class OrdinaryButtonGestureWiringTests(_AppWiringTestCase):
 
         self.assertEqual(button_calls, ["left", "right", "middle", "x1", "x2"])
 
-    def test_old_wheel_mapping_becomes_nonrepeating_page_key(self):
+    def test_wheel_mapping_repeatability_and_action_kind(self):
+        repeatable_buttons = {"up", "down", "left", "right", "back", "volume_up", "volume_down"}
         for button_id in ("mic", "power", "up", "down", "left", "right", "ok", "back",
                           "volume_up", "volume_down", "home", "menu", "tv"):
             for kind in (key_mapping.ActionKind.MOUSE_WHEEL_UP,
                          key_mapping.ActionKind.MOUSE_WHEEL_DOWN):
                 with self.subTest(button_id=button_id, kind=kind):
                     self.app._bindings["bindings"][button_id] = {"kind": kind.value, "keys": []}
-                    self.assertFalse(self.app._is_button_repeatable(button_id))
+                    self.assertEqual(
+                        self.app._is_button_repeatable(button_id),
+                        button_id in repeatable_buttons,
+                    )
                     action = key_mapping.button_action_for(
                         self.app._bindings, button_id, key_mapping.ButtonTrigger.SINGLE_CLICK
                     )
-                    self.assertEqual(action.kind, key_mapping.ActionKind.KEY_COMBO)
+                    self.assertEqual(action.kind, kind)
 
     def test_every_visible_action_option_saves_and_has_an_execution_route(self):
         senders = (
@@ -3741,6 +3754,8 @@ class OrdinaryButtonGestureWiringTests(_AppWiringTestCase):
             "send_delete_backward", "send_show_desktop", "send_context_menu",
             "send_app_switcher", "send_volume_up", "send_volume_down",
             "send_volume_mute", "send_play_pause", "send_mouse_button_click", "paste_text",
+            "focus_foreground_input_element",
+            "send_mouse_wheel_up", "send_mouse_wheel_down",
         )
         with ExitStack() as stack:
             effects = [stack.enter_context(mock.patch.object(win32_input, name)) for name in senders]

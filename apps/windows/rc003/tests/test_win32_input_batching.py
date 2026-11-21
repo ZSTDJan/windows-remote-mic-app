@@ -611,6 +611,23 @@ class MouseInputTests(unittest.TestCase):
             win32_input.send_mouse_button_click("unknown", _sender=sender)
         self.assertEqual(sender.calls, [])
 
+    def test_send_mouse_wheel_submits_expected_events(self):
+        sender = RecordingSender()
+        win32_input.send_mouse_wheel(120, _sender=sender)
+        self.assertEqual(sender.calls, [[(win32_input._MOUSEEVENTF_WHEEL, 120)]])
+
+        sender = RecordingSender()
+        win32_input.send_mouse_wheel_up(_sender=sender)
+        self.assertEqual(sender.calls, [[(win32_input._MOUSEEVENTF_WHEEL, 120)]])
+
+        sender = RecordingSender()
+        win32_input.send_mouse_wheel_down(_sender=sender)
+        self.assertEqual(sender.calls, [[(win32_input._MOUSEEVENTF_WHEEL, -120)]])
+
+    def test_send_mouse_wheel_raises_on_delivery_failure(self):
+        with self.assertRaises(OSError):
+            win32_input.send_mouse_wheel(120, _sender=lambda events: 0)
+
 
 class WeTypeVoiceKeyComboTests(unittest.TestCase):
     def test_down_sends_one_virtual_key_edge_per_call_with_80ms_gap(self):

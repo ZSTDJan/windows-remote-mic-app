@@ -64,6 +64,7 @@ class DisplayRoundTripTests(unittest.TestCase):
             "鼠标 X1 单击": key_mapping.ActionKind.MOUSE_X1_CLICK,
             "鼠标 X2 单击": key_mapping.ActionKind.MOUSE_X2_CLICK,
             "元素导航开关": key_mapping.ActionKind.ELEMENT_NAVIGATION_TOGGLE,
+            "聚焦输入框": key_mapping.ActionKind.FOCUS_INPUT,
         }
         for label, action_kind in expected.items():
             restored = _display_to_action(label)
@@ -115,15 +116,15 @@ class DisplayRoundTripTests(unittest.TestCase):
             ),
         )
 
-    def test_old_wheel_actions_display_as_page_keys(self):
-        for old_kind, label in (
-            (key_mapping.ActionKind.MOUSE_WHEEL_UP, "PageUp"),
-            (key_mapping.ActionKind.MOUSE_WHEEL_DOWN, "PageDown"),
+    def test_wheel_actions_display_as_reference_action(self):
+        for kind, label in (
+            (key_mapping.ActionKind.MOUSE_WHEEL_UP, "滚轮向上"),
+            (key_mapping.ActionKind.MOUSE_WHEEL_DOWN, "滚轮向下"),
         ):
-            self.assertEqual(_action_to_display(key_mapping.ButtonAction(old_kind)), label)
+            self.assertEqual(_action_to_display(key_mapping.ButtonAction(kind)), label)
             self.assertEqual(
                 _display_to_action(label),
-                key_mapping.ButtonAction(key_mapping.ActionKind.KEY_COMBO, (label.lower(),)),
+                key_mapping.ButtonAction(kind),
             )
 
     def test_legacy_alt_escape_app_switch_is_displayed_as_reference_action(self):

@@ -39,6 +39,7 @@ without needing ``ctypes.windll`` (which does not exist off Windows) at all.
 from __future__ import annotations
 
 import ctypes
+import logging
 import os
 import sys
 import threading
@@ -86,6 +87,8 @@ _MOUSEEVENTF_MIDDLEDOWN = 0x0020
 _MOUSEEVENTF_MIDDLEUP = 0x0040
 _MOUSEEVENTF_XDOWN = 0x0080
 _MOUSEEVENTF_XUP = 0x0100
+_MOUSEEVENTF_WHEEL = 0x0800
+_MOUSE_WHEEL_DELTA = 120
 _XBUTTON1 = 0x0001
 _XBUTTON2 = 0x0002
 _VK_LBUTTON = 0x01
@@ -1003,6 +1006,68 @@ def send_mouse_button_up(
         raise error_type(
             f"SendInput did not deliver mouse {button} up; retry attempted"
         )
+
+
+def _ensure_cursor_in_foreground_window() -> None:
+    """If the mouse cursor is outside the active foreground window, place it inside."""
+    try:
+        if sys.platform != "win32":
+            return
+        user32 = ctypes.windll.user32
+        foreground = user32.GetForegroundWindow()
+        if not foreground:
+            return
+        rect = wintypes.RECT()
+        if not user32.GetWindowRect(foreground, ctypes.byref(rect)):
+            return
+        if rect.right <= rect.left or rect.bottom <= rect.top:
+            return
+        pt = wintypes.POINT()
+        if not user32.GetCursorPos(ctypes.byref(pt)):
+            return
+        if not (rect.left <= pt.x < rect.right and rect.top <= pt.y < rect.bottom):
+            cx = rect.left + (rect.right - rect.left) // 2
+            cy = rect.top + (rect.bottom - rect.top) // 2
+            user32.SetCursorPos(cx, cy)
+    except Exception:
+        pass
+
+
+def send_mouse_wheel(
+    delta: int = _MOUSE_WHEEL_DELTA,
+    *,
+    _sender: Optional[MouseSender] = None,
+) -> None:
+    """Submit a mouse wheel rotation event. Positive delta scrolls up, negative down."""
+    _ensure_cursor_in_foreground_window()
+    sender = _sender or _real_send_mouse_input_batch
+    event: MouseEvent = (_MOUSEEVENTF_WHEEL, int(delta))
+    try:
+        sent = sender([event])
+    except Win32InputUnavailableError:
+        raise
+    except Exception as exc:
+        raise OSError(f"mouse wheel delivery failed: {exc}") from exc
+    if sent < 1:
+        raise OSError("SendInput did not deliver mouse wheel event")
+
+
+def send_mouse_wheel_up(
+    delta: int = _MOUSE_WHEEL_DELTA,
+    *,
+    _sender: Optional[MouseSender] = None,
+) -> None:
+    """Scroll mouse wheel up (forward)."""
+    send_mouse_wheel(abs(delta), _sender=_sender)
+
+
+def send_mouse_wheel_down(
+    delta: int = _MOUSE_WHEEL_DELTA,
+    *,
+    _sender: Optional[MouseSender] = None,
+) -> None:
+    """Scroll mouse wheel down (backward)."""
+    send_mouse_wheel(-abs(delta), _sender=_sender)
 
 
 def _best_effort_release(
@@ -2228,3 +2293,183 @@ def send_volume_mute(*, _sender: Optional[RawSender] = None) -> None:
 
 def send_play_pause(*, _sender: Optional[RawSender] = None) -> None:
     _send_semantic_tap(("media_play_pause",), _sender=_sender)
+
+
+_logger = logging.getLogger("ovb_rc003.win32_input")
+
+
+def focus_foreground_input_element(
+    *,
+    _target_hwnd: Optional[int] = None,
+    _sender: Optional[MouseSender] = None,
+) -> bool:
+    """Find and focus the primary editable text element in the foreground window.
+
+    Supports UIAutomation (Win32, WPF, UWP, Chromium / Electron apps) with a
+    standard Win32 EnumChildWindows fallback for traditional dialogs.
+    """
+    _require_windows()
+    user = ctypes.WinDLL("user32", use_last_error=True)
+    user.GetForegroundWindow.argtypes = ()
+    user.GetForegroundWindow.restype = wintypes.HWND
+    hwnd = _target_hwnd if _target_hwnd is not None else user.GetForegroundWindow()
+    if not hwnd:
+        _logger.info("focus_foreground_input_element: no foreground window handle")
+        return False
+
+    # 1. UIAutomation path
+    try:
+        import uiautomation as auto
+        window = auto.ControlFromHandle(hwnd)
+        if window:
+            win_rect = window.BoundingRectangle
+            win_w = win_rect.width()
+            win_h = win_rect.height()
+
+            candidates = []
+            count = 0
+            for ctrl, depth in auto.WalkControl(window, includeTop=False, maxDepth=45):
+                count += 1
+                if count > 2500:
+                    break
+                try:
+                    if getattr(ctrl, "IsOffscreen", False):
+                        continue
+                    if not getattr(ctrl, "IsEnabled", True):
+                        continue
+
+                    rect = ctrl.BoundingRectangle
+                    w_px = rect.width()
+                    h_px = rect.height()
+                    if w_px < 15 or h_px < 10:
+                        continue
+
+                    # Reject root document / full window canvas containers
+                    if (win_w > 0 and win_h > 0 and w_px >= win_w * 0.85 and h_px >= win_h * 0.85) or getattr(ctrl, "AutomationId", "") == "RootWebArea":
+                        continue
+
+                    c_type = ctrl.ControlType
+                    name_lower = (ctrl.Name or "").lower()
+                    class_lower = (ctrl.ClassName or "").lower()
+                    is_focusable = getattr(ctrl, "IsKeyboardFocusable", False)
+
+                    is_input = False
+                    type_bonus = 0
+
+                    # 1. EditControl is the primary standard
+                    if c_type == auto.ControlType.EditControl:
+                        is_input = True
+                        type_bonus = 50000
+                    # 2. DocumentControl that is an editor (not whole-window)
+                    elif c_type == auto.ControlType.DocumentControl:
+                        if win_h == 0 or h_px < win_h * 0.7:
+                            is_input = True
+                            type_bonus = 30000
+                    # 3. ComboBoxControl with input traits (e.g. Antigravity chat input)
+                    elif c_type == auto.ControlType.ComboBoxControl:
+                        if any(k in name_lower for k in ("message", "input", "prompt", "chat", "search", "输入")) or "cursor-text" in class_lower:
+                            is_input = True
+                            type_bonus = 50000
+                        elif is_focusable and h_px < 150:
+                            is_input = True
+                            type_bonus = 20000
+                    # 4. Other custom controls with text editor classes or input names
+                    elif is_focusable:
+                        if "cursor-text" in class_lower or "ql-editor" in class_lower:
+                            is_input = True
+                            type_bonus = 50000
+                        elif any(k in name_lower for k in ("message input", "chat input", "输入提示", "发送消息", "输入消息")):
+                            is_input = True
+                            type_bonus = 40000
+
+                    if not is_input:
+                        continue
+
+                    name_bonus = 0
+                    if any(k in name_lower for k in ("message", "prompt", "消息", "提示", "chat", "发送")):
+                        name_bonus = 60000
+                    if any(k in name_lower for k in ("search", "搜索")) or "omnibox" in class_lower:
+                        name_bonus = -20000
+
+                    score = type_bonus + name_bonus + rect.bottom * 10 + min(w_px * h_px, 10000)
+                    candidates.append((score, ctrl, rect))
+                except Exception:
+                    pass
+
+            if candidates:
+                candidates.sort(key=lambda item: item[0], reverse=True)
+                score, target_el, target_rect = candidates[0]
+                _logger.info(
+                    "focus_foreground_input_element: uiautomation found %d candidate(s), chosen %s name=%r rect=%s score=%d",
+                    len(candidates),
+                    getattr(target_el, "ControlTypeName", "element"),
+                    getattr(target_el, "Name", ""),
+                    target_rect,
+                    score,
+                )
+                try:
+                    target_el.SetFocus()
+                except Exception as exc:
+                    _logger.debug("target_el.SetFocus failed: %s", exc)
+                try:
+                    click_x = (target_rect.left + target_rect.right) // 2
+                    click_y = (target_rect.top + target_rect.bottom) // 2
+                    user.SetCursorPos.argtypes = (ctypes.c_int, ctypes.c_int)
+                    user.SetCursorPos.restype = wintypes.BOOL
+                    user.SetCursorPos(click_x, click_y)
+                    send_mouse_button_click("left", _sender=_sender)
+                    return True
+                except Exception as exc:
+                    _logger.debug("SetCursorPos/click failed: %s", exc)
+                return True
+    except Exception as exc:
+        _logger.warning("focus_foreground_input_element: uiautomation scan failed: %s", exc)
+
+    # 2. Pure Win32 fallback
+    try:
+        edit_candidates = []
+        user.IsWindowVisible.argtypes = (wintypes.HWND,)
+        user.IsWindowVisible.restype = wintypes.BOOL
+        user.IsWindowEnabled.argtypes = (wintypes.HWND,)
+        user.IsWindowEnabled.restype = wintypes.BOOL
+        user.GetClassNameW.argtypes = (wintypes.HWND, wintypes.LPWSTR, ctypes.c_int)
+        user.GetClassNameW.restype = ctypes.c_int
+        user.GetWindowRect.argtypes = (wintypes.HWND, ctypes.POINTER(wintypes.RECT))
+        user.GetWindowRect.restype = wintypes.BOOL
+        user.SetFocus.argtypes = (wintypes.HWND,)
+        user.SetFocus.restype = wintypes.HWND
+        user.SetCursorPos.argtypes = (ctypes.c_int, ctypes.c_int)
+        user.SetCursorPos.restype = wintypes.BOOL
+
+        def _enum_child(h: int, _: int) -> bool:
+            class_name = (ctypes.c_wchar * 256)()
+            user.GetClassNameW(h, class_name, 256)
+            cname = class_name.value.lower()
+            if "edit" in cname or "rich" in cname:
+                if user.IsWindowVisible(h) and user.IsWindowEnabled(h):
+                    rect = wintypes.RECT()
+                    user.GetWindowRect(h, ctypes.byref(rect))
+                    w = rect.right - rect.left
+                    h_val = rect.bottom - rect.top
+                    if w > 10 and h_val > 8:
+                        edit_candidates.append((rect.bottom + (10000 if w * h_val > 2000 else 0), h, rect))
+            return True
+
+        WNDENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+        user.EnumChildWindows.argtypes = (wintypes.HWND, WNDENUMPROC, wintypes.LPARAM)
+        user.EnumChildWindows.restype = wintypes.BOOL
+        user.EnumChildWindows(hwnd, WNDENUMPROC(_enum_child), 0)
+        if edit_candidates:
+            edit_candidates.sort(key=lambda item: item[0], reverse=True)
+            _, target_h, target_rect = edit_candidates[0]
+            _logger.info("focus_foreground_input_element: win32 fallback found %d candidate(s)", len(edit_candidates))
+            user.SetFocus(target_h)
+            click_x = min(target_rect.left + 25, (target_rect.left + target_rect.right) // 2)
+            click_y = min(target_rect.top + 15, (target_rect.top + target_rect.bottom) // 2)
+            user.SetCursorPos(click_x, click_y)
+            send_mouse_button_click("left", _sender=_sender)
+            return True
+    except Exception as exc:
+        _logger.warning("focus_foreground_input_element: win32 fallback failed: %s", exc)
+
+    return False
