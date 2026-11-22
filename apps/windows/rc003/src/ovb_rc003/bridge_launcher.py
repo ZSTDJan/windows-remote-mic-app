@@ -1,8 +1,9 @@
-"""Own the bridge worker inside the single desktop application process.
+"""Own the bridge worker inside the single resident desktop process.
 
-Normal product calls start one in-process worker. Explicit commands and the
-``Popen`` seams remain only for compatibility tooling and deterministic tests;
-the settings window and login startup never create a second resident process.
+The resident process starts one in-process worker; the settings window asks
+that process to start or reconnect instead of creating a second one. The
+``Popen`` seams remain for the compatibility ``--bridge`` launch and
+deterministic tests.
 """
 
 from __future__ import annotations
@@ -22,6 +23,7 @@ from . import dev_session, single_instance
 # Reused, not redefined - see module docstring's ALREADY_RUNNING note.
 ALREADY_RUNNING_EXIT_CODE = single_instance.DUPLICATE_INSTANCE_EXIT_CODE
 SETTINGS_LAUNCH_FLAG = "--bridge-from-settings"
+NO_VOICE_PROGRAM_FLAG = "--no-voice-program"
 
 DEFAULT_GRACE_CHECKS = 10
 DEFAULT_POLL_INTERVAL_SECONDS = 0.15
@@ -51,6 +53,7 @@ def build_launch_command(
     *,
     frozen: Optional[bool] = None,
     executable: Optional[str] = None,
+    launch_voice_program_on_start: bool = True,
 ) -> List[str]:
     """Builds the bridge launch command for the CURRENT process shape.
     Always appends ``--bridge``: the no-argument form of this exe now opens
@@ -70,12 +73,13 @@ def build_launch_command(
             "sys.executable is empty; cannot construct a bridge launch command"
         )
 
+    extra_flags = [] if launch_voice_program_on_start else [NO_VOICE_PROGRAM_FLAG]
     if frozen:
         # The same frozen exe handles both modes: with no arguments (or
         # --settings) it opens the settings window, and with --bridge (as
         # launched here) it starts the bridge - see __main__.py's dispatch.
         return dev_session.mark_command(
-            [executable, "--bridge", SETTINGS_LAUNCH_FLAG]
+            [executable, "--bridge", SETTINGS_LAUNCH_FLAG, *extra_flags]
         )
     # The current interpreter, `-m ovb_rc003 --bridge`.
     return dev_session.mark_command(
@@ -85,6 +89,7 @@ def build_launch_command(
             "ovb_rc003",
             "--bridge",
             SETTINGS_LAUNCH_FLAG,
+            *extra_flags,
         ]
     )
 
@@ -494,23 +499,23 @@ def start_bridge_launch(
     grace_checks: int = DEFAULT_GRACE_CHECKS,
     _popen: Callable[..., "subprocess.Popen"] = subprocess.Popen,
     _popen_kwargs: Optional[Dict[str, object]] = None,
+    launch_voice_program_on_start: bool = True,
 ) -> Union[LaunchResult, PendingBridgeLaunch]:
-    """Start the bridge and perform only the immediate status poll.
+    """Start the resident bridge process and perform only the immediate poll.
 
-    Production calls without an explicit command run inside the current
-    desktop process. Explicit commands and injected ``Popen`` callables keep
-    the bounded subprocess path for compatibility tests and tooling.
+    The settings window is an on-demand UI process and never hosts a worker;
+    the command always launches the resident ``--bridge`` entry point (or the
+    explicit/injected command a test supplies).
     """
 
-    if (
-        command is None
-        and _popen is subprocess.Popen
-        and _popen_kwargs is None
-    ):
-        return start_in_process_bridge(grace_checks=grace_checks)
-
     resolved_command: Tuple[str, ...] = (
-        tuple(command) if command is not None else tuple(build_launch_command())
+        tuple(command)
+        if command is not None
+        else tuple(
+            build_launch_command(
+                launch_voice_program_on_start=launch_voice_program_on_start
+            )
+        )
     )
     popen_kwargs = dict(_popen_kwargs) if _popen_kwargs is not None else {}
     if _popen is subprocess.Popen and sys.platform == "win32":
@@ -585,6 +590,7 @@ def launch_bridge(
     _popen: Callable[..., "subprocess.Popen"] = subprocess.Popen,
     _sleep: Callable[[float], None] = time.sleep,
     _popen_kwargs: Optional[Dict[str, object]] = None,
+    launch_voice_program_on_start: bool = True,
 ) -> LaunchResult:
     """Starts the bridge and watches it for a short grace period to tell a
     process that is actually running apart from one that merely got created
@@ -599,6 +605,7 @@ def launch_bridge(
         grace_checks=grace_checks,
         _popen=_popen,
         _popen_kwargs=_popen_kwargs,
+        launch_voice_program_on_start=launch_voice_program_on_start,
     )
     if isinstance(attempt, LaunchResult):
         return attempt

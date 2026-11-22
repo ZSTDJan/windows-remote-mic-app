@@ -548,6 +548,12 @@ class _ArgvRestoringTestCase(unittest.TestCase):
         self._original_runtime_guard_cls = (
             single_instance.ApplicationRuntimeInstanceGuard
         )
+        self._original_settings_window_guard_cls = (
+            single_instance.SettingsWindowInstanceGuard
+        )
+        self._original_configured_start_bridge = (
+            main_module._configured_start_bridge
+        )
         self._original_activate_settings = (
             single_instance.activate_existing_settings_window
         )
@@ -574,9 +580,11 @@ class _ArgvRestoringTestCase(unittest.TestCase):
         single_instance.show_bridge_startup_blocked_notice = lambda message: None
         single_instance.ApplicationInstanceGuard = _make_guard_class()
         single_instance.ApplicationRuntimeInstanceGuard = _make_guard_class()
+        single_instance.SettingsWindowInstanceGuard = _make_guard_class()
+        main_module._configured_start_bridge = lambda: False
         single_instance.activate_existing_settings_window = lambda: True
         single_instance.activate_current_runtime_settings_window = lambda: True
-        single_instance.write_bridge_start_request = lambda _root: None
+        single_instance.write_bridge_start_request = lambda _root, **kwargs: None
         main_module._migrate_legacy_bridge_before_desktop_start = lambda: False
 
     def tearDown(self):
@@ -586,6 +594,12 @@ class _ArgvRestoringTestCase(unittest.TestCase):
         )
         single_instance.ApplicationRuntimeInstanceGuard = (
             self._original_runtime_guard_cls
+        )
+        single_instance.SettingsWindowInstanceGuard = (
+            self._original_settings_window_guard_cls
+        )
+        main_module._configured_start_bridge = (
+            self._original_configured_start_bridge
         )
         single_instance.activate_existing_settings_window = (
             self._original_activate_settings
@@ -624,9 +638,22 @@ class DesktopModeRoutingTests(_ArgvRestoringTestCase):
             settings_ui.main = original
         return calls
 
-    def test_no_arguments_open_the_single_desktop_application(self):
+    def _run_with_resident_spy(self, argv):
+        from ovb_rc003 import resident_shell
+
+        calls = []
+        original = resident_shell.main
+        resident_shell.main = lambda **kwargs: calls.append(kwargs) or 0
+        sys.argv = argv
+        try:
+            main_module.main()
+        finally:
+            resident_shell.main = original
+        return calls
+
+    def test_no_arguments_open_the_on_demand_settings_window(self):
         enter_calls = []
-        single_instance.ApplicationInstanceGuard = _make_guard_class(
+        single_instance.SettingsWindowInstanceGuard = _make_guard_class(
             enter_calls=enter_calls
         )
 
@@ -635,51 +662,119 @@ class DesktopModeRoutingTests(_ArgvRestoringTestCase):
         self.assertEqual(enter_calls, [1])
         self.assertEqual(calls, [{"start_bridge": False}])
 
-    def test_residual_legacy_bridge_is_restarted_inside_the_desktop_process(self):
+    def test_residual_legacy_bridge_is_restarted_by_the_resident(self):
         main_module._migrate_legacy_bridge_before_desktop_start = lambda: True
 
-        calls = self._run_with_settings_spy(["ovb_rc003"])
+        calls = self._run_with_resident_spy(["ovb_rc003", "--background"])
 
-        self.assertEqual(calls, [{"start_bridge": True}])
+        self.assertEqual(
+            calls,
+            [{"start_bridge": True, "launch_voice_program_on_start": True}],
+        )
 
-    def test_explicit_settings_open_the_same_desktop_application(self):
+    def test_explicit_settings_open_the_settings_window(self):
         calls = self._run_with_settings_spy(["ovb_rc003", "--settings"])
 
         self.assertEqual(calls, [{"start_bridge": False}])
 
-    def test_background_start_keeps_the_single_application_hidden(self):
-        calls = self._run_with_settings_spy(["ovb_rc003", "--background"])
-
-        self.assertEqual(
-            calls,
-            [{"start_hidden": True, "start_bridge": False}],
+    def test_background_start_runs_the_resident_without_a_window(self):
+        resident_calls = self._run_with_resident_spy(
+            ["ovb_rc003", "--background"]
         )
 
-    def test_bridge_compatibility_mode_starts_the_same_application_hidden(self):
-        calls = self._run_with_settings_spy(["ovb_rc003", "--bridge"])
+        self.assertEqual(
+            resident_calls,
+            [{"start_bridge": False, "launch_voice_program_on_start": True}],
+        )
+
+    def test_bridge_compatibility_mode_starts_the_resident_bridge(self):
+        resident_calls = self._run_with_resident_spy(["ovb_rc003", "--bridge"])
 
         self.assertEqual(
-            calls,
-            [{"start_hidden": True, "start_bridge": True}],
+            resident_calls,
+            [{"start_bridge": True, "launch_voice_program_on_start": True}],
+        )
+
+    def test_background_start_honours_the_saved_service_start_choice(self):
+        main_module._configured_start_bridge = lambda: True
+
+        resident_calls = self._run_with_resident_spy(
+            ["ovb_rc003", "--background"]
+        )
+
+        self.assertEqual(
+            resident_calls,
+            [{"start_bridge": True, "launch_voice_program_on_start": True}],
+        )
+
+    def test_background_start_never_offers_a_version_handoff_at_logon(self):
+        single_instance.ApplicationInstanceGuard = _make_guard_class(
+            raise_on_enter=single_instance.DuplicateInstanceError("old copy")
+        )
+        main_module._handoff_previous_application = lambda: self.fail(
+            "a logon background start must not hand off another version"
+        )
+
+        resident_calls = self._run_with_resident_spy(
+            ["ovb_rc003", "--background"]
+        )
+
+        self.assertEqual(resident_calls, [])
+
+    def test_background_start_rebinds_the_owned_login_entry(self):
+        from ovb_rc003 import startup_windows
+
+        calls = []
+        with mock.patch.object(
+            startup_windows,
+            "rebind_owned_frozen_startup",
+            side_effect=lambda: calls.append(1) or startup_windows.StartupState(False),
+        ):
+            self._run_with_resident_spy(["ovb_rc003", "--background"])
+
+        self.assertEqual(calls, [1])
+
+    def test_settings_launch_keeps_the_voice_program_flag_for_the_resident(self):
+        resident_calls = self._run_with_resident_spy(
+            [
+                "ovb_rc003",
+                "--bridge",
+                "--bridge-from-settings",
+                "--no-voice-program",
+            ]
+        )
+
+        self.assertEqual(
+            resident_calls,
+            [{"start_bridge": True, "launch_voice_program_on_start": False}],
         )
 
     def test_explicit_settings_wins_when_bridge_flag_is_also_present(self):
-        calls = self._run_with_settings_spy(
-            ["ovb_rc003", "--bridge", "--settings"]
-        )
+        from ovb_rc003 import resident_shell
 
-        self.assertEqual(calls, [{"start_bridge": False}])
+        calls = []
+        original = resident_shell.main
+        resident_shell.main = lambda **kwargs: calls.append(kwargs) or 0
+        try:
+            settings_calls = self._run_with_settings_spy(
+                ["ovb_rc003", "--bridge", "--settings"]
+            )
+        finally:
+            resident_shell.main = original
+
+        self.assertEqual(settings_calls, [{"start_bridge": False}])
+        self.assertEqual(calls, [])
 
     def test_duplicate_visible_launch_activates_the_existing_window(self):
         from ovb_rc003 import settings_ui
 
         current_activation_calls = []
         fallback_activation_calls = []
-        single_instance.ApplicationRuntimeInstanceGuard = _make_guard_class(
+        single_instance.SettingsWindowInstanceGuard = _make_guard_class(
             raise_on_enter=single_instance.DuplicateInstanceError("already open")
         )
         main_module._handoff_previous_application = lambda: self.fail(
-            "the same runtime must activate, not start a version handoff"
+            "a duplicate settings window must activate, not hand off"
         )
         single_instance.activate_current_runtime_settings_window = (
             lambda: current_activation_calls.append(1) or True
@@ -689,7 +784,7 @@ class DesktopModeRoutingTests(_ArgvRestoringTestCase):
         )
         original = settings_ui.main
         settings_ui.main = lambda **kwargs: self.fail(
-            "duplicate launch must not build another desktop application"
+            "duplicate launch must not build another settings window"
         )
         sys.argv = ["ovb_rc003", "--settings"]
         try:
@@ -706,7 +801,7 @@ class DesktopModeRoutingTests(_ArgvRestoringTestCase):
         current_activation_calls = []
         fallback_activation_calls = []
         notice_calls = []
-        single_instance.ApplicationRuntimeInstanceGuard = _make_guard_class(
+        single_instance.SettingsWindowInstanceGuard = _make_guard_class(
             raise_on_enter=single_instance.DuplicateInstanceError("already open")
         )
         single_instance.activate_current_runtime_settings_window = (
@@ -718,7 +813,7 @@ class DesktopModeRoutingTests(_ArgvRestoringTestCase):
         single_instance.show_bridge_startup_blocked_notice = notice_calls.append
         original = settings_ui.main
         settings_ui.main = lambda **kwargs: self.fail(
-            "duplicate launch must not build another desktop application"
+            "duplicate launch must not build another settings window"
         )
         sys.argv = ["ovb_rc003", "--settings"]
         try:
@@ -729,20 +824,19 @@ class DesktopModeRoutingTests(_ArgvRestoringTestCase):
         self.assertEqual(current_activation_calls, [1])
         self.assertEqual(fallback_activation_calls, [1])
         self.assertEqual(len(notice_calls), 1)
-        self.assertEqual(
-            notice_calls[0],
-            "无线麦已经在启动或运行。\n\n"
-            "请从通知区域打开现有程序。",
-        )
+        self.assertIn("设置窗口已经打开", notice_calls[0])
 
-    def test_duplicate_visible_launch_during_handoff_only_restores_the_old_window(self):
+    def test_duplicate_visible_launch_falls_back_without_a_version_handoff(self):
         from ovb_rc003 import settings_ui
 
         current_activation_calls = []
         fallback_activation_calls = []
         notice_calls = []
-        single_instance.ApplicationRuntimeInstanceGuard = _make_guard_class(
-            raise_on_enter=single_instance.DuplicateInstanceError("handoff waiter")
+        single_instance.SettingsWindowInstanceGuard = _make_guard_class(
+            raise_on_enter=single_instance.DuplicateInstanceError("already open")
+        )
+        main_module._handoff_previous_application = lambda: self.fail(
+            "a duplicate settings window must never trigger a handoff"
         )
         single_instance.activate_current_runtime_settings_window = (
             lambda: current_activation_calls.append(1) or False
@@ -753,7 +847,7 @@ class DesktopModeRoutingTests(_ArgvRestoringTestCase):
         single_instance.show_bridge_startup_blocked_notice = notice_calls.append
         original = settings_ui.main
         settings_ui.main = lambda **kwargs: self.fail(
-            "a second launch must not create another application"
+            "a second launch must not create another settings window"
         )
         sys.argv = ["ovb_rc003", "--settings"]
         try:
@@ -877,8 +971,8 @@ class DesktopModeRoutingTests(_ArgvRestoringTestCase):
 
         self.assertEqual(activation_calls, [])
 
-    def test_different_runtime_visible_launch_waits_then_starts_current_copy(self):
-        from ovb_rc003 import settings_ui
+    def test_different_runtime_bridge_launch_waits_then_starts_current_copy(self):
+        from ovb_rc003 import resident_shell
 
         enter_calls = []
 
@@ -893,25 +987,28 @@ class DesktopModeRoutingTests(_ArgvRestoringTestCase):
                 return False
 
         handoff_calls = []
-        settings_calls = []
+        resident_calls = []
         single_instance.ApplicationInstanceGuard = _FirstDuplicateThenOwner
         main_module._handoff_previous_application = (
             lambda: handoff_calls.append(1) or True
         )
-        original = settings_ui.main
-        settings_ui.main = lambda **kwargs: settings_calls.append(kwargs)
-        sys.argv = ["ovb_rc003"]
+        original = resident_shell.main
+        resident_shell.main = lambda **kwargs: resident_calls.append(kwargs) or 0
+        sys.argv = ["ovb_rc003", "--bridge"]
         try:
             main_module.main()
         finally:
-            settings_ui.main = original
+            resident_shell.main = original
 
         self.assertEqual(enter_calls, [1, 1])
         self.assertEqual(handoff_calls, [1])
-        self.assertEqual(settings_calls, [{"start_bridge": False}])
+        self.assertEqual(
+            resident_calls,
+            [{"start_bridge": True, "launch_voice_program_on_start": True}],
+        )
 
-    def test_different_runtime_visible_launch_does_not_start_when_handoff_is_cancelled(self):
-        from ovb_rc003 import settings_ui
+    def test_different_runtime_bridge_launch_does_not_start_when_handoff_is_cancelled(self):
+        from ovb_rc003 import resident_shell
 
         single_instance.ApplicationInstanceGuard = _make_guard_class(
             raise_on_enter=single_instance.DuplicateInstanceError("old copy")
@@ -920,20 +1017,20 @@ class DesktopModeRoutingTests(_ArgvRestoringTestCase):
         main_module._handoff_previous_application = (
             lambda: handoff_calls.append(1) or False
         )
-        original = settings_ui.main
-        settings_ui.main = lambda **kwargs: self.fail(
-            "cancelled handoff must not start the current application"
+        original = resident_shell.main
+        resident_shell.main = lambda **kwargs: self.fail(
+            "cancelled handoff must not start the current resident"
         )
-        sys.argv = ["ovb_rc003"]
+        sys.argv = ["ovb_rc003", "--bridge"]
         try:
             main_module.main()
         finally:
-            settings_ui.main = original
+            resident_shell.main = original
 
         self.assertEqual(handoff_calls, [1])
 
     def test_guard_failure_is_visible_and_never_starts_the_application(self):
-        from ovb_rc003 import settings_ui
+        from ovb_rc003 import resident_shell
 
         notice_calls = []
         single_instance.ApplicationInstanceGuard = _make_guard_class(
@@ -942,16 +1039,16 @@ class DesktopModeRoutingTests(_ArgvRestoringTestCase):
             )
         )
         single_instance.show_bridge_startup_blocked_notice = notice_calls.append
-        original = settings_ui.main
-        settings_ui.main = lambda **kwargs: self.fail(
-            "application must not start without its instance guard"
+        original = resident_shell.main
+        resident_shell.main = lambda **kwargs: self.fail(
+            "the resident must not start without its instance guard"
         )
-        sys.argv = ["ovb_rc003"]
+        sys.argv = ["ovb_rc003", "--background"]
         try:
             with self.assertRaises(SystemExit) as ctx:
                 main_module.main()
         finally:
-            settings_ui.main = original
+            resident_shell.main = original
 
         self.assertEqual(
             ctx.exception.code,
@@ -984,14 +1081,22 @@ class DesktopModeRoutingTests(_ArgvRestoringTestCase):
         self.assertNotIn("private detail", notice_calls[0])
 
     def test_frozen_desktop_opens_with_either_known_permission_state(self):
-        from ovb_rc003 import settings_ui
+        from ovb_rc003 import resident_shell, settings_ui
 
         for elevated in (False, True):
-            for arguments, expected in (
-                ([], {"start_bridge": False}),
-                (["--settings"], {"start_bridge": False}),
-                (["--background"], {"start_hidden": True, "start_bridge": False}),
-                (["--bridge"], {"start_hidden": True, "start_bridge": True}),
+            for arguments, expected_settings, expected_resident in (
+                ([], {"start_bridge": False}, None),
+                (["--settings"], {"start_bridge": False}, None),
+                (
+                    ["--background"],
+                    None,
+                    {"start_bridge": False, "launch_voice_program_on_start": True},
+                ),
+                (
+                    ["--bridge"],
+                    None,
+                    {"start_bridge": True, "launch_voice_program_on_start": True},
+                ),
             ):
                 with self.subTest(elevated=elevated, arguments=arguments), mock.patch.object(
                     sys, "frozen", True, create=True
@@ -1005,13 +1110,23 @@ class DesktopModeRoutingTests(_ArgvRestoringTestCase):
                     main_module, "_register_current_hid_helper_consumer"
                 ) as register, mock.patch.object(
                     single_instance, "show_bridge_startup_blocked_notice"
-                ) as notice, mock.patch.object(settings_ui, "main") as settings_main:
+                ) as notice, mock.patch.object(
+                    settings_ui, "main"
+                ) as settings_main, mock.patch.object(
+                    resident_shell, "main", return_value=0
+                ) as resident_main:
                     main_module.main()
 
                 query.assert_called_once_with()
                 maintenance.assert_called_once_with()
-                register.assert_called_once_with()
-                settings_main.assert_called_once_with(**expected)
+                if expected_resident is None:
+                    register.assert_not_called()
+                    settings_main.assert_called_once_with(**expected_settings)
+                    resident_main.assert_not_called()
+                else:
+                    register.assert_called_once_with()
+                    resident_main.assert_called_once_with(**expected_resident)
+                    settings_main.assert_not_called()
                 notice.assert_not_called()
 
     def test_frozen_desktop_refuses_to_start_when_elevation_is_unknown(self):
@@ -1086,7 +1201,7 @@ class DesktopModeRoutingTests(_ArgvRestoringTestCase):
         ), mock.patch.object(
             single_instance, "installer_maintenance_running", return_value=False
         ), mock.patch.object(
-            single_instance, "ApplicationRuntimeInstanceGuard",
+            single_instance, "SettingsWindowInstanceGuard",
             _make_guard_class(raise_on_enter=single_instance.DuplicateInstanceError()),
         ), mock.patch.object(
             single_instance, "activate_current_runtime_settings_window", return_value=True
@@ -1396,8 +1511,10 @@ class ApplicationExitRequestEntrypointTests(unittest.TestCase):
         self._original_exit_guard = single_instance.ApplicationExitRequestGuard
         self._original_capability = single_instance.application_exit_request_capability
         self._original_session_id = single_instance.current_process_session_id
+        self._original_settings_window_running = single_instance.settings_window_running
         config.config_root = lambda: self.root
         single_instance.ApplicationExitRequestGuard = _make_guard_class()
+        single_instance.settings_window_running = lambda: False
         single_instance.application_exit_request_capability = lambda: (
             single_instance.ApplicationExitRequestCapability.SESSION_SUPPORTED
         )
@@ -1410,6 +1527,7 @@ class ApplicationExitRequestEntrypointTests(unittest.TestCase):
         single_instance.ApplicationExitRequestGuard = self._original_exit_guard
         single_instance.application_exit_request_capability = self._original_capability
         single_instance.current_process_session_id = self._original_session_id
+        single_instance.settings_window_running = self._original_settings_window_running
         self._tmp.cleanup()
 
     def test_already_stopped_returns_success_without_deleting_an_unowned_request(self):

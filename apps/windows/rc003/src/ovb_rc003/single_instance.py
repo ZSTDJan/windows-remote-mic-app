@@ -86,6 +86,7 @@ from . import __version__, product_identity
 # bridge from the same session.
 _MUTEX_NAME = r"Local\RemoteMicRC003_BridgeInstance"
 _SETTINGS_MUTEX_NAME = r"Local\RemoteMicRC003_SettingsInstance"
+_SETTINGS_WINDOW_MUTEX_NAME = r"Local\RemoteMicRC003_SettingsWindowInstance"
 _ELEMENT_NAVIGATION_MUTEX_NAME = r"Local\RemoteMicRC003_ElementNavigationInstance"
 _APPLICATION_RUNTIME_MUTEX_PREFIX = r"Local\RemoteMicRC003_Runtime_"
 _APPLICATION_HANDOFF_MUTEX_NAME = r"Local\RemoteMicRC003_ApplicationHandoff"
@@ -497,6 +498,30 @@ def mark_settings_window(
         _SETTINGS_WINDOW_PROPERTY,
         application_runtime_window_property(),
         _SETTINGS_WINDOW_RESTORE_CAPABILITY_PROPERTY,
+    ):
+        try:
+            marked = bool(_set_property(hwnd, property_name)) or marked
+        except Exception:
+            continue
+    return marked
+
+
+def mark_resident_exit_capability(
+    hwnd: int,
+    *,
+    _set_property: SetWindowPropertyFn = _real_set_window_property,
+) -> bool:
+    """Publish the redirectable exit contract from the resident tray window.
+
+    The resident process has no settings window, so it advertises the same
+    capability markers without the settings-window identity that duplicate
+    launches use to reactivate a window.
+    """
+
+    if not hwnd:
+        return False
+    marked = False
+    for property_name in (
         _APPLICATION_EXIT_CAPABILITY_PROPERTY_V2,
         _APPLICATION_EXIT_CAPABILITY_PROPERTY,
         _APPLICATION_EXIT_WINDOW_SIGNAL_CAPABILITY_PROPERTY,
@@ -506,6 +531,64 @@ def mark_settings_window(
         except Exception:
             continue
     return marked
+
+
+_WM_CLOSE = 0x0010
+
+
+def _real_settings_window_handles() -> List[int]:
+    """Enumerate top-level windows that still carry the settings marker."""
+
+    _require_windows()
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    enum_windows_proc = ctypes.WINFUNCTYPE(
+        wintypes.BOOL,
+        wintypes.HWND,
+        wintypes.LPARAM,
+    )
+    user32.EnumWindows.argtypes = (enum_windows_proc, wintypes.LPARAM)
+    user32.EnumWindows.restype = wintypes.BOOL
+    user32.GetPropW.argtypes = (wintypes.HWND, wintypes.LPCWSTR)
+    user32.GetPropW.restype = wintypes.HANDLE
+    found: List[int] = []
+
+    @enum_windows_proc
+    def visit(hwnd, _lparam):
+        if user32.GetPropW(hwnd, _SETTINGS_WINDOW_PROPERTY):
+            found.append(int(hwnd))
+        return True
+
+    user32.EnumWindows(visit, 0)
+    return found
+
+
+def settings_window_running() -> bool:
+    """Whether a settings-window process still exists in this session."""
+
+    try:
+        return bool(_real_settings_window_handles())
+    except Exception:
+        return False
+
+
+def request_settings_window_close() -> bool:
+    """Ask the open settings window to run its normal close path."""
+
+    try:
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        user32.PostMessageW.argtypes = (
+            wintypes.HWND,
+            wintypes.UINT,
+            wintypes.WPARAM,
+            wintypes.LPARAM,
+        )
+        user32.PostMessageW.restype = wintypes.BOOL
+        posted = False
+        for hwnd in _real_settings_window_handles():
+            posted = bool(user32.PostMessageW(hwnd, _WM_CLOSE, 0, 0)) or posted
+        return posted
+    except Exception:
+        return False
 
 
 def consume_settings_window_restore_request(
@@ -658,9 +741,13 @@ def _real_application_exit_window_markers() -> ApplicationExitWindowMarkers:
         nonlocal supported_window_found
         nonlocal legacy_supported_window_found
         nonlocal session_supported_window_found
-        if not user32.GetPropW(hwnd, _SETTINGS_WINDOW_PROPERTY):
-            return True
-        settings_window_found = True
+        # A resident process has no settings window; its tray window still
+        # carries the capability markers, so both kinds of owner count here.
+        has_settings_marker = bool(
+            user32.GetPropW(hwnd, _SETTINGS_WINDOW_PROPERTY)
+        )
+        if has_settings_marker:
+            settings_window_found = True
         if user32.GetPropW(hwnd, _APPLICATION_EXIT_CAPABILITY_PROPERTY):
             session_supported_window_found = True
             supported_window_found = True
@@ -668,7 +755,9 @@ def _real_application_exit_window_markers() -> ApplicationExitWindowMarkers:
         if user32.GetPropW(hwnd, _APPLICATION_EXIT_CAPABILITY_PROPERTY_V2):
             supported_window_found = True
             return True
-        if _real_window_has_legacy_exit_capability(int(hwnd)):
+        if has_settings_marker and _real_window_has_legacy_exit_capability(
+            int(hwnd)
+        ):
             legacy_supported_window_found = True
         return True
 
@@ -1872,6 +1961,29 @@ class ApplicationExitRequestGuard(BridgeInstanceGuard):
 
 class SettingsInstanceGuard(ApplicationInstanceGuard):
     """Compatibility name for callers from the former settings-only model."""
+
+
+class SettingsWindowInstanceGuard(BridgeInstanceGuard):
+    """Guard the on-demand settings window separately from the resident core."""
+
+    def __init__(
+        self,
+        *,
+        name: str = _SETTINGS_WINDOW_MUTEX_NAME,
+        _create_mutex: CreateMutexFn = _real_create_mutex,
+        _release_mutex: ReleaseMutexFn = _real_release_mutex,
+        _close_handle: CloseHandleFn = _real_close_handle,
+    ) -> None:
+        super().__init__(
+            name=name,
+            _create_mutex=_create_mutex,
+            _release_mutex=_release_mutex,
+            _close_handle=_close_handle,
+            _duplicate_message=(
+                f"{product_identity.DISPLAY_NAME}设置窗口已在当前 Windows 会话中运行"
+            ),
+            _access_denied_means_duplicate=True,
+        )
 
 
 class ElementNavigationInstanceGuard(BridgeInstanceGuard):

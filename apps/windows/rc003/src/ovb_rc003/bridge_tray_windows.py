@@ -145,6 +145,12 @@ class BridgeTray:
     def startup_error(self) -> str:
         return self._startup_error
 
+    @property
+    def window_handle(self) -> int:
+        """Invisible top-level HWND the resident publishes its capabilities on."""
+
+        return int(self._hwnd or 0)
+
     def start(self, timeout: float = 5.0) -> bool:
         if os.name != "nt":
             self._startup_error = "notification area is only available on Windows"

@@ -304,7 +304,11 @@ ApplicationWindow {
         function onWindowHideReady() {
             window.settleInputUiAfterStop()
             window.hide()
+            // This process exists only for the window; hiding it without a
+            // notification-area icon would leave an invisible process.
+            Qt.quit()
         }
+
         function onWindowHideFailed(message) {
             window.restoreWindow()
             window.lifecycleErrorTitle = qsTr("无法隐藏窗口")
@@ -731,7 +735,9 @@ ApplicationWindow {
     Platform.SystemTrayIcon {
         id: systemTrayIcon
         objectName: "systemTrayIcon"
-        visible: true
+        // The notification-area icon belongs to the resident process; this
+        // on-demand settings window must never keep its own.
+        visible: false
         icon.source: SettingsController.trayIconSource
         tooltip: SettingsController.trayTooltip
         onMessageClicked: SettingsController.showApplicationUpdate()
