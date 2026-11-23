@@ -169,6 +169,46 @@ class InjectedScriptTests(unittest.TestCase):
             self.assertEqual([(edge.button, edge.action) for edge in edges], expected)
             self.assertEqual(result["messages"][-1]["counts"]["length_rejected"], 0)
 
+    def test_one_byte_reports_deliver_device_codes_through_receiver(self):
+        from ovb_rc003.chromecast_buttons import HidButtonReceiver
+        # Independent protocol examples for the single-byte variant: its codes
+        # are device-private, so they are listed here rather than derived.
+        codes = ((0x01, "power"), (0x03, "up"), (0x04, "down"), (0x05, "left"),
+                 (0x06, "right"), (0x07, "ok"), (0x08, "volume_mute"), (0x0a, "home"),
+                 (0x0b, "back"), (0x0c, "volume_up"), (0x0d, "volume_down"),
+                 (0x0e, "youtube"), (0x0f, "netflix"), (0x11, "input_source"))
+        for offset in (8, 24):
+            cases, expected = [], []
+            for code, key in codes:
+                cases.extend([dict(length=1, bytes=[code], addressOffset=offset),
+                              dict(length=1, bytes=[0], addressOffset=offset)])
+                expected.extend([(key, "down"), (key, "up")])
+            result = self.run_script(cases, address_offset=offset)
+            receiver = HidButtonReceiver("a" * 64, "b" * 64)
+            receiver.confirm_source()
+            edges = []
+            for stamp, row in enumerate(r for r in result["messages"] if r["kind"] == "report"):
+                edges.extend(receiver.feed(bytes.fromhex(row["value"]), stamp))
+            self.assertEqual([(edge.button, edge.action) for edge in edges], expected)
+            self.assertEqual(result["messages"][-1]["counts"]["length_rejected"], 0)
+
+    def test_report_id_prefixed_two_byte_reports_use_the_same_table(self):
+        result = self.run_script([dict(length=2, bytes=[0x01, 0x0a]),
+                                  dict(length=2, bytes=[0x01, 0x00])])
+        self.assertEqual([row["value"] for row in result["messages"] if row["kind"] == "report"],
+                         ["0a00000000000000", "0000000000000000"])
+
+    def test_unknown_single_byte_codes_are_rejected_not_delivered(self):
+        result = self.run_script([dict(length=1, bytes=[0x02]), dict(length=1, bytes=[0x7f])])
+        self.assertFalse([row for row in result["messages"] if row["kind"] == "report"])
+        self.assertEqual(result["messages"][-1]["counts"]["code_rejected"], 2)
+
+    def test_three_byte_and_other_lengths_stay_rejected(self):
+        result = self.run_script([dict(length=3, bytes=[2, 0x42, 0]),
+                                  dict(length=9, bytes=[1] + [0] * 8)])
+        self.assertFalse([row for row in result["messages"] if row["kind"] == "report"])
+        self.assertEqual(result["messages"][-1]["counts"]["length_rejected"], 2)
+
     def test_consumer_unknown_and_other_device_never_become_actions(self):
         result = self.run_script([
             dict(length=2, bytes=[0x45, 0], repeat=2),
