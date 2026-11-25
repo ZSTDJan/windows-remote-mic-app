@@ -38,6 +38,18 @@ RELEASES_API_URL = (
     f"https://api.github.com/repos/{REPOSITORY_SLUG}/releases?per_page=30"
 )
 
+OFFICIAL_CHANNEL = "official"
+CUSTOM_CHANNEL = "custom"
+CHANNEL_LABELS = {
+    OFFICIAL_CHANNEL: "官方通道",
+    CUSTOM_CHANNEL: "自定义通道",
+}
+_CHANNEL_REPOSITORIES = {
+    OFFICIAL_CHANNEL: ("ZSTDJan", "windows-remote-mic-app"),
+    CUSTOM_CHANNEL: ("zyj1195078324", "windows-remote-mic-app"),
+}
+_ACTIVE_CHANNEL = OFFICIAL_CHANNEL
+
 NETWORK_TIMEOUT_SECONDS = 10.0
 DOWNLOAD_TIMEOUT_SECONDS = 30.0
 DOWNLOAD_ATTEMPTS = 5
@@ -65,13 +77,13 @@ _VERSION_TEXT_PATTERN = (
     r"(?:0|[1-9][0-9]*)\."
     r"(?:0|[1-9][0-9]*)\."
     r"(?:0|[1-9][0-9]*)"
-    r"(?:-candidate(?:\.(?:0|[1-9][0-9]*))?)?"
+    r"(?:-(?:candidate|custom)(?:\.(?:0|[1-9][0-9]*))?)?"
 )
 _VERSION_PATTERN = re.compile(
     r"^(?P<major>0|[1-9][0-9]*)\."
     r"(?P<minor>0|[1-9][0-9]*)\."
     r"(?P<patch>0|[1-9][0-9]*)"
-    r"(?:-candidate(?:\.(?P<candidate>0|[1-9][0-9]*))?)?$"
+    r"(?:-(?P<channel>candidate|custom)(?:\.(?P<channel_number>0|[1-9][0-9]*))?)?$"
 )
 _INSTALLER_PATTERN = re.compile(
     rf"^RemoteMicRC003Setup-(?P<version>{_VERSION_TEXT_PATTERN})-unsigned\.exe$"
@@ -120,6 +132,8 @@ class ApplicationVersion:
     minor: int
     patch: int
     candidate: Optional[int]
+    channel: str = OFFICIAL_CHANNEL
+    custom: Optional[int] = None
 
     @property
     def is_prerelease(self) -> bool:
@@ -127,12 +141,16 @@ class ApplicationVersion:
 
     @property
     def sort_key(self) -> tuple[int, int, int, int, int]:
+        if self.channel == CUSTOM_CHANNEL:
+            channel_rank = 2
+        else:
+            channel_rank = 0 if self.is_prerelease else 1
         return (
             self.major,
             self.minor,
             self.patch,
-            0 if self.is_prerelease else 1,
-            self.candidate or 0,
+            channel_rank,
+            self.custom or self.candidate or 0,
         )
 
     def __lt__(self, other: object) -> bool:
@@ -184,6 +202,47 @@ class ApplicationUpdateDownload:
     package_kind: PackageKind
     path: Path
     reused_existing_file: bool
+
+
+def resolve_update_channel(
+    explicit: Optional[str] = None,
+    current_channel: Optional[str] = None,
+) -> str:
+    """Pick the update repository/channel.
+
+    Priority: explicit argument > REMOTEMIC_UPDATE_CHANNEL > update-channel.txt
+    > the current build's channel > official. A ``-custom.N`` build therefore
+    defaults to the custom fork, while users can override it without rebuilding.
+    """
+    candidates = [explicit, os.environ.get("REMOTEMIC_UPDATE_CHANNEL")]
+    local_app_data = os.environ.get("LOCALAPPDATA")
+    if local_app_data:
+        channel_file = Path(local_app_data) / "RemoteMic" / "RC003" / "update-channel.txt"
+        try:
+            candidates.append(channel_file.read_text(encoding="utf-8").strip())
+        except OSError:
+            pass
+    candidates.append(current_channel)
+    for candidate in candidates:
+        text = str(candidate or "").strip().lower()
+        if text in _CHANNEL_REPOSITORIES:
+            return text
+    return OFFICIAL_CHANNEL
+
+
+def _configure_channel(channel: str) -> str:
+    """Point the module's GitHub URLs at the selected channel's repository."""
+    global REPOSITORY_OWNER, REPOSITORY_NAME, REPOSITORY_SLUG
+    global RELEASES_PAGE_URL, RELEASES_API_URL, _ACTIVE_CHANNEL
+    selected = channel if channel in _CHANNEL_REPOSITORIES else OFFICIAL_CHANNEL
+    owner, name = _CHANNEL_REPOSITORIES[selected]
+    REPOSITORY_OWNER = owner
+    REPOSITORY_NAME = name
+    REPOSITORY_SLUG = f"{owner}/{name}"
+    RELEASES_PAGE_URL = f"https://github.com/{REPOSITORY_SLUG}/releases"
+    RELEASES_API_URL = f"https://api.github.com/repos/{REPOSITORY_SLUG}/releases?per_page=30"
+    _ACTIVE_CHANNEL = selected
+    return selected
 
 
 def claim_daily_update_check(cache_directory: Path, *, today: date | None = None) -> bool:
@@ -284,20 +343,24 @@ def parse_application_version(value: str) -> ApplicationVersion:
     match = _VERSION_PATTERN.fullmatch(text)
     if match is None:
         raise ValueError(f"unsupported application version: {text!r}")
-    candidate_group = match.group("candidate")
-    has_candidate_suffix = "-candidate" in text
+    channel_token = match.group("channel")
+    channel_number = match.group("channel_number")
+    candidate = None
+    custom = None
+    channel = OFFICIAL_CHANNEL
+    if channel_token == CUSTOM_CHANNEL:
+        channel = CUSTOM_CHANNEL
+        custom = int(channel_number) if channel_number is not None else 0
+    elif channel_token == "candidate":
+        candidate = int(channel_number) if channel_number is not None else 0
     return ApplicationVersion(
         text=text,
         major=int(match.group("major")),
         minor=int(match.group("minor")),
         patch=int(match.group("patch")),
-        candidate=(
-            int(candidate_group)
-            if candidate_group is not None
-            else 0
-            if has_candidate_suffix
-            else None
-        ),
+        candidate=candidate,
+        channel=channel,
+        custom=custom,
     )
 
 
@@ -756,7 +819,11 @@ def _parse_release(
 
 
 def _select_release(
-    payload: Any, current: ApplicationVersion, *, maximum_count: int = MAX_RELEASE_COUNT
+    payload: Any,
+    current: ApplicationVersion,
+    *,
+    maximum_count: int = MAX_RELEASE_COUNT,
+    channel: str = OFFICIAL_CHANNEL,
 ) -> ApplicationRelease:
     if not isinstance(payload, list) or len(payload) > maximum_count:
         _raise("invalid_response", "GitHub 返回了无法识别的发布列表。")
@@ -775,6 +842,8 @@ def _select_release(
             recognized_invalid = recognized_invalid or eligible_invalid
             if eligible_invalid:
                 invalid_versions.append(version_hint)
+            continue
+        if release.version.channel != channel:
             continue
         if not current.is_prerelease and release.version.is_prerelease:
             continue
@@ -889,6 +958,7 @@ def check_for_update(
     *,
     opener: Callable[..., Any] = _default_open,
     timeout: float = NETWORK_TIMEOUT_SECONDS,
+    channel: Optional[str] = None,
 ) -> ApplicationUpdateCheck:
     try:
         current = parse_application_version(current_version)
@@ -896,8 +966,16 @@ def check_for_update(
         raise ApplicationUpdateError(
             "invalid_local_version", "当前程序版本无法识别，不能安全比较更新。"
         ) from exc
+    selected_channel = _configure_channel(
+        resolve_update_channel(channel, current.channel)
+    )
     payload = _fetch_release_list(opener=opener, timeout=timeout)
-    release = _select_release(payload, current, maximum_count=MAX_RELEASE_COUNT * MAX_RELEASE_PAGES)
+    release = _select_release(
+        payload,
+        current,
+        maximum_count=MAX_RELEASE_COUNT * MAX_RELEASE_PAGES,
+        channel=selected_channel,
+    )
     if release.version > current:
         outcome = UpdateCheckOutcome.UPDATE_AVAILABLE
     elif release.version == current:

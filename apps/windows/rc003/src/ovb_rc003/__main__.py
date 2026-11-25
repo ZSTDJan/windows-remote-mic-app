@@ -98,6 +98,7 @@ Dry-run, diagnostics and help touch neither application nor bridge ownership.
 
 from __future__ import annotations
 
+import os
 import sys
 import time
 import uuid
@@ -155,6 +156,8 @@ def _print_help() -> None:
     print("  python -m ovb_rc003 --background  start hidden in the notification area")
     print("  python -m ovb_rc003 --bridge      start hidden and run the bridge")
     print("  python -m ovb_rc003 --dry-run     import every module and exit 0 (CI smoke check)")
+    print("  python -m ovb_rc003 --update-channel official|custom")
+    print("                                    choose the update channel for this launch")
     print("  python -m ovb_rc003 --version     print the application version and exit")
     print("  python -m ovb_rc003 --help        show this message and exit 0")
 
@@ -811,6 +814,13 @@ def _handoff_previous_application(
 
 def main() -> None:
     args = dev_session.consume_marker(sys.argv[1:])
+    if "--update-channel" in args:
+        index = args.index("--update-channel")
+        if index + 1 < len(args):
+            channel = str(args[index + 1]).strip().lower()
+            if channel in ("official", "custom"):
+                os.environ["REMOTEMIC_UPDATE_CHANNEL"] = channel
+            args = args[:index] + args[index + 2:]
     if any(flag in args for flag in ('--receiver-startup-report', '--receiver-report-worker')):
         from . import receiver_startup_report
         if not args or args[0] not in (receiver_startup_report.FLAG, receiver_startup_report.CHILD_FLAG):
