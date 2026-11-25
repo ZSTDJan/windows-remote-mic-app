@@ -13,6 +13,7 @@ from __future__ import annotations
 import ctypes
 import hashlib
 import os
+import struct
 import sys
 import threading
 from functools import lru_cache
@@ -35,6 +36,8 @@ _DOUBAO_0927_HOOK_LAYOUT = (0x7829E0, 0x782B12, 0x782B18, 0x7837DA, 0x38)
 # callback's stack layout in this rewritten callback.
 _DOUBAO_09320_HOOK_LAYOUT = (0x7CD5A0, 0x7CE5B2, 0x7CE5B8, 0, 0)
 _DOUBAO_10023_HOOK_LAYOUT = (0x7DDD90, 0x7DF19D, 0x7DF1A3, 0, 0)
+# 1.1.1.12 keeps the same forward-only callback shape as 1.0.0.23.
+_DOUBAO_11112_HOOK_LAYOUT = (0x7ED410, 0x7EE81D, 0x7EE823, 0, 0)
 _VERIFIED_IME_SERVICE_BUILDS = {
     "94b17bdca571ac3cd2dafa687b4cb8e3a789cda9d044276483003b0a9e8f77a6":
         _DOUBAO_0900_HOOK_LAYOUT,
@@ -46,6 +49,8 @@ _VERIFIED_IME_SERVICE_BUILDS = {
         _DOUBAO_09320_HOOK_LAYOUT,
     "fee3566aeb39913707b0afe6afd1c4e0ab84d5c676bf3abe1f9ea265d878cec3":
         _DOUBAO_10023_HOOK_LAYOUT,
+    "68a7642e6d590fc7dc1488d446fde3fdd1cc2ceb978951f76a48c24d48f82b06":
+        _DOUBAO_11112_HOOK_LAYOUT,
 }
 # These gates belong to the same exact build as the callback, not just the
 # same version label. Both are checked in loaded memory before any hook.
@@ -73,6 +78,10 @@ _VERIFIED_FORWARD_ONLY_SIGNATURES = {
     _DOUBAO_10023_HOOK_LAYOUT: (
         bytes.fromhex("4C 8B DC 53 56 57 41 54 41 55 41 56 41 57 48 81 EC B0 0A 00 00"),
         bytes.fromhex("FF 15 7D 72 DE 00 48 8B D8 48 8D 8C 24 20 07 00 00 E8 1D 88 FF FF 48 8B C3"),
+    ),
+    _DOUBAO_11112_HOOK_LAYOUT: (
+        bytes.fromhex("4C 8B DC 53 56 57 41 54 41 55 41 56 41 57 48 81 EC B0 0A 00 00"),
+        bytes.fromhex("FF 15 C5 AB E9 00 48 8B D8 48 8D 8C 24 20 07 00 00 E8 1D 88 FF FF 48 8B C3"),
     ),
 }
 _VERIFIED_VOICE_STOP_BUILDS = {
@@ -150,6 +159,157 @@ def _module_sha256(path: str) -> str:
     """Hash the current module contents at every verification boundary."""
 
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+_DYNAMIC_LAYOUT_CACHE: dict[str, Optional[tuple[tuple[int, int, int, int, int], tuple[bytes, bytes]]]] = {}
+
+
+def _iter_ff15(data: bytes, start: int = 0, end: Optional[int] = None):
+    limit = len(data) if end is None else min(end, len(data))
+    position = data.find(b"\xFF\x15", start, limit)
+    while position != -1:
+        yield position
+        position = data.find(b"\xFF\x15", position + 1, limit)
+
+
+class _PEImage:
+    """Minimal PE reader used only to locate the IME keyboard callback."""
+
+    def __init__(self, path: str):
+        self.data = Path(path).read_bytes()
+        data = self.data
+        if len(data) < 0x40 or data[:2] != b"MZ":
+            raise ValueError("not a PE image")
+        pe_offset = struct.unpack_from("<I", data, 0x3C)[0]
+        if data[pe_offset:pe_offset + 4] != b"PE\0\0":
+            raise ValueError("missing PE signature")
+        coff = pe_offset + 4
+        section_count = struct.unpack_from("<H", data, coff + 2)[0]
+        optional_size = struct.unpack_from("<H", data, coff + 16)[0]
+        optional = coff + 20
+        self.image_base = struct.unpack_from("<Q", data, optional + 24)[0]
+        directory_count = struct.unpack_from("<I", data, optional + 108)[0]
+        self.directories = [
+            (
+                struct.unpack_from("<I", data, optional + 112 + index * 8)[0],
+                struct.unpack_from("<I", data, optional + 112 + index * 8 + 4)[0],
+            )
+            for index in range(directory_count)
+        ]
+        section_table = optional + optional_size
+        self.sections = []
+        for index in range(section_count):
+            offset = section_table + index * 40
+            name = data[offset:offset + 8].rstrip(b"\0").decode("ascii", "replace")
+            virtual_size = struct.unpack_from("<I", data, offset + 8)[0]
+            virtual_address = struct.unpack_from("<I", data, offset + 12)[0]
+            raw_size = struct.unpack_from("<I", data, offset + 16)[0]
+            raw_offset = struct.unpack_from("<I", data, offset + 20)[0]
+            self.sections.append((name, virtual_address, virtual_size, raw_offset, raw_size))
+        self.text = next(section for section in self.sections if section[0].startswith(".text"))
+
+    def offset(self, rva: int) -> int:
+        for _name, virtual_address, virtual_size, raw_offset, raw_size in self.sections:
+            if virtual_address <= rva < virtual_address + max(virtual_size, raw_size):
+                return raw_offset + (rva - virtual_address)
+        raise KeyError(hex(rva))
+
+    def read(self, rva: int, length: int) -> bytes:
+        start = self.offset(rva)
+        return self.data[start:start + length]
+
+    def cstring(self, rva: int) -> str:
+        start = self.offset(rva)
+        end = self.data.index(b"\0", start)
+        return self.data[start:end].decode("ascii", "replace")
+
+    def imports(self):
+        import_rva, _import_size = self.directories[1]
+        offset = self.offset(import_rva)
+        while True:
+            descriptor = self.data[offset:offset + 20]
+            if len(descriptor) < 20 or descriptor == b"\0" * 20:
+                break
+            original_thunk, _timestamp, _forwarder, name_rva, first_thunk = struct.unpack("<IIIII", descriptor)
+            dll = self.cstring(name_rva).lower()
+            thunk = original_thunk or first_thunk
+            index = 0
+            while True:
+                value = struct.unpack_from("<Q", self.data, self.offset(thunk + index * 8))[0]
+                if value == 0:
+                    break
+                if value & 0x8000000000000000:
+                    name = f"ord{value & 0xFFFF}"
+                else:
+                    name = self.cstring(value + 2)
+                yield dll, name, first_thunk + index * 8
+                index += 1
+            offset += 20
+
+
+def _find_dynamic_hook_layout(path: str) -> Optional[tuple[tuple[int, int, int, int, int], tuple[bytes, bytes]]]:
+    """Find the keyboard LL callback and its CallNextHookEx forwarding site.
+
+    This keeps unknown-but-structurally-compatible Doubao builds working after
+    an update. The exact callback/forward bytes are still verified by the
+    Frida script before any hook is installed; a mismatch fails closed.
+    """
+    try:
+        pe = _PEImage(path)
+        iat: dict[str, int] = {}
+        for dll, name, slot in pe.imports():
+            if dll == "user32.dll" and name in ("SetWindowsHookExW", "CallNextHookEx"):
+                iat[name] = slot
+        if "SetWindowsHookExW" not in iat or "CallNextHookEx" not in iat:
+            return None
+        _name, text_va, text_vs, text_raw, text_raw_size = pe.text
+        text = pe.data[text_raw:text_raw + text_raw_size]
+        installs: list[tuple[int, int]] = []
+        for index in _iter_ff15(text):
+            call_rva = text_va + index
+            target = call_rva + 6 + struct.unpack_from("<i", text, index + 2)[0]
+            if target != iat["SetWindowsHookExW"]:
+                continue
+            callback_rva = None
+            for back in range(max(0, index - 48), index):
+                if text[back:back + 3] == b"\x48\x8D\x15":
+                    candidate = text_va + back + 7 + struct.unpack_from("<i", text, back + 3)[0]
+                    if text_va <= candidate < text_va + text_vs:
+                        callback_rva = candidate
+                        break
+                if text[back:back + 2] == b"\x48\xBA":
+                    immediate = struct.unpack_from("<Q", text, back + 2)[0]
+                    candidate = immediate - pe.image_base
+                    if text_va <= candidate < text_va + text_vs:
+                        callback_rva = candidate
+                        break
+            if callback_rva is not None:
+                installs.append((call_rva, callback_rva))
+        for _install_rva, callback_rva in installs:
+            try:
+                callback_offset = pe.offset(callback_rva)
+            except KeyError:
+                continue
+            limit = min(len(pe.data) - 6, callback_offset + 0x20000)
+            forwards: list[tuple[int, int, bytes]] = []
+            for index in _iter_ff15(pe.data, callback_offset, limit):
+                call_rva = callback_rva + (index - callback_offset)
+                target = call_rva + 6 + struct.unpack_from("<i", pe.data, index + 2)[0]
+                if target != iat["CallNextHookEx"]:
+                    continue
+                forwards.append((call_rva, call_rva + 6, pe.data[index + 6:index + 9]))
+            if not forwards:
+                continue
+            chosen = next((item for item in forwards if item[2] == b"\x48\x8B\xD8"), forwards[-1])
+            forward_rva, continue_rva, _follow = chosen
+            layout = (callback_rva, forward_rva, continue_rva, 0, 0)
+            entry = pe.read(callback_rva, 18)
+            forward = pe.read(forward_rva, 25)
+            if entry and forward:
+                return layout, (entry, forward)
+    except (OSError, ValueError, KeyError, struct.error, StopIteration):
+        return None
+    return None
 
 
 def _shortcut_vks_to_suppress(vk_codes: Sequence[int]) -> tuple[int, ...]:
@@ -477,11 +637,22 @@ class DoubaoPhysicalizer:
         except OSError:
             return None
         layout = _VERIFIED_IME_SERVICE_BUILDS.get(digest)
+        dynamic = False
+        if layout is None:
+            if digest not in _DYNAMIC_LAYOUT_CACHE:
+                _DYNAMIC_LAYOUT_CACHE[digest] = _find_dynamic_hook_layout(str(module_path))
+            found = _DYNAMIC_LAYOUT_CACHE[digest]
+            if found is not None:
+                layout, signatures = found
+                _VERIFIED_IME_SERVICE_BUILDS[digest] = layout
+                _VERIFIED_FORWARD_ONLY_SIGNATURES[layout] = signatures
+                dynamic = True
         _trace(
             "doubao_module_verification",
             module_name=module_path.name,
             sha256=digest,
             verified=layout is not None,
+            dynamic=dynamic,
             callback_rva=int(layout[0]) if layout is not None else -1,
             early_forward_rva=int(layout[1]) if layout is not None else -1,
             decision_gate_rva=int(layout[3]) if layout is not None and layout[3] else -1,
