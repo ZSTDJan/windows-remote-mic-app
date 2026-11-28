@@ -268,7 +268,7 @@ class VoiceReceiver:
             decision = "detect_ignored"
             if kind == "control" and not self.stopping:
                 if value == b"\x08" or (len(value) == 4 and value[:3] == b"\x04\x03\x02"
-                                        and 1 <= value[3] <= 128):
+                                        and 1 <= value[3] <= 255):
                     if not self.mic_down:
                         self.emit("mic", 0, "pressed", now)
                     self.mic_down = True

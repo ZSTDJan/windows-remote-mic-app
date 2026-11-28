@@ -321,15 +321,16 @@ class NegotiationTests(unittest.IsolatedAsyncioTestCase):
         device.voice_write_option = GattWriteOption.WRITE_WITHOUT_RESPONSE
         device.voice_tx = SimpleNamespace(write_value_with_result_and_option_async=mock.AsyncMock(
             return_value=SimpleNamespace(status=0)))
-        await device.write_voice(GET_CAPABILITIES)
+        for valid in (GET_CAPABILITIES, b"\x0d\xff", b"\x0e\xff"):
+            await device.write_voice(valid)
         for bad in (b"\x0a", GET_CAPABILITIES[:-1] + b"\x00", bytearray(GET_CAPABILITIES),
-                    b"\x0c\x01", b"\x0d\xff", b"\x0d"):
+                    b"\x0c\x01", b"\x0f\xff", b"\x0d"):
             with self.assertRaises(PipeError):
                 await device.write_voice(bad)
         device.changed.set()
         with self.assertRaises(PipeError):
             await device.write_voice(GET_CAPABILITIES)
-        self.assertEqual(device.voice_tx.write_value_with_result_and_option_async.await_count, 1)
+        self.assertEqual(device.voice_tx.write_value_with_result_and_option_async.await_count, 3)
 
 
 if __name__ == "__main__":
