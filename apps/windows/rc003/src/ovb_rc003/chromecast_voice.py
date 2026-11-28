@@ -234,7 +234,7 @@ class Recording:
         opcode = payload[0]
         if opcode == 0x04:  # AUDIO_START: reason, codec, stream.
             if len(payload) != 4 or payload[2] != 2 or not (
-                    (payload[1] == 3 and 1 <= payload[3] <= 128)
+                    (payload[1] == 3 and 1 <= payload[3] <= 255)
                     or (payload[1] == 0 and payload[3] == 0)):
                 self.control_result = "unsupported_voice_stream"
                 return self.finish(now, "unsupported_voice_stream")

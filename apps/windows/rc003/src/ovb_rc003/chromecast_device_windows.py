@@ -687,7 +687,7 @@ class SelectedDevice:
                 or self.device.connection_status != BluetoothConnectionStatus.CONNECTED
                 or not isinstance(command, bytes)
                 or not (command == GET_CAPABILITIES or (len(command) == 2
-                    and command[0] in (12, 13, 14) and command[1] <= 128
+                    and command[0] in (12, 13, 14) and command[1] <= 255
                     and (command[0] != 12 or command[1] == 0)))):
             raise PipeError("invalid_voice_command")
         writer = DataWriter()

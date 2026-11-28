@@ -185,7 +185,7 @@ def valid_record(row):
                             'duration_ms', 'error_type', 'error_family', 'native_code',
                             'status', 'protocol_error'}
                 and _integer(row['elapsed_ms']) and _integer(row['attempt'], 0)
-                and _integer(row['opcode'], 0, 255) and _integer(row['stream'], -1, 128)
+                and _integer(row['opcode'], 0, 255) and _integer(row['stream'], -1, 255)
                 and all(isinstance(row[k], str) for k in ('state', 'error_type', 'error_family'))
                 and row['state'] in {'begin', 'written', 'failed', 'native_pending',
                                      'cancel_requested', 'cancel_settled', 'caps_reply_timeout'}
